@@ -335,6 +335,22 @@ class QuickJSRuntime : public jsi::Runtime {
   /// Throws the pending quickjs exception as a jsi::JSError. Never returns.
   [[noreturn]] void throwPendingError();
 
+  /// Describes `exception` using nothing that can re-enter JavaScript. Always
+  /// returns a non-empty string for a non-empty exception and never leaves a
+  /// pending exception behind.
+  std::string describeExceptionWithoutRunningJS(JSValue exception);
+
+  /// Throws if `value` is the exception sentinel, otherwise returns it.
+  JSValue checkException(JSValue value);
+  /// Throws if `result` is negative, the quickjs error convention.
+  void checkException(int result);
+
+  /// Converts an in-flight C++ exception into a pending quickjs exception.
+  /// Called from class callbacks, which must not let C++ exceptions escape into
+  /// the engine's C frames. `origin` names the kind of callback that threw.
+  JSValue throwAsJSException(
+      const std::exception *e, const char *origin = "HostFunction") noexcept;
+
  private:
   void drainPendingReleases() noexcept;
   void rebaseOntoCurrentThread() noexcept;
@@ -407,6 +423,20 @@ class QuickJSRuntime : public jsi::Runtime {
   std::recursive_mutex engineMutex_;
   unsigned lockDepth_{0};
   bool jsThreadAdopted_{false};
+
+  // Building a jsi::JSError reads .message and .stack, which can itself throw.
+  // Bounding the nesting stops a pathological error object, or a stack overflow
+  // where every recovery attempt overflows again, from recursing until the
+  // native stack is gone.
+  int errorDepth_{0};
+  static constexpr int kMaxErrorDepth = 8;
+
+  // A JS-free description of the outermost exception, taken once on the way in
+  // and reported if the nesting bound is hit. Without it the bail-out named
+  // only itself: the first device run of a real bundle aborted with eight
+  // nested copies of our own message and nothing about the error that started
+  // it, which on a device is the entire evidence available.
+  std::string firstErrorDescription_;
 
   QuickJSPointerValue *freeValues_{nullptr};
   QuickJSAtomPointerValue *freeAtoms_{nullptr};

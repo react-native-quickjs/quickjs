@@ -423,8 +423,135 @@ jsi::PropNameID QuickJSRuntime::createPropNameIDFrom(JSAtom atom) {
   return make<jsi::PropNameID>(allocAtomPointerValue(atom));
 }
 
+/**
+ * Runs where describing an exception the normal way has already failed, or is
+ * about to: JS_ToCString on an Error calls its toString, reading .message can
+ * hit an accessor, and reading .stack is exactly what jsi::JSError does and
+ * exactly what was throwing. So this reads own properties only, and swallows
+ * anything they raise, because the caller is about to throw a C++ exception and
+ * a stray pending JS exception would surface later against unrelated code.
+ */
+std::string QuickJSRuntime::describeExceptionWithoutRunningJS(
+    JSValue exception) {
+  if (JS_IsString(exception)) {
+    const char *s = JS_ToCString(context_, exception);
+    std::string out = s != nullptr
+                          ? std::string("<string exception: ") + s + ">"
+                          : std::string("<indescribable exception>");
+    if (s != nullptr) {
+      JS_FreeCString(context_, s);
+    }
+    return out;
+  }
+  if (!JS_IsObject(exception)) {
+    return "<non-object exception>";
+  }
+
+  auto readString = [&](const char *key) -> std::string {
+    JSValue v = JS_GetPropertyStr(context_, exception, key);
+    if (JS_IsException(v)) {
+      JS_FreeValue(context_, JS_GetException(context_));
+      return {};
+    }
+    std::string out;
+    if (JS_IsString(v)) {
+      const char *s = JS_ToCString(context_, v);
+      if (s != nullptr) {
+        out = s;
+        JS_FreeCString(context_, s);
+      }
+    }
+    JS_FreeValue(context_, v);
+    return out;
+  };
+
+  std::string name = readString("name");
+  std::string message = readString("message");
+  if (name.empty() && message.empty()) {
+    // Never empty: at the call site that is indistinguishable from "no original
+    // exception was recorded".
+    return "<indescribable exception>";
+  }
+  if (message.empty()) {
+    return name;
+  }
+  if (name.empty()) {
+    return message;
+  }
+  return name + ": " + message;
+}
+
 void QuickJSRuntime::throwPendingError() {
-  notImplemented("throwPendingError");
+  JSValue exception = JS_GetException(context_);
+  if (JS_IsNull(exception) || JS_IsUndefined(exception)) {
+    JS_FreeValue(context_, exception);
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: operation failed with no pending exception");
+  }
+
+  if (errorDepth_ >= kMaxErrorDepth) {
+    JS_FreeValue(context_, exception);
+    // Report the outermost exception: by the time the bound is reached this one
+    // is a failure that happened while describing the original, and naming it
+    // explains nothing.
+    std::string what =
+        "QuickJSRuntime: exception thrown while handling an exception";
+    if (!firstErrorDescription_.empty()) {
+      what += "; original exception: " + firstErrorDescription_;
+    }
+    // A recursive bail-out is usually a stack-limit problem, and the limit is
+    // the one thing about it invisible from JavaScript.
+    what += "; jsThreadOwnsEngine=";
+    what += isOnJSThread() ? "true" : "false";
+    what +=
+        ", remainingNativeStack=" + std::to_string(remainingNativeStackBytes());
+    what += ", configuredStackSize=" + std::to_string(config_.stackSize);
+    throw jsi::JSINativeException(what);
+  }
+
+  if (errorDepth_ == 0) {
+    firstErrorDescription_ = describeExceptionWithoutRunningJS(exception);
+  }
+
+  struct DepthGuard {
+    int &depth;
+    explicit DepthGuard(int &d) : depth(d) {
+      ++depth;
+    }
+    ~DepthGuard() {
+      --depth;
+    }
+  } guard(errorDepth_);
+
+  // JS_GetException already cleared the pending exception, so the reads inside
+  // JSError start from a clean slate.
+  throw jsi::JSError(*this, createValue(exception));
+}
+
+JSValue QuickJSRuntime::checkException(JSValue value) {
+  if (JS_IsException(value)) {
+    throwPendingError();
+  }
+  return value;
+}
+
+void QuickJSRuntime::checkException(int result) {
+  if (result < 0) {
+    throwPendingError();
+  }
+}
+
+JSValue QuickJSRuntime::throwAsJSException(
+    const std::exception *e, const char *origin) noexcept {
+  // A JSError already carries a thrown JS value, so rethrow it unchanged rather
+  // than reshaping it.
+  if (const auto *jsError = dynamic_cast<const jsi::JSError *>(e)) {
+    return JS_Throw(
+        context_, JS_DupValue(context_, toJSValue(jsError->value())));
+  }
+  return JS_ThrowInternalError(
+      context_, "Exception in %s: %s", origin,
+      e != nullptr ? e->what() : "unknown C++ exception");
 }
 
 std::string QuickJSRuntime::description() {
