@@ -1,0 +1,40 @@
+<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="qjsTitle">
+  <title id="qjsTitle">react-native-quickjs</title>
+  <defs>
+    <linearGradient id="qjsBowl" x1=".05" y1="0" x2=".95" y2="1">
+      <stop offset="0" stop-color="#FBBF24"/>
+      <stop offset="1" stop-color="#EF4444"/>
+    </linearGradient>
+    <linearGradient id="qjsShade" x1=".05" y1="0" x2=".95" y2="1">
+      <stop offset="0" stop-color="#B45309"/>
+      <stop offset="1" stop-color="#991B1B"/>
+    </linearGradient>
+    <!-- The bowl is masked by a 3-unit dilation of the bolt, so the channel
+         where the two shapes meet is the same width all the way round. -->
+    <mask id="qjsGap">
+      <rect width="120" height="120" fill="#fff"/>
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+               fill="#000" stroke="#000" stroke-width="6" stroke-linejoin="round"/>
+    </mask>
+    <!-- Annulus centred on (54,52), outer r=33, inner r=17, cut open from
+         10° to 80° so the bolt leaves through the opening. -->
+    <clipPath id="qjsClip" clipPathUnits="userSpaceOnUse">
+      <path transform="translate(6,7)"
+            d="M59.73,84.50 A33,33 0 0 1 21.50,57.73 A33,33 0 0 1 48.27,19.50
+               A33,33 0 0 1 86.50,46.27 A33,33 0 0 1 86.50,57.73
+               L70.74,54.95 A17,17 0 0 0 56.95,35.26 A17,17 0 0 0 37.26,49.05
+               A17,17 0 0 0 51.05,68.74 A17,17 0 0 0 56.95,68.74 Z"/>
+    </clipPath>
+  </defs>
+
+  <rect width="120" height="120" rx="27" fill="#1A0E0A"/>
+
+  <g clip-path="url(#qjsClip)" mask="url(#qjsGap)">
+    <polygon points="0,0 120,0 0,120" fill="url(#qjsBowl)"/>
+    <polygon points="120,0 120,120 0,120" fill="url(#qjsShade)"/>
+    <path d="M120,0 L0,120" fill="none" stroke="#1A0E0A" stroke-width="1.8" opacity=".45"/>
+  </g>
+
+  <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+           fill="#FFF7E0"/>
+</svg>
