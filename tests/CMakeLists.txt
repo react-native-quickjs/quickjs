@@ -44,6 +44,10 @@ target_compile_definitions(quickjs_bytecode_tests
   PRIVATE QJSC_NG_PATH="$<TARGET_FILE:qjsc-ng>")
 add_dependencies(quickjs_bytecode_tests qjsc-ng)
 
+# Drives the C API on JSRuntime/JSContext directly rather than through JSI,
+# because that is the surface a debugger bridge sits on.
+qjs_add_test_suite(quickjs_debugger_tests debugger_test.cpp)
+
 add_executable(quickjs_jsi_bench bench/jsi_bench.cpp)
 target_link_libraries(quickjs_jsi_bench PRIVATE quickjs_jsi)
 
