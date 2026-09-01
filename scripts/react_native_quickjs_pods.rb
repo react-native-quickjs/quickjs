@@ -234,17 +234,26 @@ def react_native_quickjs_relax_return_type(installer)
     end
 end
 
+# Raises when the pod is not there. Every caller is repairing something in
+# React Native that stops the build without the repair, so a silent no-op here
+# would surface much later as the error it was meant to prevent -- and these
+# match React Native's pods by name, which is exactly the kind of thing a
+# version bump renames.
 def react_native_quickjs_add_define(installer, pod_name, define, debug_only: false)
-  installer.target_installation_results.pod_target_installation_results
-    .each do |name, result|
-      next unless name.to_s == pod_name
+  results = installer.target_installation_results.pod_target_installation_results
+  result = results[pod_name]
 
-      result.native_target.build_configurations.each do |config|
-        next if debug_only && config.type != :debug
+  if result.nil?
+    raise "[ReactNativeQuickJS] no pod named #{pod_name}, so #{define} was " \
+          "not applied. React Native has probably renamed it; this needs " \
+          "updating in scripts/react_native_quickjs_pods.rb."
+  end
 
-        defs = config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] || "$(inherited)"
-        defs = defs.join(" ") if defs.is_a?(Array)
-        config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] = "#{defs} #{define}"
-      end
-    end
+  result.native_target.build_configurations.each do |config|
+    next if debug_only && config.type != :debug
+
+    defs = config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] || "$(inherited)"
+    defs = defs.join(" ") if defs.is_a?(Array)
+    config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] = "#{defs} #{define}"
+  end
 end
