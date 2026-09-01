@@ -1,0 +1,147 @@
+Subject: let the debugger ask where each stack frame is
+
+What this does
+  Adds a way to ask the engine, for any frame on the call stack, which file
+  and line it is currently at, what the function is called, and whether the
+  frame is native code rather than JavaScript.
+
+Why we need it
+  When a debugger pauses, Chrome DevTools shows the whole call stack, not just
+  the innermost frame. The engine could already report where it stopped and
+  could list a frame's variables, but there was no way to ask where a frame
+  is, so the debugger had nothing to fill the rest of the list with.
+
+What it adds
+  JS_GetFrameInfoAtLevel()  - file, line, column, function name, and whether
+                              the frame is native. Level 0 is the frame that
+                              is running right now.
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  Returns -1 for a level that does not exist, and zero-fills the struct first,
+  so a caller that forgets to check the return value reads -1 and empty names
+  rather than stack garbage. It never throws.
+
+  The line number can be -1 for a real JavaScript frame. The engine only
+  records a frame's position at points where it might re-enter itself, so a
+  frame that has not called anything yet, and is not the frame that stopped,
+  genuinely does not know where it is.
+
+diff --git a/quickjs.c b/quickjs.c
+index ec92d97..e12e185 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3270,6 +3270,51 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
+     return ret;
+ }
+ 
++/* Defined much later in the file; declared here so the debugger block, which
++   sits early enough to be next to the rest of the debug API, can use them. */
++static bool js_class_has_bytecode(JSClassID class_id);
++static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
++                         uint32_t pc_value, int *col);
++
++int JS_GetFrameInfoAtLevel(JSContext *ctx, int level, JSDebugFrameInfo *info)
++{
++    JSStackFrame *sf;
++    JSObject *p;
++    JSFunctionBytecode *b;
++
++    if (!info)
++        return -1;
++    memset(info, 0, sizeof(*info));
++    info->filename = JS_ATOM_NULL;
++    info->func_name = JS_ATOM_NULL;
++    info->line = -1;
++    info->col = -1;
++
++    sf = js_get_stack_frame_at_level(ctx, level);
++    if (sf == NULL)
++        return -1;
++
++    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT) {
++        info->is_native = true;
++        return 0;
++    }
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!js_class_has_bytecode(p->class_id)) {
++        info->is_native = true;
++        return 0;
++    }
++
++    b = p->u.func.function_bytecode;
++    info->filename = b->filename;
++    info->func_name = b->func_name;
++    if (sf->cur_pc) {
++        /* cur_pc points just past the executing instruction */
++        uint32_t pc = (uint32_t)(sf->cur_pc - b->byte_code_buf - 1);
++        info->line = find_line_num(ctx, b, pc, &info->col);
++    }
++    return 0;
++}
++
+ #else /* !JS_ENABLE_DEBUGGER */
+ 
+ /* Stubs so an embedder built against the full header still links.  They fail
+@@ -3318,6 +3363,19 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level, const char *input,
+                                  "debugger not compiled in (JS_ENABLE_DEBUGGER=0)");
+ }
+ 
++int JS_GetFrameInfoAtLevel(JSContext *ctx, int level, JSDebugFrameInfo *info)
++{
++    (void)ctx; (void)level;
++    if (!info)
++        return -1;
++    memset(info, 0, sizeof(*info));
++    info->filename = JS_ATOM_NULL;
++    info->func_name = JS_ATOM_NULL;
++    info->line = -1;
++    info->col = -1;
++    return -1;
++}
++
+ #endif /* JS_ENABLE_DEBUGGER */
+ 
+ typedef enum JSFreeModuleEnum {
+@@ -18530,6 +18588,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     uint32_t pc_index = (uint32_t)(pc - b->byte_code_buf - 2);
+                     line_num = find_line_num(ctx, b, pc_index, &col_num);
+ 
++                    /* JS_CallInternal keeps pc in a local and only writes
++                       sf->cur_pc where it can re-enter the engine; the trap
++                       is such a point, so publish it for the trapping frame. */
++                    sf->cur_pc = pc;
++
+                     /* Pass the JSAtom values directly -- no heap allocation.
+                        The atoms are valid for the lifetime of the bytecode
+                        object, which outlives the callback.  The embedder must
+diff --git a/quickjs.h b/quickjs.h
+index 1d9f291..fbbecc7 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -641,6 +641,23 @@ JS_EXTERN JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
+                                       const char *input, size_t input_len,
+                                       const char *filename);
+ 
++/* Source location and function identity of one live stack frame. `filename`
++   and `func_name` are borrowed atoms, valid only while the frame is alive;
++   JS_DupAtom() to retain. `line`/`col` are -1 when unavailable. */
++typedef struct JSDebugFrameInfo {
++    JSAtom filename;   /* borrowed; JS_ATOM_NULL if unknown */
++    JSAtom func_name;  /* borrowed; JS_ATOM_NULL for anonymous functions */
++    int line;          /* 1-based, or -1 */
++    int col;           /* 1-based, or -1 */
++    bool is_native;    /* true for a C function frame */
++} JSDebugFrameInfo;
++
++/* Fill *info for the frame at `level` (0 = the innermost frame, 1 = its
++   caller).  Returns 0 on success and -1 if `level` is out of range, in which
++   case *info is zero-filled.  Never throws. */
++JS_EXTERN int JS_GetFrameInfoAtLevel(JSContext *ctx, int level,
++                                     JSDebugFrameInfo *info);
++
+ /* the following functions are used to select the intrinsic object to
+    save memory */
+ JS_EXTERN JSContext *JS_NewContextRaw(JSRuntime *rt);
