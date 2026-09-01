@@ -37,6 +37,9 @@
     "!**/__tests__",
     "!**/.*"
   ],
+  "workspaces": [
+    "example"
+  ],
   "scripts": {
     "submodules": "git submodule update --init --recursive",
     "patches": "node scripts/apply-patches.js",
@@ -49,7 +52,8 @@
     "bytecode": "./build/qjsc-ng",
     "clean": "rm -rf build build-release",
     "prepack": "node scripts/check-submodule.js && node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check",
-    "postinstall": "node scripts/postinstall.js"
+    "postinstall": "node scripts/postinstall.js",
+    "example": "npm run --workspace @react-native-quickjs/example"
   },
   "peerDependencies": {
     "react": "*",
