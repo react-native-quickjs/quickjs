@@ -25,6 +25,16 @@ static_assert(
 
 namespace {
 
+/// Keeps a jsi::MutableBuffer alive for as long as the ArrayBuffer pointing
+/// into it.
+struct ArrayBufferProxy {
+  std::shared_ptr<jsi::MutableBuffer> buffer;
+};
+
+void freeArrayBufferProxy(JSRuntime * /*rt*/, void *opaque, void * /*ptr*/) {
+  delete static_cast<ArrayBufferProxy *>(opaque);
+}
+
 const char *kEnumeratePropertyNamesSource =
     "(function (o) { const r = []; for (const k in o) r.push(k); return r; })";
 
@@ -842,33 +852,65 @@ jsi::Value QuickJSRuntime::lockWeakObject(const jsi::WeakObject &) {
 }
 
 jsi::Array QuickJSRuntime::createArray(size_t length) {
-  notImplemented("createArray");
+  JSValue array = JS_NewArray(context_);
+  checkException(array);
+  if (JS_SetLength(context_, array, static_cast<int64_t>(length)) < 0) {
+    JS_FreeValue(context_, array);
+    throwPendingError();
+  }
+  return make<jsi::Object>(allocPointerValue(array)).getArray(*this);
 }
 
 jsi::ArrayBuffer QuickJSRuntime::createArrayBuffer(
     std::shared_ptr<jsi::MutableBuffer> buffer) {
-  notImplemented("createArrayBuffer");
+  uint8_t *data = buffer->data();
+  size_t size = buffer->size();
+  auto *proxy = new ArrayBufferProxy{std::move(buffer)};
+
+  JSValue arrayBuffer = JS_NewArrayBuffer(
+      context_, data, size, freeArrayBufferProxy, proxy, false);
+  if (JS_IsException(arrayBuffer)) {
+    delete proxy;
+    throwPendingError();
+  }
+  return make<jsi::Object>(allocPointerValue(arrayBuffer))
+      .getArrayBuffer(*this);
 }
 
-size_t QuickJSRuntime::size(const jsi::Array &) {
-  notImplemented("size");
+size_t QuickJSRuntime::size(const jsi::Array &array) {
+  int64_t length = 0;
+  checkException(JS_GetLength(context_, toJSValue(array), &length));
+  return static_cast<size_t>(length);
 }
 
-size_t QuickJSRuntime::size(const jsi::ArrayBuffer &) {
-  notImplemented("size");
+size_t QuickJSRuntime::size(const jsi::ArrayBuffer &arrayBuffer) {
+  size_t size = 0;
+  if (JS_GetArrayBuffer(context_, &size, toJSValue(arrayBuffer)) == nullptr) {
+    throwPendingError();
+  }
+  return size;
 }
 
-uint8_t *QuickJSRuntime::data(const jsi::ArrayBuffer &) {
-  notImplemented("data");
+uint8_t *QuickJSRuntime::data(const jsi::ArrayBuffer &arrayBuffer) {
+  size_t size = 0;
+  uint8_t *data = JS_GetArrayBuffer(context_, &size, toJSValue(arrayBuffer));
+  if (data == nullptr) {
+    throwPendingError();
+  }
+  return data;
 }
 
-jsi::Value QuickJSRuntime::getValueAtIndex(const jsi::Array &, size_t i) {
-  notImplemented("getValueAtIndex");
+jsi::Value QuickJSRuntime::getValueAtIndex(
+    const jsi::Array &array, size_t index) {
+  return createValue(JS_GetPropertyUint32(
+      context_, toJSValue(array), static_cast<uint32_t>(index)));
 }
 
 void QuickJSRuntime::setValueAtIndexImpl(
-    const jsi::Array &, size_t i, const jsi::Value &value) {
-  notImplemented("setValueAtIndexImpl");
+    const jsi::Array &array, size_t index, const jsi::Value &value) {
+  checkException(JS_SetPropertyUint32(
+      context_, toJSValue(array), static_cast<uint32_t>(index),
+      JS_DupValue(context_, toJSValue(value))));
 }
 
 jsi::Function QuickJSRuntime::createFunctionFromHostFunction(
