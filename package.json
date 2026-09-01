@@ -53,7 +53,9 @@
     "clean": "rm -rf build build-release",
     "prepack": "node scripts/check-submodule.js && node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check",
     "postinstall": "node scripts/postinstall.js",
-    "example": "npm run --workspace @react-native-quickjs/example"
+    "example": "npm run --workspace @react-native-quickjs/example",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs"
   },
   "peerDependencies": {
     "react": "*",
@@ -64,7 +66,8 @@
     "commitlint": "^21.0.2",
     "lefthook": "^2.1.9",
     "react": "19.2.3",
-    "react-native": "0.85.0"
+    "react-native": "0.85.0",
+    "vitepress": "^1.6.4"
   },
   "commitlint": {
     "extends": [

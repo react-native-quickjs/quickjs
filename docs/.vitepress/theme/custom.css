@@ -1,0 +1,106 @@
+/**
+ * Overrides on top of the VitePress default theme. Everything here is
+ * expressed in the theme's own tokens so both colour modes work from one
+ * stylesheet, and there are no webfonts.
+ *
+ * The one thing that moves is the home-page mark: it plays a short intro on
+ * first paint and then idles. That lives in theme/components/HeroLogo.vue and
+ * is disabled under prefers-reduced-motion. Nothing else on the page animates.
+ */
+
+/* The accent is taken from the mark: #FBBF24 → #EF4444 through amber.
+ *
+ * The theme reuses --vp-c-brand-2 for two jobs that pull in opposite
+ * directions — hovered link *text*, and the hovered brand button's
+ * *background* under white text. One value cannot serve both in dark mode
+ * without one of them failing contrast, so the button backgrounds are set
+ * explicitly here and the brand ramp is left to do only the text job.
+ *
+ * Measured against #fff and the theme's dark background #1b1b1f:
+ *   links       light 5.18:1   dark 10.18:1   (AA needs 4.5)
+ *   link hover  light 7.31:1   dark 11.91:1
+ *   button      white on #c2410c 5.18:1, hover 7.31:1, active 9.37:1
+ */
+:root {
+  --vp-c-brand-1: #c2410c;
+  --vp-c-brand-2: #9a3412;
+  --vp-c-brand-3: #c2410c;
+  --vp-c-brand-soft: rgb(234 88 12 / 0.14);
+
+  --vp-button-brand-bg: #c2410c;
+  --vp-button-brand-hover-bg: #9a3412;
+  --vp-button-brand-active-bg: #7c2d12;
+
+  --vp-home-hero-name-color: var(--vp-c-text-1);
+  --vp-home-hero-name-font-size: 1rem;
+}
+
+.dark {
+  --vp-c-brand-1: #fdba74;
+  --vp-c-brand-2: #fcd34d;
+  --vp-c-brand-3: #c2410c;
+  --vp-c-brand-soft: rgb(251 146 60 / 0.16);
+}
+
+/* The hero name is the package name, not a wordmark: keep it as an eyebrow
+   above the sentence that carries the meaning. */
+.VPHero .name {
+  font-family: var(--vp-font-family-mono);
+  font-size: 0.875rem;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+  margin-bottom: 0.5rem;
+}
+
+.VPHero .text {
+  font-size: clamp(2.125rem, 5vw, 3.25rem);
+  line-height: 1.1;
+  letter-spacing: -0.022em;
+  max-width: 20ch;
+}
+
+.VPHero .tagline {
+  max-width: 64ch;
+  font-size: 1.0625rem;
+  line-height: 1.7;
+}
+
+/* The mark carries its own dark tile, so the theme's blurred brand blob behind
+   the hero image would sit under it as a coloured halo. Drop it and let the
+   component's own drop-shadow do the lifting. */
+.VPHero .image-bg {
+  display: none;
+}
+
+.VPHero .image-container {
+  transform: none;
+  padding: 0;
+}
+
+/* The nav mark is small enough that the 3-unit keyline around the bolt starts
+   to close up; a touch more size keeps it legible next to the site title. */
+.VPNavBarTitle .logo {
+  height: 26px;
+  margin-right: 8px;
+}
+
+/* The four figures on the home page. Tabular numerals so the digits line up
+   across the grid. */
+.VPFeature .title {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.015em;
+}
+
+/* Prose below the features on the home page reads as body text, not as a
+   documentation page, so it gets no top rule on its first heading. */
+.VPHome .vp-doc > div > h2:first-child {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+}
+
+.VPHome .vp-doc {
+  padding-bottom: 5rem;
+}

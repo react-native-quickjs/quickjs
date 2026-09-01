@@ -1,0 +1,96 @@
+<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="qjsTitle">
+  <title id="qjsTitle">react-native-quickjs</title>
+  <!--
+    Self-contained animated mark. Identical geometry to logo.svg; the motion is
+    a 3.6s loop — a charge travels around the bowl, reaches the opening the bolt
+    sits in, and discharges.
+
+    The CSS below runs when this file is used as <img src>, <object>, a CSS
+    background, or inlined. It does NOT run on GitHub, which strips <style>
+    from SVG in Markdown — use logo.svg or the PNG there.
+  -->
+  <defs>
+    <style><![CDATA[
+      .orbit { transform-box: view-box; transform-origin: 60px 59px;
+               animation: qjs-orbit 3.6s linear infinite; }
+      .halo, .blowout, .wave { transform-box: fill-box; transform-origin: center; }
+      .halo    { animation: qjs-halo 3.6s ease-out infinite; }
+      .blowout { animation: qjs-blowout 3.6s ease-out infinite; }
+      .wave    { animation: qjs-wave 3.6s ease-out infinite; }
+
+      @keyframes qjs-orbit { to { transform: rotate(360deg); } }
+      @keyframes qjs-halo {
+        0%, 62% { opacity: 0; transform: scale(1); }
+        80%     { opacity: .55; transform: scale(1.04); }
+        100%    { opacity: 0; transform: scale(1.14); }
+      }
+      @keyframes qjs-blowout {
+        0%, 76%   { opacity: 0; }
+        80%       { opacity: .9; }
+        88%, 100% { opacity: 0; }
+      }
+      @keyframes qjs-wave {
+        0%, 78% { opacity: 0; transform: scale(.5); }
+        81%     { opacity: .6; }
+        100%    { opacity: 0; transform: scale(2.1); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .orbit, .halo, .blowout, .wave { animation: none; }
+        .halo, .blowout, .wave { display: none; }
+      }
+    ]]></style>
+
+    <linearGradient id="qjsBowl" x1=".05" y1="0" x2=".95" y2="1">
+      <stop offset="0" stop-color="#FBBF24"/>
+      <stop offset="1" stop-color="#EF4444"/>
+    </linearGradient>
+    <linearGradient id="qjsShade" x1=".05" y1="0" x2=".95" y2="1">
+      <stop offset="0" stop-color="#B45309"/>
+      <stop offset="1" stop-color="#991B1B"/>
+    </linearGradient>
+    <radialGradient id="qjsSpark">
+      <stop offset="0" stop-color="#FFF7E0" stop-opacity=".95"/>
+      <stop offset=".45" stop-color="#FFD9A0" stop-opacity=".45"/>
+      <stop offset="1" stop-color="#FFD9A0" stop-opacity="0"/>
+    </radialGradient>
+
+    <mask id="qjsGap">
+      <rect width="120" height="120" fill="#fff"/>
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+               fill="#000" stroke="#000" stroke-width="6" stroke-linejoin="round"/>
+    </mask>
+
+    <clipPath id="qjsClip" clipPathUnits="userSpaceOnUse">
+      <path transform="translate(6,7)"
+            d="M59.73,84.50 A33,33 0 0 1 21.50,57.73 A33,33 0 0 1 48.27,19.50
+               A33,33 0 0 1 86.50,46.27 A33,33 0 0 1 86.50,57.73
+               L70.74,54.95 A17,17 0 0 0 56.95,35.26 A17,17 0 0 0 37.26,49.05
+               A17,17 0 0 0 51.05,68.74 A17,17 0 0 0 56.95,68.74 Z"/>
+    </clipPath>
+  </defs>
+
+  <rect width="120" height="120" rx="27" fill="#1A0E0A"/>
+
+  <g clip-path="url(#qjsClip)" mask="url(#qjsGap)">
+    <polygon points="0,0 120,0 0,120" fill="url(#qjsBowl)"/>
+    <polygon points="120,0 120,120 0,120" fill="url(#qjsShade)"/>
+    <path d="M120,0 L0,120" fill="none" stroke="#1A0E0A" stroke-width="1.8" opacity=".45"/>
+    <g class="orbit"><circle cx="64.3" cy="83.6" r="17" fill="url(#qjsSpark)"/></g>
+  </g>
+
+  <circle class="wave" opacity="0" cx="60" cy="59" r="24" fill="none" stroke="#FFF7E0" stroke-width="2.5"/>
+
+  <g class="halo" opacity="0">
+    <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+             fill="none" stroke="#FFD08A" stroke-width="6" stroke-linejoin="round"/>
+  </g>
+
+  <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+           fill="#FFF7E0"/>
+
+  <g class="blowout" opacity="0">
+    <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+             fill="#fff"/>
+  </g>
+</svg>

@@ -48,3 +48,7 @@ example/android/build/
 example/android/app/build/
 example/android/.gradle/
 example/android/.cxx/
+
+# vitepress
+docs/.vitepress/dist/
+docs/.vitepress/cache/

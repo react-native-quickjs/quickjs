@@ -1,0 +1,171 @@
+<svg viewBox="0 0 1600 900" width="1600" height="900" xmlns="http://www.w3.org/2000/svg"
+     role="img" aria-labelledby="bTitle bDesc">
+  <title id="bTitle">React Native QuickJS</title>
+  <desc id="bDesc">A JavaScript engine you can read, patch and own.</desc>
+  <!--
+    1600x900 banner. Self-contained: no external fonts, no external images.
+
+    Sequence — the mark lands first and then runs forever, and the type arrives
+    after it, so the eye is never asked to read and watch at the same time:
+      0.00s  tile settles
+      0.12s  bowl settles
+      0.62s  bolt strikes down its own axis
+      1.15s  the forever loop starts (3.6s cycle, discharge at ~4.0s)
+      1.05s  wordmark
+      1.25s  headline
+      1.45s  rule and feature line
+
+    The CSS runs as <img src>, <object>, a CSS background, or inlined. GitHub
+    strips inline CSS from SVG in Markdown — use banner.png there.
+  -->
+  <defs>
+    <style><![CDATA[
+      .t { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
+
+      .tile, .bowl, .bolt, .strike, .blowout, .halo, .wave,
+      .e1, .e2, .e4, .e5 { transform-box: fill-box; transform-origin: center; }
+      /* The mark is a nested <svg>, so `view-box` here resolves to its own
+         0 0 120 120 viewport and the bowl centre is 60,59 — the same values
+         the standalone mark uses. Inside a scaled <g> it would not have been:
+         the reference box would be the 1600x900 root while the transform still
+         applied in the mark's local space. */
+      .orbit { transform-box: view-box; transform-origin: 60px 59px; }
+
+      /* the mark arrives */
+      .tile   { animation: b-tile   .70s cubic-bezier(.2,.85,.25,1) both; }
+      .bowl   { animation: b-bowl   .85s .12s cubic-bezier(.2,.85,.25,1) both; }
+      .bolt   { animation: b-bolt   .45s .62s cubic-bezier(.25,1.5,.45,1) both; }
+      .strike { animation: b-strike .40s .72s ease-out both; }
+
+      /* …then never stops */
+      .orbit   { animation: b-orbit   3.6s 1.15s linear infinite; }
+      .halo    { animation: b-halo    3.6s 1.15s ease-out infinite; }
+      .blowout { animation: b-blowout 3.6s 1.15s ease-out infinite; }
+      .wave    { animation: b-wave    3.6s 1.15s ease-out infinite; }
+
+      /* …and the type follows it in */
+      .e1 { animation: b-rise .7s 1.05s cubic-bezier(.2,.8,.2,1) both; }
+      .e2 { animation: b-rise .7s 1.25s cubic-bezier(.2,.8,.2,1) both; }
+            .e4 { animation: b-wipe .8s 1.45s cubic-bezier(.2,.8,.2,1) both; }
+      .e5 { animation: b-rise .7s 1.55s cubic-bezier(.2,.8,.2,1) both; }
+
+      @keyframes b-tile   { from { opacity:0; transform:scale(.94) } to { opacity:1; transform:none } }
+      @keyframes b-bowl   { from { opacity:0; transform:scale(.82) rotate(-14deg) } to { opacity:1; transform:none } }
+      @keyframes b-bolt   { from { opacity:0; transform:translate(-32px,-32px) } to { opacity:1; transform:none } }
+      @keyframes b-strike { 0% { opacity:0; transform:translate(-32px,-32px) } 55% { opacity:.85; transform:none } 100% { opacity:0; transform:none } }
+
+      @keyframes b-orbit   { to { transform: rotate(360deg) } }
+      @keyframes b-halo    { 0%,62% { opacity:0; transform:scale(1) } 80% { opacity:.55; transform:scale(1.04) } 100% { opacity:0; transform:scale(1.14) } }
+      @keyframes b-blowout { 0%,76% { opacity:0 } 80% { opacity:.9 } 88%,100% { opacity:0 } }
+      @keyframes b-wave    { 0%,78% { opacity:0; transform:scale(.5) } 81% { opacity:.6 } 100% { opacity:0; transform:scale(2.1) } }
+
+      @keyframes b-rise { from { opacity:0; transform:translateY(18px) } to { opacity:1; transform:none } }
+      @keyframes b-wipe { from { opacity:0; transform:scaleX(0) } to { opacity:1; transform:none } }
+
+      @media (prefers-reduced-motion: reduce) {
+        .tile,.bowl,.bolt,.strike,.blowout,.halo,.wave,.orbit,
+        .e1,.e2,.e4,.e5 { animation: none }
+        .strike,.blowout,.halo,.wave,.orbit { display: none }
+      }
+    ]]></style>
+
+    <radialGradient id="bGlow" cx=".5" cy=".5" r=".5">
+      <stop offset="0"  stop-color="#EF4444" stop-opacity=".16"/>
+      <stop offset=".55" stop-color="#FBBF24" stop-opacity=".07"/>
+      <stop offset="1"  stop-color="#FBBF24" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="bWord" gradientUnits="userSpaceOnUse" x1="790" y1="460" x2="1170" y2="520">
+      <stop offset="0" stop-color="#EA580C"/>
+      <stop offset="1" stop-color="#DC2626"/>
+    </linearGradient>
+
+    <linearGradient id="bRule" gradientUnits="userSpaceOnUse" x1="620" y1="0" x2="980" y2="0">
+      <stop offset="0"  stop-color="#EA580C" stop-opacity="0"/>
+      <stop offset=".5" stop-color="#EA580C" stop-opacity=".55"/>
+      <stop offset="1"  stop-color="#EA580C" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- the mark, in its own 0–120 space -->
+    <linearGradient id="bBowl" x1=".05" y1="0" x2=".95" y2="1">
+      <stop offset="0" stop-color="#FBBF24"/><stop offset="1" stop-color="#EF4444"/>
+    </linearGradient>
+    <linearGradient id="bShade" x1=".05" y1="0" x2=".95" y2="1">
+      <stop offset="0" stop-color="#B45309"/><stop offset="1" stop-color="#991B1B"/>
+    </linearGradient>
+    <radialGradient id="bSpark">
+      <stop offset="0" stop-color="#FFF7E0" stop-opacity=".95"/>
+      <stop offset=".45" stop-color="#FFD9A0" stop-opacity=".45"/>
+      <stop offset="1" stop-color="#FFD9A0" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="bGap">
+      <rect width="120" height="120" fill="#fff"/>
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+               fill="#000" stroke="#000" stroke-width="6" stroke-linejoin="round"/>
+    </mask>
+    <clipPath id="bClip" clipPathUnits="userSpaceOnUse">
+      <path transform="translate(6,7)"
+            d="M59.73,84.50 A33,33 0 0 1 21.50,57.73 A33,33 0 0 1 48.27,19.50
+               A33,33 0 0 1 86.50,46.27 A33,33 0 0 1 86.50,57.73
+               L70.74,54.95 A17,17 0 0 0 56.95,35.26 A17,17 0 0 0 37.26,49.05
+               A17,17 0 0 0 51.05,68.74 A17,17 0 0 0 56.95,68.74 Z"/>
+    </clipPath>
+
+    <filter id="bDrop" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#7C2D12" flood-opacity=".28"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="900" fill="#FFFFFF"/>
+  <!-- Centred on the whole stack, not on the mark: pinned to the mark it left
+       the lower third of the canvas visibly empty. -->
+  <ellipse cx="800" cy="440" rx="720" ry="470" fill="url(#bGlow)"/>
+
+  <!-- ── the mark: 210px, centred, top of the stack ───────────────────── -->
+  <g filter="url(#bDrop)">
+   <svg x="695" y="210" width="210" height="210" viewBox="0 0 120 120" overflow="visible">
+    <rect class="tile" width="120" height="120" rx="27" fill="#1A0E0A"/>
+    <g class="bowl">
+      <g clip-path="url(#bClip)" mask="url(#bGap)">
+        <polygon points="0,0 120,0 0,120" fill="url(#bBowl)"/>
+        <polygon points="120,0 120,120 0,120" fill="url(#bShade)"/>
+        <path d="M120,0 L0,120" fill="none" stroke="#1A0E0A" stroke-width="1.8" opacity=".45"/>
+        <g class="orbit"><circle cx="64.3" cy="83.6" r="17" fill="url(#bSpark)"/></g>
+      </g>
+    </g>
+    <circle class="wave" opacity="0" cx="60" cy="59" r="24" fill="none" stroke="#FFF7E0" stroke-width="2.5"/>
+    <g class="halo" opacity="0">
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)"
+               fill="none" stroke="#FFD08A" stroke-width="6" stroke-linejoin="round"/>
+    </g>
+    <g class="bolt">
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)" fill="#FFF7E0"/>
+    </g>
+    <g class="strike" opacity="0">
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)" fill="#fff"/>
+    </g>
+    <g class="blowout" opacity="0">
+      <polygon points="3,-11 -8,8 0,8 -4,45 8,2 1,2" transform="translate(60,59) rotate(-45)" fill="#fff"/>
+    </g>
+   </svg>
+  </g>
+
+  <!-- ── type ─────────────────────────────────────────────────────────── -->
+  <!-- One line. The weight change carries the hierarchy that the tracked-out
+       eyebrow was carrying badly: "React Native" recedes, "QuickJS" is the
+       name being introduced. -->
+  <text class="t e1" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Inter, Helvetica, Arial, sans-serif" x="800" y="505" text-anchor="middle"
+        font-size="76" letter-spacing="-2" fill="#16110F"><tspan
+        font-weight="450" fill="#6B564C">React Native </tspan><tspan
+        font-weight="800" fill="url(#bWord)">QuickJS</tspan></text>
+
+  <text class="t e2" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Inter, Helvetica, Arial, sans-serif" x="800" y="575" text-anchor="middle"
+        font-size="34" font-weight="500" letter-spacing="-.4" fill="#4A3B34">A JavaScript engine you can read, patch and own.</text>
+
+  <rect class="e4" x="620" y="630" width="360" height="2" rx="1" fill="url(#bRule)"/>
+
+  <text class="t e5" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Inter, Helvetica, Arial, sans-serif" x="800" y="686" text-anchor="middle"
+        font-size="21" font-weight="500" letter-spacing=".2" fill="#7C6155">
+    Small &#183; Blazingly fast &#183; 100% compatible &#183; No hidden APIs &#183; Built from source
+  </text>
+</svg>
