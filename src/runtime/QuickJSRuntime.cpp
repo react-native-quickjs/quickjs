@@ -346,7 +346,7 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
 
   // Baseline for the pressure valve. Left at zero, the first `grown` reading is
   // the whole live heap and the valve fires whatever the app is doing.
-  mallocAfterLastGC_ = JS_GetMallocSize(runtime_);
+  heapBaseline_ = JS_GetMallocSize(runtime_);
 
   registerClasses();
   enumeratePropertyNames_ = evalInternal(kEnumeratePropertyNamesSource);
@@ -1073,17 +1073,17 @@ jsi::Value QuickJSRuntime::evaluateJavaScript(
   StartupGCBracket bracket(
       runtime_, config_.startupGCBracketBytes, startupGCBracketUsed_);
 
-  jsi::Value result = [&] {
-    if (isBytecodeContainer(data, size)) {
-      return evaluateBytecode(
-          data + kBytecodeHeaderSize, size - kBytecodeHeaderSize);
-    }
+  jsi::Value result;
+  if (isBytecodeContainer(data, size)) {
+    result = evaluateBytecode(
+        data + kBytecodeHeaderSize, size - kBytecodeHeaderSize);
+  } else {
     throwIfHermesBytecode(data, size, sourceURL);
-    return evaluateSource(
-        data, size, effectiveSourceURL(data, size, sourceURL));
-  }();
+    result =
+        evaluateSource(data, size, effectiveSourceURL(data, size, sourceURL));
+  }
 
-  noteCollection();
+  rebaselineHeap();
   return result;
 }
 
@@ -1139,7 +1139,7 @@ jsi::Value QuickJSRuntime::evaluatePreparedJavaScript(
 
   jsi::Value result = evaluateBytecode(
       prepared->bytecode().data(), prepared->bytecode().size());
-  noteCollection();
+  rebaselineHeap();
   return result;
 }
 
@@ -1186,12 +1186,20 @@ void QuickJSRuntime::runPendingGC() noexcept {
   lastTaskEnd_ = std::chrono::steady_clock::now();
 }
 
-/// The live set just changed, so the growth baseline, the staleness clock and
-/// the ceiling derived from it are all stale.
-void QuickJSRuntime::noteCollection() noexcept {
-  mallocAfterLastGC_ = JS_GetMallocSize(runtime_);
-  pendingSince_ = {};
+/// The live set just changed, so the growth baseline and the ceiling derived
+/// from it are stale.
+void QuickJSRuntime::rebaselineHeap() noexcept {
+  heapBaseline_ = JS_GetMallocSize(runtime_);
   refreshDeferredGCLimit();
+}
+
+/// A collection ran, so the clock the max-deferral valve measures from restarts
+/// too. Only a collection may reset it: a script that merely rebaselines the
+/// heap would restart the wait without ending it, and an app that keeps
+/// evaluating would defer a pending collection forever.
+void QuickJSRuntime::noteCollection() noexcept {
+  rebaselineHeap();
+  pendingSince_ = {};
 }
 
 size_t QuickJSRuntime::deferredGCSlack() const noexcept {
@@ -1268,8 +1276,7 @@ void QuickJSRuntime::runPendingGCIfIdle(
   // against half the ceiling reduces to `live > slack`, which is true on every
   // safepoint for any real app, turning the valve into "collect constantly".
   const size_t live = JS_GetMallocSize(runtime_);
-  const size_t grown =
-      live > mallocAfterLastGC_ ? live - mallocAfterLastGC_ : 0;
+  const size_t grown = live > heapBaseline_ ? live - heapBaseline_ : 0;
   size_t pressureLimit = config_.gcPressureBytes;
   if (pressureLimit == 0) {
     // Also capped by the live heap, or the valve is unreachable on an app whose

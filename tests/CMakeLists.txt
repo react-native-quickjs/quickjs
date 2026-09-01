@@ -15,7 +15,6 @@ FetchContent_Declare(googletest
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-# Every gtest suite here wants the same three things.
 function(qjs_add_test_suite name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE quickjs_jsi GTest::gtest GTest::gtest_main)
@@ -49,6 +48,8 @@ add_dependencies(quickjs_bytecode_tests qjsc-ng)
 qjs_add_test_suite(quickjs_debugger_tests debugger_test.cpp)
 
 qjs_add_test_suite(quickjs_module_tests modules_test.cpp)
+
+qjs_add_test_suite(quickjs_runtime_tests runtime_test.cpp)
 
 # --- differential corpus ---------------------------------------------------
 #

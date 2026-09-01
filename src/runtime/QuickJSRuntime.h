@@ -368,6 +368,7 @@ class QuickJSRuntime : public jsi::Runtime {
   void registerClasses();
   void releaseNativePayloads() noexcept;
   void drainPendingReleases() noexcept;
+  void rebaselineHeap() noexcept;
   void noteCollection() noexcept;
   void checkCanHoldNativeState(const jsi::Object &object);
   JSValue evalInternal(const char *source) noexcept;
@@ -501,7 +502,9 @@ class QuickJSRuntime : public jsi::Runtime {
   // what says whether anything is still driving JS.
   std::chrono::steady_clock::time_point lastTaskEnd_{};
   std::chrono::steady_clock::time_point pendingSince_{};
-  size_t mallocAfterLastGC_{0};
+  // What heap growth is measured from. Reset by a collection and after each
+  // top-level script, so `grown` means growth since the app last settled.
+  size_t heapBaseline_{0};
   bool startupGCBracketUsed_{false};
   std::mutex pendingMutex_;
   std::vector<JSValue> pendingValues_;
