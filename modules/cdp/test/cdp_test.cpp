@@ -219,6 +219,12 @@ class CDPPauseTest : public CDPTest {
 
   void runScriptOnAnotherThread() {
     thread_ = std::thread([this] {
+      // The engine records the stack bounds of whichever thread created the
+      // runtime, and refuses to run once it believes the stack is exhausted.
+      // Entering from a second thread without this fails immediately with
+      // "Maximum call stack size exceeded" -- on Linux always, on macOS never,
+      // because there the two stacks happen to sit close enough together.
+      JS_UpdateStackTop(rt_);
       JSValue v = JS_Eval(
           ctx_, kSource, strlen(kSource), "app.js", JS_EVAL_TYPE_GLOBAL);
       JS_FreeValue(ctx_, v);
@@ -227,6 +233,9 @@ class CDPPauseTest : public CDPTest {
   }
 
   int32_t readResult() {
+    // Runs back on the test thread, after the script thread pointed the
+    // engine's stack bounds at its own stack.
+    JS_UpdateStackTop(rt_);
     JSValue v = JS_Eval(ctx_, "result", 6, "<check>", JS_EVAL_TYPE_GLOBAL);
     int32_t n = -1;
     JS_ToInt32(ctx_, &n, v);
