@@ -131,12 +131,24 @@ Chrome DevTools attaches over React Native's inspector: breakpoints, stepping,
 call stacks, scope inspection and console. The backend is compiled into debug
 builds and omitted from release builds.
 
+## Bytecode bundles
+
+Release builds compile the JavaScript bundle to QuickJS bytecode, which is what
+the app then loads. Debug builds are untouched -- they load JavaScript from
+Metro. There is nothing to configure.
+
+The compiler is pinned to the engine by `BC_VERSION`, because bytecode is only
+loadable by the engine build that produced it. If the two ever disagree the
+build stops rather than shipping a bundle the app cannot read.
+
+Set `RNQJS_BYTECODE=0` (iOS) or `-PrnqjsBytecode=false` (Android) to ship plain
+JavaScript instead.
+
 ## Known limitations
 
 | | |
 |---|---|
 | **iOS compiles React Native core from source** | `use_quickjs!` sets `RCT_USE_PREBUILT_RNCORE=0`. On the prebuilt path `hermesvm.framework` also carries the JSI implementation, so removing Hermes removes JSI with it. First builds and cold CI are slower. |
-| **No bytecode bundles** | Release bundles ship as plain JavaScript. |
 | **Conditional breakpoints always stop** | A breakpoint `condition` is stored and reported back, never evaluated. |
 | **React Native is patched at `pod install`** | `scripts/react_native_quickjs_pods.rb` applies five workarounds to React Native 0.85's non-Hermes path. Each fails with a named error if React Native changes. |
 
@@ -158,7 +170,7 @@ npm test          # configures, builds, and runs the suites
 | `engine/quickjs-rel/` | Generated: the submodule with the patches applied. This is what ships. |
 | `modules/cdp/` | The Chrome DevTools Protocol backend, in C. See [its README](modules/cdp/README.md). |
 | `cmake/quickjs.cmake` | The quickjs target, shared by the Android and host builds. |
-| `tools/bytecode/` | `qjsc-ng`, the ahead-of-time bytecode compiler. |
+| `tools/bytecode/` | `qjsc`, the ahead-of-time bytecode compiler. |
 | `tests/` | Host suites, Hermes' JSI conformance suite, and the differential corpus. |
 | `example/` | An app that runs on QuickJS, used as the end-to-end check. |
 | `docs/` | The landing page. |
