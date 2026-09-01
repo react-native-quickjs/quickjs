@@ -1,0 +1,130 @@
+Subject: turn the debugger's per-statement callback on and off cheaply
+
+What this does
+  Adds a switch that decides whether the per-statement debugger callback
+  actually runs. Installing a handler still decides whether the traps exist in
+  the compiled code at all; this decides whether they do anything.
+
+Why we need it
+  A debugger has to install its handler before any script is parsed, because
+  that is what puts the traps into the compiled code, and it cannot be undone
+  afterwards. So a debugger stays installed for the whole session -- including
+  the long stretches where it has no breakpoints and nothing to stop on.
+
+  Without a switch, those stretches are expensive. Measured on one of our
+  workloads, per statement:
+
+      no handler installed                      546 ns
+      handler installed but switched off        578 ns
+      handler installed and running             4,040 ns
+
+  Almost all of the cost is the engine working out which source line it is on,
+  which it redoes from the start of the function every single time. An
+  attached but idle DevTools window is the normal state for a whole day of
+  development, so it must not cost anything.
+
+What it adds
+  JS_SetDebugTraceArmed()  - switch the callback on or off.
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  A `debugger;` statement still reaches the handler even when switched off. It
+  has to keep working in an attached-but-idle session, and it is free to keep:
+  those traps exist only where the programmer wrote the keyword, unlike
+  ordinary statement traps which are on every statement.
+
+  Switching ON may be done from any thread, and has to be -- a pause request
+  arrives on the debugger's own thread and must interrupt a runtime that is
+  already running. The flag is atomic and read without ordering, so a late
+  read costs at most one extra statement before the pause, which an
+  asynchronous pause is allowed to do anyway. Switching OFF is only safe from
+  the JavaScript thread. Only this one flag is thread-safe; the context as a
+  whole is not.
+
+diff --git a/quickjs.c b/quickjs.c
+index e19f5b9..d162a8f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -77,6 +77,20 @@
+ #define CONFIG_ATOMICS
+ #endif
+ 
++/* Relaxed atomic access; quickjs-c-atomics.h only provides seq_cst, which
++   would put a barrier on the statement-trap path. */
++#if defined(CONFIG_ATOMICS) && !defined(GCC_BUILTIN_ATOMICS)
++#define js_atomic_load_relaxed(p)       atomic_load_explicit(p, memory_order_relaxed)
++#define js_atomic_store_relaxed(p, v)   atomic_store_explicit(p, v, memory_order_relaxed)
++#elif defined(GCC_BUILTIN_ATOMICS)
++#define js_atomic_load_relaxed(p)       __atomic_load_n(p, __ATOMIC_RELAXED)
++#define js_atomic_store_relaxed(p, v)   __atomic_store_n(p, v, __ATOMIC_RELAXED)
++#else
++/* tcc, emscripten and wasi are single-threaded here */
++#define js_atomic_load_relaxed(p)       (*(p))
++#define js_atomic_store_relaxed(p, v)   (*(p) = (v))
++#endif
++
+ /* Compile in the debugger trap, frame inspection and statement instrumentation. */
+ #ifndef JS_ENABLE_DEBUGGER
+ #define JS_ENABLE_DEBUGGER 1
+@@ -609,6 +623,10 @@ struct JSContext {
+ #if JS_ENABLE_DEBUGGER
+     JSDebugTraceFunc *debug_trace;
+     void *debug_trace_opaque;
++    /* When false, OP_debug consumes its operand and does nothing else.
++       Atomic because arming happens off the JS thread; relaxed is correct,
++       as a stale read only costs one more statement before the pause. */
++    _Atomic bool debug_trace_armed;
+ #endif
+ };
+ 
+@@ -2971,6 +2989,14 @@ void JS_SetDebugTraceHandler(JSContext *ctx, JSDebugTraceFunc *cb, void *opaque)
+ {
+     ctx->debug_trace = cb;
+     ctx->debug_trace_opaque = opaque;
++    /* Installing a handler arms it; clearing it disarms, so the flag is
++       never armed with nothing to call. */
++    js_atomic_store_relaxed(&ctx->debug_trace_armed, cb != NULL);
++}
++
++void JS_SetDebugTraceArmed(JSContext *ctx, bool armed)
++{
++    js_atomic_store_relaxed(&ctx->debug_trace_armed, armed);
+ }
+ 
+ static JSStackFrame *js_get_stack_frame_at_level(JSContext *ctx, int level)
+@@ -18581,7 +18607,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #if JS_ENABLE_DEBUGGER
+             {
+                 int flags = *pc++;
+-                if (unlikely(ctx->debug_trace)) {
++                /* Armed, not merely installed: an attached-but-idle debugger
++                   would otherwise pay find_line_num() on every statement. */
++                if (unlikely(ctx->debug_trace &&
++                             (js_atomic_load_relaxed(&ctx->debug_trace_armed) ||
++                              (flags & JS_DEBUG_TRACE_DEBUGGER_STMT)))) {
+                     int col_num = 0;
+                     int line_num = -1;
+                     /* -2: step back over the flag operand and the opcode */
+diff --git a/quickjs.h b/quickjs.h
+index fbbecc7..c2cb445 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -589,6 +589,16 @@ typedef int JSDebugTraceFunc(JSContext *ctx,
+    disable.  Works with any context, including those created with
+    JS_NewContextRaw.  See JSDebugTraceFunc above for the parse-time
+    instrumentation contract. */
++/* Arm or disarm the statement trace hook. Installing a handler is what causes
++   traps to be emitted at parse time and cannot be undone; this is the cheap
++   switch for whether they do anything when executed. A freshly installed
++   handler is armed. Disarmed, OP_debug falls through, except for a trap
++   carrying JS_DEBUG_TRACE_DEBUGGER_STMT, which always reaches the handler.
++
++   Arming may be called from any thread; disarming is JS thread only. Only
++   this flag is thread-safe, not ctx as a whole. */
++JS_EXTERN void JS_SetDebugTraceArmed(JSContext *ctx, bool armed);
++
+ JS_EXTERN void JS_SetDebugTraceHandler(JSContext *ctx,
+                                        JSDebugTraceFunc *cb,
+                                        void *opaque);

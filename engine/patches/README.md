@@ -15,6 +15,7 @@ what we changed and why without opening a single `.patch` file.
 | `0002` | Lets the app choose when garbage collection runs | Otherwise a collection lands in the middle of a frame and drops it; the worst frame went from 45ms to 3.3ms | `JS_SetGCDeferred`, `JS_HasPendingGC`, `JS_RunPendingGC` | No |
 | `0003` | Lets a debugger pause code, read variables and evaluate expressions | Without it no debugger can attach to an app running on this engine, and `debugger;` does nothing | `JS_SetDebugTraceHandler`, `JS_GetStackDepth`, `JS_GetLocalVariablesAtLevel`, `JS_FreeLocalVariables`, `JS_SetVariableAtLevel`, `JS_EvalInStackFrame` | **Yes** - adds an opcode |
 | `0004` | Lets the debugger ask where each stack frame is | Chrome DevTools shows a full call stack, not just the line that stopped | `JS_GetFrameInfoAtLevel` | No |
+| `0005` | Turns the debugger's per-statement callback on and off cheaply | A debugger must stay installed all session; idle, the callback cost 4,040ns per statement against 546ns with none | `JS_SetDebugTraceArmed` | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Writing a patch header
