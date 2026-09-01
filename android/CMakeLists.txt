@@ -60,18 +60,14 @@ target_link_libraries(quickjsinstancejni
 
 # --- Chrome DevTools Protocol ----------------------------------------------
 #
-# Compiled into debug builds and left out of release builds, testing the same
-# two conditions React Native puts on its own inspector -- see
-# ReactCommon/jsinspector-modern/CMakeLists.txt. The runtime flag,
-# QuickJSRuntimeConfig::enableDebugger, already follows the configuration
-# through QuickJSInstance::debuggerEnabledByDefault(); gating the sources here
-# keeps the two answers in agreement rather than shipping a backend a release
-# build can never reach. -DRNQJS_ENABLE_CDP=ON puts it back either way.
+# In debug builds, out of release builds, which is what
+# QuickJSInstance::debuggerEnabledByDefault() already decides at runtime.
+# -DRNQJS_ENABLE_CDP=ON puts it back.
 #
 # The two sources are compiled here rather than through modules/cdp's own
 # CMakeLists because that file also declares a host test target. Two files is
 # less machinery than teaching it to be cross-compiled.
-if(CMAKE_BUILD_TYPE MATCHES Debug OR REACT_NATIVE_DEBUG_OPTIMIZED)
+if(CMAKE_BUILD_TYPE MATCHES Debug)
   set(RNQJS_CDP_DEFAULT ON)
 else()
   set(RNQJS_CDP_DEFAULT OFF)

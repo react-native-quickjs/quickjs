@@ -77,9 +77,8 @@ Pod::Spec.new do |s|
     # points either way, so a build that compiles them out fails at link rather
     # than at the call site.
     #
-    # RNQJS_ENABLE_CDP is deliberately absent: undefined means the DevTools
-    # backend is not compiled in, and react_native_quickjs_post_install defines
-    # it for debug configurations only.
+    # RNQJS_ENABLE_CDP is absent on purpose: undefined means no DevTools
+    # backend, and react_native_quickjs_post_install defines it for debug only.
     "GCC_PREPROCESSOR_DEFINITIONS" =>
       "$(inherited) _GNU_SOURCE=1 JS_ENABLE_DEBUGGER=1",
     "USE_HEADERMAP" => "YES",

@@ -5,8 +5,7 @@ require Pod::Executable.execute_command('node', ['-p',
     {paths: [process.argv[1]]},
   )', __dir__]).strip
 
-# Runs JavaScript on QuickJS. See scripts/react_native_quickjs_pods.rb for what
-# use_quickjs! removes and why a post_install hook cannot do it.
+# Runs JavaScript on QuickJS. See scripts/react_native_quickjs_pods.rb.
 require_relative '../../scripts/react_native_quickjs_pods.rb'
 
 platform :ios, min_ios_version_supported
@@ -21,8 +20,7 @@ end
 target 'ReactNativeQuickjsExample' do
   config = use_native_modules!
 
-  # Must precede use_react_native!: it replaces functions that call runs while
-  # the podspecs are being evaluated.
+  # Must precede use_react_native!, which reads what this sets.
   use_quickjs!
 
   use_react_native!(

@@ -104,7 +104,6 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
-    // Neither Hermes nor JavaScriptCore. The template picks one of them here,
-    // but this app runs on QuickJS, so either one would be a second engine
-    // that nothing ever loads -- libjsc.so alone is 10 MB per architecture.
+    // Neither Hermes nor JavaScriptCore: this app runs on QuickJS, and either
+    // would be a second engine nothing loads -- libjsc.so is 10 MB per ABI.
 }
