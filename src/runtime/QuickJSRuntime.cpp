@@ -1090,6 +1090,13 @@ jsi::Value QuickJSRuntime::evaluateJavaScript(
 std::shared_ptr<const jsi::PreparedJavaScript>
 QuickJSRuntime::prepareJavaScript(
     const std::shared_ptr<const jsi::Buffer> &buffer, std::string sourceURL) {
+  // Compiling is an engine entry like any other, and it recurses: the parser
+  // descends once per nesting level. Without this the recursion bound is still
+  // keyed to whichever thread built the runtime, and a script prepared on the
+  // JS thread before anything has evaluated runs off the end of its stack.
+  adoptCurrentThread();
+  drainPendingReleases();
+
   const uint8_t *data = buffer->data();
   const size_t size = buffer->size();
 

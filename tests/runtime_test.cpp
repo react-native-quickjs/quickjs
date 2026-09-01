@@ -4,9 +4,12 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Runtime behaviour that is not part of the JSI surface. It is invisible from
- * JavaScript and fails silently: a collection that never runs looks like a
- * memory leak, not like a scheduling bug.
+ * Runtime behaviour that is not part of the JSI surface: when a deferred
+ * collection is allowed to run, and which thread the engine believes it is on.
+ *
+ * Both are invisible from JavaScript and both have failed silently before --
+ * a collection that never runs looks like a memory leak, and a stale thread
+ * binding looks like a random stack overflow.
  */
 
 #include <gtest/gtest.h>
@@ -108,4 +111,64 @@ TEST(GCScheduling, RunPendingGCCollectsUnconditionally) {
 
   runtime.runPendingGC();
   EXPECT_FALSE(JS_HasPendingGC(runtime.runtime()));
+}
+
+/*
+ * React Native builds the runtime on one thread and runs JavaScript on another.
+ * Two things are keyed to the thread the engine believes it is on: the
+ * recursion bound, which quickjs derives from a stack pointer captured at
+ * construction, and the choice between freeing a value inline and queueing it.
+ *
+ * Getting the first wrong is not a clean failure. The bound is compared against
+ * a stack that no longer exists, so it either rejects every call or -- worse --
+ * sits past the end of the real stack and the next deep recursion runs off it.
+ */
+TEST(RuntimeThread, EvaluateAdoptsTheCallingThread) {
+  qjs::QuickJSRuntime runtime{qjs::QuickJSRuntimeConfig{}};
+  bool adopted = false;
+  std::thread worker([&] {
+    eval(runtime, "1 + 1");
+    adopted = runtime.isOnJSThread();
+  });
+  worker.join();
+  EXPECT_TRUE(adopted);
+}
+
+TEST(RuntimeThread, PrepareJavaScriptAdoptsTheCallingThread) {
+  // Compiling recurses once per nesting level, so it needs a bound keyed to the
+  // stack it is actually running on just as much as evaluating does.
+  qjs::QuickJSRuntime runtime{qjs::QuickJSRuntimeConfig{}};
+  bool adopted = false;
+  std::thread worker([&] {
+    runtime.prepareJavaScript(
+        std::make_shared<jsi::StringBuffer>(std::string("1 + 1")), "p.js");
+    adopted = runtime.isOnJSThread();
+  });
+  worker.join();
+  EXPECT_TRUE(adopted);
+}
+
+TEST(RuntimeThread, DeepCompilationOnAWorkerThrowsRatherThanCrashing) {
+  /*
+   * A worker thread's stack is much smaller than the one the runtime was built
+   * on -- 512 KB against 8 MB on macOS. With the bound still keyed to the
+   * constructing thread, compiling something deeply nested here overruns the
+   * real stack and takes the process with it. The engine must run out of budget
+   * before it runs out of stack, so this has to be a catchable error.
+   */
+  qjs::QuickJSRuntime runtime{qjs::QuickJSRuntimeConfig{}};
+  const std::string deep = std::string(400, '(') + "1" + std::string(400, ')');
+
+  bool threwOrCompiled = false;
+  std::thread worker([&] {
+    try {
+      runtime.prepareJavaScript(
+          std::make_shared<jsi::StringBuffer>(deep), "deep.js");
+      threwOrCompiled = true;  // enough stack for it; also fine
+    } catch (const jsi::JSError &) {
+      threwOrCompiled = true;
+    }
+  });
+  worker.join();
+  EXPECT_TRUE(threwOrCompiled);
 }
