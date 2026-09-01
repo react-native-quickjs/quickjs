@@ -23,6 +23,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const diffPreview = require('./diff-preview.js');
 const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
@@ -194,9 +195,18 @@ if (check) {
   }
 
   if (stale.length > 0) {
+    const previews = stale
+      .filter((name) => name !== 'MANIFEST.json')
+      .map((name) => {
+        const file = path.join(dst, name);
+        const actual = fs.existsSync(file) ? fs.readFileSync(file) : '';
+        return diffPreview(contents[name], actual, name);
+      });
+
     fail(
       'engine/quickjs-rel is out of date with engine/quickjs-ng + engine/patches.\n\n' +
         stale.map((name) => `  ${name}`).join('\n') +
+        (previews.length > 0 ? '\n\n' + previews.join('\n\n') : '') +
         '\n\nRun: node scripts/sync-quickjs-rel.js'
     );
   }
