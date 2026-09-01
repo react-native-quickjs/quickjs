@@ -27,11 +27,12 @@ class InspectorSession : public RuntimeAgentDelegate {
  public:
   InspectorSession(
       QuickJSInspectorDelegate &owner, QJSCDPAgent *agent,
-      FrontendChannel channel, RuntimeExecutor executor)
+      FrontendChannel channel, RuntimeExecutor executor, bool debuggerEnabled)
       : owner_(owner),
         agent_(agent),
         channel_(std::move(channel)),
-        executor_(std::move(executor)) {}
+        executor_(std::move(executor)),
+        debuggerEnabled_(debuggerEnabled) {}
 
   ~InspectorSession() override {
     owner_.forget(this);
@@ -40,6 +41,16 @@ class InspectorSession : public RuntimeAgentDelegate {
   bool handleRequest(const cdp::PreparsedRequest &req) override {
     if (!qjs_cdp_handles(req.method.c_str())) {
       return false;
+    }
+    // Enabling a domain is per session, not per runtime: one frontend can be
+    // watching the debugger while another is not, and sending Debugger events
+    // to the second is a message it never asked for.
+    if (req.method == "Debugger.enable") {
+      debuggerEnabled_ = true;
+      owner_.debuggerEnabledChanged();
+    } else if (req.method == "Debugger.disable") {
+      debuggerEnabled_ = false;
+      owner_.debuggerEnabledChanged();
     }
     const std::string json = req.toJson();
     qjs_cdp_send_message(agent_, this, json.c_str(), json.size());
@@ -51,7 +62,18 @@ class InspectorSession : public RuntimeAgentDelegate {
     return true;
   }
 
+  /// Handed to the agent that replaces this one when the runtime is reloaded.
+  std::unique_ptr<ExportedState> getExportedState() override;
+
+  bool debuggerEnabled() const {
+    return debuggerEnabled_;
+  }
+
   void deliver(std::string_view message) const {
+    if (!debuggerEnabled_ &&
+        message.find("\"method\":\"Debugger.") != std::string_view::npos) {
+      return;
+    }
     channel_(message);
   }
 
@@ -60,9 +82,24 @@ class InspectorSession : public RuntimeAgentDelegate {
   QJSCDPAgent *agent_;
   FrontendChannel channel_;
   RuntimeExecutor executor_;
+  bool debuggerEnabled_;
 };
 
 namespace {
+
+/// The debugger state that outlives one runtime: whether it was enabled, and
+/// the breakpoints the frontend believes it has set.
+class CarriedState : public RuntimeAgentDelegate::ExportedState {
+ public:
+  explicit CarriedState(std::string json) : json_(std::move(json)) {}
+
+  const std::string &json() const {
+    return json_;
+  }
+
+ private:
+  std::string json_;
+};
 
 /// A captured stack, kept as the JSON the frontend will eventually be given.
 /// Capture happens on the JS thread while the frames are alive; serialization
@@ -80,6 +117,83 @@ class CapturedStack : public StackTrace {
 };
 
 }  // namespace
+
+namespace {
+
+const char *consoleTypeName(ConsoleAPIType type) {
+  switch (type) {
+    case ConsoleAPIType::kLog:
+      return "log";
+    case ConsoleAPIType::kDebug:
+      return "debug";
+    case ConsoleAPIType::kInfo:
+      return "info";
+    case ConsoleAPIType::kError:
+      return "error";
+    case ConsoleAPIType::kWarning:
+      return "warning";
+    case ConsoleAPIType::kDir:
+      return "dir";
+    case ConsoleAPIType::kDirXML:
+      return "dirxml";
+    case ConsoleAPIType::kTable:
+      return "table";
+    case ConsoleAPIType::kTrace:
+      return "trace";
+    case ConsoleAPIType::kStartGroup:
+      return "startGroup";
+    case ConsoleAPIType::kStartGroupCollapsed:
+      return "startGroupCollapsed";
+    case ConsoleAPIType::kEndGroup:
+      return "endGroup";
+    case ConsoleAPIType::kClear:
+      return "clear";
+    case ConsoleAPIType::kAssert:
+      return "assert";
+    case ConsoleAPIType::kTimeEnd:
+      return "timeEnd";
+    case ConsoleAPIType::kCount:
+      return "count";
+    default:
+      return "log";
+  }
+}
+
+}  // namespace
+
+bool QuickJSInspectorDelegate::supportsConsole() const {
+  // True, and that is the switch: with it React Native stops using its own
+  // string-only fallback and routes console calls through here, where each
+  // argument becomes a real remote object the frontend can expand.
+  return true;
+}
+
+void QuickJSInspectorDelegate::addConsoleMessage(
+    facebook::jsi::Runtime &runtime, ConsoleMessage message) {
+  auto &quickjs = dynamic_cast<QuickJSRuntime &>(runtime);
+
+  // toJSValue borrows -- the jsi::Value still owns the reference -- which is
+  // what the agent wants, since it only reads each argument to describe it.
+  std::vector<JSValue> args;
+  args.reserve(message.args.size());
+  for (const facebook::jsi::Value &arg : message.args) {
+    args.push_back(quickjs.toJSValue(arg));
+  }
+
+  qjs_cdp_console_message(
+      agent_, consoleTypeName(message.type), args.data(), (int)args.size());
+}
+
+std::unique_ptr<RuntimeAgentDelegate::ExportedState>
+InspectorSession::getExportedState() {
+  char *json = qjs_cdp_export_state(agent_);
+  if (!json) {
+    return std::make_unique<ExportedState>();
+  }
+  auto carried = std::make_unique<CarriedState>(std::string(json));
+  free(json);
+  return carried;
+}
 
 std::unique_ptr<StackTrace> QuickJSInspectorDelegate::captureStackTrace(
     facebook::jsi::Runtime &runtime, size_t framesToSkip) {
@@ -134,14 +248,23 @@ QuickJSInspectorDelegate::createAgentDelegate(
     const ExecutionContextDescription &executionContextDescription,
     RuntimeExecutor runtimeExecutor) {
   (void)sessionState;
-  (void)previouslyExportedState;
+
+  // A reload replaces the runtime without telling the frontend, so the
+  // breakpoints it set have to be carried over to the agent that takes over.
+  if (auto *carried =
+          dynamic_cast<CarriedState *>(previouslyExportedState.get())) {
+    qjs_cdp_import_state(agent_, carried->json().c_str());
+  }
 
   // React Native assigns the execution context id, and the frontend addresses
   // requests to it by number.
   qjs_cdp_set_execution_context(agent_, executionContextDescription.id);
 
+  // A reload replaces the agent but not the frontend, so a session that had
+  // the debugger enabled before still has it enabled after.
   auto session = std::make_unique<InspectorSession>(
-      *this, agent_, std::move(channel), std::move(runtimeExecutor));
+      *this, agent_, std::move(channel), std::move(runtimeExecutor),
+      qjs_cdp_debugger_enabled(agent_));
   {
     std::lock_guard<std::mutex> guard(lock_);
     sessions_.push_back(session.get());
@@ -150,10 +273,26 @@ QuickJSInspectorDelegate::createAgentDelegate(
 }
 
 void QuickJSInspectorDelegate::forget(InspectorSession *session) {
-  std::lock_guard<std::mutex> guard(lock_);
-  sessions_.erase(
-      std::remove(sessions_.begin(), sessions_.end(), session),
-      sessions_.end());
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    sessions_.erase(
+        std::remove(sessions_.begin(), sessions_.end(), session),
+        sessions_.end());
+  }
+  debuggerEnabledChanged();
+}
+
+/// The debugger is on for the runtime when it is on for anybody. One frontend
+/// turning it off must not stop the statement traps another is relying on.
+void QuickJSInspectorDelegate::debuggerEnabledChanged() {
+  bool any = false;
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    for (const auto *session : sessions_) {
+      any = any || session->debuggerEnabled();
+    }
+  }
+  qjs_cdp_set_debugger_enabled(agent_, any);
 }
 
 void QuickJSInspectorDelegate::scriptLoaded(

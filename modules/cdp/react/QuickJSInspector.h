@@ -53,6 +53,12 @@ class QuickJSInspectorDelegate : public facebook::react::jsinspector_modern::
           &executionContextDescription,
       facebook::react::RuntimeExecutor runtimeExecutor) override;
 
+  void addConsoleMessage(
+      facebook::jsi::Runtime &runtime,
+      facebook::react::jsinspector_modern::ConsoleMessage message) override;
+
+  bool supportsConsole() const override;
+
   std::unique_ptr<facebook::react::jsinspector_modern::StackTrace>
   captureStackTrace(
       facebook::jsi::Runtime &runtime, size_t framesToSkip) override;
@@ -68,6 +74,10 @@ class QuickJSInspectorDelegate : public facebook::react::jsinspector_modern::
   /// Called by a session as it goes away, so that a reply can never be routed
   /// to a frontend that has disconnected.
   void forget(InspectorSession *session);
+
+  /// Recomputes whether any session still wants the debugger, and tells the
+  /// agent. Called whenever a session enables, disables, or goes away.
+  void debuggerEnabledChanged();
 
  private:
   static void deliver(
