@@ -275,6 +275,19 @@ struct HostFunctionHandlers {
   }
 };
 
+struct NativeStateProxy {
+  NativePayloadLink link;  // must stay first
+  std::shared_ptr<jsi::NativeState> state;
+};
+
+void nativeStateFinalizer(JSRuntime *rt, JSValueConst value) {
+  auto *runtime = static_cast<QuickJSRuntime *>(JS_GetRuntimeOpaque(rt));
+  auto *proxy = static_cast<NativeStateProxy *>(
+      JS_GetOpaque(value, runtime->nativeStateClassID()));
+  runtime->unregisterNativeState(proxy);
+  delete proxy;
+}
+
 /// Keeps a jsi::MutableBuffer alive for as long as the ArrayBuffer pointing
 /// into it.
 struct ArrayBufferProxy {
@@ -287,6 +300,9 @@ void freeArrayBufferProxy(JSRuntime * /*rt*/, void *opaque, void * /*ptr*/) {
 
 const char *kEnumeratePropertyNamesSource =
     "(function (o) { const r = []; for (const k in o) r.push(k); return r; })";
+const char *kSymbolToStringSource = "(function (s) { return s.toString(); })";
+const char *kBigIntToStringSource =
+    "(function (b, radix) { return b.toString(radix); })";
 
 [[noreturn]] void notImplemented(const char *what) {
   throw jsi::JSINativeException(
@@ -321,6 +337,24 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
 
   registerClasses();
   enumeratePropertyNames_ = evalInternal(kEnumeratePropertyNamesSource);
+  symbolToString_ = evalInternal(kSymbolToStringSource);
+  bigIntToString_ = evalInternal(kBigIntToStringSource);
+
+  // WeakMap has no C API, so reach for the JS-visible constructor once.
+  JSValue global = JS_GetGlobalObject(context_);
+  JSValue weakMapConstructor = JS_GetPropertyStr(context_, global, "WeakMap");
+  if (JS_IsObject(weakMapConstructor)) {
+    nativeStateMap_ =
+        JS_CallConstructor(context_, weakMapConstructor, 0, nullptr);
+    JSValue proto =
+        JS_GetPropertyStr(context_, weakMapConstructor, "prototype");
+    weakMapGet_ = JS_GetPropertyStr(context_, proto, "get");
+    weakMapSet_ = JS_GetPropertyStr(context_, proto, "set");
+    weakMapHas_ = JS_GetPropertyStr(context_, proto, "has");
+    JS_FreeValue(context_, proto);
+  }
+  JS_FreeValue(context_, weakMapConstructor);
+  JS_FreeValue(context_, global);
 }
 
 void QuickJSRuntime::registerClasses() {
@@ -337,6 +371,12 @@ void QuickJSRuntime::registerClasses() {
   hostFunctionDef.finalizer = HostFunctionHandlers::finalizer;
   hostFunctionDef.call = HostFunctionHandlers::call;
   JS_NewClass(runtime_, hostFunctionClassID_, &hostFunctionDef);
+
+  JS_NewClassID(runtime_, &nativeStateClassID_);
+  JSClassDef nativeStateDef = {};
+  nativeStateDef.class_name = "NativeState";
+  nativeStateDef.finalizer = nativeStateFinalizer;
+  JS_NewClass(runtime_, nativeStateClassID_, &nativeStateDef);
 
   // Host functions must be indistinguishable from JS functions: without
   // Function.prototype, `instanceof Function` is false and bind/call/apply are
@@ -356,6 +396,14 @@ void QuickJSRuntime::registerHostObject(void *proxy) {
 
 void QuickJSRuntime::unregisterHostObject(void *proxy) {
   payloadUnlink(hostObjectProxies_, proxy);
+}
+
+void QuickJSRuntime::registerNativeState(void *proxy) {
+  payloadLink(nativeStateProxies_, proxy);
+}
+
+void QuickJSRuntime::unregisterNativeState(void *proxy) {
+  payloadUnlink(nativeStateProxies_, proxy);
 }
 
 void QuickJSRuntime::registerHostFunction(void *proxy) {
@@ -382,6 +430,12 @@ void QuickJSRuntime::releaseNativePayloads() noexcept {
     reinterpret_cast<HostFunctionProxy *>(l)->function = nullptr;
     l = next;
   }
+  for (auto *l = static_cast<NativePayloadLink *>(nativeStateProxies_);
+       l != nullptr;) {
+    auto *next = l->next;
+    reinterpret_cast<NativeStateProxy *>(l)->state.reset();
+    l = next;
+  }
 }
 
 /// Undefined rather than throwing: a runtime that cannot build a helper is
@@ -401,6 +455,12 @@ QuickJSRuntime::~QuickJSRuntime() {
   drainPendingReleases();
   releaseNativePayloads();
   JS_FreeValue(context_, enumeratePropertyNames_);
+  JS_FreeValue(context_, symbolToString_);
+  JS_FreeValue(context_, bigIntToString_);
+  JS_FreeValue(context_, nativeStateMap_);
+  JS_FreeValue(context_, weakMapGet_);
+  JS_FreeValue(context_, weakMapSet_);
+  JS_FreeValue(context_, weakMapHas_);
 
   if (context_ != nullptr) {
     JS_FreeContext(context_);
@@ -961,32 +1021,79 @@ bool QuickJSRuntime::compare(
   return toJSAtom(a) == toJSAtom(b);
 }
 
-std::string QuickJSRuntime::symbolToString(const jsi::Symbol &) {
-  notImplemented("symbolToString");
+std::string QuickJSRuntime::symbolToString(const jsi::Symbol &symbol) {
+  JSValue argument = toJSValue(symbol);
+  JSValue result =
+      JS_Call(context_, symbolToString_, JS_UNDEFINED, 1, &argument);
+  checkException(result);
+
+  size_t length = 0;
+  const char *chars = JS_ToCStringLen(context_, &length, result);
+  JS_FreeValue(context_, result);
+  if (chars == nullptr) {
+    throwPendingError();
+  }
+  std::string string(chars, length);
+  JS_FreeCString(context_, chars);
+  return string;
 }
 
-jsi::BigInt QuickJSRuntime::createBigIntFromInt64(int64_t) {
-  notImplemented("createBigIntFromInt64");
+jsi::BigInt QuickJSRuntime::createBigIntFromInt64(int64_t value) {
+  JSValue bigint = JS_NewBigInt64(context_, value);
+  checkException(bigint);
+  return make<jsi::BigInt>(allocPointerValue(bigint));
 }
 
-jsi::BigInt QuickJSRuntime::createBigIntFromUint64(uint64_t) {
-  notImplemented("createBigIntFromUint64");
+jsi::BigInt QuickJSRuntime::createBigIntFromUint64(uint64_t value) {
+  JSValue bigint = JS_NewBigUint64(context_, value);
+  checkException(bigint);
+  return make<jsi::BigInt>(allocPointerValue(bigint));
 }
 
-bool QuickJSRuntime::bigintIsInt64(const jsi::BigInt &) {
-  notImplemented("bigintIsInt64");
+bool QuickJSRuntime::bigintIsInt64(const jsi::BigInt &bigint) {
+  int64_t truncated = 0;
+  if (JS_ToBigInt64(context_, &truncated, toJSValue(bigint)) != 0) {
+    JS_FreeValue(context_, JS_GetException(context_));
+    return false;
+  }
+  // JS_ToBigInt64 wraps rather than failing, so round-trip to detect loss.
+  JSValue roundTrip = JS_NewBigInt64(context_, truncated);
+  bool fits = JS_IsStrictEqual(context_, roundTrip, toJSValue(bigint));
+  JS_FreeValue(context_, roundTrip);
+  return fits;
 }
 
-bool QuickJSRuntime::bigintIsUint64(const jsi::BigInt &) {
-  notImplemented("bigintIsUint64");
+bool QuickJSRuntime::bigintIsUint64(const jsi::BigInt &bigint) {
+  uint64_t truncated = 0;
+  if (JS_ToBigUint64(context_, &truncated, toJSValue(bigint)) != 0) {
+    JS_FreeValue(context_, JS_GetException(context_));
+    return false;
+  }
+  JSValue roundTrip = JS_NewBigUint64(context_, truncated);
+  bool fits = JS_IsStrictEqual(context_, roundTrip, toJSValue(bigint));
+  JS_FreeValue(context_, roundTrip);
+  return fits;
 }
 
-uint64_t QuickJSRuntime::truncate(const jsi::BigInt &) {
-  notImplemented("truncate");
+uint64_t QuickJSRuntime::truncate(const jsi::BigInt &bigint) {
+  uint64_t truncated = 0;
+  if (JS_ToBigUint64(context_, &truncated, toJSValue(bigint)) != 0) {
+    throwPendingError();
+  }
+  return truncated;
 }
 
-jsi::String QuickJSRuntime::bigintToString(const jsi::BigInt &, int) {
-  notImplemented("bigintToString");
+jsi::String QuickJSRuntime::bigintToString(
+    const jsi::BigInt &bigint, int radix) {
+  if (radix < 2 || radix > 36) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: radix must be between 2 and 36");
+  }
+  JSValue arguments[2] = {toJSValue(bigint), JS_NewInt32(context_, radix)};
+  JSValue result =
+      JS_Call(context_, bigIntToString_, JS_UNDEFINED, 2, arguments);
+  checkException(result);
+  return createStringFrom(result);
 }
 
 jsi::String QuickJSRuntime::createStringFromAscii(
@@ -1079,18 +1186,57 @@ jsi::Value QuickJSRuntime::getPrototypeOf(const jsi::Object &object) {
       checkException(JS_GetPrototype(context_, toJSValue(object))));
 }
 
-bool QuickJSRuntime::hasNativeState(const jsi::Object &) {
-  notImplemented("hasNativeState");
+bool QuickJSRuntime::hasNativeState(const jsi::Object &object) {
+  if (!JS_IsObject(nativeStateMap_)) {
+    return false;
+  }
+  JSValue key = toJSValue(object);
+  JSValue present = JS_Call(context_, weakMapHas_, nativeStateMap_, 1, &key);
+  checkException(present);
+  bool result = JS_ToBool(context_, present) > 0;
+  JS_FreeValue(context_, present);
+  return result;
 }
 
 std::shared_ptr<jsi::NativeState> QuickJSRuntime::getNativeState(
-    const jsi::Object &) {
-  notImplemented("getNativeState");
+    const jsi::Object &object) {
+  if (!JS_IsObject(nativeStateMap_)) {
+    throw jsi::JSINativeException("QuickJSRuntime: object has no native state");
+  }
+  JSValue key = toJSValue(object);
+  JSValue holder = JS_Call(context_, weakMapGet_, nativeStateMap_, 1, &key);
+  checkException(holder);
+
+  auto *proxy = static_cast<NativeStateProxy *>(
+      JS_GetOpaque(holder, nativeStateClassID_));
+  JS_FreeValue(context_, holder);
+  if (proxy == nullptr) {
+    throw jsi::JSINativeException("QuickJSRuntime: object has no native state");
+  }
+  // May be null: JSI allows clearing the state, after which hasNativeState
+  // still reports true.
+  return proxy->state;
 }
 
 void QuickJSRuntime::setNativeState(
-    const jsi::Object &, std::shared_ptr<jsi::NativeState>) {
-  notImplemented("setNativeState");
+    const jsi::Object &object, std::shared_ptr<jsi::NativeState> state) {
+  if (!JS_IsObject(nativeStateMap_)) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: WeakMap is unavailable in this context");
+  }
+
+  JSValue holder = JS_NewObjectClass(context_, nativeStateClassID_);
+  checkException(holder);
+  auto *proxy = new NativeStateProxy{{}, std::move(state)};
+  registerNativeState(proxy);
+  JS_SetOpaque(holder, proxy);
+
+  JSValue arguments[2] = {toJSValue(object), holder};
+  JSValue result =
+      JS_Call(context_, weakMapSet_, nativeStateMap_, 2, arguments);
+  JS_FreeValue(context_, holder);
+  checkException(result);
+  JS_FreeValue(context_, result);
 }
 
 jsi::Value QuickJSRuntime::getProperty(

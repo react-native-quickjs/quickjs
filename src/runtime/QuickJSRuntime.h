@@ -154,6 +154,8 @@ class QuickJSRuntime : public jsi::Runtime {
   void unregisterHostObject(void *proxy);
   void registerHostFunction(void *proxy);
   void unregisterHostFunction(void *proxy);
+  void registerNativeState(void *proxy);
+  void unregisterNativeState(void *proxy);
 
   /// Public because the class callbacks are free functions.
   JSClassID hostObjectClassID() const noexcept {
@@ -161,6 +163,9 @@ class QuickJSRuntime : public jsi::Runtime {
   }
   JSClassID hostFunctionClassID() const noexcept {
     return hostFunctionClassID_;
+  }
+  JSClassID nativeStateClassID() const noexcept {
+    return nativeStateClassID_;
   }
 
   // jsi::Runtime -- public API
@@ -443,14 +448,26 @@ class QuickJSRuntime : public jsi::Runtime {
 
   JSClassID hostObjectClassID_{0};
   JSClassID hostFunctionClassID_{0};
+  JSClassID nativeStateClassID_{0};
 
   // Intrusive list heads of the live native payloads, held as void* to keep the
   // payload types private to the implementation.
   void *hostObjectProxies_{nullptr};
   void *hostFunctionProxies_{nullptr};
+  void *nativeStateProxies_{nullptr};
 
   // Engine facilities with no C API, evaluated once at startup.
   JSValue enumeratePropertyNames_{JS_UNDEFINED};
+  JSValue symbolToString_{JS_UNDEFINED};
+  JSValue bigIntToString_{JS_UNDEFINED};
+
+  // NativeState lives in a runtime-private WeakMap rather than a property: a
+  // property, even symbol-keyed and non-enumerable, is reachable through
+  // Object.getOwnPropertySymbols and can be clobbered by script.
+  JSValue nativeStateMap_{JS_UNDEFINED};
+  JSValue weakMapGet_{JS_UNDEFINED};
+  JSValue weakMapSet_{JS_UNDEFINED};
+  JSValue weakMapHas_{JS_UNDEFINED};
 
   QuickJSPointerValue *freeValues_{nullptr};
   QuickJSAtomPointerValue *freeAtoms_{nullptr};
