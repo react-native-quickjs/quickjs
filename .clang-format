@@ -10,3 +10,7 @@ IndentWidth: 2
 PointerAlignment: Right
 SpaceAfterCStyleCast: false
 Standard: c++20
+# Format code, leave prose alone. Comments here lay out tables and indented
+# continuations by hand, and reflowing them to the column limit strips that
+# structure and makes them harder to read, not easier.
+ReflowComments: false
