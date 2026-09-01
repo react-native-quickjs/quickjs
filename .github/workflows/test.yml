@@ -43,7 +43,7 @@ jobs:
           cmake --build build -j"$(nproc)"
 
       - name: Test
-        run: ctest --test-dir build -j4 --output-on-failure --output-junit results.xml
+        run: ctest --test-dir build --timeout 300 -j4 --output-on-failure --output-junit results.xml
 
       # Runs even when the tests failed -- that is when the report is worth
       # reading. It exits non-zero on a failure, so the job still fails.
@@ -102,7 +102,7 @@ jobs:
           # runs there rather than on macOS, where it does not exist.
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1
-        run: ctest --test-dir build -j2 --output-on-failure -E '${{ matrix.skip }}' --output-junit results.xml
+        run: ctest --test-dir build --timeout 300 -j2 --output-on-failure -E '${{ matrix.skip }}' --output-junit results.xml
 
       - name: Report
         if: always()
