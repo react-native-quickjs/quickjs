@@ -92,8 +92,7 @@ function touchedFiles(patches) {
 }
 
 /*
- * Builds "upstream plus the whole series" in a scratch directory and returns
- * its path, or null if some patch does not apply.
+ * Builds "upstream plus the whole series" in a scratch directory.
  *
  * The series is stacked: each patch is cut against the tree with the previous
  * ones already applied. That makes a per-patch check meaningless -- reversing
@@ -103,11 +102,15 @@ function touchedFiles(patches) {
  */
 function buildExpected(patches, files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnqjs-patches-'));
+  const abort = (message) => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fail(message);
+  };
+
   for (const file of files) {
     const blob = git(['show', `HEAD:${file}`], { encoding: 'buffer' });
     if (blob.status !== 0) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      fail(`engine/quickjs-ng has no ${file} at HEAD; the submodule may have moved.`);
+      abort(`engine/quickjs-ng has no ${file} at HEAD; the submodule may have moved.`);
     }
     fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
     fs.writeFileSync(path.join(dir, file), blob.stdout);
@@ -119,11 +122,13 @@ function buildExpected(patches, files) {
       encoding: 'utf8',
     });
     if (result.status !== 0) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      return { dir: null, failed: patch, stderr: result.stderr };
+      abort(
+        `${patch} does not apply to upstream plus the patches before it.\n` +
+          result.stderr
+      );
     }
   }
-  return { dir, failed: null, stderr: '' };
+  return dir;
 }
 
 /* Which of `files` in the submodule working tree differ from `dir`. */
@@ -138,12 +143,7 @@ function diverged(dir, files) {
 
 /* Whether the working tree is still exactly upstream for these files. */
 function isPristine(files) {
-  return files.every((file) => {
-    const blob = git(['show', `HEAD:${file}`], { encoding: 'buffer' });
-    if (blob.status !== 0) return false;
-    const onDisk = path.join(submodule, file);
-    return fs.existsSync(onDisk) && blob.stdout.equals(fs.readFileSync(onDisk));
-  });
+  return git(['diff', '--quiet', 'HEAD', '--', ...files]).status === 0;
 }
 
 // --- the two series rules --------------------------------------------------
@@ -241,18 +241,22 @@ if (mode !== 'reverse') {
   checkBytecodeRule(patches);
 }
 
+/* --reverse needs no scratch tree: it just unwinds the series in place. */
+if (mode === 'reverse') {
+  for (const patch of [...patches].reverse()) {
+    const result = git(['apply', '--reverse', path.join(patchDir, patch)]);
+    if (result.status !== 0) fail(`could not reverse ${patch}\n${result.stderr}`);
+  }
+  console.log(`[apply-patches] reversed ${patches.length} patch(es)`);
+  process.exit(0);
+}
+
 const files = touchedFiles(patches);
 const expected = buildExpected(patches, files);
+const stale = diverged(expected, files);
+fs.rmSync(expected, { recursive: true, force: true });
 
 if (mode === 'check') {
-  if (expected.dir === null) {
-    fail(
-      `${expected.failed} does not apply to upstream plus the patches before it.\n` +
-        expected.stderr
-    );
-  }
-  const stale = diverged(expected.dir, files);
-  fs.rmSync(expected.dir, { recursive: true, force: true });
   if (stale.length > 0) {
     fail(
       'engine/quickjs-ng does not match upstream plus engine/patches.\n\n' +
@@ -264,34 +268,12 @@ if (mode === 'check') {
   process.exit(0);
 }
 
-if (mode === 'reverse') {
-  for (const patch of [...patches].reverse()) {
-    const result = git(['apply', '--reverse', path.join(patchDir, patch)]);
-    if (result.status !== 0) {
-      fail(`could not reverse ${patch}\n${result.stderr}`);
-    }
-  }
-  if (expected.dir) fs.rmSync(expected.dir, { recursive: true, force: true });
-  console.log(`[apply-patches] reversed ${patches.length} patch(es)`);
-  process.exit(0);
-}
-
-// apply
-if (expected.dir === null) {
-  fail(
-    `${expected.failed} does not apply to upstream plus the patches before it.\n` +
-      expected.stderr
-  );
-}
-
-if (diverged(expected.dir, files).length === 0) {
-  fs.rmSync(expected.dir, { recursive: true, force: true });
+if (stale.length === 0) {
   console.log(`[apply-patches] already applied (${patches.length} patches)`);
   process.exit(0);
 }
 
 if (!isPristine(files)) {
-  fs.rmSync(expected.dir, { recursive: true, force: true });
   fail(
     'engine/quickjs-ng is neither upstream nor fully patched.\n' +
       'Run: node scripts/apply-patches.js --reverse\n' +
@@ -303,5 +285,4 @@ for (const patch of patches) {
   const result = git(['apply', path.join(patchDir, patch)]);
   if (result.status !== 0) fail(`could not apply ${patch}\n${result.stderr}`);
 }
-fs.rmSync(expected.dir, { recursive: true, force: true });
 console.log(`[apply-patches] applied ${patches.length} patch(es)`);

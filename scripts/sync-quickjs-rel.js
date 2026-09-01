@@ -9,25 +9,15 @@
  *   node scripts/sync-quickjs-rel.js            regenerate
  *   node scripts/sync-quickjs-rel.js --check    exit non-zero if out of date
  *
- * There are two copies of the engine and they have different jobs.
+ * There are two copies of the engine. engine/quickjs-ng is the submodule --
+ * upstream, plus whatever engine/patches has been applied to its working tree,
+ * and where engine development happens. engine/quickjs-rel is a committed,
+ * pre-patched copy: what cmake compiles and what npm packs.
  *
- *   engine/quickjs-ng    the git submodule. Upstream, plus whatever
- *                        engine/patches has been applied to its WORKING TREE.
- *                        This is where engine development happens.
- *
- *   engine/quickjs-rel   a committed, pre-patched copy. This is what cmake
- *                        compiles and what npm packs.
- *
- * The submodule cannot be the thing that ships, for two reasons that both end
- * in an engine which still compiles -- so neither announces itself:
- *
- *   - our patches live in the submodule's WORKING TREE, and
- *     `git submodule update` reverts them;
- *   - npm does not pack submodules at all, so a consumer installing the
- *     tarball would get an empty directory.
- *
- * Compiling the committed copy means the sources under test are the sources
- * that ship.
+ * The submodule cannot be the thing that ships. Our patches live in its working
+ * tree, which `git submodule update` reverts, and npm does not pack submodules
+ * at all, so a consumer would get an empty directory. Both failure modes leave
+ * an engine that still compiles, so neither announces itself.
  */
 
 const fs = require('fs');
@@ -79,15 +69,9 @@ const FILES = [
   'LICENSE',
 ];
 
-/*
- * The marker proving the patch stack is applied.
- *
- * JS_GetMallocSize comes from engine/patches/0001 and exists nowhere upstream,
- * so its absence means the submodule working tree was reverted. That is the
- * exact state this script must refuse to copy from: doing so would bake an
- * unpatched engine into a committed file, where it is far harder to notice
- * than in a submodule.
- */
+/* Proof the patches are applied: JS_GetMallocSize comes from engine/patches/0001
+   and exists nowhere upstream. Projecting an unpatched engine would bake it into
+   a committed file, where it is far harder to notice than in a submodule. */
 const PATCH_MARKER = 'JS_GetMallocSize';
 
 function sha256(buffer) {

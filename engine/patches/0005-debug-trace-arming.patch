@@ -35,13 +35,12 @@ Notes
   those traps exist only where the programmer wrote the keyword, unlike
   ordinary statement traps which are on every statement.
 
-  Switching ON may be done from any thread, and has to be -- a pause request
+  Switching ON may be done from any thread, and has to be: a pause request
   arrives on the debugger's own thread and must interrupt a runtime that is
-  already running. The flag is atomic and read without ordering, so a late
-  read costs at most one extra statement before the pause, which an
-  asynchronous pause is allowed to do anyway. Switching OFF is only safe from
-  the JavaScript thread. Only this one flag is thread-safe; the context as a
-  whole is not.
+  already running. The flag is atomic and read without ordering, so a late read
+  costs at most one extra statement before the pause -- which an asynchronous
+  pause is allowed to do anyway. Switching OFF is only safe from the JavaScript
+  thread. Only this flag is thread-safe; the context as a whole is not.
 
 diff --git a/quickjs.c b/quickjs.c
 index e19f5b9..d162a8f 100644

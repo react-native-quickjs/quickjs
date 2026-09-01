@@ -36,66 +36,57 @@ function run(script, args = []) {
 
 let failures = 0;
 
-function expectRed(name, breakIt, restore) {
-  let status;
+/* Break one thing, assert the guard goes red, put it back, assert it goes green. */
+function expectRed(label, script, breakIt, restore) {
+  let red;
   try {
     breakIt();
-    status = run(...name.command);
+    red = run(script, ['--check']) !== 0;
   } finally {
     restore();
   }
-  const green = run(...name.command) === 0;
-  const ok = status !== 0 && green;
-  console.log(
-    `${ok ? 'ok  ' : 'FAIL'}  ${name.label}` +
-      (ok ? '' : `  (red=${status !== 0}, green-after-restore=${green})`)
-  );
+  const green = run(script, ['--check']) === 0;
+  const ok = red && green;
+  console.log(`${ok ? 'ok  ' : 'FAIL'}  ${label}${ok ? '' : `  (red=${red}, green=${green})`}`);
   if (!ok) failures += 1;
 }
 
-const applyCheck = { label: '', command: ['apply-patches.js', ['--check']] };
-const syncCheck = { label: '', command: ['sync-quickjs-rel.js', ['--check']] };
-
-// 1. The submodule drifting away from upstream-plus-patches.
-{
-  const saved = fs.readFileSync(engineFile);
-  expectRed(
-    { ...applyCheck, label: 'apply-patches notices an edited engine' },
-    () => fs.appendFileSync(engineFile, '\n/* selftest */\n'),
-    () => fs.writeFileSync(engineFile, saved)
-  );
+/* A file restored from a saved copy, whatever the check did in between. */
+function withSaved(file, mutate) {
+  const saved = fs.readFileSync(file);
+  return [() => mutate(saved), () => fs.writeFileSync(file, saved)];
 }
 
-// 2. A patch with no row in the table.
-{
-  const saved = fs.readFileSync(readme, 'utf8');
-  expectRed(
-    { ...applyCheck, label: 'apply-patches notices a patch missing from the table' },
-    () => fs.writeFileSync(readme, saved.replace(/^\| `0003`.*\n/m, '')),
-    () => fs.writeFileSync(readme, saved)
-  );
-}
+expectRed(
+  'apply-patches notices an edited engine',
+  'apply-patches.js',
+  ...withSaved(engineFile, () => fs.appendFileSync(engineFile, '\n/* selftest */\n'))
+);
 
-// 3. A patch other than the tail one touching the bytecode version.
-{
-  const victim = path.join(patchDir, '0001-runtime-malloc-size-accessor.patch');
-  const saved = fs.readFileSync(victim, 'utf8');
-  expectRed(
-    { ...applyCheck, label: 'apply-patches notices a stray BC_VERSION change' },
-    () => fs.writeFileSync(victim, saved + '\n+#define BC_VERSION 99\n'),
-    () => fs.writeFileSync(victim, saved)
-  );
-}
+expectRed(
+  'apply-patches notices a patch missing from the table',
+  'apply-patches.js',
+  ...withSaved(readme, (saved) =>
+    fs.writeFileSync(readme, saved.toString().replace(/^\| `0003`.*\n/m, ''))
+  )
+);
 
-// 4. The shipped projection drifting from the submodule.
-{
-  const saved = fs.readFileSync(projection);
-  expectRed(
-    { ...syncCheck, label: 'sync-quickjs-rel notices a stale projection' },
-    () => fs.appendFileSync(projection, '\n/* selftest */\n'),
-    () => fs.writeFileSync(projection, saved)
-  );
-}
+expectRed(
+  'apply-patches notices a stray BC_VERSION change',
+  'apply-patches.js',
+  ...withSaved(path.join(patchDir, '0001-runtime-malloc-size-accessor.patch'), (saved) =>
+    fs.writeFileSync(
+      path.join(patchDir, '0001-runtime-malloc-size-accessor.patch'),
+      saved + '\n+#define BC_VERSION 99\n'
+    )
+  )
+);
+
+expectRed(
+  'sync-quickjs-rel notices a stale projection',
+  'sync-quickjs-rel.js',
+  ...withSaved(projection, () => fs.appendFileSync(projection, '\n/* selftest */\n'))
+);
 
 console.log(
   failures === 0

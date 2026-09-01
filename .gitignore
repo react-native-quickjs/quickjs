@@ -1,48 +1,9 @@
-# OSX
+# macOS
 .DS_Store
 
 # Editors
 .vscode/
 .idea
-jsconfig.json
-
-# Expo
-.expo/
-
-# Xcode
-build/
-*.pbxuser
-!default.pbxuser
-*.mode1v3
-!default.mode1v3
-*.mode2v3
-!default.mode2v3
-*.perspectivev3
-!default.perspectivev3
-xcuserdata
-*.xccheckout
-*.moved-aside
-DerivedData
-*.hmap
-*.ipa
-*.xcuserstate
-project.xcworkspace
-**/.xcode.env.local
-
-# Android
-.classpath
-.cxx
-.gradle
-.project
-.settings
-local.properties
-android.iml
-
-# CocoaPods
-example/ios/Pods
-
-# Ruby
-example/vendor/
 
 # node
 node_modules/
@@ -58,15 +19,30 @@ yarn-error.log
 !.yarn/sdks
 !.yarn/versions
 
-# React Native codegen
-ios/generated
-android/generated
+# Xcode
+build/
+DerivedData
+xcuserdata
+*.xcuserstate
+project.xcworkspace
+**/.xcode.env.local
+
+# Android
+.cxx
+.gradle
+local.properties
+
+# CocoaPods and Ruby (example app)
+example/ios/Pods
+example/vendor/
+
+# Expo
+.expo/
 
 # Out-of-source CMake build directories (build-rel, build-napi, build-intl).
 # Directories only -- the trailing slash is load-bearing, or the pattern also
 # swallows build-*.sh and build-*.mjs scripts that are meant to be tracked.
 build-*/
-build-*.log
 
 # Debug symbol bundles
 *.dSYM/

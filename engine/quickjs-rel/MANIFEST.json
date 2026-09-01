@@ -20,7 +20,7 @@
     },
     {
       "name": "0005-debug-trace-arming.patch",
-      "sha256": "23e0eb87458812f6f775b98543c46a17992d6c7cd09d1b5a675744cbc587619d"
+      "sha256": "6633129288091f711ec6749ef0eaf3f36e9934948ccdab138ef48a556bb78958"
     },
     {
       "name": "9999-bc-version-bump.patch",

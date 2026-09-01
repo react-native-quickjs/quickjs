@@ -20,8 +20,8 @@ what we changed and why without opening a single `.patch` file.
 
 ## Writing a patch header
 
-Headers are for people. Keep them short and say things the way you would say
-them out loud.
+Headers are for people. Keep them short -- usually twenty to forty lines --
+and say things the way you would say them out loud.
 
 ```
 Subject: <one sentence saying what this adds>
