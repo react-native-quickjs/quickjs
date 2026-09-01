@@ -1,6 +1,4 @@
-/* Adversarial corpus for the CONSTRUCTOR BIRTH CACHE
-   (patches/pending/0072-constructor-birth-cache.patch as repaired by lane
-   CTOR-1; docs/ctor-1-the-constructor-birth-cache-can-be-made-correct.md).
+/* Adversarial corpus for the CONSTRUCTOR BIRTH CACHE.
 
    The mechanism under test replaces `js_create_from_ctor`'s generic
    `JS_GetProperty(ctor, "prototype")` plus `find_hashed_shape_proto()` with a

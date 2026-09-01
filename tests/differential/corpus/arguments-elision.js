@@ -18,7 +18,7 @@
    In a sloppy-mode function with a simple parameter list the `arguments` object
    is *mapped*: `arguments[i]` and the i-th named parameter are two names for one
    storage slot. QuickJS implements that with a JSVarRef whose `pvalue` points
-   straight at `sf->arg_buf[i]` (`get_var_ref`, vendor/quickjs-ng/quickjs.c:20031),
+   straight at `sf->arg_buf[i]` (`get_var_ref`, engine/quickjs-ng/quickjs.c:20031),
    so reading `arg_buf[i]` at use time is the same read the object would have
    done. In STRICT mode, or with any non-simple parameter list, the object is
    *unmapped* and `js_build_arguments` (:18767) COPIES `argv[]` at function

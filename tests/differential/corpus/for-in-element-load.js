@@ -33,7 +33,7 @@
       cannot be turned into a deterministic test: it needs the allocator to hand
       back the exact freed block, and in practice deleting the reference makes
       the comparison FAIL rather than wrongly succeed, because
-      `js_shape_prepare_update` (vendor/quickjs-ng/quickjs.c:12103-12129) and
+      `js_shape_prepare_update` (engine/quickjs-ng/quickjs.c:12103-12129) and
       `add_property` (:11108-11123) *clone* a shape whose refcount is not 1 —
       so removing our reference changes which pointer the object ends up on and
       the fast path simply misses. A sabotaged build with the reference removed

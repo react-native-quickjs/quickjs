@@ -2,7 +2,7 @@
  * `super` and `#private` members read across a generator suspend/resume.
  *
  * WHAT THIS PINS. `OP_special_object` / `HOME_OBJECT` is the only reader of
- * `JS_CallInternal`'s function-scope `JSObject *p` (vendor/quickjs-ng/quickjs.c
+ * `JS_CallInternal`'s function-scope `JSObject *p` (engine/quickjs-ng/quickjs.c
  * ~21958). That variable is written in exactly two places, both in the
  * prologue and mutually exclusive:
  *

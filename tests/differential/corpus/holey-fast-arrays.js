@@ -42,7 +42,7 @@
    **js_is_fast_array()'s holey test.** MEASURED 2026-07-30 by mutation: a build
    with it deleted passes this entire corpus, and that is correct rather than a
    corpus weakness. `js_is_fast_array` has exactly ONE caller
-   (`vendor/quickjs-ng/quickjs.c`, in `js_array_slice`, guarding the fast
+   (`engine/quickjs-ng/quickjs.c`, in `js_array_slice`, guarding the fast
    slice/splice loop) and it is applied to `arr`, the DESTINATION returned by
    `JS_ArraySpeciesCreate`. Reaching the mutant requires a `Symbol.species`
    constructor that returns an already-holey array; even then the loop writes

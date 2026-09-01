@@ -19,7 +19,7 @@
        an accessor installed on globalThis after a site is warm, a Proxy on
        globalThis's prototype, `with`, and direct `eval` introducing a binding.
 
-   Note on the two runs.  `qjs-bench` evaluates this file as a *script*, so
+   Note on the two runs.  `qjs-run` evaluates this file as a *script*, so
    top-level `let`/`const` create real global lexical bindings and the engine
    reaches them through `global_var_obj`.  node evaluates it as an ES module, so
    the same declarations are module-scoped.  The two engines reach the bindings

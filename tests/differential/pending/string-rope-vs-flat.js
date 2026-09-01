@@ -8,7 +8,7 @@
  * same ECMAScript type, so no observable operation may distinguish them. Any
  * engine site that tests `tag == JS_TAG_STRING` instead of `tag_is_string(tag)`
  * silently drops ropes onto a different path, and that class of defect has now
- * been found twice in vendor/quickjs-ng:
+ * been found twice in engine/quickjs-ng:
  *
  *   - `js_eq_slow`: `rope == flat` answered false while `rope === flat`
  *     answered true (patch 0058-eq-slow-rope-vs-flat-string).

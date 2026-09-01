@@ -1,7 +1,7 @@
 /*
  * Mixed BigInt/Number relational and equality comparisons.
  *
- * Guards `js_bigint_float64_cmp` (vendor/quickjs-ng/quickjs.c), the helper
+ * Guards `js_bigint_float64_cmp` (engine/quickjs-ng/quickjs.c), the helper
  * every Number-vs-BigInt `<`, `<=`, `>`, `>=`, `==` and `!=` funnels through
  * via `js_compare_bigint`. Its `f != e` arm (differing binary exponents)
  * ordered by magnitude alone and never applied `a_sign`, so EVERY mixed
