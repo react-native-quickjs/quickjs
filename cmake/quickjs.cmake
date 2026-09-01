@@ -57,6 +57,18 @@ add_library(quickjs STATIC
 target_include_directories(quickjs PUBLIC "${QUICKJS_DIR}")
 target_compile_definitions(quickjs PRIVATE _GNU_SOURCE)
 
+# The maths functions are in libSystem on Apple and in a separate libm
+# elsewhere, so a macOS host build links clean while Linux fails at the link
+# step on round, floor, pow and friends. Detected rather than assumed, the way
+# quickjs-ng's own CMakeLists does it.
+find_library(QUICKJS_M_LIBRARY m)
+if(QUICKJS_M_LIBRARY)
+  target_link_libraries(quickjs PUBLIC m)
+endif()
+
+find_package(Threads)
+target_link_libraries(quickjs PUBLIC ${CMAKE_DL_LIBS} ${CMAKE_THREAD_LIBS_INIT})
+
 # The debugger interface added by engine/patches/0003. It costs nothing at
 # runtime with no trace handler installed, because the per-statement traps are
 # emitted at parse time only when there is one. PUBLIC because embedders
