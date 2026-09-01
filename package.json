@@ -36,19 +36,14 @@
     "!**/.*"
   ],
   "scripts": {
-    "doctor": "node scripts/doctor.js",
-    "test:install": "node scripts/install/test/run.js",
-    "test:expo": "node scripts/expo/test/run.js",
-    "example": "yarn workspace @react-native-quickjs/example",
     "submodules": "git submodule update --init --recursive",
     "patches": "node scripts/apply-patches.js",
     "sync-engine": "node scripts/sync-quickjs-rel.js",
     "guard:selftest": "node scripts/guard-selftest.js",
-    "postinstall": "node scripts/postinstall.js",
     "prepack": "node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check && node scripts/check-submodule.js",
     "configure": "cmake -B build -DCMAKE_BUILD_TYPE=Debug",
     "build": "cmake --build build -j8",
-    "test": "yarn configure && yarn build && ctest --test-dir build --output-on-failure",
+    "test": "npm run configure && npm run build && ctest --test-dir build --output-on-failure",
     "bytecode": "./build/qjsc-ng",
     "clean": "del-cli build platform/android/build platform/android/.cxx example/android/build example/android/app/build example/ios/build",
     "release": "release-it --only-version"
@@ -59,6 +54,9 @@
   },
   "author": "Ammar Ahmed <ammarahmed6506@gmail.com> (https://github.com/ammarahm-ed)",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "bugs": {
     "url": "https://github.com/react-native-quickjs/quickjs/issues"
   },
@@ -82,10 +80,6 @@
     "react": "*",
     "react-native": ">=0.85.0"
   },
-  "workspaces": [
-    "example"
-  ],
-  "packageManager": "yarn@4.11.0",
   "commitlint": {
     "extends": [
       "@commitlint/config-conventional"
