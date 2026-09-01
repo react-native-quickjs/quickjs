@@ -19,7 +19,7 @@ const RED = '\x1b[31m';
 const DIM = '\x1b[2m';
 const OFF = '\x1b[0m';
 
-function root(argv) {
+function resolveProjectDirectory(argv) {
   const at = argv.indexOf('--project');
   const dir = at === -1 ? process.cwd() : path.resolve(argv[at + 1] || '.');
   if (!fs.existsSync(path.join(dir, 'package.json'))) {
@@ -30,34 +30,34 @@ function root(argv) {
 }
 
 /**
- * @param {'apply'|'revert'} mode
+ * @param {'addQuickJS'|'removeQuickJS'} direction
  * @returns {number} exit code
  */
-function change(mode, argv) {
-  const dir = root(argv);
+function applyEdits(direction, argv) {
+  const project = resolveProjectDirectory(argv);
   const dryRun = argv.includes('--dry-run');
   const manual = [];
   let changed = 0;
 
   console.log('');
   for (const edit of edits) {
-    const file = edit.locate(dir);
+    const file = edit.findFile(project);
     if (!file || !fs.existsSync(file)) {
       console.log(`  ${DIM}skipped${OFF}  ${edit.label} ${DIM}(not in this project)${OFF}`);
       continue;
     }
 
     const before = fs.readFileSync(file, 'utf8');
-    const satisfied = mode === 'apply' ? edit.done(before) : !edit.done(before);
+    const satisfied = direction === 'addQuickJS' ? edit.isApplied(before) : !edit.isApplied(before);
     if (satisfied) {
       console.log(`  ${DIM}already${OFF}  ${edit.label}`);
       continue;
     }
 
-    const after = edit[mode](before);
+    const after = edit[direction](before);
     if (after == null || after === before) {
       console.log(`  ${YELLOW}by hand${OFF}  ${edit.label}`);
-      manual.push([edit.label, edit.manual]);
+      manual.push([edit.label, edit.manualSteps]);
       continue;
     }
 
@@ -71,7 +71,7 @@ function change(mode, argv) {
     for (const line of lines) console.log(`  ${line}`);
   }
 
-  if (changed && !dryRun && mode === 'apply') {
+  if (changed && !dryRun && direction === 'addQuickJS') {
     console.log(`\nNext: cd ios && pod install\n`);
   } else {
     console.log('');
@@ -80,35 +80,35 @@ function change(mode, argv) {
 }
 
 function doctor(argv) {
-  const dir = root(argv);
-  let missing = 0;
+  const project = resolveProjectDirectory(argv);
+  let notConfigured = 0;
 
   console.log('');
   for (const edit of edits) {
-    const file = edit.locate(dir);
+    const file = edit.findFile(project);
     if (!file || !fs.existsSync(file)) {
       console.log(`  ${DIM}—${OFF}  ${edit.label} ${DIM}(not in this project)${OFF}`);
       continue;
     }
-    if (edit.done(fs.readFileSync(file, 'utf8'))) {
+    if (edit.isApplied(fs.readFileSync(file, 'utf8'))) {
       console.log(`  ${GREEN}✓${OFF}  ${edit.label}`);
     } else {
       console.log(`  ${RED}✗${OFF}  ${edit.label}`);
-      missing++;
+      notConfigured++;
     }
   }
 
   console.log(
-    missing
-      ? `\n${missing} of ${edits.length} not configured for QuickJS. ` +
+    notConfigured
+      ? `\n${notConfigured} of ${edits.length} not configured for QuickJS. ` +
           `Run: npx react-native-quickjs install\n`
       : `\nConfigured to run on QuickJS.\n`
   );
-  return missing ? 1 : 0;
+  return notConfigured ? 1 : 0;
 }
 
 module.exports = {
-  install: (argv) => change('apply', argv),
-  revert: (argv) => change('revert', argv),
+  install: (argv) => applyEdits('addQuickJS', argv),
+  revert: (argv) => applyEdits('removeQuickJS', argv),
   doctor,
 };
