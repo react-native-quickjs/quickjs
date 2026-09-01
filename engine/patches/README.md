@@ -12,6 +12,7 @@ what we changed and why without opening a single `.patch` file.
 | Patch | What it does | Why we need it | Adds | Bytecode bump? |
 |---|---|---|---|---|
 | `0001` | Reports how much memory the engine is currently holding | The runtime decides when to collect garbage based on how much memory is live, and the existing way to measure it walks the whole heap | `JS_GetMallocSize` | No |
+| `0002` | Lets the app choose when garbage collection runs | Otherwise a collection lands in the middle of a frame and drops it; the worst frame went from 45ms to 3.3ms | `JS_SetGCDeferred`, `JS_HasPendingGC`, `JS_RunPendingGC` | No |
 
 ## Writing a patch header
 

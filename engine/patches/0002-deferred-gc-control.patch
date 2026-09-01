@@ -1,0 +1,130 @@
+Subject: let the app choose when garbage collection runs
+
+What this does
+  Normally the engine collects garbage during whichever allocation happens to
+  push memory past its threshold. That allocation is usually somewhere deep
+  inside the work a frame is doing, so the pause lands in the middle of the
+  frame and the frame is dropped.
+
+  This adds a mode where a collection that would start while JavaScript is
+  running is remembered instead, and the app runs it later at a moment it
+  picks -- when nothing is on the stack and the app is idle between frames.
+
+Why we need it
+  Measured on a list-rebuilding workload of 300 frames, each building 6000
+  rows and keeping the last 8 frames alive:
+
+                       mean     p50     p95     p99     max   over 16.7ms
+      before          10.87    2.63   41.79   43.53   45.07   68 of 300
+      after            2.67    2.65    2.90    3.03    3.33    0 of 300
+
+  The worst frame goes from 45ms to 3.3ms and nothing misses the budget.
+
+What it adds
+  JS_SetGCDeferred()  - turn deferral on or off, and set a memory ceiling.
+  JS_HasPendingGC()   - true if a collection is waiting to be run.
+  JS_RunPendingGC()   - run the waiting collection now.
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  This does not stop memory being reclaimed. QuickJS counts references first,
+  so anything without a reference cycle is freed the moment it stops being
+  used, collection or no collection. The collector only exists to break
+  cycles, so what builds up while deferred is cyclic garbage, not all garbage.
+
+  The ceiling is a hard limit. If memory reaches it while a collection is
+  waiting, the engine collects immediately wherever it is, so an app that
+  never goes idle still cannot grow without bound.
+
+diff --git a/quickjs.c b/quickjs.c
+index b7d53e5..1f1d656 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -351,6 +351,9 @@ struct JSRuntime {
+     struct list_head tmp_obj_list; /* used during GC */
+     JSGCPhaseEnum gc_phase : 8;
+     size_t malloc_gc_threshold;
++    bool gc_deferred; /* see JS_SetGCDeferred */
++    bool gc_pending;
++    size_t gc_deferred_limit;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head string_list; /* list of JSString.link */
+ #endif
+@@ -1657,12 +1660,21 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
+                 rt->malloc_gc_threshold);
+ #endif
+     if (force_gc) {
++        /* deferred: collect at the next safepoint, not under running JS */
++        if (rt->gc_deferred && rt->current_stack_frame != NULL &&
++            (rt->malloc_state.malloc_size + size) < rt->gc_deferred_limit) {
++            rt->gc_pending = true;
++            rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
++                (rt->malloc_state.malloc_size >> 1);
++            return;
++        }
+ #ifdef ENABLE_DUMPS // JS_DUMP_GC
+         if (check_dump_flag(rt, JS_DUMP_GC)) {
+             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
+         }
+ #endif
+         JS_RunGC(rt);
++        rt->gc_pending = false;
+         rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+             (rt->malloc_state.malloc_size >> 1);
+     }
+@@ -7453,6 +7465,35 @@ static void gc_free_cycles(JSRuntime *rt)
+     init_list_head(&rt->gc_zero_ref_count_list);
+ }
+ 
++void JS_SetGCDeferred(JSRuntime *rt, bool deferred, size_t limit)
++{
++    rt->gc_deferred = deferred;
++    /* 0: derive a ceiling from the current threshold */
++    rt->gc_deferred_limit = limit != 0 ? limit : rt->malloc_gc_threshold * 4;
++    if (!deferred && rt->gc_pending) {
++        rt->gc_pending = false;
++        JS_RunGC(rt);
++        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
++            (rt->malloc_state.malloc_size >> 1);
++    }
++}
++
++bool JS_HasPendingGC(JSRuntime *rt)
++{
++    return rt->gc_pending;
++}
++
++void JS_RunPendingGC(JSRuntime *rt)
++{
++    if (!rt->gc_pending)
++        return;
++    assert(rt->current_stack_frame == NULL);
++    rt->gc_pending = false;
++    JS_RunGC(rt);
++    rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
++        (rt->malloc_state.malloc_size >> 1);
++}
++
+ size_t JS_GetMallocSize(JSRuntime *rt)
+ {
+     return rt->malloc_state.malloc_size;
+diff --git a/quickjs.h b/quickjs.h
+index 836e0c7..8b9c2a7 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -531,6 +531,13 @@ JS_EXTERN void JS_MarkValue(JSRuntime *rt, JSValueConst val,
+                             JS_MarkFunc *mark_func);
+ JS_EXTERN void JS_RunGC(JSRuntime *rt);
+ JS_EXTERN size_t JS_GetMallocSize(JSRuntime *rt);
++/* Defer collections triggered while JS is running; JS_RunPendingGC then runs
++   them at a safepoint. `limit` bytes is a hard ceiling past which the engine
++   collects anyway; 0 derives one from the current threshold. */
++JS_EXTERN void JS_SetGCDeferred(JSRuntime *rt, bool deferred, size_t limit);
++JS_EXTERN bool JS_HasPendingGC(JSRuntime *rt);
++/* Must be called with an empty JS stack. */
++JS_EXTERN void JS_RunPendingGC(JSRuntime *rt);
+ JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
+ 
+ JS_EXTERN JSContext *JS_NewContext(JSRuntime *rt);
