@@ -572,6 +572,23 @@ static JSValue call_frames(QJSCDPAgent *agent) {
 static void handle_message(QJSCDPAgent *agent, const char *json, size_t len);
 
 /* Caller holds the lock. */
+/*
+ * The agent's own runtime is entered from whichever thread is currently
+ * driving the agent, and the engine records the stack bounds of the thread
+ * that created a runtime. React Native creates the agent on one thread and
+ * then calls it from the JS thread; the pause loop runs on the JS thread while
+ * the frontend posts from another.
+ *
+ * Without this, every use of the agent's runtime from a second thread fails
+ * the stack check on its first allocation -- so a posted Debugger.resume never
+ * parses, the pause loop never wakes, and the app hangs at the breakpoint.
+ * Both thread stacks happen to sit close together on macOS, so it only shows
+ * up on Linux and Android.
+ */
+static void enter_agent_runtime(QJSCDPAgent *agent) {
+  JS_UpdateStackTop(agent->jrt);
+}
+
 static char *take_message(QJSCDPAgent *agent, void **session) {
   if (agent->queue_len == 0) return NULL;
   char *msg = agent->queue[0];
@@ -637,6 +654,7 @@ static int on_statement(
   (void)funcname;
   (void)col;
   QJSCDPAgent *agent = opaque;
+  enter_agent_runtime(agent);
 
   /* Re-entrant: an evaluate issued from the pause loop runs instrumented code
      of its own, and stopping inside it would deadlock the frontend. */
@@ -1174,6 +1192,7 @@ void qjs_cdp_send_message(
 }
 
 void qjs_cdp_poll(QJSCDPAgent *agent) {
+  enter_agent_runtime(agent);
   for (;;) {
     void *session = NULL;
     pthread_mutex_lock(&agent->lock);
@@ -1189,6 +1208,7 @@ void qjs_cdp_poll(QJSCDPAgent *agent) {
 
 void qjs_cdp_console_message(
     QJSCDPAgent *agent, const char *type, const JSValue *args, int count) {
+  enter_agent_runtime(agent);
   JSValue list = json_array(agent);
   for (int i = 0; i < count; i++)
     json_set_index(
@@ -1204,6 +1224,7 @@ void qjs_cdp_console_message(
 
 void qjs_cdp_script_loaded(
     QJSCDPAgent *agent, const char *url, const char *source) {
+  enter_agent_runtime(agent);
   agent->scripts =
       realloc(agent->scripts, sizeof(Script) * (size_t)(agent->nscripts + 1));
   Script *script = &agent->scripts[agent->nscripts++];
@@ -1218,6 +1239,7 @@ void qjs_cdp_script_loaded(
 }
 
 char *qjs_cdp_export_state(QJSCDPAgent *agent) {
+  enter_agent_runtime(agent);
   JSValue list = json_array(agent);
   for (int i = 0; i < agent->nbps; i++) {
     Breakpoint *bp = &agent->bps[i];
@@ -1252,6 +1274,7 @@ char *qjs_cdp_export_state(QJSCDPAgent *agent) {
 }
 
 void qjs_cdp_import_state(QJSCDPAgent *agent, const char *json) {
+  enter_agent_runtime(agent);
   if (!json) return;
   JSValue state = JS_ParseJSON(agent->jctx, json, strlen(json), "<state>");
   if (JS_IsException(state)) {
@@ -1302,6 +1325,7 @@ void qjs_cdp_set_debugger_enabled(QJSCDPAgent *agent, bool enabled) {
 }
 
 char *qjs_cdp_capture_stack_trace(QJSCDPAgent *agent, int frames_to_skip) {
+  enter_agent_runtime(agent);
   JSValue frames = json_array(agent);
   const int depth = JS_GetStackDepth(agent->ctx);
   uint32_t n = 0;
@@ -1357,5 +1381,6 @@ void qjs_cdp_set_execution_context(QJSCDPAgent *agent, int id) {
 }
 
 void qjs_cdp_pause(QJSCDPAgent *agent) {
+  enter_agent_runtime(agent);
   agent->pause_pending = true;
 }
