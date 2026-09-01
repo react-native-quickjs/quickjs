@@ -45,8 +45,8 @@ set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Built from the engine in this tree, not shipped prebuilt: bytecode is only
 # loadable by the exact engine build that produced it.
-add_executable(qjsc-ng tools/bytecode/qjsc-ng.c)
-target_link_libraries(qjsc-ng PRIVATE quickjs)
+add_executable(qjsc tools/bytecode/qjsc.c)
+target_link_libraries(qjsc PRIVATE quickjs)
 
 add_subdirectory(tests)
 

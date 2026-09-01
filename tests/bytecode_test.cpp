@@ -4,7 +4,7 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Round-trips real ahead-of-time bytecode: compiles JS with the qjsc-ng tool
+ * Round-trips real ahead-of-time bytecode: compiles JS with the qjsc tool
  * built from the same engine, then loads the container through the runtime.
  * The conformance suite covers the JSI surface; this covers the container
  * format and the bytecode paths through evaluateJavaScript /
@@ -55,7 +55,7 @@ std::string tempPath(const char *suffix) {
   return base + "rnqjs-bytecode-test" + suffix;
 }
 
-/// Compiles `source` with the qjsc-ng tool and returns the container bytes.
+/// Compiles `source` with the qjsc tool and returns the container bytes.
 std::vector<uint8_t> compileToBytecode(
     const std::string &source, const char *extraFlags = "") {
   const std::string jsPath = tempPath(".js");
@@ -66,10 +66,10 @@ std::vector<uint8_t> compileToBytecode(
     out << source;
   }
 
-  const std::string command = std::string(QJSC_NG_PATH) + " " + extraFlags +
-                              " '" + jsPath + "' '" + bcPath + "'";
+  const std::string command = std::string(QJSC_PATH) + " " + extraFlags + " '" +
+                              jsPath + "' '" + bcPath + "'";
   const int status = std::system(command.c_str());
-  EXPECT_EQ(status, 0) << "qjsc-ng failed: " << command;
+  EXPECT_EQ(status, 0) << "qjsc failed: " << command;
 
   std::ifstream in(bcPath, std::ios::binary);
   std::vector<uint8_t> bytes{
@@ -285,7 +285,7 @@ TEST(Bytecode, EngineBuiltinBlobsLoad) {
       "function|function|function|[[1,3],[2,4]]");
 }
 
-// --- qjsc-ng --strip-source -------------------------------------------------
+// --- qjsc --strip-source -------------------------------------------------
 //
 // Stripping omits the embedded source text of every function, which is 65% of
 // the .bc on a real React Native bundle. It needs no format change and no
@@ -353,7 +353,7 @@ TEST(Bytecode, StrippedBytecodeKeepsLineAndColumnInformation) {
     auto bytes = compileToBytecode(source, flags);
     runtime->evaluateJavaScript(
         std::make_shared<VectorBuffer>(std::move(bytes)), "loc.bc");
-    // The filename is the temp path qjsc-ng was given, which is the same for
+    // The filename is the temp path qjsc was given, which is the same for
     // both compiles, so the whole stack string is comparable verbatim.
     return runtime->global()
                .getProperty(*runtime, "stack")

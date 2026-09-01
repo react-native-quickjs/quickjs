@@ -939,7 +939,7 @@ void throwIfHermesBytecode(
       " is Hermes bytecode, which this engine cannot execute. In a React "
       "Native app that usually means hermesEnabled is still true in "
       "android/gradle.properties, or :hermes_enabled in the Podfile. Turn it "
-      "off so Metro ships plain JavaScript, or precompile with qjsc-ng.");
+      "off so Metro ships plain JavaScript, or precompile with qjsc.");
 }
 
 /**
@@ -1055,7 +1055,7 @@ jsi::Value QuickJSRuntime::evaluateBytecode(
     JS_FreeValue(context_, JS_GetException(context_));
     throw jsi::JSINativeException(
         "QuickJSRuntime: could not load bytecode. It was most likely compiled "
-        "by a different build of the engine -- recompile it with the qjsc-ng "
+        "by a different build of the engine -- recompile it with the qjsc "
         "from this checkout.");
   }
   return createValue(JS_EvalFunction(context_, function));

@@ -19,7 +19,7 @@
  * because bytecode is only loadable by the exact engine build that produced
  * it.
  *
- *   usage: qjsc-ng [--no-checksum] [--strip-source] <input.js> <output.bc>
+ *   usage: qjsc [--no-checksum] [--strip-source] <input.js> <output.bc>
  *
  * `--strip-source` drops the embedded source text of every function: 3.30 MB
  * -> 1.16 MB on a 990 KB production Metro bundle, and the same saving in
