@@ -1,0 +1,45 @@
+# Builds the example app for the simulator. Manual, for the same reason as the
+# android workflow.
+name: ios
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install pods
+        working-directory: example/ios
+        run: pod install
+
+      - name: Build the example app
+        working-directory: example/ios
+        run: |
+          set -o pipefail
+          xcodebuild -workspace ReactNativeQuickjsExample.xcworkspace \
+            -scheme ReactNativeQuickjsExample -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build | tee xcodebuild.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-simulator-app
+          path: |
+            example/ios/xcodebuild.log
+            example/ios/build/Build/Products/Debug-iphonesimulator/ReactNativeQuickjsExample.app
