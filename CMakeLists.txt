@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 # The host build, used for development and the test suites. Android builds
-# through platform/android and Apple through the podspec; all three reuse
+# through android/ and Apple through the podspec; all three reuse
 # cmake/quickjs.cmake and the same src/ sources.
 #
 #   cmake -B build -DCMAKE_BUILD_TYPE=Debug

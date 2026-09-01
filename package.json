@@ -22,8 +22,8 @@
   },
   "files": [
     "src",
-    "platform/android",
-    "platform/apple",
+    "android",
+    "apple",
     "cmake",
     "engine/quickjs-rel",
     "modules/cdp/quickjs-cdp.h",
@@ -31,10 +31,9 @@
     "modules/cdp/react",
     "scripts/postinstall.js",
     "scripts/react_native_quickjs_pods.rb",
-    "react-native.config.js",
     "*.podspec",
-    "!platform/android/build",
-    "!platform/android/.cxx",
+    "!android/build",
+    "!android/.cxx",
     "!**/__tests__",
     "!**/.*"
   ],

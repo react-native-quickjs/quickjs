@@ -32,7 +32,7 @@ Pod::Spec.new do |s|
   # list from the #include closure and deletes anything else -- so the globs
   # cannot pick up a stray main() the way they could against the full submodule.
   s.source_files = [
-    "platform/apple/*.{h,mm}",
+    "apple/*.{h,mm}",
     "src/**/*.{h,cpp}",
     # The Chrome DevTools Protocol backend. quickjs-cdp.c needs only
     # <quickjs.h>; react/ needs jsinspector-modern and folly, which the
@@ -50,7 +50,7 @@ Pod::Spec.new do |s|
   ]
 
   # Consumers only ever need the C factory entry point.
-  s.public_header_files = "platform/apple/RCTQuickJSInstanceFactory.h"
+  s.public_header_files = "apple/RCTQuickJSInstanceFactory.h"
 
   # DEFINES_MODULE makes CocoaPods emit a module map even though this builds as
   # a static library, which is what lets an app's AppDelegate.swift write

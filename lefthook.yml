@@ -16,7 +16,7 @@ pre-commit:
         # noise and make the parity diff against Node worthless.
         - "modules/napi/include/**"
         - "modules/napi/cpp/**"
-        - "platform/android/src/main/jni/JJSRuntimeFactory.h"
+        - "android/src/main/jni/JJSRuntimeFactory.h"
       run: clang-format --dry-run --Werror {staged_files}
 
     # engine/patches is the source of truth; engine/quickjs-rel is the

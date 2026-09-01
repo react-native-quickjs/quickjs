@@ -31,6 +31,12 @@ apply plugin: "kotlin-android"
 android {
   namespace "com.ammarahmed.quickjs"
 
+  // Follow the app's NDK, or let the Android plugin choose. Pinning our own
+  // would compile this library with a different toolchain than the app.
+  if (rootProject.ext.has("ndkVersion")) {
+    ndkVersion rootProject.ext.get("ndkVersion")
+  }
+
   compileSdkVersion getExtOrDefault("compileSdkVersion")
 
   defaultConfig {

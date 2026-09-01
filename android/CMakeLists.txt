@@ -16,7 +16,7 @@ if(NOT DEFINED REACT_NATIVE_DIR)
   message(FATAL_ERROR "REACT_NATIVE_DIR must be passed in from build.gradle")
 endif()
 
-set(RNQJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(RNQJS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 # React Native's headers reach into folly, which does not compile without these
 # flags unless a generated folly-config.h is on the include path.
