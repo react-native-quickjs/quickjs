@@ -32,6 +32,7 @@ add_library(quickjs_jsi STATIC
   src/module/QuickJSCompat.cpp
   src/module/QuickJSModule.cpp
   src/runtime/QuickJSRuntime.cpp
+  src/runtime/QuickJSRuntimeFactory.cpp
 )
 target_include_directories(quickjs_jsi PUBLIC src/bytecode src/module src/runtime)
 target_link_libraries(quickjs_jsi PUBLIC jsi quickjs)
