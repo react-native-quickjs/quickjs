@@ -191,6 +191,135 @@ void QuickJSRuntime::freePointerValuePool() noexcept {
   freeAtoms_ = nullptr;
 }
 
+JSValue QuickJSRuntime::toJSValue(const jsi::Pointer &pointer) {
+  return static_cast<const QuickJSPointerValue *>(getPointerValue(pointer))
+      ->value();
+}
+
+JSAtom QuickJSRuntime::toJSAtom(const jsi::PropNameID &name) {
+  return static_cast<const QuickJSAtomPointerValue *>(getPointerValue(name))
+      ->atom();
+}
+
+JSValue QuickJSRuntime::toJSValue(const jsi::Value &value) const {
+  if (value.isUndefined()) {
+    return JS_UNDEFINED;
+  }
+  if (value.isNull()) {
+    return JS_NULL;
+  }
+  if (value.isBool()) {
+    return JS_NewBool(context_, value.getBool());
+  }
+  if (value.isNumber()) {
+    return JS_NewFloat64(context_, value.getNumber());
+  }
+  return static_cast<const QuickJSPointerValue *>(getPointerValue(value))
+      ->value();
+}
+
+jsi::Value QuickJSRuntime::createValue(JSValue value) {
+  if (JS_IsException(value)) {
+    throwPendingError();
+  }
+  if (JS_IsUndefined(value)) {
+    return jsi::Value::undefined();
+  }
+  if (JS_IsNull(value)) {
+    return jsi::Value::null();
+  }
+  if (JS_IsBool(value)) {
+    return jsi::Value(static_cast<bool>(JS_ToBool(context_, value)));
+  }
+  if (JS_IsNumber(value)) {
+    double number = 0;
+    JS_ToFloat64(context_, &number, value);
+    return jsi::Value(number);
+  }
+  if (JS_IsString(value)) {
+    return jsi::Value(createStringFrom(value));
+  }
+  if (JS_IsSymbol(value)) {
+    return jsi::Value(createSymbolFrom(value));
+  }
+  if (JS_IsBigInt(value)) {
+    return jsi::Value(make<jsi::BigInt>(allocPointerValue(value)));
+  }
+  return jsi::Value(createObjectFrom(value));
+}
+
+jsi::Value QuickJSRuntime::borrowValue(JSValue value) {
+  // Primitives carry no reference, so they are already borrow-shaped.
+  if (JS_IsUndefined(value)) {
+    return jsi::Value::undefined();
+  }
+  if (JS_IsNull(value)) {
+    return jsi::Value::null();
+  }
+  if (JS_IsBool(value)) {
+    return jsi::Value(static_cast<bool>(JS_ToBool(context_, value)));
+  }
+  if (JS_IsNumber(value)) {
+    double number = 0;
+    JS_ToFloat64(context_, &number, value);
+    return jsi::Value(number);
+  }
+  if (JS_IsString(value)) {
+    return jsi::Value(make<jsi::String>(allocPointerValue(value, false)));
+  }
+  if (JS_IsSymbol(value)) {
+    return jsi::Value(make<jsi::Symbol>(allocPointerValue(value, false)));
+  }
+  if (JS_IsBigInt(value)) {
+    return jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
+  }
+  return jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
+}
+
+JSValue QuickJSRuntime::takeJSValue(jsi::Value &&value) {
+  if (value.isUndefined()) {
+    return JS_UNDEFINED;
+  }
+  if (value.isNull()) {
+    return JS_NULL;
+  }
+  if (value.isBool()) {
+    return JS_NewBool(context_, value.getBool());
+  }
+  if (value.isNumber()) {
+    return JS_NewFloat64(context_, value.getNumber());
+  }
+  auto *pv = const_cast<QuickJSPointerValue *>(
+      static_cast<const QuickJSPointerValue *>(getPointerValue(value)));
+  if (!pv->owned_) {
+    return JS_DupValue(context_, pv->value());
+  }
+  // Hand the reference over and disarm the destructor, which is about to run
+  // as `value` goes out of scope.
+  pv->owned_ = false;
+  return pv->value();
+}
+
+jsi::Object QuickJSRuntime::createObjectFrom(JSValue value) {
+  return make<jsi::Object>(allocPointerValue(value));
+}
+
+jsi::Symbol QuickJSRuntime::createSymbolFrom(JSValue value) {
+  return make<jsi::Symbol>(allocPointerValue(value));
+}
+
+jsi::String QuickJSRuntime::createStringFrom(JSValue value) {
+  return make<jsi::String>(allocPointerValue(value));
+}
+
+jsi::PropNameID QuickJSRuntime::createPropNameIDFrom(JSAtom atom) {
+  return make<jsi::PropNameID>(allocAtomPointerValue(atom));
+}
+
+void QuickJSRuntime::throwPendingError() {
+  notImplemented("throwPendingError");
+}
+
 std::string QuickJSRuntime::description() {
   return "QuickJSRuntime";
 }
@@ -228,7 +357,7 @@ bool QuickJSRuntime::drainMicrotasks(int maxMicrotasksHint) {
 }
 
 jsi::Object QuickJSRuntime::global() {
-  notImplemented("global");
+  return createObjectFrom(JS_GetGlobalObject(context_));
 }
 
 jsi::Runtime::PointerValue *QuickJSRuntime::cloneSymbol(

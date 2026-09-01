@@ -238,6 +238,43 @@ class QuickJSRuntime : public jsi::Runtime {
   void setExternalMemoryPressure(
       const jsi::Object &obj, size_t amount) override;
 
+ public:
+  // Conversions. Public because the class callbacks are free functions; they
+  // are not part of the JSI surface.
+
+  /// Takes ownership of the reference.
+  jsi::Value createValue(JSValue value);
+
+  /**
+   * Wraps a JSValue without taking a reference of its own, so the caller's
+   * reference must outlive the wrapper.
+   *
+   * Used for host function arguments: quickjs keeps argv alive for the whole
+   * call, so dup'ing each argument on entry and freeing it on return is a pair
+   * of refcount operations that provably cancel. Every path that keeps an
+   * argument copies it, and every copy path takes a real reference, so a
+   * borrowed wrapper cannot outlive the call that made it.
+   */
+  jsi::Value borrowValue(JSValue value);
+
+  /// Takes the reference out of a jsi::Value that is about to be destroyed,
+  /// rather than dup'ing a value whose destructor is about to free the
+  /// original. Symmetric with borrowValue.
+  JSValue takeJSValue(jsi::Value &&value);
+
+  jsi::Object createObjectFrom(JSValue value);
+  jsi::Symbol createSymbolFrom(JSValue value);
+  jsi::String createStringFrom(JSValue value);
+  jsi::PropNameID createPropNameIDFrom(JSAtom atom);
+
+  /// Returns a borrowed reference; the caller must not free it.
+  static JSValue toJSValue(const jsi::Pointer &pointer);
+  JSValue toJSValue(const jsi::Value &value) const;
+  static JSAtom toJSAtom(const jsi::PropNameID &name);
+
+  /// Throws the pending quickjs exception as a jsi::JSError. Never returns.
+  [[noreturn]] void throwPendingError();
+
  private:
   void drainPendingReleases() noexcept;
 
