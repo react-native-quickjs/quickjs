@@ -498,17 +498,16 @@ TEST_F(DebuggerTest, OutOfRangeLevelIsSafe) {
 }
 
 /*
- * Patch 0027 (Gap 4 in docs/debugger.md): every frame on the stack, not just
- * the trapping one, must report its own script, function name, line and
- * column. Without this a CDP `Debugger.paused` event has no callFrames array
- * and there is no call stack in DevTools.
+ * Every frame on the stack, not just the trapping one, must report its own
+ * script, function name, line and column. Without that a Chrome DevTools
+ * `Debugger.paused` event has no call frames and the debugger shows no stack.
  *
- * The assertion that matters is the one on LEVEL 0. QuickJS keeps the program
+ * The assertion that matters is the one on level 0. quickjs keeps the program
  * counter in a JS_CallInternal local and only writes it into the frame at
- * points that can re-enter the engine, so before 0027 the innermost frame --
- * the one the user is looking at -- reported a stale line or none at all,
- * while every OUTER frame was already correct. A test that only checked the
- * outer frames would have passed against the unfixed engine.
+ * points that can re-enter the engine, so the innermost frame -- the one the
+ * user is looking at -- is the one that reports a stale line if that write is
+ * ever removed, while every outer frame stays correct. A test that checked only
+ * the outer frames would pass against a broken engine.
  */
 TEST_F(DebuggerTest, FrameInfoAtEveryLevel) {
   struct Captured {
