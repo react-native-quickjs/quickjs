@@ -1,0 +1,47 @@
+# Builds the example app and checks it contains the engine. Manual, because the
+# host suites are the gate and this takes an SDK and several minutes.
+name: android
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - run: npm ci
+
+      - name: Build the example app
+        working-directory: example/android
+        run: ./gradlew :app:assembleDebug --no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a
+
+      # A build that succeeds without the engine in it is the failure this
+      # check exists for: autolinking can quietly find nothing.
+      - name: Check the engine is in the apk
+        run: |
+          apk=example/android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libquickjsinstancejni.so'
+          unzip -l "$apk" | grep 'lib/arm64-v8a/'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-debug-apk
+          path: example/android/app/build/outputs/apk/debug/app-debug.apk
