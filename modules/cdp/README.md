@@ -1,7 +1,7 @@
 # The Chrome DevTools Protocol, for QuickJS
 
 Two files. `quickjs-cdp.h` is the API, `quickjs-cdp.c` is the whole
-implementation — about 1,100 lines of C over `<quickjs.h>` and nothing else.
+implementation — about 1,360 lines of C over `<quickjs.h>` and nothing else.
 
 ## What the protocol is
 
@@ -117,14 +117,70 @@ lines that name an engine adapter and changes nothing else. A failing-test list
 from a suite we did not write is a work plan in a way our own assertions are
 not.
 
-Measured 2026-09-01, macOS arm64: **22 pass, 5 fail, 0 crash of 27.**
+Measured 2026-09-01, macOS arm64: **26 pass, 1 fail, 0 crash of 27.**
 
-| still failing | why |
+The one failure is `testCaptureAndSerializeStackTrace`, and only its column
+numbers: we report the first character of the callee where the suite expects the
+opening paren. Frame count, function names, script ids and line numbers all
+match. The engine records a frame's column from the pc2line table at the call
+instruction, so closing this means changing what the engine records, not what
+this layer reports.
+
+## What it does not do yet
+
+Worth knowing, because several of these are accepted and quietly ignored rather
+than refused -- the frontend gets an empty success and nothing happens:
+
+| | |
 |---|---|
-| `testCaptureAndSerializeStackTrace` | column numbers. We report the first character of the callee, the suite expects the opening paren. Frame count, names, script ids and line numbers all match |
-| `ResolveColumnlessBreakpointAfterReload`, `ResolveColumnBreakpointAfterReload` | breakpoints do not survive a reload. Needs `RuntimeAgentDelegate::getExportedState` |
-| `TwoConnectionsDebuggerLifecycle` | enabling and disabling the debugger from two frontends at once |
-| `HermesObjectsTableDoesNotMemoryLeak` | the remote object table is never trimmed while a session lives |
+| `Debugger.setPauseOnExceptions` | accepted, ignored. The engine has no throw hook to hang it on |
+| `Debugger.setBlackboxPatterns`, `setBlackboxedRanges` | accepted, ignored |
+| `Debugger.setSkipAllPauses` | accepted, ignored |
+| breakpoint `condition` | stored and handed back, never evaluated. A conditional breakpoint stops every time |
+| `Debugger.setBreakpoint` | not implemented. Breakpoints are set by URL only |
+| `Runtime.callFunctionOn`, `compileScript`, `globalLexicalScopeNames` | not implemented |
+
+## Roadmap
+
+Roughly in order of value for effort. The first group needs nothing from the
+engine that is not already there.
+
+**Cheap, and the engine already supports them**
+
+- **Evaluate breakpoint conditions.** The condition is already stored; this is
+  a `JS_EvalInStackFrame` at the trap and a check of the result.
+- **`Debugger.setSkipAllPauses`** -- one flag consulted in `on_statement`.
+- **`Debugger.continueToLocation`** -- a one-shot breakpoint, then resume.
+- **`Debugger.setBreakpoint`** -- the same as `setBreakpointByUrl` addressed by
+  scriptId instead of URL.
+- **`Runtime.terminateExecution`** -- `JS_SetInterruptHandler` already exists to
+  stop a running program.
+- **`Runtime.callFunctionOn`** -- call a function against an object the frontend
+  holds by objectId. Used by DevTools when expanding values.
+
+**Needs a little engine work**
+
+- **`Debugger.getPossibleBreakpoints`** -- answerable properly from the pc2line
+  table; today a frontend gets back only the location it asked about.
+- **Pause on exceptions.** Needs a seam at `OP_throw` rather than at `JS_Throw`,
+  which is called internally and would fire spuriously.
+- **Stack trace columns**, to match what other engines report.
+
+**Whole domains**
+
+- **`Profiler`.** Sample the stack on a timer and return a `Profile` of nodes,
+  samples and time deltas. `JS_SetInterruptHandler` already runs periodically on
+  the JS thread at a safe point, which is the hard part of sampling solved.
+- **`HeapProfiler`.** `takeHeapSnapshot` streams a column-oriented document --
+  flat integer arrays of nodes and edges over a string table -- built by a
+  traversal shaped like the mark phase. Note that this needs backpressure, not
+  just a chunk loop: React Native has an open bug where snapshots over about
+  100 MB overflow the WebSocket send queue and close the connection.
+
+**Probably not**
+
+`Debugger.setScriptSource` (live edit), `restartFrame` and `setReturnValue` all
+need the engine to rewrite or unwind a live frame, which QuickJS cannot do.
 
 ## Using it
 
