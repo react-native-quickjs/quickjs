@@ -15,14 +15,10 @@
 
 namespace qjs {
 
-// The release path reads jsThread_ from threads that do not own the engine, so
-// a lock inside the atomic would be a lock on every jsi::Value destructor.
 static_assert(
     std::atomic<std::thread::id>::is_always_lock_free,
     "std::thread::id must be lock-free to be read on the release path");
 
-// jsi::Runtime is abstract, so a missing override would otherwise only show up
-// at the first attempt to construct one, which is in another translation unit.
 static_assert(
     !std::is_abstract<QuickJSRuntime>::value,
     "QuickJSRuntime does not implement every jsi::Runtime method");
@@ -66,9 +62,8 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
   enumeratePropertyNames_ = evalInternal(kEnumeratePropertyNamesSource);
 }
 
-/// Evaluates a runtime-private helper. Returns undefined rather than throwing,
-/// because a runtime that cannot build its helpers is still usable for
-/// everything that does not need them.
+/// Undefined rather than throwing: a runtime that cannot build a helper is
+/// still usable for everything that does not need it.
 JSValue QuickJSRuntime::evalInternal(const char *source) noexcept {
   JSValue fn = JS_Eval(
       context_, source, std::strlen(source), "<jsi-internal>",
@@ -82,7 +77,6 @@ JSValue QuickJSRuntime::evalInternal(const char *source) noexcept {
 
 QuickJSRuntime::~QuickJSRuntime() {
   drainPendingReleases();
-
   JS_FreeValue(context_, enumeratePropertyNames_);
 
   if (context_ != nullptr) {
@@ -91,11 +85,8 @@ QuickJSRuntime::~QuickJSRuntime() {
   }
 
   if (runtime_ != nullptr) {
-    // The global object sits in reference cycles, so dropping the context only
-    // makes it collectable. Objects hanging off it can own jsi values, and
-    // releasing those from a finalizer dirties the heap again. JS_FreeRuntime
-    // runs one GC pass and then asserts the heap is empty, so collect until it
-    // settles first.
+    // JS_FreeRuntime runs one GC pass then asserts the heap is empty, but a
+    // finalizer releasing a jsi value dirties it again, so settle first.
     for (int pass = 0; pass < kMaxTeardownGCPasses; ++pass) {
       JS_RunGC(runtime_);
       drainPendingReleases();
@@ -104,79 +95,49 @@ QuickJSRuntime::~QuickJSRuntime() {
     runtime_ = nullptr;
   }
 
-  // After the engine, because recycling during teardown still touches the free
-  // list.
+  // After the engine: teardown still recycles into the free list.
   freePointerValuePool();
 }
 
 void QuickJSRuntime::lock() noexcept {
   engineMutex_.lock();
-  if (++lockDepth_ > 1) {
-    return;
-  }
-  // Ownership may have moved since the last acquisition, and a different thread
-  // means a different stack and a different set of queued releases.
-  if (!isOnJSThread()) {
-    rebaseOntoCurrentThread();
-  }
+  adoptCurrentThread();
   drainPendingReleases();
 }
 
 void QuickJSRuntime::unlock() noexcept {
-  --lockDepth_;
   engineMutex_.unlock();
 }
 
 /**
- * Binds the runtime to the thread that runs JavaScript.
- *
  * quickjs captures rt->stack_top inside JS_NewRuntime, on whichever thread
- * called it, and bounds recursion against it. React Native constructs the
- * runtime on one thread and runs JavaScript on another, where the stack pointer
- * measured 1,115,672 bytes below that mark -- already past the 1 MiB default --
- * so every call threw "Maximum call stack size exceeded" and the app aborted
- * while loading its bundle.
+ * called it. On React Native's JS thread that mark was 1,115,672 bytes above
+ * the real stack pointer, so every call threw "Maximum call stack size
+ * exceeded" and the app aborted while loading its bundle.
  *
- * The budget is recomputed, not just re-based: a 1 MiB budget on a thread with
- * less than 1 MiB below the new mark puts the limit past the end of the real
- * mapping, trading a spurious RangeError for a stack smash. Three quarters of
- * the measured remainder is assumed rather than tuned -- the quarter held back
- * covers the native frames between the overflow check and the deepest point
- * reached after it.
+ * The budget is recomputed rather than only re-based, because a 1 MiB default
+ * on a smaller thread puts the limit past the end of the mapping and trades a
+ * catchable RangeError for a stack smash. The quarter held back covers the
+ * native frames reached after the overflow check fires.
  */
-void QuickJSRuntime::rebaseOntoCurrentThread() noexcept {
-  jsThread_.store(std::this_thread::get_id(), std::memory_order_relaxed);
-  if (runtime_ == nullptr) {
+void QuickJSRuntime::adoptCurrentThread() noexcept {
+  if (isOnJSThread() || runtime_ == nullptr) {
     return;
   }
+  jsThread_.store(std::this_thread::get_id(), std::memory_order_relaxed);
   JS_UpdateStackTop(runtime_);
 
   if (config_.stackSize > 0) {
-    return;  // the embedder chose; JS_UpdateStackTop already re-based it.
-  }
-  const size_t remaining = remainingNativeStackBytes();
-  if (remaining == 0) {
-    return;  // the platform could not say, so leave the engine default alone.
-  }
-  JS_SetMaxStackSize(runtime_, remaining / 4 * 3);
-}
-
-void QuickJSRuntime::adoptCurrentThreadAsJSThread() noexcept {
-  if (jsThreadAdopted_) {
     return;
   }
-  jsThreadAdopted_ = true;
-  rebaseOntoCurrentThread();
+  const size_t remaining = remainingNativeStackBytes();
+  if (remaining > 0) {
+    JS_SetMaxStackSize(runtime_, remaining / 4 * 3);
+  }
 }
 
-/**
- * quickjs's bound is only meaningful if stack_size is smaller than the stack
- * that actually exists below stack_top. Its default is 1 MiB; React Native's
- * Android JS thread is created with the platform default, which is not 1 MiB
- * and differs between ART versions and ABIs. So the budget is derived from the
- * mapping rather than chosen, and 0 means the caller must leave the engine
- * default alone rather than guess.
- */
+/// 0 when the platform cannot say, so the caller leaves the engine default
+/// alone rather than guessing.
 size_t QuickJSRuntime::remainingNativeStackBytes() noexcept {
   char here = 0;
   const auto sp = reinterpret_cast<uintptr_t>(&here);
@@ -231,10 +192,8 @@ void QuickJSRuntime::releaseAtom(JSAtom atom) noexcept {
 }
 
 void QuickJSRuntime::drainPendingReleases() noexcept {
-  // Runs on every call into JS, where the queue is almost always empty, so the
-  // common case is one relaxed load rather than a mutex. Racing a producer is
-  // harmless: the flag is set after the push, so a release landing just after
-  // this load is drained by the next call. These frees have no deadline.
+  // Racing a producer is harmless: the flag is set after the push, so a release
+  // landing just after this load is drained by the next call.
   if (!hasPendingReleases_.load(std::memory_order_acquire)) {
     return;
   }
@@ -272,7 +231,6 @@ void QuickJSRuntime::refillValueSlab() {
   auto *slab = static_cast<QuickJSPointerValue *>(
       ::operator new(sizeof(QuickJSPointerValue) * kPointerValueSlabSize));
   valueSlabs_.push_back(slab);
-  // Raw storage: slots are constructed in place on allocation, not here.
   for (size_t i = 0; i < kPointerValueSlabSize; ++i) {
     auto *slot = slab + i;
     slot->nextFree_ = freeValues_;
@@ -305,9 +263,6 @@ void QuickJSRuntime::queueAtomPointerValue(
 }
 
 void QuickJSRuntime::freePointerValuePool() noexcept {
-  // Anything still live here is a JSI pointer the embedder outlived the runtime
-  // with, which is already undefined behaviour and not something the pool can
-  // repair.
   for (void *slab : valueSlabs_) {
     ::operator delete(slab);
   }
@@ -446,12 +401,10 @@ jsi::PropNameID QuickJSRuntime::createPropNameIDFrom(JSAtom atom) {
 }
 
 /**
- * Runs where describing an exception the normal way has already failed, or is
- * about to: JS_ToCString on an Error calls its toString, reading .message can
- * hit an accessor, and reading .stack is exactly what jsi::JSError does and
- * exactly what was throwing. So this reads own properties only, and swallows
- * anything they raise, because the caller is about to throw a C++ exception and
- * a stray pending JS exception would surface later against unrelated code.
+ * Runs where describing an exception normally has already failed: JS_ToCString
+ * calls toString, and reading .stack is what jsi::JSError does and what was
+ * throwing. So own properties only, and anything they raise is swallowed --
+ * a pending exception left behind would surface later against unrelated code.
  */
 std::string QuickJSRuntime::describeExceptionWithoutRunningJS(
     JSValue exception) {
@@ -490,8 +443,6 @@ std::string QuickJSRuntime::describeExceptionWithoutRunningJS(
   std::string name = readString("name");
   std::string message = readString("message");
   if (name.empty() && message.empty()) {
-    // Never empty: at the call site that is indistinguishable from "no original
-    // exception was recorded".
     return "<indescribable exception>";
   }
   if (message.empty()) {
@@ -513,16 +464,13 @@ void QuickJSRuntime::throwPendingError() {
 
   if (errorDepth_ >= kMaxErrorDepth) {
     JS_FreeValue(context_, exception);
-    // Report the outermost exception: by the time the bound is reached this one
-    // is a failure that happened while describing the original, and naming it
-    // explains nothing.
     std::string what =
         "QuickJSRuntime: exception thrown while handling an exception";
     if (!firstErrorDescription_.empty()) {
       what += "; original exception: " + firstErrorDescription_;
     }
     // A recursive bail-out is usually a stack-limit problem, and the limit is
-    // the one thing about it invisible from JavaScript.
+    // the one thing invisible from JavaScript.
     what += "; jsThreadOwnsEngine=";
     what += isOnJSThread() ? "true" : "false";
     what +=
@@ -545,8 +493,6 @@ void QuickJSRuntime::throwPendingError() {
     }
   } guard(errorDepth_);
 
-  // JS_GetException already cleared the pending exception, so the reads inside
-  // JSError start from a clean slate.
   throw jsi::JSError(*this, createValue(exception));
 }
 
@@ -565,8 +511,7 @@ void QuickJSRuntime::checkException(int result) {
 
 JSValue QuickJSRuntime::throwAsJSException(
     const std::exception *e, const char *origin) noexcept {
-  // A JSError already carries a thrown JS value, so rethrow it unchanged rather
-  // than reshaping it.
+  // A JSError already carries a thrown JS value, so rethrow it unchanged.
   if (const auto *jsError = dynamic_cast<const jsi::JSError *>(e)) {
     return JS_Throw(
         context_, JS_DupValue(context_, toJSValue(jsError->value())));
@@ -879,8 +824,8 @@ bool QuickJSRuntime::isHostFunction(const jsi::Function &) const {
 }
 
 jsi::Array QuickJSRuntime::getPropertyNames(const jsi::Object &object) {
-  // JSI wants own and inherited enumerable string keys, which is exactly
-  // for-in, and quickjs has no C API for that.
+  // Own and inherited enumerable string keys is exactly for-in, which has no
+  // C API.
   JSValue argument = toJSValue(object);
   JSValue names =
       JS_Call(context_, enumeratePropertyNames_, JS_UNDEFINED, 1, &argument);

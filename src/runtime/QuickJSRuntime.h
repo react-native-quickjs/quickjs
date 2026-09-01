@@ -42,28 +42,14 @@ class QuickJSRuntime : public jsi::Runtime {
   }
 
   /**
-   * Serialises access to the engine so more than one embedding layer -- a JSI
-   * runtime and a Node-API runtime in the same app, say -- can run JavaScript
-   * on different threads.
+   * Serialises access to the engine so more than one embedder can run
+   * JavaScript on different threads. Lock where native enters JavaScript,
+   * unlock when it leaves; the JSI methods in between do no locking.
    *
-   * Held at the boundary, not per call: lock where native enters JavaScript,
-   * do the work, unlock. Everything in between -- property reads, calls,
-   * allocation -- is already covered, so JSI methods do no locking of their
-   * own.
-   *
-   * Acquiring transfers engine ownership to the calling thread. The recursion
-   * bound is re-based onto that thread's stack, and its releases take the
-   * inline path instead of the cross-thread queue.
-   *
-   * Recursive, so a host function called from JavaScript can lock defensively
-   * without deadlocking against the boundary lock it is already running under.
-   *
-   * The contract is all-or-nothing. quickjs does no locking of its own, so once
-   * a second thread runs JavaScript, every entry point must hold this. An
-   * embedder that only ever uses one thread never calls it and pays nothing.
-   *
-   * Dropping a jsi::Value is the one thing that needs no lock: an off-thread
-   * release is queued and freed by whichever thread next owns the engine.
+   * All-or-nothing: quickjs locks nothing itself, so once a second thread runs
+   * JavaScript every entry point must hold this. A single-threaded embedder
+   * never calls it and pays nothing. Dropping a jsi::Value is the exception --
+   * an off-thread release is queued rather than blocked.
    */
   void lock() noexcept;
   void unlock() noexcept;
@@ -83,32 +69,23 @@ class QuickJSRuntime : public jsi::Runtime {
     QuickJSRuntime &runtime_;
   };
 
-  /// Whether the calling thread currently owns the engine.
   bool isOnJSThread() const noexcept {
     return jsThread_.load(std::memory_order_relaxed) ==
            std::this_thread::get_id();
   }
 
-  /// Re-bases the recursion bound onto the calling thread and makes it the
-  /// owner. lock() does this on every handover; an embedder that never locks
-  /// calls it once, at the first evaluate, because React Native constructs the
-  /// runtime on one thread and runs JavaScript on another.
-  void adoptCurrentThreadAsJSThread() noexcept;
+  /// Makes the calling thread the owner and re-bases the recursion bound onto
+  /// its stack. A no-op when it already owns the engine. lock() calls it on
+  /// every handover; an embedder that never locks calls it at its first
+  /// evaluate, since React Native builds the runtime on one thread and runs
+  /// JavaScript on another.
+  void adoptCurrentThread() noexcept;
 
-  /// Bytes of native stack below the caller's frame, from the OS, or 0 if the
-  /// platform cannot say. Never guesses.
   static size_t remainingNativeStackBytes() noexcept;
 
-  /**
-   * Backing store for jsi::Symbol, jsi::BigInt, jsi::String and jsi::Object.
-   *
-   * Holds one reference on a JSValue. JSI clones by creating a new instance and
-   * releases through invalidate(), which may run on any thread -- a TurboModule
-   * dropping a jsi::Value on a background thread is normal -- so the release is
-   * routed through releaseValue().
-   *
-   * Nested because jsi::Runtime::PointerValue is protected.
-   */
+  /// Holds one reference on a JSValue. invalidate() may run on any thread, so
+  /// the release is routed through releaseValue(). Nested because
+  /// jsi::Runtime::PointerValue is protected.
   class QuickJSPointerValue final : public PointerValue {
    public:
     QuickJSPointerValue(
@@ -116,8 +93,6 @@ class QuickJSRuntime : public jsi::Runtime {
         : runtime_(runtime), owned_(owned), value_(value) {}
 
     void invalidate() noexcept override {
-      // A borrowed wrapper carries no reference of its own, so releasing one
-      // would drop somebody else's. See borrowValue().
       if (owned_) {
         runtime_.releaseValue(value_);
       }
@@ -140,8 +115,8 @@ class QuickJSRuntime : public jsi::Runtime {
     };
   };
 
-  /// Backing store for jsi::PropNameID, which maps onto a JSAtom. Atoms are
-  /// interned and comparable by identity, which is what PropNameID needs.
+  /// Backing store for jsi::PropNameID. Atoms are interned and comparable by
+  /// identity, which is what PropNameID needs.
   class QuickJSAtomPointerValue final : public PointerValue {
    public:
     QuickJSAtomPointerValue(QuickJSRuntime &runtime, JSAtom atom)
@@ -353,20 +328,11 @@ class QuickJSRuntime : public jsi::Runtime {
 
  private:
   void drainPendingReleases() noexcept;
-  void rebaseOntoCurrentThread() noexcept;
   JSValue evalInternal(const char *source) noexcept;
 
-  /**
-   * PointerValues are the most allocated object in a JSI binding: one per
-   * jsi::Object, String, Symbol, BigInt and PropNameID crossing the boundary.
-   * new/delete measured ~20 ns against a ~4.5 ns property lookup, so the
-   * wrapper cost several times the work it wrapped. They are fixed-size and
-   * freed in no order, so a slab plus an intrusive free list threaded through
-   * the slot's own payload costs no extra memory.
-   *
-   * Inline because an out-of-line call was a measurable part of what the pool
-   * was meant to remove.
-   */
+  // Pooled: one PointerValue per jsi value crossing the boundary, and
+  // new/delete measured ~20 ns against a ~4.5 ns property lookup. Inline
+  // because the call itself was a measurable part of that cost.
   QuickJSPointerValue *allocPointerValue(JSValue value, bool owned = true) {
     if (freeValues_ == nullptr) {
       refillValueSlab();
@@ -417,26 +383,18 @@ class QuickJSRuntime : public jsi::Runtime {
   JSRuntime *runtime_{nullptr};
   JSContext *context_{nullptr};
 
-  // Atomic because lock() moves ownership between threads while other threads
-  // are reading it to route their releases.
+  // Atomic because ownership moves while other threads read it to route their
+  // releases. Recursive so a host function called from JavaScript can lock
+  // without deadlocking against the boundary lock it already runs under.
   std::atomic<std::thread::id> jsThread_;
-
   std::recursive_mutex engineMutex_;
-  unsigned lockDepth_{0};
-  bool jsThreadAdopted_{false};
 
-  // Building a jsi::JSError reads .message and .stack, which can itself throw.
-  // Bounding the nesting stops a pathological error object, or a stack overflow
-  // where every recovery attempt overflows again, from recursing until the
-  // native stack is gone.
+  // Building a jsi::JSError reads .message and .stack, which can throw again.
   int errorDepth_{0};
   static constexpr int kMaxErrorDepth = 8;
 
-  // A JS-free description of the outermost exception, taken once on the way in
-  // and reported if the nesting bound is hit. Without it the bail-out named
-  // only itself: the first device run of a real bundle aborted with eight
-  // nested copies of our own message and nothing about the error that started
-  // it, which on a device is the entire evidence available.
+  // Described on the way in, because by the time the nesting bound is hit the
+  // original exception is gone and the bail-out would name only itself.
   std::string firstErrorDescription_;
 
   // Engine facilities with no C API, evaluated once at startup.
@@ -447,8 +405,6 @@ class QuickJSRuntime : public jsi::Runtime {
   std::vector<void *> valueSlabs_;
   std::vector<void *> atomSlabs_;
 
-  // hasPendingReleases_ lets the drain exit without touching the mutex, which
-  // matters because it runs on every call into JS.
   std::atomic<bool> hasPendingReleases_{false};
   std::mutex pendingMutex_;
   std::vector<JSValue> pendingValues_;
