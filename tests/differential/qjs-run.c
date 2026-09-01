@@ -13,7 +13,7 @@
  * exposed here that node does not have is a way for the two to disagree for a
  * reason that has nothing to do with the engine.
  *
- * Accepts either JavaScript source or an NSBCNGS container from qjsc-ng, so
+ * Accepts either JavaScript source or an NSBCNGS container from qjsc, so
  * the corpus can be run down both paths -- and they are not the same path:
  * anything the compiler derives from source that the serializer drops is
  * present in one and absent in the other.

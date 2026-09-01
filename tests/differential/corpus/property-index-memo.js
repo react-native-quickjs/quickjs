@@ -53,7 +53,7 @@
 
    Run with:
      node tests/differential/run.mjs
-     node tests/differential/run.mjs --via-bytecode --qjsc <build>/qjsc-ng */
+     node tests/differential/run.mjs --via-bytecode --qjsc <build>/qjsc */
 
 var out = [];
 function log(x) { out.push(String(x)); }

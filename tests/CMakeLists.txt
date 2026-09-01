@@ -43,8 +43,8 @@ target_include_directories(quickjs_jsi_conformance PRIVATE third_party)
 # the real container rather than a hand-written fixture.
 qjs_add_test_suite(quickjs_bytecode_tests bytecode_test.cpp)
 target_compile_definitions(quickjs_bytecode_tests
-  PRIVATE QJSC_NG_PATH="$<TARGET_FILE:qjsc-ng>")
-add_dependencies(quickjs_bytecode_tests qjsc-ng)
+  PRIVATE QJSC_PATH="$<TARGET_FILE:qjsc>")
+add_dependencies(quickjs_bytecode_tests qjsc)
 
 # Drives the C API on JSRuntime/JSContext directly rather than through JSI,
 # because that is the surface a debugger bridge sits on.
@@ -73,7 +73,7 @@ if(NODE_EXECUTABLE)
             --qjs $<TARGET_FILE:qjs-run>)
   add_test(NAME differential_bytecode
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
-            --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc-ng>
+            --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
             --via-bytecode)
 else()
   message(STATUS "rnqjs: node not found, differential corpus will not run")
