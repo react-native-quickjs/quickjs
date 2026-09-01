@@ -1,0 +1,110 @@
+buildscript {
+  ext.ReactNativeQuickJS = [
+    kotlinVersion: "2.0.21",
+    minSdkVersion: 24,
+    compileSdkVersion: 36
+  ]
+
+  ext.getExtOrDefault = { prop ->
+    if (rootProject.ext.has(prop)) {
+      return rootProject.ext.get(prop)
+    }
+
+    return ReactNativeQuickJS[prop]
+  }
+
+  repositories {
+    google()
+    mavenCentral()
+  }
+
+  dependencies {
+    classpath "com.android.tools.build:gradle:8.7.2"
+    // noinspection DifferentKotlinGradleVersion
+    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:${getExtOrDefault('kotlinVersion')}"
+  }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "kotlin-android"
+
+android {
+  namespace "com.ammarahmed.quickjs"
+
+  compileSdkVersion getExtOrDefault("compileSdkVersion")
+
+  defaultConfig {
+    minSdkVersion getExtOrDefault("minSdkVersion")
+
+    externalNativeBuild {
+      cmake {
+        // ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES gives the shared library 16 KB
+        // LOAD alignment. Without it we link at 4 KB while every prebuilt in
+        // the same APK -- libreactnative.so, libjsi.so, libfbjni.so,
+        // libc++_shared.so -- is already 16 KB, and on an Android 15 kernel
+        // the loader refuses ours outright:
+        //
+        //   "...so" program alignment (4096) cannot be smaller than
+        //    system page size (16384)
+        //
+        // The process is killed at System.loadLibrary, so there is no partial
+        // functionality to notice: the app does not start. NDK r27 leaves this
+        // off by default, r28 turns it on, and no host build can see it.
+        arguments "-DANDROID_STL=c++_shared",
+                  "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                  "-DREACT_NATIVE_DIR=${reactNativeDir()}"
+        abiFilters(*reactNativeArchitectures())
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
+  }
+
+  buildFeatures {
+    // Required to consume ReactAndroid::jsi and ReactAndroid::reactnative from
+    // the react-android AAR via find_package(ReactAndroid CONFIG).
+    prefab true
+  }
+
+  packagingOptions {
+    // These ship with React Native itself; a second copy would conflict at
+    // load time.
+    excludes += [
+      "**/libc++_shared.so",
+      "**/libfbjni.so",
+      "**/libjsi.so",
+      "**/libreactnative.so",
+    ]
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+}
+
+// Resolved through node so this works regardless of how the consuming app
+// hoists its node_modules.
+def reactNativeDir() {
+  def resolved = providers.exec {
+    workingDir(rootDir)
+    commandLine("node", "--print", "require.resolve('react-native/package.json')")
+  }.standardOutput.asText.get().trim()
+
+  return new File(resolved).getParentFile().getAbsolutePath()
+}
+
+def reactNativeArchitectures() {
+  def value = rootProject.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+  implementation "com.facebook.fbjni:fbjni:0.7.0"
+}
