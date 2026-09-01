@@ -8,9 +8,11 @@
 #pragma once
 
 #include <jsi/jsi.h>
+#include <pthread.h>
 #include <quickjs.h>
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <new>
 #include <string>
@@ -38,6 +40,64 @@ class QuickJSRuntime : public jsi::Runtime {
   JSContext *context() const noexcept {
     return context_;
   }
+
+  /**
+   * Serialises access to the engine so more than one embedding layer -- a JSI
+   * runtime and a Node-API runtime in the same app, say -- can run JavaScript
+   * on different threads.
+   *
+   * Held at the boundary, not per call: lock where native enters JavaScript,
+   * do the work, unlock. Everything in between -- property reads, calls,
+   * allocation -- is already covered, so JSI methods do no locking of their
+   * own.
+   *
+   * Acquiring transfers engine ownership to the calling thread. The recursion
+   * bound is re-based onto that thread's stack, and its releases take the
+   * inline path instead of the cross-thread queue.
+   *
+   * Recursive, so a host function called from JavaScript can lock defensively
+   * without deadlocking against the boundary lock it is already running under.
+   *
+   * The contract is all-or-nothing. quickjs does no locking of its own, so once
+   * a second thread runs JavaScript, every entry point must hold this. An
+   * embedder that only ever uses one thread never calls it and pays nothing.
+   *
+   * Dropping a jsi::Value is the one thing that needs no lock: an off-thread
+   * release is queued and freed by whichever thread next owns the engine.
+   */
+  void lock() noexcept;
+  void unlock() noexcept;
+
+  class Lock {
+   public:
+    explicit Lock(QuickJSRuntime &runtime) noexcept : runtime_(runtime) {
+      runtime_.lock();
+    }
+    ~Lock() {
+      runtime_.unlock();
+    }
+    Lock(const Lock &) = delete;
+    Lock &operator=(const Lock &) = delete;
+
+   private:
+    QuickJSRuntime &runtime_;
+  };
+
+  /// Whether the calling thread currently owns the engine.
+  bool isOnJSThread() const noexcept {
+    return jsThread_.load(std::memory_order_relaxed) ==
+           std::this_thread::get_id();
+  }
+
+  /// Re-bases the recursion bound onto the calling thread and makes it the
+  /// owner. lock() does this on every handover; an embedder that never locks
+  /// calls it once, at the first evaluate, because React Native constructs the
+  /// runtime on one thread and runs JavaScript on another.
+  void adoptCurrentThreadAsJSThread() noexcept;
+
+  /// Bytes of native stack below the caller's frame, from the OS, or 0 if the
+  /// platform cannot say. Never guesses.
+  static size_t remainingNativeStackBytes() noexcept;
 
   /**
    * Backing store for jsi::Symbol, jsi::BigInt, jsi::String and jsi::Object.
@@ -277,6 +337,7 @@ class QuickJSRuntime : public jsi::Runtime {
 
  private:
   void drainPendingReleases() noexcept;
+  void rebaseOntoCurrentThread() noexcept;
 
   /**
    * PointerValues are the most allocated object in a JSI binding: one per
@@ -309,7 +370,7 @@ class QuickJSRuntime : public jsi::Runtime {
   }
 
   void recyclePointerValue(QuickJSPointerValue *pv) noexcept {
-    if (std::this_thread::get_id() == jsThread_) {
+    if (isOnJSThread()) {
       pv->nextFree_ = freeValues_;
       freeValues_ = pv;
       return;
@@ -318,7 +379,7 @@ class QuickJSRuntime : public jsi::Runtime {
   }
 
   void recycleAtomPointerValue(QuickJSAtomPointerValue *pv) noexcept {
-    if (std::this_thread::get_id() == jsThread_) {
+    if (isOnJSThread()) {
       pv->nextFree_ = freeAtoms_;
       freeAtoms_ = pv;
       return;
@@ -338,7 +399,14 @@ class QuickJSRuntime : public jsi::Runtime {
   QuickJSRuntimeConfig config_;
   JSRuntime *runtime_{nullptr};
   JSContext *context_{nullptr};
-  std::thread::id jsThread_;
+
+  // Atomic because lock() moves ownership between threads while other threads
+  // are reading it to route their releases.
+  std::atomic<std::thread::id> jsThread_;
+
+  std::recursive_mutex engineMutex_;
+  unsigned lockDepth_{0};
+  bool jsThreadAdopted_{false};
 
   QuickJSPointerValue *freeValues_{nullptr};
   QuickJSAtomPointerValue *freeAtoms_{nullptr};

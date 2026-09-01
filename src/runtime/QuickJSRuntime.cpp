@@ -7,11 +7,18 @@
 
 #include "QuickJSRuntime.h"
 
+#include <cstdint>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace qjs {
+
+// The release path reads jsThread_ from threads that do not own the engine, so
+// a lock inside the atomic would be a lock on every jsi::Value destructor.
+static_assert(
+    std::atomic<std::thread::id>::is_always_lock_free,
+    "std::thread::id must be lock-free to be read on the release path");
 
 // jsi::Runtime is abstract, so a missing override would otherwise only show up
 // at the first attempt to construct one, which is in another translation unit.
@@ -80,8 +87,108 @@ QuickJSRuntime::~QuickJSRuntime() {
   freePointerValuePool();
 }
 
+void QuickJSRuntime::lock() noexcept {
+  engineMutex_.lock();
+  if (++lockDepth_ > 1) {
+    return;
+  }
+  // Ownership may have moved since the last acquisition, and a different thread
+  // means a different stack and a different set of queued releases.
+  if (!isOnJSThread()) {
+    rebaseOntoCurrentThread();
+  }
+  drainPendingReleases();
+}
+
+void QuickJSRuntime::unlock() noexcept {
+  --lockDepth_;
+  engineMutex_.unlock();
+}
+
+/**
+ * Binds the runtime to the thread that runs JavaScript.
+ *
+ * quickjs captures rt->stack_top inside JS_NewRuntime, on whichever thread
+ * called it, and bounds recursion against it. React Native constructs the
+ * runtime on one thread and runs JavaScript on another, where the stack pointer
+ * measured 1,115,672 bytes below that mark -- already past the 1 MiB default --
+ * so every call threw "Maximum call stack size exceeded" and the app aborted
+ * while loading its bundle.
+ *
+ * The budget is recomputed, not just re-based: a 1 MiB budget on a thread with
+ * less than 1 MiB below the new mark puts the limit past the end of the real
+ * mapping, trading a spurious RangeError for a stack smash. Three quarters of
+ * the measured remainder is assumed rather than tuned -- the quarter held back
+ * covers the native frames between the overflow check and the deepest point
+ * reached after it.
+ */
+void QuickJSRuntime::rebaseOntoCurrentThread() noexcept {
+  jsThread_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+  if (runtime_ == nullptr) {
+    return;
+  }
+  JS_UpdateStackTop(runtime_);
+
+  if (config_.stackSize > 0) {
+    return;  // the embedder chose; JS_UpdateStackTop already re-based it.
+  }
+  const size_t remaining = remainingNativeStackBytes();
+  if (remaining == 0) {
+    return;  // the platform could not say, so leave the engine default alone.
+  }
+  JS_SetMaxStackSize(runtime_, remaining / 4 * 3);
+}
+
+void QuickJSRuntime::adoptCurrentThreadAsJSThread() noexcept {
+  if (jsThreadAdopted_) {
+    return;
+  }
+  jsThreadAdopted_ = true;
+  rebaseOntoCurrentThread();
+}
+
+/**
+ * quickjs's bound is only meaningful if stack_size is smaller than the stack
+ * that actually exists below stack_top. Its default is 1 MiB; React Native's
+ * Android JS thread is created with the platform default, which is not 1 MiB
+ * and differs between ART versions and ABIs. So the budget is derived from the
+ * mapping rather than chosen, and 0 means the caller must leave the engine
+ * default alone rather than guess.
+ */
+size_t QuickJSRuntime::remainingNativeStackBytes() noexcept {
+  char here = 0;
+  const auto sp = reinterpret_cast<uintptr_t>(&here);
+#if defined(__ANDROID__) || defined(__linux__)
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+    return 0;
+  }
+  void *base = nullptr;
+  size_t size = 0;
+  const int rc = pthread_attr_getstack(&attr, &base, &size);
+  pthread_attr_destroy(&attr);
+  if (rc != 0 || base == nullptr || size == 0) {
+    return 0;
+  }
+  // pthread_attr_getstack reports the lowest address; the stack grows down.
+  const auto lowest = reinterpret_cast<uintptr_t>(base);
+  return sp > lowest ? static_cast<size_t>(sp - lowest) : 0;
+#elif defined(__APPLE__)
+  void *high = pthread_get_stackaddr_np(pthread_self());
+  const size_t size = pthread_get_stacksize_np(pthread_self());
+  if (high == nullptr || size == 0) {
+    return 0;
+  }
+  const auto lowest = reinterpret_cast<uintptr_t>(high) - size;
+  return sp > lowest ? static_cast<size_t>(sp - lowest) : 0;
+#else
+  (void)sp;
+  return 0;
+#endif
+}
+
 void QuickJSRuntime::releaseValue(JSValue value) noexcept {
-  if (std::this_thread::get_id() == jsThread_) {
+  if (isOnJSThread()) {
     JS_FreeValueRT(runtime_, value);
     return;
   }
@@ -92,7 +199,7 @@ void QuickJSRuntime::releaseValue(JSValue value) noexcept {
 }
 
 void QuickJSRuntime::releaseAtom(JSAtom atom) noexcept {
-  if (std::this_thread::get_id() == jsThread_) {
+  if (isOnJSThread()) {
     JS_FreeAtomRT(runtime_, atom);
     return;
   }
