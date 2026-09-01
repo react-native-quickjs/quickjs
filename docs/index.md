@@ -19,9 +19,9 @@ features:
   - title: Fast
     details: A small, fast interpreter that starts quickly and stays light while it runs.
   - title: Small
-    details: About 1.5 MB of compiled engine in your app.
+    details: About 1 MB of compiled engine in your app.
   - title: Debugging support
-    details: Chrome DevTools over React Native's own debugger — breakpoints, stepping, call stacks, variable inspection and console. Debug builds only.
+    details: Chrome DevTools over React Native's own debugger — breakpoints, stepping, call stacks, variable inspection and console.
   - title: Built from source
     details: The engine compiles with your app, from the C sources in the package. Nothing prebuilt is downloaded.
 ---
