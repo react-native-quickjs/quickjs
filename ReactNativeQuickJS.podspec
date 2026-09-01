@@ -76,8 +76,12 @@ Pod::Spec.new do |s|
     # on for the host and Android builds. quickjs.h declares the debugger entry
     # points either way, so a build that compiles them out fails at link rather
     # than at the call site.
+    #
+    # RNQJS_ENABLE_CDP is deliberately absent: undefined means the DevTools
+    # backend is not compiled in, and react_native_quickjs_post_install defines
+    # it for debug configurations only.
     "GCC_PREPROCESSOR_DEFINITIONS" =>
-      "$(inherited) _GNU_SOURCE=1 JS_ENABLE_DEBUGGER=1 RNQJS_ENABLE_CDP=1",
+      "$(inherited) _GNU_SOURCE=1 JS_ENABLE_DEBUGGER=1",
     "USE_HEADERMAP" => "YES",
   }
 

@@ -71,6 +71,8 @@
 # as "use Hermes".
 
 def react_native_quickjs_post_install(installer)
+  react_native_quickjs_set_cdp_for_debug(installer)
+
   projects = installer.aggregate_targets
     .map { |t| t.user_project }
     .uniq { |p| p.path }
@@ -88,4 +90,28 @@ def react_native_quickjs_post_install(installer)
     "[ReactNativeQuickJS] USE_HERMES=false — release bundles will be plain " \
     "JavaScript, not Hermes bytecode.".green
   )
+end
+
+# The Chrome DevTools Protocol backend is compiled into debug configurations
+# only -- the same gate React Native puts on its own inspector, in
+# scripts/cocoapods/utils.rb's set_gcc_preprocessor_definition_for_debugger.
+#
+# QuickJSInstance::debuggerEnabledByDefault() already refuses to attach a
+# debugger in a release build, so without this the release binary would carry a
+# backend nothing can reach. Keyed on config.type rather than the name, so an
+# app whose debug configuration is called something else still gets it.
+def react_native_quickjs_set_cdp_for_debug(installer)
+  installer.target_installation_results.pod_target_installation_results
+    .each do |pod_name, result|
+      next unless pod_name.to_s == "ReactNativeQuickJS"
+
+      result.native_target.build_configurations.each do |config|
+        next unless config.type == :debug
+
+        defs = config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] || "$(inherited)"
+        defs = defs.join(" ") if defs.is_a?(Array)
+        config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] =
+          "#{defs} RNQJS_ENABLE_CDP=1"
+      end
+    end
 end

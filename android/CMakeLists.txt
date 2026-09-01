@@ -60,15 +60,24 @@ target_link_libraries(quickjsinstancejni
 
 # --- Chrome DevTools Protocol ----------------------------------------------
 #
-# On by default: a debugger that cannot be switched on is not a debugger. What
-# stays off by default is the runtime flag, QuickJSRuntimeConfig::enableDebugger
-# -- see modules/cdp/README.md for why that decision has to precede the first
-# parse.
+# Compiled into debug builds and left out of release builds, testing the same
+# two conditions React Native puts on its own inspector -- see
+# ReactCommon/jsinspector-modern/CMakeLists.txt. The runtime flag,
+# QuickJSRuntimeConfig::enableDebugger, already follows the configuration
+# through QuickJSInstance::debuggerEnabledByDefault(); gating the sources here
+# keeps the two answers in agreement rather than shipping a backend a release
+# build can never reach. -DRNQJS_ENABLE_CDP=ON puts it back either way.
 #
 # The two sources are compiled here rather than through modules/cdp's own
 # CMakeLists because that file also declares a host test target. Two files is
 # less machinery than teaching it to be cross-compiled.
-option(RNQJS_ENABLE_CDP "Compile in the Chrome DevTools Protocol backend" ON)
+if(CMAKE_BUILD_TYPE MATCHES Debug OR REACT_NATIVE_DEBUG_OPTIMIZED)
+  set(RNQJS_CDP_DEFAULT ON)
+else()
+  set(RNQJS_CDP_DEFAULT OFF)
+endif()
+option(RNQJS_ENABLE_CDP "Compile in the Chrome DevTools Protocol backend"
+       ${RNQJS_CDP_DEFAULT})
 
 if(RNQJS_ENABLE_CDP)
   set(CDP_DIR "${RNQJS_ROOT}/modules/cdp")

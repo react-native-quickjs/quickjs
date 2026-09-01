@@ -2076,7 +2076,7 @@ SPEC CHECKSUMS:
   ReactCodegen: 2f0ae2f4bdb77897a207e3f8f26f767d94b2eecd
   ReactCommon: fe2a3af8975e63efa60f95fca8c34dc85deee360
   ReactNativeDependencies: d03cd6c9393b1e3b56764734083adf2bd12df30c
-  ReactNativeQuickJS: 11b6f5c560e26a36444d91bfe5a1d9315ff13ee0
+  ReactNativeQuickJS: 3c4df32c48b10649d3d613230274a9cfa6f33a96
   Yoga: e83c3121d079541e69f3c5c623faaaf933fb5812
 
 PODFILE CHECKSUM: aa28bab3356a08a9cd2094d330578400ea8b8d6e
