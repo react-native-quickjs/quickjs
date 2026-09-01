@@ -126,8 +126,19 @@ jobs:
           pattern: report-*
           merge-multiple: true
 
+      # In a fixed order, and tolerant of a missing one: a job that died before
+      # it could write its report is exactly when this output is worth reading.
       - name: Assemble
-        run: cat report-host.md report-asan.md report-tsan.md > report.md 2>/dev/null || cat report-*.md > report.md
+        run: |
+          : > report.md
+          for name in host asan tsan; do
+            if [ -f "report-$name.md" ]; then
+              cat "report-$name.md" >> report.md
+            else
+              printf '### %s\n\nNo report -- the job did not reach it.\n\n' "$name" >> report.md
+            fi
+          done
+          cat report.md
 
       - uses: actions/upload-artifact@v4
         with:

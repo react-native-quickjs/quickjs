@@ -13,7 +13,20 @@
 
 const fs = require('fs');
 
-const xml = fs.readFileSync(process.argv[2], 'utf8');
+const [, , input, output] = process.argv;
+
+// A build that failed produced no results file. Say so and stop: the real
+// error is further up the log, and a stack trace here only buries it.
+if (!fs.existsSync(input)) {
+  fs.writeFileSync(
+    output,
+    `### ${output.replace(/^report-|\.md$/g, '')}\n\n` +
+      'The suites did not run -- the build failed before `ctest`.\n'
+  );
+  process.exit(1);
+}
+
+const xml = fs.readFileSync(input, 'utf8');
 
 // Matched in two steps rather than one expression: a <testcase> may be
 // self-closing or may wrap a <failure>, and one alternation over both swallows
