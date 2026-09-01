@@ -8,6 +8,7 @@
 #include "QuickJSRuntime.h"
 
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -27,6 +28,9 @@ static_assert(
     "QuickJSRuntime does not implement every jsi::Runtime method");
 
 namespace {
+
+const char *kEnumeratePropertyNamesSource =
+    "(function (o) { const r = []; for (const k in o) r.push(k); return r; })";
 
 [[noreturn]] void notImplemented(const char *what) {
   throw jsi::JSINativeException(
@@ -58,10 +62,28 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
 
   JS_SetContextOpaque(context_, this);
   JS_SetRuntimeOpaque(runtime_, this);
+
+  enumeratePropertyNames_ = evalInternal(kEnumeratePropertyNamesSource);
+}
+
+/// Evaluates a runtime-private helper. Returns undefined rather than throwing,
+/// because a runtime that cannot build its helpers is still usable for
+/// everything that does not need them.
+JSValue QuickJSRuntime::evalInternal(const char *source) noexcept {
+  JSValue fn = JS_Eval(
+      context_, source, std::strlen(source), "<jsi-internal>",
+      JS_EVAL_TYPE_GLOBAL);
+  if (JS_IsException(fn)) {
+    JS_FreeValue(context_, JS_GetException(context_));
+    return JS_UNDEFINED;
+  }
+  return fn;
 }
 
 QuickJSRuntime::~QuickJSRuntime() {
   drainPendingReleases();
+
+  JS_FreeValue(context_, enumeratePropertyNames_);
 
   if (context_ != nullptr) {
     JS_FreeContext(context_);
@@ -732,7 +754,7 @@ std::string QuickJSRuntime::utf8(const jsi::String &string) {
 }
 
 jsi::Object QuickJSRuntime::createObject() {
-  notImplemented("createObject");
+  return createObjectFrom(checkException(JS_NewObject(context_)));
 }
 
 jsi::Object QuickJSRuntime::createObject(std::shared_ptr<jsi::HostObject> ho) {
@@ -750,16 +772,27 @@ jsi::HostFunctionType &QuickJSRuntime::getHostFunction(const jsi::Function &) {
 
 jsi::Object QuickJSRuntime::createObjectWithPrototype(
     const jsi::Value &prototype) {
-  notImplemented("createObjectWithPrototype");
+  if (!prototype.isObject() && !prototype.isNull()) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: prototype must be an object or null");
+  }
+  return createObjectFrom(
+      checkException(JS_NewObjectProto(context_, toJSValue(prototype))));
 }
 
 void QuickJSRuntime::setPrototypeOf(
     const jsi::Object &object, const jsi::Value &prototype) {
-  notImplemented("setPrototypeOf");
+  if (!prototype.isObject() && !prototype.isNull()) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: prototype must be an object or null");
+  }
+  checkException(
+      JS_SetPrototype(context_, toJSValue(object), toJSValue(prototype)));
 }
 
 jsi::Value QuickJSRuntime::getPrototypeOf(const jsi::Object &object) {
-  notImplemented("getPrototypeOf");
+  return createValue(
+      checkException(JS_GetPrototype(context_, toJSValue(object))));
 }
 
 bool QuickJSRuntime::hasNativeState(const jsi::Object &) {
@@ -777,44 +810,64 @@ void QuickJSRuntime::setNativeState(
 }
 
 jsi::Value QuickJSRuntime::getProperty(
-    const jsi::Object &, const jsi::PropNameID &name) {
-  notImplemented("getProperty");
+    const jsi::Object &object, const jsi::PropNameID &name) {
+  return createValue(
+      JS_GetProperty(context_, toJSValue(object), toJSAtom(name)));
 }
 
 jsi::Value QuickJSRuntime::getProperty(
-    const jsi::Object &, const jsi::String &name) {
-  notImplemented("getProperty");
+    const jsi::Object &object, const jsi::String &name) {
+  JSAtom atom = JS_ValueToAtom(context_, toJSValue(name));
+  JSValue value = JS_GetProperty(context_, toJSValue(object), atom);
+  JS_FreeAtom(context_, atom);
+  return createValue(value);
 }
 
 bool QuickJSRuntime::hasProperty(
-    const jsi::Object &, const jsi::PropNameID &name) {
-  notImplemented("hasProperty");
+    const jsi::Object &object, const jsi::PropNameID &name) {
+  int result = JS_HasProperty(context_, toJSValue(object), toJSAtom(name));
+  checkException(result);
+  return result != 0;
 }
 
-bool QuickJSRuntime::hasProperty(const jsi::Object &, const jsi::String &name) {
-  notImplemented("hasProperty");
+bool QuickJSRuntime::hasProperty(
+    const jsi::Object &object, const jsi::String &name) {
+  JSAtom atom = JS_ValueToAtom(context_, toJSValue(name));
+  int result = JS_HasProperty(context_, toJSValue(object), atom);
+  JS_FreeAtom(context_, atom);
+  checkException(result);
+  return result != 0;
 }
 
 void QuickJSRuntime::setPropertyValue(
-    const jsi::Object &, const jsi::PropNameID &name, const jsi::Value &value) {
-  notImplemented("setPropertyValue");
+    const jsi::Object &object, const jsi::PropNameID &name,
+    const jsi::Value &value) {
+  checkException(JS_SetProperty(
+      context_, toJSValue(object), toJSAtom(name),
+      JS_DupValue(context_, toJSValue(value))));
 }
 
 void QuickJSRuntime::setPropertyValue(
-    const jsi::Object &, const jsi::String &name, const jsi::Value &value) {
-  notImplemented("setPropertyValue");
+    const jsi::Object &object, const jsi::String &name,
+    const jsi::Value &value) {
+  JSAtom atom = JS_ValueToAtom(context_, toJSValue(name));
+  int result = JS_SetProperty(
+      context_, toJSValue(object), atom,
+      JS_DupValue(context_, toJSValue(value)));
+  JS_FreeAtom(context_, atom);
+  checkException(result);
 }
 
-bool QuickJSRuntime::isArray(const jsi::Object &) const {
-  notImplemented("isArray");
+bool QuickJSRuntime::isArray(const jsi::Object &object) const {
+  return JS_IsArray(toJSValue(object));
 }
 
-bool QuickJSRuntime::isArrayBuffer(const jsi::Object &) const {
-  notImplemented("isArrayBuffer");
+bool QuickJSRuntime::isArrayBuffer(const jsi::Object &object) const {
+  return JS_IsArrayBuffer(toJSValue(object));
 }
 
-bool QuickJSRuntime::isFunction(const jsi::Object &) const {
-  notImplemented("isFunction");
+bool QuickJSRuntime::isFunction(const jsi::Object &object) const {
+  return JS_IsFunction(context_, toJSValue(object));
 }
 
 bool QuickJSRuntime::isHostObject(const jsi::Object &) const {
@@ -825,8 +878,14 @@ bool QuickJSRuntime::isHostFunction(const jsi::Function &) const {
   notImplemented("isHostFunction");
 }
 
-jsi::Array QuickJSRuntime::getPropertyNames(const jsi::Object &) {
-  notImplemented("getPropertyNames");
+jsi::Array QuickJSRuntime::getPropertyNames(const jsi::Object &object) {
+  // JSI wants own and inherited enumerable string keys, which is exactly
+  // for-in, and quickjs has no C API for that.
+  JSValue argument = toJSValue(object);
+  JSValue names =
+      JS_Call(context_, enumeratePropertyNames_, JS_UNDEFINED, 1, &argument);
+  checkException(names);
+  return make<jsi::Object>(allocPointerValue(names)).getArray(*this);
 }
 
 jsi::WeakObject QuickJSRuntime::createWeakObject(const jsi::Object &) {
@@ -886,31 +945,35 @@ jsi::Value QuickJSRuntime::callAsConstructor(
 
 bool QuickJSRuntime::strictEquals(
     const jsi::Symbol &a, const jsi::Symbol &b) const {
-  notImplemented("strictEquals");
+  return JS_IsStrictEqual(context_, toJSValue(a), toJSValue(b));
 }
 
 bool QuickJSRuntime::strictEquals(
     const jsi::BigInt &a, const jsi::BigInt &b) const {
-  notImplemented("strictEquals");
+  return JS_IsStrictEqual(context_, toJSValue(a), toJSValue(b));
 }
 
 bool QuickJSRuntime::strictEquals(
     const jsi::String &a, const jsi::String &b) const {
-  notImplemented("strictEquals");
+  return JS_IsStrictEqual(context_, toJSValue(a), toJSValue(b));
 }
 
 bool QuickJSRuntime::strictEquals(
     const jsi::Object &a, const jsi::Object &b) const {
-  notImplemented("strictEquals");
+  return JS_IsStrictEqual(context_, toJSValue(a), toJSValue(b));
 }
 
-bool QuickJSRuntime::instanceOf(const jsi::Object &o, const jsi::Function &f) {
-  notImplemented("instanceOf");
+bool QuickJSRuntime::instanceOf(
+    const jsi::Object &object, const jsi::Function &function) {
+  int result =
+      JS_IsInstanceOf(context_, toJSValue(object), toJSValue(function));
+  checkException(result);
+  return result != 0;
 }
 
 void QuickJSRuntime::setExternalMemoryPressure(
-    const jsi::Object &obj, size_t amount) {
-  notImplemented("setExternalMemoryPressure");
+    const jsi::Object & /*object*/, size_t /*amount*/) {
+  // quickjs has no external memory pressure hook.
 }
 
 }  // namespace qjs

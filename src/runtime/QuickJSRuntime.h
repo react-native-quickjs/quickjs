@@ -354,6 +354,7 @@ class QuickJSRuntime : public jsi::Runtime {
  private:
   void drainPendingReleases() noexcept;
   void rebaseOntoCurrentThread() noexcept;
+  JSValue evalInternal(const char *source) noexcept;
 
   /**
    * PointerValues are the most allocated object in a JSI binding: one per
@@ -437,6 +438,9 @@ class QuickJSRuntime : public jsi::Runtime {
   // nested copies of our own message and nothing about the error that started
   // it, which on a device is the entire evidence available.
   std::string firstErrorDescription_;
+
+  // Engine facilities with no C API, evaluated once at startup.
+  JSValue enumeratePropertyNames_{JS_UNDEFINED};
 
   QuickJSPointerValue *freeValues_{nullptr};
   QuickJSAtomPointerValue *freeAtoms_{nullptr};
