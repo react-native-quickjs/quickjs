@@ -71,21 +71,58 @@ class CDPTest : public ::testing::Test {
   std::vector<std::string> sent_;
 };
 
-TEST_F(CDPTest, UnknownMethodIsAnErrorAndNotSilence) {
+// A frontend talks to several agents at once, so refusing a method this one
+// does not implement would answer on everyone else's behalf.
+TEST_F(CDPTest, AMethodThisAgentDoesNotImplementIsLeftAlone) {
+  EXPECT_FALSE(qjs_cdp_handles("Nonsense.method"));
+  EXPECT_FALSE(qjs_cdp_handles("Runtime.addBinding"));
+  EXPECT_TRUE(qjs_cdp_handles("Runtime.evaluate"));
+
   send(R"J({"id":1,"method":"Nonsense.method"})J");
-  EXPECT_NE(find(R"J("id":1)J").find(R"J("error")J"), std::string::npos);
+  EXPECT_TRUE(find(R"J("id":1)J").empty());
+}
+
+// qjs_cdp_handles() is a second list of method names, and a second list drifts.
+TEST_F(CDPTest, EveryAdvertisedMethodIsImplemented) {
+  static const char *kAdvertised[] = {
+      "Runtime.evaluate",
+      "Runtime.getProperties",
+      "Runtime.releaseObject",
+      "Runtime.releaseObjectGroup",
+      "Runtime.getHeapUsage",
+      "Runtime.discardConsoleEntries",
+      "Debugger.enable",
+      "Debugger.disable",
+      "Debugger.setBreakpointByUrl",
+      "Debugger.removeBreakpoint",
+      "Debugger.setBreakpointsActive",
+      "Debugger.resume",
+      "Debugger.stepOver",
+      "Debugger.stepInto",
+      "Debugger.stepOut",
+      "Debugger.pause",
+      "Debugger.evaluateOnCallFrame",
+      "Debugger.setVariableValue",
+      "Debugger.getScriptSource",
+      "Debugger.setPauseOnExceptions",
+      "Debugger.setAsyncCallStackDepth",
+      "Debugger.setBlackboxPatterns",
+      "Debugger.setBlackboxedRanges",
+      "Debugger.setSkipAllPauses"};
+
+  for (const char *method : kAdvertised) {
+    EXPECT_TRUE(qjs_cdp_handles(method)) << method;
+    sent_.clear();
+    send(std::string(R"J({"id":99,"method":")J") + method + R"J("})J");
+    // Something came back. Which reply is the business of the other tests;
+    // silence here would mean the two lists had drifted apart.
+    EXPECT_FALSE(find(R"J("id":99)J").empty()) << method;
+  }
 }
 
 TEST_F(CDPTest, MalformedJsonDoesNotCrashOrReply) {
   send("{ this is not json");
   EXPECT_TRUE(find("\"id\"").empty());
-}
-
-TEST_F(CDPTest, EnablingRuntimeAnnouncesTheExecutionContext) {
-  send(R"J({"id":1,"method":"Runtime.enable"})J");
-  EXPECT_NE(
-      find("Runtime.executionContextCreated").find(R"J("id":1)J"),
-      std::string::npos);
 }
 
 TEST_F(CDPTest, EvaluateReturnsATypedRemoteObject) {

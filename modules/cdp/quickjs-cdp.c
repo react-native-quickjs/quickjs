@@ -14,6 +14,7 @@
 
 #include "quickjs-cdp.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -78,7 +79,6 @@ struct QJSCDPAgent {
   int nobjs, next_obj_id;
 
   bool debugger_enabled;
-  bool runtime_enabled;
   bool breakpoints_active;
 
   PauseMode mode;
@@ -225,9 +225,11 @@ static void forget_object(QJSCDPAgent *agent, int i) {
   agent->objs[i] = agent->objs[--agent->nobjs];
 }
 
-static void release_object(QJSCDPAgent *agent, const char *object_id) {
+static bool release_object(QJSCDPAgent *agent, const char *object_id) {
   RemoteObject *r = find_object(agent, object_id);
-  if (r) forget_object(agent, (int)(r - agent->objs));
+  if (!r) return false;
+  forget_object(agent, (int)(r - agent->objs));
+  return true;
 }
 
 static void release_object_group(QJSCDPAgent *agent, const char *group) {
@@ -294,8 +296,22 @@ static JSValue to_remote_object(
     double d;
     JS_ToFloat64(agent->ctx, &d, v);
     json_set_string(agent, o, "type", "number");
-    json_set(agent, o, "value", JS_NewFloat64(agent->jctx, d));
-    set_description(agent, o, v);
+    /* NaN, the infinities and -0 have no JSON spelling, so the protocol sends
+       them by name instead of as a value. Every other number is just a
+       number: adding a description to those would be noise. */
+    const char *name = NULL;
+    if (isnan(d))
+      name = "NaN";
+    else if (isinf(d))
+      name = d > 0 ? "Infinity" : "-Infinity";
+    else if (d == 0 && signbit(d))
+      name = "-0";
+    if (name) {
+      json_set_string(agent, o, "unserializableValue", name);
+      json_set_string(agent, o, "description", name);
+    } else {
+      json_set(agent, o, "value", JS_NewFloat64(agent->jctx, d));
+    }
     return o;
   }
   if (JS_IsString(v)) {
@@ -678,11 +694,13 @@ static void send_properties(QJSCDPAgent *agent, int id, JSValue params) {
     return;
   }
 
+  /* Not JS_GPN_ENUM_ONLY: the frontend asked for own properties and expects the
+     non-enumerable ones too, which is how an empty array still has a `length`
+     to show. */
   JSPropertyEnum *props = NULL;
   uint32_t count = 0;
   if (JS_GetOwnPropertyNames(
-          agent->ctx, &props, &count, remote->value,
-          JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+          agent->ctx, &props, &count, remote->value, JS_GPN_STRING_MASK) < 0) {
     JS_FreeValue(agent->ctx, JS_GetException(agent->ctx));
     send_error(agent, id, "Could not read the object's properties");
     return;
@@ -691,20 +709,45 @@ static void send_properties(QJSCDPAgent *agent, int id, JSValue params) {
   JSValue list = json_array(agent);
   for (uint32_t i = 0; i < count; i++) {
     const char *name = JS_AtomToCString(agent->ctx, props[i].atom);
-    JSValue value = JS_GetProperty(agent->ctx, remote->value, props[i].atom);
-    if (JS_IsException(value)) {
-      JS_FreeValue(agent->ctx, JS_GetException(agent->ctx));
-      value = JS_UNDEFINED;
-    }
+
+    JSPropertyDescriptor desc;
+    int described =
+        JS_GetOwnProperty(agent->ctx, &desc, remote->value, props[i].atom);
+    if (described < 0) JS_FreeValue(agent->ctx, JS_GetException(agent->ctx));
+
     JSValue entry = json_object(agent);
     json_set_string(agent, entry, "name", name ? name : "");
-    json_set(agent, entry, "value", to_remote_object(agent, value, NULL));
-    json_set_bool(agent, entry, "writable", true);
-    json_set_bool(agent, entry, "configurable", true);
-    json_set_bool(agent, entry, "enumerable", true);
     json_set_bool(agent, entry, "isOwn", true);
+    json_set_bool(
+        agent, entry, "writable",
+        described > 0 && (desc.flags & JS_PROP_WRITABLE) != 0);
+    json_set_bool(
+        agent, entry, "configurable",
+        described > 0 && (desc.flags & JS_PROP_CONFIGURABLE) != 0);
+    json_set_bool(
+        agent, entry, "enumerable",
+        described > 0 && (desc.flags & JS_PROP_ENUMERABLE) != 0);
+
+    if (described > 0 && (desc.flags & JS_PROP_GETSET)) {
+      /* An accessor is described, not invoked. Reading it to fill in a value
+         would run the program's own code to answer a question about it. */
+      if (!JS_IsUndefined(desc.getter))
+        json_set(
+            agent, entry, "get", to_remote_object(agent, desc.getter, NULL));
+      if (!JS_IsUndefined(desc.setter))
+        json_set(
+            agent, entry, "set", to_remote_object(agent, desc.setter, NULL));
+    } else if (described > 0) {
+      json_set(
+          agent, entry, "value", to_remote_object(agent, desc.value, NULL));
+    }
+    if (described > 0) {
+      JS_FreeValue(agent->ctx, desc.value);
+      JS_FreeValue(agent->ctx, desc.getter);
+      JS_FreeValue(agent->ctx, desc.setter);
+    }
+
     json_set_index(agent, list, i, entry);
-    JS_FreeValue(agent->ctx, value);
     if (name) JS_FreeCString(agent->ctx, name);
   }
   JS_FreePropertyEnum(agent->ctx, props, count);
@@ -809,25 +852,48 @@ static bool is(const char *method, const char *name) {
   return strcmp(method, name) == 0;
 }
 
+/* Every method dispatch() answers. Kept beside it rather than derived from it
+   because the frontend needs the answer before the message is queued, on
+   another thread; CDPTest.EveryAdvertisedMethodIsImplemented keeps the two
+   honest. */
+static const char *const kMethods[] = {
+    "Runtime.evaluate",
+    "Runtime.getProperties",
+    "Runtime.releaseObject",
+    "Runtime.releaseObjectGroup",
+    "Runtime.getHeapUsage",
+    "Runtime.discardConsoleEntries",
+    "Debugger.enable",
+    "Debugger.disable",
+    "Debugger.setBreakpointByUrl",
+    "Debugger.removeBreakpoint",
+    "Debugger.setBreakpointsActive",
+    "Debugger.resume",
+    "Debugger.stepOver",
+    "Debugger.stepInto",
+    "Debugger.stepOut",
+    "Debugger.pause",
+    "Debugger.evaluateOnCallFrame",
+    "Debugger.setVariableValue",
+    "Debugger.getScriptSource",
+    "Debugger.setPauseOnExceptions",
+    "Debugger.setAsyncCallStackDepth",
+    "Debugger.setBlackboxPatterns",
+    "Debugger.setBlackboxedRanges",
+    "Debugger.setSkipAllPauses",
+};
+
+bool qjs_cdp_handles(const char *method) {
+  if (!method) return false;
+  for (size_t i = 0; i < sizeof(kMethods) / sizeof(kMethods[0]); i++)
+    if (is(method, kMethods[i])) return true;
+  return false;
+}
+
 static void dispatch(
     QJSCDPAgent *agent, int id, const char *method, JSValue params) {
   /* --- Runtime --- */
-  if (is(method, "Runtime.enable")) {
-    agent->runtime_enabled = true;
-    JSValue ctx_info = json_object(agent);
-    json_set_int(agent, ctx_info, "id", agent->exec_ctx_id);
-    json_set_string(agent, ctx_info, "origin", "");
-    json_set_string(agent, ctx_info, "name", "QuickJS");
-    JSValue p = json_object(agent);
-    json_set(agent, p, "context", ctx_info);
-    send_event(agent, "Runtime.executionContextCreated", p);
-    send_empty_result(agent, id);
-
-  } else if (is(method, "Runtime.disable")) {
-    agent->runtime_enabled = false;
-    send_empty_result(agent, id);
-
-  } else if (is(method, "Runtime.evaluate")) {
+  if (is(method, "Runtime.evaluate")) {
     const char *expr = json_get_string(agent, params, "expression");
     const char *group = json_get_string(agent, params, "objectGroup");
     JSValue v = expr ? JS_Eval(
@@ -843,9 +909,14 @@ static void dispatch(
 
   } else if (is(method, "Runtime.releaseObject")) {
     const char *object_id = json_get_string(agent, params, "objectId");
-    release_object(agent, object_id);
+    const bool released = release_object(agent, object_id);
     if (object_id) JS_FreeCString(agent->jctx, object_id);
-    send_empty_result(agent, id);
+    /* Releasing something already released is an error, not a no-op: the
+       frontend is telling us about a reference it believes it holds. */
+    if (released)
+      send_empty_result(agent, id);
+    else
+      send_error(agent, id, "No object found for the given objectId");
 
   } else if (is(method, "Runtime.releaseObjectGroup")) {
     const char *group = json_get_string(agent, params, "objectGroup");
@@ -874,9 +945,7 @@ static void dispatch(
     JS_SetDebugTraceArmed(agent->ctx, true);
     for (int i = 0; i < agent->nscripts; i++)
       announce_script(agent, &agent->scripts[i]);
-    JSValue result = json_object(agent);
-    json_set_string(agent, result, "debuggerId", "quickjs");
-    send_result(agent, id, result);
+    send_empty_result(agent, id);
 
   } else if (is(method, "Debugger.disable")) {
     agent->debugger_enabled = false;
@@ -951,9 +1020,6 @@ static void dispatch(
       is(method, "Debugger.setBlackboxedRanges") ||
       is(method, "Debugger.setSkipAllPauses")) {
     send_empty_result(agent, id);
-
-  } else {
-    send_error(agent, id, "Not supported by this engine");
   }
 }
 

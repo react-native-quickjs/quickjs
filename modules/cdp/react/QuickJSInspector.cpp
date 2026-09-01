@@ -27,6 +27,9 @@ class SessionAgent : public RuntimeAgentDelegate {
       : agent_(agent), executor_(std::move(executor)) {}
 
   bool handleRequest(const cdp::PreparsedRequest &req) override {
+    if (!qjs_cdp_handles(req.method.c_str())) {
+      return false;
+    }
     const std::string json = req.toJson();
     qjs_cdp_send_message(agent_, json.c_str(), json.size());
     // Nothing happens until someone runs the queue on the JS thread. While

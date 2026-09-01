@@ -29,6 +29,7 @@
 #define QUICKJS_CDP_H
 
 #include <quickjs.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -49,6 +50,12 @@ QJSCDPAgent *qjs_cdp_new(
     void *send_opaque);
 
 void qjs_cdp_free(QJSCDPAgent *agent);
+
+/* True when this agent implements `method`.
+   A request it does not implement must be left to whoever else is listening
+   rather than answered with an error: the frontend talks to several agents at
+   once, and refusing on behalf of all of them is not ours to do. */
+bool qjs_cdp_handles(const char *method);
 
 /* Queues one CDP message. Any thread. */
 void qjs_cdp_send_message(QJSCDPAgent *agent, const char *json, size_t len);
