@@ -1,0 +1,112 @@
+{
+  "name": "@react-native-quickjs/quickjs",
+  "version": "0.1.0",
+  "description": "QuickJS JSI runtime for React Native, built from source",
+  "keywords": [
+    "react-native",
+    "quickjs",
+    "jsi",
+    "javascript-engine",
+    "ios",
+    "android"
+  ],
+  "files": [
+    "platform",
+    "src",
+    "cmake",
+    "scripts/postinstall.js",
+    "scripts/doctor.js",
+    "scripts/install",
+    "scripts/expo",
+    "!scripts/expo/test",
+    "!scripts/install/test",
+    "scripts/react_native_quickjs_pods.rb",
+    "app.plugin.js",
+    "engine/quickjs-rel",
+    "*.podspec",
+    "modules/cdp/cdp",
+    "modules/cdp/react",
+    "!modules/cdp/test",
+    "modules/hermes-compat/include",
+    "modules/hermes-compat/src",
+    "!modules/**/build",
+    "!platform/android/build",
+    "!platform/android/.cxx",
+    "!**/__tests__",
+    "!**/.*"
+  ],
+  "scripts": {
+    "doctor": "node scripts/doctor.js",
+    "test:install": "node scripts/install/test/run.js",
+    "test:expo": "node scripts/expo/test/run.js",
+    "example": "yarn workspace @react-native-quickjs/example",
+    "submodules": "git submodule update --init --recursive",
+    "patches": "node scripts/apply-patches.js",
+    "sync-engine": "node scripts/sync-quickjs-rel.js",
+    "postinstall": "node scripts/postinstall.js",
+    "prepack": "node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check && node scripts/check-submodule.js",
+    "configure": "cmake -B build -DCMAKE_BUILD_TYPE=Debug",
+    "build": "cmake --build build -j8",
+    "test": "yarn configure && yarn build && ctest --test-dir build --output-on-failure",
+    "bytecode": "./build/qjsc-ng",
+    "clean": "del-cli build platform/android/build platform/android/.cxx example/android/build example/android/app/build example/ios/build",
+    "release": "release-it --only-version"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/react-native-quickjs/quickjs.git"
+  },
+  "author": "Ammar Ahmed <ammarahmed6506@gmail.com> (https://github.com/ammarahm-ed)",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/react-native-quickjs/quickjs/issues"
+  },
+  "homepage": "https://github.com/react-native-quickjs/quickjs#readme",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "@commitlint/config-conventional": "^21.0.2",
+    "@expo/config-plugins": "^54.0.0",
+    "@react-native/babel-preset": "0.85.0",
+    "@release-it/conventional-changelog": "^11.0.1",
+    "commitlint": "^21.0.2",
+    "del-cli": "^7.0.0",
+    "lefthook": "^2.1.9",
+    "react": "19.2.3",
+    "react-native": "0.85.0",
+    "release-it": "^20.2.0"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.85.0"
+  },
+  "workspaces": [
+    "example"
+  ],
+  "packageManager": "yarn@4.11.0",
+  "commitlint": {
+    "extends": [
+      "@commitlint/config-conventional"
+    ]
+  },
+  "release-it": {
+    "git": {
+      "commitMessage": "chore: release ${version}",
+      "tagName": "v${version}"
+    },
+    "npm": {
+      "publish": true
+    },
+    "github": {
+      "release": true
+    },
+    "plugins": {
+      "@release-it/conventional-changelog": {
+        "preset": {
+          "name": "angular"
+        }
+      }
+    }
+  }
+}
