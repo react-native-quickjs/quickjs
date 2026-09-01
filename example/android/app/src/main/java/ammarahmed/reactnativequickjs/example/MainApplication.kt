@@ -6,7 +6,7 @@ import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
 import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
-import com.ammarahmed.quickjs.QuickJSInstance
+import com.reactnativequickjs.quickjs.QuickJSInstance
 
 class MainApplication : Application(), ReactApplication {
 

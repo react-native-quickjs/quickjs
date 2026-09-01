@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-package com.ammarahmed.quickjs
+package com.reactnativequickjs.quickjs
 
 import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.NativeModule

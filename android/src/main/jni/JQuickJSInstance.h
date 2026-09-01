@@ -28,7 +28,7 @@ class JQuickJSInstance
     : public jni::HybridClass<JQuickJSInstance, JJSRuntimeFactory> {
  public:
   static constexpr auto kJavaDescriptor =
-      "Lcom/ammarahmed/quickjs/QuickJSInstance;";
+      "Lcom/reactnativequickjs/quickjs/QuickJSInstance;";
 
   static jni::local_ref<jhybriddata> initHybrid(jni::alias_ref<jclass>);
 

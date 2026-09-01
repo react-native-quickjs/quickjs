@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-package com.ammarahmed.quickjs
+package com.reactnativequickjs.quickjs
 
 import com.facebook.jni.HybridData
 import com.facebook.jni.annotations.DoNotStrip
