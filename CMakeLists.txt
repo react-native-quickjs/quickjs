@@ -27,6 +27,13 @@ enable_testing()
 include(cmake/quickjs.cmake)
 include(cmake/jsi.cmake)
 
+add_library(quickjs_jsi STATIC
+  src/runtime/QuickJSRuntime.cpp
+)
+target_include_directories(quickjs_jsi PUBLIC src/runtime)
+target_link_libraries(quickjs_jsi PUBLIC jsi quickjs)
+set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Built from the engine in this tree, not shipped prebuilt: bytecode is only
 # loadable by the exact engine build that produced it.
 add_executable(qjsc-ng tools/bytecode/qjsc-ng.c)
