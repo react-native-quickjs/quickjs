@@ -24,8 +24,9 @@
     "configure": "cmake -B build -DCMAKE_BUILD_TYPE=Debug",
     "build": "cmake --build build -j8",
     "test": "npm run configure && npm run build && ctest --test-dir build --output-on-failure",
+    "bench": "cmake -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j8 && ctest --test-dir build-release -V -R jsi_bench",
     "bytecode": "./build/qjsc-ng",
-    "clean": "rm -rf build",
+    "clean": "rm -rf build build-release",
     "prepack": "node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check"
   },
   "peerDependencies": {

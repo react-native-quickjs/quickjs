@@ -38,3 +38,5 @@ set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # loadable by the exact engine build that produced it.
 add_executable(qjsc-ng tools/bytecode/qjsc-ng.c)
 target_link_libraries(qjsc-ng PRIVATE quickjs)
+
+add_subdirectory(tests)
