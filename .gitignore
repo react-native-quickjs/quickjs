@@ -40,3 +40,11 @@ build-*/
 # React Native's inspector suite, rewritten from node_modules by
 # modules/cdp/test/rn-inspector/generate-suite.mjs. Generated, never edited.
 modules/cdp/test/rn-inspector/generated/
+
+# example app build output
+example/ios/Pods/
+example/ios/build/
+example/android/build/
+example/android/app/build/
+example/android/.gradle/
+example/android/.cxx/
