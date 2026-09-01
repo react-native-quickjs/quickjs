@@ -1079,8 +1079,12 @@ jsi::Value QuickJSRuntime::evaluateJavaScript(
         data + kBytecodeHeaderSize, size - kBytecodeHeaderSize);
   } else {
     throwIfHermesBytecode(data, size, sourceURL);
-    result =
-        evaluateSource(data, size, effectiveSourceURL(data, size, sourceURL));
+    const std::string url = effectiveSourceURL(data, size, sourceURL);
+    result = evaluateSource(data, size, url);
+    if (onScriptEvaluated_) {
+      onScriptEvaluated_(
+          url, std::string(reinterpret_cast<const char *>(data), size));
+    }
   }
 
   rebaselineHeap();

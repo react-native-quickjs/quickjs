@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <new>
 #include <string>
@@ -39,6 +40,16 @@ class QuickJSRuntime : public jsi::Runtime {
   JSRuntime *runtime() const noexcept {
     return runtime_;
   }
+  /// Called after each script is evaluated from source, with the URL it was
+  /// given and the source itself. The debugger uses it to announce the script
+  /// and to bind breakpoints that named its URL. Set after construction,
+  /// because whoever installs it needs the context this runtime owns.
+  void setScriptEvaluatedHook(
+      std::function<void(const std::string &url, const std::string &source)>
+          hook) noexcept {
+    onScriptEvaluated_ = std::move(hook);
+  }
+
   JSContext *context() const noexcept {
     return context_;
   }
@@ -455,6 +466,8 @@ class QuickJSRuntime : public jsi::Runtime {
   QuickJSRuntimeConfig config_;
   JSRuntime *runtime_{nullptr};
   JSContext *context_{nullptr};
+  std::function<void(const std::string &, const std::string &)>
+      onScriptEvaluated_;
 
   // Atomic because ownership moves while other threads read it to route their
   // releases. Recursive so a host function called from JavaScript can lock
