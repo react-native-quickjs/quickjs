@@ -4245,6 +4245,19 @@ static JSValue JS_NewSymbolFromAtom(JSContext *ctx, JSAtom descr,
 }
 
 /* `description` may be pure ASCII or UTF-8 encoded */
+JSValue JS_NewPrivateSymbol(JSContext *ctx, const char *description)
+{
+    JSAtom atom;
+    JSValue symbol;
+
+    atom = JS_NewAtom(ctx, description ? description : "");
+    if (atom == JS_ATOM_NULL)
+        return JS_EXCEPTION;
+    symbol = JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE);
+    JS_FreeAtom(ctx, atom);
+    return symbol;
+}
+
 JSValue JS_NewSymbol(JSContext *ctx, const char *description, bool is_global)
 {
     if (description == NULL) {

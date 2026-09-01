@@ -1261,6 +1261,10 @@ JS_EXTERN bool JS_IsPromise(JSValueConst val);
 JS_EXTERN JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value);
 
 JS_EXTERN JSValue JS_NewSymbol(JSContext *ctx, const char *description, bool is_global);
+/* A symbol that script cannot reach: property enumeration, including
+   Object.getOwnPropertySymbols and JSON.stringify, skips keys of this kind.
+   Intended for an embedder attaching its own data to an arbitrary object. */
+JS_EXTERN JSValue JS_NewPrivateSymbol(JSContext *ctx, const char *description);
 
 typedef enum JSPromiseHookType {
     JS_PROMISE_HOOK_INIT,     // emitted when a new promise is created

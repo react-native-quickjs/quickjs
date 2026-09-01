@@ -355,8 +355,11 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
   symbolToString_ = evalInternal(kSymbolToStringSource);
   bigIntToString_ = evalInternal(kBigIntToStringSource);
 
-  // Neither WeakRef nor WeakMap has a C API, so reach for the JS-visible
-  // constructors once.
+  JSValue nativeStateKey = JS_NewPrivateSymbol(context_, "nativeState");
+  nativeStateKey_ = JS_ValueToAtom(context_, nativeStateKey);
+  JS_FreeValue(context_, nativeStateKey);
+
+  // WeakRef has no C API, so reach for the JS-visible constructor once.
   JSValue global = JS_GetGlobalObject(context_);
   weakRefConstructor_ = JS_GetPropertyStr(context_, global, "WeakRef");
   if (JS_IsObject(weakRefConstructor_)) {
@@ -365,19 +368,6 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
     weakRefDeref_ = JS_GetPropertyStr(context_, proto, "deref");
     JS_FreeValue(context_, proto);
   }
-
-  JSValue weakMapConstructor = JS_GetPropertyStr(context_, global, "WeakMap");
-  if (JS_IsObject(weakMapConstructor)) {
-    nativeStateMap_ =
-        JS_CallConstructor(context_, weakMapConstructor, 0, nullptr);
-    JSValue proto =
-        JS_GetPropertyStr(context_, weakMapConstructor, "prototype");
-    weakMapGet_ = JS_GetPropertyStr(context_, proto, "get");
-    weakMapSet_ = JS_GetPropertyStr(context_, proto, "set");
-    weakMapHas_ = JS_GetPropertyStr(context_, proto, "has");
-    JS_FreeValue(context_, proto);
-  }
-  JS_FreeValue(context_, weakMapConstructor);
   JS_FreeValue(context_, global);
 }
 
@@ -483,10 +473,7 @@ QuickJSRuntime::~QuickJSRuntime() {
   JS_FreeValue(context_, weakRefConstructor_);
   JS_FreeValue(context_, weakRefDeref_);
   JS_FreeValue(context_, bigIntToString_);
-  JS_FreeValue(context_, nativeStateMap_);
-  JS_FreeValue(context_, weakMapGet_);
-  JS_FreeValue(context_, weakMapSet_);
-  JS_FreeValue(context_, weakMapHas_);
+  JS_FreeAtom(context_, nativeStateKey_);
 
   if (context_ != nullptr) {
     JS_FreeContext(context_);
@@ -1348,27 +1335,35 @@ jsi::Value QuickJSRuntime::getPrototypeOf(const jsi::Object &object) {
       checkException(JS_GetPrototype(context_, toJSValue(object))));
 }
 
+/// JSI reserves native state for ordinary objects: a proxy would route the
+/// property through its traps, and a host object answers for every key.
+void QuickJSRuntime::checkCanHoldNativeState(const jsi::Object &object) {
+  JSValue value = toJSValue(object);
+  if (JS_IsProxy(value)) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: cannot set native state on a proxy");
+  }
+  if (JS_GetOpaque(value, hostObjectClassID_) != nullptr) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: cannot set native state on a host object");
+  }
+}
+
 bool QuickJSRuntime::hasNativeState(const jsi::Object &object) {
-  if (!JS_IsObject(nativeStateMap_)) {
+  JSValue holder = JS_GetProperty(context_, toJSValue(object), nativeStateKey_);
+  if (JS_IsException(holder)) {
+    JS_FreeValue(context_, JS_GetException(context_));
     return false;
   }
-  JSValue key = toJSValue(object);
-  JSValue present = JS_Call(context_, weakMapHas_, nativeStateMap_, 1, &key);
-  checkException(present);
-  bool result = JS_ToBool(context_, present) > 0;
-  JS_FreeValue(context_, present);
-  return result;
+  const bool present = JS_GetOpaque(holder, nativeStateClassID_) != nullptr;
+  JS_FreeValue(context_, holder);
+  return present;
 }
 
 std::shared_ptr<jsi::NativeState> QuickJSRuntime::getNativeState(
     const jsi::Object &object) {
-  if (!JS_IsObject(nativeStateMap_)) {
-    throw jsi::JSINativeException("QuickJSRuntime: object has no native state");
-  }
-  JSValue key = toJSValue(object);
-  JSValue holder = JS_Call(context_, weakMapGet_, nativeStateMap_, 1, &key);
-  checkException(holder);
-
+  JSValue holder = checkException(
+      JS_GetProperty(context_, toJSValue(object), nativeStateKey_));
   auto *proxy = static_cast<NativeStateProxy *>(
       JS_GetOpaque(holder, nativeStateClassID_));
   JS_FreeValue(context_, holder);
@@ -1382,9 +1377,18 @@ std::shared_ptr<jsi::NativeState> QuickJSRuntime::getNativeState(
 
 void QuickJSRuntime::setNativeState(
     const jsi::Object &object, std::shared_ptr<jsi::NativeState> state) {
-  if (!JS_IsObject(nativeStateMap_)) {
-    throw jsi::JSINativeException(
-        "QuickJSRuntime: WeakMap is unavailable in this context");
+  checkCanHoldNativeState(object);
+
+  // Overwriting is a pointer swap: the holder is reachable only from this
+  // property, so nothing else can be looking at it.
+  JSValue existing = checkException(
+      JS_GetProperty(context_, toJSValue(object), nativeStateKey_));
+  auto *held = static_cast<NativeStateProxy *>(
+      JS_GetOpaque(existing, nativeStateClassID_));
+  JS_FreeValue(context_, existing);
+  if (held != nullptr) {
+    held->state = std::move(state);
+    return;
   }
 
   JSValue holder = JS_NewObjectClass(context_, nativeStateClassID_);
@@ -1393,12 +1397,11 @@ void QuickJSRuntime::setNativeState(
   registerNativeState(proxy);
   JS_SetOpaque(holder, proxy);
 
-  JSValue arguments[2] = {toJSValue(object), holder};
-  JSValue result =
-      JS_Call(context_, weakMapSet_, nativeStateMap_, 2, arguments);
-  JS_FreeValue(context_, holder);
-  checkException(result);
-  JS_FreeValue(context_, result);
+  // Writable and configurable so a later call can replace it, which JSI
+  // requires. Neither weakens anything: script has no way to name the key.
+  checkException(JS_DefinePropertyValue(
+      context_, toJSValue(object), JS_DupAtom(context_, nativeStateKey_),
+      holder, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE));
 }
 
 jsi::Value QuickJSRuntime::getProperty(

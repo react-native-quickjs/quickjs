@@ -369,6 +369,7 @@ class QuickJSRuntime : public jsi::Runtime {
   void releaseNativePayloads() noexcept;
   void drainPendingReleases() noexcept;
   void noteCollection() noexcept;
+  void checkCanHoldNativeState(const jsi::Object &object);
   JSValue evalInternal(const char *source) noexcept;
 
   // toJSValue borrows, so the array holds no references and needs no cleanup:
@@ -481,13 +482,10 @@ class QuickJSRuntime : public jsi::Runtime {
   JSValue weakRefDeref_{JS_UNDEFINED};
   JSValue bigIntToString_{JS_UNDEFINED};
 
-  // NativeState lives in a runtime-private WeakMap rather than a property: a
-  // property, even symbol-keyed and non-enumerable, is reachable through
-  // Object.getOwnPropertySymbols and can be clobbered by script.
-  JSValue nativeStateMap_{JS_UNDEFINED};
-  JSValue weakMapGet_{JS_UNDEFINED};
-  JSValue weakMapSet_{JS_UNDEFINED};
-  JSValue weakMapHas_{JS_UNDEFINED};
+  // NativeState is an ordinary property under a private symbol, which script
+  // has no way to name, list or overwrite. A WeakMap would also be invisible
+  // but costs a call into JavaScript on every read and write.
+  JSAtom nativeStateKey_{JS_ATOM_NULL};
 
   QuickJSPointerValue *freeValues_{nullptr};
   QuickJSAtomPointerValue *freeAtoms_{nullptr};
