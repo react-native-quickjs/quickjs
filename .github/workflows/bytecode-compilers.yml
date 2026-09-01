@@ -1,5 +1,5 @@
-# Builds the bytecode compiler for every host an app is built on, and commits
-# the binaries.
+# Builds the bytecode compiler for every host an app is built on, and opens a
+# pull request with the binaries.
 #
 # Bytecode is only loadable by the engine build that produced it, so a compiler
 # and an engine agree or nothing works. BC_VERSION is what says whether they
@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: bytecode-compilers
@@ -124,11 +125,44 @@ jobs:
           "
           cat bin/qjsc/manifest.json
 
-      - name: Commit
+      # A pull request rather than a push to main: these are binaries, and one
+      # that lands unreviewed is one nobody ever looks at.
+      #
+      # A pull request opened with GITHUB_TOKEN does not start other workflows,
+      # so the test suite will not run on it by itself. Pushing an empty commit
+      # to the branch, or closing and reopening it, gets a run.
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
+          branch="bytecode-compilers/bc-$VERSION"
           git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+
           git add bin/qjsc
-          git diff --cached --quiet && echo 'nothing changed' && exit 0
-          git commit -m 'build: rebuild the bytecode compilers for BC_VERSION ${{ needs.check.outputs.version }}'
-          git push
+          if git diff --cached --quiet; then
+            echo 'the committed compilers already match; nothing to open'
+            exit 0
+          fi
+
+          git commit -m "build: rebuild the bytecode compilers for BC_VERSION $VERSION"
+          git push --force -u origin "$branch"
+
+          if gh pr view "$branch" >/dev/null 2>&1; then
+            echo 'a pull request for this branch is already open'
+            exit 0
+          fi
+
+          platforms=$(cd bin/qjsc && ls -1d */ | sed 's|/$||' | sed 's|^|- |')
+          printf '%s\n\n%s\n\n%s\n\n%s\n' \
+            "The engine's BC_VERSION is now $VERSION, which the committed compilers were not built for." \
+            "Bytecode is only loadable by the engine build that produced it, so they are rebuilt here for every host." \
+            "$platforms" \
+            "Built from $SOURCE_SHA by .github/workflows/bytecode-compilers.yml." > body.md
+
+          gh pr create --base main --head "$branch" \
+            --title "Rebuild the bytecode compilers for BC_VERSION $VERSION" \
+            --body-file body.md
