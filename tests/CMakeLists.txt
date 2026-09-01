@@ -27,6 +27,16 @@ add_executable(quickjs_jsi_tests smoketest.cpp)
 target_link_libraries(quickjs_jsi_tests PRIVATE quickjs_jsi)
 add_test(NAME quickjs_jsi_tests COMMAND quickjs_jsi_tests)
 
+# Hermes' own JSI conformance suite, parameterised over a RuntimeFactory, so
+# supplying ours is the whole integration. testlib.h is included as
+# <jsi/test/testlib.h>: only third_party/ goes on the include path, so
+# <jsi/jsi.h> still resolves to React Native's JSI. See third_party/README.md.
+qjs_add_test_suite(quickjs_jsi_conformance
+  conformance.cpp
+  third_party/jsi/test/testlib.cpp
+)
+target_include_directories(quickjs_jsi_conformance PRIVATE third_party)
+
 add_executable(quickjs_jsi_bench bench/jsi_bench.cpp)
 target_link_libraries(quickjs_jsi_bench PRIVATE quickjs_jsi)
 
