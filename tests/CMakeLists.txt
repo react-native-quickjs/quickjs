@@ -50,6 +50,31 @@ qjs_add_test_suite(quickjs_debugger_tests debugger_test.cpp)
 
 qjs_add_test_suite(quickjs_module_tests modules_test.cpp)
 
+# --- differential corpus ---------------------------------------------------
+#
+# Every corpus file is run by this engine and by node, and the two outputs are
+# compared byte for byte. An expectation written by the same person who wrote
+# the code encodes the same misunderstanding; node is an independent
+# implementation of the same specification, so a diff is evidence.
+add_executable(qjs-run differential/qjs-run.c)
+target_link_libraries(qjs-run PRIVATE quickjs)
+
+find_program(NODE_EXECUTABLE node)
+if(NODE_EXECUTABLE)
+  # Twice, because they are not the same path: React Native ships bytecode, and
+  # anything the compiler derives from source that the serializer drops is
+  # present in one run and absent in the other.
+  add_test(NAME differential
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+            --qjs $<TARGET_FILE:qjs-run>)
+  add_test(NAME differential_bytecode
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+            --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc-ng>
+            --via-bytecode)
+else()
+  message(STATUS "rnqjs: node not found, differential corpus will not run")
+endif()
+
 add_executable(quickjs_jsi_bench bench/jsi_bench.cpp)
 target_link_libraries(quickjs_jsi_bench PRIVATE quickjs_jsi)
 
