@@ -9,6 +9,7 @@
 
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace qjs {
 
@@ -53,12 +54,141 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
 }
 
 QuickJSRuntime::~QuickJSRuntime() {
+  drainPendingReleases();
+
   if (context_ != nullptr) {
     JS_FreeContext(context_);
+    context_ = nullptr;
   }
+
   if (runtime_ != nullptr) {
+    // The global object sits in reference cycles, so dropping the context only
+    // makes it collectable. Objects hanging off it can own jsi values, and
+    // releasing those from a finalizer dirties the heap again. JS_FreeRuntime
+    // runs one GC pass and then asserts the heap is empty, so collect until it
+    // settles first.
+    for (int pass = 0; pass < kMaxTeardownGCPasses; ++pass) {
+      JS_RunGC(runtime_);
+      drainPendingReleases();
+    }
     JS_FreeRuntime(runtime_);
+    runtime_ = nullptr;
   }
+
+  // After the engine, because recycling during teardown still touches the free
+  // list.
+  freePointerValuePool();
+}
+
+void QuickJSRuntime::releaseValue(JSValue value) noexcept {
+  if (std::this_thread::get_id() == jsThread_) {
+    JS_FreeValueRT(runtime_, value);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pendingMutex_);
+  pendingValues_.push_back(value);
+  // Published after the push, so a drainer that sees the flag sees the item.
+  hasPendingReleases_.store(true, std::memory_order_release);
+}
+
+void QuickJSRuntime::releaseAtom(JSAtom atom) noexcept {
+  if (std::this_thread::get_id() == jsThread_) {
+    JS_FreeAtomRT(runtime_, atom);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pendingMutex_);
+  pendingAtoms_.push_back(atom);
+  hasPendingReleases_.store(true, std::memory_order_release);
+}
+
+void QuickJSRuntime::drainPendingReleases() noexcept {
+  // Runs on every call into JS, where the queue is almost always empty, so the
+  // common case is one relaxed load rather than a mutex. Racing a producer is
+  // harmless: the flag is set after the push, so a release landing just after
+  // this load is drained by the next call. These frees have no deadline.
+  if (!hasPendingReleases_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  std::vector<JSValue> values;
+  std::vector<JSAtom> atoms;
+  std::vector<QuickJSPointerValue *> pointerValues;
+  std::vector<QuickJSAtomPointerValue *> atomPointerValues;
+  {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    hasPendingReleases_.store(false, std::memory_order_relaxed);
+    values.swap(pendingValues_);
+    atoms.swap(pendingAtoms_);
+    pointerValues.swap(pendingPointerValues_);
+    atomPointerValues.swap(pendingAtomPointerValues_);
+  }
+
+  for (JSValue value : values) {
+    JS_FreeValueRT(runtime_, value);
+  }
+  for (JSAtom atom : atoms) {
+    JS_FreeAtomRT(runtime_, atom);
+  }
+  for (QuickJSPointerValue *pv : pointerValues) {
+    pv->nextFree_ = freeValues_;
+    freeValues_ = pv;
+  }
+  for (QuickJSAtomPointerValue *pv : atomPointerValues) {
+    pv->nextFree_ = freeAtoms_;
+    freeAtoms_ = pv;
+  }
+}
+
+void QuickJSRuntime::refillValueSlab() {
+  auto *slab = static_cast<QuickJSPointerValue *>(
+      ::operator new(sizeof(QuickJSPointerValue) * kPointerValueSlabSize));
+  valueSlabs_.push_back(slab);
+  // Raw storage: slots are constructed in place on allocation, not here.
+  for (size_t i = 0; i < kPointerValueSlabSize; ++i) {
+    auto *slot = slab + i;
+    slot->nextFree_ = freeValues_;
+    freeValues_ = slot;
+  }
+}
+
+void QuickJSRuntime::refillAtomSlab() {
+  auto *slab = static_cast<QuickJSAtomPointerValue *>(
+      ::operator new(sizeof(QuickJSAtomPointerValue) * kPointerValueSlabSize));
+  atomSlabs_.push_back(slab);
+  for (size_t i = 0; i < kPointerValueSlabSize; ++i) {
+    auto *slot = slab + i;
+    slot->nextFree_ = freeAtoms_;
+    freeAtoms_ = slot;
+  }
+}
+
+void QuickJSRuntime::queuePointerValue(QuickJSPointerValue *pv) noexcept {
+  std::lock_guard<std::mutex> lock(pendingMutex_);
+  pendingPointerValues_.push_back(pv);
+  hasPendingReleases_.store(true, std::memory_order_release);
+}
+
+void QuickJSRuntime::queueAtomPointerValue(
+    QuickJSAtomPointerValue *pv) noexcept {
+  std::lock_guard<std::mutex> lock(pendingMutex_);
+  pendingAtomPointerValues_.push_back(pv);
+  hasPendingReleases_.store(true, std::memory_order_release);
+}
+
+void QuickJSRuntime::freePointerValuePool() noexcept {
+  // Anything still live here is a JSI pointer the embedder outlived the runtime
+  // with, which is already undefined behaviour and not something the pool can
+  // repair.
+  for (void *slab : valueSlabs_) {
+    ::operator delete(slab);
+  }
+  for (void *slab : atomSlabs_) {
+    ::operator delete(slab);
+  }
+  valueSlabs_.clear();
+  atomSlabs_.clear();
+  freeValues_ = nullptr;
+  freeAtoms_ = nullptr;
 }
 
 std::string QuickJSRuntime::description() {
@@ -103,27 +233,32 @@ jsi::Object QuickJSRuntime::global() {
 
 jsi::Runtime::PointerValue *QuickJSRuntime::cloneSymbol(
     const Runtime::PointerValue *pv) {
-  notImplemented("cloneSymbol");
+  const auto *value = static_cast<const QuickJSPointerValue *>(pv);
+  return allocPointerValue(JS_DupValue(context_, value->value()));
 }
 
 jsi::Runtime::PointerValue *QuickJSRuntime::cloneBigInt(
     const Runtime::PointerValue *pv) {
-  notImplemented("cloneBigInt");
+  const auto *value = static_cast<const QuickJSPointerValue *>(pv);
+  return allocPointerValue(JS_DupValue(context_, value->value()));
 }
 
 jsi::Runtime::PointerValue *QuickJSRuntime::cloneString(
     const Runtime::PointerValue *pv) {
-  notImplemented("cloneString");
+  const auto *value = static_cast<const QuickJSPointerValue *>(pv);
+  return allocPointerValue(JS_DupValue(context_, value->value()));
 }
 
 jsi::Runtime::PointerValue *QuickJSRuntime::cloneObject(
     const Runtime::PointerValue *pv) {
-  notImplemented("cloneObject");
+  const auto *value = static_cast<const QuickJSPointerValue *>(pv);
+  return allocPointerValue(JS_DupValue(context_, value->value()));
 }
 
 jsi::Runtime::PointerValue *QuickJSRuntime::clonePropNameID(
     const Runtime::PointerValue *pv) {
-  notImplemented("clonePropNameID");
+  const auto *value = static_cast<const QuickJSAtomPointerValue *>(pv);
+  return allocAtomPointerValue(JS_DupAtom(context_, value->atom()));
 }
 
 jsi::PropNameID QuickJSRuntime::createPropNameIDFromAscii(

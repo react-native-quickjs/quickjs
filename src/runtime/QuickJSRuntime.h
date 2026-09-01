@@ -10,8 +10,12 @@
 #include <jsi/jsi.h>
 #include <quickjs.h>
 
+#include <atomic>
+#include <mutex>
+#include <new>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "QuickJSRuntimeConfig.h"
 
@@ -34,6 +38,79 @@ class QuickJSRuntime : public jsi::Runtime {
   JSContext *context() const noexcept {
     return context_;
   }
+
+  /**
+   * Backing store for jsi::Symbol, jsi::BigInt, jsi::String and jsi::Object.
+   *
+   * Holds one reference on a JSValue. JSI clones by creating a new instance and
+   * releases through invalidate(), which may run on any thread -- a TurboModule
+   * dropping a jsi::Value on a background thread is normal -- so the release is
+   * routed through releaseValue().
+   *
+   * Nested because jsi::Runtime::PointerValue is protected.
+   */
+  class QuickJSPointerValue final : public PointerValue {
+   public:
+    QuickJSPointerValue(
+        QuickJSRuntime &runtime, JSValue value, bool owned = true)
+        : runtime_(runtime), owned_(owned), value_(value) {}
+
+    void invalidate() noexcept override {
+      // A borrowed wrapper carries no reference of its own, so releasing one
+      // would drop somebody else's. See borrowValue().
+      if (owned_) {
+        runtime_.releaseValue(value_);
+      }
+      runtime_.recyclePointerValue(this);
+    }
+
+    JSValue value() const noexcept {
+      return value_;
+    }
+
+   private:
+    friend class QuickJSRuntime;
+    ~QuickJSPointerValue() override = default;
+
+    QuickJSRuntime &runtime_;
+    bool owned_;
+    union {
+      JSValue value_;
+      QuickJSPointerValue *nextFree_;
+    };
+  };
+
+  /// Backing store for jsi::PropNameID, which maps onto a JSAtom. Atoms are
+  /// interned and comparable by identity, which is what PropNameID needs.
+  class QuickJSAtomPointerValue final : public PointerValue {
+   public:
+    QuickJSAtomPointerValue(QuickJSRuntime &runtime, JSAtom atom)
+        : runtime_(runtime), atom_(atom) {}
+
+    void invalidate() noexcept override {
+      runtime_.releaseAtom(atom_);
+      runtime_.recycleAtomPointerValue(this);
+    }
+
+    JSAtom atom() const noexcept {
+      return atom_;
+    }
+
+   private:
+    friend class QuickJSRuntime;
+    ~QuickJSAtomPointerValue() override = default;
+
+    QuickJSRuntime &runtime_;
+    union {
+      JSAtom atom_;
+      QuickJSAtomPointerValue *nextFree_;
+    };
+  };
+
+  /// Safe to call from any thread: an off-thread release is queued and freed on
+  /// the JS thread.
+  void releaseValue(JSValue value) noexcept;
+  void releaseAtom(JSAtom atom) noexcept;
 
   // jsi::Runtime -- public API
   jsi::Value evaluateJavaScript(
@@ -162,10 +239,83 @@ class QuickJSRuntime : public jsi::Runtime {
       const jsi::Object &obj, size_t amount) override;
 
  private:
+  void drainPendingReleases() noexcept;
+
+  /**
+   * PointerValues are the most allocated object in a JSI binding: one per
+   * jsi::Object, String, Symbol, BigInt and PropNameID crossing the boundary.
+   * new/delete measured ~20 ns against a ~4.5 ns property lookup, so the
+   * wrapper cost several times the work it wrapped. They are fixed-size and
+   * freed in no order, so a slab plus an intrusive free list threaded through
+   * the slot's own payload costs no extra memory.
+   *
+   * Inline because an out-of-line call was a measurable part of what the pool
+   * was meant to remove.
+   */
+  QuickJSPointerValue *allocPointerValue(JSValue value, bool owned = true) {
+    if (freeValues_ == nullptr) {
+      refillValueSlab();
+    }
+    QuickJSPointerValue *slot = freeValues_;
+    freeValues_ = slot->nextFree_;
+    return new (static_cast<void *>(slot))
+        QuickJSPointerValue(*this, value, owned);
+  }
+
+  QuickJSAtomPointerValue *allocAtomPointerValue(JSAtom atom) {
+    if (freeAtoms_ == nullptr) {
+      refillAtomSlab();
+    }
+    QuickJSAtomPointerValue *slot = freeAtoms_;
+    freeAtoms_ = slot->nextFree_;
+    return new (static_cast<void *>(slot)) QuickJSAtomPointerValue(*this, atom);
+  }
+
+  void recyclePointerValue(QuickJSPointerValue *pv) noexcept {
+    if (std::this_thread::get_id() == jsThread_) {
+      pv->nextFree_ = freeValues_;
+      freeValues_ = pv;
+      return;
+    }
+    queuePointerValue(pv);
+  }
+
+  void recycleAtomPointerValue(QuickJSAtomPointerValue *pv) noexcept {
+    if (std::this_thread::get_id() == jsThread_) {
+      pv->nextFree_ = freeAtoms_;
+      freeAtoms_ = pv;
+      return;
+    }
+    queueAtomPointerValue(pv);
+  }
+
+  void refillValueSlab();
+  void refillAtomSlab();
+  void queuePointerValue(QuickJSPointerValue *pv) noexcept;
+  void queueAtomPointerValue(QuickJSAtomPointerValue *pv) noexcept;
+  void freePointerValuePool() noexcept;
+
+  static constexpr size_t kPointerValueSlabSize = 256;
+  static constexpr int kMaxTeardownGCPasses = 2;
+
   QuickJSRuntimeConfig config_;
   JSRuntime *runtime_{nullptr};
   JSContext *context_{nullptr};
   std::thread::id jsThread_;
+
+  QuickJSPointerValue *freeValues_{nullptr};
+  QuickJSAtomPointerValue *freeAtoms_{nullptr};
+  std::vector<void *> valueSlabs_;
+  std::vector<void *> atomSlabs_;
+
+  // hasPendingReleases_ lets the drain exit without touching the mutex, which
+  // matters because it runs on every call into JS.
+  std::atomic<bool> hasPendingReleases_{false};
+  std::mutex pendingMutex_;
+  std::vector<JSValue> pendingValues_;
+  std::vector<JSAtom> pendingAtoms_;
+  std::vector<QuickJSPointerValue *> pendingPointerValues_;
+  std::vector<QuickJSAtomPointerValue *> pendingAtomPointerValues_;
 };
 
 }  // namespace qjs
