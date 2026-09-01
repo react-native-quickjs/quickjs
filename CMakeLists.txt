@@ -29,9 +29,10 @@ include(cmake/jsi.cmake)
 
 add_library(quickjs_jsi STATIC
   src/bytecode/QuickJSBytecode.cpp
+  src/module/QuickJSModule.cpp
   src/runtime/QuickJSRuntime.cpp
 )
-target_include_directories(quickjs_jsi PUBLIC src/bytecode src/runtime)
+target_include_directories(quickjs_jsi PUBLIC src/bytecode src/module src/runtime)
 target_link_libraries(quickjs_jsi PUBLIC jsi quickjs)
 set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

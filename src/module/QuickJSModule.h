@@ -1,0 +1,108 @@
+/*
+ * Copyright (c) Ammar Ahmed.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#pragma once
+
+#include <jsi/jsi.h>
+
+#include <vector>
+
+struct JSContext;
+
+namespace qjs {
+
+namespace jsi = facebook::jsi;
+
+/**
+ * The QuickJS module ABI.
+ *
+ * A module is a standalone npm package containing C or C++ that installs
+ * globals into the runtime -- a native implementation of an API React Native
+ * would otherwise ship as a JavaScript shim. `TextEncoder` is the archetype:
+ * the shim walks a string one code unit at a time building an array, where the
+ * native version is a bounds-checked loop into a pre-sized buffer.
+ *
+ * Modules are ordinary consumers of JSI, so they stay portable and testable on
+ * the host -- until they need not to be, at which point see
+ * `contextFromRuntime()`.
+ */
+
+/// Installs a module's globals. Called once per runtime, before any
+/// application JavaScript runs.
+using ModuleInstaller = void (*)(jsi::Runtime &);
+
+struct ModuleRegistration {
+  /// Conventionally the npm package name. Used in diagnostics and to make
+  /// double registration detectable.
+  const char *name;
+
+  ModuleInstaller install;
+
+  /// Ascending install order, so a module depending on another's globals can
+  /// order itself after it. Ties keep registration order.
+  int priority;
+};
+
+/**
+ * Registers a module to be installed into every runtime created afterwards.
+ * Safe to call before any runtime exists.
+ *
+ * A duplicate name is ignored rather than fatal: static libraries get linked
+ * twice more often than anyone expects, and crashing an app over it would be a
+ * poor trade.
+ */
+void registerModule(const ModuleRegistration &module);
+
+inline void registerModule(
+    const char *name, ModuleInstaller install, int priority = 0) {
+  registerModule(ModuleRegistration{name, install, priority});
+}
+
+/// `makeQuickJSRuntime()` calls this. Call it yourself only for a runtime you
+/// built by other means.
+void installModules(jsi::Runtime &runtime);
+
+const std::vector<ModuleRegistration> &registeredModules();
+
+/**
+ * The `JSContext *` behind `runtime`, or nullptr if it is not one of ours.
+ *
+ * Use it where JSI cannot express something efficiently. The cost is
+ * portability, so check the return value rather than assuming it, and keep a
+ * plain-JSI path behind it. `QuickJSModuleNative.h` has the companion helpers;
+ * it is a separate header because it pulls in `quickjs.h`, which a portable
+ * module has no reason to see.
+ */
+JSContext *contextFromRuntime(jsi::Runtime &runtime) noexcept;
+
+/**
+ * Registers a module at static-initialization time.
+ *
+ * Convenient, but a static initializer in a static library is dropped by the
+ * linker unless something in its translation unit is referenced. The primary
+ * mechanism for a shipped module is therefore generated registration code,
+ * which cannot be stripped. Use this for shared libraries and tests.
+ */
+/* The indirection is so INSTALL_FN may be a qualified name such as
+   ns::install -- pasting that into an identifier would not compile. */
+#define QJS_REGISTER_MODULE_IMPL2(NAME, INSTALL_FN, UNIQUE)                \
+  namespace {                                                              \
+  struct QjsModuleAutoRegister_##UNIQUE {                                  \
+    QjsModuleAutoRegister_##UNIQUE() {                                     \
+      ::qjs::registerModule(NAME, INSTALL_FN);                             \
+    }                                                                      \
+  };                                                                       \
+  static QjsModuleAutoRegister_##UNIQUE qjs_module_auto_register_##UNIQUE; \
+  }
+
+#define QJS_REGISTER_MODULE_IMPL(NAME, INSTALL_FN, UNIQUE) \
+  QJS_REGISTER_MODULE_IMPL2(NAME, INSTALL_FN, UNIQUE)
+
+#define QJS_REGISTER_MODULE(NAME, INSTALL_FN) \
+  QJS_REGISTER_MODULE_IMPL(NAME, INSTALL_FN, __LINE__)
+
+}  // namespace qjs
