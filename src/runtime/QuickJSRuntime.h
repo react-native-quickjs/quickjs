@@ -17,6 +17,7 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "QuickJSRuntimeConfig.h"
@@ -149,10 +150,15 @@ class QuickJSRuntime : public jsi::Runtime {
 
   /// Registration of the native payloads attached to JS objects, so teardown
   /// can release them without waiting for the collector to reach their owners.
+  void registerHostObject(void *proxy);
+  void unregisterHostObject(void *proxy);
   void registerHostFunction(void *proxy);
   void unregisterHostFunction(void *proxy);
 
   /// Public because the class callbacks are free functions.
+  JSClassID hostObjectClassID() const noexcept {
+    return hostObjectClassID_;
+  }
   JSClassID hostFunctionClassID() const noexcept {
     return hostFunctionClassID_;
   }
@@ -435,10 +441,12 @@ class QuickJSRuntime : public jsi::Runtime {
   // original exception is gone and the bail-out would name only itself.
   std::string firstErrorDescription_;
 
+  JSClassID hostObjectClassID_{0};
   JSClassID hostFunctionClassID_{0};
 
   // Intrusive list heads of the live native payloads, held as void* to keep the
   // payload types private to the implementation.
+  void *hostObjectProxies_{nullptr};
   void *hostFunctionProxies_{nullptr};
 
   // Engine facilities with no C API, evaluated once at startup.

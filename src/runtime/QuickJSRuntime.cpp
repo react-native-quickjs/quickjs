@@ -30,6 +30,14 @@ struct NativePayloadLink {
   NativePayloadLink *next{nullptr};
 };
 
+/// Opaque payload of a host object. Owned by the JS object and released by the
+/// class finalizer.
+struct HostObjectProxy {
+  NativePayloadLink link;  // must stay first
+  QuickJSRuntime *runtime;
+  std::shared_ptr<jsi::HostObject> hostObject;
+};
+
 /// Opaque payload of a host function. `function` is returned by reference from
 /// getHostFunction, so it must keep a stable address for the lifetime of the JS
 /// function.
@@ -67,6 +75,160 @@ void payloadUnlink(void *&head, void *proxy) {
   }
   link->prev = link->next = nullptr;
 }
+
+struct HostObjectHandlers {
+  static HostObjectProxy *proxyOf(JSContext *ctx, JSValueConst obj) {
+    return static_cast<HostObjectProxy *>(
+        JS_GetOpaque(obj, runtimeOf(ctx)->hostObjectClassID()));
+  }
+
+  static int getOwnProperty(
+      JSContext *ctx, JSPropertyDescriptor *desc, JSValueConst obj,
+      JSAtom prop) {
+    auto *proxy = proxyOf(ctx, obj);
+    if (proxy == nullptr) {
+      return false;
+    }
+    // A host object answers for every key, so an existence check needs no call
+    // into C++.
+    if (desc == nullptr) {
+      return true;
+    }
+
+    auto *runtime = proxy->runtime;
+    try {
+      jsi::PropNameID name =
+          runtime->createPropNameIDFrom(JS_DupAtom(ctx, prop));
+      jsi::Value value = proxy->hostObject->get(*runtime, name);
+      desc->flags = JS_PROP_C_W_E;
+      desc->value = JS_DupValue(ctx, runtime->toJSValue(value));
+      desc->getter = JS_UNDEFINED;
+      desc->setter = JS_UNDEFINED;
+      return true;
+    } catch (const std::exception &e) {
+      runtime->throwAsJSException(&e, "HostObject");
+      return -1;
+    } catch (...) {
+      runtime->throwAsJSException(nullptr, "HostObject");
+      return -1;
+    }
+  }
+
+  static int getOwnPropertyNames(
+      JSContext *ctx, JSPropertyEnum **ptab, uint32_t *plen, JSValueConst obj) {
+    auto *proxy = proxyOf(ctx, obj);
+    if (proxy == nullptr) {
+      *ptab = nullptr;
+      *plen = 0;
+      return 0;
+    }
+
+    auto *runtime = proxy->runtime;
+    std::vector<jsi::PropNameID> names;
+    try {
+      names = proxy->hostObject->getPropertyNames(*runtime);
+    } catch (const std::exception &e) {
+      runtime->throwAsJSException(&e, "HostObject");
+      return -1;
+    } catch (...) {
+      runtime->throwAsJSException(nullptr, "HostObject");
+      return -1;
+    }
+
+    // JSI allows duplicates here; the property enumeration protocol does not.
+    std::vector<JSAtom> unique;
+    std::unordered_set<JSAtom> seen;
+    unique.reserve(names.size());
+    for (const jsi::PropNameID &name : names) {
+      JSAtom atom = QuickJSRuntime::toJSAtom(name);
+      if (seen.insert(atom).second) {
+        unique.push_back(atom);
+      }
+    }
+
+    auto *table = static_cast<JSPropertyEnum *>(js_malloc(
+        ctx, sizeof(JSPropertyEnum) * std::max<size_t>(unique.size(), 1)));
+    if (table == nullptr) {
+      return -1;
+    }
+    for (size_t i = 0; i < unique.size(); ++i) {
+      table[i].is_enumerable = true;
+      table[i].atom = JS_DupAtom(ctx, unique[i]);
+    }
+
+    *ptab = table;
+    *plen = static_cast<uint32_t>(unique.size());
+    return 0;
+  }
+
+  static int setProperty(
+      JSContext *ctx, JSValueConst obj, JSAtom atom, JSValueConst value,
+      JSValueConst receiver, int flags) {
+    auto *proxy = proxyOf(ctx, obj);
+    if (proxy == nullptr) {
+      return false;
+    }
+
+    // OrdinarySetWithOwnDescriptor: an assignment that reached this host object
+    // by walking a receiver's prototype chain creates an own property on the
+    // receiver instead of calling HostObject::set. React Native's TurboModules
+    // depend on it -- TurboModule::get memoises each method by writing it back
+    // onto a plain object whose prototype is the module's HostObject.
+    const bool receiverIsThisObject =
+        JS_VALUE_GET_TAG(receiver) == JS_VALUE_GET_TAG(obj) &&
+        JS_VALUE_GET_PTR(receiver) == JS_VALUE_GET_PTR(obj);
+
+    if (!JS_IsUndefined(receiver) && !receiverIsThisObject) {
+      // Step 3.a returns false for a non-object receiver, reachable through
+      // Reflect.set(hostObj, k, v, 5). Defining would throw instead.
+      if (JS_VALUE_GET_TAG(receiver) != JS_TAG_OBJECT) {
+        return false;
+      }
+      // Defining is safe: quickjs only consults a prototype's set_property
+      // after failing to find an own property. Both throw flags are forwarded
+      // so the caller's own strictness policy is reproduced -- without them a
+      // strict assignment onto a frozen receiver returns false where the spec
+      // throws.
+      int defined = JS_DefinePropertyValue(
+          ctx, receiver, JS_DupAtom(ctx, atom), JS_DupValue(ctx, value),
+          JS_PROP_C_W_E | (flags & (JS_PROP_THROW | JS_PROP_THROW_STRICT)));
+      return defined < 0 ? -1 : defined;
+    }
+
+    auto *runtime = proxy->runtime;
+    try {
+      jsi::PropNameID name =
+          runtime->createPropNameIDFrom(JS_DupAtom(ctx, atom));
+      proxy->hostObject->set(
+          *runtime, name, runtime->createValue(JS_DupValue(ctx, value)));
+      return true;
+    } catch (const std::exception &e) {
+      runtime->throwAsJSException(&e, "HostObject");
+      return -1;
+    } catch (...) {
+      runtime->throwAsJSException(nullptr, "HostObject");
+      return -1;
+    }
+  }
+
+  static void finalizer(JSRuntime *rt, JSValueConst value) {
+    auto *runtime = static_cast<QuickJSRuntime *>(JS_GetRuntimeOpaque(rt));
+    auto *proxy = static_cast<HostObjectProxy *>(
+        JS_GetOpaque(value, runtime->hostObjectClassID()));
+    runtime->unregisterHostObject(proxy);
+    delete proxy;
+  }
+};
+
+JSClassExoticMethods gHostObjectExotic = {
+    /* get_own_property */ HostObjectHandlers::getOwnProperty,
+    /* get_own_property_names */ HostObjectHandlers::getOwnPropertyNames,
+    /* delete_property */ nullptr,
+    /* define_own_property */ nullptr,
+    /* has_property */ nullptr,
+    /* get_property */ nullptr,
+    /* set_property */ HostObjectHandlers::setProperty,
+};
 
 struct HostFunctionHandlers {
   static JSValue call(
@@ -162,6 +324,13 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
 }
 
 void QuickJSRuntime::registerClasses() {
+  JS_NewClassID(runtime_, &hostObjectClassID_);
+  JSClassDef hostObjectDef = {};
+  hostObjectDef.class_name = "HostObject";
+  hostObjectDef.finalizer = HostObjectHandlers::finalizer;
+  hostObjectDef.exotic = &gHostObjectExotic;
+  JS_NewClass(runtime_, hostObjectClassID_, &hostObjectDef);
+
   JS_NewClassID(runtime_, &hostFunctionClassID_);
   JSClassDef hostFunctionDef = {};
   hostFunctionDef.class_name = "HostFunction";
@@ -181,6 +350,14 @@ void QuickJSRuntime::registerClasses() {
   JS_FreeValue(context_, global);
 }
 
+void QuickJSRuntime::registerHostObject(void *proxy) {
+  payloadLink(hostObjectProxies_, proxy);
+}
+
+void QuickJSRuntime::unregisterHostObject(void *proxy) {
+  payloadUnlink(hostObjectProxies_, proxy);
+}
+
 void QuickJSRuntime::registerHostFunction(void *proxy) {
   payloadLink(hostFunctionProxies_, proxy);
 }
@@ -193,6 +370,12 @@ void QuickJSRuntime::unregisterHostFunction(void *proxy) {
 /// still run during JS_FreeRuntime, which is what unlinks them. Releasing a
 /// payload can free jsi values and so re-enter, hence remembering `next` first.
 void QuickJSRuntime::releaseNativePayloads() noexcept {
+  for (auto *l = static_cast<NativePayloadLink *>(hostObjectProxies_);
+       l != nullptr;) {
+    auto *next = l->next;
+    reinterpret_cast<HostObjectProxy *>(l)->hostObject.reset();
+    l = next;
+  }
   for (auto *l = static_cast<NativePayloadLink *>(hostFunctionProxies_);
        l != nullptr;) {
     auto *next = l->next;
@@ -843,12 +1026,22 @@ jsi::Object QuickJSRuntime::createObject() {
 }
 
 jsi::Object QuickJSRuntime::createObject(std::shared_ptr<jsi::HostObject> ho) {
-  notImplemented("createObject");
+  JSValue object = JS_NewObjectClass(context_, hostObjectClassID_);
+  checkException(object);
+  auto *proxy = new HostObjectProxy{{}, this, std::move(ho)};
+  registerHostObject(proxy);
+  JS_SetOpaque(object, proxy);
+  return createObjectFrom(object);
 }
 
 std::shared_ptr<jsi::HostObject> QuickJSRuntime::getHostObject(
-    const jsi::Object &) {
-  notImplemented("getHostObject");
+    const jsi::Object &object) {
+  auto *proxy = static_cast<HostObjectProxy *>(
+      JS_GetOpaque(toJSValue(object), hostObjectClassID_));
+  if (proxy == nullptr) {
+    throw jsi::JSINativeException("QuickJSRuntime: not a host object");
+  }
+  return proxy->hostObject;
 }
 
 jsi::HostFunctionType &QuickJSRuntime::getHostFunction(
@@ -961,8 +1154,8 @@ bool QuickJSRuntime::isFunction(const jsi::Object &object) const {
   return JS_IsFunction(context_, toJSValue(object));
 }
 
-bool QuickJSRuntime::isHostObject(const jsi::Object &) const {
-  notImplemented("isHostObject");
+bool QuickJSRuntime::isHostObject(const jsi::Object &object) const {
+  return JS_GetOpaque(toJSValue(object), hostObjectClassID_) != nullptr;
 }
 
 bool QuickJSRuntime::isHostFunction(const jsi::Function &function) const {
