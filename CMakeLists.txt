@@ -29,6 +29,7 @@ include(cmake/jsi.cmake)
 
 add_library(quickjs_jsi STATIC
   src/bytecode/QuickJSBytecode.cpp
+  src/module/QuickJSCompat.cpp
   src/module/QuickJSModule.cpp
   src/runtime/QuickJSRuntime.cpp
 )
