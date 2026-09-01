@@ -920,14 +920,26 @@ jsi::Function QuickJSRuntime::createFunctionFromHostFunction(
 }
 
 jsi::Value QuickJSRuntime::call(
-    const jsi::Function &, const jsi::Value &jsThis, const jsi::Value *args,
-    size_t count) {
-  notImplemented("call");
+    const jsi::Function &function, const jsi::Value &jsThis,
+    const jsi::Value *args, size_t count) {
+  adoptCurrentThread();
+  drainPendingReleases();
+
+  ArgumentList arguments(*this, args, count);
+  return createValue(JS_Call(
+      context_, toJSValue(function), toJSValue(jsThis), static_cast<int>(count),
+      arguments.data()));
 }
 
 jsi::Value QuickJSRuntime::callAsConstructor(
-    const jsi::Function &, const jsi::Value *args, size_t count) {
-  notImplemented("callAsConstructor");
+    const jsi::Function &function, const jsi::Value *args, size_t count) {
+  adoptCurrentThread();
+  drainPendingReleases();
+
+  ArgumentList arguments(*this, args, count);
+  return createValue(JS_CallConstructor(
+      context_, toJSValue(function), static_cast<int>(count),
+      arguments.data()));
 }
 
 bool QuickJSRuntime::strictEquals(

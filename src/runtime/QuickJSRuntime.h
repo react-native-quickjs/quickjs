@@ -330,6 +330,32 @@ class QuickJSRuntime : public jsi::Runtime {
   void drainPendingReleases() noexcept;
   JSValue evalInternal(const char *source) noexcept;
 
+  // toJSValue borrows, so the array holds no references and needs no cleanup:
+  // the jsi::Values the caller owns outlive the call.
+  class ArgumentList {
+   public:
+    ArgumentList(
+        const QuickJSRuntime &runtime, const jsi::Value *args, size_t count) {
+      if (count > kInline) {
+        heap_.resize(count);
+        values_ = heap_.data();
+      }
+      for (size_t i = 0; i < count; ++i) {
+        values_[i] = runtime.toJSValue(args[i]);
+      }
+    }
+
+    JSValue *data() noexcept {
+      return values_;
+    }
+
+   private:
+    static constexpr size_t kInline = 8;
+    JSValue inline_[kInline];
+    std::vector<JSValue> heap_;
+    JSValue *values_{inline_};
+  };
+
   // Pooled: one PointerValue per jsi value crossing the boundary, and
   // new/delete measured ~20 ns against a ~4.5 ns property lookup. Inline
   // because the call itself was a measurable part of that cost.
