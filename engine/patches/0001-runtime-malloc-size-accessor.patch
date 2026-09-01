@@ -1,0 +1,46 @@
+Subject: report how much memory the engine is currently holding
+
+What this does
+  Adds a way to ask the engine how many bytes it has allocated right now.
+  It reads a number the engine already keeps, so it costs nothing to call.
+
+Why we need it
+  The runtime decides when to collect garbage based on how much memory is
+  live. There was already a way to measure memory, JS_ComputeMemoryUsage, but
+  it walks the whole heap to produce its answer. That is far too expensive to
+  call on every check, which is exactly where we need the number.
+
+What it adds
+  JS_GetMallocSize()  - the number of bytes the engine has allocated.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 55f7c76..b7d53e5 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7453,6 +7453,11 @@ static void gc_free_cycles(JSRuntime *rt)
+     init_list_head(&rt->gc_zero_ref_count_list);
+ }
+ 
++size_t JS_GetMallocSize(JSRuntime *rt)
++{
++    return rt->malloc_state.malloc_size;
++}
++
+ void JS_RunGC(JSRuntime *rt)
+ {
+     /* decrement the reference of the children of each object. mark =
+diff --git a/quickjs.h b/quickjs.h
+index 6763f83..836e0c7 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -530,6 +530,7 @@ typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
+ JS_EXTERN void JS_MarkValue(JSRuntime *rt, JSValueConst val,
+                             JS_MarkFunc *mark_func);
+ JS_EXTERN void JS_RunGC(JSRuntime *rt);
++JS_EXTERN size_t JS_GetMallocSize(JSRuntime *rt);
+ JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
+ 
+ JS_EXTERN JSContext *JS_NewContext(JSRuntime *rt);

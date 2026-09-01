@@ -11,6 +11,7 @@ what we changed and why without opening a single `.patch` file.
 
 | Patch | What it does | Why we need it | Adds | Bytecode bump? |
 |---|---|---|---|---|
+| `0001` | Reports how much memory the engine is currently holding | The runtime decides when to collect garbage based on how much memory is live, and the existing way to measure it walks the whole heap | `JS_GetMallocSize` | No |
 
 ## Writing a patch header
 
