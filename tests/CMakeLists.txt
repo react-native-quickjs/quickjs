@@ -22,6 +22,11 @@ function(qjs_add_test_suite name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# No gtest here on purpose -- see the file header.
+add_executable(quickjs_jsi_tests smoketest.cpp)
+target_link_libraries(quickjs_jsi_tests PRIVATE quickjs_jsi)
+add_test(NAME quickjs_jsi_tests COMMAND quickjs_jsi_tests)
+
 add_executable(quickjs_jsi_bench bench/jsi_bench.cpp)
 target_link_libraries(quickjs_jsi_bench PRIVATE quickjs_jsi)
 
