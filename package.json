@@ -1,6 +1,6 @@
 {
   "name": "@react-native-quickjs/quickjs",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "QuickJS JSI runtime for React Native, built from source",
   "keywords": [
     "react-native",
@@ -32,6 +32,10 @@
     "scripts/postinstall.js",
     "scripts/react_native_quickjs_pods.rb",
     "*.podspec",
+    "bin",
+    "app.plugin.js",
+    "scripts/setup",
+    "scripts/expo",
     "!android/build",
     "!android/.cxx",
     "!**/__tests__",
@@ -59,7 +63,8 @@
   },
   "peerDependencies": {
     "react": "*",
-    "react-native": ">=0.85.0"
+    "react-native": ">=0.85.0",
+    "@expo/config-plugins": "*"
   },
   "devDependencies": {
     "@commitlint/config-conventional": "^21.0.2",
@@ -76,5 +81,13 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "bin": {
+    "react-native-quickjs": "bin/react-native-quickjs.js"
+  },
+  "peerDependenciesMeta": {
+    "@expo/config-plugins": {
+      "optional": true
+    }
   }
 }
