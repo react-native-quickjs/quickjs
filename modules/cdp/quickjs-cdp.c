@@ -69,7 +69,12 @@ struct QJSCDPAgent {
   pthread_mutex_t lock;
   pthread_cond_t cond;
   char **queue;
+  void **queue_session;
   int queue_len, queue_cap;
+
+  /* The session whose request is being handled right now. Replies go to it;
+     events go to everyone. */
+  void *session;
 
   Script *scripts;
   int nscripts;
@@ -163,7 +168,7 @@ static void send_message(QJSCDPAgent *agent, JSValue msg) {
   size_t len = 0;
   const char *text = JS_ToCStringLen(agent->jctx, &len, s);
   if (text) {
-    agent->send(agent->send_opaque, text, len);
+    agent->send(agent->send_opaque, agent->session, text, len);
     JS_FreeCString(agent->jctx, text);
   }
   JS_FreeValue(agent->jctx, s);
@@ -182,9 +187,10 @@ static void send_empty_result(QJSCDPAgent *agent, int id) {
   send_result(agent, id, json_object(agent));
 }
 
-static void send_error(QJSCDPAgent *agent, int id, const char *message) {
+static void send_error_code(
+    QJSCDPAgent *agent, int id, int code, const char *message) {
   JSValue e = json_object(agent);
-  json_set_int(agent, e, "code", -32000);
+  json_set_int(agent, e, "code", code);
   json_set_string(agent, e, "message", message);
   JSValue m = json_object(agent);
   json_set_int(agent, m, "id", id);
@@ -192,12 +198,22 @@ static void send_error(QJSCDPAgent *agent, int id, const char *message) {
   send_message(agent, m);
 }
 
-/* Takes ownership of params. */
+/* -32000 is "server error", which is what the protocol uses for anything the
+   engine simply could not do. */
+static void send_error(QJSCDPAgent *agent, int id, const char *message) {
+  send_error_code(agent, id, -32000, message);
+}
+
+/* Takes ownership of params. Goes to every attached frontend, not just the one
+   whose request happens to be in flight. */
 static void send_event(QJSCDPAgent *agent, const char *method, JSValue params) {
+  void *asked = agent->session;
+  agent->session = NULL;
   JSValue m = json_object(agent);
   json_set_string(agent, m, "method", method);
   json_set(agent, m, "params", params);
   send_message(agent, m);
+  agent->session = asked;
 }
 
 /* ------------------------------------------------------- remote objects --- */
@@ -482,6 +498,12 @@ static JSValue frame_scope_object(QJSCDPAgent *agent, int level) {
   return scope;
 }
 
+/* quickjs names the top-level frame "<eval>"; the protocol calls it "global". */
+static const char *frame_name(const char *func) {
+  if (!func || !*func) return "";
+  return strcmp(func, "<eval>") == 0 ? "global" : func;
+}
+
 static JSValue call_frames(QJSCDPAgent *agent) {
   JSValue frames = json_array(agent);
   int depth = JS_GetStackDepth(agent->ctx);
@@ -524,7 +546,7 @@ static JSValue call_frames(QJSCDPAgent *agent) {
 
     JSValue frame = json_object(agent);
     json_set_string(agent, frame, "callFrameId", frame_id);
-    json_set_string(agent, frame, "functionName", func ? func : "");
+    json_set_string(agent, frame, "functionName", frame_name(func));
     json_set(agent, frame, "location", location);
     json_set(agent, frame, "url", JS_NewString(agent->jctx, file ? file : ""));
     json_set(agent, frame, "scopeChain", scope_chain);
@@ -542,12 +564,17 @@ static JSValue call_frames(QJSCDPAgent *agent) {
 static void handle_message(QJSCDPAgent *agent, const char *json, size_t len);
 
 /* Caller holds the lock. */
-static char *take_message(QJSCDPAgent *agent) {
+static char *take_message(QJSCDPAgent *agent, void **session) {
   if (agent->queue_len == 0) return NULL;
   char *msg = agent->queue[0];
+  *session = agent->queue_session[0];
+  agent->queue_len--;
   memmove(
       agent->queue, agent->queue + 1,
-      sizeof(char *) * (size_t)(--agent->queue_len));
+      sizeof(char *) * (size_t)agent->queue_len);
+  memmove(
+      agent->queue_session, agent->queue_session + 1,
+      sizeof(void *) * (size_t)agent->queue_len);
   return msg;
 }
 
@@ -576,10 +603,13 @@ static void pause_until_resumed(
 
   pthread_mutex_lock(&agent->lock);
   for (;;) {
-    char *msg = take_message(agent);
+    void *session = NULL;
+    char *msg = take_message(agent, &session);
     if (msg) {
       pthread_mutex_unlock(&agent->lock);
+      agent->session = session;
       handle_message(agent, msg, strlen(msg));
+      agent->session = NULL;
       free(msg);
       pthread_mutex_lock(&agent->lock);
       continue;
@@ -894,6 +924,15 @@ static void dispatch(
     QJSCDPAgent *agent, int id, const char *method, JSValue params) {
   /* --- Runtime --- */
   if (is(method, "Runtime.evaluate")) {
+    /* A contextId naming some other execution context is an invalid request,
+       not an evaluation: answering it would run the expression in the wrong
+       place and the frontend would never know. */
+    const int wanted =
+        json_get_int(agent, params, "contextId", agent->exec_ctx_id);
+    if (wanted != agent->exec_ctx_id) {
+      send_error_code(agent, id, -32600, "Unknown execution context id");
+      return;
+    }
     const char *expr = json_get_string(agent, params, "expression");
     const char *group = json_get_string(agent, params, "objectGroup");
     JSValue v = expr ? JS_Eval(
@@ -1097,6 +1136,7 @@ void qjs_cdp_free(QJSCDPAgent *agent) {
   free(agent->scripts);
   free(agent->bps);
   free(agent->queue);
+  free(agent->queue_session);
 
   JS_FreeContext(agent->jctx);
   JS_FreeRuntime(agent->jrt);
@@ -1105,7 +1145,8 @@ void qjs_cdp_free(QJSCDPAgent *agent) {
   free(agent);
 }
 
-void qjs_cdp_send_message(QJSCDPAgent *agent, const char *json, size_t len) {
+void qjs_cdp_send_message(
+    QJSCDPAgent *agent, void *session, const char *json, size_t len) {
   char *copy = malloc(len + 1);
   memcpy(copy, json, len);
   copy[len] = '\0';
@@ -1115,7 +1156,10 @@ void qjs_cdp_send_message(QJSCDPAgent *agent, const char *json, size_t len) {
     agent->queue_cap = agent->queue_cap ? agent->queue_cap * 2 : 8;
     agent->queue =
         realloc(agent->queue, sizeof(char *) * (size_t)agent->queue_cap);
+    agent->queue_session = realloc(
+        agent->queue_session, sizeof(void *) * (size_t)agent->queue_cap);
   }
+  agent->queue_session[agent->queue_len] = session;
   agent->queue[agent->queue_len++] = copy;
   pthread_cond_broadcast(&agent->cond);
   pthread_mutex_unlock(&agent->lock);
@@ -1123,11 +1167,14 @@ void qjs_cdp_send_message(QJSCDPAgent *agent, const char *json, size_t len) {
 
 void qjs_cdp_poll(QJSCDPAgent *agent) {
   for (;;) {
+    void *session = NULL;
     pthread_mutex_lock(&agent->lock);
-    char *msg = take_message(agent);
+    char *msg = take_message(agent, &session);
     pthread_mutex_unlock(&agent->lock);
     if (!msg) return;
+    agent->session = session;
     handle_message(agent, msg, strlen(msg));
+    agent->session = NULL;
     free(msg);
   }
 }
@@ -1145,6 +1192,61 @@ void qjs_cdp_script_loaded(
     announce_script(agent, script);
     resolve_breakpoints(agent, script);
   }
+}
+
+char *qjs_cdp_capture_stack_trace(QJSCDPAgent *agent, int frames_to_skip) {
+  JSValue frames = json_array(agent);
+  const int depth = JS_GetStackDepth(agent->ctx);
+  uint32_t n = 0;
+
+  for (int level = frames_to_skip; level < depth; level++) {
+    JSDebugFrameInfo info;
+    if (JS_GetFrameInfoAtLevel(agent->ctx, level, &info) < 0) break;
+    if (info.is_native) continue;
+
+    const char *file = info.filename != JS_ATOM_NULL
+                           ? JS_AtomToCString(agent->ctx, info.filename)
+                           : NULL;
+    const char *func = info.func_name != JS_ATOM_NULL
+                           ? JS_AtomToCString(agent->ctx, info.func_name)
+                           : NULL;
+    Script *script = file ? find_script_by_url(agent, file) : NULL;
+    char script_id[16];
+    snprintf(script_id, sizeof(script_id), "%d", script ? script->id : 0);
+
+    JSValue frame = json_object(agent);
+    json_set_string(agent, frame, "functionName", frame_name(func));
+    json_set_string(agent, frame, "scriptId", script_id);
+    json_set_string(agent, frame, "url", file ? file : "");
+    json_set_int(agent, frame, "lineNumber", info.line > 0 ? info.line - 1 : 0);
+    json_set_int(agent, frame, "columnNumber", info.col > 0 ? info.col - 1 : 0);
+    json_set_index(agent, frames, n++, frame);
+
+    if (file) JS_FreeCString(agent->ctx, file);
+    if (func) JS_FreeCString(agent->ctx, func);
+  }
+
+  JSValue trace = json_object(agent);
+  json_set(agent, trace, "callFrames", frames);
+
+  JSValue text =
+      JS_JSONStringify(agent->jctx, trace, JS_UNDEFINED, JS_UNDEFINED);
+  size_t len = 0;
+  const char *json = JS_ToCStringLen(agent->jctx, &len, text);
+  char *out = NULL;
+  if (json) {
+    out = malloc(len + 1);
+    memcpy(out, json, len);
+    out[len] = '\0';
+    JS_FreeCString(agent->jctx, json);
+  }
+  JS_FreeValue(agent->jctx, text);
+  JS_FreeValue(agent->jctx, trace);
+  return out;
+}
+
+void qjs_cdp_set_execution_context(QJSCDPAgent *agent, int id) {
+  agent->exec_ctx_id = id;
 }
 
 void qjs_cdp_pause(QJSCDPAgent *agent) {

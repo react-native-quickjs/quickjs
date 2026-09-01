@@ -27,6 +27,8 @@ extern "C" {
 
 namespace qjs {
 
+class InspectorSession;
+
 /**
  * Owns the agent for one runtime.
  *
@@ -51,20 +53,29 @@ class QuickJSInspectorDelegate : public facebook::react::jsinspector_modern::
           &executionContextDescription,
       facebook::react::RuntimeExecutor runtimeExecutor) override;
 
+  std::unique_ptr<facebook::react::jsinspector_modern::StackTrace>
+  captureStackTrace(
+      facebook::jsi::Runtime &runtime, size_t framesToSkip) override;
+
+  std::optional<folly::dynamic> serializeStackTrace(
+      const facebook::react::jsinspector_modern::StackTrace &stackTrace)
+      override;
+
   /// Tells the frontend a script exists, and resolves breakpoints set against
   /// its URL. JS thread only.
   void scriptLoaded(const std::string &url, const std::string &source);
 
-  QJSCDPAgent *agent() const {
-    return agent_;
-  }
+  /// Called by a session as it goes away, so that a reply can never be routed
+  /// to a frontend that has disconnected.
+  void forget(InspectorSession *session);
 
  private:
-  static void sendToFrontends(void *opaque, const char *json, size_t len);
+  static void deliver(
+      void *opaque, void *session, const char *json, size_t len);
 
   QJSCDPAgent *agent_;
   std::mutex lock_;
-  std::vector<facebook::react::jsinspector_modern::FrontendChannel> channels_;
+  std::vector<InspectorSession *> sessions_;  // not owned
 };
 
 /**

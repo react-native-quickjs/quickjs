@@ -39,8 +39,14 @@ extern "C" {
 typedef struct QJSCDPAgent QJSCDPAgent;
 
 /* Receives one complete CDP message to deliver to the frontend. Called on the
-   JS thread. `json` is owned by the agent and is not valid after the call. */
-typedef void QJSCDPSendFunc(void *opaque, const char *json, size_t len);
+   JS thread. `json` is owned by the agent and is not valid after the call.
+
+   `session` is the token that came with the request being answered, or NULL for
+   an event, which belongs to every session at once. A reply must reach only the
+   frontend that asked: two frontends can be attached, and answering both makes
+   each of them see a response to something it never sent. */
+typedef void QJSCDPSendFunc(
+    void *opaque, void *session, const char *json, size_t len);
 
 /* Creates the agent and installs the engine's trace handler on `ctx`.
    `execution_context_id` is the id reported in Runtime.executionContextCreated
@@ -57,8 +63,14 @@ void qjs_cdp_free(QJSCDPAgent *agent);
    once, and refusing on behalf of all of them is not ours to do. */
 bool qjs_cdp_handles(const char *method);
 
-/* Queues one CDP message. Any thread. */
-void qjs_cdp_send_message(QJSCDPAgent *agent, const char *json, size_t len);
+/* Tells the agent which execution context it is speaking for. The embedder
+   assigns the id, and a Runtime.evaluate naming any other context is refused
+   rather than run in this one. */
+void qjs_cdp_set_execution_context(QJSCDPAgent *agent, int id);
+
+/* Queues one CDP message from `session`. Any thread. */
+void qjs_cdp_send_message(
+    QJSCDPAgent *agent, void *session, const char *json, size_t len);
 
 /* Handles every queued message. JS thread only. */
 void qjs_cdp_poll(QJSCDPAgent *agent);
@@ -68,6 +80,12 @@ void qjs_cdp_poll(QJSCDPAgent *agent);
    JS thread only. */
 void qjs_cdp_script_loaded(
     QJSCDPAgent *agent, const char *url, const char *source);
+
+/* The call stack right now, as a Runtime.StackTrace JSON object. Returns a
+   string the caller frees with free(), or NULL when nothing is running.
+   `frames_to_skip` drops that many innermost frames, which is how a native
+   function leaves itself out of the trace it is capturing. JS thread only. */
+char *qjs_cdp_capture_stack_trace(QJSCDPAgent *agent, int frames_to_skip);
 
 /* Asks the running program to stop at the next statement. Any thread. */
 void qjs_cdp_pause(QJSCDPAgent *agent);

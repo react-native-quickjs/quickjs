@@ -37,14 +37,16 @@ class CDPTest : public ::testing::Test {
     JS_FreeRuntime(rt_);
   }
 
-  static void collect(void *opaque, const char *json, size_t len) {
+  static void collect(
+      void *opaque, void *session, const char *json, size_t len) {
+    (void)session;
     auto *self = static_cast<CDPTest *>(opaque);
     std::lock_guard<std::mutex> guard(self->lock_);
     self->sent_.emplace_back(json, len);
   }
 
   void send(const std::string &message) {
-    qjs_cdp_send_message(agent_, message.c_str(), message.size());
+    qjs_cdp_send_message(agent_, this, message.c_str(), message.size());
     qjs_cdp_poll(agent_);
   }
 
@@ -234,7 +236,7 @@ class CDPPauseTest : public CDPTest {
 
   /// Queues without polling: while paused, the pause loop is the pump.
   void post(const std::string &message) {
-    qjs_cdp_send_message(agent_, message.c_str(), message.size());
+    qjs_cdp_send_message(agent_, this, message.c_str(), message.size());
   }
 
   void breakOnLineTwoAndRun() {
