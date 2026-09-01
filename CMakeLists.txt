@@ -23,3 +23,5 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # add_test() calls made in directories processed before this line, with no
 # warning -- the test simply never appears in `ctest -N`.
 enable_testing()
+
+include(cmake/quickjs.cmake)
