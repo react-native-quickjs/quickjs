@@ -49,3 +49,7 @@ add_executable(qjsc-ng tools/bytecode/qjsc-ng.c)
 target_link_libraries(qjsc-ng PRIVATE quickjs)
 
 add_subdirectory(tests)
+
+# Added after tests/ on purpose: tests/CMakeLists.txt is where googletest is
+# fetched, and modules/cdp registers its own test against GTest::gtest.
+add_subdirectory(modules/cdp)
