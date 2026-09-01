@@ -6,11 +6,20 @@
  *
  * The build-config edits that move an app between Hermes and QuickJS, written
  * once. `install` applies them, `revert` undoes them, `doctor` reports them,
- * and the Expo plugin runs the same `apply` inside Expo's own mods.
+ * and the Expo plugin runs the same functions inside Expo's own mods.
  *
- * `apply` returns null when it cannot find what it expects. That is not a
- * failure to report as an error -- the file has been customised, and the
- * caller prints `manual` instead.
+ * Each edit is:
+ *
+ *   label         what to call the file in output
+ *   findFile      absolute path in a project, or null if the project has none
+ *   isApplied     is this file already configured for QuickJS?
+ *   addQuickJS    returns the edited source, or null (see below)
+ *   removeQuickJS the inverse
+ *   manualSteps   what to tell someone when the functions return null
+ *
+ * Returning null means "this file does not look the way I expect". That is not
+ * an error to throw -- the file has been customised, and the caller prints
+ * manualSteps instead of guessing.
  */
 
 'use strict';
@@ -18,82 +27,111 @@
 const fs = require('fs');
 const path = require('path');
 
-const PKG = '@react-native-quickjs/quickjs';
-const KOTLIN_IMPORT = `import com.reactnativequickjs.quickjs.QuickJSInstance`;
+const PACKAGE = '@react-native-quickjs/quickjs';
+const KOTLIN_IMPORT = 'import com.reactnativequickjs.quickjs.QuickJSInstance';
 const SWIFT_IMPORT = 'import ReactNativeQuickJS';
-const PODS_REQUIRE = `require_relative '../node_modules/${PKG}/scripts/react_native_quickjs_pods.rb'`;
+const PODFILE_REQUIRE = `require_relative '../node_modules/${PACKAGE}/scripts/react_native_quickjs_pods.rb'`;
 
-/** First file matching `name` under `dir`, breadth-first. */
-function findUnder(dir, name, depth = 7) {
-  if (depth < 0 || !fs.existsSync(dir)) return null;
-  let dirs = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'build' || entry.name === 'node_modules') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) dirs.push(full);
-    else if (entry.name === name) return full;
+const SKIP_DIRECTORIES = new Set(['build', 'node_modules', 'Pods']);
+
+/** The first file called `fileName` anywhere under `directory`. */
+function findFileNamed(directory, fileName, depth = 7) {
+  if (depth < 0 || !fs.existsSync(directory)) return null;
+
+  const subdirectories = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (SKIP_DIRECTORIES.has(entry.name)) continue;
+    const fullPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) subdirectories.push(fullPath);
+    else if (entry.name === fileName) return fullPath;
   }
-  for (const d of dirs) {
-    const hit = findUnder(d, name, depth - 1);
-    if (hit) return hit;
+
+  for (const subdirectory of subdirectories) {
+    const found = findFileNamed(subdirectory, fileName, depth - 1);
+    if (found) return found;
   }
   return null;
 }
 
-/** Index just past the `)` closing the call whose `(` is at `open`. */
-function endOfCall(source, open) {
+/** Index of the `)` that closes the call whose `(` is at `openParen`. */
+function closingParenIndex(source, openParen) {
   let depth = 0;
-  for (let i = open; i < source.length; i++) {
+  for (let i = openParen; i < source.length; i++) {
     if (source[i] === '(') depth++;
     else if (source[i] === ')' && --depth === 0) return i;
   }
   return -1;
 }
 
-/** Insert `line` after the last `import` in a Kotlin or Swift file. */
-function afterImports(source, line) {
-  if (source.includes(line)) return source;
+/** The source with `importLine` added after the last import, or null. */
+function withImportAdded(source, importLine) {
+  if (source.includes(importLine)) return source;
+
   const imports = [...source.matchAll(/^import .*$/gm)];
   if (imports.length === 0) return null;
-  const last = imports[imports.length - 1];
-  const at = last.index + last[0].length;
-  return source.slice(0, at) + '\n' + line + source.slice(at);
+
+  const lastImport = imports[imports.length - 1];
+  const insertAt = lastImport.index + lastImport[0].length;
+  return source.slice(0, insertAt) + '\n' + importLine + source.slice(insertAt);
+}
+
+/**
+ * The source without `line`, and without the blank line that followed it.
+ * A plain string match, so there is no regular expression to escape.
+ */
+function withLineRemoved(source, line) {
+  return source.includes(line + '\n\n')
+    ? source.replace(line + '\n\n', '')
+    : source.replace(line + '\n', '');
+}
+
+/** The indentation of the first line at or after `index`. */
+function indentAt(source, index, fallback) {
+  const match = /^([ \t]+)\S/.exec(source.slice(index));
+  return match ? match[1] : fallback;
 }
 
 const edits = [
   {
     label: 'android/gradle.properties',
-    locate: (root) => path.join(root, 'android', 'gradle.properties'),
-    done: (s) => /^[ \t]*hermesEnabled[ \t]*=[ \t]*false[ \t]*$/m.test(s),
-    apply: (s) =>
-      /^[ \t]*hermesEnabled[ \t]*=/m.test(s)
-        ? s.replace(/^([ \t]*hermesEnabled[ \t]*=[ \t]*).*$/m, '$1false')
-        : `${s.replace(/\s*$/, '')}\n\nhermesEnabled=false\n`,
-    revert: (s) => s.replace(/^([ \t]*hermesEnabled[ \t]*=[ \t]*).*$/m, '$1true'),
-    manual: ['Set hermesEnabled=false in android/gradle.properties'],
+    findFile: (project) => path.join(project, 'android', 'gradle.properties'),
+    isApplied: (source) => /^[ \t]*hermesEnabled[ \t]*=[ \t]*false[ \t]*$/m.test(source),
+
+    addQuickJS: (source) =>
+      /^[ \t]*hermesEnabled[ \t]*=/m.test(source)
+        ? source.replace(/^([ \t]*hermesEnabled[ \t]*=[ \t]*).*$/m, '$1false')
+        : `${source.replace(/\s*$/, '')}\n\nhermesEnabled=false\n`,
+
+    removeQuickJS: (source) =>
+      source.replace(/^([ \t]*hermesEnabled[ \t]*=[ \t]*).*$/m, '$1true'),
+
+    manualSteps: ['Set hermesEnabled=false in android/gradle.properties'],
   },
 
   {
-    // The template selects Hermes or JavaScriptCore here. An app on QuickJS
-    // needs neither, and the JavaScriptCore branch is the one hermesEnabled=false
-    // would otherwise take.
+    // The template picks Hermes or JavaScriptCore here, and hermesEnabled=false
+    // is what sends it down the JavaScriptCore branch. An app on QuickJS wants
+    // neither, so the whole block goes.
     label: 'android/app/build.gradle',
-    locate: (root) => path.join(root, 'android', 'app', 'build.gradle'),
-    done: (s) => !/hermes-android|jscFlavor/.test(s),
-    apply(s) {
-      const out = s
+    findFile: (project) => path.join(project, 'android', 'app', 'build.gradle'),
+    isApplied: (source) => !/hermes-android|jscFlavor/.test(source),
+
+    addQuickJS(source) {
+      const withoutEngines = source
         .replace(
           /[ \t]*if \([ \t]*hermesEnabled\.toBoolean\(\)[ \t]*\) \{[\s\S]*?\n[ \t]*\}[ \t]*\n/,
           ''
         )
         .replace(/[ \t]*def jscFlavor[ \t]*=.*\n/, '');
-      return out === s ? null : out;
+      return withoutEngines === source ? null : withoutEngines;
     },
-    revert(s) {
-      const anchor = /([ \t]*)implementation\("com\.facebook\.react:react-android"\)\n/;
-      if (!anchor.test(s)) return null;
-      return s.replace(
-        anchor,
+
+    removeQuickJS(source) {
+      const reactAndroid = /([ \t]*)implementation\("com\.facebook\.react:react-android"\)\n/;
+      if (!reactAndroid.test(source)) return null;
+
+      return source.replace(
+        reactAndroid,
         (line, indent) =>
           `${line}\n${indent}if (hermesEnabled.toBoolean()) {\n` +
           `${indent}    implementation("com.facebook.react:hermes-android")\n` +
@@ -102,7 +140,8 @@ const edits = [
           `${indent}}\n`
       );
     },
-    manual: [
+
+    manualSteps: [
       'In android/app/build.gradle, delete the dependencies block that picks',
       'between com.facebook.react:hermes-android and jscFlavor.',
     ],
@@ -110,29 +149,38 @@ const edits = [
 
   {
     label: 'MainApplication.kt',
-    locate: (root) => findUnder(path.join(root, 'android', 'app', 'src'), 'MainApplication.kt'),
-    done: (s) => s.includes('QuickJSInstance('),
-    apply(s) {
-      const withImport = afterImports(s, KOTLIN_IMPORT);
+    findFile: (project) =>
+      findFileNamed(path.join(project, 'android', 'app', 'src'), 'MainApplication.kt'),
+    isApplied: (source) => source.includes('QuickJSInstance('),
+
+    addQuickJS(source) {
+      const withImport = withImportAdded(source, KOTLIN_IMPORT);
       if (!withImport) return null;
-      const open = /getDefaultReactHost\(\n/.exec(withImport);
-      if (!open) return null;
-      // Added as the first argument, not the last: Kotlin named arguments may
-      // be given in any order, and the first one's indent is the only one that
-      // can be read without matching parens through a nested lambda.
-      const at = open.index + open[0].length;
-      const indent = (/^([ \t]+)\S/.exec(withImport.slice(at)) || [, '      '])[1];
+
+      const call = /getDefaultReactHost\(\n/.exec(withImport);
+      if (!call) return null;
+
+      // Added as the first argument rather than the last. Kotlin named
+      // arguments may be given in any order, and the first one's indentation
+      // is the only one readable without matching parens through the nested
+      // PackageList lambda.
+      const firstArgument = call.index + call[0].length;
+      const indent = indentAt(withImport, firstArgument, '      ');
+
       return (
-        withImport.slice(0, at) +
+        withImport.slice(0, firstArgument) +
         `${indent}jsRuntimeFactory = QuickJSInstance(),\n` +
-        withImport.slice(at)
+        withImport.slice(firstArgument)
       );
     },
-    revert: (s) =>
-      s
-        .replace(new RegExp(`^${KOTLIN_IMPORT}\\n`, 'm'), '')
-        .replace(/^[ \t]*jsRuntimeFactory = QuickJSInstance\(\),?[ \t]*\n/m, ''),
-    manual: [
+
+    removeQuickJS: (source) =>
+      withLineRemoved(source, KOTLIN_IMPORT).replace(
+        /^[ \t]*jsRuntimeFactory = QuickJSInstance\(\),?[ \t]*\n/m,
+        ''
+      ),
+
+    manualSteps: [
       'In MainApplication.kt add:',
       `  ${KOTLIN_IMPORT}`,
       'and pass jsRuntimeFactory = QuickJSInstance() to getDefaultReactHost().',
@@ -141,38 +189,50 @@ const edits = [
 
   {
     label: 'ios/Podfile',
-    locate: (root) => path.join(root, 'ios', 'Podfile'),
-    done: (s) => s.includes('use_quickjs!'),
-    apply(s) {
-      if (!/^[ \t]*use_react_native!\(/m.test(s)) return null;
-      let out = s.includes(PODS_REQUIRE)
-        ? s
-        : s.replace(/^(platform :ios)/m, `${PODS_REQUIRE}\n\n$1`);
-      out = out.replace(
-        /^([ \t]*)(use_react_native!\()/m,
-        `$1use_quickjs!\n\n$1$2`
+    findFile: (project) => path.join(project, 'ios', 'Podfile'),
+    isApplied: (source) => source.includes('use_quickjs!'),
+
+    addQuickJS(source) {
+      // Every anchor is checked before anything is written, so a Podfile this
+      // does not recognise is left alone rather than half configured.
+      const hasPlatform = /^platform :ios/m.test(source);
+      const useReactNative = /^([ \t]*)use_react_native!\(/m.exec(source);
+      const postInstall = source.indexOf('react_native_post_install(');
+      if (!hasPlatform || !useReactNative || postInstall === -1) return null;
+
+      const withRequire = source.includes(PODFILE_REQUIRE)
+        ? source
+        : source.replace(/^platform :ios/m, `${PODFILE_REQUIRE}\n\nplatform :ios`);
+
+      const withUseQuickJS = withRequire.replace(
+        /^([ \t]*)use_react_native!\(/m,
+        '$1use_quickjs!\n\n$1use_react_native!('
       );
-      // After React Native's own hook, which writes the value this overwrites.
-      const rn = out.indexOf('react_native_post_install(');
-      if (rn === -1) return null;
-      const close = endOfCall(out, out.indexOf('(', rn));
-      if (close === -1) return null;
-      const eol = out.indexOf('\n', close);
-      const indent = (out.slice(0, rn).match(/\n([ \t]*)$/) || [, '    '])[1];
+
+      // The hook must follow React Native's own, which writes the USE_HERMES
+      // build setting this overwrites.
+      const call = withUseQuickJS.indexOf('react_native_post_install(');
+      const closing = closingParenIndex(withUseQuickJS, withUseQuickJS.indexOf('(', call));
+      if (closing === -1) return null;
+
+      const endOfLine = withUseQuickJS.indexOf('\n', closing);
+      const indent = /\n([ \t]*)$/.exec(withUseQuickJS.slice(0, call));
+
       return (
-        out.slice(0, eol + 1) +
-        `\n${indent}react_native_quickjs_post_install(installer)\n` +
-        out.slice(eol + 1)
+        withUseQuickJS.slice(0, endOfLine + 1) +
+        `\n${indent ? indent[1] : '    '}react_native_quickjs_post_install(installer)\n` +
+        withUseQuickJS.slice(endOfLine + 1)
       );
     },
-    revert: (s) =>
-      s
-        .replace(new RegExp(`^${PODS_REQUIRE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n\\n?`, 'm'), '')
+
+    removeQuickJS: (source) =>
+      withLineRemoved(source, PODFILE_REQUIRE)
         .replace(/^[ \t]*use_quickjs!\n\n?/m, '')
         .replace(/\n?[ \t]*react_native_quickjs_post_install\(installer\)\n/, '\n'),
-    manual: [
+
+    manualSteps: [
       'In ios/Podfile add, before use_react_native!:',
-      `  ${PODS_REQUIRE}`,
+      `  ${PODFILE_REQUIRE}`,
       '  use_quickjs!',
       'and react_native_quickjs_post_install(installer) after react_native_post_install.',
     ],
@@ -180,30 +240,34 @@ const edits = [
 
   {
     label: 'AppDelegate.swift',
-    locate: (root) => findUnder(path.join(root, 'ios'), 'AppDelegate.swift'),
-    done: (s) => s.includes('jsrt_create_quickjs_factory'),
-    apply(s) {
-      const withImport = afterImports(s, SWIFT_IMPORT);
+    findFile: (project) => findFileNamed(path.join(project, 'ios'), 'AppDelegate.swift'),
+    isApplied: (source) => source.includes('jsrt_create_quickjs_factory'),
+
+    addQuickJS(source) {
+      const withImport = withImportAdded(source, SWIFT_IMPORT);
       if (!withImport) return null;
-      const cls = /class\s+\w+\s*:\s*RCTDefaultReactNativeFactoryDelegate\s*\{/.exec(withImport);
-      if (!cls) return null;
-      const at = cls.index + cls[0].length;
+
+      const delegateClass =
+        /class\s+\w+\s*:\s*RCTDefaultReactNativeFactoryDelegate\s*\{/.exec(withImport);
+      if (!delegateClass) return null;
+
+      const classBody = delegateClass.index + delegateClass[0].length;
       return (
-        withImport.slice(0, at) +
+        withImport.slice(0, classBody) +
         '\n  override func createJSRuntimeFactory() -> JSRuntimeFactoryRef {\n' +
         '    jsrt_create_quickjs_factory()\n' +
         '  }\n' +
-        withImport.slice(at)
+        withImport.slice(classBody)
       );
     },
-    revert: (s) =>
-      s
-        .replace(new RegExp(`^${SWIFT_IMPORT}\\n`, 'm'), '')
-        .replace(
-          /\n[ \t]*override func createJSRuntimeFactory\(\)[^\n]*\{\n[ \t]*jsrt_create_quickjs_factory\(\)\n[ \t]*\}\n/,
-          '\n'
-        ),
-    manual: [
+
+    removeQuickJS: (source) =>
+      withLineRemoved(source, SWIFT_IMPORT).replace(
+        /\n[ \t]*override func createJSRuntimeFactory\(\)[^\n]*\{\n[ \t]*jsrt_create_quickjs_factory\(\)\n[ \t]*\}\n/,
+        '\n'
+      ),
+
+    manualSteps: [
       'In AppDelegate.swift add:',
       `  ${SWIFT_IMPORT}`,
       'and override createJSRuntimeFactory() to return jsrt_create_quickjs_factory().',
@@ -211,4 +275,4 @@ const edits = [
   },
 ];
 
-module.exports = { edits, PKG, KOTLIN_IMPORT, SWIFT_IMPORT, PODS_REQUIRE, findUnder };
+module.exports = { edits };

@@ -24,25 +24,26 @@ const {
 
 const { edits } = require('../setup/edits');
 
-const byLabel = (label) => edits.find((e) => e.label === label);
+const editFor = (label) => edits.find((edit) => edit.label === label);
 
-function warn(label) {
+function warnCouldNotEdit(label) {
   console.warn(
     `[@react-native-quickjs/quickjs] could not edit ${label}. ` +
       'Run `npx react-native-quickjs doctor` after prebuild.'
   );
 }
 
-/** Apply an edit to a string mod's contents. */
-function edit(label, source) {
-  const e = byLabel(label);
-  if (e.done(source)) return source;
-  const out = e.apply(source);
-  if (out == null) {
-    warn(label);
+/** Run one edit from edits.js over the contents of a string mod. */
+function addQuickJS(label, source) {
+  const edit = editFor(label);
+  if (edit.isApplied(source)) return source;
+
+  const edited = edit.addQuickJS(source);
+  if (edited == null) {
+    warnCouldNotEdit(label);
     return source;
   }
-  return out;
+  return edited;
 }
 
 // withGradleProperties hands over parsed items rather than text, so this one
@@ -60,19 +61,19 @@ function withHermesOff(config) {
 
 const withNoEngineDependency = (config) =>
   withAppBuildGradle(config, (cfg) => {
-    cfg.modResults.contents = edit('android/app/build.gradle', cfg.modResults.contents);
+    cfg.modResults.contents = addQuickJS('android/app/build.gradle', cfg.modResults.contents);
     return cfg;
   });
 
 const withAndroidFactory = (config) =>
   withMainApplication(config, (cfg) => {
-    cfg.modResults.contents = edit('MainApplication.kt', cfg.modResults.contents);
+    cfg.modResults.contents = addQuickJS('MainApplication.kt', cfg.modResults.contents);
     return cfg;
   });
 
 const withIosFactory = (config) =>
   withAppDelegate(config, (cfg) => {
-    cfg.modResults.contents = edit('AppDelegate.swift', cfg.modResults.contents);
+    cfg.modResults.contents = addQuickJS('AppDelegate.swift', cfg.modResults.contents);
     return cfg;
   });
 
@@ -84,10 +85,10 @@ const withPodfile = (config) =>
     (cfg) => {
       const file = path.join(cfg.modRequest.platformProjectRoot, 'Podfile');
       if (!fs.existsSync(file)) {
-        warn('ios/Podfile');
+        warnCouldNotEdit('ios/Podfile');
         return cfg;
       }
-      fs.writeFileSync(file, edit('ios/Podfile', fs.readFileSync(file, 'utf8')));
+      fs.writeFileSync(file, addQuickJS('ios/Podfile', fs.readFileSync(file, 'utf8')));
       return cfg;
     },
   ]);
