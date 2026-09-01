@@ -300,6 +300,13 @@ void freeArrayBufferProxy(JSRuntime * /*rt*/, void *opaque, void * /*ptr*/) {
 
 const char *kEnumeratePropertyNamesSource =
     "(function (o) { const r = []; for (const k in o) r.push(k); return r; })";
+JSValue microtaskJob(JSContext *ctx, int argc, JSValueConst *argv) {
+  if (argc < 1) {
+    return JS_UNDEFINED;
+  }
+  return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, nullptr);
+}
+
 const char *kSymbolToStringSource = "(function (s) { return s.toString(); })";
 const char *kBigIntToStringSource =
     "(function (b, radix) { return b.toString(radix); })";
@@ -340,8 +347,17 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
   symbolToString_ = evalInternal(kSymbolToStringSource);
   bigIntToString_ = evalInternal(kBigIntToStringSource);
 
-  // WeakMap has no C API, so reach for the JS-visible constructor once.
+  // Neither WeakRef nor WeakMap has a C API, so reach for the JS-visible
+  // constructors once.
   JSValue global = JS_GetGlobalObject(context_);
+  weakRefConstructor_ = JS_GetPropertyStr(context_, global, "WeakRef");
+  if (JS_IsObject(weakRefConstructor_)) {
+    JSValue proto =
+        JS_GetPropertyStr(context_, weakRefConstructor_, "prototype");
+    weakRefDeref_ = JS_GetPropertyStr(context_, proto, "deref");
+    JS_FreeValue(context_, proto);
+  }
+
   JSValue weakMapConstructor = JS_GetPropertyStr(context_, global, "WeakMap");
   if (JS_IsObject(weakMapConstructor)) {
     nativeStateMap_ =
@@ -456,6 +472,8 @@ QuickJSRuntime::~QuickJSRuntime() {
   releaseNativePayloads();
   JS_FreeValue(context_, enumeratePropertyNames_);
   JS_FreeValue(context_, symbolToString_);
+  JS_FreeValue(context_, weakRefConstructor_);
+  JS_FreeValue(context_, weakRefDeref_);
   JS_FreeValue(context_, bigIntToString_);
   JS_FreeValue(context_, nativeStateMap_);
   JS_FreeValue(context_, weakMapGet_);
@@ -933,11 +951,30 @@ jsi::Value QuickJSRuntime::evaluatePreparedJavaScript(
 }
 
 void QuickJSRuntime::queueMicrotask(const jsi::Function &callback) {
-  notImplemented("queueMicrotask");
+  JSValue function = toJSValue(callback);
+  checkException(JS_EnqueueJob(context_, microtaskJob, 1, &function));
 }
 
 bool QuickJSRuntime::drainMicrotasks(int maxMicrotasksHint) {
-  notImplemented("drainMicrotasks");
+  adoptCurrentThread();
+  drainPendingReleases();
+
+  int executed = 0;
+  while (maxMicrotasksHint < 0 || executed < maxMicrotasksHint) {
+    JSContext *jobContext = nullptr;
+    int result = JS_ExecutePendingJob(runtime_, &jobContext);
+    if (result == 0) {
+      return true;
+    }
+    if (result < 0) {
+      // JSI discards the exceptional job and keeps going; the queue is only
+      // reported as not drained if work remains.
+      JSContext *ctx = jobContext != nullptr ? jobContext : context_;
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    ++executed;
+  }
+  return !JS_IsJobPending(runtime_);
 }
 
 jsi::Object QuickJSRuntime::global() {
@@ -1318,12 +1355,23 @@ jsi::Array QuickJSRuntime::getPropertyNames(const jsi::Object &object) {
   return make<jsi::Object>(allocPointerValue(names)).getArray(*this);
 }
 
-jsi::WeakObject QuickJSRuntime::createWeakObject(const jsi::Object &) {
-  notImplemented("createWeakObject");
+jsi::WeakObject QuickJSRuntime::createWeakObject(const jsi::Object &object) {
+  if (!JS_IsObject(weakRefConstructor_)) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: WeakRef is unavailable in this context");
+  }
+  JSValue argument = toJSValue(object);
+  JSValue weakRef =
+      JS_CallConstructor(context_, weakRefConstructor_, 1, &argument);
+  checkException(weakRef);
+  return make<jsi::WeakObject>(allocPointerValue(weakRef));
 }
 
-jsi::Value QuickJSRuntime::lockWeakObject(const jsi::WeakObject &) {
-  notImplemented("lockWeakObject");
+jsi::Value QuickJSRuntime::lockWeakObject(const jsi::WeakObject &weakObject) {
+  JSValue result =
+      JS_Call(context_, weakRefDeref_, toJSValue(weakObject), 0, nullptr);
+  checkException(result);
+  return createValue(result);
 }
 
 jsi::Array QuickJSRuntime::createArray(size_t length) {

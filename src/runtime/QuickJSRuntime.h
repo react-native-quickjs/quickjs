@@ -459,6 +459,8 @@ class QuickJSRuntime : public jsi::Runtime {
   // Engine facilities with no C API, evaluated once at startup.
   JSValue enumeratePropertyNames_{JS_UNDEFINED};
   JSValue symbolToString_{JS_UNDEFINED};
+  JSValue weakRefConstructor_{JS_UNDEFINED};
+  JSValue weakRefDeref_{JS_UNDEFINED};
   JSValue bigIntToString_{JS_UNDEFINED};
 
   // NativeState lives in a runtime-private WeakMap rather than a property: a
