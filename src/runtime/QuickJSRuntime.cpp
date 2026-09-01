@@ -9,9 +9,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "QuickJSBytecode.h"
 
 namespace qjs {
 
@@ -310,11 +313,6 @@ JSValue microtaskJob(JSContext *ctx, int argc, JSValueConst *argv) {
 const char *kSymbolToStringSource = "(function (s) { return s.toString(); })";
 const char *kBigIntToStringSource =
     "(function (b, radix) { return b.toString(radix); })";
-
-[[noreturn]] void notImplemented(const char *what) {
-  throw jsi::JSINativeException(
-      std::string("QuickJSRuntime::") + what + " is not implemented yet");
-}
 
 }  // namespace
 
@@ -928,21 +926,221 @@ bool QuickJSRuntime::isInspectable() {
   return config_.enableDebugger;
 }
 
+namespace {
+
+void throwIfHermesBytecode(
+    const uint8_t *data, size_t size, const std::string &sourceURL) {
+  if (!isHermesBytecode(data, size)) {
+    return;
+  }
+  throw jsi::JSINativeException(
+      "QuickJSRuntime: " +
+      (sourceURL.empty() ? std::string("this bundle") : sourceURL) +
+      " is Hermes bytecode, which this engine cannot execute. In a React "
+      "Native app that usually means hermesEnabled is still true in "
+      "android/gradle.properties, or :hermes_enabled in the Podfile. Turn it "
+      "off so Metro ships plain JavaScript, or precompile with qjsc-ng.");
+}
+
+/**
+ * The name a script should be known by: its `//# sourceURL=` comment if it has
+ * one, otherwise the URL the embedder passed.
+ *
+ * Every other engine renames a script by that comment -- it is what
+ * `error.stack` shows and what `Debugger.setBreakpointByUrl` matches against.
+ * quickjs ignores it and records whatever filename JS_Eval was handed, so a
+ * script carrying the comment would be known by two names and a breakpoint set
+ * on it would never fire.
+ *
+ * Only the last 8 KiB are scanned, which makes this O(1) in bundle size rather
+ * than a full pass over a multi-megabyte bundle on the startup path. Tools
+ * append the comment at the end; one placed earlier is not honoured.
+ */
+constexpr size_t kSourceURLScanBytes = 8192;
+
+std::string effectiveSourceURL(
+    const uint8_t *data, size_t size, const std::string &sourceURL) {
+  const size_t start =
+      size > kSourceURLScanBytes ? size - kSourceURLScanBytes : 0;
+  const std::string_view tail(
+      reinterpret_cast<const char *>(data) + start, size - start);
+
+  size_t best = std::string_view::npos;
+  for (std::string_view form : {"//# sourceURL=", "//@ sourceURL="}) {
+    const size_t pos = tail.rfind(form);
+    if (pos != std::string_view::npos &&
+        (best == std::string_view::npos || pos > best)) {
+      best = pos + form.size();
+    }
+  }
+  if (best == std::string_view::npos) {
+    return sourceURL;
+  }
+
+  const size_t end = tail.find_first_of("\r\n", best);
+  const std::string_view value = tail.substr(
+      best,
+      end == std::string_view::npos ? std::string_view::npos : end - best);
+  const size_t first = value.find_first_not_of(" \t");
+  if (first == std::string_view::npos) {
+    return sourceURL;
+  }
+  const size_t last = value.find_last_not_of(" \t");
+  return std::string(value.substr(first, last - first + 1));
+}
+
+/// Raises the collection threshold for the first top-level script and hands
+/// pacing back at the rung the engine would otherwise be on. Bounded rather
+/// than a disable, so a larger bundle degrades to normal pacing by itself. See
+/// QuickJSRuntimeConfig::startupGCBracketBytes.
+class StartupGCBracket final {
+ public:
+  StartupGCBracket(JSRuntime *rt, size_t bytes, bool &used) {
+    if (rt == nullptr || bytes == 0 || used) {
+      return;
+    }
+    used = true;
+    rt_ = rt;
+    JS_SetGCThreshold(rt_, JS_GetMallocSize(rt_) + bytes);
+  }
+
+  ~StartupGCBracket() {
+    if (rt_ == nullptr) {
+      return;
+    }
+    const size_t live = JS_GetMallocSize(rt_);
+    JS_SetGCThreshold(rt_, live + (live >> 1));
+  }
+
+  StartupGCBracket(const StartupGCBracket &) = delete;
+  StartupGCBracket &operator=(const StartupGCBracket &) = delete;
+
+ private:
+  JSRuntime *rt_{nullptr};
+};
+
+/// Compiled form of a script: a JS_WriteObject payload, whether it arrived as
+/// source or as a container.
+class QuickJSPreparedJavaScript final : public jsi::PreparedJavaScript {
+ public:
+  explicit QuickJSPreparedJavaScript(std::vector<uint8_t> bytecode)
+      : bytecode_(std::move(bytecode)) {}
+
+  const std::vector<uint8_t> &bytecode() const noexcept {
+    return bytecode_;
+  }
+
+ private:
+  std::vector<uint8_t> bytecode_;
+};
+
+}  // namespace
+
+jsi::Value QuickJSRuntime::evaluateSource(
+    const uint8_t *source, size_t size, const std::string &sourceURL) {
+  // JS_Eval wants a NUL-terminated buffer, which jsi::Buffer does not promise.
+  const std::string owned(reinterpret_cast<const char *>(source), size);
+  return createValue(JS_Eval(
+      context_, owned.c_str(), owned.size(), sourceURL.c_str(),
+      JS_EVAL_TYPE_GLOBAL));
+}
+
+jsi::Value QuickJSRuntime::evaluateBytecode(
+    const uint8_t *payload, size_t size) {
+  JSValue function =
+      JS_ReadObject(context_, payload, size, JS_READ_OBJ_BYTECODE);
+  if (JS_IsException(function)) {
+    // Almost always an engine mismatch. quickjs bytecode loads only in the
+    // build that wrote it, and "bytecode function expected" does not say so.
+    JS_FreeValue(context_, JS_GetException(context_));
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: could not load bytecode. It was most likely compiled "
+        "by a different build of the engine -- recompile it with the qjsc-ng "
+        "from this checkout.");
+  }
+  return createValue(JS_EvalFunction(context_, function));
+}
+
 jsi::Value QuickJSRuntime::evaluateJavaScript(
     const std::shared_ptr<const jsi::Buffer> &buffer,
     const std::string &sourceURL) {
-  notImplemented("evaluateJavaScript");
+  adoptCurrentThread();
+  drainPendingReleases();
+
+  const uint8_t *data = buffer->data();
+  const size_t size = buffer->size();
+
+  StartupGCBracket bracket(
+      runtime_, config_.startupGCBracketBytes, startupGCBracketUsed_);
+
+  jsi::Value result = [&] {
+    if (isBytecodeContainer(data, size)) {
+      return evaluateBytecode(
+          data + kBytecodeHeaderSize, size - kBytecodeHeaderSize);
+    }
+    throwIfHermesBytecode(data, size, sourceURL);
+    return evaluateSource(
+        data, size, effectiveSourceURL(data, size, sourceURL));
+  }();
+
+  noteCollection();
+  return result;
 }
 
 std::shared_ptr<const jsi::PreparedJavaScript>
 QuickJSRuntime::prepareJavaScript(
     const std::shared_ptr<const jsi::Buffer> &buffer, std::string sourceURL) {
-  notImplemented("prepareJavaScript");
+  const uint8_t *data = buffer->data();
+  const size_t size = buffer->size();
+
+  if (isBytecodeContainer(data, size)) {
+    return std::make_shared<const QuickJSPreparedJavaScript>(
+        std::vector<uint8_t>(data + kBytecodeHeaderSize, data + size));
+  }
+  throwIfHermesBytecode(data, size, sourceURL);
+
+  // The name compiled in here is the only one that survives into the function
+  // bytecode, so it has to be the name the debugger will look the script up by.
+  sourceURL = effectiveSourceURL(data, size, sourceURL);
+
+  const std::string owned(reinterpret_cast<const char *>(data), size);
+  JSValue compiled = checkException(JS_Eval(
+      context_, owned.c_str(), owned.size(), sourceURL.c_str(),
+      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY));
+
+  size_t length = 0;
+  uint8_t *bytes =
+      JS_WriteObject(context_, &length, compiled, JS_WRITE_OBJ_BYTECODE);
+  JS_FreeValue(context_, compiled);
+  if (bytes == nullptr) {
+    throwPendingError();
+  }
+
+  std::vector<uint8_t> bytecode(bytes, bytes + length);
+  js_free(context_, bytes);
+  return std::make_shared<const QuickJSPreparedJavaScript>(std::move(bytecode));
 }
 
 jsi::Value QuickJSRuntime::evaluatePreparedJavaScript(
     const std::shared_ptr<const jsi::PreparedJavaScript> &js) {
-  notImplemented("evaluatePreparedJavaScript");
+  adoptCurrentThread();
+  drainPendingReleases();
+
+  auto prepared =
+      std::dynamic_pointer_cast<const QuickJSPreparedJavaScript>(js);
+  if (!prepared) {
+    throw jsi::JSINativeException(
+        "QuickJSRuntime: PreparedJavaScript was created by a different runtime "
+        "implementation");
+  }
+
+  StartupGCBracket bracket(
+      runtime_, config_.startupGCBracketBytes, startupGCBracketUsed_);
+
+  jsi::Value result = evaluateBytecode(
+      prepared->bytecode().data(), prepared->bytecode().size());
+  noteCollection();
+  return result;
 }
 
 void QuickJSRuntime::queueMicrotask(const jsi::Function &callback) {

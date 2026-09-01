@@ -372,6 +372,10 @@ class QuickJSRuntime : public jsi::Runtime {
   void checkCanHoldNativeState(const jsi::Object &object);
   JSValue evalInternal(const char *source) noexcept;
 
+  jsi::Value evaluateSource(
+      const uint8_t *source, size_t size, const std::string &sourceURL);
+  jsi::Value evaluateBytecode(const uint8_t *payload, size_t size);
+
   // toJSValue borrows, so the array holds no references and needs no cleanup:
   // the jsi::Values the caller owns outlive the call.
   class ArgumentList {
