@@ -57,3 +57,26 @@ target_link_libraries(quickjsinstancejni
   android
   log
 )
+
+# --- Chrome DevTools Protocol ----------------------------------------------
+#
+# On by default: a debugger that cannot be switched on is not a debugger. What
+# stays off by default is the runtime flag, QuickJSRuntimeConfig::enableDebugger
+# -- see modules/cdp/README.md for why that decision has to precede the first
+# parse.
+#
+# The two sources are compiled here rather than through modules/cdp's own
+# CMakeLists because that file also declares a host test target. Two files is
+# less machinery than teaching it to be cross-compiled.
+option(RNQJS_ENABLE_CDP "Compile in the Chrome DevTools Protocol backend" ON)
+
+if(RNQJS_ENABLE_CDP)
+  set(CDP_DIR "${RNQJS_ROOT}/modules/cdp")
+  target_sources(quickjsinstancejni PRIVATE
+    "${CDP_DIR}/quickjs-cdp.c"
+    "${CDP_DIR}/react/QuickJSInspector.cpp"
+  )
+  target_include_directories(quickjsinstancejni PRIVATE
+    "${CDP_DIR}" "${CDP_DIR}/react")
+  target_compile_definitions(quickjsinstancejni PRIVATE RNQJS_ENABLE_CDP=1)
+endif()

@@ -50,8 +50,13 @@ android {
         // The process is killed at System.loadLibrary, so there is no partial
         // functionality to notice: the app does not start. NDK r27 leaves this
         // off by default, r28 turns it on, and no host build can see it.
+        // -PrnqjsEnableCdp=false drops the DevTools backend. It defaults to
+        // on; this exists so a size-sensitive build can leave it out.
+        def enableCdp = !project.hasProperty('rnqjsEnableCdp') ||
+            project.property('rnqjsEnableCdp').toString() != 'false'
         arguments "-DANDROID_STL=c++_shared",
                   "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                  "-DRNQJS_ENABLE_CDP=${enableCdp ? 'ON' : 'OFF'}",
                   "-DREACT_NATIVE_DIR=${reactNativeDir()}"
         abiFilters(*reactNativeArchitectures())
       }
