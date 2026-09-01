@@ -145,3 +145,34 @@ gradle.projectsEvaluated {
     }
   }
 }
+
+// Compile the release bundle to QuickJS bytecode, after React Native has
+// written it. Debug builds load JavaScript from Metro and never produce a
+// bundle, so there is nothing to compile. -PrnqjsBytecode=false turns it off.
+gradle.projectsEvaluated {
+  if (project.findProperty('rnqjsBytecode')?.toString() == 'false') return
+
+  def compiler = file("${projectDir}/../scripts/bytecode/compile.js")
+
+  rootProject.subprojects.each { app ->
+    if (!app.plugins.hasPlugin("com.android.application")) return
+
+    app.tasks.matching { it.name ==~ /createBundle.*JsAndAssets/ }.configureEach { bundleTask ->
+      bundleTask.doLast {
+        // Found by name rather than by reading the task's own properties,
+        // which are React Native Gradle plugin internals. ProcessBuilder
+        // rather than project.exec, which Gradle 9 removed.
+        def assets = app.layout.buildDirectory.dir("generated/assets").get().asFile
+        app.fileTree(assets).matching { include '**/index.android.bundle' }.each { bundle ->
+          def process = new ProcessBuilder(['node', compiler.absolutePath, bundle.absolutePath])
+              .redirectErrorStream(true)
+              .start()
+          process.inputStream.eachLine { line -> logger.lifecycle(line) }
+          if (process.waitFor() != 0) {
+            throw new GradleException("could not compile ${bundle.name} to bytecode")
+          }
+        }
+      }
+    }
+  }
+}

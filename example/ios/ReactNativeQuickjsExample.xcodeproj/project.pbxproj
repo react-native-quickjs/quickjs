@@ -110,6 +110,7 @@
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
+				4BDCD6CA88E01D7F90ABF34F /* [ReactNativeQuickJS] Compile JavaScript to bytecode */,
 				00EEFC60759A1932668264C0 /* [CP] Embed Pods Frameworks */,
 				E235C05ADACE081382539298 /* [CP] Copy Pods Resources */,
 			);
@@ -199,6 +200,24 @@
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-ReactNativeQuickjsExample/Pods-ReactNativeQuickjsExample-frameworks.sh\"\n";
 			showEnvVarsInLog = 0;
+		};
+		4BDCD6CA88E01D7F90ABF34F /* [ReactNativeQuickJS] Compile JavaScript to bytecode */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "[ReactNativeQuickJS] Compile JavaScript to bytecode";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\n[ \"$CONFIGURATION\" = \"Debug\" ] && exit 0\n[ \"$RNQJS_BYTECODE\" = \"0\" ] && exit 0\n\n# The same files React Native's own bundle phase reads NODE_BINARY from.\n[ -f \"$SRCROOT/.xcode.env\" ] && . \"$SRCROOT/.xcode.env\"\n[ -f \"$SRCROOT/.xcode.env.local\" ] && . \"$SRCROOT/.xcode.env.local\"\n: \"${NODE_BINARY:=node}\"\n\n# Resolved through node, so a hoisted node_modules is found.\nCOMPILER=$(\"$NODE_BINARY\" --print   \"require.resolve('@react-native-quickjs/quickjs/scripts/bytecode/compile.js', {paths: ['$SRCROOT']})\")\n\n\"$NODE_BINARY\" \"$COMPILER\"   \"$CONFIGURATION_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/main.jsbundle\"\n";
 		};
 		C38B50BA6285516D6DCD4F65 /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
