@@ -49,7 +49,54 @@ def use_quickjs!
   )
 end
 
+# Compiles the release bundle to QuickJS bytecode, in a build phase placed
+# right after React Native's own bundling phase. Debug builds load JavaScript
+# from Metro and never produce a bundle, so the script exits early there.
+BYTECODE_PHASE = '[ReactNativeQuickJS] Compile JavaScript to bytecode'
+
+BYTECODE_SCRIPT = <<~SH
+  set -e
+  [ "$CONFIGURATION" = "Debug" ] && exit 0
+  [ "$RNQJS_BYTECODE" = "0" ] && exit 0
+
+  # The same files React Native's own bundle phase reads NODE_BINARY from.
+  [ -f "$SRCROOT/.xcode.env" ] && . "$SRCROOT/.xcode.env"
+  [ -f "$SRCROOT/.xcode.env.local" ] && . "$SRCROOT/.xcode.env.local"
+  : "${NODE_BINARY:=node}"
+
+  # Resolved through node, so a hoisted node_modules is found.
+  COMPILER=$("$NODE_BINARY" --print \
+    "require.resolve('@react-native-quickjs/quickjs/scripts/bytecode/compile.js', {paths: ['$SRCROOT']})")
+
+  "$NODE_BINARY" "$COMPILER" \
+    "$CONFIGURATION_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/main.jsbundle"
+SH
+
+def react_native_quickjs_add_bytecode_phase(installer)
+  installer.aggregate_targets.map(&:user_project).uniq(&:path).compact.each do |project|
+    project.native_targets.each do |target|
+      next unless target.product_type == 'com.apple.product-type.application'
+      next if target.build_phases.any? { |phase| phase.display_name == BYTECODE_PHASE }
+
+      phase = target.new_shell_script_build_phase(BYTECODE_PHASE)
+      phase.shell_script = BYTECODE_SCRIPT
+
+      # Ordering matters: the bundle has to exist before it can be compiled.
+      after = target.build_phases.index do |other|
+        other.display_name.to_s.include?('Bundle React Native code and images')
+      end
+      next if after.nil?
+
+      target.build_phases.delete(phase)
+      target.build_phases.insert(after + 1, phase)
+    end
+    project.save
+  end
+end
+
 def react_native_quickjs_post_install(installer)
+  react_native_quickjs_add_bytecode_phase(installer)
+
   # Debug only, matching the gate React Native puts on its own inspector.
   # QuickJSInstance::debuggerEnabledByDefault() already refuses to attach in a
   # release build, so this keeps the compiled surface in agreement.
