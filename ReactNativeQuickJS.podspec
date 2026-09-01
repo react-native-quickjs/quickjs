@@ -34,6 +34,11 @@ Pod::Spec.new do |s|
   s.source_files = [
     "platform/apple/*.{h,mm}",
     "src/**/*.{h,cpp}",
+    # The Chrome DevTools Protocol backend. quickjs-cdp.c needs only
+    # <quickjs.h>; react/ needs jsinspector-modern and folly, which the
+    # React-jsinspector dependency below provides.
+    "modules/cdp/*.{h,c}",
+    "modules/cdp/react/*.{h,cpp}",
     "engine/quickjs-rel/*.h",
     # libregexp.c #includes libregexp-backtrack.c.inc twice, to build the 8-bit
     # and 16-bit matchers, so the .inc has to be copied too.
@@ -62,7 +67,9 @@ Pod::Spec.new do |s|
       "\"$(PODS_TARGET_SRCROOT)/src/bytecode\" " \
       "\"$(PODS_TARGET_SRCROOT)/src/module\" " \
       "\"$(PODS_TARGET_SRCROOT)/src/runtime\" " \
-      "\"$(PODS_TARGET_SRCROOT)/engine/quickjs-rel\"",
+      "\"$(PODS_TARGET_SRCROOT)/engine/quickjs-rel\" " \
+      "\"$(PODS_TARGET_SRCROOT)/modules/cdp\" " \
+      "\"$(PODS_TARGET_SRCROOT)/modules/cdp/react\"",
     "GCC_C_LANGUAGE_STANDARD" => "gnu11",
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     # JS_ENABLE_DEBUGGER must agree with cmake/quickjs.cmake, which defaults it
@@ -70,7 +77,7 @@ Pod::Spec.new do |s|
     # points either way, so a build that compiles them out fails at link rather
     # than at the call site.
     "GCC_PREPROCESSOR_DEFINITIONS" =>
-      "$(inherited) _GNU_SOURCE=1 JS_ENABLE_DEBUGGER=1",
+      "$(inherited) _GNU_SOURCE=1 JS_ENABLE_DEBUGGER=1 RNQJS_ENABLE_CDP=1",
     "USE_HEADERMAP" => "YES",
   }
 
@@ -83,4 +90,5 @@ Pod::Spec.new do |s|
   s.dependency "React-cxxreact"
   s.dependency "React-RuntimeCore"
   add_dependency(s, "React-jsitooling", :framework_name => "JSITooling")
+  add_dependency(s, "React-jsinspector", :framework_name => "jsinspector_modern")
 end
