@@ -1,0 +1,12 @@
+# Matches React Native's and Hermes' C++ style, so code copied between this
+# repo and the prior art it references stays diffable.
+BasedOnStyle: Google
+AccessModifierOffset: -1
+AlignAfterOpenBracket: AlwaysBreak
+AllowShortFunctionsOnASingleLine: Empty
+ColumnLimit: 80
+DerivePointerAlignment: false
+IndentWidth: 2
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+Standard: c++20
