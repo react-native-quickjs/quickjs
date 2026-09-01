@@ -1080,11 +1080,13 @@ jsi::Value QuickJSRuntime::evaluateJavaScript(
   } else {
     throwIfHermesBytecode(data, size, sourceURL);
     const std::string url = effectiveSourceURL(data, size, sourceURL);
-    result = evaluateSource(data, size, url);
+    // Before evaluating, not after: a script is parsed before it runs, and a
+    // stack captured while it is running has to be able to name it.
     if (onScriptEvaluated_) {
       onScriptEvaluated_(
           url, std::string(reinterpret_cast<const char *>(data), size));
     }
+    result = evaluateSource(data, size, url);
   }
 
   rebaselineHeap();
