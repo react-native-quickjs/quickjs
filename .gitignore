@@ -36,3 +36,7 @@ build-*/
 
 # Debug symbol bundles
 *.dSYM/
+
+# React Native's inspector suite, rewritten from node_modules by
+# modules/cdp/test/rn-inspector/generate-suite.mjs. Generated, never edited.
+modules/cdp/test/rn-inspector/generated/
