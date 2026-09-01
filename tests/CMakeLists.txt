@@ -48,6 +48,8 @@ add_dependencies(quickjs_bytecode_tests qjsc-ng)
 # because that is the surface a debugger bridge sits on.
 qjs_add_test_suite(quickjs_debugger_tests debugger_test.cpp)
 
+qjs_add_test_suite(quickjs_module_tests modules_test.cpp)
+
 add_executable(quickjs_jsi_bench bench/jsi_bench.cpp)
 target_link_libraries(quickjs_jsi_bench PRIVATE quickjs_jsi)
 
