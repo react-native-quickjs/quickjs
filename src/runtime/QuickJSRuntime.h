@@ -147,6 +147,16 @@ class QuickJSRuntime : public jsi::Runtime {
   void releaseValue(JSValue value) noexcept;
   void releaseAtom(JSAtom atom) noexcept;
 
+  /// Registration of the native payloads attached to JS objects, so teardown
+  /// can release them without waiting for the collector to reach their owners.
+  void registerHostFunction(void *proxy);
+  void unregisterHostFunction(void *proxy);
+
+  /// Public because the class callbacks are free functions.
+  JSClassID hostFunctionClassID() const noexcept {
+    return hostFunctionClassID_;
+  }
+
   // jsi::Runtime -- public API
   jsi::Value evaluateJavaScript(
       const std::shared_ptr<const jsi::Buffer> &buffer,
@@ -327,6 +337,8 @@ class QuickJSRuntime : public jsi::Runtime {
       const std::exception *e, const char *origin = "HostFunction") noexcept;
 
  private:
+  void registerClasses();
+  void releaseNativePayloads() noexcept;
   void drainPendingReleases() noexcept;
   JSValue evalInternal(const char *source) noexcept;
 
@@ -422,6 +434,12 @@ class QuickJSRuntime : public jsi::Runtime {
   // Described on the way in, because by the time the nesting bound is hit the
   // original exception is gone and the bail-out would name only itself.
   std::string firstErrorDescription_;
+
+  JSClassID hostFunctionClassID_{0};
+
+  // Intrusive list heads of the live native payloads, held as void* to keep the
+  // payload types private to the implementation.
+  void *hostFunctionProxies_{nullptr};
 
   // Engine facilities with no C API, evaluated once at startup.
   JSValue enumeratePropertyNames_{JS_UNDEFINED};

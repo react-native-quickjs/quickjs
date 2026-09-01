@@ -25,6 +25,94 @@ static_assert(
 
 namespace {
 
+struct NativePayloadLink {
+  NativePayloadLink *prev{nullptr};
+  NativePayloadLink *next{nullptr};
+};
+
+/// Opaque payload of a host function. `function` is returned by reference from
+/// getHostFunction, so it must keep a stable address for the lifetime of the JS
+/// function.
+struct HostFunctionProxy {
+  NativePayloadLink link;  // must stay first: the registry casts through it
+  QuickJSRuntime *runtime;
+  jsi::HostFunctionType function;
+};
+
+QuickJSRuntime *runtimeOf(JSContext *ctx) {
+  return static_cast<QuickJSRuntime *>(JS_GetContextOpaque(ctx));
+}
+
+void payloadLink(void *&head, void *proxy) {
+  auto *link = static_cast<NativePayloadLink *>(proxy);
+  link->prev = nullptr;
+  link->next = static_cast<NativePayloadLink *>(head);
+  if (link->next != nullptr) {
+    link->next->prev = link;
+  }
+  head = link;
+}
+
+void payloadUnlink(void *&head, void *proxy) {
+  auto *link = static_cast<NativePayloadLink *>(proxy);
+  if (link->prev != nullptr) {
+    link->prev->next = link->next;
+  } else if (head == link) {
+    head = link->next;
+  } else {
+    return;
+  }
+  if (link->next != nullptr) {
+    link->next->prev = link->prev;
+  }
+  link->prev = link->next = nullptr;
+}
+
+struct HostFunctionHandlers {
+  static JSValue call(
+      JSContext *ctx, JSValueConst funcObj, JSValueConst thisVal, int argc,
+      JSValueConst *argv, int /*flags*/) {
+    auto *runtime = runtimeOf(ctx);
+    auto *proxy = static_cast<HostFunctionProxy *>(
+        JS_GetOpaque(funcObj, runtime->hostFunctionClassID()));
+    if (proxy == nullptr) {
+      return JS_ThrowTypeError(ctx, "not a host function");
+    }
+
+    try {
+      // Borrowed, not dup'd: quickjs keeps argv and thisVal alive for the whole
+      // call, so a reference taken here and dropped on return would cancel out.
+      constexpr int kInlineArgs = 8;
+      jsi::Value inlineArgs[kInlineArgs];
+      std::vector<jsi::Value> heapArgs;
+      jsi::Value *args = inlineArgs;
+      if (argc > kInlineArgs) {
+        heapArgs.resize(static_cast<size_t>(argc));
+        args = heapArgs.data();
+      }
+      for (int i = 0; i < argc; ++i) {
+        args[i] = runtime->borrowValue(argv[i]);
+      }
+      jsi::Value thisValue = runtime->borrowValue(thisVal);
+      jsi::Value result =
+          proxy->function(*runtime, thisValue, args, static_cast<size_t>(argc));
+      return runtime->takeJSValue(std::move(result));
+    } catch (const std::exception &e) {
+      return runtime->throwAsJSException(&e);
+    } catch (...) {
+      return runtime->throwAsJSException(nullptr);
+    }
+  }
+
+  static void finalizer(JSRuntime *rt, JSValueConst value) {
+    auto *runtime = static_cast<QuickJSRuntime *>(JS_GetRuntimeOpaque(rt));
+    auto *proxy = static_cast<HostFunctionProxy *>(
+        JS_GetOpaque(value, runtime->hostFunctionClassID()));
+    runtime->unregisterHostFunction(proxy);
+    delete proxy;
+  }
+};
+
 /// Keeps a jsi::MutableBuffer alive for as long as the ArrayBuffer pointing
 /// into it.
 struct ArrayBufferProxy {
@@ -69,7 +157,48 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
   JS_SetContextOpaque(context_, this);
   JS_SetRuntimeOpaque(runtime_, this);
 
+  registerClasses();
   enumeratePropertyNames_ = evalInternal(kEnumeratePropertyNamesSource);
+}
+
+void QuickJSRuntime::registerClasses() {
+  JS_NewClassID(runtime_, &hostFunctionClassID_);
+  JSClassDef hostFunctionDef = {};
+  hostFunctionDef.class_name = "HostFunction";
+  hostFunctionDef.finalizer = HostFunctionHandlers::finalizer;
+  hostFunctionDef.call = HostFunctionHandlers::call;
+  JS_NewClass(runtime_, hostFunctionClassID_, &hostFunctionDef);
+
+  // Host functions must be indistinguishable from JS functions: without
+  // Function.prototype, `instanceof Function` is false and bind/call/apply are
+  // missing.
+  JSValue global = JS_GetGlobalObject(context_);
+  JSValue functionConstructor = JS_GetPropertyStr(context_, global, "Function");
+  JS_SetClassProto(
+      context_, hostFunctionClassID_,
+      JS_GetPropertyStr(context_, functionConstructor, "prototype"));
+  JS_FreeValue(context_, functionConstructor);
+  JS_FreeValue(context_, global);
+}
+
+void QuickJSRuntime::registerHostFunction(void *proxy) {
+  payloadLink(hostFunctionProxies_, proxy);
+}
+
+void QuickJSRuntime::unregisterHostFunction(void *proxy) {
+  payloadUnlink(hostFunctionProxies_, proxy);
+}
+
+/// Leaves the lists intact: the proxies stay allocated and their finalizers
+/// still run during JS_FreeRuntime, which is what unlinks them. Releasing a
+/// payload can free jsi values and so re-enter, hence remembering `next` first.
+void QuickJSRuntime::releaseNativePayloads() noexcept {
+  for (auto *l = static_cast<NativePayloadLink *>(hostFunctionProxies_);
+       l != nullptr;) {
+    auto *next = l->next;
+    reinterpret_cast<HostFunctionProxy *>(l)->function = nullptr;
+    l = next;
+  }
 }
 
 /// Undefined rather than throwing: a runtime that cannot build a helper is
@@ -87,6 +216,7 @@ JSValue QuickJSRuntime::evalInternal(const char *source) noexcept {
 
 QuickJSRuntime::~QuickJSRuntime() {
   drainPendingReleases();
+  releaseNativePayloads();
   JS_FreeValue(context_, enumeratePropertyNames_);
 
   if (context_ != nullptr) {
@@ -721,8 +851,14 @@ std::shared_ptr<jsi::HostObject> QuickJSRuntime::getHostObject(
   notImplemented("getHostObject");
 }
 
-jsi::HostFunctionType &QuickJSRuntime::getHostFunction(const jsi::Function &) {
-  notImplemented("getHostFunction");
+jsi::HostFunctionType &QuickJSRuntime::getHostFunction(
+    const jsi::Function &function) {
+  auto *proxy = static_cast<HostFunctionProxy *>(
+      JS_GetOpaque(toJSValue(function), hostFunctionClassID_));
+  if (proxy == nullptr) {
+    throw jsi::JSINativeException("QuickJSRuntime: not a host function");
+  }
+  return proxy->function;
 }
 
 jsi::Object QuickJSRuntime::createObjectWithPrototype(
@@ -829,8 +965,8 @@ bool QuickJSRuntime::isHostObject(const jsi::Object &) const {
   notImplemented("isHostObject");
 }
 
-bool QuickJSRuntime::isHostFunction(const jsi::Function &) const {
-  notImplemented("isHostFunction");
+bool QuickJSRuntime::isHostFunction(const jsi::Function &function) const {
+  return JS_GetOpaque(toJSValue(function), hostFunctionClassID_) != nullptr;
 }
 
 jsi::Array QuickJSRuntime::getPropertyNames(const jsi::Object &object) {
@@ -916,7 +1052,24 @@ void QuickJSRuntime::setValueAtIndexImpl(
 jsi::Function QuickJSRuntime::createFunctionFromHostFunction(
     const jsi::PropNameID &name, unsigned int paramCount,
     jsi::HostFunctionType func) {
-  notImplemented("createFunctionFromHostFunction");
+  JSValue function = JS_NewObjectClass(context_, hostFunctionClassID_);
+  checkException(function);
+  auto *proxy = new HostFunctionProxy{{}, this, std::move(func)};
+  registerHostFunction(proxy);
+  JS_SetOpaque(function, proxy);
+  JS_SetConstructorBit(context_, function, true);
+
+  // `name` and `length` are ordinary own properties on JS functions, and code
+  // in the wild reads them.
+  JS_DefinePropertyValueStr(
+      context_, function, "length",
+      JS_NewInt32(context_, static_cast<int32_t>(paramCount)),
+      JS_PROP_CONFIGURABLE);
+  JS_DefinePropertyValueStr(
+      context_, function, "name", JS_AtomToString(context_, toJSAtom(name)),
+      JS_PROP_CONFIGURABLE);
+
+  return make<jsi::Object>(allocPointerValue(function)).getFunction(*this);
 }
 
 jsi::Value QuickJSRuntime::call(
