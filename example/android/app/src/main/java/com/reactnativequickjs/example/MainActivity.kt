@@ -1,4 +1,4 @@
-package ammarahmed.reactnativequickjs.example
+package com.reactnativequickjs.example
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate

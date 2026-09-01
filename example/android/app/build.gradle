@@ -70,9 +70,9 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
-    namespace "ammarahmed.reactnativequickjs.example"
+    namespace "com.reactnativequickjs.example"
     defaultConfig {
-        applicationId "ammarahmed.reactnativequickjs.example"
+        applicationId "com.reactnativequickjs.example"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1

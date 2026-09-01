@@ -1,4 +1,4 @@
-package ammarahmed.reactnativequickjs.example
+package com.reactnativequickjs.example
 
 import android.app.Application
 import com.facebook.react.PackageList
