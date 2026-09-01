@@ -27,12 +27,6 @@ generated marshalling code either. A message is parsed with `JS_ParseJSON` into
 a `JSValue`, a reply is a `JSValue` built by setting properties, and
 `JS_JSONStringify` turns it back into text.
 
-The usual way to implement this protocol is to generate a class per message
-from the protocol's published schema — for the 32 methods here that would be
-several thousand lines that have to be regenerated whenever the schema moves.
-Reading `params.expression` out of a `JSValue` costs one line and needs no
-schema at all.
-
 Protocol JSON is parsed on **a second, private QuickJS runtime** that never
 runs a program. It exists so that answering a message cannot allocate in,
 collect from, or throw into the heap the debugger is supposed to be observing.
