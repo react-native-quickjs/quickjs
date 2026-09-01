@@ -13,6 +13,7 @@ what we changed and why without opening a single `.patch` file.
 |---|---|---|---|---|
 | `0001` | Reports how much memory the engine is currently holding | The runtime decides when to collect garbage based on how much memory is live, and the existing way to measure it walks the whole heap | `JS_GetMallocSize` | No |
 | `0002` | Lets the app choose when garbage collection runs | Otherwise a collection lands in the middle of a frame and drops it; the worst frame went from 45ms to 3.3ms | `JS_SetGCDeferred`, `JS_HasPendingGC`, `JS_RunPendingGC` | No |
+| `0003` | Lets a debugger pause code, read variables and evaluate expressions | Without it no debugger can attach to an app running on this engine, and `debugger;` does nothing | `JS_SetDebugTraceHandler`, `JS_GetStackDepth`, `JS_GetLocalVariablesAtLevel`, `JS_FreeLocalVariables`, `JS_SetVariableAtLevel`, `JS_EvalInStackFrame` | **Yes** - adds an opcode |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Writing a patch header
