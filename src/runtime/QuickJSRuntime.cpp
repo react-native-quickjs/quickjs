@@ -332,6 +332,10 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
     JS_SetMaxStackSize(runtime_, config_.stackSize);
   }
 
+  if (config_.deferGC) {
+    JS_SetGCDeferred(runtime_, true, config_.deferredGCLimit);
+  }
+
   context_ = JS_NewContext(runtime_);
   if (context_ == nullptr) {
     JS_FreeRuntime(runtime_);
@@ -341,6 +345,10 @@ QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
 
   JS_SetContextOpaque(context_, this);
   JS_SetRuntimeOpaque(runtime_, this);
+
+  // Baseline for the pressure valve. Left at zero, the first `grown` reading is
+  // the whole live heap and the valve fires whatever the app is doing.
+  mallocAfterLastGC_ = JS_GetMallocSize(runtime_);
 
   registerClasses();
   enumeratePropertyNames_ = evalInternal(kEnumeratePropertyNamesSource);
@@ -956,6 +964,7 @@ void QuickJSRuntime::queueMicrotask(const jsi::Function &callback) {
 }
 
 bool QuickJSRuntime::drainMicrotasks(int maxMicrotasksHint) {
+  const auto taskStart = std::chrono::steady_clock::now();
   adoptCurrentThread();
   drainPendingReleases();
 
@@ -964,6 +973,10 @@ bool QuickJSRuntime::drainMicrotasks(int maxMicrotasksHint) {
     JSContext *jobContext = nullptr;
     int result = JS_ExecutePendingJob(runtime_, &jobContext);
     if (result == 0) {
+      // Queue drained, so the JS stack is empty: a safepoint. Every safepoint
+      // ends a task, whether or not it collected.
+      runPendingGCIfIdle(taskStart);
+      lastTaskEnd_ = std::chrono::steady_clock::now();
       return true;
     }
     if (result < 0) {
@@ -975,6 +988,118 @@ bool QuickJSRuntime::drainMicrotasks(int maxMicrotasksHint) {
     ++executed;
   }
   return !JS_IsJobPending(runtime_);
+}
+
+void QuickJSRuntime::runPendingGC() noexcept {
+  // Unconditional: the embedder is asserting the app is idle. Safe only with an
+  // empty JS stack, never from inside a host function.
+  if (runtime_ == nullptr) {
+    return;
+  }
+  JS_RunPendingGC(runtime_);
+  noteCollection();
+  lastTaskEnd_ = std::chrono::steady_clock::now();
+}
+
+/// The live set just changed, so the growth baseline, the staleness clock and
+/// the ceiling derived from it are all stale.
+void QuickJSRuntime::noteCollection() noexcept {
+  mallocAfterLastGC_ = JS_GetMallocSize(runtime_);
+  pendingSince_ = {};
+  refreshDeferredGCLimit();
+}
+
+size_t QuickJSRuntime::deferredGCSlack() const noexcept {
+  size_t slack = JS_GetMallocSize(runtime_);
+  if (slack < config_.deferredGCMinSlack) {
+    slack = config_.deferredGCMinSlack;
+  }
+  if (slack > config_.deferredGCMaxSlack) {
+    slack = config_.deferredGCMaxSlack;
+  }
+  return slack;
+}
+
+size_t QuickJSRuntime::deferredGCCeiling() const noexcept {
+  if (config_.deferredGCLimit != 0) {
+    return config_.deferredGCLimit;
+  }
+  return JS_GetMallocSize(runtime_) + deferredGCSlack();
+}
+
+void QuickJSRuntime::refreshDeferredGCLimit() noexcept {
+  if (runtime_ == nullptr || !config_.deferGC) {
+    return;
+  }
+  if (config_.deferredGCLimit != 0) {
+    return;  // an explicit ceiling belongs to the embedder
+  }
+  JS_SetGCDeferred(runtime_, true, deferredGCCeiling());
+}
+
+void QuickJSRuntime::runPendingGCIfIdle(
+    std::chrono::steady_clock::time_point taskStart) noexcept {
+  if (runtime_ == nullptr) {
+    return;
+  }
+
+  // Before the pending check on purpose: the case this fixes is where nothing
+  // is pending because the trigger has drifted out of reach of the live heap.
+  if (config_.gcThresholdRetuneRatio > 0.0) {
+    const size_t liveNow = JS_GetMallocSize(runtime_);
+    const size_t threshold = JS_GetGCThreshold(runtime_);
+    const double drift = liveNow > 0 ? static_cast<double>(threshold) /
+                                           static_cast<double>(liveNow)
+                                     : 0.0;
+    if (liveNow > 0 && drift > config_.gcThresholdRetuneRatio) {
+      JS_SetGCThreshold(runtime_, liveNow + (liveNow >> 1));
+    }
+  }
+
+  if (!JS_HasPendingGC(runtime_)) {
+    return;
+  }
+
+  // Measured against the end of the previous task, not the last collection:
+  // timing from the collection makes any long stretch of work look idle.
+  const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       taskStart - lastTaskEnd_)
+                       .count();
+  const bool idle = lastTaskEnd_.time_since_epoch().count() == 0 ||
+                    gap >= static_cast<long long>(config_.gcIdleGapMs);
+
+  if (pendingSince_.time_since_epoch().count() == 0) {
+    pendingSince_ = taskStart;
+  }
+  bool stale = false;
+  if (!idle && config_.gcMaxDeferralMs > 0) {
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            taskStart - pendingSince_)
+                            .count();
+    stale = waited >= static_cast<long long>(config_.gcMaxDeferralMs);
+  }
+
+  // Pressure is growth since the last collection, not size. Comparing live size
+  // against half the ceiling reduces to `live > slack`, which is true on every
+  // safepoint for any real app, turning the valve into "collect constantly".
+  const size_t live = JS_GetMallocSize(runtime_);
+  const size_t grown =
+      live > mallocAfterLastGC_ ? live - mallocAfterLastGC_ : 0;
+  size_t pressureLimit = config_.gcPressureBytes;
+  if (pressureLimit == 0) {
+    // Also capped by the live heap, or the valve is unreachable on an app whose
+    // whole heap is smaller than the slack -- measured as a collection pending
+    // forever on an app with a ticker, which never reaches an idle gap either.
+    const size_t bySlack = deferredGCSlack() / 2;
+    const size_t byHeap = live / 2;
+    pressureLimit = bySlack < byHeap ? bySlack : byHeap;
+  }
+  if (!idle && !stale && grown < pressureLimit) {
+    return;
+  }
+
+  JS_RunPendingGC(runtime_);
+  noteCollection();
 }
 
 jsi::Object QuickJSRuntime::global() {

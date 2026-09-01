@@ -12,6 +12,7 @@
 #include <quickjs.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <new>
@@ -180,6 +181,22 @@ class QuickJSRuntime : public jsi::Runtime {
 
   void queueMicrotask(const jsi::Function &callback) override;
   bool drainMicrotasks(int maxMicrotasksHint = -1) override;
+
+  /// Runs a collection deferred by QuickJSRuntimeConfig::deferGC. Call with no
+  /// JS on the stack; drainMicrotasks already does when the queue empties.
+  void runPendingGC() noexcept;
+
+  /// Safepoint with an idleness test: collects only if nothing drove JS for
+  /// gcIdleGapMs before `taskStart`, if the collection has waited longer than
+  /// gcMaxDeferralMs, or if the heap has grown past the pressure limit.
+  void runPendingGCIfIdle(
+      std::chrono::steady_clock::time_point taskStart) noexcept;
+
+  /// `live + clamp(live, minSlack, maxSlack)`, re-derived because the engine
+  /// computes its own ceiling once, before it has seen the app's heap.
+  size_t deferredGCCeiling() const noexcept;
+  size_t deferredGCSlack() const noexcept;
+  void refreshDeferredGCLimit() noexcept;
 
   jsi::Object global() override;
   std::string description() override;
@@ -351,6 +368,7 @@ class QuickJSRuntime : public jsi::Runtime {
   void registerClasses();
   void releaseNativePayloads() noexcept;
   void drainPendingReleases() noexcept;
+  void noteCollection() noexcept;
   JSValue evalInternal(const char *source) noexcept;
 
   // toJSValue borrows, so the array holds no references and needs no cleanup:
@@ -477,6 +495,12 @@ class QuickJSRuntime : public jsi::Runtime {
   std::vector<void *> atomSlabs_;
 
   std::atomic<bool> hasPendingReleases_{false};
+  // End of the most recent JS task. The gap to the start of the next one is
+  // what says whether anything is still driving JS.
+  std::chrono::steady_clock::time_point lastTaskEnd_{};
+  std::chrono::steady_clock::time_point pendingSince_{};
+  size_t mallocAfterLastGC_{0};
+  bool startupGCBracketUsed_{false};
   std::mutex pendingMutex_;
   std::vector<JSValue> pendingValues_;
   std::vector<JSAtom> pendingAtoms_;
