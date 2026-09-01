@@ -25,3 +25,4 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 enable_testing()
 
 include(cmake/quickjs.cmake)
+include(cmake/jsi.cmake)
