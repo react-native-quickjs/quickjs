@@ -75,11 +75,36 @@ void qjs_cdp_send_message(
 /* Handles every queued message. JS thread only. */
 void qjs_cdp_poll(QJSCDPAgent *agent);
 
+/* Reports a console call to the frontend as Runtime.consoleAPICalled. `type` is
+   the protocol's name for it ("log", "warning", ...). The values are borrowed
+   for the duration of the call. JS thread only. */
+void qjs_cdp_console_message(
+    QJSCDPAgent *agent, const char *type, const JSValue *args, int count);
+
 /* Tells the agent a script was loaded, so it can answer Debugger.scriptParsed
    and resolve breakpoints set against `url`. Call after evaluating each script.
    JS thread only. */
 void qjs_cdp_script_loaded(
     QJSCDPAgent *agent, const char *url, const char *source);
+
+/* Everything a replacement agent needs to carry on where this one left off:
+   whether the debugger was enabled and which breakpoints the frontend has set.
+   React Native destroys and recreates the runtime on a reload, and the frontend
+   is not told -- from its side the breakpoints it set are still set.
+
+   Export returns a string the caller frees with free(); import takes one back. */
+char *qjs_cdp_export_state(QJSCDPAgent *agent);
+void qjs_cdp_import_state(QJSCDPAgent *agent, const char *json);
+
+/* Whether the debugger is switched on for the runtime.
+
+   Debugger.enable turns it on by itself, so a lone embedder needs none of this.
+   Turning it OFF is different: enabling is per session and two frontends can
+   disagree, so Debugger.disable from one of them is not the whole story. An
+   embedder that supports several sessions calls the setter with the union.
+   After an import this is whatever it was before the reload. */
+bool qjs_cdp_debugger_enabled(QJSCDPAgent *agent);
+void qjs_cdp_set_debugger_enabled(QJSCDPAgent *agent, bool enabled);
 
 /* The call stack right now, as a Runtime.StackTrace JSON object. Returns a
    string the caller frees with free(), or NULL when nothing is running.

@@ -204,16 +204,23 @@ static void send_error(QJSCDPAgent *agent, int id, const char *message) {
   send_error_code(agent, id, -32000, message);
 }
 
-/* Takes ownership of params. Goes to every attached frontend, not just the one
-   whose request happens to be in flight. */
-static void send_event(QJSCDPAgent *agent, const char *method, JSValue params) {
+/* Takes ownership of params. `everyone` distinguishes something that happened
+   in the program, which every attached frontend wants, from a reply-shaped
+   event such as the scripts replayed when one frontend enables the debugger --
+   which the others have already been told about. */
+static void send_event_to(
+    QJSCDPAgent *agent, const char *method, JSValue params, bool everyone) {
   void *asked = agent->session;
-  agent->session = NULL;
+  if (everyone) agent->session = NULL;
   JSValue m = json_object(agent);
   json_set_string(agent, m, "method", method);
   json_set(agent, m, "params", params);
   send_message(agent, m);
   agent->session = asked;
+}
+
+static void send_event(QJSCDPAgent *agent, const char *method, JSValue params) {
+  send_event_to(agent, method, params, true);
 }
 
 /* ------------------------------------------------------- remote objects --- */
@@ -420,7 +427,8 @@ static bool url_matches(const char *script_url, const char *wanted) {
   return m <= n && strcmp(script_url + n - m, wanted) == 0;
 }
 
-static void announce_script(QJSCDPAgent *agent, const Script *script) {
+static void announce_script(
+    QJSCDPAgent *agent, const Script *script, bool everyone) {
   char id[16];
   snprintf(id, sizeof(id), "%d", script->id);
 
@@ -437,7 +445,7 @@ static void announce_script(QJSCDPAgent *agent, const Script *script) {
   json_set_int(agent, p, "endColumn", 0);
   json_set_int(agent, p, "executionContextId", agent->exec_ctx_id);
   json_set_string(agent, p, "hash", id);
-  send_event(agent, "Debugger.scriptParsed", p);
+  send_event_to(agent, "Debugger.scriptParsed", p, everyone);
 }
 
 /* --------------------------------------------------------- breakpoints --- */
@@ -878,6 +886,8 @@ done:
 
 /* ------------------------------------------------------------ dispatch --- */
 
+void qjs_cdp_set_debugger_enabled(QJSCDPAgent *agent, bool enabled);
+
 static bool is(const char *method, const char *name) {
   return strcmp(method, name) == 0;
 }
@@ -980,17 +990,15 @@ static void dispatch(
 
     /* --- Debugger --- */
   } else if (is(method, "Debugger.enable")) {
-    agent->debugger_enabled = true;
-    JS_SetDebugTraceArmed(agent->ctx, true);
+    /* Enabling is safe to act on directly -- one more frontend watching cannot
+       hurt another. DISABLING is not, which is why it is the embedder that
+       turns this back off, once it knows no session wants it any more. */
+    qjs_cdp_set_debugger_enabled(agent, true);
     for (int i = 0; i < agent->nscripts; i++)
-      announce_script(agent, &agent->scripts[i]);
+      announce_script(agent, &agent->scripts[i], false);
     send_empty_result(agent, id);
 
   } else if (is(method, "Debugger.disable")) {
-    agent->debugger_enabled = false;
-    /* Disarmed rather than uninstalled: uninstalling the handler would
-       permanently un-instrument everything parsed afterwards. */
-    JS_SetDebugTraceArmed(agent->ctx, false);
     send_empty_result(agent, id);
 
   } else if (is(method, "Debugger.setBreakpointByUrl")) {
@@ -1179,6 +1187,21 @@ void qjs_cdp_poll(QJSCDPAgent *agent) {
   }
 }
 
+void qjs_cdp_console_message(
+    QJSCDPAgent *agent, const char *type, const JSValue *args, int count) {
+  JSValue list = json_array(agent);
+  for (int i = 0; i < count; i++)
+    json_set_index(
+        agent, list, (uint32_t)i, to_remote_object(agent, args[i], NULL));
+
+  JSValue params = json_object(agent);
+  json_set_string(agent, params, "type", type ? type : "log");
+  json_set(agent, params, "args", list);
+  json_set_int(agent, params, "executionContextId", agent->exec_ctx_id);
+  json_set(agent, params, "timestamp", JS_NewFloat64(agent->jctx, 0));
+  send_event(agent, "Runtime.consoleAPICalled", params);
+}
+
 void qjs_cdp_script_loaded(
     QJSCDPAgent *agent, const char *url, const char *source) {
   agent->scripts =
@@ -1189,9 +1212,93 @@ void qjs_cdp_script_loaded(
   script->source = strdup(source ? source : "");
 
   if (agent->debugger_enabled) {
-    announce_script(agent, script);
+    announce_script(agent, script, true);
     resolve_breakpoints(agent, script);
   }
+}
+
+char *qjs_cdp_export_state(QJSCDPAgent *agent) {
+  JSValue list = json_array(agent);
+  for (int i = 0; i < agent->nbps; i++) {
+    Breakpoint *bp = &agent->bps[i];
+    JSValue e = json_object(agent);
+    json_set_int(agent, e, "id", bp->id);
+    json_set_string(agent, e, "url", bp->url);
+    json_set_int(agent, e, "line", bp->line);
+    json_set_int(agent, e, "col", bp->col);
+    if (bp->condition) json_set_string(agent, e, "condition", bp->condition);
+    json_set_index(agent, list, (uint32_t)i, e);
+  }
+
+  JSValue state = json_object(agent);
+  json_set_bool(agent, state, "enabled", agent->debugger_enabled);
+  json_set_int(agent, state, "nextBreakpointId", agent->next_bp_id);
+  json_set(agent, state, "breakpoints", list);
+
+  JSValue text =
+      JS_JSONStringify(agent->jctx, state, JS_UNDEFINED, JS_UNDEFINED);
+  size_t len = 0;
+  const char *json = JS_ToCStringLen(agent->jctx, &len, text);
+  char *out = NULL;
+  if (json) {
+    out = malloc(len + 1);
+    memcpy(out, json, len);
+    out[len] = '\0';
+    JS_FreeCString(agent->jctx, json);
+  }
+  JS_FreeValue(agent->jctx, text);
+  JS_FreeValue(agent->jctx, state);
+  return out;
+}
+
+void qjs_cdp_import_state(QJSCDPAgent *agent, const char *json) {
+  if (!json) return;
+  JSValue state = JS_ParseJSON(agent->jctx, json, strlen(json), "<state>");
+  if (JS_IsException(state)) {
+    JS_FreeValue(agent->jctx, JS_GetException(agent->jctx));
+    JS_FreeValue(agent->jctx, state);
+    return;
+  }
+
+  agent->debugger_enabled = json_get_bool(agent, state, "enabled", false);
+  if (agent->debugger_enabled) JS_SetDebugTraceArmed(agent->ctx, true);
+  agent->next_bp_id = json_get_int(agent, state, "nextBreakpointId", 0);
+
+  JSValue list = json_get(agent, state, "breakpoints");
+  const int count = json_get_int(agent, list, "length", 0);
+  for (int i = 0; i < count; i++) {
+    JSValue e = JS_GetPropertyUint32(agent->jctx, list, (uint32_t)i);
+    const char *url = json_get_string(agent, e, "url");
+    if (url) {
+      const char *condition = json_get_string(agent, e, "condition");
+      agent->bps = realloc(agent->bps, sizeof(Breakpoint) * (agent->nbps + 1));
+      Breakpoint *bp = &agent->bps[agent->nbps++];
+      bp->id = json_get_int(agent, e, "id", 0);
+      bp->url = strdup(url);
+      bp->condition = condition ? strdup(condition) : NULL;
+      bp->line = json_get_int(agent, e, "line", 1);
+      bp->col = json_get_int(agent, e, "col", 1);
+      /* Unresolved again on purpose: the scripts are gone with the old runtime,
+         and each one that comes back re-announces the breakpoints it binds. */
+      bp->resolved = false;
+      if (condition) JS_FreeCString(agent->jctx, condition);
+      JS_FreeCString(agent->jctx, url);
+    }
+    JS_FreeValue(agent->jctx, e);
+  }
+  JS_FreeValue(agent->jctx, list);
+  JS_FreeValue(agent->jctx, state);
+}
+
+bool qjs_cdp_debugger_enabled(QJSCDPAgent *agent) {
+  return agent->debugger_enabled;
+}
+
+void qjs_cdp_set_debugger_enabled(QJSCDPAgent *agent, bool enabled) {
+  agent->debugger_enabled = enabled;
+  /* Disarmed rather than uninstalled: uninstalling the handler would
+     permanently un-instrument everything parsed afterwards. */
+  JS_SetDebugTraceArmed(agent->ctx, enabled);
 }
 
 char *qjs_cdp_capture_stack_trace(QJSCDPAgent *agent, int frames_to_skip) {
