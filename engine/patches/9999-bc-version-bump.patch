@@ -1,0 +1,92 @@
+Subject: raise the bytecode version for the whole patch series
+
+What this does
+  Raises the number the engine writes into compiled bytecode and checks when
+  reading it back, from 27 to 28.
+
+Why we need it
+  Some of our patches change what compiled bytecode looks like. Bytecode built
+  by a patched engine must not be loaded by an unpatched one, and the version
+  number is how the engine refuses it -- with a clear message instead of a
+  confusing failure much later.
+
+  This is the only patch allowed to touch that number, and it applies last. If
+  every patch bumped the version itself, any two of them would collide on the
+  same line for reasons unrelated to what either one does, and rebasing the
+  series would be a day's work instead of a minute's.
+
+  Patches currently relying on this bump:
+
+    0003-debugger-interface   adds an opcode
+
+  A patch that needs the version raised says so in its own header and in its
+  row of README.md, and changes nothing itself.
+
+Needs a bytecode version bump
+  This is the bump.
+
+Notes
+  Three precompiled builtins ship as bytecode inside the engine, and each one
+  records the version in its first byte. Raising the version without rebuilding
+  them makes the engine reject its own builtins at startup: Array.fromAsync,
+  Iterator.zip and Iterator.zipKeyed all fail with "invalid version". So this
+  patch rebuilds them too, which changes exactly one byte in each.
+
+  Rebuild them with the compiler built from this same engine:
+
+    qjsc -C -ss -o builtin-array-fromasync.h    builtin-array-fromasync.js
+    qjsc -C -ss -o builtin-iterator-zip.h       builtin-iterator-zip.js
+    qjsc -C -ss -o builtin-iterator-zip-keyed.h builtin-iterator-zip-keyed.js
+
+diff --git a/quickjs.c b/quickjs.c
+index 1f1d656..1956108 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38330,7 +38330,7 @@ typedef enum BCTagEnum {
+     BC_TAG_SYMBOL,
+ } BCTagEnum;
+ 
+-#define BC_VERSION 27
++#define BC_VERSION 28
+ 
+ typedef struct BCWriterState {
+     JSContext *ctx;
+diff --git a/builtin-array-fromasync.h b/builtin-array-fromasync.h
+index 4a53f38..f2b568a 100644
+--- a/builtin-array-fromasync.h
++++ b/builtin-array-fromasync.h
+@@ -5,7 +5,7 @@
+ const uint32_t qjsc_builtin_array_fromasync_size = 888;
+ 
+ const uint8_t qjsc_builtin_array_fromasync[888] = {
+- 0x1b, 0xc5, 0x39, 0x53, 0x3c, 0x0e, 0x01, 0x28,
++ 0x1c, 0xc5, 0x39, 0x53, 0x3c, 0x0e, 0x01, 0x28,
+  0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0xb7, 0x61,
+  0x73, 0x79, 0x6e, 0x63, 0x49, 0x74, 0x65, 0x72,
+  0x61, 0x74, 0x6f, 0x72, 0x01, 0x2a, 0x4f, 0x62,
+diff --git a/builtin-iterator-zip-keyed.h b/builtin-iterator-zip-keyed.h
+index a63d15a..8a8ca29 100644
+--- a/builtin-iterator-zip-keyed.h
++++ b/builtin-iterator-zip-keyed.h
+@@ -5,7 +5,7 @@
+ const uint32_t qjsc_builtin_iterator_zip_keyed_size = 2582;
+ 
+ const uint8_t qjsc_builtin_iterator_zip_keyed[2582] = {
+- 0x1b, 0xeb, 0x00, 0x6f, 0x50, 0x2b, 0x01, 0x1c,
++ 0x1c, 0xeb, 0x00, 0x6f, 0x50, 0x2b, 0x01, 0x1c,
+  0x49, 0x74, 0x65, 0x72, 0x61, 0x74, 0x6f, 0x72,
+  0x48, 0x65, 0x6c, 0x70, 0x65, 0x72, 0x01, 0x08,
+  0x63, 0x61, 0x6c, 0x6c, 0x01, 0x24, 0x68, 0x61,
+diff --git a/builtin-iterator-zip.h b/builtin-iterator-zip.h
+index 266d3d3..0d2146e 100644
+--- a/builtin-iterator-zip.h
++++ b/builtin-iterator-zip.h
+@@ -5,7 +5,7 @@
+ const uint32_t qjsc_builtin_iterator_zip_size = 2621;
+ 
+ const uint8_t qjsc_builtin_iterator_zip[2621] = {
+- 0x1b, 0xca, 0x2d, 0xe4, 0xa6, 0x2a, 0x01, 0x1c,
++ 0x1c, 0xca, 0x2d, 0xe4, 0xa6, 0x2a, 0x01, 0x1c,
+  0x49, 0x74, 0x65, 0x72, 0x61, 0x74, 0x6f, 0x72,
+  0x48, 0x65, 0x6c, 0x70, 0x65, 0x72, 0x01, 0x08,
+  0x63, 0x61, 0x6c, 0x6c, 0x01, 0x1e, 0x53, 0x79,
