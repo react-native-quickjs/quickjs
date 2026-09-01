@@ -37,6 +37,13 @@ qjs_add_test_suite(quickjs_jsi_conformance
 )
 target_include_directories(quickjs_jsi_conformance PRIVATE third_party)
 
+# Shells out to the compiler built from the same engine, so the tests exercise
+# the real container rather than a hand-written fixture.
+qjs_add_test_suite(quickjs_bytecode_tests bytecode_test.cpp)
+target_compile_definitions(quickjs_bytecode_tests
+  PRIVATE QJSC_NG_PATH="$<TARGET_FILE:qjsc-ng>")
+add_dependencies(quickjs_bytecode_tests qjsc-ng)
+
 add_executable(quickjs_jsi_bench bench/jsi_bench.cpp)
 target_link_libraries(quickjs_jsi_bench PRIVATE quickjs_jsi)
 
