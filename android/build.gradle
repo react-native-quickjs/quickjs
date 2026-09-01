@@ -119,3 +119,29 @@ dependencies {
   implementation "com.facebook.react:react-android"
   implementation "com.facebook.fbjni:fbjni:0.7.0"
 }
+
+// The app template chooses a JavaScript engine in its own build.gradle: Hermes
+// when hermesEnabled is true, JavaScriptCore otherwise. An app on QuickJS wants
+// neither -- and because it has to set hermesEnabled=false, it lands in the
+// JavaScriptCore branch and ships a 10 MB libjsc.so per architecture that
+// nothing ever loads. Gradle gives a library no way to drop a dependency the
+// app declared itself, so the most we can do is say so on every build.
+gradle.projectsEvaluated {
+  rootProject.subprojects
+      .findAll { it.plugins.hasPlugin("com.android.application") }
+      .each { app ->
+    def declared = app.configurations.findByName("implementation")
+        ?.dependencies?.collect { it.name } ?: []
+
+    if (declared.contains("hermes-android")) {
+      app.logger.warn("[ReactNativeQuickJS] ${app.path} bundles Hermes. Set " +
+          "hermesEnabled=false in gradle.properties: with it on, a release " +
+          "bundle is Hermes bytecode, which QuickJS cannot execute.")
+    }
+    if (declared.any { it.startsWith("jsc-android") }) {
+      app.logger.warn("[ReactNativeQuickJS] ${app.path} bundles JavaScriptCore " +
+          "and never loads it. Delete the jscFlavor dependency from " +
+          "${app.path}/build.gradle to save about 10 MB per architecture.")
+    }
+  }
+}
