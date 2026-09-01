@@ -20,6 +20,24 @@
   "engines": {
     "node": ">=20"
   },
+  "files": [
+    "src",
+    "platform/android",
+    "platform/apple",
+    "cmake",
+    "engine/quickjs-rel",
+    "modules/cdp/quickjs-cdp.h",
+    "modules/cdp/quickjs-cdp.c",
+    "modules/cdp/react",
+    "scripts/postinstall.js",
+    "scripts/react_native_quickjs_pods.rb",
+    "react-native.config.js",
+    "*.podspec",
+    "!platform/android/build",
+    "!platform/android/.cxx",
+    "!**/__tests__",
+    "!**/.*"
+  ],
   "scripts": {
     "submodules": "git submodule update --init --recursive",
     "patches": "node scripts/apply-patches.js",
@@ -31,7 +49,8 @@
     "bench": "cmake -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j8 && ctest --test-dir build-release -V -R jsi_bench",
     "bytecode": "./build/qjsc-ng",
     "clean": "rm -rf build build-release",
-    "prepack": "node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check"
+    "prepack": "node scripts/check-submodule.js && node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check",
+    "postinstall": "node scripts/postinstall.js"
   },
   "peerDependencies": {
     "react": "*",
