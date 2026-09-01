@@ -1,0 +1,71 @@
+# The gate on every change. The platform builds are separate and manual: they
+# need an SDK and twenty minutes, and they have never caught something these
+# suites did not.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # postinstall applies the engine patches.
+      - run: npm ci
+
+      - name: Check the patches and the engine projection
+        run: |
+          node scripts/apply-patches.js --check
+          node scripts/sync-quickjs-rel.js --check
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j"$(nproc)"
+
+      - name: Test
+        id: test
+        run: ctest --test-dir build -j4 --output-on-failure --output-junit results.xml
+
+      # Runs even when the tests failed -- that is when the report is worth
+      # reading. It exits non-zero on a failure, so the job still fails.
+      - name: Report
+        if: always()
+        run: node scripts/ci-report.js build/results.xml report.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: host-test-report
+          path: |
+            report.md
+            build/results.xml
+
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Edit the previous comment rather than adding one per push.
+          gh pr comment "${{ github.event.number }}" --body-file report.md --edit-last \
+            || gh pr comment "${{ github.event.number }}" --body-file report.md
