@@ -38,6 +38,11 @@ target_include_directories(quickjs_jsi PUBLIC src/bytecode src/module src/runtim
 target_link_libraries(quickjs_jsi PUBLIC jsi quickjs)
 set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# src/runtime/QuickJSInstance.cpp is deliberately not in quickjs_jsi. It
+# includes react/runtime/JSRuntimeFactory.h, which reaches folly and
+# jsinspector-modern -- both of which arrive through gradle and CocoaPods, not
+# node_modules. The Android and Apple builds compile it; the host build cannot.
+
 # Built from the engine in this tree, not shipped prebuilt: bytecode is only
 # loadable by the exact engine build that produced it.
 add_executable(qjsc-ng tools/bytecode/qjsc-ng.c)
