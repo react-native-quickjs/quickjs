@@ -104,7 +104,30 @@ frontend's "edit value" reaches the live frame rather than a copy of it:
 paused in add(2, 3), set y = 40, resume  ->  result is 42
 ```
 
+## Testing
+
+`test/cdp_test.cpp` is the fast gate: it asserts on the JSON text, because that
+text is the contract and a test that reached inside the agent could pass while
+the wire format was wrong.
+
+The real measure is somebody else's suite. `test/rn-inspector/` builds React
+Native's own `JsiIntegrationTest.cpp` out of `node_modules`, unmodified, and
+points its engine list at this one; `generate-suite.mjs` redirects the three
+lines that name an engine adapter and changes nothing else. A failing-test list
+from a suite we did not write is a work plan in a way our own assertions are
+not.
+
+Measured 2026-09-01, macOS arm64: **22 pass, 5 fail, 0 crash of 27.**
+
+| still failing | why |
+|---|---|
+| `testCaptureAndSerializeStackTrace` | column numbers. We report the first character of the callee, the suite expects the opening paren. Frame count, names, script ids and line numbers all match |
+| `ResolveColumnlessBreakpointAfterReload`, `ResolveColumnBreakpointAfterReload` | breakpoints do not survive a reload. Needs `RuntimeAgentDelegate::getExportedState` |
+| `TwoConnectionsDebuggerLifecycle` | enabling and disabling the debugger from two frontends at once |
+| `HermesObjectsTableDoesNotMemoryLeak` | the remote object table is never trimmed while a session lives |
+
 ## Using it
+
 
 ```c
 QJSCDPAgent *agent = qjs_cdp_new(ctx, 1, send_to_frontend, socket);
