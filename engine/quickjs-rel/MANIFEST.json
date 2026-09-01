@@ -12,7 +12,7 @@
     },
     {
       "name": "0003-debugger-interface.patch",
-      "sha256": "39a018105046e5a95bd685e1931faf64cad67ce7634dbfb1d2f3f51797972cdb"
+      "sha256": "eb0e05d2449685768cdd44c8458c3ffb13efa47a92994363ba040ecef46b22e4"
     },
     {
       "name": "0004-debugger-frame-info.patch",

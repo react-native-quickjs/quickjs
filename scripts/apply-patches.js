@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
+const diffPreview = require('./diff-preview.js');
 
 const root = path.join(__dirname, '..');
 const submodule = path.join(root, 'engine', 'quickjs-ng');
@@ -37,6 +38,12 @@ const readmePath = path.join(patchDir, 'README.md');
  * engine/patches/README.md.
  */
 const BC_PATCH = '9999-bc-version-bump.patch';
+
+/* Explicit, because `git apply` otherwise honours the user's apply.whitespace
+   setting. With it set to `fix` the engine ends up byte-different from the same
+   patches applied anywhere else, and the committed projection then matches only
+   the machine that generated it. */
+const WHITESPACE = '--whitespace=nowarn';
 
 const mode = process.argv.includes('--check')
   ? 'check'
@@ -117,7 +124,7 @@ function buildExpected(patches, files) {
   }
 
   for (const patch of patches) {
-    const result = spawnSync('git', ['apply', path.join(patchDir, patch)], {
+    const result = spawnSync('git', ['apply', WHITESPACE, path.join(patchDir, patch)], {
       cwd: dir,
       encoding: 'utf8',
     });
@@ -244,7 +251,7 @@ if (mode !== 'reverse') {
 /* --reverse needs no scratch tree: it just unwinds the series in place. */
 if (mode === 'reverse') {
   for (const patch of [...patches].reverse()) {
-    const result = git(['apply', '--reverse', path.join(patchDir, patch)]);
+    const result = git(['apply', '--reverse', WHITESPACE, path.join(patchDir, patch)]);
     if (result.status !== 0) fail(`could not reverse ${patch}\n${result.stderr}`);
   }
   console.log(`[apply-patches] reversed ${patches.length} patch(es)`);
@@ -254,6 +261,19 @@ if (mode === 'reverse') {
 const files = touchedFiles(patches);
 const expected = buildExpected(patches, files);
 const stale = diverged(expected, files);
+
+/* Captured before the scratch tree is removed on the next line, because that is
+   the only copy of what the files were supposed to contain. */
+const previews = stale.map((name) =>
+  diffPreview(
+    fs.readFileSync(path.join(expected, name)),
+    fs.existsSync(path.join(submodule, name))
+      ? fs.readFileSync(path.join(submodule, name))
+      : '',
+    name
+  )
+);
+
 fs.rmSync(expected, { recursive: true, force: true });
 
 if (mode === 'check') {
@@ -261,6 +281,8 @@ if (mode === 'check') {
     fail(
       'engine/quickjs-ng does not match upstream plus engine/patches.\n\n' +
         stale.map((name) => `  ${name}`).join('\n') +
+        '\n\n' +
+        previews.join('\n\n') +
         '\n\nRun: node scripts/apply-patches.js'
     );
   }
@@ -282,7 +304,7 @@ if (!isPristine(files)) {
 }
 
 for (const patch of patches) {
-  const result = git(['apply', path.join(patchDir, patch)]);
+  const result = git(['apply', WHITESPACE, path.join(patchDir, patch)]);
   if (result.status !== 0) fail(`could not apply ${patch}\n${result.stderr}`);
 }
 console.log(`[apply-patches] applied ${patches.length} patch(es)`);

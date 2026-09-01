@@ -120,7 +120,7 @@ index 1f1d656..9b27ac1 100644
 +    JSRuntime *rt = ctx->rt;
 +    JSStackFrame *sf = rt->current_stack_frame;
 +    int current_level = 0;
-+    
++
 +    while (sf != NULL && current_level < level) {
 +        sf = sf->prev_frame;
 +        current_level++;
@@ -133,7 +133,7 @@ index 1f1d656..9b27ac1 100644
 +    JSRuntime *rt = ctx->rt;
 +    JSStackFrame *sf = rt->current_stack_frame;
 +    int depth = 0;
-+    
++
 +    while (sf != NULL) {
 +        depth++;
 +        sf = sf->prev_frame;
