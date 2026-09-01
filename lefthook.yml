@@ -1,0 +1,37 @@
+pre-commit:
+  parallel: true
+  commands:
+    clang-format:
+      glob: "*.{c,h,cpp,mm}"
+      # A list of globs, not one string: lefthook reads a bare string as a
+      # regular expression, in which `**` means "zero or more asterisks"
+      # rather than "any path". Written that way these exclusions never
+      # match, and vendored code gets checked against our style.
+      exclude:
+        - "engine/**"
+        - "tests/third_party/**"
+        # modules/napi/include/*.h are Node's own headers, copied verbatim,
+        # and modules/napi/cpp/** is a fork of an external node-api
+        # implementation. Reformatting either would bury every real change in
+        # noise and make the parity diff against Node worthless.
+        - "modules/napi/include/**"
+        - "modules/napi/cpp/**"
+        - "platform/android/src/main/jni/JJSRuntimeFactory.h"
+      run: clang-format --dry-run --Werror {staged_files}
+
+    # engine/patches is the source of truth; engine/quickjs-rel is the
+    # projection that ships. Checking this only in `prepack` is too late: a
+    # patch can sit unprojected for days, so the repository looks green while
+    # the shipped source is missing the change. A guard belongs on the
+    # receiving side, and for day-to-day work that is the commit.
+    engine-sync:
+      glob:
+        - "engine/**"
+        - "scripts/**"
+      run: node scripts/sync-quickjs-rel.js --check
+
+commit-msg:
+  parallel: true
+  commands:
+    commitlint:
+      run: npx commitlint --edit
