@@ -626,35 +626,49 @@ jsi::Runtime::PointerValue *QuickJSRuntime::clonePropNameID(
 
 jsi::PropNameID QuickJSRuntime::createPropNameIDFromAscii(
     const char *str, size_t length) {
-  notImplemented("createPropNameIDFromAscii");
+  return createPropNameIDFrom(JS_NewAtomLen(context_, str, length));
 }
 
 jsi::PropNameID QuickJSRuntime::createPropNameIDFromUtf8(
     const uint8_t *utf8, size_t length) {
-  notImplemented("createPropNameIDFromUtf8");
+  return createPropNameIDFrom(
+      JS_NewAtomLen(context_, reinterpret_cast<const char *>(utf8), length));
 }
 
 jsi::PropNameID QuickJSRuntime::createPropNameIDFromUtf16(
     const char16_t *utf16, size_t length) {
-  notImplemented("createPropNameIDFromUtf16");
+  JSValue string = JS_NewStringUTF16(
+      context_, reinterpret_cast<const uint16_t *>(utf16), length);
+  checkException(string);
+  JSAtom atom = JS_ValueToAtom(context_, string);
+  JS_FreeValue(context_, string);
+  return createPropNameIDFrom(atom);
 }
 
 jsi::PropNameID QuickJSRuntime::createPropNameIDFromString(
     const jsi::String &str) {
-  notImplemented("createPropNameIDFromString");
+  return createPropNameIDFrom(JS_ValueToAtom(context_, toJSValue(str)));
 }
 
 jsi::PropNameID QuickJSRuntime::createPropNameIDFromSymbol(
     const jsi::Symbol &sym) {
-  notImplemented("createPropNameIDFromSymbol");
+  return createPropNameIDFrom(JS_ValueToAtom(context_, toJSValue(sym)));
 }
 
-std::string QuickJSRuntime::utf8(const jsi::PropNameID &) {
-  notImplemented("utf8");
+std::string QuickJSRuntime::utf8(const jsi::PropNameID &name) {
+  size_t length = 0;
+  const char *chars = JS_AtomToCStringLen(context_, &length, toJSAtom(name));
+  if (chars == nullptr) {
+    throwPendingError();
+  }
+  std::string result(chars, length);
+  JS_FreeCString(context_, chars);
+  return result;
 }
 
-bool QuickJSRuntime::compare(const jsi::PropNameID &, const jsi::PropNameID &) {
-  notImplemented("compare");
+bool QuickJSRuntime::compare(
+    const jsi::PropNameID &a, const jsi::PropNameID &b) {
+  return toJSAtom(a) == toJSAtom(b);
 }
 
 std::string QuickJSRuntime::symbolToString(const jsi::Symbol &) {
@@ -687,21 +701,34 @@ jsi::String QuickJSRuntime::bigintToString(const jsi::BigInt &, int) {
 
 jsi::String QuickJSRuntime::createStringFromAscii(
     const char *str, size_t length) {
-  notImplemented("createStringFromAscii");
+  return createStringFromUtf8(reinterpret_cast<const uint8_t *>(str), length);
 }
 
 jsi::String QuickJSRuntime::createStringFromUtf8(
     const uint8_t *utf8, size_t length) {
-  notImplemented("createStringFromUtf8");
+  JSValue string =
+      JS_NewStringLen(context_, reinterpret_cast<const char *>(utf8), length);
+  checkException(string);
+  return createStringFrom(string);
 }
 
 jsi::String QuickJSRuntime::createStringFromUtf16(
     const char16_t *utf16, size_t length) {
-  notImplemented("createStringFromUtf16");
+  JSValue string = JS_NewStringUTF16(
+      context_, reinterpret_cast<const uint16_t *>(utf16), length);
+  checkException(string);
+  return createStringFrom(string);
 }
 
-std::string QuickJSRuntime::utf8(const jsi::String &) {
-  notImplemented("utf8");
+std::string QuickJSRuntime::utf8(const jsi::String &string) {
+  size_t length = 0;
+  const char *chars = JS_ToCStringLen(context_, &length, toJSValue(string));
+  if (chars == nullptr) {
+    throwPendingError();
+  }
+  std::string result(chars, length);
+  JS_FreeCString(context_, chars);
+  return result;
 }
 
 jsi::Object QuickJSRuntime::createObject() {
