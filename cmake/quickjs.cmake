@@ -91,7 +91,13 @@ set_target_properties(quickjs PROPERTIES
 # MSVC rejects these outright -- `cl` reads -Wn as the numeric warning level
 # and stops with D8021 -- and it is only reached by the bytecode compiler,
 # which is built for Windows too.
-if(NOT MSVC)
+if(MSVC)
+  # engine/patches/0005 stores the debug-trace arming flag in an `_Atomic bool`,
+  # because it is written from a thread other than the one running JavaScript.
+  # MSVC treats _Atomic as C11 it does not implement by default, and the first
+  # error cascades into a hundred more. quickjs-ng passes the same flag.
+  target_compile_options(quickjs PRIVATE /experimental:c11atomics)
+else()
   target_compile_options(quickjs PRIVATE
     -Wno-unused-parameter
     -Wno-unused-variable
