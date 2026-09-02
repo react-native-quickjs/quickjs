@@ -19,8 +19,8 @@ Provides a `jsi::Runtime` backed by quickjs-ng, and the `JSRuntimeFactory` glue
 React Native uses to select it. The engine is compiled from source as part of
 the app build. Neither Hermes nor JavaScriptCore is linked into the result.
 
-> **Alpha.** Setup is manual on both platforms. See
-> [Known limitations](#known-limitations). Breaking changes are expected.
+> **Alpha.** See [Known limitations](#known-limitations). Breaking changes are
+> expected.
 
 ## Requirements
 
@@ -31,9 +31,21 @@ the app build. Neither Hermes nor JavaScriptCore is linked into the result.
 
 ```sh
 npm install @react-native-quickjs/quickjs
+npx react-native-quickjs install
+cd ios && pod install
 ```
 
-Both platform sections below are required.
+For Expo, add the config plugin instead and run `expo prebuild`:
+
+```json
+{ "expo": { "plugins": ["@react-native-quickjs/quickjs"] } }
+```
+
+`npx react-native-quickjs doctor` reports which parts are configured, and
+`revert` puts the app back on Hermes.
+
+The two sections below are the changes `install` makes. Follow them by hand if
+you would rather, or if `install` reports a file it could not edit.
 
 ## iOS
 
