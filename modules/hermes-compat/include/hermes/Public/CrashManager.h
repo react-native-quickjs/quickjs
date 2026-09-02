@@ -31,4 +31,12 @@ class CrashManager {
   virtual void unregisterCallback(CallbackKey) {}
 };
 
+/// react-native-worklets constructs one of these, so the class needs a vtable
+/// in this library. The destructor is deliberately out of line: it is the key
+/// function, and that is what decides where the vtable is emitted.
+class NopCrashManager : public CrashManager {
+ public:
+  ~NopCrashManager() override;
+};
+
 }  // namespace hermes::vm
