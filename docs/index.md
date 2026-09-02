@@ -6,7 +6,7 @@ description: 'Run your React Native app on QuickJS instead of Hermes. Full Chrom
 hero:
   name: react-native-quickjs
   text: Run React Native on QuickJS.
-  tagline: A drop-in JavaScript engine for React Native 0.85 and newer. Change a few lines of build config and your app runs on QuickJS instead of Hermes.
+  tagline: A drop-in JavaScript engine for React Native 0.85 and newer. One command and your app runs on QuickJS instead of Hermes.
   actions:
     - theme: brand
       text: Get started
@@ -33,9 +33,18 @@ React Native runs your JavaScript on Hermes. This replaces it with
 the current ECMAScript specification — and gives React Native the runtime and
 factory it needs to use it.
 
-It is **alpha**: setup is manual, release bundles ship as plain JavaScript
-rather than bytecode, and on iOS removing Hermes means React Native core is
-compiled from source, which makes the first build slower.
+<div style="text-align: left; max-width: 460px; margin: 1.75rem auto;">
+
+```sh
+npm install @react-native-quickjs/quickjs
+npx react-native-quickjs install
+```
+
+</div>
+
+It is **alpha**: release bundles ship as plain JavaScript rather than bytecode,
+and on iOS removing Hermes means React Native core is compiled from source,
+which makes the first build slower.
 
 [Install](https://github.com/react-native-quickjs/quickjs#install) ·
 [Known limitations](https://github.com/react-native-quickjs/quickjs#known-limitations)
