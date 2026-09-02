@@ -111,12 +111,15 @@ def react_native_quickjs_post_install(installer)
     installer, "React-Core", "GCC_PREPROCESSOR_DEFINITIONS", "USE_HERMES=0"
   )
 
-  # RCTAppSetupUtils.h needs USE_THIRD_PARTY_JSC, which is lost to a missing
-  # space in React-RCTAppDelegate.podspec:21 -- clang receives the two flags
-  # joined, as -DRCT_NEW_ARCH_ENABLED=1-DUSE_THIRD_PARTY_JSC=1.
-  react_native_quickjs_append(
-    installer, "React-RCTAppDelegate", "GCC_PREPROCESSOR_DEFINITIONS",
-    "USE_THIRD_PARTY_JSC=1"
+  # RCTAppSetupUtils.h imports Hermes under `#if USE_THIRD_PARTY_JSC != 1`, and
+  # React-RCTAppDelegate.podspec:21 loses the flag to a missing space -- clang
+  # receives the two joined, as -DRCT_NEW_ARCH_ENABLED=1-DUSE_THIRD_PARTY_JSC=1.
+  #
+  # Every pod target, not just React-RCTAppDelegate: any pod including that
+  # header resolves the same #if, and Expo's does, through RCTAppDelegateUmbrella
+  # -- so a targeted define builds a plain app and fails an Expo one.
+  react_native_quickjs_append_all(
+    installer, "GCC_PREPROCESSOR_DEFINITIONS", "USE_THIRD_PARTY_JSC=1"
   )
 
   # createJSRuntimeFactory has an empty body under USE_THIRD_PARTY_JSC=1, which
@@ -142,8 +145,8 @@ def react_native_quickjs_post_install(installer)
     end
 
   Pod::UI.puts(
-    "[ReactNativeQuickJS] USE_HERMES=false — release bundles will be plain " \
-    "JavaScript, not Hermes bytecode.".green
+    "[ReactNativeQuickJS] USE_HERMES=false — release bundles are compiled to " \
+    "QuickJS bytecode, not Hermes bytecode.".green
   )
 end
 
@@ -151,6 +154,19 @@ end
 # breaks the build, and they match React Native's pods by name -- exactly what a
 # version bump renames -- so a silent no-op would resurface much later as the
 # error it was meant to prevent.
+# Applies a setting to every pod target. Used for a flag that selects which
+# JavaScript engine header a React Native header imports: any pod that includes
+# it needs the same answer, and which pods those are is not knowable here.
+def react_native_quickjs_append_all(installer, setting, value)
+  installer.target_installation_results.pod_target_installation_results.each_value do |result|
+    result.native_target.build_configurations.each do |config|
+      current = config.build_settings[setting] || "$(inherited)"
+      current = current.join(" ") if current.is_a?(Array)
+      config.build_settings[setting] = "#{current} #{value}"
+    end
+  end
+end
+
 def react_native_quickjs_append(installer, pod_name, setting, value, debug_only: false)
   result = installer.target_installation_results
     .pod_target_installation_results[pod_name]

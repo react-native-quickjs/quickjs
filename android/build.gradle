@@ -157,6 +157,17 @@ gradle.projectsEvaluated {
 // Compile the release bundle to QuickJS bytecode, after React Native has
 // written it. Debug builds load JavaScript from Metro and never produce a
 // bundle, so there is nothing to compile. -PrnqjsBytecode=false turns it off.
+
+// ExecOperations is how a Gradle 9 build spawns a process; project.exec was
+// removed. A plain ProcessBuilder also runs, but not identically: under a
+// Volta-managed node it fails to resolve a version at all, in a build where
+// React Native's own bundle task -- which goes through ExecOperations -- had
+// just run the same binary.
+interface ReactNativeQuickJSProcess {
+  @javax.inject.Inject
+  org.gradle.process.ExecOperations getExecOperations()
+}
+
 gradle.projectsEvaluated {
   if (project.findProperty('rnqjsBytecode')?.toString() == 'false') return
 
@@ -165,19 +176,19 @@ gradle.projectsEvaluated {
   rootProject.subprojects.each { app ->
     if (!app.plugins.hasPlugin("com.android.application")) return
 
+    def process = app.objects.newInstance(ReactNativeQuickJSProcess).execOperations
+    // The same node React Native bundles with, including an override of it.
+    def node = app.extensions.findByName('react')?.nodeExecutableAndArgs?.getOrNull() ?: ['node']
+
     app.tasks.matching { it.name ==~ /createBundle.*JsAndAssets/ }.configureEach { bundleTask ->
       bundleTask.doLast {
         // Found by name rather than by reading the task's own properties,
-        // which are React Native Gradle plugin internals. ProcessBuilder
-        // rather than project.exec, which Gradle 9 removed.
+        // which are React Native Gradle plugin internals.
         def assets = app.layout.buildDirectory.dir("generated/assets").get().asFile
         app.fileTree(assets).matching { include '**/index.android.bundle' }.each { bundle ->
-          def process = new ProcessBuilder(['node', compiler.absolutePath, bundle.absolutePath])
-              .redirectErrorStream(true)
-              .start()
-          process.inputStream.eachLine { line -> logger.lifecycle(line) }
-          if (process.waitFor() != 0) {
-            throw new GradleException("could not compile ${bundle.name} to bytecode")
+          process.exec {
+            commandLine(*node, compiler.absolutePath, bundle.absolutePath)
+            workingDir app.rootDir
           }
         }
       }

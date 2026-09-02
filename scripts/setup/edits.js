@@ -114,15 +114,16 @@ const edits = [
     // neither, so the whole block goes.
     label: 'android/app/build.gradle',
     findFile: (project) => path.join(project, 'android', 'app', 'build.gradle'),
-    isApplied: (source) => !/hermes-android|jscFlavor/.test(source),
+    isApplied: (source) => !/hermes-android|implementation jscFlavor/.test(source),
 
+    // `def jscFlavor` is left alone. It declares the coordinate; the dependency
+    // this removes is what pulled libjsc.so into the app, and leaving the
+    // declaration keeps revert able to put the block back unchanged.
     addQuickJS(source) {
-      const withoutEngines = source
-        .replace(
-          /[ \t]*if \([ \t]*hermesEnabled\.toBoolean\(\)[ \t]*\) \{[\s\S]*?\n[ \t]*\}[ \t]*\n/,
-          ''
-        )
-        .replace(/[ \t]*def jscFlavor[ \t]*=.*\n/, '');
+      const withoutEngines = source.replace(
+        /[ \t]*if \([ \t]*hermesEnabled\.toBoolean\(\)[ \t]*\) \{[\s\S]*?\n[ \t]*\}[ \t]*\n/,
+        ''
+      );
       return withoutEngines === source ? null : withoutEngines;
     },
 
@@ -204,10 +205,18 @@ const edits = [
         ? source
         : source.replace(/^platform :ios/m, `${PODFILE_REQUIRE}\n\nplatform :ios`);
 
-      const withUseQuickJS = withRequire.replace(
-        /^([ \t]*)use_react_native!\(/m,
-        '$1use_quickjs!\n\n$1use_react_native!('
-      );
+      // use_quickjs! only sets environment flags, but Expo's autolinking reads
+      // them when use_expo_modules! runs, which is before use_react_native!.
+      // Placed after it, Expo resolves its modules against the prebuilt React
+      // Native this is about to turn off, and then fetches them from a git
+      // source that does not build. So it goes before whichever comes first.
+      const anchor = /^([ \t]*)(use_expo_modules!|use_react_native!\()/m.exec(withRequire);
+      if (!anchor) return null;
+
+      const withUseQuickJS =
+        withRequire.slice(0, anchor.index) +
+        `${anchor[1]}use_quickjs!\n\n` +
+        withRequire.slice(anchor.index);
 
       // The hook must follow React Native's own, which writes the USE_HERMES
       // build setting this overwrites.
@@ -231,7 +240,7 @@ const edits = [
         .replace(/\n?[ \t]*react_native_quickjs_post_install\(installer\)\n/, '\n'),
 
     manualSteps: [
-      'In ios/Podfile add, before use_react_native!:',
+      'In ios/Podfile add, before use_expo_modules! or use_react_native!:',
       `  ${PODFILE_REQUIRE}`,
       '  use_quickjs!',
       'and react_native_quickjs_post_install(installer) after react_native_post_install.',
@@ -247,8 +256,10 @@ const edits = [
       const withImport = withImportAdded(source, SWIFT_IMPORT);
       if (!withImport) return null;
 
+      // Expo names its own subclass ExpoReactNativeFactoryDelegate, so the
+      // class this overrides is matched by suffix rather than by exact name.
       const delegateClass =
-        /class\s+\w+\s*:\s*RCTDefaultReactNativeFactoryDelegate\s*\{/.exec(withImport);
+        /class\s+\w+\s*:\s*\w*ReactNativeFactoryDelegate\s*\{/.exec(withImport);
       if (!delegateClass) return null;
 
       const classBody = delegateClass.index + delegateClass[0].length;

@@ -13,7 +13,7 @@
 namespace qjs {
 
 /**
- * Precompiled bytecode container, written by tools/bytecode/qjsc-ng.c.
+ * Precompiled bytecode container, written by tools/bytecode/qjsc.c.
  *
  *     [8 bytes magic "NSBCNGS\0"][4 bytes format version, little-endian]
  *     [JS_WriteObject payload]
