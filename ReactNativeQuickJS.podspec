@@ -125,8 +125,8 @@ Pod::Spec.new do |s|
   # hermes-engine pod also installed the target has two <hermes/hermes.h> on one
   # search path and two definitions of makeHermesRuntime on one link line, and
   # pod ordering decides which wins. use_hermes() is what decides whether that
-  # pod is there, so ask it rather than reading ENV["USE_HERMES"], which on
-  # React Native 0.85 aborts pod install and does not control this.
+  # pod is there, so ask it rather than reading ENV["USE_HERMES"]: React Native
+  # sets that pod up from use_hermes(), which never consults that variable.
   #
   # Skipped rather than raised. Now that the shim is on by default this is
   # reached by installing the package and running pod install before
