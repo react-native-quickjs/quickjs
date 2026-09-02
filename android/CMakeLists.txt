@@ -99,9 +99,10 @@ endif()
 # two copies would mean two engines in one app, and roughly a megabyte of
 # duplicate code per architecture.
 #
-# Off by default because a library named libhermesvm.so changes what every
-# Hermes-detecting library in the app believes. -PrnqjsHermesCompat=true.
-option(RNQJS_HERMES_COMPAT "Build the Hermes compatibility shim as libhermesvm.so" OFF)
+# On by default: react-native-worklets does not load without it, and neither
+# does react-native-reanimated, which is most apps. -PrnqjsHermesCompat=false
+# turns it off.
+option(RNQJS_HERMES_COMPAT "Build the Hermes compatibility shim as libhermesvm.so" ON)
 if(RNQJS_HERMES_COMPAT)
   add_library(hermes SHARED
     "${RNQJS_ROOT}/modules/hermes-compat/src/HermesCompat.cpp")

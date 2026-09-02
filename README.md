@@ -156,6 +156,27 @@ build stops rather than shipping a bundle the app cannot read.
 Set `RNQJS_BYTECODE=0` (iOS) or `-PrnqjsBytecode=false` (Android) to ship plain
 JavaScript instead.
 
+## Hermes compatibility
+
+Many React Native libraries create their own JavaScript runtime by calling into
+Hermes directly -- `react-native-worklets` does, and so `react-native-reanimated`
+does through it. They include `<hermes/hermes.h>` and link the Hermes library by
+name, neither of which exists in a QuickJS app.
+
+A compatibility shim ships that header and library, backed by this engine, so
+those libraries build and run unmodified. `makeHermesRuntime()` returns a QuickJS
+runtime; on Android the library is named `libhermesvm.so`, which is the name they
+look for. It is about 100 KB and contains no second engine.
+
+This is on by default. `RNQJS_HERMES_COMPAT=0` (iOS) or `-PrnqjsHermesCompat=false`
+(Android) turns it off, which is worth doing only if nothing in the app wants
+Hermes: with it on, any library that feature-detects `__has_include(<hermes/hermes.h>)`
+takes its Hermes path, and gets this engine.
+
+The shim covers the whole public Hermes API. Calls that have no QuickJS meaning
+return sensible values rather than failing, and report themselves once through
+`hermes-compat/Diagnostics.h`.
+
 ## Known limitations
 
 | | |

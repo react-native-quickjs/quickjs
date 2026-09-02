@@ -30,7 +30,7 @@
 # Only done when the shim is installed, so that without it a library asking for
 # the real Hermes still fails loudly rather than silently losing it.
 def react_native_quickjs_drop_react_hermes
-  return unless ENV["RNQJS_HERMES_COMPAT"] == "1"
+  return if ENV["RNQJS_HERMES_COMPAT"] == "0"
 
   dependency = Pod::Specification.instance_method(:dependency)
   Pod::Specification.send(:define_method, :dependency) do |*args, &block|
@@ -151,7 +151,7 @@ def react_native_quickjs_post_install(installer)
   # resolve <hermes/hermes.h> -- react-native-worklets decides which engine it
   # is built for with __has_include on exactly that path. The headers cannot be
   # published as public headers of this pod; see the HermesCompat subspec.
-  if ENV["RNQJS_HERMES_COMPAT"] == "1"
+  if ENV["RNQJS_HERMES_COMPAT"] != "0"
     shim = File.expand_path("../modules/hermes-compat/include", __dir__)
     react_native_quickjs_append_all(installer, "HEADER_SEARCH_PATHS", "\"#{shim}\"")
     react_native_quickjs_append_all(

@@ -111,31 +111,37 @@ Pod::Spec.new do |s|
   # makeHermesRuntime() returns a QuickJS-backed runtime, so react-native-worklets
   # -- and so react-native-reanimated -- build and run unmodified.
   #
-  # Opt-in because these headers land in $(PODS_ROOT)/Headers/Public/hermes/,
-  # which CocoaPods puts on every pod's header search path. From that moment any
-  # library feature-detecting with __has_include(<hermes/hermes.h>) believes this
-  # is a Hermes app. That is an app-wide behavioural change and should be a
-  # decision, not a side effect of installing a pod. Turn it on in the Podfile,
-  # before use_native_modules!:
+  # On by default: react-native-worklets does not build without it, and neither
+  # does react-native-reanimated, which is most apps. RNQJS_HERMES_COMPAT=0 in
+  # the Podfile turns it off.
   #
-  #   ENV["RNQJS_HERMES_COMPAT"] = "1"
-  if ENV["RNQJS_HERMES_COMPAT"] == "1"
-    # The shim is source-compatible with Hermes, not ABI-compatible. With the
-    # hermes-engine pod also installed the target has two <hermes/hermes.h> on
-    # one search path and two definitions of makeHermesRuntime on one link line,
-    # and pod ordering decides which wins. use_hermes() is what decides whether
-    # that pod is there, so ask it rather than reading ENV["USE_HERMES"], which
-    # on React Native 0.85 aborts pod install and does not control this.
-    if defined?(use_hermes) && use_hermes()
-      raise <<~MSG
-        [ReactNativeQuickJS] RNQJS_HERMES_COMPAT=1 cannot be used while the
-        hermes-engine pod is installed. The shim replaces Hermes rather than
-        extending it: installing both puts two <hermes/hermes.h> on one header
-        search path and two definitions of facebook::hermes::makeHermesRuntime
-        on one link line.
-      MSG
-    end
+  # react_native_quickjs_post_install puts these headers on every pod's header
+  # search path, so any library feature-detecting with
+  # __has_include(<hermes/hermes.h>) believes this is a Hermes app -- which is
+  # the point: what it then calls is this engine.
+  hermes_compat = ENV["RNQJS_HERMES_COMPAT"] != "0"
 
+  # The shim is source-compatible with Hermes, not ABI-compatible. With the
+  # hermes-engine pod also installed the target has two <hermes/hermes.h> on one
+  # search path and two definitions of makeHermesRuntime on one link line, and
+  # pod ordering decides which wins. use_hermes() is what decides whether that
+  # pod is there, so ask it rather than reading ENV["USE_HERMES"], which on
+  # React Native 0.85 aborts pod install and does not control this.
+  #
+  # Skipped rather than raised. Now that the shim is on by default this is
+  # reached by installing the package and running pod install before
+  # `npx react-native-quickjs install` has edited the Podfile -- a normal step
+  # in setting the package up, and no place to abort.
+  if hermes_compat && defined?(use_hermes) && use_hermes()
+    Pod::UI.warn(
+      "[ReactNativeQuickJS] the Hermes compatibility shim was skipped because " \
+      "the hermes-engine pod is installed. Add use_quickjs! to the Podfile " \
+      "(`npx react-native-quickjs install` does it) and run pod install again."
+    )
+    hermes_compat = false
+  end
+
+  if hermes_compat
     s.subspec "HermesCompat" do |ss|
       ss.source_files = [
         "modules/hermes-compat/src/*.cpp",
