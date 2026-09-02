@@ -42,14 +42,25 @@ end
 
 # Removes Hermes. Must run before use_react_native!, which reads all of this as
 # the podspecs are evaluated.
-#
-# ENV['USE_HERMES'] is deliberately not set. React Native's own use_hermes() is
-# `!use_third_party_jsc()` and never reads it, so setting it would change
-# nothing here -- while any podspec that does read it directly, as Expo's does,
-# reads USE_HERMES=0 as "use JavaScriptCore" rather than "use neither".
 def use_quickjs!
   # Turns off every `if use_hermes()` dependency on hermes-engine at once.
+  # React Native's own use_hermes() is `!use_third_party_jsc()`, so this one
+  # flag answers for every React Native pod.
   ENV['USE_THIRD_PARTY_JSC'] = '1'
+
+  # Set as well, because a podspec is free to read it directly rather than call
+  # use_hermes() -- Expo's does -- and to such a reader an unset USE_HERMES
+  # means "yes, Hermes". Leaving it unset would have this app claim an engine it
+  # does not have, and any library added later would be told the same.
+  #
+  # Safe alongside the flag above: error_if_try_to_use_jsc_from_core aborts on
+  # USE_HERMES=0 only while USE_THIRD_PARTY_JSC is unset or 0, which is the
+  # "asking for the JavaScriptCore that used to be in core" case, not this one.
+  #
+  # A reader that has only two engines in mind resolves this to JavaScriptCore
+  # rather than to no engine. That is what the Expo config plugin's podspec
+  # patch is for: it teaches USE_THIRD_PARTY_JSC as a third answer.
+  ENV['USE_HERMES'] = '0'
 
   react_native_quickjs_drop_react_hermes
 
