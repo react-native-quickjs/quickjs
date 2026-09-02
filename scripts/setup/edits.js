@@ -31,7 +31,6 @@ const PACKAGE = '@react-native-quickjs/quickjs';
 const KOTLIN_IMPORT = 'import com.reactnativequickjs.quickjs.QuickJSInstance';
 const SWIFT_IMPORT = 'import ReactNativeQuickJS';
 const PODFILE_REQUIRE = `require_relative '../node_modules/${PACKAGE}/scripts/react_native_quickjs_pods.rb'`;
-
 const GRADLE_APPLY = `apply from: file("../../node_modules/${PACKAGE}/android/quickjs.gradle")`;
 
 const SKIP_DIRECTORIES = new Set(['build', 'node_modules', 'Pods']);
@@ -227,12 +226,13 @@ const edits = [
         ? source
         : source.replace(/^platform :ios/m, `${PODFILE_REQUIRE}\n\nplatform :ios`);
 
-      // use_quickjs! only sets environment flags, but Expo's autolinking reads
-      // them when use_expo_modules! runs, which is before use_react_native!.
-      // Placed after it, Expo resolves its modules against the prebuilt React
-      // Native this is about to turn off, and then fetches them from a git
-      // source that does not build. So it goes before whichever comes first.
-      const anchor = /^([ \t]*)(use_expo_modules!|use_react_native!\()/m.exec(withRequire);
+      // use_quickjs! only sets environment flags, but everything after it reads
+      // them. use_native_modules! evaluates every autolinked podspec, and
+      // use_expo_modules! resolves Expo's modules against the prebuilt React
+      // Native this is about to turn off -- both of which run before
+      // use_react_native!. So it goes before whichever comes first.
+      const anchor =
+        /^([ \t]*)(use_native_modules!|use_expo_modules!|use_react_native!\()/m.exec(withRequire);
       if (!anchor) return null;
 
       const withUseQuickJS =
