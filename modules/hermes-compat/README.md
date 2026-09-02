@@ -37,10 +37,14 @@ may not. Consumers are compiled separately from this shim with flags it does
 not control, so a conditional virtual shifts every later vtable slot and the
 failure is a silent call to the wrong function.
 
-**Do not fill in `hermes::vm::RuntimeConfig`.** It is empty so that code
-configuring the VM fails to compile with the field named, rather than having
-settings -- several of them security settings -- silently dropped. If a real
-consumer needs one field, add that one and wire it to QuickJS.
+**A new `RuntimeConfig` field is not honoured until it is reported.**
+`RuntimeConfig` and `GCConfig` carry Hermes's full field set and its defaults,
+so code configuring the VM compiles. Nothing configures QuickJS, so
+`makeHermesRuntime` compares what it is handed against those defaults and names
+every field it cannot honour -- unsupported where the field changes what
+JavaScript may do, such as `EnableEval`, ignored where nothing observable
+depends on it. Add a field to `reportUnhonoured` in the same commit that adds
+it to the list, or it will be dropped in silence.
 
 ## Not ABI compatibility
 

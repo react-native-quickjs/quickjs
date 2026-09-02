@@ -18,3 +18,10 @@ set_target_properties(hermes_compat PROPERTIES
   CXX_STANDARD_REQUIRED ON
   POSITION_INDEPENDENT_CODE ON
 )
+
+if(TARGET GTest::gtest)
+  add_executable(hermes_compat_tests test/hermes_compat_test.cpp)
+  target_link_libraries(hermes_compat_tests
+    PRIVATE hermes_compat GTest::gtest GTest::gtest_main)
+  add_test(NAME hermes_compat COMMAND hermes_compat_tests)
+endif()
