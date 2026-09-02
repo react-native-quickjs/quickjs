@@ -82,6 +82,7 @@ function applyEdits(direction, argv) {
 function doctor(argv) {
   const project = resolveProjectDirectory(argv);
   let notConfigured = 0;
+  let found = 0;
 
   console.log('');
   for (const edit of edits) {
@@ -90,12 +91,18 @@ function doctor(argv) {
       console.log(`  ${DIM}—${OFF}  ${edit.label} ${DIM}(not in this project)${OFF}`);
       continue;
     }
+    found++;
     if (edit.isApplied(fs.readFileSync(file, 'utf8'))) {
       console.log(`  ${GREEN}✓${OFF}  ${edit.label}`);
     } else {
       console.log(`  ${RED}✗${OFF}  ${edit.label}`);
       notConfigured++;
     }
+  }
+
+  if (!found) {
+    console.log(`\nNo React Native app found in ${project}\nUse --project <path> to point at one.\n`);
+    return 1;
   }
 
   console.log(

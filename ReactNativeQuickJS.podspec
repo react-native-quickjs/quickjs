@@ -57,6 +57,24 @@ Pod::Spec.new do |s|
   # `import ReactNativeQuickJS`.
   s.module_name = "ReactNativeQuickJS"
 
+  # Expo's ExpoModulesJSI is a prebuilt dynamic framework that resolves JSI from
+  # the flat namespace when it loads. Two of the symbols it needs come from
+  # React-jsi and nothing linked statically into the app refers to them, so the
+  # linker drops both and dyld kills the app before main() with
+  # "symbol not found in flat namespace '__ZTIN8facebook3jsi13MutableBufferE'".
+  #
+  # Both are named, not just the destructor: ld64 dead-strips per atom rather
+  # than per object file, so keeping the destructor does not keep the typeinfo
+  # sitting beside it in the same object.
+  #
+  # Plain React Native never loads JSI dynamically and does not need this; there
+  # it retains two symbols nothing asks for.
+  s.user_target_xcconfig = {
+    "OTHER_LDFLAGS" => "$(inherited) " \
+      "-Wl,-u,__ZN8facebook3jsi13MutableBufferD2Ev " \
+      "-Wl,-u,__ZTIN8facebook3jsi13MutableBufferE"
+  }
+
   s.pod_target_xcconfig = {
     "DEFINES_MODULE" => "YES",
     # Must be quickjs-rel and not quickjs-ng. Pointing this at the submodule
