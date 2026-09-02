@@ -453,6 +453,10 @@ void reportUnhonoured(const ::hermes::vm::RuntimeConfig &config) {
   QJS_IF_SET(VMExperimentFlags)
   unsupported("RuntimeConfig::VMExperimentFlags", "no Hermes VM to configure");
 
+  // MicrotaskQueue is deliberately not reported. Hermes has to be asked for a
+  // microtask queue; QuickJS always runs one, so a caller enabling it -- which
+  // is what react-native-worklets does -- gets what it asked for.
+
   QJS_IF_SET(EnableJIT)
   ignored("RuntimeConfig::EnableJIT", "QuickJS interprets; there is no JIT");
   QJS_IF_SET(TraceEnabled)
