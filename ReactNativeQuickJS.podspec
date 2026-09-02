@@ -139,22 +139,23 @@ Pod::Spec.new do |s|
     s.subspec "HermesCompat" do |ss|
       ss.source_files = [
         "modules/hermes-compat/src/*.cpp",
-        "modules/hermes-compat/include/hermes/**/*.h",
+        "modules/hermes-compat/include/**/*.h",
       ]
 
-      # header_dir and header_mappings_dir are what land these at
-      # Headers/Public/hermes/hermes.h and
-      # Headers/Public/hermes/inspector-modern/chrome/Registration.h -- the exact
-      # paths worklets includes. Without the mapping CocoaPods flattens the tree
-      # and the nested includes are not found.
-      ss.public_header_files = "modules/hermes-compat/include/hermes/**/*.h"
-      ss.header_dir = "hermes"
-      ss.header_mappings_dir = "modules/hermes-compat/include/hermes"
+      # Private on purpose. This pod sets DEFINES_MODULE, so a public header
+      # joins ReactNativeQuickJS-umbrella.h, which Clang compiles as Objective-C
+      # while building the module -- and <hermes/hermes.h> reaches <cstdint>,
+      # which that compile cannot resolve. CocoaPods would also install them
+      # under Headers/Public/ReactNativeQuickJS/hermes/, so <hermes/hermes.h>
+      # would not resolve for a consumer either.
+      #
+      # react_native_quickjs_post_install puts the source directory itself on
+      # every pod's header search path instead, which is what worklets needs.
+      ss.private_header_files = "modules/hermes-compat/include/**/*.h"
 
       ss.pod_target_xcconfig = {
         # Our own sources include <hermes/hermes.h> and
-        # <hermes-compat/Diagnostics.h> from the source tree, not the published
-        # copy. An embedder installing a diagnostics handler adds this too.
+        # <hermes-compat/Diagnostics.h> from the source tree.
         "HEADER_SEARCH_PATHS" =>
           "$(inherited) \"$(PODS_TARGET_SRCROOT)/modules/hermes-compat/include\"",
         # Unconditional, not tied to the configuration: RNWorklets.podspec sets
