@@ -85,3 +85,49 @@ if(RNQJS_ENABLE_CDP)
     "${CDP_DIR}" "${CDP_DIR}/react")
   target_compile_definitions(quickjsinstancejni PRIVATE RNQJS_ENABLE_CDP=1)
 endif()
+
+# The Hermes compatibility shim, opt-in, built as libhermesvm.so.
+#
+# react-native-worklets picks its engine at compile time and links React
+# Native's imported `hermes` target, so what it records as NEEDED is the file
+# that target points at. On React Native 0.85 that is libhermesvm.so, not
+# libhermes.so -- see ReactAndroid/src/main/jni/first-party/hermes/CMakeLists.txt.
+# Giving it a library of that name, whose makeHermesRuntime returns a QuickJS
+# runtime, is what lets it run here unmodified.
+#
+# It links libquickjsinstancejni.so rather than compiling the engine again:
+# two copies would mean two engines in one app, and roughly a megabyte of
+# duplicate code per architecture.
+#
+# Off by default because a library named hermes changes what every
+# Hermes-detecting library in the app believes. -PrnqjsHermesCompat=true.
+option(RNQJS_HERMES_COMPAT "Build the Hermes compatibility shim as libhermes.so" OFF)
+if(RNQJS_HERMES_COMPAT)
+  add_library(hermes SHARED
+    "${RNQJS_ROOT}/modules/hermes-compat/src/HermesCompat.cpp")
+
+  target_include_directories(hermes PUBLIC
+    "${RNQJS_ROOT}/modules/hermes-compat/include")
+  target_include_directories(hermes PRIVATE
+    "${RNQJS_ROOT}/src/bytecode"
+    "${RNQJS_ROOT}/src/module"
+    "${RNQJS_ROOT}/src/runtime")
+
+  # Unconditional, matching the podspec: RNWorklets defines this for every
+  # Debug build, so enableDebugging must exist whatever this library was
+  # compiled with. Safe only because no member declaration in the shim's
+  # headers is conditional on it.
+  target_compile_definitions(hermes PRIVATE HERMES_ENABLE_DEBUGGER=1)
+
+  target_link_libraries(hermes
+    quickjsinstancejni
+    ReactAndroid::jsi
+    android
+    log
+  )
+
+  set_target_properties(hermes PROPERTIES
+    OUTPUT_NAME hermesvm
+    POSITION_INDEPENDENT_CODE ON
+  )
+endif()
