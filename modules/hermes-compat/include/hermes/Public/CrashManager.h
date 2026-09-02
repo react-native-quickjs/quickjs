@@ -20,7 +20,13 @@ class CrashManager {
   using CallbackKey = int;
   using CallbackFunc = void (*)(int fd);
 
-  virtual ~CrashManager() = default;
+  /// Out of line, and so this class's key function: it is what places the
+  /// vtable in this library. react-native-worklets references the base class
+  /// vtable directly, not only NopCrashManager's, and with every virtual
+  /// defined inline no translation unit here emits it -- the shim then loads
+  /// on its own but fails dlopen the moment worklets links against it.
+  virtual ~CrashManager();
+
   virtual void registerMemory(void *, size_t) {}
   virtual void unregisterMemory(void *) {}
   virtual void setCustomData(const char *, const char *) {}
@@ -31,9 +37,8 @@ class CrashManager {
   virtual void unregisterCallback(CallbackKey) {}
 };
 
-/// react-native-worklets constructs one of these, so the class needs a vtable
-/// in this library. The destructor is deliberately out of line: it is the key
-/// function, and that is what decides where the vtable is emitted.
+/// react-native-worklets constructs one of these, so this class needs its own
+/// vtable here too, by the same rule.
 class NopCrashManager : public CrashManager {
  public:
   ~NopCrashManager() override;
