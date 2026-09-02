@@ -160,6 +160,46 @@ const withExpoAndroidEngine = (config) =>
     },
   ]);
 
+// ExpoModulesCore.podspec offers two engines and no way to opt out of both:
+// Hermes on depends on hermes-engine, off depends on React-jsc. So an app
+// running a third engine still ships a Hermes it never executes -- and cannot
+// escape it without pulling in JavaScriptCore instead.
+//
+// Only the dependency is dropped. Everything else the Hermes branch does stays,
+// including -DUSE_HERMES and the jsinspector dependency: ExpoModulesCore has no
+// Hermes symbols of its own, and the one thing that did need Hermes --
+// ExpoModulesJSI's makeHermesRuntime -- is what modules/hermes-compat defines.
+//
+// This edits node_modules, so a reinstall undoes it. Prebuild again after one.
+const EXPO_PODSPEC = 'expo-modules-core/ExpoModulesCore.podspec';
+const EXPO_HERMES_DEPENDENCY = "    s.dependency 'hermes-engine'\n";
+const EXPO_HERMES_REPLACEMENT =
+  '    # react-native-quickjs: the hermes compatibility shim stands in for it\n';
+
+const withExpoIosEngine = (config) =>
+  withDangerousMod(config, [
+    'ios',
+    (cfg) => {
+      const file = path.join(cfg.modRequest.projectRoot, 'node_modules', EXPO_PODSPEC);
+      if (!fs.existsSync(file)) return cfg;
+
+      const source = fs.readFileSync(file, 'utf8');
+      if (source.includes(EXPO_HERMES_REPLACEMENT)) return cfg;
+
+      if (!source.includes(EXPO_HERMES_DEPENDENCY)) {
+        console.warn(
+          '[@react-native-quickjs/quickjs] this version of Expo declares its engine ' +
+            'dependency differently than the plugin expects, so the app will also ' +
+            'ship Hermes. It will still run on QuickJS.'
+        );
+        return cfg;
+      }
+
+      fs.writeFileSync(file, source.replace(EXPO_HERMES_DEPENDENCY, EXPO_HERMES_REPLACEMENT));
+      return cfg;
+    },
+  ]);
+
 module.exports = function withQuickJS(config) {
   return [
     withHermesOff,
@@ -168,5 +208,6 @@ module.exports = function withQuickJS(config) {
     withIosFactory,
     withPodfile,
     withExpoAndroidEngine,
+    withExpoIosEngine,
   ].reduce((c, mod) => mod(c), config);
 };
