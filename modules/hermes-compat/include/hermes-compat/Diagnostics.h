@@ -29,4 +29,7 @@ void setHandler(Handler handler);
 /// once. Called by the shim; `api` is always a literal.
 void report(Severity severity, const char *api, const char *detail);
 
+/// Forgets which APIs have reported, so the next call to each reports again.
+void resetForTesting();
+
 }  // namespace qjs::hermescompat

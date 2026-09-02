@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -78,6 +79,12 @@ void report(Severity severity, const char *api, const char *detail) {
 #endif
 }
 
+void resetForTesting() {
+  std::lock_guard<std::mutex> lock(gMutex);
+  gSeen.clear();
+  gHandler = nullptr;
+}
+
 }  // namespace qjs::hermescompat
 
 // -------------------------------------------------------------------- runtime
@@ -94,13 +101,13 @@ using diag::Severity;
 constexpr uint64_t kHermesMagic = 0x1F1903C103BC1FC6ULL;
 
 void degraded(const char *api, const char *why) {
-  degraded(api, why);
+  diag::report(Severity::Degraded, api, why);
 }
 void ignored(const char *api, const char *why) {
-  ignored(api, why);
+  diag::report(Severity::Ignored, api, why);
 }
 void unsupported(const char *api, const char *why) {
-  unsupported(api, why);
+  diag::report(Severity::Unsupported, api, why);
 }
 
 bool looksLikeHermesBytecode(const uint8_t *data, size_t len) {
@@ -173,16 +180,16 @@ class RootAPI final : public IHermesRootAPI, public ISetFatalHandler {
   }
 
   void enableSamplingProfiler(double) override {
-    noProfiler();
+    noProfiler("enableSamplingProfiler");
   }
   void disableSamplingProfiler() override {
-    noProfiler();
+    noProfiler("disableSamplingProfiler");
   }
   void dumpSampledTraceToFile(const std::string &) override {
-    noProfiler();
+    noProfiler("dumpSampledTraceToFile");
   }
   void dumpSampledTraceToStream(std::ostream &) override {
-    noProfiler();
+    noProfiler("dumpSampledTraceToStream");
   }
 
   std::unordered_map<std::string, std::vector<std::string>>
@@ -196,21 +203,18 @@ class RootAPI final : public IHermesRootAPI, public ISetFatalHandler {
     return false;
   }
   void enableCodeCoverageProfiler() override {
-    noCoverage();
+    noCoverage("enableCodeCoverageProfiler");
   }
   void disableCodeCoverageProfiler() override {
-    noCoverage();
+    noCoverage("disableCodeCoverageProfiler");
   }
 
  private:
-  static void noProfiler() {
-    unsupported(
-        "IHermesRootAPI sampling profiler", "QuickJS has no sampling profiler");
+  static void noProfiler(const char *api) {
+    unsupported(api, "QuickJS has no sampling profiler");
   }
-  static void noCoverage() {
-    unsupported(
-        "IHermesRootAPI code coverage profiler",
-        "QuickJS has no code coverage profiler");
+  static void noCoverage(const char *api) {
+    unsupported(api, "QuickJS has no code coverage profiler");
   }
 };
 
@@ -244,17 +248,19 @@ class CompatRuntime final
   }
 
   void sampledTraceToStreamInDevToolsFormat(std::ostream &) override {
-    noProfiler();
+    noProfiler("sampledTraceToStreamInDevToolsFormat");
   }
 
   sampling_profiler::Profile dumpSampledTraceToProfile() override {
-    noProfiler();
+    noProfiler("dumpSampledTraceToProfile");
     return {};
   }
 
-  /// QuickJS reads the zone on every conversion and caches nothing, so there
-  /// is nothing engine-side to invalidate.
-  void resetTimezoneCache() override {}
+  /// QuickJS reads the zone on every conversion and keeps no cache of its
+  /// own, so the one that can go stale is libc's.
+  void resetTimezoneCache() override {
+    ::tzset();
+  }
 
   void loadSegment(
       std::unique_ptr<const jsi::Buffer>, const jsi::Value &) override {
@@ -322,10 +328,10 @@ class CompatRuntime final
   }
 
   void registerForProfiling() override {
-    noProfiler();
+    noProfiler("registerForProfiling");
   }
   void unregisterForProfiling() override {
-    noProfiler();
+    noProfiler("unregisterForProfiling");
   }
 
   void asyncTriggerTimeout() override {
@@ -333,7 +339,12 @@ class CompatRuntime final
   }
 
   void watchTimeLimit(uint32_t timeoutInMs) override {
-    if (quickjs_ == nullptr) return;
+    if (quickjs_ == nullptr) {
+      unsupported(
+          "IHermes::watchTimeLimit",
+          "the wrapped runtime is not a QuickJSRuntime; no limit is enforced");
+      return;
+    }
     deadline_.store(nowMs() + timeoutInMs, std::memory_order_relaxed);
     JS_SetInterruptHandler(
         quickjs_->runtime(), &CompatRuntime::onInterrupt, this);
@@ -382,9 +393,8 @@ class CompatRuntime final
         JS_VALUE_GET_PTR(qjs::QuickJSRuntime::toJSValue(pointer)));
   }
 
-  static void noProfiler() {
-    unsupported(
-        "IHermes sampling profiler", "QuickJS has no sampling profiler");
+  static void noProfiler(const char *api) {
+    unsupported(api, "QuickJS has no sampling profiler");
   }
 
   static uint64_t nowMs() {
@@ -407,8 +417,65 @@ class CompatRuntime final
   std::atomic<bool> interrupt_{false};
 };
 
+/// A config field set away from its Hermes default is a request this engine
+/// cannot carry out. Silently running with the opposite of what was asked is
+/// the failure this shim exists to prevent, so each one is named: unsupported
+/// where it changes what JavaScript may do, ignored where nothing observable
+/// depends on it.
+void reportUnhonoured(const ::hermes::vm::RuntimeConfig &config) {
+  using Config = ::hermes::vm::RuntimeConfig;
+#define QJS_IF_SET(FIELD) \
+  if (config.get##FIELD() != Config::getDefault##FIELD())
+
+  QJS_IF_SET(EnableEval)
+  unsupported("RuntimeConfig::EnableEval", "eval and Function stay enabled");
+  QJS_IF_SET(ES6Promise)
+  unsupported(
+      "RuntimeConfig::ES6Promise", "Promise stays as the engine has it");
+  QJS_IF_SET(ES6Proxy)
+  unsupported("RuntimeConfig::ES6Proxy", "Proxy stays as the engine has it");
+  QJS_IF_SET(Intl)
+  unsupported("RuntimeConfig::Intl", "Intl stays as the engine has it");
+  QJS_IF_SET(EnableGenerator)
+  unsupported("RuntimeConfig::EnableGenerator", "generators stay enabled");
+  QJS_IF_SET(EnableHermesInternal)
+  unsupported(
+      "RuntimeConfig::EnableHermesInternal",
+      "HermesInternal is installed by the runtime, not by this");
+  QJS_IF_SET(MaxNumRegisters)
+  unsupported(
+      "RuntimeConfig::MaxNumRegisters", "the stack limit is the engine's own");
+  QJS_IF_SET(VMExperimentFlags)
+  unsupported("RuntimeConfig::VMExperimentFlags", "no Hermes VM to configure");
+
+  QJS_IF_SET(EnableJIT)
+  ignored("RuntimeConfig::EnableJIT", "QuickJS interprets; there is no JIT");
+  QJS_IF_SET(TraceEnabled)
+  ignored("RuntimeConfig::TraceEnabled", "no synth trace is recorded");
+  QJS_IF_SET(TrackIO)
+  ignored("RuntimeConfig::TrackIO", "no IO tracking");
+  QJS_IF_SET(EnableSampleProfiling)
+  ignored("RuntimeConfig::EnableSampleProfiling", "no sampling profiler");
+  QJS_IF_SET(EnableSampledStats)
+  ignored("RuntimeConfig::EnableSampledStats", "no sampled stats");
+  QJS_IF_SET(BytecodeWarmupPercent)
+  ignored("RuntimeConfig::BytecodeWarmupPercent", "an HBC warmup hint");
+  QJS_IF_SET(RandomizeMemoryLayout)
+  ignored("RuntimeConfig::RandomizeMemoryLayout", "layout is the allocator's");
+#undef QJS_IF_SET
+
+  const auto &gc = config.getGCConfig();
+  using GC = ::hermes::vm::GCConfig;
+  if (gc.getMinHeapSize() != GC::getDefaultMinHeapSize() ||
+      gc.getInitHeapSize() != GC::getDefaultInitHeapSize() ||
+      gc.getMaxHeapSize() != GC::getDefaultMaxHeapSize()) {
+    ignored("RuntimeConfig::GCConfig", "QuickJS sizes its own heap");
+  }
+}
+
 std::unique_ptr<HermesRuntime> RootAPI::makeHermesRuntime(
-    const ::hermes::vm::RuntimeConfig &) {
+    const ::hermes::vm::RuntimeConfig &config) {
+  reportUnhonoured(config);
   return std::make_unique<CompatRuntime>(qjs::makeQuickJSRuntime());
 }
 
