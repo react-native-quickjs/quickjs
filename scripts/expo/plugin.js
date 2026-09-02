@@ -160,22 +160,39 @@ const withExpoAndroidEngine = (config) =>
     },
   ]);
 
-// ExpoModulesCore.podspec offers two engines and no way to opt out of both:
-// Hermes on depends on hermes-engine, off depends on React-jsc. So an app
-// running a third engine still ships a Hermes it never executes -- and cannot
-// escape it without pulling in JavaScriptCore instead.
+// ExpoModulesCore.podspec picks its engine by reading ENV['USE_HERMES'] itself
+// rather than calling React Native's use_hermes(), and it knows only two
+// answers: Hermes, or React-jsc. use_quickjs! sets USE_HERMES=0 truthfully, so
+// without this patch Expo resolves that to JavaScriptCore -- an engine the app
+// never instantiates, whose JSI runtime it would still compile and link.
 //
-// Dropping it is safe because nothing in expo-modules-core's iOS sources
-// mentions Hermes at all -- the package's only makeHermesRuntime call is in its
-// Android JNI. Only the dependency goes; everything else the Hermes branch does
-// stays, including the jsinspector dependency, which the app needs either way,
-// and -DUSE_HERMES, which gates nothing in this pod.
+// Taught here as a third branch on USE_THIRD_PARTY_JSC, which is React Native's
+// own name for "this app brought its own engine", so Expo depends on neither.
+// jsinspector is still needed and comes from where the Hermes branch takes it.
 //
-// This edits node_modules, so a reinstall undoes it. Prebuild again after one.
+// Safe because nothing in expo-modules-core's iOS sources mentions Hermes --
+// the package's only makeHermesRuntime call is in its Android JNI -- so the
+// -DUSE_HERMES that this branch also drops gates nothing in this pod.
+//
+// This is the change proposed upstream; when it lands, this mod goes away.
+// It edits node_modules, so a reinstall undoes it. Prebuild again after one.
 const EXPO_PODSPEC = 'expo-modules-core/ExpoModulesCore.podspec';
-const EXPO_HERMES_DEPENDENCY = "    s.dependency 'hermes-engine'\n";
-const EXPO_HERMES_REPLACEMENT =
-  '    # react-native-quickjs: the hermes compatibility shim stands in for it\n';
+
+const EXPO_ENGINE_BRANCH = `  if use_hermes
+    s.dependency 'hermes-engine'
+    add_dependency(s, "React-jsinspector", :framework_name => 'jsinspector_modern')
+  else
+    s.dependency 'React-jsc'
+  end`;
+
+const EXPO_ENGINE_BRANCH_PATCHED = `  if ENV['USE_THIRD_PARTY_JSC'] == '1'
+    add_dependency(s, "React-jsinspector", :framework_name => 'jsinspector_modern')
+  elsif use_hermes
+    s.dependency 'hermes-engine'
+    add_dependency(s, "React-jsinspector", :framework_name => 'jsinspector_modern')
+  else
+    s.dependency 'React-jsc'
+  end`;
 
 const withExpoIosEngine = (config) =>
   withDangerousMod(config, [
@@ -185,18 +202,18 @@ const withExpoIosEngine = (config) =>
       if (!fs.existsSync(file)) return cfg;
 
       const source = fs.readFileSync(file, 'utf8');
-      if (source.includes(EXPO_HERMES_REPLACEMENT)) return cfg;
+      if (source.includes(EXPO_ENGINE_BRANCH_PATCHED)) return cfg;
 
-      if (!source.includes(EXPO_HERMES_DEPENDENCY)) {
+      if (!source.includes(EXPO_ENGINE_BRANCH)) {
         console.warn(
-          '[@react-native-quickjs/quickjs] this version of Expo declares its engine ' +
+          '[@react-native-quickjs/quickjs] this version of Expo picks its engine ' +
             'dependency differently than the plugin expects, so the app will also ' +
-            'ship Hermes. It will still run on QuickJS.'
+            'ship an engine it never runs. It will still run on QuickJS.'
         );
         return cfg;
       }
 
-      fs.writeFileSync(file, source.replace(EXPO_HERMES_DEPENDENCY, EXPO_HERMES_REPLACEMENT));
+      fs.writeFileSync(file, source.replace(EXPO_ENGINE_BRANCH, EXPO_ENGINE_BRANCH_PATCHED));
       return cfg;
     },
   ]);
