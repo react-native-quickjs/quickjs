@@ -17,6 +17,29 @@
 #     end
 #   end
 
+# react-native-worklets and react-native-reanimated declare
+# `s.dependency 'React-hermes'` unconditionally, and use_quickjs! never declares
+# that pod, so `pod install` cannot resolve it. Neither uses anything from it:
+# their only Hermes include is <hermes/hermes.h>, which the compatibility shim
+# provides.
+#
+# Dropped as each podspec is read, rather than by editing node_modules, so a
+# reinstall does not undo it. React Native's own podspecs are not affected: they
+# declare the same dependency behind `if use_hermes()`, which is already false.
+#
+# Only done when the shim is installed, so that without it a library asking for
+# the real Hermes still fails loudly rather than silently losing it.
+def react_native_quickjs_drop_react_hermes
+  return unless ENV["RNQJS_HERMES_COMPAT"] == "1"
+
+  dependency = Pod::Specification.instance_method(:dependency)
+  Pod::Specification.send(:define_method, :dependency) do |*args, &block|
+    next if args.first.to_s == "React-hermes"
+
+    dependency.bind(self).call(*args, &block)
+  end
+end
+
 # Removes Hermes. Must run before use_react_native!, which reads all of this as
 # the podspecs are evaluated.
 #
@@ -25,6 +48,8 @@
 def use_quickjs!
   # Turns off every `if use_hermes()` dependency on hermes-engine at once.
   ENV['USE_THIRD_PARTY_JSC'] = '1'
+
+  react_native_quickjs_drop_react_hermes
 
   # On the prebuilt path hermesvm.framework carries the JSI implementation, and
   # React-jsi.podspec drops its own jsi.cpp whenever Hermes is on. Removing
@@ -121,6 +146,18 @@ def react_native_quickjs_post_install(installer)
   react_native_quickjs_append_all(
     installer, "GCC_PREPROCESSOR_DEFINITIONS", "USE_THIRD_PARTY_JSC=1"
   )
+
+  # With the Hermes compatibility shim installed, every pod must be able to
+  # resolve <hermes/hermes.h> -- react-native-worklets decides which engine it
+  # is built for with __has_include on exactly that path. The headers cannot be
+  # published as public headers of this pod; see the HermesCompat subspec.
+  if ENV["RNQJS_HERMES_COMPAT"] == "1"
+    shim = File.expand_path("../modules/hermes-compat/include", __dir__)
+    react_native_quickjs_append_all(installer, "HEADER_SEARCH_PATHS", "\"#{shim}\"")
+    react_native_quickjs_append_all(
+      installer, "GCC_PREPROCESSOR_DEFINITIONS", "HERMES_ENABLE_DEBUGGER=1"
+    )
+  end
 
   # createJSRuntimeFactory has an empty body under USE_THIRD_PARTY_JSC=1, which
   # -Werror,-Wreturn-type rejects. Reachable only in an app that does not
