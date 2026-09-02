@@ -1,0 +1,6 @@
+{
+  "_comment": "What the engine scores on test262 today. CI compares against this and fails if the failure count goes up. Update it in the same commit as whatever changed the score, and say why in the message.",
+  "errors": 74,
+  "total": 80896,
+  "config": "test262.conf + test262-fast.conf, -m -a"
+}
