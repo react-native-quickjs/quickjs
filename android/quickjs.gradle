@@ -1,0 +1,39 @@
+// Copyright (c) Ammar Ahmed.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+//
+// Applied from the app's android/app/build.gradle:
+//
+//   apply from: file("../../node_modules/@react-native-quickjs/quickjs/android/quickjs.gradle")
+//
+// React Native strips the JavaScript engine the app is not using. It knows two
+// engines, so "not Hermes" means "delete **/libhermesvm.so" -- and that is the
+// name the Hermes compatibility shim has to carry, because it is what
+// react-native-worklets records as NEEDED. See useThirdPartyJSC in
+// NdkConfiguratorUtils.kt.
+//
+// Turning that cleanup off would also stop JavaScriptCore and the Hermes
+// tooling library being stripped, so it is replaced here rather than dropped:
+// the same removals, minus the one file this engine needs.
+
+react {
+  enableSoCleanup = false
+}
+
+androidComponents {
+  onVariants(selector().all()) { variant ->
+    variant.packaging.jniLibs.excludes.addAll([
+      "**/libjsc.so",
+      "**/libjsctooling.so",
+      "**/libhermestooling.so",
+    ])
+  }
+}
+
+// A transitively pulled Hermes would put a second libhermesvm.so into the merge
+// and the winner would be whichever the merger saw first -- a real engine,
+// satisfying worklets and starting up silently. So it cannot enter the graph.
+configurations.configureEach {
+  exclude group: "com.facebook.hermes", module: "hermes-android"
+}

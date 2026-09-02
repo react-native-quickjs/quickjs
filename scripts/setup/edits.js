@@ -32,6 +32,8 @@ const KOTLIN_IMPORT = 'import com.reactnativequickjs.quickjs.QuickJSInstance';
 const SWIFT_IMPORT = 'import ReactNativeQuickJS';
 const PODFILE_REQUIRE = `require_relative '../node_modules/${PACKAGE}/scripts/react_native_quickjs_pods.rb'`;
 
+const GRADLE_APPLY = `apply from: file("../../node_modules/${PACKAGE}/android/quickjs.gradle")`;
+
 const SKIP_DIRECTORIES = new Set(['build', 'node_modules', 'Pods']);
 
 /** The first file called `fileName` anywhere under `directory`. */
@@ -114,7 +116,8 @@ const edits = [
     // neither, so the whole block goes.
     label: 'android/app/build.gradle',
     findFile: (project) => path.join(project, 'android', 'app', 'build.gradle'),
-    isApplied: (source) => !/hermes-android|implementation jscFlavor/.test(source),
+    isApplied: (source) =>
+      !/hermes-android|implementation jscFlavor/.test(source) && source.includes(GRADLE_APPLY),
 
     // `def jscFlavor` is left alone. It declares the coordinate; the dependency
     // this removes is what pulled libjsc.so into the app, and leaving the
@@ -124,14 +127,31 @@ const edits = [
         /[ \t]*if \([ \t]*hermesEnabled\.toBoolean\(\)[ \t]*\) \{[\s\S]*?\n[ \t]*\}[ \t]*\n/,
         ''
       );
-      return withoutEngines === source ? null : withoutEngines;
+      // The block being absent is fine on its own -- a rerun, or an app that
+      // never had it. Absent while the dependencies are still declared means
+      // the file has been rewritten into a shape this does not recognise.
+      if (withoutEngines === source && /hermes-android|implementation jscFlavor/.test(source)) {
+        return null;
+      }
+
+      // Appended, not inserted: quickjs.gradle configures the `react` extension
+      // and the app's variants, so it has to run after the plugins that create
+      // them, and the end of the file is the only place guaranteed to be after
+      // all of them.
+      return withoutEngines.includes(GRADLE_APPLY)
+        ? withoutEngines
+        : `${withoutEngines.replace(/\s*$/, '')}\n\n${GRADLE_APPLY}\n`;
     },
 
     removeQuickJS(source) {
       const reactAndroid = /([ \t]*)implementation\("com\.facebook\.react:react-android"\)\n/;
       if (!reactAndroid.test(source)) return null;
 
-      return source.replace(
+      // The apply line is the last line of the file, so removing it leaves the
+      // blank line that separated it behind.
+      const withoutApply = withLineRemoved(source, GRADLE_APPLY).replace(/\n+$/, '\n');
+
+      return withoutApply.replace(
         reactAndroid,
         (line, indent) =>
           `${line}\n${indent}if (hermesEnabled.toBoolean()) {\n` +
@@ -144,7 +164,9 @@ const edits = [
 
     manualSteps: [
       'In android/app/build.gradle, delete the dependencies block that picks',
-      'between com.facebook.react:hermes-android and jscFlavor.',
+      'between com.facebook.react:hermes-android and jscFlavor, and add this',
+      'as the last line of the file:',
+      `  ${GRADLE_APPLY}`,
     ],
   },
 

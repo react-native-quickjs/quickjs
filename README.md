@@ -111,7 +111,19 @@ hermesEnabled=false
 `libjsc.so` is about 10 MB per architecture. The build warns if either
 dependency is still declared.
 
-**3. `MainApplication.kt`**
+**3. `android/app/build.gradle`** — apply the Gradle script, as the last line:
+
+```groovy
+apply from: file("../../node_modules/@react-native-quickjs/quickjs/android/quickjs.gradle")
+```
+
+React Native strips the engine the app is not using, and with only two engines
+to choose from it reads "not Hermes" as "delete `libhermesvm.so`" — the name the
+Hermes compatibility shim has to carry for `react-native-worklets` to find it.
+This script does the same removals, minus that one file, and fails the build if
+a real Hermes ever reaches packaging.
+
+**4. `MainApplication.kt`**
 
 ```kotlin
 import com.reactnativequickjs.quickjs.QuickJSInstance
