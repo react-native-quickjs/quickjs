@@ -43,8 +43,10 @@ end
 # Removes Hermes. Must run before use_react_native!, which reads all of this as
 # the podspecs are evaluated.
 #
-# ENV['USE_HERMES'] is deliberately not set: on 0.85 it aborts pod install
-# (error_if_try_to_use_jsc_from_core) and use_hermes() never reads it anyway.
+# ENV['USE_HERMES'] is deliberately not set. React Native's own use_hermes() is
+# `!use_third_party_jsc()` and never reads it, so setting it would change
+# nothing here -- while any podspec that does read it directly, as Expo's does,
+# reads USE_HERMES=0 as "use JavaScriptCore" rather than "use neither".
 def use_quickjs!
   # Turns off every `if use_hermes()` dependency on hermes-engine at once.
   ENV['USE_THIRD_PARTY_JSC'] = '1'

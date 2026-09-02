@@ -165,10 +165,11 @@ const withExpoAndroidEngine = (config) =>
 // running a third engine still ships a Hermes it never executes -- and cannot
 // escape it without pulling in JavaScriptCore instead.
 //
-// Only the dependency is dropped. Everything else the Hermes branch does stays,
-// including -DUSE_HERMES and the jsinspector dependency: ExpoModulesCore has no
-// Hermes symbols of its own, and the one thing that did need Hermes --
-// ExpoModulesJSI's makeHermesRuntime -- is what modules/hermes-compat defines.
+// Dropping it is safe because nothing in expo-modules-core's iOS sources
+// mentions Hermes at all -- the package's only makeHermesRuntime call is in its
+// Android JNI. Only the dependency goes; everything else the Hermes branch does
+// stays, including the jsinspector dependency, which the app needs either way,
+// and -DUSE_HERMES, which gates nothing in this pod.
 //
 // This edits node_modules, so a reinstall undoes it. Prebuild again after one.
 const EXPO_PODSPEC = 'expo-modules-core/ExpoModulesCore.podspec';
