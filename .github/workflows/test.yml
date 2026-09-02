@@ -45,11 +45,35 @@ jobs:
       - name: Test
         run: ctest --test-dir build --timeout 300 -j4 --output-on-failure --output-junit results.xml
 
+      # A separate optimized build, because the benchmark refuses to report
+      # from an unoptimized engine -- it measures a property read at 45 ns that
+      # really costs 5. Only the benchmark target is built.
+      - name: Benchmark
+        if: always()
+        run: |
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release --target quickjs_jsi_bench -j"$(nproc)"
+          ./build-release/tests/quickjs_jsi_bench | tee bench.txt
+
       # Runs even when the tests failed -- that is when the report is worth
       # reading. It exits non-zero on a failure, so the job still fails.
       - name: Report
         if: always()
-        run: node scripts/ci-report.js build/results.xml report-host.md
+        run: |
+          status=0
+          node scripts/ci-report.js build/results.xml report-host.md || status=$?
+          if [ -f bench.txt ]; then
+            {
+              printf '\n<details><summary>jsi bench</summary>\n\n```\n'
+              cat bench.txt
+              printf '```\n\n</details>\n'
+            } >> report-host.md
+          fi
+          exit $status
+
+      - name: Publish to the run summary
+        if: always()
+        run: cat report-host.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -102,22 +126,98 @@ jobs:
           # runs there rather than on macOS, where it does not exist.
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1
-        run: ctest --test-dir build --timeout 300 -j2 --output-on-failure -E '${{ matrix.skip }}' --output-junit results.xml
+        run: |
+          set -o pipefail
+          ctest --test-dir build --timeout 300 -j2 --output-on-failure \
+            -E '${{ matrix.skip }}' --output-junit results.xml | tee ctest.log
 
+      # A sanitizer says exactly what it found and where. Reporting only that
+      # a suite went red throws that away and sends whoever reads it back to
+      # the raw log, so the diagnostic itself goes in the report.
       - name: Report
         if: always()
         run: |
-          node scripts/ci-report.js build/results.xml report-${{ matrix.name }}.md
+          status=0
+          node scripts/ci-report.js build/results.xml report-${{ matrix.name }}.md || status=$?
           sed -i "s/^### Host test suites/### ${{ matrix.name }} (skipped: ${{ matrix.skip }})/" report-${{ matrix.name }}.md
+
+          if grep -qE 'ERROR: (Address|Leak)Sanitizer|WARNING: ThreadSanitizer|runtime error:' ctest.log; then
+            {
+              printf '\n<details open><summary><b>sanitizer findings</b></summary>\n\n```\n'
+              grep -E -A 40 'ERROR: (Address|Leak)Sanitizer|WARNING: ThreadSanitizer|runtime error:' ctest.log | head -300
+              printf '```\n\n</details>\n'
+            } >> report-${{ matrix.name }}.md
+          fi
+          exit $status
+
+      - name: Publish to the run summary
+        if: always()
+        run: cat report-${{ matrix.name }}.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: report-${{ matrix.name }}
-          path: report-${{ matrix.name }}.md
+          path: |
+            report-${{ matrix.name }}.md
+            ctest.log
+
+  # The engine's own conformance suite, run against the patched engine and
+  # compared with tests/test262/baseline.json. A raw number is not actionable;
+  # the delta against a recorded score is.
+  test262:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # quickjs-ng marks its test262 submodule `update = none`, so an ordinary
+      # recursive checkout skips it and it has to be asked for by name.
+      - name: Fetch test262
+        run: |
+          git -C engine/quickjs-ng config submodule.test262.update checkout
+          git -C engine/quickjs-ng submodule update --init --depth 1 test262
+
+      # quickjs-ng's own runner, built from the submodule because it needs
+      # quickjs-libc, which the shipped projection does not carry. The engine
+      # it links is the patched one, which is the point.
+      - name: Build the runner
+        run: |
+          cmake -S engine/quickjs-ng -B build-test262 -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-test262 --target run-test262 -j"$(nproc)"
+
+      - name: Run
+        working-directory: engine/quickjs-ng
+        run: |
+          touch test262_errors.txt
+          ../../build-test262/run-test262 -m -c test262.conf -c test262-fast.conf -a \
+            > ../../test262.txt 2>&1 || true
+          tail -3 ../../test262.txt
+
+      - name: Report
+        if: always()
+        run: node scripts/ci-test262.js test262.txt tests/test262/baseline.json report-test262.md
+
+      - name: Publish to the run summary
+        if: always()
+        run: cat report-test262.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-test262
+          path: |
+            report-test262.md
+            test262.txt
 
   report:
-    needs: [host, sanitizers]
+    needs: [host, sanitizers, test262]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -131,7 +231,7 @@ jobs:
       - name: Assemble
         run: |
           : > report.md
-          for name in host asan tsan; do
+          for name in host asan tsan test262; do
             if [ -f "report-$name.md" ]; then
               cat "report-$name.md" >> report.md
             else
@@ -139,6 +239,9 @@ jobs:
             fi
           done
           cat report.md
+
+      - name: Publish to the run summary
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
