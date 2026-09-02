@@ -58,6 +58,7 @@ class PinnedHermesValue;
   F(constexpr, bool, EnableHermesInternal, true)             \
   F(constexpr, bool, EnableHermesInternalTestMethods, false) \
   F(constexpr, bool, EnableGenerator, true)                  \
+  F(constexpr, bool, MicrotaskQueue, false)                  \
   F(constexpr, uint32_t, VMExperimentFlags, 0)
 
 _HERMES_CTORCONFIG_STRUCT(RuntimeConfig, RUNTIME_FIELDS, {});
