@@ -87,6 +87,11 @@ void resetForTesting() {
 
 }  // namespace qjs::hermescompat
 
+// Out of line so that this library, not its consumer, carries the vtable.
+namespace hermes::vm {
+NopCrashManager::~NopCrashManager() = default;
+}  // namespace hermes::vm
+
 // -------------------------------------------------------------------- runtime
 
 namespace facebook::hermes {
