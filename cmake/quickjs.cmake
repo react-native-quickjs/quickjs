@@ -88,9 +88,14 @@ set_target_properties(quickjs PROPERTIES
 )
 
 # Upstream builds cleanly, but not warning-free under React Native's flags.
-target_compile_options(quickjs PRIVATE
-  -Wno-unused-parameter
-  -Wno-unused-variable
-  -Wno-sign-compare
-  -Wno-implicit-fallthrough
-)
+# MSVC rejects these outright -- `cl` reads -Wn as the numeric warning level
+# and stops with D8021 -- and it is only reached by the bytecode compiler,
+# which is built for Windows too.
+if(NOT MSVC)
+  target_compile_options(quickjs PRIVATE
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-sign-compare
+    -Wno-implicit-fallthrough
+  )
+endif()
