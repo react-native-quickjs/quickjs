@@ -69,7 +69,8 @@ android {
 
         // Ships the Hermes compatibility shim as libhermesvm.so, so libraries
         // that link against Hermes -- react-native-worklets, and so
-        // react-native-reanimated -- run on QuickJS unmodified.
+        // react-native-reanimated -- run on QuickJS unmodified. Left unset,
+        // CMakeLists.txt builds it; -PrnqjsHermesCompat=false turns it off.
         if (project.hasProperty('rnqjsHermesCompat')) {
           def on = project.property('rnqjsHermesCompat').toString() != 'false'
           arguments "-DRNQJS_HERMES_COMPAT=${on ? 'ON' : 'OFF'}"
