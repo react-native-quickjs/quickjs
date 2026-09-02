@@ -29,6 +29,8 @@
     "modules/cdp/quickjs-cdp.h",
     "modules/cdp/quickjs-cdp.c",
     "modules/cdp/react",
+    "modules/hermes-compat/include",
+    "modules/hermes-compat/src",
     "scripts/postinstall.js",
     "scripts/react_native_quickjs_pods.rb",
     "*.podspec",

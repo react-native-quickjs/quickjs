@@ -87,6 +87,68 @@ Pod::Spec.new do |s|
   # quickjs builds warning-clean upstream, but not under React Native's flags.
   s.compiler_flags = "-Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare -Wno-implicit-fallthrough"
 
+  # The Hermes compatibility shim, opt-in.
+  #
+  # modules/hermes-compat publishes a source-compatible <hermes/hermes.h> whose
+  # makeHermesRuntime() returns a QuickJS-backed runtime, so react-native-worklets
+  # -- and so react-native-reanimated -- build and run unmodified.
+  #
+  # Opt-in because these headers land in $(PODS_ROOT)/Headers/Public/hermes/,
+  # which CocoaPods puts on every pod's header search path. From that moment any
+  # library feature-detecting with __has_include(<hermes/hermes.h>) believes this
+  # is a Hermes app. That is an app-wide behavioural change and should be a
+  # decision, not a side effect of installing a pod. Turn it on in the Podfile,
+  # before use_native_modules!:
+  #
+  #   ENV["RNQJS_HERMES_COMPAT"] = "1"
+  if ENV["RNQJS_HERMES_COMPAT"] == "1"
+    # The shim is source-compatible with Hermes, not ABI-compatible. With the
+    # hermes-engine pod also installed the target has two <hermes/hermes.h> on
+    # one search path and two definitions of makeHermesRuntime on one link line,
+    # and pod ordering decides which wins. use_hermes() is what decides whether
+    # that pod is there, so ask it rather than reading ENV["USE_HERMES"], which
+    # on React Native 0.85 aborts pod install and does not control this.
+    if defined?(use_hermes) && use_hermes()
+      raise <<~MSG
+        [ReactNativeQuickJS] RNQJS_HERMES_COMPAT=1 cannot be used while the
+        hermes-engine pod is installed. The shim replaces Hermes rather than
+        extending it: installing both puts two <hermes/hermes.h> on one header
+        search path and two definitions of facebook::hermes::makeHermesRuntime
+        on one link line.
+      MSG
+    end
+
+    s.subspec "HermesCompat" do |ss|
+      ss.source_files = [
+        "modules/hermes-compat/src/*.cpp",
+        "modules/hermes-compat/include/hermes/**/*.h",
+      ]
+
+      # header_dir and header_mappings_dir are what land these at
+      # Headers/Public/hermes/hermes.h and
+      # Headers/Public/hermes/inspector-modern/chrome/Registration.h -- the exact
+      # paths worklets includes. Without the mapping CocoaPods flattens the tree
+      # and the nested includes are not found.
+      ss.public_header_files = "modules/hermes-compat/include/hermes/**/*.h"
+      ss.header_dir = "hermes"
+      ss.header_mappings_dir = "modules/hermes-compat/include/hermes"
+
+      ss.pod_target_xcconfig = {
+        # Our own sources include <hermes/hermes.h> and
+        # <hermes-compat/Diagnostics.h> from the source tree, not the published
+        # copy. An embedder installing a diagnostics handler adds this too.
+        "HEADER_SEARCH_PATHS" =>
+          "$(inherited) \"$(PODS_TARGET_SRCROOT)/modules/hermes-compat/include\"",
+        # Unconditional, not tied to the configuration: RNWorklets.podspec sets
+        # HERMES_ENABLE_DEBUGGER=1 for every Debug build regardless of
+        # USE_HERMES, so a Debug worklets references enableDebugging and needs
+        # it defined. Safe only because no member declaration in the shim's
+        # headers is conditional on this macro.
+        "GCC_PREPROCESSOR_DEFINITIONS" => "$(inherited) HERMES_ENABLE_DEBUGGER=1",
+      }
+    end
+  end
+
   install_modules_dependencies(s)
 
   s.dependency "React-jsi"
