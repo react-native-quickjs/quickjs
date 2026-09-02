@@ -53,3 +53,4 @@ add_subdirectory(tests)
 # Added after tests/ on purpose: tests/CMakeLists.txt is where googletest is
 # fetched, and modules/cdp registers its own test against GTest::gtest.
 add_subdirectory(modules/cdp)
+add_subdirectory(modules/hermes-compat)
