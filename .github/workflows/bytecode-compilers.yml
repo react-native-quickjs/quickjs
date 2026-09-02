@@ -125,58 +125,11 @@ jobs:
           "
           cat bin/qjsc/manifest.json
 
-      # A pull request rather than a push to main: these are binaries, and one
-      # that lands unreviewed is one nobody ever looks at.
-      #
-      # A pull request opened with GITHUB_TOKEN does not start other workflows,
-      # so the test suite will not run on it by itself. Pushing an empty commit
-      # to the branch, or closing and reopening it, gets a run.
-      - name: Open a pull request
+      - name: Write the pull request body
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.check.outputs.version }}
           SOURCE_SHA: ${{ github.sha }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          branch="bytecode-compilers/bc-$VERSION"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout -b "$branch"
-
-          git add bin/qjsc
-          if git diff --cached --quiet; then
-            echo 'the committed compilers already match; nothing to open'
-            exit 0
-          fi
-
-          git commit -m "build: rebuild the bytecode compilers for BC_VERSION $VERSION"
-          git push --force -u origin "$branch"
-
-          if gh pr view "$branch" >/dev/null 2>&1; then
-            echo 'a pull request for this branch is already open'
-            exit 0
-          fi
-
-          # Opening the pull request needs "Allow GitHub Actions to create and
-          # approve pull requests", which is off by default for organisations.
-          # The branch is pushed either way, so a refusal reports the link to
-          # open it by hand rather than failing the run and leaving the
-          # binaries looking as though they were never built.
-          open_by_hand() {
-            {
-              echo "### bytecode compilers for BC_VERSION $VERSION"
-              echo
-              echo "Built and pushed to \`$branch\`, but the pull request could not"
-              echo "be opened from here:"
-              echo
-              echo '```'
-              cat pr-error.txt
-              echo '```'
-              echo
-              echo "Open it: $REPO_URL/compare/main...$branch?expand=1"
-            } >> "$GITHUB_STEP_SUMMARY"
-          }
-
           platforms=$(cd bin/qjsc && ls -1d */ | sed 's|/$||' | sed 's|^|- |')
           printf '%s\n\n%s\n\n%s\n\n%s\n' \
             "The engine's BC_VERSION is now $VERSION, which the committed compilers were not built for." \
@@ -184,9 +137,21 @@ jobs:
             "$platforms" \
             "Built from $SOURCE_SHA by .github/workflows/bytecode-compilers.yml." > body.md
 
-          if ! gh pr create --base main --head "$branch" \
-              --title "Rebuild the bytecode compilers for BC_VERSION $VERSION" \
-              --body-file body.md 2>pr-error.txt; then
-            cat pr-error.txt
-            open_by_hand
-          fi
+      # A pull request rather than a push to main: these are binaries, and one
+      # that lands unreviewed is one nobody ever looks at.
+      #
+      # GH_TOKEN_QJS rather than GITHUB_TOKEN, for two reasons. Actions may not
+      # open pull requests unless a repository setting allows it, and a pull
+      # request opened with GITHUB_TOKEN does not start other workflows -- the
+      # test suite would never run on the binaries this proposes.
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GH_TOKEN_QJS }}
+          base: main
+          branch: bytecode-compilers/bc-${{ needs.check.outputs.version }}
+          add-paths: bin/qjsc
+          commit-message: "build: rebuild the bytecode compilers for BC_VERSION ${{ needs.check.outputs.version }}"
+          title: "Rebuild the bytecode compilers for BC_VERSION ${{ needs.check.outputs.version }}"
+          body-path: body.md
+          committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
