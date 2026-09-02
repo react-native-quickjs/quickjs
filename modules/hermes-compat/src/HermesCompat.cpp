@@ -87,8 +87,11 @@ void resetForTesting() {
 
 }  // namespace qjs::hermescompat
 
-// Out of line so that this library, not its consumer, carries the vtable.
+// Out of line so that this library, not its consumer, carries the vtables.
+// Both classes need one: worklets references hermes::vm::CrashManager's vtable
+// as well as NopCrashManager's.
 namespace hermes::vm {
+CrashManager::~CrashManager() = default;
 NopCrashManager::~NopCrashManager() = default;
 }  // namespace hermes::vm
 
