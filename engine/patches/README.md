@@ -19,6 +19,16 @@ what we changed and why without opening a single `.patch` file.
 | `0006` | Lets us attach native data to a JavaScript object where script cannot see or overwrite it | The engine's embedder slot only exists on objects the embedder created, and this data attaches to any object. The alternative, a WeakMap, enters JavaScript on every read and write: reads went 11.1ns to 4.4ns, writes 59.5ns to 8.6ns | `JS_NewPrivateSymbol` | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
+## Reading the patches
+
+`patch_viewer.html` renders every `.patch` in this directory side by side, with
+the header, the diff and syntax highlighting. Open it from a local server so it
+can list the directory, or drag the patch files onto it:
+
+```
+python3 -m http.server -d engine/patches
+```
+
 ## Writing a patch header
 
 Headers are for people. Keep them short -- usually twenty to forty lines --

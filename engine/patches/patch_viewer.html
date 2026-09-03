@@ -1,0 +1,219 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine patches</title>
+
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff; --fg: #1c1e21; --dim: #6b7280; --line: #e5e7eb;
+    --side: #f7f8fa; --add: #e6ffec; --del: #ffebe9; --hunk: #ddf4ff;
+    --kw: #cf222e; --str: #0a3069; --com: #6e7781; --num: #0550ae; --api: #8250df;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --dim: #8b949e; --line: #21262d;
+      --side: #010409; --add: #12261e; --del: #25191c; --hunk: #121d2f;
+      --kw: #ff7b72; --str: #a5d6ff; --com: #8b949e; --num: #79c0ff; --api: #d2a8ff;
+    }
+  }
+
+  * { box-sizing: border-box }
+  [hidden] { display: none !important }
+  body {
+    margin: 0; display: flex; height: 100vh;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+
+  nav {
+    width: 260px; flex: none; overflow-y: auto; padding: 20px 0;
+    background: var(--side); border-right: 1px solid var(--line);
+  }
+  nav h1 { margin: 0 0 14px 20px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim) }
+  nav a {
+    display: block; padding: 8px 20px; color: inherit; text-decoration: none;
+    border-left: 2px solid transparent;
+  }
+  nav a:hover { background: var(--bg) }
+  nav a[aria-current] { border-left-color: currentColor; background: var(--bg); font-weight: 600 }
+  nav a b { display: block; font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim) }
+
+  main { flex: 1; overflow-y: auto; padding: 40px 48px 120px }
+  .wrap { max-width: 1000px }
+
+  h2 { margin: 0 0 4px; font-size: 26px; line-height: 1.25 }
+  .file { margin: 0 0 32px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim) }
+  h3 { margin: 28px 0 8px; font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim) }
+  p { margin: 0 0 10px; max-width: 68ch }
+  .note { margin: 0 0 10px; padding: 10px 14px; border-left: 3px solid var(--line);
+          font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-x: auto }
+
+  details { margin-top: 20px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden }
+  summary { padding: 10px 14px; cursor: pointer; background: var(--side);
+            font: 12px ui-monospace, SFMono-Regular, Menlo, monospace }
+  pre { margin: 0; overflow-x: auto; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace }
+  pre div { padding: 0 14px; white-space: pre }
+  .a { background: var(--add) } .d { background: var(--del) }
+  .h { background: var(--hunk); color: var(--dim) } .m { color: var(--dim) }
+  .kw { color: var(--kw) } .str { color: var(--str) } .com { color: var(--com); font-style: italic }
+  .num { color: var(--num) } .api { color: var(--api) }
+
+  #empty { padding: 40px 48px; max-width: 62ch }
+  #empty .or { margin-top: 26px; color: var(--dim); font-size: 13px; line-height: 2 }
+  body.drop { outline: 3px dashed var(--dim); outline-offset: -12px }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--side); padding: 2px 5px; border-radius: 4px }
+</style>
+
+<nav hidden><h1>Engine patches</h1><div id="list"></div></nav>
+<main id="main"><div class="wrap" id="view"></div></main>
+
+<div id="empty" hidden>
+  <h2>Point this at the patches</h2>
+  <p>A page opened from <code>file://</code> may not read the files next to it.
+     Drop the <code>engine/patches</code> folder anywhere on this page, or choose it:</p>
+  <p><input type="file" id="pick" webkitdirectory multiple></p>
+  <p class="or">Serving the directory instead also works, and then it loads by itself:<br>
+     <code>python3 -m http.server -d engine/patches</code></p>
+</div>
+
+<script>
+const KEYWORDS = 'if|else|for|while|do|switch|case|default|break|continue|return|goto|sizeof|typedef|struct|union|enum|static|const|extern|inline|volatile|void|char|short|int|long|float|double|signed|unsigned|bool|true|false|NULL';
+
+// One pass with alternation: highlighting in several passes would re-match
+// inside the tags the earlier passes inserted.
+const TOKEN = new RegExp(
+  '(/\\*[\\s\\S]*?\\*/|//.*)' +          // comment
+  '|("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\')' + // string
+  '|(\\b(?:' + KEYWORDS + ')\\b)' +      // keyword
+  '|(\\b(?:JS_|js_)\\w+)' +              // engine api
+  '|(\\b\\d[\\w.]*)', 'g');              // number
+
+const CLASS = ['com', 'str', 'kw', 'api', 'num'];
+
+// Only &<> are escaped: quotes have to survive for the string rule above, and
+// nothing here is ever placed in an attribute.
+const escape = (s) => s.replace(/[&<>]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c]));
+
+const highlight = (code) =>
+  escape(code).replace(TOKEN, (m, ...g) => {
+    const i = g.findIndex((x, n) => n < 5 && x !== undefined);
+    return `<span class="${CLASS[i]}">${m}</span>`;
+  });
+
+// Everything before the first `diff --git` is the header a person wrote.
+function split(text) {
+  const at = text.search(/^diff --git /m);
+  return at < 0 ? [text, ''] : [text.slice(0, at), text.slice(at)];
+}
+
+// A block that lines names up in columns -- the signature lists under
+// "What it adds" -- keeps its spacing. Prose is unwrapped, because the source
+// is wrapped for a terminal and the browser wraps for itself.
+function renderHeader(header) {
+  const [subject, ...rest] = header.trimEnd().split('\n');
+  let html = `<h2>${escape(subject.replace(/^Subject:\s*/, ''))}</h2>`;
+
+  for (const block of rest.join('\n').split(/\n(?=\S)/)) {
+    const [heading, ...body] = block.split('\n');
+    if (!heading.trim()) continue;
+    html += `<h3>${escape(heading.trim())}</h3>`;
+
+    for (const para of body.join('\n').split(/\n\s*\n/)) {
+      if (!para.trim()) continue;
+      html += /\S {2,}\S/.test(para)
+        ? `<div class="note">${escape(para.replace(/^ {2}/gm, ''))}</div>`
+        : `<p>${escape(para.trim().replace(/\s*\n\s*/g, ' '))}</p>`;
+    }
+  }
+  return html;
+}
+
+function renderDiff(diff) {
+  if (!diff) return '';
+
+  return diff.split(/\n(?=diff --git )/).map((chunk) => {
+    const name = (chunk.match(/^diff --git a\/(\S+)/) || [, 'diff'])[1];
+    const stat = (chunk.match(/^[-+][^-+\n]/gm) || []).reduce(
+      (a, m) => (m[0] === '+' ? [a[0] + 1, a[1]] : [a[0], a[1] + 1]), [0, 0]);
+
+    const lines = chunk.split('\n').map((line) => {
+      if (/^@@/.test(line)) return `<div class="h">${escape(line)}</div>`;
+      if (/^(diff|index|---|\+\+\+|new file|deleted|similarity|rename)/.test(line))
+        return `<div class="m">${escape(line)}</div>`;
+      const kind = line[0] === '+' ? 'a' : line[0] === '-' ? 'd' : '';
+      return `<div class="${kind}">${escape(line[0] || ' ')}${highlight(line.slice(1))}</div>`;
+    }).join('');
+
+    return `<details open><summary>${escape(name)}
+      <span class="a">+${stat[0]}</span> <span class="d">-${stat[1]}</span></summary>
+      <pre>${lines}</pre></details>`;
+  }).join('');
+}
+
+const patches = [];
+
+function show(i) {
+  const patch = patches[i];
+  document.querySelectorAll('nav a').forEach((a, n) =>
+    n === i ? a.setAttribute('aria-current', 'true') : a.removeAttribute('aria-current'));
+
+  const [header, diff] = split(patch.text);
+  view.innerHTML = renderHeader(header) +
+    `<div class="file">${escape(patch.name)}</div>` + renderDiff(diff);
+  main.scrollTop = 0;
+  location.hash = patch.name;
+}
+
+function load(files) {
+  patches.length = 0;
+  patches.push(...files.sort((a, b) => a.name.localeCompare(b.name)));
+
+  list.innerHTML = patches.map((p, i) => {
+    const subject = (p.text.match(/^Subject:\s*(.*)/) || [, p.name])[1];
+    const number = p.name.split('-')[0];
+    return `<a href="#${p.name}" onclick="show(${i});return false"><b>${number}</b>${escape(subject)}</a>`;
+  }).join('');
+
+  document.querySelector('nav').hidden = false;
+  empty.hidden = true;
+  show(Math.max(0, patches.findIndex((p) => '#' + p.name === decodeURIComponent(location.hash))));
+}
+
+// Served over http, the directory index names every patch, so nothing here
+// has to be kept in step with what is on disk.
+(async () => {
+  try {
+    const index = await (await fetch('./')).text();
+    const names = [...new Set([...index.matchAll(/href="([^"]+\.patch)"/g)].map((m) => decodeURIComponent(m[1])))];
+    if (!names.length) throw new Error('no patches in the directory index');
+    load(await Promise.all(names.map(async (name) => ({name, text: await (await fetch(name)).text()}))));
+  } catch (error) {
+    if (patches.length) throw error;
+    empty.hidden = false;
+  }
+})();
+
+const read = async (files) => load(await Promise.all(
+  [...files].filter((f) => f.name.endsWith('.patch'))
+            .map(async (f) => ({name: f.name, text: await f.text()}))));
+
+pick.onchange = (e) => read(e.target.files);
+
+// Dropping the folder is the one gesture that works from file://, where a page
+// is not allowed to read the files sitting next to it.
+document.ondragover = (e) => { e.preventDefault(); document.body.classList.add('drop'); };
+document.ondragleave = () => document.body.classList.remove('drop');
+document.ondrop = async (e) => {
+  e.preventDefault();
+  document.body.classList.remove('drop');
+
+  const dropped = [...e.dataTransfer.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  const dir = dropped.find((entry) => entry.isDirectory);
+  if (!dir) return read(e.dataTransfer.files);
+
+  const inside = await new Promise((done) => dir.createReader().readEntries(done));
+  read(await Promise.all(inside.filter((entry) => entry.isFile && entry.name.endsWith('.patch'))
+                               .map((entry) => new Promise((file) => entry.file(file)))));
+};
+</script>
