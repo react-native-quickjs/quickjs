@@ -120,6 +120,21 @@
   filter: drop-shadow(0 22px 44px rgb(0 0 0 / 0.45));
 }
 
+/* Below the two-column breakpoint the mark sits above the sentence rather than
+   beside it, so it has to leave room for the text instead of filling the
+   column. At 280px it takes most of a phone screen on its own. */
+@media (max-width: 959px) {
+  .HeroLogo {
+    max-width: 200px;
+  }
+}
+
+@media (max-width: 479px) {
+  .HeroLogo {
+    max-width: 168px;
+  }
+}
+
 /* Each group animates its own wrapper — the polygons keep their attribute
    transforms, and a CSS transform on the same element would replace them. */
 .tile,

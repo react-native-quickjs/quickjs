@@ -79,6 +79,27 @@
   padding: 0;
 }
 
+/* The default hero expects an <img> that it positions absolutely in the middle
+   of a fixed 320px box, and it pulls the whole block up 76px to close the
+   empty space that leaves. This mark is an inline SVG in normal flow, so
+   nothing absorbs that pull: it drags the tile up under the nav bar and into
+   the eyebrow below it. Below the two-column breakpoint the box sizes to the
+   mark and the pull goes away. */
+@media (max-width: 959px) {
+  .VPHero .image {
+    margin: 0 0 2rem;
+  }
+
+  /* Sizing to the mark loses the theme's `margin: 0 auto`, and everything
+     below the mark is centred, so centre it here instead. */
+  .VPHero .image-container {
+    display: flex;
+    justify-content: center;
+    width: auto;
+    height: auto;
+  }
+}
+
 /* The nav mark is small enough that the 3-unit keyline around the bolt starts
    to close up; a touch more size keeps it legible next to the site title. */
 .VPNavBarTitle .logo {
