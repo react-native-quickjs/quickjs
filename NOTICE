@@ -1,0 +1,31 @@
+@react-native-quickjs/quickjs
+Copyright (c) 2026 React Native QuickJS
+
+This product includes software developed by third parties, listed below. The
+license for this project is in LICENSE.
+
+--------------------------------------------------------------------------------
+QuickJS-NG
+https://github.com/quickjs-ng/quickjs
+
+The JavaScript engine. Its sources are redistributed in this package under
+engine/quickjs-rel, pre-patched with the changes in engine/patches -- each of
+which is described in engine/patches/README.md.
+
+  Copyright (c) 2016-2026 Fabrice Bellard
+  Copyright (c) 2017-2025 Charlie Gordon
+  Copyright (c) 2023-2026 Ben Noordhuis
+  Copyright (c) 2023-2026 Saúl Ibarra Corretgé
+  Copyright (c) 2023 Marcin Kolny
+
+Licensed under the MIT License.
+
+--------------------------------------------------------------------------------
+React Native (JSI)
+
+This package compiles React Native's own copy of JSI rather than vendoring one,
+so no JSI source is redistributed here. JSI is part of React Native.
+
+  Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Licensed under the MIT License.
