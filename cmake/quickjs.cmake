@@ -88,10 +88,14 @@ endif()
 # in the log but "Maximum call stack size exceeded". Optimized the same frame is
 # a small fraction of that.
 #
-# So the engine is compiled optimized whatever the app is built as. It is a
-# dependency rather than the code an app author steps through, and -g is kept,
-# so a stack trace through it still resolves.
-if(NOT MSVC)
+# So an app build compiles the engine optimized whatever the app itself is
+# built as. It is a dependency rather than the code an app author steps
+# through, and -g is kept, so a stack trace through it still resolves.
+#
+# Host builds are left alone: they are this project's own tests, they run on a
+# far larger stack than a React Native JavaScript thread, and the third-party
+# JSI conformance suite measures stack-overflow behaviour that this changes.
+if(ANDROID AND NOT MSVC)
   target_compile_options(quickjs PRIVATE $<$<CONFIG:Debug>:-O2>)
 endif()
 
