@@ -1,5 +1,7 @@
 # @react-native-quickjs/text-encoding
 
+[![npm](https://img.shields.io/npm/v/@react-native-quickjs/text-encoding?color=cb3837)](https://www.npmjs.com/package/@react-native-quickjs/text-encoding)
+
 `TextEncoder` and `TextDecoder`, per [WHATWG Encoding][spec], as direct QuickJS bindings.
 
 Hermes provides both, so an app moving to QuickJS expects them. Without them a

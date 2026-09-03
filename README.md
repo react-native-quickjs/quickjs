@@ -15,6 +15,17 @@
   React Native, compiled from source in every app.
 </p>
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/@react-native-quickjs/quickjs"><img
+     alt="@react-native-quickjs/quickjs on npm"
+     src="https://img.shields.io/npm/v/@react-native-quickjs/quickjs/alpha?label=%40react-native-quickjs%2Fquickjs&color=cb3837"></a>
+  <a href="https://www.npmjs.com/package/@react-native-quickjs/text-encoding"><img
+     alt="@react-native-quickjs/text-encoding on npm"
+     src="https://img.shields.io/npm/v/@react-native-quickjs/text-encoding?label=%40react-native-quickjs%2Ftext-encoding&color=cb3837"></a>
+  <a href="LICENSE"><img alt="MIT licensed"
+     src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
 Provides a `jsi::Runtime` backed by quickjs-ng, and the `JSRuntimeFactory` glue
 React Native uses to select it. The engine is compiled from source as part of
 the app build. Neither Hermes nor JavaScriptCore is linked into the result.
