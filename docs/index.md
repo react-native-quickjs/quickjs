@@ -42,9 +42,8 @@ npx react-native-quickjs install
 
 </div>
 
-It is **alpha**: release bundles ship as plain JavaScript rather than bytecode,
-and on iOS removing Hermes means React Native core is compiled from source,
-which makes the first build slower.
+It is **alpha**. On iOS, removing Hermes means React Native core is compiled
+from source, which makes the first build slower.
 
 [Install](https://github.com/react-native-quickjs/quickjs#install) ·
 [Known limitations](https://github.com/react-native-quickjs/quickjs#known-limitations)

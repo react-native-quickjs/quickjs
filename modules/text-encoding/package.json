@@ -1,6 +1,6 @@
 {
   "name": "@react-native-quickjs/text-encoding",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Native TextEncoder and TextDecoder for react-native-quickjs",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -36,5 +36,13 @@
   "reactNativeQuickJSModule": {
     "install": "textEncoding_install",
     "header": "cpp/TextEncodingModule.h"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/react-native-quickjs/quickjs.git",
+    "directory": "modules/text-encoding"
   }
 }
