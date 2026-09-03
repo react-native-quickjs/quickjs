@@ -77,6 +77,19 @@ Pod::Spec.new do |s|
 
   s.pod_target_xcconfig = {
     "DEFINES_MODULE" => "YES",
+    # The interpreter recurses on the native stack: one JavaScript call is one
+    # JS_CallInternal frame. Unoptimized that frame is around 10 KB, so on
+    # React Native's JavaScript thread only about 80 JavaScript calls fit --
+    # too few for React to render, and a Debug app comes up blank or reports
+    # "Maximum call stack size exceeded" from whichever library recurses first.
+    #
+    # Debug only: Release already optimizes, and forcing a level there would
+    # override the -Os the rest of the pods are built with. This covers the
+    # whole pod rather than the engine alone, which CocoaPods gives no way to
+    # single out, so the JSI layer is optimized in a Debug app too -- this
+    # project's own debugging is done through the host CMake build, which is
+    # left unoptimized.
+    "GCC_OPTIMIZATION_LEVEL[config=Debug]" => "2",
     # Must be quickjs-rel and not quickjs-ng. Pointing this at the submodule
     # while compiling the -rel sources would take headers from one copy and
     # translation units from the other: fine while they agree, and a
