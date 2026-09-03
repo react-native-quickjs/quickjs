@@ -43038,17 +43038,23 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
     JSObject *p;
+    bool source_stripped;
     JSFunctionKindEnum func_kind = JS_FUNC_NORMAL;
 
     if (check_function(ctx, this_val))
         return JS_EXCEPTION;
 
     p = JS_VALUE_GET_OBJ(this_val);
+    source_stripped = false;
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         /* `b->source` must be pure ASCII or UTF-8 encoded */
         if (b->source)
             return JS_NewStringLen(ctx, b->source, b->source_len);
+        /* The embedded source was stripped at compile time (qjsc
+         * --strip-source); only the declaration survives, so say so instead
+         * of pretending this is a native C function. */
+        source_stripped = true;
     }
     {
         JSValue name;
@@ -43069,7 +43075,10 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
             pref = "async function *";
             break;
         }
-        suff = "() {\n    [native code]\n}";
+        if (source_stripped)
+            suff = "() {\n    [stripped source]\n}";
+        else
+            suff = "() {\n    [native code]\n}";
         name = JS_GetProperty(ctx, this_val, JS_ATOM_name);
         if (JS_IsUndefined(name))
             name = js_empty_string(ctx->rt);

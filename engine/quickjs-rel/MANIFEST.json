@@ -27,12 +27,16 @@
       "sha256": "cf4ba5df3779f81c1721abab677381de5174ed34323bcb5cee68f2f5cf572edd"
     },
     {
+      "name": "0007-stripped-source-tostring.patch",
+      "sha256": "5543d3f33108b3666ccc2317b65afc3ae132a8a12e223ed9f6defeaef2367b8b"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "1a89bc63c09a7411d3f5d8cacbccbb7c525ad37ec4f7f07ee130f5ade736d428"
     }
   ],
   "files": {
-    "quickjs.c": "e59a0172640094f35db7238cb9a0b4ed38152b7388142cdc9a4aa53447cfa80f",
+    "quickjs.c": "9016fa1b5e6682c0c45fef8d1b057aa44cfad95ff1eb50e3432ad520187a86e1",
     "libregexp.c": "27cd5fb4f4f0d8c05fea4cb0ddcd4dede7f39364e87f0f5610cfc25a89908158",
     "libunicode.c": "d88f53190ad772dd09b2beb93ffb8fc3097852f4987485aac8663a00189c43eb",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

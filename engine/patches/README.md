@@ -17,6 +17,7 @@ what we changed and why without opening a single `.patch` file.
 | `0004` | Lets the debugger ask where each stack frame is | Chrome DevTools shows a full call stack, not just the line that stopped | `JS_GetFrameInfoAtLevel` | No |
 | `0005` | Turns the debugger's per-statement callback on and off cheaply | A debugger must stay installed all session; idle, the callback cost 4,040ns per statement against 546ns with none | `JS_SetDebugTraceArmed` | No |
 | `0006` | Lets us attach native data to a JavaScript object where script cannot see or overwrite it | The engine's embedder slot only exists on objects the embedder created, and this data attaches to any object. The alternative, a WeakMap, enters JavaScript on every read and write: reads went 11.1ns to 4.4ns, writes 59.5ns to 8.6ns | `JS_NewPrivateSymbol` | No |
+| `0007` | Makes a stripped bytecode function stringify as `[stripped source]` rather than `[native code]` | Stripping the source text made every affected function indistinguishable from a C built-in, which is a lie that confuses debugging | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
