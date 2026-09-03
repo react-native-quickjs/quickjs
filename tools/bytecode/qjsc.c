@@ -131,6 +131,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  int status = 0;
   JSRuntime *rt = JS_NewRuntime();
   JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
   if (!ctx) {
@@ -156,7 +157,8 @@ int main(int argc, char **argv) {
       JS_FreeCString(ctx, message);
     }
     JS_FreeValue(ctx, exception);
-    return 1;
+    status = 1;
+    goto done;
   }
 
   int write_flags = JS_WRITE_OBJ_BYTECODE;
@@ -171,7 +173,8 @@ int main(int argc, char **argv) {
   JS_FreeValue(ctx, compiled);
   if (!payload) {
     fprintf(stderr, "JS_WriteObject failed for %s\n", in_path);
-    return 1;
+    status = 1;
+    goto done;
   }
 
   if (!keep_checksum) {
@@ -182,7 +185,8 @@ int main(int argc, char **argv) {
   if (!out) {
     fprintf(stderr, "cannot write %s\n", out_path);
     js_free(ctx, payload);
-    return 1;
+    status = 1;
+    goto done;
   }
 
   unsigned char header[NSBC_HEADER_SIZE];
@@ -202,7 +206,13 @@ int main(int argc, char **argv) {
 
   if (!ok) {
     fprintf(stderr, "write failed for %s\n", out_path);
-    return 1;
+    status = 1;
   }
-  return 0;
+
+done:
+  /* The runtime owns the atom table and the class list, so leaving it to
+   * process exit shows up as a leak under LeakSanitizer. */
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+  return status;
 }
