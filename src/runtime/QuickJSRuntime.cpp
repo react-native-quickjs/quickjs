@@ -873,8 +873,14 @@ void QuickJSRuntime::throwPendingError() {
     throw jsi::JSINativeException(what);
   }
 
+  // Described without running JavaScript, and handed to jsi::JSError as its
+  // what(). Left to itself jsi::JSError builds what() by reading .message and
+  // .stack through JavaScript -- which is the one thing a stack overflow has
+  // just made impossible. That read throws, and the error then reports that it
+  // could not be described instead of reporting that the stack ran out.
+  std::string description = describeExceptionWithoutRunningJS(exception);
   if (errorDepth_ == 0) {
-    firstErrorDescription_ = describeExceptionWithoutRunningJS(exception);
+    firstErrorDescription_ = description;
   }
 
   struct DepthGuard {
@@ -887,7 +893,13 @@ void QuickJSRuntime::throwPendingError() {
     }
   } guard(errorDepth_);
 
-  throw jsi::JSError(*this, createValue(exception));
+  // An empty or placeholder description is worse than what jsi::JSError
+  // manages on its own, so only override what() when there is something real
+  // to say.
+  if (description.empty() || description[0] == '<') {
+    throw jsi::JSError(*this, createValue(exception));
+  }
+  throw jsi::JSError(std::move(description), *this, createValue(exception));
 }
 
 JSValue QuickJSRuntime::checkException(JSValue value) {
