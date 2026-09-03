@@ -44,6 +44,7 @@
     "!**/.*"
   ],
   "workspaces": [
+    "modules/text-encoding",
     "example"
   ],
   "scripts": {
@@ -91,5 +92,8 @@
     "@expo/config-plugins": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "@react-native-quickjs/text-encoding": "0.1.0"
   }
 }

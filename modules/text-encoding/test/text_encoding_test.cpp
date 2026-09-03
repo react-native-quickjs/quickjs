@@ -13,13 +13,24 @@
 
 #include "QuickJSRuntimeFactory.h"
 
+// The symbol a generated module registry calls by name. Naming it here is also
+// what keeps the object file: a static library link is entitled to drop one
+// nothing references, which is the failure this entry point exists to prevent.
+extern "C" void textEncoding_install(facebook::jsi::Runtime &runtime);
+
 namespace {
 
 namespace jsi = facebook::jsi;
 
 class TextEncodingTest : public ::testing::Test {
  protected:
-  std::unique_ptr<jsi::Runtime> rt = qjs::makeQuickJSRuntime();
+  std::unique_ptr<jsi::Runtime> rt = makeRuntime();
+
+  static std::unique_ptr<jsi::Runtime> makeRuntime() {
+    auto runtime = qjs::makeQuickJSRuntime();
+    textEncoding_install(*runtime);
+    return runtime;
+  }
 
   jsi::Value eval(const char *source) {
     return rt->evaluateJavaScript(

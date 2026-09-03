@@ -1,0 +1,51 @@
+buildscript {
+  repositories { google(); mavenCentral() }
+  dependencies {
+    classpath("com.android.tools.build:gradle:8.7.2")
+    classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
+  }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+android {
+  namespace "com.text_encoding"
+  compileSdk 35
+
+  defaultConfig {
+    minSdk 24
+    externalNativeBuild {
+      cmake {
+        // Built from source, as C++20, against the QuickJS engine the app
+        // already compiles. Nothing here is ever shipped prebuilt.
+        cppFlags "-O2", "-frtti", "-fexceptions", "-std=c++20"
+        // 16 KB page size. Without this the .so links with 4 KB LOAD
+        // alignment and the loader SIGKILLs the process on an Android 15+
+        // device. NDK r27 leaves it OFF by default. See the long note in
+        // android/build.gradle and docs/on-device-execution.md.
+        arguments "-DANDROID_STL=c++_shared",
+                  "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
+  }
+
+  sourceSets {
+    main {
+      java.srcDirs = ["src/main/java"]
+      manifest.srcFile "src/main/AndroidManifest.xml"
+    }
+  }
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+  implementation "org.jetbrains.kotlin:kotlin-stdlib"
+}

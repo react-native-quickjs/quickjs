@@ -28,15 +28,13 @@ include(cmake/quickjs.cmake)
 include(cmake/jsi.cmake)
 
 add_library(quickjs_jsi STATIC
-  modules/text-encoding/TextEncoding.cpp
   src/bytecode/QuickJSBytecode.cpp
   src/module/QuickJSCompat.cpp
   src/module/QuickJSModule.cpp
   src/runtime/QuickJSRuntime.cpp
   src/runtime/QuickJSRuntimeFactory.cpp
 )
-target_include_directories(quickjs_jsi
-  PUBLIC src/bytecode src/module src/runtime modules/text-encoding)
+target_include_directories(quickjs_jsi PUBLIC src/bytecode src/module src/runtime)
 target_link_libraries(quickjs_jsi PUBLIC jsi quickjs)
 set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -56,4 +54,5 @@ add_subdirectory(tests)
 # fetched, and modules/cdp registers its own test against GTest::gtest.
 add_subdirectory(modules/cdp)
 add_subdirectory(modules/hermes-compat)
+set(REACT_NATIVE_QUICKJS_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "" FORCE)
 add_subdirectory(modules/text-encoding)
