@@ -250,10 +250,27 @@ bool utf8Decode(
 bool readBytes(
     JSContext *ctx, JSValueConst value, const uint8_t *&data, size_t &size) {
   size_t len = 0;
-  if (uint8_t *raw = JS_GetArrayBuffer(ctx, &len, value)) {
+
+  /*
+   * Asked which it is first, rather than trying one and catching the failure.
+   * JS_GetArrayBuffer on anything else throws, and building that TypeError --
+   * an object with a captured stack -- costs more than the whole decode for a
+   * short input. It also leaves the exception pending, to surface later
+   * against unrelated code.
+   */
+  if (JS_IsArrayBuffer(value)) {
+    uint8_t *raw = JS_GetArrayBuffer(ctx, &len, value);
+    if (raw == nullptr) {
+      JS_FreeValue(ctx, JS_GetException(ctx));
+      return false;
+    }
     data = raw;
     size = len;
     return true;
+  }
+
+  if (JS_GetTypedArrayType(value) < 0) {
+    return false;
   }
 
   size_t byteOffset = 0;
@@ -512,6 +529,27 @@ JSValue decoderDecode(
       bytes[2] == 0xBF) {
     bytes += 3;
     len -= 3;
+  }
+
+  /*
+   * Pure ASCII needs no decoding: the bytes are already the string, and
+   * JS_NewStringLen picks the narrowest representation the engine has.
+   *
+   * The UTF-16 path below cannot do that. JS_NewStringUTF16 calls
+   * js_alloc_string(ctx, len, 1) unconditionally, so it hands back a wide
+   * string even for text that is entirely ASCII -- twice the memory, and every
+   * later operation on that string works on the wide form. Worth a scan to
+   * avoid, since app strings and JSON are overwhelmingly this case.
+   */
+  bool ascii = true;
+  for (size_t i = 0; i < len; i++) {
+    if (bytes[i] >= 0x80) {
+      ascii = false;
+      break;
+    }
+  }
+  if (ascii) {
+    return JS_NewStringLen(ctx, reinterpret_cast<const char *>(bytes), len);
   }
 
   std::u16string out;
