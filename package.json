@@ -1,6 +1,6 @@
 {
   "name": "@react-native-quickjs/quickjs",
-  "version": "1.0.0",
+  "version": "1.0.0-alpha.0",
   "description": "QuickJS JSI runtime for React Native, built from source",
   "keywords": [
     "react-native",
@@ -65,7 +65,9 @@
     "postinstall": "node scripts/postinstall.js",
     "example": "npm run --workspace @react-native-quickjs/example",
     "docs:dev": "vitepress dev docs",
-    "docs:build": "vitepress build docs"
+    "docs:build": "vitepress build docs",
+    "release:module": "npm publish -w @react-native-quickjs/text-encoding",
+    "release:alpha": "npm publish --tag alpha"
   },
   "peerDependencies": {
     "react": "*",
