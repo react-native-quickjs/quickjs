@@ -36,14 +36,15 @@ factory it needs to use it.
 <div style="text-align: left; max-width: 460px; margin: 1.75rem auto;">
 
 ```sh
-npm install @react-native-quickjs/quickjs
+npm install @react-native-quickjs/quickjs@alpha
 npx react-native-quickjs install
 ```
 
 </div>
 
-It is **alpha**. On iOS, removing Hermes means React Native core is compiled
-from source, which makes the first build slower.
+It is **alpha**, published under the `alpha` tag — hence the `@alpha` above.
+On iOS, removing Hermes means React Native core is compiled from source, which
+makes the first build slower.
 
 [Install](https://github.com/react-native-quickjs/quickjs#install) ·
 [Known limitations](https://github.com/react-native-quickjs/quickjs#known-limitations)

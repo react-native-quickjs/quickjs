@@ -30,7 +30,7 @@ the app build. Neither Hermes nor JavaScriptCore is linked into the result.
 ## Install
 
 ```sh
-npm install @react-native-quickjs/quickjs
+npm install @react-native-quickjs/quickjs@alpha
 npx react-native-quickjs install
 cd ios && pod install
 ```
