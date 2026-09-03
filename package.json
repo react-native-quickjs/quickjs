@@ -97,6 +97,6 @@
     }
   },
   "dependencies": {
-    "@react-native-quickjs/text-encoding": "0.1.0"
+    "@react-native-quickjs/text-encoding": "1.0.0"
   }
 }
