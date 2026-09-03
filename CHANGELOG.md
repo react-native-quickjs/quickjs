@@ -29,8 +29,8 @@ Nothing has been published yet. This section becomes the first release entry.
 - React Native's non-Hermes path is patched at `pod install`. Each workaround
   fails with a named error if React Native changes.
 - Expo's `getDefaultReactHost` hardcodes Hermes, so the config plugin edits
-  `node_modules`. Until [expo#PENDING][expo-pr] lands, an `npm install` reverts
+  `node_modules`. Until [expo#49686][expo-pr] lands, an `npm install` reverts
   that edit and the app silently launches on Hermes.
 
 [ng]: https://github.com/quickjs-ng/quickjs
-[expo-pr]: https://github.com/expo/expo/pulls
+[expo-pr]: https://github.com/expo/expo/pull/49686
