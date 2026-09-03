@@ -379,10 +379,10 @@ TEST(Bytecode, StrippedBytecodeKeepsLineAndColumnInformation) {
 
 TEST(Bytecode, StrippedBytecodeDegradesFunctionToString) {
   // What stripping costs, pinned so the trade is explicit rather than
-  // discovered. The placeholder is spec-conformant NativeFunction syntax and
-  // matches what node prints for a built-in; note that the *kind* is not
-  // reflected -- an async function and a class both stringify as `function`,
-  // which is also what node does for its built-ins.
+  // discovered. The placeholder is spec-conformant NativeFunction syntax;
+  // note that the *kind* is not reflected -- an async function and a class
+  // both stringify as `function`, which is also what node does for its
+  // built-ins.
   const std::string source =
       "function named(a, b) { return a + b; }\n"
       "async function asyncFn() {}\n"
@@ -408,9 +408,9 @@ TEST(Bytecode, StrippedBytecodeDegradesFunctionToString) {
       "class Klass {}");
   EXPECT_EQ(
       runFor("--strip-source"),
-      "function named() {\n    [native code]\n}~"
-      "function asyncFn() {\n    [native code]\n}~"
-      "function Klass() {\n    [native code]\n}");
+      "function named() {\n    [stripped source]\n}~"
+      "function asyncFn() {\n    [stripped source]\n}~"
+      "function Klass() {\n    [stripped source]\n}");
 }
 
 TEST(Bytecode, SyntaxErrorInSourceThrows) {

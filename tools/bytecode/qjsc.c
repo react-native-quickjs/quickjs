@@ -24,8 +24,10 @@
  * `--strip-source` drops the embedded source text of every function: 3.30 MB
  * -> 1.16 MB on a 990 KB production Metro bundle, and the same saving in
  * resident memory. It costs Function.prototype.toString, which then reports
- * `[native code]`. Line and column numbers are written under a separate flag
- * and are unaffected, so error.stack is byte-identical either way.
+ * `[stripped source]` instead of the original source, and so stays
+ * distinguishable from a real native function. Line and column numbers are
+ * written under a separate flag and are unaffected, so error.stack is
+ * byte-identical either way.
  *
  * JS_WRITE_OBJ_STRIP_DEBUG is deliberately not exposed. It saves a further
  * 0.18 MB and destroys every line and column number in every stack trace,

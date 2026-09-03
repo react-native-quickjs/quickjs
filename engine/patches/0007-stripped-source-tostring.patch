@@ -1,0 +1,72 @@
+Subject: say a function was stripped, not native, when its source is gone
+
+What this does
+  When a function is loaded from bytecode whose embedded source text was
+  stripped at compile time (qjsc --strip-source), Function.prototype.toString
+  now reports `[stripped source]` instead of `[native code]`.
+
+Why we need it
+  Stripping the source text is a size win, but it cost a lie: every function
+  it touched stringified as `[native code]`, indistinguishable from a real C
+  built-in. That makes debugging confusing -- a function someone wants to read
+  looks like an engine primitive, and there is no way to tell the two apart.
+  The declaration survives stripping, so this preserves that truth: the
+  function is real, it is just source-less.
+
+What it adds
+  Nothing public. A bytecode function whose `b->source` is missing (rather
+  than a genuine C function, which has no function_bytecode at all) now
+  stringifies as:
+
+    function name() {
+        [stripped source]
+    }
+
+Needs a bytecode version bump
+  No. This is a toString change only; the bytecode format is untouched.
+
+Notes
+  A real native function never has a JSFunctionBytecode, so this only fires
+  on bytecode functions that lost their source. Both stringify as
+  `function`, matching what the engine already did and what node prints for
+  its built-ins.
+diff --git a/quickjs.c b/quickjs.c
+index 7ad7e9b..edef01a 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -43038,17 +43038,23 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+ {
+     JSObject *p;
++    bool source_stripped;
+     JSFunctionKindEnum func_kind = JS_FUNC_NORMAL;
+ 
+     if (check_function(ctx, this_val))
+         return JS_EXCEPTION;
+ 
+     p = JS_VALUE_GET_OBJ(this_val);
++    source_stripped = false;
+     if (js_class_has_bytecode(p->class_id)) {
+         JSFunctionBytecode *b = p->u.func.function_bytecode;
+         /* `b->source` must be pure ASCII or UTF-8 encoded */
+         if (b->source)
+             return JS_NewStringLen(ctx, b->source, b->source_len);
++        /* The embedded source was stripped at compile time (qjsc
++         * --strip-source); only the declaration survives, so say so instead
++         * of pretending this is a native C function. */
++        source_stripped = true;
+     }
+     {
+         JSValue name;
+@@ -43069,7 +43075,10 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
+             pref = "async function *";
+             break;
+         }
+-        suff = "() {\n    [native code]\n}";
++        if (source_stripped)
++            suff = "() {\n    [stripped source]\n}";
++        else
++            suff = "() {\n    [native code]\n}";
+         name = JS_GetProperty(ctx, this_val, JS_ATOM_name);
+         if (JS_IsUndefined(name))
+             name = js_empty_string(ctx->rt);
