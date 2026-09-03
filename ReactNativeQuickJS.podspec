@@ -38,6 +38,7 @@ Pod::Spec.new do |s|
     # <quickjs.h>; react/ needs jsinspector-modern and folly, which the
     # React-jsinspector dependency below provides.
     "modules/cdp/*.{h,c}",
+    "modules/text-encoding/*.{h,cpp}",
     "modules/cdp/react/*.{h,cpp}",
     "engine/quickjs-rel/*.h",
     # libregexp.c #includes libregexp-backtrack.c.inc twice, to build the 8-bit
@@ -68,6 +69,7 @@ Pod::Spec.new do |s|
       "\"$(PODS_TARGET_SRCROOT)/src/module\" " \
       "\"$(PODS_TARGET_SRCROOT)/src/runtime\" " \
       "\"$(PODS_TARGET_SRCROOT)/engine/quickjs-rel\" " \
+      "\"$(PODS_TARGET_SRCROOT)/modules/text-encoding\" " \
       "\"$(PODS_TARGET_SRCROOT)/modules/cdp\" " \
       "\"$(PODS_TARGET_SRCROOT)/modules/cdp/react\"",
     "GCC_C_LANGUAGE_STANDARD" => "gnu11",

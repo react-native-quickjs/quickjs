@@ -10,6 +10,7 @@
 #include "QuickJSCompat.h"
 #include "QuickJSModule.h"
 #include "QuickJSRuntime.h"
+#include "TextEncoding.h"
 
 namespace qjs {
 
@@ -25,6 +26,14 @@ std::unique_ptr<facebook::jsi::Runtime> makeQuickJSRuntime(
   if (reactNativeCompat) {
     installReactNativeCompat(*runtime);
   }
+
+  // Called directly rather than through the module registry: the registry
+  // relies on a static initializer, and a static library link is entitled to
+  // drop an object file nothing references -- which would leave TextEncoder
+  // missing with nothing to show for it. Hermes provides these, so an app
+  // moving here expects them.
+  textencoding::install(*runtime);
+
   installModules(*runtime);
 
   return runtime;

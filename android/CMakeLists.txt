@@ -29,6 +29,7 @@ include("${RNQJS_ROOT}/cmake/quickjs.cmake")
 # so a file added there builds on iOS and fails to link on Android -- an
 # asymmetry worth remembering when adding a source.
 add_library(quickjsinstancejni SHARED
+  "${RNQJS_ROOT}/modules/text-encoding/TextEncoding.cpp"
   "${RNQJS_ROOT}/src/bytecode/QuickJSBytecode.cpp"
   "${RNQJS_ROOT}/src/module/QuickJSCompat.cpp"
   "${RNQJS_ROOT}/src/module/QuickJSModule.cpp"
@@ -40,6 +41,7 @@ add_library(quickjsinstancejni SHARED
 )
 
 target_include_directories(quickjsinstancejni PRIVATE
+  "${RNQJS_ROOT}/modules/text-encoding"
   "${RNQJS_ROOT}/src/bytecode"
   "${RNQJS_ROOT}/src/module"
   "${RNQJS_ROOT}/src/runtime"
