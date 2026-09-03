@@ -69,12 +69,9 @@ android {
 
         // Ships the Hermes compatibility shim as libhermesvm.so, so libraries
         // that link against Hermes -- react-native-worklets, and so
-        // react-native-reanimated -- run on QuickJS unmodified. Left unset,
-        // CMakeLists.txt builds it; -PrnqjsHermesCompat=false turns it off.
-        if (project.hasProperty('rnqjsHermesCompat')) {
-          def on = project.property('rnqjsHermesCompat').toString() != 'false'
-          arguments "-DRNQJS_HERMES_COMPAT=${on ? 'ON' : 'OFF'}"
-        }
+        // react-native-reanimated -- run on QuickJS unmodified.
+        arguments "-DRNQJS_HERMES_COMPAT=${hermesCompatEnabled() ? 'ON' : 'OFF'}"
+
         abiFilters(*reactNativeArchitectures())
       }
     }
@@ -108,6 +105,25 @@ android {
     sourceCompatibility JavaVersion.VERSION_17
     targetCompatibility JavaVersion.VERSION_17
   }
+}
+
+// Whether to build the Hermes compatibility shim.
+//
+// Autolinking puts this library into every app that has the package installed,
+// including one still running Hermes and one part-way through switching over.
+// The shim is named libhermesvm.so, because that is the name the libraries
+// needing it look for, so building it in a Hermes app puts a second file of
+// that name into the merge -- and a ~100 KB shim winning over the real engine
+// leaves the app dead at startup with NoClassDefFoundError: HermesInstance.
+//
+// So it is built only once the app has actually left Hermes, which is what
+// hermesEnabled=false in gradle.properties says. -PrnqjsHermesCompat decides
+// it outright either way.
+def hermesCompatEnabled() {
+  if (project.hasProperty('rnqjsHermesCompat')) {
+    return project.property('rnqjsHermesCompat').toString() != 'false'
+  }
+  return rootProject.findProperty('hermesEnabled')?.toString() == 'false'
 }
 
 // Resolved through node so this works regardless of how the consuming app
