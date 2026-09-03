@@ -81,6 +81,20 @@ else()
   target_compile_definitions(quickjs PUBLIC JS_ENABLE_DEBUGGER=0)
 endif()
 
+# The interpreter recurses on the native stack: one JavaScript call is one
+# JS_CallInternal frame. Unoptimized that frame is around 10 KB, so on React
+# Native's roughly 1 MB JavaScript thread only about 80 JavaScript calls fit --
+# far too few for React to render, and a debug app comes up blank with nothing
+# in the log but "Maximum call stack size exceeded". Optimized the same frame is
+# a small fraction of that.
+#
+# So the engine is compiled optimized whatever the app is built as. It is a
+# dependency rather than the code an app author steps through, and -g is kept,
+# so a stack trace through it still resolves.
+if(NOT MSVC)
+  target_compile_options(quickjs PRIVATE $<$<CONFIG:Debug>:-O2>)
+endif()
+
 set_target_properties(quickjs PROPERTIES
   C_STANDARD 11
   C_STANDARD_REQUIRED ON
