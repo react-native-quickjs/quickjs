@@ -1,15 +1,12 @@
 /*
- * Copyright (c) Ammar Ahmed.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
+ * react-native-quickjs-text-encoding
  */
 
 #pragma once
 
 #include <jsi/jsi.h>
 
-namespace qjs::textencoding {
+namespace rnqjs::textencoding {
 
 /// Installs TextEncoder and TextDecoder as globals.
 ///
@@ -18,4 +15,6 @@ namespace qjs::textencoding {
 /// portable version would be worse than not installing at all.
 void install(facebook::jsi::Runtime &runtime);
 
-}  // namespace qjs::textencoding
+}  // namespace rnqjs::textencoding
+
+extern "C" void textEncoding_install(facebook::jsi::Runtime &runtime);

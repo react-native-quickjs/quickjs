@@ -1,0 +1,34 @@
+{
+  "name": "@react-native-quickjs/text-encoding",
+  "version": "0.1.0",
+  "description": "Native TextEncoder and TextDecoder for react-native-quickjs",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "files": [
+    "src",
+    "cpp",
+    "ios",
+    "android",
+    "CMakeLists.txt",
+    "*.podspec",
+    "!**/build",
+    "!**/.cxx"
+  ],
+  "keywords": [
+    "react-native",
+    "quickjs",
+    "jsi",
+    "text-encoding"
+  ],
+  "author": "Ammar Ahmed",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "@react-native-quickjs/quickjs": "*"
+  },
+  "reactNativeQuickJSModule": {
+    "install": "textEncoding_install",
+    "header": "cpp/TextEncodingModule.h"
+  }
+}
