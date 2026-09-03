@@ -4,6 +4,12 @@
   "description": "Native TextEncoder and TextDecoder for react-native-quickjs",
   "main": "src/index.js",
   "types": "src/index.d.ts",
+  "scripts": {
+    "build": "cmake -S ../.. -B ../../build -DCMAKE_BUILD_TYPE=Debug && cmake --build ../../build --target text_encoding_tests -j8",
+    "test": "npm run build && ctest --test-dir ../../build -R text_encoding --output-on-failure",
+    "bench:build": "cmake -S ../.. -B ../../build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build ../../build-rel --target text_encoding_bench -j8",
+    "bench": "npm run bench:build && ../../build-rel/modules/text-encoding/text_encoding_bench"
+  },
   "files": [
     "src",
     "cpp",

@@ -53,4 +53,16 @@ if(TARGET quickjs_jsi AND TARGET GTest::gtest)
     CXX_STANDARD_REQUIRED ON
   )
   add_test(NAME text_encoding COMMAND text_encoding_tests)
+
+  # The numbers mean nothing unless the engine it links was optimized, so the
+  # benchmark says so and reports nothing rather than printing a Debug figure
+  # someone might quote.
+  add_executable(text_encoding_bench bench/text_encoding_bench.cpp)
+  target_link_libraries(text_encoding_bench PRIVATE ${RNQJS_MODULE_NAME})
+  target_compile_definitions(text_encoding_bench PRIVATE
+    QJS_BENCH_OPTIMIZED=$<IF:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>,1,0>)
+  set_target_properties(text_encoding_bench PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
 endif()
