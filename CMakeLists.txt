@@ -58,19 +58,9 @@ set(REACT_NATIVE_QUICKJS_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "" FORCE)
 add_subdirectory(modules/text-encoding)
 add_subdirectory(modules/intl)
 
-# --- generated module registry ----------------------------------------------
-#
-# The registry TU force-references each autolinked module's install function by
-# name, which is what keeps a module's object file out of the linker's dead
-# strip on iOS (where a module compiles into the app as a static archive).
-# installModules() calls registerGeneratedModules(), defined here.
-#
-# This test compiles that generated TU together with the modules and must not
-# call any install function directly, so it proves the registry actually links
-# the modules in -- the host analogue of the app's iOS build. --dir makes the
-# list authoritative, so a package sitting in node_modules without a linked
-# native build is not referenced (an undefined symbol at link would fail the
-# build).
+# Test the generated module registry end to end: the TU must link the modules
+# in without any test calling their install functions directly -- the host
+# analogue of an app's iOS build. --dir keeps the list authoritative.
 find_program(RNQJS_NODE_EXECUTABLE node)
 if(RNQJS_NODE_EXECUTABLE AND TARGET GTest::gtest
    AND TARGET react-native-quickjs-intl

@@ -80,13 +80,8 @@ Pod::Spec.new do |s|
   # which Swift does not link still links, still runs, and degrades to "no
   # opinion" on the six things only Swift can answer.
   #
-  # The C++ headers are not API for consumers -- registration happens through
-  # the intl_install symbol -- so they are private. CocoaPods generates a
-  # module map for any pod with Swift sources, and its umbrella header is built
-  # from the *public* headers; leaving these public would put jsi.h and
-  # quickjs.h inside a Clang module that Swift then has to compile, which fails
-  # (C++ headers are not importable from Swift). Private keeps them out of the
-  # umbrella while still visible to the pod's own sources.
+  # Public headers would put jsi.h and quickjs.h in the Swift module map, which
+  # cannot import C++; consumers only need the intl_install symbol anyway.
   s.private_header_files = "cpp/**/*.h"
 
   s.source_files = "cpp/**/*.{h,hpp,c,cpp}", "ios/**/*.{h,m,mm,swift}"

@@ -141,16 +141,13 @@ def reactNativeArchitectures() {
   return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
 }
 
-// Installed QuickJS modules (@react-native-quickjs/* declaring
-// reactNativeQuickJSModule with an android/ dir). Their native code is compiled
-// into this engine's single .so so QJS_REGISTER_MODULE static initializers run
-// at load -- a module must not ship its own .so, which would load before the
-// engine and fail to resolve the JS_* API.
+// Autolinked QuickJS modules (@react-native-quickjs/* declaring
+// reactNativeQuickJSModule with an android/ dir), folded into this engine's
+// single .so.
 def quickjsModuleDirs() {
   def engineRoot = projectDir.parentFile
-  // Consumer: engineRoot is node_modules/@react-native-quickjs/quickjs, so the
-  // scope is its parent. Monorepo: engineRoot is the workspace root, so the
-  // scope is its own node_modules/@react-native-quickjs.
+  // Consumer: engineRoot is node_modules/@react-native-quickjs/quickjs.
+  // Monorepo: engineRoot is the workspace root.
   def scopes = [engineRoot.parentFile,
                 new File(engineRoot, "node_modules/@react-native-quickjs")]
   def dirs = []

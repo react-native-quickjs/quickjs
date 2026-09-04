@@ -9,10 +9,8 @@ buildscript {
 apply plugin: "com.android.library"
 apply plugin: "org.jetbrains.kotlin.android"
 
-// This package ships no native code of its own. The module core and the Android
-// platform JNI are compiled into the engine's single .so by the
-// @react-native-quickjs/quickjs package (which discovers this module through
-// its reactNativeQuickJSModule field). This library is the Kotlin half only.
+// This package ships no native code of its own: the core and platform JNI are
+// folded into the engine's single .so. This library is the Kotlin half only.
 
 android {
   namespace "com.text_encoding"

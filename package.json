@@ -35,6 +35,7 @@
     "modules/hermes-compat/src",
     "scripts/postinstall.js",
     "scripts/bytecode",
+    "scripts/generate-module-registry.js",
     "scripts/react_native_quickjs_pods.rb",
     "*.podspec",
     "bin",

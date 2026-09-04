@@ -79,10 +79,7 @@ object IntlPlatform {
   private var appContext: Context? = null
 
   init {
-    // The native half of this module (platform JNI plus the module core) is
-    // folded into the engine's single .so, which has no separate library to
-    // load. Loading the engine library here is what makes the exported
-    // Java_com_intl_IntlPlatform_nativeAttach resolvable by attach().
+    // The native half of this module lives in the engine's .so.
     SoLoader.loadLibrary("quickjsinstancejni")
   }
 
