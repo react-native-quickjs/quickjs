@@ -1,7 +1,7 @@
 package com.text_encoding
 
 import android.content.Context
-
+import com.facebook.soloader.SoLoader
 /**
  * The Android half of the platform seam.
  *
@@ -17,7 +17,10 @@ object TextEncodingPlatform {
   private var appContext: Context? = null
 
   init {
-    System.loadLibrary("text_encoding_platform")
+    // The native half of this module is folded into the engine's single .so,
+    // which has no separate library to load. Loading the engine library here is
+    // what makes the exported Java_..._nativeAttach resolvable by attach().
+    SoLoader.loadLibrary("quickjsinstancejni")
   }
 
   @JvmStatic

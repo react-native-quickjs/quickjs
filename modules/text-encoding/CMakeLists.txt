@@ -40,6 +40,20 @@ target_include_directories(${RNQJS_MODULE_NAME} PUBLIC
 target_compile_features(${RNQJS_MODULE_NAME} PUBLIC cxx_std_20)
 set_target_properties(${RNQJS_MODULE_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# JSI is not optional for this module: TextEncoder and TextDecoder are host
+# objects, so cpp/TextEncodingModule.cpp includes <jsi/jsi.h> unconditionally.
+# Which target provides the headers depends on the build -- the engine's
+# Android CMakeLists finds ReactAndroid::jsi, the host build defines jsi.
+if(TARGET ReactAndroid::jsi)
+  target_link_libraries(${RNQJS_MODULE_NAME} PUBLIC ReactAndroid::jsi)
+elseif(TARGET jsi)
+  target_link_libraries(${RNQJS_MODULE_NAME} PUBLIC jsi)
+else()
+  message(FATAL_ERROR
+    "react-native-quickjs-text-encoding needs JSI. Build it where "
+    "ReactAndroid::jsi (Android) or jsi (host) is defined.")
+endif()
+
 # Host tests. Only when this is built as part of the repository, where the
 # engine and googletest are already configured.
 if(TARGET quickjs_jsi AND TARGET GTest::gtest)
