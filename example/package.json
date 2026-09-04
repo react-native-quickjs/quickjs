@@ -10,7 +10,9 @@
     "build:ios": "react-native build-ios --mode Debug"
   },
   "dependencies": {
+    "@react-native-quickjs/intl": "file:../modules/intl",
     "@react-native-quickjs/quickjs": "file:..",
+    "@react-native-quickjs/text-encoding": "file:../modules/text-encoding",
     "react": "19.2.3",
     "react-native": "0.85.0"
   },
