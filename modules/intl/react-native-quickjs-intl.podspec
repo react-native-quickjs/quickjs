@@ -79,6 +79,16 @@ Pod::Spec.new do |s|
   # each declared __attribute__((weak)) on the Objective-C++ side. A build in
   # which Swift does not link still links, still runs, and degrades to "no
   # opinion" on the six things only Swift can answer.
+  #
+  # The C++ headers are not API for consumers -- registration happens through
+  # the intl_install symbol -- so they are private. CocoaPods generates a
+  # module map for any pod with Swift sources, and its umbrella header is built
+  # from the *public* headers; leaving these public would put jsi.h and
+  # quickjs.h inside a Clang module that Swift then has to compile, which fails
+  # (C++ headers are not importable from Swift). Private keeps them out of the
+  # umbrella while still visible to the pod's own sources.
+  s.private_header_files = "cpp/**/*.h"
+
   s.source_files = "cpp/**/*.{h,hpp,c,cpp}", "ios/**/*.{h,m,mm,swift}"
 
   # ARC, stated rather than inherited. CocoaPods defaults this to true, so the
@@ -94,7 +104,6 @@ Pod::Spec.new do |s|
   s.pod_target_xcconfig = {
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     "SWIFT_VERSION" => "5.0",
-    "DEFINES_MODULE" => "YES",
     "HEADER_SEARCH_PATHS" =>
       "\"#{rnqjs_root}/src/bytecode\" " \
       "\"#{rnqjs_root}/src/module\" " \

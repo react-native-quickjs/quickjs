@@ -1,6 +1,7 @@
 package com.intl
 
 import android.content.Context
+import com.facebook.soloader.SoLoader
 import android.icu.lang.UCharacter
 import android.icu.text.BreakIterator
 import android.icu.text.CompactDecimalFormat
@@ -17,15 +18,15 @@ import android.icu.text.NumberingSystem
 import android.icu.text.PluralRules
 import android.icu.text.RelativeDateTimeFormatter
 import android.icu.text.RuleBasedCollator
+import android.icu.text.SimpleDateFormat
+import android.icu.util.Calendar
 import android.icu.util.Currency
 import android.icu.util.Measure
 import android.icu.util.MeasureUnit
-import java.math.BigDecimal
-import java.math.RoundingMode
-import android.icu.text.SimpleDateFormat
-import android.icu.util.Calendar
 import android.icu.util.TimeZone
 import android.icu.util.ULocale
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.text.AttributedCharacterIterator
 import java.util.Date
 import java.util.concurrent.atomic.AtomicLong
@@ -78,7 +79,11 @@ object IntlPlatform {
   private var appContext: Context? = null
 
   init {
-    System.loadLibrary("intl_platform")
+    // The native half of this module (platform JNI plus the module core) is
+    // folded into the engine's single .so, which has no separate library to
+    // load. Loading the engine library here is what makes the exported
+    // Java_com_intl_IntlPlatform_nativeAttach resolvable by attach().
+    SoLoader.loadLibrary("quickjsinstancejni")
   }
 
   @JvmStatic
@@ -471,9 +476,7 @@ object IntlPlatform {
   // module has already shipped once.
   //
   // So an option bag crosses as a `String[]` in a documented field order, and
-  // both sides pin the order with a named index constant. `scripts/verify-android.sh`
-  // asserts the resulting signatures against the compiled class, so a rename or
-  // an arity change fails the build rather than the device.
+  // both sides pin the order with a named index constant.
   //
   // ## API levels — checked, not assumed
   //
