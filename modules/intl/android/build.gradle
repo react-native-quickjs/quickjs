@@ -1,0 +1,116 @@
+buildscript {
+  repositories { google(); mavenCentral() }
+  dependencies {
+    classpath("com.android.tools.build:gradle:8.7.2")
+    classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
+  }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+// The CMake build is shared with the host and finds the engine package itself,
+// but the NDK build needs it passed in: this directory is one level deeper than
+// the module CMakeLists expects, and a consumer install hoists the packages
+// elsewhere. Resolution mirrors the podspec: node require.resolve first, then a
+// walk up for the workspace-root manifest (this monorepo).
+def rnqjsDir = findEngineRoot()
+
+/** Resolves the @react-native-quickjs/quickjs package the same way the
+ * podspec does: node require.resolve first (consumer installs), then a walk up
+ * for the workspace-root manifest (this monorepo). */
+def findEngineRoot() {
+  def script = "console.log(require('path').dirname(" +
+               "require.resolve('@react-native-quickjs/quickjs/package.json', " +
+               "{paths:[process.argv[1]]})))"
+  try {
+    def proc = ["node", "--print", script, projectDir.absolutePath].execute()
+    proc.waitFor()
+    def root = proc.text.trim()
+    if (proc.exitValue() == 0 && !root.isEmpty()) {
+      return new File(root)
+    }
+  } catch (ignored) {
+    // fall through to the walk
+  }
+  def dir = projectDir.parentFile
+  while (dir != null) {
+    def manifest = new File(dir, "package.json")
+    if (manifest.exists()) {
+      def json = new groovy.json.JsonSlurper().parse(manifest)
+      if (json.name == "@react-native-quickjs/quickjs") return dir
+    }
+    dir = dir.parentFile
+  }
+  null
+}
+
+android {
+  namespace "com.intl"
+  compileSdk 35
+
+  // Prefab, so the NDK build can `find_package(ReactAndroid)` and pick up JSI.
+  //
+  // Without this, modules/intl/CMakeLists.txt finds no jsi/jsi.h, drops
+  // cpp/IntlModuleJSI.cpp from the build, and the module compiles and links
+  // *successfully* with no QJS_REGISTER_MODULE in it — an app that installs
+  // this package would then have no `Intl` and no error anywhere explaining
+  // why. The CMake prints a STATUS line for exactly this case; this flag is
+  // what stops it firing.
+  buildFeatures {
+    prefab true
+  }
+
+  defaultConfig {
+    // `android.icu` as a package has been public since API 24, and everything
+    // the DateTimeFormat backend uses is API 24 — but "android.icu is API 24"
+    // is NOT true member by member, and the difference matters for the
+    // services after stage one. MEASURED against the SDK's own
+    // data/api-versions.xml by modules/intl/scripts/android-api-levels.py:
+    //   ListFormatter                     API 26  (the class itself)
+    //   ListFormatter.getInstance(…Type…) API 33  (disjunction, short, narrow)
+    //   RelativeDateTimeFormatter
+    //     .formatNumeric                  API 28
+    //     .formatToValue                  API 31  (formatToParts)
+    //   android.icu.number.NumberFormatter API 30
+    // Run that script before adding a backend; it exits non-zero if anything
+    // on its REQUIRED list is above this minSdk.
+    minSdk 24
+    externalNativeBuild {
+      cmake {
+        // Built from source, as C++20, against the QuickJS engine the app
+        // already compiles. Nothing here is ever shipped prebuilt.
+        cppFlags "-O2", "-frtti", "-fexceptions", "-std=c++20"
+        // 16 KB page size. Without this the .so links with 4 KB LOAD
+        // alignment and the loader SIGKILLs the process on an Android 15+
+        // device. NDK r27 leaves it OFF by default. See the long note in
+        // android/build.gradle and docs/on-device-execution.md.
+        def args = ["-DANDROID_STL=c++_shared",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"]
+        if (rnqjsDir != null) {
+          args += "-DREACT_NATIVE_QUICKJS_DIR=${rnqjsDir.absolutePath}"
+        }
+        arguments args
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
+  }
+
+  sourceSets {
+    main {
+      java.srcDirs = ["src/main/java"]
+      manifest.srcFile "src/main/AndroidManifest.xml"
+    }
+  }
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+  implementation "org.jetbrains.kotlin:kotlin-stdlib"
+}
