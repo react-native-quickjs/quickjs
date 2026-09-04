@@ -30,21 +30,13 @@ include("${RNQJS_ROOT}/cmake/quickjs.cmake")
 find_package(ReactAndroid REQUIRED CONFIG)
 find_package(fbjni REQUIRED CONFIG)
 
-# --- QuickJS modules ---------------------------------------------------------
-#
-# Installed modules (@react-native-quickjs/* declaring reactNativeQuickJSModule,
-# listed by build.gradle as package directories) are folded into THIS single
-# .so. Their core and their Android platform JNI compile into the engine image,
-# linked whole-archive so the QJS_REGISTER_MODULE static initializer in each
-# module's JSI object runs when the engine .so loads, and so the platform's
-# exported Java_<module>_nativeAttach survives the link (nothing else references
-# it). A module must not ship its own .so: it would load before the engine (the
-# app instantiates packages before the runtime factory) and fail to resolve the
-# engine's JS_* API.
-#
-# RNQJS_QUICKJS_FOLDED tells a module's platform JNI not to define its own
-# JNI_OnLoad (only one may exist per .so) and to capture the JavaVM from the
-# JNIEnv its attach call arrives with instead.
+# Autolinked modules (@react-native-quickjs/* declaring reactNativeQuickJSModule,
+# listed by build.gradle) are folded into this .so: whole-archive so each
+# module's QJS_REGISTER_MODULE static initializer runs at load and its exported
+# Java_<module>_nativeAttach survives the link. RNQJS_QUICKJS_FOLDED tells a
+# module's platform JNI to skip JNI_OnLoad (one per .so) and capture the JavaVM
+# from its attach call instead. A module must not ship its own .so -- it would
+# load before the engine and fail to resolve the JS_* API.
 if(DEFINED RNQJS_QUICKJS_MODULES)
   set(REACT_NATIVE_QUICKJS_DIR "${RNQJS_ROOT}" CACHE PATH "" FORCE)
   add_compile_definitions(RNQJS_QUICKJS_FOLDED=1)
@@ -64,11 +56,10 @@ if(DEFINED RNQJS_QUICKJS_MODULES)
     unset(RNQJS_QUICKJS_MODULE_TARGETS)
   endforeach()
 
-  # The generated registry names each module's install function explicitly. The
-  # reference makes a module that configured without its JSI edge a link error
-  # rather than a silently missing global, and gives installs a deterministic
-  # order. installModules() calls registerGeneratedModules(); QuickJSModule.cpp
-  # declares it weak, and this strong definition in the same .so wins.
+  # The registry TU names each module's install function, making a module that
+  # configured without its JSI edge a link error rather than a silently missing
+  # global. QuickJSModule.cpp declares registerGeneratedModules() weak; this
+  # strong definition in the same .so wins.
   set(RNQJS_REGISTRY "${CMAKE_CURRENT_BINARY_DIR}/generated/QuickJSGeneratedModules.cpp")
   find_program(RNQJS_NODE NAMES node REQUIRED)
   add_custom_command(
@@ -110,11 +101,10 @@ target_include_directories(quickjsinstancejni PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/main/jni"
 )
 
-# The module archives and the engine's own quickjs static archive are grouped so
-# the linker resolves references in both directions no matter their order. The
-# modules are whole-archived: a static module's platform object is referenced
-# only by a name Java resolves at runtime, and its QJS_REGISTER_MODULE
-# initializer must run at load, so every object has to be in.
+# The module archives and the quickjs archive are grouped so the linker
+# resolves references in both directions; the modules are whole-archived because
+# nothing references their platform objects except names Java resolves at
+# runtime, and their initializers must run at load.
 if(RNQJS_FOLDED_TARGETS)
   target_link_libraries(quickjsinstancejni
     -Wl,--start-group

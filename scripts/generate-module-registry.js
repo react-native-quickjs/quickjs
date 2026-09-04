@@ -7,35 +7,17 @@
  */
 
 /*
- * Autolinking for QuickJS modules.
+ * Emits a C++ file that calls each autolinked QuickJS module's install
+ * function by name.
  *
- * Scans node_modules for packages declaring a `reactNativeQuickJSModule` field
- * and emits a C++ file that calls each module's install function explicitly.
+ * Naming the function is what stops the linker dropping a static library's
+ * object file, which would otherwise leave the module silently uninstalled.
  *
- *   node scripts/generate-module-registry.js [--out <file>] [--root <dir>]
- *
- * ## Why generate this rather than rely on static initializers
- *
- * `QJS_REGISTER_MODULE` puts a static initializer in the module's translation
- * unit, which works for a shared library. For a **static** library the linker
- * is entitled to drop any object file nothing references — and it does. The
- * module then compiles, links, and silently installs nothing, which is close to
- * the worst failure mode available: no error, no missing symbol, just a global
- * that never appears and a JavaScript polyfill quietly winning instead.
- *
- * Generated code that names each install function is a direct reference, so the
- * object file cannot be dropped. Both mechanisms are kept deliberately: the
- * static initializer is the convenient path during development, and this is the
- * one that survives a release build.
- *
- * Registration is idempotent and deduplicated by name (see registerModule), so
- * a module reached by both routes installs exactly once.
+ *   node scripts/generate-module-registry.js [--dir <pkg> ...] [--out <file>]
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
-
-// --- arguments -------------------------------------------------------------
 
 const argv = process.argv.slice(2);
 const opt = (name, dflt = null) => {
@@ -69,26 +51,22 @@ const only = opt('only', null) ? new Set(opt('only').split(',')) : null;
 const asJson = argv.includes('--json');
 const quiet = argv.includes('--quiet');
 
-// --- discovery -------------------------------------------------------------
-
 /**
- * Directories to scan. Monorepos hoist to the root `node_modules`, but a
- * workspace package may also carry its own, and this repository keeps its
- * first-party modules in `modules/` where they are not installed at all.
+ * Directories to scan. Monorepos hoist to the root `node_modules`, and this
+ * repository keeps its first-party modules in `modules/`, uninstalled.
  */
 function candidateDirs() {
   const dirs = [];
   const nodeModules = path.join(root, 'node_modules');
   if (fs.existsSync(nodeModules)) dirs.push(nodeModules);
 
-  // First-party modules developed in-tree, which have no node_modules entry.
   const modules = path.join(root, 'modules');
   if (fs.existsSync(modules)) dirs.push(modules);
 
   return dirs;
 }
 
-/** Reads a package.json, returning null rather than throwing on bad input. */
+/** Reads a package.json, or null when it is missing or invalid. */
 function readPackage(dir) {
   try {
     const raw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
@@ -125,8 +103,8 @@ function discover() {
     for (const entry of entries) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
 
-      // Scoped packages nest one level deeper: node_modules/@scope/name.
-      const dirs = entry.name.startsWith('@')
+    // Scoped packages nest one level deeper: node_modules/@scope/name.
+    const dirs = entry.name.startsWith('@')
         ? fs
             .readdirSync(path.join(base, entry.name), { withFileTypes: true })
             .filter((e) => e.isDirectory() || e.isSymbolicLink())
@@ -140,19 +118,17 @@ function discover() {
     }
   }
 
-  // Deterministic output: same inputs must produce a byte-identical file, or
-  // every build looks like a change to the build system.
+  // Deterministic output, so an unchanged build does not retrigger everything
+  // downstream of the registry.
   return [...found.values()].sort(
     (a, b) => a.priority - b.priority || a.name.localeCompare(b.name)
   );
 }
 
-// Repeated --dir names an explicit module package directory. When any are
-// given they are authoritative -- the registry becomes exactly those modules,
-// in a deterministic order -- which is what an app build wants: node_modules
-// contains packages that are present but not linked (transitive dependencies),
-// and the registry must only reference symbols the app actually links, or the
-// build fails on an undefined symbol.
+// --dir is authoritative: the registry becomes exactly these modules, which is
+// what an app build wants. node_modules holds packages that are present but not
+// linked (transitive dependencies), and referencing their symbols would fail
+// the link.
 const explicitDirs = [];
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === '--dir' && argv[i + 1]) explicitDirs.push(path.resolve(argv[i + 1]));
@@ -171,8 +147,7 @@ if (explicitDirs.length > 0) {
 } else {
   modules = discover();
   if (only) {
-    // An allow-list over discovered modules, for callers that scan node_modules
-    // and know which of the results are actually linked.
+    // An allow-list over the discovered modules.
     modules = modules.filter((m) => only.has(m.name));
   }
 }
@@ -181,8 +156,6 @@ if (asJson) {
   console.log(JSON.stringify(modules, null, 2));
   process.exit(0);
 }
-
-// --- emit ------------------------------------------------------------------
 
 const isValidIdentifier = (s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 
@@ -198,10 +171,6 @@ for (const m of modules) {
 
 const lines = [];
 lines.push('// Generated by scripts/generate-module-registry.js — do not edit.');
-lines.push('//');
-lines.push('// Calls each autolinked module\'s install function by name. The explicit');
-lines.push('// reference is the point: it stops the linker dropping a static library\'s');
-lines.push('// object file, which would otherwise leave the module silently uninstalled.');
 lines.push('');
 lines.push('#include <jsi/jsi.h>');
 lines.push('');

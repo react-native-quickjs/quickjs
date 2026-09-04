@@ -4,15 +4,11 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * The generated module registry, exercised end to end.
- *
- * This test links the registry TU emitted by scripts/generate-module-registry.js
- * together with the modules it names, and must NOT call any module's install
- * function directly. That is the point: the registry is what force-references
- * each module's object file out of its static archive (the failure mode
- * QJS_REGISTER_MODULE alone is subject to), so if the wiring regresses and the
- * modules stop being linked, `Intl` and `TextEncoder` are simply undefined and
- * this fails. It is the host analogue of an app's iOS build.
+ * The generated module registry, exercised end to end: this links the registry
+ * TU emitted by scripts/generate-module-registry.js with the modules it names
+ * and must not call any module's install function directly, so if the wiring
+ * regresses and the modules stop being linked, `Intl` and `TextEncoder` are
+ * simply undefined here. Host analogue of an app's iOS build.
  */
 
 #include <gtest/gtest.h>

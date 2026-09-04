@@ -40,10 +40,8 @@ target_include_directories(${RNQJS_MODULE_NAME} PUBLIC
 target_compile_features(${RNQJS_MODULE_NAME} PUBLIC cxx_std_20)
 set_target_properties(${RNQJS_MODULE_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# JSI is not optional for this module: TextEncoder and TextDecoder are host
-# objects, so cpp/TextEncodingModule.cpp includes <jsi/jsi.h> unconditionally.
-# Which target provides the headers depends on the build -- the engine's
-# Android CMakeLists finds ReactAndroid::jsi, the host build defines jsi.
+# TextEncodingModule.cpp includes <jsi/jsi.h> unconditionally; which target
+# provides it depends on the build (ReactAndroid::jsi on Android, jsi on host).
 if(TARGET ReactAndroid::jsi)
   target_link_libraries(${RNQJS_MODULE_NAME} PUBLIC ReactAndroid::jsi)
 elseif(TARGET jsi)

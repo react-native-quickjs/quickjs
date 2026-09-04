@@ -1,8 +1,10 @@
 # @react-native-quickjs/intl
 
 ECMA-402 `Intl` for react-native-quickjs, backed by the operating system's own
-CLDR database. No locale data ships in your bundle and none ships in this
+CLDR database as Hermes does. No locale data ships in your bundle and none ships in this
 package.
+
+## Installation
 
 **This is deliberately a separate, opt-in package and will stay one.** It is
 not folded into `@react-native-quickjs/quickjs` and is not enabled by default:
@@ -10,10 +12,9 @@ an app that never touches `Intl` should not carry the platform seam
 (`android.icu` on Android, `NSLocale` and friends on Apple) or this package's
 JavaScript.
 
-Ported from the research repository (`modules/intl`) into the shipping one,
-following the module conventions of `modules/text-encoding`. The engine API
-used is public quickjs-ng throughout; the module ABI and the bytecode toolchain
-are this repository's.
+```sh
+npm install @react-native-quickjs/intl
+```
 
 ## What it provides
 
@@ -127,16 +128,3 @@ tie resolves identically on iOS and Android; Apple lacks a few
 `RelativeTimeFormat` and unit forms that `android.icu` has, and Android lacks
 compound `x-per-y` units that Apple derives. A deviation found later is a bug;
 the list is kept current in `js/intl.js` and the platform files.
-
-## Registering a module
-
-Both routes exist, deduplicated by name:
-
-- `QJS_REGISTER_MODULE("react-native-quickjs-intl", rnqjs::intl::install)`, a
-  static initializer that works in a shared library, and
-- `extern "C" void intl_install(facebook::jsi::Runtime&)`, the symbol a
-  generated module registry calls by name and the one that survives a
-  static-library link.
-
-`package.json` declares `reactNativeQuickJSModule: { install: "intl_install",
-header: "cpp/IntlModule.h" }` for autolinking.
