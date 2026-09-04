@@ -25,10 +25,69 @@ add_compile_options(${folly_FLAGS})
 
 include("${RNQJS_ROOT}/cmake/quickjs.cmake")
 
-# Every src/ translation unit has to be listed. The Apple build globs src/,
-# so a file added there builds on iOS and fails to link on Android -- an
-# asymmetry worth remembering when adding a source.
-add_library(quickjsinstancejni SHARED
+# Before any module subdirectory is configured: each module's CMakeLists probes
+# for ReactAndroid::jsi to decide whether to compile its JSI registration edge.
+find_package(ReactAndroid REQUIRED CONFIG)
+find_package(fbjni REQUIRED CONFIG)
+
+# --- QuickJS modules ---------------------------------------------------------
+#
+# Installed modules (@react-native-quickjs/* declaring reactNativeQuickJSModule,
+# listed by build.gradle as package directories) are folded into THIS single
+# .so. Their core and their Android platform JNI compile into the engine image,
+# linked whole-archive so the QJS_REGISTER_MODULE static initializer in each
+# module's JSI object runs when the engine .so loads, and so the platform's
+# exported Java_<module>_nativeAttach survives the link (nothing else references
+# it). A module must not ship its own .so: it would load before the engine (the
+# app instantiates packages before the runtime factory) and fail to resolve the
+# engine's JS_* API.
+#
+# RNQJS_QUICKJS_FOLDED tells a module's platform JNI not to define its own
+# JNI_OnLoad (only one may exist per .so) and to capture the JavaVM from the
+# JNIEnv its attach call arrives with instead.
+if(DEFINED RNQJS_QUICKJS_MODULES)
+  set(REACT_NATIVE_QUICKJS_DIR "${RNQJS_ROOT}" CACHE PATH "" FORCE)
+  add_compile_definitions(RNQJS_QUICKJS_FOLDED=1)
+
+  set(RNQJS_FOLDED_TARGETS "")
+  set(RNQJS_REGISTRY_DIRS "")
+  foreach(MODULE_DIR IN LISTS RNQJS_QUICKJS_MODULES)
+    get_filename_component(MODULE_NAME "${MODULE_DIR}" NAME)
+    list(APPEND RNQJS_REGISTRY_DIRS "--dir" "${MODULE_DIR}")
+    add_subdirectory("${MODULE_DIR}/android" "quickjs-modules/${MODULE_NAME}")
+    if(NOT RNQJS_QUICKJS_MODULE_TARGETS)
+      message(FATAL_ERROR
+        "${MODULE_DIR}/android did not declare RNQJS_QUICKJS_MODULE_TARGETS "
+        "(the static libraries to fold into the engine .so)")
+    endif()
+    list(APPEND RNQJS_FOLDED_TARGETS ${RNQJS_QUICKJS_MODULE_TARGETS})
+    unset(RNQJS_QUICKJS_MODULE_TARGETS)
+  endforeach()
+
+  # The generated registry names each module's install function explicitly. The
+  # reference makes a module that configured without its JSI edge a link error
+  # rather than a silently missing global, and gives installs a deterministic
+  # order. installModules() calls registerGeneratedModules(); QuickJSModule.cpp
+  # declares it weak, and this strong definition in the same .so wins.
+  set(RNQJS_REGISTRY "${CMAKE_CURRENT_BINARY_DIR}/generated/QuickJSGeneratedModules.cpp")
+  find_program(RNQJS_NODE NAMES node REQUIRED)
+  add_custom_command(
+    OUTPUT "${RNQJS_REGISTRY}"
+    COMMAND "${RNQJS_NODE}"
+            "${RNQJS_ROOT}/scripts/generate-module-registry.js"
+            ${RNQJS_REGISTRY_DIRS}
+            --out "${RNQJS_REGISTRY}"
+            --quiet
+    DEPENDS
+      "${RNQJS_ROOT}/scripts/generate-module-registry.js"
+    COMMENT "Generating the QuickJS module registry"
+    VERBATIM)
+endif()
+
+# Every src/ translation unit has to be listed. The Apple build globs src/, so
+# a file added there builds on iOS and fails to link on Android -- an asymmetry
+# worth remembering when adding a source.
+set(RNQJS_QUICKJSINSTANCE_SOURCES
   "${RNQJS_ROOT}/src/bytecode/QuickJSBytecode.cpp"
   "${RNQJS_ROOT}/src/module/QuickJSCompat.cpp"
   "${RNQJS_ROOT}/src/module/QuickJSModule.cpp"
@@ -38,6 +97,11 @@ add_library(quickjsinstancejni SHARED
   src/main/jni/JQuickJSInstance.cpp
   src/main/jni/OnLoad.cpp
 )
+if(DEFINED RNQJS_QUICKJS_MODULES)
+  list(APPEND RNQJS_QUICKJSINSTANCE_SOURCES "${RNQJS_REGISTRY}")
+endif()
+
+add_library(quickjsinstancejni SHARED ${RNQJS_QUICKJSINSTANCE_SOURCES})
 
 target_include_directories(quickjsinstancejni PRIVATE
   "${RNQJS_ROOT}/src/bytecode"
@@ -46,17 +110,35 @@ target_include_directories(quickjsinstancejni PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/main/jni"
 )
 
-find_package(ReactAndroid REQUIRED CONFIG)
-find_package(fbjni REQUIRED CONFIG)
-
-target_link_libraries(quickjsinstancejni
-  quickjs
-  fbjni::fbjni
-  ReactAndroid::jsi
-  ReactAndroid::reactnative
-  android
-  log
-)
+# The module archives and the engine's own quickjs static archive are grouped so
+# the linker resolves references in both directions no matter their order. The
+# modules are whole-archived: a static module's platform object is referenced
+# only by a name Java resolves at runtime, and its QJS_REGISTER_MODULE
+# initializer must run at load, so every object has to be in.
+if(RNQJS_FOLDED_TARGETS)
+  target_link_libraries(quickjsinstancejni
+    -Wl,--start-group
+    -Wl,--whole-archive
+    ${RNQJS_FOLDED_TARGETS}
+    -Wl,--no-whole-archive
+    quickjs
+    -Wl,--end-group
+    fbjni::fbjni
+    ReactAndroid::jsi
+    ReactAndroid::reactnative
+    android
+    log
+  )
+else()
+  target_link_libraries(quickjsinstancejni
+    quickjs
+    fbjni::fbjni
+    ReactAndroid::jsi
+    ReactAndroid::reactnative
+    android
+    log
+  )
+endif()
 
 # --- Chrome DevTools Protocol ----------------------------------------------
 #
