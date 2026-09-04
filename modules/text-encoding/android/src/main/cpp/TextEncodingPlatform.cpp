@@ -54,13 +54,18 @@ AndroidPlatform g_platform;
 
 }  // namespace
 
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
-  g_vm = vm;
-  return JNI_VERSION_1_6;
-}
-
+/*
+ * The Kotlin package is com.text_encoding, which JNI mangles to
+ * Java_com_text_1encoding (the underscore is encoded). So the export is spelled
+ * with _1 and the class is resolved through RegisterNatives-free short names:
+ * JNI first tries the mangled name below, which matches.
+ */
 extern "C" JNIEXPORT void JNICALL
-Java_com_text_encoding_TextEncodingPlatform_nativeAttach(JNIEnv *e, jobject) {
+Java_com_text_1encoding_TextEncodingPlatform_nativeAttach(JNIEnv *e, jobject) {
+  JavaVM *vm = nullptr;
+  if (e->GetJavaVM(&vm) == JNI_OK) {
+    g_vm = vm;
+  }
   // The local class reference dies with this frame, so a global one is
   // required for later calls from other threads.
   jclass local = e->FindClass("com/text_encoding/TextEncodingPlatform");

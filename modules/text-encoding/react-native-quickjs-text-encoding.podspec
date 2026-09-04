@@ -68,6 +68,15 @@ Pod::Spec.new do |s|
   s.platforms    = { :ios => "15.1" }
   s.source       = { :git => ".", :tag => "#{s.version}" }
 
+  # The C++ headers are not API for consumers -- registration happens through
+  # the textEncoding_install symbol -- so they are private. CocoaPods generates
+  # a module map for any pod with Swift sources, and its umbrella header is
+  # built from the *public* headers; leaving these public would put jsi.h and
+  # quickjs.h inside a Clang module that Swift then has to compile, which fails
+  # (C++ headers are not importable from Swift). Private keeps them out of the
+  # umbrella while still visible to the pod's own sources.
+  s.private_header_files = "cpp/**/*.h"
+
   # Compiled from source into the app, alongside the engine itself. The ios/
   # sources are the Apple half of the platform seam — Foundation lives there,
   # so a module can use NSLocale, Security.framework and the rest without
