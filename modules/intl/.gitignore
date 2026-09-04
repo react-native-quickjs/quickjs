@@ -1,0 +1,14 @@
+node_modules/
+build/
+.cxx/
+*.log
+
+# Generated at build time by scripts/embed-js.js from js/intl.js.
+#
+# Deliberately NOT checked in. QuickJS bytecode is loadable only by the engine
+# build that produced it, so a committed blob is a silent trap the first time
+# the vendored engine moves: it would either be rejected at load (best case,
+# and the module falls back to source) or, if BC_VERSION happened not to change
+# while the format did, be undefined behaviour. Regenerating it is one command
+# and both build systems run it.
+cpp/generated/
