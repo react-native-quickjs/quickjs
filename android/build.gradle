@@ -59,6 +59,9 @@ android {
         arguments "-DANDROID_STL=c++_shared",
                   "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                   "-DREACT_NATIVE_DIR=${reactNativeDir()}"
+        if (quickjsModuleDirs().size() > 0) {
+          arguments "-DRNQJS_QUICKJS_MODULES=${quickjsModuleDirs().join(';')}"
+        }
 
         // Left unset, CMakeLists.txt takes the DevTools backend from the build
         // type. -PrnqjsEnableCdp=true|false forces it either way.
@@ -140,6 +143,34 @@ def reactNativeDir() {
 def reactNativeArchitectures() {
   def value = rootProject.getProperties().get("reactNativeArchitectures")
   return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+// Installed QuickJS modules (@react-native-quickjs/* declaring
+// reactNativeQuickJSModule with an android/ dir). Their native code is compiled
+// into this engine's single .so so QJS_REGISTER_MODULE static initializers run
+// at load -- a module must not ship its own .so, which would load before the
+// engine and fail to resolve the JS_* API.
+def quickjsModuleDirs() {
+  def engineRoot = projectDir.parentFile
+  // Consumer: engineRoot is node_modules/@react-native-quickjs/quickjs, so the
+  // scope is its parent. Monorepo: engineRoot is the workspace root, so the
+  // scope is its own node_modules/@react-native-quickjs.
+  def scopes = [engineRoot.parentFile,
+                new File(engineRoot, "node_modules/@react-native-quickjs")]
+  def dirs = []
+  scopes.each { scope ->
+    if (scope == null || !scope.exists()) return
+    scope.listFiles().each { pkg ->
+      def manifest = new File(pkg, "package.json")
+      if (!manifest.exists()) return
+      def json = new groovy.json.JsonSlurper().parse(manifest)
+      if (json.reactNativeQuickJSModule && new File(pkg, "android").exists()
+          && !dirs.contains(pkg.absolutePath)) {
+        dirs << pkg.absolutePath
+      }
+    }
+  }
+  return dirs
 }
 
 dependencies {
