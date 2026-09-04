@@ -48,6 +48,7 @@
   ],
   "workspaces": [
     "modules/text-encoding",
+    "modules/intl",
     "example"
   ],
   "scripts": {
