@@ -27,6 +27,18 @@ std::vector<ModuleRegistration> &registry() {
 
 }  // namespace
 
+// Weak default so anything that links quickjs_jsi without the generated
+// registry TU still links and runs. An app that compiles the generated TU
+// (which defines this strongly) gets that definition, exactly like the weak
+// Swift symbols in modules/intl/ios/IntlPlatform.mm. clang and gcc both
+// support this; MSVC does not, but no app or test target links quickjs_jsi on
+// Windows (only the standalone qjsc bytecode compiler is built there).
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void registerGeneratedModules() {}
+#else
+void registerGeneratedModules() {}
+#endif
+
 void registerModule(const ModuleRegistration &module) {
   if (module.install == nullptr || module.name == nullptr) {
     return;
@@ -54,6 +66,9 @@ const std::vector<ModuleRegistration> &registeredModules() {
 }
 
 void installModules(jsi::Runtime &runtime) {
+  // The generated registry first, so a module's object file is force-referenced
+  // (and registered) before any runtime installs it. See registerGeneratedModules.
+  registerGeneratedModules();
   for (const auto &module : registry()) {
     module.install(runtime);
   }
