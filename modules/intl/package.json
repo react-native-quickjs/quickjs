@@ -1,0 +1,54 @@
+{
+  "name": "@react-native-quickjs/intl",
+  "version": "1.0.0",
+  "description": "Platform-backed ECMA-402 Intl for react-native-quickjs — NSLocale on Apple, android.icu on Android, no CLDR data in the bundle",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "scripts": {
+    "build": "cmake -S ../.. -B ../../build -DCMAKE_BUILD_TYPE=Debug -DRNQJS_INTL_BUILD_CLI=ON && cmake --build ../../build --target intl_tests intl-cli intl-bench -j8",
+    "test": "npm run build && ctest --test-dir ../../build -R intl --output-on-failure",
+    "bench:build": "cmake -S ../.. -B ../../build-rel -DCMAKE_BUILD_TYPE=Release -DRNQJS_INTL_BUILD_CLI=ON && cmake --build ../../build-rel --target intl-bench intl-cli intl-cli-apple -j8",
+    "bench": "npm run bench:build && ../../build-rel/modules/intl/intl-bench",
+    "generate": "node scripts/embed-js.js",
+    "size-gate": "node scripts/embed-js.js"
+  },
+  "files": [
+    "src",
+    "js",
+    "cpp",
+    "ios",
+    "android",
+    "scripts",
+    "CMakeLists.txt",
+    "*.podspec",
+    "!**/build",
+    "!**/.cxx",
+    "!cpp/generated"
+  ],
+  "keywords": [
+    "react-native",
+    "quickjs",
+    "intl",
+    "ecma-402",
+    "i18n"
+  ],
+  "author": "Ammar Ahmed",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "@react-native-quickjs/quickjs": "*"
+  },
+  "reactNativeQuickJSModule": {
+    "install": "intl_install",
+    "header": "cpp/IntlModule.h"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/react-native-quickjs/quickjs.git",
+    "directory": "modules/intl"
+  }
+}
