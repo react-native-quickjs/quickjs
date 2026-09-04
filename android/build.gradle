@@ -2,7 +2,8 @@ buildscript {
   ext.ReactNativeQuickJS = [
     kotlinVersion: "2.0.21",
     minSdkVersion: 24,
-    compileSdkVersion: 36
+    compileSdkVersion: 36,
+    ndkVersion: "29.0.14206865"
   ]
 
   ext.getExtOrDefault = { prop ->
@@ -31,12 +32,7 @@ apply plugin: "kotlin-android"
 android {
   namespace "com.reactnativequickjs.quickjs"
 
-  // Follow the app's NDK, or let the Android plugin choose. Pinning our own
-  // would compile this library with a different toolchain than the app.
-  if (rootProject.ext.has("ndkVersion")) {
-    ndkVersion rootProject.ext.get("ndkVersion")
-  }
-
+  ndkVersion getExtOrDefault("ndkVersion")
   compileSdkVersion getExtOrDefault("compileSdkVersion")
 
   defaultConfig {
