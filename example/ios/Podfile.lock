@@ -1184,6 +1184,14 @@ PODS:
     - React-RCTFBReactNativeSpec
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
+  - react-native-quickjs-intl (1.0.0):
+    - React-Core
+    - React-jsi
+    - ReactNativeQuickJS
+  - react-native-quickjs-text-encoding (1.0.0):
+    - React-Core
+    - React-jsi
+    - ReactNativeQuickJS
   - React-NativeModulesApple (0.85.0):
     - React-callinvoker
     - React-Core
@@ -1506,7 +1514,32 @@ PODS:
     - React-utils (= 0.85.0)
     - ReactNativeDependencies
   - ReactNativeDependencies (0.85.0)
-  - ReactNativeQuickJS (0.1.0):
+  - ReactNativeQuickJS (1.0.0-alpha.0):
+    - RCTRequired
+    - RCTTypeSafety
+    - React-Core
+    - React-cxxreact
+    - React-debug
+    - React-Fabric
+    - React-featureflags
+    - React-graphics
+    - React-ImageManager
+    - React-jsi
+    - React-jsinspector
+    - React-jsitooling
+    - React-NativeModulesApple
+    - React-RCTFabric
+    - React-renderercss
+    - React-rendererdebug
+    - React-RuntimeCore
+    - React-utils
+    - ReactCodegen
+    - ReactCommon/turbomodule/bridging
+    - ReactCommon/turbomodule/core
+    - ReactNativeDependencies
+    - ReactNativeQuickJS/HermesCompat (= 1.0.0-alpha.0)
+    - Yoga
+  - ReactNativeQuickJS/HermesCompat (1.0.0-alpha.0):
     - RCTRequired
     - RCTTypeSafety
     - React-Core
@@ -1569,6 +1602,8 @@ DEPENDENCIES:
   - React-logger (from `../../node_modules/react-native/ReactCommon/logger`)
   - React-Mapbuffer (from `../../node_modules/react-native/ReactCommon`)
   - React-microtasksnativemodule (from `../../node_modules/react-native/ReactCommon/react/nativemodule/microtasks`)
+  - "react-native-quickjs-intl (from `../../node_modules/@react-native-quickjs/intl`)"
+  - "react-native-quickjs-text-encoding (from `../../node_modules/@react-native-quickjs/text-encoding`)"
   - React-NativeModulesApple (from `../../node_modules/react-native/ReactCommon/react/nativemodule/core/platform/ios`)
   - React-networking (from `../../node_modules/react-native/ReactCommon/react/networking`)
   - React-oscompat (from `../../node_modules/react-native/ReactCommon/oscompat`)
@@ -1676,6 +1711,10 @@ EXTERNAL SOURCES:
     :path: "../../node_modules/react-native/ReactCommon"
   React-microtasksnativemodule:
     :path: "../../node_modules/react-native/ReactCommon/react/nativemodule/microtasks"
+  react-native-quickjs-intl:
+    :path: "../../node_modules/@react-native-quickjs/intl"
+  react-native-quickjs-text-encoding:
+    :path: "../../node_modules/@react-native-quickjs/text-encoding"
   React-NativeModulesApple:
     :path: "../../node_modules/react-native/ReactCommon/react/nativemodule/core/platform/ios"
   React-networking:
@@ -1783,6 +1822,8 @@ SPEC CHECKSUMS:
   React-logger: 8f571a5e1f80a2eca304c26bfa93467a93b234c0
   React-Mapbuffer: 00e07cab4e54523043acc3ae823b7cf91733c8a8
   React-microtasksnativemodule: feb73bf1e0a8aceb5e8d95a5c6887e0ce56803aa
+  react-native-quickjs-intl: 475cfe46e402ac251c0e0457c09c4ce2d748cc31
+  react-native-quickjs-text-encoding: 26907d7f8b81dc008365c40eb588802c42b0413e
   React-NativeModulesApple: 0ca9b8664c14f76b9fff7dd57d69e1283647dd28
   React-networking: a2faaaa97202a74bb283b4269e1a187f8cf015b8
   React-oscompat: 2c4945336d3a1e509944c6a6a530bc1b6e756581
@@ -1816,7 +1857,7 @@ SPEC CHECKSUMS:
   ReactCodegen: d1f70d6087aa5e752ff4a21f256dc6089afde5e1
   ReactCommon: f88c8aa722cc193ec0ca3f1e1a6ef27eab0c0c09
   ReactNativeDependencies: d03cd6c9393b1e3b56764734083adf2bd12df30c
-  ReactNativeQuickJS: f0a237b59b29e208bc968c17b859fe1ad206d2ce
+  ReactNativeQuickJS: 944f865f9766b52f9b3135d3c9830598877b0532
   Yoga: 7549f28c2f55a71280f339554f8980f4a1414b0f
 
 PODFILE CHECKSUM: 74a205c7bc98a71f517baf5b1a3ca580ab917c0f

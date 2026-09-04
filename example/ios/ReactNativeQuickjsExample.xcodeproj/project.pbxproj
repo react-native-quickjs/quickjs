@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0C80B921A6F3F58F76C31292 /* libPods-ReactNativeQuickjsExample.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-ReactNativeQuickjsExample.a */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
+		1F922732A457F2ECF1240D0F /* QuickJSGeneratedModules.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F9B69CF20CB89B4A7BA7F90D /* QuickJSGeneratedModules.cpp */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
 		C7927899A33D1391325ACCBE /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
@@ -25,6 +26,7 @@
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = ReactNativeQuickjsExample/AppDelegate.swift; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = ReactNativeQuickjsExample/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
+		F9B69CF20CB89B4A7BA7F90D /* QuickJSGeneratedModules.cpp */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.cpp.cpp; name = QuickJSGeneratedModules.cpp; path = build/generated/QuickJSGeneratedModules.cpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -75,6 +77,7 @@
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
 				BBD78D7AC51CEA395F1C20DB /* Pods */,
+				F9B69CF20CB89B4A7BA7F90D /* QuickJSGeneratedModules.cpp */,
 			);
 			indentWidth = 2;
 			sourceTree = "<group>";
@@ -106,6 +109,7 @@
 			buildConfigurationList = 13B07F931A680F5B00A75B9A /* Build configuration list for PBXNativeTarget "ReactNativeQuickjsExample" */;
 			buildPhases = (
 				C38B50BA6285516D6DCD4F65 /* [CP] Check Pods Manifest.lock */,
+				3E45CD5ADEE67D33AAA3C904 /* [ReactNativeQuickJS] Generate module registry */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
@@ -201,6 +205,25 @@
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-ReactNativeQuickjsExample/Pods-ReactNativeQuickjsExample-frameworks.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
+		3E45CD5ADEE67D33AAA3C904 /* [ReactNativeQuickJS] Generate module registry */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "[ReactNativeQuickJS] Generate module registry";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/build/generated/QuickJSGeneratedModules.cpp",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\n[ -f \"$SRCROOT/.xcode.env\" ] && . \"$SRCROOT/.xcode.env\"\n[ -f \"$SRCROOT/.xcode.env.local\" ] && . \"$SRCROOT/.xcode.env.local\"\n: \"${NODE_BINARY:=node}\"\nENGINE=\"$(\"$NODE_BINARY\" --print \"require.resolve('@react-native-quickjs/quickjs/package.json', {paths: ['$SRCROOT']})\" | xargs dirname)\"\nOUT=\"$SRCROOT/build/generated/QuickJSGeneratedModules.cpp\"\nmkdir -p \"$(dirname \"$OUT\")\"\n\"$NODE_BINARY\" \"$ENGINE/scripts/generate-module-registry.js\" --dir \"$ENGINE/node_modules/@react-native-quickjs/intl\" --dir \"$ENGINE/node_modules/@react-native-quickjs/text-encoding\" \\\n  --out \"$OUT\" --quiet\n";
+		};
 		4BDCD6CA88E01D7F90ABF34F /* [ReactNativeQuickJS] Compile JavaScript to bytecode */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -266,6 +289,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
+				1F922732A457F2ECF1240D0F /* QuickJSGeneratedModules.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -280,6 +304,11 @@
 				CLANG_ENABLE_MODULES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_BITCODE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"/Users/ammarahmed/Work/react-native-quickjs-org/quickjs/example/ios/Pods/Headers/Public/React-jsi\"",
+					"\"/Users/ammarahmed/Work/react-native-quickjs-org/quickjs/src/module\"",
+				);
 				INFOPLIST_FILE = ReactNativeQuickjsExample/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -309,6 +338,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"/Users/ammarahmed/Work/react-native-quickjs-org/quickjs/example/ios/Pods/Headers/Public/React-jsi\"",
+					"\"/Users/ammarahmed/Work/react-native-quickjs-org/quickjs/src/module\"",
+				);
 				INFOPLIST_FILE = ReactNativeQuickjsExample/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
