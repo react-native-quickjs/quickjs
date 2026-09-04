@@ -57,3 +57,51 @@ add_subdirectory(modules/hermes-compat)
 set(REACT_NATIVE_QUICKJS_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "" FORCE)
 add_subdirectory(modules/text-encoding)
 add_subdirectory(modules/intl)
+
+# --- generated module registry ----------------------------------------------
+#
+# The registry TU force-references each autolinked module's install function by
+# name, which is what keeps a module's object file out of the linker's dead
+# strip on iOS (where a module compiles into the app as a static archive).
+# installModules() calls registerGeneratedModules(), defined here.
+#
+# This test compiles that generated TU together with the modules and must not
+# call any install function directly, so it proves the registry actually links
+# the modules in -- the host analogue of the app's iOS build. --dir makes the
+# list authoritative, so a package sitting in node_modules without a linked
+# native build is not referenced (an undefined symbol at link would fail the
+# build).
+find_program(RNQJS_NODE_EXECUTABLE node)
+if(RNQJS_NODE_EXECUTABLE AND TARGET GTest::gtest
+   AND TARGET react-native-quickjs-intl
+   AND TARGET react-native-quickjs-text-encoding)
+  set(RNQJS_GENERATED_REGISTRY "${CMAKE_BINARY_DIR}/QuickJSGeneratedModules.cpp")
+  add_custom_command(
+    OUTPUT "${RNQJS_GENERATED_REGISTRY}"
+    COMMAND "${RNQJS_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate-module-registry.js"
+            --dir "${CMAKE_CURRENT_SOURCE_DIR}/modules/intl"
+            --dir "${CMAKE_CURRENT_SOURCE_DIR}/modules/text-encoding"
+            --out "${RNQJS_GENERATED_REGISTRY}"
+            --quiet
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate-module-registry.js"
+      "${CMAKE_CURRENT_SOURCE_DIR}/modules/intl/package.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/modules/text-encoding/package.json"
+    COMMENT "Generating the QuickJS module registry"
+    VERBATIM)
+
+  add_executable(quickjs_generated_modules_tests
+    tests/generated_modules_test.cpp
+    "${RNQJS_GENERATED_REGISTRY}")
+  target_link_libraries(quickjs_generated_modules_tests PRIVATE
+    quickjs_jsi
+    react-native-quickjs-intl
+    react-native-quickjs-text-encoding
+    GTest::gtest GTest::gtest_main)
+  set_target_properties(quickjs_generated_modules_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+  add_test(NAME generated_modules COMMAND quickjs_generated_modules_tests)
+endif()
