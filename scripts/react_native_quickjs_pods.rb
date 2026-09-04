@@ -17,6 +17,9 @@
 #     end
 #   end
 
+require "json"
+require "pathname"
+
 # react-native-worklets and react-native-reanimated declare
 # `s.dependency 'React-hermes'` unconditionally, and use_quickjs! never declares
 # that pod, so `pod install` cannot resolve it. Neither uses anything from it:
@@ -134,6 +137,7 @@ end
 
 def react_native_quickjs_post_install(installer)
   react_native_quickjs_add_bytecode_phase(installer)
+  react_native_quickjs_add_module_registry(installer)
 
   # Debug only, matching the gate React Native puts on its own inspector.
   # QuickJSInstance::debuggerEnabledByDefault() already refuses to attach in a
@@ -233,5 +237,175 @@ def react_native_quickjs_append(installer, pod_name, setting, value, debug_only:
     current = config.build_settings[setting] || "$(inherited)"
     current = current.join(" ") if current.is_a?(Array)
     config.build_settings[setting] = "#{current} #{value}"
+  end
+end
+
+# Generated module registry, compiled into the app.
+#
+# WHY
+#   A QuickJS module registers itself through QJS_REGISTER_MODULE, a static
+#   initializer in its translation unit. That works for a shared library (a
+#   .so is loaded whole and runs every initializer) but not for a static
+#   archive: the linker drops any object file nothing references, so on iOS a
+#   module's object -- and its registration -- silently vanishes and the global
+#   it installs (Intl, TextEncoder) is undefined. The generated registry names
+#   each module's install function explicitly, which is a direct reference the
+#   linker cannot drop, and installModules() calls registerGeneratedModules()
+#   before installing anything.
+#
+# WHY THE APP TARGET AND NOT THE ENGINE POD
+#   A static linker resolves archives left to right, and CocoaPods orders each
+#   module pod before the engine pod it depends on. The registry's reference to
+#   a module's install symbol must therefore live in the *last*-linked thing --
+#   the app target -- not in the engine archive, or the reference would arrive
+#   after the module archive had already been passed over and the link would
+#   fail with an undefined symbol.
+#
+# HOW
+#   scripts/generate-module-registry.js names exactly the installed quickjs
+#   module pods (--dir is authoritative, so a package sitting in node_modules
+#   without a linked native build is never referenced -- that would be an
+#   undefined symbol at link). The generated translation unit is added to the
+#   app target's compile sources, a build phase regenerates it before compile,
+#   and the app target is given the engine's module-ABI header path so the file
+#   compiles there.
+#
+# The host build exercises the same path in quickjs_generated_modules_tests.
+MODULE_REGISTRY_PHASE = "[ReactNativeQuickJS] Generate module registry"
+
+def react_native_quickjs_add_module_registry(installer)
+  engine_root = File.expand_path("..", __dir__)
+  # Resolved at build time relative to $SRCROOT via node, so the checked-in
+  # project carries no absolute path: the script asks node where the engine is
+  # (require.resolve) exactly like the bytecode phase above does.
+  generator = "scripts/generate-module-registry.js"
+
+  sandbox = Pod::Config.instance.sandbox
+  sandbox_root = sandbox.root.to_s
+
+  # An installed quickjs-module pod is named react-native-quickjs-<segment>. Its
+  # package.json (which declares the reactNativeQuickJSModule field) sits next
+  # to its podspec, wherever that is -- node_modules/@react-native-quickjs/ for
+  # a consumer, modules/ for this monorepo. The absolute package directory comes
+  # from the local-pod storage CocoaPods keeps (keyed by pod name), which is the
+  # original `:path` for a file: dependency -- so no layout assumption here.
+  module_dirs = []
+  dev_pods = sandbox.send(:development_pods)
+  (installer.pod_targets || []).each do |pod_target|
+    next unless pod_target.name.start_with?("react-native-quickjs-")
+    # For a local (file:) pod, development_pods stores the podspec file path.
+    # Its directory is the module's package root (package.json sits next to the
+    # podspec). Prefer it over any layout guess.
+    spec_file = dev_pods[pod_target.pod_name].to_s
+    pkg_root = spec_file.empty? ? "" : File.dirname(spec_file)
+    if pkg_root.empty? || !File.exist?(File.join(pkg_root, "package.json"))
+      spec_file = pod_target.root_spec.defined_in_file
+      pkg_root = spec_file ? File.dirname(spec_file) : ""
+    end
+    next if pkg_root.empty?
+    pkg = File.join(pkg_root, "package.json")
+    next unless File.exist?(pkg)
+    next unless JSON.parse(File.read(pkg))["reactNativeQuickJSModule"]
+    module_dirs << pkg_root
+  end
+
+  # QuickJS modules that failed the reactNativeQuickJSModule check above are not
+  # interesting; but a pod can also be excluded from pod_targets entirely (e.g.
+  # script_phase-only). Detect by name from the pods project so the registry is
+  # not silently empty when modules ARE installed.
+  if module_dirs.empty? && (installer.pods_project)
+    (installer.pods_project.targets).each do |t|
+      next unless t.name.start_with?("react-native-quickjs-")
+      Pod::UI.warn(
+        "[ReactNativeQuickJS] found pod #{t.name} but no package.json with " \
+        "reactNativeQuickJSModule next to it; module registry will be empty."
+      )
+    end
+  end
+
+  return if module_dirs.empty?
+
+  node_binary = ENV["NODE_BINARY"] || "node"
+
+  # The generated file includes src/module/QuickJSModule.h (which includes
+  # <jsi/jsi.h>). The module pod exposes those headers to itself, not to the app
+  # target, so the app target needs the engine's module-ABI header path added to
+  # compile the registry. The path is resolved here with node (the same way the
+  # module podspecs resolve the engine) and written into the project -- which is
+  # exactly what the engine pod's own xcconfig already does for its headers.
+  jsi_headers = File.join(sandbox_root, "Headers", "Public", "React-jsi")
+  engine_src = File.join(engine_root, "src", "module")
+  engine_headers = [
+    "\"#{jsi_headers}\"",
+    "\"#{engine_src}\"",
+  ].select { |p| p.include?("$(PODS_ROOT)") || File.directory?(p.tr("\"", "")) }
+
+  installer.aggregate_targets.map(&:user_project).uniq(&:path).compact.each do |project|
+    project.native_targets.each do |target|
+      next unless target.product_type == "com.apple.product-type.application"
+
+      project_dir = File.dirname(project.path)
+      # The generated translation unit lives in the app project's build dir. It
+      # is referenced from the .xcodeproj and produced by the script phase using
+      # only paths Xcode already knows ($SRCROOT is the directory holding the
+      # .xcodeproj), so nothing machine-specific is written into the project.
+      out = File.join(project_dir, "build", "generated", "QuickJSGeneratedModules.cpp")
+
+      # Header search paths for the generated translation unit. Built from
+      # build settings only, so nothing machine-specific reaches the project.
+      target.build_configurations.each do |config|
+        paths = [config.build_settings["HEADER_SEARCH_PATHS"] || "$(inherited)"]
+        paths = [paths] unless paths.is_a?(Array)
+        paths = paths.flatten
+        paths.concat(engine_headers)
+        config.build_settings["HEADER_SEARCH_PATHS"] = paths.uniq.join(" ")
+      end
+
+      # Idempotent: reuse an existing phase (a re-run of this pod helper must
+      # refresh it, not accumulate another), but keep it ordered before Sources.
+      phase = target.build_phases.find do |p|
+        p.respond_to?(:display_name) && p.display_name == MODULE_REGISTRY_PHASE
+      end
+      phase ||= target.new_shell_script_build_phase(MODULE_REGISTRY_PHASE)
+
+      # Regenerate on every build, before sources compile. The generated file is
+      # declared as an output so the build system knows this phase produces the
+      # source that Compile Sources consumes (otherwise it errors with "Build
+      # input file cannot be found"). The engine and the module directories are
+      # resolved at build time through node, and the output is addressed with
+      # $SRCROOT, so nothing machine-specific lands in the checked-in project.
+      phase.output_paths = ["$(SRCROOT)/build/generated/QuickJSGeneratedModules.cpp"]
+      rel_dirs = module_dirs.map do |d|
+        Pathname.new(d).relative_path_from(Pathname.new(engine_root)).to_s
+      end
+      phase.shell_script = <<~SH
+        set -e
+        [ -f "$SRCROOT/.xcode.env" ] && . "$SRCROOT/.xcode.env"
+        [ -f "$SRCROOT/.xcode.env.local" ] && . "$SRCROOT/.xcode.env.local"
+        : "${NODE_BINARY:=#{node_binary}}"
+        ENGINE="$("$NODE_BINARY" --print "require.resolve('@react-native-quickjs/quickjs/package.json', {paths: ['$SRCROOT']})" | xargs dirname)"
+        OUT="$SRCROOT/build/generated/QuickJSGeneratedModules.cpp"
+        mkdir -p "$(dirname "$OUT")"
+        "$NODE_BINARY" "$ENGINE/#{generator}" --dir "$ENGINE/#{rel_dirs.join('" --dir "$ENGINE/')}" \\
+          --out "$OUT" --quiet
+      SH
+
+      compile = target.build_phases.find do |p|
+        p.respond_to?(:display_name) && p.display_name == "Sources"
+      end
+      target.build_phases.delete(phase)
+      index = compile ? target.build_phases.index(compile) : nil
+      target.build_phases.insert(index, phase) if index
+
+      rel = Pathname.new(out).relative_path_from(Pathname.new(project_dir)).to_s
+      ref = project.main_group.files.find { |f| f.path == rel }
+      ref ||= project.main_group.new_file(rel)
+      target.source_build_phase.add_file_reference(ref)
+
+      Pod::UI.puts(
+        "[ReactNativeQuickJS] module registry -> #{module_dirs.map { |d| File.basename(d) }.join(', ')}".green
+      )
+    end
+    project.save
   end
 end
