@@ -70,11 +70,11 @@ platform seam (`cpp/IntlPlatform.h`).
   declared `__attribute__((weak))` on the Objective-C++ side, so a build where
   Swift does not link still links and degrades to "no opinion" on likely
   subtags.
-- **The Android backend compiles; it has not run in this repository.** No
-  device is attached here. `scripts/verify-android.sh` builds the JNI C++ for
-  three ABIs, compiles the Kotlin against `android.jar`, and asserts every JNI
-  signature the C++ resolves exists on the compiled class. Behavioural
-  verification needs a physical device.
+- **Android** is verified on an emulator in this repository: the example app
+  renders `Intl` with the `android` backend. The module ships no `.so` of its
+  own — its core and JNI are compiled into the engine's single
+  `libquickjsinstancejni.so` by the autolinker (see the engine's
+  `android/CMakeLists.txt`).
 
 ## Building and testing on a host
 

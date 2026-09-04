@@ -1002,13 +1002,19 @@ AndroidPlatform g_platform;
 }  // namespace
 }  // namespace rnqjs::intl
 
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
-  rnqjs::jni::setVM(vm);
-  return JNI_VERSION_1_6;
-}
-
+/*
+ * Folded into the engine .so (RNQJS_QUICKJS_FOLDED) a module cannot define
+ * JNI_OnLoad -- only one may exist per library -- and the JavaVM is captured
+ * here instead, from the JNIEnv the attach call arrives with. The exported
+ * Java_com_intl_IntlPlatform_nativeAttach entry point is what makes the engine
+ * .so answer IntlPlatform.attach().
+ */
 extern "C" JNIEXPORT void JNICALL
 Java_com_intl_IntlPlatform_nativeAttach(JNIEnv *e, jobject) {
+  JavaVM *vm = nullptr;
+  if (e->GetJavaVM(&vm) == JNI_OK) {
+    rnqjs::jni::setVM(vm);
+  }
   rnqjs::jni::Env env;
   if (!env.valid()) return;
   /*
