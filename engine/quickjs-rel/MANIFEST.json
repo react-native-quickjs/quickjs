@@ -31,12 +31,16 @@
       "sha256": "5543d3f33108b3666ccc2317b65afc3ae132a8a12e223ed9f6defeaef2367b8b"
     },
     {
+      "name": "0008-json-fast-paths.patch",
+      "sha256": "0c202d69a878b0d9eb3dfa1da0d2bf7d9e1e65d3aff7ec726d4dafc3419b0a3e"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "1a89bc63c09a7411d3f5d8cacbccbb7c525ad37ec4f7f07ee130f5ade736d428"
     }
   ],
   "files": {
-    "quickjs.c": "9c79e6cb413c5f3241a93f089ca84df906cd8d6dc026f375156f861c75ef496d",
+    "quickjs.c": "f10d57a41b1bc407c5cdfcb33ee5ea1060d14c1afde91dfa3e50af0d3928628a",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
