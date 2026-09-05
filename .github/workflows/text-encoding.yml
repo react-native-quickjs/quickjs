@@ -1,0 +1,30 @@
+name: text-encoding
+
+on:
+  push:
+    branches: [main]
+    paths: ['modules/text-encoding/**']
+  pull_request:
+    paths: ['modules/text-encoding/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: text-encoding-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build --target text_encoding_tests -j"$(nproc)"
+      - run: ctest --test-dir build -R '^text_encoding$' --output-on-failure --timeout 300
