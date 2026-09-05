@@ -1,6 +1,6 @@
 {
   "name": "@react-native-quickjs/text-encoding",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Native TextEncoder and TextDecoder for react-native-quickjs",
   "main": "src/index.js",
   "types": "src/index.d.ts",
