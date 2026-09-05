@@ -32,7 +32,7 @@
     },
     {
       "name": "0008-json-fast-paths.patch",
-      "sha256": "0c202d69a878b0d9eb3dfa1da0d2bf7d9e1e65d3aff7ec726d4dafc3419b0a3e"
+      "sha256": "f8bb98c818fe2eebf5029f919c396530cbd1f11c360464acfdaef82dd0f1f615"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -40,7 +40,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "f10d57a41b1bc407c5cdfcb33ee5ea1060d14c1afde91dfa3e50af0d3928628a",
+    "quickjs.c": "b24b93c72c2aef6371c93349b90ae934e20ad8efe44bd531936261317031a940",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

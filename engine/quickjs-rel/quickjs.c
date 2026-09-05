@@ -52199,10 +52199,6 @@ typedef struct JSONStringifyContext {
     JSValue gap;
     JSValue empty;
     StringBuffer *b;
-    /* whether the default Object/Array prototypes carry a toJSON in their
-       chain; if not, plain objects/arrays can skip the per-node toJSON probe */
-    bool obj_proto_has_tojson;
-    bool arr_proto_has_tojson;
 } JSONStringifyContext;
 
 static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
@@ -52228,34 +52224,6 @@ static int json_stack_push(JSContext *ctx, JSONStringifyContext *jsc, JSObject *
     return 0;
 }
 
-/* fast, side-effect-free check: can we skip the toJSON lookup for this value? */
-static bool json_can_skip_tojson(JSContext *ctx, JSONStringifyContext *jsc,
-                                  JSValueConst val)
-{
-    JSObject *p;
-    int cl;
-
-    if (!JS_IsObject(val))
-        return false;
-    p = JS_VALUE_GET_OBJ(val);
-    cl = p->class_id;
-    if (cl == JS_CLASS_OBJECT) {
-        if (jsc->obj_proto_has_tojson)
-            return false;
-    } else if (cl == JS_CLASS_ARRAY) {
-        if (jsc->arr_proto_has_tojson)
-            return false;
-    } else {
-        return false;
-    }
-    /* must have the pristine default prototype and no own toJSON */
-    if (p->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[cl]))
-        return false;
-    if (find_own_property1(p, JS_ATOM_toJSON) != NULL)
-        return false;
-    return true;
-}
-
 static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
     JSValue r = JS_ToQuotedString(ctx, val);
     JS_FreeValue(ctx, val);
@@ -52269,8 +52237,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     JSValue v;
     JSValueConst args[2];
 
-    if ((JS_IsObject(val) || JS_IsBigInt(val)) &&
-        !json_can_skip_tojson(ctx, jsc, val)) {
+    if (JS_IsObject(val) || JS_IsBigInt(val)) {
 		JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
 		if (JS_IsException(f))
 			goto exception;
@@ -52536,28 +52503,6 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     jsc->empty = js_empty_string(ctx->rt);
     ret = JS_UNDEFINED;
     wrapper = JS_UNDEFINED;
-
-    /* Determine once whether the default Object/Array prototypes carry a
-       toJSON method; if not, plain objects/arrays skip the per-node probe. */
-    {
-        JSValue f;
-        f = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_ATOM_toJSON);
-        if (JS_IsException(f)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            jsc->obj_proto_has_tojson = true;
-        } else {
-            jsc->obj_proto_has_tojson = JS_IsFunction(ctx, f);
-            JS_FreeValue(ctx, f);
-        }
-        f = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_ARRAY], JS_ATOM_toJSON);
-        if (JS_IsException(f)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            jsc->arr_proto_has_tojson = true;
-        } else {
-            jsc->arr_proto_has_tojson = JS_IsFunction(ctx, f);
-            JS_FreeValue(ctx, f);
-        }
-    }
 
     string_buffer_init(ctx, jsc->b, 0);
     if (JS_IsFunction(ctx, replacer)) {
