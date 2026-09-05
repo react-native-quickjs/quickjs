@@ -14,7 +14,7 @@
     "@react-native-quickjs/quickjs": "file:..",
     "@react-native-quickjs/text-encoding": "file:../modules/text-encoding",
     "react": "19.2.3",
-    "react-native": "0.85.0"
+    "react-native": "0.85.3"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
@@ -23,9 +23,9 @@
     "@react-native-community/cli": "20.1.0",
     "@react-native-community/cli-platform-android": "20.1.0",
     "@react-native-community/cli-platform-ios": "20.1.0",
-    "@react-native/babel-preset": "0.85.0",
-    "@react-native/metro-config": "0.85.0",
-    "@react-native/typescript-config": "0.85.0",
+    "@react-native/babel-preset": "0.85.3",
+    "@react-native/metro-config": "0.85.3",
+    "@react-native/typescript-config": "0.85.3",
     "@types/react": "^19.2.0",
     "react-native-monorepo-config": "^0.4.0"
   },

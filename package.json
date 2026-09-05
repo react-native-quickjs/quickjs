@@ -1,6 +1,6 @@
 {
   "name": "@react-native-quickjs/quickjs",
-  "version": "1.0.0-alpha.1",
+  "version": "1.0.0-alpha.2",
   "description": "QuickJS JSI runtime for React Native, built from source",
   "keywords": [
     "react-native",
@@ -102,6 +102,6 @@
     }
   },
   "dependencies": {
-    "@react-native-quickjs/text-encoding": "1.0.0"
+    "@react-native-quickjs/text-encoding": "1.0.1"
   }
 }

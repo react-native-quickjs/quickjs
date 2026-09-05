@@ -11,7 +11,10 @@
  * Gates, in order, so a bad package cannot reach the registry:
  *   1. engine integrity  check-submodule / apply-patches --check /
  *      sync-quickjs-rel --check / guard-selftest
- *   2. clean working tree and a package-lock.json that matches package.json
+ *   2. clean working tree and a package-lock.json that matches package.json,
+ *      and any @react-native-quickjs/* workspace-module dependency pinned
+ *      exact to the module's current, published version (a drifting range
+ *      nests a second module copy and breaks the folded Android build)
  *   3. a fresh `npm ci` (re-applies submodules and patches) followed by the
  *      full host test suite (configure + build + ctest)
  *   4. a `npm pack --dry-run` whose tarball is sanity-checked (engine present,
@@ -182,6 +185,82 @@ function guardLockMatches() {
   console.log(`ok    package-lock.json matches package.json (${pkg})`);
 }
 
+/* --- workspace-module dependency guard ---------------------------------- */
+
+const MODULES_DIR = path.join(ROOT, 'modules');
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+function moduleNameFromDir(dir) {
+  // modules/text-encoding -> @react-native-quickjs/text-encoding
+  return `@react-native-quickjs/${dir}`;
+}
+
+function isModulePublished(name, version) {
+  const r = capture('npm', ['view', `${name}@${version}`, 'version', '--json'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (r.status !== 0) return false;
+  try {
+    return JSON.parse(r.stdout) === version;
+  } catch {
+    return false;
+  }
+}
+
+/*
+ * The root package folds its autolinked modules (@react-native-quickjs/*) into
+ * the engine .so at the consumer's build. A dependency range that resolves to
+ * a different version than the one this release was built against -- or a
+ * pinned version that was never published -- makes the consumer install a
+ * nested second copy of the module (npm nests it under the engine's own
+ * node_modules), and the folded Android build then configures the same module
+ * twice and fails. The pin must be exact and equal to the module it ships
+ * with.
+ */
+function guardModuleDepVersions() {
+  const pkg = readJson(PKG_PATH);
+  const deps = pkg.dependencies || {};
+  const checked = [];
+  for (const dir of fs.readdirSync(MODULES_DIR)) {
+    const moduleDir = path.join(MODULES_DIR, dir);
+    if (!fs.statSync(moduleDir).isDirectory()) continue;
+    const modulePkgPath = path.join(moduleDir, 'package.json');
+    if (!fs.existsSync(modulePkgPath)) continue;
+    const modulePkg = readJson(modulePkgPath);
+    const name = moduleNameFromDir(dir);
+    if (!deps[name]) continue;
+
+    const spec = String(deps[name]);
+    if (!EXACT_VERSION.test(spec)) {
+      fail(
+        `dependency ${name} must be pinned to an exact version ` +
+          `(found "${spec}"); a range resolves to a version this release was ` +
+          `not built against. Pin it to ${modulePkg.version}.`
+      );
+    }
+    if (spec !== modulePkg.version) {
+      fail(
+        `dependency ${name} is pinned to ${spec}, but the module in ` +
+          `modules/${dir} is at ${modulePkg.version}. Release the module ` +
+          'first and pin this package to that same version.'
+      );
+    }
+    if (!isModulePublished(name, spec)) {
+      fail(
+        `dependency ${name}@${spec} is not published on npm. The engine ` +
+          'folds this module, so consumers cannot install a version that ' +
+          'does not exist. Publish the module first.'
+      );
+    }
+    checked.push(`${name}@${spec} (exact, published)`);
+  }
+  if (checked.length === 0) {
+    console.log('ok    no @react-native-quickjs/* workspace-module dependencies to check');
+  } else {
+    for (const c of checked) console.log(`ok    ${c}`);
+  }
+}
+
 function defaultNext(tag, current) {
   return computeNext(current, tag === 'alpha' ? 'prerelease' : 'patch');
 }
@@ -240,9 +319,10 @@ async function main() {
   runEngineGuard('sync-quickjs-rel.js', 'engine/quickjs-rel is in sync', ['--check']);
   runEngineGuard('guard-selftest.js', 'the engine guards can fail (self-test)');
 
-  console.log(`\n[2/6] Tree and lockfile\n`);
+  console.log(`\n[2/6] Tree, lockfile and module dependencies\n`);
   guardCleanTree();
   guardLockMatches();
+  guardModuleDepVersions();
 
   if (!noCi) {
     console.log('\n[3/6] Fresh install (npm ci) -- re-checks submodules and patches\n');
