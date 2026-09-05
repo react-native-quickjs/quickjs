@@ -95,12 +95,14 @@ index 1f1d656..9b27ac1 100644
  };
  
  typedef union JSFloat64Union {
-@@ -1445,6 +1455,7 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValueConst val,
+@@ -1445,8 +1455,9 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValueConst val,
  static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                 const char *input, size_t input_len,
                                 const char *filename, int line, int flags, int scope_idx);
 +static const char *JS_AtomGetStr(JSContext *ctx, char *buf, int buf_size, JSAtom atom);
  static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+ static int js_module_attributes_equal(JSContext *ctx, JSValueConst attr1,
+                                       JSValueConst attr2);
  static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                 JS_MarkFunc *mark_func);
 @@ -2954,6 +2965,361 @@ JSValue JS_GetFunctionProto(JSContext *ctx)

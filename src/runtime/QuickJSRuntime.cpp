@@ -297,8 +297,14 @@ struct ArrayBufferProxy {
   std::shared_ptr<jsi::MutableBuffer> buffer;
 };
 
-void freeArrayBufferProxy(JSRuntime * /*rt*/, void *opaque, void * /*ptr*/) {
-  delete static_cast<ArrayBufferProxy *>(opaque);
+void *reallocArrayBufferProxy(
+    JSRuntime * /*rt*/, void *opaque, void * /*ptr*/, size_t size) {
+  ArrayBufferProxy *proxy = static_cast<ArrayBufferProxy *>(opaque);
+  if (size == 0) {
+    delete proxy;
+    return nullptr;
+  }
+  return nullptr;
 }
 
 const char *kEnumeratePropertyNamesSource =
@@ -1737,7 +1743,8 @@ jsi::ArrayBuffer QuickJSRuntime::createArrayBuffer(
   auto *proxy = new ArrayBufferProxy{std::move(buffer)};
 
   JSValue arrayBuffer = JS_NewArrayBuffer(
-      context_, data, size, freeArrayBufferProxy, proxy, false);
+      context_, data, size, /*max_len*/ 0, reallocArrayBufferProxy, proxy,
+      false);
   if (JS_IsException(arrayBuffer)) {
     delete proxy;
     throwPendingError();
