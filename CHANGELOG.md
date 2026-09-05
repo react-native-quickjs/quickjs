@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning][semver].
 ### Added
 - Update the embedded [quickjs-ng][ng] engine to v0.16.2.
 
+### Changed
+- Faster `JSON.parse` and `JSON.stringify` on mobile-real payloads — integer
+  arrays, plain ASCII strings and small nested objects (new engine patch
+  `0008`).
+
 ## [v1.0.0-alpha.2] — 2026-09-05
 
 ### Changed
