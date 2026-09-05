@@ -48,6 +48,14 @@ set_target_properties(quickjs_jsi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(qjsc tools/bytecode/qjsc.c)
 target_link_libraries(qjsc PRIVATE quickjs)
 
+add_executable(qjs-bench tools/benchmark/qjs-bench.c)
+target_link_libraries(qjs-bench PRIVATE quickjs)
+target_include_directories(qjs-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-rel")
+
+add_executable(native-call-bench tools/benchmark/calls.c)
+target_link_libraries(native-call-bench PRIVATE quickjs)
+target_include_directories(native-call-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-rel")
+
 add_subdirectory(tests)
 
 # Added after tests/ on purpose: tests/CMakeLists.txt is where googletest is
