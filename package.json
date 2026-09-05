@@ -68,8 +68,9 @@
     "example": "npm run --workspace @react-native-quickjs/example",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
-    "release:module": "node scripts/release-module.js",
-    "release:alpha": "npm publish --tag alpha"
+    "release": "node scripts/release.js",
+    "release:alpha": "node scripts/release.js --tag alpha",
+    "release:module": "node scripts/release-module.js"
   },
   "peerDependencies": {
     "react": "*",
