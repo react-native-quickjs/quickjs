@@ -1,0 +1,30 @@
+name: intl
+
+on:
+  push:
+    branches: [main]
+    paths: ['modules/intl/**']
+  pull_request:
+    paths: ['modules/intl/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build --target intl_tests -j"$(nproc)"
+      - run: ctest --test-dir build -R '^intl$' --output-on-failure --timeout 300
