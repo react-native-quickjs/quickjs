@@ -15187,6 +15187,15 @@ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
     return JS_ToString(ctx, val);
 }
 
+/* 1 for bytes that must be escaped in a JSON string: control chars, '"', '\\' */
+static const uint8_t json_quote_needs_escape[256] = {
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,   /* 0x00-0x0f */
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,   /* 0x10-0x1f */
+    0,0,1,0,0,0,0,0, 0,0,0,0,0,0,0,0,   /* 0x20-0x2f : 0x22 = '"' */
+    /* rest default to 0 except 0x5c = '\\' set below via designated init */
+    [0x5c] = 1,
+};
+
 static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
 {
     JSValue val;
@@ -15206,6 +15215,51 @@ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
 
     if (string_buffer_putc8(b, '\"'))
         goto fail;
+
+    if (!p->is_wide_char) {
+        /* narrow (Latin-1) fast path: bulk-copy runs that need no escaping.
+           Bytes >= 0x80 are valid Latin-1 code points and are not escaped. */
+        const uint8_t *s8 = str8(p);
+        int len = p->len;
+        i = 0;
+        while (i < len) {
+            int run = i;
+            while (i < len && !json_quote_needs_escape[s8[i]])
+                i++;
+            if (i > run) {
+                if (string_buffer_write8(b, s8 + run, i - run))
+                    goto fail;
+            }
+            if (i >= len)
+                break;
+            c = s8[i++];
+            switch (c) {
+            case '\t': c = 't'; goto quote8;
+            case '\r': c = 'r'; goto quote8;
+            case '\n': c = 'n'; goto quote8;
+            case '\b': c = 'b'; goto quote8;
+            case '\f': c = 'f'; goto quote8;
+            case '\"':
+            case '\\':
+            quote8:
+                if (string_buffer_putc8(b, '\\'))
+                    goto fail;
+                if (string_buffer_putc8(b, c))
+                    goto fail;
+                break;
+            default: /* remaining control chars < 0x20 */
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                if (string_buffer_write8(b, (uint8_t*)buf, 6))
+                    goto fail;
+                break;
+            }
+        }
+        if (string_buffer_putc8(b, '\"'))
+            goto fail;
+        JS_FreeValue(ctx, val);
+        return string_buffer_end(b);
+    }
+
     for(i = 0; i < p->len; ) {
         c = string_getc(p, &i);
         switch(c) {
@@ -24100,10 +24154,29 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     uint32_t c;
     StringBuffer b_s, *b = &b_s;
 
+    p = *pp;
+
+    /* Fast path: a pure-ASCII string with no escapes can be built directly from
+       the source range, skipping the StringBuffer entirely. */
+    {
+        const uint8_t *q = p;
+        while (q < s->buf_end && *q != '"' && *q != '\\' && *q >= 0x20 && *q < 0x80)
+            q++;
+        if (q < s->buf_end && *q == '"') {
+            JSValue str = js_new_string8_len(s->ctx, (const char *)p, q - p);
+            if (JS_IsException(str))
+                return -1;
+            s->token.val = TOK_STRING;
+            s->token.u.str.sep = '"';
+            s->token.u.str.str = str;
+            *pp = q + 1; /* skip closing quote */
+            return 0;
+        }
+    }
+
     if (string_buffer_init(s->ctx, b, 48))
         goto fail;
 
-    p = *pp;
     for(;;) {
         if (p >= s->buf_end) {
             goto end_of_input;
@@ -24188,9 +24261,15 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
     const uint8_t *p_start = p;
+    bool neg = false;
+    bool is_float = false;
+    uint64_t ival = 0;
+    int ndigits = 0;
 
-    if (*p == '+' || *p == '-')
+    if (*p == '+' || *p == '-') {
+        neg = (*p == '-');
         p++;
+    }
 
     if (!is_digit(*p))
         return js_parse_error(s, "Unexpected token '%c'", *p_start);
@@ -24198,10 +24277,17 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
     if (p[0] == '0' && is_digit(p[1]))
         return json_parse_error(s, p, "Unexpected number");
 
-    while (is_digit(*p))
+    while (is_digit(*p)) {
+        /* accumulate the integer value while it stays exact in a double
+           (<= 15 digits < 2^53); longer numbers fall back to strtod */
+        if (ndigits <= 15)
+            ival = ival * 10 + (*p - '0');
+        ndigits++;
         p++;
+    }
 
     if (*p == '.') {
+        is_float = true;
         p++;
         if (!is_digit(*p))
             return json_parse_error(s, p, "Unterminated fractional number");
@@ -24209,6 +24295,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     if (*p == 'e' || *p == 'E') {
+        is_float = true;
         p++;
         if (*p == '+' || *p == '-')
             p++;
@@ -24218,7 +24305,22 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    if (!is_float && ndigits <= 15) {
+        /* integer fast path: avoids a second (locale-aware) strtod scan */
+        if (ival == 0) {
+            /* preserve -0 as a float64 negative zero */
+            s->token.u.num.val = neg ? js_float64(-0.0) : js_int32(0);
+        } else if (!neg && ival <= INT32_MAX) {
+            s->token.u.num.val = js_int32((int32_t)ival);
+        } else if (neg && ival <= (uint64_t)INT32_MAX + 1) {
+            s->token.u.num.val = js_int32((int32_t)(0 - (int64_t)ival));
+        } else {
+            double d = (double)ival;
+            s->token.u.num.val = js_float64(neg ? -d : d);
+        }
+    } else {
+        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    }
     *pp = p;
     return 0;
 }
@@ -51705,24 +51807,63 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
 
             if (json_next_token(s))
                 goto fail;
+            if (!pr) {
+                /* fast path (no reviver): stage elements in a C buffer, then
+                   bulk-build a dense array in one shot, avoiding a property
+                   define per element */
+                JSValue *elems = NULL;
+                int elems_size = 0, n = 0;
+                if (s->token.val != ']') {
+                    for (;;) {
+                        if (n >= elems_size) {
+                            int ns2 = elems_size ? elems_size * 2 : 8;
+                            JSValue *ne = js_realloc(ctx, elems, sizeof(JSValue) * ns2);
+                            if (!ne)
+                                goto array_stage_fail;
+                            elems = ne;
+                            elems_size = ns2;
+                        }
+                        el = json_parse_value(s, NULL);
+                        if (JS_IsException(el))
+                            goto array_stage_fail;
+                        elems[n++] = el;
+                        if (s->token.val == ']')
+                            break;
+                        if (s->token.val != ',') {
+                            json_parse_error(s, s->token.ptr, "Expected ',' or ']' after array element");
+                            goto array_stage_fail;
+                        }
+                        if (json_next_token(s))
+                            goto array_stage_fail;
+                        continue;
+                    array_stage_fail:
+                        while (n > 0)
+                            JS_FreeValue(ctx, elems[--n]);
+                        js_free(ctx, elems);
+                        goto fail;
+                    }
+                }
+                val = JS_NewArrayFrom(ctx, n, elems); /* takes ownership of elems[] */
+                js_free(ctx, elems);
+                if (JS_IsException(val))
+                    goto fail;
+                if (json_next_token(s))
+                    goto fail;
+                break;
+            }
+            /* reviver path: build incrementally to populate the parse record */
             val = JS_NewArray(ctx);
             if (JS_IsException(val))
                 goto fail;
-            if (pr) {
-                json_parse_record_init_array(ctx, pr, val);
-                pr_size = 0;
-            }
+            json_parse_record_init_array(ctx, pr, val);
+            pr_size = 0;
             if (s->token.val != ']') {
                 for(idx = 0;; idx++) {
-                    if (pr) {
-                        if (js_resize_array(ctx, (void **)&pr->u.array.elements, sizeof(pr->u.array.elements[0]),
-                                            &pr_size, pr->u.array.count + 1))
-                            goto fail;
-                        pr1 = &pr->u.array.elements[pr->u.array.count++];
-                        pr1->value = JS_UNDEFINED;
-                    } else {
-                        pr1 = NULL;
-                    }
+                    if (js_resize_array(ctx, (void **)&pr->u.array.elements, sizeof(pr->u.array.elements[0]),
+                                        &pr_size, pr->u.array.count + 1))
+                        goto fail;
+                    pr1 = &pr->u.array.elements[pr->u.array.count++];
+                    pr1->value = JS_UNDEFINED;
                     el = json_parse_value(s, pr1);
                     if (JS_IsException(el))
                         goto fail;
@@ -52049,12 +52190,71 @@ static JSValue js_json_rawJSON(JSContext *ctx, JSValueConst this_val,
 
 typedef struct JSONStringifyContext {
     JSValueConst replacer_func;
-    JSValue stack;
+    /* circular-reference detection: a plain C vector of borrowed object
+       pointers (each is alive on the recursion stack), replacing a JS array */
+    JSObject **stack;
+    int stack_len;
+    int stack_size;
     JSValue property_list;
     JSValue gap;
     JSValue empty;
     StringBuffer *b;
+    /* whether the default Object/Array prototypes carry a toJSON in their
+       chain; if not, plain objects/arrays can skip the per-node toJSON probe */
+    bool obj_proto_has_tojson;
+    bool arr_proto_has_tojson;
 } JSONStringifyContext;
+
+static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
+{
+    int i;
+    for (i = 0; i < jsc->stack_len; i++)
+        if (jsc->stack[i] == p)
+            return true;
+    return false;
+}
+
+static int json_stack_push(JSContext *ctx, JSONStringifyContext *jsc, JSObject *p)
+{
+    if (jsc->stack_len >= jsc->stack_size) {
+        int new_size = jsc->stack_size ? jsc->stack_size * 2 : 8;
+        JSObject **ns = js_realloc(ctx, jsc->stack, sizeof(*ns) * new_size);
+        if (!ns)
+            return -1;
+        jsc->stack = ns;
+        jsc->stack_size = new_size;
+    }
+    jsc->stack[jsc->stack_len++] = p; /* borrowed: alive on the recursion */
+    return 0;
+}
+
+/* fast, side-effect-free check: can we skip the toJSON lookup for this value? */
+static bool json_can_skip_tojson(JSContext *ctx, JSONStringifyContext *jsc,
+                                  JSValueConst val)
+{
+    JSObject *p;
+    int cl;
+
+    if (!JS_IsObject(val))
+        return false;
+    p = JS_VALUE_GET_OBJ(val);
+    cl = p->class_id;
+    if (cl == JS_CLASS_OBJECT) {
+        if (jsc->obj_proto_has_tojson)
+            return false;
+    } else if (cl == JS_CLASS_ARRAY) {
+        if (jsc->arr_proto_has_tojson)
+            return false;
+    } else {
+        return false;
+    }
+    /* must have the pristine default prototype and no own toJSON */
+    if (p->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[cl]))
+        return false;
+    if (find_own_property1(p, JS_ATOM_toJSON) != NULL)
+        return false;
+    return true;
+}
 
 static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
     JSValue r = JS_ToQuotedString(ctx, val);
@@ -52069,7 +52269,8 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     JSValue v;
     JSValueConst args[2];
 
-    if (JS_IsObject(val) || JS_IsBigInt(val)) {
+    if ((JS_IsObject(val) || JS_IsBigInt(val)) &&
+        !json_can_skip_tojson(ctx, jsc, val)) {
 		JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
 		if (JS_IsException(f))
 			goto exception;
@@ -52165,10 +52366,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             val = val1;
             goto concat_value;
         }
-        v = js_array_includes(ctx, jsc->stack, 1, vc(&val));
-        if (JS_IsException(v))
-            goto exception;
-        if (JS_ToBoolFree(ctx, v)) {
+        if (json_stack_contains(jsc, JS_VALUE_GET_OBJ(val))) {
             JS_ThrowTypeError(ctx, "circular reference");
             goto exception;
         }
@@ -52186,8 +52384,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             sep = js_dup(jsc->empty);
             sep1 = js_dup(jsc->empty);
         }
-        v = js_array_push(ctx, jsc->stack, 1, vc(&val), 0);
-        if (check_exception_free(ctx, v))
+        if (json_stack_push(ctx, jsc, JS_VALUE_GET_OBJ(val)))
             goto exception;
         ret = js_is_array(ctx, val);
         if (ret < 0)
@@ -52268,8 +52465,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             }
             string_buffer_putc8(jsc->b, '}');
         }
-        if (check_exception_free(ctx, js_array_pop(ctx, jsc->stack, 0, NULL, 0)))
-            goto exception;
+        jsc->stack_len--; /* pop (borrowed pointer, nothing to free) */
         JS_FreeValue(ctx, val);
         JS_FreeValue(ctx, tab);
         JS_FreeValue(ctx, sep);
@@ -52292,6 +52488,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
         }
         goto concat_value;
     case JS_TAG_INT:
+        {
+            /* format integers straight into the buffer (no JSString alloc) */
+            char numbuf[16];
+            int n = i32toa(numbuf, JS_VALUE_GET_INT(val));
+            return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
+        }
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     concat_value:
@@ -52325,7 +52527,9 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     int64_t i, j, n;
 
     jsc->replacer_func = JS_UNDEFINED;
-    jsc->stack = JS_UNDEFINED;
+    jsc->stack = NULL;
+    jsc->stack_len = 0;
+    jsc->stack_size = 0;
     jsc->property_list = JS_UNDEFINED;
     jsc->gap = JS_UNDEFINED;
     jsc->b = &b_s;
@@ -52333,10 +52537,29 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     ret = JS_UNDEFINED;
     wrapper = JS_UNDEFINED;
 
+    /* Determine once whether the default Object/Array prototypes carry a
+       toJSON method; if not, plain objects/arrays skip the per-node probe. */
+    {
+        JSValue f;
+        f = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_ATOM_toJSON);
+        if (JS_IsException(f)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            jsc->obj_proto_has_tojson = true;
+        } else {
+            jsc->obj_proto_has_tojson = JS_IsFunction(ctx, f);
+            JS_FreeValue(ctx, f);
+        }
+        f = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_ARRAY], JS_ATOM_toJSON);
+        if (JS_IsException(f)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            jsc->arr_proto_has_tojson = true;
+        } else {
+            jsc->arr_proto_has_tojson = JS_IsFunction(ctx, f);
+            JS_FreeValue(ctx, f);
+        }
+    }
+
     string_buffer_init(ctx, jsc->b, 0);
-    jsc->stack = JS_NewArray(ctx);
-    if (JS_IsException(jsc->stack))
-        goto exception;
     if (JS_IsFunction(ctx, replacer)) {
         jsc->replacer_func = replacer;
     } else {
@@ -52449,7 +52672,7 @@ done:
     JS_FreeValue(ctx, jsc->empty);
     JS_FreeValue(ctx, jsc->gap);
     JS_FreeValue(ctx, jsc->property_list);
-    JS_FreeValue(ctx, jsc->stack);
+    js_free(ctx, jsc->stack);
     return ret;
 }
 
