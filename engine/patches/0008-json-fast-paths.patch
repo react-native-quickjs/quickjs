@@ -7,11 +7,8 @@ What this does
 What it changes
   - JSON.stringify: cycle detection moves from a JSValue array to a plain
     heap stack of borrowed object pointers, so push/pop no longer allocate
-    or hit the GC. A per-stringify check also learns whether
-    Object.prototype or Array.prototype carries a toJSON method, letting
-    plain objects and arrays skip the per-node toJSON lookup entirely.
-    Integers are formatted straight into the output buffer instead of
-    building a temporary JSString.
+    or hit the GC. Integers are formatted straight into the output buffer
+    instead of building a temporary JSString.
   - JS_ToQuotedString: a 256-entry escape lookup table plus a bulk copy of
     the runs that need no escaping, replacing the per-character loop.
   - JSON.parse: a pure-ASCII string with no escapes is built directly from
@@ -24,7 +21,7 @@ Why we need it
   JSON is the serialization format React Native uses for the bridge and
   native bindings, so its hot shapes dominate real payloads. The engine's
   parser and serializer allocated per element and per character on paths
-  these fast paths make constant-time.
+  these fast paths make more efficient.
 
 Needs a bytecode version bump
   No. This changes only runtime behaviour inside quickjs.c; the bytecode
@@ -37,17 +34,23 @@ Notes
   engine commit and a different collector, so they are not carried over here;
   the effect is re-measured by tools/benchmark.
 
+  An earlier version of this port also skipped the per-node toJSON lookup
+  when the default Object/Array prototypes had none. That was unsafe: the
+  prototype chain is observable and can change during serialization, so it
+  was removed. toJSON is looked up on every object, as the specification
+  requires.
+
   The JSON.stringify cycle-stack holds borrowed object pointers that are all
   alive on the recursion stack, so it needs no refcounting. json_parse_value
   hands the staged element buffer to JS_NewArrayFrom, which takes ownership
   of the individual values on error; the buffer itself is freed here.
-diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -15187,6 +15187,15 @@ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
+@@ -15186,6 +15186,15 @@
+         return JS_ThrowTypeError(ctx, "null or undefined are forbidden");
      return JS_ToString(ctx, val);
  }
- 
++
 +/* 1 for bytes that must be escaped in a JSON string: control chars, '"', '\\' */
 +static const uint8_t json_quote_needs_escape[256] = {
 +    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,   /* 0x00-0x0f */
@@ -56,11 +59,10 @@ diff --git a/quickjs.c b/quickjs.c
 +    /* rest default to 0 except 0x5c = '\\' set below via designated init */
 +    [0x5c] = 1,
 +};
-+
+ 
  static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
  {
-     JSValue val;
-@@ -15206,6 +15215,51 @@ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
+@@ -15206,6 +15215,51 @@
  
      if (string_buffer_putc8(b, '\"'))
          goto fail;
@@ -112,12 +114,13 @@ diff --git a/quickjs.c b/quickjs.c
      for(i = 0; i < p->len; ) {
          c = string_getc(p, &i);
          switch(c) {
-@@ -24100,10 +24154,29 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
+@@ -24099,11 +24153,30 @@
+     int i;
      uint32_t c;
      StringBuffer b_s, *b = &b_s;
- 
-+    p = *pp;
 +
++    p = *pp;
+ 
 +    /* Fast path: a pure-ASCII string with no escapes can be built directly from
 +       the source range, skipping the StringBuffer entirely. */
 +    {
@@ -143,7 +146,7 @@ diff --git a/quickjs.c b/quickjs.c
      for(;;) {
          if (p >= s->buf_end) {
              goto end_of_input;
-@@ -24188,9 +24261,15 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+@@ -24188,9 +24261,15 @@
  {
      const uint8_t *p = *pp;
      const uint8_t *p_start = p;
@@ -160,7 +163,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      if (!is_digit(*p))
          return js_parse_error(s, "Unexpected token '%c'", *p_start);
-@@ -24198,10 +24277,17 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+@@ -24198,10 +24277,17 @@
      if (p[0] == '0' && is_digit(p[1]))
          return json_parse_error(s, p, "Unexpected number");
  
@@ -179,7 +182,7 @@ diff --git a/quickjs.c b/quickjs.c
          p++;
          if (!is_digit(*p))
              return json_parse_error(s, p, "Unterminated fractional number");
-@@ -24209,6 +24295,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+@@ -24209,6 +24295,7 @@
              p++;
      }
      if (*p == 'e' || *p == 'E') {
@@ -187,7 +190,7 @@ diff --git a/quickjs.c b/quickjs.c
          p++;
          if (*p == '+' || *p == '-')
              p++;
-@@ -24218,7 +24305,22 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+@@ -24218,7 +24305,22 @@
              p++;
      }
      s->token.val = TOK_NUMBER;
@@ -211,7 +214,7 @@ diff --git a/quickjs.c b/quickjs.c
      *pp = p;
      return 0;
  }
-@@ -51705,24 +51807,63 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+@@ -51705,24 +51807,63 @@
  
              if (json_next_token(s))
                  goto fail;
@@ -288,7 +291,7 @@ diff --git a/quickjs.c b/quickjs.c
                      el = json_parse_value(s, pr1);
                      if (JS_IsException(el))
                          goto fail;
-@@ -52049,13 +52190,72 @@ static JSValue js_json_rawJSON(JSContext *ctx, JSValueConst this_val,
+@@ -52049,12 +52190,39 @@
  
  typedef struct JSONStringifyContext {
      JSValueConst replacer_func;
@@ -302,12 +305,8 @@ diff --git a/quickjs.c b/quickjs.c
      JSValue gap;
      JSValue empty;
      StringBuffer *b;
-+    /* whether the default Object/Array prototypes carry a toJSON in their
-+       chain; if not, plain objects/arrays can skip the per-node toJSON probe */
-+    bool obj_proto_has_tojson;
-+    bool arr_proto_has_tojson;
  } JSONStringifyContext;
- 
++
 +static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
 +{
 +    int i;
@@ -330,49 +329,10 @@ diff --git a/quickjs.c b/quickjs.c
 +    jsc->stack[jsc->stack_len++] = p; /* borrowed: alive on the recursion */
 +    return 0;
 +}
-+
-+/* fast, side-effect-free check: can we skip the toJSON lookup for this value? */
-+static bool json_can_skip_tojson(JSContext *ctx, JSONStringifyContext *jsc,
-+                                  JSValueConst val)
-+{
-+    JSObject *p;
-+    int cl;
-+
-+    if (!JS_IsObject(val))
-+        return false;
-+    p = JS_VALUE_GET_OBJ(val);
-+    cl = p->class_id;
-+    if (cl == JS_CLASS_OBJECT) {
-+        if (jsc->obj_proto_has_tojson)
-+            return false;
-+    } else if (cl == JS_CLASS_ARRAY) {
-+        if (jsc->arr_proto_has_tojson)
-+            return false;
-+    } else {
-+        return false;
-+    }
-+    /* must have the pristine default prototype and no own toJSON */
-+    if (p->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[cl]))
-+        return false;
-+    if (find_own_property1(p, JS_ATOM_toJSON) != NULL)
-+        return false;
-+    return true;
-+}
-+
+ 
  static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
      JSValue r = JS_ToQuotedString(ctx, val);
-     JS_FreeValue(ctx, val);
-@@ -52069,7 +52269,8 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
-     JSValue v;
-     JSValueConst args[2];
- 
--    if (JS_IsObject(val) || JS_IsBigInt(val)) {
-+    if ((JS_IsObject(val) || JS_IsBigInt(val)) &&
-+        !json_can_skip_tojson(ctx, jsc, val)) {
- 		JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
- 		if (JS_IsException(f))
- 			goto exception;
-@@ -52165,10 +52366,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+@@ -52165,10 +52333,7 @@
              val = val1;
              goto concat_value;
          }
@@ -384,7 +344,7 @@ diff --git a/quickjs.c b/quickjs.c
              JS_ThrowTypeError(ctx, "circular reference");
              goto exception;
          }
-@@ -52186,8 +52384,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+@@ -52186,8 +52351,7 @@
              sep = js_dup(jsc->empty);
              sep1 = js_dup(jsc->empty);
          }
@@ -394,7 +354,7 @@ diff --git a/quickjs.c b/quickjs.c
              goto exception;
          ret = js_is_array(ctx, val);
          if (ret < 0)
-@@ -52268,8 +52465,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+@@ -52268,8 +52432,7 @@
              }
              string_buffer_putc8(jsc->b, '}');
          }
@@ -404,7 +364,7 @@ diff --git a/quickjs.c b/quickjs.c
          JS_FreeValue(ctx, val);
          JS_FreeValue(ctx, tab);
          JS_FreeValue(ctx, sep);
-@@ -52292,6 +52488,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+@@ -52292,6 +52455,12 @@
          }
          goto concat_value;
      case JS_TAG_INT:
@@ -417,7 +377,7 @@ diff --git a/quickjs.c b/quickjs.c
      case JS_TAG_BOOL:
      case JS_TAG_NULL:
      concat_value:
-@@ -52325,7 +52527,9 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+@@ -52325,7 +52494,9 @@
      int64_t i, j, n;
  
      jsc->replacer_func = JS_UNDEFINED;
@@ -428,32 +388,9 @@ diff --git a/quickjs.c b/quickjs.c
      jsc->property_list = JS_UNDEFINED;
      jsc->gap = JS_UNDEFINED;
      jsc->b = &b_s;
-@@ -52333,10 +52537,29 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
-     ret = JS_UNDEFINED;
+@@ -52334,9 +52505,6 @@
      wrapper = JS_UNDEFINED;
  
-+    /* Determine once whether the default Object/Array prototypes carry a
-+       toJSON method; if not, plain objects/arrays skip the per-node probe. */
-+    {
-+        JSValue f;
-+        f = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_ATOM_toJSON);
-+        if (JS_IsException(f)) {
-+            JS_FreeValue(ctx, JS_GetException(ctx));
-+            jsc->obj_proto_has_tojson = true;
-+        } else {
-+            jsc->obj_proto_has_tojson = JS_IsFunction(ctx, f);
-+            JS_FreeValue(ctx, f);
-+        }
-+        f = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_ARRAY], JS_ATOM_toJSON);
-+        if (JS_IsException(f)) {
-+            JS_FreeValue(ctx, JS_GetException(ctx));
-+            jsc->arr_proto_has_tojson = true;
-+        } else {
-+            jsc->arr_proto_has_tojson = JS_IsFunction(ctx, f);
-+            JS_FreeValue(ctx, f);
-+        }
-+    }
-+
      string_buffer_init(ctx, jsc->b, 0);
 -    jsc->stack = JS_NewArray(ctx);
 -    if (JS_IsException(jsc->stack))
@@ -461,7 +398,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (JS_IsFunction(ctx, replacer)) {
          jsc->replacer_func = replacer;
      } else {
-@@ -52449,7 +52672,7 @@ done:
+@@ -52449,7 +52617,7 @@
      JS_FreeValue(ctx, jsc->empty);
      JS_FreeValue(ctx, jsc->gap);
      JS_FreeValue(ctx, jsc->property_list);

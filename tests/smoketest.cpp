@@ -130,6 +130,29 @@ int main() {
   check(
       eval(rt, "JSON.stringify({a:1})").getString(rt).utf8(rt) == "{\"a\":1}",
       "JSON");
+  // toJSON is observable per the specification: it must be looked up on every
+  // object, even when the default prototypes have none. A fast path that
+  // skips it would silently serialize the wrong value (regression guard).
+  check(
+      eval(
+          rt,
+          "var p=Object.prototype.toJSON=function(){return 'proto'};"
+          "var r=JSON.stringify({a:1});delete Object.prototype.toJSON;"
+          "r")
+              .getString(rt)
+              .utf8(rt) == "\"proto\"",
+      "JSON toJSON on Object.prototype");
+  check(
+      eval(
+          rt,
+          "Object.defineProperty(Object.prototype,'toJSON',{get:function(){"
+          "var t=this;return t===Object.prototype?undefined:function(){"
+          "return 'converted'};}});"
+          "var r=JSON.stringify({v:1});delete Object.prototype.toJSON;"
+          "r")
+              .getString(rt)
+              .utf8(rt) == "\"converted\"",
+      "JSON toJSON accessor");
   check(
       eval(rt, "typeof Symbol()").getString(rt).utf8(rt) == "symbol", "Symbol");
   check(eval(rt, "10n ** 3n === 1000n").getBool(), "BigInt");
