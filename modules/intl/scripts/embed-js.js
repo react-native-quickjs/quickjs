@@ -116,11 +116,18 @@ function parseArgs(argv) {
      * change: +1,914 B for four mechanisms, six counters and a bitmask on one
      * seam.
      *
+     * RAISED FROM 212 KB TO 220 KB ON 2026-09-04. The recent perf work added
+     * the toLocaleString options-object memo and the ASCII fast path on
+     * toLocale*Case. Both are 2026-09 bench wins: 95 us -> 2 us on
+     * `toLocaleString-locale+opts` (39x) and 506 ns -> ~50 ns on
+     * `toLocaleUpperCase` against a German locale (10x). The source cost
+     * is ~1.7 KB; the blob cost is the number to watch (`maxBlob` below).
+     *
      * If this gate fires again on comments, raise it again and write down why.
      * The gate that must not be raised without a data-versus-code argument is
      * `maxBlob` below.
      */
-    max: 212 * 1024,
+    max: 220 * 1024,
     /*
      * The blob budget. 100 KB of QuickJS bytecode — the bytes that ship.
      *

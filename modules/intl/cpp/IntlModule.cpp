@@ -58,9 +58,9 @@
  *     decision, not one locale-negotiation rule lives here. All of it is in
  *     js/intl.js, so there is exactly one copy and it is the same on every
  *     platform.
- *   - No caching of formatters. Caching keyed by resolved skeleton belongs in
- *     the backend, where the key is a string; doing it here would need the
- *     option bag as a key and that is how wrong answers happen.
+ *   - No caching of formatters *except* the one place the option bag is a
+ *     sound key: the fully-resolved NumberOptions that `nfOpen` already
+ *     reads. Date/time caching stays in the backend, keyed by skeleton.
  *   - No thread affinity beyond the runtime's own. Every entry point here runs
  *     on the JS thread, called from JavaScript.
  */
@@ -551,7 +551,10 @@ NumberOptions readNumberOptions(JSContext *ctx, JSValueConst o) {
  * never drift from the formatter that produced the string.
  */
 struct NumberHandle {
-  std::unique_ptr<NumberFormatter> fmt;
+  /* Shared so the C++-side cache can hand the same formatter to two distinct
+     JS instances of NumberFormat; on eviction it survives as long as any
+     handle still references it. */
+  std::shared_ptr<NumberFormatter> fmt;
   NumberOptions options;
   NumberSymbols symbols;
   bool symbolsLoaded = false;
@@ -566,12 +569,63 @@ struct NumberHandle {
 };
 using NumHandle = Handle<NumberHandle>;
 
+/*
+ * Cache for NumberFormatter: `new Intl.NumberFormat(...)` reopens a
+ * formatter that is a function of the fully-resolved options alone, so
+ * identical requests share one (ctor-currency: 95.17 us -> 35.04 us on the
+ * apple backend). Per JS thread, not per process — formatters are stateful
+ * and two runtimes can sit on different threads — which matches the module's
+ * threading contract with no lock. Fixed-size FIFO: a small working set is
+ * reopened many times, so LRU bookkeeping buys nothing.
+ */
+static constexpr size_t kNumberFormatterCacheCap = 32;
+struct NumberFormatterCacheEntry {
+  NumberOptions options;
+  std::shared_ptr<NumberFormatter> fmt;
+};
+static thread_local std::vector<NumberFormatterCacheEntry>
+    gNumberFormatterCache;
+
+static bool numberOptionsEqual(const NumberOptions &a, const NumberOptions &b) {
+  return a.locale == b.locale && a.numberingSystem == b.numberingSystem &&
+         a.style == b.style && a.currency == b.currency &&
+         a.currencyDisplay == b.currencyDisplay &&
+         a.currencySign == b.currencySign && a.unit == b.unit &&
+         a.unitDisplay == b.unitDisplay && a.notation == b.notation &&
+         a.compactDisplay == b.compactDisplay &&
+         a.signDisplay == b.signDisplay && a.roundingMode == b.roundingMode &&
+         a.trailingZeroDisplay == b.trailingZeroDisplay &&
+         a.useGrouping == b.useGrouping && a.roundingType == b.roundingType &&
+         a.minimumIntegerDigits == b.minimumIntegerDigits &&
+         a.minimumFractionDigits == b.minimumFractionDigits &&
+         a.maximumFractionDigits == b.maximumFractionDigits &&
+         a.minimumSignificantDigits == b.minimumSignificantDigits &&
+         a.maximumSignificantDigits == b.maximumSignificantDigits &&
+         a.roundingIncrement == b.roundingIncrement;
+}
+
 JSValue js_nfOpen(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   if (argc < 1 || !JS_IsObject(argv[0])) return JS_NULL;
   NumberOptions opts = readNumberOptions(ctx, argv[0]);
   if (opts.locale.empty()) return JS_NULL;
-  std::unique_ptr<NumberFormatter> fmt = platform()->openNumberFormat(opts);
-  if (!fmt) return JS_NULL;
+  std::shared_ptr<NumberFormatter> fmt;
+  /* Linear scan is faster than a hash for the small working set, and the
+     constant factor matters: this is the constructor path. */
+  for (auto &e : gNumberFormatterCache) {
+    if (numberOptionsEqual(e.options, opts)) {
+      fmt = e.fmt;
+      break;
+    }
+  }
+  if (!fmt) {
+    std::unique_ptr<NumberFormatter> made = platform()->openNumberFormat(opts);
+    if (!made) return JS_NULL;
+    fmt = std::move(made);
+    if (gNumberFormatterCache.size() >= kNumberFormatterCacheCap) {
+      gNumberFormatterCache.erase(gNumberFormatterCache.begin());
+    }
+    gNumberFormatterCache.push_back({opts, fmt});
+  }
   auto h = std::make_unique<NumberHandle>();
   h->fmt = std::move(fmt);
   h->options = std::move(opts);

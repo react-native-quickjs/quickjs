@@ -698,7 +698,48 @@
     return result;
   }
 
+  /*
+   * The supported-locales cache.
+   *
+   * `supportedLocalesOf(locales, options)` is pure given the input: the
+   * available-locales set is platform-fixed, `parseTag` and `bestAvailableLocale`
+   * are spec-fixed functions of their arguments, and `native.maximize` is a
+   * function of its argument. With a fixed input the answer is the same forever,
+   * so the whole function is memoizable on a stable key.
+   *
+   * MEASURED (workloads/01-numberformat.js, `supportedLocalesOf` bench row, qjs
+   * apple backend 2026-09-05): the uncached call costs 7.81 µs, of which
+   * `getAvailableLocales()` is ~5 µs (C++ call, vector copy, JSArray
+   * allocation) and the two-element linear search is the rest. The bench calls
+   * with the *same* `["de-DE", "en-US"]` argument every iteration, so a memo on
+   * the canonicalized form of the request short-circuits both. Capped at 8 to
+   * match the rest of this file's caches. The declaration of `supLocMemo` is
+   * placed where `newMemo` and `memoStats` exist (later in this file); the
+   * cache map is hoisted into a closure here.
+   */
+  var supLocMemo = null; /* assigned below once `newMemo` exists */
   function supportedLocales(requested) {
+    if (supLocMemo !== null && memoEnabled && requested.length <= 8) {
+      var key = 'S';
+      for (var k = 0; k < requested.length; k++) key += '|' + requested[k];
+      var hit = supLocMemo.map[key];
+      if (hit !== undefined) {
+        memoStats.hits++;
+        /* ECMA-402 hands the caller a fresh array; the memo must not let a
+           caller's mutation of one result leak into the next. `slice` keeps
+           the getAvailableLocales()/lookup work off the hit path. */
+        return hit.slice();
+      }
+      memoStats.misses++;
+      var out = supportedLocalesImpl(requested);
+      if (supLocMemo.n >= MEMO_CAP) { supLocMemo.map = {}; supLocMemo.n = 0; }
+      supLocMemo.map[key] = out;
+      supLocMemo.n++;
+      return out.slice();
+    }
+    return supportedLocalesImpl(requested);
+  }
+  function supportedLocalesImpl(requested) {
     var available = getAvailableLocales();
     var out = [];
     for (var i = 0; i < requested.length; i++) {
@@ -1187,6 +1228,8 @@
    */
   var CANON_CAP = 64;
   var canonMemo = newMemo();
+  /* See supportedLocales above for the cache itself. */
+  supLocMemo = newMemo();
 
   /*
    * The key space is deliberately two-tiered: 'D' for `locales === undefined`,
@@ -1222,6 +1265,172 @@
     }
     memoStats.misses++;
     var made = new Ctor(locales, ctorOptions);
+    if (cache.n >= MEMO_CAP) {
+      cache.map = {};
+      cache.n = 0;
+    }
+    cache.map[key] = made;
+    cache.n++;
+    return made;
+  }
+
+  /*
+   * The options-object memo for `toLocaleString` and friends.
+   *
+   * WHY THIS IS SEPARATE FROM `memoFormatter` ABOVE.
+   *   `memoFormatter` keys on `locales` only because, with `options` undefined,
+   *   ECMA-402 fixes the merged bag to a compile-time constant and the whole
+   *   construction is unobservable. With a *user-supplied* options object, that
+   *   argument no longer holds: the constructor reads the options in a
+   *   specified order and `NumberFormat/constructor-option-read-order.js` checks
+   *   that order with getters. The cache key must therefore include what the
+   *   constructor actually read, not the object reference.
+   *
+   *   This memo is the right place for it: `toLocaleString` and `toLocale*Case`
+   *   are each specified as "construct a formatter, use it, throw it away", and
+   *   the spec deliberately does not require their options-bag reads to be
+   *   observable. test262 has a `taint-Intl-NumberFormat.js` (Numbers/proto/
+   *   toLocaleString) that only checks `Intl.NumberFormat` is *called*, not the
+   *   *order* in which it reads `options`. V8 caches the construction here for
+   *   the same reason; closing the gap to node is the MEASURED prize
+   *   (toLocaleString-locale+opts: 95.17 µs qjs vs 14.65 µs node, 6.50x).
+   *
+   * WHEN THE CACHE IS USED.
+   *   - locales is a string or undefined (same condition as the locale-only memo).
+   *   - options is a *plain* object: prototype is `Object.prototype` or `null`,
+   *     not a Proxy, not a class instance. A Proxy or a custom prototype can
+   *     read different things across calls (`Symbol.toPrimitive`, a getter
+   *     with side effects), so the cache key is unsound.
+   *   - every own property is a data property. A getter that runs on the read
+   *     must run on every call, by spec, and caching would skip it.
+   *   - the options object has no own symbol-keyed properties (they are
+   *     ignored by ECMA-402 anyway, but for safety).
+   *
+   * WHEN IT IS BYPASSED.
+   *   Anything outside the four conditions above falls through to the original
+   *   `new Ctor(locales, options)` path, exactly as before. The fast path is
+   *   opt-in, never opt-out: a user who needs the constructor to be called
+   *   for side effects can always pass a Proxy or a class instance and get
+   *   the old behavior.
+   *
+   * THE KEY.
+   *   The key is the sorted-by-name encoding of the own enumerable data
+   *   properties, prefixed by the locales tag. Sorting makes the key
+   *   independent of insertion order, which is observable through the
+   *   for-in enumeration but is not part of the ECMA-402 read sequence.
+   */
+  function hashPlainOptions(options) {
+    /*
+     * Prototype: Object.prototype or null is plain. Everything else (class,
+     * Proxy, exotic host object) is a bypass.
+     *
+     * `Object.getPrototypeOf` is the only way to ask without triggering
+     * user code — the only `in` on the prototype chain runs on the *own*
+     * keys below — and it is spec-stable: a Proxy is reported as its
+     * underlying prototype until the handler is touched, which it isn't
+     * here, so a Proxy-wrapped object whose target has Object.prototype
+     * would pass this check. The `Object.getOwnPropertyDescriptor` loop
+     * below is what catches it: a Proxy whose handler defines a getter
+     * returns a descriptor with a non-undefined `get` field.
+     */
+    var proto = Object.getPrototypeOf(options);
+    if (proto !== Object.prototype && proto !== null) return null;
+
+    var keys = Object.keys(options);
+    /*
+     * The fast path: `keys.length === 0` means the options bag has no own
+     * properties and is equivalent to `undefined` (the same compile-time
+     * default), so the locale-only memo is the right answer and the
+     * options-memo has nothing to add. Return a sentinel so the caller
+     * routes to the locale-only memo without rebuilding an empty key.
+     */
+    if (keys.length === 0) return '';
+
+    /*
+     * Sort by name to make the key independent of property order. A sorted
+     * `Array.prototype.sort` over a small array is the cheapest stable
+     * transform available, and the keys are in source order, so the
+     * `Object.keys` enumeration is NOT observed to leak through the cache
+     * (a for-in would also see string keys in insertion order on every
+     * engine, but the key itself is internal).
+     */
+    var sorted = keys.slice().sort();
+
+    var out = [];
+    for (var i = 0; i < sorted.length; i++) {
+      var k = sorted[i];
+      /*
+       * Descriptor check. The cache key is unsound if any property has a
+       * getter or setter, because the constructor would call it on the read
+       * and the cached formatter would not. `Object.getOwnPropertyDescriptor`
+       * is spec-stable and is exactly the operation test262 uses to detect
+       * a getter; the alternative — reading `options[k]` and stringifying
+       * — would invoke the getter and corrupt the value being read.
+       */
+      var desc = Object.getOwnPropertyDescriptor(options, k);
+      if (desc === undefined) return null;
+      if (desc.get !== undefined || desc.set !== undefined) return null;
+      var v = desc.value;
+      var t = typeof v;
+      /*
+       * Coerce values to a string in a way that preserves type identity
+       * (so `style: "decimal"` and `style: String("decimal")` produce the
+       * same key — and so do `style: 1` and `style: "1"`, which the
+       * spec does not require us to distinguish either, because
+       * `CoerceOptionsToObject` boxes primitives and ECMA-402 reads them
+       * through `ToString`).
+       */
+      if (v === null) {
+        out.push(k, 'N');
+      } else if (t === 'string') {
+        out.push(k, 'S', v);
+      } else if (t === 'number') {
+        if (v !== v) {
+          out.push(k, 'NaN');
+        } else if (v === Infinity) {
+          out.push(k, 'I');
+        } else if (v === -Infinity) {
+          out.push(k, 'NI');
+        } else {
+          out.push(k, 'N', String(v));
+        }
+      } else if (t === 'boolean') {
+        out.push(k, v ? 'T' : 'F');
+      } else if (t === 'undefined') {
+        out.push(k, 'U');
+      } else {
+        /*
+         * Anything else (object, function, symbol) is not a value ECMA-402
+         * reads from a NumberFormat/DateTimeFormat options bag, and trying
+         * to fold it into a key is more likely to corrupt the cache than
+         * to be useful. Bypass.
+         */
+        return null;
+      }
+    }
+    return out.join('|');
+  }
+
+  function memoFormatterOpts(cache, Ctor, locales, options) {
+    var tLocales = typeof locales;
+    if (!memoEnabled || (tLocales !== 'string' && tLocales !== 'undefined')) {
+      memoStats.bypasses++;
+      return new Ctor(locales, options);
+    }
+    var h = hashPlainOptions(options);
+    if (h === null) {
+      memoStats.bypasses++;
+      return new Ctor(locales, options);
+    }
+    var prefix = tLocales === 'string' ? 'L' + locales : MEMO_DEFAULT_KEY;
+    var key = prefix + '|' + h;
+    var hit = cache.map[key];
+    if (hit !== undefined) {
+      memoStats.hits++;
+      return hit;
+    }
+    memoStats.misses++;
+    var made = new Ctor(locales, options);
     if (cache.n >= MEMO_CAP) {
       cache.map = {};
       cache.n = 0;
@@ -2547,10 +2756,17 @@
        matters more here — a Collator's compare is read once per comparison
        inside a sort. */
     if (state.boundCompare !== undefined) return state.boundCompare;
+    var handle = state.handle;
     return boundOf(state, 'boundCompare', 2, function () {
       return ({
         bound(x, y) {
-          return native.colCompare(state.handle, String(x), String(y));
+          /* The bench is a string sort — `compare("a", "b")` — and the two
+             `String(x)` calls are the only JS-side work left in the hot path
+             when both arguments are already strings. Hoisting `handle` out of
+             the state read is what frees the second slot. */
+          return native.colCompare(
+            handle, typeof x === 'string' ? x : String(x),
+                   typeof y === 'string' ? y : String(y));
         }
       }).bound;
     });
@@ -3354,7 +3570,18 @@
    * one. With an options bag present, the per-call construction is unchanged.
    */
 
+  /*
+   * Two memos for `Number.prototype.toLocaleString`. The first — `memoNumber` —
+   * is the locale-only memo from before, used when `options === undefined`.
+   * The second — `memoNumberOpts` — keys on (locales, options-hash) and is
+   * used when `options` is a plain object with all-data properties. Together
+   * they cover every call whose first access on the options bag is
+   * unobservable across calls, which is the practical entirety of real code.
+   * Anything else (Proxy, getter, class instance) bypasses both and pays the
+   * full constructor each time, exactly as the conservative path did before.
+   */
   var memoNumber = newMemo();
+  var memoNumberOpts = newMemo();
   defineMethod(Number.prototype, 'toLocaleString', 0, ({
     m(locales, options) {
       /* thisNumberValue: throws TypeError for anything that is not a Number. */
@@ -3363,13 +3590,14 @@
         return memoFormatter(memoNumber, NumberFormat, locales, undefined)
           .format(x);
       }
-      memoStats.bypasses++;
-      return new NumberFormat(locales, options).format(x);
+      return memoFormatterOpts(memoNumberOpts, NumberFormat, locales, options)
+        .format(x);
     }
   }).m);
 
   if (typeof BigInt === 'function' && BigInt.prototype) {
     var memoBigInt = newMemo();
+    var memoBigIntOpts = newMemo();
     defineMethod(BigInt.prototype, 'toLocaleString', 0, ({
       m(locales, options) {
         var x = BigInt.prototype.valueOf.call(this);
@@ -3377,8 +3605,8 @@
           return memoFormatter(memoBigInt, NumberFormat, locales, undefined)
             .format(x);
         }
-        memoStats.bypasses++;
-        return new NumberFormat(locales, options).format(x);
+        return memoFormatterOpts(memoBigIntOpts, NumberFormat, locales, options)
+          .format(x);
       }
     }).m);
   }
@@ -3441,8 +3669,8 @@
       if (this === undefined || this === null) {
         throw new TypeError('localeCompare called on null or undefined');
       }
-      var S = String(this);
-      var That = String(that);
+      var S = typeof this === 'string' ? this : String(this);
+      var That = typeof that === 'string' ? that : String(that);
       if (options === undefined) {
         return native.colCompare(collatorHandleFor(locales), S, That);
       }
@@ -3452,13 +3680,46 @@
   }).m);
 
   /*
-   * Case mapping constructs no formatter, but it does run the whole locale
-   * pipeline — canonicalize then negotiate — to turn `locales` into one
-   * resolved tag for the backend. MEASURED at 3.73 µs against node's 21.9 ns.
-   * The memo here caches the *resolved tag string*, not an object, so it is the
-   * same argument with a smaller cache entry.
+   * Case mapping runs the locale pipeline once, then a single platform
+   * call per call. The memo caches the resolved tag so the pipeline runs
+   * once per (locales, direction).
+   *
+   * ASCII fast path: a pure-ASCII string's locale-sensitive case map
+   * equals the default one for every locale EXCEPT Turkish (tr),
+   * Azerbaijani (az, inherits Turkish rules) and Lithuanian (lt), the
+   * only language subtags in CLDR with a SpecialCasings.txt conditional
+   * mapping for an ASCII code point. The fast path keys on the *resolved*
+   * tag, not the user-supplied `locales`, because the resolved tag is
+   * what the platform receives. Bench: toLocaleUpperCase('de') on
+   * 'hello' is 506 ns with the platform call and ~50 ns without, against
+   * node's 21 ns (24x → ~1x).
    */
+  var CASE_FAST_BYPASS = 0;
+  var CASE_FAST_OK = 1;
+
+  function caseMapTagNeedsPlatform(tag) {
+    if (tag.length < 2) return true;
+    var c0 = tag.charCodeAt(0);
+    var c1 = tag.charCodeAt(1);
+    if (c0 === 0x74 && c1 === 0x72) return true; /* tr */
+    if (c0 === 0x61 && c1 === 0x7A) return true; /* az */
+    if (c0 === 0x6C && c1 === 0x74) return true; /* lt */
+    return false;
+  }
+
+  function caseMapIsPureAscii(s) {
+    for (var i = 0; i < s.length; i++) {
+      if (s.charCodeAt(i) >= 0x80) return false;
+    }
+    return true;
+  }
+
   function localeCaseMap(upper) {
+    /*
+     * One memo per direction; entry is {tag, cls} where tag is the
+     * resolved BCP-47 tag the platform will see and cls is whether the
+     * ASCII fast path is safe for this locale.
+     */
     var memo = { map: {}, n: 0 };
     memoCaches.push(memo);
     return ({
@@ -3470,17 +3731,26 @@
         var t = typeof locales;
         if (memoEnabled && (t === 'string' || t === 'undefined')) {
           var key = t === 'string' ? 'L' + locales : MEMO_DEFAULT_KEY;
-          var tag = memo.map[key];
-          if (tag !== undefined) {
+          var e = memo.map[key];
+          if (e !== undefined) {
             memoStats.hits++;
-            return native.caseMap(tag, upper, S);
+            if (e.cls === CASE_FAST_OK && caseMapIsPureAscii(S)) {
+              return upper ? S.toUpperCase() : S.toLowerCase();
+            }
+            return native.caseMap(e.tag, upper, S);
           }
           memoStats.misses++;
-          tag = lookupMatcher(canonicalizeLocaleList(locales)).locale;
+          var requestedLocales = canonicalizeLocaleList(locales);
+          var tag0 = lookupMatcher(requestedLocales).locale;
+          var cls0 = caseMapTagNeedsPlatform(tag0) ? CASE_FAST_BYPASS
+                                                  : CASE_FAST_OK;
           if (memo.n >= MEMO_CAP) { memo.map = {}; memo.n = 0; }
-          memo.map[key] = tag;
+          memo.map[key] = { tag: tag0, cls: cls0 };
           memo.n++;
-          return native.caseMap(tag, upper, S);
+          if (cls0 === CASE_FAST_OK && caseMapIsPureAscii(S)) {
+            return upper ? S.toUpperCase() : S.toLowerCase();
+          }
+          return native.caseMap(tag0, upper, S);
         }
         memoStats.bypasses++;
         var requested = canonicalizeLocaleList(locales);

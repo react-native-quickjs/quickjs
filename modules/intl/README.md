@@ -128,3 +128,14 @@ tie resolves identically on iOS and Android; Apple lacks a few
 `RelativeTimeFormat` and unit forms that `android.icu` has, and Android lacks
 compound `x-per-y` units that Apple derives. A deviation found later is a bug;
 the list is kept current in `js/intl.js` and the platform files.
+
+## Acknowledgements
+
+This module is largely inspired by the Intl support in the
+[Hermes JavaScript engine](https://github.com/facebook/hermes). The core idea —
+that a mobile app should not ship its own copy of the CLDR locale database when
+the operating system already carries one, so the algorithm is implemented once
+and the data is reached through a thin platform seam — is exactly the approach
+Hermes pioneered for React Native. Much of what this package does is a
+QuickJS-flavored retelling of that design, and the ECMA-402 behavior it aims
+for is the behavior Hermes established as the baseline on iOS and Android.
