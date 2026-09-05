@@ -1,5 +1,7 @@
 # @react-native-quickjs/intl
 
+[![npm](https://img.shields.io/npm/v/@react-native-quickjs/intl?color=cb3837)](https://www.npmjs.com/package/@react-native-quickjs/intl)
+
 ECMA-402 `Intl` for react-native-quickjs, backed by the operating system's own
 CLDR database as Hermes does. No locale data ships in your bundle and none ships in this
 package.
