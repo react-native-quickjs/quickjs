@@ -63,6 +63,8 @@
     "bench": "cmake -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j8 && ctest --test-dir build-release -V -R jsi_bench",
     "bytecode": "./build/qjsc-ng",
     "clean": "rm -rf build build-release",
+    "format": "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.mm' | grep -Ev '^(engine/|tests/third_party/|modules/napi/)' | grep -v '^android/src/main/jni/JJSRuntimeFactory.h$')",
+    "format:check": "clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' '*.cpp' '*.mm' | grep -Ev '^(engine/|tests/third_party/|modules/napi/)' | grep -v '^android/src/main/jni/JJSRuntimeFactory.h$')",
     "prepack": "node scripts/check-submodule.js && node scripts/apply-patches.js --check && node scripts/sync-quickjs-rel.js --check",
     "postinstall": "node scripts/postinstall.js",
     "example": "npm run --workspace @react-native-quickjs/example",
