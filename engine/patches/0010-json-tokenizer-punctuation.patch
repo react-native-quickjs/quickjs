@@ -16,10 +16,6 @@ Why we need it
 Needs a bytecode version bump
   No. This is a JSON tokenizer change only; bytecode is untouched.
 
-Notes
-  The fast path handles only the six bytes that carry no payload. True, false,
-  null, strings and numbers still take the full slow path so their line/column
-  tracking is preserved for error backtraces.
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -24369,6 +24369,21 @@

@@ -28,15 +28,6 @@ Needs a bytecode version bump
   No. This changes only runtime behaviour inside quickjs.c; the bytecode
   format is untouched.
 
-Notes
-  Ported from the research tree (0010-json-stringify-fast-paths) and layered
-  on 0008, which supplies the JS_ToQuotedString narrow fast path this
-  refactor splits out. The source's toJSON skip is not carried over -- 0008
-  deliberately removed that optimization for a correctness bug, and this
-  patch must look up toJSON on every object.
-
-  An earlier draft of the research patch had progress comments throughout;
-  only the integral-double exactness note is kept here.
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -15196,25 +15196,14 @@
