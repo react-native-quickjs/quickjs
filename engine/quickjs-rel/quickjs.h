@@ -184,6 +184,7 @@ enum {
     JS_TAG_SYMBOL      = -8,
     JS_TAG_STRING      = -7,
     JS_TAG_STRING_ROPE = -6,
+    JS_TAG_LAZY_JSON   = -4, /* internal, immediate lazy JSON entry index */
     JS_TAG_MODULE      = -3, /* used internally */
     JS_TAG_FUNCTION_BYTECODE = -2, /* used internally */
     JS_TAG_OBJECT      = -1,
@@ -396,7 +397,9 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 #define JS_VALUE_IS_BOTH_INT(v1, v2) ((JS_VALUE_GET_TAG(v1) | JS_VALUE_GET_TAG(v2)) == 0)
 #define JS_VALUE_IS_BOTH_FLOAT(v1, v2) (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v1)) && JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v2)))
 
-#define JS_VALUE_HAS_REF_COUNT(v) ((unsigned)JS_VALUE_GET_TAG(v) >= (unsigned)JS_TAG_FIRST)
+#define JS_VALUE_HAS_REF_COUNT(v) \
+    (JS_VALUE_GET_TAG(v) != JS_TAG_LAZY_JSON && \
+     (unsigned)JS_VALUE_GET_TAG(v) >= (unsigned)JS_TAG_FIRST)
 
 /* special values */
 #define JS_NULL      JS_MKVAL(JS_TAG_NULL, 0)
