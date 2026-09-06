@@ -349,6 +349,9 @@ struct JSRuntime {
     JSArenaState arena_state;
     const char *rt_info;
 
+    /* Private key used by the experimental lazy JSON document tape. */
+    JSAtom lazy_json_node_atom;
+
     int atom_hash_size; /* power of two */
     int atom_count;
     int atom_size;
@@ -9602,8 +9605,8 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
-static int js_lazy_marker_is(JSValue v);
-static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot);
+static int js_lazy_marker_is(JSValueConst v);
+static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
 
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                       JSAtom prop, JSValueConst this_obj,
@@ -9691,7 +9694,7 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 }
             } else {
                 if (js_lazy_marker_is(pr->u.value))
-                    return js_lazy_materialize_slot(ctx, &pr->u.value);
+                    return js_lazy_materialize_slot(ctx, &pr->u.value, p);
                 return js_dup(pr->u.value);
             }
         }
@@ -10251,7 +10254,13 @@ retry:
                     goto retry;
                 }
             } else {
-                desc->value = js_dup(pr->u.value);
+                if (js_lazy_marker_is(pr->u.value)) {
+                    desc->value = js_lazy_materialize_slot(ctx, &pr->u.value, p);
+                    if (JS_IsException(desc->value))
+                        return -1;
+                } else {
+                    desc->value = js_dup(pr->u.value);
+                }
             }
         } else {
             if (pflags) {
@@ -10457,8 +10466,8 @@ JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val)
     return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
 }
 
-static int js_lazy_marker_is(JSValue v);
-static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot);
+static int js_lazy_marker_is(JSValueConst v);
+static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
 
 static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
                                       uint32_t idx, JSValue *pval)
@@ -10468,7 +10477,7 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     case JS_CLASS_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
         if (js_lazy_marker_is(p->u.array.u.values[idx]))
-            *pval = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx]);
+            *pval = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
         else
             *pval = js_dup(p->u.array.u.values[idx]);
         return true;
@@ -20168,7 +20177,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (unlikely(prs->flags & JS_PROP_TMASK))
                                 goto get_field_slow_path;
                             if (js_lazy_marker_is(pr->u.value)) {
-                                val = js_lazy_materialize_slot(ctx, &pr->u.value);
+                                val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
                             } else {
                                 val = js_dup(pr->u.value);
                             }
@@ -20476,7 +20485,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         if (js_lazy_marker_is(p->u.array.u.values[idx]))
-                            val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx]);
+                            val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
                         else
                             val = js_dup(p->u.array.u.values[idx]);
                         JS_FreeValue(ctx, sp[-2]);
@@ -20513,7 +20522,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         if (js_lazy_marker_is(p->u.array.u.values[idx]))
-                            sp[-1] = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx]);
+                            sp[-1] = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
                         else
                             sp[-1] = js_dup(p->u.array.u.values[idx]);
                         BREAK;
@@ -52113,7 +52122,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
 /* ---- Temporary lazy JSON.parse experiment (QJS_JSON_LAZY=1) ----
    NOT a production patch. Exposes accessors; may retain source copies. */
 
-#define QJS_JSON_LAZY_DOC_MIN_LEN 65536U
+#define QJS_JSON_LAZY_DOC_MIN_LEN 4096U
 #define QJS_JSON_LAZY_CONTAINER_MIN_LEN 1024U
 #define QJS_JSON_LAZY_CONTAINER_MIN_CHILDREN 8
 
@@ -52133,104 +52142,336 @@ typedef struct JSONLazySource {
     char text[];
 } JSONLazySource;
 
+typedef struct JSONLazyTapeNode {
+    uint32_t start;
+    uint32_t end;
+    uint32_t first_child;
+    uint32_t next_sibling;
+    uint32_t child_count;
+    uint32_t key_start;
+    uint32_t key_length;
+    uint8_t type;
+} JSONLazyTapeNode;
+
+/* Kept as a compatibility view while the tape-backed constructor is
+   introduced below.  It is not retained by the document. */
 typedef struct JSONLazyEntry {
     JSAtom key;
-    uint32_t start;      /* absolute offset into source */
-    uint32_t end;        /* absolute offset into source */
+    uint32_t start;
+    uint32_t end;
     uint8_t type;
 } JSONLazyEntry;
 
+typedef struct JSONLazyLayout {
+    JSShape *shape;
+    JSValue template;
+    JSAtom *ordered_atoms;
+    uint32_t *slot_indices;
+    uint32_t backing_slot;
+    uint32_t node_slot;
+    uint32_t count;
+    uint64_t key_fingerprint;
+    uint32_t instance_count;
+    uint32_t completed_instances;
+    uint32_t slot_access_count[8];
+    uint8_t hot_slot_mask;
+    int valid;
+} JSONLazyLayout;
+
 typedef struct JSONLazyBacking {
     JSONLazySource *source;
-    uint32_t start;      /* absolute offset of this container in source */
-    uint32_t end;
-    int is_array;
-    int count;
+    JSONLazyTapeNode *nodes;
+    uint32_t node_count;
+    uint32_t node_capacity;
+    uint32_t *children;
+    uint32_t child_count;
+    uint32_t child_capacity;
+    /* transient compatibility fields used only by the old constructor */
+    uint32_t start, end;
+    int is_array, count;
+    uint32_t materialized_count;
+    int completing;
     JSONLazyEntry *entries;
+    JSONLazyLayout layout;
 } JSONLazyBacking;
 
 static JSClassID js_lazy_backing_class_id;
-static JSClassID js_lazy_marker_class_id;
 static int js_lazy_json_enabled;
+static int js_lazy_trace_initialized;
+static int js_lazy_trace_enabled;
+static uint64_t js_lazy_markers_allocated;
+static uint64_t js_lazy_markers_finalized;
+static uint64_t js_lazy_backings_allocated;
+static uint64_t js_lazy_backings_finalized;
+static uint64_t js_lazy_source_refs;
+static uint64_t js_lazy_source_unrefs;
+static uint64_t js_lazy_slots_materialized;
+static uint64_t js_lazy_markers_replaced;
+static uint64_t js_lazy_parser_fallbacks;
+static uint64_t js_lazy_cursor_initializations;
+static uint64_t js_lazy_containers_materialized;
+static uint64_t js_lazy_scalars_materialized;
+static uint64_t js_lazy_temp_bytes_copied;
+static uint64_t js_lazy_direct_slot_writes;
+static uint64_t js_lazy_generic_property_definitions;
+static uint64_t js_lazy_layout_candidates;
+static uint64_t js_lazy_layout_matches;
+static uint64_t js_lazy_layout_mismatch_count;
+static uint64_t js_lazy_layout_mismatch_order;
+static uint64_t js_lazy_layout_mismatch_duplicate;
+static uint64_t js_lazy_layout_mismatch_unsupported;
+static uint64_t js_lazy_layout_fast_objects;
+static uint64_t js_lazy_layout_fallback_objects;
+static uint64_t js_lazy_layout_atoms_avoided;
+static uint64_t js_lazy_layout_definitions_avoided;
+static uint64_t js_lazy_layout_transitions_avoided;
+static uint64_t js_lazy_layout_direct_writes;
+static uint64_t js_lazy_layout_shape_retains;
+static uint64_t js_lazy_layout_shape_releases;
+static uint64_t js_lazy_layout_templates_created;
+static uint64_t js_lazy_layout_templates_freed;
+static uint64_t js_lazy_documents_allocated;
+static uint64_t js_lazy_documents_finalized;
+static uint64_t js_lazy_tape_nodes;
+static uint64_t js_lazy_tape_children;
+static uint64_t js_lazy_tape_reallocations;
+static uint64_t js_lazy_tape_copied_bytes;
+static uint64_t js_lazy_layout_feedback_samples;
+static uint64_t js_lazy_layout_hot_masks;
+static uint64_t js_lazy_layout_completion_calls;
+static uint64_t js_lazy_layout_completion_slots;
+static uint64_t js_lazy_layout_markers_avoided;
+static uint64_t js_lazy_layout_cold_markers;
 
-typedef struct JSONLazyMarker {
-    JSValue backing;
-    uint32_t idx;
-} JSONLazyMarker;
+static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout);
 
-static void js_lazy_marker_finalizer(JSRuntime *rt, JSValueConst val)
+static int js_lazy_trace_is_enabled(void)
 {
-    JSONLazyMarker *m = JS_GetOpaque(val, js_lazy_marker_class_id);
-    if (m) {
-        JS_FreeValueRT(rt, m->backing);
-        js_free_rt(rt, m);
+    if (!js_lazy_trace_initialized) {
+        const char *e = getenv("QJS_JSON_LAZY_TRACE");
+        js_lazy_trace_enabled = e && *e == '1';
+        js_lazy_trace_initialized = 1;
     }
+    return js_lazy_trace_enabled;
 }
 
-static int js_lazy_register_marker_class(JSContext *ctx)
+static int js_lazy_marker_is(JSValueConst v)
 {
-    JSClassDef cd;
-    JSClassID cid = 0;
-    if (js_lazy_marker_class_id)
-        return 0;
-    JS_NewClassID(ctx->rt, &cid);
-    if (cid == 0)
+    return JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON;
+}
+
+static JSValue js_lazy_marker_new(uint32_t idx)
+{
+    return JS_MKVAL(JS_TAG_LAZY_JSON, idx);
+}
+
+static uint32_t js_lazy_marker_index(JSValueConst v)
+{
+    return (uint32_t)JS_VALUE_GET_INT(v);
+}
+
+static void json_lazy_layout_feedback(JSONLazyLayout *layout, uint32_t slot)
+{
+    uint32_t i;
+    if (!layout || !layout->valid || slot >= layout->count || slot >= 8)
+        return;
+    layout->slot_access_count[slot]++;
+    js_lazy_layout_feedback_samples++;
+    if (layout->instance_count < 32 || (layout->instance_count & 7) != 0)
+        return;
+    layout->hot_slot_mask = 0;
+    for (i = 0; i < layout->count && i < 8; i++) {
+        if (layout->slot_access_count[i] * 4 >=
+            layout->instance_count * 3)
+            layout->hot_slot_mask |= (uint8_t)(1U << i);
+    }
+    if (layout->hot_slot_mask)
+        js_lazy_layout_hot_masks++;
+}
+
+static const JSAtom js_lazy_backing_atom = JS_ATOM_Private_brand;
+
+static JSAtom js_lazy_node_atom(JSContext *ctx)
+{
+    if (!ctx->rt->lazy_json_node_atom) {
+        ctx->rt->lazy_json_node_atom = __JS_NewAtomInit(
+            ctx->rt, "[[LazyJSONNode]]", strlen("[[LazyJSONNode]]"),
+            JS_ATOM_TYPE_PRIVATE);
+    }
+    return ctx->rt->lazy_json_node_atom;
+}
+
+static JSValue js_lazy_get_backing(JSContext *ctx, JSObject *holder)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    prs = find_own_property(&pr, holder, js_lazy_backing_atom);
+    if (!prs || !pr || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+        return JS_ThrowInternalError(ctx, "lazy JSON backing missing");
+    return js_dup(pr->u.value);
+}
+
+static int js_lazy_set_backing(JSContext *ctx, JSValueConst holder,
+                               JSValueConst backing)
+{
+    return JS_DefinePropertyValue(ctx, holder, js_lazy_backing_atom,
+                                  js_dup(backing), JS_PROP_C_W_E);
+}
+
+static int js_lazy_set_node(JSContext *ctx, JSValueConst holder,
+                            uint32_t node_index)
+{
+    return JS_DefinePropertyValue(ctx, holder, js_lazy_node_atom(ctx),
+                                  JS_MKVAL(JS_TAG_INT, (int32_t)node_index),
+                                  JS_PROP_C_W_E);
+}
+
+static int js_lazy_get_node(JSContext *ctx, JSObject *holder,
+                            uint32_t *node_index)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSAtom atom = js_lazy_node_atom(ctx);
+    prs = find_own_property(&pr, holder, atom);
+    if (!prs || !pr || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_INT)
         return -1;
-    memset(&cd, 0, sizeof(cd));
-    cd.class_name = "JSONLazyMarker";
-    cd.finalizer = js_lazy_marker_finalizer;
-    if (JS_NewClass(ctx->rt, cid, &cd) < 0)
-        return -1;
-    js_lazy_marker_class_id = cid;
+    *node_index = (uint32_t)JS_VALUE_GET_INT(pr->u.value);
     return 0;
-}
-
-static int js_lazy_marker_is(JSValue v)
-{
-    if (!js_lazy_marker_class_id || JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
-        return 0;
-    return JS_GetClassID(v) == js_lazy_marker_class_id;
-}
-
-static JSValue js_lazy_marker_new(JSContext *ctx, JSValue backing, uint32_t idx)
-{
-    JSValue obj;
-    JSONLazyMarker *m;
-    if (js_lazy_register_marker_class(ctx) < 0)
-        return JS_EXCEPTION;
-    obj = JS_NewObjectClass(ctx, js_lazy_marker_class_id);
-    if (JS_IsException(obj))
-        return JS_EXCEPTION;
-    m = js_malloc(ctx, sizeof(*m));
-    if (!m) {
-        JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
-    }
-    m->backing = js_dup(backing);
-    m->idx = idx;
-    JS_SetOpaque(obj, m);
-    return obj;
 }
 
 static JSValue json_lazy_materialize_value(JSContext *ctx, JSONLazyBacking *b,
                                           uint32_t idx);
+static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
+                                                JSONLazyBacking *doc,
+                                                uint32_t node_index,
+                                                JSValueConst document,
+                                                JSONLazyLayout *layout_hint);
+static uint32_t json_lazy_tape_child(JSONLazyBacking *doc,
+                                     JSONLazyTapeNode *node, uint32_t index);
+static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
+                                        uint32_t start, uint32_t len);
 
-static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot)
+static bool json_lazy_should_complete(JSONLazyBacking *b)
 {
-    JSONLazyMarker *m;
+    static int completion_pct = -1;
+    int pct = 40;
+    if (completion_pct < 0) {
+        const char *e = getenv("QJS_JSON_LAZY_COMPLETE_PCT");
+        if (e && *e)
+            completion_pct = atoi(e);
+        else
+            completion_pct = 40;
+        if (completion_pct < 1)
+            completion_pct = 1;
+        if (completion_pct > 100)
+            completion_pct = 100;
+    }
+    pct = completion_pct;
+    return b->count >= 32 &&
+           b->materialized_count * 100 >= (uint32_t)b->count * (uint32_t)pct;
+}
+
+static int json_lazy_complete_markers(JSContext *ctx, JSONLazyBacking *b,
+                                      JSObject *holder)
+{
+    int i;
+    if (b->completing)
+        return 0;
+    if (b->count < 32)
+        return 0;
+    b->completing = 1;
+    if (b->is_array) {
+        for (i = 0; i < b->count; i++) {
+            JSValue val, old_marker;
+            /* skip already materialized/replaced slots (non-marker) */
+            if (!js_lazy_marker_is(holder->u.array.u.values[i]))
+                continue;
+            val = json_lazy_materialize_value(ctx, b, i);
+            if (JS_IsException(val))
+                goto except;
+            old_marker = holder->u.array.u.values[i];
+            holder->u.array.u.values[i] = val;
+            JS_FreeValue(ctx, old_marker);
+            js_lazy_direct_slot_writes++;
+            js_lazy_markers_replaced++;
+            b->materialized_count++;
+        }
+    } else {
+        for (i = 0; i < b->count; i++) {
+            JSONLazyEntry *e = &b->entries[i];
+            JSProperty *pr;
+            JSShapeProperty *prs;
+            JSValue val, old_marker;
+            prs = find_own_property(&pr, holder, e->key);
+            /* A deleted property must remain deleted; an assigned property
+               must remain assigned.  Only replace the original marker in
+               the existing slot, preserving the holder's shape. */
+            if (!prs || !js_lazy_marker_is(pr->u.value))
+                continue;
+            val = json_lazy_materialize_value(ctx, b, (uint32_t)i);
+            if (JS_IsException(val))
+                goto except;
+            old_marker = pr->u.value;
+            pr->u.value = val;
+            js_lazy_markers_replaced++;
+            js_lazy_direct_slot_writes++;
+            JS_FreeValue(ctx, old_marker);
+            b->materialized_count++;
+        }
+    }
+    return 0;
+ except:
+    return -1;
+}
+
+static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder)
+{
+    JSONLazyBacking *b;
+    JSValue backing;
     JSValue val;
+    uint32_t holder_node, child_node;
     if (!js_lazy_marker_is(*slot))
         return js_dup(*slot);
-    m = JS_GetOpaque(*slot, js_lazy_marker_class_id);
-    if (!m)
-        return JS_ThrowInternalError(ctx, "bad lazy marker");
-    val = json_lazy_materialize_value(ctx,
-            JS_GetOpaque2(ctx, m->backing, js_lazy_backing_class_id), m->idx);
-    if (JS_IsException(val))
+    backing = js_lazy_get_backing(ctx, holder);
+    if (JS_IsException(backing))
         return JS_EXCEPTION;
+    b = JS_GetOpaque2(ctx, backing, js_lazy_backing_class_id);
+    if (!b)
+        goto fail;
+    if (b->nodes) {
+        if (js_lazy_get_node(ctx, holder, &holder_node) < 0 ||
+            holder_node >= b->node_count ||
+            js_lazy_marker_index(*slot) >= b->nodes[holder_node].child_count)
+            goto fail;
+        child_node = json_lazy_tape_child(
+            b, &b->nodes[holder_node], js_lazy_marker_index(*slot));
+        if (b->nodes[holder_node].type == JSON_LAZY_OBJECT)
+            json_lazy_layout_feedback(&b->layout,
+                                      js_lazy_marker_index(*slot));
+        val = json_lazy_materialize_tape_value(
+            ctx, b, child_node, backing,
+            b->nodes[holder_node].type == JSON_LAZY_ARRAY &&
+                    b->nodes[child_node].type == JSON_LAZY_OBJECT
+                ? &b->layout : NULL);
+    } else {
+        val = json_lazy_materialize_value(ctx, b, js_lazy_marker_index(*slot));
+    }
+    if (JS_IsException(val))
+        goto fail;
     JS_FreeValue(ctx, *slot);
     *slot = val;
+    js_lazy_slots_materialized++;
+    js_lazy_direct_slot_writes++;
+    b->materialized_count++;
+    if (!b->nodes && !b->completing && json_lazy_should_complete(b)) {
+        if (json_lazy_complete_markers(ctx, b, holder) < 0)
+            goto fail;
+    }
+    JS_FreeValue(ctx, backing);
     return js_dup(val);
+fail:
+    JS_FreeValue(ctx, backing);
+    return JS_EXCEPTION;
 }
 
 static JSONLazySource *js_lazy_source_new(JSContext *ctx, const char *buf, size_t len)
@@ -52239,6 +52480,7 @@ static JSONLazySource *js_lazy_source_new(JSContext *ctx, const char *buf, size_
     if (!src)
         return NULL;
     src->ref_count = 1;
+    js_lazy_source_refs++;
     src->len = (uint32_t)len;
     memcpy(src->text, buf, len);
     src->text[len] = '\0';
@@ -52247,16 +52489,85 @@ static JSONLazySource *js_lazy_source_new(JSContext *ctx, const char *buf, size_
 
 static void js_lazy_source_ref(JSONLazySource *src)
 {
-    if (src)
+    if (src) {
         src->ref_count++;
+        js_lazy_source_refs++;
+    }
 }
 
 static void js_lazy_source_unref(JSRuntime *rt, JSONLazySource *src)
 {
     if (!src)
         return;
-    if (--src->ref_count <= 0)
+    js_lazy_source_unrefs++;
+    if (--src->ref_count <= 0) {
+        if (js_lazy_trace_is_enabled()) {
+            fprintf(stderr,
+                    "lazy-json markers=%llu/%llu backings=%llu/%llu "
+                    "documents=%llu/%llu source-refs=%llu/%llu "
+                    "tape-nodes=%llu tape-children=%llu reallocations=%llu "
+                    "copied-bytes=%llu slots=%llu replaced=%llu\n",
+                    (unsigned long long)js_lazy_markers_allocated,
+                    (unsigned long long)js_lazy_markers_finalized,
+                    (unsigned long long)js_lazy_backings_allocated,
+                    (unsigned long long)js_lazy_backings_finalized,
+                    (unsigned long long)js_lazy_documents_allocated,
+                    (unsigned long long)js_lazy_documents_finalized,
+                    (unsigned long long)js_lazy_source_refs,
+                    (unsigned long long)js_lazy_source_unrefs,
+                    (unsigned long long)js_lazy_tape_nodes,
+                    (unsigned long long)js_lazy_tape_children,
+                    (unsigned long long)js_lazy_tape_reallocations,
+                    (unsigned long long)js_lazy_tape_copied_bytes,
+                    (unsigned long long)js_lazy_slots_materialized,
+                    (unsigned long long)js_lazy_markers_replaced);
+            fprintf(stderr,
+                    "lazy-json parser-fallbacks=%llu cursors=%llu "
+                    "containers=%llu scalars=%llu temp-bytes=%llu "
+                    "direct-writes=%llu generic-defines=%llu\n",
+                    (unsigned long long)js_lazy_parser_fallbacks,
+                    (unsigned long long)js_lazy_cursor_initializations,
+                    (unsigned long long)js_lazy_containers_materialized,
+                    (unsigned long long)js_lazy_scalars_materialized,
+                    (unsigned long long)js_lazy_temp_bytes_copied,
+                    (unsigned long long)js_lazy_direct_slot_writes,
+                    (unsigned long long)js_lazy_generic_property_definitions);
+            fprintf(stderr,
+                    "lazy-json layout candidates=%llu matches=%llu fast=%llu "
+                    "fallback=%llu mismatch-count=%llu order=%llu duplicate=%llu "
+                    "unsupported=%llu atoms-avoided=%llu defs-avoided=%llu "
+                    "transitions-avoided=%llu direct-writes=%llu "
+                    "shape-retains/releases=%llu/%llu\n",
+                    (unsigned long long)js_lazy_layout_candidates,
+                    (unsigned long long)js_lazy_layout_matches,
+                    (unsigned long long)js_lazy_layout_fast_objects,
+                    (unsigned long long)js_lazy_layout_fallback_objects,
+                    (unsigned long long)js_lazy_layout_mismatch_count,
+                    (unsigned long long)js_lazy_layout_mismatch_order,
+                    (unsigned long long)js_lazy_layout_mismatch_duplicate,
+                    (unsigned long long)js_lazy_layout_mismatch_unsupported,
+                    (unsigned long long)js_lazy_layout_atoms_avoided,
+                    (unsigned long long)js_lazy_layout_definitions_avoided,
+                    (unsigned long long)js_lazy_layout_transitions_avoided,
+                    (unsigned long long)js_lazy_layout_direct_writes,
+                    (unsigned long long)js_lazy_layout_shape_retains,
+                    (unsigned long long)js_lazy_layout_shape_releases);
+            fprintf(stderr, "lazy-json templates=%llu/%llu\n",
+                    (unsigned long long)js_lazy_layout_templates_created,
+                    (unsigned long long)js_lazy_layout_templates_freed);
+            fprintf(stderr,
+                    "lazy-json feedback samples=%llu masks=%llu "
+                    "completion-calls=%llu completion-slots=%llu "
+                    "markers-avoided=%llu cold-markers=%llu\n",
+                    (unsigned long long)js_lazy_layout_feedback_samples,
+                    (unsigned long long)js_lazy_layout_hot_masks,
+                    (unsigned long long)js_lazy_layout_completion_calls,
+                    (unsigned long long)js_lazy_layout_completion_slots,
+                    (unsigned long long)js_lazy_layout_markers_avoided,
+                    (unsigned long long)js_lazy_layout_cold_markers);
+        }
         js_free_rt(rt, src);
+    }
 }
 
 static void js_lazy_backing_finalizer(JSRuntime *rt, JSValueConst val)
@@ -52265,21 +52576,25 @@ static void js_lazy_backing_finalizer(JSRuntime *rt, JSValueConst val)
     int i;
     if (!b)
         return;
+    if (js_lazy_trace_is_enabled())
+        fprintf(stderr, "lazy-json document-finalizer nodes=%u\n", b->node_count);
+    js_lazy_documents_finalized++;
     for (i = 0; i < b->count; i++)
-        JS_FreeAtomRT(rt, b->entries[i].key);
+        JS_FreeAtomRT(rt, b->entries ? b->entries[i].key : JS_ATOM_NULL);
     js_free_rt(rt, b->entries);
-    if (b->source) {
-        b->source->ref_count--;
-        if (b->source->ref_count <= 0)
-            js_free_rt(rt, b->source);
-    }
+    js_free_rt(rt, b->nodes);
+    js_free_rt(rt, b->children);
+    json_lazy_layout_release(rt, &b->layout);
+    js_lazy_source_unref(rt, b->source);
     js_free_rt(rt, b);
 }
 
 static void js_lazy_backing_mark(JSRuntime *rt, JSValueConst val,
                                  JS_MarkFunc *mark_func)
 {
-    /* atoms are in the runtime atom table; raw source is C memory */
+    JSONLazyBacking *b = JS_GetOpaque(val, js_lazy_backing_class_id);
+    if (b && b->layout.valid)
+        JS_MarkValue(rt, b->layout.template, mark_func);
 }
 
 static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
@@ -52300,7 +52615,7 @@ static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
             return 0;
         JSClassDef cd;
         memset(&cd, 0, sizeof(cd));
-        cd.class_name = "JSONLazyBacking";
+        cd.class_name = "JSONLazyDocument";
         cd.finalizer = js_lazy_backing_finalizer;
         cd.gc_mark = js_lazy_backing_mark;
         if (JS_NewClass(ctx->rt, cid, &cd) < 0)
@@ -52329,12 +52644,29 @@ static int json_lazy_skip_string(const uint8_t **pp, const uint8_t *end)
 {
     const uint8_t *p = *pp;
     int c, i;
+    const uint64_t ones = UINT64_C(0x0101010101010101);
+    const uint64_t highs = UINT64_C(0x8080808080808080);
     if (p >= end || *p != '"')
         return -1;
     p++;
     for (;;) {
         if (p >= end)
             return -1;
+        if ((size_t)(end - p) >= sizeof(uint64_t)) {
+            uint64_t word, quote, slash, low;
+            memcpy(&word, p, sizeof(word));
+            quote = word ^ UINT64_C(0x2222222222222222);
+            slash = word ^ UINT64_C(0x5c5c5c5c5c5c5c5c);
+            low = word & highs;
+            if ((((quote - ones) & ~quote & highs) == 0) &&
+                (((slash - ones) & ~slash & highs) == 0) &&
+                low == 0 &&
+                (((word - UINT64_C(0x2020202020202020)) &
+                  ~word & highs) == 0)) {
+                p += sizeof(uint64_t);
+                continue;
+            }
+        }
         c = *p++;
         if (c == '"') {
             *pp = p;
@@ -52546,6 +52878,186 @@ static int json_lazy_value_type(const uint8_t *p, const uint8_t *end)
     return -1;
 }
 
+static int json_lazy_tape_reserve_nodes(JSContext *ctx, JSONLazyBacking *doc)
+{
+    uint32_t cap;
+    JSONLazyTapeNode *nodes;
+    if (doc->node_count < doc->node_capacity)
+        return 0;
+    cap = doc->node_capacity ? doc->node_capacity * 2 : 64;
+    nodes = js_realloc(ctx, doc->nodes, sizeof(*nodes) * cap);
+    if (!nodes)
+        return -1;
+    doc->nodes = nodes;
+    js_lazy_tape_reallocations++;
+    js_lazy_tape_copied_bytes += (uint64_t)doc->node_count * sizeof(*nodes);
+    doc->node_capacity = cap;
+    return 0;
+}
+
+static int json_lazy_tape_reserve_children(JSContext *ctx,
+                                           JSONLazyBacking *doc)
+{
+    uint32_t cap;
+    uint32_t *children;
+    if (doc->child_count < doc->child_capacity)
+        return 0;
+    cap = doc->child_capacity ? doc->child_capacity * 2 : 128;
+    children = js_realloc(ctx, doc->children, sizeof(*children) * cap);
+    if (!children)
+        return -1;
+    doc->children = children;
+    js_lazy_tape_reallocations++;
+    js_lazy_tape_copied_bytes += (uint64_t)doc->child_count * sizeof(*children);
+    doc->child_capacity = cap;
+    return 0;
+}
+
+static int json_lazy_tape_value(JSContext *ctx, JSONLazyBacking *doc,
+                                const uint8_t *base, const uint8_t **pp,
+                                const uint8_t *end, uint32_t key_start,
+                                uint32_t key_length, uint32_t *node_out)
+{
+    const uint8_t *p = *pp, *q, *kstart, *kend;
+    JSONLazyTapeNode *node;
+    uint32_t node_index, child_index, previous_child = UINT32_MAX;
+    int type;
+
+    json_lazy_skip_ws(&p, end);
+    q = p;
+    type = json_lazy_value_type(p, end);
+    if (type < 0)
+        return -1;
+    if (json_lazy_tape_reserve_nodes(ctx, doc) < 0)
+        return -1;
+    node_index = doc->node_count++;
+    node = &doc->nodes[node_index];
+    memset(node, 0, sizeof(*node));
+    node->start = (uint32_t)(p - base);
+    node->key_start = key_start;
+    node->key_length = key_length;
+    node->type = (uint8_t)type;
+    node->first_child = UINT32_MAX;
+    node->next_sibling = UINT32_MAX;
+    if (type == JSON_LAZY_OBJECT || type == JSON_LAZY_ARRAY) {
+        int is_object = type == JSON_LAZY_OBJECT;
+        q++;
+        json_lazy_skip_ws(&q, end);
+        if ((is_object && q < end && *q == '}') ||
+            (!is_object && q < end && *q == ']')) {
+            q++;
+        } else {
+            for (;;) {
+                uint32_t child_node;
+                uint32_t child_key_start = 0, child_key_length = 0;
+                json_lazy_skip_ws(&q, end);
+                if (is_object) {
+                    kstart = q;
+                    if (json_lazy_skip_string(&q, end) < 0)
+                        return -1;
+                    kend = q;
+                    child_key_start = (uint32_t)(kstart - base);
+                    child_key_length = (uint32_t)(kend - kstart);
+                    json_lazy_skip_ws(&q, end);
+                    if (q >= end || *q++ != ':')
+                        return -1;
+                }
+                if (json_lazy_tape_value(ctx, doc, base, &q, end,
+                                         child_key_start, child_key_length,
+                                         &child_node) < 0)
+                    return -1;
+                if (doc->nodes[node_index].first_child == UINT32_MAX)
+                    doc->nodes[node_index].first_child = child_node;
+                else
+                    doc->nodes[previous_child].next_sibling = child_node;
+                previous_child = child_node;
+                doc->nodes[node_index].child_count++;
+                json_lazy_skip_ws(&q, end);
+                if (q < end && ((is_object && *q == '}') ||
+                                (!is_object && *q == ']'))) {
+                    q++;
+                    break;
+                }
+                if (q >= end || *q++ != ',')
+                    return -1;
+            }
+        }
+    } else if (json_lazy_skip_value(&q, end) < 0) {
+        return -1;
+    }
+    doc->nodes[node_index].end = (uint32_t)(q - base);
+    *pp = q;
+    *node_out = node_index;
+    js_lazy_tape_nodes++;
+    js_lazy_tape_children += doc->nodes[node_index].child_count;
+    (void)child_index;
+    return 0;
+}
+
+static int json_lazy_build_tape(JSContext *ctx, JSONLazyBacking *doc)
+{
+    const uint8_t *base = (const uint8_t *)doc->source->text;
+    const uint8_t *p = base, *end = base + doc->source->len;
+    uint32_t root;
+    uint32_t estimate = doc->source->len / 4;
+    if (estimate < 64)
+        estimate = 64;
+    if (estimate > UINT32_MAX / 2)
+        estimate = UINT32_MAX / 2;
+    doc->nodes = js_malloc(ctx, sizeof(*doc->nodes) * estimate);
+    if (!doc->nodes)
+        return -1;
+    doc->node_capacity = estimate;
+    doc->children = js_malloc(ctx, sizeof(*doc->children) * estimate);
+    if (!doc->children)
+        return -1;
+    doc->child_capacity = estimate;
+    if (json_lazy_tape_value(ctx, doc, base, &p, end, 0, 0, &root) < 0)
+        return -1;
+    json_lazy_skip_ws(&p, end);
+    if (p != end || root != 0)
+        return -1;
+    {
+        uint32_t i, total = 0, pos = 0;
+        for (i = 0; i < doc->node_count; i++)
+            total += doc->nodes[i].child_count;
+        if (total) {
+            if (total > doc->child_capacity) {
+                uint32_t *children = js_realloc(
+                    ctx, doc->children, sizeof(*doc->children) * total);
+                if (!children)
+                    return -1;
+                doc->children = children;
+                js_lazy_tape_reallocations++;
+                js_lazy_tape_copied_bytes +=
+                    (uint64_t)doc->child_count * sizeof(*doc->children);
+                doc->child_capacity = total;
+            }
+            doc->child_count = total;
+            for (i = 0; i < doc->node_count; i++) {
+                uint32_t child = doc->nodes[i].first_child;
+                uint32_t j;
+                if (child == UINT32_MAX)
+                    continue;
+                doc->nodes[i].first_child = pos;
+                for (j = 0; j < doc->nodes[i].child_count; j++) {
+                    doc->children[pos++] = child;
+                    child = doc->nodes[child].next_sibling;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static uint32_t json_lazy_tape_child(JSONLazyBacking *doc,
+                                     JSONLazyTapeNode *node, uint32_t index)
+{
+    if (index >= node->child_count || !doc->children)
+        return UINT32_MAX;
+    return doc->children[node->first_child + index];
+}
+
 /* Atomize an unescaped ASCII JSON key. Returns JS_ATOM_NULL on unsupported. */
 static JSAtom js_lazy_key_atom(JSContext *ctx, const uint8_t *p, const uint8_t *q)
 {
@@ -52587,6 +53099,8 @@ static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
 {
     char *tmp = js_malloc(ctx, (size_t)len + 1);
     JSValue v;
+    js_lazy_parser_fallbacks++;
+    js_lazy_temp_bytes_copied += len;
     if (!tmp)
         return JS_EXCEPTION;
     memcpy(tmp, base + start, len);
@@ -52669,11 +53183,14 @@ static JSValue json_lazy_materialize_string(JSContext *ctx, JSONLazySource *src,
 }
 
 static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
-                                      uint32_t abs_start, uint32_t abs_end);
+                                      uint32_t abs_start, uint32_t abs_end,
+                                      JSONLazyLayout *layout_hint);
 
 static JSValue json_lazy_materialize_value(JSContext *ctx, JSONLazyBacking *b,
                                           uint32_t idx)
 {
+    if (b && b->nodes)
+        return JS_EXCEPTION;
     JSONLazySource *src;
     JSONLazyEntry *e;
     JSValue val = JS_UNDEFINED;
@@ -52705,10 +53222,9 @@ static JSValue json_lazy_materialize_value(JSContext *ctx, JSONLazyBacking *b,
         break;
     case JSON_LAZY_OBJECT:
     case JSON_LAZY_ARRAY:
-        if (getenv("LAZY_DEBUG"))
-            fprintf(stderr, "materialize %s start=%u end=%u c=%c\n", e->type==JSON_LAZY_ARRAY?"arr":"obj", e->start, e->end, src->text[e->start]);
-        if (e->end - e->start >= QJS_JSON_LAZY_DOC_MIN_LEN)
-            val = js_lazy_parse_children(ctx, src, e->start, e->end);
+        val = js_lazy_parse_children(ctx, src, e->start, e->end,
+                                     e->type == JSON_LAZY_OBJECT && b->is_array
+                                         ? &b->layout : NULL);
         if (JS_IsUndefined(val))
             val = js_lazy_eager_parse_range(ctx, src->text, e->start, e->end - e->start);
         break;
@@ -52717,6 +53233,10 @@ static JSValue json_lazy_materialize_value(JSContext *ctx, JSONLazyBacking *b,
     }
     if (JS_IsException(val))
         return JS_EXCEPTION;
+    if (e->type == JSON_LAZY_OBJECT || e->type == JSON_LAZY_ARRAY)
+        js_lazy_containers_materialized++;
+    else
+        js_lazy_scalars_materialized++;
     return val;
 }
 
@@ -52790,15 +53310,450 @@ static JSValue js_lazy_new_backing(JSContext *ctx, JSONLazySource *src,
     b->end = abs_end;
     b->is_array = is_array;
     b->count = count;
+    b->materialized_count = 0;
+    b->completing = 0;
     b->entries = entries;
+    memset(&b->layout, 0, sizeof(b->layout));
     JS_SetOpaque(backing, b);
+    js_lazy_backings_allocated++;
     return backing;
+}
+
+static uint64_t json_lazy_layout_hash_key(uint64_t hash,
+                                          const uint8_t *p, size_t len)
+{
+    size_t i;
+    hash ^= (uint64_t)len;
+    hash *= UINT64_C(1099511628211);
+    for (i = 0; i < len; i++) {
+        hash ^= p[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+/* Return 1 for an exact supported key match, 0 for a different key and -1
+   for a key encoding this experiment deliberately does not fast-path. */
+static int json_lazy_layout_key_match(JSContext *ctx,
+                                      JSONLazyLayout *layout, uint32_t index,
+                                      const uint8_t *kstart,
+                                      const uint8_t *kend)
+{
+    JSAtom atom;
+    JSAtomStruct *str;
+    size_t len, i;
+    const uint8_t *key = kstart + 1;
+    (void)ctx;
+    if (index >= layout->count)
+        return 0;
+    len = (size_t)(kend - kstart - 2);
+    for (i = 0; i < len; i++) {
+        if (key[i] == '\\' || key[i] < 0x20 || key[i] >= 0x80)
+            return -1;
+    }
+    atom = layout->ordered_atoms[index];
+    if (__JS_AtomIsTaggedInt(atom))
+        return -1;
+    str = ctx->rt->atom_array[atom];
+    if (str->is_wide_char || str->len != len)
+        return 0;
+    return memcmp(str8(str), key, len) == 0;
+}
+
+static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout)
+{
+    uint32_t i;
+    if (!layout->valid)
+        return;
+    for (i = 0; i < layout->count; i++)
+        JS_FreeAtomRT(rt, layout->ordered_atoms[i]);
+    js_free_rt(rt, layout->ordered_atoms);
+    js_free_rt(rt, layout->slot_indices);
+    JS_FreeValueRT(rt, layout->template);
+    js_lazy_layout_templates_freed++;
+    layout->shape = NULL;
+    memset(layout, 0, sizeof(*layout));
+}
+
+static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
+                                     JSObject *obj, JSONLazyEntry *entries,
+                                     int count)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    uint32_t i, j;
+    uint64_t fingerprint = UINT64_C(1469598103934665603);
+
+    if (layout->valid || !obj->shape->is_hashed || count <= 0)
+        return 0;
+    for (i = 0; i < (uint32_t)count; i++) {
+        if (__JS_AtomIsTaggedInt(entries[i].key)) {
+            js_lazy_layout_mismatch_unsupported++;
+            return 0;
+        }
+        for (j = 0; j < i; j++) {
+            if (entries[i].key == entries[j].key) {
+                js_lazy_layout_mismatch_duplicate++;
+                return 0;
+            }
+        }
+    }
+    layout->ordered_atoms = js_malloc(ctx, sizeof(JSAtom) * count);
+    layout->slot_indices = js_malloc(ctx, sizeof(uint32_t) * count);
+    if (!layout->ordered_atoms || !layout->slot_indices)
+        goto fail;
+    for (i = 0; i < (uint32_t)count; i++) {
+        layout->ordered_atoms[i] = JS_DupAtom(ctx, entries[i].key);
+        prs = find_own_property(&pr, obj, entries[i].key);
+        if (!prs || !pr)
+            goto fail;
+        layout->slot_indices[i] = (uint32_t)(pr - obj->prop);
+        {
+            JSAtomStruct *str = ctx->rt->atom_array[entries[i].key];
+            fingerprint = json_lazy_layout_hash_key(
+                fingerprint, (const uint8_t *)str8(str), str->len);
+        }
+    }
+    prs = find_own_property(&pr, obj, js_lazy_backing_atom);
+    if (!prs || !pr)
+        goto fail;
+    layout->backing_slot = (uint32_t)(pr - obj->prop);
+    prs = find_own_property(&pr, obj, js_lazy_node_atom(ctx));
+    if (!prs || !pr)
+        goto fail;
+    layout->node_slot = (uint32_t)(pr - obj->prop);
+    layout->template = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, obj));
+    js_lazy_layout_templates_created++;
+    layout->shape = obj->shape;
+    layout->count = count;
+    layout->key_fingerprint = fingerprint;
+    layout->valid = 1;
+    return 0;
+fail:
+    if (layout->ordered_atoms) {
+        while (i-- > 0)
+            JS_FreeAtom(ctx, layout->ordered_atoms[i]);
+    }
+    js_free(ctx, layout->ordered_atoms);
+    js_free(ctx, layout->slot_indices);
+    memset(layout, 0, sizeof(*layout));
+    return -1;
+}
+
+static JSValue js_lazy_build_layout_object(JSContext *ctx,
+                                           JSValueConst backing,
+                                           JSONLazyLayout *layout)
+{
+    JSProperty *props;
+    JSValue obj;
+    uint32_t i;
+
+    props = js_mallocz(ctx, sizeof(*props) * layout->shape->prop_size);
+    if (!props)
+        return JS_EXCEPTION;
+    for (i = 0; i < layout->count; i++) {
+        props[layout->slot_indices[i]].u.value =
+            js_lazy_marker_new(i);
+        if (JS_IsException(props[layout->slot_indices[i]].u.value)) {
+            while (i-- > 0)
+                JS_FreeValue(ctx, props[layout->slot_indices[i]].u.value);
+            js_free(ctx, props);
+            return JS_EXCEPTION;
+        }
+        js_lazy_layout_direct_writes++;
+    }
+    props[layout->backing_slot].u.value = js_dup(backing);
+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(layout->shape),
+                                JS_CLASS_OBJECT, props);
+    if (JS_IsException(obj)) {
+        js_free(ctx, props);
+        return JS_EXCEPTION;
+    }
+    js_free(ctx, props);
+    js_lazy_layout_fast_objects++;
+    js_lazy_layout_matches++;
+    js_lazy_layout_atoms_avoided += layout->count;
+    js_lazy_layout_definitions_avoided += layout->count;
+    js_lazy_layout_transitions_avoided += layout->count;
+    return obj;
+}
+
+static JSValue js_lazy_new_document(JSContext *ctx, JSONLazySource *source)
+{
+    JSValue value;
+    JSONLazyBacking *doc;
+    value = JS_NewObjectClass(ctx, js_lazy_backing_class_id);
+    if (JS_IsException(value))
+        return JS_EXCEPTION;
+    doc = js_mallocz(ctx, sizeof(*doc));
+    if (!doc) {
+        JS_FreeValue(ctx, value);
+        return JS_EXCEPTION;
+    }
+    doc->source = source;
+    js_lazy_source_ref(source);
+    JS_SetOpaque(value, doc);
+    js_lazy_documents_allocated++;
+    return value;
+}
+
+static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
+                                                JSValueConst document,
+                                                uint32_t node_index,
+                                                JSONLazyLayout *layout)
+{
+    JSProperty *props;
+    JSValue obj;
+    uint32_t i;
+    JSONLazyBacking *doc = JS_GetOpaque(document, js_lazy_backing_class_id);
+    JSONLazyTapeNode *node;
+    uint8_t hot_mask;
+    if (!doc || node_index >= doc->node_count)
+        return JS_EXCEPTION;
+    node = &doc->nodes[node_index];
+    layout->instance_count++;
+    hot_mask = layout->instance_count >= 32 ? layout->hot_slot_mask : 0;
+    if (hot_mask)
+        js_lazy_layout_completion_calls++;
+    props = js_mallocz(ctx, sizeof(*props) * layout->shape->prop_size);
+    if (!props)
+        return JS_EXCEPTION;
+    for (i = 0; i < layout->count; i++) {
+        uint32_t child_index = json_lazy_tape_child(doc, node, i);
+        if (hot_mask & (uint8_t)(1U << i)) {
+            props[layout->slot_indices[i]].u.value =
+                json_lazy_materialize_tape_value(ctx, doc, child_index,
+                                                 document, NULL);
+            if (JS_IsException(props[layout->slot_indices[i]].u.value)) {
+                js_free(ctx, props);
+                return JS_EXCEPTION;
+            }
+            layout->completed_instances++;
+            js_lazy_layout_completion_slots++;
+            js_lazy_layout_markers_avoided++;
+        } else {
+            props[layout->slot_indices[i]].u.value = js_lazy_marker_new(i);
+            js_lazy_layout_cold_markers++;
+        }
+        js_lazy_layout_direct_writes++;
+    }
+    props[layout->backing_slot].u.value = js_dup(document);
+    props[layout->node_slot].u.value =
+        JS_MKVAL(JS_TAG_INT, (int32_t)node_index);
+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(layout->shape),
+                                JS_CLASS_OBJECT, props);
+    if (JS_IsException(obj)) {
+        js_free(ctx, props);
+        return JS_EXCEPTION;
+    }
+    js_free(ctx, props);
+    js_lazy_layout_fast_objects++;
+    js_lazy_layout_matches++;
+    js_lazy_layout_atoms_avoided += layout->count;
+    js_lazy_layout_definitions_avoided += layout->count;
+    js_lazy_layout_transitions_avoided += layout->count;
+    return obj;
+}
+
+static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
+                                       JSValueConst document,
+                                       uint32_t node_index,
+                                       JSONLazyLayout *layout_hint)
+{
+    JSONLazyTapeNode *node;
+    JSValue obj = JS_UNDEFINED;
+    const uint8_t *base;
+    uint32_t i;
+    int layout_match = layout_hint && layout_hint->valid;
+    uint64_t layout_fingerprint = UINT64_C(1469598103934665603);
+    JSONLazyEntry *entries = NULL;
+
+    if (!doc || node_index >= doc->node_count)
+        return JS_UNDEFINED;
+    node = &doc->nodes[node_index];
+    base = (const uint8_t *)doc->source->text;
+    if (node->type == JSON_LAZY_ARRAY) {
+        JSValue *values = NULL;
+        if (node->child_count) {
+            values = js_malloc(ctx, sizeof(*values) * node->child_count);
+            if (!values)
+                return JS_EXCEPTION;
+            for (i = 0; i < node->child_count; i++)
+                values[i] = js_lazy_marker_new(i);
+        }
+        obj = JS_NewArrayFrom(ctx, node->child_count, values);
+        js_free(ctx, values);
+        if (JS_IsException(obj))
+            return JS_EXCEPTION;
+    } else if (node->type == JSON_LAZY_OBJECT) {
+        if (layout_hint && layout_hint->valid) {
+            int match = node->child_count == layout_hint->count;
+            uint64_t fingerprint = UINT64_C(1469598103934665603);
+            for (i = 0; match && i < node->child_count; i++) {
+                uint32_t child_index = json_lazy_tape_child(doc, node, i);
+                JSONLazyTapeNode *child = &doc->nodes[child_index];
+                int key_match = json_lazy_layout_key_match(
+                    ctx, layout_hint, i, base + child->key_start,
+                    base + child->key_start + child->key_length);
+                if (key_match != 1) {
+                    match = 0;
+                    if (key_match < 0)
+                        js_lazy_layout_mismatch_unsupported++;
+                    else
+                        js_lazy_layout_mismatch_order++;
+                } else {
+                    fingerprint = json_lazy_layout_hash_key(
+                        fingerprint, base + child->key_start + 1,
+                        child->key_length - 2);
+                }
+            }
+            if (layout_hint->shape && match &&
+                fingerprint == layout_hint->key_fingerprint) {
+                return js_lazy_build_tape_layout_object(
+                    ctx, document, node_index, layout_hint);
+            }
+        }
+        if (node->child_count && layout_hint && !layout_hint->valid) {
+            entries = js_mallocz(ctx, sizeof(*entries) * node->child_count);
+            if (!entries)
+                return JS_EXCEPTION;
+        }
+        obj = JS_NewObject(ctx);
+        if (JS_IsException(obj))
+            return JS_EXCEPTION;
+        for (i = 0; i < node->child_count; i++) {
+            uint32_t child_index = json_lazy_tape_child(doc, node, i);
+            JSONLazyTapeNode *child = &doc->nodes[child_index];
+            const uint8_t *kstart = base + child->key_start;
+            const uint8_t *kend = kstart + child->key_length;
+            JSAtom key = JS_ATOM_NULL;
+            JSValue marker;
+            int key_match = 0;
+            if (layout_match) {
+                key_match = json_lazy_layout_key_match(
+                    ctx, layout_hint, i, kstart, kend);
+                if (key_match == 1) {
+                    key = JS_DupAtom(ctx, layout_hint->ordered_atoms[i]);
+                    layout_fingerprint = json_lazy_layout_hash_key(
+                        layout_fingerprint, kstart + 1,
+                        (size_t)(kend - kstart - 2));
+                } else {
+                    layout_match = 0;
+                    if (key_match < 0)
+                        js_lazy_layout_mismatch_unsupported++;
+                    else
+                        js_lazy_layout_mismatch_order++;
+                }
+            }
+            if (key == JS_ATOM_NULL)
+                key = js_lazy_key_atom(ctx, kstart, kend - 1);
+            if (key == JS_ATOM_NULL)
+                goto fail;
+            if (entries)
+                entries[i].key = JS_DupAtom(ctx, key);
+            marker = js_lazy_marker_new(i);
+            if (JS_DefinePropertyValue(ctx, obj, key, marker,
+                                       JS_PROP_C_W_E) < 0) {
+                JS_FreeAtom(ctx, key);
+                goto fail;
+            }
+            JS_FreeAtom(ctx, key);
+            js_lazy_generic_property_definitions++;
+        }
+    } else {
+        return JS_UNDEFINED;
+    }
+    if (layout_hint && layout_hint->valid && layout_match &&
+        layout_fingerprint != layout_hint->key_fingerprint) {
+        layout_match = 0;
+        js_lazy_layout_mismatch_order++;
+    }
+    if (layout_hint && layout_hint->valid && layout_hint->shape &&
+        layout_match) {
+        JSValue fast = js_lazy_build_tape_layout_object(
+            ctx, document, node_index, layout_hint);
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, entries);
+        return fast;
+    }
+    if (js_lazy_set_backing(ctx, obj, document) < 0 ||
+        js_lazy_set_node(ctx, obj, node_index) < 0)
+        goto fail;
+    if (layout_hint && !layout_hint->valid && entries) {
+        if (json_lazy_layout_capture(ctx, layout_hint,
+                                     JS_VALUE_GET_OBJ(obj), entries,
+                                     node->child_count) < 0)
+            goto fail;
+    }
+    if (entries) {
+        for (i = 0; i < node->child_count; i++)
+            JS_FreeAtom(ctx, entries[i].key);
+        js_free(ctx, entries);
+    }
+    (void)layout_match;
+    return obj;
+fail:
+    if (entries) {
+        for (i = 0; i < node->child_count; i++)
+            JS_FreeAtom(ctx, entries[i].key);
+        js_free(ctx, entries);
+    }
+    JS_FreeValue(ctx, obj);
+    return JS_UNDEFINED;
+}
+
+static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
+                                                JSONLazyBacking *doc,
+                                                uint32_t node_index,
+                                                JSValueConst document,
+                                                JSONLazyLayout *layout_hint)
+{
+    JSONLazyTapeNode *node;
+    JSONLazySource *src;
+    JSValue value;
+    if (!doc || node_index >= doc->node_count)
+        return JS_EXCEPTION;
+    node = &doc->nodes[node_index];
+    src = doc->source;
+    switch (node->type) {
+    case JSON_LAZY_TRUE: value = JS_TRUE; break;
+    case JSON_LAZY_FALSE: value = JS_FALSE; break;
+    case JSON_LAZY_NULL: value = JS_NULL; break;
+    case JSON_LAZY_NUMBER:
+        value = json_lazy_materialize_number(ctx, src, node->start, node->end);
+        break;
+    case JSON_LAZY_STRING:
+        value = json_lazy_materialize_string(ctx, src, node->start, node->end);
+        break;
+    case JSON_LAZY_OBJECT:
+    case JSON_LAZY_ARRAY: {
+        value = js_lazy_parse_tape_node(ctx, doc, document, node_index,
+                                        layout_hint);
+        if (JS_IsUndefined(value))
+            value = js_lazy_eager_parse_range(ctx, src->text, node->start,
+                                              node->end - node->start);
+        if (JS_IsException(value))
+            return JS_EXCEPTION;
+        js_lazy_containers_materialized++;
+        break;
+    }
+    default:
+        value = JS_EXCEPTION;
+        break;
+    }
+    if ((node->type == JSON_LAZY_OBJECT || node->type == JSON_LAZY_ARRAY))
+        return value;
+    if (JS_IsException(value))
+        return JS_EXCEPTION;
+    js_lazy_scalars_materialized++;
+    return value;
 }
 
 /* Parse the immediate children of a container in the *shared* source.
    Returns JS_UNDEFINED on failure or if not lazy-worthy. */
 static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
-                                      uint32_t abs_start, uint32_t abs_end)
+                                      uint32_t abs_start, uint32_t abs_end,
+                                      JSONLazyLayout *layout_hint)
 {
     const uint8_t *base = (const uint8_t *)source->text;
     const uint8_t *buf = base + abs_start;
@@ -52811,10 +53766,17 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
     JSValue backing;
     JSONLazyBacking *bl;
     int i;
+    int layout_candidate = layout_hint != NULL;
+    int layout_match = layout_hint && layout_hint->valid;
+    uint64_t layout_fingerprint = UINT64_C(1469598103934665603);
     uint32_t child_start_off;
+
+    if (layout_candidate)
+        js_lazy_layout_candidates++;
 
     if (!js_lazy_backing_class_id)
         return JS_UNDEFINED;
+    js_lazy_cursor_initializations++;
     json_lazy_skip_ws(&p, end);
     if (p >= end)
         return JS_UNDEFINED;
@@ -52904,7 +53866,25 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
                 if (json_lazy_skip_value(&p, end))
                     goto fail;
                 vend = p;
-                key = js_lazy_key_atom(ctx, kstart, kend - 1);
+                if (layout_match) {
+                    int key_match = json_lazy_layout_key_match(
+                        ctx, layout_hint, (uint32_t)count, kstart, kend);
+                    if (key_match == 1) {
+                        key = JS_DupAtom(ctx, layout_hint->ordered_atoms[count]);
+                        layout_fingerprint = json_lazy_layout_hash_key(
+                            layout_fingerprint, kstart + 1,
+                            (size_t)(kend - kstart - 2));
+                    } else {
+                        layout_match = 0;
+                        if (key_match < 0)
+                            js_lazy_layout_mismatch_unsupported++;
+                        else
+                            js_lazy_layout_mismatch_order++;
+                        key = js_lazy_key_atom(ctx, kstart, kend - 1);
+                    }
+                } else {
+                    key = js_lazy_key_atom(ctx, kstart, kend - 1);
+                }
                 if (key == JS_ATOM_NULL)
                     goto fail;
                 ne = &entries[count];
@@ -52941,6 +53921,17 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
         goto fail;
     }
 
+    if (layout_candidate && layout_hint->valid && layout_match &&
+        count != (int)layout_hint->count) {
+        layout_match = 0;
+        js_lazy_layout_mismatch_count++;
+    }
+    if (layout_candidate && layout_hint->valid && layout_match &&
+        layout_fingerprint != layout_hint->key_fingerprint) {
+        layout_match = 0;
+        js_lazy_layout_mismatch_order++;
+    }
+
     if (is_array) {
         JSValue *elems = NULL;
         if (count > 0) {
@@ -52948,7 +53939,7 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
             if (!elems)
                 goto fail_obj2;
             for (i = 0; i < count; i++) {
-                elems[i] = js_lazy_marker_new(ctx, backing, i);
+                elems[i] = js_lazy_marker_new(i);
                 if (JS_IsException(elems[i])) {
                     while (i > 0)
                         JS_FreeValue(ctx, elems[--i]);
@@ -52961,17 +53952,33 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
         js_free(ctx, elems);
         if (JS_IsException(obj))
             goto fail_obj2;
+        if (js_lazy_set_backing(ctx, obj, backing) < 0)
+            goto fail_obj2;
+    } else if (layout_candidate && layout_hint->valid && layout_match) {
+        obj = js_lazy_build_layout_object(ctx, backing, layout_hint);
+        if (JS_IsException(obj))
+            goto fail_obj2;
     } else {
+        if (layout_candidate)
+            js_lazy_layout_fallback_objects++;
         obj = JS_NewObject(ctx);
         if (JS_IsException(obj))
             goto fail_obj2;
         for (i = 0; i < count; i++) {
-            JSValue marker = js_lazy_marker_new(ctx, backing, i);
+            JSValue marker = js_lazy_marker_new(i);
             if (JS_IsException(marker))
                 goto fail_obj2;
             if (JS_DefinePropertyValue(ctx, obj, bl->entries[i].key, marker, JS_PROP_C_W_E) < 0)
                 goto fail_obj2;
+            js_lazy_generic_property_definitions++;
         }
+        if (js_lazy_set_backing(ctx, obj, backing) < 0)
+            goto fail_obj2;
+    }
+    if (layout_candidate && !layout_hint->valid && !is_array) {
+        if (json_lazy_layout_capture(ctx, layout_hint, JS_VALUE_GET_OBJ(obj),
+                                     entries, count) < 0)
+            goto fail_obj2;
     }
     JS_FreeValue(ctx, backing);
     return obj;
@@ -52997,13 +54004,37 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
 static JSValue json_lazy_parse(JSContext *ctx, const char *buf, size_t buf_len)
 {
     JSONLazySource *src;
-    JSValue v;
+    JSValue document, v;
+    JSONLazyBacking *doc;
     if (!js_lazy_json_should_enable(ctx, buf_len))
         return JS_UNDEFINED;
     src = js_lazy_source_new(ctx, buf, buf_len);
     if (!src)
         return JS_UNDEFINED;
-    v = js_lazy_parse_children(ctx, src, 0, (uint32_t)buf_len);
+    document = js_lazy_new_document(ctx, src);
+    if (JS_IsException(document)) {
+        js_lazy_source_unref(ctx->rt, src);
+        return JS_UNDEFINED;
+    }
+    doc = JS_GetOpaque(document, js_lazy_backing_class_id);
+    if (!doc || json_lazy_build_tape(ctx, doc) < 0) {
+        JS_FreeValue(ctx, document);
+        js_lazy_source_unref(ctx->rt, src);
+        return JS_UNDEFINED;
+    }
+    v = js_lazy_parse_tape_node(ctx, doc, document, 0, NULL);
+    if (JS_IsUndefined(v)) {
+        JS_FreeValue(ctx, document);
+        js_lazy_source_unref(ctx->rt, src);
+        return JS_UNDEFINED;
+    }
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, document);
+        js_lazy_source_unref(ctx->rt, src);
+        return JS_EXCEPTION;
+    }
+    /* The document is retained by the root's private property. */
+    JS_FreeValue(ctx, document);
     js_lazy_source_unref(ctx->rt, src);
     return v;
 }
