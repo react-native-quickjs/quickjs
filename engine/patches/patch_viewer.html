@@ -101,9 +101,9 @@ const highlight = (code) =>
     return `<span class="${CLASS[i]}">${m}</span>`;
   });
 
-// Everything before the first `diff --git` is the header a person wrote.
+// Everything before the first Git or unified-diff file header is prose.
 function split(text) {
-  const at = text.search(/^diff --git /m);
+  const at = text.search(/^(?:diff --git |--- a\/)/m);
   return at < 0 ? [text, ''] : [text.slice(0, at), text.slice(at)];
 }
 
@@ -132,8 +132,13 @@ function renderHeader(header) {
 function renderDiff(diff) {
   if (!diff) return '';
 
-  return diff.split(/\n(?=diff --git )/).map((chunk) => {
-    const name = (chunk.match(/^diff --git a\/(\S+)/) || [, 'diff'])[1];
+  const chunks = diff.split(/\n(?=diff --git )/).flatMap((chunk) =>
+    chunk.startsWith('diff --git ')
+      ? [chunk]
+      : chunk.split(/\n(?=--- a\/)/));
+
+  return chunks.map((chunk) => {
+    const name = (chunk.match(/^(?:diff --git a\/|--- a\/)(\S+)/) || [, 'diff'])[1];
     const stat = (chunk.match(/^[-+][^-+\n]/gm) || []).reduce(
       (a, m) => (m[0] === '+' ? [a[0] + 1, a[1]] : [a[0], a[1] + 1]), [0, 0]);
 
