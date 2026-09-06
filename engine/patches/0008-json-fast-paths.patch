@@ -27,23 +27,6 @@ Needs a bytecode version bump
   No. This changes only runtime behaviour inside quickjs.c; the bytecode
   format is untouched.
 
-Notes
-  Ported from the research tree (0001-json-fast-paths) and re-derived against
-  this tree, which already had upstream's batch-ASCII string parse path. The
-  numbers quoted in the source header were measured against a different
-  engine commit and a different collector, so they are not carried over here;
-  the effect is re-measured by tools/benchmark.
-
-  An earlier version of this port also skipped the per-node toJSON lookup
-  when the default Object/Array prototypes had none. That was unsafe: the
-  prototype chain is observable and can change during serialization, so it
-  was removed. toJSON is looked up on every object, as the specification
-  requires.
-
-  The JSON.stringify cycle-stack holds borrowed object pointers that are all
-  alive on the recursion stack, so it needs no refcounting. json_parse_value
-  hands the staged element buffer to JS_NewArrayFrom, which takes ownership
-  of the individual values on error; the buffer itself is freed here.
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -15186,6 +15186,15 @@
