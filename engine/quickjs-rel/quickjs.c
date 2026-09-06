@@ -52163,7 +52163,6 @@ typedef struct JSONLazyEntry {
 } JSONLazyEntry;
 
 typedef struct JSONLazyLayout {
-    JSShape *shape;
     JSValue template;
     JSAtom *ordered_atoms;
     uint32_t *slot_indices;
@@ -52613,14 +52612,16 @@ static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
         JS_NewClassID(ctx->rt, &cid);
         if (cid == 0)
             return 0;
+        js_lazy_backing_class_id = cid;
+    }
+    if (!JS_IsRegisteredClass(ctx->rt, js_lazy_backing_class_id)) {
         JSClassDef cd;
         memset(&cd, 0, sizeof(cd));
         cd.class_name = "JSONLazyDocument";
         cd.finalizer = js_lazy_backing_finalizer;
         cd.gc_mark = js_lazy_backing_mark;
-        if (JS_NewClass(ctx->rt, cid, &cd) < 0)
+        if (JS_NewClass(ctx->rt, js_lazy_backing_class_id, &cd) < 0)
             return 0;
-        js_lazy_backing_class_id = cid;
     }
     return 1;
 }
@@ -53371,8 +53372,35 @@ static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout)
     js_free_rt(rt, layout->slot_indices);
     JS_FreeValueRT(rt, layout->template);
     js_lazy_layout_templates_freed++;
-    layout->shape = NULL;
     memset(layout, 0, sizeof(*layout));
+}
+
+static JSShape *json_lazy_layout_shape(const JSONLazyLayout *layout)
+{
+    if (!layout || !layout->valid ||
+        JS_VALUE_GET_TAG(layout->template) != JS_TAG_OBJECT)
+        return NULL;
+    return JS_VALUE_GET_OBJ(layout->template)->shape;
+}
+
+static JSValue json_lazy_make_shape_template(JSContext *ctx, JSObject *obj)
+{
+    JSProperty *props;
+    JSShape *shape;
+    JSValue value;
+    uint32_t i;
+
+    shape = js_dup_shape(obj->shape);
+    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
+    if (!props) {
+        js_free_shape(ctx->rt, shape);
+        return JS_EXCEPTION;
+    }
+    for (i = 0; i < shape->prop_size; i++)
+        props[i].u.value = JS_UNDEFINED;
+    value = JS_NewObjectFromShape(ctx, shape, JS_CLASS_OBJECT, props);
+    js_free(ctx, props);
+    return value;
 }
 
 static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
@@ -53381,8 +53409,9 @@ static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
 {
     JSShapeProperty *prs;
     JSProperty *pr;
-    uint32_t i, j;
+    uint32_t i = 0, j, atom_count = 0;
     uint64_t fingerprint = UINT64_C(1469598103934665603);
+    JSValue template = JS_UNDEFINED;
 
     if (layout->valid || !obj->shape->is_hashed || count <= 0)
         return 0;
@@ -53404,6 +53433,7 @@ static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
         goto fail;
     for (i = 0; i < (uint32_t)count; i++) {
         layout->ordered_atoms[i] = JS_DupAtom(ctx, entries[i].key);
+        atom_count++;
         prs = find_own_property(&pr, obj, entries[i].key);
         if (!prs || !pr)
             goto fail;
@@ -53422,18 +53452,20 @@ static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
     if (!prs || !pr)
         goto fail;
     layout->node_slot = (uint32_t)(pr - obj->prop);
-    layout->template = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, obj));
+    template = json_lazy_make_shape_template(ctx, obj);
+    if (JS_IsException(template))
+        goto fail;
+    layout->template = template;
+    template = JS_UNDEFINED;
     js_lazy_layout_templates_created++;
-    layout->shape = obj->shape;
     layout->count = count;
     layout->key_fingerprint = fingerprint;
     layout->valid = 1;
     return 0;
 fail:
-    if (layout->ordered_atoms) {
-        while (i-- > 0)
-            JS_FreeAtom(ctx, layout->ordered_atoms[i]);
-    }
+    JS_FreeValue(ctx, template);
+    while (atom_count-- > 0)
+        JS_FreeAtom(ctx, layout->ordered_atoms[atom_count]);
     js_free(ctx, layout->ordered_atoms);
     js_free(ctx, layout->slot_indices);
     memset(layout, 0, sizeof(*layout));
@@ -53446,11 +53478,16 @@ static JSValue js_lazy_build_layout_object(JSContext *ctx,
 {
     JSProperty *props;
     JSValue obj;
+    JSShape *shape = json_lazy_layout_shape(layout);
     uint32_t i;
 
-    props = js_mallocz(ctx, sizeof(*props) * layout->shape->prop_size);
+    if (!shape)
+        return JS_EXCEPTION;
+    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
     if (!props)
         return JS_EXCEPTION;
+    for (i = 0; i < shape->prop_size; i++)
+        props[i].u.value = JS_UNDEFINED;
     for (i = 0; i < layout->count; i++) {
         props[layout->slot_indices[i]].u.value =
             js_lazy_marker_new(i);
@@ -53463,7 +53500,7 @@ static JSValue js_lazy_build_layout_object(JSContext *ctx,
         js_lazy_layout_direct_writes++;
     }
     props[layout->backing_slot].u.value = js_dup(backing);
-    obj = JS_NewObjectFromShape(ctx, js_dup_shape(layout->shape),
+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(shape),
                                 JS_CLASS_OBJECT, props);
     if (JS_IsException(obj)) {
         js_free(ctx, props);
@@ -53504,20 +53541,24 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
 {
     JSProperty *props;
     JSValue obj;
+    JSShape *shape = json_lazy_layout_shape(layout);
     uint32_t i;
     JSONLazyBacking *doc = JS_GetOpaque(document, js_lazy_backing_class_id);
     JSONLazyTapeNode *node;
     uint8_t hot_mask;
-    if (!doc || node_index >= doc->node_count)
+    if (!doc || !shape || node_index >= doc->node_count)
         return JS_EXCEPTION;
     node = &doc->nodes[node_index];
     layout->instance_count++;
     hot_mask = layout->instance_count >= 32 ? layout->hot_slot_mask : 0;
     if (hot_mask)
         js_lazy_layout_completion_calls++;
-    props = js_mallocz(ctx, sizeof(*props) * layout->shape->prop_size);
+    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
     if (!props)
         return JS_EXCEPTION;
+    for (i = 0; i < shape->prop_size; i++)
+        props[i].u.value = JS_UNDEFINED;
+    i = 0;
     for (i = 0; i < layout->count; i++) {
         uint32_t child_index = json_lazy_tape_child(doc, node, i);
         if (hot_mask & (uint8_t)(1U << i)) {
@@ -53525,6 +53566,9 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
                 json_lazy_materialize_tape_value(ctx, doc, child_index,
                                                  document, NULL);
             if (JS_IsException(props[layout->slot_indices[i]].u.value)) {
+                uint32_t j;
+                for (j = 0; j < shape->prop_size; j++)
+                    JS_FreeValue(ctx, props[j].u.value);
                 js_free(ctx, props);
                 return JS_EXCEPTION;
             }
@@ -53540,7 +53584,7 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
     props[layout->backing_slot].u.value = js_dup(document);
     props[layout->node_slot].u.value =
         JS_MKVAL(JS_TAG_INT, (int32_t)node_index);
-    obj = JS_NewObjectFromShape(ctx, js_dup_shape(layout->shape),
+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(shape),
                                 JS_CLASS_OBJECT, props);
     if (JS_IsException(obj)) {
         js_free(ctx, props);
@@ -53607,7 +53651,7 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
                         child->key_length - 2);
                 }
             }
-            if (layout_hint->shape && match &&
+            if (json_lazy_layout_shape(layout_hint) && match &&
                 fingerprint == layout_hint->key_fingerprint) {
                 return js_lazy_build_tape_layout_object(
                     ctx, document, node_index, layout_hint);
@@ -53668,7 +53712,8 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
         layout_match = 0;
         js_lazy_layout_mismatch_order++;
     }
-    if (layout_hint && layout_hint->valid && layout_hint->shape &&
+    if (layout_hint && layout_hint->valid &&
+        json_lazy_layout_shape(layout_hint) &&
         layout_match) {
         JSValue fast = js_lazy_build_tape_layout_object(
             ctx, document, node_index, layout_hint);
