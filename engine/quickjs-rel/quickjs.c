@@ -52088,6 +52088,820 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     return JS_EXCEPTION;
 }
 
+
+/* ---- Temporary lazy JSON.parse experiment (QJS_JSON_LAZY=1) ----
+   NOT a production patch. Exposes accessors; may retain source copies. */
+
+#define QJS_JSON_LAZY_DOC_MIN_LEN 65536U
+#define QJS_JSON_LAZY_CONTAINER_MIN_LEN 1024U
+#define QJS_JSON_LAZY_CONTAINER_MIN_CHILDREN 8
+
+typedef enum JSONLazyType {
+    JSON_LAZY_STRING,
+    JSON_LAZY_NUMBER,
+    JSON_LAZY_TRUE,
+    JSON_LAZY_FALSE,
+    JSON_LAZY_NULL,
+    JSON_LAZY_OBJECT,
+    JSON_LAZY_ARRAY,
+} JSONLazyType;
+
+typedef struct JSONLazySource {
+    int ref_count;
+    uint32_t len;
+    char text[];
+} JSONLazySource;
+
+typedef struct JSONLazyEntry {
+    JSAtom key;
+    uint32_t start;      /* absolute offset into source */
+    uint32_t end;        /* absolute offset into source */
+    uint8_t type;
+} JSONLazyEntry;
+
+typedef struct JSONLazyBacking {
+    JSONLazySource *source;
+    uint32_t start;      /* absolute offset of this container in source */
+    uint32_t end;
+    int is_array;
+    int count;
+    JSONLazyEntry *entries;
+} JSONLazyBacking;
+
+static JSClassID js_lazy_backing_class_id;
+static int js_lazy_json_enabled;
+
+static JSONLazySource *js_lazy_source_new(JSContext *ctx, const char *buf, size_t len)
+{
+    JSONLazySource *src = js_malloc(ctx, sizeof(*src) + len + 1);
+    if (!src)
+        return NULL;
+    src->ref_count = 1;
+    src->len = (uint32_t)len;
+    memcpy(src->text, buf, len);
+    src->text[len] = '\0';
+    return src;
+}
+
+static void js_lazy_source_ref(JSONLazySource *src)
+{
+    if (src)
+        src->ref_count++;
+}
+
+static void js_lazy_source_unref(JSRuntime *rt, JSONLazySource *src)
+{
+    if (!src)
+        return;
+    if (--src->ref_count <= 0)
+        js_free_rt(rt, src);
+}
+
+static void js_lazy_backing_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    JSONLazyBacking *b = JS_GetOpaque(val, js_lazy_backing_class_id);
+    int i;
+    if (!b)
+        return;
+    for (i = 0; i < b->count; i++)
+        JS_FreeAtomRT(rt, b->entries[i].key);
+    js_free_rt(rt, b->entries);
+    if (b->source) {
+        b->source->ref_count--;
+        if (b->source->ref_count <= 0)
+            js_free_rt(rt, b->source);
+    }
+    js_free_rt(rt, b);
+}
+
+static void js_lazy_backing_mark(JSRuntime *rt, JSValueConst val,
+                                 JS_MarkFunc *mark_func)
+{
+    /* atoms are in the runtime atom table; raw source is C memory */
+}
+
+static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
+{
+    if (!js_lazy_json_enabled) {
+        const char *e = getenv("QJS_JSON_LAZY");
+        if (e && *e == '1')
+            js_lazy_json_enabled = 1;
+    }
+    if (!js_lazy_json_enabled)
+        return 0;
+    if (len < QJS_JSON_LAZY_DOC_MIN_LEN)
+        return 0;
+    if (!js_lazy_backing_class_id) {
+        JSClassID cid = 0;
+        JS_NewClassID(ctx->rt, &cid);
+        if (cid == 0)
+            return 0;
+        JSClassDef cd;
+        memset(&cd, 0, sizeof(cd));
+        cd.class_name = "JSONLazyBacking";
+        cd.finalizer = js_lazy_backing_finalizer;
+        cd.gc_mark = js_lazy_backing_mark;
+        if (JS_NewClass(ctx->rt, cid, &cd) < 0)
+            return 0;
+        js_lazy_backing_class_id = cid;
+    }
+    return 1;
+}
+
+static int json_lazy_should_lazy_container(size_t len, int children)
+{
+    return len >= QJS_JSON_LAZY_CONTAINER_MIN_LEN ||
+           children >= QJS_JSON_LAZY_CONTAINER_MIN_CHILDREN;
+}
+
+static int json_lazy_skip_ws(const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p = *pp;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    *pp = p;
+    return 0;
+}
+
+static int json_lazy_skip_string(const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p = *pp;
+    int c, i;
+    if (p >= end || *p != '"')
+        return -1;
+    p++;
+    for (;;) {
+        if (p >= end)
+            return -1;
+        c = *p++;
+        if (c == '"') {
+            *pp = p;
+            return 0;
+        }
+        if (c == '\\') {
+            if (p >= end)
+                return -1;
+            c = *p++;
+            switch (c) {
+            case '"': case '\\': case '/': case 'b': case 'f':
+            case 'n': case 'r': case 't':
+                break;
+            case 'u':
+                for (i = 0; i < 4; i++) {
+                    int h;
+                    if (p >= end)
+                        return -1;
+                    h = from_hex(*p++);
+                    if (h < 0)
+                        return -1;
+                }
+                break;
+            default:
+                return -1;
+            }
+        } else if (c < 0x20) {
+            return -1;
+        }
+    }
+}
+
+static int json_lazy_is_digit(int c) { return c >= '0' && c <= '9'; }
+static int json_lazy_skip_number(const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p = *pp;
+    if (p >= end)
+        return -1;
+    if (*p == '-') {
+        p++;
+        if (p >= end || !json_lazy_is_digit(*p))
+            return -1;
+    }
+    if (*p == '0') {
+        p++;
+        if (p < end && json_lazy_is_digit(*p))
+            return -1;
+    } else if (*p >= '1' && *p <= '9') {
+        while (p < end && json_lazy_is_digit(*p))
+            p++;
+    } else {
+        return -1;
+    }
+    if (p < end && *p == '.') {
+        p++;
+        if (p >= end || !json_lazy_is_digit(*p))
+            return -1;
+        while (p < end && json_lazy_is_digit(*p))
+            p++;
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        if (p < end && (*p == '+' || *p == '-'))
+            p++;
+        if (p >= end || !json_lazy_is_digit(*p))
+            return -1;
+        while (p < end && json_lazy_is_digit(*p))
+            p++;
+    }
+    *pp = p;
+    return 0;
+}
+
+static int json_lazy_skip_literal(const uint8_t **pp, const uint8_t *end,
+                                  const char *lit)
+{
+    const uint8_t *p = *pp;
+    const char *q;
+    for (q = lit; *q; q++) {
+        if (p >= end || *p != (uint8_t)*q)
+            return -1;
+        p++;
+    }
+    *pp = p;
+    return 0;
+}
+
+static int json_lazy_skip_value(const uint8_t **pp, const uint8_t *end);
+
+static int json_lazy_skip_object(const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p = *pp;
+    if (p >= end || *p != '{')
+        return -1;
+    p++;
+    json_lazy_skip_ws(&p, end);
+    if (p < end && *p == '}') {
+        p++;
+        *pp = p;
+        return 0;
+    }
+    for (;;) {
+        json_lazy_skip_ws(&p, end);
+        if (p >= end || *p != '"')
+            return -1;
+        if (json_lazy_skip_string(&p, end))
+            return -1;
+        json_lazy_skip_ws(&p, end);
+        if (p >= end || *p != ':')
+            return -1;
+        p++;
+        json_lazy_skip_ws(&p, end);
+        if (json_lazy_skip_value(&p, end))
+            return -1;
+        json_lazy_skip_ws(&p, end);
+        if (p < end && *p == '}') {
+            p++;
+            *pp = p;
+            return 0;
+        }
+        if (p >= end || *p != ',')
+            return -1;
+        p++;
+    }
+}
+
+static int json_lazy_skip_array(const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p = *pp;
+    if (p >= end || *p != '[')
+        return -1;
+    p++;
+    json_lazy_skip_ws(&p, end);
+    if (p < end && *p == ']') {
+        p++;
+        *pp = p;
+        return 0;
+    }
+    for (;;) {
+        json_lazy_skip_ws(&p, end);
+        if (json_lazy_skip_value(&p, end))
+            return -1;
+        json_lazy_skip_ws(&p, end);
+        if (p < end && *p == ']') {
+            p++;
+            *pp = p;
+            return 0;
+        }
+        if (p >= end || *p != ',')
+            return -1;
+        p++;
+    }
+}
+
+static int json_lazy_skip_value(const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p;
+    json_lazy_skip_ws(pp, end);
+    p = *pp;
+    if (p >= end)
+        return -1;
+    switch (*p) {
+    case '{':
+        if (json_lazy_skip_object(&p, end) < 0)
+            return -1;
+        *pp = p;
+        return 0;
+    case '[':
+        if (json_lazy_skip_array(&p, end) < 0)
+            return -1;
+        *pp = p;
+        return 0;
+    case '"':
+        if (json_lazy_skip_string(&p, end) < 0)
+            return -1;
+        *pp = p;
+        return 0;
+    case '-': case '0': case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8': case '9':
+        if (json_lazy_skip_number(&p, end) < 0)
+            return -1;
+        *pp = p;
+        return 0;
+    case 't':
+        if (json_lazy_skip_literal(&p, end, "true") == 0) { *pp = p; return 0; }
+        return -1;
+    case 'f':
+        if (json_lazy_skip_literal(&p, end, "false") == 0) { *pp = p; return 0; }
+        return -1;
+    case 'n':
+        if (json_lazy_skip_literal(&p, end, "null") == 0) { *pp = p; return 0; }
+        return -1;
+    default:
+        return -1;
+    }
+}
+
+static int json_lazy_value_type(const uint8_t *p, const uint8_t *end)
+{
+    if (p >= end)
+        return -1;
+    if (*p == '{') return JSON_LAZY_OBJECT;
+    if (*p == '[') return JSON_LAZY_ARRAY;
+    if (*p == '"') return JSON_LAZY_STRING;
+    if (*p == '-' || json_lazy_is_digit(*p)) return JSON_LAZY_NUMBER;
+    if (end - p >= 4 && memcmp(p, "true", 4) == 0) return JSON_LAZY_TRUE;
+    if (end - p >= 5 && memcmp(p, "false", 5) == 0) return JSON_LAZY_FALSE;
+    if (end - p >= 4 && memcmp(p, "null", 4) == 0) return JSON_LAZY_NULL;
+    return -1;
+}
+
+/* Atomize an unescaped ASCII JSON key. Returns JS_ATOM_NULL on unsupported. */
+static JSAtom js_lazy_key_atom(JSContext *ctx, const uint8_t *p, const uint8_t *q)
+{
+    const uint8_t *k = p + 1;
+    size_t len = (size_t)(q - k);
+    size_t i;
+    if (len == 0)
+        return JS_NewAtomLen(ctx, "", 0);
+    for (i = 0; i < len; i++) {
+        uint8_t c = k[i];
+        if (c == '\\' || c < 0x20 || c >= 0x80)
+            return JS_ATOM_NULL;
+        if (c == '"')
+            return JS_ATOM_NULL;
+    }
+    return JS_NewAtomLen(ctx, (const char *)k, len);
+}
+
+static JSONLazyEntry *json_lazy_find_array_entry(JSONLazyBacking *b, uint32_t idx)
+{
+    if (!b || !b->is_array || idx >= (uint32_t)b->count)
+        return NULL;
+    return &b->entries[idx];
+}
+static JSONLazyEntry *json_lazy_find_obj_entry(JSONLazyBacking *b, JSAtom atom)
+{
+    int i;
+    if (!b || b->is_array)
+        return NULL;
+    for (i = 0; i < b->count; i++) {
+        if (b->entries[i].key == atom)
+            return &b->entries[i];
+    }
+    return NULL;
+}
+
+static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
+                                        uint32_t start, uint32_t len)
+{
+    char *tmp = js_malloc(ctx, (size_t)len + 1);
+    JSValue v;
+    if (!tmp)
+        return JS_EXCEPTION;
+    memcpy(tmp, base + start, len);
+    tmp[len] = '\0';
+    v = JS_ParseJSON(ctx, tmp, len, "<lazy>");
+    js_free(ctx, tmp);
+    return v;
+}
+
+static JSValue json_lazy_materialize_number(JSContext *ctx, JSONLazySource *src,
+                                            uint32_t start, uint32_t end)
+{
+    const uint8_t *p = (const uint8_t *)src->text + start;
+    const uint8_t *q = (const uint8_t *)src->text + end;
+    bool neg = false;
+    uint64_t ival = 0;
+    int ndigits = 0;
+    const uint8_t *p0 = p;
+    if (p >= q)
+        return JS_EXCEPTION;
+    if (*p == '-') { neg = true; p++; }
+    if (p >= q || !json_lazy_is_digit(*p))
+        return JS_EXCEPTION;
+    if (*p == '0') {
+        p++;
+        if (p < q && json_lazy_is_digit(*p))
+            return JS_EXCEPTION;
+    } else {
+        while (p < q && json_lazy_is_digit(*p)) {
+            if (ndigits <= 15)
+                ival = ival * 10 + (*p - '0');
+            ndigits++;
+            p++;
+        }
+    }
+    if (p == q) {
+        /* integer fast path */
+        if (ival == 0)
+            return neg ? js_float64(-0.0) : js_int32(0);
+        if (!neg && ival <= INT32_MAX)
+            return js_int32((int32_t)ival);
+        if (neg && ival <= (uint64_t)INT32_MAX + 1)
+            return js_int32((int32_t)(0 - (int64_t)ival));
+        return js_float64(neg ? -(double)ival : (double)ival);
+    }
+    /* fallback through full parser for decimals/exponents/edge cases */
+    {
+        JSValue v = js_lazy_eager_parse_range(ctx, src->text, start, end - start);
+        (void)p0;
+        return v;
+    }
+}
+
+static JSValue json_lazy_materialize_string(JSContext *ctx, JSONLazySource *src,
+                                            uint32_t start, uint32_t end)
+{
+    const uint8_t *p = (const uint8_t *)src->text + start;
+    const uint8_t *q = (const uint8_t *)src->text + end;
+    /* p points at opening quote, q points right after closing quote */
+    if (p >= q || *p != '"')
+        return JS_EXCEPTION;
+    {
+        const uint8_t *k = p + 1;
+        const uint8_t *e = q - 1;
+        const uint8_t *tmp;
+        int has_escape = 0;
+        for (tmp = k; tmp < e; tmp++) {
+            if (*tmp == '\\' || *tmp < 0x20 || *tmp >= 0x80) {
+                has_escape = 1;
+                break;
+            }
+        }
+        if (!has_escape)
+            return js_new_string8_len(ctx, (const char *)k, (size_t)(e - k));
+    }
+    {
+        JSValue v = js_lazy_eager_parse_range(ctx, src->text, start, end - start);
+        return v;
+    }
+}
+
+static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
+                                      uint32_t abs_start, uint32_t abs_end);
+
+static JSValue js_lazy_materialize_entry(JSContext *ctx, JSONLazyBacking *b,
+                                         JSONLazyEntry *e, JSValueConst this_val)
+{
+    JSONLazySource *src = b->source;
+    JSValue val = JS_UNDEFINED;
+    if (!src)
+        return JS_EXCEPTION;
+    switch (e->type) {
+    case JSON_LAZY_TRUE:
+        val = JS_TRUE;
+        break;
+    case JSON_LAZY_FALSE:
+        val = JS_FALSE;
+        break;
+    case JSON_LAZY_NULL:
+        val = JS_NULL;
+        break;
+    case JSON_LAZY_NUMBER:
+        val = json_lazy_materialize_number(ctx, src, e->start, e->end);
+        if (JS_IsException(val))
+            return JS_EXCEPTION;
+        break;
+    case JSON_LAZY_STRING:
+        val = json_lazy_materialize_string(ctx, src, e->start, e->end);
+        if (JS_IsException(val))
+            return JS_EXCEPTION;
+        break;
+    case JSON_LAZY_OBJECT:
+    case JSON_LAZY_ARRAY:
+        /* Large subtrees become lazy without copying; small ones use a
+           temporary NUL-terminated copy for correctness. */
+        if (e->end - e->start >= QJS_JSON_LAZY_DOC_MIN_LEN)
+            val = js_lazy_parse_children(ctx, src, e->start, e->end);
+        if (JS_IsUndefined(val))
+            val = js_lazy_eager_parse_range(ctx, src->text, e->start, e->end - e->start);
+        break;
+    default:
+        return JS_EXCEPTION;
+    }
+
+    if (JS_IsException(val))
+        return JS_EXCEPTION;
+    if (JS_DefinePropertyValue(ctx, this_val, e->key, val, JS_PROP_C_W_E) < 0)
+        return JS_EXCEPTION;
+    return js_dup(val);
+}
+
+static JSValue js_lazy_get(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv, int magic,
+                           JSValueConst *func_data)
+{
+    JSONLazyBacking *b;
+    JSONLazyEntry *e;
+    if (!js_lazy_backing_class_id)
+        return JS_ThrowInternalError(ctx, "lazy backing class missing");
+    b = JS_GetOpaque2(ctx, func_data[0], js_lazy_backing_class_id);
+    if (!b)
+        return JS_EXCEPTION;
+    if (magic < 0 || magic >= b->count)
+        return JS_ThrowInternalError(ctx, "lazy json entry out of range");
+    e = &b->entries[magic];
+    return js_lazy_materialize_entry(ctx, b, e, this_val);
+}
+
+static JSValue js_lazy_set(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv, int magic,
+                           JSValueConst *func_data)
+{
+    JSONLazyBacking *b;
+    JSONLazyEntry *e;
+    JSValue v;
+    if (!js_lazy_backing_class_id)
+        return JS_ThrowInternalError(ctx, "lazy backing class missing");
+    b = JS_GetOpaque2(ctx, func_data[0], js_lazy_backing_class_id);
+    if (!b)
+        return JS_EXCEPTION;
+    if (magic < 0 || magic >= b->count)
+        return JS_ThrowInternalError(ctx, "lazy json entry out of range");
+    e = &b->entries[magic];
+    v = js_dup(argv[0]);
+    if (JS_DefinePropertyValue(ctx, this_val, e->key, v, JS_PROP_C_W_E) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_lazy_new_backing(JSContext *ctx, JSONLazySource *src,
+                                   uint32_t abs_start, uint32_t abs_end,
+                                   int is_array, JSONLazyEntry *entries, int count)
+{
+    JSValue backing;
+    JSONLazyBacking *b;
+    backing = JS_NewObjectClass(ctx, js_lazy_backing_class_id);
+    if (JS_IsException(backing))
+        return JS_EXCEPTION;
+    b = js_malloc(ctx, sizeof(*b));
+    if (!b) {
+        JS_FreeValue(ctx, backing);
+        return JS_EXCEPTION;
+    }
+    b->source = src;
+    js_lazy_source_ref(src);
+    b->start = abs_start;
+    b->end = abs_end;
+    b->is_array = is_array;
+    b->count = count;
+    b->entries = entries;
+    JS_SetOpaque(backing, b);
+    return backing;
+}
+
+/* Parse the immediate children of a container in the *shared* source.
+   Returns JS_UNDEFINED on failure or if not lazy-worthy. */
+static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
+                                      uint32_t abs_start, uint32_t abs_end)
+{
+    const uint8_t *base = (const uint8_t *)source->text;
+    const uint8_t *buf = base + abs_start;
+    const uint8_t *end = base + abs_end;
+    const uint8_t *p = buf;
+    int is_array;
+    JSONLazyEntry *entries = NULL;
+    int count = 0, cap = 0;
+    JSValue obj = JS_UNDEFINED;
+    JSValue backing;
+    JSONLazyBacking *bl;
+    int i;
+    uint32_t child_start_off;
+
+    if (!js_lazy_backing_class_id)
+        return JS_UNDEFINED;
+    json_lazy_skip_ws(&p, end);
+    if (p >= end)
+        return JS_UNDEFINED;
+    if (*p == '{') {
+        is_array = 0;
+        p++;
+    } else if (*p == '[') {
+        is_array = 1;
+        p++;
+    } else {
+        return JS_UNDEFINED;
+    }
+
+    json_lazy_skip_ws(&p, end);
+    if (is_array) {
+        if (p < end && *p == ']') {
+            /* empty */
+        } else {
+            for (;;) {
+                JSONLazyEntry *ne;
+                const uint8_t *vstart, *vend;
+                int typ;
+                if (count >= cap) {
+                    int ncap = cap ? cap * 2 : 8;
+                    JSONLazyEntry *nent = js_realloc(ctx, entries, sizeof(JSONLazyEntry) * ncap);
+                    if (!nent)
+                        goto fail;
+                    entries = nent;
+                    cap = ncap;
+                }
+                json_lazy_skip_ws(&p, end);
+                vstart = p;
+                typ = json_lazy_value_type(vstart, end);
+                if (json_lazy_skip_value(&p, end))
+                    goto fail;
+                vend = p;
+                ne = &entries[count];
+                ne->key = JS_NewAtomUInt32(ctx, count);
+                if (ne->key == JS_ATOM_NULL)
+                    goto fail;
+                ne->start = (uint32_t)(vstart - base);
+                ne->end = (uint32_t)(vend - base);
+                ne->type = (uint8_t)typ;
+                count++;
+                json_lazy_skip_ws(&p, end);
+                if (p < end && *p == ']') {
+                    p++;
+                    break;
+                }
+                if (p >= end || *p != ',')
+                    goto fail;
+                p++;
+            }
+        }
+    } else {
+        if (p < end && *p == '}') {
+            /* empty */
+        } else {
+            for (;;) {
+                const uint8_t *kstart, *kend;
+                JSONLazyEntry *ne;
+                JSAtom key;
+                const uint8_t *vstart, *vend;
+                int typ;
+                if (count >= cap) {
+                    int ncap = cap ? cap * 2 : 8;
+                    JSONLazyEntry *nent = js_realloc(ctx, entries, sizeof(JSONLazyEntry) * ncap);
+                    if (!nent)
+                        goto fail;
+                    entries = nent;
+                    cap = ncap;
+                }
+                json_lazy_skip_ws(&p, end);
+                if (p >= end || *p != '"')
+                    goto fail;
+                kstart = p;
+                if (json_lazy_skip_string(&p, end))
+                    goto fail;
+                kend = p; /* after closing quote */
+                json_lazy_skip_ws(&p, end);
+                if (p >= end || *p != ':')
+                    goto fail;
+                p++;
+                json_lazy_skip_ws(&p, end);
+                vstart = p;
+                typ = json_lazy_value_type(vstart, end);
+                if (json_lazy_skip_value(&p, end))
+                    goto fail;
+                vend = p;
+                key = js_lazy_key_atom(ctx, kstart, kend - 1);
+                if (key == JS_ATOM_NULL)
+                    goto fail;
+                ne = &entries[count];
+                ne->key = key;
+                ne->start = (uint32_t)(vstart - base);
+                ne->end = (uint32_t)(vend - base);
+                ne->type = (uint8_t)typ;
+                count++;
+                json_lazy_skip_ws(&p, end);
+                if (p < end && *p == '}') {
+                    p++;
+                    break;
+                }
+                if (p >= end || *p != ',')
+                    goto fail;
+                p++;
+            }
+        }
+    }
+    json_lazy_skip_ws(&p, end);
+    if (p != end)
+        goto fail;
+
+    child_start_off = (uint32_t)(buf - base);
+    backing = js_lazy_new_backing(ctx, source, child_start_off, (uint32_t)(end - base),
+                                  is_array, entries, count);
+    if (JS_IsException(backing)) {
+        entries = NULL;
+        goto fail;
+    }
+    bl = JS_GetOpaque(backing, js_lazy_backing_class_id);
+    if (!bl) {
+        JS_FreeValue(ctx, backing);
+        goto fail;
+    }
+
+    if (is_array)
+        obj = JS_NewArray(ctx);
+    else
+        obj = JS_NewObject(ctx);
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, backing);
+        goto fail;
+    }
+
+    if (is_array) {
+        JSValueConst data[1];
+        JSValue getter, setter;
+        data[0] = backing;
+        for (i = 0; i < count; i++) {
+            JSAtom atom = JS_NewAtomUInt32(ctx, i);
+            if (atom == JS_ATOM_NULL)
+                goto fail_obj;
+            getter = JS_NewCFunctionData(ctx, js_lazy_get, 0, i, 1, data);
+            setter = JS_NewCFunctionData(ctx, js_lazy_set, 1, i, 1, data);
+            if (JS_IsException(getter) || JS_IsException(setter)) {
+                JS_FreeValue(ctx, getter);
+                JS_FreeValue(ctx, setter);
+                JS_FreeAtom(ctx, atom);
+                goto fail_obj;
+            }
+            if (JS_DefinePropertyGetSet(ctx, obj, atom, getter, setter, JS_PROP_C_W_E) < 0) {
+                JS_FreeAtom(ctx, atom);
+                goto fail_obj;
+            }
+            JS_FreeAtom(ctx, atom);
+        }
+    } else {
+        JSValueConst data[1];
+        JSValue getter, setter;
+        data[0] = backing;
+        for (i = 0; i < count; i++) {
+            getter = JS_NewCFunctionData(ctx, js_lazy_get, 0, i, 1, data);
+            setter = JS_NewCFunctionData(ctx, js_lazy_set, 1, i, 1, data);
+            if (JS_IsException(getter) || JS_IsException(setter)) {
+                JS_FreeValue(ctx, getter);
+                JS_FreeValue(ctx, setter);
+                goto fail_obj;
+            }
+            if (JS_DefinePropertyGetSet(ctx, obj, bl->entries[i].key, getter, setter, JS_PROP_C_W_E) < 0)
+                goto fail_obj;
+        }
+    }
+    JS_FreeValue(ctx, backing);
+    return obj;
+
+ fail_obj:
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, backing);
+    return JS_EXCEPTION;
+
+ fail:
+    for (i = 0; i < count; i++)
+        JS_FreeAtom(ctx, entries ? entries[i].key : JS_ATOM_NULL);
+    js_free(ctx, entries);
+    return JS_UNDEFINED;
+}
+
+/* Root entry point for a large document. */
+static JSValue json_lazy_parse(JSContext *ctx, const char *buf, size_t buf_len)
+{
+    JSONLazySource *src;
+    JSValue v;
+    if (!js_lazy_json_should_enable(ctx, buf_len))
+        return JS_UNDEFINED;
+    src = js_lazy_source_new(ctx, buf, buf_len);
+    if (!src)
+        return JS_UNDEFINED;
+    v = js_lazy_parse_children(ctx, src, 0, (uint32_t)buf_len);
+    js_lazy_source_unref(ctx->rt, src);
+    return v;
+}
+
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -52098,6 +52912,18 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
+    if (!(argc > 1 && JS_IsFunction(ctx, argv[1]))) {
+        JSValue laz = JS_UNDEFINED;
+        if (js_lazy_json_should_enable(ctx, len)) {
+            laz = json_lazy_parse(ctx, str, len);
+            if (JS_IsException(laz))
+                goto fail;
+            if (!JS_IsUndefined(laz)) {
+                JS_FreeCString(ctx, str);
+                return laz;
+            }
+        }
+    }
     if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
         JSONParseRecord pr_s, *pr = &pr_s, *pr1;
         JSValue root;
