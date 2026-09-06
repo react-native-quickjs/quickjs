@@ -35,12 +35,16 @@
       "sha256": "f8bb98c818fe2eebf5029f919c396530cbd1f11c360464acfdaef82dd0f1f615"
     },
     {
+      "name": "0009-json-stringify-fast-paths.patch",
+      "sha256": "ce13c4ac546364efece43310afd98345059a253ab25d16d170b5a780553c27e2"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "1a89bc63c09a7411d3f5d8cacbccbb7c525ad37ec4f7f07ee130f5ade736d428"
     }
   ],
   "files": {
-    "quickjs.c": "b24b93c72c2aef6371c93349b90ae934e20ad8efe44bd531936261317031a940",
+    "quickjs.c": "d6aa2a0eab6cd9402b0f4e00c17730dea127486a210755315fdac4f48a64f76a",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

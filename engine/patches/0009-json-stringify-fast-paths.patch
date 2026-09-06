@@ -1,0 +1,343 @@
+Subject: faster JSON.stringify for keys, strings and numbers
+
+What this does
+  Speeds up JSON.stringify on the paths apps exercise most, without
+  changing what is emitted.
+
+What it changes
+  - Non-exotic objects enumerate own enumerable string keys as atoms
+    directly instead of building a JS array of key strings and reading them
+    back out (JS_GetOwnPropertyNamesInternal).
+  - Quoting is split into json_quote_str, which writes into the caller's
+    buffer. Keys and string values quote straight from the JSString instead
+    of building an intermediate quoted string to copy and free.
+  - The array and object branches build the key string only when a replacer
+    function or a toJSON lookup could observe it.
+  - Float, boolean and null values write directly into the buffer. Integral
+    doubles format as their digits, exact within +/-2^53, avoiding
+    multi-precision arithmetic. -0 prints "0", as Number(-0).toString()
+    gives.
+
+Why we need it
+  JSON.stringify is on the hot path of every app that talks to a network:
+  fetch bodies, cached payloads, bridge round trips. The old code built a
+  key array, an intermediate quoted string per key and per string value,
+  and a JSString per number.
+
+Needs a bytecode version bump
+  No. This changes only runtime behaviour inside quickjs.c; the bytecode
+  format is untouched.
+
+Notes
+  Ported from the research tree (0010-json-stringify-fast-paths) and layered
+  on 0008, which supplies the JS_ToQuotedString narrow fast path this
+  refactor splits out. The source's toJSON skip is not carried over -- 0008
+  deliberately removed that optimization for a correctness bug, and this
+  patch must look up toJSON on every object.
+
+  An earlier draft of the research patch had progress comments throughout;
+  only the integral-double exactness note is kept here.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -15196,25 +15196,14 @@
+     [0x5c] = 1,
+ };
+ 
+-static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
++static int json_quote_str(StringBuffer *b, JSString *p)
+ {
+-    JSValue val;
+-    JSString *p;
+-    int i;
+-    uint32_t c;
+-    StringBuffer b_s, *b = &b_s;
+     char buf[16];
+-
+-    val = JS_ToStringCheckObject(ctx, val1);
+-    if (JS_IsException(val))
+-        return val;
+-    p = JS_VALUE_GET_STRING(val);
+-
+-    if (string_buffer_init(ctx, b, p->len + 2))
+-        goto fail;
++    uint32_t c;
++    int i;
+ 
+     if (string_buffer_putc8(b, '\"'))
+-        goto fail;
++        return -1;
+ 
+     if (!p->is_wide_char) {
+         /* narrow (Latin-1) fast path: bulk-copy runs that need no escaping.
+@@ -15228,7 +15217,7 @@
+                 i++;
+             if (i > run) {
+                 if (string_buffer_write8(b, s8 + run, i - run))
+-                    goto fail;
++                    return -1;
+             }
+             if (i >= len)
+                 break;
+@@ -15243,63 +15232,67 @@
+             case '\\':
+             quote8:
+                 if (string_buffer_putc8(b, '\\'))
+-                    goto fail;
++                    return -1;
+                 if (string_buffer_putc8(b, c))
+-                    goto fail;
++                    return -1;
+                 break;
+             default: /* remaining control chars < 0x20 */
+                 snprintf(buf, sizeof(buf), "\\u%04x", c);
+                 if (string_buffer_write8(b, (uint8_t*)buf, 6))
+-                    goto fail;
++                    return -1;
+                 break;
+             }
+         }
+-        if (string_buffer_putc8(b, '\"'))
+-            goto fail;
+-        JS_FreeValue(ctx, val);
+-        return string_buffer_end(b);
++        return string_buffer_putc8(b, '\"');
+     }
+ 
++
+     for(i = 0; i < p->len; ) {
+         c = string_getc(p, &i);
+         switch(c) {
+-        case '\t':
+-            c = 't';
+-            goto quote;
+-        case '\r':
+-            c = 'r';
+-            goto quote;
+-        case '\n':
+-            c = 'n';
+-            goto quote;
+-        case '\b':
+-            c = 'b';
+-            goto quote;
+-        case '\f':
+-            c = 'f';
+-            goto quote;
++        case '\t': c = 't'; goto quote;
++        case '\r': c = 'r'; goto quote;
++        case '\n': c = 'n'; goto quote;
++        case '\b': c = 'b'; goto quote;
++        case '\f': c = 'f'; goto quote;
+         case '\"':
+         case '\\':
+         quote:
+             if (string_buffer_putc8(b, '\\'))
+-                goto fail;
++                return -1;
+             if (string_buffer_putc8(b, c))
+-                goto fail;
++                return -1;
+             break;
+         default:
+             if (c < 32 || is_surrogate(c)) {
+                 snprintf(buf, sizeof(buf), "\\u%04x", c);
+                 if (string_buffer_write8(b, (uint8_t*)buf, 6))
+-                    goto fail;
++                    return -1;
+             } else {
+                 if (string_buffer_putc(b, c))
+-                    goto fail;
++                    return -1;
+             }
+             break;
+         }
+     }
+-    if (string_buffer_putc8(b, '\"'))
++    return string_buffer_putc8(b, '\"');
++}
++
++static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
++{
++    JSValue val;
++    JSString *p;
++    StringBuffer b_s, *b = &b_s;
++
++    val = JS_ToStringCheckObject(ctx, val1);
++    if (JS_IsException(val))
++        return val;
++    p = JS_VALUE_GET_STRING(val);
++
++    if (string_buffer_init(ctx, b, p->len + 2))
+         goto fail;
++    if (json_quote_str(b, p))
++        goto fail;
+     JS_FreeValue(ctx, val);
+     return string_buffer_end(b);
+  fail:
+@@ -52367,10 +52360,15 @@
+                 v = JS_GetPropertyInt64(ctx, val, i);
+                 if (JS_IsException(v))
+                     goto exception;
+-                /* XXX: could do this string conversion only when needed */
+-                prop = JS_ToStringFree(ctx, js_int64(i));
+-                if (JS_IsException(prop))
+-                    goto exception;
++
++                if (!JS_IsUndefined(jsc->replacer_func) ||
++                    (JS_IsObject(v) || JS_IsBigInt(v))) {
++                    prop = JS_ToStringFree(ctx, js_int64(i));
++                    if (JS_IsException(prop))
++                        goto exception;
++                } else {
++                    prop = JS_UNDEFINED;
++                }
+                 v = js_json_check(ctx, jsc, val, v, prop);
+                 JS_FreeValue(ctx, prop);
+                 prop = JS_UNDEFINED;
+@@ -52386,6 +52384,78 @@
+                 string_buffer_concat_value(jsc->b, indent);
+             }
+             string_buffer_putc8(jsc->b, ']');
++        } else if (JS_IsUndefined(jsc->property_list) &&
++                   !JS_VALUE_GET_OBJ(val)->is_exotic) {
++
++            JSPropertyEnum *ptab;
++            uint32_t plen, pi;
++
++            if (JS_GetOwnPropertyNamesInternal(ctx, &ptab, &plen,
++                                               JS_VALUE_GET_OBJ(val),
++                                               JS_GPN_STRING_MASK |
++                                               JS_GPN_ENUM_ONLY))
++                goto exception;
++            string_buffer_putc8(jsc->b, '{');
++            has_content = false;
++            for (pi = 0; pi < plen; pi++) {
++                JSAtom atom = ptab[pi].atom;
++                JS_FreeValue(ctx, prop);
++                prop = JS_UNDEFINED;
++                v = JS_GetProperty(ctx, val, atom);
++                if (JS_IsException(v))
++                    goto exception_ptab;
++
++                if (!JS_IsUndefined(jsc->replacer_func) ||
++                    (JS_IsObject(v) || JS_IsBigInt(v))) {
++                    prop = JS_AtomToString(ctx, atom);
++                    if (JS_IsException(prop)) {
++                        JS_FreeValue(ctx, v);
++                        goto exception_ptab;
++                    }
++                }
++                v = js_json_check(ctx, jsc, val, v, prop);
++                if (JS_IsException(v))
++                    goto exception_ptab;
++                if (!JS_IsUndefined(v)) {
++                    if (has_content)
++                        string_buffer_putc8(jsc->b, ',');
++                    string_buffer_concat_value(jsc->b, sep);
++
++                    if (!__JS_AtomIsTaggedInt(atom)) {
++                        if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
++                            JS_FreeValue(ctx, v);
++                            goto exception_ptab;
++                        }
++                    } else {
++
++                        JS_FreeValue(ctx, prop);
++                        prop = JS_AtomToString(ctx, atom);
++                        if (JS_IsException(prop)) {
++                            JS_FreeValue(ctx, v);
++                            goto exception_ptab;
++                        }
++                        if (json_quote_str(jsc->b, JS_VALUE_GET_STRING(prop))) {
++                            JS_FreeValue(ctx, v);
++                            goto exception_ptab;
++                        }
++                    }
++                    string_buffer_putc8(jsc->b, ':');
++                    string_buffer_concat_value(jsc->b, sep1);
++                    if (js_json_to_str(ctx, jsc, val, v, indent1))
++                        goto exception_ptab;
++                    has_content = true;
++                }
++            }
++            js_free_prop_enum(ctx, ptab, plen);
++            if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
++                string_buffer_putc8(jsc->b, '\n');
++                string_buffer_concat_value(jsc->b, indent);
++            }
++            string_buffer_putc8(jsc->b, '}');
++            goto done_object;
++        exception_ptab:
++            js_free_prop_enum(ctx, ptab, plen);
++            goto exception;
+         } else {
+             if (!JS_IsUndefined(jsc->property_list))
+                 tab = js_dup(jsc->property_list);
+@@ -52432,6 +52502,7 @@
+             }
+             string_buffer_putc8(jsc->b, '}');
+         }
++    done_object:
+         jsc->stack_len--; /* pop (borrowed pointer, nothing to free) */
+         JS_FreeValue(ctx, val);
+         JS_FreeValue(ctx, tab);
+@@ -52444,16 +52515,45 @@
+  concat_primitive:
+     switch (JS_VALUE_GET_NORM_TAG(val)) {
+     case JS_TAG_STRING:
++
++        if (json_quote_str(jsc->b, JS_VALUE_GET_STRING(val)))
++            goto exception;
++        JS_FreeValue(ctx, val);
++        return 0;
+     case JS_TAG_STRING_ROPE:
++
+         val = JS_ToQuotedStringFree(ctx, val);
+         if (JS_IsException(val))
+             goto exception;
+         goto concat_value;
+     case JS_TAG_FLOAT64:
+-        if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
+-            val = JS_NULL;
++        {
++
++            double d = JS_VALUE_GET_FLOAT64(val);
++            char numbuf[JS_DTOA_MAX_DIGITS + 32];
++            JSDTOATempMem dtoa_mem;
++            int64_t i64;
++            size_t n;
++            if (!isfinite(d))
++                return string_buffer_write8(jsc->b, (const uint8_t *)"null", 4);
++            /* Integral doubles -- timestamps, ids, counts, prices in minor
++               units -- are most of the numbers in a real payload, and their
++               shortest round-trip representation is simply their digits.
++               js_dtoa reaches for multi-precision arithmetic to work that out;
++               profiling a number-heavy payload puts ~60% of the time inside
++               mpb_shr_round / mul_pow / mp_div1norm.
++
++               Exact within +/-2^53, where every integer is representable, so
++               the round trip is exact by construction. -0 takes this path and
++               prints "0", which is what Number(-0).toString() gives. */
++            if (d >= -9007199254740992.0 && d <= 9007199254740992.0 &&
++                (double)(i64 = (int64_t)d) == d) {
++                n = i64toa(numbuf, i64);
++                return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
++            }
++            n = js_dtoa(numbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
++            return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
+         }
+-        goto concat_value;
+     case JS_TAG_INT:
+         {
+             /* format integers straight into the buffer (no JSString alloc) */
+@@ -52462,7 +52562,11 @@
+             return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
+         }
+     case JS_TAG_BOOL:
++        return string_buffer_write8(
++            jsc->b, (const uint8_t *)(JS_VALUE_GET_BOOL(val) ? "true" : "false"),
++            JS_VALUE_GET_BOOL(val) ? 4 : 5);
+     case JS_TAG_NULL:
++        return string_buffer_write8(jsc->b, (const uint8_t *)"null", 4);
+     concat_value:
+         return string_buffer_concat_value_free(jsc->b, val);
+     case JS_TAG_SHORT_BIG_INT:
