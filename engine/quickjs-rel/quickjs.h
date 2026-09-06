@@ -184,7 +184,7 @@ enum {
     JS_TAG_SYMBOL      = -8,
     JS_TAG_STRING      = -7,
     JS_TAG_STRING_ROPE = -6,
-    JS_TAG_LAZY_JSON   = -4, /* internal, immediate lazy JSON entry index */
+    JS_TAG_LAZY_JSON   = -4, /* internal, immediate lazy JSON child ordinal */
     JS_TAG_MODULE      = -3, /* used internally */
     JS_TAG_FUNCTION_BYTECODE = -2, /* used internally */
     JS_TAG_OBJECT      = -1,

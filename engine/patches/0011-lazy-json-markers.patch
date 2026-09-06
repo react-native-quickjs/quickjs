@@ -2,8 +2,9 @@ Subject: experimental lazy JSON.parse markers and sequential materialization
 
 What this does
   Adds an opt-in lazy JSON.parse representation for large documents. Normal
-  object and dense-array slots contain marker values backed by one shared source
-  and entry table. Scalars and nested containers are materialized directly from
+  object and dense-array slots contain immediate container-relative markers
+  backed by one shared source and structural tape. Scalars and nested containers are
+  materialized directly from
   recorded source ranges; broad completion fills pending slots by the same
   direct entry path. Repeated object layouts can build later children directly
   from the first hashed shape.
@@ -19,12 +20,11 @@ Needs a bytecode version bump
 
 Notes
   This is experimental and enabled only with QJS_JSON_LAZY=1. The marker
-  representation is still heap allocated; an immediate JSValue marker can be
-  evaluated after the materialization strategy is settled. QJS_JSON_LAZY_TRACE=1
+  representation is an internal immediate JSValue and never escapes to
+  JavaScript. QJS_JSON_LAZY_TRACE=1
   prints lifetime, fallback-parser, cursor, materialization, copy and slot-write
   counters. Complex strings and decimals still use counted temporary-parser
   fallbacks; integers, ASCII strings, booleans and null do not.
-
 diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
@@ -131,10 +131,11 @@ diff --git a/quickjs.c b/quickjs.c
                          BREAK;
                      }
                      if (js_get_fast_array_element(ctx, p, idx, &val)) {
-@@ -52086,8 +52116,1929 @@
+@@ -52085,7 +52115,1973 @@
+     js_free_prop_enum(ctx, atoms, len);
      JS_FreeValue(ctx, context);
      JS_FreeValue(ctx, val);
-     return JS_EXCEPTION;
++    return JS_EXCEPTION;
 +}
 +
 +
@@ -182,7 +183,6 @@ diff --git a/quickjs.c b/quickjs.c
 +} JSONLazyEntry;
 +
 +typedef struct JSONLazyLayout {
-+    JSShape *shape;
 +    JSValue template;
 +    JSAtom *ordered_atoms;
 +    uint32_t *slot_indices;
@@ -606,8 +606,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    json_lazy_layout_release(rt, &b->layout);
 +    js_lazy_source_unref(rt, b->source);
 +    js_free_rt(rt, b);
- }
- 
++}
++
 +static void js_lazy_backing_mark(JSRuntime *rt, JSValueConst val,
 +                                 JS_MarkFunc *mark_func)
 +{
@@ -632,14 +632,16 @@ diff --git a/quickjs.c b/quickjs.c
 +        JS_NewClassID(ctx->rt, &cid);
 +        if (cid == 0)
 +            return 0;
++        js_lazy_backing_class_id = cid;
++    }
++    if (!JS_IsRegisteredClass(ctx->rt, js_lazy_backing_class_id)) {
 +        JSClassDef cd;
 +        memset(&cd, 0, sizeof(cd));
 +        cd.class_name = "JSONLazyDocument";
 +        cd.finalizer = js_lazy_backing_finalizer;
 +        cd.gc_mark = js_lazy_backing_mark;
-+        if (JS_NewClass(ctx->rt, cid, &cd) < 0)
++        if (JS_NewClass(ctx->rt, js_lazy_backing_class_id, &cd) < 0)
 +            return 0;
-+        js_lazy_backing_class_id = cid;
 +    }
 +    return 1;
 +}
@@ -1390,8 +1392,35 @@ diff --git a/quickjs.c b/quickjs.c
 +    js_free_rt(rt, layout->slot_indices);
 +    JS_FreeValueRT(rt, layout->template);
 +    js_lazy_layout_templates_freed++;
-+    layout->shape = NULL;
 +    memset(layout, 0, sizeof(*layout));
++}
++
++static JSShape *json_lazy_layout_shape(const JSONLazyLayout *layout)
++{
++    if (!layout || !layout->valid ||
++        JS_VALUE_GET_TAG(layout->template) != JS_TAG_OBJECT)
++        return NULL;
++    return JS_VALUE_GET_OBJ(layout->template)->shape;
++}
++
++static JSValue json_lazy_make_shape_template(JSContext *ctx, JSObject *obj)
++{
++    JSProperty *props;
++    JSShape *shape;
++    JSValue value;
++    uint32_t i;
++
++    shape = js_dup_shape(obj->shape);
++    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
++    if (!props) {
++        js_free_shape(ctx->rt, shape);
++        return JS_EXCEPTION;
++    }
++    for (i = 0; i < shape->prop_size; i++)
++        props[i].u.value = JS_UNDEFINED;
++    value = JS_NewObjectFromShape(ctx, shape, JS_CLASS_OBJECT, props);
++    js_free(ctx, props);
++    return value;
 +}
 +
 +static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
@@ -1400,8 +1429,9 @@ diff --git a/quickjs.c b/quickjs.c
 +{
 +    JSShapeProperty *prs;
 +    JSProperty *pr;
-+    uint32_t i, j;
++    uint32_t i = 0, j, atom_count = 0;
 +    uint64_t fingerprint = UINT64_C(1469598103934665603);
++    JSValue template = JS_UNDEFINED;
 +
 +    if (layout->valid || !obj->shape->is_hashed || count <= 0)
 +        return 0;
@@ -1423,6 +1453,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        goto fail;
 +    for (i = 0; i < (uint32_t)count; i++) {
 +        layout->ordered_atoms[i] = JS_DupAtom(ctx, entries[i].key);
++        atom_count++;
 +        prs = find_own_property(&pr, obj, entries[i].key);
 +        if (!prs || !pr)
 +            goto fail;
@@ -1441,18 +1472,20 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (!prs || !pr)
 +        goto fail;
 +    layout->node_slot = (uint32_t)(pr - obj->prop);
-+    layout->template = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, obj));
++    template = json_lazy_make_shape_template(ctx, obj);
++    if (JS_IsException(template))
++        goto fail;
++    layout->template = template;
++    template = JS_UNDEFINED;
 +    js_lazy_layout_templates_created++;
-+    layout->shape = obj->shape;
 +    layout->count = count;
 +    layout->key_fingerprint = fingerprint;
 +    layout->valid = 1;
 +    return 0;
 +fail:
-+    if (layout->ordered_atoms) {
-+        while (i-- > 0)
-+            JS_FreeAtom(ctx, layout->ordered_atoms[i]);
-+    }
++    JS_FreeValue(ctx, template);
++    while (atom_count-- > 0)
++        JS_FreeAtom(ctx, layout->ordered_atoms[atom_count]);
 +    js_free(ctx, layout->ordered_atoms);
 +    js_free(ctx, layout->slot_indices);
 +    memset(layout, 0, sizeof(*layout));
@@ -1465,11 +1498,16 @@ diff --git a/quickjs.c b/quickjs.c
 +{
 +    JSProperty *props;
 +    JSValue obj;
++    JSShape *shape = json_lazy_layout_shape(layout);
 +    uint32_t i;
 +
-+    props = js_mallocz(ctx, sizeof(*props) * layout->shape->prop_size);
++    if (!shape)
++        return JS_EXCEPTION;
++    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
 +    if (!props)
 +        return JS_EXCEPTION;
++    for (i = 0; i < shape->prop_size; i++)
++        props[i].u.value = JS_UNDEFINED;
 +    for (i = 0; i < layout->count; i++) {
 +        props[layout->slot_indices[i]].u.value =
 +            js_lazy_marker_new(i);
@@ -1482,7 +1520,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        js_lazy_layout_direct_writes++;
 +    }
 +    props[layout->backing_slot].u.value = js_dup(backing);
-+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(layout->shape),
++    obj = JS_NewObjectFromShape(ctx, js_dup_shape(shape),
 +                                JS_CLASS_OBJECT, props);
 +    if (JS_IsException(obj)) {
 +        js_free(ctx, props);
@@ -1523,20 +1561,24 @@ diff --git a/quickjs.c b/quickjs.c
 +{
 +    JSProperty *props;
 +    JSValue obj;
++    JSShape *shape = json_lazy_layout_shape(layout);
 +    uint32_t i;
 +    JSONLazyBacking *doc = JS_GetOpaque(document, js_lazy_backing_class_id);
 +    JSONLazyTapeNode *node;
 +    uint8_t hot_mask;
-+    if (!doc || node_index >= doc->node_count)
++    if (!doc || !shape || node_index >= doc->node_count)
 +        return JS_EXCEPTION;
 +    node = &doc->nodes[node_index];
 +    layout->instance_count++;
 +    hot_mask = layout->instance_count >= 32 ? layout->hot_slot_mask : 0;
 +    if (hot_mask)
 +        js_lazy_layout_completion_calls++;
-+    props = js_mallocz(ctx, sizeof(*props) * layout->shape->prop_size);
++    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
 +    if (!props)
 +        return JS_EXCEPTION;
++    for (i = 0; i < shape->prop_size; i++)
++        props[i].u.value = JS_UNDEFINED;
++    i = 0;
 +    for (i = 0; i < layout->count; i++) {
 +        uint32_t child_index = json_lazy_tape_child(doc, node, i);
 +        if (hot_mask & (uint8_t)(1U << i)) {
@@ -1544,6 +1586,9 @@ diff --git a/quickjs.c b/quickjs.c
 +                json_lazy_materialize_tape_value(ctx, doc, child_index,
 +                                                 document, NULL);
 +            if (JS_IsException(props[layout->slot_indices[i]].u.value)) {
++                uint32_t j;
++                for (j = 0; j < shape->prop_size; j++)
++                    JS_FreeValue(ctx, props[j].u.value);
 +                js_free(ctx, props);
 +                return JS_EXCEPTION;
 +            }
@@ -1559,7 +1604,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    props[layout->backing_slot].u.value = js_dup(document);
 +    props[layout->node_slot].u.value =
 +        JS_MKVAL(JS_TAG_INT, (int32_t)node_index);
-+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(layout->shape),
++    obj = JS_NewObjectFromShape(ctx, js_dup_shape(shape),
 +                                JS_CLASS_OBJECT, props);
 +    if (JS_IsException(obj)) {
 +        js_free(ctx, props);
@@ -1626,7 +1671,7 @@ diff --git a/quickjs.c b/quickjs.c
 +                        child->key_length - 2);
 +                }
 +            }
-+            if (layout_hint->shape && match &&
++            if (json_lazy_layout_shape(layout_hint) && match &&
 +                fingerprint == layout_hint->key_fingerprint) {
 +                return js_lazy_build_tape_layout_object(
 +                    ctx, document, node_index, layout_hint);
@@ -1687,7 +1732,8 @@ diff --git a/quickjs.c b/quickjs.c
 +        layout_match = 0;
 +        js_lazy_layout_mismatch_order++;
 +    }
-+    if (layout_hint && layout_hint->valid && layout_hint->shape &&
++    if (layout_hint && layout_hint->valid &&
++        json_lazy_layout_shape(layout_hint) &&
 +        layout_match) {
 +        JSValue fast = js_lazy_build_tape_layout_object(
 +            ctx, document, node_index, layout_hint);
@@ -2005,7 +2051,7 @@ diff --git a/quickjs.c b/quickjs.c
 + fail_obj2:
 +    JS_FreeValue(ctx, obj);
 +    JS_FreeValue(ctx, backing);
-+    return JS_EXCEPTION;
+     return JS_EXCEPTION;
 +
 + fail_obj:
 +    JS_FreeValue(ctx, obj);
@@ -2056,12 +2102,10 @@ diff --git a/quickjs.c b/quickjs.c
 +    JS_FreeValue(ctx, document);
 +    js_lazy_source_unref(ctx->rt, src);
 +    return v;
-+}
-+
+ }
+ 
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
- {
-@@ -52098,6 +54049,18 @@
+@@ -52098,6 +54094,18 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
@@ -2087,7 +2131,7 @@ diff --git a/quickjs.h b/quickjs.h
      JS_TAG_SYMBOL      = -8,
      JS_TAG_STRING      = -7,
      JS_TAG_STRING_ROPE = -6,
-+    JS_TAG_LAZY_JSON   = -4, /* internal, immediate lazy JSON entry index */
++    JS_TAG_LAZY_JSON   = -4, /* internal, immediate lazy JSON child ordinal */
      JS_TAG_MODULE      = -3, /* used internally */
      JS_TAG_FUNCTION_BYTECODE = -2, /* used internally */
      JS_TAG_OBJECT      = -1,
