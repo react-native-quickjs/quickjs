@@ -63,7 +63,7 @@
     "bench": "cmake -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j8 --target qjs-bench native-call-bench && node tools/benchmark/bench.mjs",
     "bench:build": "cmake -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j8 --target qjs-bench native-call-bench",
     "bench:octane": "node tools/benchmark/bench.mjs octane",
-    "bench:workloads": "node tools/benchmark/bench.mjs react minireact rn primitives data strings surface suspense modern arrayholes",
+    "bench:workloads": "node tools/benchmark/bench.mjs react minireact rn primitives data strings surface suspense modern arrayholes jsonparse",
     "bench:kernels": "node tools/benchmark/bench.mjs compiler jit",
     "bench:calls": "node tools/benchmark/bench.mjs calls",
     "bench:startup": "node tools/benchmark/bench.mjs startup",

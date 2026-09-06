@@ -62,7 +62,7 @@ function usage() {
   console.log(`usage: bench.mjs [suites...] [options]
 
 suites:
-  react minireact rn primitives data strings surface suspense modern arrayholes
+  react minireact rn primitives data strings surface suspense modern arrayholes jsonparse
   octane compiler jit calls startup
 
 options:
@@ -96,6 +96,7 @@ const SUITES = [
   { kind: 'workload', name: 'surface',     file: '60-surface.js' },
   { kind: 'workload', name: 'suspense',    file: '70-suspense.js' },
   { kind: 'workload', name: 'modern',      file: '80-modern.js' },
+  { kind: 'workload', name: 'jsonparse',   file: '90-jsonparse.js' },
   { kind: 'octane',    name: 'octane' },
   { kind: 'kernels',   name: 'compiler', file: 'compiler_bench.js' },
   { kind: 'kernels',   name: 'jit',      file: 'jit_bench.js' },
