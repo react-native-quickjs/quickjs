@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning][semver].
 - Faster `JSON.parse` and `JSON.stringify` on mobile-real payloads — integer
   arrays, plain ASCII strings and small nested objects (new engine patch
   `0008`).
+- Faster `JSON.stringify`: object keys enumerate as atoms, keys and strings
+  quote straight into the output buffer, and floats/booleans/null format
+  directly (new engine patch `0009`).
 
 ## [v1.0.0-alpha.2] — 2026-09-05
 
