@@ -39,12 +39,16 @@
       "sha256": "ce13c4ac546364efece43310afd98345059a253ab25d16d170b5a780553c27e2"
     },
     {
+      "name": "0010-json-tokenizer-punctuation.patch",
+      "sha256": "48f63397b25bcc2aa20cfdcab2a21bb701c804f1ae2a86e67f9a8eb884d3ab9a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "1a89bc63c09a7411d3f5d8cacbccbb7c525ad37ec4f7f07ee130f5ade736d428"
     }
   ],
   "files": {
-    "quickjs.c": "d6aa2a0eab6cd9402b0f4e00c17730dea127486a210755315fdac4f48a64f76a",
+    "quickjs.c": "a85f3ef70a3b24cc550b5b7160dfc5fbd118812a0fb9dbd504dc4fdae10f7a34",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

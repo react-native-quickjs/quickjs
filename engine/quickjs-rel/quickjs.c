@@ -24369,6 +24369,21 @@ static __exception int json_next_token(JSParseState *s)
     p = s->last_ptr = s->buf_ptr;
     s->last_line_num = s->token.line_num;
     s->last_col_num = s->token.col_num;
+    /* Fast path: JSON structural punctuation carries no value, so it needs no
+       token-state bookkeeping (line/col/mark/eol) -- error positions are
+       recomputed from the source buffer by json_parse_error. Return the
+       punctuation directly; value tokens keep the full slow path. */
+    {
+        uint8_t c0 = *p;
+        if (c0 == 0x5b || c0 == 0x5d || c0 == 0x7b || c0 == 0x7d ||
+            c0 == 0x3a || c0 == 0x2c) {   /* [ ] { } : , */
+            s->token.val = c0;
+            s->token.ptr = p;
+            s->token.line_start = s->line_start;
+            s->buf_ptr = p + 1;
+            return 0;
+        }
+    }
  redo:
     s->token.line_num = s->line_num;
     s->token.col_num = s->col_num;

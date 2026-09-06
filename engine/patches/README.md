@@ -20,6 +20,7 @@ what we changed and why without opening a single `.patch` file.
 | `0007` | Makes a stripped bytecode function stringify as `[stripped source]` rather than `[native code]` | Stripping the source text made every affected function indistinguishable from a C built-in, which is a lie that confuses debugging | - | No |
 | `0008` | Speeds up JSON.parse and JSON.stringify on mobile-real payloads: integer arrays, plain ASCII strings, small nested objects | JSON is what native bindings and the bridge use, so its hot shapes dominate real payloads; the old code allocated per character and per element | - | No |
 | `0009` | Speeds up JSON.stringify: enumerate object keys as atoms, quote keys and strings straight into the buffer, and format floats/booleans/null directly (integral doubles exact within +/-2^53) | JSON.stringify dominates network payloads; the old code built a key array and an intermediate quoted string per key and per value | - | No |
+| `0010` | Faster json tokenizer for structural punctuation: `[ ] { } : ,` return directly without per-token state bookkeeping | Punctuation is 50-80% of JSON tokens, and each previously paid the full tokenizer update for a byte the parse loop just compares against | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
