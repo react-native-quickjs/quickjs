@@ -9602,6 +9602,9 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+static int js_lazy_marker_is(JSValue v);
+static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot);
+
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                       JSAtom prop, JSValueConst this_obj,
                                       bool throw_ref_error)
@@ -9687,6 +9690,8 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     continue;
                 }
             } else {
+                if (js_lazy_marker_is(pr->u.value))
+                    return js_lazy_materialize_slot(ctx, &pr->u.value);
                 return js_dup(pr->u.value);
             }
         }
@@ -10452,6 +10457,9 @@ JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val)
     return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
 }
 
+static int js_lazy_marker_is(JSValue v);
+static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot);
+
 static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
                                       uint32_t idx, JSValue *pval)
 {
@@ -10459,7 +10467,10 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     case JS_CLASS_ARRAY:
     case JS_CLASS_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
-        *pval = js_dup(p->u.array.u.values[idx]);
+        if (js_lazy_marker_is(p->u.array.u.values[idx]))
+            *pval = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx]);
+        else
+            *pval = js_dup(p->u.array.u.values[idx]);
         return true;
     case JS_CLASS_MAPPED_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
@@ -20156,7 +20167,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             /* found */
                             if (unlikely(prs->flags & JS_PROP_TMASK))
                                 goto get_field_slow_path;
-                            val = js_dup(pr->u.value);
+                            if (js_lazy_marker_is(pr->u.value)) {
+                                val = js_lazy_materialize_slot(ctx, &pr->u.value);
+                            } else {
+                                val = js_dup(pr->u.value);
+                            }
                             break;
                         }
                         if (unlikely(p->is_exotic)) {
@@ -20460,7 +20475,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
-                        val = js_dup(p->u.array.u.values[idx]);
+                        if (js_lazy_marker_is(p->u.array.u.values[idx]))
+                            val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx]);
+                        else
+                            val = js_dup(p->u.array.u.values[idx]);
                         JS_FreeValue(ctx, sp[-2]);
                         sp[-2] = val;
                         sp--;
@@ -20494,7 +20512,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
-                        sp[-1] = js_dup(p->u.array.u.values[idx]);
+                        if (js_lazy_marker_is(p->u.array.u.values[idx]))
+                            sp[-1] = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx]);
+                        else
+                            sp[-1] = js_dup(p->u.array.u.values[idx]);
                         BREAK;
                     }
                     if (js_get_fast_array_element(ctx, p, idx, &val)) {
@@ -52129,7 +52150,88 @@ typedef struct JSONLazyBacking {
 } JSONLazyBacking;
 
 static JSClassID js_lazy_backing_class_id;
+static JSClassID js_lazy_marker_class_id;
 static int js_lazy_json_enabled;
+
+typedef struct JSONLazyMarker {
+    JSValue backing;
+    uint32_t idx;
+} JSONLazyMarker;
+
+static void js_lazy_marker_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    JSONLazyMarker *m = JS_GetOpaque(val, js_lazy_marker_class_id);
+    if (m) {
+        JS_FreeValueRT(rt, m->backing);
+        js_free_rt(rt, m);
+    }
+}
+
+static int js_lazy_register_marker_class(JSContext *ctx)
+{
+    JSClassDef cd;
+    JSClassID cid = 0;
+    if (js_lazy_marker_class_id)
+        return 0;
+    JS_NewClassID(ctx->rt, &cid);
+    if (cid == 0)
+        return -1;
+    memset(&cd, 0, sizeof(cd));
+    cd.class_name = "JSONLazyMarker";
+    cd.finalizer = js_lazy_marker_finalizer;
+    if (JS_NewClass(ctx->rt, cid, &cd) < 0)
+        return -1;
+    js_lazy_marker_class_id = cid;
+    return 0;
+}
+
+static int js_lazy_marker_is(JSValue v)
+{
+    if (!js_lazy_marker_class_id || JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 0;
+    return JS_GetClassID(v) == js_lazy_marker_class_id;
+}
+
+static JSValue js_lazy_marker_new(JSContext *ctx, JSValue backing, uint32_t idx)
+{
+    JSValue obj;
+    JSONLazyMarker *m;
+    if (js_lazy_register_marker_class(ctx) < 0)
+        return JS_EXCEPTION;
+    obj = JS_NewObjectClass(ctx, js_lazy_marker_class_id);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    m = js_malloc(ctx, sizeof(*m));
+    if (!m) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    m->backing = js_dup(backing);
+    m->idx = idx;
+    JS_SetOpaque(obj, m);
+    return obj;
+}
+
+static JSValue json_lazy_materialize_value(JSContext *ctx, JSONLazyBacking *b,
+                                          uint32_t idx);
+
+static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot)
+{
+    JSONLazyMarker *m;
+    JSValue val;
+    if (!js_lazy_marker_is(*slot))
+        return js_dup(*slot);
+    m = JS_GetOpaque(*slot, js_lazy_marker_class_id);
+    if (!m)
+        return JS_ThrowInternalError(ctx, "bad lazy marker");
+    val = json_lazy_materialize_value(ctx,
+            JS_GetOpaque2(ctx, m->backing, js_lazy_backing_class_id), m->idx);
+    if (JS_IsException(val))
+        return JS_EXCEPTION;
+    JS_FreeValue(ctx, *slot);
+    *slot = val;
+    return js_dup(val);
+}
 
 static JSONLazySource *js_lazy_source_new(JSContext *ctx, const char *buf, size_t len)
 {
@@ -52569,11 +52671,16 @@ static JSValue json_lazy_materialize_string(JSContext *ctx, JSONLazySource *src,
 static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
                                       uint32_t abs_start, uint32_t abs_end);
 
-static JSValue js_lazy_materialize_entry(JSContext *ctx, JSONLazyBacking *b,
-                                         JSONLazyEntry *e, JSValueConst this_val)
+static JSValue json_lazy_materialize_value(JSContext *ctx, JSONLazyBacking *b,
+                                          uint32_t idx)
 {
-    JSONLazySource *src = b->source;
+    JSONLazySource *src;
+    JSONLazyEntry *e;
     JSValue val = JS_UNDEFINED;
+    if (!b || idx >= (uint32_t)b->count)
+        return JS_EXCEPTION;
+    src = b->source;
+    e = &b->entries[idx];
     if (!src)
         return JS_EXCEPTION;
     switch (e->type) {
@@ -52598,8 +52705,8 @@ static JSValue js_lazy_materialize_entry(JSContext *ctx, JSONLazyBacking *b,
         break;
     case JSON_LAZY_OBJECT:
     case JSON_LAZY_ARRAY:
-        /* Large subtrees become lazy without copying; small ones use a
-           temporary NUL-terminated copy for correctness. */
+        if (getenv("LAZY_DEBUG"))
+            fprintf(stderr, "materialize %s start=%u end=%u c=%c\n", e->type==JSON_LAZY_ARRAY?"arr":"obj", e->start, e->end, src->text[e->start]);
         if (e->end - e->start >= QJS_JSON_LAZY_DOC_MIN_LEN)
             val = js_lazy_parse_children(ctx, src, e->start, e->end);
         if (JS_IsUndefined(val))
@@ -52608,7 +52715,16 @@ static JSValue js_lazy_materialize_entry(JSContext *ctx, JSONLazyBacking *b,
     default:
         return JS_EXCEPTION;
     }
+    if (JS_IsException(val))
+        return JS_EXCEPTION;
+    return val;
+}
 
+static JSValue js_lazy_materialize_entry(JSContext *ctx, JSONLazyBacking *b,
+                                         JSONLazyEntry *e, JSValueConst this_val)
+{
+    uint32_t idx = (uint32_t)(e - b->entries);
+    JSValue val = json_lazy_materialize_value(ctx, b, idx);
     if (JS_IsException(val))
         return JS_EXCEPTION;
     if (JS_DefinePropertyValue(ctx, this_val, e->key, val, JS_PROP_C_W_E) < 0)
@@ -52825,55 +52941,45 @@ static JSValue js_lazy_parse_children(JSContext *ctx, JSONLazySource *source,
         goto fail;
     }
 
-    if (is_array)
-        obj = JS_NewArray(ctx);
-    else
-        obj = JS_NewObject(ctx);
-    if (JS_IsException(obj)) {
-        JS_FreeValue(ctx, backing);
-        goto fail;
-    }
-
     if (is_array) {
-        JSValueConst data[1];
-        JSValue getter, setter;
-        data[0] = backing;
-        for (i = 0; i < count; i++) {
-            JSAtom atom = JS_NewAtomUInt32(ctx, i);
-            if (atom == JS_ATOM_NULL)
-                goto fail_obj;
-            getter = JS_NewCFunctionData(ctx, js_lazy_get, 0, i, 1, data);
-            setter = JS_NewCFunctionData(ctx, js_lazy_set, 1, i, 1, data);
-            if (JS_IsException(getter) || JS_IsException(setter)) {
-                JS_FreeValue(ctx, getter);
-                JS_FreeValue(ctx, setter);
-                JS_FreeAtom(ctx, atom);
-                goto fail_obj;
+        JSValue *elems = NULL;
+        if (count > 0) {
+            elems = js_malloc(ctx, sizeof(JSValue) * count);
+            if (!elems)
+                goto fail_obj2;
+            for (i = 0; i < count; i++) {
+                elems[i] = js_lazy_marker_new(ctx, backing, i);
+                if (JS_IsException(elems[i])) {
+                    while (i > 0)
+                        JS_FreeValue(ctx, elems[--i]);
+                    js_free(ctx, elems);
+                    goto fail_obj2;
+                }
             }
-            if (JS_DefinePropertyGetSet(ctx, obj, atom, getter, setter, JS_PROP_C_W_E) < 0) {
-                JS_FreeAtom(ctx, atom);
-                goto fail_obj;
-            }
-            JS_FreeAtom(ctx, atom);
         }
+        obj = JS_NewArrayFrom(ctx, count, elems); /* takes ownership */
+        js_free(ctx, elems);
+        if (JS_IsException(obj))
+            goto fail_obj2;
     } else {
-        JSValueConst data[1];
-        JSValue getter, setter;
-        data[0] = backing;
+        obj = JS_NewObject(ctx);
+        if (JS_IsException(obj))
+            goto fail_obj2;
         for (i = 0; i < count; i++) {
-            getter = JS_NewCFunctionData(ctx, js_lazy_get, 0, i, 1, data);
-            setter = JS_NewCFunctionData(ctx, js_lazy_set, 1, i, 1, data);
-            if (JS_IsException(getter) || JS_IsException(setter)) {
-                JS_FreeValue(ctx, getter);
-                JS_FreeValue(ctx, setter);
-                goto fail_obj;
-            }
-            if (JS_DefinePropertyGetSet(ctx, obj, bl->entries[i].key, getter, setter, JS_PROP_C_W_E) < 0)
-                goto fail_obj;
+            JSValue marker = js_lazy_marker_new(ctx, backing, i);
+            if (JS_IsException(marker))
+                goto fail_obj2;
+            if (JS_DefinePropertyValue(ctx, obj, bl->entries[i].key, marker, JS_PROP_C_W_E) < 0)
+                goto fail_obj2;
         }
     }
     JS_FreeValue(ctx, backing);
     return obj;
+
+ fail_obj2:
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, backing);
+    return JS_EXCEPTION;
 
  fail_obj:
     JS_FreeValue(ctx, obj);
