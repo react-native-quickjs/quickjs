@@ -52,9 +52,12 @@ add_library(quickjs STATIC
   "${QUICKJS_DIR}/libregexp.c"
   "${QUICKJS_DIR}/libunicode.c"
   "${QUICKJS_DIR}/dtoa.c"
+  "${CMAKE_CURRENT_LIST_DIR}/../third-party/fast_float/qjs_fast_double.cpp"
 )
 
 target_include_directories(quickjs PUBLIC "${QUICKJS_DIR}")
+target_include_directories(quickjs PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/../third-party/fast_float")
 target_compile_definitions(quickjs PRIVATE _GNU_SOURCE)
 
 # The maths functions are in libSystem on Apple and in a separate libm
