@@ -6882,8 +6882,13 @@ static JSValue js_new_array_from_owned(JSContext *ctx, int count, JSValue *value
 {
     JSValue obj = JS_NewArray(ctx);
     JSObject *p;
-    if (JS_IsException(obj))
+    int i;
+    if (JS_IsException(obj)) {
+        for (i = 0; i < count; i++)
+            JS_FreeValue(ctx, values[i]);
+        js_free(ctx, values);
         return JS_EXCEPTION;
+    }
     p = JS_VALUE_GET_OBJ(obj);
     if (count > 0) {
         p->u.array.u.values = values;
@@ -24449,12 +24454,8 @@ static int json_parse_numeric_array(JSParseState *s, JSValue *pval)
     }
     if (ret == 0) {
         JSValue array = js_new_array_from_owned(ctx, n, elems);
-        if (JS_IsException(array)) {
-            while (n > 0)
-                JS_FreeValue(ctx, elems[--n]);
-            js_free(ctx, elems);
+        if (JS_IsException(array))
             return -1;
-        }
         s->buf_ptr = p;
         s->token.val = ']';
         *pval = array;
@@ -52035,8 +52036,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                         goto fail;
                     }
                 }
-                val = JS_NewArrayFrom(ctx, n, elems); /* takes ownership of elems[] */
-                js_free(ctx, elems);
+                val = js_new_array_from_owned(ctx, n, elems);
                 if (JS_IsException(val))
                     goto fail;
                 if (json_next_token(s))
