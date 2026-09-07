@@ -74,19 +74,19 @@ Needs a bytecode version bump
      js_arena_init(rt);
      rt->malloc_gc_threshold = 256 * 1024;
 
-@@ -2682,6 +2685,12 @@
+@@ -2680,6 +2683,12 @@
+ {
+     if (rt)
          rt->rt_info = s;
- }
-
++}
++
 +void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled)
 +{
 +    if (rt)
 +        rt->json_lazy_enabled = enabled;
-+}
-+
+ }
+
  void JS_FreeRuntime(JSRuntime *rt)
- {
-     struct list_head *el, *el1;
 @@ -9624,6 +9633,9 @@
      return 0;
  }
@@ -180,7 +180,7 @@ Needs a bytecode version bump
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52299,9 +52331,1060 @@
+@@ -52299,9 +52331,1103 @@
      js_free_prop_enum(ctx, atoms, len);
      JS_FreeValue(ctx, context);
      JS_FreeValue(ctx, val);
@@ -294,6 +294,48 @@ Needs a bytecode version bump
 +                                  js_dup(backing), JS_PROP_C_W_E);
 +}
 +
++static int js_lazy_container_has_markers(JSObject *holder)
++{
++    uint32_t i;
++    if (holder->class_id == JS_CLASS_ARRAY && holder->fast_array) {
++        for (i = 0; i < holder->u.array.count; i++) {
++            if (js_lazy_marker_is(holder->u.array.u.values[i]))
++                return 1;
++        }
++        return 0;
++    }
++    {
++        JSShapeProperty *prs = get_shape_prop(holder->shape);
++        for (i = 0; i < (uint32_t)holder->shape->prop_size; i++, prs++) {
++            if (prs->atom == JS_ATOM_NULL ||
++                prs->atom == js_lazy_document_atom ||
++                (prs->flags & JS_PROP_TMASK))
++                continue;
++            if (js_lazy_marker_is(holder->prop[i].u.value))
++                return 1;
++        }
++    }
++    return 0;
++}
++
++/* Keep the private slot in the shape, but release its document once this
++   container no longer has any deferred values of its own. */
++static void js_lazy_release_document_if_complete(JSContext *ctx,
++                                                 JSObject *holder)
++{
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    if (js_lazy_container_has_markers(holder))
++        return;
++    prs = find_own_property(&pr, holder, js_lazy_document_atom);
++    if (prs && pr && !(prs->flags & JS_PROP_TMASK) &&
++        JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT) {
++        JSValue document = pr->u.value;
++        pr->u.value = JS_UNDEFINED;
++        JS_FreeValue(ctx, document);
++    }
++}
++
 +static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
 +                                                JSONLazyDocument *doc,
 +                                                uint32_t node_index,
@@ -340,11 +382,12 @@ Needs a bytecode version bump
 +        goto fail;
 +    JS_FreeValue(ctx, *slot);
 +    *slot = val;
++    js_lazy_release_document_if_complete(ctx, holder);
 +    JS_FreeValue(ctx, backing);
 +    return js_dup(val);
 +fail:
 +    JS_FreeValue(ctx, backing);
-+    return JS_EXCEPTION;
+     return JS_EXCEPTION;
 +}
 +
 +static void js_lazy_document_finalizer(JSRuntime *rt, JSValueConst val)
@@ -392,8 +435,8 @@ Needs a bytecode version bump
 +            return 0;
 +    }
 +    return 1;
-+}
-+
+ }
+
 +static void json_lazy_skip_ws(const uint8_t **pp, const uint8_t *end)
 +{
 +    const uint8_t *p = *pp;
@@ -1009,7 +1052,7 @@ Needs a bytecode version bump
 +    for (i = 0; i < shape->prop_size; i++)
 +        JS_FreeValue(ctx, props[i].u.value);
 +    js_free(ctx, props);
-     return JS_EXCEPTION;
++    return JS_EXCEPTION;
 +}
 +
 +static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyDocument *doc,
@@ -1166,8 +1209,8 @@ Needs a bytecode version bump
 +    }
 +    JS_FreeValue(ctx, obj);
 +    return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
- }
-
++}
++
 +static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
 +                                                JSONLazyDocument *doc,
 +                                                uint32_t node_index,
@@ -1241,7 +1284,7 @@ Needs a bytecode version bump
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -52312,6 +53395,19 @@
+@@ -52312,6 +53438,19 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
