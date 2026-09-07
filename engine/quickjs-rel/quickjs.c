@@ -52467,19 +52467,22 @@ static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject 
         return JS_ThrowInternalError(ctx, "lazy JSON document is not a tape document");
     }
     child_node = js_lazy_marker_index(*slot);
-    if (child_node >= b->node_count)
-        goto fail;
+    if (child_node >= b->node_count) {
+        JS_FreeValue(ctx, backing);
+        return JS_ThrowInternalError(ctx, "lazy JSON marker is invalid");
+    }
     feedback_slot = b->nodes[child_node].feedback_slot;
     if (holder->class_id == JS_CLASS_OBJECT && b->layout.valid &&
         feedback_slot != UINT8_MAX && feedback_slot < b->layout.count &&
         JS_VALUE_GET_TAG(b->layout.template) == JS_TAG_OBJECT &&
-        holder->shape == JS_VALUE_GET_OBJ(b->layout.template)->shape)
+        holder->shape == JS_VALUE_GET_OBJ(b->layout.template)->shape) {
         json_lazy_layout_feedback(&b->layout, feedback_slot);
-        val = json_lazy_materialize_tape_value(
-            ctx, b, child_node, backing,
-            holder->class_id == JS_CLASS_ARRAY &&
-                    b->nodes[child_node].type == JSON_LAZY_OBJECT
-                ? &b->layout : NULL);
+    }
+    val = json_lazy_materialize_tape_value(
+        ctx, b, child_node, backing,
+        holder->class_id == JS_CLASS_ARRAY &&
+                b->nodes[child_node].type == JSON_LAZY_OBJECT
+            ? &b->layout : NULL);
     if (JS_IsException(val))
         goto fail;
     JS_FreeValue(ctx, *slot);

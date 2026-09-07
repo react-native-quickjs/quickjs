@@ -168,6 +168,35 @@ int main() {
           "duplicate.a === 2 && duplicate['é'] === 'v'")
           .getBool(),
       "JSON duplicate and escaped keys");
+  check(
+      eval(
+          rt,
+          "var boundaryBase='{\\\"a\\\":1,\\\"p\\\":\\\"\\\"}';"
+          "function boundary(n){var p='x'.repeat(n-boundaryBase.length);"
+          "var v=JSON.parse('{\\\"a\\\":1,\\\"p\\\":\\\"'+p+'\\\"}');"
+          "return v.a===1 && v.p.length===p.length;}"
+          "boundary(4095) && boundary(4096) && boundary(4097)")
+          .getBool(),
+      "lazy JSON threshold boundaries");
+  check(
+      eval(
+          rt,
+          "var exact=JSON.parse('{\\\"a\\\":9007199254740991,"
+          "\\\"b\\\":9007199254740992,\\\"pad\\\":\\\"' + "
+          "'x'.repeat(4096) + '\\\"}');"
+          "exact.a===9007199254740991 && exact.b===9007199254740992")
+          .getBool(),
+      "lazy JSON 2^53 boundaries");
+  check(
+      eval(
+          rt,
+          "var deepText=('[                ').repeat(300)+'0'+"
+          "('                ]').repeat(300);"
+          "var deepValue=JSON.parse(deepText);"
+          "for(var depth=0;depth<300;depth++) deepValue=deepValue[0];"
+          "deepValue===0")
+          .getBool(),
+      "lazy JSON deep document");
   // toJSON is observable per the specification: it must be looked up on every
   // object, even when the default prototypes have none. A fast path that
   // skips it would silently serialize the wrong value (regression guard).
@@ -226,6 +255,19 @@ int main() {
   check(message == "boom", "exception message preserved");
 
   checkReceiverSemantics(rt);
+
+  auto runtime2 = qjs::makeQuickJSRuntime();
+  check(runtime2 != nullptr, "second runtime constructed");
+  if (runtime2) {
+    check(
+        eval(
+            *runtime2,
+            "var multi=JSON.parse('{\\\"value\\\":1,\\\"pad\\\":\\\"' + "
+            "'x'.repeat(4096) + '\\\"}'); multi.value===1")
+            .getBool(),
+        "lazy JSON second runtime registration");
+    runtime2.reset();
+  }
 
   runtime.reset();
   check(true, "runtime destroyed cleanly");

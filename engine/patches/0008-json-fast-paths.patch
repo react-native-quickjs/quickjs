@@ -11,11 +11,10 @@ What it changes
     instead of building a temporary JSString.
   - JS_ToQuotedString: a 256-entry escape lookup table plus a bulk copy of
     the runs that need no escaping, replacing the per-character loop.
-  - JSON.parse: a pure-ASCII string with no escapes is built directly from
-    the source range. Integer literals that fit in a double are read
-    without a strtod call. Array elements are staged in a C buffer and a
-    dense array is built in one shot, avoiding a property define per
-    element, when there is no reviver.
+  - JSON.parse: pure-ASCII object keys are interned directly from the source
+    range, integer literals that fit in a double avoid strtod, and number-only
+    arrays use a dedicated cursor path before transfer to dense storage. Arrays
+    with a reviver or unsupported content use the normal parser.
 
 Why we need it
   JSON is the serialization format React Native uses for the bridge and
@@ -29,7 +28,36 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -15186,6 +15186,15 @@
+@@ -6877,6 +6877,28 @@
+     return JS_EXCEPTION;
+ }
+
++/* Take ownership of an already allocated dense value buffer. */
++static JSValue js_new_array_from_owned(JSContext *ctx, int count, JSValue *values)
++{
++    JSValue obj = JS_NewArray(ctx);
++    JSObject *p;
++    int i;
++    if (JS_IsException(obj)) {
++        for (i = 0; i < count; i++)
++            JS_FreeValue(ctx, values[i]);
++        js_free(ctx, values);
++        return JS_EXCEPTION;
++    }
++    p = JS_VALUE_GET_OBJ(obj);
++    if (count > 0) {
++        p->u.array.u.values = values;
++        p->u.array.u1.size = count;
++        p->u.array.count = count;
++        p->prop[0].u.value = js_int32(count);
++    }
++    return obj;
++}
++
+ JSValue JS_NewObject(JSContext *ctx)
+ {
+     /* inline JS_NewObjectClass(ctx, JS_CLASS_OBJECT); */
+@@ -15186,6 +15208,15 @@
          return JS_ThrowTypeError(ctx, "null or undefined are forbidden");
      return JS_ToString(ctx, val);
  }
@@ -42,11 +70,11 @@ Needs a bytecode version bump
 +    /* rest default to 0 except 0x5c = '\\' set below via designated init */
 +    [0x5c] = 1,
 +};
- 
+
  static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
  {
-@@ -15206,6 +15215,51 @@
- 
+@@ -15206,6 +15237,51 @@
+
      if (string_buffer_putc8(b, '\"'))
          goto fail;
 +
@@ -97,13 +125,20 @@ Needs a bytecode version bump
      for(i = 0; i < p->len; ) {
          c = string_getc(p, &i);
          switch(c) {
-@@ -24099,11 +24153,30 @@
-     int i;
+@@ -22947,6 +23023,7 @@
+     const uint8_t *line_start; /* first character of the current line */
+     const uint8_t *eol;  // most recently seen end-of-line character
+     const uint8_t *mark; // first token character, invariant: eol < mark
++    bool json_key_mode;
+
+     /* current function code */
+     JSFunctionDef *cur_func;
+@@ -24100,10 +24177,29 @@
      uint32_t c;
      StringBuffer b_s, *b = &b_s;
-+
+
 +    p = *pp;
- 
++
 +    /* Fast path: a pure-ASCII string with no escapes can be built directly from
 +       the source range, skipping the StringBuffer entirely. */
 +    {
@@ -124,12 +159,42 @@ Needs a bytecode version bump
 +
      if (string_buffer_init(s->ctx, b, 48))
          goto fail;
- 
+
 -    p = *pp;
      for(;;) {
          if (p >= s->buf_end) {
              goto end_of_input;
-@@ -24188,9 +24261,15 @@
+@@ -24182,15 +24278,45 @@
+  fail:
+     string_buffer_free(b);
+     return -1;
++}
++
++/* Parse an ordinary JSON object key without first allocating a JSString. */
++static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
++{
++    const uint8_t *start = *pp;
++    const uint8_t *p = start;
++
++    while (p < s->buf_end && *p != '"' && *p != '\\' &&
++           *p >= 0x20 && *p < 0x80)
++        p++;
++    if (p < s->buf_end && *p == '"') {
++        JSAtom atom = JS_NewAtomLen(s->ctx, (const char *)start,
++                                    p - start);
++        if (atom == JS_ATOM_NULL)
++            return -1;
++        s->token.val = TOK_IDENT;
++        s->token.u.ident.atom = atom;
++        s->token.u.ident.has_escape = false;
++        s->token.u.ident.is_reserved = false;
++        *pp = p + 1;
++        return 0;
++    }
++    return json_parse_string(s, pp);
+ }
+
+ static int json_parse_number(JSParseState *s, const uint8_t **pp)
  {
      const uint8_t *p = *pp;
      const uint8_t *p_start = p;
@@ -137,19 +202,19 @@ Needs a bytecode version bump
 +    bool is_float = false;
 +    uint64_t ival = 0;
 +    int ndigits = 0;
- 
+
 -    if (*p == '+' || *p == '-')
 +    if (*p == '+' || *p == '-') {
 +        neg = (*p == '-');
          p++;
 +    }
- 
+
      if (!is_digit(*p))
          return js_parse_error(s, "Unexpected token '%c'", *p_start);
-@@ -24198,10 +24277,17 @@
+@@ -24198,10 +24324,17 @@
      if (p[0] == '0' && is_digit(p[1]))
          return json_parse_error(s, p, "Unexpected number");
- 
+
 -    while (is_digit(*p))
 +    while (is_digit(*p)) {
 +        /* accumulate the integer value while it stays exact in a double
@@ -159,13 +224,13 @@ Needs a bytecode version bump
 +        ndigits++;
          p++;
 +    }
- 
+
      if (*p == '.') {
 +        is_float = true;
          p++;
          if (!is_digit(*p))
              return json_parse_error(s, p, "Unterminated fractional number");
-@@ -24209,6 +24295,7 @@
+@@ -24209,6 +24342,7 @@
              p++;
      }
      if (*p == 'e' || *p == 'E') {
@@ -173,7 +238,7 @@ Needs a bytecode version bump
          p++;
          if (*p == '+' || *p == '-')
              p++;
-@@ -24218,7 +24305,22 @@
+@@ -24218,11 +24352,163 @@
              p++;
      }
      s->token.val = TOK_NUMBER;
@@ -192,13 +257,238 @@ Needs a bytecode version bump
 +            s->token.u.num.val = js_float64(neg ? -d : d);
 +        }
 +    } else {
-+        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
++        double d;
++        d = strtod((const char *)p_start, NULL);
++        s->token.u.num.val = js_float64(d);
 +    }
      *pp = p;
      return 0;
++}
++
++/* Parse an array whose elements are all JSON numbers without routing each
++   number and punctuation mark through json_next_token().  Return 1 when the
++   array is not numeric-only so the caller can use the general parser. */
++static int json_parse_numeric_array(JSParseState *s, JSValue *pval)
++{
++    JSContext *ctx = s->ctx;
++    const uint8_t *saved = s->buf_ptr;
++    const uint8_t *p = saved;
++    JSValue *elems = NULL;
++    int elems_size = 0, n = 0, ret = 1;
++
++    for (;;) {
++        while (p < s->buf_end && (*p == ' ' || *p == '\t' ||
++                                   *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= s->buf_end)
++            goto fallback;
++        if (*p == ']') {
++            p++;
++            ret = 0;
++            break;
++        }
++        if (*p != '-' && (*p < '0' || *p > '9'))
++            goto fallback;
++        if (n >= elems_size) {
++            int new_size = elems_size ? elems_size * 2 : 8;
++            JSValue *new_elems = js_realloc(ctx, elems,
++                                            sizeof(*elems) * new_size);
++            if (!new_elems) {
++                ret = -1;
++                goto fail;
++            }
++            elems = new_elems;
++            elems_size = new_size;
++        }
++        if (json_parse_number(s, &p) < 0) {
++            ret = -1;
++            goto fail;
++        }
++        elems[n++] = s->token.u.num.val;
++        while (p < s->buf_end && (*p == ' ' || *p == '\t' ||
++                                   *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= s->buf_end)
++            goto fallback;
++        if (*p == ']') {
++            p++;
++            ret = 0;
++            break;
++        }
++        if (*p != ',')
++            goto fallback;
++        p++;
++        while (p < s->buf_end && (*p == ' ' || *p == '\t' ||
++                                   *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= s->buf_end || *p == ']' ||
++            (*p != '-' && (*p < '0' || *p > '9')))
++            goto fallback;
++    }
++    if (ret == 0) {
++        JSValue array = js_new_array_from_owned(ctx, n, elems);
++        if (JS_IsException(array))
++            return -1;
++        s->buf_ptr = p;
++        s->token.val = ']';
++        *pval = array;
++        return 0;
++    }
++fallback:
++    while (n > 0)
++        JS_FreeValue(ctx, elems[--n]);
++    js_free(ctx, elems);
++    s->buf_ptr = saved;
++    return 1;
++fail:
++    js_free(ctx, elems);
++    s->buf_ptr = saved;
++    if (ret == 1)
++        return -1;
++    return -1;
  }
-@@ -51705,24 +51807,63 @@
- 
+
++/* Keep large integer-only arrays on the optimized eager path.  The lazy
++   representation is useful for object-heavy documents, but adds tape and
++   marker work that is unnecessary when every element is a number. */
++static int json_is_integer_array(const char *buf, size_t len)
++{
++    const uint8_t *p = (const uint8_t *)buf;
++    const uint8_t *end = p + len;
++    int count = 0;
++
++    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++        p++;
++    if (p >= end || *p++ != '[')
++        return 0;
++    for (;;) {
++        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= end)
++            return 0;
++        if (*p == ']') {
++            p++;
++            break;
++        }
++        if (*p == '-')
++            p++;
++        if (p >= end || *p < '0' || *p > '9')
++            return 0;
++        if (*p == '0') {
++            p++;
++            if (p < end && *p >= '0' && *p <= '9')
++                return 0;
++        } else {
++            do {
++                p++;
++            } while (p < end && *p >= '0' && *p <= '9');
++        }
++        count = 1;
++        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= end)
++            return 0;
++        if (*p == ']') {
++            p++;
++            break;
++        }
++        if (*p++ != ',')
++            return 0;
++    }
++    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++        p++;
++    return count && p == end;
++}
++
+ /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
+ static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
+ {
+@@ -24293,8 +24579,12 @@
+         goto def_token;
+     case '\"':
+         p++;
+-        if (json_parse_string(s, &p))
++        if (s->json_key_mode) {
++            if (json_parse_key_string(s, &p))
++                goto fail;
++        } else if (json_parse_string(s, &p)) {
+             goto fail;
++        }
+         break;
+     case '\r':  /* accept DOS and MAC newline sequences */
+         if (p[1] == '\n') {
+@@ -24335,6 +24625,8 @@
+     case 'Y': case 'Z':
+     case '_':
+     case '$':
++        if (s->json_key_mode)
++            goto def_token;
+         /* identifier : only pure ascii characters are accepted */
+         p++;
+         atom = json_parse_ident(s, &p, c);
+@@ -24394,6 +24686,16 @@
+     return -1;
+ }
+
++static int json_next_key_token(JSParseState *s)
++{
++    bool saved = s->json_key_mode;
++    int ret;
++    s->json_key_mode = true;
++    ret = json_next_token(s);
++    s->json_key_mode = saved;
++    return ret;
++}
++
+ #ifndef QJS_DISABLE_PARSER
+
+ /* only used for ':' and '=>', 'let' or 'function' look-ahead. *pp is
+@@ -51636,7 +51938,7 @@
+             JSONParseRecord *pr1;
+             int pr_size;
+
+-            if (json_next_token(s))
++            if (json_next_key_token(s))
+                 goto fail;
+             val = JS_NewObject(ctx);
+             if (JS_IsException(val))
+@@ -51647,8 +51949,12 @@
+             }
+             if (s->token.val != '}') {
+                 for(;;) {
+-                    if (s->token.val == TOK_STRING) {
++                    if (s->token.val == TOK_STRING || s->token.val == TOK_IDENT) {
++                        if (s->token.val == TOK_IDENT) {
++                            prop_name = JS_DupAtom(ctx, s->token.u.ident.atom);
++                        } else {
+                         prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
++                        }
+                         if (prop_name == JS_ATOM_NULL)
+                             goto fail;
+                     } else {
+@@ -51688,7 +51994,7 @@
+                         json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
+                         goto fail;
+                     }
+-                    if (json_next_token(s))
++                    if (json_next_key_token(s))
+                         goto fail;
+                 }
+             }
+@@ -51703,26 +52009,75 @@
+             JSONParseRecord *pr1;
+             int pr_size;
+
++            if (!pr) {
++                ret = json_parse_numeric_array(s, &val);
++                if (ret == 0) {
++                    if (json_next_token(s))
++                        goto fail;
++                    break;
++                }
++                if (ret < 0)
++                    goto fail;
++            }
              if (json_next_token(s))
                  goto fail;
 +            if (!pr) {
@@ -274,8 +564,8 @@ Needs a bytecode version bump
                      el = json_parse_value(s, pr1);
                      if (JS_IsException(el))
                          goto fail;
-@@ -52049,12 +52190,39 @@
- 
+@@ -52049,13 +52404,40 @@
+
  typedef struct JSONStringifyContext {
      JSValueConst replacer_func;
 -    JSValue stack;
@@ -289,7 +579,7 @@ Needs a bytecode version bump
      JSValue empty;
      StringBuffer *b;
  } JSONStringifyContext;
-+
+
 +static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
 +{
 +    int i;
@@ -312,10 +602,11 @@ Needs a bytecode version bump
 +    jsc->stack[jsc->stack_len++] = p; /* borrowed: alive on the recursion */
 +    return 0;
 +}
- 
++
  static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
      JSValue r = JS_ToQuotedString(ctx, val);
-@@ -52165,10 +52333,7 @@
+     JS_FreeValue(ctx, val);
+@@ -52165,10 +52547,7 @@
              val = val1;
              goto concat_value;
          }
@@ -327,7 +618,7 @@ Needs a bytecode version bump
              JS_ThrowTypeError(ctx, "circular reference");
              goto exception;
          }
-@@ -52186,8 +52351,7 @@
+@@ -52186,8 +52565,7 @@
              sep = js_dup(jsc->empty);
              sep1 = js_dup(jsc->empty);
          }
@@ -337,7 +628,7 @@ Needs a bytecode version bump
              goto exception;
          ret = js_is_array(ctx, val);
          if (ret < 0)
-@@ -52268,8 +52432,7 @@
+@@ -52268,8 +52646,7 @@
              }
              string_buffer_putc8(jsc->b, '}');
          }
@@ -347,7 +638,7 @@ Needs a bytecode version bump
          JS_FreeValue(ctx, val);
          JS_FreeValue(ctx, tab);
          JS_FreeValue(ctx, sep);
-@@ -52292,6 +52455,12 @@
+@@ -52292,6 +52669,12 @@
          }
          goto concat_value;
      case JS_TAG_INT:
@@ -360,9 +651,9 @@ Needs a bytecode version bump
      case JS_TAG_BOOL:
      case JS_TAG_NULL:
      concat_value:
-@@ -52325,7 +52494,9 @@
+@@ -52325,7 +52708,9 @@
      int64_t i, j, n;
- 
+
      jsc->replacer_func = JS_UNDEFINED;
 -    jsc->stack = JS_UNDEFINED;
 +    jsc->stack = NULL;
@@ -371,9 +662,9 @@ Needs a bytecode version bump
      jsc->property_list = JS_UNDEFINED;
      jsc->gap = JS_UNDEFINED;
      jsc->b = &b_s;
-@@ -52334,9 +52505,6 @@
+@@ -52334,9 +52719,6 @@
      wrapper = JS_UNDEFINED;
- 
+
      string_buffer_init(ctx, jsc->b, 0);
 -    jsc->stack = JS_NewArray(ctx);
 -    if (JS_IsException(jsc->stack))
@@ -381,7 +672,7 @@ Needs a bytecode version bump
      if (JS_IsFunction(ctx, replacer)) {
          jsc->replacer_func = replacer;
      } else {
-@@ -52449,7 +52617,7 @@
+@@ -52449,7 +52831,7 @@
      JS_FreeValue(ctx, jsc->empty);
      JS_FreeValue(ctx, jsc->gap);
      JS_FreeValue(ctx, jsc->property_list);
@@ -389,4 +680,4 @@ Needs a bytecode version bump
 +    js_free(ctx, jsc->stack);
      return ret;
  }
- 
+
