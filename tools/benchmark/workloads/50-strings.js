@@ -403,6 +403,63 @@ bench({
   expect: 3,
 });
 
+/* Mixed search sizes: short strings exercise call/setup overhead while long
+   strings exercise candidate scanning and same-width comparison. */
+var SEARCH_HAYSTACKS = null;
+var SEARCH_NEEDLES = null;
+
+function setupMixedSearch() {
+  var longA = '';
+  var longB = '';
+  var longNeedle = 'target-token-target-token-1234';
+  for (var i = 0; i < 256; i++) {
+    longA += 'asset-' + (i % 10) + '/';
+    longB += 'aaaaaaaa';
+  }
+  SEARCH_HAYSTACKS = [
+    'abc',
+    'short-test-id',
+    longA + longNeedle,
+    longB + longNeedle,
+    longA,
+    longB + longNeedle,
+  ];
+  SEARCH_NEEDLES = [
+    'b',
+    'missing',
+    longNeedle,
+    'aaaaaaaaab',
+    'not-present',
+    longNeedle,
+  ];
+}
+
+bench({
+  name: 'str/indexOf-mixed-short-long',
+  unit: '6 searches',
+  setup: setupMixedSearch,
+  run: function () {
+    var n = 0;
+    for (var i = 0; i < SEARCH_HAYSTACKS.length; i++)
+      n += SEARCH_HAYSTACKS[i].indexOf(SEARCH_NEEDLES[i]) >= 0 ? 1 : 0;
+    return n;
+  },
+  expect: 3,
+});
+
+bench({
+  name: 'str/includes-mixed-short-long',
+  unit: '6 searches',
+  setup: setupMixedSearch,
+  run: function () {
+    var n = 0;
+    for (var i = 0; i < SEARCH_HAYSTACKS.length; i++)
+      n += SEARCH_HAYSTACKS[i].includes(SEARCH_NEEDLES[i]) ? 1 : 0;
+    return n;
+  },
+  expect: 3,
+});
+
 /* startsWith, which is the check that should be used for the prefix cases
    above and is often not. */
 bench({

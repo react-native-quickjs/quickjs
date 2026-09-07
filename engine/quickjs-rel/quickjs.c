@@ -48618,6 +48618,11 @@ slow_path:
 static int string_cmp(JSString *p1, JSString *p2, int x1, int x2, int len)
 {
     int i, c1, c2;
+    if (len >= 16 && !p1->is_wide_char && !p2->is_wide_char)
+        return memcmp(str8(p1) + x1, str8(p2) + x2, len);
+    if (len >= 16 && p1->is_wide_char && p2->is_wide_char)
+        return memcmp(str16(p1) + x1, str16(p2) + x2,
+                      (size_t)len * sizeof(uint16_t));
     for (i = 0; i < len; i++) {
         if ((c1 = string_get(p1, x1 + i)) != (c2 = string_get(p2, x2 + i)))
             return c1 - c2;
@@ -48630,16 +48635,18 @@ static int string_indexof_char(JSString *p, int c, int from)
     /* assuming 0 <= from <= p->len */
     int i, len = p->len;
     if (p->is_wide_char) {
+        const uint16_t *s = str16(p);
         for (i = from; i < len; i++) {
-            if (str16(p)[i] == c)
+            if (s[i] == c)
                 return i;
         }
     } else {
         if ((c & ~0xff) == 0) {
-            for (i = from; i < len; i++) {
-                if (str8(p)[i] == (uint8_t)c)
-                    return i;
-            }
+            const uint8_t *s = str8(p);
+            const uint8_t *r = memchr(s + from, (uint8_t)c,
+                                      (size_t)(len - from));
+            if (r)
+                return (int)(r - s);
         }
     }
     return -1;
@@ -48794,13 +48801,17 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     }
     ret = -1;
     if (len >= v_len && inc * (stop - start) >= 0) {
-        for (i = start;; i += inc) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = i;
-                break;
+        if (!lastIndexOf) {
+            ret = string_indexof(p, p1, start);
+        } else {
+            for (i = start;; i += inc) {
+                if (!string_cmp(p, p1, i, 0, v_len)) {
+                    ret = i;
+                    break;
+                }
+                if (i == stop)
+                    break;
             }
-            if (i == stop)
-                break;
         }
     }
     JS_FreeValue(ctx, str);
@@ -48860,13 +48871,17 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
         start = stop = pos;
     }
     if (start >= 0 && start <= stop) {
-        for (i = start;; i++) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = 1;
-                break;
+        if (magic == 0) {
+            ret = (string_indexof(p, p1, start) >= 0);
+        } else {
+            for (i = start;; i++) {
+                if (!string_cmp(p, p1, i, 0, v_len)) {
+                    ret = 1;
+                    break;
+                }
+                if (i == stop)
+                    break;
             }
-            if (i == stop)
-                break;
         }
     }
  done:
