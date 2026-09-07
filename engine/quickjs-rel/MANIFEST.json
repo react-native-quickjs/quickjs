@@ -44,7 +44,7 @@
     },
     {
       "name": "0011-lazy-json-markers.patch",
-      "sha256": "8029731c5458f2f41f81e7700582a86e48a152055534f3b837f7c848f55d9db8"
+      "sha256": "3c05fca8f2b78bed44275ade87b8d95b05c29286ddbb09e8bd5db0535291b7f6"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -52,7 +52,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "709f9670a939f54ae9e54cf1e12f1c05830b51c294fd39d8e8759cfe8f171553",
+    "quickjs.c": "376dbbe9a78fa19f385d4933bcc6b43de06daaee6eaf7b1a355bd409908d52a0",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
