@@ -24486,6 +24486,58 @@ fail:
     return -1;
 }
 
+/* Keep large integer-only arrays on the optimized eager path.  The lazy
+   representation is useful for object-heavy documents, but adds tape and
+   marker work that is unnecessary when every element is a number. */
+static int json_is_integer_array(const char *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    const uint8_t *end = p + len;
+    int count = 0;
+
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    if (p >= end || *p++ != '[')
+        return 0;
+    for (;;) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+            p++;
+        if (p >= end)
+            return 0;
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (*p == '-')
+            p++;
+        if (p >= end || *p < '0' || *p > '9')
+            return 0;
+        if (*p == '0') {
+            p++;
+            if (p < end && *p >= '0' && *p <= '9')
+                return 0;
+        } else {
+            do {
+                p++;
+            } while (p < end && *p >= '0' && *p <= '9');
+        }
+        count = 1;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+            p++;
+        if (p >= end)
+            return 0;
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (*p++ != ',')
+            return 0;
+    }
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    return count && p == end;
+}
+
 /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
 static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
 {
@@ -53342,7 +53394,8 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (!(argc > 1 && JS_IsFunction(ctx, argv[1]))) {
         JSValue laz = JS_UNDEFINED;
-        if (js_lazy_json_should_enable(ctx, len)) {
+        if (js_lazy_json_should_enable(ctx, len) &&
+            !json_is_integer_array(str, len)) {
             laz = json_lazy_parse(ctx, str, len);
             if (JS_IsException(laz))
                 goto fail;

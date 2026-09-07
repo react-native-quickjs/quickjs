@@ -1,16 +1,17 @@
 Subject: lazy JSON.parse and JSON construction fast paths
 
 Technical overview
-  Adds lazy JSON.parse for large documents using one shared source,
-  structural tape, immediate tape-node markers, direct scalar/container
-  materialization, repeated-layout construction and access feedback. Eager
-  JSON parsing uses direct key-to-atom scanning and owned dense-array transfer
-  for the numeric-array fast path.
+  Adds lazy JSON.parse for documents at least 4 KiB, while keeping
+  integer-only numeric arrays on the optimized eager path. Lazy documents use
+  shared source storage, a structural tape, immediate tape-node markers, direct
+  scalar/container materialization, repeated-layout construction and access
+  feedback. Eager JSON parsing uses direct key-to-atom scanning and owned
+  dense-array transfer for numeric arrays.
 
-  Lazy parsing is enabled by default for large documents and can be disabled
-  per runtime with JS_SetJSONLazyEnabled() or overridden for testing with
-  QJS_JSON_LAZY=0/1. Lazy containers retain the document through a private
-  non-enumerable property; unsupported values use the existing fallback parser.
+  Lazy parsing can be disabled per runtime with JS_SetJSONLazyEnabled() or
+  overridden for testing with QJS_JSON_LAZY=0/1. Lazy containers retain the
+  document through a private non-enumerable property; unsupported values use
+  the existing fallback parser.
 
 Needs a bytecode version bump
   No.
@@ -24,13 +25,13 @@ Needs a bytecode version bump
 +
  #include "libregexp.h"
  #include "dtoa.h"
- 
+
 @@ -348,6 +349,7 @@
      JSMallocState malloc_state;
      JSArenaState arena_state;
      const char *rt_info;
 +    int json_lazy_enabled;
- 
+
      int atom_hash_size; /* power of two */
      int atom_count;
 @@ -2373,6 +2375,7 @@
@@ -40,7 +41,7 @@ Needs a bytecode version bump
 +    rt->json_lazy_enabled = 1;
      js_arena_init(rt);
      rt->malloc_gc_threshold = 256 * 1024;
- 
+
 @@ -2680,6 +2683,12 @@
  {
      if (rt)
@@ -52,7 +53,7 @@ Needs a bytecode version bump
 +    if (rt)
 +        rt->json_lazy_enabled = enabled;
  }
- 
+
  void JS_FreeRuntime(JSRuntime *rt)
 @@ -6875,6 +6884,28 @@
      for (i = 0; i < count; i++)
@@ -81,18 +82,18 @@ Needs a bytecode version bump
 +    }
 +    return obj;
  }
- 
+
  JSValue JS_NewObject(JSContext *ctx)
-@@ -9602,6 +9633,9 @@
+@@ -9601,6 +9632,9 @@
+     pr->u.value = val;
      return 0;
  }
- 
++
 +static int js_lazy_marker_is(JSValueConst v);
 +static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
-+
+
  static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                        JSAtom prop, JSValueConst this_obj,
-                                       bool throw_ref_error)
 @@ -9687,6 +9721,8 @@
                      continue;
                  }
@@ -120,7 +121,7 @@ Needs a bytecode version bump
 @@ -10452,6 +10494,9 @@
      return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
  }
- 
+
 +static int js_lazy_marker_is(JSValueConst v);
 +static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
 +
@@ -181,13 +182,15 @@ Needs a bytecode version bump
      const uint8_t *eol;  // most recently seen end-of-line character
      const uint8_t *mark; // first token character, invariant: eol < mark
 +    bool json_key_mode;
- 
+
      /* current function code */
      JSFunctionDef *cur_func;
-@@ -24250,6 +24309,30 @@
+@@ -24248,6 +24307,30 @@
+  fail:
+     string_buffer_free(b);
      return -1;
- }
- 
++}
++
 +/* Parse an ordinary JSON object key without first allocating a JSString. */
 +static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
 +{
@@ -210,12 +213,10 @@ Needs a bytecode version bump
 +        return 0;
 +    }
 +    return json_parse_string(s, pp);
-+}
-+
+ }
+
  static int json_parse_number(JSParseState *s, const uint8_t **pp)
- {
-     const uint8_t *p = *pp;
-@@ -24312,12 +24395,97 @@
+@@ -24312,12 +24395,149 @@
              s->token.u.num.val = js_float64(neg ? -d : d);
          }
      } else {
@@ -226,8 +227,8 @@ Needs a bytecode version bump
      }
      *pp = p;
      return 0;
- }
- 
++}
++
 +/* Parse an array whose elements are all JSON numbers without routing each
 +   number and punctuation mark through json_next_token().  Return 1 when the
 +   array is not numeric-only so the caller can use the general parser. */
@@ -309,12 +310,64 @@ Needs a bytecode version bump
 +    if (ret == 1)
 +        return -1;
 +    return -1;
+ }
+
++/* Keep large integer-only arrays on the optimized eager path.  The lazy
++   representation is useful for object-heavy documents, but adds tape and
++   marker work that is unnecessary when every element is a number. */
++static int json_is_integer_array(const char *buf, size_t len)
++{
++    const uint8_t *p = (const uint8_t *)buf;
++    const uint8_t *end = p + len;
++    int count = 0;
++
++    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++        p++;
++    if (p >= end || *p++ != '[')
++        return 0;
++    for (;;) {
++        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= end)
++            return 0;
++        if (*p == ']') {
++            p++;
++            break;
++        }
++        if (*p == '-')
++            p++;
++        if (p >= end || *p < '0' || *p > '9')
++            return 0;
++        if (*p == '0') {
++            p++;
++            if (p < end && *p >= '0' && *p <= '9')
++                return 0;
++        } else {
++            do {
++                p++;
++            } while (p < end && *p >= '0' && *p <= '9');
++        }
++        count = 1;
++        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++            p++;
++        if (p >= end)
++            return 0;
++        if (*p == ']') {
++            p++;
++            break;
++        }
++        if (*p++ != ',')
++            return 0;
++    }
++    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
++        p++;
++    return count && p == end;
 +}
 +
  /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
  static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
  {
-@@ -24403,8 +24571,12 @@
+@@ -24403,8 +24623,12 @@
          goto def_token;
      case '\"':
          p++;
@@ -328,7 +381,7 @@ Needs a bytecode version bump
          break;
      case '\r':  /* accept DOS and MAC newline sequences */
          if (p[1] == '\n') {
-@@ -24445,6 +24617,8 @@
+@@ -24445,6 +24669,8 @@
      case 'Y': case 'Z':
      case '_':
      case '$':
@@ -337,10 +390,12 @@ Needs a bytecode version bump
          /* identifier : only pure ascii characters are accepted */
          p++;
          atom = json_parse_ident(s, &p, c);
-@@ -24504,6 +24678,16 @@
+@@ -24502,6 +24728,16 @@
+  fail:
+     s->token.val = TOK_ERROR;
      return -1;
- }
- 
++}
++
 +static int json_next_key_token(JSParseState *s)
 +{
 +    bool saved = s->json_key_mode;
@@ -349,21 +404,19 @@ Needs a bytecode version bump
 +    ret = json_next_token(s);
 +    s->json_key_mode = saved;
 +    return ret;
-+}
-+
+ }
+
  #ifndef QJS_DISABLE_PARSER
- 
- /* only used for ':' and '=>', 'let' or 'function' look-ahead. *pp is
-@@ -51746,7 +51930,7 @@
+@@ -51746,7 +51982,7 @@
              JSONParseRecord *pr1;
              int pr_size;
- 
+
 -            if (json_next_token(s))
 +            if (json_next_key_token(s))
                  goto fail;
              val = JS_NewObject(ctx);
              if (JS_IsException(val))
-@@ -51757,8 +51941,12 @@
+@@ -51757,8 +51993,12 @@
              }
              if (s->token.val != '}') {
                  for(;;) {
@@ -377,7 +430,7 @@ Needs a bytecode version bump
                          if (prop_name == JS_ATOM_NULL)
                              goto fail;
                      } else {
-@@ -51798,7 +51986,7 @@
+@@ -51798,7 +52038,7 @@
                          json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                          goto fail;
                      }
@@ -386,10 +439,10 @@ Needs a bytecode version bump
                          goto fail;
                  }
              }
-@@ -51813,6 +52001,16 @@
+@@ -51813,6 +52053,16 @@
              JSONParseRecord *pr1;
              int pr_size;
- 
+
 +            if (!pr) {
 +                ret = json_parse_numeric_array(s, &val);
 +                if (ret == 0) {
@@ -403,7 +456,7 @@ Needs a bytecode version bump
              if (json_next_token(s))
                  goto fail;
              if (!pr) {
-@@ -51851,8 +52049,7 @@
+@@ -51851,8 +52101,7 @@
                          goto fail;
                      }
                  }
@@ -413,12 +466,10 @@ Needs a bytecode version bump
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52085,7 +52282,1052 @@
-     js_free_prop_enum(ctx, atoms, len);
-     JS_FreeValue(ctx, context);
+@@ -52087,7 +52336,1052 @@
      JS_FreeValue(ctx, val);
-+    return JS_EXCEPTION;
-+}
+     return JS_EXCEPTION;
+ }
 +
 +
 +/* ---- Lazy JSON.parse ----
@@ -450,7 +501,7 @@ Needs a bytecode version bump
 +    uint8_t type;
 +    uint8_t feedback_slot;
 +} JSONLazyTapeNode;
-+
+
 +typedef struct JSONLazyLayoutEntry {
 +    JSAtom atom;
 +    uint32_t slot;
@@ -1217,7 +1268,7 @@ Needs a bytecode version bump
 +    for (i = 0; i < shape->prop_size; i++)
 +        JS_FreeValue(ctx, props[i].u.value);
 +    js_free(ctx, props);
-     return JS_EXCEPTION;
++    return JS_EXCEPTION;
 +}
 +
 +static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
@@ -1463,16 +1514,19 @@ Needs a bytecode version bump
 +    /* The document is retained by the root's private property. */
 +    JS_FreeValue(ctx, document);
 +    return v;
- }
- 
++}
++
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
-@@ -52098,6 +53340,18 @@
+                              int argc, JSValueConst *argv)
+ {
+@@ -52098,6 +53392,19 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
 +    if (!(argc > 1 && JS_IsFunction(ctx, argv[1]))) {
 +        JSValue laz = JS_UNDEFINED;
-+        if (js_lazy_json_should_enable(ctx, len)) {
++        if (js_lazy_json_should_enable(ctx, len) &&
++            !json_is_integer_array(str, len)) {
 +            laz = json_lazy_parse(ctx, str, len);
 +            if (JS_IsException(laz))
 +                goto fail;
@@ -1498,12 +1552,12 @@ Needs a bytecode version bump
 @@ -396,7 +397,9 @@
  #define JS_VALUE_IS_BOTH_INT(v1, v2) ((JS_VALUE_GET_TAG(v1) | JS_VALUE_GET_TAG(v2)) == 0)
  #define JS_VALUE_IS_BOTH_FLOAT(v1, v2) (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v1)) && JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v2)))
- 
+
 -#define JS_VALUE_HAS_REF_COUNT(v) ((unsigned)JS_VALUE_GET_TAG(v) >= (unsigned)JS_TAG_FIRST)
 +#define JS_VALUE_HAS_REF_COUNT(v) \
 +    (JS_VALUE_GET_TAG(v) != JS_TAG_LAZY_JSON && \
 +     (unsigned)JS_VALUE_GET_TAG(v) >= (unsigned)JS_TAG_FIRST)
- 
+
  /* special values */
  #define JS_NULL      JS_MKVAL(JS_TAG_NULL, 0)
 @@ -509,6 +512,8 @@
