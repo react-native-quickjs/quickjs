@@ -23,6 +23,7 @@ what we changed and why without opening a single `.patch` file.
 | `0010` | Faster json tokenizer for structural punctuation: `[ ] { } : ,` return directly without per-token state bookkeeping | Punctuation is 50-80% of JSON tokens, and each previously paid the full tokenizer update for a byte the parse loop just compares against | - | No |
 | `0011` | Lazy JSON.parse with shared source, structural tape, direct markers, repeated-layout construction, and access feedback | Large payloads are often only partly inspected; eager parsing pays for values that are never read, while the lazy document keeps source and tape ownership safe for retained descendants | - | No |
 | `0012` | Caches shapes for eligible static object literals and serializes their reusable metadata with bytecode | Repeated object-literal sites otherwise rebuild the same property shape through one transition per property | - | Yes |
+| `0013` | Accelerates forward string `indexOf` and `includes` searches with `memchr` and same-width `memcmp` | Forward searches repeatedly scan for candidate bytes and compare matching-width strings; libc can perform both operations efficiently | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning][semver].
   embedders can opt out per runtime with `JS_SetJSONLazyEnabled()`.
 - Patch `0012`: caches shapes for eligible repeated static object literals.
   Representative object-literal workloads are approximately 12–52% faster.
+- Patch `0013`: accelerates forward `String.prototype.indexOf` and `includes`
+  searches with `memchr` and same-width `memcmp`; representative mixed
+  short/long searches are approximately 8–9% faster.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is

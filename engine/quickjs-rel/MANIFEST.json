@@ -51,12 +51,16 @@
       "sha256": "2537a703361646275ab8426bbc77291222dee112e8e921a76e6c30e28ed4374e"
     },
     {
+      "name": "0013-string-memchr-search.patch",
+      "sha256": "e23816f01dc98dea510a7d85f20ac803f5708c19276216f33d97e3775c0deb3d"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "2b0c310d83004029d7c7be6245c56f96a2683ff0ae15209fa157c4a0e40c2b0a"
     }
   ],
   "files": {
-    "quickjs.c": "19cfaab5c12204fb571e43c34471906e46abee37531d20db413153ffa7cde883",
+    "quickjs.c": "80c7206b66d3bbd2529f5e4141c96c3764803d10d2ab39c6517c4509086bdb65",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
