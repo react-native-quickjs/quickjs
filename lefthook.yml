@@ -16,6 +16,7 @@ pre-commit:
         # noise and make the parity diff against Node worthless.
         - "modules/napi/include/**"
         - "modules/napi/cpp/**"
+        - "third-party/fast_float/**"
         - "android/src/main/jni/JJSRuntimeFactory.h"
       run: clang-format --dry-run --Werror {staged_files}
 

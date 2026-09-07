@@ -45,6 +45,9 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+
+extern int qjs_fast_strtod(const char *first, const char *last,
+                           double *out);
 #include "libregexp.h"
 #include "dtoa.h"
 
@@ -24386,7 +24389,10 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             s->token.u.num.val = js_float64(neg ? -d : d);
         }
     } else {
-        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+        double d;
+        if (!qjs_fast_strtod((const char *)p_start, (const char *)p, &d))
+            d = strtod((const char *)p_start, NULL);
+        s->token.u.num.val = js_float64(d);
     }
     *pp = p;
     return 0;

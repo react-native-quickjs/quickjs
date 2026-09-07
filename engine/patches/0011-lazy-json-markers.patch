@@ -14,10 +14,19 @@ Technical overview
 Needs a bytecode version bump
   No.
 
-diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -6875,6 +6875,28 @@
+@@ -45,6 +45,9 @@
+ #include "cutils.h"
+ #include "list.h"
+ #include "quickjs.h"
++
++extern int qjs_fast_strtod(const char *first, const char *last,
++                           double *out);
+ #include "libregexp.h"
+ #include "dtoa.h"
+
+@@ -6875,6 +6878,28 @@
      for (i = 0; i < count; i++)
          JS_FreeValue(ctx, values[i]);
      return JS_EXCEPTION;
@@ -46,17 +55,17 @@ diff --git a/quickjs.c b/quickjs.c
  }
 
  JSValue JS_NewObject(JSContext *ctx)
-@@ -9601,6 +9623,9 @@
-     pr->u.value = val;
+@@ -9602,6 +9627,9 @@
      return 0;
  }
-+
+
 +static int js_lazy_marker_is(JSValueConst v);
 +static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
-
++
  static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                        JSAtom prop, JSValueConst this_obj,
-@@ -9687,6 +9712,8 @@
+                                       bool throw_ref_error)
+@@ -9687,6 +9715,8 @@
                      continue;
                  }
              } else {
@@ -65,7 +74,7 @@ diff --git a/quickjs.c b/quickjs.c
                  return js_dup(pr->u.value);
              }
          }
-@@ -10246,7 +10273,13 @@
+@@ -10246,7 +10276,13 @@
                      goto retry;
                  }
              } else {
@@ -80,17 +89,17 @@ diff --git a/quickjs.c b/quickjs.c
              }
          } else {
              if (pflags) {
-@@ -10452,6 +10485,9 @@
+@@ -10451,6 +10487,9 @@
+ {
      return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
  }
-
++
 +static int js_lazy_marker_is(JSValueConst v);
 +static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
-+
+
  static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
                                        uint32_t idx, JSValue *pval)
- {
-@@ -10459,7 +10495,10 @@
+@@ -10459,7 +10498,10 @@
      case JS_CLASS_ARRAY:
      case JS_CLASS_ARGUMENTS:
          if (unlikely(idx >= p->u.array.count)) return false;
@@ -102,7 +111,7 @@ diff --git a/quickjs.c b/quickjs.c
          return true;
      case JS_CLASS_MAPPED_ARGUMENTS:
          if (unlikely(idx >= p->u.array.count)) return false;
-@@ -20156,7 +20195,11 @@
+@@ -20156,7 +20198,11 @@
                              /* found */
                              if (unlikely(prs->flags & JS_PROP_TMASK))
                                  goto get_field_slow_path;
@@ -115,7 +124,7 @@ diff --git a/quickjs.c b/quickjs.c
                              break;
                          }
                          if (unlikely(p->is_exotic)) {
-@@ -20460,7 +20503,10 @@
+@@ -20460,7 +20506,10 @@
                      uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                      if (likely(p->class_id == JS_CLASS_ARRAY &&
                                 idx < p->u.array.count)) {
@@ -127,7 +136,7 @@ diff --git a/quickjs.c b/quickjs.c
                          JS_FreeValue(ctx, sp[-2]);
                          sp[-2] = val;
                          sp--;
-@@ -20494,7 +20540,10 @@
+@@ -20494,7 +20543,10 @@
                      uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                      if (likely(p->class_id == JS_CLASS_ARRAY &&
                                 idx < p->u.array.count)) {
@@ -139,7 +148,7 @@ diff --git a/quickjs.c b/quickjs.c
                          BREAK;
                      }
                      if (js_get_fast_array_element(ctx, p, idx, &val)) {
-@@ -22994,6 +23043,7 @@
+@@ -22994,6 +23046,7 @@
      const uint8_t *line_start; /* first character of the current line */
      const uint8_t *eol;  // most recently seen end-of-line character
      const uint8_t *mark; // first token character, invariant: eol < mark
@@ -147,12 +156,10 @@ diff --git a/quickjs.c b/quickjs.c
 
      /* current function code */
      JSFunctionDef *cur_func;
-@@ -24248,6 +24298,30 @@
-  fail:
-     string_buffer_free(b);
+@@ -24250,6 +24303,30 @@
      return -1;
-+}
-+
+ }
+
 +/* Parse an ordinary JSON object key without first allocating a JSString. */
 +static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
 +{
@@ -175,10 +182,20 @@ diff --git a/quickjs.c b/quickjs.c
 +        return 0;
 +    }
 +    return json_parse_string(s, pp);
- }
-
++}
++
  static int json_parse_number(JSParseState *s, const uint8_t **pp)
-@@ -24316,6 +24390,89 @@
+ {
+     const uint8_t *p = *pp;
+@@ -24312,10 +24389,96 @@
+             s->token.u.num.val = js_float64(neg ? -d : d);
+         }
+     } else {
+-        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
++        double d;
++        if (!qjs_fast_strtod((const char *)p_start, (const char *)p, &d))
++            d = strtod((const char *)p_start, NULL);
++        s->token.u.num.val = js_float64(d);
      }
      *pp = p;
      return 0;
@@ -268,7 +285,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
 
  /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
-@@ -24403,8 +24560,12 @@
+@@ -24403,8 +24566,12 @@
          goto def_token;
      case '\"':
          p++;
@@ -282,12 +299,10 @@ diff --git a/quickjs.c b/quickjs.c
          break;
      case '\r':  /* accept DOS and MAC newline sequences */
          if (p[1] == '\n') {
-@@ -24502,6 +24663,16 @@
-  fail:
-     s->token.val = TOK_ERROR;
+@@ -24504,6 +24671,16 @@
      return -1;
-+}
-+
+ }
+
 +static int json_next_key_token(JSParseState *s)
 +{
 +    bool saved = s->json_key_mode;
@@ -296,10 +311,12 @@ diff --git a/quickjs.c b/quickjs.c
 +    ret = json_next_token(s);
 +    s->json_key_mode = saved;
 +    return ret;
- }
-
++}
++
  #ifndef QJS_DISABLE_PARSER
-@@ -51746,7 +51917,7 @@
+
+ /* only used for ':' and '=>', 'let' or 'function' look-ahead. *pp is
+@@ -51746,7 +51923,7 @@
              JSONParseRecord *pr1;
              int pr_size;
 
@@ -308,7 +325,7 @@ diff --git a/quickjs.c b/quickjs.c
                  goto fail;
              val = JS_NewObject(ctx);
              if (JS_IsException(val))
-@@ -51757,8 +51928,12 @@
+@@ -51757,8 +51934,12 @@
              }
              if (s->token.val != '}') {
                  for(;;) {
@@ -322,7 +339,7 @@ diff --git a/quickjs.c b/quickjs.c
                          if (prop_name == JS_ATOM_NULL)
                              goto fail;
                      } else {
-@@ -51798,7 +51973,7 @@
+@@ -51798,7 +51979,7 @@
                          json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                          goto fail;
                      }
@@ -331,7 +348,7 @@ diff --git a/quickjs.c b/quickjs.c
                          goto fail;
                  }
              }
-@@ -51813,6 +51988,16 @@
+@@ -51813,6 +51994,16 @@
              JSONParseRecord *pr1;
              int pr_size;
 
@@ -348,7 +365,7 @@ diff --git a/quickjs.c b/quickjs.c
              if (json_next_token(s))
                  goto fail;
              if (!pr) {
-@@ -51851,8 +52036,7 @@
+@@ -51851,8 +52042,7 @@
                          goto fail;
                      }
                  }
@@ -358,7 +375,7 @@ diff --git a/quickjs.c b/quickjs.c
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52085,9 +52269,1055 @@
+@@ -52085,9 +52275,1055 @@
      js_free_prop_enum(ctx, atoms, len);
      JS_FreeValue(ctx, context);
      JS_FreeValue(ctx, val);
@@ -1414,7 +1431,7 @@ diff --git a/quickjs.c b/quickjs.c
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -52098,6 +53328,18 @@
+@@ -52098,6 +53334,18 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
