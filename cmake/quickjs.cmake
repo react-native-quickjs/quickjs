@@ -57,6 +57,15 @@ add_library(quickjs STATIC
 target_include_directories(quickjs PUBLIC "${QUICKJS_DIR}")
 target_compile_definitions(quickjs PRIVATE _GNU_SOURCE)
 
+# Lazy JSON is opt-in for applications. Android and CocoaPods derive this
+# option from the consuming app's package.json; host builds can override it
+# with -DRNQJS_JSON_LAZY_DEFAULT=ON or QJS_JSON_LAZY at runtime for tests.
+option(RNQJS_JSON_LAZY_DEFAULT
+       "Enable lazy JSON parsing by default for this build" OFF)
+if(RNQJS_JSON_LAZY_DEFAULT)
+  target_compile_definitions(quickjs PRIVATE QJS_JSON_LAZY_DEFAULT=1)
+endif()
+
 # The maths functions are in libSystem on Apple and in a separate libm
 # elsewhere, so a macOS host build links clean while Linux fails at the link
 # step on round, floor, pow and friends. Detected rather than assumed, the way

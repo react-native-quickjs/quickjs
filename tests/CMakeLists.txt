@@ -33,6 +33,11 @@ add_executable(quickjs_lazy_json_oom_tests lazy_json_oom_test.cpp)
 target_link_libraries(quickjs_lazy_json_oom_tests PRIVATE quickjs)
 add_test(NAME quickjs_lazy_json_oom_tests COMMAND quickjs_lazy_json_oom_tests)
 
+# Production defaults are intentionally off; these tests explicitly exercise
+# the opt-in lazy implementation.
+set_tests_properties(quickjs_jsi_tests quickjs_lazy_json_oom_tests
+  PROPERTIES ENVIRONMENT "QJS_JSON_LAZY=1")
+
 # Hermes' own JSI conformance suite, parameterised over a RuntimeFactory, so
 # supplying ours is the whole integration. testlib.h is included as
 # <jsi/test/testlib.h>: only third_party/ goes on the include path, so

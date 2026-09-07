@@ -30,6 +30,11 @@
 #include <inttypes.h>
 #include <string.h>
 #include <assert.h>
+
+#ifndef QJS_JSON_LAZY_DEFAULT
+#define QJS_JSON_LAZY_DEFAULT 0
+#endif
+
 #if !defined(_MSC_VER)
 #include <sys/time.h>
 #if defined(_WIN32)
@@ -2375,7 +2380,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     ms.malloc_count++;
     ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
     rt->malloc_state = ms;
-    rt->json_lazy_enabled = 1;
+    rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
     js_arena_init(rt);
     rt->malloc_gc_threshold = 256 * 1024;
 

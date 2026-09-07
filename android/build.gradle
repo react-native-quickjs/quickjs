@@ -54,7 +54,8 @@ android {
         // off by default, r28 turns it on, and no host build can see it.
         arguments "-DANDROID_STL=c++_shared",
                   "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
-                  "-DREACT_NATIVE_DIR=${reactNativeDir()}"
+                  "-DREACT_NATIVE_DIR=${reactNativeDir()}",
+                  "-DRNQJS_JSON_LAZY_DEFAULT=${jsonLazyEnabled() ? 'ON' : 'OFF'}"
         if (quickjsModuleDirs().size() > 0) {
           arguments "-DRNQJS_QUICKJS_MODULES=${quickjsModuleDirs().join(';')}"
         }
@@ -139,6 +140,19 @@ def reactNativeDir() {
 def reactNativeArchitectures() {
   def value = rootProject.getProperties().get("reactNativeArchitectures")
   return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+// The app's existing package.json is the single cross-platform opt-in. A
+// Gradle property remains useful for CI and local experiments without adding
+// another project file.
+def jsonLazyEnabled() {
+  if (project.hasProperty('rnqjsJsonLazy')) {
+    return project.property('rnqjsJsonLazy').toString() != 'false'
+  }
+  def manifest = new File(rootProject.projectDir.parentFile, "package.json")
+  if (!manifest.exists()) return false
+  def json = new groovy.json.JsonSlurper().parse(manifest)
+  return json["react-native-quickjs"]?.lazyJson == true
 }
 
 // Autolinked QuickJS modules (@react-native-quickjs/* declaring
