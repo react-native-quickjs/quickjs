@@ -101,6 +101,7 @@ int main(int argc, char **argv) {
   }
 
   JSRuntime *rt = JS_NewRuntime();
+  JS_SetMaxStackSize(rt, 4 * 1024 * 1024);
   JSContext *ctx = JS_NewContext(rt);
   JSValue global = JS_GetGlobalObject(ctx);
   JS_SetPropertyStr(
