@@ -1,17 +1,53 @@
 Subject: lazy JSON.parse and JSON construction fast paths
 
 Technical overview
-  Adds lazy JSON.parse for documents at least 4 KiB, while keeping
-  integer-only numeric arrays on the optimized eager path. Lazy documents use
-  shared source storage, a structural tape, immediate tape-node markers, direct
-  scalar/container materialization, repeated-layout construction and access
-  feedback. Eager JSON parsing uses direct key-to-atom scanning and owned
-  dense-array transfer for numeric arrays.
+  Extends JSON.parse with a lazy representation for documents at least 4 KiB.
+  The parser validates the input once and records source ranges, value types,
+  and container relationships in a document-local structural tape. Containers
+  retain one private, non-enumerable reference to that document, while their
+  ordinary properties/elements contain immediate internal markers until a
+  value is read.
 
-  Lazy parsing can be disabled per runtime with JS_SetJSONLazyEnabled() or
-  overridden for testing with QJS_JSON_LAZY=0/1. Lazy containers retain the
-  document through a private non-enumerable property; unsupported values use
-  the existing fallback parser.
+  Representation:
+
+      JSON.parse(input)
+          |                         reviver or small input
+          |                                  |
+          v                                  v
+      JSONLazyDocument                  eager parser
+      +------------------+
+      | source bytes     |
+      | tape nodes       |       lazy container
+      | layout metadata  |<------+ private document ref
+      +------------------+       +----------------------+
+             ^                   | LAZY(node index)    |
+             |                   | ordinary JS slots   |
+             +-------------------+----------------------+
+                    first property read
+                             |
+                             v
+                 decode source range from tape
+                 replace marker with JSValue
+
+  Immediate markers store only a tape-node index and require no allocation or
+  reference counting. Scalar values are decoded directly from the shared
+  source. Nested objects and arrays are created with lazy child markers. A
+  repeated object layout may reuse its anchored hashed shape and known slots;
+  layout feedback can materialize frequently accessed fields without making
+  cold fields eager. Assignment, deletion, descriptors, enumeration, and
+  stringify replace or inspect ordinary slots through the normal object model.
+
+  Valid integer-only arrays remain on the optimized eager numeric-array path,
+  avoiding lazy tape overhead for a representation that has no useful sparse
+  access. Reviver inputs and unsupported or malformed values use the existing
+  eager parser and error behavior. Lazy parsing can be disabled per runtime
+  with JS_SetJSONLazyEnabled() or overridden for testing with QJS_JSON_LAZY=0/1.
+
+  Source and tape lifetime is tied to the document reference held by every
+  lazy container, so a child that outlives the root remains safe to materialize.
+  The document class exposes its retained layout/template edges to the cycle
+  collector and releases all source, tape, layout, and shape ownership during
+  finalization.
 
 Needs a bytecode version bump
   No.
