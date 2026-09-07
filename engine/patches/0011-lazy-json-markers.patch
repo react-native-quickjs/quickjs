@@ -1508,3 +1508,30 @@ Needs a bytecode version bump
  /* use 0 to disable memory limit */
  JS_EXTERN void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
  JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -276,6 +276,16 @@
+     quickjs.c
+ )
+ 
++# The JSON number fast path is declared in quickjs.c and implemented by the
++# vendored C++ converter in the parent project.
++set(QJS_FAST_FLOAT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third-party/fast_float")
++set(QJS_FAST_FLOAT_SOURCE "${QJS_FAST_FLOAT_DIR}/qjs_fast_double.cpp")
++if(NOT EXISTS "${QJS_FAST_FLOAT_SOURCE}")
++    message(FATAL_ERROR "missing vendored fast_float source: ${QJS_FAST_FLOAT_SOURCE}")
++endif()
++enable_language(CXX)
++list(APPEND qjs_sources "${QJS_FAST_FLOAT_SOURCE}")
++
+ if(QJS_BUILD_LIBC)
+     list(APPEND qjs_sources quickjs-libc.c)
+     # The definition must be added to the entire project.
+@@ -307,6 +317,7 @@
+     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+ )
++target_include_directories(qjs PRIVATE "${QJS_FAST_FLOAT_DIR}")
+ target_link_libraries(qjs PUBLIC ${qjs_libs})
+ 
+ # Pass a compiler definition so that Windows gets its declspec's right.
