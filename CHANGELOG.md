@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning][semver].
   opt in from the existing `package.json` with
   `react-native-quickjs.lazyJson: true`. Reviver calls remain eager, and
   embedders can opt out per runtime with `JS_SetJSONLazyEnabled()`.
+- Patch `0012`: caches shapes for eligible repeated static object literals.
+  Representative object-literal workloads are approximately 12–52% faster.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is
