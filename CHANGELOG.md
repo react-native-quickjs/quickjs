@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning][semver].
   directly (new engine patch `0009`).
 - Lazy `JSON.parse` is enabled by default for documents at least 4 KiB. It uses
   a shared source document, structural tape, direct tape-node markers and
-  repeated-layout materialization. Reviver calls remain eager, and embedders
-  can opt out per runtime with `JS_SetJSONLazyEnabled()`.
+  repeated-layout materialization. Large integer-only arrays remain on the
+  optimized eager numeric-array path. Reviver calls remain eager, and
+  embedders can opt out per runtime with `JS_SetJSONLazyEnabled()`.
 - JSON benchmark reporting now separates checksum-free parse-only timing from
   traversal and parse-plus-consume timing. The current lazy path reduces the
   repeated-object parse-only workload from about 199 µs eager to about 44 µs.
