@@ -6877,6 +6877,23 @@ exception:
     return JS_EXCEPTION;
 }
 
+/* Take ownership of an already allocated dense value buffer. */
+static JSValue js_new_array_from_owned(JSContext *ctx, int count, JSValue *values)
+{
+    JSValue obj = JS_NewArray(ctx);
+    JSObject *p;
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (count > 0) {
+        p->u.array.u.values = values;
+        p->u.array.u1.size = count;
+        p->u.array.count = count;
+        p->prop[0].u.value = js_int32(count);
+    }
+    return obj;
+}
+
 JSValue JS_NewObject(JSContext *ctx)
 {
     /* inline JS_NewObjectClass(ctx, JS_CLASS_OBJECT); */
@@ -23021,6 +23038,7 @@ typedef struct JSParseState {
     const uint8_t *line_start; /* first character of the current line */
     const uint8_t *eol;  // most recently seen end-of-line character
     const uint8_t *mark; // first token character, invariant: eol < mark
+    bool json_key_mode;
 
     /* current function code */
     JSFunctionDef *cur_func;
@@ -24277,6 +24295,30 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     return -1;
 }
 
+/* Parse an ordinary JSON object key without first allocating a JSString. */
+static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
+{
+    const uint8_t *start = *pp;
+    const uint8_t *p = start;
+
+    while (p < s->buf_end && *p != '"' && *p != '\\' &&
+           *p >= 0x20 && *p < 0x80)
+        p++;
+    if (p < s->buf_end && *p == '"') {
+        JSAtom atom = JS_NewAtomLen(s->ctx, (const char *)start,
+                                    p - start);
+        if (atom == JS_ATOM_NULL)
+            return -1;
+        s->token.val = TOK_IDENT;
+        s->token.u.ident.atom = atom;
+        s->token.u.ident.has_escape = false;
+        s->token.u.ident.is_reserved = false;
+        *pp = p + 1;
+        return 0;
+    }
+    return json_parse_string(s, pp);
+}
+
 static int json_parse_number(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
@@ -24406,10 +24448,13 @@ static int json_parse_numeric_array(JSParseState *s, JSValue *pval)
             goto fallback;
     }
     if (ret == 0) {
-        JSValue array = JS_NewArrayFrom(ctx, n, elems);
-        js_free(ctx, elems);
-        if (JS_IsException(array))
+        JSValue array = js_new_array_from_owned(ctx, n, elems);
+        if (JS_IsException(array)) {
+            while (n > 0)
+                JS_FreeValue(ctx, elems[--n]);
+            js_free(ctx, elems);
             return -1;
+        }
         s->buf_ptr = p;
         s->token.val = ']';
         *pval = array;
@@ -24514,8 +24559,12 @@ static __exception int json_next_token(JSParseState *s)
         goto def_token;
     case '\"':
         p++;
-        if (json_parse_string(s, &p))
+        if (s->json_key_mode) {
+            if (json_parse_key_string(s, &p))
+                goto fail;
+        } else if (json_parse_string(s, &p)) {
             goto fail;
+        }
         break;
     case '\r':  /* accept DOS and MAC newline sequences */
         if (p[1] == '\n') {
@@ -24613,6 +24662,16 @@ static __exception int json_next_token(JSParseState *s)
  fail:
     s->token.val = TOK_ERROR;
     return -1;
+}
+
+static int json_next_key_token(JSParseState *s)
+{
+    bool saved = s->json_key_mode;
+    int ret;
+    s->json_key_mode = true;
+    ret = json_next_token(s);
+    s->json_key_mode = saved;
+    return ret;
 }
 
 #ifndef QJS_DISABLE_PARSER
@@ -51857,7 +51916,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
             JSONParseRecord *pr1;
             int pr_size;
 
-            if (json_next_token(s))
+            if (json_next_key_token(s))
                 goto fail;
             val = JS_NewObject(ctx);
             if (JS_IsException(val))
@@ -51868,8 +51927,12 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
             }
             if (s->token.val != '}') {
                 for(;;) {
-                    if (s->token.val == TOK_STRING) {
+                    if (s->token.val == TOK_STRING || s->token.val == TOK_IDENT) {
+                        if (s->token.val == TOK_IDENT) {
+                            prop_name = JS_DupAtom(ctx, s->token.u.ident.atom);
+                        } else {
                         prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
+                        }
                         if (prop_name == JS_ATOM_NULL)
                             goto fail;
                     } else {
@@ -51909,7 +51972,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                         json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                         goto fail;
                     }
-                    if (json_next_token(s))
+                    if (json_next_key_token(s))
                         goto fail;
                 }
             }
