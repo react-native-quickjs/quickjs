@@ -77,6 +77,7 @@ DEF(      push_this, 1, 0, 1, none) /* only used at the start of a function */
 DEF(     push_false, 1, 0, 1, none)
 DEF(      push_true, 1, 0, 1, none)
 DEF(         object, 1, 0, 1, none)
+DEF( object_template, 3, 0, 1, u16)
 DEF( special_object, 2, 0, 1, u8) /* only used at the start of a function */
 DEF(           rest, 3, 0, 1, u16) /* only used at the start of a function */
 

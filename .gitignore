@@ -53,3 +53,6 @@ example/android/.cxx/
 docs/.vitepress/dist/
 docs/.vitepress/cache/
 .cache/
+
+# misc
+.local

@@ -1,12 +1,12 @@
 /*
- * Object-literal semantics, aimed at the shape-template fast path (patch 0002)
- * and at its bytecode round-trip (patch 0015).
+ * Object-literal semantics, aimed at the shape-template fast path (patch 0012)
+ * and at its bytecode round-trip.
  *
  * The template path pre-builds a shape and allocates from it, so anything that
  * makes property order, descriptor flags, or key identity differ from the
  * generic path shows up here. Run it twice -- once from source and once via
- * `--via-bytecode` -- because the template table only survives serialization
- * since 0015, and a table that came back wrong would silently produce objects
+ * `--via-bytecode` -- because the template table survives serialization, and
+ * a table that came back wrong would silently produce objects
  * with the right keys in the wrong order.
  *
  * Deterministic, ES5-printable, no host objects.
