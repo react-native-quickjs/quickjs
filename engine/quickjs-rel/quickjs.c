@@ -10494,9 +10494,6 @@ JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val)
     return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
 }
 
-static int js_lazy_marker_is(JSValueConst v);
-static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
-
 static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
                                       uint32_t idx, JSValue *pval)
 {
@@ -52343,8 +52340,6 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
    QJS_JSON_LAZY=0/1 overrides the per-runtime default for testing. */
 
 #define QJS_JSON_LAZY_DOC_MIN_LEN 4096U
-#define QJS_JSON_LAZY_CONTAINER_MIN_LEN 1024U
-#define QJS_JSON_LAZY_CONTAINER_MIN_CHILDREN 8
 
 typedef enum JSONLazyType {
     JSON_LAZY_STRING,
@@ -52376,25 +52371,24 @@ typedef struct JSONLazyLayoutEntry {
 typedef struct JSONLazyLayout {
     JSValue template;
     JSONLazyLayoutEntry *entries;
-    uint32_t backing_slot;
+    uint32_t document_slot;
     uint32_t count;
     uint32_t instance_count;
-    uint32_t completed_instances;
     uint32_t slot_access_count[8];
     uint8_t hot_slot_mask;
     int valid;
 } JSONLazyLayout;
 
-typedef struct JSONLazyBacking {
+typedef struct JSONLazyDocument {
     uint32_t source_len;
     JSONLazyTapeNode *nodes;
     uint32_t node_count;
     uint32_t node_capacity;
     JSONLazyLayout layout;
     char source[];
-} JSONLazyBacking;
+} JSONLazyDocument;
 
-static JSClassID js_lazy_backing_class_id;
+static JSClassID js_lazy_document_class_id;
 static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout);
 
 static int js_lazy_marker_is(JSValueConst v)
@@ -52428,27 +52422,27 @@ static void json_lazy_layout_feedback(JSONLazyLayout *layout, uint32_t slot)
     }
 }
 
-static const JSAtom js_lazy_backing_atom = JS_ATOM_Private_brand;
+static const JSAtom js_lazy_document_atom = JS_ATOM_Private_brand;
 
-static JSValue js_lazy_get_backing(JSContext *ctx, JSObject *holder)
+static JSValue js_lazy_get_document(JSContext *ctx, JSObject *holder)
 {
     JSProperty *pr;
     JSShapeProperty *prs;
-    prs = find_own_property(&pr, holder, js_lazy_backing_atom);
+    prs = find_own_property(&pr, holder, js_lazy_document_atom);
     if (!prs || !pr || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
-        return JS_ThrowInternalError(ctx, "lazy JSON backing missing");
+        return JS_ThrowInternalError(ctx, "lazy JSON document missing");
     return js_dup(pr->u.value);
 }
 
-static int js_lazy_set_backing(JSContext *ctx, JSValueConst holder,
+static int js_lazy_set_document(JSContext *ctx, JSValueConst holder,
                                JSValueConst backing)
 {
-    return JS_DefinePropertyValue(ctx, holder, js_lazy_backing_atom,
+    return JS_DefinePropertyValue(ctx, holder, js_lazy_document_atom,
                                   js_dup(backing), JS_PROP_C_W_E);
 }
 
 static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
-                                                JSONLazyBacking *doc,
+                                                JSONLazyDocument *doc,
                                                 uint32_t node_index,
                                                 JSValueConst document,
                                                 JSONLazyLayout *layout_hint);
@@ -52457,20 +52451,20 @@ static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
 
 static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder)
 {
-    JSONLazyBacking *b;
+    JSONLazyDocument *b;
     JSValue backing;
     JSValue val;
     uint32_t child_node;
     uint8_t feedback_slot;
     if (!js_lazy_marker_is(*slot))
         return js_dup(*slot);
-    backing = js_lazy_get_backing(ctx, holder);
+    backing = js_lazy_get_document(ctx, holder);
     if (JS_IsException(backing))
         return JS_EXCEPTION;
-    b = JS_GetOpaque2(ctx, backing, js_lazy_backing_class_id);
+    b = JS_GetOpaque2(ctx, backing, js_lazy_document_class_id);
     if (!b || !b->nodes) {
         JS_FreeValue(ctx, backing);
-        return JS_ThrowInternalError(ctx, "lazy JSON backing is not a tape document");
+        return JS_ThrowInternalError(ctx, "lazy JSON document is not a tape document");
     }
     child_node = js_lazy_marker_index(*slot);
     if (child_node >= b->node_count)
@@ -52497,9 +52491,9 @@ fail:
     return JS_EXCEPTION;
 }
 
-static void js_lazy_backing_finalizer(JSRuntime *rt, JSValueConst val)
+static void js_lazy_document_finalizer(JSRuntime *rt, JSValueConst val)
 {
-    JSONLazyBacking *b = JS_GetOpaque(val, js_lazy_backing_class_id);
+    JSONLazyDocument *b = JS_GetOpaque(val, js_lazy_document_class_id);
     if (!b)
         return;
     js_free_rt(rt, b->nodes);
@@ -52507,10 +52501,10 @@ static void js_lazy_backing_finalizer(JSRuntime *rt, JSValueConst val)
     js_free_rt(rt, b);
 }
 
-static void js_lazy_backing_mark(JSRuntime *rt, JSValueConst val,
+static void js_lazy_document_mark(JSRuntime *rt, JSValueConst val,
                                  JS_MarkFunc *mark_func)
 {
-    JSONLazyBacking *b = JS_GetOpaque(val, js_lazy_backing_class_id);
+    JSONLazyDocument *b = JS_GetOpaque(val, js_lazy_document_class_id);
     if (b && b->layout.valid)
         JS_MarkValue(rt, b->layout.template, mark_func);
 }
@@ -52525,32 +52519,31 @@ static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
         return 0;
     if (len < QJS_JSON_LAZY_DOC_MIN_LEN)
         return 0;
-    if (!js_lazy_backing_class_id) {
+    if (!js_lazy_document_class_id) {
         JSClassID cid = 0;
         JS_NewClassID(ctx->rt, &cid);
         if (cid == 0)
             return 0;
-        js_lazy_backing_class_id = cid;
+        js_lazy_document_class_id = cid;
     }
-    if (!JS_IsRegisteredClass(ctx->rt, js_lazy_backing_class_id)) {
+    if (!JS_IsRegisteredClass(ctx->rt, js_lazy_document_class_id)) {
         JSClassDef cd;
         memset(&cd, 0, sizeof(cd));
         cd.class_name = "JSONLazyDocument";
-        cd.finalizer = js_lazy_backing_finalizer;
-        cd.gc_mark = js_lazy_backing_mark;
-        if (JS_NewClass(ctx->rt, js_lazy_backing_class_id, &cd) < 0)
+        cd.finalizer = js_lazy_document_finalizer;
+        cd.gc_mark = js_lazy_document_mark;
+        if (JS_NewClass(ctx->rt, js_lazy_document_class_id, &cd) < 0)
             return 0;
     }
     return 1;
 }
 
-static int json_lazy_skip_ws(const uint8_t **pp, const uint8_t *end)
+static void json_lazy_skip_ws(const uint8_t **pp, const uint8_t *end)
 {
     const uint8_t *p = *pp;
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
         p++;
     *pp = p;
-    return 0;
 }
 
 static int json_lazy_skip_string(const uint8_t **pp, const uint8_t *end)
@@ -52710,13 +52703,21 @@ static int json_lazy_skip_scalar(const uint8_t **pp, const uint8_t *end,
 }
 
 
-static int json_lazy_tape_reserve_nodes(JSContext *ctx, JSONLazyBacking *doc)
+static int json_lazy_tape_reserve_nodes(JSContext *ctx, JSONLazyDocument *doc)
 {
     uint32_t cap;
     JSONLazyTapeNode *nodes;
     if (doc->node_count < doc->node_capacity)
         return 0;
+    if (doc->node_capacity > UINT32_MAX / 2) {
+        JS_ThrowInternalError(ctx, "lazy JSON tape is too large");
+        return -1;
+    }
     cap = doc->node_capacity ? doc->node_capacity * 2 : 64;
+    if ((size_t)cap > SIZE_MAX / sizeof(*nodes)) {
+        JS_ThrowInternalError(ctx, "lazy JSON tape is too large");
+        return -1;
+    }
     nodes = js_realloc(ctx, doc->nodes, sizeof(*nodes) * cap);
     if (!nodes)
         return -1;
@@ -52725,23 +52726,27 @@ static int json_lazy_tape_reserve_nodes(JSContext *ctx, JSONLazyBacking *doc)
     return 0;
 }
 
-static int json_lazy_tape_value(JSContext *ctx, JSONLazyBacking *doc,
+static int json_lazy_tape_value(JSContext *ctx, JSONLazyDocument *doc,
                                 const uint8_t *base, const uint8_t **pp,
                                 const uint8_t *end, uint32_t key_start,
                                 uint32_t key_length, uint32_t *node_out)
 {
     const uint8_t *p = *pp, *q, *kstart, *kend;
     JSONLazyTapeNode *node;
-    uint32_t node_index, child_index, previous_child = UINT32_MAX;
-    int type;
+    uint32_t node_index, previous_child = UINT32_MAX;
+    uint8_t type;
 
+    if (js_check_stack_overflow(ctx->rt, 0)) {
+        JS_ThrowStackOverflow(ctx);
+        return -1;
+    }
     json_lazy_skip_ws(&p, end);
     q = p;
     if (p < end && *p == '{')
         type = JSON_LAZY_OBJECT;
     else if (p < end && *p == '[')
         type = JSON_LAZY_ARRAY;
-    else if (json_lazy_skip_scalar(&q, end, (uint8_t *)&type) < 0)
+    else if (json_lazy_skip_scalar(&q, end, &type) < 0)
         return -1;
     if (json_lazy_tape_reserve_nodes(ctx, doc) < 0)
         return -1;
@@ -52806,20 +52811,19 @@ static int json_lazy_tape_value(JSContext *ctx, JSONLazyBacking *doc,
     doc->nodes[node_index].end = (uint32_t)(q - base);
     *pp = q;
     *node_out = node_index;
-    (void)child_index;
     return 0;
 }
 
-static int json_lazy_build_tape(JSContext *ctx, JSONLazyBacking *doc)
+static int json_lazy_build_tape(JSContext *ctx, JSONLazyDocument *doc)
 {
     const uint8_t *base = (const uint8_t *)doc->source;
     const uint8_t *p = base, *end = base + doc->source_len;
     uint32_t root;
-    uint32_t estimate = doc->source_len / 4;
+    uint32_t estimate = doc->source_len / 16;
     if (estimate < 64)
         estimate = 64;
-    if (estimate > UINT32_MAX / 2)
-        estimate = UINT32_MAX / 2;
+    if (estimate > 1024)
+        estimate = 1024;
     doc->nodes = js_malloc(ctx, sizeof(*doc->nodes) * estimate);
     if (!doc->nodes)
         return -1;
@@ -52829,6 +52833,14 @@ static int json_lazy_build_tape(JSContext *ctx, JSONLazyBacking *doc)
     json_lazy_skip_ws(&p, end);
     if (p != end || root != 0)
         return -1;
+    if (doc->node_count < doc->node_capacity) {
+        JSONLazyTapeNode *nodes = js_realloc(ctx, doc->nodes,
+                                             sizeof(*nodes) * doc->node_count);
+        if (nodes) {
+            doc->nodes = nodes;
+            doc->node_capacity = doc->node_count;
+        }
+    }
     return 0;
 }
 
@@ -52865,7 +52877,7 @@ static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
 }
 
 static JSValue json_lazy_materialize_number(JSContext *ctx,
-                                            JSONLazyBacking *doc,
+                                            JSONLazyDocument *doc,
                                             uint32_t start, uint32_t end)
 {
     const uint8_t *p = (const uint8_t *)doc->source + start;
@@ -52899,10 +52911,11 @@ static JSValue json_lazy_materialize_number(JSContext *ctx,
             return js_int32((int32_t)ival);
         if (neg && ival <= (uint64_t)INT32_MAX + 1)
             return js_int32((int32_t)(0 - (int64_t)ival));
-        return js_float64(neg ? -(double)ival : (double)ival);
+        if (ndigits <= 15)
+            return js_float64(neg ? -(double)ival : (double)ival);
     }
-    /* The tape has already validated the complete range. Reuse QuickJS's
-       exact decimal converter instead of reparsing a temporary substring. */
+    /* The tape has already validated the complete range. Use the exact
+       converter for long integers as well as fractions and exponents. */
     {
         JSATODTempMem tmp_mem;
         double d = js_atod((const char *)p0, NULL, 10, 0, &tmp_mem);
@@ -52911,7 +52924,7 @@ static JSValue json_lazy_materialize_number(JSContext *ctx,
 }
 
 static JSValue json_lazy_materialize_string(JSContext *ctx,
-                                            JSONLazyBacking *doc,
+                                            JSONLazyDocument *doc,
                                             uint32_t start, uint32_t end)
 {
     const uint8_t *p = (const uint8_t *)doc->source + start;
@@ -52951,7 +52964,6 @@ static int json_lazy_layout_key_match(JSContext *ctx,
     JSAtomStruct *str;
     size_t len, i;
     const uint8_t *key = kstart + 1;
-    (void)ctx;
     if (index >= layout->count)
         return 0;
     len = (size_t)(kend - kstart - 2);
@@ -52996,6 +53008,10 @@ static JSValue json_lazy_make_shape_template(JSContext *ctx, JSObject *obj)
     uint32_t i;
 
     shape = js_dup_shape(obj->shape);
+    if ((size_t)shape->prop_size > SIZE_MAX / sizeof(*props)) {
+        js_free_shape(ctx->rt, shape);
+        return JS_ThrowInternalError(ctx, "lazy JSON shape is too large");
+    }
     props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
     if (!props) {
         js_free_shape(ctx->rt, shape);
@@ -53033,10 +53049,10 @@ static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
             return -1;
         entries[i].slot = (uint32_t)(pr - obj->prop);
     }
-    prs = find_own_property(&pr, obj, js_lazy_backing_atom);
+    prs = find_own_property(&pr, obj, js_lazy_document_atom);
     if (!prs || !pr)
         return -1;
-    layout->backing_slot = (uint32_t)(pr - obj->prop);
+    layout->document_slot = (uint32_t)(pr - obj->prop);
     template = json_lazy_make_shape_template(ctx, obj);
     if (JS_IsException(template))
         return -1;
@@ -53050,10 +53066,10 @@ static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
 static JSValue js_lazy_new_document(JSContext *ctx, const char *buf, size_t len)
 {
     JSValue value;
-    JSONLazyBacking *doc;
+    JSONLazyDocument *doc;
     if (len > UINT32_MAX || len > SIZE_MAX - sizeof(*doc) - 1)
         return JS_EXCEPTION;
-    value = JS_NewObjectClass(ctx, js_lazy_backing_class_id);
+    value = JS_NewObjectClass(ctx, js_lazy_document_class_id);
     if (JS_IsException(value))
         return JS_EXCEPTION;
     doc = js_mallocz(ctx, sizeof(*doc) + len + 1);
@@ -53077,7 +53093,7 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
     JSValue obj;
     JSShape *shape = json_lazy_layout_shape(layout);
     uint32_t i;
-    JSONLazyBacking *doc = JS_GetOpaque(document, js_lazy_backing_class_id);
+    JSONLazyDocument *doc = JS_GetOpaque(document, js_lazy_document_class_id);
     JSONLazyTapeNode *node;
     uint8_t hot_mask;
     if (!doc || !shape || node_index >= doc->node_count)
@@ -53085,6 +53101,8 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
     node = &doc->nodes[node_index];
     layout->instance_count++;
     hot_mask = layout->instance_count >= 32 ? layout->hot_slot_mask : 0;
+    if ((size_t)shape->prop_size > SIZE_MAX / sizeof(*props))
+        return JS_ThrowInternalError(ctx, "lazy JSON shape is too large");
     props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
     if (!props)
         return JS_EXCEPTION;
@@ -53110,7 +53128,6 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
                 js_free(ctx, props);
                 return JS_EXCEPTION;
             }
-            layout->completed_instances++;
         } else {
             props[layout->entries[i].slot].u.value =
                 js_lazy_marker_new(child_index);
@@ -53120,7 +53137,7 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
         if (child_index != UINT32_MAX)
             goto fail;
     }
-    props[layout->backing_slot].u.value = js_dup(document);
+    props[layout->document_slot].u.value = js_dup(document);
     obj = JS_NewObjectFromShape(ctx, js_dup_shape(shape),
                                 JS_CLASS_OBJECT, props);
     if (JS_IsException(obj)) {
@@ -53137,7 +53154,7 @@ fail:
     return JS_EXCEPTION;
 }
 
-static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
+static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyDocument *doc,
                                        JSValueConst document,
                                        uint32_t node_index,
                                        JSONLazyLayout *layout_hint)
@@ -53146,16 +53163,17 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
     JSValue obj = JS_UNDEFINED;
     const uint8_t *base;
     uint32_t i, initialized_atoms = 0;
-    int layout_match = layout_hint && layout_hint->valid;
     JSONLazyLayoutEntry *entries = NULL;
 
     if (!doc || node_index >= doc->node_count)
-        return JS_UNDEFINED;
+        return JS_ThrowInternalError(ctx, "lazy JSON tape node is invalid");
     node = &doc->nodes[node_index];
     base = (const uint8_t *)doc->source;
     if (node->type == JSON_LAZY_ARRAY) {
         JSValue *values = NULL;
         if (node->child_count) {
+            if ((size_t)node->child_count > SIZE_MAX / sizeof(*values))
+                return JS_ThrowInternalError(ctx, "lazy JSON array is too large");
             values = js_malloc(ctx, sizeof(*values) * node->child_count);
             if (!values)
                 return JS_EXCEPTION;
@@ -53183,8 +53201,8 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
                 }
             }
         }
-        obj = JS_NewArrayFrom(ctx, node->child_count, values);
-        js_free(ctx, values);
+        obj = js_new_array_from_owned(ctx, node->child_count, values);
+        values = NULL;
         if (JS_IsException(obj))
             return JS_EXCEPTION;
     } else if (node->type == JSON_LAZY_OBJECT) {
@@ -53193,13 +53211,12 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
             uint32_t child_index = node->first_child;
             for (i = 0; i < node->child_count; i++) {
                 JSONLazyTapeNode *child;
-                int key_match;
                 if (child_index == UINT32_MAX ||
                     child_index >= doc->node_count)
                     return JS_EXCEPTION;
                 child = &doc->nodes[child_index];
                 if (match) {
-                    key_match = json_lazy_layout_key_match(
+                    int key_match = json_lazy_layout_key_match(
                         ctx, layout_hint, i, base + child->key_start,
                         base + child->key_start + child->key_length);
                     if (key_match != 1) {
@@ -53216,6 +53233,8 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
             }
         }
         if (node->child_count && layout_hint && !layout_hint->valid) {
+            if ((size_t)node->child_count > SIZE_MAX / sizeof(*entries))
+                return JS_ThrowInternalError(ctx, "lazy JSON object is too large");
             entries = js_mallocz(ctx, sizeof(*entries) * node->child_count);
             if (!entries)
                 return JS_EXCEPTION;
@@ -53224,46 +53243,37 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
         }
         obj = JS_NewObject(ctx);
         if (JS_IsException(obj))
-            return JS_EXCEPTION;
+            goto fail;
         {
             uint32_t child_index = node->first_child;
             for (i = 0; i < node->child_count; i++) {
                 JSONLazyTapeNode *child;
+                const uint8_t *kstart;
+                const uint8_t *kend;
+                JSAtom key;
+                JSValue marker;
                 if (child_index == UINT32_MAX ||
                     child_index >= doc->node_count)
                     goto fail;
                 child = &doc->nodes[child_index];
-            const uint8_t *kstart = base + child->key_start;
-            const uint8_t *kend = kstart + child->key_length;
-            JSAtom key = JS_ATOM_NULL;
-            JSValue marker;
-            int key_match = 0;
-            if (layout_match) {
-                key_match = json_lazy_layout_key_match(
-                    ctx, layout_hint, i, kstart, kend);
-                if (key_match == 1) {
-                    key = JS_DupAtom(ctx, layout_hint->entries[i].atom);
-                } else {
-                    layout_match = 0;
-                }
-            }
-            if (key == JS_ATOM_NULL)
+                kstart = base + child->key_start;
+                kend = kstart + child->key_length;
                 key = js_lazy_key_atom(ctx, kstart, kend - 1);
-            if (key == JS_ATOM_NULL)
-                goto fail;
-            if (entries) {
-                entries[i].atom = JS_DupAtom(ctx, key);
-                initialized_atoms++;
-            }
-            if (child_index == UINT32_MAX || child_index > INT32_MAX)
-                goto fail;
-            marker = js_lazy_marker_new(child_index);
-            if (JS_DefinePropertyValue(ctx, obj, key, marker,
-                                       JS_PROP_C_W_E) < 0) {
+                if (key == JS_ATOM_NULL)
+                    goto fail;
+                if (entries) {
+                    entries[i].atom = JS_DupAtom(ctx, key);
+                    initialized_atoms++;
+                }
+                if (child_index > INT32_MAX)
+                    goto fail;
+                marker = js_lazy_marker_new(child_index);
+                if (JS_DefinePropertyValue(ctx, obj, key, marker,
+                                           JS_PROP_C_W_E) < 0) {
+                    JS_FreeAtom(ctx, key);
+                    goto fail;
+                }
                 JS_FreeAtom(ctx, key);
-                goto fail;
-            }
-            JS_FreeAtom(ctx, key);
                 child_index = child->next_sibling;
             }
             if (child_index != UINT32_MAX)
@@ -53272,16 +53282,7 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
     } else {
         return JS_UNDEFINED;
     }
-    if (layout_hint && layout_hint->valid &&
-        json_lazy_layout_shape(layout_hint) &&
-        layout_match) {
-        JSValue fast = js_lazy_build_tape_layout_object(
-            ctx, document, node_index, layout_hint);
-        JS_FreeValue(ctx, obj);
-        js_free(ctx, entries);
-        return fast;
-    }
-    if (js_lazy_set_backing(ctx, obj, document) < 0)
+    if (js_lazy_set_document(ctx, obj, document) < 0)
         goto fail;
     if (layout_hint && !layout_hint->valid && entries) {
         if (json_lazy_layout_capture(ctx, layout_hint,
@@ -53298,7 +53299,6 @@ static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
             JS_FreeAtom(ctx, entries[--initialized_atoms].atom);
         js_free(ctx, entries);
     }
-    (void)layout_match;
     return obj;
 fail:
     if (entries) {
@@ -53307,11 +53307,11 @@ fail:
         js_free(ctx, entries);
     }
     JS_FreeValue(ctx, obj);
-    return JS_UNDEFINED;
+    return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
 }
 
 static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
-                                                JSONLazyBacking *doc,
+                                                JSONLazyDocument *doc,
                                                 uint32_t node_index,
                                                 JSValueConst document,
                                                 JSONLazyLayout *layout_hint)
@@ -53335,9 +53335,12 @@ static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
     case JSON_LAZY_ARRAY: {
         value = js_lazy_parse_tape_node(ctx, doc, document, node_index,
                                         layout_hint);
-        if (JS_IsUndefined(value))
+        if (JS_IsUndefined(value)) {
+            if (JS_HasException(ctx))
+                return JS_EXCEPTION;
             value = js_lazy_eager_parse_range(ctx, doc->source, node->start,
                                               node->end - node->start);
+        }
         if (JS_IsException(value))
             return JS_EXCEPTION;
         break;
@@ -53346,10 +53349,6 @@ static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
         value = JS_EXCEPTION;
         break;
     }
-    if ((node->type == JSON_LAZY_OBJECT || node->type == JSON_LAZY_ARRAY))
-        return value;
-    if (JS_IsException(value))
-        return JS_EXCEPTION;
     return value;
 }
 
@@ -53357,16 +53356,15 @@ static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
 static JSValue json_lazy_parse(JSContext *ctx, const char *buf, size_t buf_len)
 {
     JSValue document, v;
-    JSONLazyBacking *doc;
-    if (!js_lazy_json_should_enable(ctx, buf_len))
-        return JS_UNDEFINED;
+    JSONLazyDocument *doc;
     document = js_lazy_new_document(ctx, buf, buf_len);
     if (JS_IsException(document))
-        return JS_UNDEFINED;
-    doc = JS_GetOpaque(document, js_lazy_backing_class_id);
+        return JS_EXCEPTION;
+    doc = JS_GetOpaque(document, js_lazy_document_class_id);
     if (!doc || json_lazy_build_tape(ctx, doc) < 0) {
+        int is_exception = JS_HasException(ctx);
         JS_FreeValue(ctx, document);
-        return JS_UNDEFINED;
+        return is_exception ? JS_EXCEPTION : JS_UNDEFINED;
     }
     v = js_lazy_parse_tape_node(ctx, doc, document, 0, NULL);
     if (JS_IsUndefined(v)) {
