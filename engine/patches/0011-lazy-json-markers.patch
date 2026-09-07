@@ -1,7 +1,10 @@
 Subject: lazy JSON.parse with a document-local tape
 
 Technical overview
-  Extends JSON.parse with a lazy representation for documents at least 4 KiB.
+  Extends JSON.parse with an opt-in lazy representation for documents at least
+  4 KiB. Application builds default to eager parsing; the package's existing
+  package.json can opt in with react-native-quickjs.lazyJson: true, while
+  embedders can still select the compile-time or runtime setting directly.
   The parser validates the input once and records source ranges, value types,
   and container relationships in a document-local structural tape. Containers
   retain one private, non-enumerable reference to that document, while their
@@ -50,7 +53,19 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -45,6 +45,7 @@
+@@ -30,6 +30,11 @@
+ #include <inttypes.h>
+ #include <string.h>
+ #include <assert.h>
++
++#ifndef QJS_JSON_LAZY_DEFAULT
++#define QJS_JSON_LAZY_DEFAULT 0
++#endif
++
+ #if !defined(_MSC_VER)
+ #include <sys/time.h>
+ #if defined(_WIN32)
+@@ -45,6 +50,7 @@
  #include "cutils.h"
  #include "list.h"
  #include "quickjs.h"
@@ -58,7 +73,7 @@ Needs a bytecode version bump
  #include "libregexp.h"
  #include "dtoa.h"
 
-@@ -348,6 +349,7 @@
+@@ -348,6 +354,7 @@
      JSMallocState malloc_state;
      JSArenaState arena_state;
      const char *rt_info;
@@ -66,15 +81,15 @@ Needs a bytecode version bump
 
      int atom_hash_size; /* power of two */
      int atom_count;
-@@ -2373,6 +2375,7 @@
+@@ -2373,6 +2380,7 @@
      ms.malloc_count++;
      ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
      rt->malloc_state = ms;
-+    rt->json_lazy_enabled = 1;
++    rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
      js_arena_init(rt);
      rt->malloc_gc_threshold = 256 * 1024;
 
-@@ -2680,6 +2683,12 @@
+@@ -2680,6 +2688,12 @@
  {
      if (rt)
          rt->rt_info = s;
@@ -87,7 +102,7 @@ Needs a bytecode version bump
  }
 
  void JS_FreeRuntime(JSRuntime *rt)
-@@ -9624,6 +9633,9 @@
+@@ -9624,6 +9638,9 @@
      return 0;
  }
 
@@ -97,7 +112,7 @@ Needs a bytecode version bump
  static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                        JSAtom prop, JSValueConst this_obj,
                                        bool throw_ref_error)
-@@ -9709,6 +9721,8 @@
+@@ -9709,6 +9726,8 @@
                      continue;
                  }
              } else {
@@ -106,7 +121,7 @@ Needs a bytecode version bump
                  return js_dup(pr->u.value);
              }
          }
-@@ -10268,7 +10282,13 @@
+@@ -10268,7 +10287,13 @@
                      goto retry;
                  }
              } else {
@@ -121,7 +136,7 @@ Needs a bytecode version bump
              }
          } else {
              if (pflags) {
-@@ -10481,7 +10501,10 @@
+@@ -10481,7 +10506,10 @@
      case JS_CLASS_ARRAY:
      case JS_CLASS_ARGUMENTS:
          if (unlikely(idx >= p->u.array.count)) return false;
@@ -133,7 +148,7 @@ Needs a bytecode version bump
          return true;
      case JS_CLASS_MAPPED_ARGUMENTS:
          if (unlikely(idx >= p->u.array.count)) return false;
-@@ -20178,7 +20201,11 @@
+@@ -20178,7 +20206,11 @@
                              /* found */
                              if (unlikely(prs->flags & JS_PROP_TMASK))
                                  goto get_field_slow_path;
@@ -146,7 +161,7 @@ Needs a bytecode version bump
                              break;
                          }
                          if (unlikely(p->is_exotic)) {
-@@ -20482,7 +20509,10 @@
+@@ -20482,7 +20514,10 @@
                      uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                      if (likely(p->class_id == JS_CLASS_ARRAY &&
                                 idx < p->u.array.count)) {
@@ -158,7 +173,7 @@ Needs a bytecode version bump
                          JS_FreeValue(ctx, sp[-2]);
                          sp[-2] = val;
                          sp--;
-@@ -20516,7 +20546,10 @@
+@@ -20516,7 +20551,10 @@
                      uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                      if (likely(p->class_id == JS_CLASS_ARRAY &&
                                 idx < p->u.array.count)) {
@@ -170,7 +185,7 @@ Needs a bytecode version bump
                          BREAK;
                      }
                      if (js_get_fast_array_element(ctx, p, idx, &val)) {
-@@ -52065,8 +52098,7 @@
+@@ -52065,8 +52103,7 @@
                          goto fail;
                      }
                  }
@@ -180,7 +195,7 @@ Needs a bytecode version bump
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52299,9 +52331,1103 @@
+@@ -52299,9 +52336,1103 @@
      js_free_prop_enum(ctx, atoms, len);
      JS_FreeValue(ctx, context);
      JS_FreeValue(ctx, val);
@@ -387,7 +402,7 @@ Needs a bytecode version bump
 +    return js_dup(val);
 +fail:
 +    JS_FreeValue(ctx, backing);
-     return JS_EXCEPTION;
++    return JS_EXCEPTION;
 +}
 +
 +static void js_lazy_document_finalizer(JSRuntime *rt, JSValueConst val)
@@ -435,8 +450,8 @@ Needs a bytecode version bump
 +            return 0;
 +    }
 +    return 1;
- }
-
++}
++
 +static void json_lazy_skip_ws(const uint8_t **pp, const uint8_t *end)
 +{
 +    const uint8_t *p = *pp;
@@ -1052,7 +1067,7 @@ Needs a bytecode version bump
 +    for (i = 0; i < shape->prop_size; i++)
 +        JS_FreeValue(ctx, props[i].u.value);
 +    js_free(ctx, props);
-+    return JS_EXCEPTION;
+     return JS_EXCEPTION;
 +}
 +
 +static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyDocument *doc,
@@ -1209,8 +1224,8 @@ Needs a bytecode version bump
 +    }
 +    JS_FreeValue(ctx, obj);
 +    return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
-+}
-+
+ }
+
 +static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
 +                                                JSONLazyDocument *doc,
 +                                                uint32_t node_index,
@@ -1284,7 +1299,7 @@ Needs a bytecode version bump
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -52312,6 +53438,19 @@
+@@ -52312,6 +53443,19 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
