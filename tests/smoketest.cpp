@@ -147,6 +147,27 @@ int main() {
           "retainedChild.value === 1")
           .getBool(),
       "lazy JSON retained child");
+  check(
+      eval(
+          rt,
+          "var mutable = JSON.parse('{\\\"a\\\":1,\\\"b\\\":2,"
+          "\\\"pad\\\":\\\"' + 'x'.repeat(4090) + '\\\"}');"
+          "mutable.a = 7; delete mutable.b;"
+          "var md = Object.getOwnPropertyDescriptor(mutable, 'a');"
+          "var copy = {...mutable};"
+          "md.value === 7 && copy.a === 7 && "
+          "Object.keys(mutable).length === 2 && "
+          "JSON.stringify(mutable).indexOf('\\\"a\\\":7') >= 0")
+          .getBool(),
+      "lazy JSON mutation and observability");
+  check(
+      eval(
+          rt,
+          "var duplicate = JSON.parse('{\\\"a\\\":1,\\\"a\\\":2,"
+          "\\\"\\\\u00e9\\\":\\\"v\\\"}');"
+          "duplicate.a === 2 && duplicate['é'] === 'v'")
+          .getBool(),
+      "JSON duplicate and escaped keys");
   // toJSON is observable per the specification: it must be looked up on every
   // object, even when the default prototypes have none. A fast path that
   // skips it would silently serialize the wrong value (regression guard).
