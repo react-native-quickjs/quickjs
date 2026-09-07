@@ -890,6 +890,23 @@ typedef enum JSFunctionKindEnum {
     JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
 } JSFunctionKindEnum;
 
+typedef struct JSObjLitTemplate {
+    uint32_t pc;
+    uint16_t prop_count;
+    JSShape *shape;
+    JSAtom *atoms;
+} JSObjLitTemplate;
+
+typedef struct JSObjLitSite {
+    int pos;
+    uint16_t template_index;
+    uint16_t prop_count;
+    uint16_t prop_capacity;
+    uint8_t eligible;
+    JSAtom *atoms;
+} JSObjLitSite;
+#define JS_OBJLIT_MAX_PROPS 16
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_strict_mode : 1;
@@ -926,6 +943,8 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+    JSObjLitTemplate *objlit_tab;
+    uint16_t objlit_count;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -6731,6 +6750,50 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     return JS_MKPTR(JS_TAG_OBJECT, p);
 }
 
+static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl)
+{
+    JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
+    int i;
+
+    if (likely(tpl->shape != NULL)) {
+        JSProperty props[JS_OBJLIT_MAX_PROPS];
+        if (unlikely(tpl->shape->proto != proto))
+            return JS_NewObject(ctx);
+        for (i = 0; i < tpl->prop_count; i++)
+            props[i].u.value = JS_UNDEFINED;
+        return JS_NewObjectFromShape(ctx, js_dup_shape(tpl->shape),
+                                     JS_CLASS_OBJECT, props);
+    }
+    JSValue obj = JS_NewObject(ctx);
+    JSObject *p;
+    if (JS_IsException(obj))
+        return obj;
+    p = JS_VALUE_GET_OBJ(obj);
+    for (i = 0; i < tpl->prop_count; i++) {
+        JSProperty *pr = add_property(ctx, p, tpl->atoms[i], JS_PROP_C_W_E);
+        if (unlikely(!pr)) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+        pr->u.value = JS_UNDEFINED;
+    }
+    tpl->shape = js_dup_shape(p->shape);
+    for (i = 0; i < tpl->prop_count; i++)
+        JS_FreeAtom(ctx, tpl->atoms[i]);
+    js_free(ctx, tpl->atoms);
+    tpl->atoms = NULL;
+    return obj;
+}
+
+static JSAtom js_objlit_template_atom(JSObjLitTemplate *tpl, int index)
+{
+    if (tpl->atoms)
+        return tpl->atoms[index];
+    assert(tpl->shape != NULL);
+    assert(index < tpl->shape->prop_count);
+    return get_shape_prop(tpl->shape)[index].atom;
+}
+
 /* WARNING: proto must be an object or JS_NULL */
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
                                JSClassID class_id)
@@ -7815,6 +7878,13 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             }
             if (b->realm)
                 mark_func(rt, &b->realm->header);
+            if (b->objlit_tab) {
+                uint32_t oi;
+                for (oi = 0; oi < b->objlit_count; oi++) {
+                    if (b->objlit_tab[oi].shape)
+                        mark_func(rt, &b->objlit_tab[oi].shape->header);
+                }
+            }
         }
         break;
     case JS_GC_OBJ_TYPE_VAR_REF:
@@ -8083,6 +8153,17 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     }
     if (b->closure_var) {
         js_func_size += b->closure_var_count * sizeof(*b->closure_var);
+    }
+    if (b->objlit_tab) {
+        js_func_size += b->objlit_count * sizeof(*b->objlit_tab);
+        memory_used_count++;
+        for (i = 0; i < b->objlit_count; i++) {
+            if (b->objlit_tab[i].atoms) {
+                js_func_size += b->objlit_tab[i].prop_count *
+                    sizeof(b->objlit_tab[i].atoms[0]);
+                memory_used_count++;
+            }
+        }
     }
     if (b->byte_code_buf) {
         hp->js_func_code_size += b->byte_code_len;
@@ -18949,6 +19030,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
             BREAK;
+        CASE(OP_object_template):
+            {
+                uint16_t index = get_u16(pc);
+                JSObjLitTemplate *tpl;
+                pc += 2;
+                assert(index < b->objlit_count);
+                if (unlikely(index >= b->objlit_count)) {
+                    JS_ThrowInternalError(ctx, "invalid object literal template");
+                    goto exception;
+                }
+                tpl = &b->objlit_tab[index];
+                assert(tpl->pc == (uint32_t)(pc - 3 - b->byte_code_buf));
+                *sp++ = js_new_object_from_template(ctx, tpl);
+                if (unlikely(JS_IsException(sp[-1])))
+                    goto exception;
+                BREAK;
+            }
         CASE(OP_special_object):
             {
                 int arg = *pc++;
@@ -22909,6 +23007,9 @@ typedef struct JSFunctionDef {
     bool is_eval : 1; /* true if eval code */
     bool is_global_var : 1; /* true if variables are not defined locally:
                            eval global, eval module or non strict eval */
+    JSObjLitSite *objlit_sites;
+    int objlit_count;
+    int objlit_size;
     bool is_func_expr : 1; /* true if function expression */
     bool has_home_object : 1; /* true if the home object is available */
     bool has_prototype : 1; /* true if a prototype field is necessary */
@@ -26141,17 +26242,92 @@ static void set_object_name_computed(JSParseState *s)
     }
 }
 
+static int objlit_begin(JSParseState *s)
+{
+    JSFunctionDef *fd = s->cur_func;
+    JSObjLitSite *site;
+    if (js_resize_array(s->ctx, (void **)&fd->objlit_sites, sizeof(*site),
+                        &fd->objlit_size, fd->objlit_count + 1))
+        return -1;
+    site = &fd->objlit_sites[fd->objlit_count];
+    site->pos = fd->last_opcode_pos;
+    site->template_index = UINT16_MAX;
+    site->prop_count = 0;
+    site->prop_capacity = 0;
+    site->eligible = 1;
+    site->atoms = NULL;
+    return fd->objlit_count++;
+}
+
+static void objlit_discard(JSParseState *s, JSObjLitSite *site)
+{
+    int i;
+    for (i = 0; i < site->prop_count; i++)
+        JS_FreeAtom(s->ctx, site->atoms[i]);
+    js_free(s->ctx, site->atoms);
+    site->atoms = NULL;
+    site->prop_count = 0;
+    site->prop_capacity = 0;
+    site->eligible = 0;
+}
+
+static void objlit_kill(JSParseState *s, int idx)
+{
+    if (idx >= 0)
+        objlit_discard(s, &s->cur_func->objlit_sites[idx]);
+}
+
+static int objlit_add(JSParseState *s, int idx, JSAtom name)
+{
+    JSObjLitSite *site;
+    JSAtom *tab;
+    int i;
+    if (idx < 0)
+        return 0;
+    site = &s->cur_func->objlit_sites[idx];
+    if (!site->eligible)
+        return 0;
+    if (__JS_AtomIsTaggedInt(name)) {
+        objlit_discard(s, site);
+        return 0;
+    }
+    for (i = 0; i < site->prop_count; i++)
+        if (site->atoms[i] == name)
+            return 0;
+    if (site->prop_count >= JS_OBJLIT_MAX_PROPS) {
+        objlit_discard(s, site);
+        return 0;
+    }
+    if (site->prop_count == site->prop_capacity) {
+        uint32_t capacity = site->prop_capacity ?
+            site->prop_capacity * 2 : 4;
+        if (capacity > JS_OBJLIT_MAX_PROPS)
+            capacity = JS_OBJLIT_MAX_PROPS;
+        tab = js_realloc(s->ctx, site->atoms, sizeof(JSAtom) * capacity);
+        if (!tab)
+            return -1;
+        site->atoms = tab;
+        site->prop_capacity = (uint16_t)capacity;
+    }
+    site->atoms[site->prop_count++] = JS_DupAtom(s->ctx, name);
+    return 0;
+}
+
 static __exception int js_parse_object_literal(JSParseState *s)
 {
     JSAtom name = JS_ATOM_NULL;
     const uint8_t *start_ptr;
     int start_line, start_col, prop_type;
+    int lit_idx;
     bool has_proto;
 
     if (next_token(s))
         goto fail;
     /* XXX: add an initial length that will be patched back */
     emit_op(s, OP_object);
+    lit_idx = objlit_begin(s);
+    if (lit_idx < 0)
+        goto fail;
     has_proto = false;
     while (s->token.val != '}') {
         /* specific case for getter/setter */
@@ -26160,6 +26336,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
         start_col = s->token.col_num;
 
         if (s->token.val == TOK_ELLIPSIS) {
+            objlit_kill(s, lit_idx);
             if (next_token(s))
                 return -1;
             if (js_parse_assign_expr(s))
@@ -26178,12 +26355,15 @@ static __exception int js_parse_object_literal(JSParseState *s)
 
         if (prop_type == PROP_TYPE_VAR) {
             /* shortcut for x: x */
+            if (objlit_add(s, lit_idx, name) < 0)
+                goto fail;
             emit_op(s, OP_scope_get_var);
             emit_atom(s, name);
             emit_u16(s, s->cur_func->scope_level);
             emit_op(s, OP_define_field);
             emit_atom(s, name);
         } else if (s->token.val == '(') {
+            objlit_kill(s, lit_idx);
             bool is_getset = (prop_type == PROP_TYPE_GET ||
                               prop_type == PROP_TYPE_SET);
             JSParseFunctionEnum func_type;
@@ -26224,10 +26404,12 @@ static __exception int js_parse_object_literal(JSParseState *s)
             if (js_parse_assign_expr(s))
                 goto fail;
             if (name == JS_ATOM_NULL) {
+                objlit_kill(s, lit_idx);
                 set_object_name_computed(s);
                 emit_op(s, OP_define_array_el);
                 emit_op(s, OP_drop);
             } else if (name == JS_ATOM___proto__) {
+                objlit_kill(s, lit_idx);
                 if (has_proto) {
                     js_parse_error(s, "duplicate __proto__ property name");
                     goto fail;
@@ -26235,6 +26417,8 @@ static __exception int js_parse_object_literal(JSParseState *s)
                 emit_op(s, OP_set_proto);
                 has_proto = true;
             } else {
+                if (objlit_add(s, lit_idx, name) < 0)
+                    goto fail;
                 set_object_name(s, name);
                 emit_op(s, OP_define_field);
                 emit_atom(s, name);
@@ -33983,6 +34167,24 @@ static void free_bytecode_atoms(JSRuntime *rt,
 
 #ifndef QJS_DISABLE_PARSER
 
+static void free_objlit_sites(JSContext *ctx, JSFunctionDef *fd)
+{
+    int i;
+    if (!fd->objlit_sites)
+        return;
+    for (i = 0; i < fd->objlit_count; i++) {
+        JSObjLitSite *site = &fd->objlit_sites[i];
+        if (site->atoms) {
+            int k;
+            for (k = 0; k < site->prop_count; k++)
+                JS_FreeAtom(ctx, site->atoms[k]);
+            js_free(ctx, site->atoms);
+        }
+    }
+    js_free(ctx, fd->objlit_sites);
+    fd->objlit_sites = NULL;
+}
+
 static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
 {
     int i;
@@ -33998,6 +34200,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     free_bytecode_atoms(ctx->rt, fd->byte_code.buf, fd->byte_code.size,
                         fd->use_short_opcodes);
     dbuf_free(&fd->byte_code);
+    free_objlit_sites(ctx, fd);
     js_free(ctx, fd->jump_slots);
     js_free(ctx, fd->label_slots);
     js_free(ctx, fd->source_loc_slots);
@@ -36056,6 +36259,7 @@ static int get_label_pos(JSFunctionDef *s, int label)
 static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
 {
     int pos, pos_next, bc_len, op, len, i, idx, line_num, col_num;
+    int objlit_k = 0;
     uint8_t *bc_buf;
     JSAtom var_name;
     DynBuf bc_out;
@@ -36111,6 +36315,14 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
+        while (objlit_k < s->objlit_count &&
+               s->objlit_sites[objlit_k].pos <= pos) {
+            JSObjLitSite *site = &s->objlit_sites[objlit_k++];
+            if (site->pos == pos && op == OP_object)
+                site->pos = (int)bc_out.size;
+            else
+                site->pos = -1;
+        }
         switch(op) {
         case OP_source_loc:
             line_num = get_u32(bc_buf + pos + 1);
@@ -36694,6 +36906,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     CodeContext cc;
     int label;
     JumpSlot *jp;
+    int objlit_k = 0;
+    int objlit_live_count = 0;
+    int objlit_template_index;
 
     label_slots = s->label_slots;
 
@@ -36785,9 +37000,23 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     for (pos = 0; pos < bc_len; pos = pos_next) {
         int val;
+        objlit_template_index = -1;
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
+        while (objlit_k < s->objlit_count &&
+               s->objlit_sites[objlit_k].pos <= pos) {
+            JSObjLitSite *site = &s->objlit_sites[objlit_k++];
+            if (site->pos == pos && op == OP_object && site->eligible &&
+                site->prop_count > 0 && objlit_live_count < UINT16_MAX) {
+                objlit_template_index = objlit_live_count++;
+                site->template_index = (uint16_t)objlit_template_index;
+                site->pos = (int)bc_out.size;
+            } else {
+                site->template_index = UINT16_MAX;
+                site->pos = -1;
+            }
+        }
         switch(op) {
         case OP_source_loc:
             /* line number info (for debug). We put it in a separate
@@ -37487,6 +37716,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             goto no_change;
 
         case OP_object:
+            if (objlit_template_index >= 0) {
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                dbuf_putc(&bc_out, OP_object_template);
+                dbuf_put_u16(&bc_out, objlit_template_index);
+                break;
+            }
             if (code_match(&cc, pos_next, OP_null, OP_set_proto, -1)) {
                 if (cc.line_num >= 0) line_num = cc.line_num;
                 if (cc.col_num >= 0) col_num = cc.col_num;
@@ -37560,6 +37795,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 for (j = 0; j < s->source_loc_count; j++) {
                     if (s->source_loc_slots[j].pc > pos)
                         s->source_loc_slots[j].pc -= delta;
+                }
+                for (j = 0; j < s->objlit_count; j++) {
+                    if (s->objlit_sites[j].pos > pos)
+                        s->objlit_sites[j].pos -= delta;
                 }
                 continue;
             }
@@ -38010,6 +38249,39 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         goto fail;
     JS_REF_COUNT(b) = 1;
 
+    {
+        int n_live = 0, j;
+        for (j = 0; j < fd->objlit_count; j++) {
+            JSObjLitSite *st = &fd->objlit_sites[j];
+            if (st->pos >= 0 && st->eligible && st->prop_count > 0)
+                n_live++;
+        }
+        if (n_live > 0 && n_live <= UINT16_MAX) {
+            b->objlit_tab = js_mallocz(ctx, sizeof(JSObjLitTemplate) * n_live);
+            if (!b->objlit_tab) {
+                js_free(ctx, b);
+                b = NULL;
+                goto fail;
+            }
+            {
+                int t = 0;
+                for (j = 0; j < fd->objlit_count; j++) {
+                    JSObjLitSite *st = &fd->objlit_sites[j];
+                    if (st->pos >= 0 && st->eligible && st->prop_count > 0) {
+                        JSObjLitTemplate *tpl;
+                        assert(st->template_index == (uint16_t)t);
+                        tpl = &b->objlit_tab[t++];
+                        tpl->pc = (uint32_t)st->pos;
+                        tpl->prop_count = st->prop_count;
+                        tpl->atoms = st->atoms;
+                        st->atoms = NULL;
+                    }
+                }
+            }
+            b->objlit_count = (uint16_t)n_live;
+        }
+    }
+
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
     b->byte_code_len = fd->byte_code.size;
     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
@@ -38092,6 +38364,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         list_del(&fd->link);
     }
 
+    free_objlit_sites(ctx, fd);
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
  fail:
@@ -38123,6 +38396,21 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     if (b->realm)
         JS_FreeContext(b->realm);
 
+    if (b->objlit_tab) {
+        uint32_t oi;
+        for (oi = 0; oi < b->objlit_count; oi++) {
+            JSObjLitTemplate *tpl = &b->objlit_tab[oi];
+            uint16_t k;
+            if (tpl->shape)
+                js_free_shape(rt, tpl->shape);
+            if (tpl->atoms) {
+                for (k = 0; k < tpl->prop_count; k++)
+                    JS_FreeAtomRT(rt, tpl->atoms[k]);
+                js_free_rt(rt, tpl->atoms);
+            }
+        }
+        js_free_rt(rt, b->objlit_tab);
+    }
     JS_FreeAtomRT(rt, b->func_name);
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
@@ -39799,6 +40087,21 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     if (JS_WriteFunctionBytecode(s, b))
         goto fail;
 
+    bc_put_leb128(s, b->objlit_count);
+    assert(b->objlit_count == 0 || b->objlit_tab != NULL);
+    for (i = 0; i < b->objlit_count; i++) {
+        JSObjLitTemplate *tpl = &b->objlit_tab[i];
+        uint16_t k;
+        assert(tpl->pc < (uint32_t)b->byte_code_len);
+        assert(i == 0 || tpl->pc > b->objlit_tab[i - 1].pc);
+        assert(b->byte_code_buf[tpl->pc] == OP_object_template);
+        assert(get_u16(b->byte_code_buf + tpl->pc + 1) == i);
+        bc_put_leb128(s, tpl->pc);
+        bc_put_leb128(s, tpl->prop_count);
+        for (k = 0; k < tpl->prop_count; k++)
+            bc_put_atom(s, js_objlit_template_atom(tpl, k));
+    }
+
     if (s->allow_debug) {
         bc_put_atom(s, b->filename);
         bc_put_leb128(s, b->line_num);
@@ -40655,6 +40958,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     int idx, i, local_count, has_debug_info;
     int function_size, cpool_offset, byte_code_offset;
     int closure_var_offset, vardefs_offset;
+    uint32_t *objlit_template_pcs = NULL;
 
     memset(&bc, 0, sizeof(bc));
     //bc.gc_header.mark = 0;
@@ -40830,6 +41134,124 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             goto fail;
         bc_read_trace(s, "}\n");
     }
+    {
+        uint32_t template_count;
+        uint32_t pc, byte_code_len;
+
+        if (bc_get_leb128(s, &template_count)) {
+            JS_ThrowSyntaxError(ctx,
+                                "invalid object literal template metadata: "
+                                "truncated template table");
+            goto fail;
+        }
+        if (template_count > UINT16_MAX) {
+            JS_ThrowSyntaxError(ctx,
+                                "invalid object literal template metadata: "
+                                "too many templates");
+            goto fail;
+        }
+        if (template_count != 0) {
+            objlit_template_pcs = js_malloc(ctx, sizeof(*objlit_template_pcs) *
+                                            template_count);
+            if (!objlit_template_pcs)
+                goto fail;
+            for (i = 0; i < (int)template_count; i++)
+                objlit_template_pcs[i] = UINT32_MAX;
+        }
+
+        byte_code_len = (uint32_t)b->byte_code_len;
+        for (pc = 0; pc < byte_code_len;) {
+            uint8_t opcode = b->byte_code_buf[pc];
+            uint32_t instruction_len;
+
+            if (opcode >= OP_COUNT + (OP_TEMP_END - OP_TEMP_START)) {
+                JS_ThrowSyntaxError(ctx,
+                                    "invalid object literal template metadata: "
+                                    "invalid bytecode opcode");
+                goto fail;
+            }
+            instruction_len = short_opcode_info(opcode).size;
+            if (instruction_len == 0 || instruction_len > byte_code_len - pc) {
+                JS_ThrowSyntaxError(ctx,
+                                    "invalid object literal template metadata: "
+                                    "truncated bytecode instruction");
+                goto fail;
+            }
+            if (opcode == OP_object_template) {
+                uint32_t index;
+
+                if (instruction_len != 3) {
+                    JS_ThrowSyntaxError(ctx,
+                                        "invalid object literal template metadata: "
+                                        "invalid template instruction size");
+                    goto fail;
+                }
+                index = get_u16(b->byte_code_buf + pc + 1);
+                if (index >= template_count ||
+                    objlit_template_pcs[index] != UINT32_MAX) {
+                    JS_ThrowSyntaxError(ctx,
+                                        "invalid object literal template metadata: "
+                                        "invalid or duplicate template index");
+                    goto fail;
+                }
+                objlit_template_pcs[index] = pc;
+            }
+            pc += instruction_len;
+        }
+
+        for (i = 0; i < (int)template_count; i++) {
+            if (objlit_template_pcs[i] == UINT32_MAX) {
+                JS_ThrowSyntaxError(ctx,
+                                    "invalid object literal template metadata: "
+                                    "missing template entry");
+                goto fail;
+            }
+        }
+
+        if (template_count != 0) {
+            b->objlit_tab = js_mallocz(ctx,
+                                       sizeof(*b->objlit_tab) * template_count);
+            if (!b->objlit_tab)
+                goto fail;
+            b->objlit_count = (uint16_t)template_count;
+            for (i = 0; i < b->objlit_count; i++) {
+                JSObjLitTemplate *tpl = &b->objlit_tab[i];
+                uint32_t pc_value, prop_count;
+                uint32_t k;
+
+                if (bc_get_leb128(s, &pc_value) ||
+                    bc_get_leb128(s, &prop_count)) {
+                    JS_ThrowSyntaxError(ctx,
+                                        "invalid object literal template metadata: "
+                                        "truncated template entry");
+                    goto fail;
+                }
+                if (pc_value != objlit_template_pcs[i] ||
+                    prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS) {
+                    JS_ThrowSyntaxError(ctx,
+                                        "invalid object literal template metadata: "
+                                        "template entry does not match bytecode");
+                    goto fail;
+                }
+                tpl->pc = pc_value;
+                tpl->atoms = js_malloc(ctx, sizeof(JSAtom) * prop_count);
+                if (!tpl->atoms)
+                    goto fail;
+                tpl->prop_count = 0;
+                for (k = 0; k < prop_count; k++) {
+                    if (bc_get_atom(s, &tpl->atoms[k])) {
+                        JS_ThrowSyntaxError(ctx,
+                                            "invalid object literal template metadata: "
+                                            "invalid template atom");
+                        goto fail;
+                    }
+                    tpl->prop_count++;
+                }
+            }
+        }
+        js_free(ctx, objlit_template_pcs);
+        objlit_template_pcs = NULL;
+    }
     if (!has_debug_info)
         goto nodebug;
 
@@ -40878,6 +41300,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     return obj;
 
  fail:
+    js_free(ctx, objlit_template_pcs);
     JS_FreeAtom(ctx, bc.func_name);
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;

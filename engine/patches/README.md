@@ -22,6 +22,7 @@ what we changed and why without opening a single `.patch` file.
 | `0009` | Speeds up JSON.stringify: enumerate object keys as atoms, quote keys and strings straight into the buffer, and format floats/booleans/null directly (integral doubles exact within +/-2^53) | JSON.stringify dominates network payloads; the old code built a key array and an intermediate quoted string per key and per value | - | No |
 | `0010` | Faster json tokenizer for structural punctuation: `[ ] { } : ,` return directly without per-token state bookkeeping | Punctuation is 50-80% of JSON tokens, and each previously paid the full tokenizer update for a byte the parse loop just compares against | - | No |
 | `0011` | Lazy JSON.parse with shared source, structural tape, direct markers, repeated-layout construction, and access feedback | Large payloads are often only partly inspected; eager parsing pays for values that are never read, while the lazy document keeps source and tape ownership safe for retained descendants | - | No |
+| `0012` | Caches shapes for eligible static object literals and serializes their reusable metadata with bytecode | Repeated object-literal sites otherwise rebuild the same property shape through one transition per property | - | Yes |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
