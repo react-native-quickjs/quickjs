@@ -23,13 +23,42 @@ function networkPayload() {
 /* Stable checksum over a parsed value. */
 function checksum(v){var h=0;(function walk(x){if(typeof x==='number'){h+=Math.floor(x*65536)|0;return;}if(typeof x==='string'){for(var i=0;i<x.length;i++)h+=x.charCodeAt(i);return;}if(typeof x==='boolean'){h+=x?7:3;return;}if(Array.isArray(x)){for(var i=0;i<x.length;i++)walk(x[i]);h++;return;}var ks=Object.keys(x).sort();for(var j=0;j<ks.length;j++){h+=ks[j].length;walk(x[ks[j]]);}})(v);return h;}
 
-/* Each row: cache the serialized text, parse+checksum per iteration. */
-bench({ name: 'jsonparse/int-array-2000', unit: 'parse', run: (function(){ var t=JSON.stringify(intArray(2000)); var e=checksum(JSON.parse(t)); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ var j=intArray(2000); return checksum(j); })() });
-bench({ name: 'jsonparse/dbl-array-2000', unit: 'parse', run: (function(){ var t=JSON.stringify(dblArray(2000)); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(dblArray(2000)); })() });
-bench({ name: 'jsonparse/repeated-objects-800', unit: 'parse', run: (function(){ var t=JSON.stringify(repeatedObjects(800)); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(repeatedObjects(800)); })() });
-bench({ name: 'jsonparse/small-nested', unit: 'parse', run: (function(){ var t=JSON.stringify(smallNested()); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(smallNested()); })() });
-bench({ name: 'jsonparse/large-flat-300', unit: 'parse', run: (function(){ var t=JSON.stringify(largeFlat(300)); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(largeFlat(300)); })() });
-bench({ name: 'jsonparse/string-heavy-120', unit: 'parse', run: (function(){ var t=JSON.stringify(stringHeavy(120)); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(stringHeavy(120)); })() });
-bench({ name: 'jsonparse/escaped-nonascii', unit: 'parse', run: (function(){ var t=JSON.stringify(escaped()); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(escaped()); })() });
-bench({ name: 'jsonparse/network-payload', unit: 'parse', run: (function(){ var t=JSON.stringify(networkPayload()); return function(){ return checksum(JSON.parse(t)); }; })(), expect: (function(){ return checksum(networkPayload()); })() });
-bench({ name: 'jsonparse/network-reviver', unit: 'parse', run: (function(){ var t=JSON.stringify(networkPayload()); return function(){ return checksum(JSON.parse(t,function(k,v){return v;})); }; })(), expect: (function(){ return checksum(JSON.parse(JSON.stringify(networkPayload()))); })() });
+/* Keep parsing, traversal, and the real-world combined operation separate. */
+function addJsonParseRows(name, text, expected, reviver) {
+  var parse = function() { return JSON.parse(text, reviver); };
+  var parsed = JSON.parse(text, reviver);
+  bench({
+    name: 'jsonparse/' + name + '/parse-only', unit: 'parse', run: parse,
+    expect: function(v) { return v !== null; }
+  });
+  bench({
+    name: 'jsonparse/' + name + '/traversal-only', unit: 'traversal',
+    run: function() { return checksum(parsed); }, expect: expected
+  });
+  bench({
+    name: 'jsonparse/' + name + '/parse-consume', unit: 'parse+traversal',
+    run: function() { return checksum(parse()); }, expect: expected
+  });
+}
+
+addJsonParseRows('int-array-2000', JSON.stringify(intArray(2000)),
+                checksum(intArray(2000)));
+addJsonParseRows('dbl-array-2000', JSON.stringify(dblArray(2000)),
+                checksum(dblArray(2000)));
+addJsonParseRows('repeated-objects-800', JSON.stringify(repeatedObjects(800)),
+                checksum(repeatedObjects(800)));
+addJsonParseRows('small-nested', JSON.stringify(smallNested()),
+                checksum(smallNested()));
+addJsonParseRows('large-flat-300', JSON.stringify(largeFlat(300)),
+                checksum(largeFlat(300)));
+addJsonParseRows('string-heavy-120', JSON.stringify(stringHeavy(120)),
+                checksum(stringHeavy(120)));
+addJsonParseRows('escaped-nonascii', JSON.stringify(escaped()),
+                checksum(escaped()));
+addJsonParseRows('network-payload', JSON.stringify(networkPayload()),
+                checksum(networkPayload()));
+addJsonParseRows(
+    'network-reviver', JSON.stringify(networkPayload()),
+    checksum(JSON.parse(JSON.stringify(networkPayload()), function(k, v) {
+      return v;
+    })), function(k, v) { return v; });
