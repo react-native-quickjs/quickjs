@@ -45,7 +45,9 @@ class IntlTest : public ::testing::Test {
   std::unique_ptr<jsi::Runtime> rt = makeRuntime();
 
   static std::unique_ptr<jsi::Runtime> makeRuntime() {
-    auto runtime = qjs::makeQuickJSRuntime();
+    qjs::QuickJSRuntimeConfig config;
+    config.stackSize = 4 * 1024 * 1024;
+    auto runtime = qjs::makeQuickJSRuntime(std::move(config));
     intl_install(*runtime);
     return runtime;
   }

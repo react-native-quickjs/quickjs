@@ -20,7 +20,10 @@ namespace facebook::jsi {
 
 std::vector<RuntimeFactory> runtimeGenerators() {
   return {[]() -> std::shared_ptr<Runtime> {
-    return std::shared_ptr<Runtime>(qjs::makeQuickJSRuntime().release());
+    qjs::QuickJSRuntimeConfig config;
+    config.stackSize = 4 * 1024 * 1024;
+    return std::shared_ptr<Runtime>(
+        qjs::makeQuickJSRuntime(std::move(config)).release());
   }};
 }
 
