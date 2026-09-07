@@ -44,7 +44,7 @@
     },
     {
       "name": "0011-lazy-json-markers.patch",
-      "sha256": "0cf01b446dbf52ae89d213f8aa268f138c450e06eb6e5e52abdc87d83a9e0135"
+      "sha256": "086be47e01fda03b90c96c5933d24d6e21315b942e83b3e1c181d8a929fd0c2e"
     },
     {
       "name": "9999-bc-version-bump.patch",
