@@ -163,6 +163,14 @@ int main() {
   check(
       eval(
           rt,
+          "var frozen=Object.freeze(JSON.parse('{\\\"a\\\":1,"
+          "\\\"pad\\\":\\\"'+'x'.repeat(4096)+'\\\"}'));"
+          "frozen.a===1 && Object.isFrozen(frozen)")
+          .getBool(),
+      "lazy JSON frozen materialization");
+  check(
+      eval(
+          rt,
           "var duplicate = JSON.parse('{\\\"a\\\":1,\\\"a\\\":2,"
           "\\\"\\\\u00e9\\\":\\\"v\\\"}');"
           "duplicate.a === 2 && duplicate['é'] === 'v'")

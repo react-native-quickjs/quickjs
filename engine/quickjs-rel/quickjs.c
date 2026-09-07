@@ -52441,6 +52441,48 @@ static int js_lazy_set_document(JSContext *ctx, JSValueConst holder,
                                   js_dup(backing), JS_PROP_C_W_E);
 }
 
+static int js_lazy_container_has_markers(JSObject *holder)
+{
+    uint32_t i;
+    if (holder->class_id == JS_CLASS_ARRAY && holder->fast_array) {
+        for (i = 0; i < holder->u.array.count; i++) {
+            if (js_lazy_marker_is(holder->u.array.u.values[i]))
+                return 1;
+        }
+        return 0;
+    }
+    {
+        JSShapeProperty *prs = get_shape_prop(holder->shape);
+        for (i = 0; i < (uint32_t)holder->shape->prop_size; i++, prs++) {
+            if (prs->atom == JS_ATOM_NULL ||
+                prs->atom == js_lazy_document_atom ||
+                (prs->flags & JS_PROP_TMASK))
+                continue;
+            if (js_lazy_marker_is(holder->prop[i].u.value))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* Keep the private slot in the shape, but release its document once this
+   container no longer has any deferred values of its own. */
+static void js_lazy_release_document_if_complete(JSContext *ctx,
+                                                 JSObject *holder)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    if (js_lazy_container_has_markers(holder))
+        return;
+    prs = find_own_property(&pr, holder, js_lazy_document_atom);
+    if (prs && pr && !(prs->flags & JS_PROP_TMASK) &&
+        JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT) {
+        JSValue document = pr->u.value;
+        pr->u.value = JS_UNDEFINED;
+        JS_FreeValue(ctx, document);
+    }
+}
+
 static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
                                                 JSONLazyDocument *doc,
                                                 uint32_t node_index,
@@ -52487,6 +52529,7 @@ static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject 
         goto fail;
     JS_FreeValue(ctx, *slot);
     *slot = val;
+    js_lazy_release_document_if_complete(ctx, holder);
     JS_FreeValue(ctx, backing);
     return js_dup(val);
 fail:
