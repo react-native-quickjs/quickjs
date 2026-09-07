@@ -328,7 +328,16 @@ Needs a bytecode version bump
          break;
      case '\r':  /* accept DOS and MAC newline sequences */
          if (p[1] == '\n') {
-@@ -24504,6 +24676,16 @@
+@@ -24445,6 +24617,8 @@
+     case 'Y': case 'Z':
+     case '_':
+     case '$':
++        if (s->json_key_mode)
++            goto def_token;
+         /* identifier : only pure ascii characters are accepted */
+         p++;
+         atom = json_parse_ident(s, &p, c);
+@@ -24504,6 +24678,16 @@
      return -1;
  }
  
@@ -345,7 +354,7 @@ Needs a bytecode version bump
  #ifndef QJS_DISABLE_PARSER
  
  /* only used for ':' and '=>', 'let' or 'function' look-ahead. *pp is
-@@ -51746,7 +51928,7 @@
+@@ -51746,7 +51930,7 @@
              JSONParseRecord *pr1;
              int pr_size;
  
@@ -354,7 +363,7 @@ Needs a bytecode version bump
                  goto fail;
              val = JS_NewObject(ctx);
              if (JS_IsException(val))
-@@ -51757,8 +51939,12 @@
+@@ -51757,8 +51941,12 @@
              }
              if (s->token.val != '}') {
                  for(;;) {
@@ -368,7 +377,7 @@ Needs a bytecode version bump
                          if (prop_name == JS_ATOM_NULL)
                              goto fail;
                      } else {
-@@ -51798,7 +51984,7 @@
+@@ -51798,7 +51986,7 @@
                          json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                          goto fail;
                      }
@@ -377,7 +386,7 @@ Needs a bytecode version bump
                          goto fail;
                  }
              }
-@@ -51813,6 +51999,16 @@
+@@ -51813,6 +52001,16 @@
              JSONParseRecord *pr1;
              int pr_size;
  
@@ -394,7 +403,7 @@ Needs a bytecode version bump
              if (json_next_token(s))
                  goto fail;
              if (!pr) {
-@@ -51851,8 +52047,7 @@
+@@ -51851,8 +52049,7 @@
                          goto fail;
                      }
                  }
@@ -404,7 +413,7 @@ Needs a bytecode version bump
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52085,7 +52280,1052 @@
+@@ -52085,7 +52282,1052 @@
      js_free_prop_enum(ctx, atoms, len);
      JS_FreeValue(ctx, context);
      JS_FreeValue(ctx, val);
@@ -1457,7 +1466,7 @@ Needs a bytecode version bump
  }
  
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
-@@ -52098,6 +53338,18 @@
+@@ -52098,6 +53340,18 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
