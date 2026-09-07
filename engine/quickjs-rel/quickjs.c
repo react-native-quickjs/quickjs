@@ -53096,11 +53096,12 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
     JSONLazyDocument *doc = JS_GetOpaque(document, js_lazy_document_class_id);
     JSONLazyTapeNode *node;
     uint8_t hot_mask;
+    uint32_t instance_number;
     if (!doc || !shape || node_index >= doc->node_count)
         return JS_EXCEPTION;
     node = &doc->nodes[node_index];
-    layout->instance_count++;
-    hot_mask = layout->instance_count >= 32 ? layout->hot_slot_mask : 0;
+    instance_number = layout->instance_count + 1;
+    hot_mask = instance_number >= 32 ? layout->hot_slot_mask : 0;
     if ((size_t)shape->prop_size > SIZE_MAX / sizeof(*props))
         return JS_ThrowInternalError(ctx, "lazy JSON shape is too large");
     props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
@@ -53117,21 +53118,21 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
                 child_index > INT32_MAX)
                 goto fail;
             child = &doc->nodes[child_index];
-        if (hot_mask & (uint8_t)(1U << i)) {
-            props[layout->entries[i].slot].u.value =
-                json_lazy_materialize_tape_value(ctx, doc, child_index,
-                                                 document, NULL);
-            if (JS_IsException(props[layout->entries[i].slot].u.value)) {
-                uint32_t j;
-                for (j = 0; j < shape->prop_size; j++)
-                    JS_FreeValue(ctx, props[j].u.value);
-                js_free(ctx, props);
-                return JS_EXCEPTION;
+            if (hot_mask & (uint8_t)(1U << i)) {
+                props[layout->entries[i].slot].u.value =
+                    json_lazy_materialize_tape_value(ctx, doc, child_index,
+                                                     document, NULL);
+                if (JS_IsException(props[layout->entries[i].slot].u.value)) {
+                    uint32_t j;
+                    for (j = 0; j < shape->prop_size; j++)
+                        JS_FreeValue(ctx, props[j].u.value);
+                    js_free(ctx, props);
+                    return JS_EXCEPTION;
+                }
+            } else {
+                props[layout->entries[i].slot].u.value =
+                    js_lazy_marker_new(child_index);
             }
-        } else {
-            props[layout->entries[i].slot].u.value =
-                js_lazy_marker_new(child_index);
-        }
             child_index = child->next_sibling;
         }
         if (child_index != UINT32_MAX)
@@ -53144,6 +53145,7 @@ static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
         js_free(ctx, props);
         return JS_EXCEPTION;
     }
+    layout->instance_count = instance_number;
     js_free(ctx, props);
     return obj;
 

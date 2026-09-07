@@ -491,18 +491,16 @@ Needs a bytecode version bump
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52085,9 +52331,1055 @@
-     js_free_prop_enum(ctx, atoms, len);
-     JS_FreeValue(ctx, context);
+@@ -52087,7 +52333,1055 @@
      JS_FreeValue(ctx, val);
-+    return JS_EXCEPTION;
-+}
+     return JS_EXCEPTION;
+ }
 +
 +
 +/* ---- Lazy JSON.parse ----
 +   Large documents use a shared validated source and tape for direct materialization.
 +   QJS_JSON_LAZY=0/1 overrides the per-runtime default for testing. */
-+
+
 +#define QJS_JSON_LAZY_DOC_MIN_LEN 4096U
 +
 +typedef enum JSONLazyType {
@@ -652,9 +650,9 @@ Needs a bytecode version bump
 +    return js_dup(val);
 +fail:
 +    JS_FreeValue(ctx, backing);
-     return JS_EXCEPTION;
- }
-
++    return JS_EXCEPTION;
++}
++
 +static void js_lazy_document_finalizer(JSRuntime *rt, JSValueConst val)
 +{
 +    JSONLazyDocument *b = JS_GetOpaque(val, js_lazy_document_class_id);
@@ -1260,11 +1258,12 @@ Needs a bytecode version bump
 +    JSONLazyDocument *doc = JS_GetOpaque(document, js_lazy_document_class_id);
 +    JSONLazyTapeNode *node;
 +    uint8_t hot_mask;
++    uint32_t instance_number;
 +    if (!doc || !shape || node_index >= doc->node_count)
 +        return JS_EXCEPTION;
 +    node = &doc->nodes[node_index];
-+    layout->instance_count++;
-+    hot_mask = layout->instance_count >= 32 ? layout->hot_slot_mask : 0;
++    instance_number = layout->instance_count + 1;
++    hot_mask = instance_number >= 32 ? layout->hot_slot_mask : 0;
 +    if ((size_t)shape->prop_size > SIZE_MAX / sizeof(*props))
 +        return JS_ThrowInternalError(ctx, "lazy JSON shape is too large");
 +    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
@@ -1281,21 +1280,21 @@ Needs a bytecode version bump
 +                child_index > INT32_MAX)
 +                goto fail;
 +            child = &doc->nodes[child_index];
-+        if (hot_mask & (uint8_t)(1U << i)) {
-+            props[layout->entries[i].slot].u.value =
-+                json_lazy_materialize_tape_value(ctx, doc, child_index,
-+                                                 document, NULL);
-+            if (JS_IsException(props[layout->entries[i].slot].u.value)) {
-+                uint32_t j;
-+                for (j = 0; j < shape->prop_size; j++)
-+                    JS_FreeValue(ctx, props[j].u.value);
-+                js_free(ctx, props);
-+                return JS_EXCEPTION;
++            if (hot_mask & (uint8_t)(1U << i)) {
++                props[layout->entries[i].slot].u.value =
++                    json_lazy_materialize_tape_value(ctx, doc, child_index,
++                                                     document, NULL);
++                if (JS_IsException(props[layout->entries[i].slot].u.value)) {
++                    uint32_t j;
++                    for (j = 0; j < shape->prop_size; j++)
++                        JS_FreeValue(ctx, props[j].u.value);
++                    js_free(ctx, props);
++                    return JS_EXCEPTION;
++                }
++            } else {
++                props[layout->entries[i].slot].u.value =
++                    js_lazy_marker_new(child_index);
 +            }
-+        } else {
-+            props[layout->entries[i].slot].u.value =
-+                js_lazy_marker_new(child_index);
-+        }
 +            child_index = child->next_sibling;
 +        }
 +        if (child_index != UINT32_MAX)
@@ -1308,6 +1307,7 @@ Needs a bytecode version bump
 +        js_free(ctx, props);
 +        return JS_EXCEPTION;
 +    }
++    layout->instance_count = instance_number;
 +    js_free(ctx, props);
 +    return obj;
 +
@@ -1547,7 +1547,7 @@ Needs a bytecode version bump
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -52098,6 +53390,19 @@
+@@ -52098,6 +53392,19 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
