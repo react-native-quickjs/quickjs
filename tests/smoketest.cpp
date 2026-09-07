@@ -130,6 +130,23 @@ int main() {
   check(
       eval(rt, "JSON.stringify({a:1})").getString(rt).utf8(rt) == "{\"a\":1}",
       "JSON");
+  check(
+      eval(
+          rt,
+          "var lazy = JSON.parse('{\\\"value\\\":' + ' '.repeat(4090) + "
+          "'12345678901234567890,\\\"pad\\\":\\\"' + 'x'.repeat(32) + "
+          "'\\\"}'); lazy.value === 12345678901234567890")
+          .getBool(),
+      "lazy JSON long integer");
+  check(
+      eval(
+          rt,
+          "var retainedRoot = JSON.parse('{\\\"child\\\":{\\\"value\\\":1},"
+          "\\\"pad\\\":\\\"' + 'x'.repeat(4090) + '\\\"}');"
+          "var retainedChild = retainedRoot.child; retainedRoot = null;"
+          "retainedChild.value === 1")
+          .getBool(),
+      "lazy JSON retained child");
   // toJSON is observable per the specification: it must be looked up on every
   // object, even when the default prototypes have none. A fast path that
   // skips it would silently serialize the wrong value (regression guard).
