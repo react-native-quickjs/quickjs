@@ -512,6 +512,8 @@ typedef struct JSGCObjectHeader JSGCObjectHeader;
 JS_EXTERN JSRuntime *JS_NewRuntime(void);
 /* info lifetime must exceed that of rt */
 JS_EXTERN void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
+/* QJS_JSON_LAZY=0/1 remains available as a process-level test override. */
+JS_EXTERN void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled);
 /* use 0 to disable memory limit */
 JS_EXTERN void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
 JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);

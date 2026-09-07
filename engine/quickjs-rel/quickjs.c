@@ -351,6 +351,7 @@ struct JSRuntime {
     JSMallocState malloc_state;
     JSArenaState arena_state;
     const char *rt_info;
+    int json_lazy_enabled;
 
     int atom_hash_size; /* power of two */
     int atom_count;
@@ -2376,6 +2377,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     ms.malloc_count++;
     ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
     rt->malloc_state = ms;
+    rt->json_lazy_enabled = 1;
     js_arena_init(rt);
     rt->malloc_gc_threshold = 256 * 1024;
 
@@ -2683,6 +2685,12 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
 {
     if (rt)
         rt->rt_info = s;
+}
+
+void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled)
+{
+    if (rt)
+        rt->json_lazy_enabled = enabled;
 }
 
 void JS_FreeRuntime(JSRuntime *rt)
@@ -52279,8 +52287,9 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
 }
 
 
-/* ---- Temporary lazy JSON.parse experiment (QJS_JSON_LAZY=1) ----
-   Lazy JSON uses a shared validated source and tape for direct materialization. */
+/* ---- Lazy JSON.parse ----
+   Large documents use a shared validated source and tape for direct materialization.
+   QJS_JSON_LAZY=0/1 overrides the per-runtime default for testing. */
 
 #define QJS_JSON_LAZY_DOC_MIN_LEN 32768U
 #define QJS_JSON_LAZY_CONTAINER_MIN_LEN 1024U
@@ -52335,7 +52344,6 @@ typedef struct JSONLazyBacking {
 } JSONLazyBacking;
 
 static JSClassID js_lazy_backing_class_id;
-static int js_lazy_json_enabled;
 static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout);
 
 static int js_lazy_marker_is(JSValueConst v)
@@ -52458,12 +52466,11 @@ static void js_lazy_backing_mark(JSRuntime *rt, JSValueConst val,
 
 static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
 {
-    if (!js_lazy_json_enabled) {
-        const char *e = getenv("QJS_JSON_LAZY");
-        if (e && *e == '1')
-            js_lazy_json_enabled = 1;
-    }
-    if (!js_lazy_json_enabled)
+    const char *e = getenv("QJS_JSON_LAZY");
+    int enabled = ctx->rt->json_lazy_enabled;
+    if (e && (*e == '0' || *e == '1'))
+        enabled = *e == '1';
+    if (!enabled)
         return 0;
     if (len < QJS_JSON_LAZY_DOC_MIN_LEN)
         return 0;
