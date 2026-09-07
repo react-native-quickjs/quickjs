@@ -52774,12 +52774,12 @@ static JSValue json_lazy_materialize_number(JSContext *ctx,
             return js_int32((int32_t)(0 - (int64_t)ival));
         return js_float64(neg ? -(double)ival : (double)ival);
     }
-    /* fallback through full parser for decimals/exponents/edge cases */
+    /* The tape has already validated the complete range. Reuse QuickJS's
+       exact decimal converter instead of reparsing a temporary substring. */
     {
-        JSValue v = js_lazy_eager_parse_range(ctx, doc->source, start,
-                                              end - start);
-        (void)p0;
-        return v;
+        JSATODTempMem tmp_mem;
+        double d = js_atod((const char *)p0, NULL, 10, 0, &tmp_mem);
+        return js_float64(d);
     }
 }
 
