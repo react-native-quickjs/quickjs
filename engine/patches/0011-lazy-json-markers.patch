@@ -17,17 +17,15 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -45,6 +45,9 @@
+@@ -45,6 +45,7 @@
  #include "cutils.h"
  #include "list.h"
  #include "quickjs.h"
 +
-+extern int qjs_fast_strtod(const char *first, const char *last,
-+                           double *out);
  #include "libregexp.h"
  #include "dtoa.h"
  
-@@ -348,6 +351,7 @@
+@@ -348,6 +349,7 @@
      JSMallocState malloc_state;
      JSArenaState arena_state;
      const char *rt_info;
@@ -35,7 +33,7 @@ Needs a bytecode version bump
  
      int atom_hash_size; /* power of two */
      int atom_count;
-@@ -2373,6 +2377,7 @@
+@@ -2373,6 +2375,7 @@
      ms.malloc_count++;
      ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
      rt->malloc_state = ms;
@@ -43,7 +41,7 @@ Needs a bytecode version bump
      js_arena_init(rt);
      rt->malloc_gc_threshold = 256 * 1024;
  
-@@ -2680,6 +2685,12 @@
+@@ -2680,6 +2683,12 @@
  {
      if (rt)
          rt->rt_info = s;
@@ -56,7 +54,7 @@ Needs a bytecode version bump
  }
  
  void JS_FreeRuntime(JSRuntime *rt)
-@@ -6875,6 +6886,28 @@
+@@ -6875,6 +6884,28 @@
      for (i = 0; i < count; i++)
          JS_FreeValue(ctx, values[i]);
      return JS_EXCEPTION;
@@ -85,7 +83,7 @@ Needs a bytecode version bump
  }
  
  JSValue JS_NewObject(JSContext *ctx)
-@@ -9602,6 +9635,9 @@
+@@ -9602,6 +9633,9 @@
      return 0;
  }
  
@@ -95,7 +93,7 @@ Needs a bytecode version bump
  static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                        JSAtom prop, JSValueConst this_obj,
                                        bool throw_ref_error)
-@@ -9687,6 +9723,8 @@
+@@ -9687,6 +9721,8 @@
                      continue;
                  }
              } else {
@@ -104,7 +102,7 @@ Needs a bytecode version bump
                  return js_dup(pr->u.value);
              }
          }
-@@ -10246,7 +10284,13 @@
+@@ -10246,7 +10282,13 @@
                      goto retry;
                  }
              } else {
@@ -119,7 +117,7 @@ Needs a bytecode version bump
              }
          } else {
              if (pflags) {
-@@ -10452,6 +10496,9 @@
+@@ -10452,6 +10494,9 @@
      return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
  }
  
@@ -129,7 +127,7 @@ Needs a bytecode version bump
  static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
                                        uint32_t idx, JSValue *pval)
  {
-@@ -10459,7 +10506,10 @@
+@@ -10459,7 +10504,10 @@
      case JS_CLASS_ARRAY:
      case JS_CLASS_ARGUMENTS:
          if (unlikely(idx >= p->u.array.count)) return false;
@@ -141,7 +139,7 @@ Needs a bytecode version bump
          return true;
      case JS_CLASS_MAPPED_ARGUMENTS:
          if (unlikely(idx >= p->u.array.count)) return false;
-@@ -20156,7 +20206,11 @@
+@@ -20156,7 +20204,11 @@
                              /* found */
                              if (unlikely(prs->flags & JS_PROP_TMASK))
                                  goto get_field_slow_path;
@@ -154,7 +152,7 @@ Needs a bytecode version bump
                              break;
                          }
                          if (unlikely(p->is_exotic)) {
-@@ -20460,7 +20514,10 @@
+@@ -20460,7 +20512,10 @@
                      uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                      if (likely(p->class_id == JS_CLASS_ARRAY &&
                                 idx < p->u.array.count)) {
@@ -166,7 +164,7 @@ Needs a bytecode version bump
                          JS_FreeValue(ctx, sp[-2]);
                          sp[-2] = val;
                          sp--;
-@@ -20494,7 +20551,10 @@
+@@ -20494,7 +20549,10 @@
                      uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                      if (likely(p->class_id == JS_CLASS_ARRAY &&
                                 idx < p->u.array.count)) {
@@ -178,7 +176,7 @@ Needs a bytecode version bump
                          BREAK;
                      }
                      if (js_get_fast_array_element(ctx, p, idx, &val)) {
-@@ -22994,6 +23054,7 @@
+@@ -22994,6 +23052,7 @@
      const uint8_t *line_start; /* first character of the current line */
      const uint8_t *eol;  // most recently seen end-of-line character
      const uint8_t *mark; // first token character, invariant: eol < mark
@@ -186,7 +184,7 @@ Needs a bytecode version bump
  
      /* current function code */
      JSFunctionDef *cur_func;
-@@ -24250,6 +24311,30 @@
+@@ -24250,6 +24309,30 @@
      return -1;
  }
  
@@ -217,14 +215,13 @@ Needs a bytecode version bump
  static int json_parse_number(JSParseState *s, const uint8_t **pp)
  {
      const uint8_t *p = *pp;
-@@ -24312,12 +24397,98 @@
+@@ -24312,12 +24395,97 @@
              s->token.u.num.val = js_float64(neg ? -d : d);
          }
      } else {
 -        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
 +        double d;
-+        if (!qjs_fast_strtod((const char *)p_start, (const char *)p, &d))
-+            d = strtod((const char *)p_start, NULL);
++        d = strtod((const char *)p_start, NULL);
 +        s->token.u.num.val = js_float64(d);
      }
      *pp = p;
@@ -317,7 +314,7 @@ Needs a bytecode version bump
  /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
  static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
  {
-@@ -24403,8 +24574,12 @@
+@@ -24403,8 +24571,12 @@
          goto def_token;
      case '\"':
          p++;
@@ -331,7 +328,7 @@ Needs a bytecode version bump
          break;
      case '\r':  /* accept DOS and MAC newline sequences */
          if (p[1] == '\n') {
-@@ -24504,6 +24679,16 @@
+@@ -24504,6 +24676,16 @@
      return -1;
  }
  
@@ -348,7 +345,7 @@ Needs a bytecode version bump
  #ifndef QJS_DISABLE_PARSER
  
  /* only used for ':' and '=>', 'let' or 'function' look-ahead. *pp is
-@@ -51746,7 +51931,7 @@
+@@ -51746,7 +51928,7 @@
              JSONParseRecord *pr1;
              int pr_size;
  
@@ -357,7 +354,7 @@ Needs a bytecode version bump
                  goto fail;
              val = JS_NewObject(ctx);
              if (JS_IsException(val))
-@@ -51757,8 +51942,12 @@
+@@ -51757,8 +51939,12 @@
              }
              if (s->token.val != '}') {
                  for(;;) {
@@ -371,7 +368,7 @@ Needs a bytecode version bump
                          if (prop_name == JS_ATOM_NULL)
                              goto fail;
                      } else {
-@@ -51798,7 +51987,7 @@
+@@ -51798,7 +51984,7 @@
                          json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                          goto fail;
                      }
@@ -380,7 +377,7 @@ Needs a bytecode version bump
                          goto fail;
                  }
              }
-@@ -51813,6 +52002,16 @@
+@@ -51813,6 +51999,16 @@
              JSONParseRecord *pr1;
              int pr_size;
  
@@ -397,7 +394,7 @@ Needs a bytecode version bump
              if (json_next_token(s))
                  goto fail;
              if (!pr) {
-@@ -51851,8 +52050,7 @@
+@@ -51851,8 +52047,7 @@
                          goto fail;
                      }
                  }
@@ -407,10 +404,13 @@ Needs a bytecode version bump
                  if (JS_IsException(val))
                      goto fail;
                  if (json_next_token(s))
-@@ -52088,6 +52286,1051 @@
-     return JS_EXCEPTION;
- }
- 
+@@ -52085,7 +52280,1052 @@
+     js_free_prop_enum(ctx, atoms, len);
+     JS_FreeValue(ctx, context);
+     JS_FreeValue(ctx, val);
++    return JS_EXCEPTION;
++}
++
 +
 +/* ---- Lazy JSON.parse ----
 +   Large documents use a shared validated source and tape for direct materialization.
@@ -1208,7 +1208,7 @@ Needs a bytecode version bump
 +    for (i = 0; i < shape->prop_size; i++)
 +        JS_FreeValue(ctx, props[i].u.value);
 +    js_free(ctx, props);
-+    return JS_EXCEPTION;
+     return JS_EXCEPTION;
 +}
 +
 +static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyBacking *doc,
@@ -1454,12 +1454,10 @@ Needs a bytecode version bump
 +    /* The document is retained by the root's private property. */
 +    JS_FreeValue(ctx, document);
 +    return v;
-+}
-+
+ }
+ 
  static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
- {
-@@ -52098,6 +53341,18 @@
+@@ -52098,6 +53338,18 @@
      str = JS_ToCStringLen(ctx, &len, argv[0]);
      if (!str)
          return JS_EXCEPTION;
@@ -1508,30 +1506,3 @@ Needs a bytecode version bump
  /* use 0 to disable memory limit */
  JS_EXTERN void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
  JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -276,6 +276,16 @@
-     quickjs.c
- )
- 
-+# The JSON number fast path is declared in quickjs.c and implemented by the
-+# vendored C++ converter in the parent project.
-+set(QJS_FAST_FLOAT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third-party/fast_float")
-+set(QJS_FAST_FLOAT_SOURCE "${QJS_FAST_FLOAT_DIR}/qjs_fast_double.cpp")
-+if(NOT EXISTS "${QJS_FAST_FLOAT_SOURCE}")
-+    message(FATAL_ERROR "missing vendored fast_float source: ${QJS_FAST_FLOAT_SOURCE}")
-+endif()
-+enable_language(CXX)
-+list(APPEND qjs_sources "${QJS_FAST_FLOAT_SOURCE}")
-+
- if(QJS_BUILD_LIBC)
-     list(APPEND qjs_sources quickjs-libc.c)
-     # The definition must be added to the entire project.
-@@ -307,6 +317,7 @@
-     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
- )
-+target_include_directories(qjs PRIVATE "${QJS_FAST_FLOAT_DIR}")
- target_link_libraries(qjs PUBLIC ${qjs_libs})
- 
- # Pass a compiler definition so that Windows gets its declspec's right.
