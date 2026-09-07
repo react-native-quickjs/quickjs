@@ -52288,7 +52288,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
    Large documents use a shared validated source and tape for direct materialization.
    QJS_JSON_LAZY=0/1 overrides the per-runtime default for testing. */
 
-#define QJS_JSON_LAZY_DOC_MIN_LEN 32768U
+#define QJS_JSON_LAZY_DOC_MIN_LEN 4096U
 #define QJS_JSON_LAZY_CONTAINER_MIN_LEN 1024U
 #define QJS_JSON_LAZY_CONTAINER_MIN_CHILDREN 8
 
