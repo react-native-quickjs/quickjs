@@ -122,7 +122,20 @@ function allRows(suites) {
     if (s.kind === 'workload') {
       const text = readFileSync(join(WORKLOADS, s.file), 'utf8');
       for (const m of text.matchAll(/bench\(\{[\s\S]{0,120}?name:\s*['"]([^'"]+)['"]/g))
-        out.push({ id: m[1], suite: s.name, name: m[1] });
+        if (!m[1].endsWith('/')) out.push({ id: m[1], suite: s.name, name: m[1] });
+      if (s.name === 'jsonparse' && text.includes('addJsonParseRows(')) {
+        const names = [
+          'int-array-2000', 'dbl-array-2000', 'repeated-objects-800',
+          'small-nested', 'large-flat-300', 'string-heavy-120',
+          'escaped-nonascii', 'network-payload', 'network-reviver'
+        ];
+        const modes = ['parse-only', 'traversal-only', 'parse-consume'];
+        for (const name of names)
+          for (const mode of modes) {
+            const id = `jsonparse/${name}/${mode}`;
+            out.push({ id, suite: s.name, name: id });
+          }
+      }
     } else if (s.kind === 'octane') {
       if (!existsSync(join(OCTANE, 'corpus', 'MANIFEST.json'))) return out;
       for (const f of readFileSync(join(OCTANE, 'corpus', 'MANIFEST.json'), 'utf8').matchAll(/"row":\s*"([^"]+)"/g))
