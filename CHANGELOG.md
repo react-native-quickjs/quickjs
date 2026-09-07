@@ -11,22 +11,26 @@ and this project adheres to [Semantic Versioning][semver].
 - Update the embedded [quickjs-ng][ng] engine to v0.16.2.
 
 ### Changed
-- Faster `JSON.parse` and `JSON.stringify` on mobile-real payloads — integer
-  arrays, plain ASCII strings and small nested objects (new engine patch
-  `0008`).
-- Faster `JSON.stringify`: object keys enumerate as atoms, keys and strings
-  quote straight into the output buffer, and floats/booleans/null format
-  directly (new engine patch `0009`).
-- Lazy `JSON.parse` is available for documents at least 4 KiB. It uses
-  a shared source document, structural tape, direct tape-node markers and
-  repeated-layout materialization. Large integer-only arrays remain on the
-  optimized eager numeric-array path. Reviver calls remain eager, and
-  embedders can opt out per runtime with `JS_SetJSONLazyEnabled()`. Application
-  builds now default lazy parsing off and can opt in from their existing
-  `package.json` with `react-native-quickjs.lazyJson: true`.
+- Patch `0008`: faster eager `JSON.parse` through direct ASCII key-to-atom
+  parsing, optimized numeric arrays, integer-aware number parsing, and owned
+  dense-array construction.
+- Patch `0009`: faster `JSON.stringify` through direct atom enumeration,
+  efficient key/string quoting, and direct primitive formatting.
+- Patch `0010`: faster JSON tokenization with a dedicated common-punctuation
+  fast path for brackets, braces, commas and colons.
+- Patch `0011`: opt-in lazy `JSON.parse` for documents at least 4 KiB, using a
+  shared source document, structural tape, direct tape-node markers and
+  repeated-layout materialization. Application builds remain eager by default;
+  opt in from the existing `package.json` with
+  `react-native-quickjs.lazyJson: true`. Reviver calls remain eager, and
+  embedders can opt out per runtime with `JS_SetJSONLazyEnabled()`.
+- Across the representative parse-only benchmark suite, the eager changes
+  average about **1.5× faster** (geometric mean), while the opt-in lazy path
+  averages about **2.2× faster** on the same inputs where lazy parsing is
+  selected. Results vary by payload and do not include traversal time.
 - JSON benchmark reporting now separates checksum-free parse-only timing from
-  traversal and parse-plus-consume timing. The current lazy path reduces the
-  repeated-object parse-only workload from about 199 µs eager to about 44 µs.
+  traversal and parse-plus-consume timing. The lazy path reduces the
+  repeated-object parse-only workload from about 199 µs eager to about 43 µs.
 
 ## [v1.0.0-alpha.2] — 2026-09-05
 
