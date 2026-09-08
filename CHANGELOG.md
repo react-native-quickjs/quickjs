@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning][semver].
   invalidation, runtime destruction, width-4 ASan/OOM/differential paths, and
   malformed serialized bytecode. Release CTest passed 15/15; host timings are
   smoke results, with device performance based on the selected 1095 evidence.
+- Patch `0016` paired host Octane smoke results improved the geomean by 7.3%
+  over the IC-disabled baseline across three runs. The largest gains were
+  DeltaBlue (+34.1%), Richards (+24.3%), Raytrace (+19.7%), and Box2D
+  (+14.5%); Crypto, RegExp, Splay, Navier-Stokes, PDF.js, and Mandreel were
+  within neutral-to-small-regression noise. The full reference data is in
+  `tools/benchmark/octane/octane-results.json`.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is

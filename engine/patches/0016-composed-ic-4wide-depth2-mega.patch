@@ -86,7 +86,7 @@ Needs a bytecode version bump
      void *user_opaque;
      void *libc_opaque;
      JSRuntimeFinalizerState *finalizers;
-@@ -946,6 +965,20 @@
+@@ -946,6 +965,21 @@
      uint32_t  flags;    /* kind/state bits + epoch + saturating miss counter */
  } JSICEntry;
 
@@ -99,6 +99,7 @@ Needs a bytecode version bump
 +struct JSMegaEntry {
 +    JSShape *shape;
 +    JSShape *mid_shape;
++    JSShape *holder_shape;
 +    JSAtom atom;
 +    uint32_t off_depth;
 +    uint32_t shape_epoch;
@@ -151,7 +152,7 @@ Needs a bytecode version bump
              return;
          }
          ic[0].flags = (ic[0].flags & ~JS_IC_MISS_MASK) | miss;
-@@ -6502,8 +6544,141 @@
+@@ -6502,8 +6544,137 @@
          ic[k].flags |= JS_IC_FLAG_PROTO;
      else
          ic[k].flags &= ~JS_IC_FLAG_PROTO;
@@ -217,8 +218,6 @@ Needs a bytecode version bump
 +{
 +    JSMegaEntry *e;
 +    JSObject *holder;
-+    JSShape *hsh;
-+    JSShapeProperty *hpr;
 +    uint32_t depth, offset;
 +    if (!rt->mega_cache)
 +        return 0;
@@ -244,11 +243,7 @@ Needs a bytecode version bump
 +    }
 +    if (depth > 2)
 +        return 0;
-+    hsh = holder->shape;
-+    if (offset >= (uint32_t)hsh->prop_count)
-+        return 0;
-+    hpr = &get_shape_prop(hsh)[offset];
-+    if (hpr->atom != atom || (hpr->flags & JS_PROP_TMASK))
++    if (holder->shape != e->holder_shape)
 +        return 0;
 +    *pholder = holder;
 +    *poffset = offset;
@@ -257,7 +252,8 @@ Needs a bytecode version bump
 +}
 +
 +static void js_megacache_fill(JSRuntime *rt, JSShape *recv_shape, JSAtom atom,
-+                              uint32_t offset, uint32_t depth, JSShape *mid)
++                              uint32_t offset, uint32_t depth, JSShape *mid,
++                              JSShape *holder_shape)
 +{
 +    JSMegaEntry *e;
 +    if (!rt->mega_cache) {
@@ -269,6 +265,7 @@ Needs a bytecode version bump
 +    e = &rt->mega_cache[js_mega_slot(recv_shape, atom)];
 +    e->shape = recv_shape;
 +    e->mid_shape = mid;
++    e->holder_shape = holder_shape;
 +    e->atom = atom;
 +    e->off_depth = (offset << 2) | depth;
 +    e->shape_epoch = rt->shape_free_epoch;
@@ -354,7 +351,7 @@ Needs a bytecode version bump
                              for(;;) {
                                  prs = find_own_property(&pr, p, atom);
                                  if (prs) {
-@@ -20099,13 +20295,28 @@
+@@ -20099,13 +20295,29 @@
                                      else if (p == recv->shape->proto)
                                          ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
                                                         (uint32_t)(pr - p->prop), true);
@@ -369,7 +366,8 @@ Needs a bytecode version bump
 +                                        if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
 +                                            js_megacache_fill(ctx->rt, recv->shape, atom,
 +                                                              (uint32_t)(pr - p->prop), ic_depth,
-+                                                              ic_depth == 2 ? recv->shape->proto->shape : NULL);
++                                                              ic_depth == 2 ? recv->shape->proto->shape : NULL,
++                                                              p->shape);
 +                                    }
  #endif
 +#endif
@@ -437,7 +435,7 @@ Needs a bytecode version bump
                          for(;;) {
                              prs = find_own_property(&pr, p, atom);
                              if (prs) {
-@@ -20946,13 +21180,28 @@
+@@ -20946,13 +21180,29 @@
                                  else if (p == recv->shape->proto)
                                      ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
                                                     (uint32_t)(pr - p->prop), true);
@@ -452,7 +450,8 @@ Needs a bytecode version bump
 +                                    if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
 +                                        js_megacache_fill(ctx->rt, recv->shape, atom,
 +                                                          (uint32_t)(pr - p->prop), ic_depth,
-+                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL);
++                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL,
++                                                          p->shape);
 +                                }
  #endif
 +#endif
@@ -518,7 +517,7 @@ Needs a bytecode version bump
                          for(;;) {
                              prs = find_own_property(&pr, p, atom);
                              if (prs) {
-@@ -21049,13 +21319,28 @@
+@@ -21049,13 +21319,29 @@
                                  else if (p == recv->shape->proto)
                                      ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
                                                     (uint32_t)(pr - p->prop), true);
@@ -533,7 +532,8 @@ Needs a bytecode version bump
 +                                    if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
 +                                        js_megacache_fill(ctx->rt, recv->shape, atom,
 +                                                          (uint32_t)(pr - p->prop), ic_depth,
-+                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL);
++                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL,
++                                                          p->shape);
 +                                }
  #endif
 +#endif

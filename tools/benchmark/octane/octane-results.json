@@ -1,0 +1,25 @@
+{
+  "commit": "2549b53fe3b5b9725e5888ccc9ce01e5f37f00c5",
+  "runs": 3,
+  "builds": {
+    "baseline": { "flags": ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_FLAGS=-DJS_ENABLE_IC=0"] },
+    "ic": { "flags": ["-DCMAKE_BUILD_TYPE=Release"], "effective_defines": { "JS_ENABLE_IC": 1, "JS_IC_ENTRIES": 4, "JS_MEGA_DISABLE": 0, "QJS_ICSTAT": false } }
+  },
+  "options": ["--no-mem"],
+  "results": [
+    { "benchmark": "richards", "baseline": [1582, 1629, 1619], "ic": [2051, 2010, 2012], "baseline_median": 1619, "ic_median": 2012, "change_percent": 24.3 },
+    { "benchmark": "deltablue", "baseline": [1585, 1579, 1590], "ic": [2131, 2100, 2125], "baseline_median": 1585, "ic_median": 2125, "change_percent": 34.1 },
+    { "benchmark": "crypto", "baseline": [1978, 1940, 1968], "ic": [1951, 1963, 1971], "baseline_median": 1968, "ic_median": 1963, "change_percent": -0.3 },
+    { "benchmark": "raytrace", "baseline": [3499, 3496, 3482], "ic": [4224, 4156, 4184], "baseline_median": 3496, "ic_median": 4184, "change_percent": 19.7 },
+    { "benchmark": "earleyboyer", "baseline": [4712, 4681, 4723], "ic": [5217, 5142, 5192], "baseline_median": 4712, "ic_median": 5192, "change_percent": 10.2 },
+    { "benchmark": "regexp", "baseline": [826, 825, 824], "ic": [827, 822, 819], "baseline_median": 825, "ic_median": 822, "change_percent": -0.4 },
+    { "benchmark": "splay", "baseline": [13291, 13416, 13322], "ic": [13331, 13418, 13416], "baseline_median": 13322, "ic_median": 13416, "change_percent": 0.7 },
+    { "benchmark": "navierstokes", "baseline": [4102, 4122, 4114], "ic": [4050, 4058, 4046], "baseline_median": 4114, "ic_median": 4050, "change_percent": -1.6 },
+    { "benchmark": "pdfjs", "baseline": [7656, 7627, 7620], "ic": [7397, 7404, 7390], "baseline_median": 7627, "ic_median": 7397, "change_percent": -3.0 },
+    { "benchmark": "mandreel", "baseline": [4202, 4190, 4097], "ic": [4038, 4093, 4113], "baseline_median": 4190, "ic_median": 4093, "change_percent": -2.3 },
+    { "benchmark": "gbemu", "baseline": [14159, 14159, 14045], "ic": [14824, 14796, 14937], "baseline_median": 14159, "ic_median": 14824, "change_percent": 4.7 },
+    { "benchmark": "box2d", "baseline": [7561, 7591, 7442], "ic": [8581, 8658, 8675], "baseline_median": 7561, "ic_median": 8658, "change_percent": 14.5 },
+    { "benchmark": "typescript", "baseline": [25481, 25384, 25259], "ic": [25874, 25884, 25748], "baseline_median": 25384, "ic_median": 25874, "change_percent": 1.9 }
+  ],
+  "geomean_change_percent": 7.3
+}
