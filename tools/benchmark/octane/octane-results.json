@@ -1,9 +1,8 @@
 {
-  "commit": "2549b53fe3b5b9725e5888ccc9ce01e5f37f00c5",
   "runs": 3,
   "builds": {
-    "baseline": { "flags": ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_FLAGS=-DJS_ENABLE_IC=0"] },
-    "ic": { "flags": ["-DCMAKE_BUILD_TYPE=Release"], "effective_defines": { "JS_ENABLE_IC": 1, "JS_IC_ENTRIES": 4, "JS_MEGA_DISABLE": 0, "QJS_ICSTAT": false } }
+    "baseline": { "commit": "7882a781a72db4ee386afb7e725a804157a3ef38", "flags": ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_FLAGS=-DJS_ENABLE_IC=0"] },
+    "ic": { "commit": "7882a781a72db4ee386afb7e725a804157a3ef38", "flags": ["-DCMAKE_BUILD_TYPE=Release"], "effective_defines": { "JS_ENABLE_IC": 1, "JS_IC_ENTRIES": 4, "JS_MEGA_DISABLE": 0, "QJS_ICSTAT": false } }
   },
   "options": ["--no-mem"],
   "results": [
