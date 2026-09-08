@@ -263,6 +263,7 @@ typedef struct JSShape JSShape;
 typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 typedef struct JSStringRope JSStringRope;
+typedef struct JSMegaEntry JSMegaEntry;
 
 #define JS_VALUE_GET_OBJ(v) ((JSObject *)JS_VALUE_GET_PTR(v))
 #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
@@ -309,18 +310,22 @@ typedef struct JSMallocState {
 #ifndef JS_ENABLE_IC
 #define JS_ENABLE_IC 1
 #endif
-/* JS_IC_POLY is the original optional two-entry configuration. The shipping
-   default is deliberately monomorphic; wider/adaptive PICs belong to 1095. */
+/* JS_IC_ENTRIES is the per-site width. The shipping default remains
+   monomorphic; 0016 can set it to 4 explicitly at compile time. */
 #ifndef JS_IC_POLY
 #define JS_IC_POLY 0
 #endif
+#ifndef JS_IC_ENTRIES
 #if JS_IC_POLY
 #define JS_IC_ENTRIES 2
 #else
 #define JS_IC_ENTRIES 1
 #endif
+#endif
 /* refills that did not stick before a monomorphic/PIC site goes megamorphic */
+#ifndef JS_IC_MEGAMORPHIC_MISSES
 #define JS_IC_MEGAMORPHIC_MISSES 8
+#endif
 /* Cache flags: high bits are kind/state, a 13-bit watchpoint epoch, and a
    saturating miss counter. This is the unified entry layout expected by 1095. */
 #define JS_IC_FLAG_MEGAMORPHIC 0x80000000u /* site disabled: stop probing/refilling */
@@ -330,6 +335,18 @@ typedef struct JSMallocState {
 #define JS_IC_EPOCH_MASK       0x1fff0000u /* bits 16..28: proto-watchpoint epoch snapshot */
 #define JS_IC_EPOCH_MAX        0x1fffu     /* saturation: stop filling transition entries */
 #define JS_IC_MISS_MASK        0x0000ffffu
+
+#ifdef QJS_ICSTAT
+static uint64_t qjs_ic_hits, qjs_ic_misses, qjs_ic_promotions;
+static uint64_t qjs_mega_probes, qjs_mega_hits, qjs_mega_fills;
+static uint64_t qjs_ic_depth2;
+#define QJS_ICSTAT_INC(x) ((x)++)
+#else
+#define QJS_ICSTAT_INC(x) ((void)0)
+#endif
+#ifdef QJS_ICSTAT
+static void js_icstat_dump(void);
+#endif
 
 /* 8-byte header preceding every user allocation. It carries the allocator
    bookkeeping (block_idx/free_next + block_size_idx) and, the
@@ -470,6 +487,8 @@ struct JSRuntime {
        an is_prototype object. Add-transition IC entries snapshot it and only hit while
        it is unchanged. Saturates at JS_IC_EPOCH_MAX (then transition filling stops). */
     uint32_t ic_watchpoint_epoch;
+    JSMegaEntry *mega_cache;
+    uint32_t shape_free_epoch;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -945,6 +964,20 @@ typedef struct JSICEntry {
     uint32_t  offset;   /* property index in the receiver or direct prototype. */
     uint32_t  flags;    /* kind/state bits + epoch + saturating miss counter */
 } JSICEntry;
+
+#ifndef JS_MEGA_DISABLE
+#define JS_MEGA_DISABLE 0
+#endif
+#ifndef JS_MEGA_BITS
+#define JS_MEGA_BITS 9
+#endif
+struct JSMegaEntry {
+    JSShape *shape;
+    JSShape *mid_shape;
+    JSAtom atom;
+    uint32_t off_depth;
+    uint32_t shape_epoch;
+};
 
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
@@ -2770,6 +2803,9 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
+#ifdef QJS_ICSTAT
+    js_icstat_dump();
+#endif
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -2906,6 +2942,9 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_free_rt(rt, rt->atom_array);
     js_free_rt(rt, rt->atom_hash);
     js_free_rt(rt, rt->shape_hash);
+#if !JS_MEGA_DISABLE
+    js_free_rt(rt, rt->mega_cache);
+#endif
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     if (check_dump_flag(rt, JS_DUMP_LEAKS) && !list_empty(&rt->string_list)) {
         if (rt->rt_info) {
@@ -6366,6 +6405,7 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
     JSShapeProperty *pr;
 
     assert(JS_REF_COUNT(sh) == 0);
+    rt->shape_free_epoch++;
     if (sh->is_hashed)
         js_shape_hash_unlink(rt, sh);
     if (sh->proto != NULL) {
@@ -6465,6 +6505,7 @@ static void ic_read_update(JSRuntime *rt, JSFunctionBytecode *b, uint32_t ic_idx
     JSShape *rsh = recv->shape;
     JSICEntry *ic, *t;
     int k;
+    QJS_ICSTAT_INC(qjs_ic_misses);
 
     t = ic_table_ensure(rt, b);
     if (unlikely(!t))
@@ -6490,6 +6531,7 @@ static void ic_read_update(JSRuntime *rt, JSFunctionBytecode *b, uint32_t ic_idx
             for (k = 0; k < b->ic_entries; k++)
                 ic_entry_reset(rt, &ic[k]);
             ic[0].flags = JS_IC_FLAG_MEGAMORPHIC;
+            QJS_ICSTAT_INC(qjs_ic_promotions);
             return;
         }
         ic[0].flags = (ic[0].flags & ~JS_IC_MISS_MASK) | miss;
@@ -6503,6 +6545,139 @@ static void ic_read_update(JSRuntime *rt, JSFunctionBytecode *b, uint32_t ic_idx
     else
         ic[k].flags &= ~JS_IC_FLAG_PROTO;
 }
+
+static void ic_read_update2(JSRuntime *rt, JSFunctionBytecode *b,
+                            uint32_t ic_idx, JSObject *recv,
+                            JSShape *mid_sh, uint32_t offset)
+{
+    JSICEntry *ic, *t;
+    int k;
+    QJS_ICSTAT_INC(qjs_ic_misses);
+    QJS_ICSTAT_INC(qjs_ic_depth2);
+    t = ic_table_ensure(rt, b);
+    if (unlikely(!t) || !recv->shape->is_hashed || !mid_sh->is_hashed)
+        return;
+    ic = &t[(size_t)ic_idx * b->ic_entries];
+    if (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)
+        return;
+    for (k = 0; k < b->ic_entries; k++) {
+        if (ic[k].shape == NULL)
+            break;
+    }
+    if (k == b->ic_entries) {
+        uint32_t miss = (ic[0].flags & JS_IC_MISS_MASK) + 1;
+        if (miss >= JS_IC_MEGAMORPHIC_MISSES) {
+            for (k = 0; k < b->ic_entries; k++)
+                ic_entry_reset(rt, &ic[k]);
+            ic[0].flags = JS_IC_FLAG_MEGAMORPHIC;
+            QJS_ICSTAT_INC(qjs_ic_promotions);
+            return;
+        }
+        ic[0].flags = (ic[0].flags & ~JS_IC_MISS_MASK) | miss;
+        k = b->ic_entries - 1;
+    }
+    ic_entry_reset(rt, &ic[k]);
+    ic[k].shape = js_dup_shape(recv->shape);
+    ic[k].to_shape = js_dup_shape(mid_sh);
+    ic[k].offset = offset;
+    ic[k].flags = (ic[k].flags & ~JS_IC_FLAG_TRANSITION) |
+                  JS_IC_FLAG_PROTO;
+}
+
+static inline void ic_read_update2_guarded(JSRuntime *rt, JSFunctionBytecode *b,
+                                           JSICEntry *ic, uint32_t ic_idx,
+                                           JSObject *recv, JSShape *mid_sh,
+                                           uint32_t offset)
+{
+    if (ic != NULL && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
+        return;
+    ic_read_update2(rt, b, ic_idx, recv, mid_sh, offset);
+}
+
+#if !JS_MEGA_DISABLE
+static inline uint32_t js_mega_slot(JSShape *shape, JSAtom atom)
+{
+    return (((uintptr_t)shape >> 5) ^ (uint32_t)atom * 2654435761u) &
+           ((1u << JS_MEGA_BITS) - 1);
+}
+
+static int js_megacache_probe(JSRuntime *rt, JSObject *recv, JSAtom atom,
+                              JSObject **pholder, uint32_t *poffset)
+{
+    JSMegaEntry *e;
+    JSObject *holder;
+    JSShape *hsh;
+    JSShapeProperty *hpr;
+    uint32_t depth, offset;
+    if (!rt->mega_cache)
+        return 0;
+    QJS_ICSTAT_INC(qjs_mega_probes);
+    e = &rt->mega_cache[js_mega_slot(recv->shape, atom)];
+    if (e->shape_epoch != rt->shape_free_epoch ||
+        e->shape != recv->shape || e->atom != atom)
+        return 0;
+    offset = e->off_depth >> 2;
+    depth = e->off_depth & 3;
+    holder = recv;
+    if (depth >= 1) {
+        holder = recv->shape->proto;
+        if (!holder)
+            return 0;
+    }
+    if (depth == 2) {
+        if (holder->shape != e->mid_shape)
+            return 0;
+        holder = e->mid_shape->proto;
+        if (!holder)
+            return 0;
+    }
+    if (depth > 2)
+        return 0;
+    hsh = holder->shape;
+    if (offset >= (uint32_t)hsh->prop_count)
+        return 0;
+    hpr = &get_shape_prop(hsh)[offset];
+    if (hpr->atom != atom || (hpr->flags & JS_PROP_TMASK))
+        return 0;
+    *pholder = holder;
+    *poffset = offset;
+    QJS_ICSTAT_INC(qjs_mega_hits);
+    return 1;
+}
+
+static void js_megacache_fill(JSRuntime *rt, JSShape *recv_shape, JSAtom atom,
+                              uint32_t offset, uint32_t depth, JSShape *mid)
+{
+    JSMegaEntry *e;
+    if (!rt->mega_cache) {
+        rt->mega_cache = js_calloc_rt(rt, 1u << JS_MEGA_BITS,
+                                      sizeof(*rt->mega_cache));
+        if (!rt->mega_cache)
+            return;
+    }
+    e = &rt->mega_cache[js_mega_slot(recv_shape, atom)];
+    e->shape = recv_shape;
+    e->mid_shape = mid;
+    e->atom = atom;
+    e->off_depth = (offset << 2) | depth;
+    e->shape_epoch = rt->shape_free_epoch;
+    QJS_ICSTAT_INC(qjs_mega_fills);
+}
+#endif
+
+#ifdef QJS_ICSTAT
+static void js_icstat_dump(void)
+{
+    fprintf(stderr, "[ic] width=%d misses=%llu promotions=%llu "
+                    "mega_probes=%llu mega_hits=%llu mega_fills=%llu depth2=%llu\n",
+            JS_IC_ENTRIES, (unsigned long long)qjs_ic_misses,
+            (unsigned long long)qjs_ic_promotions,
+            (unsigned long long)qjs_mega_probes,
+            (unsigned long long)qjs_mega_hits,
+            (unsigned long long)qjs_mega_fills,
+            (unsigned long long)qjs_ic_depth2);
+}
+#endif
 
 /* Skip the call entirely when the site is already megamorphic.
    A megamorphic site is permanently dead -- ic_read_update's first act is to
@@ -20047,16 +20222,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* NULL until this function's first IC fill */
                         ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
                                          : NULL;
-                        if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
-                            goto get_loc_field_nr_slow;
+                    /* Megamorphic sites are handled by the fallback probe in
+                       the chain-walk block below. */
                         for (k = 0; k < b->ic_entries; k++) {
                             if (!ic)
                                 break;  /* no table yet: nothing is cached */
                             if (ic[k].shape == p->shape &&
                                 !(ic[k].flags & JS_IC_FLAG_TRANSITION)) {
-                                if (ic[k].flags & JS_IC_FLAG_PROTO) {
-                                    JSObject *holder = p->shape->proto;
-                                    JSShape *hsh = holder->shape;
+                            if (ic[k].flags & JS_IC_FLAG_PROTO) {
+                                JSObject *holder = p->shape->proto;
+                                if (ic[k].to_shape) {
+                                    if (!holder || holder->shape != ic[k].to_shape)
+                                        break;
+                                    holder = ic[k].to_shape->proto;
+                                    if (!holder)
+                                        break;
+                                }
+                                JSShape *hsh = holder->shape;
                                     JSShapeProperty *hpr;
                                     if (ic[k].offset >= (uint32_t)hsh->prop_count)
                                         break;
@@ -20075,14 +20257,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
                                         goto get_loc_field_nr_slow;
                                     val = js_dup(p->prop[ic[k].offset].u.value);
-                                }
-                                *sp++ = val;
-                                BREAK;
+                            }
+                            *sp++ = val;
+                            QJS_ICSTAT_INC(qjs_ic_hits);
+                            BREAK;
                             }
                         }
 #endif
                         {
                             JSObject *recv = p;
+                            uint32_t ic_depth = 0;
+#if !JS_MEGA_DISABLE
+                            if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)) {
+                                JSObject *holder;
+                                uint32_t offset;
+                                if (js_megacache_probe(ctx->rt, recv, atom,
+                                                       &holder, &offset) &&
+                                    !js_lazy_marker_is(holder->prop[offset].u.value)) {
+                                    *sp++ = js_dup(holder->prop[offset].u.value);
+                                    BREAK;
+                                }
+                            }
+#endif
                             for(;;) {
                                 prs = find_own_property(&pr, p, atom);
                                 if (prs) {
@@ -20099,6 +20295,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     else if (p == recv->shape->proto)
                                         ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
                                                        (uint32_t)(pr - p->prop), true);
+                                    else if (recv->shape->proto &&
+                                             recv->shape->proto->shape->proto == p)
+                                        ic_read_update2_guarded(ctx->rt, b, ic, ic_idx,
+                                                        recv, recv->shape->proto->shape,
+                                                        (uint32_t)(pr - p->prop));
+#if !JS_MEGA_DISABLE
+                                    if (b->ic_table) {
+                                        JSICEntry *site = &b->ic_table[(size_t)ic_idx * b->ic_entries];
+                                        if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
+                                            js_megacache_fill(ctx->rt, recv->shape, atom,
+                                                              (uint32_t)(pr - p->prop), ic_depth,
+                                                              ic_depth == 2 ? recv->shape->proto->shape : NULL);
+                                    }
+#endif
 #endif
                                     break;
                                 }
@@ -20106,6 +20316,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     obj = JS_MKPTR(JS_TAG_OBJECT, p);
                                     goto get_loc_field_nr_slow;
                                 }
+                                ic_depth++;
                                 p = p->shape->proto;
                                 if (!p) {
                                     val = JS_UNDEFINED;
@@ -20893,8 +21104,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* NULL until this function's first IC fill */
                     ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
                                      : NULL;
-                    if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
-                        goto get_field_ic_slow;
+                    /* Megamorphic sites are handled by the fallback probe in
+                       the chain-walk block below. */
                     for (k = 0; k < b->ic_entries; k++) {
                         if (!ic)
                             break;      /* no table yet: nothing is cached */
@@ -20902,6 +21113,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             !(ic[k].flags & JS_IC_FLAG_TRANSITION)) {
                             if (ic[k].flags & JS_IC_FLAG_PROTO) {
                                 JSObject *holder = p->shape->proto;
+                                if (ic[k].to_shape) {
+                                    if (!holder || holder->shape != ic[k].to_shape)
+                                        break;
+                                    holder = ic[k].to_shape->proto;
+                                    if (!holder)
+                                        break;
+                                }
                                 JSShape *hsh = holder->shape;
                                 JSShapeProperty *hpr;
                                 if (ic[k].offset >= (uint32_t)hsh->prop_count)
@@ -20924,12 +21142,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             }
                             JS_FreeValue(ctx, sp[-1]);
                             sp[-1] = val;
+                            QJS_ICSTAT_INC(qjs_ic_hits);
                             BREAK;
                         }
                     }
 #endif
                     {
                         JSObject *recv = p;
+                        uint32_t ic_depth = 0;
+#if !JS_MEGA_DISABLE
+                        if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)) {
+                            JSObject *holder;
+                            uint32_t offset;
+                            if (js_megacache_probe(ctx->rt, recv, atom,
+                                                   &holder, &offset) &&
+                                !js_lazy_marker_is(holder->prop[offset].u.value)) {
+                                val = js_dup(holder->prop[offset].u.value);
+                                JS_FreeValue(ctx, sp[-1]);
+                                sp[-1] = val;
+                                BREAK;
+                            }
+                        }
+#endif
                         for(;;) {
                             prs = find_own_property(&pr, p, atom);
                             if (prs) {
@@ -20946,6 +21180,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 else if (p == recv->shape->proto)
                                     ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
                                                    (uint32_t)(pr - p->prop), true);
+                                else if (recv->shape->proto &&
+                                         recv->shape->proto->shape->proto == p)
+                                    ic_read_update2_guarded(ctx->rt, b, ic, ic_idx,
+                                                    recv, recv->shape->proto->shape,
+                                                    (uint32_t)(pr - p->prop));
+#if !JS_MEGA_DISABLE
+                                if (b->ic_table) {
+                                    JSICEntry *site = &b->ic_table[(size_t)ic_idx * b->ic_entries];
+                                    if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
+                                        js_megacache_fill(ctx->rt, recv->shape, atom,
+                                                          (uint32_t)(pr - p->prop), ic_depth,
+                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL);
+                                }
+#endif
 #endif
                                 break;
                             }
@@ -20953,6 +21201,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 obj = JS_MKPTR(JS_TAG_OBJECT, p);
                                 goto get_field_ic_slow;
                             }
+                            ic_depth++;
                             p = p->shape->proto;
                             if (!p) {
                                 val = JS_UNDEFINED;
@@ -20997,8 +21246,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* NULL until this function's first IC fill */
                     ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
                                      : NULL;
-                    if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
-                        goto get_field2_ic_slow;
+                    /* Megamorphic sites are handled by the fallback probe in
+                       the chain-walk block below. */
                     for (k = 0; k < b->ic_entries; k++) {
                         if (!ic)
                             break;      /* no table yet: nothing is cached */
@@ -21006,6 +21255,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             !(ic[k].flags & JS_IC_FLAG_TRANSITION)) {
                             if (ic[k].flags & JS_IC_FLAG_PROTO) {
                                 JSObject *holder = p->shape->proto;
+                                if (ic[k].to_shape) {
+                                    if (!holder || holder->shape != ic[k].to_shape)
+                                        break;
+                                    holder = ic[k].to_shape->proto;
+                                    if (!holder)
+                                        break;
+                                }
                                 JSShape *hsh = holder->shape;
                                 JSShapeProperty *hpr;
                                 if (ic[k].offset >= (uint32_t)hsh->prop_count)
@@ -21027,12 +21283,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 val = js_dup(p->prop[ic[k].offset].u.value);
                             }
                             *sp++ = val;
+                            QJS_ICSTAT_INC(qjs_ic_hits);
                             BREAK;
                         }
                     }
 #endif
                     {
                         JSObject *recv = p;
+                        uint32_t ic_depth = 0;
+#if !JS_MEGA_DISABLE
+                        if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)) {
+                            JSObject *holder;
+                            uint32_t offset;
+                            if (js_megacache_probe(ctx->rt, recv, atom,
+                                                   &holder, &offset) &&
+                                !js_lazy_marker_is(holder->prop[offset].u.value)) {
+                                *sp++ = js_dup(holder->prop[offset].u.value);
+                                BREAK;
+                            }
+                        }
+#endif
                         for(;;) {
                             prs = find_own_property(&pr, p, atom);
                             if (prs) {
@@ -21049,6 +21319,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 else if (p == recv->shape->proto)
                                     ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
                                                    (uint32_t)(pr - p->prop), true);
+                                else if (recv->shape->proto &&
+                                         recv->shape->proto->shape->proto == p)
+                                    ic_read_update2_guarded(ctx->rt, b, ic, ic_idx,
+                                                    recv, recv->shape->proto->shape,
+                                                    (uint32_t)(pr - p->prop));
+#if !JS_MEGA_DISABLE
+                                if (b->ic_table) {
+                                    JSICEntry *site = &b->ic_table[(size_t)ic_idx * b->ic_entries];
+                                    if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
+                                        js_megacache_fill(ctx->rt, recv->shape, atom,
+                                                          (uint32_t)(pr - p->prop), ic_depth,
+                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL);
+                                }
+#endif
 #endif
                                 break;
                             }
@@ -21056,6 +21340,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 obj = JS_MKPTR(JS_TAG_OBJECT, p);
                                 goto get_field2_ic_slow;
                             }
+                            ic_depth++;
                             p = p->shape->proto;
                             if (!p) {
                                 val = JS_UNDEFINED;

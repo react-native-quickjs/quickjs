@@ -63,12 +63,16 @@
       "sha256": "24decd2b7639b67644a078289c5b8d3bb207e0d4e00d65b2d0d1b3d908ab56cb"
     },
     {
+      "name": "0016-composed-ic-4wide-depth2-mega.patch",
+      "sha256": "c29ece68bb0b5682ffaddfdaafab687184d163c38e4911630002ed03bb7d2313"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "dac56a621ecb2241827bbb3fc582c5c2a30cb8ae24e192cc057b33b9dbdc20ff"
     }
   ],
   "files": {
-    "quickjs.c": "55a54723dfe3bd5c06f6be4e987839dec4c1ba46f65b7a6c313fa7a1f7ea5c83",
+    "quickjs.c": "1afb722f8bf7b1d3457bc9b7d97fc0433ad65102b712576a9d41245e46386e39",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

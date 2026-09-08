@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning][semver].
 - Patch `0015` hardens serialized-bytecode and IC metadata validation, moves
   prototype-watchpoint invalidation after successful mutations, and preserves
   non-throwing lazy allocation and correct transition OOM unwinding.
+- Patch `0016`: composes explicitly enabled four-entry polymorphic sites,
+  guarded depth-two prototype reads, and a weak direct-mapped megamorphic
+  fallback cache. Width 1 remains the shipping default; the width-4 default
+  change is reserved for a later patch.
+- Patch `0016` validation covers weak fallback shape reuse, prototype mutation
+  invalidation, runtime destruction, width-4 ASan/OOM/differential paths, and
+  malformed serialized bytecode. Release CTest passed 15/15; host timings are
+  smoke results, with device performance based on the selected 1095 evidence.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is
