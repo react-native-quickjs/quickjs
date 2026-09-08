@@ -1,0 +1,77 @@
+Subject: Reclaim one primary opcode slot with a compact escape prefix
+
+The bytecode table is limited to 256 one-byte opcodes. The patch reuses the never-emitted invalid slot as an escape prefix and moves debugger trap variants behind it, freeing one primary slot while preserving debugger behavior and malformed-bytecode rejection. This leaves room for the inline-cache opcode set without changing ordinary property or object-literal execution.
+
+The escape prefix accepts only the two debugger subcodes currently emitted by the compiler; all other subcodes raise an internal bytecode error. The bytecode version bump is provided by 9999.
+
+diff --git a/quickjs.c b/quickjs.c
+index 572444f..d61fd13 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1320,6 +1320,8 @@ typedef enum OPCodeEnum {
+     OP_TEMP_END,
+ } OPCodeEnum;
+
++#define OP_invalid OP_esc1
++
+ static int JS_InitAtoms(JSRuntime *rt);
+ static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
+                                int atom_type);
+@@ -18856,10 +18858,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         JSValue *call_argv;
+
+         SWITCH(pc) {
+-        CASE(OP_debug):
++        CASE(OP_esc1):
+ #if JS_ENABLE_DEBUGGER
+             {
+                 int flags = *pc++;
++                if (unlikely(flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
++                    JS_ThrowInternalError(ctx, "invalid escape subopcode: %d", flags);
++                    goto exception;
++                }
+                 /* Armed, not merely installed: an attached-but-idle debugger
+                    would otherwise pay find_line_num() on every statement. */
+                 if (unlikely(ctx->debug_trace &&
+@@ -21639,7 +21645,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             JS_FreeValue(ctx, sp[-1]);
+             sp[-1] = JS_FALSE;
+             BREAK;
+-        CASE(OP_invalid):
+         DEFAULT:
+             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
+                                   (int)(pc - b->byte_code_buf - 1), opcode);
+@@ -37031,7 +37036,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+                record pc2line, so the debugger can resolve the source location
+                when OP_debug is hit at runtime. */
+             add_pc2line_info(s, bc_out.size, line_num, col_num);
+-            dbuf_putc(&bc_out, OP_debug);
++            dbuf_putc(&bc_out, OP_esc1);
+             dbuf_putc(&bc_out, bc_buf[pos + 1]);   /* flag operand */
+             break;
+
+diff --git a/quickjs-opcode.h b/quickjs-opcode.h
+index e851a12..92fbade 100644
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -63,7 +63,8 @@ FMT(label_u16)
+ #define def(id, size, n_pop, n_push, f) DEF(id, size, n_pop, n_push, f)
+ #endif
+
+-DEF(invalid, 1, 0, 0, none) /* never emitted */
++/* Escape prefix. Subcode 0/1 are the debugger trap variants. */
++DEF(      esc1, 2, 0, 0, u8)
+
+ /* push values */
+ DEF(       push_i32, 5, 0, 1, i32)
+@@ -377,10 +378,6 @@ DEF(        is_null, 1, 1, 1, none)
+ DEF(typeof_is_undefined, 1, 1, 1, none)
+ DEF( typeof_is_function, 1, 1, 1, none)
+
+-/* Debugger trap. The u8 operand carries JS_DEBUG_TRACE_* flags. Defined
+-   unconditionally so opcode numbering never depends on JS_ENABLE_DEBUGGER. */
+-DEF(          debug, 2, 0, 0, u8)
+-
+ #undef DEF
+ #undef def
+ #endif  /* DEF */
