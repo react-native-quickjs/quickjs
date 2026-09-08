@@ -27,28 +27,51 @@ jobs:
     outputs:
       stale: ${{ steps.compare.outputs.stale }}
       version: ${{ steps.compare.outputs.version }}
+      patch_changed: ${{ steps.compare.outputs.patch_changed }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: compare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_SHA: ${{ github.sha }}
         run: |
-          node -e "
+          node <<'NODE'
             const fs = require('fs');
+            const { spawnSync } = require('child_process');
             const engine = fs.readFileSync('engine/quickjs-rel/quickjs.c', 'utf8');
             const version = Number(/^#define BC_VERSION (\d+)/m.exec(engine)[1]);
             const path = 'bin/qjsc/manifest.json';
             const built = fs.existsSync(path)
               ? JSON.parse(fs.readFileSync(path, 'utf8')).bcVersion
               : null;
-            console.log('version=' + version);
-            console.log('stale=' + (built !== version));
-            console.error(\`engine BC_VERSION \${version}, compilers built for \${built}\`);
-          " >> "$GITHUB_OUTPUT"
+            let patchChanged = process.env.EVENT_NAME === 'workflow_dispatch';
+            if (!patchChanged) {
+              const before = process.env.EVENT_BEFORE;
+              const sha = process.env.EVENT_SHA;
+              const range = before && !/^0+$/.test(before)
+                ? `${before}..${sha}`
+                : `${sha}^..${sha}`;
+              patchChanged = spawnSync(
+                'git',
+                ['diff', '--quiet', range, '--', 'engine/patches/9999-bc-version-bump.patch']
+              ).status !== 0;
+            }
+            const stale = built !== version;
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              `version=${version}\nstale=${stale || patchChanged}\npatch_changed=${patchChanged}\n`);
+            console.error(
+              `engine BC_VERSION ${version}, compilers built for ${built}; ` +
+              `9999 patch changed: ${patchChanged}`);
+          NODE
 
   build:
     needs: check
     # A manual run rebuilds regardless: the reason to reach for it is a
     # compiler that is wrong for a reason BC_VERSION did not capture.
-    if: needs.check.outputs.stale == 'true' || github.event_name == 'workflow_dispatch'
+    if: needs.check.outputs.stale == 'true'
     strategy:
       fail-fast: false
       matrix:

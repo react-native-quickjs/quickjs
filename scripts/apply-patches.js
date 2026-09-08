@@ -43,7 +43,7 @@ const BC_PATCH = '9999-bc-version-bump.patch';
    setting. With it set to `fix` the engine ends up byte-different from the same
    patches applied anywhere else, and the committed projection then matches only
    the machine that generated it. */
-const WHITESPACE = '--whitespace=nowarn';
+const APPLY_FLAGS = ['--whitespace=nowarn', '--unidiff-zero'];
 
 const mode = process.argv.includes('--check')
   ? 'check'
@@ -124,7 +124,7 @@ function buildExpected(patches, files) {
   }
 
   for (const patch of patches) {
-    const result = spawnSync('git', ['apply', WHITESPACE, path.join(patchDir, patch)], {
+    const result = spawnSync('git', ['apply', ...APPLY_FLAGS, path.join(patchDir, patch)], {
       cwd: dir,
       encoding: 'utf8',
     });
@@ -251,7 +251,7 @@ if (mode !== 'reverse') {
 /* --reverse needs no scratch tree: it just unwinds the series in place. */
 if (mode === 'reverse') {
   for (const patch of [...patches].reverse()) {
-    const result = git(['apply', '--reverse', WHITESPACE, path.join(patchDir, patch)]);
+    const result = git(['apply', '--reverse', ...APPLY_FLAGS, path.join(patchDir, patch)]);
     if (result.status !== 0) fail(`could not reverse ${patch}\n${result.stderr}`);
   }
   console.log(`[apply-patches] reversed ${patches.length} patch(es)`);
@@ -304,7 +304,7 @@ if (!isPristine(files)) {
 }
 
 for (const patch of patches) {
-  const result = git(['apply', WHITESPACE, path.join(patchDir, patch)]);
+  const result = git(['apply', ...APPLY_FLAGS, path.join(patchDir, patch)]);
   if (result.status !== 0) fail(`could not apply ${patch}\n${result.stderr}`);
 }
 console.log(`[apply-patches] applied ${patches.length} patch(es)`);
