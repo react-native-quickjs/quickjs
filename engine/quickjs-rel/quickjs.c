@@ -20267,7 +20267,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         {
                             JSObject *recv = p;
                             uint32_t ic_depth = 0;
-#if !JS_MEGA_DISABLE
+#if JS_ENABLE_IC && !JS_MEGA_DISABLE
                             if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)) {
                                 JSObject *holder;
                                 uint32_t offset;
@@ -21150,7 +21150,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     {
                         JSObject *recv = p;
                         uint32_t ic_depth = 0;
-#if !JS_MEGA_DISABLE
+#if JS_ENABLE_IC && !JS_MEGA_DISABLE
                         if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)) {
                             JSObject *holder;
                             uint32_t offset;
@@ -21291,7 +21291,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     {
                         JSObject *recv = p;
                         uint32_t ic_depth = 0;
-#if !JS_MEGA_DISABLE
+#if JS_ENABLE_IC && !JS_MEGA_DISABLE
                         if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)) {
                             JSObject *holder;
                             uint32_t offset;
