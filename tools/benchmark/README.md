@@ -37,7 +37,7 @@ node tools/benchmark/bench.mjs react rn --rows create-element
 |---|---|---|
 | `react` | 8 | React reconciler hot paths (element/fiber/hook alloc, reconcile, whole-tree render) |
 | `minireact` | 1 | Meta's MiniReact benchmark, reconciler from the Hermes tree (calibration anchor) |
-| `ic` | 12 | foundational monomorphic property/transition-store ICs: own/direct-prototype reads, overwrites, constructor/add transitions, megamorphic and mutation-guard sites |
+| `ic` | 13 | foundational and composed ICs: own/direct-prototype reads, two/four-shape polymorphism, depth-two prototypes, overwrites, transitions, megamorphic and mutation-guard sites |
 | `rn` | 6 | RN 0.85 native-prop payload: `diffProperties`/`flattenStyle`/`deepDiffer` at real 187/150-key scale |
 | `primitives` | 17 | for-in, keyed loads into large configs, mono/poly/mega IC ladder, closure alloc |
 | `data` | 20 | JSON.parse/stringify, sort, array chains, Object.assign, Map lookups |

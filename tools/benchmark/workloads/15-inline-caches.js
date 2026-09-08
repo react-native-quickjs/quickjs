@@ -27,12 +27,13 @@ function ShapeC(x) { this.z = 1; this.x = x; }
 function ShapeD(x) { this.a = 1; this.b = 2; this.x = x; }
 function ShapeE(x) { this.c = 1; this.d = 2; this.e = 3; this.x = x; }
 
-var mono = [], poly2 = [], mega5 = [], mostlyPolyStore = [];
+var mono = [], poly2 = [], poly4 = [], mega5 = [], mostlyPolyStore = [];
 var ownStore = [], proto1 = [], proto2 = [], proto3 = [], missing = [];
 
 function makeFixtures() {
   mono = [];
   poly2 = [];
+  poly4 = [];
   mega5 = [];
   mostlyPolyStore = [];
   ownStore = [];
@@ -47,6 +48,7 @@ function makeFixtures() {
   for (var i = 0; i < 128; i++) {
     mono.push(new ShapeA(i));
     poly2.push(i & 1 ? new ShapeB(i) : new ShapeA(i));
+    poly4.push([new ShapeA(i), new ShapeB(i), new ShapeC(i), new ShapeD(i)][i & 3]);
     mega5.push(new ctors[i % 5](i));
     mostlyPolyStore.push(i === 63 ? new ShapeC(i) : (i & 1 ? new ShapeB(i) : new ShapeA(i)));
     ownStore.push(new ShapeA(0));
@@ -100,6 +102,18 @@ bench({
   run: function () {
     var s = 0;
     for (var i = 0; i < 128; i++) s += loadX(mega5[i]);
+    return s;
+  },
+  expect: 8128,
+});
+
+bench({
+  name: 'ic/poly4-own-load',
+  unit: '128 reads',
+  setup: makeFixtures,
+  run: function () {
+    var s = 0;
+    for (var i = 0; i < 128; i++) s += loadX(poly4[i]);
     return s;
   },
   expect: 8128,
