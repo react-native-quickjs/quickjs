@@ -64,7 +64,7 @@
     },
     {
       "name": "0016-composed-ic-4wide-depth2-mega.patch",
-      "sha256": "c29ece68bb0b5682ffaddfdaafab687184d163c38e4911630002ed03bb7d2313"
+      "sha256": "86ef708a5ca1916396d1120d4cbca00d5d393029d935dd54c42580fb2a33c94e"
     },
     {
       "name": "0017-ic4-width-4-inline-cache-default-on.patch",
@@ -76,7 +76,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "e84555210daae148c056b11cd25296e2f74f573dc8bee0e09ec9e93e69b6b191",
+    "quickjs.c": "c6eafca7a3755868c1d7ad731c7bbe9838c3c1e3b5ee22095f5028aeebc67287",
     "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
