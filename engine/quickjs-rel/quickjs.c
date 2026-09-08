@@ -974,6 +974,7 @@ typedef struct JSICEntry {
 struct JSMegaEntry {
     JSShape *shape;
     JSShape *mid_shape;
+    JSShape *holder_shape;
     JSAtom atom;
     uint32_t off_depth;
     uint32_t shape_epoch;
@@ -6606,8 +6607,6 @@ static int js_megacache_probe(JSRuntime *rt, JSObject *recv, JSAtom atom,
 {
     JSMegaEntry *e;
     JSObject *holder;
-    JSShape *hsh;
-    JSShapeProperty *hpr;
     uint32_t depth, offset;
     if (!rt->mega_cache)
         return 0;
@@ -6633,11 +6632,7 @@ static int js_megacache_probe(JSRuntime *rt, JSObject *recv, JSAtom atom,
     }
     if (depth > 2)
         return 0;
-    hsh = holder->shape;
-    if (offset >= (uint32_t)hsh->prop_count)
-        return 0;
-    hpr = &get_shape_prop(hsh)[offset];
-    if (hpr->atom != atom || (hpr->flags & JS_PROP_TMASK))
+    if (holder->shape != e->holder_shape)
         return 0;
     *pholder = holder;
     *poffset = offset;
@@ -6646,7 +6641,8 @@ static int js_megacache_probe(JSRuntime *rt, JSObject *recv, JSAtom atom,
 }
 
 static void js_megacache_fill(JSRuntime *rt, JSShape *recv_shape, JSAtom atom,
-                              uint32_t offset, uint32_t depth, JSShape *mid)
+                              uint32_t offset, uint32_t depth, JSShape *mid,
+                              JSShape *holder_shape)
 {
     JSMegaEntry *e;
     if (!rt->mega_cache) {
@@ -6658,6 +6654,7 @@ static void js_megacache_fill(JSRuntime *rt, JSShape *recv_shape, JSAtom atom,
     e = &rt->mega_cache[js_mega_slot(recv_shape, atom)];
     e->shape = recv_shape;
     e->mid_shape = mid;
+    e->holder_shape = holder_shape;
     e->atom = atom;
     e->off_depth = (offset << 2) | depth;
     e->shape_epoch = rt->shape_free_epoch;
@@ -20306,7 +20303,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                         if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
                                             js_megacache_fill(ctx->rt, recv->shape, atom,
                                                               (uint32_t)(pr - p->prop), ic_depth,
-                                                              ic_depth == 2 ? recv->shape->proto->shape : NULL);
+                                                              ic_depth == 2 ? recv->shape->proto->shape : NULL,
+                                                              p->shape);
                                     }
 #endif
 #endif
@@ -21191,7 +21189,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
                                         js_megacache_fill(ctx->rt, recv->shape, atom,
                                                           (uint32_t)(pr - p->prop), ic_depth,
-                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL);
+                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL,
+                                                          p->shape);
                                 }
 #endif
 #endif
@@ -21330,7 +21329,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     if ((site[0].flags & JS_IC_FLAG_MEGAMORPHIC) && ic_depth <= 2)
                                         js_megacache_fill(ctx->rt, recv->shape, atom,
                                                           (uint32_t)(pr - p->prop), ic_depth,
-                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL);
+                                                          ic_depth == 2 ? recv->shape->proto->shape : NULL,
+                                                          p->shape);
                                 }
 #endif
 #endif
