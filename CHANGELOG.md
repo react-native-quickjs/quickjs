@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning][semver].
 - Patch `0013`: accelerates forward `String.prototype.indexOf` and `includes`
   searches with `memchr` and same-width `memcmp`; representative mixed
   short/long searches are approximately 8–9% faster.
+- Patch `0014`: reclaims an opcode slot with a compact escape prefix for
+  debugger traps, preserving malformed-bytecode rejection.
+- Patch `0015`: adds foundational monomorphic inline caches for property reads,
+  writable overwrites, and transition stores, with lazy tables and a cheap
+  megamorphic call-site guard. In local paired release measurements,
+  constructor stores were 1.36× faster, React fiber allocation 1.92× faster,
+  tree rendering 1.29× faster, and RN commit performance was neutral.
+- Patch `0015` hardens serialized-bytecode and IC metadata validation, moves
+  prototype-watchpoint invalidation after successful mutations, and preserves
+  non-throwing lazy allocation and correct transition OOM unwinding.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is

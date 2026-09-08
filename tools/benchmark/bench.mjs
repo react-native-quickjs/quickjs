@@ -88,6 +88,7 @@ options:
 const SUITES = [
   { kind: 'workload', name: 'react',       file: '10-react.js' },
   { kind: 'workload', name: 'minireact',   file: '11-minireact.js' },
+  { kind: 'workload', name: 'ic',          file: '15-inline-caches.js' },
   { kind: 'workload', name: 'rn',          file: '20-rn-props.js' },
   { kind: 'workload', name: 'arrayholes',  file: '25-array-holes.js' },
   { kind: 'workload', name: 'primitives',  file: '30-primitives.js' },

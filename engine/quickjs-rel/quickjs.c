@@ -304,6 +304,33 @@ typedef struct JSMallocState {
 #define JS_ARENA_LARGE_BLOCKS_ONLY 0
 #endif
 
+/* Inline caches. The default is one compact entry per site; a second entry is
+   allocated for the function only after a site observes a second shape. */
+#ifndef JS_ENABLE_IC
+#define JS_ENABLE_IC 1
+#endif
+/* JS_IC_POLY is the original optional two-entry configuration. The shipping
+   default is deliberately monomorphic; wider/adaptive PICs belong to 1095. */
+#ifndef JS_IC_POLY
+#define JS_IC_POLY 0
+#endif
+#if JS_IC_POLY
+#define JS_IC_ENTRIES 2
+#else
+#define JS_IC_ENTRIES 1
+#endif
+/* refills that did not stick before a monomorphic/PIC site goes megamorphic */
+#define JS_IC_MEGAMORPHIC_MISSES 8
+/* Cache flags: high bits are kind/state, a 13-bit watchpoint epoch, and a
+   saturating miss counter. This is the unified entry layout expected by 1095. */
+#define JS_IC_FLAG_MEGAMORPHIC 0x80000000u /* site disabled: stop probing/refilling */
+#define JS_IC_FLAG_PROTO       0x40000000u /* value lives on shape->proto */
+#define JS_IC_FLAG_TRANSITION  0x20000000u /* add-transition (to_shape set) */
+#define JS_IC_EPOCH_SHIFT      16
+#define JS_IC_EPOCH_MASK       0x1fff0000u /* bits 16..28: proto-watchpoint epoch snapshot */
+#define JS_IC_EPOCH_MAX        0x1fffu     /* saturation: stop filling transition entries */
+#define JS_IC_MISS_MASK        0x0000ffffu
+
 /* 8-byte header preceding every user allocation. It carries the allocator
    bookkeeping (block_idx/free_next + block_size_idx) and, the
    GC/refcount fields (gc_obj_type/mark/ref_count) that would otherwise sit in
@@ -438,6 +465,11 @@ struct JSRuntime {
     int shape_hash_size;
     int shape_hash_count; /* number of hashed shapes */
     JSShape **shape_hash;
+    /* Inline-cache prototype watchpoint (doc/ic-design.md Task 2.4). Bumped when an
+       interceptor (getset/non-writable) is defined on, or a proto swap/delete touches,
+       an is_prototype object. Add-transition IC entries snapshot it and only hit while
+       it is unchanged. Saturates at JS_IC_EPOCH_MAX (then transition filling stops). */
+    uint32_t ic_watchpoint_epoch;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -907,6 +939,13 @@ typedef struct JSObjLitSite {
 } JSObjLitSite;
 #define JS_OBJLIT_MAX_PROPS 16
 
+typedef struct JSICEntry {
+    JSShape  *shape;    /* receiver shape guard; ref held. NULL = empty slot. */
+    JSShape  *to_shape; /* add-transition target; NULL for reads/overwrites. */
+    uint32_t  offset;   /* property index in the receiver or direct prototype. */
+    uint32_t  flags;    /* kind/state bits + epoch + saturating miss counter */
+} JSICEntry;
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_strict_mode : 1;
@@ -924,6 +963,10 @@ typedef struct JSFunctionBytecode {
     /* XXX: 5 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
+    /* Runtime-only unified IC storage. It is allocated on first successful fill. */
+    JSICEntry *ic_table;
+    uint32_t ic_count;
+    uint8_t ic_entries;
     JSAtom func_name;
     JSVarDef *vardefs; /* arguments + local variables (arg_count + var_count) (self pointer) */
     JSClosureVar *closure_var; /* list of variables in the closure (self pointer) */
@@ -1320,6 +1363,9 @@ typedef enum OPCodeEnum {
     OP_TEMP_END,
 } OPCodeEnum;
 
+#define OP_invalid OP_esc1
+#define OP_ESC_GET_LOC0_LOC1 2
+
 static int JS_InitAtoms(JSRuntime *rt);
 static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type);
@@ -1571,6 +1617,8 @@ static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
+static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
+                                                 JSAtom atom);
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static int init_shape_hash(JSRuntime *rt);
@@ -6192,8 +6240,14 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh = get_shape_from_alloc(sh_alloc, hash_size);
     JS_REF_COUNT(sh) = 1;
     add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
-    if (proto)
+    if (proto) {
         js_dup(JS_MKPTR(JS_TAG_OBJECT, proto));
+        /* Any object that backs a shape's prototype is a prototype. Mark it so the
+           IC prototype watchpoint (doc/ic-design.md Task 2.4) fires when it gains an
+           interceptor — `new`/literals/Object.create reach protos only through here,
+           not through JS_SetPrototypeInternal. Idempotent, one-way. */
+        proto->is_prototype = true;
+    }
     sh->proto = proto;
     /* prop_hash_mask must be set before prop_hash_end(sh) is used, as the hash
        location depends on it in the merged-header layout. */
@@ -6338,6 +6392,235 @@ static void js_free_shape_null(JSRuntime *rt, JSShape *sh)
     if (sh)
         js_free_shape(rt, sh);
 }
+
+/* ---- Inline caches (Phase 2). See doc/ic-design.md. -------------------- */
+
+/* Release the refs held by a (possibly empty) unified IC entry. */
+static void ic_entry_reset(JSRuntime *rt, JSICEntry *e)
+{
+    uint32_t keep = e->flags & (JS_IC_FLAG_MEGAMORPHIC | JS_IC_MISS_MASK);
+    if (e->shape)
+        js_free_shape(rt, e->shape);
+    if (e->to_shape)
+        js_free_shape(rt, e->to_shape);
+    e->shape = NULL;
+    e->to_shape = NULL;
+    e->offset = 0;
+    e->flags = keep;
+}
+
+/* Free the whole IC table of a function bytecode (finalizer path; RT-only). */
+static void js_free_ic_table(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    uint32_t i, n;
+    if (!b->ic_table)
+        return;
+    n = b->ic_count * b->ic_entries;
+    for (i = 0; i < n; i++)
+        ic_entry_reset(rt, &b->ic_table[i]);
+    js_free_rt(rt, b->ic_table);
+    b->ic_table = NULL;
+}
+
+#if JS_ENABLE_IC
+/* Lazy allocation of the IC table (docs/gc-pass-decomposition.md §7).
+
+   The table used to be js_mallocz'd eagerly at compile time and again at
+   bytecode-read time, for EVERY function, whether or not the function ever ran.
+   MEASURED on bench/fixtures/rn-metro-ios-prod.js after the entry cascade:
+   8,136 of 8,358 tables (97.3%) never receive a single entry -- 425 of the
+   bundle's 498 modules never execute -- yet the cycle collector walks every slot
+   of every table twice per collection, 50,948 slots = 1.22 MB, of which 96.4%
+   sit in a table that is entirely empty.
+
+   So the table is now allocated on FIRST FILL. Everything that reads it must
+   tolerate NULL; mark_children and js_free_ic_table already did.
+
+   Allocation failure is not an error: the site simply does not cache. This must
+   stay silent (no exception) because the callers are mid-opcode fast paths that
+   have already produced the correct value the slow way. */
+static JSICEntry *ic_table_ensure(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    JSICEntry *t = b->ic_table;
+    if (likely(t != NULL))
+        return t;
+    if (b->ic_count == 0)
+        return NULL;
+    if (b->ic_entries == 0)
+        b->ic_entries = JS_IC_ENTRIES;
+    t = js_mallocz_rt(rt, sizeof(*t) *
+                      (size_t)b->ic_count * b->ic_entries);
+    b->ic_table = t;   /* NULL on OOM: retry, without throwing */
+    return t;
+}
+
+/* Fill (or refill) a read IC site after a successful lookup. holder is recv for
+   an own-data hit, or recv's direct prototype (depth-1) for a proto hit; offset
+   is the property's slot in holder->prop. Caches only plain data props on hashed
+   receiver shapes (doc/ic-design.md §3); refills on miss, and after
+   JS_IC_MEGAMORPHIC_MISSES thrashing refills disables the site. */
+static void ic_read_update(JSRuntime *rt, JSFunctionBytecode *b, uint32_t ic_idx,
+                           JSObject *recv, uint32_t offset, bool is_proto)
+{
+    JSShape *rsh = recv->shape;
+    JSICEntry *ic, *t;
+    int k;
+
+    t = ic_table_ensure(rt, b);
+    if (unlikely(!t))
+        return;
+    ic = &t[(size_t)ic_idx * b->ic_entries];
+
+    if (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)
+        return;
+    if (!rsh->is_hashed)
+        return; /* uncacheable shape — not counted as a polymorphism miss */
+
+    for (k = 0; k < b->ic_entries; k++) {
+        if (ic[k].shape == rsh && !(ic[k].flags & JS_IC_FLAG_TRANSITION))
+            return; /* a stale lookup must not promote a resident shape */
+    }
+    for (k = 0; k < b->ic_entries; k++) {
+        if (ic[k].shape == NULL)
+            break;
+    }
+    if (k == b->ic_entries) {
+        uint32_t miss = (ic[0].flags & JS_IC_MISS_MASK) + 1;
+        if (miss >= JS_IC_MEGAMORPHIC_MISSES) {
+            for (k = 0; k < b->ic_entries; k++)
+                ic_entry_reset(rt, &ic[k]);
+            ic[0].flags = JS_IC_FLAG_MEGAMORPHIC;
+            return;
+        }
+        ic[0].flags = (ic[0].flags & ~JS_IC_MISS_MASK) | miss;
+        k = b->ic_entries - 1; /* evict the last entry */
+    }
+    ic_entry_reset(rt, &ic[k]);
+    ic[k].shape = js_dup_shape(rsh);
+    ic[k].offset = offset;
+    if (is_proto)
+        ic[k].flags |= JS_IC_FLAG_PROTO;
+    else
+        ic[k].flags &= ~JS_IC_FLAG_PROTO;
+}
+
+/* Skip the call entirely when the site is already megamorphic.
+   A megamorphic site is permanently dead -- ic_read_update's first act is to
+   test that flag and return -- but reaching that test costs an out-of-line
+   call, table allocation check, an index multiply and the return, on every property
+   access, forever. The caller already holds `ic`, so the same test is a load
+   and a branch it can do itself.
+   MEASURED on the reference low-end device, share of ic_read_update calls that
+   were already megamorphic: richards 99.9% (460,093 of 460,347), deltablue
+   93.0% (3,359,172 of 3,613,306), raytrace 74.6% (4,485,103 of 6,011,650).
+   Only 39 sites actually go megamorphic on deltablue; those 39 account for 3.36
+   million wasted calls.
+   Deliberately NOT also checking `ic[0].shape == NULL` or anything else here:
+   this must stay one load and one predictable branch. Anything more belongs in
+   the callee. */
+static inline void ic_read_update_guarded(JSRuntime *rt, JSFunctionBytecode *b,
+                                          JSICEntry *ic, uint32_t ic_idx,
+                                          JSObject *recv, uint32_t offset,
+                                          bool is_proto)
+{
+    if (ic != NULL && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
+        return;
+    ic_read_update(rt, b, ic_idx, recv, offset, is_proto);
+}
+
+/* Prototype watchpoint (doc/ic-design.md Task 2.4): bump when an interceptor
+   (getset / non-writable) is introduced on a prototype, a prototype is deleted from,
+   or a proto swap occurs. Add-transition IC entries snapshot the epoch and stop
+   hitting once it changes. Saturates — filling stops at the cap (wrap-free). */
+static inline void ic_watchpoint_bump(JSRuntime *rt)
+{
+    if (rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX)
+        rt->ic_watchpoint_epoch++;
+}
+
+/* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
+   `to_sh` with the new value at `offset`. Mirrors ic_read_update's slot/poly policy. */
+static void ic_add_transition_update(JSRuntime *rt, JSFunctionBytecode *b,
+                                     uint32_t ic_idx, JSShape *from_sh,
+                                     JSShape *to_sh, uint32_t offset)
+{
+    JSICEntry *ic, *t;
+    int k;
+
+    t = ic_table_ensure(rt, b);
+    if (unlikely(!t))
+        return;
+    ic = &t[(size_t)ic_idx * b->ic_entries];
+
+    if (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC)
+        return;
+    if (!from_sh->is_hashed || !to_sh->is_hashed)
+        return;
+    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
+        return; /* watchpoint saturated: stop caching transitions (keeps epoch wrap-free) */
+
+    for (k = 0; k < b->ic_entries; k++) {
+        if (ic[k].shape == from_sh && (ic[k].flags & JS_IC_FLAG_TRANSITION))
+            return;
+    }
+    for (k = 0; k < b->ic_entries; k++) {
+        if (ic[k].shape == NULL)
+            break;
+    }
+    if (k == b->ic_entries) {
+        uint32_t miss = (ic[0].flags & JS_IC_MISS_MASK) + 1;
+        if (miss >= JS_IC_MEGAMORPHIC_MISSES) {
+            for (k = 0; k < b->ic_entries; k++)
+                ic_entry_reset(rt, &ic[k]);
+            ic[0].flags = JS_IC_FLAG_MEGAMORPHIC;
+            return;
+        }
+        ic[0].flags = (ic[0].flags & ~JS_IC_MISS_MASK) | miss;
+        k = b->ic_entries - 1;
+    }
+    ic_entry_reset(rt, &ic[k]);
+    ic[k].shape = js_dup_shape(from_sh);
+    ic[k].to_shape = js_dup_shape(to_sh);
+    ic[k].offset = offset;
+    ic[k].flags = (ic[k].flags & ~JS_IC_EPOCH_MASK)
+                   | JS_IC_FLAG_TRANSITION
+                   | ((rt->ic_watchpoint_epoch << JS_IC_EPOCH_SHIFT) & JS_IC_EPOCH_MASK);
+}
+
+#ifdef IC_VERIFY
+/* Differential check: recompute the property location the generic way and abort
+   on any disagreement with what the IC returned (doc/ic-design.md §9). */
+static void ic_verify_read(JSObject *recv, JSAtom atom,
+                           JSObject *holder, uint32_t offset)
+{
+    JSObject *p = recv;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSObject *found = NULL;
+    uint32_t foff = 0;
+    for (;;) {
+        prs = find_own_property(&pr, p, atom);
+        if (prs) {
+            if (!(prs->flags & JS_PROP_TMASK)) {
+                found = p;
+                foff = (uint32_t)(pr - p->prop);
+            }
+            break;
+        }
+        if (p->is_exotic)
+            return; /* generic path diverges on exotics; nothing to compare */
+        p = p->shape->proto;
+        if (!p)
+            break;
+    }
+    if (found != holder || (found && foff != offset)) {
+        fprintf(stderr, "IC read mismatch: atom=%u holder=%p/%p off=%u/%u\n",
+                (unsigned)atom, (void *)found, (void *)holder, foff, offset);
+        abort();
+    }
+}
+#endif /* IC_VERIFY */
+#endif /* JS_ENABLE_IC */
 
 /* make space to hold at least 'count' properties */
 static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
@@ -7885,6 +8168,19 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                         mark_func(rt, &b->objlit_tab[oi].shape->header);
                 }
             }
+            /* IC entries hold one shape ref each; the proto holder is reached via
+               shape->proto's own mark. Marking must match exactly the refs held
+               (doc/ic-design.md §5). */
+            if (b->ic_table) {
+                uint32_t j, n = b->ic_count * b->ic_entries;
+                for (j = 0; j < n; j++) {
+                    JSICEntry *e = &b->ic_table[j];
+                    if (e->shape)
+                        mark_func(rt, &e->shape->header);
+                    if (e->to_shape)
+                        mark_func(rt, &e->to_shape->header);
+                }
+            }
         }
         break;
     case JS_GC_OBJ_TYPE_VAR_REF:
@@ -8167,6 +8463,10 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     }
     if (b->byte_code_buf) {
         hp->js_func_code_size += b->byte_code_len;
+    }
+    if (b->ic_table) {
+        js_func_size += (size_t)b->ic_count * b->ic_entries * sizeof(JSICEntry);
+        memory_used_count++;
     }
     memory_used_count++;
     js_func_size += b->source_len + 1;
@@ -9370,6 +9670,12 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
             ctx->std_array_prototype = false;
         }
     }
+#if JS_ENABLE_IC
+    /* Consume an epoch only after the prototype pointer and its ownership have
+       been changed successfully. All rejection, cycle, and OOM paths above
+       return before this point. */
+    ic_watchpoint_bump(ctx->rt);
+#endif
     return true;
 }
 
@@ -10916,6 +11222,10 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
                 sh->deleted_prop_count >= ((unsigned)sh->prop_count / 2)) {
                 compact_properties(ctx, p);
             }
+#if JS_ENABLE_IC
+            if (unlikely(p->is_prototype))
+                ic_watchpoint_bump(ctx->rt);
+#endif
             return true;
         }
         lpr = pr;
@@ -11753,6 +12063,12 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
             pr->u.value = JS_UNDEFINED;
         }
     }
+#if JS_ENABLE_IC
+    if (unlikely(p->is_prototype) &&
+        (((prop_flags & JS_PROP_TMASK) == JS_PROP_GETSET) ||
+         !(prop_flags & JS_PROP_WRITABLE)))
+        ic_watchpoint_bump(ctx->rt);
+#endif
     return true;
 }
 
@@ -12025,6 +12341,12 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         if (js_update_property_flags(ctx, p, &prs,
                                      (prs->flags & ~mask) | (flags & mask)))
             return -1;
+#if JS_ENABLE_IC
+        if (unlikely(p->is_prototype) &&
+            ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
+             ((flags & JS_PROP_HAS_WRITABLE) && !(flags & JS_PROP_WRITABLE))))
+            ic_watchpoint_bump(ctx->rt);
+#endif
         return true;
     }
 
@@ -18741,11 +19063,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DEFAULT         default
 #define BREAK           break
 #else
-    __extension__ static const void * const dispatch_table[256] = {
+    /* Dispatch is byte-indexed and the IC opcode set fills all 256 entries. */
+    _Static_assert(OP_COUNT <= 256, "opcode space exceeds one-byte dispatch");
+    __extension__ static const void * const dispatch_table[257] = {
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
 #include "quickjs-opcode.h"
-        [ OP_COUNT ... 255 ] = &&case_default
+        [OP_COUNT] = &&case_default
     };
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
@@ -18856,10 +19180,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JSValue *call_argv;
 
         SWITCH(pc) {
-        CASE(OP_debug):
-#if JS_ENABLE_DEBUGGER
+        CASE(OP_esc1):
             {
-                int flags = *pc++;
+                int subop = *pc++;
+                if (subop == OP_ESC_GET_LOC0_LOC1) {
+                    *sp++ = js_dup(var_buf[0]);
+                    *sp++ = js_dup(var_buf[1]);
+                    BREAK;
+                }
+#if JS_ENABLE_DEBUGGER
+                {
+                int flags = subop;
+                if (unlikely(flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
+                    JS_ThrowInternalError(ctx, "invalid escape subopcode: %d", flags);
+                    goto exception;
+                }
                 /* Armed, not merely installed: an attached-but-idle debugger
                    would otherwise pay find_line_num() on every statement. */
                 if (unlikely(ctx->debug_trace &&
@@ -18894,13 +19229,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     }
                 }
-            }
+                }
 #else
             /* Debugger compiled out: skip the flag operand.  Only reachable via
                a `debugger;` statement, which is emitted in every build so that
                bytecode stays configuration-independent. */
-            pc++;
+            (void)subop;
 #endif
+            }
             BREAK;
         CASE(OP_push_i32):
             *sp++ = js_int32(get_u32(pc));
@@ -19679,9 +20015,118 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         // Observation: get_loc0 and get_loc1 are individually very
         // frequent opcodes _and_ they are very often paired together,
         // making them ideal candidates for opcode fusion.
-        CASE(OP_get_loc0_loc1):
-            *sp++ = js_dup(var_buf[0]);
-            *sp++ = js_dup(var_buf[1]);
+        CASE(OP_get_loc_field_nr):
+            /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
+               The receiver is the local var_buf[loc] and is NEVER pushed to the
+               stack, so nothing else can free it — we borrow it (no dup) and never
+               free it. Then the same IC read as OP_get_field_ic. */
+            {
+                JSValue val;
+                JSAtom atom;
+                JSObject *p;
+                JSProperty *pr;
+                JSShapeProperty *prs;
+                uint32_t loc;
+#if JS_ENABLE_IC
+                JSICEntry *ic;
+                uint32_t ic_idx;
+                int k;
+#endif
+                atom = get_u32(pc);
+                loc = get_u16(pc + 4);
+#if JS_ENABLE_IC
+                ic_idx = get_u16(pc + 6);
+#endif
+                pc += 8;
+
+                {
+                    JSValue obj = var_buf[loc];   /* borrowed, not dup'd */
+                    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                        p = JS_VALUE_GET_OBJ(obj);
+#if JS_ENABLE_IC
+                        /* NULL until this function's first IC fill */
+                        ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
+                                         : NULL;
+                        if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
+                            goto get_loc_field_nr_slow;
+                        for (k = 0; k < b->ic_entries; k++) {
+                            if (!ic)
+                                break;  /* no table yet: nothing is cached */
+                            if (ic[k].shape == p->shape &&
+                                !(ic[k].flags & JS_IC_FLAG_TRANSITION)) {
+                                if (ic[k].flags & JS_IC_FLAG_PROTO) {
+                                    JSObject *holder = p->shape->proto;
+                                    JSShape *hsh = holder->shape;
+                                    JSShapeProperty *hpr;
+                                    if (ic[k].offset >= (uint32_t)hsh->prop_count)
+                                        break;
+                                    hpr = &get_shape_prop(hsh)[ic[k].offset];
+                                    if (hpr->atom != atom ||
+                                        (hpr->flags & JS_PROP_TMASK))
+                                        break;
+#ifdef IC_VERIFY
+                                    ic_verify_read(p, atom, holder, ic[k].offset);
+#endif
+                                    val = js_dup(holder->prop[ic[k].offset].u.value);
+                                } else {
+#ifdef IC_VERIFY
+                                    ic_verify_read(p, atom, p, ic[k].offset);
+#endif
+                                    if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
+                                        goto get_loc_field_nr_slow;
+                                    val = js_dup(p->prop[ic[k].offset].u.value);
+                                }
+                                *sp++ = val;
+                                BREAK;
+                            }
+                        }
+#endif
+                        {
+                            JSObject *recv = p;
+                            for(;;) {
+                                prs = find_own_property(&pr, p, atom);
+                                if (prs) {
+                                    if (unlikely(prs->flags & JS_PROP_TMASK))
+                                        goto get_loc_field_nr_slow;
+                                    if (js_lazy_marker_is(pr->u.value))
+                                        val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
+                                    else
+                                        val = js_dup(pr->u.value);
+#if JS_ENABLE_IC
+                                    if (p == recv)
+                                        ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
+                                                       (uint32_t)(pr - p->prop), false);
+                                    else if (p == recv->shape->proto)
+                                        ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
+                                                       (uint32_t)(pr - p->prop), true);
+#endif
+                                    break;
+                                }
+                                if (unlikely(p->is_exotic)) {
+                                    obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                                    goto get_loc_field_nr_slow;
+                                }
+                                p = p->shape->proto;
+                                if (!p) {
+                                    val = JS_UNDEFINED;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                    get_loc_field_nr_slow:
+                        /* Fallback: the generic getter borrows obj (does not free
+                           it), exactly as the plain OP_get_field slow path relies on.
+                           The receiver is the borrowed local, so we pass it directly
+                           and never free it. */
+                        sf->cur_pc = pc;
+                        val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
+                        if (unlikely(JS_IsException(val)))
+                            goto exception;
+                    }
+                    *sp++ = val;
+                }
+            }
             BREAK;
 
         CASE(OP_get_loc0): *sp++ = js_dup(var_buf[0]); BREAK;
@@ -20415,6 +20860,349 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sf->cur_pc = pc;
                     ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
                                                   JS_PROP_THROW_STRICT);
+                    JS_FreeValue(ctx, obj);
+                    sp -= 2;
+                    if (unlikely(ret < 0))
+                        goto exception;
+                }
+            }
+            BREAK;
+
+        CASE(OP_get_field_ic):
+            {
+                JSValue val, obj;
+                JSAtom atom;
+                JSObject *p;
+                JSProperty *pr;
+                JSShapeProperty *prs;
+#if JS_ENABLE_IC
+                    JSICEntry *ic;
+                uint32_t ic_idx;
+                int k;
+#endif
+                atom = get_u32(pc);
+#if JS_ENABLE_IC
+                ic_idx = get_u16(pc + 4);
+#endif
+                pc += 6;
+
+                obj = sp[-1];
+                if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                    p = JS_VALUE_GET_OBJ(obj);
+#if JS_ENABLE_IC
+                    /* NULL until this function's first IC fill */
+                    ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
+                                     : NULL;
+                    if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
+                        goto get_field_ic_slow;
+                    for (k = 0; k < b->ic_entries; k++) {
+                        if (!ic)
+                            break;      /* no table yet: nothing is cached */
+                        if (ic[k].shape == p->shape &&
+                            !(ic[k].flags & JS_IC_FLAG_TRANSITION)) {
+                            if (ic[k].flags & JS_IC_FLAG_PROTO) {
+                                JSObject *holder = p->shape->proto;
+                                JSShape *hsh = holder->shape;
+                                JSShapeProperty *hpr;
+                                if (ic[k].offset >= (uint32_t)hsh->prop_count)
+                                    break; /* slot moved: miss */
+                                hpr = &get_shape_prop(hsh)[ic[k].offset];
+                                if (hpr->atom != atom ||
+                                    (hpr->flags & JS_PROP_TMASK))
+                                    break; /* slot changed: miss */
+#ifdef IC_VERIFY
+                                ic_verify_read(p, atom, holder, ic[k].offset);
+#endif
+                                val = js_dup(holder->prop[ic[k].offset].u.value);
+                            } else {
+#ifdef IC_VERIFY
+                                ic_verify_read(p, atom, p, ic[k].offset);
+#endif
+                                if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
+                                    goto get_field_ic_slow;
+                                val = js_dup(p->prop[ic[k].offset].u.value);
+                            }
+                            JS_FreeValue(ctx, sp[-1]);
+                            sp[-1] = val;
+                            BREAK;
+                        }
+                    }
+#endif
+                    {
+                        JSObject *recv = p;
+                        for(;;) {
+                            prs = find_own_property(&pr, p, atom);
+                            if (prs) {
+                                if (unlikely(prs->flags & JS_PROP_TMASK))
+                                    goto get_field_ic_slow;
+                                if (js_lazy_marker_is(pr->u.value))
+                                    val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
+                                else
+                                    val = js_dup(pr->u.value);
+#if JS_ENABLE_IC
+                                if (p == recv)
+                                    ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
+                                                   (uint32_t)(pr - p->prop), false);
+                                else if (p == recv->shape->proto)
+                                    ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
+                                                   (uint32_t)(pr - p->prop), true);
+#endif
+                                break;
+                            }
+                            if (unlikely(p->is_exotic)) {
+                                obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                                goto get_field_ic_slow;
+                            }
+                            p = p->shape->proto;
+                            if (!p) {
+                                val = JS_UNDEFINED;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                get_field_ic_slow:
+                    sf->cur_pc = pc;
+                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = val;
+            }
+            BREAK;
+
+        CASE(OP_get_field2_ic):
+            {
+                JSValue val, obj;
+                JSAtom atom;
+                JSObject *p;
+                JSProperty *pr;
+                JSShapeProperty *prs;
+#if JS_ENABLE_IC
+                JSICEntry *ic;
+                uint32_t ic_idx;
+                int k;
+#endif
+                atom = get_u32(pc);
+#if JS_ENABLE_IC
+                ic_idx = get_u16(pc + 4);
+#endif
+                pc += 6;
+
+                obj = sp[-1];
+                if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                    p = JS_VALUE_GET_OBJ(obj);
+#if JS_ENABLE_IC
+                    /* NULL until this function's first IC fill */
+                    ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
+                                     : NULL;
+                    if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
+                        goto get_field2_ic_slow;
+                    for (k = 0; k < b->ic_entries; k++) {
+                        if (!ic)
+                            break;      /* no table yet: nothing is cached */
+                        if (ic[k].shape == p->shape &&
+                            !(ic[k].flags & JS_IC_FLAG_TRANSITION)) {
+                            if (ic[k].flags & JS_IC_FLAG_PROTO) {
+                                JSObject *holder = p->shape->proto;
+                                JSShape *hsh = holder->shape;
+                                JSShapeProperty *hpr;
+                                if (ic[k].offset >= (uint32_t)hsh->prop_count)
+                                    break;
+                                hpr = &get_shape_prop(hsh)[ic[k].offset];
+                                if (hpr->atom != atom ||
+                                    (hpr->flags & JS_PROP_TMASK))
+                                    break;
+#ifdef IC_VERIFY
+                                ic_verify_read(p, atom, holder, ic[k].offset);
+#endif
+                                val = js_dup(holder->prop[ic[k].offset].u.value);
+                            } else {
+#ifdef IC_VERIFY
+                                ic_verify_read(p, atom, p, ic[k].offset);
+#endif
+                                if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
+                                    goto get_field2_ic_slow;
+                                val = js_dup(p->prop[ic[k].offset].u.value);
+                            }
+                            *sp++ = val;
+                            BREAK;
+                        }
+                    }
+#endif
+                    {
+                        JSObject *recv = p;
+                        for(;;) {
+                            prs = find_own_property(&pr, p, atom);
+                            if (prs) {
+                                if (unlikely(prs->flags & JS_PROP_TMASK))
+                                    goto get_field2_ic_slow;
+                                if (js_lazy_marker_is(pr->u.value))
+                                    val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
+                                else
+                                    val = js_dup(pr->u.value);
+#if JS_ENABLE_IC
+                                if (p == recv)
+                                    ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
+                                                   (uint32_t)(pr - p->prop), false);
+                                else if (p == recv->shape->proto)
+                                    ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
+                                                   (uint32_t)(pr - p->prop), true);
+#endif
+                                break;
+                            }
+                            if (unlikely(p->is_exotic)) {
+                                obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                                goto get_field2_ic_slow;
+                            }
+                            p = p->shape->proto;
+                            if (!p) {
+                                val = JS_UNDEFINED;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                get_field2_ic_slow:
+                    sf->cur_pc = pc;
+                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                *sp++ = val;
+            }
+            BREAK;
+
+        CASE(OP_put_field_ic):
+            {
+                int ret;
+                JSValue obj;
+                JSAtom atom;
+                JSObject *p;
+                JSProperty *pr;
+                JSShapeProperty *prs;
+#if JS_ENABLE_IC
+                JSICEntry *ic;
+                uint32_t ic_idx;
+                int k;
+                JSShape *pre_sh;
+                uint32_t pre_count;
+#endif
+                atom = get_u32(pc);
+#if JS_ENABLE_IC
+                ic_idx = get_u16(pc + 4);
+#endif
+                pc += 6;
+
+                obj = sp[-2];
+                if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                    p = JS_VALUE_GET_OBJ(obj);
+#if JS_ENABLE_IC
+                    /* NULL until this function's first IC fill */
+                    ic = b->ic_table ? &b->ic_table[(size_t)ic_idx * b->ic_entries]
+                                     : NULL;
+                    if (ic && (ic[0].flags & JS_IC_FLAG_MEGAMORPHIC))
+                        goto put_field_ic_slow;
+                    for (k = 0; k < b->ic_entries; k++) {
+                        if (!ic)
+                            break;      /* no table yet: nothing is cached */
+                        if (ic[k].shape != p->shape)
+                            continue;
+                        if (ic[k].flags & JS_IC_FLAG_TRANSITION) {
+                            /* Add-transition hit: `atom` is a fresh own property whose
+                               shape S -> to_shape. Sound iff the object is still
+                               extensible + non-exotic (per-object bits, not in the
+                               shape) and no proto interceptor appeared since fill
+                               (watchpoint epoch unchanged). See doc/ic-design.md 2.4. */
+                            JSShape *nsh = ic[k].to_shape;
+                            if (likely(p->extensible && !p->is_exotic &&
+                                       ((ic[k].flags & JS_IC_EPOCH_MASK) >> JS_IC_EPOCH_SHIFT)
+                                           == ctx->rt->ic_watchpoint_epoch)) {
+                                uint32_t off = ic[k].offset;
+                                JSShape *osh = p->shape;
+                                if (nsh->prop_size != osh->prop_size) {
+                                    JSProperty *np = js_realloc(ctx, p->prop,
+                                            sizeof(p->prop[0]) * nsh->prop_size);
+                                    if (unlikely(!np))
+                                        goto exception;
+                                    p->prop = np;
+                                }
+                                p->shape = js_dup_shape(nsh);
+                                js_free_shape(ctx->rt, osh);
+                                p->prop[off].u.value = sp[-1]; /* fresh slot: transfer */
+                                JS_FreeValue(ctx, obj);
+                                sp -= 2;
+                                BREAK;
+                            }
+                            goto put_field_ic_slow; /* guard failed: generic + re-fill */
+                        }
+                        /* Overwrite hit: cached shape -> writable data slot. */
+                        set_value(ctx, &p->prop[ic[k].offset].u.value, sp[-1]);
+                        JS_FreeValue(ctx, obj);
+                        sp -= 2;
+                        BREAK;
+                    }
+#endif
+                    prs = find_own_property(&pr, p, atom);
+                    if (!prs)
+                        goto put_field_ic_slow;
+                    if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                              JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+                        set_value(ctx, &pr->u.value, sp[-1]);
+#if JS_ENABLE_IC
+                        /* cache the overwrite site (shape -> writable slot) */
+                        ic_read_update_guarded(ctx->rt, b, ic, ic_idx, p,
+                                       (uint32_t)(pr - p->prop), false);
+#endif
+                        JS_FreeValue(ctx, obj);
+                        sp -= 2;
+                    } else {
+                        goto put_field_ic_slow;
+                    }
+                } else {
+                put_field_ic_slow:
+#if JS_ENABLE_IC
+                    /* Snapshot the pre-add shape of a plain, extensible, non-exotic
+                       object whose `atom` is not yet own, to cache the add-transition
+                       once the generic path performs the (proven-clean) add. The held
+                       ref keeps pre_sh alive across the call. */
+                    pre_sh = NULL;
+                    pre_count = 0;
+                    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+                        JSObject *po = JS_VALUE_GET_OBJ(obj);
+                        if (po->extensible && !po->is_exotic && po->shape->is_hashed) {
+                            JSProperty *pr0;
+                            if (!find_own_property(&pr0, po, atom)) {
+                                pre_sh = js_dup_shape(po->shape);
+                                pre_count = po->shape->prop_count;
+                            }
+                        }
+                    }
+#endif
+                    sf->cur_pc = pc;
+                    ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
+                                                  JS_PROP_THROW_STRICT);
+#if JS_ENABLE_IC
+                    if (likely(ret >= 0) && pre_sh) {
+                        /* obj still holds a ref (freed below), so po is alive. Cache iff
+                           the set added `atom` as a plain writable own data slot. */
+                        JSObject *po = JS_VALUE_GET_OBJ(obj);
+                        JSShape *nsh = po->shape;
+                        if (nsh != pre_sh && nsh->is_hashed &&
+                            nsh->prop_count == pre_count + 1) {
+                            JSProperty *pr1;
+                            JSShapeProperty *prs1 = find_own_property(&pr1, po, atom);
+                            if (prs1 &&
+                                (prs1->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
+                                ic_add_transition_update(ctx->rt, b, ic_idx, pre_sh, nsh,
+                                                         (uint32_t)(pr1 - po->prop));
+                        }
+                    }
+                    if (pre_sh)
+                        js_free_shape(ctx->rt, pre_sh);
+#endif
                     JS_FreeValue(ctx, obj);
                     sp -= 2;
                     if (unlikely(ret < 0))
@@ -21639,7 +22427,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = JS_FALSE;
             BREAK;
-        CASE(OP_invalid):
         DEFAULT:
             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
                                   (int)(pc - b->byte_code_buf - 1), opcode);
@@ -23074,6 +23861,7 @@ typedef struct JSFunctionDef {
 
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
+    int ic_count; /* number of IC sites assigned in resolve_labels (Phase 2) */
 
     LabelSlot *label_slots;
     int label_size; /* allocated size for label_slots[] */
@@ -34495,17 +35283,8 @@ static void dump_byte_code(JSContext *ctx, int pass,
                 printf(",%u", get_u16(tab + pos + 8));
             break;
         case OP_FMT_none_loc:
-            if (op == OP_get_loc0_loc1) {
-                printf(" 0, 1 ; ");
-                if (var_count > 0)
-                    print_atom(ctx, vars[0].var_name);
-                if (var_count > 1)
-                    print_atom(ctx, vars[1].var_name);
-            } else {
-                idx = (op - OP_get_loc0) % 4;
-                goto has_loc;
-            }
-            break;
+            idx = (op - OP_get_loc0) % 4;
+            goto has_loc;
         case OP_FMT_loc8:
             idx = get_u8(tab + pos);
             goto has_loc;
@@ -36694,6 +37473,25 @@ static void add_pc2line_info(JSFunctionDef *s, uint32_t pc,
     s->col_number_last = col_num;
 }
 
+/* Emit the IC variant for every cacheable field access when enabled. */
+static void resolve_emit_field(JSFunctionDef *s, DynBuf *bc_out,
+                               int plain_op, int ic_op, JSAtom atom,
+                               int line_num, int col_num)
+{
+    add_pc2line_info(s, bc_out->size, line_num, col_num);
+#if JS_ENABLE_IC
+    if (s->ic_count < 0xffff) {
+        dbuf_putc(bc_out, ic_op);
+        dbuf_put_u32(bc_out, atom);
+        dbuf_put_u16(bc_out, s->ic_count++);
+        return;
+    }
+#endif
+    (void)ic_op;
+    dbuf_putc(bc_out, plain_op);
+    dbuf_put_u32(bc_out, atom);
+}
+
 static void compute_pc2line_info(JSFunctionDef *s)
 {
     if (s->source_loc_slots) {
@@ -37031,7 +37829,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                record pc2line, so the debugger can resolve the source location
                when OP_debug is hit at runtime. */
             add_pc2line_info(s, bc_out.size, line_num, col_num);
-            dbuf_putc(&bc_out, OP_debug);
+            dbuf_putc(&bc_out, OP_esc1);
             dbuf_putc(&bc_out, bc_buf[pos + 1]);   /* flag operand */
             break;
 
@@ -37384,8 +38182,26 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     dbuf_putc(&bc_out, OP_get_length);
                     break;
                 }
+                resolve_emit_field(s, &bc_out, OP_get_field, OP_get_field_ic,
+                                   atom, line_num, col_num);
             }
-            goto no_change;
+            break;
+
+        case OP_get_field2:
+            {
+                JSAtom atom = get_u32(bc_buf + pos + 1);
+                resolve_emit_field(s, &bc_out, OP_get_field2, OP_get_field2_ic,
+                                   atom, line_num, col_num);
+            }
+            break;
+
+        case OP_put_field:
+            {
+                JSAtom atom = get_u32(bc_buf + pos + 1);
+                resolve_emit_field(s, &bc_out, OP_put_field, OP_put_field_ic,
+                                   atom, line_num, col_num);
+            }
+            break;
 
         case OP_push_atom_value:
             {
@@ -37468,9 +38284,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             if (code_match(&cc, pos_next, OP_put_field, OP_drop, -1)) {
                 if (cc.line_num >= 0) line_num = cc.line_num;
                 if (cc.col_num >= 0) col_num = cc.col_num;
-                add_pc2line_info(s, bc_out.size, line_num, col_num);
-                dbuf_putc(&bc_out, OP_put_field);
-                dbuf_put_u32(&bc_out, cc.atom);
+                resolve_emit_field(s, &bc_out, OP_put_field, OP_put_field_ic,
+                                   cc.atom, line_num, col_num);
                 pos_next = cc.pos;
                 break;
             }
@@ -37525,6 +38340,13 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                  */
                 int idx;
                 idx = get_u16(bc_buf + pos + 1);
+                if (idx == 0 && code_match(&cc, pos_next, OP_get_loc, 1, -1)) {
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_esc1);
+                    dbuf_putc(&bc_out, OP_ESC_GET_LOC0_LOC1);
+                    pos_next = cc.pos;
+                    break;
+                }
                 if (idx >= 256)
                     goto no_change;
                 if (code_match(&cc, pos_next, M2(OP_post_dec, OP_post_inc), OP_put_loc, idx, OP_drop, -1) ||
@@ -37584,15 +38406,26 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     pos_next = cc.pos;
                     break;
                 }
-                /* transformation: get_loc(0) get_loc(1) -> get_loc0_loc1 */
-                if (idx == 0 && code_match(&cc, pos_next, OP_get_loc, 1, -1)) {
+#if JS_ENABLE_IC
+                /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom) ->
+                   get_loc_field_nr(atom, n, ic). Only when the field read consumes
+                   the receiver (plain OP_get_field, not get_field2 which keeps the
+                   receiver for a call), the atom isn't 'length' (that becomes
+                   OP_get_length), and the IC index space isn't exhausted. */
+                if (s->ic_count < 0xffff &&
+                    code_match(&cc, pos_next, OP_get_field, -1) &&
+                    cc.atom != JS_ATOM_length) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    dbuf_putc(&bc_out, OP_get_loc0_loc1);
+                    dbuf_putc(&bc_out, OP_get_loc_field_nr);
+                    dbuf_put_u32(&bc_out, cc.atom);      /* atom at pos+1 */
+                    dbuf_put_u16(&bc_out, idx);          /* loc  at pos+5 */
+                    dbuf_put_u16(&bc_out, s->ic_count++);/* ic   at pos+7 */
                     pos_next = cc.pos;
                     break;
                 }
+#endif
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -37658,8 +38491,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     dbuf_putc(&bc_out, OP_dec + (op - OP_post_dec));
-                    dbuf_putc(&bc_out, OP_put_field);
-                    dbuf_put_u32(&bc_out, cc.atom);
+                    resolve_emit_field(s, &bc_out, OP_put_field, OP_put_field_ic,
+                                       cc.atom, line_num, col_num);
                     pos_next = cc.pos;
                     break;
                 }
@@ -37907,7 +38740,7 @@ static __exception int compute_stack_size(JSContext *ctx,
                                           int *pstack_size)
 {
     StackSizeState s_s, *s = &s_s;
-    int i, diff, n_pop, pos_next, stack_len, pos, op, catch_pos, catch_level;
+    int i, diff, n_pop, n_push, pos_next, stack_len, pos, op, catch_pos, catch_level;
     const JSOpCode *oi;
     const uint8_t *bc_buf;
 
@@ -37938,7 +38771,7 @@ static __exception int compute_stack_size(JSContext *ctx,
         stack_len = s->stack_level_tab[pos];
         catch_pos = s->catch_pos_tab[pos];
         op = bc_buf[pos];
-        if (op == 0 || op >= OP_COUNT) {
+        if (op >= OP_COUNT) {
             JS_ThrowInternalError(ctx, "invalid opcode (op=%d, pc=%d)", op, pos);
             goto fail;
         }
@@ -37953,6 +38786,9 @@ static __exception int compute_stack_size(JSContext *ctx,
             goto fail;
         }
         n_pop = oi->n_pop;
+        n_push = oi->n_push;
+        if (op == OP_esc1 && bc_buf[pos + 1] == OP_ESC_GET_LOC0_LOC1)
+            n_push = 2;
         /* call pops a variable number of arguments */
         if (oi->fmt == OP_FMT_npop || oi->fmt == OP_FMT_npop_u16) {
             n_pop += get_u16(bc_buf + pos + 1);
@@ -37964,7 +38800,7 @@ static __exception int compute_stack_size(JSContext *ctx,
             JS_ThrowInternalError(ctx, "stack underflow (op=%d, pc=%d)", op, pos);
             goto fail;
         }
-        stack_len += oi->n_push - n_pop;
+        stack_len += n_push - n_pop;
         if (stack_len > s->stack_len_max) {
             s->stack_len_max = stack_len;
             if (s->stack_len_max > JS_STACK_SIZE_MAX) {
@@ -38282,6 +39118,11 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         }
     }
 
+    /* IC site count is serialized; read and transition tables are runtime-only
+       and allocated independently on their first fill. */
+    b->ic_count = fd->ic_count;
+    b->ic_entries = JS_IC_ENTRIES;
+
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
     b->byte_code_len = fd->byte_code.size;
     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
@@ -38377,6 +39218,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
     int i;
+
+    /* release IC-held shape refs and free the table */
+    js_free_ic_table(rt, b);
 
     if (b->byte_code_buf)
         free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, true);
@@ -40042,6 +40886,9 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_put_leb128(s, b->closure_var_count);
     bc_put_leb128(s, b->cpool_count);
     bc_put_leb128(s, b->byte_code_len);
+    /* IC table size only; contents are runtime-only (doc/ic-design.md §1). The
+       _ic opcodes are already in byte_code, so a nonzero count round-trips. */
+    bc_put_leb128(s, b->ic_count);
     if (b->vardefs) {
         /* XXX: this field is redundant */
         bc_put_leb128(s, b->arg_count + b->var_count);
@@ -40948,6 +41795,93 @@ static int BC_add_object_ref(BCReaderState *s, JSValue obj)
     return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
 }
 
+static int js_validate_ic_bytecode(JSContext *ctx, JSFunctionBytecode *b)
+{
+    const uint8_t *buf = b->byte_code_buf;
+    uint32_t len = (uint32_t)b->byte_code_len;
+    uint32_t pc = 0;
+    uint32_t ic_seen_count = 0;
+    uint8_t *ic_seen = NULL;
+    const uint32_t opcode_count = OP_COUNT;
+
+    if (b->ic_count > UINT16_MAX) {
+        JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: too many sites");
+        return -1;
+    }
+    if (b->ic_count != 0) {
+        ic_seen = js_mallocz(ctx, b->ic_count);
+        if (!ic_seen)
+            return -1;
+    }
+    while (pc < len) {
+        uint8_t opcode = buf[pc];
+        uint32_t size;
+
+        if ((uint32_t)opcode >= opcode_count) {
+            JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: invalid opcode");
+            goto fail;
+        }
+        size = short_opcode_info(opcode).size;
+        if (size == 0 || size > len - pc) {
+            JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: truncated instruction");
+            goto fail;
+        }
+        switch (opcode) {
+        case OP_esc1:
+            if (buf[pc + 1] > JS_DEBUG_TRACE_DEBUGGER_STMT &&
+                buf[pc + 1] != OP_ESC_GET_LOC0_LOC1) {
+                JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: invalid escape");
+                goto fail;
+            }
+            break;
+        case OP_get_field_ic:
+        case OP_get_field2_ic:
+        case OP_put_field_ic:
+            {
+                uint32_t ic_idx = get_u16(buf + pc + 5);
+                if (ic_idx >= b->ic_count || ic_seen[ic_idx]) {
+                    JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: non-canonical site index");
+                    goto fail;
+                }
+                ic_seen[ic_idx] = 1;
+                ic_seen_count++;
+            }
+            break;
+        case OP_get_loc_field_nr:
+            {
+                uint32_t ic_idx = get_u16(buf + pc + 7);
+                if (get_u16(buf + pc + 5) >= (uint32_t)b->var_count + b->arg_count ||
+                    ic_idx >= b->ic_count || ic_seen[ic_idx]) {
+                    JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: non-canonical fused operands");
+                    goto fail;
+                }
+                ic_seen[ic_idx] = 1;
+                ic_seen_count++;
+            }
+            break;
+        default:
+            break;
+        }
+        if (pc > len - size) {
+            JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: instruction overflow");
+            goto fail;
+        }
+        pc += size;
+    }
+    if (ic_seen_count != b->ic_count) {
+        JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: incomplete site table");
+        goto fail;
+    }
+    if (ic_seen) {
+        js_free(ctx, ic_seen);
+    }
+    return 0;
+fail:
+    if (ic_seen)
+        js_free(ctx, ic_seen);
+    return -1;
+}
+
 static JSValue JS_ReadFunctionTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -40998,6 +41932,16 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
     if (bc_get_leb128_int(s, &bc.byte_code_len))
         goto fail;
+    {
+        uint32_t ic_count;
+        if (bc_get_leb128(s, &ic_count))
+            goto fail;
+        if (ic_count > UINT16_MAX) {
+            JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: too many sites");
+            goto fail;
+        }
+        bc.ic_count = ic_count;
+    }
     if (bc_get_leb128_int(s, &local_count))
         goto fail;
 
@@ -41017,6 +41961,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 
     memcpy(b, &bc, sizeof(*b));
     bc.func_name = JS_ATOM_NULL;
+    b->ic_entries = JS_IC_ENTRIES;
     JS_REF_COUNT(b) = 1;
     if (local_count != 0) {
         b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
@@ -41031,6 +41976,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
 
     obj = JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
+
+    /* b->ic_count was read from the stream above; contents never serialize, and
+       the tables themselves are allocated on first fill. This is
+       the path React Native actually ships (precompiled .bc), so it must take
+       the lazy branch too or the win evaporates. b was js_mallocz'd, so both
+       IC table pointers are already NULL. */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
     if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
@@ -41132,6 +42083,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         bc_read_trace(s, "bytecode {\n");
         if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
             goto fail;
+        if (js_validate_ic_bytecode(ctx, b) < 0)
+            goto fail;
         bc_read_trace(s, "}\n");
     }
     {
@@ -41164,7 +42117,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             uint8_t opcode = b->byte_code_buf[pc];
             uint32_t instruction_len;
 
-            if (opcode >= OP_COUNT + (OP_TEMP_END - OP_TEMP_START)) {
+            if ((uint32_t)opcode >= OP_COUNT) {
                 JS_ThrowSyntaxError(ctx,
                                     "invalid object literal template metadata: "
                                     "invalid bytecode opcode");

@@ -171,15 +171,18 @@ int main(int argc, char **argv) {
         "\"objCount\":%lld,\"objSize\":%lld,"
         "\"propCount\":%lld,\"propSize\":%lld,"
         "\"shapeCount\":%lld,\"shapeSize\":%lld,"
+        "\"jsFuncCount\":%lld,\"jsFuncSize\":%lld,\"jsFuncCodeSize\":%lld,"
         "\"strCount\":%lld,\"strSize\":%lld,"
         "\"atomCount\":%lld,\"atomSize\":%lld,"
         "\"fastArrayCount\":%lld,\"fastArrayElements\":%lld}\n",
         (long long)u.malloc_size, (long long)u.malloc_count,
         (long long)u.obj_count, (long long)u.obj_size, (long long)u.prop_count,
         (long long)u.prop_size, (long long)u.shape_count,
-        (long long)u.shape_size, (long long)u.str_count, (long long)u.str_size,
-        (long long)u.atom_count, (long long)u.atom_size,
-        (long long)u.fast_array_count, (long long)u.fast_array_elements);
+        (long long)u.shape_size, (long long)u.js_func_count,
+        (long long)u.js_func_size, (long long)u.js_func_code_size,
+        (long long)u.str_count, (long long)u.str_size, (long long)u.atom_count,
+        (long long)u.atom_size, (long long)u.fast_array_count,
+        (long long)u.fast_array_elements);
   }
 
   JS_FreeContext(ctx);

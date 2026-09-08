@@ -63,7 +63,10 @@ FMT(label_u16)
 #define def(id, size, n_pop, n_push, f) DEF(id, size, n_pop, n_push, f)
 #endif
 
-DEF(invalid, 1, 0, 0, none) /* never emitted */
+/* Escape prefix. Subopcode 0/1 are the two debugger trap variants; other
+   subopcodes are rejected. Reusing the never-emitted invalid slot keeps the
+   primary opcode table within one byte. */
+DEF(      esc1, 2, 0, 0, u8)
 
 /* push values */
 DEF(       push_i32, 5, 0, 1, i32)
@@ -141,6 +144,14 @@ DEF(    define_func, 6, 1, 0, atom_u8)
 DEF(      get_field, 5, 1, 1, atom)
 DEF(     get_field2, 5, 1, 2, atom)
 DEF(      put_field, 5, 2, 0, atom)
+
+/* Inline-cache variants: atom:u32 followed by a u16 site index. Same stack
+   effects as the plain forms.
+   Emitted by resolve_labels when JS_ENABLE_IC; always defined and handled so
+   precompiled bytecode blobs stay valid regardless of the build flag. */
+DEF(   get_field_ic, 7, 1, 1, atom_u16)
+DEF(  get_field2_ic, 7, 1, 2, atom_u16)
+DEF(   put_field_ic, 7, 2, 0, atom_u16)
 
 DEF( get_private_field, 1, 2, 1, none) /* obj prop -> value */
 DEF( put_private_field, 1, 3, 0, none) /* obj value prop -> */
@@ -322,7 +333,8 @@ DEF(       get_loc8, 2, 0, 1, loc8)
 DEF(       put_loc8, 2, 1, 0, loc8)
 DEF(       set_loc8, 2, 1, 1, loc8)
 
-DEF(  get_loc0_loc1, 1, 0, 2, none_loc)
+DEF(get_loc_field_nr, 9, 0, 1, atom_u16)
+
 DEF(       get_loc0, 1, 0, 1, none_loc)
 DEF(       get_loc1, 1, 0, 1, none_loc)
 DEF(       get_loc2, 1, 0, 1, none_loc)
@@ -376,10 +388,6 @@ DEF(   is_undefined, 1, 1, 1, none)
 DEF(        is_null, 1, 1, 1, none)
 DEF(typeof_is_undefined, 1, 1, 1, none)
 DEF( typeof_is_function, 1, 1, 1, none)
-
-/* Debugger trap. The u8 operand carries JS_DEBUG_TRACE_* flags. Defined
-   unconditionally so opcode numbering never depends on JS_ENABLE_DEBUGGER. */
-DEF(          debug, 2, 0, 0, u8)
 
 #undef DEF
 #undef def
