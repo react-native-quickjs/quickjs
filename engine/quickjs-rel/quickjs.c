@@ -310,8 +310,8 @@ typedef struct JSMallocState {
 #ifndef JS_ENABLE_IC
 #define JS_ENABLE_IC 1
 #endif
-/* JS_IC_ENTRIES is the per-site width. The shipping default remains
-   monomorphic; 0016 can set it to 4 explicitly at compile time. */
+/* JS_IC_ENTRIES is the per-site width. The shipping default is four entries;
+   an explicit -DJS_IC_ENTRIES=1 retains the cheap monomorphic configuration. */
 #ifndef JS_IC_POLY
 #define JS_IC_POLY 0
 #endif
@@ -319,7 +319,7 @@ typedef struct JSMallocState {
 #if JS_IC_POLY
 #define JS_IC_ENTRIES 2
 #else
-#define JS_IC_ENTRIES 1
+#define JS_IC_ENTRIES 4
 #endif
 #endif
 /* refills that did not stick before a monomorphic/PIC site goes megamorphic */

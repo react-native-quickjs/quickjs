@@ -1,0 +1,45 @@
+Subject: Make four-entry inline caches the shipping default
+
+What this does
+  Changes the default per-site inline-cache width from one entry to four.
+  Explicit `-DJS_IC_ENTRIES=1` builds remain available for controlled
+  monomorphic comparisons.
+
+Why we need it
+  The composed inline-cache implementation is now validated independently,
+  but the release projection still used the narrow configuration while device
+  benchmark recipes used four entries. This patch makes the shipped
+  configuration match the selected device configuration.
+
+What it adds
+  Four-entry inline-cache default  - enables the already-ported 0016 width-
+                                   configurable cache without changing behavior
+                                   or bytecode encoding.
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  This is a configuration-only follow-up to 0016. The megamorphic threshold
+  remains unchanged at eight misses. The foundational width-one configuration
+  remains available as an explicit build-time control.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -310,11 +310,11 @@
+-/* JS_IC_ENTRIES is the per-site width. The shipping default remains
+-   monomorphic; 0016 can set it to 4 explicitly at compile time. */
++/* JS_IC_ENTRIES is the per-site width. The shipping default is four entries;
++   an explicit -DJS_IC_ENTRIES=1 retains the cheap monomorphic configuration. */
+ #ifndef JS_IC_POLY
+ #define JS_IC_POLY 0
+ #endif
+ #ifndef JS_IC_ENTRIES
+ #if JS_IC_POLY
+ #define JS_IC_ENTRIES 2
+ #else
+-#define JS_IC_ENTRIES 1
++#define JS_IC_ENTRIES 4
+ #endif
+ #endif
