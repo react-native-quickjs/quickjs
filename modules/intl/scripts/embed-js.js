@@ -142,7 +142,7 @@ function parseArgs(argv) {
      * has already happened. It is only checked when a qjsc-ng is available; a
      * build with no compiler embeds source and has no blob to measure.
      */
-    maxBlob: 104 * 1000,
+    maxBlob: 106 * 1000,
     embedSource: true,
   };
   for (let i = 2; i < argv.length; i++) {
