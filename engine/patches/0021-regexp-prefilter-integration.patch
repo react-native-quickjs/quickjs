@@ -1,0 +1,74 @@
+From e88ff76407fdedd3b15900722c4d90f1e7a2dc2a Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:00:55 +0500
+Subject: [PATCH] integrate regexp prefilters
+
+
+diff --git a/quickjs.c b/quickjs.c
+index b6c9b41..98ec319 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1061,6 +1061,10 @@ typedef struct JSForInIterator {
+ typedef struct JSRegExp {
+     JSString *pattern;
+     JSString *bytecode; /* also contains the flags */
++    /* borrowed pointer into 'bytecode' at the start of the optimization
++       metadata header, or NULL if the pattern has no metadata. Always
++       re-derived from 'bytecode' by js_regexp_set_compiled_data(). */
++    const uint8_t *metadata;
+ } JSRegExp;
+ 
+ typedef struct JSProxyData {
+@@ -7188,6 +7192,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
+     case JS_CLASS_REGEXP:
+         p->u.regexp.pattern = NULL;
+         p->u.regexp.bytecode = NULL;
++        p->u.regexp.metadata = NULL;
+         goto set_exotic;
+     default:
+     set_exotic:
+@@ -51887,6 +51892,22 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
+     return ret;
+ }
+ 
++/* The caller transfers its existing pattern and bytecode references to re.
++   'metadata' is a borrowed view and must always be re-derived from bytecode. */
++static void js_regexp_set_compiled_data(JSRegExp *re, JSString *pattern,
++                                        JSString *bytecode)
++{
++    LREMetadata metadata;
++
++    re->pattern = pattern;
++    re->bytecode = bytecode;
++    re->metadata = NULL;
++    if (!bytecode->is_wide_char &&
++        lre_get_metadata(str8(bytecode), bytecode->len, &metadata) == 1) {
++        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
++    }
++}
++
+ /* create a RegExp object from a string containing the RegExp bytecode
+    and the source pattern */
+ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
+@@ -51918,8 +51939,8 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
+     }
+     p = JS_VALUE_GET_OBJ(obj);
+     re = &p->u.regexp;
+-    re->pattern = JS_VALUE_GET_STRING(pattern);
+-    re->bytecode = JS_VALUE_GET_STRING(bc);
++    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
++                                JS_VALUE_GET_STRING(bc));
+     return obj;
+ fail:
+     JS_FreeValue(ctx, bc);
+@@ -52066,8 +52087,8 @@ static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
+     }
+     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
+     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
+-    re->pattern = JS_VALUE_GET_STRING(pattern);
+-    re->bytecode = JS_VALUE_GET_STRING(bc);
++    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
++                                JS_VALUE_GET_STRING(bc));
+     if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
+                        js_int32(0)) < 0)
+         return JS_EXCEPTION;
