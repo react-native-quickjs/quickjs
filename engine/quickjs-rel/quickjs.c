@@ -41453,8 +41453,17 @@ static uint32_t bc_csum_sw(const uint8_t *p, size_t n)
 
 #if defined(__ARM_FEATURE_CRC32)
 #define BC_CSUM_HW_ATTR
-#else
+#elif defined(__clang__)
 #define BC_CSUM_HW_ATTR __attribute__((target("crc")))
+#else
+#define BC_CSUM_HW_ATTR __attribute__((target("+crc")))
+#endif
+#if defined(__clang__)
+#define BC_CSUM_CRC32CD __builtin_arm_crc32cd
+#define BC_CSUM_CRC32CB __builtin_arm_crc32cb
+#else
+#define BC_CSUM_CRC32CD __builtin_aarch64_crc32cd
+#define BC_CSUM_CRC32CB __builtin_aarch64_crc32cb
 #endif
 
 BC_CSUM_HW_ATTR
@@ -41464,9 +41473,9 @@ static uint32_t bc_csum_hw(const uint8_t *p, size_t n)
     size_t i = 0;
 
     for (; i + 8 <= n; i += 8)
-        h = __builtin_arm_crc32cd(h, get_u64(p + i));
+        h = BC_CSUM_CRC32CD(h, get_u64(p + i));
     for (; i < n; i++)
-        h = __builtin_arm_crc32cb(h, p[i]);
+        h = BC_CSUM_CRC32CB(h, p[i]);
     return h ^ 0xffffffff;
 }
 
