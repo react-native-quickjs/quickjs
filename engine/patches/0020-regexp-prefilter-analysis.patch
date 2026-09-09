@@ -1,0 +1,1359 @@
+From 2f74df5b17b8a18259a2e5cafb3f1fea4c7a77bc Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:00:44 +0500
+Subject: [PATCH] add regexp prefilter analysis
+
+
+diff --git a/libregexp.c b/libregexp.c
+index 49c474c..ffb119a 100644
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -75,6 +75,14 @@ typedef enum {
+    enough to call the interrupt callback often. */
+ #define INTERRUPT_COUNTER_INIT 10000
+ 
++/* Use GCC/Clang computed-goto (label-as-value) threaded dispatch in the
++   backtracking matcher where available; fall back to a plain switch. */
++#if defined(EMSCRIPTEN) || defined(_MSC_VER)
++#define LRE_DIRECT_DISPATCH 0
++#else
++#define LRE_DIRECT_DISPATCH 1
++#endif
++
+ /* unicode code points */
+ #define CP_LS   0x2028
+ #define CP_PS   0x2029
+@@ -132,6 +140,618 @@ static inline int lre_is_digit(int c) {
+     return c >= '0' && c <= '9';
+ }
+ 
++/* ==== RegExp optimization metadata ====================================== *
++ * The compiler appends optional metadata after the opcode stream so that the
++ * quickjs fast paths can locate matches with direct string searches instead
++ * of running the backtracking interpreter at every input position. The three
++ * derived kinds are: a raw literal (LRE_META_LITERAL, whole pattern is a
++ * substring match), a required literal prefix (LRE_META_PREFIX), and a set of
++ * fixed first-character sets (LRE_META_FIRST_SET). */
++
++/* Return true if the source pattern is a literal run of characters with no
++   metacharacters and no case/unicode folding, i.e. a plain substring. */
++int lre_is_raw_atom(const char *buf, size_t len, int re_flags)
++{
++    size_t i;
++
++    if (len == 0 ||
++        (re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_STICKY |
++                     LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS))) {
++        return false;
++    }
++    for (i = 0; i < len; i++) {
++        switch ((uint8_t)buf[i]) {
++        case '\\': case '^': case '$': case '.': case '*': case '+':
++        case '?': case '(': case ')': case '[': case ']': case '{':
++        case '}': case '|':
++            return false;
++        default:
++            break;
++        }
++    }
++    return true;
++}
++
++/* Match the synthetic ".*?" scan prologue emitted by lre_compile for
++   non-sticky patterns: split_goto_first(+6), any, goto(-11), save_start 0.
++   On success *pentry_pos is the offset of the leading save_start (11). */
++static bool re_get_scan_entry(const uint8_t *bc_buf, size_t bc_buf_len,
++                              size_t *pentry_pos)
++{
++    const uint8_t *code;
++
++    if (bc_buf_len < RE_HEADER_LEN + 13)
++        return false;
++    code = bc_buf + RE_HEADER_LEN;
++    if (code[0] != REOP_split_goto_first || get_i32(code + 1) != 6 ||
++        code[5] != REOP_any || code[6] != REOP_goto ||
++        get_i32(code + 7) != -11 || code[11] != REOP_save_start ||
++        code[12] != 0) {
++        return false;
++    }
++    *pentry_pos = 11;
++    return true;
++}
++
++/* Detect a pattern whose whole body is "save_start 0; char...; save_end 0;
++   match", i.e. a bare literal wrapped in the implicit capture 0. */
++static bool re_has_literal_body(const uint8_t *bc_buf, size_t bc_buf_len,
++                                int re_flags, int capture_count,
++                                size_t *pchar_pos, uint32_t *plength,
++                                int *pencoding)
++{
++    const uint8_t *code;
++    size_t pos, char_pos;
++    uint32_t length, c;
++    int encoding;
++
++    if (capture_count != 1 ||
++        (re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_STICKY |
++                     LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ||
++        bc_buf_len < RE_HEADER_LEN + 16 ||
++        !re_get_scan_entry(bc_buf, bc_buf_len, &char_pos)) {
++        return false;
++    }
++    code = bc_buf + RE_HEADER_LEN;
++    bc_buf_len -= RE_HEADER_LEN;
++
++    pos = char_pos = 13;
++    length = 0;
++    encoding = 0;
++    while (pos < bc_buf_len) {
++        if (code[pos] == REOP_char) {
++            if (pos + 3 > bc_buf_len)
++                return false;
++            c = get_u16(code + pos + 1);
++            pos += 3;
++        } else if (code[pos] == REOP_char32) {
++            if (pos + 5 > bc_buf_len)
++                return false;
++            c = get_u32(code + pos + 1);
++            if (c > 0xffff)
++                return false;
++            pos += 5;
++        } else {
++            break;
++        }
++        if (c > 0xff)
++            encoding = 1;
++        if (length == UINT32_MAX)
++            return false;
++        length++;
++    }
++    if (length == 0 || pos + 3 != bc_buf_len ||
++        code[pos] != REOP_save_end || code[pos + 1] != 0 ||
++        code[pos + 2] != REOP_match) {
++        return false;
++    }
++    *pchar_pos = char_pos;
++    *plength = length;
++    *pencoding = encoding;
++    return true;
++}
++
++/* Detect a required literal prefix (a run of chars that any match must begin
++   with), possibly shared by a leading two-way alternation. */
++static bool re_get_linear_prefix(const uint8_t *bc_buf, size_t bc_buf_len,
++                                 int re_flags, size_t *pentry_pos,
++                                 size_t *pchar_pos, uint32_t *plength,
++                                 int *pencoding)
++{
++    const uint8_t *code;
++    size_t pos, pos1, pos2, target;
++    uint32_t length, c, c1, c2;
++    int encoding;
++
++    if ((re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_STICKY |
++                     LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ||
++        bc_buf_len < RE_HEADER_LEN + 16 ||
++        !re_get_scan_entry(bc_buf, bc_buf_len, &pos)) {
++        return false;
++    }
++    code = bc_buf + RE_HEADER_LEN;
++    bc_buf_len -= RE_HEADER_LEN;
++
++    pos = 13;
++    if (code[pos] == REOP_split_goto_first ||
++        code[pos] == REOP_split_next_first) {
++        if (pos + 5 > bc_buf_len)
++            return false;
++        target = pos + 5 + get_i32(code + pos + 1);
++        if (target >= bc_buf_len)
++            return false;
++        pos1 = pos + 5;
++        pos2 = target;
++        length = 0;
++        encoding = 0;
++        for (;;) {
++            if (pos1 >= bc_buf_len || pos2 >= bc_buf_len)
++                break;
++            if (code[pos1] == REOP_char && pos1 + 3 <= bc_buf_len) {
++                c1 = get_u16(code + pos1 + 1);
++                pos1 += 3;
++            } else if (code[pos1] == REOP_char32 &&
++                       pos1 + 5 <= bc_buf_len) {
++                c1 = get_u32(code + pos1 + 1);
++                pos1 += 5;
++            } else {
++                break;
++            }
++            if (code[pos2] == REOP_char && pos2 + 3 <= bc_buf_len) {
++                c2 = get_u16(code + pos2 + 1);
++                pos2 += 3;
++            } else if (code[pos2] == REOP_char32 &&
++                       pos2 + 5 <= bc_buf_len) {
++                c2 = get_u32(code + pos2 + 1);
++                pos2 += 5;
++            } else {
++                break;
++            }
++            if (c1 != c2 || c1 > 0xffff)
++                break;
++            if (c1 > 0xff)
++                encoding = 1;
++            length++;
++        }
++        if (length == 0)
++            return false;
++        *pentry_pos = 11;
++        *pchar_pos = 18;
++        *plength = length;
++        *pencoding = encoding;
++        return true;
++    }
++    length = 0;
++    encoding = 0;
++    while (pos < bc_buf_len) {
++        if (code[pos] == REOP_char) {
++            if (pos + 3 > bc_buf_len)
++                return false;
++            c = get_u16(code + pos + 1);
++            pos += 3;
++        } else if (code[pos] == REOP_char32) {
++            if (pos + 5 > bc_buf_len)
++                return false;
++            c = get_u32(code + pos + 1);
++            if (c > 0xffff)
++                return false;
++            pos += 5;
++        } else {
++            break;
++        }
++        if (c > 0xff)
++            encoding = 1;
++        if (length == UINT32_MAX)
++            return false;
++        length++;
++    }
++    if (length == 0)
++        return false;
++    *pentry_pos = 11;
++    *pchar_pos = 13;
++    *plength = length;
++    *pencoding = encoding;
++    return true;
++}
++
++/* Append a metadata record (24-byte header + optional decoded payload) to the
++   compiled bytecode. */
++static int re_append_metadata(REParseState *s, int kind, size_t entry_pos,
++                              size_t char_pos, uint32_t length, int encoding,
++                              int metadata_flags)
++{
++    uint8_t header[LRE_META_HEADER_LEN];
++    size_t primary_payload_size, pos, code_len;
++    uint32_t c;
++
++    if (entry_pos > UINT32_MAX || (encoding && length > UINT32_MAX / 2))
++        return 0;
++    primary_payload_size = (metadata_flags & LRE_META_FLAG_SOURCE) ? 0 :
++        (size_t)length << encoding;
++    if (primary_payload_size > UINT32_MAX)
++        return 0;
++    code_len = get_u32(s->byte_code.buf + RE_HEADER_BYTECODE_LEN);
++    memset(header, 0, sizeof(header));
++    header[LRE_META_VERSION_OFFSET] = LRE_META_VERSION;
++    header[LRE_META_KIND_OFFSET] = kind;
++    header[LRE_META_ENCODING_OFFSET] = encoding;
++    header[LRE_META_FLAGS_OFFSET] = metadata_flags;
++    put_u32(header + LRE_META_PAYLOAD_SIZE_OFFSET, primary_payload_size);
++    put_u32(header + LRE_META_LENGTH_OFFSET, length);
++    put_u32(header + LRE_META_ENTRY_OFFSET, entry_pos);
++    dbuf_put(&s->byte_code, header, sizeof(header));
++    if (dbuf_error(&s->byte_code))
++        return -1;
++
++    pos = char_pos;
++    while (primary_payload_size != 0 && pos < code_len) {
++        if (s->byte_code.buf[RE_HEADER_LEN + pos] == REOP_char) {
++            c = get_u16(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
++            pos += 3;
++        } else if (s->byte_code.buf[RE_HEADER_LEN + pos] == REOP_char32) {
++            c = get_u32(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
++            pos += 5;
++        } else {
++            break;
++        }
++        if (encoding)
++            dbuf_put_u16(&s->byte_code, c);
++        else
++            dbuf_putc(&s->byte_code, c);
++        if (--length == 0)
++            break;
++    }
++    put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
++            lre_get_flags(s->byte_code.buf) | LRE_FLAG_HAS_META);
++    return dbuf_error(&s->byte_code) ? -1 : 1;
++}
++
++static int re_append_literal_metadata(REParseState *s, int re_flags,
++                                      bool payload_matches_source)
++{
++    size_t char_pos, code_len;
++    uint32_t length;
++    int encoding;
++
++    code_len = get_u32(s->byte_code.buf + RE_HEADER_BYTECODE_LEN);
++    if (!re_has_literal_body(s->byte_code.buf, RE_HEADER_LEN + code_len,
++                             re_flags, s->capture_count, &char_pos, &length,
++                             &encoding)) {
++        return 0;
++    }
++    if (!payload_matches_source && length > LRE_LITERAL_MAX_LENGTH)
++        return 0;
++    if (re_append_metadata(s, LRE_META_LITERAL, 11, char_pos, length,
++                           encoding, payload_matches_source ?
++                           LRE_META_FLAG_SOURCE : 0) < 0)
++        return -1;
++    put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
++            lre_get_flags(s->byte_code.buf) | LRE_FLAG_ATOM);
++    return 1;
++}
++
++static int re_append_prefix_metadata(REParseState *s, int re_flags)
++{
++    size_t entry_pos, char_pos, code_len, pos;
++    uint32_t c, i, length;
++    int encoding;
++
++    code_len = get_u32(s->byte_code.buf + RE_HEADER_BYTECODE_LEN);
++    if (!re_get_linear_prefix(s->byte_code.buf, RE_HEADER_LEN + code_len,
++                              re_flags, &entry_pos, &char_pos, &length,
++                              &encoding) || length < LRE_PREFIX_MIN_LENGTH) {
++        return 0;
++    }
++    if (length > LRE_PREFIX_MAX_LENGTH) {
++        length = LRE_PREFIX_MAX_LENGTH;
++        encoding = 0;
++        pos = char_pos;
++        for(i = 0; i < length; i++) {
++            if (s->byte_code.buf[RE_HEADER_LEN + pos] == REOP_char) {
++                c = get_u16(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
++                pos += 3;
++            } else {
++                c = get_u32(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
++                pos += 5;
++            }
++            if (c > 0xff)
++                encoding = 1;
++        }
++    }
++    return re_append_metadata(s, LRE_META_PREFIX, entry_pos, char_pos,
++                              length, encoding, 0);
++}
++
++static bool re_get_first_char_set(const uint8_t *bc_buf, size_t bc_buf_len,
++                                  int re_flags, uint8_t *bitmap, int *phas_wide);
++
++/* Derive the set of characters that a match must begin with, when the pattern
++   opens with a single mandatory character or character class. Fills a 256-bit
++   bitmap for code points 0..255 and sets *phas_wide if the first character may
++   be > 0xff. Returns false (no filter) for anything not provably a mandatory
++   leading char/class, which is always sound: falling back to a full scan can
++   never produce a wrong match. */
++#define RE_FIRST_SET_MAX_DEPTH 24
++
++/* Recursively OR the set of possible first characters reachable from 'pos'
++   into 'bitmap', following alternation splits and gotos and skipping
++   zero-width capture bookkeeping. This lets alternation-prefixed patterns
++   (e.g. /foo|bar|baz/) benefit from the leading-scan prefilter, not just
++   single-char/class prefixes. Returns false (sound: caller falls back to a
++   full scan, never a wrong match) for any op it can't statically resolve or
++   if the structure is too deep. *phas_wide is OR-accumulated. */
++static bool re_first_set_scan(const uint8_t *code, size_t bc_buf_len,
++                              size_t pos, uint8_t *bitmap, int *phas_wide,
++                              int *phas_fold, int depth)
++{
++    uint32_t low, high, c;
++    int i, n;
++
++    if (depth > RE_FIRST_SET_MAX_DEPTH)
++        return false;
++    /* Skip zero-width bookkeeping to reach the first consuming op. REOP_set_i32
++       / REOP_set_char_pos as a *leading* op is the counter setup of a counted
++       quantifier with quant_min >= 1 (e.g. \d{3}, [ab]{2,5}): the atom that
++       follows is executed unconditionally at least once, so its first-char set
++       is the mandatory first set of the whole term. (quant_min == 0 quantifiers
++       lead with REOP_split_goto_first, handled by the split case below, which
++       correctly unions the optional atom with what follows.) This lets counted-
++       quantifier-prefixed patterns get the leading scan instead of a full
++       position-by-position VM walk. */
++    for (;;) {
++        if (pos >= bc_buf_len)
++            return false;
++        if (code[pos] == REOP_save_start || code[pos] == REOP_save_end) {
++            pos += 2;
++        } else if (code[pos] == REOP_save_reset) {
++            pos += 3;
++        } else if (code[pos] == REOP_set_i32) {
++            pos += 6;
++        } else if (code[pos] == REOP_set_char_pos) {
++            pos += 2;
++        } else {
++            break;
++        }
++    }
++    switch (code[pos]) {
++    case REOP_split_goto_first:
++    case REOP_split_next_first:
++        if (pos + 5 > bc_buf_len)
++            return false;
++        {
++            int32_t off = (int32_t)get_u32(code + pos + 1);
++            size_t target = pos + 5 + (size_t)off;
++            /* both the fall-through and the goto target can start a match */
++            if (!re_first_set_scan(code, bc_buf_len, pos + 5, bitmap,
++                                   phas_wide, phas_fold, depth + 1))
++                return false;
++            if (target > bc_buf_len)
++                return false;
++            return re_first_set_scan(code, bc_buf_len, target, bitmap,
++                                     phas_wide, phas_fold, depth + 1);
++        }
++    case REOP_goto:
++        if (pos + 5 > bc_buf_len)
++            return false;
++        {
++            int32_t off = (int32_t)get_u32(code + pos + 1);
++            size_t target = pos + 5 + (size_t)off;
++            if (target > bc_buf_len)
++                return false;
++            return re_first_set_scan(code, bc_buf_len, target, bitmap,
++                                     phas_wide, phas_fold, depth + 1);
++        }
++    case REOP_char_i:
++        *phas_fold = 1;
++        /* fallthrough */
++    case REOP_char:
++        if (pos + 3 > bc_buf_len)
++            return false;
++        c = get_u16(code + pos + 1);
++        if (c <= 0xff)
++            bitmap[c >> 3] |= 1 << (c & 7);
++        else
++            *phas_wide = 1;
++        return true;
++    case REOP_char32_i:
++        *phas_fold = 1;
++        /* fallthrough */
++    case REOP_char32:
++        if (pos + 5 > bc_buf_len)
++            return false;
++        c = get_u32(code + pos + 1);
++        if (c <= 0xff)
++            bitmap[c >> 3] |= 1 << (c & 7);
++        else
++            *phas_wide = 1;
++        return true;
++    case REOP_range_i:
++        *phas_fold = 1;
++        /* fallthrough */
++    case REOP_range:
++        if (pos + 3 > bc_buf_len)
++            return false;
++        n = get_u16(code + pos + 1);
++        if (n == 0 || (size_t)n > (bc_buf_len - pos - 3) / 4)
++            return false;
++        for (i = 0; i < n; i++) {
++            low = get_u16(code + pos + 3 + i * 4);
++            high = get_u16(code + pos + 5 + i * 4);
++            if (high > 0xff)
++                *phas_wide = 1;
++            if (low > 0xff)
++                continue;
++            if (high > 0xff)
++                high = 0xff;
++            for (c = low; c <= high; c++)
++                bitmap[c >> 3] |= 1 << (c & 7);
++        }
++        return true;
++    case REOP_range32_i:
++        *phas_fold = 1;
++        /* fallthrough */
++    case REOP_range32:
++        if (pos + 3 > bc_buf_len)
++            return false;
++        n = get_u16(code + pos + 1);
++        if (n == 0 || (size_t)n > (bc_buf_len - pos - 3) / 8)
++            return false;
++        for (i = 0; i < n; i++) {
++            low = get_u32(code + pos + 3 + i * 8);
++            high = get_u32(code + pos + 7 + i * 8);
++            if (high > 0xff)
++                *phas_wide = 1;
++            if (low > 0xff)
++                continue;
++            if (high > 0xff)
++                high = 0xff;
++            for (c = low; c <= high; c++)
++                bitmap[c >> 3] |= 1 << (c & 7);
++        }
++        return true;
++    default:
++        return false;
++    }
++}
++
++static bool re_get_first_char_set(const uint8_t *bc_buf, size_t bc_buf_len,
++                                  int re_flags, uint8_t *bitmap, int *phas_wide)
++{
++    const uint8_t *code;
++    size_t entry_pos;
++    int has_fold;
++
++    /* Case-insensitive first sets use the canonicalized character closure.
++       Sticky and Unicode-surrogate cases remain on the generic path. */
++    if ((re_flags & (LRE_FLAG_STICKY |
++                     LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ||
++        bc_buf_len < RE_HEADER_LEN + 14 ||
++        !re_get_scan_entry(bc_buf, bc_buf_len, &entry_pos)) {
++        return false;
++    }
++    code = bc_buf + RE_HEADER_LEN;
++    bc_buf_len -= RE_HEADER_LEN;
++
++    memset(bitmap, 0, LRE_FIRST_SET_BITMAP_LEN);
++    *phas_wide = 0;
++    has_fold = 0;
++    /* Scan from pos 13 (past the ".*?" scan prologue + its save_start 0),
++       following alternation splits/gotos to union every branch's first char.
++       Case-folding (_i) leading ops store canonical values and set has_fold. */
++    if (!re_first_set_scan(code, bc_buf_len, 13, bitmap, phas_wide, &has_fold, 0))
++        return false;
++
++    if (has_fold) {
++        /* Add every input byte that canonicalizes into the scanned set (e.g.
++           'H' -> {'h','H'}), so the NEON scan can locate /i candidates that
++           lre_exec_at then verifies. UNION with — never replace — the scanned
++           bits: a case-sensitive REOP_char (from (?-i:...)) may store a value
++           that is not a fixed-point of canonicalization, so replacing would
++           drop it and miss real matches. Over-inclusion is always sound; a wide
++           char may also fold into the set, so mark has_wide (the wide path
++           rechecks every position). Non-unicode canonicalization only. */
++        uint8_t closure[LRE_FIRST_SET_BITMAP_LEN];
++        int b;
++        uint32_t cb;
++        memset(closure, 0, sizeof(closure));
++        for (b = 0; b < 256; b++) {
++            cb = lre_canonicalize(b, false);
++            if (cb <= 0xff && ((bitmap[cb >> 3] >> (cb & 7)) & 1))
++                closure[b >> 3] |= 1 << (b & 7);
++        }
++        for (b = 0; b < LRE_FIRST_SET_BITMAP_LEN; b++)
++            bitmap[b] |= closure[b];
++        *phas_wide = 1;
++    }
++    return true;
++}
++
++static int re_append_first_set_metadata(REParseState *s, int re_flags)
++{
++    uint8_t header[LRE_META_HEADER_LEN];
++    uint8_t bitmap[LRE_FIRST_SET_BITMAP_LEN];
++    size_t code_len;
++    int has_wide;
++
++    code_len = get_u32(s->byte_code.buf + RE_HEADER_BYTECODE_LEN);
++    if (!re_get_first_char_set(s->byte_code.buf, RE_HEADER_LEN + code_len,
++                               re_flags, bitmap, &has_wide)) {
++        return 0;
++    }
++    memset(header, 0, sizeof(header));
++    header[LRE_META_VERSION_OFFSET] = LRE_META_VERSION;
++    header[LRE_META_KIND_OFFSET] = LRE_META_FIRST_SET;
++    put_u32(header + LRE_META_PAYLOAD_SIZE_OFFSET, LRE_FIRST_SET_PAYLOAD_LEN);
++    put_u32(header + LRE_META_LENGTH_OFFSET, 0);
++    put_u32(header + LRE_META_ENTRY_OFFSET, 11);
++    dbuf_put(&s->byte_code, header, sizeof(header));
++    dbuf_putc(&s->byte_code, has_wide);
++    dbuf_put(&s->byte_code, bitmap, sizeof(bitmap));
++    put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
++            lre_get_flags(s->byte_code.buf) | LRE_FLAG_HAS_META);
++    return dbuf_error(&s->byte_code) ? -1 : 1;
++}
++
++/* Parse the metadata trailer. Returns 1 if present and well-formed, 0 if
++   absent, -1 if malformed. *ptrailer (if given) receives the byte following
++   the metadata (where group names begin). */
++static int lre_parse_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
++                              LREMetadata *meta, const uint8_t **ptrailer)
++{
++    const uint8_t *p, *end;
++    size_t code_len;
++    uint32_t payload_size;
++    int flags;
++
++    if (meta)
++        memset(meta, 0, sizeof(*meta));
++    if (!bc_buf || bc_buf_len < RE_HEADER_LEN)
++        return -1;
++    code_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
++    if (code_len > bc_buf_len - RE_HEADER_LEN)
++        return -1;
++    p = bc_buf + RE_HEADER_LEN + code_len;
++    end = bc_buf + bc_buf_len;
++    flags = get_u16(bc_buf + RE_HEADER_FLAGS);
++    if (!(flags & LRE_FLAG_HAS_META)) {
++        if (ptrailer)
++            *ptrailer = p;
++        return 0;
++    }
++    if ((size_t)(end - p) < LRE_META_HEADER_LEN ||
++        p[LRE_META_VERSION_OFFSET] != LRE_META_VERSION ||
++        p[LRE_META_KIND_OFFSET] > LRE_META_FIRST_SET ||
++        p[LRE_META_ENCODING_OFFSET] > 1 ||
++        (p[LRE_META_FLAGS_OFFSET] & ~LRE_META_FLAG_SOURCE)) {
++        return -1;
++    }
++    payload_size = get_u32(p + LRE_META_PAYLOAD_SIZE_OFFSET);
++    if (payload_size > (size_t)(end - p - LRE_META_HEADER_LEN))
++        return -1;
++    if (meta) {
++        meta->kind = p[LRE_META_KIND_OFFSET];
++        meta->encoding = p[LRE_META_ENCODING_OFFSET];
++        meta->flags = p[LRE_META_FLAGS_OFFSET];
++        meta->payload_size = payload_size;
++        meta->primary_payload_size = payload_size;
++        meta->length = get_u32(p + LRE_META_LENGTH_OFFSET);
++        meta->entry_offset = get_u32(p + LRE_META_ENTRY_OFFSET);
++        meta->payload = p + LRE_META_HEADER_LEN;
++        meta->leading_chars = NULL;
++    }
++    if (ptrailer)
++        *ptrailer = p + LRE_META_HEADER_LEN + payload_size;
++    return 1;
++}
++
++int lre_get_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
++                     LREMetadata *meta)
++{
++    if (!meta)
++        return -1;
++    return lre_parse_metadata(bc_buf, bc_buf_len, meta, NULL);
++}
++
+ /* insert 'len' bytes at position 'pos'. Return < 0 if error. */
+ static int dbuf_insert(DynBuf *s, int pos, int len)
+ {
+@@ -2562,7 +3185,7 @@ static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
+ static void *lre_bytecode_realloc(void *opaque, void *ptr, size_t size)
+ {
+     if (size > (INT32_MAX / 2)) {
+-        /* the bytecode cannot be larger than 2G. Leave some slack to 
++        /* the bytecode cannot be larger than 2G. Leave some slack to
+            avoid some overflows. */
+         return NULL;
+     } else {
+@@ -2579,8 +3202,9 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+                      void *opaque)
+ {
+     REParseState s_s, *s = &s_s;
+-    int register_count;
++    int register_count, metadata_result;
+     bool is_sticky;
++    bool payload_matches_source;
+ 
+     memset(s, 0, sizeof(*s));
+     s->opaque = opaque;
+@@ -2597,6 +3221,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+     s->capture_count = 1;
+     s->total_capture_count = -1;
+     s->has_named_captures = -1;
++    payload_matches_source = lre_is_raw_atom(buf, buf_len, re_flags);
+ 
+     dbuf_init2(&s->byte_code, opaque, lre_bytecode_realloc);
+     dbuf_init2(&s->group_names, opaque, lre_realloc);
+@@ -2651,6 +3276,18 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+     put_u32(s->byte_code.buf + RE_HEADER_BYTECODE_LEN,
+             s->byte_code.size - RE_HEADER_LEN);
+ 
++    /* Append the optional search metadata before the named-group trailer. */
++    metadata_result = re_append_literal_metadata(s, re_flags,
++                                                 payload_matches_source);
++    if (metadata_result == 0)
++        metadata_result = re_append_prefix_metadata(s, re_flags);
++    if (metadata_result == 0)
++        metadata_result = re_append_first_set_metadata(s, re_flags);
++    if (metadata_result < 0) {
++        re_parse_out_of_memory(s);
++        goto error;
++    }
++
+     /* add the named groups if needed */
+     if (s->group_names.size > (s->capture_count - 1) * LRE_GROUP_NAME_TRAILER_LEN) {
+         if (dbuf_put(&s->byte_code, s->group_names.buf, s->group_names.size)) {
+@@ -2829,563 +3466,19 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
+ }
+ 
+ /* return 1 if match, 0 if not match or < 0 if error. */
+-static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
+-                                   const uint8_t *pc, const uint8_t *cptr)
+-{
+-    int opcode;
+-    int cbuf_type;
+-    uint32_t val, c, idx;
+-    const uint8_t *cbuf_end;
+-    StackElem *sp, *bp, *stack_end;
+-#ifdef DUMP_EXEC
+-    const uint8_t *pc_start = pc; /* TEST */
+-#endif
+-    cbuf_type = s->cbuf_type;
+-    cbuf_end = s->cbuf_end;
+-
+-    sp = s->stack_buf;
+-    bp = s->stack_buf;
+-    stack_end = s->stack_buf + s->stack_size;
+-    
+-#define CHECK_STACK_SPACE(n)                            \
+-    if (unlikely((stack_end - sp) < (n))) {             \
+-        size_t saved_sp = sp - s->stack_buf;            \
+-        size_t saved_bp = bp - s->stack_buf;            \
+-        if (stack_realloc(s, sp - s->stack_buf + (n)))  \
+-            return LRE_RET_MEMORY_ERROR;                \
+-        stack_end = s->stack_buf + s->stack_size;       \
+-        sp = s->stack_buf + saved_sp;                   \
+-        bp = s->stack_buf + saved_bp;                   \
+-    }
+-
+-    /* XXX: could test if the value was saved to reduce the stack size
+-       but slower */
+-#define SAVE_CAPTURE(idx, value)                        \
+-    {                                                   \
+-        CHECK_STACK_SPACE(2);                           \
+-        sp[0].val = idx;                                \
+-        sp[1].ptr = capture[idx];                       \
+-        sp += 2;                                        \
+-        capture[idx] = (value);                         \
+-    }
+-
+-    /* avoid saving the previous value if already saved */
+-#define SAVE_CAPTURE_CHECK(idx, value)          \
+-    {                                           \
+-        StackElem *sp1;                         \
+-        sp1 = sp;                               \
+-        for(;;) {                               \
+-            if (sp1 > bp) {                             \
+-                if (sp1[-2].val == idx)                 \
+-                    break;                              \
+-                sp1 -= 2;                               \
+-            } else {                                    \
+-                CHECK_STACK_SPACE(2);                   \
+-                sp[0].val = idx;                        \
+-                sp[1].ptr = capture[idx];               \
+-                sp += 2;                                \
+-                break;                                  \
+-            }                                           \
+-        }                                               \
+-        capture[idx] = (value);                         \
+-    }
+-
+-
+-#ifdef DUMP_EXEC
+-    printf("%5s %5s %5s %5s %s\n", "PC", "CP", "BP", "SP", "OPCODE");
+-#endif    
+-    for(;;) {
+-        opcode = *pc++;
+-#ifdef DUMP_EXEC
+-        printf("%5ld %5ld %5ld %5ld %s\n",
+-               pc - 1 - pc_start,
+-               cbuf_type == 0 ? cptr - s->cbuf : (cptr - s->cbuf) / 2,
+-               bp - s->stack_buf,
+-               sp - s->stack_buf,
+-               reopcode_info[opcode].name);
+-#endif        
+-        switch(opcode) {
+-        case REOP_match:
+-            return 1;
+-        no_match:
+-            for(;;) {
+-                REExecStateEnum type;
+-                if (bp == s->stack_buf)
+-                    return 0;
+-                /* undo the modifications to capture[] */
+-                while (sp > bp) {
+-                    capture[sp[-2].val] = sp[-1].ptr;
+-                    sp -= 2;
+-                }
+-                
+-                pc = sp[-3].ptr;
+-                cptr = sp[-2].ptr;
+-                type = sp[-1].bp.type;
+-                bp = s->stack_buf + sp[-1].bp.val;
+-                sp -= 3;
+-                if (type != RE_EXEC_STATE_LOOKAHEAD)
+-                    break;
+-            }
+-            if (lre_poll_timeout(s))
+-                return LRE_RET_TIMEOUT;
+-            break;
+-        case REOP_lookahead_match:
+-            /* pop all the saved states until reaching the start of
+-               the lookahead and keep the updated captures and
+-               variables and the corresponding undo info. */
+-            {
+-                StackElem *sp1, *sp_top, *next_sp;
+-                REExecStateEnum type;
+-
+-                sp_top = sp;
+-                for(;;) {
+-                    sp1 = sp;
+-                    sp = bp;
+-                    pc = sp[-3].ptr;
+-                    cptr = sp[-2].ptr;
+-                    type = sp[-1].bp.type;
+-                    bp = s->stack_buf + sp[-1].bp.val;
+-                    sp[-1].ptr = (void *)sp1; /* save the next value for the copy step */
+-                    sp -= 3;
+-                    if (type == RE_EXEC_STATE_LOOKAHEAD)
+-                        break;
+-                }
+-                if (sp != s->stack_buf) {
+-                    /* keep the undo info if there is a saved state */
+-                    sp1 = sp;
+-                    while (sp1 < sp_top) {
+-                        next_sp = (void *)sp1[2].ptr;
+-                        sp1 += 3;
+-                        while (sp1 < next_sp)
+-                            *sp++ = *sp1++;
+-                    }
+-                }
+-            }
+-            break;
+-        case REOP_negative_lookahead_match:
+-            /* pop all the saved states until reaching start of the negative lookahead */
+-            for(;;) {
+-                REExecStateEnum type;
+-                type = bp[-1].bp.type;
+-                /* undo the modifications to capture[] */
+-                while (sp > bp) {
+-                    capture[sp[-2].val] = sp[-1].ptr;
+-                    sp -= 2;
+-                }
+-                pc = sp[-3].ptr;
+-                cptr = sp[-2].ptr;
+-                type = sp[-1].bp.type;
+-                bp = s->stack_buf + sp[-1].bp.val;
+-                sp -= 3;
+-                if (type == RE_EXEC_STATE_NEGATIVE_LOOKAHEAD)
+-                    break;
+-            }
+-            goto no_match;
+-        case REOP_char32:
+-        case REOP_char32_i:
+-            val = get_u32(pc);
+-            pc += 4;
+-            goto test_char;
+-        case REOP_char:
+-        case REOP_char_i:
+-            val = get_u16(pc);
+-            pc += 2;
+-        test_char:
+-            if (cptr >= cbuf_end)
+-                goto no_match;
+-            GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-            if (opcode == REOP_char_i || opcode == REOP_char32_i) {
+-                c = lre_canonicalize(c, s->is_unicode);
+-            }
+-            if (val != c)
+-                goto no_match;
+-            break;
+-        case REOP_split_goto_first:
+-        case REOP_split_next_first:
+-            {
+-                const uint8_t *pc1;
+-
+-                val = get_u32(pc);
+-                pc += 4;
+-                if (opcode == REOP_split_next_first) {
+-                    pc1 = pc + (int)val;
+-                } else {
+-                    pc1 = pc;
+-                    pc = pc + (int)val;
+-                }
+-                CHECK_STACK_SPACE(3);
+-                sp[0].ptr = (uint8_t *)pc1;
+-                sp[1].ptr = (uint8_t *)cptr;
+-                sp[2].bp.val = bp - s->stack_buf;
+-                sp[2].bp.type = RE_EXEC_STATE_SPLIT;
+-                sp += 3;
+-                bp = sp;
+-            }
+-            break;
+-        case REOP_lookahead:
+-        case REOP_negative_lookahead:
+-            val = get_u32(pc);
+-            pc += 4;
+-            CHECK_STACK_SPACE(3);
+-            sp[0].ptr = (uint8_t *)(pc + (int)val);
+-            sp[1].ptr = (uint8_t *)cptr;
+-            sp[2].bp.val = bp - s->stack_buf;
+-            sp[2].bp.type = RE_EXEC_STATE_LOOKAHEAD + opcode - REOP_lookahead;
+-            sp += 3;
+-            bp = sp;
+-            break;
+-        case REOP_goto:
+-            val = get_u32(pc);
+-            pc += 4 + (int)val;
+-            if (lre_poll_timeout(s))
+-                return LRE_RET_TIMEOUT;
+-            break;
+-        case REOP_line_start:
+-        case REOP_line_start_m:
+-            if (cptr == s->cbuf)
+-                break;
+-            if (opcode == REOP_line_start)
+-                goto no_match;
+-            PEEK_PREV_CHAR(c, cptr, s->cbuf, cbuf_type);
+-            if (!is_line_terminator(c))
+-                goto no_match;
+-            break;
+-        case REOP_line_end:
+-        case REOP_line_end_m:
+-            if (cptr == cbuf_end)
+-                break;
+-            if (opcode == REOP_line_end)
+-                goto no_match;
+-            PEEK_CHAR(c, cptr, cbuf_end, cbuf_type);
+-            if (!is_line_terminator(c))
+-                goto no_match;
+-            break;
+-        case REOP_dot:
+-            if (cptr == cbuf_end)
+-                goto no_match;
+-            GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-            if (is_line_terminator(c))
+-                goto no_match;
+-            break;
+-        case REOP_any:
+-            if (cptr == cbuf_end)
+-                goto no_match;
+-            GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-            break;
+-        case REOP_space:
+-            if (cptr == cbuf_end)
+-                goto no_match;
+-            GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-            if (!lre_is_space(c))
+-                goto no_match;
+-            break;
+-        case REOP_not_space:
+-            if (cptr == cbuf_end)
+-                goto no_match;
+-            GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-            if (lre_is_space(c))
+-                goto no_match;
+-            break;
+-        case REOP_save_start:
+-        case REOP_save_end:
+-            val = *pc++;
+-            if (val >= (uint32_t)s->capture_count)
+-                return LRE_RET_BYTECODE_ERROR;
+-            idx = 2 * val + opcode - REOP_save_start;
+-            SAVE_CAPTURE(idx, (uint8_t *)cptr);
+-            break;
+-        case REOP_save_reset:
+-            {
+-                uint32_t val2;
+-                val = pc[0];
+-                val2 = pc[1];
+-                pc += 2;
+-                if (val2 >= (uint32_t)s->capture_count)
+-                    return LRE_RET_BYTECODE_ERROR;
+-                CHECK_STACK_SPACE(2 * (val2 - val + 1));
+-                while (val <= val2) {
+-                    idx = 2 * val;
+-                    SAVE_CAPTURE(idx, NULL);
+-                    idx = 2 * val + 1;
+-                    SAVE_CAPTURE(idx, NULL);
+-                    val++;
+-                }
+-            }
+-            break;
+-        case REOP_set_i32:
+-            idx = 2 * s->capture_count + pc[0];
+-            val = get_u32(pc + 1);
+-            pc += 5;
+-            SAVE_CAPTURE_CHECK(idx, (void *)(uintptr_t)val);
+-            break;
+-        case REOP_loop:
+-            {
+-                uint32_t val2;
+-                idx = 2 * s->capture_count + pc[0];
+-                val = get_u32(pc + 1);
+-                pc += 5;
+-
+-                val2 = (uintptr_t)capture[idx] - 1;
+-                SAVE_CAPTURE_CHECK(idx, (void *)(uintptr_t)val2);
+-                if (val2 != 0) {
+-                    pc += (int)val;
+-                    if (lre_poll_timeout(s))
+-                        return LRE_RET_TIMEOUT;
+-                }
+-            }
+-            break;
+-        case REOP_loop_split_goto_first:
+-        case REOP_loop_split_next_first:
+-        case REOP_loop_check_adv_split_goto_first:
+-        case REOP_loop_check_adv_split_next_first:
+-            {
+-                const uint8_t *pc1;
+-                uint32_t val2, limit;
+-                idx = 2 * s->capture_count + pc[0];
+-                limit = get_u32(pc + 1);
+-                val = get_u32(pc + 5);
+-                pc += 9;
+-
+-                /* decrement the counter */
+-                val2 = (uintptr_t)capture[idx] - 1;
+-                SAVE_CAPTURE_CHECK(idx, (void *)(uintptr_t)val2);
+-
+-                if (val2 > limit) {
+-                    /* normal loop if counter > limit */
+-                    pc += (int)val;
+-                    if (lre_poll_timeout(s))
+-                        return LRE_RET_TIMEOUT;
+-                } else {
+-                    /* check advance */
+-                    if ((opcode == REOP_loop_check_adv_split_goto_first ||
+-                         opcode == REOP_loop_check_adv_split_next_first) &&
+-                        capture[idx + 1] == cptr &&
+-                        val2 != limit) {
+-                        goto no_match;
+-                    }
+-                    
+-                    /* otherwise conditional split */
+-                    if (val2 != 0) {
+-                        if (opcode == REOP_loop_split_next_first ||
+-                            opcode == REOP_loop_check_adv_split_next_first) {
+-                            pc1 = pc + (int)val;
+-                        } else {
+-                            pc1 = pc;
+-                            pc = pc + (int)val;
+-                        }
+-                        CHECK_STACK_SPACE(3);
+-                        sp[0].ptr = (uint8_t *)pc1;
+-                        sp[1].ptr = (uint8_t *)cptr;
+-                        sp[2].bp.val = bp - s->stack_buf;
+-                        sp[2].bp.type = RE_EXEC_STATE_SPLIT;
+-                        sp += 3;
+-                        bp = sp;
+-                    }
+-                }
+-            }
+-            break;
+-        case REOP_set_char_pos:
+-            idx = 2 * s->capture_count + pc[0];
+-            pc++;
+-            SAVE_CAPTURE_CHECK(idx, (uint8_t *)cptr);
+-            break;
+-        case REOP_check_advance:
+-            idx = 2 * s->capture_count + pc[0];
+-            pc++;
+-            if (capture[idx] == cptr)
+-                goto no_match;
+-            break;
+-        case REOP_word_boundary:
+-        case REOP_word_boundary_i:
+-        case REOP_not_word_boundary:
+-        case REOP_not_word_boundary_i:
+-            {
+-                bool v1, v2;
+-                int ignore_case = (opcode == REOP_word_boundary_i || opcode == REOP_not_word_boundary_i);
+-                bool is_boundary = (opcode == REOP_word_boundary || opcode == REOP_word_boundary_i);
+-                /* char before */
+-                if (cptr == s->cbuf) {
+-                    v1 = false;
+-                } else {
+-                    PEEK_PREV_CHAR(c, cptr, s->cbuf, cbuf_type);
+-                    if (c < 256) {
+-                        v1 = (lre_is_word_byte(c) != 0);
+-                    } else {
+-                        v1 = ignore_case && (c == 0x017f || c == 0x212a);
+-                    }
+-                }
+-                /* current char */
+-                if (cptr >= cbuf_end) {
+-                    v2 = false;
+-                } else {
+-                    PEEK_CHAR(c, cptr, cbuf_end, cbuf_type);
+-                    if (c < 256) {
+-                        v2 = (lre_is_word_byte(c) != 0);
+-                    } else {
+-                        v2 = ignore_case && (c == 0x017f || c == 0x212a);
+-                    }
+-                }
+-                if (v1 ^ v2 ^ is_boundary)
+-                    goto no_match;
+-            }
+-            break;
+-        case REOP_back_reference:
+-        case REOP_back_reference_i:
+-        case REOP_backward_back_reference:
+-        case REOP_backward_back_reference_i:
+-            {
+-                const uint8_t *cptr1, *cptr1_end, *cptr1_start;
+-                const uint8_t *pc1;
+-                uint32_t c1, c2;
+-                int i, n;
+-
+-                n = *pc++;
+-                pc1 = pc;
+-                pc += n;
+-
+-                for(i = 0; i < n; i++) {
+-                    val = pc1[i];
+-                    if (val >= s->capture_count)
+-                        goto no_match;
+-                    cptr1_start = capture[2 * val];
+-                    cptr1_end = capture[2 * val + 1];
+-                    /* test the first not empty capture */
+-                    if (cptr1_start && cptr1_end) {
+-                        if (opcode == REOP_back_reference ||
+-                            opcode == REOP_back_reference_i) {
+-                            cptr1 = cptr1_start;
+-                            while (cptr1 < cptr1_end) {
+-                                if (cptr >= cbuf_end)
+-                                    goto no_match;
+-                                GET_CHAR(c1, cptr1, cptr1_end, cbuf_type);
+-                                GET_CHAR(c2, cptr, cbuf_end, cbuf_type);
+-                                if (opcode == REOP_back_reference_i) {
+-                                    c1 = lre_canonicalize(c1, s->is_unicode);
+-                                    c2 = lre_canonicalize(c2, s->is_unicode);
+-                                }
+-                                if (c1 != c2)
+-                                    goto no_match;
+-                            }
+-                        } else {
+-                            cptr1 = cptr1_end;
+-                            while (cptr1 > cptr1_start) {
+-                                if (cptr == s->cbuf)
+-                                    goto no_match;
+-                                GET_PREV_CHAR(c1, cptr1, cptr1_start, cbuf_type);
+-                                GET_PREV_CHAR(c2, cptr, s->cbuf, cbuf_type);
+-                                if (opcode == REOP_backward_back_reference_i) {
+-                                    c1 = lre_canonicalize(c1, s->is_unicode);
+-                                    c2 = lre_canonicalize(c2, s->is_unicode);
+-                                }
+-                                if (c1 != c2)
+-                                    goto no_match;
+-                            }
+-                        }
+-                        break;
+-                    }
+-                }
+-            }
+-            break;
+-        case REOP_range:
+-        case REOP_range_i:
+-            {
+-                int n;
+-                uint32_t low, high, idx_min, idx_max, idx;
+-
+-                n = get_u16(pc); /* n must be >= 1 */
+-                pc += 2;
+-                if (cptr >= cbuf_end)
+-                    goto no_match;
+-                GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-                if (opcode == REOP_range_i) {
+-                    c = lre_canonicalize(c, s->is_unicode);
+-                }
+-                idx_min = 0;
+-                low = get_u16(pc + 0 * 4);
+-                if (c < low)
+-                    goto no_match;
+-                idx_max = n - 1;
+-                high = get_u16(pc + idx_max * 4 + 2);
+-                /* 0xffff in for last value means +infinity */
+-                if (unlikely(c >= 0xffff) && high == 0xffff)
+-                    goto range_match;
+-                if (c > high)
+-                    goto no_match;
+-                while (idx_min <= idx_max) {
+-                    idx = (idx_min + idx_max) / 2;
+-                    low = get_u16(pc + idx * 4);
+-                    high = get_u16(pc + idx * 4 + 2);
+-                    if (c < low)
+-                        idx_max = idx - 1;
+-                    else if (c > high)
+-                        idx_min = idx + 1;
+-                    else
+-                        goto range_match;
+-                }
+-                goto no_match;
+-            range_match:
+-                pc += 4 * n;
+-            }
+-            break;
+-        case REOP_range32:
+-        case REOP_range32_i:
+-            {
+-                int n;
+-                uint32_t low, high, idx_min, idx_max, idx;
+-
+-                n = get_u16(pc); /* n must be >= 1 */
+-                pc += 2;
+-                if (cptr >= cbuf_end)
+-                    goto no_match;
+-                GET_CHAR(c, cptr, cbuf_end, cbuf_type);
+-                if (opcode == REOP_range32_i) {
+-                    c = lre_canonicalize(c, s->is_unicode);
+-                }
+-                idx_min = 0;
+-                low = get_u32(pc + 0 * 8);
+-                if (c < low)
+-                    goto no_match;
+-                idx_max = n - 1;
+-                high = get_u32(pc + idx_max * 8 + 4);
+-                if (c > high)
+-                    goto no_match;
+-                while (idx_min <= idx_max) {
+-                    idx = (idx_min + idx_max) / 2;
+-                    low = get_u32(pc + idx * 8);
+-                    high = get_u32(pc + idx * 8 + 4);
+-                    if (c < low)
+-                        idx_max = idx - 1;
+-                    else if (c > high)
+-                        idx_min = idx + 1;
+-                    else
+-                        goto range32_match;
+-                }
+-                goto no_match;
+-            range32_match:
+-                pc += 8 * n;
+-            }
+-            break;
+-        case REOP_prev:
+-            /* go to the previous char */
+-            if (cptr == s->cbuf)
+-                goto no_match;
+-            PREV_CHAR(cptr, s->cbuf, cbuf_type);
+-            break;
+-        default:
+-#ifdef DUMP_EXEC
+-            printf("unknown opcode pc=%ld\n", pc - 1 - pc_start);
+-#endif            
+-            abort();
+-        }
+-    }
+-}
++#define LRE_BT_FUNC lre_exec_backtrack
++#define LRE_CBUF_TYPE_INIT (s->cbuf_type)
++#include "libregexp-backtrack.c.inc"
++#undef LRE_BT_FUNC
++#undef LRE_CBUF_TYPE_INIT
+ 
+ /* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
+    starting position of the match and must be such as 0 <= cindex <=
+    clen. */
+-int lre_exec(uint8_t **capture,
+-             const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
+-             int cbuf_type, void *opaque)
++static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
++                             uint32_t bytecode_offset,
++                             const uint8_t *cbuf, int cindex, int clen,
++                             int cbuf_type, void *opaque)
+ {
+     REExecContext s_s, *s = &s_s;
+     int re_flags, i, ret;
+@@ -3416,13 +3509,42 @@ int lre_exec(uint8_t **capture,
+         }
+     }
+ 
+-    ret = lre_exec_backtrack(s, capture, bc_buf + RE_HEADER_LEN, cptr);
++    ret = lre_exec_backtrack(s, capture,
++                             bc_buf + RE_HEADER_LEN + bytecode_offset, cptr);
+ 
+     if (s->stack_buf != s->static_stack_buf)
+         lre_realloc(s->opaque, s->stack_buf, 0);
+     return ret;
+ }
+ 
++int lre_exec(uint8_t **capture,
++             const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
++             int cbuf_type, void *opaque)
++{
++    return lre_exec_internal(capture, bc_buf, 0, cbuf, cindex, clen,
++                             cbuf_type, opaque);
++}
++
++/* Execute the pattern anchored at 'cindex', entering the bytecode at
++   'bytecode_offset' (which must point at the leading REOP_save_start 0 that
++   follows the synthetic .*? scan prologue). Used by the quickjs fast paths
++   after they have located a candidate start position by direct string
++   search. Returns 0 when 'bytecode_offset' is not a valid save_start entry. */
++int lre_exec_at(uint8_t **capture,
++                const uint8_t *bc_buf, uint32_t bytecode_offset,
++                const uint8_t *cbuf, int cindex, int clen,
++                int cbuf_type, void *opaque)
++{
++    uint32_t bytecode_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
++
++    if (bytecode_len < 2 || bytecode_offset > bytecode_len - 2 ||
++        bc_buf[RE_HEADER_LEN + bytecode_offset] != REOP_save_start ||
++        bc_buf[RE_HEADER_LEN + bytecode_offset + 1] != 0)
++        return 0;
++    return lre_exec_internal(capture, bc_buf, bytecode_offset, cbuf, cindex,
++                             clen, cbuf_type, opaque);
++}
++
+ int lre_get_alloc_count(const uint8_t *bc_buf)
+ {
+     return bc_buf[RE_HEADER_CAPTURE_COUNT] * 2 +
+@@ -3455,13 +3577,20 @@ int lre_get_flags(const uint8_t *bc_buf)
+ 
+ /* Return NULL if no group names. Otherwise, return a pointer to
+    'capture_count - 1' zero terminated UTF-8 strings. */
+-const char *lre_get_groupnames(const uint8_t *bc_buf)
++const char *lre_get_groupnames(const uint8_t *bc_buf, size_t bc_buf_len)
+ {
+-    uint32_t re_bytecode_len;
++    const uint8_t *trailer;
++
++    if (!bc_buf || bc_buf_len < RE_HEADER_LEN)
++        return NULL;
+     if ((lre_get_flags(bc_buf) & LRE_FLAG_NAMED_GROUPS) == 0)
+         return NULL;
+-    re_bytecode_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+-    return (const char *)(bc_buf + RE_HEADER_LEN + re_bytecode_len);
++    /* Group names follow the optional optimization metadata; parse it to
++       find the trailer. */
++    if (lre_parse_metadata(bc_buf, bc_buf_len, NULL, &trailer) < 0 ||
++        trailer >= bc_buf + bc_buf_len)
++        return NULL;
++    return (const char *)trailer;
+ }
+ 
+ #ifdef TEST
+diff --git a/libregexp.h b/libregexp.h
+index 8f345b7..e585b1c 100644
+--- a/libregexp.h
++++ b/libregexp.h
+@@ -105,7 +105,7 @@ int lre_get_flags(const uint8_t *bc_buf);
+ int lre_is_raw_atom(const char *buf, size_t len, int re_flags);
+ int lre_get_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
+                      LREMetadata *meta);
+-const char *lre_get_groupnames(const uint8_t *bc_buf);
++const char *lre_get_groupnames(const uint8_t *bc_buf, size_t bc_buf_len);
+ int lre_exec(uint8_t **capture,
+              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
+              int cbuf_type, void *opaque);
+diff --git a/quickjs.c b/quickjs.c
+index 714dff9..b6c9b41 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -52413,7 +52413,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
+                                js_int32((capture[1] - str_buf) >> shift)) < 0)
+                 goto fail;
+         }
+-        group_name_ptr = lre_get_groupnames(re_bytecode);
++        group_name_ptr = lre_get_groupnames(re_bytecode, re->bytecode->len);
+         if (group_name_ptr) {
+             groups = JS_NewObjectProto(ctx, JS_NULL);
+             if (JS_IsException(groups))

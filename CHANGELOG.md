@@ -59,8 +59,8 @@ and this project adheres to [Semantic Versioning][semver].
   alongside compiled regexp bytecode.
 - Patch `0019`: adds the runtime-width backtracking matcher with computed-goto
   dispatch and register-based execution.
-- Patch `0020`: adds literal, prefix, and first-set analysis so the matcher can
-  reject impossible start positions before entering the full interpreter.
+- Patch `0020`: analyzes patterns for literal, prefix, and first-set candidate
+  searches before entering the full matcher.
 - Patch `0021`: wires the prefilter analysis into regexp compilation and
   execution. It is primarily an integration step; the benchmark change was
   within run-to-run noise.
