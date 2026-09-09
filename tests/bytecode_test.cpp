@@ -15,6 +15,7 @@
 #include <QuickJSRuntimeFactory.h>
 #include <gtest/gtest.h>
 #include <jsi/jsi.h>
+#include <quickjs.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -110,6 +111,34 @@ TEST(Bytecode, PlainSourceIsNotMistakenForBytecode) {
                                       'S', 0,   1,   0,   0,   0};
   EXPECT_FALSE(
       qjs::isBytecodeContainer(otherEngine.data(), otherEngine.size()));
+}
+
+TEST(Bytecode, RegExpObjectRoundTripUsesContextAllocator) {
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+
+  static constexpr char source[] = "/a(?:b|c)+/g";
+  JSValue regexp = JS_Eval(
+      ctx, source, sizeof(source) - 1, "regexp.js", JS_EVAL_TYPE_GLOBAL);
+  ASSERT_FALSE(JS_IsException(regexp));
+
+  size_t serialized_size = 0;
+  uint8_t *serialized =
+      JS_WriteObject(ctx, &serialized_size, regexp, JS_WRITE_OBJ_BYTECODE);
+  ASSERT_NE(serialized, nullptr);
+  ASSERT_GT(serialized_size, 0u);
+
+  JSValue round_trip =
+      JS_ReadObject(ctx, serialized, serialized_size, JS_READ_OBJ_BYTECODE);
+  EXPECT_FALSE(JS_IsException(round_trip));
+
+  JS_FreeValue(ctx, round_trip);
+  JS_FreeValue(ctx, regexp);
+  js_free(ctx, serialized);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
 }
 
 namespace {
