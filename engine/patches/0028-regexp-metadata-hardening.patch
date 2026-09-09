@@ -1,0 +1,426 @@
+From 64f3f74952fa8981d6f7c38311d8819f7ac09843 Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:28:18 +0500
+Subject: [PATCH] harden regexp bytecode validation
+
+
+diff --git a/libregexp.c b/libregexp.c
+index 5963f21..82069b8 100644
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -714,6 +714,222 @@ static int re_append_first_set_metadata(REParseState *s, int re_flags)
+     return dbuf_error(&s->byte_code) ? -1 : 1;
+ }
+ 
++/* Return the complete length of one serialized instruction, or false when
++   the instruction is truncated or its opcode is not in the table. */
++static bool re_checked_op_len(const uint8_t *code, size_t remaining,
++                              size_t *plen)
++{
++    uint8_t opcode;
++    size_t len;
++    uint32_t count;
++
++    if (remaining == 0)
++        return false;
++    opcode = code[0];
++    if (opcode >= REOP_COUNT || opcode == REOP_invalid)
++        return false;
++    len = reopcode_info[opcode].size;
++    if (len == 0 || len > remaining)
++        return false;
++    switch (opcode) {
++    case REOP_back_reference:
++    case REOP_back_reference_i:
++    case REOP_backward_back_reference:
++    case REOP_backward_back_reference_i:
++        if (remaining < 2 || code[1] > remaining - 2)
++            return false;
++        len = 2 + code[1];
++        break;
++    case REOP_range:
++    case REOP_range_i:
++        if (remaining < 3)
++            return false;
++        count = get_u16(code + 1);
++        if (count == 0 || count > (remaining - 3) / 4)
++            return false;
++        len = 3 + (size_t)count * 4;
++        break;
++    case REOP_range32:
++    case REOP_range32_i:
++        if (remaining < 3)
++            return false;
++        count = get_u16(code + 1);
++        if (count == 0 || count > (remaining - 3) / 8)
++            return false;
++        len = 3 + (size_t)count * 8;
++        break;
++    default:
++        break;
++    }
++    if (len > remaining)
++        return false;
++    *plen = len;
++    return true;
++}
++
++static bool re_boundary_get(const uint8_t *boundary_bits, size_t pos)
++{
++    return (boundary_bits[pos >> 3] >> (pos & 7)) & 1;
++}
++
++static void re_boundary_set(uint8_t *boundary_bits, size_t pos)
++{
++    boundary_bits[pos >> 3] |= (uint8_t)1 << (pos & 7);
++}
++
++static bool re_validate_target(const uint8_t *boundary_bits, size_t code_len,
++                               size_t base, uint32_t raw_offset);
++
++static bool re_validate_code(const uint8_t *code, size_t code_len,
++                             uint8_t capture_count, uint8_t register_count,
++                             void *opaque)
++{
++    uint8_t *boundary_bits;
++    size_t boundary_size;
++    size_t pos = 0, len;
++    uint8_t last_opcode = REOP_invalid;
++    bool valid = false;
++
++    if (code_len == 0 || code_len > (SIZE_MAX - 7) / 8)
++        return false;
++    boundary_size = (code_len + 7) / 8;
++    /* Keep the map compact; the caller supplies the real allocator context. */
++    boundary_bits = lre_realloc(opaque, NULL, boundary_size);
++    if (!boundary_bits)
++        return false;
++    memset(boundary_bits, 0, boundary_size);
++    re_boundary_set(boundary_bits, 0);
++    pos = 0;
++    while (pos < code_len) {
++        if (!re_checked_op_len(code + pos, code_len - pos, &len))
++            goto done;
++        last_opcode = code[pos];
++        pos += len;
++        if (pos < code_len)
++            re_boundary_set(boundary_bits, pos);
++    }
++    if (pos != code_len ||
++        code[0] == REOP_lookahead_match ||
++        code[0] == REOP_negative_lookahead_match)
++        goto done;
++    /* Every executable path must have a terminating matcher instruction.
++       Matcher-stack state is still part of the trusted bytecode contract. */
++    if (last_opcode != REOP_match)
++        goto done;
++    pos = 0;
++    while (pos < code_len) {
++        uint8_t opcode = code[pos];
++        uint32_t val, val2;
++
++        if (!re_checked_op_len(code + pos, code_len - pos, &len))
++            goto done;
++        switch (opcode) {
++        case REOP_save_start:
++        case REOP_save_end:
++            if (code[pos + 1] >= capture_count)
++                goto done;
++            break;
++        case REOP_save_reset:
++            val = code[pos + 1];
++            val2 = code[pos + 2];
++            if (val > val2 || val2 >= capture_count)
++                goto done;
++            break;
++        case REOP_set_i32:
++        case REOP_set_char_pos:
++        case REOP_check_advance:
++            if (code[pos + 1] >= register_count)
++                goto done;
++            break;
++        case REOP_back_reference:
++        case REOP_back_reference_i:
++        case REOP_backward_back_reference:
++        case REOP_backward_back_reference_i:
++            for (val = 0; val < code[pos + 1]; val++)
++                if (code[pos + 2 + val] >= capture_count)
++                    goto done;
++            break;
++        case REOP_goto:
++        case REOP_split_goto_first:
++        case REOP_split_next_first:
++        case REOP_lookahead:
++        case REOP_negative_lookahead:
++            val = get_u32(code + pos + 1);
++            if (!re_validate_target(boundary_bits, code_len, pos + 5, val))
++                goto done;
++            break;
++        case REOP_loop:
++            if (code[pos + 1] >= register_count)
++                goto done;
++            val = get_u32(code + pos + 2);
++            if (!re_validate_target(boundary_bits, code_len, pos + 6, val))
++                goto done;
++            break;
++        case REOP_loop_split_goto_first:
++        case REOP_loop_split_next_first:
++            if (code[pos + 1] >= register_count)
++                goto done;
++            val = get_u32(code + pos + 6);
++            if (!re_validate_target(boundary_bits, code_len, pos + 10, val))
++                goto done;
++            break;
++        case REOP_loop_check_adv_split_goto_first:
++        case REOP_loop_check_adv_split_next_first:
++            if (register_count < 2 || code[pos + 1] >= register_count - 1)
++                goto done;
++            val = get_u32(code + pos + 6);
++            if (!re_validate_target(boundary_bits, code_len, pos + 10, val))
++                goto done;
++            break;
++        default:
++            break;
++        }
++        pos += len;
++    }
++    valid = true;
++done:
++    lre_realloc(opaque, boundary_bits, 0);
++    return valid;
++}
++
++/* Metadata entry offsets must land on an instruction boundary and identify
++   the synthetic save_start 0 used by lre_exec_at(). */
++static bool re_validate_entry(const uint8_t *code, size_t code_len,
++                              uint32_t entry_offset)
++{
++    size_t pos = 0, len;
++
++    if (entry_offset > code_len || code_len - entry_offset < 2)
++        return false;
++    while (pos < entry_offset) {
++        if (!re_checked_op_len(code + pos, entry_offset - pos, &len))
++            return false;
++        pos += len;
++    }
++    return pos == entry_offset && code[pos] == REOP_save_start &&
++        code[pos + 1] == 0;
++}
++
++static bool re_validate_target(const uint8_t *boundary_bits, size_t code_len,
++                               size_t base, uint32_t raw_offset)
++{
++    int32_t offset = (int32_t)raw_offset;
++    size_t target;
++
++    if (offset < 0) {
++        size_t distance = (size_t)(-(int64_t)offset);
++        if (distance > base)
++            return false;
++        target = base - distance;
++    } else {
++        size_t distance = (size_t)offset;
++        if (distance > SIZE_MAX - base)
++            return false;
++        target = base + distance;
++    }
++    return target < code_len && re_boundary_get(boundary_bits, target);
++}
++
+ /* Parse the metadata trailer. Returns 1 if present and well-formed, 0 if
+    absent, -1 if malformed. *ptrailer (if given) receives the byte following
+    the metadata (where group names begin). */
+@@ -742,6 +958,7 @@ static int lre_parse_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
+     }
+     if ((size_t)(end - p) < LRE_META_HEADER_LEN ||
+         p[LRE_META_VERSION_OFFSET] != LRE_META_VERSION ||
++        p[LRE_META_KIND_OFFSET] < LRE_META_LITERAL ||
+         p[LRE_META_KIND_OFFSET] > LRE_META_FIRST_SET ||
+         p[LRE_META_ENCODING_OFFSET] > 1 ||
+         (p[LRE_META_FLAGS_OFFSET] & ~LRE_META_FLAG_SOURCE)) {
+@@ -750,6 +967,37 @@ static int lre_parse_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
+     payload_size = get_u32(p + LRE_META_PAYLOAD_SIZE_OFFSET);
+     if (payload_size > (size_t)(end - p - LRE_META_HEADER_LEN))
+         return -1;
++    switch (p[LRE_META_KIND_OFFSET]) {
++    case LRE_META_LITERAL:
++        if (p[LRE_META_FLAGS_OFFSET] & ~LRE_META_FLAG_SOURCE)
++            return -1;
++        if (p[LRE_META_FLAGS_OFFSET] & LRE_META_FLAG_SOURCE) {
++            if (payload_size != 0)
++                return -1;
++        } else if (get_u32(p + LRE_META_LENGTH_OFFSET) > LRE_LITERAL_MAX_LENGTH ||
++                   ((uint64_t)get_u32(p + LRE_META_LENGTH_OFFSET) <<
++                    p[LRE_META_ENCODING_OFFSET]) != payload_size) {
++            return -1;
++        }
++        break;
++    case LRE_META_PREFIX:
++        if (p[LRE_META_FLAGS_OFFSET] != 0 ||
++            get_u32(p + LRE_META_LENGTH_OFFSET) < LRE_PREFIX_MIN_LENGTH ||
++            get_u32(p + LRE_META_LENGTH_OFFSET) > LRE_PREFIX_MAX_LENGTH ||
++            ((uint64_t)get_u32(p + LRE_META_LENGTH_OFFSET) <<
++             p[LRE_META_ENCODING_OFFSET]) != payload_size)
++            return -1;
++        break;
++    case LRE_META_FIRST_SET:
++        if (p[LRE_META_ENCODING_OFFSET] != 0 ||
++            p[LRE_META_FLAGS_OFFSET] != 0 ||
++            get_u32(p + LRE_META_LENGTH_OFFSET) != 0 ||
++            payload_size != LRE_FIRST_SET_PAYLOAD_LEN)
++            return -1;
++        break;
++    default:
++        return -1;
++    }
+     if (meta) {
+         meta->kind = p[LRE_META_KIND_OFFSET];
+         meta->encoding = p[LRE_META_ENCODING_OFFSET];
+@@ -3573,14 +3821,25 @@ int lre_get_alloc_count(const uint8_t *bc_buf)
+ /* Structurally validate serialized regexp bytecode (e.g. from JS_ReadObject)
+    before it is executed: a present header and a body length that fits within
+    the buffer. Returns 0 on success, -1 if the bytecode is malformed. */
+-int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len)
++int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len, void *opaque)
+ {
+     uint32_t re_bytecode_len;
++    LREMetadata meta;
+     if (bc_buf_len < RE_HEADER_LEN)
+         return -1;
+     re_bytecode_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+     if (re_bytecode_len > (uint32_t)(bc_buf_len - RE_HEADER_LEN))
+         return -1;
++    if (!re_validate_code(bc_buf + RE_HEADER_LEN, re_bytecode_len,
++                          bc_buf[RE_HEADER_CAPTURE_COUNT],
++                          bc_buf[RE_HEADER_REGISTER_COUNT], opaque))
++        return -1;
++    if (lre_parse_metadata(bc_buf, bc_buf_len, &meta, NULL) < 0)
++        return -1;
++    if (meta.kind != LRE_META_NONE &&
++        !re_validate_entry(bc_buf + RE_HEADER_LEN, re_bytecode_len,
++                           meta.entry_offset))
++        return -1;
+     return 0;
+ }
+ 
+diff --git a/libregexp.h b/libregexp.h
+index e585b1c..fc39929 100644
+--- a/libregexp.h
++++ b/libregexp.h
+@@ -99,7 +99,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
+                      const char *buf, size_t buf_len, int re_flags,
+                      void *opaque);
+ int lre_get_alloc_count(const uint8_t *bc_buf);
+-int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len);
++int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len, void *opaque);
+ int lre_get_capture_count(const uint8_t *bc_buf);
+ int lre_get_flags(const uint8_t *bc_buf);
+ int lre_is_raw_atom(const char *buf, size_t len, int re_flags);
+diff --git a/quickjs.c b/quickjs.c
+index 1b01302..fad54c3 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -42917,7 +42917,7 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
+     }
+ 
+     if (bc->is_wide_char ||
+-        lre_check_bytecode(str8(bc), bc->len) != 0) {
++        lre_check_bytecode(str8(bc), bc->len, ctx) != 0) {
+         js_free_string(ctx->rt, pattern);
+         js_free_string(ctx->rt, bc);
+         return JS_ThrowInternalError(ctx, "bad regexp bytecode");
+@@ -52751,8 +52751,8 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
+     return 0;
+ }
+ 
+-static int js_regexp_first_set_scan8(const uint8_t *bitmap, const uint8_t *s,
+-                                     int from, int len);
++static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
++                                     const uint8_t *s, int from, int len);
+ 
+ #if defined(__aarch64__) && defined(__ARM_NEON)
+ #include <arm_neon.h>
+@@ -52766,38 +52766,44 @@ static int js_regexp_first_set_scan8(const uint8_t *bitmap, const uint8_t *s,
+    bytes per iteration with a table-gather (vqtbl2q): idx = byte>>3 selects one
+    of the 32 bitmap bytes, then (gathered >> (byte&7)) & 1 is the membership.
+    Behaves identically to the scalar bitmap test. */
+-static int js_regexp_first_set_scan8(const uint8_t *bitmap, const uint8_t *s,
+-                                     int from, int len)
++static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
++                                     const uint8_t *s, int from, int len)
+ {
+-    int i = from;
++    int i = from, chunk_end;
++
++    while (i < len) {
++        chunk_end = i + min_int(len - i, JS_REGEXP_SCAN_CHUNK_SIZE);
+ #if JS_REGEXP_FIRST_SET_SIMD
+-    uint8x16x2_t tbl;
+-    uint8x16_t ones = vdupq_n_u8(1);
+-    uint8x16_t seven = vdupq_n_u8(7);
+-
+-    tbl.val[0] = vld1q_u8(bitmap);
+-    tbl.val[1] = vld1q_u8(bitmap + 16);
+-    for (; i + 16 <= len; i += 16) {
+-        uint8x16_t v = vld1q_u8(s + i);
+-        uint8x16_t gathered = vqtbl2q_u8(tbl, vshrq_n_u8(v, 3));
+-        uint8x16_t mask = vshlq_u8(ones,
+-                              vreinterpretq_s8_u8(vandq_u8(v, seven)));
+-        uint8x16_t hit = vtstq_u8(gathered, mask);
+-        if (vmaxvq_u8(hit)) {
+-            uint8_t lanes[16];
+-            int j;
+-            vst1q_u8(lanes, hit);
+-            for (j = 0; j < 16; j++) {
+-                if (lanes[j])
+-                    return i + j;
++        uint8x16x2_t tbl;
++        uint8x16_t ones = vdupq_n_u8(1);
++        uint8x16_t seven = vdupq_n_u8(7);
++
++        tbl.val[0] = vld1q_u8(bitmap);
++        tbl.val[1] = vld1q_u8(bitmap + 16);
++        for (; i + 16 <= chunk_end; i += 16) {
++            uint8x16_t v = vld1q_u8(s + i);
++            uint8x16_t gathered = vqtbl2q_u8(tbl, vshrq_n_u8(v, 3));
++            uint8x16_t mask = vshlq_u8(ones,
++                                  vreinterpretq_s8_u8(vandq_u8(v, seven)));
++            uint8x16_t hit = vtstq_u8(gathered, mask);
++            if (vmaxvq_u8(hit)) {
++                uint8_t lanes[16];
++                int j;
++                vst1q_u8(lanes, hit);
++                for (j = 0; j < 16; j++) {
++                    if (lanes[j])
++                        return i + j;
++                }
+             }
+         }
+-    }
+ #endif
+-    for (; i < len; i++) {
+-        uint8_t c = s[i];
+-        if ((bitmap[c >> 3] >> (c & 7)) & 1)
+-            return i;
++        for (; i < chunk_end; i++) {
++            uint8_t c = s[i];
++            if ((bitmap[c >> 3] >> (c & 7)) & 1)
++                return i;
++        }
++        if (i < len && lre_check_timeout(ctx))
++            return LRE_RET_TIMEOUT;
+     }
+     return len;
+ }
+@@ -52821,7 +52827,9 @@ static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
+         const uint8_t *s = str8(str);
+         candidate = start_index;
+         while (candidate < len) {
+-            candidate = js_regexp_first_set_scan8(bitmap, s, candidate, len);
++            candidate = js_regexp_first_set_scan8(ctx, bitmap, s, candidate, len);
++            if (candidate == LRE_RET_TIMEOUT)
++                return LRE_RET_TIMEOUT;
+             if (candidate >= len)
+                 break;
+             ret = lre_exec_at(capture, re_bytecode, entry, s, candidate,
