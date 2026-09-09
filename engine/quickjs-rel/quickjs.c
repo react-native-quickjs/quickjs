@@ -41462,7 +41462,7 @@ static uint32_t bc_csum_sw(const uint8_t *p, size_t n)
 #define BC_CSUM_CRC32CD __builtin_arm_crc32cd
 #define BC_CSUM_CRC32CB __builtin_arm_crc32cb
 #else
-#define BC_CSUM_CRC32CD __builtin_aarch64_crc32cd
+#define BC_CSUM_CRC32CD __builtin_aarch64_crc32cx
 #define BC_CSUM_CRC32CB __builtin_aarch64_crc32cb
 #endif
 

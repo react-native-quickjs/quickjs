@@ -120,7 +120,7 @@
     },
     {
       "name": "0030-crc32c-bytecode-checksum.patch",
-      "sha256": "ca7e2b96b7d9d148f503cc068a6a0bc50537a740ae34d81ebda015c422b156f9"
+      "sha256": "b0f244db173181a94b7d7a090f61da9ff66e6cb3c2a93eac4991af1adec72388"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -128,7 +128,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "c1837a131455556bfc30a31311226c889753d8f34cbb6012347a5200b059e128",
+    "quickjs.c": "96b0ccb35f11b4606fa6f3deaafad67e32340cb31882e3e8d6c4068a8f1e890a",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

@@ -455,7 +455,7 @@ index 0202c54..b14ee34 100644
 +#define BC_CSUM_CRC32CD __builtin_arm_crc32cd
 +#define BC_CSUM_CRC32CB __builtin_arm_crc32cb
 +#else
-+#define BC_CSUM_CRC32CD __builtin_aarch64_crc32cd
++#define BC_CSUM_CRC32CD __builtin_aarch64_crc32cx
 +#define BC_CSUM_CRC32CB __builtin_aarch64_crc32cb
 +#endif
 +
