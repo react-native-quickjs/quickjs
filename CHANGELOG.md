@@ -61,9 +61,8 @@ and this project adheres to [Semantic Versioning][semver].
   dispatch and register-based execution.
 - Patch `0020`: analyzes patterns for literal, prefix, and first-set candidate
   searches before entering the full matcher.
-- Patch `0021`: wires the prefilter analysis into regexp compilation and
-  execution. It is primarily an integration step; the benchmark change was
-  within run-to-run noise.
+- Patch `0021`: connects compiled search metadata to RegExp compilation and
+  execution.
 - Patch `0022`: adds the regexp execution fast paths and avoids unnecessary
   capture-buffer allocation. This was one of the measured steps toward the
   final 2.1× regexp benchmark improvement.
