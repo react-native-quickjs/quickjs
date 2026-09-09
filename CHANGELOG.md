@@ -86,6 +86,10 @@ and this project adheres to [Semantic Versioning][semver].
   bytecode API. Hardware availability is probed per call, avoiding shared
   runtime state, and bytecode tests cover the standard CRC-32C vector plus
   empty, short, unaligned-length, and larger inputs.
+- Patch `0031`: adds lazy bytecode loading. The React Native runtime uses an
+  engine-owned copy, while borrowed payloads remain an explicit C API option.
+  Function bodies and atom interning are deferred until use, and the format
+  bump plus regenerated built-in blobs remain in `9999-bc-version-bump.patch`.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is

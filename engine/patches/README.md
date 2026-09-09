@@ -41,6 +41,7 @@ what we changed and why without opening a single `.patch` file.
 | `0028` | Hardens RegExp metadata validation and keeps first-set scans interruptible | Deserialized metadata must not drive out-of-bounds fast-path reads, and large no-hit scans must remain interruptible | - | No |
 | `0029` | Adds regression coverage for malformed RegExp metadata | Header mutations must be rejected before optimized execution can consume them | - | No |
 | `0030` | Replaces the serialized-bytecode checksum with portable CRC-32C and uses hardware acceleration when available | Bytecode loading scans the full payload before parsing, so faster integrity verification reduces cold-start cost while preserving corruption detection | - | **Yes** - changes checksum encoding |
+| `0031` | Frames serialized function bodies and provides one checked bounded reader for eager and lazy-ready records | A declared body boundary and shared overflow-safe layout prevent malformed function records from consuming adjacent data while allowing later lazy materialization to use the same parser | - | **Yes** - changes bytecode record layout |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

@@ -1406,6 +1406,12 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
    writer in the same process (e.g. another Worker on the same runtime). */
 #define JS_READ_OBJ_SAB       (1 << 2) /* allow SharedArrayBuffer */
 #define JS_READ_OBJ_REFERENCE (1 << 3) /* allow object references */
+/* Defer function-body deserialization, including local definitions, constant
+   pools, bytecode, object-literal metadata and debug data, until first use.
+   The payload is copied internally,
+   so `buf` need not outlive the call. Requires JS_READ_OBJ_BYTECODE and is
+   incompatible with JS_READ_OBJ_REFERENCE and JS_READ_OBJ_SAB. */
+#define JS_READ_OBJ_LAZY      (1 << 4)
 JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
 JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                                  int flags, JSSABTab *psab_tab);
