@@ -1,0 +1,251 @@
+From 381db0b5ccfb335d1b8d1dea10e337c96cbc56ff Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:02:20 +0500
+Subject: [PATCH] accelerate regexp split scanning
+
+
+diff --git a/libregexp.c b/libregexp.c
+index ffb119a..5963f21 100644
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -30,6 +30,9 @@
+ 
+ #include "cutils.h"
+ #include "libregexp.h"
++#ifndef JS_RE_PREFILTER
++#define JS_RE_PREFILTER 1
++#endif
+ #include "libunicode.h"
+ 
+ /* ASCII identifier tables, used by lre_js_is_ident_first/next in libregexp.h
+@@ -565,6 +568,22 @@ static bool re_first_set_scan(const uint8_t *code, size_t bc_buf_len,
+         else
+             *phas_wide = 1;
+         return true;
++#if JS_RE_PREFILTER
++    case REOP_space:
++        /* W2: \s has its own opcode, so it fell through to `default: return
++           false` and every \s-led pattern got NO prefilter at all.  The executor tests lre_is_space(), which
++           for c < 256 is exactly lre_is_space_byte(); the non-ASCII members
++           (U+1680, U+2000..U+200A, U+2028/9, U+202F, U+205F, U+3000, U+FEFF)
++           are covered by has_wide. */
++        {
++            int b;
++            for (b = 0; b < 256; b++)
++                if (lre_is_space_byte((uint8_t)b))
++                    bitmap[b >> 3] |= 1 << (b & 7);
++        }
++        *phas_wide = 1;
++        return true;
++#endif /* JS_RE_PREFILTER -- REOP_space first set */
+     case REOP_range_i:
+         *phas_fold = 1;
+         /* fallthrough */
+diff --git a/quickjs.c b/quickjs.c
+index 4cc31a7..85070e1 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -53815,6 +53815,144 @@ exception:
+     return JS_EXCEPTION;
+ }
+ 
++
++/* Fast path for RegExp.prototype[Symbol.split].
++ *
++ * The spec algorithm sets `splitter.lastIndex = q` and calls
++ * RegExpExec(splitter) once per source-string position, so a split over an
++ * n-character string performs n exec calls of which all but one per separator
++ * fail.  Each failing call pays a lastIndex Set, an `exec` property lookup, a
++ * C-function call, a lastIndex Get + ToLength, and an anchored run of the
++ * backtracking VM.
++ *
++ * Under the admission conditions checked by the caller, the union over q of
++ * "sticky match anchored at q" is exactly "leftmost match starting at index
++ * >= q", which is what the non-sticky scanning matcher (and hence the
++ * prefilter in js_regexp_match) computes in one call.  So the whole ladder
++ * collapses to one scanning match per separator found.
++ *
++ * `re` is the ORIGINAL regexp's JSRegExp (non-sticky, so its bytecode carries
++ * the synthetic `.*?` scan prologue and its metadata prefilter is populated);
++ * the sticky splitter's bytecode cannot scan.
++ *
++ * Returns 0 on success, -1 with an exception pending on failure.
++ */
++/* --------------------------------------------------------------------------
++   JS_RE_PREFILTER: the RegExp[Symbol.split] scanning fast path and the
++   REOP_space first-set arm (bench/spikes/regexp-prefilter,
++   docs/regexp-prefilter-census.md).  MEASURED by its author: Octane regexp
++   -24.32% instructions, -17.43% cycles, -3.21% RSS, all twelve other rows
++   within +/-0.05%.  Default ON; -DJS_RE_PREFILTER=0 removes both halves and
++   restores the spec [Symbol.split] loop and the `default: return false` for
++   REOP_space exactly.
++   -------------------------------------------------------------------------- */
++#ifndef JS_RE_PREFILTER
++#define JS_RE_PREFILTER 1
++#endif
++
++#if JS_RE_PREFILTER
++static int js_regexp_split_fast(JSContext *ctx, JSValueConst A, JSRegExp *re,
++                                JSString *strp, uint32_t lim,
++                                int unicodeMatching)
++{
++    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
++    uint8_t **capture = capture_stack;
++    JSRegExpExecData exec_data;
++    const uint8_t *re_bytecode = str8(re->bytecode);
++    const uint8_t *str_buf = str8(strp);
++    uint32_t size = strp->len, p = 0, q = 0, ms, me;
++    int capture_count = lre_get_capture_count(re_bytecode);
++    int shift = strp->is_wide_char;
++    int rc, i, ret = -1;
++    int64_t lengthA = 0;
++    JSValue sub;
++
++    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
++                                &exec_data))
++        return -1;
++
++    while (q < size) {
++        rc = js_regexp_match(ctx, capture, &exec_data, re, strp, (int)q);
++        if (rc != 1) {
++            if (rc == 0)
++                break;
++            switch(rc) {
++            case LRE_RET_TIMEOUT:
++                JS_ThrowInterrupted(ctx);
++                break;
++            case LRE_RET_MEMORY_ERROR:
++                JS_ThrowInternalError(ctx, "out of memory in regexp execution");
++                break;
++            case LRE_RET_BYTECODE_ERROR:
++                JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
++                break;
++            default:
++                JS_ThrowInternalError(ctx, "regexp execution error");
++                break;
++            }
++            goto done;
++        }
++        ms = (uint32_t)((capture[0] - str_buf) >> shift);
++        me = (uint32_t)((capture[1] - str_buf) >> shift);
++        /* the spec loop only ever probes q < size, so a match that starts at
++           the very end of the string is not reachable from it */
++        if (ms >= size)
++            break;
++        if (me > size)
++            me = size;
++        q = ms;
++        if (me == p) {
++            q = (uint32_t)string_advance_index(strp, q, unicodeMatching);
++            continue;
++        }
++        sub = js_sub_string(ctx, strp, p, q);
++        if (JS_IsException(sub))
++            goto done;
++        if (JS_DefinePropertyValueInt64(ctx, A, lengthA++, sub,
++                                        JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++            goto done;
++        if (lengthA == lim) {
++            ret = 0;
++            goto done;
++        }
++        p = me;
++        for (i = 1; i < capture_count; i++) {
++            uint8_t **match = &capture[2 * i];
++            if (match[0] && match[1]) {
++                sub = js_sub_string(ctx, strp,
++                                    (uint32_t)((match[0] - str_buf) >> shift),
++                                    (uint32_t)((match[1] - str_buf) >> shift));
++                if (JS_IsException(sub))
++                    goto done;
++            } else {
++                sub = JS_UNDEFINED;
++            }
++            if (JS_DefinePropertyValueInt64(ctx, A, lengthA++, sub,
++                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++                goto done;
++            if (lengthA == lim) {
++                ret = 0;
++                goto done;
++            }
++        }
++        q = p;
++    }
++    if (p > size)
++        p = size;
++    sub = js_sub_string(ctx, strp, p, size);
++    if (JS_IsException(sub))
++        goto done;
++    if (JS_DefinePropertyValueInt64(ctx, A, lengthA++, sub,
++                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++        goto done;
++    ret = 0;
++done:
++    if (capture != capture_stack)
++        js_free(ctx, capture);
++    return ret;
++}
++#endif /* JS_RE_PREFILTER -- js_regexp_split_fast */
++
+ static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+ {
+@@ -53880,6 +54018,58 @@ static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
+             goto add_tail;
+         goto done;
+     }
++#if JS_RE_PREFILTER
++    /* --- scanning fast path admission ---------------------------------
++       All of these must hold for the per-position sticky-exec ladder to be
++       replaceable by a forward scan over the original regexp:
++         - the species constructor is the built-in RegExp, so `splitter` is a
++           freshly created object unreachable from user code and its
++           lastIndex is unobservable;
++         - both receiver and splitter are native RegExp objects and are
++           distinct objects;
++         - they were compiled from the *same* pattern string (pointer
++           identity) and from the same flags except that the splitter adds
++           /y -- so the two bytecodes accept exactly the same language;
++         - the receiver is not itself sticky, so its bytecode carries the
++           `.*?` scan prologue that lre_exec needs in order to scan;
++         - `splitter.constructor === RegExp` and `splitter.exec` is the
++           unmodified built-in, so RegExpExec would have dispatched to
++           js_regexp_exec (js_is_standard_regexp).
++       Anything else falls through to the spec loop below. */
++    {
++        JSRegExp *re_rx = js_get_regexp(ctx, rx, false);
++        JSRegExp *re_sp = js_get_regexp(ctx, splitter, false);
++        if (re_rx && re_sp && re_rx != re_sp &&
++            re_rx->pattern == re_sp->pattern &&
++            js_same_value(ctx, ctor, ctx->regexp_ctor)) {
++            /* lre_get_flags() also reports the INTERNAL bits LRE_FLAG_ATOM
++               and LRE_FLAG_HAS_META, which record whether libregexp attached
++               prefilter metadata.  Sticky patterns never get metadata, so
++               comparing raw flags rejects every pattern that has it -- a
++               near-miss that silently cost the whole /[+, ]/ population
++               (2,948,190 match calls on Octane regexp).  Compare only the
++               user-visible flags, bits 0..8. */
++            const int fmask = LRE_FLAG_GLOBAL | LRE_FLAG_IGNORECASE |
++                LRE_FLAG_MULTILINE | LRE_FLAG_DOTALL | LRE_FLAG_UNICODE |
++                LRE_FLAG_STICKY | LRE_FLAG_INDICES | LRE_FLAG_NAMED_GROUPS |
++                LRE_FLAG_UNICODE_SETS;
++            int rx_flags = lre_get_flags(str8(re_rx->bytecode)) & fmask;
++            int sp_flags = lre_get_flags(str8(re_sp->bytecode)) & fmask;
++            if (!(rx_flags & LRE_FLAG_STICKY) &&
++                sp_flags == (rx_flags | LRE_FLAG_STICKY)) {
++                int std = js_is_standard_regexp(ctx, splitter);
++                if (std < 0)
++                    goto exception;
++                if (std) {
++                    if (js_regexp_split_fast(ctx, A, re_rx, strp, lim,
++                                             unicodeMatching) < 0)
++                        goto exception;
++                    goto done;
++                }
++            }
++        }
++    }
++#endif /* JS_RE_PREFILTER -- Symbol.split admission */
+     while (q < size) {
+         if (JS_SetProperty(ctx, splitter, JS_ATOM_lastIndex, js_int32(q)) < 0)
+             goto exception;
