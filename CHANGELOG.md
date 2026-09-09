@@ -73,8 +73,8 @@ and this project adheres to [Semantic Versioning][semver].
   compilation.
 - Patch `0026`: serves eligible `.flags` reads from validated compiled flags
   while preserving the generic observable path.
-- Patch `0027`: corrects the stale regexp test fixture and keeps the test data
-  aligned with the matcher’s bounds checks.
+- Patch `0027`: keeps the regexp fixture and bounds-accounting coverage aligned
+  with the matcher.
 - Patch `0028`: hardens regexp bytecode and metadata validation, including
   operand, target-boundary, allocator, and overflow checks.
 - Patch `0029`: expands malformed-bytecode and runtime regexp serialization

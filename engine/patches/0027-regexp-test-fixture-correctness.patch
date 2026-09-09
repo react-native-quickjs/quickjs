@@ -1,0 +1,72 @@
+From 9cb2895ca1354e0fb1723654cf0b32a9af222269 Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:02:20 +0500
+Subject: [PATCH] fix regexp test fixtures
+
+
+diff --git a/api-test.c b/api-test.c
+index 2de83c5..13a34f6 100644
+--- a/api-test.c
++++ b/api-test.c
+@@ -1479,6 +1479,17 @@ static void bulk_free_macros(void) {
+     JSAtom atom4 = JS_NewAtom(ctx, "BELONG!!");
+     JSAtom atom5 = JS_NewAtom(ctx, "TO US!!");
+ 
++    /* COLLECT BEFORE COUNTING.  This assertion requires three freed objects to
++       have LEFT the object count, and under the tracing collector releasing the
++       last reference does not reclaim -- deferred reclamation is the entire
++       point of it, and a promise of synchronous accounting would forbid every
++       mechanism built on top of it, the minor cycle included.  So the frees are
++       followed by a collection and the requirement stays EXACT: after the GC
++       the count must be lower by EXACTLY three, not "at most" three and not
++       "within a tolerance".  On the reference-counted build the GC is a no-op
++       for this purpose -- the objects were already gone -- so the arm that
++       always passed still passes for the same reason it did before. */
++    JS_RunGC(rt);
+     JS_ComputeMemoryUsage(rt, &mem_usage);
+     assert((obj_count - 3) == mem_usage.obj_count);
+     int atom_count = mem_usage.atom_count;
+diff --git a/lre-test.c b/lre-test.c
+index 6f57188..303a610 100644
+--- a/lre-test.c
++++ b/lre-test.c
+@@ -6,6 +6,14 @@
+ #include <string.h>
+ #include "libregexp.h"
+ 
++/* Keep bytecode fixtures tied to the opcode table used by the matcher. */
++typedef enum {
++#define DEF(id, size) REOP_ ## id,
++#include "libregexp-opcode.h"
++#undef DEF
++    REOP_COUNT,
++} REOPCodeEnum;
++
+ // If >= 0, the next 'alloc_countdown' allocations succeed and the one after
+ // that fails. Used to inject out-of-memory conditions in the compiler.
+ // When alloc_fail_persist is true, every subsequent allocation fails too.
+@@ -44,19 +52,20 @@ static void oob_save_index(void)
+ {
+     // Bytecode with REOP_save_start index=100, but capture_count=1.
+     // Without validation this causes a heap-buffer-overflow in lre_exec_backtrack.
++    // Use symbolic opcodes so inserting an opcode cannot stale this fixture.
+     uint8_t bc[] = {
+         0x00, 0x00,              // RE_HEADER_FLAGS = 0
+         0x01,                    // RE_HEADER_CAPTURE_COUNT = 1
+         0x00,                    // RE_HEADER_REGISTER_COUNT = 0
+         0x04, 0x00, 0x00, 0x00, // RE_HEADER_BYTECODE_LEN = 4 (little-endian)
+-        0x06,                    // REOP_any
+-        0x13, 0x64,             // REOP_save_start, index=100
+-        0x10,                    // REOP_match
++        REOP_any,
++        REOP_save_start, 100,    // index=100, out of range for capture_count=1
++        REOP_match,
+     };
+ 
+     uint8_t *capture[2] = {NULL, NULL};
+     int ret = lre_exec(capture, bc, (const uint8_t *)"a", 0, 1, 0, NULL);
+-    assert(ret < 0);
++    assert(ret == LRE_RET_BYTECODE_ERROR);
+ }
+ 
+ static void oom_no_oob_write(void)
