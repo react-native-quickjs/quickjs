@@ -1,0 +1,80 @@
+From 946a3ebbc200e582d55e5761158843060e96def5 Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:09:00 +0500
+Subject: [PATCH] add regexp optimization metadata
+
+
+diff --git a/libregexp.h b/libregexp.h
+index 44eded3..8f345b7 100644
+--- a/libregexp.h
++++ b/libregexp.h
+@@ -42,6 +42,51 @@ extern "C" {
+ #define LRE_FLAG_INDICES    (1 << 6) /* Unused by libregexp, just recorded. */
+ #define LRE_FLAG_NAMED_GROUPS (1 << 7) /* named groups are present in the regexp */
+ #define LRE_FLAG_UNICODE_SETS (1 << 8)
++#define LRE_FLAG_ATOM       (1 << 9) /* internal: raw literal pattern */
++#define LRE_FLAG_HAS_META   (1 << 10) /* internal optimization metadata */
++
++/* RegExp optimization metadata is serialized little-endian after the opcode
++   stream. Source literals borrow their payload from JSRegExp.pattern; all
++   other payloads are bounded so untrusted bytecode cannot request an
++   unbounded fast-path allocation or comparison. */
++#define LRE_META_VERSION 3
++#define LRE_META_NONE 0
++#define LRE_META_LITERAL 1
++#define LRE_META_PREFIX 2
++#define LRE_META_FIRST_SET 3 /* 256-bit bitmap of the mandatory first char */
++
++/* LRE_META_FIRST_SET payload: 1 flag byte (whether the first char may be
++   > 0xff) followed by a 32-byte little-endian bitmap covering code points
++   0..255. */
++#define LRE_FIRST_SET_BITMAP_LEN 32
++#define LRE_FIRST_SET_PAYLOAD_LEN (1 + LRE_FIRST_SET_BITMAP_LEN)
++
++#define LRE_META_FLAG_SOURCE 1 /* literal uses the source pattern; no payload */
++
++#define LRE_LITERAL_MAX_LENGTH 4096
++#define LRE_PREFIX_MIN_LENGTH 3
++#define LRE_PREFIX_MAX_LENGTH 32
++
++#define LRE_META_VERSION_OFFSET 0
++#define LRE_META_KIND_OFFSET 1
++#define LRE_META_ENCODING_OFFSET 2
++#define LRE_META_FLAGS_OFFSET 3
++#define LRE_META_PAYLOAD_SIZE_OFFSET 4
++#define LRE_META_LENGTH_OFFSET 8
++#define LRE_META_ENTRY_OFFSET 12
++#define LRE_META_HEADER_LEN 16
++
++typedef struct LREMetadata {
++    const uint8_t *payload;
++    const uint8_t *leading_chars;
++    uint32_t payload_size;
++    uint32_t primary_payload_size;
++    uint32_t length;
++    uint32_t entry_offset;
++    uint8_t kind;
++    uint8_t encoding;
++    uint8_t flags;
++} LREMetadata;
+ 
+ #define LRE_RET_MEMORY_ERROR   (-1)
+ #define LRE_RET_TIMEOUT        (-2)
+@@ -57,10 +102,17 @@ int lre_get_alloc_count(const uint8_t *bc_buf);
+ int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len);
+ int lre_get_capture_count(const uint8_t *bc_buf);
+ int lre_get_flags(const uint8_t *bc_buf);
++int lre_is_raw_atom(const char *buf, size_t len, int re_flags);
++int lre_get_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
++                     LREMetadata *meta);
+ const char *lre_get_groupnames(const uint8_t *bc_buf);
+ int lre_exec(uint8_t **capture,
+              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
+              int cbuf_type, void *opaque);
++int lre_exec_at(uint8_t **capture,
++                const uint8_t *bc_buf, uint32_t bytecode_offset,
++                const uint8_t *cbuf, int cindex, int clen,
++                int cbuf_type, void *opaque);
+ 
+ int lre_parse_escape(const uint8_t **pp, int allow_utf16);
+ /* lre_is_space() is provided as an inline in libunicode.h */
