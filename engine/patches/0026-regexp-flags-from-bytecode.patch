@@ -1,0 +1,129 @@
+From 43d51a13d9a34a84f63db1ca7fe9c08ac2ab8867 Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:02:20 +0500
+Subject: [PATCH] optimize regexp flags
+
+
+diff --git a/quickjs.c b/quickjs.c
+index 2c80b9b..1b01302 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -52244,6 +52244,90 @@ static JSValue js_re_get_flag_prop(JSContext *ctx, JSValueConst obj, int i)
+     return JS_GetProperty(ctx, obj, a);
+ }
+ 
++
++/* ---------------------------------------------------------------------------
++   RegExp.prototype.flags, part 2 of 2: answer it from re->bytecode.
++
++   All eight flag accessors on RegExp.prototype are the SAME C function
++   (js_regexp_get_flag) returning one bit of lre_get_flags(re->bytecode), so
++   the spec's eight observable Gets have a constant answer whenever nothing
++   can intercept them.  Guarded; anything the guard does not recognise takes
++   the generic derivation below, unchanged.
++   --------------------------------------------------------------------------- */
++
++/* The eight flags in the order ECMA-262 21.2.5.4 assembles them.  slot < 0
++   means the name already has a predefined atom, held in `atom`. */
++static const struct {
++    uint16_t mask;
++    char ch;
++    signed char slot;
++    JSAtom atom;
++} js_re_flag_tab[8] = {
++    { LRE_FLAG_INDICES,      'd', JS_RE_FA_hasIndices,  JS_ATOM_NULL },
++    { LRE_FLAG_GLOBAL,       'g', -1,                   JS_ATOM_global },
++    { LRE_FLAG_IGNORECASE,   'i', JS_RE_FA_ignoreCase,  JS_ATOM_NULL },
++    { LRE_FLAG_MULTILINE,    'm', JS_RE_FA_multiline,   JS_ATOM_NULL },
++    { LRE_FLAG_DOTALL,       's', JS_RE_FA_dotAll,      JS_ATOM_NULL },
++    { LRE_FLAG_UNICODE,      'u', -1,                   JS_ATOM_unicode },
++    { LRE_FLAG_UNICODE_SETS, 'v', JS_RE_FA_unicodeSets, JS_ATOM_NULL },
++    { LRE_FLAG_STICKY,       'y', JS_RE_FA_sticky,      JS_ATOM_NULL },
++};
++
++/* True only if `proto` still carries all eight flag accessors as own
++   JS_PROP_GETSET properties whose getter is the intrinsic js_regexp_get_flag
++   with the matching magic.  Every property is re-read from the live object on
++   every call, so nothing is cached and there is no stale-pointer window:
++     - a redefined getter changes pr->u.getset.getter          -> caught
++     - an accessor turned into a data property changes prs->flags -> caught
++     - a deleted or added property changes the shape lookup    -> caught
++     - a Proxy or an ordinary object in the prototype position has no such own
++       properties at all                                       -> caught
++   A prototype from another realm would pass, and that is correct: the getters
++   it holds are this same C function and would read this same receiver. */
++static bool js_re_proto_flags_pristine(JSContext *ctx, JSObject *proto)
++{
++    int i;
++
++    for (i = 0; i < 8; i++) {
++        JSShapeProperty *prs;
++        JSProperty *pr;
++        JSObject *g;
++        JSAtom atom;
++
++        if (js_re_flag_tab[i].slot < 0)
++            atom = js_re_flag_tab[i].atom;
++        else
++            atom = js_re_flag_atom(ctx, js_re_flag_tab[i].slot);
++        if (unlikely(atom == JS_ATOM_NULL))
++            return false;
++        prs = find_own_property(&pr, proto, atom);
++        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET)
++            return false;
++        g = pr->u.getset.getter;
++        if (!g || g->class_id != JS_CLASS_C_FUNCTION)
++            return false;
++        if (g->u.cfunc.cproto != JS_CFUNC_getter_magic ||
++            g->u.cfunc.c_function.getter_magic != js_regexp_get_flag ||
++            g->u.cfunc.magic != (int)js_re_flag_tab[i].mask)
++            return false;
++    }
++    return true;
++}
++
++/* True if no own property of the receiver can shadow a flag accessor.  A plain
++   RegExp instance carries exactly one own property, lastIndex.  Deleted slots
++   still occupy prop_count, so this is conservative in the safe direction. */
++static bool js_re_instance_unshadowed(JSObject *p)
++{
++    JSShape *sh = p->shape;
++
++    if (sh->prop_count == 0)
++        return true;
++    if (sh->prop_count > 1)
++        return false;
++    return get_shape_prop(sh)->atom == JS_ATOM_lastIndex;
++}
++
+ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+ {
+     char str[8], *p = str;
+@@ -52252,6 +52336,27 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+ 
++    {
++        JSObject *o = JS_VALUE_GET_OBJ(this_val);
++        JSObject *proto = o->shape->proto;
++        if (o->class_id == JS_CLASS_REGEXP &&
++            o->u.regexp.bytecode != NULL &&
++            proto != NULL &&
++            JS_VALUE_GET_TAG(ctx->class_proto[JS_CLASS_REGEXP]) == JS_TAG_OBJECT &&
++            proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_REGEXP]) &&
++            js_re_instance_unshadowed(o) &&
++            js_re_proto_flags_pristine(ctx, proto)) {
++            int fl = lre_get_flags(str8(o->u.regexp.bytecode));
++            int i;
++            for (i = 0; i < 8; i++)
++                if (fl & js_re_flag_tab[i].mask)
++                    *p++ = js_re_flag_tab[i].ch;
++            if (p == str)
++                return js_empty_string(ctx->rt);
++            return js_new_string8_len(ctx, str, p - str);
++        }
++    }
++
+     res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_hasIndices));
+     if (res < 0)
+         goto exception;
