@@ -1,0 +1,135 @@
+From ca037894084c26cef6ea1d22442413ac7062a1dd Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:02:20 +0500
+Subject: [PATCH] cache regexp flag atoms
+
+
+diff --git a/quickjs.c b/quickjs.c
+index 85070e1..2c80b9b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -492,6 +492,10 @@ struct JSRuntime {
+     void *user_opaque;
+     void *libc_opaque;
+     JSRuntimeFinalizerState *finalizers;
++    /* RegExp.prototype.flags: the six flag names js_regexp_get_flags spells
++       with a C string literal, interned once per runtime.  JS_ATOM_NULL until
++       first use; rt is calloc'd. */
++    JSAtom re_flag_atom[6];
+ };
+ 
+ struct JSClass {
+@@ -2875,6 +2879,14 @@ void JS_FreeRuntime(JSRuntime *rt)
+     }
+     js_free_rt(rt, rt->class_array);
+ 
++    /* Drop the interned RegExp flag-name atoms before the atom leak scan. */
++    for (int fa = 0; fa < 6; fa++) {
++        if (rt->re_flag_atom[fa] != JS_ATOM_NULL) {
++            JS_FreeAtomRT(rt, rt->re_flag_atom[fa]);
++            rt->re_flag_atom[fa] = JS_ATOM_NULL;
++        }
++    }
++
+ #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
+     /* only the atoms defined in JS_InitAtoms() should be left */
+     if (check_dump_flag(rt, JS_DUMP_ATOM_LEAKS)) {
+@@ -52185,6 +52197,53 @@ static JSValue js_regexp_get_flag(JSContext *ctx, JSValueConst this_val, int mas
+     return js_bool(flags & mask);
+ }
+ 
++
++/* ---------------------------------------------------------------------------
++   RegExp.prototype.flags, part 1 of 2: intern the six flag names once.
++
++   Six of the eight Gets in js_regexp_get_flags name their property with a C
++   string literal, so every read runs JS_NewAtom -> JS_NewAtomLen ->
++   __JS_FindAtom on a name that has been interned since startup.  MEASURED on
++   the fixed-work Octane regexp row: 23,485,530 of that row's 23,493,652
++   JS_NewAtomLen calls come from this one function and every one of them is a
++   hit -- 6 lookups per read, 3,914,255 reads, none creating anything.  The
++   six names are interned once per runtime instead, in rt->re_flag_atom[].
++
++   Semantics are identical and there is no admission guard, because there is
++   nothing to admit: the same eight generic Gets still happen, on the same
++   receiver, in the same order, with the same atoms.
++   --------------------------------------------------------------------------- */
++enum {
++    JS_RE_FA_hasIndices, JS_RE_FA_ignoreCase, JS_RE_FA_multiline,
++    JS_RE_FA_dotAll, JS_RE_FA_unicodeSets, JS_RE_FA_sticky, JS_RE_FA_COUNT
++};
++
++static const char * const js_re_flag_name[JS_RE_FA_COUNT] = {
++    "hasIndices", "ignoreCase", "multiline", "dotAll", "unicodeSets", "sticky",
++};
++
++/* JS_ATOM_NULL on OOM. */
++static JSAtom js_re_flag_atom(JSContext *ctx, int i)
++{
++    JSRuntime *rt = ctx->rt;
++    JSAtom a = rt->re_flag_atom[i];
++    if (unlikely(a == JS_ATOM_NULL)) {
++        a = JS_NewAtom(ctx, js_re_flag_name[i]);
++        if (a == JS_ATOM_NULL)
++            return JS_ATOM_NULL;
++        rt->re_flag_atom[i] = a;
++    }
++    return a;
++}
++
++static JSValue js_re_get_flag_prop(JSContext *ctx, JSValueConst obj, int i)
++{
++    JSAtom a = js_re_flag_atom(ctx, i);
++    if (unlikely(a == JS_ATOM_NULL))
++        return JS_EXCEPTION;
++    return JS_GetProperty(ctx, obj, a);
++}
++
+ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+ {
+     char str[8], *p = str;
+@@ -52193,7 +52252,7 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+ 
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "hasIndices"));
++    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_hasIndices));
+     if (res < 0)
+         goto exception;
+     if (res)
+@@ -52203,17 +52262,17 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+         goto exception;
+     if (res)
+         *p++ = 'g';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "ignoreCase"));
++    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_ignoreCase));
+     if (res < 0)
+         goto exception;
+     if (res)
+         *p++ = 'i';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "multiline"));
++    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_multiline));
+     if (res < 0)
+         goto exception;
+     if (res)
+         *p++ = 'm';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "dotAll"));
++    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_dotAll));
+     if (res < 0)
+         goto exception;
+     if (res)
+@@ -52223,12 +52282,12 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
+         goto exception;
+     if (res)
+         *p++ = 'u';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "unicodeSets"));
++    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_unicodeSets));
+     if (res < 0)
+         goto exception;
+     if (res)
+         *p++ = 'v';
+-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "sticky"));
++    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_sticky));
+     if (res < 0)
+         goto exception;
+     if (res)
