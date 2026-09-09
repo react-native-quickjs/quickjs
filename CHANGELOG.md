@@ -67,9 +67,8 @@ and this project adheres to [Semantic Versioning][semver].
   sets, reducing the work needed for common matches.
 - Patch `0023`: keeps `RegExp.prototype.test` result-free and streamlines
   successful match handling.
-- Patch `0024`: separates the forward scan from first-set construction and
-  improves the prefilter layout. This was the largest measured step, making
-  the regexp benchmark about 43% faster at that stage.
+- Patch `0024`: accelerates split scanning and improves first-set handling for
+  whitespace-led patterns.
 - Patch `0025`: interns regexp flag names as atoms, reducing repeated flag
   string work during compilation.
 - Patch `0026`: reads regexp flags directly from compiled bytecode where that
