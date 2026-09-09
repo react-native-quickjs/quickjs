@@ -28,6 +28,18 @@ what we changed and why without opening a single `.patch` file.
 | `0015` | Adds the foundational monomorphic property and transition-store inline caches, with lazy tables and a cheap megamorphic call-site guard | React Native repeatedly reads and initializes the same object fields; caching the receiver shape avoids repeating hashed property lookup while unsafe cases keep the generic path | `get_field_ic`, `get_field2_ic`, `put_field_ic` | **Yes** - adds opcodes |
 | `0016` | Composes explicitly enabled four-entry sites, depth-two prototype reads, and a non-owning megamorphic fallback cache on top of the foundational inline caches | Polymorphic and megamorphic workloads can revisit a small set of receiver shapes and prototype paths often enough to justify the optional wider cache | - | No |
 | `0017` | Makes the four-entry inline-cache configuration the shipping default | The validated composed cache was measured at width four on device, while the release projection still defaulted to width one | - | No |
+| `0018` | Adds bounded metadata for regular-expression optimization | The matcher needs safe, serialized search information for supported literal and prefix patterns | - | **Yes** - extends serialized regular-expression bytecode |
+| `0019` | Adds specialized regular-expression matcher execution | Common eight-bit expressions should not pay for wide-character handling on every operation | - | No |
+| `0020` | Analyzes regular expressions for literal, prefix, and first-set prefilters | Search-heavy expressions reject most input positions before a match can begin | - | **Yes** - emits regular-expression metadata |
+| `0021` | Connects regular-expression metadata to JavaScript matching | Compiled metadata only helps when RegExp operations use it to skip impossible candidates | - | No |
+| `0022` | Reduces setup and capture overhead in regular-expression execution | Repeated execution otherwise rebuilds state and allocates capture storage for common small expressions | - | No |
+| `0023` | Optimizes regular-expression result arrays and boolean tests | Successful matches with captures pay unnecessary property-growth and result-object costs | - | No |
+| `0024` | Adds a fast scanning path for `RegExp[Symbol.split]` and recognizes whitespace first sets | Splitting otherwise invokes the sticky matcher once per source position, while whitespace-led patterns lose the prefilter entirely | - | No |
+| `0025` | Interns the six non-predefined RegExp flag property names once per runtime | Repeated `.flags` reads otherwise redo atom-table lookups for names that are already permanent atoms | - | No |
+| `0026` | Derives RegExp flags directly from compiled bytecode under a semantic guard | Standard RegExp instances can answer `.flags` without eight generic prototype lookups and native getter calls | - | No |
+| `0027` | Keeps the malformed RegExp test fixture synchronized with the opcode table and tightens its assertion | Adding matcher opcodes must not silently turn a bounds-check regression test into a different bytecode program | - | No |
+| `0028` | Hardens RegExp metadata validation and keeps first-set scans interruptible | Deserialized metadata must not drive out-of-bounds fast-path reads, and large no-hit scans must remain interruptible | - | No |
+| `0029` | Adds regression coverage for malformed RegExp metadata | Header mutations must be rejected before optimized execution can consume them | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

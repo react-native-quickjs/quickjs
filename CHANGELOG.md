@@ -77,8 +77,8 @@ and this project adheres to [Semantic Versioning][semver].
   with the matcher.
 - Patch `0028`: hardens serialized RegExp validation with safe opcode, operand,
   target, metadata, allocator, and interrupt checks.
-- Patch `0029`: expands malformed-bytecode and runtime regexp serialization
-  coverage, including the embedding allocator path.
+- Patch `0029`: adds table-driven malformed-bytecode coverage and preserves
+  runtime serialization round-trip coverage through the embedding allocator.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is

@@ -58,6 +58,7 @@ const FILES = [
   'cutils.h',
   'dtoa.h',
   'libregexp-opcode.h',
+  'libregexp-backtrack.c.inc',
   'libregexp.h',
   'libunicode-table.h',
   'libunicode.h',

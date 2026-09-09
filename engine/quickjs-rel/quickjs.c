@@ -492,6 +492,10 @@ struct JSRuntime {
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
+    /* RegExp.prototype.flags: the six flag names js_regexp_get_flags spells
+       with a C string literal, interned once per runtime.  JS_ATOM_NULL until
+       first use; rt is calloc'd. */
+    JSAtom re_flag_atom[6];
 };
 
 struct JSClass {
@@ -1061,6 +1065,10 @@ typedef struct JSForInIterator {
 typedef struct JSRegExp {
     JSString *pattern;
     JSString *bytecode; /* also contains the flags */
+    /* borrowed pointer into 'bytecode' at the start of the optimization
+       metadata header, or NULL if the pattern has no metadata. Always
+       re-derived from 'bytecode' by js_regexp_set_compiled_data(). */
+    const uint8_t *metadata;
 } JSRegExp;
 
 typedef struct JSProxyData {
@@ -2870,6 +2878,14 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
     js_free_rt(rt, rt->class_array);
+
+    /* Drop the interned RegExp flag-name atoms before the atom leak scan. */
+    for (int fa = 0; fa < 6; fa++) {
+        if (rt->re_flag_atom[fa] != JS_ATOM_NULL) {
+            JS_FreeAtomRT(rt, rt->re_flag_atom[fa]);
+            rt->re_flag_atom[fa] = JS_ATOM_NULL;
+        }
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
     /* only the atoms defined in JS_InitAtoms() should be left */
@@ -7188,6 +7204,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
+        p->u.regexp.metadata = NULL;
         goto set_exotic;
     default:
     set_exotic:
@@ -40860,7 +40877,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 28
+#define BC_VERSION 29
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -42900,7 +42917,7 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
     }
 
     if (bc->is_wide_char ||
-        lre_check_bytecode(str8(bc), bc->len) != 0) {
+        lre_check_bytecode(str8(bc), bc->len, ctx) != 0) {
         js_free_string(ctx->rt, pattern);
         js_free_string(ctx->rt, bc);
         return JS_ThrowInternalError(ctx, "bad regexp bytecode");
@@ -51887,6 +51904,22 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
     return ret;
 }
 
+/* The caller transfers its existing pattern and bytecode references to re.
+   'metadata' is a borrowed view and must always be re-derived from bytecode. */
+static void js_regexp_set_compiled_data(JSRegExp *re, JSString *pattern,
+                                        JSString *bytecode)
+{
+    LREMetadata metadata;
+
+    re->pattern = pattern;
+    re->bytecode = bytecode;
+    re->metadata = NULL;
+    if (!bytecode->is_wide_char &&
+        lre_get_metadata(str8(bytecode), bytecode->len, &metadata) == 1) {
+        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
+    }
+}
+
 /* create a RegExp object from a string containing the RegExp bytecode
    and the source pattern */
 static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
@@ -51918,8 +51951,8 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
     }
     p = JS_VALUE_GET_OBJ(obj);
     re = &p->u.regexp;
-    re->pattern = JS_VALUE_GET_STRING(pattern);
-    re->bytecode = JS_VALUE_GET_STRING(bc);
+    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
+                                JS_VALUE_GET_STRING(bc));
     return obj;
 fail:
     JS_FreeValue(ctx, bc);
@@ -52066,8 +52099,8 @@ static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
     }
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
-    re->pattern = JS_VALUE_GET_STRING(pattern);
-    re->bytecode = JS_VALUE_GET_STRING(bc);
+    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
+                                JS_VALUE_GET_STRING(bc));
     if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
                        js_int32(0)) < 0)
         return JS_EXCEPTION;
@@ -52164,6 +52197,137 @@ static JSValue js_regexp_get_flag(JSContext *ctx, JSValueConst this_val, int mas
     return js_bool(flags & mask);
 }
 
+
+/* ---------------------------------------------------------------------------
+   RegExp.prototype.flags, part 1 of 2: intern the six flag names once.
+
+   Six of the eight Gets in js_regexp_get_flags name their property with a C
+   string literal, so every read runs JS_NewAtom -> JS_NewAtomLen ->
+   __JS_FindAtom on a name that has been interned since startup.  MEASURED on
+   the fixed-work Octane regexp row: 23,485,530 of that row's 23,493,652
+   JS_NewAtomLen calls come from this one function and every one of them is a
+   hit -- 6 lookups per read, 3,914,255 reads, none creating anything.  The
+   six names are interned once per runtime instead, in rt->re_flag_atom[].
+
+   Semantics are identical and there is no admission guard, because there is
+   nothing to admit: the same eight generic Gets still happen, on the same
+   receiver, in the same order, with the same atoms.
+   --------------------------------------------------------------------------- */
+enum {
+    JS_RE_FA_hasIndices, JS_RE_FA_ignoreCase, JS_RE_FA_multiline,
+    JS_RE_FA_dotAll, JS_RE_FA_unicodeSets, JS_RE_FA_sticky, JS_RE_FA_COUNT
+};
+
+static const char * const js_re_flag_name[JS_RE_FA_COUNT] = {
+    "hasIndices", "ignoreCase", "multiline", "dotAll", "unicodeSets", "sticky",
+};
+
+/* JS_ATOM_NULL on OOM. */
+static JSAtom js_re_flag_atom(JSContext *ctx, int i)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAtom a = rt->re_flag_atom[i];
+    if (unlikely(a == JS_ATOM_NULL)) {
+        a = JS_NewAtom(ctx, js_re_flag_name[i]);
+        if (a == JS_ATOM_NULL)
+            return JS_ATOM_NULL;
+        rt->re_flag_atom[i] = a;
+    }
+    return a;
+}
+
+static JSValue js_re_get_flag_prop(JSContext *ctx, JSValueConst obj, int i)
+{
+    JSAtom a = js_re_flag_atom(ctx, i);
+    if (unlikely(a == JS_ATOM_NULL))
+        return JS_EXCEPTION;
+    return JS_GetProperty(ctx, obj, a);
+}
+
+
+/* ---------------------------------------------------------------------------
+   RegExp.prototype.flags, part 2 of 2: answer it from re->bytecode.
+
+   All eight flag accessors on RegExp.prototype are the SAME C function
+   (js_regexp_get_flag) returning one bit of lre_get_flags(re->bytecode), so
+   the spec's eight observable Gets have a constant answer whenever nothing
+   can intercept them.  Guarded; anything the guard does not recognise takes
+   the generic derivation below, unchanged.
+   --------------------------------------------------------------------------- */
+
+/* The eight flags in the order ECMA-262 21.2.5.4 assembles them.  slot < 0
+   means the name already has a predefined atom, held in `atom`. */
+static const struct {
+    uint16_t mask;
+    char ch;
+    signed char slot;
+    JSAtom atom;
+} js_re_flag_tab[8] = {
+    { LRE_FLAG_INDICES,      'd', JS_RE_FA_hasIndices,  JS_ATOM_NULL },
+    { LRE_FLAG_GLOBAL,       'g', -1,                   JS_ATOM_global },
+    { LRE_FLAG_IGNORECASE,   'i', JS_RE_FA_ignoreCase,  JS_ATOM_NULL },
+    { LRE_FLAG_MULTILINE,    'm', JS_RE_FA_multiline,   JS_ATOM_NULL },
+    { LRE_FLAG_DOTALL,       's', JS_RE_FA_dotAll,      JS_ATOM_NULL },
+    { LRE_FLAG_UNICODE,      'u', -1,                   JS_ATOM_unicode },
+    { LRE_FLAG_UNICODE_SETS, 'v', JS_RE_FA_unicodeSets, JS_ATOM_NULL },
+    { LRE_FLAG_STICKY,       'y', JS_RE_FA_sticky,      JS_ATOM_NULL },
+};
+
+/* True only if `proto` still carries all eight flag accessors as own
+   JS_PROP_GETSET properties whose getter is the intrinsic js_regexp_get_flag
+   with the matching magic.  Every property is re-read from the live object on
+   every call, so nothing is cached and there is no stale-pointer window:
+     - a redefined getter changes pr->u.getset.getter          -> caught
+     - an accessor turned into a data property changes prs->flags -> caught
+     - a deleted or added property changes the shape lookup    -> caught
+     - a Proxy or an ordinary object in the prototype position has no such own
+       properties at all                                       -> caught
+   A prototype from another realm would pass, and that is correct: the getters
+   it holds are this same C function and would read this same receiver. */
+static bool js_re_proto_flags_pristine(JSContext *ctx, JSObject *proto)
+{
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        JSShapeProperty *prs;
+        JSProperty *pr;
+        JSObject *g;
+        JSAtom atom;
+
+        if (js_re_flag_tab[i].slot < 0)
+            atom = js_re_flag_tab[i].atom;
+        else
+            atom = js_re_flag_atom(ctx, js_re_flag_tab[i].slot);
+        if (unlikely(atom == JS_ATOM_NULL))
+            return false;
+        prs = find_own_property(&pr, proto, atom);
+        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET)
+            return false;
+        g = pr->u.getset.getter;
+        if (!g || g->class_id != JS_CLASS_C_FUNCTION)
+            return false;
+        if (g->u.cfunc.cproto != JS_CFUNC_getter_magic ||
+            g->u.cfunc.c_function.getter_magic != js_regexp_get_flag ||
+            g->u.cfunc.magic != (int)js_re_flag_tab[i].mask)
+            return false;
+    }
+    return true;
+}
+
+/* True if no own property of the receiver can shadow a flag accessor.  A plain
+   RegExp instance carries exactly one own property, lastIndex.  Deleted slots
+   still occupy prop_count, so this is conservative in the safe direction. */
+static bool js_re_instance_unshadowed(JSObject *p)
+{
+    JSShape *sh = p->shape;
+
+    if (sh->prop_count == 0)
+        return true;
+    if (sh->prop_count > 1)
+        return false;
+    return get_shape_prop(sh)->atom == JS_ATOM_lastIndex;
+}
+
 static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
 {
     char str[8], *p = str;
@@ -52172,7 +52336,28 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
         return JS_ThrowTypeErrorNotAnObject(ctx);
 
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "hasIndices"));
+    {
+        JSObject *o = JS_VALUE_GET_OBJ(this_val);
+        JSObject *proto = o->shape->proto;
+        if (o->class_id == JS_CLASS_REGEXP &&
+            o->u.regexp.bytecode != NULL &&
+            proto != NULL &&
+            JS_VALUE_GET_TAG(ctx->class_proto[JS_CLASS_REGEXP]) == JS_TAG_OBJECT &&
+            proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_REGEXP]) &&
+            js_re_instance_unshadowed(o) &&
+            js_re_proto_flags_pristine(ctx, proto)) {
+            int fl = lre_get_flags(str8(o->u.regexp.bytecode));
+            int i;
+            for (i = 0; i < 8; i++)
+                if (fl & js_re_flag_tab[i].mask)
+                    *p++ = js_re_flag_tab[i].ch;
+            if (p == str)
+                return js_empty_string(ctx->rt);
+            return js_new_string8_len(ctx, str, p - str);
+        }
+    }
+
+    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_hasIndices));
     if (res < 0)
         goto exception;
     if (res)
@@ -52182,17 +52367,17 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
         goto exception;
     if (res)
         *p++ = 'g';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "ignoreCase"));
+    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_ignoreCase));
     if (res < 0)
         goto exception;
     if (res)
         *p++ = 'i';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "multiline"));
+    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_multiline));
     if (res < 0)
         goto exception;
     if (res)
         *p++ = 'm';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "dotAll"));
+    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_dotAll));
     if (res < 0)
         goto exception;
     if (res)
@@ -52202,12 +52387,12 @@ static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
         goto exception;
     if (res)
         *p++ = 'u';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "unicodeSets"));
+    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_unicodeSets));
     if (res < 0)
         goto exception;
     if (res)
         *p++ = 'v';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "sticky"));
+    res = JS_ToBoolFree(ctx, js_re_get_flag_prop(ctx, this_val, JS_RE_FA_sticky));
     if (res < 0)
         goto exception;
     if (res)
@@ -52323,16 +52508,462 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* ==== RegExp execution fast paths ====================================== *
+ * When a compiled pattern carries optimization metadata (see libregexp.c),
+ * these helpers locate matches with direct string searches, only entering the
+ * backtracking interpreter (via lre_exec_at) at candidate positions that
+ * already satisfy a cheap literal/prefix test. */
+
+#define JS_REGEXP_SCAN_CHUNK_SIZE 65536
+/* Most patterns need only a handful of capture/register slots; keep those on
+   the stack to avoid a malloc/free pair on every exec. Larger patterns fall
+   back to the heap. */
+#define JS_REGEXP_CAPTURE_STACK_SIZE 16
+
+
+typedef enum {
+    JS_REGEXP_MATCH_GENERIC,
+    JS_REGEXP_MATCH_ATOM,
+    JS_REGEXP_MATCH_PREFIX,
+    JS_REGEXP_MATCH_FIRST_SET,
+} JSRegExpMatchStrategy;
+
+
+static inline int js_regexp_atom_char(const uint8_t *atom, int index)
+{
+    const uint8_t *payload = atom + LRE_META_HEADER_LEN;
+
+    if (atom[LRE_META_ENCODING_OFFSET])
+        return get_u16(payload + index * 2);
+    return payload[index];
+}
+
+/* true if 'pattern' occurs in 'str' at position 'start'. Caller guarantees
+   start + pattern->len <= str->len. */
+static inline bool js_regexp_source_starts_at(JSString *str, int start,
+                                                    JSString *pattern)
+{
+    int i, len = pattern->len;
+
+    if (str->is_wide_char == pattern->is_wide_char) {
+        if (pattern->is_wide_char)
+            return memcmp(str16(str) + start, str16(pattern),
+                          (size_t)len * 2) == 0;
+        return memcmp(str8(str) + start, str8(pattern), len) == 0;
+    }
+    for(i = 0; i < len; i++) {
+        if (string_get(str, start + i) != string_get(pattern, i))
+            return false;
+    }
+    return true;
+}
+
+/* true if the decoded literal 'atom' occurs in 'str' at position 'start'. */
+static inline bool js_regexp_atom_starts_at(JSString *str, int start,
+                                                  const uint8_t *atom)
+{
+    const uint8_t *payload = atom + LRE_META_HEADER_LEN;
+    int encoding = atom[LRE_META_ENCODING_OFFSET];
+    int i, len = get_u32(atom + LRE_META_LENGTH_OFFSET);
+
+    if (len > str->len - start)
+        return false;
+    if (str->is_wide_char == encoding) {
+        return memcmp(str8(str) + (start << encoding), payload,
+                      (size_t)len << encoding) == 0;
+    }
+    for(i = 0; i < len; i++) {
+        if (string_get(str, start + i) != js_regexp_atom_char(atom, i))
+            return false;
+    }
+    return true;
+}
+
+/* Return the first index in [from, to) where character 'c' occurs, or -1. */
+static inline int js_regexp_indexof_char_range(JSString *str, int c,
+                                                     int from, int to)
+{
+    int i;
+
+    if (str->is_wide_char) {
+        if (c > 0xffff)
+            return -1;
+        for(i = from; i < to; i++) {
+            if (str16(str)[i] == c)
+                return i;
+        }
+    } else if ((c & ~0xff) == 0) {
+        const uint8_t *p = memchr(str8(str) + from, c, to - from);
+
+        if (p)
+            return p - str8(str);
+    }
+    return -1;
+}
+
+static int js_regexp_find_source_atom(JSContext *ctx, JSString *str,
+                                      JSString *pattern, int start_index,
+                                      int *pstart)
+{
+    int c, candidate, chunk_end, limit;
+
+    if (pattern->len > str->len) {
+        *pstart = -1;
+        return 0;
+    }
+    limit = str->len - pattern->len + 1;
+    c = string_get(pattern, 0);
+    while (start_index < limit) {
+        chunk_end = start_index +
+            min_int(limit - start_index, JS_REGEXP_SCAN_CHUNK_SIZE);
+        while (start_index < chunk_end) {
+            candidate = js_regexp_indexof_char_range(str, c, start_index,
+                                                     chunk_end);
+            if (candidate < 0)
+                break;
+            if (js_regexp_source_starts_at(str, candidate, pattern)) {
+                *pstart = candidate;
+                return 0;
+            }
+            start_index = candidate + 1;
+        }
+        start_index = chunk_end;
+        if (start_index < limit && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    *pstart = -1;
+    return 0;
+}
+
+static int js_regexp_find_decoded_atom(JSContext *ctx, JSString *str,
+                                       const uint8_t *atom, int start_index,
+                                       int *pstart)
+{
+    int c, candidate, chunk_end, len, limit;
+
+    len = get_u32(atom + LRE_META_LENGTH_OFFSET);
+    if (len > str->len) {
+        *pstart = -1;
+        return 0;
+    }
+    limit = str->len - len + 1;
+    c = js_regexp_atom_char(atom, 0);
+    while (start_index < limit) {
+        chunk_end = start_index +
+            min_int(limit - start_index, JS_REGEXP_SCAN_CHUNK_SIZE);
+        while (start_index < chunk_end) {
+            candidate = js_regexp_indexof_char_range(str, c, start_index,
+                                                     chunk_end);
+            if (candidate < 0)
+                break;
+            if (js_regexp_atom_starts_at(str, candidate, atom)) {
+                *pstart = candidate;
+                return 0;
+            }
+            start_index = candidate + 1;
+        }
+        start_index = chunk_end;
+        if (start_index < limit && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    *pstart = -1;
+    return 0;
+}
+
+/* Match a whole-pattern literal by direct substring search. capture[0..1] are
+   set to the match bounds on success. */
+static inline int js_regexp_match_atom(JSContext *ctx,
+                                             uint8_t **capture, JSString *str,
+                                             const uint8_t *atom,
+                                             JSString *pattern,
+                                             int start_index)
+{
+    int ret, start, shift, len;
+
+    if (atom[LRE_META_FLAGS_OFFSET] & LRE_META_FLAG_SOURCE) {
+        len = pattern->len;
+        if (len <= str->len - start_index &&
+            js_regexp_source_starts_at(str, start_index, pattern)) {
+            start = start_index;
+            ret = 0;
+        } else {
+            ret = js_regexp_find_source_atom(ctx, str, pattern,
+                                             start_index + 1, &start);
+        }
+    } else {
+        len = get_u32(atom + LRE_META_LENGTH_OFFSET);
+        if (len <= str->len - start_index &&
+            js_regexp_atom_starts_at(str, start_index, atom)) {
+            start = start_index;
+            ret = 0;
+        } else {
+            ret = js_regexp_find_decoded_atom(ctx, str, atom,
+                                              start_index + 1, &start);
+        }
+    }
+    if (ret < 0)
+        return ret;
+    if (start < 0)
+        return 0;
+    shift = str->is_wide_char;
+    capture[0] = str8(str) + (start << shift);
+    capture[1] = str8(str) + ((start + len) << shift);
+    return 1;
+}
+
+/* Match a pattern with a required literal prefix: scan for the prefix, then
+   run the interpreter anchored at each hit. */
+static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
+                                  const uint8_t *re_bytecode,
+                                  const uint8_t *prefix, JSString *str,
+                                  int start_index)
+{
+    int c, candidate, chunk_end, ret, len, limit, shift;
+
+    len = get_u32(prefix + LRE_META_LENGTH_OFFSET);
+    shift = str->is_wide_char;
+    c = js_regexp_atom_char(prefix, 0);
+    candidate = start_index;
+    if (len > str->len)
+        return 0;
+    limit = str->len - len + 1;
+    while (candidate < limit) {
+        chunk_end = candidate +
+            min_int(limit - candidate, JS_REGEXP_SCAN_CHUNK_SIZE);
+        while (candidate < chunk_end) {
+            candidate = js_regexp_indexof_char_range(str, c, candidate,
+                                                     chunk_end);
+            if (candidate < 0)
+                break;
+            if (js_regexp_atom_starts_at(str, candidate, prefix)) {
+                ret = lre_exec_at(capture, re_bytecode,
+                                  get_u32(prefix + LRE_META_ENTRY_OFFSET),
+                                  str8(str), candidate, str->len, shift, ctx);
+                if (ret != 0)
+                    return ret;
+            }
+            candidate++;
+        }
+        candidate = chunk_end;
+        if (candidate < limit && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    return 0;
+}
+
+static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
+                                     const uint8_t *s, int from, int len);
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define JS_REGEXP_FIRST_SET_SIMD 1
+#else
+#define JS_REGEXP_FIRST_SET_SIMD 0
+#endif
+
+/* Return the first index in [from, len) of an 8-bit string whose byte is a
+   member of the 256-bit 'bitmap', or len if none. On arm64 this tests 16
+   bytes per iteration with a table-gather (vqtbl2q): idx = byte>>3 selects one
+   of the 32 bitmap bytes, then (gathered >> (byte&7)) & 1 is the membership.
+   Behaves identically to the scalar bitmap test. */
+static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
+                                     const uint8_t *s, int from, int len)
+{
+    int i = from, chunk_end;
+
+    while (i < len) {
+        chunk_end = i + min_int(len - i, JS_REGEXP_SCAN_CHUNK_SIZE);
+#if JS_REGEXP_FIRST_SET_SIMD
+        uint8x16x2_t tbl;
+        uint8x16_t ones = vdupq_n_u8(1);
+        uint8x16_t seven = vdupq_n_u8(7);
+
+        tbl.val[0] = vld1q_u8(bitmap);
+        tbl.val[1] = vld1q_u8(bitmap + 16);
+        for (; i + 16 <= chunk_end; i += 16) {
+            uint8x16_t v = vld1q_u8(s + i);
+            uint8x16_t gathered = vqtbl2q_u8(tbl, vshrq_n_u8(v, 3));
+            uint8x16_t mask = vshlq_u8(ones,
+                                  vreinterpretq_s8_u8(vandq_u8(v, seven)));
+            uint8x16_t hit = vtstq_u8(gathered, mask);
+            if (vmaxvq_u8(hit)) {
+                uint8_t lanes[16];
+                int j;
+                vst1q_u8(lanes, hit);
+                for (j = 0; j < 16; j++) {
+                    if (lanes[j])
+                        return i + j;
+                }
+            }
+        }
+#endif
+        for (; i < chunk_end; i++) {
+            uint8_t c = s[i];
+            if ((bitmap[c >> 3] >> (c & 7)) & 1)
+                return i;
+        }
+        if (i < len && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    return len;
+}
+
+/* Match a pattern with a known mandatory first-character set: scan the input
+   for a character in the set (a cheap 256-bit bitmap test, SIMD-accelerated
+   for 8-bit strings), then run the interpreter anchored there. Handles
+   patterns like \d+, \w+, [class]... that have no literal prefix. */
+static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
+                                     const uint8_t *re_bytecode,
+                                     const uint8_t *fs, JSString *str,
+                                     int start_index)
+{
+    const uint8_t *bitmap = fs + LRE_META_HEADER_LEN + 1;
+    int has_wide = fs[LRE_META_HEADER_LEN];
+    uint32_t entry = get_u32(fs + LRE_META_ENTRY_OFFSET);
+    int shift = str->is_wide_char, len = str->len;
+    int candidate, c, in_set, ret, attempts = 0;
+
+    if (!str->is_wide_char) {
+        const uint8_t *s = str8(str);
+        candidate = start_index;
+        while (candidate < len) {
+            candidate = js_regexp_first_set_scan8(ctx, bitmap, s, candidate, len);
+            if (candidate == LRE_RET_TIMEOUT)
+                return LRE_RET_TIMEOUT;
+            if (candidate >= len)
+                break;
+            ret = lre_exec_at(capture, re_bytecode, entry, s, candidate,
+                              len, 0, ctx);
+            if (ret != 0)
+                return ret;
+            candidate++;
+            if ((++attempts & 1023) == 0 && lre_check_timeout(ctx))
+                return LRE_RET_TIMEOUT;
+        }
+        return 0;
+    }
+    for (candidate = start_index; candidate < len; candidate++) {
+        c = string_get(str, candidate);
+        in_set = (c <= 0xff) ? ((bitmap[c >> 3] >> (c & 7)) & 1) : has_wide;
+        if (in_set) {
+            ret = lre_exec_at(capture, re_bytecode, entry,
+                              str8(str), candidate, len, shift, ctx);
+            if (ret != 0)
+                return ret;
+        }
+        if ((++attempts & 1023) == 0 && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    return 0;
+}
+
+typedef struct JSRegExpExecData {
+    const uint8_t *bytecode;
+    const uint8_t *metadata;
+    int re_flags;
+    JSRegExpMatchStrategy strategy;
+} JSRegExpExecData;
+
+static inline void
+js_regexp_exec_data_init(JSRegExpExecData *d, JSRegExp *re, int capture_count)
+{
+    d->bytecode = str8(re->bytecode);
+    d->re_flags = lre_get_flags(d->bytecode);
+    d->metadata = re->metadata;
+    d->strategy = JS_REGEXP_MATCH_GENERIC;
+    if (d->metadata) {
+        switch (d->metadata[LRE_META_KIND_OFFSET]) {
+        case LRE_META_LITERAL:
+            if ((d->re_flags & LRE_FLAG_ATOM) && capture_count == 1 &&
+                re->pattern->len != 0)
+                d->strategy = JS_REGEXP_MATCH_ATOM;
+            break;
+        case LRE_META_PREFIX:
+            d->strategy = JS_REGEXP_MATCH_PREFIX;
+            break;
+        case LRE_META_FIRST_SET:
+            d->strategy = JS_REGEXP_MATCH_FIRST_SET;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/* Run one match attempt starting at 'start_index', choosing the fastest
+   applicable strategy. Same return convention as lre_exec. */
+static inline int
+js_regexp_match(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
+                JSRegExp *re, JSString *str, int start_index)
+{
+    switch (d->strategy) {
+    case JS_REGEXP_MATCH_ATOM:
+        return js_regexp_match_atom(ctx, capture, str, d->metadata, re->pattern,
+                                    start_index);
+    case JS_REGEXP_MATCH_PREFIX:
+        return js_regexp_match_prefix(ctx, capture, d->bytecode, d->metadata,
+                                      str, start_index);
+    case JS_REGEXP_MATCH_FIRST_SET:
+        return js_regexp_match_first_set(ctx, capture, d->bytecode,
+                                         d->metadata, str, start_index);
+    case JS_REGEXP_MATCH_GENERIC:
+    default:
+        return lre_exec(capture, d->bytecode, str8(str), start_index,
+                        str->len, str->is_wide_char, ctx);
+    }
+}
+
+/* Prepare the shared capture buffer and execution strategy. Callers retain
+   control over matching, lastIndex, and result construction. */
+static inline bool
+js_regexp_exec_prepare(JSContext *ctx, JSRegExp *re, uint8_t **capture_stack,
+                       uint8_t ***pcapture, JSRegExpExecData *exec_data)
+{
+    const uint8_t *bytecode = str8(re->bytecode);
+    int alloc_count = lre_get_alloc_count(bytecode);
+    uint8_t **capture = capture_stack;
+
+    if (alloc_count > (int)countof(capture_stack)) {
+        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
+        if (!capture)
+            return false;
+    }
+    js_regexp_exec_data_init(exec_data, re, lre_get_capture_count(bytecode));
+    *pcapture = capture;
+    return true;
+}
+
+/* Preallocate a freshly created JS_CLASS_ARRAY result object's fast-array
+   storage as BOXED for 'n' elements, so the exec capture loop can store each
+   match/capture directly (values[i] = owned JSValue; bump count) instead of
+   paying the generic JS_DefinePropertyValueUint32 -> add_fast_array_element ->
+   incremental expand chain per capture. Returns the value buffer or NULL (OOM).
+   The array's `length` prop is set by the caller (via regexp_result_shape). */
+static JSValue *js_regexp_result_prealloc(JSContext *ctx, JSValue obj, int n)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    /* obj is empty (count/size 0); it starts life as packed INT32 but we store
+       JSValues, so settle it to BOXED before allocating the buffer. */
+#if QJS_PACKED_ARRAYS
+    p->array_kind = JS_ARRAY_KIND_BOXED;
+#endif
+    if (expand_fast_array(ctx, p, n) < 0)
+        return NULL;
+    return p->u.array.u.values;
+}
+
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
-    int rc, capture_count, alloc_count, shift, index, i, re_flags, prop_flags;
+    int rc, capture_count, shift, index, i, re_flags, prop_flags;
     JSRegExp *re = js_get_regexp(ctx, this_val, true);
+    JSRegExpExecData exec_data;
     JSString *str;
     JSValue t, ret, str_val, obj, val, groups;
     JSValue indices, indices_groups;
     uint8_t *re_bytecode;
     uint8_t **capture, *str_buf;
+    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
     int64_t last_index;
     const char *group_name_ptr;
     JSAtom group_name;
@@ -52351,7 +52982,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     indices = JS_UNDEFINED;
     indices_groups = JS_UNDEFINED;
     group_name = JS_ATOM_NULL;
-    capture = NULL;
+    capture = capture_stack;
 
     val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
     if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
@@ -52369,20 +53000,16 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
        (= capture_count*2 + register_count), not capture_count*2. Sizing it
        by capture_count*2 silently overflows the heap on any regexp that
        uses registers (i.e. most non-trivial patterns). */
-    alloc_count = lre_get_alloc_count(re_bytecode);
-    if (alloc_count > 0) {
-        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
-        if (!capture)
-            goto fail;
-    }
+    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
+                                &exec_data))
+        goto fail;
     shift = str->is_wide_char;
     str_buf = str8(str);
     if (last_index > str->len) {
         rc = 2;
     } else {
-        rc = lre_exec(capture, re_bytecode,
-                      str_buf, last_index, str->len,
-                      shift, ctx);
+        rc = js_regexp_match(ctx, capture, &exec_data, re, str,
+                             (int)last_index);
     }
     if (rc != 1) {
         if (rc >= 0) {
@@ -52413,7 +53040,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                                js_int32((capture[1] - str_buf) >> shift)) < 0)
                 goto fail;
         }
-        group_name_ptr = lre_get_groupnames(re_bytecode);
+        group_name_ptr = lre_get_groupnames(re_bytecode, re->bytecode->len);
         if (group_name_ptr) {
             groups = JS_NewObjectProto(ctx, JS_NULL);
             if (JS_IsException(groups))
@@ -52438,6 +53065,13 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
         obj = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->regexp_result_shape),
                                     JS_CLASS_ARRAY, props);
         if (JS_IsException(obj))
+            goto fail;
+        /* Preallocate the fast-array element storage once and store each
+           capture directly below (see result_values), skipping the per-capture
+           generic define + incremental growth. */
+        JSValue *result_values = js_regexp_result_prealloc(ctx, obj,
+                                                           capture_count);
+        if (!result_values)
             goto fail;
         prop_flags = JS_PROP_C_W_E | JS_PROP_THROW;
         for(i = 0; i < capture_count; i++) {
@@ -52522,8 +53156,10 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                 group_name = JS_ATOM_NULL;
             }
 
-            if (JS_DefinePropertyValueUint32(ctx, obj, i, val, prop_flags) < 0)
-                goto fail;
+            /* Store directly in the fast array. Bump count as we go so an error in
+               a later iteration frees already-stored values via obj's finalizer. */
+            result_values[i] = val;
+            JS_VALUE_GET_OBJ(obj)->u.array.count = i + 1;
         }
 
         if (!JS_IsUndefined(indices)) {
@@ -52548,7 +53184,82 @@ fail:
     JS_FreeValue(ctx, str_val);
     JS_FreeValue(ctx, groups);
     JS_FreeValue(ctx, obj);
-    js_free(ctx, capture);
+    if (capture != capture_stack)
+        js_free(ctx, capture);
+    return ret;
+}
+
+/* Lean boolean match used by RegExp.prototype.test when 'exec' is the
+   unmodified builtin: runs the search and updates lastIndex per
+   RegExpBuiltinExec, but allocates none of the match-result object. */
+static JSValue js_regexp_exec_bool(JSContext *ctx, JSValueConst this_val,
+                                   JSRegExp *re, JSValueConst arg)
+{
+    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
+    uint8_t **capture = capture_stack;
+    uint8_t *re_bytecode;
+    JSRegExpExecData exec_data;
+    JSString *str;
+    JSValue str_val, val, ret = JS_EXCEPTION;
+    int rc, shift, re_flags;
+    int64_t last_index;
+    bool result = false;
+
+    str_val = JS_ToString(ctx, arg);
+    if (JS_IsException(str_val))
+        return JS_EXCEPTION;
+
+    val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
+    if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
+        goto done;
+
+    re_bytecode = str8(re->bytecode);
+    re_flags = lre_get_flags(re_bytecode);
+    if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0)
+        last_index = 0;
+    str = JS_VALUE_GET_STRING(str_val);
+    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
+                                &exec_data))
+        goto done;
+    if (last_index > str->len) {
+        rc = 2;
+    } else {
+        rc = js_regexp_match(ctx, capture, &exec_data, re, str,
+                             (int)last_index);
+    }
+    if (rc < 0) {
+        switch(rc) {
+        case LRE_RET_TIMEOUT:
+            JS_ThrowInterrupted(ctx);
+            break;
+        case LRE_RET_MEMORY_ERROR:
+            JS_ThrowInternalError(ctx, "out of memory in regexp execution");
+            break;
+        case LRE_RET_BYTECODE_ERROR:
+            JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
+            break;
+        default:
+            abort();
+        }
+        goto done;
+    }
+    if (rc == 1) {
+        result = true;
+        if (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
+            shift = str->is_wide_char;
+            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
+                               js_int32((capture[1] - str8(str)) >> shift)) < 0)
+                goto done;
+        }
+    } else if (rc == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
+        if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0)
+            goto done;
+    }
+    ret = js_bool(result);
+done:
+    if (capture != capture_stack)
+        js_free(ctx, capture);
+    JS_FreeValue(ctx, str_val);
     return ret;
 }
 
@@ -52561,17 +53272,19 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
     uint8_t *re_bytecode;
     int ret;
     uint8_t **capture, *str_buf;
-    int alloc_count, shift, re_flags;
+    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
+    int shift, re_flags;
     int next_src_pos, start, end;
     int64_t last_index;
     StringBuffer b_s, *b = &b_s;
+    JSRegExpExecData exec_data;
 
     if (!re)
         return JS_EXCEPTION;
 
     string_buffer_init(ctx, b, 0);
 
-    capture = NULL;
+    capture = capture_stack;
     str_val = JS_ToString(ctx, arg);
     if (JS_IsException(str_val))
         goto fail;
@@ -52587,12 +53300,9 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
     }
     /* size by alloc_count: the register executor uses capture[] beyond
        the capture positions for its registers (see js_regexp_exec). */
-    alloc_count = lre_get_alloc_count(re_bytecode);
-    if (alloc_count > 0) {
-        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
-        if (!capture)
-            goto fail;
-    }
+    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
+                                &exec_data))
+        goto fail;
     shift = str->is_wide_char;
     str_buf = str8(str);
     next_src_pos = 0;
@@ -52600,8 +53310,8 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
         if (last_index > str->len)
             break;
 
-        ret = lre_exec(capture, re_bytecode,
-                       str_buf, last_index, str->len, shift, ctx);
+        ret = js_regexp_match(ctx, capture, &exec_data, re, str,
+                              (int)last_index);
         if (ret != 1) {
             if (ret >= 0) {
                 if (ret == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
@@ -52653,11 +53363,13 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
     if (string_buffer_concat(b, str, next_src_pos, str->len))
         goto fail;
     JS_FreeValue(ctx, str_val);
-    js_free(ctx, capture);
+    if (capture != capture_stack)
+        js_free(ctx, capture);
     return string_buffer_end(b);
 fail:
     JS_FreeValue(ctx, str_val);
-    js_free(ctx, capture);
+    if (capture != capture_stack)
+        js_free(ctx, capture);
     string_buffer_free(b);
     return JS_EXCEPTION;
 }
@@ -52688,6 +53400,20 @@ static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val,
 {
     JSValue val;
     bool ret;
+    JSRegExp *re;
+
+    /* Fast path: a native RegExp whose 'exec' is the unmodified builtin needs
+       neither the generic RegExpExec dispatch nor a match-result object. */
+    re = js_get_regexp(ctx, this_val, false);
+    if (re) {
+        val = JS_GetProperty(ctx, this_val, JS_ATOM_exec);
+        if (JS_IsException(val))
+            return JS_EXCEPTION;
+        ret = JS_IsCFunction(ctx, val, js_regexp_exec, 0);
+        JS_FreeValue(ctx, val);
+        if (ret)
+            return js_regexp_exec_bool(ctx, this_val, re, argv[0]);
+    }
 
     val = JS_RegExpExec(ctx, this_val, argv[0]);
     if (JS_IsException(val))
@@ -53261,6 +53987,144 @@ exception:
     return JS_EXCEPTION;
 }
 
+
+/* Fast path for RegExp.prototype[Symbol.split].
+ *
+ * The spec algorithm sets `splitter.lastIndex = q` and calls
+ * RegExpExec(splitter) once per source-string position, so a split over an
+ * n-character string performs n exec calls of which all but one per separator
+ * fail.  Each failing call pays a lastIndex Set, an `exec` property lookup, a
+ * C-function call, a lastIndex Get + ToLength, and an anchored run of the
+ * backtracking VM.
+ *
+ * Under the admission conditions checked by the caller, the union over q of
+ * "sticky match anchored at q" is exactly "leftmost match starting at index
+ * >= q", which is what the non-sticky scanning matcher (and hence the
+ * prefilter in js_regexp_match) computes in one call.  So the whole ladder
+ * collapses to one scanning match per separator found.
+ *
+ * `re` is the ORIGINAL regexp's JSRegExp (non-sticky, so its bytecode carries
+ * the synthetic `.*?` scan prologue and its metadata prefilter is populated);
+ * the sticky splitter's bytecode cannot scan.
+ *
+ * Returns 0 on success, -1 with an exception pending on failure.
+ */
+/* --------------------------------------------------------------------------
+   JS_RE_PREFILTER: the RegExp[Symbol.split] scanning fast path and the
+   REOP_space first-set arm (bench/spikes/regexp-prefilter,
+   docs/regexp-prefilter-census.md).  MEASURED by its author: Octane regexp
+   -24.32% instructions, -17.43% cycles, -3.21% RSS, all twelve other rows
+   within +/-0.05%.  Default ON; -DJS_RE_PREFILTER=0 removes both halves and
+   restores the spec [Symbol.split] loop and the `default: return false` for
+   REOP_space exactly.
+   -------------------------------------------------------------------------- */
+#ifndef JS_RE_PREFILTER
+#define JS_RE_PREFILTER 1
+#endif
+
+#if JS_RE_PREFILTER
+static int js_regexp_split_fast(JSContext *ctx, JSValueConst A, JSRegExp *re,
+                                JSString *strp, uint32_t lim,
+                                int unicodeMatching)
+{
+    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
+    uint8_t **capture = capture_stack;
+    JSRegExpExecData exec_data;
+    const uint8_t *re_bytecode = str8(re->bytecode);
+    const uint8_t *str_buf = str8(strp);
+    uint32_t size = strp->len, p = 0, q = 0, ms, me;
+    int capture_count = lre_get_capture_count(re_bytecode);
+    int shift = strp->is_wide_char;
+    int rc, i, ret = -1;
+    int64_t lengthA = 0;
+    JSValue sub;
+
+    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
+                                &exec_data))
+        return -1;
+
+    while (q < size) {
+        rc = js_regexp_match(ctx, capture, &exec_data, re, strp, (int)q);
+        if (rc != 1) {
+            if (rc == 0)
+                break;
+            switch(rc) {
+            case LRE_RET_TIMEOUT:
+                JS_ThrowInterrupted(ctx);
+                break;
+            case LRE_RET_MEMORY_ERROR:
+                JS_ThrowInternalError(ctx, "out of memory in regexp execution");
+                break;
+            case LRE_RET_BYTECODE_ERROR:
+                JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
+                break;
+            default:
+                JS_ThrowInternalError(ctx, "regexp execution error");
+                break;
+            }
+            goto done;
+        }
+        ms = (uint32_t)((capture[0] - str_buf) >> shift);
+        me = (uint32_t)((capture[1] - str_buf) >> shift);
+        /* the spec loop only ever probes q < size, so a match that starts at
+           the very end of the string is not reachable from it */
+        if (ms >= size)
+            break;
+        if (me > size)
+            me = size;
+        q = ms;
+        if (me == p) {
+            q = (uint32_t)string_advance_index(strp, q, unicodeMatching);
+            continue;
+        }
+        sub = js_sub_string(ctx, strp, p, q);
+        if (JS_IsException(sub))
+            goto done;
+        if (JS_DefinePropertyValueInt64(ctx, A, lengthA++, sub,
+                                        JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+            goto done;
+        if (lengthA == lim) {
+            ret = 0;
+            goto done;
+        }
+        p = me;
+        for (i = 1; i < capture_count; i++) {
+            uint8_t **match = &capture[2 * i];
+            if (match[0] && match[1]) {
+                sub = js_sub_string(ctx, strp,
+                                    (uint32_t)((match[0] - str_buf) >> shift),
+                                    (uint32_t)((match[1] - str_buf) >> shift));
+                if (JS_IsException(sub))
+                    goto done;
+            } else {
+                sub = JS_UNDEFINED;
+            }
+            if (JS_DefinePropertyValueInt64(ctx, A, lengthA++, sub,
+                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                goto done;
+            if (lengthA == lim) {
+                ret = 0;
+                goto done;
+            }
+        }
+        q = p;
+    }
+    if (p > size)
+        p = size;
+    sub = js_sub_string(ctx, strp, p, size);
+    if (JS_IsException(sub))
+        goto done;
+    if (JS_DefinePropertyValueInt64(ctx, A, lengthA++, sub,
+                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+        goto done;
+    ret = 0;
+done:
+    if (capture != capture_stack)
+        js_free(ctx, capture);
+    return ret;
+}
+#endif /* JS_RE_PREFILTER -- js_regexp_split_fast */
+
 static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
@@ -53326,6 +54190,58 @@ static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
             goto add_tail;
         goto done;
     }
+#if JS_RE_PREFILTER
+    /* --- scanning fast path admission ---------------------------------
+       All of these must hold for the per-position sticky-exec ladder to be
+       replaceable by a forward scan over the original regexp:
+         - the species constructor is the built-in RegExp, so `splitter` is a
+           freshly created object unreachable from user code and its
+           lastIndex is unobservable;
+         - both receiver and splitter are native RegExp objects and are
+           distinct objects;
+         - they were compiled from the *same* pattern string (pointer
+           identity) and from the same flags except that the splitter adds
+           /y -- so the two bytecodes accept exactly the same language;
+         - the receiver is not itself sticky, so its bytecode carries the
+           `.*?` scan prologue that lre_exec needs in order to scan;
+         - `splitter.constructor === RegExp` and `splitter.exec` is the
+           unmodified built-in, so RegExpExec would have dispatched to
+           js_regexp_exec (js_is_standard_regexp).
+       Anything else falls through to the spec loop below. */
+    {
+        JSRegExp *re_rx = js_get_regexp(ctx, rx, false);
+        JSRegExp *re_sp = js_get_regexp(ctx, splitter, false);
+        if (re_rx && re_sp && re_rx != re_sp &&
+            re_rx->pattern == re_sp->pattern &&
+            js_same_value(ctx, ctor, ctx->regexp_ctor)) {
+            /* lre_get_flags() also reports the INTERNAL bits LRE_FLAG_ATOM
+               and LRE_FLAG_HAS_META, which record whether libregexp attached
+               prefilter metadata.  Sticky patterns never get metadata, so
+               comparing raw flags rejects every pattern that has it -- a
+               near-miss that silently cost the whole /[+, ]/ population
+               (2,948,190 match calls on Octane regexp).  Compare only the
+               user-visible flags, bits 0..8. */
+            const int fmask = LRE_FLAG_GLOBAL | LRE_FLAG_IGNORECASE |
+                LRE_FLAG_MULTILINE | LRE_FLAG_DOTALL | LRE_FLAG_UNICODE |
+                LRE_FLAG_STICKY | LRE_FLAG_INDICES | LRE_FLAG_NAMED_GROUPS |
+                LRE_FLAG_UNICODE_SETS;
+            int rx_flags = lre_get_flags(str8(re_rx->bytecode)) & fmask;
+            int sp_flags = lre_get_flags(str8(re_sp->bytecode)) & fmask;
+            if (!(rx_flags & LRE_FLAG_STICKY) &&
+                sp_flags == (rx_flags | LRE_FLAG_STICKY)) {
+                int std = js_is_standard_regexp(ctx, splitter);
+                if (std < 0)
+                    goto exception;
+                if (std) {
+                    if (js_regexp_split_fast(ctx, A, re_rx, strp, lim,
+                                             unicodeMatching) < 0)
+                        goto exception;
+                    goto done;
+                }
+            }
+        }
+    }
+#endif /* JS_RE_PREFILTER -- Symbol.split admission */
     while (q < size) {
         if (JS_SetProperty(ctx, splitter, JS_ATOM_lastIndex, js_int32(q)) < 0)
             goto exception;

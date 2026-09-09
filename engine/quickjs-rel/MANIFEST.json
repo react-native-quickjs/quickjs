@@ -71,22 +71,71 @@
       "sha256": "c8527464beb2a05afab4948edee31a419b149d2a6e76797f7d7524ee4813e2fd"
     },
     {
+      "name": "0018-regexp-metadata.patch",
+      "sha256": "674bb67c6cfd8ee1129d05cca528f97507d37e7f1303a2129b51db87ce6ce5c0"
+    },
+    {
+      "name": "0019-regexp-matcher-core.patch",
+      "sha256": "f71c6efc193f7805f0cdd2af940721673c331b01a8306c36eda02eee4ab6527a"
+    },
+    {
+      "name": "0020-regexp-prefilter-analysis.patch",
+      "sha256": "8cd48dd0ed65a0bcc43b97f0e5b6e1e0e70cbabd5543e4ebd0b990a9297e10ae"
+    },
+    {
+      "name": "0021-regexp-prefilter-integration.patch",
+      "sha256": "6fc4b32b0f26c597ae308dc8f82f4a4f7d25486b4a18f415cc815bfb2f9ca05c"
+    },
+    {
+      "name": "0022-regexp-exec-fast-paths.patch",
+      "sha256": "26b6151109f20d3f1e960d69f9f0078405d62afc609f415e0a1cffabd220850b"
+    },
+    {
+      "name": "0023-regexp-result-optimization.patch",
+      "sha256": "a688acc0aec07ae143457860843234a47afbac947696f873c48aff2b444af4af"
+    },
+    {
+      "name": "0024-regexp-split-scan-and-space-first-set.patch",
+      "sha256": "f8564a1336bc656bdf4b5e8093f8a0c625d234c5396ae3b020a8c559d82cb80e"
+    },
+    {
+      "name": "0025-regexp-flag-name-atoms.patch",
+      "sha256": "55dcc10393c2d84375e460219b2f5a739f0be04aee26c41ed47ac1dcf1f6b133"
+    },
+    {
+      "name": "0026-regexp-flags-from-bytecode.patch",
+      "sha256": "fa087ea4c14a5d86d04df7fda2e80842dc7ab47a04d161a5c1f6cb58063cfa41"
+    },
+    {
+      "name": "0027-regexp-test-fixture-correctness.patch",
+      "sha256": "da90adbb88285da1d37ac14c6611f60fbf44ec4098a23775a8c3bd5dab37cc3a"
+    },
+    {
+      "name": "0028-regexp-metadata-hardening.patch",
+      "sha256": "82d5fa08ddba839bc98f2acb001bb995ceef605f95a91b85a4f1e6a4bf682a7d"
+    },
+    {
+      "name": "0029-regexp-metadata-tests.patch",
+      "sha256": "32f31ab67f340b0c94f54ab64bf158a47189bd03625934a639b9ed4b0f92a1f9"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "39ee368fbab7f618ae6d222c968de4c252d1e607d1cfc1087b80c5444a1d8571"
+      "sha256": "2ba5b9c8b2b140b586d54d12d995622ff38f70815c8a32942881674897131c97"
     }
   ],
   "files": {
-    "quickjs.c": "c70162248fd628ca1249e3d3ff3facc661ab51947d59e97ac9f017f71b3ce6b5",
-    "libregexp.c": "af13e996abb1767fe0cdfda123c45b811d53688d403a2ac47142e97bf79f1fae",
+    "quickjs.c": "e337d78c46e66c7c8d0b614ca0b01a5aaf603f84a5c1dac048f345fe1d60aa46",
+    "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
-    "builtin-array-fromasync.h": "feadf42a3ed7a4a16582ad2abaf546a185079e588034ed9261318da0d031ed54",
-    "builtin-iterator-zip-keyed.h": "3fa1540f5d7ac6710762d7b3c3c8302e2bc255344529ceff494ba4a35c53adfb",
-    "builtin-iterator-zip.h": "81d646b328daa793a7bf3c769878ffa220587b022865ebaac8f312519c1ae461",
+    "builtin-array-fromasync.h": "4b0f10d6d99ab1319952e7adec8b4c0d96400df62e09f9247f96df6d8fa4b8cc",
+    "builtin-iterator-zip-keyed.h": "8872165a6ed3171794d0b18b58c8ed0bb26a86a2fa0ff3d262999d215cf71778",
+    "builtin-iterator-zip.h": "01fa7dacc9900ceac661daf4b2a09e76c21c76e9c25c4db7ec4c9a6f6ad49a47",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
-    "libregexp.h": "53ff95a038f7001b752c455d195d998e2955f0ae4ed62a002c13eca798db3ceb",
+    "libregexp-backtrack.c.inc": "c0048b115cb43a46f9e3688b962fd2c95188acc528d65cfd7191f73c787c861a",
+    "libregexp.h": "2e6fca80aace54a614b5a3f65912f2d6b03dd0d87a7ed3f25f064d997e6eb557",
     "libunicode-table.h": "5840a921ac11664b505ee37b1219f518fff2a04972fe848b4bdf1e85c5a0bd83",
     "libunicode.h": "ad13f66aaea3fab1616e84b9c048f2a315e1bdbab628b966617a7a3e55bcba2b",
     "list.h": "cb6e24e8ee54bccdd66234fe54cd702d1160b9841db2b9b9adeb5003afe301d5",
