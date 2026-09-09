@@ -280,6 +280,88 @@ TEST(Bytecode, PrepareJavaScriptAcceptsBytecode) {
       runtime->global().getProperty(*runtime, "answer").getNumber(), 42.0);
 }
 
+TEST(Bytecode, LazyFunctionSerializesBeforeCall) {
+  auto bytes = compileToBytecode("globalThis.answer = {value: 40}.value + 2;");
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+
+  JSValue top = JS_ReadObject(
+      ctx, bytes.data() + qjs::kBytecodeHeaderSize,
+      bytes.size() - qjs::kBytecodeHeaderSize,
+      JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY);
+  ASSERT_FALSE(JS_IsException(top));
+  size_t serialized_size = 0;
+  uint8_t *serialized =
+      JS_WriteObject(ctx, &serialized_size, top, JS_WRITE_OBJ_BYTECODE);
+  ASSERT_NE(serialized, nullptr);
+  bytes.clear();
+  JS_FreeValue(ctx, top);
+
+  JSValue round_trip =
+      JS_ReadObject(ctx, serialized, serialized_size, JS_READ_OBJ_BYTECODE);
+  ASSERT_FALSE(JS_IsException(round_trip));
+  JSValue result = JS_EvalFunction(ctx, round_trip);
+  ASSERT_FALSE(JS_IsException(result));
+  int32_t value = 0;
+  ASSERT_EQ(JS_ToInt32(ctx, &value, result), 0);
+  EXPECT_EQ(value, 42);
+  JS_FreeValue(ctx, result);
+  js_free(ctx, serialized);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
+TEST(Bytecode, LazyCopiedInputSurvivesCallerBufferDestruction) {
+  auto bytes = compileToBytecode(
+      "globalThis.answerFunction = () => ({value: 40}).value + 2;");
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+
+  JSValue top = JS_ReadObject(
+      ctx, bytes.data() + qjs::kBytecodeHeaderSize,
+      bytes.size() - qjs::kBytecodeHeaderSize,
+      JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY);
+  ASSERT_FALSE(JS_IsException(top));
+  JSValue result = JS_EvalFunction(ctx, top);
+  ASSERT_FALSE(JS_IsException(result));
+  JS_FreeValue(ctx, result);
+  bytes.clear();
+
+  JSValue global = JS_GetGlobalObject(ctx);
+  JSValue function = JS_GetPropertyStr(ctx, global, "answerFunction");
+  JSValue answer = JS_Call(ctx, function, JS_UNDEFINED, 0, nullptr);
+  ASSERT_FALSE(JS_IsException(answer));
+  double value = 0;
+  ASSERT_EQ(JS_ToFloat64(ctx, &value, answer), 0);
+  EXPECT_EQ(value, 42.0);
+  JS_FreeValue(ctx, answer);
+  JS_FreeValue(ctx, function);
+  JS_FreeValue(ctx, global);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
+TEST(Bytecode, LazyFlagCombinationsAreRejected) {
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  const uint8_t payload[] = {0};
+  EXPECT_TRUE(JS_IsException(
+      JS_ReadObject(ctx, payload, sizeof(payload), JS_READ_OBJ_LAZY)));
+  JS_FreeValue(ctx, JS_GetException(ctx));
+  EXPECT_TRUE(JS_IsException(JS_ReadObject(
+      ctx, payload, sizeof(payload),
+      JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY | JS_READ_OBJ_REFERENCE)));
+  JS_FreeValue(ctx, JS_GetException(ctx));
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
 TEST(Bytecode, PreparedScriptIsReusableAcrossRuntimes) {
   // JSI allows a PreparedJavaScript to be shared between runtimes of the same
   // concrete type, so evaluating one must not consume it.

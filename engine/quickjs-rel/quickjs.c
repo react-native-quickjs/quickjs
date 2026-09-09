@@ -998,7 +998,19 @@ typedef struct JSFunctionBytecode {
     uint8_t super_allowed : 1;
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
-    /* XXX: 5 bits available */
+    /* Body not deserialized yet: vardefs, cpool, byte_code and debug info are
+       still sitting in the source blob. Everything the runtime needs *before*
+       a call -- name, arity, closure vars -- is already here, so a lazy
+       function can be closed over, stored and inspected without touching it.
+       See js_materialize_function_body. */
+    uint8_t is_lazy : 1;
+    uint8_t lazy_has_debug : 1; /* the deferred region carries debug info */
+    /* A materialization attempt failed (allocation failure, or a blob that
+       passed the checksum but does not decode). The body is now partially
+       filled and cannot be re-parsed, so every later call has to fail rather
+       than run with a NULL byte_code_buf. */
+    uint8_t lazy_failed : 1;
+    /* XXX: 2 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
@@ -1014,6 +1026,7 @@ typedef struct JSFunctionBytecode {
     uint16_t stack_size; /* maximum stack size */
     uint16_t var_ref_count; /* number of local variable references */
     uint16_t closure_var_count;
+    uint32_t local_count; /* serialized vardef count, validated against args + vars */
     int cpool_count;
     JSContext *realm; /* function realm */
     JSValue *cpool; /* constant pool (self pointer) */
@@ -1026,7 +1039,66 @@ typedef struct JSFunctionBytecode {
     char *source;
     JSObjLitTemplate *objlit_tab;
     uint16_t objlit_count;
+    /* Where the undeserialized body lives, while is_lazy. Dropped (and the
+       source unref'd) on materialization. */
+    struct JSLazySource *lazy_src;
+    uint32_t lazy_off;
+    uint32_t lazy_len;
 } JSFunctionBytecode;
+
+/* Shared backing for lazily deserialized function bodies.
+ *
+ * Deferring a parse means keeping everything that parse would have needed:
+ * the bytes themselves, and the atom table they index into. Both outlive the
+ * JS_ReadObject call that produced them, so they are refcounted here and every
+ * lazy function holds a reference. The last function to materialize (or be
+ * freed) releases the blob. */
+typedef struct JSLazySource {
+    int ref_count;
+    const uint8_t *buf; /* engine-owned copy of the serialized payload */
+    size_t buf_len;
+    /* Interned atoms, one reference held per populated entry. */
+    JSAtom *idx_to_atom;
+    uint32_t idx_to_atom_count;
+    uint32_t first_atom;
+} JSLazySource;
+
+typedef struct JSFunctionLayout {
+    size_t base_size;
+    size_t cpool_offset;
+    size_t vardefs_offset;
+    size_t closure_var_offset;
+    size_t byte_code_offset;
+    size_t total_size;
+} JSFunctionLayout;
+
+static int js_function_layout(size_t cpool_count, size_t local_count,
+                              size_t closure_var_count, size_t byte_code_len,
+                              JSFunctionLayout *layout)
+{
+    size_t n;
+
+    layout->base_size = sizeof(JSFunctionBytecode);
+    if (layout->base_size > SIZE_MAX - 7)
+        return -1;
+    layout->cpool_offset = (layout->base_size + 7) & ~(size_t)7;
+    if (cpool_count > (SIZE_MAX - layout->cpool_offset) / sizeof(JSValue))
+        return -1;
+    n = layout->cpool_offset + cpool_count * sizeof(JSValue);
+    layout->vardefs_offset = n;
+    if (local_count > (SIZE_MAX - n) / sizeof(JSVarDef))
+        return -1;
+    n += local_count * sizeof(JSVarDef);
+    layout->closure_var_offset = n;
+    if (closure_var_count > (SIZE_MAX - n) / sizeof(JSClosureVar))
+        return -1;
+    n += closure_var_count * sizeof(JSClosureVar);
+    layout->byte_code_offset = n;
+    if (byte_code_len > SIZE_MAX - n)
+        return -1;
+    layout->total_size = n + byte_code_len;
+    return 0;
+}
 
 typedef struct JSBoundFunction {
     JSValue func_obj;
@@ -1413,6 +1485,9 @@ static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type);
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p);
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b);
+static JSLazySource *js_lazy_source_dup(JSLazySource *src);
+static void js_lazy_source_free(JSRuntime *rt, JSLazySource *src);
+static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b);
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
                                   int argc, JSValueConst *argv, int flags);
@@ -17757,11 +17832,16 @@ static JSValue js_throw_type_error(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* filename, line and column live in the deferred region, so reading them off a
+   function that has not run yet has to pull the body in. These are debug
+   accessors -- correctness matters, speed does not. */
 static JSValue js_function_proto_fileName(JSContext *ctx,
                                           JSValueConst this_val)
 {
     JSFunctionBytecode *b = JS_GetFunctionBytecode(this_val);
     if (b) {
+        if (b->is_lazy && js_materialize_function_body(b->realm, b))
+            return JS_EXCEPTION;
         return JS_AtomToString(ctx, b->filename);
     }
     return JS_UNDEFINED;
@@ -17773,7 +17853,10 @@ static JSValue js_function_proto_int32(JSContext *ctx,
 {
     JSFunctionBytecode *b = JS_GetFunctionBytecode(this_val);
     if (b) {
-        int *field = (int *) ((char *)b + magic);
+        int *field;
+        if (b->is_lazy && js_materialize_function_body(b->realm, b))
+            return JS_EXCEPTION;
+        field = (int *) ((char *)b + magic);
         return js_int32(*field);
     }
     return JS_UNDEFINED;
@@ -19306,6 +19389,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          argv, flags);
     }
     b = p->u.func.function_bytecode;
+
+    /* First call of a function whose body was left in the blob. Everything
+       below reads byte_code_buf, cpool and vardefs, so this is the point where
+       the deferral has to end. */
+    if (unlikely(b->is_lazy)) {
+        if (js_materialize_function_body(b->realm, b))
+            return JS_EXCEPTION;
+    }
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
@@ -22978,6 +23069,15 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf = &s->frame;
     p = JS_VALUE_GET_OBJ(func_obj);
     b = p->u.func.function_bytecode;
+    /* Async and generator functions set up their frame here and then enter
+       JS_CallInternal through the JS_CALL_FLAG_GENERATOR path, which resumes
+       from sf->cur_pc and never reaches the materialization check there. So
+       this is their first-call point, and skipping it would seed the frame
+       with a NULL pc. */
+    if (unlikely(b->is_lazy)) {
+        if (js_materialize_function_body(b->realm, b))
+            return -1;
+    }
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = false;
     sf->cur_pc = b->byte_code_buf;
@@ -39562,6 +39662,11 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
 
+    /* Still holding the blob it was never read from (or a failed
+       materialization left it attached). */
+    if (b->lazy_src)
+        js_lazy_source_free(rt, b->lazy_src);
+
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(b) != 0) {
         list_add_tail(&b->header.link, &rt->gc_zero_ref_count_list);
@@ -41635,7 +41740,11 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
 {
     JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
     uint32_t flags;
+    size_t lazy_len_pos, lazy_body_pos;
     int idx, i;
+
+    if (b->lazy_src && js_materialize_function_body(b->realm, b))
+        return -1;
 
     bc_put_u8(s, BC_TAG_FUNCTION_BYTECODE);
     flags = idx = 0;
@@ -41666,9 +41775,42 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     /* IC table size only; contents are runtime-only (doc/ic-design.md §1). The
        _ic opcodes are already in byte_code, so a nonzero count round-trips. */
     bc_put_leb128(s, b->ic_count);
+    /* local_count moved ahead of the deferred region: the reader needs it to
+       size the function allocation, which it must do before it can decide to
+       skip anything. */
+    bc_put_leb128(s, b->vardefs ? b->arg_count + b->var_count : 0);
+
+    /* Closure variables stay eager. js_closure2 walks them to build var_refs
+       when the closure is *created*, which happens long before the function is
+       ever called -- deferring them would mean materializing every function at
+       closure creation, i.e. no laziness at all. */
+    for(i = 0; i < b->closure_var_count; i++) {
+        JSClosureVar *cv = &b->closure_var[i];
+        bc_put_atom(s, cv->var_name);
+        bc_put_leb128(s, cv->var_idx);
+        flags = idx = 0;
+        bc_set_flags(&flags, &idx, cv->closure_type, 3);
+        bc_set_flags(&flags, &idx, cv->is_const, 1);
+        bc_set_flags(&flags, &idx, cv->is_lexical, 1);
+        bc_set_flags(&flags, &idx, cv->var_kind, 4);
+        assert(idx <= 16);
+        bc_put_leb128(s, flags);
+    }
+
+    /* Everything from here to the end of this function record is deferrable.
+       It has to be length-prefixed to be skippable: vardefs are leb128 runs and
+       the constant pool is *recursive* (nested functions live in it), so
+       without a byte count the only way to find the end of the region is to
+       parse it -- which is the cost we are trying to avoid.
+
+       The length is not known until the region is written, so reserve a fixed
+       u32 and patch it afterwards. Record the offset, not a pointer: dbuf
+       reallocs as it grows. */
+    lazy_len_pos = s->dbuf.size;
+    bc_put_u32(s, 0);
+    lazy_body_pos = s->dbuf.size;
+
     if (b->vardefs) {
-        /* XXX: this field is redundant */
-        bc_put_leb128(s, b->arg_count + b->var_count);
         for(i = 0; i < b->arg_count + b->var_count; i++) {
             JSVarDef *vd = &b->vardefs[i];
             bc_put_atom(s, vd->var_name);
@@ -41684,21 +41826,6 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
             if (vd->is_captured)
                 bc_put_leb128(s, vd->var_ref_idx);
         }
-    } else {
-        bc_put_leb128(s, 0);
-    }
-
-    for(i = 0; i < b->closure_var_count; i++) {
-        JSClosureVar *cv = &b->closure_var[i];
-        bc_put_atom(s, cv->var_name);
-        bc_put_leb128(s, cv->var_idx);
-        flags = idx = 0;
-        bc_set_flags(&flags, &idx, cv->closure_type, 3);
-        bc_set_flags(&flags, &idx, cv->is_const, 1);
-        bc_set_flags(&flags, &idx, cv->is_lexical, 1);
-        bc_set_flags(&flags, &idx, cv->var_kind, 4);
-        assert(idx <= 16);
-        bc_put_leb128(s, flags);
     }
 
     // write constant pool before code so code can be disassembled
@@ -41739,6 +41866,19 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
             bc_put_leb128(s, 0);
         }
     }
+
+    /* dbuf_put can fail silently (error flag); check before patching so we do
+       not write into a buffer that never grew. */
+    if (s->dbuf.error)
+        goto fail;
+    /* Refuse rather than truncate: a silently wrapped count would produce a
+       blob that passes the checksum and then skips to the wrong offset. */
+    if (s->dbuf.size - lazy_body_pos > UINT32_MAX) {
+        JS_ThrowInternalError(s->ctx, "function too large to serialize");
+        goto fail;
+    }
+    put_u32(s->dbuf.buf + lazy_len_pos,
+            (uint32_t)(s->dbuf.size - lazy_body_pos));
     return 0;
  fail:
     return -1;
@@ -42215,6 +42355,10 @@ typedef struct BCReaderState {
     bool allow_sab;
     bool allow_bytecode;
     bool allow_reference;
+    /* Non-NULL when function bodies may be deferred. Also set while
+       materializing, so nested functions in a materialized constant pool stay
+       lazy themselves rather than dragging in the whole subtree. */
+    JSLazySource *lazy_src;
     /* object references */
     JSObject **objects;
     int objects_count;
@@ -42371,6 +42515,8 @@ static int bc_get_buf(BCReaderState *s, void *buf, uint32_t buf_len)
     return 0;
 }
 
+static JSString *JS_ReadString(BCReaderState *s);
+
 static int bc_idx_to_atom(BCReaderState *s, JSAtom *patom, uint32_t idx)
 {
     JSAtom atom;
@@ -42471,7 +42617,17 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
     pos = 0;
     while (pos < bc_len) {
         op = bc_buf[pos];
+        if ((uint32_t)op >= OP_COUNT) {
+            JS_ThrowSyntaxError(s->ctx, "invalid bytecode opcode");
+            b->byte_code_len = pos;
+            return -1;
+        }
         len = short_opcode_info(op).size;
+        if (len == 0 || len > bc_len - pos) {
+            JS_ThrowSyntaxError(s->ctx, "truncated bytecode instruction");
+            b->byte_code_len = pos;
+            return -1;
+        }
         switch(short_opcode_info(op).fmt) {
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
@@ -42659,6 +42815,230 @@ fail:
     return -1;
 }
 
+/* Parses the deferrable region of a function record: vardefs, constant pool,
+   bytecode and debug info. Shared by the eager read and by materialization, so
+   the two can never drift apart -- the whole scheme rests on them producing
+   byte-identical results from the same bytes. */
+static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+                               int local_count, int byte_code_offset,
+                               bool has_debug_info)
+{
+    JSContext *ctx = s->ctx;
+    uint8_t v8;
+    int idx, i;
+
+    if (local_count != 0) {
+        bc_read_trace(s, "vars {\n");
+        bc_read_trace(s, "off flags scope name\n");
+        for(i = 0; i < local_count; i++) {
+            JSVarDef *vd = &b->vardefs[i];
+            if (bc_get_atom(s, &vd->var_name))
+                return -1;
+            if (bc_get_leb128_int(s, &vd->scope_level))
+                return -1;
+            if (bc_get_leb128_int(s, &vd->scope_next))
+                return -1;
+            vd->scope_next--;
+            if (bc_get_u8(s, &v8))
+                return -1;
+            idx = 0;
+            vd->var_kind = bc_get_flags(v8, &idx, 4);
+            vd->is_const = bc_get_flags(v8, &idx, 1);
+            vd->is_lexical = bc_get_flags(v8, &idx, 1);
+            vd->is_captured = bc_get_flags(v8, &idx, 1);
+            if (vd->is_captured) {
+                if (bc_get_leb128_u16(s, &vd->var_ref_idx))
+                    return -1;
+            }
+#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+            if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
+                bc_read_trace(s, "%3d  %d%c%c%c %4d  ",
+                              i, vd->var_kind,
+                              vd->is_const ? 'C' : '.',
+                              vd->is_lexical ? 'L' : '.',
+                              vd->is_captured ? 'X' : '.',
+                              vd->scope_level);
+                print_atom(s->ctx, vd->var_name);
+                printf("\n");
+            }
+#endif
+        }
+        bc_read_trace(s, "}\n");
+    }
+
+    if (b->cpool_count != 0) {
+        bc_read_trace(s, "cpool {\n");
+        for(i = 0; i < b->cpool_count; i++) {
+            JSValue val;
+            val = JS_ReadObjectRec(s);
+            if (JS_IsException(val))
+                return -1;
+            b->cpool[i] = val;
+        }
+        bc_read_trace(s, "}\n");
+    }
+    {
+        bc_read_trace(s, "bytecode {\n");
+        if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
+            return -1;
+        if (js_validate_ic_bytecode(ctx, b))
+            return -1;
+        bc_read_trace(s, "}\n");
+    }
+    {
+        uint32_t template_count, prop_count, pc;
+        uint32_t *template_pcs = NULL;
+        if (bc_get_leb128(s, &template_count) || template_count > UINT16_MAX)
+            return -1;
+        if (template_count != 0) {
+            template_pcs = js_malloc(s->ctx,
+                                     sizeof(*template_pcs) * template_count);
+            if (!template_pcs)
+                return -1;
+            for (i = 0; i < (int)template_count; i++)
+                template_pcs[i] = UINT32_MAX;
+        }
+        for (pc = 0; pc < (uint32_t)b->byte_code_len;) {
+            uint8_t opcode = b->byte_code_buf[pc];
+            uint32_t instruction_len;
+            if ((uint32_t)opcode >= OP_COUNT) {
+                JS_ThrowSyntaxError(ctx, "invalid object literal template metadata: invalid opcode");
+                goto objlit_fail;
+            }
+            instruction_len = short_opcode_info(opcode).size;
+            if (instruction_len == 0 || instruction_len >
+                (uint32_t)b->byte_code_len - pc) {
+                JS_ThrowSyntaxError(ctx, "invalid object literal template metadata: truncated instruction");
+                goto objlit_fail;
+            }
+            if (opcode == OP_object_template) {
+                uint32_t index;
+                if (instruction_len != 3) {
+                    JS_ThrowSyntaxError(ctx, "invalid object literal template metadata: invalid instruction size");
+                    goto objlit_fail;
+                }
+                index = get_u16(b->byte_code_buf + pc + 1);
+                if (index >= template_count || template_pcs[index] != UINT32_MAX) {
+                    JS_ThrowSyntaxError(ctx, "invalid object literal template metadata: invalid or duplicate index");
+                    goto objlit_fail;
+                }
+                template_pcs[index] = pc;
+            }
+            pc += instruction_len;
+        }
+        for (i = 0; i < (int)template_count; i++) {
+            if (template_pcs[i] == UINT32_MAX) {
+                JS_ThrowSyntaxError(ctx, "invalid object literal template metadata: missing template");
+                goto objlit_fail;
+            }
+        }
+        if (template_count != 0) {
+            b->objlit_tab = js_mallocz(s->ctx,
+                                       sizeof(*b->objlit_tab) * template_count);
+            if (!b->objlit_tab)
+                goto objlit_fail;
+            b->objlit_count = (uint16_t)template_count;
+        }
+        for (i = 0; i < (int)template_count; i++) {
+            if (bc_get_leb128(s, &pc) || bc_get_leb128(s, &prop_count) ||
+                prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS ||
+                pc != template_pcs[i])
+                goto objlit_fail;
+            b->objlit_tab[i].pc = pc;
+            b->objlit_tab[i].atoms = js_malloc(s->ctx,
+                                               sizeof(JSAtom) * prop_count);
+            if (!b->objlit_tab[i].atoms)
+                goto objlit_fail;
+            for (idx = 0; idx < (int)prop_count; idx++) {
+                if (bc_get_atom(s, &b->objlit_tab[i].atoms[idx]))
+                    goto objlit_fail;
+                b->objlit_tab[i].prop_count++;
+            }
+        }
+        js_free(s->ctx, template_pcs);
+        template_pcs = NULL;
+        goto objlit_done;
+objlit_fail:
+        js_free(s->ctx, template_pcs);
+        return -1;
+objlit_done:
+        ;
+    }
+    if (!has_debug_info)
+        return 0;
+
+    /* read optional debug information */
+    bc_read_trace(s, "debug {\n");
+    if (bc_get_atom(s, &b->filename))
+        return -1;
+    if (bc_get_leb128_int(s, &b->line_num))
+        return -1;
+    if (bc_get_leb128_int(s, &b->col_num))
+        return -1;
+#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+    if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
+        bc_read_trace(s, "filename: ");
+        print_atom(s->ctx, b->filename);
+        printf(", line: %d, column: %d\n", b->line_num, b->col_num);
+    }
+#endif
+    if (bc_get_leb128_int(s, &b->pc2line_len))
+        return -1;
+    if (b->pc2line_len) {
+        bc_read_trace(s, "positions: %d bytes\n", b->pc2line_len);
+        b->pc2line_buf = js_mallocz(ctx, b->pc2line_len);
+        if (!b->pc2line_buf)
+            return -1;
+        if (bc_get_buf(s, b->pc2line_buf, b->pc2line_len))
+            return -1;
+    }
+    if (bc_get_leb128_int(s, &b->source_len))
+        return -1;
+    if (b->source_len) {
+        bc_read_trace(s, "source: %d bytes\n", b->source_len);
+        if (s->ptr_last)
+            s->ptr_last += b->source_len;  // omit source code hex dump
+        /* b->source is a UTF-8 encoded null terminated C string */
+        b->source = js_mallocz(ctx, b->source_len + 1);
+        if (!b->source)
+            return -1;
+        if (bc_get_buf(s, b->source, b->source_len))
+            return -1;
+    }
+    bc_read_trace(s, "}\n");
+    return 0;
+}
+
+static int JS_ReadFunctionBodyBounded(BCReaderState *s, JSFunctionBytecode *b,
+                                      uint32_t body_len, uint32_t local_count,
+                                      size_t byte_code_offset,
+                                      bool has_debug_info)
+{
+    const uint8_t *outer_end = s->buf_end;
+    const uint8_t *body_start = s->ptr;
+    const uint8_t *body_end;
+    int ret;
+
+    if (body_start > outer_end ||
+        (size_t)body_len > (size_t)(outer_end - body_start)) {
+        JS_ThrowInternalError(s->ctx, "invalid function body length: %u",
+                              body_len);
+        return -1;
+    }
+    body_end = body_start + body_len;
+    s->buf_end = body_end;
+    ret = JS_ReadFunctionBody(s, b, local_count, byte_code_offset,
+                              has_debug_info);
+    if (ret == 0 && s->ptr != body_end) {
+        JS_ThrowInternalError(s->ctx,
+                              "function body length mismatch: parsed %zu, declared %u",
+                              (size_t)(s->ptr - body_start), body_len);
+        ret = -1;
+    }
+    s->buf_end = outer_end;
+    return ret;
+}
+
 static JSValue JS_ReadFunctionTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -42667,9 +43047,10 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     uint16_t v16;
     uint8_t v8;
     int idx, i, local_count, has_debug_info;
-    int function_size, cpool_offset, byte_code_offset;
-    int closure_var_offset, vardefs_offset;
-    uint32_t *objlit_template_pcs = NULL;
+    size_t function_size;
+    JSFunctionLayout layout;
+    uint32_t lazy_len = 0;
+    const uint8_t *lazy_body_ptr = NULL;
 
     memset(&bc, 0, sizeof(bc));
     //bc.gc_header.mark = 0;
@@ -42721,16 +43102,25 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     }
     if (bc_get_leb128_int(s, &local_count))
         goto fail;
+    if (local_count < 0 || local_count > 65535 * 2) {
+        JS_ThrowInternalError(ctx, "invalid local count: %d", local_count);
+        goto fail;
+    }
 
-    function_size = sizeof(*b);
-    cpool_offset = (function_size + 7) & ~7;
-    function_size = cpool_offset + bc.cpool_count * sizeof(*bc.cpool);
-    vardefs_offset = function_size;
-    function_size += local_count * sizeof(*bc.vardefs);
-    closure_var_offset = function_size;
-    function_size += bc.closure_var_count * sizeof(*bc.closure_var);
-    byte_code_offset = function_size;
-    function_size += bc.byte_code_len;
+    if (bc.arg_count + (uint32_t)bc.var_count != (uint32_t)local_count) {
+        JS_ThrowSyntaxError(ctx, "invalid local count: expected %u, got %d",
+                            bc.arg_count + (uint32_t)bc.var_count, local_count);
+        goto fail;
+    }
+    bc.local_count = (uint32_t)local_count;
+    if (bc.cpool_count < 0 || bc.byte_code_len < 0 ||
+        js_function_layout((size_t)bc.cpool_count, (size_t)bc.local_count,
+                           bc.closure_var_count, (size_t)bc.byte_code_len,
+                           &layout)) {
+        JS_ThrowInternalError(ctx, "invalid function layout");
+        goto fail;
+    }
+    function_size = layout.total_size;
 
     b = js_mallocz(ctx, function_size);
     if (!b)
@@ -42740,14 +43130,14 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc.func_name = JS_ATOM_NULL;
     b->ic_entries = JS_IC_ENTRIES;
     JS_REF_COUNT(b) = 1;
-    if (local_count != 0) {
-        b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
+    if (b->local_count != 0) {
+        b->vardefs = (void *)((uint8_t*)b + layout.vardefs_offset);
     }
     if (b->closure_var_count != 0) {
-        b->closure_var = (void *)((uint8_t*)b + closure_var_offset);
+        b->closure_var = (void *)((uint8_t*)b + layout.closure_var_offset);
     }
     if (b->cpool_count != 0) {
-        b->cpool = (void *)((uint8_t*)b + cpool_offset);
+        b->cpool = (void *)((uint8_t*)b + layout.cpool_offset);
     }
 
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
@@ -42775,44 +43165,6 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc_read_trace(s, "stack=%d bclen=%d locals=%d\n",
                   b->stack_size, b->byte_code_len, local_count);
 
-    if (local_count != 0) {
-        bc_read_trace(s, "vars {\n");
-        bc_read_trace(s, "off flags scope name\n");
-        for(i = 0; i < local_count; i++) {
-            JSVarDef *vd = &b->vardefs[i];
-            if (bc_get_atom(s, &vd->var_name))
-                goto fail;
-            if (bc_get_leb128_int(s, &vd->scope_level))
-                goto fail;
-            if (bc_get_leb128_int(s, &vd->scope_next))
-                goto fail;
-            vd->scope_next--;
-            if (bc_get_u8(s, &v8))
-                goto fail;
-            idx = 0;
-            vd->var_kind = bc_get_flags(v8, &idx, 4);
-            vd->is_const = bc_get_flags(v8, &idx, 1);
-            vd->is_lexical = bc_get_flags(v8, &idx, 1);
-            vd->is_captured = bc_get_flags(v8, &idx, 1);
-            if (vd->is_captured) {
-                if (bc_get_leb128_u16(s, &vd->var_ref_idx))
-                    goto fail;
-            }
-#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-            if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
-                bc_read_trace(s, "%3d  %d%c%c%c %4d  ",
-                              i, vd->var_kind,
-                              vd->is_const ? 'C' : '.',
-                              vd->is_lexical ? 'L' : '.',
-                              vd->is_captured ? 'X' : '.',
-                              vd->scope_level);
-                print_atom(s->ctx, vd->var_name);
-                printf("\n");
-            }
-#endif
-        }
-        bc_read_trace(s, "}\n");
-    }
     if (b->closure_var_count != 0) {
         bc_read_trace(s, "closure vars {\n");
         bc_read_trace(s, "off  flags idx  name\n");
@@ -42845,192 +43197,34 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
-    if (b->cpool_count != 0) {
-        bc_read_trace(s, "cpool {\n");
-        for(i = 0; i < b->cpool_count; i++) {
-            JSValue val;
-            val = JS_ReadObjectRec(s);
-            if (JS_IsException(val))
-                goto fail;
-            b->cpool[i] = val;
-        }
-        bc_read_trace(s, "}\n");
-    }
-    {
-        bc_read_trace(s, "bytecode {\n");
-        if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
-            goto fail;
-        if (js_validate_ic_bytecode(ctx, b) < 0)
-            goto fail;
-        bc_read_trace(s, "}\n");
-    }
-    {
-        uint32_t template_count;
-        uint32_t pc, byte_code_len;
 
-        if (bc_get_leb128(s, &template_count)) {
-            JS_ThrowSyntaxError(ctx,
-                                "invalid object literal template metadata: "
-                                "truncated template table");
-            goto fail;
-        }
-        if (template_count > UINT16_MAX) {
-            JS_ThrowSyntaxError(ctx,
-                                "invalid object literal template metadata: "
-                                "too many templates");
-            goto fail;
-        }
-        if (template_count != 0) {
-            objlit_template_pcs = js_malloc(ctx, sizeof(*objlit_template_pcs) *
-                                            template_count);
-            if (!objlit_template_pcs)
-                goto fail;
-            for (i = 0; i < (int)template_count; i++)
-                objlit_template_pcs[i] = UINT32_MAX;
-        }
-
-        byte_code_len = (uint32_t)b->byte_code_len;
-        for (pc = 0; pc < byte_code_len;) {
-            uint8_t opcode = b->byte_code_buf[pc];
-            uint32_t instruction_len;
-
-            if ((uint32_t)opcode >= OP_COUNT) {
-                JS_ThrowSyntaxError(ctx,
-                                    "invalid object literal template metadata: "
-                                    "invalid bytecode opcode");
-                goto fail;
-            }
-            instruction_len = short_opcode_info(opcode).size;
-            if (instruction_len == 0 || instruction_len > byte_code_len - pc) {
-                JS_ThrowSyntaxError(ctx,
-                                    "invalid object literal template metadata: "
-                                    "truncated bytecode instruction");
-                goto fail;
-            }
-            if (opcode == OP_object_template) {
-                uint32_t index;
-
-                if (instruction_len != 3) {
-                    JS_ThrowSyntaxError(ctx,
-                                        "invalid object literal template metadata: "
-                                        "invalid template instruction size");
-                    goto fail;
-                }
-                index = get_u16(b->byte_code_buf + pc + 1);
-                if (index >= template_count ||
-                    objlit_template_pcs[index] != UINT32_MAX) {
-                    JS_ThrowSyntaxError(ctx,
-                                        "invalid object literal template metadata: "
-                                        "invalid or duplicate template index");
-                    goto fail;
-                }
-                objlit_template_pcs[index] = pc;
-            }
-            pc += instruction_len;
-        }
-
-        for (i = 0; i < (int)template_count; i++) {
-            if (objlit_template_pcs[i] == UINT32_MAX) {
-                JS_ThrowSyntaxError(ctx,
-                                    "invalid object literal template metadata: "
-                                    "missing template entry");
-                goto fail;
-            }
-        }
-
-        if (template_count != 0) {
-            b->objlit_tab = js_mallocz(ctx,
-                                       sizeof(*b->objlit_tab) * template_count);
-            if (!b->objlit_tab)
-                goto fail;
-            b->objlit_count = (uint16_t)template_count;
-            for (i = 0; i < b->objlit_count; i++) {
-                JSObjLitTemplate *tpl = &b->objlit_tab[i];
-                uint32_t pc_value, prop_count;
-                uint32_t k;
-
-                if (bc_get_leb128(s, &pc_value) ||
-                    bc_get_leb128(s, &prop_count)) {
-                    JS_ThrowSyntaxError(ctx,
-                                        "invalid object literal template metadata: "
-                                        "truncated template entry");
-                    goto fail;
-                }
-                if (pc_value != objlit_template_pcs[i] ||
-                    prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS) {
-                    JS_ThrowSyntaxError(ctx,
-                                        "invalid object literal template metadata: "
-                                        "template entry does not match bytecode");
-                    goto fail;
-                }
-                tpl->pc = pc_value;
-                tpl->atoms = js_malloc(ctx, sizeof(JSAtom) * prop_count);
-                if (!tpl->atoms)
-                    goto fail;
-                tpl->prop_count = 0;
-                for (k = 0; k < prop_count; k++) {
-                    if (bc_get_atom(s, &tpl->atoms[k])) {
-                        JS_ThrowSyntaxError(ctx,
-                                            "invalid object literal template metadata: "
-                                            "invalid template atom");
-                        goto fail;
-                    }
-                    tpl->prop_count++;
-                }
-            }
-        }
-        js_free(ctx, objlit_template_pcs);
-        objlit_template_pcs = NULL;
-    }
-    if (!has_debug_info)
-        goto nodebug;
-
-    /* read optional debug information */
-    bc_read_trace(s, "debug {\n");
-    if (bc_get_atom(s, &b->filename))
+    /* Byte count of the deferrable region (vardefs, cpool, bytecode,
+       object-literal metadata and debug). */
+    if (bc_get_u32(s, &lazy_len))
         goto fail;
-    if (bc_get_leb128_int(s, &b->line_num))
+    if ((size_t)lazy_len > (size_t)(s->buf_end - s->ptr)) {
+        JS_ThrowInternalError(ctx, "invalid lazy region length: %u", lazy_len);
         goto fail;
-    if (bc_get_leb128_int(s, &b->col_num))
-        goto fail;
-#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-    if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
-        bc_read_trace(s, "filename: ");
-        print_atom(s->ctx, b->filename);
-        printf(", line: %d, column: %d\n", b->line_num, b->col_num);
     }
-#endif
-    if (bc_get_leb128_int(s, &b->pc2line_len))
-        goto fail;
-    if (b->pc2line_len) {
-        bc_read_trace(s, "positions: %d bytes\n", b->pc2line_len);
-        b->pc2line_buf = js_mallocz(ctx, b->pc2line_len);
-        if (!b->pc2line_buf)
-            goto fail;
-        if (bc_get_buf(s, b->pc2line_buf, b->pc2line_len))
-            goto fail;
+    lazy_body_ptr = s->ptr;
+    if (s->lazy_src && lazy_len > 0) {
+        b->is_lazy = true;
+        b->lazy_has_debug = has_debug_info;
+        b->lazy_src = js_lazy_source_dup(s->lazy_src);
+        b->lazy_off = (size_t)(lazy_body_ptr - s->buf_start);
+        b->lazy_len = lazy_len;
+        s->ptr = lazy_body_ptr + lazy_len;
+        b->realm = JS_DupContext(ctx);
+        return obj;
     }
-    if (bc_get_leb128_int(s, &b->source_len))
-        goto fail;
-    if (b->source_len) {
-        bc_read_trace(s, "source: %d bytes\n", b->source_len);
-        if (s->ptr_last)
-            s->ptr_last += b->source_len;  // omit source code hex dump
-        /* b->source is a UTF-8 encoded null terminated C string */
-        b->source = js_mallocz(ctx, b->source_len + 1);
-        if (!b->source)
-            goto fail;
-        if (bc_get_buf(s, b->source, b->source_len))
-            goto fail;
-    }
-    bc_read_trace(s, "}\n");
 
- nodebug:
+    if (JS_ReadFunctionBodyBounded(s, b, lazy_len, b->local_count,
+                                   layout.byte_code_offset, has_debug_info))
+        goto fail;
     b->realm = JS_DupContext(ctx);
     return obj;
 
  fail:
-    js_free(ctx, objlit_template_pcs);
     JS_FreeAtom(ctx, bc.func_name);
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
@@ -43652,10 +43846,34 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
         }
         if (atom == JS_ATOM_NULL)
             return s->error_state = -1;
+        /* Constant atoms (type 0) are cheap and carry no reference, so they
+           are stored even in deferred mode. */
         s->idx_to_atom[i] = atom;
     }
     bc_read_trace(s, "}\n");
     return 0;
+}
+
+static JSLazySource *js_lazy_source_dup(JSLazySource *src)
+{
+    src->ref_count++;
+    return src;
+}
+
+static void js_lazy_source_free(JSRuntime *rt, JSLazySource *src)
+{
+    uint32_t i;
+
+    if (--src->ref_count > 0)
+        return;
+    if (src->idx_to_atom) {
+        /* Unfilled entries are JS_ATOM_NULL, which JS_FreeAtomRT ignores. */
+        for (i = 0; i < src->idx_to_atom_count; i++)
+            JS_FreeAtomRT(rt, src->idx_to_atom[i]);
+        js_free_rt(rt, src->idx_to_atom);
+    }
+    js_free_rt(rt, (uint8_t *)src->buf);
+    js_free_rt(rt, src);
 }
 
 static void bc_reader_free(BCReaderState *s)
@@ -43670,12 +43888,92 @@ static void bc_reader_free(BCReaderState *s)
     js_free(s->ctx, s->objects);
 }
 
+/* Deserializes a function body that was skipped at read time.
+ *
+ * Called from the interpreter the first time the function actually runs, which
+ * for a React Native bundle is never for most of them: Metro registers every
+ * module factory but only the entry path executes.
+ *
+ * The reserved regions inside `b` were sized from the eager header and are
+ * already allocated, so this fills them in place -- nothing that points at `b`
+ * has to be updated, and free_function_bytecode needs no special case. */
+static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
+{
+    BCReaderState ss, *s = &ss;
+    JSLazySource *src = b->lazy_src;
+    JSFunctionLayout layout;
+    int ret;
+
+    assert(b->is_lazy);
+    assert(src != NULL);
+
+    /* A previous attempt already consumed part of the region. Re-running it
+       would double-fill cpool slots and double-count atom references, so this
+       function is permanently unusable. */
+    if (b->lazy_failed) {
+        JS_ThrowInternalError(ctx, "function body could not be deserialized");
+        return -1;
+    }
+
+    if (b->local_count != b->arg_count + (uint32_t)b->var_count ||
+        js_function_layout((size_t)b->cpool_count, (size_t)b->local_count,
+                           b->closure_var_count, (size_t)b->byte_code_len,
+                           &layout)) {
+        JS_ThrowInternalError(ctx, "invalid function layout");
+        b->lazy_failed = true;
+        return -1;
+    }
+
+    memset(s, 0, sizeof(*s));
+    s->ctx = ctx;
+    s->buf_start = src->buf;
+    s->buf_end = src->buf + src->buf_len;
+    s->ptr = src->buf + b->lazy_off;
+    s->first_atom = src->first_atom;
+    s->allow_bytecode = true;
+    s->idx_to_atom = src->idx_to_atom;
+    s->idx_to_atom_count = src->idx_to_atom_count;
+    /* Keep nested functions lazy. Materializing a module factory should not
+       drag in every function it happens to close over. */
+    s->lazy_src = src;
+
+    /* Clear the flag first: JS_ReadFunctionBody can run arbitrary allocation
+       and hence GC, and a half-filled function must not look lazy again. */
+    b->is_lazy = false;
+
+    ret = JS_ReadFunctionBodyBounded(s, b, b->lazy_len, b->local_count,
+                                     layout.byte_code_offset,
+                                     b->lazy_has_debug);
+
+    s->idx_to_atom = NULL;
+    bc_reader_free(s);
+
+    if (ret == 0) {
+        b->lazy_src = NULL;
+        b->lazy_off = b->lazy_len = 0;
+        js_lazy_source_free(ctx->rt, src);
+    } else {
+        /* Leave lazy_src attached; free_function_bytecode releases it. Stay
+           is_lazy so every later call routes back here and hits the
+           lazy_failed check above -- clearing it instead would let the
+           interpreter run with a NULL byte_code_buf. */
+        b->is_lazy = true;
+        b->lazy_failed = true;
+    }
+    return ret;
+}
+
 JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                        int flags, JSSABTab *psab_tab)
 {
     BCReaderState ss, *s = &ss;
     JSValue obj;
+    bool want_lazy;
 
+    if (psab_tab) {
+        psab_tab->tab = NULL;
+        psab_tab->len = 0;
+    }
     ctx->binary_object_count += 1;
     ctx->binary_object_size += buf_len;
 
@@ -43687,15 +43985,75 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     s->allow_bytecode = ((flags & JS_READ_OBJ_BYTECODE) != 0);
     s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
     s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
+    if ((flags & JS_READ_OBJ_LAZY) && !s->allow_bytecode) {
+        JS_ThrowTypeError(ctx, "JS_READ_OBJ_LAZY requires JS_READ_OBJ_BYTECODE");
+        obj = JS_EXCEPTION;
+        goto done;
+    }
+    if ((flags & JS_READ_OBJ_LAZY) &&
+        (s->allow_reference || (flags & JS_READ_OBJ_SAB))) {
+        JS_ThrowTypeError(ctx,
+                          "JS_READ_OBJ_LAZY is incompatible with references and SharedArrayBuffer");
+        obj = JS_EXCEPTION;
+        goto done;
+    }
+    if ((flags & JS_READ_OBJ_LAZY) && buf_len > UINT32_MAX) {
+        JS_ThrowRangeError(ctx, "lazy bytecode payload is too large");
+        obj = JS_EXCEPTION;
+        goto done;
+    }
     if (s->allow_bytecode)
         s->first_atom = JS_ATOM_END;
     else
         s->first_atom = 1;
+
+    /* Deferring anything is deliberately incompatible with object references
+       and SharedArrayBuffers: both are resolved against reader state that only
+       exists for the duration of this call. */
+    want_lazy = (flags & JS_READ_OBJ_LAZY) && s->allow_bytecode &&
+        !s->allow_reference && !s->allow_sab;
     if (JS_ReadObjectAtoms(s)) {
         obj = JS_EXCEPTION;
-    } else {
-        obj = JS_ReadObjectRec(s);
+        goto done;
     }
+
+    if (want_lazy) {
+        JSLazySource *src = js_mallocz(ctx, sizeof(*src));
+        if (!src) {
+            obj = JS_EXCEPTION;
+            goto done;
+        }
+        {
+            uint8_t *copy = js_malloc(ctx, buf_len);
+            if (!copy) {
+                js_free(ctx, src);
+                obj = JS_EXCEPTION;
+                goto done;
+            }
+            memcpy(copy, buf, buf_len);
+            src->buf = copy;
+        }
+        src->buf_len = buf_len;
+        src->ref_count = 1;
+        src->first_atom = s->first_atom;
+        /* The source takes ownership of the atom table. */
+        src->idx_to_atom = s->idx_to_atom;
+        src->idx_to_atom_count = s->idx_to_atom_count;
+        s->lazy_src = src;
+    }
+
+    obj = JS_ReadObjectRec(s);
+
+    if (s->lazy_src) {
+        /* Detach before teardown: these now belong to the source. */
+        s->idx_to_atom = NULL;
+        /* Drop the reader's own reference; the lazy functions hold theirs. If
+           nothing deferred, this frees the source immediately. */
+        js_lazy_source_free(ctx->rt, s->lazy_src);
+        s->lazy_src = NULL;
+    }
+
+ done:
     if (psab_tab) {
         psab_tab->tab = s->sab_tab;
         psab_tab->len = s->sab_tab_len;
@@ -45742,6 +46100,10 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
     source_stripped = false;
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
+        /* Source text is in the deferred region too; without this, a function
+           that has not run yet would stringify as [native code]. */
+        if (b->is_lazy && js_materialize_function_body(b->realm, b))
+            return JS_EXCEPTION;
         /* `b->source` must be pure ASCII or UTF-8 encoded */
         if (b->source)
             return JS_NewStringLen(ctx, b->source, b->source_len);
