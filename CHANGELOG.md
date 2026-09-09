@@ -71,8 +71,8 @@ and this project adheres to [Semantic Versioning][semver].
   whitespace-led patterns.
 - Patch `0025`: interns RegExp flag names as atoms for consistent reuse during
   compilation.
-- Patch `0026`: reads regexp flags directly from compiled bytecode where that
-  information is already available.
+- Patch `0026`: serves eligible `.flags` reads from validated compiled flags
+  while preserving the generic observable path.
 - Patch `0027`: corrects the stale regexp test fixture and keeps the test data
   aligned with the matcher’s bounds checks.
 - Patch `0028`: hardens regexp bytecode and metadata validation, including
