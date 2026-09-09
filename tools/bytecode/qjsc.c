@@ -56,7 +56,7 @@ static uint8_t *read_file(const char *path, size_t *out_len) {
     return NULL;
   }
   long n = ftell(f);
-  if (n < 0 || fseek(f, 0, SEEK_SET) != 0) {
+  if (n < 0 || (size_t)n >= SIZE_MAX || fseek(f, 0, SEEK_SET) != 0) {
     fclose(f);
     return NULL;
   }
