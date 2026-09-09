@@ -53,6 +53,35 @@ and this project adheres to [Semantic Versioning][semver].
   (+14.5%); Crypto, RegExp, Splay, Navier-Stokes, PDF.js, and Mandreel were
   within neutral-to-small-regression noise. The full reference data is in
   `tools/benchmark/octane/octane-results.json`.
+- Patch `0017`: makes four-entry inline-cache sites the shipping default after
+ the width-4 validation of the composed cache.
+- Patch `0018`: stores bounded literal, prefix, and first-set metadata
+  alongside compiled regexp bytecode.
+- Patch `0019`: ports the regexp matcher core and its register-based execution
+  support.
+- Patch `0020`: adds literal, prefix, and first-set analysis so the matcher can
+  reject impossible start positions before entering the full interpreter.
+- Patch `0021`: wires the prefilter analysis into regexp compilation and
+  execution. It is primarily an integration step; the benchmark change was
+  within run-to-run noise.
+- Patch `0022`: adds the regexp execution fast paths and avoids unnecessary
+  capture-buffer allocation. This was one of the measured steps toward the
+  final 2.1× regexp benchmark improvement.
+- Patch `0023`: speeds up successful matches and `RegExp.prototype.test` by
+  reusing result storage and providing a result-free boolean path.
+- Patch `0024`: separates the forward scan from first-set construction and
+  improves the prefilter layout. This was the largest measured step, making
+  the regexp benchmark about 43% faster at that stage.
+- Patch `0025`: interns regexp flag names as atoms, reducing repeated flag
+  string work during compilation.
+- Patch `0026`: reads regexp flags directly from compiled bytecode where that
+  information is already available.
+- Patch `0027`: corrects the stale regexp test fixture and keeps the test data
+  aligned with the matcher’s bounds checks.
+- Patch `0028`: hardens regexp bytecode and metadata validation, including
+  operand, target-boundary, allocator, and overflow checks.
+- Patch `0029`: expands malformed-bytecode and runtime regexp serialization
+  coverage, including the embedding allocator path.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is
