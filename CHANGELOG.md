@@ -63,9 +63,8 @@ and this project adheres to [Semantic Versioning][semver].
   searches before entering the full matcher.
 - Patch `0021`: connects compiled search metadata to RegExp compilation and
   execution.
-- Patch `0022`: adds the regexp execution fast paths and avoids unnecessary
-  capture-buffer allocation. This was one of the measured steps toward the
-  final 2.1× regexp benchmark improvement.
+- Patch `0022`: adds direct candidate scans and stack storage for small capture
+  sets, reducing the work needed for common matches.
 - Patch `0023`: speeds up successful matches and `RegExp.prototype.test` by
   reusing result storage and providing a result-free boolean path.
 - Patch `0024`: separates the forward scan from first-set construction and
