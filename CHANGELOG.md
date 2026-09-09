@@ -57,8 +57,8 @@ and this project adheres to [Semantic Versioning][semver].
  the width-4 validation of the composed cache.
 - Patch `0018`: stores bounded literal, prefix, and first-set metadata
   alongside compiled regexp bytecode.
-- Patch `0019`: ports the regexp matcher core and its register-based execution
-  support.
+- Patch `0019`: adds the runtime-width backtracking matcher with computed-goto
+  dispatch and register-based execution.
 - Patch `0020`: adds literal, prefix, and first-set analysis so the matcher can
   reject impossible start positions before entering the full interpreter.
 - Patch `0021`: wires the prefilter analysis into regexp compilation and
