@@ -1,0 +1,94 @@
+From 0424c90fe44a62d56cab658e8541b0bfca2482be Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:34:06 +0500
+Subject: [PATCH] consolidate regexp validation cases
+
+
+diff --git a/lre-test.c b/lre-test.c
+index 303a610..4061f31 100644
+--- a/lre-test.c
++++ b/lre-test.c
+@@ -68,6 +68,74 @@ static void oob_save_index(void)
+     assert(ret == LRE_RET_BYTECODE_ERROR);
+ }
+ 
++static void malformed_metadata_rejected(void)
++{
++    char error_msg[128];
++    uint8_t *bc, *copy;
++    LREMetadata meta;
++    int bc_len, code_len;
++    size_t metadata_pos;
++
++    bc = lre_compile(&bc_len, error_msg, sizeof(error_msg),
++                     "literal", 7, 0, NULL);
++    assert(bc != NULL);
++    assert(lre_get_metadata(bc, bc_len, &meta) == 1);
++    code_len = bc[4] | (bc[5] << 8) | (bc[6] << 16) | (bc[7] << 24);
++    metadata_pos = 8 + (size_t)code_len;
++    copy = malloc((size_t)bc_len);
++    assert(copy != NULL);
++
++    memcpy(copy, bc, (size_t)bc_len);
++    copy[metadata_pos + LRE_META_KIND_OFFSET] = LRE_META_NONE;
++    assert(lre_get_metadata(copy, bc_len, &meta) < 0);
++
++    memcpy(copy, bc, (size_t)bc_len);
++    copy[metadata_pos + LRE_META_PAYLOAD_SIZE_OFFSET] = 1;
++    assert(lre_get_metadata(copy, bc_len, &meta) < 0);
++
++    memcpy(copy, bc, (size_t)bc_len);
++    copy[metadata_pos + LRE_META_ENTRY_OFFSET] = 0xff;
++    copy[metadata_pos + LRE_META_ENTRY_OFFSET + 1] = 0xff;
++    copy[metadata_pos + LRE_META_ENTRY_OFFSET + 2] = 0xff;
++    copy[metadata_pos + LRE_META_ENTRY_OFFSET + 3] = 0xff;
++    assert(lre_check_bytecode(copy, bc_len, NULL) < 0);
++
++    free(copy);
++    lre_realloc(NULL, bc, 0);
++}
++
++static void malformed_operands_rejected(void)
++{
++    static const struct {
++        uint8_t capture_count, register_count, code_len;
++        uint8_t code[16];
++    } cases[] = {
++        { 1, 0, 6, { REOP_set_i32 } },
++        { 1, 0, 3, { REOP_save_start, 1, REOP_match } },
++        { 1, 0, 6, { REOP_goto, 1, 0, 0, 0, REOP_match } },
++        { 1, 0, 2, { REOP_invalid, REOP_match } },
++        { 1, 1, 11, { REOP_loop_check_adv_split_goto_first, 0, 0, 0, 0,
++                      0, 0, 0, 0, 0, REOP_match } },
++        { 1, 0, 1, { REOP_any } },
++        { 1, 0, 2, { REOP_lookahead_match, REOP_match } },
++        { 1, 0, 2, { REOP_negative_lookahead_match, REOP_match } },
++        { 1, 0, 9, { REOP_goto, 1, 0, 0, 0, REOP_char, 0, 0,
++                     REOP_match } },
++        { 1, 0, 6, { REOP_goto, 0xfa, 0xff, 0xff, 0xff, REOP_match } },
++    };
++    size_t i;
++
++    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++        uint8_t bc[32] = { 0 };
++
++        bc[2] = cases[i].capture_count;
++        bc[3] = cases[i].register_count;
++        bc[4] = cases[i].code_len;
++        memcpy(bc + 8, cases[i].code, cases[i].code_len);
++        assert(lre_check_bytecode(bc, 8 + cases[i].code_len, NULL) < 0);
++    }
++}
++
+ static void oom_no_oob_write(void)
+ {
+     static const struct {
+@@ -116,6 +184,8 @@ static void oom_no_oob_write(void)
+ int main(void)
+ {
+     oob_save_index();
++    malformed_metadata_rejected();
++    malformed_operands_rejected();
+     oom_no_oob_write();
+     return 0;
+ }

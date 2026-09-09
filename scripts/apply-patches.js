@@ -116,11 +116,22 @@ function buildExpected(patches, files) {
 
   for (const file of files) {
     const blob = git(['show', `HEAD:${file}`], { encoding: 'buffer' });
-    if (blob.status !== 0) {
-      abort(`engine/quickjs-ng has no ${file} at HEAD; the submodule may have moved.`);
-    }
     fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
-    fs.writeFileSync(path.join(dir, file), blob.stdout);
+    if (blob.status === 0) {
+      fs.writeFileSync(path.join(dir, file), blob.stdout);
+    } else {
+      /* A patch may add a source file that does not exist in the pinned
+         upstream commit. Start its expected projection from an empty file;
+         git apply will create it when the corresponding patch is applied. */
+      const added = patches.some((patch) => {
+        const body = fs.readFileSync(path.join(patchDir, patch), 'utf8');
+        return new RegExp(`^--- /dev/null\\n\\+\\+\\+ b/${file.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`, 'm').test(body);
+      });
+      if (!added) {
+        abort(`engine/quickjs-ng has no ${file} at HEAD; the submodule may have moved.`);
+      }
+      /* Leave the path absent so git apply can create it. */
+    }
   }
 
   for (const patch of patches) {
