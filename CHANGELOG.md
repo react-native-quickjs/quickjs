@@ -65,8 +65,8 @@ and this project adheres to [Semantic Versioning][semver].
   execution.
 - Patch `0022`: adds direct candidate scans and stack storage for small capture
   sets, reducing the work needed for common matches.
-- Patch `0023`: speeds up successful matches and `RegExp.prototype.test` by
-  reusing result storage and providing a result-free boolean path.
+- Patch `0023`: keeps `RegExp.prototype.test` result-free and streamlines
+  successful match handling.
 - Patch `0024`: separates the forward scan from first-set construction and
   improves the prefilter layout. This was the largest measured step, making
   the regexp benchmark about 43% faster at that stage.

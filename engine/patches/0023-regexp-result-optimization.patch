@@ -1,0 +1,177 @@
+From 58ea2dff4b85dad852110c09271fd1c225a7bd68 Mon Sep 17 00:00:00 2001
+From: Ammar Ahmed <ammarahmed6506@gmail.com>
+Date: Wed, 9 Sep 2026 08:02:20 +0500
+Subject: [PATCH] optimize regexp results
+
+
+diff --git a/quickjs.c b/quickjs.c
+index 6cb479d..4cc31a7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -53017,6 +53017,80 @@ fail:
+     return ret;
+ }
+ 
++/* Lean boolean match used by RegExp.prototype.test when 'exec' is the
++   unmodified builtin: runs the search and updates lastIndex per
++   RegExpBuiltinExec, but allocates none of the match-result object. */
++static JSValue js_regexp_exec_bool(JSContext *ctx, JSValueConst this_val,
++                                   JSRegExp *re, JSValueConst arg)
++{
++    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
++    uint8_t **capture = capture_stack;
++    uint8_t *re_bytecode;
++    JSRegExpExecData exec_data;
++    JSString *str;
++    JSValue str_val, val, ret = JS_EXCEPTION;
++    int rc, shift, re_flags;
++    int64_t last_index;
++    bool result = false;
++
++    str_val = JS_ToString(ctx, arg);
++    if (JS_IsException(str_val))
++        return JS_EXCEPTION;
++
++    val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
++    if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
++        goto done;
++
++    re_bytecode = str8(re->bytecode);
++    re_flags = lre_get_flags(re_bytecode);
++    if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0)
++        last_index = 0;
++    str = JS_VALUE_GET_STRING(str_val);
++    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
++                                &exec_data))
++        goto done;
++    if (last_index > str->len) {
++        rc = 2;
++    } else {
++        rc = js_regexp_match(ctx, capture, &exec_data, re, str,
++                             (int)last_index);
++    }
++    if (rc < 0) {
++        switch(rc) {
++        case LRE_RET_TIMEOUT:
++            JS_ThrowInterrupted(ctx);
++            break;
++        case LRE_RET_MEMORY_ERROR:
++            JS_ThrowInternalError(ctx, "out of memory in regexp execution");
++            break;
++        case LRE_RET_BYTECODE_ERROR:
++            JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
++            break;
++        default:
++            abort();
++        }
++        goto done;
++    }
++    if (rc == 1) {
++        result = true;
++        if (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
++            shift = str->is_wide_char;
++            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
++                               js_int32((capture[1] - str8(str)) >> shift)) < 0)
++                goto done;
++        }
++    } else if (rc == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
++        if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0)
++            goto done;
++    }
++    ret = js_bool(result);
++done:
++    if (capture != capture_stack)
++        js_free(ctx, capture);
++    JS_FreeValue(ctx, str_val);
++    return ret;
++}
++
+ /* delete portions of a string that match a given regex */
+ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue arg)
+ {
+@@ -53026,17 +53100,19 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
+     uint8_t *re_bytecode;
+     int ret;
+     uint8_t **capture, *str_buf;
+-    int alloc_count, shift, re_flags;
++    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
++    int shift, re_flags;
+     int next_src_pos, start, end;
+     int64_t last_index;
+     StringBuffer b_s, *b = &b_s;
++    JSRegExpExecData exec_data;
+ 
+     if (!re)
+         return JS_EXCEPTION;
+ 
+     string_buffer_init(ctx, b, 0);
+ 
+-    capture = NULL;
++    capture = capture_stack;
+     str_val = JS_ToString(ctx, arg);
+     if (JS_IsException(str_val))
+         goto fail;
+@@ -53052,12 +53128,9 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
+     }
+     /* size by alloc_count: the register executor uses capture[] beyond
+        the capture positions for its registers (see js_regexp_exec). */
+-    alloc_count = lre_get_alloc_count(re_bytecode);
+-    if (alloc_count > 0) {
+-        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
+-        if (!capture)
+-            goto fail;
+-    }
++    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture,
++                                &exec_data))
++        goto fail;
+     shift = str->is_wide_char;
+     str_buf = str8(str);
+     next_src_pos = 0;
+@@ -53065,8 +53138,8 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
+         if (last_index > str->len)
+             break;
+ 
+-        ret = lre_exec(capture, re_bytecode,
+-                       str_buf, last_index, str->len, shift, ctx);
++        ret = js_regexp_match(ctx, capture, &exec_data, re, str,
++                              (int)last_index);
+         if (ret != 1) {
+             if (ret >= 0) {
+                 if (ret == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
+@@ -53118,11 +53191,13 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
+     if (string_buffer_concat(b, str, next_src_pos, str->len))
+         goto fail;
+     JS_FreeValue(ctx, str_val);
+-    js_free(ctx, capture);
++    if (capture != capture_stack)
++        js_free(ctx, capture);
+     return string_buffer_end(b);
+ fail:
+     JS_FreeValue(ctx, str_val);
+-    js_free(ctx, capture);
++    if (capture != capture_stack)
++        js_free(ctx, capture);
+     string_buffer_free(b);
+     return JS_EXCEPTION;
+ }
+@@ -53153,6 +53228,20 @@ static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val,
+ {
+     JSValue val;
+     bool ret;
++    JSRegExp *re;
++
++    /* Fast path: a native RegExp whose 'exec' is the unmodified builtin needs
++       neither the generic RegExpExec dispatch nor a match-result object. */
++    re = js_get_regexp(ctx, this_val, false);
++    if (re) {
++        val = JS_GetProperty(ctx, this_val, JS_ATOM_exec);
++        if (JS_IsException(val))
++            return JS_EXCEPTION;
++        ret = JS_IsCFunction(ctx, val, js_regexp_exec, 0);
++        JS_FreeValue(ctx, val);
++        if (ret)
++            return js_regexp_exec_bool(ctx, this_val, re, argv[0]);
++    }
+ 
+     val = JS_RegExpExec(ctx, this_val, argv[0]);
+     if (JS_IsException(val))
