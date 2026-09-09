@@ -119,18 +119,22 @@
       "sha256": "32f31ab67f340b0c94f54ab64bf158a47189bd03625934a639b9ed4b0f92a1f9"
     },
     {
+      "name": "0030-crc32c-bytecode-checksum.patch",
+      "sha256": "5867847385e17a82195ed072bfafdb4ba9eabced289e9f2f8941ea75f66ab77d"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "2ba5b9c8b2b140b586d54d12d995622ff38f70815c8a32942881674897131c97"
+      "sha256": "0fc4b4d4d0e771b02607982aa5585a815d673349ed90547f4d4c812ecd817ba3"
     }
   ],
   "files": {
-    "quickjs.c": "e337d78c46e66c7c8d0b614ca0b01a5aaf603f84a5c1dac048f345fe1d60aa46",
+    "quickjs.c": "fb96bcc447d0d2a194a1cba45345f61d32ee9ddc3f69e49c3b4ed091e268aa37",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
-    "builtin-array-fromasync.h": "4b0f10d6d99ab1319952e7adec8b4c0d96400df62e09f9247f96df6d8fa4b8cc",
-    "builtin-iterator-zip-keyed.h": "8872165a6ed3171794d0b18b58c8ed0bb26a86a2fa0ff3d262999d215cf71778",
-    "builtin-iterator-zip.h": "01fa7dacc9900ceac661daf4b2a09e76c21c76e9c25c4db7ec4c9a6f6ad49a47",
+    "builtin-array-fromasync.h": "500d966b4cc1d4532dd2f5047c91c72fcfa07573bd9179bc92d4fbb526b3ce6a",
+    "builtin-iterator-zip-keyed.h": "81fa6366c16a35bed90068928183a24a76c0dbfc9fe741adb19f7e4eeacd7c2b",
+    "builtin-iterator-zip.h": "239b48ac5035f747fc1d32c23cb55a1dd96f40a7bf06f8ced47d8bf0ba22fbdf",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",

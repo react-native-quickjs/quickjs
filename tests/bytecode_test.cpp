@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -45,6 +46,49 @@ class VectorBuffer : public jsi::Buffer {
 std::shared_ptr<jsi::Buffer> bufferOf(const std::string &text) {
   return std::make_shared<VectorBuffer>(
       std::vector<uint8_t>(text.begin(), text.end()));
+}
+
+uint32_t crc32cReference(const uint8_t *data, size_t size) {
+  uint32_t crc = 0xffffffffu;
+  for (size_t i = 0; i < size; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ (0x82f63b78u & -(crc & 1));
+    }
+  }
+  return crc ^ 0xffffffffu;
+}
+
+// JS_ReadObject validates the checksum before it parses the body. Supplying a
+// deliberately malformed body therefore lets this test check the private
+// engine checksum without adding a public checksum API. The body starts at an
+// offset of five bytes, so the non-empty cases also exercise unaligned input.
+bool engineAcceptsChecksum(JSContext *ctx, const std::vector<uint8_t> &body) {
+  std::vector<uint8_t> blob = {
+      static_cast<uint8_t>(qjs::kBytecodeFormatVersion), 0, 0, 0, 0};
+  const uint32_t checksum = crc32cReference(body.data(), body.size());
+  blob[1] = static_cast<uint8_t>(checksum);
+  blob[2] = static_cast<uint8_t>(checksum >> 8);
+  blob[3] = static_cast<uint8_t>(checksum >> 16);
+  blob[4] = static_cast<uint8_t>(checksum >> 24);
+  blob.insert(blob.end(), body.begin(), body.end());
+
+  JSValue value =
+      JS_ReadObject(ctx, blob.data(), blob.size(), JS_READ_OBJ_BYTECODE);
+  if (!JS_IsException(value)) {
+    JS_FreeValue(ctx, value);
+    return true;
+  }
+
+  JSValue exception = JS_GetException(ctx);
+  const char *message = JS_ToCString(ctx, exception);
+  const bool checksumAccepted =
+      message == nullptr || std::strstr(message, "checksum error") == nullptr;
+  if (message != nullptr) {
+    JS_FreeCString(ctx, message);
+  }
+  JS_FreeValue(ctx, exception);
+  return checksumAccepted;
 }
 
 std::string tempPath(const char *suffix) {
@@ -289,6 +333,35 @@ TEST(Bytecode, CorruptBytecodeIsRejectedCleanly) {
       runtime->evaluateJavaScript(
           std::make_shared<VectorBuffer>(std::move(bytes)), "corrupt.bc"),
       jsi::JSIException);
+}
+
+TEST(Bytecode, CRC32CKnownVectorAndInputLengths) {
+  const std::vector<uint8_t> knownVector = {'1', '2', '3', '4', '5',
+                                            '6', '7', '8', '9'};
+  EXPECT_EQ(
+      crc32cReference(knownVector.data(), knownVector.size()), 0xe3069283u);
+
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+
+  // The first byte is zero where possible, making the malformed body fail
+  // quickly after the checksum gate instead of asking the parser to consume
+  // an arbitrary atom table. The expected checksum is computed independently
+  // so this verifies the engine's selected path, including the full body.
+  const std::vector<size_t> lengths = {0, 1, 7, 8, 9, 15, 16, 17, 257, 4097};
+  for (size_t length : lengths) {
+    std::vector<uint8_t> body(length, 0xa5);
+    if (!body.empty() && length != knownVector.size()) {
+      body[0] = 0;
+    }
+    EXPECT_TRUE(engineAcceptsChecksum(ctx, body)) << "length=" << length;
+  }
+  EXPECT_TRUE(engineAcceptsChecksum(ctx, knownVector));
+
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
 }
 
 TEST(Bytecode, EngineBuiltinBlobsLoad) {

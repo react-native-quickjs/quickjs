@@ -79,6 +79,13 @@ and this project adheres to [Semantic Versioning][semver].
   target, metadata, allocator, and interrupt checks.
 - Patch `0029`: adds table-driven malformed-bytecode coverage and preserves
   runtime serialization round-trip coverage through the embedding allocator.
+- Patch `0030`: replaces the serialized-bytecode checksum with portable
+  CRC-32C, using arm64 and x86-64 hardware instructions when available while
+  retaining a software fallback and corruption detection. This reduces the
+  checksum portion of bytecode loading without changing the application-facing
+  bytecode API. Hardware availability is probed per call, avoiding shared
+  runtime state, and bytecode tests cover the standard CRC-32C vector plus
+  empty, short, unaligned-length, and larger inputs.
 - Across the representative parse-only benchmark suite, the eager changes
   average about **1.5× faster** (geometric mean), while the opt-in lazy path
   averages about **2.2× faster** on the same inputs where lazy parsing is
