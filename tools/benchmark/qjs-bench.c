@@ -18,7 +18,10 @@
  * so a workload can be measured from source and from AOT bytecode -- and they
  * are not the same path.
  *
- *   qjs-bench [--mem] [--stats] <file.js|file.bc>
+ *   qjs-bench [--mem] [--stats] [--bytecode-mode=<mode>] <file.js|file.bc>
+ *
+ * Bytecode modes: eager, lazy-copy, lazy-borrow. Borrowed mode is safe here
+ * because the input buffer remains allocated until the runtime is destroyed.
  */
 
 #include <stdio.h>
@@ -94,17 +97,34 @@ static double now_ms(void) {
 int main(int argc, char **argv) {
   int mem = 0;
   int stats = 0;
+  const char *bytecode_mode = "eager";
   const char *path = NULL;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--mem"))
       mem = 1;
     else if (!strcmp(argv[i], "--stats"))
       stats = 1;
+    else if (!strncmp(argv[i], "--bytecode-mode=", 16))
+      bytecode_mode = argv[i] + 16;
+    else if (!strcmp(argv[i], "--bytecode-mode") && i + 1 < argc)
+      bytecode_mode = argv[++i];
     else
       path = argv[i];
   }
   if (!path) {
-    fprintf(stderr, "usage: qjs-bench [--mem] [--stats] <file.js|file.bc>\n");
+    fprintf(
+        stderr,
+        "usage: qjs-bench [--mem] [--stats] "
+        "[--bytecode-mode=<eager|lazy-copy|lazy-borrow>] <file.js|file.bc>\n");
+    return 2;
+  }
+  int read_flags = JS_READ_OBJ_BYTECODE;
+  if (!strcmp(bytecode_mode, "lazy-copy"))
+    read_flags |= JS_READ_OBJ_LAZY;
+  else if (!strcmp(bytecode_mode, "lazy-borrow"))
+    read_flags |= JS_READ_OBJ_LAZY | JS_READ_OBJ_BORROW;
+  else if (strcmp(bytecode_mode, "eager")) {
+    fprintf(stderr, "unknown bytecode mode: %s\n", bytecode_mode);
     return 2;
   }
 
@@ -126,8 +146,7 @@ int main(int argc, char **argv) {
   JSValue result;
   if (size >= NSBC_HEADER_SIZE && memcmp(buf, NSBC_MAGIC, 7) == 0) {
     JSValue fn = JS_ReadObject(
-        ctx, buf + NSBC_HEADER_SIZE, size - NSBC_HEADER_SIZE,
-        JS_READ_OBJ_BYTECODE);
+        ctx, buf + NSBC_HEADER_SIZE, size - NSBC_HEADER_SIZE, read_flags);
     result = JS_IsException(fn) ? fn : JS_EvalFunction(ctx, fn);
   } else {
     result = JS_Eval(ctx, (const char *)buf, size, path, JS_EVAL_TYPE_GLOBAL);
