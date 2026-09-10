@@ -94,6 +94,12 @@ endif()
 
 add_library(quickjsinstancejni SHARED ${RNQJS_QUICKJSINSTANCE_SOURCES})
 
+if(RNQJS_BYTECODE_LAZY)
+  target_compile_definitions(quickjsinstancejni PRIVATE RNQJS_BYTECODE_LAZY=1)
+else()
+  target_compile_definitions(quickjsinstancejni PRIVATE RNQJS_BYTECODE_LAZY=0)
+endif()
+
 target_include_directories(quickjsinstancejni PRIVATE
   "${RNQJS_ROOT}/src/bytecode"
   "${RNQJS_ROOT}/src/module"

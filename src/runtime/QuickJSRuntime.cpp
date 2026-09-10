@@ -1053,8 +1053,14 @@ jsi::Value QuickJSRuntime::evaluateSource(
 
 jsi::Value QuickJSRuntime::evaluateBytecode(
     const uint8_t *payload, size_t size) {
-  JSValue function =
-      JS_ReadObject(context_, payload, size, JS_READ_OBJ_BYTECODE);
+#ifndef RNQJS_BYTECODE_LAZY
+#define RNQJS_BYTECODE_LAZY 1
+#endif
+  int readFlags = JS_READ_OBJ_BYTECODE;
+#if RNQJS_BYTECODE_LAZY
+  readFlags |= JS_READ_OBJ_LAZY;
+#endif
+  JSValue function = JS_ReadObject(context_, payload, size, readFlags);
   if (JS_IsException(function)) {
     // Almost always an engine mismatch. quickjs bytecode loads only in the
     // build that wrote it, and "bytecode function expected" does not say so.

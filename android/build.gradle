@@ -55,7 +55,8 @@ android {
         arguments "-DANDROID_STL=c++_shared",
                   "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                   "-DREACT_NATIVE_DIR=${reactNativeDir()}",
-                  "-DRNQJS_JSON_LAZY_DEFAULT=${jsonLazyEnabled() ? 'ON' : 'OFF'}"
+                  "-DRNQJS_JSON_LAZY_DEFAULT=${jsonLazyEnabled() ? 'ON' : 'OFF'}",
+                  "-DRNQJS_BYTECODE_LAZY=${quickjsLazyEnabled() ? 'ON' : 'OFF'}"
         if (quickjsModuleDirs().size() > 0) {
           arguments "-DRNQJS_QUICKJS_MODULES=${quickjsModuleDirs().join(';')}"
         }
@@ -153,6 +154,13 @@ def jsonLazyEnabled() {
   if (!manifest.exists()) return false
   def json = new groovy.json.JsonSlurper().parse(manifest)
   return json["react-native-quickjs"]?.lazyJson == true
+}
+
+def quickjsLazyEnabled() {
+  if (project.hasProperty('rnqjsLazy')) {
+    return project.property('rnqjsLazy').toString() != 'false'
+  }
+  return true
 }
 
 // Autolinked QuickJS modules (@react-native-quickjs/* declaring

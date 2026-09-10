@@ -280,6 +280,21 @@ TEST(Bytecode, PrepareJavaScriptAcceptsBytecode) {
       runtime->global().getProperty(*runtime, "answer").getNumber(), 42.0);
 }
 
+TEST(Bytecode, RuntimeUsesCopiedLazyBodiesForRetainedFunctions) {
+  auto runtime = qjs::makeQuickJSRuntime();
+  auto bytes = compileToBytecode(
+      "globalThis.answerFunction = () => ({value: 40}).value + 2;");
+  runtime->evaluateJavaScript(
+      std::make_shared<VectorBuffer>(std::move(bytes)), "lazy-runtime.bc");
+  auto function = runtime->global().getProperty(*runtime, "answerFunction");
+  EXPECT_EQ(
+      function.asObject(*runtime)
+          .asFunction(*runtime)
+          .call(*runtime)
+          .getNumber(),
+      42.0);
+}
+
 TEST(Bytecode, LazyFunctionSerializesBeforeCall) {
   auto bytes = compileToBytecode("globalThis.answer = {value: 40}.value + 2;");
   JSRuntime *rt = JS_NewRuntime();
