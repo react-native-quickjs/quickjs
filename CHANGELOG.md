@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog][keep-a-changelog],
 and this project adheres to [Semantic Versioning][semver].
 
-## [Unreleased]
+## [v1.0.0-alpha.3] — 2026-09-10
 
 ### Added
 - Update the embedded [quickjs-ng][ng] engine to v0.16.2.
