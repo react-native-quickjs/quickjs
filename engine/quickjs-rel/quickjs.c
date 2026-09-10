@@ -43918,9 +43918,16 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
                    arbitrary later call. */
                 uint32_t len;
                 size_t size;
+                bool is_wide_char;
                 if (bc_get_leb128(s, &len))
                     return -1;
-                size = (size_t)(len >> 1) << (len & 1);
+                is_wide_char = len & 1;
+                len >>= 1;
+                if (len > JS_STRING_LEN_MAX) {
+                    JS_ThrowInternalError(s->ctx, "string too long");
+                    return -1;
+                }
+                size = (size_t)len << is_wide_char;
                 if ((size_t)(s->buf_end - s->ptr) < size)
                     return bc_read_error_end(s);
                 s->ptr += size;

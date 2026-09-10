@@ -41,4 +41,5 @@ export const notifications = [
 export const navItems = [
   ['feed', 'Feed'], ['search', 'Search'], ['saved', 'Saved'], ['notifications', 'Notifications'],
   ['profile', 'Profile'], ['settings', 'Settings'], ['analytics', 'Analytics'], ['help', 'Help'],
+  ['orders', 'Orders'], ['messages', 'Messages'],
 ] as const;

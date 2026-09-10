@@ -150,7 +150,7 @@ index 078f724..6ec3e67 100644
          if (bc_get_u8(s, &type)) {
              return -1;
          }
-@@ -43840,6 +43911,21 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
+@@ -43840,6 +43911,28 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
                  JS_ThrowInternalError(s->ctx, "invalid symbol type %d", type);
                  return -1;
              }
@@ -161,9 +161,16 @@ index 078f724..6ec3e67 100644
 +                   arbitrary later call. */
 +                uint32_t len;
 +                size_t size;
++                bool is_wide_char;
 +                if (bc_get_leb128(s, &len))
 +                    return -1;
-+                size = (size_t)(len >> 1) << (len & 1);
++                is_wide_char = len & 1;
++                len >>= 1;
++                if (len > JS_STRING_LEN_MAX) {
++                    JS_ThrowInternalError(s->ctx, "string too long");
++                    return -1;
++                }
++                size = (size_t)len << is_wide_char;
 +                if ((size_t)(s->buf_end - s->ptr) < size)
 +                    return bc_read_error_end(s);
 +                s->ptr += size;

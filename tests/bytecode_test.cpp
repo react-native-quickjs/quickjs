@@ -17,6 +17,7 @@
 #include <jsi/jsi.h>
 #include <quickjs.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,6 +124,50 @@ std::vector<uint8_t> compileToBytecode(
   std::remove(jsPath.c_str());
   std::remove(bcPath.c_str());
   return bytes;
+}
+
+bool readLeb128(
+    const std::vector<uint8_t> &bytes, size_t *pos, uint32_t *value) {
+  uint32_t result = 0;
+  int shift = 0;
+  while (*pos < bytes.size() && shift < 32) {
+    const uint8_t byte = bytes[(*pos)++];
+    result |= static_cast<uint32_t>(byte & 0x7f) << shift;
+    if (!(byte & 0x80)) {
+      *value = result;
+      return true;
+    }
+    shift += 7;
+  }
+  return false;
+}
+
+size_t firstStringLengthOffset(const std::vector<uint8_t> &bytes) {
+  size_t pos = qjs::kBytecodeHeaderSize + 5;
+  uint32_t atomCount = 0;
+  if (!readLeb128(bytes, &pos, &atomCount)) return 0;
+  for (uint32_t i = 0; i < atomCount && pos < bytes.size(); ++i) {
+    const uint8_t type = bytes[pos++];
+    if (type == 0) {
+      pos += 4;
+      continue;
+    }
+    const size_t lengthOffset = pos;
+    uint32_t encodedLength = 0;
+    if (!readLeb128(bytes, &pos, &encodedLength)) return 0;
+    const size_t logicalLength = encodedLength >> 1;
+    const size_t byteLength = logicalLength << (encodedLength & 1);
+    if (byteLength > bytes.size() - pos) return 0;
+    return lengthOffset;
+  }
+  return 0;
+}
+
+void disableChecksum(std::vector<uint8_t> *bytes) {
+  ASSERT_GT(bytes->size(), qjs::kBytecodeHeaderSize);
+  std::fill(
+      bytes->begin() + qjs::kBytecodeHeaderSize + 1,
+      bytes->begin() + qjs::kBytecodeHeaderSize + 5, 0xff);
 }
 
 }  // namespace
@@ -400,6 +445,96 @@ TEST(Bytecode, LazyFlagCombinationsAreRejected) {
   JS_FreeValue(ctx, JS_GetException(ctx));
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
+}
+
+TEST(Bytecode, DeferredAtomsRejectOversizedAndTruncatedStrings) {
+  auto oversized = compileToBytecode("globalThis.value = {longAtom: 1};");
+  const size_t lengthOffset = firstStringLengthOffset(oversized);
+  ASSERT_NE(lengthOffset, 0u);
+  ASSERT_LE(lengthOffset + 5, oversized.size());
+  const uint8_t tooLong[] = {0x80, 0x80, 0x80, 0x80, 0x08};
+  std::copy(tooLong, tooLong + 5, oversized.begin() + lengthOffset);
+  disableChecksum(&oversized);
+
+  auto truncated = compileToBytecode("globalThis.value = {shortAtom: 1};");
+  ASSERT_GT(truncated.size(), qjs::kBytecodeHeaderSize + 1);
+  disableChecksum(&truncated);
+  truncated.resize(truncated.size() - 1);
+
+  for (const auto &bytes : {oversized, truncated}) {
+    for (const int flags :
+         {JS_READ_OBJ_BYTECODE, JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY}) {
+      JSRuntime *rt = JS_NewRuntime();
+      ASSERT_NE(rt, nullptr);
+      JSContext *ctx = JS_NewContext(rt);
+      ASSERT_NE(ctx, nullptr);
+      for (int attempt = 0; attempt < 2; ++attempt) {
+        JSValue value = JS_ReadObject(
+            ctx, bytes.data() + qjs::kBytecodeHeaderSize,
+            bytes.size() - qjs::kBytecodeHeaderSize, flags);
+        EXPECT_TRUE(JS_IsException(value));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+      }
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+}
+
+TEST(Bytecode, LazyFramedBodyTruncationIsRejectedRepeatedly) {
+  auto bytes = compileToBytecode(
+      "function deferred() { return {value: 42}.value; }\n"
+      "globalThis.deferred = deferred;");
+  ASSERT_GT(bytes.size(), qjs::kBytecodeHeaderSize + 1);
+  disableChecksum(&bytes);
+  bytes.resize(bytes.size() - 1);
+
+  for (const int flags :
+       {JS_READ_OBJ_BYTECODE, JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY}) {
+    JSRuntime *rt = JS_NewRuntime();
+    ASSERT_NE(rt, nullptr);
+    JSContext *ctx = JS_NewContext(rt);
+    ASSERT_NE(ctx, nullptr);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      JSValue value = JS_ReadObject(
+          ctx, bytes.data() + qjs::kBytecodeHeaderSize,
+          bytes.size() - qjs::kBytecodeHeaderSize, flags);
+      EXPECT_TRUE(JS_IsException(value));
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+  }
+}
+
+TEST(Bytecode, LazyNestedAsyncGeneratorAndDebugFunctionsMaterialize) {
+  const std::string source =
+      "function outer() { function nested() { return 7; } return nested(); }\n"
+      "async function asyncFn() { return 3; }\n"
+      "function* generatorFn() { yield 5; }\n"
+      "globalThis.values = [outer(), asyncFn, generatorFn, String(asyncFn)];";
+  auto runtime = qjs::makeQuickJSRuntime();
+  runtime->evaluateJavaScript(
+      std::make_shared<VectorBuffer>(compileToBytecode(source)), "lazy.bc");
+  auto values = runtime->global()
+                    .getProperty(*runtime, "values")
+                    .asObject(*runtime)
+                    .asArray(*runtime);
+  EXPECT_EQ(values.getValueAtIndex(*runtime, 0).getNumber(), 7.0);
+  auto asyncFn = values.getValueAtIndex(*runtime, 1)
+                     .asObject(*runtime)
+                     .asFunction(*runtime);
+  EXPECT_TRUE(asyncFn.call(*runtime).isObject());
+  auto generatorFn = values.getValueAtIndex(*runtime, 2)
+                         .asObject(*runtime)
+                         .asFunction(*runtime);
+  EXPECT_TRUE(generatorFn.call(*runtime).isObject());
+  EXPECT_NE(
+      values.getValueAtIndex(*runtime, 3)
+          .getString(*runtime)
+          .utf8(*runtime)
+          .find("asyncFn"),
+      std::string::npos);
 }
 
 TEST(Bytecode, PreparedScriptIsReusableAcrossRuntimes) {
