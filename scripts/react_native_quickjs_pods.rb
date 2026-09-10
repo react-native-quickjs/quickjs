@@ -46,6 +46,8 @@ end
 # Removes Hermes. Must run before use_react_native!, which reads all of this as
 # the podspecs are evaluated.
 def use_quickjs!
+  ENV['USE_QUICKJS'] = '1'
+
   # Turns off every `if use_hermes()` dependency on hermes-engine at once.
   # React Native's own use_hermes() is `!use_third_party_jsc()`, so this one
   # flag answers for every React Native pod.
@@ -138,6 +140,10 @@ end
 def react_native_quickjs_post_install(installer)
   react_native_quickjs_add_bytecode_phase(installer)
   react_native_quickjs_add_module_registry(installer)
+
+  react_native_quickjs_append_all(
+    installer, "GCC_PREPROCESSOR_DEFINITIONS", "USE_QUICKJS=1"
+  ) if ENV['USE_QUICKJS'] == '1'
 
   # Debug only, matching the gate React Native puts on its own inspector.
   # QuickJSInstance::debuggerEnabledByDefault() already refuses to attach in a
