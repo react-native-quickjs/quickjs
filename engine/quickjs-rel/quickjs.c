@@ -1055,11 +1055,14 @@ typedef struct JSFunctionBytecode {
  * freed) releases the blob. */
 typedef struct JSLazySource {
     int ref_count;
-    const uint8_t *buf; /* payload; owned unless borrow_buf */
+    const uint8_t *buf; /* the payload; owned unless borrow_buf */
     size_t buf_len;
-    bool borrow_buf; /* caller keeps borrowed payload alive */
-    /* Interned atoms, one reference held per populated entry. */
+    bool borrow_buf; /* caller guarantees buf outlives every lazy function */
+    /* Interned atoms, one reference held per populated entry. With
+       atom_offset set, entries start as JS_ATOM_NULL and are filled in on
+       first use -- a bundle only interns the atoms its executed code names. */
     JSAtom *idx_to_atom;
+    uint32_t *atom_offset; /* NULL when atoms were interned eagerly */
     uint32_t idx_to_atom_count;
     uint32_t first_atom;
 } JSLazySource;
@@ -42360,6 +42363,10 @@ typedef struct BCReaderState {
        materializing, so nested functions in a materialized constant pool stay
        lazy themselves rather than dragging in the whole subtree. */
     JSLazySource *lazy_src;
+    /* Byte offset of each atom's entry in the payload, when interning is
+       deferred. NULL means the atom table was interned up front. */
+    uint32_t *atom_offset;
+    bool defer_atoms; /* set before JS_ReadObjectAtoms to build atom_offset */
     /* object references */
     JSObject **objects;
     int objects_count;
@@ -42518,6 +42525,52 @@ static int bc_get_buf(BCReaderState *s, void *buf, uint32_t buf_len)
 
 static JSString *JS_ReadString(BCReaderState *s);
 
+/* Interns atom `idx` from its recorded position in the payload and memoises it
+   in idx_to_atom. Reads through a scratch cursor so the caller's parse position
+   is untouched. */
+static int bc_intern_atom(BCReaderState *s, uint32_t idx)
+{
+    const uint8_t *saved_ptr = s->ptr;
+    const uint8_t *saved_ptr_last = s->ptr_last;
+    const uint8_t *saved_buf_end = s->buf_end;
+    JSString *p;
+    JSAtom atom;
+    uint8_t type;
+
+    s->ptr = s->buf_start + s->atom_offset[idx];
+    if (s->lazy_src)
+        s->buf_end = s->lazy_src->buf + s->lazy_src->buf_len;
+    s->ptr_last = NULL;
+
+    if (bc_get_u8(s, &type))
+        goto fail;
+    if (type == 0) {
+        uint32_t v;
+        if (bc_get_u32(s, &v))
+            goto fail;
+        atom = v;
+    } else {
+        p = JS_ReadString(s);
+        if (!p)
+            goto fail;
+        atom = __JS_NewAtom(s->ctx->rt, p, type);
+    }
+    if (atom == JS_ATOM_NULL) {
+        s->error_state = -1;
+        goto fail;
+    }
+    s->idx_to_atom[idx] = atom;
+    s->ptr = saved_ptr;
+    s->ptr_last = saved_ptr_last;
+    s->buf_end = saved_buf_end;
+    return 0;
+ fail:
+    s->ptr = saved_ptr;
+    s->ptr_last = saved_ptr_last;
+    s->buf_end = saved_buf_end;
+    return -1;
+}
+
 static int bc_idx_to_atom(BCReaderState *s, JSAtom *patom, uint32_t idx)
 {
     JSAtom atom;
@@ -42533,6 +42586,15 @@ static int bc_idx_to_atom(BCReaderState *s, JSAtom *patom, uint32_t idx)
                                 (unsigned int)(s->ptr - s->buf_start));
             *patom = JS_ATOM_NULL;
             return s->error_state = -1;
+        }
+        if (s->atom_offset && s->idx_to_atom[idx] == JS_ATOM_NULL) {
+            /* First mention of this atom: intern it now. Most of a bundle's
+               atoms are named only by code that never runs, so most are never
+               interned at all. */
+            if (bc_intern_atom(s, idx)) {
+                *patom = JS_ATOM_NULL;
+                return -1;
+            }
         }
         atom = JS_DupAtom(s->ctx, s->idx_to_atom[idx]);
     }
@@ -43824,7 +43886,16 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
         if (!s->idx_to_atom)
             return s->error_state = -1;
     }
+    if (s->defer_atoms && s->idx_to_atom_count != 0) {
+        s->atom_offset = js_mallocz(s->ctx, s->idx_to_atom_count *
+                                    sizeof(s->atom_offset[0]));
+        if (!s->atom_offset)
+            return s->error_state = -1;
+    }
+
     for(i = 0; i < s->idx_to_atom_count; i++) {
+        if (s->atom_offset)
+            s->atom_offset[i] = (uint32_t)(s->ptr - s->buf_start);
         if (bc_get_u8(s, &type)) {
             return -1;
         }
@@ -43839,6 +43910,21 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
             if (type < JS_ATOM_TYPE_STRING || type >= JS_ATOM_TYPE_PRIVATE) {
                 JS_ThrowInternalError(s->ctx, "invalid symbol type %d", type);
                 return -1;
+            }
+            if (s->atom_offset) {
+                /* Walk past the string without building one. The structure is
+                   still validated here -- only the interning is deferred, so a
+                   malformed table is still caught at load rather than at some
+                   arbitrary later call. */
+                uint32_t len;
+                size_t size;
+                if (bc_get_leb128(s, &len))
+                    return -1;
+                size = (size_t)(len >> 1) << (len & 1);
+                if ((size_t)(s->buf_end - s->ptr) < size)
+                    return bc_read_error_end(s);
+                s->ptr += size;
+                continue;
             }
             p = JS_ReadString(s);
             if (!p)
@@ -43873,6 +43959,7 @@ static void js_lazy_source_free(JSRuntime *rt, JSLazySource *src)
             JS_FreeAtomRT(rt, src->idx_to_atom[i]);
         js_free_rt(rt, src->idx_to_atom);
     }
+    js_free_rt(rt, src->atom_offset);
     if (!src->borrow_buf)
         js_free_rt(rt, (uint8_t *)src->buf);
     js_free_rt(rt, src);
@@ -43887,6 +43974,7 @@ static void bc_reader_free(BCReaderState *s)
         }
         js_free(s->ctx, s->idx_to_atom);
     }
+    js_free(s->ctx, s->atom_offset);
     js_free(s->ctx, s->objects);
 }
 
@@ -43935,6 +44023,7 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
     s->allow_bytecode = true;
     s->idx_to_atom = src->idx_to_atom;
     s->idx_to_atom_count = src->idx_to_atom_count;
+    s->atom_offset = src->atom_offset;
     /* Keep nested functions lazy. Materializing a module factory should not
        drag in every function it happens to close over. */
     s->lazy_src = src;
@@ -43948,6 +44037,7 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
                                      b->lazy_has_debug);
 
     s->idx_to_atom = NULL;
+    s->atom_offset = NULL;
     bc_reader_free(s);
 
     if (ret == 0) {
@@ -44019,6 +44109,10 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
        exists for the duration of this call. */
     want_lazy = (flags & JS_READ_OBJ_LAZY) && s->allow_bytecode &&
         !s->allow_reference && !s->allow_sab;
+    /* Decided before the atom table is read, because that is what it changes:
+       record where each atom lives and intern on first mention instead. */
+    s->defer_atoms = want_lazy;
+
     if (JS_ReadObjectAtoms(s)) {
         obj = JS_EXCEPTION;
         goto done;
@@ -44031,6 +44125,7 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
             goto done;
         }
         if (flags & JS_READ_OBJ_BORROW) {
+            /* Caller guarantees the payload outlives every lazy function. */
             src->buf = buf;
             src->borrow_buf = true;
         } else {
@@ -44046,9 +44141,10 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
         src->buf_len = buf_len;
         src->ref_count = 1;
         src->first_atom = s->first_atom;
-        /* The source takes ownership of the atom table. */
+        /* The source retains the atom table shared by lazy functions. */
         src->idx_to_atom = s->idx_to_atom;
         src->idx_to_atom_count = s->idx_to_atom_count;
+        src->atom_offset = s->atom_offset;
         s->lazy_src = src;
     }
 
@@ -44057,6 +44153,7 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     if (s->lazy_src) {
         /* Detach before teardown: these now belong to the source. */
         s->idx_to_atom = NULL;
+        s->atom_offset = NULL;
         /* Drop the reader's own reference; the lazy functions hold theirs. If
            nothing deferred, this frees the source immediately. */
         js_lazy_source_free(ctx->rt, s->lazy_src);
