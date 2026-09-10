@@ -86,14 +86,22 @@ and this project adheres to [Semantic Versioning][semver].
   bytecode API. Hardware availability is probed per call, avoiding shared
   runtime state, and bytecode tests cover the standard CRC-32C vector plus
   empty, short, unaligned-length, and larger inputs.
-- Patch `0031`: adds lazy bytecode loading. The React Native runtime uses an
-  engine-owned copy, while borrowed payloads remain an explicit C API option.
-  Function bodies and atom interning are deferred until use, and the format
-  bump plus regenerated built-in blobs remain in `9999-bc-version-bump.patch`.
-- Across the representative parse-only benchmark suite, the eager changes
-  average about **1.5× faster** (geometric mean), while the opt-in lazy path
-  averages about **2.2× faster** on the same inputs where lazy parsing is
-  selected. Results vary by payload and do not include traversal time.
+- Patch `0031`: frames serialized function bodies and adds copied lazy
+  function-body loading. The reader validates and owns the copied payload;
+  body parsing and reconstruction move to first use.
+- Patch `0032`: adds explicit borrowed lazy-bytecode input for embedders that
+  can keep their immutable payload alive for the required lifetime. It is not
+  used by the React Native runtime.
+- Patch `0033`: defers interning non-constant bytecode atoms until they are
+  first referenced, while preserving eager validation of their serialized
+  lengths and boundaries.
+- The React Native runtime integration enables copied lazy loading; it is an
+  integration change layered on top of patches `0031`–`0033`, not part of
+  patch `0031` itself.
+- In the isolated atom comparison, deferred interning saved 0.330 ms in the
+  host load-only median. The Android `bundleLoaded` median was 0.736 ms slower
+  with deferred atoms; the observed `appLoaded` difference is not conclusive
+  without variance measurements, so no device loading improvement is claimed.
 - JSON benchmark reporting now separates checksum-free parse-only timing from
   traversal and parse-plus-consume timing. The lazy path reduces the
   repeated-object parse-only workload from about 199 µs eager to about 43 µs.

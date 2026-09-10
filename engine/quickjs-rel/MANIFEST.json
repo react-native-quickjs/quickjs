@@ -132,7 +132,7 @@
     },
     {
       "name": "0033-deferred-bytecode-atoms.patch",
-      "sha256": "1e8a7428f2e716c6a301501ac794e12d5df5905d560df6c562398f52feb1c814"
+      "sha256": "bc5d8aba4747e808f9dcc0e0150db5cbbc34edbafa5624430ba8fb78fedc0242"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -140,7 +140,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "aa18afca868dcda0b67ffd7388b2db5d6fbe6b52d0316deea2606b35a1fd1345",
+    "quickjs.c": "aab1e3ae19a8ee2b320814e3eb7054866f20b682680efeccf1edb3904025b950",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
