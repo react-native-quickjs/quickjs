@@ -1,0 +1,2 @@
+import React from 'react'; import { ScrollView, Text } from 'react-native'; import { ScreenFrame, styles } from '../components';
+export default function OrdersScreen() { return <ScreenFrame title="Orders"><ScrollView>{['March workspace plan', 'Design review package', 'Team seats renewal'].map((x, i) => <Text key={x} style={styles.rowTitle}>{x}{'\n'}<Text style={styles.muted}>{i === 0 ? 'Complete' : 'Processing'} · local record</Text></Text>)}</ScrollView></ScreenFrame>; }

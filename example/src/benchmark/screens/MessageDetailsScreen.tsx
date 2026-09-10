@@ -1,0 +1,2 @@
+import React from 'react'; import { Text } from 'react-native'; import { ScreenFrame, styles } from '../components';
+export default function MessageDetailsScreen({ back }: { back: () => void }) { return <ScreenFrame title="Conversation" onBack={back}><Text style={styles.body}>Mina: The review notes are ready.</Text><Text style={styles.body}>Alex: I will take a look this afternoon.</Text></ScreenFrame>; }

@@ -1,0 +1,2 @@
+import React from 'react'; import { Text } from 'react-native'; import { ScreenFrame, styles } from '../components';
+export default function PreferencesScreen() { return <ScreenFrame title="Preferences"><Text style={styles.rowTitle}>Digest frequency · Weekly</Text><Text style={styles.rowTitle}>Default feed · Recommended</Text><Text style={styles.rowTitle}>Reduce motion · Off</Text></ScreenFrame>; }

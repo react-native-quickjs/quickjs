@@ -1,0 +1,2 @@
+import React from 'react'; import { Text } from 'react-native'; import { ScreenFrame, styles } from '../components';
+export default function OrderDetailsScreen({ back }: { back: () => void }) { return <ScreenFrame title="Order details" onBack={back}><Text style={styles.heroTitle}>March workspace plan</Text><Text style={styles.body}>A complete detail and status view with locally derived totals and payment state.</Text><Text style={styles.badge}>Paid · 3 line items</Text></ScreenFrame>; }

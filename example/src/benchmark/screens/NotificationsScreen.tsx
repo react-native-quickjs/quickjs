@@ -1,0 +1,2 @@
+import React from 'react'; import { ScrollView, Text } from 'react-native'; import { notifications } from '../data'; import { ScreenFrame, styles } from '../components';
+export default function NotificationsScreen() { return <ScreenFrame title="Notifications"><ScrollView>{notifications.map(item => <Text key={item.id} style={styles.rowTitle}>{item.unread ? '● ' : ''}{item.title}{'\n'}<Text style={styles.muted}>{item.detail}</Text></Text>)}</ScrollView></ScreenFrame>; }

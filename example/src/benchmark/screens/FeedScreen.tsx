@@ -1,0 +1,2 @@
+import React from 'react'; import { ScrollView } from 'react-native'; import { feed } from '../data'; import { FeedRow, ScreenFrame } from '../components';
+export default function FeedScreen({ open }: { open: (route: string) => void }) { return <ScreenFrame title="Feed"><ScrollView>{feed.map(item => <FeedRow key={item.id} item={item} onPress={() => open('article')} />)}</ScrollView></ScreenFrame>; }

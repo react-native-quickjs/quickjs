@@ -1,0 +1,2 @@
+import React from 'react'; import { ScrollView } from 'react-native'; import { feed } from '../data'; import { FeedRow, ScreenFrame } from '../components';
+export default function SavedScreen({ open }: { open: (route: string) => void }) { return <ScreenFrame title="Saved"><ScrollView>{feed.filter(item => item.saved).map(item => <FeedRow key={item.id} item={item} onPress={() => open('article')} />)}</ScrollView></ScreenFrame>; }

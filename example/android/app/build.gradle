@@ -3,7 +3,11 @@ if (!(benchmarkEngine in ["quickjs", "hermes"])) {
     throw new GradleException("RNQJS_ENGINE must be quickjs or hermes (got '${benchmarkEngine}')")
 }
 def usingHermes = benchmarkEngine == "hermes"
-project.buildDir = file("${rootProject.projectDir}/build-${benchmarkEngine}")
+def exampleMode = System.getenv("RNQJS_EXAMPLE_MODE") ?: "simple"
+if (!(exampleMode in ["simple", "benchmark"])) {
+    throw new GradleException("RNQJS_EXAMPLE_MODE must be simple or benchmark (got '${exampleMode}')")
+}
+project.buildDir = file("${rootProject.projectDir}/build-${benchmarkEngine}-${exampleMode}")
 
 def hermescPath() {
     def os = System.getProperty("os.name").toLowerCase()
@@ -28,7 +32,7 @@ react {
     if (usingHermes) {
         hermesCommand = hermescPath().absolutePath
     }
-    entryFile = file("../../index.js")
+    entryFile = file(exampleMode == "benchmark" ? "../../index.benchmark.js" : "../../index.js")
 
     /* Folders */
     //   The root of your project, i.e. where "package.json" lives. Default is '../..'
@@ -89,12 +93,13 @@ android {
 
     namespace "com.reactnativequickjs.example"
     defaultConfig {
-        applicationId "com.reactnativequickjs.example.${benchmarkEngine}"
+        applicationId "com.reactnativequickjs.example.${benchmarkEngine}${exampleMode == 'benchmark' ? '.benchmark' : ''}"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
         buildConfigField "String", "RNQJS_ENGINE", "\"${benchmarkEngine}\""
+        buildConfigField "String", "RNQJS_EXAMPLE_MODE", "\"${exampleMode}\""
     }
     signingConfigs {
         debug {
