@@ -14,12 +14,17 @@ class MainApplication : Application(), ReactApplication {
     getDefaultReactHost(
       context = applicationContext,
       packageList =
-        PackageList(this).packages.apply {
-          // Packages that cannot be autolinked yet can be added manually here, for example:
-          // add(MyReactNativePackage())
-        },
-      // Run JavaScript on QuickJS instead of Hermes.
-      jsRuntimeFactory = QuickJSInstance(),
+        PackageList(this).packages.filterNot { pkg ->
+          BuildConfig.RNQJS_ENGINE == "hermes" &&
+              (pkg.javaClass.name.startsWith("com.intl.") ||
+                  pkg.javaClass.name.startsWith("com.text_encoding.") ||
+                  pkg.javaClass.name.startsWith("com.reactnativequickjs.quickjs."))
+        }.toMutableList(),
+      jsRuntimeFactory = if (BuildConfig.RNQJS_ENGINE == "quickjs") {
+        QuickJSInstance()
+      } else {
+        null
+      },
     )
   }
 

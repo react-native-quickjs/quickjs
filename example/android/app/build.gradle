@@ -1,3 +1,16 @@
+def benchmarkEngine = System.getenv("RNQJS_ENGINE") ?: "quickjs"
+if (!(benchmarkEngine in ["quickjs", "hermes"])) {
+    throw new GradleException("RNQJS_ENGINE must be quickjs or hermes (got '${benchmarkEngine}')")
+}
+def usingHermes = benchmarkEngine == "hermes"
+project.buildDir = file("${rootProject.projectDir}/build-${benchmarkEngine}")
+
+def hermescPath() {
+    def os = System.getProperty("os.name").toLowerCase()
+    def dir = os.contains("win") ? "win64-bin" : os.contains("mac") ? "osx-bin" : "linux64-bin"
+    return file("../../../node_modules/hermes-compiler/hermesc/${dir}/hermesc")
+}
+
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
@@ -12,6 +25,10 @@ react {
     reactNativeDir = file("../../../node_modules/react-native")
     codegenDir = file("../../../node_modules/@react-native/codegen")
     cliFile = file("../../../node_modules/react-native/cli.js")
+    if (usingHermes) {
+        hermesCommand = hermescPath().absolutePath
+    }
+    entryFile = file("../../index.js")
 
     /* Folders */
     //   The root of your project, i.e. where "package.json" lives. Default is '../..'
@@ -72,11 +89,12 @@ android {
 
     namespace "com.reactnativequickjs.example"
     defaultConfig {
-        applicationId "com.reactnativequickjs.example"
+        applicationId "com.reactnativequickjs.example.${benchmarkEngine}"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        buildConfigField "String", "RNQJS_ENGINE", "\"${benchmarkEngine}\""
     }
     signingConfigs {
         debug {
@@ -98,12 +116,28 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+    buildFeatures {
+        buildConfig true
+    }
+    packagingOptions {
+        if (usingHermes) {
+            jniLibs.excludes += ["**/libquickjsinstancejni.so"]
+        }
+    }
 }
 
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    if (usingHermes) {
+        implementation("com.facebook.react:hermes-android")
+    }
+
     // Neither Hermes nor JavaScriptCore: this app runs on QuickJS, and either
     // would be a second engine nothing loads -- libjsc.so is 10 MB per ABI.
+}
+
+if (!usingHermes) {
+    apply from: file("../../../android/quickjs.gradle")
 }

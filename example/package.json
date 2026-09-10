@@ -4,6 +4,10 @@
   "private": true,
   "scripts": {
     "android": "react-native run-android --active-arch-only",
+    "android:release": "node scripts/android-launcher.js release",
+    "android:release:quickjs": "node scripts/android-launcher.js release quickjs",
+    "android:release:hermes": "node scripts/android-launcher.js release hermes",
+    "android:engine-info": "node scripts/android-launcher.js info",
     "ios": "react-native run-ios",
     "start": "react-native start",
     "build:android": "react-native build-android --extra-params \"--no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a\"",
