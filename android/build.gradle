@@ -217,9 +217,8 @@ gradle.projectsEvaluated {
   }
 }
 
-// Compile the release bundle to QuickJS bytecode, after React Native has
-// written it. Debug builds load JavaScript from Metro and never produce a
-// bundle, so there is nothing to compile. -PrnqjsBytecode=false turns it off.
+// Compile each QuickJS bundle after React Native has written it.
+// -PrnqjsBytecode=false turns this off.
 
 // ExecOperations is how a Gradle 9 build spawns a process; project.exec was
 // removed. A plain ProcessBuilder also runs, but not identically: under a
@@ -246,9 +245,15 @@ gradle.projectsEvaluated {
     app.tasks.matching { it.name ==~ /createBundle.*JsAndAssets/ }.configureEach { bundleTask ->
       bundleTask.doLast {
         // Found by name rather than by reading the task's own properties,
-        // which are React Native Gradle plugin internals.
+        // which are React Native Gradle plugin internals. Restrict the scan
+        // to this task's variant so a prior variant's bytecode is not passed
+        // back through qjsc as if it were source JavaScript.
+        def variant = bundleTask.name - 'createBundle' - 'JsAndAssets'
+        def variantDir = variant.substring(0, 1).toLowerCase() + variant.substring(1)
         def assets = app.layout.buildDirectory.dir("generated/assets").get().asFile
-        app.fileTree(assets).matching { include '**/index.android.bundle' }.each { bundle ->
+        app.fileTree(assets).matching {
+          include "**/${variantDir}/index.android.bundle"
+        }.each { bundle ->
           process.exec {
             commandLine(*node, compiler.absolutePath, bundle.absolutePath)
             workingDir app.rootDir
