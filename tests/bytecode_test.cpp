@@ -345,12 +345,37 @@ TEST(Bytecode, LazyCopiedInputSurvivesCallerBufferDestruction) {
   JS_FreeRuntime(rt);
 }
 
+TEST(Bytecode, LazyBorrowedBytecodeMaterializesOnCall) {
+  auto bytes = compileToBytecode(
+      "function answerFunction() { return {value: 40}.value + 2; }"
+      "globalThis.answer = answerFunction();");
+  ASSERT_GT(bytes.size(), qjs::kBytecodeHeaderSize);
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+
+  JSValue function = JS_ReadObject(
+      ctx, bytes.data() + qjs::kBytecodeHeaderSize,
+      bytes.size() - qjs::kBytecodeHeaderSize,
+      JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY | JS_READ_OBJ_BORROW);
+  ASSERT_FALSE(JS_IsException(function));
+  JSValue result = JS_EvalFunction(ctx, function);
+  ASSERT_FALSE(JS_IsException(result));
+  JS_FreeValue(ctx, result);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
 TEST(Bytecode, LazyFlagCombinationsAreRejected) {
   JSRuntime *rt = JS_NewRuntime();
   ASSERT_NE(rt, nullptr);
   JSContext *ctx = JS_NewContext(rt);
   ASSERT_NE(ctx, nullptr);
   const uint8_t payload[] = {0};
+  EXPECT_TRUE(JS_IsException(
+      JS_ReadObject(ctx, payload, sizeof(payload), JS_READ_OBJ_BORROW)));
+  JS_FreeValue(ctx, JS_GetException(ctx));
   EXPECT_TRUE(JS_IsException(
       JS_ReadObject(ctx, payload, sizeof(payload), JS_READ_OBJ_LAZY)));
   JS_FreeValue(ctx, JS_GetException(ctx));

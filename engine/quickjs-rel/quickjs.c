@@ -1055,8 +1055,9 @@ typedef struct JSFunctionBytecode {
  * freed) releases the blob. */
 typedef struct JSLazySource {
     int ref_count;
-    const uint8_t *buf; /* engine-owned copy of the serialized payload */
+    const uint8_t *buf; /* payload; owned unless borrow_buf */
     size_t buf_len;
+    bool borrow_buf; /* caller keeps borrowed payload alive */
     /* Interned atoms, one reference held per populated entry. */
     JSAtom *idx_to_atom;
     uint32_t idx_to_atom_count;
@@ -43872,7 +43873,8 @@ static void js_lazy_source_free(JSRuntime *rt, JSLazySource *src)
             JS_FreeAtomRT(rt, src->idx_to_atom[i]);
         js_free_rt(rt, src->idx_to_atom);
     }
-    js_free_rt(rt, (uint8_t *)src->buf);
+    if (!src->borrow_buf)
+        js_free_rt(rt, (uint8_t *)src->buf);
     js_free_rt(rt, src);
 }
 
@@ -43985,6 +43987,11 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     s->allow_bytecode = ((flags & JS_READ_OBJ_BYTECODE) != 0);
     s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
     s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
+    if ((flags & JS_READ_OBJ_BORROW) && !(flags & JS_READ_OBJ_LAZY)) {
+        JS_ThrowTypeError(ctx, "JS_READ_OBJ_BORROW requires JS_READ_OBJ_LAZY");
+        obj = JS_EXCEPTION;
+        goto done;
+    }
     if ((flags & JS_READ_OBJ_LAZY) && !s->allow_bytecode) {
         JS_ThrowTypeError(ctx, "JS_READ_OBJ_LAZY requires JS_READ_OBJ_BYTECODE");
         obj = JS_EXCEPTION;
@@ -44023,7 +44030,10 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
             obj = JS_EXCEPTION;
             goto done;
         }
-        {
+        if (flags & JS_READ_OBJ_BORROW) {
+            src->buf = buf;
+            src->borrow_buf = true;
+        } else {
             uint8_t *copy = js_malloc(ctx, buf_len);
             if (!copy) {
                 js_free(ctx, src);

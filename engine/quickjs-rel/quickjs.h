@@ -1412,6 +1412,10 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
    so `buf` need not outlive the call. Requires JS_READ_OBJ_BYTECODE and is
    incompatible with JS_READ_OBJ_REFERENCE and JS_READ_OBJ_SAB. */
 #define JS_READ_OBJ_LAZY      (1 << 4)
+/* Borrow the serialized payload instead of copying it. The caller must keep
+   it alive and unchanged until all values and runtimes created from it are
+   freed. Requires JS_READ_OBJ_LAZY; invalid combinations are rejected. */
+#define JS_READ_OBJ_BORROW    (1 << 5)
 JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
 JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                                  int flags, JSSABTab *psab_tab);

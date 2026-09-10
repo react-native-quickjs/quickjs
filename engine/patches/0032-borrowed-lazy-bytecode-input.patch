@@ -1,0 +1,85 @@
+Subject: Support Explicit Borrowed Lazy Bytecode Input
+
+What this does
+  Adds JS_READ_OBJ_BORROW for callers that can keep serialized bytecode storage
+  alive and unchanged for the lifetime of every value and runtime created from
+  it. Borrowed reads retain the caller's pointer and release only engine-owned
+  metadata when the last lazy source is freed.
+
+Why we need it
+  Low-level embedders with stable immutable storage can avoid the payload copy
+  while retaining lazy function-body parsing and validation.
+
+What it adds
+  Validates that borrowing is paired with lazy bytecode loading, selects the
+  correct cleanup path, and documents the caller-owned lifetime contract.
+  Copied lazy loading remains the safe default and React Native does not use
+  this API.
+
+Needs a bytecode version bump
+  No. Ownership selection does not change the serialized bytecode layout.
+
+diff --git a/quickjs.c b/quickjs.c
+index 35df775..078f724 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1055,8 +1055,9 @@ typedef struct JSFunctionBytecode {
+  * freed) releases the blob. */
+ typedef struct JSLazySource {
+     int ref_count;
+-    const uint8_t *buf; /* engine-owned copy of the serialized payload */
++    const uint8_t *buf; /* payload; owned unless borrow_buf */
+     size_t buf_len;
++    bool borrow_buf; /* caller keeps borrowed payload alive */
+     /* Interned atoms, one reference held per populated entry. */
+     JSAtom *idx_to_atom;
+     uint32_t idx_to_atom_count;
+@@ -43872,7 +43873,8 @@ static void js_lazy_source_free(JSRuntime *rt, JSLazySource *src)
+             JS_FreeAtomRT(rt, src->idx_to_atom[i]);
+         js_free_rt(rt, src->idx_to_atom);
+     }
+-    js_free_rt(rt, (uint8_t *)src->buf);
++    if (!src->borrow_buf)
++        js_free_rt(rt, (uint8_t *)src->buf);
+     js_free_rt(rt, src);
+ }
+
+@@ -43985,6 +43987,11 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+     s->allow_bytecode = ((flags & JS_READ_OBJ_BYTECODE) != 0);
+     s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
+     s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
++    if ((flags & JS_READ_OBJ_BORROW) && !(flags & JS_READ_OBJ_LAZY)) {
++        JS_ThrowTypeError(ctx, "JS_READ_OBJ_BORROW requires JS_READ_OBJ_LAZY");
++        obj = JS_EXCEPTION;
++        goto done;
++    }
+     if ((flags & JS_READ_OBJ_LAZY) && !s->allow_bytecode) {
+         JS_ThrowTypeError(ctx, "JS_READ_OBJ_LAZY requires JS_READ_OBJ_BYTECODE");
+         obj = JS_EXCEPTION;
+@@ -44023,7 +44030,10 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+             obj = JS_EXCEPTION;
+             goto done;
+         }
+-        {
++        if (flags & JS_READ_OBJ_BORROW) {
++            src->buf = buf;
++            src->borrow_buf = true;
++        } else {
+             uint8_t *copy = js_malloc(ctx, buf_len);
+             if (!copy) {
+                 js_free(ctx, src);
+diff --git a/quickjs.h b/quickjs.h
+index ae6af95..db60f60 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1412,6 +1412,10 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
+    so `buf` need not outlive the call. Requires JS_READ_OBJ_BYTECODE and is
+    incompatible with JS_READ_OBJ_REFERENCE and JS_READ_OBJ_SAB. */
+ #define JS_READ_OBJ_LAZY      (1 << 4)
++/* Borrow the serialized payload instead of copying it. The caller must keep
++   it alive and unchanged until all values and runtimes created from it are
++   freed. Requires JS_READ_OBJ_LAZY; invalid combinations are rejected. */
++#define JS_READ_OBJ_BORROW    (1 << 5)
+ JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
+ JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                                  int flags, JSSABTab *psab_tab);
