@@ -1,0 +1,2 @@
+import React from 'react'; import { ScrollView, Text } from 'react-native'; import { accounts } from '../data'; import { ScreenFrame, styles } from '../components';
+export default function MessagesScreen() { return <ScreenFrame title="Messages"><ScrollView>{accounts.map(account => <Text key={account.id} style={styles.rowTitle}>{account.initials}  {account.name}{'\n'}<Text style={styles.muted}>Latest project update is ready to review</Text></Text>)}</ScrollView></ScreenFrame>; }

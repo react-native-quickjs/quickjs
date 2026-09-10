@@ -25,6 +25,23 @@ Print the resolved configuration with:
 RNQJS_ENGINE=hermes npm run android:engine-info
 ```
 
+Set `RNQJS_EXAMPLE_MODE=benchmark` for the deterministic local dashboard. The
+default `simple` mode remains the lightweight demo. Benchmark runs require an explicit engine. QuickJS accepts `RNQJS_LAZY=0` for
+eager loading or `RNQJS_LAZY=1` for copied lazy loading:
+
+```sh
+RNQJS_EXAMPLE_MODE=benchmark RNQJS_ENGINE=quickjs RNQJS_LAZY=0 npm run benchmark:android
+RNQJS_EXAMPLE_MODE=benchmark RNQJS_ENGINE=quickjs RNQJS_LAZY=1 npm run benchmark:android
+RNQJS_EXAMPLE_MODE=benchmark RNQJS_ENGINE=hermes npm run benchmark:android
+```
+
+Benchmark mode includes 17 statically discoverable screen modules: dashboard,
+feed, search, article details, profile, settings, profile editing,
+notifications, saved items, analytics, help, orders, order details, messages,
+message details, security, and preferences. They are in the release bundle but
+noninitial modules are loaded only when their route is opened. All screens use
+the same deterministic local fixtures on QuickJS and Hermes.
+
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
 
 ## Step 1: Start Metro

@@ -1,0 +1,2 @@
+import React from 'react'; import { ScrollView, Text } from 'react-native'; import { ScreenFrame, styles } from '../components';
+export default function HelpScreen() { return <ScreenFrame title="Help center"><ScrollView>{['Getting started', 'Managing saved items', 'Working offline', 'Contact support'].map(title => <Text key={title} style={styles.rowTitle}>{title}{'\n'}<Text style={styles.muted}>Read the concise guide ›</Text></Text>)}</ScrollView></ScreenFrame>; }
