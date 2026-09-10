@@ -163,6 +163,31 @@ size_t firstStringLengthOffset(const std::vector<uint8_t> &bytes) {
   return 0;
 }
 
+size_t firstFunctionBodyLengthOffset(const std::vector<uint8_t> &bytes) {
+  for (size_t tag = qjs::kBytecodeHeaderSize; tag + 1 < bytes.size(); ++tag) {
+    if (bytes[tag] != 12)  // BC_TAG_FUNCTION_BYTECODE
+      continue;
+    size_t pos = tag + 3;  // tag, flags, strict mode
+    uint32_t counts[10];
+    uint32_t functionName;
+    if (pos > bytes.size() || !readLeb128(bytes, &pos, &functionName) ||
+        !readLeb128(bytes, &pos, &counts[0]))
+      continue;
+    bool valid = true;
+    for (size_t i = 1; i < 10 && valid; ++i)
+      valid = readLeb128(bytes, &pos, &counts[i]);
+    if (!valid) continue;
+    for (uint32_t i = 0; i < counts[5] && valid; ++i) {
+      uint32_t ignored;
+      valid = readLeb128(bytes, &pos, &ignored) &&
+              readLeb128(bytes, &pos, &ignored) &&
+              readLeb128(bytes, &pos, &ignored);
+    }
+    if (valid && pos + sizeof(uint32_t) <= bytes.size()) return pos;
+  }
+  return 0;
+}
+
 void disableChecksum(std::vector<uint8_t> *bytes) {
   ASSERT_GT(bytes->size(), qjs::kBytecodeHeaderSize);
   std::fill(
@@ -502,6 +527,40 @@ TEST(Bytecode, LazyFramedBodyTruncationIsRejectedRepeatedly) {
       EXPECT_TRUE(JS_IsException(value));
       JS_FreeValue(ctx, JS_GetException(ctx));
     }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+  }
+}
+
+TEST(Bytecode, LazyFramedBodyOverDeclarationIsRejected) {
+  auto bytes = compileToBytecode(
+      "function deferred() { return {value: 42}.value; }\n"
+      "globalThis.deferred = deferred;");
+  const size_t lengthOffset = firstFunctionBodyLengthOffset(bytes);
+  ASSERT_NE(lengthOffset, 0u);
+  ASSERT_LE(lengthOffset + sizeof(uint32_t), bytes.size());
+  const uint32_t length =
+      static_cast<uint32_t>(bytes[lengthOffset]) |
+      (static_cast<uint32_t>(bytes[lengthOffset + 1]) << 8) |
+      (static_cast<uint32_t>(bytes[lengthOffset + 2]) << 16) |
+      (static_cast<uint32_t>(bytes[lengthOffset + 3]) << 24);
+  ASSERT_LT(length, UINT32_MAX);
+  const uint32_t overdeclared = length + 1;
+  for (int i = 0; i < 4; ++i)
+    bytes[lengthOffset + i] = static_cast<uint8_t>(overdeclared >> (i * 8));
+  disableChecksum(&bytes);
+
+  for (const int flags :
+       {JS_READ_OBJ_BYTECODE, JS_READ_OBJ_BYTECODE | JS_READ_OBJ_LAZY}) {
+    JSRuntime *rt = JS_NewRuntime();
+    ASSERT_NE(rt, nullptr);
+    JSContext *ctx = JS_NewContext(rt);
+    ASSERT_NE(ctx, nullptr);
+    JSValue value = JS_ReadObject(
+        ctx, bytes.data() + qjs::kBytecodeHeaderSize,
+        bytes.size() - qjs::kBytecodeHeaderSize, flags);
+    EXPECT_TRUE(JS_IsException(value));
+    JS_FreeValue(ctx, JS_GetException(ctx));
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
   }
