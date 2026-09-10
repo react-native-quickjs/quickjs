@@ -2,6 +2,29 @@ This is a new [**React Native**](https://reactnative.dev) project, bootstrapped 
 
 # Getting Started
 
+## Android engine selection
+
+The normal release app defaults to QuickJS. Select the engine without editing
+Gradle or Kotlin files:
+
+```sh
+RNQJS_EXAMPLE_MODE=simple RNQJS_ENGINE=quickjs npm run android:release
+RNQJS_EXAMPLE_MODE=simple RNQJS_ENGINE=hermes npm run android:release
+```
+
+Convenient aliases are also available:
+
+```sh
+npm run android:release:quickjs
+npm run android:release:hermes
+```
+
+Print the resolved configuration with:
+
+```sh
+RNQJS_ENGINE=hermes npm run android:engine-info
+```
+
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
 
 ## Step 1: Start Metro
