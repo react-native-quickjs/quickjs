@@ -101,6 +101,8 @@ and this project adheres to [Semantic Versioning][semver].
   accumulator while preserving iterator semantics for unsupported arrays.
 - Patch `0036`: forwards unchanged dense mapped arguments directly from their
   live parameter slots during apply, with the existing generic fallback.
+- Patch `0037`: avoids copying complete argument arrays for callees proven not
+  to write, capture, expose, or alias their argument slots.
 - The React Native runtime integration enables copied lazy loading; it is an
   integration change layered on top of patches `0031`–`0033`, not part of
   patch `0031` itself.

@@ -1,0 +1,132 @@
+Subject: Elide Safe Argument Copies For Read-Only Callees
+
+What this does
+  Adds a compiler proof that marks a function when its bytecode cannot
+  write, capture, expose, or alias an argument slot. When such a function is
+  called with JS_CALL_FLAG_COPY_ARGV and receives all declared arguments, the
+  caller's argument array is used directly instead of being duplicated into a
+  second value buffer.
+
+Why we need it
+  COPY_ARGV protects callers from callees that write argument slots. Functions
+  that only read their arguments already provide that property, but the normal
+  call path still allocates and fills a private buffer. Such functions can use
+  the caller's values without changing observable argument behavior.
+
+What it adds
+  A conservative bytecode scan rejects parameter writes, all current short and
+  general argument-write opcodes, argument references, eval, apply-eval, and
+  mapped arguments creation. It runs after final compilation and during shared
+  bytecode-body validation, covering eager and lazy deserialization. Unknown or
+  malformed instruction streams leave the bit clear, preserving the existing
+  copy behavior.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -42374,1 +42374,44 @@ static JSString *JS_ReadString(BCReaderState *s);
+ static JSString *JS_ReadString(BCReaderState *s);
++static bool js_argv_safe_opcode(const uint8_t *bc, int pos, int op)
++{
++    switch (op) {
++    case OP_put_arg:  case OP_set_arg:
++    case OP_put_arg0: case OP_set_arg0:
++    case OP_put_arg1: case OP_set_arg1:
++    case OP_put_arg2: case OP_set_arg2:
++    case OP_put_arg3: case OP_set_arg3:
++    case OP_make_arg_ref:
++    case OP_eval:     case OP_apply_eval:
++    case OP_get_arg_el:
++    case OP_apply_arguments:
++        return false;
++    case OP_special_object:
++        return bc[pos + 1] != OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS;
++    default:
++        return true;
++    }
++}
++
++static void js_scan_argv_safe(JSFunctionBytecode *b)
++{
++    const uint8_t *bc;
++    int pos = 0, len;
++
++    if (b == NULL)
++        return;
++    bc = b->byte_code_buf;
++    len = b->byte_code_len;
++    if (bc == NULL || len <= 0)
++        return;
++
++    while (pos < len) {
++        int op = bc[pos];
++        int sz = short_opcode_info(op).size;
++        if (sz <= 0 || pos + sz > len)
++            return;
++        if (!js_argv_safe_opcode(bc, pos, op))
++            return;
++        pos += sz;
++    }
++    b->argv_safe = 1;
++}
+@@ -42471,5 +42473,6 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
+ {
+     uint8_t *bc_buf;
+     int pos, len, op;
++    bool argv_safe = true;
+     JSAtom atom;
+     uint32_t idx;
+@@ -42490,4 +42493,6 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
+             b->byte_code_len = pos;
+             return -1;
+         }
++        if (!js_argv_safe_opcode(bc_buf, pos, op))
++            argv_safe = false;
+         switch(short_opcode_info(op).fmt) {
+@@ -42522,4 +42527,5 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
+         pos += len;
+     }
++    b->argv_safe = argv_safe;
+     return 0;
+ }
+@@ -39458,1 +39458,3 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
++static void js_scan_argv_safe(JSFunctionBytecode *b);
++
+ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -39918,5 +39920,6 @@
+     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
+     b->byte_code_len = fd->byte_code.size;
+     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
++    js_scan_argv_safe(b);
+     js_free(ctx, fd->byte_code.buf);
+     fd->byte_code.buf = NULL;
+@@ -1010,7 +1010,7 @@
+        filled and cannot be re-parsed, so every later call has to fail rather
+        than run with a NULL byte_code_buf. */
+     uint8_t lazy_failed : 1;
+-    /* XXX: 2 bits available */
++    uint8_t argv_safe : 1;
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
+@@ -19162,6 +19163,8 @@
+ }
+ 
+ #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
++
++#define JS_ARGV_SAFE(b) ((b)->argv_safe)
+ #define JS_CALL_FLAG_GENERATOR   (1 << 2)
+ 
+ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
+@@ -19474,7 +19481,8 @@
+             return JS_EXCEPTION;
+     }
+ 
+-    if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
++    if (unlikely(argc < b->arg_count ||
++                 ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b)))) {
+         arg_allocated_size = b->arg_count;
+     } else {
+         arg_allocated_size = 0;

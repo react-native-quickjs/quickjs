@@ -47,6 +47,7 @@ what we changed and why without opening a single `.patch` file.
 | `0034` | Dispatches interpreter-issued calls to native functions without an interpreter activation | Native calls otherwise enter the bytecode-call machinery before reaching the same class call entry, adding setup and argument spill work that is unnecessary for non-bytecode callees | - | No |
 | `0035` | Copies eligible dense array spreads directly into the argument accumulator | Unchanged builtin array iterators otherwise allocate an iterator and route every element through general property definition before the call | - | No |
 | `0036` | Copies unchanged dense mapped arguments directly from their live variable-reference slots during apply | Avoids one exotic property lookup per forwarded argument while preserving the generic path for modified or sparse arguments objects | - | No |
+| `0037` | Skips COPY_ARGV materialization for functions proven not to write or retain argument slots | Callback callees that only read their arguments can reuse the caller's complete argument array without allocation or duplication | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
