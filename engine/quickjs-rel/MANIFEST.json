@@ -135,12 +135,16 @@
       "sha256": "bc5d8aba4747e808f9dcc0e0150db5cbbc34edbafa5624430ba8fb78fedc0242"
     },
     {
+      "name": "0034-native-call-dispatch.patch",
+      "sha256": "daab2bfee4648a13188b761e05a19b759e3fbe8604d72c11c777c903da8bdbf3"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "06463ac103bea52a86b1cc413ac056ec19980640ff6d57af5444a1728d4d5aad"
     }
   ],
   "files": {
-    "quickjs.c": "aab1e3ae19a8ee2b320814e3eb7054866f20b682680efeccf1edb3904025b950",
+    "quickjs.c": "da03d153cfaae4cc5da4dec87b294b84546a184b6c5b87a20dfced79b35455b3",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

@@ -95,6 +95,8 @@ and this project adheres to [Semantic Versioning][semver].
 - Patch `0033`: defers interning non-constant bytecode atoms until they are
   first referenced, while preserving eager validation of their serialized
   lengths and boundaries.
+- Patch `0034`: dispatches interpreter-issued calls directly to supported
+  native functions while retaining the existing fallback for other callables.
 - The React Native runtime integration enables copied lazy loading; it is an
   integration change layered on top of patches `0031`–`0033`, not part of
   patch `0031` itself.
