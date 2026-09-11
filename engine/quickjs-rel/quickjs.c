@@ -46134,6 +46134,12 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
         for(i = 0; i < len; i++) {
             tab[i] = js_dup(p->u.array.u.values[i]);
         }
+    } else if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS &&
+               p->fast_array &&
+               len == p->u.array.count) {
+        for(i = 0; i < len; i++) {
+            tab[i] = js_dup(*p->u.array.u.var_refs[i]->pvalue);
+        }
     } else {
         for(i = 0; i < len; i++) {
             ret = JS_GetPropertyUint32(ctx, array_arg, i);
