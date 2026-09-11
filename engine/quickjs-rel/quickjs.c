@@ -1010,7 +1010,7 @@ typedef struct JSFunctionBytecode {
        filled and cannot be re-parsed, so every later call has to fail rather
        than run with a NULL byte_code_buf. */
     uint8_t lazy_failed : 1;
-    /* XXX: 2 bits available */
+    uint8_t argv_safe : 1;
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
@@ -19163,6 +19163,8 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 }
 
 #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
+
+#define JS_ARGV_SAFE(b) ((b)->argv_safe)
 #define JS_CALL_FLAG_GENERATOR   (1 << 2)
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
@@ -19470,7 +19472,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             return JS_EXCEPTION;
     }
 
-    if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
+    if (unlikely(argc < b->arg_count ||
+                 ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b)))) {
         arg_allocated_size = b->arg_count;
     } else {
         arg_allocated_size = 0;
@@ -39450,6 +39453,8 @@ static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
 /* create a function object from a function definition. The function
    definition is freed. All the child functions are also created. It
    must be done this way to resolve all the variables. */
+static void js_scan_argv_safe(JSFunctionBytecode *b);
+
 static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 {
     JSValue func_obj;
@@ -39604,6 +39609,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
     b->byte_code_len = fd->byte_code.size;
     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
+    js_scan_argv_safe(b);
     js_free(ctx, fd->byte_code.buf);
     fd->byte_code.buf = NULL;
 
@@ -42596,6 +42602,49 @@ static int bc_get_buf(BCReaderState *s, void *buf, uint32_t buf_len)
 }
 
 static JSString *JS_ReadString(BCReaderState *s);
+static bool js_argv_safe_opcode(const uint8_t *bc, int pos, int op)
+{
+    switch (op) {
+    case OP_put_arg:  case OP_set_arg:
+    case OP_put_arg0: case OP_set_arg0:
+    case OP_put_arg1: case OP_set_arg1:
+    case OP_put_arg2: case OP_set_arg2:
+    case OP_put_arg3: case OP_set_arg3:
+    case OP_make_arg_ref:
+    case OP_eval:     case OP_apply_eval:
+    case OP_get_arg_el:
+    case OP_apply_arguments:
+        return false;
+    case OP_special_object:
+        return bc[pos + 1] != OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS;
+    default:
+        return true;
+    }
+}
+
+static void js_scan_argv_safe(JSFunctionBytecode *b)
+{
+    const uint8_t *bc;
+    int pos = 0, len;
+
+    if (b == NULL)
+        return;
+    bc = b->byte_code_buf;
+    len = b->byte_code_len;
+    if (bc == NULL || len <= 0)
+        return;
+
+    while (pos < len) {
+        int op = bc[pos];
+        int sz = short_opcode_info(op).size;
+        if (sz <= 0 || pos + sz > len)
+            return;
+        if (!js_argv_safe_opcode(bc, pos, op))
+            return;
+        pos += sz;
+    }
+    b->argv_safe = 1;
+}
 
 /* Interns atom `idx` from its recorded position in the payload and memoises it
    in idx_to_atom. Reads through a scratch cursor so the caller's parse position
@@ -42741,6 +42790,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
 {
     uint8_t *bc_buf;
     int pos, len, op;
+    bool argv_safe = true;
     JSAtom atom;
     uint32_t idx;
 
@@ -42763,6 +42813,8 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
             b->byte_code_len = pos;
             return -1;
         }
+        if (!js_argv_safe_opcode(bc_buf, pos, op))
+            argv_safe = false;
         switch(short_opcode_info(op).fmt) {
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
@@ -42794,6 +42846,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
 #endif
         pos += len;
     }
+    b->argv_safe = argv_safe;
     return 0;
 }
 
