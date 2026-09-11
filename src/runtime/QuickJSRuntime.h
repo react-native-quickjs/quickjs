@@ -341,6 +341,9 @@ class QuickJSRuntime : public jsi::Runtime {
    */
   jsi::Value borrowValue(JSValue value);
 
+  void borrowValues(
+      JSValueConst *values, size_t count, jsi::Value *destination);
+
   /// Takes the reference out of a jsi::Value that is about to be destroyed,
   /// rather than dup'ing a value whose destructor is about to free the
   /// original. Symmetric with borrowValue.

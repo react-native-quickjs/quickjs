@@ -255,8 +255,8 @@ struct HostFunctionHandlers {
         heapArgs.resize(static_cast<size_t>(argc));
         args = heapArgs.data();
       }
-      for (int i = 0; i < argc; ++i) {
-        args[i] = runtime->borrowValue(argv[i]);
+      if (argc != 0) {
+        runtime->borrowValues(argv, static_cast<size_t>(argc), args);
       }
       jsi::Value thisValue = runtime->borrowValue(thisVal);
       jsi::Value result =
@@ -758,6 +758,47 @@ jsi::Value QuickJSRuntime::borrowValue(JSValue value) {
     return jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
   }
   return jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
+}
+
+void QuickJSRuntime::borrowValues(
+    JSValueConst *values, size_t count, jsi::Value *destination) {
+  for (size_t i = 0; i < count; ++i) {
+    JSValueConst value = values[i];
+    switch (JS_VALUE_GET_TAG(value)) {
+      case JS_TAG_UNDEFINED:
+        destination[i] = jsi::Value::undefined();
+        break;
+      case JS_TAG_NULL:
+        destination[i] = jsi::Value::null();
+        break;
+      case JS_TAG_BOOL:
+        destination[i] = jsi::Value(JS_VALUE_GET_BOOL(value) != 0);
+        break;
+      case JS_TAG_INT:
+        destination[i] = jsi::Value(JS_VALUE_GET_INT(value));
+        break;
+      case JS_TAG_FLOAT64:
+        destination[i] = jsi::Value(JS_VALUE_GET_FLOAT64(value));
+        break;
+      case JS_TAG_STRING:
+        destination[i] =
+            jsi::Value(make<jsi::String>(allocPointerValue(value, false)));
+        break;
+      case JS_TAG_SYMBOL:
+        destination[i] =
+            jsi::Value(make<jsi::Symbol>(allocPointerValue(value, false)));
+        break;
+      case JS_TAG_BIG_INT:
+      case JS_TAG_SHORT_BIG_INT:
+        destination[i] =
+            jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
+        break;
+      default:
+        destination[i] =
+            jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
+        break;
+    }
+  }
 }
 
 JSValue QuickJSRuntime::takeJSValue(jsi::Value &&value) {
