@@ -18615,6 +18615,54 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
                                        JS_ITERATOR_KIND_VALUE);
     JS_FreeValue(ctx, iterator);
 
+    /* Used to squelch a -Wcast-function-type warning. */
+    JSCFunctionType ft2 = { .iterator_next = js_array_iterator_next };
+    if (is_array_iterator) {
+        JSPropertyDescriptor desc;
+        JSValue *src_arr;
+        uint32_t src_count, src_len;
+        JSObject *dst;
+        int ret;
+
+        ret = JS_GetOwnProperty(ctx, &desc,
+                                ctx->class_proto[JS_CLASS_ARRAY_ITERATOR],
+                                JS_ATOM_next);
+        if (ret < 0)
+            return -1;
+        if (ret > 0 && !(desc.flags & JS_PROP_GETSET)) {
+            bool next_ok = JS_IsCFunction(ctx, desc.value, ft2.generic, 0);
+            if (next_ok && js_get_fast_array(ctx, sp[-1], &src_arr, &src_count)) {
+                if (!js_get_length32(ctx, &src_len, sp[-1]) &&
+                    js_get_fast_array(ctx, sp[-1], &src_arr, &src_count) &&
+                    src_len == src_count) {
+                    dst = JS_VALUE_GET_OBJ(sp[-3]);
+                    if (dst->class_id == JS_CLASS_ARRAY && dst->fast_array &&
+                        dst->u.array.count == pos &&
+                        JS_VALUE_GET_TAG(dst->prop[0].u.value) == JS_TAG_INT &&
+                        (get_shape_prop(dst->shape)->flags & JS_PROP_WRITABLE)) {
+                        uint32_t k, new_count = pos + src_count;
+                        if (new_count >= pos) {
+                            if (new_count > dst->u.array.u1.size &&
+                                expand_fast_array(ctx, dst, new_count)) {
+                                js_free_desc(ctx, &desc);
+                                return -1;
+                            }
+                            for (k = 0; k < src_count; k++)
+                                dst->u.array.u.values[pos + k] = js_dup(src_arr[k]);
+                            dst->u.array.count = new_count;
+                            dst->prop[0].u.value = js_int32(new_count);
+                            sp[-2] = js_int32(new_count);
+                            js_free_desc(ctx, &desc);
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+        if (ret > 0)
+            js_free_desc(ctx, &desc);
+    }
+
     enumobj = JS_GetIterator(ctx, sp[-1], false);
     if (JS_IsException(enumobj))
         return -1;
@@ -18623,8 +18671,6 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
         JS_FreeValue(ctx, enumobj);
         return -1;
     }
-    /* Used to squelch a -Wcast-function-type warning. */
-    JSCFunctionType ft2 = { .iterator_next = js_array_iterator_next };
     if (is_array_iterator
             &&  JS_IsCFunction(ctx, method, ft2.generic, 0)
             &&  js_get_fast_array(ctx, sp[-1], &arrp, &count32)) {

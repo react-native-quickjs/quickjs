@@ -97,6 +97,8 @@ and this project adheres to [Semantic Versioning][semver].
   lengths and boundaries.
 - Patch `0034`: dispatches interpreter-issued calls directly to supported
   native functions while retaining the existing fallback for other callables.
+- Patch `0035`: copies eligible dense array spreads directly into the
+  accumulator while preserving iterator semantics for unsupported arrays.
 - The React Native runtime integration enables copied lazy loading; it is an
   integration change layered on top of patches `0031`–`0033`, not part of
   patch `0031` itself.
