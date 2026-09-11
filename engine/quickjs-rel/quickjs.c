@@ -19310,6 +19310,28 @@ static bool needs_backtrace(JSValue exc)
     return can_store_error_stack(exc) || can_add_backtrace(exc);
 }
 
+static inline int js_call_c_function_fast(
+    JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj, int argc,
+    JSValueConst *argv, int flags, JSValue *pret)
+{
+    JSObject *p;
+    JSClassCall *call_func;
+
+    if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT))
+        return 0;
+    p = JS_VALUE_GET_OBJ(func_obj);
+    if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    call_func = ctx->rt->class_array[p->class_id].call;
+    if (unlikely(!call_func))
+        return 0;
+    if (unlikely(js_poll_interrupts(ctx)))
+        *pret = JS_EXCEPTION;
+    else
+        *pret = call_func(ctx, func_obj, this_obj, argc, argv, flags);
+    return 1;
+}
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -19896,6 +19918,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (!js_call_c_function_fast(ctx, call_argv[-1], JS_UNDEFINED, call_argc,
+                                             vc(call_argv), 0, &ret_val))
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -19933,6 +19957,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (!js_call_c_function_fast(ctx, call_argv[-1], call_argv[-2], call_argc,
+                                             vc(call_argv), 0, &ret_val))
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);

@@ -44,6 +44,7 @@ what we changed and why without opening a single `.patch` file.
 | `0031` | Frames serialized function bodies and provides one checked bounded reader for eager and lazy-ready records | A declared body boundary and shared overflow-safe layout prevent malformed function records from consuming adjacent data while allowing later lazy materialization to use the same parser | - | **Yes** - changes bytecode record layout |
 | `0032` | Adds explicit caller-owned borrowed storage for lazy bytecode input | Embedders with stable immutable storage can avoid the engine-owned payload copy without changing the safe copied-lazy default | `JS_READ_OBJ_BORROW` | No |
 | `0033` | Defers atom interning for lazy bytecode entries until first use | Cold Metro function bodies need not construct their string and symbol atoms during startup; entries are validated, memoized, and shared when materialized | - | No |
+| `0034` | Dispatches interpreter-issued calls to native functions without an interpreter activation | Native calls otherwise enter the bytecode-call machinery before reaching the same class call entry, adding setup and argument spill work that is unnecessary for non-bytecode callees | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
@@ -68,7 +69,7 @@ What this does
   Two to four short sentences.
 
 Why we need it
-  What in react-native-quickjs is broken or impossible without this.
+  What in the current engine is broken or impossible without this.
 
 What it adds
   JS_GetFrameInfoAtLevel()  - asks the engine where a given stack frame is
