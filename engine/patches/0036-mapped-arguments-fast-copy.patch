@@ -1,0 +1,38 @@
+Subject: Copy Mapped Arguments Without Property Lookups
+
+What this does
+  Adds a fast path for mapped arguments objects passed to
+  Function.prototype.apply, Reflect.apply, and Reflect.construct. When the
+  arguments object is still a dense fast array with its original length, the
+  values are duplicated directly from the live variable-reference slots.
+
+Why we need it
+  Mapped arguments expose parameter slots through JSVarRef entries, but the
+  generic apply path reads each element through the arguments exotic property
+  lookup. The lookup is unnecessary while the object remains dense and
+  unmodified.
+
+What it adds
+  The fast path admits only the unchanged dense mapped-arguments representation
+  and duplicates each referenced value into the existing argument buffer.
+  Deleted or redefined elements, changed length, sparse data, proxies, and all
+  other cases continue through the existing property-based path.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -46142,6 +46142,12 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
+         for(i = 0; i < len; i++) {
+             tab[i] = js_dup(p->u.array.u.values[i]);
+         }
++    } else if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS &&
++               p->fast_array &&
++               len == p->u.array.count) {
++        for(i = 0; i < len; i++) {
++            tab[i] = js_dup(*p->u.array.u.var_refs[i]->pvalue);
++        }
+     } else {
+         for(i = 0; i < len; i++) {
+             ret = JS_GetPropertyUint32(ctx, array_arg, i);
