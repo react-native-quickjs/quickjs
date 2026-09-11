@@ -1525,6 +1525,7 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt);
 
 static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int magic);
+static int check_function(JSContext *ctx, JSValueConst obj);
 static void js_array_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
                           JS_MarkFunc *mark_func);
@@ -3256,6 +3257,10 @@ int JS_GetStackDepth(JSContext *ctx)
     return depth;
 }
 
+static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv);
+static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
+                                         JSValueConst *argv, JSStackFrame *sf,
+                                         int arg_count);
 int JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
                                 JSDebugLocalVar **pvars, int *pcount)
 {
@@ -3291,6 +3296,23 @@ int JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
         return -1;
 
     int idx = 0;
+    for (int i = 0; i < b->var_count; i++) {
+        if (b->vardefs[b->arg_count + i].var_name == JS_ATOM_arguments &&
+            JS_VALUE_GET_TAG(sf->var_buf[i]) != JS_TAG_OBJECT) {
+            JSValue arguments;
+            if (b->is_strict_mode || !b->has_simple_parameter_list)
+                arguments = js_build_arguments(ctx, sf->arg_count, sf->arg_buf);
+            else
+                arguments = js_build_mapped_arguments(ctx, sf->arg_count,
+                                                      sf->arg_buf, sf,
+                                                      min_int(sf->arg_count,
+                                                              b->arg_count));
+            if (JS_IsException(arguments))
+                goto fail;
+            sf->var_buf[i] = arguments;
+            break;
+        }
+    }
 
 #define APPEND_VAR(vd_, value_, is_arg_)                                  \
     do {                                                                  \
@@ -18020,6 +18042,58 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
     return JS_EXCEPTION;
 }
 
+static JSObject *js_args_apply_is_builtin(JSValueConst v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id == JS_CLASS_C_FUNCTION &&
+        p->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+        p->u.cfunc.c_function.generic_magic == js_function_apply &&
+        p->u.cfunc.magic == 0)
+        return p;
+    return NULL;
+}
+
+static no_inline JSValue js_args_memo(JSContext *ctx, JSValue *slot,
+                                      int argc, JSValueConst *argv,
+                                      JSStackFrame *sf, int arg_count)
+{
+    JSValue v;
+    if (likely(JS_VALUE_GET_TAG(*slot) != JS_TAG_UNINITIALIZED))
+        return *slot;
+    v = js_build_mapped_arguments(ctx, argc, argv, sf, min_int(argc, arg_count));
+    if (unlikely(JS_IsException(v)))
+        return JS_EXCEPTION;
+    *slot = v;
+    return v;
+}
+
+static no_inline JSValue js_args_el_slow(JSContext *ctx, JSValue *slot,
+                                        JSValue key, int argc,
+                                        JSValueConst *argv, JSStackFrame *sf,
+                                        int arg_count)
+{
+    JSValue ao = js_args_memo(ctx, slot, argc, argv, sf, arg_count);
+    if (unlikely(JS_IsException(ao)))
+        return JS_EXCEPTION;
+    return JS_GetPropertyValue(ctx, ao, key);
+}
+
+static no_inline JSValue js_args_apply_reified(JSContext *ctx, JSValue *slot,
+                                               JSValue *st, int argc,
+                                               JSValueConst *argv, JSStackFrame *sf,
+                                               int arg_count)
+{
+    JSValue args2[2];
+    JSValue ao = js_args_memo(ctx, slot, argc, argv, sf, arg_count);
+    if (unlikely(JS_IsException(ao)))
+        return JS_EXCEPTION;
+    args2[0] = st[2];
+    args2[1] = ao;
+    return JS_Call(ctx, st[1], st[0], 2, vc(args2));
+}
 static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
 {
     JSObject *p;
@@ -19341,6 +19415,7 @@ typedef enum {
     OP_SPECIAL_OBJECT_VAR_OBJECT,
     OP_SPECIAL_OBJECT_IMPORT_META,
     OP_SPECIAL_OBJECT_NULL_PROTO,
+    OP_SPECIAL_OBJECT_ARG_COUNT,
 } OPSpecialObjectEnum;
 
 #define FUNC_RET_AWAIT      0
@@ -19784,6 +19859,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (unlikely(JS_IsException(sp[-1])))
                         goto exception;
                     break;
+                case OP_SPECIAL_OBJECT_ARG_COUNT:
+                    *sp++ = js_int32(argc);
+                    break;
                 default:
                     abort();
                 }
@@ -20042,6 +20120,52 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
 
                 ret_val = js_function_apply(ctx, sp[-3], 2, vc(&sp[-2]), magic);
+                if (unlikely(JS_IsException(ret_val)))
+                    goto exception;
+                JS_FreeValue(ctx, sp[-3]);
+                JS_FreeValue(ctx, sp[-2]);
+                JS_FreeValue(ctx, sp[-1]);
+                sp -= 3;
+                *sp++ = ret_val;
+            }
+            BREAK;
+
+        CASE(OP_get_arg_el):
+            {
+                int idx = get_u16(pc);
+                pc += 2;
+                if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
+                    uint32_t i = (uint32_t)JS_VALUE_GET_INT(sp[-1]);
+                    if (likely(i < (uint32_t)argc)) {
+                        sp[-1] = js_dup(i < (uint32_t)b->arg_count
+                                        ? arg_buf[i] : argv[i]);
+                        BREAK;
+                    }
+                }
+                sf->cur_pc = pc;
+                ret_val = js_args_el_slow(ctx, &var_buf[idx], sp[-1], argc, argv,
+                                          sf, b->arg_count);
+                if (unlikely(JS_IsException(ret_val)))
+                    goto exception;
+                sp[-1] = ret_val;
+            }
+            BREAK;
+
+        CASE(OP_apply_arguments):
+            {
+                int idx = get_u16(pc);
+                pc += 2;
+                sf->cur_pc = pc;
+                JSObject *pa = js_args_apply_is_builtin(sp[-2]);
+                if (likely(pa != NULL &&
+                           (arg_buf == (JSValue *)argv || argc <= b->arg_count))) {
+                    if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
+                        goto exception;
+                    ret_val = JS_Call(ctx, sp[-3], sp[-1], argc, vc(arg_buf));
+                } else {
+                    ret_val = js_args_apply_reified(ctx, &var_buf[idx], sp - 3,
+                                                 argc, argv, sf, b->arg_count);
+                }
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 JS_FreeValue(ctx, sp[-3]);
@@ -20554,8 +20678,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
         CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
         CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
@@ -38144,8 +38266,11 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             dbuf_putc(bc_out, OP_get_var_ref0 + idx);
             return;
         case OP_put_var_ref:
-            dbuf_putc(bc_out, OP_put_var_ref0 + idx);
-            return;
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_put_var_ref0);
+                return;
+            }
+            break;
         case OP_set_var_ref:
             dbuf_putc(bc_out, OP_set_var_ref0 + idx);
             return;
@@ -38175,6 +38300,128 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
 }
 
 /* peephole optimizations and resolve goto/labels */
+
+enum {
+    JS_ARGS_KIND_NONE,
+    JS_ARGS_KIND_LENGTH,
+    JS_ARGS_KIND_ELEM,
+    JS_ARGS_KIND_APPLY,
+};
+
+static int js_args_find_elem_load(const uint8_t *bc_buf, int bc_len, int pos_next)
+{
+    int pos, op, len, depth = 1;
+    const JSOpCode *oi;
+
+    for (pos = pos_next; pos < bc_len; pos += len) {
+        op = bc_buf[pos];
+        oi = &opcode_info[op];
+        len = oi->size;
+        if (len <= 0 || pos + len > bc_len)
+            return -1;
+        if (op == OP_get_array_el && depth == 2)
+            return pos;
+        switch (oi->fmt) {
+        case OP_FMT_label:
+        case OP_FMT_label8:
+        case OP_FMT_label16:
+        case OP_FMT_label_u16:
+        case OP_FMT_atom_label_u8:
+        case OP_FMT_atom_label_u16:
+        case OP_FMT_npop:
+        case OP_FMT_npopx:
+        case OP_FMT_npop_u16:
+            return -1;
+        default:
+            break;
+        }
+        switch (op) {
+        case OP_label:
+        case OP_with_get_var:   case OP_with_delete_var:
+        case OP_with_make_ref:  case OP_with_get_ref:
+        case OP_with_get_ref_undef: case OP_with_put_var:
+        case OP_catch:          case OP_nip_catch:
+        case OP_for_of_start:   case OP_for_await_of_start:
+        case OP_iterator_close:
+        case OP_drop:           case OP_nip:  case OP_nip1:
+        case OP_return:         case OP_return_undef:
+        case OP_return_async:   case OP_throw: case OP_throw_error:
+        case OP_ret:            case OP_gosub:
+            return -1;
+        default:
+            break;
+        }
+        depth += (int)oi->n_push - (int)oi->n_pop;
+        if (depth < 1)
+            return -1;
+    }
+    return -1;
+}
+
+static int js_args_site_kind(CodeContext *cc, int pos_next, bool mapped, int *pel)
+{
+    int el;
+    if (code_match(cc, pos_next, OP_get_field, -1))
+        return cc->atom == JS_ATOM_length ? JS_ARGS_KIND_LENGTH
+                                          : JS_ARGS_KIND_NONE;
+    if (!mapped)
+        return JS_ARGS_KIND_NONE;
+    if (code_match(cc, pos_next, OP_call_method, 2, -1))
+        return JS_ARGS_KIND_APPLY;
+    el = js_args_find_elem_load(cc->bc_buf, cc->bc_len, pos_next);
+    if (el >= 0) {
+        *pel = el;
+        return JS_ARGS_KIND_ELEM;
+    }
+    return JS_ARGS_KIND_NONE;
+}
+
+static int js_args_elide_scan(JSFunctionDef *s, uint8_t *bc_buf, int bc_len,
+                              bool mapped, bool mark)
+{
+    CodeContext cc;
+    int pos, op, len, fmt, A, kinds = 0;
+
+    A = s->arguments_var_idx;
+    if (A < 0 || A >= s->var_count)
+        return -1;
+    if (s->arguments_arg_idx >= 0 || s->has_eval_call ||
+        s->var_object_idx >= 0 || s->arg_var_object_idx >= 0) {
+        return -1;
+    }
+    if (s->vars[A].is_captured) {
+        return -1;
+    }
+    cc.bc_buf = bc_buf;
+    cc.bc_len = bc_len;
+    for (pos = 0; pos < bc_len; pos += len) {
+        int kind, el = -1;
+        op = bc_buf[pos];
+        len = opcode_info[op].size;
+        if (len <= 0)
+            return -1;
+        fmt = opcode_info[op].fmt;
+        if (fmt == OP_FMT_none_loc || fmt == OP_FMT_loc8)
+            return -1;
+        if (fmt != OP_FMT_loc)
+            continue;
+        if (get_u16(bc_buf + pos + 1) != A)
+            continue;
+        if (op != OP_get_loc)
+            return -1;
+        kind = js_args_site_kind(&cc, pos + len, mapped, &el);
+        if (kind == JS_ARGS_KIND_NONE)
+            return -1;
+        kinds |= 1 << kind;
+        if (mark) {
+            bc_buf[pos] = OP_args_recv;
+            put_u16(bc_buf + pos + 1, kind);
+            if (kind == JS_ARGS_KIND_ELEM)
+                bc_buf[el] = OP_args_el;
+        }
+    }
+    return kinds;
+}
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
     int pos, pos_next, bc_len, op, op1, len, i, line_num, col_num, patch_offsets;
@@ -38188,6 +38435,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     int objlit_k = 0;
     int objlit_live_count = 0;
     int objlit_template_index;
+    int args_elide_kinds = -1;
 
     label_slots = s->label_slots;
 
@@ -38211,6 +38459,26 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         s->line_number_last = s->line_num;
         s->col_number_last = s->col_num;
         s->line_number_last_pc = 0;
+    }
+
+    if (s->arguments_var_idx >= 0) {
+        bool mapped = !s->is_strict_mode && s->has_simple_parameter_list;
+        args_elide_kinds = js_args_elide_scan(s, (uint8_t *)bc_buf, bc_len,
+                                              mapped, false);
+        if (args_elide_kinds >= 0) {
+            js_args_elide_scan(s, (uint8_t *)bc_buf, bc_len, mapped, true);
+            if (mapped && (args_elide_kinds &
+                           ((1 << JS_ARGS_KIND_ELEM) |
+                            (1 << JS_ARGS_KIND_APPLY)))) {
+                for (i = 0; i < s->arg_count; i++)
+                    capture_var(s, &s->args[i]);
+            }
+            if (args_elide_kinds &
+                ((1 << JS_ARGS_KIND_ELEM) | (1 << JS_ARGS_KIND_APPLY))) {
+                dbuf_putc(&bc_out, OP_set_loc_uninitialized);
+                dbuf_put_u16(&bc_out, s->arguments_var_idx);
+            }
+        }
     }
 
     /* initialize the 'home_object' variable if needed */
@@ -38243,7 +38511,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
     /* initialize the 'arguments' variable if needed */
-    if (s->arguments_var_idx >= 0) {
+    if (s->arguments_var_idx >= 0 && args_elide_kinds < 0) {
         if (s->is_strict_mode || !s->has_simple_parameter_list) {
             dbuf_putc(&bc_out, OP_special_object);
             dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_ARGUMENTS);
@@ -38810,6 +39078,49 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 break;
             }
             goto no_change;
+        case OP_args_recv:
+            {
+                int kind = get_u16(bc_buf + pos + 1);
+                assert(args_elide_kinds >= 0);
+                switch (kind) {
+                case JS_ARGS_KIND_LENGTH:
+                    /* Removing get_field(length) requires releasing its atom. */
+                    if (!code_match(&cc, pos_next, OP_get_field, -1) ||
+                        cc.atom != JS_ATOM_length)
+                        goto args_elide_desync;
+                    JS_FreeAtom(ctx, cc.atom);
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_special_object);
+                    dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_ARG_COUNT);
+                    pos_next = cc.pos;
+                    break;
+                case JS_ARGS_KIND_APPLY:
+                    if (!code_match(&cc, pos_next, OP_call_method, 2, -1))
+                        goto args_elide_desync;
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_apply_arguments);
+                    dbuf_put_u16(&bc_out, s->arguments_var_idx);
+                    pos_next = cc.pos;
+                    break;
+                case JS_ARGS_KIND_ELEM:
+                    break;
+                default:
+                args_elide_desync:
+                    JS_ThrowInternalError(ctx, "arguments elision desync (kind=%d, pos=%d)",
+                                          kind, pos);
+                    goto fail;
+                }
+            }
+            break;
+        case OP_args_el:
+            add_pc2line_info(s, bc_out.size, line_num, col_num);
+            dbuf_putc(&bc_out, OP_get_arg_el);
+            dbuf_put_u16(&bc_out, s->arguments_var_idx);
+            break;
 
         case OP_get_loc:
             {

@@ -314,6 +314,9 @@ def(     source_loc, 9, 0, 0, u32x2) /* emitted in phase 1, removed in phase 3 *
    rewrites it into OP_debug in phase 3. */
 def(     debug_stmt, 2, 0, 0, u8) /* emitted in phase 1, removed in phase 3 */
 
+def(      args_recv, 3, 0, 1, u16)
+def(        args_el, 1, 2, 1, none)
+
 DEF(    push_minus1, 1, 0, 1, none_int)
 DEF(         push_0, 1, 0, 1, none_int)
 DEF(         push_1, 1, 0, 1, none_int)
@@ -364,8 +367,8 @@ DEF(   get_var_ref1, 1, 0, 1, none_var_ref)
 DEF(   get_var_ref2, 1, 0, 1, none_var_ref)
 DEF(   get_var_ref3, 1, 0, 1, none_var_ref)
 DEF(   put_var_ref0, 1, 1, 0, none_var_ref)
-DEF(   put_var_ref1, 1, 1, 0, none_var_ref)
-DEF(   put_var_ref2, 1, 1, 0, none_var_ref)
+DEF(     get_arg_el, 3, 1, 1, loc)
+DEF(apply_arguments, 3, 3, 1, loc)
 DEF(   put_var_ref3, 1, 1, 0, none_var_ref)
 DEF(   set_var_ref0, 1, 1, 1, none_var_ref)
 DEF(   set_var_ref1, 1, 1, 1, none_var_ref)

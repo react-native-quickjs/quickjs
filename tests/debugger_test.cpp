@@ -39,6 +39,7 @@ extern "C" {
 #include <quickjs.h>
 }
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -585,6 +586,23 @@ TEST_F(DebuggerTest, FrameInfoAtEveryLevel) {
   for (const auto &f : cap.files) {
     EXPECT_EQ(f, "<test>");
   }
+}
+
+TEST_F(DebuggerTest, OptimizedArgumentsAreMaterializedForFrameInspection) {
+  TraceState st;
+  st.inspectOnDebuggerStmt = true;
+  JS_SetDebugTraceHandler(ctx_, traceCb, &st);
+
+  JSValue v =
+      eval("function f(a) { arguments.length; debugger; return a; } f(7)");
+  JS_FreeValue(ctx_, v);
+
+  auto it = std::find_if(
+      st.locals.begin(), st.locals.end(), [](const std::string &local) {
+        return local.rfind("arguments=", 0) == 0;
+      });
+  ASSERT_NE(it, st.locals.end());
+  EXPECT_NE(*it, "arguments=undefined");
 }
 
 #endif  // JS_ENABLE_DEBUGGER
