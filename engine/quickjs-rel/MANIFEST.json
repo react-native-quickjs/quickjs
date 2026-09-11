@@ -151,12 +151,16 @@
       "sha256": "b6ec1f1a63685df26f5d2fcfa489cce16f2f067db7beaf8aa0d8562bd2f79d4e"
     },
     {
+      "name": "0038-arguments-reification-elision.patch",
+      "sha256": "d9a673b5baf7a531ed4cb42b51044291eec1ce66047573e3bbe41ec712f28e1c"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "06463ac103bea52a86b1cc413ac056ec19980640ff6d57af5444a1728d4d5aad"
+      "sha256": "2adbdaf59af795cc88e74b0cd9632dffcc330333a8cf2186305b410966502f76"
     }
   ],
   "files": {
-    "quickjs.c": "3f5060efaf0bb792e486aa528ca691f5d444dab32d53e646a5c3a2f625b6313e",
+    "quickjs.c": "cff1fd7d06db53d1a3f54b23a4a198c75b0927eabc53412dcccb00b85415721c",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
@@ -173,7 +177,7 @@
     "list.h": "cb6e24e8ee54bccdd66234fe54cd702d1160b9841db2b9b9adeb5003afe301d5",
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
-    "quickjs-opcode.h": "ede502651cd914c9cf44ecf1202c5ac33263286a31c06065e2b0ea985463fb82",
+    "quickjs-opcode.h": "b245471b2c135189f1f7f431357c955509bcf8ed082552d07c598486e01ba980",
     "quickjs.h": "a532b83c8c37cc79fedff1846ed2469478fc4f1ca1e6197cb402443c66a8996d",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }

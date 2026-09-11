@@ -22,6 +22,7 @@ Why we need it
     0015-inline-caches       adds opcodes and serialized IC metadata
     0030-crc32c-bytecode-checksum changes the checksum encoding
     0031-lazy-bytecode-function-bodies changes the serialized function layout
+    0038-arguments-reification-elision changes emitted argument-use opcodes
 
   A patch that needs the version raised says so in its own header and in its
   row of README.md, and changes nothing itself.
