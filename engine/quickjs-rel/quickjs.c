@@ -12765,11 +12765,34 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+static JSObject *js_fast_array_append_target(JSValueConst this_obj,
+                                             int64_t idx, int flags)
+{
+    JSObject *p;
+
+    if ((flags & ~JS_PROP_THROW) != JS_PROP_C_W_E)
+        return NULL;
+    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(this_obj);
+    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || !p->extensible)
+        return NULL;
+    if (idx != (int64_t)p->u.array.count)
+        return NULL;
+    return p;
+}
+
 int JS_DefinePropertyValueValue(JSContext *ctx, JSValueConst this_obj,
                                 JSValue prop, JSValue val, int flags)
 {
     JSAtom atom;
     int ret;
+    if (JS_VALUE_GET_TAG(prop) == JS_TAG_INT) {
+        JSObject *p = js_fast_array_append_target(
+            this_obj, JS_VALUE_GET_INT(prop), flags);
+        if (p != NULL)
+            return add_fast_array_element(ctx, p, val, flags) < 0 ? -1 : 0;
+    }
     atom = JS_ValueToAtom(ctx, prop);
     JS_FreeValue(ctx, prop);
     if (unlikely(atom == JS_ATOM_NULL)) {
@@ -12839,6 +12862,12 @@ static int JS_DefinePropertyValueInt64Const(JSContext *ctx, JSValueConst this_ob
 {
     JSAtom atom;
     int ret;
+    if (idx <= INT32_MAX) {
+        JSObject *p = js_fast_array_append_target(this_obj, idx, flags);
+        if (p != NULL)
+            return add_fast_array_element(ctx, p, js_dup(val), flags) < 0
+                ? -1 : 0;
+    }
     atom = JS_ValueToAtom(ctx, js_int64(idx));
     if (unlikely(atom == JS_ATOM_NULL))
         return -1;
