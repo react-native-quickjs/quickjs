@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning][semver].
   with a syntax error.
 - Patch `0040`: assigns the C-function frame argument buffer, which was
   previously left uninitialized.
+- Patch `0041`: appends `Array.prototype.map` and `filter` results directly to
+  the dense result array instead of walking the generic define path per
+  element. On-device, `map` identity is 25.2% faster, `filter` 19.9% faster and
+  mapping to objects 11.7% faster. The sampled Octane rows are neutral overall
+  (geomean -0.49%), the largest moves being deltablue -1.76% and richards
+  -1.29%, which measure as code layout rather than the added check.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

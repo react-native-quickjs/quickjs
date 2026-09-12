@@ -163,12 +163,16 @@
       "sha256": "5631979871976a9c40220f51bf1e7908da609f2319c6cb1f4d71a4777f00cfe6"
     },
     {
+      "name": "0041-array-map-filter-fast-append.patch",
+      "sha256": "466416a907d91bb83fae02b4a57003897544a48d9b3b4941a257ab9c492829a1"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "2adbdaf59af795cc88e74b0cd9632dffcc330333a8cf2186305b410966502f76"
     }
   ],
   "files": {
-    "quickjs.c": "732a8bdc23f8bed1bbd08b35098d325caa7e4996d0a5749a372e830c1005c586",
+    "quickjs.c": "d6edacb4e73d22e22066947159d508e63954e5238aa22bd95ae51b7181fbf0bc",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
