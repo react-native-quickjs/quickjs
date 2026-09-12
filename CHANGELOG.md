@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning][semver].
   100-element arrays 80%, a scalar 81% and two 20,000-element arrays 74%, with
   an input pair that keeps the generic path unchanged. The sampled Octane rows
   are flat (8-row geomean +0.21%).
+- Patch `0046`: reserves capacity for the `Array.prototype.filter` result from
+  the input length, capped at 4096 slots, before the callback loop. On-device,
+  filtering a 200-element array is 8.3% faster and a 100,000-element array
+  7.6%; a filter that keeps nothing pays about 1%, and a live result can hold
+  up to 32 KB of reserved storage that its `length` does not expose. The
+  sampled Octane rows are flat (8-row geomean -0.32%).
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
