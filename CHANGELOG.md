@@ -84,6 +84,18 @@ and this project adheres to [Semantic Versioning][semver].
   anonymous function expression 50.4%, an arrow 44.6%, a generator 43.4%, a
   capturing closure 40.7% -- with `new` and plain calls unchanged. The sampled
   Octane rows move +0.30% geomean same-binary and +0.60% shipped (pdfjs +2.7%).
+- Patch `0050`: an object whose shape needs at most four property slots -- an
+  object literal, a closure, a for-in iterator -- keeps its property array
+  inside its own allocation, so birth and death lose a malloc, a free and a
+  second block header. Measured same-binary, an empty object is 9.8% cheaper to
+  create, a one-property object 11.3%, a two-property object 11.3%, a capturing
+  closure 6.1%, an arrow function 11.8% and a for-in loop 2.3%, with a
+  five-property object and both array shapes (ineligible) unchanged. On a
+  260,000-object workload total malloc falls 3.4% and the allocation count 46%
+  (521,128 -> 281,102). The inline area is sized to the shape: a fixed four-slot
+  area measured +11.8% total heap for the same speed. The sampled Octane rows
+  move +1.54% geomean same-binary (splay +10.7%) and +0.24% shipped (splay
+  +9.7%).
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
