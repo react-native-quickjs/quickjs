@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning][semver].
   literal -- past the template limit, so it never stages -- is unchanged. The
   sampled Octane rows are flat (8-row geomean +0.01%); one cross-binary run read
   -0.72% and did not reproduce.
+- Patch `0049`: `js_closure()` builds a function object from a per-realm shape
+  template in one allocation, writing `length`, `name` and `prototype` straight
+  into the property array instead of adding them one shape transition at a time.
+  Measured same-binary, creating a closure is 40% to 50% cheaper -- a named or
+  anonymous function expression 50.4%, an arrow 44.6%, a generator 43.4%, a
+  capturing closure 40.7% -- with `new` and plain calls unchanged. The sampled
+  Octane rows move +0.30% geomean same-binary and +0.60% shipped (pdfjs +2.7%).
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
