@@ -7765,6 +7765,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
+    sf->arg_buf = (JSValue *)arg_buf;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
     return ret;
@@ -7891,6 +7892,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
+    sf->arg_buf = (JSValue *)arg_buf;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
 

@@ -50,6 +50,7 @@ what we changed and why without opening a single `.patch` file.
 | `0037` | Skips COPY_ARGV materialization for functions proven not to write or retain argument slots | Callback callees that only read their arguments can reuse the caller's complete argument array without allocation or duplication | - | No |
 | `0038` | Avoids reifying frame-visible mapped arguments for length, indexed reads, and verified builtin apply calls | Non-escaping argument uses can read the active frame without allocating an arguments object, while all observable slow paths retain the ordinary object | - | Yes |
 | `0039` | Keeps a pending exception when a formal parameter fails to parse | A stack overflow, interrupt or allocation failure raised while reading the parameter token is the real error; replacing it with "missing formal parameter" hides the cause and makes the reported failure depend on native stack depth | - | No |
+| `0040` | Assigns the C-function frame argument buffer | `js_call_c_function_data` and `js_call_c_closure` published a frame whose `arg_buf` was never set, so anything that walks frames precisely read an uninitialized buffer | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

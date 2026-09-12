@@ -1,0 +1,38 @@
+Subject: Assign The C-Function Frame Argument Buffer
+
+What this does
+  js_call_c_function_data and js_call_c_closure never assign sf->arg_buf, so
+  the JSStackFrame they publish to rt->current_stack_frame carries whatever the
+  C stack held while the callee re-enters the engine.
+
+Why we need it
+  sf is a C-stack local. Nothing in the shipping engine reads arg_buf for these
+  frame kinds, but any consumer that walks frames precisely -- a root scanner,
+  or a debugger inspecting C-function frames -- reads it immediately.
+
+What it adds
+  Both sites assign sf->arg_buf before calling their callee, matching
+  js_call_c_function. The publish order is unchanged: no engine code runs
+  between the publish and these stores.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7765,6 +7765,7 @@
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+     sf->cur_func = unsafe_unconst(func_obj);
+     sf->arg_count = argc;
++    sf->arg_buf = (JSValue *)arg_buf;
+     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
+     rt->current_stack_frame = sf->prev_frame;
+     return ret;
+@@ -7891,6 +7892,7 @@
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+     sf->cur_func = unsafe_unconst(func_obj);
+     sf->arg_count = argc;
++    sf->arg_buf = (JSValue *)arg_buf;
+     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
+     rt->current_stack_frame = sf->prev_frame;
+ 
