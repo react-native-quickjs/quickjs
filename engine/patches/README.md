@@ -52,6 +52,7 @@ what we changed and why without opening a single `.patch` file.
 | `0039` | Keeps a pending exception when a formal parameter fails to parse | A stack overflow, interrupt or allocation failure raised while reading the parameter token is the real error; replacing it with "missing formal parameter" hides the cause and makes the reported failure depend on native stack depth | - | No |
 | `0040` | Assigns the C-function frame argument buffer | `js_call_c_function_data` and `js_call_c_closure` published a frame whose `arg_buf` was never set, so anything that walks frames precisely read an uninitialized buffer | - | No |
 | `0041` | Appends map and filter results directly to the dense result array | The generic define path turns every result index into an atom and re-derives, per element, that this is an append to a dense array | - | No |
+| `0042` | Keeps an array dense when an index is skipped or deleted, by storing holes and tracking how many | Upstream demotes the array to a property table permanently the first time a store lands past the end, so `Array(n)`, gap fills, row-offset matrices and `delete` cost every later access | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
