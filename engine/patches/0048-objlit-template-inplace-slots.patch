@@ -1,0 +1,57 @@
+Subject: Initialize Template Object Slots Without Staging Them On The Stack
+
+What this does
+  `js_new_object_from_template()` builds a templated object literal by having
+  `JS_NewObjectFromShape()` allocate the object and then writing JS_UNDEFINED
+  into that object's property array directly, instead of staging a
+  `JSProperty props[JS_OBJLIT_MAX_PROPS]` array on the stack and having the
+  allocator copy every slot into the object.
+
+Why we need it
+  The staging array is 256 bytes of stack for every literal, and the copy loop
+  it feeds is the only writer of the new property array, so each slot is
+  written twice and read once on the path every object literal takes.
+
+What it adds
+  The allocation call passes NULL for its property staging, which is already
+  the contract for shapes that carry no values, and the caller fills
+  `prop[0 .. prop_count)` in place. Nothing else moves: the shape, its flags and
+  the `prop_size` default are untouched, and the slots past `prop_count` are
+  left uninitialized exactly as before.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7344,19 +7344,23 @@
+ static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl)
+ {
+     JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
++    JSValue obj;
++    JSObject *p;
+     int i;
+ 
+     if (likely(tpl->shape != NULL)) {
+-        JSProperty props[JS_OBJLIT_MAX_PROPS];
+         if (unlikely(tpl->shape->proto != proto))
+             return JS_NewObject(ctx);
+-        for (i = 0; i < tpl->prop_count; i++)
+-            props[i].u.value = JS_UNDEFINED;
+-        return JS_NewObjectFromShape(ctx, js_dup_shape(tpl->shape),
+-                                     JS_CLASS_OBJECT, props);
++        obj = JS_NewObjectFromShape(ctx, js_dup_shape(tpl->shape),
++                                    JS_CLASS_OBJECT, NULL);
++        if (unlikely(JS_IsException(obj)))
++            return obj;
++        p = JS_VALUE_GET_OBJ(obj);
++        for (i = 0; i < tpl->prop_count; i++)
++            p->prop[i].u.value = JS_UNDEFINED;
++        return obj;
+     }
+-    JSValue obj = JS_NewObject(ctx);
+-    JSObject *p;
++    obj = JS_NewObject(ctx);
+     if (JS_IsException(obj))
+         return obj;
+     p = JS_VALUE_GET_OBJ(obj);

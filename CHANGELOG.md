@@ -70,6 +70,13 @@ and this project adheres to [Semantic Versioning][semver].
   amortised. On the sampled Octane rows the mechanism alone moves the 8-row
   geomean +0.90% (splay +4.7%, navierstokes +2.2%) and the shipped binary
   +1.4% to +1.6% across two runs.
+- Patch `0048`: initializes a templated object literal's slots where they live,
+  instead of staging a 16-slot array on the stack for the allocator to copy in.
+  Measured same-binary (both paths in one build, so no layout component), a
+  3-field literal is 3.9% faster, 9 fields 2.7% and 1 field 1.9%, and a 20-field
+  literal -- past the template limit, so it never stages -- is unchanged. The
+  sampled Octane rows are flat (8-row geomean +0.01%); one cross-binary run read
+  -0.72% and did not reproduce.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
