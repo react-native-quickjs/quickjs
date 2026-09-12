@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning][semver].
   50-element window of it 70%, and a 100,000-element array 70%, with an
   array-like source and an empty result unchanged. The sampled Octane rows are
   flat (8-row geomean -0.04%).
+- Patch `0045`: copies `Array.prototype.concat` inputs that are already dense
+  fast arrays straight into the result instead of reading and defining every
+  element. On-device, concatenating two 200-element arrays is 85% faster, four
+  100-element arrays 80%, a scalar 81% and two 20,000-element arrays 74%, with
+  an input pair that keeps the generic path unchanged. The sampled Octane rows
+  are flat (8-row geomean +0.21%).
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
