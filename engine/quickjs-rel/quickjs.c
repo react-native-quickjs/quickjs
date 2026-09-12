@@ -1337,6 +1337,7 @@ struct JSShape {
     int prop_count; /* include deleted properties */
     int deleted_prop_count;
     JSShape *shape_hash_next; /* in JSRuntime.shape_hash[h] list */
+    JSShape *parent; /* strong reference to the shape this one was derived from */
     JSObject *proto;
     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
 };
@@ -6441,6 +6442,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->prop_count = 0;
     sh->deleted_prop_count = 0;
     sh->is_hashed = false;
+    sh->parent = NULL;
     return sh;
 }
 
@@ -6528,6 +6530,7 @@ static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
     JS_REF_COUNT(sh) = 1;
     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
     sh->is_hashed = false;
+    sh->parent = NULL;
     if (sh->proto) {
         js_dup(JS_MKPTR(JS_TAG_OBJECT, sh->proto));
     }
@@ -6561,6 +6564,13 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
         pr++;
     }
     remove_gc_object(&sh->header);
+    {
+        JSShape *parent = sh->parent;
+
+        sh->parent = NULL;
+        if (parent)
+            js_free_shape(rt, parent);
+    }
     js_free_rt(rt, get_alloc_from_shape(sh));
 }
 
@@ -8569,6 +8579,9 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             JSShape *sh = (JSShape *)gp;
             if (sh->proto != NULL) {
                 mark_func(rt, &sh->proto->header);
+            }
+            if (sh->parent != NULL) {
+                mark_func(rt, &sh->parent->header);
             }
         }
         break;
@@ -11503,6 +11516,7 @@ static JSProperty *add_property(JSContext *ctx,
             new_sh = js_clone_shape(ctx, sh);
             if (!new_sh)
                 return NULL;
+            new_sh->parent = js_dup_shape(sh);
             /* hash the cloned shape */
             new_sh->is_hashed = true;
             js_shape_hash_link(ctx->rt, new_sh);

@@ -203,12 +203,16 @@
       "sha256": "2fbc3a055f1b5a0c003d7f61bb3f95044605e9b229b365f69b1d117cdd2445a2"
     },
     {
+      "name": "0051-shape-transition-retention.patch",
+      "sha256": "1a590e7db69f1b6f848a884a0d358c25b65b7ca76b158542321bf57f58efd638"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "2adbdaf59af795cc88e74b0cd9632dffcc330333a8cf2186305b410966502f76"
     }
   ],
   "files": {
-    "quickjs.c": "36eb7c1c53d290324ca7524eeb6d87ef94d30fd007d813707aa31e1e80519fcb",
+    "quickjs.c": "65beb70456c2439acd52dd170f96f3f2feee386b28cae604f367b4168f9f3f3d",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
