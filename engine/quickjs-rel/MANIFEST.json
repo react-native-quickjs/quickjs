@@ -155,12 +155,16 @@
       "sha256": "d9a673b5baf7a531ed4cb42b51044291eec1ce66047573e3bbe41ec712f28e1c"
     },
     {
+      "name": "0039-pending-exception-wins-over-syntax-error.patch",
+      "sha256": "b1908cc455b58e11153669fabf8b852c879d55d6489b856633a3eab73a0cde3a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "2adbdaf59af795cc88e74b0cd9632dffcc330333a8cf2186305b410966502f76"
     }
   ],
   "files": {
-    "quickjs.c": "cff1fd7d06db53d1a3f54b23a4a198c75b0927eabc53412dcccb00b85415721c",
+    "quickjs.c": "add0b0a9d475d310cbdb93c35b586bbe3ffee29eb1cf3828f58e8f0429e46f9a",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",

@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning][semver].
   to write, capture, expose, or alias their argument slots.
 - Patch `0038`: avoids reifying frame-visible arguments for safe length, indexed
   access, and builtin apply patterns while preserving observable slow paths.
+- Patch `0039`: keeps a pending exception when a formal parameter fails to
+  parse, instead of replacing a stack overflow, interrupt or allocation failure
+  with a syntax error.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

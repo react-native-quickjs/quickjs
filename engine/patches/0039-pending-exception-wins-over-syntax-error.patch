@@ -1,0 +1,35 @@
+Subject: Keep A Pending Exception When A Formal Parameter Fails To Parse
+
+What this does
+  When the formal-parameter loop meets a token that is not a parameter name,
+  it first checks whether an exception is already pending and, if so, lets it
+  propagate instead of replacing it with "missing formal parameter".
+
+Why we need it
+  A stack overflow, interrupt or allocation failure raised while reading that
+  token is the real error. Overwriting it with a syntax error hides the cause
+  and makes the failure the embedder sees depend on how deep the native stack
+  happened to be when the parser was reached -- which varies with code layout
+  and target, not with anything the program did.
+
+What it adds
+  One JS_HasException() guard in the parameter loop. No opcode, bytecode or
+  API change.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -40570,6 +40570,11 @@
+                     }
+                 }
+             } else {
++                /* A pending exception (stack overflow, interrupt, OOM) set while
++                   reading this token is the real error; reporting a syntax error
++                   here would replace it and hide what actually happened. */
++                if (JS_HasException(s->ctx))
++                    goto fail;
+                 js_parse_error(s, "missing formal parameter");
+                 goto fail;
+             }

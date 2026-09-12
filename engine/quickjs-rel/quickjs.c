@@ -40570,6 +40570,11 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     }
                 }
             } else {
+                /* A pending exception (stack overflow, interrupt, OOM) set while
+                   reading this token is the real error; reporting a syntax error
+                   here would replace it and hide what actually happened. */
+                if (JS_HasException(s->ctx))
+                    goto fail;
                 js_parse_error(s, "missing formal parameter");
                 goto fail;
             }
