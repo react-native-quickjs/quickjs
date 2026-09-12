@@ -339,7 +339,30 @@ class QuickJSRuntime : public jsi::Runtime {
    * argument copies it, and every copy path takes a real reference, so a
    * borrowed wrapper cannot outlive the call that made it.
    */
-  __attribute__((always_inline)) jsi::Value borrowValue(JSValue value);
+  __attribute__((always_inline)) jsi::Value borrowValue(JSValue value) {
+    // Primitives carry no reference, so they are already borrow-shaped.
+    switch (JS_VALUE_GET_TAG(value)) {
+      case JS_TAG_UNDEFINED:
+        return jsi::Value::undefined();
+      case JS_TAG_NULL:
+        return jsi::Value::null();
+      case JS_TAG_BOOL:
+        return jsi::Value(JS_VALUE_GET_BOOL(value) != 0);
+      case JS_TAG_INT:
+        return jsi::Value(JS_VALUE_GET_INT(value));
+      case JS_TAG_FLOAT64:
+        return jsi::Value(JS_VALUE_GET_FLOAT64(value));
+      case JS_TAG_STRING:
+        return jsi::Value(make<jsi::String>(allocPointerValue(value, false)));
+      case JS_TAG_SYMBOL:
+        return jsi::Value(make<jsi::Symbol>(allocPointerValue(value, false)));
+      case JS_TAG_BIG_INT:
+      case JS_TAG_SHORT_BIG_INT:
+        return jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
+      default:
+        return jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
+    }
+  }
 
   void borrowValues(
       JSValueConst *values, size_t count, jsi::Value *destination);
