@@ -61,6 +61,15 @@ and this project adheres to [Semantic Versioning][semver].
   7.6%; a filter that keeps nothing pays about 1%, and a live result can hold
   up to 32 KB of reserved storage that its `length` does not expose. The
   sampled Octane rows are flat (8-row geomean -0.32%).
+- Patch `0047`: `OP_define_field` overwrites an object literal's existing slot
+  inline instead of re-defining it through the generic path. On-device, a
+  1-field literal is 12.1% faster, 3 fields 24.4%, 9 fields 44.7% and a literal
+  whose values are three call results 16.3%, with a constructor using `this.x =`
+  unchanged; a literal site wider than the 16-property template limit is 2.4%
+  slower, because those defines are inserts and the one extra lookup is not
+  amortised. On the sampled Octane rows the mechanism alone moves the 8-row
+  geomean +0.90% (splay +4.7%, navierstokes +2.2%) and the shipped binary
+  +1.4% to +1.6% across two runs.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

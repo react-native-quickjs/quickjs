@@ -1,0 +1,59 @@
+Subject: Overwrite Object Literal Slots Inline Instead Of Defining Them
+
+What this does
+  `OP_define_field` -- what every non-computed `key: value` in an object
+  literal compiles to -- overwrites an existing plain data property directly
+  instead of calling JS_DefinePropertyValue once per field.
+
+Why we need it
+  A literal built from a shape template arrives with every slot already present
+  as JS_UNDEFINED with flags exactly JS_PROP_C_W_E, so every store was a
+  re-define: find_own_property, the LENGTH test, check_define_prop_flags, the
+  AUTOINIT test, the getset/varref branch cluster and two
+  js_update_property_flags calls that are provably no-ops, all behind a
+  six-argument non-inlined call. `o.a = v` has an inline cache; the literal path
+  had nothing.
+
+What it adds
+  One lookup and one flag test. The overwrite happens only when the receiver is
+  an ordinary object and the atom is already an own property with exactly
+  JS_PROP_C_W_E and no TMASK bits. GETSET, VARREF and AUTOINIT keep the generic
+  path, JS_PROP_LENGTH is excluded so an Array's length is never touched here,
+  and the autoinit, flag-update and inline-cache watchpoint work the generic
+  call would do is a no-op by construction. A literal site wider than
+  JS_OBJLIT_MAX_PROPS is not templated, so its defines are inserts and the
+  lookup is not amortised: that shape measures 2-4% slower and is stated in the
+  notes.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22079,9 +22079,26 @@
+             {
+                 int ret;
+                 JSAtom atom;
++                JSObject *p;
++                JSProperty *pr;
++                JSShapeProperty *prs;
+                 atom = get_u32(pc);
+                 pc += 4;
+ 
++                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT)) {
++                    p = JS_VALUE_GET_OBJ(sp[-2]);
++                    if (likely(!p->is_exotic)) {
++                        prs = find_own_property(&pr, p, atom);
++                        if (likely(prs != NULL &&
++                                   (prs->flags & (JS_PROP_TMASK | JS_PROP_C_W_E |
++                                                  JS_PROP_LENGTH)) == JS_PROP_C_W_E)) {
++                            set_value(ctx, &pr->u.value, sp[-1]);
++                            sp--;
++                            BREAK;
++                        }
++                    }
++                }
++
+                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
+                                              JS_PROP_C_W_E | JS_PROP_THROW);
+                 sp--;

@@ -22079,8 +22079,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int ret;
                 JSAtom atom;
+                JSObject *p;
+                JSProperty *pr;
+                JSShapeProperty *prs;
                 atom = get_u32(pc);
                 pc += 4;
+
+                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT)) {
+                    p = JS_VALUE_GET_OBJ(sp[-2]);
+                    if (likely(!p->is_exotic)) {
+                        prs = find_own_property(&pr, p, atom);
+                        if (likely(prs != NULL &&
+                                   (prs->flags & (JS_PROP_TMASK | JS_PROP_C_W_E |
+                                                  JS_PROP_LENGTH)) == JS_PROP_C_W_E)) {
+                            set_value(ctx, &pr->u.value, sp[-1]);
+                            sp--;
+                            BREAK;
+                        }
+                    }
+                }
 
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
