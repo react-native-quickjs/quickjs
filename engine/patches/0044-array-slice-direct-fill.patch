@@ -1,0 +1,55 @@
+Subject: Fill Array Slice And Splice Results Directly
+
+What this does
+  When `Array.prototype.slice` -- and `splice`, which shares the same code --
+  copies a range of an ordinary dense array into an ordinary dense result, it
+  grows the result's value buffer once and fills it element by element instead
+  of defining every index through JS_CreateDataPropertyUint32Const.
+
+Why we need it
+  The define path re-derives, for every element, that the index is an append to
+  a dense array, and it cannot see that the result was just created with exactly
+  the length being filled. Copying a list to render, filter or paginate it is an
+  everyday React Native shape.
+
+What it adds
+  The fill is guarded: the result must be an ordinary extensible dense array
+  with no elements yet, an integer length equal to the count, and either enough
+  capacity or one successful grow. The whole source range must lie inside the
+  source's dense storage, so a holey or inherited tail keeps the existing
+  per-index path -- as do an array-like source, a species result that is frozen
+  or pre-filled or has a locked length, and a species that returns the source
+  itself.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -48650,9 +48650,23 @@
+     if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
+         js_is_fast_array(ctx, arr)) {
+         /* XXX: should share code with fast array constructor */
+-        for (; k < final && k < count32; k++, n++) {
+-            if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
+-                goto exception;
++        JSObject *ap = JS_VALUE_GET_OBJ(arr);
++        if (count > 0 && count <= INT32_MAX && final <= (int64_t)count32 &&
++            ap->extensible && ap->u.array.count == 0 &&
++            JS_VALUE_GET_TAG(ap->prop[0].u.value) == JS_TAG_INT &&
++            JS_VALUE_GET_INT(ap->prop[0].u.value) == count &&
++            (ap->u.array.u1.size >= (uint32_t)count ||
++             expand_fast_array(ctx, ap, count) == 0)) {
++            for (i = 0; i < (uint32_t)count; i++)
++                ap->u.array.u.values[i] = js_dup(arrp[start + i]);
++            ap->u.array.count = count;
++            n = count;
++            k = final;
++        } else {
++            for (; k < final && k < count32; k++, n++) {
++                if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
++                    goto exception;
++            }
+         }
+     }
+     /* Copy the remaining elements if any (handle case of inherited properties) */

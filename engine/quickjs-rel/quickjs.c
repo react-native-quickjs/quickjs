@@ -48650,9 +48650,23 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
     if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
         js_is_fast_array(ctx, arr)) {
         /* XXX: should share code with fast array constructor */
-        for (; k < final && k < count32; k++, n++) {
-            if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
-                goto exception;
+        JSObject *ap = JS_VALUE_GET_OBJ(arr);
+        if (count > 0 && count <= INT32_MAX && final <= (int64_t)count32 &&
+            ap->extensible && ap->u.array.count == 0 &&
+            JS_VALUE_GET_TAG(ap->prop[0].u.value) == JS_TAG_INT &&
+            JS_VALUE_GET_INT(ap->prop[0].u.value) == count &&
+            (ap->u.array.u1.size >= (uint32_t)count ||
+             expand_fast_array(ctx, ap, count) == 0)) {
+            for (i = 0; i < (uint32_t)count; i++)
+                ap->u.array.u.values[i] = js_dup(arrp[start + i]);
+            ap->u.array.count = count;
+            n = count;
+            k = final;
+        } else {
+            for (; k < final && k < count32; k++, n++) {
+                if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
+                    goto exception;
+            }
         }
     }
     /* Copy the remaining elements if any (handle case of inherited properties) */
