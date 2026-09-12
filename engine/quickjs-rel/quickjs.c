@@ -47794,6 +47794,24 @@ exception:
 #define special_filter   4
 #define special_TA       8
 
+#define JS_FILTER_RESERVE_MAX 4096
+
+static void js_filter_reserve(JSContext *ctx, JSValueConst ret, int64_t len)
+{
+    JSObject *p;
+    int64_t cap;
+
+    if (JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(ret);
+    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || !p->extensible ||
+        p->holey || p->u.array.count != 0)
+        return;
+    cap = len < JS_FILTER_RESERVE_MAX ? len : JS_FILTER_RESERVE_MAX;
+    if (cap > 0 && p->u.array.u1.size < (uint32_t)cap)
+        expand_fast_array(ctx, p, (uint32_t)cap);
+}
+
 static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val)
 {
     JSObject *p;
@@ -47882,6 +47900,7 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
         ret = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
         if (JS_IsException(ret))
             goto exception;
+        js_filter_reserve(ctx, ret, len);
         break;
     case special_map | special_TA:
         args[0] = obj;
