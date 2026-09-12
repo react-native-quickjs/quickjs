@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog][keep-a-changelog],
 and this project adheres to [Semantic Versioning][semver].
 
+## [Unreleased]
+
+### Changed
+- Patch `0034`: dispatches interpreter-issued calls directly to supported
+  native functions while retaining the existing fallback for other callables.
+- Patch `0035`: copies eligible dense array spreads directly into the
+  accumulator while preserving iterator semantics for unsupported arrays.
+- Patch `0036`: forwards unchanged dense mapped arguments directly from their
+  live parameter slots during apply, with the existing generic fallback.
+- Patch `0037`: avoids copying complete argument arrays for callees proven not
+  to write, capture, expose, or alias their argument slots.
+- Patch `0038`: avoids reifying frame-visible arguments for safe length, indexed
+  access, and builtin apply patterns while preserving observable slow paths.
+- Host-function calls now build only the arguments actually passed, instead of
+  materialising all eight inline slots, and the QuickJS value conversion is
+  inlined into the argument loop. Measured against the same branch without this
+  change, on-device release builds are 22–44% cheaper across arities 0, 1, 4 and
+  8 and for string- and object-backed arguments, with direct native and
+  JavaScript call controls unchanged.
+
+### Added
+- A JSI host-call benchmark in the example app, and a class-call row (the shape
+  a host function presents to the engine) in the `calls` benchmark suite.
+
 ## [v1.0.0-alpha.3] — 2026-09-10
 
 ### Added
@@ -95,16 +119,6 @@ and this project adheres to [Semantic Versioning][semver].
 - Patch `0033`: defers interning non-constant bytecode atoms until they are
   first referenced, while preserving eager validation of their serialized
   lengths and boundaries.
-- Patch `0034`: dispatches interpreter-issued calls directly to supported
-  native functions while retaining the existing fallback for other callables.
-- Patch `0035`: copies eligible dense array spreads directly into the
-  accumulator while preserving iterator semantics for unsupported arrays.
-- Patch `0036`: forwards unchanged dense mapped arguments directly from their
-  live parameter slots during apply, with the existing generic fallback.
-- Patch `0037`: avoids copying complete argument arrays for callees proven not
-  to write, capture, expose, or alias their argument slots.
-- Patch `0038`: avoids reifying frame-visible arguments for safe length, indexed
-  access, and builtin apply patterns while preserving observable slow paths.
 - The React Native runtime integration enables copied lazy loading; it is an
   integration change layered on top of patches `0031`–`0033`, not part of
   patch `0031` itself.
