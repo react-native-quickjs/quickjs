@@ -2,7 +2,7 @@ import { FeedItem, accounts } from './data';
 
 export const formatMinutes = (minutes: number) => `${minutes} min read`;
 export const formatScore = (score: number) => `${score}% match`;
-export const formatCount = (count: number) => count.toLocaleString('en-US');
+export const formatCount = (count: number) => String(count);
 
 export function selectRecommended(items: FeedItem[]) {
   return items.filter(item => item.score >= 80).sort((a, b) => b.score - a.score);

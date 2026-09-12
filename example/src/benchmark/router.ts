@@ -1,6 +1,6 @@
 import React from 'react';
 
-export type Route = 'dashboard' | 'feed' | 'search' | 'article' | 'profile' | 'settings' | 'editProfile' | 'notifications' | 'saved' | 'analytics' | 'help' | 'orders' | 'orderDetails' | 'messages' | 'messageDetails' | 'security' | 'preferences';
+export type Route = 'dashboard' | 'feed' | 'search' | 'article' | 'profile' | 'settings' | 'editProfile' | 'notifications' | 'saved' | 'analytics' | 'help' | 'orders' | 'orderDetails' | 'messages' | 'messageDetails' | 'security' | 'preferences' | 'jsiBenchmark';
 type Screen = React.ComponentType<any>;
 
 // These static factories keep every screen discoverable to Metro while avoiding
@@ -23,4 +23,5 @@ export const screenFactories: Record<Route, () => Screen> = {
   messageDetails: () => require('./screens/MessageDetailsScreen').default,
   security: () => require('./screens/SecurityScreen').default,
   preferences: () => require('./screens/PreferencesScreen').default,
+  jsiBenchmark: () => require('./screens/JsiBenchmarkScreen').default,
 };

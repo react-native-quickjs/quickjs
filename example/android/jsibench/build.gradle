@@ -1,0 +1,31 @@
+apply plugin: "com.android.library"
+
+android {
+    namespace "com.reactnativequickjs.jsibench"
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion rootProject.ext.ndkVersion
+
+    defaultConfig {
+        minSdk rootProject.ext.minSdkVersion
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
+    buildFeatures {
+        prefab true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file("src/main/cpp/CMakeLists.txt")
+            version "3.22.1"
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+}
