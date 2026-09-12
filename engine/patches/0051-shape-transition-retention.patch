@@ -1,0 +1,92 @@
+Subject: Retain A Shape's Predecessor So Transitions Survive
+
+What this does
+  `JSShape` gains `parent`, a strong reference to the shape it was cloned from,
+  set by `add_property`'s clone arm and released with the shape. A construction
+  path that was walked once can then be resolved from the transition table
+  instead of being cloned again.
+
+Why we need it
+  A construction path arrives at a new shape by cloning the shape it extends,
+  and records that transition under the successor. The predecessor was reachable
+  only from the same table, which holds no reference, so it died with its last
+  object and every later object on the same path paid the clone again.
+
+What it adds
+  One pointer per shape, marked and released with the shape. The parent graph is
+  acyclic by construction -- a parent always existed before its child -- so the
+  release recurses along a bounded chain. MEASURED on-device, shape clones per
+  Octane run: typescript 7,017,436 -> 29,514 (238x), while the other seven rows
+  are unchanged (splay 65, pdfjs 7,586, deltablue 149, richards 103, crypto 161,
+  gbemu 621, navierstokes 61). Score, same-binary over six runs: typescript
+  +4.55% (7,971 -> 8,334, the two arms not overlapping); 8-row geomean +0.40%.
+
+  COST, stated because it is the opposite of the source patch's claim that peak
+  heap goes down: retaining predecessors keeps them allocated, so on typescript
+  the live shapes go 1,252 -> 3,283 and shape bytes 295,024 -> 2,005,472
+  (+1.7 MB, +580%), making total malloc 4.93 MB -> 6.66 MB (+35%) on that row. A
+  workload that creates and drops shapes measures +0.2%, and the other seven
+  rows clone nothing extra, so the cost is confined to the clone-heavy workloads
+  that also gain.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1337,6 +1337,7 @@
+     int prop_count; /* include deleted properties */
+     int deleted_prop_count;
+     JSShape *shape_hash_next; /* in JSRuntime.shape_hash[h] list */
++    JSShape *parent; /* strong reference to the shape this one was derived from */
+     JSObject *proto;
+     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
+ };
+@@ -6441,6 +6442,7 @@
+     sh->prop_count = 0;
+     sh->deleted_prop_count = 0;
+     sh->is_hashed = false;
++    sh->parent = NULL;
+     return sh;
+ }
+ 
+@@ -6528,6 +6530,7 @@
+     JS_REF_COUNT(sh) = 1;
+     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
+     sh->is_hashed = false;
++    sh->parent = NULL;
+     if (sh->proto) {
+         js_dup(JS_MKPTR(JS_TAG_OBJECT, sh->proto));
+     }
+@@ -6561,6 +6564,13 @@
+         pr++;
+     }
+     remove_gc_object(&sh->header);
++    {
++        JSShape *parent = sh->parent;
++
++        sh->parent = NULL;
++        if (parent)
++            js_free_shape(rt, parent);
++    }
+     js_free_rt(rt, get_alloc_from_shape(sh));
+ }
+ 
+@@ -8569,6 +8579,9 @@
+             JSShape *sh = (JSShape *)gp;
+             if (sh->proto != NULL) {
+                 mark_func(rt, &sh->proto->header);
++            }
++            if (sh->parent != NULL) {
++                mark_func(rt, &sh->parent->header);
+             }
+         }
+         break;
+@@ -11503,6 +11516,7 @@
+             new_sh = js_clone_shape(ctx, sh);
+             if (!new_sh)
+                 return NULL;
++            new_sh->parent = js_dup_shape(sh);
+             /* hash the cloned shape */
+             new_sh->is_hashed = true;
+             js_shape_hash_link(ctx->rt, new_sh);

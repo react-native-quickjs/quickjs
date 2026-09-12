@@ -61,6 +61,7 @@ what we changed and why without opening a single `.patch` file.
 | `0048` | Initializes a templated object literal's slots in place | The template path staged a 16-slot `JSProperty` array on the stack for the allocator to copy into the new object, so every slot was written twice and read once on the path every object literal takes | - | No |
 | `0049` | Builds a closure from a cached per-realm shape, in one allocation | Every closure of a kind ends at the identical shape, so the two or three defines rebuilt that same shape per function object: a shape-hash lookup, a refcount swap, an atom dup and a property-array realloc for the third property | - | No |
 | `0050` | Carves a small property array out of the object's own allocation | Every object was two allocations and two frees; an inline property array costs no second block header and no separate free, which every object literal, closure and for-in iterator pays | - | No |
+| `0051` | Retains a shape's predecessor so the transition that produced it survives | The predecessor was reachable only from the transition table, which holds no reference, so it died with its last object and every later object on the same construction path cloned the successor again | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

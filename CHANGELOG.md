@@ -96,6 +96,18 @@ and this project adheres to [Semantic Versioning][semver].
   area measured +11.8% total heap for the same speed. The sampled Octane rows
   move +1.54% geomean same-binary (splay +10.7%) and +0.24% shipped (splay
   +9.7%).
+- Patch `0051`: a shape keeps a strong reference to the shape it was cloned
+  from, so a construction path that was already walked once is resolved from the
+  transition table instead of being cloned again. Shape clones per Octane run:
+  typescript 7,017,436 -> 29,514 (238x), with the other seven rows unchanged.
+  Score, same-binary over six runs: typescript +4.55% (7,971 -> 8,334, the arms
+  not overlapping) and 8-row geomean +0.40%; shipped, typescript +3.70% and
+  geomean +1.21%. Unlike the patches above it, this one costs memory where it
+  gains: retained predecessors stay allocated, so typescript's shape bytes go
+  295,024 -> 2,005,472 (+1.7 MB, +580%) and its total malloc 4.93 MB -> 6.66 MB
+  (+35%). A workload that creates and drops shapes measures +0.2%, and the other
+  seven rows clone nothing extra, so the cost is confined to the clone-heavy
+  workloads that also gain.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
