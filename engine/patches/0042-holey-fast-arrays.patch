@@ -1,0 +1,443 @@
+Subject: Represent Array Holes Instead Of Demoting To A Property Table
+
+What this does
+  A fast array keeps its dense JSValue vector when an index is skipped or
+  deleted: the skipped slots hold JS_TAG_UNINITIALIZED and the object tracks
+  how many.  A gap store that would allocate too much vector, or a store from
+  a non-C_W_E descriptor, still demotes exactly as before.
+
+Why we need it
+  Upstream abandons the fast representation permanently the first time a store
+  lands past the end, so Array(n), a reverse fill, a row-offset matrix or a
+  delete turns every later access into a property-table lookup.
+
+What it adds
+  One flag bit and one uint32 inside padding the union already had, so
+  sizeof(JSObject) is unchanged and a static assert pins that.  Absence is
+  reported through the read funnel, own-property lookups, key lists, argument
+  lists and element copies; holes are skipped when demoting, so a delete is
+  not resurrected as undefined.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1349,6 +1349,7 @@
+     uint8_t free_mark : 1; /* only used when freeing objects with cycles */
+     uint8_t is_exotic : 1; /* true if object has exotic property handlers */
+     uint8_t fast_array : 1; /* true if u.array is used for get/put (for JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS, JS_CLASS_MAPPED_ARGUMENTS and typed arrays) */
++    uint8_t holey : 1;
+     uint8_t is_constructor : 1; /* true if object is a constructor function */
+     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
+     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
+@@ -1418,13 +1419,17 @@
+                 double *double_ptr;     /* JS_CLASS_FLOAT64_ARRAY */
+             } u;
+             uint32_t count; /* <= 2^31-1. 0 for a detached typed array */
+-        } array;    /* 12/20 bytes */
++            uint32_t hole_count; /* JS_CLASS_ARRAY only, valid while p->holey */
++        } array;    /* 16/24 bytes */
+         JSRegExp regexp;    /* JS_CLASS_REGEXP: 8/16 bytes */
+         JSValue object_data;    /* for JS_SetObjectData(): 8/16/16 bytes */
+     } u;
+     /* byte sizes: 40/48/72 */
+ };
+ 
++_Static_assert(sizeof(((JSObject *)0)->u.array) <= sizeof(((JSObject *)0)->u.func),
++               "u.array outgrew u.func");
++
+ typedef struct JSCallSiteData {
+     JSValue filename;
+     JSValue func;
+@@ -3198,6 +3203,11 @@
+     JS_FreeValue(ctx, old_val);
+ }
+ 
++static inline bool js_array_slot_is_hole(JSValueConst v)
++{
++    return JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED;
++}
++
+ void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
+ {
+     assert(class_id < ctx->rt->class_count);
+@@ -7218,6 +7228,7 @@
+     p->free_mark = 0;
+     p->is_exotic = 0;
+     p->fast_array = 0;
++    p->holey = 0;
+     p->is_constructor = 0;
+     p->is_uncatchable_error = 0;
+     p->tmp_mark = 0;
+@@ -7251,6 +7262,7 @@
+             p->fast_array = 1;
+             p->u.array.u.values = NULL;
+             p->u.array.count = 0;
++            p->u.array.hole_count = 0;
+             p->u.array.u1.size = 0;
+             if (!props) {
+                 /* XXX: remove */
+@@ -10415,7 +10427,9 @@
+             if (p->fast_array) {
+                 if (__JS_AtomIsTaggedInt(prop)) {
+                     uint32_t idx = __JS_AtomToUInt32(prop);
+-                    if (idx < p->u.array.count) {
++                    if (idx < p->u.array.count &&
++                        !(p->holey &&
++                          js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                         /* we avoid duplicating the code */
+                         return JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
+                     } else if (is_typed_array(p->class_id)) {
+@@ -10787,6 +10801,8 @@
+         if (p->fast_array) {
+             if (flags & JS_GPN_STRING_MASK) {
+                 num_keys_count += p->u.array.count;
++                if (unlikely(p->holey))
++                    num_keys_count -= p->u.array.hole_count;
+             }
+         } else if (p->class_id == JS_CLASS_STRING) {
+             if (flags & JS_GPN_STRING_MASK) {
+@@ -10868,7 +10884,21 @@
+         if (p->fast_array) {
+             if (flags & JS_GPN_STRING_MASK) {
+                 len = p->u.array.count;
+-                goto add_array_keys;
++                if (unlikely(p->holey)) {
++                    for(i = 0; i < len; i++) {
++                        if (js_array_slot_is_hole(p->u.array.u.values[i]))
++                            continue;
++                        tab_atom[num_index].atom = __JS_AtomFromUInt32(i);
++                        if (tab_atom[num_index].atom == JS_ATOM_NULL) {
++                            js_free_prop_enum(ctx, tab_atom, num_index);
++                            return -1;
++                        }
++                        tab_atom[num_index].is_enumerable = true;
++                        num_index++;
++                    }
++                } else {
++                    goto add_array_keys;
++                }
+             }
+         } else if (p->class_id == JS_CLASS_STRING) {
+             if (flags & JS_GPN_STRING_MASK) {
+@@ -10998,7 +11028,9 @@
+             if (__JS_AtomIsTaggedInt(prop)) {
+                 uint32_t idx;
+                 idx = __JS_AtomToUInt32(prop);
+-                if (idx < p->u.array.count) {
++                if (idx < p->u.array.count &&
++                    !(p->holey &&
++                      js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                     if (desc) {
+                         desc->flags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
+                             JS_PROP_CONFIGURABLE;
+@@ -11183,6 +11215,18 @@
+ {
+     switch(p->class_id) {
+     case JS_CLASS_ARRAY:
++        {
++            JSValue v;
++            if (unlikely(idx >= p->u.array.count)) return false;
++            v = p->u.array.u.values[idx];
++            if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED))
++                return false;
++            if (js_lazy_marker_is(v))
++                *pval = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
++            else
++                *pval = js_dup(v);
++            return true;
++        }
+     case JS_CLASS_ARGUMENTS:
+         if (unlikely(idx >= p->u.array.count)) return false;
+         if (js_lazy_marker_is(p->u.array.u.values[idx]))
+@@ -11451,17 +11495,22 @@
+     } else {
+         JSValue *tab = p->u.array.u.values;
+         for(i = 0; i < len; i++) {
++            JSValue v = *tab++;
++            if (unlikely(js_array_slot_is_hole(v)))
++                continue;
+             /* add_property cannot fail here but
+                __JS_AtomFromUInt32(i) fails for i > INT32_MAX */
+             pr = add_property(ctx, p, __JS_AtomFromUInt32(i), JS_PROP_C_W_E);
+-            pr->u.value = *tab++;
++            pr->u.value = v;
+         }
+     }
+     js_free(ctx, p->u.array.u.values);
+     p->u.array.count = 0;
++    p->u.array.hole_count = 0;
+     p->u.array.u.values = NULL; /* fail safe */
+     p->u.array.u1.size = 0;
+     p->fast_array = 0;
++    p->holey = 0;
+     return 0;
+ }
+ 
+@@ -11529,8 +11578,20 @@
+             uint32_t idx;
+             if (JS_AtomIsArrayIndex(ctx, &idx, atom) &&
+                 idx < p->u.array.count) {
+-                if (p->class_id == JS_CLASS_ARRAY ||
+-                    p->class_id == JS_CLASS_ARGUMENTS ||
++                if (p->class_id == JS_CLASS_ARRAY) {
++                    JSValue v = p->u.array.u.values[idx];
++                    if (js_array_slot_is_hole(v))
++                        return true;              /* already absent */
++                    p->u.array.u.values[idx] = JS_UNINITIALIZED;
++                    if (!p->holey) {
++                        p->holey = 1;
++                        p->u.array.hole_count = 0;
++                    }
++                    p->u.array.hole_count++;
++                    JS_FreeValue(ctx, v);
++                    return true;
++                }
++                if (p->class_id == JS_CLASS_ARGUMENTS ||
+                     p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
+                     if (convert_fast_array_to_array(ctx, p))
+                         return -1;
+@@ -11594,6 +11655,11 @@
+         uint32_t old_len = p->u.array.count;
+         if (len < old_len) {
+             for(i = len; i < old_len; i++) {
++                if (unlikely(p->holey) &&
++                    js_array_slot_is_hole(p->u.array.u.values[i])) {
++                    if (--p->u.array.hole_count == 0)
++                        p->holey = 0;
++                }
+                 JS_FreeValue(ctx, p->u.array.u.values[i]);
+                 p->u.array.u.values[i] = JS_UNDEFINED;
+             }
+@@ -11723,6 +11789,88 @@
+     p->u.array.u.values[new_len - 1] = val;
+     p->u.array.count = new_len;
+     return true;
++}
++
++
++#define JS_ARRAY_HOLE_MAX_GAP     256
++#define JS_ARRAY_HOLE_DENSE_FLOOR 256
++#define JS_ARRAY_HOLE_MIN_DENSITY 4
++
++static inline bool js_array_can_fill_hole_fast(JSContext *ctx, JSObject *p)
++{
++    return p->extensible &&
++        p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
++        ctx->std_array_prototype;
++}
++
++static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
++                                   JSValue val)
++{
++    uint32_t count, gap, new_count, elems, array_len, i;
++
++    count = p->u.array.count;
++    gap = idx - count;
++    if (gap > JS_ARRAY_HOLE_MAX_GAP)
++        return 0;
++    if (idx >= (uint32_t)INT32_MAX)
++        return 0;
++    new_count = idx + 1;
++    elems = new_count - ((p->holey ? p->u.array.hole_count : 0) + gap);
++    if (new_count > JS_ARRAY_HOLE_DENSE_FLOOR &&
++        elems * (uint64_t)JS_ARRAY_HOLE_MIN_DENSITY < new_count)
++        return 0;
++    if (unlikely(JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT))
++        return 0;
++    array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
++    if (new_count > array_len &&
++        unlikely(!(get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE)))
++        return 0;
++    if (new_count > p->u.array.u1.size) {
++        if (expand_fast_array(ctx, p, new_count)) {
++            JS_FreeValue(ctx, val);
++            return -1;
++        }
++    }
++    for (i = count; i < idx; i++)
++        p->u.array.u.values[i] = JS_UNINITIALIZED;
++    p->u.array.u.values[idx] = val;
++    p->u.array.count = new_count;
++    if (new_count > array_len)
++        p->prop[0].u.value = js_int32(new_count);
++    if (!p->holey) {
++        p->holey = 1;
++        p->u.array.hole_count = 0;
++    }
++    p->u.array.hole_count += gap;
++    return 1;
++}
++
++static void js_array_fill_hole(JSObject *p, uint32_t idx, JSValue val)
++{
++    assert(p->holey && js_array_slot_is_hole(p->u.array.u.values[idx]));
++    p->u.array.u.values[idx] = val;
++    if (--p->u.array.hole_count == 0)
++        p->holey = 0;
++}
++
++static bool js_array_try_repack(JSObject *p)
++{
++    uint32_t i, count, holes;
++
++    if (p->u.array.hole_count == 0) {   /* kept exact; this is the usual exit */
++        p->holey = 0;
++        return true;
++    }
++    count = p->u.array.count;
++    holes = 0;
++    for (i = 0; i < count; i++)
++        holes += js_array_slot_is_hole(p->u.array.u.values[i]);
++    p->u.array.hole_count = holes;
++    if (holes == 0) {
++        p->holey = 0;
++        return true;
++    }
++    return false;
+ }
+ 
+ /* Allocate a new fast array initialized to JS_UNDEFINED. Its maximum
+@@ -11835,7 +11983,9 @@
+             if (p1->fast_array) {
+                 if (__JS_AtomIsTaggedInt(prop)) {
+                     uint32_t idx = __JS_AtomToUInt32(prop);
+-                    if (idx < p1->u.array.count) {
++                    if (idx < p1->u.array.count &&
++                        !(p1->holey &&
++                          js_array_slot_is_hole(p1->u.array.u.values[idx]))) {
+                         if (unlikely(p == p1))
+                             return JS_SetPropertyValue(ctx, this_obj, js_int32(idx), val, flags);
+                         else
+@@ -12065,6 +12215,13 @@
+                 /* add element */
+                 return add_fast_array_element(ctx, p, val, flags);
+             }
++            if (unlikely(p->holey) &&
++                js_array_slot_is_hole(p->u.array.u.values[idx])) {
++                if (unlikely(!js_array_can_fill_hole_fast(ctx, p)))
++                    goto slow_path;
++                js_array_fill_hole(p, idx, val);
++                break;
++            }
+             set_value(ctx, &p->u.array.u.values[idx], val);
+             break;
+         case JS_CLASS_ARGUMENTS:
+@@ -12274,6 +12431,24 @@
+                         return add_fast_array_element(ctx, p,
+                                                       js_dup(val), flags);
+                     } else {
++                        if (!p->extensible)
++                            goto not_extensible;
++                        if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET))
++                            goto convert_to_array;
++                        if (get_prop_flags(flags, 0) != JS_PROP_C_W_E)
++                            goto convert_to_array;
++                        if (idx < p->u.array.count) {
++                            assert(p->holey &&
++                                   js_array_slot_is_hole(p->u.array.u.values[idx]));
++                            js_array_fill_hole(p, idx, js_dup(val));
++                            return true;
++                        }
++                        ret = js_array_store_hole_gap(ctx, p, idx,
++                                                      js_dup(val));
++                        if (ret < 0)
++                            return -1;
++                        if (ret > 0)
++                            return true;
+                         goto convert_to_array;
+                     }
+                 } else if (JS_AtomIsArrayIndex(ctx, &idx, prop)) {
+@@ -12649,7 +12824,9 @@
+         if (p->class_id == JS_CLASS_ARRAY) {
+             if (__JS_AtomIsTaggedInt(prop)) {
+                 idx = __JS_AtomToUInt32(prop);
+-                if (idx < p->u.array.count) {
++                if (idx < p->u.array.count &&
++                    !(p->holey &&
++                      js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                     prop_flags = get_prop_flags(flags, JS_PROP_C_W_E);
+                     if (prop_flags != JS_PROP_C_W_E)
+                         goto convert_to_slow_array;
+@@ -18668,13 +18845,14 @@
+     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+         JSObject *p = JS_VALUE_GET_OBJ(obj);
+         if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
++            if (unlikely(p->holey) && !js_array_try_repack(p))
++                return false;
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+-/* Access an Array's internal JSValue array if available */
+ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
+                               JSValue **arrpp, uint32_t *countp)
+ {
+@@ -18682,6 +18860,8 @@
+     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+         JSObject *p = JS_VALUE_GET_OBJ(obj);
+         if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
++            if (unlikely(p->holey) && !js_array_try_repack(p))
++                return false;
+             *countp = p->u.array.count;
+             *arrpp = p->u.array.u.values;
+             return true;
+@@ -22024,7 +22204,8 @@
+                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
+                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
+                     if (likely(p->class_id == JS_CLASS_ARRAY &&
+-                               idx < p->u.array.count)) {
++                               idx < p->u.array.count &&
++                               !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                         if (js_lazy_marker_is(p->u.array.u.values[idx]))
+                             val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+                         else
+@@ -22061,7 +22242,8 @@
+                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
+                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
+                     if (likely(p->class_id == JS_CLASS_ARRAY &&
+-                               idx < p->u.array.count)) {
++                               idx < p->u.array.count &&
++                               !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                         if (js_lazy_marker_is(p->u.array.u.values[idx]))
+                             sp[-1] = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+                         else
+@@ -22135,7 +22317,8 @@
+                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
+                         p = JS_VALUE_GET_OBJ(sp[-3]);
+                         if (likely(p->class_id == JS_CLASS_ARRAY &&
+-                                   idx < (uint32_t)p->u.array.count)) {
++                                   idx < (uint32_t)p->u.array.count &&
++                                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                             set_value(ctx, &p->u.array.u.values[idx], val);
+                             JS_FreeValue(ctx, sp[-3]);
+                             sp -= 3;
+@@ -46530,6 +46713,7 @@
+     p = JS_VALUE_GET_OBJ(array_arg);
+     if ((p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) &&
+         p->fast_array &&
++        !p->holey &&
+         len == p->u.array.count) {
+         for(i = 0; i < len; i++) {
+             tab[i] = js_dup(p->u.array.u.values[i]);
+@@ -47058,7 +47242,7 @@
+     p = NULL;
+     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+         p = JS_VALUE_GET_OBJ(obj);
+-        if (p->class_id != JS_CLASS_ARRAY || !p->fast_array) {
++        if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || p->holey) {
+             p = NULL;
+         }
+     }
+@@ -47071,7 +47255,7 @@
+             from = from_pos + i;
+             to = to_pos + i;
+         }
+-        if (p && p->fast_array &&
++        if (p && p->fast_array && !p->holey &&
+             from >= 0 && from < (len = p->u.array.count)  &&
+             to >= 0 && to < len) {
+             int64_t l, j;
