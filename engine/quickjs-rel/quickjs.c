@@ -1340,6 +1340,12 @@ struct JSShape {
     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
 };
 
+typedef struct JSArrayIteratorData {
+    JSValue obj;
+    JSIteratorKindEnum kind;
+    uint32_t idx;
+} JSArrayIteratorData;
+
 struct JSObject {
     /* ref_count/gc_obj_type/mark live in the allocator block header; the object
        body keeps only the GC list link plus the object's own flags. */
@@ -1371,7 +1377,7 @@ struct JSObject {
         struct JSTypedArray *typed_array; /* JS_CLASS_UINT8C_ARRAY..JS_CLASS_DATAVIEW */
         struct JSMapState *map_state;   /* JS_CLASS_MAP..JS_CLASS_WEAKSET */
         struct JSMapIteratorData *map_iterator_data; /* JS_CLASS_MAP_ITERATOR, JS_CLASS_SET_ITERATOR */
-        struct JSArrayIteratorData *array_iterator_data; /* JS_CLASS_ARRAY_ITERATOR, JS_CLASS_STRING_ITERATOR */
+        JSArrayIteratorData array_iterator_data; /* JS_CLASS_ARRAY_ITERATOR, JS_CLASS_STRING_ITERATOR */
         struct JSRegExpStringIteratorData *regexp_string_iterator_data; /* JS_CLASS_REGEXP_STRING_ITERATOR */
         struct JSGeneratorData *generator_data; /* JS_CLASS_GENERATOR */
         struct JSIteratorConcatData *iterator_concat_data; /* JS_CLASS_ITERATOR_CONCAT */
@@ -9027,8 +9033,9 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         case JS_CLASS_WEAKSET:           /* u.map_state */
         case JS_CLASS_MAP_ITERATOR:      /* u.map_iterator_data */
         case JS_CLASS_SET_ITERATOR:      /* u.map_iterator_data */
-        case JS_CLASS_ARRAY_ITERATOR:    /* u.array_iterator_data */
-        case JS_CLASS_STRING_ITERATOR:   /* u.array_iterator_data */
+        case JS_CLASS_ARRAY_ITERATOR:    /* u.array_iterator_data, stored inline */
+        case JS_CLASS_STRING_ITERATOR:   /* no separate block to account for */
+            break;
         case JS_CLASS_PROXY:             /* u.proxy_data */
         case JS_CLASS_PROMISE:           /* u.promise_data */
         case JS_CLASS_PROMISE_RESOLVE_FUNCTION:  /* u.promise_function_data */
@@ -49121,30 +49128,20 @@ exception:
     return ret;
 }
 
-typedef struct JSArrayIteratorData {
-    JSValue obj;
-    JSIteratorKindEnum kind;
-    uint32_t idx;
-} JSArrayIteratorData;
-
 static void js_array_iterator_finalizer(JSRuntime *rt, JSValueConst val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
-    JSArrayIteratorData *it = p->u.array_iterator_data;
-    if (it) {
-        JS_FreeValueRT(rt, it->obj);
-        js_free_rt(rt, it);
-    }
+    JSArrayIteratorData *it = &p->u.array_iterator_data;
+    JS_FreeValueRT(rt, it->obj);
+    it->obj = JS_UNDEFINED;
 }
 
 static void js_array_iterator_mark(JSRuntime *rt, JSValueConst val,
                                    JS_MarkFunc *mark_func)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
-    JSArrayIteratorData *it = p->u.array_iterator_data;
-    if (it) {
-        JS_MarkValue(rt, it->obj, mark_func);
-    }
+    JSArrayIteratorData *it = &p->u.array_iterator_data;
+    JS_MarkValue(rt, it->obj, mark_func);
 }
 
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab)
@@ -49193,16 +49190,11 @@ static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
     enum_obj = JS_NewObjectClass(ctx, class_id);
     if (JS_IsException(enum_obj))
         goto fail;
-    it = js_malloc(ctx, sizeof(*it));
-    if (!it)
-        goto fail1;
+    it = &JS_VALUE_GET_OBJ(enum_obj)->u.array_iterator_data;
     it->obj = arr;
     it->kind = kind;
     it->idx = 0;
-    JS_SetOpaqueInternal(enum_obj, it);
     return enum_obj;
- fail1:
-    JS_FreeValue(ctx, enum_obj);
  fail:
     JS_FreeValue(ctx, arr);
     return JS_EXCEPTION;
@@ -49217,11 +49209,43 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
     JSValue val, obj;
     JSObject *p;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ARRAY_ITERATOR);
+    if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT &&
+               JS_VALUE_GET_OBJ(this_val)->class_id == JS_CLASS_ARRAY_ITERATOR)) {
+        it = &JS_VALUE_GET_OBJ(this_val)->u.array_iterator_data;
+    } else {
+        it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ARRAY_ITERATOR);
+    }
     if (!it)
         goto fail1;
     if (JS_IsUndefined(it->obj))
         goto done;
+    {
+        JSObject *ap = JS_VALUE_GET_OBJ(it->obj);
+        if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array &&
+                   !ap->holey && it->idx < ap->u.array.count)) {
+            uint32_t i2 = it->idx;
+            it->idx = i2 + 1;
+            *pdone = false;
+            if (it->kind == JS_ITERATOR_KIND_KEY)
+                return js_uint32(i2);
+            if (js_lazy_marker_is(ap->u.array.u.values[i2]))
+                val = js_lazy_materialize_slot(ctx, &ap->u.array.u.values[i2], ap);
+            else
+                val = js_dup(ap->u.array.u.values[i2]);
+            if (it->kind == JS_ITERATOR_KIND_VALUE)
+                return val;
+            {
+                JSValueConst args2[2];
+                JSValue num2 = js_uint32(i2);
+                args2[0] = num2;
+                args2[1] = val;
+                obj = js_create_array(ctx, 2, args2);
+                JS_FreeValue(ctx, val);
+                JS_FreeValue(ctx, num2);
+                return obj;
+            }
+        }
+    }
     p = JS_VALUE_GET_OBJ(it->obj);
     if (is_typed_array(p->class_id)) {
         if (typed_array_is_oob(p)) {
@@ -52657,7 +52681,12 @@ static JSValue js_string_iterator_next(JSContext *ctx, JSValueConst this_val,
     uint32_t idx, c, start;
     JSString *p;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_STRING_ITERATOR);
+    if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT &&
+               JS_VALUE_GET_OBJ(this_val)->class_id == JS_CLASS_STRING_ITERATOR)) {
+        it = &JS_VALUE_GET_OBJ(this_val)->u.array_iterator_data;
+    } else {
+        it = JS_GetOpaque2(ctx, this_val, JS_CLASS_STRING_ITERATOR);
+    }
     if (!it) {
         *pdone = false;
         return JS_EXCEPTION;

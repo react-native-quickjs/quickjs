@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning][semver].
   whose element accesses previously landed on a demoted array; the other
   sampled rows are flat (8-row geomean +5.3%). Filling from index 2 is 52.8%
   faster and deleting every other element 17.7%; a reverse fill is unchanged.
+- Patch `0043`: steps array iterators from the dense storage instead of
+  re-reading `length` and the element with two property gets, and stores the
+  iterator record inline instead of in its own allocation. On-device `for...of`
+  over an array is 33.3% faster, array destructuring 11.1%, `.values()` 8.1%,
+  `.entries()` 6.9% and `.keys()` 4.9%, with an indexed loop unchanged; each
+  live iterator also costs one fewer malloc and 32 bytes. The sampled Octane
+  rows are flat (10-row geomean -0.27%), because those rows iterate with
+  indexed loops rather than `for...of`.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
