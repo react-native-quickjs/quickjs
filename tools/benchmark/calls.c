@@ -50,6 +50,20 @@ static JSValue c_gen_magic(
   (void)magic;
   return JS_UNDEFINED;
 }
+/* A class-call object: the shape a JSI HostFunction presents to the engine.
+   Reaches the same js_call_c_function_fast() dispatch as c0..c8, but invokes
+   the class call slot directly instead of js_call_c_function(). */
+static JSValue c_class_call(
+    JSContext *ctx, JSValueConst func_obj, JSValueConst this_val, int argc,
+    JSValueConst *argv, int flags) {
+  (void)ctx;
+  (void)func_obj;
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  (void)flags;
+  return JS_UNDEFINED;
+}
 static JSValue c_data(
     JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv, int magic,
     JSValue *data) {
@@ -169,7 +183,8 @@ static const char *KNOWN[] = {
     "ret_strnew",  "ret_obj",   "arg_int",  "arg_dbl",    "arg_str",
     "apply1",      "apply4",    "apply8",   "jsapply4",   "spread0",
     "spread1",     "spread4",   "spread8",  "applyargs4", "applygen4",
-    "applyacc4",   "jsspread4", NULL};
+    "applyacc4",   "jsspread4", "cc0",      "cc1",        "cc2",
+    "cc4",         "cc8",       NULL};
 
 static int is_known(const char *n) {
   for (int i = 0; KNOWN[i]; i++)
@@ -228,6 +243,20 @@ int main(int argc, char **argv) {
       ctx, g, "c4", JS_NewCFunction2(ctx, c_gen, "c4", 4, JS_CFUNC_generic, 0));
   JS_SetPropertyStr(
       ctx, g, "c8", JS_NewCFunction2(ctx, c_gen, "c8", 8, JS_CFUNC_generic, 0));
+  {
+    JSClassID cc_class_id = 0;
+    JSClassDef cc_def;
+    JS_NewClassID(rt, &cc_class_id);
+    memset(&cc_def, 0, sizeof(cc_def));
+    cc_def.class_name = "CCFunction";
+    cc_def.call = c_class_call;
+    if (JS_NewClass(rt, cc_class_id, &cc_def)) return 1;
+    JS_SetPropertyStr(ctx, g, "cc0", JS_NewObjectClass(ctx, cc_class_id));
+    JS_SetPropertyStr(ctx, g, "cc1", JS_NewObjectClass(ctx, cc_class_id));
+    JS_SetPropertyStr(ctx, g, "cc2", JS_NewObjectClass(ctx, cc_class_id));
+    JS_SetPropertyStr(ctx, g, "cc4", JS_NewObjectClass(ctx, cc_class_id));
+    JS_SetPropertyStr(ctx, g, "cc8", JS_NewObjectClass(ctx, cc_class_id));
+  }
   JSValue dat = JS_NewInt32(ctx, 1);
   JS_SetPropertyStr(
       ctx, g, "d0", JS_NewCFunctionData(ctx, c_data, 0, 0, 1, &dat));
@@ -347,6 +376,21 @@ int main(int argc, char **argv) {
     body = "f(1,2,3,4);";
   } else if (!strcmp(shape, "gen8")) {
     setup = "var f=g.c8;";
+    body = "f(1,2,3,4,5,6,7,8);";
+  } else if (!strcmp(shape, "cc0")) {
+    setup = "var f=g.cc0;";
+    body = "f();";
+  } else if (!strcmp(shape, "cc1")) {
+    setup = "var f=g.cc1;";
+    body = "f(1);";
+  } else if (!strcmp(shape, "cc2")) {
+    setup = "var f=g.cc2;";
+    body = "f(1,2);";
+  } else if (!strcmp(shape, "cc4")) {
+    setup = "var f=g.cc4;";
+    body = "f(1,2,3,4);";
+  } else if (!strcmp(shape, "cc8")) {
+    setup = "var f=g.cc8;";
     body = "f(1,2,3,4,5,6,7,8);";
   } else if (!strcmp(shape, "pad4x1")) {
     setup = "var f=g.c4;";
