@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning][semver].
   live iterator also costs one fewer malloc and 32 bytes. The sampled Octane
   rows are flat (10-row geomean -0.27%), because those rows iterate with
   indexed loops rather than `for...of`.
+- Patch `0044`: fills `Array.prototype.slice` and `splice` results directly into
+  the dense result array instead of defining every index through the generic
+  path. On-device, slicing a 200-element packed array is 74% faster, a
+  50-element window of it 70%, and a 100,000-element array 70%, with an
+  array-like source and an empty result unchanged. The sampled Octane rows are
+  flat (8-row geomean -0.04%).
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
