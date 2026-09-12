@@ -960,6 +960,12 @@ typedef struct JSObjLitSite {
     uint16_t prop_capacity;
     uint8_t eligible;
     JSAtom *atoms;
+    int *def_pos;
+    int def_count;
+    int def_size;
+    int def_seen;
+    int tab_idx;
+    uint8_t fusable;
 } JSObjLitSite;
 #define JS_OBJLIT_MAX_PROPS 16
 
@@ -20227,11 +20233,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp[-2] = sp[-1];
             sp--;
             BREAK;
-        CASE(OP_nip1): /* a b c -> b c */
-            JS_FreeValue(ctx, sp[-3]);
-            sp[-3] = sp[-2];
-            sp[-2] = sp[-1];
-            sp--;
+        CASE(OP_object_fill):
+            {
+                int n = get_u16(pc), ti = get_u16(pc + 2), i;
+                JSValue *vals = sp - n;
+                JSObjLitTemplate *tpl = &b->objlit_tab[ti];
+                pc += 4;
+                if (likely(JS_VALUE_GET_TAG(vals[-1]) == JS_TAG_OBJECT)) {
+                    JSObject *p = JS_VALUE_GET_OBJ(vals[-1]);
+                    if (likely(!p->is_exotic && p->shape == tpl->shape &&
+                               (int)tpl->prop_count == n)) {
+                        for (i = 0; i < n; i++)
+                            set_value(ctx, &p->prop[i].u.value, vals[i]);
+                        sp = vals;
+                        BREAK;
+                    }
+                }
+                for (i = 0; i < n; i++) {
+                    int ret = JS_DefinePropertyValue(ctx, vals[-1],
+                                                     js_objlit_template_atom(tpl, i),
+                                                     vals[i],
+                                                     JS_PROP_C_W_E | JS_PROP_THROW);
+                    if (unlikely(ret < 0)) {
+                        int j;
+                        for (j = i + 1; j < n; j++)
+                            JS_FreeValue(ctx, vals[j]);
+                        sp = vals;
+                        goto exception;
+                    }
+                }
+                sp = vals;
+            }
             BREAK;
         CASE(OP_dup):
             sp[0] = js_dup(sp[-1]);
@@ -24759,6 +24791,8 @@ typedef struct JSFunctionDef {
     JSObjLitSite *objlit_sites;
     int objlit_count;
     int objlit_size;
+    int d3_fused;
+    JSObjLitTemplate *objlit_pretab;
     bool is_func_expr : 1; /* true if function expression */
     bool has_home_object : 1; /* true if the home object is available */
     bool has_prototype : 1; /* true if a prototype field is necessary */
@@ -28006,6 +28040,12 @@ static int objlit_begin(JSParseState *s)
     site->prop_capacity = 0;
     site->eligible = 1;
     site->atoms = NULL;
+    site->def_pos = NULL;
+    site->def_count = 0;
+    site->def_size = 0;
+    site->def_seen = -1;
+    site->tab_idx = -1;
+    site->fusable = 1;
     return fd->objlit_count++;
 }
 
@@ -28027,6 +28067,24 @@ static void objlit_kill(JSParseState *s, int idx)
         objlit_discard(s, &s->cur_func->objlit_sites[idx]);
 }
 
+static void objlit_def(JSParseState *s, int idx)
+{
+    JSFunctionDef *fd = s->cur_func;
+    JSObjLitSite *site;
+
+    if (idx < 0)
+        return;
+    site = &fd->objlit_sites[idx];
+    if (!site->eligible || !site->fusable)
+        return;
+    if (js_resize_array(s->ctx, (void **)&site->def_pos, sizeof(int),
+                        &site->def_size, site->def_count + 1)) {
+        site->fusable = 0;
+        return;
+    }
+    site->def_pos[site->def_count++] = fd->last_opcode_pos;
+}
+
 static int objlit_add(JSParseState *s, int idx, JSAtom name)
 {
     JSObjLitSite *site;
@@ -28042,8 +28100,10 @@ static int objlit_add(JSParseState *s, int idx, JSAtom name)
         return 0;
     }
     for (i = 0; i < site->prop_count; i++)
-        if (site->atoms[i] == name)
+        if (site->atoms[i] == name) {
+            site->fusable = 0;
             return 0;
+        }
     if (site->prop_count >= JS_OBJLIT_MAX_PROPS) {
         objlit_discard(s, site);
         return 0;
@@ -28111,6 +28171,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
             emit_atom(s, name);
             emit_u16(s, s->cur_func->scope_level);
             emit_op(s, OP_define_field);
+            objlit_def(s, lit_idx);
             emit_atom(s, name);
         } else if (s->token.val == '(') {
             objlit_kill(s, lit_idx);
@@ -28171,6 +28232,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
                     goto fail;
                 set_object_name(s, name);
                 emit_op(s, OP_define_field);
+                objlit_def(s, lit_idx);
                 emit_atom(s, name);
             }
         }
@@ -35920,6 +35982,8 @@ static void free_bytecode_atoms(JSRuntime *rt,
 static void free_objlit_sites(JSContext *ctx, JSFunctionDef *fd)
 {
     int i;
+    js_free(ctx, fd->objlit_pretab);
+    fd->objlit_pretab = NULL;
     if (!fd->objlit_sites)
         return;
     for (i = 0; i < fd->objlit_count; i++) {
@@ -35930,6 +35994,7 @@ static void free_objlit_sites(JSContext *ctx, JSFunctionDef *fd)
                 JS_FreeAtom(ctx, site->atoms[k]);
             js_free(ctx, site->atoms);
         }
+        js_free(ctx, site->def_pos);
     }
     js_free(ctx, fd->objlit_sites);
     fd->objlit_sites = NULL;
@@ -37995,12 +38060,59 @@ static int get_label_pos(JSFunctionDef *s, int label)
     return pos;
 }
 
+typedef struct D3Ev { int pos; int site; int ord; } D3Ev;
+
+static int d3_ev_cmp(const void *a, const void *b)
+{
+    int pa = ((const D3Ev *)a)->pos, pb = ((const D3Ev *)b)->pos;
+    return (pa > pb) - (pa < pb);
+}
+
+static bool d3_site_ok(const JSObjLitSite *st)
+{
+    return st->eligible && st->fusable && st->def_count > 0 &&
+           st->def_count == (int)st->prop_count;
+}
+
+static D3Ev *d3_build_events(JSContext *ctx, JSFunctionDef *s, int *pn)
+{
+    int i, k, n = 0;
+    D3Ev *ev;
+
+    *pn = 0;
+    for (i = 0; i < s->objlit_count; i++)
+        if (d3_site_ok(&s->objlit_sites[i]))
+            n += s->objlit_sites[i].def_count;
+    if (n == 0)
+        return NULL;
+    ev = js_malloc(ctx, sizeof(D3Ev) * n);
+    if (!ev)
+        return NULL;
+    n = 0;
+    for (i = 0; i < s->objlit_count; i++) {
+        JSObjLitSite *st = &s->objlit_sites[i];
+        if (!d3_site_ok(st))
+            continue;
+        for (k = 0; k < st->def_count; k++) {
+            ev[n].pos = st->def_pos[k];
+            ev[n].site = i;
+            ev[n].ord = k;
+            n++;
+        }
+    }
+    qsort(ev, n, sizeof(D3Ev), d3_ev_cmp);
+    *pn = n;
+    return ev;
+}
+
 /* convert global variable accesses to local variables or closure
    variables when necessary */
 static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
 {
     int pos, pos_next, bc_len, op, len, i, idx, line_num, col_num;
     int objlit_k = 0;
+    D3Ev *d3_ev;
+    int d3_n = 0, d3_k = 0;
     uint8_t *bc_buf;
     JSAtom var_name;
     DynBuf bc_out;
@@ -38010,6 +38122,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
     js_dbuf_init(ctx, &bc_out);
+    d3_ev = d3_build_events(ctx, s, &d3_n);
 
     /* first pass for runtime checks (must be done before the
        variables are created) */
@@ -38063,6 +38176,15 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 site->pos = (int)bc_out.size;
             else
                 site->pos = -1;
+        }
+        while (d3_k < d3_n && d3_ev[d3_k].pos <= pos) {
+            JSObjLitSite *st = &s->objlit_sites[d3_ev[d3_k].site];
+
+            if (d3_ev[d3_k].pos == pos && op == OP_define_field)
+                st->def_pos[d3_ev[d3_k].ord] = (int)bc_out.size;
+            else
+                st->fusable = 0;
+            d3_k++;
         }
         switch(op) {
         case OP_source_loc:
@@ -38391,6 +38513,11 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
+    while (d3_k < d3_n)
+        s->objlit_sites[d3_ev[d3_k++].site].fusable = 0;
+    js_free(ctx, d3_ev);
+    d3_ev = NULL;
+
     /* set the new byte code */
     dbuf_free(&s->byte_code);
     s->byte_code = bc_out;
@@ -38400,6 +38527,9 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
     }
     return 0;
  fail:
+    while (d3_k < d3_n)
+        s->objlit_sites[d3_ev[d3_k++].site].fusable = 0;
+    js_free(ctx, d3_ev);
     /* continue the copy to keep the atom refcounts consistent */
     /* XXX: find a better solution ? */
     for (; pos < bc_len; pos = pos_next) {
@@ -38702,7 +38832,7 @@ static int js_args_find_elem_load(const uint8_t *bc_buf, int bc_len, int pos_nex
         case OP_catch:          case OP_nip_catch:
         case OP_for_of_start:   case OP_for_await_of_start:
         case OP_iterator_close:
-        case OP_drop:           case OP_nip:  case OP_nip1:
+        case OP_drop:           case OP_nip:
         case OP_return:         case OP_return_undef:
         case OP_return_async:   case OP_throw: case OP_throw_error:
         case OP_ret:            case OP_gosub:
@@ -38795,6 +38925,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     int objlit_live_count = 0;
     int objlit_template_index;
     int args_elide_kinds = -1;
+    D3Ev *d3_ev = NULL;
+    int d3_n = 0, d3_k = 0;
 
     label_slots = s->label_slots;
 
@@ -38904,6 +39036,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         put_short_code(&bc_out, OP_put_loc, s->arg_var_object_idx);
     }
 
+    d3_ev = d3_build_events(ctx, s, &d3_n);
+    if (d3_ev) {
+        s->objlit_pretab = js_mallocz(ctx, sizeof(JSObjLitTemplate) *
+                                           s->objlit_count);
+        if (!s->objlit_pretab) {
+            js_free(ctx, d3_ev);
+            d3_ev = NULL;
+            d3_n = 0;
+        }
+    }
+
     for (pos = 0; pos < bc_len; pos = pos_next) {
         int val;
         objlit_template_index = -1;
@@ -38918,9 +39061,42 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 objlit_template_index = objlit_live_count++;
                 site->template_index = (uint16_t)objlit_template_index;
                 site->pos = (int)bc_out.size;
+                site->tab_idx = objlit_template_index;
             } else {
                 site->template_index = UINT16_MAX;
+                site->tab_idx = -1;
                 site->pos = -1;
+            }
+        }
+        if (d3_ev) {
+            JSObjLitSite *fire = NULL;
+
+            while (d3_k < d3_n && d3_ev[d3_k].pos <= pos) {
+                JSObjLitSite *st = &s->objlit_sites[d3_ev[d3_k].site];
+                int evpos = d3_ev[d3_k].pos, ord = d3_ev[d3_k].ord;
+
+                d3_k++;
+                if (evpos == pos && op == OP_define_field && st->fusable &&
+                    st->tab_idx >= 0 && ord == st->def_seen + 1) {
+                    st->def_seen = ord;
+                    fire = st;
+                } else if (st->def_seen >= 0) {
+                    JS_ThrowInternalError(ctx, "d3: site left half-rewritten");
+                    goto fail;
+                } else {
+                    st->fusable = 0;
+                }
+            }
+            if (fire) {
+                JS_FreeAtom(ctx, get_u32(bc_buf + pos + 1));
+                if (fire->def_seen == fire->def_count - 1) {
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_object_fill);
+                    dbuf_put_u16(&bc_out, fire->def_count);
+                    dbuf_put_u16(&bc_out, fire->tab_idx);
+                    s->d3_fused++;
+                }
+                continue;
             }
         }
         switch(op) {
@@ -39813,6 +39989,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     s->jump_slots = NULL;
     js_free(ctx, s->label_slots);
     s->label_slots = NULL;
+    while (d3_k < d3_n) {
+        JSObjLitSite *st = &s->objlit_sites[d3_ev[d3_k++].site];
+
+        if (st->def_seen >= 0) {
+            JS_ThrowInternalError(ctx, "d3: site left half-rewritten at end");
+            goto fail;
+        }
+        st->fusable = 0;
+    }
+    js_free(ctx, d3_ev);
+    d3_ev = NULL;
     /* XXX: should delay until copying to runtime bytecode function */
     compute_pc2line_info(s);
     js_free(ctx, s->source_loc_slots);
@@ -39827,6 +40014,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     }
     return 0;
  fail:
+    js_free(ctx, d3_ev);
     /* XXX: not safe */
     dbuf_free(&bc_out);
     return -1;
@@ -40034,9 +40222,6 @@ static __exception int compute_stack_size(JSContext *ctx,
         case OP_nip:
             catch_level = stack_len - 1;
             goto check_catch;
-        case OP_nip1:
-            catch_level = stack_len - 1;
-            goto check_catch;
         case OP_iterator_close:
             catch_level = stack_len + 2;
         check_catch:
@@ -40133,6 +40318,32 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     int stack_size, scope, idx;
     int function_size, byte_code_offset, cpool_offset;
     int closure_var_offset, vardefs_offset;
+
+    if (fd->d3_fused > 0) {
+        int t = 0, j;
+
+        for (j = 0; j < fd->objlit_count; j++) {
+            JSObjLitSite *st = &fd->objlit_sites[j];
+            bool live = (st->pos >= 0 && st->eligible && st->prop_count > 0);
+
+            if (live) {
+                if (st->tab_idx >= 0 && st->tab_idx != t) {
+                    JS_ThrowInternalError(ctx, "d3: tab index %d != %d",
+                                          st->tab_idx, t);
+                    goto fail;
+                }
+                t++;
+            } else if (st->tab_idx >= 0) {
+                JS_ThrowInternalError(ctx, "d3: a fused site went dead");
+                goto fail;
+            }
+        }
+        if (t <= 0 || t > UINT16_MAX || fd->objlit_pretab == NULL) {
+            JS_ThrowInternalError(ctx, "d3: %d fill(s), %d live template(s)",
+                                  fd->d3_fused, t);
+            goto fail;
+        }
+    }
 
     /* recompute scope linkage */
     for (scope = 0; scope < fd->scope_count; scope++) {
@@ -40246,7 +40457,13 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
                 n_live++;
         }
         if (n_live > 0 && n_live <= UINT16_MAX) {
-            b->objlit_tab = js_mallocz(ctx, sizeof(JSObjLitTemplate) * n_live);
+            if (fd->objlit_pretab) {
+                b->objlit_tab = fd->objlit_pretab;
+                fd->objlit_pretab = NULL;
+            } else {
+                b->objlit_tab = js_mallocz(ctx,
+                                           sizeof(JSObjLitTemplate) * n_live);
+            }
             if (!b->objlit_tab) {
                 js_free(ctx, b);
                 b = NULL;
@@ -40269,6 +40486,12 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             }
             b->objlit_count = (uint16_t)n_live;
         }
+        for (j = 0; j < fd->objlit_count; j++) {
+            js_free(ctx, fd->objlit_sites[j].def_pos);
+            fd->objlit_sites[j].def_pos = NULL;
+        }
+        js_free(ctx, fd->objlit_pretab);
+        fd->objlit_pretab = NULL;
     }
 
     /* IC site count is serialized; read and transition tables are runtime-only
