@@ -32,6 +32,7 @@ react {
     if (usingHermes) {
         hermesCommand = hermescPath().absolutePath
     }
+    hermesEnabled = usingHermes
     entryFile = file(exampleMode == "benchmark" ? "../../index.benchmark.js" : "../../index.js")
 
     /* Folders */
@@ -134,6 +135,7 @@ android {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
+    implementation(project(":jsibench"))
 
     if (usingHermes) {
         implementation("com.facebook.react:hermes-android")
