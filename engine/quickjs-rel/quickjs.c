@@ -660,6 +660,7 @@ struct JSContext {
     JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
     JSShape *regexp_shape;  /* shape for regexp objects */
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
+    JSShape *closure_shape[8];
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -3751,6 +3752,9 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
+    for (i = 0; i < (int)countof(ctx->closure_shape); i++)
+        if (ctx->closure_shape[i])
+            mark_func(rt, &ctx->closure_shape[i]->header);
 }
 
 void JS_FreeContext(JSContext *ctx)
@@ -3825,6 +3829,8 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+    for (i = 0; i < (int)countof(ctx->closure_shape); i++)
+        js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
 
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
@@ -19264,9 +19270,59 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     JSFunctionBytecode *b;
     JSValue func_obj;
     JSAtom name_atom;
+    JSClassID class_id;
+    JSShape *sh;
+    int has_proto, tpl_idx;
 
     b = JS_VALUE_GET_PTR(bfunc);
-    func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
+    class_id = func_kind_to_class_id[b->func_kind];
+    has_proto = (b->func_kind & JS_FUNC_GENERATOR) ? 1 : b->has_prototype;
+    tpl_idx = b->func_kind * 2 + has_proto;
+    sh = ctx->closure_shape[tpl_idx];
+    if (likely(sh != NULL &&
+               sh->proto == object_or_null(ctx->class_proto[class_id]))) {
+        JSProperty props[3];
+        JSValue name_str;
+        JSObject *p;
+
+        name_atom = b->func_name;
+        if (name_atom == JS_ATOM_NULL)
+            name_atom = JS_ATOM_empty_string;
+        name_str = JS_AtomToString(ctx, name_atom);
+        if (unlikely(JS_IsException(name_str))) {
+            JS_FreeValue(ctx, bfunc);
+            return JS_EXCEPTION;
+        }
+        props[0].u.value = js_int32(b->defined_arg_count);
+        props[1].u.value = name_str;
+        if (b->func_kind & JS_FUNC_GENERATOR) {
+            int proto_class_id = (b->func_kind == JS_FUNC_ASYNC_GENERATOR) ?
+                JS_CLASS_ASYNC_GENERATOR : JS_CLASS_GENERATOR;
+            JSValue proto = JS_NewObjectProto(ctx,
+                                              ctx->class_proto[proto_class_id]);
+            if (unlikely(JS_IsException(proto))) {
+                JS_FreeValue(ctx, name_str);
+                JS_FreeValue(ctx, bfunc);
+                return JS_EXCEPTION;
+            }
+            props[2].u.value = proto;
+        } else if (has_proto) {
+            props[2].u.init.realm_and_id = (uintptr_t)JS_DupContext(ctx);
+            assert((props[2].u.init.realm_and_id & 3) == 0);
+            props[2].u.init.realm_and_id |= JS_AUTOINIT_ID_PROTOTYPE;
+            props[2].u.init.opaque = NULL;
+        }
+        func_obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), class_id, props);
+        if (unlikely(JS_IsException(func_obj))) {
+            JS_FreeValue(ctx, bfunc);
+            return JS_EXCEPTION;
+        }
+        p = JS_VALUE_GET_OBJ(func_obj);
+        if (has_proto && !(b->func_kind & JS_FUNC_GENERATOR))
+            p->is_constructor = true;
+        return js_closure2(ctx, func_obj, b, cur_var_refs, sf);
+    }
+    func_obj = JS_NewObjectClass(ctx, class_id);
     if (JS_IsException(func_obj)) {
         JS_FreeValue(ctx, bfunc);
         return JS_EXCEPTION;
@@ -19304,6 +19360,13 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
         JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
                                   JS_AUTOINIT_ID_PROTOTYPE, NULL,
                                   JS_PROP_WRITABLE);
+    }
+    if (ctx->closure_shape[tpl_idx] == NULL) {
+        JSShape *sh1 = JS_VALUE_GET_OBJ(func_obj)->shape;
+        if (sh1->is_hashed && sh1->deleted_prop_count == 0 &&
+            sh1->prop_count == 2 + has_proto &&
+            sh1->proto == object_or_null(ctx->class_proto[class_id]))
+            ctx->closure_shape[tpl_idx] = js_dup_shape(sh1);
     }
     return func_obj;
  fail:
