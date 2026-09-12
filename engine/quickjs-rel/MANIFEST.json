@@ -171,12 +171,16 @@
       "sha256": "b30b7c2f5b3c9b3c9dbac20c3fa09107f88d539498f0a3ceac4de26fa19f1880"
     },
     {
+      "name": "0043-array-iterator-fast-step.patch",
+      "sha256": "90a9f299d1e35daf3ccfd050f49bd45ecc81c18e5f9db21b4e8abbb6ba02db48"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "2adbdaf59af795cc88e74b0cd9632dffcc330333a8cf2186305b410966502f76"
     }
   ],
   "files": {
-    "quickjs.c": "8e2e335749a33c22fd9c6ace360a35f7a1aaf85fc5643f572d04b2a28fce15ad",
+    "quickjs.c": "dca4fe16d0b004c38f988939a71b0c0d91999905684c4824609b33fd78cb1826",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "a8d2cf2d04db406e0c16acdd95ab0e709d309902865722f41dac07a1ba5676af",
