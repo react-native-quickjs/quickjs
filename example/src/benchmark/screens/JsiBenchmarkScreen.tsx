@@ -32,9 +32,9 @@ function runCalls(fn: BenchFunction, args: number[]) {
 
 function measure(name: string, fn: BenchFunction, args: number[]) {
   runCalls(fn, args);
-  const start = global.performance.now();
+  const start = globalThis.performance.now();
   runCalls(fn, args);
-  const elapsed = global.performance.now() - start;
+  const elapsed = globalThis.performance.now() - start;
   return { name, ns: (elapsed * 1_000_000) / iterations };
 }
 
@@ -57,17 +57,11 @@ export default function JsiBenchmarkScreen({ back }: { back: () => void }) {
       setOutput('JSI benchmark bindings are unavailable.');
       return;
     }
-    const nativeC0 = (globalThis as typeof globalThis & { __RNQJSNativeC0?: BenchFunction }).__RNQJSNativeC0;
-    if (typeof nativeC0 !== 'function') {
-      setOutput('QuickJS native C function is unavailable.');
-      return;
-    }
     const jsCall = (arity: number) => {
       const fn = (...values: number[]) => values.length + 1;
       return measure(`JS→JS ${arity}`, fn, Array.from({ length: arity }, (_, i) => i));
     };
       const rows = [
-      measure('QuickJS C function 0', nativeC0, []),
       measure('HostFunction 0', bench.native0, []),
       measure('HostFunction 1', bench.native1, [1]),
       measure('HostFunction 4', bench.native4, [1, 2, 3, 4]),
