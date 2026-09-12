@@ -233,6 +233,37 @@ JSClassExoticMethods gHostObjectExotic = {
     /* set_property */ HostObjectHandlers::setProperty,
 };
 
+/// Raw storage for the borrowed arguments of a host call. Only the entries
+/// actually built are destroyed, so an unused slot never holds an object.
+class InlineArgs {
+ public:
+  static constexpr size_t kCapacity = 8;
+
+  ~InlineArgs() {
+    reset();
+  }
+
+  jsi::Value *data() noexcept {
+    return reinterpret_cast<jsi::Value *>(storage_);
+  }
+
+  /// Constructs the next entry; a throw leaves it uncounted.
+  void emplace(QuickJSRuntime &runtime, JSValueConst value) {
+    new (data() + size_) jsi::Value(runtime.borrowValue(value));
+    ++size_;
+  }
+
+ private:
+  void reset() noexcept {
+    while (size_ != 0) {
+      data()[--size_].~Value();
+    }
+  }
+
+  alignas(jsi::Value) unsigned char storage_[kCapacity * sizeof(jsi::Value)];
+  size_t size_{0};
+};
+
 struct HostFunctionHandlers {
   static JSValue call(
       JSContext *ctx, JSValueConst funcObj, JSValueConst thisVal, int argc,
@@ -247,16 +278,18 @@ struct HostFunctionHandlers {
     try {
       // Borrowed, not dup'd: quickjs keeps argv and thisVal alive for the whole
       // call, so a reference taken here and dropped on return would cancel out.
-      constexpr int kInlineArgs = 8;
-      jsi::Value inlineArgs[kInlineArgs];
       std::vector<jsi::Value> heapArgs;
-      jsi::Value *args = inlineArgs;
-      if (argc > kInlineArgs) {
+      InlineArgs inlineArgs;
+      jsi::Value *args = nullptr;
+      if (argc > static_cast<int>(InlineArgs::kCapacity)) {
         heapArgs.resize(static_cast<size_t>(argc));
+        runtime->borrowValues(argv, static_cast<size_t>(argc), heapArgs.data());
         args = heapArgs.data();
-      }
-      if (argc != 0) {
-        runtime->borrowValues(argv, static_cast<size_t>(argc), args);
+      } else if (argc != 0) {
+        for (int i = 0; i < argc; ++i) {
+          inlineArgs.emplace(*runtime, argv[i]);
+        }
+        args = inlineArgs.data();
       }
       jsi::Value thisValue = runtime->borrowValue(thisVal);
       jsi::Value result =
@@ -319,7 +352,6 @@ JSValue microtaskJob(JSContext *ctx, int argc, JSValueConst *argv) {
 const char *kSymbolToStringSource = "(function (s) { return s.toString(); })";
 const char *kBigIntToStringSource =
     "(function (b, radix) { return b.toString(radix); })";
-
 }  // namespace
 
 QuickJSRuntime::QuickJSRuntime(QuickJSRuntimeConfig config)
@@ -734,70 +766,35 @@ jsi::Value QuickJSRuntime::createValue(JSValue value) {
 
 jsi::Value QuickJSRuntime::borrowValue(JSValue value) {
   // Primitives carry no reference, so they are already borrow-shaped.
-  if (JS_IsUndefined(value)) {
-    return jsi::Value::undefined();
+  switch (JS_VALUE_GET_TAG(value)) {
+    case JS_TAG_UNDEFINED:
+      return jsi::Value::undefined();
+    case JS_TAG_NULL:
+      return jsi::Value::null();
+    case JS_TAG_BOOL:
+      return jsi::Value(JS_VALUE_GET_BOOL(value) != 0);
+    case JS_TAG_INT:
+      return jsi::Value(JS_VALUE_GET_INT(value));
+    case JS_TAG_FLOAT64:
+      return jsi::Value(JS_VALUE_GET_FLOAT64(value));
+    case JS_TAG_STRING:
+      return jsi::Value(make<jsi::String>(allocPointerValue(value, false)));
+    case JS_TAG_SYMBOL:
+      return jsi::Value(make<jsi::Symbol>(allocPointerValue(value, false)));
+    case JS_TAG_BIG_INT:
+    case JS_TAG_SHORT_BIG_INT:
+      return jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
+    default:
+      return jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
   }
-  if (JS_IsNull(value)) {
-    return jsi::Value::null();
-  }
-  if (JS_IsBool(value)) {
-    return jsi::Value(static_cast<bool>(JS_ToBool(context_, value)));
-  }
-  if (JS_IsNumber(value)) {
-    double number = 0;
-    JS_ToFloat64(context_, &number, value);
-    return jsi::Value(number);
-  }
-  if (JS_IsString(value)) {
-    return jsi::Value(make<jsi::String>(allocPointerValue(value, false)));
-  }
-  if (JS_IsSymbol(value)) {
-    return jsi::Value(make<jsi::Symbol>(allocPointerValue(value, false)));
-  }
-  if (JS_IsBigInt(value)) {
-    return jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
-  }
-  return jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
 }
 
 void QuickJSRuntime::borrowValues(
     JSValueConst *values, size_t count, jsi::Value *destination) {
   for (size_t i = 0; i < count; ++i) {
-    JSValueConst value = values[i];
-    switch (JS_VALUE_GET_TAG(value)) {
-      case JS_TAG_UNDEFINED:
-        destination[i] = jsi::Value::undefined();
-        break;
-      case JS_TAG_NULL:
-        destination[i] = jsi::Value::null();
-        break;
-      case JS_TAG_BOOL:
-        destination[i] = jsi::Value(JS_VALUE_GET_BOOL(value) != 0);
-        break;
-      case JS_TAG_INT:
-        destination[i] = jsi::Value(JS_VALUE_GET_INT(value));
-        break;
-      case JS_TAG_FLOAT64:
-        destination[i] = jsi::Value(JS_VALUE_GET_FLOAT64(value));
-        break;
-      case JS_TAG_STRING:
-        destination[i] =
-            jsi::Value(make<jsi::String>(allocPointerValue(value, false)));
-        break;
-      case JS_TAG_SYMBOL:
-        destination[i] =
-            jsi::Value(make<jsi::Symbol>(allocPointerValue(value, false)));
-        break;
-      case JS_TAG_BIG_INT:
-      case JS_TAG_SHORT_BIG_INT:
-        destination[i] =
-            jsi::Value(make<jsi::BigInt>(allocPointerValue(value, false)));
-        break;
-      default:
-        destination[i] =
-            jsi::Value(make<jsi::Object>(allocPointerValue(value, false)));
-        break;
-    }
+    // Assignment, not placement construction: a conversion that throws must
+    // leave a live value behind for the vector's destructor to run.
+    destination[i] = borrowValue(values[i]);
   }
 }
 

@@ -339,7 +339,7 @@ class QuickJSRuntime : public jsi::Runtime {
    * argument copies it, and every copy path takes a real reference, so a
    * borrowed wrapper cannot outlive the call that made it.
    */
-  jsi::Value borrowValue(JSValue value);
+  __attribute__((always_inline)) jsi::Value borrowValue(JSValue value);
 
   void borrowValues(
       JSValueConst *values, size_t count, jsi::Value *destination);
