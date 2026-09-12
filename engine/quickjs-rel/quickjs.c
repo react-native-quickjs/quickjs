@@ -1361,6 +1361,9 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    uint8_t prop_inline_cap : 3; /* non-zero: p->prop points into this object's
+                                    own block, which holds this many slots and
+                                    must not be freed or realloc'd */
     uint16_t class_id; /* see JS_CLASS_x */
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
@@ -1765,6 +1768,7 @@ static __exception int js_set_length64(JSContext *ctx, JSValueConst obj,
 static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len);
 static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
                                JSValueConst array_arg);
+static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes);
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
 static bool js_get_fast_array(JSContext *ctx, JSValue obj,
                               JSValue **arrpp, uint32_t *countp);
@@ -6949,7 +6953,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
        in case of memory allocation failure */
     if (p) {
         JSProperty *new_prop;
-        new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+        new_prop = js_prop_grow(ctx, p, sizeof(new_prop[0]) * new_size);
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
@@ -7077,7 +7081,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     js_free(ctx, get_alloc_from_shape(old_sh));
 
     /* reduce the size of the object properties */
-    new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+    new_prop = js_prop_grow(ctx, p, sizeof(new_prop[0]) * new_size);
     if (new_prop)
         p->prop = new_prop;
     return 0;
@@ -7223,6 +7227,25 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
     printf("}\n");
 }
 
+#define JS_OBJ_INLINE_PROPS 4
+
+static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
+{
+    if (unlikely(p->prop_inline_cap != 0)) {
+        JSProperty *np;
+
+        if (nbytes <= p->prop_inline_cap * sizeof(JSProperty))
+            return p->prop;
+        np = js_malloc(ctx, nbytes);
+        if (np) {
+            memcpy(np, p->prop, p->prop_inline_cap * sizeof(JSProperty));
+            p->prop_inline_cap = 0;
+        }
+        return np;
+    }
+    return js_realloc(ctx, p->prop, nbytes);
+}
+
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
 static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
@@ -7232,9 +7255,18 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     int i;
 
     js_trigger_gc(ctx->rt, sizeof(JSObject));
-    p = js_malloc(ctx, sizeof(JSObject));
-    if (unlikely(!p))
-        goto fail;
+    {
+        uint32_t inline_cap = ((class_id == JS_CLASS_OBJECT ||
+                                class_id == JS_CLASS_BYTECODE_FUNCTION ||
+                                class_id == JS_CLASS_FOR_IN_ITERATOR) &&
+                               sh->prop_size <= JS_OBJ_INLINE_PROPS) ?
+                              sh->prop_size : 0;
+        p = js_malloc(ctx, sizeof(JSObject) +
+                           inline_cap * sizeof(JSProperty));
+        if (unlikely(!p))
+            goto fail;
+        p->prop_inline_cap = inline_cap;
+    }
     p->class_id = class_id;
     p->extensible = true;
     p->free_mark = 0;
@@ -7249,7 +7281,10 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
     p->shape = sh;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
+    if (p->prop_inline_cap != 0)
+        p->prop = (JSProperty *)(p + 1);
+    else
+        p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
     if (unlikely(!p->prop)) {
         js_free(ctx, p);
     fail:
@@ -8230,7 +8265,8 @@ static void free_object(JSRuntime *rt, JSObject *p)
         free_property(rt, &p->prop[i], pr->flags);
         pr++;
     }
-    js_free_rt(rt, p->prop);
+    if (p->prop_inline_cap == 0)
+        js_free_rt(rt, p->prop);
     /* as an optimization we destroy the shape immediately without
        putting it in gc_zero_ref_count_list */
     js_free_shape(rt, sh);
@@ -8891,8 +8927,12 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         sh = p->shape;
         s->obj_count++;
         if (p->prop) {
-            s->memory_used_count++;
-            s->prop_size += sh->prop_size * sizeof(*p->prop);
+            if (p->prop_inline_cap == 0)
+                s->memory_used_count++;
+            if (p->prop_inline_cap != 0)
+                s->prop_size += p->prop_inline_cap * sizeof(*p->prop);
+            else
+                s->prop_size += sh->prop_size * sizeof(*p->prop);
             s->prop_count += sh->prop_count;
             prs = get_shape_prop(sh);
             for(i = 0; i < sh->prop_count; i++) {
@@ -11449,8 +11489,8 @@ static JSProperty *add_property(JSContext *ctx,
             /*  the property array may need to be resized */
             if (new_sh->prop_size != sh->prop_size) {
                 JSProperty *new_prop;
-                new_prop = js_realloc(ctx, p->prop, sizeof(p->prop[0]) *
-                                      new_sh->prop_size);
+                new_prop = js_prop_grow(ctx, p,
+                                        sizeof(p->prop[0]) * new_sh->prop_size);
                 if (!new_prop)
                     return NULL;
                 p->prop = new_prop;
@@ -22001,7 +22041,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 uint32_t off = ic[k].offset;
                                 JSShape *osh = p->shape;
                                 if (nsh->prop_size != osh->prop_size) {
-                                    JSProperty *np = js_realloc(ctx, p->prop,
+                                    JSProperty *np = js_prop_grow(ctx, p,
                                             sizeof(p->prop[0]) * nsh->prop_size);
                                     if (unlikely(!np))
                                         goto exception;
