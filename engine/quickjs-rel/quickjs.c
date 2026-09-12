@@ -7344,19 +7344,23 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
 static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl)
 {
     JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
+    JSValue obj;
+    JSObject *p;
     int i;
 
     if (likely(tpl->shape != NULL)) {
-        JSProperty props[JS_OBJLIT_MAX_PROPS];
         if (unlikely(tpl->shape->proto != proto))
             return JS_NewObject(ctx);
+        obj = JS_NewObjectFromShape(ctx, js_dup_shape(tpl->shape),
+                                    JS_CLASS_OBJECT, NULL);
+        if (unlikely(JS_IsException(obj)))
+            return obj;
+        p = JS_VALUE_GET_OBJ(obj);
         for (i = 0; i < tpl->prop_count; i++)
-            props[i].u.value = JS_UNDEFINED;
-        return JS_NewObjectFromShape(ctx, js_dup_shape(tpl->shape),
-                                     JS_CLASS_OBJECT, props);
+            p->prop[i].u.value = JS_UNDEFINED;
+        return obj;
     }
-    JSValue obj = JS_NewObject(ctx);
-    JSObject *p;
+    obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         return obj;
     p = JS_VALUE_GET_OBJ(obj);

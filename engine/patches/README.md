@@ -58,6 +58,7 @@ what we changed and why without opening a single `.patch` file.
 | `0045` | Copies `concat` inputs that are already dense fast arrays straight into the result | The per-element get and define re-derive that this is an ordinary dense read followed by an append to a dense array, when the input is already dense storage | - | No |
 | `0046` | Reserves capped fast-array capacity for the `filter` result before the callback loop | The result starts empty and grows while the callback keeps elements, reallocating and copying storage repeatedly although the final size is known to be at most the input length | - | No |
 | `0047` | Overwrites an object literal's slot inline in `OP_define_field` | A templated literal arrives with every slot already present as `JS_UNDEFINED` with flags exactly `C_W_E`, so each store was a re-define through the generic path: a hash lookup, the flag checks, the AUTOINIT/getset branches and two provably no-op flag updates behind a six-argument call | - | No |
+| `0048` | Initializes a templated object literal's slots in place | The template path staged a 16-slot `JSProperty` array on the stack for the allocator to copy into the new object, so every slot was written twice and read once on the path every object literal takes | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
