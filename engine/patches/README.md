@@ -49,6 +49,7 @@ what we changed and why without opening a single `.patch` file.
 | `0036` | Copies unchanged dense mapped arguments directly from their live variable-reference slots during apply | Avoids one exotic property lookup per forwarded argument while preserving the generic path for modified or sparse arguments objects | - | No |
 | `0037` | Skips COPY_ARGV materialization for functions proven not to write or retain argument slots | Callback callees that only read their arguments can reuse the caller's complete argument array without allocation or duplication | - | No |
 | `0038` | Avoids reifying frame-visible mapped arguments for length, indexed reads, and verified builtin apply calls | Non-escaping argument uses can read the active frame without allocating an arguments object, while all observable slow paths retain the ordinary object | - | Yes |
+| `0039` | Keeps a pending exception when a formal parameter fails to parse | A stack overflow, interrupt or allocation failure raised while reading the parameter token is the real error; replacing it with "missing formal parameter" hides the cause and makes the reported failure depend on native stack depth | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
