@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning][semver].
   mapping to objects 11.7% faster. The sampled Octane rows are neutral overall
   (geomean -0.49%), the largest moves being deltablue -1.76% and richards
   -1.29%, which measure as code layout rather than the added check.
+- Patch `0042`: gives fast arrays a hole representation instead of demoting the
+  object to a property table when an index is skipped or deleted. On-device the
+  crypto row of Octane is 23.4% faster and pdfjs 20.4% faster, the two rows
+  whose element accesses previously landed on a demoted array; the other
+  sampled rows are flat (8-row geomean +5.3%). Filling from index 2 is 52.8%
+  faster and deleting every other element 17.7%; a reverse fill is unchanged.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
