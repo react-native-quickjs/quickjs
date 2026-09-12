@@ -55,6 +55,7 @@ what we changed and why without opening a single `.patch` file.
 | `0042` | Keeps an array dense when an index is skipped or deleted, by storing holes and tracking how many | Upstream demotes the array to a property table permanently the first time a store lands past the end, so `Array(n)`, gap fills, row-offset matrices and `delete` cost every later access | - | No |
 | `0043` | Stores the array/string iterator record inline and steps array iterators from the dense storage | Every iteration step re-read `length` with a property get and the element with a generic get; each iterator also allocated a record | - | No |
 | `0044` | Fills `slice` and `splice` results directly into the dense result array | The generic define path re-derives per element that the index appends to a dense array, and cannot see that the result was created with exactly that length | - | No |
+| `0045` | Copies `concat` inputs that are already dense fast arrays straight into the result | The per-element get and define re-derive that this is an ordinary dense read followed by an append to a dense array, when the input is already dense storage | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

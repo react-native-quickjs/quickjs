@@ -1,0 +1,139 @@
+Subject: Copy Concat Inputs That Are Already Dense
+
+What this does
+  `Array.prototype.concat` copies a packed dense fast array straight into the
+  result's value buffer, growing it once per input, instead of reading every
+  element with a generic property get and defining it back with a generic
+  define.
+
+Why we need it
+  The element get and the element define both re-derive, per element, that this
+  is an ordinary dense array read followed by an append to a dense array, when
+  the input is already dense storage.
+
+What it adds
+  The copy is used only when the element reads cannot be observed: the input
+  must be an ordinary dense fast array whose dense storage covers its whole
+  length, so every index is an own data property and no prototype, hole or
+  accessor can be reached. The result must be an ordinary extensible dense array
+  with no elements, an integer length and a writable `length`. A hole, an
+  array-like, a pre-filled or frozen species result, and a species that returns
+  the receiver all keep the existing per-element path unchanged.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -47642,13 +47642,71 @@
+     JS_FreeValue(ctx, arr);
+     JS_FreeValue(ctx, obj);
+     return ret;
++}
++
++static JSObject *js_concat_direct_target(JSValueConst arr)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
++        return NULL;
++    p = JS_VALUE_GET_OBJ(arr);
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || !p->extensible)
++        return NULL;
++    if (p->holey || p->u.array.count != 0)
++        return NULL;
++    if (!(get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE))
++        return NULL;
++    if (JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT ||
++        JS_VALUE_GET_INT(p->prop[0].u.value) != 0)
++        return NULL;
++    return p;
++}
++
++static int js_concat_direct_append(JSContext *ctx, JSObject *p, int64_t n,
++                                   JSValueConst e)
++{
++    if (p->holey || p->u.array.count != (uint32_t)n || n >= INT32_MAX)
++        return 0;
++    if (p->u.array.u1.size <= (uint32_t)n &&
++        expand_fast_array(ctx, p, (uint32_t)n + 1) < 0)
++        return -1;
++    p->u.array.u.values[n] = js_dup(e);
++    p->u.array.count = (uint32_t)n + 1;
++    set_value(ctx, &p->prop[0].u.value, js_int32(n + 1));
++    return 1;
+ }
+ 
++static int js_concat_direct_spread(JSContext *ctx, JSObject *p, int64_t n,
++                                   JSValueConst e, int64_t len)
++{
++    JSValue *arrp;
++    uint32_t count32, i;
++
++    if (len <= 0)
++        return 0;
++    if (p->holey || p->u.array.count != (uint32_t)n || n + len > INT32_MAX)
++        return 0;
++    if (JS_VALUE_GET_TAG(e) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(e) == p)
++        return 0;
++    if (!js_get_fast_array(ctx, e, &arrp, &count32) || (int64_t)count32 != len)
++        return 0;
++    if (p->u.array.u1.size < (uint32_t)(n + len) &&
++        expand_fast_array(ctx, p, (uint32_t)(n + len)) < 0)
++        return -1;
++    for (i = 0; i < (uint32_t)len; i++)
++        p->u.array.u.values[n + i] = js_dup(arrp[i]);
++    p->u.array.count = (uint32_t)(n + len);
++    set_value(ctx, &p->prop[0].u.value, js_int32(n + len));
++    return 1;
++}
++
+ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+ {
+     JSValue obj, arr, val;
+     JSValueConst e;
++    JSObject *dp;
+     int64_t len, k, n;
+     int i, res;
+ 
+@@ -47660,6 +47718,7 @@
+     arr = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
+     if (JS_IsException(arr))
+         goto exception;
++    dp = js_concat_direct_target(arr);
+     n = 0;
+     for (i = -1; i < argc; i++) {
+         if (i < 0)
+@@ -47677,6 +47736,15 @@
+                 JS_ThrowTypeError(ctx, "Array loo long");
+                 goto exception;
+             }
++            if (dp != NULL) {
++                res = js_concat_direct_spread(ctx, dp, n, e, len);
++                if (res < 0)
++                    goto exception;
++                if (res) {
++                    n += len;
++                    continue;
++                }
++            }
+             for (k = 0; k < len; k++, n++) {
+                 res = JS_TryGetPropertyInt64(ctx, e, k, &val);
+                 if (res < 0)
+@@ -47692,6 +47760,15 @@
+                 JS_ThrowTypeError(ctx, "Array loo long");
+                 goto exception;
+             }
++            if (dp != NULL) {
++                res = js_concat_direct_append(ctx, dp, n, e);
++                if (res < 0)
++                    goto exception;
++                if (res) {
++                    n++;
++                    continue;
++                }
++            }
+             if (JS_DefinePropertyValueInt64Const(ctx, arr, n, e,
+                                                  JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                 goto exception;
