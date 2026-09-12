@@ -86,7 +86,7 @@ DEF(           rest, 3, 0, 1, u16) /* only used at the start of a function */
 
 DEF(           drop, 1, 1, 0, none) /* a -> */
 DEF(            nip, 1, 2, 1, none) /* a b -> b */
-DEF(           nip1, 1, 3, 2, none) /* a b c -> b c */
+DEF(   object_fill, 5, 1, 1, npop_u16) /* obj v0..vn-1 -> obj */
 DEF(            dup, 1, 1, 2, none) /* a -> a a */
 DEF(           dup1, 1, 2, 3, none) /* a b -> a a b */
 DEF(           dup2, 1, 2, 4, none) /* a b -> a b a b */
