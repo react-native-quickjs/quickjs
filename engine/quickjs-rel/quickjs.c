@@ -51460,6 +51460,23 @@ static JSValue js_parseInt(JSContext *ctx, JSValueConst this_val,
     int32_t radix;
     JSValue ret;
 
+    if (JS_VALUE_GET_TAG(argv[1]) == JS_TAG_UNDEFINED ||
+         (JS_VALUE_GET_TAG(argv[1]) == JS_TAG_INT &&
+          (JS_VALUE_GET_INT(argv[1]) == 0 ||
+           JS_VALUE_GET_INT(argv[1]) == 10))) {
+        int vtag = JS_VALUE_GET_TAG(argv[0]);
+
+        if (vtag == JS_TAG_INT)
+            return js_int32(JS_VALUE_GET_INT(argv[0]));
+        if (JS_TAG_IS_FLOAT64(vtag)) {
+            double d = JS_VALUE_GET_FLOAT64(argv[0]);
+            double ad = fabs(d);
+
+            if (ad >= 1.0 && ad < 1e21)
+                return js_number(trunc(d));
+        }
+    }
+
     str = JS_ToCString(ctx, argv[0]);
     if (!str)
         return JS_EXCEPTION;

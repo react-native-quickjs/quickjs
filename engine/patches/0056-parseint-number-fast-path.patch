@@ -1,0 +1,51 @@
+Subject: Answer parseInt(<number>) From The Number
+
+What this does
+  js_parseInt answers a numeric argument with a decimal radix directly: an int32
+  argument is returned unchanged, and a float64 in 1 <= |d| < 1e21 returns
+  trunc(d).
+
+Why we need it
+  The general path converts the number to a decimal string, copies it out to a
+  second buffer, parses the digits back and frees both -- two allocations, a dtoa
+  and an atof to recompute a value the caller already had. Compiled JavaScript
+  uses parseInt() as an integer cast on values that are already numbers.
+
+What it adds
+  Admission is the radix being absent, undefined, 0 or 10, and the argument being
+  an int, or a float in the fixed-point window where Number::toString produces
+  [-]digits[.digits]. Everything else -- NaN, the infinities, 1e21, 1e-7 and the
+  -0-producing cases -- keeps the general path rather than being approximated. A
+  number argument's ToString and an int or undefined radix's ToInt32 cannot call
+  user code, so no observable step is skipped.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -51459,7 +51459,24 @@
+     int flags;
+     int32_t radix;
+     JSValue ret;
++
++    if (JS_VALUE_GET_TAG(argv[1]) == JS_TAG_UNDEFINED ||
++         (JS_VALUE_GET_TAG(argv[1]) == JS_TAG_INT &&
++          (JS_VALUE_GET_INT(argv[1]) == 0 ||
++           JS_VALUE_GET_INT(argv[1]) == 10))) {
++        int vtag = JS_VALUE_GET_TAG(argv[0]);
+ 
++        if (vtag == JS_TAG_INT)
++            return js_int32(JS_VALUE_GET_INT(argv[0]));
++        if (JS_TAG_IS_FLOAT64(vtag)) {
++            double d = JS_VALUE_GET_FLOAT64(argv[0]);
++            double ad = fabs(d);
++
++            if (ad >= 1.0 && ad < 1e21)
++                return js_number(trunc(d));
++        }
++    }
++
+     str = JS_ToCString(ctx, argv[0]);
+     if (!str)
+         return JS_EXCEPTION;

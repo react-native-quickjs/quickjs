@@ -126,6 +126,11 @@ and this project adheres to [Semantic Versioning][semver].
   their tags differ, so a rope compared with a flat string now takes the
   same-type path `===` already took. `rope == flat` answered false and answers
   true, matching node. No performance claim.
+- Patch `0056`: `parseInt` answers a numeric argument with a decimal radix from
+  the number itself, instead of converting it to a string, copying it to a second
+  buffer and parsing the digits back. An int argument is 67.4% faster, a float
+  84.9% and `1.5e20` 87.2%; values outside the fast window keep the general
+  path.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
