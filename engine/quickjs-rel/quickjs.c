@@ -52096,6 +52096,14 @@ static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int idx, c;
 
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING &&
+        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
+        p = JS_VALUE_GET_STRING(this_val);
+        if (likely((uint32_t)JS_VALUE_GET_INT(argv[0]) < p->len))
+            return js_int32(string_get(p, JS_VALUE_GET_INT(argv[0])));
+        return JS_NAN;
+    }
+
     val = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(val))
         return val;
@@ -52120,6 +52128,15 @@ static JSValue js_string_charAt(JSContext *ctx, JSValueConst this_val,
     JSValue val, ret;
     JSString *p;
     int idx, c;
+
+    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING &&
+        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
+        p = JS_VALUE_GET_STRING(this_val);
+        if (likely((uint32_t)JS_VALUE_GET_INT(argv[0]) < p->len))
+            return js_new_string_char(ctx,
+                       string_get(p, JS_VALUE_GET_INT(argv[0])));
+        return js_empty_string(ctx->rt);
+    }
 
     val = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(val))

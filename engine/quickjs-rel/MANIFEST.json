@@ -239,12 +239,16 @@
       "sha256": "711ba141d7fcbfa9576ed73a3ae4d6ea7783d19d9ac8b323fec1bd56df0640d7"
     },
     {
+      "name": "0060-charidx-primitive-receiver-arm.patch",
+      "sha256": "b47018f7f8cbcef0ffa8e2e7bf91dbe856c894e89c10a1561b4a929d25df2c09"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "6ad922324de6e0d47e0b263e9fc998b9213702e9334403c36e381365510fd64a"
     }
   ],
   "files": {
-    "quickjs.c": "bc74714807b15ee0039b1c104d531e36f501bfe6f19dc728df7667cc3d10cd70",
+    "quickjs.c": "edd28cf51cfbb6ccdfe72d2fe28a271a762905048ef7080ffc7469d780653857",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
