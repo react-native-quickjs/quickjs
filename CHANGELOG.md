@@ -118,6 +118,10 @@ and this project adheres to [Semantic Versioning][semver].
   platform conversion instead of running the multi-precision search, whose cost
   grows with the exponent. `5e-324` is 90.2% faster and `1.5e-300` 6.6%, with the
   ordinary range unchanged.
+- Patch `0054`: `js_string_eq` returns true when both operands are the same
+  `JSString`, before the length test and the memcmp. Comparing equal strings is
+  8.4-12.8% faster, with different content and non-string comparisons unchanged;
+  the sampled Octane rows move +0.48% geomean.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

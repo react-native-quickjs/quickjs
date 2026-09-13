@@ -5806,6 +5806,8 @@ static int js_string_memcmp(JSString *p1, JSString *p2, int len)
 }
 
 static bool js_string_eq(JSString *p1, JSString *p2) {
+    if (p1 == p2)
+        return true;
     if (p1->len != p2->len)
         return false;
     return js_string_memcmp(p1, p2, p1->len) == 0;
