@@ -1,0 +1,31 @@
+Subject: Answer Loose Equality Between A Rope And A Flat String
+
+What this does
+  js_eq_slow sends two strings to js_strict_eq2 even when their tags differ, so a
+  rope compared with a flat string takes the same-type path that === already
+  takes.
+
+Why we need it
+  A rope (JS_TAG_STRING_ROPE) and a flat string (JS_TAG_STRING) are the same
+  ECMAScript type, and ECMA-262 7.2.15 step 1 dispatches on type, not on tag. The
+  tag equality test made `rope == flat` answer false while `rope === flat`
+  answered true.
+
+What it adds
+  One condition: `tag1 == tag2 || (tag_is_string(tag1) && tag_is_string(tag2))`.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -17695,7 +17695,8 @@
+             if (res < 0)
+                 goto exception;
+         }
+-    } else if (tag1 == tag2) {
++    } else if (tag1 == tag2 ||
++               (tag_is_string(tag1) && tag_is_string(tag2))) {
+         res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
+         JS_FreeValue(ctx, op1);
+         JS_FreeValue(ctx, op2);
