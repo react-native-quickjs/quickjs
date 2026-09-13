@@ -395,6 +395,8 @@ typedef struct JSValueLink {
 
 #define JS_INTSTR_MAX 256
 
+#define JS_CHAR2_K 1024
+
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -413,6 +415,11 @@ struct JSRuntime {
     /* Interned one-character Latin-1 strings, lazily filled.  Each non-NULL
        entry holds ONE permanent reference, dropped in JS_FreeRuntime. */
     JSAtomStruct *onechar[256];
+
+    /* Two-character ASCII strings.  Each non-NULL entry holds ONE permanent
+       reference, dropped in JS_FreeRuntime.  Entries fill empty slots only, so
+       the table is a bound rather than a policy. */
+    JSAtomStruct *char2[JS_CHAR2_K];
 
     /* Canonical decimal strings for small non-negative ints.  Each non-NULL
        entry holds ONE permanent reference, dropped in JS_FreeRuntime. */
@@ -3010,6 +3017,12 @@ void JS_FreeRuntime(JSRuntime *rt)
             rt->onechar[oc] = NULL;
         }
     }
+    for (int c2 = 0; c2 < JS_CHAR2_K; c2++) {
+        if (rt->char2[c2] != NULL) {
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->char2[c2]));
+            rt->char2[c2] = NULL;
+        }
+    }
     for (int iv = 0; iv < JS_INTSTR_MAX; iv++) {
         if (rt->intstr[iv] != NULL) {
             JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->intstr[iv]));
@@ -5059,16 +5072,40 @@ static JSValue js_int_to_string(JSContext *ctx, int32_t v)
     return js_new_string8_len(ctx, buf, len);
 }
 
+static inline unsigned js_char2_slot(const char *buf)
+{
+    uint16_t k = ((uint8_t)buf[0] << 8) | (uint8_t)buf[1];
+    return (k * 2654435761u) >> 22;
+}
+
 // XXX: `buf` contains raw 8-bit data, no UTF-8 decoding is performed
 // XXX: no special case for len == 0
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len)
 {
     JSString *str;
+    unsigned h;
+
+    if (len == 2) {
+        JSString *c2 = ctx->rt->char2[js_char2_slot(buf)];
+
+        if (c2 != NULL && (uint8_t)str8(c2)[0] == (uint8_t)buf[0] &&
+            (uint8_t)str8(c2)[1] == (uint8_t)buf[1]) {
+            JS_REF_COUNT(c2)++;
+            return JS_MKPTR(JS_TAG_STRING, c2);
+        }
+    }
     str = js_alloc_string(ctx, len, 0);
     if (!str)
         return JS_EXCEPTION;
     memcpy(str8(str), buf, len);
     str8(str)[len] = '\0';
+    if (len == 2) {
+        h = js_char2_slot(buf);
+        if (ctx->rt->char2[h] == NULL) {
+            ctx->rt->char2[h] = str;
+            JS_REF_COUNT(str)++; /* the table's permanent reference */
+        }
+    }
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
