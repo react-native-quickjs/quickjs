@@ -1180,7 +1180,37 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
        B^(P-1) <= F < 2.B^P. */
     E = 1 + mul_log2_radix(e - 1, radix);
     
-    if (fmt == JS_DTOA_FORMAT_FREE) {
+    if (fmt == JS_DTOA_FORMAT_FREE && radix == 10 && E <= -100) {
+        char tmpbuf[64];
+        double ad = fabs(d);
+        uint64_t mant = 0;
+        const char *s;
+        int lo = 1, hi = 17, best = 17;
+
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+
+            snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", mid - 1, ad);
+            if (strtod(tmpbuf, NULL) == ad) {
+                best = mid;
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", best - 1, ad);
+        for (s = tmpbuf; *s && *s != 'e'; s++) {
+            if (*s >= '0' && *s <= '9')
+                mant = mant * 10 + (*s - '0');
+        }
+        P = best;
+        E = atoi(s + 1) + 1;
+        while (P > 1 && (mant % 10) == 0) {
+            mant /= 10;
+            P--;
+        }
+        mpb_set_u64(tmp1, mant);
+    } else if (fmt == JS_DTOA_FORMAT_FREE) {
         int P_max, E0, e1, E_found, P_found;
         uint64_t m1, mant_found, mant, mant_max1;
         /* P_max is guarranteed to work by construction */
