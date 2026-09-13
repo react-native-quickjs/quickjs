@@ -393,6 +393,8 @@ typedef struct JSValueLink {
     JSValueConst value;
 } JSValueLink;
 
+#define JS_INTSTR_MAX 256
+
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -411,6 +413,10 @@ struct JSRuntime {
     /* Interned one-character Latin-1 strings, lazily filled.  Each non-NULL
        entry holds ONE permanent reference, dropped in JS_FreeRuntime. */
     JSAtomStruct *onechar[256];
+
+    /* Canonical decimal strings for small non-negative ints.  Each non-NULL
+       entry holds ONE permanent reference, dropped in JS_FreeRuntime. */
+    JSAtomStruct *intstr[JS_INTSTR_MAX];
 
     JSClassID js_class_id_alloc; /* counter for user defined classes */
     int class_count;    /* size of class_array */
@@ -3004,6 +3010,12 @@ void JS_FreeRuntime(JSRuntime *rt)
             rt->onechar[oc] = NULL;
         }
     }
+    for (int iv = 0; iv < JS_INTSTR_MAX; iv++) {
+        if (rt->intstr[iv] != NULL) {
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->intstr[iv]));
+            rt->intstr[iv] = NULL;
+        }
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
     /* only the atoms defined in JS_InitAtoms() should be left */
@@ -5018,6 +5030,33 @@ static inline JSValue js_empty_string(JSRuntime *rt)
 {
     JSAtomStruct *p = rt->atom_array[JS_ATOM_empty_string];
     return js_dup(JS_MKPTR(JS_TAG_STRING, p));
+}
+
+static JSValue js_int_to_string(JSContext *ctx, int32_t v)
+{
+    char buf[16];
+    size_t len = i32toa(buf, v);
+
+    if ((uint32_t)v < JS_INTSTR_MAX) {
+        JSRuntime *rt = ctx->rt;
+        JSString *p = rt->intstr[v];
+
+        if (likely(p != NULL)) {
+            JS_REF_COUNT(p)++;
+            return JS_MKPTR(JS_TAG_STRING, p);
+        }
+        {
+            JSValue s = js_new_string8_len(ctx, buf, len);
+
+            if (unlikely(JS_IsException(s)))
+                return s;
+            p = JS_VALUE_GET_STRING(s);
+            rt->intstr[v] = p;
+            JS_REF_COUNT(p)++; /* the table's permanent reference */
+            return s;
+        }
+    }
+    return js_new_string8_len(ctx, buf, len);
 }
 
 // XXX: `buf` contains raw 8-bit data, no UTF-8 decoding is performed
@@ -16192,8 +16231,6 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                                    int flags)
 {
     uint32_t tag;
-    char buf[32];
-    size_t len;
 
     tag = JS_VALUE_GET_NORM_TAG(val);
     switch(tag) {
@@ -16202,8 +16239,7 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
     case JS_TAG_STRING_ROPE:
         return js_linearize_string_rope(ctx, val);
     case JS_TAG_INT:
-        len = i32toa(buf, JS_VALUE_GET_INT(val));
-        return js_new_string8_len(ctx, buf, len);
+        return js_int_to_string(ctx, JS_VALUE_GET_INT(val));
     case JS_TAG_BOOL:
         return JS_AtomToString(ctx, JS_VALUE_GET_BOOL(val) ?
                           JS_ATOM_true : JS_ATOM_false);
