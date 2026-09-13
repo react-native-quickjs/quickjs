@@ -1,0 +1,176 @@
+Subject: Fold The Prologue Store-Load Pair And Minified `!0`
+
+What this does
+  Two rewrites in resolve_labels, both strict shrinks of the bytecode stream.
+  A function whose body opens by reading a prologue-initialised binding starts
+  with `put_loc(n) get_loc(n)`; that becomes `set_loc(n)`. And the sequence a
+  minifier emits for a boolean constant -- `push_i32(0) lnot` for `!0`,
+  `push_i32(v) lnot` for `!v` -- becomes `push_true` or `push_false`.
+
+Why we need it
+  Upstream already folds `put_x(n) get_x(n)` into `set_x(n)`, but the prologue
+  initialisers are written straight into the output buffer before the rewriting
+  loop starts, so their stores never pass through that case and the redundant
+  load survives on every call, forever. The store is whichever initialiser was
+  emitted last -- `this`, `new.target`, `arguments`, the home object, the active
+  function, the function's self-reference or either variable-environment object
+  -- which is the complete set, because the body's first instruction can only
+  read one binding. The `lnot` fold exists because terser writes `true` as `!0`
+  and `false` as `!1`: a production React Native bundle in this repository
+  contains 478-488 of them, against seven foldable binary constants, so the
+  bundler reintroduces exactly the pattern the engine can remove.
+
+What it adds
+  The store's stack effect is unchanged -- `put_loc` pops, `set_loc` does not,
+  and the `get_loc` that followed pushed the value back -- so compute_stack_size
+  and the interpreter are untouched. The prologue fold only fires when the store
+  is still the last thing emitted, when the body's first instruction is not a
+  branch target, and when it is not one of the shapes the element-load and
+  borrow fusions take over: consuming that `get_loc` here would defeat
+  `get_loc_field_nr` and `get_loc8_array_el` and reintroduce the dup/free round
+  trip on the receiver. No opcode slot is spent and nothing is renumbered.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -39263,8 +39263,17 @@
+     }
+     return kinds;
+ }
++#define PROLOGUE_PUT_LOC(var_idx) do {                  \
++        prologue_put_pos = (int)bc_out.size;            \
++        put_short_code(&bc_out, OP_put_loc, (var_idx)); \
++        prologue_put_end = (int)bc_out.size;            \
++        prologue_put_idx = (var_idx);                   \
++    } while (0)
++
+ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+ {
++    int prologue_put_pos = -1, prologue_put_end = -1, prologue_put_idx = -1;
++    int prologue_skip_to = 0;
+     int pos, pos_next, bc_len, op, op1, len, i, line_num, col_num, patch_offsets;
+     const uint8_t *bc_buf;
+     DynBuf bc_out;
+@@ -39328,19 +39337,19 @@
+     if (s->home_object_var_idx >= 0) {
+         dbuf_putc(&bc_out, OP_special_object);
+         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_HOME_OBJECT);
+-        put_short_code(&bc_out, OP_put_loc, s->home_object_var_idx);
++        PROLOGUE_PUT_LOC(s->home_object_var_idx);
+     }
+     /* initialize the 'this.active_func' variable if needed */
+     if (s->this_active_func_var_idx >= 0) {
+         dbuf_putc(&bc_out, OP_special_object);
+         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_THIS_FUNC);
+-        put_short_code(&bc_out, OP_put_loc, s->this_active_func_var_idx);
++        PROLOGUE_PUT_LOC(s->this_active_func_var_idx);
+     }
+     /* initialize the 'new.target' variable if needed */
+     if (s->new_target_var_idx >= 0) {
+         dbuf_putc(&bc_out, OP_special_object);
+         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_NEW_TARGET);
+-        put_short_code(&bc_out, OP_put_loc, s->new_target_var_idx);
++        PROLOGUE_PUT_LOC(s->new_target_var_idx);
+     }
+     /* initialize the 'this' variable if needed. In a derived class
+        constructor, this is initially uninitialized. */
+@@ -39350,7 +39359,7 @@
+             dbuf_put_u16(&bc_out, s->this_var_idx);
+         } else {
+             dbuf_putc(&bc_out, OP_push_this);
+-            put_short_code(&bc_out, OP_put_loc, s->this_var_idx);
++            PROLOGUE_PUT_LOC(s->this_var_idx);
+         }
+     }
+     /* initialize the 'arguments' variable if needed */
+@@ -39368,24 +39377,49 @@
+         }
+         if (s->arguments_arg_idx >= 0)
+             put_short_code(&bc_out, OP_set_loc, s->arguments_arg_idx);
+-        put_short_code(&bc_out, OP_put_loc, s->arguments_var_idx);
++        PROLOGUE_PUT_LOC(s->arguments_var_idx);
+     }
+     /* initialize a reference to the current function if needed */
+     if (s->func_var_idx >= 0) {
+         dbuf_putc(&bc_out, OP_special_object);
+         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_THIS_FUNC);
+-        put_short_code(&bc_out, OP_put_loc, s->func_var_idx);
++        PROLOGUE_PUT_LOC(s->func_var_idx);
+     }
+     /* initialize the variable environment object if needed */
+     if (s->var_object_idx >= 0) {
+         dbuf_putc(&bc_out, OP_special_object);
+         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_VAR_OBJECT);
+-        put_short_code(&bc_out, OP_put_loc, s->var_object_idx);
++        PROLOGUE_PUT_LOC(s->var_object_idx);
+     }
+     if (s->arg_var_object_idx >= 0) {
+         dbuf_putc(&bc_out, OP_special_object);
+         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_VAR_OBJECT);
+-        put_short_code(&bc_out, OP_put_loc, s->arg_var_object_idx);
++        PROLOGUE_PUT_LOC(s->arg_var_object_idx);
++    }
++
++    /* <push X> put_loc(n) get_loc(n)  ->  <push X> set_loc(n) */
++    if (prologue_put_pos >= 0 && (int)bc_out.size == prologue_put_end) {
++        CodeContext cc0;
++        cc0.bc_buf = bc_buf;
++        cc0.bc_len = bc_len;
++        if (!code_match(&cc0, 0, OP_get_loc, prologue_put_idx, OP_get_field, -1)
++        &&  !code_match(&cc0, 0, OP_get_loc, prologue_put_idx, OP_get_array_el, -1)
++        &&  code_match(&cc0, 0, OP_get_loc, prologue_put_idx, -1)) {
++            int pop = bc_out.buf[prologue_put_pos];
++            int sop = -1;
++            if (pop >= OP_put_loc0 && pop <= OP_put_loc3)
++                sop = OP_set_loc0 + (pop - OP_put_loc0);
++            else if (pop == OP_put_loc8)
++                sop = OP_set_loc8;
++            else if (pop == OP_put_loc)
++                sop = OP_set_loc;
++            if (sop >= 0) {
++                bc_out.buf[prologue_put_pos] = sop;
++                if (cc0.line_num >= 0) line_num = cc0.line_num;
++                if (cc0.col_num >= 0) col_num = cc0.col_num;
++                prologue_skip_to = cc0.pos;
++            }
++        }
+     }
+ 
+     d3_ev = d3_build_events(ctx, s, &d3_n);
+@@ -39399,7 +39433,7 @@
+         }
+     }
+ 
+-    for (pos = 0; pos < bc_len; pos = pos_next) {
++    for (pos = prologue_skip_to; pos < bc_len; pos = pos_next) {
+         int val;
+         objlit_template_index = -1;
+         op = bc_buf[pos];
+@@ -39760,8 +39794,17 @@
+             }
+             /* remove push/drop pairs generated by the parser */
+             if (code_match(&cc, pos_next, OP_drop, -1)) {
++                if (cc.line_num >= 0) line_num = cc.line_num;
++                if (cc.col_num >= 0) col_num = cc.col_num;
++                pos_next = cc.pos;
++                break;
++            }
++            /* transform i32(val) lnot -> true/false */
++            if (code_match(&cc, pos_next, OP_lnot, -1)) {
+                 if (cc.line_num >= 0) line_num = cc.line_num;
+                 if (cc.col_num >= 0) col_num = cc.col_num;
++                add_pc2line_info(s, bc_out.size, line_num, col_num);
++                dbuf_putc(&bc_out, val == 0 ? OP_push_true : OP_push_false);
+                 pos_next = cc.pos;
+                 break;
+             }
+@@ -40428,6 +40471,7 @@
+     dbuf_free(&bc_out);
+     return -1;
+ }
++#undef PROLOGUE_PUT_LOC
+ 
+ /* compute the maximum stack size needed by the function */
+ 

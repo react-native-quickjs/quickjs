@@ -255,18 +255,54 @@
       "sha256": "9c1ac970c0ec0909806baf4817d752ad9080c7d09691aa064c8e7ceb2e13a9ff"
     },
     {
+      "name": "0064-get-loc8-array-el-fusion.patch",
+      "sha256": "e414571f4ca1784bb0ecba3197884c518cfa70b5dede455e685915b31bdcd5f3"
+    },
+    {
+      "name": "0065-free-peepholes.patch",
+      "sha256": "7215058ec0c761ef276e6bf5577176769c56e705453e811c0db205efae43c91f"
+    },
+    {
+      "name": "0066-arg-element-and-for-in-fusion.patch",
+      "sha256": "ee5ce68f7a03b2f95014e07664191f3046bd23671c01e40d2cab872edb1dac96"
+    },
+    {
+      "name": "0067-prologue-store-load-and-lnot-fold.patch",
+      "sha256": "79ba49846d220ad05f5bd22668c2cb9d4d257b705db738ecfe2c556238337ac2"
+    },
+    {
+      "name": "0068-tdz-check-elimination.patch",
+      "sha256": "6ca73229504e8dd567579c8f0d41ec8bd848ff1fcded5f13ec522f3f409c983e"
+    },
+    {
+      "name": "0069-arg-field-borrow-fusion.patch",
+      "sha256": "57b2bcffe6788e1cfa07b00d3cda7ab81503662b986e1999c24fd8f296e8e359"
+    },
+    {
+      "name": "0070-element-store-template-removal.patch",
+      "sha256": "4295cc1e1af155fdb67b7f38e6dd1647d1446ef93a99649d4aa9a77abd7b06f6"
+    },
+    {
+      "name": "0071-arguments-alias-elision.patch",
+      "sha256": "59933754adea68b7ae5ccbef5f019825db9cf50a479351aefd5e8cde9eda2334"
+    },
+    {
+      "name": "0072-arg-key-element-load-fusion.patch",
+      "sha256": "de629172f892274c1cdafb654f7d78a4ad8c7c01faad4b9f1e0ecb8b1b8583e0"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "6ad922324de6e0d47e0b263e9fc998b9213702e9334403c36e381365510fd64a"
+      "sha256": "9fa34067db850193d6d7f5dcd9d9b4980f6f38c2912c16015770308f2146c689"
     }
   ],
   "files": {
-    "quickjs.c": "4beed39e8e5113b8a8efd144a0cbe498ebff5befeb1346d3a678089c192548c1",
+    "quickjs.c": "a3081b742720724c446894b30e39673cbc044bb5820d018fd631460d408482b2",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
-    "builtin-array-fromasync.h": "830677aaec6fa478b31a99a2a90cec3f12c6ed3d63d287375dc16e643fdc852b",
-    "builtin-iterator-zip-keyed.h": "4bd3c13042b28fe61e0fc5ce704b6ea686564c550005f8bcd975426e27b6b744",
-    "builtin-iterator-zip.h": "4ff72c86c1bae92e3261bf6ed8a1ec4661cc6f873acacaabf41b6f2e4d43ffcc",
+    "builtin-array-fromasync.h": "32c09f74213db61775d9bb7f0a779f7113ecc2888367a9a30fc378e6f58027c7",
+    "builtin-iterator-zip-keyed.h": "eec60b26c18d47699654de40ea3876cd6ad6be117609151450b193edeb30cd59",
+    "builtin-iterator-zip.h": "2990b9dde3357ee992fcb1eb30ce7bcefc51e60c8f94676d70ead14656e535ab",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
@@ -277,7 +313,7 @@
     "list.h": "cb6e24e8ee54bccdd66234fe54cd702d1160b9841db2b9b9adeb5003afe301d5",
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
-    "quickjs-opcode.h": "fdbb9d0924132c47ee4aaf87786a16cf6a06f9260d7a3a0369d71fcf5070cebe",
+    "quickjs-opcode.h": "1b7048a6ef57bd952257c4b2b0c0fe8848f1a476c35c420c80c7f939e9fe7319",
     "quickjs.h": "a532b83c8c37cc79fedff1846ed2469478fc4f1ca1e6197cb402443c66a8996d",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }

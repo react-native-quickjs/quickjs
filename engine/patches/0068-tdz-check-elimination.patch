@@ -1,0 +1,122 @@
+Subject: Eliminate Provably-Redundant TDZ Checks
+
+What this does
+  A linear pass between scope resolution and label resolution tracks one bit per
+  local -- "known to hold a value on every path that reaches here" -- and
+  rewrites OP_get_loc_check to OP_get_loc where that bit is set. Both opcodes are
+  three bytes with a `loc` operand, so the rewrite is one byte in place and no
+  offset moves.
+
+Why we need it
+  Every read of a lexical local is emitted with a TDZ test, because the emission
+  site decides on is_lexical alone. `const n = props.n; f(n); g(n); h(n);` pays
+  the test four times when three of them cannot fire. Running before label
+  resolution also makes a check removed here eligible for the element-load and
+  borrow fusions, which match OP_get_loc only.
+
+What it adds
+  Not a dataflow fixpoint: the bitmap is cleared at every OP_label, which is
+  sufficient because every jump target is still an explicit label at this point
+  in compilation, plus at OP_gosub and OP_ret because a finally block runs
+  between them and can leave a slot uninitialised. A successful check is itself
+  proof that the slot holds a value, so the first read in a region keeps its
+  check and later reads are rewritten. Bail-out is always toward keeping the
+  check: an allocation failure, an opcode with no fixed size or an out-of-range
+  slot leaves the stream alone. QJS_TDZ_KEEP_CHECKS=1 keeps every check, which is
+  the rollback and the same-binary control leg.
+
+Needs a bytecode version bump
+  Yes. `9999` carries the version and the rebuilt built-in blobs.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -39269,7 +39269,80 @@
+         prologue_put_end = (int)bc_out.size;            \
+         prologue_put_idx = (var_idx);                   \
+     } while (0)
++
++/* Rollback and same-binary control leg: QJS_TDZ_KEEP_CHECKS=1 keeps every TDZ
++   check, which is what the compiler emitted before. */
++static int js_tdz_keep_v = -1;
++static inline bool js_tdz_elim_on(void)
++{
++    if (unlikely(js_tdz_keep_v < 0)) {
++        const char *e = getenv("QJS_TDZ_KEEP_CHECKS");
++        js_tdz_keep_v = (e != NULL && e[0] == '1');
++    }
++    return !js_tdz_keep_v;
++}
+ 
++/* Rewrites OP_get_loc_check to OP_get_loc for lexical locals already known to
++   hold a value: one linear scan with a bit per local, not a dataflow fixpoint.
++   Every jump target is still an OP_label here, so labels reset the state, and
++   OP_gosub/OP_ret are barriers because a finally block can run between them.
++   Both opcodes are 3 bytes, so the rewrite is one byte in place. */
++static void eliminate_tdz_checks(JSFunctionDef *s)
++{
++    uint8_t *bc_buf = s->byte_code.buf;
++    int bc_len = s->byte_code.size;
++    int pos, op, len, idx, n, nwords;
++    uint32_t *init;
++
++    if (!js_tdz_elim_on())
++        return;
++    n = s->var_count;
++    if (n <= 0)
++        return;
++    nwords = (n + 31) / 32;
++    init = js_mallocz(s->ctx, sizeof(*init) * nwords);
++    if (init == NULL)
++        return;
++
++    for (pos = 0; pos < bc_len; pos += len) {
++        op = bc_buf[pos];
++        len = opcode_info[op].size;
++        if (len <= 0)
++            break;
++        switch (op) {
++        case OP_label:
++        case OP_gosub:
++        case OP_ret:
++            memset(init, 0, sizeof(*init) * nwords);
++            break;
++        case OP_get_loc_check:
++            idx = get_u16(bc_buf + pos + 1);
++            if (idx >= n)
++                break;
++            if (init[idx >> 5] & (1u << (idx & 31)))
++                bc_buf[pos] = OP_get_loc;
++            else
++                init[idx >> 5] |= 1u << (idx & 31);
++            break;
++        case OP_put_loc:
++        case OP_set_loc:
++        case OP_put_loc_check:
++        case OP_put_loc_check_init:
++            idx = get_u16(bc_buf + pos + 1);
++            if (idx < n)
++                init[idx >> 5] |= 1u << (idx & 31);
++            break;
++        case OP_set_loc_uninitialized:
++        case OP_close_loc:
++            idx = get_u16(bc_buf + pos + 1);
++            if (idx < n)
++                init[idx >> 5] &= ~(1u << (idx & 31));
++            break;
++        }
++    }
++    js_free(s->ctx, init);
++}
++
+ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+ {
+     int prologue_put_pos = -1, prologue_put_end = -1, prologue_put_idx = -1;
+@@ -40887,6 +40960,8 @@
+     }
+ #endif
+ 
++    eliminate_tdz_checks(fd);
++
+     if (resolve_labels(ctx, fd))
+         goto fail;
+ 
