@@ -227,12 +227,16 @@
       "sha256": "b1f77bd49d10440820e8e8ea506878c5cb8da6996f17f916b214f0d3141318e4"
     },
     {
+      "name": "0057-fused-string-accumulation.patch",
+      "sha256": "3047c6db7edd1258686c05d963a3e4794d2d78e3b56312c7cec653c568c7ac81"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "6ad922324de6e0d47e0b263e9fc998b9213702e9334403c36e381365510fd64a"
     }
   ],
   "files": {
-    "quickjs.c": "ece9a453a8fc360f4e8461b3ebc07f6f7aa5d107780ec672f95edca815ab75cc",
+    "quickjs.c": "434a9e6209e9c3a1125b42681b712c3dd810833a7b7216e67745daae4ce774e4",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

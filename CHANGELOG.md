@@ -131,6 +131,11 @@ and this project adheres to [Semantic Versioning][semver].
   buffer and parsing the digits back. An int argument is 67.4% faster, a float
   84.9% and `1.5e20` 87.2%; values outside the fast window keep the general
   path.
+- Patch `0057`: a store that follows a string `add` and targets the very
+  `JSString` being concatenated appends into that string's own buffer instead of
+  copying it, which turns repeated appends from O(n^2) into amortised O(n).
+  Appending to a local is 56.5% faster, to a property 49.8%, two-character chunks
+  63.5% and a wide character 79.4%; Octane pdfjs +17.86% and geomean +4.70%.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

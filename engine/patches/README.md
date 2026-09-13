@@ -67,6 +67,7 @@ what we changed and why without opening a single `.patch` file.
 | `0054` | Compares identical strings by pointer before their bytes | Two references to the same JSString ran a memcmp of a buffer against itself, and interned literals make that the common case for a prop tested against a constant | - | No |
 | `0055` | Answers loose equality between a rope and a flat string | A rope and a flat string are the same ECMAScript type, but `js_eq_slow` dispatched on tag equality, so `rope == flat` answered false while `rope === flat` answered true (ECMA-262 7.2.15 step 1) | - | No |
 | `0056` | Answers `parseInt(<number>)` from the number | The general path converts the number to a decimal string, copies it to a second buffer, parses the digits back and frees both -- two allocations, a dtoa and an atof to recompute a value already in a register | - | No |
+| `0057` | Fuses `x += s` string accumulation into the accumulator | `x += s` loads `x`, so at the add the accumulator is held by `x`'s storage and the operand stack; `JS_ConcatString2`'s in-place extend requires refcount 1, so the whole accumulator is copied instead -- 42.7 GB of characters on Octane pdfjs | - | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches

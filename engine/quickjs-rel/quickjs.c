@@ -17140,6 +17140,126 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
     return -1;
 }
 
+#define JS_STRING_ACCUM_MIN_GROW  64
+#define JS_STRING_ACCUM_MAX_SLACK (1 << 16)
+
+static int js_accum_append(JSContext *ctx, JSValue *pslot,
+                           JSValue op1, JSValue op2, int stack_ref)
+{
+    JSString *p1, *p2;
+    uint32_t nlen, cap;
+    size_t need;
+
+    if (JS_VALUE_GET_TAG(*pslot) != JS_TAG_STRING ||
+        JS_VALUE_GET_PTR(*pslot) != JS_VALUE_GET_PTR(op1))
+        return 0;
+    p1 = JS_VALUE_GET_STRING(op1);
+    p2 = JS_VALUE_GET_STRING(op2);
+    if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0)
+        return 0;
+    if (JS_REF_COUNT(p1) != 1 + stack_ref)
+        return 0;
+    if (p1->is_wide_char != p2->is_wide_char)
+        return 0;
+    if (p2->len == 0)
+        return 0;
+    if ((uint64_t)p1->len + p2->len > JS_STRING_LEN_MAX)
+        return 0;
+    nlen = p1->len + p2->len;
+    need = sizeof(*p1) + ((size_t)nlen << p1->is_wide_char) + 1 -
+           p1->is_wide_char;
+    if (js_malloc_usable_size(ctx, p1) >= need) {
+        if (p1->is_wide_char) {
+            memcpy(str16(p1) + p1->len, str16(p2), (size_t)p2->len << 1);
+        } else {
+            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
+            str8(p1)[nlen] = '\0';
+        }
+        p1->len = nlen;
+        if (stack_ref)
+            JS_FreeValue(ctx, op1);
+    } else {
+        JSString *np;
+
+        cap = nlen;
+        if (nlen >= JS_STRING_ACCUM_MIN_GROW) {
+            uint32_t slack = nlen >> 1;
+            if (slack > JS_STRING_ACCUM_MAX_SLACK)
+                slack = JS_STRING_ACCUM_MAX_SLACK;
+            if (nlen <= JS_STRING_LEN_MAX - slack)
+                cap = nlen + slack;
+        }
+        np = js_alloc_string(ctx, cap, p1->is_wide_char);
+        if (unlikely(!np))
+            return -1;
+        if (p1->is_wide_char) {
+            memcpy(str16(np), str16(p1), (size_t)p1->len << 1);
+            memcpy(str16(np) + p1->len, str16(p2), (size_t)p2->len << 1);
+        } else {
+            memcpy(str8(np), str8(p1), p1->len);
+            memcpy(str8(np) + p1->len, str8(p2), p2->len);
+            str8(np)[nlen] = '\0';
+        }
+        np->len = nlen;
+        set_value(ctx, pslot, JS_MKPTR(JS_TAG_STRING, np));
+        if (stack_ref)
+            JS_FreeValue(ctx, op1);
+    }
+    JS_FreeValue(ctx, op2);
+    return 1;
+}
+
+static no_inline int js_add_accum_fused(JSContext *ctx, const uint8_t *pc,
+                                        JSValue *sp, JSValue *var_buf)
+{
+    JSValue op1 = sp[-2], op2 = sp[-1];
+    JSValue *pslot;
+    int adv, pop, r;
+
+    pslot = NULL;
+    pop = 2;
+    switch (*pc) {
+    case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
+        pslot = &var_buf[*pc - OP_put_loc0];
+        adv = 1;
+        break;
+    case OP_put_loc8:
+        pslot = &var_buf[pc[1]];
+        adv = 2;
+        break;
+    case OP_put_loc:
+        pslot = &var_buf[get_u16(pc + 1)];
+        adv = 3;
+        break;
+    case OP_put_field:
+    case OP_put_field_ic:
+        adv = (*pc == OP_put_field_ic) ? 7 : 5;
+        pop = 3;
+        if (JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT) {
+            JSObject *p = JS_VALUE_GET_OBJ(sp[-3]);
+            JSProperty *pr;
+            JSShapeProperty *prs;
+
+            if (!p->is_exotic &&
+                (prs = find_own_property(&pr, p, get_u32(pc + 1))) != NULL &&
+                (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                               JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
+                pslot = &pr->u.value;
+        }
+        break;
+    default:
+        return 0;
+    }
+    if (!pslot)
+        return 0;
+    r = js_accum_append(ctx, pslot, op1, op2, 1);
+    if (r <= 0)
+        return r;
+    if (pop == 3)
+        JS_FreeValue(ctx, sp[-3]);
+    return (adv << 2) | pop;
+}
+
 static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
@@ -22660,6 +22780,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                 } else {
                 add_slow_case:
+                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&
+                        JS_VALUE_GET_TAG(op2) == JS_TAG_STRING) {
+                        int r;
+
+                        sf->cur_pc = pc;
+                        r = js_add_accum_fused(ctx, pc, sp, var_buf);
+                        if (r > 0) {
+                            sp -= r & 3;
+                            pc += r >> 2;
+                            BREAK;
+                        }
+                        if (unlikely(r < 0))
+                            goto exception;
+                    }
                     sf->cur_pc = pc;
                     if (js_add_slow(ctx, sp))
                         goto exception;
@@ -22692,6 +22826,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
                     if (JS_IsException(op1))
                         goto exception;
+                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING) {
+                        int r = js_accum_append(ctx, pv, *pv, op1, 0);
+
+                        /* The braces are load-bearing: with asserts on, BREAK
+                           expands to two statements and guards only the dump. */
+                        if (r > 0) {
+                            BREAK;
+                        }
+                        if (unlikely(r < 0)) {
+                            JS_FreeValue(ctx, op1);
+                            goto exception;
+                        }
+                    }
                     op1 = JS_ConcatString(ctx, js_dup(*pv), op1);
                     if (JS_IsException(op1))
                         goto exception;
