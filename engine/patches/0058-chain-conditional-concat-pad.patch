@@ -1,0 +1,101 @@
+Subject: Pad A Concatenation Result When The Bytecode Shows The Chain Continues
+
+What this does
+  When the instruction after a string add is another add -- immediately, or after
+  exactly one operand-producing opcode of known width -- JS_ConcatString1
+  allocates the result with 16 bytes of headroom, so the next concatenation
+  appends into it in place instead of allocating and copying.
+
+Why we need it
+  A concatenation result is the most likely LEFT operand of the next
+  concatenation, and exact sizing is what refuses JS_ConcatString2's in-place
+  append. `A + x + B` therefore pays an allocation, a copy and a free for the
+  second concatenation. Padding every result is worse than useless: it grows the
+  allocations of single concatenations that never chain.
+
+What it adds
+  The decision needs `pc`, which JS_ConcatString1 does not have, so it is taken
+  in OP_add's slow tail and passed down as a one-shot hint that JS_ConcatString1
+  consumes. The lookahead is a 256-entry table indexed by the next opcode -- 0
+  refuses, 255 means the next opcode IS the add, otherwise the value is the width
+  of one operand push to step over -- and not a function, because a call from
+  inside JS_CallInternal clobbers the registers holding the interpreter's cached
+  state. A wrong width cannot corrupt anything: pc is only read, so the worst
+  outcome is a pad decision taken from a byte that is really an operand. The hint
+  is self-clearing, and the pad changes only a string's capacity, never its
+  length or its characters.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6169,6 +6169,33 @@
+ 
+ /* flat string concatenation - used by rope when concatenating short strings */
+ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2);
++
++#define JS_STRPAD_BYTES 16
++
++static int js_scat_hint;
++
++static const uint8_t js_scat_adv[256] = {
++    [OP_add] = 255, [OP_add_loc] = 255,
++    [OP_push_i32] = 5, [OP_push_const] = 5, [OP_push_atom_value] = 5,
++    [OP_get_loc] = 3, [OP_get_arg] = 3, [OP_get_var_ref] = 3,
++    [OP_push_i16] = 3,
++    [OP_push_i8] = 2, [OP_push_const8] = 2, [OP_get_loc8] = 2,
++    [OP_undefined] = 1, [OP_push_false] = 1, [OP_push_true] = 1,
++    [OP_push_empty_string] = 1,
++    [OP_get_loc0] = 1, [OP_get_loc1] = 1, [OP_get_loc2] = 1, [OP_get_loc3] = 1,
++    [OP_get_arg0] = 1, [OP_get_arg1] = 1, [OP_get_arg2] = 1, [OP_get_arg3] = 1,
++    [OP_get_var_ref0] = 1, [OP_get_var_ref1] = 1,
++    [OP_get_var_ref2] = 1, [OP_get_var_ref3] = 1,
++};
++
++static inline void js_scat_set_hint(const uint8_t *pc)
++{
++    unsigned a = js_scat_adv[pc[0]];
++
++    js_scat_hint = (a == 0) ? 0 :
++                   (a == 255) ? 1 :
++                   (pc[a] == OP_add || pc[a] == OP_add_loc);
++}
+ 
+ static JSValue JS_ConcatString1(JSContext *ctx, JSString *p1, JSString *p2)
+ {
+@@ -6180,9 +6207,21 @@
+     if (len > JS_STRING_LEN_MAX)
+         return JS_ThrowRangeError(ctx, "invalid string length");
+     is_wide_char = p1->is_wide_char | p2->is_wide_char;
+-    p = js_alloc_string(ctx, len, is_wide_char);
+-    if (!p)
+-        return JS_EXCEPTION;
++    {
++        uint32_t cap = len;
++
++        if (js_scat_hint) {
++            uint32_t slack = (uint32_t)JS_STRPAD_BYTES >> is_wide_char;
++
++            if (slack != 0 && len <= (uint32_t)JS_STRING_LEN_MAX - slack)
++                cap = len + slack;
++        }
++        js_scat_hint = 0;
++        p = js_alloc_string(ctx, cap, is_wide_char);
++        if (!p)
++            return JS_EXCEPTION;
++        p->len = len;
++    }
+     if (!is_wide_char) {
+         memcpy(str8(p), str8(p1), p1->len);
+         memcpy(str8(p) + p1->len, str8(p2), p2->len);
+@@ -22794,6 +22833,9 @@
+                         if (unlikely(r < 0))
+                             goto exception;
+                     }
++                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING ||
++                        JS_VALUE_GET_TAG(op2) == JS_TAG_STRING)
++                        js_scat_set_hint(pc);
+                     sf->cur_pc = pc;
+                     if (js_add_slow(ctx, sp))
+                         goto exception;
