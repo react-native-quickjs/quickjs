@@ -1,0 +1,65 @@
+Subject: Remove The dtoa Exponent Cliff For Small Values
+
+What this does
+  js_dtoa's shortest-representation search hands an extreme negative decimal
+  exponent to the platform conversion: it binary-searches precisions 1..17 and
+  accepts a candidate only when it parses back to exactly this double, so the
+  smallest accepted candidate is the shortest representation. The existing
+  formatter is then fed the same (mant, P, E) the search would have produced.
+
+Why we need it
+  The search is multi-precision, and mul_pow builds radix^f by repeatedly
+  multiplying or dividing the whole number, so its cost grows with the decimal
+  exponent. Near the bottom of the double range that collapses: the smallest
+  denormal cost about a hundred times an ordinary value.
+
+What it adds
+  The branch is taken only for JS_DTOA_FORMAT_FREE, radix 10 and E <= -100. No
+  format, opcode or bytecode change. The positive side is left alone, where the
+  platform round trip costs more than the engine's search when many digits are
+  needed.
+
+Needs a bytecode version bump
+  No
+
+--- a/dtoa.c
++++ b/dtoa.c
+@@ -1180,7 +1180,37 @@
+        B^(P-1) <= F < 2.B^P. */
+     E = 1 + mul_log2_radix(e - 1, radix);
+     
+-    if (fmt == JS_DTOA_FORMAT_FREE) {
++    if (fmt == JS_DTOA_FORMAT_FREE && radix == 10 && E <= -100) {
++        char tmpbuf[64];
++        double ad = fabs(d);
++        uint64_t mant = 0;
++        const char *s;
++        int lo = 1, hi = 17, best = 17;
++
++        while (lo <= hi) {
++            int mid = (lo + hi) / 2;
++
++            snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", mid - 1, ad);
++            if (strtod(tmpbuf, NULL) == ad) {
++                best = mid;
++                hi = mid - 1;
++            } else {
++                lo = mid + 1;
++            }
++        }
++        snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", best - 1, ad);
++        for (s = tmpbuf; *s && *s != 'e'; s++) {
++            if (*s >= '0' && *s <= '9')
++                mant = mant * 10 + (*s - '0');
++        }
++        P = best;
++        E = atoi(s + 1) + 1;
++        while (P > 1 && (mant % 10) == 0) {
++            mant /= 10;
++            P--;
++        }
++        mpb_set_u64(tmp1, mant);
++    } else if (fmt == JS_DTOA_FORMAT_FREE) {
+         int P_max, E0, e1, E_found, P_found;
+         uint64_t m1, mant_found, mant, mant_max1;
+         /* P_max is guarranteed to work by construction */

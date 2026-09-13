@@ -114,6 +114,10 @@ and this project adheres to [Semantic Versioning][semver].
   8.0% faster, a 9-property literal 17.4% and a literal whose values are
   variables 7.0%, and the three shipped builtins shrink 952 -> 921, 2755 -> 2720
   and 2704 -> 2669 bytes.
+- Patch `0053`: `js_dtoa` hands an extreme negative decimal exponent to the
+  platform conversion instead of running the multi-precision search, whose cost
+  grows with the exponent. `5e-324` is 90.2% faster and `1.5e-300` 6.6%, with the
+  ordinary range unchanged.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
