@@ -60,7 +60,12 @@ static uint8_t *read_file(const char *path, size_t *out_len) {
     fclose(f);
     return NULL;
   }
-  /* JS_Eval requires a NUL-terminated buffer. */
+  /* JS_Eval requires a NUL-terminated buffer. Guard against the +1 below
+   * wrapping to 0 on a file whose size is SIZE_MAX. */
+  if ((size_t)n >= SIZE_MAX) {
+    fclose(f);
+    return NULL;
+  }
   uint8_t *buf = (uint8_t *)malloc((size_t)n + 1);
   if (!buf) {
     fclose(f);
