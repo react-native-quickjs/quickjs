@@ -149,6 +149,9 @@ and this project adheres to [Semantic Versioning][semver].
   `ToString` refcount round trip and the tagged index conversion. `charCodeAt` is
   11.3% faster, `charAt` 6.0% and `charAt` on a slice receiver 10.2%; the nine-row
   Octane geomean is +0.39%.
+- Patch `0061`: number-to-string conversion for 0..255 answers from a
+  runtime-owned table of canonical decimal strings instead of running `i32toa`
+  and allocating. `'' + i` is 4.3% faster and the `'a' + i + 'b'` idiom 4.8%.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
