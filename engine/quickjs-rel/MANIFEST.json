@@ -223,12 +223,16 @@
       "sha256": "0a4623e8be206f7cbe7f4b283dc90d10c65ea718c143f1902f7070d73cddc4d8"
     },
     {
+      "name": "0056-parseint-number-fast-path.patch",
+      "sha256": "b1f77bd49d10440820e8e8ea506878c5cb8da6996f17f916b214f0d3141318e4"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "6ad922324de6e0d47e0b263e9fc998b9213702e9334403c36e381365510fd64a"
     }
   ],
   "files": {
-    "quickjs.c": "9bab15778643a0841c663d4b9d4085f9e7177b1a7bd9cd73419ffd5084c492df",
+    "quickjs.c": "ece9a453a8fc360f4e8461b3ebc07f6f7aa5d107780ec672f95edca815ab75cc",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
