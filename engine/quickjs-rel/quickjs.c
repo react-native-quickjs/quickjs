@@ -17695,7 +17695,8 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             if (res < 0)
                 goto exception;
         }
-    } else if (tag1 == tag2) {
+    } else if (tag1 == tag2 ||
+               (tag_is_string(tag1) && tag_is_string(tag2))) {
         res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
         JS_FreeValue(ctx, op1);
         JS_FreeValue(ctx, op2);

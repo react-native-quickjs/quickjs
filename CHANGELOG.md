@@ -122,6 +122,10 @@ and this project adheres to [Semantic Versioning][semver].
   `JSString`, before the length test and the memcmp. Comparing equal strings is
   8.4-12.8% faster, with different content and non-string comparisons unchanged;
   the sampled Octane rows move +0.48% geomean.
+- Patch `0055`: `js_eq_slow` sends two strings to `js_strict_eq2` even when
+  their tags differ, so a rope compared with a flat string now takes the
+  same-type path `===` already took. `rope == flat` answered false and answers
+  true, matching node. No performance claim.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
