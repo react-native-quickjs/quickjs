@@ -2,57 +2,28 @@ Subject: Fuse Object Literal Field Stores Into One Opcode
 
 What this does
   An eligible object literal compiles to OP_object followed by one
-  OP_define_field per property. In resolve_labels those N defines are deleted
-  and replaced by a single OP_object_fill [u16 n][u16 tpl_idx], which stores the
-  N values that are sitting on the operand stack into the template's slots 0..n-1
-  and leaves the object where it was.
+  OP_define_field per property. In resolve_labels those N defines are deleted and
+  replaced by a single OP_object_fill [u16 n][u16 tpl_idx], which stores the N
+  values sitting on the operand stack into the template's slots 0..n-1 and leaves
+  the object where it was.
 
 Why we need it
   Each OP_define_field costs a dispatch, a four-byte inline atom decode, a tag
-  test, an exotic test, a find_own_property hash lookup and a flags test before
-  it reaches the store. A fusion that only ran at load time would not help React
-  Native, which ships precompiled bytecode: this is a COMPILE-TIME
-  transformation, so it is baked into the .bc and the saved ops are never
-  executed at all.
+  test, an exotic test, a find_own_property hash lookup and a flags test before it
+  reaches the store. The transformation is done at compile time, so it is baked
+  into the shipped bytecode and the saved ops are never executed at all.
 
 What it adds
-  One opcode, taken over the slot of OP_nip1, which nothing emits (verified in
-  this tree: no emit_op(s, OP_nip1) anywhere and no opcode-arithmetic synthesis
-  of it). The encoding is OP_FMT_npop_u16, the same shape OP_eval already uses,
-  so compute_stack_size() and the bytecode reader/writer model the variable pop
-  with no new case.
-
-  Admission is enforced, not assumed: a site is copied only when every property
-  is a static plain data key (a spread, getter, setter, computed key, `__proto__`
-  or method all kill it), no key repeats (two defines, one slot would break the
-  correspondence), and the recorded define count matches the template's slot
-  count. The rewriter is all-or-nothing: if it passes a recorded define after
-  already deleting one for that site the compilation fails with an internal
-  error rather than emitting values with no consumer, and js_create_function
-  re-derives every template index from the same liveness predicate before it
-  allocates anything.
-
-  MEASURED, same-binary (QJS_D3_NO_FUSE as the off switch, so the code-layout
-  effect of a new opcode cancels): a 3-property literal is 8.0% faster, a
-  9-property literal 17.4% and a literal whose values are variables 7.0%, while
-  a 20-property literal (past the 16-slot template cap, so unfused), a
-  constructor and an array literal are unchanged. A literal whose three values
-  are CALL RESULTS is 2.8% slower, and that is the trade the fusion makes: the
-  values stay live on the operand stack instead of being popped one at a time.
-  Coverage on a probe: 7 of 8 sites fused, 13 defines deleted, every fill on the
-  shape-identity fast path, and the duplicate-key literal correctly left alone.
-  Bytecodes shrink by 5 bytes per deleted define, which is what the three
-  shipped builtins measure: 952 -> 921, 2755 -> 2720, 2704 -> 2669 bytes.
-
-  The sampled Octane rows are neutral (8-row geomean -0.25%, no row outside
-  noise) because they barely use literals -- splay has 6 literal sites and
-  typescript 83 -- so this patch's claim is bytecode size and startup define
-  work, not these rows.
+  One opcode, taken over the slot of OP_nip1, which nothing emits. Its encoding is
+  OP_FMT_npop_u16, the same shape OP_eval already uses, so compute_stack_size()
+  and the bytecode reader and writer model the variable pop with no new case. A
+  site is copied only when every property is a static plain data key, no key
+  repeats, and the recorded define count matches the template's slot count; the
+  rewriter is all-or-nothing, and js_create_function re-derives every template
+  index from the same liveness predicate before it allocates anything.
 
 Needs a bytecode version bump
-  No. 9999 owns the version and was regenerated for this patch: it still raises
-  27 -> 28 and now carries the three builtin blobs rebuilt by this compiler.
-  This patch changes no version number itself.
+  No. 9999 owns the version number and carries this patch's rebuilt builtins.
 
 --- a/quickjs-opcode.h
 +++ b/quickjs-opcode.h

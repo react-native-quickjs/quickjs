@@ -208,7 +208,7 @@
     },
     {
       "name": "0052-object-literal-store-fusion.patch",
-      "sha256": "28a083b06927f3de4fa617c8eecc87bcfd1c6f56ee415147a8138e117ce8ca4a"
+      "sha256": "6dbe266e44b384669fcc1744f8a1b15592ee5080c61392477e33d029f0163f5c"
     },
     {
       "name": "9999-bc-version-bump.patch",
