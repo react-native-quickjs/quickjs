@@ -155,6 +155,10 @@ and this project adheres to [Semantic Versioning][semver].
 - Patch `0062`: a two-character narrow string answers from a bounded
   1,024-entry direct-mapped per-runtime table instead of allocating. A
   two-character substring is 15.6% faster.
+- Patch `0063`: `toLowerCase` and `toUpperCase` scan a narrow string first and
+  either return the original, when no byte changes, or map the ASCII bytes in one
+  allocation. Mixed-case lowercase is 50.1% faster, already-lowercase 70.7% and
+  uppercase 55.3%, with non-ASCII input unchanged.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

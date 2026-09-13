@@ -53353,6 +53353,44 @@ static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
     p = JS_VALUE_GET_STRING(val);
     if (p->len == 0)
         return val;
+    if (!p->is_wide_char) {
+        const uint8_t *s8 = str8(p);
+        uint32_t k;
+        int ascii = 1, changed = 0;
+
+        for (k = 0; k < p->len; k++) {
+            uint8_t c8 = s8[k];
+
+            if (c8 >= 0x80) {
+                ascii = 0;
+                break;
+            }
+            if (to_lower ? (c8 >= 'A' && c8 <= 'Z')
+                         : (c8 >= 'a' && c8 <= 'z'))
+                changed = 1;
+        }
+        if (ascii) {
+            JSString *q;
+
+            if (!changed)
+                return val; /* no byte changes: the original is already owned */
+            q = js_alloc_string(ctx, p->len, 0);
+            if (!q)
+                goto fail;
+            q->len = p->len;
+            for (k = 0; k < p->len; k++) {
+                uint8_t c8 = s8[k];
+
+                if (to_lower ? (c8 >= 'A' && c8 <= 'Z')
+                             : (c8 >= 'a' && c8 <= 'z'))
+                    c8 += to_lower ? 32 : (uint8_t)-32;
+                str8(q)[k] = c8;
+            }
+            str8(q)[p->len] = '\0';
+            JS_FreeValue(ctx, val);
+            return JS_MKPTR(JS_TAG_STRING, q);
+        }
+    }
     if (string_buffer_init(ctx, b, p->len))
         goto fail;
     for(i = 0; i < p->len;) {
