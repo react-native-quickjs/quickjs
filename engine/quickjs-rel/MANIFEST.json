@@ -215,12 +215,16 @@
       "sha256": "b8fba2dcc019f1f09162ab796058f0c3ae32d25c3220f6b4028c2973f3e9c321"
     },
     {
+      "name": "0054-string-eq-pointer-identity.patch",
+      "sha256": "d62c4c241f66ee3f63ffdf3c0f6f6faaa1a1c43cabbc69d9a91c800a97c41c85"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "6ad922324de6e0d47e0b263e9fc998b9213702e9334403c36e381365510fd64a"
     }
   ],
   "files": {
-    "quickjs.c": "7caec95b0e64e0d843ca5cf12e2fcc4ea7b273e9da5e758d1ba29955c3025e35",
+    "quickjs.c": "0e76da4d366b5cb48500aab70278933bf0a16c61c4b9cca19d635b134e7b1313",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
