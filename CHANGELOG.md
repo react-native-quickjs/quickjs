@@ -140,6 +140,10 @@ and this project adheres to [Semantic Versioning][semver].
   `JS_ConcatString1` allocates the result with 16 bytes of headroom so the next
   concatenation appends into it in place. Octane splay +4.04% and the nine-row
   geomean +0.48%; a four-part chain is 10.0% faster.
+- Patch `0059`: `js_new_string_char` answers a Latin-1 character from a lazy
+  per-runtime table instead of allocating, so a hit is a load and a refcount
+  increment rather than a `js_malloc`, a header init and a one-byte memcpy.
+  Octane pdfjs +3.08%, and its allocation size falls 1.99%.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
