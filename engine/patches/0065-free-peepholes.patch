@@ -1,0 +1,65 @@
+Subject: Two Peepholes That Remove Dead Dispatches
+
+What this does
+  Two transformations in resolve_labels that delete executed instructions
+  without adding an opcode or changing the bytecode format:
+  `dup put_x_check(n) drop` becomes `put_x_check(n)`, and `lnot` in front of a
+  conditional branch becomes the inverted branch.
+
+Why we need it
+  The TDZ-checked stores have no set_x form, so the existing
+  `dup put_x(n) drop -> put_x(n)` peephole cannot match them and every
+  `let`/`const` assignment used as a statement kept its dup and its drop.
+  Separately, `!x` in front of an `if` ran a ToBoolean and a branch where the
+  branch alone does the same work.
+
+What it adds
+  Neither transformation changes what is observable. `dup put_x_check(n) drop`
+  stores one value and consumes one net reference, exactly as put_x_check(n)
+  alone does, and the TDZ check still runs before any store, so the same
+  ReferenceError is raised at the same point. `lnot` followed by a branch only
+  ever consumed one value and branched on its truthiness, and ToBoolean runs no
+  JavaScript, so the branch performs the same conversion, inversion and free.
+  No opcode is added or retired, BC_VERSION is unchanged, and the precompiled
+  built-in blobs are not regenerated because the format does not move.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -39938,9 +39938,34 @@
+                     if (line2 >= 0) line_num = line2;
+                     break;
+                 }
++                /* Transformation: dup put_x_check(n) drop -> put_x_check(n) */
++                if (code_match(&cc, pos_next,
++                               M4(OP_put_loc_check, OP_put_loc_check_init,
++                                  OP_put_var_ref_check, OP_put_var_ref_check_init),
++                               -1, OP_drop, -1)) {
++                    if (cc.line_num >= 0) line_num = cc.line_num;
++                    if (cc.col_num >= 0) col_num = cc.col_num;
++                    add_pc2line_info(s, bc_out.size, line_num, col_num);
++                    dbuf_putc(&bc_out, cc.op);
++                    dbuf_put_u16(&bc_out, cc.idx);
++                    pos_next = cc.pos;
++                    break;
++                }
+             }
+             goto no_change;
+ 
++        case OP_lnot:
++            /* Transformation: lnot if_false(l) -> if_true(l), and the reverse */
++            if (code_match(&cc, pos_next, M2(OP_if_false, OP_if_true), -1)) {
++                if (cc.line_num >= 0) line_num = cc.line_num;
++                if (cc.col_num >= 0) col_num = cc.col_num;
++                pos_next = cc.pos;
++                label = cc.label;
++                op = cc.op ^ OP_if_false ^ OP_if_true;
++                goto has_label;
++            }
++            goto no_change;
++
+         case OP_swap:
+             // transformation: swap swap -> nothing!
+             if (code_match(&cc, pos_next, OP_swap, -1, -1)) {

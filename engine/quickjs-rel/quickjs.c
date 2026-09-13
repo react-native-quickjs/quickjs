@@ -11512,8 +11512,8 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
-static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
-                                   JSValue prop)
+static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
+                                        JSValueConst prop)
 {
     JSAtom atom;
     JSValue ret;
@@ -11534,7 +11534,6 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         // so we must ensure to not invoke JS anything that's observable
         // from JS code
         atom = JS_ValueToAtomInternal(ctx, prop, JS_TO_STRING_NO_SIDE_EFFECTS);
-        JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL))
             return JS_EXCEPTION;
         if (tag == JS_TAG_NULL) {
@@ -11546,11 +11545,18 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         return JS_EXCEPTION;
     }
     atom = JS_ValueToAtom(ctx, prop);
-    JS_FreeValue(ctx, prop);
     if (unlikely(atom == JS_ATOM_NULL))
         return JS_EXCEPTION;
     ret = JS_GetProperty(ctx, this_obj, atom);
     JS_FreeAtom(ctx, atom);
+    return ret;
+}
+
+static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                                   JSValue prop)
+{
+    JSValue ret = JS_GetPropertyValueConst(ctx, this_obj, prop);
+    JS_FreeValue(ctx, prop);
     return ret;
 }
 
@@ -20079,6 +20085,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
+    /* which register file the borrow fusion reads; shared so the argument
+       and local forms have one handler body */
+    JSValue *nr_buf;
     JSVarRef **var_refs;
     size_t alloca_size;
 
@@ -21135,7 +21144,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         // Observation: get_loc0 and get_loc1 are individually very
         // frequent opcodes _and_ they are very often paired together,
         // making them ideal candidates for opcode fusion.
+        CASE(OP_get_arg_field_nr):
+            nr_buf = arg_buf;
+            goto field_nr_common;
         CASE(OP_get_loc_field_nr):
+            nr_buf = var_buf;
+        field_nr_common:
             /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
                The receiver is the local var_buf[loc] and is NEVER pushed to the
                stack, so nothing else can free it — we borrow it (no dup) and never
@@ -21160,7 +21174,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 8;
 
                 {
-                    JSValue obj = var_buf[loc];   /* borrowed, not dup'd */
+                    JSValue obj = nr_buf[loc];    /* borrowed, not dup'd */
                     if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                         p = JS_VALUE_GET_OBJ(obj);
 #if JS_ENABLE_IC
@@ -21303,23 +21317,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
         CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); BREAK;
         CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
-        CASE(OP_put_arg1): set_value(ctx, &arg_buf[1], *--sp); BREAK;
-        CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
-        CASE(OP_put_arg3): set_value(ctx, &arg_buf[3], *--sp); BREAK;
         CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
+        CASE(OP_reserved1):
+        CASE(OP_reserved2):
+        CASE(OP_reserved3):
+            JS_ThrowInternalError(ctx, "invalid opcode (retired slot)");
+            goto exception;
         CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
         CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref3): set_value(ctx, var_refs[3]->pvalue, js_dup(sp[-1])); BREAK;
 
         CASE(OP_get_var_ref):
             {
@@ -21528,6 +21539,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
             }
             BREAK;
+        CASE(OP_for_in_next_if_false):
+            sf->cur_pc = pc;
+            if (js_for_in_next(ctx, sp))
+                goto exception;
+            sp += 2;
+            /* fall through */
         CASE(OP_if_false):
             {
                 int res;
@@ -22672,6 +22689,83 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
                 if (unlikely(JS_IsException(val)))
                     goto exception;
+            }
+            BREAK;
+
+        CASE(OP_get_arg8_loc8_array_el):
+            *sp++ = js_dup(arg_buf[*pc++]);
+            /* fall through */
+        CASE(OP_get_loc8_array_el):
+            {
+                JSValue val;
+                int idx = *pc++;
+
+                if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_TAG(var_buf[idx]) == JS_TAG_INT &&
+                           JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_ARRAY &&
+                           (uint32_t)JS_VALUE_GET_INT(var_buf[idx]) <
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.count &&
+                           !js_array_slot_is_hole(
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                   JS_VALUE_GET_INT(var_buf[idx])]))) {
+                    if (js_lazy_marker_is(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                              JS_VALUE_GET_INT(var_buf[idx])]))
+                        val = js_lazy_materialize_slot(ctx,
+                                  &JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                       JS_VALUE_GET_INT(var_buf[idx])],
+                                  JS_VALUE_GET_OBJ(sp[-1]));
+                    else
+                        val = js_dup(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                         JS_VALUE_GET_INT(var_buf[idx])]);
+                } else {
+                    sf->cur_pc = pc;
+                    val = JS_GetPropertyValueConst(ctx, sp[-1], var_buf[idx]);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = val;
+            }
+            BREAK;
+
+        CASE(OP_get_arg8_array_el):
+            /* the argument-register form of OP_get_loc8_array_el: the receiver
+               is on the stack and the KEY is arg_buf[a], borrowed -- no dup, no
+               free, no 16-byte stack push and pop for it. Borrowing the key is
+               legal because JS_GetPropertyValueConst() never frees it, and the
+               only user code it can reach with the key still live takes its own
+               reference. The body is duplicated rather than shared with the loc
+               form so that form's register allocation is unchanged, and it adds
+               no function-wide local. */
+            {
+                JSValue val;
+                int idx = *pc++;
+
+                if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_TAG(arg_buf[idx]) == JS_TAG_INT &&
+                           JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_ARRAY &&
+                           (uint32_t)JS_VALUE_GET_INT(arg_buf[idx]) <
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.count &&
+                           !js_array_slot_is_hole(
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                   JS_VALUE_GET_INT(arg_buf[idx])]))) {
+                    if (js_lazy_marker_is(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                              JS_VALUE_GET_INT(arg_buf[idx])]))
+                        val = js_lazy_materialize_slot(ctx,
+                                  &JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                       JS_VALUE_GET_INT(arg_buf[idx])],
+                                  JS_VALUE_GET_OBJ(sp[-1]));
+                    else
+                        val = js_dup(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                         JS_VALUE_GET_INT(arg_buf[idx])]);
+                } else {
+                    sf->cur_pc = pc;
+                    val = JS_GetPropertyValueConst(ctx, sp[-1], arg_buf[idx]);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = val;
             }
             BREAK;
 
@@ -31604,38 +31698,25 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, (op != '='), op) < 0)
             return -1;
 
-        // comply with rather obtuse evaluation order of computed properties:
-        // obj[key]=val evaluates val->obj->key when obj is null/undefined
-        // but key->obj->val when an object
-        // FIXME(bnoordhuis) less stack shuffling; don't to_propkey twice in
-        // happy path; replace `dup is_undefined_or_null if_true` with new
-        // opcode if_undefined_or_null? replace `swap dup` with over?
+        /* `obj[key] = val` needs no stack shuffling: the order is obj -> key ->
+           val and BOTH coercions happen afterwards, inside PutValue (ES2024
+           6.2.5.6 step 3: ToObject(base), then ToPropertyKey(referenced name)).
+           OP_put_array_el already performs both. The template this replaces
+           hoisted ToPropertyKey ahead of the right-hand side whenever the base
+           was not nullish, which is the pre-ES2021 order; deleting it removes
+           eleven dispatches and moves the observable coercion order onto
+           node's. get_lvalue() emitted an OP_to_propkey2 for this lvalue, which
+           is redundant for the same reason and is dropped here. */
         if (op == '=' && opcode == OP_get_array_el) {
-            int label_next = -1;
             JSFunctionDef *fd = s->cur_func;
             assert(OP_to_propkey2 == fd->byte_code.buf[fd->last_opcode_pos]);
             fd->byte_code.size = fd->last_opcode_pos;
             fd->last_opcode_pos = -1;
-            emit_op(s, OP_swap); // obj key -> key obj
-            emit_op(s, OP_dup);
-            emit_op(s, OP_is_undefined_or_null);
-            label_next = emit_goto(s, OP_if_true, -1);
-            emit_op(s, OP_swap);
-            emit_op(s, OP_to_propkey);
-            emit_op(s, OP_swap);
-            emit_label(s, label_next);
-            emit_op(s, OP_swap);
         }
 
         if (js_parse_assign_expr2(s, parse_flags)) {
             JS_FreeAtom(s->ctx, name);
             return -1;
-        }
-
-        if (op == '=' && opcode == OP_get_array_el) {
-            emit_op(s, OP_swap); // obj key val -> obj val key
-            emit_op(s, OP_to_propkey);
-            emit_op(s, OP_swap);
         }
 
         if (op == '=') {
@@ -36608,6 +36689,9 @@ static void dump_byte_code(JSContext *ctx, int pass,
         case OP_FMT_none_loc:
             idx = (op - OP_get_loc0) % 4;
             goto has_loc;
+        case OP_FMT_loc8_loc8:
+            idx = get_u8(tab + pos + 1);
+            goto has_loc;
         case OP_FMT_loc8:
             idx = get_u8(tab + pos);
             goto has_loc;
@@ -39042,11 +39126,17 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             dbuf_putc(bc_out, OP_get_arg0 + idx);
             return;
         case OP_put_arg:
-            dbuf_putc(bc_out, OP_put_arg0 + idx);
-            return;
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_put_arg0);
+                return;
+            }
+            break;
         case OP_set_arg:
-            dbuf_putc(bc_out, OP_set_arg0 + idx);
-            return;
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_set_arg0);
+                return;
+            }
+            break;
         case OP_get_var_ref:
             dbuf_putc(bc_out, OP_get_var_ref0 + idx);
             return;
@@ -39057,8 +39147,14 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             }
             break;
         case OP_set_var_ref:
-            dbuf_putc(bc_out, OP_set_var_ref0 + idx);
-            return;
+            /* OP_set_var_ref3's slot now holds OP_get_arg8_array_el, so only
+               index 0 keeps the short form; 1-3 take the general 3-byte form,
+               like put_arg, set_arg and put_var_ref already do. */
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_set_var_ref0);
+                return;
+            }
+            break;
         case OP_call:
             dbuf_putc(bc_out, OP_call0 + idx);
             return;
@@ -39091,7 +39187,72 @@ enum {
     JS_ARGS_KIND_LENGTH,
     JS_ARGS_KIND_ELEM,
     JS_ARGS_KIND_APPLY,
+    /* `var a = arguments;`: the site emits nothing and swallows the adjacent
+       put_loc into a local whose every read is itself an approved consumer. */
+    JS_ARGS_KIND_ALIAS,
 };
+
+/* Find `var a = arguments;` and prove that the store dominates every read of
+   the alias. Dominance is by construction: the store must sit in the function's
+   entry basic block, so [0, store) must contain no label, no label-carrying
+   branch, no exception-region opener and no block terminator. Positional order
+   is not dominance -- `function f(x){ if (x) {} else { var a = arguments; }
+   return a.length; }` stores before the read in position but not in execution,
+   and rewriting that read would return argc instead of throwing. The other two
+   conditions -- the alias is written once and every read of it is an approved
+   consumer -- are checked by the main scan, which visits every OP_FMT_loc site. */
+static int js_args_alias_find(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
+                              int A, int *pstore_pos)
+{
+    int pos, op, len, fmt, B;
+
+    for (pos = 0; pos < bc_len; pos += len) {
+        op = bc_buf[pos];
+        len = opcode_info[op].size;
+        if (len <= 0 || pos + len > bc_len)
+            return -1;
+        fmt = opcode_info[op].fmt;
+        switch (fmt) {
+        case OP_FMT_label:      case OP_FMT_label8:
+        case OP_FMT_label16:    case OP_FMT_label_u16:
+        case OP_FMT_atom_label_u8: case OP_FMT_atom_label_u16:
+            return -1;          /* a branch: the entry block ends here */
+        default:
+            break;
+        }
+        switch (op) {
+        case OP_label:
+        case OP_catch:          case OP_nip_catch:
+        case OP_gosub:          case OP_ret:
+        case OP_for_of_start:   case OP_for_await_of_start:
+        case OP_iterator_close:
+        case OP_with_get_var:   case OP_with_delete_var:
+        case OP_with_make_ref:  case OP_with_get_ref:
+        case OP_with_get_ref_undef: case OP_with_put_var:
+        case OP_return:         case OP_return_undef:
+        case OP_return_async:   case OP_throw: case OP_throw_error:
+            return -1;
+        default:
+            break;
+        }
+        if (fmt != OP_FMT_loc || op != OP_get_loc)
+            continue;
+        if (get_u16(bc_buf + pos + 1) != A)
+            continue;
+        /* get_loc(A) put_loc(B), adjacent: `var a = arguments` is a single
+           assignment expression statement. */
+        if (pos + len + 3 > bc_len || bc_buf[pos + len] != OP_put_loc)
+            return -1;
+        B = get_u16(bc_buf + pos + len + 1);
+        if (B == A || B < 0 || B >= s->var_count)
+            return -1;
+        if (s->vars[B].is_captured)
+            return -1;
+        *pstore_pos = pos + len;   /* the put_loc, which is what the main scan sees */
+        return B;
+    }
+    return -1;
+}
 
 static int js_args_find_elem_load(const uint8_t *bc_buf, int bc_len, int pos_next)
 {
@@ -39143,9 +39304,15 @@ static int js_args_find_elem_load(const uint8_t *bc_buf, int bc_len, int pos_nex
     return -1;
 }
 
-static int js_args_site_kind(CodeContext *cc, int pos_next, bool mapped, int *pel)
+static int js_args_site_kind(CodeContext *cc, int pos_next, bool mapped,
+                             int alias_idx, int *pel)
 {
     int el;
+    /* The alias store. Checked first because put_loc is otherwise a hard
+       refusal; only the one store js_args_alias_find() located is admitted, and
+       the scan rejects any second write to the same local. */
+    if (alias_idx >= 0 && code_match(cc, pos_next, OP_put_loc, alias_idx, -1))
+        return JS_ARGS_KIND_ALIAS;
     if (code_match(cc, pos_next, OP_get_field, -1))
         return cc->atom == JS_ATOM_length ? JS_ARGS_KIND_LENGTH
                                           : JS_ARGS_KIND_NONE;
@@ -39162,10 +39329,11 @@ static int js_args_site_kind(CodeContext *cc, int pos_next, bool mapped, int *pe
 }
 
 static int js_args_elide_scan(JSFunctionDef *s, uint8_t *bc_buf, int bc_len,
-                              bool mapped, bool mark)
+                              bool mapped, bool mark, int *palias)
 {
     CodeContext cc;
     int pos, op, len, fmt, A, kinds = 0;
+    int alias, alias_store_pos = -1, idx;
 
     A = s->arguments_var_idx;
     if (A < 0 || A >= s->var_count)
@@ -39179,6 +39347,8 @@ static int js_args_elide_scan(JSFunctionDef *s, uint8_t *bc_buf, int bc_len,
     }
     cc.bc_buf = bc_buf;
     cc.bc_len = bc_len;
+    alias = js_args_alias_find(s, bc_buf, bc_len, A, &alias_store_pos);
+    *palias = alias;
     for (pos = 0; pos < bc_len; pos += len) {
         int kind, el = -1;
         op = bc_buf[pos];
@@ -39190,11 +39360,27 @@ static int js_args_elide_scan(JSFunctionDef *s, uint8_t *bc_buf, int bc_len,
             return -1;
         if (fmt != OP_FMT_loc)
             continue;
-        if (get_u16(bc_buf + pos + 1) != A)
+        idx = get_u16(bc_buf + pos + 1);
+        if (idx == alias) {
+            if (op == OP_put_loc) {
+                if (pos != alias_store_pos)
+                    return -1;      /* a second write to the alias */
+                continue;           /* consumed by the ALIAS site before it */
+            }
+            if (op != OP_get_loc)
+                return -1;          /* a write or an escape of the alias */
+        } else if (idx != A) {
             continue;
-        if (op != OP_get_loc)
+        } else if (op != OP_get_loc) {
+            /* Any other opcode naming the slot -- put_loc, set_loc, close_loc,
+               make_loc_ref, the _check variants -- is a write or an escape. */
             return -1;
-        kind = js_args_site_kind(&cc, pos + len, mapped, &el);
+        }
+        /* A read of the alias may not itself be re-aliased: `var a = arguments;
+           var b = a;` would need a second alias slot, and admitting the store
+           form here would mark a put_loc nobody swallows. */
+        kind = js_args_site_kind(&cc, pos + len, mapped,
+                                 idx == A ? alias : -1, &el);
         if (kind == JS_ARGS_KIND_NONE)
             return -1;
         kinds |= 1 << kind;
@@ -39207,8 +39393,90 @@ static int js_args_elide_scan(JSFunctionDef *s, uint8_t *bc_buf, int bc_len,
     }
     return kinds;
 }
+#define PROLOGUE_PUT_LOC(var_idx) do {                  \
+        prologue_put_pos = (int)bc_out.size;            \
+        put_short_code(&bc_out, OP_put_loc, (var_idx)); \
+        prologue_put_end = (int)bc_out.size;            \
+        prologue_put_idx = (var_idx);                   \
+    } while (0)
+
+/* Rollback and same-binary control leg: QJS_TDZ_KEEP_CHECKS=1 keeps every TDZ
+   check, which is what the compiler emitted before. */
+static int js_tdz_keep_v = -1;
+static inline bool js_tdz_elim_on(void)
+{
+    if (unlikely(js_tdz_keep_v < 0)) {
+        const char *e = getenv("QJS_TDZ_KEEP_CHECKS");
+        js_tdz_keep_v = (e != NULL && e[0] == '1');
+    }
+    return !js_tdz_keep_v;
+}
+
+/* Rewrites OP_get_loc_check to OP_get_loc for lexical locals already known to
+   hold a value: one linear scan with a bit per local, not a dataflow fixpoint.
+   Every jump target is still an OP_label here, so labels reset the state, and
+   OP_gosub/OP_ret are barriers because a finally block can run between them.
+   Both opcodes are 3 bytes, so the rewrite is one byte in place. */
+static void eliminate_tdz_checks(JSFunctionDef *s)
+{
+    uint8_t *bc_buf = s->byte_code.buf;
+    int bc_len = s->byte_code.size;
+    int pos, op, len, idx, n, nwords;
+    uint32_t *init;
+
+    if (!js_tdz_elim_on())
+        return;
+    n = s->var_count;
+    if (n <= 0)
+        return;
+    nwords = (n + 31) / 32;
+    init = js_mallocz(s->ctx, sizeof(*init) * nwords);
+    if (init == NULL)
+        return;
+
+    for (pos = 0; pos < bc_len; pos += len) {
+        op = bc_buf[pos];
+        len = opcode_info[op].size;
+        if (len <= 0)
+            break;
+        switch (op) {
+        case OP_label:
+        case OP_gosub:
+        case OP_ret:
+            memset(init, 0, sizeof(*init) * nwords);
+            break;
+        case OP_get_loc_check:
+            idx = get_u16(bc_buf + pos + 1);
+            if (idx >= n)
+                break;
+            if (init[idx >> 5] & (1u << (idx & 31)))
+                bc_buf[pos] = OP_get_loc;
+            else
+                init[idx >> 5] |= 1u << (idx & 31);
+            break;
+        case OP_put_loc:
+        case OP_set_loc:
+        case OP_put_loc_check:
+        case OP_put_loc_check_init:
+            idx = get_u16(bc_buf + pos + 1);
+            if (idx < n)
+                init[idx >> 5] |= 1u << (idx & 31);
+            break;
+        case OP_set_loc_uninitialized:
+        case OP_close_loc:
+            idx = get_u16(bc_buf + pos + 1);
+            if (idx < n)
+                init[idx >> 5] &= ~(1u << (idx & 31));
+            break;
+        }
+    }
+    js_free(s->ctx, init);
+}
+
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
+    int prologue_put_pos = -1, prologue_put_end = -1, prologue_put_idx = -1;
+    int prologue_skip_to = 0;
     int pos, pos_next, bc_len, op, op1, len, i, line_num, col_num, patch_offsets;
     const uint8_t *bc_buf;
     DynBuf bc_out;
@@ -39221,6 +39489,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     int objlit_live_count = 0;
     int objlit_template_index;
     int args_elide_kinds = -1;
+    /* the local that `var a = arguments` stores into, or -1 */
+    int args_alias_idx = -1;
     D3Ev *d3_ev = NULL;
     int d3_n = 0, d3_k = 0;
 
@@ -39251,9 +39521,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     if (s->arguments_var_idx >= 0) {
         bool mapped = !s->is_strict_mode && s->has_simple_parameter_list;
         args_elide_kinds = js_args_elide_scan(s, (uint8_t *)bc_buf, bc_len,
-                                              mapped, false);
+                                              mapped, false, &args_alias_idx);
         if (args_elide_kinds >= 0) {
-            js_args_elide_scan(s, (uint8_t *)bc_buf, bc_len, mapped, true);
+            js_args_elide_scan(s, (uint8_t *)bc_buf, bc_len, mapped, true,
+                               &args_alias_idx);
             if (mapped && (args_elide_kinds &
                            ((1 << JS_ARGS_KIND_ELEM) |
                             (1 << JS_ARGS_KIND_APPLY)))) {
@@ -39272,19 +39543,19 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     if (s->home_object_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_HOME_OBJECT);
-        put_short_code(&bc_out, OP_put_loc, s->home_object_var_idx);
+        PROLOGUE_PUT_LOC(s->home_object_var_idx);
     }
     /* initialize the 'this.active_func' variable if needed */
     if (s->this_active_func_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_THIS_FUNC);
-        put_short_code(&bc_out, OP_put_loc, s->this_active_func_var_idx);
+        PROLOGUE_PUT_LOC(s->this_active_func_var_idx);
     }
     /* initialize the 'new.target' variable if needed */
     if (s->new_target_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_NEW_TARGET);
-        put_short_code(&bc_out, OP_put_loc, s->new_target_var_idx);
+        PROLOGUE_PUT_LOC(s->new_target_var_idx);
     }
     /* initialize the 'this' variable if needed. In a derived class
        constructor, this is initially uninitialized. */
@@ -39294,7 +39565,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             dbuf_put_u16(&bc_out, s->this_var_idx);
         } else {
             dbuf_putc(&bc_out, OP_push_this);
-            put_short_code(&bc_out, OP_put_loc, s->this_var_idx);
+            PROLOGUE_PUT_LOC(s->this_var_idx);
         }
     }
     /* initialize the 'arguments' variable if needed */
@@ -39312,24 +39583,49 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
         if (s->arguments_arg_idx >= 0)
             put_short_code(&bc_out, OP_set_loc, s->arguments_arg_idx);
-        put_short_code(&bc_out, OP_put_loc, s->arguments_var_idx);
+        PROLOGUE_PUT_LOC(s->arguments_var_idx);
     }
     /* initialize a reference to the current function if needed */
     if (s->func_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_THIS_FUNC);
-        put_short_code(&bc_out, OP_put_loc, s->func_var_idx);
+        PROLOGUE_PUT_LOC(s->func_var_idx);
     }
     /* initialize the variable environment object if needed */
     if (s->var_object_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_VAR_OBJECT);
-        put_short_code(&bc_out, OP_put_loc, s->var_object_idx);
+        PROLOGUE_PUT_LOC(s->var_object_idx);
     }
     if (s->arg_var_object_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_VAR_OBJECT);
-        put_short_code(&bc_out, OP_put_loc, s->arg_var_object_idx);
+        PROLOGUE_PUT_LOC(s->arg_var_object_idx);
+    }
+
+    /* <push X> put_loc(n) get_loc(n)  ->  <push X> set_loc(n) */
+    if (prologue_put_pos >= 0 && (int)bc_out.size == prologue_put_end) {
+        CodeContext cc0;
+        cc0.bc_buf = bc_buf;
+        cc0.bc_len = bc_len;
+        if (!code_match(&cc0, 0, OP_get_loc, prologue_put_idx, OP_get_field, -1)
+        &&  !code_match(&cc0, 0, OP_get_loc, prologue_put_idx, OP_get_array_el, -1)
+        &&  code_match(&cc0, 0, OP_get_loc, prologue_put_idx, -1)) {
+            int pop = bc_out.buf[prologue_put_pos];
+            int sop = -1;
+            if (pop >= OP_put_loc0 && pop <= OP_put_loc3)
+                sop = OP_set_loc0 + (pop - OP_put_loc0);
+            else if (pop == OP_put_loc8)
+                sop = OP_set_loc8;
+            else if (pop == OP_put_loc)
+                sop = OP_set_loc;
+            if (sop >= 0) {
+                bc_out.buf[prologue_put_pos] = sop;
+                if (cc0.line_num >= 0) line_num = cc0.line_num;
+                if (cc0.col_num >= 0) col_num = cc0.col_num;
+                prologue_skip_to = cc0.pos;
+            }
+        }
     }
 
     d3_ev = d3_build_events(ctx, s, &d3_n);
@@ -39343,7 +39639,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
-    for (pos = 0; pos < bc_len; pos = pos_next) {
+    for (pos = prologue_skip_to; pos < bc_len; pos = pos_next) {
         int val;
         objlit_template_index = -1;
         op = bc_buf[pos];
@@ -39709,6 +40005,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 pos_next = cc.pos;
                 break;
             }
+            /* transform i32(val) lnot -> true/false */
+            if (code_match(&cc, pos_next, OP_lnot, -1)) {
+                if (cc.line_num >= 0) line_num = cc.line_num;
+                if (cc.col_num >= 0) col_num = cc.col_num;
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                dbuf_putc(&bc_out, val == 0 ? OP_push_true : OP_push_false);
+                pos_next = cc.pos;
+                break;
+            }
             /* Optimize constant tests: `if (0)`, `if (1)`, `if (!0)`... */
             if (code_match(&cc, pos_next, M2(OP_if_false, OP_if_true), -1)) {
                 val = (val != 0);
@@ -39897,6 +40202,42 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (line2 >= 0) line_num = line2;
                     break;
                 }
+                /* Transformation: dup put_x_check(n) drop -> put_x_check(n) */
+                if (code_match(&cc, pos_next,
+                               M4(OP_put_loc_check, OP_put_loc_check_init,
+                                  OP_put_var_ref_check, OP_put_var_ref_check_init),
+                               -1, OP_drop, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, cc.op);
+                    dbuf_put_u16(&bc_out, cc.idx);
+                    pos_next = cc.pos;
+                    break;
+                }
+            }
+            goto no_change;
+
+        case OP_lnot:
+            /* Transformation: lnot if_false(l) -> if_true(l), and the reverse */
+            if (code_match(&cc, pos_next, M2(OP_if_false, OP_if_true), -1)) {
+                if (cc.line_num >= 0) line_num = cc.line_num;
+                if (cc.col_num >= 0) col_num = cc.col_num;
+                pos_next = cc.pos;
+                label = cc.label;
+                op = cc.op ^ OP_if_false ^ OP_if_true;
+                goto has_label;
+            }
+            goto no_change;
+
+        case OP_for_in_next:
+            if (code_match(&cc, pos_next, OP_if_false, -1)) {
+                if (cc.line_num >= 0) line_num = cc.line_num;
+                if (cc.col_num >= 0) col_num = cc.col_num;
+                pos_next = cc.pos;
+                label = cc.label;
+                op = OP_for_in_next_if_false;
+                goto has_label;
             }
             goto no_change;
 
@@ -39938,6 +40279,18 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     pos_next = cc.pos;
                     break;
                 case JS_ARGS_KIND_ELEM:
+                    break;
+                case JS_ARGS_KIND_ALIAS:
+                    /* `var a = arguments;` -- emit nothing and swallow the
+                       adjacent put_loc as well. The alias local keeps its
+                       frame-setup value and every read of it was marked as a
+                       site of its own, so nothing observes it. */
+                    if (args_alias_idx < 0 ||
+                        !code_match(&cc, pos_next, OP_put_loc, args_alias_idx, -1))
+                        goto args_elide_desync;
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    pos_next = cc.pos;
                     break;
                 default:
                 args_elide_desync:
@@ -40049,6 +40402,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
 #endif
+                if (code_match(&cc, pos_next, OP_get_array_el, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_loc8_array_el);
+                    dbuf_putc(&bc_out, idx);
+                    pos_next = cc.pos;
+                    break;
+                }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -40058,6 +40420,53 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             {
                 int idx;
                 idx = get_u16(bc_buf + pos + 1);
+                if (op == OP_get_arg && idx < 256 &&
+                    code_match(&cc, pos_next, OP_get_loc, -1, OP_get_array_el, -1) &&
+                    cc.idx < 256) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_arg8_loc8_array_el);
+                    dbuf_putc(&bc_out, idx);
+                    dbuf_putc(&bc_out, cc.idx);
+                    pos_next = cc.pos;
+                    break;
+                }
+#if JS_ENABLE_IC
+                /* Borrow-fusion: get_arg(n) get_field(atom) ->
+                   get_arg_field_nr(atom, n, ic). The receiver is the
+                   argument register and is never pushed, so the dup/free
+                   round trip and the push/pop both disappear. Plain
+                   get_field only, and not `.length`, which becomes
+                   OP_get_length further down. */
+                /* get_arg(a) get_array_el -> get_arg8_array_el(a): the key is
+                   the argument and is borrowed, the receiver stays on the
+                   operand stack. After the triple above, which matches a
+                   different successor, and before the field fusion below. */
+                if (op == OP_get_arg && idx < 256 &&
+                    code_match(&cc, pos_next, OP_get_array_el, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_arg8_array_el);
+                    dbuf_putc(&bc_out, idx);
+                    pos_next = cc.pos;
+                    break;
+                }
+                if (op == OP_get_arg && s->ic_count < 0xffff &&
+                    code_match(&cc, pos_next, OP_get_field, -1) &&
+                    cc.atom != JS_ATOM_length) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_arg_field_nr);
+                    dbuf_put_u32(&bc_out, cc.atom);      /* atom at pos+1 */
+                    dbuf_put_u16(&bc_out, idx);          /* arg  at pos+5 */
+                    dbuf_put_u16(&bc_out, s->ic_count++);/* ic   at pos+7 */
+                    pos_next = cc.pos;
+                    break;
+                }
+#endif
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -40315,6 +40724,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     dbuf_free(&bc_out);
     return -1;
 }
+#undef PROLOGUE_PUT_LOC
 
 /* compute the maximum stack size needed by the function */
 
@@ -40473,6 +40883,12 @@ static __exception int compute_stack_size(JSContext *ctx,
             break;
         case OP_if_true:
         case OP_if_false:
+            diff = get_u32(bc_buf + pos + 1);
+            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+                goto fail;
+            break;
+        case OP_for_in_next_if_false:
+            stack_len--;
             diff = get_u32(bc_buf + pos + 1);
             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
                 goto fail;
@@ -40723,6 +41139,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         printf("\n");
     }
 #endif
+
+    eliminate_tdz_checks(fd);
 
     if (resolve_labels(ctx, fd))
         goto fail;
@@ -43801,9 +44219,6 @@ static bool js_argv_safe_opcode(const uint8_t *bc, int pos, int op)
     switch (op) {
     case OP_put_arg:  case OP_set_arg:
     case OP_put_arg0: case OP_set_arg0:
-    case OP_put_arg1: case OP_set_arg1:
-    case OP_put_arg2: case OP_set_arg2:
-    case OP_put_arg3: case OP_set_arg3:
     case OP_make_arg_ref:
     case OP_eval:     case OP_apply_eval:
     case OP_get_arg_el:
@@ -44166,6 +44581,18 @@ static int js_validate_ic_bytecode(JSContext *ctx, JSFunctionBytecode *b)
             {
                 uint32_t ic_idx = get_u16(buf + pc + 7);
                 if (get_u16(buf + pc + 5) >= (uint32_t)b->var_count + b->arg_count ||
+                    ic_idx >= b->ic_count || ic_seen[ic_idx]) {
+                    JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: non-canonical fused operands");
+                    goto fail;
+                }
+                ic_seen[ic_idx] = 1;
+                ic_seen_count++;
+            }
+            break;
+        case OP_get_arg_field_nr:
+            {
+                uint32_t ic_idx = get_u16(buf + pc + 7);
+                if (get_u16(buf + pc + 5) >= (uint32_t)b->arg_count ||
                     ic_idx >= b->ic_count || ic_seen[ic_idx]) {
                     JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: non-canonical fused operands");
                     goto fail;

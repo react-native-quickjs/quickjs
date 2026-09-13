@@ -159,6 +159,40 @@ and this project adheres to [Semantic Versioning][semver].
   either return the original, when no byte changes, or map the ASCII bytes in one
   allocation. Mixed-case lowercase is 50.1% faster, already-lowercase 70.7% and
   uppercase 55.3%, with non-ASCII input unchanged.
+- Patch `0064`: fuses `get_loc(n) get_array_el` into one opcode, so `obj[key]`
+  with a local key no longer pays a second dispatch, a stack round trip for the
+  key and a refcount pair on it. Against the landed 0063, five host passes: the
+  RN-prop rows are 3.9% faster with all six rows ahead, React is 1.5% faster with
+  7 of 9 rows ahead, and Octane is unchanged at +0.24% geomean.
+- Patch `0065`: removes two dead dispatches at bytecode emission. A `let`/`const`
+  assignment used as a statement no longer keeps the `dup` and `drop` around its
+  TDZ-checked store, and `!x` in front of a conditional branch no longer runs a
+  separate ToBoolean. No opcode and no bytecode-version change.
+- Patch `0066`: fuses the argument-frame element load and the for-in branch into two
+  superinstructions, retiring `put_arg2`, `put_arg3` and `set_arg1..3` to pay for
+  the two new opcodes.
+- Patch `0067`: folds a function body's opening `put_loc(n) get_loc(n)` into
+  `set_loc(n)`, and the minified boolean constant a bundler emits (`!0`) into
+  `push_false`.
+- Patch `0068`: eliminates provably-redundant TDZ checks by rewriting
+  `OP_get_loc_check` to `OP_get_loc` for lexical locals already known to hold a
+  value, in a linear pass before label resolution.
+- Patch `0069`: adds `OP_get_arg_field_nr`, the argument-register form of
+  `OP_get_loc_field_nr`, so reading a field off a parameter never pushes the
+  receiver and never pays the dup/free round trip.
+- Patch `0070`: deletes the fixed eleven-instruction stack template every computed
+  element store was compiled through; `[obj][key][val] put_array_el` is now the
+  whole store.
+- Patch `0071`: elides the `var a = arguments` alias. The declaration emits nothing,
+  and later reads of the alias read the argument frame directly.
+- Patch `0072`: adds `OP_get_arg8_array_el`, the argument-register form of
+  `OP_get_loc8_array_el`, borrowing the key out of the argument register instead of
+  pushing it.
+- The `0065`-`0072` stack landed as one unit, because the patches were cut as a
+  chain: `0068` needs `0067`, `0069` needs `0066`, and `0072` needs `0066`+`0069`.
+  Measured against the landed 0064 over three host passes (medians): Octane geomean
+  +10.5% with 12 of 13 rows ahead, React 4.3% faster with 7 of 9 ahead, RN props
+  2.8% faster with all 6 ahead, and minireact 2.7% faster.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

@@ -1,0 +1,189 @@
+Subject: Fuse The Argument Element Load And The For-In Branch
+
+What this does
+  Two more superinstructions, in the slots of retired opcodes.
+  `get_arg(a) get_loc(l) get_array_el` becomes `OP_get_arg8_loc8_array_el`,
+  which takes the receiver from the argument frame and the key from a local;
+  and `for_in_next if_false(L)` becomes `OP_for_in_next_if_false(L)`, whose
+  operand layout is byte-for-byte what the branch expects.
+
+Why we need it
+  Round 1 folded the local load and the element load but left the receiver
+  alone, and on prop-diff code the receiver is a function parameter -- so
+  `nextProps[propKey]` still paid two dispatches and a stack round trip for the
+  receiver. The for-in shape is the other half of the same code: every
+  `for_in_next` on that path is immediately followed by its conditional branch,
+  whose sense is always the same because the parser emits `if (!done) goto body`.
+
+What it adds
+  Both handlers do their own work and then fall through into the general handler
+  rather than repeating it, so neither adds a local, a live value or an exit to
+  JS_CallInternal and neither costs recursion depth. The receiver in the triple
+  is OWNED, not borrowed: it lives in the argument frame, which user code can
+  overwrite while the key's ToPropertyKey runs, so the handler takes its own
+  reference. Five opcodes are retired to pay for the two new ones -- put_arg2,
+  put_arg3 and set_arg1..3, which are pure size aliases with a general form
+  already -- and the three banked slots raise InternalError if executed, so a
+  desynchronised stream fails loudly instead of returning wrong answers.
+  The fused branch needs a case in compute_stack_size: an unlisted branch opcode
+  leaves its target unvisited and mis-sizes the stack. No bytecode version bump:
+  `9999` raises the version and carries the regenerated built-in blobs.
+
+Needs a bytecode version bump
+  Yes. `9999` carries the version and the rebuilt built-in blobs.
+
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -32,6 +32,7 @@
+ FMT(u8)
+ FMT(i8)
+ FMT(loc8)
++FMT(loc8_loc8)
+ FMT(const8)
+ FMT(label8)
+ FMT(u16)
+@@ -356,12 +357,12 @@
+ DEF(       get_arg3, 1, 0, 1, none_arg)
+ DEF(       put_arg0, 1, 1, 0, none_arg)
+ DEF(get_loc8_array_el, 2, 1, 1, loc8)
+-DEF(       put_arg2, 1, 1, 0, none_arg)
+-DEF(       put_arg3, 1, 1, 0, none_arg)
++DEF(get_arg8_loc8_array_el, 3, 0, 1, loc8_loc8)
++DEF(for_in_next_if_false, 5, 1, 3, label)
+ DEF(       set_arg0, 1, 1, 1, none_arg)
+-DEF(       set_arg1, 1, 1, 1, none_arg)
+-DEF(       set_arg2, 1, 1, 1, none_arg)
+-DEF(       set_arg3, 1, 1, 1, none_arg)
++DEF(      reserved1, 1, 0, 0, none)
++DEF(      reserved2, 1, 0, 0, none)
++DEF(      reserved3, 1, 0, 0, none)
+ DEF(   get_var_ref0, 1, 0, 1, none_var_ref)
+ DEF(   get_var_ref1, 1, 0, 1, none_var_ref)
+ DEF(   get_var_ref2, 1, 0, 1, none_var_ref)
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21309,12 +21309,12 @@
+         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
+         CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); BREAK;
+         CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
+-        CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
+-        CASE(OP_put_arg3): set_value(ctx, &arg_buf[3], *--sp); BREAK;
+         CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
+-        CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
+-        CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
+-        CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
++        CASE(OP_reserved1):
++        CASE(OP_reserved2):
++        CASE(OP_reserved3):
++            JS_ThrowInternalError(ctx, "invalid opcode (retired slot)");
++            goto exception;
+         CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
+         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
+         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
+@@ -21533,6 +21533,12 @@
+                     goto exception;
+             }
+             BREAK;
++        CASE(OP_for_in_next_if_false):
++            sf->cur_pc = pc;
++            if (js_for_in_next(ctx, sp))
++                goto exception;
++            sp += 2;
++            /* fall through */
+         CASE(OP_if_false):
+             {
+                 int res;
+@@ -22680,6 +22686,9 @@
+             }
+             BREAK;
+ 
++        CASE(OP_get_arg8_loc8_array_el):
++            *sp++ = js_dup(arg_buf[*pc++]);
++            /* fall through */
+         CASE(OP_get_loc8_array_el):
+             {
+                 JSValue val;
+@@ -36646,6 +36655,9 @@
+         case OP_FMT_none_loc:
+             idx = (op - OP_get_loc0) % 4;
+             goto has_loc;
++        case OP_FMT_loc8_loc8:
++            idx = get_u8(tab + pos + 1);
++            goto has_loc;
+         case OP_FMT_loc8:
+             idx = get_u8(tab + pos);
+             goto has_loc;
+@@ -39086,8 +39098,11 @@
+             }
+             break;
+         case OP_set_arg:
+-            dbuf_putc(bc_out, OP_set_arg0 + idx);
+-            return;
++            if (idx == 0) {
++                dbuf_putc(bc_out, OP_set_arg0);
++                return;
++            }
++            break;
+         case OP_get_var_ref:
+             dbuf_putc(bc_out, OP_get_var_ref0 + idx);
+             return;
+@@ -39966,6 +39981,17 @@
+             }
+             goto no_change;
+ 
++        case OP_for_in_next:
++            if (code_match(&cc, pos_next, OP_if_false, -1)) {
++                if (cc.line_num >= 0) line_num = cc.line_num;
++                if (cc.col_num >= 0) col_num = cc.col_num;
++                pos_next = cc.pos;
++                label = cc.label;
++                op = OP_for_in_next_if_false;
++                goto has_label;
++            }
++            goto no_change;
++
+         case OP_swap:
+             // transformation: swap swap -> nothing!
+             if (code_match(&cc, pos_next, OP_swap, -1, -1)) {
+@@ -40133,6 +40159,18 @@
+             {
+                 int idx;
+                 idx = get_u16(bc_buf + pos + 1);
++                if (op == OP_get_arg && idx < 256 &&
++                    code_match(&cc, pos_next, OP_get_loc, -1, OP_get_array_el, -1) &&
++                    cc.idx < 256) {
++                    if (cc.line_num >= 0) line_num = cc.line_num;
++                    if (cc.col_num >= 0) col_num = cc.col_num;
++                    add_pc2line_info(s, bc_out.size, line_num, col_num);
++                    dbuf_putc(&bc_out, OP_get_arg8_loc8_array_el);
++                    dbuf_putc(&bc_out, idx);
++                    dbuf_putc(&bc_out, cc.idx);
++                    pos_next = cc.pos;
++                    break;
++                }
+                 add_pc2line_info(s, bc_out.size, line_num, col_num);
+                 put_short_code(&bc_out, op, idx);
+             }
+@@ -40548,6 +40586,12 @@
+             break;
+         case OP_if_true:
+         case OP_if_false:
++            diff = get_u32(bc_buf + pos + 1);
++            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
++                goto fail;
++            break;
++        case OP_for_in_next_if_false:
++            stack_len--;
+             diff = get_u32(bc_buf + pos + 1);
+             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+                 goto fail;
+@@ -43876,9 +43920,6 @@
+     switch (op) {
+     case OP_put_arg:  case OP_set_arg:
+     case OP_put_arg0: case OP_set_arg0:
+-    case OP_set_arg1:
+-    case OP_put_arg2: case OP_set_arg2:
+-    case OP_put_arg3: case OP_set_arg3:
+     case OP_make_arg_ref:
+     case OP_eval:     case OP_apply_eval:
+     case OP_get_arg_el:
