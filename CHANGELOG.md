@@ -152,6 +152,9 @@ and this project adheres to [Semantic Versioning][semver].
 - Patch `0061`: number-to-string conversion for 0..255 answers from a
   runtime-owned table of canonical decimal strings instead of running `i32toa`
   and allocating. `'' + i` is 4.3% faster and the `'a' + i + 'b'` idiom 4.8%.
+- Patch `0062`: a two-character narrow string answers from a bounded
+  1,024-entry direct-mapped per-runtime table instead of allocating. A
+  two-character substring is 15.6% faster.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
