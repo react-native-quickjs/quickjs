@@ -136,6 +136,10 @@ and this project adheres to [Semantic Versioning][semver].
   copying it, which turns repeated appends from O(n^2) into amortised O(n).
   Appending to a local is 56.5% faster, to a property 49.8%, two-character chunks
   63.5% and a wide character 79.4%; Octane pdfjs +17.86% and geomean +4.70%.
+- Patch `0058`: when the instruction after a string `add` is another `add`,
+  `JS_ConcatString1` allocates the result with 16 bytes of headroom so the next
+  concatenation appends into it in place. Octane splay +4.04% and the nine-row
+  geomean +0.48%; a four-part chain is 10.0% faster.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this
