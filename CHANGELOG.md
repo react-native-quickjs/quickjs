@@ -144,6 +144,11 @@ and this project adheres to [Semantic Versioning][semver].
   per-runtime table instead of allocating, so a hit is a load and a refcount
   increment rather than a `js_malloc`, a header init and a one-byte memcpy.
   Octane pdfjs +3.08%, and its allocation size falls 1.99%.
+- Patch `0060`: `charCodeAt` and `charAt` read the character directly when the
+  receiver is already a primitive string and the index is an int, skipping the
+  `ToString` refcount round trip and the tagged index conversion. `charCodeAt` is
+  11.3% faster, `charAt` 6.0% and `charAt` on a slice receiver 10.2%; the nine-row
+  Octane geomean is +0.39%.
 - Host-function calls now build only the arguments actually passed, instead of
   materialising all eight inline slots, and the QuickJS value conversion is
   inlined into the argument loop. Measured against the same branch without this

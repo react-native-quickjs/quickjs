@@ -1,0 +1,56 @@
+Subject: Answer charCodeAt And charAt From A Primitive Receiver Without Converting
+
+What this does
+  js_string_charCodeAt and js_string_charAt read the character directly when
+  this_val is already a JS_TAG_STRING and the index is a JS_TAG_INT.
+
+Why we need it
+  `s.charCodeAt(i)` spends most of its work before the read:
+  JS_ToStringCheckObject is an identity on a primitive string plus a
+  js_dup/JS_FreeValue refcount round trip, and JS_ToInt32Sat is a tagged dispatch
+  that does nothing for an int.
+
+What it adds
+  A rope, a String object, a number receiver, null or undefined, a fractional,
+  string or object index and a missing argument all still take the generic path.
+  js_string_at is deliberately not served, because it accepts a negative index as
+  an offset from the end. A negative int index is safe here: the unsigned bounds
+  test rejects it, and out of range is NaN for charCodeAt and "" for charAt,
+  which is what the generic path returns.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -52095,6 +52095,14 @@
+     JSValue val, ret;
+     JSString *p;
+     int idx, c;
++
++    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING &&
++        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
++        p = JS_VALUE_GET_STRING(this_val);
++        if (likely((uint32_t)JS_VALUE_GET_INT(argv[0]) < p->len))
++            return js_int32(string_get(p, JS_VALUE_GET_INT(argv[0])));
++        return JS_NAN;
++    }
+ 
+     val = JS_ToStringCheckObject(ctx, this_val);
+     if (JS_IsException(val))
+@@ -52121,6 +52129,15 @@
+     JSString *p;
+     int idx, c;
+ 
++    if (JS_VALUE_GET_TAG(this_val) == JS_TAG_STRING &&
++        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
++        p = JS_VALUE_GET_STRING(this_val);
++        if (likely((uint32_t)JS_VALUE_GET_INT(argv[0]) < p->len))
++            return js_new_string_char(ctx,
++                       string_get(p, JS_VALUE_GET_INT(argv[0])));
++        return js_empty_string(ctx->rt);
++    }
++
+     val = JS_ToStringCheckObject(ctx, this_val);
+     if (JS_IsException(val))
+         return val;
