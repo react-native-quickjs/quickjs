@@ -408,6 +408,10 @@ struct JSRuntime {
     JSAtomStruct **atom_array;
     int atom_free_index; /* 0 = none */
 
+    /* Interned one-character Latin-1 strings, lazily filled.  Each non-NULL
+       entry holds ONE permanent reference, dropped in JS_FreeRuntime. */
+    JSAtomStruct *onechar[256];
+
     JSClassID js_class_id_alloc; /* counter for user defined classes */
     int class_count;    /* size of class_array */
     JSClass *class_array;
@@ -2990,6 +2994,17 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
 
+    /* Drop the one-character cache's permanent references before the atom and
+       string leak scans.  An entry may have been turned into an atom in place
+       by __JS_NewAtom (which reuses a JSString whose atom_type is 0), and
+       js_free_string handles that case, so nothing special is needed here. */
+    for (int oc = 0; oc < 256; oc++) {
+        if (rt->onechar[oc] != NULL) {
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->onechar[oc]));
+            rt->onechar[oc] = NULL;
+        }
+    }
+
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
     /* only the atoms defined in JS_InitAtoms() should be left */
     if (check_dump_flag(rt, JS_DUMP_ATOM_LEAKS)) {
@@ -5038,8 +5053,24 @@ static JSValue js_new_string16_len(JSContext *ctx, const uint16_t *buf, int len)
 static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
 {
     if (c < 0x100) {
-        char ch8 = c;
-        return js_new_string8_len(ctx, &ch8, 1);
+        JSRuntime *rt = ctx->rt;
+        JSString *p = rt->onechar[c];
+
+        if (likely(p != NULL)) {
+            JS_REF_COUNT(p)++;
+            return JS_MKPTR(JS_TAG_STRING, p);
+        }
+        {
+            char ch8 = c;
+            JSValue v = js_new_string8_len(ctx, &ch8, 1);
+
+            if (unlikely(JS_IsException(v)))
+                return v;
+            p = JS_VALUE_GET_STRING(v);
+            rt->onechar[c] = p;
+            JS_REF_COUNT(p)++; /* the table's permanent reference */
+            return v;
+        }
     } else {
         uint16_t ch16 = c;
         return js_new_string16_len(ctx, &ch16, 1);

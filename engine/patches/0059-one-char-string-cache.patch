@@ -1,0 +1,81 @@
+Subject: Intern One-Character Latin-1 Strings Per Runtime
+
+What this does
+  js_new_string_char answers a code point below 0x100 from a lazily filled,
+  per-runtime 256-entry table instead of allocating.
+
+Why we need it
+  Single-character strings are a large share of the engine's string allocation
+  traffic, and each one costs a js_malloc, a header init and a one-byte memcpy,
+  plus a matching js_free when it dies. The same few Latin-1 characters are
+  requested over and over.
+
+What it adds
+  A hit is a load, a NULL test and a refcount increment. Each entry holds one
+  permanent reference, dropped in JS_FreeRuntime. An entry is pinned at refcount
+  2, so a string taken from the table is never extended in place: an accumulator
+  that starts as a one-character string copies instead. The common `var s = ''`
+  accumulator seeds from the atom table's empty string and is never a table entry
+  after the first append.
+
+Needs a bytecode version bump
+  No
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -407,6 +407,10 @@
+     uint32_t *atom_hash;
+     JSAtomStruct **atom_array;
+     int atom_free_index; /* 0 = none */
++
++    /* Interned one-character Latin-1 strings, lazily filled.  Each non-NULL
++       entry holds ONE permanent reference, dropped in JS_FreeRuntime. */
++    JSAtomStruct *onechar[256];
+ 
+     JSClassID js_class_id_alloc; /* counter for user defined classes */
+     int class_count;    /* size of class_array */
+@@ -2990,6 +2994,17 @@
+         }
+     }
+ 
++    /* Drop the one-character cache's permanent references before the atom and
++       string leak scans.  An entry may have been turned into an atom in place
++       by __JS_NewAtom (which reuses a JSString whose atom_type is 0), and
++       js_free_string handles that case, so nothing special is needed here. */
++    for (int oc = 0; oc < 256; oc++) {
++        if (rt->onechar[oc] != NULL) {
++            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->onechar[oc]));
++            rt->onechar[oc] = NULL;
++        }
++    }
++
+ #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
+     /* only the atoms defined in JS_InitAtoms() should be left */
+     if (check_dump_flag(rt, JS_DUMP_ATOM_LEAKS)) {
+@@ -5038,8 +5053,24 @@
+ static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
+ {
+     if (c < 0x100) {
+-        char ch8 = c;
+-        return js_new_string8_len(ctx, &ch8, 1);
++        JSRuntime *rt = ctx->rt;
++        JSString *p = rt->onechar[c];
++
++        if (likely(p != NULL)) {
++            JS_REF_COUNT(p)++;
++            return JS_MKPTR(JS_TAG_STRING, p);
++        }
++        {
++            char ch8 = c;
++            JSValue v = js_new_string8_len(ctx, &ch8, 1);
++
++            if (unlikely(JS_IsException(v)))
++                return v;
++            p = JS_VALUE_GET_STRING(v);
++            rt->onechar[c] = p;
++            JS_REF_COUNT(p)++; /* the table's permanent reference */
++            return v;
++        }
+     } else {
+         uint16_t ch16 = c;
+         return js_new_string16_len(ctx, &ch16, 1);
