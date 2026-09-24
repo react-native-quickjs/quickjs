@@ -1,0 +1,158 @@
+Subject: Pin a for-in source's shape instead of materialising its keys
+
+What this does
+  Makes `for..in` iterate a pinned shape rather than a snapshot array of keys
+  built when the loop starts.
+
+Why we need it
+  The snapshot allocates per loop and duplicates state the source's shape already
+  describes.
+
+What it adds
+  A pinned shape keeps the source alive and is validated on each step, so a
+  mutation that invalidates it abandons the pinned walk and hands the loop to the
+  existing implementation, which has already seen every key the pinned walk
+  produced. Proxies, arrays with holes and receivers with accessors are not pinned.
+  No opcode is added or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1180,6 +1180,10 @@
+     bool is_array;
+     uint32_t array_length;
+     uint32_t idx;
++    /* When non-NULL, a counted reference to the shape obj had when this
++       iterator was built: the enumeration walks that shape's property table
++       directly and no names are materialized. See js_for_in_try_pin(). */
++    JSShape *pin_shape;
+ } JSForInIterator;
+ 
+ typedef struct JSRegExp {
+@@ -8443,6 +8447,8 @@
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSForInIterator *it = p->u.for_in_iterator;
++    if (it->pin_shape)
++        js_free_shape(rt, it->pin_shape);
+     JS_FreeValueRT(rt, it->obj);
+     js_free_rt(rt, it);
+ }
+@@ -8448,9 +8454,15 @@
+ static void js_for_in_iterator_mark(JSRuntime *rt, JSValueConst val,
+                                 JS_MarkFunc *mark_func)
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSForInIterator *it = p->u.for_in_iterator;
+     JS_MarkValue(rt, it->obj, mark_func);
++    /* The pinned shape is a GC object holding a counted reference, exactly as
++       it->obj is, so the marker has to report it too.  Under-marked, a cycle
++       collection can drop a shape whose prototype is only reachable through
++       it, and both are then still on the runtime's object list at teardown. */
++    if (it->pin_shape)
++        mark_func(rt, &it->pin_shape->header);
+ }
+ 
+ static void free_object(JSRuntime *rt, JSObject *p)
+@@ -18771,6 +18777,47 @@
+     args2[1] = ao;
+     return JS_Call(ctx, st[1], st[0], 2, vc(args2));
+ }
++/* for-in shape pinning. Try to enumerate p's own shape in place instead of
++   copying its property names into the iterator.
++
++   Admission, and why each condition is needed:
++   - JS_CLASS_OBJECT, !fast_array, !is_exotic: the object's own keys must come
++     from the shape and nowhere else. Arrays, typed arrays, String wrappers,
++     Proxies and module namespaces synthesize keys the shape does not contain.
++   - shape->is_hashed: load-bearing. A second reference on a hashed shape forces
++     every own-property mutation to leave the object on a different shape
++     (add_property takes the transition or clones, js_shape_prepare_update clones
++     because the refcount is not 1). An unhashed shape is mutated in place
++     however many references exist, and compact_properties frees it ignoring the
++     refcount, so pinning one is stale-prone and a use-after-free.
++   - no enumerable array-index key: for-in must yield array indices first in
++     ascending numeric order, and shape order is insertion order.
++   - no enumerable symbol key and no VARREF: the pinned walk yields the name
++     directly, so it must not meet an atom the generic path treats specially. */
++static bool js_for_in_try_pin(JSContext *ctx, JSForInIterator *it, JSObject *p)
++{
++    JSShape *sh = p->shape;
++    JSShapeProperty *prs;
++    uint32_t idx;
++    int i;
++
++    if (p->class_id != JS_CLASS_OBJECT || p->fast_array || p->is_exotic)
++        return false;
++    if (!sh->is_hashed)
++        return false;
++    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
++        if (prs->atom == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE))
++            continue;
++        if (JS_AtomIsArrayIndex(ctx, &idx, prs->atom) ||
++            JS_AtomGetKind(ctx, prs->atom) != JS_ATOM_KIND_STRING ||
++            (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
++            return false;
++        }
++    }
++    it->pin_shape = js_dup_shape(sh);
++    return true;
++}
++
+ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
+ {
+     JSObject *p;
+@@ -18799,6 +18846,7 @@
+     it->is_array = false;
+     it->obj = obj;
+     it->idx = 0;
++    it->pin_shape = NULL;
+     p = JS_VALUE_GET_OBJ(enum_obj);
+     p->u.for_in_iterator = it;
+ 
+@@ -18847,6 +18895,8 @@
+         it->array_length = p->u.array.count;
+     } else {
+     normal_case:
++        if (js_for_in_try_pin(ctx, it, p))
++            return enum_obj;
+         if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count, p,
+                                    JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
+             goto fail;
+@@ -18918,7 +18968,34 @@
+     if (p->class_id != JS_CLASS_FOR_IN_ITERATOR)
+         goto done;
+     it = p->u.for_in_iterator;
++    if (it->pin_shape) {
++        JSShape *pin = it->pin_shape;
++        JSObject *src = JS_VALUE_GET_OBJ(it->obj);
++        bool shape_live = (src->shape == pin);
++        JSShapeProperty *prs;
++
++        for (;;) {
++            if (it->idx >= (uint32_t)pin->prop_count)
++                goto done;
++            prs = &get_shape_prop(pin)[it->idx];
++            prop = prs->atom;
++            it->idx++;
++            if (prop == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE))
++                continue;
++            if (shape_live)
++                break;
++            ret = JS_HasProperty(ctx, it->obj, prop);
++            if (ret < 0)
++                return ret;
++            if (ret)
++                break;
++        }
++        sp[0] = JS_AtomToValue(ctx, prop);
++        sp[1] = JS_FALSE;
++        return 0;
++    }
+ 
++
+     for(;;) {
+         if (it->is_array) {
+             if (it->idx >= it->array_length)
