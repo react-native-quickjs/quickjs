@@ -61517,7 +61517,23 @@ static JSValueConst map_normalize_key_const(JSContext *ctx, JSValueConst key)
     return safe_const(map_normalize_key(ctx, unsafe_unconst(key)));
 }
 
-/* XXX: better hash ? */
+/* splitmix64 finalizer: a full 64->64 avalanche, so every input bit reaches
+   every output bit. Required because map bucket selection is `h & (size-1)`,
+   i.e. it only ever looks at the LOW bits of the hash. A bare odd multiply
+   (the previous `* 3163`) preserves trailing zero bits, and both of the inputs
+   fed to it are dominated by trailing zeros: a small integer as an IEEE754
+   double has 32 zero low bits plus >=16 more in the high word, and a heap
+   pointer is 16-byte aligned and usually size-class strided. */
+static inline uint64_t map_hash_mix64(uint64_t x)
+{
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
 static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
 {
     uint32_t tag = JS_VALUE_GET_NORM_TAG(key);
@@ -61538,7 +61554,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
-        h = (uintptr_t)JS_VALUE_GET_PTR(key) * 3163;
+        h = (uint32_t)map_hash_mix64((uint64_t)(uintptr_t)JS_VALUE_GET_PTR(key));
         break;
     case JS_TAG_INT:
         d = JS_VALUE_GET_INT(key);
@@ -61557,7 +61573,11 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
             d = NAN;
     hash_float64:
         u.d = d;
-        h = (u.u32[0] ^ u.u32[1]) * 3163;
+        /* All numeric keys funnel through here with tag forced to FLOAT64 so
+           that 1 and 1.0 (and 1n via SHORT_BIG_INT) hash identically, as
+           SameValueZero requires. -0 never reaches here: map_normalize_key()
+           rewrites it to int 0 before hashing or comparing. */
+        h = (uint32_t)map_hash_mix64(u.u64);
         tag = JS_TAG_FLOAT64;
         break;
     default:

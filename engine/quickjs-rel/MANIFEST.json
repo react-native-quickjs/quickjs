@@ -327,12 +327,16 @@
       "sha256": "047817d5634ff74daa2883baccb0c193c744ad5ad2c44b52d3ed820ac0b5564c"
     },
     {
+      "name": "0085-map-and-set-hash-avalanche.patch",
+      "sha256": "7d9e1c9f46d25ec5746d920e1d9d6794b2797bfa6d6867aaba2be4151b6237f6"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "44cbed99a48cda27d894b3bbabfb7f87e25cce2bdc0ea90871e3fcd029a26705",
+    "quickjs.c": "16196ea22ec1080646665ca3da4f1cfc5a5cff73696f96437510d79171e54437",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
