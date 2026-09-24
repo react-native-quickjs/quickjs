@@ -46,7 +46,7 @@ node tools/benchmark/bench.mjs react rn --rows create-element
 | `suspense` | 4 | throw-based control flow (Suspense, error boundary) + non-throwing control |
 | `modern` | 15 | class/promise/async-await/iterator/Map/Set/module patterns |
 | `arrayholes` | 5 | array holes fill/read-back |
-| `octane` | 13 | stock Octane (time-budgeted `Score:` per row; zlib & codeload excluded) |
+| `octane` | 9 (13 with `--all`) | stock Octane (time-budgeted `Score:` per row; zlib & codeload excluded). `splay`, `gbemu`, `regexp` and `pdfjs` are held out of the default run because the engine already wins or ties them, and an equal-weight geomean would count them as much as the rows being worked on |
 | `compiler` | 94 | AOT `compiler_bench` kernels (fixed-work, per-kernel checksum) |
 | `jit` | 26 | jitbench kernels (corpus shapes + defect canaries; 8-call warmup) |
 | `calls` | ~50 | JavaScript → C call boundary shapes (arity, pad, closure, magic, accessor, apply/spread) |
@@ -123,6 +123,14 @@ several:
 ```sh
 node tools/benchmark/bench.mjs workloads --rows for-in,keyed-load
 node tools/benchmark/bench.mjs all --skip spay,pdfjs,mandreel
+```
+
+The octane suite already skips four rows by default (`splay`, `gbemu`, `regexp`,
+`pdfjs`). `--all` includes them; nothing else does, so an `--rows` naming one of
+them still leaves it out:
+
+```sh
+node tools/benchmark/bench.mjs octane --all
 ```
 
 ## Android device

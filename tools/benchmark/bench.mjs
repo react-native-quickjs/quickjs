@@ -57,6 +57,7 @@ function parseArgs(argv) {
     device: false,
     ab_only: false,
     ab_baseline: null,
+    all: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -85,6 +86,7 @@ function parseArgs(argv) {
     else if (a === "--label") out.ab_label = argv[++i];
     else if (a === "--baseline") out.ab_baseline = argv[++i];
     else if (a === "--ab-only") out.ab_only = true;
+    else if (a === "--all") out.all = true;
     else if (a === "-h" || a === "--help") out.help = true;
     else if (a.startsWith("--")) fail(`unknown flag: ${a}`);
     else out._.push(a);
@@ -102,6 +104,7 @@ suites:
 options:
   --rows a,b,c         only run rows matching (substring)
   --skip a,b,c         exclude rows matching
+  --all                include the octane rows held back by default (see below)
   --engine qjs|hermes  add an engine (qjs always added)
   --ab a=/x,b=/y       A/B compare two binaries (alias for --engine)
   --reps N             process reps (default 1)
@@ -116,7 +119,11 @@ options:
   --json               machine-readable
   --list               list rows and exit
   --device             run on a connected Android device
-  -h, --help           this help`);
+  -h, --help           this help
+
+octane rows reported by default exclude splay, gbemu, regexp and pdfjs, which
+the engine already wins or ties, so the geomean measures the rows being worked
+on rather than being pulled toward 1x. Pass --all to score all thirteen.`);
 }
 
 const SUITES = [
@@ -217,12 +224,23 @@ function knownCalls() {
   return _knownCalls;
 }
 
+/* Octane rows held out of the default run.
+ *
+ * Octane's geomean counts every row equally, so four rows the engine already
+ * wins or nearly ties -- splay, gbemu, regexp, pdfjs -- move it as much as the
+ * compute-heavy rows that are the actual target, and they pull it toward 1x.
+ * The default run scores only the rows the work is aimed at; `--all` puts the
+ * whole suite back. */
+const OCTANE_DEFAULT_SKIP = ["splay", "gbemu", "regexp", "pdfjs"];
+
 function filterRows(rows, args) {
   const wants = args.rows.flatMap((s) => s.split(",")).filter(Boolean);
   const skips = args.skip.flatMap((s) => s.split(",")).filter(Boolean);
+  const held = args.all ? [] : OCTANE_DEFAULT_SKIP;
   return rows.filter((r) => {
     if (wants.length && !wants.some((w) => r.id.includes(w))) return false;
     if (skips.length && skips.some((w) => r.id.includes(w))) return false;
+    if (r.suite === "octane" && held.includes(r.name)) return false;
     return true;
   });
 }
