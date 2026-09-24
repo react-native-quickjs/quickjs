@@ -116,7 +116,9 @@ for (const f of files) {
   let input = src;
   if (viaBytecode) {
     input = join(tmp, f.replace(/\.js$/, '.bc'));
-    execFileSync(qjsc, [src, input], { stdio: 'ignore' });
+    execFileSync(qjsc, [src, input], {
+      stdio: 'ignore',
+    });
   }
 
   let a, b;

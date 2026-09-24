@@ -84,6 +84,10 @@ if(NODE_EXECUTABLE)
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
             --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
             --via-bytecode)
+  add_test(NAME differential_bytecode_optimized
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+            --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
+            --via-bytecode)
 else()
   message(STATUS "rnqjs: node not found, differential corpus will not run")
 endif()
