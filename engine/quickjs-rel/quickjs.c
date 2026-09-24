@@ -10405,6 +10405,19 @@ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
 
     if (!JS_IsObject(obj))
         goto fail;
+    /* A plain function whose [[Prototype]] is Function.prototype and which has
+       no own @@hasInstance can only resolve @@hasInstance to the builtin
+       js_function_hasInstance, whose whole body is a call to
+       JS_OrdinaryIsInstanceOf. Function.prototype[@@hasInstance] is installed
+       non-writable and non-configurable, so no invalidation is needed. */
+    {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        if ((p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
+             p->class_id == JS_CLASS_C_FUNCTION) &&
+            p->shape->proto == JS_VALUE_GET_OBJ(ctx->function_proto) &&
+            !find_own_property1(p, JS_ATOM_Symbol_hasInstance))
+            return JS_OrdinaryIsInstanceOf(ctx, val, obj);
+    }
     method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_hasInstance);
     if (JS_IsException(method))
         return -1;

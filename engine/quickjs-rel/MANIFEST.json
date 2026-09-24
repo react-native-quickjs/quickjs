@@ -303,12 +303,16 @@
       "sha256": "e067783a08c753444685f773c94e9791c0f5b0fe02b7d2a422e342c39b73144b"
     },
     {
+      "name": "0077-instanceof-hasinstance-fast-path.patch",
+      "sha256": "827b18c3fee79eed5d2be428c68d0a9d8a49ad2d1ad7b66325606d66e20ce92f"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "f2cd509ca99d095e8da375071d403b8e211682cc6d805fd96f4f629d41d05163",
+    "quickjs.c": "e60da4476e0d8a70778910e214597efb15c9659eaf7d3eef4b36b4e9f43249c7",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

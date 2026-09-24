@@ -1,0 +1,48 @@
+Subject: Skip the @@hasInstance lookup for a plain function in instanceof
+
+What this does
+  Adds a fast path at the top of JS_IsInstanceOf for a plain function whose
+  [[Prototype]] is Function.prototype and which has no own @@hasInstance.
+
+Why we need it
+  JS_IsInstanceOf always performs Get(obj, @@hasInstance), calls the resulting C
+  function and converts its result to boolean, on every instanceof. For a plain
+  bytecode or C function that lookup can only resolve to the built-in
+  js_function_hasInstance, whose entire body is a call to
+  JS_OrdinaryIsInstanceOf -- so the property lookup, the C-function dispatch and
+  the ToBool round trip all happen for nothing.
+
+What it adds
+  A class test, a prototype test and an own-property test, then a direct call to
+  JS_OrdinaryIsInstanceOf. No invalidation bit is needed because
+  Function.prototype[@@hasInstance] is installed non-writable and
+  non-configurable, so the property the lookup would find cannot change for the
+  life of the realm. A function carrying its own @@hasInstance, a bound
+  function, a Proxy, a class with a static @@hasInstance and every non-callable
+  right-hand side keep the existing lookup. No opcode is added or retired and
+  BC_VERSION is unchanged, so the built-in blobs are not regenerated.
+
+Needs a bytecode version bump
+  No.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -10407,6 +10407,19 @@
+ 
+     if (!JS_IsObject(obj))
+         goto fail;
++    /* A plain function whose [[Prototype]] is Function.prototype and which has
++       no own @@hasInstance can only resolve @@hasInstance to the builtin
++       js_function_hasInstance, whose whole body is a call to
++       JS_OrdinaryIsInstanceOf. Function.prototype[@@hasInstance] is installed
++       non-writable and non-configurable, so no invalidation is needed. */
++    {
++        JSObject *p = JS_VALUE_GET_OBJ(obj);
++        if ((p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
++             p->class_id == JS_CLASS_C_FUNCTION) &&
++            p->shape->proto == JS_VALUE_GET_OBJ(ctx->function_proto) &&
++            !find_own_property1(p, JS_ATOM_Symbol_hasInstance))
++            return JS_OrdinaryIsInstanceOf(ctx, val, obj);
++    }
+     method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_hasInstance);
+     if (JS_IsException(method))
+         return -1;
