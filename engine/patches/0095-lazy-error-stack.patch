@@ -1,0 +1,270 @@
+Subject: Defer Error stack-string formatting to the first `.stack` read
+
+What this does
+  Captures an Error's stack as frames and formats the text when `.stack` is
+  first read, memoising the result.
+
+Why we need it
+  Formatting the text when the Error is constructed spends that cost even for the
+  errors whose stack is never read.
+
+What it adds
+  An internal class holds the frames, each retaining a name reference, a filename
+  atom and two positions, with a finalizer that releases them; nothing retained is
+  an object or a bytecode, so an Error cannot keep a function alive. The name is
+  captured at construction, so a later rename does not rewrite the trace, and
+  repeated reads return identical bytes. The eager path is kept for a prepare hook,
+  a filter and a parse error, and an out-of-memory frame allocation yields what the
+  eager path yielded. No opcode is added or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -218,6 +218,7 @@
+     JS_CLASS_DOM_EXCEPTION,
+     JS_CLASS_CALL_SITE,
+     JS_CLASS_RAWJSON,
++    JS_CLASS_ERROR_STACK,   /* u.opaque: JSErrorStackData, internal, never reaches JS */
+ 
+     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
+ };
+@@ -9776,6 +9777,114 @@
+ 
+ /* if filename != NULL, an additional level is added with the filename
+    and line number information (used for parse error). */
++/* Deferred Error stack frames: the walk stays eager, the FORMATTING is what is
++   deferred to the first .stack read. A frame retains only a name JSString, a
++   filename JSAtom and two ints -- no object and no bytecode -- so nothing here
++   can take part in a reference cycle and the class needs no mark function. The
++   name is captured eagerly because `f.name` is writable and the trace must show
++   the name as it was when the Error was constructed. */
++typedef struct JSErrorStackFrame {
++    JSValue func_name;   /* JS_TAG_STRING, or JS_NULL => "<anonymous>" */
++    JSAtom filename;     /* JS_ATOM_NULL => "<null>" */
++    int line_num;        /* -1 => omit ":line:col" */
++    int col_num;
++    uint8_t kind;        /* 0 = located, 1 = "(missing)", 2 = "(native)" */
++} JSErrorStackFrame;
++
++typedef struct JSErrorStackData {
++    uint32_t count;
++    JSErrorStackFrame frames[];
++} JSErrorStackData;
++
++static void js_error_stack_finalizer(JSRuntime *rt, JSValueConst val)
++{
++    JSErrorStackData *esd = JS_GetOpaque(val, JS_CLASS_ERROR_STACK);
++    uint32_t i;
++
++    if (esd) {
++        for (i = 0; i < esd->count; i++) {
++            JS_FreeValueRT(rt, esd->frames[i].func_name);
++            JS_FreeAtomRT(rt, esd->frames[i].filename);
++        }
++        js_free_rt(rt, esd);
++    }
++}
++
++static const JSClassShortDef js_error_stack_class_def[] = {
++    { JS_ATOM_Error, js_error_stack_finalizer, NULL }, /* JS_CLASS_ERROR_STACK */
++};
++
++/* Like get_func_name(), but returns a strong reference to the name JSString
++   instead of a converted C string. Same acceptance rule: an own, normal
++   (non-accessor) data property named "name" whose value is a string. */
++static JSValue get_func_name_value(JSContext *ctx, JSValueConst func)
++{
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    JSValue val;
++
++    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
++        return JS_NULL;
++    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(func), JS_ATOM_name);
++    if (!prs)
++        return JS_NULL;
++    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return JS_NULL;
++    val = pr->u.value;
++    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
++        return JS_NULL;
++    return js_dup(val);
++}
++
++/* Formats captured frames into the exact byte sequence the eager path produced.
++   Consumes nothing; returns JS_NULL where the eager path also yielded NULL on a
++   dbuf error. */
++static JSValue js_error_stack_format(JSContext *ctx, JSErrorStackData *esd)
++{
++    DynBuf dbuf;
++    JSValue ret;
++    uint32_t i;
++
++    js_dbuf_init(ctx, &dbuf);
++    for (i = 0; i < esd->count; i++) {
++        JSErrorStackFrame *f = &esd->frames[i];
++        const char *str1;
++        const char *name_str = NULL;
++
++        if (JS_IsString(f->func_name))
++            name_str = JS_ToCString(ctx, f->func_name);
++        if (!name_str || name_str[0] == '\0')
++            str1 = "<anonymous>";
++        else
++            str1 = name_str;
++        dbuf_printf(&dbuf, "    at %s", str1);
++        JS_FreeCString(ctx, name_str);
++
++        if (f->kind == 0) {
++            const char *atom_str;
++
++            atom_str = f->filename != JS_ATOM_NULL
++                     ? JS_AtomToCString(ctx, f->filename) : NULL;
++            dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
++            JS_FreeCString(ctx, atom_str);
++            if (f->line_num != -1)
++                dbuf_printf(&dbuf, ":%d:%d", f->line_num, f->col_num);
++            dbuf_putc(&dbuf, ')');
++        } else if (f->kind == 1) {
++            dbuf_printf(&dbuf, " (missing)");
++        } else {
++            dbuf_printf(&dbuf, " (native)");
++        }
++        dbuf_putc(&dbuf, '\n');
++    }
++    if (dbuf_error(&dbuf))
++        ret = JS_NULL;
++    else
++        ret = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
++    dbuf_free(&dbuf);
++    return ret;
++}
++
+ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+                             JSValueConst filter_func, const char *filename,
+                             int line_num, int col_num, int backtrace_flags)
+@@ -9793,6 +9902,9 @@
+     uint32_t i;
+     double d;
+     int stack_trace_limit;
++    bool lazy;
++    JSErrorStackFrame lazy_frames[64];
++    JSValue lazy_obj;
+ 
+     rt = ctx->rt;
+     if (rt->in_build_stack_trace)
+@@ -9829,7 +9941,13 @@
+         has_prepare = JS_IsFunction(ctx, prepare);
+     }
+ 
+-    if (has_prepare) {
++    lazy = !has_prepare && !has_filter_func && filename == NULL
++        && can_store_error_stack(error_val);
++
++    if (lazy) {
++        if (stack_trace_limit == 0)
++            goto done;
++    } else if (has_prepare) {
+         saved_exception = JS_GetException(ctx);
+         if (stack_trace_limit == 0)
+             goto done;
+@@ -9879,7 +9997,23 @@
+             backtrace_barrier = b->backtrace_barrier;
+         }
+ 
+-        if (has_prepare) {
++        if (lazy) {
++            JSErrorStackFrame *lf = &lazy_frames[i];
++
++            lf->func_name = get_func_name_value(ctx, sf->cur_func);
++            if (b && sf->cur_pc) {
++                uint32_t pc = sf->cur_pc - b->byte_code_buf - 1;
++
++                lf->kind = 0;
++                lf->line_num = find_line_num(ctx, b, pc, &lf->col_num);
++                lf->filename = JS_DupAtom(ctx, b->filename);
++            } else {
++                lf->kind = b ? 1 : 2;
++                lf->line_num = -1;
++                lf->col_num = -1;
++                lf->filename = JS_ATOM_NULL;
++            }
++        } else if (has_prepare) {
+             js_new_callsite_data(ctx, &csd[i], sf);
+         } else {
+             /* func_name_str is UTF-8 encoded if needed */
+@@ -9921,7 +10055,30 @@
+             break;
+     }
+  done:
+-    if (has_prepare) {
++    if (lazy) {
++        JSErrorStackData *esd;
++        uint32_t k;
++
++        lazy_obj = JS_NewObjectClass(ctx, JS_CLASS_ERROR_STACK);
++        esd = JS_IsException(lazy_obj) ? NULL
++            : js_mallocz(ctx, sizeof(*esd) + i * sizeof(esd->frames[0]));
++        if (!esd) {
++            /* Out of memory: drop the frames and leave the slot empty, which is
++               what the eager path did on a dbuf failure. */
++            for (k = 0; k < i; k++) {
++                JS_FreeValue(ctx, lazy_frames[k].func_name);
++                JS_FreeAtom(ctx, lazy_frames[k].filename);
++            }
++            JS_FreeValue(ctx, lazy_obj);
++            JS_FreeValue(ctx, JS_GetException(ctx));
++            stack = JS_NULL;
++        } else {
++            esd->count = i;
++            memcpy(esd->frames, lazy_frames, i * sizeof(esd->frames[0]));
++            JS_SetOpaqueInternal(lazy_obj, esd);
++            stack = lazy_obj;
++        }
++    } else if (has_prepare) {
+         int j = 0, k;
+         stack = JS_NewArray(ctx);
+         if (JS_IsException(stack)) {
+@@ -49400,6 +49557,23 @@
+     p = JS_VALUE_GET_OBJ(this_val);
+     if (p->class_id != JS_CLASS_ERROR)
+         return JS_UNDEFINED;
++    /* Deferred frames: format once and then MEMOISE by replacing the slot with
++       the string. Memoisation is required, not an optimisation: two reads of
++       .stack must produce the same bytes and the frames are gone by then. */
++    if (JS_VALUE_GET_TAG(p->u.object_data) == JS_TAG_OBJECT) {
++        JSObject *sp = JS_VALUE_GET_OBJ(p->u.object_data);
++
++        if (sp->class_id == JS_CLASS_ERROR_STACK) {
++            JSErrorStackData *esd = JS_GetOpaque(p->u.object_data,
++                                                 JS_CLASS_ERROR_STACK);
++            JSValue str = esd ? js_error_stack_format(ctx, esd) : JS_NULL;
++
++            if (JS_IsException(str))
++                return JS_EXCEPTION;
++            JS_FreeValue(ctx, p->u.object_data);
++            p->u.object_data = str;
++        }
++    }
+     return js_dup(p->u.object_data);
+ }
+ 
+@@ -67767,6 +67941,16 @@
+                                                       JS_CLASS_OBJECT, 16);
+     if (JS_IsException(ctx->global_var_obj))
+         return -1;
++
++    /* The class name atom is REUSED rather than added: a new predefined atom
++       would shift JS_ATOM_* numbering, and predefined atoms are serialised by
++       index in .bc, so it would invalidate every existing bytecode blob. */
++    if (!JS_IsRegisteredClass(ctx->rt, JS_CLASS_ERROR_STACK)) {
++        if (init_class_range(ctx->rt, js_error_stack_class_def,
++                             JS_CLASS_ERROR_STACK,
++                             countof(js_error_stack_class_def)) < 0)
++            return -1;
++    }
+     JS_VALUE_GET_OBJ(ctx->global_obj)->gv_watched = 1;
+     JS_VALUE_GET_OBJ(ctx->global_var_obj)->gv_watched = 1;
+ 

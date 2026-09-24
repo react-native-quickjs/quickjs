@@ -359,12 +359,16 @@
       "sha256": "8301033c646fc6c994018d9e007dee34418df8433c3f729e0576258398bea35d"
     },
     {
+      "name": "0095-lazy-error-stack.patch",
+      "sha256": "ad997a36879ca0e8ff5f0612b218e4a27d4bb8e2e5d4d3546746586474ea9aff"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "0f7c536e4c360b117e447f73c16652d098f759300d347694ca4155c9dad4622c",
+    "quickjs.c": "f2945c71de2bcd7e03b03dce01542fd71239e4cd8ef29a5c20527defab2d2fd3",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
