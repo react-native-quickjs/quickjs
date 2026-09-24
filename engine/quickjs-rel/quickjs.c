@@ -13459,12 +13459,16 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
 
     /* no exotic behavior is possible in global_var_obj */
     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        /* XXX: should handle JS_PROP_TMASK properties */
-        if (unlikely(JS_IsUninitialized(pr->u.value)))
-            return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
-        return js_dup(pr->u.value);
+    /* prop_count counts deleted properties as well, so a shape with prop_count == 0
+       has no entries at all and the probe cannot succeed. */
+    if (p->shape->prop_count != 0) {
+        prs = find_own_property(&pr, p, prop);
+        if (prs) {
+            /* XXX: should handle JS_PROP_TMASK properties */
+            if (unlikely(JS_IsUninitialized(pr->u.value)))
+                return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+            return js_dup(pr->u.value);
+        }
     }
 
     /* fast path */
@@ -13528,22 +13532,26 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
 
     /* no exotic behavior is possible in global_var_obj */
     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    prs = find_own_property(&pr, p, prop);
-    if (prs) {
-        /* XXX: should handle JS_PROP_AUTOINIT properties? */
-        if (flag != 1) {
-            if (unlikely(JS_IsUninitialized(pr->u.value))) {
-                JS_FreeValue(ctx, val);
-                JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
-                return -1;
+    /* prop_count counts deleted properties as well, so a shape with prop_count == 0
+       has no entries at all and the probe cannot succeed. */
+    if (p->shape->prop_count != 0) {
+        prs = find_own_property(&pr, p, prop);
+        if (prs) {
+            /* XXX: should handle JS_PROP_AUTOINIT properties? */
+            if (flag != 1) {
+                if (unlikely(JS_IsUninitialized(pr->u.value))) {
+                    JS_FreeValue(ctx, val);
+                    JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+                    return -1;
+                }
+                if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
+                    JS_FreeValue(ctx, val);
+                    return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
+                }
             }
-            if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
-                JS_FreeValue(ctx, val);
-                return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
-            }
+            set_value(ctx, &pr->u.value, val);
+            return 0;
         }
-        set_value(ctx, &pr->u.value, val);
-        return 0;
     }
 
     p = JS_VALUE_GET_OBJ(ctx->global_obj);

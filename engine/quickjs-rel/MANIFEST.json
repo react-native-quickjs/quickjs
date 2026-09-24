@@ -295,12 +295,16 @@
       "sha256": "9a54cd97d889cd6cfc40cb24f5610ee34805d73cdf42c8651636699d9929fe56"
     },
     {
+      "name": "0075-global-var-empty-shape-early-out.patch",
+      "sha256": "1b954382a409ac9f755af7206fd261405b4d826d98537944df1463b915bfe106"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "8fd73796ec1751caf8fb0aa9830562e66960312addcb53f4d14b2184e25b9ed2",
+    "quickjs.c": "a30cdcca97155de7cf85fdf1a42e33182dfd69842f62494a47f05faa1497c384",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
