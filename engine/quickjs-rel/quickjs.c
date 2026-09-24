@@ -21050,6 +21050,15 @@ static JSValue js_u3_el_recv(JSContext *ctx, JSStackFrame *sf,
     JS_FreeValue(ctx, recv_ref);
     return val;
 }
+static no_inline void js_perm3(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = tmp; }
+static no_inline void js_rot3l(JSValue *sp) { JSValue tmp = sp[-3]; sp[-3] = sp[-2]; sp[-2] = sp[-1]; sp[-1] = tmp; }
+static no_inline void js_rot4l(JSValue *sp) { JSValue tmp = sp[-4]; sp[-4] = sp[-3]; sp[-3] = sp[-2]; sp[-2] = sp[-1]; sp[-1] = tmp; }
+static no_inline void js_rot5l(JSValue *sp) { JSValue tmp = sp[-5]; sp[-5] = sp[-4]; sp[-4] = sp[-3]; sp[-3] = sp[-2]; sp[-2] = sp[-1]; sp[-1] = tmp; }
+static no_inline void js_rot3r(JSValue *sp) { JSValue tmp = sp[-1]; sp[-1] = sp[-2]; sp[-2] = sp[-3]; sp[-3] = tmp; }
+static no_inline void js_perm4(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = tmp; }
+static no_inline void js_perm5(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = sp[-5]; sp[-5] = tmp; }
+static no_inline void js_swap2(JSValue *sp) { JSValue tmp1 = sp[-4], tmp2 = sp[-3]; sp[-4] = sp[-2]; sp[-3] = sp[-1]; sp[-2] = tmp1; sp[-1] = tmp2; }
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -21576,70 +21585,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp++;
             BREAK;
         CASE(OP_perm3): /* obj a b -> a obj b (213) */
-            {
-                JSValue tmp;
-                tmp = sp[-2];
-                sp[-2] = sp[-3];
-                sp[-3] = tmp;
-            }
+            js_perm3(sp);
+
             BREAK;
         CASE(OP_rot3l): /* x a b -> a b x (231) */
-            {
-                JSValue tmp;
-                tmp = sp[-3];
-                sp[-3] = sp[-2];
-                sp[-2] = sp[-1];
-                sp[-1] = tmp;
-            }
+            js_rot3l(sp);
+
             BREAK;
         CASE(OP_rot4l): /* x a b c -> a b c x */
-            {
-                JSValue tmp;
-                tmp = sp[-4];
-                sp[-4] = sp[-3];
-                sp[-3] = sp[-2];
-                sp[-2] = sp[-1];
-                sp[-1] = tmp;
-            }
+            js_rot4l(sp);
+
             BREAK;
         CASE(OP_rot5l): /* x a b c d -> a b c d x */
-            {
-                JSValue tmp;
-                tmp = sp[-5];
-                sp[-5] = sp[-4];
-                sp[-4] = sp[-3];
-                sp[-3] = sp[-2];
-                sp[-2] = sp[-1];
-                sp[-1] = tmp;
-            }
+            js_rot5l(sp);
+
             BREAK;
         CASE(OP_rot3r): /* a b x -> x a b (312) */
-            {
-                JSValue tmp;
-                tmp = sp[-1];
-                sp[-1] = sp[-2];
-                sp[-2] = sp[-3];
-                sp[-3] = tmp;
-            }
+            js_rot3r(sp);
+
             BREAK;
         CASE(OP_perm4): /* obj prop a b -> a obj prop b */
-            {
-                JSValue tmp;
-                tmp = sp[-2];
-                sp[-2] = sp[-3];
-                sp[-3] = sp[-4];
-                sp[-4] = tmp;
-            }
+            js_perm4(sp);
+
             BREAK;
         CASE(OP_perm5): /* this obj prop a b -> a this obj prop b */
-            {
-                JSValue tmp;
-                tmp = sp[-2];
-                sp[-2] = sp[-3];
-                sp[-3] = sp[-4];
-                sp[-4] = sp[-5];
-                sp[-5] = tmp;
-            }
+            js_perm5(sp);
+
             BREAK;
         CASE(OP_swap): /* a b -> b a */
             {
@@ -21650,15 +21621,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_swap2): /* a b c d -> c d a b */
-            {
-                JSValue tmp1, tmp2;
-                tmp1 = sp[-4];
-                tmp2 = sp[-3];
-                sp[-4] = sp[-2];
-                sp[-3] = sp[-1];
-                sp[-2] = tmp1;
-                sp[-1] = tmp2;
-            }
+            js_swap2(sp);
+
             BREAK;
 
         CASE(OP_fclosure):

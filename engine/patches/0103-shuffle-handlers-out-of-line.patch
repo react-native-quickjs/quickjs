@@ -1,0 +1,142 @@
+Subject: Move the operand-shuffle handlers out of the interpreter's dispatch body
+
+What this does
+  Gives the eight operand-shuffle opcodes out-of-line handler functions and
+  leaves a call in each interpreter case.
+
+Why we need it
+  Each inline case declared a temporary JSValue and performed the shuffle inside
+  JS_CallInternal. Every such local enlarges that function's stack frame and
+  every such body adds to its code, and both are paid on every interpreted call,
+  whether or not the shuffle executes. The frames multiply with interpreter
+  recursion depth.
+
+What it adds
+  Eight noinline helpers -- perm3, rot3l, rot4l, rot5l, rot3r, perm4, perm5 and
+  swap2 -- whose bodies are the shuffles the cases performed, each replaced by a
+  single call. The opcodes, their stack effects and the values moved are
+  unchanged. No opcode is added or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21046,6 +21046,15 @@
+     JS_FreeValue(ctx, recv_ref);
+     return val;
+ }
++static no_inline void js_perm3(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = tmp; }
++static no_inline void js_rot3l(JSValue *sp) { JSValue tmp = sp[-3]; sp[-3] = sp[-2]; sp[-2] = sp[-1]; sp[-1] = tmp; }
++static no_inline void js_rot4l(JSValue *sp) { JSValue tmp = sp[-4]; sp[-4] = sp[-3]; sp[-3] = sp[-2]; sp[-2] = sp[-1]; sp[-1] = tmp; }
++static no_inline void js_rot5l(JSValue *sp) { JSValue tmp = sp[-5]; sp[-5] = sp[-4]; sp[-4] = sp[-3]; sp[-3] = sp[-2]; sp[-2] = sp[-1]; sp[-1] = tmp; }
++static no_inline void js_rot3r(JSValue *sp) { JSValue tmp = sp[-1]; sp[-1] = sp[-2]; sp[-2] = sp[-3]; sp[-3] = tmp; }
++static no_inline void js_perm4(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = tmp; }
++static no_inline void js_perm5(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = sp[-5]; sp[-5] = tmp; }
++static no_inline void js_swap2(JSValue *sp) { JSValue tmp1 = sp[-4], tmp2 = sp[-3]; sp[-4] = sp[-2]; sp[-3] = sp[-1]; sp[-2] = tmp1; sp[-1] = tmp2; }
++
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags)
+@@ -21572,70 +21582,32 @@
+             sp++;
+             BREAK;
+         CASE(OP_perm3): /* obj a b -> a obj b (213) */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-2];
+-                sp[-2] = sp[-3];
+-                sp[-3] = tmp;
+-            }
++            js_perm3(sp);
++
+             BREAK;
+         CASE(OP_rot3l): /* x a b -> a b x (231) */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-3];
+-                sp[-3] = sp[-2];
+-                sp[-2] = sp[-1];
+-                sp[-1] = tmp;
+-            }
++            js_rot3l(sp);
++
+             BREAK;
+         CASE(OP_rot4l): /* x a b c -> a b c x */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-4];
+-                sp[-4] = sp[-3];
+-                sp[-3] = sp[-2];
+-                sp[-2] = sp[-1];
+-                sp[-1] = tmp;
+-            }
++            js_rot4l(sp);
++
+             BREAK;
+         CASE(OP_rot5l): /* x a b c d -> a b c d x */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-5];
+-                sp[-5] = sp[-4];
+-                sp[-4] = sp[-3];
+-                sp[-3] = sp[-2];
+-                sp[-2] = sp[-1];
+-                sp[-1] = tmp;
+-            }
++            js_rot5l(sp);
++
+             BREAK;
+         CASE(OP_rot3r): /* a b x -> x a b (312) */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-1];
+-                sp[-1] = sp[-2];
+-                sp[-2] = sp[-3];
+-                sp[-3] = tmp;
+-            }
++            js_rot3r(sp);
++
+             BREAK;
+         CASE(OP_perm4): /* obj prop a b -> a obj prop b */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-2];
+-                sp[-2] = sp[-3];
+-                sp[-3] = sp[-4];
+-                sp[-4] = tmp;
+-            }
++            js_perm4(sp);
++
+             BREAK;
+         CASE(OP_perm5): /* this obj prop a b -> a this obj prop b */
+-            {
+-                JSValue tmp;
+-                tmp = sp[-2];
+-                sp[-2] = sp[-3];
+-                sp[-3] = sp[-4];
+-                sp[-4] = sp[-5];
+-                sp[-5] = tmp;
+-            }
++            js_perm5(sp);
++
+             BREAK;
+         CASE(OP_swap): /* a b -> b a */
+             {
+@@ -21646,15 +21618,8 @@
+             }
+             BREAK;
+         CASE(OP_swap2): /* a b c d -> c d a b */
+-            {
+-                JSValue tmp1, tmp2;
+-                tmp1 = sp[-4];
+-                tmp2 = sp[-3];
+-                sp[-4] = sp[-2];
+-                sp[-3] = sp[-1];
+-                sp[-2] = tmp1;
+-                sp[-1] = tmp2;
+-            }
++            js_swap2(sp);
++
+             BREAK;
+ 
+         CASE(OP_fclosure):
