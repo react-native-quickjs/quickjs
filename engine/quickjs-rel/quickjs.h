@@ -733,6 +733,16 @@ typedef struct JSMemoryUsage {
     int64_t c_func_count, array_count;
     int64_t fast_array_count, fast_array_elements;
     int64_t binary_object_count, binary_object_size;
+    /* The population the CYCLE COLLECTOR walks, and its composition.
+       `obj_count` is not it: JS_ComputeMemoryUsage increments that only for
+       JS_GC_OBJ_TYPE_JS_OBJECT and continues on every other GC type, so it is a
+       strict subset of gc_obj_list. Dividing a collection time by obj_count
+       therefore prices per-JSObject rather than per-traced-object, and the ratio
+       between the two is not constant across workloads: lazily-deserialized
+       function bytecodes are not traced while source-compiled ones are. */
+    int64_t traced_count, notrace_count;
+    int64_t traced_js_object, traced_fnbc, traced_shape, traced_var_ref,
+            traced_async, traced_other;
 } JSMemoryUsage;
 
 JS_EXTERN void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
