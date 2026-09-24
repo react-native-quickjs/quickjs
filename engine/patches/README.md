@@ -4,6 +4,7 @@
 Every change we make to the engine lives here as a patch, applied to that
 submodule's working tree by `scripts/apply-patches.js`.
 
+| `0073` | Stores typed-array elements from the element-store handler | The opcode's inline arm covers only fast arrays, so every other element store leaves the interpreter for a call that re-derives the class the handler already resolved, and pays the frame publication and operand re-fetch around that call | A guarded arm writes integer and float views directly; the helper is out of line so its switch over the view classes does not sit in the interpreter body | Typed-array element stores ~9% faster; octane +1.1%, react -0.3%, minireact -0.7% against the stock engine | No |
 | `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 The table below is the whole fork at a glance. You should be able to understand
 what we changed and why without opening a single `.patch` file.

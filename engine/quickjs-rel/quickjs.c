@@ -20071,6 +20071,55 @@ static inline int js_call_c_function_fast(
 }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+static __attribute__((noinline)) bool
+js_ta_store_inline(JSObject *p, uint32_t idx, JSValue val)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(val);
+
+    switch (p->class_id) {
+    case JS_CLASS_INT8_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+        if (tag != JS_TAG_INT || idx >= (uint32_t)p->u.array.count ||
+            typed_array_is_immutable(p))
+            return false;
+        p->u.array.u.uint8_ptr[idx] = JS_VALUE_GET_INT(val);
+        return true;
+    case JS_CLASS_INT16_ARRAY:
+    case JS_CLASS_UINT16_ARRAY:
+        if (tag != JS_TAG_INT || idx >= (uint32_t)p->u.array.count ||
+            typed_array_is_immutable(p))
+            return false;
+        p->u.array.u.uint16_ptr[idx] = JS_VALUE_GET_INT(val);
+        return true;
+    case JS_CLASS_INT32_ARRAY:
+    case JS_CLASS_UINT32_ARRAY:
+        if (tag != JS_TAG_INT || idx >= (uint32_t)p->u.array.count ||
+            typed_array_is_immutable(p))
+            return false;
+        p->u.array.u.uint32_ptr[idx] = JS_VALUE_GET_INT(val);
+        return true;
+    case JS_CLASS_FLOAT32_ARRAY:
+    case JS_CLASS_FLOAT64_ARRAY: {
+        double d;
+        if (tag == JS_TAG_INT)
+            d = JS_VALUE_GET_INT(val);
+        else if (JS_TAG_IS_FLOAT64(tag))
+            d = JS_VALUE_GET_FLOAT64(val);
+        else
+            return false;
+        if (idx >= (uint32_t)p->u.array.count || typed_array_is_immutable(p))
+            return false;
+        if (p->class_id == JS_CLASS_FLOAT32_ARRAY)
+            p->u.array.u.float_ptr[idx] = d;
+        else
+            p->u.array.u.double_ptr[idx] = d;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -22880,6 +22929,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                     BREAK;
                                 }
                             }
+                        }
+                        if (js_ta_store_inline(p, idx, val)) {
+                            JS_FreeValue(ctx, val);
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            BREAK;
                         }
                     }
                 }

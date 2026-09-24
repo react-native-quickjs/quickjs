@@ -1,0 +1,99 @@
+Subject: Store typed-array elements from the element-store handler
+
+What this does
+  Adds an inline arm to OP_put_array_el for typed-array receivers, placed before
+  the out-of-line JS_SetPropertyValue call the opcode otherwise makes for every
+  store that is not a fast array.
+
+Why we need it
+  The opcode's inline arm tests JS_CLASS_ARRAY only, so every other element store
+  leaves the interpreter for a call that re-derives the class the handler has
+  already resolved, and pays the frame publication and operand re-fetch around
+  that call.
+
+What it adds
+  The helper is out of line so its switch over the view classes does not sit in
+  the interpreter's dispatch body, which every non-array element store reaches.
+  Integer views with a JS_TAG_INT value, and the float views with an int or
+  double value, are written directly from the handler. Uint8Clamped, Float16,
+  BigInt64 and BigUint64, a non-int value into an integer view, an out-of-range
+  index, a detached buffer and an immutable buffer all return false and take the
+  existing slow path unchanged; the arm writes nothing before it decides, and
+  class_id is tested first because reading the array union on a non-typed-array
+  reads an unrelated member. No opcode is added or retired and BC_VERSION is
+  unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -20073,6 +20073,55 @@
+ }
+ 
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
++static __attribute__((noinline)) bool
++js_ta_store_inline(JSObject *p, uint32_t idx, JSValue val)
++{
++    uint32_t tag = JS_VALUE_GET_TAG(val);
++
++    switch (p->class_id) {
++    case JS_CLASS_INT8_ARRAY:
++    case JS_CLASS_UINT8_ARRAY:
++        if (tag != JS_TAG_INT || idx >= (uint32_t)p->u.array.count ||
++            typed_array_is_immutable(p))
++            return false;
++        p->u.array.u.uint8_ptr[idx] = JS_VALUE_GET_INT(val);
++        return true;
++    case JS_CLASS_INT16_ARRAY:
++    case JS_CLASS_UINT16_ARRAY:
++        if (tag != JS_TAG_INT || idx >= (uint32_t)p->u.array.count ||
++            typed_array_is_immutable(p))
++            return false;
++        p->u.array.u.uint16_ptr[idx] = JS_VALUE_GET_INT(val);
++        return true;
++    case JS_CLASS_INT32_ARRAY:
++    case JS_CLASS_UINT32_ARRAY:
++        if (tag != JS_TAG_INT || idx >= (uint32_t)p->u.array.count ||
++            typed_array_is_immutable(p))
++            return false;
++        p->u.array.u.uint32_ptr[idx] = JS_VALUE_GET_INT(val);
++        return true;
++    case JS_CLASS_FLOAT32_ARRAY:
++    case JS_CLASS_FLOAT64_ARRAY: {
++        double d;
++        if (tag == JS_TAG_INT)
++            d = JS_VALUE_GET_INT(val);
++        else if (JS_TAG_IS_FLOAT64(tag))
++            d = JS_VALUE_GET_FLOAT64(val);
++        else
++            return false;
++        if (idx >= (uint32_t)p->u.array.count || typed_array_is_immutable(p))
++            return false;
++        if (p->class_id == JS_CLASS_FLOAT32_ARRAY)
++            p->u.array.u.float_ptr[idx] = d;
++        else
++            p->u.array.u.double_ptr[idx] = d;
++        return true;
++    }
++    default:
++        return false;
++    }
++}
++
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags)
+@@ -22883,6 +22932,12 @@
+                                 }
+                             }
+                         }
++                        if (js_ta_store_inline(p, idx, val)) {
++                            JS_FreeValue(ctx, val);
++                            JS_FreeValue(ctx, sp[-3]);
++                            sp -= 3;
++                            BREAK;
++                        }
+                     }
+                 }
+                 sf->cur_pc = pc;
