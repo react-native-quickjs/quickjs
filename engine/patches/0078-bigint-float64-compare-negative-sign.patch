@@ -1,0 +1,41 @@
+Subject: Compare a Number and a BigInt without losing the sign
+
+What this does
+  Corrects the mixed Number/BigInt comparison so the result does not depend on
+  a sign that was discarded on the way in.
+
+Why we need it
+  The mixed path reduced both operands to a common form before ordering them,
+  which loses which operand is negative and can report the order inverted.
+
+What it adds
+  The comparison takes account of which operand is negative and which
+  representation it holds before deciding the order. Values that are equal compare
+  equal, NaN keeps its unordered result, and same-type comparisons are untouched.
+  No opcode is added or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -15189,10 +15189,16 @@
+         /* compute f so that 2^f <= abs(a) < 2^(f+1) */
+         a_mant = js_bigint_get_mant_exp(ctx, &f, a);
+         if (f != e) {
+-            if (f < e)
+-                return -1;
++            /* a and b have the same sign here (the a_sign != b_sign case was
++               handled above), so the operand of larger magnitude is the larger
++               number when both are positive and the SMALLER when both are
++               negative.  Ordering by exponent alone answers the negative case
++               backwards.  The two expressions below are the same sign
++               convention the f == e arm and js_bigint_cmp already use. */
++            if (f < e)
++                return 2 * a_sign - 1;   /* abs(a) < abs(b) */
+             else
+-                return 1;
++                return 1 - 2 * a_sign;   /* abs(a) > abs(b) */
+         } else {
+             mant = (mant | ((uint64_t)1 << 52)) << 11; /* align to a_mant */
+             if (a_mant < mant)

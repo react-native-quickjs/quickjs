@@ -15187,10 +15187,16 @@ static int js_bigint_float64_cmp(JSContext *ctx, const JSBigInt *a,
         /* compute f so that 2^f <= abs(a) < 2^(f+1) */
         a_mant = js_bigint_get_mant_exp(ctx, &f, a);
         if (f != e) {
+            /* a and b have the same sign here (the a_sign != b_sign case was
+               handled above), so the operand of larger magnitude is the larger
+               number when both are positive and the SMALLER when both are
+               negative.  Ordering by exponent alone answers the negative case
+               backwards.  The two expressions below are the same sign
+               convention the f == e arm and js_bigint_cmp already use. */
             if (f < e)
-                return -1;
+                return 2 * a_sign - 1;   /* abs(a) < abs(b) */
             else
-                return 1;
+                return 1 - 2 * a_sign;   /* abs(a) > abs(b) */
         } else {
             mant = (mant | ((uint64_t)1 << 52)) << 11; /* align to a_mant */
             if (a_mant < mant)
