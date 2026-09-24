@@ -375,12 +375,16 @@
       "sha256": "d5b945c4865d84d6c63b03dde7c30514d9387ed9d76e2ebac8a05e8cefe512d9"
     },
     {
+      "name": "0099-yield-paced-cycle-collection.patch",
+      "sha256": "8e324ca1155a8b58fd353755ba17bc9b99de9c20aedb50d99bf0b87025a615f6"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "d1af82002da07950e81de20ddea5f26271a72426d3bfb8fddbd5388e1311991b",
+    "quickjs.c": "ab584002f740300252a0dda381766c190008ac6312a05a5583dbb7717cddf273",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
@@ -398,7 +402,7 @@
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "1b7048a6ef57bd952257c4b2b0c0fe8848f1a476c35c420c80c7f939e9fe7319",
-    "quickjs.h": "f00c47fe01d6d1036a64492aec60cb1baacca50cb7fe447e711dd29cb892127c",
+    "quickjs.h": "84ff71a5aa30d2b0004672c6aedcb1aefc9b50cdb8745e2de1ab0c511634fb0e",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
 }

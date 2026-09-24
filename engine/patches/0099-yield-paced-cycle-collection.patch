@@ -1,0 +1,191 @@
+Subject: Pace cycle collection by whether the last collection reclaimed anything
+
+What this does
+  Replaces the fixed heap-growth rearm at both collection sites with a
+  productivity-gated one: a collection that reclaimed almost nothing widens the
+  interval that follows it, and one that reclaimed something restores it.
+
+Why we need it
+  The rearm is a function of heap growth alone and never asks whether the
+  collection it just paid for reclaimed anything. Everything acyclic is freed at its
+  last decrement without the collector, so a collection finds nothing at all unless
+  the program built a cycle.
+
+What it adds
+  A collection is unproductive when it reclaimed less than 1/64 of the heap, or
+  less than 256 KB absolutely. Each consecutive unproductive collection doubles the
+  growth step, bounded as a percentage of the live heap (400%) and never tighter
+  than the unmodified 1.5x, so a large heap cannot balloon and a small one may back
+  off a long way; one productive collection resets the streak. Delaying a
+  collection that would have freed nothing cannot retain anything it would have
+  freed, and the bound releases garbage produced afterwards at the next productive
+  collection. JS_GetGCPacingCap and JS_SetGCPacingCap expose the streak cap,
+  default 8; 0 restores the unmodified rule exactly. The policy is one helper
+  called from both the inline trigger and the deferred-collection path. No opcode
+  is added or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -515,5 +515,14 @@
+ JS_EXTERN uint64_t JS_GetDumpFlags(JSRuntime *rt);
+ JS_EXTERN size_t JS_GetGCThreshold(JSRuntime *rt);
+ JS_EXTERN void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
++/* Yield-aware collection pacing. The rearm after a collection normally uses a
++   fixed 1.5x of the size that collection left, which never asks whether it
++   reclaimed anything -- and in a reference-counted engine a collection finds
++   nothing at all unless the program built a cycle. `cap` is how many
++   consecutive unproductive collections may widen the trigger: each doubles the
++   growth step, bounded to a fraction of the live heap, and one productive
++   collection resets it. 0 restores the unmodified rule exactly. */
++JS_EXTERN int JS_GetGCPacingCap(JSRuntime *rt);
++JS_EXTERN void JS_SetGCPacingCap(JSRuntime *rt, int cap);
+ /* use 0 to disable maximum stack size check */
+ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -257,6 +257,18 @@
+ #define JS_STRING_ROPE_SHORT2_LEN 8192
+ /* rope depth at which we rebalance */
+ #define JS_STRING_ROPE_MAX_DEPTH 60
++
++/* Yield-aware collection pacing. A collection is unproductive when it reclaimed
++   less than 1/JS_GC_BARREN_FRACTION of the heap, or less than JS_GC_MIN_WORTH
++   bytes absolutely -- the absolute term is what makes a small collection
++   skippable even when its ratio looks respectable. Consecutive unproductive
++   collections double the growth step, bounded by JS_GC_PACE_MAX_PCT of the live
++   heap; one productive collection resets the streak. A streak cap of 0 is the
++   unmodified heap-growth rule. */
++#define JS_GC_BARREN_FRACTION     64
++#define JS_GC_MIN_WORTH           (256 * 1024)
++#define JS_GC_PACE_MAX_PCT        400
++#define JS_GC_PACE_STREAK_DEFAULT 8
+ 
+ #define __exception __attribute__((warn_unused_result))
+ 
+@@ -445,6 +457,11 @@
+     bool gc_deferred; /* see JS_SetGCDeferred */
+     bool gc_pending;
+     size_t gc_deferred_limit;
++    /* Yield-aware pacing. gc_cyc_empty_streak counts consecutive collections
++       that reclaimed almost nothing, saturating at gc_pace_streak_cap; see
++       js_gc_rearm_pace(). */
++    uint8_t gc_pace_streak_cap;
++    uint8_t gc_cyc_empty_streak;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head string_list; /* list of JSString.link */
+ #endif
+@@ -2018,7 +2035,43 @@
+ {
+     return js_dup(v);
+ }
++
++/* The rearm policy, shared by both collection sites. The collector's cost is
++   proportional to LIVE objects while its benefit is proportional to CYCLIC
++   garbage only -- everything acyclic already died by refcount -- so a
++   collection that reclaimed nothing has proved there was nothing to reclaim and
++   repeating it at the same interval repeats a whole-heap walk for a
++   guaranteed-zero return. Delaying such a collection cannot retain anything it
++   would have freed; the only memory a longer interval can hold is garbage
++   produced afterwards, which is bounded by JS_GC_PACE_MAX_PCT and released at
++   the next productive collection. */
++static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
++{
++    size_t step = after >> 1, maxstep;
++    size_t freed = before > after ? before - after : 0;
++    int unproductive;
+ 
++    if (rt->gc_pace_streak_cap == 0) {
++        rt->malloc_gc_threshold = after + step;   /* the unmodified rule */
++        return;
++    }
++    unproductive = (freed * JS_GC_BARREN_FRACTION < before) ||
++                   (freed < (size_t)JS_GC_MIN_WORTH);
++    if (unproductive) {
++        if (rt->gc_cyc_empty_streak < rt->gc_pace_streak_cap)
++            rt->gc_cyc_empty_streak++;
++    } else {
++        rt->gc_cyc_empty_streak = 0;
++    }
++    step <<= rt->gc_cyc_empty_streak;
++    maxstep = (size_t)((uint64_t)after * JS_GC_PACE_MAX_PCT / 100);
++    if (maxstep < (after >> 1))
++        maxstep = after >> 1;                     /* never tighter than the rule */
++    if (step > maxstep)
++        step = maxstep;
++    rt->malloc_gc_threshold = after + step;
++}
++
+ static void js_trigger_gc(JSRuntime *rt, size_t size)
+ {
+     bool force_gc;
+@@ -2042,10 +2095,13 @@
+             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
+         }
+ #endif
+-        JS_RunGC(rt);
+-        rt->gc_pending = false;
+-        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+-            (rt->malloc_state.malloc_size >> 1);
++        {
++            size_t before = rt->malloc_state.malloc_size;
++
++            JS_RunGC(rt);
++            rt->gc_pending = false;
++            js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
++        }
+     }
+ }
+ 
+@@ -2688,6 +2744,8 @@
+     rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
+     js_arena_init(rt);
+     rt->malloc_gc_threshold = 256 * 1024;
++    rt->gc_pace_streak_cap = JS_GC_PACE_STREAK_DEFAULT;
++    rt->gc_cyc_empty_streak = 0;
+ 
+     init_list_head(&rt->context_list);
+     init_list_head(&rt->gc_obj_list);
+@@ -2823,6 +2881,22 @@
+ void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
+ {
+     rt->malloc_gc_threshold = gc_threshold;
++}
++
++int JS_GetGCPacingCap(JSRuntime *rt)
++{
++    return rt->gc_pace_streak_cap;
++}
++
++void JS_SetGCPacingCap(JSRuntime *rt, int cap)
++{
++    if (cap < 0)
++        cap = 0;
++    if (cap > 8)
++        cap = 8;
++    rt->gc_pace_streak_cap = (uint8_t)cap;
++    if (rt->gc_cyc_empty_streak > rt->gc_pace_streak_cap)
++        rt->gc_cyc_empty_streak = rt->gc_pace_streak_cap;
+ }
+ 
+ #define malloc(s) malloc_is_forbidden(s)
+@@ -9117,10 +9191,13 @@
+     /* 0: derive a ceiling from the current threshold */
+     rt->gc_deferred_limit = limit != 0 ? limit : rt->malloc_gc_threshold * 4;
+     if (!deferred && rt->gc_pending) {
+-        rt->gc_pending = false;
+-        JS_RunGC(rt);
+-        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+-            (rt->malloc_state.malloc_size >> 1);
++        {
++            size_t before = rt->malloc_state.malloc_size;
++
++            rt->gc_pending = false;
++            JS_RunGC(rt);
++            js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
++        }
+     }
+ }
+ 
