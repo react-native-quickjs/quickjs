@@ -331,12 +331,16 @@
       "sha256": "7d9e1c9f46d25ec5746d920e1d9d6794b2797bfa6d6867aaba2be4151b6237f6"
     },
     {
+      "name": "0086-property-array-geometric-growth.patch",
+      "sha256": "3da15f40f81b058eb4f741339d3547d7a6f307c4381cf739bb20f88ffb0b9fec"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "16196ea22ec1080646665ca3da4f1cfc5a5cff73696f96437510d79171e54437",
+    "quickjs.c": "9c49999c94f0a4690991be0c0647788453bb4524278f46710e2ec5eba857bbfc",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

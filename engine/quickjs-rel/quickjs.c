@@ -7141,7 +7141,37 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     intptr_t h;
 
     sh = *psh;
-    new_size = max_int(count, sh->prop_size * 3 / 2);
+    /* AMORTISED DOUBLING, upstream is 3/2.  See docs/property-array-growth.md.
+
+       An object built one field at a time -- which is what a React component
+       constructor, a fiber and an element all are -- reallocates its property
+       array once per growth step.  Starting from JS_PROP_INITIAL_SIZE 2, the
+       3/2 policy walks 2, 3, 4, 6, 9, 13, 19, so a nine-field constructor
+       reallocates five times; doubling walks 2, 4, 8, 16 and reallocates
+       twice.  MEASURED with a per-outcome counter on minireact/render, at the
+       0001-0025 patch state: add-transitions that reallocate fall 493 -> 251
+       per iteration while the TOTAL number of add-transitions stays at exactly
+       995 in both arms, which is the check that only the sizing moved and not
+       the semantics.
+
+       Two things this policy has that a flat floor (the spike that started
+       this line proposed max(8, ...)) does not:
+
+         - it costs NOTHING for an object that never exceeds two properties,
+           which is most objects a program creates.  MEASURED on the 990 KB
+           React Native production bundle, live heap after a forced GC:
+           doubling +0.22% of the heap, a floor of 8 +0.91%, for the same
+           object graph (identical objCount/propCount/shapeCount).
+         - the growth sequence matches the shape hash table's power-of-two
+           sizing at every step, so prop_size == hash_size exactly.  Under 3/2
+           a nine-slot property array forces a sixteen-entry hash table and
+           wastes seven slots.
+
+       Do not raise this further: MEASURED, the curve gets WORSE past the knee,
+       because the reallocations that survive are the large late ones (per
+       realloc 12.53 -> 13.91 -> 14.99 ns as the count falls), while a bigger
+       step makes the first allocation bigger without removing anything more. */
+    new_size = max_int(count, sh->prop_size * 2);
     /* Reallocate prop array first to avoid crash or size inconsistency
        in case of memory allocation failure */
     if (p) {
