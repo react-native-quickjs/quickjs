@@ -24400,8 +24400,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
-    if (needs_backtrace(rt->current_exception)
-    || JS_IsUndefined(ctx->error_back_trace)) {
+    if (needs_backtrace(rt->current_exception)) {
         sf->cur_pc = pc;
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);

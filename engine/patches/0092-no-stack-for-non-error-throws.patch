@@ -1,0 +1,35 @@
+Subject: Do not build a stack trace for thrown values that cannot carry one
+
+What this does
+  Collects stack frames on the throw path only when the value being thrown can
+  hold a trace, instead of also collecting them to fill the context's
+  error-backtrace slot.
+
+Why we need it
+  Frames were collected before it was known whether the value could carry them,
+  so a thrown primitive, plain object or thenable paid for a complete stack walk
+  with string formatting, on a path that programs use for control flow. Only a
+  reporter that reads the slot through js_std_cmd(ErrorBackTrace=2, ...) could
+  observe it, and nothing in this runtime does.
+
+What it adds
+  One condition with one clause fewer: `needs_backtrace()` decides on its own.
+  An Error is unaffected -- its stack is still captured when it is constructed,
+  still readable, and still names the throwing function after a rethrow. Every
+  other value propagates untouched, with its identity, prototype and type
+  preserved. No field is added to the runtime, and no opcode is added or retired;
+  BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24605,7 +24605,6 @@
+     }
+  exception:
+-    if (needs_backtrace(rt->current_exception)
+-    || JS_IsUndefined(ctx->error_back_trace)) {
++    if (needs_backtrace(rt->current_exception)) {
+         sf->cur_pc = pc;
+         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
+                         NULL, 0, 0, 0);
