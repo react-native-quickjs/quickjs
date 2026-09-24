@@ -159,10 +159,6 @@
       "sha256": "b1908cc455b58e11153669fabf8b852c879d55d6489b856633a3eab73a0cde3a"
     },
     {
-      "name": "0040-cfunction-frame-arg-buf.patch",
-      "sha256": "5631979871976a9c40220f51bf1e7908da609f2319c6cb1f4d71a4777f00cfe6"
-    },
-    {
       "name": "0041-array-map-filter-fast-append.patch",
       "sha256": "466416a907d91bb83fae02b4a57003897544a48d9b3b4941a257ab9c492829a1"
     },
@@ -292,11 +288,11 @@
     },
     {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "9fa34067db850193d6d7f5dcd9d9b4980f6f38c2912c16015770308f2146c689"
+      "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "a3081b742720724c446894b30e39673cbc044bb5820d018fd631460d408482b2",
+    "quickjs.c": "e4e6c67f65f6d34edcbfcf2a48cc3aa4d8f80ed79df783a98d2e2fb8301ccc8f",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

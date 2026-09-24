@@ -29,6 +29,14 @@ Why we need it
     0069-arg-field-borrow-fusion adds an opcode and reuses a retired slot
     0068-tdz-check-elimination changes emitted local-read opcodes
     0066-arg-element-and-for-in-fusion retires five opcodes and reuses their slots
+    0080-compare-and-branch-fusion reuses two reserved slots for new opcodes
+    0093-element-load-receiver-borrow reuses two retired slots for new opcodes
+    0094-element-store-receiver-borrow reuses one reserved slot for a new opcode
+    0106-escape-page-and-loc-mul adds a fused opcode and moves swap2 to the
+                             escape page so OP_COUNT stays at 256
+    0109-cmp-branch-fusion  adds an opcode in the banked reserved slot
+    0108-i8-fusions         adds two fused opcodes and moves perm5 and rot4l to
+                             the escape page so OP_COUNT stays at 256
 
   A patch that needs the version raised says so in its own header and in its
   row of README.md, and changes nothing itself.
@@ -44,9 +52,11 @@ Notes
   patch rebuilds them with the final patched compiler so their opcode tables and
   serialized metadata match the engine that loads them.
 
+diff --git a/quickjs.c b/quickjs.c
+index 4de70c1..4e26040 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -42000,7 +42000,7 @@
+@@ -42674,7 +42674,7 @@ typedef enum BCTagEnum {
      BC_TAG_SYMBOL,
  } BCTagEnum;
  
@@ -55,6 +65,8 @@ Notes
  
  typedef struct BCWriterState {
      JSContext *ctx;
+diff --git a/builtin-array-fromasync.h b/builtin-array-fromasync.h
+index 4a53f38..c98e1b1 100644
 --- a/builtin-array-fromasync.h
 +++ b/builtin-array-fromasync.h
 @@ -2,10 +2,10 @@
@@ -71,7 +83,7 @@ Notes
   0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0xb7, 0x61,
   0x73, 0x79, 0x6e, 0x63, 0x49, 0x74, 0x65, 0x72,
   0x61, 0x74, 0x6f, 0x72, 0x01, 0x2a, 0x4f, 0x62,
-@@ -27,94 +27,96 @@
+@@ -27,94 +27,96 @@ const uint8_t qjsc_builtin_array_fromasync[888] = {
   0x63, 0x74, 0x69, 0x6f, 0x6e, 0x01, 0x08, 0x63,
   0x61, 0x6c, 0x6c, 0x0c, 0x00, 0x02, 0x00, 0xa8,
   0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01,
@@ -257,6 +269,8 @@ Notes
 + 0x00,
  };
  
+diff --git a/builtin-iterator-zip.h b/builtin-iterator-zip.h
+index 266d3d3..11fa9c3 100644
 --- a/builtin-iterator-zip.h
 +++ b/builtin-iterator-zip.h
 @@ -2,10 +2,10 @@
@@ -273,7 +287,7 @@ Notes
   0x49, 0x74, 0x65, 0x72, 0x61, 0x74, 0x6f, 0x72,
   0x48, 0x65, 0x6c, 0x70, 0x65, 0x72, 0x01, 0x08,
   0x63, 0x61, 0x6c, 0x6c, 0x01, 0x1e, 0x53, 0x79,
-@@ -54,284 +54,268 @@
+@@ -54,284 +54,268 @@ const uint8_t qjsc_builtin_iterator_zip[2621] = {
   0x18, 0x62, 0x61, 0x64, 0x20, 0x69, 0x74, 0x65,
   0x72, 0x61, 0x74, 0x6f, 0x72, 0x0c, 0x00, 0x02,
   0x00, 0xa8, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
@@ -820,6 +834,8 @@ Notes
 + 0x29, 0x00, 0xc9, 0x00, 0xd7, 0x29, 0x00,
  };
  
+diff --git a/builtin-iterator-zip-keyed.h b/builtin-iterator-zip-keyed.h
+index a63d15a..69e74d0 100644
 --- a/builtin-iterator-zip-keyed.h
 +++ b/builtin-iterator-zip-keyed.h
 @@ -2,10 +2,10 @@
@@ -836,7 +852,7 @@ Notes
   0x49, 0x74, 0x65, 0x72, 0x61, 0x74, 0x6f, 0x72,
   0x48, 0x65, 0x6c, 0x70, 0x65, 0x72, 0x01, 0x08,
   0x63, 0x61, 0x6c, 0x6c, 0x01, 0x24, 0x68, 0x61,
-@@ -56,277 +56,259 @@
+@@ -56,277 +56,259 @@ const uint8_t qjsc_builtin_iterator_zip_keyed[2582] = {
   0x18, 0x62, 0x61, 0x64, 0x20, 0x69, 0x74, 0x65,
   0x72, 0x61, 0x74, 0x6f, 0x72, 0x0c, 0x00, 0x02,
   0x00, 0xa8, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
