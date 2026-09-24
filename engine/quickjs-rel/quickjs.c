@@ -470,6 +470,29 @@ struct JSRuntime {
     JSAtom forin_atom;
     uint32_t forin_idx;
 
+    /* Memo for js_for_in_try_pin's admission scan, which is O(properties) and
+       was re-run on every for-in entry to re-derive an answer that cannot have
+       changed. The recorded fact -- "this shape contains only enumerable
+       plain-string non-VARREF keys, or it does not" -- is a property of the
+       shape's table, not of any object wearing it, so one entry serves every
+       object of that shape.
+
+       Each slot holds a COUNTED REFERENCE and that is load-bearing, for the
+       same reason as forin_shape above: a hashed shape at refcount 1 can be
+       mutated in place, while a second reference forces the clone branches, so
+       the table the memo describes is frozen while the memo names it. No
+       invalidation hook is therefore needed, and address recycling cannot make
+       a stale entry compare equal because the reference keeps the shape
+       allocated.
+
+       A single entry measured poorly on a loop nest that alternates between two
+       or three shapes, which is the React case (props, style, fiber), so this is
+       a small direct-mapped set indexed by shape address. */
+#define JS_PIN_MEMO_BITS 3
+#define JS_PIN_MEMO_SIZE (1 << JS_PIN_MEMO_BITS)
+    JSShape *pin_memo_shape[JS_PIN_MEMO_SIZE];
+    uint8_t pin_memo_ok[JS_PIN_MEMO_SIZE];
+
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
@@ -2972,6 +2995,12 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_free_shape(rt, rt->forin_shape);
         rt->forin_shape = NULL;
         rt->forin_atom = JS_ATOM_NULL;
+    }
+    for (int i = 0; i < JS_PIN_MEMO_SIZE; i++) {
+        if (rt->pin_memo_shape[i]) {
+            js_free_shape(rt, rt->pin_memo_shape[i]);
+            rt->pin_memo_shape[i] = NULL;
+        }
     }
     rt->in_free = true;
 #ifdef QJS_ICSTAT
@@ -18893,24 +18922,44 @@ static no_inline JSValue js_args_apply_reified(JSContext *ctx, JSValue *slot,
      directly, so it must not meet an atom the generic path treats specially. */
 static bool js_for_in_try_pin(JSContext *ctx, JSForInIterator *it, JSObject *p)
 {
+    JSRuntime *rt = ctx->rt;
     JSShape *sh = p->shape;
     JSShapeProperty *prs;
     uint32_t idx;
-    int i;
+    int i, slot;
+    bool ok;
 
     if (p->class_id != JS_CLASS_OBJECT || p->fast_array || p->is_exotic)
         return false;
     if (!sh->is_hashed)
         return false;
-    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
-        if (prs->atom == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE))
-            continue;
-        if (JS_AtomIsArrayIndex(ctx, &idx, prs->atom) ||
-            JS_AtomGetKind(ctx, prs->atom) != JS_ATOM_KIND_STRING ||
-            (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
-            return false;
+    /* Per-shape admission, memoized. Shapes come from the allocator well above
+       byte granularity, so the low bits carry no entropy and are shifted off
+       before indexing. Both verdicts are recorded: caching only the successes
+       would leave a program enumerating one rejected shape re-scanning it
+       forever. */
+    slot = (int)(((uintptr_t)sh >> 5) & (JS_PIN_MEMO_SIZE - 1));
+    if (sh == rt->pin_memo_shape[slot]) {
+        ok = rt->pin_memo_ok[slot] != 0;
+    } else {
+        ok = true;
+        for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+            if (prs->atom == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE))
+                continue;
+            if (JS_AtomIsArrayIndex(ctx, &idx, prs->atom) ||
+                JS_AtomGetKind(ctx, prs->atom) != JS_ATOM_KIND_STRING ||
+                (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+                ok = false;
+                break;
+            }
         }
+        if (rt->pin_memo_shape[slot])
+            js_free_shape(rt, rt->pin_memo_shape[slot]);
+        rt->pin_memo_shape[slot] = js_dup_shape(sh);
+        rt->pin_memo_ok[slot] = ok;
     }
+    if (!ok)
+        return false;
     it->pin_shape = js_dup_shape(sh);
     return true;
 }
