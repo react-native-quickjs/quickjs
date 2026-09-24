@@ -399,12 +399,16 @@
       "sha256": "b725d27928d1684f554d05aaaa39a00700b0c8eb36b2d5faa1551e41476d06fc"
     },
     {
+      "name": "0105-closure-self-cycle-frame-teardown.patch",
+      "sha256": "3e7788310c080f9c87ca916717122509bcbe84c08d6b3e63d76a4bc8affa9cbf"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "97ff3a9b22c71216fcf2b365bcab3be8dfd3a6769f18e5c3d81e29d095078b77"
     }
   ],
   "files": {
-    "quickjs.c": "b1cd19d1c8568e6fa639cd34b7ab1beac77ceef4d8f330595eb92a29317b2357",
+    "quickjs.c": "1aa3a84c0bd87e7ec5e2d53e3444b4cae193a4d9969fe98531dd8480e611de4e",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

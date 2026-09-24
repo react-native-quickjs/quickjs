@@ -21582,6 +21582,46 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose(JSContext *ctx, uin
     return JS_COLD_HANDLER_OK(sp);
 }
 
+static no_inline __attribute__((cold)) void
+js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf)
+{
+    int i;
+
+    for (i = 0; i < sf->var_ref_count; i++) {
+        JSVarRef *vr = sf->var_refs[i];
+        JSFunctionBytecode *b;
+        JSVarRef **vrs;
+        JSObject *o;
+        int j, n, owns;
+
+        if (!vr || !vr->is_detached || JS_REF_COUNT(vr) != 1)
+            continue;
+        if (JS_VALUE_GET_TAG(vr->value) != JS_TAG_OBJECT)
+            continue;
+        o = JS_VALUE_GET_OBJ(vr->value);
+        if (o->class_id != JS_CLASS_BYTECODE_FUNCTION || JS_REF_COUNT(o) != 1)
+            continue;
+        b = o->u.func.function_bytecode;
+        vrs = o->u.func.var_refs;
+        if (!b || !vrs)
+            continue;
+        n = b->closure_var_count;
+        owns = 0;
+        for (j = 0; j < n; j++)
+            if (vrs[j] == vr) { owns = 1; break; }
+        if (!owns)
+            continue;
+
+        sf->var_refs[i] = NULL;
+        {
+            JSValue t = vr->value;
+            vr->value = JS_UNDEFINED;
+            vr->pvalue = &vr->value;
+            JS_FreeValueRT(rt, t);
+        }
+    }
+}
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -25144,6 +25184,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
+        if (unlikely(sf->var_ref_count != 0))
+            js_closcyc_frame(rt, sf);
     }
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
