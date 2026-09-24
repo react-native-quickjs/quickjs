@@ -1,0 +1,49 @@
+Subject: Compare a rope string against a BigInt as a string
+
+What this does
+  Makes the relational comparison of a rope string and a BigInt take the string
+  route rather than converting the BigInt to a Number.
+
+Why we need it
+  A string operand compares by string, and a rope reaches the wrong arm because
+  its representation is not the flat string the classification expects.
+
+What it adds
+  The rope is resolved to its string before the operand kinds are classified, so
+  a rope that resolves into a numeric-looking string still compares as the string
+  it is. Ordinary strings, non-rope operands and string-to-string comparisons take
+  the existing path. No opcode is added or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -17956,17 +17956,21 @@
+         /* fast path for float64/int */
+         goto float64_compare;
+     } else {
+-        if ((((tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT) &&
+-              tag2 == JS_TAG_STRING) ||
+-             ((tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) &&
+-              tag1 == JS_TAG_STRING))) {
+-            if (tag1 == JS_TAG_STRING) {
++        /* tag_is_string, not tag1 == JS_TAG_STRING: a rope is a String too.
++           Testing the tag alone sends a rope/BigInt pair down the ToNumeric
++           path below, which applies ToNumber to the string instead of
++           StringToBigInt (ECMA-262 7.2.13 IsLessThan step 3.c/3.d). */
++        if (((tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT) &&
++             tag_is_string(tag2)) ||
++            ((tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) &&
++             tag_is_string(tag1))) {
++            if (tag_is_string(tag1)) {
+                 op1 = JS_StringToBigInt(ctx, op1);
+                 if (JS_VALUE_GET_TAG(op1) != JS_TAG_BIG_INT &&
+                     JS_VALUE_GET_TAG(op1) != JS_TAG_SHORT_BIG_INT)
+                     goto invalid_bigint_string;
+             }
+-            if (tag2 == JS_TAG_STRING) {
++            if (tag_is_string(tag2)) {
+                 op2 = JS_StringToBigInt(ctx, op2);
+                 if (JS_VALUE_GET_TAG(op2) != JS_TAG_BIG_INT &&
+                     JS_VALUE_GET_TAG(op2) != JS_TAG_SHORT_BIG_INT) {
