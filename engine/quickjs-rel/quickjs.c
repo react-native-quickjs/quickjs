@@ -459,6 +459,17 @@ struct JSRuntime {
 
     struct JSStackFrame *current_stack_frame;
 
+    /* for-in element-load memo: "in shape forin_shape, the property named
+       forin_atom lives at index forin_idx". That is a property of the SHAPE
+       alone, not of any object or loop, which is what makes it self-validating:
+       a reader that observes the same shape may trust the index. The reference
+       is load-bearing -- without it a shape update mutates in place at the same
+       address and pointer equality would match a layout that has changed. It
+       also transitively keeps forin_atom alive. */
+    JSShape *forin_shape;
+    JSAtom forin_atom;
+    uint32_t forin_idx;
+
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
@@ -2957,6 +2968,11 @@ void JS_FreeRuntime(JSRuntime *rt)
     bool leak = false;
     int i;
 
+    if (rt->forin_shape) {
+        js_free_shape(rt, rt->forin_shape);
+        rt->forin_shape = NULL;
+        rt->forin_atom = JS_ATOM_NULL;
+    }
     rt->in_free = true;
 #ifdef QJS_ICSTAT
     js_icstat_dump();
@@ -3845,6 +3861,12 @@ void JS_FreeContext(JSContext *ctx)
     if (--JS_REF_COUNT(ctx) > 0)
         return;
     assert(JS_REF_COUNT(ctx) == 0);
+
+    if (rt->forin_shape) {
+        js_free_shape(rt, rt->forin_shape);
+        rt->forin_shape = NULL;
+        rt->forin_atom = JS_ATOM_NULL;
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
     if (check_dump_flag(rt, JS_DUMP_ATOMS))
@@ -11607,6 +11629,39 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
+/* for-in element-load memo, read side.  Returns true and stores the value when
+   the receiver's shape is the memoized shape and the key is the memoized atom,
+   in which case the index within that shape is already known and a direct read
+   replaces JS_ValueToAtom (which scans the key for a numeric string),
+   find_own_property's hash probe and the prototype walk.
+
+   Guards, shortest first.  The shape compare is first so an empty memo
+   short-circuits before atom_array is indexed.  The key pointer compare proves
+   this is the key whose index was recorded, not merely a key in a matching
+   object; it is exact because JS_AtomToValue on a string atom returns that
+   atom's own JSString.  The class test is belt-and-braces.  The final two are
+   load-bearing: re-deriving the atom from the shape degrades a bookkeeping bug
+   into a miss, and the TMASK test is reachable from ordinary JavaScript because
+   two objects carrying an accessor at the same slot have equal shapes, so the
+   memoized index can name a getter slot whose union is not a value. */
+static bool js_forinreg_lookup(JSRuntime *rt, JSObject *p, JSValueConst prop,
+                               JSValue *pval)
+{
+    JSShapeProperty *prs;
+
+    if (p->shape != rt->forin_shape)
+        return false;
+    if (JS_VALUE_GET_PTR(prop) != (void *)rt->atom_array[rt->forin_atom])
+        return false;
+    if (p->class_id != JS_CLASS_OBJECT || p->is_exotic || p->fast_array)
+        return false;
+    prs = &get_shape_prop(p->shape)[rt->forin_idx];
+    if (prs->atom != rt->forin_atom || (prs->flags & JS_PROP_TMASK) != 0)
+        return false;
+    *pval = js_dup(p->prop[rt->forin_idx].u.value);
+    return true;
+}
+
 static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
                                         JSValueConst prop)
 {
@@ -11622,6 +11677,14 @@ static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
             JSValue val;
             /* fast path for array and typed array access */
             if (js_get_fast_array_element(ctx, p, idx, &val))
+                return val;
+        } else if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING) {
+            /* One site, not the interpreter's CASE bodies: with the fused
+               element load every load on the prop rows funnels through here,
+               and adding live values to a CASE body costs recursion depth. */
+            JSValue val;
+            if (js_forinreg_lookup(ctx->rt, JS_VALUE_GET_OBJ(this_obj), prop,
+                                   &val))
                 return val;
         }
     } else if (unlikely(tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)) {
@@ -19061,6 +19124,16 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
                 return ret;
             if (ret)
                 break;
+        }
+        {
+            JSRuntime *rt = ctx->rt;
+            if (rt->forin_shape != pin) {
+                if (rt->forin_shape)
+                    js_free_shape(rt, rt->forin_shape);
+                rt->forin_shape = js_dup_shape(pin);
+            }
+            rt->forin_atom = prop;
+            rt->forin_idx = it->idx - 1;
         }
         sp[0] = JS_AtomToValue(ctx, prop);
         sp[1] = JS_FALSE;

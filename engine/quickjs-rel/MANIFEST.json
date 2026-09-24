@@ -343,12 +343,16 @@
       "sha256": "847b92cb5692f06dbeabb634feb12433e6db3a691c6a95f6be0c1c52bed0aaf4"
     },
     {
+      "name": "0089-for-in-element-load-memo.patch",
+      "sha256": "3a4738298a991afe240d4c98ec727480f51862e0b803cd3365ab3f97ab7228c0"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "42c316e18c479230cdb4710e7f82807ffb66529900af97779640e477027ef339",
+    "quickjs.c": "20887766a20615bdf93beaef6793bed209eb42f774b8a74d3ce3d999e4347405",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
