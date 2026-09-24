@@ -1,0 +1,241 @@
+Subject: Cache the global name resolution of OP_get_var
+
+What this does
+  Adds a per-context, per-runtime-validated cache in front of the global name
+  resolution performed by OP_get_var, OP_get_var_undef and the OP_put_var
+  handlers' read side.
+
+Why we need it
+  Resolving one global name probes two objects and walks their hash chains --
+  ctx->global_var_obj for a global lexical binding, then ctx->global_obj for a
+  `var` or function declaration -- and publishes the current pc through
+  sf->cur_pc before calling out, on every execution of the opcode.
+
+What it adds
+  A 128-set, 2-way table keyed on the low bits of the atom, memoizing "this atom
+  is own data property #offset of this object". A hit returns a new reference to
+  the same slot the probe would have found. Coherence is by generation, not by
+  assumption: a single counter is bumped by add_property(), add_shape_property()
+  and js_shape_prepare_update(), which between them gate every change to any
+  watched object's property layout, and a cell is only filled on a path that has
+  already established the property is a data property and, for the lexical arm,
+  has already passed the temporal-dead-zone test -- the sole writer of
+  JS_UNINITIALIZED into global_var_obj is JS_DefineGlobalVar immediately after
+  its own add_property(). The two global objects carry a bit marking them
+  watched, so a realm that does not own them still invalidates on their behalf.
+  No opcode is added or retired and BC_VERSION is unchanged, so the built-in
+  blobs are not regenerated.
+
+Needs a bytecode version bump
+  No.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -487,6 +487,9 @@
+     void *module_loader_opaque;
+     /* timestamp for internal use in module evaluation */
+     int64_t module_async_evaluation_next_timestamp;
++
++    /* OP_get_var cell cache generation; see js_gv_cell_invalidate. */
++    uint32_t gv_cell_gen;
+ 
+     /* used to allocate, free and clone SharedArrayBuffers */
+     JSSharedArrayBufferFunctions sab_funcs;
+@@ -656,6 +659,20 @@
+    enough to call the interrupt callback often. */
+ #define JS_INTERRUPT_COUNTER_INIT 10000
+ 
++/* OP_get_var cell cache: "atom is own data property #offset of this object".
++   128 sets of 2 ways, indexed by the low 7 bits of the atom, 32 bytes so the
++   set stride stays a shift. */
++#define JS_GV_CELL_SETS 128
++#define JS_GV_CELL_WAYS 2
++typedef struct JSGVCell {
++    uint32_t atom;      /* JS_ATOM_NULL (0) when empty */
++    uint32_t gen;       /* rt->gv_cell_gen snapshot; 0 never matches */
++    uint32_t offset;    /* index into obj->prop[] */
++    uint32_t pad_;
++    JSObject *obj;      /* ctx->global_obj or ctx->global_var_obj */
++    void *pad2_;
++} JSGVCell;
++
+ struct JSContext {
+     JSGCObjectHeader header; /* must come first */
+     JSRuntime *rt;
+@@ -728,6 +745,9 @@
+        as a stale read only costs one more statement before the pause. */
+     _Atomic bool debug_trace_armed;
+ #endif
++
++    /* LAST FIELD ON PURPOSE: 8 KB, allocated once per context. */
++    JSGVCell gv_cells[JS_GV_CELL_SETS][JS_GV_CELL_WAYS]; /* zeroed */
+ };
+ 
+ typedef union JSFloat64Union {
+@@ -1385,6 +1405,8 @@
+     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
+     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
+     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
++    /* This object's property layout invalidates the OP_get_var cell cache. */
++    uint8_t gv_watched : 1;
+     uint8_t prop_inline_cap : 3; /* non-zero: p->prop points into this object's
+                                     own block, which holds this many slots and
+                                     must not be freed or realloc'd */
+@@ -3172,6 +3194,9 @@
+ 
+ JSContext *JS_NewContextRaw(JSRuntime *rt)
+ {
++    if (rt->gv_cell_gen == 0)
++        rt->gv_cell_gen = 1;   /* 0 is the "empty cell" sentinel */
++
+     JSContext *ctx;
+     int i;
+ 
+@@ -7251,6 +7276,19 @@
+     return 0;
+ }
+ 
++/* Invalidate every OP_get_var cell in the runtime. */
++static void js_gv_cell_invalidate(JSRuntime *rt)
++{
++    if (unlikely(++rt->gv_cell_gen == 0)) {
++        struct list_head *el;
++        rt->gv_cell_gen = 1;
++        list_for_each(el, &rt->context_list) {
++            JSContext *c = list_entry(el, JSContext, link);
++            memset(c->gv_cells, 0, sizeof(c->gv_cells));
++        }
++    }
++}
++
+ static int add_shape_property(JSContext *ctx, JSShape **psh,
+                               JSObject *p, JSAtom atom, int prop_flags)
+ {
+@@ -7260,6 +7298,10 @@
+     uint32_t hash_mask, new_shape_hash = 0;
+     intptr_t h;
+ 
++    /* A watched object gaining a property can shadow a cached name. */
++    if (unlikely(p != NULL && p->gv_watched))
++        js_gv_cell_invalidate(ctx->rt);
++
+     /* update the shape hash */
+     if (sh->is_hashed) {
+         js_shape_hash_unlink(rt, sh);
+@@ -11644,6 +11686,10 @@
+ {
+     JSShape *sh, *new_sh;
+ 
++    /* Covers add_property's find_hashed_shape_prop fast branch. */
++    if (unlikely(p->gv_watched))
++        js_gv_cell_invalidate(ctx->rt);
++
+     if (unlikely(p->is_prototype)) {
+         /* track addition of small integer properties to
+            Array.prototype and Object.prototype */
+@@ -12809,6 +12855,10 @@
+     JSShape *sh;
+     uint32_t idx = 0;    /* prevent warning */
+ 
++    /* Every in-place shape-property mutation passes through here. */
++    if (unlikely(p->gv_watched))
++        js_gv_cell_invalidate(ctx->rt);
++
+     sh = p->shape;
+     if (sh->is_hashed) {
+         if (JS_REF_COUNT(sh) != 1) {
+@@ -13450,8 +13500,39 @@
+                           JS_UNDEFINED, JS_UNDEFINED, flags) < 0)
+         return -1;
+     return 0;
++}
++
++/* Probe the cell cache; on a hit stores a new reference in *pval.  A helper so
++   the OP_get_var handler adds no locals to JS_CallInternal. */
++static inline bool js_gv_cell_probe(JSContext *ctx, JSAtom atom, JSValue *pval)
++{
++    JSGVCell *gvc = ctx->gv_cells[atom & (JS_GV_CELL_SETS - 1)];
++    uint32_t gen = ctx->rt->gv_cell_gen;
++
++    if (likely(gvc[0].atom == atom && gvc[0].gen == gen)) {
++        *pval = js_dup(gvc[0].obj->prop[gvc[0].offset].u.value);
++        return true;
++    }
++    if (gvc[1].atom == atom && gvc[1].gen == gen) {
++        *pval = js_dup(gvc[1].obj->prop[gvc[1].offset].u.value);
++        return true;
++    }
++    return false;
+ }
+ 
++/* Record "this atom is own data property #(pr - p->prop) of p". */
++static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
++                                   JSObject *p, JSProperty *pr)
++{
++    JSGVCell *set = ctx->gv_cells[prop & (JS_GV_CELL_SETS - 1)];
++    if (set[0].atom != prop)
++        set[1] = set[0];
++    set[0].atom = prop;
++    set[0].gen = ctx->rt->gv_cell_gen;
++    set[0].offset = (uint32_t)(pr - p->prop);
++    set[0].obj = p;
++}
++
+ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
+                                bool throw_ref_error)
+ {
+@@ -13469,6 +13550,11 @@
+             /* XXX: should handle JS_PROP_TMASK properties */
+             if (unlikely(JS_IsUninitialized(pr->u.value)))
+                 return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
++            /* Filled only after the TDZ test passed, and the sole writer of
++               JS_UNINITIALIZED into global_var_obj bumps the generation, so a
++               hit needs no TDZ test. */
++            if (likely((prs->flags & JS_PROP_TMASK) == 0))
++                js_gv_cell_fill(ctx, prop, p, pr);
+             return js_dup(pr->u.value);
+         }
+     }
+@@ -13477,8 +13563,11 @@
+     p = JS_VALUE_GET_OBJ(ctx->global_obj);
+     prs = find_own_property(&pr, p, prop);
+     if (prs) {
+-        if (likely((prs->flags & JS_PROP_TMASK) == 0))
++        if (likely((prs->flags & JS_PROP_TMASK) == 0)) {
++            /* Reached only after the global_var_obj probe missed. */
++            js_gv_cell_fill(ctx, prop, p, pr);
+             return js_dup(pr->u.value);
++        }
+     }
+     return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
+                                  ctx->global_obj, throw_ref_error);
+@@ -21108,12 +21197,15 @@
+                 JSAtom atom;
+                 atom = get_u32(pc);
+                 pc += 4;
+-                sf->cur_pc = pc;
+-
+-                val = JS_GetGlobalVar(ctx, atom, opcode - OP_get_var_undef);
+-                if (unlikely(JS_IsException(val)))
+-                    goto exception;
+-                *sp++ = val;
++                if (likely(js_gv_cell_probe(ctx, atom, &val))) {
++                    *sp++ = val;
++                } else {
++                    sf->cur_pc = pc;
++                    val = JS_GetGlobalVar(ctx, atom, opcode - OP_get_var_undef);
++                    if (unlikely(JS_IsException(val)))
++                        goto exception;
++                    *sp++ = val;
++                }
+             }
+             BREAK;
+ 
+@@ -66555,6 +66647,8 @@
+                                                       JS_CLASS_OBJECT, 16);
+     if (JS_IsException(ctx->global_var_obj))
+         return -1;
++    JS_VALUE_GET_OBJ(ctx->global_obj)->gv_watched = 1;
++    JS_VALUE_GET_OBJ(ctx->global_var_obj)->gv_watched = 1;
+ 
+     ctx->class_proto[JS_CLASS_ERROR] = JS_NewObject(ctx);
+     JS_SetPropertyFunctionList(ctx, ctx->class_proto[JS_CLASS_ERROR],
