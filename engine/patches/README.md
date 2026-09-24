@@ -4,6 +4,7 @@
 Every change we make to the engine lives here as a patch, applied to that
 submodule's working tree by `scripts/apply-patches.js`.
 
+| `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 The table below is the whole fork at a glance. You should be able to understand
 what we changed and why without opening a single `.patch` file.
 
@@ -50,7 +51,6 @@ what we changed and why without opening a single `.patch` file.
 | `0037` | Skips COPY_ARGV materialization for functions proven not to write or retain argument slots | Callback callees that only read their arguments can reuse the caller's complete argument array without allocation or duplication | - | No |
 | `0038` | Avoids reifying frame-visible mapped arguments for length, indexed reads, and verified builtin apply calls | Non-escaping argument uses can read the active frame without allocating an arguments object, while all observable slow paths retain the ordinary object | - | Yes |
 | `0039` | Keeps a pending exception when a formal parameter fails to parse | A stack overflow, interrupt or allocation failure raised while reading the parameter token is the real error; replacing it with "missing formal parameter" hides the cause and makes the reported failure depend on native stack depth | - | No |
-| `0040` | Assigns the C-function frame argument buffer | `js_call_c_function_data` and `js_call_c_closure` published a frame whose `arg_buf` was never set, so anything that walks frames precisely read an uninitialized buffer | - | No |
 | `0041` | Appends map and filter results directly to the dense result array | The generic define path turns every result index into an atom and re-derives, per element, that this is an append to a dense array | - | No |
 | `0042` | Keeps an array dense when an index is skipped or deleted, by storing holes and tracking how many | Upstream demotes the array to a property table permanently the first time a store lands past the end, so `Array(n)`, gap fills, row-offset matrices and `delete` cost every later access | - | No |
 | `0043` | Stores the array/string iterator record inline and steps array iterators from the dense storage | Every iteration step re-read `length` with a property get and the element with a generic get; each iterator also allocated a record | - | No |
@@ -83,7 +83,6 @@ what we changed and why without opening a single `.patch` file.
 | `0070` | Deletes the fixed eleven-instruction stack template every computed element store was compiled through, so `[obj][key][val] put_array_el` is the whole store | `function f(a,i,v){ a[i]=v; }` compiled to sixteen opcodes where five carry the meaning | Landed as part of the 0065-0072 stack and measured as a unit against the landed 0064: Octane geomean +10.5% (12 of 13 rows), React 4.3% faster (7 of 9), RN props 2.8% faster (6 of 6) over three passes; the stack cannot be split because 0068 needs 0067, 0069 needs 0066 and 0072 needs 0066+0069 | No |
 | `0071` | Teaches the arguments-elision scan a fourth site kind, `var a = arguments;`: the site emits nothing, swallows the adjacent `put_loc`, and later reads of the alias are rewritten to read the argument frame directly | An alias of `arguments` is not a real local, but the scan did not recognise the declaration form, so every aliased read paid for the reified object | Landed as part of the 0065-0072 stack and measured as a unit against the landed 0064: Octane geomean +10.5% (12 of 13 rows), React 4.3% faster (7 of 9), RN props 2.8% faster (6 of 6) over three passes; the stack cannot be split because 0068 needs 0067, 0069 needs 0066 and 0072 needs 0066+0069 | No |
 | `0072` | Adds `OP_get_arg8_array_el`, the argument-register form of `OP_get_loc8_array_el`: `get_arg(a) get_array_el` becomes one instruction whose key is borrowed out of the argument register and never pushed | The keyed read `nextProps[propKey]` with the key in a parameter still paid a push, a pop and a dup/free round trip for the key | Landed as part of the 0065-0072 stack and measured as a unit against the landed 0064: Octane geomean +10.5% (12 of 13 rows), React 4.3% faster (7 of 9), RN props 2.8% faster (6 of 6) over three passes; the stack cannot be split because 0068 needs 0067, 0069 needs 0066 and 0072 needs 0066+0069 | Yes |
-| `9999` | Raises the bytecode version number, once, for every patch above that needs it | Bytecode built by a patched engine must not load in an unpatched one. Doing it here rather than in each patch stops patches colliding on the same line | - | This is the bump |
 
 ## Reading the patches
 
