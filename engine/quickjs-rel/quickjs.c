@@ -21018,6 +21018,38 @@ static inline bool js_ta_length_getter(JSObject *getter)
         getter->u.cfunc.c_function.getter == js_typed_array_get_length;
 }
 
+static JSValue js_u3_el_recv(JSContext *ctx, JSStackFrame *sf,
+                             uint8_t *pc, JSValue key,
+                             JSValueConst recv)
+{
+    JSValue val, recv_ref;
+
+    if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
+               JS_VALUE_GET_TAG(key) == JS_TAG_INT)) {
+        JSObject *p = JS_VALUE_GET_OBJ(recv);
+        uint32_t idx = JS_VALUE_GET_INT(key);
+
+        if (likely(p->class_id == JS_CLASS_ARRAY &&
+                   idx < p->u.array.count &&
+                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+            if (js_lazy_marker_is(p->u.array.u.values[idx]))
+                val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+            else
+                val = js_dup(p->u.array.u.values[idx]);
+            JS_FreeValue(ctx, key);
+            return val;
+        }
+        if (js_get_fast_array_element(ctx, p, idx, &val)) {
+            JS_FreeValue(ctx, key);
+            return val;
+        }
+    }
+    sf->cur_pc = pc;
+    recv_ref = js_dup(recv);
+    val = JS_GetPropertyValue(ctx, recv_ref, key);
+    JS_FreeValue(ctx, recv_ref);
+    return val;
+}
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -22292,8 +22324,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
         CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
 
         CASE(OP_get_var_ref):
             {
@@ -23650,6 +23680,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = val;
                 sp--;
+                if (unlikely(JS_IsException(val)))
+                    goto exception;
+            }
+            BREAK;
+
+        CASE(OP_get_arg8_el_recv):
+            {
+                JSValueConst recv = arg_buf[*pc++];
+                JSValue val = js_u3_el_recv(ctx, sf, pc, sp[-1], recv);
+                sp[-1] = val;
+                if (unlikely(JS_IsException(val)))
+                    goto exception;
+            }
+            BREAK;
+
+        CASE(OP_get_loc8_el_recv):
+            {
+                JSValueConst recv = var_buf[*pc++];
+                JSValue val = js_u3_el_recv(ctx, sf, pc, sp[-1], recv);
+                sp[-1] = val;
                 if (unlikely(JS_IsException(val)))
                     goto exception;
             }
@@ -40441,8 +40491,164 @@ static void eliminate_tdz_checks(JSFunctionDef *s)
     js_free(s->ctx, init);
 }
 
+#define JS_U3_ARMED   0x40000000u
+#define JS_U3_MAX_WIN 16
+
+static bool js_u3_win_op(const uint8_t *bc_buf, int pos, int op,
+                         bool *pruns_user, int *pw_kind, int *pw_idx)
+{
+    *pruns_user = false;
+    *pw_kind = -1;
+    *pw_idx = -1;
+
+    switch (op) {
+    case OP_push_i32: case OP_push_const: case OP_push_atom_value:
+    case OP_push_bigint_i32:
+    case OP_undefined: case OP_null: case OP_push_false: case OP_push_true:
+    case OP_push_this:
+    case OP_get_loc: case OP_get_arg: case OP_get_var_ref:
+    case OP_get_loc_check: case OP_get_var_ref_check:
+    case OP_drop: case OP_nip: case OP_dup: case OP_dup1: case OP_dup2:
+    case OP_swap: case OP_rot3l: case OP_rot3r: case OP_perm3:
+    case OP_insert2:
+        return true;
+    case OP_put_loc: case OP_set_loc: case OP_put_loc_check:
+    case OP_put_loc_check_init:
+        *pw_kind = 0;
+        *pw_idx = get_u16(bc_buf + pos + 1);
+        return true;
+    case OP_put_arg: case OP_set_arg:
+        *pw_kind = 1;
+        *pw_idx = get_u16(bc_buf + pos + 1);
+        return true;
+    case OP_put_var_ref: case OP_set_var_ref:
+    case OP_put_var_ref_check: case OP_put_var_ref_check_init:
+        *pw_kind = 2;
+        return true;
+    case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
+    case OP_pow: case OP_shl: case OP_shr: case OP_sar:
+    case OP_and: case OP_or: case OP_xor:
+    case OP_neg: case OP_plus: case OP_inc: case OP_dec:
+    case OP_not: case OP_lnot: case OP_typeof:
+    case OP_post_inc: case OP_post_dec:
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+    case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+    case OP_is_undefined_or_null:
+    case OP_get_field: case OP_get_field2: case OP_get_array_el:
+    case OP_to_propkey: case OP_to_object: case OP_check_object:
+    case OP_get_var: case OP_get_var_undef:
+        *pruns_user = true;
+        return true;
+    case OP_add_loc:
+        *pruns_user = true;
+        *pw_kind = 0;
+        *pw_idx = bc_buf[pos + 1];
+        return true;
+    case OP_inc_loc: case OP_dec_loc:
+        *pruns_user = true;
+        *pw_kind = 0;
+        *pw_idx = bc_buf[pos + 1];
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool js_u3_slot_private(JSFunctionDef *s, int kind, int idx)
+{
+    if (s->has_eval_call ||
+        s->var_object_idx >= 0 || s->arg_var_object_idx >= 0)
+        return false;
+    if (kind == 0)
+        return idx < s->var_count && !s->vars[idx].is_captured;
+    if (idx >= s->arg_count || s->args[idx].is_captured)
+        return false;
+    return s->arguments_var_idx < 0 && s->arguments_arg_idx < 0;
+}
+
+static uint32_t *js_u3_scan(JSContext *ctx, JSFunctionDef *s,
+                            const uint8_t *bc_buf, int bc_len)
+{
+    uint32_t *map = NULL;
+    int pos, len;
+
+    for (pos = 0; pos < bc_len; pos += len) {
+        int op = bc_buf[pos], kind, idx, p, depth, win_len, last_op;
+        bool runs_user, touches_varref;
+
+        len = opcode_info[op].size;
+        if (len <= 0)
+            break;
+        if (op == OP_get_loc)
+            kind = 0;
+        else if (op == OP_get_arg)
+            kind = 1;
+        else
+            continue;
+        idx = get_u16(bc_buf + pos + 1);
+        if (idx >= 256)
+            continue;
+
+        depth = 0;
+        win_len = 0;
+        last_op = -1;
+        runs_user = false;
+        touches_varref = false;
+        p = pos + len;
+        while (p < bc_len) {
+            int op2 = bc_buf[p], n_pop, len2, write_kind, write_idx;
+            bool runs_user2;
+
+            len2 = opcode_info[op2].size;
+            if (len2 <= 0)
+                break;
+            if (op2 == OP_get_array_el) {
+                if (depth != 1 || last_op == OP_get_loc)
+                    break;
+                goto found;
+            }
+            if (op2 == OP_source_loc) {
+                p += len2;
+                continue;
+            }
+            if (!js_u3_win_op(bc_buf, p, op2, &runs_user2,
+                              &write_kind, &write_idx))
+                break;
+            n_pop = opcode_info[op2].n_pop;
+            if (depth < n_pop)
+                break;
+            if (write_kind == kind && write_idx == idx)
+                break;
+            if (write_kind == 2)
+                touches_varref = true;
+            depth += opcode_info[op2].n_push - n_pop;
+            runs_user |= runs_user2;
+            last_op = op2;
+            if (++win_len > JS_U3_MAX_WIN)
+                break;
+            p += len2;
+            continue;
+
+        found:
+            if ((runs_user || touches_varref) &&
+                !js_u3_slot_private(s, kind, idx))
+                break;
+            if (!map) {
+                map = js_mallocz_rt(ctx->rt, sizeof(*map) * bc_len);
+                if (!map)
+                    return NULL;
+            }
+            map[pos] = (uint32_t)p + 1;
+            break;
+        }
+    }
+    return map;
+}
+
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
+    uint32_t *u3_map = NULL;
+    int u3_armed = 0;
     int prologue_put_pos = -1, prologue_put_end = -1, prologue_put_idx = -1;
     int prologue_skip_to = 0;
     int pos, pos_next, bc_len, op, op1, len, i, line_num, col_num, patch_offsets;
@@ -40506,6 +40712,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             }
         }
     }
+
+    u3_map = js_u3_scan(ctx, s, bc_buf, bc_len);
 
     /* initialize the 'home_object' variable if needed */
     if (s->home_object_var_idx >= 0) {
@@ -40658,6 +40866,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 }
                 continue;
             }
+        }
+        if (u3_armed && op != OP_source_loc &&
+            !(u3_map[pos] & JS_U3_ARMED)) {
+            add_pc2line_info(s, bc_out.size, line_num, col_num);
+            dbuf_put(&bc_out, bc_buf + pos, len);
+            continue;
         }
         switch(op) {
         case OP_source_loc:
@@ -41218,6 +41432,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 break;
             }
             goto no_change;
+        case OP_get_array_el:
+            if (u3_map && (u3_map[pos] & JS_U3_ARMED)) {
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                dbuf_putc(&bc_out, (u3_map[pos] & 0x100) ? OP_get_arg8_el_recv
+                                                         : OP_get_loc8_el_recv);
+                dbuf_putc(&bc_out, u3_map[pos] & 0xff);
+                u3_armed--;
+                break;
+            }
+            goto no_change;
+
         case OP_args_recv:
             {
                 int kind = get_u16(bc_buf + pos + 1);
@@ -41379,6 +41604,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     pos_next = cc.pos;
                     break;
                 }
+                if (u3_map && u3_map[pos]) {
+                    u3_map[u3_map[pos] - 1] = JS_U3_ARMED | (uint32_t)idx;
+                    u3_armed++;
+                    break;
+                }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -41435,6 +41665,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
 #endif
+                if (op == OP_get_arg && u3_map && u3_map[pos]) {
+                    u3_map[u3_map[pos] - 1] =
+                        JS_U3_ARMED | 0x100 | (uint32_t)idx;
+                    u3_armed++;
+                    break;
+                }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -41673,6 +41909,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     }
     js_free(ctx, d3_ev);
     d3_ev = NULL;
+    if (unlikely(u3_armed != 0)) {
+        JS_ThrowInternalError(ctx, "unconsumed receiver borrow");
+        goto fail;
+    }
+    js_free(ctx, u3_map);
+    u3_map = NULL;
     /* XXX: should delay until copying to runtime bytecode function */
     compute_pc2line_info(s);
     js_free(ctx, s->source_loc_slots);
@@ -41687,6 +41929,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     }
     return 0;
  fail:
+    js_free(ctx, u3_map);
     js_free(ctx, d3_ev);
     /* XXX: not safe */
     dbuf_free(&bc_out);
