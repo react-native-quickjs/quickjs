@@ -315,12 +315,16 @@
       "sha256": "a7b741184003271b55419490a7c781b6073f59be05d4d68f694fe764fbe20e53"
     },
     {
+      "name": "0082-object-spread-shape-walk.patch",
+      "sha256": "97de7f96f1bdb5c0c3d2634efed0deebdce54f4e498aadb31e1223f3cfef1475"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "f2414917e45ec8550543540917bfa602fc97f3a79857c8ad244f578c95330b89",
+    "quickjs.c": "cfaaccb0641ed9d7fe9fe945c4d6f5583a82050add94b51c5725a8be645b4833",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
