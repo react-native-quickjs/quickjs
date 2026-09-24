@@ -56,6 +56,7 @@
     "submodules": "git submodule update --init --recursive",
     "patches": "node scripts/apply-patches.js",
     "sync-engine": "node scripts/sync-quickjs-rel.js",
+    "regenerate-builtins": "node scripts/regenerate-builtin-blobs.js",
     "guard:selftest": "node scripts/guard-selftest.js",
     "configure": "cmake -B build -DCMAKE_BUILD_TYPE=Debug",
     "build": "cmake --build build -j8",
