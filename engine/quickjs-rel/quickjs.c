@@ -17517,6 +17517,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
     /* fast path for float64 */
     if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
         goto handle_float64;
+    /* the slot must not name a value the helper no longer owns */
+sp[-1] = JS_UNDEFINED;
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1))
         goto exception;
@@ -17650,6 +17652,8 @@ static __exception int js_post_inc_slow(JSContext *ctx,
 
     /* XXX: allow custom operators */
     op1 = sp[-1];
+    /* the slot must not name a value the helper no longer owns */
+sp[-1] = JS_UNDEFINED;
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         sp[-1] = JS_UNDEFINED;
@@ -17665,6 +17669,8 @@ static no_inline int js_not_slow(JSContext *ctx, JSValue *sp)
     JSValue op1;
 
     op1 = sp[-1];
+    /* the slot must not name a value the helper no longer owns */
+sp[-1] = JS_UNDEFINED;
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1))
         goto exception;
@@ -17750,11 +17756,14 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
         }
         return 0;
     }
+    /* the slot must not name a value the helper no longer owns */
+sp[-2] = JS_UNDEFINED;
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
         goto exception;
     }
+sp[-1] = JS_UNDEFINED;
     op2 = JS_ToNumericFree(ctx, op2);
     if (JS_IsException(op2)) {
         JS_FreeValue(ctx, op1);
@@ -18041,11 +18050,14 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
     }
 
     if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
+        /* the slot must not name a value the helper no longer owns */
+sp[-2] = JS_UNDEFINED;
         op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
         if (JS_IsException(op1)) {
             JS_FreeValue(ctx, op2);
             goto exception;
         }
+sp[-1] = JS_UNDEFINED;
 
         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
         if (JS_IsException(op2)) {
@@ -18062,12 +18074,14 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
             goto exception;
         return 0;
     }
+sp[-2] = JS_UNDEFINED;
 
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
         goto exception;
     }
+sp[-1] = JS_UNDEFINED;
     op2 = JS_ToNumericFree(ctx, op2);
     if (JS_IsException(op2)) {
         JS_FreeValue(ctx, op1);
@@ -18191,11 +18205,14 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
         sp[-2] = __JS_NewShortBigInt(ctx, v);
         return 0;
     }
+    /* the slot must not name a value the helper no longer owns */
+sp[-2] = JS_UNDEFINED;
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
         goto exception;
     }
+sp[-1] = JS_UNDEFINED;
     op2 = JS_ToNumericFree(ctx, op2);
     if (JS_IsException(op2)) {
         JS_FreeValue(ctx, op1);
@@ -18393,11 +18410,15 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
 
+    /* the slot must not name a value the helper no longer owns */
+sp[-2] = JS_UNDEFINED;
+
     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NUMBER);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
         goto exception;
     }
+sp[-1] = JS_UNDEFINED;
     op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NUMBER);
     if (JS_IsException(op2)) {
         JS_FreeValue(ctx, op1);
@@ -18461,11 +18482,13 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
                 }
             }
         } else {
+sp[-2] = JS_UNDEFINED;
             op1 = JS_ToNumericFree(ctx, op1);
             if (JS_IsException(op1)) {
                 JS_FreeValue(ctx, op2);
                 goto exception;
             }
+sp[-1] = JS_UNDEFINED;
             op2 = JS_ToNumericFree(ctx, op2);
             if (JS_IsException(op2)) {
                 JS_FreeValue(ctx, op1);
@@ -18594,11 +18617,14 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                 }
             }
         } else {
+            /* the slot must not name a value the helper no longer owns */
+sp[-2] = JS_UNDEFINED;
             op1 = JS_ToNumericFree(ctx, op1);
             if (JS_IsException(op1)) {
                 JS_FreeValue(ctx, op2);
                 goto exception;
             }
+sp[-1] = JS_UNDEFINED;
             op2 = JS_ToNumericFree(ctx, op2);
             if (JS_IsException(op2)) {
                 JS_FreeValue(ctx, op1);
@@ -18618,11 +18644,13 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                 (tag_is_number(tag2) || tag_is_string(tag2) || tag2 == JS_TAG_SYMBOL)) ||
                (tag2 == JS_TAG_OBJECT &&
                 (tag_is_number(tag1) || tag_is_string(tag1) || tag1 == JS_TAG_SYMBOL))) {
+sp[-2] = JS_UNDEFINED;
         op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
         if (JS_IsException(op1)) {
             JS_FreeValue(ctx, op2);
             goto exception;
         }
+sp[-1] = JS_UNDEFINED;
         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
         if (JS_IsException(op2)) {
             JS_FreeValue(ctx, op1);
@@ -18658,11 +18686,14 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
 
     op1 = sp[-2];
     op2 = sp[-1];
+    /* the slot must not name a value the helper no longer owns */
+sp[-2] = JS_UNDEFINED;
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
         goto exception;
     }
+sp[-1] = JS_UNDEFINED;
     op2 = JS_ToNumericFree(ctx, op2);
     if (JS_IsException(op2)) {
         JS_FreeValue(ctx, op1);

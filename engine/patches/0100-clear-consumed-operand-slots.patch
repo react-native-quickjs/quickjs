@@ -1,0 +1,186 @@
+Subject: Clear the operand-stack slot before a helper consumes the value it names
+
+What this does
+  Stores undefined into the operand-stack slot at the moment a slow-path helper
+  moves the operand's reference into a C local, in the twelve helpers that read
+  their operands from sp[-2] and sp[-1].
+
+Why we need it
+  Those helpers hand the operand to a conversion that consumes the reference and
+  then convert the other operand, which can run user code. From the first call
+  until the result is stored, the slot names a value the helper no longer owns,
+  so anything that inspects the operand stack during that window reads a stale
+  reference.
+
+What it adds
+  Nine two-operand sites clear both slots and three single-operand sites clear
+  the one, at the point where the reference moves rather than after the
+  conversion returns. The value the helper computes, the reference it releases on
+  each failure path and every observable result are unchanged. No opcode is added
+  or retired and BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -17530,6 +17530,8 @@
+     /* fast path for float64 */
+     if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
+         goto handle_float64;
++    /* the slot must not name a value the helper no longer owns */
++sp[-1] = JS_UNDEFINED;
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1))
+         goto exception;
+@@ -17663,6 +17665,8 @@
+ 
+     /* XXX: allow custom operators */
+     op1 = sp[-1];
++    /* the slot must not name a value the helper no longer owns */
++sp[-1] = JS_UNDEFINED;
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1)) {
+         sp[-1] = JS_UNDEFINED;
+@@ -17678,6 +17682,8 @@
+     JSValue op1;
+ 
+     op1 = sp[-1];
++    /* the slot must not name a value the helper no longer owns */
++sp[-1] = JS_UNDEFINED;
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1))
+         goto exception;
+@@ -17763,11 +17769,14 @@
+         }
+         return 0;
+     }
++    /* the slot must not name a value the helper no longer owns */
++sp[-2] = JS_UNDEFINED;
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1)) {
+         JS_FreeValue(ctx, op2);
+         goto exception;
+     }
++sp[-1] = JS_UNDEFINED;
+     op2 = JS_ToNumericFree(ctx, op2);
+     if (JS_IsException(op2)) {
+         JS_FreeValue(ctx, op1);
+@@ -18054,11 +18063,14 @@
+     }
+ 
+     if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
++        /* the slot must not name a value the helper no longer owns */
++sp[-2] = JS_UNDEFINED;
+         op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
+         if (JS_IsException(op1)) {
+             JS_FreeValue(ctx, op2);
+             goto exception;
+         }
++sp[-1] = JS_UNDEFINED;
+ 
+         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
+         if (JS_IsException(op2)) {
+@@ -18075,12 +18087,14 @@
+             goto exception;
+         return 0;
+     }
++sp[-2] = JS_UNDEFINED;
+ 
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1)) {
+         JS_FreeValue(ctx, op2);
+         goto exception;
+     }
++sp[-1] = JS_UNDEFINED;
+     op2 = JS_ToNumericFree(ctx, op2);
+     if (JS_IsException(op2)) {
+         JS_FreeValue(ctx, op1);
+@@ -18204,11 +18218,14 @@
+         sp[-2] = __JS_NewShortBigInt(ctx, v);
+         return 0;
+     }
++    /* the slot must not name a value the helper no longer owns */
++sp[-2] = JS_UNDEFINED;
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1)) {
+         JS_FreeValue(ctx, op2);
+         goto exception;
+     }
++sp[-1] = JS_UNDEFINED;
+     op2 = JS_ToNumericFree(ctx, op2);
+     if (JS_IsException(op2)) {
+         JS_FreeValue(ctx, op1);
+@@ -18406,11 +18423,15 @@
+     tag1 = JS_VALUE_GET_NORM_TAG(op1);
+     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+ 
++    /* the slot must not name a value the helper no longer owns */
++sp[-2] = JS_UNDEFINED;
++
+     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NUMBER);
+     if (JS_IsException(op1)) {
+         JS_FreeValue(ctx, op2);
+         goto exception;
+     }
++sp[-1] = JS_UNDEFINED;
+     op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NUMBER);
+     if (JS_IsException(op2)) {
+         JS_FreeValue(ctx, op1);
+@@ -18474,11 +18495,13 @@
+                 }
+             }
+         } else {
++sp[-2] = JS_UNDEFINED;
+             op1 = JS_ToNumericFree(ctx, op1);
+             if (JS_IsException(op1)) {
+                 JS_FreeValue(ctx, op2);
+                 goto exception;
+             }
++sp[-1] = JS_UNDEFINED;
+             op2 = JS_ToNumericFree(ctx, op2);
+             if (JS_IsException(op2)) {
+                 JS_FreeValue(ctx, op1);
+@@ -18607,11 +18630,14 @@
+                 }
+             }
+         } else {
++            /* the slot must not name a value the helper no longer owns */
++sp[-2] = JS_UNDEFINED;
+             op1 = JS_ToNumericFree(ctx, op1);
+             if (JS_IsException(op1)) {
+                 JS_FreeValue(ctx, op2);
+                 goto exception;
+             }
++sp[-1] = JS_UNDEFINED;
+             op2 = JS_ToNumericFree(ctx, op2);
+             if (JS_IsException(op2)) {
+                 JS_FreeValue(ctx, op1);
+@@ -18631,11 +18657,13 @@
+                 (tag_is_number(tag2) || tag_is_string(tag2) || tag2 == JS_TAG_SYMBOL)) ||
+                (tag2 == JS_TAG_OBJECT &&
+                 (tag_is_number(tag1) || tag_is_string(tag1) || tag1 == JS_TAG_SYMBOL))) {
++sp[-2] = JS_UNDEFINED;
+         op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
+         if (JS_IsException(op1)) {
+             JS_FreeValue(ctx, op2);
+             goto exception;
+         }
++sp[-1] = JS_UNDEFINED;
+         op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
+         if (JS_IsException(op2)) {
+             JS_FreeValue(ctx, op1);
+@@ -18671,11 +18699,14 @@
+ 
+     op1 = sp[-2];
+     op2 = sp[-1];
++    /* the slot must not name a value the helper no longer owns */
++sp[-2] = JS_UNDEFINED;
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1)) {
+         JS_FreeValue(ctx, op2);
+         goto exception;
+     }
++sp[-1] = JS_UNDEFINED;
+     op2 = JS_ToNumericFree(ctx, op2);
+     if (JS_IsException(op2)) {
+         JS_FreeValue(ctx, op1);
