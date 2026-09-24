@@ -6867,8 +6867,14 @@ static void ic_entry_reset(JSRuntime *rt, JSICEntry *e)
    retain memory. */
 static int fnbc_is_acyclic(JSFunctionBytecode *b)
 {
-    return b->cpool_count == 0 && b->objlit_tab == NULL &&
-           b->ic_table == NULL;
+    /* A lazily read body reserves its constant pool inline in the same zeroed
+       allocation and never writes it until the body is materialized, so the
+       reserved slots are all JS_TAG_INT 0 and marking them does nothing.  A
+       body whose materialization FAILED is excluded: JS_ReadFunctionBody fills
+       the pool before it installs byte_code_buf, so such a body is flagged lazy
+       with real references in its pool. */
+    return (b->cpool_count == 0 || (b->is_lazy && !b->lazy_failed)) &&
+           b->objlit_tab == NULL && b->ic_table == NULL;
 }
 
 /* Idempotent: moves b between the two lists so the header bit and the list

@@ -367,12 +367,16 @@
       "sha256": "a10891e23cd2f8c74dfa9a8ccb62afeb01a5f488e0774fb2ea6188599c66a067"
     },
     {
+      "name": "0097-untraced-lazy-function-bytecodes.patch",
+      "sha256": "c190b01c22b05cd1468065b165badf829672586c97c16e90bb303c4f1cb314fe"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "2ab5b735308d73407a4684b96005d6de1098ca6393fef5003c91720f4b1ea59c",
+    "quickjs.c": "32c232e37e5a26812875eb16ebd122e29e79d5ab25084ad05c8c328c54c192ef",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
