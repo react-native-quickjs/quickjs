@@ -20120,6 +20120,17 @@ js_ta_store_inline(JSObject *p, uint32_t idx, JSValue val)
     }
 }
 
+/* Inline the intrinsic %TypedArray%.prototype.length getter in OP_get_length. */
+static JSValue js_typed_array_get_length(JSContext *ctx, JSValueConst this_val);
+
+static inline bool js_ta_length_getter(JSObject *getter)
+{
+    return getter != NULL &&
+        getter->class_id == JS_CLASS_C_FUNCTION &&
+        getter->u.cfunc.cproto == JS_CFUNC_getter &&
+        getter->u.cfunc.c_function.getter == js_typed_array_get_length;
+}
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -20394,12 +20405,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
                             /* found */
-                            if (unlikely(prs->flags & JS_PROP_TMASK))
+                            if (unlikely(prs->flags & JS_PROP_TMASK)) {
+                                if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET &&
+                                    js_ta_length_getter(pr->u.getset.getter) &&
+                                    is_typed_array(JS_VALUE_GET_OBJ(sp[-1])->class_id)) {
+                                    val = js_int32(JS_VALUE_GET_OBJ(sp[-1])->u.array.count);
+                                    break;
+                                }
                                 goto get_length_slow_path;
+                            }
                             val = js_dup(pr->u.value);
                             break;
                         }
                         if (unlikely(p->is_exotic)) {
+                            /* For `length` a typed array's exotic [[Get]] is a
+                               no-op, so the ordinary walk may continue. */
+                            if (is_typed_array(p->class_id)) {
+                                p = p->shape->proto;
+                                if (!p) {
+                                    val = JS_UNDEFINED;
+                                    break;
+                                }
+                                continue;
+                            }
                             obj = JS_MKPTR(JS_TAG_OBJECT, p);
                             goto get_length_slow_path;
                         }
