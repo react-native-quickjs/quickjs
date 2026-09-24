@@ -1,0 +1,67 @@
+Subject: Object.assign must not use the object-spread fast path
+
+What this does
+  Routes Object.assign through assignment semantics rather than sharing the
+  shape walk used by object spread.
+
+Why we need it
+  The spread walk defines properties, while assignment runs a setter on the target,
+  refuses a read-only target in strict mode, and orders the copy as the assignment
+  operation does.
+
+What it adds
+  Object.assign uses the assignment operation for each source property, so a
+  setter runs, a read-only target throws as it should, and property order and
+  enumerability are those of the assignment. Object literals with a spread keep the
+  shape walk they already had. No opcode is added or retired and BC_VERSION is
+  unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -19765,11 +19765,38 @@
+         return ret;
+     }
+ 
+-    /* No exclusion list means plain `{...src}` / Object.assign, which is the
+-       shape worth specialising. `setprop` (Object.assign) would additionally
+-       have to honour setters on the target; the fast path only accepts targets
+-       that cannot have any, so both callers can share it. */
+-    if (JS_VALUE_GET_TAG(excluded) != JS_TAG_OBJECT) {
++    /* No exclusion list means plain `{...src}`, which is the shape worth
++       specialising.
++
++       SPREAD ONLY, NEVER Object.assign. The fast path writes with
++       JS_DefinePropertyValue, which is exactly CreateDataPropertyOrThrow --
++       what the spec calls for in a spread (ECMA-262 13.2.5.5), where the target
++       is always a fresh object literal and no conflict is possible.
++
++       Object.assign is specified in terms of Set(to, nextKey, propValue, true)
++       (ECMA-262 20.1.2.1 step 5.c.iii.3), and Set differs from Define in three
++       observable ways that this fast path cannot honour: it invokes a setter on
++       the target, it walks the target's PROTOTYPE CHAIN looking for one, and it
++       preserves an existing property's attributes instead of resetting them to
++       C_W_E. An earlier version of this comment claimed the fast path "only
++       accepts targets that cannot have any" setters -- it does not. The scan
++       below inspects the SOURCE shape for JS_PROP_TMASK; the target is only
++       checked for class_id, is_exotic, fast_array and extensible, all of which
++       a target carrying an accessor or a read-only property passes.
++
++       That gap silently broke two things, caught by test262
++       built-ins/Object/assign/target-set-user-error.js (a throwing setter on
++       the target was replaced rather than called, so nothing threw) and
++       target-set-not-writable.js (a non-writable target property was
++       overwritten instead of raising TypeError).
++
++       Gating on !setprop rather than hardening the scan is deliberate: the
++       shipped React Native bundle has 125 spread sites against 11
++       Object.assign, so this keeps the optimization where essentially all of
++       the traffic is, and returns Object.assign to a path that is correct for
++       prototype setters and attribute preservation too -- not merely for the
++       two cases test262 happens to cover. */
++    if (!setprop && JS_VALUE_GET_TAG(excluded) != JS_TAG_OBJECT) {
+         ret = JS_CopyDataPropertiesFast(ctx, target, source);
+         if (ret != 0)
+             return ret < 0 ? -1 : 0;

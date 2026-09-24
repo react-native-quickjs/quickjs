@@ -339,12 +339,16 @@
       "sha256": "a0f8eeead96de5d8e1bd76954619f86755764b860c34d188d1191b67d37e30c3"
     },
     {
+      "name": "0088-object-assign-set-semantics.patch",
+      "sha256": "847b92cb5692f06dbeabb634feb12433e6db3a691c6a95f6be0c1c52bed0aaf4"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "77cbee6222b0a2225f94dd00909060bc579e72faf90f001fdd85ff829c11f4a6",
+    "quickjs.c": "42c316e18c479230cdb4710e7f82807ffb66529900af97779640e477027ef339",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
