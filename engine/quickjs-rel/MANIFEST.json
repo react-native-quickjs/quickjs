@@ -335,12 +335,16 @@
       "sha256": "3da15f40f81b058eb4f741339d3547d7a6f307c4381cf739bb20f88ffb0b9fec"
     },
     {
+      "name": "0087-array-species-default-guard.patch",
+      "sha256": "a0f8eeead96de5d8e1bd76954619f86755764b860c34d188d1191b67d37e30c3"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "c8150aa81d53e98b50db1dd38676228a1957e1ec7676d34619ec4410c6ba2640"
     }
   ],
   "files": {
-    "quickjs.c": "9c49999c94f0a4690991be0c0647788453bb4524278f46710e2ec5eba857bbfc",
+    "quickjs.c": "77cbee6222b0a2225f94dd00909060bc579e72faf90f001fdd85ff829c11f4a6",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
