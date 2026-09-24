@@ -22315,9 +22315,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
         CASE(OP_reserved1):
         CASE(OP_reserved2):
-        CASE(OP_reserved3):
-            JS_ThrowInternalError(ctx, "invalid opcode (retired slot)");
-            goto exception;
         CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
@@ -23908,6 +23905,68 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
                 JS_FreeValue(ctx, sp[-3]);
                 sp -= 3;
+                if (unlikely(ret < 0))
+                    goto exception;
+            }
+            BREAK;
+
+        CASE(OP_put_el_recv):
+            {
+                int ret;
+                JSValue obj, val;
+                uint32_t idx;
+                JSObject *p;
+
+                idx = *pc++;
+                obj = (idx & 0x80) ? arg_buf[idx & 0x7f]
+                                   : var_buf[idx];
+                val = sp[-1];
+                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
+                    idx = JS_VALUE_GET_INT(sp[-2]);
+                    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                        p = JS_VALUE_GET_OBJ(obj);
+                        if (likely(p->class_id == JS_CLASS_ARRAY &&
+                                   idx < (uint32_t)p->u.array.count &&
+                                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                            set_value(ctx, &p->u.array.u.values[idx], val);
+                            sp -= 2;
+                            BREAK;
+                        }
+                        if (likely(p->class_id == JS_CLASS_ARRAY &&
+                                   idx == (uint32_t)p->u.array.count &&
+                                   p->fast_array && p->extensible &&
+                                   p->shape->proto == JS_VALUE_GET_OBJ(
+                                       ctx->class_proto[JS_CLASS_ARRAY]) &&
+                                   ctx->std_array_prototype)) {
+                            uint32_t array_len;
+
+                            if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) ==
+                                       JS_TAG_INT)) {
+                                uint32_t new_len = idx + 1;
+                                array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
+                                if (likely(new_len <= p->u.array.u1.size)) {
+                                    p->u.array.u.values[idx] = val;
+                                    p->u.array.count = new_len;
+                                    if (new_len > array_len)
+                                        p->prop[0].u.value = js_int32(new_len);
+                                    sp -= 2;
+                                    BREAK;
+                                }
+                            }
+                        }
+                        if (js_ta_store_inline(p, idx, val)) {
+                            JS_FreeValue(ctx, val);
+                            sp -= 2;
+                            BREAK;
+                        }
+                    }
+                }
+                sf->cur_pc = pc;
+                obj = js_dup(obj);
+                ret = JS_SetPropertyValue(ctx, obj, sp[-2], sp[-1],
+                                          JS_PROP_THROW_STRICT);
+                JS_FreeValue(ctx, obj);
+                sp -= 2;
                 if (unlikely(ret < 0))
                     goto exception;
             }
@@ -32888,7 +32947,8 @@ static void emit_iterator_close(JSParseState *s, bool is_async,
         emit_op(s, OP_drop);
     }
     emit_op(s, OP_dup);
-    emit_op(s, OP_is_undefined);
+    emit_op(s, OP_undefined);
+    emit_op(s, OP_strict_eq);
     label_done = emit_goto(s, OP_if_true, -1);
     emit_op(s, OP_get_field2);
     emit_atom(s, JS_ATOM_return);
@@ -40602,8 +40662,13 @@ static uint32_t *js_u3_scan(JSContext *ctx, JSFunctionDef *s,
             len2 = opcode_info[op2].size;
             if (len2 <= 0)
                 break;
-            if (op2 == OP_get_array_el) {
-                if (depth != 1 || last_op == OP_get_loc)
+            if (op2 == OP_get_array_el && depth == 1) {
+                if (last_op == OP_get_loc)
+                    break;
+                goto found;
+            }
+            if (op2 == OP_put_array_el) {
+                if (depth != 2 || idx >= 128)
                     break;
                 goto found;
             }
@@ -41438,6 +41503,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 dbuf_putc(&bc_out, (u3_map[pos] & 0x100) ? OP_get_arg8_el_recv
                                                          : OP_get_loc8_el_recv);
                 dbuf_putc(&bc_out, u3_map[pos] & 0xff);
+                u3_armed--;
+                break;
+            }
+            goto no_change;
+
+        case OP_put_array_el:
+            if (u3_map && (u3_map[pos] & JS_U3_ARMED)) {
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                dbuf_putc(&bc_out, OP_put_el_recv);
+                dbuf_putc(&bc_out, (u3_map[pos] & 0xff) |
+                                   ((u3_map[pos] & 0x100) >> 1));
                 u3_armed--;
                 break;
             }
