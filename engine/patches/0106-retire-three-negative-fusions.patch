@@ -1,0 +1,125 @@
+Subject: Retire Three Element And Branch Fusions Whose A/B Was Null
+
+What this does
+  Deletes the emission of three fused opcodes measured null as a group, keeping each
+  opcode's slot: the DEFs become reserved6, reserved7 and reserved12 at their existing
+  positions, and their handler bodies stay because the dispatch table needs a label
+  per DEF.
+
+Why we need it
+  Measured by removing each fusion from the full stack, four rows and five pairs, on a
+  quiet host: for-in-next-if-false +0.09%, get_arg8_loc8_array_el +0.03% and
+  get_loc8_array_el -0.40% geomean, all inside the null floor, while the three together
+  are worth about +1.3%. get_arg_field_nr and get_arg8_array_el were measured as keeps
+  and are left alone.
+
+Bytecode bump?
+  No. No opcode number moves; the retired slots are held as reservedN.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23020,7 +23020,7 @@
+                     goto exception;
+             }
+             BREAK;
+-        CASE(OP_for_in_next_if_false):
++        CASE(OP_reserved6):
+             sf->cur_pc = pc;
+             if (js_for_in_next(ctx, sp))
+                 goto exception;
+@@ -24008,10 +24008,10 @@
+             }
+             BREAK;
+ 
+-        CASE(OP_get_arg8_loc8_array_el):
++        CASE(OP_reserved7):
+             *sp++ = js_dup(arg_buf[*pc++]);
+             /* fall through */
+-        CASE(OP_get_loc8_array_el):
++        CASE(OP_reserved12):
+             {
+                 JSValue val;
+                 int idx = *pc++;
+@@ -24045,7 +24045,7 @@
+             BREAK;
+ 
+         CASE(OP_get_arg8_array_el):
+-            /* the argument-register form of OP_get_loc8_array_el: the receiver
++            /* the argument-register form of OP_reserved12: the receiver
+                is on the stack and the KEY is arg_buf[a], borrowed -- no dup, no
+                free, no 16-byte stack push and pop for it. Borrowing the key is
+                legal because JS_GetPropertyValueConst() never frees it, and the
+@@ -41731,14 +41731,6 @@
+             goto no_change;
+ 
+         case OP_for_in_next:
+-            if (code_match(&cc, pos_next, OP_if_false, -1)) {
+-                if (cc.line_num >= 0) line_num = cc.line_num;
+-                if (cc.col_num >= 0) col_num = cc.col_num;
+-                pos_next = cc.pos;
+-                label = cc.label;
+-                op = OP_for_in_next_if_false;
+-                goto has_label;
+-            }
+             goto no_change;
+ 
+         case OP_swap:
+@@ -41924,15 +41916,6 @@
+                     break;
+                 }
+ #endif
+-                if (code_match(&cc, pos_next, OP_get_array_el, -1)) {
+-                    if (cc.line_num >= 0) line_num = cc.line_num;
+-                    if (cc.col_num >= 0) col_num = cc.col_num;
+-                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+-                    dbuf_putc(&bc_out, OP_get_loc8_array_el);
+-                    dbuf_putc(&bc_out, idx);
+-                    pos_next = cc.pos;
+-                    break;
+-                }
+                 if (u3_map && u3_map[pos]) {
+                     u3_map[u3_map[pos] - 1] = JS_U3_ARMED | (uint32_t)idx;
+                     u3_armed++;
+@@ -41947,18 +41930,6 @@
+             {
+                 int idx;
+                 idx = get_u16(bc_buf + pos + 1);
+-                if (op == OP_get_arg && idx < 256 &&
+-                    code_match(&cc, pos_next, OP_get_loc, -1, OP_get_array_el, -1) &&
+-                    cc.idx < 256) {
+-                    if (cc.line_num >= 0) line_num = cc.line_num;
+-                    if (cc.col_num >= 0) col_num = cc.col_num;
+-                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+-                    dbuf_putc(&bc_out, OP_get_arg8_loc8_array_el);
+-                    dbuf_putc(&bc_out, idx);
+-                    dbuf_putc(&bc_out, cc.idx);
+-                    pos_next = cc.pos;
+-                    break;
+-                }
+ #if JS_ENABLE_IC
+                 /* Borrow-fusion: get_arg(n) get_field(atom) ->
+                    get_arg_field_nr(atom, n, ic). The receiver is the
+@@ -42427,7 +42398,7 @@
+             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+                 goto fail;
+             break;
+-        case OP_for_in_next_if_false:
++        case OP_reserved6:
+             stack_len--;
+             diff = get_u32(bc_buf + pos + 1);
+             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -356,9 +356,9 @@
+ DEF(       get_arg2, 1, 0, 1, none_arg)
+ DEF(       get_arg3, 1, 0, 1, none_arg)
+ DEF(       put_arg0, 1, 1, 0, none_arg)
+-DEF(get_loc8_array_el, 2, 1, 1, loc8)
+-DEF(get_arg8_loc8_array_el, 3, 0, 1, loc8_loc8)
+-DEF(for_in_next_if_false, 5, 1, 3, label)
++DEF(reserved12, 2, 1, 1, loc8)
++DEF(reserved7, 3, 0, 1, loc8_loc8)
++DEF(reserved6, 5, 1, 3, label)
+ DEF(       set_arg0, 1, 1, 1, none_arg)
+ DEF(      reserved1, 1, 0, 0, none)
+ DEF(      reserved2, 1, 0, 0, none)

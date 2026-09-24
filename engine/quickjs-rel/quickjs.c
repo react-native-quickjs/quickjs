@@ -23020,7 +23020,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
             }
             BREAK;
-        CASE(OP_for_in_next_if_false):
+        CASE(OP_reserved6):
             sf->cur_pc = pc;
             if (js_for_in_next(ctx, sp))
                 goto exception;
@@ -24008,10 +24008,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
-        CASE(OP_get_arg8_loc8_array_el):
+        CASE(OP_reserved7):
             *sp++ = js_dup(arg_buf[*pc++]);
             /* fall through */
-        CASE(OP_get_loc8_array_el):
+        CASE(OP_reserved12):
             {
                 JSValue val;
                 int idx = *pc++;
@@ -24045,7 +24045,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_get_arg8_array_el):
-            /* the argument-register form of OP_get_loc8_array_el: the receiver
+            /* the argument-register form of OP_reserved12: the receiver
                is on the stack and the KEY is arg_buf[a], borrowed -- no dup, no
                free, no 16-byte stack push and pop for it. Borrowing the key is
                legal because JS_GetPropertyValueConst() never frees it, and the
@@ -41732,14 +41732,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             goto no_change;
 
         case OP_for_in_next:
-            if (code_match(&cc, pos_next, OP_if_false, -1)) {
-                if (cc.line_num >= 0) line_num = cc.line_num;
-                if (cc.col_num >= 0) col_num = cc.col_num;
-                pos_next = cc.pos;
-                label = cc.label;
-                op = OP_for_in_next_if_false;
-                goto has_label;
-            }
             goto no_change;
 
         case OP_swap:
@@ -41925,15 +41917,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
 #endif
-                if (code_match(&cc, pos_next, OP_get_array_el, -1)) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    if (cc.col_num >= 0) col_num = cc.col_num;
-                    add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    dbuf_putc(&bc_out, OP_get_loc8_array_el);
-                    dbuf_putc(&bc_out, idx);
-                    pos_next = cc.pos;
-                    break;
-                }
                 if (u3_map && u3_map[pos]) {
                     u3_map[u3_map[pos] - 1] = JS_U3_ARMED | (uint32_t)idx;
                     u3_armed++;
@@ -41948,18 +41931,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             {
                 int idx;
                 idx = get_u16(bc_buf + pos + 1);
-                if (op == OP_get_arg && idx < 256 &&
-                    code_match(&cc, pos_next, OP_get_loc, -1, OP_get_array_el, -1) &&
-                    cc.idx < 256) {
-                    if (cc.line_num >= 0) line_num = cc.line_num;
-                    if (cc.col_num >= 0) col_num = cc.col_num;
-                    add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    dbuf_putc(&bc_out, OP_get_arg8_loc8_array_el);
-                    dbuf_putc(&bc_out, idx);
-                    dbuf_putc(&bc_out, cc.idx);
-                    pos_next = cc.pos;
-                    break;
-                }
 #if JS_ENABLE_IC
                 /* Borrow-fusion: get_arg(n) get_field(atom) ->
                    get_arg_field_nr(atom, n, ic). The receiver is the
@@ -42428,7 +42399,7 @@ static __exception int compute_stack_size(JSContext *ctx,
             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
                 goto fail;
             break;
-        case OP_for_in_next_if_false:
+        case OP_reserved6:
             stack_len--;
             diff = get_u32(bc_buf + pos + 1);
             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
