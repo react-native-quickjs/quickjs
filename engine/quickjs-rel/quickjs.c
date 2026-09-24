@@ -21059,6 +21059,529 @@ static no_inline void js_perm4(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[
 static no_inline void js_perm5(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = sp[-5]; sp[-5] = tmp; }
 static no_inline void js_swap2(JSValue *sp) { JSValue tmp1 = sp[-4], tmp2 = sp[-3]; sp[-4] = sp[-2]; sp[-3] = sp[-1]; sp[-2] = tmp1; sp[-1] = tmp2; }
 
+/* Cold opcode handlers, defined out of line.
+ *
+ * sp is passed and returned by value. pc is passed by value and never returned:
+ * the caller advances it by the opcode's own constant size. The exception flag
+ * rides in bit 0 of the returned pointer, which is free because JSValue is at
+ * least 2-byte aligned. */
+typedef uintptr_t JSColdHandlerResult;
+#define JS_COLD_HANDLER_OK(spx)         ((JSColdHandlerResult)(uintptr_t)(spx))
+#define JS_COLD_HANDLER_EXCEPTION(spx)  ((JSColdHandlerResult)((uintptr_t)(spx) | 1u))
+#define JS_COLD_HANDLER_SP(r)           ((JSValue *)(uintptr_t)((r) & ~(uintptr_t)1))
+#define JS_COLD_HANDLER_IS_EXCEPTION(r) ((r) & 1u)
+#define JS_COLD_HANDLER_FN static no_inline __attribute__((cold))
+
+_Static_assert(_Alignof(JSValue) >= 2, "cold handler tagging needs bit 0 of a JSValue* free");
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_add_brand(JSContext *ctx, JSValue *sp)
+{
+    if (JS_AddBrand(ctx, sp[-2], sp[-1]) < 0)
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    JS_FreeValue(ctx, sp[-2]);
+    JS_FreeValue(ctx, sp[-1]);
+    sp -= 2;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_append(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    sf->cur_pc = pc;
+    if (js_append_enumerate(ctx, sp))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    JS_FreeValue(ctx, *--sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_check_define_var(JSContext *ctx, uint8_t *pc, JSValue *sp)
+{
+    JSAtom atom;
+    int flags;
+    atom = get_u32(pc);
+    flags = pc[4];
+    pc += 5;
+    if (JS_CheckDefineGlobalVar(ctx, atom, flags))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_define_class_computed(JSContext *ctx, int opcode, uint8_t *pc, JSStackFrame *sf, JSValue *sp, JSVarRef **var_refs)
+{
+    int class_flags;
+    JSAtom atom;
+
+    atom = get_u32(pc);
+    class_flags = pc[4];
+    pc += 5;
+    if (js_op_define_class(ctx, sp, atom, class_flags,
+                           var_refs, sf,
+                           (opcode == OP_define_class_computed)) < 0)
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_define_method_computed(JSContext *ctx, int opcode, uint8_t *pc, JSValue *sp)
+{
+                    JSValue getter, setter, value;
+                    JSValue obj;
+                    JSAtom atom;
+                    int flags, ret, op_flags;
+                    bool is_computed;
+    #define OP_DEFINE_METHOD_METHOD 0
+    #define OP_DEFINE_METHOD_GETTER 1
+    #define OP_DEFINE_METHOD_SETTER 2
+    #define OP_DEFINE_METHOD_ENUMERABLE 4
+
+                    is_computed = (opcode == OP_define_method_computed);
+                    if (is_computed) {
+                        atom = JS_ValueToAtom(ctx, sp[-2]);
+                        if (unlikely(atom == JS_ATOM_NULL))
+                            return JS_COLD_HANDLER_EXCEPTION(sp);
+                        opcode += OP_define_method - OP_define_method_computed;
+                    } else {
+                        atom = get_u32(pc);
+                        pc += 4;
+                    }
+                    op_flags = *pc++;
+
+                    obj = sp[-2 - is_computed];
+                    flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+                        JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW;
+                    if (op_flags & OP_DEFINE_METHOD_ENUMERABLE)
+                        flags |= JS_PROP_ENUMERABLE;
+                    op_flags &= 3;
+                    value = JS_UNDEFINED;
+                    getter = JS_UNDEFINED;
+                    setter = JS_UNDEFINED;
+                    if (op_flags == OP_DEFINE_METHOD_METHOD) {
+                        value = sp[-1];
+                        flags |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE;
+                    } else if (op_flags == OP_DEFINE_METHOD_GETTER) {
+                        getter = sp[-1];
+                        flags |= JS_PROP_HAS_GET;
+                    } else {
+                        setter = sp[-1];
+                        flags |= JS_PROP_HAS_SET;
+                    }
+                    ret = js_method_set_properties(ctx, sp[-1], atom, flags, obj);
+                    if (ret >= 0) {
+                        ret = JS_DefineProperty(ctx, obj, atom, value,
+                                                getter, setter, flags);
+                    }
+                    JS_FreeValue(ctx, sp[-1]);
+                    if (is_computed) {
+                        JS_FreeAtom(ctx, atom);
+                        JS_FreeValue(ctx, sp[-2]);
+                    }
+                    sp -= 1 + is_computed;
+                    if (unlikely(ret < 0))
+                        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_define_private_field(JSContext *ctx, JSValue *sp)
+{
+    int ret;
+    ret = JS_DefinePrivateField(ctx, sp[-3], sp[-2], sp[-1]);
+    JS_FreeValue(ctx, sp[-2]);
+    sp -= 2;
+    if (unlikely(ret < 0))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_delete_var(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    JSAtom atom;
+    int ret;
+
+    atom = get_u32(pc);
+    pc += 4;
+
+    sf->cur_pc = pc;
+    ret = JS_DeleteGlobalVar(ctx, atom);
+    if (unlikely(ret < 0))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    *sp++ = js_bool(ret);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_delete(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    sf->cur_pc = pc;
+    if (js_operator_delete(ctx, sp))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    sp--;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_for_of_next(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    int offset = -3 - pc[0];
+    pc += 1;
+    sf->cur_pc = pc;
+    if (js_for_of_next(ctx, sp, offset))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    sp += 2;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_get_field(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    JSValue val, obj;
+    JSAtom atom;
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    atom = get_u32(pc);
+    pc += 4;
+
+    obj = sp[-1];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        for(;;) {
+            prs = find_own_property(&pr, p, atom);
+            if (prs) {
+                /* found */
+                if (unlikely(prs->flags & JS_PROP_TMASK))
+                    goto get_field_slow_path;
+                if (js_lazy_marker_is(pr->u.value)) {
+                    val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
+                } else {
+                    val = js_dup(pr->u.value);
+                }
+                break;
+            }
+            if (unlikely(p->is_exotic)) {
+                /* XXX: should avoid the slow path for arrays
+                   and typed arrays by ensuring that 'prop' is
+                   not numeric */
+                obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                goto get_field_slow_path;
+            }
+            p = p->shape->proto;
+            if (!p) {
+                val = JS_UNDEFINED;
+                break;
+            }
+        }
+    } else {
+    get_field_slow_path:
+        sf->cur_pc = pc;
+        val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+        if (unlikely(JS_IsException(val)))
+            return JS_COLD_HANDLER_EXCEPTION(sp);
+    }
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = val;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_get_private_field(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    JSValue val;
+    sf->cur_pc = pc;
+    val = JS_GetPrivateField(ctx, sp[-2], sp[-1]);
+    JS_FreeValue(ctx, sp[-1]);
+    JS_FreeValue(ctx, sp[-2]);
+    sp[-2] = val;
+    sp--;
+    if (unlikely(JS_IsException(val)))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_get_super_value(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    JSValue val;
+    JSAtom atom;
+    sf->cur_pc = pc;
+    atom = JS_ValueToAtom(ctx, sp[-1]);
+    if (unlikely(atom == JS_ATOM_NULL))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    val = JS_GetPropertyInternal(ctx, sp[-2], atom, sp[-3], false);
+    JS_FreeAtom(ctx, atom);
+    if (unlikely(JS_IsException(val)))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    JS_FreeValue(ctx, sp[-1]);
+    JS_FreeValue(ctx, sp[-2]);
+    JS_FreeValue(ctx, sp[-3]);
+    sp[-3] = val;
+    sp -= 2;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_import(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    JSValue val;
+    sf->cur_pc = pc;
+    val = js_dynamic_import(ctx, sp[-2], sp[-1]);
+    if (JS_IsException(val))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    JS_FreeValue(ctx, sp[-2]);
+    JS_FreeValue(ctx, sp[-1]);
+    sp--;
+    sp[-1] = val;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_in(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    sf->cur_pc = pc;
+    if (js_operator_in(ctx, sp))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    sp--;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_make_var_ref(JSContext *ctx, uint8_t *pc, JSValue *sp)
+{
+    JSAtom atom;
+    atom = get_u32(pc);
+    pc += 4;
+
+    if (JS_GetGlobalVarRef(ctx, atom, sp))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    sp += 2;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_object_fill(JSFunctionBytecode *b, JSContext *ctx, uint8_t *pc, JSValue *sp)
+{
+    int n = get_u16(pc), ti = get_u16(pc + 2), i;
+    JSValue *vals = sp - n;
+    JSObjLitTemplate *tpl = &b->objlit_tab[ti];
+    pc += 4;
+    if (likely(JS_VALUE_GET_TAG(vals[-1]) == JS_TAG_OBJECT)) {
+        JSObject *p = JS_VALUE_GET_OBJ(vals[-1]);
+        if (likely(!p->is_exotic && p->shape == tpl->shape &&
+                   (int)tpl->prop_count == n)) {
+            for (i = 0; i < n; i++)
+                set_value(ctx, &p->prop[i].u.value, vals[i]);
+            sp = vals;
+            return JS_COLD_HANDLER_OK(sp);
+        }
+    }
+    for (i = 0; i < n; i++) {
+        int ret = JS_DefinePropertyValue(ctx, vals[-1],
+                                         js_objlit_template_atom(tpl, i),
+                                         vals[i],
+                                         JS_PROP_C_W_E | JS_PROP_THROW);
+        if (unlikely(ret < 0)) {
+            int j;
+            for (j = i + 1; j < n; j++)
+                JS_FreeValue(ctx, vals[j]);
+            sp = vals;
+            return JS_COLD_HANDLER_EXCEPTION(sp);
+        }
+    }
+    sp = vals;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_private_in(JSContext *ctx, JSValue *sp)
+{
+    if (js_operator_private_in(ctx, sp))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    sp--;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_put_field(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    int ret;
+    JSValue obj;
+    JSAtom atom;
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    atom = get_u32(pc);
+    pc += 4;
+
+    obj = sp[-2];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            goto put_field_slow_path;
+        if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                  JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+            /* fast path */
+            set_value(ctx, &pr->u.value, sp[-1]);
+        } else {
+            goto put_field_slow_path;
+        }
+        JS_FreeValue(ctx, obj);
+        sp -= 2;
+    } else {
+    put_field_slow_path:
+        sf->cur_pc = pc;
+        ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
+                                      JS_PROP_THROW_STRICT);
+        JS_FreeValue(ctx, obj);
+        sp -= 2;
+        if (unlikely(ret < 0))
+            return JS_COLD_HANDLER_EXCEPTION(sp);
+    }
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_put_private_field(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    int ret;
+    sf->cur_pc = pc;
+    ret = JS_SetPrivateField(ctx, sp[-3], sp[-1], sp[-2]);
+    JS_FreeValue(ctx, sp[-3]);
+    JS_FreeValue(ctx, sp[-1]);
+    sp -= 3;
+    if (unlikely(ret < 0))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_put_ref_value(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    int ret, flags;
+    sf->cur_pc = pc;
+    flags = JS_PROP_THROW_STRICT;
+    if (unlikely(JS_IsUndefined(sp[-3]))) {
+        if (is_strict_mode(ctx)) {
+            JSAtom atom = JS_ValueToAtom(ctx, sp[-2]);
+            if (atom != JS_ATOM_NULL) {
+                JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                JS_FreeAtom(ctx, atom);
+            }
+            return JS_COLD_HANDLER_EXCEPTION(sp);
+        } else {
+            sp[-3] = js_dup(ctx->global_obj);
+        }
+    } else {
+        if (is_strict_mode(ctx))
+            flags |= JS_PROP_NO_ADD;
+    }
+    ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], flags);
+    JS_FreeValue(ctx, sp[-3]);
+    sp -= 3;
+    if (unlikely(ret < 0))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_put_super_value(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    int ret;
+    JSAtom atom;
+    sf->cur_pc = pc;
+    if (JS_VALUE_GET_TAG(sp[-3]) != JS_TAG_OBJECT) {
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    }
+    atom = JS_ValueToAtom(ctx, sp[-2]);
+    if (unlikely(atom == JS_ATOM_NULL))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    ret = JS_SetPropertyInternal2(ctx,
+                                  sp[-3], atom,
+                                  sp[-1], sp[-4],
+                                  JS_PROP_THROW_STRICT);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, sp[-4]);
+    JS_FreeValue(ctx, sp[-3]);
+    JS_FreeValue(ctx, sp[-2]);
+    sp -= 4;
+    if (ret < 0)
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_check(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp)
+{
+    int hint = pc[0];
+    JSValue method;
+    pc += 1;
+    sf->cur_pc = pc;
+    if (js_op_using_check(ctx, sp[-1], hint, &method))
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    sp[0] = method;
+    sp++;
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose_end(JSContext *ctx, JSValue *sp)
+{
+    JSValue error_state = sp[-1];
+    sp--;
+    if (!JS_IsUninitialized(error_state)) {
+        JS_Throw(ctx, error_state);
+        return JS_COLD_HANDLER_EXCEPTION(sp);
+    }
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose_merge(JSContext *ctx, JSValue *sp)
+{
+    JSValue new_error = sp[-1];
+    JSValue error_state = sp[-2];
+    sp--;
+    if (!JS_IsUninitialized(error_state)) {
+        JSValue se = js_new_suppressed_error(ctx, new_error,
+                                             error_state);
+        JS_FreeValue(ctx, new_error);
+        JS_FreeValue(ctx, error_state);
+        if (JS_IsException(se)) {
+            sp[-1] = JS_GetException(ctx);
+        } else {
+            sp[-1] = se;
+        }
+    } else {
+        sp[-1] = new_error;
+    }
+    return JS_COLD_HANDLER_OK(sp);
+}
+
+JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose(JSContext *ctx, uint8_t *pc, JSStackFrame *sf, JSValue *sp, JSValue *var_buf)
+{
+    int idx;
+    JSValueConst val, method;
+    JSValue ret, error_state;
+
+    idx = get_u16(pc);
+    pc += 2;
+    val = var_buf[idx];
+    method = var_buf[idx + 1];
+    error_state = sp[-1];
+
+    if (JS_IsNull(val) || JS_IsUndefined(val) ||
+        JS_IsUninitialized(val)) {
+        /* null/undefined (spec-permitted) or uninitialized
+           (declaration threw before assignment). */
+        return JS_COLD_HANDLER_OK(sp);
+    }
+    sf->cur_pc = pc;
+    ret = JS_Call(ctx, method, val, 0, NULL);
+    if (JS_IsException(ret)) {
+        JSValue new_error = JS_GetException(ctx);
+        if (!JS_IsUninitialized(error_state)) {
+            JSValue se;
+            se = js_new_suppressed_error(ctx, new_error,
+                                         error_state);
+            JS_FreeValue(ctx, new_error);
+            JS_FreeValue(ctx, error_state);
+            if (JS_IsException(se)) {
+                sp[-1] = JS_GetException(ctx);
+            } else {
+                sp[-1] = se;
+            }
+        } else {
+            sp[-1] = new_error;
+        }
+    } else {
+        JS_FreeValue(ctx, ret);
+    }
+    return JS_COLD_HANDLER_OK(sp);
+}
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -21513,34 +22036,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_object_fill):
             {
-                int n = get_u16(pc), ti = get_u16(pc + 2), i;
-                JSValue *vals = sp - n;
-                JSObjLitTemplate *tpl = &b->objlit_tab[ti];
+                JSColdHandlerResult r = js_cold_object_fill(b, ctx, pc, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 4;
-                if (likely(JS_VALUE_GET_TAG(vals[-1]) == JS_TAG_OBJECT)) {
-                    JSObject *p = JS_VALUE_GET_OBJ(vals[-1]);
-                    if (likely(!p->is_exotic && p->shape == tpl->shape &&
-                               (int)tpl->prop_count == n)) {
-                        for (i = 0; i < n; i++)
-                            set_value(ctx, &p->prop[i].u.value, vals[i]);
-                        sp = vals;
-                        BREAK;
-                    }
-                }
-                for (i = 0; i < n; i++) {
-                    int ret = JS_DefinePropertyValue(ctx, vals[-1],
-                                                     js_objlit_template_atom(tpl, i),
-                                                     vals[i],
-                                                     JS_PROP_C_W_E | JS_PROP_THROW);
-                    if (unlikely(ret < 0)) {
-                        int j;
-                        for (j = i + 1; j < n; j++)
-                            JS_FreeValue(ctx, vals[j]);
-                        sp = vals;
-                        goto exception;
-                    }
-                }
-                sp = vals;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
         CASE(OP_dup):
@@ -21834,11 +22333,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_add_brand):
-            if (JS_AddBrand(ctx, sp[-2], sp[-1]) < 0)
-                goto exception;
-            JS_FreeValue(ctx, sp[-2]);
-            JS_FreeValue(ctx, sp[-1]);
-            sp -= 2;
+            {
+                JSColdHandlerResult r = js_cold_add_brand(ctx, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
+            }
             BREAK;
 
         CASE(OP_throw):
@@ -21962,15 +22461,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_import):
             {
-                JSValue val;
-                sf->cur_pc = pc;
-                val = js_dynamic_import(ctx, sp[-2], sp[-1]);
-                if (JS_IsException(val))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-2]);
-                JS_FreeValue(ctx, sp[-1]);
-                sp--;
-                sp[-1] = val;
+                JSColdHandlerResult r = js_cold_import(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -22011,13 +22504,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_check_define_var):
             {
-                JSAtom atom;
-                int flags;
-                atom = get_u32(pc);
-                flags = pc[4];
+                JSColdHandlerResult r = js_cold_check_define_var(ctx, pc, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 5;
-                if (JS_CheckDefineGlobalVar(ctx, atom, flags))
-                    goto exception;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
         CASE(OP_define_var):
@@ -22448,13 +22938,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_make_var_ref):
             {
-                JSAtom atom;
-                atom = get_u32(pc);
+                JSColdHandlerResult r = js_cold_make_var_ref(ctx, pc, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 4;
-
-                if (JS_GetGlobalVarRef(ctx, atom, sp))
-                    goto exception;
-                sp += 2;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -22616,12 +23103,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_for_of_next):
             {
-                int offset = -3 - pc[0];
+                JSColdHandlerResult r = js_cold_for_of_next(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 1;
-                sf->cur_pc = pc;
-                if (js_for_of_next(ctx, sp, offset))
-                    goto exception;
-                sp += 2;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
         CASE(OP_for_await_of_start):
@@ -22682,43 +23167,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_using_dispose):
             {
-                int idx;
-                JSValueConst val, method;
-                JSValue ret, error_state;
-
-                idx = get_u16(pc);
+                JSColdHandlerResult r = js_cold_using_dispose(ctx, pc, sf, sp, var_buf);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 2;
-                val = var_buf[idx];
-                method = var_buf[idx + 1];
-                error_state = sp[-1];
-
-                if (JS_IsNull(val) || JS_IsUndefined(val) ||
-                    JS_IsUninitialized(val)) {
-                    /* null/undefined (spec-permitted) or uninitialized
-                       (declaration threw before assignment). */
-                    BREAK;
-                }
-                sf->cur_pc = pc;
-                ret = JS_Call(ctx, method, val, 0, NULL);
-                if (JS_IsException(ret)) {
-                    JSValue new_error = JS_GetException(ctx);
-                    if (!JS_IsUninitialized(error_state)) {
-                        JSValue se;
-                        se = js_new_suppressed_error(ctx, new_error,
-                                                     error_state);
-                        JS_FreeValue(ctx, new_error);
-                        JS_FreeValue(ctx, error_state);
-                        if (JS_IsException(se)) {
-                            sp[-1] = JS_GetException(ctx);
-                        } else {
-                            sp[-1] = se;
-                        }
-                    } else {
-                        sp[-1] = new_error;
-                    }
-                } else {
-                    JS_FreeValue(ctx, ret);
-                }
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -22750,46 +23202,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_using_dispose_merge):
             {
-                JSValue new_error = sp[-1];
-                JSValue error_state = sp[-2];
-                sp--;
-                if (!JS_IsUninitialized(error_state)) {
-                    JSValue se = js_new_suppressed_error(ctx, new_error,
-                                                         error_state);
-                    JS_FreeValue(ctx, new_error);
-                    JS_FreeValue(ctx, error_state);
-                    if (JS_IsException(se)) {
-                        sp[-1] = JS_GetException(ctx);
-                    } else {
-                        sp[-1] = se;
-                    }
-                } else {
-                    sp[-1] = new_error;
-                }
+                JSColdHandlerResult r = js_cold_using_dispose_merge(ctx, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
         CASE(OP_using_dispose_end):
             {
-                JSValue error_state = sp[-1];
-                sp--;
-                if (!JS_IsUninitialized(error_state)) {
-                    JS_Throw(ctx, error_state);
-                    goto exception;
-                }
+                JSColdHandlerResult r = js_cold_using_dispose_end(ctx, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
         CASE(OP_using_check):
             {
-                int hint = pc[0];
-                JSValue method;
+                JSColdHandlerResult r = js_cold_using_check(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 1;
-                sf->cur_pc = pc;
-                if (js_op_using_check(ctx, sp[-1], hint, &method))
-                    goto exception;
-                sp[0] = method;
-                sp++;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -22857,53 +23289,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_get_field):
             {
-                JSValue val, obj;
-                JSAtom atom;
-                JSObject *p;
-                JSProperty *pr;
-                JSShapeProperty *prs;
-
-                atom = get_u32(pc);
+                JSColdHandlerResult r = js_cold_get_field(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 4;
-
-                obj = sp[-1];
-                if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = JS_VALUE_GET_OBJ(obj);
-                    for(;;) {
-                        prs = find_own_property(&pr, p, atom);
-                        if (prs) {
-                            /* found */
-                            if (unlikely(prs->flags & JS_PROP_TMASK))
-                                goto get_field_slow_path;
-                            if (js_lazy_marker_is(pr->u.value)) {
-                                val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
-                            } else {
-                                val = js_dup(pr->u.value);
-                            }
-                            break;
-                        }
-                        if (unlikely(p->is_exotic)) {
-                            /* XXX: should avoid the slow path for arrays
-                               and typed arrays by ensuring that 'prop' is
-                               not numeric */
-                            obj = JS_MKPTR(JS_TAG_OBJECT, p);
-                            goto get_field_slow_path;
-                        }
-                        p = p->shape->proto;
-                        if (!p) {
-                            val = JS_UNDEFINED;
-                            break;
-                        }
-                    }
-                } else {
-                get_field_slow_path:
-                    sf->cur_pc = pc;
-                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
-                    if (unlikely(JS_IsException(val)))
-                        goto exception;
-                }
-                JS_FreeValue(ctx, sp[-1]);
-                sp[-1] = val;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -22956,41 +23345,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_put_field):
             {
-                int ret;
-                JSValue obj;
-                JSAtom atom;
-                JSObject *p;
-                JSProperty *pr;
-                JSShapeProperty *prs;
-
-                atom = get_u32(pc);
+                JSColdHandlerResult r = js_cold_put_field(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 4;
-
-                obj = sp[-2];
-                if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = JS_VALUE_GET_OBJ(obj);
-                    prs = find_own_property(&pr, p, atom);
-                    if (!prs)
-                        goto put_field_slow_path;
-                    if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
-                                              JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-                        /* fast path */
-                        set_value(ctx, &pr->u.value, sp[-1]);
-                    } else {
-                        goto put_field_slow_path;
-                    }
-                    JS_FreeValue(ctx, obj);
-                    sp -= 2;
-                } else {
-                put_field_slow_path:
-                    sf->cur_pc = pc;
-                    ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
-                                                  JS_PROP_THROW_STRICT);
-                    JS_FreeValue(ctx, obj);
-                    sp -= 2;
-                    if (unlikely(ret < 0))
-                        goto exception;
-                }
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -23429,39 +23787,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_get_private_field):
             {
-                JSValue val;
-                sf->cur_pc = pc;
-                val = JS_GetPrivateField(ctx, sp[-2], sp[-1]);
-                JS_FreeValue(ctx, sp[-1]);
-                JS_FreeValue(ctx, sp[-2]);
-                sp[-2] = val;
-                sp--;
-                if (unlikely(JS_IsException(val)))
-                    goto exception;
+                JSColdHandlerResult r = js_cold_get_private_field(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
         CASE(OP_put_private_field):
             {
-                int ret;
-                sf->cur_pc = pc;
-                ret = JS_SetPrivateField(ctx, sp[-3], sp[-1], sp[-2]);
-                JS_FreeValue(ctx, sp[-3]);
-                JS_FreeValue(ctx, sp[-1]);
-                sp -= 3;
-                if (unlikely(ret < 0))
-                    goto exception;
+                JSColdHandlerResult r = js_cold_put_private_field(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
         CASE(OP_define_private_field):
             {
-                int ret;
-                ret = JS_DefinePrivateField(ctx, sp[-3], sp[-2], sp[-1]);
-                JS_FreeValue(ctx, sp[-2]);
-                sp -= 2;
-                if (unlikely(ret < 0))
-                    goto exception;
+                JSColdHandlerResult r = js_cold_define_private_field(ctx, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -23533,78 +23877,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             js_method_set_home_object(ctx, sp[-1], sp[-2]);
             BREAK;
         CASE(OP_define_method):
+            {
+                JSColdHandlerResult r = js_cold_define_method_computed(ctx, opcode, pc, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                pc += 5;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
+            }
+            BREAK;
         CASE(OP_define_method_computed):
             {
-                JSValue getter, setter, value;
-                JSValue obj;
-                JSAtom atom;
-                int flags, ret, op_flags;
-                bool is_computed;
-#define OP_DEFINE_METHOD_METHOD 0
-#define OP_DEFINE_METHOD_GETTER 1
-#define OP_DEFINE_METHOD_SETTER 2
-#define OP_DEFINE_METHOD_ENUMERABLE 4
-
-                is_computed = (opcode == OP_define_method_computed);
-                if (is_computed) {
-                    atom = JS_ValueToAtom(ctx, sp[-2]);
-                    if (unlikely(atom == JS_ATOM_NULL))
-                        goto exception;
-                    opcode += OP_define_method - OP_define_method_computed;
-                } else {
-                    atom = get_u32(pc);
-                    pc += 4;
-                }
-                op_flags = *pc++;
-
-                obj = sp[-2 - is_computed];
-                flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
-                    JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW;
-                if (op_flags & OP_DEFINE_METHOD_ENUMERABLE)
-                    flags |= JS_PROP_ENUMERABLE;
-                op_flags &= 3;
-                value = JS_UNDEFINED;
-                getter = JS_UNDEFINED;
-                setter = JS_UNDEFINED;
-                if (op_flags == OP_DEFINE_METHOD_METHOD) {
-                    value = sp[-1];
-                    flags |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE;
-                } else if (op_flags == OP_DEFINE_METHOD_GETTER) {
-                    getter = sp[-1];
-                    flags |= JS_PROP_HAS_GET;
-                } else {
-                    setter = sp[-1];
-                    flags |= JS_PROP_HAS_SET;
-                }
-                ret = js_method_set_properties(ctx, sp[-1], atom, flags, obj);
-                if (ret >= 0) {
-                    ret = JS_DefineProperty(ctx, obj, atom, value,
-                                            getter, setter, flags);
-                }
-                JS_FreeValue(ctx, sp[-1]);
-                if (is_computed) {
-                    JS_FreeAtom(ctx, atom);
-                    JS_FreeValue(ctx, sp[-2]);
-                }
-                sp -= 1 + is_computed;
-                if (unlikely(ret < 0))
-                    goto exception;
+                JSColdHandlerResult r = js_cold_define_method_computed(ctx, opcode, pc, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                pc += 1;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
         CASE(OP_define_class):
+            {
+                JSColdHandlerResult r = js_cold_define_class_computed(ctx, opcode, pc, sf, sp, var_refs);
+                sp = JS_COLD_HANDLER_SP(r);
+                pc += 5;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
+            }
+            BREAK;
         CASE(OP_define_class_computed):
             {
-                int class_flags;
-                JSAtom atom;
-
-                atom = get_u32(pc);
-                class_flags = pc[4];
+                JSColdHandlerResult r = js_cold_define_class_computed(ctx, opcode, pc, sf, sp, var_refs);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 5;
-                if (js_op_define_class(ctx, sp, atom, class_flags,
-                                       var_refs, sf,
-                                       (opcode == OP_define_class_computed)) < 0)
-                    goto exception;
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -23797,21 +24099,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_get_super_value):
             {
-                JSValue val;
-                JSAtom atom;
-                sf->cur_pc = pc;
-                atom = JS_ValueToAtom(ctx, sp[-1]);
-                if (unlikely(atom == JS_ATOM_NULL))
-                    goto exception;
-                val = JS_GetPropertyInternal(ctx, sp[-2], atom, sp[-3], false);
-                JS_FreeAtom(ctx, atom);
-                if (unlikely(JS_IsException(val)))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-1]);
-                JS_FreeValue(ctx, sp[-2]);
-                JS_FreeValue(ctx, sp[-3]);
-                sp[-3] = val;
-                sp -= 2;
+                JSColdHandlerResult r = js_cold_get_super_value(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -23938,55 +24228,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_put_ref_value):
             {
-                int ret, flags;
-                sf->cur_pc = pc;
-                flags = JS_PROP_THROW_STRICT;
-                if (unlikely(JS_IsUndefined(sp[-3]))) {
-                    if (is_strict_mode(ctx)) {
-                        JSAtom atom = JS_ValueToAtom(ctx, sp[-2]);
-                        if (atom != JS_ATOM_NULL) {
-                            JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                            JS_FreeAtom(ctx, atom);
-                        }
-                        goto exception;
-                    } else {
-                        sp[-3] = js_dup(ctx->global_obj);
-                    }
-                } else {
-                    if (is_strict_mode(ctx))
-                        flags |= JS_PROP_NO_ADD;
-                }
-                ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], flags);
-                JS_FreeValue(ctx, sp[-3]);
-                sp -= 3;
-                if (unlikely(ret < 0))
-                    goto exception;
+                JSColdHandlerResult r = js_cold_put_ref_value(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
         CASE(OP_put_super_value):
             {
-                int ret;
-                JSAtom atom;
-                sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-3]) != JS_TAG_OBJECT) {
-                    JS_ThrowTypeErrorNotAnObject(ctx);
-                    goto exception;
-                }
-                atom = JS_ValueToAtom(ctx, sp[-2]);
-                if (unlikely(atom == JS_ATOM_NULL))
-                    goto exception;
-                ret = JS_SetPropertyInternal2(ctx,
-                                              sp[-3], atom,
-                                              sp[-1], sp[-4],
-                                              JS_PROP_THROW_STRICT);
-                JS_FreeAtom(ctx, atom);
-                JS_FreeValue(ctx, sp[-4]);
-                JS_FreeValue(ctx, sp[-3]);
-                JS_FreeValue(ctx, sp[-2]);
-                sp -= 4;
-                if (ret < 0)
-                    goto exception;
+                JSColdHandlerResult r = js_cold_put_super_value(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -24001,12 +24253,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
-        CASE(OP_append):    /* array pos enumobj -- array pos */
+        CASE(OP_append):
             {
-                sf->cur_pc = pc;
-                if (js_append_enumerate(ctx, sp))
-                    goto exception;
-                JS_FreeValue(ctx, *--sp);
+                JSColdHandlerResult r = js_cold_append(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 
@@ -24604,15 +24855,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
 
         CASE(OP_in):
-            sf->cur_pc = pc;
-            if (js_operator_in(ctx, sp))
-                goto exception;
-            sp--;
+            {
+                JSColdHandlerResult r = js_cold_in(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
+            }
             BREAK;
         CASE(OP_private_in):
-            if (js_operator_private_in(ctx, sp))
-                goto exception;
-            sp--;
+            {
+                JSColdHandlerResult r = js_cold_private_in(ctx, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
+            }
             BREAK;
         CASE(OP_instanceof):
             sf->cur_pc = pc;
@@ -24632,24 +24886,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_delete):
-            sf->cur_pc = pc;
-            if (js_operator_delete(ctx, sp))
-                goto exception;
-            sp--;
+            {
+                JSColdHandlerResult r = js_cold_delete(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
+            }
             BREAK;
         CASE(OP_delete_var):
             {
-                JSAtom atom;
-                int ret;
-
-                atom = get_u32(pc);
+                JSColdHandlerResult r = js_cold_delete_var(ctx, pc, sf, sp);
+                sp = JS_COLD_HANDLER_SP(r);
                 pc += 4;
-
-                sf->cur_pc = pc;
-                ret = JS_DeleteGlobalVar(ctx, atom);
-                if (unlikely(ret < 0))
-                    goto exception;
-                *sp++ = js_bool(ret);
+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
             }
             BREAK;
 

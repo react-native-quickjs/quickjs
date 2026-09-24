@@ -395,12 +395,16 @@
       "sha256": "13eb18221bc0c840c592e4ad8c31a17fe09f9067125b1c7c3acc394f02c6ad50"
     },
     {
+      "name": "0104-outline-cold-handler-bodies.patch",
+      "sha256": "b725d27928d1684f554d05aaaa39a00700b0c8eb36b2d5faa1551e41476d06fc"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "97ff3a9b22c71216fcf2b365bcab3be8dfd3a6769f18e5c3d81e29d095078b77"
     }
   ],
   "files": {
-    "quickjs.c": "259c013dc5beedda36d208f33c97027aa758c94dc325982015318d6db7db8b8d",
+    "quickjs.c": "b1cd19d1c8568e6fa639cd34b7ab1beac77ceef4d8f330595eb92a29317b2357",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
