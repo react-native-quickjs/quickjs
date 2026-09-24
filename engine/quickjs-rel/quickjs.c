@@ -21873,12 +21873,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     } else {
                     get_loc_field_nr_slow:
-                        /* Fallback: the generic getter borrows obj (does not free
-                           it), exactly as the plain OP_get_field slow path relies on.
-                           The receiver is the borrowed local, so we pass it directly
-                           and never free it. */
                         sf->cur_pc = pc;
-                        val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
+                        /* owns neither argument; the receiver is the slot, not
+                           obj, which the prototype walk may have reassigned */
+                        val = JS_GetPropertyInternal(ctx, obj, atom, nr_buf[loc], false);
                         if (unlikely(JS_IsException(val)))
                             goto exception;
                     }

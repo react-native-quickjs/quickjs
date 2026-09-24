@@ -1,0 +1,40 @@
+Subject: Pass the original object as the receiver in the borrowed field load
+
+What this does
+  Saves the receiver before the prototype walk in the fused local-field load and
+  passes the saved value to the slow property path.
+
+Why we need it
+  The variable that holds the borrowed receiver is reassigned by the walk to the
+  exotic object it stops on, and the slow path then handed that object on as the
+  receiver.
+
+What it adds
+  The slow path reads the receiver back from the frame slot the load borrowed it
+  from, instead of keeping a second local alive for the whole handler. A proxy's
+  get trap and a getter on a prototype now observe the object the program named.
+  The returned value, the borrowed arguments of the fallback, own properties and
+  the missing-property case are unchanged. No opcode is added or retired and
+  BC_VERSION is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22279,12 +22279,10 @@
+                         }
+                     } else {
+                     get_loc_field_nr_slow:
+-                        /* Fallback: the generic getter borrows obj (does not free
+-                           it), exactly as the plain OP_get_field slow path relies on.
+-                           The receiver is the borrowed local, so we pass it directly
+-                           and never free it. */
+                         sf->cur_pc = pc;
++                        /* owns neither argument; the receiver is the slot, not
++                           obj, which the prototype walk may have reassigned */
+-                        val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
++                        val = JS_GetPropertyInternal(ctx, obj, atom, nr_buf[loc], false);
+                         if (unlikely(JS_IsException(val)))
+                             goto exception;
+                     }
