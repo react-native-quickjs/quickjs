@@ -1,0 +1,79 @@
+Subject: Answer the for-in prototype-chain question without allocating
+
+What this does
+  Adds a non-allocating scan of a prototype object's own properties for the
+  for-in chain walk, replacing the key array the walk built only to ask whether
+  that level contributes anything.
+
+Why we need it
+  The walk collected every own key of each prototype into an array and inspected
+  the result, so a level that contributes nothing still cost an allocation and
+  the collection of all of its keys.
+
+What it adds
+  A noinline helper that reports whether a level has an enumerable string-keyed
+  own property: 1 yes, 0 no, -1 for an exotic object the scan cannot judge, where
+  the caller keeps the original allocating path. It reads the shape directly and
+  tests each candidate atom's kind without a call. The helper stays out of line
+  because inlining it into the builder would put its locals in the interpreter's
+  frame and cost recursion depth. No opcode is added or retired and BC_VERSION is
+  unchanged.
+
+Needs a bytecode version bump
+  No.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -19338,7 +19338,31 @@
+     return true;
+ }
+ 
+-static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
++static __attribute__((noinline)) int
++js_proto_has_enum_string_prop(JSContext *ctx, JSObject *p1)
++{
++    JSShape *psh;
++    JSShapeProperty *pprs;
++    int pi;
++
++    if (p1->is_exotic)
++        return -1;
++    psh = p1->shape;
++    JSRuntime *rt = ctx->rt;
++
++    for (pi = 0, pprs = get_shape_prop(psh); pi < psh->prop_count; pi++, pprs++) {
++        if (pprs->atom == JS_ATOM_NULL || !(pprs->flags & JS_PROP_ENUMERABLE))
++            continue;
++        if ((pprs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
++            return 1;
++        if (__JS_AtomIsTaggedInt(pprs->atom) ||
++            rt->atom_array[pprs->atom]->atom_type == JS_ATOM_TYPE_STRING)
++            return 1;
++    }
++    return 0;
++}
++
++static __attribute__((noinline)) JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
+ {
+     JSObject *p;
+     JSPropertyEnum *tab_atom;
+@@ -19381,6 +19407,20 @@
+             break;
+         if (JS_IsException(obj1))
+             goto fail;
++        {
++            int r = js_proto_has_enum_string_prop(ctx, JS_VALUE_GET_OBJ(obj1));
++            if (r >= 0) {
++                if (r > 0) {
++                    JS_FreeValue(ctx, obj1);
++                    goto slow_path;
++                }
++                if (js_poll_interrupts(ctx)) {
++                    JS_FreeValue(ctx, obj1);
++                    goto fail;
++                }
++                continue;
++            }
++        }
+         if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
+                                            JS_VALUE_GET_OBJ(obj1),
+                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {

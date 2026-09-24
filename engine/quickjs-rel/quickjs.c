@@ -18822,7 +18822,31 @@ static bool js_for_in_try_pin(JSContext *ctx, JSForInIterator *it, JSObject *p)
     return true;
 }
 
-static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
+static __attribute__((noinline)) int
+js_proto_has_enum_string_prop(JSContext *ctx, JSObject *p1)
+{
+    JSShape *psh;
+    JSShapeProperty *pprs;
+    int pi;
+
+    if (p1->is_exotic)
+        return -1;
+    psh = p1->shape;
+    JSRuntime *rt = ctx->rt;
+
+    for (pi = 0, pprs = get_shape_prop(psh); pi < psh->prop_count; pi++, pprs++) {
+        if (pprs->atom == JS_ATOM_NULL || !(pprs->flags & JS_PROP_ENUMERABLE))
+            continue;
+        if ((pprs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+            return 1;
+        if (__JS_AtomIsTaggedInt(pprs->atom) ||
+            rt->atom_array[pprs->atom]->atom_type == JS_ATOM_TYPE_STRING)
+            return 1;
+    }
+    return 0;
+}
+
+static __attribute__((noinline)) JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
 {
     JSObject *p;
     JSPropertyEnum *tab_atom;
@@ -18865,6 +18889,20 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
             break;
         if (JS_IsException(obj1))
             goto fail;
+        {
+            int r = js_proto_has_enum_string_prop(ctx, JS_VALUE_GET_OBJ(obj1));
+            if (r >= 0) {
+                if (r > 0) {
+                    JS_FreeValue(ctx, obj1);
+                    goto slow_path;
+                }
+                if (js_poll_interrupts(ctx)) {
+                    JS_FreeValue(ctx, obj1);
+                    goto fail;
+                }
+                continue;
+            }
+        }
         if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
                                            JS_VALUE_GET_OBJ(obj1),
                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
