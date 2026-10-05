@@ -1,0 +1,947 @@
+Subject: Adds a register-VM profile build that records per-site, per-call and per-function hotness
+
+What this does:
+  A build with `-DQJS_AOT_PROFILE=1` records what the register interpreter
+  actually executes: per-function opcode totals, loop back-edge iteration
+  counts, register type classes, property-site receiver shapes, and call sites
+  with the identity of their callee. The record is dumped at runtime teardown
+  to the file named by `QJS_AOT_PROFILE_OUT` in a small text format
+  (`qjsprof 1 abi=1`), one line per fact. `tools/aot/profmerge.py` merges runs
+  and `tools/aot/profreport.py` prints the hot set, the coverage curve and the
+  call graph. This is phase P0 of `.local/aot-regvm-impl-plan.md`: the profile
+  is what later phases use to choose which functions and which opcodes to
+  compile.
+
+  Counting has to see every opcode, and the register VM only routes every
+  opcode through one loop in its monolith (non-threaded, non-asm) form, so the
+  macro is rejected by an `#error` unless the build is
+  `QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0`. Nothing
+  here is compiled or executed in a normal build.
+
+  Functions are identified by a 128-bit digest over the register program's
+  content -- atom operands are hashed by their string content, not their
+  interned id, so the same source yields the same digest across runs and across
+  programs that intern atoms differently -- plus the function's flags, constant
+  pool and closure variables. That digest is the key the AOT binding will use
+  in P2, so a profile taken on one build can select code for a function found
+  in another.
+
+  Hooks: `REGVM_NEXT` (opcode and loop back-edge counts), the
+  `js_regvm_execute` entry, both `SET_REG_P` definitions (register type
+  classes), `regvm_pic_fill`/`regvm_put_pic_fill` (receiver shapes) and the
+  five monolith call handlers (callee identity). A C callee is named by
+  `dladdr`, falling back to a walk of the running image's `.symtab` for the
+  `static` builtins that `dladdr` cannot see; the latter needs the engine built
+  `-no-pie`.
+
+  Adds a lazily allocated `aot_prof` field to `JSFunctionBytecode`, released in
+  `free_function_bytecode`. Off by default; the register-VM monolith is
+  byte-identical without it and the Box2D checksum `546.1008391043414` is
+  unchanged in both builds.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31,6 +31,12 @@
+ #include <string.h>
+ #include <assert.h>
+ 
++#if QJS_AOT_PROFILE && !defined(_WIN32)
++#include <dlfcn.h> /* dladdr */
++#include <elf.h>   /* symbol table walk, for naming static C callees */
++#include <link.h>  /* dl_iterate_phdr, for the image load base */
++#endif
++
+ #ifndef QJS_JSON_LAZY_DEFAULT
+ #define QJS_JSON_LAZY_DEFAULT 0
+ #endif
+@@ -1246,6 +1252,70 @@ struct JSMegaEntry {
+     uint32_t shape_epoch;
+ };
+ 
++#if QJS_AOT_PROFILE
++/*
++ * AOT profiler (phase P0 of .local/aot-regvm-impl-plan.md).
++ *
++ * Built only into a dedicated profiling build (`-DQJS_AOT_PROFILE=1`, which
++ * additionally requires the non-threaded monolith so that every opcode passes
++ * through REGVM_NEXT and can be counted). Records attach to the bytecode that
++ * owns them, lazily, and are dumped at runtime teardown when the environment
++ * variable QJS_AOT_PROFILE_OUT names a file. Nothing here is compiled or
++ * executed in a normal build.
++ */
++#define QJS_AOT_ABI 1u
++
++/* One property site: the receiver shapes observed and how often each was seen.
++   Identity only; the profiler holds no shape references. */
++typedef struct JSAotProfSite {
++    uint32_t count;
++    uint8_t nshapes;
++    JSShape *shapes[4];
++    uint32_t shape_hits[4];
++} JSAotProfSite;
++
++typedef struct JSAotProfCallee {
++    uint8_t kind;          /* 1 = bytecode, 2 = C function, 3 = other */
++    uint8_t digest[16];    /* kind 1: the callee's own aot digest */
++    void *cfn;             /* kind 2: c_function.generic */
++    int16_t magic;         /* kind 2 */
++    uint8_t cproto;        /* kind 2 */
++    uint32_t hits;
++} JSAotProfCallee;
++
++typedef struct JSAotProfCall {
++    uint32_t pc;           /* regvm offset just past the call opcode */
++    uint32_t count;
++    uint8_t argc_min, argc_max;
++    uint8_t ncallee;
++    JSAotProfCallee callee[4];
++} JSAotProfCall;
++
++typedef struct JSAotProfFunc {
++    uint64_t ops;
++    uint32_t entries;
++    uint32_t *loop_iters;  /* indexed by regvm offset; size loop_n */
++    uint16_t *reg_types;   /* bitmask by register; size reg_n */
++    JSAotProfSite *sites;  /* size nsites */
++    JSAotProfCall *calls;
++    int ncalls;
++    int calls_cap;
++    int loop_n;
++    int reg_n;
++    int nsites;
++} JSAotProfFunc;
++
++/* Type classes accumulated in reg_types. */
++#define AOT_TYPE_FLOAT   (1u << 0)
++#define AOT_TYPE_INT     (1u << 1)
++#define AOT_TYPE_OBJECT  (1u << 2)
++#define AOT_TYPE_STRING  (1u << 3)
++#define AOT_TYPE_BOOL    (1u << 4)
++#define AOT_TYPE_UNDEF   (1u << 5)
++#define AOT_TYPE_BIGINT  (1u << 6)
++#define AOT_TYPE_OTHER   (1u << 7)
++#endif /* QJS_AOT_PROFILE */
++
+ typedef struct JSFunctionBytecode {
+     JSGCObjectHeader header; /* must come first */
+     uint8_t is_strict_mode : 1;
+@@ -1361,8 +1431,40 @@ typedef struct JSFunctionBytecode {
+     uint8_t regvm_call_ready;
+     uint32_t regvm_frame_need;
+ #endif
++#if QJS_AOT_PROFILE
++    /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
++    JSAotProfFunc *aot_prof;
++#endif
+ } JSFunctionBytecode;
+ 
++#if QJS_AOT_PROFILE
++static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b);
++static int js_aot_prof_enter(JSFunctionBytecode *b);
++static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev);
++static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape);
++static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
++static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
++                             JSValue fn, int argc);
++static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b);
++static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
++void js_aot_prof_dump(JSRuntime *rt);
++
++/* `aot_prev_rpc` is a per-activation local in js_regvm_execute; a backward
++   branch is detected as a pointer comparison against it. */
++#define AOT_PROF_OP(b_, rpc_)       js_aot_prof_op((b_), (rpc_), &aot_prev_rpc)
++#define AOT_PROF_ENTER(b_)          js_aot_prof_enter(b_)
++#define AOT_PROF_PIC(b_, s_, sh_)   js_aot_prof_pic((b_), (s_), (sh_))
++#define AOT_PROF_REG(b_, d_, v_)    js_aot_prof_reg((b_), (d_), (v_))
++#define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
++        js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_))
++#else
++#define AOT_PROF_OP(b_, rpc_)       ((void)0)
++#define AOT_PROF_ENTER(b_)          ((void)0)
++#define AOT_PROF_PIC(b_, s_, sh_)   ((void)0)
++#define AOT_PROF_REG(b_, d_, v_)    ((void)0)
++#define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
++#endif
++
+ /* Shared backing for lazily deserialized function bodies.
+  *
+  * Deferring a parse means keeping everything that parse would have needed:
+@@ -3340,6 +3442,10 @@ void JS_FreeRuntime(JSRuntime *rt)
+ #ifdef QJS_REGVM_COUNT
+     if (getenv("QJS_REGVM_COUNTS"))
+         js_regvm_count_dump();
++#endif
++#if QJS_AOT_PROFILE
++    if (getenv("QJS_AOT_PROFILE_OUT"))
++        js_aot_prof_dump(rt);
+ #endif
+     struct list_head *el, *el1;
+     bool leak = false;
+@@ -22951,6 +23057,7 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+         return;
+ 
+     rsh = p->shape;
++    AOT_PROF_PIC(b, site, rsh);
+     slot = (uint32_t)(pr - holder->prop);
+ 
+     /* A depth-0/1 site hashes its receiver shape so the per-function PIC can
+@@ -23164,6 +23271,7 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+     if (!p->shape->is_hashed)
+         return;                     /* see regvm_pic_fill: only hashed is immutable */
+ 
++    AOT_PROF_PIC(b, site, p->shape);
+     pic = *ppic;
+     if (!pic) {
+         pic = regvm_pic_ensure(rt, b);
+@@ -27571,9 +27679,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+     uint8_t *regvm_rpc = NULL;
+     int regvm_resume_pending = 0;
+     uint8_t *regvm_resume_marker = NULL;
++#if QJS_AOT_PROFILE
++    /* Previous op start, for backward-branch (loop) detection. */
++    uint8_t *aot_prev_rpc = NULL;
++#endif
+ #endif
+  restart:
+     {
++#if QJS_AOT_PROFILE
++        aot_prev_rpc = NULL;
++        AOT_PROF_ENTER(b);
++#endif
+         regs = stack_buf;
+         /*
+          * W1c: a function's PIC table has to exist before any inline-cached
+@@ -27681,10 +27797,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+ /* Registers no longer own: a store is a plain assignment, and an owned value
+    is adopted by dropping the producer's reference. */
+ #define SET_REG_B(d, v) do { regs[d] = (v); } while (0)
+-#define SET_REG_P(d, v) do { JSValue _nv = (v); regs[d] = _nv; REG_ADOPT(ctx->rt, _nv); } while (0)
++#define SET_REG_P(d, v) do { JSValue _nv = (v); regs[d] = _nv; REG_ADOPT(ctx->rt, _nv); AOT_PROF_REG(b, (d), _nv); } while (0)
+ #else
+ #define SET_REG_B(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = js_dup(v); } while (0)
+-#define SET_REG_P(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
++#define SET_REG_P(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); AOT_PROF_REG(b, (d), regs[d]); } while (0)
+ #endif
+ 
+ #define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
+@@ -28369,6 +28485,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         } while (0)
+ #else
+ #define REGVM_NEXT() do { \
++            AOT_PROF_OP(b, rpc); \
+             op = *rpc++; \
+             REGVM_COUNT_INC(op); \
+             goto *regvm_dispatch[op]; \
+@@ -30923,6 +31040,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                    vector is the parameter `argv`, and the nested-call code
+                    saves it. */
+                 JSValue *oargv = &regs[ab];
++                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_argmoves += (uint64_t)na;
+ #endif
+@@ -30948,6 +31066,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                    vector is the parameter `argv`, and the nested-call code
+                    saves it. */
+                 JSValue *oargv = &regs[ab];
++                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_argmoves += (uint64_t)na;
+ #endif
+@@ -30970,6 +31089,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 int ab = RD_REG();
+                 int na = RD_U8();
+                 JSValue *argv = &regs[ab];
++                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+                 ret_val = JS_CallConstructorInternal(ctx, regs[c], regs[nt],
+                                                      na, vc(argv), 0);
+                 if (JS_IsException(ret_val))
+@@ -30982,6 +31102,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 int ab = RD_REG();
+                 int na = RD_U8();
+                 JSValue *argv = &regs[ab];
++                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_argmoves += (uint64_t)na;
+ #endif
+@@ -31006,6 +31127,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 int ab = RD_REG();
+                 int na = RD_U8();
+                 JSValue *argv = &regs[ab];
++                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_argmoves += (uint64_t)na;
+ #endif
+@@ -55037,6 +55159,16 @@ static int regvm_homes_mode(void)
+ #endif
+ #endif
+ 
++/*
++ * The AOT profiler counts opcodes at the monolith's dispatch point and derives
++ * its backedge/type facts from that single loop, so it is only meaningful in
++ * the plain non-threaded, non-asm build. Fail the build rather than report
++ * silently wrong counts.
++ */
++#if QJS_AOT_PROFILE && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_ASM || QJS_REGVM_RECORD)
++#error "QJS_AOT_PROFILE needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0"
++#endif
++
+ /*
+  * Register VM: decode and verify one function's final stack IR.
+  *
+@@ -56025,6 +56157,644 @@ static int regvm_map_atoms(uint8_t *code, int len, int wide,
+ {
+     return regvm_map_atoms2(code, len, wide, cb, opaque, 0, NULL);
+ }
++#if QJS_AOT_PROFILE
++/* ------------------------------------------------------------------------ */
++/* AOT profiler implementation (phase P0 of .local/aot-regvm-impl-plan.md).   */
++/* ------------------------------------------------------------------------ */
++
++static void aot_hash_bytes(uint64_t *h0, uint64_t *h1, const void *p, size_t n)
++{
++    const uint8_t *q = p;
++    uint64_t a = *h0, b = *h1;
++    size_t i;
++    for (i = 0; i < n; i++) {
++        a ^= q[i];
++        a *= 0x100000001B3ULL;
++        b += (uint64_t)q[i] + 0x9E3779B97F4A7C15ULL + (b << 6) + (b >> 2);
++    }
++    *h0 = a;
++    *h1 = b;
++}
++
++static void aot_hash_u32(uint64_t *h0, uint64_t *h1, uint32_t v)
++{
++    aot_hash_bytes(h0, h1, &v, 4);
++}
++
++static void aot_hash_u64(uint64_t *h0, uint64_t *h1, uint64_t v)
++{
++    aot_hash_bytes(h0, h1, &v, 8);
++}
++
++static void aot_hash_str(uint64_t *h0, uint64_t *h1, const char *s)
++{
++    uint64_t n = s ? (uint64_t)strlen(s) : 0;
++    aot_hash_u64(h0, h1, n);
++    if (s)
++        aot_hash_bytes(h0, h1, s, (size_t)n);
++}
++
++/* Hash the register program with atom operands replaced by their string
++   content, so the digest does not depend on atom interning order. The operand
++   walk mirrors regvm_map_atoms2's decode over regvm_rop_fmt. */
++static void aot_digest_code(uint64_t *h0, uint64_t *h1, JSFunctionBytecode *b)
++{
++    const uint8_t *code = b->regvm_code;
++    int len = b->regvm_len, p = 0;
++    JSRuntime *rt = b->realm ? b->realm->rt : NULL;
++    char buf[256];
++
++    while (p < len) {
++        int op = code[p];
++        const char *fmt;
++        int q, m, kind = -1;
++
++        if (op <= 0 || op >= ROP_COUNT) {
++            aot_hash_u32(h0, h1, 0xdeadbeefu);
++            break;
++        }
++        fmt = regvm_rop_fmt[op];
++        if (!fmt) {
++            aot_hash_u32(h0, h1, 0xbeefdeadu);
++            break;
++        }
++        aot_hash_u32(h0, h1, (uint32_t)op);
++        q = p + 1;
++        for (m = 0; fmt[m]; m++) {
++            int need, v, nar = regvm_rop_narrow((uint16_t)op);
++
++            switch (fmt[m]) {
++            case 'r': need = nar ? 1 : 2; break;
++            case 'i': case 'b': need = 1; break;
++            case 'u': case 's': need = 2; break;
++            case 'I': case 'c': case 'a': need = 4; break;
++            case 't': need = nar ? 1 : 4; break;
++            default: need = 0; break;
++            }
++            if (need == 0 || q + need > len)
++                goto done;
++            if (need == 4)
++                v = (int)((uint32_t)code[q] | ((uint32_t)code[q + 1] << 8) |
++                          ((uint32_t)code[q + 2] << 16) | ((uint32_t)code[q + 3] << 24));
++            else if (need == 2)
++                v = code[q] | (code[q + 1] << 8);
++            else
++                v = code[q];
++            if (fmt[m] == 'r') {
++                aot_hash_u32(h0, h1, (uint32_t)((v >> 4) & 0xfff));
++            } else if (fmt[m] == 'a' ||
++                       ((op == ROP_load_const || op == ROP_binary_cpool) &&
++                        fmt[m] == 'c' && kind == REG_CONST_ATOM)) {
++                if (rt)
++                    JS_AtomGetStrRT(rt, buf, sizeof(buf), (JSAtom)v);
++                else
++                    buf[0] = '\0';
++                aot_hash_str(h0, h1, buf);
++            } else {
++                aot_hash_u32(h0, h1, (uint32_t)v);
++                if (fmt[m] == 'b')
++                    kind = v;
++            }
++            q += need;
++        }
++        p = q;
++    }
++done:
++    return;
++}
++
++static void js_aot_digest_depth(JSFunctionBytecode *b, uint8_t out[16], int depth)
++{
++    uint64_t h0 = 0x9E3779B97F4A7C15ULL, h1 = 0xC2B2AE3D27D4EB4FULL;
++    JSContext *ctx = b->realm;
++    uint32_t flags;
++    int i;
++
++    aot_hash_u32(&h0, &h1, QJS_AOT_ABI);
++    aot_hash_u32(&h0, &h1, b->regvm_len > 0 ? (uint32_t)b->regvm_len : 0);
++    if (b->regvm_code && b->regvm_len > 0)
++        aot_digest_code(&h0, &h1, b);
++    aot_hash_u32(&h0, &h1, (uint32_t)b->regvm_reg_count);
++    aot_hash_u32(&h0, &h1, (uint32_t)b->regvm_ctl_count);
++    aot_hash_u32(&h0, &h1, (uint32_t)b->regvm_pic_count);
++    aot_hash_u32(&h0, &h1, (uint32_t)b->arg_count);
++    aot_hash_u32(&h0, &h1, (uint32_t)b->var_count);
++    aot_hash_u32(&h0, &h1, (uint32_t)b->defined_arg_count);
++
++    flags = (b->is_strict_mode ? 1u : 0) | (b->has_prototype ? 2u : 0) |
++            (b->need_home_object ? 4u : 0) | ((uint32_t)(b->func_kind & 3) << 3) |
++            (b->new_target_allowed ? 0x20u : 0) |
++            (b->super_call_allowed ? 0x40u : 0) |
++            (b->super_allowed ? 0x80u : 0) |
++            (b->arguments_allowed ? 0x100u : 0);
++    aot_hash_u32(&h0, &h1, flags);
++
++    aot_hash_u32(&h0, &h1, (uint32_t)b->cpool_count);
++    for (i = 0; i < b->cpool_count; i++) {
++        JSValue v = b->cpool[i];
++        int tag = JS_VALUE_GET_TAG(v);
++
++        aot_hash_u32(&h0, &h1, (uint32_t)tag);
++        switch (tag) {
++        case JS_TAG_INT:
++            aot_hash_u32(&h0, &h1, (uint32_t)JS_VALUE_GET_INT(v));
++            break;
++        case JS_TAG_FLOAT64: {
++            double d = JS_VALUE_GET_FLOAT64(v);
++            uint64_t bits;
++            memcpy(&bits, &d, 8);
++            aot_hash_u64(&h0, &h1, bits);
++            break;
++        }
++        case JS_TAG_STRING:
++        case JS_TAG_STRING_ROPE: {
++            size_t slen = 0;
++            const char *s = ctx ? JS_ToCStringLen(ctx, &slen, v) : NULL;
++            aot_hash_u64(&h0, &h1, (uint64_t)slen);
++            if (s) {
++                aot_hash_bytes(&h0, &h1, s, slen);
++                JS_FreeCString(ctx, s);
++            }
++            break;
++        }
++        case JS_TAG_OBJECT: {
++            JSObject *o = JS_VALUE_GET_OBJ(v);
++            int cls = o->class_id;
++            aot_hash_u32(&h0, &h1, (uint32_t)cls);
++            if (depth < 4 && o->u.func.function_bytecode &&
++                (cls == JS_CLASS_BYTECODE_FUNCTION ||
++                 cls == JS_CLASS_GENERATOR_FUNCTION ||
++                 cls == JS_CLASS_ASYNC_FUNCTION ||
++                 cls == JS_CLASS_ASYNC_GENERATOR_FUNCTION)) {
++                uint8_t sub[16];
++                js_aot_digest_depth(o->u.func.function_bytecode, sub, depth + 1);
++                aot_hash_bytes(&h0, &h1, sub, 16);
++            }
++            break;
++        }
++        default:
++            break;
++        }
++    }
++
++    aot_hash_u32(&h0, &h1, (uint32_t)b->closure_var_count);
++    for (i = 0; i < b->closure_var_count; i++) {
++        JSClosureVar *cv = &b->closure_var[i];
++        aot_hash_u32(&h0, &h1, (uint32_t)cv->var_idx);
++        aot_hash_u32(&h0, &h1, (uint32_t)cv->var_kind);
++        aot_hash_u32(&h0, &h1, (uint32_t)cv->closure_type);
++        aot_hash_u32(&h0, &h1, (cv->is_lexical ? 1u : 0) | (cv->is_const ? 2u : 0));
++    }
++
++    for (i = 0; i < 16; i++)
++        out[i] = (uint8_t)((i < 8 ? h0 : h1) >> ((i & 7) * 8));
++}
++
++static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16])
++{
++    js_aot_digest_depth(b, out, 0);
++}
++
++static uint16_t aot_tag_class(JSValue v)
++{
++    switch (JS_VALUE_GET_TAG(v)) {
++    case JS_TAG_FLOAT64:       return AOT_TYPE_FLOAT;
++    case JS_TAG_INT:           return AOT_TYPE_INT;
++    case JS_TAG_BOOL:          return AOT_TYPE_BOOL;
++    case JS_TAG_NULL:
++    case JS_TAG_UNDEFINED:
++    case JS_TAG_UNINITIALIZED: return AOT_TYPE_UNDEF;
++    case JS_TAG_OBJECT:        return AOT_TYPE_OBJECT;
++    case JS_TAG_STRING:
++    case JS_TAG_STRING_ROPE:   return AOT_TYPE_STRING;
++    case JS_TAG_BIG_INT:
++    case JS_TAG_SHORT_BIG_INT: return AOT_TYPE_BIGINT;
++    default:                   return AOT_TYPE_OTHER;
++    }
++}
++
++static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++
++    if (pf)
++        return pf;
++    pf = js_mallocz_rt(rt, sizeof(*pf));
++    if (!pf)
++        return NULL;
++    pf->loop_n = b->regvm_len > 0 ? b->regvm_len : 0;
++    pf->reg_n = b->regvm_reg_count > 0 ? b->regvm_reg_count : 0;
++    pf->nsites = b->regvm_pic_count;
++    if (pf->loop_n > 0) {
++        pf->loop_iters = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->loop_n);
++        if (!pf->loop_iters)
++            goto fail;
++    }
++    if (pf->reg_n > 0) {
++        pf->reg_types = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)pf->reg_n);
++        if (!pf->reg_types)
++            goto fail;
++    }
++    if (pf->nsites > 0) {
++        pf->sites = js_mallocz_rt(rt, sizeof(JSAotProfSite) * (size_t)pf->nsites);
++        if (!pf->sites)
++            goto fail;
++    }
++    b->aot_prof = pf;
++    return pf;
++fail:
++    js_free_rt(rt, pf->loop_iters);
++    js_free_rt(rt, pf->reg_types);
++    js_free_rt(rt, pf->sites);
++    js_free_rt(rt, pf);
++    return NULL;
++}
++
++static int js_aot_prof_enter(JSFunctionBytecode *b)
++{
++    JSAotProfFunc *pf = js_aot_prof_ensure(b->realm->rt, b);
++
++    if (!pf)
++        return 0;
++    pf->entries++;
++    return 1;
++}
++
++static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++
++    if (unlikely(!pf)) {
++        pf = js_aot_prof_ensure(b->realm->rt, b);
++        if (!pf) {
++            *pprev = rpc;
++            return;
++        }
++    }
++    pf->ops++;
++    if (*pprev && rpc < *pprev) {
++        int off = (int)(rpc - b->regvm_code);
++        if (off >= 0 && off < pf->loop_n)
++            pf->loop_iters[off]++;
++    }
++    *pprev = rpc;
++}
++
++static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    JSAotProfSite *s;
++    uint8_t i;
++
++    if (!pf || site < 0 || site >= pf->nsites)
++        return;
++    s = &pf->sites[site];
++    s->count++;
++    for (i = 0; i < s->nshapes; i++) {
++        if (s->shapes[i] == shape) {
++            s->shape_hits[i]++;
++            return;
++        }
++    }
++    if (s->nshapes < 4) {
++        s->shapes[s->nshapes] = shape;
++        s->shape_hits[s->nshapes] = 1;
++        s->nshapes++;
++    }
++}
++
++static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    uint16_t bit;
++
++    if (reg < 0 || !pf || reg >= pf->reg_n)
++        return;
++    bit = aot_tag_class(v);
++    pf->reg_types[reg] |= bit;
++}
++
++static JSAotProfCall *aot_call_slot(JSRuntime *rt, JSAotProfFunc *pf, uint32_t pc)
++{
++    JSAotProfCall *c;
++    int i;
++
++    for (i = 0; i < pf->ncalls; i++)
++        if (pf->calls[i].pc == pc)
++            return &pf->calls[i];
++    if (pf->ncalls == pf->calls_cap) {
++        int nc = pf->calls_cap ? pf->calls_cap * 2 : 16;
++        JSAotProfCall *n = js_realloc_rt(rt, pf->calls, sizeof(JSAotProfCall) * (size_t)nc);
++        if (!n)
++            return NULL;
++        memset(n + pf->calls_cap, 0,
++               sizeof(JSAotProfCall) * (size_t)(nc - pf->calls_cap));
++        pf->calls = n;
++        pf->calls_cap = nc;
++    }
++    c = &pf->calls[pf->ncalls++];
++    memset(c, 0, sizeof(*c));
++    c->pc = pc;
++    c->argc_min = 255;
++    return c;
++}
++
++static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
++                             JSValue fn, int argc)
++{
++    JSRuntime *rt = ctx->rt;
++    JSAotProfFunc *pf = js_aot_prof_ensure(rt, b);
++    JSAotProfCall *c;
++    JSAotProfCallee *ce = NULL;
++    uint8_t kind = 3, digest[16] = { 0 };
++    void *cfn = NULL;
++    int16_t magic = 0;
++    uint8_t cproto = 0;
++    int i;
++
++    if (!pf)
++        return;
++    c = aot_call_slot(rt, pf, pc);
++    if (!c)
++        return;
++    c->count++;
++    if (argc < c->argc_min)
++        c->argc_min = (uint8_t)argc;
++    if (argc > c->argc_max)
++        c->argc_max = (uint8_t)argc;
++
++    if (JS_VALUE_GET_TAG(fn) == JS_TAG_OBJECT) {
++        JSObject *o = JS_VALUE_GET_OBJ(fn);
++        int cls = o->class_id;
++        if (cls == JS_CLASS_BYTECODE_FUNCTION ||
++            cls == JS_CLASS_GENERATOR_FUNCTION ||
++            cls == JS_CLASS_ASYNC_FUNCTION ||
++            cls == JS_CLASS_ASYNC_GENERATOR_FUNCTION) {
++            kind = 1;
++            js_aot_digest(o->u.func.function_bytecode, digest);
++        } else if (cls == JS_CLASS_C_FUNCTION) {
++            kind = 2;
++            cfn = (void *)o->u.cfunc.c_function.generic;
++            magic = o->u.cfunc.magic;
++            cproto = o->u.cfunc.cproto;
++        }
++    }
++    for (i = 0; i < c->ncallee; i++) {
++        JSAotProfCallee *cc = &c->callee[i];
++        if (cc->kind != kind)
++            continue;
++        if (kind == 1 && memcmp(cc->digest, digest, 16) != 0)
++            continue;
++        if (kind == 2 && cc->cfn != cfn)
++            continue;
++        ce = cc;
++        break;
++    }
++    if (!ce && c->ncallee < 4) {
++        ce = &c->callee[c->ncallee++];
++        memset(ce, 0, sizeof(*ce));
++        ce->kind = kind;
++        memcpy(ce->digest, digest, 16);
++        ce->cfn = cfn;
++        ce->magic = magic;
++        ce->cproto = cproto;
++    }
++    if (ce)
++        ce->hits++;
++}
++
++static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++
++    if (!pf)
++        return;
++    js_free_rt(rt, pf->loop_iters);
++    js_free_rt(rt, pf->reg_types);
++    js_free_rt(rt, pf->sites);
++    js_free_rt(rt, pf->calls);
++    js_free_rt(rt, pf);
++    b->aot_prof = NULL;
++}
++
++static void aot_digest_hex(const uint8_t d[16], char out[33])
++{
++    static const char *hex = "0123456789abcdef";
++    int i;
++    for (i = 0; i < 16; i++) {
++        out[i * 2] = hex[d[i] >> 4];
++        out[i * 2 + 1] = hex[d[i] & 15];
++    }
++    out[32] = '\0';
++}
++
++static void aot_type_str(uint16_t bits, char *out, int n)
++{
++    static const struct { uint16_t bit; const char *name; } tab[] = {
++        { AOT_TYPE_FLOAT, "float" }, { AOT_TYPE_INT, "int" },
++        { AOT_TYPE_OBJECT, "object" }, { AOT_TYPE_STRING, "string" },
++        { AOT_TYPE_BOOL, "bool" }, { AOT_TYPE_UNDEF, "undef" },
++        { AOT_TYPE_BIGINT, "bigint" }, { AOT_TYPE_OTHER, "other" },
++    };
++    int i, off = 0;
++    out[0] = '\0';
++    for (i = 0; i < (int)(sizeof(tab) / sizeof(tab[0])); i++) {
++        if (bits & tab[i].bit)
++            off += snprintf(out + off, (size_t)(n - off), "%s%s",
++                            off ? "|" : "", tab[i].name);
++    }
++    if (!off)
++        snprintf(out, (size_t)n, "none");
++}
++
++#if !defined(_WIN32)
++static int aot_phdr_base(struct dl_phdr_info *info, size_t size, void *data)
++{
++    (void)size;
++    *(uintptr_t *)data = (uintptr_t)info->dlpi_addr;
++    return 1; /* first entry is the main executable */
++}
++#endif
++
++/*
++ * Name the C function at `p`. dladdr only sees dynamic symbols, and nearly
++ * every builtin here is file-static, so it usually fails; fall back to reading
++ * the executable's own .symtab from /proc/self/exe and picking the nearest
++ * preceding STT_FUNC at or below the address. Profile builds are linked
++ * -no-pie, so the pointer offset is the symbol's st_value.
++ */
++static const char *aot_sym_name(JSRuntime *rt, void *p, char *buf, int n)
++{
++#if !defined(_WIN32)
++    Dl_info di;
++    unsigned char *img;
++    Elf64_Ehdr *eh;
++    Elf64_Shdr *sh;
++    Elf64_Sym *sym = NULL, *best = NULL;
++    const char *str = NULL;
++    uintptr_t base = 0, off, bestv = 0;
++    FILE *fp;
++    long fsz;
++    size_t i, nsym = 0;
++    int have_best = 0;
++
++    if (!p)
++        return NULL;
++    if (dladdr(p, &di) && di.dli_sname) {
++        snprintf(buf, (size_t)n, "%s", di.dli_sname);
++        return buf;
++    }
++    dl_iterate_phdr(aot_phdr_base, &base);
++    fp = fopen("/proc/self/exe", "rb");
++    if (!fp)
++        return NULL;
++    if (fseek(fp, 0, SEEK_END) != 0 || (fsz = ftell(fp)) <= 0 ||
++        fseek(fp, 0, SEEK_SET) != 0) {
++        fclose(fp);
++        return NULL;
++    }
++    img = (unsigned char *)js_malloc_rt(rt, (size_t)fsz);
++    if (!img) {
++        fclose(fp);
++        return NULL;
++    }
++    if (fread(img, 1, (size_t)fsz, fp) != (size_t)fsz) {
++        fclose(fp);
++        js_free_rt(rt, img);
++        return NULL;
++    }
++    fclose(fp);
++    eh = (Elf64_Ehdr *)img;
++    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
++        eh->e_shoff == 0 || eh->e_shnum == 0 ||
++        eh->e_shoff + (uint64_t)eh->e_shnum * eh->e_shentsize > (uint64_t)fsz) {
++        js_free_rt(rt, img);
++        return NULL;
++    }
++    sh = (Elf64_Shdr *)(img + eh->e_shoff);
++    for (i = 0; i < eh->e_shnum; i++) {
++        if (sh[i].sh_type == SHT_SYMTAB && sh[i].sh_entsize &&
++            sh[i].sh_link < eh->e_shnum) {
++            sym = (Elf64_Sym *)(img + sh[i].sh_offset);
++            nsym = sh[i].sh_size / sh[i].sh_entsize;
++            str = (const char *)(img + sh[sh[i].sh_link].sh_offset);
++            break;
++        }
++    }
++    off = (uintptr_t)p - base;
++    if (sym && str) {
++        for (i = 0; i < nsym; i++) {
++            if (ELF64_ST_TYPE(sym[i].st_info) != STT_FUNC)
++                continue;
++            if (sym[i].st_value <= off && sym[i].st_value != 0 &&
++                (!have_best || sym[i].st_value > bestv)) {
++                best = &sym[i];
++                bestv = sym[i].st_value;
++                have_best = 1;
++            }
++        }
++    }
++    if (have_best && str + best->st_name < (const char *)img + fsz) {
++        snprintf(buf, (size_t)n, "%s", str + best->st_name);
++        js_free_rt(rt, img);
++        return buf;
++    }
++    js_free_rt(rt, img);
++#else
++    (void)rt; (void)p; (void)buf; (void)n;
++#endif
++    return NULL;
++}
++
++static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    uint8_t dg[16];
++    char dgt[33];
++    char name[256], file[256];
++    int i, j;
++
++    if (!pf || pf->ops == 0)
++        return;
++    js_aot_digest(b, dg);
++    aot_digest_hex(dg, dgt);
++    JS_AtomGetStrRT(rt, name, sizeof(name), b->func_name);
++    JS_AtomGetStrRT(rt, file, sizeof(file), b->filename);
++    fprintf(f, "F %s name=%s file=%s:%d ops=%llu entries=%u len=%d\n",
++            dgt, name, file, b->line_num,
++            (unsigned long long)pf->ops, pf->entries, b->regvm_len);
++    for (i = 0; i < pf->loop_n; i++)
++        if (pf->loop_iters[i])
++            fprintf(f, "L %s pc=%d iters=%u\n", dgt, i, pf->loop_iters[i]);
++    for (i = 0; i < pf->reg_n; i++) {
++        if (pf->reg_types[i]) {
++            char ts[128];
++            aot_type_str(pf->reg_types[i], ts, sizeof(ts));
++            fprintf(f, "R %s reg=%d types=%s\n", dgt, i, ts);
++        }
++    }
++    for (i = 0; i < pf->nsites; i++) {
++        JSAotProfSite *s = &pf->sites[i];
++        if (!s->count)
++            continue;
++        fprintf(f, "S %s site=%d count=%u shapes=%u", dgt, i, s->count, s->nshapes);
++        for (j = 0; j < s->nshapes; j++)
++            fprintf(f, " shape%d=%p hits=%u", j, (void *)s->shapes[j],
++                    s->shape_hits[j]);
++        fputc('\n', f);
++    }
++    for (i = 0; i < pf->ncalls; i++) {
++        JSAotProfCall *c = &pf->calls[i];
++        if (!c->count)
++            continue;
++        for (j = 0; j < c->ncallee; j++) {
++            JSAotProfCallee *ce = &c->callee[j];
++            fprintf(f, "C %s pc=%u count=%u argc=%u..%u ", dgt, c->pc, c->count,
++                    c->argc_min == 255 ? 0 : c->argc_min, c->argc_max);
++            if (ce->kind == 1) {
++                char cd[33];
++                aot_digest_hex(ce->digest, cd);
++                fprintf(f, "callee=bc:%s", cd);
++            } else if (ce->kind == 2) {
++                char sbuf[128];
++                const char *sn = aot_sym_name(rt, ce->cfn, sbuf, sizeof(sbuf));
++                fprintf(f, "callee=c:%s:fn=%p:magic=%d:cproto=%u",
++                        sn ? sn : "?", ce->cfn, ce->magic, ce->cproto);
++            } else {
++                fprintf(f, "callee=other");
++            }
++            fprintf(f, " hits=%u\n", ce->hits);
++        }
++    }
++}
++
++void js_aot_prof_dump(JSRuntime *rt)
++{
++    const char *out = getenv("QJS_AOT_PROFILE_OUT");
++    FILE *f = stderr;
++    struct list_head *el;
++
++    if (out && out[0]) {
++        f = fopen(out, "w");
++        if (!f)
++            f = stderr;
++    }
++    fprintf(f, "qjsprof 1 abi=%u\n", QJS_AOT_ABI);
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
++            aot_dump_one(f, rt, (JSFunctionBytecode *)gp);
++    }
++    list_for_each(el, &rt->gc_notrace_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
++            aot_dump_one(f, rt, (JSFunctionBytecode *)gp);
++    }
++    if (f != stderr)
++        fclose(f);
++}
++#endif /* QJS_AOT_PROFILE */
++
+ 
+ /*
+  * Release the first `n` atom operands of a program whose rewrite stopped
+@@ -65594,6 +66364,10 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+ #endif
+ #endif
+ 
++#if QJS_AOT_PROFILE
++    js_aot_prof_free(rt, b);
++#endif
++
+     if (b->byte_code_buf)
+         free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, true);
+ 

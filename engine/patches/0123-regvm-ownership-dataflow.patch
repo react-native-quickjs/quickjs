@@ -1,0 +1,398 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22678,6 +22678,7 @@
+ extern uint64_t js_regvm_count[ROP_COUNT];
+ #if QJS_REGVM_COUNT
+ extern uint64_t js_regvm_ir_insns, js_regvm_ir_moves, js_regvm_ir_move_adj;
++extern uint64_t js_regvm_own_plain, js_regvm_own_returns;
+ extern uint64_t js_regvm_ir_pred[ROP_COUNT];
+ extern uint64_t js_regvm_blockers[ROP_COUNT];
+ extern uint64_t js_regvm_fallback_calls;
+@@ -56609,6 +56610,356 @@
+     return 0;
+ }
+ 
++/* ================== section 6.1: register-state dataflow ==================
++ *
++ * A forward, block-level dataflow over the final register IR that says, for
++ * every physical register at every point, whether it holds a reference count
++ * (OWN), provably does not (NONE), or might (MAYBE). It is the foundation for
++ * three later savings: the plain-store variants (D3/B3) read the state of a
++ * destination before it is written, and the per-return and per-throw owned sets
++ * (C2) let the frame release and the unwinder stop walking the whole register
++ * area. It runs on physical registers, after allocation, because the value-level
++ * form (P5a) had to guard every drop and every guard was a hole.
++ *
++ * The analysis is sound by construction: an instruction's destination is always
++ * one of its register operands, and every op the lowering does not give a
++ * destination is a pure read of its operands, so a register's state changes only
++ * where `regvm_own_has_dest` says it does (plus the `*_xfer` forms, which hand a
++ * value away and so clear the source). `QJS_REGVM_RCCHECK` (section 6.2) is the
++ * belt to this braces: it asserts the claim against the frame's actual values.
++ */
++enum {
++    REG_OWN_NONE = 0,   /* no count: undefined, Number, Bool, borrowed */
++    REG_OWN_OWN = 1,    /* holds a reference count */
++    REG_OWN_MAYBE = 2,  /* the join of the two, and the safe default */
++};
++
++static inline uint8_t regvm_own_join(uint8_t a, uint8_t b)
++{
++    return a == b ? a : REG_OWN_MAYBE;
++}
++
++/* Whether ops[0] is this instruction's destination. Only the ops the lowering
++   gives a register result are listed; every other op reads its operands and
++   leaves the registers as they were (the `*_xfer` stores are handled by the
++   caller, since they clear the operand they hand away). */
++static int regvm_own_has_dest(uint16_t rop)
++{
++    switch (rop) {
++    case ROP_load_const: case ROP_load_i8: case ROP_load_i8_s:
++    case ROP_load_i32: case ROP_load_undefined: case ROP_load_null:
++    case ROP_load_true: case ROP_load_false: case ROP_load_this:
++    case ROP_load_bigint_i32: case ROP_private_symbol:
++    case ROP_new_object: case ROP_object_template:
++    case ROP_move: case ROP_move_s: case ROP_move_xfer:
++    case ROP_get_local: case ROP_get_local_s0: case ROP_get_local_s1:
++    case ROP_get_local_s2: case ROP_get_local_s3:
++    case ROP_get_arg: case ROP_get_var_ref: case ROP_get_global:
++    case ROP_make_closure: case ROP_rest:
++    case ROP_unary: case ROP_binary: case ROP_mul: case ROP_add:
++    case ROP_sub: case ROP_div: case ROP_mod: case ROP_pow:
++    case ROP_bitand: case ROP_bitor: case ROP_bitxor:
++    case ROP_shl: case ROP_sar: case ROP_shr:
++    case ROP_lt: case ROP_lte: case ROP_gt: case ROP_gte:
++    case ROP_eq: case ROP_neq: case ROP_strict_eq: case ROP_strict_neq:
++    case ROP_instanceof: case ROP_in:
++    case ROP_neg: case ROP_inc: case ROP_dec: case ROP_not:
++    case ROP_to_numeric: case ROP_to_number: case ROP_compare:
++    case ROP_binary_loc_reg: case ROP_binary_reg_loc: case ROP_binary_loc_loc:
++    case ROP_binary_imm: case ROP_binary_cpool: case ROP_binary_imm_s:
++    case ROP_add_imm_s: case ROP_sub_imm_s:
++    case ROP_add_imm_self_s: case ROP_sub_imm_self_s:
++    case ROP_add_imm_self_branch: case ROP_add_imm_self_branch_s:
++    case ROP_get_field: case ROP_get_local_field:
++    case ROP_get_local_field_0: case ROP_get_local_field_1:
++    case ROP_get_local_field_2: case ROP_get_local_field_3:
++    case ROP_get_arg_field: case ROP_get_field2: case ROP_get_private:
++    case ROP_get_element: case ROP_get_length: case ROP_super_get:
++    case ROP_get_super: case ROP_get_ref_value: case ROP_get_arg_el:
++    case ROP_call: case ROP_call_method: case ROP_construct:
++    case ROP_tail_call: case ROP_tail_call_method: case ROP_array_from:
++    case ROP_apply: case ROP_eval: case ROP_apply_eval: case ROP_apply_arguments:
++    case ROP_with_get: case ROP_with_make_ref: case ROP_with_get_ref:
++    case ROP_with_get_ref_undef: case ROP_with_put: case ROP_with_delete:
++    case ROP_make_local_ref: case ROP_make_var_ref:
++    case ROP_define_private: case ROP_define_class: case ROP_define_class_computed:
++    case ROP_define_method: case ROP_define_method_computed:
++    case ROP_set_proto: case ROP_set_home_object:
++    case ROP_set_name: case ROP_set_name_computed:
++    case ROP_catch_enter: case ROP_finally_enter: case ROP_nip_catch:
++    case ROP_check_ctor_return: case ROP_init_ctor:
++    case ROP_iterator_next: case ROP_iterator_call: case ROP_iter_next:
++    case ROP_iter_start: case ROP_for_in_start: case ROP_for_in_next:
++    case ROP_for_await_of_start: case ROP_iter_value_done:
++    case ROP_yield: case ROP_yield_star: case ROP_await:
++    case ROP_get_ref: case ROP_make_ref:
++    case ROP_to_object: case ROP_to_propkey: case ROP_to_propkey2:
++    case ROP_delete: case ROP_delete_var: case ROP_typeof:
++    case ROP_special: case ROP_special_object: case ROP_regexp:
++    case ROP_copy_props: case ROP_dynamic_import:
++    case ROP_using_init: case ROP_using_dispose: case ROP_using_dispose_async:
++    case ROP_using_merge: case ROP_using_check:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++/* The result class of a defining instruction. NONE only where the result is
++   provably count-free: the primitive constants and the boolean comparisons.
++   `move`/`move_xfer` copy their source and are handled by the caller. */
++static uint8_t regvm_own_result_class(uint16_t rop)
++{
++    switch (rop) {
++    case ROP_load_undefined: case ROP_load_null:
++    case ROP_load_true: case ROP_load_false:
++    case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
++    case ROP_lt: case ROP_lte: case ROP_gt: case ROP_gte:
++    case ROP_eq: case ROP_neq: case ROP_strict_eq: case ROP_strict_neq:
++    case ROP_instanceof: case ROP_in: case ROP_not: case ROP_compare:
++        return REG_OWN_NONE;
++    default:
++        return REG_OWN_MAYBE;
++    }
++}
++
++/* The physical register an operand names, or -1 when it is not a value register
++   (scratch, call window, cycle temporary, or a non-register operand). */
++static int regvm_own_op_reg(const JSRegInsn *in, int k, const int *ireg,
++                            int n_values, int reg_count, int cycle_reg)
++{
++    int r;
++    if (k >= in->n_ops || !regvm_rop_fmt[in->rop])
++        return -1;
++    r = regvm_reg_of(in, k, ireg, n_values, -1, -1, cycle_reg);
++    return (r >= 0 && r < reg_count) ? r : -1;
++}
++
++/*
++ * One instruction's transfer over `st` (reg_count bytes).
++ *
++ * The update joins with the register's current state rather than overwriting
++ * it. That is deliberate: a strong update would make the transfer non-monotone
++ * (a `move` of a NONE source can lower a register that a loop already carried in
++ * as MAYBE), and the block worklist would oscillate instead of converging. The
++ * join is the sound direction for a may-hold-a-count analysis: it can only
++ * over-approximate, and it reaches the fixed point. Strong updates, which need
++ * the SSA value to know the previous definition is dead, are a later refinement.
++ */
++static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
++                           int n_values, int reg_count, int cycle_reg)
++{
++    uint16_t rop = in->rop;
++    int d, s;
++
++    if (regvm_own_has_dest(rop) && regvm_rop_fmt[rop] && regvm_rop_fmt[rop][0] == 'r') {
++        d = regvm_own_op_reg(in, 0, ireg, n_values, reg_count, cycle_reg);
++        if (d >= 0) {
++            uint8_t cls;
++            if (rop == ROP_move || rop == ROP_move_s || rop == ROP_move_xfer) {
++                s = regvm_own_op_reg(in, 1, ireg, n_values, reg_count, cycle_reg);
++                cls = s >= 0 ? st[s] : REG_OWN_MAYBE;
++            } else {
++                cls = regvm_own_result_class(rop);
++            }
++            st[d] = regvm_own_join(st[d], cls);
++        }
++        return;
++    }
++    /*
++     * A `*_xfer` store hands its value to a slot that now owns the count, so the
++     * register no longer does. Under the join transfer the clear is the identity
++     * (`join(x, NONE) == x`), so it is not applied: leaving the register counted
++     * is the sound direction. The strong-update refinement will apply it.
++     */
++    (void)rop;
++    (void)s;
++}
++
++/*
++ * Run the dataflow. Diagnostic for now: the consumers (D3/B3 plain stores, C2
++ * release sets) are the next increment, so nothing here changes the emitted
++ * code. Under `REGVM_OWN` it dumps the analysis; under `QJS_REGVM_COUNT` it
++ * counts the plain-store opportunities so the precision can be watched.
++ */
++static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
++                              const int *bstart, const int *succ,
++                              const int *ireg, int n_values, int reg_count,
++                              int cycle_reg)
++{
++    int n = ir->insns ? ir->n_insns : 0, nreg = reg_count > 0 ? reg_count : 1;
++    int *blk = NULL, *ph = NULL, *pn = NULL, *pb = NULL, *queue = NULL;
++    int *bs = NULL, *be = NULL;
++    uint8_t *blkin = NULL, *blkout = NULL, *inq = NULL, *tmp = NULL;
++    int i, b, k, e, ne = 0, sp = 0;
++    const char *ownknob = REGVM_KNOB("REGVM_OWN");
++    int dump = ownknob != NULL;
++
++    if (n <= 0 || reg_count <= 0 || n_blocks <= 0)
++        return;
++    if ((size_t)n * (size_t)nreg > (48u << 20))
++        return;
++    blk = js_malloc(ctx, (size_t)n * sizeof(int));
++    ph = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
++    pn = js_malloc(ctx, (size_t)(2 * n_blocks + 2) * sizeof(int));
++    pb = js_malloc(ctx, (size_t)(2 * n_blocks + 2) * sizeof(int));
++    queue = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
++    bs = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
++    be = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
++    blkin = js_malloc(ctx, (size_t)n_blocks * nreg);
++    blkout = js_malloc(ctx, (size_t)n_blocks * nreg);
++    inq = js_malloc(ctx, (size_t)n_blocks);
++    tmp = js_malloc(ctx, nreg);
++    if (!blk || !ph || !pn || !pb || !queue || !bs || !be ||
++        !blkin || !blkout || !inq || !tmp)
++        goto done;
++
++    for (i = 0, b = 0; i < n; i++) {
++        while (b + 1 < n_blocks && bstart[b + 1] <= ir->insns[i].src_pc)
++            b++;
++        blk[i] = b;
++        if (i > 0 && blk[i] < blk[i - 1]) {
++            goto done;          /* instructions not grouped by block: skip */
++        }
++    }
++    for (b = 0; b < n_blocks; b++) {
++        ph[b] = -1;
++        bs[b] = -1;
++        be[b] = -1;
++        memset(blkin + (size_t)b * nreg, REG_OWN_NONE, nreg);
++        memset(blkout + (size_t)b * nreg, REG_OWN_NONE, nreg);
++        inq[b] = 0;
++    }
++    for (i = 0; i < n; i++) {
++        b = blk[i];
++        if (bs[b] < 0)
++            bs[b] = i;
++        be[b] = i + 1;
++    }
++    for (b = 0; b < n_blocks; b++) {
++        for (k = 0; k < 2; k++) {
++            int sb = succ[b * 2 + k];
++            if (sb < 0 || sb >= n_blocks)
++                continue;
++            pb[ne] = b;
++            pn[ne] = ph[sb];
++            ph[sb] = ne++;
++        }
++    }
++
++    /* Entry: every register NONE. Then a worklist to the fixed point. The
++       lattice has height one (NONE -> OWN -> MAYBE), so this terminates. The
++       worklist is a LIFO stack of block ids; `inq` keeps each block in it at
++       most once, so its capacity is exactly n_blocks. */
++    queue[sp++] = 0;
++    inq[0] = 1;
++    while (sp > 0) {
++        uint8_t *in, *out;
++        b = queue[--sp];
++        inq[b] = 0;
++        in = blkin + (size_t)b * nreg;
++        if (b != 0) {
++            for (e = ph[b]; e != -1; e = pn[e]) {
++                uint8_t *o = blkout + (size_t)pb[e] * nreg;
++                for (i = 0; i < nreg; i++)
++                    in[i] = regvm_own_join(in[i], o[i]);
++            }
++        }
++        out = blkout + (size_t)b * nreg;
++        /* Transfer into a scratch buffer, then compare with the block's last
++           output. Comparing with `in` instead would miss a growth that came
++           from a predecessor but that this block's own transfer did not add to,
++           and the successors would never be revisited. */
++        memcpy(tmp, in, nreg);
++        for (i = bs[b]; i >= 0 && i < be[b]; i++)
++            regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
++                           cycle_reg);
++        for (i = 0; i < nreg; i++) {
++            if (tmp[i] != out[i]) {
++                memcpy(out, tmp, nreg);
++                for (k = 0; k < 2; k++) {
++                    int sb = succ[b * 2 + k];
++                    if (sb >= 0 && sb < n_blocks && !inq[sb]) {
++                        queue[sp++] = sb;
++                        inq[sb] = 1;
++                    }
++                }
++                break;
++            }
++        }
++    }
++
++    /* Report: replay each block to read the state before every definition, and
++       collect the owned set at every return and throw. */
++    {
++        int plain = 0, nret = 0, owned_max = 0;
++        uint8_t *st = js_malloc(ctx, nreg);
++        if (!st)
++            goto done;
++        for (b = 0; b < n_blocks; b++) {
++            if (bs[b] < 0)
++                continue;
++            memcpy(st, blkin + (size_t)b * nreg, nreg);
++            for (i = bs[b]; i < be[b]; i++) {
++                JSRegInsn *in = &ir->insns[i];
++                uint16_t rop = in->rop;
++                if (regvm_own_has_dest(rop) && regvm_rop_fmt[rop] &&
++                    regvm_rop_fmt[rop][0] == 'r') {
++                    int d = regvm_own_op_reg(in, 0, ireg, n_values, reg_count,
++                                             cycle_reg);
++                    if (d >= 0 && st[d] == REG_OWN_NONE) {
++                        plain++;
++                        if (dump)
++                            fprintf(stderr, "##OWN## i=%d r=%d plain\n", i, d);
++                    }
++                } else if (rop == ROP_return || rop == ROP_return_async ||
++                           rop == ROP_throw || rop == ROP_throw_error) {
++                    int cnt = 0;
++                    for (k = 0; k < nreg; k++)
++                        if (st[k] != REG_OWN_NONE)
++                            cnt++;
++                    nret++;
++                    if (cnt > owned_max)
++                        owned_max = cnt;
++                    if (dump) {
++                        fprintf(stderr, "##OWNRET## i=%d rop=%d n=%d:", i, rop,
++                                cnt);
++                        for (k = 0; k < nreg; k++)
++                            if (st[k] != REG_OWN_NONE)
++                                fprintf(stderr, " %d%c", k,
++                                        st[k] == REG_OWN_OWN ? 'o' : '?');
++                        fprintf(stderr, "\n");
++                    }
++                }
++                regvm_own_step(in, st, ireg, n_values, reg_count, cycle_reg);
++            }
++        }
++        js_free(ctx, st);
++        if (dump)
++            fprintf(stderr,
++                    "##OWNSUM## insns=%d regs=%d blocks=%d plain=%d returns=%d "
++                    "owned_max=%d\n",
++                    n, reg_count, n_blocks, plain, nret, owned_max);
++#ifdef QJS_REGVM_COUNT
++        js_regvm_own_plain += plain;
++        js_regvm_own_returns += nret;
++#endif
++    }
++
++done:
++    js_free(ctx, blk);
++    js_free(ctx, ph);
++    js_free(ctx, pn);
++    js_free(ctx, pb);
++    js_free(ctx, queue);
++    js_free(ctx, bs);
++    js_free(ctx, be);
++    js_free(ctx, blkin);
++    js_free(ctx, blkout);
++    js_free(ctx, inq);
++    js_free(ctx, tmp);
++}
++
+ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                                        const uint8_t *bc, int bc_len,
+                                        const uint8_t *reuse,
+@@ -57364,6 +57715,11 @@
+                                 phi_in,
+                                 home_of, home_mode, live_out, live_words,
+                                 bstart, n_blocks);
++
++    /* Section 6.1: the physical-register ownership state. Diagnostic for now;
++       the plain-store and release-set consumers follow. */
++    regvm_own_analyze(ctx, &ir, n_blocks, bstart, succ, ireg, n_values,
++                      reg_count, cycle_reg);
+ #ifdef QJS_REGVM_COUNT
+     /* Dump the finished register stream, so the compiler's output can be read
+        statically instead of inferred from counters. Numeric opcodes; the tool
+@@ -60460,6 +60816,8 @@
+ uint64_t js_regvm_ir_insns;            /* register instructions emitted */
+ uint64_t js_regvm_ir_moves;            /* ROP_move in the IR */
+ uint64_t js_regvm_ir_move_adj;         /* adjacent ROP_move; ROP_move pairs */
++uint64_t js_regvm_own_plain;           /* 6.1: defs whose dest was NONE */
++uint64_t js_regvm_own_returns;         /* 6.1: return/throw sites analysed */
+ uint64_t js_regvm_ir_pred[ROP_COUNT];  /* times each opcode is followed by a move */
+ uint64_t js_regvm_blockers[ROP_COUNT]; /* cold opcodes blocking a called function */
+ uint64_t js_regvm_fallback_calls;
+@@ -60574,6 +60932,9 @@
+                 (unsigned long long)js_regvm_ir_insns,
+                 (unsigned long long)js_regvm_ir_moves,
+                 (unsigned long long)js_regvm_ir_move_adj);
++        fprintf(stderr, "##OWN61## plain=%llu returns=%llu\n",
++                (unsigned long long)js_regvm_own_plain,
++                (unsigned long long)js_regvm_own_returns);
+         for (k = 0; k < 10; k++) {
+             int b = -1, j;
+             uint64_t bv = 0;

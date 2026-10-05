@@ -55,5 +55,9 @@ docs/.vitepress/dist/
 docs/.vitepress/cache/
 .cache/
 
+# Python bytecode caches (tooling under tools/)
+__pycache__/
+*.pyc
+
 # misc
 .local

@@ -56,6 +56,30 @@ add_executable(native-call-bench tools/benchmark/calls.c)
 target_link_libraries(native-call-bench PRIVATE quickjs)
 target_include_directories(native-call-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-rel")
 
+# Harnesses for the experimental register VM, declared only in a QJS_REGVM=ON
+# tree so the shipping host build neither compiles nor ships them.
+#
+# The built-ins: the engine's core is native C and always present; the
+# builtin-*.h blobs are module payloads, and a register-VM runtime must never be
+# handed a stack blob -- that is what the VM discriminator enforces. A register
+# build therefore includes builtin-*.regvm.h, the same payloads compiled by the
+# register compiler, and the reader rejects a stack blob before parsing it.
+if(QJS_REGVM)
+  add_executable(regvm-test tools/regvm/regvm-test.c)
+  target_link_libraries(regvm-test PRIVATE quickjs)
+  target_include_directories(regvm-test PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-ng")
+
+  # The conformance runner, built from the same submodule the library was built
+  # from. It needs quickjs-libc, which the shipping projection does not carry.
+  # Run it from engine/quickjs-ng:
+  #   ../../build-regvm/run-test262-regvm -a -c test262.conf -c test262-fast.conf -a
+  add_executable(run-test262-regvm
+    engine/quickjs-ng/run-test262.c
+    engine/quickjs-ng/quickjs-libc.c)
+  target_link_libraries(run-test262-regvm PRIVATE quickjs)
+  target_include_directories(run-test262-regvm PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-ng")
+endif()
+
 add_subdirectory(tests)
 
 # Added after tests/ on purpose: tests/CMakeLists.txt is where googletest is

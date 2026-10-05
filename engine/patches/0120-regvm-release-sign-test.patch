@@ -1,0 +1,89 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22749,6 +22749,32 @@
+ extern void regvm_asm_add_imm_self_branch_s(void);
+ #endif /* QJS_REGVM_ASM */
+ 
++/*
++ * Whether a value held in a register carries a reference the frame owns.
++ *
++ * The frame's registers hold two kinds of value and nothing else: an immediate
++ * (tag >= 0 -- int, bool, null, undefined, uninitialized, catch offset, exception,
++ * short BigInt, float64) or a counted pointer (tag < 0 -- object, string, string
++ * rope, BigInt, module, bytecode function). The one negative tag that is *not*
++ * counted is the internal lazy-JSON marker (JS_TAG_LAZY_JSON, -4), and no
++ * register ever holds one: every read that can produce a marker materializes it
++ * (js_lazy_materialize_slot) before the value reaches a register, and a marker
++ * is not a value user code can name. So the reference-count test collapses to a
++ * sign test, and the tag order it rests on is asserted here.
++ *
++ * This is the register-state classification of plan section 6.1 in its smallest
++ * form: NONE (an immediate, no count) versus OWN (a counted pointer).
++ * JS_VALUE_HAS_REF_COUNT stays the right test for a value read out of an object
++ * slot, which *can* be a lazy marker, so the object paths keep it.
++ */
++#if !JS_NAN_BOXING
++_Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
++               "register value classification assumes negative tags are pointers and tags >= 0 are immediates");
++#define REGVM_HAS_COUNT(v) (JS_VALUE_GET_TAG(v) < 0)
++#else
++#define REGVM_HAS_COUNT(v) JS_VALUE_HAS_REF_COUNT(v)
++#endif
++
+ #if QJS_REGVM_THREAD
+ /*
+  * --- P2: the threaded interpreter ---------------------------------------
+@@ -23034,7 +23060,7 @@
+ #define T_SET_NEXT(d, v, off) do { \
+         JSValue _v = (v), _o = fr[d]; \
+         fr[d] = _v; \
+-        if (unlikely(JS_VALUE_HAS_REF_COUNT(_o)) && \
++        if (unlikely(REGVM_HAS_COUNT(_o)) && \
+             unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(_o)) <= 0)) { \
+             f->set_v = _o; \
+             __attribute__((musttail)) \
+@@ -23716,7 +23742,7 @@
+     old = c->fr[dst];
+     c->fr[dst] = v;
+     f = c;
+-    if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
++    if (unlikely(REGVM_HAS_COUNT(old)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
+         f->set_v = old;
+         __attribute__((musttail)) return regvm_t_free_slow(rip, f->fr, f, ctx);
+@@ -24308,7 +24334,7 @@
+ 
+         fr[d] = v;
+         fr[s] = JS_UNDEFINED;
+-        if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
++        if (unlikely(REGVM_HAS_COUNT(old)) &&
+             unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
+             f->set_v = old;
+             __attribute__((musttail))
+@@ -25450,7 +25476,7 @@
+          * value's reference in the register. Without this the reference is
+          * stranded, which shows up as a leaked object when the runtime is freed.
+          */
+-#define SET_REG(d, v) do { JSValue _old_rv = regs[d]; if (JS_VALUE_HAS_REF_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
++#define SET_REG(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
+ 
+ #define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
+          * Leave the frame for the engine. The continuation is the register pc
+@@ -25858,7 +25884,7 @@
+         REGVM_RESTORE_CALLER(_rh); \
+         _rold = *_rdst; \
+         *_rdst = _rrv; \
+-        if (JS_VALUE_HAS_REF_COUNT(_rold)) \
++        if (REGVM_HAS_COUNT(_rold)) \
+             JS_FreeValue(ctx, _rold); \
+         REGVM_NEXT(); \
+     } while (0)
+@@ -30742,7 +30768,7 @@
+             /* rpc is at the opcode; the operand follows it */
+             int d = (int)regvm_ld_u16(st->rpc + 1);
+             st->rpc += 3;
+-            if (JS_VALUE_HAS_REF_COUNT(st->regs[d]))
++            if (REGVM_HAS_COUNT(st->regs[d]))
+                 JS_FreeValue(st->ctx, st->regs[d]);
+             st->regs[d] = JS_UNDEFINED;
+         }

@@ -1,0 +1,158 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24220,6 +24220,16 @@
+      */
+     if (unlikely(js_poll_interrupts(ctx)))
+         T_FAIL();
++    /*
++     * W1c: the callee runs its inline-cached handlers with no NULL test on
++     * their PIC base, so the table has to exist before the record is filled
++     * and published. Same lazy allocation as an activation's own entry.
++     */
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        T_FAIL();
++    }
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
+         /*
+          * R7: no record. If frames are live under this one, the arena is full and
+@@ -24267,6 +24277,16 @@
+      */
+     if (unlikely(js_poll_interrupts(ctx)))
+         T_FAIL();
++    /*
++     * W1c: the callee runs its inline-cached handlers with no NULL test on
++     * their PIC base, so the table has to exist before the record is filled
++     * and published. Same lazy allocation as an activation's own entry.
++     */
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        T_FAIL();
++    }
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
+         /*
+          * R7: no record. If frames are live under this one, the arena is full and
+@@ -24526,8 +24546,7 @@
+     JSValue recv = f->var_buf[0];
+     JSValue val;
+ 
+-    if (site != REG_IC_NONE && f->pic != NULL &&
+-        regvm_own_read_hit(f->pic, recv, site, &val))
++    if (regvm_own_read_hit(f->pic, recv, site, &val))
+         T_SET_NEXT(d, val, 9);
+     if (site == REG_IC_NONE)
+         val = JS_GetProperty(ctx, recv, atom);
+@@ -24899,8 +24918,7 @@
+         int r = T_REG(3); \
+         int site = T_REG(9); \
+         JSValue val; \
+-        if (site != REG_IC_NONE && f->pic != NULL && \
+-            regvm_own_read_hit(f->pic, fr[r], site, &val)) { \
++        if (regvm_own_read_hit(f->pic, fr[r], site, &val)) { \
+             T_SET_NEXT(d, val, T_SZ_RRAS); \
+         } \
+         __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+@@ -24952,7 +24970,7 @@
+     int site = T_REG(7);
+     int v = T_REG(9);
+ 
+-    if (site != REG_IC_NONE && f->pic != NULL) {
++    {
+         JSValue recv = fr[r];
+ 
+         if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+@@ -25896,6 +25914,20 @@
+  restart:
+     {
+         regs = stack_buf;
++        /*
++         * W1c: a function's PIC table has to exist before any inline-cached
++         * handler reads it, because those handlers dereference f->pic with no
++         * NULL test. The table is still allocated lazily -- an emitter that
++         * never fills a site never pays for one -- so the first activation of a
++         * function that carries a site-bearing opcode materializes it here,
++         * once, and every later entry finds it already there.
++         */
++        if (unlikely(b->regvm_pic == NULL && b->regvm_pic_count != 0)) {
++            if (regvm_pic_ensure(rt, b) == NULL) {
++                JS_ThrowOutOfMemory(ctx);
++                goto exception;
++            }
++        }
+         uint8_t *rpc;
+         /* The monolith's own read-cache base. The threaded chain keeps its own
+            in `run.pic`; a fill re-points whichever frame it ran in, and the
+@@ -27151,8 +27183,7 @@
+                 int site = RD_U16();
+                 JSValue recv = var_buf[slot];
+                 JSValue val;
+-                if (site != REG_IC_NONE && pic != NULL &&
+-                    regvm_own_read_hit(pic, recv, site, &val)) {
++                if (regvm_own_read_hit(pic, recv, site, &val)) {
+                     SET_REG(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -27174,8 +27205,7 @@
+                 JSValue recv = (op == ROP_get_local_field) ? var_buf[slot]
+                                                           : arg_buf[slot];
+                 JSValue val;
+-                if (site != REG_IC_NONE && pic != NULL &&
+-                    regvm_own_read_hit(pic, recv, site, &val)) {
++                if (regvm_own_read_hit(pic, recv, site, &val)) {
+                     SET_REG(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -27199,8 +27229,7 @@
+                    encoder emitted a site. */
+                 js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
+ #endif
+-                if (site != REG_IC_NONE && pic != NULL &&
+-                    regvm_own_read_hit(pic, regs[r], site, &val)) {
++                if (regvm_own_read_hit(pic, regs[r], site, &val)) {
+                     SET_REG(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -27221,8 +27250,7 @@
+                 JSAtom atom = RD_U32();
+                 int site = RD_U16();
+                 JSValue val;
+-                if (site != REG_IC_NONE && pic != NULL &&
+-                    regvm_own_read_hit(pic, regs[r], site, &val)) {
++                if (regvm_own_read_hit(pic, regs[r], site, &val)) {
+                     SET_REG(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -27248,9 +27276,8 @@
+                  * VM's cold handler asks for exactly this. The receiver is the
+                  * object itself, as there.
+                  */
+-                if (site != REG_IC_NONE) {
+-                    if (pic != NULL &&
+-                        JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
++                {
++                    if (JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
+                         JSObject *p = JS_VALUE_GET_OBJ(regs[r]);
+                         JSRegPIC *e = &pic[site];
+ 
+@@ -29914,8 +29941,7 @@
+                     int site = RD_U16();
+                     JSValue recv = f->var_buf[slot];
+                     JSValue val;
+-                    if (site != REG_IC_NONE && f->pic != NULL &&
+-                        regvm_own_read_hit(f->pic, recv, site, &val)) {
++                    if (regvm_own_read_hit(f->pic, recv, site, &val)) {
+                         SET_REG(d, val);
+                         REGVM_NEXT();
+                     }
+@@ -29939,8 +29965,7 @@
+                     JSValue recv = (op == ROP_get_local_field) ? f->var_buf[slot]
+                                                               : f->arg_buf[slot];
+                     JSValue val;
+-                    if (site != REG_IC_NONE && f->pic != NULL &&
+-                        regvm_own_read_hit(f->pic, recv, site, &val)) {
++                    if (regvm_own_read_hit(f->pic, recv, site, &val)) {
+                         SET_REG(d, val);
+                         REGVM_NEXT();
+                     }

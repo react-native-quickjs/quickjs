@@ -1,0 +1,183 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22798,6 +22798,8 @@
+ #define T_SZ_R      3    /* "r"     */
+ #define T_SZ_RI     4    /* "ri"    */
+ #define T_SZ_RU     5    /* "ru"    */
++#define T_SZ_RI_S   3    /* "ri"    one-byte register */
++#define T_SZ_RR_S   3    /* "rr"    one-byte registers */
+ #define T_SZ_RBC    8    /* "rbc"   */
+ #define T_SZ_RAB    8    /* "rab"   */
+ #define T_SZ_RRAS  11    /* "rras"  */
+@@ -23077,6 +23079,7 @@
+ static uint8_t *REGVM_CC regvm_t_load_true(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_load_false(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_load_i8(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_load_i8_s(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_load_const(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_load_const_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_load_this(REGVM_ARGS);
+@@ -23089,6 +23092,7 @@
+ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_move_s(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_move_xfer(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_local(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_local_s0(REGVM_ARGS);
+@@ -23261,6 +23265,7 @@
+     X(load_true, regvm_t_load_true) \
+     X(load_false, regvm_t_load_false) \
+     X(load_i8, regvm_t_load_i8) \
++    X(load_i8_s, regvm_t_load_i8_s) \
+     X(add_brand, regvm_t_cold) \
+     X(add_imm_s, regvm_t_cold) \
+     X(add_imm_self_s, regvm_t_cold) \
+@@ -23380,6 +23385,7 @@
+     X(load_const, regvm_t_load_const) \
+     X(load_this, regvm_t_load_this) \
+     X(move, regvm_t_move) \
++    X(move_s, regvm_t_move_s) \
+     X(move_xfer, regvm_t_move_xfer) \
+     X(get_local, regvm_t_get_local) \
+     X(get_local_s0, regvm_t_get_local_s0) \
+@@ -23974,6 +23980,9 @@
+ static uint8_t *REGVM_CC regvm_t_load_i8(REGVM_ARGS)
+ { T_SET_NEXT(T_REG(1), js_int32((int8_t)ip[3]), T_SZ_RI); }
+ 
++static uint8_t *REGVM_CC regvm_t_load_i8_s(REGVM_ARGS)
++{ T_SET_NEXT(T_REG8(1), js_int32((int8_t)ip[2]), T_SZ_RI_S); }
++
+ /* Keep hot opcodes out of the shared cold-opcode switch. These bodies mirror
+    their monolithic L_ROP_* cases; operand offsets come from regvm_rop_fmt. */
+ static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS)
+@@ -24148,6 +24157,16 @@
+     if (d != s)
+         T_SET_NEXT(d, js_dup(fr[s]), T_SZ_RR);
+     T_NEXT(T_SZ_RR);
++}
++
++static uint8_t *REGVM_CC regvm_t_move_s(REGVM_ARGS)
++{
++    int d = T_REG8(1);
++    int s = T_REG8(2);
++
++    if (d != s)
++        T_SET_NEXT(d, js_dup(fr[s]), T_SZ_RR_S);
++    T_NEXT(T_SZ_RR_S);
+ }
+ 
+ /* The transfer form's overwrite really can free, so it needs the record: the
+@@ -25416,6 +25435,7 @@
+             [ROP_load_const] = &&L_ROP_load_const,
+             [ROP_private_symbol] = &&L_ROP_private_symbol,
+             [ROP_load_i8] = &&L_ROP_load_i8,
++            [ROP_load_i8_s] = &&L_ROP_load_i8_s,
+             [ROP_load_i32] = &&L_ROP_load_i32,
+             [ROP_load_undefined] = &&L_ROP_load_undefined,
+             [ROP_load_null] = &&L_ROP_load_null,
+@@ -25426,6 +25446,7 @@
+             [ROP_new_object] = &&L_ROP_new_object,
+             [ROP_object_template] = &&L_ROP_object_template,
+             [ROP_move] = &&L_ROP_move,
++            [ROP_move_s] = &&L_ROP_move_s,
+             [ROP_move_xfer] = &&L_ROP_move_xfer,
+             [ROP_put_local_xfer] = &&L_ROP_put_local_xfer,
+             [ROP_put_local_xfer_s0] = &&L_ROP_put_local_xfer_s0,
+@@ -25936,6 +25957,8 @@
+         REGVM_NEXT();
+             L_ROP_load_i8:
+                 { int d = RD_REG(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
++            L_ROP_load_i8_s:
++                { int d = RD_U8(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i32:
+                 { int d = RD_REG(); SET_REG(d, js_int32(RD_I32())); REGVM_NEXT(); }
+             L_ROP_load_bigint_i32:
+@@ -26057,6 +26080,9 @@
+                    destination onto its source, and duplicating there would
+                    strand a reference. */
+                 { int d = RD_REG(); int s = RD_REG();
++                  if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
++            L_ROP_move_s:
++                { int d = RD_U8(); int s = RD_U8();
+                   if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
+             L_ROP_get_local:
+                 { int d = RD_REG(); int slot = RD_U16();
+@@ -52469,6 +52495,7 @@
+     [ROP_load_const] = "rbc",
+     [ROP_private_symbol] = "ra",
+     [ROP_load_i8] = "ri",
++    [ROP_load_i8_s] = "ri",
+     [ROP_load_i32] = "rI",
+     [ROP_load_undefined] = "r",
+     [ROP_load_null] = "r",
+@@ -52479,6 +52506,7 @@
+     [ROP_new_object] = "r",
+     [ROP_object_template] = "ru",
+     [ROP_move] = "rr",
++    [ROP_move_s] = "rr",
+     [ROP_move_xfer] = "rr",
+     [ROP_put_local_xfer] = "ur",
+     [ROP_put_local_xfer_s0] = "r",
+@@ -52767,7 +52795,8 @@
+  */
+ static int regvm_rop_narrow(uint16_t rop)
+ {
+-    return rop == ROP_branch_cmp_reg_reg_s || rop == ROP_binary_imm_s ||
++    return rop == ROP_load_i8_s || rop == ROP_move_s ||
++           rop == ROP_branch_cmp_reg_reg_s || rop == ROP_binary_imm_s ||
+            rop == ROP_branch_s ||
+            (rop >= ROP_branch_lt_s && rop <= ROP_branch_neq_s) ||
+            rop == ROP_add_imm_s || rop == ROP_sub_imm_s ||
+@@ -52883,6 +52912,12 @@
+     switch (in->rop) {
+     case ROP_branch_s:
+         in->rop = ROP_branch;
++        return 0;
++    case ROP_load_i8_s:
++        in->rop = ROP_load_i8;
++        return 0;
++    case ROP_move_s:
++        in->rop = ROP_move;
+         return 0;
+     case ROP_binary_imm_s:
+         in->rop = ROP_binary_imm;
+@@ -54384,6 +54419,13 @@
+             }
+         } else if (in->rop == ROP_branch) {
+             in->rop = ROP_branch_s;
++        } else if (in->rop == ROP_load_i8 || in->rop == ROP_move) {
++            a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
++            b = in->rop == ROP_move
++                    ? regvm_reg_of(in, 1, ireg, n_values, scratch_reg, win_base, cycle_reg)
++                    : a;
++            if (a >= 0 && a < 256 && b >= 0 && b < 256)
++                in->rop = (uint16_t)(in->rop == ROP_move ? ROP_move_s : ROP_load_i8_s);
+         } else if (in->rop == ROP_add_imm_self_branch) {
+             a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
+             if (a >= 0 && a < 256)
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -687,6 +687,13 @@
+     ROP_strict_eq, ROP_strict_neq, ROP_instanceof, ROP_in,
+     ROP_neg, ROP_inc, ROP_dec, ROP_not, ROP_to_numeric,
+ 
++    /*
++     * D6 compact register forms: the same operations with every register
++     * operand one byte wide. The D5 forms above remain available when a
++     * physical register does not fit. Appended so no earlier opcode moves.
++     */
++    ROP_load_i8_s, ROP_move_s,
++
+     ROP_COUNT
+ } JSRegOpcode;
+ 
+@@ -743,7 +750,7 @@
+  * cross-VM one does. Bump it whenever an opcode is added, removed or
+  * renumbered, or an operand's width or meaning changes.
+  */
+-#define REGVM_FORMAT_VERSION 10
++#define REGVM_FORMAT_VERSION 11
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */

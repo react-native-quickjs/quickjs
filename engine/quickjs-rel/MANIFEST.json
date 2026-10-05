@@ -407,18 +407,285 @@
       "sha256": "08a51dac154cfc8224eab7c055317e3765f17ce2ce1e24896ca57c0b20eb40dd"
     },
     {
+      "name": "0107-register-vm-backend.patch",
+      "sha256": "e367e28b5783b5dcfe10792f90d8c0b2a7c99777155ac72bf85eb23931ac2120"
+    },
+    {
+      "name": "0108-register-vm-homes.patch",
+      "sha256": "cd606b6566cd722fb3754b9c5e049e6df0bcd16a5636bb1041bf239173e03098"
+    },
+    {
+      "name": "0109-register-vm-alias-and-leak-fixes.patch",
+      "sha256": "06cb3556110f119eb19835c776228ce3415d936bec07e6bb39aa3abc47f78bc5"
+    },
+    {
+      "name": "0110-empty-liveness-bitsets.patch",
+      "sha256": "ab88b90a92ac2a2bac3f383f5f9d579082184720c5b71c8d451a737297e90e49"
+    },
+    {
+      "name": "0111-threaded-dispatch-no-null-check.patch",
+      "sha256": "27ce392951d37aa7f73f2ba43ea8fba2169dd00666d66998a6c1de220fae838e"
+    },
+    {
+      "name": "0112-preserve-none-threaded-handlers.patch",
+      "sha256": "d2c0ca6f32e8d2398061e70453957560f77706b53eaaff2043afa4f6e568bf9f"
+    },
+    {
+      "name": "0113-thread-hot-cold-opcodes.patch",
+      "sha256": "ec453d6c6f2ccc1476fc69488050c3d3ed15e103b77a72f5d8579ee2e354429a"
+    },
+    {
+      "name": "0114-homes-on-by-default.patch",
+      "sha256": "7e534aeb30671f4986fc7a4eee3981d15ea1b40088f67d13aca8b653dd94009f"
+    },
+    {
+      "name": "0115-narrow-load-move-opcodes.patch",
+      "sha256": "135aade9d79939131acbcfc0c3c1d9d0aa322afe8c913121c79b4f6acc414817"
+    },
+    {
+      "name": "0116-register-pic-sites.patch",
+      "sha256": "42dd2ba1f957b09614918c9de9446095d189be3af8ee68ce6f14816e5331634d"
+    },
+    {
+      "name": "0117-regvm-pic-ownership.patch",
+      "sha256": "53d8c9fbebcf60475d10c35bfe1bf852a64db6fd74a099ef19af7ca4bf71a234"
+    },
+    {
+      "name": "0118-regvm-pic-fill-and-hit.patch",
+      "sha256": "1e8375c33ce0712b8f07f15744da7ea2f5abc167251daba692e0390dbe75bb44"
+    },
+    {
+      "name": "0119-regvm-pic-merged-tag-test.patch",
+      "sha256": "6f22d84932f59704071e8585606fa583cf8ab9086ef856663c5aa2c9fea5a80f"
+    },
+    {
+      "name": "0120-regvm-release-sign-test.patch",
+      "sha256": "e4f5c6242721b2a1ee1a9c4122ddb0c1f2e156b23df7e1835b9f40468d5801a8"
+    },
+    {
+      "name": "0121-regvm-store-pic.patch",
+      "sha256": "5defd81c829585d74d89b0cdce1cf4edf2a59dc37c5295f77dc40a4f5df3e4e9"
+    },
+    {
+      "name": "0122-regvm-number-fast-paths.patch",
+      "sha256": "c5621296881b00d334a83f802b067ab253945899b8239f9bad948dbf96a3feea"
+    },
+    {
+      "name": "0123-regvm-ownership-dataflow.patch",
+      "sha256": "b64f87cc3959133ce878ec05b5dc08e01b4c16d28ee5a59300e7e9125676d140"
+    },
+    {
+      "name": "0124-regvm-rccheck-shadow.patch",
+      "sha256": "1789841f525265998c07af31eba0d1f3b13c0e5e85d56d2742bd84818d08f28a"
+    },
+    {
+      "name": "0125-regvm-release-call-elision.patch",
+      "sha256": "bf32f37f0e9804710a4743dbe923fb319521fce203162a5b0ccdcf65a47f73ec"
+    },
+    {
+      "name": "0126-regvm-own-init-analysis.patch",
+      "sha256": "d1776a175f57c2be548a06825415eb9cb3cad46714cb1f991e95fb38f8f4b6de"
+    },
+    {
+      "name": "0127-regvm-init-fill.patch",
+      "sha256": "6ecb345a579c97925703c913341b8b0adc4642335f07bd620fc2869122d22e9d"
+    },
+    {
+      "name": "0128-regvm-compare-fast-paths.patch",
+      "sha256": "d669ebd3121f2ce514c6f42adfc0fa88c6ab00390c99b931b40fe82acb4c87cd"
+    },
+    {
+      "name": "0129-regvm-pic-link-alloc.patch",
+      "sha256": "e6c3c5a59e594c8929067e6e61146be37752cace81a3818fb976a3b9d9fca47a"
+    },
+    {
+      "name": "0130-regvm-megacache-read.patch",
+      "sha256": "0e20666e0268f8a991903a790fc453a1289e446971bf7dac9915695992085405"
+    },
+    {
+      "name": "0131-regvm-arg-materialisation.patch",
+      "sha256": "108e94914fc6a258ef7615f6218907fe5e6507a5880765e10c08f22d525df137"
+    },
+    {
+      "name": "0132-regvm-shape-hashify.patch",
+      "sha256": "de4f26977a9aa45039596597d83d66eaf4a764d1a6879658ba6ea53a91efc895"
+    },
+    {
+      "name": "0133-regvm-prescaled-reg-operands.patch",
+      "sha256": "f67cee98f3a3c1bf91a877e6c1a7bcffe4d8064e80e7e5f2922c00ddc822aa26"
+    },
+    {
+      "name": "0134-regvm-property-read-hit-path.patch",
+      "sha256": "e751f3afb6d3fc195352713efd4942b67bcc86446c4dc098de8eb82c90c28fa4"
+    },
+    {
+      "name": "0135-regvm-float-arith-path.patch",
+      "sha256": "020aa444207b2e1ad19a50c20efa3f122d88f10f595c37367284b2ace7f085ca"
+    },
+    {
+      "name": "0136-regvm-inline-frame-release.patch",
+      "sha256": "867665faaa8a59f34686069533eba02e7128eef9d0ff3c1ec85ead70db325b09"
+    },
+    {
+      "name": "0137-regvm-fused-chain-read.patch",
+      "sha256": "456e2f9529da93f66db105952e56ce590fe39ee57123998b640dae5dda329334"
+    },
+    {
+      "name": "0138-regvm-fused-arith-pair.patch",
+      "sha256": "3effac26056a788171c76a573cb3c55ff8759c8c5a954d4d873d597c97dfdd4a"
+    },
+    {
+      "name": "0139-drc-root-registry.patch",
+      "sha256": "836006e38f75c683c4bbf9814f94ee766486abace1a91c3d8562cb131c4e8c78"
+    },
+    {
+      "name": "0140-drc-zero-count-table.patch",
+      "sha256": "f531d6f2de36fe0e87d7affe2c203d5b63f95b24543afe5b90128cff05eb446f"
+    },
+    {
+      "name": "0141-drc-exact-count-and-backedge.patch",
+      "sha256": "8d4f3b98cb897c23e1f036ba9b3595b1e7892d636e382214403b6f0fb13c3c0b"
+    },
+    {
+      "name": "0142-drc-registers-stop-owning.patch",
+      "sha256": "c07ecfcf5c2c829cf9ccb993ab8099e9b00569c859661beb5dfac122a8b5eabb"
+    },
+    {
+      "name": "0143-regvm-test262-parity.patch",
+      "sha256": "369ef4dfc3739aca776ddef15101fcacf7445201f189307daca774452ede8a49"
+    },
+    {
+      "name": "0144-regvm-borrow-reads-and-numeric-stores.patch",
+      "sha256": "f24f3b9a7290e4f7b4d87d3d09a22733c75bf77a35307203783c93d1b51d8cc1"
+    },
+    {
+      "name": "0145-regvm-strict-compare-undefined-fastpath.patch",
+      "sha256": "79ef31207a1e84ee44fbdf2f664ec46e5af5fb6774b93986fcfd3eeb6cf6185e"
+    },
+    {
+      "name": "0146-regvm-frame-fill-from-undefined-template.patch",
+      "sha256": "1853029a8ccd5fe6a17d71f902fcf24562ddace2e434b055dd878aa223bcd86e"
+    },
+    {
+      "name": "0147-regvm-fold-global-undefined-to-constant.patch",
+      "sha256": "177f7c9d8052f91e35299ce9bc1b8bdaf53596cd75947a33e06a0388890b47e5"
+    },
+    {
+      "name": "0148-regvm-chain-read-inline-second-link.patch",
+      "sha256": "b7ab0e28dd67c6f7ad7ace7f98d11bb030ac4339c83b11839c621d86c49acda0"
+    },
+    {
+      "name": "0149-regvm-two-way-read-pic.patch",
+      "sha256": "4ca5a41ee7f9cb464f98607b2ebf03030cd5559108474291cc44e5c560396bc7"
+    },
+    {
+      "name": "0150-regvm-fuse-undefined-strict-compare.patch",
+      "sha256": "b67fd713e378072a6b69cfcc7c13242d6b34f8a58d3cb51cdcd8a59b7162b9aa"
+    },
+    {
+      "name": "0151-regvm-precompute-call-descriptor.patch",
+      "sha256": "fbc31f0310a41f7266ec47ae7aa7b72bebfe4a3f7a989d7d74beeb63b3c52919"
+    },
+    {
+      "name": "0152-regvm-slim-call-frame-record.patch",
+      "sha256": "54c5206e2be2fde3cf6e7b561a05fe91b1509e0098dbc8b84be4ba0c25533151"
+    },
+    {
+      "name": "0153-regvm-materialize-frame-on-demand.patch",
+      "sha256": "c55aaa49e78e554de32ea9cdcccd1cf140399cda8764d44e23b6508084367a1c"
+    },
+    {
+      "name": "0154-regvm-inline-float-builtins-in-call-slow.patch",
+      "sha256": "2fb4e8da23db0ffc9973393974b2cfd898d5c8e565e589ff3219fc443a190c15"
+    },
+    {
+      "name": "0155-regvm-drc-own-captured-args.patch",
+      "sha256": "e898a7f76ce3dd22e6ce69c8648484bc231c476c516d39be2c8c4479e0483ba2"
+    },
+    {
+      "name": "0156-regvm-aot-profiler.patch",
+      "sha256": "eb6b82fcb18588b64be6e4fc8d893c0c4bb5bf8f30aae3c0bc4373ea80c980ed"
+    },
+    {
+      "name": "0157-regvm-step-helpers.patch",
+      "sha256": "ffa680377b09ce1a8c8edd06d5dc829a9ab256e9e69402a7cf4c131c5e688919"
+    },
+    {
+      "name": "0158-aot-unit.patch",
+      "sha256": "cd97df066333df1b3cbdb4fa9ddd9ca6dadb24833e177d0eecabfcafa440c3ed"
+    },
+    {
+      "name": "0159-regvm-nip-pop-leak.patch",
+      "sha256": "fbcac01901fbed4893367d8f7f68739f56a205bb5ba71b0935a5d57831f04ec1"
+    },
+    {
+      "name": "0160-aot-generators.patch",
+      "sha256": "aefea23169cd7b3d83e7e689ded528d08ce4d16c9134a9aba07d20c348f954e0"
+    },
+    {
+      "name": "0161-aot-layer-a.patch",
+      "sha256": "eb55b0dc68f35ac22b472601b290966ecb6cf32b39bec525f6f32d3446fb8722"
+    },
+    {
+      "name": "0162-aot-layer-b.patch",
+      "sha256": "ce1d9437a125b2b4f44ff51580bcdc42a0373ac095d5de522d0b82bbbef0443e"
+    },
+    {
+      "name": "0163-aot-p6-calls.patch",
+      "sha256": "608e06bbfa056b7b164e7a3164bfd60f9e25171e2ad3a31d28f84720363eb748"
+    },
+    {
+      "name": "0164-object-inline-capacity.patch",
+      "sha256": "890169aa49cda64ef408e6dc4272c5c4325d604506d345c1ccc76b6c5b08e21e"
+    },
+    {
+      "name": "0165-object-learned-inline-cap.patch",
+      "sha256": "1af1fa64f95e76a49960809aa743e164e90b23c114951a688b98a8512e119ea4"
+    },
+    {
+      "name": "0166-json-parse-shape-reuse.patch",
+      "sha256": "de03a9edcabe34af8489eeb67b5a185566ced69c508ad3a000cbe5751dd756de"
+    },
+    {
+      "name": "0167-regvm-stack-depth.patch",
+      "sha256": "19cd5d4cb8b02a04344b39e42d51d1df72aa24767ceffc9af7ecdf4b6495fdb3"
+    },
+    {
+      "name": "0168-regvm-arg-staging-index.patch",
+      "sha256": "ced15566c189ae6f988c9f1a4b7dea7eef9764e8cc06b8e9489ecdcb1a8897ec"
+    },
+    {
+      "name": "0169-regvm-tight-store-def.patch",
+      "sha256": "5db178f5d28ec27e50250cdbf1119db94e9d0a13ef1a3d318f35fbba7b170530"
+    },
+    {
+      "name": "0170-regvm-reads-pass-index.patch",
+      "sha256": "2b9adfb7e8110a8f68def09b81c08e564caa6321c042e60e54c39c8f8b1e7488"
+    },
+    {
+      "name": "0171-regvm-i2-verify.patch",
+      "sha256": "7c5662e8e3a10f1cea86c4ddbd04a354a69b36495e65f291b60289e4881c8683"
+    },
+    {
+      "name": "0172-regvm-drc-reconcile.patch",
+      "sha256": "71818e53c2e26f90051221bb83813799980d3060fd6b10d3775ecb5100f778b7"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "8d7aba12c97916c92933f389af483b2ad4636a7058ca206b09ba4f41694f07f8"
+      "sha256": "b57f190ffcbe2643bb81e395b1a823b7c7ccdaebaa45676a3ff979dfe8a2f4ed"
     }
   ],
   "files": {
-    "quickjs.c": "a28cb9e2ed5045827999ba6e032dd6dad4b5f11d325ba73a15bc01fe1f41fe78",
+    "quickjs.c": "3861807304aa0f45c8111b78391adc5daaa0e8c207a306c601535e0076cec8fb",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
-    "builtin-array-fromasync.h": "01b1cc446836039942b29be0172c5b233298978d59a5f518b34936521b7e647e",
-    "builtin-iterator-zip-keyed.h": "01086262c9700fbddbb61488dd6fcc86789233c70b16bda98b774932fd8442c9",
-    "builtin-iterator-zip.h": "25bb5a085e20bf40f8c4c4b7f3ab794be39fbe34428e4fde10cffc15f8057c26",
+    "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
+    "builtin-array-fromasync.regvm.h": "554c9bb60b47e5e2b129dcf467810f14de4c6a1c4913c4694d86aa5895f01185",
+    "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
+    "builtin-iterator-zip-keyed.regvm.h": "dbc09277d923d79d5299dd03dda7d5fb4f51cfcb94cfe1df09611e2c47be9cd1",
+    "builtin-iterator-zip.h": "1133567b87c8af0d6c3c680ec1a8fcfcba65acc975885477c2c688ac55f149bc",
+    "builtin-iterator-zip.regvm.h": "480b114caef122b12ecdf2901b26ffa4b8c770512e16ac2bd4325e873d4e27b2",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
@@ -430,6 +697,7 @@
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
+    "quickjs-regvm.h": "9bc3aee3b087bcee8e2ccceb108a2ac78fcf7eccb1f8dc648f1c0c82fa370a72",
     "quickjs.h": "84ff71a5aa30d2b0004672c6aedcb1aefc9b50cdb8745e2de1ab0c511634fb0e",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }

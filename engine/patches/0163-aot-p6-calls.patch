@@ -1,0 +1,830 @@
+From: quickjs-ng register-VM work
+Subject: AOT: call sites and source positions (P6)
+
+What this does
+  Adds the engine side of the P6 call-site lowerings and the 2.4 profile
+  source positions.
+
+  R1 prototype-epoch guard: a data write to an existing slot of a prototype
+  object now bumps ic_watchpoint_epoch, so a prototype method/global value
+  folded at bind time is invalidated when the prototype changes. A counter
+  rt->aot_epoch_bumps records the bumps and js_aot_stats_dump reports it.
+  qjs_aot_proto_fold folds a prototype read to a bind-time value and re-checks
+  the epoch (including a saturation guard at JS_IC_EPOCH_MAX). The fold is also
+  keyed on the receiver shape it came from: the two-way PIC can swap its primary
+  way between two prototype holders that share a shape (e.g. A.prototype.m and
+  B.prototype.m), and the epoch does not change on such a read, so without the
+  receiver-shape key a fold of A.prototype.m would be served for a B receiver.
+
+  Per-runtime site cache: rt->aot_sites, with aot_site_ensure/aot_site_store,
+  caches each call site's callee object and descriptor (bytecode digest, or
+  C function pointer + magic + cproto) per runtime rather than in a C static.
+
+  Direct compiled call: qjs_aot_call_b builds the callee frame exactly as
+  JS_CallInternal's no-copy-arguments path does and hands it to
+  js_regvm_execute, which dispatches straight to the callee's AOT entry.
+  Restricted to a non-lazy JS_FUNC_NORMAL bytecode callee compiled in the
+  unit, with uncaptured arguments and argc >= arg_count; otherwise it returns
+  0 and the caller falls back to the step engine. Exceptions cross back as -1.
+
+  Direct native C call: qjs_aot_call_c identity-guards the site, calls f_f and
+  f_f_f on unboxed doubles through the bound pointer, and routes
+  generic/generic_magic through js_call_c_function (realm, arg padding). The
+  profile's cproto guards the specialisation.
+
+  Source positions (2.4): regvm_encode_and_verify records one int32 source pc
+  per register-VM byte into a regvm_src_pc[] side table carried on
+  JSFunctionBytecode; aot_dump_one prints src=<line>:<col> on every L/R/S/C
+  profile line via find_line_num.
+
+Why we need it
+  Without a callee identity guard a cached call target can go stale when the
+  callee register or a prototype method changes. Without the epoch bump a
+  folded prototype method would keep calling the old function after the
+  prototype is written. The direct compiled call removes the generic call
+  dispatch for the common case where the callee is compiled in the same unit.
+  The source positions let a profile consumer map a hot site back to the JS
+  source.
+
+What it adds
+  quickjs.c
+      qjs_aot_call_b; qjs_aot_call_c; aot_site_ensure/aot_site_store;
+      qjs_aot_proto_fold; the is_prototype data-write bump; rt->aot_epoch_bumps
+      and its report; regvm_src_pc[] plumbing and aot_src_str.
+  quickjs-aot-rt.h
+      qjs_aot_call_b declaration.
+
+  Nothing here is compiled without -DQJS_REGVM; QJS_AOT is off by default.
+  Box2D checksum 546.1008391043414, test262-fast 50/81192, diff 398/0, ASan
+  clean. Mutants AOT_MUT_SKIP_CALLEE_GUARD, AOT_MUT_NO_ARG_PAD and
+  AOT_MUT_EPOCH_NO_DATA_WRITE_BUMP each turn a kernel red.
+
+diff --git a/quickjs.c b/quickjs.c
+index 2d14e9b..06d35b4 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -439,6 +439,27 @@ typedef struct JSValueLink {
+     JSValueConst value;
+ } JSValueLink;
+ 
++#if QJS_AOT
++/*
++ * P6: one bound call site. A generated call site guards the callee function
++ * object it first saw, so a specialised lowering (direct C call, f_f,
++ * intrinsic) is taken only while the same object is in the register. The
++ * binding is per runtime, keyed by the unit's site id, because more than one
++ * runtime can load the same unit; `expect` is a counted reference released at
++ * runtime free (simpler than a weak pointer, and the bound set is tiny).
++ */
++typedef struct JSAotSite {
++    JSValue expect;      /* counted value last bound (callee object / folded value) */
++    void *cfn;           /* kind 2: the C function pointer (generic / f_f) */
++    void *rshape;        /* kind 3: the receiver shape the fold came from */
++    uint8_t digest[16];  /* kind 1: the callee's own AOT digest */
++    uint32_t epoch;      /* ic_watchpoint_epoch at the last fold (kind 3) */
++    uint16_t magic;
++    uint8_t kind;        /* 0 unbound, 1 bytecode, 2 C, 3 folded proto value */
++    uint8_t cproto;
++} JSAotSite;
++#endif
++
+ #define JS_INTSTR_MAX 256
+ 
+ #define JS_CHAR2_K 1024
+@@ -605,6 +626,16 @@ struct JSRuntime {
+        an is_prototype object. Add-transition IC entries snapshot it and only hit while
+        it is unchanged. Saturates at JS_IC_EPOCH_MAX (then transition filling stops). */
+     uint32_t ic_watchpoint_epoch;
++    /* P6 R1: total prototype/global watchpoint bumps. The AOT prototype-epoch
++       guard assumes prototypes settle after startup, so this counts how often
++       that assumption is violated; reported by the profiler/stats dumps. */
++    uint64_t aot_epoch_bumps;
++
++#if QJS_AOT
++    /* P6 call-site bindings, indexed by the unit's site id. Lazily grown. */
++    JSAotSite *aot_sites;
++    uint32_t aot_site_count;
++#endif
+ 
+ #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
+     /*
+@@ -1277,6 +1308,7 @@ struct JSMegaEntry {
+    Identity only; the profiler holds no shape references. */
+ typedef struct JSAotProfSite {
+     uint32_t count;
++    int32_t pc;            /* regvm offset of the first op that filled it */
+     uint8_t nshapes;
+     JSShape *shapes[4];
+     uint32_t shape_hits[4];
+@@ -1302,8 +1334,10 @@ typedef struct JSAotProfCall {
+ typedef struct JSAotProfFunc {
+     uint64_t ops;
+     uint32_t entries;
++    int32_t last_pc;       /* regvm offset of the instruction about to run */
+     uint32_t *loop_iters;  /* indexed by regvm offset; size loop_n */
+     uint16_t *reg_types;   /* bitmask by register; size reg_n */
++    int32_t *reg_pc;       /* regvm offset of the first write to each register */
+     JSAotProfSite *sites;  /* size nsites */
+     JSAotProfCall *calls;
+     int ncalls;
+@@ -1442,6 +1476,11 @@ typedef struct JSFunctionBytecode {
+ #if QJS_AOT_PROFILE
+     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
+     JSAotProfFunc *aot_prof;
++    /* P0: stack pc of the instruction at each register-bytecode offset, so the
++       dump can print a source position (`src=<line>:<col>`) for every site.
++       One int32 per regvm byte; -1 at offsets that are not instruction starts.
++       Only a profile build allocates it. */
++    int32_t *regvm_src_pc;
+ #endif
+ #if QJS_AOT
+     /* AOT runtime (P2). The generated entry bound to this function, or NULL.
+@@ -1493,7 +1532,7 @@ void js_aot_prof_dump(JSRuntime *rt);
+ static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
+ #endif
+ static void js_aot_bind(JSFunctionBytecode *b);
+-void js_aot_stats_dump(void);
++void js_aot_stats_dump(JSRuntime *rt);
+ extern uint64_t js_aot_bound_count;
+ extern uint64_t js_aot_enter_count;
+ #endif
+@@ -3482,7 +3521,7 @@ void JS_FreeRuntime(JSRuntime *rt)
+ #endif
+ #if QJS_AOT
+     if (getenv("QJS_AOT_STATS"))
+-        js_aot_stats_dump();
++        js_aot_stats_dump(rt);
+ #endif
+     struct list_head *el, *el1;
+     bool leak = false;
+@@ -3513,6 +3552,23 @@ void JS_FreeRuntime(JSRuntime *rt)
+     }
+     init_list_head(&rt->job_list);
+ 
++#if QJS_AOT
++    /* Release the cached per-site callee references before the final collection.
++       A bound C callee (kind 2) holds a counted reference; a folded prototype
++       value (kind 3) is borrowed from the holder's slot and owns nothing. Holding
++       a counted reference across JS_RunGC would keep the callee's realm (and with
++       it every builtin, prototype and shape) reachable, so the whole realm leaks. */
++    if (rt->aot_sites) {
++        uint32_t si;
++        for (si = 0; si < rt->aot_site_count; si++)
++            if (rt->aot_sites[si].kind == 2)
++                JS_FreeValueRT(rt, rt->aot_sites[si].expect);
++        js_free_rt(rt, rt->aot_sites);
++        rt->aot_sites = NULL;
++        rt->aot_site_count = 0;
++    }
++#endif
++
+     /* The final collection has to break ctx -> global -> closure -> fnbc ->
+        ctx, whose last edge is counted but untraced.  Without this splice the
+        assert below fires, and in NDEBUG the realm leaks at every teardown. */
+@@ -7832,6 +7888,7 @@ static inline void ic_watchpoint_bump(JSRuntime *rt)
+ {
+     if (rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX)
+         rt->ic_watchpoint_epoch++;
++    rt->aot_epoch_bumps++;
+ }
+ 
+ /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
+@@ -13078,6 +13135,11 @@ static JSProperty *add_property(JSContext *ctx,
+                      __JS_AtomIsTaggedInt(prop))) {
+             ctx->std_array_prototype = false;
+         }
++#if JS_ENABLE_IC
++        /* P6 R1: a property added to any prototype changes what a folded
++           prototype-chain lookup would see, so invalidate the epoch. */
++        ic_watchpoint_bump(ctx->rt);
++#endif
+     }
+     sh = p->shape;
+     if (sh->is_hashed) {
+@@ -13609,6 +13671,14 @@ retry:
+         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+             /* fast case */
++#if JS_ENABLE_IC
++            /* P6 R1: overwriting an existing data slot on a prototype can
++               change a folded method/value, so invalidate the epoch. The
++               global object is covered separately by the global-var cell
++               cache (js_gv_cell_invalidate). */
++            if (unlikely(p1->is_prototype))
++                ic_watchpoint_bump(ctx->rt);
++#endif
+             set_value(ctx, &pr->u.value, val);
+             return true;
+         } else if (prs->flags & JS_PROP_LENGTH) {
+@@ -39218,6 +39288,10 @@ typedef struct JSFunctionDef {
+     JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
+     uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
+     uint16_t regvm_fill_count;
++#if QJS_AOT_PROFILE
++    /* P0: regvm-offset -> stack pc table, moved to the bytecode. */
++    int32_t *regvm_src_pc;
++#endif
+     /* Per-pc operand pops of each nip_catch, from compute_stack_size; NULL
+        when the function has none that pops more than its declared two. */
+     uint16_t *regvm_nip_pop;
+@@ -50470,6 +50544,10 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+     fd->regvm_nip_pop = NULL;
+     js_free(ctx, fd->regvm_code);
+     fd->regvm_code = NULL;
++#if QJS_AOT_PROFILE
++    js_free(ctx, fd->regvm_src_pc);
++    fd->regvm_src_pc = NULL;
++#endif
+ #endif
+     free_objlit_sites(ctx, fd);
+     js_free(ctx, fd->jump_slots);
+@@ -56670,6 +56748,9 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
+         pf->reg_types = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)pf->reg_n);
+         if (!pf->reg_types)
+             goto fail;
++        pf->reg_pc = js_mallocz_rt(rt, sizeof(int32_t) * (size_t)pf->reg_n);
++        if (!pf->reg_pc)
++            goto fail;
+     }
+     if (pf->nsites > 0) {
+         pf->sites = js_mallocz_rt(rt, sizeof(JSAotProfSite) * (size_t)pf->nsites);
+@@ -56681,6 +56762,7 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
+ fail:
+     js_free_rt(rt, pf->loop_iters);
+     js_free_rt(rt, pf->reg_types);
++    js_free_rt(rt, pf->reg_pc);
+     js_free_rt(rt, pf->sites);
+     js_free_rt(rt, pf);
+     return NULL;
+@@ -56708,6 +56790,7 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
+         }
+     }
+     pf->ops++;
++    pf->last_pc = (int32_t)(rpc - b->regvm_code);
+     if (*pprev && rpc < *pprev) {
+         int off = (int)(rpc - b->regvm_code);
+         if (off >= 0 && off < pf->loop_n)
+@@ -56725,6 +56808,8 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape)
+     if (!pf || site < 0 || site >= pf->nsites)
+         return;
+     s = &pf->sites[site];
++    if (s->count == 0)
++        s->pc = pf->last_pc;
+     s->count++;
+     for (i = 0; i < s->nshapes; i++) {
+         if (s->shapes[i] == shape) {
+@@ -56747,6 +56832,8 @@ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
+     if (reg < 0 || !pf || reg >= pf->reg_n)
+         return;
+     bit = aot_tag_class(v);
++    if (pf->reg_types[reg] == 0)
++        pf->reg_pc[reg] = pf->last_pc;
+     pf->reg_types[reg] |= bit;
+ }
+ 
+@@ -56843,10 +56930,13 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     JSAotProfFunc *pf = b->aot_prof;
+ 
++    js_free_rt(rt, b->regvm_src_pc);
++    b->regvm_src_pc = NULL;
+     if (!pf)
+         return;
+     js_free_rt(rt, pf->loop_iters);
+     js_free_rt(rt, pf->reg_types);
++    js_free_rt(rt, pf->reg_pc);
+     js_free_rt(rt, pf->sites);
+     js_free_rt(rt, pf->calls);
+     js_free_rt(rt, pf);
+@@ -56982,12 +57072,37 @@ static const char *aot_sym_name(JSRuntime *rt, void *p, char *buf, int n)
+     return NULL;
+ }
+ 
++static void aot_src_str(JSFunctionBytecode *b, int32_t regvm_off,
++                        char *out, size_t n)
++{
++    int col = 1, line;
++    int32_t src_pc, j;
++
++    if (!b->regvm_src_pc || b->regvm_len <= 0) {
++        snprintf(out, n, "?:?");
++        return;
++    }
++    j = regvm_off;
++    if (j >= b->regvm_len)
++        j = b->regvm_len - 1;
++    while (j >= 0 && b->regvm_src_pc[j] < 0)
++        j--;
++    if (j < 0) {
++        snprintf(out, n, "?:?");
++        return;
++    }
++    src_pc = b->regvm_src_pc[j];
++    line = find_line_num(NULL, b, (uint32_t)src_pc, &col);
++    snprintf(out, n, "%d:%d", line, col);
++}
++
+ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     JSAotProfFunc *pf = b->aot_prof;
+     uint8_t dg[16];
+     char dgt[33];
+     char name[256], file[256];
++    char src[32];
+     int i, j;
+ 
+     if (!pf || pf->ops == 0)
+@@ -57000,20 +57115,24 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
+             dgt, name, file, b->line_num,
+             (unsigned long long)pf->ops, pf->entries, b->regvm_len);
+     for (i = 0; i < pf->loop_n; i++)
+-        if (pf->loop_iters[i])
+-            fprintf(f, "L %s pc=%d iters=%u\n", dgt, i, pf->loop_iters[i]);
++        if (pf->loop_iters[i]) {
++            aot_src_str(b, i, src, sizeof(src));
++            fprintf(f, "L %s pc=%d iters=%u src=%s\n", dgt, i, pf->loop_iters[i], src);
++        }
+     for (i = 0; i < pf->reg_n; i++) {
+         if (pf->reg_types[i]) {
+             char ts[128];
+             aot_type_str(pf->reg_types[i], ts, sizeof(ts));
+-            fprintf(f, "R %s reg=%d types=%s\n", dgt, i, ts);
++            aot_src_str(b, pf->reg_pc[i], src, sizeof(src));
++            fprintf(f, "R %s reg=%d types=%s src=%s\n", dgt, i, ts, src);
+         }
+     }
+     for (i = 0; i < pf->nsites; i++) {
+         JSAotProfSite *s = &pf->sites[i];
+         if (!s->count)
+             continue;
+-        fprintf(f, "S %s site=%d count=%u shapes=%u", dgt, i, s->count, s->nshapes);
++        aot_src_str(b, s->pc, src, sizeof(src));
++        fprintf(f, "S %s site=%d count=%u src=%s shapes=%u", dgt, i, s->count, src, s->nshapes);
+         for (j = 0; j < s->nshapes; j++)
+             fprintf(f, " shape%d=%p hits=%u", j, (void *)s->shapes[j],
+                     s->shape_hits[j]);
+@@ -57025,8 +57144,11 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
+             continue;
+         for (j = 0; j < c->ncallee; j++) {
+             JSAotProfCallee *ce = &c->callee[j];
+-            fprintf(f, "C %s pc=%u count=%u argc=%u..%u ", dgt, c->pc, c->count,
+-                    c->argc_min == 255 ? 0 : c->argc_min, c->argc_max);
++            /* c->pc is the offset just past the call opcode; the call itself
++               is the preceding instruction start. */
++            aot_src_str(b, (int32_t)c->pc - 1, src, sizeof(src));
++            fprintf(f, "C %s pc=%u count=%u argc=%u..%u src=%s ", dgt, c->pc, c->count,
++                    c->argc_min == 255 ? 0 : c->argc_min, c->argc_max, src);
+             if (ce->kind == 1) {
+                 char cd[33];
+                 aot_digest_hex(ce->digest, cd);
+@@ -57101,15 +57223,16 @@ static int aot_unit_present(void)
+ uint64_t js_aot_bound_count;
+ uint64_t js_aot_enter_count;
+ 
+-void js_aot_stats_dump(void)
++void js_aot_stats_dump(JSRuntime *rt)
+ {
+     int present = aot_unit_present();
+     unsigned count = present ? (unsigned)qjs_aot_count : 0u;
+ 
+-    fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu\n",
++    fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu\n",
+             present, count,
+             (unsigned long long)js_aot_bound_count,
+-            (unsigned long long)js_aot_enter_count);
++            (unsigned long long)js_aot_enter_count,
++            (unsigned long long)rt->aot_epoch_bumps);
+ }
+ 
+ /*
+@@ -57280,6 +57403,13 @@ __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRu
+             JSValue *slot = (JSValue *)((char *)p->prop + e->slot_off);
+             JSValue old = *slot;
+ 
++#ifndef AOT_MUT_EPOCH_NO_DATA_WRITE_BUMP
++            /* P6 R1: a direct slot store bypasses JS_SetPropertyInternal2, so it
++               must invalidate the prototype epoch itself — a folded prototype
++               value cached by qjs_aot_proto_fold would otherwise stay stale. */
++            if (unlikely(p->is_prototype))
++                ic_watchpoint_bump(ctx->rt);
++#endif
+             *slot = js_dup(v);
+             JS_FreeValue(ctx, old);
+             return 1;
+@@ -57546,6 +57676,293 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+     }
+     return JS_EXCEPTION;
+ }
++
++/* ------------------------------------------------------------------------ */
++/* P6 (plan 8): the prototype watchpoint epoch and the per-runtime call-site  */
++/* bindings. The unit embeds one descriptor per call site from the profile;   */
++/* the engine keeps the bound callee (and its C prototype) per runtime.       */
++/* ------------------------------------------------------------------------ */
++
++uint32_t qjs_aot_epoch(JSContext *ctx)
++{
++    return ctx->rt->ic_watchpoint_epoch;
++}
++
++/* Borrowed bound value for a site, or JS_UNDEFINED when unbound. */
++JSValue qjs_aot_site_expect(JSContext *ctx, int site)
++{
++    JSRuntime *rt = ctx->rt;
++
++    if ((uint32_t)site < rt->aot_site_count)
++        return rt->aot_sites[site].expect;
++    return JS_UNDEFINED;
++}
++
++static int aot_site_ensure(JSRuntime *rt, uint32_t site)
++{
++    JSAotSite *ns;
++    uint32_t i, old = rt->aot_site_count;
++
++    if (site < old)
++        return 1;
++    ns = js_realloc_rt(rt, rt->aot_sites, (size_t)(site + 1) * sizeof(*ns));
++    if (!ns)
++        return 0;
++    rt->aot_sites = ns;
++    for (i = old; i <= site; i++) {
++        ns[i].expect = JS_UNDEFINED;
++        ns[i].kind = 0;
++        ns[i].cfn = NULL;
++        ns[i].rshape = NULL;
++        ns[i].magic = 0;
++        ns[i].cproto = 0;
++        ns[i].epoch = 0;
++        memset(ns[i].digest, 0, sizeof(ns[i].digest));
++    }
++    rt->aot_site_count = site + 1;
++    return 1;
++}
++
++static void aot_site_store(JSRuntime *rt, JSAotSite *e, int kind, JSValue v,
++                           void *cfn, int magic, int cproto)
++{
++    JSValue old = e->expect;
++
++    e->expect = JS_DupValueRT(rt, v);
++    e->kind = (uint8_t)kind;
++    e->cfn = cfn;
++    e->magic = (uint16_t)magic;
++    e->cproto = (uint8_t)cproto;
++    e->epoch = rt->ic_watchpoint_epoch;
++    JS_FreeValueRT(rt, old);
++}
++
++/*
++ * P6 (plan 8.2 item 2): direct compiled call. When the callee is a bytecode
++ * function compiled into this unit, build its frame here -- the same layout
++ * JS_CallInternal uses on its no-copy-arguments path -- and hand it to the
++ * register interpreter, which dispatches straight to the callee's AOT entry.
++ * Restricted to the cases whose frame setup is exactly that path: a non-lazy
++ * JS_FUNC_NORMAL body, uncaptured arguments, and argc >= arg_count. Anything
++ * else returns 0 and the caller falls back to the step engine (the ordinary
++ * interpreter call). Returns 1 with an owned *out, 0 to fall back, -1 on
++ * exception.
++ */
++int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
++                   JSValue this_obj, JSValue *argv, JSValue *out)
++{
++    JSRuntime *rt = caller_ctx->rt;
++    JSObject *p;
++    JSFunctionBytecode *b;
++    JSStackFrame sf_s, *sf = &sf_s;
++    JSValue *local_buf, *var_buf, *stack_buf, *arg_buf, *sp;
++    uint8_t *pc;
++    size_t alloca_size;
++    int i;
++    JSValue ret_val;
++
++    if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(callee);
++    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
++        return 0;
++    b = p->u.func.function_bytecode;
++    if (b->aot_fn == NULL || b->is_lazy || b->lazy_failed)
++        return 0;
++    if (b->func_kind != JS_FUNC_NORMAL)
++        return 0;
++    if (b->args_captured || na < b->arg_count)
++        return 0;
++    if (js_poll_interrupts(caller_ctx))
++        return -1;
++    alloca_size = sizeof(JSValue) * (b->var_count + b->regvm_reg_count + REGVM_HS) +
++        sizeof(JSVarRef *) * b->var_ref_count +
++        sizeof(JSRegCtl) * b->regvm_ctl_count;
++    if (js_check_stack_overflow(rt, alloca_size)) {
++        JS_ThrowStackOverflow(caller_ctx);
++        return -1;
++    }
++    sf->is_strict_mode = b->is_strict_mode;
++    sf->is_constructor = false;
++    arg_buf = argv;
++    sf->arg_count = na;
++    sf->cur_func = unsafe_unconst(callee);
++    local_buf = alloca(alloca_size);
++    var_buf = local_buf;
++    sf->var_buf = var_buf;
++    sf->arg_buf = arg_buf;
++    for (i = 0; i < b->var_count; i++)
++        var_buf[i] = JS_UNDEFINED;
++    stack_buf = var_buf + b->var_count;
++    sf->var_refs = (JSVarRef **)(stack_buf + b->regvm_reg_count + REGVM_HS);
++    sf->var_ref_count = b->var_ref_count;
++    for (i = 0; i < b->var_ref_count; i++)
++        sf->var_refs[i] = NULL;
++    sf->cur_gc_obj = NULL;
++    REGVM_SET_ROOT(sf, stack_buf, b->regvm_reg_count + REGVM_HS - 1);
++    sp = stack_buf;
++    pc = b->byte_code_buf;
++    sf->cur_pc = NULL;
++    sf->prev_frame = rt->current_stack_frame;
++    rt->current_stack_frame = sf;
++    ret_val = js_regvm_execute(caller_ctx, callee, this_obj, JS_UNDEFINED, na, argv,
++                               sf, b, local_buf, arg_buf, var_buf, stack_buf, sp, pc,
++                               0, 0);
++    *out = ret_val;
++    return JS_IsException(ret_val) ? -1 : 1;
++}
++
++/*
++ * Try to take the specialised C-call path for `callee(this, argv[0..na-1])`.
++ * `cproto` is the C prototype the profile saw at the site (-1 = any). Returns
++ * 1 with *out set, 0 to fall back to the step engine, or -1 on an exception.
++ * The f_f / f_f_f paths call the *bound* function pointer, so the identity
++ * guard is what keeps them sound when the callee register changes.
++ */
++int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
++                   JSValue this_obj, JSValue *argv, JSValue *out)
++{
++    JSRuntime *rt = ctx->rt;
++    JSAotSite *e;
++    JSObject *p;
++    int bound;
++
++    if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(callee);
++    if (p->class_id != JS_CLASS_C_FUNCTION)
++        return 0;
++    if (!aot_site_ensure(rt, (uint32_t)site))
++        return 0;
++    e = &rt->aot_sites[site];
++#ifdef AOT_MUT_SKIP_CALLEE_GUARD
++    /* Gate mutant (plan 8.4): accept whatever C function arrives at the site,
++       so the bound pointer goes stale and the wrong function is called. */
++    bound = (e->kind == 2);
++#else
++    bound = (e->kind == 2 && JS_VALUE_GET_OBJ(e->expect) == p);
++#endif
++    if (!bound) {
++        if (cproto >= 0 && (int)p->u.cfunc.cproto != cproto)
++            return 0;
++        aot_site_store(rt, e, 2, callee, (void *)p->u.cfunc.c_function.generic,
++                       (int)p->u.cfunc.magic, (int)p->u.cfunc.cproto);
++    }
++
++    if (e->cproto == JS_CFUNC_f_f && na == 1) {
++        double d1;
++#ifndef AOT_MUT_WRONG_REALM
++        if (p->u.cfunc.realm != ctx)
++            return 0;
++#endif
++        if (JS_ToFloat64(ctx, &d1, argv[0]))
++            return -1;
++        if (js_poll_interrupts(ctx))
++            return -1;
++        *out = js_number(((double (*)(double))e->cfn)(d1));
++        return 1;
++    }
++    if (e->cproto == JS_CFUNC_f_f_f && na == 2) {
++        double d1, d2;
++#ifndef AOT_MUT_WRONG_REALM
++        if (p->u.cfunc.realm != ctx)
++            return 0;
++#endif
++        if (JS_ToFloat64(ctx, &d1, argv[0]) || JS_ToFloat64(ctx, &d2, argv[1]))
++            return -1;
++        if (js_poll_interrupts(ctx))
++            return -1;
++        *out = js_number(((double (*)(double, double))e->cfn)(d1, d2));
++        return 1;
++    }
++    if (e->cproto == JS_CFUNC_generic || e->cproto == JS_CFUNC_generic_magic) {
++        JSValue rv;
++#ifdef AOT_MUT_NO_ARG_PAD
++        /* Gate mutant (plan 8.4): call with the raw argc instead of padding to
++           the function's declared length. A host function that reads a formal
++           parameter it was not passed sees stale register data. */
++        if (e->cproto == JS_CFUNC_generic) {
++            rv = ((JSCFunction *)e->cfn)(ctx, this_obj, na, argv);
++        } else
++#endif
++        {
++            rv = js_call_c_function(ctx, callee, this_obj, na, argv, 0);
++        }
++        if (JS_IsException(rv))
++            return -1;
++        *out = rv;
++        return 1;
++    }
++    return 0;
++}
++
++/*
++ * R1 (plan 8.0): fold a prototype property read to a bind-time value. Only a
++ * read that the PIC resolved to a prototype is foldable, because the epoch
++ * bump on a data write to a prototype is what keeps the folded value live. A
++ * miss (own property, shape change, no PIC, or the lazy-JSON marker) returns
++ * 0 and the caller runs the ordinary template, which refills the PIC.
++ *
++ * The fold is keyed on the receiver shape it came from as well as the epoch.
++ * The register PIC is two-way and its primary way can swap (a polymorphic
++ * method site alternates between, say, A.prototype.m and B.prototype.m, whose
++ * holders have the SAME shape because both are one-property prototypes). The
++ * epoch does not change on such a read, so without the receiver-shape key a
++ * fold of A.prototype.m would be served for a B receiver once the primary way
++ * had swapped to B. `e->rshape` is only ever compared, never dereferenced, so
++ * a stale entry cannot be followed.
++ */
++int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
++                       JSValue recv, int pic_site, JSValue *out)
++{
++    JSRuntime *rt = ctx->rt;
++    const JSRegPIC *pe = &((const JSRegPIC *)pic)[pic_site];
++    JSAotSite *e;
++    JSObject *p, *holder;
++    JSValue v;
++
++    if (pe->kind != REG_PIC_PROTO)
++        return 0;
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(recv);
++    if (pe->shape != p->shape)
++        return 0;
++    holder = p->shape->proto;
++    if (!holder || !f->b->regvm_pic_holder ||
++        holder->shape != f->b->regvm_pic_holder[pic_site])
++        return 0;
++    if (!aot_site_ensure(rt, (uint32_t)site))
++        return 0;
++    e = &rt->aot_sites[site];
++    /* The epoch saturates at JS_IC_EPOCH_MAX: once it is pinned there, further
++       prototype writes are invisible, so a cached fold can no longer be
++       validated and must not hit (mirrors the engine's transition-fill stop at
++       saturation). Below the cap, an unchanged epoch proves the slot's value is
++       still the one we folded. */
++    if (e->kind == 3 && e->rshape == pe->shape &&
++        e->epoch == rt->ic_watchpoint_epoch &&
++        rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX) {
++        *out = js_dup(e->expect);
++        return 1;
++    }
++    v = *(JSValue *)((char *)holder->prop + pe->slot_off);
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON)
++        return 0;
++    /* Borrowed cache, exactly like js_gv_cell_peek: the holder's property slot
++       owns the value; the receiver-shape + holder-shape + epoch guard above
++       revalidates it on every hit, so no reference is taken here and the entry
++       is not freed at teardown (kind 3). */
++    e->expect = v;
++    e->kind = 3;
++    e->cfn = NULL;
++    e->rshape = pe->shape;
++    e->magic = 0;
++    e->cproto = 0;
++    e->epoch = rt->ic_watchpoint_epoch;
++    *out = js_dup(v);
++    return 1;
++}
+ #endif /* QJS_AOT */
+ 
+ #if QJS_AOT_GEN
+@@ -59157,7 +59574,11 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+                                    int win_size, int cycle_reg,
+                                    uint8_t **out_code, int *out_len,
+                                    int *out_regs, const int *rcc_canon,
+-                                   JSRegRCC **out_rcc)
++                                   JSRegRCC **out_rcc
++#if QJS_AOT_PROFILE
++                                   , int32_t **out_src_pc
++#endif
++                                   )
+ {
+     uint8_t *code = NULL;
+     int *insn_pc = NULL;
+@@ -59169,6 +59590,11 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+     int di = 0;
+     long long n_decoded = 0;
+ 
++#if QJS_AOT_PROFILE
++    if (out_src_pc)
++        *out_src_pc = NULL;
++#endif
++
+     if (regvm_uses_scratch(ir))
+         scratch_reg = reg_count++; /* one register above every value register */
+     if (win_size > 0) {
+@@ -59658,6 +60084,28 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+      */
+     n_decoded = ir->n_insns;
+ #endif
++#if QJS_AOT_PROFILE
++    /*
++     * P0 source positions (plan 2.4): one stack pc per register-bytecode offset,
++     * so the profiler dump can turn a regvm pc into `src=<line>:<col>`. Built
++     * last, where `insn_pc[]` and the layout are final and every failure path is
++     * behind us. A failed allocation just omits source positions; it is not a
++     * reason to refuse the program.
++     */
++    if (out_src_pc) {
++        int32_t *sp = js_malloc(ctx, (code_len > 0 ? code_len : 1) * sizeof(int32_t));
++        *out_src_pc = sp;
++        if (sp) {
++            for (i = 0; i < code_len; i++)
++                sp[i] = -1;
++            for (i = 0; i < ir->n_insns; i++) {
++                int pc0 = insn_pc[i];
++                if (pc0 >= 0 && pc0 < code_len)
++                    sp[pc0] = ir->insns[i].src_pc;
++            }
++        }
++    }
++#endif
+ 
+     js_regvm_stats.encoded_insns += ir->n_insns;
+     js_regvm_stats.encoded_bytes += code_len;
+@@ -63662,6 +64110,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+             fd->regvm_rcc = NULL;
+             fd->regvm_fill = NULL;
+             fd->regvm_fill_count = 0;
++#if QJS_AOT_PROFILE
++            fd->regvm_src_pc = NULL;
++#endif
+             er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
+                                                               are two bytes */,
+                                              reg_count,
+@@ -63672,7 +64123,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                                              &fd->regvm_len,
+                                              &fd->regvm_reg_count,
+                                              rcc_canon,
+-                                             &fd->regvm_rcc);
++                                             &fd->regvm_rcc
++#if QJS_AOT_PROFILE
++                                             , &fd->regvm_src_pc
++#endif
++                                             );
+ 
+ #if QJS_REGVM_THREAD
+             /*
+@@ -67156,6 +67611,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+         fd->regvm_fill_count = 0;
+         b->regvm_compiled = 1;
+         b->regvm_all_threaded = fd->regvm_all_threaded;
++#if QJS_AOT_PROFILE
++        b->regvm_src_pc = fd->regvm_src_pc;
++        fd->regvm_src_pc = NULL;
++#endif
+         memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
+         js_free(ctx, fd->regvm_code);
+         fd->regvm_code = NULL;
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index 91da369..632bf09 100644
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -181,4 +181,30 @@ JSValue qjs_aot_field_read(JSValue recv, int slot_off);
+ int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
+ JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
+ 
++/*
++ * --- P6 call-site helpers -------------------------------------------------
++ *
++ * R1 (plan 8.0): the prototype watchpoint epoch. The unit reads it once at
++ * function entry; a change means a prototype was mutated and any folded value
++ * must be re-read.
++ */
++uint32_t qjs_aot_epoch(JSContext *ctx);
++JSValue qjs_aot_site_expect(JSContext *ctx, int site);
++
++/* The specialised C-call path (plan 8.2): 1 with an owned *out, 0 to fall back
++   to the step engine, -1 on exception. `cproto` is the profile's prototype. */
++int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
++                   JSValue this_obj, JSValue *argv, JSValue *out);
++
++/* Direct compiled call (plan 8.2 item 2): 1 with an owned *out, 0 to fall back
++   to the step engine, -1 on exception. Only the restricted no-copy frame case
++   is handled; everything else falls back. */
++int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
++                   JSValue *argv, JSValue *out);
++
++/* R1 folded prototype read (plan 8.0): 1 with an owned *out when the PIC site
++   still resolves to the same prototype slot and the epoch is unchanged. */
++int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
++                       JSValue recv, int pic_site, JSValue *out);
++
+ #endif /* QUICKJS_AOT_RT_H */

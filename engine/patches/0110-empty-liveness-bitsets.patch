@@ -1,0 +1,31 @@
+Subject: Skip the empty register liveness bitmap walk
+
+What this does
+  Skips the block liveness extension when a function has no register values.
+  This avoids forming pointers from absent bitmaps.
+
+Why we need it
+  The register allocator does not allocate liveness bitmaps when a function has
+  no SSA values. The later interval extension still formed pointers from those
+  null bitmaps, which UBSan reports as undefined behavior.
+
+What it adds
+  An empty-value guard on the block walk.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -59376,7 +59376,10 @@
+          * body would be free to take the register. So every value's interval is
+          * grown to cover each block it is live in, start as well as end.
+          */
+-        for (b = 0; b < n_blocks; b++) {
++        /* The bitsets are absent when no register values exist. In that case
++           there is no liveness to extend, and even adding a zero offset to the
++           null pointers is undefined behavior in C. */
++        for (b = 0; words > 0 && b < n_blocks; b++) {
+             uint64_t *bin, *bout;
+             if (in_depth[b] < 0)
+                 continue;

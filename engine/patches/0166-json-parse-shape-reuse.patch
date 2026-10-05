@@ -1,0 +1,301 @@
+From: quickjs-ng object-creation work
+Subject: Object creation: JSON.parse shape reuse (O3)
+
+What this does
+  Adds a per-nesting-depth expected-transition cache to the JSON parser. The
+  first object at a depth records its key sequence (atoms) and the shape chain
+  it produces (shapes[0..n]); the next object at the same depth that starts
+  from the same base shape and repeats the same keys adopts each cached shape
+  directly (json_obj_adopt_shape) instead of hashing every add-transition.
+  A divergence drops the stale tail and rebuilds the chain; duplicate keys fall
+  back to JS_DefinePropertyValue. The cache is freed by JS_ParseJSON_internal on
+  both the success and the failure path, and is re-fetched after each recursive
+  value parse because a nested object can grow the depth-indexed array.
+
+Why we need it
+  json_parse_value's object branch calls JS_DefinePropertyValue once per key,
+  which goes through add_property's hashed shape lookup for every object. JSON
+  documents repeat the same object layout, so the shape chain is identical from
+  object to object and can be reused verbatim. On a 200-object x 100-iteration
+  JSON.parse driver this drops shape allocations from 80,200 to 201 (-99.7%);
+  the ProseMirror parse-only workload improves 2-8% (S 594->582us, M
+  2.91->2.80ms, L 9.13->8.38ms).
+
+What it adds
+  quickjs.c
+      JSONShapeCache + JSParseState json_shapes/json_shapes_len/
+      json_shapes_cap; json_shape_cache_free / json_shape_cache_at /
+      json_shape_cache_reserve; json_obj_adopt_shape; the depth parameter
+      threaded through json_parse_value; the object-branch cache logic.
+
+  Box2D checksum 546.1008391043414, test262 50/81192 with no leaks,
+  differential corpus 398/0/0, ASan on test262-fast clean (one pre-existing
+  UBSan allocator-vtable report). JSON.parse-only micro-benchmark (14
+  correctness checks incl. duplicate keys, key reordering, __proto__ own
+  property, reviver, deep nesting) identical to the pre-change engine.
+
+diff --git a/quickjs.c b/quickjs.c
+index bb0e9e8..03f4b43 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -39546,6 +39546,16 @@ typedef struct JSToken {
+     } u;
+ } JSToken;
+ 
++/* O3: expected-transition cache for JSON.parse. JSON objects almost always
++   repeat the same key sequence, so the shape built for the previous object at
++   the same nesting depth is reused instead of hashing every add-transition. */
++typedef struct JSONShapeCache {
++    int n;              /* number of valid transitions (keys) */
++    int cap;
++    JSAtom *atoms;      /* atoms[k] = the k-th key */
++    JSShape **shapes;   /* shapes[k] = shape after k keys; shapes[n] is valid */
++} JSONShapeCache;
++
+ typedef struct JSParseState {
+     JSContext *ctx;
+     int last_line_num;  /* line number of last token */
+@@ -39564,6 +39574,11 @@ typedef struct JSParseState {
+     const uint8_t *mark; // first token character, invariant: eol < mark
+     bool json_key_mode;
+ 
++    /* JSON.parse shape-reuse cache, indexed by object nesting depth */
++    JSONShapeCache *json_shapes;
++    int json_shapes_len;
++    int json_shapes_cap;
++
+     /* current function code */
+     JSFunctionDef *cur_func;
+     bool is_module; /* parsing a module */
+@@ -84640,8 +84655,100 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
+     pr->value = JS_UNDEFINED; /* fail safe */
+ }
+ 
++/* O3: JSON.parse shape-reuse cache helpers.  The cache records, for each
++   object nesting depth, the key sequence and the shape chain produced by the
++   previous object at that depth, so the next object can adopt the shapes
++   directly instead of hashing every add-transition. */
++
++static void json_shape_cache_free(JSContext *ctx, JSParseState *s)
++{
++    int i, k;
++    if (!s->json_shapes)
++        return;
++    for (i = 0; i < s->json_shapes_len; i++) {
++        JSONShapeCache *c = &s->json_shapes[i];
++        if (c->shapes) {
++            for (k = 0; k <= c->n; k++)
++                js_free_shape(ctx->rt, c->shapes[k]);
++            js_free(ctx, c->shapes);
++        }
++        js_free(ctx, c->atoms);
++    }
++    js_free(ctx, s->json_shapes);
++    s->json_shapes = NULL;
++    s->json_shapes_len = 0;
++    s->json_shapes_cap = 0;
++}
++
++static JSONShapeCache *json_shape_cache_at(JSContext *ctx, JSParseState *s, int depth)
++{
++    JSONShapeCache *c;
++    if (depth >= s->json_shapes_cap) {
++        int newcap = s->json_shapes_cap ? s->json_shapes_cap * 2 : 8;
++        JSONShapeCache *na;
++        if (newcap <= depth)
++            newcap = depth + 1;
++        na = js_realloc(ctx, s->json_shapes, sizeof(*na) * newcap);
++        if (!na)
++            return NULL;
++        s->json_shapes = na;
++        memset(&s->json_shapes[s->json_shapes_cap], 0,
++               sizeof(*na) * (newcap - s->json_shapes_cap));
++        s->json_shapes_cap = newcap;
++    }
++    if (!s->json_shapes)
++        return NULL;
++    if (depth >= s->json_shapes_len)
++        s->json_shapes_len = depth + 1;
++    c = &s->json_shapes[depth];
++    return c;
++}
++
++/* ensure atoms[0..n-1] and shapes[0..n] are allocated */
++static int json_shape_cache_reserve(JSContext *ctx, JSONShapeCache *c, int n)
++{
++    int newcap;
++    JSAtom *na;
++    JSShape **ns;
++    if (n <= c->cap)
++        return 0;
++    newcap = c->cap ? c->cap * 2 : 8;
++    if (newcap < n)
++        newcap = n;
++    na = js_realloc(ctx, c->atoms, sizeof(JSAtom) * newcap);
++    if (!na)
++        return -1;
++    c->atoms = na;
++    ns = js_realloc(ctx, c->shapes, sizeof(JSShape *) * (newcap + 1));
++    if (!ns)
++        return -1;
++    c->shapes = ns;
++    c->cap = newcap;
++    return 0;
++}
++
++/* adopt an already-built shape (same effect as add_property's "matching shape
++   found" branch, without the hash lookup).  The value is stored before the
++   shape is swapped in so the GC never sees an uninitialised slot. */
++static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
++                                JSValue v)
++{
++    JSShape *sh = p->shape;
++    if (new_sh->prop_size != sh->prop_size) {
++        JSProperty *new_prop;
++        new_prop = js_prop_grow(ctx, p, sizeof(p->prop[0]) * new_sh->prop_size);
++        if (!new_prop)
++            return -1;
++        p->prop = new_prop;
++    }
++    p->prop[new_sh->prop_count - 1].u.value = v;
++    p->shape = js_dup_shape(new_sh);
++    js_free_shape(ctx->rt, sh);
++    return 0;
++}
++
+ /* 'pr' can be NULL */
+-static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
++static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
+ {
+     JSContext *ctx = s->ctx;
+     JSValue val = JS_NULL;
+@@ -84661,7 +84768,9 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+             JSValue prop_val;
+             JSAtom prop_name;
+             JSONParseRecord *pr1;
+-            int pr_size;
++            JSONShapeCache *jsc;
++            JSObject *jsobj;
++            int pr_size, k, matched;
+ 
+             if (json_next_key_token(s))
+                 goto fail;
+@@ -84672,6 +84781,21 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+                 json_parse_record_init_obj(ctx, pr, val);
+                 pr_size = 0;
+             }
++            jsobj = JS_VALUE_GET_OBJ(val);
++            k = 0;
++            matched = 0;
++            jsc = json_shape_cache_at(ctx, s, depth);
++            if (jsc) {
++                if (!jsc->shapes) {
++                    /* first object at this depth: remember its base shape */
++                    if (json_shape_cache_reserve(ctx, jsc, 1) == 0)
++                        jsc->shapes[0] = js_dup_shape(jsobj->shape);
++                    else
++                        jsc = NULL;
++                }
++                if (jsc && jsc->n > 0 && jsc->shapes[0] == jsobj->shape)
++                    matched = 1;
++            }
+             if (s->token.val != '}') {
+                 for(;;) {
+                     if (s->token.val == TOK_STRING || s->token.val == TOK_IDENT) {
+@@ -84701,17 +84825,55 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+                     } else {
+                         pr1 = NULL;
+                     }
+-                    prop_val = json_parse_value(s, pr1);
++                    prop_val = json_parse_value(s, pr1, depth + 1);
+                     if (JS_IsException(prop_val)) {
+                     fail1:
+                         JS_FreeAtom(ctx, prop_name);
+                         goto fail;
+                     }
+-                    ret = JS_DefinePropertyValue(ctx, val, prop_name,
+-                                                 prop_val, JS_PROP_C_W_E);
++                    /* re-fetch: a nested object may have grown the cache array */
++                    jsc = json_shape_cache_at(ctx, s, depth);
++                    if (jsc && matched && k < jsc->n &&
++                        jsc->atoms[k] == prop_name &&
++                        jsc->shapes[k] == jsobj->shape &&
++                        jsc->shapes[k + 1] != jsc->shapes[k]) {
++                        /* O3: expected transition; adopt the cached shape */
++                        JSShape *nsh = jsc->shapes[k + 1];
++                        if (json_obj_adopt_shape(ctx, jsobj, nsh, prop_val)) {
++                            JS_FreeValue(ctx, prop_val);
++                            JS_FreeAtom(ctx, prop_name);
++                            goto fail;
++                        }
++                        ret = 0;
++                    } else {
++                        if (jsc && matched) {
++                            /* diverged: drop the stale tail and rebuild */
++                            int j;
++                            if (k < jsc->n) {
++                                for (j = k + 1; j <= jsc->n; j++)
++                                    js_free_shape(ctx->rt, jsc->shapes[j]);
++                                for (j = k; j < jsc->n; j++)
++                                    JS_FreeAtom(ctx, jsc->atoms[j]);
++                                jsc->n = k;
++                            }
++                            matched = 0;
++                        }
++                        ret = JS_DefinePropertyValue(ctx, val, prop_name,
++                                                     prop_val, JS_PROP_C_W_E);
++                        if (ret >= 0 && jsc) {
++                            if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
++                                jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
++                                jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
++                                jsc->n = k + 1;
++                            } else {
++                                jsc = NULL;
++                            }
++                        }
++                    }
+                     JS_FreeAtom(ctx, prop_name);
+                     if (ret < 0)
+                         goto fail;
++                    k++;
+ 
+                     if (s->token.val == '}')
+                         break;
+@@ -84762,7 +84924,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+                             elems = ne;
+                             elems_size = ns2;
+                         }
+-                        el = json_parse_value(s, NULL);
++                        el = json_parse_value(s, NULL, depth + 1);
+                         if (JS_IsException(el))
+                             goto array_stage_fail;
+                         elems[n++] = el;
+@@ -84802,7 +84964,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+                         goto fail;
+                     pr1 = &pr->u.array.elements[pr->u.array.count++];
+                     pr1->value = JS_UNDEFINED;
+-                    el = json_parse_value(s, pr1);
++                    el = json_parse_value(s, pr1, depth + 1);
+                     if (JS_IsException(el))
+                         goto fail;
+                     ret = JS_DefinePropertyValueUint32(ctx, val, idx, el, JS_PROP_C_W_E);
+@@ -84890,7 +85052,7 @@ static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf
+     js_parse_init(ctx, s, buf, buf_len, filename, 1);
+     if (json_next_token(s))
+         goto fail;
+-    val = json_parse_value(s, pr);
++    val = json_parse_value(s, pr, 0);
+     if (JS_IsException(val))
+         goto fail;
+     if (s->token.val != TOK_EOF) {
+@@ -84899,8 +85061,10 @@ static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf
+             goto fail;
+         }
+     }
++    json_shape_cache_free(ctx, s);
+     return val;
+  fail:
++    json_shape_cache_free(ctx, s);
+     JS_FreeValue(ctx, val);
+     free_token(s, &s->token);
+     return JS_EXCEPTION;

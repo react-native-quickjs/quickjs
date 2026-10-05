@@ -1,0 +1,121 @@
+Subject: register VM precomputes a per-function call descriptor
+
+What this does:
+  A JS-to-JS call through the record VM tests four fields of the callee every
+  time it picks the fast path: `func_kind == JS_FUNC_NORMAL`, `regvm_compiled`,
+  `!is_lazy` and `regvm_all_threaded`. Those inputs settle once the function's
+  bytecode and metadata are final, so the conjunction is now computed there and
+  stored as a single byte, `regvm_call_ready`, and the hot classifier is one
+  load and one branch instead of four loads and three compares.
+
+  The arena size for a frame is also recomputed from scratch on every call:
+  `sizeof(JSRegRun)` plus the interpreter registers (from three counts), plus
+  the variable-reference table and the control-block array. All of those counts
+  are likewise final, so `regvm_frame_need` stores the size for the borrow case
+  (`arg_slots == 0`), and `regvm_record_alloc` is one load and one add of the
+  reserved argument area instead of three multiplies.
+
+  `regvm_set_call_desc()` refreshes both fields at the three points where a
+  function becomes fully defined: the end of `js_create_function`, the non-lazy
+  deserialize success path, and a successful lazy materialization. It is
+  guarded by `QJS_REGVM_RECORD` because the record layout type and the
+  interpreter register counts only exist in that build. A function read from a
+  serialized blob keeps `regvm_all_threaded == 0` (that flag is never
+  serialized), so it stays ineligible exactly as before.
+
+  Measured (`fixed.js`, 32 iterations, i7-8700), interleaved against 0150:
+  22,895,7xx,xxx -> 22,758,9xx,xxx instructions (**-0.136 G, -0.59 %**), cycles
+  flat within noise. On a 20 M-iteration empty JS-to-JS call benchmark the
+  per-call cost drops a uniform 12 instructions (272 -> 260, including the
+  4-argument and method forms); native calls are unchanged because they build no
+  record. Gate run 22,758,873,063 / 10,857,923,737; box2d checksum exact;
+  diff-suite 398/0/0 mono and threaded; leak assertion clean; peak RSS 13368 KB.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1331,6 +1331,14 @@
+        read from a blob gets: the field is never serialized. */
+     uint16_t *regvm_fill;
+     uint16_t regvm_fill_count;
++    /* C2: precomputed call descriptor, set by regvm_set_call_desc() whenever the
++       inputs change (compile, deserialize, lazy materialization). `regvm_call_ready`
++       is exactly the conjunction `regvm_record_eligible` used to test, so the hot
++       call handler does one byte load instead of four field tests. `regvm_frame_need`
++       is the borrow-case arena size (arg_slots == 0), the common case, so
++       `regvm_record_alloc` is one load and one add instead of three multiplies. */
++    uint8_t regvm_call_ready;
++    uint32_t regvm_frame_need;
+ #endif
+ } JSFunctionBytecode;
+ 
+@@ -26965,10 +26973,9 @@
+ static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slots,
+                               JSRegRecordLayout *out)
+ {
+-    size_t nv = (size_t)arg_slots + b->var_count + b->regvm_reg_count + REGVM_HS;
+-    size_t need = sizeof(JSRegRun) + sizeof(JSValue) * nv
+-        + sizeof(JSVarRef *) * b->var_ref_count
+-        + sizeof(JSRegCtl) * b->regvm_ctl_count;
++    /* C2: `regvm_frame_need` is the arg_slots == 0 size, so only the reserved
++       copy's worth of argument area is added here. */
++    size_t need = b->regvm_frame_need + sizeof(JSValue) * (size_t)arg_slots;
+     uint8_t *base = regvm_arena_push(rt, need);
+     uint8_t *q;
+ 
+@@ -27178,8 +27185,24 @@
+  */
+ static int regvm_record_eligible(JSFunctionBytecode *cb)
+ {
+-    return cb->func_kind == JS_FUNC_NORMAL && cb->regvm_compiled && !cb->is_lazy
+-        && cb->regvm_all_threaded;
++    return cb->regvm_call_ready != 0;
++}
++
++/*
++ * C2: precompute the record call descriptor. Called once a function's bytecode
++ * and metadata are final: the end of js_create_function, the non-lazy
++ * deserialize path, and a successful lazy materialization. `regvm_all_threaded`
++ * is a property of the interpreter build and is never serialized, so a function
++ * read from a blob stays ineligible here too -- exactly as before.
++ */
++static void regvm_set_call_desc(JSFunctionBytecode *b)
++{
++    b->regvm_call_ready = (b->func_kind == JS_FUNC_NORMAL && b->regvm_compiled
++                           && !b->is_lazy && b->regvm_all_threaded) ? 1 : 0;
++    b->regvm_frame_need = sizeof(JSRegRun)
++        + sizeof(JSValue) * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS)
++        + sizeof(JSVarRef *) * (size_t)b->var_ref_count
++        + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
+ }
+ 
+ /*
+@@ -65398,6 +65421,10 @@
+     b->backtrace_barrier = fd->backtrace_barrier;
+     b->realm = JS_DupContext(ctx);
+ 
++#if QJS_REGVM_RECORD
++    regvm_set_call_desc(b);
++#endif
++
+     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+     js_fnbc_gc_update(ctx->rt, b);
+ 
+@@ -69515,6 +69542,9 @@
+                                    layout.byte_code_offset, has_debug_info))
+         goto fail;
+     b->realm = JS_DupContext(ctx);
++#if QJS_REGVM_RECORD
++    regvm_set_call_desc(b);
++#endif
+     js_fnbc_gc_update(ctx->rt, b);
+     return obj;
+ 
+@@ -70327,6 +70357,9 @@
+     bc_reader_free(s);
+ 
+     if (ret == 0) {
++#if QJS_REGVM_RECORD
++        regvm_set_call_desc(b);
++#endif
+         js_fnbc_gc_update(ctx->rt, b);
+         b->lazy_src = NULL;
+         b->lazy_off = b->lazy_len = 0;

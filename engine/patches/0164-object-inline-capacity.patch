@@ -1,0 +1,268 @@
+From: quickjs-ng object-creation work
+Subject: Object creation: extend the inline property path (O1)
+
+What this does
+  JS_NewObjectFromShape embeds the property array in the object block only
+  for JS_CLASS_OBJECT, JS_CLASS_BYTECODE_FUNCTION and JS_CLASS_FOR_IN_ITERATOR.
+  Array and arguments objects, which dominate object creation in the
+  ProseMirror Node.fromJSON workload, always took a second js_malloc for their
+  property array. Extend the eligible set to JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS
+  and JS_CLASS_MAPPED_ARGUMENTS so a small property array is allocated in the
+  same block as the object.
+
+  Also add the QJS_ALLOC_STATS measurement counters the object-creation plan
+  asks for: objects allocated, inline vs separate property array, property
+  array sizes, per-class split, shapes created, property-array growth moves
+  and reallocs, cycle-collection runs and objects walked, and for-in
+  start/next/has-property counts. Compiled only with -DQJS_ALLOC_STATS; dumped
+  at runtime teardown when the QJS_ALLOC_STATS env var is set.
+
+Why we need it
+  On the ProseMirror reproducer (tools/benchmark/workloads/95-prosemirror.js)
+  JS_CLASS_ARRAY (2-slot length shape) and JS_CLASS_ARGUMENTS (3-slot shape)
+  were the entire separate-property-array population: 2,459,523 of 4,333,862
+  objects in 200 iterations took the second allocation. With the extension
+  that drops to 217 while the remaining property-array work is growth
+  (move_out_of_inline 817,632, realloc 445,328). The workload's fromJSON rows
+  improve 3-5%.
+
+What it adds
+  quickjs.c
+      The two class tests in JS_NewObjectFromShape gain JS_CLASS_ARRAY,
+      JS_CLASS_ARGUMENTS, JS_CLASS_MAPPED_ARGUMENTS; the QJS_ALLOC_STATS
+      counter block and dump.
+
+  Box2D checksum 546.1008391043414 (stack and register VM), test262
+  50/81192 with no leaks, differential corpus 398/0/0, ASan on test262-fast
+  clean (one pre-existing UBSan allocator-vtable report), peak RSS on box2d
+  +0.95%. QJS_ALLOC_STATS is a measurement build only and changes nothing
+  when undefined.
+
+diff --git a/quickjs.c b/quickjs.c
+index 06d35b4..2b50ddb 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3509,6 +3509,70 @@ static void js_gc_promote_all_code(JSRuntime *rt);
+ int js_regvm_count_dump(void);
+ #endif
+ 
++#ifdef QJS_ALLOC_STATS
++/* Object-creation measurement counters (see .local/object-creation-plan.md).
++   Enabled with -DQJS_ALLOC_STATS; dumped at runtime teardown when the env
++   var QJS_ALLOC_STATS is set. */
++static uint64_t qjs_st_obj_alloc;
++static uint64_t qjs_st_obj_inline;
++static uint64_t qjs_st_obj_propmalloc;
++static uint64_t qjs_st_prop_size[64];
++static uint64_t qjs_st_obj_class[32];
++static uint64_t qjs_st_obj_class_inline[32];
++static uint64_t qjs_st_obj_ps_obj[64]; /* JS_CLASS_OBJECT, all paths */
++static uint64_t qjs_st_obj_ps_obj_inl[64];
++static uint64_t qjs_st_shape_alloc;
++static uint64_t qjs_st_grow_move;
++static uint64_t qjs_st_grow_move_class[32];
++static uint64_t qjs_st_grow_realloc;
++static uint64_t qjs_st_gc_runs;
++static uint64_t qjs_st_gc_walked;
++static uint64_t qjs_st_forin_start;
++static uint64_t qjs_st_forin_next;
++static uint64_t qjs_st_forin_hasprop;
++static void qjs_alloc_stats_dump(void)
++{
++    int i;
++    printf("alloc-stats: obj=%llu inline=%llu propmalloc=%llu shape=%llu "
++           "gc_runs=%llu gc_walked=%llu\n",
++           (unsigned long long)qjs_st_obj_alloc,
++           (unsigned long long)qjs_st_obj_inline,
++           (unsigned long long)qjs_st_obj_propmalloc,
++           (unsigned long long)qjs_st_shape_alloc,
++           (unsigned long long)qjs_st_gc_runs,
++           (unsigned long long)qjs_st_gc_walked);
++    printf("alloc-stats grow: move_out_of_inline=%llu realloc=%llu\n",
++           (unsigned long long)qjs_st_grow_move,
++           (unsigned long long)qjs_st_grow_realloc);
++    printf("alloc-stats forin: start=%llu next=%llu hasprop=%llu\n",
++           (unsigned long long)qjs_st_forin_start,
++           (unsigned long long)qjs_st_forin_next,
++           (unsigned long long)qjs_st_forin_hasprop);
++    printf("alloc-stats grow class(move):");
++    for (i = 0; i < 32; i++)
++        if (qjs_st_grow_move_class[i])
++            printf(" %d:%llu", i, (unsigned long long)qjs_st_grow_move_class[i]);
++    printf("\n");
++    printf("alloc-stats prop_size(malloc path):");
++    for (i = 0; i < 64; i++)
++        if (qjs_st_prop_size[i])
++            printf(" %d:%llu", i, (unsigned long long)qjs_st_prop_size[i]);
++    printf("\nalloc-stats class(alloc/inline):");
++    for (i = 0; i < 32; i++)
++        if (qjs_st_obj_class[i])
++            printf(" %d:%llu/%llu", i,
++                   (unsigned long long)qjs_st_obj_class[i],
++                   (unsigned long long)qjs_st_obj_class_inline[i]);
++    printf("\nalloc-stats JS_CLASS_OBJECT prop_size(all/inline):");
++    for (i = 0; i < 64; i++)
++        if (qjs_st_obj_ps_obj[i])
++            printf(" %d:%llu/%llu", i,
++                   (unsigned long long)qjs_st_obj_ps_obj[i],
++                   (unsigned long long)qjs_st_obj_ps_obj_inl[i]);
++    printf("\n");
++}
++#endif
++
+ void JS_FreeRuntime(JSRuntime *rt)
+ {
+ #ifdef QJS_REGVM_COUNT
+@@ -3522,6 +3586,10 @@ void JS_FreeRuntime(JSRuntime *rt)
+ #if QJS_AOT
+     if (getenv("QJS_AOT_STATS"))
+         js_aot_stats_dump(rt);
++#endif
++#ifdef QJS_ALLOC_STATS
++    if (getenv("QJS_ALLOC_STATS"))
++        qjs_alloc_stats_dump();
+ #endif
+     struct list_head *el, *el1;
+     bool leak = false;
+@@ -7267,6 +7335,9 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
+     sh_alloc = js_malloc(ctx, get_shape_size(hash_size, prop_size));
+     if (!sh_alloc)
+         return NULL;
++#ifdef QJS_ALLOC_STATS
++    qjs_st_shape_alloc++;
++#endif
+     sh = get_shape_from_alloc(sh_alloc, hash_size);
+     JS_REF_COUNT(sh) = 1;
+     add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
+@@ -8332,6 +8403,13 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
+ 
+         if (nbytes <= p->prop_inline_cap * sizeof(JSProperty))
+             return p->prop;
++#ifdef QJS_ALLOC_STATS
++        qjs_st_grow_move++;
++        {
++            int _ci = p->class_id < 32 ? (int)p->class_id : 31;
++            qjs_st_grow_move_class[_ci]++;
++        }
++#endif
+         np = js_malloc(ctx, nbytes);
+         if (np) {
+             memcpy(np, p->prop, p->prop_inline_cap * sizeof(JSProperty));
+@@ -8339,6 +8417,9 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
+         }
+         return np;
+     }
++#ifdef QJS_ALLOC_STATS
++    qjs_st_grow_realloc++;
++#endif
+     return js_realloc(ctx, p->prop, nbytes);
+ }
+ 
+@@ -8354,9 +8435,46 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
+     {
+         uint32_t inline_cap = ((class_id == JS_CLASS_OBJECT ||
+                                 class_id == JS_CLASS_BYTECODE_FUNCTION ||
+-                                class_id == JS_CLASS_FOR_IN_ITERATOR) &&
++                                class_id == JS_CLASS_FOR_IN_ITERATOR ||
++                                class_id == JS_CLASS_ARRAY ||
++                                class_id == JS_CLASS_ARGUMENTS ||
++                                class_id == JS_CLASS_MAPPED_ARGUMENTS) &&
+                                sh->prop_size <= JS_OBJ_INLINE_PROPS) ?
+                               sh->prop_size : 0;
++#ifdef QJS_ALLOC_STATS
++        qjs_st_obj_alloc++;
++        {
++            int _ci = class_id < 32 ? (int)class_id : 31;
++            int _ps = sh->prop_size;
++            qjs_st_obj_class[_ci]++;
++            if (_ps < 0)
++                _ps = 0;
++            if (_ps > 63)
++                _ps = 63;
++            if (class_id == JS_CLASS_OBJECT) {
++                qjs_st_obj_ps_obj[_ps]++;
++            }
++        }
++        if (inline_cap != 0) {
++            int _ci = class_id < 32 ? (int)class_id : 31;
++            qjs_st_obj_inline++;
++            qjs_st_obj_class_inline[_ci]++;
++            if (class_id == JS_CLASS_OBJECT) {
++                int _ps = sh->prop_size;
++                if (_ps < 0) _ps = 0;
++                if (_ps > 63) _ps = 63;
++                qjs_st_obj_ps_obj_inl[_ps]++;
++            }
++        } else {
++            int _ps = sh->prop_size;
++            qjs_st_obj_propmalloc++;
++            if (_ps < 0)
++                _ps = 0;
++            if (_ps > 63)
++                _ps = 63;
++            qjs_st_prop_size[_ps]++;
++        }
++#endif
+         p = js_malloc(ctx, sizeof(JSObject) +
+                            inline_cap * sizeof(JSProperty));
+         if (unlikely(!p))
+@@ -9985,6 +10103,9 @@ static void gc_decref(JSRuntime *rt)
+     list_for_each_safe(el, el1, &rt->gc_obj_list) {
+         p = list_entry(el, JSGCObjectHeader, link);
+         assert(JS_GC_MARK(p) == 0);
++#ifdef QJS_ALLOC_STATS
++        qjs_st_gc_walked++;
++#endif
+         mark_children(rt, p, gc_decref_child);
+         JS_GC_MARK(p) = 1;
+         if (JS_REF_COUNT(p) == 0) {
+@@ -10121,6 +10242,9 @@ size_t JS_GetMallocSize(JSRuntime *rt)
+ 
+ void JS_RunGC(JSRuntime *rt)
+ {
++#ifdef QJS_ALLOC_STATS
++    qjs_st_gc_runs++;
++#endif
+ #if QJS_REGVM && QJS_DRC_VALIDATE
+     js_drc_validate_roots(rt);
+ #endif
+@@ -20485,6 +20609,9 @@ static __attribute__((noinline)) JSValue build_for_in_iterator(JSContext *ctx, J
+ /* obj -> enum_obj */
+ static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
+ {
++#ifdef QJS_ALLOC_STATS
++    qjs_st_forin_start++;
++#endif
+     sp[-1] = build_for_in_iterator(ctx, sp[-1]);
+     if (JS_IsException(sp[-1]))
+         return -1;
+@@ -20504,6 +20631,9 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+     /* fail safe */
+     if (JS_VALUE_GET_TAG(enum_obj) != JS_TAG_OBJECT)
+         goto done;
++#ifdef QJS_ALLOC_STATS
++    qjs_st_forin_next++;
++#endif
+     p = JS_VALUE_GET_OBJ(enum_obj);
+     if (p->class_id != JS_CLASS_FOR_IN_ITERATOR)
+         goto done;
+@@ -20524,6 +20654,9 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+                 continue;
+             if (shape_live)
+                 break;
++#ifdef QJS_ALLOC_STATS
++            qjs_st_forin_hasprop++;
++#endif
+             ret = JS_HasProperty(ctx, it->obj, prop);
+             if (ret < 0)
+                 return ret;
+@@ -20570,6 +20703,9 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+             if (p->class_id == JS_CLASS_PROXY)
+                 break;
+         }
++#ifdef QJS_ALLOC_STATS
++        qjs_st_forin_hasprop++;
++#endif
+         ret = JS_HasProperty(ctx, obj, prop);
+         if (ret < 0)
+             return ret;

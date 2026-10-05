@@ -45,6 +45,27 @@ static JSValue js_print(
   return JS_UNDEFINED;
 }
 
+/* A trivial host (C) function for the aot_bench.js "host function in loop"
+   kernel; the AOT compiler must handle a native callee like any other. */
+static JSValue js_host_add(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  int32_t a = 0, b = 0;
+  if (argc > 0) JS_ToInt32(ctx, &a, argv[0]);
+  if (argc > 1) JS_ToInt32(ctx, &b, argv[1]);
+  return JS_NewInt32(ctx, a + b);
+}
+
+/* Deliberately reads its second formal parameter even when the caller did not
+   pass one, so an unpadded call observes stale register data. Used only by the
+   AOT arity kernel to gate AOT_MUT_NO_ARG_PAD. */
+static JSValue js_host_opt(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  int32_t a = 0, b = 0;
+  if (argc > 0) JS_ToInt32(ctx, &a, argv[0]);
+  JS_ToInt32(ctx, &b, argv[1]);
+  return JS_NewInt32(ctx, a + b);
+}
+
 static void dump_exception(JSContext *ctx) {
   JSValue e = JS_GetException(ctx);
   const char *s = JS_ToCString(ctx, e);
@@ -141,6 +162,14 @@ int main(int argc, char **argv) {
   JSValue global = JS_GetGlobalObject(ctx);
   JS_SetPropertyStr(
       ctx, global, "print", JS_NewCFunction(ctx, js_print, "print", 1));
+  JS_SetPropertyStr(
+      ctx, global, "host_add", JS_NewCFunction(ctx, js_host_add, "host_add", 2));
+  JS_SetPropertyStr(
+      ctx, global, "host_opt", JS_NewCFunction(ctx, js_host_opt, "host_opt", 2));
+  /* Marks the real bench driver, so a kernel can build a function that exists
+     only at run time (never seen by qjsaot) to exercise the compiled ->
+     interpreted -> compiled unwind path. */
+  JS_SetPropertyStr(ctx, global, "__aot_bench_driver__", JS_NewBool(ctx, 1));
   JS_FreeValue(ctx, global);
   double t_start = now_ms();
   JSValue result;

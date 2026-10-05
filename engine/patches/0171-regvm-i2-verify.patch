@@ -1,0 +1,85 @@
+Subject: register VM I2 verify scans live values once per boundary
+
+What this does:
+  The I2 promoted-slot check at block boundaries walked every live value once
+  per promoted slot. It now makes a single pass over the live values per
+  boundary, recording the value seen for each slot in `seen`, then checks each
+  slot's expected value.
+
+Why we need it:
+  The per-slot walk made this verification quadratic in the frame size.
+
+Needs a bytecode version bump:
+  No. Lowering only.
+
+---
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63538,7 +63664,12 @@
+     if (home_mode >= 2 && ns_ok > 0) {
+         /* I2 at block boundaries: each live version of a promoted slot must
+            be the slot's one current value. This also catches a home version
+-           kept alive only in a register, off the simulated operand stack. */
++           kept alive only in a register, off the simulated operand stack.
++           One pass over the live values per boundary (rather than one pass per
++           promoted slot) keeps this linear in the frame size. */
++        int *seen = js_malloc(ctx, (size_t)ns_ok * sizeof(int));
++        if (!seen)
++            goto done;
+         for (b = 0; b < n_blocks; b++) {
+             int side;
+             if (in_depth[b] < 0)
+@@ -63546,28 +63677,37 @@
+             for (side = 0; side < 2; side++) {
+                 const uint64_t *bits = (side ? live_out : live_in) +
+                                        (size_t)b * live_words;
+-                for (k = 0; k < ns_ok; k++) {
+-                    int expected = side ? sout[b * ns_ok + k]
+-                                        : senc[b * ns_ok + k];
+-                    int found = -1;
+-                    for (i = 0; i < n_values; i++) {
+-                        if (home_of[i] != k ||
+-                            !regvm_bitset_test(bits, i))
+-                            continue;
+-                        if (found >= 0 || i != expected) {
+-                            regvm_home_overlap_report(bstart[b], k,
+-                                                      expected, i);
+-                            goto refused;
+-                        }
+-                        found = i;
++                for (k = 0; k < ns_ok; k++)
++                    seen[k] = -1;
++                for (i = 0; i < n_values; i++) {
++                    int hk = home_of[i];
++                    if (hk < 0 || hk >= ns_ok)
++                        continue;
++                    if (!regvm_bitset_test(bits, i))
++                        continue;
++                    if (seen[hk] >= 0) {
++                        int expected = side ? sout[b * ns_ok + hk]
++                                            : senc[b * ns_ok + hk];
++                        regvm_home_overlap_report(bstart[b], hk, expected, i);
++                        js_free(ctx, seen);
++                        goto refused;
+                     }
+-                    if (found >= 0 && found != expected) {
+-                        regvm_home_overlap_report(bstart[b], k, expected, found);
++                    seen[hk] = i;
++                }
++                for (k = 0; k < ns_ok; k++) {
++                    int expected;
++                    if (seen[k] < 0)
++                        continue;
++                    expected = side ? sout[b * ns_ok + k] : senc[b * ns_ok + k];
++                    if (seen[k] != expected) {
++                        regvm_home_overlap_report(bstart[b], k, expected, seen[k]);
++                        js_free(ctx, seen);
+                         goto refused;
+                     }
+                 }
+             }
+         }
++        js_free(ctx, seen);
+     }
+     /*
+      * How deep the frame's control stack has to be: the largest net push count

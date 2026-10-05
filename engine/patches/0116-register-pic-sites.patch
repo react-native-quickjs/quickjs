@@ -1,0 +1,325 @@
+Adds a per-function register PIC site namespace (A1)
+
+The register backend's named-property instructions carried the shared stack
+inline-cache slot index. A1 gives them their own dense per-function numbering,
+a JSFunctionBytecode field to hold the count, a per-frame base pointer carried
+on every execution and resume path, and serialization of the count.
+
+  * quickjs.c: JSRegPIC forward declaration; JSFunctionBytecode.regvm_pic and
+    .regvm_pic_count; JSRegRun.pic set at record fill, entry and threaded
+    rebind; dense site assignment derived from the ROP format string; site
+    operands validated against regvm_pic_count; regvm_pic_count written and
+    read in the register program header; ROP_get_length gains a site operand;
+    the stack-IC helpers are bypassed for register code until A3/A4 install
+    fills and hits.
+  * quickjs-regvm.h: REGVM_FORMAT_VERSION 11 -> 12.
+
+The site position is taken from regvm_rop_fmt rather than hard-coded, because
+it differs between the generic and fused spellings of one operation:
+get_field is "rras" (site at index 3) while get_local_field_0 is "ras" (site
+at index 2). A fixed index wrote the dense number over the atom for every
+"rras"/"ruas" opcode and left the real site stale.
+
+Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -58,6 +58,7 @@
+ /* The register ISA and lowering inventory, needed by the register interpreter
+    in JS_CallInternal as well as by the compiler-side analysis below. */
+ #include "quickjs-regvm.h"
++typedef struct JSRegPIC JSRegPIC;
+ #endif
+ 
+ #if defined(EMSCRIPTEN) || defined(_MSC_VER)
+@@ -1175,6 +1176,7 @@
+     int regvm_len;
+     int regvm_reg_count;
+     int regvm_ctl_count;   /* entries the frame's control stack needs */
++    uint16_t regvm_pic_count;
+     /* "Compiled" is a state of its own. `regvm_len == 0` used to mean both
+        "refused" and "the program is empty", which the interpreter cannot tell
+        apart; an empty body is now one `return_undefined`, but the flag is the
+@@ -1191,6 +1193,9 @@
+        while a compiled function's register code borrows the atoms the stack
+        bytecode already owns. */
+     uint8_t regvm_owns_atoms;
++    /* Runtime-only property cache owned by the register VM. Its entries hold
++       counted shape references; stack-VM inline caches remain in ic_table. */
++    JSRegPIC *regvm_pic;
+ #endif
+ } JSFunctionBytecode;
+ 
+@@ -21980,6 +21985,12 @@
+ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSValue recv, JSAtom atom, int ic_idx)
+ {
++    /* A1 gives register bytecode a separate dense PIC namespace. Until A3/A4
++       install fills and hits, always use the generic engine lookup here. */
++    (void)b;
++    (void)ic_idx;
++    return JS_GetPropertyInternal(ctx, recv, atom, recv, false);
++#if 0
+     JSObject *p;
+     int k;
+ 
+@@ -22106,6 +22117,7 @@
+     js_regvm_getfield_ic[2]++;
+ #endif
+     return JS_GetPropertyInternal(ctx, recv, atom, recv, false);
++#endif
+ }
+ 
+ /*
+@@ -22134,6 +22146,11 @@
+ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue recv,
+                               JSAtom atom, JSValue val, int ic_idx)
+ {
++    (void)b;
++    (void)ic_idx;
++    return JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
++                                   JS_PROP_THROW_STRICT);
++#if 0
+     JSObject *p;
+     JSShape *pre_sh = NULL;
+     uint32_t pre_count = 0;
+@@ -22266,11 +22283,18 @@
+         js_free_shape(ctx->rt, pre_sh);
+ #endif
+     return ret < 0 ? -1 : 0;
++#endif
+ }
+ 
+ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+     JSFunctionBytecode *b, JSValue recv, int ic_idx, JSValue *out)
+ {
++    (void)b;
++    (void)recv;
++    (void)ic_idx;
++    (void)out;
++    return 0;
++#if 0
+ #if JS_ENABLE_IC
+     JSObject *p;
+     JSICEntry *ic;
+@@ -22303,6 +22327,7 @@
+     (void)out;
+     return 0;
+ #endif
++#endif
+ }
+ 
+ /*
+@@ -22712,6 +22737,7 @@
+     JSContext *ctx;
+     JSRuntime *rt;
+     JSFunctionBytecode *b;
++    JSRegPIC *pic;              /* register VM property-cache base for this frame */
+     JSStackFrame *sf;
+     JSVarRef **var_refs;
+     JSValueConst this_obj;
+@@ -25101,6 +25127,7 @@
+     rec->ctx = cb->realm;
+     rec->rt = rt;
+     rec->b = cb;
++    rec->pic = cb->regvm_pic;
+     rec->sf = sf;
+     rec->fr = lay->regs;
+     rec->var_refs = co->u.func.var_refs;
+@@ -25274,6 +25301,7 @@
+         run.ctx = ctx;
+         run.rt = rt;
+         run.b = b;
++        run.pic = b->regvm_pic;
+         run.sf = sf;
+         run.var_refs = var_refs;
+         run.this_obj = this_obj;
+@@ -25698,6 +25726,7 @@
+         run.ctx = ctx; \
+         run.rt = rt; \
+         run.b = b; \
++        run.pic = b->regvm_pic; \
+         run.sf = sf; \
+         run.var_refs = var_refs; \
+         run.this_obj = this_obj; \
+@@ -27690,6 +27719,7 @@
+             L_ROP_get_length: {
+                 int d = RD_REG();
+                 int r = RD_REG();
++                (void)RD_U16();
+                 JSValue val = JS_GetProperty(ctx, regs[r], JS_ATOM_length);
+                 if (JS_IsException(val))
+                     goto exception;
+@@ -30172,6 +30202,7 @@
+      {
+                     int d = RD_REG();
+                     int r = RD_REG();
++                    (void)RD_U16();
+                     JSValue val = JS_GetProperty(ctx, regs[r], JS_ATOM_length);
+                     if (JS_IsException(val))
+                         goto exception;
+@@ -35997,6 +36028,7 @@
+     int regvm_len;
+     int regvm_reg_count;
+     int regvm_ctl_count;
++    int regvm_pic_count;
+     uint8_t regvm_compiled; /* the backend lowered this function */
+     uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
+ #endif
+@@ -52627,7 +52659,7 @@
+     [ROP_put_element_xfer] = "rrr",
+     [ROP_put_field_xfer] = "rasr",
+     [ROP_define_element] = "rrr",
+-    [ROP_get_length] = "rr",
++    [ROP_get_length] = "rrs",
+     [ROP_super_get] = "rrrr",
+     [ROP_super_put] = "rrrr",
+     /* the class builder takes a stack pointer, so its operands are staged into
+@@ -53763,7 +53795,7 @@
+         ADD(ROP_put_field, pop[0], (int32_t)get_u32(bc + pos + 1), REG_IC_NONE, pop[1]); return 0;
+     case OP_put_field_ic:
+         ADD(ROP_put_field, pop[0], (int32_t)get_u32(bc + pos + 1), get_u16(bc + pos + 5), pop[1]); return 0;
+-    case OP_get_length: ADD(ROP_get_length, dst, pop[0]); return 0;
++    case OP_get_length: ADD(ROP_get_length, dst, pop[0], REG_IC_NONE); return 0;
+ 
+     /*
+      * Object construction. define_field, set_name and the element define leave
+@@ -54302,7 +54334,7 @@
+ }
+ 
+ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+-                                   int reg_count, int cpool_count, int ic_count,
++                                   int reg_count, int cpool_count, int pic_count,
+                                    int atom_count, int n_values, const int *ireg,
+                                    const int *pc_to_insn, int n_pcs,
+                                    int win_size, int cycle_reg,
+@@ -54696,8 +54728,8 @@
+                     }
+                     break;
+                 case 's':
+-                    if ((uint32_t)v != REG_IC_NONE && (uint32_t)v >= (uint32_t)ic_count) {
+-                        JS_ThrowInternalError(ctx, "regvm: ic site %u out of range", (uint32_t)v);
++                    if (v < 0 || (uint32_t)v >= (uint32_t)pic_count) {
++                        JS_ThrowInternalError(ctx, "regvm: PIC site %u out of range", (uint32_t)v);
+                         goto done;
+                     }
+                     break;
+@@ -57222,7 +57254,42 @@
+             in->ops[2] = in->ops[3];
+         } else if (slotpos == 0) {
+             in->ops[0] = in->ops[1];
++        }
++    }
++
++    /* Register property sites have their own dense namespace. They must never
++       index the shared stack VM IC table.
++     *
++     * The site's operand position is read from the format string rather than
++     * written as a constant, because it differs between the generic and fused
++     * spellings of the same operation. `get_field` is "rras" -- site in ops[3]
++     * -- while the slot-in-opcode form the pass above produces,
++     * `get_local_field_0`, is "ras" with the site in ops[2]. A fixed position
++     * put the dense index over the *atom* for every "rras"/"ruas" opcode
++     * (get_field, get_field2, get_arg_field) and left the real site stale.
++     *
++     * Deriving it also covers the two site-bearing opcodes with no specialized
++     * form, which a hand-written list missed: the generic `get_local_field`
++     * (a slot above 3, which is emitted) and `put_field_xfer`.
++     */
++    fd->regvm_pic_count = 0;
++    for (i = 0; i < ir.n_insns; i++) {
++        JSRegInsn *in = &ir.insns[i];
++        const char *fmt = regvm_rop_fmt[in->rop];
++        const char *sp;
++        int sitepos;
++
++        if (!fmt)
++            continue;
++        sp = strchr(fmt, 's');
++        if (!sp)
++            continue;
++        sitepos = (int)(sp - fmt);
++        if (fd->regvm_pic_count >= UINT16_MAX) {
++            JS_ThrowInternalError(ctx, "regvm: too many PIC sites");
++            goto done;
+         }
++        in->ops[sitepos] = fd->regvm_pic_count++;
+     }
+ 
+ #ifdef QJS_REGVM_COUNT
+@@ -57346,7 +57413,7 @@
+             int er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
+                                                               are two bytes */,
+                                              reg_count,
+-                                             fd->cpool_count, fd->ic_count,
++                                             fd->cpool_count, fd->regvm_pic_count,
+                                              ctx->rt->atom_size, n_values, ireg,
+                                              pc_to_insn, bc_len + n_stubs_used,
+                                              win_size, cycle_reg, &fd->regvm_code,
+@@ -60705,6 +60772,7 @@
+         b->regvm_len = fd->regvm_len;
+         b->regvm_reg_count = fd->regvm_reg_count;
+         b->regvm_ctl_count = fd->regvm_ctl_count;
++        b->regvm_pic_count = fd->regvm_pic_count;
+         b->regvm_compiled = 1;
+         b->regvm_all_threaded = fd->regvm_all_threaded;
+         memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
+@@ -63031,6 +63099,7 @@
+         bc_put_u8(s, REGVM_FORMAT_VERSION);
+         bc_put_leb128(s, b->regvm_reg_count);
+         bc_put_leb128(s, b->regvm_ctl_count);
++        bc_put_leb128(s, b->regvm_pic_count);
+         bc_put_leb128(s, b->regvm_len);
+         rbuf = js_malloc(s->ctx, b->regvm_len);
+         if (!rbuf)
+@@ -64318,8 +64387,8 @@
+                     goto done;
+                 }
+             } else if (fmt[m] == 's') {
+-                if ((uint32_t)v != REG_IC_NONE && (uint32_t)v >= b->ic_count) {
+-                    JS_ThrowSyntaxError(ctx, "register IC site out of range");
++                if (v < 0 || (uint32_t)v >= b->regvm_pic_count) {
++                    JS_ThrowSyntaxError(ctx, "register PIC site out of range");
+                     goto done;
+                 }
+             }
+@@ -64670,7 +64739,7 @@
+         if (bc_get_u8(s, &compiled))
+             goto fail;
+         if (compiled) {
+-            int reg_count, ctl_count, regvm_len;
++            int reg_count, ctl_count, pic_count, regvm_len;
+             uint8_t version;
+             if (bc_get_u8(s, &version))
+                 goto fail;
+@@ -64682,10 +64751,12 @@
+             }
+             if (bc_get_leb128_int(s, &reg_count) ||
+                 bc_get_leb128_int(s, &ctl_count) ||
++                bc_get_leb128_int(s, &pic_count) ||
+                 bc_get_leb128_int(s, &regvm_len))
+                 goto fail;
+             if (reg_count <= 0 || ctl_count < 0 || regvm_len <= 0 ||
+                 reg_count > UINT16_MAX || ctl_count > UINT16_MAX ||
++                pic_count < 0 || pic_count > UINT16_MAX ||
+                 (size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
+                 JS_ThrowSyntaxError(ctx, "invalid register program header");
+                 goto fail;
+@@ -64693,6 +64764,7 @@
+             bc.regvm_compiled = 1;
+             bc.regvm_reg_count = reg_count;
+             bc.regvm_ctl_count = ctl_count;
++            bc.regvm_pic_count = pic_count;
+             bc.regvm_len = regvm_len;
+         }
+     }
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -750,7 +750,7 @@
+  * cross-VM one does. Bump it whenever an opcode is added, removed or
+  * renumbered, or an operand's width or meaning changes.
+  */
+-#define REGVM_FORMAT_VERSION 11
++#define REGVM_FORMAT_VERSION 12
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */

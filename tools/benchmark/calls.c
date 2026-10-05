@@ -184,7 +184,8 @@ static const char *KNOWN[] = {
     "apply1",      "apply4",    "apply8",   "jsapply4",   "spread0",
     "spread1",     "spread4",   "spread8",  "applyargs4", "applygen4",
     "applyacc4",   "jsspread4", "cc0",      "cc1",        "cc2",
-    "cc4",         "cc8",       NULL};
+    "cc4",         "cc8",       "site1",     "site2",      "site4",
+    "site8",       NULL};
 
 static int is_known(const char *n) {
   for (int i = 0; KNOWN[i]; i++)
@@ -350,6 +351,30 @@ int main(int argc, char **argv) {
   } else if (!strcmp(shape, "jsjs0")) {
     setup = "var f=g.js0;";
     body = "f();";
+  } else if (!strncmp(shape, "site", 4)) {
+    /*
+     * The same empty callee called from K *distinct* call sites, varying K, with
+     * **no** compare chain: K sequential calls in the loop body. This is the
+     * control for the return-target-prediction hypothesis in
+     * `P3-REVIEW-2026-09-29.md` §1.2. An if-chain was tried first and thrown
+     * away: its compares cost the same in both engines and their ~7 ns/site
+     * slope swamped whatever the return branch was doing.
+     *
+     * Per-call cost is `ns_per_iter / K`. If the record path pays for an
+     * indirect return branch that the C path's `ret` gets free from the
+     * return-address stack, the record path's per-call cost must rise with K and
+     * the C path's must not.
+     */
+    int k = atoi(shape + 4);
+    setup = "var f=g.js0;";
+    if (k == 1)
+      body = "f();";
+    else if (k == 2)
+      body = "f(); f();";
+    else if (k == 4)
+      body = "f(); f(); f(); f();";
+    else
+      body = "f(); f(); f(); f(); f(); f(); f(); f();";
   } else if (!strcmp(shape, "jsjs1")) {
     setup = "var f=g.js1;";
     body = "f(1);";

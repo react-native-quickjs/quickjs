@@ -1,6 +1,6 @@
 {
-  "_comment": "What the engine scores on test262 today. CI compares against this and fails if the failure count goes up. Update it in the same commit as whatever changed the score, and say why in the message.",
-  "errors": 52,
+  "_comment": "What the engine scores on test262 today. CI compares against this and fails if the failure count goes up. Update it in the same commit as whatever changed the score, and say why in the message. Last update: 52 -> 50, re-measured on the stack default build (QJS_REGVM unset); the register build (QJS_REGVM=1) now matches at 50/81192 too (register-VM parity, engine/patches/0143).",
+  "errors": 50,
   "total": 81192,
   "config": "test262.conf + test262-fast.conf, -m -a"
 }

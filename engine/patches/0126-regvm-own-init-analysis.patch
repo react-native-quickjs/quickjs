@@ -1,0 +1,461 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23699,8 +23699,9 @@
+ {
+     long off = f->rcc_ip ? (long)(f->rcc_ip - f->b->regvm_code) : -1;
+     (void)r;
+-    fprintf(stderr, "##RCCHECK## %s reg=%d want=%ld got=%ld off=%ld\n",
+-            what, reg, want, got, off);
++    fprintf(stderr, "##RCCHECK## %s reg=%d want=%ld got=%ld off=%ld len=%d regs=%d line=%d col=%d\n",
++            what, reg, want, got, off, f->b->regvm_len, f->b->regvm_reg_count,
++            f->b->line_num, f->b->col_num);
+     fflush(stderr);
+     abort();
+ }
+@@ -56991,15 +56992,30 @@
+ }
+ 
+ /*
++ * The init lattice, the second dimension section 6.1 needs for C1. `INIT` means
++ * the register has definitely been written in this frame; `UNINIT` means it may
++ * not have, so it must be filled at entry before anything can read it. It is a
++ * must-analysis: the entry block and every exception entry are UNINIT, a
++ * definition makes its destination INIT, and the join at a merge is AND (INIT
++ * only if INIT on every predecessor).
++ */
++enum {
++    REG_INIT_UNINIT = 0,
++    REG_INIT_INIT = 1,
++};
++
++/*
+  * One instruction's transfer over `st` (reg_count bytes).
+  *
+- * The update joins with the register's current state rather than overwriting
+- * it. That is deliberate: a strong update would make the transfer non-monotone
+- * (a `move` of a NONE source can lower a register that a loop already carried in
+- * as MAYBE), and the block worklist would oscillate instead of converging. The
+- * join is the sound direction for a may-hold-a-count analysis: it can only
+- * over-approximate, and it reaches the fixed point. Strong updates, which need
+- * the SSA value to know the previous definition is dead, are a later refinement.
++ * A strong update: a write replaces the register's state outright, because the
++ * value that was there is gone. `regvm_own_result_class` gives the new state
++ * (NONE for the count-free constants and the boolean comparisons, MAYBE for
++ * everything else), and a `move` copies its source's state. The transfer is
++ * monotone in `st` -- a constant, or a copy of one register into another -- and
++ * the join at a merge is monotone, so the block worklist still reaches a fixed
++ * point from bottom. The join this replaces was there because a strong update
++ * was believed to oscillate; it does not, because a definition's new state does
++ * not depend on the state it replaces.
+  */
+ /*
+  * The index in `ops` of an instruction's destination. Almost always the first
+@@ -57046,12 +57062,13 @@
+ }
+ 
+ static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
+-                           int n_values, int reg_count, int cycle_reg)
++                           int n_values, int reg_count, int cycle_reg, int weak)
+ {
+     uint16_t rop = in->rop;
+     const char *f = regvm_rop_fmt[rop];
+     int di = regvm_own_dest_index(rop);
+-    int d, s;
++    int d, s = -1;
++    (void)weak;   /* strong updates are deferred; see HP-S51-2026-10-01.md */
+ 
+     if (regvm_own_has_dest(rop) && f && f[di] == 'r') {
+         d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
+@@ -57064,6 +57081,10 @@
+                 cls = regvm_own_result_class(rop);
+             }
+             st[d] = regvm_own_join(st[d], cls);
++            /* A `move_xfer` hands its value to the destination: the source
++               register no longer owns the count. */
++            if (rop == ROP_move_xfer && s >= 0 && s != d)
++                st[s] = regvm_own_join(st[s], REG_OWN_NONE);
+         }
+         di = regvm_own_second_dest_index(rop);
+         if (di >= 0) {
+@@ -57074,13 +57095,46 @@
+         return;
+     }
+     /*
+-     * A `*_xfer` store hands its value to a slot that now owns the count, so the
+-     * register no longer does. Under the join transfer the clear is the identity
+-     * (`join(x, NONE) == x`), so it is not applied: leaving the register counted
+-     * is the sound direction. The strong-update refinement will apply it.
++     * The four store forms that hand their value to a slot which now owns the
++     * count, so the register no longer does. `move_xfer` is a destination form
++     * and was handled above. The value operand is the one the transfer pass
++     * chose in `regvm_transfer_dead_sources`: `put_element_xfer` takes ops[2],
++     * `put_field_xfer` ops[3], and the two binding stores ops[1] (their ops[0]
++     * is the slot index, not a register).
+      */
+-    (void)rop;
+-    (void)s;
++    if (rop == ROP_put_element_xfer)
++        s = regvm_own_op_reg(in, 2, ireg, n_values, reg_count, cycle_reg);
++    else if (rop == ROP_put_field_xfer)
++        s = regvm_own_op_reg(in, 3, ireg, n_values, reg_count, cycle_reg);
++    else if (rop == ROP_put_local_xfer || rop == ROP_put_arg_xfer)
++        s = regvm_own_op_reg(in, 1, ireg, n_values, reg_count, cycle_reg);
++    if (s >= 0)
++        st[s] = regvm_own_join(st[s], REG_OWN_NONE);
++}
++
++/* The init transfer: a definition marks its destination written; everything
++   else leaves the frame as it was. The `*_xfer` stores write a slot, not a
++   register, so they do not appear here. */
++static void regvm_own_init_step(const JSRegInsn *in, uint8_t *st,
++                                const int *ireg, int n_values, int reg_count,
++                                int cycle_reg, int weak)
++{
++    uint16_t rop = in->rop;
++    const char *f = regvm_rop_fmt[rop];
++    int di = regvm_own_dest_index(rop);
++    int d;
++
++    if (!(regvm_own_has_dest(rop) && f && f[di] == 'r'))
++        return;
++    d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
++    if (d >= 0)
++        st[d] = weak ? (uint8_t)(st[d] & REG_INIT_INIT) : REG_INIT_INIT;
++    di = regvm_own_second_dest_index(rop);
++    if (di >= 0) {
++        d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
++        if (d >= 0)
++            st[d] = weak ? (uint8_t)(st[d] & REG_INIT_INIT) : REG_INIT_INIT;
++    }
+ }
+ 
+ /*
+@@ -57099,6 +57153,10 @@
+     int *bs = NULL, *be = NULL, *sx = NULL, *sxn = NULL;
+     uint8_t *blkin = NULL, *blkout = NULL, *inq = NULL, *tmp = NULL;
+     uint8_t *ex_entry = NULL;
++    uint8_t *blkin_i = NULL, *blkout_i = NULL, *init_i = NULL;
++    uint8_t *weak = NULL;
++    uint8_t *has_def = NULL, *entry_i = NULL, *init_set = NULL, *uni = NULL;
++    int init_cnt = 0, ret_sum = 0, uni_cnt = 0, uninit_ret = 0;
+     int i, b, k, e, ne = 0, sp = 0;
+     const char *ownknob = REGVM_KNOB("REGVM_OWN");
+     int dump = ownknob != NULL;
+@@ -57132,8 +57190,19 @@
+     sx = js_malloc(ctx, (size_t)n_blocks * 4 * sizeof(int));
+     sxn = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
+     ex_entry = js_malloc(ctx, (size_t)n_blocks);
++    blkin_i = js_malloc(ctx, (size_t)n_blocks * nreg);
++    blkout_i = js_malloc(ctx, (size_t)n_blocks * nreg);
++    init_i = js_malloc(ctx, nreg);
++    weak = js_malloc(ctx, (size_t)n_blocks);
++    has_def = js_malloc(ctx, (size_t)(n_values > 0 ? n_values : 1));
++    entry_i = js_malloc(ctx, nreg);
++    init_set = js_malloc(ctx, nreg);
++    uni = js_malloc(ctx, nreg);
+     if (!blk || !ph || !pn || !pb || !queue || !bs || !be ||
+-        !blkin || !blkout || !inq || !tmp || !sx || !sxn || !ex_entry)
++        !blkin || !blkout || !inq || !tmp || !sx || !sxn || !ex_entry ||
++        !blkin_i || !blkout_i || !init_i || !has_def || !entry_i ||
++        !weak ||
++        !init_set || !uni)
+         goto done;
+ 
+     /*
+@@ -57161,12 +57230,50 @@
+         }
+         blk[i] = mb;
+     }
++    /*
++     * The INIT half of the entry state. A register is INIT at entry when some
++     * value with no defining instruction in this function maps to it: the
++     * incoming arguments, which the caller's frame setup has already written
++     * (and `regvm_record_fill` has already filled when the call passed fewer
++     * arguments than the callee declares). Every other register starts UNINIT,
++     * so C1 leaves it as garbage until it is written.
++     */
++    memset(has_def, 0, (size_t)(n_values > 0 ? n_values : 1));
++    for (i = 0; i < n; i++) {
++        const JSRegInsn *in = &ir->insns[i];
++        const char *f = regvm_rop_fmt[in->rop];
++        int di = regvm_own_dest_index(in->rop);
++        int v;
++        if (regvm_own_has_dest(in->rop) && f && f[di] == 'r') {
++            v = in->ops[di];
++            if (v >= 0 && v < n_values)
++                has_def[v] = 1;
++        }
++        di = regvm_own_second_dest_index(in->rop);
++        if (di >= 0) {
++            v = in->ops[di];
++            if (v >= 0 && v < n_values)
++                has_def[v] = 1;
++        }
++    }
++    memset(entry_i, REG_INIT_UNINIT, nreg);
++    for (k = 0; k < n_values; k++) {
++        int r;
++        if (has_def[k])
++            continue;
++        r = ireg ? ireg[k] : -1;
++        if (r >= 0 && r < nreg)
++            entry_i[r] = REG_INIT_INIT;
++    }
+     for (b = 0; b < n_blocks; b++) {
+         ph[b] = -1;
+         bs[b] = -1;
+         be[b] = -1;
++        weak[b] = 0;
+         memset(blkin + (size_t)b * nreg, REG_OWN_NONE, nreg);
+         memset(blkout + (size_t)b * nreg, REG_OWN_NONE, nreg);
++        memset(blkin_i + (size_t)b * nreg, REG_INIT_UNINIT, nreg);
++        memset(blkout_i + (size_t)b * nreg, REG_INIT_UNINIT, nreg);
+         inq[b] = 0;
+         ex_entry[b] = 0;
+     }
+@@ -57177,6 +57284,20 @@
+         be[b] = i + 1;
+     }
+     /*
++     * A block whose IR indices are not contiguous is one the fusion passes
++     * appended an island into, and its straight-line transfer is then not the
++     * block's execution order: an instruction attributed to the block by its
++     * `src_pc` can sit at the end of the IR and be on a different edge. A
++     * strong update there lowers a register the block never actually cleared,
++     * so such a block keeps the joining update. Joining is the safe direction:
++     * it can only raise a register's state, which costs precision, never
++     * soundness.
++     */
++    for (b = 0; b < n_blocks; b++) {
++        for (i = bs[b]; bs[b] >= 0 && i < be[b]; i++)
++            if (blk[i] != b) { weak[b] = 1; break; }
++    }
++    /*
+      * Successors, re-derived from the final IR. `succ` predates the fusion
+      * passes, which append a branch island -- edge copies followed by the branch
+      * -- that the original CFG never named as a block; and a branch whose target
+@@ -57270,7 +57391,7 @@
+         inq[b] = 1;
+     }
+     while (sp > 0) {
+-        uint8_t *in, *out;
++        uint8_t *in, *out, *in_i, *out_i;
+         b = queue[--sp];
+         inq[b] = 0;
+         in = blkin + (size_t)b * nreg;
+@@ -57291,19 +57412,61 @@
+             for (i = 0; i < nreg; i++)
+                 in[i] = REG_OWN_MAYBE;
+         }
++        /*
++         * The init half of the entry state, recomputed from the predecessors
++         * each visit. It is a must-analysis, so unlike the own half it can fall
++         * as well as rise; recomputing is what lets it do that. The join is AND
++         * (INIT only if INIT on every predecessor). The entry block starts from
++         * the argument registers, and an exception entry is all UNINIT -- the
++         * registers there hold whatever the protected region left, which the
++         * exception edge does not describe.
++         */
++        in_i = blkin_i + (size_t)b * nreg;
++        if (b == 0) {
++            memcpy(in_i, entry_i, nreg);
++        } else if (ex_entry[b]) {
++            memset(in_i, REG_INIT_UNINIT, nreg);
++        } else {
++            int first = 1;
++            for (e = ph[b]; e != -1; e = pn[e]) {
++                uint8_t *o = blkout_i + (size_t)pb[e] * nreg;
++                if (first) {
++                    memcpy(in_i, o, nreg);
++                    first = 0;
++                } else {
++                    for (i = 0; i < nreg; i++)
++                        in_i[i] &= o[i];
++                }
++            }
++            if (first)
++                memset(in_i, REG_INIT_UNINIT, nreg);
++        }
+         out = blkout + (size_t)b * nreg;
++        out_i = blkout_i + (size_t)b * nreg;
+         /* Transfer into a scratch buffer, then compare with the block's last
+            output. Comparing with `in` instead would miss a growth that came
+            from a predecessor but that this block's own transfer did not add to,
+            and the successors would never be revisited. */
+         memcpy(tmp, in, nreg);
+-        for (i = bs[b]; i >= 0 && i < be[b]; i++)
+-            if (blk[i] == b)
+-                regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
+-                               cycle_reg);
+-        for (i = 0; i < nreg; i++) {
+-            if (tmp[i] != out[i]) {
++        memcpy(init_i, in_i, nreg);
++        for (i = bs[b]; i >= 0 && i < be[b]; i++) {
++            if (blk[i] != b)
++                continue;
++            regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
++                           cycle_reg, weak[b]);
++            regvm_own_init_step(&ir->insns[i], init_i, ireg, n_values, reg_count,
++                                cycle_reg, weak[b]);
++        }
++        {
++            int changed = 0;
++            for (i = 0; i < nreg; i++)
++                if (tmp[i] != out[i]) { changed = 1; break; }
++            if (!changed)
++                for (i = 0; i < nreg; i++)
++                    if (init_i[i] != out_i[i]) { changed = 1; break; }
++            if (changed) {
+                 memcpy(out, tmp, nreg);
++                memcpy(out_i, init_i, nreg);
+                 for (k = 0; k < sxn[b]; k++) {
+                     int sb = sx[b * 4 + k];
+                     if (sb >= 0 && sb < n_blocks && !inq[sb]) {
+@@ -57311,7 +57474,6 @@
+                         inq[sb] = 1;
+                     }
+                 }
+-                break;
+             }
+         }
+     }
+@@ -57321,8 +57483,13 @@
+     {
+         int plain = 0, nret = 0, owned_max = 0;
+         uint8_t *st = js_malloc(ctx, nreg);
+-        if (!st)
++        uint8_t *init_st = js_malloc(ctx, nreg);
++        if (!st || !init_st) {
++            js_free(ctx, st);
++            js_free(ctx, init_st);
+             goto done;
++        }
++        memset(uni, 0, nreg);
+ #ifdef QJS_REGVM_RCCHECK
+         /* Section 6.2 consumes exactly what this replay already computes. */
+         ir->own_nreg = nreg;
+@@ -57345,11 +57512,33 @@
+             if (bs[b] < 0)
+                 continue;
+             memcpy(st, blkin + (size_t)b * nreg, nreg);
++            memcpy(init_st, blkin_i + (size_t)b * nreg, nreg);
+             for (i = bs[b]; i < be[b]; i++) {
+                 JSRegInsn *in = &ir->insns[i];
+                 uint16_t rop = in->rop;
+                 if (blk[i] != b)
+                     continue;
++                /*
++                 * Kind 1: an operand read. Every `r` operand that is not a
++                 * destination is read here, and a register that may be UNINIT
++                 * when it is read must be filled at entry.
++                 */
++                {
++                    const char *ff = regvm_rop_fmt[rop];
++                    int di_ = regvm_own_dest_index(rop);
++                    int di2_ = regvm_own_second_dest_index(rop);
++                    if (ff) {
++                        for (k = 0; ff[k]; k++) {
++                            int r;
++                            if (ff[k] != 'r' || k == di_ || k == di2_)
++                                continue;
++                            r = regvm_own_op_reg(in, k, ireg, n_values, reg_count,
++                                                 cycle_reg);
++                            if (r >= 0 && init_st[r] == REG_INIT_UNINIT)
++                                init_set[r] = REG_INIT_INIT;
++                        }
++                    }
++                }
+                 if (regvm_own_has_dest(rop) && regvm_rop_fmt[rop] &&
+                     regvm_rop_fmt[rop][regvm_own_dest_index(rop)] == 'r') {
+                     int d = regvm_own_op_reg(in, regvm_own_dest_index(rop), ireg,
+@@ -57358,6 +57547,20 @@
+                     int d2 = di2 >= 0 ? regvm_own_op_reg(in, di2, ireg, n_values,
+                                                          reg_count, cycle_reg)
+                                       : -1;
++                    if (!(d >= 0 && st[d] == REG_OWN_NONE &&
++                          (d2 < 0 || st[d2] == REG_OWN_NONE))) {
++                        /*
++                         * Kind 2: a definition that will be emitted non-plain
++                         * reads its destination's old value. If the destination
++                         * may be UNINIT, that read would touch garbage, so the
++                         * register is filled. (Once a plain variant exists for
++                         * the opcode, the definition stops needing the fill.)
++                         */
++                        if (d >= 0 && init_st[d] == REG_INIT_UNINIT)
++                            init_set[d] = REG_INIT_INIT;
++                        if (d2 >= 0 && init_st[d2] == REG_INIT_UNINIT)
++                            init_set[d2] = REG_INIT_INIT;
++                    }
+                     if (d >= 0 && st[d] == REG_OWN_NONE &&
+                         (d2 < 0 || st[d2] == REG_OWN_NONE)) {
+                         plain++;
+@@ -57390,6 +57593,21 @@
+ #endif
+                     if (cnt > owned_max)
+                         owned_max = cnt;
++                    ret_sum += cnt;
++                    /*
++                     * Kind 3-4: the release walk at a return, and the
++                     * unwinder's walk when the frame is abandoned. Every
++                     * register it may free must hold a real value or a filled
++                     * one. `uninit_ret` counts the registers the *full* walk
++                     * would touch while they are still UNINIT -- the set C2's
++                     * narrowed walk removes from the fill.
++                     */
++                    for (k = 0; k < nreg; k++)
++                        if (st[k] != REG_OWN_NONE && init_st[k] == REG_INIT_UNINIT)
++                            init_set[k] = REG_INIT_INIT;
++                    for (k = 0; k < nreg; k++)
++                        if (init_st[k] == REG_INIT_UNINIT)
++                            uninit_ret++;
+                     if (dump) {
+                         fprintf(stderr, "##OWNRET## i=%d rop=%d n=%d:", i, rop,
+                                 cnt);
+@@ -57400,15 +57618,29 @@
+                         fprintf(stderr, "\n");
+                     }
+                 }
+-                regvm_own_step(in, st, ireg, n_values, reg_count, cycle_reg);
++                regvm_own_step(in, st, ireg, n_values, reg_count, cycle_reg,
++                               weak[b]);
++                regvm_own_init_step(in, init_st, ireg, n_values, reg_count,
++                                    cycle_reg, weak[b]);
++                for (k = 0; k < nreg; k++)
++                    if (st[k] != REG_OWN_NONE)
++                        uni[k] = 1;
+             }
+         }
++        for (k = 0; k < nreg; k++) {
++            if (init_set[k] == REG_INIT_INIT)
++                init_cnt++;
++            if (uni[k])
++                uni_cnt++;
++        }
+         js_free(ctx, st);
++        js_free(ctx, init_st);
+         if (dump)
+             fprintf(stderr,
+                     "##OWNSUM## insns=%d regs=%d blocks=%d plain=%d returns=%d "
+-                    "owned_max=%d\n",
+-                    n, reg_count, n_blocks, plain, nret, owned_max);
++                    "owned_max=%d ret_sum=%d init=%d union=%d uninit_ret=%d\n",
++                    n, reg_count, n_blocks, plain, nret, owned_max, ret_sum,
++                    init_cnt, uni_cnt, uninit_ret);
+ #ifdef QJS_REGVM_COUNT
+         js_regvm_own_plain += plain;
+         js_regvm_own_returns += nret;
+@@ -57430,6 +57662,14 @@
+     js_free(ctx, sx);
+     js_free(ctx, sxn);
+     js_free(ctx, ex_entry);
++    js_free(ctx, blkin_i);
++    js_free(ctx, weak);
++    js_free(ctx, blkout_i);
++    js_free(ctx, init_i);
++    js_free(ctx, has_def);
++    js_free(ctx, entry_i);
++    js_free(ctx, init_set);
++    js_free(ctx, uni);
+ }
+ 
+ #ifdef QJS_REGVM_RCCHECK

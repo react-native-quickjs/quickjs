@@ -1,0 +1,88 @@
+Subject: register VM fills a frame's registers from a static `undefined` template
+
+What this does:
+  `regvm_record_fill` gives a callee frame its initial register values before the
+  program runs. Two properties have to hold at once. Every register must hold a
+  valid, *not reference counted* word, because the store handlers release the
+  destination's old value and the release walk frees every counted register, so a
+  register left holding a recycled frame's word would be released twice. And the
+  registers the liveness analysis named -- the ones whose value can be observed
+  before it is written, plus the scratch, window and handshake registers that sit
+  outside the analysis domain -- must read `undefined`, because that is what the
+  frame always presented.
+
+  The existing code did the first property for free, by zeroing the whole
+  register area (`all-bits-zero` is the integer 0: valid and uncounted), and then
+  paid a scalar store loop for the second, writing `JS_UNDEFINED` into each named
+  register. When there is no fill list -- a function read from a blob, whose side
+  table is never serialized -- it filled *every* register with a scalar loop.
+
+  The fill is on the JS-call path, so the loop's store count is the frame's
+  register count, once per call.
+
+  This fills the registers from a static block of `undefined` words instead:
+
+      static const JSValue regvm_undef_tmpl[REGVM_UNDEF_TMPL_N] = {
+          [0 ... REGVM_UNDEF_TMPL_N - 1] = { { .int32 = 0 }, JS_TAG_UNDEFINED },
+      };
+
+      if (likely(nregs <= REGVM_UNDEF_TMPL_N)) {
+          memcpy(lay->regs, regvm_undef_tmpl, (size_t)nregs * sizeof(JSValue));
+      } else if (!cb->regvm_fill) {
+          ... existing scalar loop ...
+      } else {
+          ... existing zero-then-list fill ...
+      }
+
+  Filling all of them with `undefined` is a superset of what the analysis asks
+  for and is still correct: `undefined` is valid and uncounted, so it satisfies
+  the first property too, and the analysis's own list only ever *names* registers
+  to set to `undefined`, never to any other value. Frames with more than
+  `REGVM_UNDEF_TMPL_N` (256) registers keep the old paths; none of the built-in
+  or measured programs reaches that, and 256 words is 4 KB of `.rodata`.
+
+  The template is a constant initializer rather than a load-time constructor, so
+  nothing has to run before `main`, and the fallback branch is a `likely` so the
+  common path is a single `memcpy` with a length the caller already computed.
+
+  Measured (`fixed.js`, 32 iterations, i7-8700): 23,834,989,409 ->
+  23,600,642,543 instructions (**-0.234 G, -0.98 %**) and 11,088,407,289 ->
+  11,159,266,968 cycles (flat within noise), against the plan's 0.33 G expected /
+  0.2 G floor for this item. Gate run: 23,577,348,399 / 11,129,160,915.
+  Checksum `546.1008391043414` exact; diff-suite `pass=398 fail=0 skip=0` mono and
+  threaded; leak assertion clean; peak RSS 13240 KB (a 4 KB `.rodata` template).
+  Re-measured on the landed `static const` build in an interleaved base+L1..L4
+  session, the delta is unchanged within noise (23,840,570,326 -> 23,601,493,569,
+  -0.239 G), confirming the `const` qualifier is codegen-neutral.
+
+No opcode, operand encoding or serialized register-format change.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27112,6 +27112,16 @@
+  * AAPCS64 passes eight in registers, so four went through the stack on every JS
+  * call. See `P3-REVIEW-2026-09-29.md` §3.1 item 2.
+  */
++/*
++ * L4: a static block of `undefined` words. Every register must hold a valid,
++ * uncounted word before the frame runs, and the registers the analysis says are
++ * live in must read `undefined`; filling the whole frame from this template is
++ * one memcpy instead of a scalar store loop. `.local/next-land-2.md` L4.
++ */
++#define REGVM_UNDEF_TMPL_N 256
++static const JSValue regvm_undef_tmpl[REGVM_UNDEF_TMPL_N] = {
++    [0 ... REGVM_UNDEF_TMPL_N - 1] = { { .int32 = 0 }, JS_TAG_UNDEFINED },
++};
+ static __attribute__((always_inline)) inline void regvm_record_fill(
+     JSRuntime *rt, const JSRegRecordLayout *lay, JSValueConst cf, JSObject *co,
+     JSFunctionBytecode *cb, JSRegRun *caller, int ret_dst, uint8_t *ret_ip,
+@@ -27247,7 +27257,9 @@
+          * handshake registers (everything outside the analysis domain), because
+          * a window slot a call does not write is read as an argument.
+          */
+-        if (!cb->regvm_fill) {
++        if (likely(nregs <= REGVM_UNDEF_TMPL_N)) {
++            memcpy(lay->regs, regvm_undef_tmpl, (size_t)nregs * sizeof(JSValue));
++        } else if (!cb->regvm_fill) {
+             for (k = 0; k < nregs; k++)
+                 lay->regs[k] = JS_UNDEFINED;
+         } else {

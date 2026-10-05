@@ -1,0 +1,202 @@
+Subject: register VM: publish each frame's register window as a GC root range
+
+What this does:
+  Every register-VM frame now records where its live registers are and how many
+  there are (`JSStackFrame.rv_regs` / `rv_nregs`), and a single walker,
+  `regvm_for_each_root_range`, visits them along the `prev_frame` chain. This
+  is stage D1 of the deferred-RC plan
+  (`HP-S3-DEFERRED-RC-PLAN-2026-10-02.md` section 3): it is the registry the
+  ZCT reconcile pass and the later register-ownership flip will both scan, and
+  it changes no ownership yet.
+
+  The window excludes the last handshake slot, which holds the control-stack
+  depth as an integer rather than a value: `rv_nregs` is
+  `regvm_reg_count + REGVM_HS - 1`. The four places that build a register frame
+  -- `regvm_record_fill`, the in-loop call macro, the fresh `JS_CallInternal`
+  bytecode path, and `async_func_init` -- set it; the three C-frame helpers
+  (`js_call_c_function_data`, `js_call_c_closure`, `js_call_c_function`) set it
+  to NULL/0 so a native frame is never mistaken for a register root.
+
+  `QJS_DRC_VALIDATE` adds a debug validator, run from `JS_RunGC`, that asserts
+  every counted value in a root range is still owned (count >= 1). It holds
+  while registers own, and is the check that catches a missed `js_dup` in the
+  D4 ownership flip. Both switches default to off; `QJS_DRC` is the umbrella
+  that stage D2 turns on.
+
+  In a build that does not turn on the deferred-RC collector the two stores are
+  compiled out (`REGVM_SET_ROOT` is a no-op), so D1 is instruction-neutral there;
+  it costs nothing until `QJS_DRC` is enabled in stage D2.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63,6 +63,18 @@
+ typedef struct JSRegRCC JSRegRCC;
+ #endif
+ 
++/*
++ * Deferred reference counting (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md).
++ * QJS_DRC enables the machinery (ZCT, reconcile, register-root scanning);
++ * it is off until stage D2. QJS_DRC_VALIDATE adds the debug root validator.
++ */
++#ifndef QJS_DRC
++#define QJS_DRC 0
++#endif
++#ifndef QJS_DRC_VALIDATE
++#define QJS_DRC_VALIDATE 0
++#endif
++
+ #if defined(EMSCRIPTEN) || defined(_MSC_VER)
+ #define DIRECT_DISPATCH  0
+ #else
+@@ -631,8 +643,46 @@
+        the coroutine's locals keep the (suspended) coroutine reachable by
+        the cycle collector. */
+     struct JSGCObjectHeader *cur_gc_obj;
++    /* Register-VM register window owned by this frame, or NULL when the
++       frame does not run register code (stack interpreter, native call,
++       C frame). `rv_regs[0..rv_nregs)` are the frame's live registers and
++       are treated as roots by the deferred-RC collector. */
++    JSValue *rv_regs;
++    uint32_t rv_nregs;
+ } JSStackFrame;
+ 
++#if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
++/*
++ * D1 root registry (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md section 3, stage D1).
++ *
++ * A register-VM frame publishes its live register window on its JSStackFrame.
++ * `regvm_for_each_root_range` is the one place that finds register roots; the
++ * deferred-RC collector and the validator both go through it. Only frames that
++ * actually run register code have `rv_regs != NULL`; stack-interpreter frames,
++ * native frames and C frames leave it NULL.
++ */
++typedef void (*JSRegRootFn)(void *opaque, JSValue *regs, uint32_t nregs);
++
++static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
++                                      void *opaque)
++{
++    JSStackFrame *sf;
++    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
++        if (sf->rv_regs && sf->rv_nregs)
++            fn(opaque, sf->rv_regs, sf->rv_nregs);
++    }
++}
++#endif /* QJS_REGVM */
++
++/* Publish a frame's live register window as a GC root range. Inert (a no-op) in
++   builds that do not use the deferred-RC collector, so the root registry costs
++   nothing there. */
++#if QJS_DRC || QJS_DRC_VALIDATE
++#define REGVM_SET_ROOT(sf_, r_, n_) do { (sf_)->rv_regs = (r_); (sf_)->rv_nregs = (n_); } while (0)
++#else
++#define REGVM_SET_ROOT(sf_, r_, n_) ((void)0)
++#endif
++
+ typedef enum {
+     JS_GC_OBJ_TYPE_JS_OBJECT,
+     JS_GC_OBJ_TYPE_FUNCTION_BYTECODE,
+@@ -695,6 +745,35 @@
+ #define JS_GC_MARK(p)   (js_rc(p)->mark)
+ #define JS_GC_NOTRACE(p) (js_rc(p)->gc_notrace)
+ 
++#if QJS_REGVM && QJS_DRC_VALIDATE
++static void js_drc_validate_range(void *opaque, JSValue *regs, uint32_t nregs)
++{
++    JSRuntime *rt = opaque;
++    uint32_t i;
++    for (i = 0; i < nregs; i++) {
++        JSValue v = regs[i];
++        if (!JS_VALUE_HAS_REF_COUNT(v))
++            continue;
++        if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1) {
++            fprintf(stderr,
++                    "drc-validate: register %p[%u] holds a counted value at "
++                    "ref_count %u\n",
++                    (void *)regs, i,
++                    JS_REF_COUNT(JS_VALUE_GET_PTR(v)));
++            abort();
++        }
++    }
++    (void)rt;
++}
++
++/* Every counted value reachable from a live register must be owned (count >= 1)
++   while registers still own. Called at GC time, never mid-release. */
++static void js_drc_validate_roots(JSRuntime *rt)
++{
++    regvm_for_each_root_range(rt, js_drc_validate_range, rt);
++}
++#endif
++
+ /* bigint */
+ typedef int32_t js_slimb_t;
+ typedef uint32_t js_limb_t;
+@@ -8498,6 +8577,7 @@
+     }
+     prev_sf = rt->current_stack_frame;
+     sf->prev_frame = prev_sf;
++    REGVM_SET_ROOT(sf, NULL, 0);
+     rt->current_stack_frame = sf;
+     // TODO(bnoordhuis) switch realms like js_call_c_function does
+     sf->is_strict_mode = false;
+@@ -8624,6 +8704,7 @@
+ 
+     prev_sf = rt->current_stack_frame;
+     sf->prev_frame = prev_sf;
++    REGVM_SET_ROOT(sf, NULL, 0);
+     rt->current_stack_frame = sf;
+     // TODO(bnoordhuis) switch realms like js_call_c_function does
+     sf->is_strict_mode = false;
+@@ -9448,6 +9529,9 @@
+ 
+ void JS_RunGC(JSRuntime *rt)
+ {
++#if QJS_DRC_VALIDATE
++    js_drc_validate_roots(rt);
++#endif
+     /* decrement the reference of the children of each object. mark =
+        1 after this pass. */
+     gc_decref(rt);
+@@ -21022,6 +21106,7 @@
+ 
+     prev_sf = rt->current_stack_frame;
+     sf->prev_frame = prev_sf;
++    REGVM_SET_ROOT(sf, NULL, 0);
+     rt->current_stack_frame = sf;
+     ctx = p->u.cfunc.realm; /* change the current realm */
+ 
+@@ -26384,6 +26469,7 @@
+     sf->cur_pc = NULL;
+     sf->cur_sp = NULL;
+     sf->prev_frame = caller->sf;
++    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+ 
+     sf->arg_buf = rec->arg_buf;
+     /*
+@@ -27143,6 +27229,7 @@
+                         _lay.sf->cur_pc = NULL; \
+                         _lay.sf->cur_sp = NULL; \
+                         _lay.sf->prev_frame = rt->current_stack_frame; \
++                        REGVM_SET_ROOT(_lay.sf, _lay.regs, _cb->regvm_reg_count + REGVM_HS - 1); \
+                         for (_k = 0; _k < _slots; _k++) \
+                             _lay.arg_buf[_k] = (_k < _na) \
+                                 ? js_dup(_oargv[_k]) : JS_UNDEFINED; \
+@@ -32471,6 +32558,7 @@
+         sf->var_refs[i] = NULL;
+     /* ordinary C-stack frame: not owned by a coroutine GC object */
+     sf->cur_gc_obj = NULL;
++    REGVM_SET_ROOT(sf, stack_buf, b->regvm_reg_count + REGVM_HS - 1);
+     sp = stack_buf;
+     pc = b->byte_code_buf;
+     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
+@@ -36183,8 +36271,10 @@
+     /* set by the caller once the owning coroutine GC object exists */
+     sf->cur_gc_obj = NULL;
+ #if QJS_REGVM
++    REGVM_SET_ROOT(sf, sf->cur_sp, b->regvm_reg_count + REGVM_HS - 1);
+     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->regvm_reg_count + REGVM_HS);
+ #else
++    REGVM_SET_ROOT(sf, NULL, 0);
+     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
+ #endif
+     sf->var_ref_count = b->var_ref_count;

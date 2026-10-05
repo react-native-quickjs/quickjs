@@ -1,0 +1,74 @@
+Subject: register VM tries the inline hit for a chained read's second link before the IC
+
+What this does:
+  A chained property read (`a.b.c`) is lowered to `ROP_get_field_chain`, whose
+  slow half resolves the first link, stores it, and then always musttails
+  `regvm_t_get_field_chain_second_slow` -> `regvm_get_field_ic` for the second
+  link. The second link has its own PIC site, and on ~20 % of chain sites
+  (906 K `regvm_get_field_ic` entries on the fixed kernel) that site already
+  holds the right shape -- so the read is about to take a full IC lookup to
+  rediscover a hit the inline checker would have confirmed in a few cycles.
+
+  This tries the second link's own inline hit first:
+
+      if (site2 != REG_IC_NONE &&
+          regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1), site2, &v2)) {
+          if (f->pic != NULL && site1 != REG_IC_NONE &&
+              f->pic[site1].kind == REG_PIC_OWN && f->pic[site2].kind == REG_PIC_OWN)
+              *ip = (uint8_t)ROP_get_field_chain_own;
+          else
+              *ip = (uint8_t)ROP_get_field_chain;
+          T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
+      }
+      __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
+
+  On a hit the instruction is rewritten to its all-own form when both sites are
+  `REG_PIC_OWN`, so the next execution takes the quickened `_own` chain handler
+  rather than re-entering the slow half; otherwise it stays on the plain chain
+  form. `ROP_get_field_chain_own` and `ROP_get_field_chain` share the same
+  operand layout (format `rrasrras`; the receiver is operand 3, the destination
+  11, the second site 19), so the rewrite is just an opcode byte. The store uses
+  the same borrowed `T_SET_NEXT_B` the quickened chain handlers use.
+
+  The change is entirely inside the slow half of the chain handler, so it only
+  runs when the fused quickened path has already missed; put sites are untouched
+  and no opcode is added.
+
+  Measured (`fixed.js`, 32 iterations, i7-8700), on top of 0147: 23,449,645,130
+  -> 23,244,145,368 instructions (**-0.205 G, -0.88 %**), against the plan's
+  0.20 G expected. Gate run: 23,217,606,600 / 11,002,994,762. Checksum
+  `546.1008391043414` exact; diff-suite `pass=398 fail=0 skip=0` mono and
+  threaded; leak assertion clean; peak RSS 13400 KB.
+
+No opcode, operand encoding or serialized register-format change.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26069,6 +26069,28 @@
+         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
+     }
+ #endif
++    /*
++     * L2: the second link's site may already hold this shape even though the
++     * first link's did not, and the path below (`chain_second_slow` ->
++     * `regvm_get_field_ic`) would then take the full IC lookup. Try the inline
++     * hit for the second link first; on a hit, requicken the whole instruction
++     * from the two sites' kinds so the next execution stays in the quickened
++     * handler.
++     */
++    {
++        int d2 = T_REG(11);
++        int site2 = T_REG(19);
++        JSValue v2;
++        if (site2 != REG_IC_NONE &&
++            regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1), site2, &v2)) {
++            if (f->pic != NULL && site1 != REG_IC_NONE &&
++                f->pic[site1].kind == REG_PIC_OWN && f->pic[site2].kind == REG_PIC_OWN)
++                *ip = (uint8_t)ROP_get_field_chain_own;
++            else
++                *ip = (uint8_t)ROP_get_field_chain;
++            T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
++        }
++    }
+     __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
+ }
+ 

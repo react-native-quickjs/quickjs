@@ -1,0 +1,299 @@
+Subject: register VM: borrow `this`, a cached global and numeric fast-path results instead of dup+adopt
+
+What this does:
+  The register VM's deferred-RC ownership flip (0142) made a register store a
+  borrow, and with it the frame and heap reads (get_local, get_arg,
+  get_var_ref, the field and element reads) already store borrowed values.
+  Two read opcodes and the arithmetic fast-path stores were left on the old
+  owning form:
+
+  - load_this dup'd `f->this_obj` (or the global object) and then adopted the
+    dup straight back into the destination. Both owners outlive the
+    instruction -- the frame owns this_obj, the runtime owns the global -- so
+    the register can borrow. Only a non-strict primitive receiver, which has
+    to be boxed and can allocate, still makes a new reference, and it stays in
+    the slow handler.
+
+  - get_global dup'd the value a filled global-cell cache hit found. The
+    cell's object slot owns that value, so it borrows the same way. A new
+    `js_gv_cell_peek` is `js_gv_cell_probe` without the dup; the stack VM's
+    OP_get_var keeps the owning probe.
+
+  - the arithmetic fast paths (T_FAST_RRR, T_FAST_UN, T_FAST_SHAPE,
+    T_FAST_RRR_F64 and the five per-shape binary handlers, plus regvm_t_unary)
+    stored with T_SET_NEXT_P, which adopts. `regvm_num_fast` and
+    `regvm_unary_num_fast` return only immediates -- an int, a float or a
+    boolean -- so there is no producer reference to give up and the adopt was
+    a six-instruction tag test that never released anything. They now store
+    with T_SET_NEXT_B. The generic cold halves keep T_SET_NEXT_P:
+    `js_regvm_binary` can hand back an owned string or object.
+
+  The monolith's load_this arm is changed to match (it is unreachable for this
+  opcode under QJS_REGVM_THREAD, but a THREAD=0 build runs it).
+
+  With deferred RC off the store macros dup as before, so both builds stay
+  correct.
+
+  Measured (`fixed.js`, 32 iterations, i7-8700): 24,558,165,446 ->
+  24,139,931,233 instructions (**-0.418 G, -1.70 %**) and 11,479,956,505 ->
+  11,411,074,466 cycles (noisy, ~-0.6 %), against the plan's 0.3 G expected /
+  0.15 G floor for this item; the two read opcodes are ~0.402 G of that and
+  the numeric stores ~0.016 G. Checksum `546.1008391043414` exact; diff-suite
+  `pass=398 fail=0 skip=0` mono and threaded; test262 50/81192 errors (<= 50,
+  baseline equal); ASan+UBSan box2d clean and a test262 subset error set equal
+  to the reference; ASan with `zct_limit` forced to 1 (every safepoint
+  reconciles) on box2d reports no use-after-free; leak assertion clean.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -14701,24 +14701,38 @@
+     return 0;
+ }
+ 
+-/* Probe the cell cache; on a hit stores a new reference in *pval.  A helper so
+-   the OP_get_var handler adds no locals to JS_CallInternal. */
+-static inline bool js_gv_cell_probe(JSContext *ctx, JSAtom atom, JSValue *pval)
++/*
++ * Probe the cell cache without taking a reference; on a hit stores the borrowed
++ * property value in *pval.  The register VM stores it straight into a register,
++ * which borrows under deferred RC, so it needs no count traffic at all: the
++ * global object's slot owns the value and keeps it alive.
++ */
++static inline bool js_gv_cell_peek(JSContext *ctx, JSAtom atom, JSValue *pval)
+ {
+     JSGVCell *gvc = ctx->gv_cells[atom & (JS_GV_CELL_SETS - 1)];
+     uint32_t gen = ctx->rt->gv_cell_gen;
+ 
+     if (likely(gvc[0].atom == atom && gvc[0].gen == gen)) {
+-        *pval = js_dup(gvc[0].obj->prop[gvc[0].offset].u.value);
++        *pval = gvc[0].obj->prop[gvc[0].offset].u.value;
+         return true;
+     }
+     if (gvc[1].atom == atom && gvc[1].gen == gen) {
+-        *pval = js_dup(gvc[1].obj->prop[gvc[1].offset].u.value);
++        *pval = gvc[1].obj->prop[gvc[1].offset].u.value;
+         return true;
+     }
+     return false;
+ }
+ 
++/* Probe the cell cache; on a hit stores a new reference in *pval.  A helper so
++   the OP_get_var handler adds no locals to JS_CallInternal. */
++static inline bool js_gv_cell_probe(JSContext *ctx, JSAtom atom, JSValue *pval)
++{
++    if (!js_gv_cell_peek(ctx, atom, pval))
++        return false;
++    *pval = js_dup(*pval);
++    return true;
++}
++
+ /* Record "this atom is own data property #(pr - p->prop) of p". */
+ static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
+                                    JSObject *p, JSProperty *pr)
+@@ -24232,12 +24246,24 @@
+         T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ 
+-/* the fast halves: the numeric path, then the cold half by tail call */
++/*
++ * The fast halves: the numeric path, then the cold half by tail call.
++ *
++ * Every hit stores with T_SET_NEXT_B, not T_SET_NEXT_P. `regvm_num_fast` and
++ * `regvm_unary_num_fast` return only immediates -- an int, a float, or a
++ * boolean -- so there is no producer reference for an adopt to give up. With
++ * T_SET_NEXT_P the store ran REG_ADOPT on a value whose tag can never be
++ * counted, a six-instruction tag test whose branch never releases anything;
++ * T_SET_NEXT_B is the plain store under deferred RC and a no-op dup under
++ * owning RC, which is what those paths actually need. The generic cold halves
++ * below still use T_SET_NEXT_P: `js_regvm_binary` can hand back an owned
++ * string or object (string concatenation), and that reference must be adopted.
++ */
+ #define T_FAST_RRR(SUB_, SZ_, SLOW_) do { \
+         int _d = T_REG(1); \
+         JSValue _out; \
+         if (likely(regvm_num_fast(SUB_, FR(T_REG(3)), FR(T_REG(5)), &_out))) { \
+-            T_SET_NEXT_P(_d, _out, SZ_); \
++            T_SET_NEXT_B(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -24245,7 +24271,7 @@
+         int _d = T_REG(1); \
+         JSValue _out; \
+         if (likely(regvm_unary_num_fast(SUB_, FR(T_REG(3)), &_out))) { \
+-            T_SET_NEXT_P(_d, _out, SZ_); \
++            T_SET_NEXT_B(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -24253,7 +24279,7 @@
+         int _d = T_REG(1); \
+         JSValue _out; \
+         if (likely(regvm_num_fast(SUB_, FR(T_REG(4)), FR(T_REG(6)), &_out))) { \
+-            T_SET_NEXT_P(_d, _out, SZ_); \
++            T_SET_NEXT_B(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -24284,7 +24310,7 @@
+         } \
+         JSValue _out; \
+         if (likely(regvm_num_fast(SUB_, FR(_a), FR(_b), &_out))) { \
+-            T_SET_NEXT_P(_d, _out, SZ_); \
++            T_SET_NEXT_B(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -25340,7 +25366,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, f->var_buf[ls], FR(rc), &out))) {
+-        T_SET_NEXT_P(d, out, T_SZ_RBUR);
++        T_SET_NEXT_B(d, out, T_SZ_RBUR);
+     }
+     __attribute__((musttail)) return regvm_t_binary_loc_reg_slow(REGVM_PASS);
+ }
+@@ -25356,7 +25382,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, FR(rc), f->var_buf[rs], &out))) {
+-        T_SET_NEXT_P(d, out, T_SZ_RBRU);
++        T_SET_NEXT_B(d, out, T_SZ_RBRU);
+     }
+     __attribute__((musttail)) return regvm_t_binary_reg_loc_slow(REGVM_PASS);
+ }
+@@ -25372,7 +25398,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, f->var_buf[ls], f->var_buf[rs], &out))) {
+-        T_SET_NEXT_P(d, out, T_SZ_RBUU);
++        T_SET_NEXT_B(d, out, T_SZ_RBUU);
+     }
+     __attribute__((musttail)) return regvm_t_binary_loc_loc_slow(REGVM_PASS);
+ }
+@@ -25388,7 +25414,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+-        T_SET_NEXT_P(d, out, T_SZ_RBR_I);
++        T_SET_NEXT_B(d, out, T_SZ_RBR_I);
+     }
+     __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS);
+ }
+@@ -25404,7 +25430,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+-        T_SET_NEXT_P(d, out, T_SZ_RBRI_S);
++        T_SET_NEXT_B(d, out, T_SZ_RBRI_S);
+     }
+     __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS);
+ }
+@@ -25419,7 +25445,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_unary_num_fast(sub, FR(s), &out))) {
+-        T_SET_NEXT_P(d, out, T_SZ_RBR);
++        T_SET_NEXT_B(d, out, T_SZ_RBR);
+     }
+     __attribute__((musttail)) return regvm_t_unary_slow(REGVM_PASS);
+ }
+@@ -25630,7 +25656,8 @@
+ }
+ 
+ /* cold: a non-strict `this` that is a primitive has to be boxed, and boxing
+-   can allocate and throw. null/undefined and an object are js_dups. */
++   can allocate and throw. null/undefined and an object are borrowed, not boxed,
++   so they never reach here. */
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_load_this_slow(REGVM_ARGS)
+ {
+     JSValue val = JS_ToObject(ctx, f->this_obj);
+@@ -25642,22 +25669,27 @@
+ static uint8_t *REGVM_CC regvm_t_load_this(REGVM_ARGS)
+ {
+     int d = T_REG(1);
+-    JSValue val;
+ 
++    /*
++     * The frame owns this_obj and the runtime owns the global object, so a
++     * register only borrows either: the dup the old form made and the adopt that
++     * gave it straight back were pure count traffic.  Boxing a primitive is the
++     * one case that makes a new reference, and it can allocate and throw, so it
++     * stays in the slow half.
++     */
+     if (likely(f->b->is_strict_mode)) {
+-        val = js_dup(f->this_obj);
++        T_SET_NEXT_B(d, f->this_obj, T_SZ_R);
+     } else {
+         uint32_t tag = JS_VALUE_GET_TAG(f->this_obj);
+         if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+-            val = js_dup(ctx->global_obj);
++            T_SET_NEXT_B(d, ctx->global_obj, T_SZ_R);
+         } else if (likely(tag == JS_TAG_OBJECT)) {
+-            val = js_dup(f->this_obj);
++            T_SET_NEXT_B(d, f->this_obj, T_SZ_R);
+         } else {
+             __attribute__((musttail))
+                 return regvm_t_load_this_slow(REGVM_PASS);
+         }
+     }
+-    T_SET_NEXT_P(d, val, T_SZ_R);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS)
+@@ -25782,8 +25814,10 @@
+  * this handler could not be frameless. A filled cell has already passed the TDZ
+  * test -- the sole writer of JS_UNINITIALIZED into global_var_obj bumps the
+  * generation, and so does any change to the global object's shape -- so a hit
+- * needs no other check. `js_gv_cell_probe` is call-free, so the fast path stays
+- * frameless, and on box2d it is the common case: 13.5M global reads.
++ * needs no other check. `js_gv_cell_peek` is call-free and takes no reference --
++ * the cell's object slot owns the value and a register borrows it -- so the fast
++ * path stays frameless with no count traffic, and on box2d it is the common
++ * case: 13.5M global reads.
+  */
+ static uint8_t *REGVM_CC regvm_t_get_global(REGVM_ARGS)
+ {
+@@ -25791,8 +25825,8 @@
+     JSAtom atom = (JSAtom)T_U32(3);
+     JSValue val;
+ 
+-    if (likely(js_gv_cell_probe(ctx, atom, &val)))
+-        T_SET_NEXT_P(d, val, T_SZ_RAB);
++    if (likely(js_gv_cell_peek(ctx, atom, &val)))
++        T_SET_NEXT_B(d, val, T_SZ_RAB);
+     __attribute__((musttail)) return regvm_t_get_global_slow(REGVM_PASS);
+ }
+ 
+@@ -28189,22 +28223,26 @@
+                  * the coercion belongs to this instruction, not to the frame.
+                  */
+                 int d = RD_REG();
+-                JSValue val;
++                /*
++                 * this_obj and the global object outlive the instruction -- the
++                 * frame owns one, the runtime the other -- so those cases only
++                 * borrow. Boxing a primitive is the ordering edge that makes a
++                 * new reference, and it can allocate and throw. */
+                 if (!b->is_strict_mode) {
+                     uint32_t tag = JS_VALUE_GET_TAG(this_obj);
+                     if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+-                        val = js_dup(ctx->global_obj);
++                        SET_REG_B(d, ctx->global_obj);
+                     } else if (likely(tag == JS_TAG_OBJECT)) {
+-                        val = js_dup(this_obj);
++                        SET_REG_B(d, this_obj);
+                     } else {
+-                        val = JS_ToObject(ctx, this_obj);
++                        JSValue val = JS_ToObject(ctx, this_obj);
+                         if (JS_IsException(val))
+                             goto exception;
++                        SET_REG_P(d, val);
+                     }
+                 } else {
+-                    val = js_dup(this_obj);
++                    SET_REG_B(d, this_obj);
+                 }
+-                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_move_xfer:

@@ -1,0 +1,171 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21931,8 +21931,67 @@
+     return JS_ToBool(ctx, v);
+ }
+ 
++/*
++ * The bitwise and shift fast path. The engine's `js_binary_logic_slow` and
++ * `js_shr_slow` convert both operands with JS_ToInt32/ToUint32 and then do the
++ * 32-bit operation; for an operand that is already an int, or a double inside
++ * the int32 range, that conversion is only a truncation, so it is done here. A
++ * double outside the range, a BigInt, a string or anything else falls through
++ * to the slow path, which owns the modular conversion, the BigInt cases and the
++ * exceptions. Returns 0 for anything it does not handle.
++ *
++ * `(int32_t)d` is only defined for a `d` inside the int32 range, so the range is
++ * checked rather than relied on; `2147483648.0` itself goes out of line, where
++ * the modular conversion lives.
++ */
++static inline __attribute__((always_inline)) int regvm_to_int32_fast(JSValue v, int32_t *out)
++{
++    int tag = JS_VALUE_GET_TAG(v);
++    if (likely(tag == JS_TAG_INT)) {
++        *out = JS_VALUE_GET_INT(v);
++        return 1;
++    }
++    if (tag == JS_TAG_FLOAT64) {
++        double d = JS_VALUE_GET_FLOAT64(v);
++        if (likely(d >= -2147483648.0 && d < 2147483648.0)) {
++            *out = (int32_t)d;
++            return 1;
++        }
++    }
++    return 0;
++}
++
++static inline __attribute__((always_inline)) int regvm_bitwise_fast(int sub, JSValue a, JSValue b, JSValue *out)
++{
++    int32_t v1, v2, r;
++
++    if (unlikely(!regvm_to_int32_fast(a, &v1) || !regvm_to_int32_fast(b, &v2)))
++        return 0;
++    switch (sub) {
++    case REG_BIN_AND: r = v1 & v2; break;
++    case REG_BIN_OR:  r = v1 | v2; break;
++    case REG_BIN_XOR: r = v1 ^ v2; break;
++    case REG_BIN_SHL: r = (int32_t)((uint32_t)v1 << (v2 & 31)); break;
++    case REG_BIN_SAR: r = v1 >> (v2 & 31); break;
++    case REG_BIN_SHR:
++        /* `>>>` is the one operation whose result is not an int32: a value above
++           INT32_MAX comes back as a double. */
++        *out = js_uint32((uint32_t)v1 >> (v2 & 31));
++        return 1;
++    default: return 0;
++    }
++    *out = js_int32(r);
++    return 1;
++}
++
+ static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue a, JSValue b, JSValue *out)
+ {
++    /* The bitwise and shift operations convert rather than promote, so they are
++       a different shape from the arithmetic ones. `sub` is a constant at every
++       leaf handler, so this test folds away there; the generic `ROP_binary`
++       pays one predictable test. */
++    if (sub >= REG_BIN_SHL && sub <= REG_BIN_OR)
++        return regvm_bitwise_fast(sub, a, b, out);
+     if (JS_VALUE_IS_BOTH_FLOAT(a, b)) {
+         double d1 = JS_VALUE_GET_FLOAT64(a), d2 = JS_VALUE_GET_FLOAT64(b);
+         switch (sub) {
+@@ -22539,6 +22598,25 @@
+ }
+ 
+ /*
++ * The double case of a fused compare, the counterpart of regvm_int_cmp. Same
++ * switch, same constant-fold at the per-sense opcodes. -1 means "not a double
++ * comparison". The inverted forms stay inverted here: `!(a < b)` is true for
++ * NaN where `a >= b` is false.
++ */
++static inline int regvm_double_cmp(int sub, double a, double b)
++{
++    switch (sub) {
++    case REG_BIN_LT: return a < b;
++    case REG_BIN_LTE: return a <= b;
++    case REG_BIN_GT: return a > b;
++    case REG_BIN_GTE: return a >= b;
++    case REG_BIN_STRICT_EQ: return a == b;
++    case REG_BIN_STRICT_NEQ: return a != b;
++    default: return -1;
++    }
++}
++
++/*
+  * Evaluate the operation a fused compare-and-branch carries and say whether the
+  * branch is taken. Exactly what the separate `ROP_binary*` + `ROP_branch_if*`
+  * pair did -- compute, then test the result's truthiness -- so any sub-operation
+@@ -24628,6 +24706,17 @@
+             if (_take) { T_BR_NEXT((SZ_) + _off); } \
+             T_NEXT((SZ_)); \
+         } \
++        if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
++                   JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64)) { \
++            int _rd = regvm_double_cmp(_sub & ~REG_CMP_INVERT, \
++                                       JS_VALUE_GET_FLOAT64(_a), \
++                                       JS_VALUE_GET_FLOAT64(_b)); \
++            if (likely(_rd >= 0)) { \
++                int _take = _rd ^ ((_sub & REG_CMP_INVERT) != 0); \
++                if (_take) { T_BR_NEXT((SZ_) + _off); } \
++                T_NEXT((SZ_)); \
++            } \
++        } \
+         __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+     }
+ 
+@@ -26241,6 +26330,12 @@
+                                                    JS_VALUE_GET_INT(_a), \
+                                                    JS_VALUE_GET_INT(_b))) < 0))) { \
+                       take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
++                  } else if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
++                                    JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64 && \
++                                    (_r = regvm_double_cmp(sub & ~REG_CMP_INVERT, \
++                                                           JS_VALUE_GET_FLOAT64(_a), \
++                                                           JS_VALUE_GET_FLOAT64(_b))) >= 0)) { \
++                      take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
+                   } else { \
+                       take = regvm_cmp_take(ctx, sub, _a, _b); \
+                       if (unlikely(take < 0)) \
+@@ -29024,21 +29119,28 @@
+                  * the integer pair goes out of line, where the coercion and the
+                  * error cases live.
+                  */
+-    #define REGVM_CMP_BRANCH(a_, b_) do { \
+-                      JSValue _a = (a_), _b = (b_); int take, _r = -1; \
+-                      if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+-                                 !((_r = regvm_int_cmp(sub & ~REG_CMP_INVERT, \
+-                                                       JS_VALUE_GET_INT(_a), \
+-                                                       JS_VALUE_GET_INT(_b))) < 0))) { \
+-                          take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
+-                      } else { \
+-                          take = regvm_cmp_take(ctx, sub, _a, _b); \
+-                          if (unlikely(take < 0)) \
+-                              goto exception; \
+-                      } \
+-                      if (take) { rpc += off; REGVM_NEXT(); } \
+-                      REGVM_NEXT(); \
+-                  } while (0)
++#undef REGVM_CMP_BRANCH
++#define REGVM_CMP_BRANCH(a_, b_) do { \
++                  JSValue _a = (a_), _b = (b_); int take, _r = -1; \
++                  if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
++                             !((_r = regvm_int_cmp(sub & ~REG_CMP_INVERT, \
++                                                   JS_VALUE_GET_INT(_a), \
++                                                   JS_VALUE_GET_INT(_b))) < 0))) { \
++                      take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
++                  } else if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
++                                    JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64 && \
++                                    (_r = regvm_double_cmp(sub & ~REG_CMP_INVERT, \
++                                                           JS_VALUE_GET_FLOAT64(_a), \
++                                                           JS_VALUE_GET_FLOAT64(_b))) >= 0)) { \
++                      take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
++                  } else { \
++                      take = regvm_cmp_take(ctx, sub, _a, _b); \
++                      if (unlikely(take < 0)) \
++                          goto exception; \
++                  } \
++                  if (take) { rpc += off; REGVM_NEXT(); } \
++                  REGVM_NEXT(); \
++              } while (0)
+ 
+         case ROP_branch_cmp_loc_loc:
+ 

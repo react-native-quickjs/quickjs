@@ -1,0 +1,74 @@
+Subject: register VM tight-store analysis walks forward, not back
+
+What this does:
+  `regvm_tight_store_def` found the two bytecode positions immediately before a
+  store by scanning forward from the block start on every call. The caller
+  already walks the block in order, so it now threads `prev`/`prev2` in and the
+  pass is linear.
+
+Why we need it:
+  The backward scan made the tight-store pass quadratic on functions with many
+  stores per block.
+
+Needs a bytecode version bump:
+  No. Lowering only.
+
+---
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61926,21 +62029,23 @@
+ 
+ /* Identify the result-producing instruction of a syntactically tight store.
+    The answer depends only on the bytecode sequence inside this basic block. */
++/*
++ * The definition position of a tight slot store at `store_pos`, given the two
++ * positions immediately before it (`prev`, `prev2`). The caller walks the block
++ * in order, so it already knows them; recomputing them by scanning back from the
++ * block start for every store is what made this pass quadratic.
++ */
+ static int regvm_tight_store_def(const JSFunctionDef *fd, const uint8_t *bc,
+                                  int block_start, int store_pos,
++                                 int prev, int prev2,
+                                  const uint8_t *slot_ok, const int *ok_index,
+                                  int *p_slot)
+ {
+-    int p, prev = -1, prev2 = -1, dpos, np, ns, role, k;
++    int dpos, np, ns, role, k;
+ 
+     if (store_pos == block_start)
+         return -1;
+-    for (p = block_start; p < store_pos;
+-         p += short_opcode_info(bc[p]).size) {
+-        prev2 = prev;
+-        prev = p;
+-    }
+-    if (prev != store_pos - short_opcode_info(bc[prev]).size)
++    if (prev < 0 || prev != store_pos - short_opcode_info(bc[prev]).size)
+         return -1;
+     dpos = prev;
+     if (bc[dpos] == OP_dup) {
+@@ -65402,6 +65572,7 @@
+     /* Allocate the P4 home/split ids after instruction results and before
+        entry values and phis. This keeps every new id stable across phi solving. */
+     for (b = 0; b < n_blocks; b++) {
++        int tprev = -1, tprev2 = -1;
+         if (in_depth[b] < 0)
+             continue;
+         for (pos = bstart[b]; pos < bstart[b + 1];
+@@ -65411,6 +65582,7 @@
+             if (k >= 0 && (role == REGVM_SLOT_WRITE || role == REGVM_SLOT_SET)) {
+                 int tight_k = -1;
+                 int dpos = regvm_tight_store_def(fd, bc, bstart[b], pos,
++                                                 tprev, tprev2,
+                                                  slot_ok, ok_index, &tight_k);
+                 if (dpos >= 0) {
+                     home_slot_of_def[dpos] = tight_k;
+@@ -65432,6 +65604,8 @@
+                 js_regvm_home_rmw++;
+ #endif
+             }
++            tprev2 = tprev;
++            tprev = pos;
+         }
+     }
+     /*

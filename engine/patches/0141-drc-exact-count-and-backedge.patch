@@ -1,0 +1,210 @@
+Subject: register VM: deferred-RC exact-count fixes and back-edge zero-count drain (stage D3)
+
+What this does:
+  Stage D3 of the deferred-RC plan
+  (`HP-S3-DEFERRED-RC-PLAN-2026-10-02.md` section 3) does two things.
+
+  (1) Exact-count fixes. Under deferred RC a value can be referenced from a
+  register without that register owning it, so a bare `JS_REF_COUNT(x) == 1`
+  test no longer proves the value is uniquely owned. Add
+  `JS_DRC_UNIQUELY_OWNED(p)` (`ref_count == 1 && !in_zct`) and use it in the
+  `JS_ConcatString2` in-place append; guard `js_accum_append` against a parked
+  value; and skip the `js_closcyc_frame` closure self-cycle break under
+  `QJS_DRC` (leave the cycle to the collector, which can see the
+  closure -> var_ref edge). With owning registers these are conservative
+  no-ops, but they are what makes the operations correct once D4 flips
+  registers to stop owning.
+
+  (2) Back-edge zero-count drain. D2's ZCT is only drained from
+  `__js_poll_interrupts`, which the register VM calls before in-line calls and
+  never at a loop back edge; a call-free allocation loop therefore parks one
+  value per iteration and grows the table to the whole iteration count
+  (`str.js` peaked at ~1.2 GB). A backward branch is the only frequent, cheap
+  and safe drain point inside a register-VM activation (every live value is in
+  a register there). `T_NEXT`/`T_BR_NEXT` now call `REGVM_DRC_BACKEDGE`, which
+  tests `off < 0` and the table bound inline and, only when both hold,
+  tail-calls `regvm_t_safepoint_slow` to reconcile and re-enter the chain at
+  the branch target. The inline test is three loads and a compare and the rare
+  reconcile is a tail call, so branch handlers stay frameless.
+
+  Measured (`fixed.js`): stage cost vs the same tree with `-DQJS_DRC=0` is
+  about +185-340M instructions (+0.6-1.2%), the D1+D2+D3 infrastructure;
+  all of it is removed again by D4. `str.js` peak RSS drops from 1,199,288 KB
+  to 175,064 KB and an object-churn loop stays at 4,236 KB. All gates pass:
+  checksum `546.1008391043414`, diff-suite `pass=398 fail=0 skip=0` mono and
+  threaded, leak check clean, ASan+UBSan clean, no new test262 failures.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -760,6 +760,20 @@
+ #define JS_GC_TYPE(p)   (js_rc(p)->gc_obj_type)
+ #define JS_GC_MARK(p)   (js_rc(p)->mark)
+ #define JS_GC_NOTRACE(p) (js_rc(p)->gc_notrace)
++#define JS_GC_IN_ZCT(p) (js_rc(p)->in_zct)
++
++/* Under deferred RC a value may be mutated in place only if this is its only
++   counted reference and it is not parked on the zero-count table. A value
++   referenced only from a register has no counted owner (it is in the ZCT), so
++   the bare ref-count test would wrongly treat it as uniquely owned. With
++   owning registers the extra test is a no-op (a register reference keeps the
++   count above zero), but it is what makes the check correct once the registers
++   stop owning in stage D4. */
++#if QJS_DRC
++#define JS_DRC_UNIQUELY_OWNED(p) (JS_REF_COUNT(p) == 1 && !JS_GC_IN_ZCT(p))
++#else
++#define JS_DRC_UNIQUELY_OWNED(p) (JS_REF_COUNT(p) == 1)
++#endif
+ 
+ #if QJS_REGVM && QJS_DRC_VALIDATE
+ static void js_drc_validate_range(void *opaque, JSValue *regs, uint32_t nregs)
+@@ -6742,7 +6756,7 @@
+     if (p2->len == 0) {
+         goto ret_op1;
+     }
+-    if (JS_REF_COUNT(p1) == 1 && p1->is_wide_char == p2->is_wide_char
++    if (JS_DRC_UNIQUELY_OWNED(p1) && p1->is_wide_char == p2->is_wide_char
+     &&  js_malloc_usable_size(ctx, p1) >= sizeof(*p1) + ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char) {
+         /* Concatenate in place in available space at the end of p1 */
+         if (p1->is_wide_char) {
+@@ -9134,7 +9148,6 @@
+  * refers to, then unpins. A counted value at ref_count zero is therefore never
+  * freed outside js_drc_reconcile().
+  */
+-#define JS_GC_IN_ZCT(p) (js_rc(p)->in_zct)
+ 
+ static void js_free_value_rt(JSRuntime *rt, JSValue v);
+ 
+@@ -9287,6 +9300,39 @@
+ #define js_drc_safepoint(rt) ((void)0)
+ #endif /* QJS_DRC */
+ 
++/*
++ * A backward branch is a loop back edge. It is the only frequent, cheap and
++ * safe point inside a register-VM activation at which the deferred-RC zero
++ * count table can be drained: every live value is in a register there, so
++ * reconciling cannot free anything reachable. Without it a call-free
++ * allocation loop (a string builder, say) parks one value per iteration and
++ * the table grows to the whole iteration count, because the register VM only
++ * polls interrupts -- the other safepoint -- before in-line calls.
++ *
++ * The record chain's `T_NEXT`/`T_BR_NEXT` pass the *total* offset from the
++ * current instruction, so a negative value is exactly a backward branch. The
++ * check folds away at every sequential call site (a positive constant) and is
++ * only live on the branch handlers.
++ */
++#if QJS_DRC
++/*
++ * Checked inline at every backward branch, so the check costs three loads and a
++ * compare and, crucially, never makes the branch handler spill its state: the
++ * rare reconcile is a *tail call* into `regvm_t_safepoint_slow`, which runs the
++ * reconcile and re-enters the chain at the branch target. A non-tail call here
++ * would force the handler to preserve ip/fr/f/ctx across it, which is exactly
++ * the per-dispatch shuffle the frameless discipline exists to avoid.
++ */
++#define REGVM_DRC_BACKEDGE(rt_, off_)                                        \
++    do { if (unlikely((off_) < 0) &&                                         \
++             unlikely((rt_)->zct_len + (rt_)->zct_nobj >                     \
++                      (rt_)->zct_limit)) {                                   \
++        return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx); }            \
++    } while (0)
++#else
++#define REGVM_DRC_BACKEDGE(rt_, off_) ((void)0)
++#endif
++
+ /* called with the ref_count of 'v' reaches zero. */
+ static void js_free_value_rt(JSRuntime *rt, JSValue v)
+ {
+@@ -18466,6 +18512,12 @@
+     p2 = JS_VALUE_GET_STRING(op2);
+     if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0)
+         return 0;
++#if QJS_DRC
++    /* The slot must be an owning location (var_buf or an object property) and
++       not a parked register-only value. Every caller passes an owning slot. */
++    if (JS_GC_IN_ZCT(p1))
++        return 0;
++#endif
+     if (JS_REF_COUNT(p1) != 1 + stack_ref)
+         return 0;
+     if (p1->is_wide_char != p2->is_wide_char)
+@@ -22180,10 +22232,12 @@
+ 
+     for (i = 0; i < sf->var_ref_count; i++) {
+         JSVarRef *vr = sf->var_refs[i];
++#if !QJS_DRC
+         JSFunctionBytecode *b;
+         JSVarRef **vrs;
+         JSObject *o;
+         int j, n, owns;
++#endif
+ 
+         if (!vr)
+             continue;
+@@ -22197,6 +22251,13 @@
+         }
+         if (!vr->is_detached || JS_REF_COUNT(vr) != 1)
+             continue;
++#if QJS_DRC
++        /* Deferred RC: a register can hold this closure without owning it, so
++           "only the cell refers to the closure" no longer proves the cycle is
++           dead. Leave it for the cycle collector, which can see the
++           closure -> var_ref edge. */
++        continue;
++#else
+         if (JS_VALUE_GET_TAG(vr->value) != JS_TAG_OBJECT)
+             continue;
+         o = JS_VALUE_GET_OBJ(vr->value);
+@@ -22220,6 +22281,7 @@
+             vr->pvalue = &vr->value;
+             JS_FreeValueRT(rt, t);
+         }
++#endif
+     }
+ }
+ 
+@@ -23703,13 +23765,32 @@
+     __attribute__((musttail)) return regvm_t_dispatch(ip, fr, f, ctx);
+ }
+ 
++/*
++ * The back-edge reconcile, reached only from a branch whose target is behind it
++ * and only when the deferred-RC zero-count table has outgrown its limit. It is a
++ * tail call so the branch handlers stay frameless; see REGVM_DRC_BACKEDGE. The
++ * register file does not move across a reconcile, so re-entering the chain at
++ * `ip` (the branch target) is safe.
++ */
++#if QJS_DRC
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_ARGS)
++{
++    js_drc_reconcile(ctx->rt);
++    __attribute__((musttail)) return regvm_t_dispatch(ip, fr, f, ctx);
++}
++#endif
++
+ 
+ /* Continue at ip + off. A threaded opcode is tail-called, so the chain never
+    grows the C stack; an unthreaded one is returned to the caller, which is
+    either another handler (unwinding to the loop) or the computed-goto loop
+    itself, which counts it and executes it there. */
+-#define T_NEXT(off) __attribute__((musttail)) \
+-    return regvm_t_dispatch(ip + (off), fr, f, ctx)
++#define T_NEXT(off) do { \
++        int32_t _t_off = (off); \
++        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
++        __attribute__((musttail)) \
++            return regvm_t_dispatch(ip + _t_off, fr, f, ctx); \
++    } while (0)
+ 
+ /*
+  * The taken arm of a conditional branch, and the reason it needs its own macro.
+@@ -23728,7 +23809,9 @@
+  * folded back together.
+  */
+ #define T_BR_NEXT(off) do { \
+-        uint8_t *_nip = ip + (off); \
++        int32_t _t_off = (off); \
++        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
++        uint8_t *_nip = ip + _t_off; \
+         __asm__ volatile("" : "+r"(_nip)); \
+         __attribute__((musttail)) \
+             return regvm_t_dispatch(_nip, fr, f, ctx); \

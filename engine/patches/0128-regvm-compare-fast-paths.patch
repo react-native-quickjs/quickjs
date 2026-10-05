@@ -1,0 +1,320 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22067,6 +22067,9 @@
+         case REG_BIN_LTE: *out = js_bool(d1 <= d2); return 1;
+         case REG_BIN_GT: *out = js_bool(d1 > d2); return 1;
+         case REG_BIN_GTE: *out = js_bool(d1 >= d2); return 1;
++        /* both are numbers here, so loose and strict agree */
++        case REG_BIN_EQ: case REG_BIN_STRICT_EQ: *out = js_bool(d1 == d2); return 1;
++        case REG_BIN_NEQ: case REG_BIN_STRICT_NEQ: *out = js_bool(d1 != d2); return 1;
+         default: return 0;
+         }
+     }
+@@ -22622,13 +22625,149 @@
+     case REG_BIN_LTE: return a <= b;
+     case REG_BIN_GT: return a > b;
+     case REG_BIN_GTE: return a >= b;
+-    case REG_BIN_STRICT_EQ: return a == b;
+-    case REG_BIN_STRICT_NEQ: return a != b;
++    /* two numbers, so the loose and the strict comparison agree */
++    case REG_BIN_EQ: case REG_BIN_STRICT_EQ: return a == b;
++    case REG_BIN_NEQ: case REG_BIN_STRICT_NEQ: return a != b;
++    default: return -1;
++    }
++}
++
++/*
++ * The strict-equality case of a fused compare. `===` is a tag test before it is
++ * a value test: equal tags compare their payloads, and different tags are
++ * unequal except for the int/double mix, because Number spans both. This keeps
++ * the default-argument guards -- `if (m === undefined) m = 0`, which dominate
++ * box2d's compare-and-branch calls -- out of the generic comparison. -1 means
++ * "not decidable here": strings and big ints compare by value, not identity.
++ */
++static inline int regvm_strict_eq(int sub, JSValue a, JSValue b)
++{
++    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
++    int eq;
++
++    if (unlikely(ta != tb)) {
++        if (ta == JS_TAG_INT && tb == JS_TAG_FLOAT64)
++            eq = (double)JS_VALUE_GET_INT(a) == JS_VALUE_GET_FLOAT64(b);
++        else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
++            eq = JS_VALUE_GET_FLOAT64(a) == (double)JS_VALUE_GET_INT(b);
++        else
++            eq = 0;
++    } else {
++        switch (ta) {
++        case JS_TAG_INT:
++            eq = JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b); break;
++        case JS_TAG_BOOL:
++            eq = JS_VALUE_GET_BOOL(a) == JS_VALUE_GET_BOOL(b); break;
++        case JS_TAG_FLOAT64:
++            eq = JS_VALUE_GET_FLOAT64(a) == JS_VALUE_GET_FLOAT64(b); break;
++        case JS_TAG_NULL:
++        case JS_TAG_UNDEFINED:
++            eq = 1; break;
++        case JS_TAG_OBJECT:
++            eq = JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b); break;
++        default:
++            return -1;
++        }
++    }
++    if (sub == REG_BIN_STRICT_NEQ)
++        eq ^= 1;
++    else if (sub != REG_BIN_STRICT_EQ)
++        return -1;
++    return eq;
++}
++
++/*
++ * `==`/`!=` when the two operands already have the same type: same-type objects
++ * compare by identity and the immediates by value, and the int/double mix by
++ * numeric equality. The differing-type cases that need no coercion are decided
++ * here too: `null`/`undefined` equal each other, and an object equals neither.
++ * A string compared with anything coerces, and an object compared with a
++ * primitive runs `ToPrimitive`, so those stay with the generic path. -1 means
++ * "not decidable here".
++ */
++static inline int regvm_loose_eq(int sub, JSValue a, JSValue b)
++{
++    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
++    int eq;
++
++    if (unlikely(ta != tb)) {
++        if (ta == JS_TAG_INT && tb == JS_TAG_FLOAT64)
++            eq = (double)JS_VALUE_GET_INT(a) == JS_VALUE_GET_FLOAT64(b);
++        else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
++            eq = JS_VALUE_GET_FLOAT64(a) == (double)JS_VALUE_GET_INT(b);
++        else if ((ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED) &&
++                 (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED))
++            eq = 1;             /* `null == undefined` */
++        else if (ta == JS_TAG_OBJECT &&
++                 (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED))
++            eq = 0;             /* an object equals neither null nor undefined */
++        else if (tb == JS_TAG_OBJECT &&
++                 (ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED))
++            eq = 0;
++        else
++            return -1;
++    } else {
++        switch (ta) {
++        case JS_TAG_INT:
++            eq = JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b); break;
++        case JS_TAG_BOOL:
++            eq = JS_VALUE_GET_BOOL(a) == JS_VALUE_GET_BOOL(b); break;
++        case JS_TAG_FLOAT64:
++            eq = JS_VALUE_GET_FLOAT64(a) == JS_VALUE_GET_FLOAT64(b); break;
++        case JS_TAG_NULL:
++        case JS_TAG_UNDEFINED:
++            eq = 1; break;
++        case JS_TAG_OBJECT:
++            eq = JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b); break;
++        default:
++            return -1;
++        }
++    }
++    return (sub == REG_BIN_NEQ) ? !eq : eq;
++}
++
++/*
++ * The bitwise and shift operations of a fused compare. The destination holds an
++ * int32 -- `>>>` can leave the int32 range, but its zero test cannot -- and the
++ * branch tests the result's truthiness, so only the zero test is needed. -1
++ * means "not a bitwise pair", which is every other sub-operation.
++ */
++static inline int regvm_int_bit_truthy(int sub, int32_t a, int32_t b)
++{
++    switch (sub) {
++    case REG_BIN_AND: return (a & b) != 0;
++    case REG_BIN_OR:  return (a | b) != 0;
++    case REG_BIN_XOR: return (a ^ b) != 0;
++    case REG_BIN_SHL: return ((uint32_t)a << (b & 31)) != 0;
++    case REG_BIN_SAR: return (a >> (b & 31)) != 0;
++    case REG_BIN_SHR: return ((uint32_t)a >> (b & 31)) != 0;
+     default: return -1;
+     }
+ }
+ 
+ /*
++ * `x instanceof C` where C is a plain class: `JS_IsInstanceOf` would look up
++ * @@hasInstance and find the builtin, whose body is the ordinary prototype
++ * walk, so the walk is the whole operation. Recognising that here skips the
++ * generic binary path's operand duplicates and dispatch; anything else falls
++ * back to it. -1 means "not decidable here".
++ */
++static inline int regvm_instanceof_fast(JSContext *ctx, JSValue a, JSValue b)
++{
++    JSObject *p;
++
++    if (!JS_IsObject(b))
++        return -1;
++    p = JS_VALUE_GET_OBJ(b);
++    if ((p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
++         p->class_id == JS_CLASS_C_FUNCTION) &&
++        p->shape->proto == JS_VALUE_GET_OBJ(ctx->function_proto) &&
++        !find_own_property1(p, JS_ATOM_Symbol_hasInstance))
++        return JS_OrdinaryIsInstanceOf(ctx, a, b);
++    return -1;
++}
++
++/*
+  * Evaluate the operation a fused compare-and-branch carries and say whether the
+  * branch is taken. Exactly what the separate `ROP_binary*` + `ROP_branch_if*`
+  * pair did -- compute, then test the result's truthiness -- so any sub-operation
+@@ -22643,14 +22782,47 @@
+  * Not inlined: it is the non-integer path, and its callers' hot path is the
+  * integer comparison they do themselves.
+  */
++#ifdef QJS_REGVM_COUNT
++static uint64_t js_regvm_cmptake[4]; /* 0 both-int, 1 both-float, 2 mixed, 3 other */
++static uint64_t js_regvm_cmptake_ta[32], js_regvm_cmptake_tb[32];
++static uint64_t js_regvm_cmptake_pair[32][32];
++static uint64_t js_regvm_cmptake_sub[64];
++static uint64_t js_regvm_cmptake_inv;
++#endif
++
+ __attribute__((noinline))
+ static __exception int regvm_cmp_take(JSContext *ctx, int sub, JSValue a,
+                                       JSValue b)
+ {
+     int inv = (sub & REG_CMP_INVERT) != 0;
++#ifdef QJS_REGVM_COUNT
++    {
++        int _ta = JS_VALUE_GET_TAG(a), _tb = JS_VALUE_GET_TAG(b);
++        int _k;
++        if (JS_VALUE_IS_BOTH_INT(a, b)) _k = 0;
++        else if (JS_VALUE_IS_BOTH_FLOAT(a, b)) _k = 1;
++        else if ((_ta == JS_TAG_INT || _ta == JS_TAG_FLOAT64) &&
++                 (_tb == JS_TAG_INT || _tb == JS_TAG_FLOAT64)) _k = 2;
++        else _k = 3;
++        js_regvm_cmptake[_k]++;
++        js_regvm_cmptake_sub[(sub & ~REG_CMP_INVERT) & 63]++;
++        if (sub & REG_CMP_INVERT) js_regvm_cmptake_inv++;
++        if (_ta >= -16 && _ta < 16) js_regvm_cmptake_ta[_ta + 16]++;
++        if (_tb >= -16 && _tb < 16) js_regvm_cmptake_tb[_tb + 16]++;
++        if (_ta >= -16 && _ta < 16 && _tb >= -16 && _tb < 16)
++            js_regvm_cmptake_pair[_ta + 16][_tb + 16]++;
++    }
++#endif
+     JSValue out;
+ 
+     sub &= ~REG_CMP_INVERT;
++    /* `===`/`!==` is a tag test first; the default-argument guards
++       (`if (m === undefined) m = 0`) never reach the generic comparison. */
++    if (sub == REG_BIN_STRICT_EQ || sub == REG_BIN_STRICT_NEQ) {
++        int e = regvm_strict_eq(sub, a, b);
++        if (likely(e >= 0))
++            return e ^ inv;
++    }
+     if (!regvm_num_fast(sub, a, b, &out) &&
+         js_regvm_binary(ctx, sub, a, b, &out))
+         return -1;
+@@ -24916,6 +25088,72 @@
+                 T_NEXT((SZ_)); \
+             } \
+         } \
++        /* a mixed int/double pair is still a numeric comparison, and promoting
++           the int to double is exact; this is the other half of box2d's
++           non-integer compares */ \
++        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) || \
++                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)))) { \
++            int _ta = JS_VALUE_GET_TAG(_a), _tb = JS_VALUE_GET_TAG(_b); \
++            if (likely((_ta == JS_TAG_INT || _ta == JS_TAG_FLOAT64) && \
++                       (_tb == JS_TAG_INT || _tb == JS_TAG_FLOAT64))) { \
++                double _da = (_ta == JS_TAG_FLOAT64) ? \
++                    JS_VALUE_GET_FLOAT64(_a) : (double)JS_VALUE_GET_INT(_a); \
++                double _db = (_tb == JS_TAG_FLOAT64) ? \
++                    JS_VALUE_GET_FLOAT64(_b) : (double)JS_VALUE_GET_INT(_b); \
++                int _rd = regvm_double_cmp(_sub & ~REG_CMP_INVERT, _da, _db); \
++                if (likely(_rd >= 0)) { \
++                    int _take = _rd ^ ((_sub & REG_CMP_INVERT) != 0); \
++                    if (_take) { T_BR_NEXT((SZ_) + _off); } \
++                    T_NEXT((SZ_)); \
++                } \
++            } \
++        } \
++        /* `===`/`!==` on the immediates is a tag test, not a coercion: the
++           default-argument guards (`if (m === undefined) m = 0`) are the
++           hottest compare-and-branch shape in box2d. The test folds away at
++           the ten per-sense opcodes, which never carry a strict sense. */ \
++        if (likely((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_EQ || \
++                    (_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_NEQ)) { \
++            int _se = regvm_strict_eq(_sub & ~REG_CMP_INVERT, _a, _b); \
++            if (likely(_se >= 0)) { \
++                int _take = _se ^ ((_sub & REG_CMP_INVERT) != 0); \
++                if (_take) { T_BR_NEXT((SZ_) + _off); } \
++                T_NEXT((SZ_)); \
++            } \
++        } \
++        /* loose equality on two objects is identity, and on the other
++           same-type immediates it is the value test the strict path uses */ \
++        if (likely((_sub & ~REG_CMP_INVERT) == REG_BIN_EQ || \
++                    (_sub & ~REG_CMP_INVERT) == REG_BIN_NEQ)) { \
++            int _le = regvm_loose_eq(_sub & ~REG_CMP_INVERT, _a, _b); \
++            if (likely(_le >= 0)) { \
++                int _take = _le ^ ((_sub & REG_CMP_INVERT) != 0); \
++                if (_take) { T_BR_NEXT((SZ_) + _off); } \
++                T_NEXT((SZ_)); \
++            } \
++        } \
++        /* `x instanceof C` for a plain class is the prototype walk itself, and
++           it is the remaining shape box2d's fused branches carry; the ordinary
++           check is called directly rather than through the generic binary */ \
++        if (likely((_sub & ~REG_CMP_INVERT) == REG_BIN_INSTANCEOF)) { \
++            int _io = regvm_instanceof_fast(ctx, _a, _b); \
++            if (likely(_io >= 0)) { \
++                int _take = _io ^ ((_sub & REG_CMP_INVERT) != 0); \
++                if (_take) { T_BR_NEXT((SZ_) + _off); } \
++                T_NEXT((SZ_)); \
++            } \
++        } \
++        /* the bitwise and shift operations are exact on two int32s, and the
++           branch only asks whether the result is zero; last because it is the
++           only one of these that a non-comparison reaches */ \
++        if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
++                   !((_r = regvm_int_bit_truthy(_sub & ~REG_CMP_INVERT, \
++                                                JS_VALUE_GET_INT(_a), \
++                                                JS_VALUE_GET_INT(_b))) < 0))) { \
++            int _take = _r ^ ((_sub & REG_CMP_INVERT) != 0); \
++            if (_take) { T_BR_NEXT((SZ_) + _off); } \
++            T_NEXT((SZ_)); \
++        } \
+         __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+     }
+ 
+@@ -62069,6 +62307,34 @@
+                 js_regvm_blockers[_b] = 0; _n++;
+             }
+         }
++        fprintf(stderr, "##CMPTAKE## bothint=%llu bothfloat=%llu mixed=%llu other=%llu\n",
++                (unsigned long long)js_regvm_cmptake[0],
++                (unsigned long long)js_regvm_cmptake[1],
++                (unsigned long long)js_regvm_cmptake[2],
++                (unsigned long long)js_regvm_cmptake[3]);
++        fprintf(stderr, "##CMPSUB## inv=%llu\n",
++                (unsigned long long)js_regvm_cmptake_inv);
++        {
++            int _i;
++            for (_i = 0; _i < 64; _i++)
++                if (js_regvm_cmptake_sub[_i])
++                    fprintf(stderr, "##CMPSUB## sub=%d n=%llu\n", _i,
++                            (unsigned long long)js_regvm_cmptake_sub[_i]);
++        }
++        {
++            int _i, _j;
++            for (_i = 0; _i < 32; _i++)
++                if (js_regvm_cmptake_ta[_i] || js_regvm_cmptake_tb[_i])
++                    fprintf(stderr, "##CMPTAG## %d a=%llu b=%llu\n", _i - 16,
++                            (unsigned long long)js_regvm_cmptake_ta[_i],
++                            (unsigned long long)js_regvm_cmptake_tb[_i]);
++            for (_i = 0; _i < 32; _i++)
++                for (_j = 0; _j < 32; _j++)
++                    if (js_regvm_cmptake_pair[_i][_j])
++                        fprintf(stderr, "##CMPPAIR## %d,%d %llu\n",
++                                _i - 16, _j - 16,
++                                (unsigned long long)js_regvm_cmptake_pair[_i][_j]);
++        }
+         fprintf(stderr, "##IR## insns=%llu moves=%llu move_move_adj=%llu\n",
+                 (unsigned long long)js_regvm_ir_insns,
+                 (unsigned long long)js_regvm_ir_moves,

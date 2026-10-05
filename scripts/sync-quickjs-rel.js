@@ -53,8 +53,11 @@ const FILES = [
   'dtoa.c',
   // headers
   'builtin-array-fromasync.h',
+  'builtin-array-fromasync.regvm.h',
   'builtin-iterator-zip-keyed.h',
+  'builtin-iterator-zip-keyed.regvm.h',
   'builtin-iterator-zip.h',
+  'builtin-iterator-zip.regvm.h',
   'cutils.h',
   'dtoa.h',
   'libregexp-opcode.h',
@@ -66,6 +69,7 @@ const FILES = [
   'quickjs-atom.h',
   'quickjs-c-atomics.h',
   'quickjs-opcode.h',
+  'quickjs-regvm.h',
   'quickjs.h',
   // provenance
   'LICENSE',

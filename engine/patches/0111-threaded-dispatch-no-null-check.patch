@@ -1,0 +1,498 @@
+Subject: Remove the null handler check from threaded dispatch
+
+What this does
+  Gives every register opcode a threaded-table entry. Opcodes that are not
+  threaded return to the monolithic loop through a small trampoline.
+
+Why we need it
+  The interpreter tested the handler pointer on every dispatch to distinguish
+  threaded opcodes from the remaining monolithic opcodes. That test is on the
+  hot path for every register instruction.
+
+What it adds
+  A shared opcode list builds both the handler table and the threaded-eligibility
+  table, keeping dispatch eligibility independent from handler pointer values.
+
+Needs a bytecode version bump
+  No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22817,6 +22817,7 @@
+ #define T_COUNT_INC(o) ((void)0)
+ #endif
+ 
++static uint8_t *regvm_t_to_loop(REGVM_ARGS);
+ static uint8_t *regvm_t_dispatch(REGVM_ARGS);
+ 
+ /*
+@@ -23183,9 +23184,9 @@
+  * returns the next `ip`, or NULL after setting `f->ret` when it threw. Its only
+  * state is its arguments: no global current record, no hand-back, no second
+  * exit label. Putting `regvm_t_cold` in a table slot is also what marks the
+- * opcode as converted -- the encoder's `regvm_all_threaded` walk already asks
+- * `regvm_threaded[op] != NULL`, so eligibility widens as entries are added and
+- * `regvm_record_eligible` needs no change at all.
++ * opcode as converted -- the encoder's `regvm_all_threaded` walk reads
++ * `regvm_is_threaded[op]`, which is generated from the same list, so eligibility
++ * widens as entries are added and `regvm_record_eligible` needs no change.
+  *
+  * The money is in the converted set being *cold*: box2d's full blocker set is
+  * about two dozen opcodes and every one of them is under 0.15% of dispatches.
+@@ -23219,196 +23220,250 @@
+ {
+     __attribute__((musttail)) return regvm_t_cold_slow(REGVM_PASS);
+ }
++
++/* One source of truth for the explicit threaded handlers. The same list
++   builds both the handler table and the eligibility table. */
++#define REGVM_T_EXPLICIT_LIST(X) \
++    X(binary, regvm_t_binary) \
++    X(binary_loc_reg, regvm_t_binary_loc_reg) \
++    X(binary_reg_loc, regvm_t_binary_reg_loc) \
++    X(binary_loc_loc, regvm_t_binary_loc_loc) \
++    X(binary_imm, regvm_t_binary_imm) \
++    X(binary_imm_s, regvm_t_binary_imm_s) \
++    X(unary, regvm_t_unary) \
++    X(load_undefined, regvm_t_load_undefined) \
++    X(load_null, regvm_t_load_null) \
++    X(load_true, regvm_t_load_true) \
++    X(load_false, regvm_t_load_false) \
++    X(load_i8, regvm_t_load_i8) \
++    X(add_brand, regvm_t_cold) \
++    X(add_imm_s, regvm_t_cold) \
++    X(add_imm_self_s, regvm_t_cold) \
++    X(append, regvm_t_cold) \
++    X(apply, regvm_t_cold) \
++    X(apply_arguments, regvm_t_cold) \
++    X(array_from, regvm_t_cold) \
++    X(binary_cpool, regvm_t_cold) \
++    X(branch_cmp_loc_loc, regvm_t_cold) \
++    X(branch_cmp_loc_reg, regvm_t_cold) \
++    X(branch_cmp_reg_loc, regvm_t_cold) \
++    X(catch_enter, regvm_t_cold) \
++    X(check_ctor, regvm_t_cold) \
++    X(check_define, regvm_t_cold) \
++    X(check_object, regvm_t_cold) \
++    X(close_local, regvm_t_cold) \
++    X(construct, regvm_t_cold) \
++    X(copy_props, regvm_t_cold) \
++    X(define_class, regvm_t_cold) \
++    X(define_class_computed, regvm_t_cold) \
++    X(define_element, regvm_t_cold) \
++    X(define_field, regvm_t_cold) \
++    X(define_global, regvm_t_cold) \
++    X(define_global_func, regvm_t_cold) \
++    X(define_private, regvm_t_cold) \
++    X(delete, regvm_t_cold) \
++    X(delete_var, regvm_t_cold) \
++    X(dynamic_import, regvm_t_cold) \
++    X(eval, regvm_t_cold) \
++    X(finally_enter, regvm_t_cold) \
++    X(finally_leave, regvm_t_cold) \
++    X(for_await_of_start, regvm_t_cold) \
++    X(for_in_next, regvm_t_cold) \
++    X(for_in_start, regvm_t_cold) \
++    X(get_arg_el, regvm_t_cold) \
++    X(get_arg_field, regvm_t_cold) \
++    X(get_length, regvm_t_cold) \
++    X(get_local_field, regvm_t_cold) \
++    X(get_local_field_0, regvm_t_cold) \
++    X(get_local_field_1, regvm_t_cold) \
++    X(get_local_field_2, regvm_t_cold) \
++    X(get_local_field_3, regvm_t_cold) \
++    X(get_private, regvm_t_cold) \
++    X(get_ref_value, regvm_t_cold) \
++    X(get_super, regvm_t_cold) \
++    X(init_ctor, regvm_t_cold) \
++    X(iter_close, regvm_t_cold) \
++    X(iter_next, regvm_t_cold) \
++    X(iter_start, regvm_t_cold) \
++    X(iterator_call, regvm_t_cold) \
++    X(iterator_next, regvm_t_cold) \
++    X(load_bigint_i32, regvm_t_cold) \
++    X(load_i32, regvm_t_cold) \
++    X(local_check, regvm_t_cold) \
++    X(local_check_init, regvm_t_cold) \
++    X(local_rmw_branch, regvm_t_cold) \
++    X(local_rmw_imm, regvm_t_cold) \
++    X(local_uninit, regvm_t_cold) \
++    X(make_closure, regvm_t_cold) \
++    X(make_local_ref, regvm_t_cold) \
++    X(make_var_ref, regvm_t_cold) \
++    X(new_object, regvm_t_cold) \
++    X(nip_catch, regvm_t_cold) \
++    X(object_fill, regvm_t_cold) \
++    X(object_template, regvm_t_cold) \
++    X(private_symbol, regvm_t_cold) \
++    X(put_arg, regvm_t_cold) \
++    X(put_arg_xfer, regvm_t_cold) \
++    X(put_element, regvm_t_cold) \
++    X(put_element_xfer, regvm_t_cold) \
++    X(put_field_xfer, regvm_t_cold) \
++    X(put_global, regvm_t_cold) \
++    X(put_local, regvm_t_cold) \
++    X(put_local_s0, regvm_t_cold) \
++    X(put_local_s1, regvm_t_cold) \
++    X(put_local_s2, regvm_t_cold) \
++    X(put_local_s3, regvm_t_cold) \
++    X(put_local_xfer, regvm_t_cold) \
++    X(put_local_xfer_s0, regvm_t_cold) \
++    X(put_local_xfer_s1, regvm_t_cold) \
++    X(put_local_xfer_s2, regvm_t_cold) \
++    X(put_local_xfer_s3, regvm_t_cold) \
++    X(put_private, regvm_t_cold) \
++    X(put_ref_value, regvm_t_cold) \
++    X(put_super_value, regvm_t_cold) \
++    X(put_var_ref, regvm_t_cold) \
++    X(regexp, regvm_t_cold) \
++    X(rest, regvm_t_cold) \
++    X(set_name, regvm_t_cold) \
++    X(set_name_computed, regvm_t_cold) \
++    X(set_proto, regvm_t_cold) \
++    X(special_object, regvm_t_cold) \
++    X(sub_imm_s, regvm_t_cold) \
++    X(sub_imm_self_s, regvm_t_cold) \
++    X(super_get, regvm_t_cold) \
++    X(tail_call, regvm_t_cold) \
++    X(tail_call_method, regvm_t_cold) \
++    X(throw, regvm_t_cold) \
++    X(throw_error, regvm_t_cold) \
++    X(to_object, regvm_t_cold) \
++    X(to_propkey, regvm_t_cold) \
++    X(to_propkey2, regvm_t_cold) \
++    X(using_check, regvm_t_cold) \
++    X(using_dispose, regvm_t_cold) \
++    X(using_dispose_async, regvm_t_cold) \
++    X(using_end, regvm_t_cold) \
++    X(using_init, regvm_t_cold) \
++    X(using_merge, regvm_t_cold) \
++    X(var_ref_check, regvm_t_cold) \
++    X(var_ref_check_init, regvm_t_cold) \
++    X(with_delete, regvm_t_cold) \
++    X(with_get, regvm_t_cold) \
++    X(with_get_ref, regvm_t_cold) \
++    X(with_get_ref_undef, regvm_t_cold) \
++    X(with_make_ref, regvm_t_cold) \
++    X(with_put, regvm_t_cold) \
++    X(load_const, regvm_t_load_const) \
++    X(load_this, regvm_t_load_this) \
++    X(move, regvm_t_move) \
++    X(move_xfer, regvm_t_move_xfer) \
++    X(get_local, regvm_t_get_local) \
++    X(get_local_s0, regvm_t_get_local_s0) \
++    X(get_local_s1, regvm_t_get_local_s1) \
++    X(get_local_s2, regvm_t_get_local_s2) \
++    X(get_local_s3, regvm_t_get_local_s3) \
++    X(get_arg, regvm_t_get_arg) \
++    X(get_var_ref, regvm_t_get_var_ref) \
++    X(get_global, regvm_t_get_global) \
++    X(get_element, regvm_t_get_element) \
++    X(get_field, regvm_t_get_field) \
++    X(get_field2, regvm_t_get_field2) \
++    X(put_field, regvm_t_put_field) \
++    X(branch, regvm_t_branch) \
++    X(branch_s, regvm_t_branch_s) \
++    X(branch_if, regvm_t_branch_if) \
++    X(branch_if_not, regvm_t_branch_if_not) \
++    X(branch_cmp_reg_reg, regvm_t_branch_cmp_reg_reg) \
++    X(branch_cmp_reg_reg_s, regvm_t_branch_cmp_reg_reg_s) \
++    X(branch_lt_s, regvm_t_branch_lt_s) \
++    X(branch_nlt_s, regvm_t_branch_nlt_s) \
++    X(branch_lte_s, regvm_t_branch_lte_s) \
++    X(branch_nlte_s, regvm_t_branch_nlte_s) \
++    X(branch_gt_s, regvm_t_branch_gt_s) \
++    X(branch_ngt_s, regvm_t_branch_ngt_s) \
++    X(branch_gte_s, regvm_t_branch_gte_s) \
++    X(branch_ngte_s, regvm_t_branch_ngte_s) \
++    X(branch_eq_s, regvm_t_branch_eq_s) \
++    X(branch_neq_s, regvm_t_branch_neq_s) \
++    X(add_imm_self_branch, regvm_t_add_imm_self_branch) \
++    X(add_imm_self_branch_s, regvm_t_add_imm_self_branch_s) \
++    X(return, regvm_t_return) \
++    X(return_undefined, regvm_t_return_undefined)
+ 
++#define REGVM_T_FALLBACK_LIST(X) \
++    X(apply_eval) \
++    X(await) \
++    X(check_brand) \
++    X(check_ctor_return) \
++    X(compare) \
++    X(define_method) \
++    X(define_method_computed) \
++    X(get_ref) \
++    X(initial_yield) \
++    X(invalid) \
++    X(iter_value_done) \
++    X(make_ref) \
++    X(put_local_probe) \
++    X(put_ref) \
++    X(return_async) \
++    X(sentinel_drop) \
++    X(set_home_object) \
++    X(special) \
++    X(super_put) \
++    X(to_number) \
++    X(typeof) \
++    X(yield) \
++    X(yield_star)
++
+ static const regvm_handler regvm_threaded[ROP_COUNT] = {
+-#define T_ENTRY(name, sub) [ROP_##name] = regvm_t_##name,
+-    REGVM_T_BINARY_LIST(T_ENTRY)
+-    REGVM_T_UNARY_LIST(T_ENTRY)
+-#undef T_ENTRY
+-    [ROP_binary] = regvm_t_binary,
+-    [ROP_binary_loc_reg] = regvm_t_binary_loc_reg,
+-    [ROP_binary_reg_loc] = regvm_t_binary_reg_loc,
+-    [ROP_binary_loc_loc] = regvm_t_binary_loc_loc,
+-    [ROP_binary_imm] = regvm_t_binary_imm,
+-    [ROP_binary_imm_s] = regvm_t_binary_imm_s,
+-    [ROP_unary] = regvm_t_unary,
+-    [ROP_load_undefined] = regvm_t_load_undefined,
+-    [ROP_load_null] = regvm_t_load_null,
+-    [ROP_load_true] = regvm_t_load_true,
+-    [ROP_load_false] = regvm_t_load_false,
+-    [ROP_load_i8] = regvm_t_load_i8,
+-    /*
+-     * Every opcode with a `regvm_exec_one` arm. Putting `regvm_t_cold` here is
+-     * what marks it converted: the encoder's walk asks `regvm_threaded[op] !=
+-     * NULL`, so eligibility widens with this list and nothing else changes.
+-     */
+-    [ROP_add_brand] = regvm_t_cold,
+-    [ROP_add_imm_s] = regvm_t_cold,
+-    [ROP_add_imm_self_s] = regvm_t_cold,
+-    [ROP_append] = regvm_t_cold,
+-    [ROP_apply] = regvm_t_cold,
+-    [ROP_apply_arguments] = regvm_t_cold,
+-    [ROP_array_from] = regvm_t_cold,
+-    [ROP_binary_cpool] = regvm_t_cold,
+-    [ROP_branch_cmp_loc_loc] = regvm_t_cold,
+-    [ROP_branch_cmp_loc_reg] = regvm_t_cold,
+-    [ROP_branch_cmp_reg_loc] = regvm_t_cold,
+-    [ROP_catch_enter] = regvm_t_cold,
+-    [ROP_check_ctor] = regvm_t_cold,
+-    [ROP_check_define] = regvm_t_cold,
+-    [ROP_check_object] = regvm_t_cold,
+-    [ROP_close_local] = regvm_t_cold,
+-    [ROP_construct] = regvm_t_cold,
+-    [ROP_copy_props] = regvm_t_cold,
+-    [ROP_define_class] = regvm_t_cold,
+-    [ROP_define_class_computed] = regvm_t_cold,
+-    [ROP_define_element] = regvm_t_cold,
+-    [ROP_define_field] = regvm_t_cold,
+-    [ROP_define_global] = regvm_t_cold,
+-    [ROP_define_global_func] = regvm_t_cold,
+-    [ROP_define_private] = regvm_t_cold,
+-    [ROP_delete] = regvm_t_cold,
+-    [ROP_delete_var] = regvm_t_cold,
+-    [ROP_dynamic_import] = regvm_t_cold,
+-    [ROP_eval] = regvm_t_cold,
+-    [ROP_finally_enter] = regvm_t_cold,
+-    [ROP_finally_leave] = regvm_t_cold,
+-    [ROP_for_await_of_start] = regvm_t_cold,
+-    [ROP_for_in_next] = regvm_t_cold,
+-    [ROP_for_in_start] = regvm_t_cold,
+-    [ROP_get_arg_el] = regvm_t_cold,
+-    [ROP_get_arg_field] = regvm_t_cold,
+-    [ROP_get_length] = regvm_t_cold,
+-    [ROP_get_local_field] = regvm_t_cold,
+-    [ROP_get_local_field_0] = regvm_t_cold,
+-    [ROP_get_local_field_1] = regvm_t_cold,
+-    [ROP_get_local_field_2] = regvm_t_cold,
+-    [ROP_get_local_field_3] = regvm_t_cold,
+-    [ROP_get_private] = regvm_t_cold,
+-    [ROP_get_ref_value] = regvm_t_cold,
+-    [ROP_get_super] = regvm_t_cold,
+-    [ROP_init_ctor] = regvm_t_cold,
+-    [ROP_iter_close] = regvm_t_cold,
+-    [ROP_iter_next] = regvm_t_cold,
+-    [ROP_iter_start] = regvm_t_cold,
+-    [ROP_iterator_call] = regvm_t_cold,
+-    [ROP_iterator_next] = regvm_t_cold,
+-    [ROP_load_bigint_i32] = regvm_t_cold,
+-    [ROP_load_i32] = regvm_t_cold,
+-    [ROP_local_check] = regvm_t_cold,
+-    [ROP_local_check_init] = regvm_t_cold,
+-    [ROP_local_rmw_branch] = regvm_t_cold,
+-    [ROP_local_rmw_imm] = regvm_t_cold,
+-    [ROP_local_uninit] = regvm_t_cold,
+-    [ROP_make_closure] = regvm_t_cold,
+-    [ROP_make_local_ref] = regvm_t_cold,
+-    [ROP_make_var_ref] = regvm_t_cold,
+-    [ROP_new_object] = regvm_t_cold,
+-    [ROP_nip_catch] = regvm_t_cold,
+-    [ROP_object_fill] = regvm_t_cold,
+-    [ROP_object_template] = regvm_t_cold,
+-    [ROP_private_symbol] = regvm_t_cold,
+-    [ROP_put_arg] = regvm_t_cold,
+-    [ROP_put_arg_xfer] = regvm_t_cold,
+-    [ROP_put_element] = regvm_t_cold,
+-    [ROP_put_element_xfer] = regvm_t_cold,
+-    [ROP_put_field_xfer] = regvm_t_cold,
+-    [ROP_put_global] = regvm_t_cold,
+-    [ROP_put_local] = regvm_t_cold,
+-    [ROP_put_local_s0] = regvm_t_cold,
+-    [ROP_put_local_s1] = regvm_t_cold,
+-    [ROP_put_local_s2] = regvm_t_cold,
+-    [ROP_put_local_s3] = regvm_t_cold,
+-    [ROP_put_local_xfer] = regvm_t_cold,
+-    [ROP_put_local_xfer_s0] = regvm_t_cold,
+-    [ROP_put_local_xfer_s1] = regvm_t_cold,
+-    [ROP_put_local_xfer_s2] = regvm_t_cold,
+-    [ROP_put_local_xfer_s3] = regvm_t_cold,
+-    [ROP_put_private] = regvm_t_cold,
+-    [ROP_put_ref_value] = regvm_t_cold,
+-    [ROP_put_super_value] = regvm_t_cold,
+-    [ROP_put_var_ref] = regvm_t_cold,
+-    [ROP_regexp] = regvm_t_cold,
+-    [ROP_rest] = regvm_t_cold,
+-    [ROP_set_name] = regvm_t_cold,
+-    [ROP_set_name_computed] = regvm_t_cold,
+-    [ROP_set_proto] = regvm_t_cold,
+-    [ROP_special_object] = regvm_t_cold,
+-    [ROP_sub_imm_s] = regvm_t_cold,
+-    [ROP_sub_imm_self_s] = regvm_t_cold,
+-    [ROP_super_get] = regvm_t_cold,
+-    [ROP_tail_call] = regvm_t_cold,
+-    [ROP_tail_call_method] = regvm_t_cold,
+-    [ROP_throw] = regvm_t_cold,
+-    [ROP_throw_error] = regvm_t_cold,
+-    [ROP_to_object] = regvm_t_cold,
+-    [ROP_to_propkey] = regvm_t_cold,
+-    [ROP_to_propkey2] = regvm_t_cold,
+-    [ROP_using_check] = regvm_t_cold,
+-    [ROP_using_dispose] = regvm_t_cold,
+-    [ROP_using_dispose_async] = regvm_t_cold,
+-    [ROP_using_end] = regvm_t_cold,
+-    [ROP_using_init] = regvm_t_cold,
+-    [ROP_using_merge] = regvm_t_cold,
+-    [ROP_var_ref_check] = regvm_t_cold,
+-    [ROP_var_ref_check_init] = regvm_t_cold,
+-    [ROP_with_delete] = regvm_t_cold,
+-    [ROP_with_get] = regvm_t_cold,
+-    [ROP_with_get_ref] = regvm_t_cold,
+-    [ROP_with_get_ref_undef] = regvm_t_cold,
+-    [ROP_with_make_ref] = regvm_t_cold,
+-    [ROP_with_put] = regvm_t_cold,
+-    [ROP_load_const] = regvm_t_load_const,
+-    [ROP_load_this] = regvm_t_load_this,
+-    [ROP_move] = regvm_t_move,
+-    [ROP_move_xfer] = regvm_t_move_xfer,
+-    [ROP_get_local] = regvm_t_get_local,
+-    [ROP_get_local_s0] = regvm_t_get_local_s0,
+-    [ROP_get_local_s1] = regvm_t_get_local_s1,
+-    [ROP_get_local_s2] = regvm_t_get_local_s2,
+-    [ROP_get_local_s3] = regvm_t_get_local_s3,
+-    [ROP_get_arg] = regvm_t_get_arg,
+-    [ROP_get_var_ref] = regvm_t_get_var_ref,
+-    [ROP_get_global] = regvm_t_get_global,
+-    [ROP_get_element] = regvm_t_get_element,
+-    [ROP_get_field] = regvm_t_get_field,
+-    [ROP_get_field2] = regvm_t_get_field2,
+-    [ROP_put_field] = regvm_t_put_field,
+-    [ROP_branch] = regvm_t_branch,
+-    [ROP_branch_s] = regvm_t_branch_s,
+-    [ROP_branch_if] = regvm_t_branch_if,
+-    [ROP_branch_if_not] = regvm_t_branch_if_not,
+-    [ROP_branch_cmp_reg_reg] = regvm_t_branch_cmp_reg_reg,
+-    [ROP_branch_cmp_reg_reg_s] = regvm_t_branch_cmp_reg_reg_s,
+-    [ROP_branch_lt_s] = regvm_t_branch_lt_s,
+-    [ROP_branch_nlt_s] = regvm_t_branch_nlt_s,
+-    [ROP_branch_lte_s] = regvm_t_branch_lte_s,
+-    [ROP_branch_nlte_s] = regvm_t_branch_nlte_s,
+-    [ROP_branch_gt_s] = regvm_t_branch_gt_s,
+-    [ROP_branch_ngt_s] = regvm_t_branch_ngt_s,
+-    [ROP_branch_gte_s] = regvm_t_branch_gte_s,
+-    [ROP_branch_ngte_s] = regvm_t_branch_ngte_s,
+-    [ROP_branch_eq_s] = regvm_t_branch_eq_s,
+-    [ROP_branch_neq_s] = regvm_t_branch_neq_s,
+-    [ROP_add_imm_self_branch] = regvm_t_add_imm_self_branch,
+-    [ROP_add_imm_self_branch_s] = regvm_t_add_imm_self_branch_s,
+-    [ROP_return] = regvm_t_return,
+-    [ROP_return_undefined] = regvm_t_return_undefined,
++#define T_BINARY_ENTRY(name, sub) [ROP_##name] = regvm_t_##name,
++    REGVM_T_BINARY_LIST(T_BINARY_ENTRY)
++    REGVM_T_UNARY_LIST(T_BINARY_ENTRY)
++#undef T_BINARY_ENTRY
++#define T_EXPLICIT_ENTRY(name, handler) [ROP_##name] = handler,
++    REGVM_T_EXPLICIT_LIST(T_EXPLICIT_ENTRY)
++#undef T_EXPLICIT_ENTRY
+ #if QJS_REGVM_RECORD
+     [ROP_call] = regvm_t_call,
+     [ROP_call_method] = regvm_t_call_method,
++#else
++    [ROP_call] = regvm_t_to_loop,
++    [ROP_call_method] = regvm_t_to_loop,
++#endif
++#define T_FALLBACK_ENTRY(name) [ROP_##name] = regvm_t_to_loop,
++    REGVM_T_FALLBACK_LIST(T_FALLBACK_ENTRY)
++#undef T_FALLBACK_ENTRY
++};
++
++static const uint8_t regvm_is_threaded[ROP_COUNT] = {
++#define T_BINARY_MARK(name, sub) [ROP_##name] = 1,
++    REGVM_T_BINARY_LIST(T_BINARY_MARK)
++    REGVM_T_UNARY_LIST(T_BINARY_MARK)
++#undef T_BINARY_MARK
++#define T_EXPLICIT_MARK(name, handler) [ROP_##name] = 1,
++    REGVM_T_EXPLICIT_LIST(T_EXPLICIT_MARK)
++#undef T_EXPLICIT_MARK
++#if QJS_REGVM_RECORD
++    [ROP_call] = 1,
++    [ROP_call_method] = 1,
+ #endif
+ };
++#undef REGVM_T_EXPLICIT_LIST
++#undef REGVM_T_FALLBACK_LIST
+ 
++static uint8_t *regvm_t_to_loop(REGVM_ARGS)
++{
++#ifdef QJS_REGVM_COUNT
++    /* The monolithic loop counts an opcode after this trampoline returns it. */
++    js_regvm_count[*ip]--;
++#endif
++    return ip;
++}
++
+ static uint8_t *regvm_t_dispatch(REGVM_ARGS)
+ {
+     regvm_handler h = regvm_threaded[*ip];
+-
+-    if (likely(h != NULL)) {
+-        T_COUNT_INC(*ip);
+-        __attribute__((musttail)) return h(REGVM_PASS);
+-    }
+-    return ip;
++    T_COUNT_INC(*ip);
++    __attribute__((musttail)) return h(REGVM_PASS);
+ }
+ 
+ /*
+@@ -25709,7 +25764,7 @@
+  * call, and it disappears entirely once every opcode has a handler.
+  */
+ #define REGVM_NEXT() do { \
+-            if (unlikely(regvm_threaded[*rpc] != NULL)) \
++            if (unlikely(regvm_is_threaded[*rpc])) \
+                 rpc = regvm_t_dispatch(rpc, regs, &run, ctx); \
+             if (unlikely(rpc == NULL)) { \
+                 ret_val = run.ret; \
+@@ -56151,7 +56206,7 @@
+         int op = *p, sz;
+         if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
+             break;
+-        if (regvm_threaded[op] == NULL)
++        if (!regvm_is_threaded[op])
+             js_regvm_blockers[op]++;
+         sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+         if (sz < 0)
+@@ -57217,7 +57272,7 @@
+                 while (_p < _end) {
+                     int _op = *_p;
+                     int _sz;
+-                    if (_op >= ROP_COUNT || regvm_threaded[_op] == NULL ||
++                    if (_op >= ROP_COUNT || !regvm_is_threaded[_op] ||
+                         regvm_rop_fmt[_op] == NULL) {
+                         _all = 0;
+                         break;

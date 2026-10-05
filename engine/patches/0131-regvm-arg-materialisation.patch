@@ -1,0 +1,271 @@
+Materialises call arguments in place instead of staging copies (W3a)
+
+Every register-VM call staged each argument into a window register with an
+explicit move before the call. For the common case of a freshly computed
+argument that move is the only reader of the value, so the producer can write
+the window slot directly and the move disappears.
+
+  * quickjs.c: regvm_arg_retarget proves a value can be retargeted -- it must be
+    a non-home version with no other reader, must not come from a phi, cycle,
+    split or home edge, and no instruction after its definition may name the
+    window; regvm_stage_args applies that across one call's operand list and
+    refuses when two arguments would share a producer; regvm_lower_insn gains
+    the home map and value count, and all six call lowerings (call, call_method,
+    call_constructor, tail_call, tail_call_method, array_from) use it.
+
+This patch does not change the register format or the bytecode version.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -54114,6 +54114,116 @@
+                               const uint8_t *slot_ok, const int *ok_index,
+                               int *p_role);
+ 
++/* Forward declarations for the ownership helpers defined next to the
++   register-state dataflow (section 6.1), which the W3a argument staging uses. */
++static int regvm_own_has_dest(uint16_t rop);
++static int regvm_own_dest_index(uint16_t rop);
++static int regvm_own_second_dest_index(uint16_t rop);
++
++/*
++ * W3a: which call arguments can be produced straight into the window.
++ *
++ * A call stages its arguments by copying each one into the reserved window
++ * (`REGVM_WIN(a)`) with a `ROP_move`. When an argument's value is read nowhere
++ * else in the emitted IR, and its producer may take an arbitrary destination,
++ * the producer can write the window slot itself and the copy disappears.
++ *
++ * The test is deliberately narrow, and every refusal is a correctness rule:
++ *   - a value that is a version of a variable's home is refused: writing the
++ *     window would strand the home write (`home_of[v] >= 0`);
++ *   - a value read by any emitted instruction is refused: the staging copy is
++ *     meant to be its one and only use;
++ *   - a value named by more than one of the call's operands (the callee, the
++ *     receiver, or a second argument) is refused;
++ *   - a producer that is itself an edge copy (phi, cycle break, split, home
++ *     copy) is refused, because it is shared positional glue;
++ *   - a producer, or anything between it and here, that names the window is
++ *     refused: a call in the interval would clobber a sibling argument's slot.
++ *
++ * The producer is the last instruction to write `v`, which is its definition
++ * for a value the operand stack still names. Returns its index, or -1 to fall
++ * back to the move.
++ */
++static int regvm_arg_retarget(const JSRegIR *ir, int v,
++                              const int *home_of, int n_values)
++{
++    int i, def = -1, reads = 0;
++    if (v < 0 || (home_of && v < n_values && home_of[v] >= 0))
++        return -1;
++    for (i = 0; i < ir->n_insns; i++) {
++        const JSRegInsn *in = &ir->insns[i];
++        const char *fmt = regvm_rop_fmt[in->rop];
++        int di, di2, k;
++        if (!fmt)
++            continue;
++        di = regvm_own_dest_index(in->rop);
++        if (!regvm_own_has_dest(in->rop) || fmt[di] != 'r')
++            di = -1;
++        di2 = di >= 0 ? regvm_own_second_dest_index(in->rop) : -1;
++        for (k = 0; k < in->n_ops && fmt[k]; k++) {
++            if (fmt[k] != 'r' || k == di || (di2 >= 0 && k == di2))
++                continue;
++            if (in->ops[k] == v)
++                reads++;
++        }
++        if (di >= 0 && in->ops[di] == v)
++            def = i;
++    }
++    if (def < 0 || reads != 0)
++        return -1;
++    {
++        const JSRegInsn *d = &ir->insns[def];
++        uint8_t o = d->origin;
++        if (o == REGVM_ORIG_PHI || o == REGVM_ORIG_CYCLE ||
++            o == REGVM_ORIG_SPLIT || o == REGVM_ORIG_HOMECOPY)
++            return -1;
++    }
++    /* Nothing from the producer to here may name the window. */
++    for (i = def; i < ir->n_insns; i++) {
++        const JSRegInsn *in = &ir->insns[i];
++        const char *fmt = regvm_rop_fmt[in->rop];
++        int k;
++        if (!fmt)
++            continue;
++        for (k = 0; k < in->n_ops && fmt[k]; k++)
++            if (in->ops[k] <= REGVM_WIN(0))
++                return -1;
++    }
++    return def;
++}
++
++/*
++ * Decide, for one call's arguments, which ones can be produced in place. `pop`
++ * names every operand the call reads (n_all of them), and the arguments are the
++ * argc entries starting at arg_off. Fills defs[a] with the producer to retarget
++ * for argument a, or -1 to stage it with a move. Two arguments never share a
++ * producer.
++ */
++static void regvm_stage_args(const JSRegIR *ir, const int *pop, int n_all,
++                             int arg_off, int argc, const int *home_of,
++                             int n_values, int *defs)
++{
++    int a, b;
++    for (a = 0; a < argc; a++) {
++        int v = pop[arg_off + a], n = 0;
++        defs[a] = regvm_arg_retarget(ir, v, home_of, n_values);
++        if (defs[a] < 0)
++            continue;
++        for (b = 0; b < n_all; b++)
++            if (pop[b] == v)
++                n++;
++        if (n != 1)
++            defs[a] = -1;
++    }
++    for (a = 0; a < argc; a++) {
++        if (defs[a] < 0)
++            continue;
++        for (b = a + 1; b < argc; b++)
++            if (defs[b] == defs[a])
++                defs[a] = defs[b] = -1;
++    }
++}
++
+ /* Lower one stack instruction to register instructions, appending them to the
+    IR. `pop` names the popped values (pop[0] is the deepest) and `dst` is the
+    first pushed value. Returns 0 when lowered, -1 when the opcode has no
+@@ -54122,7 +54232,7 @@
+                             int pos, const int *pop, const uint8_t *reuse,
+                             int dst, int below, const JSFunctionDef *fd,
+                             const uint8_t *slot_ok, const int *ok_index,
+-                            const int *sval)
++                            const int *sval, const int *home_of, int n_values)
+ {
+     int op = bc[pos];
+     int prom = REGVM_SLOT_NONE, prom_k = -1;
+@@ -54547,56 +54657,98 @@
+     case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+     case OP_call: {
+         int argc = (op == OP_call) ? get_u16(bc + pos + 1) : (op - OP_call0);
+-        int a;
++        int defs[256], a;
+         if (argc > 255)
+             return -1;
+-        for (a = 0; a < argc; a++)
+-            ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
++        regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, defs);
++        for (a = 0; a < argc; a++) {
++            if (defs[a] >= 0) {
++                JSRegInsn *d = &ir->insns[defs[a]];
++                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++            } else {
++                ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
++            }
++        }
+         ADD(ROP_call, dst, pop[0], REGVM_WIN(0), argc);
+         return 0;
+     }
+     case OP_call_method: {
+-        int argc = get_u16(bc + pos + 1), a;
++        int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+             return -1;
+-        for (a = 0; a < argc; a++)
+-            ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
++        regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, defs);
++        for (a = 0; a < argc; a++) {
++            if (defs[a] >= 0) {
++                JSRegInsn *d = &ir->insns[defs[a]];
++                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++            } else {
++                ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
++            }
++        }
+         ADD(ROP_call_method, dst, pop[1], pop[0], REGVM_WIN(0), argc);
+         return 0;
+     }
+     case OP_call_constructor: {
+-        int argc = get_u16(bc + pos + 1), a;
++        int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+             return -1;
+-        for (a = 0; a < argc; a++)
+-            ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
++        regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, defs);
++        for (a = 0; a < argc; a++) {
++            if (defs[a] >= 0) {
++                JSRegInsn *d = &ir->insns[defs[a]];
++                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++            } else {
++                ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
++            }
++        }
+         ADD(ROP_construct, dst, pop[0], pop[1], REGVM_WIN(0), argc);
+         return 0;
+     }
+     case OP_tail_call: {
+-        int argc = get_u16(bc + pos + 1), a;
++        int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+             return -1;
+-        for (a = 0; a < argc; a++)
+-            ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
++        regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, defs);
++        for (a = 0; a < argc; a++) {
++            if (defs[a] >= 0) {
++                JSRegInsn *d = &ir->insns[defs[a]];
++                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++            } else {
++                ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
++            }
++        }
+         ADD(ROP_tail_call, pop[0], REGVM_WIN(0), argc);
+         return 0;
+     }
+     case OP_tail_call_method: {
+-        int argc = get_u16(bc + pos + 1), a;
++        int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+             return -1;
+-        for (a = 0; a < argc; a++)
+-            ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
++        regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, defs);
++        for (a = 0; a < argc; a++) {
++            if (defs[a] >= 0) {
++                JSRegInsn *d = &ir->insns[defs[a]];
++                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++            } else {
++                ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
++            }
++        }
+         ADD(ROP_tail_call_method, pop[1], pop[0], REGVM_WIN(0), argc);
+         return 0;
+     }
+     case OP_array_from: {
+-        int argc = get_u16(bc + pos + 1), a;
++        int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+             return -1;
+-        for (a = 0; a < argc; a++)
+-            ADD(ROP_move, REGVM_WIN(a), pop[a]);
++        regvm_stage_args(ir, pop, argc, 0, argc, home_of, n_values, defs);
++        for (a = 0; a < argc; a++) {
++            if (defs[a] >= 0) {
++                JSRegInsn *d = &ir->insns[defs[a]];
++                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++            } else {
++                ADD(ROP_move, REGVM_WIN(a), pop[a]);
++            }
++        }
+         ADD(ROP_array_from, dst, REGVM_WIN(0), argc);
+         return 0;
+     }
+@@ -57258,7 +57410,8 @@
+     } else if (regvm_lower_insn(st->ctx, st->ir, bc, pos,
+                                 scratch + (d - np), st->reuse,
+                                 push_base[pos], d - np, st->fd,
+-                                st->slot_ok, st->ok_index, st->sval)) {
++                                st->slot_ok, st->ok_index, st->sval,
++                                sim->home_of, sim->n_values)) {
+         return -1;
+     }
+     if (sim->apply_homes && sim->home_slot_of_def &&

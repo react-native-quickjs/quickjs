@@ -1,0 +1,178 @@
+Subject: register VM fuses a strict compare against a just-loaded undefined
+
+What this does:
+  `x === undefined` and `x !== undefined` are box2d's default-argument guards
+  and its most common strict compares. 0147 already turns the `undefined`
+  operand into `ROP_load_undefined` when it is a global read, and 0145 already
+  decides the compare from one tag test, but the two instructions still
+  dispatch separately: the load writes `undefined` into a register that the
+  compare immediately reads (8.86 M such pairs on the fixed kernel).
+
+  When `regvm_fuse_branches` fuses a `ROP_binary` strict compare with the
+  following branch, it now also looks one instruction further back. If that
+  instruction is `ROP_load_undefined`, the loaded register has no other reader
+  (its use count is two: the definition and this compare), and the loaded
+  register is one of the compare's two operands, then the load and the compare
+  are both redundant: with one operand known to be `undefined`, the strict
+  compare is exactly a tag test on the other operand. The branch is rewritten
+  to carry `REG_BIN_IS_UNDEF` or `REG_BIN_IS_NOT_UNDEF`, both operands become
+  the other operand's value number, and the load and the compare are dropped.
+  Dropping two adjacent instructions leaves that operand's register untouched
+  from its definition through the branch, which is what makes reading it there
+  sound without a liveness change; the operands must be distinct, because if
+  both were the loaded register there is no other operand to test.
+
+  The two pseudo sub-operations sit below `REG_CMP_INVERT` and above every real
+  `REG_BIN_*` member, so no real sub-operation changes value and the sub byte
+  stays a single byte. `regvm_cmp_opcode` returns -1 for them, so the encoder
+  keeps the narrow `ROP_branch_cmp_reg_reg_s` form and the new test rides the
+  existing compare-and-branch handlers: one tag test in the threaded
+  `T_DEF_CMP_BRANCH` and in both monolith `REGVM_CMP_BRANCH` macros. The
+  per-sense instantiations carry a constant sub-op and fold the test away, so
+  only `branch_cmp_reg_reg(_s)` pays for the extra compare.
+
+  Because the sub byte's meaning changes, `REGVM_FORMAT_VERSION` goes 13 -> 14,
+  and the register bytecode blobs staged in 9999 are regenerated for the new
+  format.
+
+  Measured (`fixed.js`, 32 iterations, i7-8700), interleaved against 0149:
+  23,066,148,676 -> 22,894,815,962 instructions (**-0.169 G, -0.73 %**), cycles
+  median -0.7 %, against the plan's 0.07-0.09 G expected and 0.07 G floor. Gate
+  run 22,896,286,096 / 10,952,645,402. Checksum `546.1008391043414` exact;
+  diff-suite 398/0/0 mono and threaded; leak assertion clean; peak RSS 13248 KB;
+  full test262 errors 50 (<= 64, unchanged).
+
+---
+diff --git a/quickjs.c b/quickjs.c
+index 65c4946..bd32fe1 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26518,6 +26518,20 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
+         int32_t _off = (OFFEXPR); \
+         JSValue _a = FR(_la), _b = FR(_rb); \
+         int _r; \
++        /* \
++         * L3b: a strict compare whose other operand was loaded with \
++         * undefined by the instruction right before it. regvm_fuse_branches \
++         * emits these sub-ops only when the load, the compare and the branch \
++         * are mutually adjacent and the loaded register has no other reader, \
++         * so this single tag test is the whole comparison and the load's \
++         * dispatch is gone. \
++         */ \
++        if (unlikely((unsigned)(_sub - REG_BIN_IS_UNDEF) < 2)) { \
++            int _u = (JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
++                         ^ (_sub != REG_BIN_IS_UNDEF); \
++            if (_u) { T_BR_NEXT((SZ_) + _off); } \
++            T_NEXT((SZ_)); \
++        } \
+         /* \
+          * N3: `===`/`!==` against undefined. It is box2d's default-argument \
+          * guard and its most common strict compare, but the undefined operand \
+@@ -28465,6 +28479,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+              */
+ #define REGVM_CMP_BRANCH(a_, b_) do { \
+                   JSValue _a = (a_), _b = (b_); int take, _r = -1; \
++                  /* L3b: the fused strict compare against a just-loaded \
++                     undefined. A single tag test replaces the comparison; the \
++                     sub-op is only ever emitted by regvm_fuse_branches, which \
++                     guarantees the other operand is the one to test. */ \
++                  if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
++                      if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
++                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
++                      REGVM_NEXT(); \
++                  } \
+                   if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+                              !((_r = regvm_int_cmp(sub & ~REG_CMP_INVERT, \
+                                                    JS_VALUE_GET_INT(_a), \
+@@ -31539,6 +31562,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+ #undef REGVM_CMP_BRANCH
+ #define REGVM_CMP_BRANCH(a_, b_) do { \
+                   JSValue _a = (a_), _b = (b_); int take, _r = -1; \
++                  /* L3b: the fused strict compare against a just-loaded \
++                     undefined. A single tag test replaces the comparison; the \
++                     sub-op is only ever emitted by regvm_fuse_branches, which \
++                     guarantees the other operand is the one to test. */ \
++                  if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
++                      if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
++                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
++                      REGVM_NEXT(); \
++                  } \
+                   if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+                              !((_r = regvm_int_cmp(sub & ~REG_CMP_INVERT, \
+                                                    JS_VALUE_GET_INT(_a), \
+@@ -58588,6 +58620,42 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+             sub = prev->ops[1];
+             if (sub < 0 || sub > 0x3f)
+                 continue;               /* the sub-op shares bits with INV */
++            /*
++             * L3b: a strict compare against a value that the previous
++             * instruction loaded with undefined, where the load has no other
++             * reader. The comparison is then a tag test on the other operand,
++             * so the load and the compare can both go and the branch can carry
++             * REG_BIN_IS_UNDEF/REG_BIN_IS_NOT_UNDEF. Dropping the two adjacent
++             * instructions leaves the other operand's register untouched from
++             * its definition through the branch, which is what makes reading
++             * it there sound without a liveness change. Requires the operands
++             * be distinct: if both were the loaded register there is no other
++             * operand to test.
++             */
++            if (i >= 1 && prev->rop == ROP_binary && prev->n_ops == 4 &&
++                prev->ops[2] != prev->ops[3] &&
++                ir->insns[i - 1].rop == ROP_load_undefined &&
++                ir->insns[i - 1].n_ops == 1) {
++                int u = ir->insns[i - 1].ops[0];
++                int base = sub & ~REG_CMP_INVERT;
++                if (u >= 0 && u < n_values && nref[u] == 2 &&
++                    (prev->ops[2] == u || prev->ops[3] == u) &&
++                    (base == REG_BIN_STRICT_EQ || base == REG_BIN_STRICT_NEQ)) {
++                    int other = (prev->ops[2] == u) ? prev->ops[3] : prev->ops[2];
++                    int k = (base == REG_BIN_STRICT_NEQ)
++                                ^ ((sub & REG_CMP_INVERT) != 0)
++                                ^ (inv != 0);
++                    br->rop = ROP_branch_cmp_reg_reg;
++                    br->n_ops = 4;
++                    br->ops[0] = k ? REG_BIN_IS_NOT_UNDEF : REG_BIN_IS_UNDEF;
++                    br->ops[1] = other;
++                    br->ops[2] = other;
++                    br->ops[3] = target;
++                    drop[i] = 1;
++                    drop[i - 1] = 1;
++                    continue;
++                }
++            }
+             if (prev->rop == ROP_binary && prev->n_ops == 4) {
+                 br->rop = ROP_branch_cmp_reg_reg;
+                 br->ops[1] = prev->ops[2];
+diff --git a/quickjs-regvm.h b/quickjs-regvm.h
+index 02ae016..3d7f446 100644
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -784,7 +784,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
+  * cross-VM one does. Bump it whenever an opcode is added, removed or
+  * renumbered, or an operand's width or meaning changes.
+  */
+-#define REGVM_FORMAT_VERSION 13
++#define REGVM_FORMAT_VERSION 14
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */
+@@ -835,6 +835,19 @@ typedef enum JSRegBinaryOp {
+     REG_BIN_COUNT,
+ } JSRegBinaryOp;
+ 
++/*
++ * Pseudo sub-operations of ROP_branch_cmp_*. A fused strict compare against a
++ * compile-time-undefined operand carries no pair of values to compare: the
++ * operand that was loaded with undefined is gone, and the remaining operand's
++ * tag is the whole test. These name that test directly. Both sit below
++ * REG_CMP_INVERT (0x40) and above every real REG_BIN_* member, so no real
++ * sub-operation changes value and the sub byte stays a single comparison.
++ * They are produced only by the branch fusion (regvm_fuse_branches), never by
++ * the bytecode lowering.
++ */
++#define REG_BIN_IS_UNDEF     0x3e
++#define REG_BIN_IS_NOT_UNDEF 0x3f
++
+ /*
+  * --- the register frame -------------------------------------------------
+  *

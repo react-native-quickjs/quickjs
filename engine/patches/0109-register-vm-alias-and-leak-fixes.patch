@@ -1,0 +1,150 @@
+Subject: fixes register value aliasing, iterator close and two reference leaks
+
+What this does
+  Makes every part of the register compiler agree on which stack values are
+  aliases, keeps for-await loops closable, and stops two handlers leaking a
+  reference.
+
+Why we need it
+  The stack-shaper alias change left `nip` without a value definition and left
+  the slot-forwarding model naming shaper outputs as fresh values, so logical
+  assignment and `yield*` results read stale registers. The for-await step's
+  `dup3; drop` then removed the loop's iterator record, so an exception no longer
+  closed the iterator. `define_global_func` and `define_method` duplicated values
+  their callees only borrow, leaking one reference per call.
+
+What it adds
+  `nip` in the shaper alias table, alias-aware slot forwarding, a sentinel drop
+  only on the last stack reference, and borrowing calls to
+  JS_DefineGlobalFunction and JS_DefineProperty.
+
+Needs a bytecode version bump
+  No. The emitted register bytecode for the built-in blobs is unchanged.
+
+diff --git a/quickjs.c b/quickjs.c
+index 4fd4118..8299d4f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26136,7 +26136,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 JSAtom atom = RD_U32();
+                 int s = RD_REG();
+                 int flags = RD_U8();
+-                if (JS_DefineGlobalFunction(ctx, atom, js_dup(regs[s]), flags))
++                if (JS_DefineGlobalFunction(ctx, atom, regs[s], flags))
+                     goto exception;
+                 REGVM_NEXT();
+             }
+@@ -26636,11 +26636,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 ret = js_method_set_properties(ctx, regs[f], atom, flags, regs[o]);
+                 if (ret >= 0) {
+                     if (kind == 0)
+-                        value = js_dup(regs[f]);
++                        value = regs[f];
+                     else if (kind == 1)
+-                        getter = js_dup(regs[f]);
++                        getter = regs[f];
+                     else
+-                        setter = js_dup(regs[f]);
++                        setter = regs[f];
+                     ret = JS_DefineProperty(ctx, regs[o], atom, value, getter,
+                                             setter, flags);
+                 }
+@@ -28869,7 +28869,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                     JSAtom atom = RD_U32();
+                     int s = RD_REG();
+                     int flags = RD_U8();
+-                    if (JS_DefineGlobalFunction(ctx, atom, js_dup(regs[s]), flags))
++                    if (JS_DefineGlobalFunction(ctx, atom, regs[s], flags))
+                         goto exception;
+                     REGVM_NEXT();
+                 }
+@@ -55747,6 +55747,7 @@ static int regvm_perm_of(int op, int out)
+     static const int8_t rot5l[]    = { 1, 2, 3, 4, 0 };
+     static const int8_t swap[]     = { 1, 0 };
+     static const int8_t swap2[]    = { 2, 3, 0, 1 };
++    static const int8_t nip[]      = { 1 };
+     const int8_t *map = NULL;
+     int n = 0;
+ 
+@@ -55767,6 +55768,7 @@ static int regvm_perm_of(int op, int out)
+     case OP_rot5l: map = rot5l; n = countof(rot5l); break;
+     case OP_swap: map = swap; n = countof(swap); break;
+     case OP_swap2: map = swap2; n = countof(swap2); break;
++    case OP_nip: map = nip; n = countof(nip); break;
+     default: break;
+     }
+     return map && out >= 0 && out < n ? map[out] : -1;
+@@ -56176,6 +56178,16 @@ typedef struct JSRegEncodeStep {
+     const int32_t *stub_pc;
+ } JSRegEncodeStep;
+ 
++/* Does `v` appear in stack[0..n)? */
++static int regvm_stack_has(const int *stack, int n, int v)
++{
++    int i;
++    for (i = 0; i < n; i++)
++        if (stack[i] == v)
++            return 1;
++    return 0;
++}
++
+ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+                                   const uint8_t *bc, int pos, int *scratch,
+                                   const int *push_base, JSRegSlotSim *sim,
+@@ -56210,9 +56222,16 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+             return -1;
+     }
+     def_begin = st->ir->n_insns;
++    /*
++     * A drop removes the control-stack entry only when it drops the last
++     * stack reference to the sentinel. Stack shapers alias their inputs, so
++     * `dup3; drop` (the for-await step) drops a copy while the loop's own
++     * sentinel is still below it; that drop is an ordinary no-op.
++     */
+     if (bc[pos] == OP_drop && np == 1 && d >= 1 && st->sentinel_bits &&
+         scratch[d - 1] >= 0 && scratch[d - 1] < st->n_values &&
+-        st->sentinel_bits[scratch[d - 1]]) {
++        st->sentinel_bits[scratch[d - 1]] &&
++        !regvm_stack_has(scratch, d - 1, scratch[d - 1])) {
+         if (regvm_ir_add(st->ctx, st->ir, ROP_sentinel_drop, pos, NULL, 0))
+             return -1;
+     } else if (regvm_lower_insn(st->ctx, st->ir, bc, pos,
+@@ -57916,6 +57935,38 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+                     fwd_used[slot] = 1;
+                     continue;
+                 }
++                /*
++                 * Stack shapers and a kept receiver push aliases of their inputs,
++                 * not new values (regvm_pushed). This model has to name them the
++                 * same way, or a store right after a shaper records an id that
++                 * nothing defines and a forwarded read of it sees a stale
++                 * register.
++                 */
++                if (ns > 0 && ns <= 8 && np <= 8 && depth >= np &&
++                    (regvm_perm_of(op, 0) >= 0 ||
++                     (ns == 2 && regvm_keeps_receiver(op)))) {
++                    int popped[8];
++                    for (j = 0; j < np; j++)
++                        popped[j] = stk[depth - np + j];
++                    depth -= np;
++                    for (j = 0; j < ns; j++) {
++                        int src = regvm_perm_of(op, j);
++                        if (src >= 0)
++                            stk[depth + j] = popped[src];
++                        else if (j == 0 && regvm_keeps_receiver(op))
++                            stk[depth + j] = popped[0];
++                        else
++                            stk[depth + j] = -1;
++                    }
++                    if (regvm_perm_of(op, 0) < 0) {
++                        /* the kept receiver's result is a real definition */
++                        push_base[pos] = n_pushes;
++                        stk[depth + 1] = n_pushes + 1;
++                        n_pushes += ns;
++                    }
++                    depth += ns;
++                    continue;
++                }
+                 depth -= np;
+                 if (depth < 0) {
+                     JS_ThrowInternalError(ctx, "regvm: forwarding stack underflow (pc=%d)", pos);

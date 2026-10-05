@@ -1,0 +1,377 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1200,6 +1200,14 @@
+     JSRegPIC *regvm_pic;
+     /* Section 6.2 side table, debug builds only. Owned by the bytecode. */
+     JSRegRCC *regvm_rcc;
++    /* C1's frame-entry fill list: the physical registers the frame must set to
++       `undefined` before the program runs. A register the section 6.1 analysis
++       proves written before any read is omitted, and everything outside the
++       analysis domain (scratch, window, handshake) is always listed. NULL with
++       a zero count means "fill every register", which is what every function
++       read from a blob gets: the field is never serialized. */
++    uint16_t *regvm_fill;
++    uint16_t regvm_fill_count;
+ #endif
+ } JSFunctionBytecode;
+ 
+@@ -25556,8 +25564,33 @@
+             lay->var_buf[k] = JS_UNDEFINED;
+         for (k = 0; k < var_ref_count; k++)
+             lay->var_refs[k] = NULL;
+-        for (k = 0; k < nregs; k++)
+-            lay->regs[k] = JS_UNDEFINED;
++        /*
++         * C1. Every register must hold a valid, *not reference counted* value
++         * before the program runs: the store handlers release the destination's
++         * old value (`T_SET_NEXT`, `SET_REG`, `regvm_t_move_xfer`) and the
++         * release walk frees every counted register, so a register left holding
++         * a recycled frame's word would be released twice. All-bits-zero is the
++         * integer 0, which is exactly that -- valid and uncounted -- so the area
++         * is zeroed first and only the registers whose *value* can be observed
++         * before it is written are then set to `undefined`.
++         *
++         * A NULL list means "no analysis" -- a function read from a blob, whose
++         * side table is never serialized -- and fills everything with
++         * `undefined`, as the frame always did. A non-NULL list is the set the
++         * analysis named, and it always contains the scratch, window and
++         * handshake registers (everything outside the analysis domain), because
++         * a window slot a call does not write is read as an argument.
++         */
++        if (!cb->regvm_fill) {
++            for (k = 0; k < nregs; k++)
++                lay->regs[k] = JS_UNDEFINED;
++        } else {
++            int nf = cb->regvm_fill_count;
++
++            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
++            for (k = 0; k < nf; k++)
++                lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
++        }
+     }
+ 
+     rt->current_stack_frame = sf;
+@@ -26261,8 +26294,19 @@
+                         sp = regs + _cb->regvm_reg_count + REGVM_HS - 1; \
+                         pc = _cb->byte_code_buf; \
+                         rpc = _cb->regvm_code; \
+-                        for (_k = 0; _k < _cb->regvm_reg_count + REGVM_HS; _k++) \
+-                            regs[_k] = JS_UNDEFINED; \
++                        /* C1: zero the area (all-bits-zero is the uncounted \
++                           integer 0) then set the registers whose value can be \
++                           observed before it is written to `undefined`; a NULL \
++                           list (a blob) fills everything with `undefined`. */ \
++                        if (!_cb->regvm_fill) { \
++                            for (_k = 0; _k < _cb->regvm_reg_count + REGVM_HS; _k++) \
++                                regs[_k] = JS_UNDEFINED; \
++                        } else { \
++                            memset(regs, 0, (size_t)(_cb->regvm_reg_count + REGVM_HS) \
++                                             * sizeof(JSValue)); \
++                            for (_k = 0; _k < _cb->regvm_fill_count; _k++) \
++                                regs[_cb->regvm_fill[_k]] = JS_UNDEFINED; \
++                        } \
+                         rt->current_stack_frame = sf; \
+                         REGVM_T_RUN_REBIND(); \
+                         REGVM_NEXT(); \
+@@ -36427,6 +36471,8 @@
+     uint8_t regvm_compiled; /* the backend lowered this function */
+     uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
+     JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
++    uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
++    uint16_t regvm_fill_count;
+ #endif
+ } JSFunctionDef;
+ 
+@@ -52877,6 +52923,17 @@
+      * emitter overrides it for its own phi copies.
+      */
+     uint8_t next_origin;
++    /* Section 6.1's init set, one byte per analysis register: 1 when the
++       register may be read before it is written and so must be filled at frame
++       entry. Built on every build, not just RCCHECK; the encoder turns it into
++       the bytecode's C1 fill list. */
++    uint8_t *own_init;
++    /* The subset of `own_init` whose *value* can be observed before it is
++       written: a kind-1 operand read, or an init-all function (eval, `with`, a
++       ref into the frame). The rest of `own_init` is only ever released or
++       freed, and all-bits-zero is a valid uncounted value for that, so the
++       encoder's `undefined` list is this narrower set. */
++    uint8_t *own_undef;
+ #ifdef QJS_REGVM_RCCHECK
+     /* Section 6.1 outputs the section 6.2 checker consumes, per instruction. */
+     uint8_t *own_plain;     /* n_insns: 1 when the destination was NONE */
+@@ -57156,10 +57213,15 @@
+     uint8_t *blkin_i = NULL, *blkout_i = NULL, *init_i = NULL;
+     uint8_t *weak = NULL;
+     uint8_t *has_def = NULL, *entry_i = NULL, *init_set = NULL, *uni = NULL;
+-    int init_cnt = 0, ret_sum = 0, uni_cnt = 0, uninit_ret = 0;
+-    int i, b, k, e, ne = 0, sp = 0;
++    uint8_t *undef_set = NULL;
++    int init_cnt = 0, undef_cnt = 0, ret_sum = 0, uni_cnt = 0, uninit_ret = 0;
++    int init_all = 0;
++    int i, b, k, e, ne = 0, sp = 0, ok = 0;
+     const char *ownknob = REGVM_KNOB("REGVM_OWN");
+     int dump = ownknob != NULL;
++    /* Owned by the IR once the analysis completes; js_regvm_encode frees it. */
++    ir->own_init = NULL;
++    ir->own_undef = NULL;
+ #ifdef QJS_REGVM_RCCHECK
+     /* The section 6.2 side-table pointers must be NULL on every path out of
+        this function, including the early returns and the bails below:
+@@ -57176,6 +57238,7 @@
+         return;
+     if ((size_t)n * (size_t)nreg > (48u << 20))
+         return;
++    ok = 1;
+     blk = js_malloc(ctx, (size_t)n * sizeof(int));
+     ph = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
+     pn = js_malloc(ctx, (size_t)(4 * n_blocks + 2) * sizeof(int));
+@@ -57197,12 +57260,13 @@
+     has_def = js_malloc(ctx, (size_t)(n_values > 0 ? n_values : 1));
+     entry_i = js_malloc(ctx, nreg);
+     init_set = js_malloc(ctx, nreg);
++    undef_set = js_malloc(ctx, nreg);
+     uni = js_malloc(ctx, nreg);
+     if (!blk || !ph || !pn || !pb || !queue || !bs || !be ||
+         !blkin || !blkout || !inq || !tmp || !sx || !sxn || !ex_entry ||
+         !blkin_i || !blkout_i || !init_i || !has_def || !entry_i ||
+         !weak ||
+-        !init_set || !uni)
++        !init_set || !undef_set || !uni)
+         goto done;
+ 
+     /*
+@@ -57490,6 +57554,37 @@
+             goto done;
+         }
+         memset(uni, 0, nreg);
++        /*
++         * Init-all functions. `eval`, `with`, and a ref into the frame
++         * (`make_local_ref` / `make_var_ref`) can read a binding by name
++         * instead of through an IR operand, so no register is provably unread
++         * and every one is filled -- exactly what a blob function (NULL list)
++         * gets. This is plan section 1.3's init-all rule.
++         */
++        for (i = 0; i < n; i++) {
++            switch (ir->insns[i].rop) {
++            case ROP_eval:
++            case ROP_apply_eval:
++            case ROP_with_get:
++            case ROP_with_put:
++            case ROP_with_delete:
++            case ROP_with_make_ref:
++            case ROP_with_get_ref:
++            case ROP_with_get_ref_undef:
++            case ROP_make_local_ref:
++            case ROP_make_var_ref:
++                init_all = 1;
++                break;
++            default:
++                break;
++            }
++            if (init_all)
++                break;
++        }
++        if (init_all) {
++            memset(init_set, REG_INIT_INIT, nreg);
++            memset(undef_set, REG_INIT_INIT, nreg);
++        }
+ #ifdef QJS_REGVM_RCCHECK
+         /* Section 6.2 consumes exactly what this replay already computes. */
+         ir->own_nreg = nreg;
+@@ -57534,8 +57629,10 @@
+                                 continue;
+                             r = regvm_own_op_reg(in, k, ireg, n_values, reg_count,
+                                                  cycle_reg);
+-                            if (r >= 0 && init_st[r] == REG_INIT_UNINIT)
++                            if (r >= 0 && init_st[r] == REG_INIT_UNINIT) {
+                                 init_set[r] = REG_INIT_INIT;
++                                undef_set[r] = REG_INIT_INIT;
++                            }
+                         }
+                     }
+                 }
+@@ -57596,14 +57693,16 @@
+                     ret_sum += cnt;
+                     /*
+                      * Kind 3-4: the release walk at a return, and the
+-                     * unwinder's walk when the frame is abandoned. Every
+-                     * register it may free must hold a real value or a filled
+-                     * one. `uninit_ret` counts the registers the *full* walk
+-                     * would touch while they are still UNINIT -- the set C2's
+-                     * narrowed walk removes from the fill.
++                     * unwinder's walk when the frame is abandoned. The 0125
++                     * walk is the guarded *full* walk, so it reads every
++                     * register: any register that may still be UNINIT at this
++                     * pc must hold a real value, and that means it is filled.
++                     * (C2 narrows the walk to the owned set; only then can the
++                     * `own == NONE` registers drop out. `uninit_ret` counts
++                     * exactly those, so the saving stays visible.)
+                      */
+                     for (k = 0; k < nreg; k++)
+-                        if (st[k] != REG_OWN_NONE && init_st[k] == REG_INIT_UNINIT)
++                        if (init_st[k] == REG_INIT_UNINIT)
+                             init_set[k] = REG_INIT_INIT;
+                     for (k = 0; k < nreg; k++)
+                         if (init_st[k] == REG_INIT_UNINIT)
+@@ -57630,6 +57729,8 @@
+         for (k = 0; k < nreg; k++) {
+             if (init_set[k] == REG_INIT_INIT)
+                 init_cnt++;
++            if (undef_set[k] == REG_INIT_INIT)
++                undef_cnt++;
+             if (uni[k])
+                 uni_cnt++;
+         }
+@@ -57638,9 +57739,10 @@
+         if (dump)
+             fprintf(stderr,
+                     "##OWNSUM## insns=%d regs=%d blocks=%d plain=%d returns=%d "
+-                    "owned_max=%d ret_sum=%d init=%d union=%d uninit_ret=%d\n",
++                    "owned_max=%d ret_sum=%d init=%d undef=%d init_all=%d "
++                    "union=%d uninit_ret=%d\n",
+                     n, reg_count, n_blocks, plain, nret, owned_max, ret_sum,
+-                    init_cnt, uni_cnt, uninit_ret);
++                    init_cnt, undef_cnt, init_all, uni_cnt, uninit_ret);
+ #ifdef QJS_REGVM_COUNT
+         js_regvm_own_plain += plain;
+         js_regvm_own_returns += nret;
+@@ -57668,7 +57770,16 @@
+     js_free(ctx, init_i);
+     js_free(ctx, has_def);
+     js_free(ctx, entry_i);
++    /* Hand the init set to the IR: the encoder builds C1's fill list from it.
++       A bail leaves it partial, so it is freed instead. */
++    if (ok) {
++        ir->own_init = init_set;
++        ir->own_undef = undef_set;
++        init_set = NULL;
++        undef_set = NULL;
++    }
+     js_free(ctx, init_set);
++    js_free(ctx, undef_set);
+     js_free(ctx, uni);
+ }
+ 
+@@ -57915,6 +58026,10 @@
+     ir.insns = NULL;
+     ir.n_insns = 0;
+     ir.cap = 0;
++    ir.own_init = NULL;
++    ir.own_undef = NULL;
++    fd->regvm_fill = NULL;
++    fd->regvm_fill_count = 0;
+ #ifdef QJS_REGVM_RCCHECK
+     ir.own_plain = NULL;
+     ir.own_rel = NULL;
+@@ -58883,6 +58998,8 @@
+         {
+             int er;
+             fd->regvm_rcc = NULL;
++            fd->regvm_fill = NULL;
++            fd->regvm_fill_count = 0;
+             er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
+                                                               are two bytes */,
+                                              reg_count,
+@@ -58929,6 +59046,56 @@
+                 goto refused;
+             if (er)
+                 goto done;
++            /*
++             * C1's `undefined` list. The register area is zeroed first (an
++             * uncounted integer 0, which is what the store handlers' old-value
++             * release and the release walk need), so only the registers whose
++             * *value* can be observed before it is written need a real
++             * `undefined`: the analysis's kind-1 reads plus its init-all
++             * functions. Everything outside the analysis domain -- the scratch
++             * and window registers, and the handshake slots -- is always
++             * listed, and a register index in the list is a physical register.
++             * A NULL list (count zero) means "fill every register", which is
++             * also what a function read from a blob gets, since the field is
++             * never serialized.
++             */
++            {
++                int ntot = fd->regvm_reg_count + REGVM_HS;
++                int nf = ntot - reg_count;
++
++                for (k = 0; k < reg_count; k++)
++                    if (ir.own_undef && ir.own_undef[k])
++                        nf++;
++                if (nf >= (ntot + 1) / 2) {
++                    /* Most registers are live-in: a list is not worth a walk. */
++                    fd->regvm_fill = NULL;
++                    fd->regvm_fill_count = 0;
++                } else {
++                    uint16_t *fl = js_malloc(ctx,
++                                             (size_t)nf * sizeof(uint16_t));
++                    if (!fl) {
++                        fd->regvm_fill = NULL;
++                        fd->regvm_fill_count = 0;
++                    } else {
++                        int m = 0;
++
++                        for (k = 0; k < reg_count; k++)
++                            if (ir.own_undef && ir.own_undef[k])
++                                fl[m++] = (uint16_t)k;
++                        for (k = reg_count; k < ntot; k++)
++                            fl[m++] = (uint16_t)k;
++                        fd->regvm_fill = fl;
++                        fd->regvm_fill_count = (uint16_t)m;
++                    }
++                }
++                if (REGVM_KNOB("REGVM_OWN")) {
++                    fprintf(stderr, "##FILL## n=%d of %d:", fd->regvm_fill_count,
++                            ntot);
++                    for (k = 0; k < fd->regvm_fill_count; k++)
++                        fprintf(stderr, " %d", fd->regvm_fill[k]);
++                    fprintf(stderr, "\n");
++                }
++            }
+         }
+     }
+     js_regvm_stats.encoded_funcs++;
+@@ -58954,6 +59121,8 @@
+     }
+ #endif
+     js_free(ctx, ir.insns);
++    js_free(ctx, ir.own_init);
++    js_free(ctx, ir.own_undef);
+     js_free(ctx, pc_to_insn);
+     js_free(ctx, scratch);
+     js_free(ctx, sval);
+@@ -61748,8 +61917,14 @@
+         code[0] = (uint8_t)ROP_return_undefined;
+         fd->regvm_code = code;
+         fd->regvm_len = 1;
+-        if (fd->regvm_reg_count < 1)
++        if (fd->regvm_reg_count < 1) {
+             fd->regvm_reg_count = 1;
++            /* The list was built for the count the encoder reported; with the
++               count forced up here, fall back to filling every register. */
++            js_free(ctx, fd->regvm_fill);
++            fd->regvm_fill = NULL;
++            fd->regvm_fill_count = 0;
++        }
+     }
+ 
+     /* Execution is known to arrive here, so the program is the backend's. */
+@@ -62270,6 +62445,10 @@
+         b->regvm_pic_count = fd->regvm_pic_count;
+         b->regvm_rcc = fd->regvm_rcc;
+         fd->regvm_rcc = NULL;
++        b->regvm_fill = fd->regvm_fill;
++        b->regvm_fill_count = fd->regvm_fill_count;
++        fd->regvm_fill = NULL;
++        fd->regvm_fill_count = 0;
+         b->regvm_compiled = 1;
+         b->regvm_all_threaded = fd->regvm_all_threaded;
+         memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
+@@ -62384,6 +62563,8 @@
+ #if QJS_REGVM
+     /* release register-PIC-held shape refs and free the table (A2) */
+     js_free_regvm_pic(rt, b);
++    js_free_rt(rt, b->regvm_fill);
++    b->regvm_fill = NULL;
+ #ifdef QJS_REGVM_RCCHECK
+     js_free_regvm_rcc(rt, b);
+ #endif

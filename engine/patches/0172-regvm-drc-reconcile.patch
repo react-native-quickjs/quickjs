@@ -1,0 +1,592 @@
+Subject: register VM DRC reconcile on allocation pressure and taken back-edges
+
+What this does:
+  Deferred reference counting (DRC) parks zero-refcount values until a
+  safepoint reconciles them. The safepoint trigger was purely a count
+  (zct_len + zct_nobj > zct_limit), so a handful of very large parked values
+  - e.g. multi-megabyte linearized strings, which pdf.js produces constantly -
+  kept the heap ratcheting up without ever tripping the limit. The monolith
+  register VM also had no safepoint on its taken back-edges at all, so a long
+  running function could accumulate parked values for its whole duration.
+
+  This adds three triggers and the missing back-edge check:
+  1. rt->drc_malloc_mark: set after every reconcile (and after JS_RunGC's
+     reconcile) to malloc_size + max(4 MB, 25%). js_malloc_rt / js_realloc_rt
+     call js_drc_malloc_pressure(), which sets zct_limit = 0 when allocation
+     has crossed the mark and the parked list is non-empty. The reconcile
+     itself still happens at the next safepoint, never inside malloc.
+  2. An eager trigger in js_drc_zero(): parking a single large value (string or
+     rope >= 64 KB, comparable BigInt, or an object owning a large array buffer
+     / typed array) sets zct_limit = 0 directly.
+  3. js_trigger_gc()'s deferred branch sets zct_limit = 0 when values are
+     parked, preferring a reconcile over merely raising the collection
+     threshold.
+  4. REGVM_MONO_BACKEDGE(off): the monolith register VM now calls
+     js_drc_safepoint() on every taken backward branch, matching the threaded
+     handlers' REGVM_DRC_BACKEDGE.
+
+Why we need it:
+  On the Octane pdf.js corpus the register VM peaked at 1.46 GB RSS versus
+  23 MB for the stack VM (and 57.5 MB after this change, versus 58.4 MB for a
+  QJS_DRC=0 build), while the live heap at exit was smaller than the stack
+  VM's. It was a transient peak, not a leak: parked values were retained far
+  past their last use.
+
+Needs a bytecode version bump:
+  No. Runtime only.
+
+Notes:
+  The generated step-engine include quickjs-regvm-step.inc is regenerated so
+  its copy of REGVM_CMP_BRANCH carries the new back-edge check (it is emitted
+  from the monolith body). The only change there is the added
+  REGVM_MONO_BACKEDGE(off) at the taken-branch sites; it keeps the shipped
+  include in sync and avoids a macro-redefinition warning.
+
+---
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -514,6 +514,9 @@
+     uint32_t zct_cap;
+     uint32_t zct_nobj;
+     uint32_t zct_limit;
++    /* malloc_size at which allocation pressure forces a reconcile, so a few
++       very large parked values cannot ratchet the heap up unboundedly. */
++    size_t drc_malloc_mark;
+     uint8_t drc_in_reconcile;
+     struct list_head tmp_obj_list; /* used during GC */
+     JSGCPhaseEnum gc_phase : 8;
+@@ -2510,6 +2513,13 @@
+             rt->gc_pending = true;
+             rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+                 (rt->malloc_state.malloc_size >> 1);
++#if QJS_DRC
++            /* A reconcile is far cheaper than a full collection and usually
++               releases the parked memory, so prefer it over merely raising the
++               collection threshold. */
++            if (rt->zct_len != 0 || rt->zct_nobj != 0)
++                rt->zct_limit = 0;
++#endif
+             return;
+         }
+ #ifdef ENABLE_DUMPS // JS_DUMP_GC
+@@ -2839,6 +2849,25 @@
+     return ptr;
+ }
+ 
++/* Deferred free parks zero-refcount values until a safepoint reconciles them.
++   The safepoint trigger counts values, not the memory they retain, so a few
++   very large parked values (e.g. a multi-megabyte linearized string) can keep
++   the heap ratcheting up. When allocation crosses the reconcile mark, force a
++   reconcile at the next safepoint (never here: a handler may be holding values
++   mid-instruction). */
++static inline void js_drc_malloc_pressure(JSRuntime *rt)
++{
++#if QJS_DRC
++    if (unlikely(rt->drc_malloc_mark != 0 &&
++                 rt->malloc_state.malloc_size > rt->drc_malloc_mark &&
++                 (rt->zct_len != 0 || rt->zct_nobj != 0))) {
++        rt->zct_limit = 0;
++    }
++#else
++    (void)rt;
++#endif
++}
++
+ void *js_malloc_rt(JSRuntime *rt, size_t size)
+ {
+     void *ptr;
+@@ -2859,6 +2888,7 @@
+ 
+     s->malloc_count++;
+     s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
++    js_drc_malloc_pressure(rt);
+     return ptr;
+ }
+ 
+@@ -2905,6 +2935,7 @@
+         return NULL;
+ 
+     s->malloc_size += js_arena_usable_size(rt, ptr) - old_size;
++    js_drc_malloc_pressure(rt);
+     return ptr;
+ }
+ 
+@@ -3185,7 +3216,11 @@
+     rt->zct_cap = 0;
+     rt->zct_nobj = 0;
+     rt->zct_limit = 4096;
++#ifdef QJS_DRC_STRESS
++    rt->zct_limit = 0;
++#endif
+     rt->drc_in_reconcile = 0;
++    rt->drc_malloc_mark = rt->malloc_state.malloc_size + ((size_t)4 << 20);
+ #endif
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+@@ -6853,7 +6888,6 @@
+     int is_wide_char, depth;
+     JSStringRope *r;
+     JSValue res;
+-
+     if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING) {
+         JSString *p1 = JS_VALUE_GET_STRING(op1);
+         len = p1->len;
+@@ -7030,7 +7064,6 @@
+     JSValue ret;
+ 
+     r = JS_VALUE_GET_STRING_ROPE(rope);
+-
+     /* check whether it is already linearized */
+     if (JS_VALUE_GET_TAG(r->right) == JS_TAG_STRING &&
+         JS_VALUE_GET_STRING(r->right)->len == 0) {
+@@ -7042,7 +7075,12 @@
+     if (string_buffer_concat_value(b, rope))
+         goto fail;
+     ret = string_buffer_end(b);
+-    if (JS_REF_COUNT(r) > 1) {
++    /* Memoize the linearized form in the rope so a later linearization hits
++       the fast path above.  Under DRC a register reference is borrowed, not
++       counted, so JS_REF_COUNT(r) == 1 does not mean the rope is about to
++       die: it can still be reused.  Memoize unconditionally there; the
++       already-linearized check keeps this from repeating. */
++    if (QJS_DRC || JS_REF_COUNT(r) > 1) {
+         /* update the rope so that it won't need to be linearized again */
+         JS_FreeValue(ctx, r->left);
+         JS_FreeValue(ctx, r->right);
+@@ -9648,6 +9686,67 @@
+     rt->zct[rt->zct_len++] = v;
+ }
+ 
++#ifndef QJS_DRC_NO_EAGER_LARGE
++/* A parked value that retains at least this many bytes should force a
++   reconcile soon, rather than waiting for the count-based safepoint trigger. */
++#define JS_DRC_LARGE_VALUE_MIN (64 * 1024)
++
++/* True when parking 'v' would keep a large buffer alive: a long string or rope,
++   a large BigInt, or an object owning a large array buffer / typed array. */
++static bool js_drc_value_is_large(JSValue v)
++{
++    switch (JS_VALUE_GET_TAG(v)) {
++    case JS_TAG_STRING:
++        {
++            JSString *p = JS_VALUE_GET_STRING(v);
++            return (uint32_t)(p->len << p->is_wide_char) >= JS_DRC_LARGE_VALUE_MIN;
++        }
++    case JS_TAG_STRING_ROPE:
++        {
++            JSStringRope *r = JS_VALUE_GET_STRING_ROPE(v);
++            return r->len >= JS_DRC_LARGE_VALUE_MIN;
++        }
++    case JS_TAG_BIG_INT:
++        {
++            JSBigInt *p = JS_VALUE_GET_PTR(v);
++            return (uint64_t)p->len * sizeof(js_limb_t) >= JS_DRC_LARGE_VALUE_MIN;
++        }
++    case JS_TAG_OBJECT:
++        {
++            JSObject *p = JS_VALUE_GET_OBJ(v);
++            switch (p->class_id) {
++            case JS_CLASS_ARRAY_BUFFER:
++            case JS_CLASS_SHARED_ARRAY_BUFFER:
++                /* A failed allocation leaves the object with a NULL buffer. */
++                return p->u.array_buffer != NULL &&
++                       p->u.array_buffer->byte_length >= JS_DRC_LARGE_VALUE_MIN;
++            case JS_CLASS_UINT8C_ARRAY:
++            case JS_CLASS_INT8_ARRAY:
++            case JS_CLASS_UINT8_ARRAY:
++            case JS_CLASS_INT16_ARRAY:
++            case JS_CLASS_UINT16_ARRAY:
++            case JS_CLASS_INT32_ARRAY:
++            case JS_CLASS_UINT32_ARRAY:
++            case JS_CLASS_BIG_INT64_ARRAY:
++            case JS_CLASS_BIG_UINT64_ARRAY:
++            case JS_CLASS_FLOAT16_ARRAY:
++            case JS_CLASS_FLOAT32_ARRAY:
++            case JS_CLASS_FLOAT64_ARRAY:
++            case JS_CLASS_DATAVIEW:
++                {
++                    JSTypedArray *ta = p->u.array.u1.typed_array;
++                    return ta != NULL && ta->length >= JS_DRC_LARGE_VALUE_MIN;
++                }
++            default:
++                return false;
++            }
++        }
++    default:
++        return false;
++    }
++}
++#endif /* QJS_DRC_NO_EAGER_LARGE */
++
+ /* Park 'v' after its ref_count has reached zero. */
+ static void js_drc_zero(JSRuntime *rt, JSValue v)
+ {
+@@ -9657,6 +9756,13 @@
+         js_free_value_rt(rt, v);
+         return;
+     }
++#ifndef QJS_DRC_NO_EAGER_LARGE
++    if (js_drc_value_is_large(v)) {
++        /* One large value can dominate the parked memory before allocation
++           pressure is even felt; make the next safepoint reconcile. */
++        rt->zct_limit = 0;
++    }
++#endif
+     switch (tag) {
+     case JS_TAG_OBJECT:
+     case JS_TAG_FUNCTION_BYTECODE:
+@@ -9750,6 +9856,8 @@
+     rt->drc_in_reconcile = 0;
+ }
+ 
++static void js_drc_rearm_malloc_mark(JSRuntime *rt);
++
+ static void js_drc_reconcile(JSRuntime *rt)
+ {
+     js_drc_pin(rt);
+@@ -9759,6 +9867,22 @@
+     rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
+     if (rt->zct_limit < 4096)
+         rt->zct_limit = 4096;
++#ifdef QJS_DRC_STRESS
++    rt->zct_limit = 0;
++#endif
++    js_drc_rearm_malloc_mark(rt);
++}
++
++/* Set the allocation mark that forces the next safepoint to reconcile. Called
++   after every reconcile so the check in js_drc_malloc_pressure() is armed with
++   a fresh baseline plus at least 4 MB (or 25%) of slack. */
++static void js_drc_rearm_malloc_mark(JSRuntime *rt)
++{
++    size_t m = rt->malloc_state.malloc_size;
++    size_t slack = m >> 2;
++    if (slack < ((size_t)4 << 20))
++        slack = (size_t)4 << 20;
++    rt->drc_malloc_mark = m + slack;
+ }
+ 
+ static inline void js_drc_safepoint(JSRuntime *rt)
+@@ -10337,6 +10461,10 @@
+     rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
+     if (rt->zct_limit < 4096)
+         rt->zct_limit = 4096;
++#ifdef QJS_DRC_STRESS
++    rt->zct_limit = 0;
++#endif
++    js_drc_rearm_malloc_mark(rt);
+ #endif
+ }
+ 
+@@ -29061,6 +29189,18 @@
+         } while (0)
+ #endif
+ #endif
++
++/* Reconcile the deferred-free table on a backward branch. The threaded
++   handlers do this through REGVM_DRC_BACKEDGE; the monolith otherwise only
++   reaches a safepoint at a JS_Call boundary, so a long-running function can
++   accumulate parked values (including multi-megabyte strings) without ever
++   reconciling. Only taken back-edges pay the check. */
++#ifdef QJS_DRC_NO_BACKEDGE
++#define REGVM_MONO_BACKEDGE(off_) ((void)(off_))
++#else
++#define REGVM_MONO_BACKEDGE(off_) \
++    do { if (unlikely((off_) < 0)) js_drc_safepoint(ctx->rt); } while (0)
++#endif
+ #if QJS_REGVM_ASM
+      regvm_stretch:
+ #endif
+@@ -29346,7 +29486,7 @@
+                      guarantees the other operand is the one to test. */ \
+                   if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
+                       if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
+-                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
++                              == (sub == REG_BIN_IS_UNDEF)) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                       REGVM_NEXT(); \
+                   } \
+                   if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+@@ -29365,7 +29505,7 @@
+                       if (unlikely(take < 0)) \
+                           goto exception; \
+                   } \
+-                  if (take) { rpc += off; REGVM_NEXT(); } \
++                  if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                   REGVM_NEXT(); \
+               } while (0)
+             L_ROP_branch_cmp_loc_loc:
+@@ -29459,6 +29599,7 @@
+                                               : iv != INT32_MIN) {
+                               var_buf[slot] = js_int32(u == REG_UN_INC ? iv + 1
+                                                                        : iv - 1);
++                              REGVM_MONO_BACKEDGE(off);
+                               rpc += off;; REGVM_NEXT();
+                           }
+                       }
+@@ -29471,6 +29612,7 @@
+                       goto exception;
+                   }
+                   set_value(ctx, &var_buf[slot], out);
++                  REGVM_MONO_BACKEDGE(off);
+                   rpc += off;;
+                   REGVM_NEXT(); }
+             L_ROP_put_local:
+@@ -30389,6 +30531,7 @@
+                 regvm_ctl[regvm_nctl].reg = -1;
+                 regvm_ctl[regvm_nctl].pc = (uint32_t)(rpc - b->regvm_code);
+                 regvm_nctl++;
++                REGVM_MONO_BACKEDGE(off);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -30836,6 +30979,7 @@
+                     if (unlikely(JS_IsException(val)))
+                         goto exception;
+                     SET_REG_P(d, val);
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                 }
+                 REGVM_NEXT();
+@@ -30863,6 +31007,7 @@
+                     if (unlikely(JS_SetPropertyInternal(ctx, regs[o], atom, val,
+                                                         JS_PROP_THROW_STRICT) < 0))
+                         goto exception;
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                 } else {
+                     /* The fall-through result is another reference to value. */
+@@ -30906,6 +31051,7 @@
+                                                           : JS_UNDEFINED);
+                     }
+                     SET_REG_P(d1, val);
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                 }
+                 REGVM_NEXT();
+@@ -31558,10 +31704,12 @@
+ 
+                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+                         regs[d] = js_int32((int32_t)sum);
++                        REGVM_MONO_BACKEDGE(off);
+                         rpc += off;
+                         REGVM_NEXT();
+                     }
+                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                     REGVM_NEXT();
+                 }
+@@ -31569,6 +31717,7 @@
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+                 SET_REG_P(d, out);
++                REGVM_MONO_BACKEDGE(off);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -31584,10 +31733,12 @@
+ 
+                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+                         regs[d] = js_int32((int32_t)sum);
++                        REGVM_MONO_BACKEDGE(off);
+                         rpc += off;
+                         REGVM_NEXT();
+                     }
+                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                     REGVM_NEXT();
+                 }
+@@ -31595,6 +31746,7 @@
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+                 SET_REG_P(d, out);
++                REGVM_MONO_BACKEDGE(off);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -31762,16 +31914,16 @@
+                 REGVM_NEXT();
+             }
+             L_ROP_branch:
+-                { int32_t off = RD_I32(); rpc += off;; REGVM_NEXT(); }
++                { int32_t off = RD_I32(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
+             L_ROP_branch_s:
+-                { int32_t off = RD_OFF8(); rpc += off;; REGVM_NEXT(); }
++                { int32_t off = RD_OFF8(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
+             L_ROP_branch_if:
+                 { int c = RD_REG(); int32_t off = RD_I32();
+-                  if (regvm_to_bool(ctx, regs[c])) { rpc += off;; }
++                  if (regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+                   REGVM_NEXT(); }
+             L_ROP_branch_if_not:
+                 { int c = RD_REG(); int32_t off = RD_I32();
+-                  if (!regvm_to_bool(ctx, regs[c])) { rpc += off;; }
++                  if (!regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+                   REGVM_NEXT(); }
+             /*
+              * Suspension. The frame stays in the state and the body is
+@@ -32437,7 +32589,7 @@
+                      guarantees the other operand is the one to test. */ \
+                   if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
+                       if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
+-                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
++                              == (sub == REG_BIN_IS_UNDEF)) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                       REGVM_NEXT(); \
+                   } \
+                   if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+@@ -32456,7 +32608,7 @@
+                       if (unlikely(take < 0)) \
+                           goto exception; \
+                   } \
+-                  if (take) { rpc += off; REGVM_NEXT(); } \
++                  if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                   REGVM_NEXT(); \
+               } while (0)
+ 
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -103,10 +103,12 @@
+ 
+                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+                         regs[d] = js_int32((int32_t)sum);
++                        REGVM_MONO_BACKEDGE(off);
+                         rpc += off;
+                         REGVM_NEXT();
+                     }
+                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                     REGVM_NEXT();
+                 }
+@@ -114,6 +116,7 @@
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+                 SET_REG_P(d, out);
++                REGVM_MONO_BACKEDGE(off);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -144,10 +147,12 @@
+ 
+                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+                         regs[d] = js_int32((int32_t)sum);
++                        REGVM_MONO_BACKEDGE(off);
+                         rpc += off;
+                         REGVM_NEXT();
+                     }
+                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                     REGVM_NEXT();
+                 }
+@@ -155,6 +160,7 @@
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+                 SET_REG_P(d, out);
++                REGVM_MONO_BACKEDGE(off);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -688,7 +694,7 @@
+     JSValue *regs = fr;
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
+ 
+-                { int32_t off = RD_I32(); rpc += off;; REGVM_NEXT(); }
++                { int32_t off = RD_I32(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+     return NULL;
+@@ -867,7 +873,7 @@
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
+ 
+                 { int c = RD_REG(); int32_t off = RD_I32();
+-                  if (regvm_to_bool(ctx, regs[c])) { rpc += off;; }
++                  if (regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+                   REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -886,7 +892,7 @@
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
+ 
+                 { int c = RD_REG(); int32_t off = RD_I32();
+-                  if (!regvm_to_bool(ctx, regs[c])) { rpc += off;; }
++                  if (!regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+                   REGVM_NEXT(); }
+             /*
+              * Suspension. The frame stays in the state and the body is
+@@ -1049,7 +1055,7 @@
+     JSValue *regs = fr;
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
+ 
+-                { int32_t off = RD_OFF8(); rpc += off;; REGVM_NEXT(); }
++                { int32_t off = RD_OFF8(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+     return NULL;
+@@ -1841,6 +1847,7 @@
+                 rf->ctl[rf->nctl].reg = -1;
+                 rf->ctl[rf->nctl].pc = (uint32_t)(rpc - b->regvm_code);
+                 rf->nctl++;
++                REGVM_MONO_BACKEDGE(off);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -3169,6 +3176,7 @@
+                                               : iv != INT32_MIN) {
+                               rf->var_buf[slot] = js_int32(u == REG_UN_INC ? iv + 1
+                                                                        : iv - 1);
++                              REGVM_MONO_BACKEDGE(off);
+                               rpc += off;; REGVM_NEXT();
+                           }
+                       }
+@@ -3181,6 +3189,7 @@
+                       goto exception;
+                   }
+                   set_value(ctx, &rf->var_buf[slot], out);
++                  REGVM_MONO_BACKEDGE(off);
+                   rpc += off;;
+                   REGVM_NEXT(); }
+  exception:
+@@ -3259,7 +3268,7 @@
+                      guarantees the other operand is the one to test. */ \
+                   if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
+                       if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
+-                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
++                              == (sub == REG_BIN_IS_UNDEF)) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                       REGVM_NEXT(); \
+                   } \
+                   if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+@@ -3278,7 +3287,7 @@
+                       if (unlikely(take < 0)) \
+                           goto exception; \
+                   } \
+-                  if (take) { rpc += off; REGVM_NEXT(); } \
++                  if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                   REGVM_NEXT(); \
+               } while (0)
+  exception:
+@@ -5351,6 +5360,7 @@
+                     if (unlikely(JS_IsException(val)))
+                         goto exception;
+                     SET_REG_P(d, val);
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                 }
+                 REGVM_NEXT();
+@@ -5403,6 +5413,7 @@
+                                                           : JS_UNDEFINED);
+                     }
+                     SET_REG_P(d1, val);
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                 }
+                 REGVM_NEXT();
+@@ -5445,6 +5456,7 @@
+                     if (unlikely(JS_SetPropertyInternal(ctx, regs[o], atom, val,
+                                                         JS_PROP_THROW_STRICT) < 0))
+                         goto exception;
++                    REGVM_MONO_BACKEDGE(off);
+                     rpc += off;
+                 } else {
+                     /* The fall-through result is another reference to value. */

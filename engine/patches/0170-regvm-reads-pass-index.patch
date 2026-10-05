@@ -1,0 +1,256 @@
+Subject: register VM read forwarding is linear in the instruction count
+
+What this does:
+  The forward-a-frame-read pass scanned every instruction once per block to
+  find the block's stores, then again to find its reads, and cleared the whole
+  slot table at every block -- blocks x instructions and blocks x slots on
+  every function. It now buckets the instructions into one contiguous range per
+  block (the block index advances monotonically with `src_pc`) and walks each
+  range twice, so each instruction is visited a constant number of times, and
+  clears only the slots the block actually stored.
+
+  The clobber test is O(1): `lreg` holds the index of the last instruction that
+  writes each physical register. It is sized by the register count, not the
+  value count, and the buffers use `js_malloc_rt`: the pass is optional, so an
+  allocation failure (including the zero-size case) skips it instead of leaving
+  a pending out-of-memory exception on the context. A register at or beyond
+  `nlreg` is treated as clobbered rather than read out of bounds.
+
+Why we need it:
+  The per-block scans made read forwarding quadratic on large functions; encode
+  time on pdf.js and mandreel was dominated by it.
+
+Needs a bytecode version bump:
+  No. Lowering only.
+
+Notes:
+  The first revision of this pass allocated `lreg` with `js_malloc(ctx, 0)` on
+  functions with no values, which returns NULL and throws out of memory; the
+  module-code test262 failures came from that stray exception, not from the
+  forwarding itself.
+
+---
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64148,102 +64288,130 @@
+      * away.
+      */
+     {
+-        int *blk = js_malloc(ctx, (size_t)(ir.n_insns + 1) * sizeof(int));
++        int *bdef = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
++        int *bval = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
++        int *bpos = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
++        int *bcnt = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
++        int *touched = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
++        int *ins_lo = js_malloc_rt(ctx->rt, (size_t)(n_blocks + 1) * sizeof(int));
++        int *ins_hi = js_malloc_rt(ctx->rt, (size_t)(n_blocks + 1) * sizeof(int));
++        int nlreg = reg_count;
++        int *lreg = js_malloc_rt(ctx->rt, (size_t)(nlreg + 1) * sizeof(int));
+ 
+-        if (blk) {
+-            int *bdef = js_malloc(ctx, (size_t)(fd->var_count + 1) * sizeof(int));
+-            int *bval = js_malloc(ctx, (size_t)(fd->var_count + 1) * sizeof(int));
+-            int *bpos = js_malloc(ctx, (size_t)(fd->var_count + 1) * sizeof(int));
+-            int *bcnt = js_malloc(ctx, (size_t)(fd->var_count + 1) * sizeof(int));
+-
+-            if (bdef && bval && bpos && bcnt) {
+-                int bb;
+-                for (i = 0, bb = 0; i < ir.n_insns; i++) {
+-                    while (bb + 1 < n_blocks && bstart[bb + 1] <= ir.insns[i].src_pc)
+-                        bb++;
+-                    blk[i] = bb;
+-                }
+-                for (bb = 0; bb < n_blocks; bb++) {
+-                    int j, slot, rv, clobbered;
+-                    for (k = 0; k <= fd->var_count; k++)
+-                        bcnt[k] = 0;
+-                    for (i = 0; i < ir.n_insns; i++) {
+-                        int rop;
+-                        if (blk[i] != bb)
+-                            continue;
+-                        rop = ir.insns[i].rop;
+-                        if (rop == ROP_put_local || rop == ROP_put_local_xfer) {
+-                            slot = ir.insns[i].ops[0];
+-                        } else if (rop >= ROP_put_local_s0 && rop <= ROP_put_local_s3) {
+-                            slot = rop - ROP_put_local_s0;
+-                        } else if (rop >= ROP_put_local_xfer_s0 &&
+-                                   rop <= ROP_put_local_xfer_s3) {
+-                            slot = rop - ROP_put_local_xfer_s0;
+-                        } else if (rop == ROP_local_uninit) {
+-                            slot = ir.insns[i].ops[0];
+-                            if (slot >= 0 && slot < fd->var_count && bcnt[slot] < 3)
+-                                bcnt[slot] += 2;    /* a second definition */
+-                            continue;
+-                        } else {
+-                            continue;
+-                        }
+-                        if (slot < 0 || slot >= fd->var_count)
+-                            continue;
+-                        if (bcnt[slot] == 0) {
+-                            bval[slot] = ir.insns[i].ops[1];
+-                            bpos[slot] = i;
++        if (bdef && bval && bpos && bcnt && touched && ins_lo && ins_hi && lreg) {
++            int bb = 0;
++            /*
++             * Bucket the instructions by block and record each block's
++             * contiguous range. The block index advances monotonically with
++             * `src_pc`, so an instruction lands in exactly one range and the
++             * per-block scans below touch each instruction once rather than
++             * once per block.
++             */
++            for (k = 0; k <= n_blocks; k++) {
++                ins_lo[k] = ir.n_insns;
++                ins_hi[k] = -1;
++            }
++            for (i = 0; i < ir.n_insns; i++) {
++                while (bb + 1 < n_blocks && bstart[bb + 1] <= ir.insns[i].src_pc)
++                    bb++;
++                if (ins_lo[bb] == ir.n_insns)
++                    ins_lo[bb] = i;
++                ins_hi[bb] = i;
++            }
++            /* `lreg` maps a physical register to the index of the last
++               instruction that writes it. It is indexed by register, not by
++               value, so size it by the register count. Entries left by earlier
++               blocks are always below the current block's first index, so a
++               single initialisation is enough: `lreg[rv] > bpos[slot]` can only
++               be true for a write inside the current block. */
++            for (k = 0; k < nlreg; k++)
++                lreg[k] = -1;
++            for (bb = 0; bb < n_blocks; bb++) {
++                int slot, rv, clobbered, ntouch = 0;
++                for (i = ins_lo[bb]; i <= ins_hi[bb]; i++) {
++                    int rop;
++                    rop = ir.insns[i].rop;
++                    if (rop == ROP_put_local || rop == ROP_put_local_xfer) {
++                        slot = ir.insns[i].ops[0];
++                    } else if (rop >= ROP_put_local_s0 && rop <= ROP_put_local_s3) {
++                        slot = rop - ROP_put_local_s0;
++                    } else if (rop >= ROP_put_local_xfer_s0 &&
++                               rop <= ROP_put_local_xfer_s3) {
++                        slot = rop - ROP_put_local_xfer_s0;
++                    } else if (rop == ROP_local_uninit) {
++                        slot = ir.insns[i].ops[0];
++                        if (slot >= 0 && slot < fd->var_count && bcnt[slot] < 3) {
++                            if (bcnt[slot] == 0)
++                                touched[ntouch++] = slot;
++                            bcnt[slot] += 2;    /* a second definition */
+                         }
+-                        if (bcnt[slot] < 3)
+-                            bcnt[slot]++;
++                        continue;
++                    } else {
++                        continue;
+                     }
+-                    /* reads, in order, against the register the value holds */
+-                    for (i = 0; i < ir.n_insns; i++) {
+-                        int rop = ir.insns[i].rop, d;
+-                        if (blk[i] != bb)
+-                            continue;
+-                        if (rop != ROP_get_local &&
+-                            !(rop >= ROP_get_local_s0 && rop <= ROP_get_local_s3))
+-                            continue;
+-                        slot = (rop == ROP_get_local) ? ir.insns[i].ops[1]
+-                                                      : rop - ROP_get_local_s0;
+-                        if (slot < 0 || slot >= fd->var_count || bcnt[slot] != 1 ||
+-                            fd->vars[slot].is_captured)
+-                            continue;
+-                        if (bpos[slot] > i)
+-                            continue;               /* the store follows the read */
+-                        if (bval[slot] < 0 || bval[slot] >= n_values)
+-                            continue;
+-                        d = (ir.insns[i].ops[0] >= 0 && ir.insns[i].ops[0] < n_values)
+-                                ? ireg[ir.insns[i].ops[0]] : -1;
+-                        rv = ireg[bval[slot]];
+-                        if (d < 0 || rv < 0 || d == rv)
+-                            continue;
+-                        clobbered = 0;
+-                        for (j = bpos[slot] + 1; j < i; j++) {
+-                            const char *jf = regvm_rop_fmt[ir.insns[j].rop];
+-                            if (!jf || jf[0] != 'r')
+-                                continue;
+-                            int jd = (ir.insns[j].ops[0] >= 0 &&
+-                                      ir.insns[j].ops[0] < n_values)
+-                                         ? ireg[ir.insns[j].ops[0]] : -1;
+-                            if (jd == rv) {
+-                                clobbered = 1;
+-                                break;
+-                            }
+-                        }
+-                        if (clobbered)
+-                            continue;
+-                        ir.insns[i].rop = ROP_move;
+-                        ir.insns[i].ops[1] = bval[slot];
++                    if (slot < 0 || slot >= fd->var_count)
++                        continue;
++                    if (bcnt[slot] == 0) {
++                        bval[slot] = ir.insns[i].ops[1];
++                        bpos[slot] = i;
++                        touched[ntouch++] = slot;
+                     }
++                    if (bcnt[slot] < 3)
++                        bcnt[slot]++;
+                 }
+-            }
+-            js_free(ctx, bdef);
+-            js_free(ctx, bval);
+-            js_free(ctx, bpos);
+-            js_free(ctx, bcnt);
+-            js_free(ctx, blk);
+-        }
++                /* reads, in order, against the register the value holds.
++                   `lreg` is the last instruction in this block that writes each
++                   physical register, so the clobber test is O(1) instead of a
++                   scan back to the store for every read. */
++                for (i = ins_lo[bb]; i <= ins_hi[bb]; i++) {
++                    int rop, d;
++                    const char *ifmt;
++                    rop = ir.insns[i].rop;
++                    ifmt = regvm_rop_fmt[rop];
++                    if (ifmt && ifmt[0] == 'r') {
++                        int id = (ir.insns[i].ops[0] >= 0 &&
++                                  ir.insns[i].ops[0] < n_values)
++                                     ? ireg[ir.insns[i].ops[0]] : -1;
++                        if (id >= 0 && id < nlreg)
++                            lreg[id] = i;
++                    }
++                    if (rop != ROP_get_local &&
++                        !(rop >= ROP_get_local_s0 && rop <= ROP_get_local_s3))
++                        continue;
++                    slot = (rop == ROP_get_local) ? ir.insns[i].ops[1]
++                                                  : rop - ROP_get_local_s0;
++                    if (slot < 0 || slot >= fd->var_count || bcnt[slot] != 1 ||
++                        fd->vars[slot].is_captured)
++                        continue;
++                    if (bpos[slot] > i)
++                        continue;               /* the store follows the read */
++                    if (bval[slot] < 0 || bval[slot] >= n_values)
++                        continue;
++                    d = (ir.insns[i].ops[0] >= 0 && ir.insns[i].ops[0] < n_values)
++                            ? ireg[ir.insns[i].ops[0]] : -1;
++                    rv = ireg[bval[slot]];
++                    if (d < 0 || rv < 0 || d == rv)
++                        continue;
++                    clobbered = (rv >= nlreg || lreg[rv] > bpos[slot]);
++                    if (clobbered)
++                        continue;
++                    ir.insns[i].rop = ROP_move;
++                    ir.insns[i].ops[1] = bval[slot];
++                }
++                /* clear only the slots this block touched, so the reset is
++                   proportional to the block's stores, not to the frame size */
++                for (k = 0; k < ntouch; k++)
++                    bcnt[touched[k]] = 0;
++            }
++        }
++        js_free(ctx, bdef);
++        js_free(ctx, bval);
++        js_free(ctx, bpos);
++        js_free(ctx, bcnt);
++        js_free(ctx, touched);
++        js_free(ctx, ins_lo);
++        js_free(ctx, ins_hi);
++        js_free(ctx, lreg);
+     }
+     regvm_elide_dead_stores(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
+                             n_values, phi_in);

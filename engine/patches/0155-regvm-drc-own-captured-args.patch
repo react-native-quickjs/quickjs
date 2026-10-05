@@ -1,0 +1,48 @@
+Subject: register VM gives callees with captured parameters their own argument copies
+
+What this does:
+  `JS_CallInternal` let the callee use the caller's `argv` as its argument
+  area whenever enough arguments were passed. Under DRC that `argv` is often
+  the caller's register window, whose slots do not own their values. A callee
+  that reaches a parameter slot through a var_ref -- closure capture, the
+  mapped `arguments` object, `make_arg_ref` (`args_captured`) -- frees the old
+  value when it writes through that ref, so it freed a value it only borrowed.
+
+  In the monolith build every JS-to-JS call takes this path. test262
+  `language/arguments-object/10.6-10-c-ii-2.js` (sloppy `foo(a,b,c)` writing
+  `arguments[1] = 'str'` after `foo(10, 'sss', 1)`) freed the `'sss'` atom
+  string, which then failed as a double free in `JS_FreeRuntime`. The
+  threaded+record build passed only because `regvm_record_fill` already
+  refuses to borrow for such callees (`regvm_args_borrowable`).
+
+  `JS_CallInternal` now applies the same rule: under `QJS_REGVM && QJS_DRC` a
+  callee with `args_captured` gets owned copies (`arg_allocated_size =
+  arg_count`), released by the frame like any other copied argument area.
+  Callees without captured parameters are unchanged.
+
+  Correctness fix, not benchmarked (the extra copy is limited to generic-path
+  calls of functions with captured parameters). test262 errors 50/81192 in
+  the monolith and threaded+record builds (unchanged); box2d checksum
+  `546.1008391043414` in both; ASan monolith over the 258
+  `language/arguments-object` tests reports nothing.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -33797,8 +33797,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             return JS_EXCEPTION;
+     }
+ 
++    /* Under DRC the caller's argv may be borrowed registers that do not own
++       their values. A var_ref onto a parameter slot (closure capture, mapped
++       arguments, make_arg_ref) frees the old value on write, so such a
++       callee must own copies -- the same rule as regvm_args_borrowable. */
+     if (unlikely(argc < b->arg_count ||
+-                 ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b)))) {
++                 ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b))
++#if QJS_REGVM && QJS_DRC
++                 || b->args_captured
++#endif
++                 )) {
+         arg_allocated_size = b->arg_count;
+     } else {
+         arg_allocated_size = 0;

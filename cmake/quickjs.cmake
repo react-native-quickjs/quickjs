@@ -14,19 +14,45 @@
 # control over the compile flags. The source list below mirrors upstream's
 # `qjs_sources`; keep it in sync when bumping the submodule.
 
-set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-rel")
+# The experimental register VM (`QJS_REGVM=1`), off by default.
+#
+# One binary contains one VM, so this is a build-wide fork rather than a runtime
+# switch: build one variant per build directory, from this same source tree.
+#
+#   cmake -B build            # stack VM (default)
+#   cmake -B build-regvm -DQJS_REGVM=ON   # register VM
+#
+# When OFF the flag defines nothing at all, so the compile command line -- and
+# therefore the objects and binaries -- are exactly what they were before this
+# option existed. That identity is a Phase 0 requirement and a gate; adding a
+# `QJS_REGVM=0` define in the off case would put the flag into every compile
+# line for no benefit. The engine's `#if QJS_REGVM` reads an undefined macro as
+# 0, which is how the register-VM patches will use it.
+option(QJS_REGVM "Build the experimental register VM engine" OFF)
+
+if(QJS_REGVM)
+  # The register VM's engine changes are not in engine/patches yet, so the
+  # shipping projection does not carry them: a register build compiles the
+  # submodule, which is where the work lives. Once it lands, both variants read
+  # the projection and this branch goes away.
+  set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng")
+else()
+  set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-rel")
+endif()
 
 if(NOT EXISTS "${QUICKJS_DIR}/quickjs.c")
   message(FATAL_ERROR
-    "engine/quickjs-rel is missing.\n"
+    "${QUICKJS_DIR} is missing.\n"
     "Run: node scripts/sync-quickjs-rel.js")
 endif()
 
-# Patch development edits the submodule in place, but this target compiles the
-# projection, so an unsynced edit would be silently ignored. In a source
-# checkout -- never in a consumer's node_modules -- fail instead, and name the
-# command that fixes it.
-if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng/quickjs.c"
+# Patch development edits the submodule in place, but the shipping target
+# compiles the projection, so an unsynced edit would be silently ignored. In a
+# source checkout -- never in a consumer's node_modules -- fail instead, and name
+# the command that fixes it. A register build compiles the submodule directly,
+# so the projection's freshness is not what it is testing.
+if(NOT QJS_REGVM
+   AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng/quickjs.c"
    AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../scripts/sync-quickjs-rel.js")
   find_program(QUICKJS_NODE_EXECUTABLE node)
   if(QUICKJS_NODE_EXECUTABLE)
@@ -56,6 +82,42 @@ add_library(quickjs STATIC
 
 target_include_directories(quickjs PUBLIC "${QUICKJS_DIR}")
 target_compile_definitions(quickjs PRIVATE _GNU_SOURCE)
+
+if(QJS_REGVM)
+  # Production packaging stays on the stack VM until the Phase 10 acceptance
+  # gates pass (see `.local/reg_vm_design.md`). Failing here is the point: a
+  # register-VM Android or iOS artifact would be unusable if it were shipped by
+  # accident, because its bytecode is not loadable by the shipping engine and
+  # vice versa.
+  if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    message(FATAL_ERROR
+      "QJS_REGVM=ON is not supported for Android or iOS yet.\n"
+      "Production builds are stack-only until the register VM passes the "
+      "Phase 10 acceptance gates; host builds may set QJS_REGVM=ON freely.")
+  endif()
+  target_compile_definitions(quickjs PUBLIC QJS_REGVM=1)
+endif()
+
+# Ahead-of-time compilation of the register VM (`QJS_AOT=1`). The generator
+# (`tools/aot/qjsaot`) turns a profiled bundle into one C translation unit of
+# straight-line `qjs_aot_step` calls, which is linked into the engine and bound
+# lazily by bytecode digest. QJS_AOT_UNIT names that generated unit; with no
+# unit the engine still builds (the table is a weak symbol) and simply runs
+# everything through the interpreter.
+option(QJS_AOT "Build the register VM with an AOT unit" OFF)
+set(QJS_AOT_UNIT "" CACHE FILEPATH "Generated AOT unit (aot_unit.c) to link into quickjs")
+if(QJS_AOT)
+  if(NOT QJS_REGVM)
+    message(FATAL_ERROR "QJS_AOT=ON requires QJS_REGVM=ON")
+  endif()
+  target_compile_definitions(quickjs PUBLIC QJS_AOT=1)
+  if(QJS_AOT_UNIT)
+    if(NOT EXISTS "${QJS_AOT_UNIT}")
+      message(FATAL_ERROR "QJS_AOT_UNIT does not exist: ${QJS_AOT_UNIT}")
+    endif()
+    target_sources(quickjs PRIVATE "${QJS_AOT_UNIT}")
+  endif()
+endif()
 
 # Lazy JSON is opt-in for applications. Android and CocoaPods derive this
 # option from the consuming app's package.json; host builds can override it

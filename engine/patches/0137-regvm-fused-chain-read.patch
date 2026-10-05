@@ -1,0 +1,539 @@
+Subject: register VM: fuse the chained property read
+
+What this does:
+  A get_field whose destination is immediately the receiver of the next
+  get_field or get_field2 is lowered to a single instruction, ROP_get_field_chain.
+  It performs both reads and writes both destinations, so it is exactly the pair
+  it replaces: the first destination stays live and nothing observable happens
+  between the two reads. What is saved is one dispatch and the second
+  instruction's operand decode.
+
+  Both PIC sites quicken independently. The generic handler tests both shapes
+  inline; whichever read misses continues in a slow handler, and that handler
+  rewrites the opcode byte -- to the _own spelling only when both sites are
+  cached own slots, and back to the generic form otherwise, so the own handler
+  may omit the kind and prototype tests. The first store cannot use T_SET_NEXT,
+  because that dispatches and the second read has not run yet; the overwrite is
+  inlined and the rare case where the old value's last reference dies continues
+  in a separate free handler that releases it and then performs the second read.
+
+  The fusion pass runs after register allocation and the ownership analysis and
+  after dead-store elision, so neither sees the two-destination opcode. It fires
+  only when the two instructions are IR-adjacent, the second's receiver operand
+  is exactly the first's destination, the two destinations differ, and the
+  second instruction is not a branch, catch or finally target and not a block
+  leader. Site allocation was generalised to assign a dense PIC site to every
+  's' operand rather than only the first.
+
+Why we need it:
+  On box2d get_field->get_field is 129.85 M of the dynamic instruction pairs,
+  19% of all dispatches, and 67.36 M of those are chains of exactly this shape.
+
+Adds:
+  * quickjs-regvm.h: ROP_get_field_chain and ROP_get_field_chain_own, appended
+    after the own read forms so no existing opcode number moves.
+  * quickjs.c: the T_SZ_CHAIN "rrasrras" format, the four handler declarations
+    and dispatch-table entries, the generic, own, first-miss, second-miss and
+    first-free handlers, the two-destination site allocation, and the fusion
+    pass with its adjacency and target checks.
+
+Evidence:
+  box2d fixed.js, clang-19 -O3, perf stat -r7: 29.165 G to 29.065 G
+  instructions (-0.34%, -100 M), cycles -2.51%, wall -2.4%. On check.js the
+  pass fuses 9,161,961 pairs (456,594 generic and 8,705,367 quickened),
+  replacing 18,323,922 get_field-family dispatches; on fixed.js it fuses
+  73,289,789 pairs, replacing 146,579,578 dispatches, which accounts exactly.
+  A chain micro (40 M pairs) shows -3.0% instructions and -4.4% cycles. Box2d
+  checksum 546.1008391043414 is unchanged and the register differential suite
+  is 398/0/0 in both mono and threaded modes; a -DQJS_REGVM_VERIFY=1 -O1 build
+  is clean and prints the same checksum.
+
+  The measured saving is about 1.6 instructions per pair on box2d, not the 6
+  the plan projected, because box2d's chained reads are mostly already-quickened
+  own reads whose second half was already cheap.
+
+Bytecode bump:
+  No. The two opcodes are appended at the end of the enum so every existing
+  opcode keeps its value, and neither is emitted by the encoder -- the generic
+  form is produced only by the runtime fusion pass and the own form only by the
+  quickening rewrite, so no blob contains them.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23303,6 +23303,8 @@
+ #define T_SZ_RAB    8    /* "rab"   */
+ #define T_SZ_RRAS  11    /* "rras"  */
+ #define T_SZ_RASR  11    /* "rasr"  */
++/* X3b fused chain read: d1,r1,atom1,site1,d2,r2,atom2,site2. */
++#define T_SZ_CHAIN 21    /* "rrasrras" */
+ #define T_SZ_T      5    /* "t"     */
+ #define T_SZ_T_S    2    /* "t"     narrow */
+ #define T_SZ_U      3    /* "u"     */
+@@ -23683,6 +23685,11 @@
+ static uint8_t *REGVM_CC regvm_t_get_field2(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_field2_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_field2_own(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_get_field_chain_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_get_field_chain_second_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_get_field_chain_free1(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_branch(REGVM_ARGS);
+@@ -23974,6 +23981,8 @@
+     X(get_field2, regvm_t_get_field2) \
+     X(get_field_own, regvm_t_get_field_own) \
+     X(get_field2_own, regvm_t_get_field2_own) \
++    X(get_field_chain, regvm_t_get_field_chain) \
++    X(get_field_chain_own, regvm_t_get_field_chain_own) \
+     X(put_field, regvm_t_put_field) \
+     X(branch, regvm_t_branch) \
+     X(branch_s, regvm_t_branch_s) \
+@@ -25204,6 +25213,165 @@
+ T_GET_FIELD_BODY(get_field2)
+ #undef T_GET_FIELD_BODY
+ 
++/*
++ * X3b: the fused chain read.
++ *
++ * A `get_field` whose destination is immediately the receiver of the next
++ * `get_field`/`get_field2` is emitted as one instruction, `ROP_get_field_chain`.
++ * It performs both reads and writes both destinations, so it is exactly the
++ * pair it replaces: the first destination stays live, and nothing observable
++ * happens between the two reads. Only a dispatch and the second instruction's
++ * operand decode are saved.
++ *
++ * Both sites quicken independently. The generic handler tests both shapes
++ * inline; whichever read misses continues in a slow handler, and that handler
++ * is what rewrites the opcode byte -- to `_own` only when both sites are cached
++ * own slots, and back to the generic form otherwise, so the own handler may
++ * omit the kind and prototype tests.
++ *
++ * The first store cannot use T_SET_NEXT: that dispatches, and the second read
++ * has not run yet. The overwrite is inlined instead, and the rare case where
++ * the old value's last reference dies continues in `..._free1`, which releases
++ * it and then performs the second read.
++ */
++static __attribute__((noinline)) uint8_t *REGVM_CC
++regvm_t_get_field_chain_second_slow(REGVM_ARGS)
++{
++    int d1 = T_REG(1);
++    int site1 = T_REG(9);
++    int d2 = T_REG(11);
++    JSAtom atom2 = (JSAtom)T_U32(15);
++    int site2 = T_REG(19);
++    JSValue v2;
++
++    if (site2 == REG_IC_NONE) {
++        v2 = JS_GetProperty(ctx, FR(d1), atom2);
++    } else {
++        v2 = regvm_get_field_ic(ctx, f->b, &f->pic, FR(d1), atom2, site2);
++    }
++    if (unlikely(JS_IsException(v2)))
++        T_FAIL();
++    /* Quicken only when both sites are cached own slots. Anything else keeps
++       (or restores) the generic form, whose hit test carries the kind and the
++       prototype branch the own handler omits. */
++    if (likely(f->pic != NULL && site1 != REG_IC_NONE &&
++               f->pic[site1].kind == REG_PIC_OWN &&
++               f->pic[site2].kind == REG_PIC_OWN)) {
++        *ip = (uint8_t)ROP_get_field_chain_own;
++    } else {
++        *ip = (uint8_t)ROP_get_field_chain;
++    }
++    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++}
++
++static __attribute__((noinline)) uint8_t *REGVM_CC
++regvm_t_get_field_chain_free1(REGVM_ARGS)
++{
++    js_free_value_rt(ctx->rt, f->set_v);
++    __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
++}
++
++static __attribute__((noinline)) uint8_t *REGVM_CC
++regvm_t_get_field_chain_slow(REGVM_ARGS)
++{
++    int d1 = T_REG(1);
++    int r1 = T_REG(3);
++    JSAtom atom1 = (JSAtom)T_U32(5);
++    int site1 = T_REG(9);
++    JSValue v1, old1;
++
++    if (site1 == REG_IC_NONE) {
++        v1 = JS_GetProperty(ctx, FR(r1), atom1);
++    } else {
++        v1 = regvm_get_field_ic(ctx, f->b, &f->pic, FR(r1), atom1, site1);
++    }
++    if (unlikely(JS_IsException(v1)))
++        T_FAIL();
++    old1 = FR(d1);
++    FR(d1) = v1;
++    if (unlikely(REGVM_HAS_COUNT(old1)) &&
++        unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old1)) <= 0)) {
++        f->set_v = old1;
++        __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
++    }
++    __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
++}
++
++static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS)
++{
++    int d1 = T_REG(1);
++    int r1 = T_REG(3);
++    int site1 = T_REG(9);
++    int d2 = T_REG(11);
++    int site2 = T_REG(19);
++    JSValue v1, v2, old1;
++
++    if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r1),
++                                     site1, &v1)))
++        __attribute__((musttail)) return regvm_t_get_field_chain_slow(REGVM_PASS);
++    old1 = FR(d1);
++    FR(d1) = v1;
++    if (unlikely(REGVM_HAS_COUNT(old1)) &&
++        unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old1)) <= 0)) {
++        f->set_v = old1;
++        __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
++    }
++    if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1),
++                                     site2, &v2)))
++        __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
++    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++}
++
++static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
++{
++    int d1 = T_REG(1);
++    int r1 = T_REG(3);
++    int site1 = T_REG(9);
++    int d2 = T_REG(11);
++    int site2 = T_REG(19);
++    JSValue recv = FR(r1), v1, old1, v2;
++
++    if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT)) {
++        JSObject *p = JS_VALUE_GET_OBJ(recv);
++        JSRegPIC *e = &f->pic[site1];
++        if (likely(e->shape == p->shape)) {
++            v1 = *(JSValue *)((char *)p->prop + e->slot_off);
++            if (likely(JS_VALUE_GET_TAG(v1) >= 0)) {
++                goto have_v1;
++            } else if (likely(JS_VALUE_GET_TAG(v1) != JS_TAG_LAZY_JSON)) {
++                JS_REF_COUNT(JS_VALUE_GET_PTR(v1))++;
++                goto have_v1;
++            }
++        }
++    }
++    __attribute__((musttail)) return regvm_t_get_field_chain_slow(REGVM_PASS);
++ have_v1:
++    old1 = FR(d1);
++    FR(d1) = v1;
++    if (unlikely(REGVM_HAS_COUNT(old1)) &&
++        unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old1)) <= 0)) {
++        f->set_v = old1;
++        __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
++    }
++    {
++        JSValue r = FR(d1);
++        if (likely(JS_VALUE_GET_TAG(r) == JS_TAG_OBJECT)) {
++            JSObject *p = JS_VALUE_GET_OBJ(r);
++            JSRegPIC *e = &f->pic[site2];
++            if (likely(e->shape == p->shape)) {
++                v2 = *(JSValue *)((char *)p->prop + e->slot_off);
++                if (likely(JS_VALUE_GET_TAG(v2) >= 0)) {
++                    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++                } else if (likely(JS_VALUE_GET_TAG(v2) != JS_TAG_LAZY_JSON)) {
++                    JS_REF_COUNT(JS_VALUE_GET_PTR(v2))++;
++                    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++                }
++            }
++        }
++    }
++    __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
++}
++
+ /* cold: entry 0 was not a cached overwrite of this shape, so the engine's
+    routine owns everything else -- the other entries, the add transition that
+    has to grow the property array, an exotic receiver, a read-only slot, or no
+@@ -26517,6 +26685,11 @@
+                NULL slot; both labels do the full kind-tested hit. */
+             [ROP_get_field_own] = &&L_ROP_get_field,
+             [ROP_get_field2_own] = &&L_ROP_get_field2,
++            /* X3b: same story -- the fused opcode is emitted, but the
++               quickened spelling is only ever written by the threaded
++               interpreter. Both aliases run the full kind-tested read pair. */
++            [ROP_get_field_chain] = &&L_ROP_get_field_chain,
++            [ROP_get_field_chain_own] = &&L_ROP_get_field_chain,
+             [ROP_put_field] = &&L_ROP_put_field,
+             [ROP_put_field_xfer] = &&L_ROP_put_field_xfer,
+             [ROP_define_field] = &&L_ROP_define_field,
+@@ -27549,6 +27722,45 @@
+                 SET_REG(d, val);
+                 REGVM_NEXT();
+             }
++            L_ROP_get_field_chain: {
++                /* X3b: two reads, two destinations, one dispatch. The second
++                   receiver is the first destination, so it is read back after
++                   the first SET_REG -- exactly the value the dropped second
++                   instruction would have consumed. */
++                int d1 = RD_REG();
++                int r1 = RD_REG();
++                JSAtom atom1 = RD_U32();
++                int site1 = RD_U16();
++                int d2 = RD_REG();
++                int r2 = RD_REG();
++                JSAtom atom2 = RD_U32();
++                int site2 = RD_U16();
++                JSValue v1, v2;
++                (void)r2;
++                if (site1 != REG_IC_NONE &&
++                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
++                    /* hit */
++                } else if (site1 == REG_IC_NONE) {
++                    v1 = JS_GetProperty(ctx, regs[r1], atom1);
++                } else {
++                    v1 = regvm_get_field_ic(ctx, b, &pic, regs[r1], atom1, site1);
++                }
++                if (JS_IsException(v1))
++                    goto exception;
++                SET_REG(d1, v1);
++                if (site2 != REG_IC_NONE &&
++                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
++                    /* hit */
++                } else if (site2 == REG_IC_NONE) {
++                    v2 = JS_GetProperty(ctx, regs[d1], atom2);
++                } else {
++                    v2 = regvm_get_field_ic(ctx, b, &pic, regs[d1], atom2, site2);
++                }
++                if (JS_IsException(v2))
++                    goto exception;
++                SET_REG(d2, v2);
++                REGVM_NEXT();
++            }
+             L_ROP_put_field: {
+                 int r = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -53667,6 +53879,8 @@
+     [ROP_get_arg_field] = "ruas",
+     [ROP_get_field2] = "rras",
+     [ROP_get_field2_own] = "rras",
++    [ROP_get_field_chain] = "rrasrras",
++    [ROP_get_field_chain_own] = "rrasrras",
+     [ROP_put_field] = "rasr",
+     [ROP_define_field] = "rar",
+     /* object, window base, count, template index: fills an object literal's
+@@ -53822,6 +54036,7 @@
+     T_CHK(T_SZ_RBUU, binary_loc_loc);
+     T_CHK(T_SZ_RBR_I, binary_imm);
+     T_CHK(T_SZ_RBRI_S, binary_imm_s);
++    T_CHK(T_SZ_CHAIN, get_field_chain);
+ #undef T_CHK
+     if (bad)
+         abort();
+@@ -57003,6 +57218,127 @@
+ }
+ 
+ /*
++ * X3b: fuse an adjacent `get_field` chain.
++ *
++ * When a `get_field`'s destination is exactly the receiver operand of the very
++ * next instruction, and that next instruction is a `get_field`/`get_field2`,
++ * the pair becomes one `ROP_get_field_chain`. The fused instruction writes both
++ * destinations, so the first result stays available to whatever reads it after
++ * the pair; the two reads happen in the same order and nothing observable
++ * occurs between them.
++ *
++ * Two things must not hold of the second instruction: it must not be a
++ * branch/catch/finally target, and it must not start a basic block. The other
++ * removing passes drop the *first* instruction and so are free to leave a
++ * target pointing at the survivor; this one drops the *second*, and a target
++ * that still named it would have to resolve to the instruction after the fused
++ * pair, skipping it. Targets are read out of the format's `t` operands (mapped
++ * through `pc_to_insn`, exactly as the encoder will map them), and a block start
++ * is recognized by its bytecode position being a leader.
++ *
++ * This runs after register allocation and the ownership analysis, so neither
++ * ever sees the fused opcode: the two destination values and the two receiver
++ * values already have registers, and the per-register own_init/own_undef sets
++ * are unaffected by merging two writes into one instruction.
++ */
++static void regvm_fuse_field_chain(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
++                                   int n_pcs, const int *bstart, int n_blocks)
++{
++    int n = ir->n_insns, i, k, out = 0;
++    unsigned char *drop = NULL, *is_target = NULL;
++    int *remap = NULL, *first = NULL;
++
++    if (n < 2)
++        return;
++    if (REGVM_KNOB("REGVM_NOCHAIN"))
++        return;
++    drop = js_mallocz(ctx, (size_t)n);
++    is_target = js_mallocz(ctx, (size_t)n);
++    remap = js_malloc(ctx, (size_t)n * sizeof(int));
++    first = js_malloc(ctx, (size_t)(n + 1) * sizeof(int));
++    if (!drop || !is_target || !remap || !first)
++        goto done;
++
++    for (i = 0; i < n; i++) {
++        const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
++        for (k = 0; fmt && fmt[k]; k++) {
++            int32_t pc;
++            int ti;
++            if (fmt[k] != 't')
++                continue;
++            pc = ir->insns[i].ops[k];
++            ti = (pc >= 0 && pc < n_pcs) ? pc_to_insn[pc] : -1;
++            if (ti >= 0 && ti < n)
++                is_target[ti] = 1;
++        }
++    }
++
++    for (i = 0; i + 1 < n; i++) {
++        JSRegInsn *a = &ir->insns[i], *b = &ir->insns[i + 1];
++
++        if (drop[i] || drop[i + 1])
++            continue;
++        if (a->rop != ROP_get_field || a->n_ops != 4)
++            continue;
++        if (b->rop != ROP_get_field && b->rop != ROP_get_field2)
++            continue;
++        if (b->n_ops != 4)
++            continue;
++        if (b->ops[1] != a->ops[0])
++            continue;                       /* receiver is not the first result */
++        if (b->ops[0] == a->ops[0])
++            continue;                       /* would write one destination twice */
++        if (is_target[i + 1])
++            continue;
++        {
++            int bstart_hit = 0;
++            for (k = 0; k < n_blocks; k++)
++                if (bstart[k] == b->src_pc) {
++                    bstart_hit = 1;
++                    break;
++                }
++            if (bstart_hit)
++                continue;
++        }
++
++        a->rop = ROP_get_field_chain;
++        a->n_ops = 8;
++        a->ops[4] = b->ops[0];
++        a->ops[5] = b->ops[1];
++        a->ops[6] = b->ops[2];
++        a->ops[7] = b->ops[3];
++        drop[i + 1] = 1;
++        i++;                                /* do not chain into the dropped insn */
++    }
++
++    for (i = 0; i < n; i++) {
++        if (!drop[i]) {
++            if (out != i)
++                ir->insns[out] = ir->insns[i];
++            remap[i] = out;
++            out++;
++        }
++    }
++    if (out == n)
++        goto done;                          /* nothing fused */
++    ir->n_insns = out;
++    first[n] = out;
++    for (i = n - 1; i >= 0; i--)
++        first[i] = drop[i] ? first[i + 1] : remap[i];
++    for (i = 0; i < n_pcs; i++) {
++        int old = pc_to_insn[i];
++        if (old < 0 || old > n)
++            old = 0;
++        pc_to_insn[i] = first[old];
++    }
++ done:
++    js_free(ctx, drop);
++    js_free(ctx, is_target);
++    js_free(ctx, remap);
++    js_free(ctx, first);
++}
++
++/*
+  * --- promoted slots ------------------------------------------------------
+  *
+  * A promoted local or argument is one whose value the value IR carries in a
+@@ -57719,6 +58055,7 @@
+     case ROP_get_local_field_0: case ROP_get_local_field_1:
+     case ROP_get_local_field_2: case ROP_get_local_field_3:
+     case ROP_get_arg_field: case ROP_get_field2: case ROP_get_private:
++    case ROP_get_field_chain: case ROP_get_field_chain_own:
+     case ROP_get_element: case ROP_get_length: case ROP_super_get:
+     case ROP_get_super: case ROP_get_ref_value: case ROP_get_arg_el:
+     case ROP_call: case ROP_call_method: case ROP_construct:
+@@ -57845,6 +58182,9 @@
+     case ROP_with_get_ref:
+     case ROP_with_get_ref_undef:
+         return 1;
++    case ROP_get_field_chain:
++    case ROP_get_field_chain_own:
++        return 4;                           /* d1,r1,atom1,site1,d2,... */
+     default:
+         return -1;
+     }
+@@ -59534,6 +59874,12 @@
+                 fprintf(stderr, "##IREG## %d %d\n", i, ireg[i]);
+     }
+ #endif
++    /* X3b: fuse adjacent property-read chains. Runs after the allocator and the
++       ownership analysis so neither sees the fused opcode; before the site
++       assignment below, which gives each of its two `s` operands its own PIC
++       site. */
++    regvm_fuse_field_chain(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
++                           bstart, n_blocks);
+     /*
+      * Slot-in-opcode for the fused frame read. 95% of frame accesses name a slot
+      * below 16 and 55% below 4, so for those the slot operand is pure extraction
+@@ -59599,15 +59945,17 @@
+ 
+         if (!fmt)
+             continue;
+-        sp = strchr(fmt, 's');
+-        if (!sp)
+-            continue;
+-        sitepos = (int)(sp - fmt);
+-        if (fd->regvm_pic_count >= UINT16_MAX) {
+-            JS_ThrowInternalError(ctx, "regvm: too many PIC sites");
+-            goto done;
++        /* Every `s` operand gets its own dense site: an opcode may carry more
++           than one (the X3b fused chain read has two), and each operand is a
++           distinct property site. */
++        for (sp = fmt; (sp = strchr(sp, 's')) != NULL; sp++) {
++            sitepos = (int)(sp - fmt);
++            if (fd->regvm_pic_count >= UINT16_MAX) {
++                JS_ThrowInternalError(ctx, "regvm: too many PIC sites");
++                goto done;
++            }
++            in->ops[sitepos] = fd->regvm_pic_count++;
+         }
+-        in->ops[sitepos] = fd->regvm_pic_count++;
+     }
+ 
+ #ifdef QJS_REGVM_COUNT
+
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -704,6 +704,17 @@
+      */
+     ROP_get_field_own, ROP_get_field2_own,
+ 
++    /*
++     * X3b fused chain read. A `get_field`/`get_field2` whose receiver is the
++     * immediately preceding `get_field`'s destination is emitted as this one
++     * instruction: both reads and both destinations, one dispatch. Like the
++     * own forms above it is appended at the very end, so no existing opcode
++     * number moves and the serialized bytecode format is unchanged. The `_own`
++     * spelling is produced only by the threaded interpreter's quickening
++     * rewrite; both are aliased to the generic monolith label.
++     */
++    ROP_get_field_chain, ROP_get_field_chain_own,
++
+     ROP_COUNT
+ } JSRegOpcode;
+ 

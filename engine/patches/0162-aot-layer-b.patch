@@ -1,0 +1,203 @@
+From: quickjs-ng register-VM work
+Subject: AOT: Layer B typed regions (P5)
+
+What this does
+  Adds the engine-side helpers a typed loop region needs, and the entry fill
+  they build on. A region carries each numeric value as an unboxed
+  (double, isint) pair and boxes only at an exit or a deopt; property reads
+  use a shape guard hoisted out of the loop; array reads use a dense-array
+  guard plus a bounds check.
+
+  qjs_aot_fitsi is the shared int-fit rule (int32 range, exactly
+  representable, not -0). qjs_aot_box_num/to_num convert between a JSValue
+  and the pair. qjs_aot_dense exposes a fast array's values pointer and
+  length; qjs_aot_elem_num reads one element as a number, refusing holes and
+  non-numeric slots. qjs_aot_field_guard re-validates a property-cache site
+  against the receiver's current shape and yields the cached value offset;
+  qjs_aot_field_read reads at that offset. qjs_aot_get_length_num reads a
+  fast array's length; qjs_aot_var_ref_ptr yields the cell behind a captured
+  variable.
+
+  The generated unit (tools/aot/qjsaot.c, not part of this patch) emits a
+  region for a call-free, top-tested loop with an unconditional back-edge and
+  a whitelisted body; every other loop keeps the Layer A body. A per-region
+  disable counter stops retrying a region whose entry guard keeps failing.
+
+Why we need it
+  Layer A removes dispatch and operand decode but still boxes every numeric
+  intermediate. A typed region keeps the loop counter, accumulator and
+  temporaries unboxed across the whole body, which is where the remaining
+  interpreter gap lives: on a 10000-element multiply-add loop the region
+  build is 72% below the interpreter in instructions and 73% below in cycles
+  (4.47 G / 1.33 G vs 16.18 G / 4.92 G; with LTO 1.47 G / 0.42 G).
+
+What it adds
+  quickjs.c
+      qjs_aot_fitsi, qjs_aot_box_num, qjs_aot_to_num, qjs_aot_dense,
+      qjs_aot_elem_num, qjs_aot_field_guard, qjs_aot_field_read,
+      qjs_aot_get_length_num, qjs_aot_var_ref_ptr.
+  quickjs-aot-rt.h
+      declarations for the nine helpers above.
+
+  Nothing here is compiled without -DQJS_REGVM; QJS_AOT is off by default.
+  Box2D checksum 546.1008391043414 (box2d forms no regions in v1: its hot
+  loops call), test262-fast 50/81192, diff 398/0, ASan clean. The seven
+  generator mutation hooks (fitsi_loose, div_int, no_box_on_exit,
+  skip_bounds, hoist_ignore_store, iv_no_box, bounds_elide_len_write) each
+  turn a region-test kernel red.
+
+diff --git a/quickjs.c b/quickjs.c
+index 1032a0e..2d14e9b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -57361,6 +57361,121 @@ __attribute__((always_inline)) int qjs_aot_to_bool(JSContext *ctx, JSValue v)
+     return regvm_to_bool(ctx, v);
+ }
+ 
++/*
++ * --- P5 Layer B typed-region helpers --------------------------------------
++ *
++ * E1 unboxed numerics. A value in flight inside a region is a double plus an
++ * is-int flag; the tag rules have to reproduce exactly what the interpreter's
++ * numeric ops produced, so the box helper is the one source of truth and the
++ * emitted region calls it at every exit and deopt. `fitsi` is the E1 rule:
++ * the double is in int32 range, integral, and not negative zero.
++ */
++
++int qjs_aot_fitsi(double d)
++{
++    return d >= -2147483648.0 && d <= 2147483647.0 &&
++           (double)(int32_t)d == d && !(d == 0.0 && signbit(d));
++}
++
++JSValue qjs_aot_box_num(double d, int isint)
++{
++    if (isint)
++        return JS_MKVAL(JS_TAG_INT, (int32_t)d);
++    return js_float64(d);
++}
++
++/* Unbox an int or a float into (double, isint); 0 for anything else. */
++int qjs_aot_to_num(JSValue v, double *out, int *isint)
++{
++    int tag = JS_VALUE_GET_TAG(v);
++
++    if (tag == JS_TAG_INT) {
++        *out = (double)JS_VALUE_GET_INT(v);
++        *isint = 1;
++        return 1;
++    }
++    if (tag == JS_TAG_FLOAT64) {
++        *out = JS_VALUE_GET_FLOAT64(v);
++        *isint = 0;
++        return 1;
++    }
++    return 0;
++}
++
++/* The element storage of a plain fast array; 0 for any other receiver. */
++int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(v);
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array)
++        return 0;
++    *data = p->u.array.u.values;
++    *len = p->u.array.count;
++    return 1;
++}
++
++/* Read a dense element as an unboxed number. A hole, a lazy marker or a
++   non-numeric value returns 0 (the caller deopts). */
++int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint)
++{
++    JSValue v = data[i];
++
++    if (js_array_slot_is_hole(v) || js_lazy_marker_is(v))
++        return 0;
++    return qjs_aot_to_num(v, out, isint);
++}
++
++/* P5: hoisted field guard. Verify that `recv`'s shape matches the PIC entry
++   at `site` and that it is an own data property, then hand back the property
++   slot offset. The receiver is loop-invariant and the region is call-free, so
++   one check at region entry covers every access in the loop. */
++int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off)
++{
++    JSObject *p;
++    JSRegPIC *e;
++
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(recv);
++    e = &((JSRegPIC *)pic)[site];
++    if (e->shape != p->shape || e->kind != REG_PIC_OWN)
++        return 0;
++    *slot_off = (int)e->slot_off;
++    return 1;
++}
++
++/* Borrowed read of an own data property at a slot offset (registers borrow). */
++JSValue qjs_aot_field_read(JSValue recv, int slot_off)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(recv);
++    return *(JSValue *)((char *)p->prop + slot_off);
++}
++
++/* P5: array `length` as an unboxed int for a plain fast array; 0 otherwise. */
++int qjs_aot_get_length_num(JSValue v, double *out, int *isint)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(v);
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array)
++        return 0;
++    *out = (double)p->u.array.count;
++    *isint = 1;
++    return 1;
++}
++
++/* P5: pointer to a captured variable's cell. The region is call-free, so the
++   cell (and its value) is loop-invariant once guarded at entry. */
++JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot)
++{
++    return f->var_refs[slot]->pvalue;
++}
++
+ uint8_t *qjs_aot_code(JSRegRun *f)
+ {
+     return f->b->regvm_code;
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index 99e915a..91da369 100644
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -161,4 +161,24 @@ int qjs_aot_unary(JSContext *ctx, int sub, JSValue a, JSValue *out);
+ /* Mirror regvm_to_bool: 0/1, or -1 on exception. */
+ int qjs_aot_to_bool(JSContext *ctx, JSValue v);
+ 
++/*
++ * --- P5 Layer B typed-region helpers --------------------------------------
++ *
++ * E1 unboxed numerics: a region carries a value as (double, isint) and boxes
++ * only at an exit or a deopt. qjs_aot_fitsi is the shared int-fit rule.
++ */
++int qjs_aot_fitsi(double d);
++JSValue qjs_aot_box_num(double d, int isint);
++int qjs_aot_to_num(JSValue v, double *out, int *isint);
++int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
++int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
++
++/* P5 §7.3 hoisted field guard + own-data-property read. */
++int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off);
++JSValue qjs_aot_field_read(JSValue recv, int slot_off);
++
++/* P5 §7: array length and captured-variable cell accessors. */
++int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
++JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
++
+ #endif /* QUICKJS_AOT_RT_H */

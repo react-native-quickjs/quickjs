@@ -1,0 +1,794 @@
+Pre-scales register operands to byte offsets (X2)
+
+The register backend stored every register operand as a register index and
+scaled it by the 16-byte register size at each use, so the handlers carried a
+shift on the hot path -- `shl $0x4` appeared 1380 times in the binary and three
+times in regvm_t_add alone. Scaling once, at encode time, and storing the byte
+offset removes the shift from every handler.
+
+  * quickjs.c: the register access macros (FR/FRP) add the frame base instead of
+    indexing and scaling, and 78 direct fr[...] uses were rewritten to them; the
+    encoder, the verifier and the narrow-operand selection scale once; the
+    monolith's RD_REG/RD_REG8 decode macros drop their shift; the bytecode
+    reader bounds reg_count by the widest representable register offset rather
+    than by UINT16_MAX, and validates a register operand as an aligned byte
+    offset rather than as an index.
+  * quickjs.c: two narrow handlers added by 0115 (L_ROP_load_i8_s and
+    L_ROP_move_s) read their register operands with RD_U8 rather than RD_REG8,
+    which the old unshifted encoding made harmless and this one makes wrong;
+    they now use RD_REG8 like every other narrow handler.
+  * quickjs-regvm.h: REGVM_FORMAT_VERSION 12 -> 13.
+
+Bytecode version bump
+  Not here. This changes the register format only and leaves BC_VERSION alone;
+  the precompiled register blobs record REGVM_FORMAT_VERSION in their header, so
+  they are regenerated in the staged 9999 candidate, as they were for the 0115
+  and 0116 register format changes.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23285,6 +23285,14 @@
+ #define T_SZ_RIT_S  4    /* "rit"   narrow */
+ 
+ #define T_REG(o)  ((int)regvm_ld_u16(ip + (o)))
++/*
++ * X2: a register operand in the encoded stream is a *byte offset* into the
++ * register file, not an index, so `FR(x)` never needs the `shl $4` that turns
++ * an index into a 16-byte stride. `FR` is that access and `FRP` its address;
++ * both take an operand as decoded by T_REG/T_REG8.
++ */
++#define FR(x)  (*(JSValue *)((uint8_t *)fr + (x)))
++#define FRP(x) ((JSValue *)((uint8_t *)fr + (x)))
+ #define T_REG8(o) ((int)(uint8_t)ip[o])
+ #define T_OFF8(o) ((int)(int8_t)ip[o])
+ #define T_U8(o)   ((int)ip[o])
+@@ -23391,8 +23399,8 @@
+  * the two rejected shapes cost.
+  */
+ #define T_SET_NEXT(d, v, off) do { \
+-        JSValue _v = (v), _o = fr[d]; \
+-        fr[d] = _v; \
++        JSValue _v = (v), _o = FR(d); \
++        FR(d) = _v; \
+         if (unlikely(REGVM_HAS_COUNT(_o)) && \
+             unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(_o)) <= 0)) { \
+             f->set_v = _o; \
+@@ -23425,7 +23433,7 @@
+ /* the cold halves: decode the shape, run the engine's slow routine, continue */
+ #define T_BODY_RRR(SUB_, SZ_) do { \
+         int _d = T_REG(1); \
+-        JSValue _o1 = fr[T_REG(3)], _o2 = fr[T_REG(5)], _out; \
++        JSValue _o1 = FR(T_REG(3)), _o2 = FR(T_REG(5)), _out; \
+         if (js_regvm_binary(ctx, SUB_, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23433,7 +23441,7 @@
+ #define T_BODY_RBRR(SUB_, SZ_) do { \
+         int _d = T_REG(1); \
+         int _sub = T_U8(3); \
+-        JSValue _o1 = fr[T_REG(4)], _o2 = fr[T_REG(6)], _out; \
++        JSValue _o1 = FR(T_REG(4)), _o2 = FR(T_REG(6)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23441,7 +23449,7 @@
+ #define T_BODY_RBUR(SZ_) do { \
+         int _d = T_REG(1); \
+         int _sub = T_U8(3); \
+-        JSValue _o1 = f->var_buf[T_REG(4)], _o2 = fr[T_REG(6)], _out; \
++        JSValue _o1 = f->var_buf[T_REG(4)], _o2 = FR(T_REG(6)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23449,7 +23457,7 @@
+ #define T_BODY_RBRU(SZ_) do { \
+         int _d = T_REG(1); \
+         int _sub = T_U8(3); \
+-        JSValue _o1 = fr[T_REG(4)], _o2 = f->var_buf[T_REG(6)], _out; \
++        JSValue _o1 = FR(T_REG(4)), _o2 = f->var_buf[T_REG(6)], _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23465,7 +23473,7 @@
+ #define T_BODY_RBR_I(SZ_) do { \
+         int _d = T_REG(1); \
+         int _sub = T_U8(3); \
+-        JSValue _o1 = fr[T_REG(4)], _o2 = js_int32(T_I32(6)), _out; \
++        JSValue _o1 = FR(T_REG(4)), _o2 = js_int32(T_I32(6)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23473,7 +23481,7 @@
+ #define T_BODY_RBRI_S(SZ_) do { \
+         int _d = T_REG8(1); \
+         int _sub = T_U8(2); \
+-        JSValue _o1 = fr[T_REG8(3)], _o2 = js_int32(T_OFF8(4)), _out; \
++        JSValue _o1 = FR(T_REG8(3)), _o2 = js_int32(T_OFF8(4)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23481,7 +23489,7 @@
+ #define T_BODY_RBR(SZ_) do { \
+         int _d = T_REG(1); \
+         int _sub = T_U8(3); \
+-        JSValue _o1 = fr[T_REG(4)], _out; \
++        JSValue _o1 = FR(T_REG(4)), _out; \
+         if (js_regvm_unary(ctx, _sub, _o1, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23490,7 +23498,7 @@
+    so their cold half must not read one out of the stream. */
+ #define T_BODY_RR_UN(SUB_, SZ_) do { \
+         int _d = T_REG(1); \
+-        JSValue _o1 = fr[T_REG(3)], _out; \
++        JSValue _o1 = FR(T_REG(3)), _out; \
+         if (js_regvm_unary(ctx, SUB_, _o1, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT(_d, _out, SZ_); \
+@@ -23500,7 +23508,7 @@
+ #define T_FAST_RRR(SUB_, SZ_, SLOW_) do { \
+         int _d = T_REG(1); \
+         JSValue _out; \
+-        if (likely(regvm_num_fast(SUB_, fr[T_REG(3)], fr[T_REG(5)], &_out))) { \
++        if (likely(regvm_num_fast(SUB_, FR(T_REG(3)), FR(T_REG(5)), &_out))) { \
+             T_SET_NEXT(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+@@ -23508,7 +23516,7 @@
+ #define T_FAST_UN(SUB_, SZ_, SLOW_) do { \
+         int _d = T_REG(1); \
+         JSValue _out; \
+-        if (likely(regvm_unary_num_fast(SUB_, fr[T_REG(3)], &_out))) { \
++        if (likely(regvm_unary_num_fast(SUB_, FR(T_REG(3)), &_out))) { \
+             T_SET_NEXT(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+@@ -23516,7 +23524,7 @@
+ #define T_FAST_SHAPE(SUB_, SZ_, SLOW_) do { \
+         int _d = T_REG(1); \
+         JSValue _out; \
+-        if (likely(regvm_num_fast(SUB_, fr[T_REG(4)], fr[T_REG(6)], &_out))) { \
++        if (likely(regvm_num_fast(SUB_, FR(T_REG(4)), FR(T_REG(6)), &_out))) { \
+             T_SET_NEXT(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+@@ -24181,8 +24189,8 @@
+         return ip;
+     }
+     s = T_REG(1);
+-    f->ret = fr[s];
+-    fr[s] = JS_UNDEFINED;
++    f->ret = FR(s);
++    FR(s) = JS_UNDEFINED;
+     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
+ }
+ 
+@@ -24251,8 +24259,8 @@
+ 
+     regvm_record_release(ctx->rt, f);
+     ctx->rt->current_stack_frame = c->sf;
+-    old = c->fr[dst];
+-    c->fr[dst] = v;
++    old = *(JSValue *)((uint8_t *)c->fr + dst);
++    *(JSValue *)((uint8_t *)c->fr + dst) = v;
+     f = c;
+     if (unlikely(REGVM_HAS_COUNT(old)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
+@@ -24281,7 +24289,7 @@
+ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
+ {
+     int c = T_REG(3);
+-    JSValue cf = fr[c];
++    JSValue cf = FR(c);
+ 
+     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+@@ -24300,7 +24308,7 @@
+ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
+ {
+     int c = T_REG(3);
+-    JSValue cf = fr[c];
++    JSValue cf = FR(c);
+ 
+     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+@@ -24331,7 +24339,7 @@
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS)
+ {
+     int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
+-    JSValue cf = fr[c];
++    JSValue cf = FR(c);
+     JSObject *co = JS_VALUE_GET_OBJ(cf);
+     JSFunctionBytecode *cb = co->u.func.function_bytecode;
+     JSRegRecordLayout lay;
+@@ -24377,7 +24385,7 @@
+         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+     }
+     regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 8,
+-                      JS_UNDEFINED, &fr[ab], na, slots);
++                      JS_UNDEFINED, FRP(ab), na, slots);
+     f = lay.rec;
+     __attribute__((musttail))
+         return regvm_t_dispatch(f->b->regvm_code, f->fr, f, ctx);
+@@ -24387,8 +24395,8 @@
+ {
+     int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
+     int na = T_U8(9);
+-    JSValue cf = fr[c];
+-    JSValue tv = fr[r];
++    JSValue cf = FR(c);
++    JSValue tv = FR(r);
+     JSObject *co = JS_VALUE_GET_OBJ(cf);
+     JSFunctionBytecode *cb = co->u.func.function_bytecode;
+     JSRegRecordLayout lay;
+@@ -24434,7 +24442,7 @@
+         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+     }
+     regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 10,
+-                      tv, &fr[ab], na, slots);
++                      tv, FRP(ab), na, slots);
+     f = lay.rec;
+     __attribute__((musttail))
+         return regvm_t_dispatch(f->b->regvm_code, f->fr, f, ctx);
+@@ -24444,11 +24452,11 @@
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
+ {
+     int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
+-    JSValue *oargv = &fr[ab];
++    JSValue *oargv = FRP(ab);
+     JSValue rv;
+ 
+-    if (!js_call_c_function_fast(ctx, fr[c], JS_UNDEFINED, na, vc(oargv), 0, &rv))
+-        rv = JS_CallInternal(ctx, fr[c], JS_UNDEFINED, JS_UNDEFINED, na,
++    if (!js_call_c_function_fast(ctx, FR(c), JS_UNDEFINED, na, vc(oargv), 0, &rv))
++        rv = JS_CallInternal(ctx, FR(c), JS_UNDEFINED, JS_UNDEFINED, na,
+                              vc(oargv), 0);
+     if (JS_IsException(rv))
+         T_FAIL();
+@@ -24459,11 +24467,11 @@
+ {
+     int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
+     int na = T_U8(9);
+-    JSValue *oargv = &fr[ab];
++    JSValue *oargv = FRP(ab);
+     JSValue rv;
+ 
+-    if (!js_call_c_function_fast(ctx, fr[c], fr[r], na, vc(oargv), 0, &rv))
+-        rv = JS_CallInternal(ctx, fr[c], fr[r], JS_UNDEFINED, na, vc(oargv), 0);
++    if (!js_call_c_function_fast(ctx, FR(c), FR(r), na, vc(oargv), 0, &rv))
++        rv = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na, vc(oargv), 0);
+     if (JS_IsException(rv))
+         T_FAIL();
+     T_SET_NEXT(d, rv, 10);
+@@ -24503,7 +24511,7 @@
+     int rc = T_REG(6);
+     JSValue out;
+ 
+-    if (likely(regvm_num_fast(sub, f->var_buf[ls], fr[rc], &out))) {
++    if (likely(regvm_num_fast(sub, f->var_buf[ls], FR(rc), &out))) {
+         T_SET_NEXT(d, out, T_SZ_RBUR);
+     }
+     __attribute__((musttail)) return regvm_t_binary_loc_reg_slow(REGVM_PASS);
+@@ -24519,7 +24527,7 @@
+     int rs = T_REG(6);
+     JSValue out;
+ 
+-    if (likely(regvm_num_fast(sub, fr[rc], f->var_buf[rs], &out))) {
++    if (likely(regvm_num_fast(sub, FR(rc), f->var_buf[rs], &out))) {
+         T_SET_NEXT(d, out, T_SZ_RBRU);
+     }
+     __attribute__((musttail)) return regvm_t_binary_reg_loc_slow(REGVM_PASS);
+@@ -24551,7 +24559,7 @@
+     int32_t imm = T_I32(6);
+     JSValue out;
+ 
+-    if (likely(regvm_num_fast(sub, fr[a], js_int32(imm), &out))) {
++    if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+         T_SET_NEXT(d, out, T_SZ_RBR_I);
+     }
+     __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS);
+@@ -24567,7 +24575,7 @@
+     int32_t imm = T_OFF8(4);
+     JSValue out;
+ 
+-    if (likely(regvm_num_fast(sub, fr[a], js_int32(imm), &out))) {
++    if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+         T_SET_NEXT(d, out, T_SZ_RBRI_S);
+     }
+     __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS);
+@@ -24582,7 +24590,7 @@
+     int s = T_REG(4);
+     JSValue out;
+ 
+-    if (likely(regvm_unary_num_fast(sub, fr[s], &out))) {
++    if (likely(regvm_unary_num_fast(sub, FR(s), &out))) {
+         T_SET_NEXT(d, out, T_SZ_RBR);
+     }
+     __attribute__((musttail)) return regvm_t_unary_slow(REGVM_PASS);
+@@ -24657,7 +24665,7 @@
+ static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS)
+ {
+     int s = T_REG(1);
+-    set_value(ctx, &f->var_buf[0], js_dup(fr[s]));
++    set_value(ctx, &f->var_buf[0], js_dup(FR(s)));
+     T_NEXT(T_SZ_R);
+ }
+ 
+@@ -24692,10 +24700,10 @@
+     int o = T_REG(1);
+     int key = T_REG(3);
+     int v = T_REG(5);
+-    JSValue val = fr[v];
++    JSValue val = FR(v);
+ 
+-    fr[v] = JS_UNDEFINED;
+-    if (JS_SetPropertyValue(ctx, fr[o], js_dup(fr[key]), val,
++    FR(v) = JS_UNDEFINED;
++    if (JS_SetPropertyValue(ctx, FR(o), js_dup(FR(key)), val,
+                             JS_PROP_THROW_STRICT) < 0)
+         T_FAIL();
+     T_NEXT(T_SZ_RRR);
+@@ -24706,7 +24714,7 @@
+     int w = T_REG(1);
+     int d = T_REG(3);
+     int idx = T_U16(5);
+-    JSValue *sp = &fr[w + 3];
++    JSValue *sp = FRP(w + 3 * (int)sizeof(JSValue));
+     JSObject *pa = js_args_apply_is_builtin(sp[-2]);
+     JSValue ret_val;
+ 
+@@ -24735,15 +24743,15 @@
+     JSValue out;
+ 
+     if (kind == REG_CONST_CPOOL) {
+-        if (!regvm_num_fast(sub, fr[a], f->b->cpool[idx], &out) &&
+-            js_regvm_binary(ctx, sub, fr[a], f->b->cpool[idx], &out))
++        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out) &&
++            js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
+             T_FAIL();
+     } else {
+         JSValue cst = JS_AtomToValue(ctx, idx);
+         if (JS_IsException(cst))
+             T_FAIL();
+-        if (!regvm_num_fast(sub, fr[a], cst, &out) &&
+-            js_regvm_binary(ctx, sub, fr[a], cst, &out)) {
++        if (!regvm_num_fast(sub, FR(a), cst, &out) &&
++            js_regvm_binary(ctx, sub, FR(a), cst, &out)) {
+             JS_FreeValue(ctx, cst);
+             T_FAIL();
+         }
+@@ -24759,8 +24767,8 @@
+     int nt = T_REG(5);
+     int ab = T_REG(7);
+     int na = T_U8(9);
+-    JSValue *argv = &fr[ab];
+-    JSValue ret_val = JS_CallConstructorInternal(ctx, fr[c], fr[nt],
++    JSValue *argv = FRP(ab);
++    JSValue ret_val = JS_CallConstructorInternal(ctx, FR(c), FR(nt),
+                                                  na, vc(argv), 0);
+     if (JS_IsException(ret_val))
+         T_FAIL();
+@@ -24824,7 +24832,7 @@
+     /* A self-move is a no-op: the allocator coalesces a move's destination
+        onto its source, and duplicating there would strand a reference. */
+     if (d != s)
+-        T_SET_NEXT(d, js_dup(fr[s]), T_SZ_RR);
++        T_SET_NEXT(d, js_dup(FR(s)), T_SZ_RR);
+     T_NEXT(T_SZ_RR);
+ }
+ 
+@@ -24834,7 +24842,7 @@
+     int s = T_REG8(2);
+ 
+     if (d != s)
+-        T_SET_NEXT(d, js_dup(fr[s]), T_SZ_RR_S);
++        T_SET_NEXT(d, js_dup(FR(s)), T_SZ_RR_S);
+     T_NEXT(T_SZ_RR_S);
+ }
+ 
+@@ -24861,10 +24869,10 @@
+     int s = T_REG(3);
+ 
+     if (likely(d != s)) {
+-        JSValue v = fr[s], old = fr[d];
++        JSValue v = FR(s), old = FR(d);
+ 
+-        fr[d] = v;
+-        fr[s] = JS_UNDEFINED;
++        FR(d) = v;
++        FR(s) = JS_UNDEFINED;
+         if (unlikely(REGVM_HAS_COUNT(old)) &&
+             unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
+             f->set_v = old;
+@@ -24951,7 +24959,7 @@
+     int d = T_REG(1);
+     int o = T_REG(3);
+     int key = T_REG(5);
+-    JSValue recv = fr[o], k = fr[key];
++    JSValue recv = FR(o), k = FR(key);
+     JSValue val;
+ 
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
+@@ -24987,8 +24995,8 @@
+     REGVM_ARGS)
+ {
+     int d = T_REG(1);
+-    JSObject *p = JS_VALUE_GET_OBJ(fr[T_REG(3)]);
+-    uint32_t idx = JS_VALUE_GET_INT(fr[T_REG(5)]);
++    JSObject *p = JS_VALUE_GET_OBJ(FR(T_REG(3)));
++    uint32_t idx = JS_VALUE_GET_INT(FR(T_REG(5)));
+     JSValue val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+     T_SET_NEXT(d, val, T_SZ_RRR);
+ }
+@@ -24998,7 +25006,7 @@
+     int d = T_REG(1);
+     int o = T_REG(3);
+     int key = T_REG(5);
+-    JSValue recv = fr[o], k = fr[key];
++    JSValue recv = FR(o), k = FR(key);
+ 
+     if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_TAG(k) == JS_TAG_INT)) {
+@@ -25034,9 +25042,9 @@
+         int site = T_REG(9); \
+         JSValue val; \
+         if (site == REG_IC_NONE) { \
+-            val = JS_GetProperty(ctx, fr[r], atom); \
++            val = JS_GetProperty(ctx, FR(r), atom); \
+         } else { \
+-            val = regvm_get_field_ic(ctx, f->b, &f->pic, fr[r], atom, site); \
++            val = regvm_get_field_ic(ctx, f->b, &f->pic, FR(r), atom, site); \
+         } \
+         if (JS_IsException(val)) \
+             T_FAIL(); \
+@@ -25048,7 +25056,7 @@
+         int r = T_REG(3); \
+         int site = T_REG(9); \
+         JSValue val; \
+-        if (regvm_own_read_hit(f->pic, fr[r], site, &val)) { \
++        if (regvm_own_read_hit(f->pic, FR(r), site, &val)) { \
+             T_SET_NEXT(d, val, T_SZ_RRAS); \
+         } \
+         __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+@@ -25072,12 +25080,12 @@
+        to a read-only property is a silent no-op in sloppy code and a TypeError
+        in strict code. The receiver is the object itself, as in the monolith. */
+     if (site != REG_IC_NONE) {
+-        if (regvm_put_field_ic(ctx, f->b, &f->pic, fr[r], atom, fr[v], site) < 0)
++        if (regvm_put_field_ic(ctx, f->b, &f->pic, FR(r), atom, FR(v), site) < 0)
+             T_FAIL();
+         T_NEXT(T_SZ_RASR);
+     }
+-    if (JS_SetPropertyInternal2(ctx, fr[r], atom, js_dup(fr[v]),
+-                                fr[r], JS_PROP_THROW_STRICT) < 0)
++    if (JS_SetPropertyInternal2(ctx, FR(r), atom, js_dup(FR(v)),
++                                FR(r), JS_PROP_THROW_STRICT) < 0)
+         T_FAIL();
+     T_NEXT(T_SZ_RASR);
+ }
+@@ -25101,7 +25109,7 @@
+     int v = T_REG(9);
+ 
+     {
+-        JSValue recv = fr[r];
++        JSValue recv = FR(r);
+ 
+         if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+             JSObject *p = JS_VALUE_GET_OBJ(recv);
+@@ -25114,7 +25122,7 @@
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_put_hit++;
+ #endif
+-                *slot = js_dup(fr[v]);
++                *slot = js_dup(FR(v));
+                 if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
+                     unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
+                     f->set_v = old;
+@@ -25152,14 +25160,14 @@
+ {
+     int c = T_REG(1);
+     int32_t off = T_I32(3);
+-    T_NEXT(T_SZ_RT + (regvm_to_bool(ctx, fr[c]) ? off : 0));
++    T_NEXT(T_SZ_RT + (regvm_to_bool(ctx, FR(c)) ? off : 0));
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_branch_if(REGVM_ARGS)
+ {
+     int c = T_REG(1);
+     int32_t off = T_I32(3);
+-    JSValue v = fr[c];
++    JSValue v = FR(c);
+ 
+     if (likely((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)) {
+         if (JS_VALUE_GET_INT(v) != 0)
+@@ -25173,14 +25181,14 @@
+ {
+     int c = T_REG(1);
+     int32_t off = T_I32(3);
+-    T_NEXT(T_SZ_RT + (regvm_to_bool(ctx, fr[c]) ? 0 : off));
++    T_NEXT(T_SZ_RT + (regvm_to_bool(ctx, FR(c)) ? 0 : off));
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
+ {
+     int c = T_REG(1);
+     int32_t off = T_I32(3);
+-    JSValue v = fr[c];
++    JSValue v = FR(c);
+ 
+     if (likely((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)) {
+         if (JS_VALUE_GET_INT(v) == 0)
+@@ -25205,7 +25213,7 @@
+         int _sub = (SUBEXPR); \
+         int _la = (LAEXPR), _rb = (RBEXPR); \
+         int32_t _off = (OFFEXPR); \
+-        int _take = regvm_cmp_take(ctx, _sub, fr[_la], fr[_rb]); \
++        int _take = regvm_cmp_take(ctx, _sub, FR(_la), FR(_rb)); \
+         if (unlikely(_take < 0)) \
+             T_FAIL(); \
+         T_NEXT((SZ_) + (_take ? _off : 0)); \
+@@ -25215,7 +25223,7 @@
+         int _sub = (SUBEXPR); \
+         int _la = (LAEXPR), _rb = (RBEXPR); \
+         int32_t _off = (OFFEXPR); \
+-        JSValue _a = fr[_la], _b = fr[_rb]; \
++        JSValue _a = FR(_la), _b = FR(_rb); \
+         int _r; \
+         if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
+                    !((_r = regvm_int_cmp(_sub & ~REG_CMP_INVERT, \
+@@ -25353,7 +25361,7 @@
+     int d = T_REG(1);
+     int32_t imm = T_OFF8(3);
+     int32_t off = T_I32(4);
+-    JSValue v = fr[d], out;
++    JSValue v = FR(d), out;
+ 
+     if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+         js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+@@ -25366,16 +25374,16 @@
+     int d = T_REG(1);
+     int32_t imm = T_OFF8(3);
+     int32_t off = T_I32(4);
+-    JSValue v = fr[d];
++    JSValue v = FR(d);
+ 
+     if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+         int32_t sum;
+ 
+         if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+-            fr[d] = js_int32(sum);
++            FR(d) = js_int32(sum);
+             T_NEXT(T_SZ_RIT + off);
+         }
+-        fr[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
++        FR(d) = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+         T_NEXT(T_SZ_RIT + off);
+     }
+     __attribute__((musttail))
+@@ -25388,7 +25396,7 @@
+     int d = T_REG8(1);
+     int32_t imm = T_OFF8(2);
+     int32_t off = T_OFF8(3);
+-    JSValue v = fr[d], out;
++    JSValue v = FR(d), out;
+ 
+     if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+         js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+@@ -25401,16 +25409,16 @@
+     int d = T_REG8(1);
+     int32_t imm = T_OFF8(2);
+     int32_t off = T_OFF8(3);
+-    JSValue v = fr[d];
++    JSValue v = FR(d);
+ 
+     if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+         int32_t sum;
+ 
+         if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+-            fr[d] = js_int32(sum);
++            FR(d) = js_int32(sum);
+             T_NEXT(T_SZ_RIT_S + off);
+         }
+-        fr[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
++        FR(d) = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+         T_NEXT(T_SZ_RIT_S + off);
+     }
+     __attribute__((musttail))
+@@ -25789,8 +25797,8 @@
+             ctx->rt->current_exception = JS_UNINITIALIZED;
+             JS_FreeValueRT(ctx->rt, ctx->error_back_trace);
+             ctx->error_back_trace = JS_UNDEFINED;
+-            JS_FreeValue(ctx, fr[dst]);
+-            fr[dst] = caught;
++            JS_FreeValue(ctx, FR(dst));
++            FR(dst) = caught;
+             /* Resuming rather than unwinding: the chain keeps running this very
+                record, at its handler. */
+             __attribute__((musttail))
+@@ -26128,10 +26136,10 @@
+  * nothing to branch on: a register operand is one load and the advance is a
+  * constant.
+  */
+-#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2))
++#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) >> 4)
+ /* The narrow encoding's operands: one unsigned byte, and a signed byte for a
+    relative branch target. */
+-#define RD_REG8() ((int)(uint8_t)*rpc++)
++#define RD_REG8() ((int)(uint8_t)*rpc++ >> 4)
+ #define RD_OFF8() ((int)(int8_t)*rpc++)
+ #define RD_U8()  ((int)*rpc++)
+ #define RD_U16() (rpc += 2, (int)regvm_ld_u16(rpc - 2))
+@@ -26786,7 +26794,7 @@
+             L_ROP_load_i8:
+                 { int d = RD_REG(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i8_s:
+-                { int d = RD_U8(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
++                { int d = RD_REG8(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i32:
+                 { int d = RD_REG(); SET_REG(d, js_int32(RD_I32())); REGVM_NEXT(); }
+             L_ROP_load_bigint_i32:
+@@ -26910,7 +26918,7 @@
+                 { int d = RD_REG(); int s = RD_REG();
+                   if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
+             L_ROP_move_s:
+-                { int d = RD_U8(); int s = RD_U8();
++                { int d = RD_REG8(); int s = RD_REG8();
+                   if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
+             L_ROP_get_local:
+                 { int d = RD_REG(); int slot = RD_U16();
+@@ -55351,6 +55359,14 @@
+     js_free(ctx, first);
+ }
+ 
++/*
++ * X2: register operands are byte offsets into the register file, so a field's
++ * width limits the registers it can name -- one byte reaches register 15, two
++ * bytes reach register 4095.
++ */
++#define REGVM_NARROW_REG_MAX 16
++#define REGVM_WIDE_REG_MAX 4095
++
+ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+                                    int reg_count, int cpool_count, int pic_count,
+                                    int atom_count, int n_values, const int *ireg,
+@@ -55384,6 +55400,17 @@
+      */
+     if (reg_count < 1)
+         reg_count = 1;
++    /*
++     * X2: register operands are byte offsets (register * sizeof(JSValue)). A
++     * narrow operand is one byte, so it reaches registers 0..15; a wide one is
++     * two bytes, so it reaches registers 0..4095. A function with more
++     * registers than that cannot be encoded and is refused here rather than
++     * truncated.
++     */
++    if (reg_count > REGVM_WIDE_REG_MAX + 1) {
++        rc = REGVM_REFUSED;
++        goto done;
++    }
+ 
+     insn_pc = js_malloc(ctx, (ir->n_insns > 0 ? ir->n_insns : 1) * sizeof(int));
+     if (!insn_pc)
+@@ -55427,7 +55454,7 @@
+         } else if (in->rop == ROP_branch_cmp_reg_reg) {
+             a = regvm_reg_of(in, 1, ireg, n_values, scratch_reg, win_base, cycle_reg);
+             b = regvm_reg_of(in, 2, ireg, n_values, scratch_reg, win_base, cycle_reg);
+-            if (a >= 0 && a < 256 && b >= 0 && b < 256) {
++            if (a >= 0 && a < REGVM_NARROW_REG_MAX && b >= 0 && b < REGVM_NARROW_REG_MAX) {
+                 int dop = regvm_cmp_opcode(in->ops[0]);
+ 
+                 if (dop >= 0) {
+@@ -55443,7 +55470,7 @@
+         } else if (in->rop == ROP_binary_imm) {
+             a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
+             b = regvm_reg_of(in, 2, ireg, n_values, scratch_reg, win_base, cycle_reg);
+-            if (a >= 0 && a < 256 && b >= 0 && b < 256 &&
++            if (a >= 0 && a < REGVM_NARROW_REG_MAX && b >= 0 && b < REGVM_NARROW_REG_MAX &&
+                 in->ops[3] >= -128 && in->ops[3] <= 127) {
+                 if (in->ops[1] == REG_BIN_ADD || in->ops[1] == REG_BIN_SUB) {
+                     int is_add = (in->ops[1] == REG_BIN_ADD);
+@@ -55475,11 +55502,11 @@
+             b = in->rop == ROP_move
+                     ? regvm_reg_of(in, 1, ireg, n_values, scratch_reg, win_base, cycle_reg)
+                     : a;
+-            if (a >= 0 && a < 256 && b >= 0 && b < 256)
++            if (a >= 0 && a < REGVM_NARROW_REG_MAX && b >= 0 && b < REGVM_NARROW_REG_MAX)
+                 in->rop = (uint16_t)(in->rop == ROP_move ? ROP_move_s : ROP_load_i8_s);
+         } else if (in->rop == ROP_add_imm_self_branch) {
+             a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
+-            if (a >= 0 && a < 256)
++            if (a >= 0 && a < REGVM_NARROW_REG_MAX)
+                 in->rop = ROP_add_imm_self_branch_s;
+         }
+     }
+@@ -55582,6 +55609,12 @@
+                     rc = REGVM_REFUSED;
+                     goto done;
+                 }
++                /* X2: a register operand is a byte offset into the register
++                   file, so no reader ever scales an index by the value size.
++                   The narrow form holds offsets 0..255, i.e. registers below
++                   REGVM_NARROW_REG_MAX, which is what the selection loop
++                   checks. */
++                r *= (int)sizeof(JSValue);
+                 if (wide && !nar) { code[p++] = (uint8_t)r; code[p++] = (uint8_t)(r >> 8); }
+                 else code[p++] = (uint8_t)r;
+                 break;
+@@ -55677,7 +55710,7 @@
+            field, so its index is a constant-pool index or an atom index
+            depending on that byte, not on the operand position. */
+         if (op == ROP_load_const) {
+-            if (ops[0] < 0 || ops[0] >= reg_count) {
++            if (ops[0] < 0 || ops[0] >= reg_count * (int)sizeof(JSValue)) {
+                 JS_ThrowInternalError(ctx, "regvm: register %d out of range (%d)",
+                                       ops[0], reg_count);
+                 goto done;
+@@ -55706,11 +55739,11 @@
+              * dst, sub-op, lhs, kind, index: the two registers are ordinary, and
+              * the index is a pool index or an atom according to the kind byte.
+              */
+-            if (ops[0] < 0 || ops[0] >= reg_count ||
+-                ops[2] < 0 || ops[2] >= reg_count) {
++            if (ops[0] < 0 || ops[0] >= reg_count * (int)sizeof(JSValue) ||
++                ops[2] < 0 || ops[2] >= reg_count * (int)sizeof(JSValue)) {
+                 JS_ThrowInternalError(ctx, "regvm: register out of range (%d)",
+-                                      ops[0] < 0 || ops[0] >= reg_count ? ops[0]
+-                                                                        : ops[2]);
++                                      ops[0] < 0 || ops[0] >= reg_count * (int)sizeof(JSValue)
++                                          ? ops[0] : ops[2]);
+                 goto done;
+             }
+             if (ops[3] == REG_CONST_CPOOL) {
+@@ -55735,7 +55768,7 @@
+                 int32_t v = ops[m];
+                 switch (fmt[m]) {
+                 case 'r':
+-                    if (v < 0 || v >= reg_count) {
++                    if (v < 0 || v >= reg_count * (int)sizeof(JSValue)) {
+                         JS_ThrowInternalError(ctx, "regvm: register %d out of range (%d)", v, reg_count);
+                         goto done;
+                     }
+@@ -55791,7 +55824,8 @@
+                 int32_t want;
+                 switch (fmt[m]) {
+                 case 'r': {
+-                    want = regvm_reg_of(src, m, ireg, n_values, scratch_reg, win_base, cycle_reg);
++                    want = regvm_reg_of(src, m, ireg, n_values, scratch_reg, win_base, cycle_reg) *
++                           (int)sizeof(JSValue);
+                     break;
+                 }
+                 case 't': {
+@@ -66639,7 +66673,13 @@
+                         JS_ThrowSyntaxError(ctx, "register atom out of range");
+                         goto done;
+                     }
+-                } else if (v < 0 || v >= b->regvm_reg_count) {
++                } else if (v < 0 || v >= b->regvm_reg_count * (int)sizeof(JSValue) ||
++                           (v & (int)(sizeof(JSValue) - 1)) != 0) {
++                    /* X2: a register operand is a byte offset into the register
++                       file (register * sizeof(JSValue)), not an index. The
++                       compiler always emits an aligned offset, so the reader
++                       rejects anything else rather than reading across a slot
++                       boundary. */
+                     JS_ThrowSyntaxError(ctx, "register %d out of range (%d)",
+                                         v, b->regvm_reg_count);
+                     goto done;
+@@ -67018,7 +67058,7 @@
+                 bc_get_leb128_int(s, &regvm_len))
+                 goto fail;
+             if (reg_count <= 0 || ctl_count < 0 || regvm_len <= 0 ||
+-                reg_count > UINT16_MAX || ctl_count > UINT16_MAX ||
++                reg_count > REGVM_WIDE_REG_MAX + 1 || ctl_count > UINT16_MAX ||
+                 pic_count < 0 || pic_count > UINT16_MAX ||
+                 (size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
+                 JS_ThrowSyntaxError(ctx, "invalid register program header");
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -750,7 +750,7 @@
+  * cross-VM one does. Bump it whenever an opcode is added, removed or
+  * renumbered, or an operand's width or meaning changes.
+  */
+-#define REGVM_FORMAT_VERSION 12
++#define REGVM_FORMAT_VERSION 13
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */

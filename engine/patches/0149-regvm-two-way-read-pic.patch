@@ -1,0 +1,188 @@
+Subject: register VM two-way property-read PIC with promotion
+
+What this does:
+  A register-VM property-read site is a single cached entry (`JSRegPIC`), and
+  after `REG_PIC_MISS_LIMIT` (8) misses a site is marked dead and every read
+  goes out of line to `regvm_get_field_ic` (~68 instructions) even when the
+  site is 98% monomorphic and the inline hit is 22 instructions. On the fixed
+  kernel the read sites are strongly bimorphic: of the sites with a live entry,
+  1.13M see one shape, 3.0M see two, 475K see three, and 30K see four, so two
+  ways cover 99.99% of the traffic.
+
+  This gives each read site two ways. The register PIC and holder arrays are
+  allocated at `2 * regvm_pic_count`; the primary way is still `pic[site]` and
+  `holder[site]` (unchanged addressing), and the secondary is
+  `pic[regvm_pic_count + site]` and its holder. The secondary is filled lazily,
+  so a monomorphic site only pays the extra 24 bytes per table.
+
+  Fill (`regvm_pic_fill`): when the primary already holds a different shape,
+  install the new one in the secondary instead of giving up; the primary is
+  left alive, so an alternating site keeps both hits inline and only a
+  genuinely polymorphic site loses it. The secondary carries its own miss
+  counter, so its own death (and the global-stub-cache fallback) is tracked
+  separately from the primary's.
+
+  Promote (`regvm_get_field_ic`): before the engine lookup and the global stub
+  cache, probe the secondary. On a hit, serve it like any other borrowed read
+  (so the quickened handlers are unchanged) and charge one promotion credit to
+  the primary's `misses` field; at 16 credits the two ways and their holders
+  swap wholesale, so the dominant shape becomes the one the 22-instruction
+  inline hit serves. The threshold is 16 (64 was measured slower). The swap can
+  change the primary's kind (OWN to PROTO); that is safe because every threaded
+  caller requickens the instruction from `pic[site].kind` after
+  `regvm_get_field_ic` returns, and a site belongs to exactly one instruction.
+
+  All other walks of the table (free, GC mark, memory accounting) cover
+  `2 * regvm_pic_count`; put sites use the primary indices only. The serialized
+  bytecode still writes `regvm_pic_count` and rebuilds the table lazily on
+  load, so the register format is unchanged.
+
+  Measured (`fixed.js`, 32 iterations, i7-8700), on top of 0148: 23,244,145,368
+  -> 23,101,044,263 instructions (**-0.143 G, -0.62 %**), against the plan's
+  0.23 G alone (the 0.09 G gap is the overlap with 0148 -- both remove entries
+  from the same chain sites, and the plan measured the pair at -0.73...-0.76 G).
+  Cumulative base -> 0146..0149: 23,834,989,409 -> 23,067,899,335 (gate run),
+  **-0.768 G**. Gate run 23,067,899,335 / 10,985,664,881. Checksum
+  `546.1008391043414` exact; diff-suite `pass=398 fail=0 skip=0` mono and
+  threaded; leak assertion clean; peak RSS 13200 KB; full test262 errors 50
+  (<= 64, unchanged).
+
+No opcode, operand encoding or serialized register-format change.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7348,7 +7348,7 @@
+     uint32_t i;
+     if (!b->regvm_pic)
+         return;
+-    for (i = 0; i < b->regvm_pic_count; i++)
++    for (i = 0; i < 2u * b->regvm_pic_count; i++)
+         regvm_pic_entry_reset(rt, &b->regvm_pic[i], &b->regvm_pic_holder[i]);
+     js_free_rt(rt, b->regvm_pic);
+     b->regvm_pic = NULL;
+@@ -7369,13 +7369,17 @@
+         return t;
+     if (b->regvm_pic_count == 0)
+         return NULL;
+-    t = js_mallocz_rt(rt, sizeof(*t) * (size_t)b->regvm_pic_count);
++    /* Each site owns two ways: the primary at `site` (unchanged addressing)
++       and a secondary at `regvm_pic_count + site` used by the two-way read
++       cache. Both arrays are sized for both ways; the secondary is filled
++       lazily, so a monomorphic site pays only the extra bytes. */
++    t = js_mallocz_rt(rt, sizeof(*t) * 2 * (size_t)b->regvm_pic_count);
+     if (t) {
+         /* The cold holder array is allocated in the same step so that a
+            non-NULL regvm_pic always has a holder array to index. If it cannot
+            be allocated the whole cache is abandoned (NULL on OOM: retried on
+            the next fill, never throws). */
+-        JSShape **h = js_mallocz_rt(rt, sizeof(*h) * (size_t)b->regvm_pic_count);
++        JSShape **h = js_mallocz_rt(rt, sizeof(*h) * 2 * (size_t)b->regvm_pic_count);
+         if (!h) {
+             js_free_rt(rt, t);
+             return NULL;
+@@ -9666,7 +9670,7 @@
+                must match exactly the references held (A2). */
+             if (b->regvm_pic) {
+                 uint32_t j;
+-                for (j = 0; j < b->regvm_pic_count; j++) {
++                for (j = 0; j < 2u * b->regvm_pic_count; j++) {
+                     JSRegPIC *e = &b->regvm_pic[j];
+                     if (e->shape)
+                         mark_func(rt, &e->shape->header);
+@@ -9985,11 +9989,11 @@
+     }
+ #if QJS_REGVM
+     if (b->regvm_pic) {
+-        js_func_size += (size_t)b->regvm_pic_count * sizeof(JSRegPIC);
++        js_func_size += 2 * (size_t)b->regvm_pic_count * sizeof(JSRegPIC);
+         memory_used_count++;
+     }
+     if (b->regvm_pic_holder) {
+-        js_func_size += (size_t)b->regvm_pic_count * sizeof(JSShape *);
++        js_func_size += 2 * (size_t)b->regvm_pic_count * sizeof(JSShape *);
+         memory_used_count++;
+     }
+ #endif
+@@ -22960,14 +22964,32 @@
+                 return;             /* no table: the site simply does not cache */
+             *ppic = pic;            /* re-point the running frame (A1's base) */
+         }
+-        regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+-                          kind, rsh, hsh, slot);
+-        /* The install may have just pushed a live site over the miss limit;
+-           such a site can no longer be served, so cache it globally too. */
+-        if (!need_mega &&
+-            pic[site].kind == REG_PIC_EMPTY &&
+-            pic[site].misses >= REG_PIC_MISS_LIMIT)
+-            need_mega = 1;
++        if (pic[site].kind != REG_PIC_EMPTY && pic[site].shape != rsh) {
++            /* Two-way read cache: the primary way already caches a different
++               shape for this site, so install this shape in the secondary way
++               instead of giving up. The primary is left alive, so a site that
++               alternates between two shapes keeps both hits inline and only a
++               genuinely polymorphic site loses it. The secondary's own miss
++               counter drives its death (and the global-cache fallback) below;
++               it is swapped into the primary by the promotion in
++               regvm_get_field_ic once it proves to be the hot shape. */
++            int s2 = b->regvm_pic_count + site;
++            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
++                              kind, rsh, hsh, slot);
++            if (!need_mega &&
++                pic[s2].kind == REG_PIC_EMPTY &&
++                pic[s2].misses >= REG_PIC_MISS_LIMIT)
++                need_mega = 1;
++        } else {
++            regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
++                              kind, rsh, hsh, slot);
++            /* The install may have just pushed a live site over the miss limit;
++               such a site can no longer be served, so cache it globally too. */
++            if (!need_mega &&
++                pic[site].kind == REG_PIC_EMPTY &&
++                pic[site].misses >= REG_PIC_MISS_LIMIT)
++                need_mega = 1;
++        }
+     }
+ 
+     if (need_mega)
+@@ -22981,6 +23003,8 @@
+  * The value is the engine's; the fill is the register PIC's. `*ppic` is the
+  * running frame's cache base, updated here when the first fill allocates it.
+  */
++static inline __attribute__((always_inline)) int regvm_own_read_hit(
++    JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out);
+ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC **ppic, JSValue recv, JSAtom atom,
+                                   int site)
+@@ -22990,6 +23014,33 @@
+        holder deeper than one prototype, so a hot monomorphic site can stay dead
+        and pay a full lookup forever. The runtime's global stub cache does not
+        require a hashed shape; probe it before the engine lookup. */
++    /* Two-way read cache: the primary way can miss while the secondary holds
++       the receiver's shape, so probe the secondary before the engine lookup
++       (and before the global stub cache). A hit is served as a normal borrowed
++       read, so the quickened handlers need no change. Secondary hits earn the
++       primary's promotion credit in its `misses` field; at the threshold the
++       two ways and their holders swap wholesale so the dominant shape is the
++       one the quickened inline hit serves. The swap can change the primary's
++       kind (OWN to PROTO), which is safe because every threaded caller
++       requickens from `pic[site].kind` after this function returns. */
++    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT && *ppic) {
++        int s2 = b->regvm_pic_count + site;
++        JSValue v2;
++        if (regvm_own_read_hit(*ppic, b->regvm_pic_holder, recv, s2, &v2)) {
++            JSRegPIC *p1 = &(*ppic)[site], *p2 = &(*ppic)[s2];
++            if (unlikely(++p1->misses >= 16)) {
++                JSRegPIC t = *p1; JSShape *th = b->regvm_pic_holder[site];
++                *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
++                *p2 = t; b->regvm_pic_holder[s2] = th;
++                p2->misses = p1->misses; p1->misses = 0;
++            }
++#if QJS_DRC
++            return js_dup(v2);
++#else
++            return v2;
++#endif
++        }
++    }
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+         JSObject *recv_obj = JS_VALUE_GET_OBJ(recv);
+         JSObject *holder;

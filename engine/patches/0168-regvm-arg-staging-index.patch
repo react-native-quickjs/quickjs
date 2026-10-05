@@ -1,0 +1,269 @@
+Subject: register VM argument staging uses an incremental index
+
+What this does:
+  `regvm_arg_retarget` decided whether a call argument's producer may write
+  the call window directly by scanning the whole IR for the value's definition
+  and for any non-destination read of it. Every call argument did that scan, so
+  lowering was quadratic in the IR size and dominated encode time on large
+  functions (pdf.js).
+
+  The pass now keeps `aw_def` (last destination write per value), `aw_reads`
+  (non-destination `r` operand read count) and `aw_last_win` (last instruction
+  naming the call window) in `JSRegIR`, folded lazily by `regvm_arg_index_sync`
+  as instructions are appended. The per-argument test is O(1). The six call
+  lowerings that retarget a producer into the window go through
+  `regvm_arg_retarget_insn`, which keeps the index exact. A value outside the
+  index (allocation failed, or beyond it) falls back to the original full scan
+  `regvm_arg_retarget_scan`, and `QJS_REGVM_ARGCHECK` (debug) cross-checks the
+  fast path against that scan and aborts on a mismatch.
+
+Why we need it:
+  Encode time on pdf.js and other large inputs was dominated by this quadratic
+  scan; the register VM has to lower big functions in reasonable time.
+
+Needs a bytecode version bump:
+  No. Lowering only; the emitted bytecode is unchanged.
+
+---
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -56233,6 +56233,18 @@
+        freed, and all-bits-zero is a valid uncounted value for that, so the
+        encoder's `undefined` list is this narrower set. */
+     uint8_t *own_undef;
++    /*
++     * W3a argument-staging index (see regvm_arg_retarget). Per value: the last
++     * instruction whose destination writes it (-1 if none), and the number of
++     * non-destination `r` operand reads. It is folded lazily as instructions are
++     * appended, so the per-argument test is O(1) instead of a scan of the whole
++     * IR. `aw_last_win` is the last instruction naming the call window.
++     */
++    int32_t *aw_def;
++    int32_t *aw_reads;
++    int aw_n;          /* number of values the index covers (0 = disabled) */
++    int aw_scanned;    /* instructions already folded into the index */
++    int aw_last_win;   /* last instruction naming the call window, or -1 */
+ #ifdef QJS_REGVM_RCCHECK
+     /* Section 6.1 outputs the section 6.2 checker consumes, per instruction. */
+     uint8_t *own_plain;     /* n_insns: 1 when the destination was NONE */
+@@ -58742,8 +58754,8 @@
+  * for a value the operand stack still names. Returns its index, or -1 to fall
+  * back to the move.
+  */
+-static int regvm_arg_retarget(const JSRegIR *ir, int v,
+-                              const int *home_of, int n_values)
++static int regvm_arg_retarget_scan(const JSRegIR *ir, int v,
++                                   const int *home_of, int n_values)
+ {
+     int i, def = -1, reads = 0;
+     if (v < 0 || (home_of && v < n_values && home_of[v] >= 0))
+@@ -58791,6 +58803,103 @@
+ }
+ 
+ /*
++ * Fold newly appended instructions into the W3a argument index. Called lazily
++ * from regvm_arg_retarget, so each instruction is folded once and the whole
++ * lowering stays linear instead of quadratic. The per-instruction logic mirrors
++ * the first pass of regvm_arg_retarget_scan exactly; `aw_last_win` replaces its
++ * second pass.
++ */
++static void regvm_arg_index_sync(JSRegIR *ir)
++{
++    int i;
++    if (ir->aw_n <= 0)
++        return;
++    for (i = ir->aw_scanned; i < ir->n_insns; i++) {
++        const JSRegInsn *in = &ir->insns[i];
++        const char *fmt = regvm_rop_fmt[in->rop];
++        int di, di2, k;
++        if (!fmt)
++            continue;
++        di = regvm_own_dest_index(in->rop);
++        if (!regvm_own_has_dest(in->rop) || fmt[di] != 'r')
++            di = -1;
++        di2 = di >= 0 ? regvm_own_second_dest_index(in->rop) : -1;
++        for (k = 0; k < in->n_ops && fmt[k]; k++) {
++            int r = in->ops[k];
++            if (fmt[k] != 'r' || k == di || (di2 >= 0 && k == di2))
++                continue;
++            if (r >= 0 && r < ir->aw_n)
++                ir->aw_reads[r]++;
++        }
++        if (di >= 0) {
++            int d = in->ops[di];
++            if (d >= 0 && d < ir->aw_n)
++                ir->aw_def[d] = i;
++        }
++        for (k = 0; k < in->n_ops && fmt[k]; k++)
++            if (in->ops[k] <= REGVM_WIN(0))
++                ir->aw_last_win = i;
++    }
++    ir->aw_scanned = ir->n_insns;
++}
++
++/*
++ * Record that the producer at `def` was retargeted to write the call window
++ * instead of the value `v` (the six call lowerings below). The index must forget
++ * v's old definition and note that `def` now names the window.
++ */
++static void regvm_arg_retarget_insn(JSRegIR *ir, int def, int win, int v)
++{
++    JSRegInsn *d = &ir->insns[def];
++    d->ops[regvm_own_dest_index(d->rop)] = win;
++    if (ir->aw_n <= 0)
++        return;
++    if (v >= 0 && v < ir->aw_n)
++        ir->aw_def[v] = -1;
++    if (def > ir->aw_last_win)
++        ir->aw_last_win = def;
++}
++
++static int regvm_arg_retarget(JSRegIR *ir, int v,
++                              const int *home_of, int n_values)
++{
++    int result;
++    if (v < 0 || (home_of && v < n_values && home_of[v] >= 0)) {
++        result = -1;
++    } else if (v >= ir->aw_n) {
++        /* No index (allocation failed, or a value outside it): full scan. */
++        result = regvm_arg_retarget_scan(ir, v, home_of, n_values);
++    } else {
++        int def;
++        regvm_arg_index_sync(ir);
++        def = ir->aw_def[v];
++        if (def < 0 || ir->aw_reads[v] != 0) {
++            result = -1;
++        } else {
++            uint8_t o = ir->insns[def].origin;
++            if (o == REGVM_ORIG_PHI || o == REGVM_ORIG_CYCLE ||
++                o == REGVM_ORIG_SPLIT || o == REGVM_ORIG_HOMECOPY)
++                result = -1;
++            else if (ir->aw_last_win >= def)
++                result = -1;
++            else
++                result = def;
++        }
++    }
++#ifdef QJS_REGVM_ARGCHECK
++    {
++        int old = regvm_arg_retarget_scan(ir, v, home_of, n_values);
++        if (old != result) {
++            fprintf(stderr, "regvm ARGCHECK: v=%d fast=%d scan=%d\n",
++                    v, result, old);
++            abort();
++        }
++    }
++#endif
++    return result;
++}
++
++/*
+  * Decide, for one call's arguments, which ones can be produced in place. `pop`
+  * names every operand the call reads (n_all of them), and the arguments are the
+  * argc entries starting at arg_off. Fills defs[a] with the producer to retarget
+@@ -58799,7 +58908,7 @@
+  */
+ static int regvm_stack_has(const int *stack, int n, int v);
+ 
+-static void regvm_stage_args(const JSRegIR *ir, const int *pop, int n_all,
++static void regvm_stage_args(JSRegIR *ir, const int *pop, int n_all,
+                              int arg_off, int argc, const int *home_of,
+                              int n_values, int below, int *defs)
+ {
+@@ -59298,8 +59407,7 @@
+         regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+-                JSRegInsn *d = &ir->insns[defs[a]];
+-                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++                regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[1 + a]);
+             } else {
+                 ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
+             }
+@@ -59314,8 +59422,7 @@
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+-                JSRegInsn *d = &ir->insns[defs[a]];
+-                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++                regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[2 + a]);
+             } else {
+                 ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
+             }
+@@ -59330,8 +59437,7 @@
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+-                JSRegInsn *d = &ir->insns[defs[a]];
+-                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++                regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[2 + a]);
+             } else {
+                 ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
+             }
+@@ -59346,8 +59452,7 @@
+         regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+-                JSRegInsn *d = &ir->insns[defs[a]];
+-                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++                regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[1 + a]);
+             } else {
+                 ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
+             }
+@@ -59362,8 +59467,7 @@
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+-                JSRegInsn *d = &ir->insns[defs[a]];
+-                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++                regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[2 + a]);
+             } else {
+                 ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
+             }
+@@ -59378,8 +59482,7 @@
+         regvm_stage_args(ir, pop, argc, 0, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+-                JSRegInsn *d = &ir->insns[defs[a]];
+-                d->ops[regvm_own_dest_index(d->rop)] = REGVM_WIN(a);
++                regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[a]);
+             } else {
+                 ADD(ROP_move, REGVM_WIN(a), pop[a]);
+             }
+@@ -63518,6 +63623,27 @@
+     ir.cap = 0;
+     ir.own_init = NULL;
+     ir.own_undef = NULL;
++    ir.aw_def = NULL;
++    ir.aw_reads = NULL;
++    ir.aw_n = 0;
++    ir.aw_scanned = 0;
++    ir.aw_last_win = -1;
++    if (n_values > 0) {
++        int32_t *awd = js_malloc(ctx, (size_t)n_values * sizeof(int32_t));
++        int32_t *awr = js_malloc(ctx, (size_t)n_values * sizeof(int32_t));
++        if (awd && awr) {
++            for (i = 0; i < n_values; i++) {
++                awd[i] = -1;
++                awr[i] = 0;
++            }
++            ir.aw_def = awd;
++            ir.aw_reads = awr;
++            ir.aw_n = n_values;
++        } else {
++            js_free(ctx, awd);
++            js_free(ctx, awr);
++        }
++    }
+     fd->regvm_fill = NULL;
+     fd->regvm_fill_count = 0;
+ #ifdef QJS_REGVM_RCCHECK
+@@ -64632,6 +64800,8 @@
+     js_free(ctx, ir.insns);
+     js_free(ctx, ir.own_init);
+     js_free(ctx, ir.own_undef);
++    js_free(ctx, ir.aw_def);
++    js_free(ctx, ir.aw_reads);
+     js_free(ctx, pc_to_insn);
+     js_free(ctx, scratch);
+     js_free(ctx, sval);

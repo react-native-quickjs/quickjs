@@ -1,0 +1,3511 @@
+Subject: register VM: registers stop owning their values under deferred RC (stage D4)
+
+What this does:
+  Stage D4 of the deferred-RC plan
+  (`HP-S3-DEFERRED-RC-PLAN-2026-10-02.md` section 3) flips register stores
+  to non-owning. With D1 (register windows published as roots), D2 (zero-count
+  table + reconcile) and D3 (exact-count fixes, back-edge drain) in place, a
+  register write no longer dups the new value or releases the old one; a value
+  whose count reaches zero is parked and freed by reconcile only if no live
+  register refers to it. Variables, owned argument copies, object slots and
+  closure cells stay owning, so every store from a register into one of them
+  now takes its own reference.
+
+  Boundaries that had to change:
+  - stores out of registers (locals, args via `regvm_put_arg`, object fill,
+    return-to-C, catch unwind, for-of wrappers) dup;
+  - a suspended coroutine's window owns while parked (`rv_owns_regs`,
+    `js_regvm_drc_suspend`/`_resume`), including the initial yield, and
+    `async_func_mark`/`async_func_free` only walk it when it owns;
+  - a coroutine frame's arg_buf is owned (`async_func_init` dups it) even
+    though it is resumed with `argv == arg_buf`, so `arg_owned` includes
+    `JS_CALL_FLAG_GENERATOR`;
+  - a record call borrows the caller's register window for arguments only
+    when the callee cannot write back through a reference
+    (`regvm_args_borrowable`: no captured arg, no mapped `arguments`, no
+    `make_arg_ref`; new `JSFunctionBytecode.args_captured`, also derived on
+    bytecode read);
+  - atoms: a dropped atom's string may still sit in a register, so
+    `__JS_FreeAtom` parks it with `js_drc_zero`, and `JS_FreeAtomStruct`
+    turns a parked atom back into a plain string so the deferred free does not
+    remove it from the atom table a second time;
+  - `JS_FreeRuntime` sets `drc_in_reconcile` after the final drain so
+    teardown frees are immediate.
+
+  Measured (`fixed.js`, i7-8700): 28,965,011,626 -> 24,485,406,348
+  instructions (-15.5 %) and 13,701,132,294 -> 11,480,932,913 cycles
+  (-16.2 %); peak RSS 13,472 KB. Checksum `546.1008391043414`, diff-suite
+  `pass=398 fail=0 skip=0` mono and threaded, leak check clean, ASan+UBSan
+  box2d clean, test262 built-ins/language/annexB/staging error sets equal to
+  head (head additionally crashes in language/statements; D4 does not).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -665,6 +665,11 @@
+        are treated as roots by the deferred-RC collector. */
+     JSValue *rv_regs;
+     uint32_t rv_nregs;
++    /* Deferred-RC only: 1 while this coroutine frame is parked (suspended)
++       and its register window therefore owns the references the suspend walk
++       took; 0 while it is running or has returned, when the registers only
++       borrow. `async_func_free` frees the register window only when it owns. */
++    uint8_t rv_owns_regs;
+ } JSStackFrame;
+ 
+ #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
+@@ -1247,6 +1252,9 @@
+        than run with a NULL byte_code_buf. */
+     uint8_t lazy_failed : 1;
+     uint8_t argv_safe : 1;
++    /* some parameter is captured by a closure or the mapped arguments
++       object: its var_ref would write into a borrowed argument window */
++    uint8_t args_captured : 1;
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
+@@ -2383,6 +2391,7 @@
+     b->u.block_idx = JS_ARENA_FREE_NIL;
+     b->block_size_idx = 0xff; /* fail safe */
+     b->gc_notrace = 0;
++    b->in_zct = 0;
+     return b->user_data;
+ }
+ 
+@@ -2396,6 +2405,7 @@
+     b->u.block_idx = JS_ARENA_FREE_NIL;
+     b->block_size_idx = 0xff; /* fail safe */
+     b->gc_notrace = 0;
++    b->in_zct = 0;
+     return b->user_data;
+ }
+ 
+@@ -2430,6 +2440,7 @@
+         ar->first_free_block = b->u.free_next;
+         b->u.block_idx = block_idx;
+         b->gc_notrace = 0;
++    b->in_zct = 0;
+         ar->n_used_blocks++;
+         if (unlikely(ar->n_used_blocks == ar->n_blocks))
+             list_del(&ar->free_link);
+@@ -2532,6 +2543,7 @@
+             nb->gc_obj_type = b->gc_obj_type;
+             nb->mark = b->mark;
+             nb->gc_notrace = b->gc_notrace;
++            nb->in_zct = b->in_zct;
+             nb->ref_count = b->ref_count;
+         }
+         old_usable = block_size - sizeof(JSMallocBlockHeader);
+@@ -3234,11 +3246,24 @@
+ 
+ static inline void js_free_string0(JSRuntime *rt, JSString *str);
+ 
++#if QJS_DRC
++static void js_drc_zero(JSRuntime *rt, JSValue v);
++#endif
++
+ /* same as JS_FreeValueRT() but faster */
+ static inline void js_free_string(JSRuntime *rt, JSString *str)
+ {
+-    if (--JS_REF_COUNT(str) <= 0)
++    if (--JS_REF_COUNT(str) <= 0) {
++#if QJS_DRC
++        /* A register can hold this string without owning it; park it instead of
++           freeing so js_drc_reconcile() can check the register windows. */
++        if (!rt->drc_in_reconcile && rt->gc_phase == JS_GC_PHASE_NONE) {
++            js_drc_zero(rt, JS_MKPTR(JS_TAG_STRING, str));
++            return;
++        }
++#endif
+         js_free_string0(rt, str);
++    }
+ }
+ 
+ static inline void js_free_string0(JSRuntime *rt, JSString *str)
+@@ -3372,6 +3397,10 @@
+     rt->zct = NULL;
+     rt->zct_len = 0;
+     rt->zct_cap = 0;
++    /* Teardown: no register window can exist any more, so every count that
++       reaches zero from here on (class names, atoms, caches) is freed at once
++       instead of being parked in a table nobody drains. */
++    rt->drc_in_reconcile = 1;
+ #endif
+     assert(list_empty(&rt->gc_notrace_list));
+     assert(list_empty(&rt->gc_obj_list));
+@@ -4859,6 +4888,22 @@
+     if (unlikely(p->first_weak_ref)) {
+         reset_weak_ref(rt, &p->first_weak_ref);
+     }
++#if QJS_DRC
++    if (JS_GC_IN_ZCT(p)) {
++        /* This atom is parked in the deferred-free table: some register may
++           still refer to it, so js_drc_reconcile owns the actual free. The
++           atom table bookkeeping above is complete. Turn the struct back into
++           a plain string so the deferred free (js_free_string0) does not run
++           the atom-table removal a second time on a slot that may already
++           belong to another atom, and keep it on the string list so that free
++           unlinks it exactly once. */
++        p->atom_type = 0;
++        p->hash_next = 0;
++        rt->atom_count--;
++        assert(rt->atom_count >= 0);
++        return;
++    }
++#endif
+     /* free the string structure */
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     list_del(&p->link);
+@@ -4875,6 +4920,17 @@
+     p = rt->atom_array[i];
+     if (--JS_REF_COUNT(p) > 0)
+         return;
++#if QJS_DRC
++    /* The atom's string may still sit in a register that does not own it
++       (an interned key loaded from a slot that has since been overwritten).
++       Park it like any other zero count; the atom stays findable in the hash
++       table until reconcile frees it, and a lookup in between revives it. */
++    if (!rt->drc_in_reconcile && rt->gc_phase == JS_GC_PHASE_NONE) {
++        js_drc_zero(rt, JS_MKPTR(p->atom_type == JS_ATOM_TYPE_STRING ?
++                                 JS_TAG_STRING : JS_TAG_SYMBOL, p));
++        return;
++    }
++#endif
+     JS_FreeAtomStruct(rt, p);
+ }
+ 
+@@ -9171,7 +9227,6 @@
+ static void js_drc_zero(JSRuntime *rt, JSValue v)
+ {
+     uint32_t tag = JS_VALUE_GET_TAG(v);
+-
+     if (rt->drc_in_reconcile) {
+         /* Inside reconcile a zero count is final. */
+         js_free_value_rt(rt, v);
+@@ -9292,14 +9347,64 @@
+    previously owned by the destination. Only used from stage D4 onwards. */
+ #define REG_ADOPT(rt, v)                                                     \
+     do {                                                                     \
+-        if (JS_VALUE_HAS_REF_COUNT(v) &&                                     \
+-            --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)                        \
+-            js_drc_zero(rt, v);                                              \
++        if (JS_VALUE_HAS_REF_COUNT(v)) {                                     \
++            if (--JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)                    \
++                js_drc_zero(rt, v);                                          \
++        }                                                                    \
+     } while (0)
++
++/*
++ * Store a value into a callee argument slot. An owned window (arg_owned==1,
++ * used when the callee needs more slots than the caller supplied, or by an
++ * in-loop call) holds dup'd values, so the store must release the old value
++ * and take a reference on the new one. A borrowed window is the caller's
++ * register area (or a safe argv the caller manages); its slots are pinned as
++ * roots through the caller's frame, so the store is a plain register-like
++ * write with no reference-count traffic.
++ */
++static inline void regvm_put_arg(JSContext *ctx, JSValue *buf, int owned,
++                                 int slot, JSValue v)
++{
++    if (owned)
++        set_value(ctx, &buf[slot], js_dup(v));
++    else
++        buf[slot] = v;
++}
+ #else /* !QJS_DRC */
+ #define js_drc_safepoint(rt) ((void)0)
+ #endif /* QJS_DRC */
+ 
++#if QJS_REGVM
++#if QJS_DRC
++/*
++ * A suspended coroutine's registers leave the sf chain, so the pin walk no
++ * longer sees them. Turning the register area into owning while suspended (and
++ * back into borrowing on resume) is what lets async_func_mark/async_func_free,
++ * which walk arg_buf..cur_sp, keep working unchanged: cur_sp is moved past the
++ * register file by the suspension, so that range then covers it.
++ */
++static void js_regvm_drc_suspend(JSRuntime *rt, JSValue *regs, uint32_t nregs)
++{
++    uint32_t i;
++    for (i = 0; i < nregs; i++) {
++        JSValue v = regs[i];
++        if (JS_VALUE_HAS_REF_COUNT(v))
++            JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
++    }
++}
++
++static void js_regvm_drc_resume(JSRuntime *rt, JSValue *regs, uint32_t nregs)
++{
++    uint32_t i;
++    for (i = 0; i < nregs; i++)
++        REG_ADOPT(rt, regs[i]);
++}
++#else
++#define js_regvm_drc_suspend(rt, regs, nregs) ((void)0)
++#define js_regvm_drc_resume(rt, regs, nregs) ((void)0)
++#endif
++#endif /* QJS_REGVM */
++
+ /*
+  * A backward branch is a loop back edge. It is the only frequent, cheap and
+  * safe point inside a register-VM activation at which the deferred-RC zero
+@@ -20217,6 +20322,34 @@
+     return 0;
+ }
+ 
++/* Register-file wrappers for the for-in opcodes. A register slot borrows its
++   value, so the iterator must take its own reference on the object (the stack
++   VM passes an owned slot, which build_for_in_iterator consumes), and the
++   property-name value it writes into a register must be adopted. */
++static __exception int regvm_for_in_start(JSContext *ctx, JSValue *regs_sp)
++{
++#if QJS_DRC
++    JSValue it = build_for_in_iterator(ctx, js_dup(regs_sp[-1]));
++    if (JS_IsException(it))
++        return -1;
++    regs_sp[-1] = it;
++    REG_ADOPT(ctx->rt, it);
++    return 0;
++#else
++    return js_for_in_start(ctx, regs_sp);
++#endif
++}
++
++static __exception int regvm_for_in_next(JSContext *ctx, JSValue *regs_sp)
++{
++    if (js_for_in_next(ctx, regs_sp))
++        return -1;
++#if QJS_DRC
++    REG_ADOPT(ctx->rt, regs_sp[0]);
++#endif
++    return 0;
++}
++
+ static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
+                                JSValueConst method)
+ {
+@@ -20431,6 +20564,65 @@
+     return 0;
+ }
+ 
++#if QJS_REGVM
++/*
++ * Register-file variants of the two for-of helpers. Under deferred RC the
++ * destination slots only borrow, so unlike the stack versions these must not
++ * release the input iterable and must adopt the values they store (giving up
++ * the reference the helper took), leaving the slots borrowing.
++ */
++static __exception int regvm_for_of_start(JSContext *ctx, JSValue *regs_sp,
++                                          bool is_async)
++{
++#if QJS_DRC
++    JSValue obj, method;
++    obj = JS_GetIterator(ctx, regs_sp[-1], is_async);
++    if (JS_IsException(obj))
++        return -1;
++    regs_sp[-1] = obj;
++    REG_ADOPT(ctx->rt, obj);
++    method = JS_GetProperty(ctx, obj, JS_ATOM_next);
++    if (JS_IsException(method))
++        return -1;
++    regs_sp[0] = method;
++    REG_ADOPT(ctx->rt, method);
++    return 0;
++#else
++    return js_for_of_start(ctx, regs_sp, is_async);
++#endif
++}
++
++static __exception int regvm_for_of_next(JSContext *ctx, JSValue *regs_sp,
++                                         int offset)
++{
++#if QJS_DRC
++    JSValue value = JS_UNDEFINED;
++    int done = 1;
++
++    if (likely(!JS_IsUndefined(regs_sp[offset]))) {
++        value = JS_IteratorNext(ctx, regs_sp[offset], regs_sp[offset + 1],
++                                0, NULL, &done);
++        if (JS_IsException(value))
++            done = -1;
++        if (done) {
++            /* the iterator slot only borrows: drop it, do not release it */
++            regs_sp[offset] = JS_UNDEFINED;
++            if (done < 0)
++                return -1;
++            JS_FreeValue(ctx, value);
++            value = JS_UNDEFINED;
++        }
++    }
++    regs_sp[0] = value;
++    REG_ADOPT(ctx->rt, value);
++    regs_sp[1] = js_bool(done);
++    return 0;
++#else
++    return js_for_of_next(ctx, regs_sp, offset);
++#endif
++}
++#endif /* QJS_REGVM */
++
+ static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
+                                            int *pdone)
+ {
+@@ -21205,14 +21397,23 @@
+ static int js_op_define_class(JSContext *ctx, JSValue *sp,
+                               JSAtom class_name, int class_flags,
+                               JSVarRef **cur_var_refs,
+-                              JSStackFrame *sf, bool is_computed_name)
++                              JSStackFrame *sf, bool is_computed_name,
++                              bool borrowed)
+ {
+     JSValue bfunc, parent_class, proto = JS_UNDEFINED;
+     JSValue ctor = JS_UNDEFINED, parent_proto = JS_UNDEFINED;
+     JSFunctionBytecode *b;
+ 
+-    parent_class = sp[-2];
+-    bfunc = sp[-1];
++    if (borrowed) {
++        /* Register-VM operands borrow their slots: the helper consumes the
++           function (its reference is transferred to the closure) and frees the
++           parent on the error paths, so it must own both. */
++        parent_class = js_dup(sp[-2]);
++        bfunc = js_dup(sp[-1]);
++    } else {
++        parent_class = sp[-2];
++        bfunc = sp[-1];
++    }
+ 
+     if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) {
+         if (JS_IsNull(parent_class)) {
+@@ -21724,7 +21925,8 @@
+     pc += 5;
+     if (js_op_define_class(ctx, sp, atom, class_flags,
+                            var_refs, sf,
+-                           (opcode == OP_define_class_computed)) < 0)
++                           (opcode == OP_define_class_computed),
++                           false) < 0)
+         return JS_COLD_HANDLER_EXCEPTION(sp);
+     return JS_COLD_HANDLER_OK(sp);
+ }
+@@ -22935,11 +23137,19 @@
+             return 0;
+         v = *(JSValue *)((char *)holder->prop + e->slot_off);
+     }
++#if QJS_DRC
++    /* Registers do not own their values, so a register read borrows the
++       property's reference instead of taking one. Only the lazy-JSON marker
++       still has to go to the slow path, which materializes it. */
++    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
++        return 0;
++#else
+     if (unlikely(JS_VALUE_GET_TAG(v) < 0)) {
+         if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
+             return 0;                   /* the slow path materializes it */
+         JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
+     }
++#endif
+     *out = v;
+     return 1;
+ }
+@@ -23820,14 +24030,53 @@
+ /*
+  * Store v into register d and continue at ip + off.
+  *
+- * The store happens first, so the fast path is one 16-byte store; the
+- * decrement is inline, so the common case -- overwriting a value something else
+- * still references -- never leaves the handler; and only a count that reaches
+- * zero tail-calls the release, which is why the handler can be frameless
+- * without the release ceasing to happen. See regvm_t_free_slow above for what
+- * the two rejected shapes cost.
++ * Under deferred RC the register area does not own its values, so the store is
++ * the whole operation for a borrowed value (T_SET_NEXT_B) and a store followed
++ * by giving up the producer's reference for an owned one (T_SET_NEXT_P). The
++ * old value needs no release: it was only borrowed, and once no register
++ * refers to it the next reconcile frees it.
++ *
++ * With deferred RC off the register area owns again, so B duplicates the
++ * borrowed value and P takes the owned one as-is; both release the old value
++ * through regvm_t_free_slow exactly as before.
++ */
++#if QJS_DRC
++#define T_SET_NEXT_B(d, v, off) do { \
++        FR(d) = (v); \
++        T_NEXT(off); \
++    } while (0)
++
++#define T_SET_NEXT_P(d, v, off) do { \
++        JSValue _v = (v); \
++        FR(d) = _v; \
++        REG_ADOPT(ctx->rt, _v); \
++        T_NEXT(off); \
++    } while (0)
++
++/*
++ * X4: the float store tail. A float has no reference count, so the store is
++ * plain: the destination's old value was only borrowed (registers do not own),
++ * and un-rooting it is enough for the next reconcile to free it.
+  */
+-#define T_SET_NEXT(d, v, off) do { \
++#define T_SET_NEXT_F64(d, r, off) do { \
++        FR(d).u.float64 = (r); \
++        FR(d).tag = JS_TAG_FLOAT64; \
++        T_NEXT(off); \
++    } while (0)
++#else
++#define T_SET_NEXT_B(d, v, off) do { \
++        JSValue _v = js_dup(v), _o = FR(d); \
++        FR(d) = _v; \
++        if (unlikely(REGVM_HAS_COUNT(_o)) && \
++            unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(_o)) <= 0)) { \
++            f->set_v = _o; \
++            __attribute__((musttail)) \
++                return regvm_t_free_slow(ip + (off), fr, f, ctx); \
++        } \
++        T_NEXT(off); \
++    } while (0)
++
++#define T_SET_NEXT_P(d, v, off) do { \
+         JSValue _v = (v), _o = FR(d); \
+         FR(d) = _v; \
+         if (unlikely(REGVM_HAS_COUNT(_o)) && \
+@@ -23863,6 +24112,25 @@
+         } \
+         T_NEXT(off); \
+     } while (0)
++#endif
++
++/*
++ * A store of a value read straight out of a heap slot (the quickened own-read
++ * hit). The slot's reference is the object's, not the register's, so under
++ * deferred RC the store is a plain borrow. With deferred RC off the register
++ * owns, so the value is incremented before the owning store. Kept as a single
++ * macro because the handler that uses it is itself a macro body and cannot
++ * carry a preprocessor conditional.
++ */
++#if QJS_DRC
++#define T_OWN_STORE(d, v, off) T_SET_NEXT_B(d, v, off)
++#else
++#define T_OWN_STORE(d, v, off) do { \
++        JSValue _ov = (v); \
++        JS_REF_COUNT(JS_VALUE_GET_PTR(_ov))++; \
++        T_SET_NEXT_P(d, _ov, off); \
++    } while (0)
++#endif
+ 
+ /*
+  * One list per family, expanded for the declarations, the dispatch table's
+@@ -23890,7 +24158,7 @@
+         JSValue _o1 = FR(T_REG(3)), _o2 = FR(T_REG(5)), _out; \
+         if (js_regvm_binary(ctx, SUB_, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBRR(SUB_, SZ_) do { \
+         int _d = T_REG(1); \
+@@ -23898,7 +24166,7 @@
+         JSValue _o1 = FR(T_REG(4)), _o2 = FR(T_REG(6)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBUR(SZ_) do { \
+         int _d = T_REG(1); \
+@@ -23906,7 +24174,7 @@
+         JSValue _o1 = f->var_buf[T_REG(4)], _o2 = FR(T_REG(6)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBRU(SZ_) do { \
+         int _d = T_REG(1); \
+@@ -23914,7 +24182,7 @@
+         JSValue _o1 = FR(T_REG(4)), _o2 = f->var_buf[T_REG(6)], _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBUU(SZ_) do { \
+         int _d = T_REG(1); \
+@@ -23922,7 +24190,7 @@
+         JSValue _o1 = f->var_buf[T_REG(4)], _o2 = f->var_buf[T_REG(6)], _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBR_I(SZ_) do { \
+         int _d = T_REG(1); \
+@@ -23930,7 +24198,7 @@
+         JSValue _o1 = FR(T_REG(4)), _o2 = js_int32(T_I32(6)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBRI_S(SZ_) do { \
+         int _d = T_REG8(1); \
+@@ -23938,7 +24206,7 @@
+         JSValue _o1 = FR(T_REG8(3)), _o2 = js_int32(T_OFF8(4)), _out; \
+         if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ #define T_BODY_RBR(SZ_) do { \
+         int _d = T_REG(1); \
+@@ -23946,7 +24214,7 @@
+         JSValue _o1 = FR(T_REG(4)), _out; \
+         if (js_regvm_unary(ctx, _sub, _o1, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ /* The per-operation unary opcodes are "rr": destination, source, and no kind,
+    so their cold half must not read one out of the stream. */
+@@ -23955,7 +24223,7 @@
+         JSValue _o1 = FR(T_REG(3)), _out; \
+         if (js_regvm_unary(ctx, SUB_, _o1, &_out)) \
+             T_FAIL(); \
+-        T_SET_NEXT(_d, _out, SZ_); \
++        T_SET_NEXT_P(_d, _out, SZ_); \
+     } while (0)
+ 
+ /* the fast halves: the numeric path, then the cold half by tail call */
+@@ -23963,7 +24231,7 @@
+         int _d = T_REG(1); \
+         JSValue _out; \
+         if (likely(regvm_num_fast(SUB_, FR(T_REG(3)), FR(T_REG(5)), &_out))) { \
+-            T_SET_NEXT(_d, _out, SZ_); \
++            T_SET_NEXT_P(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -23971,7 +24239,7 @@
+         int _d = T_REG(1); \
+         JSValue _out; \
+         if (likely(regvm_unary_num_fast(SUB_, FR(T_REG(3)), &_out))) { \
+-            T_SET_NEXT(_d, _out, SZ_); \
++            T_SET_NEXT_P(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -23979,7 +24247,7 @@
+         int _d = T_REG(1); \
+         JSValue _out; \
+         if (likely(regvm_num_fast(SUB_, FR(T_REG(4)), FR(T_REG(6)), &_out))) { \
+-            T_SET_NEXT(_d, _out, SZ_); \
++            T_SET_NEXT_P(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -24010,7 +24278,7 @@
+         } \
+         JSValue _out; \
+         if (likely(regvm_num_fast(SUB_, FR(_a), FR(_b), &_out))) { \
+-            T_SET_NEXT(_d, _out, SZ_); \
++            T_SET_NEXT_P(_d, _out, SZ_); \
+         } \
+         __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+     } while (0)
+@@ -24166,6 +24434,24 @@
+ extern uint64_t js_regvm_blockers[ROP_COUNT];
+ extern uint64_t js_regvm_fallback_calls;
+ #endif
++/*
++ * May a record call read the caller's outgoing registers as its argument area
++ * instead of copying them? Only when every declared argument is supplied and,
++ * under DRC, no var_ref can reach a parameter slot (closure capture, direct
++ * eval, make_arg_ref, mapped arguments -- `args_captured`): the registers do
++ * not own their values and a write through such a ref frees the old one.
++ * Direct put_arg into a borrowed window is handled by regvm_put_arg. Must
++ * agree between slot reservation and regvm_record_fill.
++ */
++static inline int regvm_args_borrowable(const JSFunctionBytecode *cb, int na)
++{
++#if QJS_DRC
++    return na >= cb->arg_count && !cb->args_captured;
++#else
++    return na >= cb->arg_count;
++#endif
++}
++
+ static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
+                               JSValueConst cf, JSObject *co,
+                               JSFunctionBytecode *cb, JSRegRun *caller,
+@@ -24702,7 +24988,13 @@
+         return ip;
+     }
+     s = T_REG(1);
++#if QJS_DRC
++    /* The register only borrows, so the return value needs its own reference
++       until it lands in the caller's register (or in C). */
++    f->ret = js_dup(FR(s));
++#else
+     f->ret = FR(s);
++#endif
+     FR(s) = JS_UNDEFINED;
+     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
+ }
+@@ -24768,18 +25060,30 @@
+     int dst = f->ret_dst;
+     uint8_t *rip = f->ret_ip;
+     JSValue v = f->ret;
++#if !QJS_DRC
+     JSValue old;
++#endif
+ 
+     regvm_record_release(ctx->rt, f);
+     ctx->rt->current_stack_frame = c->sf;
++#if QJS_DRC
++    /* v already carries its own reference (regvm_t_return duplicated it), so
++       the caller's register borrows it and the producer's reference is given
++       up. The old value was only borrowed and needs no release. */
++    *(JSValue *)((uint8_t *)c->fr + dst) = v;
++    REG_ADOPT(ctx->rt, v);
++#else
+     old = *(JSValue *)((uint8_t *)c->fr + dst);
+     *(JSValue *)((uint8_t *)c->fr + dst) = v;
++#endif
+     f = c;
++#if !QJS_DRC
+     if (unlikely(REGVM_HAS_COUNT(old)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
+         f->set_v = old;
+         __attribute__((musttail)) return regvm_t_free_slow(rip, f->fr, f, ctx);
+     }
++#endif
+     __attribute__((musttail)) return regvm_t_dispatch(rip, f->fr, f, ctx);
+ }
+ #endif
+@@ -24859,7 +25163,8 @@
+     /* Reserve an argument area only when it will not be borrowed: when the
+        caller supplies every declared argument, the callee reads the caller's
+        outgoing window directly. */
+-    int slots = na >= cb->arg_count ? 0 : cb->arg_count;
++    int slots = regvm_args_borrowable(cb, na) ? 0
++        : (na > cb->arg_count ? na : cb->arg_count);
+ 
+     /*
+      * R6: the interrupt countdown. JS_CallInternal polls once per activation, so
+@@ -24916,7 +25221,8 @@
+     /* Reserve an argument area only when it will not be borrowed: when the
+        caller supplies every declared argument, the callee reads the caller's
+        outgoing window directly. */
+-    int slots = na >= cb->arg_count ? 0 : cb->arg_count;
++    int slots = regvm_args_borrowable(cb, na) ? 0
++        : (na > cb->arg_count ? na : cb->arg_count);
+ 
+     /*
+      * R6: the interrupt countdown. JS_CallInternal polls once per activation, so
+@@ -24973,7 +25279,7 @@
+                              vc(oargv), 0);
+     if (JS_IsException(rv))
+         T_FAIL();
+-    T_SET_NEXT(d, rv, 8);
++    T_SET_NEXT_P(d, rv, 8);
+ }
+ 
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS)
+@@ -24987,7 +25293,7 @@
+         rv = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na, vc(oargv), 0);
+     if (JS_IsException(rv))
+         T_FAIL();
+-    T_SET_NEXT(d, rv, 10);
++    T_SET_NEXT_P(d, rv, 10);
+ }
+ #endif /* QJS_REGVM_RECORD */
+ 
+@@ -25025,7 +25331,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, f->var_buf[ls], FR(rc), &out))) {
+-        T_SET_NEXT(d, out, T_SZ_RBUR);
++        T_SET_NEXT_P(d, out, T_SZ_RBUR);
+     }
+     __attribute__((musttail)) return regvm_t_binary_loc_reg_slow(REGVM_PASS);
+ }
+@@ -25041,7 +25347,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, FR(rc), f->var_buf[rs], &out))) {
+-        T_SET_NEXT(d, out, T_SZ_RBRU);
++        T_SET_NEXT_P(d, out, T_SZ_RBRU);
+     }
+     __attribute__((musttail)) return regvm_t_binary_reg_loc_slow(REGVM_PASS);
+ }
+@@ -25057,7 +25363,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, f->var_buf[ls], f->var_buf[rs], &out))) {
+-        T_SET_NEXT(d, out, T_SZ_RBUU);
++        T_SET_NEXT_P(d, out, T_SZ_RBUU);
+     }
+     __attribute__((musttail)) return regvm_t_binary_loc_loc_slow(REGVM_PASS);
+ }
+@@ -25073,7 +25379,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+-        T_SET_NEXT(d, out, T_SZ_RBR_I);
++        T_SET_NEXT_P(d, out, T_SZ_RBR_I);
+     }
+     __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS);
+ }
+@@ -25089,7 +25395,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+-        T_SET_NEXT(d, out, T_SZ_RBRI_S);
++        T_SET_NEXT_P(d, out, T_SZ_RBRI_S);
+     }
+     __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS);
+ }
+@@ -25104,7 +25410,7 @@
+     JSValue out;
+ 
+     if (likely(regvm_unary_num_fast(sub, FR(s), &out))) {
+-        T_SET_NEXT(d, out, T_SZ_RBR);
++        T_SET_NEXT_P(d, out, T_SZ_RBR);
+     }
+     __attribute__((musttail)) return regvm_t_unary_slow(REGVM_PASS);
+ }
+@@ -25156,22 +25462,22 @@
+  */
+ 
+ static uint8_t *REGVM_CC regvm_t_load_undefined(REGVM_ARGS)
+-{ T_SET_NEXT(T_REG(1), JS_UNDEFINED, T_SZ_R); }
++{ T_SET_NEXT_P(T_REG(1), JS_UNDEFINED, T_SZ_R); }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_null(REGVM_ARGS)
+-{ T_SET_NEXT(T_REG(1), JS_NULL, T_SZ_R); }
++{ T_SET_NEXT_P(T_REG(1), JS_NULL, T_SZ_R); }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_true(REGVM_ARGS)
+-{ T_SET_NEXT(T_REG(1), JS_TRUE, T_SZ_R); }
++{ T_SET_NEXT_P(T_REG(1), JS_TRUE, T_SZ_R); }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_false(REGVM_ARGS)
+-{ T_SET_NEXT(T_REG(1), JS_FALSE, T_SZ_R); }
++{ T_SET_NEXT_P(T_REG(1), JS_FALSE, T_SZ_R); }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_i8(REGVM_ARGS)
+-{ T_SET_NEXT(T_REG(1), js_int32((int8_t)ip[3]), T_SZ_RI); }
++{ T_SET_NEXT_P(T_REG(1), js_int32((int8_t)ip[3]), T_SZ_RI); }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_i8_s(REGVM_ARGS)
+-{ T_SET_NEXT(T_REG8(1), js_int32((int8_t)ip[2]), T_SZ_RI_S); }
++{ T_SET_NEXT_P(T_REG8(1), js_int32((int8_t)ip[2]), T_SZ_RI_S); }
+ 
+ /* Keep hot opcodes out of the shared cold-opcode switch. These bodies mirror
+    their monolithic L_ROP_* cases; operand offsets come from regvm_rop_fmt. */
+@@ -25198,14 +25504,14 @@
+     JSValue val;
+ 
+     if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val))
+-        T_SET_NEXT(d, val, 9);
++        T_SET_NEXT_B(d, val, 9);
+     if (site == REG_IC_NONE)
+         val = JS_GetProperty(ctx, recv, atom);
+     else
+         val = regvm_get_field_ic(ctx, f->b, &f->pic, recv, atom, site);
+     if (JS_IsException(val))
+         T_FAIL();
+-    T_SET_NEXT(d, val, 9);
++    T_SET_NEXT_P(d, val, 9);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
+@@ -25213,12 +25519,20 @@
+     int o = T_REG(1);
+     int key = T_REG(3);
+     int v = T_REG(5);
++#if QJS_DRC
++    /* The register only borrows the value; the property takes its own
++       reference and there is nothing to empty. */
++    if (JS_SetPropertyValue(ctx, FR(o), js_dup(FR(key)), js_dup(FR(v)),
++                            JS_PROP_THROW_STRICT) < 0)
++        T_FAIL();
++#else
+     JSValue val = FR(v);
+ 
+     FR(v) = JS_UNDEFINED;
+     if (JS_SetPropertyValue(ctx, FR(o), js_dup(FR(key)), val,
+                             JS_PROP_THROW_STRICT) < 0)
+         T_FAIL();
++#endif
+     T_NEXT(T_SZ_RRR);
+ }
+ 
+@@ -25243,7 +25557,7 @@
+     }
+     if (JS_IsException(ret_val))
+         T_FAIL();
+-    T_SET_NEXT(d, ret_val, 7);
++    T_SET_NEXT_P(d, ret_val, 7);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
+@@ -25270,7 +25584,7 @@
+         }
+         JS_FreeValue(ctx, cst);
+     }
+-    T_SET_NEXT(d, out, 11);
++    T_SET_NEXT_P(d, out, 11);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
+@@ -25285,7 +25599,7 @@
+                                                  na, vc(argv), 0);
+     if (JS_IsException(ret_val))
+         T_FAIL();
+-    T_SET_NEXT(d, ret_val, 10);
++    T_SET_NEXT_P(d, ret_val, 10);
+ }
+ 
+ /* cold: the operand is an atom, which is not a value until one is made for it,
+@@ -25293,7 +25607,7 @@
+    only call is this one. */
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_load_const_slow(REGVM_ARGS)
+ {
+-    T_SET_NEXT(T_REG(1), JS_AtomToValue(ctx, T_U32(4)), T_SZ_RBC);
++    T_SET_NEXT_P(T_REG(1), JS_AtomToValue(ctx, T_U32(4)), T_SZ_RBC);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_const(REGVM_ARGS)
+@@ -25302,7 +25616,7 @@
+     int kind = T_U8(3);
+ 
+     if (likely(kind == REG_CONST_CPOOL))
+-        T_SET_NEXT(d, js_dup(f->b->cpool[T_U32(4)]), T_SZ_RBC);
++        T_SET_NEXT_B(d,f->b->cpool[T_U32(4)], T_SZ_RBC);
+     __attribute__((musttail)) return regvm_t_load_const_slow(REGVM_PASS);
+ }
+ 
+@@ -25313,7 +25627,7 @@
+     JSValue val = JS_ToObject(ctx, f->this_obj);
+     if (JS_IsException(val))
+         T_FAIL();
+-    T_SET_NEXT(T_REG(1), val, T_SZ_R);
++    T_SET_NEXT_P(T_REG(1), val, T_SZ_R);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_load_this(REGVM_ARGS)
+@@ -25334,7 +25648,7 @@
+                 return regvm_t_load_this_slow(REGVM_PASS);
+         }
+     }
+-    T_SET_NEXT(d, val, T_SZ_R);
++    T_SET_NEXT_P(d, val, T_SZ_R);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS)
+@@ -25345,7 +25659,7 @@
+     /* A self-move is a no-op: the allocator coalesces a move's destination
+        onto its source, and duplicating there would strand a reference. */
+     if (d != s)
+-        T_SET_NEXT(d, js_dup(FR(s)), T_SZ_RR);
++        T_SET_NEXT_B(d,FR(s), T_SZ_RR);
+     T_NEXT(T_SZ_RR);
+ }
+ 
+@@ -25355,7 +25669,7 @@
+     int s = T_REG8(2);
+ 
+     if (d != s)
+-        T_SET_NEXT(d, js_dup(FR(s)), T_SZ_RR_S);
++        T_SET_NEXT_B(d,FR(s), T_SZ_RR_S);
+     T_NEXT(T_SZ_RR_S);
+ }
+ 
+@@ -25382,6 +25696,13 @@
+     int s = T_REG(3);
+ 
+     if (likely(d != s)) {
++#if QJS_DRC
++        /* Registers do not own, so a transfer is a plain copy plus clearing
++           the source. Nothing is released: the value never stopped being
++           rooted, it just moved to a different register. */
++        FR(d) = FR(s);
++        FR(s) = JS_UNDEFINED;
++#else
+         JSValue v = FR(s), old = FR(d);
+ 
+         FR(d) = v;
+@@ -25392,6 +25713,7 @@
+             __attribute__((musttail))
+                 return regvm_t_free_slow(ip + T_SZ_RR, fr, f, ctx);
+         }
++#endif
+     }
+     T_NEXT(T_SZ_RR);
+ }
+@@ -25403,12 +25725,12 @@
+ #ifdef QJS_REGVM_COUNT
+     js_regvm_slot[slot < 16 ? slot : 16]++;
+ #endif
+-    T_SET_NEXT(d, js_dup(f->var_buf[slot]), T_SZ_RU);
++    T_SET_NEXT_B(d,f->var_buf[slot], T_SZ_RU);
+ }
+ 
+ #define T_DEF_GET_LOCAL_S(n) \
+     static uint8_t *REGVM_CC regvm_t_get_local_s##n(REGVM_ARGS) \
+-    { T_SET_NEXT(T_REG(1), js_dup(f->var_buf[n]), T_SZ_R); }
++    { T_SET_NEXT_B(T_REG(1),f->var_buf[n], T_SZ_R); }
+ T_DEF_GET_LOCAL_S(0)
+ T_DEF_GET_LOCAL_S(1)
+ T_DEF_GET_LOCAL_S(2)
+@@ -25419,14 +25741,14 @@
+ {
+     int d = T_REG(1);
+     int slot = T_REG(3);
+-    T_SET_NEXT(d, js_dup(f->arg_buf[slot]), T_SZ_RU);
++    T_SET_NEXT_B(d,f->arg_buf[slot], T_SZ_RU);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_get_var_ref(REGVM_ARGS)
+ {
+     int d = T_REG(1);
+     int slot = T_REG(3);
+-    T_SET_NEXT(d, js_dup(*f->var_refs[slot]->pvalue), T_SZ_RU);
++    T_SET_NEXT_B(d,*f->var_refs[slot]->pvalue, T_SZ_RU);
+ }
+ 
+ /* cold: the cell cache missed, so the engine's own lookup owns the generic
+@@ -25441,7 +25763,7 @@
+ 
+     if (JS_IsException(val))
+         T_FAIL();
+-    T_SET_NEXT(d, val, T_SZ_RAB);
++    T_SET_NEXT_P(d, val, T_SZ_RAB);
+ }
+ 
+ /*
+@@ -25461,7 +25783,7 @@
+     JSValue val;
+ 
+     if (likely(js_gv_cell_probe(ctx, atom, &val)))
+-        T_SET_NEXT(d, val, T_SZ_RAB);
++        T_SET_NEXT_P(d, val, T_SZ_RAB);
+     __attribute__((musttail)) return regvm_t_get_global_slow(REGVM_PASS);
+ }
+ 
+@@ -25498,7 +25820,7 @@
+     }
+     if (JS_IsException(val))
+         T_FAIL();
+-    T_SET_NEXT(d, val, T_SZ_RRR);
++    T_SET_NEXT_P(d, val, T_SZ_RRR);
+ }
+ 
+ /* cold: a lazy-JSON slot has to be materialised before it is read, and that
+@@ -25511,7 +25833,7 @@
+     JSObject *p = JS_VALUE_GET_OBJ(FR(T_REG(3)));
+     uint32_t idx = JS_VALUE_GET_INT(FR(T_REG(5)));
+     JSValue val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+-    T_SET_NEXT(d, val, T_SZ_RRR);
++    T_SET_NEXT_P(d, val, T_SZ_RRR);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
+@@ -25535,7 +25857,7 @@
+             if (unlikely(js_lazy_marker_is(p->u.array.u.values[idx])))
+                 __attribute__((musttail))
+                     return regvm_t_get_element_lazy_slow(REGVM_PASS);
+-            T_SET_NEXT(d, js_dup(p->u.array.u.values[idx]), T_SZ_RRR);
++            T_SET_NEXT_B(d,p->u.array.u.values[idx], T_SZ_RRR);
+         }
+     }
+     __attribute__((musttail)) return regvm_t_get_element_slow(REGVM_PASS);
+@@ -25575,7 +25897,7 @@
+         } \
+         if (JS_IsException(val)) \
+             T_FAIL(); \
+-        T_SET_NEXT(d, val, T_SZ_RRAS); \
++        T_SET_NEXT_P(d, val, T_SZ_RRAS); \
+     } \
+     static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
+     { \
+@@ -25584,7 +25906,7 @@
+         int site = T_REG(9); \
+         JSValue val; \
+         if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
+-            T_SET_NEXT(d, val, T_SZ_RRAS); \
++            T_SET_NEXT_B(d, val, T_SZ_RRAS); \
+         } \
+         __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+     } \
+@@ -25606,10 +25928,9 @@
+             if (likely(e->shape == p->shape)) { \
+                 JSValue v = *(JSValue *)((char *)p->prop + e->slot_off); \
+                 if (likely(JS_VALUE_GET_TAG(v) >= 0)) { \
+-                    T_SET_NEXT(d, v, T_SZ_RRAS); \
++                    T_SET_NEXT_B(d, v, T_SZ_RRAS); \
+                 } else if (likely(JS_VALUE_GET_TAG(v) != JS_TAG_LAZY_JSON)) { \
+-                    JS_REF_COUNT(JS_VALUE_GET_PTR(v))++; \
+-                    T_SET_NEXT(d, v, T_SZ_RRAS); \
++                    T_OWN_STORE(d, v, T_SZ_RRAS); \
+                 } \
+             } \
+         } \
+@@ -25667,7 +25988,7 @@
+     } else {
+         *ip = (uint8_t)ROP_get_field_chain;
+     }
+-    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++    T_SET_NEXT_P(d2, v2, T_SZ_CHAIN);
+ }
+ 
+ static __attribute__((noinline)) uint8_t *REGVM_CC
+@@ -25693,6 +26014,10 @@
+     }
+     if (unlikely(JS_IsException(v1)))
+         T_FAIL();
++#if QJS_DRC
++    FR(d1) = v1;
++    REG_ADOPT(ctx->rt, v1);
++#else
+     old1 = FR(d1);
+     FR(d1) = v1;
+     if (unlikely(REGVM_HAS_COUNT(old1)) &&
+@@ -25700,6 +26025,7 @@
+         f->set_v = old1;
+         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
+     }
++#endif
+     __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
+ }
+ 
+@@ -25715,6 +26041,9 @@
+     if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r1),
+                                      site1, &v1)))
+         __attribute__((musttail)) return regvm_t_get_field_chain_slow(REGVM_PASS);
++#if QJS_DRC
++    FR(d1) = v1;
++#else
+     old1 = FR(d1);
+     FR(d1) = v1;
+     if (unlikely(REGVM_HAS_COUNT(old1)) &&
+@@ -25722,10 +26051,11 @@
+         f->set_v = old1;
+         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
+     }
++#endif
+     if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1),
+                                      site2, &v2)))
+         __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
+-    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++    T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
+@@ -25745,13 +26075,18 @@
+             if (likely(JS_VALUE_GET_TAG(v1) >= 0)) {
+                 goto have_v1;
+             } else if (likely(JS_VALUE_GET_TAG(v1) != JS_TAG_LAZY_JSON)) {
++#if !QJS_DRC
+                 JS_REF_COUNT(JS_VALUE_GET_PTR(v1))++;
++#endif
+                 goto have_v1;
+             }
+         }
+     }
+     __attribute__((musttail)) return regvm_t_get_field_chain_slow(REGVM_PASS);
+  have_v1:
++#if QJS_DRC
++    FR(d1) = v1;
++#else
+     old1 = FR(d1);
+     FR(d1) = v1;
+     if (unlikely(REGVM_HAS_COUNT(old1)) &&
+@@ -25759,6 +26094,7 @@
+         f->set_v = old1;
+         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
+     }
++#endif
+     {
+         JSValue r = FR(d1);
+         if (likely(JS_VALUE_GET_TAG(r) == JS_TAG_OBJECT)) {
+@@ -25767,10 +26103,12 @@
+             if (likely(e->shape == p->shape)) {
+                 v2 = *(JSValue *)((char *)p->prop + e->slot_off);
+                 if (likely(JS_VALUE_GET_TAG(v2) >= 0)) {
+-                    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++                    T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
+                 } else if (likely(JS_VALUE_GET_TAG(v2) != JS_TAG_LAZY_JSON)) {
++#if !QJS_DRC
+                     JS_REF_COUNT(JS_VALUE_GET_PTR(v2))++;
+-                    T_SET_NEXT(d2, v2, T_SZ_CHAIN);
++#endif
++                    T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
+                 }
+             }
+         }
+@@ -25790,16 +26128,27 @@
+  */
+ static inline void regvm_store_intermediate(JSRuntime *rt, JSValue *slot, JSValue v)
+ {
++#if QJS_DRC
++    /* Registers do not own, so a plain store is the whole operation. */
++    *slot = v;
++    (void)rt;
++#else
+     JSValue old = *slot;
+ 
+     *slot = v;
+     if (unlikely(REGVM_HAS_COUNT(old)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0))
+         js_free_value_rt(rt, old);
++#endif
+ }
+ 
+ static inline void regvm_store_intermediate_f64(JSRuntime *rt, JSValue *slot, double r)
+ {
++#if QJS_DRC
++    slot->u.float64 = r;
++    slot->tag = JS_TAG_FLOAT64;
++    (void)rt;
++#else
+     int64_t ot = slot->tag;
+     JSValue old;
+ 
+@@ -25810,6 +26159,7 @@
+     if (unlikely(ot < 0) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0))
+         js_free_value_rt(rt, old);
++#endif
+ }
+ 
+ /*
+@@ -25859,7 +26209,7 @@
+                 js_regvm_binary(ctx, sub2, FR(dm), FR(c), &r)) \
+                 T_FAIL(); \
+         } \
+-        T_SET_NEXT(da, r, T_SZ_RRRRR); \
++        T_SET_NEXT_P(da, r, T_SZ_RRRRR); \
+     } \
+     static uint8_t *REGVM_CC regvm_t_##name(REGVM_ARGS) \
+     { \
+@@ -25880,7 +26230,7 @@
+             (rev ? likely(regvm_num_fast(sub2, FR(c), t, &r)) \
+                  : likely(regvm_num_fast(sub2, t, FR(c), &r)))) { \
+             regvm_store_intermediate(ctx->rt, &FR(dm), t); \
+-            T_SET_NEXT(da, r, T_SZ_RRRRR); \
++            T_SET_NEXT_P(da, r, T_SZ_RRRRR); \
+         } \
+         __attribute__((musttail)) return regvm_t_##name##_slow(REGVM_PASS); \
+     }
+@@ -26193,7 +26543,7 @@
+     if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+         js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+         T_FAIL();
+-    T_SET_NEXT(d, out, T_SZ_RIT + off);
++    T_SET_NEXT_P(d, out, T_SZ_RIT + off);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch(REGVM_ARGS)
+@@ -26228,7 +26578,7 @@
+     if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+         js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+         T_FAIL();
+-    T_SET_NEXT(d, out, T_SZ_RIT_S + off);
++    T_SET_NEXT_P(d, out, T_SZ_RIT_S + off);
+ }
+ 
+ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s(REGVM_ARGS)
+@@ -26342,6 +26692,7 @@
+     JSObject     *p;
+     JSVarRef    **var_refs;
+     JSValue      *arg_buf, *var_buf;
++    int           arg_owned;    /* caller's argument window owns its slots */
+     JSValueConst  func_obj, this_obj, new_target;
+     JSValue      *argv;
+     int           argc;
+@@ -26409,7 +26760,14 @@
+             if (sf->var_refs[i])
+                 JS_REF_COUNT(sf->var_refs[i])++;
+     }
++#if QJS_DRC
++    /* Registers do not own their values, so the walk stops at the register
++       file: the argument copies and the variable area are the only owned
++       storage the frame has. */
++    end = regs;
++#else
+     end = regs + b->regvm_reg_count + REGVM_HS - 1;
++#endif
+     for (pval = local_buf; pval < end; pval++)
+         JS_FreeValueRT(rt, *pval);
+     if (unlikely(sf->var_ref_count != 0))
+@@ -26741,18 +27099,28 @@
+      * walk: they start at var_buf when the arguments are borrowed, so the frame
+      * frees only what it owns.
+      */
+-    if (na >= cb->arg_count) {
++    if (regvm_args_borrowable(cb, na)) {
+         rec->arg_buf = (JSValue *)oargv;
+         rec->arg_owned = 0;
+         rec->local_buf = lay->var_buf;
++#if QJS_DRC
++        /* Registers do not own, so the release walk stops at the register
++           file; only the variable area (and owned argument copies) is freed. */
++        rec->local_count = cb->var_count;
++#else
+         rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
++#endif
+         sf->arg_count = na;
+     } else {
+         rec->arg_buf = lay->arg_buf;
+         rec->arg_owned = 1;
+         rec->local_buf = lay->arg_buf;
++#if QJS_DRC
++        rec->local_count = slots + cb->var_count;
++#else
+         rec->local_count = slots + cb->var_count + cb->regvm_reg_count
+             + REGVM_HS - 1;
++#endif
+         for (k = 0; k < slots; k++)
+             lay->arg_buf[k] = (k < na) ? js_dup(oargv[k]) : JS_UNDEFINED;
+         sf->arg_count = slots;
+@@ -26851,6 +27219,10 @@
+     JSValue *local_buf = ast->local_buf, *arg_buf = ast->arg_buf;
+     JSValue *var_buf = ast->var_buf, *stack_buf = ast->stack_buf;
+     int flags = ast->flags;
++    /* a coroutine frame is resumed with argv == its own heap arg_buf, which
++       async_func_init filled with owned references */
++    int arg_owned = (arg_buf != (JSValue *)argv) ||
++                    (flags & JS_CALL_FLAG_GENERATOR);
+     int regvm_throw_pending = ast->throw_pending;
+     JSValue *regs;
+     uint8_t *pc = ast->pc;
+@@ -26869,6 +27241,15 @@
+     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+     JSVarRef **var_refs = p->u.func.var_refs;
+     JSValue *regs;
++    /* Does this frame's argument window own its slots? It borrows them when
++       they are the caller's outgoing registers (arg_buf == argv) and owns
++       them when JS_CallInternal copied the arguments into local_buf. Nested
++       in-loop frames always own, and both the flag and the pointer are saved
++       and restored across them. A coroutine frame is resumed with argv ==
++       its own heap arg_buf, which async_func_init filled with owned
++       references, so it owns too. */
++    int arg_owned = (arg_buf != (JSValue *)argv) ||
++                    (flags & JS_CALL_FLAG_GENERATOR);
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *pval;
+     int i;
+@@ -26954,7 +27335,7 @@
+         run.fr = regs;
+         run.local_buf = local_buf;
+         run.local_count = 0;
+-        run.arg_owned = 0;
++        run.arg_owned = arg_owned;
+         REGVM_T_CHECK_SIZES();
+ #endif
+ /*
+@@ -26983,7 +27364,15 @@
+          * value's reference in the register. Without this the reference is
+          * stranded, which shows up as a leaked object when the runtime is freed.
+          */
+-#define SET_REG(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
++#if QJS_DRC
++/* Registers no longer own: a store is a plain assignment, and an owned value
++   is adopted by dropping the producer's reference. */
++#define SET_REG_B(d, v) do { regs[d] = (v); } while (0)
++#define SET_REG_P(d, v) do { JSValue _nv = (v); regs[d] = _nv; REG_ADOPT(ctx->rt, _nv); } while (0)
++#else
++#define SET_REG_B(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = js_dup(v); } while (0)
++#define SET_REG_P(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
++#endif
+ 
+ #define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
+          * Leave the frame for the engine. The continuation is the register pc
+@@ -26992,9 +27381,32 @@
+          * resting sp is past the handshake slots. The caller owns the state.
+          */
+ #define REGVM_SUSPEND(code_) do { \
++        JSValue _sus_code = (code_); \
++        /* A yield/await parks the frame: the register window must own its \
++           values while it is off the C stack, so dup them all. A return \
++           hands the frame back to the engine to be finished, so the window \
++           keeps borrowing and async_func_free must not release it. */ \
++        sf->rv_owns_regs = (JS_VALUE_GET_TAG(_sus_code) == JS_TAG_INT); \
++        if (sf->rv_owns_regs) \
++            js_regvm_drc_suspend(ctx->rt, regs, \
++                                 (uint32_t)(b->regvm_reg_count + REGVM_HS - 1)); \
+         REGVM_SLOT(0) = js_int32(regvm_nctl); \
+         sp = regs + b->regvm_reg_count + REGVM_HS - 1; \
+-        ret_val = (code_); \
++        ret_val = _sus_code; \
++        goto done_generator; \
++    } while (0)
++
++/* The initial yield also parks the frame, and parameter defaults (and other
++   pre-body code) can already have left live values in the registers, so it
++   must own the register window even though it hands over JS_UNDEFINED. */
++#define REGVM_SUSPEND_OWN(code_) do { \
++        JSValue _sus_code = (code_); \
++        sf->rv_owns_regs = 1; \
++        js_regvm_drc_suspend(ctx->rt, regs, \
++                             (uint32_t)(b->regvm_reg_count + REGVM_HS - 1)); \
++        REGVM_SLOT(0) = js_int32(regvm_nctl); \
++        sp = regs + b->regvm_reg_count + REGVM_HS - 1; \
++        ret_val = _sus_code; \
+         goto done_generator; \
+     } while (0)
+ 
+@@ -27046,6 +27458,17 @@
+             regvm_nctl = 0;
+             regvm_resume_marker = NULL;
+         } else {
++            /* a coroutine resume: if the suspension made the register window
++               own its values (a yield or await), give them back to the
++               borrowing regime. The initial yield parks the frame without
++               owning -- there is nothing to give back -- so the adopt is
++               conditional. The handshake slot cur_sp[-1] (REGVM_SLOT(1)) is
++               excluded: the engine just stored the resume argument there and
++               the yield arm adopts that one itself. */
++            if (sf->rv_owns_regs)
++                js_regvm_drc_resume(ctx->rt, regs,
++                                    (uint32_t)(b->regvm_reg_count + 1));
++            sf->rv_owns_regs = 0;
+             regvm_resume_marker = sf->cur_pc;
+             rpc = regvm_resume_marker;
+             /* the marker is ours now; sf->cur_pc must never hold a register pc
+@@ -27351,7 +27774,7 @@
+             if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_) && \
+                 js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
+                 goto exception; \
+-            SET_REG(d_, out_); \
++            SET_REG_P(d_, out_); \
+             REGVM_NEXT(); \
+         } while (0)
+ /* The same for the unary set: the kind is a literal, so the numeric cases fold
+@@ -27363,7 +27786,7 @@
+             if (!regvm_unary_num_fast(SUB_, regs[s_], &out_) && \
+                 js_regvm_unary(ctx, SUB_, regs[s_], &out_)) \
+                 goto exception; \
+-            SET_REG(d_, out_); \
++            SET_REG_P(d_, out_); \
+             REGVM_NEXT(); \
+         } while (0)
+ #if QJS_REGVM_INLOOP_CALL
+@@ -27389,6 +27812,7 @@
+         run.nctl = regvm_nctl; \
+         run.arg_buf = arg_buf; \
+         run.var_buf = var_buf; \
++        run.arg_owned = arg_owned; \
+         run.ret = JS_UNDEFINED; \
+         run.set_v = JS_UNDEFINED; \
+     } while (0)
+@@ -27437,6 +27861,7 @@
+         var_refs = (H_)->var_refs; \
+         arg_buf = (H_)->arg_buf; \
+         var_buf = (H_)->var_buf; \
++        arg_owned = (H_)->arg_owned; \
+         func_obj = (H_)->func_obj; \
+         this_obj = (H_)->this_obj; \
+         new_target = (H_)->new_target; \
+@@ -27504,6 +27929,7 @@
+                         _h->var_refs = var_refs; \
+                         _h->arg_buf = arg_buf; \
+                         _h->var_buf = var_buf; \
++                        _h->arg_owned = arg_owned; \
+                         _h->func_obj = func_obj; \
+                         _h->this_obj = this_obj; \
+                         _h->new_target = new_target; \
+@@ -27544,6 +27970,7 @@
+                         var_refs = _co->u.func.var_refs; \
+                         local_buf = _lay.arg_buf; \
+                         arg_buf = _lay.arg_buf; \
++                        arg_owned = 1; /* the in-loop callee's slots are dup'd */ \
+                         var_buf = _lay.var_buf; \
+                         regs = _lay.regs; \
+                         regvm_ctl = _lay.ctl; \
+@@ -27649,28 +28076,30 @@
+         }
+         REGVM_NEXT();
+             L_ROP_load_i8:
+-                { int d = RD_REG(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
++                { int d = RD_REG(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i8_s:
+-                { int d = RD_REG8(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
++                { int d = RD_REG8(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i32:
+-                { int d = RD_REG(); SET_REG(d, js_int32(RD_I32())); REGVM_NEXT(); }
++                { int d = RD_REG(); SET_REG_P(d, js_int32(RD_I32())); REGVM_NEXT(); }
+             L_ROP_load_bigint_i32:
+-                { int d = RD_REG(); SET_REG(d, __JS_NewShortBigInt(ctx, RD_I32())); REGVM_NEXT(); }
++                { int d = RD_REG(); SET_REG_P(d, __JS_NewShortBigInt(ctx, RD_I32())); REGVM_NEXT(); }
+             L_ROP_private_symbol: {
+                 int d = RD_REG();
+                 JSAtom atom = RD_U32();
+                 JSValue sym = JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE);
+                 if (JS_IsException(sym))
+                     goto exception;
+-                SET_REG(d, sym);
++                SET_REG_P(d, sym);
+                 REGVM_NEXT();
+             }
+             L_ROP_load_const: {
+                 int d = RD_REG();
+                 int kind = RD_U8();
+                 uint32_t idx = RD_U32();
+-                SET_REG(d, (kind == REG_CONST_CPOOL) ? js_dup(b->cpool[idx])
+-                                                     : JS_AtomToValue(ctx, idx));
++                if (kind == REG_CONST_CPOOL)
++                    SET_REG_B(d, b->cpool[idx]);
++                else
++                    SET_REG_P(d, JS_AtomToValue(ctx, idx));
+                 REGVM_NEXT();
+             }
+             /*
+@@ -27698,12 +28127,12 @@
+                         tag == JS_TAG_SYMBOL) {
+                         /* already a key: a self-copy is a no-op */
+                         if (d != src)
+-                            SET_REG(d, js_dup(v));
++                            SET_REG_B(d, v);
+                     } else {
+                         JSValue key = JS_ToPropertyKey(ctx, v);
+                         if (JS_IsException(key))
+                             goto exception;
+-                        SET_REG(d, key);
++                        SET_REG_P(d, key);
+                     }
+                 }
+                 REGVM_NEXT();
+@@ -27727,13 +28156,13 @@
+                 JS_FreeAtom(ctx, atom);
+                 if (unlikely(ret < 0))
+                     goto exception;
+-                SET_REG(d, js_bool(ret));
++                SET_REG_P(d, js_bool(ret));
+                 REGVM_NEXT();
+             }
+-            L_ROP_load_undefined: { int d = RD_REG(); SET_REG(d, JS_UNDEFINED); REGVM_NEXT(); }
+-            L_ROP_load_null:      { int d = RD_REG(); SET_REG(d, JS_NULL); REGVM_NEXT(); }
+-            L_ROP_load_true:      { int d = RD_REG(); SET_REG(d, JS_TRUE); REGVM_NEXT(); }
+-            L_ROP_load_false:     { int d = RD_REG(); SET_REG(d, JS_FALSE); REGVM_NEXT(); }
++            L_ROP_load_undefined: { int d = RD_REG(); SET_REG_P(d, JS_UNDEFINED); REGVM_NEXT(); }
++            L_ROP_load_null:      { int d = RD_REG(); SET_REG_P(d, JS_NULL); REGVM_NEXT(); }
++            L_ROP_load_true:      { int d = RD_REG(); SET_REG_P(d, JS_TRUE); REGVM_NEXT(); }
++            L_ROP_load_false:     { int d = RD_REG(); SET_REG_P(d, JS_FALSE); REGVM_NEXT(); }
+             L_ROP_load_this: {
+                 /*
+                  * A non-strict function's `this` is coerced on the way in:
+@@ -27757,47 +28186,66 @@
+                 } else {
+                     val = js_dup(this_obj);
+                 }
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_move_xfer:
+                 /* The source is dead here: move its reference rather than
+-                   duplicating it, and empty the source's register. */
++                   duplicating it, and empty the source's register. Under
++                   deferred RC the register only borrows, so this is a plain
++                   copy and nothing is released. */
+                 { int d = RD_REG(); int s = RD_REG();
+                   if (d != s) {
++#if QJS_DRC
++                      regs[d] = regs[s];
++                      regs[s] = JS_UNDEFINED;
++#else
+                       set_value(ctx, &regs[d], regs[s]);
+                       regs[s] = JS_UNDEFINED;
++#endif
+                   } REGVM_NEXT(); }
+             L_ROP_move:
+                 /* A self-move is a no-op: the allocator coalesces a move's
+                    destination onto its source, and duplicating there would
+                    strand a reference. */
+                 { int d = RD_REG(); int s = RD_REG();
+-                  if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
++                  if (d != s) SET_REG_B(d,regs[s]); REGVM_NEXT(); }
+             L_ROP_move_s:
+                 { int d = RD_REG8(); int s = RD_REG8();
+-                  if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
++                  if (d != s) SET_REG_B(d,regs[s]); REGVM_NEXT(); }
+             L_ROP_get_local:
+                 { int d = RD_REG(); int slot = RD_U16();
+ #ifdef QJS_REGVM_COUNT
+                   js_regvm_slot[slot < 16 ? slot : 16]++;
+ #endif
+-                  SET_REG(d, js_dup(var_buf[slot])); REGVM_NEXT(); }
++                  SET_REG_B(d,var_buf[slot]); REGVM_NEXT(); }
+             L_ROP_get_local_s0: L_ROP_get_local_s1:
+             L_ROP_get_local_s2: L_ROP_get_local_s3:
+                 { int d = RD_REG();
+-                  SET_REG(d, js_dup(var_buf[op - ROP_get_local_s0])); REGVM_NEXT(); }
++                  SET_REG_B(d,var_buf[op - ROP_get_local_s0]); REGVM_NEXT(); }
+             L_ROP_put_local_xfer:
+                 /* The source is dead here: the binding takes its reference, as
+-                   the stack interpreter's put transfers the value it popped. */
++                   the stack interpreter's put transfers the value it popped.
++                   Under deferred RC the register only borrows, so the binding
++                   duplicates it. */
+                 { int slot = RD_U16(); int s = RD_REG();
++#if QJS_DRC
++                  set_value(ctx, &var_buf[slot], js_dup(regs[s]));
++#else
+                   set_value(ctx, &var_buf[slot], regs[s]);
+-                  regs[s] = JS_UNDEFINED; REGVM_NEXT(); }
++                  regs[s] = JS_UNDEFINED;
++#endif
++                  REGVM_NEXT(); }
+             L_ROP_put_local_xfer_s0: L_ROP_put_local_xfer_s1:
+             L_ROP_put_local_xfer_s2: L_ROP_put_local_xfer_s3:
+                 { int slot = op - ROP_put_local_xfer_s0; int s = RD_REG();
++#if QJS_DRC
++                  set_value(ctx, &var_buf[slot], js_dup(regs[s]));
++#else
+                   set_value(ctx, &var_buf[slot], regs[s]);
+-                  regs[s] = JS_UNDEFINED; REGVM_NEXT(); }
++                  regs[s] = JS_UNDEFINED;
++#endif
++                  REGVM_NEXT(); }
+             L_ROP_local_rmw_imm:
+                 /* `slot = slot <subop> imm`, the generic operation, so a string
+                    local still concatenates. The slot is borrowed (js_regvm_binary
+@@ -27988,17 +28436,28 @@
+                 { int slot = op - ROP_put_local_s0; int s = RD_REG();
+                   set_value(ctx, &var_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
+             L_ROP_get_arg:
+-                { int d = RD_REG(); int slot = RD_U16(); SET_REG(d, js_dup(arg_buf[slot])); REGVM_NEXT(); }
++                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,arg_buf[slot]); REGVM_NEXT(); }
+             L_ROP_put_arg_xfer:
+                 { int slot = RD_U16(); int s = RD_REG();
++#if QJS_DRC
++                  regvm_put_arg(ctx, arg_buf, arg_owned, slot, regs[s]);
++                  regs[s] = JS_UNDEFINED;
++#else
+                   set_value(ctx, &arg_buf[slot], regs[s]);
+-                  regs[s] = JS_UNDEFINED; REGVM_NEXT(); }
++                  regs[s] = JS_UNDEFINED;
++#endif
++                  REGVM_NEXT(); }
+             L_ROP_put_arg:
+                 { int slot = RD_U16(); int s = RD_REG();
+-                  set_value(ctx, &arg_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
++#if QJS_DRC
++                  regvm_put_arg(ctx, arg_buf, arg_owned, slot, regs[s]);
++#else
++                  set_value(ctx, &arg_buf[slot], js_dup(regs[s]));
++#endif
++                  REGVM_NEXT(); }
+             L_ROP_get_var_ref:
+                 { int d = RD_REG(); int slot = RD_U16();
+-                  SET_REG(d, js_dup(*var_refs[slot]->pvalue)); REGVM_NEXT(); }
++                  SET_REG_B(d,*var_refs[slot]->pvalue); REGVM_NEXT(); }
+             L_ROP_put_var_ref:
+                 { int slot = RD_U16(); int s = RD_REG();
+                   set_value(ctx, var_refs[slot]->pvalue, js_dup(regs[s])); REGVM_NEXT(); }
+@@ -28077,13 +28536,13 @@
+                  * remaining per-dispatch engine call.
+                  */
+                 if (likely(js_gv_cell_probe(ctx, atom, &val))) {
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+                 val = JS_GetGlobalVar(ctx, atom, throwing);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_put_global: {
+@@ -28101,7 +28560,7 @@
+                 JSValue cl = js_closure(ctx, bfunc, var_refs, sf);
+                 if (JS_IsException(cl))
+                     goto exception;
+-                SET_REG(d, cl);
++                SET_REG_P(d, cl);
+                 REGVM_NEXT();
+             }
+             L_ROP_new_object: {
+@@ -28109,7 +28568,7 @@
+                 JSValue val = JS_NewObject(ctx);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_rest: {
+@@ -28120,14 +28579,19 @@
+                 JSValue val = js_create_array(ctx, n2, n2 ? &argv[i2] : NULL);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_throw: {
+                 int s = RD_REG();
+                 JSValue v = regs[s];
+                 regs[s] = JS_UNDEFINED;
++#if QJS_DRC
++                /* The register only borrows; JS_Throw takes ownership. */
++                JS_Throw(ctx, js_dup(v));
++#else
+                 JS_Throw(ctx, v);
++#endif
+                 goto exception;
+             }
+             L_ROP_throw_error: {
+@@ -28159,7 +28623,7 @@
+                 val = js_new_object_from_template(ctx, &b->objlit_tab[index]);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -28179,7 +28643,7 @@
+                 JSValue recv = var_buf[slot];
+                 JSValue val;
+                 if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
+-                    SET_REG(d, val);
++                    SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+                 if (site == REG_IC_NONE)
+@@ -28188,7 +28652,7 @@
+                     val = regvm_get_field_ic(ctx, b, &pic, recv, atom, site);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_get_local_field:
+@@ -28201,7 +28665,7 @@
+                                                           : arg_buf[slot];
+                 JSValue val;
+                 if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
+-                    SET_REG(d, val);
++                    SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+                 if (site == REG_IC_NONE)
+@@ -28210,7 +28674,7 @@
+                     val = regvm_get_field_ic(ctx, b, &pic, recv, atom, site);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_get_field: {
+@@ -28225,7 +28689,7 @@
+                 js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
+ #endif
+                 if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+-                    SET_REG(d, val);
++                    SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+                 if (site == REG_IC_NONE) {
+@@ -28236,7 +28700,7 @@
+                 }
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_get_field2: {
+@@ -28246,7 +28710,7 @@
+                 int site = RD_U16();
+                 JSValue val;
+                 if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+-                    SET_REG(d, val);
++                    SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+                 if (site == REG_IC_NONE) {
+@@ -28256,7 +28720,7 @@
+                 }
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_get_field_chain: {
+@@ -28273,10 +28737,11 @@
+                 JSAtom atom2 = RD_U32();
+                 int site2 = RD_U16();
+                 JSValue v1, v2;
++                int own1 = 1, own2 = 1;
+                 (void)r2;
+                 if (site1 != REG_IC_NONE &&
+                     regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
+-                    /* hit */
++                    own1 = 0;
+                 } else if (site1 == REG_IC_NONE) {
+                     v1 = JS_GetProperty(ctx, regs[r1], atom1);
+                 } else {
+@@ -28284,10 +28749,17 @@
+                 }
+                 if (JS_IsException(v1))
+                     goto exception;
+-                SET_REG(d1, v1);
++#if QJS_DRC
++                SET_REG_B(d1, v1);
++                if (own1)
++                    REG_ADOPT(ctx->rt, v1);
++#else
++                SET_REG_P(d1, v1);
++                (void)own1;
++#endif
+                 if (site2 != REG_IC_NONE &&
+                     regvm_own_read_hit(pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
+-                    /* hit */
++                    own2 = 0;
+                 } else if (site2 == REG_IC_NONE) {
+                     v2 = JS_GetProperty(ctx, regs[d1], atom2);
+                 } else {
+@@ -28295,7 +28767,14 @@
+                 }
+                 if (JS_IsException(v2))
+                     goto exception;
+-                SET_REG(d2, v2);
++#if QJS_DRC
++                SET_REG_B(d2, v2);
++                if (own2)
++                    REG_ADOPT(ctx->rt, v2);
++#else
++                SET_REG_P(d2, v2);
++                (void)own2;
++#endif
+                 REGVM_NEXT();
+             }
+             L_ROP_mul_add: {
+@@ -28308,11 +28787,11 @@
+                 if (!regvm_num_fast(REG_BIN_MUL, regs[x_], regs[y_], &t_) &&
+                     js_regvm_binary(ctx, REG_BIN_MUL, regs[x_], regs[y_], &t_))
+                     goto exception;
+-                SET_REG(dm_, t_);
++                SET_REG_P(dm_, t_);
+                 if (!regvm_num_fast(REG_BIN_ADD, regs[dm_], regs[c_], &r_) &&
+                     js_regvm_binary(ctx, REG_BIN_ADD, regs[dm_], regs[c_], &r_))
+                     goto exception;
+-                SET_REG(da_, r_);
++                SET_REG_P(da_, r_);
+                 REGVM_NEXT();
+             }
+             L_ROP_mul_sub: {
+@@ -28325,11 +28804,11 @@
+                 if (!regvm_num_fast(REG_BIN_MUL, regs[x_], regs[y_], &t_) &&
+                     js_regvm_binary(ctx, REG_BIN_MUL, regs[x_], regs[y_], &t_))
+                     goto exception;
+-                SET_REG(dm_, t_);
++                SET_REG_P(dm_, t_);
+                 if (!regvm_num_fast(REG_BIN_SUB, regs[dm_], regs[c_], &r_) &&
+                     js_regvm_binary(ctx, REG_BIN_SUB, regs[dm_], regs[c_], &r_))
+                     goto exception;
+-                SET_REG(da_, r_);
++                SET_REG_P(da_, r_);
+                 REGVM_NEXT();
+             }
+             L_ROP_add_mul: {
+@@ -28342,11 +28821,11 @@
+                 if (!regvm_num_fast(REG_BIN_MUL, regs[x_], regs[y_], &t_) &&
+                     js_regvm_binary(ctx, REG_BIN_MUL, regs[x_], regs[y_], &t_))
+                     goto exception;
+-                SET_REG(dm_, t_);
++                SET_REG_P(dm_, t_);
+                 if (!regvm_num_fast(REG_BIN_ADD, regs[c_], regs[dm_], &r_) &&
+                     js_regvm_binary(ctx, REG_BIN_ADD, regs[c_], regs[dm_], &r_))
+                     goto exception;
+-                SET_REG(da_, r_);
++                SET_REG_P(da_, r_);
+                 REGVM_NEXT();
+             }
+             L_ROP_sub_mul: {
+@@ -28359,11 +28838,11 @@
+                 if (!regvm_num_fast(REG_BIN_MUL, regs[x_], regs[y_], &t_) &&
+                     js_regvm_binary(ctx, REG_BIN_MUL, regs[x_], regs[y_], &t_))
+                     goto exception;
+-                SET_REG(dm_, t_);
++                SET_REG_P(dm_, t_);
+                 if (!regvm_num_fast(REG_BIN_SUB, regs[c_], regs[dm_], &r_) &&
+                     js_regvm_binary(ctx, REG_BIN_SUB, regs[c_], regs[dm_], &r_))
+                     goto exception;
+-                SET_REG(da_, r_);
++                SET_REG_P(da_, r_);
+                 REGVM_NEXT();
+             }
+             L_ROP_put_field: {
+@@ -28415,11 +28894,19 @@
+                 int r = RD_REG();
+                 JSAtom atom = RD_U32();
+                 int v = RD_REG();
++#if QJS_DRC
++                /* The register only borrows the value, so the property has to
++                   take its own reference; there is nothing to empty. */
++                if (JS_SetPropertyInternal2(ctx, regs[r], atom, js_dup(regs[v]),
++                                            regs[r], JS_PROP_THROW_STRICT) < 0)
++                    goto exception;
++#else
+                 JSValue val = regs[v];
+                 regs[v] = JS_UNDEFINED;
+                 if (JS_SetPropertyInternal2(ctx, regs[r], atom, val,
+                                             regs[r], JS_PROP_THROW_STRICT) < 0)
+                     goto exception;
++#endif
+                 REGVM_NEXT();
+             }
+             /*
+@@ -28487,7 +28974,7 @@
+                 }
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_put_element: {
+@@ -28510,11 +28997,19 @@
+                 int o = RD_REG();
+                 int key = RD_REG();
+                 int v = RD_REG();
++#if QJS_DRC
++                /* The register only borrows; the container takes its own
++                   reference and the source is not emptied. */
++                if (JS_SetPropertyValue(ctx, regs[o], js_dup(regs[key]),
++                                        js_dup(regs[v]), JS_PROP_THROW_STRICT) < 0)
++                    goto exception;
++#else
+                 JSValue val = regs[v];
+                 regs[v] = JS_UNDEFINED;
+                 if (JS_SetPropertyValue(ctx, regs[o], js_dup(regs[key]),
+                                         val, JS_PROP_THROW_STRICT) < 0)
+                     goto exception;
++#endif
+                 REGVM_NEXT();
+             }
+             /* Definitions consume the copied value; source registers retain
+@@ -28561,8 +29056,16 @@
+                     if (likely(!po->is_exotic && po->shape == tpl->shape &&
+                                (int)tpl->prop_count == n)) {
+                         for (i2 = 0; i2 < n; i2++) {
++#if QJS_DRC
++                            /* The register only borrows its value: the property
++                               has to take its own reference. Clearing the
++                               register releases nothing. */
++                            set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
++                            vals[i2] = JS_UNDEFINED;
++#else
+                             set_value(ctx, &po->prop[i2].u.value, vals[i2]);
+                             vals[i2] = JS_UNDEFINED;
++#endif
+                         }
+                         REGVM_NEXT();
+                     }
+@@ -28570,6 +29073,17 @@
+                 for (i2 = 0; i2 < n; i2++) {
+                     JSValue v2 = vals[i2];
+                     vals[i2] = JS_UNDEFINED;
++#if QJS_DRC
++                    /* Owned transfer: duplicate the borrowed register value so
++                       the property takes its own reference. */
++                    if (JS_DefinePropertyValue(ctx, regs[o],
++                                               js_objlit_template_atom(tpl, i2), js_dup(v2),
++                                               JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
++                        for (i2 = i2 + 1; i2 < n; i2++)
++                            vals[i2] = JS_UNDEFINED;
++                        goto exception;
++                    }
++#else
+                     if (JS_DefinePropertyValue(ctx, regs[o],
+                                                js_objlit_template_atom(tpl, i2), v2,
+                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+@@ -28579,6 +29093,7 @@
+                         }
+                         goto exception;
+                     }
++#endif
+                 }
+                 REGVM_NEXT();
+             }
+@@ -28624,8 +29139,13 @@
+                 JSValue *sp = &regs[pw + 2];
+                 (void)bw;
+                 if (js_op_define_class(ctx, sp, atom, flags, var_refs, sf,
+-                                       false) < 0)
++                                       false, true) < 0)
+                     goto exception;
++#if QJS_DRC
++                /* the helper returns owned ctor/proto; a register only borrows */
++                REG_ADOPT(ctx->rt, sp[-2]);
++                REG_ADOPT(ctx->rt, sp[-1]);
++#endif
+                 REGVM_NEXT();
+             }
+             L_ROP_define_class_computed: {
+@@ -28637,8 +29157,12 @@
+                 (void)pw;
+                 (void)bw;
+                 if (js_op_define_class(ctx, sp, JS_ATOM_NULL, flags, var_refs, sf,
+-                                       true) < 0)
++                                       true, true) < 0)
+                     goto exception;
++#if QJS_DRC
++                REG_ADOPT(ctx->rt, sp[-2]);
++                REG_ADOPT(ctx->rt, sp[-1]);
++#endif
+                 REGVM_NEXT();
+             }
+             L_ROP_define_method:
+@@ -28715,7 +29239,7 @@
+                 JSValue proto = JS_GetPrototype(ctx, old);
+                 if (JS_IsException(proto))
+                     goto exception;
+-                SET_REG(d, proto);
++                SET_REG_P(d, proto);
+                 REGVM_NEXT();
+             }
+             L_ROP_check_ctor:
+@@ -28740,7 +29264,7 @@
+                 JS_FreeValue(ctx, super);
+                 if (JS_IsException(ret))
+                     goto exception;
+-                SET_REG(d, ret);
++                SET_REG_P(d, ret);
+                 REGVM_NEXT();
+             }
+             L_ROP_check_ctor_return: {
+@@ -28752,9 +29276,9 @@
+                             "derived class constructor must return an object or undefined");
+                         goto exception;
+                     }
+-                    SET_REG(d, JS_TRUE);
++                    SET_REG_P(d, JS_TRUE);
+                 } else {
+-                    SET_REG(d, JS_FALSE);
++                    SET_REG_P(d, JS_FALSE);
+                 }
+                 REGVM_NEXT();
+             }
+@@ -28798,7 +29322,7 @@
+                  */
+                 if (regvm_nctl > 0 && regvm_ctl[regvm_nctl - 1].kind == REG_CTL_CATCH)
+                     --regvm_nctl;
+-                { JSValue v = js_dup(regs[src]); SET_REG(d, v); }
++                { JSValue v = js_dup(regs[src]); SET_REG_P(d, v); }
+                 REGVM_NEXT();
+             }
+             L_ROP_finally_enter: {
+@@ -28832,7 +29356,7 @@
+             }
+             L_ROP_iter_start: {
+                 int w = RD_REG();
+-                if (js_for_of_start(ctx, &regs[w + 1], false))
++                if (regvm_for_of_start(ctx, &regs[w + 1], false))
+                     goto exception;
+                 /* the helper left the iterator at the window base and the next
+                    method beside it */
+@@ -28852,7 +29376,7 @@
+                 int w = RD_REG();
+                 /* the same start as the synchronous loop, with the async
+                    flag: the helper wraps the iterator it is given */
+-                if (js_for_of_start(ctx, &regs[w + 1], true))
++                if (regvm_for_of_start(ctx, &regs[w + 1], true))
+                     goto exception;
+                 if (regvm_nctl >= b->regvm_ctl_count) {
+                     JS_ThrowInternalError(caller_ctx,
+@@ -28888,10 +29412,10 @@
+                     goto exception;
+                 /* the sources may be the destinations (the allocator reuses a
+                    dead register), so each is duplicated before any store */
+-                SET_REG(d0, js_dup(regs[ob]));
+-                SET_REG(d1, js_dup(regs[nx]));
+-                SET_REG(d2, js_dup(regs[co]));
+-                SET_REG(d3, ret_val);
++                SET_REG_B(d0,regs[ob]);
++                SET_REG_B(d1,regs[nx]);
++                SET_REG_B(d2,regs[co]);
++                SET_REG_P(d3, ret_val);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -28909,19 +29433,25 @@
+                 int d = RD_REG();
+                 if (ip == regvm_resume_marker) {
+                     regvm_resume_marker = NULL;
+-                    SET_REG(d, REGVM_SLOT(1));
++                    SET_REG_P(d, REGVM_SLOT(1));
+                     REGVM_SLOT(1) = JS_UNDEFINED;
+                     REGVM_NEXT();
+                 }
++#if QJS_DRC
++                /* SLOT(1) only borrows here (a fresh suspension); the
++                   suspend walk below takes the engine's reference. */
++                REGVM_SLOT(1) = regs[s];
++#else
+                 JS_FreeValue(ctx, REGVM_SLOT(1));
+                 REGVM_SLOT(1) = regs[s];
++#endif
+                 regs[s] = JS_UNDEFINED;
+                 pc = ip;
+                 REGVM_SUSPEND(js_int32(FUNC_RET_AWAIT));
+             }
+             L_ROP_iter_next:
+                 { int w = RD_REG();
+-                  if (js_for_of_next(ctx, &regs[w + 2], -2)) {
++                  if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
+                       regvm_ctl_iter_forget(ctx, regvm_ctl, &regvm_nctl);
+                       goto exception;
+                   }
+@@ -29017,7 +29547,7 @@
+                       JS_FreeValue(ctx, tmp[4]);
+                       goto exception;
+                   }
+-                  SET_REG(w + 3, tmp[3]);
++                  SET_REG_P(w + 3, tmp[3]);
+                   /*
+                    * On done the helper releases the iterator at sp[-4] and
+                    * writes nothing in its place. The temporary window owns
+@@ -29025,7 +29555,7 @@
+                    * live for any other aliases. The replacement result is at
+                    * sp[-1] and the done flag is at sp[0].
+                    */
+-                  SET_REG(w + 4, tmp[4]);
++                  SET_REG_P(w + 4, tmp[4]);
+                   if (JS_ToBool(ctx, tmp[4])) {
+                       /* the slot is cleared, so nothing is left to close */
+                       regvm_ctl_iter_forget(ctx, regvm_ctl, &regvm_nctl);
+@@ -29059,8 +29589,14 @@
+                     }
+                     if (JS_IsException(ret))
+                         goto exception;
++#if QJS_DRC
++                    /* sp[-1] is a register: it borrows, so do not release the
++                       old value; store the owned result and adopt it. */
++                    SET_REG_P(w + 3, ret);
++#else
+                     JS_FreeValue(ctx, sp[-1]);
+                     sp[-1] = ret;
++#endif
+                     ret_flag = false;
+                 }
+                 sp[0] = js_bool(ret_flag);
+@@ -29075,11 +29611,11 @@
+                   REGVM_NEXT(); }
+             L_ROP_for_in_start:
+                 { int w = RD_REG();
+-                  if (js_for_in_start(ctx, &regs[w + 1])) goto exception;
++                  if (regvm_for_in_start(ctx, &regs[w + 1])) goto exception;
+                   REGVM_NEXT(); }
+             L_ROP_for_in_next:
+                 { int w = RD_REG();
+-                  if (js_for_in_next(ctx, &regs[w + 1])) goto exception;
++                  if (regvm_for_in_next(ctx, &regs[w + 1])) goto exception;
+                   REGVM_NEXT(); }
+             L_ROP_append: {
+                 int w = RD_REG();
+@@ -29113,7 +29649,7 @@
+                 val = JS_GetPropertyValue(ctx, regs[o], js_dup(regs[k]));
+                 if (unlikely(JS_IsException(val)))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_put_ref_value: {
+@@ -29175,8 +29711,8 @@
+                 JSValue pair[2];
+                 if (unlikely(JS_GetGlobalVarRef(ctx, atom, pair)))
+                     goto exception;
+-                SET_REG(d0, pair[0]);
+-                SET_REG(d1, pair[1]);
++                SET_REG_P(d0, pair[0]);
++                SET_REG_P(d1, pair[1]);
+                 REGVM_NEXT();
+             }
+             L_ROP_make_local_ref: {
+@@ -29209,12 +29745,12 @@
+                     }
+                     pr->u.var_ref = var_ref;
+                 }
+-                SET_REG(d0, obj);
++                SET_REG_P(d0, obj);
+                 {
+                     JSValue name = JS_AtomToValue(ctx, atom);
+                     if (JS_IsException(name))
+                         goto exception;
+-                    SET_REG(d1, name);
++                    SET_REG_P(d1, name);
+                 }
+                 REGVM_NEXT();
+             }
+@@ -29246,7 +29782,7 @@
+                     }
+                     if (unlikely(JS_IsException(val)))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     rpc += off;
+                 }
+                 REGVM_NEXT();
+@@ -29278,7 +29814,7 @@
+                 } else {
+                     /* The fall-through result is another reference to value. */
+                     if (d != v)
+-                        SET_REG(d, js_dup(regs[v]));
++                        SET_REG_B(d,regs[v]);
+                 }
+                 REGVM_NEXT();
+             }
+@@ -29304,7 +29840,7 @@
+                     JSValue val;
+                     if (op == ROP_with_make_ref) {
+                         /* the property name itself, for a later get or put */
+-                        SET_REG(d0, js_dup(regs[o]));
++                        SET_REG_B(d0,regs[o]);
+                         val = JS_AtomToValue(ctx, atom);
+                         if (JS_IsException(val))
+                             goto exception;
+@@ -29313,10 +29849,10 @@
+                         if (JS_IsException(val))
+                             goto exception;
+                         /* get_ref_undef hands the method an undefined receiver */
+-                        SET_REG(d0, op == ROP_with_get_ref ? js_dup(regs[o])
++                        SET_REG_B(d0, op == ROP_with_get_ref ? regs[o]
+                                                           : JS_UNDEFINED);
+                     }
+-                    SET_REG(d1, val);
++                    SET_REG_P(d1, val);
+                     rpc += off;
+                 }
+                 REGVM_NEXT();
+@@ -29340,7 +29876,7 @@
+                 }
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_apply_eval: {
+@@ -29363,7 +29899,7 @@
+                 free_arg_list(ctx, tab, len);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_apply: {
+@@ -29377,7 +29913,7 @@
+                 ret_val = js_function_apply(ctx, sp[-3], 2, &sp[-2], magic);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_apply_arguments: {
+@@ -29398,7 +29934,7 @@
+                 }
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_add_brand: {
+@@ -29418,7 +29954,7 @@
+                 /* The helper reads the object and key, and consumes only the
+                    value copy. The original registers may have other aliases. */
+                 JSValue obj = js_dup(regs[o]);
+-                SET_REG(d, obj);
++                SET_REG_P(d, obj);
+                 if (unlikely(ret < 0))
+                     goto exception;
+                 REGVM_NEXT();
+@@ -29439,7 +29975,7 @@
+                 int ret = JS_DeleteGlobalVar(ctx, atom);
+                 if (unlikely(ret < 0))
+                     goto exception;
+-                SET_REG(d, js_bool(ret));
++                SET_REG_P(d, js_bool(ret));
+                 REGVM_NEXT();
+             }
+             L_ROP_get_private: {
+@@ -29449,7 +29985,7 @@
+                 JSValue val = JS_GetPrivateField(ctx, regs[o], regs[k]);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_get_arg_el: {
+@@ -29462,7 +29998,7 @@
+                         if (likely(i2 < (uint32_t)argc)) {
+                             v2 = js_dup(i2 < (uint32_t)b->arg_count ? arg_buf[i2]
+                                                                : argv[i2]);
+-                        SET_REG(d, v2);
++                        SET_REG_P(d, v2);
+                         REGVM_NEXT();
+                     }
+                 }
+@@ -29470,7 +30006,7 @@
+                                      sf, b->arg_count);
+                 if (JS_IsException(v2))
+                     goto exception;
+-                SET_REG(d, v2);
++                SET_REG_P(d, v2);
+                 REGVM_NEXT();
+             }
+             L_ROP_check_brand: {
+@@ -29492,7 +30028,7 @@
+                 JSValue pat = js_dup(regs[p2]), fl = js_dup(regs[f2]);
+                 /* The constructor consumes copies; the source registers can
+                    remain live through another alias. */
+-                SET_REG(d, js_regexp_constructor_internal(ctx, JS_UNDEFINED, pat, fl));
++                SET_REG_P(d, js_regexp_constructor_internal(ctx, JS_UNDEFINED, pat, fl));
+                 if (JS_IsException(regs[d]))
+                     goto exception;
+                 REGVM_NEXT();
+@@ -29512,7 +30048,7 @@
+                 JSValue val = JS_GetProperty(ctx, regs[r], JS_ATOM_length);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29534,7 +30070,7 @@
+                 JS_FreeAtom(ctx, atom);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29548,7 +30084,7 @@
+                 JSValue val = js_dynamic_import(ctx, regs[spec], regs[opts]);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+ 
+@@ -29560,7 +30096,7 @@
+              */
+             L_ROP_using_init:
+                 { int d = RD_REG();
+-                  SET_REG(d, JS_UNINITIALIZED);
++                  SET_REG_P(d, JS_UNINITIALIZED);
+                   REGVM_NEXT(); }
+             L_ROP_using_dispose: {
+                 int d = RD_REG();
+@@ -29588,18 +30124,18 @@
+                                                              error_state);
+                         JS_FreeValue(ctx, new_error);
+                         if (JS_IsException(se))
+-                            SET_REG(d, JS_GetException(ctx));
++                            SET_REG_P(d, JS_GetException(ctx));
+                         else
+-                            SET_REG(d, se);
++                            SET_REG_P(d, se);
+                     } else {
+-                        SET_REG(d, new_error);
++                        SET_REG_P(d, new_error);
+                     }
+                 }
+                 REGVM_NEXT();
+              passthrough:
+                 /* the state passes through, as it does on the stack side where
+                    the slot the handler reads is the slot it leaves */
+-                { JSValue v = js_dup(error_state); SET_REG(d, v); }
++                { JSValue v = js_dup(error_state); SET_REG_P(d, v); }
+                 REGVM_NEXT();
+             }
+             L_ROP_using_dispose_async: {
+@@ -29610,13 +30146,13 @@
+                 JSValue ret;
+                 if (JS_IsNull(val) || JS_IsUndefined(val) ||
+                     JS_IsUninitialized(val)) {
+-                    SET_REG(d, JS_UNDEFINED);
++                    SET_REG_P(d, JS_UNDEFINED);
+                     REGVM_NEXT();
+                 }
+                 ret = JS_Call(ctx, method, val, 0, NULL);
+                 if (JS_IsException(ret))
+                     goto exception;
+-                SET_REG(d, ret);
++                SET_REG_P(d, ret);
+                 REGVM_NEXT();
+             }
+             L_ROP_using_merge: {
+@@ -29629,11 +30165,11 @@
+                     JSValue se = js_new_suppressed_error(ctx, new_error,
+                                                          error_state);
+                     if (JS_IsException(se))
+-                        SET_REG(d, JS_GetException(ctx));
++                        SET_REG_P(d, JS_GetException(ctx));
+                     else
+-                        SET_REG(d, se);
++                        SET_REG_P(d, se);
+                 } else {
+-                    SET_REG(d, js_dup(new_error));
++                    SET_REG_B(d,new_error);
+                 }
+                 REGVM_NEXT();
+             }
+@@ -29652,7 +30188,7 @@
+                 JSValue method;
+                 if (js_op_using_check(ctx, regs[s], RD_U8(), &method))
+                     goto exception;
+-                SET_REG(d, method);
++                SET_REG_P(d, method);
+                 REGVM_NEXT();
+             }
+             L_ROP_to_object: {
+@@ -29665,7 +30201,7 @@
+                 JSValue val = JS_ToObject(ctx, regs[s]);
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29716,7 +30252,7 @@
+                 }
+                 if (JS_IsException(val))
+                     goto exception;
+-                SET_REG(d, val);
++                SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+             L_ROP_unary: {
+@@ -29730,7 +30266,7 @@
+                 if (!regvm_unary_num_fast(sub, regs[s], &out) &&
+                     js_regvm_unary(ctx, sub, regs[s], &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_mul: { REGVM_BIN_OP(REG_BIN_MUL); }
+@@ -29772,7 +30308,7 @@
+                 if (!regvm_num_fast(sub, regs[a], regs[c], &out) &&
+                     js_regvm_binary(ctx, sub, regs[a], regs[c], &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29790,7 +30326,7 @@
+                 if (!regvm_num_fast(sub, var_buf[ls], regs[rc], &out) &&
+                     js_regvm_binary(ctx, sub, var_buf[ls], regs[rc], &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_binary_reg_loc: {
+@@ -29802,7 +30338,7 @@
+                 if (!regvm_num_fast(sub, regs[rc], var_buf[rs], &out) &&
+                     js_regvm_binary(ctx, sub, regs[rc], var_buf[rs], &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_binary_loc_loc: {
+@@ -29814,7 +30350,7 @@
+                 if (!regvm_num_fast(sub, var_buf[ls], var_buf[rs], &out) &&
+                     js_regvm_binary(ctx, sub, var_buf[ls], var_buf[rs], &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_binary_imm: {
+@@ -29826,7 +30362,7 @@
+                 if (!regvm_num_fast(sub, regs[a], js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, sub, regs[a], js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_binary_imm_s: {
+@@ -29838,7 +30374,7 @@
+                 if (!regvm_num_fast(sub, regs[a], js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, sub, regs[a], js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29864,16 +30400,16 @@
+                     int32_t sum;
+ 
+                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+-                        SET_REG(d, js_int32((int32_t)sum));
++                        SET_REG_P(d, js_int32((int32_t)sum));
+                         REGVM_NEXT();
+                     }
+-                    SET_REG(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
++                    SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                     REGVM_NEXT();
+                 }
+                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_sub_imm_s: {
+@@ -29887,16 +30423,16 @@
+                     int64_t sum = (int64_t)JS_VALUE_GET_INT(v) - imm;
+ 
+                     if (sum >= INT32_MIN && sum <= INT32_MAX) {
+-                        SET_REG(d, js_int32((int32_t)sum));
++                        SET_REG_P(d, js_int32((int32_t)sum));
+                         REGVM_NEXT();
+                     }
+-                    SET_REG(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
++                    SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                     REGVM_NEXT();
+                 }
+                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29925,7 +30461,7 @@
+                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             L_ROP_sub_imm_self_s: {
+@@ -29947,7 +30483,7 @@
+                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -29979,7 +30515,7 @@
+                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -30005,7 +30541,7 @@
+                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                     goto exception;
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 rpc += off;
+                 REGVM_NEXT();
+             }
+@@ -30039,7 +30575,7 @@
+                     }
+                     JS_FreeValue(ctx, cst);
+                 }
+-                SET_REG(d, out);
++                SET_REG_P(d, out);
+                 REGVM_NEXT();
+             }
+             /*
+@@ -30071,7 +30607,7 @@
+                                               JS_UNDEFINED, na, vc(oargv), 0);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_call_method: {
+@@ -30096,7 +30632,7 @@
+                                               na, vc(oargv), 0);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_construct: {
+@@ -30110,7 +30646,7 @@
+                                                      na, vc(argv), 0);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_tail_call: {
+@@ -30170,7 +30706,7 @@
+                    remain live through aliases. */
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-                SET_REG(d, ret_val);
++                SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
+             L_ROP_branch:
+@@ -30195,13 +30731,19 @@
+              * JS_UNDEFINED and lets the engine read the value off the frame.
+              */
+             L_ROP_initial_yield:
+-                /* no continuation state of its own: re-enter after it */
++                /* no continuation state of its own: re-enter after it.
++                   Parameter defaults may already have left live counted
++                   values in the registers, so this park must own them. */
+                 pc = rpc;
+-                REGVM_SUSPEND(JS_UNDEFINED);
++                REGVM_SUSPEND_OWN(JS_UNDEFINED);
+             L_ROP_return_async: {
+                 int s = RD_REG();
++#if QJS_DRC
++                REGVM_SLOT(1) = js_dup(regs[s]);
++#else
+                 JS_FreeValue(ctx, REGVM_SLOT(1));
+                 REGVM_SLOT(1) = regs[s];
++#endif
+                 regs[s] = JS_UNDEFINED;
+                 pc = rpc;
+                 REGVM_SUSPEND(JS_UNDEFINED);
+@@ -30218,17 +30760,23 @@
+                        the resume argument and the magic in the handshake
+                        slots, and they are the two values the yield declares
+                        it pushes. Any other yield is a fresh suspension. */
+-                    SET_REG(d, REGVM_SLOT(1));
++                    SET_REG_P(d, REGVM_SLOT(1));
+                     REGVM_SLOT(1) = JS_UNDEFINED;
+-                    SET_REG(d2, REGVM_SLOT(2));
++                    SET_REG_P(d2, REGVM_SLOT(2));
+                     REGVM_SLOT(2) = JS_UNDEFINED;
+                     /* consume the marker: a loop can reach this same yield
+                        again, and only the first arrival is the resume */
+                     regvm_resume_marker = NULL;
+                     REGVM_NEXT();
+                 }
++#if QJS_DRC
++                /* SLOT(1) only borrows here (a fresh suspension); the
++                   suspend walk below takes the engine's reference. */
++                REGVM_SLOT(1) = regs[s];
++#else
+                 JS_FreeValue(ctx, REGVM_SLOT(1));
+                 REGVM_SLOT(1) = regs[s];
++#endif
+                 regs[s] = JS_UNDEFINED;
+                 pc = ip;
+                 REGVM_SUSPEND(js_int32(op == ROP_yield ? FUNC_RET_YIELD
+@@ -30251,8 +30799,12 @@
+                    * called plainly and its return takes the ordinary exit.
+                    */
+                   if (flags & JS_CALL_FLAG_GENERATOR) {
++#if QJS_DRC
++                      REGVM_SLOT(1) = js_dup(regs[s]);
++#else
+                       JS_FreeValue(ctx, REGVM_SLOT(1));
+                       REGVM_SLOT(1) = regs[s];
++#endif
+                       regs[s] = JS_UNDEFINED;
+                       pc = rpc;
+                       REGVM_SUSPEND(JS_UNDEFINED);
+@@ -30269,12 +30821,22 @@
+                   }
+ #endif
+                   ret_val = regs[s];
++#if QJS_DRC
++                  /* the register only borrows: the caller owns the value, so
++                     hand it over with a reference of its own */
++                  if (JS_VALUE_HAS_REF_COUNT(ret_val))
++                      JS_REF_COUNT(JS_VALUE_GET_PTR(ret_val))++;
++#endif
+                   regs[s] = JS_UNDEFINED; /* the caller owns it now */
+                   goto done; }
+             L_ROP_return_undefined:
+                 if (flags & JS_CALL_FLAG_GENERATOR) {
++#if QJS_DRC
++                    REGVM_SLOT(1) = JS_UNDEFINED;
++#else
+                     JS_FreeValue(ctx, REGVM_SLOT(1));
+                     REGVM_SLOT(1) = JS_UNDEFINED;
++#endif
+                     pc = rpc;
+                     REGVM_SUSPEND(JS_UNDEFINED);
+                 }
+@@ -30315,8 +30877,15 @@
+                 rt->current_exception = JS_UNINITIALIZED;
+                 JS_FreeValueRT(rt, ctx->error_back_trace);
+                 ctx->error_back_trace = JS_UNDEFINED;
++#if QJS_DRC
++                /* the register only borrows: park the exception's reference
++                   (reconcile pins it while the handler runs) */
++                regs[e->reg] = exc;
++                REG_ADOPT(rt, exc);
++#else
+                 JS_FreeValue(ctx, regs[e->reg]);
+                 regs[e->reg] = exc;
++#endif
+                 regvm_rpc = b->regvm_code + e->pc;
+                 regvm_resume_pending = 1;
+                 goto regvm_resume;
+@@ -30415,7 +30984,12 @@
+              * walk, so neither read can change under it.
+              */
+             JSRuntime *frt = ctx->rt;
++#if QJS_DRC
++            /* Registers do not own, so the walk stops at the register file. */
++            JSValue *end = regs;
++#else
+             JSValue *end = regs + b->regvm_reg_count + REGVM_HS - 1;
++#endif
+ 
+             for (pval = local_buf; pval < end; pval++)
+                 JS_FreeValueRT(frt, *pval);
+@@ -30615,11 +31189,11 @@
+ 
+         case ROP_load_i32:
+ 
+-                    { int d = RD_REG(); SET_REG(d, js_int32(RD_I32())); REGVM_NEXT(); }
++                    { int d = RD_REG(); SET_REG_P(d, js_int32(RD_I32())); REGVM_NEXT(); }
+ 
+         case ROP_load_bigint_i32:
+ 
+-                    { int d = RD_REG(); SET_REG(d, __JS_NewShortBigInt(ctx, RD_I32())); REGVM_NEXT(); }
++                    { int d = RD_REG(); SET_REG_P(d, __JS_NewShortBigInt(ctx, RD_I32())); REGVM_NEXT(); }
+ 
+         case ROP_private_symbol:
+      {
+@@ -30628,7 +31202,7 @@
+                     JSValue sym = JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE);
+                     if (JS_IsException(sym))
+                         goto exception;
+-                    SET_REG(d, sym);
++                    SET_REG_P(d, sym);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -30651,12 +31225,12 @@
+                             tag == JS_TAG_SYMBOL) {
+                             /* already a key: a self-copy is a no-op */
+                             if (d != src)
+-                                SET_REG(d, js_dup(v));
++                                SET_REG_B(d,v);
+                         } else {
+                             JSValue key = JS_ToPropertyKey(ctx, v);
+                             if (JS_IsException(key))
+                                 goto exception;
+-                            SET_REG(d, key);
++                            SET_REG_P(d, key);
+                         }
+                     }
+                     REGVM_NEXT();
+@@ -30682,17 +31256,24 @@
+                     JS_FreeAtom(ctx, atom);
+                     if (unlikely(ret < 0))
+                         goto exception;
+-                    SET_REG(d, js_bool(ret));
++                    SET_REG_P(d, js_bool(ret));
+                     REGVM_NEXT();
+                 }
+ 
+         case ROP_put_local_xfer:
+ 
+                     /* The source is dead here: the binding takes its reference, as
+-                       the stack interpreter's put transfers the value it popped. */
++                       the stack interpreter's put transfers the value it popped.
++                       Under deferred RC the register only borrows, so the binding
++                       duplicates it. */
+                     { int slot = RD_U16(); int s = RD_REG();
++#if QJS_DRC
++                      set_value(ctx, &f->var_buf[slot], js_dup(regs[s]));
++#else
+                       set_value(ctx, &f->var_buf[slot], regs[s]);
+-                      regs[s] = JS_UNDEFINED; REGVM_NEXT(); }
++                      regs[s] = JS_UNDEFINED;
++#endif
++                      REGVM_NEXT(); }
+ 
+         case ROP_put_local_xfer_s0:
+         case ROP_put_local_xfer_s1:
+@@ -30700,8 +31281,13 @@
+         case ROP_put_local_xfer_s3:
+ 
+                     { int slot = op - ROP_put_local_xfer_s0; int s = RD_REG();
++#if QJS_DRC
++                      set_value(ctx, &f->var_buf[slot], js_dup(regs[s]));
++#else
+                       set_value(ctx, &f->var_buf[slot], regs[s]);
+-                      regs[s] = JS_UNDEFINED; REGVM_NEXT(); }
++                      regs[s] = JS_UNDEFINED;
++#endif
++                      REGVM_NEXT(); }
+ 
+         case ROP_local_rmw_imm:
+ 
+@@ -30851,13 +31437,24 @@
+         case ROP_put_arg_xfer:
+ 
+                     { int slot = RD_U16(); int s = RD_REG();
++#if QJS_DRC
++                      regvm_put_arg(ctx, f->arg_buf, f->arg_owned, slot, regs[s]);
++                      regs[s] = JS_UNDEFINED;
++#else
+                       set_value(ctx, &f->arg_buf[slot], regs[s]);
+-                      regs[s] = JS_UNDEFINED; REGVM_NEXT(); }
++                      regs[s] = JS_UNDEFINED;
++#endif
++                      REGVM_NEXT(); }
+ 
+         case ROP_put_arg:
+ 
+                     { int slot = RD_U16(); int s = RD_REG();
+-                      set_value(ctx, &f->arg_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
++#if QJS_DRC
++                      regvm_put_arg(ctx, f->arg_buf, f->arg_owned, slot, regs[s]);
++#else
++                      set_value(ctx, &f->arg_buf[slot], js_dup(regs[s]));
++#endif
++                      REGVM_NEXT(); }
+ 
+         case ROP_put_var_ref:
+ 
+@@ -30955,7 +31552,7 @@
+                     JSValue cl = js_closure(ctx, bfunc, f->var_refs, f->sf);
+                     if (JS_IsException(cl))
+                         goto exception;
+-                    SET_REG(d, cl);
++                    SET_REG_P(d, cl);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -30965,7 +31562,7 @@
+                     JSValue val = JS_NewObject(ctx);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -30978,7 +31575,7 @@
+                     JSValue val = js_create_array(ctx, n2, n2 ? &f->argv[i2] : NULL);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -30987,7 +31584,11 @@
+                     int s = RD_REG();
+                     JSValue v = regs[s];
+                     regs[s] = JS_UNDEFINED;
++#if QJS_DRC
++                    JS_Throw(ctx, js_dup(v));
++#else
+                     JS_Throw(ctx, v);
++#endif
+                     goto exception;
+                 }
+ 
+@@ -31023,7 +31624,7 @@
+                     val = js_new_object_from_template(ctx, &b->objlit_tab[index]);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -31044,7 +31645,7 @@
+                     JSValue recv = f->var_buf[slot];
+                     JSValue val;
+                     if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val)) {
+-                        SET_REG(d, val);
++                        SET_REG_B(d, val);
+                         REGVM_NEXT();
+                     }
+                     if (site == REG_IC_NONE)
+@@ -31053,7 +31654,7 @@
+                         val = regvm_get_field_ic(ctx, b, &f->pic, recv, atom, site);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31068,7 +31669,7 @@
+                                                               : f->arg_buf[slot];
+                     JSValue val;
+                     if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val)) {
+-                        SET_REG(d, val);
++                        SET_REG_B(d, val);
+                         REGVM_NEXT();
+                     }
+                     if (site == REG_IC_NONE)
+@@ -31077,7 +31678,7 @@
+                         val = regvm_get_field_ic(ctx, b, &f->pic, recv, atom, site);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31086,11 +31687,17 @@
+                     int r = RD_REG();
+                     JSAtom atom = RD_U32();
+                     int v = RD_REG();
++#if QJS_DRC
++                    if (JS_SetPropertyInternal2(ctx, regs[r], atom, js_dup(regs[v]),
++                                                regs[r], JS_PROP_THROW_STRICT) < 0)
++                        goto exception;
++#else
+                     JSValue val = regs[v];
+                     regs[v] = JS_UNDEFINED;
+                     if (JS_SetPropertyInternal2(ctx, regs[r], atom, val,
+                                                 regs[r], JS_PROP_THROW_STRICT) < 0)
+                         goto exception;
++#endif
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -31179,8 +31786,13 @@
+                         if (likely(!po->is_exotic && po->shape == tpl->shape &&
+                                    (int)tpl->prop_count == n)) {
+                             for (i2 = 0; i2 < n; i2++) {
++#if QJS_DRC
++                                set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
++                                vals[i2] = JS_UNDEFINED;
++#else
+                                 set_value(ctx, &po->prop[i2].u.value, vals[i2]);
+                                 vals[i2] = JS_UNDEFINED;
++#endif
+                             }
+                             REGVM_NEXT();
+                         }
+@@ -31188,6 +31800,15 @@
+                     for (i2 = 0; i2 < n; i2++) {
+                         JSValue v2 = vals[i2];
+                         vals[i2] = JS_UNDEFINED;
++#if QJS_DRC
++                        if (JS_DefinePropertyValue(ctx, regs[o],
++                                                   js_objlit_template_atom(tpl, i2), js_dup(v2),
++                                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
++                            for (i2 = i2 + 1; i2 < n; i2++)
++                                vals[i2] = JS_UNDEFINED;
++                            goto exception;
++                        }
++#else
+                         if (JS_DefinePropertyValue(ctx, regs[o],
+                                                    js_objlit_template_atom(tpl, i2), v2,
+                                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+@@ -31197,6 +31818,7 @@
+                             }
+                             goto exception;
+                         }
++#endif
+                     }
+                     REGVM_NEXT();
+                 }
+@@ -31250,8 +31872,12 @@
+                     JSValue *sp = &regs[pw + 2];
+                     (void)bw;
+                     if (js_op_define_class(ctx, sp, atom, flags, f->var_refs, f->sf,
+-                                           false) < 0)
++                                           false, true) < 0)
+                         goto exception;
++#if QJS_DRC
++                    REG_ADOPT(ctx->rt, sp[-2]);
++                    REG_ADOPT(ctx->rt, sp[-1]);
++#endif
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31265,8 +31891,12 @@
+                     (void)pw;
+                     (void)bw;
+                     if (js_op_define_class(ctx, sp, JS_ATOM_NULL, flags, f->var_refs, f->sf,
+-                                           true) < 0)
++                                           true, true) < 0)
+                         goto exception;
++#if QJS_DRC
++                    REG_ADOPT(ctx->rt, sp[-2]);
++                    REG_ADOPT(ctx->rt, sp[-1]);
++#endif
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31290,7 +31920,7 @@
+                     JSValue proto = JS_GetPrototype(ctx, old);
+                     if (JS_IsException(proto))
+                         goto exception;
+-                    SET_REG(d, proto);
++                    SET_REG_P(d, proto);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31319,7 +31949,7 @@
+                     JS_FreeValue(ctx, super);
+                     if (JS_IsException(ret))
+                         goto exception;
+-                    SET_REG(d, ret);
++                    SET_REG_P(d, ret);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31356,7 +31986,7 @@
+                      */
+                     if (f->nctl > 0 && f->ctl[f->nctl - 1].kind == REG_CTL_CATCH)
+                         --f->nctl;
+-                    { JSValue v = js_dup(regs[src]); SET_REG(d, v); }
++                    { JSValue v = js_dup(regs[src]); SET_REG_P(d, v); }
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31396,7 +32026,7 @@
+         case ROP_iter_start:
+      {
+                     int w = RD_REG();
+-                    if (js_for_of_start(ctx, &regs[w + 1], false))
++                    if (regvm_for_of_start(ctx, &regs[w + 1], false))
+                         goto exception;
+                     /* the helper left the iterator at the window base and the next
+                        method beside it */
+@@ -31418,7 +32048,7 @@
+                     int w = RD_REG();
+                     /* the same start as the synchronous loop, with the async
+                        flag: the helper wraps the iterator it is given */
+-                    if (js_for_of_start(ctx, &regs[w + 1], true))
++                    if (regvm_for_of_start(ctx, &regs[w + 1], true))
+                         goto exception;
+                     if (f->nctl >= b->regvm_ctl_count) {
+                         JS_ThrowInternalError(ctx,
+@@ -31456,10 +32086,10 @@
+                         goto exception;
+                     /* the sources may be the destinations (the allocator reuses a
+                        dead register), so each is duplicated before any store */
+-                    SET_REG(d0, js_dup(regs[ob]));
+-                    SET_REG(d1, js_dup(regs[nx]));
+-                    SET_REG(d2, js_dup(regs[co]));
+-                    SET_REG(d3, ret_val);
++                    SET_REG_B(d0,regs[ob]);
++                    SET_REG_B(d1,regs[nx]);
++                    SET_REG_B(d2,regs[co]);
++                    SET_REG_P(d3, ret_val);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -31472,7 +32102,7 @@
+         case ROP_iter_next:
+ 
+                     { int w = RD_REG();
+-                      if (js_for_of_next(ctx, &regs[w + 2], -2)) {
++                      if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
+                           regvm_ctl_iter_forget(ctx, f->ctl, &f->nctl);
+                           goto exception;
+                       }
+@@ -31567,8 +32197,14 @@
+                         }
+                         if (JS_IsException(ret))
+                             goto exception;
++#if QJS_DRC
++                        /* sp[-1] is a register: it borrows, so do not release
++                           the old value; store the owned result and adopt it. */
++                        SET_REG_P(w + 3, ret);
++#else
+                         JS_FreeValue(ctx, sp[-1]);
+                         sp[-1] = ret;
++#endif
+                         ret_flag = false;
+                     }
+                     sp[0] = js_bool(ret_flag);
+@@ -31587,13 +32223,13 @@
+         case ROP_for_in_start:
+ 
+                     { int w = RD_REG();
+-                      if (js_for_in_start(ctx, &regs[w + 1])) goto exception;
++                      if (regvm_for_in_start(ctx, &regs[w + 1])) goto exception;
+                       REGVM_NEXT(); }
+ 
+         case ROP_for_in_next:
+ 
+                     { int w = RD_REG();
+-                      if (js_for_in_next(ctx, &regs[w + 1])) goto exception;
++                      if (regvm_for_in_next(ctx, &regs[w + 1])) goto exception;
+                       REGVM_NEXT(); }
+ 
+         case ROP_append:
+@@ -31631,7 +32267,7 @@
+                     val = JS_GetPropertyValue(ctx, regs[o], js_dup(regs[k]));
+                     if (unlikely(JS_IsException(val)))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31699,8 +32335,8 @@
+                     JSValue pair[2];
+                     if (unlikely(JS_GetGlobalVarRef(ctx, atom, pair)))
+                         goto exception;
+-                    SET_REG(d0, pair[0]);
+-                    SET_REG(d1, pair[1]);
++                    SET_REG_P(d0, pair[0]);
++                    SET_REG_P(d1, pair[1]);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31735,12 +32371,12 @@
+                         }
+                         pr->u.var_ref = var_ref;
+                     }
+-                    SET_REG(d0, obj);
++                    SET_REG_P(d0, obj);
+                     {
+                         JSValue name = JS_AtomToValue(ctx, atom);
+                         if (JS_IsException(name))
+                             goto exception;
+-                        SET_REG(d1, name);
++                        SET_REG_P(d1, name);
+                     }
+                     REGVM_NEXT();
+                 }
+@@ -31774,7 +32410,7 @@
+                         }
+                         if (unlikely(JS_IsException(val)))
+                             goto exception;
+-                        SET_REG(d, val);
++                        SET_REG_P(d, val);
+                         rpc += off;
+                     }
+                     REGVM_NEXT();
+@@ -31808,7 +32444,7 @@
+                     } else {
+                         /* The fall-through result is another reference to value. */
+                         if (d != v)
+-                            SET_REG(d, js_dup(regs[v]));
++                            SET_REG_B(d,regs[v]);
+                     }
+                     REGVM_NEXT();
+                 }
+@@ -31836,7 +32472,7 @@
+                         JSValue val;
+                         if (op == ROP_with_make_ref) {
+                             /* the property name itself, for a later get or put */
+-                            SET_REG(d0, js_dup(regs[o]));
++                            SET_REG_B(d0,regs[o]);
+                             val = JS_AtomToValue(ctx, atom);
+                             if (JS_IsException(val))
+                                 goto exception;
+@@ -31845,10 +32481,10 @@
+                             if (JS_IsException(val))
+                                 goto exception;
+                             /* get_ref_undef hands the method an undefined receiver */
+-                            SET_REG(d0, op == ROP_with_get_ref ? js_dup(regs[o])
++                            SET_REG_B(d0, op == ROP_with_get_ref ? regs[o]
+                                                               : JS_UNDEFINED);
+                         }
+-                        SET_REG(d1, val);
++                        SET_REG_P(d1, val);
+                         rpc += off;
+                     }
+                     REGVM_NEXT();
+@@ -31874,7 +32510,7 @@
+                     }
+                     if (JS_IsException(ret_val))
+                         goto exception;
+-                    SET_REG(d, ret_val);
++                    SET_REG_P(d, ret_val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31890,7 +32526,7 @@
+                     ret_val = js_function_apply(ctx, sp[-3], 2, &sp[-2], magic);
+                     if (JS_IsException(ret_val))
+                         goto exception;
+-                    SET_REG(d, ret_val);
++                    SET_REG_P(d, ret_val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31914,7 +32550,7 @@
+                     /* The helper reads the object and key, and consumes only the
+                        value copy. The original registers may have other aliases. */
+                     JSValue obj = js_dup(regs[o]);
+-                    SET_REG(d, obj);
++                    SET_REG_P(d, obj);
+                     if (unlikely(ret < 0))
+                         goto exception;
+                     REGVM_NEXT();
+@@ -31939,7 +32575,7 @@
+                     int ret = JS_DeleteGlobalVar(ctx, atom);
+                     if (unlikely(ret < 0))
+                         goto exception;
+-                    SET_REG(d, js_bool(ret));
++                    SET_REG_P(d, js_bool(ret));
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31951,7 +32587,7 @@
+                     JSValue val = JS_GetPrivateField(ctx, regs[o], regs[k]);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31966,7 +32602,7 @@
+                             if (likely(i2 < (uint32_t)f->argc)) {
+                                 v2 = js_dup(i2 < (uint32_t)b->arg_count ? f->arg_buf[i2]
+                                                                    : f->argv[i2]);
+-                            SET_REG(d, v2);
++                            SET_REG_P(d, v2);
+                             REGVM_NEXT();
+                         }
+                     }
+@@ -31974,7 +32610,7 @@
+                                          f->sf, b->arg_count);
+                     if (JS_IsException(v2))
+                         goto exception;
+-                    SET_REG(d, v2);
++                    SET_REG_P(d, v2);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -31986,7 +32622,7 @@
+                     JSValue pat = js_dup(regs[p2]), fl = js_dup(regs[f2]);
+                     /* The constructor consumes copies; the source registers can
+                        remain live through another alias. */
+-                    SET_REG(d, js_regexp_constructor_internal(ctx, JS_UNDEFINED, pat, fl));
++                    SET_REG_P(d, js_regexp_constructor_internal(ctx, JS_UNDEFINED, pat, fl));
+                     if (JS_IsException(regs[d]))
+                         goto exception;
+                     REGVM_NEXT();
+@@ -32010,7 +32646,7 @@
+                     JSValue val = JS_GetProperty(ctx, regs[r], JS_ATOM_length);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -32034,7 +32670,7 @@
+                     JS_FreeAtom(ctx, atom);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -32050,7 +32686,7 @@
+                     JSValue val = js_dynamic_import(ctx, regs[spec], regs[opts]);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32064,7 +32700,7 @@
+         case ROP_using_init:
+ 
+                     { int d = RD_REG();
+-                      SET_REG(d, JS_UNINITIALIZED);
++                      SET_REG_P(d, JS_UNINITIALIZED);
+                       REGVM_NEXT(); }
+ 
+         case ROP_using_dispose:
+@@ -32094,18 +32730,18 @@
+                                                                  error_state);
+                             JS_FreeValue(ctx, new_error);
+                             if (JS_IsException(se))
+-                                SET_REG(d, JS_GetException(ctx));
++                                SET_REG_P(d, JS_GetException(ctx));
+                             else
+-                                SET_REG(d, se);
++                                SET_REG_P(d, se);
+                         } else {
+-                            SET_REG(d, new_error);
++                            SET_REG_P(d, new_error);
+                         }
+                     }
+                     REGVM_NEXT();
+                  passthrough:
+                     /* the state passes through, as it does on the stack side where
+                        the slot the handler reads is the slot it leaves */
+-                    { JSValue v = js_dup(error_state); SET_REG(d, v); }
++                    { JSValue v = js_dup(error_state); SET_REG_P(d, v); }
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32118,13 +32754,13 @@
+                     JSValue ret;
+                     if (JS_IsNull(val) || JS_IsUndefined(val) ||
+                         JS_IsUninitialized(val)) {
+-                        SET_REG(d, JS_UNDEFINED);
++                        SET_REG_P(d, JS_UNDEFINED);
+                         REGVM_NEXT();
+                     }
+                     ret = JS_Call(ctx, method, val, 0, NULL);
+                     if (JS_IsException(ret))
+                         goto exception;
+-                    SET_REG(d, ret);
++                    SET_REG_P(d, ret);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32139,11 +32775,11 @@
+                         JSValue se = js_new_suppressed_error(ctx, new_error,
+                                                              error_state);
+                         if (JS_IsException(se))
+-                            SET_REG(d, JS_GetException(ctx));
++                            SET_REG_P(d, JS_GetException(ctx));
+                         else
+-                            SET_REG(d, se);
++                            SET_REG_P(d, se);
+                     } else {
+-                        SET_REG(d, js_dup(new_error));
++                        SET_REG_B(d,new_error);
+                     }
+                     REGVM_NEXT();
+                 }
+@@ -32166,7 +32802,7 @@
+                     JSValue method;
+                     if (js_op_using_check(ctx, regs[s], RD_U8(), &method))
+                         goto exception;
+-                    SET_REG(d, method);
++                    SET_REG_P(d, method);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32181,7 +32817,7 @@
+                     JSValue val = JS_ToObject(ctx, regs[s]);
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -32234,7 +32870,7 @@
+                     }
+                     if (JS_IsException(val))
+                         goto exception;
+-                    SET_REG(d, val);
++                    SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32250,16 +32886,16 @@
+                         int32_t sum;
+ 
+                         if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
+-                            SET_REG(d, js_int32((int32_t)sum));
++                            SET_REG_P(d, js_int32((int32_t)sum));
+                             REGVM_NEXT();
+                         }
+-                        SET_REG(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
++                        SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                         REGVM_NEXT();
+                     }
+                     if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+                         js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                         goto exception;
+-                    SET_REG(d, out);
++                    SET_REG_P(d, out);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32275,16 +32911,16 @@
+                         int64_t sum = (int64_t)JS_VALUE_GET_INT(v) - imm;
+ 
+                         if (sum >= INT32_MIN && sum <= INT32_MAX) {
+-                            SET_REG(d, js_int32((int32_t)sum));
++                            SET_REG_P(d, js_int32((int32_t)sum));
+                             REGVM_NEXT();
+                         }
+-                        SET_REG(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
++                        SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                         REGVM_NEXT();
+                     }
+                     if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
+                         js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
+                         goto exception;
+-                    SET_REG(d, out);
++                    SET_REG_P(d, out);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -32315,7 +32951,7 @@
+                     if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+                         js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+                         goto exception;
+-                    SET_REG(d, out);
++                    SET_REG_P(d, out);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -32339,7 +32975,7 @@
+                     if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
+                         js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
+                         goto exception;
+-                    SET_REG(d, out);
++                    SET_REG_P(d, out);
+                     REGVM_NEXT();
+                 }
+                 /*
+@@ -32401,7 +33037,7 @@
+                        remain live through aliases. */
+                     if (JS_IsException(ret_val))
+                         goto exception;
+-                    SET_REG(d, ret_val);
++                    SET_REG_P(d, ret_val);
+                     REGVM_NEXT();
+                 }
+ 
+@@ -36580,6 +37216,7 @@
+     sf->cur_gc_obj = NULL;
+ #if QJS_REGVM
+     REGVM_SET_ROOT(sf, sf->cur_sp, b->regvm_reg_count + REGVM_HS - 1);
++    sf->rv_owns_regs = 0;
+     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->regvm_reg_count + REGVM_HS);
+ #else
+     REGVM_SET_ROOT(sf, NULL, 0);
+@@ -36616,8 +37253,21 @@
+            cannot mark the stack. Marking the variables is not needed
+            because a running function cannot be part of a removable
+            cycle */
++#if QJS_DRC && QJS_REGVM
++        /* Only a parked frame that owns its register window holds counted
++           references there. A frame handed back to the engine to be finished
++           (a generator/async body's return) only borrows: marking the window
++           would make gc_decref drop references it never held. The arg/var
++           area before rv_regs always owns. */
++        {
++            JSValue *mark_end = sf->rv_owns_regs ? sf->cur_sp : sf->rv_regs;
++            for(sp = sf->arg_buf; sp < mark_end; sp++)
++                JS_MarkValue(rt, *sp, mark_func);
++        }
++#else
+         for(sp = sf->arg_buf; sp < sf->cur_sp; sp++)
+             JS_MarkValue(rt, *sp, mark_func);
++#endif
+ #if QJS_REGVM
+         /* The control stack sits past the walk above. An open for-of's
+            iterator and next method are held there, so they have to be marked
+@@ -36677,9 +37327,25 @@
+ 
+         /* cannot free the function if it is running */
+         assert(sf->cur_sp != NULL);
++#if QJS_DRC && QJS_REGVM
++        /*
++         * Only a parked (suspended) coroutine's register window owns its
++         * values: the suspend walk took a reference on each. A window that
++         * was resumed and then returned or threw only borrows, and freeing
++         * it would release references the register values never held. The
++         * window starts at rv_regs; the arg/var area before it always owns.
++         */
++        {
++            JSValue *end = sf->rv_owns_regs ? sf->cur_sp : sf->rv_regs;
++            for(sp = sf->arg_buf; sp < end; sp++) {
++                JS_FreeValueRT(rt, *sp);
++            }
++        }
++#else
+         for(sp = sf->arg_buf; sp < sf->cur_sp; sp++) {
+             JS_FreeValueRT(rt, *sp);
+         }
++#endif
+         js_free_rt(rt, sf->arg_buf);
+     }
+     JS_FreeValueRT(rt, sf->cur_func);
+@@ -64335,6 +65001,9 @@
+         b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
+         if (fd->arg_count > 0)
+             memcpy(b->vardefs, fd->args, fd->arg_count * sizeof(fd->args[0]));
++        for (int ai = 0; ai < fd->arg_count; ai++)
++            if (fd->args[ai].is_captured)
++                b->args_captured = 1;
+         if (fd->var_count > 0)
+             memcpy(b->vardefs + fd->arg_count, fd->vars, fd->var_count * sizeof(fd->vars[0]));
+         b->var_count = fd->var_count;
+@@ -67432,6 +68101,15 @@
+     }
+ }
+ 
++/* Opcodes that create a var_ref onto a parameter slot: writes through it
++   free the slot's old value, so the slot must own (DRC borrow rule). */
++static bool js_arg_ref_opcode(const uint8_t *bc, int pos, int op)
++{
++    return op == OP_make_arg_ref ||
++        (op == OP_special_object &&
++         bc[pos + 1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS);
++}
++
+ static void js_scan_argv_safe(JSFunctionBytecode *b)
+ {
+     const uint8_t *bc;
+@@ -67449,6 +68127,8 @@
+         int sz = short_opcode_info(op).size;
+         if (sz <= 0 || pos + sz > len)
+             return;
++        if (js_arg_ref_opcode(bc, pos, op))
++            b->args_captured = 1;
+         if (!js_argv_safe_opcode(bc, pos, op))
+             return;
+         pos += sz;
+@@ -67625,6 +68305,8 @@
+         }
+         if (!js_argv_safe_opcode(bc_buf, pos, op))
+             argv_safe = false;
++        if (js_arg_ref_opcode(bc_buf, pos, op))
++            b->args_captured = 1;
+         switch(short_opcode_info(op).fmt) {
+         case OP_FMT_atom:
+         case OP_FMT_atom_u8:
+@@ -68027,6 +68709,8 @@
+             vd->is_lexical = bc_get_flags(v8, &idx, 1);
+             vd->is_captured = bc_get_flags(v8, &idx, 1);
+             if (vd->is_captured) {
++                if (i < b->arg_count)
++                    b->args_captured = 1;
+                 if (bc_get_leb128_u16(s, &vd->var_ref_idx))
+                     return -1;
+             }

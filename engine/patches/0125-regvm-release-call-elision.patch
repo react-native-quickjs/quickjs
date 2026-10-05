@@ -1,0 +1,24 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25274,8 +25274,19 @@
+         JSValue *buf = rec->local_buf;
+         int n = rec->local_count;
+ 
+-        for (i = 0, pval = buf; i < n; i++, pval++)
+-            JS_FreeValueRT(rt, *pval);
++        for (i = 0, pval = buf; i < n; i++, pval++) {
++            JSValue v = *pval;
++            /*
++             * `JS_FreeValueRT` is a call, and the frame area is mostly
++             * immediates: the fill writes JS_UNDEFINED over the whole of it, and
++             * a register or local that never received a pointer stays one. The
++             * guard is a pure call elision -- `JS_FreeValueRT` begins with the
++             * same reference-count test -- so this is the section 6.1 NONE/OWN
++             * distinction applied to the release walk itself.
++             */
++            if (REGVM_HAS_COUNT(v))
++                JS_FreeValueRT(rt, v);
++        }
+     }
+     if (unlikely(sf->var_ref_count != 0))
+         js_closcyc_frame(rt, sf, true);
