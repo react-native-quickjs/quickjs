@@ -96,6 +96,20 @@ if(QJS_REGVM)
       "Phase 10 acceptance gates; host builds may set QJS_REGVM=ON freely.")
   endif()
   target_compile_definitions(quickjs PUBLIC QJS_REGVM=1)
+
+  # The register VM's default executor is the threaded dispatch plus the record
+  # call path; the engine's header defaults turn both on for a Clang register
+  # build (see `engine/quickjs-ng/quickjs.c`). They are exposed here so a
+  # configure can opt back into the monolith, which the AOT runtime and the AOT
+  # profiler require -- with `QJS_AOT=ON` the engine keeps them off by itself.
+  option(QJS_REGVM_THREAD "Threaded dispatch for the register VM" ON)
+  option(QJS_REGVM_RECORD "Record call path for the register VM" ON)
+  if(NOT QJS_REGVM_THREAD)
+    target_compile_definitions(quickjs PUBLIC QJS_REGVM_THREAD=0)
+  endif()
+  if(NOT QJS_REGVM_RECORD)
+    target_compile_definitions(quickjs PUBLIC QJS_REGVM_RECORD=0)
+  endif()
 endif()
 
 # Ahead-of-time compilation of the register VM (`QJS_AOT=1`). The generator

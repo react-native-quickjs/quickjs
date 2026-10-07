@@ -89,17 +89,22 @@ case "$EXTRA" in
         # step a few seconds instead of a full link.
         $CC $R $REGFLAGS -c -o "$WORK/regvm.o" "$ROOT/engine/quickjs-ng/quickjs.c"
         "$OBJDUMP" -d --no-show-raw-insn "$WORK/regvm.o" > "$WORK/regvm.s"
-        # The only exemptions are the record-creating halves of `call` and
-        # `call_method`. They allocate a frame from the arena and fill it, so they
-        # are inherently calling and cannot be frameless. The *handlers* that
-        # dispatch to them are frameless and are NOT exempt: the frame sits off
-        # the dispatch path, which is the property this check exists to keep.
+        # The only exemptions are the record-creating halves of `call`,
+        # `call_method` and the two tail calls. They allocate a frame from the
+        # arena and fill it, so they are inherently calling and cannot be
+        # frameless. The *handlers* that dispatch to them are frameless and are
+        # NOT exempt: the frame sits off the dispatch path, which is the
+        # property this check exists to keep.
         # get_global and put_field used to be named here; both now inline their
         # cache hit and tail-call the call, so they are back under the check.
         if python3 "$ROOT/tools/regvm/spillcheck.py" "$WORK/regvm.s" \
                 --select regvm_t_ --no-frame --quiet \
                 --frame-exempt regvm_t_call_record \
                 --frame-exempt regvm_t_call_method_record \
+                --frame-exempt regvm_t_tail_call_record \
+                --frame-exempt regvm_t_tail_call_method_record \
+                --frame-exempt regvm_t_construct_record \
+                --frame-exempt regvm_t_apply_arguments_record \
                 --frame-exempt regvm_t_return_nested \
                 --frame-exempt regvm_t_unwind; then
             note "   no framed handler fast path"

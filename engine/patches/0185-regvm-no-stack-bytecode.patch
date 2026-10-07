@@ -1,0 +1,115 @@
+From: quickjs-ng bundle work
+Subject: Register bundles: no stack bytecode in memory (P5)
+
+What this does
+  In a non-AOT register build js_create_function no longer allocates or copies
+  the stack bytecode: byte_code_buf stays NULL and byte_code_len 0, and the
+  fd->byte_code buffer is freed without being installed. The layout keeps the
+  slot (the struct is unchanged) but it holds nothing. argv_safe, which the
+  removed js_scan_argv_safe used to compute from the stack code, now comes from
+  regvm_scan_argv_safe on the register program, exactly as the bundle read path
+  already does (P2). The AOT and stack builds are untouched.
+
+Why we need it
+  Bundle plan D9. After the register code has its own line table and its own
+  argv_safe scan, nothing in a non-AOT register build reads the stack bytecode
+  after lowering (bundle plan 1.3). Keeping it doubles the per-function code
+  memory for no reason: the two copies are the same program.
+
+What it adds
+  quickjs.c
+      the js_create_function layout/assignment split under
+      QJS_REGVM && !QJS_AOT; the register argv_safe computation in the regvm
+      block (and the debug cross-check kept only for the AOT path).
+
+  Memory (run.c, SOURCE + NOEVAL, JS_ComputeMemoryUsage; stack bytecode size in
+  parentheses). js_func_code_size drops to 0 and malloc_size drops by exactly
+  the stack bytecode:
+      pdfjs    9,075,448 -> 8,258,320 bytes (-817,128; js_func_code_size
+               817,618 -> 0)
+      mandreel 14,795,152 -> 12,311,512 bytes (-2,483,640; 2,482,768 -> 0)
+      box2d    1,552,680 -> 1,370,384 bytes (-182,296; 181,649 -> 0)
+  Peak RSS (/usr/bin/time -f %M) is unchanged: pdfjs ~63,180 KB, mandreel
+  ~143,780 KB before and after, because the peak is during compilation (the AST
+  and the lowering IR), before the bytecode is installed. The saving is real
+  but smaller than the compile-time peak, so it does not show in RSS.
+
+  Gates: box2d 546.1008391043414 from source, eager and lazy; test262 50/81192
+  no leaks; differential corpus 400/0/0; the 13 Octane rows read clean in all
+  three modes.
+
+diff --git a/quickjs.c b/quickjs.c
+index 1821a5f..ff659ce 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -69780,7 +69780,13 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     closure_var_offset = function_size;
+     function_size += fd->closure_var_count * sizeof(*fd->closure_var);
+     byte_code_offset = function_size;
++#if QJS_REGVM && !QJS_AOT
++    /* D9: a register build keeps no stack bytecode after lowering. The slot
++       stays in the layout (the struct is unchanged) but holds nothing, and
++       args_captured/argv_safe come from the register program below. */
++#else
+     function_size += fd->byte_code.size;
++#endif
+ #if QJS_REGVM
+     regvm_offset = function_size;
+     function_size += fd->regvm_len;
+@@ -69841,12 +69847,21 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b->ic_count = fd->ic_count;
+     b->ic_entries = JS_IC_ENTRIES;
+ 
++#if QJS_REGVM && !QJS_AOT
++    /* D9: no stack bytecode. byte_code_buf stays NULL and byte_code_len 0; the
++       register program below is the only code this function has. */
++    b->byte_code_buf = NULL;
++    b->byte_code_len = 0;
++    js_free(ctx, fd->byte_code.buf);
++    fd->byte_code.buf = NULL;
++#else
+     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
+     b->byte_code_len = fd->byte_code.size;
+     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
+     js_scan_argv_safe(b);
+     js_free(ctx, fd->byte_code.buf);
+     fd->byte_code.buf = NULL;
++#endif
+ 
+ #if QJS_REGVM
+     if (fd->regvm_compiled) {
+@@ -69869,18 +69884,23 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+         js_free(ctx, fd->regvm_code);
+         fd->regvm_code = NULL;
+         fd->regvm_len = 0;
+-#if !defined(NDEBUG)
+-        /* Bundle plan 4.4: the register scan must agree with the stack scan
+-           that js_scan_argv_safe just ran. The register VM borrows a caller's
+-           argument window on `!args_captured` (regvm_args_borrowable), and the
+-           register scan reproduces exactly that condition; a debug build
+-           asserts they agree. (`argv_safe` is the stack VM's broader flag and
+-           is not compared: the register lowering elides dead argument stores,
+-           so the register code is strictly more permissive, which is safe for
+-           the register VM.) */
+-        assert(regvm_scan_argv_safe(b->regvm_code, b->regvm_len) ==
+-               (b->args_captured == 0));
++        {
++            bool rs = regvm_scan_argv_safe(b->regvm_code, b->regvm_len);
++#if !defined(NDEBUG) && (QJS_AOT)
++            /* Bundle plan 4.4: the stack scan js_scan_argv_safe ran must agree
++               on args_captured. (Only the AOT/stack paths run it; the non-AOT
++               register build has no stack bytecode.) */
++            assert(rs == (b->args_captured == 0));
++#endif
++#if QJS_REGVM && !QJS_AOT
++            /* D9: no stack bytecode, so the register scan is the only source of
++               argv_safe. It reproduces the register VM's borrow condition
++               (!args_captured); see the P2 note. */
++            b->argv_safe = rs;
++#else
++            (void)rs;
+ #endif
++        }
+     }
+ #endif
+ 

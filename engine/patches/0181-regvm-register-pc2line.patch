@@ -1,0 +1,521 @@
+Subject: register bundles: register-keyed pc2line and frame ip
+
+What this does:
+  Rebuilds a register-compiled function's pc2line table keyed by register exec
+  offset (`regvm_build_pc2line`), captures the executing instruction pointer in
+  `JSStackFrame.regvm_ip` at every call, construct, apply and unwind boundary,
+  and teaches `build_backtrace` to read it (`regvm_frame_pc`, wired into both
+  the lazy and the eager stack-frame paths). `regvm_encode_and_verify` now
+  always returns the regvm-offset -> stack-pc table, and `js_create_function`
+  consumes it (rebuild, then free). Bumps `REGVM_FORMAT_VERSION` 14 -> 15.
+
+Why we need it:
+  A register frame reports a register exec offset, but the compiler installs a
+  pc2line table keyed by stack pc, so every register frame printed `(missing)`.
+  With the table rebuilt for register offsets and the frame's ip captured at
+  each boundary, a register build names the same file:line:col as the stack
+  build. The table is not serialized: it is recomputed at load, so bundles
+  still contain stack code and only the debug section's meaning changes (hence
+  the version bump).
+
+Needs a bytecode version bump:
+  Yes. `REGVM_FORMAT_VERSION` 14 -> 15: the debug section is now interpreted as
+  register-keyed.
+
+Notes:
+  Bundle plan 4.3 case 1 (non-tail `g(){ var r = f(1); return r; }`): source,
+  eager bundle and lazy bundle all print
+    f (t.js:3:10), g (t.js:5:23), <eval> (t.js:6:14)
+  which is exactly the stack build.
+  Case 2 (tail `g(){ return f(1); }`): source, eager and lazy all print
+    f (t.js:3:10), <eval> (t.js:6:14)
+  (no `g`; the stack build prints `g`. R2's frame elision, accepted as D12.)
+  G3: box2d `fixed.js`, register build, total instructions 21,820,379,308
+  (before) -> 21,885,527,528 (+0.30%, within the +0.3% target). Run-only
+  (check.js, total minus a NOEVAL load): +0.26%.
+  Gates: box2d checksum 546.1008391043414; test262 50/81192; diff-suite
+  400/0/0; run-gates.sh p0tree p0 full 8 pass / 0 fail.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -759,6 +759,12 @@
+        took; 0 while it is running or has returned, when the registers only
+        borrow. `async_func_free` frees the register window only when it owns. */
+     uint8_t rv_owns_regs;
++    /* Bundle plan 4.2: the register-bytecode address of the instruction this
++       frame is executing, captured on the slow paths that can build a
++       backtrace. `cur_pc` stays NULL for a register frame (a register pc is not
++       a stack pc), so the trace readers use this through regvm_frame_pc. NULL
++       means the frame is not in a register call and renders without a line. */
++    const uint8_t *regvm_ip;
+ } JSStackFrame;
+ 
+ /*
+@@ -1536,10 +1542,13 @@
+ #if QJS_AOT_PROFILE
+     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
+     JSAotProfFunc *aot_prof;
+-    /* P0: stack pc of the instruction at each register-bytecode offset, so the
+-       dump can print a source position (`src=<line>:<col>`) for every site.
+-       One int32 per regvm byte; -1 at offsets that are not instruction starts.
+-       Only a profile build allocates it. */
++#endif
++#if QJS_REGVM
++    /* Bundle plan 4.1: stack pc of the instruction at each register-bytecode
++       offset, so the compiler can build a register-keyed pc2line table. One
++       int32 per regvm byte; -1 at offsets that are not instruction starts.
++       Freed once the register pc2line is built; only a profile build keeps it
++       (the AOT profiler dump prints `src=<line>:<col>`). */
+     int32_t *regvm_src_pc;
+ #endif
+ #if QJS_AOT
+@@ -11359,6 +11368,13 @@
+     return ret;
+ }
+ 
++#if QJS_REGVM
++static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
++                          JSFunctionBytecode *b);
++#else
++#define regvm_frame_pc(rt, sf, b) (-1)
++#endif
++
+ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+                             JSValueConst filter_func, const char *filename,
+                             int line_num, int col_num, int backtrace_flags)
+@@ -11368,6 +11384,7 @@
+     DynBuf dbuf;
+     const char *func_name_str;
+     const char *str1;
++    int rpc;
+     JSObject *p;
+     JSFunctionBytecode *b;
+     bool backtrace_barrier, has_prepare, has_filter_func;
+@@ -11473,10 +11490,13 @@
+ 
+         if (lazy) {
+             JSErrorStackFrame *lf = &lazy_frames[i];
++            int rpc = (b && !sf->cur_pc) ? regvm_frame_pc(rt, sf, b) : -1;
+ 
+             lf->func_name = get_func_name_value(ctx, sf->cur_func);
+-            if (b && sf->cur_pc) {
+-                uint32_t pc = sf->cur_pc - b->byte_code_buf - 1;
++            if (b && (sf->cur_pc || rpc >= 0)) {
++                uint32_t pc = sf->cur_pc
++                    ? (uint32_t)(sf->cur_pc - b->byte_code_buf - 1)
++                    : (uint32_t)rpc;
+ 
+                 lf->kind = 0;
+                 lf->line_num = find_line_num(ctx, b, pc, &lf->col_num);
+@@ -11512,6 +11532,17 @@
+                 if (line_num1 != -1)
+                     dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
+                 dbuf_putc(&dbuf, ')');
++            } else if (b && (rpc = regvm_frame_pc(rt, sf, b)) >= 0) {
++                const char *atom_str;
++                int line_num1, col_num1;
++
++                line_num1 = find_line_num(ctx, b, (uint32_t)rpc, &col_num1);
++                atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
++                dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
++                JS_FreeCString(ctx, atom_str);
++                if (line_num1 != -1)
++                    dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
++                dbuf_putc(&dbuf, ')');
+             } else if (b) {
+                 // FIXME(bnoordhuis) Missing `sf->cur_pc = pc` in bytecode
+                 // handler in JS_CallInternal. Almost never user observable
+@@ -24836,11 +24867,46 @@
+ }
+ #endif /* REGVM_SLIM_FRAME */
+ 
++/* Bundle plan 4.3: the register-bytecode offset a frame is executing, or -1
++   when the frame is not a live register record or its saved ip is not inside
++   this function's code. The readers pair a non-negative result with
++   find_line_num, which then uses the register-keyed pc2line table. */
++#if REGVM_SLIM_FRAME
++static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
++                          JSFunctionBytecode *b)
++{
++    const uint8_t *ip = sf->regvm_ip;
++
++    (void)rt;
++    if (!ip)
++        return -1;
++    if (ip < b->regvm_code || ip >= b->regvm_code + b->regvm_len)
++        return -1;
++    return (int)(ip - b->regvm_code);
++}
++#else
++static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
++                          JSFunctionBytecode *b)
++{
++    (void)rt;
++    (void)sf;
++    (void)b;
++    return -1;
++}
++#endif
++
+ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                   JSContext *ctx) REGVM_CC;
+ 
+ #define REGVM_ARGS  uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx
+ #define REGVM_PASS  ip, fr, f, ctx
++/*
++ * Bundle plan 4.2: record the instruction address on a frame before a call
++ * that can build a backtrace. `ip` is the instruction start (handlers read
++ * operands at offsets from it and never advance it), so the saved value needs
++ * no adjustment. Fast paths must not call this.
++ */
++#define REGVM_CAPTURE_IP() (f->sf->regvm_ip = ip)
+ 
+ /*
+  * Returned by `regvm_exec_one` for a *tail call*.
+@@ -26209,6 +26209,7 @@
+     int c = T_REG(3);
+     JSValue cf = FR(c);
+ 
++    REGVM_CAPTURE_IP();
+     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+@@ -26228,6 +26304,7 @@
+     int c = T_REG(3);
+     JSValue cf = FR(c);
+ 
++    REGVM_CAPTURE_IP();
+     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+@@ -26785,6 +26867,7 @@
+     JSObject *pa = js_args_apply_is_builtin(sp[-2]);
+     JSValue ret_val;
+ 
++    REGVM_CAPTURE_IP();
+     if (likely(pa != NULL &&
+                (f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
+         if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
+@@ -26903,6 +26986,7 @@
+     int na = T_U8(9);
+     JSValue *argv = FRP(ab);
+     JSValue cf = FR(c);
++    REGVM_CAPTURE_IP();
+ #if QJS_REGVM_RECORD
+     /*
+      * R3: a plain (non-derived) bytecode constructor whose frame can be built
+@@ -28398,6 +28482,7 @@
+ {
+     if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
+         return ip;
++    REGVM_CAPTURE_IP();
+ #if QJS_REGVM_RECORD
+     {
+         int c = T_REG(1);
+@@ -28424,6 +28514,7 @@
+ {
+     if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
+         return ip;
++    REGVM_CAPTURE_IP();
+ #if QJS_REGVM_RECORD
+     {
+         int c = T_REG(1);
+@@ -29068,6 +29164,7 @@
+ 
+     if (needs_backtrace(exc)) {
+         f->sf->cur_pc = NULL;
++        REGVM_CAPTURE_IP();
+         build_backtrace(ctx, exc, JS_UNDEFINED, NULL, 0, 0, 0);
+     }
+     __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
+@@ -29322,6 +29419,7 @@
+     sf->cur_gc_obj = NULL;
+ #endif
+     sf->cur_pc = NULL;
++    sf->regvm_ip = NULL;
+     sf->prev_frame = caller->sf;
+     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+ 
+@@ -29456,6 +29554,7 @@
+     sf->cur_gc_obj = NULL;
+ #endif
+     sf->cur_pc = NULL;
++    sf->regvm_ip = NULL;
+     sf->prev_frame = caller->sf;
+     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+ 
+@@ -41110,8 +41209,8 @@
+     JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
+     uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
+     uint16_t regvm_fill_count;
+-#if QJS_AOT_PROFILE
+-    /* P0: regvm-offset -> stack pc table, moved to the bytecode. */
++#if QJS_REGVM
++    /* Bundle plan 4.1: regvm-offset -> stack pc table, moved to the bytecode. */
+     int32_t *regvm_src_pc;
+ #endif
+     /* Per-pc operand pops of each nip_catch, from compute_stack_size; NULL
+@@ -52381,11 +52480,9 @@
+     fd->regvm_nip_pop = NULL;
+     js_free(ctx, fd->regvm_code);
+     fd->regvm_code = NULL;
+-#if QJS_AOT_PROFILE
+     js_free(ctx, fd->regvm_src_pc);
+     fd->regvm_src_pc = NULL;
+ #endif
+-#endif
+     free_objlit_sites(ctx, fd);
+     js_free(ctx, fd->jump_slots);
+     js_free(ctx, fd->label_slots);
+@@ -61522,11 +61648,8 @@
+                                    int win_size, int cycle_reg,
+                                    uint8_t **out_code, int *out_len,
+                                    int *out_regs, const int *rcc_canon,
+-                                   JSRegRCC **out_rcc
+-#if QJS_AOT_PROFILE
+-                                   , int32_t **out_src_pc
+-#endif
+-                                   )
++                                   JSRegRCC **out_rcc,
++                                   int32_t **out_src_pc)
+ {
+     uint8_t *code = NULL;
+     int *insn_pc = NULL;
+@@ -61538,10 +61661,8 @@
+     int di = 0;
+     long long n_decoded = 0;
+ 
+-#if QJS_AOT_PROFILE
+     if (out_src_pc)
+         *out_src_pc = NULL;
+-#endif
+ 
+     if (regvm_uses_scratch(ir))
+         scratch_reg = reg_count++; /* one register above every value register */
+@@ -62032,13 +62153,14 @@
+      */
+     n_decoded = ir->n_insns;
+ #endif
+-#if QJS_AOT_PROFILE
++#if QJS_REGVM
+     /*
+-     * P0 source positions (plan 2.4): one stack pc per register-bytecode offset,
+-     * so the profiler dump can turn a regvm pc into `src=<line>:<col>`. Built
+-     * last, where `insn_pc[]` and the layout are final and every failure path is
+-     * behind us. A failed allocation just omits source positions; it is not a
+-     * reason to refuse the program.
++     * Register source positions (bundle plan 4.1): one stack pc per
++     * register-bytecode offset. The caller turns this into a register-keyed
++     * pc2line table, so error traces name the same file:line:col as the stack
++     * build. Built last, where `insn_pc[]` and the layout are final and every
++     * failure path is behind us. A failed allocation just omits source
++     * positions; it is not a reason to refuse the program.
+      */
+     if (out_src_pc) {
+         int32_t *sp = js_malloc(ctx, (code_len > 0 ? code_len : 1) * sizeof(int32_t));
+@@ -66123,9 +66245,7 @@
+             fd->regvm_rcc = NULL;
+             fd->regvm_fill = NULL;
+             fd->regvm_fill_count = 0;
+-#if QJS_AOT_PROFILE
+             fd->regvm_src_pc = NULL;
+-#endif
+             er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
+                                                               are two bytes */,
+                                              reg_count,
+@@ -66136,11 +66136,8 @@
+                                              &fd->regvm_len,
+                                              &fd->regvm_reg_count,
+                                              rcc_canon,
+-                                             &fd->regvm_rcc
+-#if QJS_AOT_PROFILE
+-                                             , &fd->regvm_src_pc
+-#endif
+-                                             );
++                                             &fd->regvm_rcc,
++                                             &fd->regvm_src_pc);
+ 
+ #if QJS_REGVM_THREAD
+             /*
+@@ -69398,6 +69496,138 @@
+     return 0;
+ }
+ 
++#if QJS_REGVM
++/*
++ * Bundle plan 4.1: rebuild a register-compiled function's pc2line table keyed
++ * by register exec offset. The table the compiler installed is keyed by stack
++ * pc; a register frame reports a register offset, so the two disagree. Decode
++ * the stack table once, then for every instruction start emit an entry (same
++ * byte encoding as compute_pc2line_info) whenever the source position changes.
++ * `src_pc[off]` is the stack pc the instruction at register offset `off` came
++ * from, or -1 when `off` is not an instruction start.
++ */
++static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
++                                const int32_t *src_pc)
++{
++    DynBuf out;
++    const uint8_t *p, *p_end;
++    uint32_t *tp = NULL;
++    int *tl = NULL, *tc = NULL;
++    int tn = 0, j, rc;
++    int line_num, col_num, last_line, last_col;
++    uint32_t last_pc;
++
++    if (!b->pc2line_buf || b->pc2line_len <= 0 || b->regvm_len <= 0)
++        return;
++
++    /* Decode the stack-keyed table into parallel arrays. Every entry is at
++       least two bytes, so pc2line_len bounds the entry count. */
++    tp = js_malloc(ctx, (size_t)(b->pc2line_len + 1) * sizeof(*tp));
++    tl = js_malloc(ctx, (size_t)(b->pc2line_len + 1) * sizeof(*tl));
++    tc = js_malloc(ctx, (size_t)(b->pc2line_len + 1) * sizeof(*tc));
++    if (!tp || !tl || !tc)
++        goto done;
++
++    p = b->pc2line_buf;
++    p_end = p + b->pc2line_len;
++    line_num = b->line_num;
++    col_num = b->col_num;
++    {
++        uint32_t pc = 0;
++        int32_t v;
++        while (p < p_end) {
++            unsigned int op = *p++;
++            uint32_t val;
++            if (op == 0) {
++                rc = get_leb128(&val, p, p_end);
++                if (rc < 0)
++                    goto done;
++                pc += val;
++                p += rc;
++                rc = get_sleb128(&v, p, p_end);
++                if (rc < 0)
++                    goto done;
++                p += rc;
++                line_num += v;
++            } else {
++                op -= PC2LINE_OP_FIRST;
++                pc += (op / PC2LINE_RANGE);
++                line_num += (op % PC2LINE_RANGE) + PC2LINE_BASE;
++            }
++            rc = get_sleb128(&v, p, p_end);
++            if (rc < 0)
++                goto done;
++            p += rc;
++            col_num += v;
++            tp[tn] = pc;
++            tl[tn] = line_num;
++            tc[tn] = col_num;
++            tn++;
++        }
++    }
++
++    js_dbuf_init(ctx, &out);
++    last_line = b->line_num;
++    last_col = b->col_num;
++    last_pc = 0;
++    for (j = 0; j < b->regvm_len; j++) {
++        int32_t spc = src_pc[j];
++        int lo, hi, line, col, diff_pc, diff_line, diff_col;
++        if (spc < 0)
++            continue; /* not an instruction start */
++        /* last stack entry with pc <= spc */
++        lo = 0;
++        hi = tn;
++        while (lo < hi) {
++            int mid = (lo + hi) >> 1;
++            if ((int32_t)tp[mid] <= spc)
++                lo = mid + 1;
++            else
++                hi = mid;
++        }
++        if (lo > 0) {
++            line = tl[lo - 1];
++            col = tc[lo - 1];
++        } else {
++            line = b->line_num;
++            col = b->col_num;
++        }
++        if (line == last_line && col == last_col)
++            continue;
++        diff_pc = j - (int)last_pc;
++        diff_line = line - last_line;
++        diff_col = col - last_col;
++        if (diff_line >= PC2LINE_BASE &&
++            diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
++            diff_pc <= PC2LINE_DIFF_PC_MAX) {
++            dbuf_putc(&out, (diff_line - PC2LINE_BASE) +
++                      diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
++        } else {
++            dbuf_putc(&out, 0);
++            dbuf_put_leb128(&out, diff_pc);
++            dbuf_put_sleb128(&out, diff_line);
++        }
++        dbuf_put_sleb128(&out, diff_col);
++        last_pc = (uint32_t)j;
++        last_line = line;
++        last_col = col;
++    }
++
++    if (!dbuf_error(&out)) {
++        js_free(ctx, b->pc2line_buf);
++        b->pc2line_buf = out.buf;
++        b->pc2line_len = out.size;
++        out.buf = NULL;
++        out.size = 0;
++    }
++    dbuf_free(&out);
++ done:
++    js_free(ctx, tp);
++    js_free(ctx, tl);
++    js_free(ctx, tc);
++}
++#endif /* QJS_REGVM */
++
+ /* create a function object from a function definition. The function
+    definition is freed. All the child functions are also created. It
+    must be done this way to resolve all the variables. */
+@@ -69630,10 +69860,8 @@
+         fd->regvm_fill_count = 0;
+         b->regvm_compiled = 1;
+         b->regvm_all_threaded = fd->regvm_all_threaded;
+-#if QJS_AOT_PROFILE
+         b->regvm_src_pc = fd->regvm_src_pc;
+         fd->regvm_src_pc = NULL;
+-#endif
+         memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
+         js_free(ctx, fd->regvm_code);
+         fd->regvm_code = NULL;
+@@ -69680,6 +69908,20 @@
+     if (!b->pc2line_buf)
+         b->pc2line_buf = fd->pc2line.buf;
+     b->pc2line_len = fd->pc2line.size;
++#if QJS_REGVM && !QJS_AOT && !QJS_AOT_PROFILE
++    /*
++     * Bundle plan 4.1: a register-compiled function runs register code, so its
++     * pc2line table must be keyed by register exec offset, not stack pc. AOT
++     * builds keep the stack table (and src_pc) because their frames may still
++     * be stack frames.
++     */
++    if (b->regvm_compiled && b->regvm_src_pc)
++        regvm_build_pc2line(ctx, b, b->regvm_src_pc);
++#endif
++#if QJS_REGVM && !QJS_AOT_PROFILE
++    js_free(ctx, b->regvm_src_pc);
++    b->regvm_src_pc = NULL;
++#endif
+     b->source = fd->source;
+     b->source_len = fd->source_len;
+ 
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -784,7 +784,7 @@
+  * cross-VM one does. Bump it whenever an opcode is added, removed or
+  * renumbered, or an operand's width or meaning changes.
+  */
+-#define REGVM_FORMAT_VERSION 14
++#define REGVM_FORMAT_VERSION 15
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */

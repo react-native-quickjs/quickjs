@@ -1,0 +1,175 @@
+From: quickjs-ng bundle work
+Subject: Register bundles: decoder hardening (P4)
+
+What this does
+  Hardens the register bundle reader against corrupted input, found with the
+  P4 fuzz smoke test (.local/regvm-bundle/fuzz.c). Four fixes:
+
+  1. regvm_wire_decode wrote the opcode byte before checking that the
+     instruction fits: a wire stream longer than exec_len could run one
+     instruction past the allocation (heap-buffer-overflow). The check is now
+     "q = exec + 1 > exec_len" before any byte of the instruction is written.
+
+  2. regvm_unmap_atoms assembled a 4-byte atom as
+     code[q] | code[q+1] << 8 | ... on int, so a byte >= 0x80 in the top
+     position was a signed-shift overflow (UBSan). Each byte is cast to
+     uint32_t first.
+
+  3. js_closure2 aborts on an unknown closure type, and the reader did not
+     check the 3-bit field. A corrupted bundle could reach that abort; the
+     reader now rejects closure_type > JS_CLOSURE_GLOBAL_REF.
+
+  4. The runtime dereferences frame slot operands without a second check: a
+     var_ref slot is a pointer array followed by the control stack (a wild
+     pointer), and an out-of-range vardef index makes get_var_ref build a
+     var_ref from garbage. regvm_wire_decode now bounds every slot operand --
+     local/close/uninit against var_count, arg/arg_xfer/arg_el against
+     var_count or arg_count, get/put/check var_ref and make_local_ref against
+     max(var_ref_count, closure_var_count) (a var_ref slot may name a captured
+     local or a closure variable) -- and the vardef reader rejects a captured
+     variable whose var_ref_idx is >= var_ref_count.
+
+Why we need it
+  A bundle is untrusted input, and the register reader is now the only reader
+  of a register program: the decoder's operand checks are the whole contract.
+  Before this, a corrupted bundle could write past the decoded program, trip a
+  UBSan shift, or hand the interpreter a wild var_ref.
+
+What it adds
+  quickjs.c
+      the exec_len bound in regvm_wire_decode; the uint32_t casts in
+      regvm_unmap_atoms; the slot-operand bound block in regvm_wire_decode; the
+      closure-type check in JS_ReadFunctionTag; the var_ref_idx check in
+      JS_ReadFunctionBody.
+
+  Fuzz (.local/regvm-bundle/fuzz.c, 20,000 iterations, box2d bundle, 1-8 random
+  bytes flipped, checksum bypassed with the UINT32_MAX escape hatch, ASan +
+  UBSan): eager and lazy reads are clean. A build with the register wire
+  decoder disabled still reads the same bundle in 0.12 s (P3 measurement), so
+  the read paths are genuinely exercised.
+
+  Gates: box2d 546.1008391043414 (source/eager/lazy); test262 50/81192 no
+  leaks; the 13 Octane rows read clean in all three modes.
+
+diff --git a/quickjs.c b/quickjs.c
+index bbe4727..1821a5f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60153,9 +60153,9 @@ static void regvm_unmap_atoms(uint8_t *code, int len, int wide, int n,
+             if (fmt[m] == 'a' ||
+                 ((op == ROP_load_const || op == ROP_binary_cpool) && fmt[m] == 'c' &&
+                  kind == REG_CONST_ATOM)) {
+-                uint32_t a = (uint32_t)(code[q] | (code[q + 1] << 8) |
+-                                        (code[q + 2] << 16) |
+-                                        (code[q + 3] << 24));
++                uint32_t a = ((uint32_t)code[q] | ((uint32_t)code[q + 1] << 8) |
++                              ((uint32_t)code[q + 2] << 16) |
++                              ((uint32_t)code[q + 3] << 24));
+                 JS_FreeAtomRT(rt, a);
+                 if (++seen == n)
+                     return;
+@@ -73457,6 +73457,10 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+         }
+         nar = regvm_rop_narrow((uint16_t)op);
+         q = exec + 1;
++        if (q > exec_len) {
++            JS_ThrowSyntaxError(ctx, "register program too long");
++            goto fail_ins;
++        }
+         for (m = 0; fmt[m]; m++) {
+             int need, is_atom = 0;
+             uint32_t v;
+@@ -73584,6 +73588,61 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
+             goto fail_ins;
+         }
++        {
++            /* Slot operands index the frame's local, argument or closure-ref
++               arrays, and the runtime dereferences the result without any
++               further check (a bad var_ref slot is a wild pointer; a bad vardef
++               index makes get_var_ref build one from garbage). Bound every one
++               here, where the counts are known. A var_ref slot may name either a
++               captured local (var_ref_count) or a closure variable
++               (closure_var_count), so its bound is the larger of the two. */
++            uint32_t vr_bound = b->var_ref_count > b->closure_var_count
++                                    ? b->var_ref_count : b->closure_var_count;
++            int slot = -1;
++            uint32_t bound = 0;
++            switch (op) {
++            case ROP_get_local:
++                slot = ops[1]; bound = b->var_count; break;
++            case ROP_put_local:
++            case ROP_local_check:
++            case ROP_local_check_init:
++            case ROP_local_uninit:
++            case ROP_close_local:
++                slot = ops[0]; bound = b->var_count; break;
++            case ROP_get_local_s0: case ROP_get_local_s1:
++            case ROP_get_local_s2: case ROP_get_local_s3:
++                slot = op - ROP_get_local_s0; bound = b->var_count; break;
++            case ROP_put_local_s0: case ROP_put_local_s1:
++            case ROP_put_local_s2: case ROP_put_local_s3:
++                slot = op - ROP_put_local_s0; bound = b->var_count; break;
++            case ROP_get_arg:
++                slot = ops[1]; bound = b->arg_count; break;
++            case ROP_put_arg:
++            case ROP_put_arg_xfer:
++                slot = ops[0]; bound = b->arg_count; break;
++            case ROP_get_arg_el:
++                /* `u` names the `arguments` object's var_buf slot, not an
++                   argument index (see regvm_t_get_arg_el_slow). */
++                slot = ops[1]; bound = b->var_count; break;
++            case ROP_get_var_ref:
++                slot = ops[1]; bound = vr_bound; break;
++            case ROP_put_var_ref:
++            case ROP_var_ref_check:
++            case ROP_var_ref_check_init:
++                slot = ops[0]; bound = vr_bound; break;
++            case ROP_make_local_ref:
++                slot = ops[3];
++                bound = ops[4] == 0 ? b->var_count
++                      : ops[4] == 1 ? b->arg_count : vr_bound;
++                break;
++            default:
++                break;
++            }
++            if (slot >= 0 && (uint32_t)slot >= bound) {
++                JS_ThrowSyntaxError(ctx, "register slot out of range");
++                goto fail_ins;
++            }
++        }
+         if (op == ROP_make_local_ref && ops[4] == 1)
+             borrowable = false;
+         if (op == ROP_special_object && ops[1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS)
+@@ -74153,6 +74212,15 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+                     b->args_captured = 1;
+                 if (bc_get_leb128_u16(s, &vd->var_ref_idx))
+                     return -1;
++#if QJS_REGVM
++                /* get_var_ref indexes sf->var_refs[vd->var_ref_idx] with no
++                   bound of its own; a corrupted index would build a var_ref
++                   from garbage. */
++                if (vd->var_ref_idx >= b->var_ref_count) {
++                    JS_ThrowSyntaxError(ctx, "invalid var_ref index");
++                    return -1;
++                }
++#endif
+             }
+ #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+             if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
+@@ -74651,6 +74719,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+                 goto fail;
+             idx = 0;
+             cv->closure_type = bc_get_flags(flags, &idx, 3);
++#if QJS_REGVM
++            /* js_closure2 aborts on an unknown closure type, so a corrupted
++               bundle must be rejected here instead of crashing later. */
++            if (cv->closure_type > JS_CLOSURE_GLOBAL_REF) {
++                JS_ThrowSyntaxError(ctx, "invalid closure type %d",
++                                    cv->closure_type);
++                goto fail;
++            }
++#endif
+             cv->is_const = bc_get_flags(flags, &idx, 1);
+             cv->is_lexical = bc_get_flags(flags, &idx, 1);
+             cv->var_kind = bc_get_flags(flags, &idx, 4);

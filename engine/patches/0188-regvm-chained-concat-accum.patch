@@ -1,0 +1,129 @@
+Subject: register VM: extend the in-place string accumulator to chained concatenation
+
+What this does
+  A `'a' + x + 'b'` chain allocates two strings in the register VM where the
+  stack VM allocates one. Filling a 3-part leaf string in Octane's splay (`'String
+  for key ' + tag + ' in leaf node'`) allocated 7.80M strings over the run versus
+  3.96M in the stack VM; the same doubling shows on any chained concatenation.
+
+  The register VM appended in place only when the add's destination register was
+  also its left operand (the `s += x` shape that patch 0178 covers). For a chain,
+  the intermediate result is a separate register, the add's right operand is a
+  constant, and that constant reaches the interpreter through the non-pool branch
+  of `regvm_t_binary_cpool` / `L_ROP_binary_cpool`, which had no accumulator call
+  at all. Even where the accumulator was tried, the intermediate had no headroom
+  to extend into because the register VM never set the stack VM's scatter hint,
+  so `JS_ConcatString1` allocated the result at its exact length.
+
+  Sets `js_scat_hint` in the register add before the engine call, and gives the
+  non-pool constant branches of both `binary_cpool` handlers the same
+  `regvm_accum_append` call the pool branch already had. A chain now allocates its
+  first result once and extends it in place.
+
+Why we need it
+  R7 of `.local/regvm-fix-plan.md`. The register VM loses to the stack VM on
+  splay, and the plan asked first whether the register VM frees more objects than
+  the stack VM. It does not: object, array and bytecode allocation and free
+  counts are identical (class[1] 8,255,858 objects, class[2] 3,840,008 arrays,
+  free_object 12,097,459 on both). The one producer that does differ is the
+  string allocator, and the extra strings are also what drove the deferred
+  reference-counting parking and reconcile traffic that made splay's teardown
+  look expensive (js_drc_zero 36.7M calls vs 0.7M). Fixing the producer removes
+  both costs at once.
+
+What it adds
+  js_regvm_binary now sets the scatter hint before an ADD.
+  regvm_t_binary_cpool and L_ROP_binary_cpool now call regvm_accum_append on
+  their non-pool constant branch, exactly as their pool branch does.
+  quickjs-regvm-step.inc regenerated to match.
+
+Needs a bytecode version bump
+  No. The register opcodes are unchanged; only the runtime add path differs.
+
+Notes
+  - The accumulator refuses a constant left operand and a string that any slot
+    owns, so the first concatenation of a chain still allocates once and only a
+    register-only intermediate is extended. `var t = 'x' + tag; var r = t + 'y'`
+    still leaves `t` alone.
+  - Measured on the deterministic corpus (instructions:u, same compiler, A/B):
+    splay -3.66%, cycles -2.8%; every other row within +0.28% (pdfjs) and
+    -0.06%/+0.06% (noise). splay's instruction ratio to the stack VM goes
+    1.108 -> 1.068 and its cycle ratio 1.042 -> 1.015.
+  - box2d checksum 546.1008391043414 on threaded, monolith and STEPCHECK builds;
+    differential suite 400/0/0.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23994,6 +23994,11 @@
+     ops[1] = js_dup(b);
+     switch (subop) {
+     case REG_BIN_ADD:
++        /* Mirror the stack VM's scatter hint: a concatenation result that is
++           itself the left operand of the next add should carry headroom so that
++           add can extend it in place (JS_ConcatString1's slack). Without this
++           every chained concat allocates a fresh string. */
++        js_scat_hint = 1;
+         if (js_add_slow(ctx, ops + 2))
+             goto fail;
+         break;
+@@ -26967,6 +26972,18 @@
+         JSValue cst = JS_AtomToValue(ctx, idx);
+         if (JS_IsException(cst))
+             T_FAIL();
++        if (sub == REG_BIN_ADD) {
++            int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
++                                        d >> 4, a >> 4, cst);
++            if (ar > 0) {
++                JS_FreeValue(ctx, cst);
++                T_NEXT(11);
++            }
++            if (ar < 0) {
++                JS_FreeValue(ctx, cst);
++                T_FAIL();
++            }
++        }
+         if (!regvm_num_fast(sub, FR(a), cst, &out) &&
+             js_regvm_binary(ctx, sub, FR(a), cst, &out)) {
+             JS_FreeValue(ctx, cst);
+@@ -33165,6 +33182,18 @@
+                     JSValue cst = JS_AtomToValue(ctx, idx);
+                     if (JS_IsException(cst))
+                         goto exception;
++                    if (sub == REG_BIN_ADD) {
++                        int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
++                                                     argc, d, a, cst);
++                        if (_ar > 0) {
++                            JS_FreeValue(ctx, cst);
++                            REGVM_NEXT();
++                        }
++                        if (_ar < 0) {
++                            JS_FreeValue(ctx, cst);
++                            goto exception;
++                        }
++                    }
+                     if (!regvm_num_fast(sub, regs[a], cst, &out) &&
+                         js_regvm_binary(ctx, sub, regs[a], cst, &out)) {
+                         JS_FreeValue(ctx, cst);
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -502,6 +502,18 @@
+                     JSValue cst = JS_AtomToValue(ctx, idx);
+                     if (JS_IsException(cst))
+                         goto exception;
++                    if (sub == REG_BIN_ADD) {
++                        int _ar = regvm_accum_append(ctx, b, regs, rf->arg_buf,
++                                                     rf->argc, d, a, cst);
++                        if (_ar > 0) {
++                            JS_FreeValue(ctx, cst);
++                            REGVM_NEXT();
++                        }
++                        if (_ar < 0) {
++                            JS_FreeValue(ctx, cst);
++                            goto exception;
++                        }
++                    }
+                     if (!regvm_num_fast(sub, regs[a], cst, &out) &&
+                         js_regvm_binary(ctx, sub, regs[a], cst, &out)) {
+                         JS_FreeValue(ctx, cst);

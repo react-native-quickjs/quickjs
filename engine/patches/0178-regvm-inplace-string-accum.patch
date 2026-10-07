@@ -1,0 +1,2341 @@
+Subject: register VM: in-place string accumulator
+
+What this does:
+  Adds regvm_accum_append, a register-path port of the stack VM's
+  js_accum_append. When a `s += x` add has its destination register equal to its
+  left operand and that register provably holds the only reference to a normal,
+  non-atom string, the append happens in place (memcpy + length bump, or a
+  realloc with growth slack) instead of allocating a fresh rope.
+
+  The "only reference" test is the DRC state: a register-only value has ref_count
+  0 and sits on the zero-count table, while a value any slot owns carries a
+  counted reference. Borrowed-register aliases are invisible to the count, so the
+  helper additionally scans every location in the frame that can hold a borrowed
+  value -- the register file and the argument window -- and refuses on any match.
+  Slots own counted references, so a zero count already rules out locals,
+  closures, properties and array elements.
+
+  Wired into the four add sites: the threaded T_BODY_RRR macro, the threaded
+  regvm_t_binary_cpool handler, the monolith REGVM_BIN_OP macro and the monolith
+  L_ROP_binary_cpool. The step helpers (quickjs-regvm-step.inc) are regenerated
+  to expose rf->arg_buf/rf->argc to REGVM_BIN_OP.
+
+Why we need it:
+  The generic register add duplicates both operands before calling the engine, so
+  JS_ConcatString2's in-place test can never fire and every `s += x` allocates a
+  new string. That concat memcpy is pdfjs's dominant remaining cost. Measured on
+  the deterministic corpus (instructions:u, R4 -> R5): pdfjs -10.1%; every other
+  row within +0.5%/-0.8% (noise). pdfjs Octane score 4201 -> 5094.
+
+Needs a bytecode version bump: No
+
+Notes:
+  - d and a are register indices (element offsets into fr); the threaded call
+    sites shift the raw index<<4 byte offsets the threaded decoder hands out.
+  - The right operand is borrowed and is never freed, unlike js_accum_append
+    which frees its op2.
+  - Under QJS_DRC only; a non-DRC build compiles the helper to `return 0`.
+
+diff --git a/quickjs.c b/quickjs.c
+index 7b98099..4ed305b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24021,6 +24021,126 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
+     return -1;
+ }
+ 
++/*
++ * R5: the in-place string accumulator.
++ *
++ * `s += x` compiles to an add whose destination register is also its left
++ * operand. The generic add above duplicates both operands, so
++ * JS_ConcatString2's in-place test can never fire and every append allocates a
++ * fresh rope -- pdfjs's dominant cost.
++ *
++ * This appends into the left operand in place when the register provably holds
++ * the only reference to it. Under deferred RC a register borrows its values, so
++ * a register-only string has ref_count 0 and sits on the zero-count table, while
++ * a string some slot owns carries a counted reference; a borrowed register alias
++ * is invisible to the count in either case. The test is therefore the count
++ * *plus* a scan of every location in this frame that can hold a borrowed value:
++ * the register file and the argument window. Slots own counted references, so a
++ * zero count already rules out locals, closures, properties and array elements.
++ *
++ * Returns 1 when the append happened (fr[a] already names the extended string),
++ * 0 when the caller must run the generic add, and -1 with an exception set.
++ * Unlike js_accum_append the right operand is borrowed and is never freed.
++ *
++ * d and a are register *indices* (element offsets into fr), not the raw
++ * index<<4 byte offsets the threaded decoder hands out -- the threaded call
++ * sites shift before calling.
++ */
++static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
++                              JSValue *fr, JSValue *arg_buf, int argc,
++                              int d, int a, JSValue op2)
++{
++#if QJS_DRC
++    JSString *p1, *p2;
++    uint32_t i, nregs, nlen, cap;
++    size_t need;
++    void *p1ptr;
++
++    if (d != a)
++        return 0;
++    if (JS_VALUE_GET_TAG(fr[a]) != JS_TAG_STRING ||
++        JS_VALUE_GET_TAG(op2) != JS_TAG_STRING)
++        return 0;
++    p1 = JS_VALUE_GET_STRING(fr[a]);
++    p2 = JS_VALUE_GET_STRING(op2);
++    if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0)
++        return 0;
++    /* No counted owner anywhere, and the value must be parked: a register-only
++       value. A slot-owned string has a count and is refused here. */
++    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1))
++        return 0;
++    if (p1->is_wide_char != p2->is_wide_char)
++        return 0;
++    if (p2->len == 0)
++        return 0;
++    if ((uint64_t)p1->len + p2->len > JS_STRING_LEN_MAX)
++        return 0;
++    p1ptr = p1;
++    nregs = b->regvm_reg_count;
++    for (i = 0; i < nregs; i++) {
++        if (i == (uint32_t)a)
++            continue;
++        if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
++            JS_VALUE_GET_PTR(fr[i]) == p1ptr)
++            return 0;
++    }
++    if (arg_buf != NULL) {
++        for (i = 0; i < (uint32_t)argc; i++) {
++            if (JS_VALUE_GET_TAG(arg_buf[i]) == JS_TAG_STRING &&
++                JS_VALUE_GET_PTR(arg_buf[i]) == p1ptr)
++                return 0;
++        }
++    }
++    nlen = p1->len + p2->len;
++    need = sizeof(*p1) + ((size_t)nlen << p1->is_wide_char) + 1 -
++           p1->is_wide_char;
++    if (js_malloc_usable_size(ctx, p1) >= need) {
++        if (p1->is_wide_char) {
++            memcpy(str16(p1) + p1->len, str16(p2), (size_t)p2->len << 1);
++        } else {
++            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
++            str8(p1)[nlen] = '\0';
++        }
++        p1->len = nlen;
++        return 1;
++    } else {
++        JSString *np;
++        JSValue nv;
++
++        cap = nlen;
++        if (nlen >= JS_STRING_ACCUM_MIN_GROW) {
++            uint32_t slack = nlen >> 1;
++            if (slack > JS_STRING_ACCUM_MAX_SLACK)
++                slack = JS_STRING_ACCUM_MAX_SLACK;
++            if (nlen <= JS_STRING_LEN_MAX - slack)
++                cap = nlen + slack;
++        }
++        np = js_alloc_string(ctx, cap, p1->is_wide_char);
++        if (unlikely(!np))
++            return -1;
++        if (p1->is_wide_char) {
++            memcpy(str16(np), str16(p1), (size_t)p1->len << 1);
++            memcpy(str16(np) + p1->len, str16(p2), (size_t)p2->len << 1);
++        } else {
++            memcpy(str8(np), str8(p1), p1->len);
++            memcpy(str8(np) + p1->len, str8(p2), p2->len);
++            str8(np)[nlen] = '\0';
++        }
++        np->len = nlen;
++        nv = JS_MKPTR(JS_TAG_STRING, np);
++        fr[a] = nv;
++        /* Adopt the producer's reference: the register borrows, so the fresh
++           string must end up parked exactly like any other register value. */
++        REG_ADOPT(ctx->rt, nv);
++        return 1;
++    }
++#else
++    (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
++    (void)d; (void)a; (void)op2;
++    return 0;
++#endif
++}
++
+ static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
+                                       JSValue *out)
+ {
+@@ -25052,7 +25172,14 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
+ /* the cold halves: decode the shape, run the engine's slow routine, continue */
+ #define T_BODY_RRR(SUB_, SZ_) do { \
+         int _d = T_REG(1); \
+-        JSValue _o1 = FR(T_REG(3)), _o2 = FR(T_REG(5)), _out; \
++        int _a = T_REG(3); \
++        JSValue _o1 = FR(_a), _o2 = FR(T_REG(5)), _out; \
++        if ((SUB_) == REG_BIN_ADD) { \
++            int _ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc, \
++                                         _d >> 4, _a >> 4, _o2); \
++            if (_ar > 0) T_NEXT(SZ_); \
++            if (_ar < 0) T_FAIL(); \
++        } \
+         if (js_regvm_binary(ctx, SUB_, _o1, _o2, &_out)) \
+             T_FAIL(); \
+         T_SET_NEXT_P(_d, _out, SZ_); \
+@@ -26743,9 +26870,16 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
+     JSValue out;
+ 
+     if (kind == REG_CONST_CPOOL) {
+-        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out) &&
+-            js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
+-            T_FAIL();
++        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out)) {
++            if (sub == REG_BIN_ADD) {
++                int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
++                                            d >> 4, a >> 4, f->b->cpool[idx]);
++                if (ar > 0) T_NEXT(11);
++                if (ar < 0) T_FAIL();
++            }
++            if (js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
++                T_FAIL();
++        }
+     } else {
+         JSValue cst = JS_AtomToValue(ctx, idx);
+         if (JS_IsException(cst))
+@@ -30023,9 +30157,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             int a_ = RD_REG(); \
+             int c_ = RD_REG(); \
+             JSValue out_; \
+-            if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_) && \
+-                js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
+-                goto exception; \
++            if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_)) { \
++                if ((SUB_) == REG_BIN_ADD) { \
++                    int _ar = regvm_accum_append(ctx, b, regs, arg_buf, argc, \
++                                                 d_, a_, regs[c_]); \
++                    if (_ar > 0) REGVM_NEXT(); \
++                    if (_ar < 0) goto exception; \
++                } \
++                if (js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
++                    goto exception; \
++            } \
+             SET_REG_P(d_, out_); \
+             REGVM_NEXT(); \
+         } while (0)
+@@ -32909,9 +33050,18 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 uint32_t idx = RD_U32();
+                 JSValue out;
+                 if (kind == REG_CONST_CPOOL) {
+-                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out) &&
+-                        js_regvm_binary(ctx, sub, regs[a], b->cpool[idx], &out))
+-                        goto exception;
++                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out)) {
++                        if (sub == REG_BIN_ADD) {
++                            int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
++                                                         argc, d, a,
++                                                         b->cpool[idx]);
++                            if (_ar > 0) REGVM_NEXT();
++                            if (_ar < 0) goto exception;
++                        }
++                        if (js_regvm_binary(ctx, sub, regs[a], b->cpool[idx],
++                                            &out))
++                            goto exception;
++                    }
+                 } else {
+                     JSValue cst = JS_AtomToValue(ctx, idx);
+                     if (JS_IsException(cst))
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index 66d2f1d..c20ab28 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -14,7 +14,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_ADD); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -30,7 +32,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_brand(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int home = RD_REG();
+@@ -52,7 +56,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_s(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG8();
+                 int a = RD_REG8();
+@@ -90,7 +96,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch(uint8_t *ip, JSValue *f
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int32_t imm = RD_OFF8();
+@@ -134,7 +142,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch_s(uint8_t *ip, JSValue
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG8();
+                 int32_t imm = RD_OFF8();
+@@ -186,7 +196,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_s(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG8();
+                 int32_t imm = RD_OFF8();
+@@ -223,7 +235,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_mul(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int dm_ = RD_REG();
+                 int x_ = RD_REG();
+@@ -255,7 +269,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_append(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int w = RD_REG();
+                 JSValue *sp = &regs[w + 3];
+@@ -285,7 +301,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply(uint8_t *ip, JSValue *fr, JSRegRun *r
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int w = RD_REG();
+@@ -314,7 +332,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply_arguments(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int w = RD_REG();
+                 int d = RD_REG();
+@@ -350,7 +370,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply_eval(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int f = RD_REG();
+@@ -388,7 +410,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_array_from(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int ab = RD_REG();
+@@ -413,7 +437,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -449,7 +475,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_cpool(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -458,9 +486,18 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_cpool(uint8_t *ip, JSValue *fr, JSRe
+                 uint32_t idx = RD_U32();
+                 JSValue out;
+                 if (kind == REG_CONST_CPOOL) {
+-                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out) &&
+-                        js_regvm_binary(ctx, sub, regs[a], b->cpool[idx], &out))
+-                        goto exception;
++                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out)) {
++                        if (sub == REG_BIN_ADD) {
++                            int _ar = regvm_accum_append(ctx, b, regs, rf->arg_buf,
++                                                         rf->argc, d, a,
++                                                         b->cpool[idx]);
++                            if (_ar > 0) REGVM_NEXT();
++                            if (_ar < 0) goto exception;
++                        }
++                        if (js_regvm_binary(ctx, sub, regs[a], b->cpool[idx],
++                                            &out))
++                            goto exception;
++                    }
+                 } else {
+                     JSValue cst = JS_AtomToValue(ctx, idx);
+                     if (JS_IsException(cst))
+@@ -497,7 +534,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_imm(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -524,7 +563,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_imm_s(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG8();
+                 int sub = RD_U8();
+@@ -563,7 +604,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_loc_loc(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -590,7 +633,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_loc_reg(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -617,7 +662,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_reg_loc(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -644,7 +691,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_bitand(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_AND); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -660,7 +709,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_bitor(uint8_t *ip, JSValue *fr, JSRegRun *r
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_OR); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -676,7 +727,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_bitxor(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_XOR); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -692,7 +745,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int32_t off = RD_I32(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
+  exception:
+@@ -709,7 +764,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_loc_loc(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int sub = RD_U8(); int lu = RD_U16(); int ru = RD_U16();
+                   int32_t off = RD_I32();
+@@ -728,7 +785,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_loc_reg(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int sub = RD_U8(); int lu = RD_U16(); int rr = RD_REG();
+                   int32_t off = RD_I32();
+@@ -747,7 +806,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_reg_loc(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int sub = RD_U8(); int lr = RD_REG(); int ru = RD_U16();
+                   int32_t off = RD_I32();
+@@ -766,7 +827,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_reg_reg(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int sub = RD_U8(); int la = RD_REG(); int rb = RD_REG();
+                   int32_t off = RD_I32();
+@@ -785,7 +848,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_reg_reg_s(uint8_t *ip, JSValue *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int sub = RD_U8(); int la = RD_REG8(); int rb = RD_REG8();
+                   int32_t off = RD_OFF8();
+@@ -813,7 +878,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_eq_s(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_EQ;
+@@ -832,7 +899,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_gt_s(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_GT;
+@@ -851,7 +920,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_gte_s(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_GTE;
+@@ -870,7 +941,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_if(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int c = RD_REG(); int32_t off = RD_I32();
+                   if (regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+@@ -889,7 +962,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_if_not(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int c = RD_REG(); int32_t off = RD_I32();
+                   if (!regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+@@ -917,7 +992,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_lt_s(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_LT;
+@@ -936,7 +1013,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_lte_s(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_LTE;
+@@ -955,7 +1034,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_neq_s(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_NEQ;
+@@ -977,7 +1058,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_ngt_s(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_GT | REG_CMP_INVERT;
+@@ -996,7 +1079,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_ngte_s(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_GTE | REG_CMP_INVERT;
+@@ -1015,7 +1100,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_nlt_s(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_LT | REG_CMP_INVERT;
+@@ -1034,7 +1121,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_nlte_s(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
+                   const int sub = REG_BIN_LTE | REG_CMP_INVERT;
+@@ -1053,7 +1142,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_s(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int32_t off = RD_OFF8(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
+  exception:
+@@ -1070,7 +1161,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_call(uint8_t *ip, JSValue *fr, JSRegRun *rf
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int c = RD_REG();
+@@ -1110,7 +1203,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_call_method(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int c = RD_REG();
+@@ -1151,7 +1246,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_catch_enter(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int32_t off = RD_I32();
+@@ -1180,7 +1277,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_check_brand(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int t2 = RD_REG();
+                 int f = RD_REG();
+@@ -1207,7 +1306,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_check_ctor(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 if (JS_IsUndefined(rf->new_target)) {
+                     JS_ThrowTypeError(ctx,
+@@ -1229,7 +1330,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_check_ctor_return(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -1269,7 +1372,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_check_define(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 JSAtom atom = RD_U32();
+                 int flags = RD_U8();
+@@ -1291,7 +1396,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_check_object(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int v = RD_REG();
+                   if (unlikely(!JS_IsObject(regs[v]))) {
+@@ -1313,7 +1420,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_close_local(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = RD_U16(); close_lexical_var(ctx, b, rf->sf, slot); REGVM_NEXT(); }
+  exception:
+@@ -1330,7 +1439,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_construct(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int c = RD_REG();
+@@ -1360,7 +1471,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_copy_props(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int t2 = RD_REG();
+                 int s2 = RD_REG();
+@@ -1383,7 +1496,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_dec(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_UN_OP(REG_UN_DEC); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -1399,7 +1514,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_class(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int pw = RD_REG();
+                 int bw = RD_REG();
+@@ -1433,7 +1550,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_class_computed(uint8_t *ip, JSValue
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int kw = RD_REG();
+                 int pw = RD_REG();
+@@ -1465,7 +1584,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_element(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int key = RD_REG();
+@@ -1490,7 +1611,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_field(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -1528,7 +1651,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_global(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 JSAtom atom = RD_U32();
+                 int flags = RD_U8();
+@@ -1550,7 +1675,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_global_func(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 JSAtom atom = RD_U32();
+                 int s = RD_REG();
+@@ -1573,7 +1700,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_method(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int k = -1;
+@@ -1638,7 +1767,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_define_private(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int o = RD_REG();
+@@ -1668,7 +1799,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_delete(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int robj = RD_REG();
+@@ -1705,7 +1838,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_delete_var(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -1729,7 +1864,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_div(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_DIV); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -1745,7 +1882,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_dynamic_import(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int spec = RD_REG();
+@@ -1777,7 +1916,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_eq(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_EQ); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -1793,7 +1934,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_eval(uint8_t *ip, JSValue *fr, JSRegRun *rf
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int c = RD_REG();
+@@ -1830,7 +1973,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_finally_enter(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int32_t off = RD_I32();
+@@ -1865,7 +2010,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_finally_leave(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 if (rf->nctl <= 0 || rf->ctl[rf->nctl - 1].kind != REG_CTL_GOSUB) {
+                     JS_ThrowInternalError(rf->caller_ctx,
+@@ -1890,7 +2037,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_for_await_of_start(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int w = RD_REG();
+                 /* the same start as the synchronous loop, with the async
+@@ -1929,7 +2078,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_for_in_next(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int w = RD_REG();
+                   if (regvm_for_in_next(ctx, &regs[w + 1])) goto exception;
+@@ -1948,7 +2099,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_for_in_start(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int w = RD_REG();
+                   if (regvm_for_in_start(ctx, &regs[w + 1])) goto exception;
+@@ -1967,7 +2120,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_arg(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }
+  exception:
+@@ -1984,7 +2139,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_arg_el(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int idx = RD_U16();
+@@ -2019,7 +2176,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_element(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int o = RD_REG();
+@@ -2080,7 +2239,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int r = RD_REG();
+@@ -2121,7 +2282,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field2(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int r = RD_REG();
+@@ -2156,7 +2319,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field_chain(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 /* X3b: two reads, two destinations, one dispatch. The second
+                    receiver is the first destination, so it is read back after
+@@ -2225,7 +2390,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_global(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -2264,7 +2431,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_length(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int r = RD_REG();
+@@ -2295,7 +2464,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG(); int slot = RD_U16();
+ #ifdef QJS_REGVM_COUNT
+@@ -2316,7 +2487,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int slot = RD_U16();
+@@ -2352,7 +2525,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
+@@ -2387,7 +2562,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_s0(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG();
+                   SET_REG_B(d,rf->var_buf[op - ROP_get_local_s0]); REGVM_NEXT(); }
+@@ -2405,7 +2582,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_private(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int o = RD_REG();
+@@ -2430,7 +2609,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_ref_value(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int o = RD_REG();
+@@ -2465,7 +2646,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_super(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -2490,7 +2673,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_var_ref(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG(); int slot = RD_U16();
+                   SET_REG_B(d,*rf->var_refs[slot]->pvalue); REGVM_NEXT(); }
+@@ -2508,7 +2693,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_gt(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_GT); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2524,7 +2711,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_gte(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_GTE); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2540,7 +2729,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_in(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_IN); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2556,7 +2747,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_UN_OP(REG_UN_INC); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2572,7 +2765,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_init_ctor(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 JSValue super, ret;
+@@ -2605,7 +2800,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_instanceof(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_INSTANCEOF); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2621,7 +2818,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_close(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int it = RD_REG();
+                 int nx = RD_REG();
+@@ -2689,7 +2888,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_next(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int w = RD_REG();
+                   if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
+@@ -2722,7 +2923,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_start(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int w = RD_REG();
+                 if (regvm_for_of_start(ctx, &regs[w + 1], false))
+@@ -2755,7 +2958,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_value_done(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int w = RD_REG();
+                   JSValue tmp[5] = { JS_UNDEFINED, JS_UNDEFINED,
+@@ -2807,7 +3012,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_iterator_call(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int w = RD_REG();
+                 int flags = RD_U8();
+@@ -2857,7 +3064,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_iterator_next(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d0 = RD_REG();
+                 int d1 = RD_REG();
+@@ -2900,7 +3109,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_bigint_i32(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG(); SET_REG_P(d, __JS_NewShortBigInt(ctx, RD_I32())); REGVM_NEXT(); }
+  exception:
+@@ -2917,7 +3128,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_const(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int kind = RD_U8();
+@@ -2949,7 +3162,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_false(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+      { int d = RD_REG(); SET_REG_P(d, JS_FALSE); REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2965,7 +3180,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_i32(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG(); SET_REG_P(d, js_int32(RD_I32())); REGVM_NEXT(); }
+  exception:
+@@ -2982,7 +3199,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_i8(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+  exception:
+@@ -2999,7 +3218,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_i8_s(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG8(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+  exception:
+@@ -3016,7 +3237,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_null(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+       { int d = RD_REG(); SET_REG_P(d, JS_NULL); REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3032,7 +3255,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_this(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 /*
+                  * A non-strict function's `this` is coerced on the way in:
+@@ -3077,7 +3302,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_true(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+       { int d = RD_REG(); SET_REG_P(d, JS_TRUE); REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3093,7 +3320,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_load_undefined(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { int d = RD_REG(); SET_REG_P(d, JS_UNDEFINED); REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3109,7 +3338,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_check(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int slot = RD_U16();
+                 if (JS_IsUninitialized(rf->var_buf[slot])) {
+@@ -3132,7 +3363,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_check_init(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int slot = RD_U16();
+                 if (!JS_IsUninitialized(rf->var_buf[slot])) {
+@@ -3156,7 +3389,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_branch(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 /* the update and the back edge in one instruction */
+                 { int sub = RD_U8(); int slot = RD_U16(); int32_t imm = RD_I32();
+@@ -3206,7 +3441,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_imm(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 /* `slot = slot <subop> imm`, the generic operation, so a string
+                    local still concatenates. The slot is borrowed (js_regvm_binary
+@@ -3304,7 +3541,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_uninit(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = RD_U16();
+                   set_value(ctx, &rf->var_buf[slot], JS_UNINITIALIZED); REGVM_NEXT(); }
+@@ -3322,7 +3561,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_lt(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_LT); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3338,7 +3579,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_lte(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_LTE); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3354,7 +3597,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_make_closure(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 uint32_t idx = RD_U32();
+@@ -3379,7 +3624,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_make_local_ref(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d0 = RD_REG();
+                 int d1 = RD_REG();
+@@ -3433,7 +3680,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_make_var_ref(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d0 = RD_REG();
+                 int d1 = RD_REG();
+@@ -3460,7 +3709,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_mod(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_MOD); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3476,7 +3727,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_move(uint8_t *ip, JSValue *fr, JSRegRun *rf
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 /* A self-move is a no-op: the allocator coalesces a move's
+                    destination onto its source, and duplicating there would
+@@ -3497,7 +3750,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_move_s(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG8(); int s = RD_REG8();
+                   if (d != s) SET_REG_B(d,regs[s]); REGVM_NEXT(); }
+@@ -3515,7 +3770,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_move_xfer(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 /* The source is dead here: move its reference rather than
+                    duplicating it, and empty the source's register. Under
+@@ -3545,7 +3802,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_mul(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_MUL); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3561,7 +3820,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_mul_add(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int dm_ = RD_REG();
+                 int x_ = RD_REG();
+@@ -3593,7 +3854,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_mul_sub(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int dm_ = RD_REG();
+                 int x_ = RD_REG();
+@@ -3625,7 +3888,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_neg(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_UN_OP(REG_UN_NEG); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3641,7 +3906,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_neq(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_NEQ); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3657,7 +3924,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_new_object(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 JSValue val = JS_NewObject(ctx);
+@@ -3680,7 +3949,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_nip_catch(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int src = RD_REG();
+@@ -3714,7 +3985,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_not(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_UN_OP(REG_UN_NOT); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3730,7 +4003,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_object_fill(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int ab = RD_REG();
+@@ -3805,7 +4080,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_object_template(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int index = RD_U16();
+@@ -3841,7 +4118,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_pow(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_POW); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -3857,7 +4136,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_private_symbol(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -3881,7 +4162,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_arg(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = RD_U16(); int s = RD_REG();
+ #if QJS_DRC
+@@ -3904,7 +4187,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_arg_xfer(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = RD_U16(); int s = RD_REG();
+ #if QJS_DRC
+@@ -3929,7 +4214,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_element(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int key = RD_REG();
+@@ -3960,7 +4247,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_element_xfer(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int key = RD_REG();
+@@ -3995,7 +4284,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int r = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -4063,7 +4354,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field_xfer(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int r = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -4119,7 +4412,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_global(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 JSAtom atom = RD_U32();
+                 int s = RD_REG();
+@@ -4142,7 +4437,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_local(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = RD_U16(); int s = RD_REG();
+ #ifdef QJS_REGVM_COUNT
+@@ -4163,7 +4460,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_local_s0(uint8_t *ip, JSValue *fr, JSRe
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = op - ROP_put_local_s0; int s = RD_REG();
+                   set_value(ctx, &rf->var_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
+@@ -4181,7 +4480,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_local_xfer(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 /* The source is dead here: the binding takes its reference, as
+                    the stack interpreter's put transfers the value it popped.
+@@ -4209,7 +4510,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_local_xfer_s0(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = op - ROP_put_local_xfer_s0; int s = RD_REG();
+ #if QJS_DRC
+@@ -4233,7 +4536,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_private(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int v = RD_REG();
+@@ -4258,7 +4563,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_ref_value(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int k = RD_REG();
+@@ -4302,7 +4609,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_super_value(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int home = RD_REG();
+                 int o = RD_REG();
+@@ -4339,7 +4648,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_var_ref(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int slot = RD_U16(); int s = RD_REG();
+                   set_value(ctx, rf->var_refs[slot]->pvalue, js_dup(regs[s])); REGVM_NEXT(); }
+@@ -4357,7 +4668,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_regexp(uint8_t *ip, JSValue *fr, JSRegRun *
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int p2 = RD_REG();
+@@ -4384,7 +4697,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_rest(uint8_t *ip, JSValue *fr, JSRegRun *rf
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int first = RD_U16();
+@@ -4410,7 +4725,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_sar(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_SAR); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -4426,7 +4743,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_sentinel_drop(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 if (rf->nctl > 0 && rf->ctl[rf->nctl - 1].kind == REG_CTL_ITER) {
+                     JS_FreeValue(ctx, rf->ctl[rf->nctl - 1].next);
+@@ -4456,7 +4775,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_set_home_object(uint8_t *ip, JSValue *fr, J
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int f = RD_REG();
+                 int h = RD_REG();
+@@ -4477,7 +4798,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_set_name(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int r = RD_REG();
+                 JSAtom atom = RD_U32();
+@@ -4500,7 +4823,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_set_name_computed(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int n = RD_REG();
+@@ -4529,7 +4854,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_set_proto(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int o = RD_REG();
+                 int p2 = RD_REG();
+@@ -4554,7 +4881,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_shl(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_SHL); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -4570,7 +4899,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_shr(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_SHR); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -4586,7 +4917,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_special_object(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int kind = RD_U8();
+@@ -4646,7 +4979,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_strict_eq(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_STRICT_EQ); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -4662,7 +4997,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_strict_neq(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_STRICT_NEQ); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -4678,7 +5015,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_sub(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_BIN_OP(REG_BIN_SUB); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -4694,7 +5033,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_sub_imm_s(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG8();
+                 int a = RD_REG8();
+@@ -4739,7 +5080,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_sub_imm_self_s(uint8_t *ip, JSValue *fr, JS
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG8();
+                 int32_t imm = RD_OFF8();
+@@ -4783,7 +5126,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_sub_mul(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int dm_ = RD_REG();
+                 int x_ = RD_REG();
+@@ -4815,7 +5160,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_super_get(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int t = RD_REG();
+@@ -4850,7 +5197,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_tail_call(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int c = RD_REG();
+                 int ab = RD_REG();
+@@ -4889,7 +5238,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_tail_call_method(uint8_t *ip, JSValue *fr,
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int c = RD_REG();
+                 int r = RD_REG();
+@@ -4926,7 +5277,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_throw(uint8_t *ip, JSValue *fr, JSRegRun *r
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int s = RD_REG();
+                 JSValue v = regs[s];
+@@ -4953,7 +5306,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_throw_error(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 JSAtom atom = RD_U32();
+                 int type = RD_U8();
+@@ -4985,7 +5340,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_to_numeric(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  { REGVM_UN_OP(REG_UN_TO_NUMERIC); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -5001,7 +5358,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_to_object(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -5035,7 +5394,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_to_propkey(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int src = RD_REG();
+@@ -5077,7 +5438,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_unary(uint8_t *ip, JSValue *fr, JSRegRun *r
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int sub = RD_U8();
+@@ -5106,7 +5469,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_using_check(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -5130,7 +5495,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_using_dispose(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -5185,7 +5552,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_using_dispose_async(uint8_t *ip, JSValue *f
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int slot = RD_U16();
+@@ -5217,7 +5586,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_using_end(uint8_t *ip, JSValue *fr, JSRegRu
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int s = RD_REG();
+                 JSValue error_state = regs[s];
+@@ -5241,7 +5612,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_using_init(uint8_t *ip, JSValue *fr, JSRegR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+                 { int d = RD_REG();
+                   SET_REG_P(d, JS_UNINITIALIZED);
+@@ -5260,7 +5633,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_using_merge(uint8_t *ip, JSValue *fr, JSReg
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -5293,7 +5668,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_var_ref_check(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int slot = RD_U16();
+                 if (JS_IsUninitialized(*rf->var_refs[slot]->pvalue)) {
+@@ -5316,7 +5693,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_var_ref_check_init(uint8_t *ip, JSValue *fr
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int slot = RD_U16();
+                 if (!JS_IsUninitialized(*rf->var_refs[slot]->pvalue)) {
+@@ -5339,7 +5718,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_get(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int o = RD_REG();
+@@ -5387,7 +5768,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_make_ref(uint8_t *ip, JSValue *fr, JSR
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d0 = RD_REG();
+                 int d1 = RD_REG();
+@@ -5440,7 +5823,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_put(uint8_t *ip, JSValue *fr, JSRegRun
+     int op = *rpc++;
+     JSValue ret_val = JS_UNDEFINED;
+     JSValue *regs = fr;
+-    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 int d = RD_REG();
+                 int v = RD_REG();

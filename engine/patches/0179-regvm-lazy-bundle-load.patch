@@ -1,0 +1,53 @@
+Subject: register VM: make lazy bundle loading work
+
+What this does:
+  Fixes two bugs that made every JS_READ_OBJ_LAZY read of a register bundle
+  fail (the path a React Native app ships):
+
+  1. bc_intern_atom read the atom's record at s->buf_start + offset but bounded
+     the read by the lazy source's copy of the buffer. During the eager read
+     those are two different allocations (the caller's buffer and the copy), so
+     the read failed with "read after the end of the buffer". The stack VM
+     never hit this because it interns atoms only at materialization, when the
+     reader runs over the copy; the register program's atoms are mapped during
+     the eager read. Both pointers now come from the lazy source.
+
+  2. regvm_validate_code bounded atom operands by rt->atom_count, the number of
+     live atoms, but an atom index ranges over the whole table including free
+     slots (rt->atom_size). Lazy interning reuses free slots and hands out
+     indices above the live count, so valid programs were rejected with
+     "register atom out of range".
+
+Measured: pdfjs register bundle, 30 loads, x86-64 clang-19 -O2: eager 0.70 s,
+  lazy 0.11 s (failed before). All 13 Octane rows run from a lazy register
+  bundle with output identical to the eager bundle apart from scores; box2d
+  checksum 546.1008391043414.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -73246,9 +73279,12 @@
+     JSAtom atom;
+     uint8_t type;
+ 
+-    s->ptr = s->buf_start + s->atom_offset[idx];
+-    if (s->lazy_src)
++    if (s->lazy_src) {
++        s->ptr = s->lazy_src->buf + s->atom_offset[idx];
+         s->buf_end = s->lazy_src->buf + s->lazy_src->buf_len;
++    } else {
++        s->ptr = s->buf_start + s->atom_offset[idx];
++    }
+     s->ptr_last = NULL;
+ 
+     if (bc_get_u8(s, &type))
+@@ -73631,7 +73667,9 @@
+     const uint8_t *code = b->regvm_code;
+     int len = b->regvm_len;
+     int wide = 1;                       /* register operands are two bytes */
+-    uint32_t atom_count = ctx->rt->atom_count;
++    /* atom indices range over the whole table, free slots included, so the
++       bound is its size, not the number of live atoms */
++    uint32_t atom_count = ctx->rt->atom_size;
+     uint8_t *is_start = NULL;
+     int *targets = NULL;
+     int p, i, n_targets = 0, rc = -1;

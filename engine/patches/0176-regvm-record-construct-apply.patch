@@ -1,0 +1,291 @@
+Subject: register VM: constructors and apply on the record path
+
+What this does:
+  ROP_construct now enters a plain (non-derived) bytecode constructor as a
+  record directly: `this` is made with js_create_from_ctor_cap (reusing the
+  cached prototype shape via inst_inline_cap), the frame gets two extra owned
+  slots holding the fresh object and new_target, and the return path
+  (regvm_t_return_nested) applies the legacy rule -- return `this` unless the
+  body returned an object, then js_learn_instance_cap. Natives, derived
+  constructors and ineligible frames keep JS_CallConstructorInternal.
+
+  ROP_apply_arguments now classifies its callee: when the arguments object is
+  the builtin and the callee is a record-eligible bytecode function, the callee
+  is entered as a record with `this` from the operand and the arguments
+  borrowed from the caller's window, instead of going out to JS_Call and back
+  into an activation. The reified path and non-JS callees are unchanged.
+
+Why we need it:
+  Constructors and `f.apply(this, arguments)` were the two remaining call
+  shapes that dropped out of the record path. raytrace pays 7.07% fewer cycles
+  with the fast paths on, earleyboyer 2.37%, deltablue 1.67%, box2d 1.44%; no
+  row regresses.
+
+Needs a bytecode version bump:
+  No. Runtime only.
+
+Notes:
+  Both record-creating halves (regvm_t_construct_record,
+  regvm_t_apply_arguments_record) are noinline and added to the gate's
+  --frame-exempt list. The perf evidence is a same-binary A/B (a runtime
+  REGVM_NO_FAST switch during development) because comparing two separately
+  linked binaries moves the layout and produced a spurious richards +2% in the
+  first cross-binary measurement. Box2d checksum 546.1008391043414, test262
+  threaded+record 50/81192 with no leaks, differential corpus 400/0/0, ASan
+  clean (test262 built-ins subset 0/2890, earleyboyer 699, pdfjs 1149).
+
+diff --git a/quickjs.c b/quickjs.c
+index 8e4ee63..07340fa 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25323,6 +25323,12 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
++static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
++static void js_learn_instance_cap(JSFunctionBytecode *nb, JSValueConst inst);
++static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
++                                       int class_id, uint32_t req_cap);
+ static __attribute__((always_inline)) inline void
+ regvm_record_release(JSRuntime *rt, JSRegRun *rec);
+ #endif
+@@ -25915,6 +25921,29 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
+     JSValue old;
+ #endif
+ 
++    /*
++     * R3: a constructor frame returns `this` unless the body returned an
++     * object (the legacy-constructor rule JS_CallConstructorInternal applies
++     * after JS_CallInternal). `this_obj` is the fresh object, borrowed from an
++     * owned slot the release below frees, so it must be duplicated before the
++     * release and the body's non-object return dropped.
++     */
++    if (unlikely(f->flags & JS_CALL_FLAG_CONSTRUCTOR)) {
++        JSFunctionBytecode *nb = js_new_target_bytecode(f->new_target);
++
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
++            if (nb)
++                js_learn_instance_cap(nb, v);
++        } else {
++            JSValue obj = js_dup(f->this_obj);
++
++            if (nb)
++                js_learn_instance_cap(nb, obj);
++            JS_FreeValueRT(ctx->rt, v);
++            v = obj;
++        }
++    }
++
+     regvm_record_release(ctx->rt, f);
+     ctx->rt->current_stack_frame = c->sf;
+ #if QJS_DRC
+@@ -26121,6 +26150,94 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
+         return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
+ }
+ 
++/*
++ * R3: the construct fast path. Creates `this` from the constructor's
++ * prototype (reusing the learned instance capacity, O2), then enters the
++ * callee as a record whose `this_obj` is that fresh object and whose
++ * `new_target` is the operand, with JS_CALL_FLAG_CONSTRUCTOR set so
++ * `regvm_t_return_nested` applies the "return `this` unless an object was
++ * returned" rule. Only reached for a non-derived bytecode constructor.
++ *
++ * The object and the new_target live in two owned slots between the argument
++ * area and the variable area (the same trick the tail-call handlers use), so
++ * the record's release walk frees them and `this_obj`/`new_target` merely
++ * borrow them.
++ */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS)
++{
++    int d = T_REG(1), c = T_REG(3), nt = T_REG(5), ab = T_REG(7);
++    int na = T_U8(9);
++    JSValue cf = FR(c);
++    JSValue ntv = FR(nt);
++    JSObject *co = JS_VALUE_GET_OBJ(cf);
++    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    JSRegRecordLayout lay;
++    JSValue obj, ret;
++    JSFunctionBytecode *nb;
++    int slots = regvm_args_borrowable(cb, na) ? 0
++        : (na > cb->arg_count ? na : cb->arg_count);
++
++    if (unlikely(js_poll_interrupts(ctx)))
++        T_FAIL();
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        T_FAIL();
++    }
++    nb = js_new_target_bytecode(ntv);
++    obj = js_create_from_ctor_cap(ctx, ntv, JS_CLASS_OBJECT,
++                                  nb ? nb->inst_inline_cap : 0);
++    if (JS_IsException(obj))
++        T_FAIL();
++    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
++        if (regvm_arena_busy(ctx->rt)) {
++            JS_FreeValue(ctx, obj);
++            JS_ThrowStackOverflow(ctx);
++            T_FAIL();
++        }
++        /* no arena: the nested construct, with the object already made */
++        ret = JS_CallInternal(ctx, cf, obj, ntv, na, vc(FRP(ab)),
++                              JS_CALL_FLAG_CONSTRUCTOR);
++        if (JS_IsException(ret)) {
++            JS_FreeValue(ctx, obj);
++            T_FAIL();
++        }
++        if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
++            if (nb)
++                js_learn_instance_cap(nb, ret);
++            JS_FreeValue(ctx, obj);
++            T_SET_NEXT_P(d, ret, 10);
++        } else {
++            if (nb)
++                js_learn_instance_cap(nb, obj);
++            JS_FreeValue(ctx, ret);
++            T_SET_NEXT_P(d, obj, 10);
++        }
++    }
++    regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 10,
++                      JS_UNDEFINED, FRP(ab), na, slots);
++    f = lay.rec;
++    /* own the two extra slots and point this_obj/new_target at them */
++    lay.arg_buf[slots] = obj;
++    lay.arg_buf[slots + 1] = js_dup(ntv);
++    f->this_obj = lay.arg_buf[slots];
++    f->new_target = lay.arg_buf[slots + 1];
++    f->flags |= JS_CALL_FLAG_CONSTRUCTOR;
++    f->local_buf = lay.arg_buf;
++#if QJS_DRC
++    f->local_count = slots + 2 + cb->var_count;
++#else
++    f->local_count = slots + 2 + cb->var_count + cb->regvm_reg_count
++        + REGVM_HS - 1;
++#endif
++#if !REGVM_SLIM_FRAME
++    f->sf->is_constructor = true;
++#endif
++    /* the callee runs in its own realm (its global, its error constructors) */
++    __attribute__((musttail))
++        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
++}
++
+ /* C7: handle the fixed-arity floating-point C builtins (the whole Math table
+    uses the f_f/f_f_f special calling conventions) directly in the slow call
+    handlers, so a Math call does not pay the generic js_call_c_function frame
+@@ -26452,6 +26569,26 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
+                (f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
+         if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
+             T_FAIL();
++#if QJS_REGVM_RECORD
++        /*
++         * R3: `f.apply(this, arguments)` with a JS callee enters the callee's
++         * record directly, with `this` from the operand and the arguments
++         * borrowed straight from this frame's window, instead of going out to
++         * `JS_Call` and back into an activation.
++         */
++        {
++            JSValue cf = sp[-3];
++            if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
++                JSObject *co = JS_VALUE_GET_OBJ(cf);
++                if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
++                    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++                    if (likely(regvm_record_eligible(cb)))
++                        __attribute__((musttail))
++                            return regvm_t_apply_arguments_record(REGVM_PASS);
++                }
++            }
++        }
++#endif
+         ret_val = JS_Call(ctx, sp[-3], sp[-1], f->argc, vc(f->arg_buf));
+     } else {
+         ret_val = js_args_apply_reified(ctx, &f->var_buf[idx], sp - 3,
+@@ -26463,6 +26600,46 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
+     T_SET_NEXT_P(d, ret_val, 7);
+ }
+ 
++#if QJS_REGVM_RECORD
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS)
++{
++    int w = T_REG(1), d = T_REG(3);
++    JSValue *sp = FRP(w + 3 * (int)sizeof(JSValue));
++    JSValue cf = sp[-3];
++    JSValue tv = sp[-1];
++    JSObject *co = JS_VALUE_GET_OBJ(cf);
++    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    JSRegRecordLayout lay;
++    int na = f->argc;
++    int slots = regvm_args_borrowable(cb, na) ? 0
++        : (na > cb->arg_count ? na : cb->arg_count);
++
++    if (unlikely(js_poll_interrupts(ctx)))
++        T_FAIL();
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        T_FAIL();
++    }
++    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
++        JSValue ret_val;
++        if (regvm_arena_busy(ctx->rt)) {
++            JS_ThrowStackOverflow(ctx);
++            T_FAIL();
++        }
++        ret_val = JS_Call(ctx, cf, tv, na, vc(f->arg_buf));
++        if (JS_IsException(ret_val))
++            T_FAIL();
++        T_SET_NEXT_P(d, ret_val, 7);
++    }
++    regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 7,
++                      tv, f->arg_buf, na, slots);
++    f = lay.rec;
++    __attribute__((musttail))
++        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
++}
++#endif /* QJS_REGVM_RECORD */
++
+ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
+ {
+     int d = T_REG(1);
+@@ -26498,11 +26675,33 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
+     int ab = T_REG(7);
+     int na = T_U8(9);
+     JSValue *argv = FRP(ab);
+-    JSValue ret_val = JS_CallConstructorInternal(ctx, FR(c), FR(nt),
+-                                                 na, vc(argv), 0);
+-    if (JS_IsException(ret_val))
+-        T_FAIL();
+-    T_SET_NEXT_P(d, ret_val, 10);
++    JSValue cf = FR(c);
++#if QJS_REGVM_RECORD
++    /*
++     * R3: a plain (non-derived) bytecode constructor whose frame can be built
++     * in the arena is entered directly, exactly like a normal record call.
++     * Derived constructors, natives, and ineligible frames keep the nested
++     * `JS_CallConstructorInternal` path.
++     */
++    if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
++        JSObject *co = JS_VALUE_GET_OBJ(cf);
++        if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION &&
++                   co->is_constructor)) {
++            JSFunctionBytecode *cb = co->u.func.function_bytecode;
++            if (likely(regvm_record_eligible(cb) &&
++                       !cb->is_derived_class_constructor))
++                __attribute__((musttail))
++                    return regvm_t_construct_record(REGVM_PASS);
++        }
++    }
++#endif
++    {
++        JSValue ret_val = JS_CallConstructorInternal(ctx, cf, FR(nt),
++                                                     na, vc(argv), 0);
++        if (JS_IsException(ret_val))
++            T_FAIL();
++        T_SET_NEXT_P(d, ret_val, 10);
++    }
+ }
+ 
+ /* cold: the operand is an atom, which is not a value until one is made for it,

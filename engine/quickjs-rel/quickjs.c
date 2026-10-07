@@ -70,6 +70,38 @@ typedef struct JSRegRCC JSRegRCC;
 #endif
 
 /*
+ * The register VM's default executor is the threaded dispatch (P2) plus the
+ * record call path: on the Octane corpus the pair is ~15% fewer cycles than the
+ * monolith. They rely on Clang's `musttail` and `preserve_none` and on
+ * computed-goto dispatch; the configurations that replace the monolith's
+ * dispatch (STEPCHECK, the asm core) or are defined against it (the AOT runtime
+ * and the AOT profiler) still need the monolith, and other compilers cannot run
+ * the chain at all, so on those the default stays 0. Pass
+ * `-DQJS_REGVM_THREAD=0` to build the monolith by hand, and
+ * `-DQJS_REGVM_RECORD=0` to keep the threaded dispatch without the record call
+ * path.
+ *
+ * Defaulted here, at the top, because both the runtime's struct (the frame
+ * arena) and the interpreter read them, and a `#ifndef` default only affects
+ * code that comes after it.
+ */
+#ifndef QJS_REGVM_THREAD
+#if QJS_REGVM && defined(__clang__) && \
+    !QJS_REGVM_STEPCHECK && !QJS_REGVM_ASM && !QJS_AOT && !QJS_AOT_PROFILE
+#define QJS_REGVM_THREAD 1
+#else
+#define QJS_REGVM_THREAD 0
+#endif
+#endif
+#ifndef QJS_REGVM_RECORD
+#if QJS_REGVM_THREAD && !QJS_REGVM_INLOOP_CALL
+#define QJS_REGVM_RECORD 1
+#else
+#define QJS_REGVM_RECORD 0
+#endif
+#endif
+
+/*
  * Deferred reference counting (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md).
  * QJS_DRC enables the machinery (ZCT, reconcile, register-root scanning);
  * it is on from stage D2. QJS_DRC_VALIDATE adds the debug root validator.
@@ -671,6 +703,14 @@ struct JSRuntime {
        with a C string literal, interned once per runtime.  JS_ATOM_NULL until
        first use; rt is calloc'd. */
     JSAtom re_flag_atom[6];
+    /* R2: consecutive frame-reusing tail calls in the active chain. A normal
+       record call resets it, each tail call increments it. It is what keeps a
+       runaway `return f()` from looping forever: the reused frame never
+       reaches the arena limit, so without a cap the engine would hang where
+       the nested path raises RangeError. Runtime-scoped rather than per-frame
+       because growing JSRegRun measurably perturbs frame layout, and appended
+       last so it does not shift the offsets of any hot runtime field. */
+    uint32_t regvm_tail_chain;
 };
 
 #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
@@ -719,6 +759,12 @@ typedef struct JSStackFrame {
        took; 0 while it is running or has returned, when the registers only
        borrow. `async_func_free` frees the register window only when it owns. */
     uint8_t rv_owns_regs;
+    /* Bundle plan 4.2: the register-bytecode address of the instruction this
+       frame is executing, captured on the slow paths that can build a
+       backtrace. `cur_pc` stays NULL for a register frame (a register pc is not
+       a stack pc), so the trace readers use this through regvm_frame_pc. NULL
+       means the frame is not in a register call and renders without a line. */
+    const uint8_t *regvm_ip;
 } JSStackFrame;
 
 /*
@@ -1496,10 +1542,13 @@ typedef struct JSFunctionBytecode {
 #if QJS_AOT_PROFILE
     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
     JSAotProfFunc *aot_prof;
-    /* P0: stack pc of the instruction at each register-bytecode offset, so the
-       dump can print a source position (`src=<line>:<col>`) for every site.
-       One int32 per regvm byte; -1 at offsets that are not instruction starts.
-       Only a profile build allocates it. */
+#endif
+#if QJS_REGVM
+    /* Bundle plan 4.1: stack pc of the instruction at each register-bytecode
+       offset, so the compiler can build a register-keyed pc2line table. One
+       int32 per regvm byte; -1 at offsets that are not instruction starts.
+       Freed once the register pc2line is built; only a profile build keeps it
+       (the AOT profiler dump prints `src=<line>:<col>`). */
     int32_t *regvm_src_pc;
 #endif
 #if QJS_AOT
@@ -7686,6 +7735,7 @@ _Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
 #define REG_PIC_OWN   1
 #define REG_PIC_PROTO 2
 #define REG_PIC_OWN_W 3   /* own writable data slot: the store's hit */
+#define REG_PIC_ADD_W 4   /* add-transition store: shape -> holder, fresh slot */
 
 /* Release the shape references held by one entry and clear it. Used by the
    finalizer and by a refill, which must drop the entry it replaces before
@@ -11318,6 +11368,13 @@ static JSValue js_error_stack_format(JSContext *ctx, JSErrorStackData *esd)
     return ret;
 }
 
+#if QJS_REGVM
+static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
+                          JSFunctionBytecode *b);
+#else
+#define regvm_frame_pc(rt, sf, b) (-1)
+#endif
+
 static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                             JSValueConst filter_func, const char *filename,
                             int line_num, int col_num, int backtrace_flags)
@@ -11327,6 +11384,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     DynBuf dbuf;
     const char *func_name_str;
     const char *str1;
+    int rpc;
     JSObject *p;
     JSFunctionBytecode *b;
     bool backtrace_barrier, has_prepare, has_filter_func;
@@ -11432,10 +11490,13 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
         if (lazy) {
             JSErrorStackFrame *lf = &lazy_frames[i];
+            int rpc = (b && !sf->cur_pc) ? regvm_frame_pc(rt, sf, b) : -1;
 
             lf->func_name = get_func_name_value(ctx, sf->cur_func);
-            if (b && sf->cur_pc) {
-                uint32_t pc = sf->cur_pc - b->byte_code_buf - 1;
+            if (b && (sf->cur_pc || rpc >= 0)) {
+                uint32_t pc = sf->cur_pc
+                    ? (uint32_t)(sf->cur_pc - b->byte_code_buf - 1)
+                    : (uint32_t)rpc;
 
                 lf->kind = 0;
                 lf->line_num = find_line_num(ctx, b, pc, &lf->col_num);
@@ -11465,6 +11526,17 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
                 pc = sf->cur_pc - b->byte_code_buf - 1;
                 line_num1 = find_line_num(ctx, b, pc, &col_num1);
+                atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+                dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
+                JS_FreeCString(ctx, atom_str);
+                if (line_num1 != -1)
+                    dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
+                dbuf_putc(&dbuf, ')');
+            } else if (b && (rpc = regvm_frame_pc(rt, sf, b)) >= 0) {
+                const char *atom_str;
+                int line_num1, col_num1;
+
+                line_num1 = find_line_num(ctx, b, (uint32_t)rpc, &col_num1);
                 atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                 dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
                 JS_FreeCString(ctx, atom_str);
@@ -23688,7 +23760,7 @@ uint64_t js_regvm_put_hit, js_regvm_put_direct, js_regvm_put_slow, js_regvm_put_
  */
 static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                                JSRegPIC **ppic, JSValue recv, JSAtom atom,
-                               int site)
+                               int site, JSShape *pre_sh, uint32_t pre_count)
 {
     JSRuntime *rt = ctx->rt;
     JSObject *p;
@@ -23722,21 +23794,113 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
                       REG_PIC_OWN_W, p->shape, NULL,
                       (uint32_t)(pr - p->prop));
+    /*
+     * Add-transition fill, in the site's secondary way. When the store created
+     * `atom` as a fresh plain writable own data slot (the pre-add shape was
+     * snapshotted by regvm_put_field_ic, and the post-add shape has exactly one
+     * more property), cache the pair pre_sh -> p->shape so the next store to the
+     * same pre-add shape replays the add without calling the engine. The
+     * prototype watchpoint epoch is stashed in the entry's spare `misses` field:
+     * the replay is sound only while no interceptor has appeared on a prototype
+     * since the fill (doc/ic-design.md 2.4).
+     */
+    if (pre_sh != NULL) {
+        JSShape *nsh = p->shape;
+        if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+            int s2 = b->regvm_pic_count + site;
+            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+                              REG_PIC_ADD_W, pre_sh, nsh,
+                              (uint32_t)(pr - p->prop));
+            pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
+        }
+    }
+}
+
+/*
+ * Replay a cached add-transition store. The receiver is still in the shape the
+ * fill snapshotted, `atom` is the fresh own data slot the transition adds, the
+ * object is still extensible and non-exotic, and no prototype interceptor has
+ * appeared since the fill. Grow the property array if the target shape needs it,
+ * install the new shape, and write the fresh slot. The value is duplicated: the
+ * register keeps its reference (the monolith/threaded handlers differ from the
+ * stack VM, whose transfer form hands the value over). Returns 1 on a hit, 0 on
+ * a miss, and -1 after a property-array allocation threw.
+ */
+static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC *pic, JSObject *p, JSValue v,
+                                   int site)
+{
+    JSRegPIC *e;
+    JSShape *nsh, *osh;
+    uint32_t off;
+
+    if (b->regvm_pic == NULL || b->regvm_pic_count == 0)
+        return 0;
+    e = &pic[b->regvm_pic_count + site];
+    if (e->shape != p->shape || e->kind != REG_PIC_ADD_W)
+        return 0;
+    if (!p->extensible || p->is_exotic)
+        return 0;
+    if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
+        return 0;                   /* a prototype interceptor appeared */
+    nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
+    off = e->slot_off / (uint32_t)sizeof(JSValue);
+    osh = p->shape;
+    if (nsh->prop_size != osh->prop_size) {
+        JSProperty *np = js_prop_grow(ctx, p,
+                                      sizeof(p->prop[0]) * nsh->prop_size);
+        if (unlikely(!np))
+            return -1;              /* js_prop_grow threw */
+        p->prop = np;
+    }
+    p->shape = js_dup_shape(nsh);
+    js_free_shape(ctx->rt, osh);
+    p->prop[off].u.value = js_dup(v);
+    return 1;
 }
 
 /*
  * The register store, for a site-bearing instruction. The engine performs the
  * write; the fill records where it landed. `*ppic` is the running frame's cache
- * base, updated here when the first fill allocates it.
+ * base, updated here when the first fill allocates it. The pre-add shape is
+ * snapshotted before the store so a fresh add can be cached as a transition.
  */
 static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
                               JSRegPIC **ppic, JSValue recv, JSAtom atom,
                               JSValue val, int site)
 {
-    int ret = JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
-                                      JS_PROP_THROW_STRICT);
+    JSRuntime *rt = ctx->rt;
+    JSShape *pre_sh = NULL;
+    uint32_t pre_count = 0;
+    int ret;
+
+    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+        JSObject *po = JS_VALUE_GET_OBJ(recv);
+        JSRegPIC *e2 = NULL;
+        if (*ppic != NULL && b->regvm_pic_count != 0)
+            e2 = &(*ppic)[b->regvm_pic_count + site];
+        /*
+         * Only snapshot when the site has no transition yet or already holds
+         * this exact pre-add shape. A monomorphic add site hits in the handler
+         * after the first store and never reaches here; a polymorphic site has
+         * a different cached shape and is left alone, so neither the snapshot
+         * nor a thrashing refill is paid for it.
+         */
+        if ((e2 == NULL || e2->kind == REG_PIC_EMPTY || e2->shape == po->shape) &&
+            po->extensible && !po->is_exotic && po->shape->is_hashed) {
+            JSProperty *pr0;
+            if (!find_own_property(&pr0, po, atom)) {
+                pre_sh = js_dup_shape(po->shape);
+                pre_count = po->shape->prop_count;
+            }
+        }
+    }
+    ret = JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
+                                  JS_PROP_THROW_STRICT);
     if (likely(ret >= 0))
-        regvm_put_pic_fill(ctx, b, ppic, recv, atom, site);
+        regvm_put_pic_fill(ctx, b, ppic, recv, atom, site, pre_sh, pre_count);
+    if (pre_sh)
+        js_free_shape(rt, pre_sh);
     return ret;
 }
 
@@ -23830,6 +23994,11 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
     ops[1] = js_dup(b);
     switch (subop) {
     case REG_BIN_ADD:
+        /* Mirror the stack VM's scatter hint: a concatenation result that is
+           itself the left operand of the next add should carry headroom so that
+           add can extend it in place (JS_ConcatString1's slack). Without this
+           every chained concat allocates a fresh string. */
+        js_scat_hint = 1;
         if (js_add_slow(ctx, ops + 2))
             goto fail;
         break;
@@ -23886,6 +24055,126 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
     JS_FreeValue(ctx, ops[0]);
     JS_FreeValue(ctx, ops[1]);
     return -1;
+}
+
+/*
+ * R5: the in-place string accumulator.
+ *
+ * `s += x` compiles to an add whose destination register is also its left
+ * operand. The generic add above duplicates both operands, so
+ * JS_ConcatString2's in-place test can never fire and every append allocates a
+ * fresh rope -- pdfjs's dominant cost.
+ *
+ * This appends into the left operand in place when the register provably holds
+ * the only reference to it. Under deferred RC a register borrows its values, so
+ * a register-only string has ref_count 0 and sits on the zero-count table, while
+ * a string some slot owns carries a counted reference; a borrowed register alias
+ * is invisible to the count in either case. The test is therefore the count
+ * *plus* a scan of every location in this frame that can hold a borrowed value:
+ * the register file and the argument window. Slots own counted references, so a
+ * zero count already rules out locals, closures, properties and array elements.
+ *
+ * Returns 1 when the append happened (fr[a] already names the extended string),
+ * 0 when the caller must run the generic add, and -1 with an exception set.
+ * Unlike js_accum_append the right operand is borrowed and is never freed.
+ *
+ * d and a are register *indices* (element offsets into fr), not the raw
+ * index<<4 byte offsets the threaded decoder hands out -- the threaded call
+ * sites shift before calling.
+ */
+static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
+                              JSValue *fr, JSValue *arg_buf, int argc,
+                              int d, int a, JSValue op2)
+{
+#if QJS_DRC
+    JSString *p1, *p2;
+    uint32_t i, nregs, nlen, cap;
+    size_t need;
+    void *p1ptr;
+
+    if (d != a)
+        return 0;
+    if (JS_VALUE_GET_TAG(fr[a]) != JS_TAG_STRING ||
+        JS_VALUE_GET_TAG(op2) != JS_TAG_STRING)
+        return 0;
+    p1 = JS_VALUE_GET_STRING(fr[a]);
+    p2 = JS_VALUE_GET_STRING(op2);
+    if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0)
+        return 0;
+    /* No counted owner anywhere, and the value must be parked: a register-only
+       value. A slot-owned string has a count and is refused here. */
+    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1))
+        return 0;
+    if (p1->is_wide_char != p2->is_wide_char)
+        return 0;
+    if (p2->len == 0)
+        return 0;
+    if ((uint64_t)p1->len + p2->len > JS_STRING_LEN_MAX)
+        return 0;
+    p1ptr = p1;
+    nregs = b->regvm_reg_count;
+    for (i = 0; i < nregs; i++) {
+        if (i == (uint32_t)a)
+            continue;
+        if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
+            JS_VALUE_GET_PTR(fr[i]) == p1ptr)
+            return 0;
+    }
+    if (arg_buf != NULL) {
+        for (i = 0; i < (uint32_t)argc; i++) {
+            if (JS_VALUE_GET_TAG(arg_buf[i]) == JS_TAG_STRING &&
+                JS_VALUE_GET_PTR(arg_buf[i]) == p1ptr)
+                return 0;
+        }
+    }
+    nlen = p1->len + p2->len;
+    need = sizeof(*p1) + ((size_t)nlen << p1->is_wide_char) + 1 -
+           p1->is_wide_char;
+    if (js_malloc_usable_size(ctx, p1) >= need) {
+        if (p1->is_wide_char) {
+            memcpy(str16(p1) + p1->len, str16(p2), (size_t)p2->len << 1);
+        } else {
+            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
+            str8(p1)[nlen] = '\0';
+        }
+        p1->len = nlen;
+        return 1;
+    } else {
+        JSString *np;
+        JSValue nv;
+
+        cap = nlen;
+        if (nlen >= JS_STRING_ACCUM_MIN_GROW) {
+            uint32_t slack = nlen >> 1;
+            if (slack > JS_STRING_ACCUM_MAX_SLACK)
+                slack = JS_STRING_ACCUM_MAX_SLACK;
+            if (nlen <= JS_STRING_LEN_MAX - slack)
+                cap = nlen + slack;
+        }
+        np = js_alloc_string(ctx, cap, p1->is_wide_char);
+        if (unlikely(!np))
+            return -1;
+        if (p1->is_wide_char) {
+            memcpy(str16(np), str16(p1), (size_t)p1->len << 1);
+            memcpy(str16(np) + p1->len, str16(p2), (size_t)p2->len << 1);
+        } else {
+            memcpy(str8(np), str8(p1), p1->len);
+            memcpy(str8(np) + p1->len, str8(p2), p2->len);
+            str8(np)[nlen] = '\0';
+        }
+        np->len = nlen;
+        nv = JS_MKPTR(JS_TAG_STRING, np);
+        fr[a] = nv;
+        /* Adopt the producer's reference: the register borrows, so the fresh
+           string must end up parked exactly like any other register value. */
+        REG_ADOPT(ctx->rt, nv);
+        return 1;
+    }
+#else
+    (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
+    (void)d; (void)a; (void)op2;
+    return 0;
+#endif
 }
 
 static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
@@ -24406,8 +24695,11 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
  *    reaching zero takes, so the handler itself has no prologue: see the
  *    measured note beside T_SET_NEXT.
  *
- * Off by default while the conversion is in progress: the default build
- * compiles none of this and is unchanged.
+ */
+/*
+ * QJS_REGVM_THREAD and QJS_REGVM_RECORD are defaulted near the top of the
+ * file, beside the include of the register ISA, because the runtime's struct
+ * and the interpreter both read them long before this point.
  */
 #if QJS_REGVM_THREAD && QJS_REGVM_ASM
 #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
@@ -24580,11 +24872,46 @@ static void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
 }
 #endif /* REGVM_SLIM_FRAME */
 
+/* Bundle plan 4.3: the register-bytecode offset a frame is executing, or -1
+   when the frame is not a live register record or its saved ip is not inside
+   this function's code. The readers pair a non-negative result with
+   find_line_num, which then uses the register-keyed pc2line table. */
+#if REGVM_SLIM_FRAME
+static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
+                          JSFunctionBytecode *b)
+{
+    const uint8_t *ip = sf->regvm_ip;
+
+    (void)rt;
+    if (!ip)
+        return -1;
+    if (ip < b->regvm_code || ip >= b->regvm_code + b->regvm_len)
+        return -1;
+    return (int)(ip - b->regvm_code);
+}
+#else
+static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
+                          JSFunctionBytecode *b)
+{
+    (void)rt;
+    (void)sf;
+    (void)b;
+    return -1;
+}
+#endif
+
 typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
                                   JSContext *ctx) REGVM_CC;
 
 #define REGVM_ARGS  uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx
 #define REGVM_PASS  ip, fr, f, ctx
+/*
+ * Bundle plan 4.2: record the instruction address on a frame before a call
+ * that can build a backtrace. `ip` is the instruction start (handlers read
+ * operands at offsets from it and never advance it), so the saved value needs
+ * no adjustment. Fast paths must not call this.
+ */
+#define REGVM_CAPTURE_IP() (f->sf->regvm_ip = ip)
 
 /*
  * Returned by `regvm_exec_one` for a *tail call*.
@@ -24644,6 +24971,15 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
 #define T_SZ_RRT_S  4    /* "rrt"   narrow */
 #define T_SZ_RIT    8    /* "rit"   */
 #define T_SZ_RIT_S  4    /* "rit"   narrow */
+#define T_SZ_RI32   7    /* "rI"    */
+#define T_SZ_RRI_S  4    /* "rri"   narrow */
+#define T_SZ_RRB    6    /* "rrb"   */
+#define T_SZ_RRS    7    /* "rrs"   */
+#define T_SZ_RUR    7    /* "rur"   */
+#define T_SZ_RRRB   8    /* "rrrb"  */
+#define T_SZ_BU_IT  12   /* "buIt"  */
+#define T_SZ_BURT   10   /* "burt"  */
+#define T_SZ_RB     4    /* "rb"    */
 
 #define T_REG(o)  ((int)regvm_ld_u16(ip + (o)))
 /*
@@ -24907,7 +25243,14 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 /* the cold halves: decode the shape, run the engine's slow routine, continue */
 #define T_BODY_RRR(SUB_, SZ_) do { \
         int _d = T_REG(1); \
-        JSValue _o1 = FR(T_REG(3)), _o2 = FR(T_REG(5)), _out; \
+        int _a = T_REG(3); \
+        JSValue _o1 = FR(_a), _o2 = FR(T_REG(5)), _out; \
+        if ((SUB_) == REG_BIN_ADD) { \
+            int _ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc, \
+                                         _d >> 4, _a >> 4, _o2); \
+            if (_ar > 0) T_NEXT(SZ_); \
+            if (_ar < 0) T_FAIL(); \
+        } \
         if (js_regvm_binary(ctx, SUB_, _o1, _o2, &_out)) \
             T_FAIL(); \
         T_SET_NEXT_P(_d, _out, SZ_); \
@@ -25160,6 +25503,41 @@ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s_slow(REGVM_ARGS);
+
+/* R1: dedicated handlers for the cold opcodes the count profile showed above
+   0.5% of dispatches. Same shape as the batches above: an inline fast path and
+   a musttail slow half for the part that has to call the engine. */
+static uint8_t *REGVM_CC regvm_t_load_i32(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_add_imm_s(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_add_imm_s_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_sub_imm_s(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_sub_imm_s_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_add_imm_self_s(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_add_imm_self_s_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_sub_imm_self_s(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_sub_imm_self_s_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_put_local_xfer_s0(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_put_local_xfer_s1(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_put_local_xfer_s2(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_put_local_xfer_s3(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_object_template(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_array_from(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_put_global(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_get_length(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_put_element(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_object_fill(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_get_arg_el(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_get_arg_el_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_local_rmw_branch(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_local_rmw_branch_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_tail_call_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_tail_call_method_slow(REGVM_ARGS);
+#if QJS_REGVM_RECORD
+static uint8_t *REGVM_CC regvm_t_tail_call_record(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_tail_call_method_record(REGVM_ARGS);
+#endif
 static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
@@ -25222,12 +25600,26 @@ static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
                               int ret_dst, uint8_t *ret_ip,
                               JSValueConst this_obj, const JSValue *oargv,
                               int na, int slots);
+#if QJS_REGVM_RECORD
+static void regvm_record_fill_tail(JSRuntime *rt, const JSRegRecordLayout *lay,
+                                   JSValueConst cf, JSObject *co,
+                                   JSFunctionBytecode *cb, JSRegRun *caller,
+                                   int ret_dst, uint8_t *ret_ip,
+                                   JSValueConst this_obj, const JSValue *oargv,
+                                   int na, int slots);
+#endif
 static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
+static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
+static void js_learn_instance_cap(JSFunctionBytecode *nb, JSValueConst inst);
+static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+                                       int class_id, uint32_t req_cap);
 static __attribute__((always_inline)) inline void
 regvm_record_release(JSRuntime *rt, JSRegRun *rec);
 #endif
@@ -25289,12 +25681,12 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(load_i8, regvm_t_load_i8) \
     X(load_i8_s, regvm_t_load_i8_s) \
     X(add_brand, regvm_t_cold) \
-    X(add_imm_s, regvm_t_cold) \
-    X(add_imm_self_s, regvm_t_cold) \
+    X(add_imm_s, regvm_t_add_imm_s) \
+    X(add_imm_self_s, regvm_t_add_imm_self_s) \
     X(append, regvm_t_cold) \
     X(apply, regvm_t_cold) \
     X(apply_arguments, regvm_t_apply_arguments) \
-    X(array_from, regvm_t_cold) \
+    X(array_from, regvm_t_array_from) \
     X(binary_cpool, regvm_t_binary_cpool) \
     X(branch_cmp_loc_loc, regvm_t_cold) \
     X(branch_cmp_loc_reg, regvm_t_cold) \
@@ -25322,9 +25714,9 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(for_await_of_start, regvm_t_cold) \
     X(for_in_next, regvm_t_cold) \
     X(for_in_start, regvm_t_cold) \
-    X(get_arg_el, regvm_t_cold) \
+    X(get_arg_el, regvm_t_get_arg_el) \
     X(get_arg_field, regvm_t_cold) \
-    X(get_length, regvm_t_cold) \
+    X(get_length, regvm_t_get_length) \
     X(get_local_field, regvm_t_cold) \
     X(get_local_field_0, regvm_t_get_local_field_0) \
     X(get_local_field_1, regvm_t_cold) \
@@ -25340,10 +25732,10 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(iterator_call, regvm_t_cold) \
     X(iterator_next, regvm_t_cold) \
     X(load_bigint_i32, regvm_t_cold) \
-    X(load_i32, regvm_t_cold) \
+    X(load_i32, regvm_t_load_i32) \
     X(local_check, regvm_t_cold) \
     X(local_check_init, regvm_t_cold) \
-    X(local_rmw_branch, regvm_t_cold) \
+    X(local_rmw_branch, regvm_t_local_rmw_branch) \
     X(local_rmw_imm, regvm_t_cold) \
     X(local_uninit, regvm_t_local_uninit) \
     X(make_closure, regvm_t_cold) \
@@ -25351,25 +25743,25 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(make_var_ref, regvm_t_cold) \
     X(new_object, regvm_t_cold) \
     X(nip_catch, regvm_t_cold) \
-    X(object_fill, regvm_t_cold) \
-    X(object_template, regvm_t_cold) \
+    X(object_fill, regvm_t_object_fill) \
+    X(object_template, regvm_t_object_template) \
     X(private_symbol, regvm_t_cold) \
     X(put_arg, regvm_t_cold) \
     X(put_arg_xfer, regvm_t_cold) \
-    X(put_element, regvm_t_cold) \
+    X(put_element, regvm_t_put_element) \
     X(put_element_xfer, regvm_t_put_element_xfer) \
     X(put_field_xfer, regvm_t_cold) \
-    X(put_global, regvm_t_cold) \
+    X(put_global, regvm_t_put_global) \
     X(put_local, regvm_t_cold) \
     X(put_local_s0, regvm_t_put_local_s0) \
     X(put_local_s1, regvm_t_cold) \
     X(put_local_s2, regvm_t_cold) \
     X(put_local_s3, regvm_t_cold) \
     X(put_local_xfer, regvm_t_cold) \
-    X(put_local_xfer_s0, regvm_t_cold) \
-    X(put_local_xfer_s1, regvm_t_cold) \
-    X(put_local_xfer_s2, regvm_t_cold) \
-    X(put_local_xfer_s3, regvm_t_cold) \
+    X(put_local_xfer_s0, regvm_t_put_local_xfer_s0) \
+    X(put_local_xfer_s1, regvm_t_put_local_xfer_s1) \
+    X(put_local_xfer_s2, regvm_t_put_local_xfer_s2) \
+    X(put_local_xfer_s3, regvm_t_put_local_xfer_s3) \
     X(put_private, regvm_t_cold) \
     X(put_ref_value, regvm_t_cold) \
     X(put_super_value, regvm_t_cold) \
@@ -25380,11 +25772,11 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(set_name_computed, regvm_t_cold) \
     X(set_proto, regvm_t_cold) \
     X(special_object, regvm_t_cold) \
-    X(sub_imm_s, regvm_t_cold) \
-    X(sub_imm_self_s, regvm_t_cold) \
+    X(sub_imm_s, regvm_t_sub_imm_s) \
+    X(sub_imm_self_s, regvm_t_sub_imm_self_s) \
     X(super_get, regvm_t_cold) \
-    X(tail_call, regvm_t_cold) \
-    X(tail_call_method, regvm_t_cold) \
+    X(tail_call, regvm_t_tail_call) \
+    X(tail_call_method, regvm_t_tail_call_method) \
     X(throw, regvm_t_cold) \
     X(throw_error, regvm_t_cold) \
     X(to_object, regvm_t_cold) \
@@ -25785,6 +26177,9 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
  */
 static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS)
 {
+    /* Leaving a frame ends the current tail-call chain (a chain of tail calls
+       never returns until it is done), so the cap's counter starts fresh. */
+    ctx->rt->regvm_tail_chain = 0;
     if (likely(f->caller == NULL))
         return NULL;
 #if !QJS_REGVM_RECORD
@@ -25816,6 +26211,29 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
 #if !QJS_DRC
     JSValue old;
 #endif
+
+    /*
+     * R3: a constructor frame returns `this` unless the body returned an
+     * object (the legacy-constructor rule JS_CallConstructorInternal applies
+     * after JS_CallInternal). `this_obj` is the fresh object, borrowed from an
+     * owned slot the release below frees, so it must be duplicated before the
+     * release and the body's non-object return dropped.
+     */
+    if (unlikely(f->flags & JS_CALL_FLAG_CONSTRUCTOR)) {
+        JSFunctionBytecode *nb = js_new_target_bytecode(f->new_target);
+
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            if (nb)
+                js_learn_instance_cap(nb, v);
+        } else {
+            JSValue obj = js_dup(f->this_obj);
+
+            if (nb)
+                js_learn_instance_cap(nb, obj);
+            JS_FreeValueRT(ctx->rt, v);
+            v = obj;
+        }
+    }
 
     regvm_record_release(ctx->rt, f);
     ctx->rt->current_stack_frame = c->sf;
@@ -25862,11 +26280,21 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
+    REGVM_CAPTURE_IP();
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(regvm_record_eligible(cb)))
+                __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+            /* D13: a lazy function becomes record-eligible only after it is
+               materialized, and materialization otherwise happens inside the
+               slow path on its first call. Materialize here so that first call
+               takes the record path too -- otherwise a caller frame survives in
+               Error.stack for a bundle but not for source. */
+            if (unlikely(cb->is_lazy) &&
+                js_materialize_function_body(cb->realm, cb) == 0 &&
+                regvm_record_eligible(cb))
                 __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
 #if defined(QJS_REGVM_COUNT)
             regvm_note_blockers(cb);
@@ -25881,11 +26309,17 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
+    REGVM_CAPTURE_IP();
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(regvm_record_eligible(cb)))
+                __attribute__((musttail))
+                    return regvm_t_call_method_record(REGVM_PASS);
+            if (unlikely(cb->is_lazy) &&
+                js_materialize_function_body(cb->realm, cb) == 0 &&
+                regvm_record_eligible(cb))
                 __attribute__((musttail))
                     return regvm_t_call_method_record(REGVM_PASS);
 #if defined(QJS_REGVM_COUNT)
@@ -26018,6 +26452,94 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
     regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 10,
                       tv, FRP(ab), na, slots);
     f = lay.rec;
+    /* the callee runs in its own realm (its global, its error constructors) */
+    __attribute__((musttail))
+        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
+}
+
+/*
+ * R3: the construct fast path. Creates `this` from the constructor's
+ * prototype (reusing the learned instance capacity, O2), then enters the
+ * callee as a record whose `this_obj` is that fresh object and whose
+ * `new_target` is the operand, with JS_CALL_FLAG_CONSTRUCTOR set so
+ * `regvm_t_return_nested` applies the "return `this` unless an object was
+ * returned" rule. Only reached for a non-derived bytecode constructor.
+ *
+ * The object and the new_target live in two owned slots between the argument
+ * area and the variable area (the same trick the tail-call handlers use), so
+ * the record's release walk frees them and `this_obj`/`new_target` merely
+ * borrow them.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS)
+{
+    int d = T_REG(1), c = T_REG(3), nt = T_REG(5), ab = T_REG(7);
+    int na = T_U8(9);
+    JSValue cf = FR(c);
+    JSValue ntv = FR(nt);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+    JSRegRecordLayout lay;
+    JSValue obj, ret;
+    JSFunctionBytecode *nb;
+    int slots = regvm_args_borrowable(cb, na) ? 0
+        : (na > cb->arg_count ? na : cb->arg_count);
+
+    if (unlikely(js_poll_interrupts(ctx)))
+        T_FAIL();
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        T_FAIL();
+    }
+    nb = js_new_target_bytecode(ntv);
+    obj = js_create_from_ctor_cap(ctx, ntv, JS_CLASS_OBJECT,
+                                  nb ? nb->inst_inline_cap : 0);
+    if (JS_IsException(obj))
+        T_FAIL();
+    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
+        if (regvm_arena_busy(ctx->rt)) {
+            JS_FreeValue(ctx, obj);
+            JS_ThrowStackOverflow(ctx);
+            T_FAIL();
+        }
+        /* no arena: the nested construct, with the object already made */
+        ret = JS_CallInternal(ctx, cf, obj, ntv, na, vc(FRP(ab)),
+                              JS_CALL_FLAG_CONSTRUCTOR);
+        if (JS_IsException(ret)) {
+            JS_FreeValue(ctx, obj);
+            T_FAIL();
+        }
+        if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
+            if (nb)
+                js_learn_instance_cap(nb, ret);
+            JS_FreeValue(ctx, obj);
+            T_SET_NEXT_P(d, ret, 10);
+        } else {
+            if (nb)
+                js_learn_instance_cap(nb, obj);
+            JS_FreeValue(ctx, ret);
+            T_SET_NEXT_P(d, obj, 10);
+        }
+    }
+    regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 10,
+                      JS_UNDEFINED, FRP(ab), na, slots);
+    f = lay.rec;
+    /* own the two extra slots and point this_obj/new_target at them */
+    lay.arg_buf[slots] = obj;
+    lay.arg_buf[slots + 1] = js_dup(ntv);
+    f->this_obj = lay.arg_buf[slots];
+    f->new_target = lay.arg_buf[slots + 1];
+    f->flags |= JS_CALL_FLAG_CONSTRUCTOR;
+    f->local_buf = lay.arg_buf;
+#if QJS_DRC
+    f->local_count = slots + 2 + cb->var_count;
+#else
+    f->local_count = slots + 2 + cb->var_count + cb->regvm_reg_count
+        + REGVM_HS - 1;
+#endif
+#if !REGVM_SLIM_FRAME
+    f->sf->is_constructor = true;
+#endif
     /* the callee runs in its own realm (its global, its error constructors) */
     __attribute__((musttail))
         return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
@@ -26350,10 +26872,31 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
     JSObject *pa = js_args_apply_is_builtin(sp[-2]);
     JSValue ret_val;
 
+    REGVM_CAPTURE_IP();
     if (likely(pa != NULL &&
                (f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
         if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
             T_FAIL();
+#if QJS_REGVM_RECORD
+        /*
+         * R3: `f.apply(this, arguments)` with a JS callee enters the callee's
+         * record directly, with `this` from the operand and the arguments
+         * borrowed straight from this frame's window, instead of going out to
+         * `JS_Call` and back into an activation.
+         */
+        {
+            JSValue cf = sp[-3];
+            if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+                JSObject *co = JS_VALUE_GET_OBJ(cf);
+                if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+                    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+                    if (likely(regvm_record_eligible(cb)))
+                        __attribute__((musttail))
+                            return regvm_t_apply_arguments_record(REGVM_PASS);
+                }
+            }
+        }
+#endif
         ret_val = JS_Call(ctx, sp[-3], sp[-1], f->argc, vc(f->arg_buf));
     } else {
         ret_val = js_args_apply_reified(ctx, &f->var_buf[idx], sp - 3,
@@ -26365,6 +26908,46 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
     T_SET_NEXT_P(d, ret_val, 7);
 }
 
+#if QJS_REGVM_RECORD
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS)
+{
+    int w = T_REG(1), d = T_REG(3);
+    JSValue *sp = FRP(w + 3 * (int)sizeof(JSValue));
+    JSValue cf = sp[-3];
+    JSValue tv = sp[-1];
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+    JSRegRecordLayout lay;
+    int na = f->argc;
+    int slots = regvm_args_borrowable(cb, na) ? 0
+        : (na > cb->arg_count ? na : cb->arg_count);
+
+    if (unlikely(js_poll_interrupts(ctx)))
+        T_FAIL();
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        T_FAIL();
+    }
+    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
+        JSValue ret_val;
+        if (regvm_arena_busy(ctx->rt)) {
+            JS_ThrowStackOverflow(ctx);
+            T_FAIL();
+        }
+        ret_val = JS_Call(ctx, cf, tv, na, vc(f->arg_buf));
+        if (JS_IsException(ret_val))
+            T_FAIL();
+        T_SET_NEXT_P(d, ret_val, 7);
+    }
+    regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 7,
+                      tv, f->arg_buf, na, slots);
+    f = lay.rec;
+    __attribute__((musttail))
+        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
+}
+#endif /* QJS_REGVM_RECORD */
+
 static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
 {
     int d = T_REG(1);
@@ -26375,13 +26958,32 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
     JSValue out;
 
     if (kind == REG_CONST_CPOOL) {
-        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out) &&
-            js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
-            T_FAIL();
+        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out)) {
+            if (sub == REG_BIN_ADD) {
+                int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
+                                            d >> 4, a >> 4, f->b->cpool[idx]);
+                if (ar > 0) T_NEXT(11);
+                if (ar < 0) T_FAIL();
+            }
+            if (js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
+                T_FAIL();
+        }
     } else {
         JSValue cst = JS_AtomToValue(ctx, idx);
         if (JS_IsException(cst))
             T_FAIL();
+        if (sub == REG_BIN_ADD) {
+            int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
+                                        d >> 4, a >> 4, cst);
+            if (ar > 0) {
+                JS_FreeValue(ctx, cst);
+                T_NEXT(11);
+            }
+            if (ar < 0) {
+                JS_FreeValue(ctx, cst);
+                T_FAIL();
+            }
+        }
         if (!regvm_num_fast(sub, FR(a), cst, &out) &&
             js_regvm_binary(ctx, sub, FR(a), cst, &out)) {
             JS_FreeValue(ctx, cst);
@@ -26400,11 +27002,34 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
     int ab = T_REG(7);
     int na = T_U8(9);
     JSValue *argv = FRP(ab);
-    JSValue ret_val = JS_CallConstructorInternal(ctx, FR(c), FR(nt),
-                                                 na, vc(argv), 0);
-    if (JS_IsException(ret_val))
-        T_FAIL();
-    T_SET_NEXT_P(d, ret_val, 10);
+    JSValue cf = FR(c);
+    REGVM_CAPTURE_IP();
+#if QJS_REGVM_RECORD
+    /*
+     * R3: a plain (non-derived) bytecode constructor whose frame can be built
+     * in the arena is entered directly, exactly like a normal record call.
+     * Derived constructors, natives, and ineligible frames keep the nested
+     * `JS_CallConstructorInternal` path.
+     */
+    if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+        JSObject *co = JS_VALUE_GET_OBJ(cf);
+        if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                   co->is_constructor)) {
+            JSFunctionBytecode *cb = co->u.func.function_bytecode;
+            if (likely(regvm_record_eligible(cb) &&
+                       !cb->is_derived_class_constructor))
+                __attribute__((musttail))
+                    return regvm_t_construct_record(REGVM_PASS);
+        }
+    }
+#endif
+    {
+        JSValue ret_val = JS_CallConstructorInternal(ctx, cf, FR(nt),
+                                                     na, vc(argv), 0);
+        if (JS_IsException(ret_val))
+            T_FAIL();
+        T_SET_NEXT_P(d, ret_val, 10);
+    }
 }
 
 /* cold: the operand is an atom, which is not a value until one is made for it,
@@ -27143,6 +27768,18 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
                 }
                 T_NEXT(T_SZ_RASR);
             }
+            {
+                int ah = regvm_put_field_add_hit(ctx, f->b, f->pic, p, FR(v),
+                                                 site);
+                if (ah > 0) {
+#ifdef QJS_REGVM_COUNT
+                    js_regvm_put_direct++;
+#endif
+                    T_NEXT(T_SZ_RASR);
+                }
+                if (ah < 0)
+                    T_FAIL();
+            }
         }
     }
     __attribute__((musttail)) return regvm_t_put_field_slow(REGVM_PASS);
@@ -27473,6 +28110,647 @@ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s(REGVM_ARGS)
     __attribute__((musttail))
         return regvm_t_add_imm_self_branch_s_slow(REGVM_PASS);
 }
+
+/*
+ * --- R1: the measured cold opcodes -----------------------------------------
+ *
+ * `tools/regvm/threadcover.py` reads the per-row `##ROP##` histograms and names
+ * every opcode above 0.5% of dispatches that still goes through
+ * `regvm_t_cold`. Each one below is that opcode's own handler. The shape is the
+ * same as every batch above: the common case is inline and frameless, and the
+ * half that has to call the engine is a musttail slow path.
+ *
+ * `regvm_t_cold` costs two tail calls plus the `regvm_exec_one` switch; a
+ * dedicated handler costs one tail call into its own body. For the opcodes that
+ * call the engine either way (a property read, a global store, a template fill)
+ * the win is only the switch, but that switch is what the count profile
+ * attributed 16% of deltablue's cycles to.
+ */
+static uint8_t *REGVM_CC regvm_t_load_i32(REGVM_ARGS)
+{
+    T_SET_NEXT_P(T_REG(1), js_int32(T_I32(3)), T_SZ_RI32);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_add_imm_s_slow(REGVM_ARGS)
+{
+    int d = T_REG8(1), a = T_REG8(2);
+    int32_t imm = T_OFF8(3);
+    JSValue out;
+
+    if (!regvm_num_fast(REG_BIN_ADD, FR(a), js_int32(imm), &out) &&
+        js_regvm_binary(ctx, REG_BIN_ADD, FR(a), js_int32(imm), &out))
+        T_FAIL();
+    T_SET_NEXT_P(d, out, T_SZ_RRI_S);
+}
+
+static uint8_t *REGVM_CC regvm_t_add_imm_s(REGVM_ARGS)
+{
+    int d = T_REG8(1), a = T_REG8(2);
+    int32_t imm = T_OFF8(3);
+    JSValue v = FR(a);
+
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        int32_t sum;
+
+        if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum)))
+            T_SET_NEXT_P(d, js_int32(sum), T_SZ_RRI_S);
+        T_SET_NEXT_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)),
+                     T_SZ_RRI_S);
+    }
+    __attribute__((musttail)) return regvm_t_add_imm_s_slow(REGVM_PASS);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_sub_imm_s_slow(REGVM_ARGS)
+{
+    int d = T_REG8(1), a = T_REG8(2);
+    int32_t imm = T_OFF8(3);
+    JSValue out;
+
+    if (!regvm_num_fast(REG_BIN_SUB, FR(a), js_int32(imm), &out) &&
+        js_regvm_binary(ctx, REG_BIN_SUB, FR(a), js_int32(imm), &out))
+        T_FAIL();
+    T_SET_NEXT_P(d, out, T_SZ_RRI_S);
+}
+
+static uint8_t *REGVM_CC regvm_t_sub_imm_s(REGVM_ARGS)
+{
+    int d = T_REG8(1), a = T_REG8(2);
+    int32_t imm = T_OFF8(3);
+    JSValue v = FR(a);
+
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        int64_t sum = (int64_t)JS_VALUE_GET_INT(v) - imm;
+
+        if (sum >= INT32_MIN && sum <= INT32_MAX)
+            T_SET_NEXT_P(d, js_int32((int32_t)sum), T_SZ_RRI_S);
+        T_SET_NEXT_P(d, js_float64((double)sum), T_SZ_RRI_S);
+    }
+    __attribute__((musttail)) return regvm_t_sub_imm_s_slow(REGVM_PASS);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_add_imm_self_s_slow(REGVM_ARGS)
+{
+    int d = T_REG8(1);
+    int32_t imm = T_OFF8(2);
+    JSValue v = FR(d), out;
+
+    if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
+        js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
+        T_FAIL();
+    T_SET_NEXT_P(d, out, T_SZ_RI_S);
+}
+
+static uint8_t *REGVM_CC regvm_t_add_imm_self_s(REGVM_ARGS)
+{
+    int d = T_REG8(1);
+    int32_t imm = T_OFF8(2);
+    JSValue v = FR(d);
+
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        int32_t sum;
+
+        if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum)))
+            T_SET_NEXT_P(d, js_int32(sum), T_SZ_RI_S);
+        T_SET_NEXT_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)),
+                     T_SZ_RI_S);
+    }
+    __attribute__((musttail)) return regvm_t_add_imm_self_s_slow(REGVM_PASS);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_sub_imm_self_s_slow(REGVM_ARGS)
+{
+    int d = T_REG8(1);
+    int32_t imm = T_OFF8(2);
+    JSValue v = FR(d), out;
+
+    if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
+        js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
+        T_FAIL();
+    T_SET_NEXT_P(d, out, T_SZ_RI_S);
+}
+
+static uint8_t *REGVM_CC regvm_t_sub_imm_self_s(REGVM_ARGS)
+{
+    int d = T_REG8(1);
+    int32_t imm = T_OFF8(2);
+    JSValue v = FR(d);
+
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        int64_t sum = (int64_t)JS_VALUE_GET_INT(v) - imm;
+
+        if (sum >= INT32_MIN && sum <= INT32_MAX)
+            T_SET_NEXT_P(d, js_int32((int32_t)sum), T_SZ_RI_S);
+        T_SET_NEXT_P(d, js_float64((double)sum), T_SZ_RI_S);
+    }
+    __attribute__((musttail)) return regvm_t_sub_imm_self_s_slow(REGVM_PASS);
+}
+
+/* The binding takes the value and empties the register. Under deferred RC the
+   register only borrows, so the transfer is a dup and nothing is cleared. */
+static inline void regvm_t_xfer_local(JSContext *ctx, JSValue *dst, JSValue *src)
+{
+#if QJS_DRC
+    set_value(ctx, dst, js_dup(*src));
+#else
+    set_value(ctx, dst, *src);
+    *src = JS_UNDEFINED;
+#endif
+}
+
+#define T_DEF_PUT_LOCAL_XFER_S(n) \
+    static uint8_t *REGVM_CC regvm_t_put_local_xfer_s##n(REGVM_ARGS) \
+    { \
+        int s = T_REG(1); \
+        regvm_t_xfer_local(ctx, &f->var_buf[n], &FR(s)); \
+        T_NEXT(T_SZ_R); \
+    }
+T_DEF_PUT_LOCAL_XFER_S(0)
+T_DEF_PUT_LOCAL_XFER_S(1)
+T_DEF_PUT_LOCAL_XFER_S(2)
+T_DEF_PUT_LOCAL_XFER_S(3)
+#undef T_DEF_PUT_LOCAL_XFER_S
+
+static uint8_t *REGVM_CC regvm_t_object_template(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int index = T_U16(3);
+    JSValue val;
+
+    if (unlikely(index >= f->b->objlit_count)) {
+        JS_ThrowInternalError(ctx, "invalid object literal template");
+        T_FAIL();
+    }
+    val = js_new_object_from_template(ctx, &f->b->objlit_tab[index]);
+    if (JS_IsException(val))
+        T_FAIL();
+    T_SET_NEXT_P(d, val, T_SZ_RU);
+}
+
+static uint8_t *REGVM_CC regvm_t_array_from(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int ab = T_REG(3);
+    int na = T_U8(5);
+    JSValue val = regvm_array_from_regs(ctx, FRP(ab), na);
+
+    if (JS_IsException(val))
+        T_FAIL();
+    T_SET_NEXT_P(d, val, T_SZ_RRB);
+}
+
+static uint8_t *REGVM_CC regvm_t_put_global(REGVM_ARGS)
+{
+    JSAtom atom = (JSAtom)T_U32(1);
+    int s = T_REG(5);
+    int init = T_U8(7);
+
+    if (JS_SetGlobalVar(ctx, atom, js_dup(FR(s)), init) < 0)
+        T_FAIL();
+    T_NEXT(T_SZ_RAB);
+}
+
+/* `.length` is the engine's to answer: the array case is exotic and the string
+   case is a code-unit count, so the handler is the call and nothing else. */
+static uint8_t *REGVM_CC regvm_t_get_length(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int r = T_REG(3);
+    JSValue val = JS_GetProperty(ctx, FR(r), JS_ATOM_length);
+
+    if (JS_IsException(val))
+        T_FAIL();
+    T_SET_NEXT_P(d, val, T_SZ_RRS);
+}
+
+static uint8_t *REGVM_CC regvm_t_put_element(REGVM_ARGS)
+{
+    int o = T_REG(1);
+    int key = T_REG(3);
+    int v = T_REG(5);
+
+    if (JS_SetPropertyValue(ctx, FR(o), js_dup(FR(key)), js_dup(FR(v)),
+                            JS_PROP_THROW_STRICT) < 0)
+        T_FAIL();
+    T_NEXT(T_SZ_RRR);
+}
+
+/*
+ * The object-literal fill. The fast path is the one the monolith has: the
+ * receiver is already the template's shape, so the properties can be written
+ * into their slots directly. The generic path defines each property by atom and
+ * is the engine's. `set_value` is the release-plus-store the monolith uses, so
+ * a slot that already held a reference is freed exactly once.
+ */
+static uint8_t *REGVM_CC regvm_t_object_fill(REGVM_ARGS)
+{
+    int o = T_REG(1);
+    int ab = T_REG(3);
+    int n = T_U8(5);
+    int ti = T_U16(6);
+    JSValue *vals = &FR(ab);
+    JSObjLitTemplate *tpl;
+    int i2;
+
+    if (unlikely(ti >= f->b->objlit_count)) {
+        JS_ThrowInternalError(ctx, "invalid object literal template");
+        T_FAIL();
+    }
+    tpl = &f->b->objlit_tab[ti];
+    if (likely(JS_VALUE_GET_TAG(FR(o)) == JS_TAG_OBJECT)) {
+        JSObject *po = JS_VALUE_GET_OBJ(FR(o));
+
+        if (likely(!po->is_exotic && po->shape == tpl->shape &&
+                   (int)tpl->prop_count == n)) {
+            for (i2 = 0; i2 < n; i2++) {
+#if QJS_DRC
+                set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
+                vals[i2] = JS_UNDEFINED;
+#else
+                set_value(ctx, &po->prop[i2].u.value, vals[i2]);
+                vals[i2] = JS_UNDEFINED;
+#endif
+            }
+            T_NEXT(T_SZ_RBUU);
+        }
+    }
+    for (i2 = 0; i2 < n; i2++) {
+        JSValue v2 = vals[i2];
+
+        vals[i2] = JS_UNDEFINED;
+#if QJS_DRC
+        if (JS_DefinePropertyValue(ctx, FR(o), js_objlit_template_atom(tpl, i2),
+                                   js_dup(v2),
+                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            for (i2 = i2 + 1; i2 < n; i2++)
+                vals[i2] = JS_UNDEFINED;
+            T_FAIL();
+        }
+#else
+        if (JS_DefinePropertyValue(ctx, FR(o), js_objlit_template_atom(tpl, i2),
+                                   v2, JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            for (i2 = i2 + 1; i2 < n; i2++) {
+                JS_FreeValue(ctx, vals[i2]);
+                vals[i2] = JS_UNDEFINED;
+            }
+            T_FAIL();
+        }
+#endif
+    }
+    T_NEXT(T_SZ_RBUU);
+}
+
+/* An integer index below the argument count is the whole operation; anything
+   else (a negative, a non-integer, a hole) is the engine's. */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_arg_el_slow(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int idx = T_U16(3);
+    int s = T_REG(5);
+    JSValue v2 = js_args_el_slow(ctx, &f->var_buf[idx], js_dup(FR(s)),
+                                 f->argc, f->argv, f->sf, f->b->arg_count);
+
+    if (JS_IsException(v2))
+        T_FAIL();
+    T_SET_NEXT_P(d, v2, T_SZ_RUR);
+}
+
+static uint8_t *REGVM_CC regvm_t_get_arg_el(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int s = T_REG(5);
+    JSValue k = FR(s);
+
+    if (likely(JS_VALUE_GET_TAG(k) == JS_TAG_INT)) {
+        uint32_t i2 = (uint32_t)JS_VALUE_GET_INT(k);
+
+        if (likely(i2 < (uint32_t)f->argc)) {
+            JSValue v2 = js_dup(i2 < (uint32_t)f->b->arg_count
+                                    ? f->arg_buf[i2] : f->argv[i2]);
+            T_SET_NEXT_P(d, v2, T_SZ_RUR);
+        }
+    }
+    __attribute__((musttail)) return regvm_t_get_arg_el_slow(REGVM_PASS);
+}
+
+/*
+ * `slot = slot <subop> imm` and the block's back edge. The integer increment
+ * is inline; every other update is the engine's coercion, in the slow half.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_local_rmw_branch_slow(
+    REGVM_ARGS)
+{
+    int sub = T_U8(1);
+    int slot = T_U16(2);
+    int32_t imm = T_I32(4);
+    int32_t off = T_I32(8);
+    JSValue out;
+
+    if (sub & REG_RMW_UNARY) {
+        if (js_regvm_unary(ctx, sub & ~REG_RMW_UNARY, f->var_buf[slot], &out))
+            T_FAIL();
+    } else if (!regvm_num_fast(sub, f->var_buf[slot], js_int32(imm), &out) &&
+               js_regvm_binary(ctx, sub, f->var_buf[slot], js_int32(imm),
+                               &out)) {
+        T_FAIL();
+    }
+    set_value(ctx, &f->var_buf[slot], out);
+    T_NEXT(T_SZ_BU_IT + off);
+}
+
+static uint8_t *REGVM_CC regvm_t_local_rmw_branch(REGVM_ARGS)
+{
+    int sub = T_U8(1);
+    int slot = T_U16(2);
+    int32_t imm = T_I32(4);
+    int32_t off = T_I32(8);
+
+    if (sub & REG_RMW_UNARY) {
+        int u = sub & ~REG_RMW_UNARY;
+        JSValue v = f->var_buf[slot];
+
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+            int32_t iv = JS_VALUE_GET_INT(v);
+
+            if (u == REG_UN_INC ? iv != INT32_MAX : iv != INT32_MIN) {
+                f->var_buf[slot] = js_int32(u == REG_UN_INC ? iv + 1 : iv - 1);
+                T_NEXT(T_SZ_BU_IT + off);
+            }
+        }
+    }
+    __attribute__((musttail)) return regvm_t_local_rmw_branch_slow(REGVM_PASS);
+}
+
+/*
+ * `return f(...)`: the callee's value leaves this frame exactly as `return`
+ * does, so the handler ends in the same exit. A generator frame is handed back
+ * to the monolith, whose suspension needs the interpreter's own state (see the
+ * note on `regvm_t_return`).
+ *
+ * When the callee is one the record path can run, the call is entered as a
+ * *sibling* record: this frame is released first and the callee names this
+ * frame's caller, so the value lands in the caller's register and a
+ * tail-recursive loop grows neither the C stack nor the arena. Everything the
+ * callee reads out of this frame -- the argument values, the receiver of a
+ * method call, and the callee object itself -- is copied (owned) before the
+ * release, because after it the old frame's registers are gone. Every other
+ * callee keeps the nested call in `regvm_t_tail_call_slow`.
+ */
+static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS)
+{
+    if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
+        return ip;
+    REGVM_CAPTURE_IP();
+#if QJS_REGVM_RECORD
+    {
+        int c = T_REG(1);
+        JSValue cf = FR(c);
+
+        if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+            JSObject *co = JS_VALUE_GET_OBJ(cf);
+            if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+                JSFunctionBytecode *cb = co->u.func.function_bytecode;
+                /* A tail call can only replace a nested record. The entry
+                   record belongs to the monolith's `run`, which releases the
+                   frame at `done:`, so no callee may take its place. */
+                if (likely(regvm_record_eligible(cb) && f->caller != NULL))
+                    __attribute__((musttail))
+                        return regvm_t_tail_call_record(REGVM_PASS);
+                if (unlikely(cb->is_lazy && f->caller != NULL) &&
+                    js_materialize_function_body(cb->realm, cb) == 0 &&
+                    regvm_record_eligible(cb))
+                    __attribute__((musttail))
+                        return regvm_t_tail_call_record(REGVM_PASS);
+            }
+        }
+    }
+#endif
+    __attribute__((musttail)) return regvm_t_tail_call_slow(REGVM_PASS);
+}
+
+static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
+{
+    if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
+        return ip;
+    REGVM_CAPTURE_IP();
+#if QJS_REGVM_RECORD
+    {
+        int c = T_REG(1);
+        JSValue cf = FR(c);
+
+        if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+            JSObject *co = JS_VALUE_GET_OBJ(cf);
+            if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+                JSFunctionBytecode *cb = co->u.func.function_bytecode;
+                if (likely(regvm_record_eligible(cb) && f->caller != NULL))
+                    __attribute__((musttail))
+                        return regvm_t_tail_call_method_record(REGVM_PASS);
+                if (unlikely(cb->is_lazy && f->caller != NULL) &&
+                    js_materialize_function_body(cb->realm, cb) == 0 &&
+                    regvm_record_eligible(cb))
+                    __attribute__((musttail))
+                        return regvm_t_tail_call_method_record(REGVM_PASS);
+            }
+        }
+    }
+#endif
+    __attribute__((musttail))
+        return regvm_t_tail_call_method_slow(REGVM_PASS);
+}
+
+static uint8_t *REGVM_CC regvm_t_tail_call_slow(REGVM_ARGS)
+{
+    int c, ab, na;
+    JSValue ret_val;
+
+    c = T_REG(1);
+    ab = T_REG(3);
+    na = T_U8(5);
+#ifdef QJS_REGVM_COUNT
+    js_regvm_argmoves += (uint64_t)na;
+#endif
+    if (!js_call_c_function_fast(ctx, FR(c), JS_UNDEFINED, na, vc(FRP(ab)), 0,
+                                 &ret_val))
+        ret_val = JS_CallInternal(ctx, FR(c), JS_UNDEFINED, JS_UNDEFINED, na,
+                                  vc(FRP(ab)), 0);
+    if (JS_IsException(ret_val))
+        T_FAIL();
+    f->ret = ret_val;
+    __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
+}
+
+static uint8_t *REGVM_CC regvm_t_tail_call_method_slow(REGVM_ARGS)
+{
+    int c, r, ab, na;
+    JSValue ret_val;
+
+    c = T_REG(1);
+    r = T_REG(3);
+    ab = T_REG(5);
+    na = T_U8(7);
+#ifdef QJS_REGVM_COUNT
+    js_regvm_argmoves += (uint64_t)na;
+#endif
+    if (!js_call_c_function_fast(ctx, FR(c), FR(r), na, vc(FRP(ab)), 0,
+                                 &ret_val))
+        ret_val = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na,
+                                  vc(FRP(ab)), 0);
+    if (JS_IsException(ret_val))
+        T_FAIL();
+    f->ret = ret_val;
+    __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
+}
+
+#if QJS_REGVM_RECORD
+/*
+ * The largest argument list a tail call copies through the C stack. The
+ * syntactic form (`return f(...)`) rarely passes more than a handful; a larger
+ * call keeps the nested path rather than growing this handler's frame.
+ */
+#define REGVM_TAIL_ARGS_MAX 64
+
+/*
+ * A cap on consecutive frame-reusing tail calls. Frame reuse is what makes a
+ * tail call constant-space, but it also means a runaway `return f()` never
+ * reaches the arena limit and would hang where the nested path raises
+ * RangeError. The cap keeps that observable behaviour while still letting
+ * realistic recursion go far deeper than the nested path could: it is far
+ * above the depth at which the nested path overflows, so a program that works
+ * today is unaffected.
+ */
+#define REGVM_TAIL_CHAIN_MAX (1u << 20)
+
+/*
+ * The record-taking halves of the tail calls. The current frame is released
+ * before the callee's record is allocated, so the arena slot is reused and the
+ * chain does not grow. Everything that must outlive the release -- the argument
+ * copies, the receiver, and the callee object -- is duplicated first, and the
+ * extra slots are placed past the argument area so the record's release walk
+ * frees them (they sit between `arg_buf` and `var_buf`, which the walk covers
+ * contiguously).
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_tail_call_record(REGVM_ARGS)
+{
+    int c = T_REG(1), ab = T_REG(3), na = T_U8(5);
+    JSValue cf = FR(c);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+    JSRegRun *old = f;
+    JSRegRun *ocaller = old->caller;
+    int odst = old->ret_dst;
+    uint8_t *oip = old->ret_ip;
+    uint32_t ochain = ctx->rt->regvm_tail_chain;
+    JSValue args[REGVM_TAIL_ARGS_MAX];
+    JSValue cfd;
+    JSRegRecordLayout lay;
+    int slots, k;
+
+    if (unlikely(js_poll_interrupts(ctx)))
+        T_FAIL();
+    slots = na > cb->arg_count ? na : cb->arg_count;
+    if (unlikely(na > REGVM_TAIL_ARGS_MAX || slots > REGVM_TAIL_ARGS_MAX))
+        __attribute__((musttail)) return regvm_t_tail_call_slow(REGVM_PASS);
+    if (unlikely(ochain >= REGVM_TAIL_CHAIN_MAX)) {
+        JS_ThrowStackOverflow(ctx);
+        T_FAIL();
+    }
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        T_FAIL();
+    }
+#ifdef QJS_REGVM_COUNT
+    js_regvm_argmoves += (uint64_t)na;
+#endif
+    for (k = 0; k < na; k++)
+        args[k] = js_dup(FRP(ab)[k]);
+    cfd = js_dup(cf);
+    regvm_record_release(ctx->rt, old);
+    ctx->rt->current_stack_frame = ocaller->sf;
+    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 1, &lay) != 0)) {
+        for (k = 0; k < na; k++)
+            JS_FreeValue(ctx, args[k]);
+        JS_FreeValue(ctx, cfd);
+        f = ocaller;
+        JS_ThrowStackOverflow(ctx);
+        T_FAIL();
+    }
+    regvm_record_fill_tail(ctx->rt, &lay, cf, co, cb, ocaller, odst, oip,
+                           JS_UNDEFINED, args, na, slots);
+    lay.arg_buf[slots] = cfd;         /* owns the callee object */
+    lay.rec->argv = lay.arg_buf;      /* `arguments` reads the copies */
+    lay.rec->local_count += 1;
+    ctx->rt->regvm_tail_chain = ochain + 1;
+    f = lay.rec;
+    __attribute__((musttail))
+        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_tail_call_method_record(REGVM_ARGS)
+{
+    int c = T_REG(1), r = T_REG(3), ab = T_REG(5), na = T_U8(7);
+    JSValue cf = FR(c);
+    JSValue tv = FR(r);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+    JSRegRun *old = f;
+    JSRegRun *ocaller = old->caller;
+    int odst = old->ret_dst;
+    uint8_t *oip = old->ret_ip;
+    uint32_t ochain = ctx->rt->regvm_tail_chain;
+    JSValue args[REGVM_TAIL_ARGS_MAX];
+    JSValue cfd;
+    JSRegRecordLayout lay;
+    int slots, k;
+
+    if (unlikely(js_poll_interrupts(ctx)))
+        T_FAIL();
+    slots = na > cb->arg_count ? na : cb->arg_count;
+    if (unlikely(na > REGVM_TAIL_ARGS_MAX || slots > REGVM_TAIL_ARGS_MAX))
+        __attribute__((musttail))
+            return regvm_t_tail_call_method_slow(REGVM_PASS);
+    if (unlikely(ochain >= REGVM_TAIL_CHAIN_MAX)) {
+        JS_ThrowStackOverflow(ctx);
+        T_FAIL();
+    }
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        T_FAIL();
+    }
+#ifdef QJS_REGVM_COUNT
+    js_regvm_argmoves += (uint64_t)na;
+#endif
+    for (k = 0; k < na; k++)
+        args[k] = js_dup(FRP(ab)[k]);
+    tv = js_dup(tv);
+    cfd = js_dup(cf);
+    regvm_record_release(ctx->rt, old);
+    ctx->rt->current_stack_frame = ocaller->sf;
+    /* two slots past the arguments: the receiver, then the callee object */
+    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
+        for (k = 0; k < na; k++)
+            JS_FreeValue(ctx, args[k]);
+        JS_FreeValue(ctx, tv);
+        JS_FreeValue(ctx, cfd);
+        f = ocaller;
+        JS_ThrowStackOverflow(ctx);
+        T_FAIL();
+    }
+    regvm_record_fill_tail(ctx->rt, &lay, cf, co, cb, ocaller, odst, oip,
+                           tv, args, na, slots);
+    lay.arg_buf[slots] = tv;          /* owns the receiver */
+    lay.arg_buf[slots + 1] = cfd;     /* owns the callee object */
+    lay.rec->this_obj = tv;
+    lay.rec->argv = lay.arg_buf;
+    lay.rec->local_count += 2;
+    ctx->rt->regvm_tail_chain = ochain + 1;
+    f = lay.rec;
+    __attribute__((musttail))
+        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
+}
+#endif /* QJS_REGVM_RECORD */
 
 /*
  * The T_SZ_* constants are a claim about the encoder's operand formats, so the
@@ -27903,6 +29181,7 @@ static uint8_t *REGVM_CC regvm_t_unwind(REGVM_ARGS)
 
     if (needs_backtrace(exc)) {
         f->sf->cur_pc = NULL;
+        REGVM_CAPTURE_IP();
         build_backtrace(ctx, exc, JS_UNDEFINED, NULL, 0, 0, 0);
     }
     __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
@@ -28157,6 +29436,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
     sf->cur_gc_obj = NULL;
 #endif
     sf->cur_pc = NULL;
+    sf->regvm_ip = NULL;
     sf->prev_frame = caller->sf;
     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
 
@@ -28214,6 +29494,111 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
                 lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
         }
 #endif
+    }
+
+    rt->current_stack_frame = sf;
+}
+
+/*
+ * The tail-call variant of regvm_record_fill. It is a separate function rather
+ * than a `tail` flag on the original because adding a parameter measurably
+ * perturbed the codegen of the inlined normal-call path (it pushed the register
+ * allocator over a spill threshold). The differences are deliberate: the
+ * caller's frame is already released, so nothing may be borrowed from it, and
+ * the argument values in `oargv` are already owned and are transferred rather
+ * than duplicated.
+ */
+static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+    JSRuntime *rt, const JSRegRecordLayout *lay, JSValueConst cf, JSObject *co,
+    JSFunctionBytecode *cb, JSRegRun *caller, int ret_dst, uint8_t *ret_ip,
+    JSValueConst this_obj, const JSValue *oargv, int na, int slots)
+{
+    JSRegRun *rec = lay->rec;
+    JSStackFrame *sf = lay->sf;
+    int k;
+
+    rec->caller = caller;
+    rec->ret_ip = ret_ip;
+    rec->ret_dst = ret_dst;
+#ifdef QJS_REGVM_RCCHECK
+    rec->ctx = cb->realm;
+#endif
+    rec->b = cb;
+    rec->pic = cb->regvm_pic;
+#ifdef QJS_REGVM_RCCHECK
+    rec->rcc = cb->regvm_rcc;
+    rec->rcc_shadow = NULL;
+    rec->rcc_prev = -1;
+    rec->rcc_ip = NULL;
+#endif
+    rec->sf = sf;
+    rec->fr = lay->regs;
+    rec->var_refs = co->u.func.var_refs;
+    rec->var_buf = lay->var_buf;
+    rec->this_obj = this_obj;
+    rec->new_target = JS_UNDEFINED;
+    rec->argc = na;
+    rec->argv = (JSValue *)oargv;
+    rec->ctl = lay->ctl;
+    rec->nctl = 0;
+    rec->flags = 0;
+    rec->ret = JS_UNDEFINED;
+    rec->set_v = JS_UNDEFINED;
+    rec->arg_buf = lay->arg_buf;
+    rec->arg_owned = 1;
+    rec->local_buf = lay->arg_buf;
+#if QJS_DRC
+    rec->local_count = slots + cb->var_count;
+#else
+    rec->local_count = slots + cb->var_count + cb->regvm_reg_count
+        + REGVM_HS - 1;
+#endif
+    for (k = 0; k < slots; k++)
+        lay->arg_buf[k] = (k < na) ? oargv[k] : JS_UNDEFINED;
+#if !REGVM_SLIM_FRAME
+    sf->arg_count = slots;
+#endif
+
+    sf->cur_func = cf;
+#if !REGVM_SLIM_FRAME
+    sf->is_strict_mode = cb->is_strict_mode;
+    sf->is_constructor = false;
+    sf->var_buf = lay->var_buf;
+#endif
+    sf->var_refs = lay->var_refs;
+    sf->var_ref_count = cb->var_ref_count;
+#if !REGVM_SLIM_FRAME
+    sf->cur_gc_obj = NULL;
+#endif
+    sf->cur_pc = NULL;
+    sf->regvm_ip = NULL;
+    sf->prev_frame = caller->sf;
+    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+
+#if !REGVM_SLIM_FRAME
+    sf->arg_buf = rec->arg_buf;
+#endif
+    {
+        int var_count = cb->var_count;
+        int var_ref_count = cb->var_ref_count;
+        int nregs = cb->regvm_reg_count + REGVM_HS;
+
+        for (k = 0; k < var_count; k++)
+            lay->var_buf[k] = JS_UNDEFINED;
+        for (k = 0; k < var_ref_count; k++)
+            lay->var_refs[k] = NULL;
+        if (likely(nregs <= REGVM_UNDEF_TMPL_N)) {
+            memcpy(lay->regs, regvm_undef_tmpl, (size_t)nregs * sizeof(JSValue));
+        } else if (!cb->regvm_fill) {
+            for (k = 0; k < nregs; k++)
+                lay->regs[k] = JS_UNDEFINED;
+        } else {
+            int nf = cb->regvm_fill_count;
+
+            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
+            for (k = 0; k < nf; k++)
+                lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
+        }
     }
 
     rt->current_stack_frame = sf;
@@ -28888,9 +30273,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             int a_ = RD_REG(); \
             int c_ = RD_REG(); \
             JSValue out_; \
-            if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_) && \
-                js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
-                goto exception; \
+            if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_)) { \
+                if ((SUB_) == REG_BIN_ADD) { \
+                    int _ar = regvm_accum_append(ctx, b, regs, arg_buf, argc, \
+                                                 d_, a_, regs[c_]); \
+                    if (_ar > 0) REGVM_NEXT(); \
+                    if (_ar < 0) goto exception; \
+                } \
+                if (js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
+                    goto exception; \
+            } \
             SET_REG_P(d_, out_); \
             REGVM_NEXT(); \
         } while (0)
@@ -29151,7 +30543,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             goto *regvm_dispatch[op]; \
         } while (0)
 #else
-#ifdef QJS_REGVM_THREAD
+#if QJS_REGVM_THREAD
 /*
  * Run the threaded chain from here. It returns the address of an opcode with no
  * threaded handler -- which this loop then executes, counting it -- or NULL
@@ -30060,6 +31452,14 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             *slot = js_dup(regs[v]);
                             JS_FreeValue(ctx, old);
                             REGVM_NEXT();
+                        }
+                        {
+                            int ah = regvm_put_field_add_hit(ctx, b, pic, p,
+                                                             regs[v], site);
+                            if (ah > 0)
+                                REGVM_NEXT();
+                            if (ah < 0)
+                                goto exception;
                         }
                     }
                     if (regvm_put_field_ic(ctx, b, &pic, regs[r], atom, regs[v], site) < 0)
@@ -31625,7 +33025,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                         SET_REG_P(d, js_int32((int32_t)sum));
                         REGVM_NEXT();
                     }
-                    SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                    SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm)));
                     REGVM_NEXT();
                 }
                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
@@ -31676,7 +33076,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                         regs[d] = js_int32((int32_t)sum);
                         REGVM_NEXT();
                     }
-                    regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+                    regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm));
                     REGVM_NEXT();
                 }
                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
@@ -31766,13 +33166,34 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 uint32_t idx = RD_U32();
                 JSValue out;
                 if (kind == REG_CONST_CPOOL) {
-                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out) &&
-                        js_regvm_binary(ctx, sub, regs[a], b->cpool[idx], &out))
-                        goto exception;
+                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out)) {
+                        if (sub == REG_BIN_ADD) {
+                            int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
+                                                         argc, d, a,
+                                                         b->cpool[idx]);
+                            if (_ar > 0) REGVM_NEXT();
+                            if (_ar < 0) goto exception;
+                        }
+                        if (js_regvm_binary(ctx, sub, regs[a], b->cpool[idx],
+                                            &out))
+                            goto exception;
+                    }
                 } else {
                     JSValue cst = JS_AtomToValue(ctx, idx);
                     if (JS_IsException(cst))
                         goto exception;
+                    if (sub == REG_BIN_ADD) {
+                        int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
+                                                     argc, d, a, cst);
+                        if (_ar > 0) {
+                            JS_FreeValue(ctx, cst);
+                            REGVM_NEXT();
+                        }
+                        if (_ar < 0) {
+                            JS_FreeValue(ctx, cst);
+                            goto exception;
+                        }
+                    }
                     if (!regvm_num_fast(sub, regs[a], cst, &out) &&
                         js_regvm_binary(ctx, sub, regs[a], cst, &out)) {
                         JS_FreeValue(ctx, cst);
@@ -34160,7 +35581,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                             SET_REG_P(d, js_int32((int32_t)sum));
                             REGVM_NEXT();
                         }
-                        SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                        SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm)));
                         REGVM_NEXT();
                     }
                     if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
@@ -34215,7 +35636,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                             regs[d] = js_int32((int32_t)sum);
                             REGVM_NEXT();
                         }
-                        regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+                        regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm));
                         REGVM_NEXT();
                     }
                     if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
@@ -34571,6 +35992,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSVarRef **var_refs;
     size_t alloca_size;
 
+#if QJS_REGVM && !defined(NDEBUG)
+    /* P6 invariant: when a C caller's argv is used in place, the callee must
+       not write any argument slot. Snapshot the arguments on entry and check
+       them again before returning. See the plan's "argv_safe cross-check
+       direction" decision. */
+    JSValue argv_snapshot[16];
+    int argv_snapshot_n = 0;
+#endif
+
 #if QJS_REGVM
     /* Set on the generator-rejection resume path and handed to the register
        interpreter, which unwinds from there. */
@@ -34691,6 +36121,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = 0;
     }
 
+#if QJS_REGVM && !defined(NDEBUG)
+    /* P6: nothing was copied and the callee is not argument-captured, so a C
+       caller's argv is used in place. Snapshot it; the return path asserts the
+       callee wrote nothing into it. */
+    if ((flags & JS_CALL_FLAG_COPY_ARGV) && arg_allocated_size == 0) {
+        int n = min_int(argc, b->arg_count);
+        if (n > 0 && n <= (int)(sizeof(argv_snapshot) / sizeof(argv_snapshot[0]))) {
+            memcpy(argv_snapshot, argv, sizeof(JSValue) * n);
+            argv_snapshot_n = n;
+        }
+    }
+#endif
+
 #if QJS_REGVM
     /* The register frame's temporary area is the allocator's register count,
        not the stack VM's maximum depth. */
@@ -34803,12 +36246,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         ast.resume_marker = NULL;
         ast.resume_pending = 0;
         ast.resume_rpc = NULL;
-        return regvm_asm_enter(&ast);
+        {
+            JSValue _r = regvm_asm_enter(&ast);
+#if !defined(NDEBUG)
+            if (argv_snapshot_n > 0)
+                assert(memcmp(argv, argv_snapshot,
+                              sizeof(JSValue) * argv_snapshot_n) == 0);
+#endif
+            return _r;
+        }
     }
 #else
-    return js_regvm_execute(caller_ctx, func_obj, this_obj, new_target, argc,
-                            argv, sf, b, local_buf, arg_buf, var_buf,
-                            stack_buf, sp, pc, flags, regvm_throw_pending);
+    {
+        JSValue _r = js_regvm_execute(caller_ctx, func_obj, this_obj,
+                                      new_target, argc, argv, sf, b, local_buf,
+                                      arg_buf, var_buf, stack_buf, sp, pc,
+                                      flags, regvm_throw_pending);
+#if !defined(NDEBUG)
+        if (argv_snapshot_n > 0)
+            assert(memcmp(argv, argv_snapshot,
+                          sizeof(JSValue) * argv_snapshot_n) == 0);
+#endif
+        return _r;
+    }
 #endif
 
 #else
@@ -39817,8 +41277,8 @@ typedef struct JSFunctionDef {
     JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
     uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
     uint16_t regvm_fill_count;
-#if QJS_AOT_PROFILE
-    /* P0: regvm-offset -> stack pc table, moved to the bytecode. */
+#if QJS_REGVM
+    /* Bundle plan 4.1: regvm-offset -> stack pc table, moved to the bytecode. */
     int32_t *regvm_src_pc;
 #endif
     /* Per-pc operand pops of each nip_catch, from compute_stack_size; NULL
@@ -51088,10 +52548,8 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     fd->regvm_nip_pop = NULL;
     js_free(ctx, fd->regvm_code);
     fd->regvm_code = NULL;
-#if QJS_AOT_PROFILE
     js_free(ctx, fd->regvm_src_pc);
     fd->regvm_src_pc = NULL;
-#endif
 #endif
     free_objlit_sites(ctx, fd);
     js_free(ctx, fd->jump_slots);
@@ -55926,13 +57384,11 @@ static int regvm_homes_mode(void)
  * build can still turn it off at run time.
  */
 /*
- * The threaded interpreter (P2). Off by default while the conversion is in
- * progress: with it off the build is unchanged, and with it on the default and
- * the threaded dispatch can be measured against each other from one source.
+ * QJS_REGVM_THREAD and QJS_REGVM_RECORD are defaulted at the top of the
+ * register interpreter, above, because the interpreter reads them before this
+ * block; by here they are set, whether from the command line or from that
+ * default.
  */
-#ifndef QJS_REGVM_THREAD
-#define QJS_REGVM_THREAD 0
-#endif
 
 /*
  * The P1 self-check: the monolith's dispatch is replaced by one `regvm_step`
@@ -55963,16 +57419,9 @@ static int regvm_homes_mode(void)
 #endif
 
 /*
- * The second design for the same problem, and the one the first should have
- * been: the frame record *is* the interpreter's state, so `call` and `return`
- * are ordinary threaded handlers and nothing is copied in or out.
- *
- * Needs the threaded chain, because the record is what the chain's handlers
- * read and there is no other executor for a nested frame.
+ * QJS_REGVM_RECORD is defaulted with QJS_REGVM_THREAD at the top of the
+ * register interpreter, above.
  */
-#ifndef QJS_REGVM_RECORD
-#define QJS_REGVM_RECORD 0
-#endif
 #if QJS_REGVM_RECORD && !QJS_REGVM
 #error "QJS_REGVM_RECORD needs QJS_REGVM"
 #endif
@@ -56742,6 +58191,23 @@ static void js_regvm_thread_check_sizes(void)
     T_CHK(T_SZ_RBR_I, binary_imm);
     T_CHK(T_SZ_RBRI_S, binary_imm_s);
     T_CHK(T_SZ_CHAIN, get_field_chain);
+    T_CHK(T_SZ_RI32, load_i32);
+    T_CHK(T_SZ_RRI_S, add_imm_s);
+    T_CHK(T_SZ_RI_S, add_imm_self_s);
+    T_CHK(T_SZ_RI_S, sub_imm_self_s);
+    T_CHK(T_SZ_RRB, array_from);
+    T_CHK(T_SZ_RRB, tail_call);
+    T_CHK(T_SZ_RRS, get_length);
+    T_CHK(T_SZ_RUR, get_arg_el);
+    T_CHK(T_SZ_RRRB, tail_call_method);
+    T_CHK(T_SZ_BU_IT, local_rmw_branch);
+    T_CHK(T_SZ_BURT, branch_cmp_loc_reg);
+    T_CHK(T_SZ_RB, special_object);
+    T_CHK(T_SZ_RU, object_template);
+    T_CHK(T_SZ_R, put_local_xfer_s0);
+    T_CHK(T_SZ_RRR, put_element);
+    T_CHK(T_SZ_RBUU, object_fill);
+    T_CHK(T_SZ_RAB, put_global);
 #undef T_CHK
     if (bad)
         abort();
@@ -56943,6 +58409,35 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
     }
     return n;
 }
+
+/*
+ * Does every opcode in a register program have a threaded handler? Read out of
+ * the encoded bytes rather than the IR because that is the final form -- the
+ * encoder narrows operands as it emits -- and `wide` is a constant 1 at the
+ * only compiler call site, so the walk is exact. The same walk runs on the
+ * bundle read path: `regvm_all_threaded` is a property of the interpreter
+ * build, never serialized, and a function loaded from a blob must recompute it
+ * or it stays ineligible for the record call and tail-call fast paths (D13).
+ * One function for both callers so they cannot diverge.
+ */
+#if QJS_REGVM_THREAD
+static int regvm_code_all_threaded(const uint8_t *code, int len)
+{
+    const uint8_t *p = code, *end = p + len;
+
+    while (p < end) {
+        int op = *p, sz;
+        if (op >= ROP_COUNT || !regvm_is_threaded[op] ||
+            regvm_rop_fmt[op] == NULL)
+            return 0;
+        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        if (sz < 0)
+            return 0;
+        p += 1 + sz;
+    }
+    return p == end;
+}
+#endif
 
 /*
  * Rewrite every atom operand of a register program in place. The register
@@ -58726,9 +60221,9 @@ static void regvm_unmap_atoms(uint8_t *code, int len, int wide, int n,
             if (fmt[m] == 'a' ||
                 ((op == ROP_load_const || op == ROP_binary_cpool) && fmt[m] == 'c' &&
                  kind == REG_CONST_ATOM)) {
-                uint32_t a = (uint32_t)(code[q] | (code[q + 1] << 8) |
-                                        (code[q + 2] << 16) |
-                                        (code[q + 3] << 24));
+                uint32_t a = ((uint32_t)code[q] | ((uint32_t)code[q + 1] << 8) |
+                              ((uint32_t)code[q + 2] << 16) |
+                              ((uint32_t)code[q + 3] << 24));
                 JS_FreeAtomRT(rt, a);
                 if (++seen == n)
                     return;
@@ -60221,11 +61716,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                                    int win_size, int cycle_reg,
                                    uint8_t **out_code, int *out_len,
                                    int *out_regs, const int *rcc_canon,
-                                   JSRegRCC **out_rcc
-#if QJS_AOT_PROFILE
-                                   , int32_t **out_src_pc
-#endif
-                                   )
+                                   JSRegRCC **out_rcc,
+                                   int32_t **out_src_pc)
 {
     uint8_t *code = NULL;
     int *insn_pc = NULL;
@@ -60237,10 +61729,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
     int di = 0;
     long long n_decoded = 0;
 
-#if QJS_AOT_PROFILE
     if (out_src_pc)
         *out_src_pc = NULL;
-#endif
 
     if (regvm_uses_scratch(ir))
         scratch_reg = reg_count++; /* one register above every value register */
@@ -60731,13 +62221,14 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
      */
     n_decoded = ir->n_insns;
 #endif
-#if QJS_AOT_PROFILE
+#if QJS_REGVM
     /*
-     * P0 source positions (plan 2.4): one stack pc per register-bytecode offset,
-     * so the profiler dump can turn a regvm pc into `src=<line>:<col>`. Built
-     * last, where `insn_pc[]` and the layout are final and every failure path is
-     * behind us. A failed allocation just omits source positions; it is not a
-     * reason to refuse the program.
+     * Register source positions (bundle plan 4.1): one stack pc per
+     * register-bytecode offset. The caller turns this into a register-keyed
+     * pc2line table, so error traces name the same file:line:col as the stack
+     * build. Built last, where `insn_pc[]` and the layout are final and every
+     * failure path is behind us. A failed allocation just omits source
+     * positions; it is not a reason to refuse the program.
      */
     if (out_src_pc) {
         int32_t *sp = js_malloc(ctx, (code_len > 0 ? code_len : 1) * sizeof(int32_t));
@@ -64822,9 +66313,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
             fd->regvm_rcc = NULL;
             fd->regvm_fill = NULL;
             fd->regvm_fill_count = 0;
-#if QJS_AOT_PROFILE
             fd->regvm_src_pc = NULL;
-#endif
             er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
                                                               are two bytes */,
                                              reg_count,
@@ -64835,41 +66324,19 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                              &fd->regvm_len,
                                              &fd->regvm_reg_count,
                                              rcc_canon,
-                                             &fd->regvm_rcc
-#if QJS_AOT_PROFILE
-                                             , &fd->regvm_src_pc
-#endif
-                                             );
+                                             &fd->regvm_rcc,
+                                             &fd->regvm_src_pc);
 
 #if QJS_REGVM_THREAD
             /*
              * Whether every opcode here has a threaded handler. Read out of the
              * encoded bytes rather than the IR because that is the final form --
              * the encoder narrows operands as it emits -- and `wide` is a
-             * constant 1 at the only call site, so the walk is exact.
+             * constant 1 at the only call site, so the walk is exact. Shared
+             * with the bundle read path so the two cannot diverge.
              */
-            {
-                const uint8_t *_p = fd->regvm_code;
-                const uint8_t *_end = _p + fd->regvm_len;
-                int _all = 1;
-
-                while (_p < _end) {
-                    int _op = *_p;
-                    int _sz;
-                    if (_op >= ROP_COUNT || !regvm_is_threaded[_op] ||
-                        regvm_rop_fmt[_op] == NULL) {
-                        _all = 0;
-                        break;
-                    }
-                    _sz = regvm_fmt_size(regvm_rop_fmt[_op], 1, (uint16_t)_op);
-                    if (_sz < 0) {
-                        _all = 0;
-                        break;
-                    }
-                    _p += 1 + _sz;
-                }
-                fd->regvm_all_threaded = (_all && _p == _end);
-            }
+            fd->regvm_all_threaded =
+                regvm_code_all_threaded(fd->regvm_code, fd->regvm_len);
 #endif
             if (er == REGVM_REFUSED)
                 goto refused;
@@ -68097,10 +69564,148 @@ static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
     return 0;
 }
 
+#if QJS_REGVM
+/*
+ * Bundle plan 4.1: rebuild a register-compiled function's pc2line table keyed
+ * by register exec offset. The table the compiler installed is keyed by stack
+ * pc; a register frame reports a register offset, so the two disagree. Decode
+ * the stack table once, then for every instruction start emit an entry (same
+ * byte encoding as compute_pc2line_info) whenever the source position changes.
+ * `src_pc[off]` is the stack pc the instruction at register offset `off` came
+ * from, or -1 when `off` is not an instruction start.
+ */
+static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
+                                const int32_t *src_pc)
+{
+    DynBuf out;
+    const uint8_t *p, *p_end;
+    uint32_t *tp = NULL;
+    int *tl = NULL, *tc = NULL;
+    int tn = 0, j, rc;
+    int line_num, col_num, last_line, last_col;
+    uint32_t last_pc;
+
+    if (!b->pc2line_buf || b->pc2line_len <= 0 || b->regvm_len <= 0)
+        return;
+
+    /* Decode the stack-keyed table into parallel arrays. Every entry is at
+       least two bytes, so pc2line_len bounds the entry count. */
+    tp = js_malloc(ctx, (size_t)(b->pc2line_len + 1) * sizeof(*tp));
+    tl = js_malloc(ctx, (size_t)(b->pc2line_len + 1) * sizeof(*tl));
+    tc = js_malloc(ctx, (size_t)(b->pc2line_len + 1) * sizeof(*tc));
+    if (!tp || !tl || !tc)
+        goto done;
+
+    p = b->pc2line_buf;
+    p_end = p + b->pc2line_len;
+    line_num = b->line_num;
+    col_num = b->col_num;
+    {
+        uint32_t pc = 0;
+        int32_t v;
+        while (p < p_end) {
+            unsigned int op = *p++;
+            uint32_t val;
+            if (op == 0) {
+                rc = get_leb128(&val, p, p_end);
+                if (rc < 0)
+                    goto done;
+                pc += val;
+                p += rc;
+                rc = get_sleb128(&v, p, p_end);
+                if (rc < 0)
+                    goto done;
+                p += rc;
+                line_num += v;
+            } else {
+                op -= PC2LINE_OP_FIRST;
+                pc += (op / PC2LINE_RANGE);
+                line_num += (op % PC2LINE_RANGE) + PC2LINE_BASE;
+            }
+            rc = get_sleb128(&v, p, p_end);
+            if (rc < 0)
+                goto done;
+            p += rc;
+            col_num += v;
+            tp[tn] = pc;
+            tl[tn] = line_num;
+            tc[tn] = col_num;
+            tn++;
+        }
+    }
+
+    js_dbuf_init(ctx, &out);
+    last_line = b->line_num;
+    last_col = b->col_num;
+    last_pc = 0;
+    for (j = 0; j < b->regvm_len; j++) {
+        int32_t spc = src_pc[j];
+        int lo, hi, line, col, diff_pc, diff_line, diff_col;
+        if (spc < 0)
+            continue; /* not an instruction start */
+        /* last stack entry with pc <= spc */
+        lo = 0;
+        hi = tn;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if ((int32_t)tp[mid] <= spc)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo > 0) {
+            line = tl[lo - 1];
+            col = tc[lo - 1];
+        } else {
+            line = b->line_num;
+            col = b->col_num;
+        }
+        if (line == last_line && col == last_col)
+            continue;
+        diff_pc = j - (int)last_pc;
+        diff_line = line - last_line;
+        diff_col = col - last_col;
+        if (diff_line >= PC2LINE_BASE &&
+            diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
+            diff_pc <= PC2LINE_DIFF_PC_MAX) {
+            dbuf_putc(&out, (diff_line - PC2LINE_BASE) +
+                      diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
+        } else {
+            dbuf_putc(&out, 0);
+            dbuf_put_leb128(&out, diff_pc);
+            dbuf_put_sleb128(&out, diff_line);
+        }
+        dbuf_put_sleb128(&out, diff_col);
+        last_pc = (uint32_t)j;
+        last_line = line;
+        last_col = col;
+    }
+
+    if (!dbuf_error(&out)) {
+        js_free(ctx, b->pc2line_buf);
+        b->pc2line_buf = out.buf;
+        b->pc2line_len = out.size;
+        out.buf = NULL;
+        out.size = 0;
+    }
+    dbuf_free(&out);
+ done:
+    js_free(ctx, tp);
+    js_free(ctx, tl);
+    js_free(ctx, tc);
+}
+#endif /* QJS_REGVM */
+
 /* create a function object from a function definition. The function
    definition is freed. All the child functions are also created. It
    must be done this way to resolve all the variables. */
 static void js_scan_argv_safe(JSFunctionBytecode *b);
+static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
+                                  bool *argv_safe, bool *args_captured);
+#if QJS_REGVM
+static void regvm_scan_arg_flags(const uint8_t *code, int len,
+                                 bool *argv_safe, bool *args_captured);
+#endif
 
 static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 {
@@ -68246,7 +69851,13 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     closure_var_offset = function_size;
     function_size += fd->closure_var_count * sizeof(*fd->closure_var);
     byte_code_offset = function_size;
+#if QJS_REGVM && !QJS_AOT
+    /* D9: a register build keeps no stack bytecode after lowering. The slot
+       stays in the layout (the struct is unchanged) but holds nothing, and
+       args_captured/argv_safe come from the register program below. */
+#else
     function_size += fd->byte_code.size;
+#endif
 #if QJS_REGVM
     regvm_offset = function_size;
     function_size += fd->regvm_len;
@@ -68307,12 +69918,19 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->ic_count = fd->ic_count;
     b->ic_entries = JS_IC_ENTRIES;
 
+#if QJS_REGVM && !QJS_AOT
+    /* D9: no stack bytecode. byte_code_buf stays NULL and byte_code_len 0; the
+       register program below is the only code this function has. fd->byte_code
+       stays alive until the register block so a debug build can cross-check the
+       register scan against the stack scan, then is freed. */
+    b->byte_code_buf = NULL;
+    b->byte_code_len = 0;
+#else
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
     b->byte_code_len = fd->byte_code.size;
     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
     js_scan_argv_safe(b);
-    js_free(ctx, fd->byte_code.buf);
-    fd->byte_code.buf = NULL;
+#endif
 
 #if QJS_REGVM
     if (fd->regvm_compiled) {
@@ -68329,16 +69947,50 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         fd->regvm_fill_count = 0;
         b->regvm_compiled = 1;
         b->regvm_all_threaded = fd->regvm_all_threaded;
-#if QJS_AOT_PROFILE
         b->regvm_src_pc = fd->regvm_src_pc;
         fd->regvm_src_pc = NULL;
-#endif
         memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
         js_free(ctx, fd->regvm_code);
         fd->regvm_code = NULL;
         fd->regvm_len = 0;
+        {
+            bool rs_argv, rs_args;
+            regvm_scan_arg_flags(b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
+#if !defined(NDEBUG)
+            /* Bundle plan 4.4 + P6: cross-check against the stack scan. The
+               register scan may be STRICTER than the stack scan (it sees the
+               lowered code), never more permissive:
+                 - register argv_safe implies stack argv_safe;
+                 - args_captured must match exactly.
+               fd->byte_code is still alive here (freed below), so the stack
+               scan can run in every build. */
+            {
+                bool ss_argv, ss_args;
+                js_scan_arg_flags_raw(fd->byte_code.buf, fd->byte_code.size,
+                                      &ss_argv, &ss_args);
+                /*
+                 * P6: the register scan may be MORE permissive than the stack
+                 * one, because the lowering elides dead argument stores (a
+                 * parameter the stack code writes back to arg_buf but the
+                 * register code keeps in a register). So the sound direction is
+                 * the other one: if the stack program is safe, the register
+                 * program (which has at most the stack's argument writes) must
+                 * be safe too. The bug P6 fixed -- a register scan that misses
+                 * a put_arg -- is caught by the argv-clobber gate, not by this
+                 * cross-check.
+                 */
+                assert(!ss_argv || rs_argv);
+                assert(rs_args == ss_args);
+            }
+#endif
+            b->args_captured |= rs_args;
+            b->argv_safe = rs_argv;
+        }
     }
 #endif
+
+    js_free(ctx, fd->byte_code.buf);
+    fd->byte_code.buf = NULL;
 
     b->func_name = fd->func_name;
     if (fd->arg_count + fd->var_count > 0) {
@@ -68379,6 +70031,20 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (!b->pc2line_buf)
         b->pc2line_buf = fd->pc2line.buf;
     b->pc2line_len = fd->pc2line.size;
+#if QJS_REGVM && !QJS_AOT && !QJS_AOT_PROFILE
+    /*
+     * Bundle plan 4.1: a register-compiled function runs register code, so its
+     * pc2line table must be keyed by register exec offset, not stack pc. AOT
+     * builds keep the stack table (and src_pc) because their frames may still
+     * be stack frames.
+     */
+    if (b->regvm_compiled && b->regvm_src_pc)
+        regvm_build_pc2line(ctx, b, b->regvm_src_pc);
+#endif
+#if QJS_REGVM && !QJS_AOT_PROFILE
+    js_free(ctx, b->regvm_src_pc);
+    b->regvm_src_pc = NULL;
+#endif
     b->source = fd->source;
     b->source_len = fd->source_len;
 
@@ -70621,6 +72287,122 @@ static int regvm_writer_atom(void *opaque, uint32_t *patom)
     *patom = v;
     return 0;
 }
+
+/* Wire form of an atom operand: the same tagged-int / bundle-index split as
+   bc_put_atom, but appended to the caller's buffer. The register wire is
+   staged in a temporary DynBuf so its length can be written in front of it. */
+static int regvm_wire_put_atom(BCWriterState *s, DynBuf *d, JSAtom atom)
+{
+    uint32_t v;
+
+    if (__JS_AtomIsTaggedInt(atom)) {
+        v = (__JS_AtomToUInt32(atom) << 1) | 1;
+    } else {
+        if (bc_atom_to_idx(s, &v, atom))
+            return -1;
+        v <<= 1;
+    }
+    dbuf_put_leb128(d, v);
+    return 0;
+}
+
+/*
+ * exec -> wire (bundle plan 3.2 / D3). Register operands become ULEB128
+ * register indices (the narrow form's byte stays as it is), atoms become the
+ * tagged-int / bundle-index ULEB, branch offsets become SLEB128 relative to
+ * the instruction end, and the wide 32-bit operands become LEB128. The exec
+ * width of every operand is still regvm_fmt_size's, so the walk is the same as
+ * regvm_map_atoms2's. `wire_len` is written in front of the bytes.
+ */
+static int regvm_wire_encode(BCWriterState *s, const JSFunctionBytecode *b)
+{
+    const uint8_t *code = b->regvm_code;
+    int len = b->regvm_len;
+    DynBuf wire;
+    int p = 0, rc = -1;
+
+    dbuf_init(&wire);
+    while (p < len) {
+        int op = code[p];
+        const char *fmt;
+        int q, m, kind = -1, nar;
+
+        if (op <= 0 || op >= ROP_COUNT || !(fmt = regvm_rop_fmt[op]))
+            goto done;
+        nar = regvm_rop_narrow((uint16_t)op);
+        dbuf_putc(&wire, (uint8_t)op);
+        q = p + 1;
+        for (m = 0; fmt[m]; m++) {
+            int need;
+            uint32_t v;
+            int32_t sv;
+
+            switch (fmt[m]) {
+            case 'r': need = nar ? 1 : 2; break;
+            case 'i': case 'b': need = 1; break;
+            case 'u': case 's': need = 2; break;
+            case 'I': case 'c': case 'a': need = 4; break;
+            case 't': need = nar ? 1 : 4; break;
+            default: goto done;
+            }
+            if (q + need > len)
+                goto done;
+            if (need == 4)
+                v = (uint32_t)code[q] | ((uint32_t)code[q + 1] << 8) |
+                    ((uint32_t)code[q + 2] << 16) |
+                    ((uint32_t)code[q + 3] << 24);
+            else if (need == 2)
+                v = (uint32_t)(code[q] | (code[q + 1] << 8));
+            else
+                v = code[q];
+            sv = (need == 1) ? (int32_t)(int8_t)v : (int32_t)v;
+            if (fmt[m] == 'b')
+                kind = (int)v;
+
+            switch (fmt[m]) {
+            case 'r':
+                if (nar)
+                    dbuf_putc(&wire, (uint8_t)v); /* narrow: stored byte as is */
+                else
+                    dbuf_put_leb128(&wire, v / (uint32_t)sizeof(JSValue));
+                break;
+            case 'i': case 'b':
+                dbuf_putc(&wire, (uint8_t)v);
+                break;
+            case 'u': case 's':
+                dbuf_put_leb128(&wire, v);
+                break;
+            case 'c':
+                if ((op == ROP_load_const || op == ROP_binary_cpool) &&
+                    kind == REG_CONST_ATOM) {
+                    if (regvm_wire_put_atom(s, &wire, (JSAtom)v))
+                        goto done;
+                } else {
+                    dbuf_put_leb128(&wire, v);
+                }
+                break;
+            case 'a':
+                if (regvm_wire_put_atom(s, &wire, (JSAtom)v))
+                    goto done;
+                break;
+            case 'I':
+                dbuf_put_sleb128(&wire, (int32_t)v);
+                break;
+            case 't':
+                dbuf_put_sleb128(&wire, sv);
+                break;
+            }
+            q += need;
+        }
+        p = q;
+    }
+    bc_put_leb128(s, (uint32_t)wire.size);
+    dbuf_put(&s->dbuf, wire.buf, wire.size);
+    rc = 0;
+ done:
+    dbuf_free(&wire);
+    return rc;
+}
 #endif
 
 static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
@@ -70664,32 +72446,46 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_put_leb128(s, b->arg_count);
     bc_put_leb128(s, b->var_count);
     bc_put_leb128(s, b->defined_arg_count);
+#if QJS_REGVM && !QJS_AOT
+    /* D9: a register bundle carries no stack bytecode. The field stays in the
+       shared header parse, but it is always zero. */
+    bc_put_leb128(s, 0);            /* stack_size */
+#else
     bc_put_leb128(s, b->stack_size);
+#endif
     bc_put_leb128(s, b->var_ref_count);
     bc_put_leb128(s, b->closure_var_count);
     bc_put_leb128(s, b->cpool_count);
+#if QJS_REGVM && !QJS_AOT
+    bc_put_leb128(s, 0);            /* byte_code_len */
+#else
     bc_put_leb128(s, b->byte_code_len);
+#endif
     /* IC table size only; contents are runtime-only (doc/ic-design.md §1). The
        _ic opcodes are already in byte_code, so a nonzero count round-trips. */
+#if QJS_REGVM && !QJS_AOT
+    bc_put_leb128(s, 0);            /* ic_count */
+#else
     bc_put_leb128(s, b->ic_count);
+#endif
     /* local_count moved ahead of the deferred region: the reader needs it to
        size the function allocation, which it must do before it can decide to
        skip anything. */
     bc_put_leb128(s, b->vardefs ? b->arg_count + b->var_count : 0);
 
 #if QJS_REGVM
-    /* The register program. Its atoms go through the same table as the stack
-       bytecode's, because a register instruction names its property key,
-       global or private name by atom. A function the backend refused is
-       written as "not compiled" and fails closed on the other side; the
-       explicit flag is what keeps a refusal distinct from an empty program. */
+    /* The register program. A function the backend refused is written as "not
+       compiled" and fails closed on the other side; the explicit flag is what
+       keeps a refusal distinct from an empty program. */
     bc_put_u8(s, b->regvm_compiled ? 1 : 0);
     if (b->regvm_compiled) {
         bc_put_u8(s, REGVM_FORMAT_VERSION);
         bc_put_leb128(s, b->regvm_reg_count);
         bc_put_leb128(s, b->regvm_ctl_count);
         bc_put_leb128(s, b->regvm_pic_count);
-        bc_put_leb128(s, b->regvm_len);
+        bc_put_leb128(s, b->regvm_len); /* exec_len: the decoded length */
+#if QJS_AOT
+        /* AOT keeps the old layout: the exec code in the header. */
         rbuf = js_malloc(s->ctx, b->regvm_len);
         if (!rbuf)
             goto fail;
@@ -70700,6 +72496,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         dbuf_put(&s->dbuf, rbuf, b->regvm_len);
         js_free(s->ctx, rbuf);
         rbuf = NULL;
+#endif
+        /* Otherwise the program goes to the lazy region in wire form (D4). */
     }
 #endif
 
@@ -70758,19 +72556,30 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
             goto fail;
     }
 
+#if QJS_REGVM && !QJS_AOT
+    /* D4: the register program, in wire form, replaces the stack bytecode. */
+    if (b->regvm_compiled && regvm_wire_encode(s, b))
+        goto fail;
+#else
     if (JS_WriteFunctionBytecode(s, b))
         goto fail;
+#endif
 
     bc_put_leb128(s, b->objlit_count);
     assert(b->objlit_count == 0 || b->objlit_tab != NULL);
     for (i = 0; i < b->objlit_count; i++) {
         JSObjLitTemplate *tpl = &b->objlit_tab[i];
         uint16_t k;
+#if QJS_REGVM && !QJS_AOT
+        /* D4: the register program names its templates by order, so no stack
+           pc is written. */
+#else
         assert(tpl->pc < (uint32_t)b->byte_code_len);
         assert(i == 0 || tpl->pc > b->objlit_tab[i - 1].pc);
         assert(b->byte_code_buf[tpl->pc] == OP_object_template);
         assert(get_u16(b->byte_code_buf + tpl->pc + 1) == i);
         bc_put_leb128(s, tpl->pc);
+#endif
         bc_put_leb128(s, tpl->prop_count);
         for (k = 0; k < tpl->prop_count; k++)
             bc_put_atom(s, js_objlit_template_atom(tpl, k));
@@ -71300,6 +73109,13 @@ typedef struct BCReaderState {
     /* used for JS_DUMP_READ_OBJECT */
     const uint8_t *ptr_last;
     int level;
+#if QJS_REGVM
+    /* regvm_wire_decode scratch, reused across the functions of one read
+       instead of one js_malloc per function (bundle plan 3.3 step 1). */
+    uint8_t *wire_is_start;
+    int *wire_targets;
+    int wire_scratch_len;
+#endif
 } BCReaderState;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
@@ -71472,31 +73288,126 @@ static bool js_arg_ref_opcode(const uint8_t *bc, int pos, int op)
          bc[pos + 1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS);
 }
 
-static void js_scan_argv_safe(JSFunctionBytecode *b)
+/* Scan a stack-bytecode buffer and compute both flags the way the stack VM
+   does: `args_captured` for a var_ref onto a parameter slot, and `argv_safe`
+   for "a C caller's argv may be used in place". Both stop at the first
+   argv-unsafe opcode, exactly like js_scan_argv_safe always has. */
+static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
+                                  bool *argv_safe, bool *args_captured)
 {
-    const uint8_t *bc;
-    int pos = 0, len;
+    int pos = 0;
 
-    if (b == NULL)
-        return;
-    bc = b->byte_code_buf;
-    len = b->byte_code_len;
+    *argv_safe = false;
+    *args_captured = false;
     if (bc == NULL || len <= 0)
         return;
-
     while (pos < len) {
         int op = bc[pos];
         int sz = short_opcode_info(op).size;
         if (sz <= 0 || pos + sz > len)
             return;
         if (js_arg_ref_opcode(bc, pos, op))
-            b->args_captured = 1;
+            *args_captured = true;
         if (!js_argv_safe_opcode(bc, pos, op))
             return;
         pos += sz;
     }
-    b->argv_safe = 1;
+    *argv_safe = true;
 }
+
+static void js_scan_argv_safe(JSFunctionBytecode *b)
+{
+    bool argv_safe, args_captured;
+
+    if (b == NULL)
+        return;
+    js_scan_arg_flags_raw(b->byte_code_buf, b->byte_code_len,
+                          &argv_safe, &args_captured);
+    if (args_captured)
+        b->args_captured = 1;
+    if (argv_safe)
+        b->argv_safe = 1;
+}
+
+#if QJS_REGVM
+/* The register-code form of js_arg_ref_opcode: does the instruction create a
+   var_ref onto a parameter slot, or materialise the mapped `arguments` object?
+   Those make a register frame's argument window unsafe to BORROW
+   (`regvm_args_borrowable`). `ops` points at the first operand byte. */
+static bool regvm_arg_ref_op(int op, const uint8_t *ops)
+{
+    switch (op) {
+    case ROP_make_local_ref: /* "rraub": r r a u b, kind is the last byte */
+        return ops[2 + 2 + 4 + 2] == 1;
+    case ROP_special_object: /* "rb": r b */
+        return ops[2] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS;
+    default:
+        return false;
+    }
+}
+
+/* Does the opcode write an argument slot or reach the `arguments` object? The
+   register counterparts of the write/eval opcodes js_argv_safe_opcode rejects.
+   `put_arg` and `put_arg_xfer` are the handlers that store into arg_buf; the
+   rest reach the arguments object or run eval. */
+static bool regvm_op_writes_args(int op)
+{
+    switch (op) {
+    case ROP_put_arg:
+    case ROP_put_arg_xfer:
+    case ROP_eval:
+    case ROP_apply_eval:
+    case ROP_get_arg_el:
+    case ROP_apply_arguments:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The register-code form of js_argv_safe_opcode: may a C caller's argv be used
+   in place? False for an argument write, an argument var_ref, the mapped
+   arguments object, or eval -- the same set the stack scan rejects. `ops`
+   points at the first operand byte. */
+static bool regvm_argv_safe_op(int op, const uint8_t *ops)
+{
+    return !regvm_op_writes_args(op) && !regvm_arg_ref_op(op, ops);
+}
+
+/*
+ * Walk a register program and compute the two flags separately, the way
+ * js_scan_argv_safe does:
+ *   args_captured  a var_ref onto a parameter slot, or the mapped arguments
+ *                  object (the condition regvm_args_borrowable consults);
+ *   argv_safe      a C caller's argv may be used in place -- JS_CallInternal
+ *                  reads this in every build, so a parameter write must clear
+ *                  it too, not just a capture.
+ * `wide` is 1, as at every other encoded-code walk. A malformed program leaves
+ * both flags false. */
+static void regvm_scan_arg_flags(const uint8_t *code, int len,
+                                 bool *argv_safe, bool *args_captured)
+{
+    const uint8_t *p = code, *end = p + len;
+
+    *argv_safe = false;
+    *args_captured = false;
+    while (p < end) {
+        int op = *p, sz;
+        if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
+            return;
+        if (regvm_arg_ref_op(op, p + 1))
+            *args_captured = true;
+        if (!regvm_argv_safe_op(op, p + 1))
+            return;
+        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        if (sz < 0)
+            return;
+        p += 1 + sz;
+    }
+    if (p == end)
+        *argv_safe = true;
+}
+#endif
 
 /* Interns atom `idx` from its recorded position in the payload and memoises it
    in idx_to_atom. Reads through a scratch cursor so the caller's parse position
@@ -71510,9 +73421,12 @@ static int bc_intern_atom(BCReaderState *s, uint32_t idx)
     JSAtom atom;
     uint8_t type;
 
-    s->ptr = s->buf_start + s->atom_offset[idx];
-    if (s->lazy_src)
+    if (s->lazy_src) {
+        s->ptr = s->lazy_src->buf + s->atom_offset[idx];
         s->buf_end = s->lazy_src->buf + s->lazy_src->buf_len;
+    } else {
+        s->ptr = s->buf_start + s->atom_offset[idx];
+    }
     s->ptr_last = NULL;
 
     if (bc_get_u8(s, &type))
@@ -71587,6 +73501,393 @@ static int bc_get_atom(BCReaderState *s, JSAtom *patom)
         return bc_idx_to_atom(s, patom, v >> 1);
     }
 }
+
+#if QJS_REGVM
+/* ULEB128 from a wire buffer, bounded by `end`. A value longer than 32 bits is
+   an error, and so is running off the end. */
+static inline __attribute__((always_inline)) int
+regvm_wire_get_leb(const uint8_t **pp, const uint8_t *end, uint32_t *pv)
+{
+    const uint8_t *p = *pp;
+    uint32_t v;
+    int shift, n;
+    uint8_t b;
+
+    if (likely(p < end)) {
+        b = *p;
+        if (likely(b < 0x80)) {         /* the common single-byte case */
+            *pp = p + 1;
+            *pv = b;
+            return 0;
+        }
+    }
+    v = 0;
+    shift = 0;
+    n = 0;
+    while (p < end) {
+        b = *p++;
+        if (n == 4 && (b & 0xf0))
+            return -1;
+        v |= (uint32_t)(b & 0x7f) << shift;
+        if (!(b & 0x80)) {
+            *pp = p;
+            *pv = v;
+            return 0;
+        }
+        shift += 7;
+        if (++n >= 5)
+            return -1;
+    }
+    return -1;
+}
+
+/* The signed operands use the engine's existing "sleb128" pair, which is a
+   zigzag ULEB (see dbuf_put_sleb128 / get_sleb128), not a two's-complement
+   SLEB128. Decode it the same way. */
+static inline __attribute__((always_inline)) int
+regvm_wire_get_sleb(const uint8_t **pp, const uint8_t *end, int32_t *pv)
+{
+    uint32_t v;
+    if (regvm_wire_get_leb(pp, end, &v))
+        return -1;
+    *pv = (int32_t)((v >> 1) ^ -(int32_t)(v & 1));
+    return 0;
+}
+
+/*
+ * wire -> exec (bundle plan 3.3 / D1, D8). One pass: decode into b->regvm_code
+ * (exec_len bytes, already allocated), interning atoms, checking every operand
+ * range, marking instruction starts, and collecting branch targets. It also
+ * computes args_captured / argv_safe (D7). On failure it throws SyntaxError,
+ * releases every atom it interned, and returns -1.
+ *
+ * Instructions are validated before any of their bytes are written, so the
+ * completed prefix is always instruction-aligned and can be unwound by
+ * regvm_unmap_atoms.
+ */
+static __attribute__((noinline)) int
+regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+                             const uint8_t *wire, uint32_t wire_len)
+{
+    JSContext *ctx = s->ctx;
+    uint8_t *code = b->regvm_code;
+    int exec_len = b->regvm_len;
+    const uint8_t *w = wire, *w_end = wire + wire_len;
+    uint8_t *is_start = NULL;
+    int *targets = NULL;
+    int exec = 0, n_targets = 0, n_atoms = 0, rc = -1, i;
+    bool argv_safe = true, args_captured = false;
+    uint32_t atom_count = ctx->rt->atom_size;
+#if QJS_REGVM_THREAD
+    bool all_threaded = true;
+#endif
+
+    if (exec_len <= 0 || wire_len == 0 || b->regvm_reg_count <= 0)
+        return -1;
+    if (s->wire_scratch_len < exec_len) {
+        int ncap = exec_len + (exec_len >> 1) + 64;
+        uint8_t *ni = js_malloc(ctx, ncap);
+        int *nt = js_malloc(ctx, (size_t)ncap * sizeof(int));
+        if (!ni || !nt) {
+            js_free(ctx, ni);
+            js_free(ctx, nt);
+            return -1;
+        }
+        js_free(ctx, s->wire_is_start);
+        js_free(ctx, s->wire_targets);
+        s->wire_is_start = ni;
+        s->wire_targets = nt;
+        s->wire_scratch_len = ncap;
+    }
+    is_start = s->wire_is_start;
+    targets = s->wire_targets;
+    memset(is_start, 0, exec_len);
+
+    while (w < w_end) {
+        int op, m, kind = -1, nar, q;
+        const char *fmt;
+        int32_t ops[8];
+        JSAtom ins_atoms[8];
+        int n_ins_atoms = 0;
+
+        op = *w++;
+        if (op <= 0 || op >= ROP_COUNT || !(fmt = regvm_rop_fmt[op])) {
+            JS_ThrowSyntaxError(ctx, "invalid register opcode %d", op);
+            goto fail;
+        }
+        nar = regvm_rop_narrow((uint16_t)op);
+        q = exec + 1;
+        if (q > exec_len) {
+            JS_ThrowSyntaxError(ctx, "register program too long");
+            goto fail_ins;
+        }
+        for (m = 0; fmt[m]; m++) {
+            int need, is_atom = 0;
+            uint32_t v;
+            int32_t sv;
+
+            switch (fmt[m]) {
+            case 'r': need = nar ? 1 : 2; break;
+            case 'i': case 'b': need = 1; break;
+            case 'u': case 's': need = 2; break;
+            case 'I': case 'c': case 'a': need = 4; break;
+            case 't': need = nar ? 1 : 4; break;
+            default: need = -1; break;
+            }
+            if (need < 0 || m >= 8 || q + need > exec_len) {
+                JS_ThrowSyntaxError(ctx, "malformed register instruction");
+                goto fail_ins;
+            }
+
+            if (fmt[m] == 'r') {
+                if (nar) {
+                    /* The narrow form stores the byte offset as it is (D3), so
+                       it is a raw byte, not a LEB. */
+                    if (w >= w_end) {
+                        JS_ThrowSyntaxError(ctx, "truncated register program");
+                        goto fail_ins;
+                    }
+                    v = *w++;
+                    if (v >= (uint32_t)(REGVM_NARROW_REG_MAX * sizeof(JSValue))) {
+                        JS_ThrowSyntaxError(ctx, "register %u out of range",
+                                            (unsigned)v);
+                        goto fail_ins;
+                    }
+                    sv = (int32_t)v;
+                } else {
+                    if (regvm_wire_get_leb(&w, w_end, &v))
+                        goto fail_leb;
+                    if (v >= (uint32_t)b->regvm_reg_count) {
+                        JS_ThrowSyntaxError(ctx, "register %u out of range (%d)",
+                                            (unsigned)v, b->regvm_reg_count);
+                        goto fail_ins;
+                    }
+                    sv = (int32_t)(v * sizeof(JSValue));
+                }
+            } else if (fmt[m] == 'a' ||
+                       ((op == ROP_load_const || op == ROP_binary_cpool) &&
+                        fmt[m] == 'c' && kind == REG_CONST_ATOM)) {
+                JSAtom atom;
+                if (regvm_wire_get_leb(&w, w_end, &v))
+                    goto fail_leb;
+                if (v & 1) {
+                    atom = __JS_AtomFromUInt32(v >> 1);
+                } else {
+                    if (bc_idx_to_atom(s, &atom, v >> 1))
+                        goto fail_ins;
+                    ins_atoms[n_ins_atoms++] = atom;
+                }
+                sv = (int32_t)atom;
+                is_atom = 1;
+            } else if (fmt[m] == 'i' || fmt[m] == 'b') {
+                if (w >= w_end) {
+                    JS_ThrowSyntaxError(ctx, "truncated register program");
+                    goto fail_ins;
+                }
+                v = *w++;
+                sv = (int32_t)v;
+                if (fmt[m] == 'b')
+                    kind = (int)v;
+            } else if (fmt[m] == 'u' || fmt[m] == 's') {
+                if (regvm_wire_get_leb(&w, w_end, &v) || v > 0xffff)
+                    goto fail_leb;
+                sv = (int32_t)v;
+            } else if (fmt[m] == 'I') {
+                if (regvm_wire_get_sleb(&w, w_end, &sv))
+                    goto fail_leb;
+            } else if (fmt[m] == 't') {
+                if (regvm_wire_get_sleb(&w, w_end, &sv))
+                    goto fail_leb;
+                if (nar && (sv < -128 || sv > 127)) {
+                    JS_ThrowSyntaxError(ctx, "register branch out of range");
+                    goto fail_ins;
+                }
+                targets[n_targets++] = q + need + sv;
+            } else { /* 'c', non-atom */
+                if (regvm_wire_get_leb(&w, w_end, &v))
+                    goto fail_leb;
+                sv = (int32_t)v;
+            }
+
+            if (!is_atom) {
+                if (fmt[m] == 'r') {
+                    if (sv < 0 || sv >= b->regvm_reg_count * (int)sizeof(JSValue) ||
+                        (sv & (int)(sizeof(JSValue) - 1)) != 0) {
+                        JS_ThrowSyntaxError(ctx, "register %d out of range (%d)",
+                                            sv, b->regvm_reg_count);
+                        goto fail_ins;
+                    }
+                } else if (fmt[m] == 'c') {
+                    if ((uint32_t)sv >= (uint32_t)b->cpool_count) {
+                        JS_ThrowSyntaxError(ctx, "register constant out of range");
+                        goto fail_ins;
+                    }
+                } else if (fmt[m] == 's') {
+                    if (sv < 0 || (uint32_t)sv >= b->regvm_pic_count) {
+                        JS_ThrowSyntaxError(ctx, "register PIC site out of range");
+                        goto fail_ins;
+                    }
+                }
+            }
+            ops[m] = sv;
+            q += need;
+        }
+
+        if ((op == ROP_binary_loc_reg || op == ROP_binary_loc_loc) &&
+            (uint32_t)ops[2] >= (uint32_t)b->var_count) {
+            JS_ThrowSyntaxError(ctx, "register local slot out of range");
+            goto fail_ins;
+        }
+        if ((op == ROP_binary_reg_loc || op == ROP_binary_loc_loc) &&
+            (uint32_t)ops[3] >= (uint32_t)b->var_count) {
+            JS_ThrowSyntaxError(ctx, "register local slot out of range");
+            goto fail_ins;
+        }
+        if (op == ROP_load_const &&
+            ops[1] != REG_CONST_CPOOL && ops[1] != REG_CONST_ATOM) {
+            JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
+            goto fail_ins;
+        }
+        {
+            /* Slot operands index the frame's local, argument or closure-ref
+               arrays, and the runtime dereferences the result without any
+               further check (a bad var_ref slot is a wild pointer; a bad vardef
+               index makes get_var_ref build one from garbage). Bound every one
+               here, where the counts are known. A var_ref slot may name either a
+               captured local (var_ref_count) or a closure variable
+               (closure_var_count), so its bound is the larger of the two. */
+            uint32_t vr_bound = b->var_ref_count > b->closure_var_count
+                                    ? b->var_ref_count : b->closure_var_count;
+            int slot = -1;
+            uint32_t bound = 0;
+            switch (op) {
+            case ROP_get_local:
+                slot = ops[1]; bound = b->var_count; break;
+            case ROP_put_local:
+            case ROP_local_check:
+            case ROP_local_check_init:
+            case ROP_local_uninit:
+            case ROP_close_local:
+                slot = ops[0]; bound = b->var_count; break;
+            case ROP_get_local_s0: case ROP_get_local_s1:
+            case ROP_get_local_s2: case ROP_get_local_s3:
+                slot = op - ROP_get_local_s0; bound = b->var_count; break;
+            case ROP_put_local_s0: case ROP_put_local_s1:
+            case ROP_put_local_s2: case ROP_put_local_s3:
+                slot = op - ROP_put_local_s0; bound = b->var_count; break;
+            case ROP_get_arg:
+                slot = ops[1]; bound = b->arg_count; break;
+            case ROP_put_arg:
+            case ROP_put_arg_xfer:
+                slot = ops[0]; bound = b->arg_count; break;
+            case ROP_get_arg_el:
+                /* `u` names the `arguments` object's var_buf slot, not an
+                   argument index (see regvm_t_get_arg_el_slow). */
+                slot = ops[1]; bound = b->var_count; break;
+            case ROP_get_var_ref:
+                slot = ops[1]; bound = vr_bound; break;
+            case ROP_put_var_ref:
+            case ROP_var_ref_check:
+            case ROP_var_ref_check_init:
+                slot = ops[0]; bound = vr_bound; break;
+            case ROP_make_local_ref:
+                slot = ops[3];
+                bound = ops[4] == 0 ? b->var_count
+                      : ops[4] == 1 ? b->arg_count : vr_bound;
+                break;
+            default:
+                break;
+            }
+            if (slot >= 0 && (uint32_t)slot >= bound) {
+                JS_ThrowSyntaxError(ctx, "register slot out of range");
+                goto fail_ins;
+            }
+        }
+        if (regvm_op_writes_args(op))
+            argv_safe = false;
+        if (op == ROP_make_local_ref && ops[4] == 1) {
+            args_captured = true;
+            argv_safe = false;
+        }
+        if (op == ROP_special_object && ops[1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS) {
+            args_captured = true;
+            argv_safe = false;
+        }
+#if QJS_REGVM_THREAD
+        /* D13: the interpreter-eligibility flag is a property of the build, not
+           the bytecode, so it is recomputed here rather than serialized. Doing
+           it in the decode saves a second walk over the code. */
+        if (!regvm_is_threaded[op])
+            all_threaded = false;
+#endif
+
+        /* Everything checks out: write the instruction. */
+        code[exec] = (uint8_t)op;
+        is_start[exec] = 1;
+        q = exec + 1;
+        for (m = 0; fmt[m]; m++) {
+            int need;
+            int32_t sv = ops[m];
+            switch (fmt[m]) {
+            case 'r': need = nar ? 1 : 2; break;
+            case 'i': case 'b': need = 1; break;
+            case 'u': case 's': need = 2; break;
+            case 'I': case 'c': case 'a': need = 4; break;
+            case 't': need = nar ? 1 : 4; break;
+            default: need = 1; break;
+            }
+            if (need == 4) {
+                code[q] = (uint8_t)sv;
+                code[q + 1] = (uint8_t)(sv >> 8);
+                code[q + 2] = (uint8_t)(sv >> 16);
+                code[q + 3] = (uint8_t)(sv >> 24);
+            } else if (need == 2) {
+                code[q] = (uint8_t)sv;
+                code[q + 1] = (uint8_t)(sv >> 8);
+            } else {
+                code[q] = (uint8_t)sv;
+            }
+            q += need;
+        }
+        n_atoms += n_ins_atoms;
+        exec = q;
+        continue;
+
+    fail_leb:
+        JS_ThrowSyntaxError(ctx, "truncated register program");
+    fail_ins:
+        for (i = 0; i < n_ins_atoms; i++)
+            JS_FreeAtom(ctx, ins_atoms[i]);
+        goto fail;
+    }
+
+    if (exec != exec_len) {
+        JS_ThrowSyntaxError(ctx, "register program length mismatch");
+        goto fail;
+    }
+    for (i = 0; i < n_targets; i++) {
+        int t = targets[i];
+        if (t < 0 || t >= exec_len || !is_start[t]) {
+            JS_ThrowSyntaxError(ctx, "register branch to non-instruction (%d)", t);
+            goto fail;
+        }
+    }
+    b->args_captured = args_captured ? 1 : 0;
+    b->argv_safe = argv_safe ? 1 : 0;
+#if QJS_REGVM_THREAD
+    b->regvm_all_threaded = all_threaded;
+#endif
+    rc = 0;
+
+ fail:
+    if (rc != 0) {
+        /* release the completed prefix's atoms; the current instruction's were
+           already released above */
+        regvm_unmap_atoms(code, exec, 1, n_atoms, ctx->rt);
+    }
+    return rc;
+}
+#endif
 
 static JSString *JS_ReadString(BCReaderState *s)
 {
@@ -71895,7 +74196,9 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
     const uint8_t *code = b->regvm_code;
     int len = b->regvm_len;
     int wide = 1;                       /* register operands are two bytes */
-    uint32_t atom_count = ctx->rt->atom_count;
+    /* atom indices range over the whole table, free slots included, so the
+       bound is its size, not the number of live atoms */
+    uint32_t atom_count = ctx->rt->atom_size;
     uint8_t *is_start = NULL;
     int *targets = NULL;
     int p, i, n_targets = 0, rc = -1;
@@ -72075,6 +74378,15 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
                     b->args_captured = 1;
                 if (bc_get_leb128_u16(s, &vd->var_ref_idx))
                     return -1;
+#if QJS_REGVM
+                /* get_var_ref indexes sf->var_refs[vd->var_ref_idx] with no
+                   bound of its own; a corrupted index would build a var_ref
+                   from garbage. */
+                if (vd->var_ref_idx >= b->var_ref_count) {
+                    JS_ThrowSyntaxError(ctx, "invalid var_ref index");
+                    return -1;
+                }
+#endif
             }
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
             if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
@@ -72105,10 +74417,30 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
     }
     {
         bc_read_trace(s, "bytecode {\n");
+#if QJS_REGVM && !QJS_AOT
+        /* D4: the stack bytecode is gone. The register program is decoded from
+           the wire here; the decoder interns atoms, validates, and sets
+           args_captured/argv_safe. */
+        if (b->regvm_compiled) {
+            uint32_t wire_len;
+            if (bc_get_leb128(s, &wire_len))
+                return -1;
+            if (wire_len == 0 ||
+                (size_t)wire_len > (size_t)(s->buf_end - s->ptr)) {
+                JS_ThrowSyntaxError(ctx, "invalid register wire length");
+                return -1;
+            }
+            if (regvm_wire_decode(s, b, s->ptr, wire_len))
+                return -1;
+            s->ptr += wire_len;
+            b->regvm_owns_atoms = 1;
+        }
+#else
         if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
             return -1;
         if (js_validate_ic_bytecode(ctx, b))
             return -1;
+#endif
         bc_read_trace(s, "}\n");
     }
     {
@@ -72116,6 +74448,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
         uint32_t *template_pcs = NULL;
         if (bc_get_leb128(s, &template_count) || template_count > UINT16_MAX)
             return -1;
+#if !QJS_REGVM || QJS_AOT
         if (template_count != 0) {
             template_pcs = js_malloc(s->ctx,
                                      sizeof(*template_pcs) * template_count);
@@ -72158,6 +74491,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
                 goto objlit_fail;
             }
         }
+#endif
         if (template_count != 0) {
             b->objlit_tab = js_mallocz(s->ctx,
                                        sizeof(*b->objlit_tab) * template_count);
@@ -72166,10 +74500,19 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
             b->objlit_count = (uint16_t)template_count;
         }
         for (i = 0; i < (int)template_count; i++) {
+#if QJS_REGVM && !QJS_AOT
+            /* D4: the register program names its templates by order, so no
+               stack pc is written and there is no stack code to cross-check. */
+            pc = 0;
+            if (bc_get_leb128(s, &prop_count) ||
+                prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS)
+                goto objlit_fail;
+#else
             if (bc_get_leb128(s, &pc) || bc_get_leb128(s, &prop_count) ||
                 prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS ||
                 pc != template_pcs[i])
                 goto objlit_fail;
+#endif
             b->objlit_tab[i].pc = pc;
             b->objlit_tab[i].atoms = js_malloc(s->ctx,
                                                sizeof(JSAtom) * prop_count);
@@ -72367,10 +74710,26 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             if (reg_count <= 0 || ctl_count < 0 || regvm_len <= 0 ||
                 reg_count > REGVM_WIDE_REG_MAX + 1 || ctl_count > UINT16_MAX ||
                 pic_count < 0 || pic_count > UINT16_MAX ||
-                (size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
+                regvm_len > INT32_MAX / 2) {
                 JS_ThrowSyntaxError(ctx, "invalid register program header");
                 goto fail;
             }
+#if QJS_AOT
+            /* The old layout keeps the exec code in the header, so it must fit
+               in the remaining input. */
+            if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
+                JS_ThrowSyntaxError(ctx, "invalid register program header");
+                goto fail;
+            }
+#else
+            /* D4: the exec code is decoded from the wire in the lazy region.
+               The wire is never smaller than 1/16 of the decoded length, so
+               this is the allocation bound. */
+            if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr) * 16) {
+                JS_ThrowSyntaxError(ctx, "invalid register program header");
+                goto fail;
+            }
+#endif
             bc.regvm_compiled = 1;
             bc.regvm_reg_count = reg_count;
             bc.regvm_ctl_count = ctl_count;
@@ -72413,10 +74772,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     }
 #if QJS_REGVM
     if (b->regvm_compiled) {
-        int wide = 1;                   /* register operands are two bytes */
-        int acquired = 0;
         b->regvm_code = (void *)((uint8_t*)b + layout.byte_code_offset +
                                  b->byte_code_len);
+#if QJS_AOT
+        {
+        int wide = 1;                   /* register operands are two bytes */
+        int acquired = 0;
         if (bc_get_buf(s, b->regvm_code, b->regvm_len)) {
             b->regvm_code = NULL;
             b->regvm_compiled = 0;
@@ -72456,6 +74817,31 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             b->regvm_owns_atoms = 0;
             goto fail_unregistered;
         }
+        /*
+         * Bundle plan D7 + P6: `argv_safe` and `args_captured` are never
+         * serialized. Recompute both from the register program. `argv_safe`
+         * must clear on a parameter write as well as a capture, because
+         * JS_CallInternal reads it in every build to decide whether a C
+         * caller's argv can be used in place.
+         */
+        {
+            bool rs_argv, rs_args;
+            regvm_scan_arg_flags(b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
+#if !defined(NDEBUG)
+            /* 4.4 + P6: the stack scan JS_ReadFunctionBytecode ran must agree;
+               the register scan may be stricter, never more permissive. */
+            assert(!rs_argv || b->argv_safe);
+            assert(rs_args == (b->args_captured != 0));
+#endif
+            b->args_captured |= rs_args;
+            b->argv_safe = rs_argv;
+        }
+        }
+#else
+        /* D4: the exec code is decoded from the wire by JS_ReadFunctionBody,
+           which also interns atoms, validates the program, and sets
+           args_captured/argv_safe. Nothing is read from the header here. */
+#endif
     }
 #endif
 
@@ -72499,6 +74885,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                 goto fail;
             idx = 0;
             cv->closure_type = bc_get_flags(flags, &idx, 3);
+#if QJS_REGVM
+            /* js_closure2 aborts on an unknown closure type, so a corrupted
+               bundle must be rejected here instead of crashing later. */
+            if (cv->closure_type > JS_CLOSURE_GLOBAL_REF) {
+                JS_ThrowSyntaxError(ctx, "invalid closure type %d",
+                                    cv->closure_type);
+                goto fail;
+            }
+#endif
             cv->is_const = bc_get_flags(flags, &idx, 1);
             cv->is_lexical = bc_get_flags(flags, &idx, 1);
             cv->var_kind = bc_get_flags(flags, &idx, 4);
@@ -72543,6 +74938,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
     b->realm = JS_DupContext(ctx);
 #if QJS_REGVM_RECORD
+    /* D13: `regvm_all_threaded` is a property of the interpreter build, not of
+       the bytecode, so it is never serialized. Under the new wire format
+       regvm_wire_decode computes it in its single pass; only the old AOT layout
+       needs the extra walk here. */
+#if QJS_AOT
+    if (b->regvm_compiled && b->regvm_code)
+        b->regvm_all_threaded =
+            regvm_code_all_threaded(b->regvm_code, b->regvm_len);
+#endif
     regvm_set_call_desc(b);
 #endif
 #if QJS_AOT
@@ -73285,6 +75689,10 @@ static void bc_reader_free(BCReaderState *s)
     }
     js_free(s->ctx, s->atom_offset);
     js_free(s->ctx, s->objects);
+#if QJS_REGVM
+    js_free(s->ctx, s->wire_is_start);
+    js_free(s->ctx, s->wire_targets);
+#endif
 }
 
 /* Deserializes a function body that was skipped at read time.
@@ -73361,6 +75769,13 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
 
     if (ret == 0) {
 #if QJS_REGVM_RECORD
+        /* D13: under the new wire format regvm_wire_decode already set the flag
+           in its single pass; only the old AOT layout walks the code again. */
+#if QJS_AOT
+        if (b->regvm_compiled && b->regvm_code)
+            b->regvm_all_threaded =
+                regvm_code_all_threaded(b->regvm_code, b->regvm_len);
+#endif
         regvm_set_call_desc(b);
 #endif
 #if QJS_AOT

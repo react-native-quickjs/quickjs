@@ -1,0 +1,453 @@
+Subject: register VM: tail calls on the record path
+
+What this does:
+  tail_call/tail_call_method used to do a nested JS_CallInternal in their
+  threaded handlers. They now classify the callee: for a record-eligible
+  bytecode function whose caller is itself a nested record, the current frame
+  is released and the callee is entered as a sibling record that returns
+  straight to the current frame's caller, so a tail-recursive loop grows
+  neither the C stack nor the frame arena. Everything the callee needs from
+  the old frame (the argument values, the receiver for the method form, and
+  the callee object) is duplicated before the release. Natives, bound/proxy
+  callees, generator frames, and tail calls from the activation entry record
+  fall back to the original nested call.
+
+Why we need it:
+  richards executes 7.9M tail_call_method, deltablue 7.06M, typescript 2.1M
+  (per-row ##ROP## histograms). Each was a full nested call that could not be
+  returned through; frame reuse makes the tail-call rows cheaper and removes
+  their C-stack growth.
+
+Needs a bytecode version bump:
+  No. Runtime only.
+
+Notes:
+  The tail-chain cap (REGVM_TAIL_CHAIN_MAX, 1<<20) bounds consecutive frame
+  reuse so runaway tail recursion still raises RangeError like the stack VM
+  (the differential corpus's stack-overflow kernel). The counter lives on
+  JSRuntime, not in the frame: growing sizeof(JSRegRun) by 8 bytes was
+  measured to cost ~8% cycles on navierstokes. regvm_record_fill keeps its
+  original signature and body; the tail variant is a separate function because
+  a `tail` parameter perturbed the inlined normal-call codegen
+  (regvm_t_call_record 428 -> 441 instructions, regexp +2.1% cycles).
+  Box2d checksum 546.1008391043414, test262 50/81192 threaded+record,
+  differential corpus 400/0/0. Octane geomean cycles 0.9839 of the R1 build
+  with no row worse than +0.34% (richards 0.9497, deltablue 0.9624,
+  earleyboyer 0.9549).
+
+diff --git a/quickjs.c b/quickjs.c
+index a9ce3f6..8e4ee63 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -703,6 +703,14 @@ struct JSRuntime {
+        with a C string literal, interned once per runtime.  JS_ATOM_NULL until
+        first use; rt is calloc'd. */
+     JSAtom re_flag_atom[6];
++    /* R2: consecutive frame-reusing tail calls in the active chain. A normal
++       record call resets it, each tail call increments it. It is what keeps a
++       runaway `return f()` from looping forever: the reused frame never
++       reaches the arena limit, so without a cap the engine would hang where
++       the nested path raises RangeError. Runtime-scoped rather than per-frame
++       because growing JSRegRun measurably perturbs frame layout, and appended
++       last so it does not shift the offsets of any hot runtime field. */
++    uint32_t regvm_tail_chain;
+ };
+ 
+ #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
+@@ -25233,6 +25241,12 @@ static uint8_t *REGVM_CC regvm_t_local_rmw_branch(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_local_rmw_branch_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_tail_call_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_tail_call_method_slow(REGVM_ARGS);
++#if QJS_REGVM_RECORD
++static uint8_t *REGVM_CC regvm_t_tail_call_record(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_tail_call_method_record(REGVM_ARGS);
++#endif
+ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
+@@ -25295,6 +25309,14 @@ static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
+                               int ret_dst, uint8_t *ret_ip,
+                               JSValueConst this_obj, const JSValue *oargv,
+                               int na, int slots);
++#if QJS_REGVM_RECORD
++static void regvm_record_fill_tail(JSRuntime *rt, const JSRegRecordLayout *lay,
++                                   JSValueConst cf, JSObject *co,
++                                   JSFunctionBytecode *cb, JSRegRun *caller,
++                                   int ret_dst, uint8_t *ret_ip,
++                                   JSValueConst this_obj, const JSValue *oargv,
++                                   int na, int slots);
++#endif
+ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
+@@ -25858,6 +25880,9 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
+  */
+ static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS)
+ {
++    /* Leaving a frame ends the current tail-call chain (a chain of tail calls
++       never returns until it is done), so the cap's counter starts fresh. */
++    ctx->rt->regvm_tail_chain = 0;
+     if (likely(f->caller == NULL))
+         return NULL;
+ #if !QJS_REGVM_RECORD
+@@ -27921,14 +27946,71 @@ static uint8_t *REGVM_CC regvm_t_local_rmw_branch(REGVM_ARGS)
+  * does, so the handler ends in the same exit. A generator frame is handed back
+  * to the monolith, whose suspension needs the interpreter's own state (see the
+  * note on `regvm_t_return`).
++ *
++ * When the callee is one the record path can run, the call is entered as a
++ * *sibling* record: this frame is released first and the callee names this
++ * frame's caller, so the value lands in the caller's register and a
++ * tail-recursive loop grows neither the C stack nor the arena. Everything the
++ * callee reads out of this frame -- the argument values, the receiver of a
++ * method call, and the callee object itself -- is copied (owned) before the
++ * release, because after it the old frame's registers are gone. Every other
++ * callee keeps the nested call in `regvm_t_tail_call_slow`.
+  */
+ static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS)
+ {
+-    int c, ab, na;
+-    JSValue ret_val;
++    if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
++        return ip;
++#if QJS_REGVM_RECORD
++    {
++        int c = T_REG(1);
++        JSValue cf = FR(c);
++
++        if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
++            JSObject *co = JS_VALUE_GET_OBJ(cf);
++            if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
++                JSFunctionBytecode *cb = co->u.func.function_bytecode;
++                /* A tail call can only replace a nested record. The entry
++                   record belongs to the monolith's `run`, which releases the
++                   frame at `done:`, so no callee may take its place. */
++                if (likely(regvm_record_eligible(cb) && f->caller != NULL))
++                    __attribute__((musttail))
++                        return regvm_t_tail_call_record(REGVM_PASS);
++            }
++        }
++    }
++#endif
++    __attribute__((musttail)) return regvm_t_tail_call_slow(REGVM_PASS);
++}
+ 
++static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
++{
+     if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
+         return ip;
++#if QJS_REGVM_RECORD
++    {
++        int c = T_REG(1);
++        JSValue cf = FR(c);
++
++        if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
++            JSObject *co = JS_VALUE_GET_OBJ(cf);
++            if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
++                JSFunctionBytecode *cb = co->u.func.function_bytecode;
++                if (likely(regvm_record_eligible(cb) && f->caller != NULL))
++                    __attribute__((musttail))
++                        return regvm_t_tail_call_method_record(REGVM_PASS);
++            }
++        }
++    }
++#endif
++    __attribute__((musttail))
++        return regvm_t_tail_call_method_slow(REGVM_PASS);
++}
++
++static uint8_t *REGVM_CC regvm_t_tail_call_slow(REGVM_ARGS)
++{
++    int c, ab, na;
++    JSValue ret_val;
++
+     c = T_REG(1);
+     ab = T_REG(3);
+     na = T_U8(5);
+@@ -27945,13 +28027,11 @@ static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS)
+     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
+ }
+ 
+-static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
++static uint8_t *REGVM_CC regvm_t_tail_call_method_slow(REGVM_ARGS)
+ {
+     int c, r, ab, na;
+     JSValue ret_val;
+ 
+-    if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
+-        return ip;
+     c = T_REG(1);
+     r = T_REG(3);
+     ab = T_REG(5);
+@@ -27969,6 +28049,158 @@ static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
+     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
+ }
+ 
++#if QJS_REGVM_RECORD
++/*
++ * The largest argument list a tail call copies through the C stack. The
++ * syntactic form (`return f(...)`) rarely passes more than a handful; a larger
++ * call keeps the nested path rather than growing this handler's frame.
++ */
++#define REGVM_TAIL_ARGS_MAX 64
++
++/*
++ * A cap on consecutive frame-reusing tail calls. Frame reuse is what makes a
++ * tail call constant-space, but it also means a runaway `return f()` never
++ * reaches the arena limit and would hang where the nested path raises
++ * RangeError. The cap keeps that observable behaviour while still letting
++ * realistic recursion go far deeper than the nested path could: it is far
++ * above the depth at which the nested path overflows, so a program that works
++ * today is unaffected.
++ */
++#define REGVM_TAIL_CHAIN_MAX (1u << 20)
++
++/*
++ * The record-taking halves of the tail calls. The current frame is released
++ * before the callee's record is allocated, so the arena slot is reused and the
++ * chain does not grow. Everything that must outlive the release -- the argument
++ * copies, the receiver, and the callee object -- is duplicated first, and the
++ * extra slots are placed past the argument area so the record's release walk
++ * frees them (they sit between `arg_buf` and `var_buf`, which the walk covers
++ * contiguously).
++ */
++static __attribute__((noinline)) uint8_t *REGVM_CC
++regvm_t_tail_call_record(REGVM_ARGS)
++{
++    int c = T_REG(1), ab = T_REG(3), na = T_U8(5);
++    JSValue cf = FR(c);
++    JSObject *co = JS_VALUE_GET_OBJ(cf);
++    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    JSRegRun *old = f;
++    JSRegRun *ocaller = old->caller;
++    int odst = old->ret_dst;
++    uint8_t *oip = old->ret_ip;
++    uint32_t ochain = ctx->rt->regvm_tail_chain;
++    JSValue args[REGVM_TAIL_ARGS_MAX];
++    JSValue cfd;
++    JSRegRecordLayout lay;
++    int slots, k;
++
++    if (unlikely(js_poll_interrupts(ctx)))
++        T_FAIL();
++    slots = na > cb->arg_count ? na : cb->arg_count;
++    if (unlikely(na > REGVM_TAIL_ARGS_MAX || slots > REGVM_TAIL_ARGS_MAX))
++        __attribute__((musttail)) return regvm_t_tail_call_slow(REGVM_PASS);
++    if (unlikely(ochain >= REGVM_TAIL_CHAIN_MAX)) {
++        JS_ThrowStackOverflow(ctx);
++        T_FAIL();
++    }
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        T_FAIL();
++    }
++#ifdef QJS_REGVM_COUNT
++    js_regvm_argmoves += (uint64_t)na;
++#endif
++    for (k = 0; k < na; k++)
++        args[k] = js_dup(FRP(ab)[k]);
++    cfd = js_dup(cf);
++    regvm_record_release(ctx->rt, old);
++    ctx->rt->current_stack_frame = ocaller->sf;
++    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 1, &lay) != 0)) {
++        for (k = 0; k < na; k++)
++            JS_FreeValue(ctx, args[k]);
++        JS_FreeValue(ctx, cfd);
++        f = ocaller;
++        JS_ThrowStackOverflow(ctx);
++        T_FAIL();
++    }
++    regvm_record_fill_tail(ctx->rt, &lay, cf, co, cb, ocaller, odst, oip,
++                           JS_UNDEFINED, args, na, slots);
++    lay.arg_buf[slots] = cfd;         /* owns the callee object */
++    lay.rec->argv = lay.arg_buf;      /* `arguments` reads the copies */
++    lay.rec->local_count += 1;
++    ctx->rt->regvm_tail_chain = ochain + 1;
++    f = lay.rec;
++    __attribute__((musttail))
++        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
++}
++
++static __attribute__((noinline)) uint8_t *REGVM_CC
++regvm_t_tail_call_method_record(REGVM_ARGS)
++{
++    int c = T_REG(1), r = T_REG(3), ab = T_REG(5), na = T_U8(7);
++    JSValue cf = FR(c);
++    JSValue tv = FR(r);
++    JSObject *co = JS_VALUE_GET_OBJ(cf);
++    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    JSRegRun *old = f;
++    JSRegRun *ocaller = old->caller;
++    int odst = old->ret_dst;
++    uint8_t *oip = old->ret_ip;
++    uint32_t ochain = ctx->rt->regvm_tail_chain;
++    JSValue args[REGVM_TAIL_ARGS_MAX];
++    JSValue cfd;
++    JSRegRecordLayout lay;
++    int slots, k;
++
++    if (unlikely(js_poll_interrupts(ctx)))
++        T_FAIL();
++    slots = na > cb->arg_count ? na : cb->arg_count;
++    if (unlikely(na > REGVM_TAIL_ARGS_MAX || slots > REGVM_TAIL_ARGS_MAX))
++        __attribute__((musttail))
++            return regvm_t_tail_call_method_slow(REGVM_PASS);
++    if (unlikely(ochain >= REGVM_TAIL_CHAIN_MAX)) {
++        JS_ThrowStackOverflow(ctx);
++        T_FAIL();
++    }
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        T_FAIL();
++    }
++#ifdef QJS_REGVM_COUNT
++    js_regvm_argmoves += (uint64_t)na;
++#endif
++    for (k = 0; k < na; k++)
++        args[k] = js_dup(FRP(ab)[k]);
++    tv = js_dup(tv);
++    cfd = js_dup(cf);
++    regvm_record_release(ctx->rt, old);
++    ctx->rt->current_stack_frame = ocaller->sf;
++    /* two slots past the arguments: the receiver, then the callee object */
++    if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
++        for (k = 0; k < na; k++)
++            JS_FreeValue(ctx, args[k]);
++        JS_FreeValue(ctx, tv);
++        JS_FreeValue(ctx, cfd);
++        f = ocaller;
++        JS_ThrowStackOverflow(ctx);
++        T_FAIL();
++    }
++    regvm_record_fill_tail(ctx->rt, &lay, cf, co, cb, ocaller, odst, oip,
++                           tv, args, na, slots);
++    lay.arg_buf[slots] = tv;          /* owns the receiver */
++    lay.arg_buf[slots + 1] = cfd;     /* owns the callee object */
++    lay.rec->this_obj = tv;
++    lay.rec->argv = lay.arg_buf;
++    lay.rec->local_count += 2;
++    ctx->rt->regvm_tail_chain = ochain + 1;
++    f = lay.rec;
++    __attribute__((musttail))
++        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
++}
++#endif /* QJS_REGVM_RECORD */
++
+ /*
+  * The T_SZ_* constants are a claim about the encoder's operand formats, so the
+  * claim is checked against regvm_fmt_size rather than trusted. The check cannot
+@@ -28713,6 +28945,110 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+ 
+     rt->current_stack_frame = sf;
+ }
++
++/*
++ * The tail-call variant of regvm_record_fill. It is a separate function rather
++ * than a `tail` flag on the original because adding a parameter measurably
++ * perturbed the codegen of the inlined normal-call path (it pushed the register
++ * allocator over a spill threshold). The differences are deliberate: the
++ * caller's frame is already released, so nothing may be borrowed from it, and
++ * the argument values in `oargv` are already owned and are transferred rather
++ * than duplicated.
++ */
++static __attribute__((always_inline)) inline void regvm_record_fill_tail(
++    JSRuntime *rt, const JSRegRecordLayout *lay, JSValueConst cf, JSObject *co,
++    JSFunctionBytecode *cb, JSRegRun *caller, int ret_dst, uint8_t *ret_ip,
++    JSValueConst this_obj, const JSValue *oargv, int na, int slots)
++{
++    JSRegRun *rec = lay->rec;
++    JSStackFrame *sf = lay->sf;
++    int k;
++
++    rec->caller = caller;
++    rec->ret_ip = ret_ip;
++    rec->ret_dst = ret_dst;
++#ifdef QJS_REGVM_RCCHECK
++    rec->ctx = cb->realm;
++#endif
++    rec->b = cb;
++    rec->pic = cb->regvm_pic;
++#ifdef QJS_REGVM_RCCHECK
++    rec->rcc = cb->regvm_rcc;
++    rec->rcc_shadow = NULL;
++    rec->rcc_prev = -1;
++    rec->rcc_ip = NULL;
++#endif
++    rec->sf = sf;
++    rec->fr = lay->regs;
++    rec->var_refs = co->u.func.var_refs;
++    rec->var_buf = lay->var_buf;
++    rec->this_obj = this_obj;
++    rec->new_target = JS_UNDEFINED;
++    rec->argc = na;
++    rec->argv = (JSValue *)oargv;
++    rec->ctl = lay->ctl;
++    rec->nctl = 0;
++    rec->flags = 0;
++    rec->ret = JS_UNDEFINED;
++    rec->set_v = JS_UNDEFINED;
++    rec->arg_buf = lay->arg_buf;
++    rec->arg_owned = 1;
++    rec->local_buf = lay->arg_buf;
++#if QJS_DRC
++    rec->local_count = slots + cb->var_count;
++#else
++    rec->local_count = slots + cb->var_count + cb->regvm_reg_count
++        + REGVM_HS - 1;
++#endif
++    for (k = 0; k < slots; k++)
++        lay->arg_buf[k] = (k < na) ? oargv[k] : JS_UNDEFINED;
++#if !REGVM_SLIM_FRAME
++    sf->arg_count = slots;
++#endif
++
++    sf->cur_func = cf;
++#if !REGVM_SLIM_FRAME
++    sf->is_strict_mode = cb->is_strict_mode;
++    sf->is_constructor = false;
++    sf->var_buf = lay->var_buf;
++#endif
++    sf->var_refs = lay->var_refs;
++    sf->var_ref_count = cb->var_ref_count;
++#if !REGVM_SLIM_FRAME
++    sf->cur_gc_obj = NULL;
++#endif
++    sf->cur_pc = NULL;
++    sf->prev_frame = caller->sf;
++    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
++
++#if !REGVM_SLIM_FRAME
++    sf->arg_buf = rec->arg_buf;
++#endif
++    {
++        int var_count = cb->var_count;
++        int var_ref_count = cb->var_ref_count;
++        int nregs = cb->regvm_reg_count + REGVM_HS;
++
++        for (k = 0; k < var_count; k++)
++            lay->var_buf[k] = JS_UNDEFINED;
++        for (k = 0; k < var_ref_count; k++)
++            lay->var_refs[k] = NULL;
++        if (likely(nregs <= REGVM_UNDEF_TMPL_N)) {
++            memcpy(lay->regs, regvm_undef_tmpl, (size_t)nregs * sizeof(JSValue));
++        } else if (!cb->regvm_fill) {
++            for (k = 0; k < nregs; k++)
++                lay->regs[k] = JS_UNDEFINED;
++        } else {
++            int nf = cb->regvm_fill_count;
++
++            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
++            for (k = 0; k < nf; k++)
++                lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
++        }
++    }
++
++    rt->current_stack_frame = sf;
++}
+ #endif /* QJS_REGVM_RECORD */
+ 
+ #endif /* QJS_REGVM_INLOOP_CALL */

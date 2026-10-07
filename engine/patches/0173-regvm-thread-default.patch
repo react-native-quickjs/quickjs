@@ -1,0 +1,128 @@
+Subject: register VM: make threaded+record the default executor
+
+What this does:
+  QJS_REGVM_THREAD and QJS_REGVM_RECORD now default to 1 under QJS_REGVM=1
+  (Clang, and not STEPCHECK/ASM/AOT/AOT_PROFILE), instead of 0. The defaults
+  move to the top of quickjs.c, just after the register ISA include, because
+  both JSRuntime's frame-arena fields and the interpreter read them long before
+  the old #ifndef block near the end of the file. cmake/quickjs.cmake gains
+  QJS_REGVM_THREAD/QJS_REGVM_RECORD options (default ON) and defines them to 0
+  only when turned off.
+
+Why we need it:
+  Threaded+record is ~15% fewer cycles than the monolith on the Octane corpus
+  geomean, but every published "register VM" number so far came from the
+  monolith because the default was 0.
+
+Needs a bytecode version bump:
+  No. Configuration only.
+
+Notes:
+  Also fixes a latent bug the change exposed: the monolith REGVM_NEXT tested
+  `#ifdef QJS_REGVM_THREAD`, which selects the threaded branch as soon as the
+  macro is defined at all (now always). Changed to `#if QJS_REGVM_THREAD`.
+  Box2d checksum 546.1008391043414, test262 50/81192 threaded+record.
+
+diff --git a/quickjs.c b/quickjs.c
+index aafef1e..57ff9cf 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -69,6 +69,38 @@ typedef struct JSRegIR JSRegIR;
+ typedef struct JSRegRCC JSRegRCC;
+ #endif
+ 
++/*
++ * The register VM's default executor is the threaded dispatch (P2) plus the
++ * record call path: on the Octane corpus the pair is ~15% fewer cycles than the
++ * monolith. They rely on Clang's `musttail` and `preserve_none` and on
++ * computed-goto dispatch; the configurations that replace the monolith's
++ * dispatch (STEPCHECK, the asm core) or are defined against it (the AOT runtime
++ * and the AOT profiler) still need the monolith, and other compilers cannot run
++ * the chain at all, so on those the default stays 0. Pass
++ * `-DQJS_REGVM_THREAD=0` to build the monolith by hand, and
++ * `-DQJS_REGVM_RECORD=0` to keep the threaded dispatch without the record call
++ * path.
++ *
++ * Defaulted here, at the top, because both the runtime's struct (the frame
++ * arena) and the interpreter read them, and a `#ifndef` default only affects
++ * code that comes after it.
++ */
++#ifndef QJS_REGVM_THREAD
++#if QJS_REGVM && defined(__clang__) && \
++    !QJS_REGVM_STEPCHECK && !QJS_REGVM_ASM && !QJS_AOT && !QJS_AOT_PROFILE
++#define QJS_REGVM_THREAD 1
++#else
++#define QJS_REGVM_THREAD 0
++#endif
++#endif
++#ifndef QJS_REGVM_RECORD
++#if QJS_REGVM_THREAD && !QJS_REGVM_INLOOP_CALL
++#define QJS_REGVM_RECORD 1
++#else
++#define QJS_REGVM_RECORD 0
++#endif
++#endif
++
+ /*
+  * Deferred reference counting (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md).
+  * QJS_DRC enables the machinery (ZCT, reconcile, register-root scanning);
+@@ -24406,8 +24438,11 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+  *    reaching zero takes, so the handler itself has no prologue: see the
+  *    measured note beside T_SET_NEXT.
+  *
+- * Off by default while the conversion is in progress: the default build
+- * compiles none of this and is unchanged.
++ */
++/*
++ * QJS_REGVM_THREAD and QJS_REGVM_RECORD are defaulted near the top of the
++ * file, beside the include of the register ISA, because the runtime's struct
++ * and the interpreter both read them long before this point.
+  */
+ #if QJS_REGVM_THREAD && QJS_REGVM_ASM
+ #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
+@@ -29151,7 +29186,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             goto *regvm_dispatch[op]; \
+         } while (0)
+ #else
+-#ifdef QJS_REGVM_THREAD
++#if QJS_REGVM_THREAD
+ /*
+  * Run the threaded chain from here. It returns the address of an opcode with no
+  * threaded handler -- which this loop then executes, counting it -- or NULL
+@@ -55926,13 +55961,11 @@ static int regvm_homes_mode(void)
+  * build can still turn it off at run time.
+  */
+ /*
+- * The threaded interpreter (P2). Off by default while the conversion is in
+- * progress: with it off the build is unchanged, and with it on the default and
+- * the threaded dispatch can be measured against each other from one source.
++ * QJS_REGVM_THREAD and QJS_REGVM_RECORD are defaulted at the top of the
++ * register interpreter, above, because the interpreter reads them before this
++ * block; by here they are set, whether from the command line or from that
++ * default.
+  */
+-#ifndef QJS_REGVM_THREAD
+-#define QJS_REGVM_THREAD 0
+-#endif
+ 
+ /*
+  * The P1 self-check: the monolith's dispatch is replaced by one `regvm_step`
+@@ -55963,16 +55996,9 @@ static int regvm_homes_mode(void)
+ #endif
+ 
+ /*
+- * The second design for the same problem, and the one the first should have
+- * been: the frame record *is* the interpreter's state, so `call` and `return`
+- * are ordinary threaded handlers and nothing is copied in or out.
+- *
+- * Needs the threaded chain, because the record is what the chain's handlers
+- * read and there is no other executor for a nested frame.
++ * QJS_REGVM_RECORD is defaulted with QJS_REGVM_THREAD at the top of the
++ * register interpreter, above.
+  */
+-#ifndef QJS_REGVM_RECORD
+-#define QJS_REGVM_RECORD 0
+-#endif
+ #if QJS_REGVM_RECORD && !QJS_REGVM
+ #error "QJS_REGVM_RECORD needs QJS_REGVM"
+ #endif
