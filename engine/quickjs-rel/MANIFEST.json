@@ -735,12 +735,28 @@
       "sha256": "b45c9e91b252e2a8a1f460d1077f3e2794147a1c4a6c871f1434662872d978da"
     },
     {
+      "name": "0189-regvm-frameless-call-classifier.patch",
+      "sha256": "e44b53548283ab484a3ed27e4b9ceeb5e1f4f1f559f37bb0995b5d71979421d4"
+    },
+    {
+      "name": "0190-regvm-variable-area-walk.patch",
+      "sha256": "7cb3df2250aee5a19c5df684c8f60d08dc7a4b3be52263b8a3aaa1de3f99a109"
+    },
+    {
+      "name": "0191-drc-validate-parked-objects.patch",
+      "sha256": "2c0a8bf58fd99cf8f335a43b6684347109ff33c75bcad8c3ef78dc2d9ba5e47e"
+    },
+    {
+      "name": "0192-regvm-frameless-trivial-return.patch",
+      "sha256": "2dc2184b26bbffb1eda03f52d0c63c685fc626219da5b0ee40bc6a4c1ffc1166"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "bc0f3ddca5889d7b039a8f351957092f6151590372fb76fe2d549f0301317609"
     }
   ],
   "files": {
-    "quickjs.c": "03e83e8b39ea2a9b56bd11ebff02be7f3f7c4db44996150f15991a9956670f5a",
+    "quickjs.c": "0f63fe6f8ceae8cd52801e4a5ce6ad09aa46916d8c5121291fc84778a1a5c36d",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

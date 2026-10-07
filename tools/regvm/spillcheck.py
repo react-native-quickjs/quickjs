@@ -51,6 +51,12 @@ SPILL = re.compile(r"\[(sp|x29)\b")
 X86_CALLEE_SAVE = re.compile(
     r"\b(push|pop)[a-z]*\s+%(?:rbx|rbp|r1[2-5]|ebx|ebp|r(?:12|13|14|15)d)\b",
     re.IGNORECASE)
+# Any push/pop whatever the register. On x86 a handler that makes a non-tail
+# call pays only a stack-alignment `push %rax` on the hot path -- no `[sp]`
+# home, so the `[sp]`-based --no-frame check does not see it. Named
+# classifiers must have neither. Other handlers use push/pop as a register
+# shuffle (e.g. push %rax ... pop %rdx) and are not judged by this.
+PUSH_POP = re.compile(r"\b(push|pop)[a-z]*\b", re.IGNORECASE)
 ARM_CALLEE_SAVE = re.compile(
     r"\b(?:stp|ldp|str|ldr)\s+[^\n]*\b(?:x(?:19|2[0-9])|w(?:19|2[0-9]))\b"
     r"[^\n]*\[sp\b", re.IGNORECASE)
@@ -200,6 +206,10 @@ def main():
                     help="with --no-frame, allow symbols containing SUBSTR: a "
                          "handler whose *hot* path is itself a call cannot avoid "
                          "a frame, and the exception has to be named")
+    ap.add_argument("--no-push", action="append", default=[], metavar="NAME",
+                    help="assert the exactly-named symbol contains no push/pop: "
+                         "the x86 classifier frame is only a stack-alignment "
+                         "push, which the [sp]-based --no-frame check misses")
     args = ap.parse_args()
 
     funcs = parse(args.disasm)
@@ -243,6 +253,21 @@ def main():
               f"{'OK' if ok else 'OVER'}")
         if not ok:
             status = 1
+
+    if args.no_push:
+        for name in args.no_push:
+            insns = funcs.get(name)
+            if insns is None:
+                print(f"PUSHCHECK {name}: symbol not found", file=sys.stderr)
+                status = 1
+                continue
+            hits = [text for _addr, text in insns if PUSH_POP.search(text)]
+            if hits:
+                print(f"PUSHCHECK {name}: {len(hits)} push/pop "
+                      f"({'; '.join(hits[:3])})")
+                status = 1
+            else:
+                print(f"PUSHCHECK {name}: clean")
 
     if args.no_frame:
         # The phase-2 discipline, as a check rather than a convention: a handler

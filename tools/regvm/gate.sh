@@ -99,6 +99,7 @@ case "$EXTRA" in
         # cache hit and tail-call the call, so they are back under the check.
         if python3 "$ROOT/tools/regvm/spillcheck.py" "$WORK/regvm.s" \
                 --select regvm_t_ --no-frame --quiet \
+                --no-push regvm_t_call --no-push regvm_t_call_method \
                 --frame-exempt regvm_t_call_record \
                 --frame-exempt regvm_t_call_method_record \
                 --frame-exempt regvm_t_tail_call_record \

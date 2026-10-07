@@ -1,0 +1,193 @@
+From: quickjs-ng bundle work
+Subject: Register VM: shrink the variable-area release walk (0190)
+
+What this does
+  Records, per function, how many variable (var_buf) slots the frame must fill
+  and release: the highest slot that is *not* promoted into a register, plus
+  one (`regvm_var_count`). It is derived from the promotion map
+  (`slot_ok`/`ok_index`) the register compiler already builds, stored in a
+  spare byte next to `regvm_call_ready`, and used as the DRC release walk's
+  bound (`local_count`) instead of `var_count`. The walk-only form lands here:
+  the fill keeps writing every slot, because a slot above the bound that some
+  path still reads must see `undefined` rather than the arena's previous
+  contents.
+
+Why we need it
+  A promoted local's value lives in a register, and a dead local is never
+  written, so most of a frame's declared variable slots are not part of the
+  release walk at all. On box2d, 74.9% of declared variable slots are above the
+  highest one the code still names (deltablue 89.1%, richards 80.8%). Stopping
+  the walk at that bound removes the per-slot tag check and free that the walk
+  otherwise performs on dead slots every call.
+
+Why the bound comes from the promotion map
+  A slot captured by an inner function is named in the *child's*
+  `closure_var[i].var_idx`, not as an operand in the parent's code, so a bound
+  worked out from the parent's own operands misses it -- and a missed captured
+  slot reads as `undefined`. The promotion map cannot miss it: a captured
+  local is never promoted (`js_u3_slot_private` returns false for it), so it is
+  always below the bound. A function read from a blob keeps `var_count`
+  (the map is compile-time only), and a function with more than 255 slots keeps
+  it too (the field is one byte).
+
+Measured (x86, clang-19, threaded+record)
+  box2d `fixed.js` 21,805,949,833 -> 21,573,858,578 (-232.1M, -1.06%);
+  richards -0.18% (flat on instructions); loc10 micro -71 instructions/call;
+  the no-local micros +1/call. A closure test (inner captures a parent local
+  above the parent's promoted locals) matches the baseline.
+
+No bytecode change:
+  No. Runtime only. `regvm_var_count` is derived from the code, never
+  serialized.
+
+diff --git a/quickjs.c b/quickjs.c
+index 25aa842..c0e2e3e 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1537,6 +1537,14 @@ typedef struct JSFunctionBytecode {
+        is the borrow-case arena size (arg_slots == 0), the common case, so
+        `regvm_record_alloc` is one load and one add instead of three multiplies. */
+     uint8_t regvm_call_ready;
++    /* S2: how many variable (var_buf) slots the frame must fill and release --
++       the unpromoted slots' highest index plus one. A captured local is never
++       promoted (`js_u3_slot_private`), so it is always covered. `var_count` is
++       the fallback: it is what a function read from a blob gets (the promotion
++       map is compile-time only) and what any function with more than 255 slots
++       gets (the field is one byte). Kept next to `regvm_call_ready` so the
++       struct keeps its size and offsets. */
++    uint8_t regvm_var_count;
+     uint32_t regvm_frame_need;
+ #endif
+ #if QJS_AOT_PROFILE
+@@ -29434,6 +29442,20 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+      * walk: they start at var_buf when the arguments are borrowed, so the frame
+      * frees only what it owns.
+      */
++    /*
++     * S2: the variable area only needs the slots the register code still names.
++     * `regvm_var_count` is that count, from the promotion map (captured locals
++     * included). Under DRC the release walk covers the variable area alone, so
++     * the fill and the walk both stop at it. Without DRC the walk runs
++     * contiguously through the registers too, so the bound stays `var_count`.
++     * A function with more than 255 slots keeps `var_count` (the field is one
++     * byte and cannot hold the bound).
++     */
++    int vcount = cb->var_count;
++#if QJS_DRC
++    if (cb->var_count <= 255)
++        vcount = cb->regvm_var_count;
++#endif
+     if (regvm_args_borrowable(cb, na)) {
+         rec->arg_buf = (JSValue *)oargv;
+         rec->arg_owned = 0;
+@@ -29441,7 +29463,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+ #if QJS_DRC
+         /* Registers do not own, so the release walk stops at the register
+            file; only the variable area (and owned argument copies) is freed. */
+-        rec->local_count = cb->var_count;
++        rec->local_count = vcount;
+ #else
+         rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
+ #endif
+@@ -29453,7 +29475,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+         rec->arg_owned = 1;
+         rec->local_buf = lay->arg_buf;
+ #if QJS_DRC
+-        rec->local_count = slots + cb->var_count;
++        rec->local_count = slots + vcount;
+ #else
+         rec->local_count = slots + cb->var_count + cb->regvm_reg_count
+             + REGVM_HS - 1;
+@@ -29492,7 +29514,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+      * aliased by a store through a pointer, so the count stays in a register.
+      */
+     {
+-        int var_count = cb->var_count;
++        int var_count = cb->var_count; /* S2: fill stays full */
+         int var_ref_count = cb->var_ref_count;
+         int nregs = cb->regvm_reg_count + REGVM_HS;
+ 
+@@ -29588,8 +29610,14 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+     rec->arg_buf = lay->arg_buf;
+     rec->arg_owned = 1;
+     rec->local_buf = lay->arg_buf;
++    /* S2: same variable-area bound as `regvm_record_fill`. */
++    int vcount = cb->var_count;
++#if QJS_DRC
++    if (cb->var_count <= 255)
++        vcount = cb->regvm_var_count;
++#endif
+ #if QJS_DRC
+-    rec->local_count = slots + cb->var_count;
++    rec->local_count = slots + vcount;
+ #else
+     rec->local_count = slots + cb->var_count + cb->regvm_reg_count
+         + REGVM_HS - 1;
+@@ -29620,7 +29648,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+     sf->arg_buf = rec->arg_buf;
+ #endif
+     {
+-        int var_count = cb->var_count;
++        int var_count = cb->var_count; /* S2: fill stays full */
+         int var_ref_count = cb->var_ref_count;
+         int nregs = cb->regvm_reg_count + REGVM_HS;
+ 
+@@ -41311,6 +41339,7 @@ typedef struct JSFunctionDef {
+     uint8_t *regvm_code;
+     int regvm_len;
+     int regvm_reg_count;
++    int regvm_var_count;   /* S2: unpromoted variable slots' highest index + 1 */
+     int regvm_ctl_count;
+     int regvm_pic_count;
+     uint8_t regvm_compiled; /* the backend lowered this function */
+@@ -66946,6 +66975,31 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+         }
+     }
+ 
++    /*
++     * S2: the frame's variable slots that are not promoted into registers. A
++     * promoted slot's value lives in a register for the whole function, so the
++     * variable area only needs slots up to the last unpromoted one. A captured
++     * local is never promoted (`js_u3_slot_private` returns false for it), so
++     * it is always counted here -- and that is the case an operand scan of this
++     * function's own code would miss, because the capturing *child* names the
++     * slot in its closure_var entry, not this code. `ns_ok == 0` means promotion
++     * was turned off for the whole function (the pool cap, or an ineligible
++     * body), so every slot is unpromoted and the bound is `var_count`.
++     */
++    {
++        int vc = fd->var_count, hi = -1, k;
++        if (slot_ok && ok_index && ns_ok > 0) {
++            for (k = 0; k < fd->var_count; k++)
++                if (!(slot_ok[k] && ok_index[k] >= 0))
++                    hi = k;
++            if (hi + 1 < vc)
++                vc = hi + 1;
++        }
++        if (vc < 0)
++            vc = 0;
++        fd->regvm_var_count = vc;
++    }
++
+     /* Dense value numbering: instruction results first, in pc order over
+        reachable code, then phis. Dense ids are what liveness and the allocator
+        index, and they must be deterministic rather than depend on how the
+@@ -69978,6 +70032,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+         b->regvm_code = (void *)((uint8_t*)b + regvm_offset);
+         b->regvm_len = fd->regvm_len;
+         b->regvm_reg_count = fd->regvm_reg_count;
++        b->regvm_var_count = fd->regvm_var_count > 255
++            ? 255 : (uint8_t)fd->regvm_var_count;
+         b->regvm_ctl_count = fd->regvm_ctl_count;
+         b->regvm_pic_count = fd->regvm_pic_count;
+         b->regvm_rcc = fd->regvm_rcc;
+@@ -73915,6 +73971,9 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+     }
+     b->args_captured = args_captured ? 1 : 0;
+     b->argv_safe = argv_safe ? 1 : 0;
++    /* S2: the promotion map is compile-time only, so a function read from a blob
++       keeps the unshrunk bound (`var_count`, clamped to the one-byte field). */
++    b->regvm_var_count = b->var_count > 255 ? 255 : (uint8_t)b->var_count;
+ #if QJS_REGVM_THREAD
+     b->regvm_all_threaded = all_threaded;
+ #endif

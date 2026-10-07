@@ -905,7 +905,22 @@ static void js_drc_validate_range(void *opaque, JSValue *regs, uint32_t nregs)
         JSValue v = regs[i];
         if (!JS_VALUE_HAS_REF_COUNT(v))
             continue;
+        /*
+         * Registers borrow under deferred RC (stage D4): the value they hold is
+         * owned elsewhere, or -- when its count has already reached zero -- is
+         * parked on the zero-count table, which keeps it alive until the
+         * deferred free runs. So a counted value at count zero is legitimate
+         * *if it is parked*. Only a value that is counted, at zero and not
+         * parked is unreachable garbage: nothing will free it and nothing owns
+         * it. With owning registers (the default before D4) the original,
+         * stricter test is the right one.
+         */
+#if QJS_DRC
+        if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1 &&
+            !JS_GC_IN_ZCT(JS_VALUE_GET_PTR(v))) {
+#else
         if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1) {
+#endif
             fprintf(stderr,
                     "drc-validate: register %p[%u] holds a counted value at "
                     "ref_count %u\n",
@@ -1537,6 +1552,14 @@ typedef struct JSFunctionBytecode {
        is the borrow-case arena size (arg_slots == 0), the common case, so
        `regvm_record_alloc` is one load and one add instead of three multiplies. */
     uint8_t regvm_call_ready;
+    /* S2: how many variable (var_buf) slots the frame must fill and release --
+       the unpromoted slots' highest index plus one. A captured local is never
+       promoted (`js_u3_slot_private`), so it is always covered. `var_count` is
+       the fallback: it is what a function read from a blob gets (the promotion
+       map is compile-time only) and what any function with more than 255 slots
+       gets (the field is one byte). Kept next to `regvm_call_ready` so the
+       struct keeps its size and offsets. */
+    uint8_t regvm_var_count;
     uint32_t regvm_frame_need;
 #endif
 #if QJS_AOT_PROFILE
@@ -9820,6 +9843,10 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
             list_del(&p->link);
             list_add(&p->link, &rt->gc_zero_ref_count_list);
+            /* Parked objects carry the same marker as parked strings, so a
+               borrowing register that still names one is not mistaken for a
+               dangling value (see js_drc_validate_range). */
+            JS_GC_IN_ZCT(p) = 1;
             rt->zct_nobj++;
         }
         break;
@@ -9893,6 +9920,7 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
         p = list_entry(el, JSGCObjectHeader, link);
         if (JS_REF_COUNT(p) > 0) {
             list_del(&p->link);
+            JS_GC_IN_ZCT(p) = 0;   /* resurrected: no longer parked */
             if (JS_GC_NOTRACE(p))
                 list_add_tail(&p->link, &rt->gc_notrace_list);
             else
@@ -24804,6 +24832,14 @@ typedef struct JSRegRun {
     uint8_t *resume_marker;
 } JSRegRun;
 
+/*
+ * S3: a record frame that owns nothing to release -- an empty release walk and
+ * no captured-variable cells. With S2's walk bound in place most frames are of
+ * this kind (box2d 92.2% of record calls, deltablue and richards ~99.9%), so
+ * `return` can hand the value back without the framed release path.
+ */
+#define REGVM_FLAG_TRIVIAL_RET (1 << 8)
+
 #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
 typedef struct JSRegArenaChunk {
     struct JSRegArenaChunk *prev, *next;
@@ -25544,6 +25580,11 @@ static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
 #if QJS_REGVM_RECORD
 static uint8_t *REGVM_CC regvm_t_return_nested(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial(REGVM_ARGS);
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial_chunk(REGVM_ARGS);
+static no_inline void regvm_arena_pop_chunk(JSRuntime *rt);
 #endif
 #if QJS_REGVM_RECORD
 /* Where each region of a nested frame sits. The record is at the base and the
@@ -25614,6 +25655,8 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
 static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
@@ -26133,6 +26176,20 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
         return ip;
     }
     s = T_REG(1);
+#if QJS_REGVM_RECORD
+    /*
+     * S3: a frame that owns nothing moves the value straight into the caller's
+     * register. The general path's `js_dup` is balanced by the `REG_ADOPT` in
+     * `regvm_t_return_nested`; a trivial frame has nothing for the release walk
+     * to free in between, so the pair is a net no-op and is skipped -- which is
+     * what keeps the fast handler frameless.
+     */
+    if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
+        f->ret = FR(s);
+        FR(s) = JS_UNDEFINED;
+        __attribute__((musttail)) return regvm_t_return_trivial(REGVM_PASS);
+    }
+#endif
 #if QJS_DRC
     /* The register only borrows, so the return value needs its own reference
        until it lands in the caller's register (or in C). */
@@ -26153,6 +26210,10 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
         return ip;
     }
     f->ret = JS_UNDEFINED;
+#if QJS_REGVM_RECORD
+    if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET))
+        __attribute__((musttail)) return regvm_t_return_trivial(REGVM_PASS);
+#endif
     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
 }
 
@@ -26258,6 +26319,67 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
     /* back in the caller's realm */
     __attribute__((musttail)) return regvm_t_dispatch(rip, f->fr, f, f->b->realm);
 }
+
+/*
+ * S3: the frameless return for a frame that owns nothing.
+ *
+ * `regvm_t_return_nested` is out of line and carries a frame because it calls
+ * `regvm_record_release` (which can call `JS_FreeValueRT`) and because the
+ * arena pop can call `regvm_arena_pop_chunk`. A trivial frame has an empty
+ * release walk, so the first is not needed; the second is kept off this path by
+ * the chunk guard below. What remains is a value move, a stack-frame pointer
+ * store and a dispatch -- no call, so no prologue, and the chain stays a chain.
+ *
+ * The value's reference is not duplicated: `regvm_t_return` hands over the
+ * register's value without the `js_dup` the general path does, and this side
+ * stores it without the matching `REG_ADOPT`. With nothing released in between
+ * (the frame owns nothing) the count is unchanged.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial(REGVM_ARGS)
+{
+    JSRegRun *c = f->caller;
+    int dst = f->ret_dst;
+    uint8_t *rip = f->ret_ip;
+    JSValue v = f->ret;
+    size_t top = (size_t)((uint8_t *)f - (uint8_t *)ctx->rt->regvm_frames);
+
+    ctx->rt->regvm_frames_top = top;
+    /*
+     * The one part of the pop that can call: the frame was the first in its
+     * chunk and a previous chunk can be restored. Rare, and off the hot path;
+     * the helper pops the chunk and finishes the return. `c`, `dst`, `rip` and
+     * `v` are read above, before the pop can move `regvm_frames`.
+     */
+    if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
+        __attribute__((musttail)) return regvm_t_return_trivial_chunk(REGVM_PASS);
+
+    ctx->rt->current_stack_frame = c->sf;
+    /* no `REG_ADOPT`: the caller's register borrows, exactly as the general
+       path leaves it after its balanced dup/adopt */
+    *(JSValue *)((uint8_t *)c->fr + dst) = v;
+    ctx->rt->regvm_tail_chain = 0;
+    f = c;
+    __attribute__((musttail)) return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial_chunk(REGVM_ARGS)
+{
+    JSRegRun *c = f->caller;
+    int dst = f->ret_dst;
+    uint8_t *rip = f->ret_ip;
+    JSValue v = f->ret;
+
+    /* the guard established top == 0 and a previous chunk, which is exactly
+       when the chunk is popped */
+    regvm_arena_pop_chunk(ctx->rt);
+    ctx->rt->current_stack_frame = c->sf;
+    *(JSValue *)((uint8_t *)c->fr + dst) = v;
+    ctx->rt->regvm_tail_chain = 0;
+    f = c;
+    __attribute__((musttail)) return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+}
 #endif
 
 #if QJS_REGVM_RECORD
@@ -26281,24 +26403,16 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
     JSValue cf = FR(c);
 
     REGVM_CAPTURE_IP();
+    /* S1: this handler must stay a pure classify-and-jump. The lazy
+       materialize -- and the call it makes -- lives in `regvm_t_call_lazy`
+       below, so no frame is forced onto the path every call takes. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-            /* D13: a lazy function becomes record-eligible only after it is
-               materialized, and materialization otherwise happens inside the
-               slow path on its first call. Materialize here so that first call
-               takes the record path too -- otherwise a caller frame survives in
-               Error.stack for a bundle but not for source. */
-            if (unlikely(cb->is_lazy) &&
-                js_materialize_function_body(cb->realm, cb) == 0 &&
-                regvm_record_eligible(cb))
-                __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-#if defined(QJS_REGVM_COUNT)
-            regvm_note_blockers(cb);
-#endif
+            __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
         }
     }
     __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
@@ -26310,6 +26424,8 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     JSValue cf = FR(c);
 
     REGVM_CAPTURE_IP();
+    /* S1: pure classify-and-jump; the lazy materialize is in
+       `regvm_t_call_method_lazy` below. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
@@ -26317,18 +26433,63 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail))
                     return regvm_t_call_method_record(REGVM_PASS);
-            if (unlikely(cb->is_lazy) &&
-                js_materialize_function_body(cb->realm, cb) == 0 &&
-                regvm_record_eligible(cb))
-                __attribute__((musttail))
-                    return regvm_t_call_method_record(REGVM_PASS);
-#if defined(QJS_REGVM_COUNT)
-            regvm_note_blockers(cb);
-#endif
+            __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
         }
     }
     __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
 }
+
+#if QJS_REGVM_RECORD
+/*
+ * S1: the lazy-materialize half of the call classifiers, split out so the
+ * classifiers are frameless. The classifiers reach here only for a bytecode
+ * callee that is not yet record-eligible -- in practice a lazy function whose
+ * body has not been materialized. Materializing it is a C call, and inlining
+ * that call into the classifier made the classifier carry a stack frame on
+ * every dispatch, including the monomorphic fast path that never reaches the
+ * call.
+ *
+ * D13: a lazy function becomes record-eligible only after it is materialized,
+ * and materialization otherwise happens inside the slow path on its first
+ * call. Materializing here keeps that first call on the record path too --
+ * otherwise a caller frame survives in Error.stack for a bundle but not for
+ * source.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS)
+{
+    int c = T_REG(3);
+    JSValue cf = FR(c);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+
+    if (unlikely(cb->is_lazy) &&
+        js_materialize_function_body(cb->realm, cb) == 0 &&
+        regvm_record_eligible(cb))
+        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+#if defined(QJS_REGVM_COUNT)
+    regvm_note_blockers(cb);
+#endif
+    __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS)
+{
+    int c = T_REG(3);
+    JSValue cf = FR(c);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+
+    if (unlikely(cb->is_lazy) &&
+        js_materialize_function_body(cb->realm, cb) == 0 &&
+        regvm_record_eligible(cb))
+        __attribute__((musttail))
+            return regvm_t_call_method_record(REGVM_PASS);
+#if defined(QJS_REGVM_COUNT)
+    regvm_note_blockers(cb);
+#endif
+    __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+}
+#endif
 
 /*
  * The record-creating halves. These are inherently calling -- they allocate from
@@ -26530,6 +26691,9 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGV
     f->this_obj = lay.arg_buf[slots];
     f->new_target = lay.arg_buf[slots + 1];
     f->flags |= JS_CALL_FLAG_CONSTRUCTOR;
+    /* the two owned slots above make the release walk non-empty, so the frame
+       is not trivial even if the fill saw no variables */
+    f->flags &= ~REGVM_FLAG_TRIVIAL_RET;
     f->local_buf = lay.arg_buf;
 #if QJS_DRC
     f->local_count = slots + 2 + cb->var_count;
@@ -29393,6 +29557,20 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      * walk: they start at var_buf when the arguments are borrowed, so the frame
      * frees only what it owns.
      */
+    /*
+     * S2: the variable area only needs the slots the register code still names.
+     * `regvm_var_count` is that count, from the promotion map (captured locals
+     * included). Under DRC the release walk covers the variable area alone, so
+     * the fill and the walk both stop at it. Without DRC the walk runs
+     * contiguously through the registers too, so the bound stays `var_count`.
+     * A function with more than 255 slots keeps `var_count` (the field is one
+     * byte and cannot hold the bound).
+     */
+    int vcount = cb->var_count;
+#if QJS_DRC
+    if (cb->var_count <= 255)
+        vcount = cb->regvm_var_count;
+#endif
     if (regvm_args_borrowable(cb, na)) {
         rec->arg_buf = (JSValue *)oargv;
         rec->arg_owned = 0;
@@ -29400,7 +29578,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
 #if QJS_DRC
         /* Registers do not own, so the release walk stops at the register
            file; only the variable area (and owned argument copies) is freed. */
-        rec->local_count = cb->var_count;
+        rec->local_count = vcount;
 #else
         rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
 #endif
@@ -29412,7 +29590,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
         rec->arg_owned = 1;
         rec->local_buf = lay->arg_buf;
 #if QJS_DRC
-        rec->local_count = slots + cb->var_count;
+        rec->local_count = slots + vcount;
 #else
         rec->local_count = slots + cb->var_count + cb->regvm_reg_count
             + REGVM_HS - 1;
@@ -29423,6 +29601,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
         sf->arg_count = slots;
 #endif
     }
+
+    /* S3: an empty release walk and no captured cells -> frameless return. A
+       constructor clears this below (it needs the this-unless-object rule). */
+    if (rec->local_count == 0 && cb->var_ref_count == 0)
+        rec->flags |= REGVM_FLAG_TRIVIAL_RET;
 
     sf->cur_func = cf;
 #if !REGVM_SLIM_FRAME
@@ -29451,7 +29634,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      * aliased by a store through a pointer, so the count stays in a register.
      */
     {
-        int var_count = cb->var_count;
+        int var_count = cb->var_count; /* S2: fill stays full */
         int var_ref_count = cb->var_ref_count;
         int nregs = cb->regvm_reg_count + REGVM_HS;
 
@@ -29547,8 +29730,14 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
     rec->arg_buf = lay->arg_buf;
     rec->arg_owned = 1;
     rec->local_buf = lay->arg_buf;
+    /* S2: same variable-area bound as `regvm_record_fill`. */
+    int vcount = cb->var_count;
 #if QJS_DRC
-    rec->local_count = slots + cb->var_count;
+    if (cb->var_count <= 255)
+        vcount = cb->regvm_var_count;
+#endif
+#if QJS_DRC
+    rec->local_count = slots + vcount;
 #else
     rec->local_count = slots + cb->var_count + cb->regvm_reg_count
         + REGVM_HS - 1;
@@ -29558,6 +29747,10 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
 #if !REGVM_SLIM_FRAME
     sf->arg_count = slots;
 #endif
+
+    /* S3: same frameless-return test as `regvm_record_fill`. */
+    if (rec->local_count == 0 && cb->var_ref_count == 0)
+        rec->flags |= REGVM_FLAG_TRIVIAL_RET;
 
     sf->cur_func = cf;
 #if !REGVM_SLIM_FRAME
@@ -29579,7 +29772,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
     sf->arg_buf = rec->arg_buf;
 #endif
     {
-        int var_count = cb->var_count;
+        int var_count = cb->var_count; /* S2: fill stays full */
         int var_ref_count = cb->var_ref_count;
         int nregs = cb->regvm_reg_count + REGVM_HS;
 
@@ -41270,6 +41463,7 @@ typedef struct JSFunctionDef {
     uint8_t *regvm_code;
     int regvm_len;
     int regvm_reg_count;
+    int regvm_var_count;   /* S2: unpromoted variable slots' highest index + 1 */
     int regvm_ctl_count;
     int regvm_pic_count;
     uint8_t regvm_compiled; /* the backend lowered this function */
@@ -66905,6 +67099,31 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         }
     }
 
+    /*
+     * S2: the frame's variable slots that are not promoted into registers. A
+     * promoted slot's value lives in a register for the whole function, so the
+     * variable area only needs slots up to the last unpromoted one. A captured
+     * local is never promoted (`js_u3_slot_private` returns false for it), so
+     * it is always counted here -- and that is the case an operand scan of this
+     * function's own code would miss, because the capturing *child* names the
+     * slot in its closure_var entry, not this code. `ns_ok == 0` means promotion
+     * was turned off for the whole function (the pool cap, or an ineligible
+     * body), so every slot is unpromoted and the bound is `var_count`.
+     */
+    {
+        int vc = fd->var_count, hi = -1, k;
+        if (slot_ok && ok_index && ns_ok > 0) {
+            for (k = 0; k < fd->var_count; k++)
+                if (!(slot_ok[k] && ok_index[k] >= 0))
+                    hi = k;
+            if (hi + 1 < vc)
+                vc = hi + 1;
+        }
+        if (vc < 0)
+            vc = 0;
+        fd->regvm_var_count = vc;
+    }
+
     /* Dense value numbering: instruction results first, in pc order over
        reachable code, then phis. Dense ids are what liveness and the allocator
        index, and they must be deterministic rather than depend on how the
@@ -69937,6 +70156,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         b->regvm_code = (void *)((uint8_t*)b + regvm_offset);
         b->regvm_len = fd->regvm_len;
         b->regvm_reg_count = fd->regvm_reg_count;
+        b->regvm_var_count = fd->regvm_var_count > 255
+            ? 255 : (uint8_t)fd->regvm_var_count;
         b->regvm_ctl_count = fd->regvm_ctl_count;
         b->regvm_pic_count = fd->regvm_pic_count;
         b->regvm_rcc = fd->regvm_rcc;
@@ -73874,6 +74095,9 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
     }
     b->args_captured = args_captured ? 1 : 0;
     b->argv_safe = argv_safe ? 1 : 0;
+    /* S2: the promotion map is compile-time only, so a function read from a blob
+       keeps the unshrunk bound (`var_count`, clamped to the one-byte field). */
+    b->regvm_var_count = b->var_count > 255 ? 255 : (uint8_t)b->var_count;
 #if QJS_REGVM_THREAD
     b->regvm_all_threaded = all_threaded;
 #endif

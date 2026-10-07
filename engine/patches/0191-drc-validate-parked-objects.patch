@@ -1,0 +1,75 @@
+From: quickjs-ng bundle work
+Subject: Deferred RC: mark parked objects so the register validator is not a false positive (0191)
+
+What this does
+  `js_drc_zero` parks a zero-count object on `gc_zero_ref_count_list` but did
+  not set the `in_zct` marker on it, while a parked string or BigInt did set
+  it. The register validator (`QJS_DRC_VALIDATE`) uses that marker to tell a
+  borrowing register that still names a parked value from one that names
+  garbage, so it aborted on every box2d/deltablue/richards run with
+  `register ... holds a counted value at ref_count 0`. The same marker is what
+  `JS_DRC_UNIQUELY_OWNED` reads to refuse in-place mutation of a value that is
+  parked and only resurrected.
+
+Why we need it
+  Registers borrow under deferred RC, so a counted value at ref_count 0 in a
+  register is normal: it is parked for a deferred free. The validator's rule was
+  the owning-register invariant and needs the parked marker to be honest. With
+  the marker set on objects too, the validator passes on the baseline, which is
+  what a change that removes a reference-count pair (S3) needs to be checked
+  against.
+
+Measured
+  box2d `check.js` 546.1008391043414 under `-DQJS_DRC_VALIDATE=1`;
+  deltablue and richards run to completion; box2d `fixed.js` instruction count
+  unchanged (21,806.1M -> 21,576.5M with 0190, same as before this patch).
+
+No bytecode change:
+  No. Runtime only.
+
+diff --git a/quickjs.c b/quickjs.c
+index c0e2e3e..8972d49 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -905,7 +905,22 @@ static void js_drc_validate_range(void *opaque, JSValue *regs, uint32_t nregs)
+         JSValue v = regs[i];
+         if (!JS_VALUE_HAS_REF_COUNT(v))
+             continue;
++        /*
++         * Registers borrow under deferred RC (stage D4): the value they hold is
++         * owned elsewhere, or -- when its count has already reached zero -- is
++         * parked on the zero-count table, which keeps it alive until the
++         * deferred free runs. So a counted value at count zero is legitimate
++         * *if it is parked*. Only a value that is counted, at zero and not
++         * parked is unreachable garbage: nothing will free it and nothing owns
++         * it. With owning registers (the default before D4) the original,
++         * stricter test is the right one.
++         */
++#if QJS_DRC
++        if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1 &&
++            !JS_GC_IN_ZCT(JS_VALUE_GET_PTR(v))) {
++#else
+         if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1) {
++#endif
+             fprintf(stderr,
+                     "drc-validate: register %p[%u] holds a counted value at "
+                     "ref_count %u\n",
+@@ -9828,6 +9843,10 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
+             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
+             list_del(&p->link);
+             list_add(&p->link, &rt->gc_zero_ref_count_list);
++            /* Parked objects carry the same marker as parked strings, so a
++               borrowing register that still names one is not mistaken for a
++               dangling value (see js_drc_validate_range). */
++            JS_GC_IN_ZCT(p) = 1;
+             rt->zct_nobj++;
+         }
+         break;
+@@ -9901,6 +9920,7 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
+         p = list_entry(el, JSGCObjectHeader, link);
+         if (JS_REF_COUNT(p) > 0) {
+             list_del(&p->link);
++            JS_GC_IN_ZCT(p) = 0;   /* resurrected: no longer parked */
+             if (JS_GC_NOTRACE(p))
+                 list_add_tail(&p->link, &rt->gc_notrace_list);
+             else
