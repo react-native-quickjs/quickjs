@@ -751,12 +751,16 @@
       "sha256": "2dc2184b26bbffb1eda03f52d0c63c685fc626219da5b0ee40bc6a4c1ffc1166"
     },
     {
+      "name": "0193-regvm-fast-return-undefined.patch",
+      "sha256": "f98c7070c30ba42925b26a28498a67825ace5f23b10ba5c776dd3c42b54a305a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "bc0f3ddca5889d7b039a8f351957092f6151590372fb76fe2d549f0301317609"
     }
   ],
   "files": {
-    "quickjs.c": "0f63fe6f8ceae8cd52801e4a5ce6ad09aa46916d8c5121291fc84778a1a5c36d",
+    "quickjs.c": "1e4f87fbc2b91c8debc7b100a49c3a74362aef5a6552b69229b19e3ed024fd77",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

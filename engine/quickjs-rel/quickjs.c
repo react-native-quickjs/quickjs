@@ -26209,11 +26209,37 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
 #endif
         return ip;
     }
-    f->ret = JS_UNDEFINED;
 #if QJS_REGVM_RECORD
-    if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET))
-        __attribute__((musttail)) return regvm_t_return_trivial(REGVM_PASS);
+    /*
+     * Fast exit for the implicit `return undefined`, the common ending of a
+     * small function and 20% of the empty-call micro. A frame that owns nothing
+     * writes `undefined` into the caller's destination here, in line, instead
+     * of parking it in `f->ret` and tail-calling `regvm_t_return_trivial` to
+     * move it: `undefined` carries no reference, so there is no dup/adopt pair
+     * to balance and the store is the whole of the value move. The rare arena
+     * chunk pop keeps its own out-of-line helper, so this path stays frameless.
+     */
+    if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
+        JSRegRun *c = f->caller;
+        int dst = f->ret_dst;
+        uint8_t *rip = f->ret_ip;
+        size_t top = (size_t)((uint8_t *)f - (uint8_t *)ctx->rt->regvm_frames);
+
+        ctx->rt->regvm_frames_top = top;
+        if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
+            f->ret = JS_UNDEFINED;
+            __attribute__((musttail))
+                return regvm_t_return_trivial_chunk(REGVM_PASS);
+        }
+        ctx->rt->current_stack_frame = c->sf;
+        *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
+        ctx->rt->regvm_tail_chain = 0;
+        f = c;
+        __attribute__((musttail))
+            return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+    }
 #endif
+    f->ret = JS_UNDEFINED;
     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
 }
 
