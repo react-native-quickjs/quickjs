@@ -13,7 +13,7 @@
 #   WORK        build directory             (default /tmp/rv-gate)
 #   REPS        timing repetitions          (default 4)
 #   FUZZ_N      promotion-fuzzer cases      (default 800)
-#   SUITE       differential suite script   (default .local/regvm-build/diff-suite.sh)
+#   SUITE       differential suite script   (default tools/regvm/diff-suite/diff-suite.sh)
 #   HERMES      hermes binary, optional; when set the A/B includes it
 #   MONO        monolith register binary, optional; when set the A/B times it
 #               too, which is what phase 2 is judged on: the threaded build has
@@ -34,7 +34,7 @@ WORK=${WORK:-/tmp/rv-gate}
 CC=${CC:-clang}
 REPS=${REPS:-4}
 FUZZ_N=${FUZZ_N:-800}
-SUITE=${SUITE:-$ROOT/.local/regvm-build/diff-suite.sh}
+SUITE=${SUITE:-$ROOT/tools/regvm/diff-suite/diff-suite.sh}
 SUITE_MIN=${SUITE_MIN:-300}
 BOX2D=${BOX2D:-$ROOT/.local/box2d-gap/fixed.js}
 CHECK=${CHECK:-$ROOT/.local/box2d-gap/check.js}
