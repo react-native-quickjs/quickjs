@@ -755,12 +755,16 @@
       "sha256": "f98c7070c30ba42925b26a28498a67825ace5f23b10ba5c776dd3c42b54a305a"
     },
     {
+      "name": "0194-regvm-light-frame-calls.patch",
+      "sha256": "be2daa4db7a7a120552bc208e4ec45c28e9029ac96f3e3644c9da8f751324604"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "bc0f3ddca5889d7b039a8f351957092f6151590372fb76fe2d549f0301317609"
     }
   ],
   "files": {
-    "quickjs.c": "1e4f87fbc2b91c8debc7b100a49c3a74362aef5a6552b69229b19e3ed024fd77",
+    "quickjs.c": "bf7af456d0122b9fc69732a1a12b7466372d354ade408f11347ca437a37f992b",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
