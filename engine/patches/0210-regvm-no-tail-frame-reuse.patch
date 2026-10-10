@@ -1,0 +1,30 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -57220,9 +57220,17 @@
+         case OP_call:
+         case OP_call_method:
+             {
+-                /* detect and transform tail calls */
+                 int argc;
+                 argc = get_u16(bc_buf + pos + 1);
++#if !QJS_REGVM
++                /*
++                 * Detect and transform tail calls. The register backend reuses
++                 * the caller's frame for these (`ROP_tail_call*`), which costs
++                 * more per call than an ordinary call + return and hides the
++                 * callers from `Error.stack`; it does not emit this rewrite.
++                 * The stack interpreter's `OP_tail_call` only skips the
++                 * argument cleanup, so the stack-only build keeps it.
++                 */
+                 if (code_match(&cc, pos_next, OP_return, -1)) {
+                     if (cc.line_num >= 0) line_num = cc.line_num;
+                     if (cc.col_num >= 0) col_num = cc.col_num;
+@@ -57232,6 +57240,7 @@
+                                               &line_num, &col_num);
+                     break;
+                 }
++#endif
+                 add_pc2line_info(s, bc_out.size, line_num, col_num);
+                 put_short_code(&bc_out, op, argc);
+                 break;

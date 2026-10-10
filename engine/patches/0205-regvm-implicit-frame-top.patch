@@ -1,0 +1,377 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -691,6 +691,9 @@
+     uint8_t *regvm_frames;
+     size_t regvm_frames_size;    /* bytes */
+     size_t regvm_frames_top;     /* bytes in use */
++    /* Step 10: `regvm_frames + regvm_frames_size`, kept current so a light
++       call can bounds-check against the chunk end without loading the size. */
++    uint8_t *regvm_chunk_end;
+     /* The chunk holding regvm_frames (its header), or NULL before the first
+        push. A full chunk is not grown under live frames; the next frame goes
+        into a new chunk linked after it, so no frame ever moves. */
+@@ -824,6 +827,9 @@
+ /* Step 5: `regvm_cur`/`rv_light` now keep the caller pointer even when it is a
+    record frame; readers filter through this. */
+ static struct JSRegRun *regvm_light_head(struct JSRegRun *p);
++/* Step 10: raise the arena top over a light frame that is about to stop being
++   the innermost thing in the arena. */
++static void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf);
+ #endif
+ 
+ #if QJS_DRC || QJS_DRC_VALIDATE
+@@ -1618,6 +1624,10 @@
+     uint8_t regvm_light;
+     uint8_t regvm_light_fast; /* light, and its PIC needs no lazy allocation */
+     uint32_t regvm_light_need;
++    /* Plan step 10: bytes from a frame's `fr` to the end of the frame -- the
++       larger of the record and light shapes, rounded to 16 -- so a light callee
++       is placed directly above its caller without reading the arena top. */
++    uint32_t regvm_end_off;
+ #endif
+ #if QJS_AOT_PROFILE
+     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
+@@ -4005,6 +4015,7 @@
+     rt->regvm_frames = NULL;
+     rt->regvm_frames_size = 0;
+     rt->regvm_frames_top = 0;
++    rt->regvm_chunk_end = NULL;
+ #endif
+ #endif
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+@@ -4516,6 +4527,7 @@
+ 
+     JSRuntime *rt = ctx->rt;
+     JSStackFrame *saved = rt->current_stack_frame;
++    regvm_light_seal(rt, rt->regvm_cur);
+     target->rv_light = rt->regvm_cur;
+     target->rv_rec = NULL;
+     rt->regvm_cur = NULL;
+@@ -9284,6 +9296,7 @@
+     }
+     prev_sf = rt->current_stack_frame;
+     sf->prev_frame = prev_sf;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = NULL;
+     rt->regvm_cur = NULL;
+@@ -9415,6 +9428,7 @@
+ 
+     prev_sf = rt->current_stack_frame;
+     sf->prev_frame = prev_sf;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = NULL;
+     rt->regvm_cur = NULL;
+@@ -22434,6 +22448,7 @@
+ 
+     prev_sf = rt->current_stack_frame;
+     sf->prev_frame = prev_sf;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = NULL;
+     rt->regvm_cur = NULL;
+@@ -25967,8 +25982,6 @@
+                     int na, JSValue **out_regs);
+ static __attribute__((noinline)) uint8_t *REGVM_CC
+ regvm_t_return_light_nested(REGVM_ARGS);
+-static __attribute__((noinline)) uint8_t *REGVM_CC
+-regvm_t_return_light_chunk(REGVM_ARGS);
+ #endif
+ #if defined(QJS_REGVM_COUNT)
+ /*
+@@ -26561,16 +26574,11 @@
+             int dst = (uint16_t)hp;
+             uint8_t *rip = f->ret_ip;
+             JSValue v = FR(s);
+-            size_t top = (size_t)((uint8_t *)f
+-                                  - (uint8_t *)ctx->rt->regvm_frames);
+ 
+-            /* the frame is popped here; nothing reads its register again */
+-            ctx->rt->regvm_frames_top = top;
+-            if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
+-                f->ret = v;
+-                __attribute__((musttail))
+-                    return regvm_t_return_light_chunk(REGVM_PASS);
+-            }
++            /*
++             * Step 10: a light frame lives above the arena top, so popping it
++             * is only dropping the pointer -- no top store, no chunk pop.
++             */
+             ctx->rt->regvm_cur = c;
+             *(JSValue *)((uint8_t *)c->fr + dst) = v;
+             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
+@@ -26632,15 +26640,8 @@
+             JSRegRun *c = f->caller;
+             int dst = (uint16_t)hp;
+             uint8_t *rip = f->ret_ip;
+-            size_t top = (size_t)((uint8_t *)f
+-                                  - (uint8_t *)ctx->rt->regvm_frames);
+ 
+-            ctx->rt->regvm_frames_top = top;
+-            if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
+-                f->ret = JS_UNDEFINED;
+-                __attribute__((musttail))
+-                    return regvm_t_return_light_chunk(REGVM_PASS);
+-            }
++            /* Step 10: dropping a light frame does not touch the arena top. */
+             ctx->rt->regvm_cur = c;
+             *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
+             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
+@@ -27057,6 +27058,7 @@
+         JS_ThrowOutOfMemory(ctx);
+         T_FAIL();
+     }
++    regvm_light_seal(ctx->rt, f);
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
+         /*
+          * R7: no record. If frames are live under this one, the arena is full and
+@@ -27116,6 +27118,7 @@
+         JS_ThrowOutOfMemory(ctx);
+         T_FAIL();
+     }
++    regvm_light_seal(ctx->rt, f);
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
+         /*
+          * R7: no record. If frames are live under this one, the arena is full and
+@@ -27159,19 +27162,55 @@
+  * it automatically.
+  */
+ static __attribute__((always_inline)) inline JSRegRun *
+-regvm_light_alloc(JSRuntime *rt, JSFunctionBytecode *cb)
++regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
+ {
+-    size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
+-    size_t ntop = top + cb->regvm_light_need;
+     JSRegRun *nf;
+ 
+-    if (unlikely(ntop > rt->regvm_frames_size))
++    if (unlikely(f->caller == NULL)) {
++        /*
++         * The activation's entry record lives on the C stack, not in the
++         * arena, so there is no frame to sit above: take the frame from the
++         * arena top as before. This is the cold side; a light caller uses the
++         * caller's own frame end and never reads or writes the top.
++         */
++        size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
++
++        nf = (JSRegRun *)(rt->regvm_frames + top);
++        if (unlikely((uint8_t *)nf + cb->regvm_light_need
++                     > rt->regvm_chunk_end))
++            return NULL;
++        rt->regvm_frames_top = top + cb->regvm_light_need;
++        return nf;
++    }
++    /* Step 10: the caller's frame is the topmost thing in the arena, so the
++       callee starts exactly at the caller's end. */
++    nf = (JSRegRun *)((uint8_t *)f->fr + f->b->regvm_end_off);
++    if (unlikely((uint8_t *)nf + cb->regvm_light_need > rt->regvm_chunk_end))
+         return NULL;
+-    nf = (JSRegRun *)(rt->regvm_frames + top);
+-    rt->regvm_frames_top = ntop;
+     return nf;
+ }
+ 
++/*
++ * Step 10: a light frame sits above `regvm_frames_top` (which still names the
++ * top of the record region). Before anything else allocates from the arena, or
++ * before the light chain is saved across a C call, raise the top over it.
++ */
++static inline void regvm_light_seal(JSRuntime *rt, JSRegRun *lf)
++{
++    if (lf != NULL && lf->sf == NULL) {
++        size_t top = (size_t)((uint8_t *)lf->fr - rt->regvm_frames)
++                   + lf->b->regvm_end_off;
++
++        /* A light frame's record-shaped end can sit past this chunk's end (its
++           light shape fits, its end_off does not). Clamp so a later chunk pop
++           does not restore a top past the chunk. */
++        if (top > rt->regvm_frames_size)
++            top = rt->regvm_frames_size;
++        if (top > rt->regvm_frames_top)
++            rt->regvm_frames_top = top;
++    }
++}
++
+ /* Build the callee light frame and return it, or NULL when the arena chunk is
+    full. Inline into the two handlers so neither carries a frame. */
+ static __attribute__((always_inline)) inline JSRegRun *
+@@ -27179,7 +27218,7 @@
+                   JSRegRun *f, int d, uint8_t *ret_ip,
+                   JSValue *oargv, int na, JSValue **out_regs)
+ {
+-    JSRegRun *nf = regvm_light_alloc(ctx->rt, cb);
++    JSRegRun *nf = regvm_light_alloc(ctx->rt, f, cb);
+     JSValue *regs;
+     int k, vc, nregs;
+ 
+@@ -27288,29 +27327,10 @@
+  * Plan 5.6: leaving a light frame. A light frame owns only its variable area
+  * (arguments are borrowed, registers borrow under DRC, there are no cells and
+  * no control records). The trivial form has an empty variable area and no
+- * release at all, so it stays frameless; the nested form runs the walk. The
+- * arena top is restored to the frame's own header, which is exactly where the
+- * caller's window ends, and `regvm_cur` falls back to the caller when the
+- * caller is itself light.
++ * release at all, so it stays frameless; the nested form runs the walk.
++ * `regvm_cur` falls back to the caller when the caller is itself light.
+  */
+ static __attribute__((noinline)) uint8_t *REGVM_CC
+-regvm_t_return_light_chunk(REGVM_ARGS)
+-{
+-    JSRegRun *c = f->caller;
+-    int dst = f->ret_dst;
+-    uint8_t *rip = f->ret_ip;
+-    JSValue v = f->ret;
+-
+-    regvm_arena_pop_chunk(ctx->rt);
+-    ctx->rt->regvm_cur = c;
+-    *(JSValue *)((uint8_t *)c->fr + dst) = v;
+-    ctx->rt->regvm_tail_chain = 0;
+-    f = c;
+-    __attribute__((musttail))
+-        return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+-}
+-
+-static __attribute__((noinline)) uint8_t *REGVM_CC
+ regvm_t_return_light_nested(REGVM_ARGS)
+ {
+     JSRegRun *c = f->caller;
+@@ -27329,13 +27349,8 @@
+     for (p = f->var_buf; p < end; p++)
+         if (REGVM_HAS_COUNT(*p))
+             JS_FreeValueRT(ctx->rt, *p);
+-    {
+-        size_t top = (size_t)((uint8_t *)f - (uint8_t *)ctx->rt->regvm_frames);
+-
+-        ctx->rt->regvm_frames_top = top;
+-        if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
+-            regvm_arena_pop_chunk(ctx->rt);
+-    }
++    /* Step 10: a light frame is above the arena top; releasing it is only
++       dropping the pointer, so there is no top store and no chunk pop. */
+     ctx->rt->regvm_cur = c;
+     *(JSValue *)((uint8_t *)c->fr + dst) = v;
+ #if QJS_DRC
+@@ -27389,6 +27404,7 @@
+                                   nb ? nb->inst_inline_cap : 0);
+     if (JS_IsException(obj))
+         T_FAIL();
++    regvm_light_seal(ctx->rt, f);
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
+         if (regvm_arena_busy(ctx->rt)) {
+             JS_FreeValue(ctx, obj);
+@@ -27825,6 +27841,7 @@
+         JS_ThrowOutOfMemory(ctx);
+         T_FAIL();
+     }
++    regvm_light_seal(ctx->rt, f);
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
+         JSValue ret_val;
+         if (regvm_arena_busy(ctx->rt)) {
+@@ -29569,6 +29586,7 @@
+         ctx->rt->regvm_cur = prev_light;
+         ctx->rt->current_stack_frame = prev_sf;
+     }
++    regvm_light_seal(ctx->rt, f);
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 1, &lay) != 0)) {
+         for (k = 0; k < na; k++)
+             JS_FreeValue(ctx, args[k]);
+@@ -29637,6 +29655,7 @@
+         ctx->rt->current_stack_frame = prev_sf;
+     }
+     /* two slots past the arguments: the receiver, then the callee object */
++    regvm_light_seal(ctx->rt, f);
+     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
+         for (k = 0; k < na; k++)
+             JS_FreeValue(ctx, args[k]);
+@@ -29729,6 +29748,7 @@
+     }
+     rt->regvm_chunk = NULL;
+     rt->regvm_chunks_bytes = 0;
++    rt->regvm_chunk_end = NULL;
+ }
+ 
+ static no_inline uint8_t *regvm_arena_push_slow(JSRuntime *rt, size_t need)
+@@ -29762,6 +29782,7 @@
+         rt->regvm_chunk = c;
+         rt->regvm_frames = regvm_chunk_data(c);
+         rt->regvm_frames_size = cap;
++        rt->regvm_chunk_end = rt->regvm_frames + cap;
+         rt->regvm_frames_top = need;
+         return rt->regvm_frames;
+     }
+@@ -29792,6 +29813,7 @@
+     rt->regvm_chunk = c;
+     rt->regvm_frames = regvm_chunk_data(c);
+     rt->regvm_frames_size = c->size;
++    rt->regvm_chunk_end = rt->regvm_frames + c->size;
+     rt->regvm_frames_top = need;
+     return rt->regvm_frames;
+ }
+@@ -29823,6 +29845,7 @@
+     rt->regvm_chunk = p;
+     rt->regvm_frames = regvm_chunk_data(p);
+     rt->regvm_frames_size = p->size;
++    rt->regvm_chunk_end = rt->regvm_frames + p->size;
+     rt->regvm_frames_top = p->saved_top;
+ }
+ 
+@@ -30277,6 +30300,16 @@
+         }
+     }
+ #endif
++    /* Step 10: the distance from `fr` to the frame's end, for both shapes. */
++    {
++        size_t rec = (size_t)(b->regvm_reg_count + REGVM_HS) * sizeof(JSValue)
++                   + (size_t)b->var_ref_count * sizeof(JSVarRef *)
++                   + (size_t)b->regvm_ctl_count * sizeof(JSRegCtl);
++        size_t lite = (size_t)b->regvm_reg_count * sizeof(JSValue);
++        size_t off = rec > lite ? rec : lite;
++
++        b->regvm_end_off = (uint32_t)((off + 15) & ~(size_t)15);
++    }
+ #endif
+ #if QJS_AOT
+     /* Bind the generated entry, if any, now that the bytecode is final. A
+@@ -30440,6 +30473,7 @@
+ #endif
+     sf->cur_pc = NULL;
+     sf->prev_frame = rt->current_stack_frame;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = rec;
+     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+@@ -30589,6 +30623,7 @@
+ #endif
+     sf->cur_pc = NULL;
+     sf->prev_frame = rt->current_stack_frame;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = rec;
+     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+@@ -37083,6 +37118,7 @@
+             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
+             pc = sf->cur_pc;
+             sf->prev_frame = rt->current_stack_frame;
++            regvm_light_seal(rt, rt->regvm_cur);
+             sf->rv_light = rt->regvm_cur;
+             sf->rv_rec = NULL;
+             rt->regvm_cur = NULL;
+@@ -37222,6 +37258,7 @@
+     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
+     sf->cur_pc = NULL;
+     sf->prev_frame = rt->current_stack_frame;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = NULL;
+     rt->regvm_cur = NULL;
+@@ -60933,6 +60970,7 @@
+     pc = b->byte_code_buf;
+     sf->cur_pc = NULL;
+     sf->prev_frame = rt->current_stack_frame;
++    regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = NULL;
+     rt->regvm_cur = NULL;

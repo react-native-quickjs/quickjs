@@ -1,0 +1,194 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29053,8 +29053,42 @@
+                  T_SZ_BRRT)
+ T_DEF_CMP_BRANCH(branch_cmp_reg_reg_s, T_U8(1), T_REG8(2), T_REG8(3),
+                  T_OFF8(4), T_SZ_BRRT_S)
+-T_DEF_CMP_BRANCH(branch_lt_s,   REG_BIN_LT,  T_REG8(1), T_REG8(2), T_OFF8(3),
+-                 T_SZ_RRT_S)
++/*
++ * Step 3.1: the counted loop's latch is a compare-and-branch whose operands are
++ * ints in every hot loop, so the whole `_s` family gets the same int-only fast
++ * path `branch_nlt_s` got in Step 2: one 4-byte operand decode, one combined
++ * tag test, a 32-bit payload compare, and a tail call to the generic slow
++ * handler for the float, string and engine cases.
++ */
++#define T_DEF_CMP_BRANCH_INT(NAME, SUBEXPR, CMPEXPR) \
++    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
++    { \
++        int _sub = (SUBEXPR); \
++        int _la = T_REG8(1), _rb = T_REG8(2); \
++        int32_t _off = T_OFF8(3); \
++        int _take = regvm_cmp_take(ctx, _sub, FR(_la), FR(_rb)); \
++        if (unlikely(_take < 0)) T_FAIL(); \
++        T_NEXT(T_SZ_RRT_S + (_take ? _off : 0)); \
++    } \
++    static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
++    { \
++        uint32_t _w; \
++        int _la, _rb; \
++        int32_t _off, _a, _b; \
++        memcpy(&_w, ip, 4); \
++        _la = (int)((_w >> 8) & 0xff); \
++        _rb = (int)((_w >> 16) & 0xff); \
++        _off = (int32_t)(int8_t)(_w >> 24); \
++        if (likely((JS_VALUE_GET_TAG(FR(_la)) | JS_VALUE_GET_TAG(FR(_rb))) == 0)) { \
++            _a = JS_VALUE_GET_INT(FR(_la)); \
++            _b = JS_VALUE_GET_INT(FR(_rb)); \
++            if (CMPEXPR) { T_BR_NEXT(T_SZ_RRT_S + _off); } \
++            T_NEXT(T_SZ_RRT_S); \
++        } \
++        __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
++    }
++
++T_DEF_CMP_BRANCH_INT(branch_lt_s,   REG_BIN_LT,  _a < _b)
+ /*
+  * Step 2.1: `branch_nlt_s` is the counted loop's test and is almost always two
+  * ints. Decode the three operands with one load, test both tags together, and
+@@ -29092,22 +29126,15 @@
+     }
+     __attribute__((musttail)) return regvm_t_branch_nlt_s_slow(REGVM_PASS);
+ }
+-T_DEF_CMP_BRANCH(branch_lte_s,  REG_BIN_LTE, T_REG8(1), T_REG8(2), T_OFF8(3),
+-                 T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_nlte_s, REG_BIN_LTE | REG_CMP_INVERT, T_REG8(1),
+-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_gt_s,   REG_BIN_GT,  T_REG8(1), T_REG8(2), T_OFF8(3),
+-                 T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_ngt_s,  REG_BIN_GT | REG_CMP_INVERT, T_REG8(1),
+-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_gte_s,  REG_BIN_GTE, T_REG8(1), T_REG8(2), T_OFF8(3),
+-                 T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_ngte_s, REG_BIN_GTE | REG_CMP_INVERT, T_REG8(1),
+-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_eq_s,   REG_BIN_EQ,  T_REG8(1), T_REG8(2), T_OFF8(3),
+-                 T_SZ_RRT_S)
+-T_DEF_CMP_BRANCH(branch_neq_s,  REG_BIN_NEQ, T_REG8(1), T_REG8(2), T_OFF8(3),
+-                 T_SZ_RRT_S)
++T_DEF_CMP_BRANCH_INT(branch_lte_s,  REG_BIN_LTE, _a <= _b)
++T_DEF_CMP_BRANCH_INT(branch_nlte_s, REG_BIN_LTE | REG_CMP_INVERT, _a > _b)
++T_DEF_CMP_BRANCH_INT(branch_gt_s,   REG_BIN_GT,  _a > _b)
++T_DEF_CMP_BRANCH_INT(branch_ngt_s,  REG_BIN_GT | REG_CMP_INVERT, _a <= _b)
++T_DEF_CMP_BRANCH_INT(branch_gte_s,  REG_BIN_GTE, _a >= _b)
++T_DEF_CMP_BRANCH_INT(branch_ngte_s, REG_BIN_GTE | REG_CMP_INVERT, _a < _b)
++T_DEF_CMP_BRANCH_INT(branch_eq_s,   REG_BIN_EQ,  _a == _b)
++T_DEF_CMP_BRANCH_INT(branch_neq_s,  REG_BIN_NEQ, _a != _b)
++#undef T_DEF_CMP_BRANCH_INT
+ #undef T_DEF_CMP_BRANCH
+ 
+ /*
+@@ -63055,8 +63082,10 @@
+             continue;
+         if (br->ops[0] < 0 || br->ops[0] >= n_pcs)
+             continue;
++        if (br->ops[0] >= ir->insns[i].src_pc)
++            continue;                       /* backward edges only (program order) */
+         ti = pc_to_insn[br->ops[0]];
+-        if (ti < 0 || ti >= i)              /* backward edges only */
++        if (ti < 0 || ti >= n)
+             continue;
+         switch (ir->insns[ti].rop) {
+         case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
+@@ -63083,6 +63112,92 @@
+ }
+ 
+ /*
++ * Step 3.1: one branch per iteration. The loop is laid out test-at-top with an
++ * unconditional back edge to the test, so every iteration runs the conditional
++ * test (not taken) and the unconditional jump (taken). Duplicate the test,
++ * inverted, at the latch: the back edge becomes the conditional branch itself,
++ * and the original test stays and runs once on entry. This is the narrow
++ * "duplicate the test at the latch" form, not a block reordering.
++ *
++ * Refused unless the back edge's target is exactly one compare-and-branch that
++ * nothing else but the entry and the latch reaches, and the exit immediately
++ * follows the latch (a fall-through there is the exit; otherwise the copy would
++ * need an extra branch that the fixed IR array cannot insert). The duplicated
++ * comparison performs the same one evaluation per iteration the original did.
++ */
++static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
++                                   int n_pcs, int n_values)
++{
++    int n = ir->insns ? ir->n_insns : 0, i, p;
++    int *insn_pc = NULL;
++    int *is_target = NULL;
++
++    if (n < 3 || n_values <= 0)
++        return;
++    insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
++    is_target = js_mallocz(ctx, (size_t)n * sizeof(int));
++    if (!insn_pc || !is_target)
++        goto done;
++    for (i = 0; i < n; i++)
++        insn_pc[i] = -1;
++    for (p = 0; p < n_pcs; p++) {
++        int ti = pc_to_insn[p];
++        if (ti >= 0 && ti < n && insn_pc[ti] < 0)
++            insn_pc[ti] = p;
++    }
++    for (i = 0; i < n; i++) {
++        JSRegInsn *in = &ir->insns[i];
++        const char *fmt = regvm_rop_fmt[in->rop];
++        int k;
++
++        for (k = 0; fmt && fmt[k]; k++) {
++            if (fmt[k] == 't') {
++                int ti = (in->ops[k] >= 0 && in->ops[k] < n_pcs)
++                             ? pc_to_insn[in->ops[k]] : -1;
++                if (ti >= 0 && ti < n && ti != i)
++                    is_target[ti]++;
++            }
++        }
++    }
++    for (i = 0; i < n; i++) {
++        JSRegInsn *br = &ir->insns[i];
++        JSRegInsn *test;
++        int t, exit, nxt;
++
++        if (br->rop != ROP_branch || br->n_ops != 1)
++            continue;
++        if (br->ops[0] < 0 || br->ops[0] >= n_pcs)
++            continue;
++        if (br->ops[0] >= ir->insns[i].src_pc)
++            continue;                       /* backward edges only (program order) */
++        t = pc_to_insn[br->ops[0]];
++        if (t < 0 || t >= n)
++            continue;
++        test = &ir->insns[t];
++        if (test->rop != ROP_branch_cmp_reg_reg)
++            continue;                       /* the header must be the test */
++        if (is_target[t] > 2)               /* entry + latch only */
++            continue;
++        exit = (test->ops[3] >= 0 && test->ops[3] < n_pcs)
++                   ? pc_to_insn[test->ops[3]] : -1;
++        if (exit != i + 1)
++            continue;                       /* the exit must follow the latch */
++        nxt = t + 1;
++        if (nxt >= i || insn_pc[nxt] < 0)
++            continue;
++        br->rop = ROP_branch_cmp_reg_reg;
++        br->n_ops = 4;
++        br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
++        br->ops[1] = test->ops[1];
++        br->ops[2] = test->ops[2];
++        br->ops[3] = insn_pc[nxt];
++    }
++ done:
++    js_free(ctx, insn_pc);
++    js_free(ctx, is_target);
++}
++
++/*
+  * X2: register operands are byte offsets into the register file, so a field's
+  * width limits the registers it can name -- one byte reaches register 15, two
+  * bytes reach register 4095.
+@@ -67297,6 +67412,8 @@
+                            n_values, ireg);
+     regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                            n_values, ireg);
++    regvm_rotate_loop_test(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
++                           n_values);
+     /*
+      * Forward a frame read to a value still resident in its register.
+      *

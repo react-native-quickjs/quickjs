@@ -1,0 +1,87 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25030,6 +25030,16 @@
+     uint8_t *resume_marker;
+ } JSRegRun;
+ 
++/*
++ * Step 2: the header's four narrow fields are composed into `hdr_pack` by
++ * explicit shifts, which assumes the fields sit in order at these offsets.
++ */
++_Static_assert(offsetof(JSRegRun, ret_dst) == offsetof(JSRegRun, hdr_pack) &&
++               offsetof(JSRegRun, argc) == offsetof(JSRegRun, hdr_pack) + 2 &&
++               offsetof(JSRegRun, flags) == offsetof(JSRegRun, hdr_pack) + 4 &&
++               offsetof(JSRegRun, nctl) == offsetof(JSRegRun, hdr_pack) + 6,
++               "hdr_pack field order");
++
+ #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
+ /*
+  * Plan 5.5: walk one light chain, innermost first, publishing each frame's
+@@ -26495,15 +26505,16 @@
+ #if QJS_REGVM_RECORD
+     /* Plan 5.6: a light frame has no JSStackFrame and no record release walk. */
+     if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
++        uint64_t hp = f->hdr_pack;
+         /*
+          * A frame that owns nothing moves the value straight into the caller's
+          * register. The separate `regvm_t_return_light` round-trips it through
+          * `f->ret` and needs a tail call; fusing the trivial case here keeps
+          * the value in a register and drops both.
+          */
+-        if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
++        if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_TRIVIAL_RET)) {
+             JSRegRun *c = f->caller;
+-            int dst = f->ret_dst;
++            int dst = (uint16_t)hp;
+             uint8_t *rip = f->ret_ip;
+             JSValue v = FR(s);
+             size_t top = (size_t)((uint8_t *)f
+@@ -26570,11 +26581,12 @@
+ #if QJS_REGVM_RECORD
+     /* Plan 5.6: a light frame returns through its own handlers. */
+     if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
++        uint64_t hp = f->hdr_pack;
+         /* Same fusion as `regvm_t_return`: a frame that owns nothing moves
+            `undefined` straight into the caller's register. */
+-        if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
++        if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_TRIVIAL_RET)) {
+             JSRegRun *c = f->caller;
+-            int dst = f->ret_dst;
++            int dst = (uint16_t)hp;
+             uint8_t *rip = f->ret_ip;
+             size_t top = (size_t)((uint8_t *)f
+                                   - (uint8_t *)ctx->rt->regvm_frames);
+@@ -27098,9 +27110,6 @@
+     nf->pic = cb->regvm_pic;
+     nf->var_refs = co->u.func.var_refs;
+     nf->arg_buf = oargv;
+-    nf->ret_dst = d;
+-    nf->argc = na;
+-    nf->nctl = 0;
+     nf->func = co;
+     nf->cap_ip = NULL;
+     nf->sf = NULL;
+@@ -27129,9 +27138,19 @@
+     } else {
+         nf->fr = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
+     }
+-    nf->flags = REGVM_FLAG_LIGHT;
+-    if (vc == 0)
+-        nf->flags |= REGVM_FLAG_TRIVIAL_RET;
++    /*
++     * Step 2: the four narrow header fields go out as one 64-bit store.
++     * `nctl` is 0; `d` and `na` are the call's own 16-bit operands.
++     */
++    {
++        uint16_t hflags = REGVM_FLAG_LIGHT;
++
++        if (vc == 0)
++            hflags |= REGVM_FLAG_TRIVIAL_RET;
++        nf->hdr_pack = (uint64_t)(uint16_t)d
++                     | ((uint64_t)(uint16_t)na << 16)
++                     | ((uint64_t)hflags << 32);
++    }
+     /*
+      * Fill the variable area and the register file with `undefined`. Every
+      * register must hold a valid, uncounted word before the program runs (the

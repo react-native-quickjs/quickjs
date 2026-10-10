@@ -43,6 +43,20 @@ CHECKSUM_WANT=546.1008391043414
 
 S="$ROOT/engine/quickjs-ng/quickjs.c $ROOT/engine/quickjs-ng/libregexp.c $ROOT/engine/quickjs-ng/libunicode.c $ROOT/engine/quickjs-ng/dtoa.c"
 R="-O3 -DNDEBUG -std=gnu11 -D_GNU_SOURCE -I$ROOT/engine/quickjs-ng"
+# The gate's own timing binaries carry the x86 branch-alignment workaround when
+# clang is the compiler. Without it a hot handler's dispatch jump can land on a
+# 32-byte boundary, and the Skylake jump-erratum microcode makes the same code
+# several cycles per iteration slower, so a cost line could move because of an
+# unrelated edit's code placement. Measurement only: the product build flags are
+# not touched, and the correctness binaries are built as before.
+TALIGN=""
+case "$(uname -m 2>/dev/null)" in
+    x86_64|amd64|i[3-6]86)
+        case "$CC" in
+            clang|clang-*) TALIGN="-mbranches-within-32B-boundaries" ;;
+        esac
+        ;;
+esac
 # EXTRA carries the configuration under test beyond the defaults: the phase-2
 # threaded dispatch is gated as EXTRA=-DQJS_REGVM_THREAD=1.
 REGFLAGS="-DQJS_REGVM=1 -DQJS_REGVM_VERIFY=1 -DQJS_REGVM_KNOBS=1 ${EXTRA:-}"
@@ -56,9 +70,9 @@ lt()   { [ "$(awk -v a="$1" -v b="$2" 'BEGIN{print (a<b)}')" = 1 ]; }
 if [ "${SKIP_BUILD:-0}" != 1 ]; then
     note "== build ($CC)"
     # shellcheck disable=SC2086
-    $CC $R $REGFLAGS -o "$WORK/bref"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
+    $CC $R $TALIGN $REGFLAGS -o "$WORK/bref"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
     # shellcheck disable=SC2086
-    $CC $R             -o "$WORK/bstk"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
+    $CC $R $TALIGN             -o "$WORK/bstk"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
     # shellcheck disable=SC2086
     $CC $R $REGFLAGS -o "$WORK/run1"   "$ROOT/.local/regvm-build/regvm-run.c" $S -lm
     # shellcheck disable=SC2086

@@ -1,0 +1,88 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -10157,21 +10157,32 @@
+  */
+ #if QJS_DRC
+ /*
+- * Checked inline at every backward branch, so the check costs three loads and a
+- * compare and, crucially, never makes the branch handler spill its state: the
+- * rare reconcile is a *tail call* into `regvm_t_safepoint_slow`, which runs the
+- * reconcile and re-enters the chain at the branch target. A non-tail call here
+- * would force the handler to preserve ip/fr/f/ctx across it, which is exactly
+- * the per-dispatch shuffle the frameless discipline exists to avoid.
+- */
+-#define REGVM_DRC_BACKEDGE(rt_, off_)                                        \
+-    do { if (unlikely((off_) < 0) &&                                         \
+-             unlikely((rt_)->zct_len + (rt_)->zct_nobj >                     \
+-                      (rt_)->zct_limit)) {                                   \
+-        return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx); }            \
+-    } while (0)
++ * Checked inline at every backward branch. A backward edge must also reach the
++ * interrupt handler, or a loop with no calls is uninterruptible and a watchdog
++ * cannot stop a runaway script: it decrements `interrupt_counter` and takes the
++ * poll (which runs the deferred-reference-count safepoint too) when the counter
++ * hits zero. The DRC check stays separate because its limit bounds the parked
++ * set between polls. Both slow paths are tail calls, so the branch handlers
++ * stay frameless.
++ */
++#define REGVM_DRC_BACKEDGE(ctx_, off_)                                       \
++    do { if (unlikely((off_) <= 0)) {                                         \
++        if (unlikely(--(ctx_)->interrupt_counter <= 0)) {                    \
++            __attribute__((musttail))                                        \
++                return regvm_t_interrupt_slow(ip + (off_), fr, f, ctx_);     \
++        }                                                                    \
++        if (unlikely((ctx_)->rt->zct_len + (ctx_)->rt->zct_nobj >            \
++                      (ctx_)->rt->zct_limit)) {                              \
++            return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx_);         \
++        }                                                                    \
++    } } while (0)
+ #else
+-#define REGVM_DRC_BACKEDGE(rt_, off_) ((void)0)
++#define REGVM_DRC_BACKEDGE(ctx_, off_)                                       \
++    do { if (unlikely((off_) <= 0) &&                                         \
++             unlikely(--(ctx_)->interrupt_counter <= 0)) {                   \
++        __attribute__((musttail))                                            \
++            return regvm_t_interrupt_slow(ip + (off_), fr, f, ctx_);         \
++    } } while (0)
+ #endif
+ 
+ /* called with the ref_count of 'v' reaches zero. */
+@@ -25495,6 +25506,19 @@
+  * register file does not move across a reconcile, so re-entering the chain at
+  * `ip` (the branch target) is safe.
+  */
++/*
++ * The back-edge interrupt poll: the counter in `ctx` reached zero, so run the
++ * handler (and the deferred-reference-count safepoint inside it) and re-enter
++ * the chain at the branch target. A tail call, so the branch handlers stay
++ * frameless.
++ */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_interrupt_slow(REGVM_ARGS)
++{
++    if (__js_poll_interrupts(ctx) < 0)
++        T_FAIL();
++    __attribute__((musttail)) return regvm_t_dispatch(ip, fr, f, ctx);
++}
++
+ #if QJS_DRC
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_ARGS)
+ {
+@@ -25510,7 +25534,7 @@
+    itself, which counts it and executes it there. */
+ #define T_NEXT(off) do { \
+         int32_t _t_off = (off); \
+-        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
++        REGVM_DRC_BACKEDGE(ctx, _t_off); \
+         __attribute__((musttail)) \
+             return regvm_t_dispatch(ip + _t_off, fr, f, ctx); \
+     } while (0)
+@@ -25533,7 +25557,7 @@
+  */
+ #define T_BR_NEXT(off) do { \
+         int32_t _t_off = (off); \
+-        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
++        REGVM_DRC_BACKEDGE(ctx, _t_off); \
+         uint8_t *_nip = ip + _t_off; \
+         __asm__ volatile("" : "+r"(_nip)); \
+         __attribute__((musttail)) \

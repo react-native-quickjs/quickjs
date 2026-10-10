@@ -1,0 +1,134 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1614,6 +1614,7 @@
+        size of a light frame: the 9-slot prefix, the variable area and the
+        register file (arguments are always borrowed when light). */
+     uint8_t regvm_light;
++    uint8_t regvm_light_fast; /* light, and its PIC needs no lazy allocation */
+     uint32_t regvm_light_need;
+ #endif
+ #if QJS_AOT_PROFILE
+@@ -7850,6 +7851,7 @@
+         regvm_pic_entry_reset(rt, &b->regvm_pic[i], &b->regvm_pic_holder[i]);
+     js_free_rt(rt, b->regvm_pic);
+     b->regvm_pic = NULL;
++    b->regvm_light_fast = b->regvm_light && b->regvm_pic_count == 0;
+     js_free_rt(rt, b->regvm_pic_holder);
+     b->regvm_pic_holder = NULL;
+ }
+@@ -7884,6 +7886,7 @@
+         }
+         b->regvm_pic = t;
+         b->regvm_pic_holder = h;
++        b->regvm_light_fast = b->regvm_light;
+         js_fnbc_gc_force_trace(rt, b); /* before the caller stores a JSShape */
+     }
+     return t;
+@@ -25040,7 +25043,7 @@
+          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
+         JSFunctionBytecode *b = lf->b;
+         if (lf->fr && b->regvm_reg_count)
+-            fn(opaque, lf->fr, b->regvm_reg_count + REGVM_HS - 1);
++            fn(opaque, lf->fr, b->regvm_reg_count);
+     }
+ }
+ #endif
+@@ -26489,7 +26492,7 @@
+             size_t top = (size_t)((uint8_t *)f
+                                   - (uint8_t *)ctx->rt->regvm_frames);
+ 
+-            FR(s) = JS_UNDEFINED;
++            /* the frame is popped here; nothing reads its register again */
+             ctx->rt->regvm_frames_top = top;
+             if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
+                 f->ret = v;
+@@ -26498,7 +26501,8 @@
+             }
+             ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+             *(JSValue *)((uint8_t *)c->fr + dst) = v;
+-            ctx->rt->regvm_tail_chain = 0;
++            /* No `regvm_tail_chain` reset: a light frame never tail-calls and
++               its return does not end the caller's chain. */
+             f = c;
+             __attribute__((musttail))
+                 return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+@@ -26566,7 +26570,8 @@
+             }
+             ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+             *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
+-            ctx->rt->regvm_tail_chain = 0;
++            /* No `regvm_tail_chain` reset: a light frame never tail-calls and
++               its return does not end the caller's chain. */
+             f = c;
+             __attribute__((musttail))
+                 return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+@@ -26810,15 +26815,12 @@
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+             JSFunctionBytecode *cb = co->u.func.function_bytecode;
+-            if (likely(regvm_record_eligible(cb))) {
+-                if (likely(cb->regvm_light)
+-                    && likely(cb->regvm_pic != NULL
+-                              || cb->regvm_pic_count == 0))
+-                    __attribute__((musttail))
+-                        return regvm_t_call_light(REGVM_PASS);
++            if (likely(cb->regvm_light_fast))
++                __attribute__((musttail))
++                    return regvm_t_call_light(REGVM_PASS);
++            if (likely(regvm_record_eligible(cb)))
+                 __attribute__((musttail))
+                     return regvm_t_call_record(REGVM_PASS);
+-            }
+             __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
+         }
+     }
+@@ -26837,15 +26839,12 @@
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+             JSFunctionBytecode *cb = co->u.func.function_bytecode;
+-            if (likely(regvm_record_eligible(cb))) {
+-                if (likely(cb->regvm_light)
+-                    && likely(cb->regvm_pic != NULL
+-                              || cb->regvm_pic_count == 0))
+-                    __attribute__((musttail))
+-                        return regvm_t_call_method_light(REGVM_PASS);
++            if (likely(cb->regvm_light_fast))
++                __attribute__((musttail))
++                    return regvm_t_call_method_light(REGVM_PASS);
++            if (likely(regvm_record_eligible(cb)))
+                 __attribute__((musttail))
+                     return regvm_t_call_method_record(REGVM_PASS);
+-            }
+             __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
+         }
+     }
+@@ -27126,7 +27125,8 @@
+     for (k = 0; k < vc; k++)
+         nf->var_buf[k] = JS_UNDEFINED;
+     regs = nf->fr;
+-    nregs = cb->regvm_reg_count + REGVM_HS;
++    /* a light frame never suspends, so it has no handshake slots */
++    nregs = cb->regvm_reg_count;
+     for (k = 0; k + 1 < nregs; k += 2) {
+         regs[k] = JS_UNDEFINED;
+         regs[k + 1] = JS_UNDEFINED;
+@@ -30150,6 +30150,7 @@
+      * field or the (absent) JSStackFrame.
+      */
+     b->regvm_light = 0;
++    b->regvm_light_fast = 0;
+     b->regvm_light_need = 0;
+ #if QJS_REGVM_RECORD
+ #if QJS_DRC
+@@ -30169,7 +30170,9 @@
+             b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
+                 + sizeof(JSValue)
+                     * (size_t)((lvc ? b->var_count : 0)
+-                               + b->regvm_reg_count + REGVM_HS);
++                               + b->regvm_reg_count);
++            b->regvm_light_fast = (b->regvm_pic != NULL
++                                   || b->regvm_pic_count == 0);
+         }
+     }
+ #endif

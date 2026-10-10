@@ -1,0 +1,16 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27257,8 +27257,11 @@
+          * would be pointer arithmetic on a null pointer. Test for the arena
+          * first and fall back to the record path, which allocates it.
+          */
+-        size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
++        size_t top;
+ 
++        if (unlikely(rt->regvm_frames == NULL))
++            return NULL;
++        top = (rt->regvm_frames_top + 15) & ~(size_t)15;
+         nf = (JSRegRun *)(rt->regvm_frames + top);
+         if (unlikely((uint8_t *)nf + cb->regvm_light_need
+                      > rt->regvm_chunk_end))

@@ -1,0 +1,66 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27084,7 +27084,7 @@
+ static __attribute__((always_inline)) inline JSRegRun *
+ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
+                   JSRegRun *f, int d, uint8_t *ret_ip, JSValueConst this_obj,
+-                  JSValue *oargv, int na)
++                  JSValue *oargv, int na, JSValue **out_regs)
+ {
+     JSRegRun *nf = regvm_light_alloc(ctx->rt, cb);
+     JSValue *regs;
+@@ -27151,6 +27151,7 @@
+     }
+     if (k < nregs)
+         regs[k] = JS_UNDEFINED;
++    *out_regs = regs;
+     return nf;
+ }
+ 
+@@ -27161,18 +27162,19 @@
+     JSObject *co = JS_VALUE_GET_OBJ(cf);
+     JSFunctionBytecode *cb = co->u.func.function_bytecode;
+     JSRegRun *nf;
++    JSValue *regs;
+ 
+     if (unlikely(--ctx->interrupt_counter <= 0))
+         __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+     if (unlikely(na < cb->arg_count))
+         __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+     nf = regvm_light_enter(ctx, co, cb, f, d, ip + 8, JS_UNDEFINED,
+-                           FRP(ab), na);
++                           FRP(ab), na, &regs);
+     if (unlikely(nf == NULL))
+         __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+     ctx->rt->regvm_cur = nf;
+     __attribute__((musttail))
+-        return regvm_t_dispatch(nf->b->regvm_code, nf->fr, nf, cb->realm);
++        return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
+ }
+ 
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS)
+@@ -27184,6 +27186,7 @@
+     JSObject *co = JS_VALUE_GET_OBJ(cf);
+     JSFunctionBytecode *cb = co->u.func.function_bytecode;
+     JSRegRun *nf;
++    JSValue *regs;
+ 
+     if (unlikely(--ctx->interrupt_counter <= 0))
+         __attribute__((musttail))
+@@ -27191,13 +27194,13 @@
+     if (unlikely(na < cb->arg_count))
+         __attribute__((musttail))
+             return regvm_t_call_method_record(REGVM_PASS);
+-    nf = regvm_light_enter(ctx, co, cb, f, d, ip + 10, tv, FRP(ab), na);
++    nf = regvm_light_enter(ctx, co, cb, f, d, ip + 10, tv, FRP(ab), na, &regs);
+     if (unlikely(nf == NULL))
+         __attribute__((musttail))
+             return regvm_t_call_method_record(REGVM_PASS);
+     ctx->rt->regvm_cur = nf;
+     __attribute__((musttail))
+-        return regvm_t_dispatch(nf->b->regvm_code, nf->fr, nf, cb->realm);
++        return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
+ }
+ 
+ /*

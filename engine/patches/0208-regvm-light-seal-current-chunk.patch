@@ -1,0 +1,34 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27246,12 +27246,25 @@
+ static inline void regvm_light_seal(JSRuntime *rt, JSRegRun *lf)
+ {
+     if (lf != NULL && lf->sf == NULL) {
+-        size_t top = (size_t)((uint8_t *)lf->fr - rt->regvm_frames)
+-                   + lf->b->regvm_end_off;
++        size_t top;
+ 
+-        /* A light frame's record-shaped end can sit past this chunk's end (its
+-           light shape fits, its end_off does not). Clamp so a later chunk pop
+-           does not restore a top past the chunk. */
++        /*
++         * Only a frame in the current chunk can be sealed against the current
++         * top. A record call seals its light caller and then pushes; when that
++         * push opens a new chunk, the record fill seals `regvm_cur` again, and
++         * that light frame is now in the previous chunk, already covered by
++         * its `saved_top`. Measuring it against the new chunk's base gave a
++         * huge offset that marked the new chunk full, so every later push
++         * opened another chunk and a light/record recursion ran out of arena
++         * after ~140 frames.
++         */
++        if ((uint8_t *)lf < rt->regvm_frames
++            || (uint8_t *)lf >= rt->regvm_chunk_end)
++            return;
++        top = (size_t)((uint8_t *)lf->fr - rt->regvm_frames)
++            + lf->b->regvm_end_off;
++        /* The record-shaped end can pass the chunk end when only the light
++           shape fits. */
+         if (top > rt->regvm_frames_size)
+             top = rt->regvm_frames_size;
+         if (top > rt->regvm_frames_top)

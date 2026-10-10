@@ -1,0 +1,35 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -28324,9 +28324,12 @@
+     } \
+     static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
+     { \
+-        int d = T_REG(1); \
+-        int r = T_REG(3); \
+-        int site = T_REG(9); \
++        uint32_t dr; \
++        int d, r, site; \
++        memcpy(&dr, ip + 1, 4); \
++        d = (int)(dr & 0xffff); \
++        r = (int)(dr >> 16); \
++        site = T_REG(9); \
+         JSValue val; \
+         if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
+             T_SET_NEXT_B(d, val, T_SZ_RRAS); \
+@@ -28341,9 +28344,12 @@
+        rewrite the opcode back if the site is no longer an own slot. */ \
+     static uint8_t *REGVM_CC regvm_t_##NAME##_own(REGVM_ARGS) \
+     { \
+-        int d = T_REG(1); \
+-        int r = T_REG(3); \
+-        int site = T_REG(9); \
++        uint32_t dr; \
++        int d, r, site; \
++        memcpy(&dr, ip + 1, 4); \
++        d = (int)(dr & 0xffff); \
++        r = (int)(dr >> 16); \
++        site = T_REG(9); \
+         JSValue recv = FR(r); \
+         if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT)) { \
+             JSObject *p = JS_VALUE_GET_OBJ(recv); \

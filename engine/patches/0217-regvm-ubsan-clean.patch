@@ -1,0 +1,77 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3215,6 +3215,18 @@
+     return js_realloc(ctx, ptr, size);
+ }
+ 
++/*
++ * The runtime-keyed twin of the above: `unicode_normalize` takes its allocator
++ * as a `DynBufReallocFunc`, and casting `js_realloc_rt` itself to that type is
++ * a function-pointer type mismatch (UBSan reports the call). A real function
++ * with the right prototype costs nothing -- both sides tail into the same
++ * realloc.
++ */
++static void *js_dbuf_realloc_rt(void *rt, void *ptr, size_t size)
++{
++    return js_realloc_rt(rt, ptr, size);
++}
++
+ static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
+ {
+     dbuf_init2(s, ctx, js_dbuf_realloc);
+@@ -25271,6 +25283,9 @@
+     const uint8_t *lo = rt->regvm_frames;
+     size_t top = rt->regvm_frames_top;
+ 
++    /* no arena yet: nothing is a record */
++    if (lo == NULL)
++        return NULL;
+     /* the newest frames are in the current chunk; older ones in its prev chain */
+     while (p < lo || p >= lo + top) {
+         if (!c || !(c = c->prev))
+@@ -27447,7 +27462,7 @@
+     if (b->var_count <= 255)
+         vc = b->regvm_var_count;
+ #endif
+-    end = f->var_buf + vc;
++    end = vc > 0 ? f->var_buf + vc : f->var_buf;
+     for (p = f->var_buf; p < end; p++)
+         if (REGVM_HAS_COUNT(*p))
+             JS_FreeValueRT(ctx->rt, *p);
+@@ -30349,7 +30364,7 @@
+         if (b->var_count <= 255)
+             vc = b->regvm_var_count;
+ #endif
+-        end = f->var_buf + vc;
++        end = vc > 0 ? f->var_buf + vc : f->var_buf;
+         for (p = f->var_buf; p < end; p++)
+             if (REGVM_HAS_COUNT(*p))
+                 JS_FreeValueRT(ctx->rt, *p);
+@@ -85370,7 +85385,7 @@
+ 
+     // TODO(bnoordhuis) skip normalization when input is latin1
+     an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx,
+-                           (DynBufReallocFunc *)js_realloc);
++                           js_dbuf_realloc);
+     if (an == -1)
+         goto exception;
+     js_free(ctx, as);
+@@ -85378,7 +85393,7 @@
+ 
+     // TODO(bnoordhuis) skip normalization when input is latin1
+     bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx,
+-                           (DynBufReallocFunc *)js_realloc);
++                           js_dbuf_realloc);
+     if (bn == -1)
+         goto exception;
+     js_free(ctx, bs);
+@@ -85558,7 +85573,7 @@
+     }
+ 
+     out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
+-                                ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
++                                ctx->rt, js_dbuf_realloc_rt);
+     js_free(ctx, buf);
+     if (out_len < 0)
+         return JS_EXCEPTION;

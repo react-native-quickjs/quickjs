@@ -759,12 +759,104 @@
       "sha256": "be2daa4db7a7a120552bc208e4ec45c28e9029ac96f3e3644c9da8f751324604"
     },
     {
+      "name": "0195-regvm-light-frame-trim.patch",
+      "sha256": "26c1d36b3d54d4538bffc9515f97c1fbcb7791c23304d56a8a0fcb48880a11ba"
+    },
+    {
+      "name": "0196-regvm-light-frame-bookkeeping.patch",
+      "sha256": "aedce3cfbba75aad07fb974840a78390e2b8912673f2be5552c3cbd629baa515"
+    },
+    {
+      "name": "0197-regvm-debug-arena-skew.patch",
+      "sha256": "af077ecd49dc717fb954956852b150d36c49fd1db343c29366e77eb20281d0f5"
+    },
+    {
+      "name": "0198-regvm-light-entry-values.patch",
+      "sha256": "0f69fd44c3c89cbc559ccff7c4094cededbc9e44c75fa732ca620b96dcf75723"
+    },
+    {
+      "name": "0199-regvm-pack-light-header.patch",
+      "sha256": "832d190b325d732e2b29387c2dde71dfa0a811bc6133c1320b41b903db7a06bf"
+    },
+    {
+      "name": "0200-regvm-fold-light-call-into-classifier.patch",
+      "sha256": "423f60d7a413540ae176d2552bcd04084efcc0d1cefc38f7e126fa485be3749a"
+    },
+    {
+      "name": "0201-regvm-regvm-cur-unconditional.patch",
+      "sha256": "6065c78ef2db669586da28b5d95d5e53122f8755bd776cc6f072ae5da5448819"
+    },
+    {
+      "name": "0202-regvm-this-obj-wide-store.patch",
+      "sha256": "0ee312007f3e5f2f48da3bd0730b59bae6a472259fcd1cfceebacc50fe17ba41"
+    },
+    {
+      "name": "0203-regvm-wide-undefined-fill.patch",
+      "sha256": "7fd748974b96baf9f333dc3858b14d491fc1a1e8f46d119f832215acd74dc8fd"
+    },
+    {
+      "name": "0204-regvm-backtrace-ret-ip.patch",
+      "sha256": "dffabad7aaa45cdfb6b1739ac08ce466219b68d27dc24dd468835b5d1529dc4e"
+    },
+    {
+      "name": "0205-regvm-implicit-frame-top.patch",
+      "sha256": "983f54e53720aa92e92aecb19366b57bd5dc13152b254eef5a9fb9a24539d83f"
+    },
+    {
+      "name": "0206-regvm-same-realm-return.patch",
+      "sha256": "97f2659a450dce30a1c6d72968b0a0ea0b98e72a1524969c05c79a8d1e2ec4a8"
+    },
+    {
+      "name": "0207-regvm-light-helpers-stack-build.patch",
+      "sha256": "562a8bb44344f1ce3633129c091c7d270258d23a1deb75e3a890544ea01f933a"
+    },
+    {
+      "name": "0208-regvm-light-seal-current-chunk.patch",
+      "sha256": "587d9589baa4a7ae381cc31d12bedd02de523ae7a66aa19f5b10e3adf0e58b5d"
+    },
+    {
+      "name": "0209-regvm-merge-field-operand-loads.patch",
+      "sha256": "cf412e5651b887b623bf85d588980022cbf3c3bc51440addd8825ff783d82b7d"
+    },
+    {
+      "name": "0210-regvm-no-tail-frame-reuse.patch",
+      "sha256": "d39e129e29d6a554d0de2c4906b7b13b6c684bd901b257557628d4ff0d4117b0"
+    },
+    {
+      "name": "0211-regvm-hoist-loop-constant.patch",
+      "sha256": "9d6af2c8153121cc1ba5f0052538eb7ee10206dfbe59469a896d4c829240af63"
+    },
+    {
+      "name": "0212-regvm-trim-loop-increment-and-test.patch",
+      "sha256": "5bd08b6e94d63249dcdb3a6d54e0b746b42353154a1a82b99af631e08def9f6e"
+    },
+    {
+      "name": "0213-regvm-backedge-interrupt-poll.patch",
+      "sha256": "8ea9f1ad140997be69f5f6884edb8df2e61a1b4f07e24c64f1003c6b1c49a48c"
+    },
+    {
+      "name": "0214-regvm-rotate-loop-test.patch",
+      "sha256": "544dec59641ec0a889e86118b2b4f4806d374e2c8355cc31619655778c9cadfb"
+    },
+    {
+      "name": "0215-regvm-hoist-last-write.patch",
+      "sha256": "ed4217f1bd0ed3c487826728e223ea0df172d65138a763b8f54dfadfbe8861c9"
+    },
+    {
+      "name": "0216-regvm-light-alloc-null-arena.patch",
+      "sha256": "ffba267714be8c780ede000966485abb008a43eb9779613e2cf6a30d8ce42f65"
+    },
+    {
+      "name": "0217-regvm-ubsan-clean.patch",
+      "sha256": "b5c7ded9c87ae4a674c1651476a71f7e973c114ae4e9c331e4621e231ea3edfb"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "bc0f3ddca5889d7b039a8f351957092f6151590372fb76fe2d549f0301317609"
     }
   ],
   "files": {
-    "quickjs.c": "bf7af456d0122b9fc69732a1a12b7466372d354ade408f11347ca437a37f992b",
+    "quickjs.c": "1face600f85996d8588467ad560d0eda681ac49fb3a0eaa1881109fdb653370b",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

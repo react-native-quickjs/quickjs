@@ -1,0 +1,100 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62908,6 +62908,87 @@
+ }
+ 
+ /*
++ * Step 1b: the back edge of a counted loop targets the constant load that
++ * materialises the bound, so the load re-executes every iteration although
++ * nothing in the loop rewrites its destination. Retarget the edge to the
++ * instruction after the load: the load still runs on the entry fall-through and
++ * the register keeps its value. Only a backward edge whose target is a pure
++ * constant load and whose destination register is written nowhere else in the
++ * IR is eligible, so the load has already run whenever the edge is taken and
++ * skipping it cannot read an unwritten register.
++ */
++static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
++                                   int n_pcs, int n_values, const int *ireg)
++{
++    int n = ir->insns ? ir->n_insns : 0, i, p;
++    int *defs = NULL, *insn_pc = NULL;
++
++    if (n < 3 || n_values <= 0 || !ireg)
++        return;
++    defs = js_malloc(ctx, (size_t)n_values * sizeof(int));
++    insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
++    if (!defs || !insn_pc)
++        goto done;
++    for (i = 0; i < n_values; i++)
++        defs[i] = -1;
++    for (i = 0; i < n; i++) {
++        JSRegInsn *in = &ir->insns[i];
++        const char *fmt = regvm_rop_fmt[in->rop];
++        int v, pr;
++
++        if (!fmt || fmt[0] != 'r')
++            continue;
++        v = in->ops[0];
++        if (v < 0 || v >= n_values)
++            continue;
++        pr = ireg[v];
++        if (pr < 0 || pr >= n_values)
++            continue;
++        defs[pr] = (defs[pr] < 0) ? i : -2;
++    }
++    for (i = 0; i < n; i++)
++        insn_pc[i] = -1;
++    for (p = 0; p < n_pcs; p++) {
++        int ti = pc_to_insn[p];
++        if (ti >= 0 && ti < n && insn_pc[ti] < 0)
++            insn_pc[ti] = p;
++    }
++    for (i = 0; i < n; i++) {
++        JSRegInsn *br = &ir->insns[i];
++        int ti, v, pr, nxt;
++
++        if (br->rop != ROP_branch || br->n_ops != 1)
++            continue;
++        if (br->ops[0] < 0 || br->ops[0] >= n_pcs)
++            continue;
++        ti = pc_to_insn[br->ops[0]];
++        if (ti < 0 || ti >= i)              /* backward edges only */
++            continue;
++        switch (ir->insns[ti].rop) {
++        case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
++        case ROP_load_const: case ROP_load_undefined: case ROP_load_null:
++        case ROP_load_true: case ROP_load_false:
++            break;
++        default:
++            continue;
++        }
++        v = ir->insns[ti].ops[0];
++        if (v < 0 || v >= n_values)
++            continue;
++        pr = ireg[v];
++        if (pr < 0 || pr >= n_values || defs[pr] != ti)
++            continue;                       /* one definition: this load */
++        nxt = ti + 1;
++        if (nxt >= i || insn_pc[nxt] < 0)   /* nothing between load and edge */
++            continue;
++        br->ops[0] = insn_pc[nxt];
++    }
++ done:
++    js_free(ctx, defs);
++    js_free(ctx, insn_pc);
++}
++
++/*
+  * X2: register operands are byte offsets into the register file, so a field's
+  * width limits the registers it can name -- one byte reaches register 15, two
+  * bytes reach register 4095.
+@@ -67120,6 +67201,8 @@
+                              n_values, phi_in);
+     regvm_fuse_self_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                            n_values, ireg);
++    regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
++                           n_values, ireg);
+     /*
+      * Forward a frame read to a value still resident in its register.
+      *

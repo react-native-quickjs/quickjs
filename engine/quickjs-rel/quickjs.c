@@ -691,6 +691,9 @@ struct JSRuntime {
     uint8_t *regvm_frames;
     size_t regvm_frames_size;    /* bytes */
     size_t regvm_frames_top;     /* bytes in use */
+    /* Step 10: `regvm_frames + regvm_frames_size`, kept current so a light
+       call can bounds-check against the chunk end without loading the size. */
+    uint8_t *regvm_chunk_end;
     /* The chunk holding regvm_frames (its header), or NULL before the first
        push. A full chunk is not grown under live frames; the next frame goes
        into a new chunk linked after it, so no frame ever moves. */
@@ -821,6 +824,25 @@ static inline void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
    before the real-frame chain so a light function's own strict mode wins. */
 static bool regvm_cur_strict(JSRuntime *rt);
 static JSValueConst regvm_cur_func(JSRuntime *rt);
+/* Step 5: `regvm_cur`/`rv_light` now keep the caller pointer even when it is a
+   record frame; readers filter through this. */
+static struct JSRegRun *regvm_light_head(struct JSRegRun *p);
+/* Step 10: raise the arena top over a light frame that is about to stop being
+   the innermost thing in the arena. */
+static void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf);
+#else
+/* `regvm_cur` is present in the stack-only build and always NULL there, but the
+   sites that read it compile in both builds. */
+static inline struct JSRegRun *regvm_light_head(struct JSRegRun *p)
+{
+    (void)p;
+    return NULL;
+}
+static inline void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf)
+{
+    (void)rt;
+    (void)lf;
+}
 #endif
 
 #if QJS_DRC || QJS_DRC_VALIDATE
@@ -844,14 +866,13 @@ static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
     JSStackFrame *sf;
 
 #if QJS_REGVM
-    regvm_light_walk(rt->regvm_cur, fn, opaque);
+    regvm_light_walk(regvm_light_head(rt->regvm_cur), fn, opaque);
 #endif
     for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
         if (sf->rv_regs && sf->rv_nregs)
             fn(opaque, sf->rv_regs, sf->rv_nregs);
 #if QJS_REGVM
-        if (sf->rv_light)
-            regvm_light_walk(sf->rv_light, fn, opaque);
+        regvm_light_walk(regvm_light_head(sf->rv_light), fn, opaque);
 #endif
     }
 }
@@ -1614,7 +1635,12 @@ typedef struct JSFunctionBytecode {
        size of a light frame: the 9-slot prefix, the variable area and the
        register file (arguments are always borrowed when light). */
     uint8_t regvm_light;
+    uint8_t regvm_light_fast; /* light, and its PIC needs no lazy allocation */
     uint32_t regvm_light_need;
+    /* Plan step 10: bytes from a frame's `fr` to the end of the frame -- the
+       larger of the record and light shapes, rounded to 16 -- so a light callee
+       is placed directly above its caller without reading the arena top. */
+    uint32_t regvm_end_off;
 #endif
 #if QJS_AOT_PROFILE
     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
@@ -2635,7 +2661,7 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
     if (force_gc) {
         /* deferred: collect at the next safepoint, not under running JS */
         if (rt->gc_deferred && (rt->current_stack_frame != NULL
-                                || rt->regvm_cur != NULL) &&
+                                || regvm_light_head(rt->regvm_cur) != NULL) &&
             (rt->malloc_state.malloc_size + size) < rt->gc_deferred_limit) {
             rt->gc_pending = true;
             rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
@@ -3187,6 +3213,18 @@ static inline int js_resize_array(JSContext *ctx, void **parray, int elem_size,
 static void *js_dbuf_realloc(void *ctx, void *ptr, size_t size)
 {
     return js_realloc(ctx, ptr, size);
+}
+
+/*
+ * The runtime-keyed twin of the above: `unicode_normalize` takes its allocator
+ * as a `DynBufReallocFunc`, and casting `js_realloc_rt` itself to that type is
+ * a function-pointer type mismatch (UBSan reports the call). A real function
+ * with the right prototype costs nothing -- both sides tail into the same
+ * realloc.
+ */
+static void *js_dbuf_realloc_rt(void *rt, void *ptr, size_t size)
+{
+    return js_realloc_rt(rt, ptr, size);
 }
 
 static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
@@ -4002,6 +4040,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     rt->regvm_frames = NULL;
     rt->regvm_frames_size = 0;
     rt->regvm_frames_top = 0;
+    rt->regvm_chunk_end = NULL;
 #endif
 #endif
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -4513,6 +4552,7 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
 
     JSRuntime *rt = ctx->rt;
     JSStackFrame *saved = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
     target->rv_light = rt->regvm_cur;
     target->rv_rec = NULL;
     rt->regvm_cur = NULL;
@@ -4837,7 +4877,7 @@ void JS_UpdateStackTop(JSRuntime *rt)
 static inline bool is_strict_mode(JSContext *ctx)
 {
 #if QJS_REGVM
-    if (ctx->rt->regvm_cur)
+    if (regvm_light_head(ctx->rt->regvm_cur))
         return regvm_cur_strict(ctx->rt);
 #endif
     JSStackFrame *sf = ctx->rt->current_stack_frame;
@@ -7850,6 +7890,7 @@ static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
         regvm_pic_entry_reset(rt, &b->regvm_pic[i], &b->regvm_pic_holder[i]);
     js_free_rt(rt, b->regvm_pic);
     b->regvm_pic = NULL;
+    b->regvm_light_fast = b->regvm_light && b->regvm_pic_count == 0;
     js_free_rt(rt, b->regvm_pic_holder);
     b->regvm_pic_holder = NULL;
 }
@@ -7884,6 +7925,7 @@ static JSRegPIC *regvm_pic_ensure(JSRuntime *rt, JSFunctionBytecode *b)
         }
         b->regvm_pic = t;
         b->regvm_pic_holder = h;
+        b->regvm_light_fast = b->regvm_light;
         js_fnbc_gc_force_trace(rt, b); /* before the caller stores a JSShape */
     }
     return t;
@@ -9279,6 +9321,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     }
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = NULL;
     rt->regvm_cur = NULL;
@@ -9410,6 +9453,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
 
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = NULL;
     rt->regvm_cur = NULL;
@@ -10125,21 +10169,32 @@ static void js_regvm_drc_resume(JSRuntime *rt, JSValue *regs, uint32_t nregs)
  */
 #if QJS_DRC
 /*
- * Checked inline at every backward branch, so the check costs three loads and a
- * compare and, crucially, never makes the branch handler spill its state: the
- * rare reconcile is a *tail call* into `regvm_t_safepoint_slow`, which runs the
- * reconcile and re-enters the chain at the branch target. A non-tail call here
- * would force the handler to preserve ip/fr/f/ctx across it, which is exactly
- * the per-dispatch shuffle the frameless discipline exists to avoid.
+ * Checked inline at every backward branch. A backward edge must also reach the
+ * interrupt handler, or a loop with no calls is uninterruptible and a watchdog
+ * cannot stop a runaway script: it decrements `interrupt_counter` and takes the
+ * poll (which runs the deferred-reference-count safepoint too) when the counter
+ * hits zero. The DRC check stays separate because its limit bounds the parked
+ * set between polls. Both slow paths are tail calls, so the branch handlers
+ * stay frameless.
  */
-#define REGVM_DRC_BACKEDGE(rt_, off_)                                        \
-    do { if (unlikely((off_) < 0) &&                                         \
-             unlikely((rt_)->zct_len + (rt_)->zct_nobj >                     \
-                      (rt_)->zct_limit)) {                                   \
-        return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx); }            \
-    } while (0)
+#define REGVM_DRC_BACKEDGE(ctx_, off_)                                       \
+    do { if (unlikely((off_) <= 0)) {                                         \
+        if (unlikely(--(ctx_)->interrupt_counter <= 0)) {                    \
+            __attribute__((musttail))                                        \
+                return regvm_t_interrupt_slow(ip + (off_), fr, f, ctx_);     \
+        }                                                                    \
+        if (unlikely((ctx_)->rt->zct_len + (ctx_)->rt->zct_nobj >            \
+                      (ctx_)->rt->zct_limit)) {                              \
+            return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx_);         \
+        }                                                                    \
+    } } while (0)
 #else
-#define REGVM_DRC_BACKEDGE(rt_, off_) ((void)0)
+#define REGVM_DRC_BACKEDGE(ctx_, off_)                                       \
+    do { if (unlikely((off_) <= 0) &&                                         \
+             unlikely(--(ctx_)->interrupt_counter <= 0)) {                   \
+        __attribute__((musttail))                                            \
+            return regvm_t_interrupt_slow(ip + (off_), fr, f, ctx_);         \
+    } } while (0)
 #endif
 
 /* called with the ref_count of 'v' reaches zero. */
@@ -10576,7 +10631,8 @@ void JS_RunPendingGC(JSRuntime *rt)
 {
     if (!rt->gc_pending)
         return;
-    assert(rt->current_stack_frame == NULL && rt->regvm_cur == NULL);
+    assert(rt->current_stack_frame == NULL
+           && regvm_light_head(rt->regvm_cur) == NULL);
     rt->gc_pending = false;
     JS_RunGC(rt);
     rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
@@ -11484,6 +11540,14 @@ static int regvm_ip_pc(JSFunctionBytecode *b, const uint8_t *ip)
     if (ip < b->regvm_code || ip >= b->regvm_code + b->regvm_len)
         return -1;
     return (int)(ip - b->regvm_code);
+}
+
+/* Step 9: a callee's `ret_ip` is one instruction past its caller's call, and
+   the register pc2line table is keyed by instruction start, so step back one
+   byte to land inside the call and resolve the caller's line/column. */
+static int regvm_ret_pc(JSFunctionBytecode *b, const uint8_t *ret_ip)
+{
+    return ret_ip ? regvm_ip_pc(b, ret_ip - 1) : -1;
 }
 #else
 #define regvm_frame_pc(rt, sf, b) (-1)
@@ -21952,7 +22016,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
 static JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
 #if QJS_REGVM
-    if (ctx->rt->regvm_cur)
+    if (regvm_light_head(ctx->rt->regvm_cur))
         return regvm_cur_func(ctx->rt);
 #endif
     return ctx->rt->current_stack_frame->cur_func;
@@ -22420,6 +22484,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = NULL;
     rt->regvm_cur = NULL;
@@ -25027,6 +25092,27 @@ typedef struct JSRegRun {
     uint8_t *resume_marker;
 } JSRegRun;
 
+/*
+ * Step 2: the header's four narrow fields are composed into `hdr_pack` by
+ * explicit shifts, which assumes the fields sit in order at these offsets.
+ */
+_Static_assert(offsetof(JSRegRun, ret_dst) == offsetof(JSRegRun, hdr_pack) &&
+               offsetof(JSRegRun, argc) == offsetof(JSRegRun, hdr_pack) + 2 &&
+               offsetof(JSRegRun, flags) == offsetof(JSRegRun, hdr_pack) + 4 &&
+               offsetof(JSRegRun, nctl) == offsetof(JSRegRun, hdr_pack) + 6,
+               "hdr_pack field order");
+
+/*
+ * Step 5: the return path stores its caller pointer into `regvm_cur` without
+ * testing whether that caller is a record frame. A light frame is exactly one
+ * with `sf == NULL`, so every reader of `regvm_cur` or `rv_light` filters
+ * through here.
+ */
+static inline JSRegRun *regvm_light_head(JSRegRun *p)
+{
+    return (p != NULL && p->sf == NULL) ? p : NULL;
+}
+
 #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
 /*
  * Plan 5.5: walk one light chain, innermost first, publishing each frame's
@@ -25040,7 +25126,7 @@ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
         JSFunctionBytecode *b = lf->b;
         if (lf->fr && b->regvm_reg_count)
-            fn(opaque, lf->fr, b->regvm_reg_count + REGVM_HS - 1);
+            fn(opaque, lf->fr, b->regvm_reg_count);
     }
 }
 #endif
@@ -25049,43 +25135,63 @@ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
  * Plan 5.5: the logical stack, innermost first, for a backtrace. Light frames
  * interleave with real ones: the chain at `regvm_cur` sits above
  * `current_stack_frame`, and each real frame may have a light chain saved below
- * it in `rv_light`. A light frame's pc is its captured `cap_ip`.
+ * it in `rv_light`.
+ *
+ * Step 9: only the innermost frame uses its captured `cap_ip` (set where control
+ * leaves the register VM). Every outer frame is located by its callee's
+ * `ret_ip`, which is the caller's resume address and therefore its call site.
  */
 static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
 {
     int nb = 0;
     JSRegRun *lf;
     JSStackFrame *sf;
+    const uint8_t *callee_ret = NULL;
 
-    for (lf = rt->regvm_cur;
+    for (lf = regvm_light_head(rt->regvm_cur);
          lf != NULL && nb < max;
          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
         bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
         bt[nb].cur_pc = NULL;
-        bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+        bt[nb].rpc = callee_ret ? regvm_ret_pc(lf->b, callee_ret)
+                                : regvm_ip_pc(lf->b, lf->cap_ip);
+        if (bt[nb].rpc < 0)
+            bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
         bt[nb].sf = NULL;
         nb++;
+        callee_ret = lf->ret_ip;
     }
     for (sf = rt->current_stack_frame; sf != NULL && nb < max;
          sf = sf->prev_frame) {
         JSFunctionBytecode *fb = NULL;
+        JSRegRun *rec = sf->rv_rec;
         JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
 
         if (js_class_has_bytecode(fp->class_id))
             fb = fp->u.func.function_bytecode;
         bt[nb].func = sf->cur_func;
         bt[nb].cur_pc = sf->cur_pc;
-        bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
+        if (fb && callee_ret)
+            bt[nb].rpc = regvm_ret_pc(fb, callee_ret);
+        else
+            bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
+        if (bt[nb].rpc < 0 && fb)
+            bt[nb].rpc = regvm_frame_pc(rt, sf, fb);
         bt[nb].sf = sf;
         nb++;
-        for (lf = sf->rv_light;
+        callee_ret = rec ? rec->ret_ip : NULL;
+        for (lf = regvm_light_head(sf->rv_light);
              lf != NULL && nb < max;
              lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
             bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
             bt[nb].cur_pc = NULL;
-            bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+            bt[nb].rpc = callee_ret ? regvm_ret_pc(lf->b, callee_ret)
+                                    : regvm_ip_pc(lf->b, lf->cap_ip);
+            if (bt[nb].rpc < 0)
+                bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
             bt[nb].sf = NULL;
             nb++;
+            callee_ret = lf->ret_ip;
         }
     }
     return nb;
@@ -25098,14 +25204,14 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
  */
 static bool regvm_cur_strict(JSRuntime *rt)
 {
-    JSRegRun *lf = rt->regvm_cur;
+    JSRegRun *lf = regvm_light_head(rt->regvm_cur);
 
     return lf != NULL && lf->b->is_strict_mode;
 }
 
 static JSValueConst regvm_cur_func(JSRuntime *rt)
 {
-    JSRegRun *lf = rt->regvm_cur;
+    JSRegRun *lf = regvm_light_head(rt->regvm_cur);
 
     return lf ? JS_MKPTR(JS_TAG_OBJECT, lf->func) : JS_UNDEFINED;
 }
@@ -25119,6 +25225,9 @@ static JSValueConst regvm_cur_func(JSRuntime *rt)
 #define REGVM_FLAG_TRIVIAL_RET (1 << 8)
 /* Plan 5.4: the frame is a light frame (no JSStackFrame, no record tail). */
 #define REGVM_FLAG_LIGHT (1 << 9)
+/* Step 13: the callee's realm equals the caller's, so a return can keep `ctx`
+   in its register instead of loading the caller's `c->b->realm`. */
+#define REGVM_FLAG_SAME_REALM (1 << 10)
 
 #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
 typedef struct JSRegArenaChunk {
@@ -25127,7 +25236,24 @@ typedef struct JSRegArenaChunk {
     size_t saved_top;           /* this chunk's top while a later chunk is current */
 } JSRegArenaChunk;
 
+#ifdef QJS_REGVM_KNOBS
+/* Plan step 0.1: shift the frame arena by REGVM_SKEW bytes (rounded down to 16)
+   so a measurement can pick an alias-free layout. `getenv` is read once; without
+   QJS_REGVM_KNOBS the offset folds to zero and the macro is unchanged. */
+static size_t regvm_skew(void)
+{
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("REGVM_SKEW");
+        v = e ? atol(e) & ~15L : 0;
+    }
+    return (size_t)v;
+}
+#define REGVM_CHUNK_HDR \
+    (((sizeof(JSRegArenaChunk) + 15) & ~(size_t)15) + regvm_skew())
+#else
 #define REGVM_CHUNK_HDR ((sizeof(JSRegArenaChunk) + 15) & ~(size_t)15)
+#endif
 
 static inline uint8_t *regvm_chunk_data(JSRegArenaChunk *c)
 {
@@ -25157,6 +25283,9 @@ static JSRegRun *regvm_rec_of_sf(JSRuntime *rt, JSStackFrame *sf)
     const uint8_t *lo = rt->regvm_frames;
     size_t top = rt->regvm_frames_top;
 
+    /* no arena yet: nothing is a record */
+    if (lo == NULL)
+        return NULL;
     /* the newest frames are in the current chunk; older ones in its prev chain */
     while (p < lo || p >= lo + top) {
         if (!c || !(c = c->prev))
@@ -25392,6 +25521,19 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  * register file does not move across a reconcile, so re-entering the chain at
  * `ip` (the branch target) is safe.
  */
+/*
+ * The back-edge interrupt poll: the counter in `ctx` reached zero, so run the
+ * handler (and the deferred-reference-count safepoint inside it) and re-enter
+ * the chain at the branch target. A tail call, so the branch handlers stay
+ * frameless.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_interrupt_slow(REGVM_ARGS)
+{
+    if (__js_poll_interrupts(ctx) < 0)
+        T_FAIL();
+    __attribute__((musttail)) return regvm_t_dispatch(ip, fr, f, ctx);
+}
+
 #if QJS_DRC
 static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_ARGS)
 {
@@ -25407,7 +25549,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
    itself, which counts it and executes it there. */
 #define T_NEXT(off) do { \
         int32_t _t_off = (off); \
-        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
+        REGVM_DRC_BACKEDGE(ctx, _t_off); \
         __attribute__((musttail)) \
             return regvm_t_dispatch(ip + _t_off, fr, f, ctx); \
     } while (0)
@@ -25430,7 +25572,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
  */
 #define T_BR_NEXT(off) do { \
         int32_t _t_off = (off); \
-        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
+        REGVM_DRC_BACKEDGE(ctx, _t_off); \
         uint8_t *_nip = ip + _t_off; \
         __asm__ volatile("" : "+r"(_nip)); \
         __attribute__((musttail)) \
@@ -25559,7 +25701,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
     X(instanceof, REG_BIN_INSTANCEOF) X(in, REG_BIN_IN)
 
 #define REGVM_T_UNARY_LIST(X) \
-    X(neg, REG_UN_NEG) X(inc, REG_UN_INC) X(dec, REG_UN_DEC) \
+    X(neg, REG_UN_NEG) X(dec, REG_UN_DEC) \
     X(not, REG_UN_NOT) X(to_numeric, REG_UN_TO_NUMERIC)
 
 /* the cold halves: decode the shape, run the engine's slow routine, continue */
@@ -25727,6 +25869,11 @@ REGVM_T_BINARY_LIST(T_DECL)
 REGVM_T_UNARY_LIST(T_DECL)
 #undef T_DECL
 
+/* Step 2.1: the counted loop's increment, with the float and overflow cases in
+   the slow handler. */
+static uint8_t *REGVM_CC regvm_t_inc(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_inc_slow(REGVM_ARGS);
+
 static uint8_t *REGVM_CC regvm_t_binary(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_binary_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_binary_loc_reg(REGVM_ARGS);
@@ -25889,12 +26036,12 @@ static int regvm_record_eligible(JSFunctionBytecode *cb);
 #if QJS_REGVM_RECORD
 /* Plan 5.4: the encoded program contains only light-safe opcodes. */
 static int regvm_code_light_safe(const uint8_t *code, int len);
-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS);
-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS);
+static __attribute__((always_inline)) inline JSRegRun *
+regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
+                    int ret_off, JSValue *oargv,
+                    int na, JSValue **out_regs);
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_return_light_nested(REGVM_ARGS);
-static __attribute__((noinline)) uint8_t *REGVM_CC
-regvm_t_return_light_chunk(REGVM_ARGS);
 #endif
 #if defined(QJS_REGVM_COUNT)
 /*
@@ -26211,6 +26358,7 @@ static const regvm_handler regvm_threaded[ROP_COUNT] = {
     REGVM_T_BINARY_LIST(T_BINARY_ENTRY)
     REGVM_T_UNARY_LIST(T_BINARY_ENTRY)
 #undef T_BINARY_ENTRY
+    [ROP_inc] = regvm_t_inc,
 #define T_EXPLICIT_ENTRY(name, handler) [ROP_##name] = handler,
     REGVM_T_EXPLICIT_LIST(T_EXPLICIT_ENTRY)
 #undef T_EXPLICIT_ENTRY
@@ -26231,6 +26379,7 @@ static const uint8_t regvm_is_threaded[ROP_COUNT] = {
     REGVM_T_BINARY_LIST(T_BINARY_MARK)
     REGVM_T_UNARY_LIST(T_BINARY_MARK)
 #undef T_BINARY_MARK
+    [ROP_inc] = 1,
 #define T_EXPLICIT_MARK(name, handler) [ROP_##name] = 1,
     REGVM_T_EXPLICIT_LIST(T_EXPLICIT_MARK)
 #undef T_EXPLICIT_MARK
@@ -26475,33 +26624,39 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
 #if QJS_REGVM_RECORD
     /* Plan 5.6: a light frame has no JSStackFrame and no record release walk. */
     if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
+        uint64_t hp = f->hdr_pack;
         /*
          * A frame that owns nothing moves the value straight into the caller's
          * register. The separate `regvm_t_return_light` round-trips it through
          * `f->ret` and needs a tail call; fusing the trivial case here keeps
          * the value in a register and drops both.
          */
-        if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
+        if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_TRIVIAL_RET)) {
             JSRegRun *c = f->caller;
-            int dst = f->ret_dst;
+            int dst = (uint16_t)hp;
             uint8_t *rip = f->ret_ip;
             JSValue v = FR(s);
-            size_t top = (size_t)((uint8_t *)f
-                                  - (uint8_t *)ctx->rt->regvm_frames);
 
-            FR(s) = JS_UNDEFINED;
-            ctx->rt->regvm_frames_top = top;
-            if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
-                f->ret = v;
-                __attribute__((musttail))
-                    return regvm_t_return_light_chunk(REGVM_PASS);
-            }
-            ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+            /*
+             * Step 10: a light frame lives above the arena top, so popping it
+             * is only dropping the pointer -- no top store, no chunk pop.
+             */
+            ctx->rt->regvm_cur = c;
             *(JSValue *)((uint8_t *)c->fr + dst) = v;
-            ctx->rt->regvm_tail_chain = 0;
-            f = c;
-            __attribute__((musttail))
-                return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+            /* No `regvm_tail_chain` reset: a light frame never tail-calls and
+               its return does not end the caller's chain. */
+            /* Step 13: keep `ctx` when the caller shares the callee's realm. */
+            if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_SAME_REALM)) {
+                f = c;
+                __attribute__((musttail))
+                    return regvm_t_dispatch(rip, c->fr, c, ctx);
+            } else {
+                JSContext *realm = c->b->realm;
+
+                f = c;
+                __attribute__((musttail))
+                    return regvm_t_dispatch(rip, c->fr, c, realm);
+            }
         }
 #if QJS_DRC
         /* The general path dups the value before the release walk and the
@@ -26549,27 +26704,31 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
 #if QJS_REGVM_RECORD
     /* Plan 5.6: a light frame returns through its own handlers. */
     if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
+        uint64_t hp = f->hdr_pack;
         /* Same fusion as `regvm_t_return`: a frame that owns nothing moves
            `undefined` straight into the caller's register. */
-        if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
+        if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_TRIVIAL_RET)) {
             JSRegRun *c = f->caller;
-            int dst = f->ret_dst;
+            int dst = (uint16_t)hp;
             uint8_t *rip = f->ret_ip;
-            size_t top = (size_t)((uint8_t *)f
-                                  - (uint8_t *)ctx->rt->regvm_frames);
 
-            ctx->rt->regvm_frames_top = top;
-            if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
-                f->ret = JS_UNDEFINED;
-                __attribute__((musttail))
-                    return regvm_t_return_light_chunk(REGVM_PASS);
-            }
-            ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+            /* Step 10: dropping a light frame does not touch the arena top. */
+            ctx->rt->regvm_cur = c;
             *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
-            ctx->rt->regvm_tail_chain = 0;
-            f = c;
-            __attribute__((musttail))
-                return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+            /* No `regvm_tail_chain` reset: a light frame never tail-calls and
+               its return does not end the caller's chain. */
+            /* Step 13: keep `ctx` when the caller shares the callee's realm. */
+            if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_SAME_REALM)) {
+                f = c;
+                __attribute__((musttail))
+                    return regvm_t_dispatch(rip, c->fr, c, ctx);
+            } else {
+                JSContext *realm = c->b->realm;
+
+                f = c;
+                __attribute__((musttail))
+                    return regvm_t_dispatch(rip, c->fr, c, realm);
+            }
         }
         f->ret = JS_UNDEFINED;
         __attribute__((musttail))
@@ -26783,6 +26942,10 @@ regvm_t_return_trivial_chunk(REGVM_ARGS)
 #endif
 
 #if QJS_REGVM_RECORD
+/* Step 6: a `fail`/plain call stores `this_obj = undefined`; copying from this
+   file-scope constant keeps the pair a single 16-byte store, where the
+   compound-literal `JS_UNDEFINED` is folded into two immediate stores. */
+static const JSValue regvm_undefined_value = { { .int32 = 0 }, JS_TAG_UNDEFINED };
 /*
  * The in-loop call. The fast path builds the callee's record and dispatches the
  * callee's first opcode with that record; the slow path -- ineligible, native, or
@@ -26802,7 +26965,6 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
-    REGVM_CAPTURE_IP();
     /* S1: this handler must stay a pure classify-and-jump. The lazy
        materialize -- and the call it makes -- lives in `regvm_t_call_lazy`
        below, so no frame is forced onto the path every call takes. */
@@ -26810,18 +26972,42 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
-            if (likely(regvm_record_eligible(cb))) {
-                if (likely(cb->regvm_light)
-                    && likely(cb->regvm_pic != NULL
-                              || cb->regvm_pic_count == 0))
+            if (likely(cb->regvm_light_fast)) {
+                int ab = T_REG(5), na = T_U8(7);
+                JSValue *regs;
+                JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 8,
+                                                   FRP(ab), na, &regs);
+                if (unlikely(nf == NULL))
                     __attribute__((musttail))
-                        return regvm_t_call_light(REGVM_PASS);
+                        return regvm_t_call_record(REGVM_PASS);
+                memcpy(&nf->this_obj, &regvm_undefined_value,
+                       sizeof(JSValue));
+                ctx->rt->regvm_cur = nf;
+                if (likely(cb->realm == ctx)) {
+                    __attribute__((musttail))
+                        return regvm_t_dispatch(cb->regvm_code, regs, nf, ctx);
+                } else {
+                    JSContext *realm = cb->realm;
+
+                    __attribute__((musttail))
+                        return regvm_t_dispatch(cb->regvm_code, regs, nf,
+                                                realm);
+                }
+            }
+            /*
+             * Step 9: a light callee's header carries `ret_ip`, so its caller's
+             * position is derived there. Record/lazy/slow calls can fail before
+             * a callee header exists (the "not lowered" error), so they keep
+             * the explicit capture.
+             */
+            REGVM_CAPTURE_IP();
+            if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail))
                     return regvm_t_call_record(REGVM_PASS);
-            }
             __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
         }
     }
+    REGVM_CAPTURE_IP();
     __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
 }
 
@@ -26830,25 +27016,43 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
-    REGVM_CAPTURE_IP();
     /* S1: pure classify-and-jump; the lazy materialize is in
        `regvm_t_call_method_lazy` below. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
-            if (likely(regvm_record_eligible(cb))) {
-                if (likely(cb->regvm_light)
-                    && likely(cb->regvm_pic != NULL
-                              || cb->regvm_pic_count == 0))
+            if (likely(cb->regvm_light_fast)) {
+                int r = T_REG(5), ab = T_REG(7), na = T_U8(9);
+                JSValue tv = FR(r);
+                JSValue *regs;
+                JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 10,
+                                                   FRP(ab), na, &regs);
+                if (unlikely(nf == NULL))
                     __attribute__((musttail))
-                        return regvm_t_call_method_light(REGVM_PASS);
+                        return regvm_t_call_method_record(REGVM_PASS);
+                nf->this_obj = tv;
+                ctx->rt->regvm_cur = nf;
+                if (likely(cb->realm == ctx)) {
+                    __attribute__((musttail))
+                        return regvm_t_dispatch(cb->regvm_code, regs, nf, ctx);
+                } else {
+                    JSContext *realm = cb->realm;
+
+                    __attribute__((musttail))
+                        return regvm_t_dispatch(cb->regvm_code, regs, nf,
+                                                realm);
+                }
+            }
+            /* Step 9: see `regvm_t_call`; non-light paths keep the capture. */
+            REGVM_CAPTURE_IP();
+            if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail))
                     return regvm_t_call_method_record(REGVM_PASS);
-            }
             __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
         }
     }
+    REGVM_CAPTURE_IP();
     __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
 }
 
@@ -26948,6 +27152,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARG
         JS_ThrowOutOfMemory(ctx);
         T_FAIL();
     }
+    regvm_light_seal(ctx->rt, f);
     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
         /*
          * R7: no record. If frames are live under this one, the arena is full and
@@ -27007,6 +27212,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
         JS_ThrowOutOfMemory(ctx);
         T_FAIL();
     }
+    regvm_light_seal(ctx->rt, f);
     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
         /*
          * R7: no record. If frames are live under this one, the arena is full and
@@ -27050,27 +27256,84 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
  * it automatically.
  */
 static __attribute__((always_inline)) inline JSRegRun *
-regvm_light_alloc(JSRuntime *rt, JSFunctionBytecode *cb)
+regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
 {
-    size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
-    size_t ntop = top + cb->regvm_light_need;
     JSRegRun *nf;
 
-    if (unlikely(ntop > rt->regvm_frames_size))
+    if (unlikely(f->caller == NULL)) {
+        /*
+         * The activation's entry record lives on the C stack, not in the
+         * arena, so there is no frame to sit above: take the frame from the
+         * arena top as before. This is the cold side; a light caller uses the
+         * caller's own frame end and never reads or writes the top.
+         *
+         * Before the first record call there is no arena at all, and forming
+         * `regvm_frames + top` or comparing against a null `regvm_chunk_end`
+         * would be pointer arithmetic on a null pointer. Test for the arena
+         * first and fall back to the record path, which allocates it.
+         */
+        size_t top;
+
+        if (unlikely(rt->regvm_frames == NULL))
+            return NULL;
+        top = (rt->regvm_frames_top + 15) & ~(size_t)15;
+        nf = (JSRegRun *)(rt->regvm_frames + top);
+        if (unlikely((uint8_t *)nf + cb->regvm_light_need
+                     > rt->regvm_chunk_end))
+            return NULL;
+        rt->regvm_frames_top = top + cb->regvm_light_need;
+        return nf;
+    }
+    /* Step 10: the caller's frame is the topmost thing in the arena, so the
+       callee starts exactly at the caller's end. */
+    nf = (JSRegRun *)((uint8_t *)f->fr + f->b->regvm_end_off);
+    if (unlikely((uint8_t *)nf + cb->regvm_light_need > rt->regvm_chunk_end))
         return NULL;
-    nf = (JSRegRun *)(rt->regvm_frames + top);
-    rt->regvm_frames_top = ntop;
     return nf;
+}
+
+/*
+ * Step 10: a light frame sits above `regvm_frames_top` (which still names the
+ * top of the record region). Before anything else allocates from the arena, or
+ * before the light chain is saved across a C call, raise the top over it.
+ */
+static inline void regvm_light_seal(JSRuntime *rt, JSRegRun *lf)
+{
+    if (lf != NULL && lf->sf == NULL) {
+        size_t top;
+
+        /*
+         * Only a frame in the current chunk can be sealed against the current
+         * top. A record call seals its light caller and then pushes; when that
+         * push opens a new chunk, the record fill seals `regvm_cur` again, and
+         * that light frame is now in the previous chunk, already covered by
+         * its `saved_top`. Measuring it against the new chunk's base gave a
+         * huge offset that marked the new chunk full, so every later push
+         * opened another chunk and a light/record recursion ran out of arena
+         * after ~140 frames.
+         */
+        if ((uint8_t *)lf < rt->regvm_frames
+            || (uint8_t *)lf >= rt->regvm_chunk_end)
+            return;
+        top = (size_t)((uint8_t *)lf->fr - rt->regvm_frames)
+            + lf->b->regvm_end_off;
+        /* The record-shaped end can pass the chunk end when only the light
+           shape fits. */
+        if (top > rt->regvm_frames_size)
+            top = rt->regvm_frames_size;
+        if (top > rt->regvm_frames_top)
+            rt->regvm_frames_top = top;
+    }
 }
 
 /* Build the callee light frame and return it, or NULL when the arena chunk is
    full. Inline into the two handlers so neither carries a frame. */
 static __attribute__((always_inline)) inline JSRegRun *
 regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
-                  JSRegRun *f, int d, uint8_t *ret_ip, JSValueConst this_obj,
-                  JSValue *oargv, int na)
+                  JSRegRun *f, int d, uint8_t *ret_ip,
+                  JSValue *oargv, int na, JSValue **out_regs)
 {
-    JSRegRun *nf = regvm_light_alloc(ctx->rt, cb);
+    JSRegRun *nf = regvm_light_alloc(ctx->rt, f, cb);
     JSValue *regs;
     int k, vc, nregs;
 
@@ -27081,122 +27344,109 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     nf->b = cb;
     nf->pic = cb->regvm_pic;
     nf->var_refs = co->u.func.var_refs;
-    nf->var_buf = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
-    nf->fr = nf->var_buf + cb->var_count;
     nf->arg_buf = oargv;
-    nf->ret_dst = d;
-    nf->argc = na;
-    nf->nctl = 0;
     nf->func = co;
     nf->cap_ip = NULL;
     nf->sf = NULL;
-    nf->this_obj = this_obj;
-    nf->ret = JS_UNDEFINED;
-    nf->set_v = JS_UNDEFINED;
+    /*
+     * `ret` and `set_v` are written before they are read on every path a light
+     * function can take -- the return handlers park the value in `ret`, and the
+     * free helper parks the dead value in `set_v` immediately before the read.
+     * Initialising them here was two words of dead stores per call.
+     */
     vc = cb->var_count;
 #if QJS_DRC
     if (cb->var_count <= 255)
         vc = cb->regvm_var_count;
 #endif
-    nf->flags = REGVM_FLAG_LIGHT;
-    if (vc == 0)
-        nf->flags |= REGVM_FLAG_TRIVIAL_RET;
+    /*
+     * The variable area exists only when the promotion map leaves a slot in it
+     * (`vc`, the same bound the release walk and the DRC walk use). A function
+     * whose locals are all promoted names none: `fr` is then the header's end,
+     * `var_buf` is never read (no `get_loc`, no release walk), and the frame is
+     * `var_count` slots smaller with the pointer store gone.
+     */
+    if (vc != 0) {
+        nf->var_buf = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
+        nf->fr = nf->var_buf + cb->var_count;
+    } else {
+        nf->fr = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
+    }
+    /*
+     * Step 2: the four narrow header fields go out as one 64-bit store.
+     * `nctl` is 0; `d` and `na` are the call's own 16-bit operands.
+     */
+    {
+        uint16_t hflags = REGVM_FLAG_LIGHT;
+
+        if (vc == 0)
+            hflags |= REGVM_FLAG_TRIVIAL_RET;
+        if (cb->realm == ctx)
+            hflags |= REGVM_FLAG_SAME_REALM;
+        nf->hdr_pack = (uint64_t)(uint16_t)d
+                     | ((uint64_t)(uint16_t)na << 16)
+                     | ((uint64_t)hflags << 32);
+    }
     /*
      * Fill the variable area and the register file with `undefined`. Every
      * register must hold a valid, uncounted word before the program runs (the
-     * DRC pin walk and the store handlers read them). The variable area only
-     * needs the slots the promotion map still names -- `regvm_var_count`, the
-     * same bound the release walk and the DRC walk use, and `vc` already holds
-     * it. A function whose locals are all promoted names none, and filling the
-     * source `var_count` instead was the loc10 cycle regression: ten stores to
-     * a slot no handler can read.
+     * DRC pin walk and the store handlers read them); only the variable slots
+     * the promotion map still names are filled, so a function whose locals are
+     * all promoted fills none of the source `var_count`.
      */
     for (k = 0; k < vc; k++)
-        nf->var_buf[k] = JS_UNDEFINED;
+        __builtin_memcpy(&nf->var_buf[k], &regvm_undefined_value, sizeof(JSValue));
     regs = nf->fr;
-    nregs = cb->regvm_reg_count + REGVM_HS;
+    /* a light frame never suspends, so it has no handshake slots */
+    nregs = cb->regvm_reg_count;
+    /*
+     * Step 7: one 16-byte `undefined` store per register (the old form wrote a
+     * 4-byte payload and an 8-byte tag). `__builtin_memcpy` from the constant is
+     * alignment- and aliasing-safe and lowers to `movups`; the barrier keeps the
+     * loop from being rewritten into a `memset` call.
+     */
     for (k = 0; k + 1 < nregs; k += 2) {
-        regs[k] = JS_UNDEFINED;
-        regs[k + 1] = JS_UNDEFINED;
+        __builtin_memcpy(&regs[k], &regvm_undefined_value, sizeof(JSValue));
+        __builtin_memcpy(&regs[k + 1], &regvm_undefined_value,
+                         sizeof(JSValue));
         __asm__ volatile("" ::: "memory");
     }
     if (k < nregs)
-        regs[k] = JS_UNDEFINED;
+        __builtin_memcpy(&regs[k], &regvm_undefined_value, sizeof(JSValue));
+    *out_regs = regs;
     return nf;
 }
 
-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS)
+/*
+ * Step 3: the light call's arena entry, folded into the classifiers so they do
+ * not re-decode operand `c`, reload `FR(c)` or reload the function bytecode.
+ * Returns the new frame, or NULL when the call must take the record path (the
+ * classifier owns the `musttail` jump so this stays a plain inlined helper).
+ */
+static __attribute__((always_inline)) inline JSRegRun *
+regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
+                    int ret_off, JSValue *oargv,
+                    int na, JSValue **out_regs)
 {
-    int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
-    JSValue cf = FR(c);
-    JSObject *co = JS_VALUE_GET_OBJ(cf);
-    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+    int d = T_REG(1);
     JSRegRun *nf;
 
     if (unlikely(--ctx->interrupt_counter <= 0))
-        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+        return NULL;
     if (unlikely(na < cb->arg_count))
-        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-    nf = regvm_light_enter(ctx, co, cb, f, d, ip + 8, JS_UNDEFINED,
-                           FRP(ab), na);
-    if (unlikely(nf == NULL))
-        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-    ctx->rt->regvm_cur = nf;
-    __attribute__((musttail))
-        return regvm_t_dispatch(nf->b->regvm_code, nf->fr, nf, cb->realm);
-}
-
-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS)
-{
-    int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
-    int na = T_U8(9);
-    JSValue cf = FR(c);
-    JSValue tv = FR(r);
-    JSObject *co = JS_VALUE_GET_OBJ(cf);
-    JSFunctionBytecode *cb = co->u.func.function_bytecode;
-    JSRegRun *nf;
-
-    if (unlikely(--ctx->interrupt_counter <= 0))
-        __attribute__((musttail))
-            return regvm_t_call_method_record(REGVM_PASS);
-    if (unlikely(na < cb->arg_count))
-        __attribute__((musttail))
-            return regvm_t_call_method_record(REGVM_PASS);
-    nf = regvm_light_enter(ctx, co, cb, f, d, ip + 10, tv, FRP(ab), na);
-    if (unlikely(nf == NULL))
-        __attribute__((musttail))
-            return regvm_t_call_method_record(REGVM_PASS);
-    ctx->rt->regvm_cur = nf;
-    __attribute__((musttail))
-        return regvm_t_dispatch(nf->b->regvm_code, nf->fr, nf, cb->realm);
+        return NULL;
+    nf = regvm_light_enter(ctx, co, cb, f, d, ip + ret_off,
+                           oargv, na, out_regs);
+    return nf;
 }
 
 /*
  * Plan 5.6: leaving a light frame. A light frame owns only its variable area
  * (arguments are borrowed, registers borrow under DRC, there are no cells and
  * no control records). The trivial form has an empty variable area and no
- * release at all, so it stays frameless; the nested form runs the walk. The
- * arena top is restored to the frame's own header, which is exactly where the
- * caller's window ends, and `regvm_cur` falls back to the caller when the
- * caller is itself light.
+ * release at all, so it stays frameless; the nested form runs the walk.
+ * `regvm_cur` falls back to the caller when the caller is itself light.
  */
-static __attribute__((noinline)) uint8_t *REGVM_CC
-regvm_t_return_light_chunk(REGVM_ARGS)
-{
-    JSRegRun *c = f->caller;
-    int dst = f->ret_dst;
-    uint8_t *rip = f->ret_ip;
-    JSValue v = f->ret;
-
-    regvm_arena_pop_chunk(ctx->rt);
-    ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
-    *(JSValue *)((uint8_t *)c->fr + dst) = v;
-    ctx->rt->regvm_tail_chain = 0;
-    f = c;
-    __attribute__((musttail))
-        return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
-}
-
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_return_light_nested(REGVM_ARGS)
 {
@@ -27212,18 +27462,13 @@ regvm_t_return_light_nested(REGVM_ARGS)
     if (b->var_count <= 255)
         vc = b->regvm_var_count;
 #endif
-    end = f->var_buf + vc;
+    end = vc > 0 ? f->var_buf + vc : f->var_buf;
     for (p = f->var_buf; p < end; p++)
         if (REGVM_HAS_COUNT(*p))
             JS_FreeValueRT(ctx->rt, *p);
-    {
-        size_t top = (size_t)((uint8_t *)f - (uint8_t *)ctx->rt->regvm_frames);
-
-        ctx->rt->regvm_frames_top = top;
-        if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
-            regvm_arena_pop_chunk(ctx->rt);
-    }
-    ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+    /* Step 10: a light frame is above the arena top; releasing it is only
+       dropping the pointer, so there is no top store and no chunk pop. */
+    ctx->rt->regvm_cur = c;
     *(JSValue *)((uint8_t *)c->fr + dst) = v;
 #if QJS_DRC
     /* `regvm_t_return` duplicated `v` before the release walk; the caller's
@@ -27231,9 +27476,18 @@ regvm_t_return_light_nested(REGVM_ARGS)
     REG_ADOPT(ctx->rt, v);
 #endif
     ctx->rt->regvm_tail_chain = 0;
-    f = c;
-    __attribute__((musttail))
-        return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+    /* Step 13: keep `ctx` when the caller shares the callee's realm. */
+    if (likely(f->flags & REGVM_FLAG_SAME_REALM)) {
+        f = c;
+        __attribute__((musttail))
+            return regvm_t_dispatch(rip, c->fr, c, ctx);
+    } else {
+        JSContext *realm = c->b->realm;
+
+        f = c;
+        __attribute__((musttail))
+            return regvm_t_dispatch(rip, c->fr, c, realm);
+    }
 }
 #endif /* QJS_REGVM_RECORD */
 
@@ -27276,6 +27530,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGV
                                   nb ? nb->inst_inline_cap : 0);
     if (JS_IsException(obj))
         T_FAIL();
+    regvm_light_seal(ctx->rt, f);
     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
         if (regvm_arena_busy(ctx->rt)) {
             JS_FreeValue(ctx, obj);
@@ -27422,6 +27677,34 @@ REGVM_T_BINARY_LIST(T_DEF_BIN)
     { T_FAST_UN(sub, T_SZ_RR, regvm_t_##name##_slow); }
 REGVM_T_UNARY_LIST(T_DEF_UN)
 #undef T_DEF_UN
+
+/*
+ * Step 2.1: `inc` is the counted loop's increment and is almost always an int.
+ * The float case and the INT32_MAX overflow both belong to the slow handler, so
+ * the fast path is a tag test, an overflow test, the increment and the store.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_inc_slow(REGVM_ARGS)
+{ T_BODY_RR_UN(REG_UN_INC, T_SZ_RR); }
+static uint8_t *REGVM_CC regvm_t_inc(REGVM_ARGS)
+{
+    uint32_t ds;
+    int d, s;
+    JSValue v;
+
+    memcpy(&ds, ip + 1, 4);
+    d = (int)(ds & 0xffff);
+    s = (int)(ds >> 16);
+    v = FR(s);
+    if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_INT)) {
+        int32_t i = JS_VALUE_GET_INT(v);
+
+        if (likely(i != INT32_MAX)) {
+            FR(d) = js_int32(i + 1);
+            T_NEXT(T_SZ_RR);
+        }
+    }
+    __attribute__((musttail)) return regvm_t_inc_slow(REGVM_PASS);
+}
 
 /* The generic forms: the kind is still an operand, so it is read in the body
    and passed on to the same slow routines. */
@@ -27712,6 +27995,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_apply_arguments_recor
         JS_ThrowOutOfMemory(ctx);
         T_FAIL();
     }
+    regvm_light_seal(ctx->rt, f);
     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots, &lay) != 0)) {
         JSValue ret_val;
         if (regvm_arena_busy(ctx->rt)) {
@@ -28122,9 +28406,12 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
     } \
     static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
     { \
-        int d = T_REG(1); \
-        int r = T_REG(3); \
-        int site = T_REG(9); \
+        uint32_t dr; \
+        int d, r, site; \
+        memcpy(&dr, ip + 1, 4); \
+        d = (int)(dr & 0xffff); \
+        r = (int)(dr >> 16); \
+        site = T_REG(9); \
         JSValue val; \
         if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
             T_SET_NEXT_B(d, val, T_SZ_RRAS); \
@@ -28139,9 +28426,12 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
        rewrite the opcode back if the site is no longer an own slot. */ \
     static uint8_t *REGVM_CC regvm_t_##NAME##_own(REGVM_ARGS) \
     { \
-        int d = T_REG(1); \
-        int r = T_REG(3); \
-        int site = T_REG(9); \
+        uint32_t dr; \
+        int d, r, site; \
+        memcpy(&dr, ip + 1, 4); \
+        d = (int)(dr & 0xffff); \
+        r = (int)(dr >> 16); \
+        site = T_REG(9); \
         JSValue recv = FR(r); \
         if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT)) { \
             JSObject *p = JS_VALUE_GET_OBJ(recv); \
@@ -28786,26 +29076,88 @@ T_DEF_CMP_BRANCH(branch_cmp_reg_reg, T_U8(1), T_REG(2), T_REG(4), T_I32(6),
                  T_SZ_BRRT)
 T_DEF_CMP_BRANCH(branch_cmp_reg_reg_s, T_U8(1), T_REG8(2), T_REG8(3),
                  T_OFF8(4), T_SZ_BRRT_S)
-T_DEF_CMP_BRANCH(branch_lt_s,   REG_BIN_LT,  T_REG8(1), T_REG8(2), T_OFF8(3),
-                 T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_nlt_s,  REG_BIN_LT | REG_CMP_INVERT, T_REG8(1),
-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_lte_s,  REG_BIN_LTE, T_REG8(1), T_REG8(2), T_OFF8(3),
-                 T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_nlte_s, REG_BIN_LTE | REG_CMP_INVERT, T_REG8(1),
-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_gt_s,   REG_BIN_GT,  T_REG8(1), T_REG8(2), T_OFF8(3),
-                 T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_ngt_s,  REG_BIN_GT | REG_CMP_INVERT, T_REG8(1),
-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_gte_s,  REG_BIN_GTE, T_REG8(1), T_REG8(2), T_OFF8(3),
-                 T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_ngte_s, REG_BIN_GTE | REG_CMP_INVERT, T_REG8(1),
-                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_eq_s,   REG_BIN_EQ,  T_REG8(1), T_REG8(2), T_OFF8(3),
-                 T_SZ_RRT_S)
-T_DEF_CMP_BRANCH(branch_neq_s,  REG_BIN_NEQ, T_REG8(1), T_REG8(2), T_OFF8(3),
-                 T_SZ_RRT_S)
+/*
+ * Step 3.1: the counted loop's latch is a compare-and-branch whose operands are
+ * ints in every hot loop, so the whole `_s` family gets the same int-only fast
+ * path `branch_nlt_s` got in Step 2: one 4-byte operand decode, one combined
+ * tag test, a 32-bit payload compare, and a tail call to the generic slow
+ * handler for the float, string and engine cases.
+ */
+#define T_DEF_CMP_BRANCH_INT(NAME, SUBEXPR, CMPEXPR) \
+    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
+    { \
+        int _sub = (SUBEXPR); \
+        int _la = T_REG8(1), _rb = T_REG8(2); \
+        int32_t _off = T_OFF8(3); \
+        int _take = regvm_cmp_take(ctx, _sub, FR(_la), FR(_rb)); \
+        if (unlikely(_take < 0)) T_FAIL(); \
+        T_NEXT(T_SZ_RRT_S + (_take ? _off : 0)); \
+    } \
+    static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
+    { \
+        uint32_t _w; \
+        int _la, _rb; \
+        int32_t _off, _a, _b; \
+        memcpy(&_w, ip, 4); \
+        _la = (int)((_w >> 8) & 0xff); \
+        _rb = (int)((_w >> 16) & 0xff); \
+        _off = (int32_t)(int8_t)(_w >> 24); \
+        if (likely((JS_VALUE_GET_TAG(FR(_la)) | JS_VALUE_GET_TAG(FR(_rb))) == 0)) { \
+            _a = JS_VALUE_GET_INT(FR(_la)); \
+            _b = JS_VALUE_GET_INT(FR(_rb)); \
+            if (CMPEXPR) { T_BR_NEXT(T_SZ_RRT_S + _off); } \
+            T_NEXT(T_SZ_RRT_S); \
+        } \
+        __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+    }
+
+T_DEF_CMP_BRANCH_INT(branch_lt_s,   REG_BIN_LT,  _a < _b)
+/*
+ * Step 2.1: `branch_nlt_s` is the counted loop's test and is almost always two
+ * ints. Decode the three operands with one load, test both tags together, and
+ * compare the 32-bit payloads; the float, string and engine cases go to the
+ * slow handler.
+ */
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_branch_nlt_s_slow(REGVM_ARGS)
+{
+    int _sub = REG_BIN_LT | REG_CMP_INVERT;
+    int _la = T_REG8(1), _rb = T_REG8(2);
+    int32_t _off = T_OFF8(3);
+    int _take = regvm_cmp_take(ctx, _sub, FR(_la), FR(_rb));
+
+    if (unlikely(_take < 0))
+        T_FAIL();
+    T_NEXT(T_SZ_RRT_S + (_take ? _off : 0));
+}
+static uint8_t *REGVM_CC regvm_t_branch_nlt_s(REGVM_ARGS)
+{
+    uint32_t w;
+    int la, rb;
+    int32_t off, a, b;
+
+    memcpy(&w, ip, 4);
+    la = (int)((w >> 8) & 0xff);
+    rb = (int)((w >> 16) & 0xff);
+    off = (int32_t)(int8_t)(w >> 24);
+    if (likely((JS_VALUE_GET_TAG(FR(la)) | JS_VALUE_GET_TAG(FR(rb))) == 0)) {
+        a = JS_VALUE_GET_INT(FR(la));
+        b = JS_VALUE_GET_INT(FR(rb));
+        if (a >= b)
+            T_BR_NEXT(T_SZ_RRT_S + off);
+        T_NEXT(T_SZ_RRT_S);
+    }
+    __attribute__((musttail)) return regvm_t_branch_nlt_s_slow(REGVM_PASS);
+}
+T_DEF_CMP_BRANCH_INT(branch_lte_s,  REG_BIN_LTE, _a <= _b)
+T_DEF_CMP_BRANCH_INT(branch_nlte_s, REG_BIN_LTE | REG_CMP_INVERT, _a > _b)
+T_DEF_CMP_BRANCH_INT(branch_gt_s,   REG_BIN_GT,  _a > _b)
+T_DEF_CMP_BRANCH_INT(branch_ngt_s,  REG_BIN_GT | REG_CMP_INVERT, _a <= _b)
+T_DEF_CMP_BRANCH_INT(branch_gte_s,  REG_BIN_GTE, _a >= _b)
+T_DEF_CMP_BRANCH_INT(branch_ngte_s, REG_BIN_GTE | REG_CMP_INVERT, _a < _b)
+T_DEF_CMP_BRANCH_INT(branch_eq_s,   REG_BIN_EQ,  _a == _b)
+T_DEF_CMP_BRANCH_INT(branch_neq_s,  REG_BIN_NEQ, _a != _b)
+#undef T_DEF_CMP_BRANCH_INT
 #undef T_DEF_CMP_BRANCH
 
 /*
@@ -29456,6 +29808,7 @@ regvm_t_tail_call_record(REGVM_ARGS)
         ctx->rt->regvm_cur = prev_light;
         ctx->rt->current_stack_frame = prev_sf;
     }
+    regvm_light_seal(ctx->rt, f);
     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 1, &lay) != 0)) {
         for (k = 0; k < na; k++)
             JS_FreeValue(ctx, args[k]);
@@ -29524,6 +29877,7 @@ regvm_t_tail_call_method_record(REGVM_ARGS)
         ctx->rt->current_stack_frame = prev_sf;
     }
     /* two slots past the arguments: the receiver, then the callee object */
+    regvm_light_seal(ctx->rt, f);
     if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
         for (k = 0; k < na; k++)
             JS_FreeValue(ctx, args[k]);
@@ -29616,6 +29970,7 @@ static void regvm_arena_free(JSRuntime *rt)
     }
     rt->regvm_chunk = NULL;
     rt->regvm_chunks_bytes = 0;
+    rt->regvm_chunk_end = NULL;
 }
 
 static no_inline uint8_t *regvm_arena_push_slow(JSRuntime *rt, size_t need)
@@ -29649,6 +30004,7 @@ static no_inline uint8_t *regvm_arena_push_slow(JSRuntime *rt, size_t need)
         rt->regvm_chunk = c;
         rt->regvm_frames = regvm_chunk_data(c);
         rt->regvm_frames_size = cap;
+        rt->regvm_chunk_end = rt->regvm_frames + cap;
         rt->regvm_frames_top = need;
         return rt->regvm_frames;
     }
@@ -29679,6 +30035,7 @@ static no_inline uint8_t *regvm_arena_push_slow(JSRuntime *rt, size_t need)
     rt->regvm_chunk = c;
     rt->regvm_frames = regvm_chunk_data(c);
     rt->regvm_frames_size = c->size;
+    rt->regvm_chunk_end = rt->regvm_frames + c->size;
     rt->regvm_frames_top = need;
     return rt->regvm_frames;
 }
@@ -29710,6 +30067,7 @@ static no_inline void regvm_arena_pop_chunk(JSRuntime *rt)
     rt->regvm_chunk = p;
     rt->regvm_frames = regvm_chunk_data(p);
     rt->regvm_frames_size = p->size;
+    rt->regvm_chunk_end = rt->regvm_frames + p->size;
     rt->regvm_frames_top = p->saved_top;
 }
 
@@ -30006,7 +30364,7 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
         if (b->var_count <= 255)
             vc = b->regvm_var_count;
 #endif
-        end = f->var_buf + vc;
+        end = vc > 0 ? f->var_buf + vc : f->var_buf;
         for (p = f->var_buf; p < end; p++)
             if (REGVM_HAS_COUNT(*p))
                 JS_FreeValueRT(ctx->rt, *p);
@@ -30019,7 +30377,7 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
             if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
                 regvm_arena_pop_chunk(ctx->rt);
         }
-        ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+        ctx->rt->regvm_cur = c;
         f = c;
         fr = c->fr;
         __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
@@ -30138,6 +30496,7 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
      * field or the (absent) JSStackFrame.
      */
     b->regvm_light = 0;
+    b->regvm_light_fast = 0;
     b->regvm_light_need = 0;
 #if QJS_REGVM_RECORD
 #if QJS_DRC
@@ -30146,11 +30505,33 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
         && b->regvm_ctl_count == 0
         && regvm_code_light_safe(b->regvm_code, b->regvm_len)) {
         b->regvm_light = 1;
-        b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
-            + sizeof(JSValue)
-                * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS);
+        {
+            int lvc = b->var_count;
+#if QJS_DRC
+            if (b->var_count <= 255)
+                lvc = b->regvm_var_count;
+#endif
+            /* No variable area when the promotion map leaves no slot in it;
+               `regvm_light_enter` sizes `fr` the same way. */
+            b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
+                + sizeof(JSValue)
+                    * (size_t)((lvc ? b->var_count : 0)
+                               + b->regvm_reg_count);
+            b->regvm_light_fast = (b->regvm_pic != NULL
+                                   || b->regvm_pic_count == 0);
+        }
     }
 #endif
+    /* Step 10: the distance from `fr` to the frame's end, for both shapes. */
+    {
+        size_t rec = (size_t)(b->regvm_reg_count + REGVM_HS) * sizeof(JSValue)
+                   + (size_t)b->var_ref_count * sizeof(JSVarRef *)
+                   + (size_t)b->regvm_ctl_count * sizeof(JSRegCtl);
+        size_t lite = (size_t)b->regvm_reg_count * sizeof(JSValue);
+        size_t off = rec > lite ? rec : lite;
+
+        b->regvm_end_off = (uint32_t)((off + 15) & ~(size_t)15);
+    }
 #endif
 #if QJS_AOT
     /* Bind the generated entry, if any, now that the bytecode is final. A
@@ -30314,6 +30695,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
 #endif
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = rec;
     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
@@ -30463,6 +30845,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
 #endif
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = rec;
     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
@@ -36957,6 +37340,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
+            regvm_light_seal(rt, rt->regvm_cur);
             sf->rv_light = rt->regvm_cur;
             sf->rv_rec = NULL;
             rt->regvm_cur = NULL;
@@ -37096,6 +37480,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = NULL;
     rt->regvm_cur = NULL;
@@ -40603,7 +40988,8 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
     JSValue res = JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
                                   argc, argv, JS_CALL_FLAG_COPY_ARGV);
 #if QJS_DRC
-    if (ctx->rt->current_stack_frame == NULL && ctx->rt->regvm_cur == NULL)
+    if (ctx->rt->current_stack_frame == NULL
+        && regvm_light_head(ctx->rt->regvm_cur) == NULL)
         js_drc_safepoint(ctx->rt);
 #endif
     return res;
@@ -56978,9 +57364,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_call:
         case OP_call_method:
             {
-                /* detect and transform tail calls */
                 int argc;
                 argc = get_u16(bc_buf + pos + 1);
+#if !QJS_REGVM
+                /*
+                 * Detect and transform tail calls. The register backend reuses
+                 * the caller's frame for these (`ROP_tail_call*`), which costs
+                 * more per call than an ordinary call + return and hides the
+                 * callers from `Error.stack`; it does not emit this rewrite.
+                 * The stack interpreter's `OP_tail_call` only skips the
+                 * argument cleanup, so the stack-only build keeps it.
+                 */
                 if (code_match(&cc, pos_next, OP_return, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
@@ -56990,6 +57384,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                                               &line_num, &col_num);
                     break;
                 }
+#endif
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, argc);
                 break;
@@ -60806,6 +61201,7 @@ int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
     pc = b->byte_code_buf;
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = NULL;
     rt->regvm_cur = NULL;
@@ -62653,6 +63049,184 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     js_free(ctx, drop);
     js_free(ctx, remap);
     js_free(ctx, first);
+}
+
+/*
+ * Step 1b: the back edge of a counted loop targets the constant load that
+ * materialises the bound, so the load re-executes every iteration although
+ * nothing in the loop rewrites its destination. Retarget the edge to the
+ * instruction after the load: the load still runs on the entry fall-through and
+ * the register keeps its value. Only a backward edge whose target is a pure
+ * constant load that is the last write of its register is eligible, so the load
+ * has already run whenever the edge is taken and skipping it cannot read an
+ * unwritten register. (The strict "only write" form refused every loop whose
+ * bound shares a register with a preheader value; the last-write form is both
+ * weaker and sufficient.)
+ */
+static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+                                   int n_pcs, int n_values, const int *ireg)
+{
+    int n = ir->insns ? ir->n_insns : 0, i, p;
+    int *defs = NULL, *insn_pc = NULL;
+
+    if (n < 3 || n_values <= 0 || !ireg)
+        return;
+    defs = js_malloc(ctx, (size_t)n_values * sizeof(int));
+    insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
+    if (!defs || !insn_pc)
+        goto done;
+    /*
+     * defs[pr] is the last instruction that writes physical register pr. Only
+     * the last write matters: an earlier one is overwritten by the load before
+     * the loop is entered, and any write after the load is unsafe (it can run
+     * between the load and the back edge), so the load must be that last write.
+     */
+    for (i = 0; i < n_values; i++)
+        defs[i] = -1;
+    for (i = 0; i < n; i++) {
+        JSRegInsn *in = &ir->insns[i];
+        const char *fmt = regvm_rop_fmt[in->rop];
+        int v, pr;
+
+        if (!fmt || fmt[0] != 'r')
+            continue;
+        v = in->ops[0];
+        if (v < 0 || v >= n_values)
+            continue;
+        pr = ireg[v];
+        if (pr < 0 || pr >= n_values)
+            continue;
+        if (i > defs[pr])
+            defs[pr] = i;
+    }
+    for (i = 0; i < n; i++)
+        insn_pc[i] = -1;
+    for (p = 0; p < n_pcs; p++) {
+        int ti = pc_to_insn[p];
+        if (ti >= 0 && ti < n && insn_pc[ti] < 0)
+            insn_pc[ti] = p;
+    }
+    for (i = 0; i < n; i++) {
+        JSRegInsn *br = &ir->insns[i];
+        int ti, v, pr, nxt;
+
+        if (br->rop != ROP_branch || br->n_ops != 1)
+            continue;
+        if (br->ops[0] < 0 || br->ops[0] >= n_pcs)
+            continue;
+        if (br->ops[0] >= ir->insns[i].src_pc)
+            continue;                       /* backward edges only (program order) */
+        ti = pc_to_insn[br->ops[0]];
+        if (ti < 0 || ti >= n)
+            continue;
+        switch (ir->insns[ti].rop) {
+        case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
+        case ROP_load_const: case ROP_load_undefined: case ROP_load_null:
+        case ROP_load_true: case ROP_load_false:
+            break;
+        default:
+            continue;
+        }
+        v = ir->insns[ti].ops[0];
+        if (v < 0 || v >= n_values)
+            continue;
+        pr = ireg[v];
+        if (pr < 0 || pr >= n_values || defs[pr] != ti)
+            continue;                       /* the load is the register's last write */
+        nxt = ti + 1;
+        if (nxt >= i || insn_pc[nxt] < 0)   /* nothing between load and edge */
+            continue;
+        br->ops[0] = insn_pc[nxt];
+    }
+ done:
+    js_free(ctx, defs);
+    js_free(ctx, insn_pc);
+}
+
+/*
+ * Step 3.1: one branch per iteration. The loop is laid out test-at-top with an
+ * unconditional back edge to the test, so every iteration runs the conditional
+ * test (not taken) and the unconditional jump (taken). Duplicate the test,
+ * inverted, at the latch: the back edge becomes the conditional branch itself,
+ * and the original test stays and runs once on entry. This is the narrow
+ * "duplicate the test at the latch" form, not a block reordering.
+ *
+ * Refused unless the back edge's target is exactly one compare-and-branch that
+ * nothing else but the entry and the latch reaches, and the exit immediately
+ * follows the latch (a fall-through there is the exit; otherwise the copy would
+ * need an extra branch that the fixed IR array cannot insert). The duplicated
+ * comparison performs the same one evaluation per iteration the original did.
+ */
+static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+                                   int n_pcs, int n_values)
+{
+    int n = ir->insns ? ir->n_insns : 0, i, p;
+    int *insn_pc = NULL;
+    int *is_target = NULL;
+
+    if (n < 3 || n_values <= 0)
+        return;
+    insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
+    is_target = js_mallocz(ctx, (size_t)n * sizeof(int));
+    if (!insn_pc || !is_target)
+        goto done;
+    for (i = 0; i < n; i++)
+        insn_pc[i] = -1;
+    for (p = 0; p < n_pcs; p++) {
+        int ti = pc_to_insn[p];
+        if (ti >= 0 && ti < n && insn_pc[ti] < 0)
+            insn_pc[ti] = p;
+    }
+    for (i = 0; i < n; i++) {
+        JSRegInsn *in = &ir->insns[i];
+        const char *fmt = regvm_rop_fmt[in->rop];
+        int k;
+
+        for (k = 0; fmt && fmt[k]; k++) {
+            if (fmt[k] == 't') {
+                int ti = (in->ops[k] >= 0 && in->ops[k] < n_pcs)
+                             ? pc_to_insn[in->ops[k]] : -1;
+                if (ti >= 0 && ti < n && ti != i)
+                    is_target[ti]++;
+            }
+        }
+    }
+    for (i = 0; i < n; i++) {
+        JSRegInsn *br = &ir->insns[i];
+        JSRegInsn *test;
+        int t, exit, nxt;
+
+        if (br->rop != ROP_branch || br->n_ops != 1)
+            continue;
+        if (br->ops[0] < 0 || br->ops[0] >= n_pcs)
+            continue;
+        if (br->ops[0] >= ir->insns[i].src_pc)
+            continue;                       /* backward edges only (program order) */
+        t = pc_to_insn[br->ops[0]];
+        if (t < 0 || t >= n)
+            continue;
+        test = &ir->insns[t];
+        if (test->rop != ROP_branch_cmp_reg_reg)
+            continue;                       /* the header must be the test */
+        if (is_target[t] > 2)               /* entry + latch only */
+            continue;
+        exit = (test->ops[3] >= 0 && test->ops[3] < n_pcs)
+                   ? pc_to_insn[test->ops[3]] : -1;
+        if (exit != i + 1)
+            continue;                       /* the exit must follow the latch */
+        nxt = t + 1;
+        if (nxt >= i || insn_pc[nxt] < 0)
+            continue;
+        br->rop = ROP_branch_cmp_reg_reg;
+        br->n_ops = 4;
+        br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
+        br->ops[1] = test->ops[1];
+        br->ops[2] = test->ops[2];
+        br->ops[3] = insn_pc[nxt];
+    }
+ done:
+    js_free(ctx, insn_pc);
+    js_free(ctx, is_target);
 }
 
 /*
@@ -66868,6 +67442,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                              n_values, phi_in);
     regvm_fuse_self_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                            n_values, ireg);
+    regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                           n_values, ireg);
+    regvm_rotate_loop_test(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                           n_values);
     /*
      * Forward a frame read to a value still resident in its register.
      *
@@ -72266,7 +72844,7 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    if (!rt->current_stack_frame && !rt->regvm_cur) {
+    if (!rt->current_stack_frame && !regvm_light_head(rt->regvm_cur)) {
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
     }
@@ -84807,7 +85385,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) skip normalization when input is latin1
     an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
+                           js_dbuf_realloc);
     if (an == -1)
         goto exception;
     js_free(ctx, as);
@@ -84815,7 +85393,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) skip normalization when input is latin1
     bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
+                           js_dbuf_realloc);
     if (bn == -1)
         goto exception;
     js_free(ctx, bs);
@@ -84995,7 +85573,7 @@ static JSValue js_string_normalize(JSContext *ctx, JSValueConst this_val,
     }
 
     out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
-                                ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
+                                ctx->rt, js_dbuf_realloc_rt);
     js_free(ctx, buf);
     if (out_len < 0)
         return JS_EXCEPTION;

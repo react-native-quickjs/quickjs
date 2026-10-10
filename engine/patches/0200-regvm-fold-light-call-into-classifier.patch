@@ -1,0 +1,131 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25919,8 +25919,10 @@
+ #if QJS_REGVM_RECORD
+ /* Plan 5.4: the encoded program contains only light-safe opcodes. */
+ static int regvm_code_light_safe(const uint8_t *code, int len);
+-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS);
+-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS);
++static __attribute__((always_inline)) inline JSRegRun *
++regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
++                    int ret_off, JSValueConst this_obj, JSValue *oargv,
++                    int na, JSValue **out_regs);
+ static __attribute__((noinline)) uint8_t *REGVM_CC
+ regvm_t_return_light_nested(REGVM_ARGS);
+ static __attribute__((noinline)) uint8_t *REGVM_CC
+@@ -26844,9 +26846,20 @@
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+             JSFunctionBytecode *cb = co->u.func.function_bytecode;
+-            if (likely(cb->regvm_light_fast))
++            if (likely(cb->regvm_light_fast)) {
++                int ab = T_REG(5), na = T_U8(7);
++                JSValue *regs;
++                JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 8,
++                                                   JS_UNDEFINED, FRP(ab), na,
++                                                   &regs);
++                if (unlikely(nf == NULL))
++                    __attribute__((musttail))
++                        return regvm_t_call_record(REGVM_PASS);
++                ctx->rt->regvm_cur = nf;
+                 __attribute__((musttail))
+-                    return regvm_t_call_light(REGVM_PASS);
++                    return regvm_t_dispatch(cb->regvm_code, regs, nf,
++                                            cb->realm);
++            }
+             if (likely(regvm_record_eligible(cb)))
+                 __attribute__((musttail))
+                     return regvm_t_call_record(REGVM_PASS);
+@@ -26868,9 +26881,20 @@
+         JSObject *co = JS_VALUE_GET_OBJ(cf);
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+             JSFunctionBytecode *cb = co->u.func.function_bytecode;
+-            if (likely(cb->regvm_light_fast))
++            if (likely(cb->regvm_light_fast)) {
++                int r = T_REG(5), ab = T_REG(7), na = T_U8(9);
++                JSValue tv = FR(r);
++                JSValue *regs;
++                JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 10,
++                                                   tv, FRP(ab), na, &regs);
++                if (unlikely(nf == NULL))
++                    __attribute__((musttail))
++                        return regvm_t_call_method_record(REGVM_PASS);
++                ctx->rt->regvm_cur = nf;
+                 __attribute__((musttail))
+-                    return regvm_t_call_method_light(REGVM_PASS);
++                    return regvm_t_dispatch(cb->regvm_code, regs, nf,
++                                            cb->realm);
++            }
+             if (likely(regvm_record_eligible(cb)))
+                 __attribute__((musttail))
+                     return regvm_t_call_method_record(REGVM_PASS);
+@@ -27174,52 +27198,27 @@
+     return nf;
+ }
+ 
+-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS)
+-{
+-    int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
+-    JSValue cf = FR(c);
+-    JSObject *co = JS_VALUE_GET_OBJ(cf);
+-    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+-    JSRegRun *nf;
+-    JSValue *regs;
+-
+-    if (unlikely(--ctx->interrupt_counter <= 0))
+-        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+-    if (unlikely(na < cb->arg_count))
+-        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+-    nf = regvm_light_enter(ctx, co, cb, f, d, ip + 8, JS_UNDEFINED,
+-                           FRP(ab), na, &regs);
+-    if (unlikely(nf == NULL))
+-        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+-    ctx->rt->regvm_cur = nf;
+-    __attribute__((musttail))
+-        return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
+-}
+-
+-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS)
++/*
++ * Step 3: the light call's arena entry, folded into the classifiers so they do
++ * not re-decode operand `c`, reload `FR(c)` or reload the function bytecode.
++ * Returns the new frame, or NULL when the call must take the record path (the
++ * classifier owns the `musttail` jump so this stays a plain inlined helper).
++ */
++static __attribute__((always_inline)) inline JSRegRun *
++regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
++                    int ret_off, JSValueConst this_obj, JSValue *oargv,
++                    int na, JSValue **out_regs)
+ {
+-    int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
+-    int na = T_U8(9);
+-    JSValue cf = FR(c);
+-    JSValue tv = FR(r);
+-    JSObject *co = JS_VALUE_GET_OBJ(cf);
+-    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    int d = T_REG(1);
+     JSRegRun *nf;
+-    JSValue *regs;
+ 
+     if (unlikely(--ctx->interrupt_counter <= 0))
+-        __attribute__((musttail))
+-            return regvm_t_call_method_record(REGVM_PASS);
++        return NULL;
+     if (unlikely(na < cb->arg_count))
+-        __attribute__((musttail))
+-            return regvm_t_call_method_record(REGVM_PASS);
+-    nf = regvm_light_enter(ctx, co, cb, f, d, ip + 10, tv, FRP(ab), na, &regs);
+-    if (unlikely(nf == NULL))
+-        __attribute__((musttail))
+-            return regvm_t_call_method_record(REGVM_PASS);
+-    ctx->rt->regvm_cur = nf;
+-    __attribute__((musttail))
+-        return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
++        return NULL;
++    nf = regvm_light_enter(ctx, co, cb, f, d, ip + ret_off, this_obj,
++                           oargv, na, out_regs);
++    return nf;
+ }
+ 
+ /*
