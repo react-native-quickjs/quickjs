@@ -1,0 +1,487 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -43346,6 +43346,14 @@
+     int regvm_ctl_count;
+     int regvm_pic_count;
+     uint8_t regvm_compiled; /* the backend lowered this function */
++    /*
++     * Set when the optimising lowering refused the function and the build is
++     * being retried with the frame authoritative (no slot promotion, no reuse,
++     * no frame-read folding, no hoisting, no light frame). Still a register
++     * program: the stopgap is a conservative lowering, never the stack
++     * interpreter.
++     */
++    uint8_t regvm_conservative;
+     uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
+     JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
+     uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
+@@ -67843,6 +67851,17 @@
+         JS_FreeCString(ctx, file);
+ }
+ 
++#ifdef QJS_REGVM_VERIFY
++/*
++ * The final refusal (after the conservative retry) is not supposed to happen:
++ * every deferral site carries a comment naming the invariant that makes it
++ * unreachable. Under QJS_REGVM_VERIFY, reaching one is a failure.
++ */
++#define REGVM_VERIFY_DEAD_END(why) assert(0 && "unreachable refusal: " why)
++#else
++#define REGVM_VERIFY_DEAD_END(why) ((void)0)
++#endif
++
+ #define REGVM_UNENCODABLE(why) do { unc_why = (why); unencodable = 1; } while (0)
+ 
+ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -67867,7 +67886,8 @@
+                                        const uint64_t *live_in,
+                                        const uint64_t *live_out, int live_words,
+                                        const int *ireg, int n_values,
+-                                       int reg_count, int *p_refused)
++                                       int reg_count, int *p_refused,
++                                       const char **p_refused_why)
+ {
+     JSRegIR ir;
+     int *pc_to_insn = NULL;
+@@ -68541,7 +68561,8 @@
+             goto refused;
+     }
+ 
+-    regvm_fold_frame_reads(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
++    if (!fd->regvm_conservative)
++        regvm_fold_frame_reads(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
+                            n_values, phi_in);
+     regvm_fuse_local_rmw(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                          n_values, phi_in);
+@@ -68551,7 +68572,8 @@
+                              n_values, phi_in);
+     regvm_fuse_self_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                            n_values, ireg);
+-    regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
++    if (!fd->regvm_conservative)
++        regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                            n_values, ireg);
+     regvm_rotate_loop_test(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                            n_values);
+@@ -69067,7 +69089,8 @@
+     rc = 0;
+     goto done;
+  refused:
+-    regvm_report_refusal(ctx, fd, unc_why);
++    if (p_refused_why)
++        *p_refused_why = unc_why;
+     js_regvm_stats.unencodable++;
+     *p_refused = 1;
+     rc = 0;
+@@ -69220,7 +69243,9 @@
+     int pushes = 0, phi_base = 0, n_pushes = 0, n_values = 0, words = 0;
+     long long peak_live = 0;
+     int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
++    int retry = 0;
+     const char *defer_why = "?";
++    const char *enc_why = NULL;
+ 
+     if (bc_len <= 0)
+         return 0;
+@@ -69600,7 +69625,7 @@
+              * promoted. The eligibility bits above are cleared, not merely left
+              * un-added.
+              */
+-            if (!allow)
++            if (!allow || fd->regvm_conservative)
+                 memset(slot_ok, 0, (size_t)nslots);
+         }
+         ns_ok = 0;
+@@ -69620,8 +69645,21 @@
+          * blocks; a function too large for the analysis cap falls back to the
+          * frame rather than failing, exactly as an inexpressible shape does.
+          */
+-        if (ns_ok > 0 && (long long)n_blocks * ns_ok > REGVM_MAX_POOL)
++        if (ns_ok > 0 && (long long)n_blocks * ns_ok > REGVM_MAX_POOL) {
++            /*
++             * Fall back to the frame, and clear the eligibility bits with the
++             * count: every later user of `slot_ok`/`ok_index` (the home scan,
++             * the SSA, the lowering) must agree that nothing is promoted, or a
++             * stale bit records a home id whose arrays were never allocated
++             * and the first simulator call reads a null `sval`. The same clear
++             * the REGVM_NOPROMO knob does.
++             */
++            for (i = 0; i < nslots; i++) {
++                slot_ok[i] = 0;
++                ok_index[i] = -1;
++            }
+             ns_ok = 0;
++        }
+         if (REGVM_KNOB("REGVM_NOPROMO")) {
+             for (i = 0; i < nslots; i++) {
+                 slot_ok[i] = 0;
+@@ -69853,6 +69891,7 @@
+                     slot < fd->var_count && ns == 1 && sval[slot] >= 0 &&
+                     !fwd_used[slot] && !(lexical && lexical[slot]) &&
+                     !fd->vars[slot].is_captured && !has_debug_trap &&
++                    !fd->regvm_conservative &&
+                     depth + ns <= bc_len + bias + 8) {
+                     push_base[pos] = sval[slot];
+                     reuse[pos] = 1;
+@@ -70115,15 +70154,159 @@
+         ent_set[i] = 0;
+         ent_phi[i] = 0;
+     }
++    /*
++     * A not-yet-simulated predecessor's outputs are read by the first sweep's
++     * merge (the sweep order is what makes a chain settle in one pass), so they
++     * must hold a deterministic value rather than heap garbage.
++     */
++    for (i = 0; i < out_pool; i++)
++        out[i] = -1;
+ 
+     /* Operand-stack SSA to a fixed point. */
+     for (iter = 0; iter < REGVM_MAX_ITERS; iter++) {
+         changed = 0;
+-        /* simulate every reachable block from its current entry state */
++        /*
++         * Merge and simulate in one ascending sweep, block by block: a block's
++         * entry state is merged from its predecessors' outputs after those were
++         * refreshed in this pass, so a straight-line chain of blocks settles in
++         * one pass instead of one block per pass. Only a back edge -- a
++         * predecessor later in the block order -- still carries a value from the
++         * previous pass, so the iteration count scales with loop nesting, not
++         * function length. (A chain of a few thousand blocks used to exhaust
++         * REGVM_MAX_ITERS here and refuse the function.)
++         */
+         for (b = 0; b < n_blocks; b++) {
+             int d = in_depth[b];
+             if (d < 0)
+                 continue;
++            if (b > 0) {
++                int depth = in_depth[b], first = -1, all_same, off;
++                for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
++                    int p = pred[k];
++                    if (out_depth[p] < 0)
++                        continue;
++                    /*
++                     * A predecessor that leaves *fewer* values than this block
++                     * expects cannot be modelled: the values the block would read
++                     * are not the ones that predecessor produced. Only the with
++                     * family's fall-through arm does that -- its declared effect is
++                     * the taken arm, which for with_put_var consumes two and pushes
++                     * none while the fall-through leaves one -- and the SSA has no
++                     * way to name the value the taken arm hid. Refuse the function
++                     * rather than fill the block's entry state from uninitialized
++                     * memory, which is what reading past a predecessor's outputs
++                     * would do.
++                     */
++                    if (out_depth[p] < depth) {
++                        REGVM_DEFER("a predecessor leaves fewer values than the block expects");
++                    }
++                    if (first < 0)
++                        first = p;
++                }
++                if (first < 0)
++                    goto ssa_simulate;
++                off = ent_off[b];
++                /*
++                 * The depth test comes first. `off` is `ent_off[b]`, and a block
++                 * whose entry depth is zero has no region at all: its offset is
++                 * ent_pool -- one past the end of ent/ent_set/ent_phi. Testing the
++                 * flag first read and wrote that byte, a heap overflow of exactly
++                 * one (found by ASan on Linux; the macOS run's arena hid it).
++                 */
++                if (depth > 0 && !ent_set[off]) {
++                    for (i = 0; i < depth; i++)
++                        ent[off + i] = out[out_off[first] + i];
++                    ent_set[off] = 1;
++                    changed = 1;
++                }
++                for (i = 0; i < depth; i++) {
++                    int v = out[out_off[first] + i];
++                    all_same = 1;
++                    for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
++                        int p = pred[k];
++                        if (out_depth[p] >= 0 && out[out_off[p] + i] != v) {
++                            all_same = 0;
++                            break;
++                        }
++                    }
++                    if (all_same) {
++                        if (!ent_phi[off + i] && ent[off + i] != v) {
++                            ent[off + i] = v;
++                            changed = 1;
++                        }
++                    } else if (!ent_phi[off + i]) {
++                        ent[off + i] = phi_base + phi_counter++;
++                        ent_phi[off + i] = 1;
++                        changed = 1;
++                    }
++                }
++                /*
++                 * The promoted-slot entry state joins the same way: the first
++                 * predecessor that has one seeds it, a disagreement across
++                 * predecessors becomes a phi exactly as a stack value's does. A
++                 * predecessor whose slot state has not propagated yet contributes
++                 * nothing -- comparing against its unset state would invent a phi
++                 * for a slot every path actually agrees on.
++                 */
++                if (ns_ok > 0) {
++                    int sfirst = -1;
++                    for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
++                        int p = pred[k];
++                        if (in_depth[p] >= 0 && sset[p]) {
++                            sfirst = p;
++                            break;
++                        }
++                    }
++                    if (sfirst >= 0) {
++                        if (!sset[b]) {
++                            int ok = 1;
++                            for (i = 0; i < ns_ok; i++) {
++                                int v = sout[sfirst * ns_ok + i];
++                                senc[b * ns_ok + i] = v;
++                                if (v < 0)
++                                    ok = 0;
++                            }
++                            /*
++                             * A predecessor whose own state is still invalid has an
++                             * invalid output; seeding from it would mark this block
++                             * valid on values that are not there yet, and the next
++                             * join would mistake the gap for a disagreement.
++                             */
++                            if (ok) {
++                                sset[b] = 1;
++                                changed = 1;
++                            }
++                        }
++                    }
++                    if (sset[b]) {
++                        for (i = 0; i < ns_ok; i++) {
++                            int v = sout[sfirst * ns_ok + i];
++                            all_same = 1;
++                            for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
++                                int p = pred[k];
++                                if (sset[p] && sout[p * ns_ok + i] != v) {
++                                    all_same = 0;
++                                    break;
++                                }
++                            }
++                            if (all_same) {
++                                if (!sphi[b * ns_ok + i] &&
++                                    senc[b * ns_ok + i] != v) {
++                                    senc[b * ns_ok + i] = v;
++                                    changed = 1;
++                                }
++                            } else if (!sphi[b * ns_ok + i]) {
++                                senc[b * ns_ok + i] = phi_base + phi_counter++;
++                                regvm_note_version_raw(home_of, n_ver,
++                                                       senc[b * ns_ok + i], i);
++                                sphi[b * ns_ok + i] = 1;
++                                changed = 1;
++                            }
++                        }
++                    }
++                }
++            }
++        ssa_simulate: ;
+             for (i = 0; i < d; i++)
+                 scratch[i] = ent[ent_off[b] + i];
+             for (i = 0; i < ns_ok; i++)
+@@ -70149,136 +70332,6 @@
+             for (i = 0; i < ns_ok; i++)
+                 sout[b * ns_ok + i] = sst[i];
+         }
+-        /* merge predecessors into each block's entry state */
+-        for (b = 1; b < n_blocks; b++) {
+-            int depth = in_depth[b], first = -1, all_same, off;
+-            if (depth < 0)
+-                continue;
+-            for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
+-                int p = pred[k];
+-                if (out_depth[p] < 0)
+-                    continue;
+-                /*
+-                 * A predecessor that leaves *fewer* values than this block
+-                 * expects cannot be modelled: the values the block would read
+-                 * are not the ones that predecessor produced. Only the with
+-                 * family's fall-through arm does that -- its declared effect is
+-                 * the taken arm, which for with_put_var consumes two and pushes
+-                 * none while the fall-through leaves one -- and the SSA has no
+-                 * way to name the value the taken arm hid. Refuse the function
+-                 * rather than fill the block's entry state from uninitialized
+-                 * memory, which is what reading past a predecessor's outputs
+-                 * would do.
+-                 */
+-                if (out_depth[p] < depth) {
+-                    REGVM_DEFER("a predecessor leaves fewer values than the block expects");
+-                }
+-                if (first < 0)
+-                    first = p;
+-            }
+-            if (first < 0)
+-                continue;
+-            off = ent_off[b];
+-            /*
+-             * The depth test comes first. `off` is `ent_off[b]`, and a block
+-             * whose entry depth is zero has no region at all: its offset is
+-             * ent_pool -- one past the end of ent/ent_set/ent_phi. Testing the
+-             * flag first read and wrote that byte, a heap overflow of exactly
+-             * one (found by ASan on Linux; the macOS run's arena hid it).
+-             */
+-            if (depth > 0 && !ent_set[off]) {
+-                for (i = 0; i < depth; i++)
+-                    ent[off + i] = out[out_off[first] + i];
+-                ent_set[off] = 1;
+-                changed = 1;
+-            }
+-            for (i = 0; i < depth; i++) {
+-                int v = out[out_off[first] + i];
+-                all_same = 1;
+-                for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
+-                    int p = pred[k];
+-                    if (out_depth[p] >= 0 && out[out_off[p] + i] != v) {
+-                        all_same = 0;
+-                        break;
+-                    }
+-                }
+-                if (all_same) {
+-                    if (!ent_phi[off + i] && ent[off + i] != v) {
+-                        ent[off + i] = v;
+-                        changed = 1;
+-                    }
+-                } else if (!ent_phi[off + i]) {
+-                    ent[off + i] = phi_base + phi_counter++;
+-                    ent_phi[off + i] = 1;
+-                    changed = 1;
+-                }
+-            }
+-            /*
+-             * The promoted-slot entry state joins the same way: the first
+-             * predecessor that has one seeds it, a disagreement across
+-             * predecessors becomes a phi exactly as a stack value's does. A
+-             * predecessor whose slot state has not propagated yet contributes
+-             * nothing -- comparing against its unset state would invent a phi
+-             * for a slot every path actually agrees on.
+-             */
+-            if (ns_ok > 0) {
+-                int sfirst = -1;
+-                for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
+-                    int p = pred[k];
+-                    if (in_depth[p] >= 0 && sset[p]) {
+-                        sfirst = p;
+-                        break;
+-                    }
+-                }
+-                if (sfirst >= 0) {
+-                    if (!sset[b]) {
+-                        int ok = 1;
+-                        for (i = 0; i < ns_ok; i++) {
+-                            int v = sout[sfirst * ns_ok + i];
+-                            senc[b * ns_ok + i] = v;
+-                            if (v < 0)
+-                                ok = 0;
+-                        }
+-                        /*
+-                         * A predecessor whose own state is still invalid has an
+-                         * invalid output; seeding from it would mark this block
+-                         * valid on values that are not there yet, and the next
+-                         * join would mistake the gap for a disagreement.
+-                         */
+-                        if (ok) {
+-                            sset[b] = 1;
+-                            changed = 1;
+-                        }
+-                    }
+-                }
+-                if (sset[b]) {
+-                    for (i = 0; i < ns_ok; i++) {
+-                        int v = sout[sfirst * ns_ok + i];
+-                        all_same = 1;
+-                        for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
+-                            int p = pred[k];
+-                            if (sset[p] && sout[p * ns_ok + i] != v) {
+-                                all_same = 0;
+-                                break;
+-                            }
+-                        }
+-                        if (all_same) {
+-                            if (!sphi[b * ns_ok + i] &&
+-                                senc[b * ns_ok + i] != v) {
+-                                senc[b * ns_ok + i] = v;
+-                                changed = 1;
+-                            }
+-                        } else if (!sphi[b * ns_ok + i]) {
+-                            senc[b * ns_ok + i] = phi_base + phi_counter++;
+-                            regvm_note_version_raw(home_of, n_ver,
+-                                                   senc[b * ns_ok + i], i);
+-                            sphi[b * ns_ok + i] = 1;
+-                            changed = 1;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+         if (!changed)
+             break;
+     }
+@@ -71688,7 +71741,7 @@
+                             slot_ok, ok_index, nslots, ns_ok, senc, sout,
+                             sphi, entry_val, defined, live_in, live_out, words,
+                             ireg, n_values,
+-                            max_regs, &refused))
++                            max_regs, &refused, &enc_why))
+             goto done;
+ 
+         js_free(ctx, lin);
+@@ -71713,6 +71766,14 @@
+          * interpreter fails it closed at the call.
+          */
+         if (refused) {
++            if (!fd->regvm_conservative) {
++                fd->regvm_conservative = 1;
++                retry = 1;
++                rc = 0;
++                goto done;
++            }
++            REGVM_VERIFY_DEAD_END(enc_why ? enc_why : "the encoder refused");
++            regvm_report_refusal(ctx, fd, enc_why ? enc_why : "?");
+             *pdeferred = 1;
+             rc = 0;
+             goto done;
+@@ -71776,6 +71837,17 @@
+     rc = 0;
+     goto done;
+  deferred:
++    if (!fd->regvm_conservative) {
++        /*
++         * The optimising lowering refused a shape. Retry the whole build once
++         * with the frame authoritative before giving up on the function.
++         */
++        fd->regvm_conservative = 1;
++        retry = 1;
++        rc = 0;
++        goto done;
++    }
++    REGVM_VERIFY_DEAD_END(defer_why);
+     /* A shape the register model cannot express: counted, and the function is
+        left without a register program so the interpreter refuses it at a call
+        rather than running a program built from a guess. */
+@@ -71852,6 +71924,8 @@
+     js_free(ctx, home_reg_of_slot);
+     js_free(ctx, sset);
+     js_free(ctx, sphi);
++    if (retry)
++        return js_regvm_build_cfg(ctx, fd, is_leader, pdeferred);
+     return rc;
+ }
+ 
+@@ -72880,6 +72954,11 @@
+ 
+ #if QJS_REGVM_RECORD
+     regvm_set_call_desc(b);
++    if (fd->regvm_conservative) {
++        /* the conservative retry keeps the frame authoritative: no light frame */
++        b->regvm_light = 0;
++        b->regvm_light_fast = 0;
++    }
+ #endif
+ #if QJS_AOT
+     /* Bytecode is final here; bind the generated entry if one exists. */

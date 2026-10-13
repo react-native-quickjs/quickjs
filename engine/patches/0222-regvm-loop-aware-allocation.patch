@@ -1,0 +1,121 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -68900,6 +68900,24 @@
+  * depth, a phi's arity must equal its predecessor count, and the simulation may
+  * not underflow the stack.
+  */
++/* B2: the constant pushes whose value the hoist pass can lift out of a loop.
++   Matches the register loads `regvm_hoist_loop_const` accepts. */
++static int regvm_is_const_push(int op)
++{
++    switch (op) {
++    case OP_push_i32: case OP_push_const: case OP_push_atom_value:
++    case OP_push_bigint_i32:
++    case OP_undefined: case OP_null: case OP_push_false: case OP_push_true:
++    case OP_push_minus1: case OP_push_0: case OP_push_1: case OP_push_2:
++    case OP_push_3: case OP_push_4: case OP_push_5: case OP_push_6:
++    case OP_push_7: case OP_push_i8: case OP_push_i16:
++    case OP_push_const8: case OP_push_empty_string:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
+ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+                                           const uint8_t *is_leader,
+                                           int *pdeferred)
+@@ -68921,6 +68939,7 @@
+     uint64_t *seen = NULL;
+     uint8_t *val_owner = NULL;
+     int *consumed = NULL;
++    uint8_t *is_const_push = NULL;
+     /*
+      * A function with a debugger trap keeps the frame authoritative for every
+      * slot: a trap is a point a debugger reads and writes locals from, so a
+@@ -70130,6 +70149,7 @@
+             goto done;
+         }
+         nbits = (size_t)n_blocks * words * sizeof(uint64_t);
++        is_const_push = js_mallocz(ctx, (size_t)n_values);
+         use_bits = js_malloc(ctx, nbits);
+         alluse_bits = js_malloc(ctx, nbits);
+         phi_use_bits = js_malloc(ctx, nbits);
+@@ -70137,8 +70157,8 @@
+         live_in = js_malloc(ctx, nbits);
+         live_out = js_malloc(ctx, nbits);
+         seen = js_malloc(ctx, (size_t)words * sizeof(uint64_t));
+-        if (!use_bits || !alluse_bits || !phi_use_bits || !def_bits || !live_in ||
+-            !live_out || !seen)
++        if (!is_const_push || !use_bits || !alluse_bits || !phi_use_bits ||
++            !def_bits || !live_in || !live_out || !seen)
+             goto done;
+         memset(use_bits, 0, nbits);
+         memset(alluse_bits, 0, nbits);
+@@ -70281,6 +70301,9 @@
+                     if (pdef[i]) {
+                         regvm_bitset_set(D, v);
+                         regvm_bitset_set(seen, v);
++                        if (is_const_push && v >= 0 && v < n_values &&
++                            regvm_is_const_push(bc[pos]))
++                            is_const_push[v] = 1;
+                     }
+                 }
+                 /*
+@@ -71078,6 +71101,47 @@
+             }
+         }
+ 
++        /*
++         * B2: a counted loop's bound is a constant load at the loop header, and
++         * the back edge re-executes it every iteration, so its live range ends
++         * at the header's compare and the allocator is free to give its
++         * register to a body value. Retargeting the back edge past the load
++         * (the hoist pass, which runs after allocation) would then compare
++         * against a clobbered register, which is why the hoist refused every
++         * ordinary loop. Grow the bound's interval to the latch instead, so the
++         * allocator keeps its register live across the body; the hoist then
++         * fires and the rotation follows.
++         *
++         * Only a constant value defined and used in a block that is a back
++         * edge's target is grown -- exactly the hoistable shape -- so the cost
++         * is one register held across a loop that can use it. A loop without a
++         * single preheader is not special-cased here: the extension is
++         * harmless, and the hoist still refuses it if its shape is wrong.
++         */
++        for (b = 0; b < n_blocks && is_const_push; b++) {
++            int k2;
++            if (in_depth[b] < 0)
++                continue;
++            for (k2 = 0; k2 < 2; k2++) {
++                int h = succ[b * 2 + k2];
++                uint64_t *dh, *uh;
++                if (h < 0 || h >= b || in_depth[h] < 0)
++                    continue;               /* the header is the earlier block */
++                dh = def_bits + (size_t)h * words;
++                uh = alluse_bits + (size_t)h * words;
++                for (w = 0; w < words; w++) {
++                    uint64_t bits = dh[w] & uh[w];
++                    while (bits) {
++                        int v = w * 64 + __builtin_ctzll(bits);
++                        bits &= bits - 1;
++                        if (v < n_values && is_const_push[v] &&
++                            iend[v] >= 0 && iend[v] < blk_last[b])
++                            iend[v] = blk_last[b];
++                    }
++                }
++            }
++        }
++
+         if (home_mode >= 5 && ns_ok > 0) {
+             home_reg_of_slot = js_malloc(ctx, (size_t)ns_ok * sizeof(int));
+             if (!home_reg_of_slot)
+@@ -71515,6 +71579,7 @@
+     js_free(ctx, seen);
+     js_free(ctx, val_owner);
+     js_free(ctx, consumed);
++    js_free(ctx, is_const_push);
+     js_free(ctx, owned_bits);
+     js_free(ctx, exit_live);
+     js_free(ctx, used_any);

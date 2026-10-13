@@ -1,0 +1,22 @@
+diff --git a/quickjs.c b/quickjs.c
+index 1b082be..f81df89 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64444,7 +64444,16 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+             continue;
+         br->rop = ROP_branch_cmp_reg_reg;
+         br->n_ops = 4;
+-        br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
++        /* The latch takes the opposite sense of the header test. A real
++           sub-op carries its sense in REG_CMP_INVERT; the two pseudo tag
++           tests the branch fusion emits are each other's negation and have
++           no inverted form -- every handler matches them as a bare value --
++           so they swap instead. */
++        if ((unsigned)(test->ops[0] - REG_BIN_IS_UNDEF) < 2)
++            br->ops[0] = test->ops[0] ^
++                         (REG_BIN_IS_UNDEF ^ REG_BIN_IS_NOT_UNDEF);
++        else
++            br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
+         br->ops[1] = test->ops[1];
+         br->ops[2] = test->ops[2];
+         br->ops[3] = insn_pc[nxt];

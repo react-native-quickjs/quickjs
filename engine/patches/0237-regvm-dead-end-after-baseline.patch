@@ -1,0 +1,45 @@
+diff --git a/quickjs.c b/quickjs.c
+index f75ec00..5a2b09c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60221,7 +60221,6 @@ static int regvm_ctl_bound(JSContext *ctx, const JSRegIR *ir, const uint8_t *bc,
+     return rc;
+ }
+ 
+-
+ /*
+  * Move origins that are not a stack-VM opcode.
+  */
+@@ -72317,7 +72316,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+                 rc = 0;
+                 goto done;
+             }
+-            REGVM_VERIFY_DEAD_END(enc_why ? enc_why : "the encoder refused");
++            /*
++             * The optimising lowering has now refused this shape twice. That
++             * is an expected event this round: `*pdeferred = 1` hands the
++             * function to the baseline tier, which refuses nothing. The
++             * dead-end check belongs to the baseline, not here -- a refusal by
++             * the first two tiers selects the third.
++             */
+             regvm_report_refusal(ctx, fd, enc_why ? enc_why : "?");
+             *pdeferred = 1;
+             deferred = 1;
+@@ -73507,9 +73512,15 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
+             goto done;
+         if (refused) {
+             /*
+-             * The baseline is the last tier; a refusal here is a modelling gap
+-             * the caller must surface, not a shape to hand on.
++             * The baseline is the last tier: a refusal here is a modelling gap
++             * the caller must surface, not a shape to hand on. This is the only
++             * point at which the dead-end invariant may fire under
++             * QJS_REGVM_VERIFY -- a refusal by the first two tiers now selects
++             * the baseline rather than aborting (the abort used to fire there
++             * and killed every large call site or wide switch in a debug
++             * build).
+              */
++            REGVM_VERIFY_DEAD_END(why ? why : "the baseline refused");
+             if (regvm_report_deferred_on())
+                 fprintf(stderr, "regvm: BASELINE refused: %s\n",
+                         why ? why : "?");

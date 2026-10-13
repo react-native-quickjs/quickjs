@@ -1,0 +1,78 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1148,18 +1148,19 @@
+    enough to call the interrupt callback often. */
+ #define JS_INTERRUPT_COUNTER_INIT 10000
+ 
+-/* OP_get_var cell cache: "atom is own data property #offset of this object".
+-   128 sets of 2 ways, indexed by the low 7 bits of the atom, 32 bytes so the
+-   set stride stays a shift. */
++/* OP_get_var cell cache: "atom is own data property at this slot".
++   128 sets of 2 ways, indexed by the low 7 bits of the atom, so the set
++   stride (2 * 16 bytes) stays a shift. The cell caches the property slot
++   itself, which is what makes the hit path one load shorter than walking
++   obj->prop[offset]; the generation is bumped wherever a watched object's
++   property array can move. */
++struct JSProperty;
+ #define JS_GV_CELL_SETS 128
+ #define JS_GV_CELL_WAYS 2
+ typedef struct JSGVCell {
+-    uint32_t atom;      /* JS_ATOM_NULL (0) when empty */
+-    uint32_t gen;       /* rt->gv_cell_gen snapshot; 0 never matches */
+-    uint32_t offset;    /* index into obj->prop[] */
+-    uint32_t pad_;
+-    JSObject *obj;      /* ctx->global_obj or ctx->global_var_obj */
+-    void *pad2_;
++    uint32_t atom;              /* JS_ATOM_NULL (0) when empty */
++    uint32_t gen;               /* rt->gv_cell_gen snapshot; 0 never matches */
++    struct JSProperty *slot;    /* valid while `gen` matches */
+ } JSGVCell;
+ 
+ struct JSContext {
+@@ -15757,11 +15758,11 @@
+     uint32_t gen = ctx->rt->gv_cell_gen;
+ 
+     if (likely(gvc[0].atom == atom && gvc[0].gen == gen)) {
+-        *pval = gvc[0].obj->prop[gvc[0].offset].u.value;
++        *pval = gvc[0].slot->u.value;
+         return true;
+     }
+     if (gvc[1].atom == atom && gvc[1].gen == gen) {
+-        *pval = gvc[1].obj->prop[gvc[1].offset].u.value;
++        *pval = gvc[1].slot->u.value;
+         return true;
+     }
+     return false;
+@@ -15786,8 +15787,7 @@
+         set[1] = set[0];
+     set[0].atom = prop;
+     set[0].gen = ctx->rt->gv_cell_gen;
+-    set[0].offset = (uint32_t)(pr - p->prop);
+-    set[0].obj = p;
++    set[0].slot = pr;
+ }
+ 
+ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
+@@ -24255,6 +24255,10 @@
+     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
+     off = e->slot_off / (uint32_t)sizeof(JSValue);
+     osh = p->shape;
++    /* a watched object (the global objects) gaining a property invalidates
++       every cached cell, the same as the generic add paths do */
++    if (unlikely(p->gv_watched))
++        js_gv_cell_invalidate(ctx->rt);
+     if (nsh->prop_size != osh->prop_size) {
+         JSProperty *np = js_prop_grow(ctx, p,
+                                       sizeof(p->prop[0]) * nsh->prop_size);
+@@ -40243,6 +40247,10 @@
+                                            == ctx->rt->ic_watchpoint_epoch)) {
+                                 uint32_t off = ic[k].offset;
+                                 JSShape *osh = p->shape;
++                                /* a watched object gaining a property invalidates
++                                   every cached cell, as the generic add paths do */
++                                if (unlikely(p->gv_watched))
++                                    js_gv_cell_invalidate(ctx->rt);
+                                 if (nsh->prop_size != osh->prop_size) {
+                                     JSProperty *np = js_prop_grow(ctx, p,
+                                             sizeof(p->prop[0]) * nsh->prop_size);

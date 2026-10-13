@@ -851,21 +851,105 @@
       "sha256": "b5c7ded9c87ae4a674c1651476a71f7e973c114ae4e9c331e4621e231ea3edfb"
     },
     {
+      "name": "0218-regvm-debug-light-frames.patch",
+      "sha256": "1b90fa511f5c0d385fa5aff9bd4cb27b3320359fc78cfb1d2dacc73f24396d1c"
+    },
+    {
+      "name": "0219-regvm-lower-debugger-traps.patch",
+      "sha256": "f05e049f414a16469ed35aba1444d7a52476950af87a3a1d40722e488bd3512b"
+    },
+    {
+      "name": "0220-regvm-capture-ip-before-calls.patch",
+      "sha256": "cfd5f293ba86ae58f035531dd3c0dea41a7142fa2a891ac259ff5ca16f730953"
+    },
+    {
+      "name": "0221-regvm-fuse-inc-branch.patch",
+      "sha256": "b9e5d7aa91f6cae16b342934baca532aeddc70cbbd71ebd5bda34310aeafe016"
+    },
+    {
+      "name": "0222-regvm-loop-aware-allocation.patch",
+      "sha256": "1a1cb8428ba7b9b6a482d717704997ddaa3949d7c63321f8a02b8aa13728fbf1"
+    },
+    {
+      "name": "0223-regvm-gv-cell-slot.patch",
+      "sha256": "c6217ba9d6e1c9195b463e1cfcdc5160acc5303a6963e7357b3690747f66ea76"
+    },
+    {
+      "name": "0224-regvm-call-return-aliasing.patch",
+      "sha256": "d9dd869357e1a6dd4e814ac59f75f43daf7adf90e1c7bc2f267993ab5c17cd70"
+    },
+    {
+      "name": "0225-regvm-report-deferred.patch",
+      "sha256": "23b288e3edeaaa7731336973939906e4f31a7fabdeeb4353e8e03584a1099e7a"
+    },
+    {
+      "name": "0226-regvm-big-call-apply.patch",
+      "sha256": "93efaec0e06fd177a0a96a35796e69b821a8047ccf3aacc5a2c7b02c3ccf2930"
+    },
+    {
+      "name": "0227-regvm-ssa-settle-and-retry.patch",
+      "sha256": "c5daffd1b76452626b4c927537751c26abffa839b81a3989f88cf7d5a2a88f71"
+    },
+    {
+      "name": "0228-regvm-fail-at-load.patch",
+      "sha256": "a1b1889b7f5c98738b67e191d4f5a41da49a356abc20ca53347490f83e2a7f06"
+    },
+    {
+      "name": "0229-regvm-no-abort-on-refusal.patch",
+      "sha256": "08f2867cc442039d569eadcaa6c40bbe0304d009f119eab9a7a6200e278bc50d"
+    },
+    {
+      "name": "0230-regvm-big-spread-args.patch",
+      "sha256": "d12cf676d3e75ae3b883e8ba2a44aa014c0ea56d40f4f2971ee1ba8e268fb21a"
+    },
+    {
+      "name": "0231-regvm-record-call-argv-safe.patch",
+      "sha256": "7dd099466df6a06df8b04bf612b3f1659dfe8444dbd525e7a5384d7e7de91b62"
+    },
+    {
+      "name": "0232-regvm-fused-read-keeps-ip.patch",
+      "sha256": "e279af7d5c6585c7166bdccc2101b54ec3cb037045d3bc29f4a23e055fb58930"
+    },
+    {
+      "name": "0233-regvm-empty-code-not-threaded.patch",
+      "sha256": "192d52cfbcd27e4c22927cf943f57f990434e486f0e70a396acf272a1e9b6899"
+    },
+    {
+      "name": "0234-regvm-baseline-tier.patch",
+      "sha256": "3a558a19f483afff5cb2684cb19dadcec71f342603603ff726d2001249d6da3e"
+    },
+    {
+      "name": "0235-regvm-baseline-gosub-sentinel.patch",
+      "sha256": "9a31bc0406437bdd306b58d462002ea2c9ec69787fdd6927672b453c1dfcedbd"
+    },
+    {
+      "name": "0236-regvm-control-stack-bound.patch",
+      "sha256": "0c66fe5ec79a7f01c2bf1773b39d6cdb3299ee3deee084f9ebf392d0badbce0e"
+    },
+    {
+      "name": "0237-regvm-dead-end-after-baseline.patch",
+      "sha256": "511306814e55b32c02deecc5c6b12bf950bea81adae2a06fcb70682cc5d8f117"
+    },
+    {
+      "name": "0238-regvm-rotate-undefined-test.patch",
+      "sha256": "2a44f881e7182e536622264839a04bf8d0d97e00af70aa0e1d64b75435f38036"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "bc0f3ddca5889d7b039a8f351957092f6151590372fb76fe2d549f0301317609"
+      "sha256": "eecd8699c20cc4dce63f78ef94c577436e2277025b44d78f32009c30b8aa98bf"
     }
   ],
   "files": {
-    "quickjs.c": "1face600f85996d8588467ad560d0eda681ac49fb3a0eaa1881109fdb653370b",
+    "quickjs.c": "e0152eea0befdec447c5a4a2873f1d8bb25c1bdc848529f5ba5e52c3c825e6a8",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
-    "builtin-array-fromasync.regvm.h": "2e2658843cb809df95f33e3e0410c96add346a76aec19786fe3a9480d3a58447",
+    "builtin-array-fromasync.regvm.h": "5851f9666ee83d9a907c2e664ce1ac8ce43ee9853513eec43107b65f864f722d",
     "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
-    "builtin-iterator-zip-keyed.regvm.h": "16888440df26442442d8729cec3e78fb8cb4f5dcdfa225549457e744174be1c7",
+    "builtin-iterator-zip-keyed.regvm.h": "0d4301cf1c823a109cb14db98e48b602750253911deec9fd34c07b272010cf20",
     "builtin-iterator-zip.h": "1133567b87c8af0d6c3c680ec1a8fcfcba65acc975885477c2c688ac55f149bc",
-    "builtin-iterator-zip.regvm.h": "fe22bce4840b92191097f1a85df227d710f9cbfc8b55a474c2b935afb0010e43",
+    "builtin-iterator-zip.regvm.h": "06f3c1ee10a46c67b87b6d0b792c824c6cb074911fe4685b47b05c1eb50b3260",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
@@ -877,7 +961,7 @@
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
-    "quickjs-regvm.h": "b685396e101ea98c33c17245849315dc030edc57d2a6310f1a1109a6c1b0fceb",
+    "quickjs-regvm.h": "08ebdcb671676ac341c2802486e216a3ba4045549eecf923b82ff807b7463f43",
     "quickjs.h": "84ff71a5aa30d2b0004672c6aedcb1aefc9b50cdb8745e2de1ab0c511634fb0e",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }

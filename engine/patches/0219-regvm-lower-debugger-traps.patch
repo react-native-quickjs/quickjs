@@ -1,0 +1,480 @@
+diff --git a/quickjs-regvm.h b/quickjs-regvm.h
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -728,6 +728,17 @@
+     /* X6: the mirror image, the product as the right operand. */
+     ROP_add_mul, ROP_sub_mul,
+ 
++    /*
++     * The debugger trap: the stack VM's `OP_esc1` debug sub-operations in
++     * register form, one instruction per trapped statement. The operand is the
++     * `JS_DEBUG_TRACE_*` flags byte; the handler captures the ip before calling
++     * the embedder's hook, so a backtrace taken inside the hook names the
++     * statement. It is a cold opcode and never emitted into a light-safe
++     * function (a frame the debugger stops in keeps its record). Appended at
++     * the very end so no existing opcode is renumbered.
++     */
++    ROP_debug,
++
+     ROP_COUNT
+ } JSRegOpcode;
+ 
+@@ -784,7 +795,7 @@
+  * cross-VM one does. Bump it whenever an opcode is added, removed or
+  * renumbered, or an operand's width or meaning changes.
+  */
+-#define REGVM_FORMAT_VERSION 16
++#define REGVM_FORMAT_VERSION 17
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26488,6 +26488,7 @@
+     X(close_local, regvm_t_cold) \
+     X(construct, regvm_t_construct) \
+     X(copy_props, regvm_t_cold) \
++    X(debug, regvm_t_cold) \
+     X(define_class, regvm_t_cold) \
+     X(define_class_computed, regvm_t_cold) \
+     X(define_element, regvm_t_cold) \
+@@ -31725,6 +31726,7 @@
+             [ROP_mul_sub] = &&L_ROP_mul_sub,
+             [ROP_add_mul] = &&L_ROP_add_mul,
+             [ROP_sub_mul] = &&L_ROP_sub_mul,
++            [ROP_debug] = &&L_ROP_debug,
+             [ROP_put_field] = &&L_ROP_put_field,
+             [ROP_put_field_xfer] = &&L_ROP_put_field_xfer,
+             [ROP_define_field] = &&L_ROP_define_field,
+@@ -32684,6 +32686,48 @@
+                     goto exception;
+                 REGVM_NEXT();
+             }
++            L_ROP_debug: {
++                int dbg_flags = RD_U8();
++#if JS_ENABLE_DEBUGGER
++                if (unlikely(dbg_flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
++                    JS_ThrowInternalError(ctx, "invalid debugger trap kind: %d",
++                                          dbg_flags);
++                    goto exception;
++                }
++                /*
++                 * Armed, not merely installed: an attached-but-idle debugger
++                 * would otherwise pay find_line_num on every statement. A
++                 * `debugger;` trap (DEBUGGER_STMT) always reaches the handler.
++                 */
++                if (unlikely(ctx->debug_trace &&
++                             (js_atomic_load_relaxed(&ctx->debug_trace_armed) ||
++                              (dbg_flags & JS_DEBUG_TRACE_DEBUGGER_STMT)))) {
++                    int dbg_col = 0;
++                    int dbg_line;
++                    int dbg_ret;
++
++                    /* The hook can inspect the stack and throw, so publish the
++                       frame's position before the call, exactly as the stack
++                       VM's trap does. */
++                    run.cap_ip = rpc - 1;
++                    dbg_line = find_line_num(ctx, b,
++                                             (uint32_t)(rpc - 1 - b->regvm_code),
++                                             &dbg_col);
++                    dbg_ret = ctx->debug_trace(ctx, b->filename, b->func_name,
++                                               dbg_line, dbg_col, dbg_flags,
++                                               ctx->debug_trace_opaque);
++                    if (dbg_ret != 0 || JS_HasException(ctx)) {
++                        if (dbg_ret != 0 && !JS_HasException(ctx))
++                            JS_ThrowInternalError(ctx, "aborted by debugger");
++                        goto exception;
++                    }
++                }
++#else
++                /* Debugger compiled out: the trap is inert. */
++                (void)dbg_flags;
++#endif
++                REGVM_NEXT();
++            }
+             L_ROP_close_local:
+                 { int slot = RD_U16(); close_lexical_var(ctx, b, sf, slot); REGVM_NEXT(); }
+             L_ROP_get_global: {
+@@ -37288,6 +37332,50 @@
+                     REGVM_NEXT();
+                 }
+ 
++        case ROP_debug:
++     {
++                    int dbg_flags = RD_U8();
++    #if JS_ENABLE_DEBUGGER
++                    if (unlikely(dbg_flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
++                        JS_ThrowInternalError(ctx, "invalid debugger trap kind: %d",
++                                              dbg_flags);
++                        goto exception;
++                    }
++                    /*
++                     * Armed, not merely installed: an attached-but-idle debugger
++                     * would otherwise pay find_line_num on every statement. A
++                     * `debugger;` trap (DEBUGGER_STMT) always reaches the handler.
++                     */
++                    if (unlikely(ctx->debug_trace &&
++                                 (js_atomic_load_relaxed(&ctx->debug_trace_armed) ||
++                                  (dbg_flags & JS_DEBUG_TRACE_DEBUGGER_STMT)))) {
++                        int dbg_col = 0;
++                        int dbg_line;
++                        int dbg_ret;
++
++                        /* The hook can inspect the stack and throw, so publish the
++                           frame's position before the call, exactly as the stack
++                           VM's trap does. */
++                        f->cap_ip = rpc - 1;
++                        dbg_line = find_line_num(ctx, b,
++                                                 (uint32_t)(rpc - 1 - b->regvm_code),
++                                                 &dbg_col);
++                        dbg_ret = ctx->debug_trace(ctx, b->filename, b->func_name,
++                                                   dbg_line, dbg_col, dbg_flags,
++                                                   ctx->debug_trace_opaque);
++                        if (dbg_ret != 0 || JS_HasException(ctx)) {
++                            if (dbg_ret != 0 && !JS_HasException(ctx))
++                                JS_ThrowInternalError(ctx, "aborted by debugger");
++                            goto exception;
++                        }
++                    }
++    #else
++                    /* Debugger compiled out: the trap is inert. */
++                    (void)dbg_flags;
++    #endif
++                    REGVM_NEXT();
++                }
++
+         default:
+             JS_ThrowInternalError(ctx,
+                                   "register VM: cold opcode %d has no case", op);
+@@ -59642,6 +59730,8 @@
+     [ROP_mul_sub] = "rrrrr",
+     [ROP_add_mul] = "rrrrr",
+     [ROP_sub_mul] = "rrrrr",
++    /* the debugger trap: the JS_DEBUG_TRACE_* flags byte */
++    [ROP_debug] = "b",
+     [ROP_put_field] = "rasr",
+     [ROP_define_field] = "rar",
+     /* object, window base, count, template index: fills an object literal's
+@@ -62249,6 +62339,18 @@
+    IR. `pop` names the popped values (pop[0] is the deepest) and `dst` is the
+    first pushed value. Returns 0 when lowered, -1 when the opcode has no
+    lowering yet, so the whole function is refused rather than mis-encoded. */
++/* A call whose argument count does not fit the register encoding's one-byte
++   operand cannot be lowered. More than 255 arguments is legal JavaScript, so
++   the failure names the limit at compile time instead of reading as an internal
++   mystery when the function is first run. */
++static int regvm_too_many_args(JSContext *ctx, int argc)
++{
++    JS_ThrowInternalError(ctx,
++                          "register VM: a call with %d arguments is not supported "
++                          "(the limit is 255)", argc);
++    return -1;
++}
++
+ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
+                             int pos, const int *pop, const uint8_t *reuse,
+                             int dst, int below, const JSFunctionDef *fd,
+@@ -62704,7 +62806,7 @@
+         int argc = (op == OP_call) ? get_u16(bc + pos + 1) : (op - OP_call0);
+         int defs[256], a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -62719,7 +62821,7 @@
+     case OP_call_method: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -62734,7 +62836,7 @@
+     case OP_call_constructor: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -62749,7 +62851,7 @@
+     case OP_tail_call: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -62764,7 +62866,7 @@
+     case OP_tail_call_method: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -62779,7 +62881,7 @@
+     case OP_array_from: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         regvm_stage_args(ir, pop, argc, 0, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -62826,8 +62928,13 @@
+     case OP_object_fill: {
+         int n = get_u16(bc + pos + 1);
+         int ti = get_u16(bc + pos + 3), a;
+-        if (n > 255)
++        if (n > 255) {
++            JS_ThrowInternalError(ctx,
++                                  "register VM: an object literal with %d "
++                                  "properties is not supported (the limit is "
++                                  "255)", n);
+             return -1;
++        }
+         for (a = 0; a < n; a++)
+             ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
+         ADD(ROP_object_fill, pop[0], REGVM_WIN(0), n, ti);
+@@ -63134,7 +63241,7 @@
+         int argc = get_u16(bc + pos + 1);
+         int a;
+         if (argc > 255)
+-            return -1;
++            return regvm_too_many_args(ctx, argc);
+         for (a = 0; a < argc; a++)
+             ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
+         ADD(ROP_eval, dst, pop[0], REGVM_WIN(0), get_u16(bc + pos + 3), argc);
+@@ -63255,9 +63362,26 @@
+                 ADD(ROP_get_local, dst + 1, 1);
+             return 0;
+         }
++        /*
++         * A debugger trap: `debugger;` (JS_DEBUG_TRACE_DEBUGGER_STMT) or a
++         * statement trap the parser emitted because a handler was installed.
++         * Anything else on the escape page is not lowerable.
++         */
++        if (bc[pos + 1] <= JS_DEBUG_TRACE_DEBUGGER_STMT) {
++            ADD(ROP_debug, bc[pos + 1]);
++            return 0;
++        }
+         return -1;
+ 
+     default:
++        /*
++         * A completeness failure, not a user limit: an opcode the frontend
++         * emitted that the register backend has no lowering for. A register
++         * build has no stack interpreter to fall back to, so name the opcode
++         * loudly at compile time.
++         */
++        JS_ThrowInternalError(ctx, "register VM: opcode %d has no register lowering",
++                              op);
+         return -1;
+     }
+ #undef ADD
+@@ -64471,6 +64595,15 @@
+ 
+     if (n <= 0 || n_values <= 0 || fd->has_eval_call)
+         return;
++    /*
++     * A debugger can rewrite a frame slot while the program is stopped at a
++     * trap, so a read this pass would replace with the value of the last store
++     * must stay a real frame read. A function with a trap is debugger-inspected
++     * by definition; the fold's few cycles do not matter there.
++     */
++    for (i = 0; i < n; i++)
++        if (ir->insns[i].rop == ROP_debug)
++            return;
+     nref = js_malloc(ctx, (size_t)n_values);
+     seen = js_mallocz(ctx, (size_t)n_values);
+     ri = js_malloc(ctx, (size_t)n_values * 2 * sizeof(int));
+@@ -67681,6 +67814,12 @@
+                                      stub_here, stub_pc };
+             if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
+                                pv, pdef, &ev, regvm_encode_step_hook, &step)) {
++                if (JS_HasException(ctx)) {
++                    /* a named limit or a completeness failure: it is already
++                       loud, so propagate it instead of failing closed */
++                    rc = -1;
++                    goto done;
++                }
+                 unencodable = 1;
+                 break;
+             }
+@@ -67776,6 +67915,19 @@
+         int *ins_hi = js_malloc_rt(ctx->rt, (size_t)(n_blocks + 1) * sizeof(int));
+         int nlreg = reg_count;
+         int *lreg = js_malloc_rt(ctx->rt, (size_t)(nlreg + 1) * sizeof(int));
++        int has_trap = 0;
++
++        /*
++         * A function with a debugger trap keeps every slot read a frame read:
++         * a debugger can rewrite the slot while the program is stopped, and
++         * this pass would serve the read from the register that holds the
++         * stored value. See `regvm_fold_frame_reads`.
++         */
++        for (i = 0; i < ir.n_insns; i++)
++            if (ir.insns[i].rop == ROP_debug) {
++                has_trap = 1;
++                break;
++            }
+ 
+         if (bdef && bval && bpos && bcnt && touched && ins_lo && ins_hi && lreg) {
+             int bb = 0;
+@@ -67845,6 +67997,8 @@
+                 for (i = ins_lo[bb]; i <= ins_hi[bb]; i++) {
+                     int rop, d;
+                     const char *ifmt;
++                    if (has_trap)
++                        break;      /* keep every read a frame read */
+                     rop = ir.insns[i].rop;
+                     ifmt = regvm_rop_fmt[rop];
+                     if (ifmt && ifmt[0] == 'r') {
+@@ -68315,6 +68469,26 @@
+     uint64_t *seen = NULL;
+     uint8_t *val_owner = NULL;
+     int *consumed = NULL;
++    /*
++     * A function with a debugger trap keeps the frame authoritative for every
++     * slot: a trap is a point a debugger reads and writes locals from, so a
++     * read must never be served from a register copy of the slot. This gates
++     * the promotion scan below and the block-local read forwarding, and
++     * `regvm_fold_frame_reads` checks the emitted IR for the same reason.
++     * Only functions that carry a trap pay for the scan.
++     */
++    int has_debug_trap = 0;
++    {
++        int scan;
++        for (scan = 0; scan < bc_len;
++             scan += short_opcode_info(bc[scan]).size) {
++            if (bc[scan] == OP_esc1 &&
++                bc[scan + 1] <= JS_DEBUG_TRACE_DEBUGGER_STMT) {
++                has_debug_trap = 1;
++                break;
++            }
++        }
++    }
+     uint64_t *owned_bits = NULL, *exit_live = NULL, *used_any = NULL;
+     uint64_t *edge_rel = NULL;
+     int *phi_hint = NULL;
+@@ -68665,6 +68839,18 @@
+                 case OP_with_get_ref: case OP_with_get_ref_undef:
+                     allow = 0;
+                     break;
++                case OP_esc1:
++                    /*
++                     * A debugger trap (`debugger;` or a statement trap the
++                     * parser emitted because a handler was installed) is a
++                     * point a debugger stops at and inspects the frame from.
++                     * A promoted slot has no frame storage, so the frame stays
++                     * authoritative: the entry points read and write `var_buf`.
++                     * The fused get_loc0/get_loc1 escape keeps its promotion.
++                     */
++                    if (bc[pos + 1] <= JS_DEBUG_TRACE_DEBUGGER_STMT)
++                        allow = 0;
++                    break;
+                 case OP_set_loc_uninitialized: case OP_get_loc_check:
+                 case OP_put_loc_check: case OP_put_loc_check_init:
+                 case OP_close_loc: case OP_using_dispose:
+@@ -68962,7 +69148,7 @@
+                 if (fwd_ok && !is_put && !is_kill && !is_uninit && slot >= 0 &&
+                     slot < fd->var_count && ns == 1 && sval[slot] >= 0 &&
+                     !fwd_used[slot] && !(lexical && lexical[slot]) &&
+-                    !fd->vars[slot].is_captured &&
++                    !fd->vars[slot].is_captured && !has_debug_trap &&
+                     depth + ns <= bc_len + bias + 8) {
+                     push_base[pos] = sval[slot];
+                     reuse[pos] = 1;
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -1499,6 +1499,65 @@
+     return NULL;
+ }
+ 
++static uint8_t *REGVM_CC regvm_s_ROP_debug(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
++{
++    JSFunctionBytecode *b = rf->b;
++    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSRegPIC *pic = rf->pic;
++    uint8_t *rpc = ip;
++    int op = *rpc++;
++    JSValue ret_val = JS_UNDEFINED;
++    JSValue *regs = fr;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
++ {
++                int dbg_flags = RD_U8();
++#if JS_ENABLE_DEBUGGER
++                if (unlikely(dbg_flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
++                    JS_ThrowInternalError(ctx, "invalid debugger trap kind: %d",
++                                          dbg_flags);
++                    goto exception;
++                }
++                /*
++                 * Armed, not merely installed: an attached-but-idle debugger
++                 * would otherwise pay find_line_num on every statement. A
++                 * `debugger;` trap (DEBUGGER_STMT) always reaches the handler.
++                 */
++                if (unlikely(ctx->debug_trace &&
++                             (js_atomic_load_relaxed(&ctx->debug_trace_armed) ||
++                              (dbg_flags & JS_DEBUG_TRACE_DEBUGGER_STMT)))) {
++                    int dbg_col = 0;
++                    int dbg_line;
++                    int dbg_ret;
++
++                    /* The hook can inspect the stack and throw, so publish the
++                       frame's position before the call, exactly as the stack
++                       VM's trap does. */
++                    rf->cap_ip = rpc - 1;
++                    dbg_line = find_line_num(ctx, b,
++                                             (uint32_t)(rpc - 1 - b->regvm_code),
++                                             &dbg_col);
++                    dbg_ret = ctx->debug_trace(ctx, b->filename, b->func_name,
++                                               dbg_line, dbg_col, dbg_flags,
++                                               ctx->debug_trace_opaque);
++                    if (dbg_ret != 0 || JS_HasException(ctx)) {
++                        if (dbg_ret != 0 && !JS_HasException(ctx))
++                            JS_ThrowInternalError(ctx, "aborted by debugger");
++                        goto exception;
++                    }
++                }
++#else
++                /* Debugger compiled out: the trap is inert. */
++                (void)dbg_flags;
++#endif
++                REGVM_NEXT();
++            }
++ exception:
++    rf->ret = JS_EXCEPTION;
++    return NULL;
++}
++
+ static uint8_t *REGVM_CC regvm_s_ROP_dec(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+@@ -6286,6 +6345,7 @@
+     [ROP_mul_sub] = regvm_s_ROP_mul_sub,
+     [ROP_add_mul] = regvm_s_ROP_add_mul,
+     [ROP_sub_mul] = regvm_s_ROP_sub_mul,
++    [ROP_debug] = regvm_s_ROP_debug,
+ };
+ 
+ 
+@@ -6517,6 +6577,7 @@
+     [ROP_mul_sub] = 1,
+     [ROP_add_mul] = 1,
+     [ROP_sub_mul] = 1,
++    [ROP_debug] = 1,
+ };
+ 
+ 

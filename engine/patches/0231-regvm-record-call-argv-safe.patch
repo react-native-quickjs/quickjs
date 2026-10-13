@@ -1,0 +1,56 @@
+diff --git a/quickjs.c b/quickjs.c
+index ca04010..58dc066 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26398,20 +26398,28 @@ extern uint64_t js_regvm_fallback_calls;
+ #endif
+ /*
+  * May a record call read the caller's outgoing registers as its argument area
+- * instead of copying them? Only when every declared argument is supplied and,
+- * under DRC, no var_ref can reach a parameter slot (closure capture, direct
+- * eval, make_arg_ref, mapped arguments -- `args_captured`): the registers do
+- * not own their values and a write through such a ref frees the old one.
+- * Direct put_arg into a borrowed window is handled by regvm_put_arg. Must
+- * agree between slot reservation and regvm_record_fill.
++ * instead of copying them? Only when every declared argument is supplied and
++ * the callee never writes an argument slot -- `argv_safe`, the same predicate
++ * the deferred-RC borrow fusion reads (a parameter write, a var_ref onto a
++ * parameter slot, the mapped arguments object or a direct eval clears it).
++ * The callee's `put_arg` on a borrowed window lands in the caller's outgoing
++ * registers, which are live caller temporaries here, not copies; aliasing it
++ * would let the callee mutate the caller's values (the `f.apply(null,
++ * arguments)` shape). Under DRC a var_ref onto a parameter slot is also
++ * disqualifying (`args_captured`): the registers do not own their values and a
++ * write through such a ref would free one the caller still holds. Must agree
++ * between slot reservation and regvm_record_fill.
++ *
++ * This mirrors JS_CallInternal exactly: it copies when `argc < arg_count` or
++ * `JS_CALL_FLAG_COPY_ARGV && !JS_ARGV_SAFE`.
+  */
+ static inline int regvm_args_borrowable(const JSFunctionBytecode *cb, int na)
+ {
++    return na >= cb->arg_count && cb->argv_safe
+ #if QJS_DRC
+-    return na >= cb->arg_count && !cb->args_captured;
+-#else
+-    return na >= cb->arg_count;
++        && !cb->args_captured
+ #endif
++        ;
+ }
+ 
+ static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
+@@ -31162,6 +31170,13 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+         rec->arg_buf = lay->arg_buf;
+         rec->arg_owned = 1;
+         rec->local_buf = lay->arg_buf;
++        /* The copy holds every supplied argument (`slots` is the larger of
++           `na` and the declared count), so it is what `arguments` reads, as
++           in the tail-call fill. Leaving argv on the caller's window made
++           `f.apply(this, arguments)` fail its `arg_buf == argv` test in every
++           forwarder -- none is argv_safe, so each now takes this branch --
++           and build an arguments object per call. */
++        rec->argv = lay->arg_buf;
+ #if QJS_DRC
+         rec->local_count = slots + vcount;
+ #else

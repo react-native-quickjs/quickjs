@@ -605,6 +605,113 @@ TEST_F(DebuggerTest, OptimizedArgumentsAreMaterializedForFrameInspection) {
   EXPECT_NE(*it, "arguments=undefined");
 }
 
+/*
+ * A1: the light register frames must be visible to the debugger entry points.
+ *
+ * A light frame has no JSStackFrame, so the old walk (current_stack_frame ->
+ * prev_frame) skipped it: the depth was short by one per light frame, its
+ * function had no name or line, and its arguments were unreachable. The
+ * inspection below runs from a native function called by the innermost light
+ * frame, which is the shape a debugger bridge has when a breakpoint lands in
+ * one.
+ *
+ * `boot` is the record frame that the first call of the activation produces
+ * (the light path needs an arena), and it calls the three light functions, so
+ * `inner`/`middle`/`outer` are all light by construction. The expected values
+ * are the same in the stack build, where those frames are ordinary
+ * JSStackFrames: depth, every level's name and call-site line, and each
+ * level's first argument.
+ */
+TEST_F(DebuggerTest, LightFramesAreVisibleToFrameInspection) {
+  struct Level {
+    std::string func;
+    int line = -1;
+    bool is_native = false;
+    std::vector<std::string> args;
+  };
+  struct Captured {
+    int depth = 0;
+    std::vector<Level> levels;
+  };
+  static Captured cap;
+  cap = Captured{};
+
+  auto probe = [](JSContext *ctx, JSValueConst, int,
+                  JSValueConst *) -> JSValue {
+    cap.depth = JS_GetStackDepth(ctx);
+    for (int level = 0; level < cap.depth; ++level) {
+      JSDebugFrameInfo info;
+      Level lv;
+      if (JS_GetFrameInfoAtLevel(ctx, level, &info) != 0) {
+        break;
+      }
+      lv.is_native = info.is_native;
+      if (info.func_name != JS_ATOM_NULL) {
+        const char *s = JS_AtomToCString(ctx, info.func_name);
+        lv.func = s ? s : "";
+        if (s) {
+          JS_FreeCString(ctx, s);
+        }
+      }
+      lv.line = info.line;
+      JSDebugLocalVar *vars = nullptr;
+      int count = 0;
+      if (JS_GetLocalVariablesAtLevel(ctx, level, &vars, &count) == 0) {
+        for (int i = 0; i < count; ++i) {
+          if (!vars[i].is_arg) {
+            continue;
+          }
+          const char *s = JS_ToCString(ctx, vars[i].value);
+          lv.args.push_back(std::string(vars[i].name) + "=" + (s ? s : "?"));
+          if (s) {
+            JS_FreeCString(ctx, s);
+          }
+        }
+        JS_FreeLocalVariables(ctx, vars, count);
+      }
+      cap.levels.push_back(std::move(lv));
+    }
+    return JS_UNDEFINED;
+  };
+
+  JSValue global = JS_GetGlobalObject(ctx_);
+  JS_SetPropertyStr(
+      ctx_, global, "probe", JS_NewCFunction(ctx_, probe, "probe", 0));
+  JS_FreeValue(ctx_, global);
+
+  JSValue v = eval(
+      "function boot() { return outer(1); }\n"
+      "function outer(c) { return middle(c + 1); }\n"
+      "function middle(b) { return inner(b + 1); }\n"
+      "function inner(a) { return probe(a + 1); }\n"
+      "boot();\n");
+  JS_FreeValue(ctx_, v);
+
+  // probe + inner + middle + outer + boot + the eval frame. Before the light
+  // frames were walked this was 3.
+  ASSERT_EQ(cap.depth, 6) << "light frames are missing from the depth";
+  ASSERT_EQ(cap.levels.size(), 6u);
+
+  EXPECT_TRUE(cap.levels[0].is_native);
+
+  ASSERT_EQ(cap.levels[1].func, "inner");
+  EXPECT_EQ(cap.levels[1].line, 4);
+  EXPECT_EQ(cap.levels[1].args, (std::vector<std::string>{"a=3"}));
+
+  ASSERT_EQ(cap.levels[2].func, "middle");
+  EXPECT_EQ(cap.levels[2].line, 3);
+  EXPECT_EQ(cap.levels[2].args, (std::vector<std::string>{"b=2"}));
+
+  ASSERT_EQ(cap.levels[3].func, "outer");
+  EXPECT_EQ(cap.levels[3].line, 2);
+  EXPECT_EQ(cap.levels[3].args, (std::vector<std::string>{"c=1"}));
+
+  EXPECT_EQ(cap.levels[4].func, "boot");
+  EXPECT_EQ(cap.levels[4].line, 1);
+  EXPECT_EQ(cap.levels[5].func, "<eval>");
+  EXPECT_EQ(cap.levels[5].line, 5);
+}
+
 #endif  // JS_ENABLE_DEBUGGER
 
 }  // namespace

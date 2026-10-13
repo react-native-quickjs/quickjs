@@ -1,0 +1,334 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -59905,6 +59905,13 @@
+      * emitter overrides it for its own phi copies.
+      */
+     uint8_t next_origin;
++    /*
++     * Set when a call with more than 255 arguments was lowered through the
++     * apply path: its window needs the 262 slots that path stages through (the
++     * callable, receiver and array, one chunk array, a 255-value staging chunk
++     * and the append triple), not the three an ordinary spread apply needs.
++     */
++    int big_args;
+     /* Section 6.1's init set, one byte per analysis register: 1 when the
+        register may be read before it is written and so must be filled at frame
+        entry. Built on every build, not just RCCHECK; the encoder turns it into
+@@ -62744,6 +62751,71 @@
+     return -1;
+ }
+ 
++/*
++ * Item 2.2: build an array of `argc` argument values (`args[0..argc)`) into
++ * `dst` for a call whose argument count does not fit the call opcodes' one-byte
++ * window. Up to 255 values go in one ROP_array_from; further chunks are built
++ * the same way and spread-appended with ROP_append, which is exactly the
++ * sequence a spread call uses. The window layout: WIN(0) and WIN(1) hold the
++ * callable and the receiver (staged before the build, so no operand is read
++ * after `dst` is written -- the allocator may reuse a dying operand's register
++ * for `dst`), WIN(2) the array, WIN(3) the chunk array, WIN(4..258) the
++ * staging area and WIN(259..261) the append triple; `win_size` reserves 262
++ * slots for a function with a big call. Cold by construction: the chunking
++ * only runs for calls the hot opcodes cannot encode.
++ */
++static int regvm_build_arg_array(JSContext *ctx, JSRegIR *ir, int pos,
++                                 const int *args, int argc, int dst)
++{
++    int off = 0, n = argc < 255 ? argc : 255, a;
++
++    ir->big_args = 1;
++    for (a = 0; a < n; a++) {
++        int32_t ops[2] = { REGVM_WIN(4 + a), args[a] };
++        if (regvm_ir_add(ctx, ir, ROP_move, pos, ops, 2))
++            return -1;
++    }
++    {
++        int32_t ops[3] = { dst, REGVM_WIN(4), n };
++        if (regvm_ir_add(ctx, ir, ROP_array_from, pos, ops, 3))
++            return -1;
++    }
++    for (off = n; off < argc; off += 255) {
++        n = argc - off < 255 ? argc - off : 255;
++        for (a = 0; a < n; a++) {
++            int32_t ops[2] = { REGVM_WIN(4 + a), args[off + a] };
++            if (regvm_ir_add(ctx, ir, ROP_move, pos, ops, 2))
++                return -1;
++        }
++        {
++            int32_t ops[3] = { REGVM_WIN(3), REGVM_WIN(4), n };
++            if (regvm_ir_add(ctx, ir, ROP_array_from, pos, ops, 3))
++                return -1;
++        }
++        {
++            int32_t ops[2] = { REGVM_WIN(260), off };
++            if (regvm_ir_add(ctx, ir, ROP_load_i32, pos, ops, 2))
++                return -1;
++        }
++        {
++            int32_t ops[2] = { REGVM_WIN(259), dst };
++            if (regvm_ir_add(ctx, ir, ROP_move, pos, ops, 2))
++                return -1;
++        }
++        {
++            int32_t ops[2] = { REGVM_WIN(261), REGVM_WIN(3) };
++            if (regvm_ir_add(ctx, ir, ROP_move, pos, ops, 2))
++                return -1;
++        }
++        {
++            int32_t ops[1] = { REGVM_WIN(259) };
++            if (regvm_ir_add(ctx, ir, ROP_append, pos, ops, 1))
++                return -1;
++        }
++    }
++    return 0;
++}
++
+ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
+                             int pos, const int *pop, const uint8_t *reuse,
+                             int dst, int below, const JSFunctionDef *fd,
+@@ -63198,8 +63270,19 @@
+     case OP_call: {
+         int argc = (op == OP_call) ? get_u16(bc + pos + 1) : (op - OP_call0);
+         int defs[256], a;
+-        if (argc > 255)
+-            return regvm_too_many_args(ctx, argc);
++        if (argc > 255) {
++            /* the arguments do not fit the call opcode: build an array and
++               apply it, exactly as a spread call does. The callable and the
++               receiver are staged first: `dst` is written by the array build,
++               and the allocator may have given it a dying operand's register. */
++            ADD(ROP_move, REGVM_WIN(0), pop[0]);
++            ADD(ROP_load_undefined, REGVM_WIN(1));
++            if (regvm_build_arg_array(ctx, ir, pos, pop + 1, argc, dst))
++                return -1;
++            ADD(ROP_move, REGVM_WIN(2), dst);
++            ADD(ROP_apply, dst, REGVM_WIN(0), 0);
++            return 0;
++        }
+         regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -63213,8 +63296,15 @@
+     }
+     case OP_call_method: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+-        if (argc > 255)
+-            return regvm_too_many_args(ctx, argc);
++        if (argc > 255) {
++            ADD(ROP_move, REGVM_WIN(0), pop[1]);
++            ADD(ROP_move, REGVM_WIN(1), pop[0]);
++            if (regvm_build_arg_array(ctx, ir, pos, pop + 2, argc, dst))
++                return -1;
++            ADD(ROP_move, REGVM_WIN(2), dst);
++            ADD(ROP_apply, dst, REGVM_WIN(0), 0);
++            return 0;
++        }
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -63228,8 +63318,18 @@
+     }
+     case OP_call_constructor: {
+         int argc = get_u16(bc + pos + 1), defs[256], a;
+-        if (argc > 255)
+-            return regvm_too_many_args(ctx, argc);
++        if (argc > 255) {
++            /* ROP_apply's construct magic takes the callable and the
++               new.target in the same two window slots a plain apply takes the
++               callable and the receiver */
++            ADD(ROP_move, REGVM_WIN(0), pop[0]);
++            ADD(ROP_move, REGVM_WIN(1), pop[1]);
++            if (regvm_build_arg_array(ctx, ir, pos, pop + 2, argc, dst))
++                return -1;
++            ADD(ROP_move, REGVM_WIN(2), dst);
++            ADD(ROP_apply, dst, REGVM_WIN(0), 1);
++            return 0;
++        }
+         regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
+         for (a = 0; a < argc; a++) {
+             if (defs[a] >= 0) {
+@@ -66320,8 +66420,14 @@
+    after the common stack/slot transition has run. */
+ typedef struct JSRegStepEv {
+     int np, ns, depth;
+-    /* `call_method` has two fixed operands plus an 8-bit argument count. */
+-    int pop[258];
++    /*
++     * The popped operand values, in order. Points at a caller-provided buffer
++     * (`popbuf`, sized to the deepest operand stack the function reaches) so an
++     * instruction with more operands than any fixed array -- a call with more
++     * than 255 arguments -- is representable. The values are copied before the
++     * instruction's effect mutates the simulated stack.
++     */
++    int *pop;
+     int slot_k, slot_role, slot_value;
+     int split_v, split_src;
+     int copy_v, copy_src;
+@@ -66423,16 +66529,18 @@
+ static int regvm_sim_step(const JSFunctionDef *fd, const uint8_t *bc, int pos,
+                           int *scratch, int *pd, const int *push_base,
+                           JSRegSlotSim *sim, int32_t *pv, uint8_t *pdef,
+-                          JSRegStepEv *ev, JSRegStepHook hook, void *opaque)
++                          JSRegStepEv *ev, int *popbuf, int popcap,
++                          JSRegStepHook hook, void *opaque)
+ {
+     int np, ns, d = *pd, role = REGVM_SLOT_NONE, k, i;
+     memset(ev, 0, sizeof(*ev));
++    ev->pop = popbuf;
+     ev->depth = d;
+     ev->split_v = ev->split_src = -1;
+     ev->copy_v = ev->copy_src = -1;
+     ev->home_k = -1;
+     regvm_effect(fd, bc, pos, &np, &ns);
+-    if (d < np || np > (int)countof(ev->pop) || ns > (int)countof(ev->pop))
++    if (d < np || np > popcap || ns > popcap)
+         return -1;
+     ev->np = np;
+     ev->ns = ns;
+@@ -67764,6 +67872,7 @@
+     JSRegIR ir;
+     int *pc_to_insn = NULL;
+     int *scratch = NULL;
++    int *popbuf = NULL;
+     int *sval = NULL;
+     uint8_t *sentinel_bits = NULL;
+     int *ev_off = NULL, *ev_cnt = NULL, *ev_cur = NULL;
+@@ -67781,6 +67890,7 @@
+     ir.insns = NULL;
+     ir.n_insns = 0;
+     ir.cap = 0;
++    ir.big_args = 0;
+     ir.own_init = NULL;
+     ir.own_undef = NULL;
+     ir.aw_def = NULL;
+@@ -67927,6 +68037,7 @@
+         js_free(ctx, dout);
+     }
+     scratch = js_malloc(ctx, (bc_len + 8) * sizeof(int));
++    popbuf = js_malloc(ctx, (bc_len + 8) * sizeof(int));
+     ev_off = js_malloc(ctx, (size_t)(n_edges + 1) * sizeof(int));
+     ev_cnt = js_malloc(ctx, (size_t)(n_edges + 1) * sizeof(int));
+     if (ns_ok > 0)
+@@ -68367,7 +68478,8 @@
+                                      pre_e, cycle_reg, is_term, term_branch,
+                                      stub_here, stub_pc };
+             if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
+-                               pv, pdef, &ev, regvm_encode_step_hook, &step)) {
++                               pv, pdef, &ev, popbuf, bc_len + 8,
++                               regvm_encode_step_hook, &step)) {
+                 if (JS_HasException(ctx)) {
+                     /* a named limit or a completeness failure: it is already
+                        loud, so propagate it instead of failing closed */
+@@ -68840,6 +68952,10 @@
+         }
+         if (has_call && win_size < 1)
+             win_size = 1;
++        /* a big call's apply sequence stages through 262 window slots whatever
++           its argument count */
++        if (ir.big_args && win_size < 262)
++            win_size = 262;
+         {
+             int nforof = 0;
+             for (i = 0; i < ir.n_insns; i++)
+@@ -68976,6 +69092,7 @@
+     js_free(ctx, ir.aw_reads);
+     js_free(ctx, pc_to_insn);
+     js_free(ctx, scratch);
++    js_free(ctx, popbuf);
+     js_free(ctx, sval);
+     js_free(ctx, phi_in);
+     js_free(ctx, rcc_canon);
+@@ -69041,7 +69158,9 @@
+     int *in_depth = NULL, *out_depth = NULL;
+     int *pred_off = NULL, *pred = NULL, *n_pred = NULL;
+     int *ent_off = NULL, *ent = NULL, *out_off = NULL, *out = NULL;
+-    int *phi_b = NULL, *phi_i = NULL, *scratch = NULL, *push_base = NULL;
++    int *phi_b = NULL, *phi_i = NULL, *scratch = NULL, *popbuf = NULL;
++    int popcap = 0;
++    int *push_base = NULL;
+     uint8_t *reuse = NULL;
+     int *cont = NULL, n_cont = 0;
+     int *split_of = NULL, *copy_of = NULL, *home_slot_of_def = NULL;
+@@ -69963,6 +70082,8 @@
+             }
+         }
+         scratch = js_malloc(ctx, (peak + 2) * sizeof(int));
++        popbuf = js_malloc(ctx, (peak + 2) * sizeof(int));
++        popcap = peak + 2;
+     }
+     /*
+      * One entry per phi, stack and promoted-slot alike: a stack phi comes from
+@@ -69974,7 +70095,7 @@
+         phi_i = js_malloc(ctx, (nph > 0 ? nph : 1) * sizeof(int));
+     }
+     if (!ent_off || !out_off || !ent || !out || !ent_set || !ent_phi ||
+-        !scratch || !phi_b || !phi_i)
++        !scratch || !popbuf || !phi_b || !phi_i)
+         goto done;
+     {
+         int eo = 0, oo = 0;
+@@ -70016,7 +70137,7 @@
+                                      split_of, copy_of, home_slot_of_def,
+                                      home_mode >= 1, 0 };
+                 if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
+-                                   pv, pdef, &ev, NULL, NULL))
++                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                     REGVM_DEFER("the stack-shape simulator refused an instruction (SSA)");
+             }
+             if (d != out_depth[b]) {
+@@ -70333,7 +70454,7 @@
+                                      split_of, copy_of, home_slot_of_def,
+                                      home_mode >= 1, 0 };
+                 if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
+-                                   pv, pdef, &ev, NULL, NULL))
++                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                     REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
+                 prom_role = ev.slot_role;
+                 prom_k = ev.slot_k;
+@@ -70671,7 +70792,8 @@
+                                          n_ver, split_of, copy_of,
+                                          home_slot_of_def, home_mode >= 1, 0 };
+                     if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base,
+-                                       &sim, pv, pdef, &ev, NULL, NULL))
++                                       &sim, pv, pdef, &ev, popbuf, popcap,
++                                       NULL, NULL))
+                         REGVM_DEFER("the stack-shape simulator refused an instruction (value owners)");
+                     if (ev.split_v >= 0 && ev.split_src >= 0 &&
+                         ev.split_src < n_values &&
+@@ -70998,7 +71120,7 @@
+                                      split_of, copy_of, home_slot_of_def,
+                                      home_mode >= 1, 0 };
+                 if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base, &sim,
+-                                   pv, pdef, &ev, NULL, NULL))
++                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                     REGVM_DEFER("the stack-shape simulator refused an instruction (intervals)");
+                 if (sim.apply_homes && ev.split_v >= 0) {
+                     if (lin[pos] < istart[ev.split_v])
+@@ -71116,7 +71238,7 @@
+                                      split_of, copy_of, home_slot_of_def,
+                                      home_mode >= 1, 0 };
+                 if (regvm_sim_step(fd, bc, pos, scratch, &dd, push_base, &sim,
+-                                   pv, pdef, &ev, NULL, NULL))
++                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                     REGVM_DEFER("the stack-shape simulator refused an instruction (last uses)");
+                 if (sim.apply_homes && ev.split_v >= 0 &&
+                     ev.split_src >= 0 && ev.split_src < n_values &&
+@@ -71452,7 +71574,8 @@
+                                                      home_mode >= 1, 0 };
+                                 if (regvm_sim_step(fd, bc, pos, scratch, &d2,
+                                                    push_base, &sim, pv2, pd2,
+-                                                   &ev, NULL, NULL)) {
++                                                   &ev, popbuf, popcap,
++                                                   NULL, NULL)) {
+                                     bad = 1;
+                                     break;
+                                 }
+@@ -71677,6 +71800,7 @@
+     js_free(ctx, ent_set);
+     js_free(ctx, ent_phi);
+     js_free(ctx, scratch);
++    js_free(ctx, popbuf);
+     js_free(ctx, phi_b);
+     js_free(ctx, phi_i);
+     js_free(ctx, push_base);

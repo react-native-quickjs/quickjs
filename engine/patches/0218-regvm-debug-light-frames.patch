@@ -1,0 +1,588 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -819,6 +819,95 @@
+ }
+ #endif
+ 
++/*
++ * A1: the debugger entry points see the *logical* stack, in which the light
++ * register frames interleave with the real JSStackFrame chain. One entry is
++ * either a real frame (`sf`, materialized first) or a light `JSRegRun`; a light
++ * frame has no JSStackFrame of its own, so the entry point hands in scratch
++ * storage that `regvm_debug_light_fill` fills. `callee_ret` is the callee's
++ * resume address, which names this frame's call site, exactly as in
++ * `regvm_fill_backtrace_frames`. Defined after JSRegRun; declared here because
++ * the debug API sits early in the file.
++ */
++struct JSRegRun;
++typedef struct JSRegDebugFrame {
++    JSStackFrame *sf;           /* the real frame, or the filled scratch */
++    struct JSRegRun *light;     /* non-NULL when the frame is light */
++    const uint8_t *callee_ret;  /* the callee's ret_ip, for this frame's pc */
++} JSRegDebugFrame;
++typedef struct JSRegDebugIter {
++    struct JSRegRun *light;     /* next light frame in the chain */
++    JSStackFrame *sf;           /* next real frame */
++    const uint8_t *callee_ret;  /* what the next frame's pc is derived from */
++} JSRegDebugIter;
++static void regvm_debug_iter_init(JSRuntime *rt, JSRegDebugIter *it);
++static bool regvm_debug_iter_next(JSRegDebugIter *it, JSRegDebugFrame *out);
++static bool regvm_debug_frame_at_level(JSRuntime *rt, int level,
++                                       JSStackFrame *scratch,
++                                       JSRegDebugFrame *out);
++static int regvm_debug_eval_light(JSContext *ctx, struct JSRegRun *lf,
++                                  JSStackFrame *target, JSStackFrame *saved,
++                                  JSValue **peval_vars);
++
++#if !QJS_REGVM
++/*
++ * The stack-only build has no light frames, so the logical stack is the real
++ * chain and there is nothing to reconstruct. The register build defines the
++ * full walkers next to JSRegRun.
++ */
++static void regvm_debug_iter_init(JSRuntime *rt, JSRegDebugIter *it)
++{
++    it->light = NULL;
++    it->sf = rt->current_stack_frame;
++    it->callee_ret = NULL;
++}
++
++static bool regvm_debug_iter_next(JSRegDebugIter *it, JSRegDebugFrame *out)
++{
++    if (it->sf == NULL)
++        return false;
++    out->sf = it->sf;
++    out->light = NULL;
++    out->callee_ret = it->callee_ret;
++    it->callee_ret = NULL;
++    it->sf = it->sf->prev_frame;
++    return true;
++}
++
++static bool regvm_debug_frame_at_level(JSRuntime *rt, int level,
++                                       JSStackFrame *scratch,
++                                       JSRegDebugFrame *out)
++{
++    JSRegDebugIter it;
++    JSRegDebugFrame fr;
++    int i = 0;
++
++    (void)scratch;
++    regvm_debug_iter_init(rt, &it);
++    while (regvm_debug_iter_next(&it, &fr)) {
++        if (i == level) {
++            regvm_sf_materialize(rt, fr.sf);
++            *out = fr;
++            return true;
++        }
++        i++;
++    }
++    return false;
++}
++
++static int regvm_debug_eval_light(JSContext *ctx, struct JSRegRun *lf,
++                                  JSStackFrame *target, JSStackFrame *saved,
++                                  JSValue **peval_vars)
++{
++    (void)ctx;
++    (void)lf;
++    (void)target;
++    (void)saved;
++    *peval_vars = NULL;
++    return 0;
++}
++#endif
++
+ #if QJS_REGVM
+ /* Plan 5.5: the strictness and function of the innermost light frame, read
+    before the real-frame chain so a light function's own strict mode wins. */
+@@ -4242,31 +4331,58 @@
+     js_atomic_store_relaxed(&ctx->debug_trace_armed, armed);
+ }
+ 
+-static JSStackFrame *js_get_stack_frame_at_level(JSContext *ctx, int level)
++#if QJS_REGVM
++/*
++ * A1: the variable-area bound of a light frame -- the same bound the light fill
++ * and the release walks use. Slots at or above it are promoted into registers
++ * and have no value in `var_buf`, so a reader must stop there.
++ */
++static int regvm_light_var_bound(JSFunctionBytecode *b)
+ {
+-    JSRuntime *rt = ctx->rt;
+-    JSStackFrame *sf = rt->current_stack_frame;
+-    int current_level = 0;
++    int vc = b->var_count;
+ 
+-    while (sf != NULL && current_level < level) {
+-        sf = sf->prev_frame;
+-        current_level++;
+-    }
+-    if (sf)
+-        regvm_sf_materialize(rt, sf);
+-    return sf;
++#if QJS_DRC
++    if (b->var_count <= 255)
++        vc = b->regvm_var_count;
++#endif
++    return vc;
++}
++
++/* A1: the register pc of a debugger frame. The callee's resume address names
++   this frame's call site; the frame's own captured ip is the fallback, and the
++   innermost frame always uses it. */
++static int regvm_debug_frame_pc(JSRuntime *rt, JSStackFrame *sf,
++                                JSFunctionBytecode *b,
++                                const uint8_t *callee_ret);
++#else
++#define regvm_light_var_bound(b) ((int)(b)->var_count)
++#define regvm_debug_frame_pc(rt, sf, b, callee_ret) (-1)
++#endif
++
++/*
++ * A1: the frame at `level` on the logical stack (0 = innermost). A light frame
++ * has no JSStackFrame, so `scratch` receives a reconstruction and `*out` names
++ * it; a real frame is materialized in place. Returns NULL when the level is out
++ * of range.
++ */
++static JSStackFrame *js_get_stack_frame_at_level(JSContext *ctx, int level,
++                                                 JSStackFrame *scratch,
++                                                 JSRegDebugFrame *out)
++{
++    if (!regvm_debug_frame_at_level(ctx->rt, level, scratch, out))
++        return NULL;
++    return out->sf;
+ }
+ 
+ int JS_GetStackDepth(JSContext *ctx)
+ {
+-    JSRuntime *rt = ctx->rt;
+-    JSStackFrame *sf = rt->current_stack_frame;
++    JSRegDebugIter it;
++    JSRegDebugFrame fr;
+     int depth = 0;
+ 
+-    while (sf != NULL) {
++    regvm_debug_iter_init(ctx->rt, &it);
++    while (regvm_debug_iter_next(&it, &fr))
+         depth++;
+-        sf = sf->prev_frame;
+-    }
+     return depth;
+ }
+ 
+@@ -4286,7 +4402,9 @@
+         return -1;
+     }
+ 
+-    JSStackFrame *sf = js_get_stack_frame_at_level(ctx, level);
++    JSStackFrame scratch;
++    JSRegDebugFrame fr;
++    JSStackFrame *sf = js_get_stack_frame_at_level(ctx, level, &scratch, &fr);
+     if (sf == NULL)
+         return 0;
+ 
+@@ -4300,6 +4418,13 @@
+ 
+     JSFunctionBytecode *b = p->u.func.function_bytecode;
+     int total_vars = b->arg_count + b->var_count + b->closure_var_count;
++    /*
++     * A1: a light frame stores only the unpromoted slots in `var_buf`; a slot at
++     * or above the bound lives in a register the debugger cannot name, and is
++     * reported as `undefined` exactly as a record frame reports it. Never read
++     * past the bound: those slots are not even initialised in a light frame.
++     */
++    int var_bound = fr.light ? regvm_light_var_bound(b) : b->var_count;
+ 
+     if (total_vars == 0)
+         return 0;
+@@ -4310,6 +4435,8 @@
+ 
+     int idx = 0;
+     for (int i = 0; i < b->var_count; i++) {
++        if (i >= var_bound)
++            break;
+         if (b->vardefs[b->arg_count + i].var_name == JS_ATOM_arguments &&
+             JS_VALUE_GET_TAG(sf->var_buf[i]) != JS_TAG_OBJECT) {
+             JSValue arguments;
+@@ -4359,7 +4486,8 @@
+ 
+     for (int i = 0; i < b->var_count; i++) {
+         JSVarDef *vd = &b->vardefs[b->arg_count + i];
+-        APPEND_VAR(vd, sf->var_buf[i], false);
++        JSValue v = (i < var_bound) ? sf->var_buf[i] : JS_UNDEFINED;
++        APPEND_VAR(vd, v, false);
+     }
+ 
+ #undef APPEND_VAR
+@@ -4433,7 +4561,9 @@
+         return -3;
+     }
+ 
+-    JSStackFrame *sf = js_get_stack_frame_at_level(ctx, level);
++    JSStackFrame scratch;
++    JSRegDebugFrame fr;
++    JSStackFrame *sf = js_get_stack_frame_at_level(ctx, level, &scratch, &fr);
+     if (sf == NULL) {
+         JS_FreeValue(ctx, value);
+         return -1;
+@@ -4450,6 +4580,12 @@
+         return -1;
+     }
+     JSFunctionBytecode *b = p->u.func.function_bytecode;
++    /*
++     * A1: a promoted slot has no storage in a light frame's variable area, so
++     * it is not addressable and the search below must not walk past the bound.
++     * (A record frame accepts the write into the unread slot and ignores it.)
++     */
++    int var_bound = fr.light ? regvm_light_var_bound(b) : b->var_count;
+ 
+     JSAtom target_atom = JS_NewAtom(ctx, name);
+     if (target_atom == JS_ATOM_NULL) {
+@@ -4471,7 +4607,7 @@
+     }
+ 
+     /* Search locals. */
+-    for (int i = 0; i < b->var_count; i++) {
++    for (int i = 0; i < var_bound; i++) {
+         JSVarDef *vd = &b->vardefs[b->arg_count + i];
+         if (vd->var_name == target_atom) {
+             if (vd->is_const) {
+@@ -4522,7 +4658,9 @@
+        current stack frame to the target frame so that JS_EVAL_TYPE_DIRECT
+        picks up its bytecode, var_refs and closure chain via the same path
+        used by the `eval(...)` operator at runtime. */
+-    JSStackFrame *target = js_get_stack_frame_at_level(ctx, level);
++    JSStackFrame scratch;
++    JSRegDebugFrame fr;
++    JSStackFrame *target = js_get_stack_frame_at_level(ctx, level, &scratch, &fr);
+     if (!target)
+         return JS_ThrowReferenceError(ctx, "no stack frame at level %d", level);
+ 
+@@ -4552,18 +4690,29 @@
+ 
+     JSRuntime *rt = ctx->rt;
+     JSStackFrame *saved = rt->current_stack_frame;
++    struct JSRegRun *saved_light = rt->regvm_cur;
++    JSValue *eval_vars = NULL;
++    JSValue ret;
++
+     regvm_light_seal(rt, rt->regvm_cur);
+-    target->rv_light = rt->regvm_cur;
+-    target->rv_rec = NULL;
++    if (fr.light != NULL) {
++        /* A1: the scratch stands in for the target's missing JSStackFrame. */
++        if (regvm_debug_eval_light(ctx, fr.light, target, saved, &eval_vars))
++            return JS_EXCEPTION;
++    } else {
++        target->rv_light = rt->regvm_cur;
++        target->rv_rec = NULL;
++    }
+     rt->regvm_cur = NULL;
+     rt->current_stack_frame = target;
+ 
+-    JSValue ret = JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len,
+-                                  filename ? filename : "<debugger-eval>",
+-                                  1, JS_EVAL_TYPE_DIRECT, scope_idx);
++    ret = JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len,
++                          filename ? filename : "<debugger-eval>",
++                          1, JS_EVAL_TYPE_DIRECT, scope_idx);
+ 
+-    rt->regvm_cur = target->rv_light;
++    rt->regvm_cur = saved_light;
+     rt->current_stack_frame = saved;
++    js_free(ctx, eval_vars);
+     return ret;
+ }
+ 
+@@ -4576,6 +4725,8 @@
+ int JS_GetFrameInfoAtLevel(JSContext *ctx, int level, JSDebugFrameInfo *info)
+ {
+     JSStackFrame *sf;
++    JSStackFrame scratch;
++    JSRegDebugFrame fr;
+     JSObject *p;
+     JSFunctionBytecode *b;
+ 
+@@ -4587,7 +4738,7 @@
+     info->line = -1;
+     info->col = -1;
+ 
+-    sf = js_get_stack_frame_at_level(ctx, level);
++    sf = js_get_stack_frame_at_level(ctx, level, &scratch, &fr);
+     if (sf == NULL)
+         return -1;
+ 
+@@ -4608,6 +4759,16 @@
+         /* cur_pc points just past the executing instruction */
+         uint32_t pc = (uint32_t)(sf->cur_pc - b->byte_code_buf - 1);
+         info->line = find_line_num(ctx, b, pc, &info->col);
++    } else {
++        /*
++         * A register frame (record or light) has no stack pc. Its position is
++         * the callee's resume address when it called out, and its own captured
++         * ip otherwise -- the same pair the backtrace resolves.
++         */
++        int rpc = regvm_debug_frame_pc(ctx->rt, sf, b, fr.callee_ret);
++
++        if (rpc >= 0)
++            info->line = find_line_num(ctx, b, (uint32_t)rpc, &info->col);
+     }
+     return 0;
+ }
+@@ -25113,6 +25274,145 @@
+     return (p != NULL && p->sf == NULL) ? p : NULL;
+ }
+ 
++/*
++ * A1: the debugger entry points walk the logical stack, innermost first: the
++ * light frames above `current_stack_frame`, then each real frame followed by
++ * the light chain saved under it in `rv_light`. `callee_ret` mirrors the
++ * backtrace's rule -- a callee's resume address names the call site in the
++ * frame it returns to.
++ */
++static void regvm_debug_iter_init(JSRuntime *rt, JSRegDebugIter *it)
++{
++    it->light = regvm_light_head(rt->regvm_cur);
++    it->sf = rt->current_stack_frame;
++    it->callee_ret = NULL;
++}
++
++static bool regvm_debug_iter_next(JSRegDebugIter *it, JSRegDebugFrame *out)
++{
++    if (it->light != NULL) {
++        JSRegRun *lf = it->light;
++
++        out->light = lf;
++        out->sf = NULL;
++        out->callee_ret = it->callee_ret;
++        it->light = regvm_light_head(lf->caller);
++        it->callee_ret = lf->ret_ip;
++        return true;
++    }
++    if (it->sf == NULL)
++        return false;
++    out->sf = it->sf;
++    out->light = NULL;
++    out->callee_ret = it->callee_ret;
++    it->callee_ret = it->sf->rv_rec ? it->sf->rv_rec->ret_ip : NULL;
++    it->light = regvm_light_head(it->sf->rv_light);
++    it->sf = it->sf->prev_frame;
++    return true;
++}
++
++/*
++ * A1: reconstruct the JSStackFrame fields a debugger reader uses, for a light
++ * frame, in caller-provided storage. A light frame is not in the arena's record
++ * region and has no embedded JSStackFrame, so the pointer cannot be handed out
++ * beyond the call. `cur_pc` stays NULL (a register pc is not a stack pc);
++ * `regvm_ip` is the captured ip, and `rv_rec` is left NULL so the register-pc
++ * reader falls through to it.
++ */
++static void regvm_debug_light_fill(JSRegRun *lf, JSStackFrame *sf)
++{
++    JSFunctionBytecode *b = lf->b;
++
++    memset(sf, 0, sizeof(*sf));
++    sf->cur_func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
++    sf->arg_buf = lf->arg_buf;
++    sf->var_buf = lf->var_buf;
++    sf->var_refs = lf->var_refs;
++    sf->var_ref_count = b->var_ref_count;
++    /* a light call borrows the caller's window, which supplies every declared
++       argument (`regvm_light_prepare` refuses `na < arg_count`) */
++    sf->arg_count = lf->argc;
++    sf->is_strict_mode = b->is_strict_mode;
++    sf->regvm_ip = lf->cap_ip;
++}
++
++static bool regvm_debug_frame_at_level(JSRuntime *rt, int level,
++                                       JSStackFrame *scratch,
++                                       JSRegDebugFrame *out)
++{
++    JSRegDebugIter it;
++    JSRegDebugFrame fr;
++    int i = 0;
++
++    regvm_debug_iter_init(rt, &it);
++    while (regvm_debug_iter_next(&it, &fr)) {
++        if (i == level) {
++            if (fr.light != NULL) {
++                regvm_debug_light_fill(fr.light, scratch);
++                fr.sf = scratch;
++            } else {
++                regvm_sf_materialize(rt, fr.sf);
++            }
++            *out = fr;
++            return true;
++        }
++        i++;
++    }
++    return false;
++}
++
++/*
++ * A1: stand-in setup for evaluating in a light frame. The scratch takes the
++ * target's place in the chain: its outer frames are the target's caller chain,
++ * the real chain below is `saved`, and the target's registers are published as
++ * roots for the duration (a record target does that through its own `rv_regs`).
++ * `*peval_vars` receives a full-width variable-area copy when the frame stores
++ * only unpromoted slots: `get_var_ref`'s detached path reads every slot, and a
++ * light frame leaves the promoted ones uninitialised. The copy is read-only --
++ * a light function owns no captured locals -- and lives until the eval returns.
++ */
++#if QJS_REGVM
++static int regvm_debug_eval_light(JSContext *ctx, JSRegRun *lf,
++                                  JSStackFrame *target, JSStackFrame *saved,
++                                  JSValue **peval_vars)
++{
++    JSFunctionBytecode *b = lf->b;
++    int vc = regvm_light_var_bound(b);
++    int var_count = b->var_count;
++    int i;
++
++    *peval_vars = NULL;
++    target->prev_frame = saved;
++    target->rv_light = regvm_light_head(lf->caller);
++    target->rv_rec = NULL;
++    REGVM_SET_ROOT(target, lf->fr, b->regvm_reg_count);
++    if (vc < var_count) {
++        JSValue *vars = js_malloc(ctx, sizeof(JSValue) * var_count);
++        if (!vars)
++            return -1;
++        for (i = 0; i < vc; i++)
++            vars[i] = lf->var_buf[i];
++        for (; i < var_count; i++)
++            vars[i] = JS_UNDEFINED;
++        target->var_buf = vars;
++        *peval_vars = vars;
++    }
++    return 0;
++}
++#else
++static int regvm_debug_eval_light(JSContext *ctx, JSRegRun *lf,
++                                  JSStackFrame *target, JSStackFrame *saved,
++                                  JSValue **peval_vars)
++{
++    (void)ctx;
++    (void)lf;
++    (void)target;
++    (void)saved;
++    *peval_vars = NULL;
++    return 0;
++}
++#endif
++
+ #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
+ /*
+  * Plan 5.5: walk one light chain, innermost first, publishing each frame's
+@@ -25143,56 +25443,40 @@
+  */
+ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
+ {
++    JSRegDebugIter it;
++    JSRegDebugFrame fr;
+     int nb = 0;
+-    JSRegRun *lf;
+-    JSStackFrame *sf;
+-    const uint8_t *callee_ret = NULL;
+ 
+-    for (lf = regvm_light_head(rt->regvm_cur);
+-         lf != NULL && nb < max;
+-         lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
+-        bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
+-        bt[nb].cur_pc = NULL;
+-        bt[nb].rpc = callee_ret ? regvm_ret_pc(lf->b, callee_ret)
+-                                : regvm_ip_pc(lf->b, lf->cap_ip);
+-        if (bt[nb].rpc < 0)
+-            bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+-        bt[nb].sf = NULL;
+-        nb++;
+-        callee_ret = lf->ret_ip;
+-    }
+-    for (sf = rt->current_stack_frame; sf != NULL && nb < max;
+-         sf = sf->prev_frame) {
+-        JSFunctionBytecode *fb = NULL;
+-        JSRegRun *rec = sf->rv_rec;
+-        JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
++    regvm_debug_iter_init(rt, &it);
++    while (nb < max && regvm_debug_iter_next(&it, &fr)) {
++        if (fr.light != NULL) {
++            JSRegRun *lf = fr.light;
+ 
+-        if (js_class_has_bytecode(fp->class_id))
+-            fb = fp->u.func.function_bytecode;
+-        bt[nb].func = sf->cur_func;
+-        bt[nb].cur_pc = sf->cur_pc;
+-        if (fb && callee_ret)
+-            bt[nb].rpc = regvm_ret_pc(fb, callee_ret);
+-        else
+-            bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
+-        if (bt[nb].rpc < 0 && fb)
+-            bt[nb].rpc = regvm_frame_pc(rt, sf, fb);
+-        bt[nb].sf = sf;
+-        nb++;
+-        callee_ret = rec ? rec->ret_ip : NULL;
+-        for (lf = regvm_light_head(sf->rv_light);
+-             lf != NULL && nb < max;
+-             lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
+             bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
+             bt[nb].cur_pc = NULL;
+-            bt[nb].rpc = callee_ret ? regvm_ret_pc(lf->b, callee_ret)
+-                                    : regvm_ip_pc(lf->b, lf->cap_ip);
++            bt[nb].rpc = fr.callee_ret ? regvm_ret_pc(lf->b, fr.callee_ret)
++                                       : regvm_ip_pc(lf->b, lf->cap_ip);
+             if (bt[nb].rpc < 0)
+                 bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+             bt[nb].sf = NULL;
+-            nb++;
+-            callee_ret = lf->ret_ip;
++        } else {
++            JSStackFrame *sf = fr.sf;
++            JSFunctionBytecode *fb = NULL;
++            JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
++
++            if (js_class_has_bytecode(fp->class_id))
++                fb = fp->u.func.function_bytecode;
++            bt[nb].func = sf->cur_func;
++            bt[nb].cur_pc = sf->cur_pc;
++            if (fb && fr.callee_ret)
++                bt[nb].rpc = regvm_ret_pc(fb, fr.callee_ret);
++            else
++                bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
++            if (bt[nb].rpc < 0 && fb)
++                bt[nb].rpc = regvm_frame_pc(rt, sf, fb);
++            bt[nb].sf = sf;
+         }
++        nb++;
+     }
+     return nb;
+ }
+@@ -25351,6 +25635,26 @@
+ }
+ #endif
+ 
++#if QJS_REGVM
++/*
++ * A1: the register pc a debugger frame reports. The callee's resume address
++ * names this frame's call site; the frame's own captured ip is the fallback
++ * (and the only source for the innermost frame, which nothing called out of).
++ */
++static int regvm_debug_frame_pc(JSRuntime *rt, JSStackFrame *sf,
++                                JSFunctionBytecode *b,
++                                const uint8_t *callee_ret)
++{
++    int rpc = -1;
++
++    if (callee_ret)
++        rpc = regvm_ret_pc(b, callee_ret);
++    if (rpc < 0)
++        rpc = regvm_frame_pc(rt, sf, b);
++    return rpc;
++}
++#endif
++
+ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                   JSContext *ctx) REGVM_CC;
+ 

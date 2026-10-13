@@ -88,3 +88,27 @@ globalThis.v7 = 777;
 var s2 = 0;
 for (var i = 0; i < 400; i++) s2 += globalThis[names[i]];
 print('after-readd ' + s2);
+
+/* 12. a write that ADDS properties to the global object grows its property
+   array, which can move it; a site warmed before the adds must still read its
+   own slot (a cached slot pointer would dangle here without the watched-object
+   generation bump) */
+var m1 = 101;
+function rm1() { return m1; }
+print('pre-add-move ' + warm(rm1));
+for (var i = 0; i < 24; i++) globalThis['grow' + i] = i;
+print('post-add-move ' + rm1());
+
+/* 13. deleting those properties invalidates the same cells again, and the
+   warm site must re-fill and read correctly */
+print('pre-del-move ' + rm1());
+for (var i = 0; i < 24; i++) delete globalThis['grow' + i];
+print('post-del-move ' + rm1() + ' gone ' + ('grow0' in globalThis));
+
+/* 14. a later eval adds a global var through the same object; the warm site
+   survives the addition and the new name is readable */
+var m3 = 303;
+function rm3() { return m3; }
+print('pre-eval ' + warm(rm3));
+eval("var evalAdded = 404;");
+print('post-eval ' + rm3() + ' added ' + evalAdded);

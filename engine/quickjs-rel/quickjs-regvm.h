@@ -728,6 +728,45 @@ typedef enum JSRegOpcode {
     /* X6: the mirror image, the product as the right operand. */
     ROP_add_mul, ROP_sub_mul,
 
+    /*
+     * The debugger trap: the stack VM's `OP_esc1` debug sub-operations in
+     * register form, one instruction per trapped statement. The operand is the
+     * `JS_DEBUG_TRACE_*` flags byte; the handler captures the ip before calling
+     * the embedder's hook, so a backtrace taken inside the hook names the
+     * statement. It is a cold opcode and never emitted into a light-safe
+     * function (a frame the debugger stops in keeps its record). Appended at
+     * the very end so no existing opcode is renumbered.
+     */
+    ROP_debug,
+
+    /*
+     * The counted loop's increment and its latch test in one instruction: the
+     * rotated loop ends in `inc r ; branch_lt r, bound, L_body`, two
+     * dispatches, and this is the pair fused. `r` is incremented in place
+     * (the encoder checks that the inc's destination and source are the same
+     * physical register and that the branch reads it), then `r < bound`
+     * selects the back edge; the taken arm carries the same back-edge
+     * interrupt poll every other backward branch does. Anything the int fast
+     * path cannot do -- a float or BigInt counter, `INT32_MAX`, a
+     * non-numeric bound -- tail-calls a slow half that performs the two
+     * operations in order. Appended at the very end so no existing opcode is
+     * renumbered.
+     */
+    ROP_inc_branch_lt, ROP_inc_branch_lt_s,
+
+    /*
+     * The baseline (frame-slot) tier's full-width stack access. Its operand
+     * stack can be deeper than the 16-bit register operand can name (4,096),
+     * so a value above that range is spilt to a slot at the top of the frame's
+     * register file and reached by an unscaled 16-bit slot index. slot_get
+     * reads that slot (u) into a low register (r); slot_put writes the register
+     * (r) back to the slot (u). Both borrow/copy exactly as ROP_move does, so
+     * the reference-count model is unchanged. They index `regs`, not `var_buf`,
+     * so no frame-layout change is needed. Appended at the very end so no
+     * existing opcode is renumbered.
+     */
+    ROP_slot_get, ROP_slot_put,
+
     ROP_COUNT
 } JSRegOpcode;
 
@@ -784,7 +823,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
  * cross-VM one does. Bump it whenever an opcode is added, removed or
  * renumbered, or an operand's width or meaning changes.
  */
-#define REGVM_FORMAT_VERSION 16
+#define REGVM_FORMAT_VERSION 19
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */

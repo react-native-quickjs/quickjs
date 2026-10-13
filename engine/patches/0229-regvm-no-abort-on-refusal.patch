@@ -1,0 +1,28 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67857,7 +67857,7 @@ static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
+         JS_FreeCString(ctx, file);
+ }
+ 
+-#ifdef QJS_REGVM_VERIFY
++#if QJS_REGVM_VERIFY
+ /*
+  * The final refusal (after the conservative retry) is not supposed to happen:
+  * every deferral site carries a comment naming the invariant that makes it
+@@ -67867,6 +67867,15 @@ static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
+  * (Not `assert`: the reason is a runtime string, and `assert`'s argument must
+  * still be valid when it is compiled out -- a debug build without NDEBUG would
+  * not accept a non-literal there.)
++ *
++ * QJS_REGVM_VERIFY is always defined -- to 1 in a debug build and to 0 in a
++ * release build (see the default near the top of the register interpreter).
++ * The test must therefore be `#if`, not `#ifdef`: under `#ifdef` the abort
++ * branch is compiled into every build, and a script with a shape this round
++ * does not lower kills the host instead of failing closed. Every caller
++ * reports the refusal and leaves the function uncompiled, which is the
++ * compile-time `InternalError` 0228 added; in a release build this macro is a
++ * no-op.
+  */
+ #define REGVM_VERIFY_DEAD_END(why) do { \
+         fprintf(stderr, "regvm: unreachable refusal reached: %s\n", (why)); \
