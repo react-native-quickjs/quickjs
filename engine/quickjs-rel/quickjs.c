@@ -28268,7 +28268,6 @@ static uint8_t *REGVM_CC regvm_t_move_xfer(REGVM_ARGS)
         /* A transfer is a plain copy plus clearing the source; the value stays
            rooted. */
         FR(d) = FR(s);
-        FR(s) = JS_UNDEFINED;
 #else
         JSValue v = FR(s), old = FR(d);
 
@@ -31576,7 +31575,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                   if (d != s) {
 #if QJS_DRC
                       regs[d] = regs[s];
-                      regs[s] = JS_UNDEFINED;
 #else
                       set_value(ctx, &regs[d], regs[s]);
                       regs[s] = JS_UNDEFINED;

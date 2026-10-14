@@ -1027,12 +1027,16 @@
       "sha256": "b15c8c94b6dea9e61d4716071dc7a1a940ad29aba49c4167e8ad70ece0f973fe"
     },
     {
+      "name": "0262-regvm-drc-move-xfer-no-clear.patch",
+      "sha256": "9859740ce833bcb5d714e9e38b1c5840142608744e1ffdf1dae8046f58db0257"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "d543b841d44f4b99007de2af11cda6527c7f42faadf169b2c67ae63dbcae332e",
+    "quickjs.c": "672d71c918035129ac55f432344891149e85ccbe41b5ca23c724342f090bf499",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

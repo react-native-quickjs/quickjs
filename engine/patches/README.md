@@ -271,6 +271,7 @@ what we changed and why without opening a single `.patch` file.
 | `0259` | Decides loose equality, null tests and truthiness inline in the register VM | `x == null`, `x != 0` and `if (obj)` reached out-of-line compare and branch routines on every execution, about 12% of Octane richards' instructions | Loose `==`/`!=` without coercion and object, string and double truthiness are tag tests in the fast handlers | No. |
 | `0260` | Divides and takes remainders inline in the register VM | Every `/` and `%` went through the generic binary routine and its ToNumber conversion, even on two small ints | Two ints, two doubles and an int with a double are divided and reduced in the fast path with the slow routine's result rules | No. |
 | `0261` | Gives each binary immediate operation its own threaded handler | `binary_imm` switched on its operation operand inside the fast path on every execution, 29 instructions each on Octane mandreel | The handler tail-calls a per-operation handler from an operand-indexed table, so each fast path is compiled for one operation | No. |
+| `0262` | Stops clearing the source register of a transfer move under deferred RC | Registers do not own their values under deferred RC, so emptying the dead source of `move_xfer` released nothing and cost two stores per execution | The transfer is a plain copy under deferred RC; the non-DRC build is unchanged | No. |
 
 
 ## Reading the patches
