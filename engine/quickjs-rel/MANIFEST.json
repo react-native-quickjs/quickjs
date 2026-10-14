@@ -1043,12 +1043,16 @@
       "sha256": "55761c13834994585ab10601ca743e1d4bbb7e0a06b5b3b9ff1cca204880c802"
     },
     {
+      "name": "0266-ctor-instance-shape-cache.patch",
+      "sha256": "dc3d45f3317e8083b6982a187a8c47d0dbc9f3915231ffae16db2c8e9e6ecc63"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "e7d794e10a7d1b4ea932116e94c47b23980e177be9f99b6e8d1e85132e75ff7c"
     }
   ],
   "files": {
-    "quickjs.c": "70d1975808a64f339d320867be5a5bace79c95144bd1c11d27ffd8f956ea78ee",
+    "quickjs.c": "048c80e10901c12dbd7dbfbe85d2490bcf1bdc4ec3ca35e4dc94a52e54c6cc58",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

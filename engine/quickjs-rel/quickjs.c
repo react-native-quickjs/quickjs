@@ -1573,6 +1573,10 @@ typedef struct JSFunctionBytecode {
     uint8_t inst_cap_seen;
     uint8_t inst_cap_samples;
     uint8_t *byte_code_buf; /* (self pointer) */
+    JSShape *ctor_fn_shape;
+    JSShape *ctor_inst_shape[4];
+    uint16_t ctor_proto_slot;
+    uint8_t ctor_inst_next;
     int byte_code_len;
     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
     JSICEntry *ic_table;
@@ -7794,7 +7798,8 @@ static int fnbc_is_acyclic(JSFunctionBytecode *b)
        materialization failed is excluded: its pool was filled before
        byte_code_buf was set. */
     return (b->cpool_count == 0 || (b->is_lazy && !b->lazy_failed)) &&
-           b->objlit_tab == NULL && b->ic_table == NULL
+           b->objlit_tab == NULL && b->ic_table == NULL &&
+           b->ctor_fn_shape == NULL && b->ctor_inst_shape[0] == NULL
 #if QJS_REGVM
            /* The register PIC holds counted shape references; an untraced
               bytecode must still mark them. */
@@ -10380,6 +10385,12 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                     if (e->to_shape)
                         mark_func(rt, &e->to_shape->header);
                 }
+            }
+            if (b->ctor_fn_shape)
+                mark_func(rt, &b->ctor_fn_shape->header);
+            for (i = 0; i < 4; i++) {
+                if (b->ctor_inst_shape[i])
+                    mark_func(rt, &b->ctor_inst_shape[i]->header);
             }
 #if QJS_REGVM
             /* The register PIC holds counted shape references per site; mark
@@ -24328,7 +24339,8 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
        every cached cell, the same as the generic add paths do */
     if (unlikely(p->gv_watched))
         js_gv_cell_invalidate(ctx->rt);
-    if (nsh->prop_size != osh->prop_size) {
+    if (nsh->prop_size != osh->prop_size &&
+        (uint32_t)nsh->prop_size > p->prop_inline_cap) {
         JSProperty *np = js_prop_grow(ctx, p,
                                       sizeof(p->prop[0]) * nsh->prop_size);
         if (unlikely(!np))
@@ -40271,6 +40283,9 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
 {
     JSValue proto, obj;
     JSContext *realm;
+    JSObject *cp = NULL;
+    JSProperty *ppr = NULL;
+    JSFunctionBytecode *fb = NULL;
 
     if (JS_IsUndefined(ctor)) {
         proto = js_dup(ctx->class_proto[class_id]);
@@ -40281,16 +40296,36 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
            another class) takes the generic read, which also instantiates the
            stub. */
         if (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT) {
-            JSObject *cp = JS_VALUE_GET_OBJ(ctor);
+            cp = JS_VALUE_GET_OBJ(ctor);
 
             if (cp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
-                JSProperty *pr;
-                JSShapeProperty *prs = find_own_property(&pr, cp,
-                                                         JS_ATOM_prototype);
+                JSShapeProperty *prs;
+                JSValue pv;
 
-                if (prs != NULL &&
-                    (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
-                    proto = js_dup(pr->u.value);
+                fb = cp->u.func.function_bytecode;
+                if (fb->ctor_fn_shape == cp->shape) {
+                    ppr = &cp->prop[fb->ctor_proto_slot];
+                } else {
+                    prs = find_own_property(&ppr, cp, JS_ATOM_prototype);
+                    if (prs == NULL ||
+                        (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                        ppr = NULL;
+                }
+                if (ppr) {
+                    pv = ppr->u.value;
+                    if (class_id == JS_CLASS_OBJECT &&
+                        JS_VALUE_GET_TAG(pv) == JS_TAG_OBJECT) {
+                        JSObject *po = JS_VALUE_GET_OBJ(pv);
+                        int k;
+                        for (k = 0; k < 4; k++) {
+                            JSShape *ish = fb->ctor_inst_shape[k];
+                            if (ish && ish->proto == po)
+                                return JS_NewObjectFromShapeCap(ctx,
+                                           js_dup_shape(ish), class_id, NULL,
+                                           req_cap);
+                        }
+                    }
+                    proto = js_dup(pv);
                     goto proto_ready;
                 }
             }
@@ -40301,6 +40336,7 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
     proto_ready:
         if (!JS_IsObject(proto)) {
             JS_FreeValue(ctx, proto);
+            ppr = NULL;
             realm = JS_GetFunctionRealm(ctx, ctor);
             if (!realm)
                 return JS_EXCEPTION;
@@ -40308,6 +40344,30 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
         }
     }
     obj = JS_NewObjectProtoClassCap(ctx, proto, class_id, req_cap);
+    if (ppr && class_id == JS_CLASS_OBJECT && !JS_IsException(obj)) {
+        JSShape *ish = JS_VALUE_GET_OBJ(obj)->shape;
+
+        if (ish->is_hashed && ish->prop_count == 0 &&
+            ish->proto == JS_VALUE_GET_OBJ(proto)) {
+            JSRuntime *rt = ctx->rt;
+            uint32_t slot = (uint32_t)(ppr - cp->prop);
+            int k;
+
+            js_fnbc_gc_force_trace(rt, fb);
+            if (cp->shape->is_hashed && slot <= UINT16_MAX &&
+                fb->ctor_fn_shape != cp->shape) {
+                if (fb->ctor_fn_shape)
+                    js_free_shape(rt, fb->ctor_fn_shape);
+                fb->ctor_fn_shape = js_dup_shape(cp->shape);
+                fb->ctor_proto_slot = (uint16_t)slot;
+            }
+            k = fb->ctor_inst_next & 3;
+            if (fb->ctor_inst_shape[k])
+                js_free_shape(rt, fb->ctor_inst_shape[k]);
+            fb->ctor_inst_shape[k] = js_dup_shape(ish);
+            fb->ctor_inst_next = (uint8_t)(k + 1);
+        }
+    }
     JS_FreeValue(ctx, proto);
     return obj;
 }
@@ -71065,6 +71125,16 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 
     /* release IC-held shape refs and free the table */
     js_free_ic_table(rt, b);
+    if (b->ctor_fn_shape) {
+        js_free_shape(rt, b->ctor_fn_shape);
+        b->ctor_fn_shape = NULL;
+    }
+    for (i = 0; i < 4; i++) {
+        if (b->ctor_inst_shape[i]) {
+            js_free_shape(rt, b->ctor_inst_shape[i]);
+            b->ctor_inst_shape[i] = NULL;
+        }
+    }
 
 #if QJS_REGVM
     /* release register-PIC-held shape refs and free the table */
