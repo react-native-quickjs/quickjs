@@ -1031,21 +1031,25 @@
       "sha256": "9859740ce833bcb5d714e9e38b1c5840142608744e1ffdf1dae8046f58db0257"
     },
     {
+      "name": "0263-regvm-global-site-cache.patch",
+      "sha256": "af678b7cdaf76d7ca52ec72bf599490f103ccebae9923d3d94378eb6498aae33"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
+      "sha256": "0d4224760b76db65765bec6b4667915a72e0d71f29d4e13aa02374f4499a95b6"
     }
   ],
   "files": {
-    "quickjs.c": "672d71c918035129ac55f432344891149e85ccbe41b5ca23c724342f090bf499",
+    "quickjs.c": "f2739aa33bcec6e1f226280d27d89e4ba8278c74a7395af20acca1fc67550a78",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
     "builtin-array-fromasync.regvm.h": "5851f9666ee83d9a907c2e664ce1ac8ce43ee9853513eec43107b65f864f722d",
     "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
-    "builtin-iterator-zip-keyed.regvm.h": "0d4301cf1c823a109cb14db98e48b602750253911deec9fd34c07b272010cf20",
+    "builtin-iterator-zip-keyed.regvm.h": "b8ad9f005f08f831617da827d3be4d6311f02c0d90163caa2e9adb5a6dc33afb",
     "builtin-iterator-zip.h": "1133567b87c8af0d6c3c680ec1a8fcfcba65acc975885477c2c688ac55f149bc",
-    "builtin-iterator-zip.regvm.h": "06f3c1ee10a46c67b87b6d0b792c824c6cb074911fe4685b47b05c1eb50b3260",
+    "builtin-iterator-zip.regvm.h": "b5a84fd2dff1aa5dccb5b97caaaf81bf111b3f72076daf0f905b2b8bbc379212",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",

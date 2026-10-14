@@ -7868,7 +7868,10 @@ static void js_free_ic_table(JSRuntime *rt, JSFunctionBytecode *b)
    hashed shape in place at refcount 1, so holding a reference forces
    copy-on-write and keeps the cached layout immutable. */
 struct JSRegPIC {
-    JSShape  *shape;         /* receiver shape; a counted reference */
+    union {
+        JSShape    *shape;   /* receiver shape; a counted reference */
+        JSProperty *gslot;
+    };
     uint32_t  slot_off;      /* property byte offset: slot * sizeof(JSValue) */
     uint16_t  kind;          /* REG_PIC_EMPTY / OWN / PROTO / OWN_W */
     uint16_t  misses;        /* stop refilling at a limit: megamorphic */
@@ -7884,12 +7887,13 @@ _Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
 #define REG_PIC_PROTO 2
 #define REG_PIC_OWN_W 3   /* own writable data slot: the store's hit */
 #define REG_PIC_ADD_W 4   /* add-transition store: shape -> holder, fresh slot */
+#define REG_PIC_GLOBAL 6
 
 /* Release one entry's shape references and clear it. Also used by a refill
    before storing the new shapes. */
 static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
 {
-    if (e->shape)
+    if (e->shape && e->kind != REG_PIC_GLOBAL)
         js_free_shape(rt, e->shape);
     if (*pholder)
         js_free_shape(rt, *pholder);
@@ -8458,6 +8462,29 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     return 0;
 }
 
+#if QJS_REGVM
+static void js_gv_site_flush(JSRuntime *rt, struct list_head *head)
+{
+    struct list_head *el;
+
+    list_for_each(el, head) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSFunctionBytecode *b;
+        uint32_t j;
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+            continue;
+        b = (JSFunctionBytecode *)gp;
+        if (!b->regvm_pic)
+            continue;
+        for (j = 0; j < b->regvm_pic_count; j++) {
+            if (b->regvm_pic[j].kind == REG_PIC_GLOBAL)
+                b->regvm_pic[j].slot_off = 0;
+        }
+    }
+}
+#endif
+
 /* Invalidate every OP_get_var cell in the runtime. */
 static void js_gv_cell_invalidate(JSRuntime *rt)
 {
@@ -8468,6 +8495,11 @@ static void js_gv_cell_invalidate(JSRuntime *rt)
             JSContext *c = list_entry(el, JSContext, link);
             memset(c->gv_cells, 0, sizeof(c->gv_cells));
         }
+#if QJS_REGVM
+        js_gv_site_flush(rt, &rt->gc_obj_list);
+        js_gv_site_flush(rt, &rt->gc_notrace_list);
+        js_gv_site_flush(rt, &rt->gc_zero_ref_count_list);
+#endif
     }
 }
 
@@ -10356,7 +10388,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                 uint32_t nw = (uint32_t)REGVM_PIC_WAYS * b->regvm_pic_count;
                 for (j = 0; j < nw; j++) {
                     JSRegPIC *e = &b->regvm_pic[j];
-                    if (e->shape)
+                    if (e->shape && e->kind != REG_PIC_GLOBAL)
                         mark_func(rt, &e->shape->header);
                     if (b->regvm_pic_holder && b->regvm_pic_holder[j])
                         mark_func(rt, &b->regvm_pic_holder[j]->header);
@@ -15527,6 +15559,39 @@ static inline bool js_gv_cell_probe(JSContext *ctx, JSAtom atom, JSValue *pval)
 }
 
 /* Record "this atom is own data property #(pr - p->prop) of p". */
+#if QJS_REGVM
+static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC **ppic, JSAtom atom, int site)
+{
+    JSGVCell *gvc = ctx->gv_cells[atom & (JS_GV_CELL_SETS - 1)];
+    uint32_t gen = ctx->rt->gv_cell_gen;
+    JSProperty *slot;
+    JSRegPIC *pic, *e;
+
+    if (gvc[0].atom == atom && gvc[0].gen == gen)
+        slot = gvc[0].slot;
+    else if (gvc[1].atom == atom && gvc[1].gen == gen)
+        slot = gvc[1].slot;
+    else
+        return;
+    if ((unsigned)site >= b->regvm_pic_count)
+        return;
+    pic = *ppic;
+    if (!pic) {
+        pic = regvm_pic_ensure(ctx->rt, b);
+        if (!pic)
+            return;
+        *ppic = pic;
+    }
+    e = &pic[site];
+    if (e->kind != REG_PIC_GLOBAL && e->kind != REG_PIC_EMPTY)
+        return;
+    e->gslot = slot;
+    e->slot_off = gen;
+    e->kind = REG_PIC_GLOBAL;
+}
+#endif
+
 static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
                                    JSObject *p, JSProperty *pr)
 {
@@ -25449,6 +25514,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
 #define T_SZ_RR_S   3    /* "rr"    one-byte registers */
 #define T_SZ_RBC    8    /* "rbc"   */
 #define T_SZ_RAB    8    /* "rab"   */
+#define T_SZ_RABS  10
 #define T_SZ_RRAS  11    /* "rras"  */
 #define T_SZ_RASR  11    /* "rasr"  */
 /* fused chain read: d1,r1,atom1,site1,d2,r2,atom2,site2 */
@@ -28326,31 +28392,38 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_global_slow(REGVM
     int throwing = T_U8(7);
     JSValue val;
 
-    /* a global can be an accessor, so publish this frame's position first */
     REGVM_CAPTURE_IP();
     val = JS_GetGlobalVar(ctx, atom, throwing);
 
     if (JS_IsException(val))
         T_FAIL();
-    T_SET_NEXT_P(d, val, T_SZ_RAB);
+    regvm_global_site_fill(ctx, f->b, &f->pic, atom, T_U16(8));
+    T_SET_NEXT_P(d, val, T_SZ_RABS);
 }
 
-/*
- * The global-variable cell cache, probed inline as the stack VM's OP_get_var
- * does. A filled cell has passed the TDZ test: the sole writer of
- * JS_UNINITIALIZED into global_var_obj bumps the generation, as does any change
- * to the global object's shape. `js_gv_cell_peek` is call-free and takes no
- * reference: the cell's object slot owns the value and a register borrows it.
- */
-static uint8_t *REGVM_CC regvm_t_get_global(REGVM_ARGS)
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_global_cell(REGVM_ARGS)
 {
     int d = T_REG(1);
     JSAtom atom = (JSAtom)T_U32(3);
     JSValue val;
 
-    if (likely(js_gv_cell_peek(ctx, atom, &val)))
-        T_SET_NEXT_B(d, val, T_SZ_RAB);
+    if (likely(js_gv_cell_peek(ctx, atom, &val))) {
+        regvm_global_site_fill(ctx, f->b, &f->pic, atom, T_U16(8));
+        T_SET_NEXT_B(d, val, T_SZ_RABS);
+    }
     __attribute__((musttail)) return regvm_t_get_global_slow(REGVM_PASS);
+}
+
+static uint8_t *REGVM_CC regvm_t_get_global(REGVM_ARGS)
+{
+    JSRegPIC *pic = f->pic;
+
+    if (likely(pic != NULL)) {
+        JSRegPIC *e = &pic[T_U16(8)];
+        if (likely(e->slot_off == ctx->rt->gv_cell_gen))
+            T_SET_NEXT_B(T_REG(1), e->gslot->u.value, T_SZ_RABS);
+    }
+    __attribute__((musttail)) return regvm_t_get_global_cell(REGVM_PASS);
 }
 
 /* cold: the remaining fast-array classes (arguments, mapped arguments, the
@@ -31933,6 +32006,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int d = RD_REG();
                 JSAtom atom = RD_U32();
                 int throwing = RD_U8();
+                (void)RD_U16();
                 JSValue val;
                 /* The cell cache first, as the stack VM's OP_get_var does. A
                    filled cell has passed the TDZ test, and both a write of
@@ -58318,7 +58392,7 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
     [ROP_put_arg_xfer] = "ur",
     [ROP_get_var_ref] = "ru",
     [ROP_put_var_ref] = "ur",
-    [ROP_get_global] = "rab",
+    [ROP_get_global] = "rabs",
     [ROP_put_global] = "arb",
     [ROP_local_uninit] = "u",
     [ROP_local_check] = "u",
@@ -58578,6 +58652,7 @@ static void js_regvm_thread_check_sizes(void)
     T_CHK(T_SZ_RRR, put_element);
     T_CHK(T_SZ_RBUU, object_fill);
     T_CHK(T_SZ_RAB, put_global);
+    T_CHK(T_SZ_RABS, get_global);
 #undef T_CHK
     if (bad)
         abort();
