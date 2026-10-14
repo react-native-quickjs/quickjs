@@ -2079,6 +2079,7 @@ struct JSObject {
                                     11 flag bits + 5 = exactly the 2-byte slot
                                     before class_id, which does not move. */
     uint16_t class_id; /* see JS_CLASS_x */
+    uint8_t values_inline;
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
     JSProperty *prop; /* array of properties */
@@ -8653,6 +8654,7 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 }
 
 #define JS_OBJ_INLINE_PROPS 4
+#define JS_ARRAY_INLINE_MAX 16
 /* Upper bound for the per-constructor learned inline capacity: how many own
    properties a learned object keeps inline before it grows a separate
    property array. `prop_inline_cap` is a 5-bit field, so it must stay below
@@ -8682,8 +8684,21 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
    of elements depends on the shape. req_cap is the O2 learned inline
    capacity: when non-zero and larger than the shape-derived capacity, the
    object reserves req_cap slots for JS_CLASS_OBJECT. */
+static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
+                                             JSClassID class_id,
+                                             JSProperty *props, uint32_t req_cap,
+                                             uint32_t extra_values);
+
 static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID class_id,
                                         JSProperty *props, uint32_t req_cap)
+{
+    return JS_NewObjectFromShapeCapExtra(ctx, sh, class_id, props, req_cap, 0);
+}
+
+static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
+                                             JSClassID class_id,
+                                             JSProperty *props, uint32_t req_cap,
+                                             uint32_t extra_values)
 {
     JSObject *p;
     int i;
@@ -8704,12 +8719,14 @@ static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID c
             inline_cap = req_cap;
         }
         p = js_malloc(ctx, sizeof(JSObject) +
-                           inline_cap * sizeof(JSProperty));
+                           inline_cap * sizeof(JSProperty) +
+                           extra_values * sizeof(JSValue));
         if (unlikely(!p))
             goto fail;
         p->prop_inline_cap = inline_cap;
     }
     p->class_id = class_id;
+    p->values_inline = 0;
     p->extensible = true;
     p->free_mark = 0;
     p->is_exotic = 0;
@@ -8754,6 +8771,12 @@ static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID c
             p->u.array.count = 0;
             p->u.array.hole_count = 0;
             p->u.array.u1.size = 0;
+            if (extra_values != 0) {
+                p->u.array.u.values = (JSValue *)((JSProperty *)(p + 1) +
+                                                  p->prop_inline_cap);
+                p->u.array.u1.size = extra_values;
+                p->values_inline = 1;
+            }
             if (!props) {
                 /* XXX: remove */
                 /* the length property is always the first one */
@@ -9051,14 +9074,19 @@ exception:
 static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
                                      int count)
 {
-    JSValue obj = JS_NewArray(ctx);
+    JSValue obj;
     JSObject *p;
     int i;
 
+    if (count > 0 && count <= JS_ARRAY_INLINE_MAX)
+        obj = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape),
+                                            JS_CLASS_ARRAY, NULL, 0, count);
+    else
+        obj = JS_NewArray(ctx);
     if (JS_IsException(obj) || count == 0)
         return obj;
     p = JS_VALUE_GET_OBJ(obj);
-    if (expand_fast_array(ctx, p, count)) {
+    if (!p->values_inline && expand_fast_array(ctx, p, count)) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
     }
@@ -9598,7 +9626,8 @@ static void js_array_finalizer(JSRuntime *rt, JSValueConst val)
     for(i = 0; i < p->u.array.count; i++) {
         JS_FreeValueRT(rt, p->u.array.u.values[i]);
     }
-    js_free_rt(rt, p->u.array.u.values);
+    if (!p->values_inline)
+        js_free_rt(rt, p->u.array.u.values);
 }
 
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
@@ -13814,7 +13843,9 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
             pr->u.value = v;
         }
     }
-    js_free(ctx, p->u.array.u.values);
+    if (!p->values_inline)
+        js_free(ctx, p->u.array.u.values);
+    p->values_inline = 0;
     p->u.array.count = 0;
     p->u.array.hole_count = 0;
     p->u.array.u.values = NULL; /* fail safe */
@@ -14061,9 +14092,18 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
         return -1;
     }
     new_size = max_uint32(new_len, new_size);
-    new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
-    if (!new_array_prop)
-        return -1;
+    if (p->values_inline) {
+        new_array_prop = js_malloc(ctx, sizeof(JSValue) * new_size);
+        if (!new_array_prop)
+            return -1;
+        memcpy(new_array_prop, p->u.array.u.values,
+               sizeof(JSValue) * p->u.array.count);
+        p->values_inline = 0;
+    } else {
+        new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
+        if (!new_array_prop)
+            return -1;
+    }
     p->u.array.u.values = new_array_prop;
     p->u.array.u1.size = new_size;
     return 0;

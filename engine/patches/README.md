@@ -276,6 +276,7 @@ what we changed and why without opening a single `.patch` file.
 | `0264` | Initializes an object's global-watch flag when it is created | `gv_watched` was never cleared on a new object, so a reused allocator block could leave it set and every property add on that object invalidated all global caches | The bit is cleared with the other flags; register global sites also allocate their cache table before probing the cell | No. |
 | `0265` | Fuses a register VM `this` load into the property read that uses it | Every `this.x` was two dispatches; `load_this` was 12% of Octane deltablue's register instructions | Adjacent `load_this` + `get_field`/`get_field2` becomes one instruction that writes both registers | Yes (9999 holds the version) |
 | `0266` | Caches a constructor's instance shapes and skips a redundant grow call | Every `new` hashed for `prototype` and then for the empty shape of that prototype, about 110 of the roughly 350 instructions a construction costs on Octane raytrace | A 4-way per-bytecode cache maps prototype to empty instance shape, with the `prototype` slot cached for hashed function shapes; add-transition stores skip the grow call when inline slots fit | No. |
+| `0267` | Stores a small array literal's elements in the array's own block | Every array literal was two allocations and two frees; on Octane splay creating a ten-element payload array cost about 700 instructions | Literals of up to 16 elements reserve their element storage inside the object block, copied out on growth | No. |
 
 
 ## Reading the patches
