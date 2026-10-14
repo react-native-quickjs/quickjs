@@ -274,6 +274,7 @@ what we changed and why without opening a single `.patch` file.
 | `0262` | Stops clearing the source register of a transfer move under deferred RC | Registers do not own their values under deferred RC, so emptying the dead source of `move_xfer` released nothing and cost two stores per execution | The transfer is a plain copy under deferred RC; the non-DRC build is unchanged | No. |
 | `0263` | Gives the register VM's global reads a per-instruction cache | `get_global` hashed into a shared 2-way cell cache on every execution, 22 instructions each and 21% of Octane mandreel's register instructions, with globals in one set evicting each other | `get_global` gains a cache site holding the global's slot and generation, checked with one compare | Yes (9999 holds the version and the rebuilt register blobs) |
 | `0264` | Initializes an object's global-watch flag when it is created | `gv_watched` was never cleared on a new object, so a reused allocator block could leave it set and every property add on that object invalidated all global caches | The bit is cleared with the other flags; register global sites also allocate their cache table before probing the cell | No. |
+| `0265` | Fuses a register VM `this` load into the property read that uses it | Every `this.x` was two dispatches; `load_this` was 12% of Octane deltablue's register instructions | Adjacent `load_this` + `get_field`/`get_field2` becomes one instruction that writes both registers | Yes (9999 holds the version) |
 
 
 ## Reading the patches

@@ -41,6 +41,7 @@ Why we need it
                              bytecode blobs, which record the bumped version
     0263-regvm-global-site-cache gives the register `get_global` a cache site
                              operand
+    0265-regvm-this-field-fusion adds two register opcodes
 
   A patch that needs the version raised says so in its own header and in its
   row of README.md, and changes nothing itself.

@@ -25978,6 +25978,12 @@ static uint8_t *REGVM_CC regvm_t_get_field2_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field2_own(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS);
+#if QJS_DRC
+static uint8_t *REGVM_CC regvm_t_get_this_field(REGVM_ARGS);
+#define REGVM_THIS_FIELD_HANDLER regvm_t_get_this_field
+#else
+#define REGVM_THIS_FIELD_HANDLER regvm_t_cold
+#endif
 static uint8_t *REGVM_CC regvm_t_get_field_chain_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field_chain_second_slow(REGVM_ARGS);
 #if !QJS_DRC
@@ -26353,6 +26359,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(get_field2_own, regvm_t_get_field2_own) \
     X(get_field_chain, regvm_t_get_field_chain) \
     X(get_field_chain_own, regvm_t_get_field_chain_own) \
+    X(get_this_field, REGVM_THIS_FIELD_HANDLER) \
+    X(get_this_field2, REGVM_THIS_FIELD_HANDLER) \
     X(mul_add, regvm_t_mul_add) \
     X(mul_sub, regvm_t_mul_sub) \
     X(add_mul, regvm_t_add_mul) \
@@ -28600,6 +28608,62 @@ T_GET_FIELD_BODY(get_field2)
  * when the old value's last reference dies `..._free1` releases it and does
  * the second read.
  */
+#if QJS_DRC
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_this_field_slow(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int r = T_REG(3);
+    JSAtom atom = (JSAtom)T_U32(5);
+    int site = T_REG(9);
+    JSValue t = f->this_obj, val;
+
+    REGVM_CAPTURE_IP();
+    if (!f->b->is_strict_mode && JS_VALUE_GET_TAG(t) != JS_TAG_OBJECT) {
+        uint32_t tag = JS_VALUE_GET_TAG(t);
+        if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+            FR(r) = ctx->global_obj;
+        } else {
+            JSValue o = JS_ToObject(ctx, t);
+            if (JS_IsException(o))
+                T_FAIL();
+            FR(r) = o;
+            REG_ADOPT(ctx->rt, o);
+        }
+    } else {
+        FR(r) = t;
+    }
+    if (regvm_string_proto_get(ctx, FR(r), atom, &val)) {
+        T_SET_NEXT_P(d, val, T_SZ_RRAS);
+    }
+    if (site == REG_IC_NONE)
+        val = JS_GetProperty(ctx, FR(r), atom);
+    else
+        val = regvm_get_field_ic(ctx, f->b, &f->pic, FR(r), atom, site);
+    if (JS_IsException(val))
+        T_FAIL();
+    T_SET_NEXT_P(d, val, T_SZ_RRAS);
+}
+
+static uint8_t *REGVM_CC regvm_t_get_this_field(REGVM_ARGS)
+{
+    uint32_t dr;
+    int d, r, site;
+    JSValue t = f->this_obj, val;
+
+    if (unlikely(JS_VALUE_GET_TAG(t) != JS_TAG_OBJECT))
+        __attribute__((musttail)) return regvm_t_get_this_field_slow(REGVM_PASS);
+    memcpy(&dr, ip + 1, 4);
+    d = (int)(dr & 0xffff);
+    r = (int)(dr >> 16);
+    site = T_REG(9);
+    FR(r) = t;
+    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, t, site, &val)) {
+        T_SET_NEXT_B(d, val, T_SZ_RRAS);
+    }
+    __attribute__((musttail)) return regvm_t_get_this_field_slow(REGVM_PASS);
+}
+#endif
+
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_get_field_chain_second_slow(REGVM_ARGS)
 {
@@ -31401,6 +31465,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             [ROP_get_arg_field] = REGVM_MONO_ENTRY(L_ROP_get_arg_field),
             [ROP_slot_get] = REGVM_MONO_ENTRY(L_ROP_slot_get),
             [ROP_slot_put] = REGVM_MONO_ENTRY(L_ROP_slot_put),
+            [ROP_get_this_field] = REGVM_MONO_ENTRY(L_ROP_get_this_field),
+            [ROP_get_this_field2] = REGVM_MONO_ENTRY(L_ROP_get_this_field2),
         };
 #ifdef QJS_REGVM_COUNT
 #define REGVM_COUNT_INC(o) js_regvm_count[o]++
@@ -32179,6 +32245,44 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_CAPTURE_IP_MONO(i_start);
                 if (site == REG_IC_NONE) {
                     /* no site: the generic route */
+                    val = JS_GetProperty(ctx, regs[r], atom);
+                } else {
+                    val = regvm_get_field_ic(ctx, b, &pic, regs[r], atom, site);
+                }
+                if (JS_IsException(val))
+                    goto exception;
+                SET_REG_P(d, val);
+                REGVM_NEXT();
+            }
+            L_ROP_get_this_field:
+            L_ROP_get_this_field2: {
+                const uint8_t *i_start = rpc - 1;
+                int d = RD_REG();
+                int r = RD_REG();
+                JSAtom atom = RD_U32();
+                int site = RD_U16();
+                JSValue val;
+                if (!b->is_strict_mode) {
+                    uint32_t tag = JS_VALUE_GET_TAG(this_obj);
+                    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+                        SET_REG_B(r, ctx->global_obj);
+                    } else if (likely(tag == JS_TAG_OBJECT)) {
+                        SET_REG_B(r, this_obj);
+                    } else {
+                        val = JS_ToObject(ctx, this_obj);
+                        if (JS_IsException(val))
+                            goto exception;
+                        SET_REG_P(r, val);
+                    }
+                } else {
+                    SET_REG_B(r, this_obj);
+                }
+                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                    SET_REG_B(d, val);
+                    REGVM_NEXT();
+                }
+                REGVM_CAPTURE_IP_MONO(i_start);
+                if (site == REG_IC_NONE) {
                     val = JS_GetProperty(ctx, regs[r], atom);
                 } else {
                     val = regvm_get_field_ic(ctx, b, &pic, regs[r], atom, site);
@@ -58602,6 +58706,8 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
        slot (u) of `regs`, not `var_buf` */
     [ROP_slot_get] = "ru",
     [ROP_slot_put] = "ur",
+    [ROP_get_this_field] = "rras",
+    [ROP_get_this_field2] = "rras",
 };
 
 #if QJS_REGVM_THREAD && !defined(NDEBUG)
@@ -63835,6 +63941,35 @@ static void regvm_fuse_field_chain(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 
         if (drop[i] || drop[i + 1])
             continue;
+#if QJS_DRC
+        if (a->rop == ROP_load_this && a->n_ops == 1 &&
+            (b->rop == ROP_get_field || b->rop == ROP_get_field2) &&
+            b->n_ops == 4 && b->ops[1] == a->ops[0] && !is_target[i + 1] &&
+            !(i + 2 < n && b->rop == ROP_get_field &&
+              (ir->insns[i + 2].rop == ROP_get_field ||
+               ir->insns[i + 2].rop == ROP_get_field2) &&
+              ir->insns[i + 2].ops[1] == b->ops[0])) {
+            int bstart_hit = 0;
+            for (k = 0; k < n_blocks; k++)
+                if (bstart[k] == b->src_pc) {
+                    bstart_hit = 1;
+                    break;
+                }
+            if (!bstart_hit) {
+                a->rop = b->rop == ROP_get_field ? ROP_get_this_field
+                                                 : ROP_get_this_field2;
+                a->n_ops = 4;
+                a->src_pc = b->src_pc;
+                a->ops[0] = b->ops[0];
+                a->ops[1] = b->ops[1];
+                a->ops[2] = b->ops[2];
+                a->ops[3] = b->ops[3];
+                drop[i + 1] = 1;
+                i++;
+                continue;
+            }
+        }
+#endif
         if (a->rop != ROP_get_field || a->n_ops != 4)
             continue;
         if (b->rop != ROP_get_field && b->rop != ROP_get_field2)
@@ -64694,6 +64829,7 @@ static int regvm_own_has_dest(uint16_t rop)
     case ROP_get_local_field_2: case ROP_get_local_field_3:
     case ROP_get_arg_field: case ROP_get_field2: case ROP_get_private:
     case ROP_get_field_chain: case ROP_get_field_chain_own:
+    case ROP_get_this_field: case ROP_get_this_field2:
     case ROP_get_element: case ROP_get_length: case ROP_super_get:
     case ROP_get_super: case ROP_get_ref_value: case ROP_get_arg_el:
     case ROP_call: case ROP_call_method: case ROP_construct:
@@ -64796,6 +64932,8 @@ static int regvm_own_second_dest_index(uint16_t rop)
     case ROP_with_make_ref:
     case ROP_with_get_ref:
     case ROP_with_get_ref_undef:
+    case ROP_get_this_field:
+    case ROP_get_this_field2:
         return 1;
     case ROP_get_field_chain:
     case ROP_get_field_chain_own:
