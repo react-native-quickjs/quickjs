@@ -1,9 +1,9 @@
-/* aot_bench.js -- Stage-1 kernel acceptance for the AOT compiler (phase P3).
+/* aot_bench.js -- kernel acceptance for the AOT compiler.
  *
  * WHY THIS EXISTS. compiler_bench.js and jit_bench.js name compiler decisions
  * for the SHIPPING (stack) engine and the NG JIT. Neither exercises the AOT
- * frame/entry/exit/unwind/resume design, which is the thing Stage 1 must get
- * right before any per-opcode template exists. These kernels are run in
+ * frame/entry/exit/unwind/resume design, which must be right independently of
+ * any per-opcode template. These kernels are run in
  * STEP-ONLY Layer A (every op through qjs_aot_step) and must produce the SAME
  * checksum as the interpreter at both sizes. Slow is allowed here; wrong is
  * not.
@@ -197,7 +197,7 @@ function n_elem_dense_hole(n) {         /* hole injected after the array is hot 
 }
 
 /* ------------------------------------------------------------------ *
- * Generators and async (the P3 resume switch).
+ * Generators and async (the resume switch).
  * ------------------------------------------------------------------ */
 function* g_loop(n) {
   for (var i = 0; i < n; i++) yield i;
@@ -352,8 +352,7 @@ function n_shape_change(n) {
 /* Shape-lifetime: build a fresh shape each iteration (four key orders) so the
    short-lived shapes are freed and their storage reused, then read a common
    property through one site. A stale shape guard that false-hits a reused
-   address reads the wrong slot, so this gates the IC shape ownership policy
-   (plan P4 §6.1 R3(b)). */
+   address reads the wrong slot, so this gates the IC shape ownership policy. */
 var REUSE_KEYS = ["a", "b", "c", "d"];
 function n_ic_reuse(n) {
   var s = 0;
@@ -399,7 +398,7 @@ function n_overflow(n) {
 }
 
 /* ------------------------------------------------------------------ *
- * P6 call-site guards: callee identity, prototype-value folding (R1),
+ * Call-site guards: callee identity, prototype-value folding,
  * recursion, arity padding, and builtin edge values.
  * ------------------------------------------------------------------ */
 var _orig_sqrt = Math.sqrt;
@@ -415,7 +414,7 @@ function n_math_change(n) {             /* Math.sqrt replaced mid-loop */
 }
 var _orig_abs = Math.abs;
 var _cf = Math.sqrt;
-function n_cfunc_change(n) {            /* one call site, two C callees (R1 guard) */
+function n_cfunc_change(n) {            /* one call site, two C callees */
   var s = 0;
   for (var i = 0; i < n; i++) {
     _cf = (i & 1) ? _orig_abs : _orig_sqrt;
@@ -427,7 +426,7 @@ function P_m(x) { return (x + 1) | 0; }
 function ProtoM() {}
 ProtoM.prototype.m = P_m;
 var proto_obj = new ProtoM();
-function n_proto_change(n) {            /* prototype method replaced mid-loop (R1) */
+function n_proto_change(n) {            /* prototype method replaced mid-loop */
   var s = 0;
   var orig = ProtoM.prototype.m;
   for (var i = 0; i < n; i++) {

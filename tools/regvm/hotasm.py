@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """Join callgrind's per-instruction counts with llvm-objdump -l disassembly.
 
-This is how the handler anatomy in the register-VM notes was read: which native
-instruction inside `js_regvm_execute` actually retires, and which source line
-(that is, which handler) it belongs to.
+It shows which native instruction inside `js_regvm_execute` actually retires,
+and which source line (that is, which handler) it belongs to.
 
     valgrind --tool=callgrind --dump-instr=yes --callgrind-out-file=ref.cg \
-        /tmp/rv/gref .local/box2d-gap/fixed2.js
+        ./gref workload.js
     llvm-objdump-14 -d -l --no-show-raw-insn \
-        --disassemble-symbols=js_regvm_execute /tmp/rv/gref > exec.s
+        --disassemble-symbols=js_regvm_execute ./gref > exec.s
     tools/regvm/hotasm.py ref.cg exec.s js_regvm_execute --top 40
 
 Warning -- the by-source-line modes are unreliable for `js_regvm_execute` in a
 threaded (`-DQJS_REGVM_THREAD=1`) build. That function is now mostly a prologue,
 a dispatch loop and an epilogue with the handlers compiled out of it, and its
-line table no longer separates them: addresses land on whichever line survived.
-Measured 2026-09-28, the rollup attributed 54.9 M Ir (15% of the function) to the
-`build_backtrace` call on the exception path -- and box2d takes *zero*
-exceptions, verified with a counter on a scratch copy. Use the per-instruction
-view and the activation count instead: every prologue instruction retires once
-per activation, so the prologue's counts are the activation count. See
-`.local/redesign/P3-REGISTER-STACK-FRAMES.md` section 1.1.
+line table no longer separates them: addresses land on whichever line survived,
+so the rollup can charge a path that never ran. Use the per-instruction view
+and the activation count instead: every prologue instruction retires once per
+activation, so the prologue's counts are the activation count.
 
 Modes:
     (default)   hot instructions, then the same counts rolled up by source line

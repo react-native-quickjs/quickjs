@@ -126,7 +126,7 @@ def main():
                 break
             shown += 1
             if shown <= args.top:
-                flag = " <-- R1" if kind == "cold" else ""
+                flag = " <-- cold" if kind == "cold" else ""
                 print("   %5d  %-30s %14s  %5.2f%%  %s%s"
                       % (op, name, f"{count:,}", pct, kind, flag))
             failures += 1

@@ -33,46 +33,38 @@ static uintptr_t keys[TBL_SIZE];
 static uint64_t vals[TBL_SIZE];
 static unsigned long long ncalls;
 
-void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop)
-{
-    uint32_t n = 0;
-    for (; start < stop; start++, n++)
-        *start = n ? n : 1;
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+  uint32_t n = 0;
+  for (; start < stop; start++, n++) *start = n ? n : 1;
 }
 
-void __sanitizer_cov_trace_pc_guard(uint32_t *guard)
-{
-    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
-    size_t h;
+void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+  uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+  size_t h;
 
-    (void)guard;
-    ncalls++;
-    h = (size_t)((pc >> 4) * 2654435761u) & TBL_MASK;
-    while (keys[h] && keys[h] != pc)
-        h = (h + 1) & TBL_MASK;
-    if (!keys[h])
-        keys[h] = pc;
-    vals[h]++;
+  (void)guard;
+  ncalls++;
+  h = (size_t)((pc >> 4) * 2654435761u) & TBL_MASK;
+  while (keys[h] && keys[h] != pc) h = (h + 1) & TBL_MASK;
+  if (!keys[h]) keys[h] = pc;
+  vals[h]++;
 }
 
 /* Referenced by the reducer to recover the image slide. */
-__attribute__((noinline, used)) void blockcounts_ref(void) { }
+__attribute__((noinline, used)) void blockcounts_ref(void) {}
 
-__attribute__((destructor)) static void blockcounts_dump(void)
-{
-    const char *path = getenv("BLOCKCOUNTS");
-    size_t i;
-    FILE *f;
+__attribute__((destructor)) static void blockcounts_dump(void) {
+  const char *path = getenv("BLOCKCOUNTS");
+  size_t i;
+  FILE *f;
 
-    if (!path)
-        path = "blockcounts.txt";
-    f = fopen(path, "w");
-    if (!f)
-        return;
-    fprintf(f, "#ref %zx\n", (uintptr_t)(void *)&__sanitizer_cov_trace_pc_guard_init);
-    fprintf(f, "#calls %llu\n", ncalls);
-    for (i = 0; i < TBL_SIZE; i++)
-        if (keys[i])
-            fprintf(f, "%zx %llu\n", keys[i], vals[i]);
-    fclose(f);
+  if (!path) path = "blockcounts.txt";
+  f = fopen(path, "w");
+  if (!f) return;
+  fprintf(
+      f, "#ref %zx\n", (uintptr_t)(void *)&__sanitizer_cov_trace_pc_guard_init);
+  fprintf(f, "#calls %llu\n", ncalls);
+  for (i = 0; i < TBL_SIZE; i++)
+    if (keys[i]) fprintf(f, "%zx %llu\n", keys[i], (unsigned long long)vals[i]);
+  fclose(f);
 }

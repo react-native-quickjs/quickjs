@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Measure each handler's fast path in a disassembly, and find stack traffic.
 
-The P2 gate is stated as three static properties of the compiled handlers:
+The threaded-handler gate is three static properties of the compiled handlers:
 
   * the `Mul` double path is <= 14 native instructions *including dispatch*
   * the `GetById` own-slot hit is <= 16
   * no `[sp, #...]` access on any fast path
 
 Those are all read off the disassembly, so they need a script rather than a
-person. After P2 every handler is its own function named `regvm_op_<name>`, so
-each one is a real symbol; before P2 the monolith can still be inspected, but
-only as a whole.
+person. In a threaded build every handler is its own function, so each one is a
+real symbol; the monolith can only be inspected as a whole.
 
     objdump -d --no-show-raw-insn /tmp/rv/bref > bref.s
     tools/regvm/spillcheck.py bref.s --select regvm_op_ --top 30
@@ -199,7 +198,7 @@ def main():
                          "instruction pointer must come from a real branch")
     ap.add_argument("--no-frame", action="store_true",
                     help="assert no handler's fast path touches the stack: the "
-                         "phase-2 rule that every call a handler can reach is a "
+                         "rule that every call a handler can reach is a "
                          "tail call, so nothing is live across a dispatch")
     ap.add_argument("--frame-exempt", action="append", default=[],
                     metavar="SUBSTR",
@@ -270,7 +269,7 @@ def main():
                 print(f"PUSHCHECK {name}: clean")
 
     if args.no_frame:
-        # The phase-2 discipline, as a check rather than a convention: a handler
+        # The tail-call discipline, as a check rather than a convention: a handler
         # whose fast path touches [sp, #...] has a frame, and a frame means the
         # compiler had to keep ip, fr, f and ctx somewhere callee-saved across
         # something -- which is a call, and a call on a path the handler can

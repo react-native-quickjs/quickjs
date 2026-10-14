@@ -184,7 +184,7 @@ static const char *KNOWN[] = {
     "apply1",      "apply4",    "apply8",   "jsapply4",   "spread0",
     "spread1",     "spread4",   "spread8",  "applyargs4", "applygen4",
     "applyacc4",   "jsspread4", "cc0",      "cc1",        "cc2",
-    "cc4",         "cc8",       "site1",     "site2",      "site4",
+    "cc4",         "cc8",       "site1",    "site2",      "site4",
     "site8",       NULL};
 
 static int is_known(const char *n) {
@@ -355,8 +355,7 @@ int main(int argc, char **argv) {
     /*
      * The same empty callee called from K *distinct* call sites, varying K, with
      * **no** compare chain: K sequential calls in the loop body. This is the
-     * control for the return-target-prediction hypothesis in
-     * `P3-REVIEW-2026-09-29.md` §1.2. An if-chain was tried first and thrown
+     * control for the return-target-prediction hypothesis. An if-chain was tried first and thrown
      * away: its compares cost the same in both engines and their ~7 ns/site
      * slope swamped whatever the return branch was doing.
      *

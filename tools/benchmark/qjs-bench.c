@@ -163,9 +163,11 @@ int main(int argc, char **argv) {
   JS_SetPropertyStr(
       ctx, global, "print", JS_NewCFunction(ctx, js_print, "print", 1));
   JS_SetPropertyStr(
-      ctx, global, "host_add", JS_NewCFunction(ctx, js_host_add, "host_add", 2));
+      ctx, global, "host_add",
+      JS_NewCFunction(ctx, js_host_add, "host_add", 2));
   JS_SetPropertyStr(
-      ctx, global, "host_opt", JS_NewCFunction(ctx, js_host_opt, "host_opt", 2));
+      ctx, global, "host_opt",
+      JS_NewCFunction(ctx, js_host_opt, "host_opt", 2));
   /* Marks the real bench driver, so a kernel can build a function that exists
      only at run time (never seen by qjsaot) to exercise the compiled ->
      interpreted -> compiled unwind path. */

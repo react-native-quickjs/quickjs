@@ -1,5 +1,5 @@
 /*
- * OP_get_var cell cache (docs/global-var-cell-cache.md).
+ * OP_get_var cell cache.
  *
  * The cache memoizes "atom -> index into globalThis's property array" and is
  * guarded by one generation counter. Everything below is a way for a cached

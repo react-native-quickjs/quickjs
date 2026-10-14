@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Merge one or more .qjsprof files into a single profile.
 
-The engine's P0 profiler (build with -DQJS_AOT_PROFILE=1, run with
+The engine's AOT profiler (build with -DQJS_AOT_PROFILE=1, run with
 QJS_AOT_PROFILE_OUT=...) writes one `.qjsprof` per process. A workload is
 usually several processes, and a benchmark is several workloads; this tool
 folds them together by function digest so the report sees one hot set.

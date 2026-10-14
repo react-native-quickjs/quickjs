@@ -6,7 +6,7 @@
  */
 
 /*
- * regvm-test -- Phase 0 harness for the experimental register VM.
+ * regvm-test -- a harness for the register VM.
  *
  *   regvm-test [--runs N] <file.js>
  *   regvm-test --expr [--runs N] <file.js> [arg ...]
@@ -20,8 +20,7 @@
  *
  * --expr wraps the file in parentheses, evaluates it, and calls the resulting
  * function with the numeric arguments that follow. That is how a kernel is run
- * without the script needing globals or a call site of its own, which keeps the
- * phase 0 proof's coverage requirements small.
+ * without the script needing globals or a call site of its own.
  *
  * Output, in the shape the project's fixed-work harnesses already use:
  *
@@ -56,10 +55,10 @@ extern long long js_regvm_stat_split_edges(void);
 
 /* The application packaging wrapper around a JS_WriteObject payload
    (src/bytecode/QuickJSBytecode.h). This harness exists to run *source*; a
-   container is refused rather than mis-parsed, and under QJS_REGVM it is
-   refused for a second reason: the register wire format does not exist until
-   phase 8, so a stack blob is unloadable by construction. */
-static const char kContainerMagic[8] = {'N', 'S', 'B', 'C', 'N', 'G', 'S', '\0'};
+   container is refused rather than mis-parsed; under QJS_REGVM a stack blob is
+   not loadable anyway. */
+static const char kContainerMagic[8] = {'N', 'S', 'B', 'C',
+                                        'N', 'G', 'S', '\0'};
 
 static uint64_t now_ns(void) {
   struct timespec t;
@@ -89,43 +88,42 @@ static void report_exception(JSContext *ctx) {
   JS_FreeValue(ctx, e);
 }
 
-
 #ifdef REGVM_TEST_FIXTURES
 /* Scratch fixture: a C method that always throws, so the method-call failure
    path (callee, receiver and argument cleanup) can be exercised from JS. */
-static JSValue regvm_fixture_boom(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
-{
-  (void)this_val; (void)argc; (void)argv;
+static JSValue regvm_fixture_boom(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
   return JS_ThrowTypeError(ctx, "boom");
 }
 #endif
-
 
 #ifdef REGVM_TEST_FIXTURES
 /* Element-read fixtures: a real array, an array with a hole whose prototype
    supplies the missing index, and an object with one value getter and one that
    throws. Built in C because the JS subset has no object/array literals. */
-static JSValue regvm_fixture_get42(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
-{
-  (void)this_val; (void)argc; (void)argv;
+static JSValue regvm_fixture_get42(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
   return JS_NewInt32(ctx, 42);
 }
-static JSValue regvm_fixture_getthrow(JSContext *ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv)
-{
-  (void)this_val; (void)argc; (void)argv;
+static JSValue regvm_fixture_getthrow(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
   return JS_ThrowTypeError(ctx, "elem-throw");
 }
-static void regvm_fixture_double(JSContext *ctx, const char *name, double v)
-{
+static void regvm_fixture_double(JSContext *ctx, const char *name, double v) {
   JSValue glob = JS_GetGlobalObject(ctx);
   JS_SetPropertyStr(ctx, glob, name, JS_NewFloat64(ctx, v));
   JS_FreeValue(ctx, glob);
 }
-static void regvm_fixture_elements(JSContext *ctx)
-{
+static void regvm_fixture_elements(JSContext *ctx) {
   JSValue glob, arr, hole, proto, getobj;
   JSAtom atom;
   glob = JS_GetGlobalObject(ctx);
@@ -147,14 +145,16 @@ static void regvm_fixture_elements(JSContext *ctx)
 
   getobj = JS_NewObject(ctx);
   atom = JS_NewAtomUInt32(ctx, 0);
-  JS_DefineProperty(ctx, getobj, atom, JS_UNDEFINED,
-                    JS_NewCFunction(ctx, regvm_fixture_get42, "get0", 0),
-                    JS_UNDEFINED, JS_PROP_HAS_GET | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+  JS_DefineProperty(
+      ctx, getobj, atom, JS_UNDEFINED,
+      JS_NewCFunction(ctx, regvm_fixture_get42, "get0", 0), JS_UNDEFINED,
+      JS_PROP_HAS_GET | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
   JS_FreeAtom(ctx, atom);
   atom = JS_NewAtomUInt32(ctx, 1);
-  JS_DefineProperty(ctx, getobj, atom, JS_UNDEFINED,
-                    JS_NewCFunction(ctx, regvm_fixture_getthrow, "get1", 0),
-                    JS_UNDEFINED, JS_PROP_HAS_GET | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+  JS_DefineProperty(
+      ctx, getobj, atom, JS_UNDEFINED,
+      JS_NewCFunction(ctx, regvm_fixture_getthrow, "get1", 0), JS_UNDEFINED,
+      JS_PROP_HAS_GET | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
   JS_FreeAtom(ctx, atom);
   JS_SetPropertyStr(ctx, glob, "GETOBJ", getobj);
 
@@ -184,12 +184,15 @@ int main(int argc, char **argv) {
     } else if (ncall < (int)(sizeof(call_args) / sizeof(call_args[0]))) {
       call_args[ncall++] = atof(argv[i]);
     } else {
-      fprintf(stderr, "usage: regvm-test [--expr] [--runs N] <file.js> [arg ...]\n");
+      fprintf(
+          stderr,
+          "usage: regvm-test [--expr] [--runs N] <file.js> [arg ...]\n");
       return 2;
     }
   }
   if (!path) {
-    fprintf(stderr, "usage: regvm-test [--expr] [--runs N] <file.js> [arg ...]\n");
+    fprintf(
+        stderr, "usage: regvm-test [--expr] [--runs N] <file.js> [arg ...]\n");
     return 2;
   }
 
@@ -216,11 +219,11 @@ int main(int argc, char **argv) {
   fclose(f);
 
   if (len >= 8 && !memcmp(src, kContainerMagic, 8)) {
-    fprintf(stderr,
-            "regvm-test: %s is a precompiled bytecode container, not source.\n"
-            "regvm-test runs source. A register-VM wire format does not exist "
-            "yet (phase 8), so a stack blob cannot be executed here either.\n",
-            path);
+    fprintf(
+        stderr,
+        "regvm-test: %s is a precompiled bytecode container, not source.\n"
+        "regvm-test runs source only.\n",
+        path);
     free(src);
     return 2;
   }
@@ -251,16 +254,17 @@ int main(int argc, char **argv) {
   {
     JSMemoryUsage mu_;
     JS_ComputeMemoryUsage(rt, &mu_);
-    fprintf(stderr, "MEM before str=%lld obj=%lld malloc=%lld msize=%lld\n", "%s",
-            (long long)mu_.str_count, (long long)mu_.obj_count,
-            (long long)mu_.malloc_count, (long long)mu_.malloc_size);
+    fprintf(
+        stderr, "MEM before str=%lld obj=%lld malloc=%lld msize=%lld\n", "%s",
+        (long long)mu_.str_count, (long long)mu_.obj_count,
+        (long long)mu_.malloc_count, (long long)mu_.malloc_size);
   }
 #endif
 #ifdef REGVM_TEST_FIXTURES
   {
     JSValue glob = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, glob, "boom",
-                      JS_NewCFunction(ctx, regvm_fixture_boom, "boom", 3));
+    JS_SetPropertyStr(
+        ctx, glob, "boom", JS_NewCFunction(ctx, regvm_fixture_boom, "boom", 3));
     JS_FreeValue(ctx, glob);
   }
 #endif
@@ -308,11 +312,11 @@ int main(int argc, char **argv) {
       }
       JS_FreeValue(ctx, ret);
     }
-    for (k = 0; k < nobj + ncall; k++)
-      JS_FreeValue(ctx, (JSValue)args[k]);
+    for (k = 0; k < nobj + ncall; k++) JS_FreeValue(ctx, (JSValue)args[k]);
   } else {
     for (i = 0; i < runs; i++) {
-      JSValue r = JS_Eval(ctx, src, (size_t)eval_len, path, JS_EVAL_TYPE_GLOBAL);
+      JSValue r =
+          JS_Eval(ctx, src, (size_t)eval_len, path, JS_EVAL_TYPE_GLOBAL);
       if (JS_IsException(r)) {
         report_exception(ctx);
         JS_FreeValue(ctx, r);
@@ -328,34 +332,33 @@ int main(int argc, char **argv) {
   JS_FreeRuntime(rt);
   free(src);
 
-  fprintf(stdout,
-          "regvm-test vm=%s builtins=none runs=%d ms=%.0f\n",
+  fprintf(
+      stdout, "regvm-test vm=%s builtins=none runs=%d ms=%.0f\n",
 #if QJS_REGVM
-          "regvm",
+      "regvm",
 #else
-          "stack",
+      "stack",
 #endif
-          runs,
-          (double)elapsed / 1e6);
+      runs, (double)elapsed / 1e6);
 
 #if QJS_REGVM
-  fprintf(stdout,
-          "regvm encoded=%lld unencodable=%lld bytes=%lld insns=%lld"
-          " split_edges=%lld\n",
-          js_regvm_stat_encoded_funcs(),
-          js_regvm_stat_unencodable(),
-          js_regvm_stat_encoded_bytes(),
-          js_regvm_stat_encoded_insns(),
-          js_regvm_stat_split_edges());
+  fprintf(
+      stdout,
+      "regvm encoded=%lld unencodable=%lld bytes=%lld insns=%lld"
+      " split_edges=%lld\n",
+      js_regvm_stat_encoded_funcs(), js_regvm_stat_unencodable(),
+      js_regvm_stat_encoded_bytes(), js_regvm_stat_encoded_insns(),
+      js_regvm_stat_split_edges());
 #endif
 
 #ifdef REGVM_TEST_MEMPROBE
   {
     JSMemoryUsage mu_;
     JS_ComputeMemoryUsage(rt, &mu_);
-    fprintf(stderr, "MEM after str=%lld obj=%lld malloc=%lld msize=%lld\n", "%s",
-            (long long)mu_.str_count, (long long)mu_.obj_count,
-            (long long)mu_.malloc_count, (long long)mu_.malloc_size);
+    fprintf(
+        stderr, "MEM after str=%lld obj=%lld malloc=%lld msize=%lld\n", "%s",
+        (long long)mu_.str_count, (long long)mu_.obj_count,
+        (long long)mu_.malloc_count, (long long)mu_.malloc_size);
   }
 #endif
   return i == runs ? 0 : 1;

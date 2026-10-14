@@ -1,4 +1,4 @@
-# AOT unit: React Native integration (plan §9.5)
+# AOT unit: React Native integration
 
 The register-VM AOT unit is plain, ahead-of-time C. There is no runtime code
 generation: the engine never `mmap`s executable memory and

@@ -1,12 +1,11 @@
 #!/bin/sh
-# The register VM's phase gate, in one command.
+# The register VM's gate, in one command.
 #
 #   tools/regvm/gate.sh [workdir]
 #
-# Every phase of the redesign ends with the same evidence, and the plan states it
-# as: differential suite 103/0/0, promotion fuzzer 0 mismatches, box2d checksum
-# 546.1008391043414, then the wall-time A/B against the stack VM and Hermes.
-# This runs all of it and prints one PASS/FAIL summary.
+# Runs the differential suite, the promotion fuzzer, the box2d checksum
+# (546.1008391043414) and the wall-time A/B against the stack VM and Hermes, and
+# prints one PASS/FAIL summary.
 #
 # Environment:
 #   CC          compiler                    (default clang)
@@ -14,10 +13,16 @@
 #   REPS        timing repetitions          (default 4)
 #   FUZZ_N      promotion-fuzzer cases      (default 800)
 #   SUITE       differential suite script   (default tools/regvm/diff-suite/diff-suite.sh)
+#   REGVM_AUX   required: directory holding the runner and fuzzer sources
+#               (regvm-run.c, fuzzrun.c, fuzz-promotion.py, interrupt-test.c,
+#               call-loop-nolocals.js)
+#   BOX2D       required: box2d fixed-work script; a precompiled Hermes
+#               bytecode file must sit beside it as <name>.hbc for HERMES
+#   CHECK       required: box2d checksum script
+#   LOOP        required: empty-loop kernel
 #   HERMES      hermes binary, optional; when set the A/B includes it
 #   MONO        monolith register binary, optional; when set the A/B times it
-#               too, which is what phase 2 is judged on: the threaded build has
-#               to beat the monolith, not the stack VM
+#               too: the threaded build has to beat the monolith
 #   OBJDUMP     objdump for the static handler gates (default: the first of
 #               llvm-objdump, llvm-objdump-14, objdump that exists)
 #   SKIP_BUILD  1 to reuse $WORK
@@ -36,9 +41,14 @@ REPS=${REPS:-4}
 FUZZ_N=${FUZZ_N:-800}
 SUITE=${SUITE:-$ROOT/tools/regvm/diff-suite/diff-suite.sh}
 SUITE_MIN=${SUITE_MIN:-300}
-BOX2D=${BOX2D:-$ROOT/.local/box2d-gap/fixed.js}
-CHECK=${CHECK:-$ROOT/.local/box2d-gap/check.js}
-LOOP=${LOOP:-$ROOT/.local/regvm-build/bare-loop.js}
+AUX=${REGVM_AUX:-}
+BOX2D=${BOX2D:-}
+CHECK=${CHECK:-}
+LOOP=${LOOP:-}
+if [ -z "$AUX" ] || [ -z "$BOX2D" ] || [ -z "$CHECK" ] || [ -z "$LOOP" ]; then
+    echo "gate.sh: set REGVM_AUX, BOX2D, CHECK and LOOP (see the header)" >&2
+    exit 2
+fi
 CHECKSUM_WANT=546.1008391043414
 
 S="$ROOT/engine/quickjs-ng/quickjs.c $ROOT/engine/quickjs-ng/libregexp.c $ROOT/engine/quickjs-ng/libunicode.c $ROOT/engine/quickjs-ng/dtoa.c"
@@ -57,7 +67,7 @@ case "$(uname -m 2>/dev/null)" in
         esac
         ;;
 esac
-# EXTRA carries the configuration under test beyond the defaults: the phase-2
+# EXTRA carries the configuration under test beyond the defaults: the
 # threaded dispatch is gated as EXTRA=-DQJS_REGVM_THREAD=1.
 REGFLAGS="-DQJS_REGVM=1 -DQJS_REGVM_VERIFY=1 -DQJS_REGVM_KNOBS=1 ${EXTRA:-}"
 
@@ -74,16 +84,16 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
     # shellcheck disable=SC2086
     $CC $R $TALIGN             -o "$WORK/bstk"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
     # shellcheck disable=SC2086
-    $CC $R $REGFLAGS -o "$WORK/run1"   "$ROOT/.local/regvm-build/regvm-run.c" $S -lm
+    $CC $R $REGFLAGS -o "$WORK/run1"   "$AUX/regvm-run.c" $S -lm
     # shellcheck disable=SC2086
-    $CC $R             -o "$WORK/runstk" "$ROOT/.local/regvm-build/regvm-run.c" $S -lm
+    $CC $R             -o "$WORK/runstk" "$AUX/regvm-run.c" $S -lm
     # shellcheck disable=SC2086
-    $CC $R $REGFLAGS -o "$WORK/fz1"    "$ROOT/.local/regvm-build/fuzzrun.c" $S -lm
+    $CC $R $REGFLAGS -o "$WORK/fz1"    "$AUX/fuzzrun.c" $S -lm
     # shellcheck disable=SC2086
-    $CC $R             -o "$WORK/fzstk"  "$ROOT/.local/regvm-build/fuzzrun.c" $S -lm
+    $CC $R             -o "$WORK/fzstk"  "$AUX/fuzzrun.c" $S -lm
 fi
 
-# The phase-2 handler gates are static properties of the compiled handlers, and
+# The threaded handler gates are static properties of the compiled handlers, and
 # they only exist in a threaded build. Both are regressions this project has
 # already shipped once: a call reachable from a handler puts a save/restore of
 # all four arguments on every dispatch, and a select on the branch target puts
@@ -92,7 +102,7 @@ fi
 # until it is large, so both are checked here.
 case "$EXTRA" in
 *QJS_REGVM_THREAD=1*)
-    note "== static: phase-2 handler gates"
+    note "== static: threaded handler gates"
     if [ -z "${OBJDUMP:-}" ]; then
         for c in llvm-objdump llvm-objdump-14 objdump; do
             if command -v "$c" >/dev/null 2>&1; then OBJDUMP=$c; break; fi
@@ -172,9 +182,9 @@ else
 fi
 
 note "== correctness: promotion fuzzer ($FUZZ_N cases)"
-if [ -f "$ROOT/.local/regvm-build/fuzz-promotion.py" ]; then
+if [ -f "$AUX/fuzz-promotion.py" ]; then
     fz=$(FUZZ_PRISTINE="$WORK/fzstk" FUZZ_PATCHED="$WORK/fz1" \
-         python3 "$ROOT/.local/regvm-build/fuzz-promotion.py" 0 "$FUZZ_N" 2>&1 | tail -1)
+         python3 "$AUX/fuzz-promotion.py" 0 "$FUZZ_N" 2>&1 | tail -1)
     note "   $fz"
     case "$fz" in
         *"mismatches 0"*) ;;
@@ -184,7 +194,7 @@ else
     note "   fuzzer not found (skipped)"
 fi
 
-# Gate 4 from the review: the two semantics a correctness suite cannot see. The
+# The two semantics a correctness suite cannot see. The
 # interrupt test only means anything for the record design -- without it, an
 # in-loop call loop is uninterruptible and a watchdog cannot stop a runaway
 # script -- so it runs only in that configuration. The fixture's callee has no
@@ -197,9 +207,9 @@ case "${EXTRA:-}" in
 *QJS_REGVM_RECORD=1*)
     note "== semantics: an in-loop call loop honours the interrupt handler"
     if $CC $R $REGFLAGS -o "$WORK/itest" \
-            "$ROOT/.local/regvm-build/interrupt-test.c" $S -lm 2>/dev/null; then
+            "$AUX/interrupt-test.c" $S -lm 2>/dev/null; then
         if out=$("$WORK/itest" \
-                     "$ROOT/.local/regvm-build/call-loop-nolocals.js" 5 2>&1); then
+                     "$AUX/call-loop-nolocals.js" 5 2>&1); then
             note "   $(printf '%s' "$out" | tr '\n' ' ')"
         else
             bad "an in-loop call loop did not honour JS_SetInterruptHandler"
@@ -218,7 +228,7 @@ while [ "$i" -lt "$REPS" ]; do
     v=$(run_ms "$WORK/bref" "$BOX2D"); if [ -z "$reg" ] || lt "$v" "$reg"; then reg=$v; fi
     v=$(run_ms "$WORK/bstk" "$BOX2D"); if [ -z "$stk" ] || lt "$v" "$stk"; then stk=$v; fi
     if [ -n "$HERMES" ]; then
-        v=$(run_ms "$HERMES" "$ROOT/.local/box2d-gap/fixed.hbc")
+        v=$(run_ms "$HERMES" "${BOX2D%.js}.hbc")
         if [ -z "$herm" ] || lt "$v" "$herm"; then herm=$v; fi
     fi
     if [ -n "$MONO" ]; then
@@ -261,7 +271,7 @@ fi
 
 note "== cost: empty loop, min of $REPS"
 # The loop is timed *and* checked. Its output is the iteration count, and it is
-# the one kernel whose instructions are converted by the phase-2 handlers, so a
+# the one kernel whose instructions are converted by the threaded handlers, so a
 # wrong advance in one of them shows up here as a crash rather than as a wrong
 # number -- which is how the narrow `add_imm_self_branch_s` target width went
 # unnoticed while the suite, the fuzzer and the checksum all passed.

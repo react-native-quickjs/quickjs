@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P0 digest unit test (see .local/aot-regvm-impl-plan.md, section 2.5).
+# AOT digest unit test.
 #
 # Checks that aot_digest() is:
 #   1. deterministic        - same source, two runs => same digest

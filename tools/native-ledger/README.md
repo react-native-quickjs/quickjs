@@ -51,7 +51,7 @@ time.
 
 ```sh
 python3 tools/native-ledger/ledger.py \
-    --workload .local/box2d-gap/fixed.js \
+    --workload path/to/workload.js \
     --bytecodes 953603563 992503972 \
     --ms 2963 1695 \
     --ghz 3.0 \

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Report a `.qjsprof` profile: hot set, coverage, and call graph.
 
-Consumes the output of the engine's P0 profiler (see tools/aot/profmerge.py for
-the format) and answers the questions P1+ need:
+Consumes the output of the engine's AOT profiler (see tools/aot/profmerge.py
+for the format) and answers the questions AOT selection needs:
 
   * Which functions dominate executed ops, and how concentrated is the set?
     (the `F ... ops=` total, i.e. interpreter dispatches)

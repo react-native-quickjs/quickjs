@@ -3,7 +3,7 @@
 # Each line: <templated ROP> <handler label in engine/quickjs-ng/quickjs.c>
 # tools/aot/template-sync.sh extracts the handler body text and records its
 # hash in template-sync.hashes. A change to a handler fails the check so the
-# template that mirrors it is re-reviewed (plan P4 §6.4).
+# template that mirrors it is re-reviewed.
 get_local        L_ROP_get_local
 get_local_s0     L_ROP_get_local_s0
 get_local_s1     L_ROP_get_local_s1

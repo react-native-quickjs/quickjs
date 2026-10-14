@@ -1,10 +1,7 @@
-/* The 0194 getter repro: a strict light function reads through a getter and
+/* A strict light function reads through a getter and
    writes to a frozen object, so every iteration throws at the write. Prints
    the same count three times; guards the strict-mode light frame's `this`/write
-   path against the getter's re-entry.
-
-   Derived from `.local/light-frame/repro-getter-strict.js`; the stack-trace
-   part of that probe is engine-specific and is not included here. */
+   path against the getter's re-entry. */
 
 var frozen = Object.freeze({ p: 0 });
 function helper() { return 1; }

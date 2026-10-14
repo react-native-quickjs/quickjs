@@ -6,7 +6,7 @@
  */
 
 /*
- * qjsaot -- the AOT unit generator (phase P2 of .local/aot-regvm-impl-plan.md).
+ * qjsaot -- the AOT unit generator.
  *
  *   qjsaot --out aot_unit.c [--all] [--budget N] [--profile app.qjsprof] bundle.js ...
  *
@@ -14,34 +14,34 @@
  * each bundle exactly as the app will (same flags, so the same register
  * bytecode and therefore the same digest), enumerates every eligible function,
  * and emits a translation unit of step-only bodies plus the digest-sorted
- * binding table. The bodies call qjs_aot_step once per instruction, so P2
- * exercises the frame/entry/exit design before any per-opcode optimisation;
- * P4 replaces the hot templates.
+ * binding table. Hot opcodes get inline templates (Layer A) and typed loop
+ * regions (Layer B); every other instruction calls qjs_aot_step.
  *
- * Selection is `--all` for now: `--profile`/`--budget` are accepted so the
- * eventual profile-guided selector drops in without a CLI change.
+ * `--all` emits every eligible function; `--profile`/`--budget` select a
+ * subset (see the selection section below).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "quickjs.h"
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
+#include "quickjs.h"
 
-/* P5 mutation-testing hooks (plan §7.6). Each selects a deliberately wrong
+/* Mutation-testing hooks. Each selects a deliberately wrong
  * lowering so the guard it bypasses can be shown to be load-bearing. Set with
  * `--mut <name>`; NULL means a correct build. */
 static const char *g_mut = NULL;
-static int mut_is(const char *s) { return g_mut != NULL && strcmp(g_mut, s) == 0; }
+static int mut_is(const char *s) {
+  return g_mut != NULL && strcmp(g_mut, s) == 0;
+}
 
 static char *read_file(const char *path, long *len_out) {
   FILE *f = fopen(path, "rb");
   long len;
   char *buf;
-  if (!f)
-    return NULL;
+  if (!f) return NULL;
   fseek(f, 0, SEEK_END);
   len = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -80,16 +80,22 @@ static void hex16(const uint8_t *d, char out[33]) {
   out[32] = '\0';
 }
 
-/* --- refusal census (plan §5.2) ----------------------------------------- */
+/* --- refusal census ------------------------------------------------------ */
 
 static const char *reason_name(int r) {
   switch (r) {
-  case AOT_GEN_ELIGIBLE: return "eligible";
-  case AOT_GEN_REF_LAZY: return "lazy";
-  case AOT_GEN_REF_REGVM: return "regvm_refused";
-  case AOT_GEN_REF_EMPTY: return "empty";
-  case AOT_GEN_REF_TOO_BIG: return "too_big";
-  default: return "?";
+    case AOT_GEN_ELIGIBLE:
+      return "eligible";
+    case AOT_GEN_REF_LAZY:
+      return "lazy";
+    case AOT_GEN_REF_REGVM:
+      return "regvm_refused";
+    case AOT_GEN_REF_EMPTY:
+      return "empty";
+    case AOT_GEN_REF_TOO_BIG:
+      return "too_big";
+    default:
+      return "?";
   }
 }
 
@@ -105,8 +111,7 @@ static int hex_to_bytes16(const char *s, uint8_t out[16]) {
   for (i = 0; i < 16; i++) {
     int hi = hexval((unsigned char)s[i * 2]);
     int lo = hexval((unsigned char)s[i * 2 + 1]);
-    if (hi < 0 || lo < 0)
-      return -1;
+    if (hi < 0 || lo < 0) return -1;
     out[i] = (uint8_t)((hi << 4) | lo);
   }
   return 0;
@@ -115,25 +120,31 @@ static int hex_to_bytes16(const char *s, uint8_t out[16]) {
 /* Type classes the profiler records per register (mirrors quickjs.c's
    AOT_TYPE_*). A register is a numeric-region candidate only when every bit it
    ever carried is inside the arithmetic set; the emitted code still guards. */
-#define PT_FLOAT  0x01u
-#define PT_INT    0x02u
+#define PT_FLOAT 0x01u
+#define PT_INT 0x02u
 #define PT_OBJECT 0x04u
 #define PT_STRING 0x08u
-#define PT_BOOL   0x10u
-#define PT_UNDEF  0x20u
+#define PT_BOOL 0x10u
+#define PT_UNDEF 0x20u
 #define PT_BIGINT 0x40u
-#define PT_OTHER  0x80u
-#define PT_ARITH  (PT_FLOAT | PT_INT)
+#define PT_OTHER 0x80u
+#define PT_ARITH (PT_FLOAT | PT_INT)
 
-typedef struct { int pc; long long iters; } ProfLoop;
-typedef struct { int reg; unsigned types; } ProfReg;
 typedef struct {
   int pc;
-  unsigned long long hits;   /* the dominant callee's hit count */
-  int kind;                  /* 1 bytecode, 2 C, 3 other */
-  int cproto, magic;         /* kind 2 */
+  long long iters;
+} ProfLoop;
+typedef struct {
+  int reg;
+  unsigned types;
+} ProfReg;
+typedef struct {
+  int pc;
+  unsigned long long hits; /* the dominant callee's hit count */
+  int kind;                /* 1 bytecode, 2 C, 3 other */
+  int cproto, magic;       /* kind 2 */
   int argc_min, argc_max;
-  char digest[33];           /* kind 1: the callee digest hex */
+  char digest[33]; /* kind 1: the callee digest hex */
 } ProfCall;
 
 typedef struct {
@@ -178,8 +189,7 @@ static unsigned prof_parse_types(const char *s) {
         t |= prof_type_bit(buf);
         j = 0;
       }
-      if (*s == '\0' || *s == '\n')
-        break;
+      if (*s == '\0' || *s == '\n') break;
     } else if (j < (int)sizeof(buf) - 1) {
       buf[j++] = *s;
     }
@@ -187,13 +197,12 @@ static unsigned prof_parse_types(const char *s) {
   return t;
 }
 
-static ProfEntry *prof_get(ProfEntry **parr, int *pn, int *pcap,
-                           const uint8_t dg[16]) {
+static ProfEntry *prof_get(
+    ProfEntry **parr, int *pn, int *pcap, const uint8_t dg[16]) {
   ProfEntry *arr = *parr;
   int i;
   for (i = 0; i < *pn; i++)
-    if (memcmp(arr[i].digest, dg, 16) == 0)
-      return &arr[i];
+    if (memcmp(arr[i].digest, dg, 16) == 0) return &arr[i];
   if (*pn == *pcap) {
     ProfEntry *na;
     *pcap = *pcap ? *pcap * 2 : 64;
@@ -221,36 +230,31 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   int n = 0, cap = 0;
   char line[8192];
   *pn = 0;
-  if (!f)
-    return NULL;
+  if (!f) return NULL;
   while (fgets(line, sizeof(line), f)) {
     uint8_t dg[16];
     ProfEntry *e;
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' &&
-         line[0] != 'C') || line[1] != ' ')
+         line[0] != 'C') ||
+        line[1] != ' ')
       continue;
-    if (hex_to_bytes16(line + 2, dg) < 0)
-      continue;
+    if (hex_to_bytes16(line + 2, dg) < 0) continue;
     e = prof_get(&arr, &n, &cap, dg);
-    if (!e)
-      return NULL;
+    if (!e) return NULL;
     if (line[0] == 'F') {
       char *p = strstr(line + 2, "ops=");
-      if (p)
-        e->ops += strtoull(p + 4, NULL, 10);
+      if (p) e->ops += strtoull(p + 4, NULL, 10);
     } else if (line[0] == 'L') {
       char *p = strstr(line + 2, "pc=");
       if (p) {
         long long it = 0;
         char *q = strstr(p, "iters=");
-        if (q)
-          it = strtoll(q + 6, NULL, 10);
+        if (q) it = strtoll(q + 6, NULL, 10);
         if (e->nloops == e->caploops) {
           ProfLoop *nl;
           e->caploops = e->caploops ? e->caploops * 2 : 8;
           nl = realloc(e->loops, sizeof(*nl) * (size_t)e->caploops);
-          if (!nl)
-            return NULL;
+          if (!nl) return NULL;
           e->loops = nl;
         }
         e->loops[e->nloops].pc = (int)strtol(p + 3, NULL, 10);
@@ -269,14 +273,12 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         unsigned long long hits = strtoull(h + 5, NULL, 10);
         int k, amin = 0, amax = 0, kind = 3, cproto = -1, magic = 0;
         char cd[33] = "";
-        if (a)
-          sscanf(a + 5, "%d..%d", &amin, &amax);
+        if (a) sscanf(a + 5, "%d..%d", &amin, &amax);
         if (!strncmp(cl + 7, "bc:", 3)) {
           kind = 1;
           if (hex_to_bytes16(cl + 10, dg) == 0) {
             int z;
-            for (z = 0; z < 16; z++)
-              sprintf(cd + z * 2, "%02x", dg[z]);
+            for (z = 0; z < 16; z++) sprintf(cd + z * 2, "%02x", dg[z]);
             cd[32] = 0;
           }
         } else if (!strncmp(cl + 7, "c:", 2)) {
@@ -287,15 +289,13 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           if (cp) cproto = (int)strtol(cp + 8, NULL, 10);
         }
         for (k = 0; k < e->ncalls; k++)
-          if (e->calls[k].pc == pc)
-            break;
+          if (e->calls[k].pc == pc) break;
         if (k == e->ncalls) {
           if (e->ncalls == e->capcalls) {
             ProfCall *nc;
             e->capcalls = e->capcalls ? e->capcalls * 2 : 16;
             nc = realloc(e->calls, sizeof(*nc) * (size_t)e->capcalls);
-            if (!nc)
-              return NULL;
+            if (!nc) return NULL;
             e->calls = nc;
           }
           e->ncalls++;
@@ -329,8 +329,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
             ProfReg *nr;
             e->capregs = e->capregs ? e->capregs * 2 : 16;
             nr = realloc(e->regs, sizeof(*nr) * (size_t)e->capregs);
-            if (!nr)
-              return NULL;
+            if (!nr) return NULL;
             e->regs = nr;
           }
           e->regs[e->nregs].reg = reg;
@@ -345,32 +344,28 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   return arr;
 }
 
-static const ProfEntry *prof_entry(const ProfEntry *arr, int n,
-                                   const uint8_t dg[16]) {
+static const ProfEntry *prof_entry(
+    const ProfEntry *arr, int n, const uint8_t dg[16]) {
   int i;
   for (i = 0; i < n; i++)
-    if (memcmp(arr[i].digest, dg, 16) == 0)
-      return &arr[i];
+    if (memcmp(arr[i].digest, dg, 16) == 0) return &arr[i];
   return NULL;
 }
 
 /* The dominant profiled callee at `pc`, or NULL. */
 static const ProfCall *prof_call_at(const ProfEntry *e, int pc) {
   int i;
-  if (!e)
-    return NULL;
+  if (!e) return NULL;
   for (i = 0; i < e->ncalls; i++)
-    if (e->calls[i].pc == pc)
-      return &e->calls[i];
+    if (e->calls[i].pc == pc) return &e->calls[i];
   return NULL;
 }
 
-static unsigned long long prof_lookup(const ProfEntry *arr, int n,
-                                      const uint8_t dg[16]) {
+static unsigned long long prof_lookup(
+    const ProfEntry *arr, int n, const uint8_t dg[16]) {
   int i;
   for (i = 0; i < n; i++)
-    if (memcmp(arr[i].digest, dg, 16) == 0)
-      return arr[i].ops;
+    if (memcmp(arr[i].digest, dg, 16) == 0) return arr[i].ops;
   return 0;
 }
 
@@ -380,16 +375,15 @@ static long long count_insns(const uint8_t *code, int len) {
   int off = 0;
   while (off < len) {
     int op, sz = js_aot_gen_insn_size(code, len, off, &op);
-    if (sz < 0)
-      break;
+    if (sz < 0) break;
     n++;
     off += sz;
   }
   return n;
 }
 
-static void print_census(const JSAotGenFunc *funcs, int nfuncs,
-                         const ProfEntry *prof, int nprof) {
+static void print_census(
+    const JSAotGenFunc *funcs, int nfuncs, const ProfEntry *prof, int nprof) {
   long long cnt[AOT_GEN_REF_REASON_COUNT];
   long long insns[AOT_GEN_REF_REASON_COUNT];
   long long stack[AOT_GEN_REF_REASON_COUNT];
@@ -404,8 +398,7 @@ static void print_census(const JSAotGenFunc *funcs, int nfuncs,
   memset(pops, 0, sizeof(pops));
   for (i = 0; i < nfuncs; i++) {
     r = funcs[i].eligible;
-    if (r < 0 || r >= AOT_GEN_REF_REASON_COUNT)
-      r = AOT_GEN_REF_REGVM;
+    if (r < 0 || r >= AOT_GEN_REF_REASON_COUNT) r = AOT_GEN_REF_REGVM;
     cnt[r]++;
     if (r == AOT_GEN_ELIGIBLE)
       insns[r] += count_insns(funcs[i].code, funcs[i].len);
@@ -443,62 +436,84 @@ static void print_census(const JSAotGenFunc *funcs, int nfuncs,
       if (!hit) {
         ref_pops += (long long)prof[j].ops;
         tot_pops += (long long)prof[j].ops;
-        fprintf(stderr,
-                "qjsaot: profiled digest %02x%02x%02x%02x... has no unit body "
-                "(%llu ops)\n",
-                prof[j].digest[0], prof[j].digest[1], prof[j].digest[2],
-                prof[j].digest[3], prof[j].ops);
+        fprintf(
+            stderr,
+            "qjsaot: profiled digest %02x%02x%02x%02x... has no unit body "
+            "(%llu ops)\n",
+            prof[j].digest[0], prof[j].digest[1], prof[j].digest[2],
+            prof[j].digest[3], prof[j].ops);
       }
     }
   }
 
-  fprintf(stderr, "qjsaot: refusal census (plan 5.2)\n");
-  fprintf(stderr, "  %-14s %8s %12s %12s %12s\n",
-          "reason", "funcs", "reginsns", "stackB", "profops");
+  fprintf(stderr, "qjsaot: refusal census\n");
+  fprintf(
+      stderr, "  %-14s %8s %12s %12s %12s\n", "reason", "funcs", "reginsns",
+      "stackB", "profops");
   for (r = 0; r < AOT_GEN_REF_REASON_COUNT; r++) {
-    if (cnt[r] == 0)
-      continue;
-    fprintf(stderr, "  %-14s %8lld %12lld %12lld %12lld\n", reason_name(r),
-            cnt[r], insns[r], stack[r], pops[r]);
+    if (cnt[r] == 0) continue;
+    fprintf(
+        stderr, "  %-14s %8lld %12lld %12lld %12lld\n", reason_name(r), cnt[r],
+        insns[r], stack[r], pops[r]);
   }
-  fprintf(stderr, "  %-14s %8d %12lld %12lld %12lld\n", "total", nfuncs,
-          tot_insns, tot_stack, tot_pops);
-  fprintf(stderr, "qjsaot: refused functions %lld/%d (%.2f%%)",
-          ref_funcs, nfuncs, nfuncs ? 100.0 * (double)ref_funcs / nfuncs : 0.0);
+  fprintf(
+      stderr, "  %-14s %8d %12lld %12lld %12lld\n", "total", nfuncs, tot_insns,
+      tot_stack, tot_pops);
+  fprintf(
+      stderr, "qjsaot: refused functions %lld/%d (%.2f%%)", ref_funcs, nfuncs,
+      nfuncs ? 100.0 * (double)ref_funcs / nfuncs : 0.0);
   if (nprof > 0)
-    fprintf(stderr, ", refused profiled ops %lld/%lld (%.3f%%)",
-            ref_pops, tot_pops,
-            tot_pops ? 100.0 * (double)ref_pops / (double)tot_pops : 0.0);
+    fprintf(
+        stderr, ", refused profiled ops %lld/%lld (%.3f%%)", ref_pops, tot_pops,
+        tot_pops ? 100.0 * (double)ref_pops / (double)tot_pops : 0.0);
   fprintf(stderr, "\n");
 }
 
 /* The shared step slow path for one instruction: run the op through the step
-   engine and route the result (the plan's rule 3, the slow path is always the
-   step). */
+   engine and route the result (the slow path is always the step). */
 static void emit_fallback(FILE *f, int off, int next, int last) {
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", off);
-  fprintf(f, "    if (__builtin_expect(ip == NULL, 0)) { pc = %d; goto exception; }\n", off);
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == NULL, 0)) { pc = %d; goto exception; }\n",
+      off);
   fprintf(f, "    if (ip == QJS_AOT_COLD_RET) return qjs_aot_ret(f);\n");
-  fprintf(f, "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return "
+      "qjs_aot_ret(f);\n");
   if (!last)
-    fprintf(f, "    if (__builtin_expect(ip == code + %d, 1)) goto pc_%d;\n", next, next);
+    fprintf(
+        f, "    if (__builtin_expect(ip == code + %d, 1)) goto pc_%d;\n", next,
+        next);
   fprintf(f, "    pc = (uint32_t)(ip - code);\n    goto dispatch_ip;\n");
 }
 
 /* The REG_BIN_* sub-op of a per-sense short branch, or -1 for any other op. */
 static int branch_subop(int op) {
   switch (op) {
-  case ROP_branch_lt_s:   return REG_BIN_LT;
-  case ROP_branch_nlt_s:  return REG_BIN_LT | REG_CMP_INVERT;
-  case ROP_branch_lte_s:  return REG_BIN_LTE;
-  case ROP_branch_nlte_s: return REG_BIN_LTE | REG_CMP_INVERT;
-  case ROP_branch_gt_s:   return REG_BIN_GT;
-  case ROP_branch_ngt_s:  return REG_BIN_GT | REG_CMP_INVERT;
-  case ROP_branch_gte_s:  return REG_BIN_GTE;
-  case ROP_branch_ngte_s: return REG_BIN_GTE | REG_CMP_INVERT;
-  case ROP_branch_eq_s:   return REG_BIN_EQ;
-  case ROP_branch_neq_s:  return REG_BIN_NEQ;
-  default:                return -1;
+    case ROP_branch_lt_s:
+      return REG_BIN_LT;
+    case ROP_branch_nlt_s:
+      return REG_BIN_LT | REG_CMP_INVERT;
+    case ROP_branch_lte_s:
+      return REG_BIN_LTE;
+    case ROP_branch_nlte_s:
+      return REG_BIN_LTE | REG_CMP_INVERT;
+    case ROP_branch_gt_s:
+      return REG_BIN_GT;
+    case ROP_branch_ngt_s:
+      return REG_BIN_GT | REG_CMP_INVERT;
+    case ROP_branch_gte_s:
+      return REG_BIN_GTE;
+    case ROP_branch_ngte_s:
+      return REG_BIN_GTE | REG_CMP_INVERT;
+    case ROP_branch_eq_s:
+      return REG_BIN_EQ;
+    case ROP_branch_neq_s:
+      return REG_BIN_NEQ;
+    default:
+      return -1;
   }
 }
 
@@ -506,376 +521,566 @@ static int branch_subop(int op) {
    their own immediate-friendly template), or -1 for any other op. */
 static int binop_subop(int op) {
   switch (op) {
-  case ROP_div:        return REG_BIN_DIV;
-  case ROP_mod:        return REG_BIN_MOD;
-  case ROP_pow:        return REG_BIN_POW;
-  case ROP_bitand:     return REG_BIN_AND;
-  case ROP_bitor:      return REG_BIN_OR;
-  case ROP_bitxor:     return REG_BIN_XOR;
-  case ROP_shl:        return REG_BIN_SHL;
-  case ROP_sar:        return REG_BIN_SAR;
-  case ROP_shr:        return REG_BIN_SHR;
-  case ROP_lt:         return REG_BIN_LT;
-  case ROP_lte:        return REG_BIN_LTE;
-  case ROP_gt:         return REG_BIN_GT;
-  case ROP_gte:        return REG_BIN_GTE;
-  case ROP_eq:         return REG_BIN_EQ;
-  case ROP_neq:        return REG_BIN_NEQ;
-  case ROP_strict_eq:  return REG_BIN_STRICT_EQ;
-  case ROP_strict_neq: return REG_BIN_STRICT_NEQ;
-  case ROP_instanceof: return REG_BIN_INSTANCEOF;
-  case ROP_in:         return REG_BIN_IN;
-  default:             return -1;
+    case ROP_div:
+      return REG_BIN_DIV;
+    case ROP_mod:
+      return REG_BIN_MOD;
+    case ROP_pow:
+      return REG_BIN_POW;
+    case ROP_bitand:
+      return REG_BIN_AND;
+    case ROP_bitor:
+      return REG_BIN_OR;
+    case ROP_bitxor:
+      return REG_BIN_XOR;
+    case ROP_shl:
+      return REG_BIN_SHL;
+    case ROP_sar:
+      return REG_BIN_SAR;
+    case ROP_shr:
+      return REG_BIN_SHR;
+    case ROP_lt:
+      return REG_BIN_LT;
+    case ROP_lte:
+      return REG_BIN_LTE;
+    case ROP_gt:
+      return REG_BIN_GT;
+    case ROP_gte:
+      return REG_BIN_GTE;
+    case ROP_eq:
+      return REG_BIN_EQ;
+    case ROP_neq:
+      return REG_BIN_NEQ;
+    case ROP_strict_eq:
+      return REG_BIN_STRICT_EQ;
+    case ROP_strict_neq:
+      return REG_BIN_STRICT_NEQ;
+    case ROP_instanceof:
+      return REG_BIN_INSTANCEOF;
+    case ROP_in:
+      return REG_BIN_IN;
+    default:
+      return -1;
   }
 }
 
 /* The REG_UN_* sub-op of a "rr" unary op, or -1 for any other op. */
 static int unop_subop(int op) {
   switch (op) {
-  case ROP_neg:        return REG_UN_NEG;
-  case ROP_inc:        return REG_UN_INC;
-  case ROP_dec:        return REG_UN_DEC;
-  case ROP_not:        return REG_UN_NOT;
-  case ROP_to_numeric: return REG_UN_TO_NUMERIC;
-  default:             return -1;
+    case ROP_neg:
+      return REG_UN_NEG;
+    case ROP_inc:
+      return REG_UN_INC;
+    case ROP_dec:
+      return REG_UN_DEC;
+    case ROP_not:
+      return REG_UN_NOT;
+    case ROP_to_numeric:
+      return REG_UN_TO_NUMERIC;
+    default:
+      return -1;
   }
 }
 
 /*
- * Emit the P4 Layer A fast path for one instruction. Returns 1 when it emitted
+ * Emit the Layer A fast path for one instruction. Returns 1 when it emitted
  * the whole `pc_N:` block (including the step fallback where the fast path can
  * miss), 0 to let the caller emit the plain step body. Every fast path mirrors
  * the named interpreter handler exactly; a miss falls through to the step.
  */
-static int emit_template(FILE *f, const JSAotGenInsn *in, int off, int next, int last) {
+static int emit_template(
+    FILE *f, const JSAotGenInsn *in, int off, int next, int last) {
   int d, a, b, site, sub;
 
   switch (in->op) {
-  /* get_local / get_local_s0..s3: SET_REG_B(d, var_buf[slot]). */
-  case ROP_get_local:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, vb[%d]);\n    goto pc_%d;\n",
-            d, (int)in->arg[1].val, next);
-    return 1;
-  case ROP_get_local_s0: case ROP_get_local_s1:
-  case ROP_get_local_s2: case ROP_get_local_s3:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, vb[%d]);\n    goto pc_%d;\n",
-            d, in->op - ROP_get_local_s0, next);
-    return 1;
+    /* get_local / get_local_s0..s3: SET_REG_B(d, var_buf[slot]). */
+    case ROP_get_local:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f, "    AOT_SET_B(ctx, fr, %d, vb[%d]);\n    goto pc_%d;\n", d,
+          (int)in->arg[1].val, next);
+      return 1;
+    case ROP_get_local_s0:
+    case ROP_get_local_s1:
+    case ROP_get_local_s2:
+    case ROP_get_local_s3:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f, "    AOT_SET_B(ctx, fr, %d, vb[%d]);\n    goto pc_%d;\n", d,
+          in->op - ROP_get_local_s0, next);
+      return 1;
 
-  /* add/sub/mul: REGVM_BIN_OP over regvm_num_fast, step on a miss. */
-  case ROP_add: case ROP_sub: case ROP_mul:
-    sub = in->op == ROP_add ? REG_BIN_ADD :
-          in->op == ROP_sub ? REG_BIN_SUB : REG_BIN_MUL;
-    d = (int)in->arg[0].val; a = (int)in->arg[1].val; b = (int)in->arg[2].val;
-    fprintf(f, "    { JSValue _o;\n");
-    fprintf(f, "      if (qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_o)) {\n",
-            sub, a, b);
-    fprintf(f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d, next);
-    emit_fallback(f, off, next, last);
-    return 1;
-
-  /* get_field / get_field_own / get_field2 / get_field2_own: own_read_hit.
-     get_field2 is the "load a method for call_method" form, so it also tries
-     the R1 folded-prototype read first. */
-  case ROP_get_field: case ROP_get_field_own:
-  case ROP_get_field2: case ROP_get_field2_own:
-    d = (int)in->arg[0].val; a = (int)in->arg[1].val; site = (int)in->arg[3].val;
-    if (in->op == ROP_get_field2 || in->op == ROP_get_field2_own) {
-      int sid = g_site_next++;
+    /* add/sub/mul: REGVM_BIN_OP over regvm_num_fast, step on a miss. */
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul:
+      sub = in->op == ROP_add   ? REG_BIN_ADD
+            : in->op == ROP_sub ? REG_BIN_SUB
+                                : REG_BIN_MUL;
+      d = (int)in->arg[0].val;
+      a = (int)in->arg[1].val;
+      b = (int)in->arg[2].val;
       fprintf(f, "    { JSValue _o;\n");
-      fprintf(f, "      if (qjs_aot_proto_fold(ctx, f, pic, %d, AOT_REG(fr, %d), %d, &_o)) {\n",
-              sid, a, site);
-      fprintf(f, "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n", d, next);
-    }
-    fprintf(f, "    { JSValue _o;\n");
-    fprintf(f, "      if (qjs_aot_own_read_hit(f, pic, AOT_REG(fr, %d), %d, &_o)) {\n", a, site);
-    fprintf(f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d, next);
-    emit_fallback(f, off, next, last);
-    return 1;
+      fprintf(
+          f,
+          "      if (qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_o)) {\n",
+          sub, a, b);
+      fprintf(
+          f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d,
+          next);
+      emit_fallback(f, off, next, last);
+      return 1;
 
-  /* call / call_method: the P6 specialised C-call path when the profile shows
+    /* get_field / get_field_own / get_field2 / get_field2_own: own_read_hit.
+     get_field2 is the "load a method for call_method" form, so it also tries
+     the folded-prototype read first. */
+    case ROP_get_field:
+    case ROP_get_field_own:
+    case ROP_get_field2:
+    case ROP_get_field2_own:
+      d = (int)in->arg[0].val;
+      a = (int)in->arg[1].val;
+      site = (int)in->arg[3].val;
+      /* No site (a baseline-tier function has no PIC table): the step does the
+         generic read, as the interpreter handler does. */
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      if (in->op == ROP_get_field2 || in->op == ROP_get_field2_own) {
+        int sid = g_site_next++;
+        fprintf(f, "    { JSValue _o;\n");
+        fprintf(
+            f,
+            "      if (qjs_aot_proto_fold(ctx, f, pic, %d, AOT_REG(fr, %d), "
+            "%d, &_o)) {\n",
+            sid, a, site);
+        fprintf(
+            f,
+            "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n",
+            d, next);
+      }
+      fprintf(f, "    { JSValue _o;\n");
+      fprintf(
+          f,
+          "      if (qjs_aot_own_read_hit(f, pic, AOT_REG(fr, %d), %d, &_o)) "
+          "{\n",
+          a, site);
+      fprintf(
+          f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d,
+          next);
+      emit_fallback(f, off, next, last);
+      return 1;
+
+    /* call / call_method: the specialised C-call path when the profile shows
      a C callee at this pc; the direct compiled path when it shows a bytecode
      callee; otherwise (and on a miss) the step engine. */
-  case ROP_call:
-  case ROP_call_method: {
-    const ProfCall *pcl = prof_call_at(g_cur_prof, next);
-    if (pcl && pcl->kind == 2) {
-      int is_m = in->op == ROP_call_method;
-      int sid = g_site_next++;
-      int dc = (int)in->arg[0].val;
-      int cc = (int)in->arg[1].val;
-      int rc = is_m ? (int)in->arg[2].val : -1;
-      int abc = (int)in->arg[is_m ? 3 : 2].val;
-      int nac = (int)in->arg[is_m ? 4 : 3].val;
-      fprintf(f, "    { JSValue _o;\n");
-      fprintf(f, "      int _h = qjs_aot_call_c(ctx, %d, %d, %d, AOT_REG(fr, %d), ",
-              sid, pcl->cproto, nac, cc);
-      if (is_m)
-        fprintf(f, "AOT_REG(fr, %d), ", rc);
-      else
-        fprintf(f, "JS_UNDEFINED, ");
-      fprintf(f, "&AOT_REG(fr, %d), &_o);\n", abc);
-      fprintf(f, "      if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", dc, next);
-      fprintf(f, "      if (_h < 0) { pc = %d; goto exception; } }\n", off);
-    } else if (pcl && pcl->kind == 1) {
-      int is_m = in->op == ROP_call_method;
-      int dc = (int)in->arg[0].val;
-      int cc = (int)in->arg[1].val;
-      int rc = is_m ? (int)in->arg[2].val : -1;
-      int abc = (int)in->arg[is_m ? 3 : 2].val;
-      int nac = (int)in->arg[is_m ? 4 : 3].val;
-      fprintf(f, "    { JSValue _o;\n");
-      fprintf(f, "      int _h = qjs_aot_call_b(ctx, %d, AOT_REG(fr, %d), ", nac, cc);
-      if (is_m)
-        fprintf(f, "AOT_REG(fr, %d), ", rc);
-      else
-        fprintf(f, "JS_UNDEFINED, ");
-      fprintf(f, "&AOT_REG(fr, %d), &_o);\n", abc);
-      fprintf(f, "      if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", dc, next);
-      fprintf(f, "      if (_h < 0) { pc = %d; goto exception; } }\n", off);
-    }
-    emit_fallback(f, off, next, last);
-    return 1;
-  }
-
-  /* move/move_s: SET_REG_B(d, regs[s]) unless d == s (self-move is a no-op). */
-  case ROP_move: case ROP_move_s:
-    d = (int)in->arg[0].val; a = (int)in->arg[1].val;
-    if (d == a)
-      fprintf(f, "    goto pc_%d;\n", next);
-    else
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, AOT_REG(fr, %d));\n    goto pc_%d;\n",
-              d, a, next);
-    return 1;
-
-  /* load_i8 / load_i8_s / load_i32: SET_REG_P(d, constant int). */
-  case ROP_load_i8: case ROP_load_i8_s:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, %d));\n"
-               "    goto pc_%d;\n",
-            d, (int)(int8_t)in->arg[1].val, next);
-    return 1;
-  case ROP_load_i32:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, (int32_t)%d));\n"
-               "    goto pc_%d;\n",
-            d, (int32_t)in->arg[1].val, next);
-    return 1;
-
-  /* get_arg: SET_REG_B(d, arg_buf[slot]). */
-  case ROP_get_arg:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n    goto pc_%d;\n",
-            d, (int)in->arg[1].val, next);
-    return 1;
-
-  /* put_local / put_local_s0..s3: set_value(ctx, &var_buf[slot], dup(regs[s])). */
-  case ROP_put_local:
-    fprintf(f, "    qjs_aot_put_local(ctx, vb, %d, AOT_REG(fr, %d));\n    goto pc_%d;\n",
-            (int)in->arg[0].val, (int)in->arg[1].val, next);
-    return 1;
-  case ROP_put_local_s0: case ROP_put_local_s1:
-  case ROP_put_local_s2: case ROP_put_local_s3:
-    fprintf(f, "    qjs_aot_put_local(ctx, vb, %d, AOT_REG(fr, %d));\n    goto pc_%d;\n",
-            in->op - ROP_put_local_s0, (int)in->arg[0].val, next);
-    return 1;
-
-  /* get_global: cell-cache probe then JS_GetGlobalVar (full semantics). The
-     atom is runtime-remapped, so re-read it from the live code rather than
-     baking the generator's atom id. */
-  case ROP_get_global:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    { JSValue _o;\n");
-    fprintf(f, "      if (qjs_aot_get_global(ctx, (int)qjs_aot_ld_u32(code + %d), %d, &_o) < 0) goto exception;\n",
-            in->arg[1].off, (int)in->arg[2].val);
-    fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d, next);
-    return 1;
-
-  /* put_field: the REG_PIC_OWN_W direct-slot store, else the step. */
-  case ROP_put_field:
-    a = (int)in->arg[0].val; site = (int)in->arg[2].val; b = (int)in->arg[3].val;
-    fprintf(f, "    if (qjs_aot_put_field_own(ctx, f, AOT_REG(fr, %d), %d, AOT_REG(fr, %d)))\n"
-               "        goto pc_%d;\n",
-            a, site, b, next);
-    emit_fallback(f, off, next, last);
-    return 1;
-
-  /* get_element: the plain-array fast path, else the step. */
-  case ROP_get_element:
-    d = (int)in->arg[0].val; a = (int)in->arg[1].val; b = (int)in->arg[2].val;
-    fprintf(f, "    { JSValue _o;\n");
-    fprintf(f, "      if (qjs_aot_get_element(AOT_REG(fr, %d), AOT_REG(fr, %d), &_o)) {\n", a, b);
-    fprintf(f, "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n", d, next);
-    emit_fallback(f, off, next, last);
-    return 1;
-
-  /* Fused multiply-add family: mul then add/sub, exactly as the handler. */
-  case ROP_mul_add: case ROP_mul_sub: case ROP_add_mul: case ROP_sub_mul: {
-    int dm = (int)in->arg[0].val, x = (int)in->arg[1].val, y = (int)in->arg[2].val;
-    int da = (int)in->arg[3].val, c = (int)in->arg[4].val;
-    int mul_first = (in->op == ROP_mul_add || in->op == ROP_mul_sub);
-    int sub2 = (in->op == ROP_mul_add || in->op == ROP_add_mul) ? REG_BIN_ADD
-                                                                 : REG_BIN_SUB;
-    int lhs2 = mul_first ? dm : c;
-    int rhs2 = mul_first ? c : dm;
-    fprintf(f, "    { JSValue _t, _r;\n");
-    fprintf(f, "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_t) &&\n",
-            REG_BIN_MUL, x, y);
-    fprintf(f, "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_t))\n",
-            REG_BIN_MUL, x, y);
-    fprintf(f, "          goto exception;\n");
-    fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _t);\n", dm);
-    fprintf(f, "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_r) &&\n",
-            sub2, lhs2, rhs2);
-    fprintf(f, "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_r))\n",
-            sub2, lhs2, rhs2);
-    fprintf(f, "          goto exception;\n");
-    fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _r); goto pc_%d; }\n", da, next);
-    return 1;
-  }
-
-  /* get_field_chain / get_field_chain_own: two own_read_hit fast paths. Both
-     hits are tested before either register is written, so a miss leaves the
-     registers untouched and the step fallback starts from a clean state. */
-  case ROP_get_field_chain: case ROP_get_field_chain_own: {
-    int d1 = (int)in->arg[0].val, r1 = (int)in->arg[1].val;
-    int s1 = (int)in->arg[3].val, d2 = (int)in->arg[4].val;
-    int s2 = (int)in->arg[7].val;
-    if (s1 == REG_IC_NONE || s2 == REG_IC_NONE)
-      return 0;
-    fprintf(f, "    { JSValue _v1, _v2;\n");
-    fprintf(f, "      if (qjs_aot_own_read_hit(f, pic, AOT_REG(fr, %d), %d, &_v1) &&\n", r1, s1);
-    fprintf(f, "          qjs_aot_own_read_hit(f, pic, _v1, %d, &_v2)) {\n", s2);
-    fprintf(f, "          AOT_SET_B(ctx, fr, %d, _v1);\n", d1);
-    fprintf(f, "          AOT_SET_B(ctx, fr, %d, _v2); goto pc_%d; } }\n", d2, next);
-    emit_fallback(f, off, next, last);
-    return 1;
-  }
-
-  /* branch_cmp_reg_reg / _s: the int/float compare, else the step. */
-  case ROP_branch_cmp_reg_reg: case ROP_branch_cmp_reg_reg_s: {
-    int s = (int)in->arg[0].val;
-    int la = (int)in->arg[1].val, rb = (int)in->arg[2].val;
-    int tgt = next + (int)in->arg[3].val;
-    fprintf(f, "    { int _t;\n");
-    fprintf(f, "      if (qjs_aot_branch_cmp(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_t)) {\n",
-            s, la, rb);
-    fprintf(f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt, next);
-    emit_fallback(f, off, next, last);
-    return 1;
-  }
-
-  /* get_var_ref: SET_REG_B(d, *var_refs[slot]->pvalue). */
-  case ROP_get_var_ref:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, qjs_aot_get_var_ref(f, %d));\n    goto pc_%d;\n",
-            d, (int)in->arg[1].val, next);
-    return 1;
-
-  /* load_this: SET_REG_B for a borrowed this, SET_REG_P when boxed. */
-  case ROP_load_this:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    { JSValue _o; int _r = qjs_aot_load_this(ctx, f, &_o);\n");
-    fprintf(f, "      if (_r < 0) goto exception;\n");
-    fprintf(f, "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", d);
-    fprintf(f, "      else AOT_SET_B(ctx, fr, %d, _o);\n", d);
-    fprintf(f, "      goto pc_%d; }\n", next);
-    return 1;
-
-  /* move_xfer: move d<-s then clear s (self-move is a no-op). */
-  case ROP_move_xfer:
-    d = (int)in->arg[0].val; a = (int)in->arg[1].val;
-    if (d == a)
-      fprintf(f, "    goto pc_%d;\n", next);
-    else
-      fprintf(f, "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n    goto pc_%d;\n", d, a, next);
-    return 1;
-
-  /* load_undefined / load_null / load_true / load_false: SET_REG_P(d, const). */
-  case ROP_load_undefined: case ROP_load_null:
-  case ROP_load_true: case ROP_load_false:
-    d = (int)in->arg[0].val;
-    fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, %s);\n    goto pc_%d;\n",
-            d,
-            in->op == ROP_load_undefined ? "JS_UNDEFINED" :
-            in->op == ROP_load_null ? "JS_NULL" :
-            in->op == ROP_load_true ? "JS_TRUE" : "JS_FALSE",
-            next);
-    return 1;
-
-  /* binary_imm / binary_imm_s: regvm_num_fast with an int immediate. */
-  case ROP_binary_imm: case ROP_binary_imm_s: {
-    int32_t imm = (int32_t)in->arg[3].val;
-    d = (int)in->arg[0].val; sub = (int)in->arg[1].val; a = (int)in->arg[2].val;
-    fprintf(f, "    { JSValue _o;\n");
-    fprintf(f, "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), JS_MKVAL(JS_TAG_INT, %d), &_o) &&\n",
-            sub, a, (int)imm);
-    fprintf(f, "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), JS_MKVAL(JS_TAG_INT, %d), &_o))\n",
-            sub, a, (int)imm);
-    fprintf(f, "          goto exception;\n");
-    fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d, next);
-    return 1;
-  }
-
-  /* branch / branch_s: always taken. */
-  case ROP_branch: case ROP_branch_s:
-    fprintf(f, "    goto pc_%d;\n", next + (int)in->arg[0].val);
-    return 1;
-
-  /* branch_if / branch_if_not: regvm_to_bool, else the step. */
-  case ROP_branch_if: case ROP_branch_if_not: {
-    int want_true = (in->op == ROP_branch_if);
-    int tgt = next + (int)in->arg[1].val;
-    a = (int)in->arg[0].val;
-    fprintf(f, "    if ((qjs_aot_to_bool(ctx, AOT_REG(fr, %d)) != 0) == %d) goto pc_%d; else goto pc_%d;\n",
-            a, want_true, tgt, next);
-    return 1;
-  }
-
-  default:
-    sub = branch_subop(in->op);
-    if (sub >= 0) {
-      /* The per-sense short branches: the int/float compare, else step. */
-      a = (int)in->arg[0].val; b = (int)in->arg[1].val;
-      int tgt = next + (int)in->arg[2].val;
-      fprintf(f, "    { int _t;\n");
-      fprintf(f, "      if (qjs_aot_branch_cmp(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_t)) {\n",
-              sub, a, b);
-      fprintf(f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt, next);
+    case ROP_call:
+    case ROP_call_method: {
+      const ProfCall *pcl = prof_call_at(g_cur_prof, next);
+      if (pcl && pcl->kind == 2) {
+        int is_m = in->op == ROP_call_method;
+        int sid = g_site_next++;
+        int dc = (int)in->arg[0].val;
+        int cc = (int)in->arg[1].val;
+        int rc = is_m ? (int)in->arg[2].val : -1;
+        int abc = (int)in->arg[is_m ? 3 : 2].val;
+        int nac = (int)in->arg[is_m ? 4 : 3].val;
+        fprintf(f, "    { JSValue _o;\n");
+        fprintf(
+            f,
+            "      int _h = qjs_aot_call_c(ctx, %d, %d, %d, AOT_REG(fr, %d), ",
+            sid, pcl->cproto, nac, cc);
+        if (is_m)
+          fprintf(f, "AOT_REG(fr, %d), ", rc);
+        else
+          fprintf(f, "JS_UNDEFINED, ");
+        fprintf(f, "&AOT_REG(fr, %d), &_o);\n", abc);
+        fprintf(
+            f,
+            "      if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); goto "
+            "pc_%d; }\n",
+            dc, next);
+        fprintf(f, "      if (_h < 0) { pc = %d; goto exception; } }\n", off);
+      } else if (pcl && pcl->kind == 1) {
+        int is_m = in->op == ROP_call_method;
+        int dc = (int)in->arg[0].val;
+        int cc = (int)in->arg[1].val;
+        int rc = is_m ? (int)in->arg[2].val : -1;
+        int abc = (int)in->arg[is_m ? 3 : 2].val;
+        int nac = (int)in->arg[is_m ? 4 : 3].val;
+        fprintf(f, "    { JSValue _o;\n");
+        fprintf(
+            f, "      int _h = qjs_aot_call_b(ctx, %d, AOT_REG(fr, %d), ", nac,
+            cc);
+        if (is_m)
+          fprintf(f, "AOT_REG(fr, %d), ", rc);
+        else
+          fprintf(f, "JS_UNDEFINED, ");
+        fprintf(f, "&AOT_REG(fr, %d), &_o);\n", abc);
+        fprintf(
+            f,
+            "      if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); goto "
+            "pc_%d; }\n",
+            dc, next);
+        fprintf(f, "      if (_h < 0) { pc = %d; goto exception; } }\n", off);
+      }
       emit_fallback(f, off, next, last);
       return 1;
     }
-    sub = binop_subop(in->op);
-    if (sub >= 0) {
-      /* The remaining "rrr" binary ops: REGVM_BIN_OP. */
-      d = (int)in->arg[0].val; a = (int)in->arg[1].val; b = (int)in->arg[2].val;
+
+    /* move/move_s: SET_REG_B(d, regs[s]) unless d == s (self-move is a no-op). */
+    case ROP_move:
+    case ROP_move_s:
+      d = (int)in->arg[0].val;
+      a = (int)in->arg[1].val;
+      if (d == a)
+        fprintf(f, "    goto pc_%d;\n", next);
+      else
+        fprintf(
+            f,
+            "    AOT_SET_B(ctx, fr, %d, AOT_REG(fr, %d));\n    goto pc_%d;\n",
+            d, a, next);
+      return 1;
+
+    /* load_i8 / load_i8_s / load_i32: SET_REG_P(d, constant int). */
+    case ROP_load_i8:
+    case ROP_load_i8_s:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    qjs_aot_set_reg_p(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, %d));\n"
+          "    goto pc_%d;\n",
+          d, (int)(int8_t)in->arg[1].val, next);
+      return 1;
+    case ROP_load_i32:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    qjs_aot_set_reg_p(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, "
+          "(int32_t)%d));\n"
+          "    goto pc_%d;\n",
+          d, (int32_t)in->arg[1].val, next);
+      return 1;
+
+    /* get_arg: SET_REG_B(d, arg_buf[slot]). */
+    case ROP_get_arg:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n    goto pc_%d;\n", d,
+          (int)in->arg[1].val, next);
+      return 1;
+
+    /* put_local / put_local_s0..s3: set_value(ctx, &var_buf[slot], dup(regs[s])). */
+    case ROP_put_local:
+      fprintf(
+          f,
+          "    qjs_aot_put_local(ctx, vb, %d, AOT_REG(fr, %d));\n    goto "
+          "pc_%d;\n",
+          (int)in->arg[0].val, (int)in->arg[1].val, next);
+      return 1;
+    case ROP_put_local_s0:
+    case ROP_put_local_s1:
+    case ROP_put_local_s2:
+    case ROP_put_local_s3:
+      fprintf(
+          f,
+          "    qjs_aot_put_local(ctx, vb, %d, AOT_REG(fr, %d));\n    goto "
+          "pc_%d;\n",
+          in->op - ROP_put_local_s0, (int)in->arg[0].val, next);
+      return 1;
+
+    /* get_global: cell-cache probe then JS_GetGlobalVar (full semantics). The
+     atom is runtime-remapped, so re-read it from the live code rather than
+     baking the generator's atom id. */
+    case ROP_get_global:
+      d = (int)in->arg[0].val;
       fprintf(f, "    { JSValue _o;\n");
-      fprintf(f, "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_o) &&\n",
-              sub, a, b);
-      fprintf(f, "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), &_o))\n",
-              sub, a, b);
+      fprintf(
+          f,
+          "      if (qjs_aot_get_global(ctx, (int)qjs_aot_ld_u32(code + %d), "
+          "%d, &_o) < 0) goto exception;\n",
+          in->arg[1].off, (int)in->arg[2].val);
+      fprintf(
+          f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d,
+          next);
+      return 1;
+
+    /* put_field: the REG_PIC_OWN_W direct-slot store, else the step. */
+    case ROP_put_field:
+      a = (int)in->arg[0].val;
+      site = (int)in->arg[2].val;
+      b = (int)in->arg[3].val;
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      fprintf(
+          f,
+          "    if (qjs_aot_put_field_own(ctx, f, AOT_REG(fr, %d), %d, "
+          "AOT_REG(fr, %d)))\n"
+          "        goto pc_%d;\n",
+          a, site, b, next);
+      emit_fallback(f, off, next, last);
+      return 1;
+
+    /* get_element: the plain-array fast path, else the step. */
+    case ROP_get_element:
+      d = (int)in->arg[0].val;
+      a = (int)in->arg[1].val;
+      b = (int)in->arg[2].val;
+      fprintf(f, "    { JSValue _o;\n");
+      fprintf(
+          f,
+          "      if (qjs_aot_get_element(AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_o)) {\n",
+          a, b);
+      fprintf(
+          f, "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n",
+          d, next);
+      emit_fallback(f, off, next, last);
+      return 1;
+
+    /* Fused multiply-add family: mul then add/sub, exactly as the handler. */
+    case ROP_mul_add:
+    case ROP_mul_sub:
+    case ROP_add_mul:
+    case ROP_sub_mul: {
+      int dm = (int)in->arg[0].val, x = (int)in->arg[1].val,
+          y = (int)in->arg[2].val;
+      int da = (int)in->arg[3].val, c = (int)in->arg[4].val;
+      int mul_first = (in->op == ROP_mul_add || in->op == ROP_mul_sub);
+      int sub2 = (in->op == ROP_mul_add || in->op == ROP_add_mul) ? REG_BIN_ADD
+                                                                  : REG_BIN_SUB;
+      int lhs2 = mul_first ? dm : c;
+      int rhs2 = mul_first ? c : dm;
+      fprintf(f, "    { JSValue _t, _r;\n");
+      fprintf(
+          f,
+          "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_t) &&\n",
+          REG_BIN_MUL, x, y);
+      fprintf(
+          f,
+          "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_t))\n",
+          REG_BIN_MUL, x, y);
       fprintf(f, "          goto exception;\n");
-      fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d, next);
+      fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _t);\n", dm);
+      fprintf(
+          f,
+          "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_r) &&\n",
+          sub2, lhs2, rhs2);
+      fprintf(
+          f,
+          "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_r))\n",
+          sub2, lhs2, rhs2);
+      fprintf(f, "          goto exception;\n");
+      fprintf(
+          f, "      qjs_aot_set_reg_p(ctx, fr, %d, _r); goto pc_%d; }\n", da,
+          next);
       return 1;
     }
-    sub = unop_subop(in->op);
-    if (sub >= 0) {
-      /* The unary ops: REGVM_UN_OP. */
-      d = (int)in->arg[0].val; a = (int)in->arg[1].val;
-      fprintf(f, "    { JSValue _o;\n");
-      fprintf(f, "      if (!qjs_aot_unary_num_fast(%d, AOT_REG(fr, %d), &_o) &&\n", sub, a);
-      fprintf(f, "          qjs_aot_unary(ctx, %d, AOT_REG(fr, %d), &_o))\n", sub, a);
-      fprintf(f, "          goto exception;\n");
-      fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d, next);
+
+    /* get_field_chain / get_field_chain_own: two own_read_hit fast paths. Both
+     hits are tested before either register is written, so a miss leaves the
+     registers untouched and the step fallback starts from a clean state. */
+    case ROP_get_field_chain:
+    case ROP_get_field_chain_own: {
+      int d1 = (int)in->arg[0].val, r1 = (int)in->arg[1].val;
+      int s1 = (int)in->arg[3].val, d2 = (int)in->arg[4].val;
+      int s2 = (int)in->arg[7].val;
+      if (s1 == REG_IC_NONE || s2 == REG_IC_NONE) return 0;
+      fprintf(f, "    { JSValue _v1, _v2;\n");
+      fprintf(
+          f,
+          "      if (qjs_aot_own_read_hit(f, pic, AOT_REG(fr, %d), %d, &_v1) "
+          "&&\n",
+          r1, s1);
+      fprintf(
+          f, "          qjs_aot_own_read_hit(f, pic, _v1, %d, &_v2)) {\n", s2);
+      fprintf(f, "          AOT_SET_B(ctx, fr, %d, _v1);\n", d1);
+      fprintf(
+          f, "          AOT_SET_B(ctx, fr, %d, _v2); goto pc_%d; } }\n", d2,
+          next);
+      emit_fallback(f, off, next, last);
       return 1;
     }
-    return 0;
+
+    /* branch_cmp_reg_reg / _s: the int/float compare, else the step. */
+    case ROP_branch_cmp_reg_reg:
+    case ROP_branch_cmp_reg_reg_s: {
+      int s = (int)in->arg[0].val;
+      int la = (int)in->arg[1].val, rb = (int)in->arg[2].val;
+      int tgt = next + (int)in->arg[3].val;
+      fprintf(f, "    { int _t;\n");
+      fprintf(
+          f,
+          "      if (qjs_aot_branch_cmp(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+          "&_t)) {\n",
+          s, la, rb);
+      fprintf(
+          f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt, next);
+      emit_fallback(f, off, next, last);
+      return 1;
+    }
+
+    /* get_var_ref: SET_REG_B(d, *var_refs[slot]->pvalue). */
+    case ROP_get_var_ref:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    AOT_SET_B(ctx, fr, %d, qjs_aot_get_var_ref(f, %d));\n    goto "
+          "pc_%d;\n",
+          d, (int)in->arg[1].val, next);
+      return 1;
+
+    /* load_this: SET_REG_B for a borrowed this, SET_REG_P when boxed. */
+    case ROP_load_this:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f, "    { JSValue _o; int _r = qjs_aot_load_this(ctx, f, &_o);\n");
+      fprintf(f, "      if (_r < 0) goto exception;\n");
+      fprintf(f, "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", d);
+      fprintf(f, "      else AOT_SET_B(ctx, fr, %d, _o);\n", d);
+      fprintf(f, "      goto pc_%d; }\n", next);
+      return 1;
+
+    /* move_xfer: move d<-s then clear s (self-move is a no-op). */
+    case ROP_move_xfer:
+      d = (int)in->arg[0].val;
+      a = (int)in->arg[1].val;
+      if (d == a)
+        fprintf(f, "    goto pc_%d;\n", next);
+      else
+        fprintf(
+            f, "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n    goto pc_%d;\n", d,
+            a, next);
+      return 1;
+
+    /* load_undefined / load_null / load_true / load_false: SET_REG_P(d, const). */
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false:
+      d = (int)in->arg[0].val;
+      fprintf(
+          f, "    qjs_aot_set_reg_p(ctx, fr, %d, %s);\n    goto pc_%d;\n", d,
+          in->op == ROP_load_undefined ? "JS_UNDEFINED"
+          : in->op == ROP_load_null    ? "JS_NULL"
+          : in->op == ROP_load_true    ? "JS_TRUE"
+                                       : "JS_FALSE",
+          next);
+      return 1;
+
+    /* binary_imm / binary_imm_s: regvm_num_fast with an int immediate. */
+    case ROP_binary_imm:
+    case ROP_binary_imm_s: {
+      int32_t imm = (int32_t)in->arg[3].val;
+      d = (int)in->arg[0].val;
+      sub = (int)in->arg[1].val;
+      a = (int)in->arg[2].val;
+      fprintf(f, "    { JSValue _o;\n");
+      fprintf(
+          f,
+          "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), "
+          "JS_MKVAL(JS_TAG_INT, %d), &_o) &&\n",
+          sub, a, (int)imm);
+      fprintf(
+          f,
+          "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), "
+          "JS_MKVAL(JS_TAG_INT, %d), &_o))\n",
+          sub, a, (int)imm);
+      fprintf(f, "          goto exception;\n");
+      fprintf(
+          f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d,
+          next);
+      return 1;
+    }
+
+    /* branch / branch_s: always taken. */
+    case ROP_branch:
+    case ROP_branch_s:
+      fprintf(f, "    goto pc_%d;\n", next + (int)in->arg[0].val);
+      return 1;
+
+    /* branch_if / branch_if_not: regvm_to_bool, else the step. */
+    case ROP_branch_if:
+    case ROP_branch_if_not: {
+      int want_true = (in->op == ROP_branch_if);
+      int tgt = next + (int)in->arg[1].val;
+      a = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    if ((qjs_aot_to_bool(ctx, AOT_REG(fr, %d)) != 0) == %d) goto "
+          "pc_%d; else goto pc_%d;\n",
+          a, want_true, tgt, next);
+      return 1;
+    }
+
+    default:
+      sub = branch_subop(in->op);
+      if (sub >= 0) {
+        /* The per-sense short branches: the int/float compare, else step. */
+        a = (int)in->arg[0].val;
+        b = (int)in->arg[1].val;
+        int tgt = next + (int)in->arg[2].val;
+        fprintf(f, "    { int _t;\n");
+        fprintf(
+            f,
+            "      if (qjs_aot_branch_cmp(%d, AOT_REG(fr, %d), AOT_REG(fr, "
+            "%d), &_t)) {\n",
+            sub, a, b);
+        fprintf(
+            f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt,
+            next);
+        emit_fallback(f, off, next, last);
+        return 1;
+      }
+      sub = binop_subop(in->op);
+      if (sub >= 0) {
+        /* The remaining "rrr" binary ops: REGVM_BIN_OP. */
+        d = (int)in->arg[0].val;
+        a = (int)in->arg[1].val;
+        b = (int)in->arg[2].val;
+        fprintf(f, "    { JSValue _o;\n");
+        fprintf(
+            f,
+            "      if (!qjs_aot_num_fast(%d, AOT_REG(fr, %d), AOT_REG(fr, %d), "
+            "&_o) &&\n",
+            sub, a, b);
+        fprintf(
+            f,
+            "          qjs_aot_binary(ctx, %d, AOT_REG(fr, %d), AOT_REG(fr, "
+            "%d), &_o))\n",
+            sub, a, b);
+        fprintf(f, "          goto exception;\n");
+        fprintf(
+            f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d,
+            next);
+        return 1;
+      }
+      sub = unop_subop(in->op);
+      if (sub >= 0) {
+        /* The unary ops: REGVM_UN_OP. */
+        d = (int)in->arg[0].val;
+        a = (int)in->arg[1].val;
+        fprintf(f, "    { JSValue _o;\n");
+        fprintf(
+            f,
+            "      if (!qjs_aot_unary_num_fast(%d, AOT_REG(fr, %d), &_o) &&\n",
+            sub, a);
+        fprintf(
+            f, "          qjs_aot_unary(ctx, %d, AOT_REG(fr, %d), &_o))\n", sub,
+            a);
+        fprintf(f, "          goto exception;\n");
+        fprintf(
+            f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d,
+            next);
+        return 1;
+      }
+      return 0;
   }
 }
 
-/* ======================= P5 Layer B typed regions ========================
+/* ========================= Layer B typed regions =========================
  *
  * A "region" is a single-entry back-edge loop whose body only reads numbers
  * and dense array elements. The loop-carried var slots and the numeric
@@ -894,42 +1099,43 @@ static int emit_template(FILE *f, const JSAotGenInsn *in, int off, int next, int
 #include <stdarg.h>
 
 #define RG_NONE 0
-#define RG_NUM  1
-#define RG_OBJ  2
-#define RG_BOX  3
-#define RG_MIX  4
+#define RG_NUM 1
+#define RG_OBJ 2
+#define RG_BOX 3
+#define RG_MIX 4
 
 typedef struct {
   const JSAotGenFunc *g;
   const JSAotGenInsn *ins;
   const int *offs, *nxts;
-  int h, back, n;               /* instruction indices: head .. back-edge */
+  int h, back, n; /* instruction indices: head .. back-edge */
   int head_pc, exit_pc;
-  int rn;                       /* number of register slots (off>>4 + 1) */
-  int sn;                       /* number of var slots */
-  unsigned char *role_r, *role_s; /* how each value is read */
-  unsigned char *prod_r, *prod_s; /* how each value is written */
-  unsigned char *live_r, *live_s; /* read before first write in the region */
-  unsigned char *read_r, *read_s; /* read anywhere in the region */
-  unsigned char *unb_r, *unb_s;   /* currently unboxed during emission */
+  int rn;                           /* number of register slots (off>>4 + 1) */
+  int sn;                           /* number of var slots */
+  unsigned char *role_r, *role_s;   /* how each value is read */
+  unsigned char *prod_r, *prod_s;   /* how each value is written */
+  unsigned char *live_r, *live_s;   /* read before first write in the region */
+  unsigned char *read_r, *read_s;   /* read anywhere in the region */
+  unsigned char *unb_r, *unb_s;     /* currently unboxed during emission */
   unsigned char *entry_r, *entry_s; /* unboxed set at the loop head */
-  unsigned char *elem_r;          /* register used as an element base */
-  unsigned char *elem_iv_r;       /* element base read with the IV as key */
-  int iv_reg;                     /* induction-variable register (-1 = none) */
-  int bound_isreg, bound_off;     /* loop-test bound operand (R2) */
+  unsigned char *elem_r;            /* register used as an element base */
+  unsigned char *elem_iv_r;         /* element base read with the IV as key */
+  int iv_reg;                 /* induction-variable register (-1 = none) */
+  int bound_isreg, bound_off; /* loop-test bound operand */
   int pic_count;
-  int *fguard_recv;             /* PIC site -> receiver register (-1 = none) */
-  int *vref_slot;               /* register -> captured-var slot (-1 = none) */
+  int *fguard_recv; /* PIC site -> receiver register (-1 = none) */
+  int *vref_slot;   /* register -> captured-var slot (-1 = none) */
   FILE *f;
   int dry;
 } RgCtx;
 
-static int rg_ri(int off) { return off >> 4; }
+static int rg_ri(int off) {
+  return off >> 4;
+}
 
 static void rg_out(RgCtx *c, const char *fmt, ...) {
   va_list ap;
-  if (c->dry)
-    return;
+  if (c->dry) return;
   va_start(ap, fmt);
   vfprintf(c->f, fmt, ap);
   va_end(ap);
@@ -937,8 +1143,7 @@ static void rg_out(RgCtx *c, const char *fmt, ...) {
 
 /* Record how a value is read / written; a disagreement is RG_MIX (reject). */
 static void rg_role(unsigned char *role, int idx, int r) {
-  if (idx < 0)
-    return;
+  if (idx < 0) return;
   if (role[idx] == RG_NONE)
     role[idx] = (unsigned char)r;
   else if (role[idx] != r)
@@ -957,19 +1162,17 @@ static int rg_entry_unbox(RgCtx *c, int i, int isreg) {
   unsigned char *prod = isreg ? c->prod_r : c->prod_s;
   unsigned char *live = isreg ? c->live_r : c->live_s;
   unsigned char *rd = isreg ? c->read_r : c->read_s;
-  if (role[i] != RG_NUM)
-    return 0;
+  if (role[i] != RG_NUM) return 0;
   return live[i] || (prod[i] != RG_NONE && !rd[i]);
 }
 
 /* Allocate the analysis arrays for a candidate loop. */
-static RgCtx *rg_new(const JSAotGenFunc *g, const JSAotGenInsn *ins,
-                     const int *offs, const int *nxts, int n, int h, int back,
-                     int exit_pc) {
+static RgCtx *rg_new(
+    const JSAotGenFunc *g, const JSAotGenInsn *ins, const int *offs,
+    const int *nxts, int n, int h, int back, int exit_pc) {
   RgCtx *c = (RgCtx *)calloc(1, sizeof(*c));
   int i, maxoff = 0;
-  if (!c)
-    return NULL;
+  if (!c) return NULL;
   c->g = g;
   c->ins = ins;
   c->offs = offs;
@@ -1005,26 +1208,35 @@ static RgCtx *rg_new(const JSAotGenFunc *g, const JSAotGenInsn *ins,
   c->bound_isreg = -1;
   c->bound_off = 0;
   c->pic_count = g->pic_count;
-  c->fguard_recv = (int *)malloc(sizeof(int) * (size_t)(c->pic_count > 0 ? c->pic_count : 1));
+  c->fguard_recv = (int *)malloc(
+      sizeof(int) * (size_t)(c->pic_count > 0 ? c->pic_count : 1));
   if (c->fguard_recv) {
     int j;
-    for (j = 0; j < c->pic_count; j++)
-      c->fguard_recv[j] = -1;
+    for (j = 0; j < c->pic_count; j++) c->fguard_recv[j] = -1;
   }
   c->vref_slot = (int *)malloc(sizeof(int) * (size_t)c->rn);
   if (c->vref_slot) {
     int j;
-    for (j = 0; j < c->rn; j++)
-      c->vref_slot[j] = -1;
+    for (j = 0; j < c->rn; j++) c->vref_slot[j] = -1;
   }
   if (!c->role_r || !c->role_s || !c->prod_r || !c->prod_s || !c->live_r ||
       !c->live_s || !c->read_r || !c->read_s || !c->unb_r || !c->unb_s ||
-      !c->entry_r || !c->entry_s ||
-      !c->elem_r || !c->elem_iv_r || !c->fguard_recv || !c->vref_slot) {
-    free(c->role_r); free(c->role_s); free(c->prod_r); free(c->prod_s);
-    free(c->live_r); free(c->live_s); free(c->read_r); free(c->read_s);
-    free(c->unb_r); free(c->unb_s);
-    free(c->entry_r); free(c->entry_s); free(c->elem_r); free(c->elem_iv_r);
+      !c->entry_r || !c->entry_s || !c->elem_r || !c->elem_iv_r ||
+      !c->fguard_recv || !c->vref_slot) {
+    free(c->role_r);
+    free(c->role_s);
+    free(c->prod_r);
+    free(c->prod_s);
+    free(c->live_r);
+    free(c->live_s);
+    free(c->read_r);
+    free(c->read_s);
+    free(c->unb_r);
+    free(c->unb_s);
+    free(c->entry_r);
+    free(c->entry_s);
+    free(c->elem_r);
+    free(c->elem_iv_r);
     free(c->fguard_recv);
     free(c->vref_slot);
     free(c);
@@ -1034,12 +1246,19 @@ static RgCtx *rg_new(const JSAotGenFunc *g, const JSAotGenInsn *ins,
 }
 
 static void rg_free(RgCtx *c) {
-  if (!c)
-    return;
-  free(c->role_r); free(c->role_s); free(c->prod_r); free(c->prod_s);
-  free(c->live_r); free(c->live_s); free(c->read_r); free(c->read_s);
-  free(c->unb_r); free(c->unb_s);
-  free(c->entry_r); free(c->entry_s);
+  if (!c) return;
+  free(c->role_r);
+  free(c->role_s);
+  free(c->prod_r);
+  free(c->prod_s);
+  free(c->live_r);
+  free(c->live_s);
+  free(c->read_r);
+  free(c->read_s);
+  free(c->unb_r);
+  free(c->unb_s);
+  free(c->entry_r);
+  free(c->entry_s);
   free(c->elem_r);
   free(c->elem_iv_r);
   free(c->fguard_recv);
@@ -1054,8 +1273,7 @@ static void rg_read(RgCtx *c, int isreg, int off, int role) {
   unsigned char *live_a = isreg ? c->live_r : c->live_s;
   unsigned char *read_a = isreg ? c->read_r : c->read_s;
   unsigned char *prod_a = isreg ? c->prod_r : c->prod_s;
-  if (idx < 0 || (isreg ? idx >= c->rn : idx >= c->sn))
-    return;
+  if (idx < 0 || (isreg ? idx >= c->rn : idx >= c->sn)) return;
   read_a[idx] = 1;
   rg_role(role_a, idx, role);
   if (prod_a[idx] == RG_NONE)
@@ -1066,8 +1284,7 @@ static void rg_read(RgCtx *c, int isreg, int off, int role) {
 static void rg_write(RgCtx *c, int isreg, int off, int prod) {
   int idx = isreg ? rg_ri(off) : off;
   unsigned char *prod_a = isreg ? c->prod_r : c->prod_s;
-  if (idx < 0 || (isreg ? idx >= c->rn : idx >= c->sn))
-    return;
+  if (idx < 0 || (isreg ? idx >= c->rn : idx >= c->sn)) return;
   /* A register written inside the region must carry a role even when it is
      never read in-region (a write-only / live-out temporary): otherwise it is
      neither declared nor boxed, yet rg_numop still emits `u_/k_` for it. */
@@ -1085,197 +1302,232 @@ static int rg_scan(RgCtx *c) {
   for (i = c->h; i <= c->back; i++) {
     const JSAotGenInsn *in = &c->ins[i];
     switch (in->op) {
-    case ROP_local_check:
-    case ROP_local_check_init:
-      break;
+      case ROP_local_check:
+      case ROP_local_check_init:
+        break;
 
-    case ROP_get_local:
-      rg_read(c, 0, (int)in->arg[1].val, RG_NUM); /* provisional: fixed below */
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_get_local_s0: case ROP_get_local_s1:
-    case ROP_get_local_s2: case ROP_get_local_s3:
-      rg_read(c, 0, in->op - ROP_get_local_s0, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_get_local:
+        rg_read(
+            c, 0, (int)in->arg[1].val, RG_NUM); /* provisional: fixed below */
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_get_local_s0:
+      case ROP_get_local_s1:
+      case ROP_get_local_s2:
+      case ROP_get_local_s3:
+        rg_read(c, 0, in->op - ROP_get_local_s0, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_put_local:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_write(c, 0, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_put_local_s0: case ROP_put_local_s1:
-    case ROP_put_local_s2: case ROP_put_local_s3:
-      rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
-      rg_write(c, 0, in->op - ROP_put_local_s0, RG_NUM);
-      break;
-    case ROP_put_local_xfer:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_write(c, 0, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1:
-    case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3:
-      rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
-      rg_write(c, 0, in->op - ROP_put_local_xfer_s0, RG_NUM);
-      break;
+      case ROP_put_local:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_write(c, 0, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_put_local_s0:
+      case ROP_put_local_s1:
+      case ROP_put_local_s2:
+      case ROP_put_local_s3:
+        rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
+        rg_write(c, 0, in->op - ROP_put_local_s0, RG_NUM);
+        break;
+      case ROP_put_local_xfer:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_write(c, 0, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_put_local_xfer_s0:
+      case ROP_put_local_xfer_s1:
+      case ROP_put_local_xfer_s2:
+      case ROP_put_local_xfer_s3:
+        rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
+        rg_write(c, 0, in->op - ROP_put_local_xfer_s0, RG_NUM);
+        break;
 
-    case ROP_get_element:
-      rg_read(c, 1, (int)in->arg[1].val, RG_OBJ);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      {
-        int bi = rg_ri((int)in->arg[1].val);
-        if (bi >= 0 && bi < c->rn)
-          c->elem_r[bi] = 1;
+      case ROP_get_element:
+        rg_read(c, 1, (int)in->arg[1].val, RG_OBJ);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        {
+          int bi = rg_ri((int)in->arg[1].val);
+          if (bi >= 0 && bi < c->rn) c->elem_r[bi] = 1;
+        }
+        break;
+
+      case ROP_get_field:
+      case ROP_get_field2: {
+        int d = (int)in->arg[0].val, r = (int)in->arg[1].val;
+        int site = (int)in->arg[3].val;
+        rg_read(c, 1, r, RG_OBJ);
+        rg_write(c, 1, d, RG_NUM);
+        if (site >= 0 && site < c->pic_count) {
+          if (c->fguard_recv[site] < 0)
+            c->fguard_recv[site] = r;
+          else if (c->fguard_recv[site] != r)
+            return 0; /* same site, different receiver: cannot hoist */
+        } else {
+          return 0; /* no PIC site: cannot hoist the guard */
+        }
+        break;
       }
-      break;
 
-    case ROP_get_field:
-    case ROP_get_field2: {
-      int d = (int)in->arg[0].val, r = (int)in->arg[1].val;
-      int site = (int)in->arg[3].val;
-      rg_read(c, 1, r, RG_OBJ);
-      rg_write(c, 1, d, RG_NUM);
-      if (site >= 0 && site < c->pic_count) {
-        if (c->fguard_recv[site] < 0)
-          c->fguard_recv[site] = r;
-        else if (c->fguard_recv[site] != r)
-          return 0; /* same site, different receiver: cannot hoist */
-      } else {
-        return 0; /* no PIC site: cannot hoist the guard */
-      }
-      break;
-    }
+      case ROP_get_length:
+        rg_read(c, 1, (int)in->arg[1].val, RG_OBJ);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_get_length:
-      rg_read(c, 1, (int)in->arg[1].val, RG_OBJ);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_get_var_ref:
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_get_var_ref:
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_add_mul:
+      case ROP_mul_add:
+      case ROP_mul_sub:
+      case ROP_sub_mul:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[4].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM); /* dm */
+        rg_write(c, 1, (int)in->arg[3].val, RG_NUM); /* da */
+        break;
 
-    case ROP_add_mul: case ROP_mul_add: case ROP_mul_sub: case ROP_sub_mul:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[4].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM); /* dm */
-      rg_write(c, 1, (int)in->arg[3].val, RG_NUM); /* da */
-      break;
+      case ROP_eq:
+      case ROP_lt:
+      case ROP_lte:
+      case ROP_gt:
+      case ROP_gte:
+      case ROP_neq:
+      case ROP_strict_eq:
+      case ROP_strict_neq:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_BOX);
+        break;
 
-    case ROP_eq: case ROP_lt: case ROP_lte:
-    case ROP_gt: case ROP_gte: case ROP_neq:
-    case ROP_strict_eq: case ROP_strict_neq:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_BOX);
-      break;
+      case ROP_mul:
+      case ROP_add:
+      case ROP_sub:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_binary_loc_reg:
+        rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[3].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_binary_loc_loc:
+        rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
+        rg_read(c, 0, (int)in->arg[3].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_binary_imm:
+      case ROP_binary_imm_s:
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_add_imm_s:
+      case ROP_sub_imm_s:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_add_imm_self_s:
+      case ROP_sub_imm_self_s:
+        rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_add_imm_self_branch:
+      case ROP_add_imm_self_branch_s:
+        rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_mul: case ROP_add: case ROP_sub:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_binary_loc_reg:
-      rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[3].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_binary_loc_loc:
-      rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
-      rg_read(c, 0, (int)in->arg[3].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_binary_imm: case ROP_binary_imm_s:
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_add_imm_s: case ROP_sub_imm_s:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_add_imm_self_s: case ROP_sub_imm_self_s:
-      rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_add_imm_self_branch: case ROP_add_imm_self_branch_s:
-      rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_neg:
+      case ROP_inc:
+      case ROP_dec:
+      case ROP_not:
+      case ROP_to_numeric:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_neg: case ROP_inc: case ROP_dec:
-    case ROP_not: case ROP_to_numeric:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_load_i8:
+      case ROP_load_i8_s:
+      case ROP_load_i32:
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_move:
+      case ROP_move_s:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
+      case ROP_move_xfer:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_move: case ROP_move_s:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
-    case ROP_move_xfer:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_branch_cmp_loc_loc:
+        rg_read(c, 0, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
+        break;
+      case ROP_branch_cmp_loc_reg:
+        rg_read(c, 0, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        break;
+      case ROP_branch_cmp_reg_loc:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
+        break;
+      case ROP_branch_cmp_reg_reg:
+      case ROP_branch_cmp_reg_reg_s:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        break;
 
-    case ROP_branch_cmp_loc_loc:
-      rg_read(c, 0, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
-      break;
-    case ROP_branch_cmp_loc_reg:
-      rg_read(c, 0, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      break;
-    case ROP_branch_cmp_reg_loc:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 0, (int)in->arg[2].val, RG_NUM);
-      break;
-    case ROP_branch_cmp_reg_reg:
-    case ROP_branch_cmp_reg_reg_s:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      break;
+      case ROP_branch_lt_s:
+      case ROP_branch_nlt_s:
+      case ROP_branch_lte_s:
+      case ROP_branch_nlte_s:
+      case ROP_branch_gt_s:
+      case ROP_branch_ngt_s:
+      case ROP_branch_gte_s:
+      case ROP_branch_ngte_s:
+      case ROP_branch_eq_s:
+      case ROP_branch_neq_s:
+        rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        break;
 
-    case ROP_branch_lt_s: case ROP_branch_nlt_s:
-    case ROP_branch_lte_s: case ROP_branch_nlte_s:
-    case ROP_branch_gt_s: case ROP_branch_ngt_s:
-    case ROP_branch_gte_s: case ROP_branch_ngte_s:
-    case ROP_branch_eq_s: case ROP_branch_neq_s:
-      rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      break;
+      case ROP_div:
+        rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
+        rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
+        rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_div:
-      rg_read(c, 1, (int)in->arg[1].val, RG_NUM);
-      rg_read(c, 1, (int)in->arg[2].val, RG_NUM);
-      rg_write(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_load_false:
+      case ROP_load_true:
+      case ROP_load_null:
+        rg_write(c, 1, (int)in->arg[0].val, RG_BOX);
+        break;
 
-    case ROP_load_false: case ROP_load_true: case ROP_load_null:
-      rg_write(c, 1, (int)in->arg[0].val, RG_BOX);
-      break;
+      case ROP_branch_if:
+      case ROP_branch_if_not:
+        rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
+        break;
 
-    case ROP_branch_if: case ROP_branch_if_not:
-      rg_read(c, 1, (int)in->arg[0].val, RG_NUM);
-      break;
+      case ROP_branch:
+      case ROP_branch_s:
+        break;
 
-    case ROP_branch: case ROP_branch_s:
-      break;
-
-    default:
-      if (getenv("QJSAOT_REGION_DEBUG"))
-        fprintf(stderr, "    op %d not whitelisted\n", in->op);
-      return 0;
+      default:
+        if (getenv("QJSAOT_REGION_DEBUG"))
+          fprintf(stderr, "    op %d not whitelisted\n", in->op);
+        return 0;
     }
   }
   return 1;
 }
 
-/* R2 — recognise the canonical `for (i = 0; i < n; i++) a[i]` induction
+/* Recognise the canonical `for (i = 0; i < n; i++) a[i]` induction
    variable and its loop bound. Sets c->iv_reg and c->bound_off, and marks the
    element bases read with the IV as key (so their index checks can be elided).
    Only the register-IV shape is handled; anything else leaves iv_reg = -1. */
@@ -1287,34 +1539,32 @@ static void rg_find_iv(RgCtx *c) {
     const JSAotGenInsn *in = &c->ins[t];
     int idx_off = 0, bd_off = 0, tgt = -1, ok = 0;
     switch (in->op) {
-    case ROP_branch_nlt_s:
-      idx_off = (int)in->arg[0].val;
-      bd_off = (int)in->arg[1].val;
-      tgt = c->nxts[t] + (int)in->arg[2].val;
-      ok = 1;
-      break;
-    case ROP_branch_cmp_reg_reg:
-    case ROP_branch_cmp_reg_reg_s: {
-      int sub = (int)in->arg[0].val;
-      if (sub == REG_BIN_GTE || sub == (REG_BIN_LT | REG_CMP_INVERT)) {
-        idx_off = (int)in->arg[1].val;
-        bd_off = (int)in->arg[2].val;
-        tgt = c->nxts[t] + (int)in->arg[3].val;
+      case ROP_branch_nlt_s:
+        idx_off = (int)in->arg[0].val;
+        bd_off = (int)in->arg[1].val;
+        tgt = c->nxts[t] + (int)in->arg[2].val;
         ok = 1;
+        break;
+      case ROP_branch_cmp_reg_reg:
+      case ROP_branch_cmp_reg_reg_s: {
+        int sub = (int)in->arg[0].val;
+        if (sub == REG_BIN_GTE || sub == (REG_BIN_LT | REG_CMP_INVERT)) {
+          idx_off = (int)in->arg[1].val;
+          bd_off = (int)in->arg[2].val;
+          tgt = c->nxts[t] + (int)in->arg[3].val;
+          ok = 1;
+        }
+        break;
       }
-      break;
+      default:
+        break;
     }
-    default:
-      break;
-    }
-    if (!ok || tgt != c->exit_pc)
-      continue;
+    if (!ok || tgt != c->exit_pc) continue;
     {
-      int iv = rg_ri(idx_off), bi = rg_ri(bd_off), k, writes = 0, last_write = -1;
-      if (iv < 0 || iv >= c->rn || bi < 0 || bi >= c->rn)
-        continue;
-      if (c->role_r[iv] != RG_NUM || !c->live_r[iv])
-        continue;
+      int iv = rg_ri(idx_off), bi = rg_ri(bd_off), k, writes = 0,
+          last_write = -1;
+      if (iv < 0 || iv >= c->rn || bi < 0 || bi >= c->rn) continue;
+      if (c->role_r[iv] != RG_NUM || !c->live_r[iv]) continue;
       if (c->role_r[bi] != RG_NUM || c->prod_r[bi] != RG_NONE)
         continue; /* the bound must be loop-invariant */
       /* The IV is written only by self +/- 1, and every element read keyed by
@@ -1326,16 +1576,16 @@ static void rg_find_iv(RgCtx *c) {
             (int)q->arg[1].val == idx_off) {
           writes++;
           last_write = k;
-        } else if ((q->op == ROP_add_imm_self_s || q->op == ROP_sub_imm_self_s ||
-                    q->op == ROP_add_imm_self_branch ||
-                    q->op == ROP_add_imm_self_branch_s) && d == idx_off &&
-                   (int)(int8_t)q->arg[1].val == 1) {
+        } else if (
+            (q->op == ROP_add_imm_self_s || q->op == ROP_sub_imm_self_s ||
+             q->op == ROP_add_imm_self_branch ||
+             q->op == ROP_add_imm_self_branch_s) &&
+            d == idx_off && (int)(int8_t)q->arg[1].val == 1) {
           writes++;
           last_write = k;
         }
       }
-      if (writes == 0)
-        continue;
+      if (writes == 0) continue;
       for (k = c->h; k <= c->back; k++) {
         const JSAotGenInsn *q = &c->ins[k];
         if (q->op == ROP_get_element && (int)q->arg[2].val == idx_off &&
@@ -1347,8 +1597,7 @@ static void rg_find_iv(RgCtx *c) {
         const JSAotGenInsn *q = &c->ins[k];
         if (q->op == ROP_get_element && (int)q->arg[2].val == idx_off) {
           int b = rg_ri((int)q->arg[1].val);
-          if (b >= 0 && b < c->rn)
-            c->elem_iv_r[b] = 1;
+          if (b >= 0 && b < c->rn) c->elem_iv_r[b] = 1;
         }
       }
       c->iv_reg = iv;
@@ -1362,27 +1611,34 @@ static void rg_find_iv(RgCtx *c) {
 /* Emit the box-back of every currently-unboxed value. */
 static void rg_box_all(RgCtx *c) {
   int i;
-  if (mut_is("no_box_on_exit"))
-    return;
+  if (mut_is("no_box_on_exit")) return;
   for (i = 0; i < c->rn; i++)
     if (c->role_r[i] == RG_NUM && c->unb_r[i]) {
       if (i == c->iv_reg && !mut_is("iv_no_box"))
-        rg_out(c, "        qjs_aot_set_reg_p(ctx, fr, %d, "
-                  "qjs_aot_box_num(u_%d, qjs_aot_fitsi(u_%d)));\n",
-               i * 16, i * 16, i * 16);
+        rg_out(
+            c,
+            "        qjs_aot_set_reg_p(ctx, fr, %d, "
+            "qjs_aot_box_num(u_%d, qjs_aot_fitsi(u_%d)));\n",
+            i * 16, i * 16, i * 16);
       else
-        rg_out(c, "        qjs_aot_set_reg_p(ctx, fr, %d, qjs_aot_box_num(u_%d, k_%d));\n",
-               i * 16, i * 16, i * 16);
+        rg_out(
+            c,
+            "        qjs_aot_set_reg_p(ctx, fr, %d, qjs_aot_box_num(u_%d, "
+            "k_%d));\n",
+            i * 16, i * 16, i * 16);
     }
   for (i = 0; i < c->sn; i++)
     if (c->role_s[i] == RG_NUM && c->unb_s[i])
-      rg_out(c, "        qjs_aot_put_local(ctx, vb, %d, qjs_aot_box_num(us_%d, ks_%d));\n",
-             i, i, i);
+      rg_out(
+          c,
+          "        qjs_aot_put_local(ctx, vb, %d, qjs_aot_box_num(us_%d, "
+          "ks_%d));\n",
+          i, i, i);
 }
 
 /* A deopt: box everything, then jump to the Layer A label for pc. The
    per-region disable counter is bumped so a loop that keeps failing its entry
-   guard stops paying for it (§7.4 item 3). */
+   guard stops paying for it. */
 static void rg_deopt(RgCtx *c, int pc, int is_head) {
   rg_box_all(c);
   rg_out(c, "        rg_dis_%d++;\n", c->head_pc);
@@ -1392,10 +1648,23 @@ static void rg_deopt(RgCtx *c, int pc, int is_head) {
     rg_out(c, "        goto pc_%d;\n", pc);
 }
 
-typedef struct { int isreg; int off; } RgVal;
+typedef struct {
+  int isreg;
+  int off;
+} RgVal;
 
-static RgVal rg_reg(int off) { RgVal v; v.isreg = 1; v.off = off; return v; }
-static RgVal rg_slot(int s) { RgVal v; v.isreg = 0; v.off = s; return v; }
+static RgVal rg_reg(int off) {
+  RgVal v;
+  v.isreg = 1;
+  v.off = off;
+  return v;
+}
+static RgVal rg_slot(int s) {
+  RgVal v;
+  v.isreg = 0;
+  v.off = s;
+  return v;
+}
 
 /* Emit a deopt when a value is not currently unboxed as a number. */
 static void rg_ensure_num(RgCtx *c, int isreg, int off, int pc) {
@@ -1407,15 +1676,16 @@ static void rg_ensure_num(RgCtx *c, int isreg, int off, int pc) {
     bad = 1;
   else
     bad = (role[idx] != RG_NUM || !unb[idx]);
-  if (bad)
-    rg_deopt(c, pc, pc == c->head_pc);
+  if (bad) rg_deopt(c, pc, pc == c->head_pc);
 }
 
 static void rg_num_expr(RgVal v, char *buf, size_t n) {
-  if (v.isreg) snprintf(buf, n, "u_%d", v.off);
-  else snprintf(buf, n, "us_%d", v.off);
+  if (v.isreg)
+    snprintf(buf, n, "u_%d", v.off);
+  else
+    snprintf(buf, n, "us_%d", v.off);
 }
-/* The induction variable keeps k=1 with no per-iteration FITSI (§7.6), so its
+/* The induction variable keeps k=1 with no per-iteration FITSI, so its
    tag is stale past INT32_MAX; every consumer re-derives the exact isint. */
 static int rg_is_iv(RgCtx *c, RgVal v) {
   return v.isreg && c->iv_reg >= 0 && rg_ri(v.off) == c->iv_reg;
@@ -1455,29 +1725,40 @@ static void rg_val_box_expr(RgCtx *c, int isreg, int off, char *buf, size_t n) {
 }
 
 /* Emit a numeric binary op into an unboxed destination expression. */
-static void rg_numop(RgCtx *c, int sub, const char *dst, const char *dka,
-                     const char *ea, const char *ka, const char *eb,
-                     const char *kb, int pc) {
+static void rg_numop(
+    RgCtx *c, int sub, const char *dst, const char *dka, const char *ea,
+    const char *ka, const char *eb, const char *kb, int pc) {
   if (sub == REG_BIN_ADD || sub == REG_BIN_SUB || sub == REG_BIN_MUL) {
-    const char *cs = sub == REG_BIN_ADD ? "+" : (sub == REG_BIN_SUB ? "-" : "*");
+    const char *cs =
+        sub == REG_BIN_ADD ? "+" : (sub == REG_BIN_SUB ? "-" : "*");
     if (mut_is("fitsi_loose"))
-      rg_out(c, "        { double _d = %s %s %s; %s = _d; %s = %s && %s; }\n",
-             ea, cs, eb, dst, dka, ka, kb);
+      rg_out(
+          c, "        { double _d = %s %s %s; %s = _d; %s = %s && %s; }\n", ea,
+          cs, eb, dst, dka, ka, kb);
     else
-      rg_out(c, "        { double _d = %s %s %s; %s = _d; %s = %s && %s && qjs_aot_fitsi(_d); }\n",
-             ea, cs, eb, dst, dka, ka, kb);
+      rg_out(
+          c,
+          "        { double _d = %s %s %s; %s = _d; %s = %s && %s && "
+          "qjs_aot_fitsi(_d); }\n",
+          ea, cs, eb, dst, dka, ka, kb);
   } else if (sub == REG_BIN_DIV) {
     /* E1 div: the result is an int only when it is exactly an int32. */
     if (mut_is("div_int"))
-      rg_out(c, "        { double _d = %s / %s; %s = _d; %s = 1; }\n",
-             ea, eb, dst, dka);
+      rg_out(
+          c, "        { double _d = %s / %s; %s = _d; %s = 1; }\n", ea, eb, dst,
+          dka);
     else
-      rg_out(c, "        { double _d = %s / %s; %s = _d; %s = qjs_aot_fitsi(_d); }\n",
-             ea, eb, dst, dka);
+      rg_out(
+          c,
+          "        { double _d = %s / %s; %s = _d; %s = qjs_aot_fitsi(_d); }\n",
+          ea, eb, dst, dka);
   } else {
     rg_out(c, "        { JSValue _o;\n");
-    rg_out(c, "          if (!qjs_aot_num_fast(%d, qjs_aot_box_num(%s,%s), "
-               "qjs_aot_box_num(%s,%s), &_o)) {\n", sub, ea, ka, eb, kb);
+    rg_out(
+        c,
+        "          if (!qjs_aot_num_fast(%d, qjs_aot_box_num(%s,%s), "
+        "qjs_aot_box_num(%s,%s), &_o)) {\n",
+        sub, ea, ka, eb, kb);
     rg_deopt(c, pc, pc == c->head_pc);
     rg_out(c, "          }\n");
     rg_out(c, "          qjs_aot_to_num(_o, &%s, &%s);\n", dst, dka);
@@ -1494,7 +1775,9 @@ static void rg_boxop(RgCtx *c, int sub, int d, RgVal a, RgVal b, int pc) {
   rg_box_expr(c, a, ea, sizeof ea);
   rg_box_expr(c, b, eb, sizeof eb);
   rg_out(c, "        { JSValue _r;\n");
-  rg_out(c, "          if (qjs_aot_binary(ctx, %d, %s, %s, &_r)) {\n", sub, ea, eb);
+  rg_out(
+      c, "          if (qjs_aot_binary(ctx, %d, %s, %s, &_r)) {\n", sub, ea,
+      eb);
   rg_deopt(c, pc, pc == c->head_pc);
   rg_out(c, "          }\n");
   rg_out(c, "          qjs_aot_set_reg_p(ctx, fr, %d, _r); }\n", d);
@@ -1542,24 +1825,37 @@ static void rg_un(RgCtx *c, int op, int d, RgVal a, int pc) {
     int is_iv = (op == ROP_inc || op == ROP_dec) && c->iv_reg >= 0 &&
                 rg_ri(d) == c->iv_reg && a.isreg && rg_ri(a.off) == c->iv_reg;
     if (op == ROP_neg)
-      rg_out(c, "        { double _d = -%s; u_%d = _d; k_%d = %s && qjs_aot_fitsi(_d); }\n",
-             ea, d, d, ka);
+      rg_out(
+          c,
+          "        { double _d = -%s; u_%d = _d; k_%d = %s && "
+          "qjs_aot_fitsi(_d); }\n",
+          ea, d, d, ka);
     else if (is_iv)
-      /* R2: the IV is kept as an exact double (an int64-range integer) with no
+      /* The IV is kept as an exact double (an int64-range integer) with no
          per-iteration FITSI; its tag stays 1 and may be stale past 2^31. Every
          box site re-applies the exact interpreter rule (rg_box_expr/rg_kint_expr
          and rg_box_all), so the observable tag is still INT iff (int32_t)d == d. */
-      rg_out(c, "        { double _d = %s %s 1.0; u_%d = _d; k_%d = 1; }\n",
-             ea, cs, d, d);
+      rg_out(
+          c, "        { double _d = %s %s 1.0; u_%d = _d; k_%d = 1; }\n", ea,
+          cs, d, d);
     else
-      rg_out(c, "        { double _d = %s %s 1.0; u_%d = _d; k_%d = %s && qjs_aot_fitsi(_d); }\n",
-             ea, cs, d, d, ka);
+      rg_out(
+          c,
+          "        { double _d = %s %s 1.0; u_%d = _d; k_%d = %s && "
+          "qjs_aot_fitsi(_d); }\n",
+          ea, cs, d, d, ka);
   } else {
     rg_out(c, "        { JSValue _o;\n");
-    rg_out(c, "          if (!qjs_aot_unary_num_fast(%d, qjs_aot_box_num(%s,%s), &_o)) {\n",
-           REG_UN_NOT, ea, ka);
-    rg_out(c, "            if (qjs_aot_unary(ctx, %d, qjs_aot_box_num(%s,%s), &_o)) {\n",
-           REG_UN_NOT, ea, ka);
+    rg_out(
+        c,
+        "          if (!qjs_aot_unary_num_fast(%d, qjs_aot_box_num(%s,%s), "
+        "&_o)) {\n",
+        REG_UN_NOT, ea, ka);
+    rg_out(
+        c,
+        "            if (qjs_aot_unary(ctx, %d, qjs_aot_box_num(%s,%s), &_o)) "
+        "{\n",
+        REG_UN_NOT, ea, ka);
     rg_deopt(c, pc, pc == c->head_pc);
     rg_out(c, "            }\n          }\n");
     rg_out(c, "          qjs_aot_to_num(_o, &u_%d, &k_%d);\n", d, d);
@@ -1578,17 +1874,20 @@ static void rg_elem(RgCtx *c, int d, int base, RgVal key, int pc) {
   rg_num_expr(key, ek, sizeof ek);
   rg_kint_expr(c, key, kk, sizeof kk);
   {
-    /* R2: an IV-keyed read is covered by the hoisted `bound <= len` guard. */
+    /* An IV-keyed read is covered by the hoisted `bound <= len` guard. */
     int iv_key = c->iv_reg >= 0 && key.isreg && rg_ri(key.off) == c->iv_reg;
     if (!mut_is("skip_bounds") && !iv_key) {
-      rg_out(c, "        if (!(%s && %s >= 0.0 && %s < (double)len_%d)) {\n",
-             kk, ek, ek, base);
+      rg_out(
+          c, "        if (!(%s && %s >= 0.0 && %s < (double)len_%d)) {\n", kk,
+          ek, ek, base);
       rg_deopt(c, pc, pc == c->head_pc);
       rg_out(c, "        }\n");
     }
   }
-  rg_out(c, "        if (!qjs_aot_elem_num(data_%d, (uint32_t)%s, &u_%d, &k_%d)) {\n",
-         base, ek, d, d);
+  rg_out(
+      c,
+      "        if (!qjs_aot_elem_num(data_%d, (uint32_t)%s, &u_%d, &k_%d)) {\n",
+      base, ek, d, d);
   rg_deopt(c, pc, pc == c->head_pc);
   rg_out(c, "        }\n");
   c->unb_r[rg_ri(d)] = 1;
@@ -1608,7 +1907,8 @@ static void rg_goto_target(RgCtx *c, int tgt) {
 }
 
 /* Conditional numeric compare branch. */
-static void rg_branch_cmp(RgCtx *c, int sub, RgVal a, RgVal b, int tgt, int pc) {
+static void rg_branch_cmp(
+    RgCtx *c, int sub, RgVal a, RgVal b, int tgt, int pc) {
   char ea[40], eb[40];
   int invert = (sub & REG_CMP_INVERT) != 0;
   int base = sub & ~REG_CMP_INVERT;
@@ -1618,20 +1918,37 @@ static void rg_branch_cmp(RgCtx *c, int sub, RgVal a, RgVal b, int tgt, int pc) 
   rg_num_expr(a, ea, sizeof ea);
   rg_num_expr(b, eb, sizeof eb);
   switch (base) {
-  case REG_BIN_LT: cop = "<"; break;
-  case REG_BIN_LTE: cop = "<="; break;
-  case REG_BIN_GT: cop = ">"; break;
-  case REG_BIN_GTE: cop = ">="; break;
-  case REG_BIN_EQ: case REG_BIN_STRICT_EQ: cop = "=="; break;
-  case REG_BIN_NEQ: case REG_BIN_STRICT_NEQ: cop = "!="; break;
-  default: break;
+    case REG_BIN_LT:
+      cop = "<";
+      break;
+    case REG_BIN_LTE:
+      cop = "<=";
+      break;
+    case REG_BIN_GT:
+      cop = ">";
+      break;
+    case REG_BIN_GTE:
+      cop = ">=";
+      break;
+    case REG_BIN_EQ:
+    case REG_BIN_STRICT_EQ:
+      cop = "==";
+      break;
+    case REG_BIN_NEQ:
+    case REG_BIN_STRICT_NEQ:
+      cop = "!=";
+      break;
+    default:
+      break;
   }
   if (cop == NULL) { /* not a plain numeric compare: fall back to the helper */
     char ea2[40], eb2[40];
     rg_box_expr(c, a, ea2, sizeof ea2);
     rg_box_expr(c, b, eb2, sizeof eb2);
     rg_out(c, "        { int _t;\n");
-    rg_out(c, "          if (!qjs_aot_branch_cmp(%d, %s, %s, &_t)) {\n", sub, ea2, eb2);
+    rg_out(
+        c, "          if (!qjs_aot_branch_cmp(%d, %s, %s, &_t)) {\n", sub, ea2,
+        eb2);
     rg_deopt(c, pc, pc == c->head_pc);
     rg_out(c, "          }\n");
   } else {
@@ -1639,8 +1956,7 @@ static void rg_branch_cmp(RgCtx *c, int sub, RgVal a, RgVal b, int tgt, int pc) 
        so a direct double compare has exactly JS semantics, including NaN and
        -0. */
     rg_out(c, "        { int _t = (%s %s %s);\n", ea, cop, eb);
-    if (invert)
-      rg_out(c, "          _t = !_t;\n");
+    if (invert) rg_out(c, "          _t = !_t;\n");
   }
   if (tgt == c->head_pc) {
     rg_out(c, "          if (_t) goto rg_%d_loop;\n", c->head_pc);
@@ -1660,13 +1976,18 @@ static void rg_branch_bool(RgCtx *c, int op, int a, int tgt, int pc) {
   char ev[64];
   rg_val_box_expr(c, 1, a, ev, sizeof ev);
   if (tgt == c->head_pc) {
-    rg_out(c, "        if ((qjs_aot_to_bool(ctx, %s) != 0) == %d) goto rg_%d_loop;\n",
-           ev, want, c->head_pc);
+    rg_out(
+        c,
+        "        if ((qjs_aot_to_bool(ctx, %s) != 0) == %d) goto rg_%d_loop;\n",
+        ev, want, c->head_pc);
   } else if (tgt == c->exit_pc) {
-    rg_out(c, "        if ((qjs_aot_to_bool(ctx, %s) != 0) == %d) goto rg_%d_exit;\n",
-           ev, want, c->head_pc);
+    rg_out(
+        c,
+        "        if ((qjs_aot_to_bool(ctx, %s) != 0) == %d) goto rg_%d_exit;\n",
+        ev, want, c->head_pc);
   } else {
-    rg_out(c, "        if ((qjs_aot_to_bool(ctx, %s) != 0) == %d) {\n", ev, want);
+    rg_out(
+        c, "        if ((qjs_aot_to_bool(ctx, %s) != 0) == %d) {\n", ev, want);
     rg_box_all(c);
     rg_out(c, "          goto pc_%d;\n        }\n", tgt);
   }
@@ -1679,251 +2000,318 @@ static void rg_emit_body(RgCtx *c) {
     const JSAotGenInsn *in = &c->ins[i];
     int pc = c->offs[i], next = c->nxts[i];
     switch (in->op) {
-    case ROP_local_check:
-    case ROP_local_check_init:
-      break;
+      case ROP_local_check:
+      case ROP_local_check_init:
+        break;
 
-    case ROP_get_local: {
-      int d = (int)in->arg[0].val, s = (int)in->arg[1].val;
-      if (s >= 0 && s < c->sn && c->role_s[s] == RG_NUM) {
-        rg_out(c, "        u_%d = us_%d; k_%d = ks_%d;\n", d, s, d, s);
+      case ROP_get_local: {
+        int d = (int)in->arg[0].val, s = (int)in->arg[1].val;
+        if (s >= 0 && s < c->sn && c->role_s[s] == RG_NUM) {
+          rg_out(c, "        u_%d = us_%d; k_%d = ks_%d;\n", d, s, d, s);
+          c->unb_r[rg_ri(d)] = 1;
+        } else {
+          rg_out(c, "        AOT_SET_B(ctx, fr, %d, vb[%d]);\n", d, s);
+          c->unb_r[rg_ri(d)] = 0;
+        }
+        break;
+      }
+      case ROP_get_local_s0:
+      case ROP_get_local_s1:
+      case ROP_get_local_s2:
+      case ROP_get_local_s3: {
+        int d = (int)in->arg[0].val, s = in->op - ROP_get_local_s0;
+        if (s < c->sn && c->role_s[s] == RG_NUM) {
+          rg_out(c, "        u_%d = us_%d; k_%d = ks_%d;\n", d, s, d, s);
+          c->unb_r[rg_ri(d)] = 1;
+        } else {
+          rg_out(c, "        AOT_SET_B(ctx, fr, %d, vb[%d]);\n", d, s);
+          c->unb_r[rg_ri(d)] = 0;
+        }
+        break;
+      }
+
+      case ROP_put_local: {
+        int s = (int)in->arg[0].val, r = (int)in->arg[1].val;
+        if (s >= 0 && s < c->sn && c->role_s[s] == RG_NUM) {
+          rg_ensure_num(c, 1, r, pc);
+          rg_out(c, "        us_%d = u_%d; ks_%d = k_%d;\n", s, r, s, r);
+          c->unb_s[s] = 1;
+        } else {
+          rg_deopt(c, pc, pc == c->head_pc);
+        }
+        break;
+      }
+      case ROP_put_local_s0:
+      case ROP_put_local_s1:
+      case ROP_put_local_s2:
+      case ROP_put_local_s3: {
+        int s = in->op - ROP_put_local_s0, r = (int)in->arg[0].val;
+        if (c->role_s[s] == RG_NUM) {
+          rg_ensure_num(c, 1, r, pc);
+          rg_out(c, "        us_%d = u_%d; ks_%d = k_%d;\n", s, r, s, r);
+          c->unb_s[s] = 1;
+        } else {
+          rg_deopt(c, pc, pc == c->head_pc);
+        }
+        break;
+      }
+      case ROP_put_local_xfer:
+      case ROP_put_local_xfer_s0:
+      case ROP_put_local_xfer_s1:
+      case ROP_put_local_xfer_s2:
+      case ROP_put_local_xfer_s3: {
+        int s = (in->op == ROP_put_local_xfer) ? (int)in->arg[0].val
+                                               : in->op - ROP_put_local_xfer_s0;
+        int r = (int)in->arg[in->op == ROP_put_local_xfer ? 1 : 0].val;
+        if (s >= 0 && s < c->sn && c->role_s[s] == RG_NUM) {
+          rg_ensure_num(c, 1, r, pc);
+          rg_out(c, "        us_%d = u_%d; ks_%d = k_%d;\n", s, r, s, r);
+          c->unb_s[s] = 1;
+          c->unb_r[rg_ri(r)] = 0; /* the xfer empties the register */
+        } else {
+          rg_deopt(c, pc, pc == c->head_pc);
+        }
+        break;
+      }
+
+      case ROP_get_element:
+        rg_elem(
+            c, (int)in->arg[0].val, (int)in->arg[1].val,
+            rg_reg((int)in->arg[2].val), pc);
+        break;
+
+      case ROP_get_field:
+      case ROP_get_field2: {
+        int d = (int)in->arg[0].val, r = (int)in->arg[1].val;
+        int site = (int)in->arg[3].val;
+        rg_out(
+            c,
+            "        { JSValue _v = qjs_aot_field_read(AOT_REG(fr,%d), "
+            "_fso_%d);\n",
+            r, site);
+        rg_out(c, "          if (!qjs_aot_to_num(_v, &u_%d, &k_%d)) {\n", d, d);
+        rg_deopt(c, pc, pc == c->head_pc);
+        rg_out(c, "          } }\n");
         c->unb_r[rg_ri(d)] = 1;
-      } else {
-        rg_out(c, "        AOT_SET_B(ctx, fr, %d, vb[%d]);\n", d, s);
-        c->unb_r[rg_ri(d)] = 0;
+        break;
       }
-      break;
-    }
-    case ROP_get_local_s0: case ROP_get_local_s1:
-    case ROP_get_local_s2: case ROP_get_local_s3: {
-      int d = (int)in->arg[0].val, s = in->op - ROP_get_local_s0;
-      if (s < c->sn && c->role_s[s] == RG_NUM) {
-        rg_out(c, "        u_%d = us_%d; k_%d = ks_%d;\n", d, s, d, s);
+
+      case ROP_get_length: {
+        int d = (int)in->arg[0].val, r = (int)in->arg[1].val;
+        rg_out(
+            c,
+            "        if (!qjs_aot_get_length_num(AOT_REG(fr,%d), &u_%d, "
+            "&k_%d)) {\n",
+            r, d, d);
+        rg_deopt(c, pc, pc == c->head_pc);
+        rg_out(c, "        }\n");
         c->unb_r[rg_ri(d)] = 1;
-      } else {
-        rg_out(c, "        AOT_SET_B(ctx, fr, %d, vb[%d]);\n", d, s);
-        c->unb_r[rg_ri(d)] = 0;
+        break;
       }
-      break;
-    }
-
-    case ROP_put_local: {
-      int s = (int)in->arg[0].val, r = (int)in->arg[1].val;
-      if (s >= 0 && s < c->sn && c->role_s[s] == RG_NUM) {
-        rg_ensure_num(c, 1, r, pc);
-        rg_out(c, "        us_%d = u_%d; ks_%d = k_%d;\n", s, r, s, r);
-        c->unb_s[s] = 1;
-      } else {
+      case ROP_get_var_ref: {
+        int d = (int)in->arg[0].val, slot = (int)in->arg[1].val;
+        rg_out(
+            c, "        { JSValue _v = *qjs_aot_var_ref_ptr(f, %d);\n", slot);
+        rg_out(c, "          if (!qjs_aot_to_num(_v, &u_%d, &k_%d)) {\n", d, d);
         rg_deopt(c, pc, pc == c->head_pc);
+        rg_out(c, "          } }\n");
+        c->unb_r[rg_ri(d)] = 1;
+        break;
       }
-      break;
-    }
-    case ROP_put_local_s0: case ROP_put_local_s1:
-    case ROP_put_local_s2: case ROP_put_local_s3: {
-      int s = in->op - ROP_put_local_s0, r = (int)in->arg[0].val;
-      if (c->role_s[s] == RG_NUM) {
-        rg_ensure_num(c, 1, r, pc);
-        rg_out(c, "        us_%d = u_%d; ks_%d = k_%d;\n", s, r, s, r);
-        c->unb_s[s] = 1;
-      } else {
-        rg_deopt(c, pc, pc == c->head_pc);
+
+      case ROP_add_mul:
+      case ROP_mul_add:
+      case ROP_mul_sub:
+      case ROP_sub_mul: {
+        int dm = (int)in->arg[0].val, x = (int)in->arg[1].val,
+            y = (int)in->arg[2].val;
+        int da = (int)in->arg[3].val, cc = (int)in->arg[4].val;
+        int isadd = (in->op == ROP_mul_add || in->op == ROP_add_mul);
+        int mul_first = (in->op == ROP_mul_add || in->op == ROP_mul_sub);
+        int bsub = isadd ? REG_BIN_ADD : REG_BIN_SUB;
+        rg_bin2(c, REG_BIN_MUL, dm, rg_reg(x), rg_reg(y), pc);
+        if (mul_first)
+          rg_bin2(c, bsub, da, rg_reg(dm), rg_reg(cc), pc);
+        else
+          rg_bin2(c, bsub, da, rg_reg(cc), rg_reg(dm), pc);
+        break;
       }
-      break;
-    }
-    case ROP_put_local_xfer:
-    case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1:
-    case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3: {
-      int s = (in->op == ROP_put_local_xfer) ? (int)in->arg[0].val
-                                             : in->op - ROP_put_local_xfer_s0;
-      int r = (int)in->arg[in->op == ROP_put_local_xfer ? 1 : 0].val;
-      if (s >= 0 && s < c->sn && c->role_s[s] == RG_NUM) {
-        rg_ensure_num(c, 1, r, pc);
-        rg_out(c, "        us_%d = u_%d; ks_%d = k_%d;\n", s, r, s, r);
-        c->unb_s[s] = 1;
-        c->unb_r[rg_ri(r)] = 0; /* the xfer empties the register */
-      } else {
-        rg_deopt(c, pc, pc == c->head_pc);
+
+      case ROP_eq:
+      case ROP_lt:
+      case ROP_lte:
+      case ROP_gt:
+      case ROP_gte:
+      case ROP_neq:
+      case ROP_strict_eq:
+      case ROP_strict_neq:
+        rg_boxop(
+            c, binop_subop(in->op), (int)in->arg[0].val,
+            rg_reg((int)in->arg[1].val), rg_reg((int)in->arg[2].val), pc);
+        break;
+
+      case ROP_mul:
+      case ROP_add:
+      case ROP_sub: {
+        int sub = in->op == ROP_mul   ? REG_BIN_MUL
+                  : in->op == ROP_add ? REG_BIN_ADD
+                                      : REG_BIN_SUB;
+        rg_bin2(
+            c, sub, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
+            rg_reg((int)in->arg[2].val), pc);
+        break;
       }
-      break;
-    }
+      case ROP_binary_loc_reg:
+        rg_bin2(
+            c, (int)in->arg[1].val, (int)in->arg[0].val,
+            rg_slot((int)in->arg[2].val), rg_reg((int)in->arg[3].val), pc);
+        break;
+      case ROP_binary_loc_loc:
+        rg_bin2(
+            c, (int)in->arg[1].val, (int)in->arg[0].val,
+            rg_slot((int)in->arg[2].val), rg_slot((int)in->arg[3].val), pc);
+        break;
+      case ROP_binary_imm:
+      case ROP_binary_imm_s:
+        rg_bin_imm(
+            c, (int)in->arg[1].val, (int)in->arg[0].val,
+            rg_reg((int)in->arg[2].val), (int32_t)in->arg[3].val, pc);
+        break;
+      case ROP_add_imm_s:
+      case ROP_sub_imm_s:
+        rg_bin_imm(
+            c, in->op == ROP_add_imm_s ? REG_BIN_ADD : REG_BIN_SUB,
+            (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
+            (int32_t)in->arg[2].val, pc);
+        break;
+      case ROP_add_imm_self_s:
+      case ROP_sub_imm_self_s: {
+        int d = (int)in->arg[0].val;
+        rg_bin_imm(
+            c, in->op == ROP_add_imm_self_s ? REG_BIN_ADD : REG_BIN_SUB, d,
+            rg_reg(d), (int32_t)in->arg[1].val, pc);
+        break;
+      }
+      case ROP_add_imm_self_branch:
+      case ROP_add_imm_self_branch_s: {
+        int d = (int)in->arg[0].val;
+        int tgt = next + (int)in->arg[2].val;
+        rg_bin_imm(c, REG_BIN_ADD, d, rg_reg(d), (int32_t)in->arg[1].val, pc);
+        rg_goto_target(c, tgt);
+        break;
+      }
+      case ROP_neg:
+      case ROP_inc:
+      case ROP_dec:
+      case ROP_not:
+      case ROP_to_numeric:
+        rg_un(c, in->op, (int)in->arg[0].val, rg_reg((int)in->arg[1].val), pc);
+        break;
 
-    case ROP_get_element:
-      rg_elem(c, (int)in->arg[0].val, (int)in->arg[1].val, rg_reg((int)in->arg[2].val), pc);
-      break;
+      case ROP_load_i8:
+      case ROP_load_i8_s: {
+        int d = (int)in->arg[0].val;
+        rg_out(
+            c, "        u_%d = (double)(int)%d; k_%d = 1;\n", d,
+            (int)(int8_t)in->arg[1].val, d);
+        c->unb_r[rg_ri(d)] = 1;
+        break;
+      }
+      case ROP_load_i32: {
+        int d = (int)in->arg[0].val;
+        rg_out(
+            c, "        u_%d = (double)(int32_t)%d; k_%d = 1;\n", d,
+            (int32_t)in->arg[1].val, d);
+        c->unb_r[rg_ri(d)] = 1;
+        break;
+      }
 
-    case ROP_get_field:
-    case ROP_get_field2: {
-      int d = (int)in->arg[0].val, r = (int)in->arg[1].val;
-      int site = (int)in->arg[3].val;
-      rg_out(c, "        { JSValue _v = qjs_aot_field_read(AOT_REG(fr,%d), _fso_%d);\n", r, site);
-      rg_out(c, "          if (!qjs_aot_to_num(_v, &u_%d, &k_%d)) {\n", d, d);
-      rg_deopt(c, pc, pc == c->head_pc);
-      rg_out(c, "          } }\n");
-      c->unb_r[rg_ri(d)] = 1;
-      break;
-    }
+      case ROP_move:
+      case ROP_move_s:
+      case ROP_move_xfer: {
+        int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
+        rg_ensure_num(c, 1, a, pc);
+        rg_out(c, "        u_%d = u_%d; k_%d = k_%d;\n", d, a, d, a);
+        c->unb_r[rg_ri(d)] = 1;
+        if (in->op == ROP_move_xfer) c->unb_r[rg_ri(a)] = 0;
+        break;
+      }
 
-    case ROP_get_length: {
-      int d = (int)in->arg[0].val, r = (int)in->arg[1].val;
-      rg_out(c, "        if (!qjs_aot_get_length_num(AOT_REG(fr,%d), &u_%d, &k_%d)) {\n",
-             r, d, d);
-      rg_deopt(c, pc, pc == c->head_pc);
-      rg_out(c, "        }\n");
-      c->unb_r[rg_ri(d)] = 1;
-      break;
-    }
-    case ROP_get_var_ref: {
-      int d = (int)in->arg[0].val, slot = (int)in->arg[1].val;
-      rg_out(c, "        { JSValue _v = *qjs_aot_var_ref_ptr(f, %d);\n", slot);
-      rg_out(c, "          if (!qjs_aot_to_num(_v, &u_%d, &k_%d)) {\n", d, d);
-      rg_deopt(c, pc, pc == c->head_pc);
-      rg_out(c, "          } }\n");
-      c->unb_r[rg_ri(d)] = 1;
-      break;
-    }
+      case ROP_branch_cmp_loc_loc:
+        rg_branch_cmp(
+            c, (int)in->arg[0].val, rg_slot((int)in->arg[1].val),
+            rg_slot((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
+        break;
+      case ROP_branch_cmp_loc_reg:
+        rg_branch_cmp(
+            c, (int)in->arg[0].val, rg_slot((int)in->arg[1].val),
+            rg_reg((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
+        break;
+      case ROP_branch_cmp_reg_loc:
+        rg_branch_cmp(
+            c, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
+            rg_slot((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
+        break;
+      case ROP_branch_cmp_reg_reg:
+      case ROP_branch_cmp_reg_reg_s:
+        rg_branch_cmp(
+            c, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
+            rg_reg((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
+        break;
 
-    case ROP_add_mul: case ROP_mul_add: case ROP_mul_sub: case ROP_sub_mul: {
-      int dm = (int)in->arg[0].val, x = (int)in->arg[1].val, y = (int)in->arg[2].val;
-      int da = (int)in->arg[3].val, cc = (int)in->arg[4].val;
-      int isadd = (in->op == ROP_mul_add || in->op == ROP_add_mul);
-      int mul_first = (in->op == ROP_mul_add || in->op == ROP_mul_sub);
-      int bsub = isadd ? REG_BIN_ADD : REG_BIN_SUB;
-      rg_bin2(c, REG_BIN_MUL, dm, rg_reg(x), rg_reg(y), pc);
-      if (mul_first)
-        rg_bin2(c, bsub, da, rg_reg(dm), rg_reg(cc), pc);
-      else
-        rg_bin2(c, bsub, da, rg_reg(cc), rg_reg(dm), pc);
-      break;
-    }
+      case ROP_branch_lt_s:
+      case ROP_branch_nlt_s:
+      case ROP_branch_lte_s:
+      case ROP_branch_nlte_s:
+      case ROP_branch_gt_s:
+      case ROP_branch_ngt_s:
+      case ROP_branch_gte_s:
+      case ROP_branch_ngte_s:
+      case ROP_branch_eq_s:
+      case ROP_branch_neq_s:
+        rg_branch_cmp(
+            c, branch_subop(in->op), rg_reg((int)in->arg[0].val),
+            rg_reg((int)in->arg[1].val), next + (int)in->arg[2].val, pc);
+        break;
 
-    case ROP_eq: case ROP_lt: case ROP_lte:
-    case ROP_gt: case ROP_gte: case ROP_neq:
-    case ROP_strict_eq: case ROP_strict_neq:
-      rg_boxop(c, binop_subop(in->op), (int)in->arg[0].val,
-               rg_reg((int)in->arg[1].val), rg_reg((int)in->arg[2].val), pc);
-      break;
+      case ROP_div:
+        rg_bin2(
+            c, REG_BIN_DIV, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
+            rg_reg((int)in->arg[2].val), pc);
+        break;
 
-    case ROP_mul: case ROP_add: case ROP_sub: {
-      int sub = in->op == ROP_mul ? REG_BIN_MUL : in->op == ROP_add ? REG_BIN_ADD : REG_BIN_SUB;
-      rg_bin2(c, sub, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
-              rg_reg((int)in->arg[2].val), pc);
-      break;
-    }
-    case ROP_binary_loc_reg:
-      rg_bin2(c, (int)in->arg[1].val, (int)in->arg[0].val, rg_slot((int)in->arg[2].val),
-              rg_reg((int)in->arg[3].val), pc);
-      break;
-    case ROP_binary_loc_loc:
-      rg_bin2(c, (int)in->arg[1].val, (int)in->arg[0].val, rg_slot((int)in->arg[2].val),
-              rg_slot((int)in->arg[3].val), pc);
-      break;
-    case ROP_binary_imm: case ROP_binary_imm_s:
-      rg_bin_imm(c, (int)in->arg[1].val, (int)in->arg[0].val,
-                 rg_reg((int)in->arg[2].val), (int32_t)in->arg[3].val, pc);
-      break;
-    case ROP_add_imm_s: case ROP_sub_imm_s:
-      rg_bin_imm(c, in->op == ROP_add_imm_s ? REG_BIN_ADD : REG_BIN_SUB,
-                 (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
-                 (int32_t)in->arg[2].val, pc);
-      break;
-    case ROP_add_imm_self_s: case ROP_sub_imm_self_s: {
-      int d = (int)in->arg[0].val;
-      rg_bin_imm(c, in->op == ROP_add_imm_self_s ? REG_BIN_ADD : REG_BIN_SUB,
-                 d, rg_reg(d), (int32_t)in->arg[1].val, pc);
-      break;
-    }
-    case ROP_add_imm_self_branch: case ROP_add_imm_self_branch_s: {
-      int d = (int)in->arg[0].val;
-      int tgt = next + (int)in->arg[2].val;
-      rg_bin_imm(c, REG_BIN_ADD, d, rg_reg(d), (int32_t)in->arg[1].val, pc);
-      rg_goto_target(c, tgt);
-      break;
-    }
-    case ROP_neg: case ROP_inc: case ROP_dec:
-    case ROP_not: case ROP_to_numeric:
-      rg_un(c, in->op, (int)in->arg[0].val, rg_reg((int)in->arg[1].val), pc);
-      break;
+      case ROP_load_false:
+        rg_out(
+            c, "        AOT_SET_B(ctx, fr, %d, JS_FALSE);\n",
+            (int)in->arg[0].val);
+        c->unb_r[rg_ri((int)in->arg[0].val)] = 0;
+        break;
+      case ROP_load_true:
+        rg_out(
+            c, "        AOT_SET_B(ctx, fr, %d, JS_TRUE);\n",
+            (int)in->arg[0].val);
+        c->unb_r[rg_ri((int)in->arg[0].val)] = 0;
+        break;
+      case ROP_load_null:
+        rg_out(
+            c, "        AOT_SET_B(ctx, fr, %d, JS_NULL);\n",
+            (int)in->arg[0].val);
+        c->unb_r[rg_ri((int)in->arg[0].val)] = 0;
+        break;
 
-    case ROP_load_i8: case ROP_load_i8_s: {
-      int d = (int)in->arg[0].val;
-      rg_out(c, "        u_%d = (double)(int)%d; k_%d = 1;\n", d,
-             (int)(int8_t)in->arg[1].val, d);
-      c->unb_r[rg_ri(d)] = 1;
-      break;
-    }
-    case ROP_load_i32: {
-      int d = (int)in->arg[0].val;
-      rg_out(c, "        u_%d = (double)(int32_t)%d; k_%d = 1;\n", d,
-             (int32_t)in->arg[1].val, d);
-      c->unb_r[rg_ri(d)] = 1;
-      break;
-    }
+      case ROP_branch_if:
+      case ROP_branch_if_not:
+        rg_branch_bool(
+            c, in->op, (int)in->arg[0].val, next + (int)in->arg[1].val, pc);
+        break;
 
-    case ROP_move: case ROP_move_s: case ROP_move_xfer: {
-      int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
-      rg_ensure_num(c, 1, a, pc);
-      rg_out(c, "        u_%d = u_%d; k_%d = k_%d;\n", d, a, d, a);
-      c->unb_r[rg_ri(d)] = 1;
-      if (in->op == ROP_move_xfer)
-        c->unb_r[rg_ri(a)] = 0;
-      break;
-    }
+      case ROP_branch:
+      case ROP_branch_s:
+        rg_goto_target(c, next + (int)in->arg[0].val);
+        break;
 
-    case ROP_branch_cmp_loc_loc:
-      rg_branch_cmp(c, (int)in->arg[0].val, rg_slot((int)in->arg[1].val),
-                    rg_slot((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
-      break;
-    case ROP_branch_cmp_loc_reg:
-      rg_branch_cmp(c, (int)in->arg[0].val, rg_slot((int)in->arg[1].val),
-                    rg_reg((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
-      break;
-    case ROP_branch_cmp_reg_loc:
-      rg_branch_cmp(c, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
-                    rg_slot((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
-      break;
-    case ROP_branch_cmp_reg_reg:
-    case ROP_branch_cmp_reg_reg_s:
-      rg_branch_cmp(c, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
-                    rg_reg((int)in->arg[2].val), next + (int)in->arg[3].val, pc);
-      break;
-
-    case ROP_branch_lt_s: case ROP_branch_nlt_s:
-    case ROP_branch_lte_s: case ROP_branch_nlte_s:
-    case ROP_branch_gt_s: case ROP_branch_ngt_s:
-    case ROP_branch_gte_s: case ROP_branch_ngte_s:
-    case ROP_branch_eq_s: case ROP_branch_neq_s:
-      rg_branch_cmp(c, branch_subop(in->op), rg_reg((int)in->arg[0].val),
-                    rg_reg((int)in->arg[1].val), next + (int)in->arg[2].val, pc);
-      break;
-
-    case ROP_div:
-      rg_bin2(c, REG_BIN_DIV, (int)in->arg[0].val, rg_reg((int)in->arg[1].val),
-              rg_reg((int)in->arg[2].val), pc);
-      break;
-
-    case ROP_load_false:
-      rg_out(c, "        AOT_SET_B(ctx, fr, %d, JS_FALSE);\n", (int)in->arg[0].val);
-      c->unb_r[rg_ri((int)in->arg[0].val)] = 0;
-      break;
-    case ROP_load_true:
-      rg_out(c, "        AOT_SET_B(ctx, fr, %d, JS_TRUE);\n", (int)in->arg[0].val);
-      c->unb_r[rg_ri((int)in->arg[0].val)] = 0;
-      break;
-    case ROP_load_null:
-      rg_out(c, "        AOT_SET_B(ctx, fr, %d, JS_NULL);\n", (int)in->arg[0].val);
-      c->unb_r[rg_ri((int)in->arg[0].val)] = 0;
-      break;
-
-    case ROP_branch_if: case ROP_branch_if_not:
-      rg_branch_bool(c, in->op, (int)in->arg[0].val, next + (int)in->arg[1].val, pc);
-      break;
-
-    case ROP_branch: case ROP_branch_s:
-      rg_goto_target(c, next + (int)in->arg[0].val);
-      break;
-
-    default:
-      break;
+      default:
+        break;
     }
   }
 }
@@ -1966,26 +2354,22 @@ static int insn_branch_target(const JSAotGenInsn *in, int next, int *tgt) {
 
 /* Try to build a typed region for the loop [h, back]. Returns 1 and emits it
    when eligible. */
-static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
-                       const int *offs, const int *nxts, int n, int h, int back,
-                       int exit_pc) {
+static int emit_region(
+    FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins, const int *offs,
+    const int *nxts, int n, int h, int back, int exit_pc) {
   RgCtx *c = rg_new(g, ins, offs, nxts, n, h, back, exit_pc);
   int i, ok = 1, region_end = nxts[back];
   const char *rej = NULL;
-  if (!c)
-    return 0;
-  if (exit_pc != region_end)
-    ok = 0, rej = "exit != back-fallthrough";
+  if (!c) return 0;
+  if (exit_pc != region_end) ok = 0, rej = "exit != back-fallthrough";
   /* v1 handles only a top-tested loop with an unconditional back-edge. */
   if (ok && ins[back].op != ROP_branch && ins[back].op != ROP_branch_s)
     ok = 0, rej = "back-edge not unconditional";
   if (ok) {
     int btgt = nxts[back] + (int)ins[back].arg[0].val;
-    if (btgt != c->head_pc)
-      ok = 0, rej = "back-edge target != head";
+    if (btgt != c->head_pc) ok = 0, rej = "back-edge target != head";
   }
-  if (ok && !rg_scan(c))
-    ok = 0, rej = "op outside whitelist";
+  if (ok && !rg_scan(c)) ok = 0, rej = "op outside whitelist";
   if (ok) {
     for (i = 0; i < c->rn; i++)
       if (c->role_r[i] == RG_MIX || c->prod_r[i] == RG_MIX)
@@ -2003,19 +2387,17 @@ static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
     for (i = 0; i < c->sn; i++)
       if (c->role_s[i] == RG_NUM && c->prod_s[i] == RG_BOX)
         ok = 0, rej = "num slot produced by boxed op";
-  /* R2: recognise the induction variable / loop bound (best effort). */
-  if (ok)
-    rg_find_iv(c);
+  /* Recognise the induction variable / loop bound (best effort). */
+  if (ok) rg_find_iv(c);
   /* Field-guard receivers must be loop-invariant so the guard can be hoisted
      out of the loop. */
   if (ok) {
     for (i = 0; i < c->pic_count; i++) {
       int r = c->fguard_recv[i], ri;
-      if (r < 0)
-        continue;
+      if (r < 0) continue;
       ri = rg_ri(r);
-      if (ri < 0 || ri >= c->rn || c->role_r[ri] != RG_OBJ ||
-          !c->live_r[ri] || c->prod_r[ri] != RG_NONE)
+      if (ri < 0 || ri >= c->rn || c->role_r[ri] != RG_OBJ || !c->live_r[ri] ||
+          c->prod_r[ri] != RG_NONE)
         ok = 0, rej = "field receiver not loop-invariant";
     }
   }
@@ -2023,8 +2405,7 @@ static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
      must be loop-invariant too. */
   if (ok) {
     for (i = 0; i < c->rn; i++) {
-      if (!c->elem_r[i])
-        continue;
+      if (!c->elem_r[i]) continue;
       if (c->role_r[i] != RG_OBJ || !c->live_r[i] || c->prod_r[i] != RG_NONE)
         ok = 0, rej = "element base not loop-invariant";
     }
@@ -2034,17 +2415,16 @@ static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
   if (ok) {
     for (i = h; i <= back && ok; i++) {
       int tgt;
-      if (!insn_branch_target(&ins[i], nxts[i], &tgt))
-        continue;
-      if (tgt == c->head_pc || tgt == c->exit_pc)
-        continue;
+      if (!insn_branch_target(&ins[i], nxts[i], &tgt)) continue;
+      if (tgt == c->head_pc || tgt == c->exit_pc) continue;
       ok = 0, rej = "branch to a non-exit target";
     }
   }
   if (!ok) {
     if (getenv("QJSAOT_REGION_DEBUG"))
-      fprintf(stderr, "region [%d,%d] head=%d reject: %s\n", h, back,
-              c->head_pc, rej ? rej : "?");
+      fprintf(
+          stderr, "region [%d,%d] head=%d reject: %s\n", h, back, c->head_pc,
+          rej ? rej : "?");
     rg_free(c);
     return 0;
   }
@@ -2053,7 +2433,9 @@ static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
   c->dry = 0;
   rg_out(c, "        {\n");
   rg_out(c, "        static unsigned int rg_dis_%d = 0;\n", c->head_pc);
-  rg_out(c, "        if (rg_dis_%d > 64u) goto pc_%d_la;\n", c->head_pc, c->head_pc);
+  rg_out(
+      c, "        if (rg_dis_%d > 64u) goto pc_%d_la;\n", c->head_pc,
+      c->head_pc);
   for (i = 0; i < c->rn; i++)
     if (c->role_r[i] == RG_NUM)
       rg_out(c, "        double u_%d; int k_%d;\n", i * 16, i * 16);
@@ -2065,47 +2447,61 @@ static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
       rg_out(c, "        double us_%d; int ks_%d;\n", i, i);
   for (i = 0; i < c->rn; i++) {
     if (rg_entry_unbox(c, i, 1)) {
-      rg_out(c, "        if (!qjs_aot_to_num(AOT_REG(fr,%d), &u_%d, &k_%d)) goto pc_%d_la;\n",
-             i * 16, i * 16, i * 16, c->head_pc);
+      rg_out(
+          c,
+          "        if (!qjs_aot_to_num(AOT_REG(fr,%d), &u_%d, &k_%d)) goto "
+          "pc_%d_la;\n",
+          i * 16, i * 16, i * 16, c->head_pc);
       c->unb_r[i] = 1;
     } else if (c->live_r[i] && c->role_r[i] == RG_OBJ && c->elem_r[i]) {
-      rg_out(c, "        if (!qjs_aot_dense(AOT_REG(fr,%d), &data_%d, &len_%d)) goto pc_%d_la;\n",
-             i * 16, i * 16, i * 16, c->head_pc);
+      rg_out(
+          c,
+          "        if (!qjs_aot_dense(AOT_REG(fr,%d), &data_%d, &len_%d)) goto "
+          "pc_%d_la;\n",
+          i * 16, i * 16, i * 16, c->head_pc);
     }
   }
   for (i = 0; i < c->sn; i++) {
     if (rg_entry_unbox(c, i, 0)) {
-      rg_out(c, "        if (!qjs_aot_to_num(vb[%d], &us_%d, &ks_%d)) goto pc_%d_la;\n",
-             i, i, i, c->head_pc);
+      rg_out(
+          c,
+          "        if (!qjs_aot_to_num(vb[%d], &us_%d, &ks_%d)) goto "
+          "pc_%d_la;\n",
+          i, i, i, c->head_pc);
       c->unb_s[i] = 1;
     }
   }
-  /* R2: the induction variable starts >= 0 and stays below the (invariant)
+  /* The induction variable starts >= 0 and stays below the (invariant)
      loop bound; if the bound is within every element base's length, the
      per-iteration index checks for IV-keyed reads can be elided. */
   if (c->iv_reg >= 0) {
     int iv = c->iv_reg;
-    rg_out(c, "        if (!(k_%d && u_%d >= 0.0)) goto pc_%d_la;\n",
-           iv * 16, iv * 16, c->head_pc);
+    rg_out(
+        c, "        if (!(k_%d && u_%d >= 0.0)) goto pc_%d_la;\n", iv * 16,
+        iv * 16, c->head_pc);
     if (!mut_is("bounds_elide_len_write")) {
       for (i = 0; i < c->rn; i++)
         if (c->elem_iv_r[i])
-          rg_out(c, "        if (!(k_%d && u_%d <= (double)len_%d)) goto pc_%d_la;\n",
-                 c->bound_off, c->bound_off, i * 16, c->head_pc);
+          rg_out(
+              c,
+              "        if (!(k_%d && u_%d <= (double)len_%d)) goto pc_%d_la;\n",
+              c->bound_off, c->bound_off, i * 16, c->head_pc);
     }
   }
   for (i = 0; i < c->pic_count; i++) {
     int r = c->fguard_recv[i];
-    if (r < 0)
-      continue;
+    if (r < 0) continue;
     rg_out(c, "        int _fso_%d;\n", i);
     if (mut_is("hoist_ignore_store")) {
       /* Mutant: trust the generation-time slot offset and skip the shape
          guard, so a mid-loop shape change reads a stale slot. */
       rg_out(c, "        _fso_%d = 0;\n", i);
     } else {
-      rg_out(c, "        if (!qjs_aot_field_guard(pic, AOT_REG(fr,%d), %d, &_fso_%d)) goto pc_%d_la;\n",
-             r, i, i, c->head_pc);
+      rg_out(
+          c,
+          "        if (!qjs_aot_field_guard(pic, AOT_REG(fr,%d), %d, "
+          "&_fso_%d)) goto pc_%d_la;\n",
+          r, i, i, c->head_pc);
     }
   }
   memcpy(c->entry_r, c->unb_r, (size_t)c->rn);
@@ -2128,7 +2524,7 @@ static int emit_region(FILE *f, const JSAotGenFunc *g, const JSAotGenInsn *ins,
   return 1;
 }
 
-/* Emit one function's body (P4 templates, step for the rest). Returns the
+/* Emit one function's body (templates, step for the rest). Returns the
    instruction count, or -1 on a malformed program. */
 static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   int off = 0, n = 0, i;
@@ -2171,9 +2567,11 @@ static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     off += cur.size;
   }
 
-  fprintf(f, "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
-             "                                 JSValue *fr, uint32_t entry_pc)\n{\n",
-          hex);
+  fprintf(
+      f,
+      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "                                 JSValue *fr, uint32_t entry_pc)\n{\n",
+      hex);
   fprintf(f, "    uint8_t *code = qjs_aot_code(f);\n");
   fprintf(f, "    uint8_t *ip;\n    uint32_t pc = entry_pc;\n");
   fprintf(f, "    JSValue *vb = qjs_aot_var_buf(f);\n");
@@ -2187,19 +2585,14 @@ static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     int *rb = calloc((size_t)n, sizeof(int));
     int k;
     if (rb) {
-      for (k = 0; k < n; k++)
-        rb[k] = -1;
+      for (k = 0; k < n; k++) rb[k] = -1;
       for (k = 0; k < n; k++) {
         int tgt, j;
-        if (!insn_branch_target(&ins[k], nxts[k], &tgt))
-          continue;
-        if (tgt >= offs[k])
-          continue;
+        if (!insn_branch_target(&ins[k], nxts[k], &tgt)) continue;
+        if (tgt >= offs[k]) continue;
         for (j = 0; j < n; j++)
-          if (offs[j] == tgt)
-            break;
-        if (j < n && rb[j] < 0)
-          rb[j] = k;
+          if (offs[j] == tgt) break;
+        if (j < n && rb[j] < 0) rb[j] = k;
       }
     }
     for (i = 0; i < n; i++) {
@@ -2207,10 +2600,9 @@ static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
       int is_region = 0;
       fprintf(f, "pc_%d:\n", offs[i]);
       if (rb && rb[i] >= 0) {
-        is_region = emit_region(f, g, ins, offs, nxts, n, i, rb[i],
-                                nxts[rb[i]]);
-        if (is_region)
-          fprintf(f, "pc_%d_la:\n", offs[i]);
+        is_region =
+            emit_region(f, g, ins, offs, nxts, n, i, rb[i], nxts[rb[i]]);
+        if (is_region) fprintf(f, "pc_%d_la:\n", offs[i]);
       }
       if (!emit_template(f, &ins[i], offs[i], nxts[i], last))
         emit_fallback(f, offs[i], nxts[i], last);
@@ -2226,7 +2618,8 @@ static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   fprintf(f, "exception: {\n");
   fprintf(f, "        uint32_t rp;\n");
   fprintf(f, "        JSValue ex = qjs_aot_unwind(ctx, f, fr, pc, &rp);\n");
-  fprintf(f, "        if (!JS_IsException(ex)) { pc = rp; goto dispatch_ip; }\n");
+  fprintf(
+      f, "        if (!JS_IsException(ex)) { pc = rp; goto dispatch_ip; }\n");
   fprintf(f, "        return JS_EXCEPTION;\n    }\n}\n\n");
 
   free(offs);
@@ -2234,46 +2627,43 @@ static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   return n;
 }
 
-/* --- P7 selection (plan §9.1) ---------------------------------------------
+/* --- selection ------------------------------------------------------------
    The generator measures each function's emitted body once, then chooses a
    subset: rank by profiled ops, take the prefix covering HOT_COVER of the
    profiled ops, drop startup-only entries below MIN_ENTRY_OPS, close over
-   compiled callees (§8.3), and finally drop the lowest ops/byte until the
+   compiled callees, and finally drop the lowest ops/byte until the
    estimated body bytes fit the budget. `--all` bypasses selection. */
 
 typedef struct {
-  char *buf;      /* memstream body, or NULL when the function failed */
+  char *buf; /* memstream body, or NULL when the function failed */
   size_t len;
 } EmitBuf;
 
-static unsigned long long prof_ops_of(const ProfEntry *prof, int nprof,
-                                      const uint8_t dg[16]) {
+static unsigned long long prof_ops_of(
+    const ProfEntry *prof, int nprof, const uint8_t dg[16]) {
   int i;
   for (i = 0; i < nprof; i++)
-    if (memcmp(prof[i].digest, dg, 16) == 0)
-      return prof[i].ops;
+    if (memcmp(prof[i].digest, dg, 16) == 0) return prof[i].ops;
   return 0;
 }
 
-static const ProfEntry *prof_entry_of(const ProfEntry *prof, int nprof,
-                                      const uint8_t dg[16]) {
+static const ProfEntry *prof_entry_of(
+    const ProfEntry *prof, int nprof, const uint8_t dg[16]) {
   int i;
   for (i = 0; i < nprof; i++)
-    if (memcmp(prof[i].digest, dg, 16) == 0)
-      return &prof[i];
+    if (memcmp(prof[i].digest, dg, 16) == 0) return &prof[i];
   return NULL;
 }
 
 /* The unique-body representative of a digest (the last index of its sorted
    run, matching the emit loop's dedupe), or -1. funcs is digest-sorted. */
-static int find_unit(const JSAotGenFunc *funcs, int nfuncs,
-                     const uint8_t dg[16]) {
+static int find_unit(
+    const JSAotGenFunc *funcs, int nfuncs, const uint8_t dg[16]) {
   int i, found = -1;
   for (i = 0; i < nfuncs; i++) {
     int c = memcmp(funcs[i].digest, dg, 16);
     if (c == 0) {
-      if (funcs[i].eligible == AOT_GEN_ELIGIBLE)
-        found = i;
+      if (funcs[i].eligible == AOT_GEN_ELIGIBLE) found = i;
     } else if (c > 0) {
       break;
     }
@@ -2309,8 +2699,7 @@ int main(int argc, char **argv) {
   int ninputs = 0;
 
   inputs = malloc(sizeof(*inputs) * (size_t)argc);
-  if (!inputs)
-    return 2;
+  if (!inputs) return 2;
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
       out = argv[++i];
@@ -2335,25 +2724,22 @@ int main(int argc, char **argv) {
     }
   }
   if (ninputs == 0) {
-    fprintf(stderr,
-            "usage: qjsaot --out aot_unit.c [--all] [--budget N] "
-            "[--hot-cover F] [--min-ops N] [--profile app.qjsprof] "
-            "bundle.js ...\n");
+    fprintf(
+        stderr,
+        "usage: qjsaot --out aot_unit.c [--all] [--budget N] "
+        "[--hot-cover F] [--min-ops N] [--profile app.qjsprof] "
+        "bundle.js ...\n");
     free(inputs);
     return 2;
   }
   {
     const char *e;
-    if ((e = getenv("QJS_AOT_HOT_COVER")) != NULL)
-      hot_cover = strtod(e, NULL);
-    if ((e = getenv("QJS_AOT_MIN_OPS")) != NULL)
-      min_ops = strtol(e, NULL, 10);
-    if ((e = getenv("QJS_AOT_BUDGET")) != NULL)
-      budget = strtol(e, NULL, 10);
+    if ((e = getenv("QJS_AOT_HOT_COVER")) != NULL) hot_cover = strtod(e, NULL);
+    if ((e = getenv("QJS_AOT_MIN_OPS")) != NULL) min_ops = strtol(e, NULL, 10);
+    if ((e = getenv("QJS_AOT_BUDGET")) != NULL) budget = strtol(e, NULL, 10);
   }
   if (profile && !all && !(hot_cover > 0.0))
-    fprintf(stderr,
-            "qjsaot: --profile selection is disabled; using --all\n");
+    fprintf(stderr, "qjsaot: --profile selection is disabled; using --all\n");
 
   rt = JS_NewRuntime();
   ctx = JS_NewContext(rt);
@@ -2367,12 +2753,14 @@ int main(int argc, char **argv) {
       fails++;
       continue;
     }
-    v = JS_Eval(ctx, src, (size_t)len, inputs[i],
-                JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    v = JS_Eval(
+        ctx, src, (size_t)len, inputs[i],
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(v)) {
       JS_FreeValue(ctx, JS_GetException(ctx));
-      v = JS_Eval(ctx, src, (size_t)len, inputs[i],
-                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+      v = JS_Eval(
+          ctx, src, (size_t)len, inputs[i],
+          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     }
     if (JS_IsException(v)) {
       JSValue e = JS_GetException(ctx);
@@ -2393,8 +2781,7 @@ int main(int argc, char **argv) {
   {
     ProfEntry *prof = NULL;
     int nprof = 0;
-    if (profile)
-      prof = parse_profile(profile, &nprof);
+    if (profile) prof = parse_profile(profile, &nprof);
     g_prof = prof;
     g_nprof = nprof;
     print_census(funcs, nfuncs, prof, nprof);
@@ -2410,7 +2797,9 @@ int main(int argc, char **argv) {
     long est_bytes = 0, actual_bytes = 0;
 
     if (!eb || !uniq || !sel) {
-      free(eb); free(uniq); free(sel);
+      free(eb);
+      free(uniq);
+      free(sel);
       js_aot_gen_free(rt, funcs);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
@@ -2436,8 +2825,9 @@ int main(int argc, char **argv) {
       ninsn = emit_func(mf, &funcs[i], hex);
       fclose(mf);
       if (ninsn < 0) {
-        fprintf(stderr, "qjsaot: malformed program in %s (%s)\n",
-                funcs[i].name[0] ? funcs[i].name : "?", funcs[i].file);
+        fprintf(
+            stderr, "qjsaot: malformed program in %s (%s)\n",
+            funcs[i].name[0] ? funcs[i].name : "?", funcs[i].file);
         free(eb[i].buf);
         eb[i].buf = NULL;
         eb[i].len = 0;
@@ -2448,7 +2838,7 @@ int main(int argc, char **argv) {
       uniq[nuniq++] = i;
     }
 
-    /* --- selection (plan §9.1) --- */
+    /* --- selection --- */
     if (all || !profile || g_nprof == 0) {
       int k;
       for (k = 0; k < nuniq; k++) {
@@ -2456,11 +2846,13 @@ int main(int argc, char **argv) {
         est_bytes += (long)eb[uniq[k]].len;
       }
     } else {
-      unsigned long long *ops = calloc((size_t)(nfuncs > 0 ? nfuncs : 1),
-                                       sizeof(*ops));
+      unsigned long long *ops =
+          calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*ops));
       int k;
       if (!ops) {
-        free(eb); free(uniq); free(sel);
+        free(eb);
+        free(uniq);
+        free(sel);
         js_aot_gen_free(rt, funcs);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
@@ -2481,13 +2873,11 @@ int main(int argc, char **argv) {
         unsigned long long target =
             (unsigned long long)(hot_cover * (double)total_ops);
         if (order) {
-          for (k = 0; k < nuniq; k++)
-            order[k] = uniq[k];
+          for (k = 0; k < nuniq; k++) order[k] = uniq[k];
           g_sort_ops = ops;
           qsort(order, (size_t)nuniq, sizeof(int), unit_ops_cmp);
           for (k = 0; k < nuniq; k++) {
-            if (cum >= target)
-              break;
+            if (cum >= target) break;
             sel[order[k]] = 1;
             cum += ops[order[k]];
           }
@@ -2497,7 +2887,7 @@ int main(int argc, char **argv) {
         for (k = 0; k < nuniq; k++)
           if (sel[uniq[k]] && ops[uniq[k]] < (unsigned long long)min_ops)
             sel[uniq[k]] = 0;
-        /* close over compiled callees (§8.3) */
+        /* close over compiled callees */
         {
           int changed = 1;
           while (changed) {
@@ -2505,18 +2895,14 @@ int main(int argc, char **argv) {
             for (k = 0; k < nuniq; k++) {
               const ProfEntry *pe;
               int c;
-              if (!sel[uniq[k]])
-                continue;
+              if (!sel[uniq[k]]) continue;
               pe = prof_entry_of(g_prof, g_nprof, funcs[uniq[k]].digest);
-              if (!pe)
-                continue;
+              if (!pe) continue;
               for (c = 0; c < pe->ncalls; c++) {
                 uint8_t dg[16];
                 int ci;
-                if (pe->calls[c].kind != 1 || !pe->calls[c].digest[0])
-                  continue;
-                if (hex_to_bytes16(pe->calls[c].digest, dg) < 0)
-                  continue;
+                if (pe->calls[c].kind != 1 || !pe->calls[c].digest[0]) continue;
+                if (hex_to_bytes16(pe->calls[c].digest, dg) < 0) continue;
                 ci = find_unit(funcs, nfuncs, dg);
                 if (ci >= 0 && !sel[ci]) {
                   sel[ci] = 1;
@@ -2528,8 +2914,7 @@ int main(int argc, char **argv) {
         }
         /* budget: drop the lowest ops/byte until it fits */
         for (k = 0; k < nuniq; k++)
-          if (sel[uniq[k]])
-            est_bytes += (long)eb[uniq[k]].len;
+          if (sel[uniq[k]]) est_bytes += (long)eb[uniq[k]].len;
         if (budget > 0) {
           while (est_bytes > budget) {
             int best = -1, m;
@@ -2537,20 +2922,16 @@ int main(int argc, char **argv) {
             for (m = 0; m < nuniq; m++) {
               int idx = uniq[m];
               double ratio;
-              if (!sel[idx])
-                continue;
-              ratio = eb[idx].len
-                          ? (double)ops[idx] / (double)eb[idx].len
-                          : 0.0;
+              if (!sel[idx]) continue;
+              ratio =
+                  eb[idx].len ? (double)ops[idx] / (double)eb[idx].len : 0.0;
               if (best < 0 || ratio < best_ratio ||
-                  (ratio == best_ratio &&
-                   eb[idx].len > eb[best].len)) {
+                  (ratio == best_ratio && eb[idx].len > eb[best].len)) {
                 best = idx;
                 best_ratio = ratio;
               }
             }
-            if (best < 0)
-              break;
+            if (best < 0) break;
             sel[best] = 0;
             est_bytes -= (long)eb[best].len;
           }
@@ -2559,28 +2940,29 @@ int main(int argc, char **argv) {
       free(ops);
     }
     for (i = 0; i < nfuncs; i++)
-      if (sel[i])
-        cov_ops += prof_ops_of(g_prof, g_nprof, funcs[i].digest);
+      if (sel[i]) cov_ops += prof_ops_of(g_prof, g_nprof, funcs[i].digest);
 
     f = fopen(out, "w");
     if (!f) {
       fprintf(stderr, "qjsaot: cannot write %s\n", out);
-      for (i = 0; i < nfuncs; i++)
-        free(eb[i].buf);
-      free(eb); free(uniq); free(sel);
+      for (i = 0; i < nfuncs; i++) free(eb[i].buf);
+      free(eb);
+      free(uniq);
+      free(sel);
       js_aot_gen_free(rt, funcs);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
       return 2;
     }
 
-    fprintf(f,
-            "/* Generated by qjsaot from the register-VM bytecode. Do not edit. */\n");
+    fprintf(
+        f,
+        "/* Generated by qjsaot from the register-VM bytecode. Do not edit. "
+        "*/\n");
     fprintf(f, "#include \"quickjs-aot-rt.h\"\n\n");
 
     for (i = 0; i < nfuncs; i++) {
-      if (!sel[i] || !eb[i].buf)
-        continue;
+      if (!sel[i] || !eb[i].buf) continue;
       fwrite(eb[i].buf, 1, eb[i].len, f);
       actual_bytes += (long)eb[i].len;
       emitted++;
@@ -2589,8 +2971,7 @@ int main(int argc, char **argv) {
     fprintf(f, "const JSAotEntry qjs_aot_table[] = {\n");
     for (i = 0; i < nfuncs; i++) {
       char hex[33];
-      if (!sel[i])
-        continue;
+      if (!sel[i]) continue;
       hex16(funcs[i].digest, hex);
       fprintf(f, "    { {");
       {
@@ -2601,21 +2982,23 @@ int main(int argc, char **argv) {
       fprintf(f, "}, aot_f_%s, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
     }
     fprintf(f, "};\n");
-    fprintf(f, "const uint32_t qjs_aot_count = "
-               "sizeof(qjs_aot_table) / sizeof(qjs_aot_table[0]);\n");
+    fprintf(
+        f,
+        "const uint32_t qjs_aot_count = "
+        "sizeof(qjs_aot_table) / sizeof(qjs_aot_table[0]);\n");
     fprintf(f, "const uint32_t qjs_aot_abi = QJS_AOT_ABI;\n");
     fclose(f);
 
-    fprintf(stderr,
-            "qjsaot: %d functions seen, %d emitted, %lld instructions, "
-            "coverage %.1f%% (%llu/%llu profiled ops), est %ld B, "
-            "actual %ld B -> %s\n",
-            nfuncs, emitted, total_insns,
-            total_ops ? 100.0 * (double)cov_ops / (double)total_ops : 100.0,
-            cov_ops, total_ops, est_bytes, actual_bytes, out);
+    fprintf(
+        stderr,
+        "qjsaot: %d functions seen, %d emitted, %lld instructions, "
+        "coverage %.1f%% (%llu/%llu profiled ops), est %ld B, "
+        "actual %ld B -> %s\n",
+        nfuncs, emitted, total_insns,
+        total_ops ? 100.0 * (double)cov_ops / (double)total_ops : 100.0,
+        cov_ops, total_ops, est_bytes, actual_bytes, out);
 
-    for (i = 0; i < nfuncs; i++)
-      free(eb[i].buf);
+    for (i = 0; i < nfuncs; i++) free(eb[i].buf);
     free(eb);
     free(uniq);
     free(sel);

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# stale-test.sh -- the P7 stale-unit test (plan 9.5).
+# stale-test.sh -- the stale-unit test.
 #
 # A unit is keyed by the 128-bit content digest of each function's register-VM
 # bytecode. Ship a bundle that changes one function and the unit must stay

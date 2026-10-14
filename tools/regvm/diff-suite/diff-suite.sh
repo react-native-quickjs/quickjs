@@ -5,13 +5,13 @@
 # register build and requires the same printed result AND exit 0 on both (a
 # non-zero exit is the JS_FreeRuntime leak assertion). Usage:
 #
-#   .local/regvm-build/diff-suite.sh
+#   STACK=<stack runner> REGVM=<register runner> tools/regvm/diff-suite/diff-suite.sh
 #
-# Build the two runners first; see PROGRESS.md.
+# A runner evaluates its first argument as a function expression and calls it
+# with the remaining numeric arguments, printing the result.
 
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-STACK="${STACK:-$ROOT/.local/regvm-build/run-stack}"
-REGVM="${REGVM:-$ROOT/.local/regvm-build/run-regvm}"
+STACK="${STACK:?set STACK to the stack-VM runner}"
+REGVM="${REGVM:?set REGVM to the register-VM runner}"
 
 pass=0; fail=0; skip=0
 
@@ -49,10 +49,10 @@ KLAZY() {
   fi
 }
 
-# P4 has a known yield* .return() semantic failure against the stack VM. Keep
-# this kernel as a P5 regression guard: edge drops used to make P5 return
-# undefined where P4 returned the result object. Accept a future stack-correct
-# result as well, but reject the P5-only undefined result.
+# The register VM's yield* .return() result differs from the stack VM's. Keep
+# this kernel as a guard against the edge-drop regression that returned
+# undefined instead of the result object. Accept a future stack-correct result
+# as well, but reject undefined.
 KREG_BASELINE() {
   name="$1"; k="$2"; shift 2
   r=$(timeout 20 "$REGVM" "$k" "$@" 2>&1); re=$?
@@ -83,7 +83,7 @@ K post-inc        'function(n){ var i=n; var j=i++; return i*100+j; }' 4
 K post-dec        'function(n){ var i=n; var j=i--; return i*100+j; }' 4
 K inc-nested      'function(n){ var i=0,j=0; for(i=0;i<n;i++) j=i++; return j; }' 5
 
-# P4 variable-home hazards. Keep these green on the stack VM before changing
+# Variable-home hazards. Keep these green on the stack VM before changing
 # allocation: homes must preserve overlapping versions and values assigned to
 # more than one variable.
 K homes-postfix   'function(n){ var x = 0, y = 0; for (var i = 0; i < n; i++) { y = x++; } return x * 1000 + y; }' 5
@@ -320,8 +320,7 @@ K with-fn-param   'function f(o,n){ with(o){ return x+n; } } function(n){ return
 K with-this      'function(n){ var o={x:1}; with(o){ return this===undefined ? 0 : 1; } }' 0
 K with-scopables 'function(n){ var o={x:1}; o[Symbol.unscopables]={x:true}; var x=5; with(o){ return x; } }' 0
 
-# suspension: these SKIP today (the ops are unlowered) and become the acceptance
-# set for the suspension work described in PROGRESS session 19
+# suspension: generators and async
 K gen-basic      'function(n){ function* g(){ yield 1; yield 2; } var it=g(); return it.next().value + it.next().value; }' 0
 K gen-done       'function(n){ function* g(){ yield 1; } var it=g(); it.next(); return it.next().done; }' 0
 K gen-arg        'function(n){ function* g(a,b){ yield a+b; } return g(1,2).next().value; }' 3
@@ -492,10 +491,9 @@ K a-proto-getter-add 'function(n){ var p = {}; var o = Object.create(p); Object.
 K a-delete-readd 'function(n){ var o = { x: 4 }; function read(v){ return v.x; } var a = read(o) + read(o); delete o.x; o.x = 9; return a + ":" + read(o); }' 0
 K a-shared-shape-mutate 'function(n){ var a = { x: 2, y: 3 }, b = { x: 5, y: 6 }; function read(v){ return v.x; } var before = read(a) + read(b); b.z = 10; b.x = 11; return before + ":" + read(a) + ":" + read(b); }' 0
 K a-lazy-json-warmed 'function(n){ var text = JSON.stringify({ target: 17, padding: Array(5001).join("x") }); var o = JSON.parse(text); function read(v){ return v.target; } var sum = 0; for (var i = 0; i < 6; i++) sum += read(o); return sum; }' 0
-# W1c step 4 guard: two objects from the same text share a shape, so after the
-# first object's slot is materialised and cached, a still-lazy object with that
-# shape must NOT be served from the cache. Dropping the hit's lazy test segfaults
-# here (see HP-W1c-step1-2026-10-01.md).
+# Two objects from the same text share a shape, so after the first object's
+# slot is materialised and cached, a still-lazy object with that shape must NOT
+# be served from the cache. Dropping the hit's lazy test segfaults here.
 KLAZY a-lazy-json-two 'function(n){ var text = JSON.stringify({ target: 17, pad: Array(5001).join("x") }); function read(v){ return v.target; } var a = JSON.parse(text); var s = read(a); var b = JSON.parse(text); return s + ":" + read(b) + ":" + read(b); }' 0
 KLAZY a-lazy-json-fresh 'function(n){ function read(v){ return v.target; } var sum = 0; for (var i = 0; i < 4; i++) { var text = JSON.stringify({ target: 17 + i, pad: Array(5001).join("x") }); var o = JSON.parse(text); sum += read(o); } return sum; }' 0
 K a-proxy-warmed 'function(n){ var count = 0; var target = { x: 12 }; var p = new Proxy(target, { get: function(t, k, r){ count++; return Reflect.get(t, k, r); } }); function read(v){ return v.x; } var sum = read(p) + read(p) + read(p); return sum + ":" + count; }' 0
@@ -503,17 +501,17 @@ K a-array-length-polymorphic 'function(n){ function read(v){ return v.length; } 
 K a-megamorphic-shapes 'function(n){ function read(v){ return v.x; } var sum = 0; for (var i = 0; i < 12; i++) { var o = { x: i }; o["extra" + i] = i; sum += read(o); } return sum; }' 0
 K a-borrowed-chain-delete 'function(n){ var root = {}; var child = {}; root.child = child; Object.defineProperty(child, "value", { get: function(){ delete root.child; return 42; } }); var value = root.child.value; return value + ":" + ("child" in root); }' 0
 K a-borrowed-chain-valueof 'function(n){ var root = {}; var child = { valueOf: function(){ delete root.child; return 13; } }; root.child = child; return root.child + 1; }' 0
-# W2a: the global mega stub cache (regvm_get_field_ic probe + regvm_pic_fill
+# The global mega stub cache (regvm_get_field_ic probe + regvm_pic_fill
 # fills). Each kernel drives a read site past the per-function PIC's dead limit
 # and then mutates, so a stale mega entry (raw shape/offset) would show up as a
 # wrong value. The first feeds the site fresh unhashed receiver shapes in a loop
 # (forces the dead state), then deletes and re-adds a property. The second reads
 # a property two prototypes deep and then edits that prototype. The third is
 # polymorphic (two shapes alternating) before a delete/re-add.
-K a-w2a-unhashed-dead 'function(n){ function read(v){ return v.x; } var sum = 0; for (var i = 0; i < 20; i++) { var o = { x: i, ["p" + i]: i }; sum += read(o); } var m = { x: 10, y: 20 }; var before = read(m); delete m.y; m.z = 30; return sum + ":" + before + ":" + read(m); }' 0
-K a-w2a-depth2 'function(n){ function read(v){ return v.x; } var gp = { x: 7, pad: 1 }; var p = Object.create(gp); var o = Object.create(p); var sum = 0; for (var i = 0; i < 16; i++) sum += read(o); delete gp.x; gp.x = 42; return sum + ":" + read(o); }' 0
-K a-w2a-polymorphic 'function(n){ function read(v){ return v.x; } var a = { x: 1, y: 2, pad: 3 }; var b = { x: 10, y: 20 }; var sum = 0; for (var i = 0; i < 400; i++) { sum += read(i & 1 ? a : b); } var before = read(a); delete a.x; a.x = 111; return sum + ":" + before + ":" + read(a); }' 0
-# W2a hardening: the autoinit `prototype` slot. Reading f.prototype materialises
+K a-mega-unhashed-dead 'function(n){ function read(v){ return v.x; } var sum = 0; for (var i = 0; i < 20; i++) { var o = { x: i, ["p" + i]: i }; sum += read(o); } var m = { x: 10, y: 20 }; var before = read(m); delete m.y; m.z = 30; return sum + ":" + before + ":" + read(m); }' 0
+K a-mega-depth2 'function(n){ function read(v){ return v.x; } var gp = { x: 7, pad: 1 }; var p = Object.create(gp); var o = Object.create(p); var sum = 0; for (var i = 0; i < 16; i++) sum += read(o); delete gp.x; gp.x = 42; return sum + ":" + read(o); }' 0
+K a-mega-polymorphic 'function(n){ function read(v){ return v.x; } var a = { x: 1, y: 2, pad: 3 }; var b = { x: 10, y: 20 }; var sum = 0; for (var i = 0; i < 400; i++) { sum += read(i & 1 ? a : b); } var before = read(a); delete a.x; a.x = 111; return sum + ":" + before + ":" + read(a); }' 0
+# The autoinit `prototype` slot. Reading f.prototype materialises
 # a lazily-created autoinit slot in place, and the receiver's own (unhashed,
 # refcount-1) shape is then churned by add/delete so that resize_properties /
 # compact_properties can free or move the shape allocation. The read site is
@@ -523,7 +521,7 @@ K a-w2a-polymorphic 'function(n){ function read(v){ return v.x; } var a = { x: 1
 # that depends on allocator address reuse. The fix (shape_free_epoch bumps in
 # resize_properties/compact_properties) is validated by an instrumented build
 # that saw 5 deterministic stale hits on the box2d workload and 0 after the fix.
-K a-w2a-autoinit-proto 'function(n){ function readProto(f){ return f.prototype; } var bad = 0, sum = 0; for (var i = 0; i < 400; i++) { var f = function(){}; var p = readProto(f); if (typeof p !== "object" || p === null || p.constructor !== f) bad++; sum += 1; f.p1 = i; f.p2 = i; f.p3 = i; delete f.p1; delete f.p2; delete f.p3; var g = function(){}; var q = readProto(g); if (typeof q !== "object" || q === null || q.constructor !== g) bad++; } return bad + ":" + sum; }' 0
+K a-mega-autoinit-proto 'function(n){ function readProto(f){ return f.prototype; } var bad = 0, sum = 0; for (var i = 0; i < 400; i++) { var f = function(){}; var p = readProto(f); if (typeof p !== "object" || p === null || p.constructor !== f) bad++; sum += 1; f.p1 = i; f.p2 = i; f.p3 = i; delete f.p1; delete f.p2; delete f.p3; var g = function(){}; var q = readProto(g); if (typeof q !== "object" || q === null || q.constructor !== g) bad++; } return bad + ":" + sum; }' 0
 
 # A6b: the register store PIC. The store site is inside `put`, warmed by the
 # first calls; each kernel pins one fill rule or the release the hit performs.
@@ -606,7 +604,7 @@ K loop-narrow-1      'function(){ var i = 0; while (i < 5) i = i + 1; return i; 
 K loop-narrow-2      'function(){ var i = 0; for (i = 0; i < 7; i++) { } return i; }' 0
 K loop-narrow-3      'function(){ var a = 0, b = 0; while (a < 3) { a = a + 1; b = b + 2; } return b; }' 0
 
-# Two local variables, and a local with an argument: the D4 landing bug made
+# Two local variables, and a local with an argument: a past bug made
 # `a + b` return `a + a` on two locals and every existing kernel still passed,
 # because none of them did arithmetic on two *variables* through the converted
 # opcode. One kernel per operator family.
@@ -646,11 +644,11 @@ K bin-chain-shift 'function(n){ var a = n, b = n + 1, c = n + 2; return ((a + b)
 
 K stack-nested-names 'function(n){ function e(){ return null.x; } function d(){ e(); return 1; } function c(){ d(); return 1; } function b(){ c(); return 1; } function a(){ b(); return 1; } try { a(); } catch (err) { return err.stack.split("\\n").map(function(l){ var m = /at ([A-Za-z0-9_$]+)/.exec(l); return m ? m[1] : ""; }).filter(function(s){ return s !== ""; }).join(","); } return "nothrow"; }' e,d,c,b,a
 
-# S0 regressions (2026-09-29). `nip` and the slot-forwarding model must alias
+# `nip` and the slot-forwarding model must alias
 # stack shapers exactly as regvm_pushed does, or a value nothing defines is read.
-K s0-nip-lgcl-and   'function(n){ var o={f:false}; function t(x){ return x.f &&= 1; } return String(t(o)) + String(t({f:n})); }' 3
-K s0-nip-lgcl-or    'function(n){ var o={f:0}; function t(x){ return x.f ||= n; } return String(t(o)) + ":" + o.f; }' 3
-K s0-nip-lgcl-nul   'function(n){ var o={f:null}; function t(x){ return x.f ??= n; } return String(t(o)) + ":" + o.f; }' 3
+K shaper-nip-lgcl-and   'function(n){ var o={f:false}; function t(x){ return x.f &&= 1; } return String(t(o)) + String(t({f:n})); }' 3
+K shaper-nip-lgcl-or    'function(n){ var o={f:0}; function t(x){ return x.f ||= n; } return String(t(o)) + ":" + o.f; }' 3
+K shaper-nip-lgcl-nul   'function(n){ var o={f:null}; function t(x){ return x.f ??= n; } return String(t(o)) + ":" + o.f; }' 3
 K s0-priv-lgcl      'function(n){ class C { get #f(){ return false; } set #f(v){ throw 1; } t(){ return this.#f &&= 1; } } return String(new C().t()); }' 3
 K s0-ystar-result   'function(n){ var k=0; var it={ next(v){ k++; return {value:k, done:k>n}; } }; var obj={[Symbol.iterator](){return it;}}; function* g(){ var r = yield* obj; return "r"+r; } var o=g(), out=[], x; while (!(x=o.next()).done) out.push(x.value); out.push(x.value); return out.join(); }' 3
 K s0-fwd-after-dup  'function(n){ function t(a){ var r; r = (a, a.v); var q = r; return q + r; } return t({v:n}); }' 3
