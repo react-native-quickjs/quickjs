@@ -1019,12 +1019,16 @@
       "sha256": "e248319bac034dc86d8f85e31005ff000ab496a0ef6dc25d243af3186ce0d5fb"
     },
     {
+      "name": "0260-regvm-inline-div-mod.patch",
+      "sha256": "1072a49741a8b92dedb187b061cdf819204f10c3325e1b247e9117cf184567b2"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "ecd0f5a47fe65c52530a42543b1106ab92ec028b9317a32df6e170f58b9fa082",
+    "quickjs.c": "3b27e4b5553bc812fe3d583a84b083adb39cb637dee550e33eaf03a4073b4e0b",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
