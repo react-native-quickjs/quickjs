@@ -279,6 +279,7 @@ what we changed and why without opening a single `.patch` file.
 | `0267` | Stores a small array literal's elements in the array's own block | Every array literal was two allocations and two frees; on Octane splay creating a ten-element payload array cost about 700 instructions | Literals of up to 16 elements reserve their element storage inside the object block, copied out on growth | No. |
 | `0268` | Releases an object's plain properties and array elements inline | Every property and element went through an exported free call, even an int holding no reference; freeing dominates Octane splay | Plain data properties and elements are tag-tested and decremented in the loop, calling out only when a count reaches zero | No. |
 | `0269` | Lays out a plain object's inline properties over its unused union | A plain object carried JSObject's 24-byte class union it never uses, so its shape and first property sat in different cache lines | JS_CLASS_OBJECT is allocated up to the union and its inline slots start there; the union is never written for it | No. |
+| `0270` | Trims the register VM's light call frame setup | The variable-area pointer was reloaded per filled slot and the receiver was spilled across frame setup on every method call | The fill uses a local pointer and four slots per iteration; `this` is read after the frame is built | No. |
 
 
 ## Reading the patches

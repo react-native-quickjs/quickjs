@@ -26924,8 +26924,7 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(cb->regvm_light_fast)) {
-                int r = T_REG(5), ab = T_REG(7), na = T_U8(9);
-                JSValue tv = FR(r);
+                int ab = T_REG(7), na = T_U8(9);
                 JSValue *regs;
                 JSRuntime *rt = ctx->rt;
                 JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 10,
@@ -26933,7 +26932,7 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                 if (unlikely(nf == NULL))
                     __attribute__((musttail))
                         return regvm_t_call_method_record(REGVM_PASS);
-                nf->this_obj = tv;
+                nf->this_obj = FR(T_REG(5));
                 rt->regvm_cur = nf;
                 /* The dispatch stays split: hoisting
                    `cb->realm`/`cb->regvm_code` widens the live ranges across
@@ -27183,7 +27182,7 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
                   JSValue *oargv, int na, JSValue **out_regs)
 {
     JSRegRun *nf = regvm_light_alloc(ctx->rt, f, cb);
-    JSValue *regs;
+    JSValue *regs, *vb;
     int k, vc, nregs;
 
     if (unlikely(nf == NULL))
@@ -27207,12 +27206,14 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     /* The variable area exists only when the promotion map leaves a slot in it
        (`vc`). Otherwise `fr` is the header's end and `var_buf` is never read.
        */
+    vb = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
     if (vc != 0) {
-        nf->var_buf = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
-        nf->fr = nf->var_buf + cb->var_count;
+        nf->var_buf = vb;
+        regs = vb + cb->var_count;
     } else {
-        nf->fr = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
+        regs = vb;
     }
+    nf->fr = regs;
     /* The four narrow header fields go out as one 64-bit store; `nctl` is 0. */
     {
         uint16_t hflags = REGVM_FLAG_LIGHT;
@@ -27228,8 +27229,7 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     /* Fill the variable area and register file with `undefined`; only the
        variable slots the promotion map still names are filled. */
     for (k = 0; k < vc; k++)
-        __builtin_memcpy(&nf->var_buf[k], &regvm_undefined_value, sizeof(JSValue));
-    regs = nf->fr;
+        __builtin_memcpy(&vb[k], &regvm_undefined_value, sizeof(JSValue));
     /* a light frame never suspends, so it has no handshake slots */
     nregs = cb->regvm_reg_count;
     /* One 16-byte `undefined` store per register. `__builtin_memcpy` from the
@@ -27240,9 +27240,19 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     if (nregs & 1)
         __builtin_memcpy(&regs[nregs - 1], &regvm_undefined_value,
                          sizeof(JSValue));
-    for (k = 0; k + 1 < nregs; k += 2) {
+    if (nregs & 2) {
+        __builtin_memcpy(&regs[(nregs & ~3) + 0], &regvm_undefined_value,
+                         sizeof(JSValue));
+        __builtin_memcpy(&regs[(nregs & ~3) + 1], &regvm_undefined_value,
+                         sizeof(JSValue));
+    }
+    for (k = 0; k + 3 < nregs; k += 4) {
         __builtin_memcpy(&regs[k], &regvm_undefined_value, sizeof(JSValue));
         __builtin_memcpy(&regs[k + 1], &regvm_undefined_value,
+                         sizeof(JSValue));
+        __builtin_memcpy(&regs[k + 2], &regvm_undefined_value,
+                         sizeof(JSValue));
+        __builtin_memcpy(&regs[k + 3], &regvm_undefined_value,
                          sizeof(JSValue));
         __asm__ volatile("" ::: "memory");
     }
