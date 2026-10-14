@@ -23358,6 +23358,21 @@ extern uint64_t js_regvm_getfield_ic[3];
  * integer payload (int, boolean, zeroed null and undefined); only a tag above
  * JS_TAG_UNDEFINED needs the out-of-line conversion.
  */
+static inline __attribute__((always_inline)) int regvm_truthy_fast(JSValue v)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+
+    if (tag == JS_TAG_OBJECT)
+        return !JS_VALUE_GET_OBJ(v)->is_HTMLDDA;
+    if (tag == JS_TAG_STRING)
+        return JS_VALUE_GET_STRING(v)->len != 0;
+    if (JS_TAG_IS_FLOAT64(tag)) {
+        double d = JS_VALUE_GET_FLOAT64(v);
+        return d == d && d != 0;
+    }
+    return -1;
+}
+
 static inline int regvm_to_bool(JSContext *ctx, JSValue v)
 {
     if ((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)
@@ -23416,8 +23431,55 @@ static inline __attribute__((always_inline)) int regvm_bitwise_fast(int sub, JSV
     return 1;
 }
 
+static inline __attribute__((always_inline)) int regvm_loose_eq_fast(JSValue a, JSValue b)
+{
+    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
+    int na, nb;
+
+    if (ta == tb) {
+        switch (ta) {
+        case JS_TAG_INT:
+        case JS_TAG_BOOL:
+            return JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b);
+        case JS_TAG_NULL:
+        case JS_TAG_UNDEFINED:
+            return 1;
+        case JS_TAG_OBJECT:
+            return JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
+        default:
+            if (JS_TAG_IS_FLOAT64(ta))
+                return JS_VALUE_GET_FLOAT64(a) == JS_VALUE_GET_FLOAT64(b);
+            return -1;
+        }
+    }
+    na = (unsigned)(ta - JS_TAG_NULL) <= JS_TAG_UNDEFINED - JS_TAG_NULL;
+    nb = (unsigned)(tb - JS_TAG_NULL) <= JS_TAG_UNDEFINED - JS_TAG_NULL;
+    if (na | nb) {
+        JSValue o;
+        if (na & nb)
+            return 1;
+        o = na ? b : a;
+        if (JS_VALUE_GET_TAG(o) == JS_TAG_OBJECT &&
+            unlikely(JS_VALUE_GET_OBJ(o)->is_HTMLDDA))
+            return -1;
+        return 0;
+    }
+    if (ta == JS_TAG_INT && JS_TAG_IS_FLOAT64(tb))
+        return (double)JS_VALUE_GET_INT(a) == JS_VALUE_GET_FLOAT64(b);
+    if (JS_TAG_IS_FLOAT64(ta) && tb == JS_TAG_INT)
+        return JS_VALUE_GET_FLOAT64(a) == (double)JS_VALUE_GET_INT(b);
+    return -1;
+}
+
 static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue a, JSValue b, JSValue *out)
 {
+    if (sub == REG_BIN_EQ || sub == REG_BIN_NEQ) {
+        int e = regvm_loose_eq_fast(a, b);
+        if (e < 0)
+            return 0;
+        *out = js_bool(e ^ (sub == REG_BIN_NEQ));
+        return 1;
+    }
     /* The bitwise and shift operations convert rather than promote. `sub` is a
        constant at every leaf handler, so this test folds there. */
     if (sub >= REG_BIN_SHL && sub <= REG_BIN_OR)
@@ -28811,8 +28873,16 @@ static uint8_t *REGVM_CC regvm_t_branch_if(REGVM_ARGS)
     int32_t off = T_I32(3);
     JSValue v = FR(c);
 
+    int t;
+
     if (likely((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)) {
         if (JS_VALUE_GET_INT(v) != 0)
+            T_BR_NEXT(T_SZ_RT + off);
+        T_NEXT(T_SZ_RT);
+    }
+    t = regvm_truthy_fast(v);
+    if (likely(t >= 0)) {
+        if (t)
             T_BR_NEXT(T_SZ_RT + off);
         T_NEXT(T_SZ_RT);
     }
@@ -28832,8 +28902,16 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
     int32_t off = T_I32(3);
     JSValue v = FR(c);
 
+    int t;
+
     if (likely((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)) {
         if (JS_VALUE_GET_INT(v) == 0)
+            T_BR_NEXT(T_SZ_RT + off);
+        T_NEXT(T_SZ_RT);
+    }
+    t = regvm_truthy_fast(v);
+    if (likely(t >= 0)) {
+        if (!t)
             T_BR_NEXT(T_SZ_RT + off);
         T_NEXT(T_SZ_RT);
     }
@@ -29056,8 +29134,38 @@ T_DEF_CMP_BRANCH_INT(branch_gt_s,   REG_BIN_GT,  _a > _b)
 T_DEF_CMP_BRANCH_INT(branch_ngt_s,  REG_BIN_GT | REG_CMP_INVERT, _a <= _b)
 T_DEF_CMP_BRANCH_INT(branch_gte_s,  REG_BIN_GTE, _a >= _b)
 T_DEF_CMP_BRANCH_INT(branch_ngte_s, REG_BIN_GTE | REG_CMP_INVERT, _a < _b)
-T_DEF_CMP_BRANCH_INT(branch_eq_s,   REG_BIN_EQ,  _a == _b)
-T_DEF_CMP_BRANCH_INT(branch_neq_s,  REG_BIN_NEQ, _a != _b)
+#define T_DEF_CMP_BRANCH_LOOSE(NAME, SUBEXPR, NEG) \
+    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
+    { \
+        int _la = T_REG8(1), _rb = T_REG8(2); \
+        int32_t _off = T_OFF8(3); \
+        int _take; \
+        REGVM_CAPTURE_IP(); \
+        _take = regvm_cmp_take(ctx, (SUBEXPR), FR(_la), FR(_rb)); \
+        if (unlikely(_take < 0)) T_FAIL(); \
+        T_NEXT(T_SZ_RRT_S + (_take ? _off : 0)); \
+    } \
+    static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
+    { \
+        uint32_t _w; \
+        int _la, _rb, _e; \
+        int32_t _off; \
+        JSValue _a, _b; \
+        memcpy(&_w, ip, 4); \
+        _la = (int)((_w >> 8) & 0xff); \
+        _rb = (int)((_w >> 16) & 0xff); \
+        _off = (int32_t)(int8_t)(_w >> 24); \
+        _a = FR(_la); \
+        _b = FR(_rb); \
+        if (likely((JS_VALUE_GET_TAG(_a) | JS_VALUE_GET_TAG(_b)) == 0)) \
+            _e = JS_VALUE_GET_INT(_a) == JS_VALUE_GET_INT(_b); \
+        else if (unlikely((_e = regvm_loose_eq_fast(_a, _b)) < 0)) \
+            __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+        if (_e ^ (NEG)) { T_BR_NEXT(T_SZ_RRT_S + _off); } \
+        T_NEXT(T_SZ_RRT_S); \
+    }
+T_DEF_CMP_BRANCH_LOOSE(branch_eq_s,  REG_BIN_EQ,  0)
+T_DEF_CMP_BRANCH_LOOSE(branch_neq_s, REG_BIN_NEQ, 1)
 #undef T_DEF_CMP_BRANCH_INT
 #undef T_DEF_CMP_BRANCH
 
