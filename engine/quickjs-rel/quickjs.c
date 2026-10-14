@@ -8655,6 +8655,12 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 }
 
 #define JS_OBJ_INLINE_PROPS 4
+
+static inline size_t js_object_body_size(JSClassID class_id)
+{
+    return class_id == JS_CLASS_OBJECT ? offsetof(JSObject, u)
+                                       : sizeof(JSObject);
+}
 #define JS_ARRAY_INLINE_MAX 16
 /* Upper bound for the per-constructor learned inline capacity: how many own
    properties a learned object keeps inline before it grows a separate
@@ -8719,7 +8725,7 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
                 req_cap = JS_OBJ_LEARNED_INLINE_MAX;
             inline_cap = req_cap;
         }
-        p = js_malloc(ctx, sizeof(JSObject) +
+        p = js_malloc(ctx, js_object_body_size(class_id) +
                            inline_cap * sizeof(JSProperty) +
                            extra_values * sizeof(JSValue));
         if (unlikely(!p))
@@ -8740,10 +8746,11 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
     p->gv_watched = 0;
     p->is_prototype = 0;
     p->first_weak_ref = NULL;
-    p->u.opaque = NULL;
+    if (class_id != JS_CLASS_OBJECT)
+        p->u.opaque = NULL;
     p->shape = sh;
     if (p->prop_inline_cap != 0)
-        p->prop = (JSProperty *)(p + 1);
+        p->prop = (JSProperty *)((uint8_t *)p + js_object_body_size(class_id));
     else
         p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
     if (unlikely(!p->prop)) {
@@ -9821,10 +9828,12 @@ static void free_object(JSRuntime *rt, JSObject *p)
         (*finalizer)(rt, JS_MKPTR(JS_TAG_OBJECT, p));
 
     /* fail safe */
+    if (p->class_id != JS_CLASS_OBJECT) {
+        p->u.opaque = NULL;
+        p->u.func.var_refs = NULL;
+        p->u.func.home_object = NULL;
+    }
     p->class_id = 0;
-    p->u.opaque = NULL;
-    p->u.func.var_refs = NULL;
-    p->u.func.home_object = NULL;
 
     remove_gc_object(&p->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(p) != 0) {
@@ -16051,6 +16060,8 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
     }
     p = JS_VALUE_GET_OBJ(obj);
     *class_id = p->class_id;
+    if (p->class_id == JS_CLASS_OBJECT)
+        return NULL;
     return p->u.opaque;
 }
 
