@@ -18,9 +18,20 @@ What it adds
 
 Needs a bytecode version bump
   Yes. The final series-wide bump remains in 9999.
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -362,7 +362,7 @@ DEF(for_in_next_if_false, 5, 1, 3, label)
+ DEF(       set_arg0, 1, 1, 1, none_arg)
+ DEF(      reserved1, 1, 0, 0, none)
+ DEF(      reserved2, 1, 0, 0, none)
+-DEF(      reserved3, 1, 0, 0, none)
++DEF(    put_el_recv, 2, 2, 0, loc8)
+ DEF(   get_var_ref0, 1, 0, 1, none_var_ref)
+ DEF(   get_var_ref1, 1, 0, 1, none_var_ref)
+ DEF(   get_var_ref2, 1, 0, 1, none_var_ref)
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22390,9 +22390,6 @@
+@@ -22196,9 +22196,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
          CASE(OP_reserved1):
          CASE(OP_reserved2):
@@ -30,11 +41,10 @@ Needs a bytecode version bump
          CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
          CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
          CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
-@@ -23987,7 +23984,69 @@
-                     goto exception;
+@@ -23794,6 +23791,68 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              }
              BREAK;
-+
+ 
 +        CASE(OP_put_el_recv):
 +            {
 +                int ret;
@@ -64,7 +74,7 @@ Needs a bytecode version bump
 +                                       ctx->class_proto[JS_CLASS_ARRAY]) &&
 +                                   ctx->std_array_prototype)) {
 +                            uint32_t array_len;
- 
++
 +                            if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) ==
 +                                       JS_TAG_INT)) {
 +                                uint32_t new_len = idx + 1;
@@ -100,7 +110,17 @@ Needs a bytecode version bump
          CASE(OP_put_ref_value):
              {
                  int ret, flags;
-@@ -40678,8 +40737,13 @@
+@@ -32769,7 +32828,8 @@ static void emit_iterator_close(JSParseState *s, bool is_async,
+         emit_op(s, OP_drop);
+     }
+     emit_op(s, OP_dup);
+-    emit_op(s, OP_is_undefined);
++    emit_op(s, OP_undefined);
++    emit_op(s, OP_strict_eq);
+     label_done = emit_goto(s, OP_if_true, -1);
+     emit_op(s, OP_get_field2);
+     emit_atom(s, JS_ATOM_return);
+@@ -40483,8 +40543,13 @@ static uint32_t *js_u3_scan(JSContext *ctx, JSFunctionDef *s,
              len2 = opcode_info[op2].size;
              if (len2 <= 0)
                  break;
@@ -116,42 +136,21 @@ Needs a bytecode version bump
                      break;
                  goto found;
              }
-@@ -41514,6 +41578,17 @@
-                 dbuf_putc(&bc_out, (u3_map[pos] & 0x100) ? OP_get_arg8_el_recv
-                                                          : OP_get_loc8_el_recv);
-                 dbuf_putc(&bc_out, u3_map[pos] & 0xff);
-+                u3_armed--;
-+                break;
-+            }
-+            goto no_change;
-+
+@@ -41324,6 +41389,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+             }
+             goto no_change;
+ 
 +        case OP_put_array_el:
 +            if (u3_map && (u3_map[pos] & JS_U3_ARMED)) {
 +                add_pc2line_info(s, bc_out.size, line_num, col_num);
 +                dbuf_putc(&bc_out, OP_put_el_recv);
 +                dbuf_putc(&bc_out, (u3_map[pos] & 0xff) |
 +                                   ((u3_map[pos] & 0x100) >> 1));
-                 u3_armed--;
-                 break;
-             }
-@@ -33204,7 +33204,8 @@
-         emit_op(s, OP_drop);
-     }
-     emit_op(s, OP_dup);
--    emit_op(s, OP_is_undefined);
-+    emit_op(s, OP_undefined);
-+    emit_op(s, OP_strict_eq);
-     label_done = emit_goto(s, OP_if_true, -1);
-     emit_op(s, OP_get_field2);
-     emit_atom(s, JS_ATOM_return);
---- a/quickjs-opcode.h
-+++ b/quickjs-opcode.h
-@@ -362,7 +362,7 @@
- DEF(       set_arg0, 1, 1, 1, none_arg)
- DEF(      reserved1, 1, 0, 0, none)
- DEF(      reserved2, 1, 0, 0, none)
--DEF(      reserved3, 1, 0, 0, none)
-+DEF(    put_el_recv, 2, 2, 0, loc8)
- DEF(   get_var_ref0, 1, 0, 1, none_var_ref)
- DEF(   get_var_ref1, 1, 0, 1, none_var_ref)
- DEF(   get_var_ref2, 1, 0, 1, none_var_ref)
++                u3_armed--;
++                break;
++            }
++            goto no_change;
++
+         case OP_args_recv:
+             {
+                 int kind = get_u16(bc_buf + pos + 1);

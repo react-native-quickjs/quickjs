@@ -1,71 +1,27 @@
-Subject: register VM folds a global `undefined` read to a constant
+Subject: Folds a global `undefined` read to a constant
 
-What this does:
-  Box2D reads the global `undefined` constantly (the default-argument guards and
-  the compare-and-branches that 0145 addressed all start from one). The lowered
-  form is `ROP_get_global`, which probes the runtime's global-name cell and checks
-  its generation before it can answer, on every execution -- for an atom whose
-  answer cannot change.
+What this does
+  Folds a global `undefined` read to a constant.
 
-  `undefined` is not writable and not configurable (ES §19.1.4), every realm's
-  `undefined` is the same immediate `JS_MKVAL(JS_TAG_UNDEFINED, 0)`, and the
-  global read path in the register backend is only reached after scope
-  resolution has already failed. So a `var`, `let` or `undefined` binding in this
-  function or any of its parents would have resolved to a register/local instead
-  of falling through to the global. `with` emits its own `OP_with_get_var` checks
-  ahead of the fallback. The one construct that could install a binding the
-  static scope chain does not show is a direct `eval`, and `has_eval_call` is
-  exactly that predicate, so the fold is skipped when it is set anywhere in the
-  `fd->parent` chain.
+Why we need it
+  And the lowered `ROP_get_global` probes the runtime's global-name cell and checks its generation on every execution for an atom whose answer cannot change; `undefined` is non-writable and non-configurable and every realm's is the same immediate.
 
-      case OP_get_var:
-          if (get_u32(bc + pos + 1) == JS_ATOM_undefined) {
-              const JSFunctionDef *q_;
-              int ev = 0;
-              for (q_ = fd; q_; q_ = q_->parent)
-                  if (q_->has_eval_call)
-                      ev = 1;
-              if (!ev) {
-                  ADD(ROP_load_undefined, dst);
-                  return 0;
-              }
-          }
-          ADD(ROP_get_global, dst, ...);
+What it adds
+  In `regvm_lower_insn`'s `case OP_get_var`, when the atom is `JS_ATOM_undefined` and no function in the `fd->parent` chain has `has_eval_call`, emit `ROP_load_undefined`; the global path is only reached after scope resolution fails and `with` has its own `OP_with_get_var`, so the only construct that could hide a binding is direct `eval`; `OP_get_var_undef` is left alone.
 
-  `OP_get_var_undef` (the form whose answer may be `undefined` when the binding
-  is missing) is deliberately left alone: its two results are not the same.
-  Folding at the stack-bytecode level instead -- letting the peephole recognise
-  the `undefined` literal and emit `OP_is_undefined` -- measured *worse* (+0.09 G
-  instructions), because it disturbs the surrounding lowering, so the fold stays
-  in `regvm_lower_insn`.
-
-  On `check.js` the ROP counts move `get_global` 13.47 M -> 4.60 M and
-  `load_undefined` 6.94 M -> 15.81 M.
-
-  Measured (`fixed.js`, 32 iterations, i7-8700), on top of 0146: 23,600,642,543
-  -> 23,449,645,130 instructions (**-0.151 G, -0.64 %**), against the plan's
-  0.145 G expected. Gate run: 23,447,318,225 / 11,288,401,824 (cycles flat
-  within noise). Checksum `546.1008391043414` exact; diff-suite `pass=398
-  fail=0 skip=0` mono and threaded; leak assertion clean; peak RSS 13228 KB.
-
-No opcode, operand encoding or serialized register-format change.
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -56239,6 +56239,28 @@
+@@ -54766,6 +54766,22 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
  
      /* globals */
      case OP_get_var:
-+        /*
-+         * `undefined` is a non-writable, non-configurable global (ES §19.1.4)
-+         * and every realm's `undefined` is the same immediate, so a read of it
-+         * is a constant -- unless a direct `eval` in this function or one of
-+         * its parents could have introduced a lexical `undefined` binding. The
-+         * global read is only reached after scope resolution fails, so a
-+         * `var`/`let`/`undefined` binding anywhere would have resolved there;
-+         * `with` emits its own `OP_with_get_var` ahead of the fallback, so it is
-+         * covered too. Folding to `ROP_load_undefined` removes a global-cell
-+         * probe and its generation check from a very common read.
-+         */
++        /* `undefined` is a non-writable, non-configurable global with the same
++           immediate in every realm, so reading it is a constant unless a direct
++           `eval` here or in a parent could have introduced a binding. Scope
++           resolution has already failed by this point, and `with` emits its own
++           `OP_with_get_var`. */
 +        if (get_u32(bc + pos + 1) == JS_ATOM_undefined) {
 +            const JSFunctionDef *q_;
 +            int ev = 0;

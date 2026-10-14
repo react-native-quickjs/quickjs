@@ -1,0 +1,693 @@
+Subject: Remove the switches that are always off
+
+What this does
+  Drops `QJS_REGVM_INLOOP_CALL` and `JS_MEGA_DISABLE` and their branches,
+  keeping the off path. The `INLOOP_CALL || RECORD` guards become
+  `QJS_REGVM_RECORD`; the bare `INLOOP_CALL` blocks (the nested-frame
+  interpreter) are deleted. `JS_MEGA_DISABLE`'s `#if !JS_MEGA_DISABLE` guards
+  are unwrapped, so the megamorphic stub cache is always compiled in.
+  `REGVM_SLIM_FRAME`, which was derived as `RECORD && !INLOOP_CALL`, becomes
+  `QJS_REGVM_RECORD`.
+
+Why we need it
+  Nothing sets either switch, and neither non-default setting compiles, so
+  both off branches are dead. The switches and their source only obscure the
+  one configuration that exists.
+
+What it adds
+  No new API. Runtime only.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 4943279..d80b9c2 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -89,7 +89,7 @@ typedef struct JSRegRCC JSRegRCC;
+ #endif
+ #endif
+ #ifndef QJS_REGVM_RECORD
+-#if QJS_REGVM_THREAD && !QJS_REGVM_INLOOP_CALL
++#if QJS_REGVM_THREAD
+ #define QJS_REGVM_RECORD 1
+ #else
+ #define QJS_REGVM_RECORD 0
+@@ -674,7 +674,7 @@ struct JSRuntime {
+     uint32_t aot_site_count;
+ #endif
+ 
+-#if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
++#if QJS_REGVM_RECORD
+     /*
+      * The register stack. Register frames live here rather than on the C stack.
+      *
+@@ -717,7 +717,7 @@ struct JSRuntime {
+     uint32_t regvm_tail_chain;
+ };
+ 
+-#if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
++#if QJS_REGVM_RECORD
+ static void regvm_arena_free(JSRuntime *rt);
+ #endif
+ 
+@@ -782,12 +782,10 @@ typedef struct JSStackFrame {
+    several of its fields duplicate the record's. The record fill does not store
+    them; `regvm_sf_materialize` reconstructs them on the cold paths that read
+    them (closure creation, debugger, errors, backtraces). */
+-#if QJS_REGVM_RECORD && !QJS_REGVM_INLOOP_CALL
+-#define REGVM_SLIM_FRAME 1
++#if QJS_REGVM_RECORD
+ struct JSRegRun;
+ static void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf);
+ #else
+-#define REGVM_SLIM_FRAME 0
+ static inline void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
+ {
+     (void)rt;
+@@ -4082,7 +4080,7 @@ void JS_FreeRuntime(JSRuntime *rt)
+     js_free_rt(rt, rt->shape_hash);
+ #if !JS_MEGA_DISABLE
+     js_free_rt(rt, rt->mega_cache);
+-#if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
++#if QJS_REGVM_RECORD
+     regvm_arena_free(rt);
+     rt->regvm_frames = NULL;
+     rt->regvm_frames_size = 0;
+@@ -25407,7 +25405,7 @@ static JSValueConst regvm_cur_func(JSRuntime *rt)
+    TRIVIAL_RET. */
+ #define REGVM_FLAG_LIGHT_CTOR (1 << 11)
+ 
+-#if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
++#if QJS_REGVM_RECORD
+ typedef struct JSRegArenaChunk {
+     struct JSRegArenaChunk *prev, *next;
+     size_t size;                /* data bytes */
+@@ -25447,13 +25445,10 @@ static inline bool regvm_arena_busy(JSRuntime *rt)
+ 
+ #endif
+ 
+-#if REGVM_SLIM_FRAME
+-/* Recover the record whose embedded JSStackFrame is `sf`, or NULL when `sf` is
+-   not a record frame (the activation's own frame, a stack-interpreter frame, a
+-   native frame, or a coroutine's heap frame). The frame arena holds only
+-   records in this build (QJS_REGVM_INLOOP_CALL is off), so membership decides.
+-   The arena never relocates while a frame is live, so the address test is
+-   stable for the lifetime of `sf`. */
++#if QJS_REGVM_RECORD
++/* The record whose embedded JSStackFrame is `sf`, or NULL for any other frame.
++   The frame arena holds only records, and never relocates while a frame is
++   live, so arena membership decides. */
+ static JSRegRun *regvm_rec_of_sf(JSRuntime *rt, JSStackFrame *sf)
+ {
+     const uint8_t *p = (const uint8_t *)sf;
+@@ -25493,13 +25488,13 @@ static void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
+         : rec->argc;
+     sf->cur_gc_obj = NULL;
+ }
+-#endif /* REGVM_SLIM_FRAME */
++#endif /* QJS_REGVM_RECORD */
+ 
+ /* The register-bytecode offset a frame is executing, or -1 when it is not a
+    live register record or its saved ip is outside this function. A
+    non-negative result goes to find_line_num with the register-keyed
+    pc2line. */
+-#if REGVM_SLIM_FRAME
++#if QJS_REGVM_RECORD
+ static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
+                           JSFunctionBytecode *b)
+ {
+@@ -27586,7 +27581,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGV
+     f->local_count = slots + 2 + cb->var_count + cb->regvm_reg_count
+         + REGVM_HS - 1;
+ #endif
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     f->sf->is_constructor = true;
+ #endif
+     /* the callee runs in its own realm (its global, its error constructors) */
+@@ -30295,7 +30290,7 @@ static void js_regvm_thread_check_sizes(void);
+ #endif
+ #endif /* QJS_REGVM_THREAD */
+ 
+-#if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
++#if QJS_REGVM_RECORD
+ /*
+  * --- nested register frames
+  --------------------------------------------------- *
+@@ -30485,80 +30480,6 @@ typedef struct JSRegFrameLayout {
+     JSRegCtl     *ctl;
+ } JSRegFrameLayout;
+ 
+-#if QJS_REGVM_INLOOP_CALL
+-static int regvm_frame_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slots,
+-                             JSRegFrameLayout *out)
+-{
+-    size_t nv = (size_t)arg_slots + b->var_count + b->regvm_reg_count + REGVM_HS;
+-    size_t need = sizeof(JSRegFrame) + sizeof(JSStackFrame)
+-        + sizeof(JSValue) * nv
+-        + sizeof(JSVarRef *) * b->var_ref_count
+-        + sizeof(JSRegCtl) * b->regvm_ctl_count;
+-    uint8_t *base = regvm_arena_push(rt, need);
+-    uint8_t *q;
+-
+-    if (!base)
+-        return -1;
+-    out->hdr = (JSRegFrame *)base;
+-    q = base + sizeof(JSRegFrame);
+-    out->sf = (JSStackFrame *)q;
+-    q += sizeof(JSStackFrame);
+-    out->arg_buf = (JSValue *)q;
+-    out->var_buf = out->arg_buf + arg_slots;
+-    out->regs = out->var_buf + b->var_count;
+-    out->var_refs = (JSVarRef **)(out->regs + b->regvm_reg_count + REGVM_HS);
+-    out->ctl = (JSRegCtl *)(out->var_refs + b->var_ref_count);
+-    return 0;
+-}
+-
+-/*
+- * Release everything a frame owns, in the order `done:` has always used: close
+- * the open cells first, because a value still in the frame can own the last
+- * closure over one of them; hold a reference on each cell across the value
+- * release, so freeing that closure cannot free the cell under js_closcyc_frame's
+- * walk; then free the argument area, the variables and the register file, all
+- * but the last handshake slot, which holds the control-stack depth as an
+- * integer rather than as a value. Shared with `done:` so the two cannot drift.
+- */
+-static void regvm_frame_release(JSRuntime *rt, JSStackFrame *sf,
+-                                JSFunctionBytecode *b, JSValue *local_buf,
+-                                JSValue *regs)
+-{
+-    JSValue *pval, *end;
+-    int i;
+-
+-    if (unlikely(sf->var_ref_count != 0)) {
+-        close_var_refs(rt, sf);
+-        for (i = 0; i < sf->var_ref_count; i++)
+-            if (sf->var_refs[i])
+-                JS_REF_COUNT(sf->var_refs[i])++;
+-    }
+-#if QJS_DRC
+-    /* Registers do not own their values, so the walk stops at the register
+-       file: the argument copies and the variable area are the only owned
+-       storage the frame has. */
+-    end = regs;
+-#else
+-    end = regs + b->regvm_reg_count + REGVM_HS - 1;
+-#endif
+-    for (pval = local_buf; pval < end; pval++)
+-        JS_FreeValueRT(rt, *pval);
+-    if (unlikely(sf->var_ref_count != 0))
+-        js_closcyc_frame(rt, sf, true);
+-}
+-
+-/*
+- * Could this callee be entered without leaving the interpreter? Every
+- * exclusion below is reachable, if rare.
+- *
+- * The frame is always built with room for every declared argument, and the
+- * arguments are copied in rather than aliased to the caller's outgoing window.
+- */
+-static inline int regvm_inloop_eligible(JSFunctionBytecode *cb)
+-{
+-    return cb->func_kind == JS_FUNC_NORMAL && cb->regvm_compiled && !cb->is_lazy;
+-}
+-#endif /* QJS_REGVM_INLOOP_CALL */
+ 
+ #if QJS_REGVM_RECORD
+ /*
+@@ -30941,7 +30862,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+ #else
+         rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
+ #endif
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+         sf->arg_count = na;
+ #endif
+     } else {
+@@ -30961,7 +30882,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+ #endif
+         for (k = 0; k < slots; k++)
+             lay->arg_buf[k] = (k < na) ? js_dup(oargv[k]) : JS_UNDEFINED;
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+         sf->arg_count = slots;
+ #endif
+     }
+@@ -30972,14 +30893,14 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+         rec->flags |= REGVM_FLAG_TRIVIAL_RET;
+ 
+     sf->cur_func = cf;
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->is_strict_mode = cb->is_strict_mode;
+     sf->is_constructor = false;
+     sf->var_buf = lay->var_buf;
+ #endif
+     sf->var_refs = lay->var_refs;
+     sf->var_ref_count = cb->var_ref_count;
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->cur_gc_obj = NULL;
+ #endif
+     sf->cur_pc = NULL;
+@@ -30989,7 +30910,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+     sf->rv_rec = rec;
+     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+ 
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->arg_buf = rec->arg_buf;
+ #endif
+     /* Bounds read into locals: stores through `lay->` may alias `cb`, so fields
+@@ -31103,7 +31024,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+ #endif
+     for (k = 0; k < slots; k++)
+         lay->arg_buf[k] = (k < na) ? oargv[k] : JS_UNDEFINED;
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->arg_count = slots;
+ #endif
+ 
+@@ -31112,14 +31033,14 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+         rec->flags |= REGVM_FLAG_TRIVIAL_RET;
+ 
+     sf->cur_func = cf;
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->is_strict_mode = cb->is_strict_mode;
+     sf->is_constructor = false;
+     sf->var_buf = lay->var_buf;
+ #endif
+     sf->var_refs = lay->var_refs;
+     sf->var_ref_count = cb->var_ref_count;
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->cur_gc_obj = NULL;
+ #endif
+     sf->cur_pc = NULL;
+@@ -31129,7 +31050,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+     sf->rv_rec = rec;
+     REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+ 
+-#if !REGVM_SLIM_FRAME
++#if !QJS_REGVM_RECORD
+     sf->arg_buf = rec->arg_buf;
+ #endif
+     {
+@@ -31160,7 +31081,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+ }
+ #endif /* QJS_REGVM_RECORD */
+ 
+-#endif /* QJS_REGVM_INLOOP_CALL */
++#endif /* QJS_REGVM_RECORD */
+ 
+ /* The single-instruction entry, defined in quickjs-regvm-step.inc, which is
+    included after js_regvm_execute while the RD_* and SET_REG_* macros are
+@@ -31258,12 +31179,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+            `run.pic`. regvm_pic_ensure returns the table the bytecode already
+            owns. */
+         JSRegPIC *pic = b->regvm_pic;
+-#if QJS_REGVM_INLOOP_CALL
+-        /* The innermost nested frame's header, or NULL at the activation's own
+-           frame. Every push and pop keeps it and rt->current_stack_frame in
+-           step. */
+-        JSRegFrame *regvm_frame = NULL;
+-#endif
+ #if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
+         /* Filled once per activation. The handlers only read these, and all are
+            fixed for the activation (the var_refs pointer too, though not its
+@@ -31803,229 +31718,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             SET_REG_P(d_, out_); \
+             REGVM_NEXT(); \
+         } while (0)
+-#if QJS_REGVM_INLOOP_CALL
+-/*
+- * The threaded handlers read the frame through `run`, so a frame switch has to
+- * rebind it. Nothing here is a new invariant: these are exactly the fields the
+- * activation fills once at `restart`, re-filled for the new frame.
+- */
+-#if QJS_REGVM_THREAD
+-#define REGVM_T_RUN_REBIND() do { \
+-        run.ctx = ctx; \
+-        run.b = b; \
+-        run.pic = b->regvm_pic; \
+-        run.sf = sf; \
+-        run.var_refs = var_refs; \
+-        run.this_obj = this_obj; \
+-        run.new_target = new_target; \
+-        run.argc = argc; \
+-        run.argv = (JSValue *)argv; \
+-        run.ctl = regvm_ctl; \
+-        run.nctl = regvm_nctl; \
+-        run.arg_buf = arg_buf; \
+-        run.var_buf = var_buf; \
+-        run.arg_owned = arg_owned; \
+-        run.ret = JS_UNDEFINED; \
+-        run.set_v = JS_UNDEFINED; \
+-    } while (0)
+-#else
+-#define REGVM_T_RUN_REBIND() ((void)0)
+-#endif
+-
+-/*
+- * Return to the caller's frame. The callee's contents must already have been
+- * released. Every local the callee overwrote comes back, the arena cursor goes
+- * back to the frame's base, and the threaded record is rebound.
+- */
+-/*
+- * Leave a nested frame the way `return` does: release it, hand the value back
+- * through the destination the call site recorded, and carry on in the caller.
+- * `tail_call` needs this as much as `return` does -- `return f()` compiles to a
+- * tail call, and a tail call that reaches `done` returns from the *activation*,
+- * discarding every nested frame under it.
+- */
+-#define REGVM_INLOOP_RETURN(RV_) do { \
+-        JSRegFrame *_rh = regvm_frame; \
+-        JSValue *_rdst = _rh->dst; \
+-        JSValue _rrv = (RV_); \
+-        JSValue _rold; \
+-        regvm_frame_release(rt, sf, b, local_buf, regs); \
+-        rt->current_stack_frame = sf->prev_frame; \
+-        REGVM_RESTORE_CALLER(_rh); \
+-        _rold = *_rdst; \
+-        *_rdst = _rrv; \
+-        if (REGVM_HAS_COUNT(_rold)) \
+-            JS_FreeValue(ctx, _rold); \
+-        REGVM_NEXT(); \
+-    } while (0)
+-
+-#define REGVM_RESTORE_CALLER(H_) do { \
+-        regvm_frame = (H_)->prev; \
+-        rpc = (H_)->rpc; \
+-        regs = (H_)->fr; \
+-        local_buf = (H_)->local_buf; \
+-        sp = (H_)->sp; \
+-        pc = (H_)->pc; \
+-        b = (H_)->b; \
+-        sf = (H_)->sf; \
+-        ctx = (H_)->ctx; \
+-        p = (H_)->p; \
+-        var_refs = (H_)->var_refs; \
+-        arg_buf = (H_)->arg_buf; \
+-        var_buf = (H_)->var_buf; \
+-        arg_owned = (H_)->arg_owned; \
+-        func_obj = (H_)->func_obj; \
+-        this_obj = (H_)->this_obj; \
+-        new_target = (H_)->new_target; \
+-        argv = (H_)->argv; \
+-        argc = (H_)->argc; \
+-        flags = (H_)->flags; \
+-        regvm_ctl = (H_)->ctl; \
+-        regvm_nctl = (H_)->nctl; \
+-        regvm_resume_marker = (H_)->resume_marker; \
+-        regvm_resume_pending = 0; \
+-        regvm_arena_pop(rt, (H_)); \
+-        REGVM_T_RUN_REBIND(); \
+-    } while (0)
+-
+-/*
+- * Enter a register-compiled callee without leaving the interpreter. On success
+- * this never returns: it dispatches the callee's first opcode. On any
+- * ineligibility it falls through and the caller does exactly what it did
+- * before. `OARGV_` is the outgoing window; the parameter `argv` is the
+- * activation's own argument vector and is not shadowed here -- see the rename
+- * at the two call sites.
+- */
+-/*
+- * `_this` is read at the top of the macro, before the switch below replaces
+- * `regs` with the callee's register file: reading `regs[r]` at the assignment
+- * would read the callee's register of the same number, which is what made every
+- * method call receive the wrong `this`. (A comment inside the macro body must
+- * end its lines with a backslash like every other line; one that does not
+- * terminates the definition and the rest becomes stray code.)
+- */
+-#define REGVM_INLOOP_CALL(CALLEE_, THIS_, DSTREG_, AB_, NA_) do { \
+-        JSValue _cf = (CALLEE_); \
+-        JSObject *_co; \
+-        JSFunctionBytecode *_cb; \
+-        JSRegFrameLayout _lay; \
+-        JSRegFrame *_h; \
+-        JSValue *_oargv = &regs[(AB_)]; \
+-        JSValue _this = (THIS_); \
+-        int _na = (NA_); \
+-        int _ac, _slots, _k; \
+-        if (likely(JS_VALUE_GET_TAG(_cf) == JS_TAG_OBJECT)) { \
+-            _co = JS_VALUE_GET_OBJ(_cf); \
+-            if (likely(_co->class_id == JS_CLASS_BYTECODE_FUNCTION)) { \
+-                _cb = _co->u.func.function_bytecode; \
+-                if (likely(regvm_inloop_eligible(_cb))) { \
+-                    _ac = _cb->arg_count; \
+-                    /* Room for every *supplied* argument, not just the \n
+-                       declared ones: JS_CallInternal leaves extra arguments \n
+-                       visible to `arguments`, and reporting only the declared \n
+-                       count truncates it. */ \
+-                    _slots = _na > _ac ? _na : _ac; \
+-                    if (likely(regvm_frame_alloc(rt, _cb, _slots, &_lay) == 0)) { \
+-                        /* save the caller, before anything is overwritten */ \
+-                        _h = _lay.hdr; \
+-                        _h->prev = regvm_frame; \
+-                        _h->rpc = rpc; \
+-                        _h->fr = regs; \
+-                        _h->local_buf = local_buf; \
+-                        _h->sp = sp; \
+-                        _h->pc = pc; \
+-                        _h->b = b; \
+-                        _h->sf = sf; \
+-                        _h->ctx = ctx; \
+-                        _h->p = p; \
+-                        _h->var_refs = var_refs; \
+-                        _h->arg_buf = arg_buf; \
+-                        _h->var_buf = var_buf; \
+-                        _h->arg_owned = arg_owned; \
+-                        _h->func_obj = func_obj; \
+-                        _h->this_obj = this_obj; \
+-                        _h->new_target = new_target; \
+-                        _h->argv = argv; \
+-                        _h->argc = argc; \
+-                        _h->flags = flags; \
+-                        _h->ctl = regvm_ctl; \
+-                        _h->nctl = regvm_nctl; \
+-                        _h->resume_marker = regvm_resume_marker; \
+-                        _h->dst = &regs[(DSTREG_)]; \
+-                        regvm_frame = _h; \
+-                        /* build the callee */ \
+-                        _lay.sf->cur_func = _cf; \
+-                        _lay.sf->is_strict_mode = _cb->is_strict_mode; \
+-                        _lay.sf->is_constructor = false; \
+-                        _lay.sf->arg_count = _slots; \
+-                        _lay.sf->arg_buf = _lay.arg_buf; \
+-                        _lay.sf->var_buf = _lay.var_buf; \
+-                        _lay.sf->var_refs = _lay.var_refs; \
+-                        _lay.sf->var_ref_count = _cb->var_ref_count; \
+-                        _lay.sf->cur_gc_obj = NULL; \
+-                        _lay.sf->cur_pc = NULL; \
+-                        _lay.sf->prev_frame = rt->current_stack_frame; \
+-                        REGVM_SET_ROOT(_lay.sf, _lay.regs, _cb->regvm_reg_count + REGVM_HS - 1); \
+-                        for (_k = 0; _k < _slots; _k++) \
+-                            _lay.arg_buf[_k] = (_k < _na) \
+-                                ? js_dup(_oargv[_k]) : JS_UNDEFINED; \
+-                        for (_k = 0; _k < _cb->var_count; _k++) \
+-                            _lay.var_buf[_k] = JS_UNDEFINED; \
+-                        for (_k = 0; _k < _cb->var_ref_count; _k++) \
+-                            _lay.var_refs[_k] = NULL; \
+-                        /* switch */ \
+-                        ctx = _cb->realm; \
+-                        p = _co; \
+-                        b = _cb; \
+-                        sf = _lay.sf; \
+-                        var_refs = _co->u.func.var_refs; \
+-                        local_buf = _lay.arg_buf; \
+-                        arg_buf = _lay.arg_buf; \
+-                        arg_owned = 1; /* the in-loop callee's slots are dup'd */ \
+-                        var_buf = _lay.var_buf; \
+-                        regs = _lay.regs; \
+-                        regvm_ctl = _lay.ctl; \
+-                        regvm_nctl = 0; \
+-                        regvm_resume_marker = NULL; \
+-                        regvm_resume_pending = 0; \
+-                        flags = 0; \
+-                        func_obj = _cf; \
+-                        this_obj = _this; \
+-                        new_target = JS_UNDEFINED; \
+-                        argc = _slots; \
+-                        argv = _lay.arg_buf; \
+-                        sp = regs + _cb->regvm_reg_count + REGVM_HS - 1; \
+-                        pc = _cb->byte_code_buf; \
+-                        rpc = _cb->regvm_code; \
+-                        /* zero the area (all-bits-zero is the uncounted \
+-                           integer 0) then set the registers whose value can be \
+-                           observed before it is written to `undefined`; a NULL \
+-                           list (a blob) fills everything with `undefined`. */ \
+-#ifdef AOT_MUT_FILL_DROP_ALL \
+-                        /* Gate mutant: no `undefined` fill, so a never-written \
+-                           register reads as integer 0. */ \
+-                        memset(regs, 0, (size_t)(_cb->regvm_reg_count + REGVM_HS) \
+-                                         * sizeof(JSValue)); \
+-#else \
+-                        if (!_cb->regvm_fill) { \
+-                            for (_k = 0; _k < _cb->regvm_reg_count + REGVM_HS; _k++) \
+-                                regs[_k] = JS_UNDEFINED; \
+-                        } else { \
+-                            memset(regs, 0, (size_t)(_cb->regvm_reg_count + REGVM_HS) \
+-                                             * sizeof(JSValue)); \
+-                            for (_k = 0; _k < _cb->regvm_fill_count; _k++) \
+-                                regs[_cb->regvm_fill[_k]] = JS_UNDEFINED; \
+-                        } \
+-#endif
+-                        rt->current_stack_frame = sf; \
+-                        REGVM_T_RUN_REBIND(); \
+-                        REGVM_NEXT(); \
+-                    } \
+-                } \
+-            } \
+-        } \
+-    } while (0)
+-#endif /* QJS_REGVM_INLOOP_CALL */
+ 
+ #if QJS_REGVM_ASM
+ /* Stop *before* a hot opcode, leaving rpc at it, and hand it to the driver. */
+@@ -34740,9 +34432,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_argmoves += (uint64_t)na;
+-#endif
+-#if QJS_REGVM_INLOOP_CALL
+-                REGVM_INLOOP_CALL(regs[c], JS_UNDEFINED, d, ab, na);
+ #endif
+                 if (!js_call_c_function_fast(ctx, regs[c], JS_UNDEFINED, na,
+                                              vc(oargv), 0, &ret_val))
+@@ -34764,9 +34453,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_argmoves += (uint64_t)na;
+-#endif
+-#if QJS_REGVM_INLOOP_CALL
+-                REGVM_INLOOP_CALL(regs[c], regs[r], d, ab, na);
+ #endif
+                 if (!js_call_c_function_fast(ctx, regs[c], regs[r], na,
+                                              vc(oargv), 0, &ret_val))
+@@ -34807,13 +34493,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                                               JS_UNDEFINED, na, vc(argv), 0);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-#if QJS_REGVM_INLOOP_CALL
+-                /* `return f()` is a tail call and leaves this frame as `return`
+-                   does; reaching `done` would discard every nested frame under
+-                   the activation. */
+-                if (regvm_frame != NULL)
+-                    REGVM_INLOOP_RETURN(ret_val);
+-#endif
+                 goto done;
+             }
+             L_ROP_tail_call_method: {
+@@ -34832,10 +34511,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                                               na, vc(argv), 0);
+                 if (JS_IsException(ret_val))
+                     goto exception;
+-#if QJS_REGVM_INLOOP_CALL
+-                if (regvm_frame != NULL)
+-                    REGVM_INLOOP_RETURN(ret_val);
+-#endif
+                 goto done;
+             }
+             L_ROP_array_from: {
+@@ -34946,17 +34621,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                       pc = rpc;
+                       REGVM_SUSPEND(JS_UNDEFINED);
+                   }
+-#if QJS_REGVM_INLOOP_CALL
+-                  if (regvm_frame != NULL) {
+-                      /* A nested frame: release it, hand the value back through
+-                         the destination the call site recorded, and carry on in
+-                         the caller instead of leaving the activation. */
+-                      JSValue _rv = regs[s];
+-
+-                      regs[s] = JS_UNDEFINED;
+-                      REGVM_INLOOP_RETURN(_rv);
+-                  }
+-#endif
+                   ret_val = regs[s];
+ #if QJS_DRC
+                   /* the register only borrows: the caller owns the value, so
+@@ -35027,24 +34691,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 --regvm_nctl;
+             }
+         }
+-#if QJS_REGVM_INLOOP_CALL
+-        if (regvm_frame != NULL) {
+-            /*
+-             * No handler in this frame. Release it and keep unwinding in the
+-             * caller, whose own control stack decides whether it catches. The
+-             * exception stays pending across the pop, and the backtrace above
+-             * has already taken this frame, so a trace that crosses a nested
+-             * call keeps every step.
+-             */
+-            JSRegFrame *_h = regvm_frame;
+-
+-            regvm_frame_release(rt, sf, b, local_buf, regs);
+-            rt->regvm_cur = sf->rv_light;
+-            rt->current_stack_frame = sf->prev_frame;
+-            REGVM_RESTORE_CALLER(_h);
+-            goto exception;
+-        }
+-#endif
+         ret_val = JS_EXCEPTION;
+         if (b->func_kind != JS_FUNC_NORMAL)
+             goto done_generator;
+@@ -35072,26 +34718,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         js_free(ctx, run.rcc_shadow);
+         run.rcc_shadow = NULL;
+ #endif
+-#if QJS_REGVM_INLOOP_CALL
+-        /*
+-         * The belt, and it is here rather than at each of the opcodes that
+-         * reaches this label because there are four of them -- `return`,
+-         * `return_undefined`, `tail_call` and `tail_call_method` -- and the
+-         * first three attempts at this port each guarded a different subset.
+-         * A path that reaches `done` while a nested frame is live is leaving
+-         * *that frame*, not the activation, and must hand its value to the
+-         * caller. Getting it wrong does not corrupt anything visible: the
+-         * activation simply returns early, the program ends with status 0 and
+-         * no output, which is what a class with a private field did for two
+-         * rounds (its field initialiser has no return value).
+-         */
+-        if (unlikely(regvm_frame != NULL))
+-            REGVM_INLOOP_RETURN(ret_val);
+-        /* One implementation of the release, shared with the in-loop return so
+-           the two cannot drift. With the flag off the original code below is
+-           compiled instead, byte for byte. */
+-        regvm_frame_release(rt, sf, b, local_buf, regs);
+-#else
+         if (unlikely(sf->var_ref_count != 0)) {
+             /* Close the variable references. A value still in the frame can own
+                the last closure over one of these cells, so hold a reference on
+@@ -35120,7 +34746,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         }
+         if (unlikely(sf->var_ref_count != 0))
+             js_closcyc_frame(rt, sf, true);
+-#endif /* QJS_REGVM_INLOOP_CALL */
+         rt->regvm_cur = sf->rv_light;
+         rt->current_stack_frame = sf->prev_frame;
+ #if QJS_REGVM_ASM
+@@ -58743,10 +58368,6 @@ static int regvm_homes_mode(void)
+ #error "QJS_REGVM_STEPCHECK replaces the monolith dispatch; it cannot be combined with QJS_REGVM_THREAD"
+ #endif
+ 
+-#ifndef QJS_REGVM_INLOOP_CALL
+-#define QJS_REGVM_INLOOP_CALL 0
+-#endif
+-
+ #if QJS_REGVM_RECORD && !QJS_REGVM
+ #error "QJS_REGVM_RECORD needs QJS_REGVM"
+ #endif
+@@ -58761,9 +58382,6 @@ static int regvm_homes_mode(void)
+ #endif
+ 
+ 
+-#if QJS_REGVM_INLOOP_CALL && !QJS_REGVM
+-#error "QJS_REGVM_INLOOP_CALL needs QJS_REGVM"
+-#endif
+ 
+ #ifndef QJS_REGVM_VERIFY
+ #ifdef NDEBUG

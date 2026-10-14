@@ -1,49 +1,46 @@
-Property-read hit path rebuilt: 16-byte PIC entry and kind quickening (X3a)
+Subject: Rebuilds the register property-read hit path around a 16-byte PIC entry and kind quickening
 
-The register VM's inline property-read hit carried the whole cache entry -- the
-prototype holder shape and the entry kind -- through the hot path, and the kind
-had to be re-tested on every read to decide whether the cached slot belonged to
-the receiver or to a prototype. Two changes remove that weight:
+What this does
+  Rebuilds the register property-read hit path around a 16-byte PIC entry and kind quickening.
 
-  * the hot PIC entry is now 16 bytes (shape, slot_off, kind, misses) with the
-    prototype holder shape moved to a parallel cold array on the bytecode, and
-    the slot is stored pre-scaled (slot*16) so the hit folds the shift away;
-  * a filled OWN entry rewrites the opcode byte in place to a kind-test-free
-    handler (ROP_get_field_own / ROP_get_field2_own), so the common case never
-    loads or compares the kind and never sets up the prototype branch. The
-    generic opcode stays as the unfilled/miss form, and the slow path rewrites
-    the byte back when an entry is not (or is no longer) a plain own read.
+Why we need it
+  The register VM's inline property-read hit carried the whole cache entry - the prototype holder shape and the entry kind - through the hot path, and the kind had to be re-tested on every read to decide whether the cached slot belonged to the receiver or to a prototype.
 
-  * quickjs.c: struct JSRegPIC shrinks to the hot half; regvm_pic_holder is a
-    parallel JSShape ** on JSFunctionBytecode (allocated, freed and marked with
-    regvm_pic); regvm_own_read_hit drops the kind test for the new opcodes;
-    regvm_get_field_ic and regvm_put_field_ic rewrite the opcode byte after a
-    fill; the two new handlers are registered in the threaded table.
-  * quickjs-regvm.h: ROP_get_field_own and ROP_get_field2_own appended to the
-    enum.
+What it adds
+  `struct JSRegPIC` shrinks to the hot half (`shape`, `slot_off`, `kind`, `misses`) with the slot stored pre-scaled so the hit folds the `shl $4` away and the holder shape moved to a parallel cold `regvm_pic_holder` array on the bytecode; a filled OWN entry rewrites the opcode byte in place to `ROP_get_field_own`/`ROP_get_field2_own`, whose handlers have no kind load, no kind compare and no prototype branch, while the generic opcode remains the unfilled/miss form and the slow path rewrites the byte back.
 
-Bytecode version bump
-  Not here, and no register-format bump either: the new opcodes are appended at
-  the end of the enum, so every existing opcode keeps its numeric value, and
-  they are never emitted by the encoder -- they exist only after a runtime
-  rewrite, so no blob ever contains them and existing blobs stay valid.
+Needs a bytecode version bump
+  No.
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -556,6 +556,11 @@ typedef enum JSRegOpcode {
+        one byte wide, used when every physical register fits. */
+     ROP_load_i8_s, ROP_move_s,
+ 
++    /* Quickened own-read forms, never emitted by the encoder: the threaded
++       interpreter rewrites a site's opcode to one of these when its cache holds
++       an own data slot, and back when it does not. */
++    ROP_get_field_own, ROP_get_field2_own,
++
+     ROP_COUNT
+ } JSRegOpcode;
+ 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1198,6 +1198,12 @@
+@@ -1170,6 +1170,11 @@ typedef struct JSFunctionBytecode {
      /* Runtime-only property cache owned by the register VM. Its entries hold
         counted shape references; stack-VM inline caches remain in ic_table. */
      JSRegPIC *regvm_pic;
-+    /* X3: the cold half of the register PIC, indexed by the same site as
-+       regvm_pic. `regvm_pic_holder[site]` is the prototype holder shape for a
-+       REG_PIC_PROTO entry (NULL otherwise), split out of the hot JSRegPIC so
-+       the entry is 16 bytes and the hit path never touches it. Allocated and
-+       freed alongside regvm_pic; holds counted shape references too. */
++    /* The cold half of the register PIC, indexed by site:
++       `regvm_pic_holder[site]` is the prototype holder shape for a
++       REG_PIC_PROTO entry, kept out of the 16-byte hot entry. Allocated and
++       freed with regvm_pic; holds counted shape references. */
 +    JSShape **regvm_pic_holder;
-     /* Section 6.2 side table, debug builds only. Owned by the bytecode. */
+     /* The ownership side table, debug builds only. Owned by the bytecode. */
      JSRegRCC *regvm_rcc;
-     /* C1's frame-entry fill list: the physical registers the frame must set to
-@@ -7123,11 +7129,14 @@
-    forces copy-on-write and keeps the cached layout immutable. */
+     /* The frame-entry fill list: the physical registers set to `undefined`
+@@ -7081,11 +7086,13 @@ static void js_free_ic_table(JSRuntime *rt, JSFunctionBytecode *b)
+    copy-on-write and keeps the cached layout immutable. */
  struct JSRegPIC {
      JSShape  *shape;         /* receiver shape; a counted reference */
 -    JSShape  *holder_shape;  /* NULL for own-slot entries; counted reference */
@@ -53,17 +50,16 @@ Bytecode version bump
      uint16_t  kind;          /* REG_PIC_EMPTY / OWN / PROTO / OWN_W */
 +    uint16_t  misses;        /* stop refilling at a limit: megamorphic */
  };
-+/* X3: 16 bytes, so a site's address is `pic + site * 16` and the own-read hit
-+   needs neither a multiply for the site nor a shift for the slot. The holder
-+   shape for a PROTO entry lives in the parallel regvm_pic_holder array. */
++/* 16 bytes, so a site's address is `pic + site * 16`. The holder shape for a
++   PROTO entry lives in regvm_pic_holder. */
 +_Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
  
  #define REG_PIC_EMPTY 0
  #define REG_PIC_OWN   1
-@@ -7137,15 +7146,15 @@
- /* Release the shape references held by one entry and clear it. Used by the
-    finalizer and by a refill, which must drop the entry it replaces before
-    storing the new shapes. */
+@@ -7094,15 +7101,15 @@ struct JSRegPIC {
+ 
+ /* Release one entry's shape references and clear it. Also used by a refill
+    before storing the new shapes. */
 -static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e)
 +static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
  {
@@ -81,7 +77,7 @@ Bytecode version bump
      e->misses = 0;
      e->kind = REG_PIC_EMPTY;
  }
-@@ -7158,9 +7167,11 @@
+@@ -7115,9 +7122,11 @@ static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
      if (!b->regvm_pic)
          return;
      for (i = 0; i < b->regvm_pic_count; i++)
@@ -93,18 +89,17 @@ Bytecode version bump
 +    b->regvm_pic_holder = NULL;
  }
  
- /* Lazy allocation of the register PIC, mirroring ic_table_ensure: allocated on
-@@ -7177,9 +7188,20 @@
+ /* Allocate the register PIC on first fill, as ic_table_ensure does.
+@@ -7132,9 +7141,19 @@ static JSRegPIC *regvm_pic_ensure(JSRuntime *rt, JSFunctionBytecode *b)
      if (b->regvm_pic_count == 0)
          return NULL;
      t = js_mallocz_rt(rt, sizeof(*t) * (size_t)b->regvm_pic_count);
 -    b->regvm_pic = t;   /* NULL on OOM: retried on the next fill, never throws */
 -    if (t)
 +    if (t) {
-+        /* The cold holder array is allocated in the same step so that a
-+           non-NULL regvm_pic always has a holder array to index. If it cannot
-+           be allocated the whole cache is abandoned (NULL on OOM: retried on
-+           the next fill, never throws). */
++        /* The holder array is allocated in the same step, so a non-NULL
++           regvm_pic always has one. On failure the cache is abandoned and
++           retried on the next fill. */
 +        JSShape **h = js_mallocz_rt(rt, sizeof(*h) * (size_t)b->regvm_pic_count);
 +        if (!h) {
 +            js_free_rt(rt, t);
@@ -117,7 +112,7 @@ Bytecode version bump
      return t;
  }
  #endif /* QJS_REGVM */
-@@ -9213,8 +9235,8 @@
+@@ -9131,8 +9150,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                      JSRegPIC *e = &b->regvm_pic[j];
                      if (e->shape)
                          mark_func(rt, &e->shape->header);
@@ -128,7 +123,7 @@ Bytecode version bump
                  }
              }
  #endif
-@@ -9516,6 +9538,10 @@
+@@ -9434,6 +9453,10 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
          js_func_size += (size_t)b->regvm_pic_count * sizeof(JSRegPIC);
          memory_used_count++;
      }
@@ -139,7 +134,7 @@ Bytecode version bump
  #endif
      memory_used_count++;
      js_func_size += b->source_len + 1;
-@@ -22183,27 +22209,28 @@
+@@ -21980,27 +22003,28 @@ static inline __attribute__((always_inline)) int regvm_unary_num_fast(
  
  /* Install one shape/slot into a site, counting a miss when the cached shape
     changes and going dead at the limit. Shared by the read and the write fill. */
@@ -175,9 +170,9 @@ Bytecode version bump
      e->kind = kind;
  }
  
-@@ -22354,7 +22381,8 @@
+@@ -22129,7 +22153,8 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                  return;             /* no table: the site simply does not cache */
-             *ppic = pic;            /* re-point the running frame (A1's base) */
+             *ppic = pic;            /* re-point the running frame's base */
          }
 -        regvm_pic_install(rt, &pic[site], kind, rsh, hsh, slot);
 +        regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
@@ -185,7 +180,7 @@ Bytecode version bump
          /* The install may have just pushed a live site over the miss limit;
             such a site can no longer be served, so cache it globally too. */
          if (!need_mega &&
-@@ -22478,7 +22506,8 @@
+@@ -22230,7 +22255,8 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
              return;
          *ppic = pic;
      }
@@ -195,8 +190,8 @@ Bytecode version bump
                        (uint32_t)(pr - p->prop));
  }
  
-@@ -22523,7 +22552,7 @@
-  * lazy-marker test and reference-count test with one.
+@@ -22266,7 +22292,7 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+  * lazy-JSON marker, which goes to the slow path.
   */
  static inline __attribute__((always_inline)) int regvm_own_read_hit(
 -    JSRegPIC *pic, JSValue recv, int site, JSValue *out)
@@ -204,7 +199,7 @@ Bytecode version bump
  {
      JSObject *p;
      JSRegPIC *e;
-@@ -22536,12 +22565,12 @@
+@@ -22279,12 +22305,12 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
      if (unlikely(e->shape != p->shape))
          return 0;
      if (likely(e->kind == REG_PIC_OWN)) {
@@ -220,7 +215,7 @@ Bytecode version bump
      }
      if (unlikely(JS_VALUE_GET_TAG(v) < 0)) {
          if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
-@@ -23586,8 +23615,10 @@
+@@ -23185,8 +23211,10 @@ static uint8_t *REGVM_CC regvm_t_get_element_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_element_lazy_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_field(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_field_slow(REGVM_ARGS);
@@ -231,7 +226,7 @@ Bytecode version bump
  static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_branch(REGVM_ARGS);
-@@ -23876,6 +23907,8 @@
+@@ -23451,6 +23479,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(get_element, regvm_t_get_element) \
      X(get_field, regvm_t_get_field) \
      X(get_field2, regvm_t_get_field2) \
@@ -240,7 +235,7 @@ Bytecode version bump
      X(put_field, regvm_t_put_field) \
      X(branch, regvm_t_branch) \
      X(branch_s, regvm_t_branch_s) \
-@@ -24684,7 +24717,7 @@
+@@ -24180,7 +24210,7 @@ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS)
      JSValue recv = f->var_buf[0];
      JSValue val;
  
@@ -249,19 +244,15 @@ Bytecode version bump
          T_SET_NEXT(d, val, 9);
      if (site == REG_IC_NONE)
          val = JS_GetProperty(ctx, recv, atom);
-@@ -25045,6 +25078,20 @@
+@@ -24518,6 +24548,16 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
              val = JS_GetProperty(ctx, FR(r), atom); \
          } else { \
              val = regvm_get_field_ic(ctx, f->b, &f->pic, FR(r), atom, site); \
-+            /* X3 quickening. Once the site is filled, pin this instruction's \
-+               opcode byte to the form that matches the cached kind: an own \
-+               data slot gets the kind-test-free handler, and anything else \
-+               (a prototype holder, a dead site, or a site the per-function \
-+               PIC refused) is set back to the generic handler, which still \
-+               carries the kind test and the prototype branch. The else branch \
-+               is what makes it correct to let the own handler read \
-+               p->prop[slot_off] without a kind test. The register code buffer \
-+               is malloc'd and the rewrite is single-threaded per runtime. */ \
++            /* Quickening. Once the site is filled, rewrite this instruction's \
++               opcode byte: an own data slot gets the kind-test-free handler, \
++               anything else gets the generic handler back. That else branch is \
++               what lets the own handler skip the kind test. Rewrites are \
++               single-threaded per runtime. */ \
 +            if (likely(!JS_IsException(val)) && f->pic != NULL) { \
 +                *ip = (f->pic[site].kind == REG_PIC_OWN) \
 +                          ? (uint8_t)ROP_##NAME##_own \
@@ -270,7 +261,7 @@ Bytecode version bump
          } \
          if (JS_IsException(val)) \
              T_FAIL(); \
-@@ -25056,10 +25103,37 @@
+@@ -24529,10 +24569,35 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
          int r = T_REG(3); \
          int site = T_REG(9); \
          JSValue val; \
@@ -280,12 +271,10 @@ Bytecode version bump
          } \
          __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
 +    } \
-+    /* X3: the quickened own-read hit. Entered only when the opcode byte was \
-+       rewritten above, which happens only while the cache holds an own data \
-+       slot for the receiver's (hashed, hence immutable) shape. The shape \
-+       compare alone therefore proves the slot: no kind test, no prototype \
-+       branch. A shape mismatch falls to the generic slow handler, which may \
-+       rewrite the opcode back if the site is no longer an own slot. */ \
++    /* The quickened own-read hit, valid only while the cache holds an own data \
++       slot for a hashed (immutable) shape, so the shape compare proves the \
++       slot. A mismatch goes to the generic slow handler, which may rewrite the \
++       opcode back. */ \
 +    static uint8_t *REGVM_CC regvm_t_##NAME##_own(REGVM_ARGS) \
 +    { \
 +        int d = T_REG(1); \
@@ -309,7 +298,7 @@ Bytecode version bump
      }
  T_GET_FIELD_BODY(get_field)
  T_GET_FIELD_BODY(get_field2)
-@@ -25116,7 +25190,7 @@
+@@ -24581,7 +24646,7 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
              JSRegPIC *e = &f->pic[site];
  
              if (likely(e->shape == p->shape) && e->kind == REG_PIC_OWN_W) {
@@ -318,21 +307,19 @@ Bytecode version bump
                  JSValue old = *slot;
  
  #ifdef QJS_REGVM_COUNT
-@@ -26370,6 +26444,13 @@
+@@ -25675,6 +25740,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              [ROP_compare] = &&L_default,
              [ROP_get_field] = &&L_ROP_get_field,
              [ROP_get_field2] = &&L_ROP_get_field2,
-+            /* X3: the quickened forms are produced only by the threaded
-+               interpreter's rewrite, so the monolith never executes them from
-+               compiled bytecode. They are aliased here to the generic labels
-+               purely so that a shared buffer could never dispatch through a
-+               NULL slot; both labels do the full kind-tested hit. */
++            /* The quickened forms are only written by the threaded interpreter;
++               they alias the generic labels so no slot dispatches through NULL.
++               */
 +            [ROP_get_field_own] = &&L_ROP_get_field,
 +            [ROP_get_field2_own] = &&L_ROP_get_field2,
              [ROP_put_field] = &&L_ROP_put_field,
              [ROP_put_field_xfer] = &&L_ROP_put_field_xfer,
              [ROP_define_field] = &&L_ROP_define_field,
-@@ -27321,7 +27402,7 @@
+@@ -26569,7 +26639,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int site = RD_U16();
                  JSValue recv = var_buf[slot];
                  JSValue val;
@@ -341,7 +328,7 @@ Bytecode version bump
                      SET_REG(d, val);
                      REGVM_NEXT();
                  }
-@@ -27343,7 +27424,7 @@
+@@ -26591,7 +26661,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSValue recv = (op == ROP_get_local_field) ? var_buf[slot]
                                                            : arg_buf[slot];
                  JSValue val;
@@ -350,8 +337,8 @@ Bytecode version bump
                      SET_REG(d, val);
                      REGVM_NEXT();
                  }
-@@ -27367,7 +27448,7 @@
-                    encoder emitted a site. */
+@@ -26614,7 +26684,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 /* Only where the encoder emitted a site. */
                  js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
  #endif
 -                if (regvm_own_read_hit(pic, regs[r], site, &val)) {
@@ -359,7 +346,7 @@ Bytecode version bump
                      SET_REG(d, val);
                      REGVM_NEXT();
                  }
-@@ -27388,7 +27469,7 @@
+@@ -26635,7 +26705,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSAtom atom = RD_U32();
                  int site = RD_U16();
                  JSValue val;
@@ -368,7 +355,7 @@ Bytecode version bump
                      SET_REG(d, val);
                      REGVM_NEXT();
                  }
-@@ -27421,7 +27502,7 @@
+@@ -26663,7 +26733,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  
                          if (likely(e->shape == p->shape) &&
                              e->kind == REG_PIC_OWN_W) {
@@ -377,7 +364,7 @@ Bytecode version bump
                              JSValue old = *slot;
  
                              *slot = js_dup(regs[v]);
-@@ -30079,7 +30160,7 @@
+@@ -29027,7 +29097,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int site = RD_U16();
                      JSValue recv = f->var_buf[slot];
                      JSValue val;
@@ -386,7 +373,7 @@ Bytecode version bump
                          SET_REG(d, val);
                          REGVM_NEXT();
                      }
-@@ -30103,7 +30184,7 @@
+@@ -29051,7 +29121,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      JSValue recv = (op == ROP_get_local_field) ? f->var_buf[slot]
                                                                : f->arg_buf[slot];
                      JSValue val;
@@ -395,7 +382,7 @@ Bytecode version bump
                          SET_REG(d, val);
                          REGVM_NEXT();
                      }
-@@ -53511,6 +53592,7 @@
+@@ -52289,6 +52359,7 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
      [ROP_to_number] = "rr",
      [ROP_compare] = "rbrr",
      [ROP_get_field] = "rras",
@@ -403,7 +390,7 @@ Bytecode version bump
      [ROP_get_local_field] = "ruas",
      [ROP_get_local_field_0] = "ras",
      [ROP_get_local_field_1] = "ras",
-@@ -53518,6 +53600,7 @@
+@@ -52296,6 +52367,7 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
      [ROP_get_local_field_3] = "ras",
      [ROP_get_arg_field] = "ruas",
      [ROP_get_field2] = "rras",
@@ -411,22 +398,3 @@ Bytecode version bump
      [ROP_put_field] = "rasr",
      [ROP_define_field] = "rar",
      /* object, window base, count, template index: fills an object literal's
---- a/quickjs-regvm.h
-+++ b/quickjs-regvm.h
-@@ -694,6 +694,16 @@
-      */
-     ROP_load_i8_s, ROP_move_s,
- 
-+    /*
-+     * X3 quickened own-read forms. These are never emitted by the encoder:
-+     * the threaded interpreter rewrites a site's opcode byte to one of these
-+     * once its property cache is filled as an own data slot, and back to the
-+     * generic form when the site is refilled as a prototype or goes dead.
-+     * Appended at the very end so every existing opcode keeps its number and
-+     * the serialized bytecode format is unchanged.
-+     */
-+    ROP_get_field_own, ROP_get_field2_own,
-+
-     ROP_COUNT
- } JSRegOpcode;
- 

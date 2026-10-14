@@ -1,71 +1,26 @@
-Subject: register VM: decide a strict compare with an undefined operand from the tag instead of the strict-equality helper
+Subject: Decides a strict compare with an undefined operand from the tag
 
-What this does:
-  box2d's fused compare-and-branches are dominated by the default-argument
-  guard `x === undefined` / `x !== undefined`: of ~9.5 M strict compares on the
-  fixed.js kernel, ~8.9 M have an undefined operand. The generic handler reaches
-  them the long way -- after the both-int, both-float and mixed-numeric blocks
-  have been tried and rejected, through an out-of-line call to regvm_strict_eq,
-  which is emitted with a six-register spill around a ~40-instruction path.
+What this does
+  Decides a strict compare with an undefined operand from the tag.
 
-  The undefined operand is not a compile-time constant the encoder can drop: it
-  is a global read (`ROP_get_global`) whose value is undefined only at run time,
-  so a dedicated opcode cannot be selected at lowering. (A first attempt that
-  did exactly that emitted nothing; the `undefined` literal form is already
-  folded to `OP_is_undefined` by the stack bytecode pass at compile time.)
-  Instead the fast path is taken on the runtime tag, ahead of the numeric
-  blocks:
+Why we need it
+  But the generic handler reaches them only after the both-int, both-float and mixed-numeric blocks are tried and rejected, through an out-of-line `regvm_strict_eq` call emitted with a six-register spill; the undefined side is a `ROP_get_global` read whose value is undefined only at run time, so the encoder cannot drop it and the literal form is already folded to `OP_is_undefined` by the stack pass.
 
-      if ((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_EQ || ...STRICT_NEQ) {
-          JSValue ... _ta = JS_VALUE_GET_TAG(_a), _tb = JS_VALUE_GET_TAG(_b);
-          if (likely(_ta == JS_TAG_UNDEFINED || _tb == JS_TAG_UNDEFINED)) {
-              int _se = (_ta == JS_TAG_UNDEFINED && _tb == JS_TAG_UNDEFINED)
-                            ^ ((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_NEQ);
-              int _take = _se ^ ((_sub & REG_CMP_INVERT) != 0);
-              ...
-          }
-      }
+What it adds
+  `T_DEF_CMP_BRANCH` takes the case on the runtime tag ahead of the numeric blocks: a strict compare against undefined is true exactly when both operands are undefined, so one tag test replaces the helper, and the `!==` and inverted senses fold into the same `_se ^ inv` the generic strict block uses; the per-sense instantiations see a constant `_sub` and fold the test away, so only `branch_cmp_reg_reg(_s)` pays for the extra compare; the monolith's `REGVM_CMP_BRANCH` is left as it is.
 
-  A strict comparison against undefined is true exactly when both operands are
-  undefined, so one tag test replaces the helper call. The `!==` and the
-  branch's inverted sense fold into the same `_se ^ inv` the generic strict
-  block uses. The non-undefined strict compares and every other sub-op fall
-  through unchanged.
-
-  The macro is instantiated for `branch_cmp_reg_reg` and every per-sense narrow
-  opcode; for the per-sense forms `_sub` is a compile-time constant and the new
-  test folds away, so only `branch_cmp_reg_reg(_s)` pays for the extra compare.
-  The monolith's separate REGVM_CMP_BRANCH macro is left as it is (it is the
-  THREAD=0 path, not the measured one).
-
-  Measured (`fixed.js`, 32 iterations, i7-8700): 24,139,025,404 ->
-  23,820,723,349 instructions (**-0.318 G, -1.32 %**) and 11,251,225,965 ->
-  11,164,235,943 cycles (~-0.8 %), against the plan's 0.4 G expected / 0.2 G
-  floor for this item. Gate run: 23,821,625,829 / 11,206,315,155. Checksum
-  `546.1008391043414` exact; diff-suite `pass=398 fail=0 skip=0` mono and
-  threaded; test262 50/81192 errors (<= 50, baseline equal); ASan+UBSan box2d
-  clean and the strict-equals/equals/if test262 directories 0/144 errors with no
-  sanitizer reports; leak assertion clean.
-
-No opcode, operand encoding or serialized register-format change.
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -26445,6 +26445,29 @@
+@@ -25782,6 +25782,21 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
          int32_t _off = (OFFEXPR); \
          JSValue _a = FR(_la), _b = FR(_rb); \
          int _r; \
-+        /* \
-+         * N3: `===`/`!==` against undefined. It is box2d's default-argument \
-+         * guard and its most common strict compare, but the undefined operand \
-+         * is a global read rather than a compile-time constant, so the case is \
-+         * decided here from the runtime tag instead of by a dedicated opcode. \
-+         * A strict comparison with an undefined operand is true exactly when \
-+         * both are undefined: one tag test, where the generic path below would \
-+         * walk the numeric blocks and then call regvm_strict_eq out of line. \
-+         * Deciding it before those blocks is also what keeps them off the \
-+         * critical path. The `!==` and inverted senses fold into the same \
-+         * `_se ^ inv` the strict block below uses. \
-+         */ \
++        /* `===`/`!==` against an undefined read at run time: true exactly when \
++           both are undefined, one tag test ahead of the numeric blocks. The \
++           `!==` and inverted senses fold into the same `_se ^ inv` as the \
++           strict block. */ \
 +        if ((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_EQ || \
 +            (_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_NEQ) { \
 +            int _ta = JS_VALUE_GET_TAG(_a), _tb = JS_VALUE_GET_TAG(_b); \

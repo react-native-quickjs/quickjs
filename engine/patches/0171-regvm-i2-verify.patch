@@ -1,35 +1,35 @@
-Subject: register VM I2 verify scans live values once per boundary
+Subject: I2 verify scans live values once per boundary
 
-What this does:
-  The I2 promoted-slot check at block boundaries walked every live value once
-  per promoted slot. It now makes a single pass over the live values per
-  boundary, recording the value seen for each slot in `seen`, then checks each
-  slot's expected value.
+What this does
+  I2 verify scans live values once per boundary.
 
-Why we need it:
-  The per-slot walk made this verification quadratic in the frame size.
+Why we need it
+  The I2 promoted-slot check walked every live value once per promoted slot, quadratic in the frame size.
 
-Needs a bytecode version bump:
-  No. Lowering only.
+What it adds
+  One pass over the live values per block boundary into `seen`, then a check of each slot's expected value.
 
----
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -63538,7 +63664,12 @@
+@@ -61579,9 +61579,12 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                 goto done;
+             }
      if (home_mode >= 2 && ns_ok > 0) {
-         /* I2 at block boundaries: each live version of a promoted slot must
-            be the slot's one current value. This also catches a home version
+-        /* I2 at block boundaries: each live version of a promoted slot must
+-           be the slot's one current value. This also catches a home version
 -           kept alive only in a register, off the simulated operand stack. */
-+           kept alive only in a register, off the simulated operand stack.
-+           One pass over the live values per boundary (rather than one pass per
-+           promoted slot) keeps this linear in the frame size. */
++        /* At block boundaries each live version of a promoted slot must be the
++           slot's one current value, including a home version kept only in a
++           register. One pass over the live values per boundary. */
 +        int *seen = js_malloc(ctx, (size_t)ns_ok * sizeof(int));
 +        if (!seen)
 +            goto done;
          for (b = 0; b < n_blocks; b++) {
              int side;
              if (in_depth[b] < 0)
-@@ -63546,28 +63677,37 @@
+@@ -61589,28 +61592,37 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              for (side = 0; side < 2; side++) {
                  const uint64_t *bits = (side ? live_out : live_in) +
                                         (size_t)b * live_words;

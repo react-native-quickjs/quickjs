@@ -1,37 +1,42 @@
+Subject: Lift the 255-argument call limit
+
+What this does
+  Lift the 255-argument call limit.
+
+Why we need it
+  A call, method call or construction with more than 255 arguments -- legal JavaScript, and what a template with many substitutions compiles to -- was refused because the call opcodes' argument count is one byte and the analysis simulator's operand array was fixed at 258.
+
+What it adds
+  `JSRegStepEv.pop` points at a caller-provided buffer sized to the deepest operand stack; calls with `argc > 255` build an arguments array in 255-value chunks (`ROP_array_from` + `ROP_append`) and go through `ROP_apply`; a `JSRegIR.big_args` flag reserves the 262 window slots the sequence stages through.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index fa59791..03dfe0d 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -59905,6 +59905,13 @@
-      * emitter overrides it for its own phi copies.
-      */
+@@ -58028,6 +58028,10 @@ typedef struct JSRegIR {
+        it once per stack-VM opcode; the edge-move emitter overrides it for its
+        phi copies. */
      uint8_t next_origin;
-+    /*
-+     * Set when a call with more than 255 arguments was lowered through the
-+     * apply path: its window needs the 262 slots that path stages through (the
-+     * callable, receiver and array, one chunk array, a 255-value staging chunk
-+     * and the append triple), not the three an ordinary spread apply needs.
-+     */
++    /* Set when a call with more than 255 arguments was lowered through the
++       apply path, whose window needs 262 slots (callable, receiver, array,
++       chunk array, a 255-value staging chunk and the append triple). */
 +    int big_args;
-     /* Section 6.1's init set, one byte per analysis register: 1 when the
-        register may be read before it is written and so must be filled at frame
-        entry. Built on every build, not just RCCHECK; the encoder turns it into
-@@ -62744,6 +62751,71 @@
+     /* The init set, one byte per analysis register: 1 when the register may be
+        read before it is written. The encoder turns it into the fill list. */
+     uint8_t *own_init;
+@@ -60720,6 +60724,65 @@ static int regvm_too_many_args(JSContext *ctx, int argc)
      return -1;
  }
  
-+/*
-+ * Item 2.2: build an array of `argc` argument values (`args[0..argc)`) into
-+ * `dst` for a call whose argument count does not fit the call opcodes' one-byte
-+ * window. Up to 255 values go in one ROP_array_from; further chunks are built
-+ * the same way and spread-appended with ROP_append, which is exactly the
-+ * sequence a spread call uses. The window layout: WIN(0) and WIN(1) hold the
-+ * callable and the receiver (staged before the build, so no operand is read
-+ * after `dst` is written -- the allocator may reuse a dying operand's register
-+ * for `dst`), WIN(2) the array, WIN(3) the chunk array, WIN(4..258) the
-+ * staging area and WIN(259..261) the append triple; `win_size` reserves 262
-+ * slots for a function with a big call. Cold by construction: the chunking
-+ * only runs for calls the hot opcodes cannot encode.
-+ */
++/* Build an array of `argc` argument values (`args[0..argc)`) into `dst`, for
++   a call whose argument count does not fit the one-byte window. Up to 255
++   values per ROP_array_from; further chunks are spread-appended with
++   ROP_append, as a spread call does. Window: WIN(0) and WIN(1) the callable
++   and receiver (staged before the build, since `dst` may reuse a dying
++   operand's register), WIN(2) the array, WIN(3) the chunk array, WIN(4..258)
++   the staging area, WIN(259..261) the append triple. */
 +static int regvm_build_arg_array(JSContext *ctx, JSRegIR *ir, int pos,
 +                                 const int *args, int argc, int dst)
 +{
@@ -87,17 +92,17 @@ diff --git a/quickjs.c b/quickjs.c
  static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
                              int pos, const int *pop, const uint8_t *reuse,
                              int dst, int below, const JSFunctionDef *fd,
-@@ -63198,8 +63270,19 @@
+@@ -61120,8 +61183,19 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
      case OP_call: {
          int argc = (op == OP_call) ? get_u16(bc + pos + 1) : (op - OP_call0);
          int defs[256], a;
 -        if (argc > 255)
 -            return regvm_too_many_args(ctx, argc);
 +        if (argc > 255) {
-+            /* the arguments do not fit the call opcode: build an array and
-+               apply it, exactly as a spread call does. The callable and the
-+               receiver are staged first: `dst` is written by the array build,
-+               and the allocator may have given it a dying operand's register. */
++            /* The arguments do not fit the call opcode: build an array and
++               apply it, as a spread call does. The callable and receiver are
++               staged first, since `dst` may reuse a dying operand's register.
++               */
 +            ADD(ROP_move, REGVM_WIN(0), pop[0]);
 +            ADD(ROP_load_undefined, REGVM_WIN(1));
 +            if (regvm_build_arg_array(ctx, ir, pos, pop + 1, argc, dst))
@@ -109,7 +114,7 @@ diff --git a/quickjs.c b/quickjs.c
          regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
-@@ -63213,8 +63296,15 @@
+@@ -61135,8 +61209,15 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
      }
      case OP_call_method: {
          int argc = get_u16(bc + pos + 1), defs[256], a;
@@ -127,16 +132,16 @@ diff --git a/quickjs.c b/quickjs.c
          regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
-@@ -63228,8 +63318,18 @@
+@@ -61150,8 +61231,18 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
      }
      case OP_call_constructor: {
          int argc = get_u16(bc + pos + 1), defs[256], a;
 -        if (argc > 255)
 -            return regvm_too_many_args(ctx, argc);
 +        if (argc > 255) {
-+            /* ROP_apply's construct magic takes the callable and the
-+               new.target in the same two window slots a plain apply takes the
-+               callable and the receiver */
++            /* ROP_apply's construct magic takes the callable and new.target in
++               the two window slots a plain apply uses for the callable and the
++               receiver */
 +            ADD(ROP_move, REGVM_WIN(0), pop[0]);
 +            ADD(ROP_move, REGVM_WIN(1), pop[1]);
 +            if (regvm_build_arg_array(ctx, ir, pos, pop + 2, argc, dst))
@@ -148,24 +153,20 @@ diff --git a/quickjs.c b/quickjs.c
          regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
-@@ -66320,8 +66420,14 @@
-    after the common stack/slot transition has run. */
+@@ -63907,8 +63998,10 @@ typedef struct JSRegSlotSim {
+    transition. */
  typedef struct JSRegStepEv {
      int np, ns, depth;
 -    /* `call_method` has two fixed operands plus an 8-bit argument count. */
 -    int pop[258];
-+    /*
-+     * The popped operand values, in order. Points at a caller-provided buffer
-+     * (`popbuf`, sized to the deepest operand stack the function reaches) so an
-+     * instruction with more operands than any fixed array -- a call with more
-+     * than 255 arguments -- is representable. The values are copied before the
-+     * instruction's effect mutates the simulated stack.
-+     */
++    /* The popped operand values, in order, in a caller-provided buffer sized to
++       the deepest operand stack, so a call with more than 255 arguments fits.
++       Copied before the instruction's effect mutates the simulated stack. */
 +    int *pop;
      int slot_k, slot_role, slot_value;
      int split_v, split_src;
      int copy_v, copy_src;
-@@ -66423,16 +66529,18 @@
+@@ -64010,16 +64103,18 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
  static int regvm_sim_step(const JSFunctionDef *fd, const uint8_t *bc, int pos,
                            int *scratch, int *pd, const int *push_base,
                            JSRegSlotSim *sim, int32_t *pv, uint8_t *pdef,
@@ -186,7 +187,7 @@ diff --git a/quickjs.c b/quickjs.c
          return -1;
      ev->np = np;
      ev->ns = ns;
-@@ -67764,6 +67872,7 @@
+@@ -65238,6 +65333,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      JSRegIR ir;
      int *pc_to_insn = NULL;
      int *scratch = NULL;
@@ -194,7 +195,7 @@ diff --git a/quickjs.c b/quickjs.c
      int *sval = NULL;
      uint8_t *sentinel_bits = NULL;
      int *ev_off = NULL, *ev_cnt = NULL, *ev_cur = NULL;
-@@ -67781,6 +67890,7 @@
+@@ -65255,6 +65351,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      ir.insns = NULL;
      ir.n_insns = 0;
      ir.cap = 0;
@@ -202,7 +203,7 @@ diff --git a/quickjs.c b/quickjs.c
      ir.own_init = NULL;
      ir.own_undef = NULL;
      ir.aw_def = NULL;
-@@ -67927,6 +68037,7 @@
+@@ -65399,6 +65496,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          js_free(ctx, dout);
      }
      scratch = js_malloc(ctx, (bc_len + 8) * sizeof(int));
@@ -210,7 +211,7 @@ diff --git a/quickjs.c b/quickjs.c
      ev_off = js_malloc(ctx, (size_t)(n_edges + 1) * sizeof(int));
      ev_cnt = js_malloc(ctx, (size_t)(n_edges + 1) * sizeof(int));
      if (ns_ok > 0)
-@@ -68367,7 +68478,8 @@
+@@ -65812,7 +65910,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                       pre_e, cycle_reg, is_term, term_branch,
                                       stub_here, stub_pc };
              if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
@@ -220,7 +221,7 @@ diff --git a/quickjs.c b/quickjs.c
                  if (JS_HasException(ctx)) {
                      /* a named limit or a completeness failure: it is already
                         loud, so propagate it instead of failing closed */
-@@ -68840,6 +68952,10 @@
+@@ -66238,6 +66337,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          }
          if (has_call && win_size < 1)
              win_size = 1;
@@ -231,7 +232,7 @@ diff --git a/quickjs.c b/quickjs.c
          {
              int nforof = 0;
              for (i = 0; i < ir.n_insns; i++)
-@@ -68976,6 +69092,7 @@
+@@ -66362,6 +66465,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      js_free(ctx, ir.aw_reads);
      js_free(ctx, pc_to_insn);
      js_free(ctx, scratch);
@@ -239,7 +240,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_free(ctx, sval);
      js_free(ctx, phi_in);
      js_free(ctx, rcc_canon);
-@@ -69041,7 +69158,9 @@
+@@ -66420,7 +66524,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      int *in_depth = NULL, *out_depth = NULL;
      int *pred_off = NULL, *pred = NULL, *n_pred = NULL;
      int *ent_off = NULL, *ent = NULL, *out_off = NULL, *out = NULL;
@@ -250,16 +251,16 @@ diff --git a/quickjs.c b/quickjs.c
      uint8_t *reuse = NULL;
      int *cont = NULL, n_cont = 0;
      int *split_of = NULL, *copy_of = NULL, *home_slot_of_def = NULL;
-@@ -69963,6 +70082,8 @@
+@@ -67233,6 +67339,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              }
          }
          scratch = js_malloc(ctx, (peak + 2) * sizeof(int));
 +        popbuf = js_malloc(ctx, (peak + 2) * sizeof(int));
 +        popcap = peak + 2;
      }
-     /*
-      * One entry per phi, stack and promoted-slot alike: a stack phi comes from
-@@ -69974,7 +70095,7 @@
+     /* One entry per phi: a stack phi from a block's entry stack, a slot phi
+        from its entry slot state. */
+@@ -67242,7 +67350,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          phi_i = js_malloc(ctx, (nph > 0 ? nph : 1) * sizeof(int));
      }
      if (!ent_off || !out_off || !ent || !out || !ent_set || !ent_phi ||
@@ -268,7 +269,7 @@ diff --git a/quickjs.c b/quickjs.c
          goto done;
      {
          int eo = 0, oo = 0;
-@@ -70016,7 +70137,7 @@
+@@ -67284,7 +67392,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       split_of, copy_of, home_slot_of_def,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
@@ -277,7 +278,7 @@ diff --git a/quickjs.c b/quickjs.c
                      REGVM_DEFER("the stack-shape simulator refused an instruction (SSA)");
              }
              if (d != out_depth[b]) {
-@@ -70333,7 +70454,7 @@
+@@ -67585,7 +67693,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       split_of, copy_of, home_slot_of_def,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
@@ -286,7 +287,7 @@ diff --git a/quickjs.c b/quickjs.c
                      REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
                  prom_role = ev.slot_role;
                  prom_k = ev.slot_k;
-@@ -70671,7 +70792,8 @@
+@@ -67888,7 +67996,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                           n_ver, split_of, copy_of,
                                           home_slot_of_def, home_mode >= 1, 0 };
                      if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base,
@@ -296,7 +297,7 @@ diff --git a/quickjs.c b/quickjs.c
                          REGVM_DEFER("the stack-shape simulator refused an instruction (value owners)");
                      if (ev.split_v >= 0 && ev.split_src >= 0 &&
                          ev.split_src < n_values &&
-@@ -70998,7 +71120,7 @@
+@@ -68192,7 +68301,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       split_of, copy_of, home_slot_of_def,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base, &sim,
@@ -305,7 +306,7 @@ diff --git a/quickjs.c b/quickjs.c
                      REGVM_DEFER("the stack-shape simulator refused an instruction (intervals)");
                  if (sim.apply_homes && ev.split_v >= 0) {
                      if (lin[pos] < istart[ev.split_v])
-@@ -71116,7 +71238,7 @@
+@@ -68302,7 +68411,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       split_of, copy_of, home_slot_of_def,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &dd, push_base, &sim,
@@ -314,7 +315,7 @@ diff --git a/quickjs.c b/quickjs.c
                      REGVM_DEFER("the stack-shape simulator refused an instruction (last uses)");
                  if (sim.apply_homes && ev.split_v >= 0 &&
                      ev.split_src >= 0 && ev.split_src < n_values &&
-@@ -71452,7 +71574,8 @@
+@@ -68607,7 +68716,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                                       home_mode >= 1, 0 };
                                  if (regvm_sim_step(fd, bc, pos, scratch, &d2,
                                                     push_base, &sim, pv2, pd2,
@@ -324,7 +325,7 @@ diff --git a/quickjs.c b/quickjs.c
                                      bad = 1;
                                      break;
                                  }
-@@ -71677,6 +71800,7 @@
+@@ -68817,6 +68927,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      js_free(ctx, ent_set);
      js_free(ctx, ent_phi);
      js_free(ctx, scratch);

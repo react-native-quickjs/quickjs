@@ -1,8 +1,171 @@
+Subject: A baseline lowering tier that refuses nothing
+
+What this does
+  A baseline lowering tier that refuses nothing.
+
+Why we need it
+  A valid function can still be refused: a 5,000-case `switch` exceeds the liveness cap, a long `if` chain exceeds the CFG state cap, a 4,500-argument call site or a 5,000-parameter function exceeds the 4,096-register operand range, and a function with more than 65,535 property sites cannot name a PIC site. A register build has no stack interpreter to fall back to, so every one of those is a valid program the build rejects.
+
+What it adds
+  A third tier, entered whenever the optimising path defers: its value identity is the operand-stack depth, so it needs no liveness, no SSA (hence no settle, no phi), no promotion, no destructive reuse, no folding and no fusing -- the caps that bound those analyses do not exist. Values below the 16-bit register range are their own register; a deeper one lives in the top of the register file and is reached through two new opcodes, `ROP_slot_get r,u` / `ROP_slot_put u,r`, planted by a post-pass (`regvm_baseline_spill`) that inlines the stack shapers as real parallel copies and remaps `pc_to_insn`. The call window, the argument packing (`regvm_build_arg_array`), the ownership replay and the encoder are shared with the optimising path; the hot store handler's "does this instruction have a site" test is `f->pic != NULL` -- the same question `site != REG_IC_NONE` asks, with no second immediate compare.
+
+Needs a bytecode version bump
+  Yes. Regenerated register blobs are in `9999`.
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index 20cdc6e..df69d4c 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -2185,7 +2185,16 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_arg(uint8_t *ip, JSValue *fr, JSRegRun
+     int argc = rf->argc;
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ 
+-                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }
++                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }            L_ROP_put_arg_xfer:
++                { int slot = RD_U16(); int s = RD_REG();
++#if QJS_DRC
++                  regvm_put_arg(ctx, rf->arg_buf, rf->arg_owned, slot, regs[s]);
++                  regs[s] = JS_UNDEFINED;
++#else
++                  set_value(ctx, &rf->arg_buf[slot], regs[s]);
++                  regs[s] = JS_UNDEFINED;
++#endif
++                  REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+     return NULL;
+@@ -2549,6 +2558,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
+     int argc = rf->argc;
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
++                const uint8_t *i_start = rpc - 1;
+                 int d = RD_REG();
+                 int slot = RD_U16();
+                 JSAtom atom = RD_U32();
+@@ -2591,6 +2601,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
+     int argc = rf->argc;
+     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
++                const uint8_t *i_start = rpc - 1;
+                 int d = RD_REG();
+                 int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
+                 JSAtom atom = RD_U32();
+@@ -2746,6 +2757,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_var_ref(uint8_t *ip, JSValue *fr, JSReg
+ 
+                 { int d = RD_REG(); int slot = RD_U16();
+                   SET_REG_B(d,*rf->var_refs[slot]->pvalue); REGVM_NEXT(); }
++            /* The baseline tier's full-width stack slot. It indexes the
++               register file, not `rf->var_buf`, and borrows or stores exactly
++               as ROP_move does. */
+  exception:
+     rf->ret = JS_EXCEPTION;
+     return NULL;
+@@ -4409,7 +4423,8 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
+                 /* JS_PROP_THROW_STRICT: a write to a read-only property is a
+                    no-op in sloppy code and a TypeError in strict code. */
+                 {
+-                    if (JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
++                    if (site != REG_IC_NONE &&
++                        JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
+                         JSObject *p = JS_VALUE_GET_OBJ(regs[r]);
+                         JSRegPIC *e = &pic[site];
+ 
+@@ -5001,6 +5016,46 @@ static uint8_t *REGVM_CC regvm_s_ROP_shr(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+     return NULL;
+ }
+ 
++static uint8_t *REGVM_CC regvm_s_ROP_slot_get(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
++{
++    JSFunctionBytecode *b = rf->b;
++    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSRegPIC *pic = rf->pic;
++    uint8_t *rpc = ip;
++    int op = *rpc++;
++    JSValue ret_val = JS_UNDEFINED;
++    JSValue *regs = fr;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
++
++                { int d = RD_REG(); int slot = RD_U16();
++                  SET_REG_B(d,regs[slot]); REGVM_NEXT(); }
++ exception:
++    rf->ret = JS_EXCEPTION;
++    return NULL;
++}
++
++static uint8_t *REGVM_CC regvm_s_ROP_slot_put(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
++{
++    JSFunctionBytecode *b = rf->b;
++    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSRegPIC *pic = rf->pic;
++    uint8_t *rpc = ip;
++    int op = *rpc++;
++    JSValue ret_val = JS_UNDEFINED;
++    JSValue *regs = fr;
++    JSValue *arg_buf = rf->arg_buf;
++    int argc = rf->argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
++
++                { int slot = RD_U16(); int s = RD_REG();
++                  SET_REG_B(slot,regs[s]); REGVM_NEXT(); }
++ exception:
++    rf->ret = JS_EXCEPTION;
++    return NULL;
++}
++
+ static uint8_t *REGVM_CC regvm_s_ROP_special_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+@@ -6357,6 +6412,8 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
+     [ROP_debug] = regvm_s_ROP_debug,
+     [ROP_inc_branch_lt] = regvm_s_ROP_inc_branch_lt,
+     [ROP_inc_branch_lt_s] = regvm_s_ROP_inc_branch_lt_s,
++    [ROP_slot_get] = regvm_s_ROP_slot_get,
++    [ROP_slot_put] = regvm_s_ROP_slot_put,
+ };
+ 
+ 
+@@ -6591,6 +6648,8 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
+     [ROP_debug] = 1,
+     [ROP_inc_branch_lt] = 1,
+     [ROP_inc_branch_lt_s] = 1,
++    [ROP_slot_get] = 1,
++    [ROP_slot_put] = 1,
+ };
+ 
+ 
+diff --git a/quickjs-regvm.h b/quickjs-regvm.h
+index a3ea9e6..b9a0838 100644
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -585,6 +585,13 @@ typedef enum JSRegOpcode {
+        slow half that runs the two operations in order. */
+     ROP_inc_branch_lt, ROP_inc_branch_lt_s,
+ 
++    /* The baseline tier's full-width stack access. Its operand stack can be
++       deeper than a 16-bit register operand can name, so deep values are spilt
++       to slots at the top of the register file. slot_get reads slot (u) into
++       register (r); slot_put writes (r) back to (u). Both behave as ROP_move.
++       */
++    ROP_slot_get, ROP_slot_put,
++
+     ROP_COUNT
+ } JSRegOpcode;
+ 
+@@ -628,7 +635,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
+ /* The register bytecode's format version, checked per function record before
+    any instruction is parsed. Bump it whenever an opcode is added, removed or
+    renumbered, or an operand's width or meaning changes. */
+-#define REGVM_FORMAT_VERSION 18
++#define REGVM_FORMAT_VERSION 19
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */
 diff --git a/quickjs.c b/quickjs.c
-index ade8486..f2b28f7 100644
+index ca56d8d..437910a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -12253,7 +12253,6 @@ static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
+@@ -12035,7 +12035,6 @@ static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
  {
      return JS_ThrowTypeError(ctx, "not an object");
  }
@@ -10,19 +173,18 @@ index ade8486..f2b28f7 100644
  static JSValue JS_ThrowTypeErrorNotASymbol(JSContext *ctx)
  {
      return JS_ThrowTypeError(ctx, "not a symbol");
-@@ -24348,6 +24347,11 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+@@ -23926,6 +23925,10 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
      JSRegPIC *e;
      JSValue v;
  
-+    /* A site named REG_IC_NONE -- the baseline tier names one for every
-+       property read -- has no cache entry at all, so there is nothing to
-+       probe. */
++    /* A REG_IC_NONE site (the baseline tier names one for every property read)
++       has no cache entry. */
 +    if (unlikely(site == (int)REG_IC_NONE))
 +        return 0;
      if (unlikely(JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT))
          return 0;
      p = JS_VALUE_GET_OBJ(recv);
-@@ -26672,6 +26676,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+@@ -25946,6 +25949,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(add_imm_self_branch_s, regvm_t_add_imm_self_branch_s) \
      X(inc_branch_lt, regvm_t_inc_branch_lt) \
      X(inc_branch_lt_s, regvm_t_inc_branch_lt_s) \
@@ -31,23 +193,20 @@ index ade8486..f2b28f7 100644
      X(return, regvm_t_return) \
      X(return_undefined, regvm_t_return_undefined)
  
-@@ -29217,7 +29223,14 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
+@@ -28197,7 +28202,11 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
      int site = T_REG(7);
      int v = T_REG(9);
  
 -    {
-+    /* The baseline tier names no property site, so this function has no PIC
-+       table (`f->pic` is NULL) and the engine's own store owns the work, in the
-+       slow path below. The optimising tier gives every `s` operand a dense site
-+       and materialises the table before any site-bearing handler runs, so a
-+       non-NULL table is exactly "this instruction has a site" -- the same test
-+       `site != REG_IC_NONE` made, without a second immediate compare on the hot
-+       path (the table pointer is already in a register here). */
++    /* The baseline tier names no property site, so its functions have no PIC
++       table and the engine store runs in the slow path below. The optimising
++       tier materialises the table before any site-bearing handler runs, so a
++       non-NULL table means "this instruction has a site". */
 +    if (f->pic != NULL) {
          JSValue recv = FR(r);
  
          if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
-@@ -32036,6 +32049,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -30764,6 +30773,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              [ROP_get_local_field_2] = &&L_ROP_get_local_field_2,
              [ROP_get_local_field_3] = &&L_ROP_get_local_field_3,
              [ROP_get_arg_field] = &&L_ROP_get_arg_field,
@@ -56,7 +215,7 @@ index ade8486..f2b28f7 100644
          };
  #ifdef QJS_REGVM_COUNT
  #ifdef QJS_REGVM_DYNADJ
-@@ -32829,8 +32844,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -31491,8 +31502,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  { int slot = op - ROP_put_local_s0; int s = RD_REG();
                    set_value(ctx, &var_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
              L_ROP_get_arg:
@@ -66,16 +225,13 @@ index ade8486..f2b28f7 100644
                  { int slot = RD_U16(); int s = RD_REG();
  #if QJS_DRC
                    regvm_put_arg(ctx, arg_buf, arg_owned, slot, regs[s]);
-@@ -32851,6 +32865,18 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -31513,6 +31523,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_get_var_ref:
                  { int d = RD_REG(); int slot = RD_U16();
                    SET_REG_B(d,*var_refs[slot]->pvalue); REGVM_NEXT(); }
-+            /*
-+             * The baseline tier's full-width stack slot. It indexes the register
-+             * file, not `var_buf`: the stack area sits at the top of `regs`, so
-+             * the borrow/store behaviour is exactly ROP_move's -- SET_REG_B's
-+             * borrow under DRC, dup/free otherwise.
-+             */
++            /* The baseline tier's full-width stack slot. It indexes the
++               register file, not `var_buf` (the stack area is at the top of
++               `regs`), and borrows or stores exactly as ROP_move does. */
 +            L_ROP_slot_get:
 +                { int d = RD_REG(); int slot = RD_U16();
 +                  SET_REG_B(d,regs[slot]); REGVM_NEXT(); }
@@ -85,9 +241,9 @@ index ade8486..f2b28f7 100644
              L_ROP_put_var_ref:
                  { int slot = RD_U16(); int s = RD_REG();
                    set_value(ctx, var_refs[slot]->pvalue, js_dup(regs[s])); REGVM_NEXT(); }
-@@ -33310,7 +33336,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-                  * object itself, as there.
-                  */
+@@ -31952,7 +31971,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 /* JS_PROP_THROW_STRICT: a write to a read-only property is a
+                    no-op in sloppy code and a TypeError in strict code. */
                  {
 -                    if (JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
 +                    if (site != REG_IC_NONE &&
@@ -95,7 +251,7 @@ index ade8486..f2b28f7 100644
                          JSObject *p = JS_VALUE_GET_OBJ(regs[r]);
                          JSRegPIC *e = &pic[site];
  
-@@ -35704,6 +35731,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -34199,6 +34219,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
      int op = *rpc++;
      JSValue ret_val;
  
@@ -103,7 +259,7 @@ index ade8486..f2b28f7 100644
  #undef REGVM_NEXT
  #define REGVM_NEXT() return rpc
  
-@@ -37789,6 +37817,14 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -36050,6 +36071,14 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      REGVM_NEXT();
                  }
  
@@ -118,27 +274,23 @@ index ade8486..f2b28f7 100644
          default:
              JS_ThrowInternalError(ctx,
                                    "register VM: cold opcode %d has no case", op);
-@@ -43384,6 +43420,19 @@ typedef struct JSFunctionDef {
-      * interpreter.
-      */
+@@ -41613,6 +41642,15 @@ typedef struct JSFunctionDef {
+        retried with the frame authoritative: no slot promotion, reuse,
+        frame-read folding, hoisting or light frame. */
      uint8_t regvm_conservative;
-+    /*
-+     * Set when the baseline tier is building this function: value identity is
-+     * the operand-stack depth, there is no SSA, liveness, promotion, reuse,
-+     * fusion or PIC, and a depth past the register operand's range spills to a
-+     * slot at the top of the register file (ROP_slot_get/ROP_slot_put). It is
-+     * the third tier -- the one that refuses no parser-accepted shape -- after
-+     * the optimising lowering and the conservative retry.
-+     */
++    /* Set while the baseline tier builds this function: value identity is the
++       operand-stack depth, with no SSA, liveness, promotion, reuse, fusion or
++       PIC, and depths past the register operand's range spill to slots at the
++       top of the register file (ROP_slot_get/ROP_slot_put). The tier that
++       refuses no parser-accepted shape. */
 +    uint8_t regvm_baseline;
-+    /* The baseline tier's peak operand-stack depth, set by its builder. V (the
-+       size of the directly-encodable value range) is derived from it once the
-+       call window is known. */
++    /* The baseline tier's peak operand-stack depth. V is derived from it once
++       the call window is known. */
 +    int regvm_baseline_depth;
-     /* The reason the backend refused this function (a static string), for the
-        compile-time error and the report. NULL when it lowered. */
+     /* Why the backend refused this function (a static string), for the
+        compile-time error. NULL when it lowered. */
      const char *regvm_defer_why;
-@@ -59654,6 +59703,7 @@ typedef struct JSRegScanStats {
+@@ -57810,6 +57848,7 @@ typedef struct JSRegScanStats {
      long long max_cleanup;
      long long max_depth;
      long long encoded_funcs;     /* functions encoded whole */
@@ -146,30 +298,32 @@ index ade8486..f2b28f7 100644
      long long unencodable;       /* functions with an opcode the encoder refuses */
      long long encoded_insns;     /* register instructions emitted */
      long long encoded_bytes;     /* bytes of register bytecode */
-@@ -59675,7 +59725,8 @@ static JSRegScanStats js_regvm_stats;
-    is stable across dataflow iterations. Ids are pos * REGVM_V_STRIDE + k for
-    the k-th value an instruction pushes; phi ids are allocated above that
-    range. The stride is wider than any instruction's push count (the largest is
+@@ -57826,11 +57865,11 @@ static JSRegScanStats js_regvm_stats;
+ #define REGVM_MAX_ITERS 4096
+ #define REGVM_MAX_POOL (1 << 22)
+ 
+-/* A virtual value's id is derived from the instruction that defines it, so it
+-   is stable across dataflow iterations. Ids are pos * REGVM_V_STRIDE + k for
+-   the k-th value an instruction pushes; phi ids are allocated above that
+-   range. The stride is wider than any instruction's push count (the largest is
 -   dup3's 6). */
-+   dup3's 6). The baseline tier does not use this mapping -- its ids are stack
-+   depths -- so it can exceed this range without corrupting an optimising id. */
++/* A virtual value's id is derived from its defining instruction, so it is
++   stable across dataflow iterations: pos * REGVM_V_STRIDE + k for the k-th
++   pushed value, with phi ids above that range. The stride exceeds any push
++   count (the largest is dup3's 6). The baseline tier's ids are stack depths
++   and do not use this mapping. */
  #define REGVM_V_STRIDE 16
  
  /* Operand-stack effect of the instruction at `p`, with the escape prefix
-@@ -59935,6 +59986,78 @@ typedef struct JSRegInsn {
+@@ -58058,6 +58097,66 @@ typedef struct JSRegInsn {
      uint8_t origin;
  } JSRegInsn;
  
-+/*
-+ * A stack-shaping opcode (dup, swap, rot, ...) in the baseline tier. The
-+ * optimising path represents these as value-id aliases, so `regvm_lower_insn`
-+ * emits nothing; the baseline's identity model has no aliases, so the shaping
-+ * becomes an explicit parallel copy. The encoder records the permutation here
-+ * and the spill pass -- which runs once the layout, and therefore the stack
-+ * area, is known -- expands it. `at_insn` is the placeholder instruction's
-+ * index, so pc_to_insn keeps a distinct target for a branch that lands after
-+ * the shaper.
-+ */
++/* A stack-shaping opcode (dup, swap, rot, ...) in the baseline tier. The
++   optimising path aliases value ids and emits nothing; the baseline needs an
++   explicit parallel copy, which the spill pass expands once the stack area is
++   known. `at_insn` is the placeholder's index, so a branch landing after the
++   shaper keeps a distinct target. */
 +typedef struct JSRegBShape {
 +    int at_insn;
 +    int is_perm;        /* 1: replace the placeholder; 0: the lowering still runs */
@@ -178,20 +332,15 @@ index ade8486..f2b28f7 100644
 +    int32_t dst_id[8];  /* the value each target slot defines (== its depth) */
 +} JSRegBShape;
 +
-+/*
-+ * The baseline tier's per-instruction scratch, threaded through `sim->owner` so
-+ * the stack shapers can record their permutation for the spill pass.
-+ */
++/* The baseline tier's per-instruction scratch, threaded through `sim->owner`
++   for the stack shapers. */
 +typedef struct JSRegBScratch {
 +    JSRegBShape *shapes;
 +    int n_shapes, cap_shapes;
 +} JSRegBScratch;
 +
-+/*
-+ * Where each region of the baseline register layout starts. Defined here so the
-+ * encoder (which needs the frame size) and the spill pass (defined below it)
-+ * both see one type.
-+ */
++/* Where each region of the baseline register layout starts, shared by the
++   encoder and the spill pass. */
 +typedef struct JSRegBaselineLayout {
 +    int V;              /* depth < V is its own register (0..V) */
 +    int K;              /* spill temporaries at V..V+K */
@@ -202,12 +351,10 @@ index ade8486..f2b28f7 100644
 +                           stack area when something is deep */
 +} JSRegBaselineLayout;
 +
-+/* The spill pass's view of the layout and the value map. A value/temporary is
-+   named by an id; `ireg` maps it to its physical register, and -1 marks a deep
-+   value (a depth at or above V, which has no directly-encodable register).
-+   Spill temporaries live at ids `base..base+K-1` and map to physical registers
-+   `V..V+K-1`; keeping them above the deepest value id stops them colliding with
-+   the deep value ids they stand in for. */
++/* The spill pass's view of the layout and the value map. `ireg` maps an id to
++   its physical register, -1 for a deep value (depth >= V). Spill temporaries
++   are ids `base..base+K-1` in registers `V..V+K-1`, above the deepest value
++   id. */
 +typedef struct JSRegBlCtx {
 +    const int *ireg;    /* value/temp id -> physical register, -1 for a deep value */
 +    int n_values;       /* base + K */
@@ -235,47 +382,41 @@ index ade8486..f2b28f7 100644
  typedef struct JSRegIR {
      JSRegInsn *insns;
      int n_insns;
-@@ -60284,6 +60407,11 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
+@@ -58383,6 +58482,10 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
      [ROP_using_merge] = "rrr",
      [ROP_using_end] = "r",
      [ROP_using_check] = "rrb",
 +    /* the baseline tier's full-width stack access: a register (r) and a 16-bit
-+       slot (u). slot_get reads the slot into the register; slot_put writes the
-+       register to the slot. Both name `regs` slots, not `var_buf`. */
++       slot (u) of `regs`, not `var_buf` */
 +    [ROP_slot_get] = "ru",
 +    [ROP_slot_put] = "ur",
  };
  
  #if QJS_REGVM_THREAD && !defined(NDEBUG)
-@@ -64764,7 +64892,11 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+@@ -62512,7 +62615,10 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                      }
                      break;
                  case 's':
 -                    if (v < 0 || (uint32_t)v >= (uint32_t)pic_count) {
-+                    /* A PIC site index, or REG_IC_NONE when the tier emits no
-+                       PIC at all (the baseline tier forces every site to
-+                       NONE). */
++                    /* A PIC site index, or REG_IC_NONE (the baseline tier names
++                       no sites). */
 +                    if (v != REG_IC_NONE &&
 +                        (v < 0 || (uint32_t)v >= (uint32_t)pic_count)) {
                          JS_ThrowInternalError(ctx, "regvm: PIC site %u out of range", (uint32_t)v);
                          goto done;
                      }
-@@ -66477,6 +66609,14 @@ typedef struct JSRegSlotSim {
+@@ -64042,6 +64148,10 @@ typedef struct JSRegSlotSim {
      const int *home_slot_of_def;
      int apply_homes;
      int count_homes;
-+    /*
-+     * Private to the walk that owns this sim. The baseline tier's stack-shape
-+     * hook records a shaping instruction's permutation here (see
-+     * JSRegBScratch); every other walk leaves it NULL. A struct field rather
-+     * than a new regvm_sim_step parameter, so the encoder, liveness and
-+     * allocation calls keep their exact signatures.
-+     */
++    /* Private to the walk that owns this sim: the baseline tier's stack-shape
++       hook records a permutation here (see JSRegBScratch). A field rather than
++       a regvm_sim_step parameter, so the walks keep their signatures. */
 +    void *owner;
  } JSRegSlotSim;
  
- /* The state observed at one bytecode step. Keeping the pops and promoted-slot
-@@ -66718,6 +66858,7 @@ typedef struct JSRegEncodeStep {
+ /* The state observed at one bytecode step, so the liveness and allocation
+@@ -64275,6 +64385,7 @@ typedef struct JSRegEncodeStep {
      const int *ev_off, *ev_src, *ev_dst;
      int pre_e, cycle_reg, is_term, term_branch, stub_here;
      const int32_t *stub_pc;
@@ -283,7 +424,7 @@ index ade8486..f2b28f7 100644
  } JSRegEncodeStep;
  
  /* Does `v` appear in stack[0..n)? */
-@@ -66737,10 +66878,8 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+@@ -64294,10 +64405,8 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
  {
      JSRegEncodeStep *st = opaque;
      int d = ev->depth, np = ev->np, def_begin, found_def = 0, i;
@@ -295,38 +436,31 @@ index ade8486..f2b28f7 100644
  
      /* A branch into this block must land before the edge copies at its target. */
      st->pc_to_insn[pos] = st->ir->n_insns;
-@@ -66765,12 +66904,54 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+@@ -64321,13 +64430,35 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+             return -1;
      }
      def_begin = st->ir->n_insns;
-     /*
+-    /*
 -     * A drop removes the control-stack entry only when it drops the last
 -     * stack reference to the sentinel. Stack shapers alias their inputs, so
 -     * `dup3; drop` (the for-await step) drops a copy while the loop's own
 -     * sentinel is still below it; that drop is an ordinary no-op.
-+     * The baseline tier's stack shapers (dup, swap, rot, ...) have no register
-+     * lowering: the optimising path aliases the pushed ids to the popped ones,
-+     * and `regvm_lower_insn` emits nothing. The identity model needs a real
-+     * parallel copy, and its source and destination registers -- including the
-+     * stack area above every directly-encodable register -- are not known until
-+     * the spill pass runs. The ids regvm_pushed chose for the pushed slots (`pv`,
-+     * with `pdef[j] == 0` for a copy) are recorded here and expanded by the
-+     * spill pass at the recorded index, so pc_to_insn keeps a distinct target
-+     * for a branch that lands after the shaper. `pure` shapes skip the lowering
-+     * entirely; the `get_field2`/`get_array_el2` kept receiver materialises its
-+     * value through the lowering and only needs the receiver copy added.
-      */
+-     */
 -    if (bc[pos] == OP_drop && np == 1 && d >= 1 && st->sentinel_bits &&
++    /* The baseline tier's stack shapers: the identity model needs a real
++       parallel copy, whose registers are only known after the spill pass. The
++       ids regvm_pushed chose (`pv`, with `pdef[j] == 0` for a copy) are
++       recorded for the spill pass at this index. Pure shapes skip the lowering;
++       a `get_field2`/`get_array_el2` kept receiver only needs the receiver copy
++       added. */
 +    if (super_hook && regvm_baseline_is_shaper(bc, pos)) {
 +        JSRegBScratch *bs = sim->owner;
 +        int32_t dst_ids[8];
 +        int j, at;
-+        /*
-+         * A pure permutation has no lowering; a placeholder keeps its position
-+         * an instruction boundary so pc_to_insn stays consistent for a branch
-+         * that lands after the shaper. The spill pass replaces the placeholder
-+         * with the expanded copies. `pv[j]` is the value each pushed slot takes
-+         * (an alias of a popped value), `dst_ids[j]` the slot's own depth.
-+         */
++        /* A pure permutation has no lowering; a placeholder keeps its position
++           an instruction boundary, and the spill pass replaces it with the
++           copies. `pv[j]` is each pushed slot's source, `dst_ids[j]` the slot's
++           own depth. */
 +        for (j = 0; j < ev->ns && j < 8; j++)
 +            dst_ids[j] = push_base[pos] + j;
 +        at = st->ir->n_insns;
@@ -335,36 +469,23 @@ index ade8486..f2b28f7 100644
 +        if (regvm_baseline_record_shape(st->ctx, bs, at, ev->np, ev->ns,
 +                                        pv, dst_ids))
 +            return -1;
-+        /*
-+         * The *pushed* id must be the slot's own depth, not the alias
-+         * `regvm_pushed` chose. The optimising path aliases because its value
-+         * ids *are* registers, so reading the source id reads the value. The
-+         * baseline's identity model instead performs a real parallel copy of
-+         * the registers, and after that copy the source id's register holds a
-+         * different value. The pushed slot's value is now whatever the copy
-+         * left in the destination register, and the destination register is
-+         * the slot's own depth's register, so the slot must name its depth.
-+         * (The shape record above keeps the true source ids, so the copy still
-+         * reads them.) Without this the slot name and the register contents
-+         * disagree and a following instruction -- here the `undefined`/`swap`
-+         * that stages a spread apply -- reads its arguments in the wrong order.
-+         */
++        /* The pushed id must be the slot's own depth, not `regvm_pushed`'s
++           alias: after the baseline's parallel copy the destination register,
++           which is the depth's register, holds the value. The shape record
++           keeps the true source ids for the copy. */
 +        for (j = 0; j < ev->ns && j < 8; j++)
 +            pv[j] = dst_ids[j];
 +    } else if (bc[pos] == OP_drop && np == 1 && d >= 1 && st->sentinel_bits &&
          scratch[d - 1] >= 0 && scratch[d - 1] < st->n_values &&
          st->sentinel_bits[scratch[d - 1]] &&
          !regvm_stack_has(scratch, d - 1, scratch[d - 1])) {
-@@ -66783,6 +66964,17 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+@@ -64340,6 +64471,14 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
                                  sim->home_of, sim->n_values)) {
          return -1;
      }
-+    /*
-+     * A kept receiver (`get_field2`, `get_array_el2`) aliases the receiver to
-+     * the value below the property: the optimising path resolves both to one
-+     * register, so nothing is copied. The identity model has two ids -- the
-+     * receiver's depth and the property's -- so the copy is explicit here.
-+     */
++    /* A kept receiver (`get_field2`, `get_array_el2`) has two ids in the
++       identity model (the receiver's depth and the property's), so the copy is
++       explicit. */
 +    if (super_hook && np > 0 && regvm_keeps_receiver(bc[pos])) {
 +        int32_t mv[2] = { push_base[pos], scratch[d - np] };
 +        if (regvm_ir_add(st->ctx, st->ir, ROP_move, pos, mv, 2))
@@ -373,7 +494,7 @@ index ade8486..f2b28f7 100644
      if (sim->apply_homes && sim->home_slot_of_def &&
          sim->home_slot_of_def[pos] >= 0) {
          for (i = def_begin; i < st->ir->n_insns; i++) {
-@@ -66846,6 +67038,7 @@ static int regvm_own_has_dest(uint16_t rop)
+@@ -64394,6 +64533,7 @@ static int regvm_own_has_dest(uint16_t rop)
      case ROP_get_local: case ROP_get_local_s0: case ROP_get_local_s1:
      case ROP_get_local_s2: case ROP_get_local_s3:
      case ROP_get_arg: case ROP_get_var_ref: case ROP_get_global:
@@ -381,15 +502,13 @@ index ade8486..f2b28f7 100644
      case ROP_make_closure: case ROP_rest:
      case ROP_unary: case ROP_binary: case ROP_mul: case ROP_add:
      case ROP_sub: case ROP_div: case ROP_mod: case ROP_pow:
-@@ -67938,6 +68131,127 @@ static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
+@@ -65373,6 +65513,119 @@ static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
  
  #define REGVM_UNENCODABLE(why) do { unc_why = (why); unencodable = 1; } while (0)
  
-+/* The number of contiguous registers a call (or one of the other window users)
-+   needs at its base. The lowering names `REGVM_WIN(0)..REGVM_WIN(n-1)` for a
-+   window of `n` slots, and the encoder reserves them above every value
-+   register. Shared by the encoder and the baseline tier, which sizes its spill
-+   region against it. */
++/* The number of contiguous registers a call (or another window user) needs
++   at its base: `REGVM_WIN(0)..REGVM_WIN(n-1)`, reserved above every value
++   register. Shared by the encoder and the baseline tier. */
 +static int regvm_win_size(const JSRegIR *ir)
 +{
 +    int win_size = 0, has_call = 0, i;
@@ -404,8 +523,8 @@ index ade8486..f2b28f7 100644
 +            if (argc > win_size)
 +                win_size = argc;
 +        } else if (rop == ROP_slot_get || rop == ROP_slot_put) {
-+            /* the baseline tier's spill accesses index the stack area, not the
-+               value registers; nothing is reserved for them. */
++            /* the baseline tier's spill accesses index the stack area; nothing
++               is reserved for them */
 +            ;
 +        } else if (rop == ROP_object_fill) {
 +            int n = ir->insns[i].ops[2];
@@ -468,17 +587,11 @@ index ade8486..f2b28f7 100644
 +    return win_size;
 +}
 +
-+/*
-+ * The baseline tier's stack-shape record. The optimising path never emits a
-+ * register instruction for a shaping opcode: `regvm_lower_insn` returns 0 and
-+ * `regvm_pushed` aliases each pushed id to a popped one, so the ids resolve to
-+ * one register. The baseline's identity model has no aliases, so a shaping
-+ * opcode becomes an explicit parallel copy. The ids regvm_pushed chose for the
-+ * pushed slots (`src_id[j]`, with `dst_id[j]` its own depth) are recorded here
-+ * and expanded by `regvm_baseline_spill` once the layout, and therefore the
-+ * stack area, is known. Recording here -- before the edge moves run -- means the
-+ * expansion sits ahead of the edge moves that read the shaped values.
-+ */
++/* The baseline tier's stack-shape record: the source ids regvm_pushed chose
++   (`src_id[j]`, with `dst_id[j]` the slot's depth), expanded into a parallel
++   copy by `regvm_baseline_spill` once the stack area is known. Recorded before
++   the edge moves, so the expansion precedes the moves that read the shaped
++   values. */
 +static int regvm_baseline_record_shape(JSContext *ctx, JSRegBScratch *bs,
 +                                       int at, int np, int ns,
 +                                       const int32_t *src_id,
@@ -509,24 +622,18 @@ index ade8486..f2b28f7 100644
  static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                         const uint8_t *bc, int bc_len,
                                         const uint8_t *reuse,
-@@ -67977,10 +68291,36 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -65412,10 +65665,30 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      const char *unc_why = "?";
      int enc_ok = 0;             /* the rcc table is handed to the bytecode */
      int cycle_reg = -1;
 +    int pc_cap = 0;             /* capacity of pc_to_insn, in pcs */
-+    /* the physical register the IR was encoded against: value registers, then
-+       the scratch, then the window. The baseline tier uses it to place its
-+       stack area above the window and to size its spill rewrite. */
++    /* The physical register count the IR was encoded against (values, scratch,
++       window); the baseline tier places its stack area above it. */
 +    int encode_reg_count = 0;
      uint8_t *phi_in = NULL;
      int *rcc_canon = NULL;
-+    /*
-+     * The baseline tier's stack-shape scratch. A shaping opcode has no register
-+     * lowering -- the optimising path represents it with value-id aliases and
-+     * the baseline's identity model has none -- so the encoder's sim hook
-+     * records its permutation here for the spill pass to expand once the
-+     * layout is known.
-+     */
++    /* The baseline tier's stack-shape scratch, filled by the encoder's sim hook
++       for the spill pass. */
 +    JSRegBScratch bscr;
 +    int bscr_active = 0;
 +    int n_enc;              /* value count the encoder sees; the baseline raises
@@ -536,8 +643,8 @@ index ade8486..f2b28f7 100644
      int b, i, k, s, pos, d, np, ns, fall, target, u;
  
 +    memset(&bscr, 0, sizeof(bscr));
-+    /* The baseline tier's sim hook records stack shapers; every other build
-+       leaves the owner NULL so `regvm_encode_step_hook` ignores them. */
++    /* The baseline tier's sim hook records stack shapers; other builds leave
++       the owner NULL. */
 +    bscr_active = fd->regvm_baseline != 0;
 +    n_enc = n_values;
 +
@@ -546,22 +653,21 @@ index ade8486..f2b28f7 100644
      ir.insns = NULL;
      ir.n_insns = 0;
      ir.cap = 0;
-@@ -67992,7 +68332,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -65427,7 +65700,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      ir.aw_n = 0;
      ir.aw_scanned = 0;
      ir.aw_last_win = -1;
 -    if (n_values > 0) {
-+    /* The baseline tier has no SSA and no argument retargeting, so the W3a
-+       staging index is pure overhead and, worse, its per-value arrays grow with
-+       the peak depth. Disable it there. */
++    /* The baseline tier has no SSA or argument retargeting, and the staging
++       index's arrays grow with the peak depth, so it is disabled there. */
 +    if (n_values > 0 && !fd->regvm_baseline) {
          int32_t *awd = js_malloc(ctx, (size_t)n_values * sizeof(int32_t));
          int32_t *awr = js_malloc(ctx, (size_t)n_values * sizeof(int32_t));
          if (awd && awr) {
-@@ -68323,10 +68666,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
-      * A branch resolves against a bytecode pc, or against a synthetic pc above
-      * the bytecode that names an out-of-line stub.
-      */
+@@ -65745,10 +66020,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     }
+ 
+     /* A branch target is a bytecode pc, or a synthetic pc naming a stub. */
 -    pc_to_insn = js_malloc(ctx, (size_t)(bc_len + n_stubs) * sizeof(int));
 +    pc_cap = bc_len + n_stubs + 2 * n_blocks + 64;
 +    pc_to_insn = js_malloc(ctx, (size_t)pc_cap * sizeof(int));
@@ -572,7 +678,7 @@ index ade8486..f2b28f7 100644
          pc_to_insn[i] = -1;
  
      {
-@@ -68565,7 +68909,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -65971,7 +66247,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              JSRegStepEv ev;
              JSRegSlotSim sim = { slot_ok, ok_index, sval, home_of, n_home_values,
                                   split_of, copy_of, home_slot_of_def,
@@ -582,7 +688,7 @@ index ade8486..f2b28f7 100644
              JSRegEncodeStep step = { ctx, &ir, pc_to_insn, ireg, reuse, fd,
                                       slot_ok, ok_index, sval, n_values,
                                       sentinel_bits, ev_off, ev_src, ev_dst,
-@@ -68635,6 +68980,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66038,6 +66315,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              goto refused;
      }
  
@@ -590,23 +696,23 @@ index ade8486..f2b28f7 100644
      if (!fd->regvm_conservative)
          regvm_fold_frame_reads(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
                             n_values, phi_in);
-@@ -68653,6 +68999,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66056,6 +66334,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                             n_values);
      regvm_fuse_inc_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                            n_values, ireg);
 +    }
      /*
-      * Forward a frame read to a value still resident in its register.
-      *
-@@ -68669,6 +69016,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
-      * this pass extends must not be mistaken for dead and have its reference moved
-      * away.
+      * Forward a frame read to a value still in its register: a local stored
+      * earlier in the same block can be read from the stored value's register.
+@@ -66067,6 +66346,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+      * Runs before the transfer pass, so the use added here keeps the value from
+      * looking dead.
       */
 +    if (!fd->regvm_baseline)
      {
          int *bdef = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
          int *bval = js_malloc_rt(ctx->rt, (size_t)(fd->var_count + 1) * sizeof(int));
-@@ -68810,8 +69158,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66195,8 +66475,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          js_free(ctx, ins_hi);
          js_free(ctx, lreg);
      }
@@ -618,7 +724,7 @@ index ade8486..f2b28f7 100644
  #if QJS_REGVM_COUNT
      {
          int _i;
-@@ -68827,16 +69176,20 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66212,16 +66493,19 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          }
      }
  #endif
@@ -634,56 +740,53 @@ index ade8486..f2b28f7 100644
 -       the plain-store and release-set consumers follow. */
 -    regvm_own_analyze(ctx, &ir, n_blocks, bstart, succ, ireg, n_values,
 -                      reg_count, cycle_reg);
-+    /* Section 6.1: the physical-register ownership state. The baseline tier
-+       runs it too -- it drives the C1 fill list -- but the operand-stack model
-+       it uses ignores values that live in call windows, and a baseline spill
-+       temporary is outside its domain for the same reason. */
++    /* The physical-register ownership state, also run by the baseline tier for
++       the fill list. Call-window values and baseline spill temporaries are
++       outside its domain. */
 +    if (!fd->regvm_baseline)
 +        regvm_own_analyze(ctx, &ir, n_blocks, bstart, succ, ireg, n_values,
 +                          reg_count, cycle_reg);
  #ifdef QJS_REGVM_COUNT
-     /* Dump the finished register stream, so the compiler's output can be read
-        statically instead of inferred from counters. Numeric opcodes; the tool
-@@ -68860,13 +69213,21 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
-     /* X3b: fuse adjacent property-read chains. Runs after the allocator and the
-        ownership analysis so neither sees the fused opcode; before the site
-        assignment below, which gives each of its two `s` operands its own PIC
--       site. */
+     /* Dump the finished register stream with numeric opcodes. */
+     if (REGVM_KNOB("REGVM_DUMP")) {
+@@ -66240,15 +66524,18 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                 fprintf(stderr, "##IREG## %d %d\n", i, ireg[i]);
+     }
+ #endif
+-    /* Fuse adjacent property-read chains, after the allocator and the
+-       ownership analysis and before the site assignment, which gives each `s`
+-       operand its own site. */
 -    regvm_fuse_field_chain(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 -                           bstart, n_blocks);
-+       site.
-+     *
-+     * The baseline tier does not fuse: its stacking shapers are recorded as IR
-+     * indices by the encode walk above, and a fusion that drops an instruction
-+     * compacts the IR, leaving those indices stale. The tier has no allocator
-+     * for a fusion to save work for anyway. */
++    /* Fuse adjacent property-read chains, after the allocator and the ownership
++       analysis and before the site assignment, which gives each `s` operand its
++       own site. Not in the baseline tier: its shapers are recorded as IR
++       indices, which a fusion would make stale. */
 +    if (!fd->regvm_baseline)
 +        regvm_fuse_field_chain(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 +                               bstart, n_blocks);
-     /* X6: fuse `mul` into the `add`/`sub` that consumes its product. Runs
--       beside the chain fusion, for the same reason. */
+     /* Fuse `mul` into the `add`/`sub` that consumes its product, beside the
+-       chain fusion and for the same reason. */
 -    regvm_fuse_arith_pair(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 -                          bstart, n_blocks);
-+       beside the chain fusion, for the same reason, and is skipped by the
-+       baseline tier for the same reason. */
++       chain fusion and skipped by the baseline tier for the same reason. */
 +    if (!fd->regvm_baseline)
 +        regvm_fuse_arith_pair(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 +                              bstart, n_blocks);
-     /*
-      * Slot-in-opcode for the fused frame read. 95% of frame accesses name a slot
-      * below 16 and 55% below 4, so for those the slot operand is pure extraction
-@@ -68934,16 +69295,31 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     /* Slot-in-opcode for the fused frame read: for small slots the opcode names
+        the slot and the operand is dropped, shifting the atom and site down. */
+     for (i = 0; i < ir.n_insns; i++) {
+@@ -66299,18 +66586,26 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+ 
+         if (!fmt)
              continue;
-         /* Every `s` operand gets its own dense site: an opcode may carry more
-            than one (the X3b fused chain read has two), and each operand is a
+-        /* Every `s` operand gets its own dense site: an opcode may carry more
+-           than one (the X3b fused chain read has two), and each operand is a
 -           distinct property site. */
-+           distinct property site. The baseline tier is off the hot path by
-+           construction and has no PIC, so it names no site: each operand keeps
-+           the REG_IC_NONE its lowering wrote, and the hot handlers learn "no
-+           cache" from the NULL table rather than from a per-instruction site
-+           compare (the table is non-NULL exactly when the tier emitted sites).
-+           A function with more than 65,535 property reads therefore has no site
-+           index to overflow. */
++        /* Every `s` operand gets its own dense site (the fused chain read has
++           two). The baseline tier names none: its operands keep REG_IC_NONE,
++           and its functions have a NULL table, so a function with more than
++           65,535 property reads has no site index to overflow there. */
          for (sp = fmt; (sp = strchr(sp, 's')) != NULL; sp++) {
              sitepos = (int)(sp - fmt);
 +            if (fd->regvm_baseline) {
@@ -693,9 +796,7 @@ index ade8486..f2b28f7 100644
              if (fd->regvm_pic_count >= UINT16_MAX) {
 -                JS_ThrowInternalError(ctx, "regvm: too many PIC sites");
 -                goto done;
-+                /* More than 65,535 property sites in one function: no site
-+                   index can name them. Not a shape the baseline could take
-+                   differently, so this is a genuine (if pathological) refusal. */
++                /* More than 65,535 property sites in one function: refuse. */
 +                REGVM_UNENCODABLE("too many PIC sites");
 +                break;
              }
@@ -707,20 +808,20 @@ index ade8486..f2b28f7 100644
  
  #ifdef QJS_REGVM_COUNT
      for (i = 0; i + 1 < ir.n_insns; i++)
-@@ -68957,7 +69333,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
-      * runs after the removing passes, so an operand a fusion dropped is checked
-      * against the program that is actually emitted.
-      */
+@@ -66320,7 +66615,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+        of a never-defined value is a compiler modelling gap, so the function is
+        refused. Runs after the removing passes, on the program actually emitted.
+        */
 -    if (!REGVM_KNOB("REGVM_NOVERIFY") && defined && n_values > 0) {
 +    if (!REGVM_KNOB("REGVM_NOVERIFY") && defined && n_values > 0 &&
 +        !fd->regvm_baseline) {
          for (i = 0; i < ir.n_insns; i++) {
              const char *fmt = regvm_rop_fmt[ir.insns[i].rop];
              for (k = 0; fmt && fmt[k]; k++) {
-@@ -68980,78 +69357,56 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
-          * a call with no arguments still names the base. The window is reserved
-          * above every value register, so it never aliases a live value.
-          */
+@@ -66339,78 +66635,46 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     {
+         /* Size the argument window from the widest call; a call with no
+            arguments still names the base. */
 -        int win_size = 0, has_call = 0, nreg;
 -        for (i = 0; i < ir.n_insns; i++) {
 -            int rop = ir.insns[i].rop;
@@ -796,16 +897,11 @@ index ade8486..f2b28f7 100644
 +        int win_size = regvm_win_size(&ir), nreg;
 +
 +        if (fd->regvm_baseline) {
-+            /*
-+             * The baseline tier places its stack area above every value
-+             * register, the spill temporaries, the scratch and the call window,
-+             * so every register operand the encoder emits is below 4,096 even
-+             * when the operand stack is deeper. `V` is the largest depth whose
-+             * register fits; a depth at or above it goes through a slot.
-+             * `reg_count` here is `n_values` (the baseline passes one register
-+             * per value and builds `ireg` as the identity below V), so growing
-+             * it to V+K is what reserves the temporaries.
-+             */
++            /* The baseline tier puts its stack area above every value register,
++               the spill temporaries, the scratch and the call window, so every
++               encoded register operand stays below 4,096. `V` is the largest
++               depth whose register fits. Growing `reg_count` (here `n_values`)
++               to V+K reserves the temporaries. */
 +            JSRegBaselineLayout blay;
 +            JSRegBlCtx bctx;
 +            int vv;
@@ -813,16 +909,11 @@ index ade8486..f2b28f7 100644
 +            regvm_baseline_layout(fd->regvm_baseline_depth, win_size, &blay);
 +            reg_count = blay.nreg;
 +            n_enc = blay.nreg;
-+            /*
-+             * Two maps. `bl_val` is the spill pass's value view: one entry per
-+             * operand-stack depth, `d` below V and -1 above it (a deep value
-+             * reached through a slot). `bl_map` is the encoder's view, handed
-+             * in place of the caller's allocation: every value id below V is
-+             * its own register and the K spill temporaries take ids
-+             * `V .. V+K-1`, each its own register. The spill pass replaces
-+             * every deep operand with a temporary, so no deep id reaches the
-+             * encoder and `bl_map` needs no -1 entry.
-+             */
++            /* Two maps. `bl_val`, the spill pass's view: one entry per depth,
++               `d` below V and -1 above. `bl_map`, the encoder's view: every id
++               below V is its own register and the K temporaries are ids `V ..
++               V+K-1`. The spill pass removes every deep operand, so `bl_map`
++               needs no -1. */
 +            bl_val = js_malloc(ctx, (size_t)(fd->regvm_baseline_depth + 1) *
 +                                    sizeof(int));
 +            bl_map = js_malloc(ctx, (size_t)(n_enc > 0 ? n_enc : 1) * sizeof(int));
@@ -846,7 +937,7 @@ index ade8486..f2b28f7 100644
          {
              int nforof = 0;
              for (i = 0; i < ir.n_insns; i++)
-@@ -69066,6 +69421,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66425,6 +66689,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              }
          }
          nreg = reg_count + regvm_reserved_regs(&ir, win_size);
@@ -854,7 +945,7 @@ index ade8486..f2b28f7 100644
          {
              int er;
              fd->regvm_rcc = NULL;
-@@ -69078,7 +69434,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66437,7 +66702,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                                                are two bytes */,
                                               reg_count,
                                               fd->cpool_count, fd->regvm_pic_count,
@@ -863,23 +954,21 @@ index ade8486..f2b28f7 100644
                                               pc_to_insn, bc_len + n_stubs_used,
                                               win_size, cycle_reg, &fd->regvm_code,
                                               &fd->regvm_len,
-@@ -69106,6 +69462,15 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66461,6 +66726,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              }
              if (er)
                  goto done;
-+            /*
-+             * The baseline tier's frame has to hold the stack area above the
-+             * registers the encoder placed; the encoder only knows V+K.
-+             */
++            /* The baseline frame must hold the stack area above the V+K
++               registers the encoder placed. */
 +            if (fd->regvm_baseline) {
 +                JSRegBaselineLayout blay;
 +                regvm_baseline_layout(fd->regvm_baseline_depth, win_size, &blay);
 +                fd->regvm_reg_count = blay.total;
 +            }
-             /*
-              * C1's `undefined` list. The register area is zeroed first (an
-              * uncounted integer 0, which is what the store handlers' old-value
-@@ -69126,7 +69491,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+             /* The `undefined` list. The area is zeroed first, so only registers
+                whose value can be observed before it is written need
+                `undefined`; scratch, window and handshake are always listed.
+@@ -66473,7 +66745,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                  for (k = 0; k < reg_count; k++)
                      if (ir.own_undef && ir.own_undef[k])
                          nf++;
@@ -888,7 +977,7 @@ index ade8486..f2b28f7 100644
                      /* Most registers are live-in: a list is not worth a walk. */
                      fd->regvm_fill = NULL;
                      fd->regvm_fill_count = 0;
-@@ -69169,6 +69534,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66516,6 +66788,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      *p_refused = 1;
      rc = 0;
   done:
@@ -898,22 +987,22 @@ index ade8486..f2b28f7 100644
  #ifdef QJS_REGVM_RCCHECK
      js_free(ctx, ir.own_plain);
      js_free(ctx, ir.own_rel);
-@@ -69318,7 +69686,14 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -66652,7 +66927,14 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      long long peak_live = 0;
      int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
      int retry = 0;
 +    int deferred = 0;
      const char *defer_why = "?";
 +    if (REGVM_KNOB("REGVM_BASELINE_ALL")) {
-+        /* Force every function through the baseline tier, to prove the tier
-+           changes no observable behaviour. Return before any analysis. */
++        /* Force every function through the baseline tier. Return before any
++           analysis. */
 +        *pdeferred = 1;
 +        return 0;
 +    }
      if (REGVM_KNOB("REGVM_FORCE_DEFER"))
          REGVM_DEFER("forced by REGVM_FORCE_DEFER");
      const char *enc_why = NULL;
-@@ -69559,8 +69934,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -66856,8 +67138,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          out_pool += out_depth[b];
      }
      if (ent_pool > REGVM_MAX_POOL || out_pool > REGVM_MAX_POOL) {
@@ -925,7 +1014,7 @@ index ade8486..f2b28f7 100644
      }
  
      /*
-@@ -70394,7 +70770,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -67590,7 +67873,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  JSRegStepEv ev;
                  JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                       split_of, copy_of, home_slot_of_def,
@@ -934,7 +1023,7 @@ index ade8486..f2b28f7 100644
                  if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                     pv, pdef, &ev, popbuf, popcap, NULL, NULL))
                      REGVM_DEFER("the stack-shape simulator refused an instruction (SSA)");
-@@ -70509,8 +70885,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -67691,8 +67974,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          size_t nbits;
          words = (n_values + 63) / 64;
          if ((long long)n_blocks * words > REGVM_MAX_POOL) {
@@ -946,7 +1035,7 @@ index ade8486..f2b28f7 100644
          }
          nbits = (size_t)n_blocks * words * sizeof(uint64_t);
          is_const_push = js_mallocz(ctx, (size_t)n_values);
-@@ -70581,7 +70958,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -67761,7 +68045,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  int prom_role, prom_k;
                  JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                       split_of, copy_of, home_slot_of_def,
@@ -955,7 +1044,7 @@ index ade8486..f2b28f7 100644
                  if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                     pv, pdef, &ev, popbuf, popcap, NULL, NULL))
                      REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
-@@ -70919,7 +71296,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -68064,7 +68348,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      JSRegStepEv ev;
                      JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of,
                                           n_ver, split_of, copy_of,
@@ -965,7 +1054,7 @@ index ade8486..f2b28f7 100644
                      if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base,
                                         &sim, pv, pdef, &ev, popbuf, popcap,
                                         NULL, NULL))
-@@ -71247,7 +71625,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -68369,7 +68654,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  JSRegStepEv ev;
                  JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                       split_of, copy_of, home_slot_of_def,
@@ -974,7 +1063,7 @@ index ade8486..f2b28f7 100644
                  if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base, &sim,
                                     pv, pdef, &ev, popbuf, popcap, NULL, NULL))
                      REGVM_DEFER("the stack-shape simulator refused an instruction (intervals)");
-@@ -71365,7 +71743,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -68479,7 +68764,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  JSRegStepEv ev;
                  JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                       split_of, copy_of, home_slot_of_def,
@@ -983,7 +1072,7 @@ index ade8486..f2b28f7 100644
                  if (regvm_sim_step(fd, bc, pos, scratch, &dd, push_base, &sim,
                                     pv, pdef, &ev, popbuf, popcap, NULL, NULL))
                      REGVM_DEFER("the stack-shape simulator refused an instruction (last uses)");
-@@ -71700,7 +72078,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -68783,7 +69068,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                  JSRegSlotSim sim = { slot_ok, ok_index, sst,
                                                       home_of, n_ver, split_of,
                                                       copy_of, home_slot_of_def,
@@ -992,7 +1081,7 @@ index ade8486..f2b28f7 100644
                                  if (regvm_sim_step(fd, bc, pos, scratch, &d2,
                                                     push_base, &sim, pv2, pd2,
                                                     &ev, popbuf, popcap,
-@@ -71851,6 +72229,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -68919,6 +69204,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              REGVM_VERIFY_DEAD_END(enc_why ? enc_why : "the encoder refused");
              regvm_report_refusal(ctx, fd, enc_why ? enc_why : "?");
              *pdeferred = 1;
@@ -1000,16 +1089,16 @@ index ade8486..f2b28f7 100644
              rc = 0;
              goto done;
          }
-@@ -71913,7 +72292,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -68981,7 +69267,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      rc = 0;
      goto done;
   deferred:
 -    if (!fd->regvm_conservative) {
 +    if (!fd->regvm_conservative && !fd->regvm_baseline) {
-         /*
-          * The optimising lowering refused a shape. Retry the whole build once
-          * with the frame authoritative before giving up on the function.
-@@ -71923,13 +72302,19 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+         /* The optimising lowering refused a shape: retry the whole build once
+            with the frame authoritative. */
+         fd->regvm_conservative = 1;
+@@ -68989,13 +69275,19 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          rc = 0;
          goto done;
      }
@@ -1034,18 +1123,15 @@ index ade8486..f2b28f7 100644
      rc = 0;
   done:
      js_free(ctx, bof);
-@@ -72153,8 +72538,19 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
-          * Success, not an error: the function is still created.
-          */
+@@ -69209,8 +69501,16 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
+         /* A shape the CFG cannot express is refused: no register program is
+            emitted. The function is still created. */
          if (deferred) {
 -            rc = 0;
 -            goto done;
-+            /*
-+             * The optimising lowering refused this shape twice. Hand the
-+             * function to the baseline tier, which refuses nothing: it is a
-+             * direct translation of the stack bytecode with no analysis. If it
-+             * too fails (a modelling gap, not a shape), the error propagates.
-+             */
++            /* Refused twice: hand the function to the baseline tier, a direct
++               translation of the stack bytecode. If it too fails (a modelling
++               gap) the error propagates. */
 +            fd->regvm_conservative = 0;
 +            if (js_regvm_build_baseline(ctx, fd, is_leader, &deferred))
 +                goto done;
@@ -1056,24 +1142,21 @@ index ade8486..f2b28f7 100644
          }
      }
  
-@@ -72192,6 +72588,872 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
+@@ -69244,6 +69544,786 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
      return rc;
  }
  
 +/*
 + * --- the baseline tier ------------------------------------------------------
 + *
-+ * The third lowering, entered only when the optimising path has refused a shape
-+ * twice. It is a direct translation of the stack bytecode with no analysis: a
-+ * value's identity is the operand-stack depth it sits at, so there is no SSA,
-+ * no liveness, no promotion, no destructive reuse and no fusing. Its only
-+ * per-block state is the entry stack depth.
++ * The third lowering, entered only when the optimising path refused a shape
++ * twice. A direct translation of the stack bytecode: a value's identity is its
++ * operand-stack depth, with no SSA, liveness, promotion, destructive reuse or
++ * fusion. Its only per-block state is the entry depth.
 + *
-+ * A depth below V is a register (`ireg[d] = d`). A depth at or above V -- the
-+ * deep operand stack of a huge call, whose arguments are all live before they
-+ * are packed -- has no register the 16-bit register operand can name, so it
-+ * lives in a slot at the top of the register file and is reached through
-+ * ROP_slot_get/ROP_slot_put. V is chosen once the call window is known:
++ * A depth below V is a register (`ireg[d] = d`). A deeper value has no
++ * register the 16-bit operand can name, so it lives in a slot at the top of
++ * the register file, reached through ROP_slot_get/ROP_slot_put:
 + *
 + *     [ 0 .. V )              direct value registers (depth d < V is reg d)
 + *     [ V .. V+K )            K spill temporaries
@@ -1082,11 +1165,8 @@ index ade8486..f2b28f7 100644
 + *     [ STACK_BASE .. )       the stack area (depth d >= V is
 + *                             regs[STACK_BASE + (d - V)])
 + *
-+ * so the register count the encoder sees is V+K, every register operand it
-+ * emits is below the 4,096 limit, and the frame's regvm_reg_count is raised
-+ * past the stack area afterwards. The optimising path never reaches this: its
-+ * `max_depth` is a pushed-value count that stays below 4,096 on every program
-+ * measured.
++ * The encoder sees V+K registers, and the frame's regvm_reg_count is raised
++ * past the stack area afterwards.
 + */
 +
 +#define REGVM_BASELINE_SPILL_TMPS 16
@@ -1109,13 +1189,9 @@ index ade8486..f2b28f7 100644
 +    L->total = L->stack_base + (need > L->V ? need - L->V : 0);
 +}
 +
-+/*
-+ * Does the baseline tier have a real register lowering for this opcode? A pure
-+ * permutation (dup, swap, rot, ...) does not: the optimising path represents it
-+ * with value-id aliases and `regvm_lower_insn` emits nothing, so the baseline
-+ * must synthesise a parallel copy instead. The niladic `undef`/`nop` produce no
-+ * value either and are simply skipped.
-+ */
++/* Does the baseline tier have a register lowering for this opcode? A pure
++   permutation does not (it becomes a parallel copy), and `undef`/`nop`
++   produce nothing. */
 +static int regvm_baseline_is_shaper(const uint8_t *bc, int pos)
 +{
 +    int op = bc[pos];
@@ -1126,12 +1202,8 @@ index ade8486..f2b28f7 100644
 +           op == OP_rot4l || op == OP_rot5l || op == OP_swap || op == OP_swap2;
 +}
 +
-+/*
-+ * The baseline depth dataflow's state, collected into one structure so the four
-+ * stages (CFG, entry depths, push_base, encodability) can share it without a
-+ * long parameter list. Everything here is sized by the bytecode length or the
-+ * block count, so memory is linear in the function.
-+ */
++/* The baseline depth dataflow's state, shared by its four stages (CFG, entry
++   depths, push_base, encodability). Linear in the function's size. */
 +typedef struct JSRegBaseline {
 +    const uint8_t *bc;
 +    int bc_len;
@@ -1153,12 +1225,8 @@ index ade8486..f2b28f7 100644
 +    JSRegBaselineLayout lay;
 +    int *ireg;          /* the value -> register map, or NULL for deep values */
 +    int n_values;
-+    /*
-+     * The speculative stack map for regvm_sim_step: `ireg` extended one step
-+     * ahead, so a slot_get this instruction plants can precede the edge moves
-+     * that read the value. Exactly the encoder's `scratch` array, kept here so
-+     * the spill rewrite can hand it to the simulator.
-+     */
++    /* The speculative stack map for regvm_sim_step (`ireg` one step ahead), so
++       a planted slot_get can precede the edge moves that read the value. */
 +    int *scratch;
 +    int scratch_cap;
 +} JSRegBaseline;
@@ -1181,11 +1249,8 @@ index ade8486..f2b28f7 100644
 +    memset(B, 0, sizeof(*B));
 +}
 +
-+/*
-+ * The CFG prologue, shared in structure with js_regvm_build_cfg but with none
-+ * of its SSA state. `is_leader` comes from the scan. Returns 0, or -1 on an
-+ * allocation/invariant failure (which is a hard error, not a refusal).
-+ */
++/* The CFG prologue, js_regvm_build_cfg's structure without its SSA state.
++   Returns 0, or -1 on an allocation or invariant failure (a hard error). */
 +static int regvm_baseline_cfg(JSContext *ctx, JSFunctionDef *fd,
 +                              const uint8_t *is_leader, JSRegBaseline *B)
 +{
@@ -1211,12 +1276,8 @@ index ade8486..f2b28f7 100644
 +            B->bstart[n_blocks++] = pos;
 +    B->bstart[n_blocks] = bc_len;
 +
-+    /*
-+     * Does the function's first block have a predecessor? If so it is a loop
-+     * header reached from pc 0, and a depth-carrying join would have to agree
-+     * with itself. The optimising path prepends an empty entry block for this;
-+     * the baseline follows, so a `while` at pc 0 lowers like any other.
-+     */
++    /* If the first block has a predecessor it is a loop header reached from pc
++       0; prepend an empty entry block as the optimising path does. */
 +    for (b = 1; b < n_blocks && !prepend_entry; b++) {
 +        int last = B->bstart[b], fall = 1, target = -1;
 +
@@ -1328,15 +1389,11 @@ index ade8486..f2b28f7 100644
 +    return 0;
 +}
 +
-+/*
-+ * Entry-depth dataflow. Every reachable block must be entered at one depth;
-+ * `regvm_with_edge_delta` adjusts the with family's fall-through (and the
-+ * finally return address). The result is B->in_depth/B->out_depth and
-+ * B->max_depth. Unlike the optimising path, a disagreement is NOT possible for
-+ * a shape the parser accepts -- the operand stack is exactly this model -- but
-+ * if it happened the baseline would still be entered, so this returns -1 and
-+ * the caller reports it as a hard error rather than silently picking one arm.
-+ */
++/* Entry-depth dataflow: every reachable block is entered at one depth
++   (`regvm_with_edge_delta` adjusts the with family and the finally return
++   address). Produces B->in_depth/out_depth/max_depth. A disagreement cannot
++   happen for a parser-accepted shape; if it does, return -1 as a hard
++   error. */
 +static int regvm_baseline_depths(JSContext *ctx, JSFunctionDef *fd,
 +                                 JSRegBaseline *B, int *pdeferred)
 +{
@@ -1391,19 +1448,16 @@ index ade8486..f2b28f7 100644
 +        goto refuse;
 +    return 0;
 + refuse:
-+    /* The baseline is the last tier; a depth disagreement is a modelling gap
-+       in regvm_effect, not something to fail closed on silently. */
++    /* A depth disagreement is a modelling gap in regvm_effect; report it. */
 +    *pdeferred = 1;
 +    rc = -1;
 +    (void)ctx;
 +    return rc;
 +}
 +
-+/*
-+ * push_base[pos] for every instruction: the depth at which its first pushed
-+ * value lands, so every pushed value's id is its depth. Reading the with
-+ * family's declared effect (taken arm) matches regvm_effect and the lowering.
-+ */
++/* push_base[pos] for every instruction: the depth of its first pushed value,
++   so every value's id is its depth. The with family uses its declared (taken
++   arm) effect. */
 +static int regvm_baseline_pushbase(JSContext *ctx, JSFunctionDef *fd,
 +                                   JSRegBaseline *B)
 +{
@@ -1448,36 +1502,24 @@ index ade8486..f2b28f7 100644
 +        return -1;
 +    for (b = 0; b < n; b++)
 +        B->ent[b] = B->out[b] = b;
-+    /* Every block shares the one identity array. The encoder only reads
-+       ent[ent_off[b]+i] and out[out_off[p]+i] for i < depth, and never writes
-+       them, so a shared base is exact. */
++    /* One shared identity array: the encoder only reads ent[ent_off[b]+i] and
++       out[out_off[p]+i] for i < depth. */
 +    for (b = 0; b < B->n_blocks; b++)
 +        B->ent_off[b] = B->out_off[b] = 0;
 +    return 0;
 +}
 +
 +/*
-+ * The baseline spill pass. Runs over the finished IR once the call window is
-+ * known. Its job is to make every register operand name a register below 4,096,
-+ * which the encoder's two-byte register field can hold, even when the operand
-+ * stack is deeper than that: a value whose depth is at or above V has no
-+ * directly-encodable register, so it lives in the stack area at the top of the
-+ * register file and is reached through ROP_slot_get / ROP_slot_put.
++ * The baseline spill pass, run once the call window is known, so every
++ * register operand is below 4,096. A deep value (depth >= V) lives in the
++ * stack area: a read is preceded by a ROP_slot_get into one of K spill
++ * temporaries, the operand is replaced by the temporary, and a write is
++ * followed by a ROP_slot_put. An instruction that reads and writes a deep
++ * value gets both. `regvm_own_has_dest`/`dest_index`/`second_dest_index`
++ * classify each operand.
 + *
-+ * For every instruction it emits, a read of a deep value is preceded by a
-+ * ROP_slot_get into a spill temporary (one of K fixed registers above the value
-+ * files -- a value's register contents never have to survive an instruction),
-+ * every deep operand is replaced by a temporary, and a write to a deep value is
-+ * followed by a ROP_slot_put of the temporary back to its slot. An instruction
-+ * that both reads and writes a deep value (an in-place `add`, a `move` within
-+ * the stack) gets a slot_get for the destination too, so the op sees the old
-+ * value, and a slot_put for the result. `regvm_own_has_dest`/`dest_index`/
-+ * `second_dest_index` classify each operand.
-+ *
-+ * The stack shapers the optimising path represents with value-id aliases are
-+ * expanded here too: the encoder recorded each as a list of (source id -> own
-+ * depth) copies, which become a parallel move -- loads for deep sources, moves
-+ * through a spare register for the cycle, stores for deep destinations.
++ * The recorded stack shapes are expanded here as parallel moves: loads for
++ * deep sources, a spare register for cycles, stores for deep destinations.
 + */
 +
 +typedef struct JSRegBlOut {
@@ -1522,11 +1564,8 @@ index ade8486..f2b28f7 100644
 +    return v >= 0 && v < C->n_values && C->ireg[v] < 0;
 +}
 +
-+/*
-+ * Expand the recorded parallel copy at `sh` into the output. A source or
-+ * destination that is deep moves through a spill temporary; the four scalars
-+ * below are the register or temporary each slot names.
-+ */
++/* Expand the recorded parallel copy at `sh`. A deep source or destination
++   moves through a spill temporary. */
 +static int regvm_baseline_expand_shape(JSContext *ctx, JSRegBlOut *o,
 +                                       const JSRegBlCtx *C,
 +                                       const JSRegBShape *sh, int src_pc)
@@ -1547,10 +1586,8 @@ index ade8486..f2b28f7 100644
 +        if (regvm_b_deep(C, dv)) {
 +            did = C->base + npre++;
 +        }
-+        /* A deep value's register is -1 in the spill pass's view (bl_val), so
-+           it must go through the temporary loaded from its slot, not through
-+           `ireg[sv]` (which is the identity view and would alias a spill
-+           temporary's register). */
++        /* A deep value is -1 in `bl_val`, so it goes through the temporary
++           loaded from its slot, not `ireg[sv]`. */
 +        sreg[j] = sid >= 0 ? sid
 +                           : ((sv >= 0 && sv < C->n_values) ? C->ireg[sv] : -1);
 +        dreg[j] = did >= 0 ? did
@@ -1642,13 +1679,9 @@ index ade8486..f2b28f7 100644
 +    o.ctx = ctx;
 +    o.insn = NULL;
 +    o.n = o.cap = o.failed = 0;
-+    /* The encoder recorded `pc_to_insn[pc]` as an index into the pre-spill IR
-+       *before* it emitted anything for that pc. The pass below inserts
-+       `slot_get` loads and expands shapes, which shifts every later index, so
-+       those recorded indices must be translated to the post-spill IR before
-+       the encoder resolves a branch target through them. `newidx[i]` is the
-+       output index of the first instruction the old instruction `i` produced
-+       (its first `slot_get`, its shape moves, or the body itself). */
++    /* pc_to_insn indexes the pre-spill IR, and this pass inserts instructions,
++       so `newidx[i]` maps old instruction `i` to the output index of the first
++       instruction it produced. */
 +    newidx = js_malloc(ctx, (size_t)(n > 0 ? n : 1) * sizeof(int));
 +    if (!newidx)
 +        return -1;
@@ -1661,9 +1694,9 @@ index ade8486..f2b28f7 100644
 +        int deep_col[8], is_dest_col[8], dest_read[8];
 +
 +        newidx[i] = o.n;
-+        /* `move` with no operands is a placeholder: a shape, or a dropped
-+           instruction that emits nothing. Shapes are recorded in emission
-+           order, so a single cursor finds the one at this index. */
++        /* A `move` with no operands is a placeholder: a shape, or a dropped
++           instruction. Shapes are recorded in emission order, so one cursor
++           finds it. */
 +        if (in->rop == ROP_move && in->n_ops == 0) {
 +            if (si < bs->n_shapes && bs->shapes[si].at_insn == i) {
 +                if (regvm_baseline_expand_shape(ctx, &o, C, &bs->shapes[si],
@@ -1695,8 +1728,8 @@ index ade8486..f2b28f7 100644
 +            is_dest_col[k] = (k == di || k == di2);
 +            dest_read[k] = 0;
 +        }
-+        /* A destination that also appears as a source (an in-place op) has to
-+           be read back from its slot before the instruction. */
++        /* A destination that is also a source (in place) is read from its slot
++           first. */
 +        for (k = 0; k < in->n_ops && fmt[k]; k++) {
 +            int c;
 +            if (fmt[k] != 'r' || !is_dest_col[k] || !deep_col[k])
@@ -1707,9 +1740,8 @@ index ade8486..f2b28f7 100644
 +                    break;
 +                }
 +        }
-+        /* Each deep operand is replaced by a spill temporary. The window is at
-+           or above every value id and temporary id, so no temp collides with a
-+           real value. */
++        /* Each deep operand is replaced by a spill temporary. The window is
++           above every value and temporary id. */
 +        for (k = 0; k < in->n_ops && fmt[k]; k++)
 +            if (deep_col[k])
 +                tfor[k] = C->base + ntmp++;
@@ -1753,17 +1785,9 @@ index ade8486..f2b28f7 100644
 +                              bs->n_shapes - si);
 +        goto fail;
 +    }
-+    /*
-+     * Branch targets must be remapped. The IR builder recorded `pc_to_insn[pc]`
-+     * as an index into the IR *before* this pass ran, and the pass inserts
-+     * `slot_get` loads (and expands shape placeholders), which shifts every
-+     * later index. The earlier claim that no remap was needed is wrong: the
-+     * insertion changes indices, not just content, so a branch resolved through
-+     * a stale index lands in the middle of some deep-value body. `newidx[i]`
-+     * translates an old index: it is the output index of the first instruction
-+     * the old instruction `i` produced. An index at or past the old end (a
-+     * branch to the function's end) maps to the new end.
-+     */
++    /* Remap branch targets through `newidx`: the inserted instructions shift
++       every later index. An index at or past the old end maps to the new end.
++       */
 +    for (k = 0; k < n_pcs; k++) {
 +        int oi = pc_to_insn[k];
 +        if (oi < 0)
@@ -1782,22 +1806,11 @@ index ade8486..f2b28f7 100644
 +    return -1;
 +}
 +
-+/*
-+ * The baseline builder: the third tier, entered when the optimising lowering
-+ * has refused a shape twice. It is the CFG, an entry-depth dataflow, the
-+ * identity value model, `js_regvm_encode` and the spill pass -- no SSA, no
-+ * liveness, no promotion, no reuse and no fusion. There is nothing here that
-+ * can refuse a parser-accepted shape: a depth disagreement would be a modelling
-+ * gap in `regvm_effect`, and even that falls through to a hard error rather
-+ * than a quiet refusal, because there is no fourth tier to catch it.
-+ *
-+ * Everything the encoder needs that describes a shape this tier does not have
-+ * is passed empty: no promoted slots, no liveness, no home modes, no reuse
-+ * table, no split/copy maps. The scan's synthetic entry block and its stubs are
-+ * not used either -- the identity model's edge moves are all empty (a phi's
-+ * register already holds its predecessor's incoming value), so no stubs are
-+ * ever emitted.
-+ */
++/* The baseline builder: the CFG, an entry-depth dataflow, the identity value
++   model, `js_regvm_encode` and the spill pass. It cannot refuse a
++   parser-accepted shape. The encoder gets empty promotion, liveness, home,
++   reuse and split/copy inputs, and the identity model's edge moves are all
++   empty, so no stubs are emitted. */
 +static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd,
 +                                               const uint8_t *is_leader,
 +                                               int *pdeferred)
@@ -1819,8 +1832,8 @@ index ade8486..f2b28f7 100644
 +    {
 +        int deferred = 0;
 +        if (regvm_baseline_depths(ctx, fd, &B, &deferred)) {
-+            /* A depth disagreement is a modelling gap; the caller reports it
-+               as a hard error, since the baseline is the last tier. */
++            /* A depth disagreement is a modelling gap; the caller reports it.
++               */
 +            goto done;
 +        }
 +    }
@@ -1829,22 +1842,12 @@ index ade8486..f2b28f7 100644
 +    if (regvm_baseline_ident(ctx, &B))
 +        goto done;
 +
-+    /*
-+     * The identity `ireg` the encoder is given by the caller is not used: the
-+     * encoder's baseline branch rebuilds it (values 0..max_depth are their own
-+     * registers below V) and, after the spill pass, grows `reg_count` to V+K so
-+     * the spill temporaries have registers. Pass the depth-identity array here
-+     * for the calls before the branch that consult it.
-+     *
-+     * `defined`/`ent_phi`/`ident` must span the spill temporaries too: a
-+     * shape-expansion placeholder is the one instruction whose destination is
-+     * still a raw value id when the encoder's uninitialized-read check runs.
-+     * The check is skipped for the baseline, but the arrays are sized to keep
-+     * `regvm_reg_of` and the round-trip in range regardless.
-+     */
++    /* The encoder's baseline branch rebuilds `ireg` and grows `reg_count` to
++       V+K after the spill pass; pass the depth-identity array for the calls
++       before that. `defined`/`ent_phi`/`ident` span the spill temporaries so
++       `regvm_reg_of` and the round trip stay in range. */
 +    {
-+        /* The encoder's value count is V + K with the real window, and V is at
-+           most max_depth + 1, so this is a safe upper bound. */
++        /* V is at most max_depth + 1, so this bounds V + K. */
 +        int K = B.max_depth > 0 ? REGVM_BASELINE_SPILL_TMPS : 0;
 +        i = B.max_depth + 1 + K + 1;
 +    }
@@ -1908,11 +1911,8 @@ index ade8486..f2b28f7 100644
 +    goto done;
 +
 + empty:
-+    /*
-+     * A body with no bytecode: the scan emits `return undefined` for a body the
-+     * backend reduces to nothing, and this tier does the same. Leaving
-+     * regvm_len at zero is what the scan reads to emit that.
-+     */
++    /* A body with no bytecode: leave regvm_len at zero so the scan emits
++       `return undefined`, as for any empty body. */
 +    fd->regvm_baseline = 0;
 +    fd->regvm_len = 0;
 +    rc = 0;
@@ -1926,10 +1926,10 @@ index ade8486..f2b28f7 100644
 +    return rc;
 +}
 +
- /*
-  * Executed-instruction census, compiled in only with QJS_REGVM_COUNT. The point
-  * is to rank this VM's own costs against each other from *counts*, in a build
-@@ -73046,8 +74308,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+ /* Executed-instruction census, compiled in only with QJS_REGVM_COUNT. The
+    increment is in the dispatch path, so this build's timings are
+    meaningless. */
+@@ -70065,8 +71145,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
  
  #if QJS_REGVM_RECORD
      regvm_set_call_desc(b);
@@ -1941,162 +1941,3 @@ index ade8486..f2b28f7 100644
          b->regvm_light = 0;
          b->regvm_light_fast = 0;
      }
-diff --git a/quickjs-regvm.h b/quickjs-regvm.h
-index f65c6be..21fdab9 100644
---- a/quickjs-regvm.h
-+++ b/quickjs-regvm.h
-@@ -754,6 +754,19 @@ typedef enum JSRegOpcode {
-      */
-     ROP_inc_branch_lt, ROP_inc_branch_lt_s,
- 
-+    /*
-+     * The baseline (frame-slot) tier's full-width stack access. Its operand
-+     * stack can be deeper than the 16-bit register operand can name (4,096),
-+     * so a value above that range is spilt to a slot at the top of the frame's
-+     * register file and reached by an unscaled 16-bit slot index. slot_get
-+     * reads that slot (u) into a low register (r); slot_put writes the register
-+     * (r) back to the slot (u). Both borrow/copy exactly as ROP_move does, so
-+     * the reference-count model is unchanged. They index `regs`, not `var_buf`,
-+     * so no frame-layout change is needed. Appended at the very end so no
-+     * existing opcode is renumbered.
-+     */
-+    ROP_slot_get, ROP_slot_put,
-+
-     ROP_COUNT
- } JSRegOpcode;
- 
-@@ -810,7 +823,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
-  * cross-VM one does. Bump it whenever an opcode is added, removed or
-  * renumbered, or an operand's width or meaning changes.
-  */
--#define REGVM_FORMAT_VERSION 18
-+#define REGVM_FORMAT_VERSION 19
- 
- /* ROP_get_field and ROP_put_field use this site index when the source
-    instruction has no inline cache. */
-diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
-index aa88684..efa5823 100644
---- a/quickjs-regvm-step.inc
-+++ b/quickjs-regvm-step.inc
-@@ -2237,7 +2237,16 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_arg(uint8_t *ip, JSValue *fr, JSRegRun
-     int argc = rf->argc;
-     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
- 
--                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }
-+                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }            L_ROP_put_arg_xfer:
-+                { int slot = RD_U16(); int s = RD_REG();
-+#if QJS_DRC
-+                  regvm_put_arg(ctx, rf->arg_buf, rf->arg_owned, slot, regs[s]);
-+                  regs[s] = JS_UNDEFINED;
-+#else
-+                  set_value(ctx, &rf->arg_buf[slot], regs[s]);
-+                  regs[s] = JS_UNDEFINED;
-+#endif
-+                  REGVM_NEXT(); }
-  exception:
-     rf->ret = JS_EXCEPTION;
-     return NULL;
-@@ -2612,6 +2621,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
-     int argc = rf->argc;
-     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
-  {
-+                const uint8_t *i_start = rpc - 1;
-                 int d = RD_REG();
-                 int slot = RD_U16();
-                 JSAtom atom = RD_U32();
-@@ -2654,6 +2664,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
-     int argc = rf->argc;
-     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
-  {
-+                const uint8_t *i_start = rpc - 1;
-                 int d = RD_REG();
-                 int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
-                 JSAtom atom = RD_U32();
-@@ -2809,6 +2820,12 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_var_ref(uint8_t *ip, JSValue *fr, JSReg
- 
-                 { int d = RD_REG(); int slot = RD_U16();
-                   SET_REG_B(d,*rf->var_refs[slot]->pvalue); REGVM_NEXT(); }
-+            /*
-+             * The baseline tier's full-width stack slot. It indexes the register
-+             * file, not `rf->var_buf`: the stack area sits at the top of `regs`, so
-+             * the borrow/store behaviour is exactly ROP_move's -- SET_REG_B's
-+             * borrow under DRC, dup/free otherwise.
-+             */
-  exception:
-     rf->ret = JS_EXCEPTION;
-     return NULL;
-@@ -4539,7 +4556,8 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
-                  * object itself, as there.
-                  */
-                 {
--                    if (JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
-+                    if (site != REG_IC_NONE &&
-+                        JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
-                         JSObject *p = JS_VALUE_GET_OBJ(regs[r]);
-                         JSRegPIC *e = &pic[site];
- 
-@@ -5153,6 +5171,46 @@ static uint8_t *REGVM_CC regvm_s_ROP_shr(uint8_t *ip, JSValue *fr, JSRegRun *rf,
-     return NULL;
- }
- 
-+static uint8_t *REGVM_CC regvm_s_ROP_slot_get(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
-+{
-+    JSFunctionBytecode *b = rf->b;
-+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
-+    JSRegPIC *pic = rf->pic;
-+    uint8_t *rpc = ip;
-+    int op = *rpc++;
-+    JSValue ret_val = JS_UNDEFINED;
-+    JSValue *regs = fr;
-+    JSValue *arg_buf = rf->arg_buf;
-+    int argc = rf->argc;
-+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
-+
-+                { int d = RD_REG(); int slot = RD_U16();
-+                  SET_REG_B(d,regs[slot]); REGVM_NEXT(); }
-+ exception:
-+    rf->ret = JS_EXCEPTION;
-+    return NULL;
-+}
-+
-+static uint8_t *REGVM_CC regvm_s_ROP_slot_put(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
-+{
-+    JSFunctionBytecode *b = rf->b;
-+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
-+    JSRegPIC *pic = rf->pic;
-+    uint8_t *rpc = ip;
-+    int op = *rpc++;
-+    JSValue ret_val = JS_UNDEFINED;
-+    JSValue *regs = fr;
-+    JSValue *arg_buf = rf->arg_buf;
-+    int argc = rf->argc;
-+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
-+
-+                { int slot = RD_U16(); int s = RD_REG();
-+                  SET_REG_B(slot,regs[s]); REGVM_NEXT(); }
-+ exception:
-+    rf->ret = JS_EXCEPTION;
-+    return NULL;
-+}
-+
- static uint8_t *REGVM_CC regvm_s_ROP_special_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
- {
-     JSFunctionBytecode *b = rf->b;
-@@ -6531,6 +6589,8 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
-     [ROP_debug] = regvm_s_ROP_debug,
-     [ROP_inc_branch_lt] = regvm_s_ROP_inc_branch_lt,
-     [ROP_inc_branch_lt_s] = regvm_s_ROP_inc_branch_lt_s,
-+    [ROP_slot_get] = regvm_s_ROP_slot_get,
-+    [ROP_slot_put] = regvm_s_ROP_slot_put,
- };
- 
- 
-@@ -6765,6 +6825,8 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
-     [ROP_debug] = 1,
-     [ROP_inc_branch_lt] = 1,
-     [ROP_inc_branch_lt_s] = 1,
-+    [ROP_slot_get] = 1,
-+    [ROP_slot_put] = 1,
- };
- 
- 

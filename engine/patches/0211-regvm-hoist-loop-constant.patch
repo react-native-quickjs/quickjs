@@ -1,18 +1,29 @@
+Subject: Hoist the loop constant out of the back edge
+
+What this does
+  Hoist the loop constant out of the back edge.
+
+Why we need it
+  A counted loop's back edge targets the `load_i32` that materialises the bound, so the constant reloads every iteration although nothing in the loop rewrites it.
+
+What it adds
+  An IR pass retargets a backward edge whose target is a pure constant load with a single destination definition to the instruction after it; the load runs once on the entry fall-through.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 0d948d4..4b215b8 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -62908,6 +62908,87 @@
+@@ -60866,6 +60866,83 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+     js_free(ctx, first);
  }
  
- /*
-+ * Step 1b: the back edge of a counted loop targets the constant load that
-+ * materialises the bound, so the load re-executes every iteration although
-+ * nothing in the loop rewrites its destination. Retarget the edge to the
-+ * instruction after the load: the load still runs on the entry fall-through and
-+ * the register keeps its value. Only a backward edge whose target is a pure
-+ * constant load and whose destination register is written nowhere else in the
-+ * IR is eligible, so the load has already run whenever the edge is taken and
-+ * skipping it cannot read an unwritten register.
++/*
++ * The back edge of a counted loop targets the constant load of its bound, which
++ * re-executes every iteration. Retarget the edge past the load. Only a backward
++ * edge to a pure constant load whose register is written nowhere else
++ * qualifies, so the load has always run when the edge is taken.
 + */
 +static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 +                                   int n_pcs, int n_values, const int *ireg)
@@ -85,16 +96,15 @@ diff --git a/quickjs.c b/quickjs.c
 +    js_free(ctx, insn_pc);
 +}
 +
-+/*
-  * X2: register operands are byte offsets into the register file, so a field's
-  * width limits the registers it can name -- one byte reaches register 15, two
-  * bytes reach register 4095.
-@@ -67120,6 +67201,8 @@
+ /* Register operands are byte offsets: one byte reaches register 15, two bytes
+    reach register 4095. */
+ #define REGVM_NARROW_REG_MAX 16
+@@ -64725,6 +64802,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                               n_values, phi_in);
      regvm_fuse_self_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                             n_values, ireg);
 +    regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 +                           n_values, ireg);
      /*
-      * Forward a frame read to a value still resident in its register.
-      *
+      * Forward a frame read to a value still in its register: a local stored
+      * earlier in the same block can be read from the stored value's register.

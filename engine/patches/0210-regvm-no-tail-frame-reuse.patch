@@ -1,7 +1,21 @@
+Subject: Stop reusing the frame on tail calls
+
+What this does
+  Stop reusing the frame on tail calls.
+
+Why we need it
+  A frame-reusing tail call costs more than an ordinary call + return, excludes the function from the light path, and hides the callers from `Error.stack` (`error-stack.js` differed from node).
+
+What it adds
+  The peephole rewrite of `OP_call`/`OP_call_method` + `OP_return` into `OP_tail_call`/`_method` is gated on `!QJS_REGVM`; the stack-only build keeps it (its `OP_tail_call` is only a `goto done`). The register opcodes and handlers stay for blob compatibility; nothing touches `BC_VERSION`.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index af9602d..0d948d4 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -57220,9 +57220,17 @@
+@@ -55564,9 +55564,13 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
          case OP_call:
          case OP_call_method:
              {
@@ -9,18 +23,14 @@ diff --git a/quickjs.c b/quickjs.c
                  int argc;
                  argc = get_u16(bc_buf + pos + 1);
 +#if !QJS_REGVM
-+                /*
-+                 * Detect and transform tail calls. The register backend reuses
-+                 * the caller's frame for these (`ROP_tail_call*`), which costs
-+                 * more per call than an ordinary call + return and hides the
-+                 * callers from `Error.stack`; it does not emit this rewrite.
-+                 * The stack interpreter's `OP_tail_call` only skips the
-+                 * argument cleanup, so the stack-only build keeps it.
-+                 */
++                /* Detect and transform tail calls, for the stack interpreter
++                   only. The register backend does not emit this rewrite: its
++                   frame-reusing tail call costs more per call than call +
++                   return and hides the callers from `Error.stack`. */
                  if (code_match(&cc, pos_next, OP_return, -1)) {
                      if (cc.line_num >= 0) line_num = cc.line_num;
                      if (cc.col_num >= 0) col_num = cc.col_num;
-@@ -57232,6 +57240,7 @@
+@@ -55576,6 +55580,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                                                &line_num, &col_num);
                      break;
                  }

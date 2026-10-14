@@ -1,37 +1,27 @@
-Hashes built-in object shapes so the register property cache can serve them (W2c)
+Subject: Hashes built-in object shapes so the register property cache can serve them
 
-The per-function register property cache refuses a receiver whose shape is
-unhashed, because an unhashed shape is mutated in place whatever its reference
-count, so a cached reference to one could watch its slot move. The built-in
-objects are exactly the unhashed ones, which is why their reads fell out of the
-cache. Hashing the shape keeps the cache's ownership rule instead of bypassing
-it, and makes the shape stable.
+What this does
+  Hashes built-in object shapes so the register property cache can serve them.
 
-  * quickjs.c: regvm_shape_hashify hashes a shape on first use -- growing the
-    runtime shape hash table when needed and replaying the same fold
-    js_new_shape2 uses, so find_hashed_shape_prop still verifies every property
-    atom and flag; regvm_pic_fill calls it for the receiver shape and, one hop
-    up, for the holder shape.
+Why we need it
+  The per-function register property cache refuses a receiver whose shape is unhashed because such a shape is mutated in place whatever its reference count, and the built-in objects are exactly the unhashed ones, so their reads fell out of the cache; hashing the shape keeps the cache's ownership rule instead of bypassing it.
 
-This patch does not change the register format or the bytecode version.
+What it adds
+  `regvm_shape_hashify` hashes a shape on first use, growing the runtime shape table and replaying the fold `js_new_shape2` uses so `find_hashed_shape_prop` still verifies every property; `regvm_pic_fill` calls it for the receiver shape and, one hop up, for the holder shape.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22207,6 +22207,37 @@
+@@ -22004,6 +22004,30 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, uint16_t kind,
      e->kind = kind;
  }
  
-+/* Hash an unhashed shape in place so the per-function PIC can hold it.
-+ *
-+ * The PIC stores COUNTED references, which pin a shape against being freed but
-+ * NOT against being mutated in place: `js_shape_prepare_update` returns
-+ * immediately for an unhashed shape whatever its refcount, so a cached slot can
-+ * watch a property's flags change or its offset move. A hashed shape is
-+ * copy-on-write instead -- once the PIC holds a reference the refcount is >= 2,
-+ * so any update clones rather than mutating in place -- which is exactly the
-+ * invariant the hit path needs. Reading a depth-0/1 site therefore hashes the
-+ * receiver's shape. The hash is recomputed from the property list because
-+ * `sh->hash` is only maintained while `is_hashed` (add_shape_property updates
-+ * it only in that branch).
++/* Hash an unhashed shape in place so the per-function PIC can hold it. A
++ * counted reference does not stop an unhashed shape from being mutated in
++ * place; a hashed one with refcount >= 2 is copy-on-write, which the hit path
++ * needs. The hash is recomputed from the property list because `sh->hash` is
++ * only maintained while `is_hashed`.
 + */
 +static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
 +{
@@ -54,19 +44,18 @@ This patch does not change the register format or the bytecode version.
  static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                             JSRegPIC **ppic, JSValue recv, JSAtom atom, int site)
  {
-@@ -22277,6 +22308,15 @@
+@@ -22068,6 +22092,14 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
      rsh = p->shape;
      slot = (uint32_t)(pr - holder->prop);
  
-+    /* A depth-0/1 site hashes its receiver shape so the per-function PIC can
-+       cache it (see regvm_shape_hashify). Depth-2 sites stay with the global
-+       stub cache, which does not need a hashed shape. */
++    /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);
++       depth-2 sites use the global stub cache, which does not need it. */
 +    if (depth <= 1) {
 +        regvm_shape_hashify(rt, rsh);
 +        if (hsh)
 +            regvm_shape_hashify(rt, hsh);
 +    }
 +
-     /* The site's state before the install below; the install is what can newly
-        set the dead state, so sample it first. A site with no table yet (pic
-        NULL) is not dead. */
+     /* The site's state before the install below, which can newly kill it. A
+        site with no table yet is not dead. */
+     pic = *ppic;

@@ -1,7 +1,21 @@
+Subject: Trim dead light-frame header stores
+
+What this does
+  Trim dead light-frame header stores.
+
+Why we need it
+  A light frame initialised `ret` and `set_v` to `undefined`, but every path a light function can take writes each immediately before it reads it (the return handlers park the value in `ret`, the free helper parks the dead value in `set_v`); and it always laid out and pointed at a `var_count`-slot variable area, though a function whose locals are all promoted has `regvm_var_count == 0` and no handler, release walk or DRC walk can reach any of those slots.
+
+What it adds
+  Drops the `ret`/`set_v` initialisation and, when `regvm_var_count == 0`, the variable area itself: `regvm_light_need` and `regvm_light_enter` both size the frame as header + registers, and `fr` becomes the header's end with no `var_buf` store.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index a019b94..cf0a2be 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -27081,8 +27081,6 @@
+@@ -26329,8 +26329,6 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      nf->b = cb;
      nf->pic = cb->regvm_pic;
      nf->var_refs = co->u.func.var_refs;
@@ -10,30 +24,22 @@ diff --git a/quickjs.c b/quickjs.c
      nf->arg_buf = oargv;
      nf->ret_dst = d;
      nf->argc = na;
-@@ -27091,25 +27089,39 @@
+@@ -26339,26 +26337,27 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      nf->cap_ip = NULL;
      nf->sf = NULL;
      nf->this_obj = this_obj;
 -    nf->ret = JS_UNDEFINED;
 -    nf->set_v = JS_UNDEFINED;
-+    /*
-+     * `ret` and `set_v` are written before they are read on every path a light
-+     * function can take -- the return handlers park the value in `ret`, and the
-+     * free helper parks the dead value in `set_v` immediately before the read.
-+     * Initialising them here was two words of dead stores per call.
-+     */
++    /* `ret` and `set_v` are written before they are read on every path a light
++       function can take, so they are not initialised here. */
      vc = cb->var_count;
  #if QJS_DRC
      if (cb->var_count <= 255)
          vc = cb->regvm_var_count;
  #endif
-+    /*
-+     * The variable area exists only when the promotion map leaves a slot in it
-+     * (`vc`, the same bound the release walk and the DRC walk use). A function
-+     * whose locals are all promoted names none: `fr` is then the header's end,
-+     * `var_buf` is never read (no `get_loc`, no release walk), and the frame is
-+     * `var_count` slots smaller with the pointer store gone.
-+     */
++    /* The variable area exists only when the promotion map leaves a slot in it
++       (`vc`). Otherwise `fr` is the header's end and `var_buf` is never read.
++       */
 +    if (vc != 0) {
 +        nf->var_buf = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
 +        nf->fr = nf->var_buf + cb->var_count;
@@ -43,22 +49,22 @@ diff --git a/quickjs.c b/quickjs.c
      nf->flags = REGVM_FLAG_LIGHT;
      if (vc == 0)
          nf->flags |= REGVM_FLAG_TRIVIAL_RET;
-     /*
-      * Fill the variable area and the register file with `undefined`. Every
-      * register must hold a valid, uncounted word before the program runs (the
+-    /*
+-     * Fill the variable area and the register file with `undefined`. Every
+-     * register must hold a valid, uncounted word before the program runs (the
 -     * DRC pin walk and the store handlers read them). The variable area only
 -     * needs the slots the promotion map still names -- `regvm_var_count`, the
 -     * same bound the release walk and the DRC walk use, and `vc` already holds
 -     * it. A function whose locals are all promoted names none, and filling the
 -     * source `var_count` instead was the loc10 cycle regression: ten stores to
 -     * a slot no handler can read.
-+     * DRC pin walk and the store handlers read them); only the variable slots
-+     * the promotion map still names are filled, so a function whose locals are
-+     * all promoted fills none of the source `var_count`.
-      */
+-     */
++    /* Fill the variable area and register file with `undefined`; only the
++       variable slots the promotion map still names are filled. */
      for (k = 0; k < vc; k++)
          nf->var_buf[k] = JS_UNDEFINED;
-@@ -30146,9 +30158,19 @@
+     regs = nf->fr;
+@@ -29124,9 +29123,19 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
          && b->regvm_ctl_count == 0
          && regvm_code_light_safe(b->regvm_code, b->regvm_len)) {
          b->regvm_light = 1;

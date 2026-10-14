@@ -1,27 +1,36 @@
+Subject: Seal a light frame only against its own chunk
+
+What this does
+  Seal a light frame only against its own chunk.
+
+Why we need it
+  When that push opened a new chunk, the record fill sealed `regvm_cur` again and a frame in the previous chunk against the new chunk's base, so a recursion alternating a light function with one that has a `try` ran out of arena at depth 141 instead of about 5000.
+
+What it adds
+  `regvm_light_seal` returns when the frame lies outside the current chunk; that frame is already covered by its chunk's `saved_top`, because every handler seals before it pushes.
+
+Needs a bytecode version bump
+  light-only and record-only depths unchanged
 diff --git a/quickjs.c b/quickjs.c
+index d962a8e..1b9398e 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -27246,12 +27246,25 @@
+@@ -26478,12 +26478,19 @@ regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
  static inline void regvm_light_seal(JSRuntime *rt, JSRegRun *lf)
  {
      if (lf != NULL && lf->sf == NULL) {
 -        size_t top = (size_t)((uint8_t *)lf->fr - rt->regvm_frames)
 -                   + lf->b->regvm_end_off;
-+        size_t top;
- 
+-
 -        /* A light frame's record-shaped end can sit past this chunk's end (its
 -           light shape fits, its end_off does not). Clamp so a later chunk pop
 -           does not restore a top past the chunk. */
-+        /*
-+         * Only a frame in the current chunk can be sealed against the current
-+         * top. A record call seals its light caller and then pushes; when that
-+         * push opens a new chunk, the record fill seals `regvm_cur` again, and
-+         * that light frame is now in the previous chunk, already covered by
-+         * its `saved_top`. Measuring it against the new chunk's base gave a
-+         * huge offset that marked the new chunk full, so every later push
-+         * opened another chunk and a light/record recursion ran out of arena
-+         * after ~140 frames.
-+         */
++        size_t top;
++
++        /* Only a frame in the current chunk can be sealed against the current
++           top. A light frame left in the previous chunk when a push opened a
++           new one is already covered by its `saved_top`; measuring it against
++           the new chunk would mark that chunk full. */
 +        if ((uint8_t *)lf < rt->regvm_frames
 +            || (uint8_t *)lf >= rt->regvm_chunk_end)
 +            return;

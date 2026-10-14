@@ -1,6 +1,19 @@
+Subject: Enables five register homes by default
+
+What this does
+  Enables five register homes by default.
+
+Why we need it
+  Shipping builds have no `REGVM_HOMES` knob, so the home allocation was silently disabled.
+
+What it adds
+  Defaults to mode 5 when the knob is absent; knob builds still accept `REGVM_HOMES=0` for bisection.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -52021,7 +52021,7 @@
+@@ -51014,7 +51014,7 @@ static __exception int compute_stack_size(JSContext *ctx,
  static int regvm_homes_mode(void)
  {
      const char *mode = REGVM_KNOB("REGVM_HOMES");

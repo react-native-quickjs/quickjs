@@ -17,14 +17,26 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -59376,7 +59376,10 @@
-          * body would be free to take the register. So every value's interval is
-          * grown to cover each block it is live in, start as well as end.
-          */
+@@ -57756,17 +57756,12 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+             iend[i] = (istart[i] < n_lin) ? e : -1;
+         }
+ 
+-        /*
+-         * A live range can wrap. When a loop's back edge runs from a block laid
+-         * out before the block that defines the value -- an enumerator carried
+-         * round, a phi input from an earlier block -- the value is live in a
+-         * block whose instructions come earlier in linear order than its own
+-         * definition. An interval that ran only from the definition to the last
+-         * use would then have both ends on one side of the loop body, and the
+-         * body would be free to take the register. So every value's interval is
+-         * grown to cover each block it is live in, start as well as end.
+-         */
 -        for (b = 0; b < n_blocks; b++) {
-+        /* The bitsets are absent when no register values exist. In that case
-+           there is no liveness to extend, and even adding a zero offset to the
-+           null pointers is undefined behavior in C. */
++        /* A live range can wrap: a back edge from a block laid out before the
++           defining block keeps the value live in earlier blocks. Each interval
++           is grown to cover every block it is live in, start as well as end. */
++        /* No bitsets without register values; even a zero offset from a null
++           pointer is undefined behavior. */
 +        for (b = 0; words > 0 && b < n_blocks; b++) {
              uint64_t *bin, *bout;
              if (in_depth[b] < 0)

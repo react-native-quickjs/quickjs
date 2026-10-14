@@ -18,7 +18,7 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22817,6 +22817,7 @@
+@@ -22565,6 +22565,7 @@ static uint8_t *regvm_t_unwind_loop(REGVM_ARGS);
  #define T_COUNT_INC(o) ((void)0)
  #endif
  
@@ -26,24 +26,22 @@ Needs a bytecode version bump
  static uint8_t *regvm_t_dispatch(REGVM_ARGS);
  
  /*
-@@ -23183,9 +23184,9 @@
-  * returns the next `ip`, or NULL after setting `f->ret` when it threw. Its only
-  * state is its arguments: no global current record, no hand-back, no second
-  * exit label. Putting `regvm_t_cold` in a table slot is also what marks the
-- * opcode as converted -- the encoder's `regvm_all_threaded` walk already asks
-- * `regvm_threaded[op] != NULL`, so eligibility widens as entries are added and
-- * `regvm_record_eligible` needs no change at all.
-+ * opcode as converted -- the encoder's `regvm_all_threaded` walk reads
-+ * `regvm_is_threaded[op]`, which is generated from the same list, so eligibility
-+ * widens as entries are added and `regvm_record_eligible` needs no change.
+@@ -22879,8 +22880,9 @@ static void regvm_record_release(JSRuntime *rt, JSRegRun *rec);
   *
-  * The money is in the converted set being *cold*: box2d's full blocker set is
-  * about two dozen opcodes and every one of them is under 0.15% of dispatches.
-@@ -23219,196 +23220,250 @@
- {
+  * `regvm_exec_one` executes one instruction against the record and returns the
+  * next `ip`, or NULL after setting `f->ret` when it threw. A `regvm_t_cold`
+- * table slot also marks the opcode as converted: the encoder's
+- * `regvm_all_threaded` walk asks `regvm_threaded[op] != NULL`.
++ * table slot also marks the opcode as converted: `regvm_is_threaded[op]` is
++ * generated from the same list, and the encoder's `regvm_all_threaded` reads
++   it.
+  */
+ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                                JSContext *ctx);
+@@ -22907,195 +22909,249 @@ static uint8_t *regvm_t_cold(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_cold_slow(REGVM_PASS);
  }
-+
+ 
 +/* One source of truth for the explicit threaded handlers. The same list
 +   builds both the handler table and the eligibility table. */
 +#define REGVM_T_EXPLICIT_LIST(X) \
@@ -211,7 +209,7 @@ Needs a bytecode version bump
 +    X(add_imm_self_branch_s, regvm_t_add_imm_self_branch_s) \
 +    X(return, regvm_t_return) \
 +    X(return_undefined, regvm_t_return_undefined)
- 
++
 +#define REGVM_T_FALLBACK_LIST(X) \
 +    X(apply_eval) \
 +    X(await) \
@@ -424,12 +422,12 @@ Needs a bytecode version bump
 +#else
 +    [ROP_call] = regvm_t_to_loop,
 +    [ROP_call_method] = regvm_t_to_loop,
-+#endif
+ #endif
 +#define T_FALLBACK_ENTRY(name) [ROP_##name] = regvm_t_to_loop,
 +    REGVM_T_FALLBACK_LIST(T_FALLBACK_ENTRY)
 +#undef T_FALLBACK_ENTRY
-+};
-+
+ };
+ 
 +static const uint8_t regvm_is_threaded[ROP_COUNT] = {
 +#define T_BINARY_MARK(name, sub) [ROP_##name] = 1,
 +    REGVM_T_BINARY_LIST(T_BINARY_MARK)
@@ -441,11 +439,11 @@ Needs a bytecode version bump
 +#if QJS_REGVM_RECORD
 +    [ROP_call] = 1,
 +    [ROP_call_method] = 1,
- #endif
- };
++#endif
++};
 +#undef REGVM_T_EXPLICIT_LIST
 +#undef REGVM_T_FALLBACK_LIST
- 
++
 +static uint8_t *regvm_t_to_loop(REGVM_ARGS)
 +{
 +#ifdef QJS_REGVM_COUNT
@@ -469,8 +467,8 @@ Needs a bytecode version bump
  }
  
  /*
-@@ -25709,7 +25764,7 @@
-  * call, and it disappears entirely once every opcode has a handler.
+@@ -25149,7 +25205,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+  * entry costs a load and a test rather than a call.
   */
  #define REGVM_NEXT() do { \
 -            if (unlikely(regvm_threaded[*rpc] != NULL)) \
@@ -478,7 +476,7 @@ Needs a bytecode version bump
                  rpc = regvm_t_dispatch(rpc, regs, &run, ctx); \
              if (unlikely(rpc == NULL)) { \
                  ret_val = run.ret; \
-@@ -56151,7 +56206,7 @@
+@@ -54776,7 +54832,7 @@ static void regvm_note_blockers(JSFunctionBytecode *cb)
          int op = *p, sz;
          if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
              break;
@@ -487,7 +485,7 @@ Needs a bytecode version bump
              js_regvm_blockers[op]++;
          sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
          if (sz < 0)
-@@ -57217,7 +57272,7 @@
+@@ -55793,7 +55849,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                  while (_p < _end) {
                      int _op = *_p;
                      int _sz;

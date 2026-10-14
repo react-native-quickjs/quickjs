@@ -1,27 +1,19 @@
-Subject: register VM slims the JS-to-JS call frame record
+Subject: Slims the JS-to-JS call frame record
 
-What this does:
-  A record frame (`JSRegRun`) carried several fields that nothing in the register
-  VM ever reads: `rt` (the only `->rt` access in the VM), the transfer form's
-  `set_d`/`set_s` (the `regvm_t_move_xfer_slow` handler that read them no longer
-  exists) and `func_obj` (a duplicate of `sf->cur_func`, whose one reader, the
-  `super` path of `init_ctor`, now goes through the frame). `rec->ctx` is read
-  only by the register-file consistency checker, so its store is compiled only
-  under `QJS_REGVM_RCCHECK`. `sf->cur_sp` is never read for a record frame either
-  (only async state's frame and the stack VM use it), so the record fill no
-  longer clears it.
+What this does
+  Slims the JS-to-JS call frame record.
 
-  `regvm_record_fill`, the entry-record setup and the in-loop rebind all drop the
-  corresponding stores; the struct shrinks by four members.
+Why we need it
+  A record frame carried several fields nothing in the register VM reads (`rt`, the transfer form's `set_d`/`set_s` whose `regvm_t_move_xfer_slow` handler no longer exists, and `func_obj`, a duplicate of `sf->cur_func`); `rec->ctx` is read only by the register-file consistency checker and `sf->cur_sp` is never read for a record frame.
 
-  Measured (`fixed.js`, i7-8700), interleaved against 0151:
-  22,760.2/22,760.6 M -> 22,577.0/22,579.3 M instructions (**-0.182 G, -0.80 %**),
-  cycles 10,897/10,954 M -> 10,850/10,863 M. Full gate 8 pass / 0 fail:
-  22,577,121,551 / 10,827,075,131; box2d checksum exact; diff-suite 398/0/0 mono
-  and threaded; leak assertion clean; peak RSS 13244 KB; test262 errors 50 (<= 64).
+What it adds
+  `regvm_record_fill`, the entry-record setup and the in-loop rebind drop the corresponding stores (the struct shrinks by four members); `rec->ctx`/`run.ctx` are compiled only under `QJS_REGVM_RCCHECK`; the one `func_obj` reader, `init_ctor`'s `super` path, now reads `f->sf->cur_func`.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23857,7 +23857,6 @@
+@@ -23449,25 +23449,14 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
  
  typedef struct JSRegRun {
      JSContext *ctx;
@@ -29,25 +21,28 @@ What this does:
      JSFunctionBytecode *b;
      JSRegPIC *pic;              /* register VM property-cache base for this frame */
      JSStackFrame *sf;
-@@ -23867,7 +23866,8 @@
-      * The activation's own call state, which the cold trampoline's arms need:
-      * `rest` and `special_object` build `arguments` from `argc`/`argv`,
-      * `check_ctor` tests `new_target`, and `init_ctor` reads the prototype of
+     JSVarRef **var_refs;
+     JSValueConst this_obj;
+-    /*
+-     * The activation's own call state, which the cold trampoline's arms need:
+-     * `rest` and `special_object` build `arguments` from `argc`/`argv`,
+-     * `check_ctor` tests `new_target`, and `init_ctor` reads the prototype of
 -     * `func_obj`. All borrowed -- the caller's frame owns them for the call.
-+     * the callee (`sf->cur_func`, the `func_obj` this frame used to keep). All
-+     * borrowed -- the caller's frame owns them for the call.
-      *
-      * `new_target` is always undefined in a record, and that is correct rather
-      * than a gap: a record is only ever created by `regvm_t_call_record` /
-@@ -23875,7 +23875,6 @@
-      * `ROP_construct` -> `JS_CallConstructorInternal` -> a fresh C activation, so
-      * a class constructor never enters through the chain.
-      */
+-     *
+-     * `new_target` is always undefined in a record, and that is correct rather
+-     * than a gap: a record is only ever created by `regvm_t_call_record` /
+-     * `_method_record`, i.e. by a *plain* call, and `new C()` goes through
+-     * `ROP_construct` -> `JS_CallConstructorInternal` -> a fresh C activation, so
+-     * a class constructor never enters through the chain.
+-     */
 -    JSValueConst func_obj;
++    /* The activation's call state, read by the cold arms (`rest`,
++       `special_object`, `check_ctor`, `init_ctor`). Borrowed: the caller's
++       frame owns it for the call. */
      JSValueConst new_target;
      int argc;
      JSValue *argv;
-@@ -23891,12 +23890,9 @@
+@@ -23484,12 +23473,8 @@ typedef struct JSRegRun {
      JSValue *arg_buf;
      JSValue *var_buf;
      JSValue ret;                /* JS_EXCEPTION when a handler had to stop */
@@ -58,12 +53,11 @@ What this does:
 -    int set_d;
 -    int set_s;
 +    /* `set_v` is the value whose count reached zero, handed to
-+       regvm_t_free_slow so that a cold path can be a tail call, which is what
-+       keeps the handler frameless. */
++       regvm_t_free_slow so a cold path can be a tail call. */
      JSValue set_v;
      /*
       * The frame's call flags. Fixed for the activation and set once, so it does
-@@ -27244,8 +27240,9 @@
+@@ -26459,8 +26444,9 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      rec->caller = caller;
      rec->ret_ip = ret_ip;
      rec->ret_dst = ret_dst;
@@ -74,7 +68,7 @@ What this does:
      rec->b = cb;
      rec->pic = cb->regvm_pic;
  #ifdef QJS_REGVM_RCCHECK
-@@ -27259,7 +27256,6 @@
+@@ -26474,7 +26460,6 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      rec->var_refs = co->u.func.var_refs;
      rec->var_buf = lay->var_buf;
      rec->this_obj = this_obj;
@@ -82,16 +76,16 @@ What this does:
      rec->new_target = JS_UNDEFINED;
      rec->argc = na;
      rec->argv = (JSValue *)oargv;
-@@ -27268,8 +27264,6 @@
+@@ -26483,8 +26468,6 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      rec->flags = 0;
      rec->ret = JS_UNDEFINED;
      rec->set_v = JS_UNDEFINED;
 -    rec->set_d = 0;
 -    rec->set_s = 0;
      /*
-      * Arguments: alias the caller's outgoing window when it supplies at least
-      * every declared argument, and copy only when the callee declares more than
-@@ -27329,7 +27323,6 @@
+      * Arguments: alias the caller's outgoing window when it supplies every
+      * declared argument, and copy only when the callee declares more, as
+@@ -26534,7 +26517,6 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      sf->var_ref_count = cb->var_ref_count;
      sf->cur_gc_obj = NULL;
      sf->cur_pc = NULL;
@@ -99,9 +93,9 @@ What this does:
      sf->prev_frame = caller->sf;
      REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
  
-@@ -27494,8 +27487,9 @@
-          * *pointer* does not move even when its contents do.
-          */
+@@ -26681,8 +26663,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+            fixed for the activation (the var_refs pointer too, though not its
+            contents). */
          JSRegRun run;
 +#ifdef QJS_REGVM_RCCHECK
          run.ctx = ctx;
@@ -110,7 +104,7 @@ What this does:
          run.b = b;
          run.pic = b->regvm_pic;
  #ifdef QJS_REGVM_RCCHECK
-@@ -27507,7 +27501,6 @@
+@@ -26694,7 +26677,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          run.sf = sf;
          run.var_refs = var_refs;
          run.this_obj = this_obj;
@@ -118,7 +112,7 @@ What this does:
          run.new_target = new_target;
          run.argc = argc;
          run.argv = (JSValue *)argv;
-@@ -27995,13 +27988,11 @@
+@@ -27146,13 +27128,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  #if QJS_REGVM_THREAD
  #define REGVM_T_RUN_REBIND() do { \
          run.ctx = ctx; \
@@ -132,7 +126,7 @@ What this does:
          run.new_target = new_target; \
          run.argc = argc; \
          run.argv = (JSValue *)argv; \
-@@ -28149,7 +28140,6 @@
+@@ -27300,7 +27280,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                          _lay.sf->var_ref_count = _cb->var_ref_count; \
                          _lay.sf->cur_gc_obj = NULL; \
                          _lay.sf->cur_pc = NULL; \
@@ -140,7 +134,7 @@ What this does:
                          _lay.sf->prev_frame = rt->current_stack_frame; \
                          REGVM_SET_ROOT(_lay.sf, _lay.regs, _cb->regvm_reg_count + REGVM_HS - 1); \
                          for (_k = 0; _k < _slots; _k++) \
-@@ -32190,7 +32180,7 @@
+@@ -30943,7 +30922,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                            "class constructors must be invoked with 'new'");
                          goto exception;
                      }

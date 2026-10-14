@@ -1,59 +1,21 @@
-Subject: register VM: deferred reference counting zero-count table (stage D2)
+Subject: Turns on deferred reference counting with a zero-count table
 
-What this does:
-  Stage D2 of the deferred-RC plan
-  (`HP-S3-DEFERRED-RC-PLAN-2026-10-02.md` section 3) turns the collector on.
-  Register-VM frames are already published as GC root ranges (D1); D2 makes a
-  counted value whose ref_count reaches zero park on a zero-count table (ZCT)
-  instead of being freed, and adds the reconcile pass that frees only the parked
-  values no live register refers to. Registers still own their values at this
-  stage, so the table is expected to stay small; the point is to validate the
-  machinery before D4 makes register stores stop owning.
+What this does
+  Turns on deferred reference counting with a zero-count table.
 
-  Concretely:
-  - `JSMallocBlockHeader` gains `in_zct : 1` (the `gc_obj_type` field narrows
-    from 6 to 5 bits; the bit lives in the same byte as `mark`/`gc_notrace`).
-  - `JSRuntime` gains the ZCT (`zct`, `zct_len`, `zct_cap`, `zct_nobj`,
-    `zct_limit`, `drc_in_reconcile`). The table is grown with the raw
-    `rt->mf.js_realloc` (never `js_realloc_rt`) so pushing a value can never
-    trigger a GC, and is released with the matching `rt->mf.js_free`.
-  - `js_free_value_rt` parks a value at zero instead of freeing it: objects and
-    function bytecodes move to `gc_zero_ref_count_list`; every other counted
-    type is appended to `rt->zct`.
-  - `js_drc_pin` / `js_drc_unpin` add and remove the register-window references,
-    and `js_drc_reconcile_locked` frees the parked values no register holds.
-    `JS_RunGC` runs pin, reconcile, the existing cycle collector, then unpin, so
-    a register-only object has a count of at least one while the collector runs.
-  - Safepoints (`js_drc_safepoint`, a cheap check against `zct_limit`) run from
-    `__js_poll_interrupts` and when `JS_Call` returns to C with no JS frame;
-    `JS_FreeRuntime` reconciles and drops the table before its list assertions.
+Why we need it
+  The register VM frees a value the moment its count hits zero, but a register that still holds it is about to be overwritten; so a zero-count table can park those values and a reconcile pass can free only the ones no register refers to.
 
-  The public behaviour is unchanged: the differential suite, the box2d
-  checksum, the leak assertion and the ASan/UBSan runs are all clean.
+What it adds
+  `JSMallocBlockHeader.in_zct`, `JSRuntime.zct`/`zct_len`/`zct_cap`/`zct_nobj`/`zct_limit`/`drc_in_reconcile`, `js_free_value_rt` parks at zero, `js_drc_push`/`js_drc_zero`/`js_drc_pin`/`js_drc_unpin`/`js_drc_reconcile(_locked)`/`js_drc_safepoint`, `JS_RunGC` runs pin/reconcile/gc/unpin, safepoints from `__js_poll_interrupts` and `JS_Call` returning to C, `JS_FreeRuntime` reconciles and frees the table; `QJS_DRC_VALIDATE` builds additionally assert every counted register value is still owned.
 
-  Measured cost on `.local/box2d-gap/fixed.js` (interleaved `perf stat -r5`
-  against the same tree built with `-DQJS_DRC=0`): about +0.18G instructions
-  and +2.6% cycles. That is above the plan's soft gate of +0.10G but well below
-  its +0.3G abort threshold, and it is the deferred-free bookkeeping
-  (park + reconcile) rather than the safepoint or pin walk, which the counters
-  show run only ~2k / ~14k register slots over the whole benchmark. D4 removes
-  the register-release traffic that dominates this cost, so it is carried as a
-  known stage-D2 overhead rather than optimised here.
-
-  Also fixes the validator build guard: the `js_drc_validate_roots` call in
-  `JS_RunGC` is now compiled only when `QJS_REGVM` is on, matching the
-  function's own guard, so a `QJS_DRC_VALIDATE` build of the plain stack
-  interpreter compiles.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -66,15 +66,19 @@
- /*
-  * Deferred reference counting (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md).
-  * QJS_DRC enables the machinery (ZCT, reconcile, register-root scanning);
-- * it is off until stage D2. QJS_DRC_VALIDATE adds the debug root validator.
-+ * it is on from stage D2. QJS_DRC_VALIDATE adds the debug root validator.
-  */
+@@ -66,12 +66,16 @@ typedef struct JSRegRCC JSRegRCC;
+ /* Deferred reference counting. QJS_DRC enables the machinery (ZCT, reconcile,
+    register-root scanning); QJS_DRC_VALIDATE adds the debug root validator. */
  #ifndef QJS_DRC
 -#define QJS_DRC 0
 +#define QJS_DRC 1
@@ -69,7 +31,7 @@ What this does:
  #if defined(EMSCRIPTEN) || defined(_MSC_VER)
  #define DIRECT_DISPATCH  0
  #else
-@@ -394,7 +398,8 @@
+@@ -389,7 +393,8 @@ typedef struct JSMallocBlockHeader {
      uint8_t  block_size_idx;
      /* GC/refcount header merged into the allocator header:
         the object body keeps only JSGCObjectHeader.link (no ref_count/flags). */
@@ -79,15 +41,15 @@ What this does:
      uint8_t  mark : 1;        /* used by the cycle collector */
      uint8_t  gc_notrace : 1;  /* on gc_notrace_list, not gc_obj_list */
      int      ref_count;
-@@ -472,6 +477,17 @@
+@@ -467,6 +472,17 @@ struct JSRuntime {
      int gc_notrace_ok;   /* 0 once a 2nd JSContext exists */
      /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
      struct list_head gc_zero_ref_count_list;
-+    /* Deferred reference counting (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md).
-+       Values whose ref_count reached zero are parked here until a safepoint
-+       reconciles them against the live register frames. `zct` holds the
-+       non-GC counted values (strings, ropes, BigInt, symbols); objects go on
-+       gc_zero_ref_count_list and are counted by `zct_nobj`. */
++    /* Deferred reference counting. Values whose ref_count reached zero are
++       parked here until a safepoint reconciles them against the live register
++       frames. `zct` holds the non-GC counted values (strings, ropes, BigInt,
++       symbols); objects go on gc_zero_ref_count_list and are counted by
++       `zct_nobj`. */
 +    JSValue *zct;
 +    uint32_t zct_len;
 +    uint32_t zct_cap;
@@ -97,7 +59,7 @@ What this does:
      struct list_head tmp_obj_list; /* used during GC */
      JSGCPhaseEnum gc_phase : 8;
      size_t malloc_gc_threshold;
-@@ -2914,6 +2930,14 @@
+@@ -2871,6 +2887,14 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
      rt->gc_notrace_ok = 1;
      init_list_head(&rt->gc_zero_ref_count_list);
      rt->gc_phase = JS_GC_PHASE_NONE;
@@ -112,7 +74,7 @@ What this does:
  
  #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
      init_list_head(&rt->string_list);
-@@ -3326,6 +3350,15 @@
+@@ -3282,6 +3306,15 @@ void JS_FreeRuntime(JSRuntime *rt)
      }
  #endif
  
@@ -128,19 +90,18 @@ What this does:
      assert(list_empty(&rt->gc_notrace_list));
      assert(list_empty(&rt->gc_obj_list));
  
-@@ -9091,11 +9124,181 @@
+@@ -8998,11 +9031,179 @@ static void free_zero_refcount(JSRuntime *rt)
      rt->gc_phase = JS_GC_PHASE_NONE;
  }
  
 +#if QJS_DRC
-+/* ---- Deferred reference counting (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md) ----
++/* ---- deferred reference counting ------------------------------------------
 + *
-+ * Register frames are GC roots. When a counted value's ref_count reaches zero
-+ * it is parked (objects on gc_zero_ref_count_list, every other type in
-+ * rt->zct) instead of being freed. js_drc_reconcile() pins every value still
-+ * held by a live register window, frees the parked values that no register
-+ * refers to, then unpins. A counted value at ref_count zero is therefore never
-+ * freed outside js_drc_reconcile().
++ * Register frames are GC roots. A counted value whose ref_count reaches zero
++ * is parked (objects on gc_zero_ref_count_list, everything else in rt->zct)
++ * instead of freed. js_drc_reconcile() pins every value a live register window
++ * holds, frees the parked values no register refers to, then unpins. A counted
++ * value at zero is never freed outside js_drc_reconcile().
 + */
 +#define JS_GC_IN_ZCT(p) (js_rc(p)->in_zct)
 +
@@ -150,8 +111,7 @@ What this does:
 +{
 +    if (rt->zct_len == rt->zct_cap) {
 +        uint32_t ncap = rt->zct_cap ? rt->zct_cap * 2 : 256;
-+        /* Must not go through js_realloc_rt(): pushing onto the ZCT is not
-+           allowed to trigger a GC. */
++        /* Not js_realloc_rt(): pushing onto the ZCT must not trigger a GC. */
 +        JSValue *nz = rt->mf.js_realloc(rt->malloc_state.opaque, rt->zct,
 +                                        sizeof(JSValue) * ncap);
 +        if (!nz)
@@ -235,9 +195,9 @@ What this does:
 +
 +    rt->drc_in_reconcile = 1;
 +
-+    /* Non-GC counted values (strings, ropes, BigInt, symbols). Clear the
-+       in_zct bits first so that a value resurrected and then freed by a
-+       cascade cannot leave a dangling marker behind. */
++    /* Non-GC counted values (strings, ropes, BigInt, symbols). Clear the in_zct
++       bits first so a value resurrected and then freed by a cascade leaves no
++       dangling marker. */
 +    for (i = 0; i < rt->zct_len; i++)
 +        JS_GC_IN_ZCT(JS_VALUE_GET_PTR(rt->zct[i])) = 0;
 +    for (i = 0; i < rt->zct_len; i++) {
@@ -283,8 +243,8 @@ What this does:
 +        js_drc_reconcile(rt);
 +}
 +
-+/* Adopt a value that is being stored into a register: drop the reference
-+   previously owned by the destination. Only used from stage D4 onwards. */
++/* Adopt a value being stored into a register: drop the reference previously
++   owned by the destination. */
 +#define REG_ADOPT(rt, v)                                                     \
 +    do {                                                                     \
 +        if (JS_VALUE_HAS_REF_COUNT(v) &&                                     \
@@ -310,24 +270,23 @@ What this does:
  #ifdef ENABLE_DUMPS // JS_DUMP_FREE
      if (check_dump_flag(rt, JS_DUMP_FREE)) {
          /* Prevent invalid object access during GC */
-@@ -9529,9 +9732,15 @@
+@@ -9436,8 +9637,14 @@ size_t JS_GetMallocSize(JSRuntime *rt)
  
  void JS_RunGC(JSRuntime *rt)
  {
 -#if QJS_DRC_VALIDATE
 +#if QJS_REGVM && QJS_DRC_VALIDATE
      js_drc_validate_roots(rt);
- #endif
++#endif
 +#if QJS_DRC
-+    /* Keep register-held objects alive through the collector: pin the
-+       register windows, drain the parked values, then collect while pinned. */
++    /* Pin the register windows, drain the parked values, then collect while
++       pinned. */
 +    js_drc_pin(rt);
 +    js_drc_reconcile_locked(rt);
-+#endif
+ #endif
      /* decrement the reference of the children of each object. mark =
         1 after this pass. */
-     gc_decref(rt);
-@@ -9541,6 +9750,12 @@
+@@ -9448,6 +9655,12 @@ void JS_RunGC(JSRuntime *rt)
  
      /* free the GC objects in a cycle */
      gc_free_cycles(rt);
@@ -340,7 +299,7 @@ What this does:
  }
  
  /* Return false if not an object or if the object has already been
-@@ -10909,6 +11124,7 @@
+@@ -10815,6 +11028,7 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
  {
      JSRuntime *rt = ctx->rt;
      ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
@@ -348,7 +307,7 @@ What this does:
      if (rt->interrupt_handler) {
          if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
              JS_ThrowInterrupted(ctx);
-@@ -32558,7 +32774,11 @@
+@@ -31374,7 +31588,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          sf->var_refs[i] = NULL;
      /* ordinary C-stack frame: not owned by a coroutine GC object */
      sf->cur_gc_obj = NULL;
@@ -360,7 +319,7 @@ What this does:
      sp = stack_buf;
      pc = b->byte_code_buf;
      /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
-@@ -36047,8 +36267,13 @@
+@@ -34857,8 +35075,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                  int argc, JSValueConst *argv)
  {

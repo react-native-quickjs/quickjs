@@ -1,61 +1,21 @@
-From: quickjs-ng bundle work
-Subject: Register bundles: decoder hardening (P4)
+Subject: Register bundles: decoder hardening
 
 What this does
-  Hardens the register bundle reader against corrupted input, found with the
-  P4 fuzz smoke test (.local/regvm-bundle/fuzz.c). Four fixes:
-
-  1. regvm_wire_decode wrote the opcode byte before checking that the
-     instruction fits: a wire stream longer than exec_len could run one
-     instruction past the allocation (heap-buffer-overflow). The check is now
-     "q = exec + 1 > exec_len" before any byte of the instruction is written.
-
-  2. regvm_unmap_atoms assembled a 4-byte atom as
-     code[q] | code[q+1] << 8 | ... on int, so a byte >= 0x80 in the top
-     position was a signed-shift overflow (UBSan). Each byte is cast to
-     uint32_t first.
-
-  3. js_closure2 aborts on an unknown closure type, and the reader did not
-     check the 3-bit field. A corrupted bundle could reach that abort; the
-     reader now rejects closure_type > JS_CLOSURE_GLOBAL_REF.
-
-  4. The runtime dereferences frame slot operands without a second check: a
-     var_ref slot is a pointer array followed by the control stack (a wild
-     pointer), and an out-of-range vardef index makes get_var_ref build a
-     var_ref from garbage. regvm_wire_decode now bounds every slot operand --
-     local/close/uninit against var_count, arg/arg_xfer/arg_el against
-     var_count or arg_count, get/put/check var_ref and make_local_ref against
-     max(var_ref_count, closure_var_count) (a var_ref slot may name a captured
-     local or a closure variable) -- and the vardef reader rejects a captured
-     variable whose var_ref_idx is >= var_ref_count.
+  Register bundles: decoder hardening.
 
 Why we need it
-  A bundle is untrusted input, and the register reader is now the only reader
-  of a register program: the decoder's operand checks are the whole contract.
-  Before this, a corrupted bundle could write past the decoded program, trip a
-  UBSan shift, or hand the interpreter a wild var_ref.
+  A corrupted bundle could write past the decoded program, abort `js_closure2` on a bad closure type, or hand the interpreter a wild `var_ref`; the decoder is the only reader of a register program, so its checks are the whole contract.
 
 What it adds
-  quickjs.c
-      the exec_len bound in regvm_wire_decode; the uint32_t casts in
-      regvm_unmap_atoms; the slot-operand bound block in regvm_wire_decode; the
-      closure-type check in JS_ReadFunctionTag; the var_ref_idx check in
-      JS_ReadFunctionBody.
+  Exec_len bound in `regvm_wire_decode`; `uint32_t` casts in `regvm_unmap_atoms`; slot-operand bounds for local/arg/var_ref/`make_local_ref`; closure-type check in `JS_ReadFunctionTag`; `var_ref_idx` check in `JS_ReadFunctionBody`.
 
-  Fuzz (.local/regvm-bundle/fuzz.c, 20,000 iterations, box2d bundle, 1-8 random
-  bytes flipped, checksum bypassed with the UINT32_MAX escape hatch, ASan +
-  UBSan): eager and lazy reads are clean. A build with the register wire
-  decoder disabled still reads the same bundle in 0.12 s (P3 measurement), so
-  the read paths are genuinely exercised.
-
-  Gates: box2d 546.1008391043414 (source/eager/lazy); test262 50/81192 no
-  leaks; the 13 Octane rows read clean in all three modes.
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index bbe4727..1821a5f 100644
+index 290033f..ebf975b 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -60153,9 +60153,9 @@ static void regvm_unmap_atoms(uint8_t *code, int len, int wide, int n,
+@@ -58430,9 +58430,9 @@ static void regvm_unmap_atoms(uint8_t *code, int len, int wide, int n,
              if (fmt[m] == 'a' ||
                  ((op == ROP_load_const || op == ROP_binary_cpool) && fmt[m] == 'c' &&
                   kind == REG_CONST_ATOM)) {
@@ -68,7 +28,7 @@ index bbe4727..1821a5f 100644
                  JS_FreeAtomRT(rt, a);
                  if (++seen == n)
                      return;
-@@ -73457,6 +73457,10 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+@@ -70882,6 +70882,10 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
          }
          nar = regvm_rop_narrow((uint16_t)op);
          q = exec + 1;
@@ -79,18 +39,16 @@ index bbe4727..1821a5f 100644
          for (m = 0; fmt[m]; m++) {
              int need, is_atom = 0;
              uint32_t v;
-@@ -73584,6 +73588,61 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71009,6 +71013,59 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
              JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
              goto fail_ins;
          }
 +        {
 +            /* Slot operands index the frame's local, argument or closure-ref
-+               arrays, and the runtime dereferences the result without any
-+               further check (a bad var_ref slot is a wild pointer; a bad vardef
-+               index makes get_var_ref build one from garbage). Bound every one
-+               here, where the counts are known. A var_ref slot may name either a
-+               captured local (var_ref_count) or a closure variable
-+               (closure_var_count), so its bound is the larger of the two. */
++               arrays, which the runtime dereferences unchecked, so bound every
++               one here. A var_ref slot may name a captured local or a closure
++               variable, so its bound is the larger of var_ref_count and
++               closure_var_count. */
 +            uint32_t vr_bound = b->var_ref_count > b->closure_var_count
 +                                    ? b->var_ref_count : b->closure_var_count;
 +            int slot = -1;
@@ -141,14 +99,13 @@ index bbe4727..1821a5f 100644
          if (op == ROP_make_local_ref && ops[4] == 1)
              borrowable = false;
          if (op == ROP_special_object && ops[1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS)
-@@ -74153,6 +74212,15 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71570,6 +71627,14 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
                      b->args_captured = 1;
                  if (bc_get_leb128_u16(s, &vd->var_ref_idx))
                      return -1;
 +#if QJS_REGVM
-+                /* get_var_ref indexes sf->var_refs[vd->var_ref_idx] with no
-+                   bound of its own; a corrupted index would build a var_ref
-+                   from garbage. */
++                /* get_var_ref has no bound of its own on
++                   sf->var_refs[vd->var_ref_idx]. */
 +                if (vd->var_ref_idx >= b->var_ref_count) {
 +                    JS_ThrowSyntaxError(ctx, "invalid var_ref index");
 +                    return -1;
@@ -157,13 +114,12 @@ index bbe4727..1821a5f 100644
              }
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
              if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
-@@ -74651,6 +74719,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -72061,6 +72126,14 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                  goto fail;
              idx = 0;
              cv->closure_type = bc_get_flags(flags, &idx, 3);
 +#if QJS_REGVM
-+            /* js_closure2 aborts on an unknown closure type, so a corrupted
-+               bundle must be rejected here instead of crashing later. */
++            /* js_closure2 aborts on an unknown closure type; reject it here. */
 +            if (cv->closure_type > JS_CLOSURE_GLOBAL_REF) {
 +                JS_ThrowSyntaxError(ctx, "invalid closure type %d",
 +                                    cv->closure_type);

@@ -1,3 +1,16 @@
+Subject: Adds the `QJS_REGVM_RCCHECK` value-id shadow checker, and fixes two entry facts it exposed
+
+What this does
+  Adds the `QJS_REGVM_RCCHECK` value-id shadow checker, and fixes two entry facts it exposed.
+
+Why we need it
+  And two block entries were under-approximated.
+
+What it adds
+  The encoder emits a per-instruction side table attached to the bytecode as a debug pointer; under `QJS_REGVM_RCCHECK` the threaded dispatch hook keeps one shadow value id per register and asserts each read finds the id the IR names, each plain store finds its destination count-free, and each return finds no counted register outside its release set. Reads of coalesced phis (a value defined only by a `REGVM_ORIG_PHI` edge move, or by nothing at all) are skipped, not its own block, and a `finally_enter` (gosub) return address is the next lowered instruction, so both entries are MAYBE.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -59,6 +59,8 @@
@@ -9,16 +22,16 @@
  #endif
  
  #if defined(EMSCRIPTEN) || defined(_MSC_VER)
-@@ -1196,6 +1198,8 @@
+@@ -1168,6 +1170,8 @@ typedef struct JSFunctionBytecode {
      /* Runtime-only property cache owned by the register VM. Its entries hold
         counted shape references; stack-VM inline caches remain in ic_table. */
      JSRegPIC *regvm_pic;
-+    /* Section 6.2 side table, debug builds only. Owned by the bytecode. */
++    /* The ownership side table, debug builds only. Owned by the bytecode. */
 +    JSRegRCC *regvm_rcc;
  #endif
  } JSFunctionBytecode;
  
-@@ -22920,6 +22924,13 @@
+@@ -22607,6 +22611,13 @@ typedef struct JSRegRun {
      int       local_count;      /* how many JSValues the walk owns */
      int       arg_owned;        /* 1 when the argument area holds our dups */
      JSStackFrame sf_embed;      /* a nested frame's JSStackFrame lives here */
@@ -32,7 +45,7 @@
  } JSRegRun;
  
  typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
-@@ -23639,10 +23650,188 @@
+@@ -23265,10 +23276,188 @@ static uint8_t *REGVM_CC regvm_t_to_loop(REGVM_ARGS)
      return ip;
  }
  
@@ -221,7 +234,7 @@
      __attribute__((musttail)) return h(REGVM_PASS);
  }
  
-@@ -25090,6 +25279,10 @@
+@@ -24564,6 +24753,10 @@ static void regvm_record_release(JSRuntime *rt, JSRegRun *rec)
      }
      if (unlikely(sf->var_ref_count != 0))
          js_closcyc_frame(rt, sf, true);
@@ -232,7 +245,7 @@
      regvm_arena_pop(rt, rec);
  }
  
-@@ -25260,6 +25453,12 @@
+@@ -24689,6 +24882,12 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      rec->rt = rt;
      rec->b = cb;
      rec->pic = cb->regvm_pic;
@@ -245,7 +258,7 @@
      rec->sf = sf;
      rec->fr = lay->regs;
      rec->var_refs = co->u.func.var_refs;
-@@ -25439,6 +25638,12 @@
+@@ -24848,6 +25047,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          run.rt = rt;
          run.b = b;
          run.pic = b->regvm_pic;
@@ -258,7 +271,7 @@
          run.sf = sf;
          run.var_refs = var_refs;
          run.this_obj = this_obj;
-@@ -26101,6 +26306,7 @@
+@@ -25473,6 +25678,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              } \
              op = *rpc++; \
              REGVM_COUNT_INC(op); \
@@ -266,7 +279,7 @@
              goto *regvm_dispatch[op]; \
          } while (0)
  #else
-@@ -28720,6 +28926,10 @@
+@@ -27925,6 +28131,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          goto done;
  
       done_generator:
@@ -277,7 +290,7 @@
          sf->cur_pc = pc;
          sf->cur_sp = sp;
          regs[b->regvm_reg_count] = js_int32(regvm_nctl);
-@@ -28732,6 +28942,10 @@
+@@ -27937,6 +28147,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  #endif
  
       done:
@@ -288,7 +301,7 @@
  #if QJS_REGVM_INLOOP_CALL
          /*
           * The belt, and it is here rather than at each of the opcodes that
-@@ -36200,6 +36414,7 @@
+@@ -35145,6 +35359,7 @@ typedef struct JSFunctionDef {
      int regvm_pic_count;
      uint8_t regvm_compiled; /* the backend lowered this function */
      uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
@@ -296,15 +309,12 @@
  #endif
  } JSFunctionDef;
  
-@@ -52301,6 +52516,15 @@
+@@ -51214,6 +51429,12 @@ static int regvm_homes_mode(void)
  #error "QJS_REGVM_RECORD is the threaded chain's state model"
  #endif
  
-+/*
-+ * Section 6.2's shadow checker instruments the threaded dispatch and the
-+ * monolith's threaded entry. The plain monolith loop and the asm core have no
-+ * hook, so build it only in the shipping configuration.
-+ */
++/* The ownership shadow checker instruments the threaded dispatch and the
++   monolith's threaded entry, so it needs the threaded build. */
 +#if defined(QJS_REGVM_RCCHECK) && (!QJS_REGVM_THREAD || QJS_REGVM_ASM)
 +#error "QJS_REGVM_RCCHECK needs QJS_REGVM_THREAD=1 and QJS_REGVM_ASM=0"
 +#endif
@@ -312,9 +322,9 @@
  
  #if QJS_REGVM_INLOOP_CALL && !QJS_REGVM
  #error "QJS_REGVM_INLOOP_CALL needs QJS_REGVM"
-@@ -52641,6 +52865,14 @@
-      * emitter overrides it for its own phi copies.
-      */
+@@ -51511,6 +51732,14 @@ typedef struct JSRegIR {
+        it once per stack-VM opcode; the edge-move emitter overrides it for its
+        phi copies. */
      uint8_t next_origin;
 +#ifdef QJS_REGVM_RCCHECK
 +    /* Section 6.1 outputs the section 6.2 checker consumes, per instruction. */
@@ -326,8 +336,8 @@
 +#endif
  } JSRegIR;
  
- /*
-@@ -54508,7 +54740,8 @@
+ /* Move origins that are not a stack-VM opcode. */
+@@ -53189,7 +53418,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                                     const int *pc_to_insn, int n_pcs,
                                     int win_size, int cycle_reg,
                                     uint8_t **out_code, int *out_len,
@@ -337,7 +347,7 @@
  {
      uint8_t *code = NULL;
      int *insn_pc = NULL;
-@@ -54680,6 +54913,17 @@
+@@ -53345,6 +53575,17 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
          if (!changed)
              break;
      }
@@ -355,7 +365,7 @@
  #ifdef QJS_REGVM_COUNT
      if (REGVM_KNOB("REGVM_DUMP")) {
          for (i = 0; i < ir->n_insns; i++)
-@@ -56746,24 +56990,76 @@
+@@ -55257,24 +55498,70 @@ static int regvm_own_op_reg(const JSRegInsn *in, int k, const int *ireg,
   * over-approximate, and it reaches the fixed point. Strong updates, which need
   * the SSA value to know the previous definition is dead, are a later refinement.
   */
@@ -379,15 +389,9 @@
 +    }
 +}
 +
-+/*
-+ * The index in `ops` of an instruction's SECOND destination, or -1. A `yield`
-+ * writes the result at its destination and the resume value in the following
-+ * slot (`ADD(ROP_yield, pop[0], dst, dst + 1)`), and the three `with` ref forms
-+ * write a ref and a value (`ADD(ROP_with_make_ref, dst + 0, dst + 1, ...)`).
-+ * The register holding the second result is as likely to be counted as the
-+ * first, and missing it is how a `plain` store came to be claimed for a
-+ * register the frame still owned.
-+ */
++/* The index in `ops` of an instruction's second destination, or -1. `yield`
++   writes the result and then the resume value in the next slot, and the
++   three `with` ref forms write a ref and a value. */
 +static int regvm_own_second_dest_index(uint16_t rop)
 +{
 +    switch (rop) {
@@ -435,7 +439,7 @@
          return;
      }
      /*
-@@ -56789,11 +57085,23 @@
+@@ -55296,11 +55583,23 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
  {
      int n = ir->insns ? ir->n_insns : 0, nreg = reg_count > 0 ? reg_count : 1;
      int *blk = NULL, *ph = NULL, *pn = NULL, *pb = NULL, *queue = NULL;
@@ -460,7 +464,7 @@
  
      if (n <= 0 || reg_count <= 0 || n_blocks <= 0)
          return;
-@@ -56801,8 +57109,8 @@
+@@ -55308,8 +55607,8 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          return;
      blk = js_malloc(ctx, (size_t)n * sizeof(int));
      ph = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
@@ -471,7 +475,7 @@
      queue = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
      bs = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
      be = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
-@@ -56810,17 +57118,37 @@
+@@ -55317,17 +55616,29 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
      blkout = js_malloc(ctx, (size_t)n_blocks * nreg);
      inq = js_malloc(ctx, (size_t)n_blocks);
      tmp = js_malloc(ctx, nreg);
@@ -489,17 +493,9 @@
 -        blk[i] = b;
 -        if (i > 0 && blk[i] < blk[i - 1]) {
 -            goto done;          /* instructions not grouped by block: skip */
-+    /*
-+     * Block membership by source pc, not by a monotone cursor. The fusion
-+     * passes append branch islands and out-of-line stubs at the end of the IR
-+     * with the `src_pc` of the block they belong to, so the instruction stream
-+     * is *not* grouped by block: after the body the pcs jump back. A cursor
-+     * that only advances files every island under the last block and never
-+     * transfers the block the island belongs to -- which is exactly how a
-+     * counted register comes to look NONE. Map each pc to the block whose
-+     * `bstart` range contains it, and step a block's instructions by
-+     * membership rather than by a contiguous range.
-+     */
++    /* Block membership by source pc: the fusion passes append branch islands
++       and stubs at the end of the IR with their block's `src_pc`, so the stream
++       is not grouped by block. */
 +    for (i = 0; i < n; i++) {
 +        int pc = ir->insns[i].src_pc;
 +        int lo = 0, hi = n_blocks - 1, mb = 0;
@@ -516,7 +512,7 @@
      }
      for (b = 0; b < n_blocks; b++) {
          ph[b] = -1;
-@@ -56829,6 +57157,7 @@
+@@ -55336,6 +55647,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          memset(blkin + (size_t)b * nreg, REG_OWN_NONE, nreg);
          memset(blkout + (size_t)b * nreg, REG_OWN_NONE, nreg);
          inq[b] = 0;
@@ -524,19 +520,13 @@
      }
      for (i = 0; i < n; i++) {
          b = blk[i];
-@@ -56836,9 +57165,76 @@
+@@ -55343,9 +55655,61 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
              bs[b] = i;
          be[b] = i + 1;
      }
-+    /*
-+     * Successors, re-derived from the final IR. `succ` predates the fusion
-+     * passes, which append a branch island -- edge copies followed by the branch
-+     * -- that the original CFG never named as a block; and a branch whose target
-+     * is its own block (the back edge of a `with` body, for one) is an edge
-+     * `succ` does not carry. Read each block's branch target back from the IR and
-+     * OR it in, so the join sees every predecessor. Over-approximating here is
-+     * sound: a missing edge is what makes a counted register look NONE.
-+     */
++    /* Successors, re-derived from the final IR: the fusion passes add branch
++       islands the CFG never named, and a branch to its own block is not in
++       `succ`. Over-approximating is sound; a missing edge is not. */
      for (b = 0; b < n_blocks; b++) {
 +        sxn[b] = 0;
          for (k = 0; k < 2; k++) {
@@ -568,23 +558,14 @@
 +                        (tb + 1 >= n_blocks || pc < bstart[tb + 1])) { tgt = tb; break; }
 +            if (tgt < 0)
 +                continue;
-+            /*
-+             * A `catch_enter`/`finally_enter` records the handler pc, and the
-+             * exception unwinder lands there: the handler block is the
-+             * instruction's *target*, not the instruction's own block (the
-+             * `catch_enter` sits at the start of the protected region). Mark
-+             * that block so its entry is MAYBE below.
-+             */
++            /* The exception unwinder lands at a `catch_enter`/`finally_enter`'s
++               handler pc, so mark the target block as MAYBE on entry. */
 +            if (ir->insns[i].rop == ROP_catch_enter ||
 +                ir->insns[i].rop == ROP_finally_enter)
 +                ex_entry[tgt] = 1;
-+            /*
-+             * A `finally_enter` is a gosub: it pushes the pc just past itself
-+             * on the control stack, and the matching `finally_leave` jumps back
-+             * to it. That return address is the next lowered instruction, so
-+             * its block is reachable with whatever the finally body left in the
-+             * registers -- treat its entry as MAYBE, exactly like a handler's.
-+             */
++            /* A `finally_enter` is a gosub: `finally_leave` returns to the next
++               instruction, whose block is entered with whatever the finally
++               left, so it is MAYBE too. */
 +            if (ir->insns[i].rop == ROP_finally_enter &&
 +                i + 1 < ir->n_insns)
 +                ex_entry[blk[i + 1]] = 1;
@@ -601,19 +582,21 @@
              if (sb < 0 || sb >= n_blocks)
                  continue;
              pb[ne] = b;
-@@ -56851,8 +57247,17 @@
-        lattice has height one (NONE -> OWN -> MAYBE), so this terminates. The
-        worklist is a LIFO stack of block ids; `inq` keeps each block in it at
-        most once, so its capacity is exactly n_blocks. */
+@@ -55354,12 +55718,15 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+         }
+     }
+ 
+-    /* Entry: every register NONE. Then a worklist to the fixed point. The
+-       lattice has height one (NONE -> OWN -> MAYBE), so this terminates. The
+-       worklist is a LIFO stack of block ids; `inq` keeps each block in it at
+-       most once, so its capacity is exactly n_blocks. */
 -    queue[sp++] = 0;
 -    inq[0] = 1;
-+    /*
-+     * Seed every block, not just block 0. Successors are enqueued only when a
-+     * block's output *changes*, so a block 0 whose transfer is all NONE (a
-+     * function whose first block only loads constants into a binding, for one)
-+     * would enqueue nothing and the analysis would collapse to all NONE. Every
-+     * block must be visited at least once for its transfer to run at all.
-+     */
++    /* Entry: every register NONE, then a worklist to the fixed point. The
++       lattice has height one (NONE -> OWN -> MAYBE). `inq` keeps each block in
++       the LIFO at most once, so its capacity is n_blocks. */
++    /* Seed every block: successors are enqueued only when an output changes, so
++       an all-NONE block 0 would otherwise stop the analysis. */
 +    for (b = 0; b < n_blocks; b++) {
 +        queue[sp++] = b;
 +        inq[b] = 1;
@@ -621,25 +604,20 @@
      while (sp > 0) {
          uint8_t *in, *out;
          b = queue[--sp];
-@@ -56865,6 +57270,16 @@
+@@ -55372,19 +55739,26 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                      in[i] = regvm_own_join(in[i], o[i]);
              }
          }
-+        /* A catch or finally block is entered by an exception edge, and the
-+           successor lists carry only normal edges. The registers at that
-+           point hold whatever the protected region left in them, so the
-+           entry is MAYBE, not the join of the normal predecessors. The
-+           handler block is the `catch_enter`/`finally_enter` target, found
-+           above. */
++        /* A catch or finally block is entered by an exception edge, which the
++           successor lists omit, so its entry is MAYBE. */
 +        if (ex_entry[b]) {
 +            for (i = 0; i < nreg; i++)
 +                in[i] = REG_OWN_MAYBE;
 +        }
          out = blkout + (size_t)b * nreg;
-         /* Transfer into a scratch buffer, then compare with the block's last
-            output. Comparing with `in` instead would miss a growth that came
-@@ -56872,13 +57287,14 @@
-            and the successors would never be revisited. */
+         /* Transfer into scratch and compare with the block's last output;
+            comparing with `in` would miss growth that came from a predecessor.
+            */
          memcpy(tmp, in, nreg);
          for (i = bs[b]; i >= 0 && i < be[b]; i++)
 -            regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
@@ -657,7 +635,7 @@
                      if (sb >= 0 && sb < n_blocks && !inq[sb]) {
                          queue[sp++] = sb;
                          inq[sb] = 1;
-@@ -56896,6 +57312,24 @@
+@@ -55402,6 +55776,24 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          uint8_t *st = js_malloc(ctx, nreg);
          if (!st)
              goto done;
@@ -682,7 +660,7 @@
          for (b = 0; b < n_blocks; b++) {
              if (bs[b] < 0)
                  continue;
-@@ -56903,12 +57337,23 @@
+@@ -55409,12 +55801,23 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
              for (i = bs[b]; i < be[b]; i++) {
                  JSRegInsn *in = &ir->insns[i];
                  uint16_t rop = in->rop;
@@ -710,7 +688,7 @@
                          if (dump)
                              fprintf(stderr, "##OWN## i=%d r=%d plain\n", i, d);
                      }
-@@ -56919,6 +57364,19 @@
+@@ -55425,6 +55828,19 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                          if (st[k] != REG_OWN_NONE)
                              cnt++;
                      nret++;
@@ -730,7 +708,7 @@
                      if (cnt > owned_max)
                          owned_max = cnt;
                      if (dump) {
-@@ -56958,7 +57416,210 @@
+@@ -55464,8 +55880,211 @@ done:
      js_free(ctx, blkout);
      js_free(ctx, inq);
      js_free(ctx, tmp);
@@ -927,8 +905,8 @@
 +fail:
 +    regvm_rcc_free(ctx, rcc);
 +    return NULL;
-+}
-+
+ }
+ 
 +static void regvm_rcc_free(JSContext *ctx, JSRegRCC *rcc)
 +{
 +    if (!rcc)
@@ -936,12 +914,13 @@
 +    js_free(ctx, rcc->recs);
 +    js_free(ctx, rcc->rels);
 +    js_free(ctx, rcc);
- }
++}
 +#endif /* QJS_REGVM_RCCHECK */
- 
++
  static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                         const uint8_t *bc, int bc_len,
-@@ -56994,13 +57655,22 @@
+                                        const uint8_t *reuse,
+@@ -55500,13 +56119,22 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      int *stub_edge = NULL, *stub_pc = NULL;
      int n_edges = 2 * n_blocks;
      int n_moves = 0, n_stubs = 0, n_stubs_used = 0, unencodable = 0, rc = -1;
@@ -964,7 +943,7 @@
      *p_refused = 0;
      /* Call windows start at reg_count, so every assigned home must be below it. */
      if (home_mode >= 2 && ns_ok > 0)
-@@ -57200,6 +57870,18 @@
+@@ -55698,6 +56326,18 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
       */
      for (k = 0; k <= n_edges; k++)
          ev_cnt[k] = 0;
@@ -983,7 +962,7 @@
      for (b = 0; b < n_blocks; b++) {
          int depth = in_depth[b], off;
          if (depth < 0)
-@@ -57212,6 +57894,13 @@
+@@ -55710,6 +56350,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              phi = ent[off + i];
              for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
                  int p = pred[k], e;
@@ -997,7 +976,7 @@
                  if (out_depth[p] <= i || ireg[out[out_off[p] + i]] == ireg[phi])
                      continue;
                  if (succ[p * 2] == b)
-@@ -57234,6 +57923,13 @@
+@@ -55732,6 +56379,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              phi = senc[b * ns_ok + i];
              for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
                  int p = pred[k], e;
@@ -1011,7 +990,7 @@
                  if (sout[p * ns_ok + i] < 0)
                      continue;
                  if (ireg[sout[p * ns_ok + i]] == ireg[phi])
-@@ -57934,7 +58630,9 @@
+@@ -56380,7 +57034,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          }
          nreg = reg_count + regvm_reserved_regs(&ir, win_size);
          {
@@ -1022,7 +1001,7 @@
                                                                are two bytes */,
                                               reg_count,
                                               fd->cpool_count, fd->regvm_pic_count,
-@@ -57942,7 +58640,9 @@
+@@ -56388,7 +57044,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                               pc_to_insn, bc_len + n_stubs_used,
                                               win_size, cycle_reg, &fd->regvm_code,
                                               &fd->regvm_len,
@@ -1033,7 +1012,7 @@
  
  #if QJS_REGVM_THREAD
              /*
-@@ -57981,6 +58681,7 @@
+@@ -56427,6 +57085,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          }
      }
      js_regvm_stats.encoded_funcs++;
@@ -1041,7 +1020,7 @@
      rc = 0;
      goto done;
   refused:
-@@ -57988,11 +58689,25 @@
+@@ -56434,11 +57093,25 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      *p_refused = 1;
      rc = 0;
   done:
@@ -1067,7 +1046,7 @@
      js_free(ctx, sentinel_bits);
      js_free(ctx, ev_off);
      js_free(ctx, ev_cnt);
-@@ -61302,6 +62017,8 @@
+@@ -59504,6 +60177,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
          b->regvm_reg_count = fd->regvm_reg_count;
          b->regvm_ctl_count = fd->regvm_ctl_count;
          b->regvm_pic_count = fd->regvm_pic_count;
@@ -1076,9 +1055,9 @@
          b->regvm_compiled = 1;
          b->regvm_all_threaded = fd->regvm_all_threaded;
          memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
-@@ -61416,6 +62133,9 @@
+@@ -59618,6 +60293,9 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
  #if QJS_REGVM
-     /* release register-PIC-held shape refs and free the table (A2) */
+     /* release register-PIC-held shape refs and free the table */
      js_free_regvm_pic(rt, b);
 +#ifdef QJS_REGVM_RCCHECK
 +    js_free_regvm_rcc(rt, b);

@@ -1,7 +1,21 @@
+Subject: Debug arena-skew knob
+
+What this does
+  Debug arena-skew knob.
+
+Why we need it
+  
+
+What it adds
+  `REGVM_SKEW` shifts the frame arena under `QJS_REGVM_KNOBS` so `percall.sh` can select an alias-free layout; behaviour is unchanged without the knob.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 767891a..2a5b869 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25130,7 +25130,24 @@
+@@ -24582,7 +24582,24 @@ typedef struct JSRegArenaChunk {
      size_t saved_top;           /* this chunk's top while a later chunk is current */
  } JSRegArenaChunk;
  

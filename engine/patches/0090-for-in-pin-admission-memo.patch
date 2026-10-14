@@ -20,29 +20,15 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -469,7 +469,30 @@
-     JSShape *forin_shape;
+@@ -467,6 +467,16 @@ struct JSRuntime {
      JSAtom forin_atom;
      uint32_t forin_idx;
-+
-+    /* Memo for js_for_in_try_pin's admission scan, which is O(properties) and
-+       was re-run on every for-in entry to re-derive an answer that cannot have
-+       changed. The recorded fact -- "this shape contains only enumerable
-+       plain-string non-VARREF keys, or it does not" -- is a property of the
-+       shape's table, not of any object wearing it, so one entry serves every
-+       object of that shape.
-+
-+       Each slot holds a COUNTED REFERENCE and that is load-bearing, for the
-+       same reason as forin_shape above: a hashed shape at refcount 1 can be
-+       mutated in place, while a second reference forces the clone branches, so
-+       the table the memo describes is frozen while the memo names it. No
-+       invalidation hook is therefore needed, and address recycling cannot make
-+       a stale entry compare equal because the reference keeps the shape
-+       allocated.
  
-+       A single entry measured poorly on a loop nest that alternates between two
-+       or three shapes, which is the React case (props, style, fiber), so this is
-+       a small direct-mapped set indexed by shape address. */
++    /* Memo for js_for_in_try_pin's O(properties) admission scan. The verdict is
++       a property of the shape, so one entry serves every object of that shape.
++       Each slot holds a counted reference, which forces mutations onto the
++       clone path, so the shape the memo describes cannot change and its address
++       cannot be reused. Direct-mapped by shape address. */
 +#define JS_PIN_MEMO_BITS 3
 +#define JS_PIN_MEMO_SIZE (1 << JS_PIN_MEMO_BITS)
 +    JSShape *pin_memo_shape[JS_PIN_MEMO_SIZE];
@@ -51,21 +37,21 @@ Needs a bytecode version bump
      JSInterruptHandler *interrupt_handler;
      void *interrupt_opaque;
  
-@@ -2972,6 +2995,12 @@
-         js_free_shape(rt, rt->forin_shape);
+@@ -2970,6 +2980,12 @@ void JS_FreeRuntime(JSRuntime *rt)
          rt->forin_shape = NULL;
          rt->forin_atom = JS_ATOM_NULL;
-+    }
+     }
 +    for (int i = 0; i < JS_PIN_MEMO_SIZE; i++) {
 +        if (rt->pin_memo_shape[i]) {
 +            js_free_shape(rt, rt->pin_memo_shape[i]);
 +            rt->pin_memo_shape[i] = NULL;
 +        }
-     }
++    }
      rt->in_free = true;
  #ifdef QJS_ICSTAT
-@@ -18889,24 +18918,44 @@
-      directly, so it must not meet an atom the generic path treats specially. */
+     js_icstat_dump();
+@@ -18842,24 +18858,42 @@ static no_inline JSValue js_args_apply_reified(JSContext *ctx, JSValue *slot,
+      directly. */
  static bool js_for_in_try_pin(JSContext *ctx, JSForInIterator *it, JSObject *p)
  {
 +    JSRuntime *rt = ctx->rt;
@@ -87,11 +73,9 @@ Needs a bytecode version bump
 -            JS_AtomGetKind(ctx, prs->atom) != JS_ATOM_KIND_STRING ||
 -            (prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
 -            return false;
-+    /* Per-shape admission, memoized. Shapes come from the allocator well above
-+       byte granularity, so the low bits carry no entropy and are shifted off
-+       before indexing. Both verdicts are recorded: caching only the successes
-+       would leave a program enumerating one rejected shape re-scanning it
-+       forever. */
++    /* Per-shape admission, memoized. Low address bits carry no entropy and are
++       shifted off. Both verdicts are recorded so a rejected shape is not
++       re-scanned. */
 +    slot = (int)(((uintptr_t)sh >> 5) & (JS_PIN_MEMO_SIZE - 1));
 +    if (sh == rt->pin_memo_shape[slot]) {
 +        ok = rt->pin_memo_ok[slot] != 0;

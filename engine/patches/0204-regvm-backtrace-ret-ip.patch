@@ -1,14 +1,28 @@
+Subject: Backtrace from the callee's `ret_ip`
+
+What this does
+  Backtrace from the callee's `ret_ip`.
+
+Why we need it
+  Every light call stored the caller's `cap_ip` so a backtrace could name the call site.
+
+What it adds
+  Derive an outer frame's pc from its callee's `ret_ip` (one byte back); capture only where control leaves the VM.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index fe30b22..bb143ac 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -11491,6 +11491,14 @@
+@@ -11312,6 +11312,14 @@ static int regvm_ip_pc(JSFunctionBytecode *b, const uint8_t *ip)
          return -1;
      return (int)(ip - b->regvm_code);
  }
 +
-+/* Step 9: a callee's `ret_ip` is one instruction past its caller's call, and
-+   the register pc2line table is keyed by instruction start, so step back one
-+   byte to land inside the call and resolve the caller's line/column. */
++/* A callee's `ret_ip` is one instruction past its caller's call, and pc2line
++   is keyed by instruction start, so step back one byte to resolve the
++   caller's position. */
 +static int regvm_ret_pc(JSFunctionBytecode *b, const uint8_t *ret_ip)
 +{
 +    return ret_ip ? regvm_ip_pc(b, ret_ip - 1) : -1;
@@ -16,17 +30,21 @@ diff --git a/quickjs.c b/quickjs.c
  #else
  #define regvm_frame_pc(rt, sf, b) (-1)
  #define regvm_ip_pc(b, ip) (-1)
-@@ -25076,43 +25084,63 @@
-  * Plan 5.5: the logical stack, innermost first, for a backtrace. Light frames
-  * interleave with real ones: the chain at `regvm_cur` sits above
-  * `current_stack_frame`, and each real frame may have a light chain saved below
-- * it in `rv_light`. A light frame's pc is its captured `cap_ip`.
-+ * it in `rv_light`.
-+ *
-+ * Step 9: only the innermost frame uses its captured `cap_ip` (set where control
-+ * leaves the register VM). Every outer frame is located by its callee's
-+ * `ret_ip`, which is the caller's resume address and therefore its call site.
-  */
+@@ -24525,47 +24533,62 @@ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
+ }
+ #endif
+ 
+-/*
+- * The logical stack for a backtrace, innermost first. The chain at
+- * `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
+- * light chain saved below it in `rv_light`. A light frame's pc is its captured
+- * `cap_ip`.
+- */
++/* The logical stack for a backtrace, innermost first. The chain at
++   `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
++   light chain saved below it in `rv_light`. Only the innermost frame uses its
++   captured `cap_ip`; every outer frame is located by its callee's `ret_ip`,
++   its call site. */
  static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
  {
      int nb = 0;
@@ -84,24 +102,21 @@ diff --git a/quickjs.c b/quickjs.c
          }
      }
      return nb;
-@@ -26856,7 +26884,6 @@
+@@ -26139,7 +26162,6 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
      int c = T_REG(3);
      JSValue cf = FR(c);
  
 -    REGVM_CAPTURE_IP();
-     /* S1: this handler must stay a pure classify-and-jump. The lazy
-        materialize -- and the call it makes -- lives in `regvm_t_call_lazy`
-        below, so no frame is forced onto the path every call takes. */
-@@ -26879,12 +26906,20 @@
+     /* Kept a pure classify-and-jump: the lazy materialize, and its call, live
+        in `regvm_t_call_lazy`, so no C frame lands on every call. */
+     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
+@@ -26161,12 +26183,17 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                      return regvm_t_dispatch(cb->regvm_code, regs, nf,
                                              cb->realm);
              }
-+            /*
-+             * Step 9: a light callee's header carries `ret_ip`, so its caller's
-+             * position is derived there. Record/lazy/slow calls can fail before
-+             * a callee header exists (the "not lowered" error), so they keep
-+             * the explicit capture.
-+             */
++            /* A light callee's header carries `ret_ip`, which locates the
++               caller. Record, lazy and slow calls can fail before a callee
++               header exists, so they keep the explicit capture. */
 +            REGVM_CAPTURE_IP();
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail))
@@ -113,19 +128,19 @@ diff --git a/quickjs.c b/quickjs.c
      __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
  }
  
-@@ -26893,7 +26928,6 @@
+@@ -26175,7 +26202,6 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
      int c = T_REG(3);
      JSValue cf = FR(c);
  
 -    REGVM_CAPTURE_IP();
-     /* S1: pure classify-and-jump; the lazy materialize is in
-        `regvm_t_call_method_lazy` below. */
+     /* Pure classify-and-jump; the lazy materialize is in
+        `regvm_t_call_method_lazy`. */
      if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
-@@ -26915,12 +26949,15 @@
+@@ -26197,12 +26223,15 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                      return regvm_t_dispatch(cb->regvm_code, regs, nf,
                                              cb->realm);
              }
-+            /* Step 9: see `regvm_t_call`; non-light paths keep the capture. */
++            /* see `regvm_t_call`; non-light paths keep the capture */
 +            REGVM_CAPTURE_IP();
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail))

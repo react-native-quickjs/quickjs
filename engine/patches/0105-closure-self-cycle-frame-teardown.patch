@@ -1,34 +1,22 @@
-Subject: Break the closure self-cycle at frame teardown
+Subject: Breaks the closure self-cycle at frame teardown
 
 What this does
-  Walks the frame's var_refs during teardown and releases a detached var_ref
-  whose only holder is the var_refs array of the bytecode function it points at,
-  with both counts at 1. That pair is a two-node cycle reference counting cannot
-  reach, so it otherwise survives until a full-heap trial deletion.
+  Breaks the closure self-cycle at frame teardown.
+
+Why we need it
+  About half of everything the collector visits.
 
 What it adds
-  js_closcyc_frame(), called from the existing frame teardown after the locals
-  have been released and while the frame still owns its var_ref list. The order
-  is required: close_var_refs() detaches a var_ref through a js_dup of the value,
-  so until the locals are gone the function's count is 2 and the test cannot
-  match. The call sits behind the existing sf->var_ref_count != 0 branch, so a
-  frame that captures nothing never reaches it and the work is bounded by the
-  frame's var_ref count rather than by decrement traffic.
-
-  A pair the rule does not recognise is still collected by the cycle collector.
-  Only a false positive would be unsafe, so every condition in the test is a
-  necessary one and it may be as conservative as it likes.
+  `js_closcyc_frame`, called from the teardown after the locals are released and while the frame still owns its var_ref list, which is the only moment the stranded pair reads as two count-1 objects.
 
 Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21574,6 +21574,46 @@
-         JS_FreeValue(ctx, ret);
-     }
+@@ -21463,6 +21463,46 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose(JSContext *ctx, uin
      return JS_COLD_HANDLER_OK(sp);
-+}
-+
+ }
+ 
 +static no_inline __attribute__((cold)) void
 +js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf)
 +{
@@ -67,10 +55,12 @@ Needs a bytecode version bump
 +            JS_FreeValueRT(rt, t);
 +        }
 +    }
- }
- 
++}
++
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
-@@ -25138,6 +25178,8 @@
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags)
+@@ -25025,6 +25065,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          for(pval = local_buf; pval < sp; pval++) {
              JS_FreeValue(ctx, *pval);
          }

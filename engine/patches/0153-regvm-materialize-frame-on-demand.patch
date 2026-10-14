@@ -1,46 +1,26 @@
-Subject: register VM materializes the slim call frame on demand
+Subject: Materializes the slim call frame on demand
 
-What this does:
-  A nested record frame's `JSStackFrame` (embedded at `rec->sf_embed`) carried
-  eight fields that duplicate fields of the record itself: `is_strict_mode`,
-  `is_constructor`, `var_buf`, `arg_buf`, `arg_count`, `var_refs`,
-  `var_ref_count` and `cur_gc_obj`. The record fill stored all of them on every
-  JS-to-JS call, but only the cold paths read them (closure creation, the
-  debugger, error paths and backtraces), while the hot return walk reads
-  `var_refs`/`var_ref_count` -- and those two are deliberately kept.
+What this does
+  Materializes the slim call frame on demand.
 
-  The fill now stores only the fields the hot paths need. A new
-  `regvm_sf_materialize(rt, sf)` reconstructs the dropped fields from the record
-  just before a cold reader inspects them; it is idempotent and a no-op for
-  non-record frames (the activation's own frame, a stack-interpreter frame, a
-  native frame or a coroutine's heap frame). `regvm_rec_of_sf` recovers the
-  record from the frame by testing membership in the frame arena, which holds
-  only records in this build (`QJS_REGVM_INLOOP_CALL` is off). The helper is
-  compiled only under `QJS_REGVM_RECORD && !QJS_REGVM_INLOOP_CALL`; elsewhere
-  the fields are stored as before and the helper is an empty inline.
+Why we need it
+  A nested record frame's embedded `JSStackFrame` stored eight fields that duplicate fields of the record (`is_strict_mode`, `is_constructor`, `var_buf`, `arg_buf`, `arg_count`, `var_refs`, `var_ref_count`, `cur_gc_obj`) on every JS-to-JS call, though only cold paths (closure creation, the debugger, error paths, backtraces) read them; the hot return walk reads only `var_refs`/`var_ref_count`.
 
-  `is_strict_mode`, `js_get_stack_frame_at_level`, `get_var_ref` and
-  `js_new_callsite_data` are the readers that now materialize first.
+What it adds
+  The fill stores only the hot fields; `regvm_sf_materialize(rt, sf)` reconstructs the dropped fields from the record on the cold readers (`is_strict_mode`, `js_get_stack_frame_at_level`, `get_var_ref`, `js_new_callsite_data`), recovering the record by frame-arena membership (`regvm_rec_of_sf`); compiled only under `QJS_REGVM_RECORD && !QJS_REGVM_INLOOP_CALL`.
 
-  Measured (`fixed.js`, i7-8700), interleaved against 0152:
-  22,577.3 M -> 22,481.0 M instructions (**-0.096 G, -0.43 %**), cycles
-  10,862 M -> 10,721 M (**-1.3 %**). Full gate 8 pass / 0 fail:
-  22,484,061,602 / 10,724,826,403; box2d checksum exact; diff-suite 398/0/0 mono
-  and threaded; leak assertion clean; peak RSS 13228 KB; test262 errors 50 (<= 64).
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -672,6 +672,27 @@
+@@ -647,6 +647,23 @@ typedef struct JSStackFrame {
      uint8_t rv_owns_regs;
  } JSStackFrame;
  
-+/*
-+ * C1 Phase 2. A nested register-VM record's JSStackFrame lives in the frame
-+ * arena at `rec->sf_embed`, and several of its fields duplicate fields of the
-+ * record. The record fill no longer stores them; `regvm_sf_materialize`
-+ * reconstructs them on the cold paths that read them (closure creation, the
-+ * debugger, error paths, backtraces). In every other build the fields are
-+ * stored as before and this is a no-op.
-+ */
++/* A nested record's JSStackFrame lives in the arena at `rec->sf_embed`, and
++   several of its fields duplicate the record's. The record fill does not store
++   them; `regvm_sf_materialize` reconstructs them on the cold paths that read
++   them (closure creation, debugger, errors, backtraces). */
 +#if QJS_REGVM_RECORD && !QJS_REGVM_INLOOP_CALL
 +#define REGVM_SLIM_FRAME 1
 +struct JSRegRun;
@@ -56,8 +36,8 @@ What this does:
 +
  #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
  /*
-  * D1 root registry (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md section 3, stage D1).
-@@ -3743,6 +3764,8 @@
+  * Register root registry. A register-VM frame publishes its live register
+@@ -3692,6 +3709,8 @@ static JSStackFrame *js_get_stack_frame_at_level(JSContext *ctx, int level)
          sf = sf->prev_frame;
          current_level++;
      }
@@ -66,7 +46,7 @@ What this does:
      return sf;
  }
  
-@@ -4361,7 +4384,10 @@
+@@ -4310,7 +4329,10 @@ void JS_UpdateStackTop(JSRuntime *rt)
  static inline bool is_strict_mode(JSContext *ctx)
  {
      JSStackFrame *sf = ctx->rt->current_stack_frame;
@@ -78,7 +58,7 @@ What this does:
  }
  
  /* JSAtom support */
-@@ -21167,6 +21193,7 @@
+@@ -20978,6 +21000,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
      int var_ref_idx;
      JSVarDef *vd;
  
@@ -86,7 +66,7 @@ What this does:
      p = JS_VALUE_GET_OBJ(sf->cur_func);
      b = p->u.func.function_bytecode;
  
-@@ -23924,6 +23951,43 @@
+@@ -23506,6 +23529,43 @@ typedef struct JSRegRun {
  #endif
  } JSRegRun;
  
@@ -106,8 +86,8 @@ What this does:
 +    return (JSRegRun *)(p - offsetof(JSRegRun, sf_embed));
 +}
 +
-+/* Reconstruct the JSStackFrame fields the record fill no longer stores. Called
-+   from the cold readers; idempotent, and a no-op for a non-record frame. */
++/* Reconstruct the JSStackFrame fields the record fill does not store.
++   Idempotent; a no-op for a non-record frame. */
 +static void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
 +{
 +    JSRegRun *rec = regvm_rec_of_sf(rt, sf);
@@ -130,7 +110,7 @@ What this does:
  typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
                                    JSContext *ctx) REGVM_CC;
  
-@@ -27299,7 +27363,9 @@
+@@ -26493,7 +26553,9 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
  #else
          rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
  #endif
@@ -140,7 +120,7 @@ What this does:
      } else {
          rec->arg_buf = lay->arg_buf;
          rec->arg_owned = 1;
-@@ -27312,21 +27378,29 @@
+@@ -26506,21 +26568,29 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
  #endif
          for (k = 0; k < slots; k++)
              lay->arg_buf[k] = (k < na) ? js_dup(oargv[k]) : JS_UNDEFINED;
@@ -167,10 +147,10 @@ What this does:
 +#if !REGVM_SLIM_FRAME
      sf->arg_buf = rec->arg_buf;
 +#endif
-     /*
-      * The bounds are read once into locals. Written as fields of `cb` they were
-      * reloaded on every iteration, because the stores go through `lay->` and the
-@@ -95931,6 +96005,7 @@
+     /* Bounds read into locals: stores through `lay->` may alias `cb`, so fields
+        would be reloaded every iteration. */
+     {
+@@ -93632,6 +93702,7 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
      const char *func_name_str;
      JSObject *p;
  

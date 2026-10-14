@@ -1,42 +1,54 @@
+Subject: Zeroes the register area and puts `undefined` only where a value can be observed
+
+What this does
+  Zeroes the register area and puts `undefined` only where a value can be observed.
+
+Why we need it
+  The frame filled every register with `undefined`, that literal form is unsound, because the fill is load-bearing for the store handlers' old-value release.
+
+What it adds
+  The fill becomes `memset` followed by `undefined` only for the registers the analysis marks as possibly read before written; a NULL list still means fill-all, which is what every blob function gets; the list is used only when it covers under half the range.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1200,6 +1200,14 @@
+@@ -1172,6 +1172,13 @@ typedef struct JSFunctionBytecode {
      JSRegPIC *regvm_pic;
-     /* Section 6.2 side table, debug builds only. Owned by the bytecode. */
+     /* The ownership side table, debug builds only. Owned by the bytecode. */
      JSRegRCC *regvm_rcc;
-+    /* C1's frame-entry fill list: the physical registers the frame must set to
-+       `undefined` before the program runs. A register the section 6.1 analysis
-+       proves written before any read is omitted, and everything outside the
-+       analysis domain (scratch, window, handshake) is always listed. NULL with
-+       a zero count means "fill every register", which is what every function
-+       read from a blob gets: the field is never serialized. */
++    /* The frame-entry fill list: the physical registers set to `undefined`
++       before the program runs. Registers proven written before any read are
++       omitted; scratch, window and handshake are always listed. NULL with a
++       zero count means "fill every register", which every function read from a
++       blob gets (the field is never serialized). */
 +    uint16_t *regvm_fill;
 +    uint16_t regvm_fill_count;
  #endif
  } JSFunctionBytecode;
  
-@@ -25556,8 +25564,33 @@
+@@ -24964,8 +24971,33 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
              lay->var_buf[k] = JS_UNDEFINED;
          for (k = 0; k < var_ref_count; k++)
              lay->var_refs[k] = NULL;
 -        for (k = 0; k < nregs; k++)
 -            lay->regs[k] = JS_UNDEFINED;
 +        /*
-+         * C1. Every register must hold a valid, *not reference counted* value
-+         * before the program runs: the store handlers release the destination's
-+         * old value (`T_SET_NEXT`, `SET_REG`, `regvm_t_move_xfer`) and the
-+         * release walk frees every counted register, so a register left holding
-+         * a recycled frame's word would be released twice. All-bits-zero is the
-+         * integer 0, which is exactly that -- valid and uncounted -- so the area
-+         * is zeroed first and only the registers whose *value* can be observed
-+         * before it is written are then set to `undefined`.
++         * Every register must hold a valid, uncounted value before the program
++           runs:
++         * the store handlers release the destination's old value and the
++           release walk
++         * frees every counted register. All-bits-zero is the integer 0, so the
++           area is
++         * zeroed and only registers whose value can be observed before being
++           written
++         * are then set to `undefined`.
 +         *
-+         * A NULL list means "no analysis" -- a function read from a blob, whose
-+         * side table is never serialized -- and fills everything with
-+         * `undefined`, as the frame always did. A non-NULL list is the set the
-+         * analysis named, and it always contains the scratch, window and
-+         * handshake registers (everything outside the analysis domain), because
-+         * a window slot a call does not write is read as an argument.
++         * A NULL list (a blob function) fills everything with `undefined`. A
++           non-NULL
++         * list always includes scratch, window and handshake registers: a
++           window slot
++         * a call does not write is read as an argument.
 +         */
 +        if (!cb->regvm_fill) {
 +            for (k = 0; k < nregs; k++)
@@ -51,13 +63,13 @@
      }
  
      rt->current_stack_frame = sf;
-@@ -26261,8 +26294,19 @@
+@@ -25635,8 +25667,19 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                          sp = regs + _cb->regvm_reg_count + REGVM_HS - 1; \
                          pc = _cb->byte_code_buf; \
                          rpc = _cb->regvm_code; \
 -                        for (_k = 0; _k < _cb->regvm_reg_count + REGVM_HS; _k++) \
 -                            regs[_k] = JS_UNDEFINED; \
-+                        /* C1: zero the area (all-bits-zero is the uncounted \
++                        /* zero the area (all-bits-zero is the uncounted \
 +                           integer 0) then set the registers whose value can be \
 +                           observed before it is written to `undefined`; a NULL \
 +                           list (a blob) fills everything with `undefined`. */ \
@@ -73,34 +85,30 @@
                          rt->current_stack_frame = sf; \
                          REGVM_T_RUN_REBIND(); \
                          REGVM_NEXT(); \
-@@ -36427,6 +36471,8 @@
+@@ -35366,6 +35409,8 @@ typedef struct JSFunctionDef {
      uint8_t regvm_compiled; /* the backend lowered this function */
      uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
      JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
-+    uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
++    uint16_t *regvm_fill;   /* fill list, moved to the bytecode */
 +    uint16_t regvm_fill_count;
  #endif
  } JSFunctionDef;
  
-@@ -52877,6 +52923,17 @@
-      * emitter overrides it for its own phi copies.
-      */
+@@ -51738,6 +51783,13 @@ typedef struct JSRegIR {
+        it once per stack-VM opcode; the edge-move emitter overrides it for its
+        phi copies. */
      uint8_t next_origin;
-+    /* Section 6.1's init set, one byte per analysis register: 1 when the
-+       register may be read before it is written and so must be filled at frame
-+       entry. Built on every build, not just RCCHECK; the encoder turns it into
-+       the bytecode's C1 fill list. */
++    /* The init set, one byte per analysis register: 1 when the register may be
++       read before it is written. The encoder turns it into the fill list. */
 +    uint8_t *own_init;
-+    /* The subset of `own_init` whose *value* can be observed before it is
-+       written: a kind-1 operand read, or an init-all function (eval, `with`, a
-+       ref into the frame). The rest of `own_init` is only ever released or
-+       freed, and all-bits-zero is a valid uncounted value for that, so the
-+       encoder's `undefined` list is this narrower set. */
++    /* The subset of `own_init` whose value can be observed before it is
++       written: an operand read, or an init-all function. The rest is only ever
++       released, for which all-bits-zero suffices. */
 +    uint8_t *own_undef;
  #ifdef QJS_REGVM_RCCHECK
      /* Section 6.1 outputs the section 6.2 checker consumes, per instruction. */
      uint8_t *own_plain;     /* n_insns: 1 when the destination was NONE */
-@@ -57156,10 +57213,15 @@
+@@ -55627,10 +55679,15 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
      uint8_t *blkin_i = NULL, *blkout_i = NULL, *init_i = NULL;
      uint8_t *weak = NULL;
      uint8_t *has_def = NULL, *entry_i = NULL, *init_set = NULL, *uni = NULL;
@@ -118,7 +126,7 @@
  #ifdef QJS_REGVM_RCCHECK
      /* The section 6.2 side-table pointers must be NULL on every path out of
         this function, including the early returns and the bails below:
-@@ -57176,6 +57238,7 @@
+@@ -55647,6 +55704,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          return;
      if ((size_t)n * (size_t)nreg > (48u << 20))
          return;
@@ -126,7 +134,7 @@
      blk = js_malloc(ctx, (size_t)n * sizeof(int));
      ph = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
      pn = js_malloc(ctx, (size_t)(4 * n_blocks + 2) * sizeof(int));
-@@ -57197,12 +57260,13 @@
+@@ -55668,12 +55726,13 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
      has_def = js_malloc(ctx, (size_t)(n_values > 0 ? n_values : 1));
      entry_i = js_malloc(ctx, nreg);
      init_set = js_malloc(ctx, nreg);
@@ -140,18 +148,14 @@
 +        !init_set || !undef_set || !uni)
          goto done;
  
-     /*
-@@ -57490,6 +57554,37 @@
+     /* Block membership by source pc: the fusion passes append branch islands
+@@ -55910,6 +55969,33 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
              goto done;
          }
          memset(uni, 0, nreg);
-+        /*
-+         * Init-all functions. `eval`, `with`, and a ref into the frame
-+         * (`make_local_ref` / `make_var_ref`) can read a binding by name
-+         * instead of through an IR operand, so no register is provably unread
-+         * and every one is filled -- exactly what a blob function (NULL list)
-+         * gets. This is plan section 1.3's init-all rule.
-+         */
++        /* Init-all functions: `eval`, `with` and a ref into the frame
++           (`make_local_ref` / `make_var_ref`) read bindings by name, so every
++           register is filled, as for a blob function. */
 +        for (i = 0; i < n; i++) {
 +            switch (ir->insns[i].rop) {
 +            case ROP_eval:
@@ -179,7 +183,7 @@
  #ifdef QJS_REGVM_RCCHECK
          /* Section 6.2 consumes exactly what this replay already computes. */
          ir->own_nreg = nreg;
-@@ -57534,8 +57629,10 @@
+@@ -55951,8 +56037,10 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                                  continue;
                              r = regvm_own_op_reg(in, k, ireg, n_values, reg_count,
                                                   cycle_reg);
@@ -191,30 +195,26 @@
                          }
                      }
                  }
-@@ -57596,14 +57693,16 @@
+@@ -56007,14 +56095,11 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+                     if (cnt > owned_max)
+                         owned_max = cnt;
                      ret_sum += cnt;
-                     /*
-                      * Kind 3-4: the release walk at a return, and the
--                     * unwinder's walk when the frame is abandoned. Every
--                     * register it may free must hold a real value or a filled
--                     * one. `uninit_ret` counts the registers the *full* walk
--                     * would touch while they are still UNINIT -- the set C2's
--                     * narrowed walk removes from the fill.
-+                     * unwinder's walk when the frame is abandoned. The 0125
-+                     * walk is the guarded *full* walk, so it reads every
-+                     * register: any register that may still be UNINIT at this
-+                     * pc must hold a real value, and that means it is filled.
-+                     * (C2 narrows the walk to the owned set; only then can the
-+                     * `own == NONE` registers drop out. `uninit_ret` counts
-+                     * exactly those, so the saving stays visible.)
-                      */
+-                    /*
+-                     * The release walk at a return and the unwinder's walk
+-                     * free registers, which must hold real or filled values.
+-                     * `uninit_ret` counts the registers the full walk touches
+-                     * while they are still UNINIT.
+-                     */
++                    /* The release walk at a return and the unwinder's walk read
++                       every register, so a register that may be UNINIT here is
++                       filled. */
                      for (k = 0; k < nreg; k++)
 -                        if (st[k] != REG_OWN_NONE && init_st[k] == REG_INIT_UNINIT)
 +                        if (init_st[k] == REG_INIT_UNINIT)
                              init_set[k] = REG_INIT_INIT;
                      for (k = 0; k < nreg; k++)
                          if (init_st[k] == REG_INIT_UNINIT)
-@@ -57630,6 +57729,8 @@
+@@ -56041,6 +56126,8 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          for (k = 0; k < nreg; k++) {
              if (init_set[k] == REG_INIT_INIT)
                  init_cnt++;
@@ -223,7 +223,7 @@
              if (uni[k])
                  uni_cnt++;
          }
-@@ -57638,9 +57739,10 @@
+@@ -56049,9 +56136,10 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          if (dump)
              fprintf(stderr,
                      "##OWNSUM## insns=%d regs=%d blocks=%d plain=%d returns=%d "
@@ -236,12 +236,12 @@
  #ifdef QJS_REGVM_COUNT
          js_regvm_own_plain += plain;
          js_regvm_own_returns += nret;
-@@ -57668,7 +57770,16 @@
+@@ -56079,7 +56167,16 @@ done:
      js_free(ctx, init_i);
      js_free(ctx, has_def);
      js_free(ctx, entry_i);
-+    /* Hand the init set to the IR: the encoder builds C1's fill list from it.
-+       A bail leaves it partial, so it is freed instead. */
++    /* Hand the init set to the IR for the fill list. A bail leaves it partial,
++       so it is freed instead. */
 +    if (ok) {
 +        ir->own_init = init_set;
 +        ir->own_undef = undef_set;
@@ -253,7 +253,7 @@
      js_free(ctx, uni);
  }
  
-@@ -57915,6 +58026,10 @@
+@@ -56326,6 +56423,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      ir.insns = NULL;
      ir.n_insns = 0;
      ir.cap = 0;
@@ -264,7 +264,7 @@
  #ifdef QJS_REGVM_RCCHECK
      ir.own_plain = NULL;
      ir.own_rel = NULL;
-@@ -58883,6 +58998,8 @@
+@@ -57234,6 +57335,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          {
              int er;
              fd->regvm_rcc = NULL;
@@ -273,23 +273,15 @@
              er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
                                                                are two bytes */,
                                               reg_count,
-@@ -58929,6 +59046,56 @@
+@@ -57280,6 +57383,48 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                  goto refused;
              if (er)
                  goto done;
-+            /*
-+             * C1's `undefined` list. The register area is zeroed first (an
-+             * uncounted integer 0, which is what the store handlers' old-value
-+             * release and the release walk need), so only the registers whose
-+             * *value* can be observed before it is written need a real
-+             * `undefined`: the analysis's kind-1 reads plus its init-all
-+             * functions. Everything outside the analysis domain -- the scratch
-+             * and window registers, and the handshake slots -- is always
-+             * listed, and a register index in the list is a physical register.
-+             * A NULL list (count zero) means "fill every register", which is
-+             * also what a function read from a blob gets, since the field is
-+             * never serialized.
-+             */
++            /* The `undefined` list. The area is zeroed first, so only registers
++               whose value can be observed before it is written need
++               `undefined`; scratch, window and handshake are always listed.
++               Indices are physical registers. A NULL list means "fill every
++               register". */
 +            {
 +                int ntot = fd->regvm_reg_count + REGVM_HS;
 +                int nf = ntot - reg_count;
@@ -330,7 +322,7 @@
          }
      }
      js_regvm_stats.encoded_funcs++;
-@@ -58954,6 +59121,8 @@
+@@ -57305,6 +57450,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      }
  #endif
      js_free(ctx, ir.insns);
@@ -339,15 +331,15 @@
      js_free(ctx, pc_to_insn);
      js_free(ctx, scratch);
      js_free(ctx, sval);
-@@ -61748,8 +61917,14 @@
+@@ -59867,8 +60014,14 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
          code[0] = (uint8_t)ROP_return_undefined;
          fd->regvm_code = code;
          fd->regvm_len = 1;
 -        if (fd->regvm_reg_count < 1)
 +        if (fd->regvm_reg_count < 1) {
              fd->regvm_reg_count = 1;
-+            /* The list was built for the count the encoder reported; with the
-+               count forced up here, fall back to filling every register. */
++            /* The count was forced up after the list was built, so fill every
++               register. */
 +            js_free(ctx, fd->regvm_fill);
 +            fd->regvm_fill = NULL;
 +            fd->regvm_fill_count = 0;
@@ -355,7 +347,7 @@
      }
  
      /* Execution is known to arrive here, so the program is the backend's. */
-@@ -62270,6 +62445,10 @@
+@@ -60377,6 +60530,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
          b->regvm_pic_count = fd->regvm_pic_count;
          b->regvm_rcc = fd->regvm_rcc;
          fd->regvm_rcc = NULL;
@@ -366,9 +358,9 @@
          b->regvm_compiled = 1;
          b->regvm_all_threaded = fd->regvm_all_threaded;
          memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
-@@ -62384,6 +62563,8 @@
+@@ -60491,6 +60648,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
  #if QJS_REGVM
-     /* release register-PIC-held shape refs and free the table (A2) */
+     /* release register-PIC-held shape refs and free the table */
      js_free_regvm_pic(rt, b);
 +    js_free_rt(rt, b->regvm_fill);
 +    b->regvm_fill = NULL;

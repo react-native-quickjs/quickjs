@@ -1,35 +1,35 @@
+Subject: The baseline tier must not treat a `gosub` as a droppable sentinel
+
+What this does
+  The baseline tier must not treat a `gosub` as a droppable sentinel.
+
+Why we need it
+  The baseline tier's identity model performs a real parallel copy for a stack shaper, so a `gosub`'s return address is a register move where the optimising path aliases it. The sentinel marking then made an unrelated later hand-`OP_drop` remove a `finally` continuation the baseline's address-based control stack still owned, so `break` out of nested `try/finally` raised `InternalError: register VM: no continuation to return to` (`tos-cache-exceptions.js`, `nested finally with break`).
+
+What it adds
+  The `OP_gosub` sentinel bit is not set for the baseline tier (`!fd->regvm_baseline`); the continuation is owned and popped by `ROP_finally_leave` alone.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index f2b28f7..40990e9 100644
+index 437910a..02760b5 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -68510,8 +68510,28 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -65875,8 +65875,15 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                          sentinel_bits[push_base[pos] + 2] = 1;
                  } else if (op2 == OP_catch) {
                      sentinel_bits[push_base[pos]] = 1;
 -                } else if (op2 == OP_gosub) {
 -                    /* the return address is a slot with no value in it */
 +                } else if (op2 == OP_gosub && !fd->regvm_baseline) {
-+                    /*
-+                     * The return address is a slot with no value in it, so a
-+                     * hand `OP_drop` of it removes the control-stack entry --
-+                     * the sentinel convention `regvm_lower` uses.
-+                     *
-+                     * The baseline tier does NOT mark it, and must not. Its
-+                     * control stack is address-based (`ROP_finally_enter`
-+                     * records the continuation pc and `ROP_finally_leave` pops
-+                     * it), whereas the stack model represents a gosub's return
-+                     * address as an operand-stack value that a hand `OP_drop`
-+                     * discards. A `break`/`continue`/`ret` out of nested trys
-+                     * completes each finally in turn, but the baseline's shape
-+                     * expansion (`regvm_baseline_expand_shape`) moves the operand
-+                     * stack around the gosub push, so a `sentinel_bit` left set
-+                     * for the gosub slot makes an unrelated later hand-drop
-+                     * remove a continuation whose finally has not run yet -- the
-+                     * `nested finally with break` InternalError. Because the
-+                     * continuation is owned by the control stack and popped by
-+                     * `ROP_finally_leave` alone, the gosub slot carries no drop
-+                     * responsibility, so skipping the marking is exact.
-+                     */
++                    /* The return address is a slot with no value, so a hand
++                       `OP_drop` of it removes the control-stack entry (the
++                       sentinel convention of `regvm_lower`). The baseline tier
++                       must not mark it: its control stack is address-based
++                       (`ROP_finally_enter`/`ROP_finally_leave`), and its shape
++                       expansion moves the operand stack around the gosub push,
++                       so a set `sentinel_bit` would let an unrelated hand-drop
++                       remove a continuation whose finally has not run. */
                      sentinel_bits[push_base[pos]] = 1;
                  }
              }

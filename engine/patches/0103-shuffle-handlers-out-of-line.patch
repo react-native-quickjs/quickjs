@@ -21,7 +21,7 @@ Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21046,6 +21046,15 @@
+@@ -20931,6 +20931,15 @@ static JSValue js_u3_el_recv(JSContext *ctx, JSStackFrame *sf,
      JS_FreeValue(ctx, recv_ref);
      return val;
  }
@@ -37,7 +37,7 @@ Needs a bytecode version bump
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
                                 int argc, JSValueConst *argv, int flags)
-@@ -21572,70 +21582,32 @@
+@@ -21457,70 +21466,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              sp++;
              BREAK;
          CASE(OP_perm3): /* obj a b -> a obj b (213) */
@@ -122,7 +122,7 @@ Needs a bytecode version bump
              BREAK;
          CASE(OP_swap): /* a b -> b a */
              {
-@@ -21646,15 +21618,8 @@
+@@ -21531,15 +21502,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              }
              BREAK;
          CASE(OP_swap2): /* a b c d -> c d a b */

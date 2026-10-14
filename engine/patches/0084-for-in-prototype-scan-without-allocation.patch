@@ -23,7 +23,7 @@ Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -19338,7 +19338,31 @@
+@@ -18808,7 +18808,31 @@ static bool js_for_in_try_pin(JSContext *ctx, JSForInIterator *it, JSObject *p)
      return true;
  }
  
@@ -56,7 +56,7 @@ Needs a bytecode version bump
  {
      JSObject *p;
      JSPropertyEnum *tab_atom;
-@@ -19381,6 +19407,20 @@
+@@ -18851,6 +18875,20 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
              break;
          if (JS_IsException(obj1))
              goto fail;

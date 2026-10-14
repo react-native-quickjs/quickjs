@@ -22,7 +22,7 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -218,6 +218,7 @@
+@@ -218,6 +218,7 @@ enum {
      JS_CLASS_DOM_EXCEPTION,
      JS_CLASS_CALL_SITE,
      JS_CLASS_RAWJSON,
@@ -30,7 +30,7 @@ Needs a bytecode version bump
  
      JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
  };
-@@ -9776,6 +9777,114 @@
+@@ -9720,6 +9721,114 @@ static bool can_store_error_stack(JSValueConst obj)
  
  /* if filename != NULL, an additional level is added with the filename
     and line number information (used for parse error). */
@@ -145,7 +145,7 @@ Needs a bytecode version bump
  static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                              JSValueConst filter_func, const char *filename,
                              int line_num, int col_num, int backtrace_flags)
-@@ -9793,6 +9902,9 @@
+@@ -9737,6 +9846,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      uint32_t i;
      double d;
      int stack_trace_limit;
@@ -155,7 +155,7 @@ Needs a bytecode version bump
  
      rt = ctx->rt;
      if (rt->in_build_stack_trace)
-@@ -9829,7 +9941,13 @@
+@@ -9773,7 +9885,13 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
          has_prepare = JS_IsFunction(ctx, prepare);
      }
  
@@ -170,7 +170,7 @@ Needs a bytecode version bump
          saved_exception = JS_GetException(ctx);
          if (stack_trace_limit == 0)
              goto done;
-@@ -9879,7 +9997,23 @@
+@@ -9823,7 +9941,23 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
              backtrace_barrier = b->backtrace_barrier;
          }
  
@@ -195,7 +195,7 @@ Needs a bytecode version bump
              js_new_callsite_data(ctx, &csd[i], sf);
          } else {
              /* func_name_str is UTF-8 encoded if needed */
-@@ -9921,7 +10055,30 @@
+@@ -9865,7 +9999,30 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
              break;
      }
   done:
@@ -227,13 +227,12 @@ Needs a bytecode version bump
          int j = 0, k;
          stack = JS_NewArray(ctx);
          if (JS_IsException(stack)) {
-@@ -49400,6 +49557,23 @@
+@@ -48686,6 +48843,22 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
      p = JS_VALUE_GET_OBJ(this_val);
      if (p->class_id != JS_CLASS_ERROR)
          return JS_UNDEFINED;
-+    /* Deferred frames: format once and then MEMOISE by replacing the slot with
-+       the string. Memoisation is required, not an optimisation: two reads of
-+       .stack must produce the same bytes and the frames are gone by then. */
++    /* Format once and replace the slot with the string: two reads of .stack
++       must return the same bytes and the frames are gone by then. */
 +    if (JS_VALUE_GET_TAG(p->u.object_data) == JS_TAG_OBJECT) {
 +        JSObject *sp = JS_VALUE_GET_OBJ(p->u.object_data);
 +
@@ -251,14 +250,13 @@ Needs a bytecode version bump
      return js_dup(p->u.object_data);
  }
  
-@@ -67767,6 +67941,16 @@
+@@ -67025,6 +67198,15 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
                                                        JS_CLASS_OBJECT, 16);
      if (JS_IsException(ctx->global_var_obj))
          return -1;
 +
-+    /* The class name atom is REUSED rather than added: a new predefined atom
-+       would shift JS_ATOM_* numbering, and predefined atoms are serialised by
-+       index in .bc, so it would invalidate every existing bytecode blob. */
++    /* Reuses the class name atom: a new predefined atom would renumber
++       JS_ATOM_*, which .bc files serialise by index. */
 +    if (!JS_IsRegisteredClass(ctx->rt, JS_CLASS_ERROR_STACK)) {
 +        if (init_class_range(ctx->rt, js_error_stack_class_def,
 +                             JS_CLASS_ERROR_STACK,

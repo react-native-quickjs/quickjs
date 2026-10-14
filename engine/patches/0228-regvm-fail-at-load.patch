@@ -1,7 +1,21 @@
+Subject: Fail at load, not at call
+
+What this does
+  Fail at load, not at call.
+
+Why we need it
+  A function without a register program was created silently and threw `function was not lowered` at its first call, far from the cause; a blob carrying no register program loaded the same way.
+
+What it adds
+  `js_create_function` raises `InternalError` with the site's reason and the source position as soon as the scan leaves the function uncompiled; the reader rejects a zero register-program flag with `bytecode without a register program`; the call-time check stays as a backstop that says it is an engine bug; `REGVM_FORCE_DEFER` (knob builds) forces the path; the `QJS_REGVM_VERIFY` dead-end macro no longer needs `assert` to be compiled out.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 3c75b67..393f0d1 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -31642,7 +31642,9 @@
+@@ -30405,7 +30405,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          ast->fresh = 0;
  #endif
          if (!b->regvm_compiled) {
@@ -12,17 +26,17 @@ diff --git a/quickjs.c b/quickjs.c
              goto exception;
          }
          /*
-@@ -43354,6 +43356,9 @@
-      * interpreter.
-      */
+@@ -41582,6 +41584,9 @@ typedef struct JSFunctionDef {
+        retried with the frame authoritative: no slot promotion, reuse,
+        frame-read folding, hoisting or light frame. */
      uint8_t regvm_conservative;
-+    /* The reason the backend refused this function (a static string), for the
-+       compile-time error and the report. NULL when it lowered. */
++    /* Why the backend refused this function (a static string), for the
++       compile-time error. NULL when it lowered. */
 +    const char *regvm_defer_why;
      uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
      JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
-     uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
-@@ -67831,11 +67836,12 @@
+     uint16_t *regvm_fill;   /* fill list, moved to the bytecode */
+@@ -65288,11 +65293,12 @@ static int regvm_report_deferred_on(void)
  #endif
  
  /* Print "regvm: refused <name> (<file>:<line>): <why>" once per refusal. */
@@ -36,20 +50,19 @@ diff --git a/quickjs.c b/quickjs.c
      if (!regvm_report_deferred_on())
          return;
      name = fd->func_name != JS_ATOM_NULL ? JS_AtomToCString(ctx, fd->func_name)
-@@ -67855,9 +67861,17 @@
+@@ -65312,9 +65318,17 @@ static void regvm_report_refusal(JSContext *ctx, const JSFunctionDef *fd,
  /*
   * The final refusal (after the conservative retry) is not supposed to happen:
   * every deferral site carries a comment naming the invariant that makes it
 - * unreachable. Under QJS_REGVM_VERIFY, reaching one is a failure.
-- */
--#define REGVM_VERIFY_DEAD_END(why) assert(0 && "unreachable refusal: " why)
 + * unreachable. Under QJS_REGVM_VERIFY, reaching one is a failure; the site's
 + * reason is printed so the invariant that broke is named.
 + *
 + * (Not `assert`: the reason is a runtime string, and `assert`'s argument must
 + * still be valid when it is compiled out -- a debug build without NDEBUG would
 + * not accept a non-literal there.)
-+ */
+  */
+-#define REGVM_VERIFY_DEAD_END(why) assert(0 && "unreachable refusal: " why)
 +#define REGVM_VERIFY_DEAD_END(why) do { \
 +        fprintf(stderr, "regvm: unreachable refusal reached: %s\n", (why)); \
 +        abort(); \
@@ -57,7 +70,7 @@ diff --git a/quickjs.c b/quickjs.c
  #else
  #define REGVM_VERIFY_DEAD_END(why) ((void)0)
  #endif
-@@ -69245,6 +69259,8 @@
+@@ -66601,6 +66615,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
      int retry = 0;
      const char *defer_why = "?";
@@ -66,16 +79,14 @@ diff --git a/quickjs.c b/quickjs.c
      const char *enc_why = NULL;
  
      if (bc_len <= 0)
-@@ -72718,6 +72734,22 @@
+@@ -69776,6 +69792,20 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         decodes exactly, is fully classified, and has coherent targets. */
      if (js_regvm_scan(ctx, fd))
          goto fail;
 +    if (!fd->regvm_compiled) {
-+        /*
-+         * There is no stack interpreter to run this function, so a function
-+         * the backend could not lower must not be created: the failure belongs
-+         * at the function's own source position, not at the first call.
-+         */
++        /* No stack interpreter can run this function, so it must not be
++           created: the error belongs at the function's source position, not the
++           first call. */
 +        const char *fname = fd->filename != JS_ATOM_NULL
 +                                ? JS_AtomToCString(ctx, fd->filename) : NULL;
 +        JS_ThrowInternalError(ctx,
@@ -89,16 +100,13 @@ diff --git a/quickjs.c b/quickjs.c
  #endif
  
      function_size = sizeof(*b);
-@@ -77578,6 +77610,15 @@
+@@ -74582,6 +74612,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
          uint8_t compiled;
          if (bc_get_u8(s, &compiled))
              goto fail;
 +        if (!compiled) {
-+            /*
-+             * A register build has no stack interpreter, so a blob that
-+             * carries no register program for a function cannot be run: reject
-+             * it at load rather than failing at the first call.
-+             */
++            /* No stack interpreter can run a function without a register
++               program, so reject the blob at load. */
 +            JS_ThrowSyntaxError(ctx, "bytecode without a register program");
 +            goto fail;
 +        }

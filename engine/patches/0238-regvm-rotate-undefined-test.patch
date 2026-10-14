@@ -1,17 +1,28 @@
+Subject: Loop rotation swaps the fused undefined test instead of inverting it
+
+What this does
+  Loop rotation swaps the fused undefined test instead of inverting it.
+
+Why we need it
+  `regvm_rotate_loop_test` gives the latch the header test with `REG_CMP_INVERT` flipped.
+
+What it adds
+  The rotation swaps the two pseudo tests, which are each other's negation, and inverts only real sub-operations; `tests/differential/corpus/loop-test-undefined-compare.js` covers both senses and operand orders.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index 1b082be..f81df89 100644
+index 798f1f7..57f93ca 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -64444,7 +64444,16 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+@@ -62181,7 +62181,14 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
              continue;
          br->rop = ROP_branch_cmp_reg_reg;
          br->n_ops = 4;
 -        br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
-+        /* The latch takes the opposite sense of the header test. A real
-+           sub-op carries its sense in REG_CMP_INVERT; the two pseudo tag
-+           tests the branch fusion emits are each other's negation and have
-+           no inverted form -- every handler matches them as a bare value --
-+           so they swap instead. */
++        /* The latch takes the opposite sense of the header test: REG_CMP_INVERT
++           for a real sub-op; the two pseudo tag tests are each other's
++           negation, so they swap. */
 +        if ((unsigned)(test->ops[0] - REG_BIN_IS_UNDEF) < 2)
 +            br->ops[0] = test->ops[0] ^
 +                         (REG_BIN_IS_UNDEF ^ REG_BIN_IS_NOT_UNDEF);

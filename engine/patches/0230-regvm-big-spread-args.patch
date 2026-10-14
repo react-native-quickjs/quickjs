@@ -1,23 +1,31 @@
+Subject: Lift the 255-argument limit on spread calls too
+
+What this does
+  Lift the 255-argument limit on spread calls too.
+
+Why we need it
+  But a call that mixes more than 255 fixed arguments with a trailing spread (`f`) is compiled with `OP_array_from` for the fixed prefix first; that opcode's register lowering still refused `argc > 255`, so the stack build ran `f(...,...a)` and the register build threw the 255-limit `InternalError` -- a sixth reachable refusal the round's scoreboard did not generate.
+
+What it adds
+  `OP_array_from`'s register case reuses `regvm_build_arg_array`, the same 255-value chunked `ROP_array_from`+`ROP_append` build the big-call path uses: at most one chunk is live, and the parser's own 65,534-argument limit bounds `argc`, so the byte count is what has to encode, not the 255 push-count.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 9122b76..87ad01b 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -63386,8 +63386,21 @@
+@@ -61295,8 +61295,15 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
      }
      case OP_array_from: {
          int argc = get_u16(bc + pos + 1), defs[256], a;
 -        if (argc > 255)
 -            return regvm_too_many_args(ctx, argc);
 +        if (argc > 255) {
-+            /*
-+             * More than one byte of arguments. This is the array a spread call
-+             * stages its leading fixed arguments in (`f(1,...,1, ...rest)`),
-+             * and the same chunked build the big-call path uses lower it: at
-+             * most one 255-value chunk is ever live, and the result lands in
-+             * `dst` exactly as the one-shot form does. `argc` is the number of
-+             * fixed arguments, and it is bounded by the parser's own 65,534
-+             * limit, so the byte count below (not the 255 push-count) is what
-+             * has to encode.
-+             */
++            /* More than one byte of arguments: the array a spread call stages
++               its leading fixed arguments in (`f(1,...,1, ...rest)`), built
++               with the big-call path's chunking. `argc` is bounded by the
++               parser's 65,534 limit. */
 +            if (regvm_build_arg_array(ctx, ir, pos, pop, argc, dst))
 +                return -1;
 +            return 0;

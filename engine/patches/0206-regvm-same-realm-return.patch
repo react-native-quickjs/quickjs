@@ -1,24 +1,42 @@
+Subject: Same-realm return
+
+What this does
+  Same-realm return.
+
+Why we need it
+  The light return loaded the caller's `c->b->realm` on every call.
+
+What it adds
+  Record same-realm in `hdr_pack` and branch to dispatch with `ctx` instead.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 364265d..b3912c8 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25189,6 +25189,9 @@
+@@ -24631,6 +24631,9 @@ static JSValueConst regvm_cur_func(JSRuntime *rt)
  #define REGVM_FLAG_TRIVIAL_RET (1 << 8)
- /* Plan 5.4: the frame is a light frame (no JSStackFrame, no record tail). */
+ /* The frame is a light frame (no JSStackFrame, no record tail). */
  #define REGVM_FLAG_LIGHT (1 << 9)
-+/* Step 13: the callee's realm equals the caller's, so a return can keep `ctx`
-+   in its register instead of loading the caller's `c->b->realm`. */
++/* The callee's realm is the caller's, so a return can keep `ctx` instead of
++   loading `c->b->realm`. */
 +#define REGVM_FLAG_SAME_REALM (1 << 10)
  
  #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
  typedef struct JSRegArenaChunk {
-@@ -26583,9 +26586,18 @@
+@@ -25905,11 +25908,20 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
+              */
+             ctx->rt->regvm_cur = c;
              *(JSValue *)((uint8_t *)c->fr + dst) = v;
-             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
-                its return does not end the caller's chain. */
+-            /* No `regvm_tail_chain` reset: a light frame never tail-calls and
+-               its return does not end the caller's chain. */
 -            f = c;
 -            __attribute__((musttail))
 -                return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
-+            /* Step 13: keep `ctx` when the caller shares the callee's realm. */
++            /* A light frame never tail-calls, so the caller's
++               `regvm_tail_chain` is kept. */
++            /* keep `ctx` when the caller shares the callee's realm */
 +            if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_SAME_REALM)) {
 +                f = c;
 +                __attribute__((musttail))
@@ -33,14 +51,18 @@ diff --git a/quickjs.c b/quickjs.c
          }
  #if QJS_DRC
          /* The general path dups the value before the release walk and the
-@@ -26646,9 +26658,18 @@
+@@ -25964,11 +25976,20 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
+             /* dropping a light frame does not touch the arena top */
+             ctx->rt->regvm_cur = c;
              *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
-             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
-                its return does not end the caller's chain. */
+-            /* No `regvm_tail_chain` reset: a light frame never tail-calls and
+-               its return does not end the caller's chain. */
 -            f = c;
 -            __attribute__((musttail))
 -                return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
-+            /* Step 13: keep `ctx` when the caller shares the callee's realm. */
++            /* A light frame never tail-calls, so the caller's
++               `regvm_tail_chain` is kept. */
++            /* keep `ctx` when the caller shares the callee's realm */
 +            if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_SAME_REALM)) {
 +                f = c;
 +                __attribute__((musttail))
@@ -55,7 +77,7 @@ diff --git a/quickjs.c b/quickjs.c
          }
          f->ret = JS_UNDEFINED;
          __attribute__((musttail))
-@@ -26903,9 +26924,16 @@
+@@ -26180,9 +26201,16 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                  memcpy(&nf->this_obj, &regvm_undefined_value,
                         sizeof(JSValue));
                  ctx->rt->regvm_cur = nf;
@@ -73,9 +95,9 @@ diff --git a/quickjs.c b/quickjs.c
 +                                                realm);
 +                }
              }
-             /*
-              * Step 9: a light callee's header carries `ret_ip`, so its caller's
-@@ -26946,9 +26974,16 @@
+             /* A light callee's header carries `ret_ip`, which locates the
+                caller. Record, lazy and slow calls can fail before a callee
+@@ -26220,9 +26248,16 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                          return regvm_t_call_method_record(REGVM_PASS);
                  nf->this_obj = tv;
                  ctx->rt->regvm_cur = nf;
@@ -93,9 +115,9 @@ diff --git a/quickjs.c b/quickjs.c
 +                                                realm);
 +                }
              }
-             /* Step 9: see `regvm_t_call`; non-light paths keep the capture. */
+             /* see `regvm_t_call`; non-light paths keep the capture */
              REGVM_CAPTURE_IP();
-@@ -27266,6 +27301,8 @@
+@@ -26487,6 +26522,8 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
  
          if (vc == 0)
              hflags |= REGVM_FLAG_TRIVIAL_RET;
@@ -104,14 +126,14 @@ diff --git a/quickjs.c b/quickjs.c
          nf->hdr_pack = (uint64_t)(uint16_t)d
                       | ((uint64_t)(uint16_t)na << 16)
                       | ((uint64_t)hflags << 32);
-@@ -27359,9 +27396,18 @@
+@@ -26568,9 +26605,18 @@ regvm_t_return_light_nested(REGVM_ARGS)
      REG_ADOPT(ctx->rt, v);
  #endif
      ctx->rt->regvm_tail_chain = 0;
 -    f = c;
 -    __attribute__((musttail))
 -        return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
-+    /* Step 13: keep `ctx` when the caller shares the callee's realm. */
++    /* keep `ctx` when the caller shares the callee's realm */
 +    if (likely(f->flags & REGVM_FLAG_SAME_REALM)) {
 +        f = c;
 +        __attribute__((musttail))

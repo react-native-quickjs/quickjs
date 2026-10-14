@@ -1,40 +1,27 @@
-Subject: register VM: free the nip_catch pop table on the success path
+Subject: Frees the `nip_catch` pop table on the success path of `js_create_function`
 
 What this does
-  js_create_function() has two exits. The fail path calls js_free_function_def(),
-  which frees fd->regvm_nip_pop. The success path frees only fd->regvm_code
-  (once it has been copied into the bytecode object) and then drops fd with
-  free_objlit_sites() + js_free(), so fd->regvm_nip_pop — a uint16_t[bc_len]
-  table that compute_stack_size() allocates whenever an OP_nip_catch pops a
-  count other than 2 — was leaked.
-
-  The table is read only while compiling (js_regvm_scan and the lowering), so
-  freeing it on the success path is safe.
+  Frees the `nip_catch` pop table on the success path of `js_create_function`.
 
 Why we need it
-  Any register-compiled function whose body yields through a for-of/finally
-  frame (e.g. `o.f = yield` inside a finally) leaked one block. It is reported
-  only in debug builds because the leak report is compiled under ENABLE_DUMPS,
-  which NDEBUG disables; the allocation itself happened in every build.
+  `js_create_function` has two exits: the fail path calls `js_free_function_def`, which frees `fd->regvm_nip_pop`, but the success path frees only `fd->regvm_code` (once copied into the bytecode object) and then drops `fd` with `free_objlit_sites` + `js_free`, so the `uint16_t[bc_len]` table `compute_stack_size` allocates whenever an `OP_nip_catch` pops a count other than 2 was leaked. The table is read only while compiling, so freeing it on the success path is safe.
 
 What it adds
-  quickjs.c
-      js_free(ctx, fd->regvm_nip_pop) before free_objlit_sites() in the
-      success path of js_create_function().
+  `js_free(ctx, fd->regvm_nip_pop)` before `free_objlit_sites(ctx, fd)` in the success path of `js_create_function`, under `QJS_REGVM`.
 
-  A no-op unless QJS_REGVM.
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index aab9dc3..eb346f5 100644
+index 65747d2..5cbb959 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -66794,6 +66794,12 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -64479,6 +64479,12 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
          list_del(&fd->link);
      }
  
 +#if QJS_REGVM
-+    /* fd->regvm_code was already freed above once it was copied into b; the
-+       nip_catch pop table has no other owner and must not ride out with fd. */
++    /* fd->regvm_code was already freed once copied into b; the nip_catch pop
++       table has no other owner. */
 +    js_free(ctx, fd->regvm_nip_pop);
 +    fd->regvm_nip_pop = NULL;
 +#endif

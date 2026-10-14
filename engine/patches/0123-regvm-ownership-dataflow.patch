@@ -1,6 +1,19 @@
+Subject: Runs the register-ownership dataflow as an inert last encoder pass
+
+What this does
+  Runs the register-ownership dataflow as an inert last encoder pass.
+
+Why we need it
+  The register PIC, the borrowed reads and per-return release sets all need to know which physical registers may hold a reference count, and no pass computed it; the value-level form needed a guard on every drop and every guard was a hole.
+
+What it adds
+  `regvm_own_analyze` runs after `regvm_transfer_dead_sources` over the final IR on physical registers (through `regvm_reg_of`) with a NONE/OWN/MAYBE lattice and a join-based, monotone block worklist, so it can only over-approximate and it reaches the fixed point. It reports, per defining instruction, whether the destination register was count-free before the write and the owned set at every return and throw. Diagnostic only: nothing in the emitted code changes.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22678,6 +22678,7 @@
+@@ -22404,6 +22404,7 @@ static __exception int regvm_cmp_take(JSContext *ctx, int sub, JSValue a,
  extern uint64_t js_regvm_count[ROP_COUNT];
  #if QJS_REGVM_COUNT
  extern uint64_t js_regvm_ir_insns, js_regvm_ir_moves, js_regvm_ir_move_adj;
@@ -8,27 +21,20 @@
  extern uint64_t js_regvm_ir_pred[ROP_COUNT];
  extern uint64_t js_regvm_blockers[ROP_COUNT];
  extern uint64_t js_regvm_fallback_calls;
-@@ -56609,6 +56610,356 @@
+@@ -55129,6 +55130,342 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
      return 0;
  }
  
-+/* ================== section 6.1: register-state dataflow ==================
++/* ======================= register-state dataflow ========================
 + *
 + * A forward, block-level dataflow over the final register IR that says, for
 + * every physical register at every point, whether it holds a reference count
-+ * (OWN), provably does not (NONE), or might (MAYBE). It is the foundation for
-+ * three later savings: the plain-store variants (D3/B3) read the state of a
-+ * destination before it is written, and the per-return and per-throw owned sets
-+ * (C2) let the frame release and the unwinder stop walking the whole register
-+ * area. It runs on physical registers, after allocation, because the value-level
-+ * form (P5a) had to guard every drop and every guard was a hole.
++ * (OWN), provably does not (NONE), or might (MAYBE). Plain stores read a
++ * destination's state before it is written. It runs on physical registers,
++ * after allocation.
 + *
-+ * The analysis is sound by construction: an instruction's destination is always
-+ * one of its register operands, and every op the lowering does not give a
-+ * destination is a pure read of its operands, so a register's state changes only
-+ * where `regvm_own_has_dest` says it does (plus the `*_xfer` forms, which hand a
-+ * value away and so clear the source). `QJS_REGVM_RCCHECK` (section 6.2) is the
-+ * belt to this braces: it asserts the claim against the frame's actual values.
++ * A register's state changes only where `regvm_own_has_dest` says it does,
++ * plus the `*_xfer` forms, which clear the source they hand away.
 + */
 +enum {
 +    REG_OWN_NONE = 0,   /* no count: undefined, Number, Bool, borrowed */
@@ -41,10 +47,8 @@
 +    return a == b ? a : REG_OWN_MAYBE;
 +}
 +
-+/* Whether ops[0] is this instruction's destination. Only the ops the lowering
-+   gives a register result are listed; every other op reads its operands and
-+   leaves the registers as they were (the `*_xfer` stores are handled by the
-+   caller, since they clear the operand they hand away). */
++/* Whether ops[0] is this instruction's destination. Every op not listed only
++   reads its operands. */
 +static int regvm_own_has_dest(uint16_t rop)
 +{
 +    switch (rop) {
@@ -178,12 +182,8 @@
 +    (void)s;
 +}
 +
-+/*
-+ * Run the dataflow. Diagnostic for now: the consumers (D3/B3 plain stores, C2
-+ * release sets) are the next increment, so nothing here changes the emitted
-+ * code. Under `REGVM_OWN` it dumps the analysis; under `QJS_REGVM_COUNT` it
-+ * counts the plain-store opportunities so the precision can be watched.
-+ */
++/* Run the dataflow. Under `QJS_REGVM_COUNT` it also counts the plain-store
++   opportunities. */
 +static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
 +                              const int *bstart, const int *succ,
 +                              const int *ireg, int n_values, int reg_count,
@@ -268,10 +268,9 @@
 +            }
 +        }
 +        out = blkout + (size_t)b * nreg;
-+        /* Transfer into a scratch buffer, then compare with the block's last
-+           output. Comparing with `in` instead would miss a growth that came
-+           from a predecessor but that this block's own transfer did not add to,
-+           and the successors would never be revisited. */
++        /* Transfer into scratch and compare with the block's last output;
++           comparing with `in` would miss growth that came from a predecessor.
++           */
 +        memcpy(tmp, in, nreg);
 +        for (i = bs[b]; i >= 0 && i < be[b]; i++)
 +            regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
@@ -365,7 +364,7 @@
  static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                         const uint8_t *bc, int bc_len,
                                         const uint8_t *reuse,
-@@ -57364,6 +57715,11 @@
+@@ -55849,6 +56186,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                  phi_in,
                                  home_of, home_mode, live_out, live_words,
                                  bstart, n_blocks);
@@ -375,9 +374,9 @@
 +    regvm_own_analyze(ctx, &ir, n_blocks, bstart, succ, ireg, n_values,
 +                      reg_count, cycle_reg);
  #ifdef QJS_REGVM_COUNT
-     /* Dump the finished register stream, so the compiler's output can be read
-        statically instead of inferred from counters. Numeric opcodes; the tool
-@@ -60460,6 +60816,8 @@
+     /* Dump the finished register stream with numeric opcodes. */
+     if (REGVM_KNOB("REGVM_DUMP")) {
+@@ -58679,6 +59021,8 @@ uint64_t js_regvm_count[ROP_COUNT];
  uint64_t js_regvm_ir_insns;            /* register instructions emitted */
  uint64_t js_regvm_ir_moves;            /* ROP_move in the IR */
  uint64_t js_regvm_ir_move_adj;         /* adjacent ROP_move; ROP_move pairs */
@@ -386,7 +385,7 @@
  uint64_t js_regvm_ir_pred[ROP_COUNT];  /* times each opcode is followed by a move */
  uint64_t js_regvm_blockers[ROP_COUNT]; /* cold opcodes blocking a called function */
  uint64_t js_regvm_fallback_calls;
-@@ -60574,6 +60932,9 @@
+@@ -58790,6 +59134,9 @@ int js_regvm_count_dump(void)
                  (unsigned long long)js_regvm_ir_insns,
                  (unsigned long long)js_regvm_ir_moves,
                  (unsigned long long)js_regvm_ir_move_adj);

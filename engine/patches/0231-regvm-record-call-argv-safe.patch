@@ -1,8 +1,21 @@
+Subject: A record call must not borrow an argv the callee writes
+
+What this does
+  A record call must not borrow an argv the callee writes.
+
+Why we need it
+  `regvm_args_borrowable` decided whether a record call could read the caller's outgoing registers as its own argument area by asking only whether every declared argument was supplied. A callee that writes a parameter slot with `put_arg` then wrote into those caller registers, which are live caller temporaries, not copies -- so `f.apply(null, arguments)` where `f` writes its parameters mutated the caller's `arguments` values.
+
+What it adds
+  The predicate also requires `cb->argv_safe`, the same "a C caller's argv may be used in place" flag the deferred-RC borrow fusion reads (cleared by a parameter write, a var_ref onto a parameter slot, the mapped `arguments` object or a direct `eval`), mirroring `JS_CallInternal`'s own `JS_CALL_FLAG_COPY_ARGV && !JS_ARGV_SAFE` copy rule. An owned copy also becomes the frame's `argv`: no function containing `f.apply(this, arguments)` is `argv_safe`, so every forwarder now takes the copy, as in the tail-call fill.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index ca04010..58dc066 100644
+index 87ad01b..c938cd0 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -26398,20 +26398,28 @@ extern uint64_t js_regvm_fallback_calls;
+@@ -25685,20 +25685,24 @@ extern uint64_t js_regvm_fallback_calls;
  #endif
  /*
   * May a record call read the caller's outgoing registers as its argument area
@@ -13,18 +26,14 @@ index ca04010..58dc066 100644
 - * Direct put_arg into a borrowed window is handled by regvm_put_arg. Must
 - * agree between slot reservation and regvm_record_fill.
 + * instead of copying them? Only when every declared argument is supplied and
-+ * the callee never writes an argument slot -- `argv_safe`, the same predicate
-+ * the deferred-RC borrow fusion reads (a parameter write, a var_ref onto a
-+ * parameter slot, the mapped arguments object or a direct eval clears it).
-+ * The callee's `put_arg` on a borrowed window lands in the caller's outgoing
-+ * registers, which are live caller temporaries here, not copies; aliasing it
-+ * would let the callee mutate the caller's values (the `f.apply(null,
-+ * arguments)` shape). Under DRC a var_ref onto a parameter slot is also
-+ * disqualifying (`args_captured`): the registers do not own their values and a
-+ * write through such a ref would free one the caller still holds. Must agree
-+ * between slot reservation and regvm_record_fill.
++ * the callee is `argv_safe` (no parameter write, no var_ref onto a parameter
++ * slot, no mapped arguments object, no direct eval): a `put_arg` on a borrowed
++ * window would mutate the caller's live temporaries. Under DRC `args_captured`
++ * also disqualifies, since a write through such a ref would free a value the
++ * caller still holds. Must agree between slot reservation and
++ * regvm_record_fill.
 + *
-+ * This mirrors JS_CallInternal exactly: it copies when `argc < arg_count` or
++ * This mirrors JS_CallInternal: it copies when `argc < arg_count` or
 + * `JS_CALL_FLAG_COPY_ARGV && !JS_ARGV_SAFE`.
   */
  static inline int regvm_args_borrowable(const JSFunctionBytecode *cb, int na)
@@ -40,16 +49,14 @@ index ca04010..58dc066 100644
  }
  
  static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
-@@ -31162,6 +31170,13 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+@@ -29969,6 +29973,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
          rec->arg_buf = lay->arg_buf;
          rec->arg_owned = 1;
          rec->local_buf = lay->arg_buf;
-+        /* The copy holds every supplied argument (`slots` is the larger of
-+           `na` and the declared count), so it is what `arguments` reads, as
-+           in the tail-call fill. Leaving argv on the caller's window made
-+           `f.apply(this, arguments)` fail its `arg_buf == argv` test in every
-+           forwarder -- none is argv_safe, so each now takes this branch --
-+           and build an arguments object per call. */
++        /* The copy holds every supplied argument (`slots` is the larger of `na`
++           and the declared count), so it is what `arguments` reads, and
++           `arg_buf == argv` holds for the `f.apply(this, arguments)` forwarding
++           test. */
 +        rec->argv = lay->arg_buf;
  #if QJS_DRC
          rec->local_count = slots + vcount;

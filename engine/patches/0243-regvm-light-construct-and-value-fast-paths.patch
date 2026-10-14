@@ -1,0 +1,683 @@
+Subject: Light-frame constructors and forwarders, and inline paths for equality, truthiness, elements, `length` and string methods
+
+What this does
+  Light-frame constructors and forwarders, and inline paths for equality, truthiness, elements, `length` and string methods.
+
+Why we need it
+  `x == null` and `if (obj)` always reached `js_strict_eq_slow` / `js_eq_slow` / `JS_ToBool`. Unary tag tests (`=== null` as a value, `!obj`, `typeof x === "undefined"`) tail-called the out-of-line unary helper. Typed-array reads and every `a[i] = v` took the generic element path.
+
+What it adds
+  `regvm_code_light_safe` admits `construct`, and `apply_arguments` in a function that declares no parameters (`regvm_code_has_op`). `regvm_t_construct_light` + `REGVM_FLAG_LIGHT_CTOR`: a light-eligible, non-derived constructor called with `new.target` equal to itself and every declared argument runs in a light frame that owns `this`; `regvm_t_return_light_nested` applies this-unless-object and the unwinder releases `this`. `regvm_t_apply_arguments` enters a light-eligible callee as a light frame; when `apply` is not the builtin, a light forwarder builds the (parameterless, so unmapped-cell) arguments object itself, with `callee` set to its own function and the usual memo slot.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs.c b/quickjs.c
+index a7f3028..f7f6cf7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -597,6 +597,11 @@ struct JSRuntime {
+        very large parked values cannot ratchet the heap up. */
+     size_t drc_malloc_mark;
+     uint8_t drc_in_reconcile;
++    /* Upper bound on the slot hints kept for property reads on string
++       primitives; see regvm_string_proto_get. Guesses only, re-proved on every
++       use. */
++#define JS_STRPROTO_HINTS 32
++    struct { JSAtom atom; uint32_t idx; } strproto_hint[JS_STRPROTO_HINTS];
+ #if QJS_DRC && QJS_DRC_CLOSCYC
+     /* Detached cells whose closure is still in flight (a
+        `var loop = function() { ... loop() ... }` self-cycle), collected by
+@@ -8679,10 +8684,11 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
+ }
+ 
+ #define JS_OBJ_INLINE_PROPS 4
+-/* Upper bound for the per-constructor learned inline capacity (O2). Kept at 8
+-   so a Node (4 slots) and a TextNode (8 slots) stay inline without the shape
+-   doubling overshooting, and so every learned object block stays small. */
+-#define JS_OBJ_LEARNED_INLINE_MAX 8
++/* Upper bound for the per-constructor learned inline capacity: how many own
++   properties a learned object keeps inline before it grows a separate
++   property array. `prop_inline_cap` is a 5-bit field, so it must stay below
++   32. */
++#define JS_OBJ_LEARNED_INLINE_MAX 16
+ /* Constructions observed before a constructor's instance capacity is locked in. */
+ #define JS_OBJ_LEARN_SAMPLES 8
+ 
+@@ -23472,6 +23478,10 @@ static inline int regvm_to_bool(JSContext *ctx, JSValue v)
+ {
+     if ((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)
+         return JS_VALUE_GET_INT(v) != 0;
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
++        return !JS_VALUE_GET_OBJ(v)->is_HTMLDDA;
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING)
++        return JS_VALUE_GET_STRING(v)->len != 0;
+     return JS_ToBool(ctx, v);
+ }
+ 
+@@ -23613,6 +23623,37 @@ static inline __attribute__((always_inline)) int regvm_unary_num_fast(
+ {
+     int tag = JS_VALUE_GET_TAG(v);
+ 
++    /* pure tag tests: no operand needs converting */
++    switch (sub) {
++    case REG_UN_IS_UNDEFINED:
++        *out = js_bool(tag == JS_TAG_UNDEFINED); return 1;
++    case REG_UN_IS_NULL:
++        *out = js_bool(tag == JS_TAG_NULL); return 1;
++    case REG_UN_IS_UNDEFINED_OR_NULL:
++        *out = js_bool(tag == JS_TAG_UNDEFINED || tag == JS_TAG_NULL); return 1;
++    case REG_UN_LNOT:
++        if (tag == JS_TAG_OBJECT) {
++            *out = js_bool(JS_VALUE_GET_OBJ(v)->is_HTMLDDA); return 1;
++        }
++        if (tag == JS_TAG_STRING) {
++            *out = js_bool(JS_VALUE_GET_STRING(v)->len == 0); return 1;
++        }
++        break;
++    case REG_UN_TYPEOF_IS_UNDEFINED:
++        if (tag == JS_TAG_INT || tag == JS_TAG_BOOL || tag == JS_TAG_NULL ||
++            tag == JS_TAG_UNDEFINED || tag == JS_TAG_STRING ||
++            JS_TAG_IS_FLOAT64(tag)) {
++            *out = js_bool(tag == JS_TAG_UNDEFINED); return 1;
++        }
++        break;
++    case REG_UN_TYPEOF_IS_FUNCTION:
++        if (tag == JS_TAG_INT || tag == JS_TAG_BOOL || tag == JS_TAG_NULL ||
++            tag == JS_TAG_UNDEFINED || tag == JS_TAG_STRING ||
++            JS_TAG_IS_FLOAT64(tag)) {
++            *out = JS_FALSE; return 1;
++        }
++        break;
++    }
+     if (JS_TAG_IS_FLOAT64(tag)) {
+         double d = JS_VALUE_GET_FLOAT64(v);
+         switch (sub) {
+@@ -23861,6 +23902,60 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+ /* The register property read for a site-bearing instruction. `*ppic` is the
+    running frame's cache base, updated here when the first fill allocates
+    it. */
++
++/*
++ * A property read on a string primitive, such as `"abc".charCodeAt`. The
++ * receiver has no shape for the per-site cache to key on. A string's own
++ * properties are `length` and its indices, both excluded here; this answers
++ * the case of an own plain data slot of String.prototype.
++ *
++ * The runtime keeps one hint per atom bucket: the slot index the atom had last
++ * time, re-proved against the prototype's current shape on every use, so a
++ * stale hint or another realm's prototype can only miss.
++ */
++static __attribute__((noinline)) int
++regvm_string_proto_fill(JSContext *ctx, JSObject *p, JSAtom atom, JSValue *out)
++{
++    JSProperty *pr;
++    JSShapeProperty *prs = find_own_property(&pr, p, atom);
++    unsigned h = atom & (JS_STRPROTO_HINTS - 1);
++
++    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return 0;
++    ctx->rt->strproto_hint[h].atom = atom;
++    ctx->rt->strproto_hint[h].idx = (uint32_t)(pr - p->prop);
++    *out = js_dup(pr->u.value);
++    return 1;
++}
++
++static inline __attribute__((always_inline)) int
++regvm_string_proto_get(JSContext *ctx, JSValue recv, JSAtom atom, JSValue *out)
++{
++    JSRuntime *rt = ctx->rt;
++    JSObject *p;
++    unsigned h = atom & (JS_STRPROTO_HINTS - 1);
++    uint32_t idx;
++
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_STRING || atom == JS_ATOM_length ||
++        __JS_AtomIsTaggedInt(atom))
++        return 0;
++    if (JS_VALUE_GET_TAG(ctx->class_proto[JS_CLASS_STRING]) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_STRING]);
++    idx = rt->strproto_hint[h].idx;
++    if (likely(rt->strproto_hint[h].atom == atom &&
++               idx < (uint32_t)p->shape->prop_count)) {
++        JSShapeProperty *prs = &get_shape_prop(p->shape)[idx];
++
++        if (likely(prs->atom == atom &&
++                   (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)) {
++            *out = js_dup(p->prop[idx].u.value);
++            return 1;
++        }
++    }
++    return regvm_string_proto_fill(ctx, p, atom, out);
++}
++
+ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+     JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out);
+ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+@@ -23877,6 +23972,16 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+        two ways swap so the dominant shape is the one the quickened hit serves.
+        A swap can change the primary's kind, which is safe because every
+        threaded caller requickens from `pic[site].kind` afterwards. */
++    if (JS_VALUE_GET_TAG(recv) == JS_TAG_STRING) {
++        if (atom == JS_ATOM_length)
++            return js_int32(JS_VALUE_GET_STRING(recv)->len);
++        if (regvm_string_proto_get(ctx, recv, atom, &val))
++            return val;
++    } else if (atom == JS_ATOM_length && JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
++               JS_VALUE_GET_OBJ(recv)->class_id == JS_CLASS_ARRAY &&
++               JS_VALUE_GET_TAG(JS_VALUE_GET_OBJ(recv)->prop[0].u.value) == JS_TAG_INT) {
++        return JS_VALUE_GET_OBJ(recv)->prop[0].u.value;
++    }
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT && *ppic) {
+         int s2 = b->regvm_pic_count + site;
+         JSValue v2;
+@@ -24136,11 +24241,20 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+  * (`ROP_add_imm_s` and friends) fold the switch to one case; out of line it is
+  * a large regression.
+  */
++static inline int regvm_strict_eq(int sub, JSValue a, JSValue b);
++static inline int regvm_loose_eq(int sub, JSValue a, JSValue b);
+ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSContext *ctx, int subop,
+                                        JSValue a, JSValue b, JSValue *out)
+ {
+     JSValue ops[2];
+ 
++    if (subop == REG_BIN_EQ || subop == REG_BIN_NEQ) {
++        int e = regvm_loose_eq(subop, a, b);
++        if (e >= 0) { *out = js_bool(e); return 0; }
++    } else if (subop == REG_BIN_STRICT_EQ || subop == REG_BIN_STRICT_NEQ) {
++        int e = regvm_strict_eq(subop, a, b);
++        if (e >= 0) { *out = js_bool(e); return 0; }
++    }
+     ops[0] = js_dup(a);
+     ops[1] = js_dup(b);
+     switch (subop) {
+@@ -24344,7 +24458,7 @@ static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
+         if ((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)
+             res = JS_VALUE_GET_INT(v) != 0;
+         else
+-            res = JS_ToBoolFree(ctx, js_dup(v));
++            res = regvm_to_bool(ctx, v);
+         *out = js_bool(!res);
+         return 0;
+     }
+@@ -24451,6 +24565,9 @@ static inline int regvm_strict_eq(int sub, JSValue a, JSValue b)
+             eq = 1; break;
+         case JS_TAG_OBJECT:
+             eq = JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b); break;
++        case JS_TAG_STRING:
++            eq = js_string_eq(JS_VALUE_GET_STRING(a), JS_VALUE_GET_STRING(b));
++            break;
+         default:
+             return -1;
+         }
+@@ -24479,11 +24596,18 @@ static inline int regvm_loose_eq(int sub, JSValue a, JSValue b)
+                  (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED))
+             eq = 1;             /* `null == undefined` */
+         else if (ta == JS_TAG_OBJECT &&
+-                 (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED))
+-            eq = 0;             /* an object equals neither null nor undefined */
+-        else if (tb == JS_TAG_OBJECT &&
+-                 (ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED))
++                 (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED)) {
++            /* an object equals neither null nor undefined, unless it is the
++               annex B IsHTMLDDA object, which the generic path answers */
++            if (unlikely(JS_VALUE_GET_OBJ(a)->is_HTMLDDA))
++                return -1;
+             eq = 0;
++        } else if (tb == JS_TAG_OBJECT &&
++                 (ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED)) {
++            if (unlikely(JS_VALUE_GET_OBJ(b)->is_HTMLDDA))
++                return -1;
++            eq = 0;
++        }
+         else
+             return -1;
+     } else {
+@@ -24499,6 +24623,9 @@ static inline int regvm_loose_eq(int sub, JSValue a, JSValue b)
+             eq = 1; break;
+         case JS_TAG_OBJECT:
+             eq = JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b); break;
++        case JS_TAG_STRING:
++            eq = js_string_eq(JS_VALUE_GET_STRING(a), JS_VALUE_GET_STRING(b));
++            break;
+         default:
+             return -1;
+         }
+@@ -24585,6 +24712,10 @@ static __exception int regvm_cmp_take(JSContext *ctx, int sub, JSValue a,
+         int e = regvm_strict_eq(sub, a, b);
+         if (likely(e >= 0))
+             return e ^ inv;
++    } else if (sub == REG_BIN_EQ || sub == REG_BIN_NEQ) {
++        int e = regvm_loose_eq(sub, a, b);
++        if (likely(e >= 0))
++            return e ^ inv;
+     }
+     if (!regvm_num_fast(sub, a, b, &out) &&
+         js_regvm_binary(ctx, sub, a, b, &out))
+@@ -25084,6 +25215,10 @@ static JSValueConst regvm_cur_func(JSRuntime *rt)
+ /* The callee's realm is the caller's, so a return can keep `ctx` instead of
+    loading `c->b->realm`. */
+ #define REGVM_FLAG_SAME_REALM (1 << 10)
++/* A light frame entered by `new`: it owns its `this_obj`, and its return
++   applies the this-unless-an-object-was-returned rule. Never set with
++   TRIVIAL_RET. */
++#define REGVM_FLAG_LIGHT_CTOR (1 << 11)
+ 
+ #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
+ typedef struct JSRegArenaChunk {
+@@ -25853,6 +25988,7 @@ static int regvm_record_eligible(JSFunctionBytecode *cb);
+ #if QJS_REGVM_RECORD
+ /* The encoded program contains only light-safe opcodes. */
+ static int regvm_code_light_safe(const uint8_t *code, int len);
++static int regvm_code_has_op(const uint8_t *code, int len, int want);
+ static __attribute__((always_inline)) inline JSRegRun *
+ regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
+                     int ret_off, JSValue *oargv,
+@@ -25913,6 +26049,7 @@ static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_construct_light(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
+ static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
+ static void js_learn_instance_cap(JSFunctionBytecode *nb, JSValueConst inst);
+@@ -27142,6 +27279,16 @@ regvm_t_return_light_nested(REGVM_ARGS)
+     JSValue *p, *end;
+     int vc = b->var_count;
+ 
++    if (unlikely(f->flags & REGVM_FLAG_LIGHT_CTOR)) {
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
++            js_learn_instance_cap(b, v);
++            JS_FreeValueRT(ctx->rt, f->this_obj);
++        } else {
++            JS_FreeValueRT(ctx->rt, v);
++            v = f->this_obj;            /* the frame's own reference */
++            js_learn_instance_cap(b, v);
++        }
++    }
+ #if QJS_DRC
+     if (b->var_count <= 255)
+         vc = b->regvm_var_count;
+@@ -27321,6 +27468,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
+     T_SET_NEXT_P(d, rv, 8);
+ }
+ 
++static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
++                                     int argc, JSValueConst *argv);
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS)
+ {
+     int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
+@@ -27328,6 +27477,20 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
+     JSValue *oargv = FRP(ab);
+     JSValue rv;
+ 
++    /* `str.charCodeAt(int)` on a flat string, answered without building the
++       native's JSStackFrame. */
++    if (JS_VALUE_GET_TAG(FR(c)) == JS_TAG_OBJECT && na >= 1 &&
++        JS_VALUE_GET_TAG(FR(r)) == JS_TAG_STRING &&
++        JS_VALUE_GET_TAG(oargv[0]) == JS_TAG_INT) {
++        JSObject *fo = JS_VALUE_GET_OBJ(FR(c));
++        if (fo->class_id == JS_CLASS_C_FUNCTION &&
++            fo->u.cfunc.c_function.generic == js_string_charCodeAt) {
++            JSString *sp_ = JS_VALUE_GET_STRING(FR(r));
++            uint32_t i_ = (uint32_t)JS_VALUE_GET_INT(oargv[0]);
++            rv = i_ < sp_->len ? js_int32(string_get(sp_, i_)) : JS_NAN;
++            T_SET_NEXT_P(d, rv, 10);
++        }
++    }
+     if (!regvm_cfunc_fp_fast(ctx, FR(c), na, vc(oargv), &rv) &&
+         !js_call_c_function_fast(ctx, FR(c), FR(r), na, vc(oargv), 0, &rv))
+         rv = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na, vc(oargv), 0);
+@@ -27772,11 +27935,82 @@ static uint8_t *REGVM_CC regvm_t_set_name(REGVM_ARGS)
+     __attribute__((musttail)) return regvm_t_set_name_slow(REGVM_PASS);
+ }
+ 
++
++/* Element fast paths: an int index into a typed array, or an in-bounds store
++   into a dense array. Returns 1 when it did the whole operation. */
++static inline __attribute__((always_inline)) int
++regvm_get_elem_typed(JSObject *p, uint32_t idx, JSValue *out)
++{
++    if (unlikely(idx >= p->u.array.count))
++        return 0;
++    switch (p->class_id) {
++    case JS_CLASS_UINT8C_ARRAY:
++    case JS_CLASS_UINT8_ARRAY: *out = js_int32(p->u.array.u.uint8_ptr[idx]); return 1;
++    case JS_CLASS_INT8_ARRAY:  *out = js_int32(p->u.array.u.int8_ptr[idx]); return 1;
++    case JS_CLASS_INT16_ARRAY: *out = js_int32(p->u.array.u.int16_ptr[idx]); return 1;
++    case JS_CLASS_UINT16_ARRAY: *out = js_int32(p->u.array.u.uint16_ptr[idx]); return 1;
++    case JS_CLASS_INT32_ARRAY: *out = js_int32(p->u.array.u.int32_ptr[idx]); return 1;
++    case JS_CLASS_UINT32_ARRAY: *out = js_uint32(p->u.array.u.uint32_ptr[idx]); return 1;
++    case JS_CLASS_FLOAT32_ARRAY: *out = js_float64(p->u.array.u.float_ptr[idx]); return 1;
++    case JS_CLASS_FLOAT64_ARRAY: *out = js_float64(p->u.array.u.double_ptr[idx]); return 1;
++    default: return 0;
++    }
++}
++
++static inline __attribute__((always_inline)) int
++regvm_put_elem_fast(JSContext *ctx, JSValue recv, JSValue k, JSValue v)
++{
++    JSObject *p;
++    uint32_t idx;
++
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(k) != JS_TAG_INT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(recv);
++    idx = JS_VALUE_GET_INT(k);
++    if (p->class_id == JS_CLASS_ARRAY) {
++        JSValue old;
++        if (unlikely(idx >= (uint32_t)p->u.array.count || p->holey))
++            return 0;
++        old = p->u.array.u.values[idx];
++        p->u.array.u.values[idx] = js_dup(v);
++        JS_FreeValue(ctx, old);
++        return 1;
++    }
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_INT)
++        return 0;
++    if (unlikely(idx >= (uint32_t)p->u.array.count))
++        return 0;
++    switch (p->class_id) {
++    case JS_CLASS_INT8_ARRAY:
++    case JS_CLASS_UINT8_ARRAY:
++        if (unlikely(typed_array_is_immutable(p))) return 0;
++        p->u.array.u.uint8_ptr[idx] = JS_VALUE_GET_INT(v); return 1;
++    case JS_CLASS_UINT8C_ARRAY: {
++        int32_t x = JS_VALUE_GET_INT(v);
++        if (unlikely(typed_array_is_immutable(p))) return 0;
++        p->u.array.u.uint8_ptr[idx] = x < 0 ? 0 : x > 255 ? 255 : x; return 1;
++    }
++    case JS_CLASS_INT16_ARRAY:
++    case JS_CLASS_UINT16_ARRAY:
++        if (unlikely(typed_array_is_immutable(p))) return 0;
++        p->u.array.u.uint16_ptr[idx] = JS_VALUE_GET_INT(v); return 1;
++    case JS_CLASS_INT32_ARRAY:
++    case JS_CLASS_UINT32_ARRAY:
++        if (unlikely(typed_array_is_immutable(p))) return 0;
++        p->u.array.u.uint32_ptr[idx] = JS_VALUE_GET_INT(v); return 1;
++    default:
++        return 0;
++    }
++}
+ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
+ {
+     int o = T_REG(1);
+     int key = T_REG(3);
+     int v = T_REG(5);
++#if QJS_DRC
++    if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
++        T_NEXT(T_SZ_RRR);
++#endif
+     /* the write can call a setter, so publish this frame's position first */
+     REGVM_CAPTURE_IP();
+ #if QJS_DRC
+@@ -27806,11 +28040,80 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
+     JSValue ret_val;
+ 
+     REGVM_CAPTURE_IP();
++    if (unlikely(f->flags & REGVM_FLAG_LIGHT) && pa == NULL) {
++        /* `apply` is not the builtin, so the callee needs a real `arguments`
++           object. Light eligibility admits only functions that declare no
++           parameters, so every element is unmapped, as
++           js_build_mapped_arguments makes past `arg_count`. Its `callee` (taken
++           from the innermost JSStackFrame, an outer function's here) is
++           replaced with this frame's function. Memoized in the record path's
++           variable slot and freed by the release walk. */
++        JSFunctionBytecode *lb = f->b;
++        JSValue args2[2], ao;
++        JSValue *slot = NULL;
++        int lvc = lb->var_count;
++
++#if QJS_DRC
++        if (lb->var_count <= 255)
++            lvc = lb->regvm_var_count;
++#endif
++        if (idx < lvc)
++            slot = &f->var_buf[idx];
++        if (slot && JS_VALUE_GET_TAG(*slot) != JS_TAG_UNINITIALIZED) {
++            ao = *slot;
++        } else {
++            JSObject *ap;
++
++            ao = js_build_mapped_arguments(ctx, f->argc, vc(f->arg_buf),
++                                           NULL, 0);
++            if (JS_IsException(ao))
++                T_FAIL();
++            ap = JS_VALUE_GET_OBJ(ao);
++            JS_FreeValue(ctx, ap->prop[2].u.value);
++            ap->prop[2].u.value = js_dup(JS_MKPTR(JS_TAG_OBJECT, f->func));
++            if (slot)
++                *slot = ao;
++        }
++        args2[0] = sp[-1];
++        args2[1] = ao;
++        ret_val = JS_Call(ctx, sp[-2], sp[-3], 2, vc(args2));
++        if (!slot)
++            JS_FreeValue(ctx, ao);
++        if (JS_IsException(ret_val))
++            T_FAIL();
++        T_SET_NEXT_P(d, ret_val, 7);
++    }
+     if (likely(pa != NULL &&
+-               (f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
++               ((f->flags & REGVM_FLAG_LIGHT) ||
++                f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
+         if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
+             T_FAIL();
+ #if QJS_REGVM_RECORD
++        /* A light-eligible callee given every declared argument is entered as a
++           light frame, borrowing this frame's window. */
++        {
++            JSValue cf0 = sp[-3];
++            if (JS_VALUE_GET_TAG(cf0) == JS_TAG_OBJECT) {
++                JSObject *co0 = JS_VALUE_GET_OBJ(cf0);
++                if (co0->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                    JSFunctionBytecode *cb0 = co0->u.func.function_bytecode;
++                    if (cb0->regvm_light_fast && (int)f->argc >= cb0->arg_count &&
++                        --ctx->interrupt_counter > 0) {
++                        JSValue *regs0;
++                        JSValue tv0 = sp[-1];
++                        JSRegRun *nf0 = regvm_light_enter(ctx, co0, cb0, f, d, ip + 7,
++                                                          f->arg_buf, f->argc, &regs0);
++                        if (nf0 != NULL) {
++                            nf0->this_obj = tv0;
++                            ctx->rt->regvm_cur = nf0;
++                            __attribute__((musttail))
++                                return regvm_t_dispatch(cb0->regvm_code, regs0, nf0,
++                                                        cb0->realm);
++                        }
++                    }
++                }
++            }
++        }
+         /* `f.apply(this, arguments)` with a JS callee enters the callee's
+            record directly, borrowing the arguments from this frame's window. */
+         {
+@@ -27927,6 +28230,44 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
+     T_SET_NEXT_P(d, out, 11);
+ }
+ 
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_light(REGVM_ARGS)
++{
++    int c = T_REG(3), ab = T_REG(7);
++    int na = T_U8(9);
++    JSValue cf = FR(c);
++    JSObject *co = JS_VALUE_GET_OBJ(cf);
++    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    JSValue obj, *regs;
++    JSRuntime *rt = ctx->rt;
++    JSRegRun *nf;
++
++    obj = js_create_from_ctor_cap(ctx, cf, JS_CLASS_OBJECT, cb->inst_inline_cap);
++    if (JS_IsException(obj))
++        T_FAIL();
++    nf = regvm_light_prepare(REGVM_PASS, co, cb, 10, FRP(ab), na, &regs);
++    if (unlikely(nf == NULL)) {
++        /* no room or an interrupt is due: the nested construct, object made */
++        JSValue ret = JS_CallInternal(ctx, cf, obj, cf, na, vc(FRP(ab)),
++                                      JS_CALL_FLAG_CONSTRUCTOR);
++        if (JS_IsException(ret)) {
++            JS_FreeValue(ctx, obj);
++            T_FAIL();
++        }
++        if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
++            JS_FreeValue(ctx, obj);
++            T_SET_NEXT_P(T_REG(1), ret, 10);
++        }
++        JS_FreeValue(ctx, ret);
++        T_SET_NEXT_P(T_REG(1), obj, 10);
++    }
++    nf->this_obj = obj;
++    nf->hdr_pack = (nf->hdr_pack & ~((uint64_t)REGVM_FLAG_TRIVIAL_RET << 32))
++                 | ((uint64_t)REGVM_FLAG_LIGHT_CTOR << 32);
++    rt->regvm_cur = nf;
++    __attribute__((musttail))
++        return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
++}
++
+ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
+ {
+     int d = T_REG(1);
+@@ -27946,6 +28287,14 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
+         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                    co->is_constructor)) {
+             JSFunctionBytecode *cb = co->u.func.function_bytecode;
++            /* A light-eligible plain constructor with new.target equal to
++               itself and every declared argument runs in a light frame that
++               owns `this` (regvm_t_construct_light). */
++            if (cb->regvm_light_fast && !cb->is_derived_class_constructor &&
++                JS_VALUE_GET_TAG(FR(nt)) == JS_TAG_OBJECT &&
++                JS_VALUE_GET_OBJ(FR(nt)) == co && na >= cb->arg_count)
++                __attribute__((musttail))
++                    return regvm_t_construct_light(REGVM_PASS);
+             if (likely(regvm_record_eligible(cb) &&
+                        !cb->is_derived_class_constructor))
+                 __attribute__((musttail))
+@@ -28203,12 +28552,18 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
+                     return regvm_t_get_element_lazy_slow(REGVM_PASS);
+             T_SET_NEXT_B(d,p->u.array.u.values[idx], T_SZ_RRR);
+         }
++        {
++            JSValue tv;
++            if (regvm_get_elem_typed(p, idx, &tv))
++                T_SET_NEXT_B(d, tv, T_SZ_RRR);
++        }
+     }
+     __attribute__((musttail)) return regvm_t_get_element_slow(REGVM_PASS);
+ }
+ 
+ /* The three named-property forms. The IC hit is call-free (shape compare,
+    flags test, lazy-marker test, js_dup); the miss is a tail call. */
++
+ #define T_GET_FIELD_BODY(NAME) \
+     static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
+     { \
+@@ -28220,6 +28575,9 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
+         /* the lookup can call a getter, so publish this frame's position first \
+            (the hit paths above never call out) */ \
+         REGVM_CAPTURE_IP(); \
++        if (regvm_string_proto_get(ctx, FR(r), atom, &val)) { \
++            T_SET_NEXT_P(d, val, T_SZ_RRAS); \
++        } \
+         if (site == REG_IC_NONE) { \
+             val = JS_GetProperty(ctx, FR(r), atom); \
+         } else { \
+@@ -29298,6 +29656,20 @@ static uint8_t *REGVM_CC regvm_t_get_length(REGVM_ARGS)
+     int r = T_REG(3);
+     JSValue val;
+ 
++    {
++        JSValue rv_ = FR(r);
++        if (JS_VALUE_GET_TAG(rv_) == JS_TAG_STRING)
++            T_SET_NEXT_B(d, js_int32(JS_VALUE_GET_STRING(rv_)->len), T_SZ_RRS);
++        if (JS_VALUE_GET_TAG(rv_) == JS_TAG_OBJECT) {
++            JSObject *p_ = JS_VALUE_GET_OBJ(rv_);
++            if (p_->class_id == JS_CLASS_ARRAY) {
++                /* an Array's `length` is its first own property, a plain value */
++                JSValue lv_ = p_->prop[0].u.value;
++                if (likely(JS_VALUE_GET_TAG(lv_) == JS_TAG_INT))
++                    T_SET_NEXT_B(d, lv_, T_SZ_RRS);
++            }
++        }
++    }
+     /* an exotic receiver can answer .length with an accessor or a trap */
+     REGVM_CAPTURE_IP();
+     val = JS_GetProperty(ctx, FR(r), JS_ATOM_length);
+@@ -29312,6 +29684,10 @@ static uint8_t *REGVM_CC regvm_t_put_element(REGVM_ARGS)
+     int o = T_REG(1);
+     int key = T_REG(3);
+     int v = T_REG(5);
++#if QJS_DRC
++    if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
++        T_NEXT(T_SZ_RRR);
++#endif
+ 
+     /* the write can call a setter, so publish this frame's position first */
+     REGVM_CAPTURE_IP();
+@@ -30139,6 +30515,8 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
+         for (p = f->var_buf; p < end; p++)
+             if (REGVM_HAS_COUNT(*p))
+                 JS_FreeValueRT(ctx->rt, *p);
++        if (f->flags & REGVM_FLAG_LIGHT_CTOR)
++            JS_FreeValueRT(ctx->rt, f->this_obj);
+         c = f->caller;
+         {
+             size_t top = (size_t)((uint8_t *)f
+@@ -30251,7 +30629,9 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
+     if (b->regvm_call_ready && b->func_kind == JS_FUNC_NORMAL
+         && b->var_ref_count == 0 && !b->args_captured
+         && b->regvm_ctl_count == 0
+-        && regvm_code_light_safe(b->regvm_code, b->regvm_len)) {
++        && regvm_code_light_safe(b->regvm_code, b->regvm_len)
++        && !(b->arg_count != 0 &&
++             regvm_code_has_op(b->regvm_code, b->regvm_len, ROP_apply_arguments))) {
+         b->regvm_light = 1;
+         {
+             int lvc = b->var_count;
+@@ -59272,9 +59652,33 @@ static int regvm_code_all_threaded(const uint8_t *code, int len)
+  * Is every opcode of this program safe to run in a light frame? A light frame
+  * has only the 9-slot prefix: no JSStackFrame, `argv`, `new_target` or control
+  * stack. Any cold opcode disqualifies (`regvm_exec_one`'s arms touch that
+- * state), as do `get_arg_el` and `apply_arguments`, which read record-only
+- * state. Construct and tail calls are excluded too.
++ * state), as do `get_arg_el` (its slow path reads `f->sf`/`f->argv`) and tail
++ * calls.
++ *
++ * `construct` is safe: the handler reads only the register file, and its
++ * record path seals a light caller as a record call does.
++ *
++ * `apply_arguments` is safe in a function with no declared parameters, which
++ * the caller checks (regvm_code_has_op): its forwarding path reads `argc` and
++ * `arg_buf` from the prefix, and its reified path has nothing to map.
+  */
++static int regvm_code_has_op(const uint8_t *code, int len, int want)
++{
++    const uint8_t *p = code, *end = p + len;
++    while (p < end) {
++        int op = *p, sz;
++        if (op == want)
++            return 1;
++        if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
++            return 1;
++        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
++        if (sz < 0)
++            return 1;
++        p += 1 + sz;
++    }
++    return 0;
++}
++
+ static int regvm_code_light_safe(const uint8_t *code, int len)
+ {
+     static uint8_t unsafe[ROP_COUNT];
+@@ -59287,8 +59691,8 @@ static int regvm_code_light_safe(const uint8_t *code, int len)
+             unsafe[op] = !regvm_is_threaded[op]
+                 || regvm_threaded[op] == regvm_t_cold;
+         unsafe[ROP_get_arg_el] = 1;
+-        unsafe[ROP_apply_arguments] = 1;
+-        unsafe[ROP_construct] = 1;
++        unsafe[ROP_apply_arguments] = 0;
++        unsafe[ROP_construct] = 0;
+         unsafe[ROP_tail_call] = 1;
+         unsafe[ROP_tail_call_method] = 1;
+ #if QJS_REGVM_FAST_COLD

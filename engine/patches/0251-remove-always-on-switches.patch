@@ -1,0 +1,365 @@
+Subject: Remove the switches that are always on
+
+What this does
+  Drops the `QJS_REGVM_FAST_COLD`, `QJS_SETNAME_FAST`, `QJS_CTOR_PROTO_FAST`
+  and `QJS_DRC_CLOSCYC` switches and their off branches, keeping the default
+  path: the seven dedicated handlers are always used, `set_name` always swaps
+  an inferred closure name in place, `js_create_from_ctor_cap` always reads an
+  instantiated constructor's `prototype` slot directly, and the closure
+  self-cycle is always broken at the next reconcile.
+
+Why we need it
+  Nothing sets any of the four, and their off branches are dead source that
+  would only bit-rot. Every one of them defaults to the same setting the whole
+  way through the series.
+
+What it adds
+  `REGVM_FAST_HANDLER(name)` is now `regvm_t_##name` unconditionally. No
+  behaviour change.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index d9843ac..4943279 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -96,57 +96,10 @@ typedef struct JSRegRCC JSRegRCC;
+ #endif
+ #endif
+ 
+-/*
+- * Fast threaded handlers for seven opcodes that would otherwise dispatch
+- * through the cold trampoline. Each is the monolith/`regvm_exec_one` body with
+- * record field names; the ones that can allocate, throw or run user code keep
+- * their slow half out of line, exactly like `regvm_t_cold`. Off restores the
+- * old `regvm_t_cold` entry for all seven.
+- */
+-#ifndef QJS_REGVM_FAST_COLD
+-#define QJS_REGVM_FAST_COLD 1
+-#endif
+-
+-/*
+- * QJS_SETNAME_FAST: `set_name` swaps the closure's empty inferred name for its
+- * real one in place instead of going through the generic property definer.
+- * Off restores the definer call for every case.
+- */
+-#ifndef QJS_SETNAME_FAST
+-#define QJS_SETNAME_FAST 1
+-#endif
+-
+-/*
+- * QJS_CTOR_PROTO_FAST: `js_create_from_ctor_cap` reads an instantiated
+- * bytecode constructor's own `prototype` slot directly instead of through
+- * JS_GetProperty. Off restores the generic read for every `new`.
+- */
+-#ifndef QJS_CTOR_PROTO_FAST
+-#define QJS_CTOR_PROTO_FAST 1
+-#endif
+-
+-/*
+- * QJS_DRC_CLOSCYC: under deferred reference counting, break a frame's
+- * closure -> cell self-cycle at the next reconcile instead of leaving it to the
+- * full collector. Off restores the old `continue` (every such cycle waits for a
+- * mark-sweep).
+- */
+-#ifndef QJS_DRC_CLOSCYC
+-#define QJS_DRC_CLOSCYC 1
+-#endif
+-
+-/*
+- * The handler-table entry for the seven opcodes above. With the switch on each
+- * names its own `regvm_t_<name>`; off, all seven fall back to `regvm_t_cold`,
+- * which is exactly the old behaviour. Used in `regvm_threaded` (which reads the
+- * handler) and in `regvm_is_threaded` (which ignores it and writes 1), so it
+- * must stay a plain expression.
+- */
+-#if QJS_REGVM_FAST_COLD
++/* The handler-table entry for the seven fast-cold opcodes, used in
++   `regvm_threaded` and in `regvm_is_threaded` (which writes 1), so it must
++   stay a plain expression. */
+ #define REGVM_FAST_HANDLER(name) regvm_t_##name
+-#else
+-#define REGVM_FAST_HANDLER(name) regvm_t_cold
+-#endif
+ 
+ /* Deferred reference counting. QJS_DRC enables the machinery (ZCT, reconcile,
+    register-root scanning); QJS_DRC_VALIDATE adds the debug root validator. */
+@@ -159,7 +112,7 @@ typedef struct JSRegRCC JSRegRCC;
+ 
+ #if QJS_DRC
+ static void js_drc_reconcile(JSRuntime *rt);
+-#if QJS_DRC && QJS_DRC_CLOSCYC
++#if QJS_DRC
+ static void js_closcyc_resolve(JSRuntime *rt);
+ #endif
+ #endif
+@@ -385,7 +338,7 @@ typedef struct JSString JSString;
+ typedef struct JSString JSAtomStruct;
+ typedef struct JSStringRope JSStringRope;
+ typedef struct JSMegaEntry JSMegaEntry;
+-/* QJS_DRC_CLOSCYC: the runtime's candidate list needs the name before the
++/* QJS_DRC: the runtime's candidate list needs the name before the
+    struct definition below. */
+ typedef struct JSVarRef JSVarRef;
+ 
+@@ -608,7 +561,7 @@ struct JSRuntime {
+        use. */
+ #define JS_STRPROTO_HINTS 32
+     struct { JSAtom atom; uint32_t idx; } strproto_hint[JS_STRPROTO_HINTS];
+-#if QJS_DRC && QJS_DRC_CLOSCYC
++#if QJS_DRC
+     /* Detached cells whose closure is still in flight (a
+        `var loop = function() { ... loop() ... }` self-cycle), collected by
+        `js_closcyc_frame` and resolved at the next reconcile once every live
+@@ -3950,7 +3903,7 @@ void JS_FreeRuntime(JSRuntime *rt)
+ 
+     JS_RunGC(rt);
+ 
+-#if QJS_DRC && QJS_DRC_CLOSCYC
++#if QJS_DRC
+     /* The final JS_RunGC reconciles and drains the candidates; drop anything
+        recorded after it before the leak checks. */
+     while (rt->closcyc_n > 0) {
+@@ -10153,13 +10106,11 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
+     rt->zct_nobj = 0;
+     if (!list_empty(&rt->gc_zero_ref_count_list))
+         free_zero_refcount(rt);
+-#if QJS_DRC_CLOSCYC
+     /* Break the recorded closure -> cell self-cycles last: registers are still
+        pinned, so counts are exact, and the parked lists are drained, so the
+        closure free's free_zero_refcount only sees objects at count zero. */
+     js_closcyc_resolve(rt);
+     assert(list_empty(&rt->gc_zero_ref_count_list));
+-#endif
+ 
+     rt->drc_in_reconcile = 0;
+ }
+@@ -23383,7 +23334,7 @@ js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf, bool guarded)
+             }
+             JS_REF_COUNT(vr)--;
+         }
+-#if QJS_DRC && QJS_DRC_CLOSCYC
++#if QJS_DRC
+         /* Dead closures over this cell may still be parked and hold it, so its
+            count is not exact here. Record the cell when it holds its own
+            closure; js_closcyc_resolve tests the count once the parked values
+@@ -23399,7 +23350,6 @@ js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf, bool guarded)
+            refers to the closure" proves nothing yet. Hand the cell to
+            `js_closcyc_resolve`, which runs in the next reconcile with every
+            register pinned. The `owns` test is the non-DRC branch's. */
+-#if QJS_DRC_CLOSCYC
+         {
+             JSObject *o;
+             JSFunctionBytecode *b;
+@@ -23428,7 +23378,6 @@ js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf, bool guarded)
+             JS_REF_COUNT(vr)++;
+             rt->closcyc_cand[rt->closcyc_n++] = vr;
+         }
+-#endif /* QJS_DRC_CLOSCYC */
+         continue;
+ #else
+         if (JS_VALUE_GET_TAG(vr->value) != JS_TAG_OBJECT)
+@@ -23458,7 +23407,7 @@ js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf, bool guarded)
+     }
+ }
+ 
+-#if QJS_DRC && QJS_DRC_CLOSCYC
++#if QJS_DRC
+ /* Resolve the cells `js_closcyc_frame` handed over. Runs at the end of
+    `js_drc_reconcile_locked`, after the parked lists are drained, with every
+    register pinned, so a count of 2 (the list's reference plus the closure's)
+@@ -23503,7 +23452,7 @@ static void js_closcyc_resolve(JSRuntime *rt)
+         free_var_ref(rt, vr);
+     }
+ }
+-#endif /* QJS_DRC && QJS_DRC_CLOSCYC */
++#endif /* QJS_DRC */
+ 
+ #if QJS_REGVM
+ /* How many for-of loops one activation can be inside at once. A function with
+@@ -26083,7 +26032,6 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_local_uninit(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS);
+-#if QJS_REGVM_FAST_COLD
+ static uint8_t *REGVM_CC regvm_t_get_arg_field(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_arg_xfer(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_local_s1(REGVM_ARGS);
+@@ -26092,7 +26040,6 @@ static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_special_object(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_make_closure(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_set_name(REGVM_ARGS);
+-#endif
+ static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_move_s(REGVM_ARGS);
+@@ -26355,7 +26302,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(array_from, regvm_t_array_from) \
+     X(binary_cpool, regvm_t_binary_cpool) \
+     X(branch_cmp_loc_loc, regvm_t_cold) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(branch_cmp_loc_reg, REGVM_FAST_HANDLER(branch_cmp_loc_reg)) \
+     X(branch_cmp_reg_loc, regvm_t_cold) \
+     X(catch_enter, regvm_t_cold) \
+@@ -26383,7 +26330,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(for_in_next, regvm_t_cold) \
+     X(for_in_start, regvm_t_cold) \
+     X(get_arg_el, regvm_t_get_arg_el) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(get_arg_field, REGVM_FAST_HANDLER(get_arg_field)) \
+     X(get_length, regvm_t_get_length) \
+     X(get_local_field, regvm_t_cold) \
+@@ -26407,7 +26354,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(local_rmw_branch, regvm_t_local_rmw_branch) \
+     X(local_rmw_imm, regvm_t_cold) \
+     X(local_uninit, regvm_t_local_uninit) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(make_closure, REGVM_FAST_HANDLER(make_closure)) \
+     X(make_local_ref, regvm_t_cold) \
+     X(make_var_ref, regvm_t_cold) \
+@@ -26417,7 +26364,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(object_template, regvm_t_object_template) \
+     X(private_symbol, regvm_t_cold) \
+     X(put_arg, regvm_t_cold) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(put_arg_xfer, REGVM_FAST_HANDLER(put_arg_xfer)) \
+     X(put_element, regvm_t_put_element) \
+     X(put_element_xfer, regvm_t_put_element_xfer) \
+@@ -26425,7 +26372,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(put_global, regvm_t_put_global) \
+     X(put_local, regvm_t_cold) \
+     X(put_local_s0, regvm_t_put_local_s0) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(put_local_s1, REGVM_FAST_HANDLER(put_local_s1)) \
+     X(put_local_s2, regvm_t_cold) \
+     X(put_local_s3, regvm_t_cold) \
+@@ -26440,11 +26387,11 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(put_var_ref, regvm_t_cold) \
+     X(regexp, regvm_t_cold) \
+     X(rest, regvm_t_cold) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(set_name, REGVM_FAST_HANDLER(set_name)) \
+     X(set_name_computed, regvm_t_cold) \
+     X(set_proto, regvm_t_cold) \
+-    /* QJS_REGVM_FAST_COLD */ \
++    /* dedicated handler */ \
+     X(special_object, REGVM_FAST_HANDLER(special_object)) \
+     X(sub_imm_s, regvm_t_sub_imm_s) \
+     X(sub_imm_self_s, regvm_t_sub_imm_self_s) \
+@@ -27955,17 +27902,11 @@ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS)
+     T_SET_NEXT_P(d, val, 9);
+ }
+ 
+-/*
+- * QJS_REGVM_FAST_COLD: dedicated handlers for seven opcodes that were
+- * dispatched through `regvm_t_cold` -> `regvm_t_cold_slow` -> `regvm_exec_one`.
+- * That path costs a call into `regvm_exec_one` and its own dispatch on top of
+- * the opcode, ~69 instructions per dispatch. Each body below is the
+- * `regvm_exec_one` arm (already written against the record `f`) with its
+- * operands decoded from the opcode's fixed format. The three that can allocate,
+- * throw or run user code (`special_object`, `make_closure`, `set_name`) keep
+- * their body in a `noinline` `_slow` half and tail-call into it, so the handler
+- * that sits on the dispatch path stays frameless -- the gate checks this.
+- */
++/* Dedicated handlers for seven opcodes otherwise dispatched through
++   `regvm_t_cold` into `regvm_exec_one`. Each body is the `regvm_exec_one` arm
++   with its operands decoded from the fixed format. `special_object`,
++   `make_closure` and `set_name` can allocate, throw or run user code, so their
++   bodies are `noinline` `_slow` halves reached by tail call. */
+ 
+ /* "ruas": d, receiver slot, atom, PIC site. Same body as get_local_field_0
+    with the receiver read from the argument area instead of var_buf[0]. */
+@@ -28128,19 +28069,10 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_A
+     JSAtom atom = T_U32(3);
+     JSValue v = FR(r);
+ 
+-    /*
+-     * QJS_SETNAME_FAST: `js_closure` already gave every closure its own
+-     * compile-time name, and `set_name` only ever replaces the *empty* one
+-     * (inference writes the name after the object exists). A closure's `name`
+-     * is an own, non-writable, non-enumerable, configurable data property
+-     * (`js_function_set_properties`, JS_PROP_CONFIGURABLE), so when it is
+-     * already present and normal the generic definer's whole job is to swap
+-     * the string -- it frees the old value, stores the new one, and re-applies
+-     * a mask that changes no bit (JS_DefineProperty's `else` branch below the
+-     * find_own_property, quickjs.c:15336). Going through the generic definer
+-     * costs ~256 instructions for that swap; this is it directly.
+-     */
+-#if QJS_SETNAME_FAST
++    /* `set_name` only replaces a closure's empty compile-time name. A closure's
++       `name` is an own non-writable, non-enumerable, configurable data property
++       (`js_function_set_properties`), so when it is present and normal the
++       definer's whole job is to swap the string. */
+     if (atom != JS_ATOM_NULL && JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+         JSObject *p = JS_VALUE_GET_OBJ(v);
+ 
+@@ -28164,7 +28096,6 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_A
+             }
+         }
+     }
+-#endif
+     if (JS_DefineObjectName(ctx, v, atom, JS_PROP_CONFIGURABLE) < 0)
+         T_FAIL();
+     T_NEXT(T_SZ_RA);
+@@ -41186,7 +41117,6 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+            return. Anything else (not found, the AUTOINIT stub, GETSET, VARREF,
+            another class) takes the generic read, which also instantiates the
+            stub. */
+-#if QJS_CTOR_PROTO_FAST
+         if (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT) {
+             JSObject *cp = JS_VALUE_GET_OBJ(ctor);
+ 
+@@ -41202,7 +41132,6 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+                 }
+             }
+         }
+-#endif
+         proto = JS_GetProperty(ctx, ctor, JS_ATOM_prototype);
+         if (JS_IsException(proto))
+             return proto;
+@@ -59945,17 +59874,20 @@ static int regvm_code_light_safe(const uint8_t *code, int len)
+         unsafe[ROP_construct] = 0;
+         unsafe[ROP_tail_call] = 1;
+         unsafe[ROP_tail_call_method] = 1;
+-#if QJS_REGVM_FAST_COLD
+         /*
+-         * These seven have dedicated handlers under QJS_REGVM_FAST_COLD, but
+-         * they were light-unsafe while they dispatched through regvm_t_cold
+-         * (the `== regvm_t_cold` test above). Five read record-only frame
+-         * fields -- sf, argv, arg_buf, arg_owned, new_target -- and all seven
+-         * stay unsafe so this patch changes no function's frame kind. Widening
+-         * eligibility for put_local_s1 or branch_cmp_loc_reg would be just as
+-         * wrong: their handlers are frameless, but the point is that the set of
+-         * light-eligible functions must be identical with the switch on and
+-         * off.
++         * The `unsafe[]` test above already marks every opcode whose handler is
++           the
++         * cold trampoline. These seven have their own handlers but stay
++         light-unsafe. *
++         * Read a record-only field, so a light frame cannot run them:
++         *   special_object  `new_target`, `argv`, `argc`
++         *   make_closure    `sf`, passed to js_closure
++         *   put_arg_xfer    `arg_owned`
++         *
++         * Read only prefix fields; unsafe only to keep the set of
++           light-eligible
++         * functions fixed:
++         *   branch_cmp_loc_reg, put_local_s1, get_arg_field, set_name
+          */
+         unsafe[ROP_branch_cmp_loc_reg] = 1;
+         unsafe[ROP_special_object] = 1;
+@@ -59964,7 +59896,6 @@ static int regvm_code_light_safe(const uint8_t *code, int len)
+         unsafe[ROP_get_arg_field] = 1;
+         unsafe[ROP_put_arg_xfer] = 1;
+         unsafe[ROP_put_local_s1] = 1;
+-#endif
+         ready = 1;
+     }
+     while (p < end) {

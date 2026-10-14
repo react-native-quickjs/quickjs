@@ -1,71 +1,35 @@
-Subject: register VM: fuse a multiply into the add or subtract that consumes it
+Subject: Fuses a multiply into the add or subtract that consumes its product
 
-What this does:
-  A multiply whose product is one of the operands of the immediately following
-  add or subtract is lowered to a single instruction that performs both: it
-  forms the product, stores it to the multiply's destination, and writes the
-  sum or difference to the add's destination. The fused instruction still
-  writes the product, so anything that reads it afterwards sees exactly what it
-  saw before; what is saved is one dispatch and the second instruction's operand
-  decode. No single-use condition is needed for that reason.
+What this does
+  Fuses a multiply into the add or subtract that consumes its product.
 
-  Both operand positions are covered, and they are four distinct opcodes rather
-  than one with a swapped operand list: `c + p` is not `p + c` when a string is
-  involved, because concatenation order is observable, and `c - p` is not
-  `p - c` at all. The two orders are ROP_mul_add/ROP_mul_sub (`p` on the left)
-  and ROP_add_mul/ROP_sub_mul (`p` on the right).
+Why we need it
+  And the product is usually the right operand of the add because the common source shape is `acc + a*b`.
 
-  The add must read its other operand after the product is stored, because that
-  operand may be the multiply's own destination; the float path therefore forms
-  the product, stores it, and only then reads the third operand. The float case
-  multiplies and adds in one expression and never round-trips through a JSValue;
-  the integer case chains regvm_num_fast; anything else -- a string, an object, a
-  mixed pair -- continues in a slow handler that runs the two operations in
-  order through js_regvm_binary.
+What it adds
+  Four appended opcodes with format `rrrrr` -- `ROP_mul_add`/`ROP_mul_sub` for the product on the left and `ROP_add_mul`/`ROP_sub_mul` for it on the right, since `c + p` is not `p + c` for strings and `c - p` is not `p - c` -- each storing the product to the multiply's destination and the result to the add's, reading the third operand only after that store because it may be the multiply's own destination, with a float path that never round-trips through a JSValue, an integer path chaining `regvm_num_fast`, and a slow path through `js_regvm_binary`; the fusion pass matches the unlowered `ROP_binary` form, refuses a branch/catch/finally target or block leader at the second instruction, and runs beside the chained-read fusion after register allocation, the ownership analysis and dead-store elision.
 
-  The fusion pass runs beside the chained-read fusion, after register allocation
-  and the ownership analysis and after dead-store elision. It matches the
-  unlowered ROP_binary form, because the rewrite from ROP_binary to the specific
-  arithmetic opcode happens later, in the encoder. It fires only on IR-adjacent
-  pairs, refuses a branch, catch or finally target and a block leader at the
-  second instruction -- dropping it would otherwise move a target past the fused
-  pair -- and can be disabled with REGVM_NOARITH2.
-
-Why we need it:
-  On box2d the arithmetic pairs are the largest dynamic adjacency that fusion
-  can address: mul->add is 3.97 M and mul->sub 2.37 M of the 64.76 M adjacent
-  dispatch transitions, and the product is usually the right operand of the add
-  (the common source shape is `acc + a*b`). Fusion is the remaining
-  non-structural lever, and the multiply feeding the very next operation is its
-  densest target.
-
-Adds:
-  Four register-VM opcodes (ROP_mul_add, ROP_mul_sub, ROP_add_mul, ROP_sub_mul)
-  with format "rrrrr" -- destination-of-the-multiply, two multiply operands, the
-  add's destination, the add's other operand -- their threaded handlers and slow
-  continuations, their monolith labels, and the fusion pass that produces them
-  from an adjacent ROP_binary multiply and add/subtract.
-
-Evidence:
-  Box2D 32-iteration `fixed.js`: 29.055 G to 28.746 G instructions
-  (**-1.06 %**, -0.309 G), cycles 13.103 G to 12.766 G (**-2.57 %**), wall
-  -2.4 %. On `check.js` the pass fuses 6,292,072 dispatches (ROP_mul_add
-  17,708, ROP_add_mul 3,948,024, ROP_sub_mul 2,326,340), matching the predicted
-  6.34 M mul->add/sub pairs, which is about 7 instructions saved per pair.
-  Checksum `546.1008391043414` exact; `QJS_REGVM_VERIFY=1` build clean; the
-  differential suite passes 398/0/0 in both mono and threaded modes; hand
-  kernels cover both operand positions, both operators, integer and float, and
-  the order-sensitive string-concatenation slow path.
-
-Bytecode bump:
-  No. The four opcodes are appended at the end of the enum so every existing
-  opcode keeps its value, and they are never emitted by the encoder -- they
-  exist only between the fusion pass and the encoder within a single compile --
-  so no blob contains them.
-
+Needs a bytecode version bump
+  No.
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -566,6 +566,13 @@ typedef enum JSRegOpcode {
+        quickening; both alias the generic monolith label. */
+     ROP_get_field_chain, ROP_get_field_chain_own,
+ 
++    /* Fused arithmetic: a `mul` followed by an `add`/`sub` consuming the
++       product as its left operand. Operands: the product's destination, x, y,
++       the add's destination, its other operand. */
++    ROP_mul_add, ROP_mul_sub,
++    /* the product as the right operand */
++    ROP_add_mul, ROP_sub_mul,
++
+     ROP_COUNT
+ } JSRegOpcode;
+ 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23019,6 +23019,10 @@
+@@ -22694,6 +22694,10 @@ static __exception int regvm_cmp_take(JSContext *ctx, int sub, JSValue a,
  
  #ifdef QJS_REGVM_COUNT
  extern uint64_t js_regvm_count[ROP_COUNT];
@@ -76,7 +40,7 @@ Bytecode bump:
  #if QJS_REGVM_COUNT
  extern uint64_t js_regvm_ir_insns, js_regvm_ir_moves, js_regvm_ir_move_adj;
  extern uint64_t js_regvm_own_plain, js_regvm_own_returns;
-@@ -23287,6 +23291,7 @@
+@@ -22922,6 +22926,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
   */
  #define T_SZ_RR     5    /* "rr"    */
  #define T_SZ_RRR    7    /* "rrr"   */
@@ -84,7 +48,7 @@ Bytecode bump:
  #define T_SZ_RBR    6    /* "rbr"   */
  #define T_SZ_RBRR   8    /* "rbrr"  */
  #define T_SZ_RBUR   8    /* "rbur"  */
-@@ -23341,7 +23346,16 @@
+@@ -22973,7 +22978,16 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS);
  #define T_FAIL()  do { f->ret = JS_EXCEPTION; return NULL; } while (0)
  #endif
  #ifdef QJS_REGVM_COUNT
@@ -101,7 +65,7 @@ Bytecode bump:
  #else
  #define T_COUNT_INC(o) ((void)0)
  #endif
-@@ -23690,6 +23704,10 @@
+@@ -23274,6 +23288,10 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_field_chain_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_field_chain_second_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_field_chain_free1(REGVM_ARGS);
@@ -112,7 +76,7 @@ Bytecode bump:
  static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_branch(REGVM_ARGS);
-@@ -23983,6 +24001,10 @@
+@@ -23543,6 +23561,10 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(get_field2_own, regvm_t_get_field2_own) \
      X(get_field_chain, regvm_t_get_field_chain) \
      X(get_field_chain_own, regvm_t_get_field_chain_own) \
@@ -123,20 +87,13 @@ Bytecode bump:
      X(put_field, regvm_t_put_field) \
      X(branch, regvm_t_branch) \
      X(branch_s, regvm_t_branch_s) \
-@@ -25372,6 +25394,120 @@
+@@ -24813,6 +24835,100 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
  }
  
-+/*
-+ * X6: store an intermediate value without dispatching.
-+ *
-+ * The fused arithmetic still owes the mul's own store -- `dm` keeps the product
-+ * exactly as it did before the fusion, so anything reading it afterwards is
-+ * unaffected. T_SET_NEXT cannot be used because it dispatches, and the add has
-+ * not run yet. The rare case where the old value's last reference dies is
-+ * released directly; the handler is already a normal (non-tail) function here,
-+ * so there is no dispatch to preserve.
-+ */
++/* Store an intermediate value without dispatching: the fused arithmetic still
++   stores the product to `dm`. When the old value's last reference dies it is
++   released directly. */
 +static inline void regvm_store_intermediate(JSRuntime *rt, JSValue *slot, JSValue v)
 +{
 +    JSValue old = *slot;
@@ -162,30 +119,17 @@ Bytecode bump:
 +}
 +
 +/*
-+ * X6: the fused three-operand arithmetic.
-+ *
-+ * `mul dm, x, y` immediately followed by `add da, dm, c` becomes one
-+ * instruction, `dm x y da c`: the product is formed and stored to `dm`, then
-+ * `da` receives `dm + c`. Only the product as the LEFT operand is fused,
-+ * because `c + p` and `c - p` are not the same operations and the operand order
-+ * of a JavaScript `+` is observable.
-+ *
-+ * The float path multiplies and adds in one expression, so the product never
-+ * round-trips through a JSValue; every operand is read before either store, so
-+ * a register that is both an operand and a destination is still correct. The
-+ * int path chains regvm_num_fast. Anything else -- a string, an object, a mixed
-+ * pair -- continues in the slow handler, which runs the two operations in order
-+ * through js_regvm_binary.
++ * Fused arithmetic: `mul dm, x, y` followed by an add or sub of `dm` and `c`
++ * becomes one instruction. The product is stored to `dm` and the add's result
++ * to `da`. Every operand is read before either store. The int path chains
++ * regvm_num_fast; anything else runs the two operations in order in the slow
++ * handler.
 + */
 +#define REGVM_F_ADD(a, b) ((a) + (b))
 +#define REGVM_F_SUB(a, b) ((a) - (b))
 +
-+/*
-+ * `rev` is 0 when the product is the left operand (`p OP c`) and 1 when it is
-+ * the right (`c OP p`). `c + p` is not `p + c` when a string is involved, and
-+ * `c - p` is not `p - c` at all, so the two orders are separate opcodes; the
-+ * flag is a compile-time constant, so each instantiation folds to one form.
-+ */
++/* `rev` is 0 for `p OP c` and 1 for `c OP p`: the orders differ for `-` and,
++   with strings, for `+`. A compile-time constant per instantiation. */
 +#define T_DEF_ARITH2(name, sub2, FOP, rev) \
 +    static __attribute__((noinline)) uint8_t *REGVM_CC \
 +    regvm_t_##name##_slow(REGVM_ARGS) \
@@ -241,15 +185,15 @@ Bytecode bump:
 +#undef REGVM_F_ADD
 +#undef REGVM_F_SUB
 +
- /* cold: entry 0 was not a cached overwrite of this shape, so the engine's
-    routine owns everything else -- the other entries, the add transition that
-    has to grow the property array, an exotic receiver, a read-only slot, or no
-@@ -26690,6 +26826,12 @@
-                interpreter. Both aliases run the full kind-tested read pair. */
+ /* cold: not a cached overwrite of this shape; the engine handles the other
+    entries, add transitions, exotic receivers, read-only slots and empty
+    tables. */
+@@ -25960,6 +26076,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                interpreter; both aliases run the full kind-tested read pair. */
              [ROP_get_field_chain] = &&L_ROP_get_field_chain,
              [ROP_get_field_chain_own] = &&L_ROP_get_field_chain,
-+            /* X6: the fused arithmetic is emitted by the compiler, so the
-+               monolith runs it too. */
++            /* The fused arithmetic is emitted by the compiler, so the monolith
++               runs it too. */
 +            [ROP_mul_add] = &&L_ROP_mul_add,
 +            [ROP_mul_sub] = &&L_ROP_mul_sub,
 +            [ROP_add_mul] = &&L_ROP_add_mul,
@@ -257,7 +201,7 @@ Bytecode bump:
              [ROP_put_field] = &&L_ROP_put_field,
              [ROP_put_field_xfer] = &&L_ROP_put_field_xfer,
              [ROP_define_field] = &&L_ROP_define_field,
-@@ -26796,7 +26938,16 @@
+@@ -26066,7 +26188,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              [ROP_get_arg_field] = &&L_ROP_get_arg_field,
          };
  #ifdef QJS_REGVM_COUNT
@@ -274,7 +218,7 @@ Bytecode bump:
  #else
  #define REGVM_COUNT_INC(o) ((void)0)
  #endif
-@@ -27761,6 +27912,74 @@
+@@ -26971,6 +27102,74 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  SET_REG(d2, v2);
                  REGVM_NEXT();
              }
@@ -349,11 +293,11 @@ Bytecode bump:
              L_ROP_put_field: {
                  int r = RD_REG();
                  JSAtom atom = RD_U32();
-@@ -53881,6 +54100,11 @@
+@@ -52622,6 +52821,11 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
      [ROP_get_field2_own] = "rras",
      [ROP_get_field_chain] = "rrasrras",
      [ROP_get_field_chain_own] = "rrasrras",
-+    /* X6 fused arithmetic: dm x y da c */
++    /* fused arithmetic: dm x y da c */
 +    [ROP_mul_add] = "rrrrr",
 +    [ROP_mul_sub] = "rrrrr",
 +    [ROP_add_mul] = "rrrrr",
@@ -361,24 +305,13 @@ Bytecode bump:
      [ROP_put_field] = "rasr",
      [ROP_define_field] = "rar",
      /* object, window base, count, template index: fills an object literal's
-@@ -57339,6 +57563,129 @@
+@@ -55750,6 +55954,116 @@ static void regvm_fuse_field_chain(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+     js_free(ctx, first);
  }
  
- /*
-+ * X6: fuse an arithmetic pair.
-+ *
-+ * `mul dm, x, y` immediately followed by `add`/`sub da, dm, c` becomes one
-+ * instruction, `mul_add dm x y da c`: the product is formed and stored to `dm`,
-+ * then `da` receives `dm + c`. Only the product as the LEFT operand is fused,
-+ * because `c + p` and `c - p` are not the same operations and the operand order
-+ * of a JavaScript `+` is observable. The fused instruction still writes `dm`,
-+ * so anything that reads the product afterwards sees exactly what it saw
-+ * before; the fusion removes a dispatch, not a value.
-+ *
-+ * Like the chain fusion, this drops the second instruction, so a branch, catch
-+ * or finally target that still named it would resolve past the fused pair. That
-+ * and a block start are refused.
-+ */
++/* Fuse `mul dm, x, y` with an immediately following `add`/`sub` of `dm`. The
++   fused instruction still writes `dm`. It drops the second instruction, so a
++   branch, catch or finally target or a block start there is refused. */
 +static void regvm_fuse_arith_pair(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 +                                  int n_pcs, const int *bstart, int n_blocks)
 +{
@@ -425,9 +358,8 @@ Bytecode bump:
 +            continue;
 +        if (b->ops[1] != REG_BIN_ADD && b->ops[1] != REG_BIN_SUB)
 +            continue;
-+        /* The product must be one of the two operands. Which one decides the
-+           opcode: `c + p` is not `p + c` when a string is involved, and
-+           `c - p` is not `p - c` at all. */
++        /* The product must be one of the operands; which one picks the opcode.
++           */
 +        if (b->ops[2] == a->ops[0]) {
 +            rev = 0;
 +            c = b->ops[3];
@@ -487,23 +419,22 @@ Bytecode bump:
 +    js_free(ctx, first);
 +}
 +
-+/*
+ /*
   * --- promoted slots ------------------------------------------------------
   *
-  * A promoted local or argument is one whose value the value IR carries in a
-@@ -59880,6 +60227,10 @@
-        site. */
+@@ -58096,6 +58410,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+        operand its own site. */
      regvm_fuse_field_chain(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                             bstart, n_blocks);
-+    /* X6: fuse `mul` into the `add`/`sub` that consumes its product. Runs
-+       beside the chain fusion, for the same reason. */
++    /* Fuse `mul` into the `add`/`sub` that consumes its product, beside the
++       chain fusion and for the same reason. */
 +    regvm_fuse_arith_pair(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 +                          bstart, n_blocks);
-     /*
-      * Slot-in-opcode for the fused frame read. 95% of frame accesses name a slot
-      * below 16 and 55% below 4, so for those the slot operand is pure extraction
-@@ -63025,6 +63376,10 @@
-  */
+     /* Slot-in-opcode for the fused frame read: for small slots the opcode names
+        the slot and the operand is dropped, shifting the atom and site down. */
+     for (i = 0; i < ir.n_insns; i++) {
+@@ -60975,6 +61293,10 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
+    meaningless. */
  #ifdef QJS_REGVM_COUNT
  uint64_t js_regvm_count[ROP_COUNT];
 +#ifdef QJS_REGVM_DYNADJ
@@ -511,9 +442,9 @@ Bytecode bump:
 +uint64_t js_regvm_dyn_adj[ROP_COUNT * ROP_COUNT];
 +#endif
  #if QJS_REGVM_COUNT
- /*
-  * The IR's own view of the compiler's output: how many register instructions it
-@@ -63206,6 +63561,17 @@
+ /* The IR's view of the compiler's output: how many register instructions it
+    emits, how many are copies, and what precedes a copy. */
+@@ -61147,6 +61469,17 @@ int js_regvm_count_dump(void)
                  fprintf(stderr, "##ADJ## %d %d %llu\n", i, j, (unsigned long long)cn);
          }
      }
@@ -531,25 +462,3 @@ Bytecode bump:
      for (i = 0; i < 17; i++)
          if (js_regvm_slot[i])
              fprintf(stderr, "##SLOT## %d %llu\n", i, (unsigned long long)js_regvm_slot[i]);
---- a/quickjs-regvm.h
-+++ b/quickjs-regvm.h
-@@ -715,6 +715,19 @@
-      */
-     ROP_get_field_chain, ROP_get_field_chain_own,
- 
-+    /*
-+     * X6 fused three-operand arithmetic. A `mul` immediately followed by an
-+     * `add`/`sub` that consumes the product as its left operand becomes one
-+     * instruction with five register operands -- the product's own destination
-+     * first, then the add's destination and its right operand. Only the left
-+     * operand is fused, because `c + p` and `c - p` are not the same operations
-+     * and the operand order of a JavaScript `+` is observable. Appended at the
-+     * end like the other fusions, so no existing opcode number moves.
-+     */
-+    ROP_mul_add, ROP_mul_sub,
-+    /* X6: the mirror image, the product as the right operand. */
-+    ROP_add_mul, ROP_sub_mul,
-+
-     ROP_COUNT
- } JSRegOpcode;
- 

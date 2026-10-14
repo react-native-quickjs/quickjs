@@ -1,103 +1,162 @@
-Subject: AOT generator skeleton: binding, entry/exit and the runtime ABI
+Subject: AOT generator skeleton: digest binding, entry/exit and the runtime ABI
 
 What this does
-  Adds phase P2 of .local/aot-regvm-impl-plan.md: the runtime side that lets a
-  generated C unit run register-compiled functions. A function that matches a
-  unit entry by its 128-bit content digest is bound at bytecode finalisation
-  (aot_fn/aot_state on JSFunctionBytecode) and, when it is called, js_regvm_execute
-  hands the already-set-up frame to the generated body instead of entering the
-  interpreter loop.
-
-  quickjs-aot-rt.h is the ABI the generated code is compiled against:
-  JSAotEntry, JSAotFn, QJS_AOT_ABI, the QJS_AOT_COLD_RET / QJS_AOT_SUSPEND
-  sentinels, and qjs_aot_step()/qjs_aot_code()/qjs_aot_ret()/qjs_aot_unwind().
-  quickjs-aot-gen.h is the host-side generator interface (js_aot_gen_collect,
-  js_aot_gen_insn_size) used by tools/aot/qjsaot.c, which is not shipped.
-
-  The generated body is step-only: it calls qjs_aot_step() for each instruction
-  and follows the returned ip. qjs_aot_unwind() is the monolith exception walk
-  specialised to an entry frame. QJS_AOT_VERIFY additionally recomputes a
-  per-function signature at bind time and refuses a unit built from a different
-  engine revision; the signature is derived from the same interning-order
-  independent digest, so it is stable across processes.
+  Entry/exit and the runtime ABI.
 
 Why we need it
-  Phase P1 gave every opcode a one-instruction step form. P2 turns that into a
-  linkable unit: enumerate a bundle's functions, emit a C body per function,
-  and run those bodies from the real call path. This is the skeleton P3-P7
-  build on (coverage, kernels, budget selection, inlining).
+  And this turns that into a linkable unit the real call path can enter and leave.
 
 What it adds
-  quickjs-aot-rt.h
-      The generated-code ABI (types, ABI constant, sentinels, entry points).
-  quickjs-aot-gen.h
-      The host generator interface used by tools/aot/qjsaot.c.
-  quickjs.c
-      JSFunctionBytecode.aot_fn/aot_state; eager digest binding at the three
-      bytecode-finalisation sites; the AOT entry in js_regvm_execute; the
-      runtime block (weak unit table, aot_unit_present, js_aot_bind,
-      qjs_aot_step/code/ret/unwind, QJS_AOT_STATS counters); the generator
-      collection block (QJS_AOT_GEN); the shared QJS_AOT/QJS_AOT_GEN/QJS_AOT_VERIFY
-      knobs. QJS_AOT requires the monolith register build.
+  `quickjs-aot-rt.h` (the generated-code ABI: `JSAotEntry`/`JSAotFn`/`QJS_AOT_ABI`, the `QJS_AOT_COLD_RET`/`QJS_AOT_SUSPEND` sentinels, `qjs_aot_step`/`qjs_aot_code`/`qjs_aot_ret`/`qjs_aot_unwind`), `quickjs-aot-gen.h` (the host generator interface used by the unshipped `tools/aot/qjsaot.c`), `JSFunctionBytecode.aot_fn`/`aot_state`, the AOT entry in `js_regvm_execute`, the runtime block (weak unit table, `aot_unit_present`, `js_aot_bind`, `QJS_AOT_STATS` counters), the generator collection block, and the `QJS_AOT`/`QJS_AOT_GEN`/`QJS_AOT_VERIFY` knobs.
 
-  Nothing here is compiled without -DQJS_REGVM; QJS_AOT is off by default and
-  the plain register build is byte-for-byte unchanged. Box2D runs fully
-  compiled with checksum 546.1008391043414 and test262-fast stays at 50/81192.
-
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
+new file mode 100644
+index 0000000..fccf565
+--- /dev/null
++++ b/quickjs-aot-gen.h
+@@ -0,0 +1,41 @@
++/* AOT generator API. The engine is built with -DQJS_AOT_GEN to expose these
++   enumeration and decode helpers; tools/aot/qjsaot.c links the engine and
++   emits aot_unit.c. Not compiled into the shipping engine. */
++#ifndef QUICKJS_AOT_GEN_H
++#define QUICKJS_AOT_GEN_H
++
++#include <stdint.h>
++#include "quickjs.h"
++
++/* One AOT-eligible function, flattened out of the engine's bytecode. */
++typedef struct JSAotGenFunc {
++    uint8_t digest[16];        /* the binding key */
++    uint32_t code_crc;         /* IRVERIFY hash of the register program */
++    int len;                   /* register program length in bytes */
++    int reg_count;
++    int ctl_count;
++    int pic_count;
++    int arg_count;
++    int var_count;
++    int defined_arg_count;
++    int func_kind;
++    const uint8_t *code;       /* the register program; owned by the runtime */
++    char name[128];
++    char file[256];
++} JSAotGenFunc;
++
++/*
++ * Collect every AOT-eligible function in `rt`. Returns the count and stores a
++ * malloc'd array in *pout (release with js_aot_gen_free). Zero with *pout NULL
++ * on allocation failure.
++ */
++int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout);
++void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);
++
++/*
++ * Decode one instruction: returns its size in bytes (opcode included) and the
++ * opcode via *p_op, or -1 past the end or on a malformed program.
++ */
++int js_aot_gen_insn_size(const uint8_t *code, int len, int off, int *p_op);
++
++#endif /* QUICKJS_AOT_GEN_H */
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+new file mode 100644
+index 0000000..705c2be
+--- /dev/null
++++ b/quickjs-aot-rt.h
+@@ -0,0 +1,46 @@
++/* AOT runtime ABI: the whole contract between the generated unit (aot_unit.c)
++   and the engine. Self-contained: only quickjs.h, with JSRegRun opaque. An ABI
++   change bumps QJS_AOT_ABI; the engine refuses a unit whose qjs_aot_abi does
++   not match. */
++#ifndef QUICKJS_AOT_RT_H
++#define QUICKJS_AOT_RT_H
++
++#include "quickjs.h"
++
++/* The register-frame handle. Opaque here; defined in quickjs.c. */
++typedef struct JSRegRun JSRegRun;
++
++#ifndef QJS_AOT_ABI
++#define QJS_AOT_ABI 1u
++#endif
++
++/* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
++   REGVM_STEP_SUSPEND in quickjs.c. */
++#define QJS_AOT_COLD_RET ((uint8_t *)1)
++#define QJS_AOT_SUSPEND  ((uint8_t *)2)
++
++/* One generated function: digest, entry, reserved flags. The table is sorted
++   by `digest`. */
++typedef JSValue (*JSAotFn)(JSContext *ctx, JSRegRun *f, JSValue *fr,
++                           uint32_t entry_pc);
++typedef struct JSAotEntry {
++    uint8_t digest[16];
++    JSAotFn fn;
++    uint32_t flags;
++    uint32_t code_crc;   /* IRVERIFY: hash of the register program */
++} JSAotEntry;
++
++/* The unit's table and size, referenced weakly by the engine; qjs_aot_count
++   is 0 without a unit. */
++extern const JSAotEntry qjs_aot_table[];
++extern const uint32_t qjs_aot_count;
++extern const uint32_t qjs_aot_abi;
++
++/* ABI entry points implemented by the engine. */
++uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
++uint8_t *qjs_aot_code(JSRegRun *f);
++JSValue qjs_aot_ret(JSRegRun *f);
++JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
++                       uint32_t pc, uint32_t *resume_pc);
++
++#endif /* QUICKJS_AOT_RT_H */
 diff --git a/quickjs.c b/quickjs.c
-index 626f1ea..aab9dc3 100644
+index 84a3c84..65747d2 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1252,6 +1252,15 @@ struct JSMegaEntry {
+@@ -1215,12 +1215,17 @@ struct JSMegaEntry {
      uint32_t shape_epoch;
  };
  
-+/*
-+ * ABI version. Shared by the profiler digest (P0) and the AOT runtime (P2);
-+ * the generated unit carries the value it was built against and the engine
-+ * refuses a unit whose version does not match.
-+ */
++/* AOT ABI version, shared by the profiler digest and the AOT runtime. The
++   engine refuses a generated unit built against another version. */
 +#ifndef QJS_AOT_ABI
 +#define QJS_AOT_ABI 1u
 +#endif
 +
  #if QJS_AOT_PROFILE
- /*
-  * AOT profiler (phase P0 of .local/aot-regvm-impl-plan.md).
-@@ -1263,7 +1272,6 @@ struct JSMegaEntry {
-  * variable QJS_AOT_PROFILE_OUT names a file. Nothing here is compiled or
-  * executed in a normal build.
-  */
+ /* AOT profiler, built only with `-DQJS_AOT_PROFILE=1`, which also needs the
+    non-threaded monolith so every opcode passes through REGVM_NEXT. Records
+    attach lazily to their bytecode and are dumped at runtime teardown when
+    QJS_AOT_PROFILE_OUT names a file. */
 -#define QJS_AOT_ABI 1u
  
  /* One property site: the receiver shapes observed and how often each was seen.
     Identity only; the profiler holds no shape references. */
-@@ -1435,6 +1443,14 @@ typedef struct JSFunctionBytecode {
-     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
+@@ -1381,6 +1386,14 @@ typedef struct JSFunctionBytecode {
+     /* AOT profiler record. Lazily allocated, owned by this bytecode. */
      JSAotProfFunc *aot_prof;
  #endif
 +#if QJS_AOT
-+    /* AOT runtime (P2). The generated entry bound to this function, or NULL.
-+       `aot_state` is 0 unknown, 1 bound, 2 known-absent; it is set once, when
-+       the bytecode is final, by js_aot_bind(). Kept out of the hot call
-+       prologue: a bound function is simply not regvm_record_eligible. */
++    /* AOT runtime: the generated entry bound to this function, or NULL.
++       `aot_state` is 0 unknown, 1 bound, 2 known-absent, set once by
++       js_aot_bind() when the bytecode is final. A bound function is not
++       regvm_record_eligible. */
 +    void *aot_fn;
 +    uint8_t aot_state;
 +#endif
  } JSFunctionBytecode;
  
  #if QJS_AOT_PROFILE
-@@ -1465,6 +1481,23 @@ void js_aot_prof_dump(JSRuntime *rt);
+@@ -1411,6 +1424,21 @@ void js_aot_prof_dump(JSRuntime *rt);
  #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
  #endif
  
 +#if QJS_AOT
-+/* AOT runtime (P2). `js_aot_digest` is the P0 digest, reused as the binding
-+   key; `js_aot_bind` is called from regvm_set_call_desc once the bytecode is
-+   final, so its definition (beside the digest) is far below. The ABI header
-+   supplies `JSAotFn`/`JSAotEntry`/`QJS_AOT_ABI` and the entry-point prototypes
-+   to both the engine and the generated unit; JSRegRun is opaque there and
-+   defined below. */
++/* AOT runtime. `js_aot_digest` is the profiler digest, reused as the binding
++   key; `js_aot_bind` is called from regvm_set_call_desc. The ABI header
++   supplies `JSAotFn`/`JSAotEntry`/`QJS_AOT_ABI` and the entry points to both
++   the engine and the generated unit; JSRegRun is opaque there. */
 +#include "quickjs-aot-rt.h"
 +#if !QJS_AOT_PROFILE
 +static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
@@ -111,7 +170,7 @@ index 626f1ea..aab9dc3 100644
  /* Shared backing for lazily deserialized function bodies.
   *
   * Deferring a parse means keeping everything that parse would have needed:
-@@ -3446,6 +3479,10 @@ void JS_FreeRuntime(JSRuntime *rt)
+@@ -3387,6 +3415,10 @@ void JS_FreeRuntime(JSRuntime *rt)
  #if QJS_AOT_PROFILE
      if (getenv("QJS_AOT_PROFILE_OUT"))
          js_aot_prof_dump(rt);
@@ -122,14 +181,13 @@ index 626f1ea..aab9dc3 100644
  #endif
      struct list_head *el, *el1;
      bool leak = false;
-@@ -27443,6 +27480,14 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
+@@ -26641,6 +26673,13 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
          + sizeof(JSValue) * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS)
          + sizeof(JSVarRef *) * (size_t)b->var_ref_count
          + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
 +#if QJS_AOT
-+    /* Bind the generated entry, if any, now that the bytecode is final. A
-+       bound function is excluded from the record path below so that a call to
-+       it always reaches js_regvm_execute's AOT entry. */
++    /* Bind the generated entry, if any. A bound function is kept off the record
++       path so its calls reach js_regvm_execute's AOT entry. */
 +    js_aot_bind(b);
 +    if (b->aot_fn != NULL)
 +        b->regvm_call_ready = 0;
@@ -137,38 +195,33 @@ index 626f1ea..aab9dc3 100644
  }
  
  /*
-@@ -27748,7 +27793,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26906,7 +26945,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             step. */
          JSRegFrame *regvm_frame = NULL;
  #endif
 -#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
 +#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
-         /*
-          * Filled once per activation, not per dispatch. The converted handlers
-          * only read these (they write registers through `fr`), and every one of
-@@ -27942,7 +27987,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         /* Filled once per activation. The handlers only read these, and all are
+            fixed for the activation (the var_refs pointer too, though not its
+            contents). */
+@@ -27069,7 +27108,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          }
          sp = regs + b->regvm_reg_count + REGVM_HS - 1;
          regvm_ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
 -#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
 +#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
-         /*
-          * From here the monolith's control stack *is* the entry record's. It has
-          * to be: the dispatch below sends a cold opcode to the chain, the chain's
-@@ -27966,6 +28011,24 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         /* From here the monolith's control stack is the entry record's: cold
+            opcodes run in the chain's arms, which write `f->ctl`/`f->nctl` with
+            `f == &run`, so a separate copy of the depth would drift. */
+@@ -27087,6 +27126,19 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              regvm_resume_marker = NULL;
              goto exception;
          }
 +#if QJS_AOT
-+        /*
-+         * AOT entry (P2). A bound function is never record-eligible, so a call
-+         * to it always reaches this slow path and a non-AOT function pays
-+         * nothing. The generated unit owns the frame from here: it drives
-+         * qjs_aot_step and its own exception unwinder and returns either a
-+         * value or JS_EXCEPTION. On a value, `done` releases the frame; on an
-+         * exception the unit has already walked the control stack, so
-+         * `exception` sees an empty one and simply propagates.
-+         */
++        /* AOT entry. A bound function is never record-eligible, so its calls
++           reach this path. The generated unit owns the frame from here and
++           returns a value or JS_EXCEPTION; on an exception it has already
++           walked the control stack, so `exception` just propagates. */
 +        if (unlikely(b->aot_fn != NULL && regvm_resume_marker == NULL)) {
 +            js_aot_enter_count++;
 +            ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, 0);
@@ -180,22 +233,19 @@ index 626f1ea..aab9dc3 100644
  
          int op;
          /* One dispatch site per handler (computed goto), as the stack
-@@ -55266,6 +55329,35 @@ static int regvm_homes_mode(void)
+@@ -53866,6 +53918,32 @@ static int regvm_homes_mode(void)
  #error "QJS_AOT_PROFILE needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0"
  #endif
  
 +/*
-+ * AOT runtime (phase P2 of .local/aot-regvm-impl-plan.md).
++ * AOT runtime. The generated unit is a separate translation unit; the engine
++ * binds a register-compiled function to its entry by digest and enters it
++ * from js_regvm_execute. It is defined against the monolith's bytecode and
++ * control stack, so it needs the monolith build.
 + *
-+ * The generated unit is a separate translation unit linked into the build; the
-+ * engine binds a register-compiled function to its generated entry by digest
-+ * and enters it from js_regvm_execute. Like the profiler it is defined against
-+ * the monolith's bytecode and control stack, so it needs the same build.
-+ *
-+ * `QJS_AOT_GEN` builds the generator (tools/aot/qjsaot.c) into the engine:
-+ * the tool then links the engine like any other and calls the enumeration and
-+ * decode helpers below. `QJS_AOT_VERIFY` additionally checks a per-function
-+ * code CRC at bind, to catch a stale unit.
++ * `QJS_AOT_GEN` builds the generator's helpers (tools/aot/qjsaot.c) into the
++ * engine. `QJS_AOT_VERIFY` also checks a per-function code CRC at bind, to
++ * catch a stale unit.
 + */
 +#ifndef QJS_AOT
 +#define QJS_AOT 0
@@ -216,26 +266,26 @@ index 626f1ea..aab9dc3 100644
  /*
   * Register VM: decode and verify one function's final stack IR.
   *
-@@ -56254,9 +56346,9 @@ static int regvm_map_atoms(uint8_t *code, int len, int wide,
+@@ -54760,9 +54838,9 @@ static int regvm_map_atoms(uint8_t *code, int len, int wide,
  {
      return regvm_map_atoms2(code, len, wide, cb, opaque, 0, NULL);
  }
 -#if QJS_AOT_PROFILE
 +#if QJS_AOT_PROFILE || QJS_AOT || QJS_AOT_GEN
  /* ------------------------------------------------------------------------ */
--/* AOT profiler implementation (phase P0 of .local/aot-regvm-impl-plan.md).   */
-+/* AOT digest (shared by the P0 profiler and the P2 runtime/generator).       */
+-/* AOT profiler implementation.                                              */
++/* AOT digest (shared by the profiler, the AOT runtime and the generator).    */
  /* ------------------------------------------------------------------------ */
  
  static void aot_hash_bytes(uint64_t *h0, uint64_t *h1, const void *p, size_t n)
-@@ -56452,6 +56544,32 @@ static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16])
+@@ -54957,6 +55035,30 @@ static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16])
      js_aot_digest_depth(b, out, 0);
  }
  
 +#if QJS_AOT_VERIFY || QJS_AOT_GEN
-+/* IRVERIFY (P2): a cheap hash of the register program and the frame metadata,
-+   emitted alongside each unit entry and recomputed at bind to catch a unit
-+   built from a different engine revision. */
++/* A cheap hash of the register program and frame metadata, emitted with each
++   unit entry and recomputed at bind to catch a unit from another engine
++   revision. */
 +static uint32_t js_aot_code_crc(JSFunctionBytecode *b)
 +{
 +    uint8_t d[16];
@@ -243,9 +293,7 @@ index 626f1ea..aab9dc3 100644
 +    int i;
 +
 +    /* The digest is atom- and encoding-independent, so it is stable across
-+       processes (unlike a hash of the raw regvm_code bytes, whose atom
-+       operands are interned per process). Mix it with the frame counts, which
-+       the digest does not cover. */
++       processes; mix in the frame counts, which it does not cover. */
 +    js_aot_digest(b, d);
 +    for (i = 0; i < 16; i++)
 +        h = (h ^ d[i]) * 16777619u;
@@ -261,7 +309,7 @@ index 626f1ea..aab9dc3 100644
  static uint16_t aot_tag_class(JSValue v)
  {
      switch (JS_VALUE_GET_TAG(v)) {
-@@ -56890,7 +57008,253 @@ void js_aot_prof_dump(JSRuntime *rt)
+@@ -55391,7 +55493,245 @@ void js_aot_prof_dump(JSRuntime *rt)
      if (f != stderr)
          fclose(f);
  }
@@ -271,14 +319,11 @@ index 626f1ea..aab9dc3 100644
 +
 +#if QJS_AOT
 +/* ------------------------------------------------------------------------ */
-+/* AOT runtime (phase P2 of .local/aot-regvm-impl-plan.md).                   */
++/* AOT runtime                                                              */
 +/* ------------------------------------------------------------------------ */
 +
-+/*
-+ * The generated unit defines the table and its size. Weak references keep a
-+ * QJS_AOT build with no unit linkable: aot_unit_present() is then false and no
-+ * function is ever bound.
-+ */
++/* The generated unit defines the table and its size. Weak references keep a
++   QJS_AOT build with no unit linkable; then no function is bound. */
 +#if defined(__GNUC__)
 +extern const JSAotEntry qjs_aot_table[] __attribute__((weak));
 +extern const uint32_t qjs_aot_count __attribute__((weak));
@@ -309,11 +354,9 @@ index 626f1ea..aab9dc3 100644
 +            (unsigned long long)js_aot_enter_count);
 +}
 +
-+/*
-+ * Bind a function to its generated entry. The digest is the key and the table
-+ * is sorted by it; `code_crc` is the belt for a stale unit (QJS_AOT_VERIFY).
-+ * Called once, when the bytecode is final.
-+ */
++/* Bind a function to its generated entry. The table is sorted by digest;
++   `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
++   bytecode is final. */
 +static void js_aot_bind(JSFunctionBytecode *b)
 +{
 +    uint8_t digest[16];
@@ -368,14 +411,11 @@ index 626f1ea..aab9dc3 100644
 +    return f->ret;
 +}
 +
-+/*
-+ * The generated unit's exception unwinder. It is the monolith's `exception:`
-+ * control-stack walk, specialised to an entry frame (an AOT function is always
-+ * called through js_regvm_execute, so its record has no caller): close every
-+ * for-of it passes, and resume at the innermost catch instead of unwinding.
-+ * Returns JS_UNDEFINED when a catch caught it, with *resume_pc set; otherwise
-+ * JS_EXCEPTION.
-+ */
++/* The generated unit's exception unwinder: the monolith's `exception:` walk
++   for an entry frame (an AOT function is always called through
++   js_regvm_execute). Closes every for-of it passes and resumes at the
++   innermost catch. Returns JS_UNDEFINED with *resume_pc set when caught,
++   otherwise JS_EXCEPTION. */
 +JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
 +                       uint32_t pc, uint32_t *resume_pc)
 +{
@@ -423,7 +463,7 @@ index 626f1ea..aab9dc3 100644
 +
 +#if QJS_AOT_GEN
 +/* ------------------------------------------------------------------------ */
-+/* AOT generator API (phase P2). tools/aot/qjsaot.c links this.               */
++/* AOT generator API, linked by tools/aot/qjsaot.c.                         */
 +/* ------------------------------------------------------------------------ */
 +#include "quickjs-aot-gen.h"
 +
@@ -515,8 +555,8 @@ index 626f1ea..aab9dc3 100644
 +#endif /* QJS_AOT_GEN */
  
  
- /*
-@@ -66412,6 +66776,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+ /* Release the first `n` atom operands of a program whose rewrite stopped
+@@ -64121,6 +64461,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
  #if QJS_REGVM_RECORD
      regvm_set_call_desc(b);
  #endif
@@ -527,7 +567,7 @@ index 626f1ea..aab9dc3 100644
  
      add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
      js_fnbc_gc_update(ctx->rt, b);
-@@ -70536,6 +70904,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -68230,6 +68574,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      b->realm = JS_DupContext(ctx);
  #if QJS_REGVM_RECORD
      regvm_set_call_desc(b);
@@ -537,7 +577,7 @@ index 626f1ea..aab9dc3 100644
  #endif
      js_fnbc_gc_update(ctx->rt, b);
      return obj;
-@@ -71351,6 +71722,9 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
+@@ -69040,6 +69387,9 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
      if (ret == 0) {
  #if QJS_REGVM_RECORD
          regvm_set_call_desc(b);
@@ -547,117 +587,3 @@ index 626f1ea..aab9dc3 100644
  #endif
          js_fnbc_gc_update(ctx->rt, b);
          b->lazy_src = NULL;
-diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
-new file mode 100644
---- /dev/null
-+++ b/quickjs-aot-rt.h
-@@ -0,0 +1,58 @@
-+/*
-+ * AOT runtime ABI (phase P2 of .local/aot-regvm-impl-plan.md).
-+ *
-+ * This header is the whole contract between the generated unit (aot_unit.c)
-+ * and the engine. It is deliberately self-contained: it includes only the
-+ * public quickjs.h and treats JSRegRun as opaque, so the generated translation
-+ * unit needs no engine internals and its emitted C does not depend on the
-+ * engine's private layout. A change to the ABI bumps QJS_AOT_ABI; the engine
-+ * refuses a unit whose qjs_aot_abi does not match at bind time.
-+ */
-+#ifndef QUICKJS_AOT_RT_H
-+#define QUICKJS_AOT_RT_H
-+
-+#include "quickjs.h"
-+
-+/* The register-frame handle. Opaque here; defined in quickjs.c. */
-+typedef struct JSRegRun JSRegRun;
-+
-+#ifndef QJS_AOT_ABI
-+#define QJS_AOT_ABI 1u
-+#endif
-+
-+/*
-+ * Sentinels returned by qjs_aot_step. They mirror REGVM_COLD_RET and
-+ * REGVM_STEP_SUSPEND in quickjs.c; keep the two in step.
-+ */
-+#define QJS_AOT_COLD_RET ((uint8_t *)1)
-+#define QJS_AOT_SUSPEND  ((uint8_t *)2)
-+
-+/*
-+ * One generated function: its digest, its entry, and reserved flags. The table
-+ * is sorted by `digest` so the engine can binary-search it.
-+ */
-+typedef JSValue (*JSAotFn)(JSContext *ctx, JSRegRun *f, JSValue *fr,
-+                           uint32_t entry_pc);
-+typedef struct JSAotEntry {
-+    uint8_t digest[16];
-+    JSAotFn fn;
-+    uint32_t flags;
-+    uint32_t code_crc;   /* IRVERIFY: hash of the register program */
-+} JSAotEntry;
-+
-+/*
-+ * The unit's table and its size. The engine references these weakly, so a
-+ * QJS_AOT build with no unit links cleanly; qjs_aot_count is 0 then.
-+ */
-+extern const JSAotEntry qjs_aot_table[];
-+extern const uint32_t qjs_aot_count;
-+extern const uint32_t qjs_aot_abi;
-+
-+/* ABI entry points implemented by the engine. */
-+uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
-+uint8_t *qjs_aot_code(JSRegRun *f);
-+JSValue qjs_aot_ret(JSRegRun *f);
-+JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
-+                       uint32_t pc, uint32_t *resume_pc);
-+
-+#endif /* QUICKJS_AOT_RT_H */
-diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
-new file mode 100644
---- /dev/null
-+++ b/quickjs-aot-gen.h
-@@ -0,0 +1,46 @@
-+/*
-+ * AOT generator API (phase P2 of .local/aot-regvm-impl-plan.md).
-+ *
-+ * The engine is built with -DQJS_AOT_GEN to expose the enumeration and decode
-+ * helpers below; tools/aot/qjsaot.c then links the engine like any other tool
-+ * and drives it to emit aot_unit.c. Nothing here is compiled into the shipping
-+ * engine.
-+ */
-+#ifndef QUICKJS_AOT_GEN_H
-+#define QUICKJS_AOT_GEN_H
-+
-+#include <stdint.h>
-+#include "quickjs.h"
-+
-+/* One AOT-eligible function, flattened out of the engine's bytecode. */
-+typedef struct JSAotGenFunc {
-+    uint8_t digest[16];        /* the binding key */
-+    uint32_t code_crc;         /* IRVERIFY hash of the register program */
-+    int len;                   /* register program length in bytes */
-+    int reg_count;
-+    int ctl_count;
-+    int pic_count;
-+    int arg_count;
-+    int var_count;
-+    int defined_arg_count;
-+    int func_kind;
-+    const uint8_t *code;       /* the register program; owned by the runtime */
-+    char name[128];
-+    char file[256];
-+} JSAotGenFunc;
-+
-+/*
-+ * Collect every AOT-eligible function in `rt`. Returns the count and stores a
-+ * malloc'd array in *pout (release with js_aot_gen_free). Zero with *pout NULL
-+ * on allocation failure.
-+ */
-+int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout);
-+void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);
-+
-+/*
-+ * Decode one instruction: returns its size in bytes (opcode included) and the
-+ * opcode via *p_op, or -1 past the end or on a malformed program.
-+ */
-+int js_aot_gen_insn_size(const uint8_t *code, int len, int off, int *p_op);
-+
-+#endif /* QUICKJS_AOT_GEN_H */

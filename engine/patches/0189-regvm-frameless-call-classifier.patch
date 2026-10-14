@@ -1,40 +1,21 @@
-From: quickjs-ng bundle work
-Subject: Register VM: frameless call classifiers (0189)
+Subject: Frameless call classifiers
 
 What this does
-  Splits the lazy-materialize branch out of the register VM's `call` and
-  `call_method` threaded classifiers into separate noinline handlers
-  (`regvm_t_call_lazy`, `regvm_t_call_method_lazy`). The classifier is now a
-  tag test, a class-id test, a ready-byte test and a jump; the materialize call
-  -- and the stack frame the compiler has to keep across it -- is reached only
-  for a lazy callee that is not yet record-eligible.
+  Frameless call classifiers.
 
 Why we need it
-  Inlining `js_materialize_function_body` into the classifier forced the
-  classifier to be a calling function, so every dispatch of a JS call paid the
-  prologue. On aarch64 that is the callee-saved save/restore (the classifier
-  was framed even though the call is on a branch no eligible call takes); on
-  x86 it is a stack-alignment `push %rax`/`pop %rax`. Measured on x86
-  (clang-19, threaded+record), the split retires 3 fewer instructions per JS
-  call, uniform across 0/1/4-argument and method forms (60,000,000 over the
-  20M-call micro), and box2d `fixed.js` drops 43.7M instructions. Cycles are
-  neutral.
+  The `call`/`call_method` threaded classifiers inlined the lazy-materialize call, so the compiler kept a stack frame across it and every dispatch of a JS call paid the prologue even though no eligible call reaches it.
 
-Gates
-  box2d checksum 546.1008391043414; differential suite all pass, none skipped;
-  test262 at baseline; ASan clean. The handler frame check in
-  `tools/regvm/gate.sh` now also asserts the two classifiers contain no
-  push/pop (the [sp]-based check cannot see an x86 alignment push), so the
-  regression cannot return.
+What it adds
+  The lazy branch moves to separate noinline `regvm_t_call_lazy`/`regvm_t_call_method_lazy`; the classifier is a tag test, a class-id test, a ready-byte test and a jump; the gate's handler frame check now also fails on any push/pop in those two handlers, which the `[sp]`-based check could not see on x86.
 
-No bytecode change:
-  No. Runtime only.
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index 8c20cf6..25aa842 100644
+index 205616a..b18a67b 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25614,6 +25614,8 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
+@@ -25017,6 +25017,8 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
@@ -43,24 +24,21 @@ index 8c20cf6..25aa842 100644
  static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
  static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
-@@ -26281,24 +26283,16 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
+@@ -25644,22 +25646,15 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
      JSValue cf = FR(c);
  
      REGVM_CAPTURE_IP();
-+    /* S1: this handler must stay a pure classify-and-jump. The lazy
-+       materialize -- and the call it makes -- lives in `regvm_t_call_lazy`
-+       below, so no frame is forced onto the path every call takes. */
++    /* Kept a pure classify-and-jump: the lazy materialize, and its call, live
++       in `regvm_t_call_lazy`, so no C frame lands on every call. */
      if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
--            /* D13: a lazy function becomes record-eligible only after it is
--               materialized, and materialization otherwise happens inside the
--               slow path on its first call. Materialize here so that first call
--               takes the record path too -- otherwise a caller frame survives in
--               Error.stack for a bundle but not for source. */
+-            /* A lazy function becomes record-eligible only once materialized.
+-               Materializing here keeps its first call on the record path, so
+-               Error.stack is the same for a bundle and for source. */
 -            if (unlikely(cb->is_lazy) &&
 -                js_materialize_function_body(cb->realm, cb) == 0 &&
 -                regvm_record_eligible(cb))
@@ -72,16 +50,16 @@ index 8c20cf6..25aa842 100644
          }
      }
      __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
-@@ -26310,6 +26304,8 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
+@@ -25671,6 +25666,8 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
      JSValue cf = FR(c);
  
      REGVM_CAPTURE_IP();
-+    /* S1: pure classify-and-jump; the lazy materialize is in
-+       `regvm_t_call_method_lazy` below. */
++    /* Pure classify-and-jump; the lazy materialize is in
++       `regvm_t_call_method_lazy`. */
      if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
-@@ -26317,19 +26313,64 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
+@@ -25678,19 +25675,54 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail))
                      return regvm_t_call_method_record(REGVM_PASS);
@@ -100,21 +78,11 @@ index 8c20cf6..25aa842 100644
  }
  
 +#if QJS_REGVM_RECORD
-+/*
-+ * S1: the lazy-materialize half of the call classifiers, split out so the
-+ * classifiers are frameless. The classifiers reach here only for a bytecode
-+ * callee that is not yet record-eligible -- in practice a lazy function whose
-+ * body has not been materialized. Materializing it is a C call, and inlining
-+ * that call into the classifier made the classifier carry a stack frame on
-+ * every dispatch, including the monomorphic fast path that never reaches the
-+ * call.
-+ *
-+ * D13: a lazy function becomes record-eligible only after it is materialized,
-+ * and materialization otherwise happens inside the slow path on its first
-+ * call. Materializing here keeps that first call on the record path too --
-+ * otherwise a caller frame survives in Error.stack for a bundle but not for
-+ * source.
-+ */
++/* The lazy-materialize half of the call classifiers, split out so the
++   classifiers stay frameless. Reached for a bytecode callee that is not yet
++   record-eligible, in practice a lazy function. Materializing here keeps its
++   first call on the record path, so Error.stack is the same for a bundle and
++   for source. */
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS)
 +{
 +    int c = T_REG(3);
@@ -152,5 +120,5 @@ index 8c20cf6..25aa842 100644
 +#endif
 +
  /*
-  * The record-creating halves. These are inherently calling -- they allocate from
-  * the arena and fill a frame -- so they carry a frame, and that is why the
+  * The record-creating halves. They allocate from the arena and fill a frame,
+  * so they carry a C frame; the handlers above only classify and tail-call into

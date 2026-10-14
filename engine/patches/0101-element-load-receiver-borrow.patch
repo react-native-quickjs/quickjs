@@ -21,9 +21,22 @@ What it adds
 
 Needs a bytecode version bump
   Yes. The final series-wide bump remains in 9999.
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -372,8 +372,8 @@ DEF(     get_arg_el, 3, 1, 1, loc)
+ DEF(apply_arguments, 3, 3, 1, loc)
+ DEF(get_arg_field_nr, 9, 0, 1, atom_u16)
+ DEF(   set_var_ref0, 1, 1, 1, none_var_ref)
+-DEF(   set_var_ref1, 1, 1, 1, none_var_ref)
+-DEF(   set_var_ref2, 1, 1, 1, none_var_ref)
++DEF(get_loc8_el_recv, 2, 1, 1, loc8)
++DEF(get_arg8_el_recv, 2, 1, 1, loc8)
+ DEF(get_arg8_array_el, 2, 1, 1, loc8)
+ 
+ DEF(     get_length, 1, 1, 1, none)
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21085,6 +21085,38 @@
+@@ -20899,6 +20899,38 @@ static inline bool js_ta_length_getter(JSObject *getter)
          getter->u.cfunc.c_function.getter == js_typed_array_get_length;
  }
  
@@ -62,7 +75,7 @@ Needs a bytecode version bump
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
                                 int argc, JSValueConst *argv, int flags)
-@@ -22367,8 +22399,6 @@
+@@ -22173,8 +22205,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
          CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
          CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
@@ -71,15 +84,10 @@ Needs a bytecode version bump
  
          CASE(OP_get_var_ref):
              {
-@@ -23725,6 +23755,26 @@
-                 JS_FreeValue(ctx, sp[-2]);
-                 sp[-2] = val;
-                 sp--;
-+                if (unlikely(JS_IsException(val)))
-+                    goto exception;
-+            }
-+            BREAK;
-+
+@@ -23536,6 +23566,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             }
+             BREAK;
+ 
 +        CASE(OP_get_arg8_el_recv):
 +            {
 +                JSValueConst recv = arg_buf[*pc++];
@@ -95,10 +103,15 @@ Needs a bytecode version bump
 +                JSValueConst recv = var_buf[*pc++];
 +                JSValue val = js_u3_el_recv(ctx, sf, pc, sp[-1], recv);
 +                sp[-1] = val;
-                 if (unlikely(JS_IsException(val)))
-                     goto exception;
-             }
-@@ -40517,8 +40567,164 @@
++                if (unlikely(JS_IsException(val)))
++                    goto exception;
++            }
++            BREAK;
++
+         CASE(OP_get_arg8_loc8_array_el):
+             *sp++ = js_dup(arg_buf[*pc++]);
+             /* fall through */
+@@ -40322,8 +40372,164 @@ static void eliminate_tdz_checks(JSFunctionDef *s)
      js_free(s->ctx, init);
  }
  
@@ -263,7 +276,7 @@ Needs a bytecode version bump
      int prologue_put_pos = -1, prologue_put_end = -1, prologue_put_idx = -1;
      int prologue_skip_to = 0;
      int pos, pos_next, bc_len, op, op1, len, i, line_num, col_num, patch_offsets;
-@@ -40583,6 +40789,8 @@
+@@ -40388,6 +40594,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
          }
      }
  
@@ -272,7 +285,7 @@ Needs a bytecode version bump
      /* initialize the 'home_object' variable if needed */
      if (s->home_object_var_idx >= 0) {
          dbuf_putc(&bc_out, OP_special_object);
-@@ -40735,6 +40943,12 @@
+@@ -40540,6 +40748,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                  continue;
              }
          }
@@ -285,7 +298,7 @@ Needs a bytecode version bump
          switch(op) {
          case OP_source_loc:
              /* line number info (for debug). We put it in a separate
-@@ -41294,6 +41508,17 @@
+@@ -41099,6 +41313,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                  break;
              }
              goto no_change;
@@ -303,19 +316,19 @@ Needs a bytecode version bump
          case OP_args_recv:
              {
                  int kind = get_u16(bc_buf + pos + 1);
-@@ -41453,6 +41678,11 @@
-                     dbuf_putc(&bc_out, OP_get_loc8_array_el);
-                     dbuf_putc(&bc_out, idx);
+@@ -41260,6 +41485,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                      pos_next = cc.pos;
-+                    break;
-+                }
+                     break;
+                 }
 +                if (u3_map && u3_map[pos]) {
 +                    u3_map[u3_map[pos] - 1] = JS_U3_ARMED | (uint32_t)idx;
 +                    u3_armed++;
-                     break;
-                 }
++                    break;
++                }
                  add_pc2line_info(s, bc_out.size, line_num, col_num);
-@@ -41511,6 +41741,12 @@
+                 put_short_code(&bc_out, op, idx);
+             }
+@@ -41316,6 +41546,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                      break;
                  }
  #endif
@@ -328,7 +341,7 @@ Needs a bytecode version bump
                  add_pc2line_info(s, bc_out.size, line_num, col_num);
                  put_short_code(&bc_out, op, idx);
              }
-@@ -41749,6 +41985,12 @@
+@@ -41554,6 +41790,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
      }
      js_free(ctx, d3_ev);
      d3_ev = NULL;
@@ -341,7 +354,7 @@ Needs a bytecode version bump
      /* XXX: should delay until copying to runtime bytecode function */
      compute_pc2line_info(s);
      js_free(ctx, s->source_loc_slots);
-@@ -41763,6 +42005,7 @@
+@@ -41568,6 +41810,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
      }
      return 0;
   fail:
@@ -349,16 +362,3 @@ Needs a bytecode version bump
      js_free(ctx, d3_ev);
      /* XXX: not safe */
      dbuf_free(&bc_out);
---- a/quickjs-opcode.h
-+++ b/quickjs-opcode.h
-@@ -372,8 +372,8 @@
- DEF(apply_arguments, 3, 3, 1, loc)
- DEF(get_arg_field_nr, 9, 0, 1, atom_u16)
- DEF(   set_var_ref0, 1, 1, 1, none_var_ref)
--DEF(   set_var_ref1, 1, 1, 1, none_var_ref)
--DEF(   set_var_ref2, 1, 1, 1, none_var_ref)
-+DEF(get_loc8_el_recv, 2, 1, 1, loc8)
-+DEF(get_arg8_el_recv, 2, 1, 1, loc8)
- DEF(get_arg8_array_el, 2, 1, 1, loc8)
- 
- DEF(     get_length, 1, 1, 1, none)

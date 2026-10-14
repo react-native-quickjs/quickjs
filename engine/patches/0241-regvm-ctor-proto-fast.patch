@@ -1,0 +1,66 @@
+Subject: `new` reads an instantiated bytecode constructor's `prototype` directly
+
+What this does
+  `new` reads an instantiated bytecode constructor's `prototype` directly.
+
+Why we need it
+  `js_create_from_ctor_cap` read `ctor.prototype` with `JS_GetProperty` on every `new`: a shape walk, a cache probe and a getter test for what is always an own plain slot.
+
+What it adds
+  When the receiver is a bytecode function whose own `prototype` is present and `JS_PROP_NORMAL`, take `js_dup(pr->u.value)` as the result -- which is what `JS_GetProperty` would return, since a constructor's prototype is never an accessor (the property is non-configurable, `JS_PROP_WRITABLE`). Every other case keeps the generic read: not found, the `JS_PROP_AUTOINIT` stub an uninstantiated function carries (the read is what realises it), a getter, a var_ref, or any other class. `QJS_CTOR_PROTO_FAST=0` restores the generic read.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs.c b/quickjs.c
+index b9d4ee3..358ec43 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -116,6 +116,15 @@ typedef struct JSRegRCC JSRegRCC;
+ #define QJS_SETNAME_FAST 1
+ #endif
+ 
++/*
++ * QJS_CTOR_PROTO_FAST: `js_create_from_ctor_cap` reads an instantiated
++ * bytecode constructor's own `prototype` slot directly instead of through
++ * JS_GetProperty. Off restores the generic read for every `new`.
++ */
++#ifndef QJS_CTOR_PROTO_FAST
++#define QJS_CTOR_PROTO_FAST 1
++#endif
++
+ /*
+  * The handler-table entry for the seven opcodes above. With the switch on each
+  * names its own `regvm_t_<name>`; off, all seven fall back to `regvm_t_cold`,
+@@ -40420,9 +40429,32 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+     if (JS_IsUndefined(ctor)) {
+         proto = js_dup(ctx->class_proto[class_id]);
+     } else {
++        /* A bytecode constructor's `prototype`, once instantiated, is an own
++           normal data property, so its value is what JS_GetProperty would
++           return. Anything else (not found, the AUTOINIT stub, GETSET, VARREF,
++           another class) takes the generic read, which also instantiates the
++           stub. */
++#if QJS_CTOR_PROTO_FAST
++        if (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT) {
++            JSObject *cp = JS_VALUE_GET_OBJ(ctor);
++
++            if (cp->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++                JSProperty *pr;
++                JSShapeProperty *prs = find_own_property(&pr, cp,
++                                                         JS_ATOM_prototype);
++
++                if (prs != NULL &&
++                    (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
++                    proto = js_dup(pr->u.value);
++                    goto proto_ready;
++                }
++            }
++        }
++#endif
+         proto = JS_GetProperty(ctx, ctor, JS_ATOM_prototype);
+         if (JS_IsException(proto))
+             return proto;
++    proto_ready:
+         if (!JS_IsObject(proto)) {
+             JS_FreeValue(ctx, proto);
+             realm = JS_GetFunctionRealm(ctx, ctor);

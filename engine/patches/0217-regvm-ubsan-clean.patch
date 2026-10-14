@@ -1,17 +1,26 @@
+Subject: Remove the remaining null-offset UB in the light-frame and dynbuf paths
+
+What this does
+  Remove the remaining null-offset UB in the light-frame and dynbuf paths.
+
+Why we need it
+  With the first null test fixed, a variable-less light frame forms `var_buf + 0` in the unwind and nested-return walks, and `unicode_normalize` is handed `(DynBufReallocFunc *)js_realloc`/`js_realloc_rt` casts whose function types do not match.
+
+What it adds
+  `regvm_rec_of_sf` returns NULL when the arena is absent; the release walks skip the addition when `vc == 0`; the casts become real wrappers (`js_dbuf_realloc`, `js_dbuf_realloc_rt`) with the right prototype.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index acb9d70..e3c3065 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -3215,6 +3215,18 @@
+@@ -3110,6 +3110,13 @@ static void *js_dbuf_realloc(void *ctx, void *ptr, size_t size)
      return js_realloc(ctx, ptr, size);
  }
  
-+/*
-+ * The runtime-keyed twin of the above: `unicode_normalize` takes its allocator
-+ * as a `DynBufReallocFunc`, and casting `js_realloc_rt` itself to that type is
-+ * a function-pointer type mismatch (UBSan reports the call). A real function
-+ * with the right prototype costs nothing -- both sides tail into the same
-+ * realloc.
-+ */
++/* The runtime-keyed twin of the above: casting `js_realloc_rt` to
++   `DynBufReallocFunc` is a function-pointer type mismatch (UBSan). */
 +static void *js_dbuf_realloc_rt(void *rt, void *ptr, size_t size)
 +{
 +    return js_realloc_rt(rt, ptr, size);
@@ -20,7 +29,7 @@ diff --git a/quickjs.c b/quickjs.c
  static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
  {
      dbuf_init2(s, ctx, js_dbuf_realloc);
-@@ -25271,6 +25283,9 @@
+@@ -24708,6 +24715,9 @@ static JSRegRun *regvm_rec_of_sf(JSRuntime *rt, JSStackFrame *sf)
      const uint8_t *lo = rt->regvm_frames;
      size_t top = rt->regvm_frames_top;
  
@@ -30,7 +39,7 @@ diff --git a/quickjs.c b/quickjs.c
      /* the newest frames are in the current chunk; older ones in its prev chain */
      while (p < lo || p >= lo + top) {
          if (!c || !(c = c->prev))
-@@ -27447,7 +27462,7 @@
+@@ -26630,7 +26640,7 @@ regvm_t_return_light_nested(REGVM_ARGS)
      if (b->var_count <= 255)
          vc = b->regvm_var_count;
  #endif
@@ -39,7 +48,7 @@ diff --git a/quickjs.c b/quickjs.c
      for (p = f->var_buf; p < end; p++)
          if (REGVM_HAS_COUNT(*p))
              JS_FreeValueRT(ctx->rt, *p);
-@@ -30349,7 +30364,7 @@
+@@ -29277,7 +29287,7 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
          if (b->var_count <= 255)
              vc = b->regvm_var_count;
  #endif
@@ -48,7 +57,7 @@ diff --git a/quickjs.c b/quickjs.c
          for (p = f->var_buf; p < end; p++)
              if (REGVM_HAS_COUNT(*p))
                  JS_FreeValueRT(ctx->rt, *p);
-@@ -85370,7 +85385,7 @@
+@@ -82526,7 +82536,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
  
      // TODO(bnoordhuis) skip normalization when input is latin1
      an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx,
@@ -57,7 +66,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (an == -1)
          goto exception;
      js_free(ctx, as);
-@@ -85378,7 +85393,7 @@
+@@ -82534,7 +82544,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
  
      // TODO(bnoordhuis) skip normalization when input is latin1
      bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx,
@@ -66,7 +75,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (bn == -1)
          goto exception;
      js_free(ctx, bs);
-@@ -85558,7 +85573,7 @@
+@@ -82714,7 +82724,7 @@ static JSValue js_string_normalize(JSContext *ctx, JSValueConst this_val,
      }
  
      out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,

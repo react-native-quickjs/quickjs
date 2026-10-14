@@ -1,19 +1,29 @@
+Subject: Rotate the counted loop's test to the latch
+
+What this does
+  Rotate the counted loop's test to the latch.
+
+Why we need it
+  The loop is test-at-top with an unconditional back edge to the test, so each iteration runs the test (not taken) and the jump (taken).
+
+What it adds
+  An IR pass duplicates the test at the latch with the inverted sense, branching back to the body, when the back edge's target is exactly one compare-and-branch, only the entry and the latch reach it, and the exit immediately follows; the `_s` compare family also gets the Step 2 int-only fast path. The original test stays and runs once on entry.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 0f2a8bd..95ecbb2 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -29053,8 +29053,42 @@
+@@ -28096,8 +28096,38 @@ T_DEF_CMP_BRANCH(branch_cmp_reg_reg, T_U8(1), T_REG(2), T_REG(4), T_I32(6),
                   T_SZ_BRRT)
  T_DEF_CMP_BRANCH(branch_cmp_reg_reg_s, T_U8(1), T_REG8(2), T_REG8(3),
                   T_OFF8(4), T_SZ_BRRT_S)
 -T_DEF_CMP_BRANCH(branch_lt_s,   REG_BIN_LT,  T_REG8(1), T_REG8(2), T_OFF8(3),
 -                 T_SZ_RRT_S)
-+/*
-+ * Step 3.1: the counted loop's latch is a compare-and-branch whose operands are
-+ * ints in every hot loop, so the whole `_s` family gets the same int-only fast
-+ * path `branch_nlt_s` got in Step 2: one 4-byte operand decode, one combined
-+ * tag test, a 32-bit payload compare, and a tail call to the generic slow
-+ * handler for the float, string and engine cases.
-+ */
++/* The `_s` compare-and-branch family's int-only fast path: one 4-byte operand
++   decode, one combined tag test, a 32-bit payload compare, and a tail call to
++   the generic slow handler for everything else. */
 +#define T_DEF_CMP_BRANCH_INT(NAME, SUBEXPR, CMPEXPR) \
 +    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
 +    { \
@@ -43,10 +53,10 @@ diff --git a/quickjs.c b/quickjs.c
 +    }
 +
 +T_DEF_CMP_BRANCH_INT(branch_lt_s,   REG_BIN_LT,  _a < _b)
- /*
-  * Step 2.1: `branch_nlt_s` is the counted loop's test and is almost always two
-  * ints. Decode the three operands with one load, test both tags together, and
-@@ -29092,22 +29126,15 @@
+ /* `branch_nlt_s` is almost always two ints: decode the three operands with
+    one load, test both tags together, and compare the 32-bit payloads. */
+ static __attribute__((noinline)) uint8_t *REGVM_CC
+@@ -28131,22 +28161,15 @@ static uint8_t *REGVM_CC regvm_t_branch_nlt_s(REGVM_ARGS)
      }
      __attribute__((musttail)) return regvm_t_branch_nlt_s_slow(REGVM_PASS);
  }
@@ -78,7 +88,7 @@ diff --git a/quickjs.c b/quickjs.c
  #undef T_DEF_CMP_BRANCH
  
  /*
-@@ -63055,8 +63082,10 @@
+@@ -60992,8 +61015,10 @@ static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
              continue;
          if (br->ops[0] < 0 || br->ops[0] >= n_pcs)
              continue;
@@ -90,23 +100,16 @@ diff --git a/quickjs.c b/quickjs.c
              continue;
          switch (ir->insns[ti].rop) {
          case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
-@@ -63083,6 +63112,92 @@
+@@ -61019,6 +61044,84 @@ static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+     js_free(ctx, insn_pc);
  }
  
- /*
-+ * Step 3.1: one branch per iteration. The loop is laid out test-at-top with an
-+ * unconditional back edge to the test, so every iteration runs the conditional
-+ * test (not taken) and the unconditional jump (taken). Duplicate the test,
-+ * inverted, at the latch: the back edge becomes the conditional branch itself,
-+ * and the original test stays and runs once on entry. This is the narrow
-+ * "duplicate the test at the latch" form, not a block reordering.
-+ *
-+ * Refused unless the back edge's target is exactly one compare-and-branch that
-+ * nothing else but the entry and the latch reaches, and the exit immediately
-+ * follows the latch (a fall-through there is the exit; otherwise the copy would
-+ * need an extra branch that the fixed IR array cannot insert). The duplicated
-+ * comparison performs the same one evaluation per iteration the original did.
-+ */
++/* Loop rotation: a test-at-top loop runs the test and an unconditional back
++   edge every iteration. Duplicate the test, inverted, at the latch so the back
++   edge is the conditional branch; the original test runs once on entry.
++   Refused unless the back edge targets exactly one compare-and-branch reached
++   only from the entry and the latch, and the exit immediately follows the
++   latch. */
 +static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 +                                   int n_pcs, int n_values)
 +{
@@ -179,16 +182,15 @@ diff --git a/quickjs.c b/quickjs.c
 +    js_free(ctx, is_target);
 +}
 +
-+/*
-  * X2: register operands are byte offsets into the register file, so a field's
-  * width limits the registers it can name -- one byte reaches register 15, two
-  * bytes reach register 4095.
-@@ -67297,6 +67412,8 @@
+ /* Register operands are byte offsets: one byte reaches register 15, two bytes
+    reach register 4095. */
+ #define REGVM_NARROW_REG_MAX 16
+@@ -64880,6 +64983,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                             n_values, ireg);
      regvm_hoist_loop_const(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                             n_values, ireg);
 +    regvm_rotate_loop_test(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
 +                           n_values);
      /*
-      * Forward a frame read to a value still resident in its register.
-      *
+      * Forward a frame read to a value still in its register: a local stored
+      * earlier in the same block can be read from the stored value's register.

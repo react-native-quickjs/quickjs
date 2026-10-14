@@ -1,7 +1,21 @@
+Subject: Use the values in hand at callee entry
+
+What this does
+  Use the values in hand at callee entry.
+
+Why we need it
+  The light call reloaded `nf->b` and `nf->fr` from the header it had just written.
+
+What it adds
+  `regvm_light_enter` returns the register base and the classifiers dispatch with `cb->regvm_code`.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 2a5b869..4da1df3 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -27084,7 +27084,7 @@
+@@ -26332,7 +26332,7 @@ regvm_light_alloc(JSRuntime *rt, JSFunctionBytecode *cb)
  static __attribute__((always_inline)) inline JSRegRun *
  regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
                    JSRegRun *f, int d, uint8_t *ret_ip, JSValueConst this_obj,
@@ -10,7 +24,7 @@ diff --git a/quickjs.c b/quickjs.c
  {
      JSRegRun *nf = regvm_light_alloc(ctx->rt, cb);
      JSValue *regs;
-@@ -27151,6 +27151,7 @@
+@@ -26386,6 +26386,7 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      }
      if (k < nregs)
          regs[k] = JS_UNDEFINED;
@@ -18,7 +32,7 @@ diff --git a/quickjs.c b/quickjs.c
      return nf;
  }
  
-@@ -27161,18 +27162,19 @@
+@@ -26396,18 +26397,19 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS
      JSObject *co = JS_VALUE_GET_OBJ(cf);
      JSFunctionBytecode *cb = co->u.func.function_bytecode;
      JSRegRun *nf;
@@ -40,7 +54,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS)
-@@ -27184,6 +27186,7 @@
+@@ -26419,6 +26421,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REG
      JSObject *co = JS_VALUE_GET_OBJ(cf);
      JSFunctionBytecode *cb = co->u.func.function_bytecode;
      JSRegRun *nf;
@@ -48,7 +62,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      if (unlikely(--ctx->interrupt_counter <= 0))
          __attribute__((musttail))
-@@ -27191,13 +27194,13 @@
+@@ -26426,13 +26429,13 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REG
      if (unlikely(na < cb->arg_count))
          __attribute__((musttail))
              return regvm_t_call_method_record(REGVM_PASS);

@@ -1,44 +1,16 @@
 Subject: Adds a register-VM profile build that records per-site, per-call and per-function hotness
 
-What this does:
-  A build with `-DQJS_AOT_PROFILE=1` records what the register interpreter
-  actually executes: per-function opcode totals, loop back-edge iteration
-  counts, register type classes, property-site receiver shapes, and call sites
-  with the identity of their callee. The record is dumped at runtime teardown
-  to the file named by `QJS_AOT_PROFILE_OUT` in a small text format
-  (`qjsprof 1 abi=1`), one line per fact. `tools/aot/profmerge.py` merges runs
-  and `tools/aot/profreport.py` prints the hot set, the coverage curve and the
-  call graph. This is phase P0 of `.local/aot-regvm-impl-plan.md`: the profile
-  is what later phases use to choose which functions and which opcodes to
-  compile.
+What this does
+  Adds a register-VM profile build that records per-site, per-call and per-function hotness.
 
-  Counting has to see every opcode, and the register VM only routes every
-  opcode through one loop in its monolith (non-threaded, non-asm) form, so the
-  macro is rejected by an `#error` unless the build is
-  `QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0`. Nothing
-  here is compiled or executed in a normal build.
+Why we need it
+  AOT compilation needs to know which functions and which opcodes actually run, and the register VM routes every opcode through one loop only in its non-threaded monolith form, so counting can see them all there and nowhere else.
 
-  Functions are identified by a 128-bit digest over the register program's
-  content -- atom operands are hashed by their string content, not their
-  interned id, so the same source yields the same digest across runs and across
-  programs that intern atoms differently -- plus the function's flags, constant
-  pool and closure variables. That digest is the key the AOT binding will use
-  in P2, so a profile taken on one build can select code for a function found
-  in another.
+What it adds
+  `JSAotProfSite`/`JSAotProfCall`/`JSAotProfFunc`, hooks in `REGVM_NEXT`, the `js_regvm_execute` entry, both `SET_REG_P` definitions, the register PIC fills and the five monolith call handlers; an `aot_prof` field on `JSFunctionBytecode`; `QJS_AOT_PROFILE` rejected by `#error` outside `QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0`; C callees named by `dladdr` with a `/proc/self/exe` `.symtab` fallback (`-no-pie`).
 
-  Hooks: `REGVM_NEXT` (opcode and loop back-edge counts), the
-  `js_regvm_execute` entry, both `SET_REG_P` definitions (register type
-  classes), `regvm_pic_fill`/`regvm_put_pic_fill` (receiver shapes) and the
-  five monolith call handlers (callee identity). A C callee is named by
-  `dladdr`, falling back to a walk of the running image's `.symtab` for the
-  `static` builtins that `dladdr` cannot see; the latter needs the engine built
-  `-no-pie`.
-
-  Adds a lazily allocated `aot_prof` field to `JSFunctionBytecode`, released in
-  `free_function_bytecode`. Off by default; the register-VM monolith is
-  byte-identical without it and the Box2D checksum `546.1008391043414` is
-  unchanged in both builds.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -31,6 +31,12 @@
@@ -54,21 +26,15 @@ What this does:
  #ifndef QJS_JSON_LAZY_DEFAULT
  #define QJS_JSON_LAZY_DEFAULT 0
  #endif
-@@ -1246,6 +1252,70 @@ struct JSMegaEntry {
+@@ -1209,6 +1215,64 @@ struct JSMegaEntry {
      uint32_t shape_epoch;
  };
  
 +#if QJS_AOT_PROFILE
-+/*
-+ * AOT profiler (phase P0 of .local/aot-regvm-impl-plan.md).
-+ *
-+ * Built only into a dedicated profiling build (`-DQJS_AOT_PROFILE=1`, which
-+ * additionally requires the non-threaded monolith so that every opcode passes
-+ * through REGVM_NEXT and can be counted). Records attach to the bytecode that
-+ * owns them, lazily, and are dumped at runtime teardown when the environment
-+ * variable QJS_AOT_PROFILE_OUT names a file. Nothing here is compiled or
-+ * executed in a normal build.
-+ */
++/* AOT profiler, built only with `-DQJS_AOT_PROFILE=1`, which also needs the
++   non-threaded monolith so every opcode passes through REGVM_NEXT. Records
++   attach lazily to their bytecode and are dumped at runtime teardown when
++   QJS_AOT_PROFILE_OUT names a file. */
 +#define QJS_AOT_ABI 1u
 +
 +/* One property site: the receiver shapes observed and how often each was seen.
@@ -125,12 +91,12 @@ What this does:
  typedef struct JSFunctionBytecode {
      JSGCObjectHeader header; /* must come first */
      uint8_t is_strict_mode : 1;
-@@ -1361,8 +1431,40 @@ typedef struct JSFunctionBytecode {
+@@ -1313,8 +1377,40 @@ typedef struct JSFunctionBytecode {
      uint8_t regvm_call_ready;
      uint32_t regvm_frame_need;
  #endif
 +#if QJS_AOT_PROFILE
-+    /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
++    /* AOT profiler record. Lazily allocated, owned by this bytecode. */
 +    JSAotProfFunc *aot_prof;
 +#endif
  } JSFunctionBytecode;
@@ -166,7 +132,7 @@ What this does:
  /* Shared backing for lazily deserialized function bodies.
   *
   * Deferring a parse means keeping everything that parse would have needed:
-@@ -3340,6 +3442,10 @@ void JS_FreeRuntime(JSRuntime *rt)
+@@ -3287,6 +3383,10 @@ void JS_FreeRuntime(JSRuntime *rt)
  #ifdef QJS_REGVM_COUNT
      if (getenv("QJS_REGVM_COUNTS"))
          js_regvm_count_dump();
@@ -177,15 +143,15 @@ What this does:
  #endif
      struct list_head *el, *el1;
      bool leak = false;
-@@ -22951,6 +23057,7 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+@@ -22689,6 +22789,7 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
          return;
  
      rsh = p->shape;
 +    AOT_PROF_PIC(b, site, rsh);
      slot = (uint32_t)(pr - holder->prop);
  
-     /* A depth-0/1 site hashes its receiver shape so the per-function PIC can
-@@ -23164,6 +23271,7 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+     /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);
+@@ -22867,6 +22968,7 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
      if (!p->shape->is_hashed)
          return;                     /* see regvm_pic_fill: only hashed is immutable */
  
@@ -193,7 +159,7 @@ What this does:
      pic = *ppic;
      if (!pic) {
          pic = regvm_pic_ensure(rt, b);
-@@ -27571,9 +27679,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26751,9 +26853,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
      uint8_t *regvm_rpc = NULL;
      int regvm_resume_pending = 0;
      uint8_t *regvm_resume_marker = NULL;
@@ -209,9 +175,9 @@ What this does:
 +        AOT_PROF_ENTER(b);
 +#endif
          regs = stack_buf;
-         /*
-          * W1c: a function's PIC table has to exist before any inline-cached
-@@ -27681,10 +27797,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         /* The inline-cached handlers dereference f->pic with no NULL test, so
+            the first activation of a function with a site-bearing opcode
+@@ -26835,10 +26945,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  /* Registers no longer own: a store is a plain assignment, and an owned value
     is adopted by dropping the producer's reference. */
  #define SET_REG_B(d, v) do { regs[d] = (v); } while (0)
@@ -224,7 +190,7 @@ What this does:
  #endif
  
  #define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
-@@ -28369,6 +28485,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -27495,6 +27605,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          } while (0)
  #else
  #define REGVM_NEXT() do { \
@@ -232,23 +198,23 @@ What this does:
              op = *rpc++; \
              REGVM_COUNT_INC(op); \
              goto *regvm_dispatch[op]; \
-@@ -30923,6 +31040,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-                    vector is the parameter `argv`, and the nested-call code
-                    saves it. */
+@@ -29882,6 +29993,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 int na = RD_U8();
+                 /* `oargv`: `argv` is the activation's own argument vector. */
                  JSValue *oargv = &regs[ab];
 +                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
  #ifdef QJS_REGVM_COUNT
                  js_regvm_argmoves += (uint64_t)na;
  #endif
-@@ -30948,6 +31066,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-                    vector is the parameter `argv`, and the nested-call code
-                    saves it. */
+@@ -29905,6 +30017,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 int na = RD_U8();
+                 /* `oargv`: `argv` is the activation's own argument vector. */
                  JSValue *oargv = &regs[ab];
 +                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
  #ifdef QJS_REGVM_COUNT
                  js_regvm_argmoves += (uint64_t)na;
  #endif
-@@ -30970,6 +31089,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29927,6 +30040,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int ab = RD_REG();
                  int na = RD_U8();
                  JSValue *argv = &regs[ab];
@@ -256,7 +222,7 @@ What this does:
                  ret_val = JS_CallConstructorInternal(ctx, regs[c], regs[nt],
                                                       na, vc(argv), 0);
                  if (JS_IsException(ret_val))
-@@ -30982,6 +31102,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29939,6 +30053,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int ab = RD_REG();
                  int na = RD_U8();
                  JSValue *argv = &regs[ab];
@@ -264,7 +230,7 @@ What this does:
  #ifdef QJS_REGVM_COUNT
                  js_regvm_argmoves += (uint64_t)na;
  #endif
-@@ -31006,6 +31127,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29963,6 +30078,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int ab = RD_REG();
                  int na = RD_U8();
                  JSValue *argv = &regs[ab];
@@ -272,16 +238,12 @@ What this does:
  #ifdef QJS_REGVM_COUNT
                  js_regvm_argmoves += (uint64_t)na;
  #endif
-@@ -55037,6 +55159,16 @@ static int regvm_homes_mode(void)
+@@ -53667,6 +53783,12 @@ static int regvm_homes_mode(void)
  #endif
  #endif
  
-+/*
-+ * The AOT profiler counts opcodes at the monolith's dispatch point and derives
-+ * its backedge/type facts from that single loop, so it is only meaningful in
-+ * the plain non-threaded, non-asm build. Fail the build rather than report
-+ * silently wrong counts.
-+ */
++/* The AOT profiler counts at the monolith's dispatch point, so it needs the
++   plain non-threaded build. */
 +#if QJS_AOT_PROFILE && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_ASM || QJS_REGVM_RECORD)
 +#error "QJS_AOT_PROFILE needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0"
 +#endif
@@ -289,13 +251,13 @@ What this does:
  /*
   * Register VM: decode and verify one function's final stack IR.
   *
-@@ -56025,6 +56157,644 @@ static int regvm_map_atoms(uint8_t *code, int len, int wide,
+@@ -54561,6 +54683,639 @@ static int regvm_map_atoms(uint8_t *code, int len, int wide,
  {
      return regvm_map_atoms2(code, len, wide, cb, opaque, 0, NULL);
  }
 +#if QJS_AOT_PROFILE
 +/* ------------------------------------------------------------------------ */
-+/* AOT profiler implementation (phase P0 of .local/aot-regvm-impl-plan.md).   */
++/* AOT profiler implementation.                                              */
 +/* ------------------------------------------------------------------------ */
 +
 +static void aot_hash_bytes(uint64_t *h0, uint64_t *h1, const void *p, size_t n)
@@ -330,9 +292,8 @@ What this does:
 +        aot_hash_bytes(h0, h1, s, (size_t)n);
 +}
 +
-+/* Hash the register program with atom operands replaced by their string
-+   content, so the digest does not depend on atom interning order. The operand
-+   walk mirrors regvm_map_atoms2's decode over regvm_rop_fmt. */
++/* Hash the register program with atom operands replaced by their strings, so
++   the digest is independent of interning order. */
 +static void aot_digest_code(uint64_t *h0, uint64_t *h1, JSFunctionBytecode *b)
 +{
 +    const uint8_t *code = b->regvm_code;
@@ -752,13 +713,9 @@ What this does:
 +}
 +#endif
 +
-+/*
-+ * Name the C function at `p`. dladdr only sees dynamic symbols, and nearly
-+ * every builtin here is file-static, so it usually fails; fall back to reading
-+ * the executable's own .symtab from /proc/self/exe and picking the nearest
-+ * preceding STT_FUNC at or below the address. Profile builds are linked
-+ * -no-pie, so the pointer offset is the symbol's st_value.
-+ */
++/* Name the C function at `p`. dladdr only sees dynamic symbols, so fall back
++   to the nearest preceding STT_FUNC in /proc/self/exe's .symtab. Profile
++   builds are linked -no-pie. */
 +static const char *aot_sym_name(JSRuntime *rt, void *p, char *buf, int n)
 +{
 +#if !defined(_WIN32)
@@ -932,9 +889,9 @@ What this does:
 +#endif /* QJS_AOT_PROFILE */
 +
  
- /*
-  * Release the first `n` atom operands of a program whose rewrite stopped
-@@ -65594,6 +66364,10 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+ /* Release the first `n` atom operands of a program whose rewrite stopped
+    part-way. The same walk visits the same operands in the same order. */
+@@ -63338,6 +64093,10 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
  #endif
  #endif
  

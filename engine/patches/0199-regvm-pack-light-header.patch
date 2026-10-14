@@ -1,14 +1,26 @@
+Subject: Pack the light header
+
+What this does
+  Pack the light header.
+
+Why we need it
+  The four narrow header fields were four stores and the return read them back separately.
+
+What it adds
+  Compose `ret_dst.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 4da1df3..7a13bf3 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25030,6 +25030,16 @@
+@@ -24491,6 +24491,14 @@ typedef struct JSRegRun {
      uint8_t *resume_marker;
  } JSRegRun;
  
-+/*
-+ * Step 2: the header's four narrow fields are composed into `hdr_pack` by
-+ * explicit shifts, which assumes the fields sit in order at these offsets.
-+ */
++/* `hdr_pack` is composed by explicit shifts, which assumes the four narrow
++   fields sit in order at these offsets. */
 +_Static_assert(offsetof(JSRegRun, ret_dst) == offsetof(JSRegRun, hdr_pack) &&
 +               offsetof(JSRegRun, argc) == offsetof(JSRegRun, hdr_pack) + 2 &&
 +               offsetof(JSRegRun, flags) == offsetof(JSRegRun, hdr_pack) + 4 &&
@@ -16,19 +28,16 @@ diff --git a/quickjs.c b/quickjs.c
 +               "hdr_pack field order");
 +
  #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
- /*
-  * Plan 5.5: walk one light chain, innermost first, publishing each frame's
-@@ -26495,15 +26505,16 @@
+ /* Walk one light chain, innermost first, publishing each frame's register
+    window as a root range (registers borrow under DRC). The chain ends at the
+@@ -25832,12 +25840,13 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
  #if QJS_REGVM_RECORD
-     /* Plan 5.6: a light frame has no JSStackFrame and no record release walk. */
+     /* A light frame has no JSStackFrame and no record release walk. */
      if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
 +        uint64_t hp = f->hdr_pack;
-         /*
-          * A frame that owns nothing moves the value straight into the caller's
-          * register. The separate `regvm_t_return_light` round-trips it through
-          * `f->ret` and needs a tail call; fusing the trivial case here keeps
-          * the value in a register and drops both.
-          */
+         /* A frame that owns nothing moves the value straight into the caller's
+            register, without the round trip through `f->ret` and
+            `regvm_t_return_light`. */
 -        if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
 +        if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_TRIVIAL_RET)) {
              JSRegRun *c = f->caller;
@@ -37,9 +46,9 @@ diff --git a/quickjs.c b/quickjs.c
              uint8_t *rip = f->ret_ip;
              JSValue v = FR(s);
              size_t top = (size_t)((uint8_t *)f
-@@ -26570,11 +26581,12 @@
+@@ -25900,11 +25909,12 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
  #if QJS_REGVM_RECORD
-     /* Plan 5.6: a light frame returns through its own handlers. */
+     /* A light frame returns through its own handlers. */
      if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
 +        uint64_t hp = f->hdr_pack;
          /* Same fusion as `regvm_t_return`: a frame that owns nothing moves
@@ -52,7 +61,7 @@ diff --git a/quickjs.c b/quickjs.c
              uint8_t *rip = f->ret_ip;
              size_t top = (size_t)((uint8_t *)f
                                    - (uint8_t *)ctx->rt->regvm_frames);
-@@ -27098,9 +27110,6 @@
+@@ -26346,9 +26356,6 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      nf->pic = cb->regvm_pic;
      nf->var_refs = co->u.func.var_refs;
      nf->arg_buf = oargv;
@@ -62,17 +71,14 @@ diff --git a/quickjs.c b/quickjs.c
      nf->func = co;
      nf->cap_ip = NULL;
      nf->sf = NULL;
-@@ -27129,9 +27138,19 @@
+@@ -26369,9 +26376,16 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      } else {
          nf->fr = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
      }
 -    nf->flags = REGVM_FLAG_LIGHT;
 -    if (vc == 0)
 -        nf->flags |= REGVM_FLAG_TRIVIAL_RET;
-+    /*
-+     * Step 2: the four narrow header fields go out as one 64-bit store.
-+     * `nctl` is 0; `d` and `na` are the call's own 16-bit operands.
-+     */
++    /* The four narrow header fields go out as one 64-bit store; `nctl` is 0. */
 +    {
 +        uint16_t hflags = REGVM_FLAG_LIGHT;
 +
@@ -82,6 +88,6 @@ diff --git a/quickjs.c b/quickjs.c
 +                     | ((uint64_t)(uint16_t)na << 16)
 +                     | ((uint64_t)hflags << 32);
 +    }
-     /*
-      * Fill the variable area and the register file with `undefined`. Every
-      * register must hold a valid, uncounted word before the program runs (the
+     /* Fill the variable area and register file with `undefined`; only the
+        variable slots the promotion map still names are filled. */
+     for (k = 0; k < vc; k++)

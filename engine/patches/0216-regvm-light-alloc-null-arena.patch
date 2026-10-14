@@ -1,10 +1,24 @@
+Subject: Test for the frame arena before taking the entry record from its top
+
+What this does
+  Test for the frame arena before taking the entry record from its top.
+
+Why we need it
+  `regvm_light_alloc`'s entry-record branch formed `rt->regvm_frames + top` and compared against `rt->regvm_chunk_end` before the arena existed, which is pointer arithmetic on null.
+
+What it adds
+  The null test comes first and returns NULL, falling back to the record path that allocates the arena.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 9d899c8..acb9d70 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -27257,8 +27257,11 @@
-          * would be pointer arithmetic on a null pointer. Test for the arena
-          * first and fall back to the record path, which allocates it.
-          */
+@@ -26471,8 +26471,11 @@ regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
+         /* The entry record lives on the C stack, not in the arena, so take the
+            frame from the arena top. Before the first record call there is no
+            arena at all; fall back to the record path, which allocates it. */
 -        size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
 +        size_t top;
  

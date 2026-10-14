@@ -1,19 +1,31 @@
+Subject: Cache the global-variable property slot, not its offset
+
+What this does
+  Cache the global-variable property slot, not its offset.
+
+Why we need it
+  Which is what kept `meth` and `m0` behind.
+
+What it adds
+  `JSGVCell` caches the `JSProperty *` itself, so the hit path is generation + atom + slot + value; the generation must be bumped wherever a watched object's property array can move, so the two add-transition IC replays (`regvm_put_field_add_hit` and the stack VM's) now invalidate a watched receiver like the generic add paths already did; every other mover (`resize_properties`, `compact_properties`, `add_property`, the in-place shape mutations, the TDZ write) was already behind an invalidate.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 2b6fac0..0785a02 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1148,18 +1148,19 @@
+@@ -1071,18 +1071,17 @@ enum {
     enough to call the interrupt callback often. */
  #define JS_INTERRUPT_COUNTER_INIT 10000
  
 -/* OP_get_var cell cache: "atom is own data property #offset of this object".
 -   128 sets of 2 ways, indexed by the low 7 bits of the atom, 32 bytes so the
 -   set stride stays a shift. */
-+/* OP_get_var cell cache: "atom is own data property at this slot".
-+   128 sets of 2 ways, indexed by the low 7 bits of the atom, so the set
-+   stride (2 * 16 bytes) stays a shift. The cell caches the property slot
-+   itself, which is what makes the hit path one load shorter than walking
-+   obj->prop[offset]; the generation is bumped wherever a watched object's
-+   property array can move. */
++/* OP_get_var cell cache: "atom is own data property at this slot". 128 sets
++   of 2 ways, indexed by the atom's low 7 bits. The cell caches the slot
++   itself; the generation is bumped wherever a watched object's property array
++   can move. */
 +struct JSProperty;
  #define JS_GV_CELL_SETS 128
  #define JS_GV_CELL_WAYS 2
@@ -30,7 +42,7 @@ diff --git a/quickjs.c b/quickjs.c
  } JSGVCell;
  
  struct JSContext {
-@@ -15757,11 +15758,11 @@
+@@ -15526,11 +15525,11 @@ static inline bool js_gv_cell_peek(JSContext *ctx, JSAtom atom, JSValue *pval)
      uint32_t gen = ctx->rt->gv_cell_gen;
  
      if (likely(gvc[0].atom == atom && gvc[0].gen == gen)) {
@@ -44,7 +56,7 @@ diff --git a/quickjs.c b/quickjs.c
          return true;
      }
      return false;
-@@ -15786,8 +15787,7 @@
+@@ -15555,8 +15554,7 @@ static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
          set[1] = set[0];
      set[0].atom = prop;
      set[0].gen = ctx->rt->gv_cell_gen;
@@ -54,7 +66,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
-@@ -24255,6 +24255,10 @@
+@@ -23852,6 +23850,10 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
      nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
      off = e->slot_off / (uint32_t)sizeof(JSValue);
      osh = p->shape;
@@ -65,7 +77,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (nsh->prop_size != osh->prop_size) {
          JSProperty *np = js_prop_grow(ctx, p,
                                        sizeof(p->prop[0]) * nsh->prop_size);
-@@ -40243,6 +40247,10 @@
+@@ -38513,6 +38515,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                             == ctx->rt->ic_watchpoint_epoch)) {
                                  uint32_t off = ic[k].offset;
                                  JSShape *osh = p->shape;

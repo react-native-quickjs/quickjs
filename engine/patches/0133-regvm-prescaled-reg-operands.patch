@@ -1,47 +1,42 @@
-Pre-scales register operands to byte offsets (X2)
+Subject: Pre-scales register operands to byte offsets
 
-The register backend stored every register operand as a register index and
-scaled it by the 16-byte register size at each use, so the handlers carried a
-shift on the hot path -- `shl $0x4` appeared 1380 times in the binary and three
-times in regvm_t_add alone. Scaling once, at encode time, and storing the byte
-offset removes the shift from every handler.
+What this does
+  Pre-scales register operands to byte offsets.
 
-  * quickjs.c: the register access macros (FR/FRP) add the frame base instead of
-    indexing and scaling, and 78 direct fr[...] uses were rewritten to them; the
-    encoder, the verifier and the narrow-operand selection scale once; the
-    monolith's RD_REG/RD_REG8 decode macros drop their shift; the bytecode
-    reader bounds reg_count by the widest representable register offset rather
-    than by UINT16_MAX, and validates a register operand as an aligned byte
-    offset rather than as an index.
-  * quickjs.c: two narrow handlers added by 0115 (L_ROP_load_i8_s and
-    L_ROP_move_s) read their register operands with RD_U8 rather than RD_REG8,
-    which the old unshifted encoding made harmless and this one makes wrong;
-    they now use RD_REG8 like every other narrow handler.
-  * quickjs-regvm.h: REGVM_FORMAT_VERSION 12 -> 13.
+Why we need it
+  The register backend stored every register operand as a register index and scaled it by the 16-byte register size at each use, so every handler carried a shift on the hot path.
 
-Bytecode version bump
-  Not here. This changes the register format only and leaves BC_VERSION alone;
-  the precompiled register blobs record REGVM_FORMAT_VERSION in their header, so
-  they are regenerated in the staged 9999 candidate, as they were for the 0115
-  and 0116 register format changes.
+What it adds
+  The register access macros add the frame base instead of indexing and scaling, 78 direct `fr[...]` uses were rewritten to them, the encoder, verifier and narrow-operand selection scale once, the monolith's `RD_REG`/`RD_REG8` drop their shift, and the reader bounds `reg_count` by the widest representable register offset and validates each register operand as an aligned byte offset rather than as an index; which the old unshifted encoding made harmless and this one makes wrong, and now use `RD_REG8`.
+
+Needs a bytecode version bump
+  Yes. The register blobs are regenerated in 9999. `BC_VERSION` is unchanged.
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -599,7 +599,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
+ /* The register bytecode's format version, checked per function record before
+    any instruction is parsed. Bump it whenever an opcode is added, removed or
+    renumbered, or an operand's width or meaning changes. */
+-#define REGVM_FORMAT_VERSION 12
++#define REGVM_FORMAT_VERSION 13
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23285,6 +23285,14 @@
+@@ -22923,6 +22923,11 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
  #define T_SZ_RIT_S  4    /* "rit"   narrow */
  
  #define T_REG(o)  ((int)regvm_ld_u16(ip + (o)))
-+/*
-+ * X2: a register operand in the encoded stream is a *byte offset* into the
-+ * register file, not an index, so `FR(x)` never needs the `shl $4` that turns
-+ * an index into a 16-byte stride. `FR` is that access and `FRP` its address;
-+ * both take an operand as decoded by T_REG/T_REG8.
-+ */
++/* A register operand in the encoded stream is a byte offset into the
++   register file, so `FR(x)` needs no scaling. `FR` is the access and `FRP`
++   its address; both take an operand decoded by T_REG/T_REG8. */
 +#define FR(x)  (*(JSValue *)((uint8_t *)fr + (x)))
 +#define FRP(x) ((JSValue *)((uint8_t *)fr + (x)))
  #define T_REG8(o) ((int)(uint8_t)ip[o])
  #define T_OFF8(o) ((int)(int8_t)ip[o])
  #define T_U8(o)   ((int)ip[o])
-@@ -23391,8 +23399,8 @@
+@@ -22996,8 +23001,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
   * the two rejected shapes cost.
   */
  #define T_SET_NEXT(d, v, off) do { \
@@ -52,7 +47,7 @@ Bytecode version bump
          if (unlikely(REGVM_HAS_COUNT(_o)) && \
              unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(_o)) <= 0)) { \
              f->set_v = _o; \
-@@ -23425,7 +23433,7 @@
+@@ -23027,7 +23032,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  /* the cold halves: decode the shape, run the engine's slow routine, continue */
  #define T_BODY_RRR(SUB_, SZ_) do { \
          int _d = T_REG(1); \
@@ -61,7 +56,7 @@ Bytecode version bump
          if (js_regvm_binary(ctx, SUB_, _o1, _o2, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23433,7 +23441,7 @@
+@@ -23035,7 +23040,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_BODY_RBRR(SUB_, SZ_) do { \
          int _d = T_REG(1); \
          int _sub = T_U8(3); \
@@ -70,7 +65,7 @@ Bytecode version bump
          if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23441,7 +23449,7 @@
+@@ -23043,7 +23048,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_BODY_RBUR(SZ_) do { \
          int _d = T_REG(1); \
          int _sub = T_U8(3); \
@@ -79,7 +74,7 @@ Bytecode version bump
          if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23449,7 +23457,7 @@
+@@ -23051,7 +23056,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_BODY_RBRU(SZ_) do { \
          int _d = T_REG(1); \
          int _sub = T_U8(3); \
@@ -88,7 +83,7 @@ Bytecode version bump
          if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23465,7 +23473,7 @@
+@@ -23067,7 +23072,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_BODY_RBR_I(SZ_) do { \
          int _d = T_REG(1); \
          int _sub = T_U8(3); \
@@ -97,7 +92,7 @@ Bytecode version bump
          if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23473,7 +23481,7 @@
+@@ -23075,7 +23080,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_BODY_RBRI_S(SZ_) do { \
          int _d = T_REG8(1); \
          int _sub = T_U8(2); \
@@ -106,7 +101,7 @@ Bytecode version bump
          if (js_regvm_binary(ctx, _sub, _o1, _o2, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23481,7 +23489,7 @@
+@@ -23083,7 +23088,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_BODY_RBR(SZ_) do { \
          int _d = T_REG(1); \
          int _sub = T_U8(3); \
@@ -115,7 +110,7 @@ Bytecode version bump
          if (js_regvm_unary(ctx, _sub, _o1, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23490,7 +23498,7 @@
+@@ -23092,7 +23097,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
     so their cold half must not read one out of the stream. */
  #define T_BODY_RR_UN(SUB_, SZ_) do { \
          int _d = T_REG(1); \
@@ -124,7 +119,7 @@ Bytecode version bump
          if (js_regvm_unary(ctx, SUB_, _o1, &_out)) \
              T_FAIL(); \
          T_SET_NEXT(_d, _out, SZ_); \
-@@ -23500,7 +23508,7 @@
+@@ -23102,7 +23107,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_FAST_RRR(SUB_, SZ_, SLOW_) do { \
          int _d = T_REG(1); \
          JSValue _out; \
@@ -133,7 +128,7 @@ Bytecode version bump
              T_SET_NEXT(_d, _out, SZ_); \
          } \
          __attribute__((musttail)) return SLOW_(REGVM_PASS); \
-@@ -23508,7 +23516,7 @@
+@@ -23110,7 +23115,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_FAST_UN(SUB_, SZ_, SLOW_) do { \
          int _d = T_REG(1); \
          JSValue _out; \
@@ -142,7 +137,7 @@ Bytecode version bump
              T_SET_NEXT(_d, _out, SZ_); \
          } \
          __attribute__((musttail)) return SLOW_(REGVM_PASS); \
-@@ -23516,7 +23524,7 @@
+@@ -23118,7 +23123,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_FAST_SHAPE(SUB_, SZ_, SLOW_) do { \
          int _d = T_REG(1); \
          JSValue _out; \
@@ -151,7 +146,7 @@ Bytecode version bump
              T_SET_NEXT(_d, _out, SZ_); \
          } \
          __attribute__((musttail)) return SLOW_(REGVM_PASS); \
-@@ -24181,8 +24189,8 @@
+@@ -23748,8 +23753,8 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
          return ip;
      }
      s = T_REG(1);
@@ -162,7 +157,7 @@ Bytecode version bump
      __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
  }
  
-@@ -24251,8 +24259,8 @@
+@@ -23806,8 +23811,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
  
      regvm_record_release(ctx->rt, f);
      ctx->rt->current_stack_frame = c->sf;
@@ -173,7 +168,7 @@ Bytecode version bump
      f = c;
      if (unlikely(REGVM_HAS_COUNT(old)) &&
          unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
-@@ -24281,7 +24289,7 @@
+@@ -23833,7 +23838,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
  static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
  {
      int c = T_REG(3);
@@ -182,7 +177,7 @@ Bytecode version bump
  
      if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
          JSObject *co = JS_VALUE_GET_OBJ(cf);
-@@ -24300,7 +24308,7 @@
+@@ -23852,7 +23857,7 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
  static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
  {
      int c = T_REG(3);
@@ -191,7 +186,7 @@ Bytecode version bump
  
      if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
          JSObject *co = JS_VALUE_GET_OBJ(cf);
-@@ -24331,7 +24339,7 @@
+@@ -23878,7 +23883,7 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS)
  {
      int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
@@ -200,7 +195,7 @@ Bytecode version bump
      JSObject *co = JS_VALUE_GET_OBJ(cf);
      JSFunctionBytecode *cb = co->u.func.function_bytecode;
      JSRegRecordLayout lay;
-@@ -24377,7 +24385,7 @@
+@@ -23914,7 +23919,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARG
          __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
      }
      regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 8,
@@ -209,7 +204,7 @@ Bytecode version bump
      f = lay.rec;
      __attribute__((musttail))
          return regvm_t_dispatch(f->b->regvm_code, f->fr, f, ctx);
-@@ -24387,8 +24395,8 @@
+@@ -23924,8 +23929,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
  {
      int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
      int na = T_U8(9);
@@ -220,7 +215,7 @@ Bytecode version bump
      JSObject *co = JS_VALUE_GET_OBJ(cf);
      JSFunctionBytecode *cb = co->u.func.function_bytecode;
      JSRegRecordLayout lay;
-@@ -24434,7 +24442,7 @@
+@@ -23961,7 +23966,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
          __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
      }
      regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 10,
@@ -229,7 +224,7 @@ Bytecode version bump
      f = lay.rec;
      __attribute__((musttail))
          return regvm_t_dispatch(f->b->regvm_code, f->fr, f, ctx);
-@@ -24444,11 +24452,11 @@
+@@ -23971,11 +23976,11 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
  {
      int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
@@ -244,7 +239,7 @@ Bytecode version bump
                               vc(oargv), 0);
      if (JS_IsException(rv))
          T_FAIL();
-@@ -24459,11 +24467,11 @@
+@@ -23986,11 +23991,11 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
  {
      int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
      int na = T_U8(9);
@@ -259,7 +254,7 @@ Bytecode version bump
      if (JS_IsException(rv))
          T_FAIL();
      T_SET_NEXT(d, rv, 10);
-@@ -24503,7 +24511,7 @@
+@@ -24030,7 +24035,7 @@ static uint8_t *REGVM_CC regvm_t_binary_loc_reg(REGVM_ARGS)
      int rc = T_REG(6);
      JSValue out;
  
@@ -268,7 +263,7 @@ Bytecode version bump
          T_SET_NEXT(d, out, T_SZ_RBUR);
      }
      __attribute__((musttail)) return regvm_t_binary_loc_reg_slow(REGVM_PASS);
-@@ -24519,7 +24527,7 @@
+@@ -24046,7 +24051,7 @@ static uint8_t *REGVM_CC regvm_t_binary_reg_loc(REGVM_ARGS)
      int rs = T_REG(6);
      JSValue out;
  
@@ -277,7 +272,7 @@ Bytecode version bump
          T_SET_NEXT(d, out, T_SZ_RBRU);
      }
      __attribute__((musttail)) return regvm_t_binary_reg_loc_slow(REGVM_PASS);
-@@ -24551,7 +24559,7 @@
+@@ -24078,7 +24083,7 @@ static uint8_t *REGVM_CC regvm_t_binary_imm(REGVM_ARGS)
      int32_t imm = T_I32(6);
      JSValue out;
  
@@ -286,7 +281,7 @@ Bytecode version bump
          T_SET_NEXT(d, out, T_SZ_RBR_I);
      }
      __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS);
-@@ -24567,7 +24575,7 @@
+@@ -24094,7 +24099,7 @@ static uint8_t *REGVM_CC regvm_t_binary_imm_s(REGVM_ARGS)
      int32_t imm = T_OFF8(4);
      JSValue out;
  
@@ -295,7 +290,7 @@ Bytecode version bump
          T_SET_NEXT(d, out, T_SZ_RBRI_S);
      }
      __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS);
-@@ -24582,7 +24590,7 @@
+@@ -24109,7 +24114,7 @@ static uint8_t *REGVM_CC regvm_t_unary(REGVM_ARGS)
      int s = T_REG(4);
      JSValue out;
  
@@ -304,7 +299,7 @@ Bytecode version bump
          T_SET_NEXT(d, out, T_SZ_RBR);
      }
      __attribute__((musttail)) return regvm_t_unary_slow(REGVM_PASS);
-@@ -24657,7 +24665,7 @@
+@@ -24156,7 +24161,7 @@ static uint8_t *REGVM_CC regvm_t_load_i8_s(REGVM_ARGS)
  static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS)
  {
      int s = T_REG(1);
@@ -313,7 +308,7 @@ Bytecode version bump
      T_NEXT(T_SZ_R);
  }
  
-@@ -24692,10 +24700,10 @@
+@@ -24191,10 +24196,10 @@ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
      int o = T_REG(1);
      int key = T_REG(3);
      int v = T_REG(5);
@@ -327,7 +322,7 @@ Bytecode version bump
                              JS_PROP_THROW_STRICT) < 0)
          T_FAIL();
      T_NEXT(T_SZ_RRR);
-@@ -24706,7 +24714,7 @@
+@@ -24205,7 +24210,7 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
      int w = T_REG(1);
      int d = T_REG(3);
      int idx = T_U16(5);
@@ -336,7 +331,7 @@ Bytecode version bump
      JSObject *pa = js_args_apply_is_builtin(sp[-2]);
      JSValue ret_val;
  
-@@ -24735,15 +24743,15 @@
+@@ -24234,15 +24239,15 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
      JSValue out;
  
      if (kind == REG_CONST_CPOOL) {
@@ -356,7 +351,7 @@ Bytecode version bump
              JS_FreeValue(ctx, cst);
              T_FAIL();
          }
-@@ -24759,8 +24767,8 @@
+@@ -24258,8 +24263,8 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
      int nt = T_REG(5);
      int ab = T_REG(7);
      int na = T_U8(9);
@@ -367,7 +362,7 @@ Bytecode version bump
                                                   na, vc(argv), 0);
      if (JS_IsException(ret_val))
          T_FAIL();
-@@ -24824,7 +24832,7 @@
+@@ -24321,7 +24326,7 @@ static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS)
      /* A self-move is a no-op: the allocator coalesces a move's destination
         onto its source, and duplicating there would strand a reference. */
      if (d != s)
@@ -376,7 +371,7 @@ Bytecode version bump
      T_NEXT(T_SZ_RR);
  }
  
-@@ -24834,7 +24842,7 @@
+@@ -24331,7 +24336,7 @@ static uint8_t *REGVM_CC regvm_t_move_s(REGVM_ARGS)
      int s = T_REG8(2);
  
      if (d != s)
@@ -385,7 +380,7 @@ Bytecode version bump
      T_NEXT(T_SZ_RR_S);
  }
  
-@@ -24861,10 +24869,10 @@
+@@ -24345,10 +24350,10 @@ static uint8_t *REGVM_CC regvm_t_move_xfer(REGVM_ARGS)
      int s = T_REG(3);
  
      if (likely(d != s)) {
@@ -399,7 +394,7 @@ Bytecode version bump
          if (unlikely(REGVM_HAS_COUNT(old)) &&
              unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
              f->set_v = old;
-@@ -24951,7 +24959,7 @@
+@@ -24431,7 +24436,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_slow(REGV
      int d = T_REG(1);
      int o = T_REG(3);
      int key = T_REG(5);
@@ -408,7 +403,7 @@ Bytecode version bump
      JSValue val;
  
      if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
-@@ -24987,8 +24995,8 @@
+@@ -24466,8 +24471,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_lazy_slow
      REGVM_ARGS)
  {
      int d = T_REG(1);
@@ -419,7 +414,7 @@ Bytecode version bump
      JSValue val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
      T_SET_NEXT(d, val, T_SZ_RRR);
  }
-@@ -24998,7 +25006,7 @@
+@@ -24477,7 +24482,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
      int d = T_REG(1);
      int o = T_REG(3);
      int key = T_REG(5);
@@ -428,7 +423,7 @@ Bytecode version bump
  
      if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
                 JS_VALUE_GET_TAG(k) == JS_TAG_INT)) {
-@@ -25034,9 +25042,9 @@
+@@ -24510,9 +24515,9 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
          int site = T_REG(9); \
          JSValue val; \
          if (site == REG_IC_NONE) { \
@@ -440,7 +435,7 @@ Bytecode version bump
          } \
          if (JS_IsException(val)) \
              T_FAIL(); \
-@@ -25048,7 +25056,7 @@
+@@ -24524,7 +24529,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
          int r = T_REG(3); \
          int site = T_REG(9); \
          JSValue val; \
@@ -449,9 +444,9 @@ Bytecode version bump
              T_SET_NEXT(d, val, T_SZ_RRAS); \
          } \
          __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
-@@ -25072,12 +25080,12 @@
-        to a read-only property is a silent no-op in sloppy code and a TypeError
-        in strict code. The receiver is the object itself, as in the monolith. */
+@@ -24546,12 +24551,12 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_
+     /* JS_PROP_THROW_STRICT: a write to a read-only property is a no-op in
+        sloppy code and a TypeError in strict code. */
      if (site != REG_IC_NONE) {
 -        if (regvm_put_field_ic(ctx, f->b, &f->pic, fr[r], atom, fr[v], site) < 0)
 +        if (regvm_put_field_ic(ctx, f->b, &f->pic, FR(r), atom, FR(v), site) < 0)
@@ -465,7 +460,7 @@ Bytecode version bump
          T_FAIL();
      T_NEXT(T_SZ_RASR);
  }
-@@ -25101,7 +25109,7 @@
+@@ -24569,7 +24574,7 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
      int v = T_REG(9);
  
      {
@@ -474,7 +469,7 @@ Bytecode version bump
  
          if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
              JSObject *p = JS_VALUE_GET_OBJ(recv);
-@@ -25114,7 +25122,7 @@
+@@ -24582,7 +24587,7 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
  #ifdef QJS_REGVM_COUNT
                  js_regvm_put_hit++;
  #endif
@@ -483,7 +478,7 @@ Bytecode version bump
                  if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
                      unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
                      f->set_v = old;
-@@ -25152,14 +25160,14 @@
+@@ -24616,14 +24621,14 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_branch_if_slow(REGVM_
  {
      int c = T_REG(1);
      int32_t off = T_I32(3);
@@ -500,7 +495,7 @@ Bytecode version bump
  
      if (likely((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)) {
          if (JS_VALUE_GET_INT(v) != 0)
-@@ -25173,14 +25181,14 @@
+@@ -24637,14 +24642,14 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_branch_if_not_slow(RE
  {
      int c = T_REG(1);
      int32_t off = T_I32(3);
@@ -517,7 +512,7 @@ Bytecode version bump
  
      if (likely((uint32_t)JS_VALUE_GET_TAG(v) <= JS_TAG_UNDEFINED)) {
          if (JS_VALUE_GET_INT(v) == 0)
-@@ -25205,7 +25213,7 @@
+@@ -24666,7 +24671,7 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
          int _sub = (SUBEXPR); \
          int _la = (LAEXPR), _rb = (RBEXPR); \
          int32_t _off = (OFFEXPR); \
@@ -526,7 +521,7 @@ Bytecode version bump
          if (unlikely(_take < 0)) \
              T_FAIL(); \
          T_NEXT((SZ_) + (_take ? _off : 0)); \
-@@ -25215,7 +25223,7 @@
+@@ -24676,7 +24681,7 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
          int _sub = (SUBEXPR); \
          int _la = (LAEXPR), _rb = (RBEXPR); \
          int32_t _off = (OFFEXPR); \
@@ -535,7 +530,7 @@ Bytecode version bump
          int _r; \
          if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
                     !((_r = regvm_int_cmp(_sub & ~REG_CMP_INVERT, \
-@@ -25353,7 +25361,7 @@
+@@ -24798,7 +24803,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s
      int d = T_REG(1);
      int32_t imm = T_OFF8(3);
      int32_t off = T_I32(4);
@@ -544,7 +539,7 @@ Bytecode version bump
  
      if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
          js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
-@@ -25366,16 +25374,16 @@
+@@ -24811,16 +24816,16 @@ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch(REGVM_ARGS)
      int d = T_REG(1);
      int32_t imm = T_OFF8(3);
      int32_t off = T_I32(4);
@@ -564,7 +559,7 @@ Bytecode version bump
          T_NEXT(T_SZ_RIT + off);
      }
      __attribute__((musttail))
-@@ -25388,7 +25396,7 @@
+@@ -24833,7 +24838,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s
      int d = T_REG8(1);
      int32_t imm = T_OFF8(2);
      int32_t off = T_OFF8(3);
@@ -573,7 +568,7 @@ Bytecode version bump
  
      if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
          js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
-@@ -25401,16 +25409,16 @@
+@@ -24846,16 +24851,16 @@ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s(REGVM_ARGS)
      int d = T_REG8(1);
      int32_t imm = T_OFF8(2);
      int32_t off = T_OFF8(3);
@@ -593,7 +588,7 @@ Bytecode version bump
          T_NEXT(T_SZ_RIT_S + off);
      }
      __attribute__((musttail))
-@@ -25789,8 +25797,8 @@
+@@ -25167,8 +25172,8 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
              ctx->rt->current_exception = JS_UNINITIALIZED;
              JS_FreeValueRT(ctx->rt, ctx->error_back_trace);
              ctx->error_back_trace = JS_UNDEFINED;
@@ -604,10 +599,10 @@ Bytecode version bump
              /* Resuming rather than unwinding: the chain keeps running this very
                 record, at its handler. */
              __attribute__((musttail))
-@@ -26128,10 +26136,10 @@
-  * nothing to branch on: a register operand is one load and the advance is a
-  * constant.
-  */
+@@ -25454,10 +25459,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+ #endif
+ /* Register operands are always two bytes: a register operand is one load and
+    the advance is a constant. */
 -#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2))
 +#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) >> 4)
  /* The narrow encoding's operands: one unsigned byte, and a signed byte for a
@@ -617,7 +612,7 @@ Bytecode version bump
  #define RD_OFF8() ((int)(int8_t)*rpc++)
  #define RD_U8()  ((int)*rpc++)
  #define RD_U16() (rpc += 2, (int)regvm_ld_u16(rpc - 2))
-@@ -26786,7 +26794,7 @@
+@@ -26086,7 +26091,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_load_i8:
                  { int d = RD_REG(); SET_REG(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
              L_ROP_load_i8_s:
@@ -626,7 +621,7 @@ Bytecode version bump
              L_ROP_load_i32:
                  { int d = RD_REG(); SET_REG(d, js_int32(RD_I32())); REGVM_NEXT(); }
              L_ROP_load_bigint_i32:
-@@ -26910,7 +26918,7 @@
+@@ -26199,7 +26204,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  { int d = RD_REG(); int s = RD_REG();
                    if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
              L_ROP_move_s:
@@ -635,32 +630,24 @@ Bytecode version bump
                    if (d != s) SET_REG(d, js_dup(regs[s])); REGVM_NEXT(); }
              L_ROP_get_local:
                  { int d = RD_REG(); int slot = RD_U16();
-@@ -55351,6 +55359,14 @@
+@@ -53940,6 +53945,11 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
      js_free(ctx, first);
  }
  
-+/*
-+ * X2: register operands are byte offsets into the register file, so a field's
-+ * width limits the registers it can name -- one byte reaches register 15, two
-+ * bytes reach register 4095.
-+ */
++/* Register operands are byte offsets: one byte reaches register 15, two bytes
++   reach register 4095. */
 +#define REGVM_NARROW_REG_MAX 16
 +#define REGVM_WIDE_REG_MAX 4095
 +
  static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                                     int reg_count, int cpool_count, int pic_count,
                                     int atom_count, int n_values, const int *ireg,
-@@ -55384,6 +55400,17 @@
-      */
+@@ -53969,6 +53979,12 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+        count, so the count floors at one. */
      if (reg_count < 1)
          reg_count = 1;
-+    /*
-+     * X2: register operands are byte offsets (register * sizeof(JSValue)). A
-+     * narrow operand is one byte, so it reaches registers 0..15; a wide one is
-+     * two bytes, so it reaches registers 0..4095. A function with more
-+     * registers than that cannot be encoded and is refused here rather than
-+     * truncated.
-+     */
++    /* Register operands are byte offsets (register * sizeof(JSValue)); a
++       function with more than 4096 registers is refused. */
 +    if (reg_count > REGVM_WIDE_REG_MAX + 1) {
 +        rc = REGVM_REFUSED;
 +        goto done;
@@ -668,7 +655,7 @@ Bytecode version bump
  
      insn_pc = js_malloc(ctx, (ir->n_insns > 0 ? ir->n_insns : 1) * sizeof(int));
      if (!insn_pc)
-@@ -55427,7 +55454,7 @@
+@@ -54003,7 +54019,7 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
          } else if (in->rop == ROP_branch_cmp_reg_reg) {
              a = regvm_reg_of(in, 1, ireg, n_values, scratch_reg, win_base, cycle_reg);
              b = regvm_reg_of(in, 2, ireg, n_values, scratch_reg, win_base, cycle_reg);
@@ -677,7 +664,7 @@ Bytecode version bump
                  int dop = regvm_cmp_opcode(in->ops[0]);
  
                  if (dop >= 0) {
-@@ -55443,7 +55470,7 @@
+@@ -54019,7 +54035,7 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
          } else if (in->rop == ROP_binary_imm) {
              a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
              b = regvm_reg_of(in, 2, ireg, n_values, scratch_reg, win_base, cycle_reg);
@@ -686,7 +673,7 @@ Bytecode version bump
                  in->ops[3] >= -128 && in->ops[3] <= 127) {
                  if (in->ops[1] == REG_BIN_ADD || in->ops[1] == REG_BIN_SUB) {
                      int is_add = (in->ops[1] == REG_BIN_ADD);
-@@ -55475,11 +55502,11 @@
+@@ -54048,11 +54064,11 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
              b = in->rop == ROP_move
                      ? regvm_reg_of(in, 1, ireg, n_values, scratch_reg, win_base, cycle_reg)
                      : a;
@@ -700,32 +687,29 @@ Bytecode version bump
                  in->rop = ROP_add_imm_self_branch_s;
          }
      }
-@@ -55582,6 +55609,12 @@
+@@ -54155,6 +54171,9 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                      rc = REGVM_REFUSED;
                      goto done;
                  }
-+                /* X2: a register operand is a byte offset into the register
-+                   file, so no reader ever scales an index by the value size.
-+                   The narrow form holds offsets 0..255, i.e. registers below
-+                   REGVM_NARROW_REG_MAX, which is what the selection loop
-+                   checks. */
++                /* The narrow form holds offsets 0..255, i.e. registers below
++                   REGVM_NARROW_REG_MAX. */
 +                r *= (int)sizeof(JSValue);
                  if (wide && !nar) { code[p++] = (uint8_t)r; code[p++] = (uint8_t)(r >> 8); }
                  else code[p++] = (uint8_t)r;
                  break;
-@@ -55677,7 +55710,7 @@
-            field, so its index is a constant-pool index or an atom index
-            depending on that byte, not on the operand position. */
+@@ -54249,7 +54268,7 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+         /* Range checks. ROP_load_const's kind byte says whether its index is a
+            constant-pool index or an atom index. */
          if (op == ROP_load_const) {
 -            if (ops[0] < 0 || ops[0] >= reg_count) {
 +            if (ops[0] < 0 || ops[0] >= reg_count * (int)sizeof(JSValue)) {
                  JS_ThrowInternalError(ctx, "regvm: register %d out of range (%d)",
                                        ops[0], reg_count);
                  goto done;
-@@ -55706,11 +55739,11 @@
-              * dst, sub-op, lhs, kind, index: the two registers are ordinary, and
-              * the index is a pool index or an atom according to the kind byte.
-              */
+@@ -54276,11 +54295,11 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+         } else if (op == ROP_binary_cpool) {
+             /* dst, sub-op, lhs, kind, index: the index is a pool index or an
+                atom according to the kind byte. */
 -            if (ops[0] < 0 || ops[0] >= reg_count ||
 -                ops[2] < 0 || ops[2] >= reg_count) {
 +            if (ops[0] < 0 || ops[0] >= reg_count * (int)sizeof(JSValue) ||
@@ -738,7 +722,7 @@ Bytecode version bump
                  goto done;
              }
              if (ops[3] == REG_CONST_CPOOL) {
-@@ -55735,7 +55768,7 @@
+@@ -54305,7 +54324,7 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                  int32_t v = ops[m];
                  switch (fmt[m]) {
                  case 'r':
@@ -747,7 +731,7 @@ Bytecode version bump
                          JS_ThrowInternalError(ctx, "regvm: register %d out of range (%d)", v, reg_count);
                          goto done;
                      }
-@@ -55791,7 +55824,8 @@
+@@ -54358,7 +54377,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                  int32_t want;
                  switch (fmt[m]) {
                  case 'r': {
@@ -757,22 +741,19 @@ Bytecode version bump
                      break;
                  }
                  case 't': {
-@@ -66639,7 +66673,13 @@
+@@ -64636,7 +64656,10 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
                          JS_ThrowSyntaxError(ctx, "register atom out of range");
                          goto done;
                      }
 -                } else if (v < 0 || v >= b->regvm_reg_count) {
 +                } else if (v < 0 || v >= b->regvm_reg_count * (int)sizeof(JSValue) ||
 +                           (v & (int)(sizeof(JSValue) - 1)) != 0) {
-+                    /* X2: a register operand is a byte offset into the register
-+                       file (register * sizeof(JSValue)), not an index. The
-+                       compiler always emits an aligned offset, so the reader
-+                       rejects anything else rather than reading across a slot
-+                       boundary. */
++                    /* A register operand is a byte offset; reject one that is
++                       not slot aligned. */
                      JS_ThrowSyntaxError(ctx, "register %d out of range (%d)",
                                          v, b->regvm_reg_count);
                      goto done;
-@@ -67018,7 +67058,7 @@
+@@ -65015,7 +65038,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                  bc_get_leb128_int(s, &regvm_len))
                  goto fail;
              if (reg_count <= 0 || ctl_count < 0 || regvm_len <= 0 ||
@@ -781,14 +762,3 @@ Bytecode version bump
                  pic_count < 0 || pic_count > UINT16_MAX ||
                  (size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
                  JS_ThrowSyntaxError(ctx, "invalid register program header");
---- a/quickjs-regvm.h
-+++ b/quickjs-regvm.h
-@@ -750,7 +750,7 @@
-  * cross-VM one does. Bump it whenever an opcode is added, removed or
-  * renumbered, or an operand's width or meaning changes.
-  */
--#define REGVM_FORMAT_VERSION 12
-+#define REGVM_FORMAT_VERSION 13
- 
- /* ROP_get_field and ROP_put_field use this site index when the source
-    instruction has no inline cache. */

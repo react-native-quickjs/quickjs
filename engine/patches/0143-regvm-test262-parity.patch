@@ -1,16 +1,19 @@
-Subject: register VM: test262 parity fixes (catch unwind, staged args, strict_eq, nip_catch, realm, for-await close)
+Subject: Test262 parity fixes
 
-What this does:
-- Catch unwinder resolves the frame/index correctly and adopts the caught value under deferred RC.
-- regvm_stage_args takes the `below` bound so staged argument windows do not clobber live registers.
-- regvm_strict_eq: mixed STRING/ROPE compare by content; BIG_INT/SHORT_BIG_INT fall back to the slow path.
-- nip_catch performs a real pop (JSFunctionDef.regvm_nip_pop, regvm_effect takes fd).
-- Record calls dispatch with the callee's realm; local_check TDZ throws use the caller's realm (regvm_caller_realm), mirroring the stack VM.
-- for-await-of: on {done:true} the iterator slot is cleared so the trailing async close does not call return() (spec: no AsyncIteratorClose on normal completion).
+What this does
+  
 
+Why we need it
+  The register VM diverged from the stack VM on catch unwinding, staged argument windows, mixed string/rope and BigInt strict equality, `nip_catch`, cross-realm calls/TDZ throws and for-await-of close on normal completion.
+
+What it adds
+  Catch unwinder frame/index + DRC adopt; `regvm_stage_args` `below` bound; `regvm_strict_eq` STRING/ROPE by content, BigInt to slow path; real `nip_catch` pop; record calls use callee realm, `local_check` throws use `regvm_caller_realm`; `iter_value_done` clears the iterator slot on done.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23382,6 +23382,12 @@
+@@ -23052,6 +23052,12 @@ static inline int regvm_strict_eq(int sub, JSValue a, JSValue b)
              eq = (double)JS_VALUE_GET_INT(a) == JS_VALUE_GET_FLOAT64(b);
          else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
              eq = JS_VALUE_GET_FLOAT64(a) == (double)JS_VALUE_GET_INT(b);
@@ -23,7 +26,7 @@ What this does:
          else
              eq = 0;
      } else {
-@@ -25081,10 +25087,11 @@
+@@ -24570,10 +24576,11 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
      if (unlikely(REGVM_HAS_COUNT(old)) &&
          unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
          f->set_v = old;
@@ -37,7 +40,7 @@ What this does:
  }
  #endif
  
-@@ -25205,8 +25212,9 @@
+@@ -24676,8 +24683,9 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARG
      regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 8,
                        JS_UNDEFINED, FRP(ab), na, slots);
      f = lay.rec;
@@ -48,7 +51,7 @@ What this does:
  }
  
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS)
-@@ -25263,8 +25271,9 @@
+@@ -24724,8 +24732,9 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
      regvm_record_fill(ctx->rt, &lay, cf, co, cb, f, d, ip + 10,
                        tv, FRP(ab), na, slots);
      f = lay.rec;
@@ -59,7 +62,7 @@ What this does:
  }
  
  /* the unthreaded halves: exactly what the monolith's L_ROP_call did */
-@@ -26983,12 +26992,21 @@
+@@ -26257,12 +26266,21 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
              ctx->rt->current_exception = JS_UNINITIALIZED;
              JS_FreeValueRT(ctx->rt, ctx->error_back_trace);
              ctx->error_back_trace = JS_UNDEFINED;
@@ -84,30 +87,47 @@ What this does:
          } else {
              --f->nctl;
          }
-@@ -29557,7 +29575,12 @@
-                    */
+@@ -28637,7 +28655,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                      the done flag at sp[0]. */
                    SET_REG_P(w + 4, tmp[4]);
                    if (JS_ToBool(ctx, tmp[4])) {
 -                      /* the slot is cleared, so nothing is left to close */
-+                      /* the slot is cleared, so nothing is left to close: the
-+                         window's iterator register reads undefined, which the
-+                         lowering copies back to the loop's iterator slot so
-+                         the trailing async close skips return() (spec:
-+                         AsyncIteratorClose does not run on normal completion) */
++                      /* The slot is cleared, so nothing is left to close: the
++                         lowering copies the undefined iterator back so the
++                         trailing async close skips return() (AsyncIteratorClose
++                         does not run on normal completion). */
 +                      SET_REG_P(w, JS_UNDEFINED);
                        regvm_ctl_iter_forget(ctx, regvm_ctl, &regvm_nctl);
                    }
                    JS_FreeValue(ctx, tmp[0]);
-@@ -31028,6 +31051,30 @@
-  * a function this cannot run. The `default:` arm is the guard for that, and a
-  * debug build can assert it is never reached.
+@@ -30015,23 +30037,34 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+ /*
+  * One cold instruction against the record.
+  *
+- * The case bodies are copied from the monolith's `L_ROP_*` labels **unchanged**,
+- * which two things make possible:
+- *
+- *  - `REGVM_NEXT()` is redefined to `return rpc`. A body has already advanced
+- *    `rpc` past its operands by the time it reaches it, and the caller is what
+- *    dispatches, so "next" means "hand back the pointer".
+- *  - `goto exception` lands on this function's own label at the bottom, so the
+- *    throw path needs no edit either.
+- *
+- * `regs`, `ctx` and `b` are named exactly as the monolith names them, so the only
+- * edits a body needs are the frame fields, which are spelled `f->` here.
++ * The case bodies are the monolith's `L_ROP_*` bodies with the frame fields
++ * spelled `f->`. `REGVM_NEXT()` is redefined to `return rpc`, and `goto
++ * exception` lands on this function's own label.
+  *
+  * An opcode with no case must have no `regvm_t_cold` table entry: eligibility
+- * asks only whether the slot is non-NULL, so an entry without a case would admit
+- * a function this cannot run. The `default:` arm is the guard for that, and a
+- * debug build can assert it is never reached.
++ * only asks whether the slot is non-NULL. The `default:` arm guards it.
   */
-+/*
-+ * The realm a "this/binding not initialized" check throws in. The stack VM throws
-+ * these with caller_ctx -- the derived-constructor check runs after the callee's
-+ * context is popped -- so the cold arms match it: the calling record's realm in a
-+ * chain, else the realm of whatever frame called this activation.
-+ */
++/* The realm a "this/binding not initialized" check throws in: the stack VM
++   uses caller_ctx, so the calling record's realm in a chain, else the realm
++   of the frame that called this activation. */
 +static JSContext *regvm_caller_realm(JSRegRun *f, JSContext *ctx)
 +{
 +    JSStackFrame *pf;
@@ -129,7 +149,7 @@ What this does:
  static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                 JSContext *ctx)
  {
-@@ -31465,7 +31512,7 @@
+@@ -30300,7 +30333,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
       {
                      int slot = RD_U16();
                      if (JS_IsUninitialized(f->var_buf[slot])) {
@@ -138,7 +158,7 @@ What this does:
                          goto exception;
                      }
                      REGVM_NEXT();
-@@ -31475,7 +31522,7 @@
+@@ -30310,7 +30343,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
       {
                      int slot = RD_U16();
                      if (!JS_IsUninitialized(f->var_buf[slot])) {
@@ -147,9 +167,9 @@ What this does:
                                                 "'this' can be initialized only once");
                          goto exception;
                      }
-@@ -38519,6 +38566,9 @@
+@@ -37266,6 +37299,9 @@ typedef struct JSFunctionDef {
      JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
-     uint16_t *regvm_fill;   /* C1 fill list, moved to the bytecode */
+     uint16_t *regvm_fill;   /* fill list, moved to the bytecode */
      uint16_t regvm_fill_count;
 +    /* Per-pc operand pops of each nip_catch, from compute_stack_size; NULL
 +       when the function has none that pops more than its declared two. */
@@ -157,7 +177,7 @@ What this does:
  #endif
  } JSFunctionDef;
  
-@@ -49764,6 +49814,8 @@
+@@ -48500,6 +48536,8 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
                          fd->use_short_opcodes);
      dbuf_free(&fd->byte_code);
  #if QJS_REGVM
@@ -166,7 +186,7 @@ What this does:
      js_free(ctx, fd->regvm_code);
      fd->regvm_code = NULL;
  #endif
-@@ -54511,11 +54563,32 @@
+@@ -53247,11 +53285,29 @@ static __exception int compute_stack_size(JSContext *ctx,
                  JS_ThrowInternalError(ctx, "nip_catch: no catch op (pc=%d)", pos);
                  goto fail;
              }
@@ -180,12 +200,9 @@ What this does:
              stack_len++; /* no stack overflow is possible by construction */
              catch_pos = s->catch_pos_tab[catch_pos];
 +#if QJS_REGVM
-+            /*
-+             * nip_catch pops down to and including the catch offset, which is
-+             * more than its declared two when a `yield` left values of the
-+             * enclosing expression under the returned one (`o.f = yield`).
-+             * The register backend's stack model needs the real count.
-+             */
++            /* nip_catch pops down to and including the catch offset, which is
++               more than its declared two when a `yield` left values under the
++               returned one (`o.f = yield`). */
 +            if (before - stack_len + 1 != 2) {
 +                if (!fd->regvm_nip_pop) {
 +                    fd->regvm_nip_pop = js_mallocz(ctx, sizeof(uint16_t) * s->bc_len);
@@ -199,7 +216,7 @@ What this does:
              break;
          default:
              break;
-@@ -54709,7 +54782,8 @@
+@@ -53413,7 +53469,8 @@ static JSRegScanStats js_regvm_stats;
  
  /* Operand-stack effect of the instruction at `p`, with the escape prefix
     refined. Mirrors compute_stack_size. */
@@ -209,7 +226,7 @@ What this does:
  {
      int op = bc[p];
      const JSOpCode *oi = &short_opcode_info(op);
-@@ -54719,6 +54793,11 @@
+@@ -53423,6 +53480,11 @@ static void regvm_effect(const uint8_t *bc, int p, int *n_pop, int *n_push)
          ns = 2;
      /* the with family's taken arm, which is what the branch sees */
      switch (op) {
@@ -221,10 +238,10 @@ What this does:
      case OP_with_get_var:
      case OP_with_delete_var:
          np = 1; ns = 1; break;
-@@ -55899,9 +55978,11 @@
-  * for argument a, or -1 to stage it with a move. Two arguments never share a
-  * producer.
-  */
+@@ -54498,9 +54560,11 @@ static int regvm_arg_retarget(const JSRegIR *ir, int v,
+    the call's n_all operands; the arguments are argc entries from arg_off.
+    defs[a] is the producer to retarget, or -1. No two arguments share a
+    producer. */
 +static int regvm_stack_has(const int *stack, int n, int v);
 +
  static void regvm_stage_args(const JSRegIR *ir, const int *pop, int n_all,
@@ -234,17 +251,13 @@ What this does:
  {
      int a, b;
      for (a = 0; a < argc; a++) {
-@@ -55909,6 +55990,17 @@
+@@ -54508,6 +54572,13 @@ static void regvm_stage_args(const JSRegIR *ir, const int *pop, int n_all,
          defs[a] = regvm_arg_retarget(ir, v, home_of, n_values);
          if (defs[a] < 0)
              continue;
-+        /*
-+         * The IR is emitted in program order, so regvm_arg_retarget sees only
-+         * the readers before this call. A value still on the operand stack
-+         * under the call's operands outlives it and is read later -- the value
-+         * of `o.#p = v` or `x.#p += v`, whose setter call takes v while the
-+         * expression keeps it -- so it must keep its own register.
-+         */
++        /* regvm_arg_retarget sees only readers before this call. A value still
++           on the operand stack under the call's operands is read later (the
++           value of `o.#p = v`), so it keeps its own register. */
 +        if (regvm_stack_has(pop - below, below, v)) {
 +            defs[a] = -1;
 +            continue;
@@ -252,7 +265,7 @@ What this does:
          for (b = 0; b < n_all; b++)
              if (pop[b] == v)
                  n++;
-@@ -56324,6 +56416,8 @@
+@@ -54878,6 +54949,8 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          ADD(ROP_move, REGVM_WIN(2), pop[-1]);
          ADD(ROP_move, REGVM_WIN(3), pop[0]);
          ADD(ROP_iter_value_done, REGVM_WIN(0));
@@ -261,7 +274,7 @@ What this does:
          ADD(ROP_move, dst + 0, REGVM_WIN(3));
          ADD(ROP_move, dst + 1, REGVM_WIN(4));
          return 0;
-@@ -56360,7 +56454,7 @@
+@@ -54911,7 +54984,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          int defs[256], a;
          if (argc > 255)
              return -1;
@@ -270,7 +283,7 @@ What this does:
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
                  JSRegInsn *d = &ir->insns[defs[a]];
-@@ -56376,7 +56470,7 @@
+@@ -54927,7 +55000,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          int argc = get_u16(bc + pos + 1), defs[256], a;
          if (argc > 255)
              return -1;
@@ -279,7 +292,7 @@ What this does:
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
                  JSRegInsn *d = &ir->insns[defs[a]];
-@@ -56392,7 +56486,7 @@
+@@ -54943,7 +55016,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          int argc = get_u16(bc + pos + 1), defs[256], a;
          if (argc > 255)
              return -1;
@@ -288,7 +301,7 @@ What this does:
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
                  JSRegInsn *d = &ir->insns[defs[a]];
-@@ -56408,7 +56502,7 @@
+@@ -54959,7 +55032,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          int argc = get_u16(bc + pos + 1), defs[256], a;
          if (argc > 255)
              return -1;
@@ -297,7 +310,7 @@ What this does:
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
                  JSRegInsn *d = &ir->insns[defs[a]];
-@@ -56424,7 +56518,7 @@
+@@ -54975,7 +55048,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          int argc = get_u16(bc + pos + 1), defs[256], a;
          if (argc > 255)
              return -1;
@@ -306,7 +319,7 @@ What this does:
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
                  JSRegInsn *d = &ir->insns[defs[a]];
-@@ -56440,7 +56534,7 @@
+@@ -54991,7 +55064,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          int argc = get_u16(bc + pos + 1), defs[256], a;
          if (argc > 255)
              return -1;
@@ -315,7 +328,7 @@ What this does:
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
                  JSRegInsn *d = &ir->insns[defs[a]];
-@@ -56588,8 +56682,13 @@
+@@ -55122,8 +55195,13 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          ADD(ROP_finally_enter, dst, pos + 1 + (int32_t)get_u32(bc + pos + 1)); return 0;
      case OP_ret:
          ADD0(ROP_finally_leave); return 0;
@@ -329,9 +342,9 @@ What this does:
 +        ADD(ROP_nip_catch, dst, pop[np - 1]); return 0;
 +    }
  
-     /*
-      * for-of. The register side of it is in place -- the iterator and next
-@@ -58947,7 +59046,7 @@
+     /* for-of: the iterator and next method go through the window, and the
+        activation records them so an exception leaving the frame closes them. */
+@@ -57233,7 +57311,7 @@ static int regvm_tight_store_def(const JSFunctionDef *fd, const uint8_t *bc,
      k = regvm_slot_operand(fd, bc, store_pos, slot_ok, ok_index, &role);
      if (k < 0 || (role != REGVM_SLOT_WRITE && role != REGVM_SLOT_SET))
          return -1;
@@ -340,7 +353,7 @@ What this does:
      if (ns != 1 || regvm_op_kind[bc[dpos]] == REG_LOWER_ELIDED ||
          regvm_perm_of(bc[dpos], 0) >= 0)
          return -1;
-@@ -59204,7 +59303,7 @@
+@@ -57472,7 +57550,7 @@ static int regvm_sim_step(const JSFunctionDef *fd, const uint8_t *bc, int pos,
      ev->split_v = ev->split_src = -1;
      ev->copy_v = ev->copy_src = -1;
      ev->home_k = -1;
@@ -349,7 +362,7 @@ What this does:
      if (d < np || np > (int)countof(ev->pop) || ns > (int)countof(ev->pop))
          return -1;
      ev->np = np;
-@@ -61886,7 +61985,7 @@
+@@ -59929,7 +60007,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              d = in_depth[b];
              for (pos = bstart[b]; pos < bstart[b + 1];
                   pos += short_opcode_info(bc[pos]).size) {
@@ -358,7 +371,7 @@ What this does:
                  if (d < np) {
                      /* the declared stack shape does not balance here */
                      goto deferred;
-@@ -62245,7 +62344,7 @@
+@@ -60250,7 +60328,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      slot = get_u16(bc + pos + 1);
                      is_uninit = 1;
                  }
@@ -367,7 +380,7 @@ What this does:
                  if ((is_uninit || is_kill) && slot >= 0 && slot < fd->var_count) {
                      sval[slot] = -1;    /* the slot no longer holds the cached value */
                      fwd_used[slot] = 0;
-@@ -62378,7 +62477,7 @@
+@@ -60374,7 +60452,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              continue;
          for (pos = bstart[b]; pos < bstart[b + 1];
               pos += short_opcode_info(bc[pos]).size) {
@@ -376,7 +389,7 @@ What this does:
              if (ns > 0 && push_base[pos] < 0) {
                  push_base[pos] = n_pushes;
                  n_pushes += ns;
-@@ -62515,7 +62614,7 @@
+@@ -60501,7 +60579,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              d2 = in_depth[b];
              for (pos2 = bstart[b]; pos2 < bstart[b + 1];
                   pos2 += short_opcode_info(bc[pos2]).size) {
@@ -385,7 +398,7 @@ What this does:
                  if (d2 < np2)
                      break;
                  d2 += ns2 - np2;
-@@ -63193,7 +63292,7 @@
+@@ -61126,7 +61204,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  continue;
              for (pos = bstart[b]; pos < bstart[b + 1];
                   pos += short_opcode_info(bc[pos]).size) {
@@ -394,7 +407,7 @@ What this does:
                  if (ns <= 0)
                      continue;
                  cls = regvm_value_class(bc, pos);
-@@ -64119,7 +64218,7 @@
+@@ -61987,7 +62065,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              continue;
          for (pos = bstart[b]; pos < bstart[b + 1];
               pos += short_opcode_info(bc[pos]).size) {

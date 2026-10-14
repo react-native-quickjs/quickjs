@@ -1,51 +1,28 @@
-From: quickjs-ng bundle work
-Subject: Register VM: debug assertion for the argv invariant (0187)
+Subject: Debug assertion for the argv invariant
 
 What this does
-  Adds a debug-only check of the invariant P6 relies on, directly where it
-  matters. In JS_CallInternal, when a C caller's argv is used in place -- the
-  caller passed JS_CALL_FLAG_COPY_ARGV and nothing was copied
-  (arg_allocated_size == 0) -- the first min(argc, b->arg_count) arguments
-  (capped at 16; the check is skipped above that) are snapshotted on entry and
-  memcmp'd on the way out, on both the register-ASM and register-interpreter
-  return paths. Under #ifndef NDEBUG plus QJS_REGVM.
+  Debug assertion for the argv invariant.
 
 Why we need it
-  The 0186 cross-check (stack argv_safe => register argv_safe, plus
-  args_captured equality) can only catch the register scan being stricter than
-  the stack scan, which costs speed. It cannot catch the register scan being
-  wrong -- missing an opcode that writes an argument slot -- and that is the
-  case that clobbers a C caller's array and corrupts reference counts.
-  argv-clobber.c covers only the ten shapes in it. This asserts the invariant
-  itself, on every call test262 and the differential suite make.
+  It cannot catch the scan missing an argument-writing opcode, which is the memory-safety case, and argv-clobber.c covers only ten shapes.
 
 What it adds
-  quickjs.c
-      the argv_snapshot[16] / argv_snapshot_n locals, the entry snapshot, and
-      the memcmp assertions before the two register return paths in
-      JS_CallInternal.
+  `JS_CallInternal` snapshots the first `min(argc, arg_count)` arguments when a C caller's argv is used in place, and `memcmp`s them before both register return paths (debug only).
 
-  Run once with a debug build: test262 50/81192, differential suite 400/0/0,
-  zero assertions. A failure means an opcode is missing from
-  regvm_scan_arg_flags -- add the opcode, do not weaken the assert.
-
-  Gates (release): box2d 546.1008391043414 (source/eager/lazy); test262
-  50/81192 no leaks; 13 Octane rows clean; argv-clobber source/eager/lazy all
-  ok.
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index 7b8ee72..a2cb97f 100644
+index 39caa57..c1d442c 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -35963,6 +35963,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -34481,6 +34481,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      JSVarRef **var_refs;
      size_t alloca_size;
  
 +#if QJS_REGVM && !defined(NDEBUG)
-+    /* P6 invariant: when a C caller's argv is used in place, the callee must
-+       not write any argument slot. Snapshot the arguments on entry and check
-+       them again before returning. See the plan's "argv_safe cross-check
-+       direction" decision. */
++    /* When a C caller's argv is used in place the callee must not write any
++       argument slot: snapshot the arguments on entry and check them before
++       returning. */
 +    JSValue argv_snapshot[16];
 +    int argv_snapshot_n = 0;
 +#endif
@@ -53,14 +30,13 @@ index 7b8ee72..a2cb97f 100644
  #if QJS_REGVM
      /* Set on the generator-rejection resume path and handed to the register
         interpreter, which unwinds from there. */
-@@ -36083,6 +36092,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -34596,6 +34604,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          arg_allocated_size = 0;
      }
  
 +#if QJS_REGVM && !defined(NDEBUG)
-+    /* P6: nothing was copied and the callee is not argument-captured, so a C
-+       caller's argv is used in place. Snapshot it; the return path asserts the
-+       callee wrote nothing into it. */
++    /* Nothing was copied and the callee is not argument-captured, so a C
++       caller's argv is used in place. Snapshot it for the return-path check. */
 +    if ((flags & JS_CALL_FLAG_COPY_ARGV) && arg_allocated_size == 0) {
 +        int n = min_int(argc, b->arg_count);
 +        if (n > 0 && n <= (int)(sizeof(argv_snapshot) / sizeof(argv_snapshot[0]))) {
@@ -73,7 +49,7 @@ index 7b8ee72..a2cb97f 100644
  #if QJS_REGVM
      /* The register frame's temporary area is the allocator's register count,
         not the stack VM's maximum depth. */
-@@ -36195,12 +36217,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -34702,12 +34722,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          ast.resume_marker = NULL;
          ast.resume_pending = 0;
          ast.resume_rpc = NULL;

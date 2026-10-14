@@ -1,73 +1,54 @@
-Subject: register VM: extend the in-place string accumulator to chained concatenation
+Subject: Extend the in-place string accumulator to chained concatenation
 
 What this does
-  A `'a' + x + 'b'` chain allocates two strings in the register VM where the
-  stack VM allocates one. Filling a 3-part leaf string in Octane's splay (`'String
-  for key ' + tag + ' in leaf node'`) allocated 7.80M strings over the run versus
-  3.96M in the stack VM; the same doubling shows on any chained concatenation.
-
-  The register VM appended in place only when the add's destination register was
-  also its left operand (the `s += x` shape that patch 0178 covers). For a chain,
-  the intermediate result is a separate register, the add's right operand is a
-  constant, and that constant reaches the interpreter through the non-pool branch
-  of `regvm_t_binary_cpool` / `L_ROP_binary_cpool`, which had no accumulator call
-  at all. Even where the accumulator was tried, the intermediate had no headroom
-  to extend into because the register VM never set the stack VM's scatter hint,
-  so `JS_ConcatString1` allocated the result at its exact length.
-
-  Sets `js_scat_hint` in the register add before the engine call, and gives the
-  non-pool constant branches of both `binary_cpool` handlers the same
-  `regvm_accum_append` call the pool branch already had. A chain now allocates its
-  first result once and extends it in place.
+  Extend the in-place string accumulator to chained concatenation.
 
 Why we need it
-  R7 of `.local/regvm-fix-plan.md`. The register VM loses to the stack VM on
-  splay, and the plan asked first whether the register VM frees more objects than
-  the stack VM. It does not: object, array and bytecode allocation and free
-  counts are identical (class[1] 8,255,858 objects, class[2] 3,840,008 arrays,
-  free_object 12,097,459 on both). The one producer that does differ is the
-  string allocator, and the extra strings are also what drove the deferred
-  reference-counting parking and reconcile traffic that made splay's teardown
-  look expensive (js_drc_zero 36.7M calls vs 0.7M). Fixing the producer removes
-  both costs at once.
+  A `'a' + x + 'b'` chain allocated two strings where the stack VM allocates one: the accumulator only fired when destination == left operand, the constant right operand of a chain reached the interpreter through `binary_cpool`'s non-pool branch which had no accumulator call, and no scatter hint gave the intermediate headroom to extend into.
 
 What it adds
-  js_regvm_binary now sets the scatter hint before an ADD.
-  regvm_t_binary_cpool and L_ROP_binary_cpool now call regvm_accum_append on
-  their non-pool constant branch, exactly as their pool branch does.
-  quickjs-regvm-step.inc regenerated to match.
+  Sets `js_scat_hint` in `js_regvm_binary`'s ADD path and gives the non-pool constant branches of threaded `regvm_t_binary_cpool` and monolith `L_ROP_binary_cpool` the same `regvm_accum_append` call the pool branch has; step helpers regenerated.
 
 Needs a bytecode version bump
-  No. The register opcodes are unchanged; only the runtime add path differs.
-
-Notes
-  - The accumulator refuses a constant left operand and a string that any slot
-    owns, so the first concatenation of a chain still allocates once and only a
-    register-only intermediate is extended. `var t = 'x' + tag; var r = t + 'y'`
-    still leaves `t` alone.
-  - Measured on the deterministic corpus (instructions:u, same compiler, A/B):
-    splay -3.66%, cycles -2.8%; every other row within +0.28% (pdfjs) and
-    -0.06%/+0.06% (noise). splay's instruction ratio to the stack VM goes
-    1.108 -> 1.068 and its cycle ratio 1.042 -> 1.015.
-  - box2d checksum 546.1008391043414 on threaded, monolith and STEPCHECK builds;
-    differential suite 400/0/0.
-
+  No.
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index 3b960ca..1fdd073 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -487,6 +487,18 @@ static uint8_t *REGVM_CC regvm_s_ROP_binary_cpool(uint8_t *ip, JSValue *fr, JSRe
+                     JSValue cst = JS_AtomToValue(ctx, idx);
+                     if (JS_IsException(cst))
+                         goto exception;
++                    if (sub == REG_BIN_ADD) {
++                        int _ar = regvm_accum_append(ctx, b, regs, rf->arg_buf,
++                                                     rf->argc, d, a, cst);
++                        if (_ar > 0) {
++                            JS_FreeValue(ctx, cst);
++                            REGVM_NEXT();
++                        }
++                        if (_ar < 0) {
++                            JS_FreeValue(ctx, cst);
++                            goto exception;
++                        }
++                    }
+                     if (!regvm_num_fast(sub, regs[a], cst, &out) &&
+                         js_regvm_binary(ctx, sub, regs[a], cst, &out)) {
+                         JS_FreeValue(ctx, cst);
 diff --git a/quickjs.c b/quickjs.c
+index c1d442c..205616a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23994,6 +23994,11 @@
+@@ -23621,6 +23621,9 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
      ops[1] = js_dup(b);
      switch (subop) {
      case REG_BIN_ADD:
-+        /* Mirror the stack VM's scatter hint: a concatenation result that is
-+           itself the left operand of the next add should carry headroom so that
-+           add can extend it in place (JS_ConcatString1's slack). Without this
-+           every chained concat allocates a fresh string. */
++        /* As in the stack VM: a concatenation result that is the left operand
++           of the next add gets headroom so that add can extend it in place. */
 +        js_scat_hint = 1;
          if (js_add_slow(ctx, ops + 2))
              goto fail;
          break;
-@@ -26967,6 +26972,18 @@
+@@ -26264,6 +26267,18 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
          JSValue cst = JS_AtomToValue(ctx, idx);
          if (JS_IsException(cst))
              T_FAIL();
@@ -86,35 +67,13 @@ diff --git a/quickjs.c b/quickjs.c
          if (!regvm_num_fast(sub, FR(a), cst, &out) &&
              js_regvm_binary(ctx, sub, FR(a), cst, &out)) {
              JS_FreeValue(ctx, cst);
-@@ -33165,6 +33182,18 @@
+@@ -31962,6 +31977,18 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      JSValue cst = JS_AtomToValue(ctx, idx);
                      if (JS_IsException(cst))
                          goto exception;
 +                    if (sub == REG_BIN_ADD) {
 +                        int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
 +                                                     argc, d, a, cst);
-+                        if (_ar > 0) {
-+                            JS_FreeValue(ctx, cst);
-+                            REGVM_NEXT();
-+                        }
-+                        if (_ar < 0) {
-+                            JS_FreeValue(ctx, cst);
-+                            goto exception;
-+                        }
-+                    }
-                     if (!regvm_num_fast(sub, regs[a], cst, &out) &&
-                         js_regvm_binary(ctx, sub, regs[a], cst, &out)) {
-                         JS_FreeValue(ctx, cst);
-diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
---- a/quickjs-regvm-step.inc
-+++ b/quickjs-regvm-step.inc
-@@ -502,6 +502,18 @@
-                     JSValue cst = JS_AtomToValue(ctx, idx);
-                     if (JS_IsException(cst))
-                         goto exception;
-+                    if (sub == REG_BIN_ADD) {
-+                        int _ar = regvm_accum_append(ctx, b, regs, rf->arg_buf,
-+                                                     rf->argc, d, a, cst);
 +                        if (_ar > 0) {
 +                            JS_FreeValue(ctx, cst);
 +                            REGVM_NEXT();

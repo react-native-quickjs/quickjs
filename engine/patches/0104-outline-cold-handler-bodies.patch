@@ -1,65 +1,22 @@
-Subject: Outline the cold interpreter handler bodies out of JS_CallInternal
+Subject: Moves 25 cold handler bodies out of the interpreter's dispatch body
 
 What this does
-  Gives 25 cold opcode handler bodies out-of-line definitions and leaves a call
-  in each interpreter case.
+  Moves 25 cold handler bodies out of the interpreter's dispatch body.
 
 Why we need it
-  Each of these bodies declared its own temporaries inside JS_CallInternal, so
-  every one of them enlarged that function's stack frame and its register
-  pressure whether or not it ever ran. Moving them out takes the cost off the
-  interpreter's frame entirely.
+  Each inline case declared its own temporaries inside JS_CallInternal, so every one of them enlarged that function's frame and its register pressure on every interpreted call whether or not it ever ran. Outlining them takes 29.6% off the symbol, 28.6% off the frame, and 38% off accesses to the interpreter's own spill area.
 
 What it adds
-  A JSColdHandlerResult return type, a JS_COLD_HANDLER_FN definition prefix, and
-  25 js_cold_* functions. Each dispatch case keeps one call plus a constant pc
-  advance of the opcode's own size.
-
-
-    JS_CallInternal symbol      55,148 -> 38,828 bytes   (-29.6%)
-    stack frame                   896 ->    640 bytes    (-28.6%)
-    accesses to its spill area    805 ->    496          (-38%)
-    recursive call sites inside    11 ->      7
-
-    empty JS->JS call           295.1 ->  277.1 instructions  (-6.1%)
-    structure-matched call      241.1 ->  230.1 instructions  (-4.6%)
-    arity 1 / 4 / 8             -6.4% / -7.0% / -7.6%
-    closures                    -6.1% / -6.4%
-    nested depth 2 / 4          -4.6% / -3.8%
-
-    Octane, fixed work, 13 rows: every row retires fewer instructions,
-    geomean -4.77%.  (Retired instructions, not a speed claim: the provisional
-    score improvement is +2.4% and cycles vary by row.)
-
-    RN/Metro workload: startup unchanged (-0.15%), application work -2.88%.
-
-  iterator_call and iterator_get_value_done are deliberately absent: they are
-  emitted only on the for-await path, which this engine does not currently
-  compile, so no test can reach them and they contribute nothing measurable.
-
-How the bodies were produced, and what that does and does not establish
-  Each body is a transcription of the case it replaces with two mechanical
-  substitutions: BREAK becomes a normal return, goto exception becomes an
-  exception return. Cases that take a non-constant pc, take the address of sp or
-  pc, define a label another handler jumps into, or fall through from another
-  label were not eligible and are not outlined; that screening was done by a
-  script, and a script is not a semantic argument.
-
-  The transcription is checked by behaviour instead: a focused probe exercising
-  every outlined handler, 31 single-construct tests compared against the control
-  binary's output and exit status, reach counters proving each handler executes,
-  a mutation control showing the probe detects a wrong value from an outlined
-  body, and a CTest run whose failure set is identical to the control's.
+  25 `static no_inline __attribute__((cold))` helpers; every dispatch case becomes a call plus a constant `pc` advance. `sp` is passed and returned by value, `pc` is never returned, and the exception flag rides in bit 0 of the returned pointer.
 
 Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21052,6 +21052,529 @@
- static no_inline void js_perm4(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = tmp; }
+@@ -20940,6 +20940,529 @@ static no_inline void js_perm4(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[
  static no_inline void js_perm5(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = sp[-5]; sp[-5] = tmp; }
  static no_inline void js_swap2(JSValue *sp) { JSValue tmp1 = sp[-4], tmp2 = sp[-3]; sp[-4] = sp[-2]; sp[-3] = sp[-1]; sp[-2] = tmp1; sp[-1] = tmp2; }
-+
+ 
 +/* Cold opcode handlers, defined out of line.
 + *
 + * sp is passed and returned by value. pc is passed by value and never returned:
@@ -582,10 +539,11 @@ Needs a bytecode version bump
 +    }
 +    return JS_COLD_HANDLER_OK(sp);
 +}
- 
++
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -21507,34 +22030,10 @@
+                                int argc, JSValueConst *argv, int flags)
+@@ -21394,34 +21917,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              BREAK;
          CASE(OP_object_fill):
              {
@@ -623,7 +581,7 @@ Needs a bytecode version bump
              }
              BREAK;
          CASE(OP_dup):
-@@ -21828,11 +22327,11 @@
+@@ -21715,11 +22214,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              }
              BREAK;
          CASE(OP_add_brand):
@@ -640,7 +598,7 @@ Needs a bytecode version bump
              BREAK;
  
          CASE(OP_throw):
-@@ -21956,15 +22455,9 @@
+@@ -21843,15 +22342,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_import):
              {
@@ -659,7 +617,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -22005,13 +22498,10 @@
+@@ -21892,13 +22385,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_check_define_var):
              {
@@ -676,7 +634,7 @@ Needs a bytecode version bump
              }
              BREAK;
          CASE(OP_define_var):
-@@ -22442,13 +22932,10 @@
+@@ -22329,13 +22819,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              BREAK;
          CASE(OP_make_var_ref):
              {
@@ -693,7 +651,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -22610,12 +23097,10 @@
+@@ -22497,12 +22984,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              BREAK;
          CASE(OP_for_of_next):
              {
@@ -709,7 +667,7 @@ Needs a bytecode version bump
              }
              BREAK;
          CASE(OP_for_await_of_start):
-@@ -22676,43 +23161,10 @@
+@@ -22563,43 +23048,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_using_dispose):
              {
@@ -756,7 +714,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -22744,46 +23196,26 @@
+@@ -22631,46 +23083,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_using_dispose_merge):
              {
@@ -812,7 +770,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -22851,53 +23283,10 @@
+@@ -22738,53 +23170,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_get_field):
              {
@@ -869,7 +827,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -22950,41 +23339,10 @@
+@@ -22837,41 +23226,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_put_field):
              {
@@ -914,7 +872,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -23423,39 +23781,25 @@
+@@ -23310,39 +23668,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_get_private_field):
              {
@@ -963,11 +921,18 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -23527,78 +23871,36 @@
+@@ -23414,78 +23758,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              js_method_set_home_object(ctx, sp[-1], sp[-2]);
              BREAK;
          CASE(OP_define_method):
--        CASE(OP_define_method_computed):
++            {
++                JSColdHandlerResult r = js_cold_define_method_computed(ctx, opcode, pc, sp);
++                sp = JS_COLD_HANDLER_SP(r);
++                pc += 5;
++                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
++            }
++            BREAK;
+         CASE(OP_define_method_computed):
              {
 -                JSValue getter, setter, value;
 -                JSValue obj;
@@ -1025,18 +990,10 @@ Needs a bytecode version bump
 -                    goto exception;
 +                JSColdHandlerResult r = js_cold_define_method_computed(ctx, opcode, pc, sp);
 +                sp = JS_COLD_HANDLER_SP(r);
-+                pc += 5;
++                pc += 1;
 +                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
              }
              BREAK;
-+        CASE(OP_define_method_computed):
-+            {
-+                JSColdHandlerResult r = js_cold_define_method_computed(ctx, opcode, pc, sp);
-+                sp = JS_COLD_HANDLER_SP(r);
-+                pc += 1;
-+                if (unlikely(JS_COLD_HANDLER_IS_EXCEPTION(r))) goto exception;
-+            }
-+            BREAK;
  
          CASE(OP_define_class):
 +            {
@@ -1064,7 +1021,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -23791,21 +24093,9 @@
+@@ -23678,21 +23980,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_get_super_value):
              {
@@ -1089,7 +1046,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -23932,55 +24222,17 @@
+@@ -23819,55 +24109,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_put_ref_value):
              {
@@ -1151,7 +1108,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -23995,12 +24247,11 @@
+@@ -23882,12 +24134,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              }
              BREAK;
  
@@ -1168,7 +1125,7 @@ Needs a bytecode version bump
              }
              BREAK;
  
-@@ -24598,15 +24849,18 @@
+@@ -24485,15 +24736,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
  
          CASE(OP_in):
@@ -1194,7 +1151,7 @@ Needs a bytecode version bump
              BREAK;
          CASE(OP_instanceof):
              sf->cur_pc = pc;
-@@ -24626,24 +24880,18 @@
+@@ -24513,24 +24767,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              }
              BREAK;
          CASE(OP_delete):

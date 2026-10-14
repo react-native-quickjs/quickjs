@@ -1,8 +1,47 @@
+Subject: Keep the frame's position across a fused property read
+
+What this does
+  Keep the frame's position across a fused property read.
+
+Why we need it
+  `ROP_get_arg_field`/`ROP_get_local_field` (the fused `get_loc(n) get_field` pair) call `JS_GetProperty`, which can run a getter, but they never published the frame's position the way `ROP_get_field` does. A getter that throws therefore produced a backtrace frame with `(missing)` where the stack build named the line of the read -- seen whenever the receiver load is fused, which the baseline tier does for every property read (the `readX` frame of `accessor-throw-stack.js`).
+
+What it adds
+  The monolith threaded labels, the `regvm_exec_one` arms and the generated threaded twins all capture `i_start` before the slow read and call `REGVM_CAPTURE_IP_MONO`; `quickjs-regvm-step.inc` is regenerated.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index a1e3023..20cdc6e 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -2560,6 +2560,10 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
++                /* A slow read may run a getter that throws; the fused receiver
++                   read has no separate get_field to capture this frame's line.
++                   */
++                REGVM_CAPTURE_IP_MONO(i_start);
+                 if (site == REG_IC_NONE)
+                     val = JS_GetProperty(ctx, recv, atom);
+                 else
+@@ -2597,6 +2601,10 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
++                /* A slow read may run a getter that throws; the fused receiver
++                   read has no separate get_field to capture this frame's line.
++                   */
++                REGVM_CAPTURE_IP_MONO(i_start);
+                 if (site == REG_IC_NONE)
+                     val = JS_GetProperty(ctx, recv, atom);
+                 else
 diff --git a/quickjs.c b/quickjs.c
-index 88357ea..e127fda 100644
+index c938cd0..e2866a1 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -33072,6 +33072,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -31722,6 +31722,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_get_local_field_1:
              L_ROP_get_local_field_2:
              L_ROP_get_local_field_3: {
@@ -10,18 +49,18 @@ index 88357ea..e127fda 100644
                  int d = RD_REG();
                  int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
                  JSAtom atom = RD_U32();
-@@ -33082,6 +33083,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -31732,6 +31733,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      SET_REG_B(d, val);
                      REGVM_NEXT();
                  }
-+                /* A slow read may invoke a getter, and a throw from one must name
-+                   this frame's line: the fused receiver read has no separate
-+                   get_field to carry the capture. */
++                /* A slow read may run a getter that throws; the fused receiver
++                   read has no separate get_field to capture this frame's line.
++                   */
 +                REGVM_CAPTURE_IP_MONO(i_start);
                  if (site == REG_IC_NONE)
                      val = JS_GetProperty(ctx, recv, atom);
                  else
-@@ -33093,6 +33098,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -31743,6 +31748,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              }
              L_ROP_get_local_field:
              L_ROP_get_arg_field: {
@@ -29,18 +68,18 @@ index 88357ea..e127fda 100644
                  int d = RD_REG();
                  int slot = RD_U16();
                  JSAtom atom = RD_U32();
-@@ -33104,6 +33110,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -31754,6 +31760,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      SET_REG_B(d, val);
                      REGVM_NEXT();
                  }
-+                /* A slow read may invoke a getter, and a throw from one must name
-+                   this frame's line: the fused receiver read has no separate
-+                   get_field to carry the capture. */
++                /* A slow read may run a getter that throws; the fused receiver
++                   read has no separate get_field to capture this frame's line.
++                   */
 +                REGVM_CAPTURE_IP_MONO(i_start);
                  if (site == REG_IC_NONE)
                      val = JS_GetProperty(ctx, recv, atom);
                  else
-@@ -36303,6 +36313,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -34627,6 +34637,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
          case ROP_get_local_field_2:
          case ROP_get_local_field_3:
       {
@@ -48,18 +87,18 @@ index 88357ea..e127fda 100644
                      int d = RD_REG();
                      int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
                      JSAtom atom = RD_U32();
-@@ -36313,6 +36324,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -34637,6 +34648,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                          SET_REG_B(d, val);
                          REGVM_NEXT();
                      }
-+                    /* A slow read may invoke a getter, and a throw from one must
-+                       name this frame's line: the fused receiver read has no
-+                       separate get_field to carry the capture. */
++                    /* A slow read may run a getter that throws; the fused
++                       receiver read has no separate get_field to capture this
++                       frame's line. */
 +                    REGVM_CAPTURE_IP_MONO(i_start);
                      if (site == REG_IC_NONE)
                          val = JS_GetProperty(ctx, recv, atom);
                      else
-@@ -36326,6 +36341,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -34650,6 +34665,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
          case ROP_get_arg_field:
          case ROP_get_local_field:
       {
@@ -67,40 +106,14 @@ index 88357ea..e127fda 100644
                      int d = RD_REG();
                      int slot = RD_U16();
                      JSAtom atom = RD_U32();
-@@ -36337,6 +36353,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -34661,6 +34677,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                          SET_REG_B(d, val);
                          REGVM_NEXT();
                      }
-+                    /* A slow read may invoke a getter, and a throw from one must
-+                       name this frame's line: the fused receiver read has no
-+                       separate get_field to carry the capture. */
++                    /* A slow read may run a getter that throws; the fused
++                       receiver read has no separate get_field to capture this
++                       frame's line. */
 +                    REGVM_CAPTURE_IP_MONO(i_start);
                      if (site == REG_IC_NONE)
                          val = JS_GetProperty(ctx, recv, atom);
                      else
-diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
-index 2e75159..aa88684 100644
---- a/quickjs-regvm-step.inc
-+++ b/quickjs-regvm-step.inc
-@@ -2623,6 +2623,10 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
-                     SET_REG_B(d, val);
-                     REGVM_NEXT();
-                 }
-+                /* A slow read may invoke a getter, and a throw from one must name
-+                   this frame's line: the fused receiver read has no separate
-+                   get_field to carry the capture. */
-+                REGVM_CAPTURE_IP_MONO(i_start);
-                 if (site == REG_IC_NONE)
-                     val = JS_GetProperty(ctx, recv, atom);
-                 else
-@@ -2660,6 +2664,10 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
-                     SET_REG_B(d, val);
-                     REGVM_NEXT();
-                 }
-+                /* A slow read may invoke a getter, and a throw from one must name
-+                   this frame's line: the fused receiver read has no separate
-+                   get_field to carry the capture. */
-+                REGVM_CAPTURE_IP_MONO(i_start);
-                 if (site == REG_IC_NONE)
-                     val = JS_GetProperty(ctx, recv, atom);
-                 else

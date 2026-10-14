@@ -1,6 +1,19 @@
+Subject: Inlines the compare-and-branch and equality fast paths so the generic compare helper is reached only when a coercion is unavoidable
+
+What this does
+  Inlines the compare-and-branch and equality fast paths so the generic compare helper is reached only when a coercion is unavoidable.
+
+Why we need it
+  `instanceof`, loose `==` and relational-on-objects - because the twelve fused compare-and-branch handlers inlined only both-int and both-float64.
+
+What it adds
+  `regvm_strict_eq`, `regvm_loose_eq`, `regvm_int_bit_truthy` (AND/OR/XOR/SHL/SAR/SHR zero test), `regvm_instanceof_fast` (ordinary `instanceof` when `b`'s prototype is `Function.prototype` and it has no `Symbol.hasInstance`), and a macro arm order of both-int, float, mixed int/double, strict-eq, loose-eq, instanceof, bit; `regvm_cmp_take` gains a strict-eq fast path and EQ/NEQ on numbers in `regvm_double_cmp`/`regvm_num_fast`; `QJS_REGVM_COUNT` sub/tag/pair histograms report what still reaches the helper.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22067,6 +22067,9 @@
+@@ -21889,6 +21889,9 @@ static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue
          case REG_BIN_LTE: *out = js_bool(d1 <= d2); return 1;
          case REG_BIN_GT: *out = js_bool(d1 > d2); return 1;
          case REG_BIN_GTE: *out = js_bool(d1 >= d2); return 1;
@@ -10,7 +23,7 @@
          default: return 0;
          }
      }
-@@ -22622,13 +22625,149 @@
+@@ -22361,12 +22364,129 @@ static inline int regvm_double_cmp(int sub, double a, double b)
      case REG_BIN_LTE: return a <= b;
      case REG_BIN_GT: return a > b;
      case REG_BIN_GTE: return a >= b;
@@ -23,14 +36,9 @@
 +    }
 +}
 +
-+/*
-+ * The strict-equality case of a fused compare. `===` is a tag test before it is
-+ * a value test: equal tags compare their payloads, and different tags are
-+ * unequal except for the int/double mix, because Number spans both. This keeps
-+ * the default-argument guards -- `if (m === undefined) m = 0`, which dominate
-+ * box2d's compare-and-branch calls -- out of the generic comparison. -1 means
-+ * "not decidable here": strings and big ints compare by value, not identity.
-+ */
++/* The strict-equality case of a fused compare: equal tags compare payloads;
++   different tags are unequal except the int/double mix. -1 means "not
++   decidable here": strings and big ints compare by value. */
 +static inline int regvm_strict_eq(int sub, JSValue a, JSValue b)
 +{
 +    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
@@ -67,15 +75,9 @@
 +    return eq;
 +}
 +
-+/*
-+ * `==`/`!=` when the two operands already have the same type: same-type objects
-+ * compare by identity and the immediates by value, and the int/double mix by
-+ * numeric equality. The differing-type cases that need no coercion are decided
-+ * here too: `null`/`undefined` equal each other, and an object equals neither.
-+ * A string compared with anything coerces, and an object compared with a
-+ * primitive runs `ToPrimitive`, so those stay with the generic path. -1 means
-+ * "not decidable here".
-+ */
++/* `==`/`!=` without coercion: same-type operands, the int/double mix,
++   `null`/`undefined` with each other, and an object against either. A string
++   or an object against a primitive coerces, so those return -1. */
 +static inline int regvm_loose_eq(int sub, JSValue a, JSValue b)
 +{
 +    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
@@ -117,12 +119,9 @@
 +    return (sub == REG_BIN_NEQ) ? !eq : eq;
 +}
 +
-+/*
-+ * The bitwise and shift operations of a fused compare. The destination holds an
-+ * int32 -- `>>>` can leave the int32 range, but its zero test cannot -- and the
-+ * branch tests the result's truthiness, so only the zero test is needed. -1
-+ * means "not a bitwise pair", which is every other sub-operation.
-+ */
++/* The bitwise and shift operations of a fused compare. The branch only tests
++   the result for zero, which stays exact for `>>>`. -1 for any other
++   sub-operation. */
 +static inline int regvm_int_bit_truthy(int sub, int32_t a, int32_t b)
 +{
 +    switch (sub) {
@@ -136,13 +135,8 @@
      }
  }
  
- /*
-+ * `x instanceof C` where C is a plain class: `JS_IsInstanceOf` would look up
-+ * @@hasInstance and find the builtin, whose body is the ordinary prototype
-+ * walk, so the walk is the whole operation. Recognising that here skips the
-+ * generic binary path's operand duplicates and dispatch; anything else falls
-+ * back to it. -1 means "not decidable here".
-+ */
++/* `x instanceof C` for a plain class: @@hasInstance resolves to the builtin,
++   whose body is the ordinary prototype walk. -1 means "not decidable here". */
 +static inline int regvm_instanceof_fast(JSContext *ctx, JSValue a, JSValue b)
 +{
 +    JSObject *p;
@@ -158,13 +152,12 @@
 +    return -1;
 +}
 +
-+/*
-  * Evaluate the operation a fused compare-and-branch carries and say whether the
-  * branch is taken. Exactly what the separate `ROP_binary*` + `ROP_branch_if*`
-  * pair did -- compute, then test the result's truthiness -- so any sub-operation
-@@ -22643,14 +22782,47 @@
-  * Not inlined: it is the non-integer path, and its callers' hot path is the
-  * integer comparison they do themselves.
+ /*
+  * Evaluate a fused compare-and-branch's operation and test the result's
+  * truthiness, as the separate `ROP_binary*` + `ROP_branch_if*` pair would.
+@@ -22374,14 +22494,46 @@ static inline int regvm_double_cmp(int sub, double a, double b)
+  * rather than written through a pointer so the caller's flag stays in a
+  * register. Not inlined: it is the non-integer path.
   */
 +#ifdef QJS_REGVM_COUNT
 +static uint64_t js_regvm_cmptake[4]; /* 0 both-int, 1 both-float, 2 mixed, 3 other */
@@ -200,8 +193,7 @@
      JSValue out;
  
      sub &= ~REG_CMP_INVERT;
-+    /* `===`/`!==` is a tag test first; the default-argument guards
-+       (`if (m === undefined) m = 0`) never reach the generic comparison. */
++    /* `===`/`!==` is a tag test first. */
 +    if (sub == REG_BIN_STRICT_EQ || sub == REG_BIN_STRICT_NEQ) {
 +        int e = regvm_strict_eq(sub, a, b);
 +        if (likely(e >= 0))
@@ -210,13 +202,11 @@
      if (!regvm_num_fast(sub, a, b, &out) &&
          js_regvm_binary(ctx, sub, a, b, &out))
          return -1;
-@@ -24916,6 +25088,72 @@
+@@ -24430,6 +24582,65 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
                  T_NEXT((SZ_)); \
              } \
          } \
-+        /* a mixed int/double pair is still a numeric comparison, and promoting
-+           the int to double is exact; this is the other half of box2d's
-+           non-integer compares */ \
++        /* a mixed int/double pair: promoting the int to double is exact */ \
 +        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) || \
 +                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)))) { \
 +            int _ta = JS_VALUE_GET_TAG(_a), _tb = JS_VALUE_GET_TAG(_b); \
@@ -234,10 +224,8 @@
 +                } \
 +            } \
 +        } \
-+        /* `===`/`!==` on the immediates is a tag test, not a coercion: the
-+           default-argument guards (`if (m === undefined) m = 0`) are the
-+           hottest compare-and-branch shape in box2d. The test folds away at
-+           the ten per-sense opcodes, which never carry a strict sense. */ \
++        /* `===`/`!==` on the immediates is a tag test. It folds away at the
++           per-sense opcodes, which never carry a strict sense. */ \
 +        if (likely((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_EQ || \
 +                    (_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_NEQ)) { \
 +            int _se = regvm_strict_eq(_sub & ~REG_CMP_INVERT, _a, _b); \
@@ -247,8 +235,8 @@
 +                T_NEXT((SZ_)); \
 +            } \
 +        } \
-+        /* loose equality on two objects is identity, and on the other
-+           same-type immediates it is the value test the strict path uses */ \
++        /* loose equality: identity on two objects, the value test on same-type
++           immediates */ \
 +        if (likely((_sub & ~REG_CMP_INVERT) == REG_BIN_EQ || \
 +                    (_sub & ~REG_CMP_INVERT) == REG_BIN_NEQ)) { \
 +            int _le = regvm_loose_eq(_sub & ~REG_CMP_INVERT, _a, _b); \
@@ -258,9 +246,7 @@
 +                T_NEXT((SZ_)); \
 +            } \
 +        } \
-+        /* `x instanceof C` for a plain class is the prototype walk itself, and
-+           it is the remaining shape box2d's fused branches carry; the ordinary
-+           check is called directly rather than through the generic binary */ \
++        /* `x instanceof C` for a plain class is the prototype walk */ \
 +        if (likely((_sub & ~REG_CMP_INVERT) == REG_BIN_INSTANCEOF)) { \
 +            int _io = regvm_instanceof_fast(ctx, _a, _b); \
 +            if (likely(_io >= 0)) { \
@@ -269,9 +255,8 @@
 +                T_NEXT((SZ_)); \
 +            } \
 +        } \
-+        /* the bitwise and shift operations are exact on two int32s, and the
-+           branch only asks whether the result is zero; last because it is the
-+           only one of these that a non-comparison reaches */ \
++        /* the bitwise and shift operations, exact on two int32s; the branch
++           only tests the result for zero */ \
 +        if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
 +                   !((_r = regvm_int_bit_truthy(_sub & ~REG_CMP_INVERT, \
 +                                                JS_VALUE_GET_INT(_a), \
@@ -283,7 +268,7 @@
          __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
      }
  
-@@ -62069,6 +62307,34 @@
+@@ -60154,6 +60365,34 @@ int js_regvm_count_dump(void)
                  js_regvm_blockers[_b] = 0; _n++;
              }
          }

@@ -1,0 +1,355 @@
+Subject: Dedicated threaded handlers for seven cold opcodes
+
+What this does
+  Dedicated threaded handlers for seven cold opcodes.
+
+Why we need it
+  `branch_cmp_loc_reg`, `special_object`, `make_closure`, `set_name`, `get_arg_field`, `put_arg_xfer` and `put_local_s1` each dispatched through `regvm_t_cold` -> `regvm_t_cold_slow` -> `regvm_exec_one`, a call and a second switch on top of the opcode. The `unsafe[]` test in `regvm_code_light_safe` keys on `regvm_threaded[op] == regvm_t_cold`, so giving them handlers would have widened light-frame eligibility; five read record-only frame fields (`sf`, `argv`, `arg_buf`, `arg_owned`, `new_target`) and the frame has only the 9-slot light prefix, so the corpus segfaulted.
+
+What it adds
+  Each is its own `regvm_t_<name>` handler, built from that opcode's `regvm_exec_one` arm (record field names already) with operands decoded from `regvm_rop_fmt`; `special_object`, `make_closure` and `set_name` keep a `noinline` `_slow` half so the dispatch-path handler stays frameless. `QJS_REGVM_FAST_COLD=0` restores the old table entries, and under it `regvm_code_light_safe` forces all seven `unsafe[]` so no function's frame kind changes: light-eligible and record-eligible function counts over the corpus.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs.c b/quickjs.c
+index 57f93ca..da1e411 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -96,6 +96,30 @@ typedef struct JSRegRCC JSRegRCC;
+ #endif
+ #endif
+ 
++/*
++ * Fast threaded handlers for seven opcodes that would otherwise dispatch
++ * through the cold trampoline. Each is the monolith/`regvm_exec_one` body with
++ * record field names; the ones that can allocate, throw or run user code keep
++ * their slow half out of line, exactly like `regvm_t_cold`. Off restores the
++ * old `regvm_t_cold` entry for all seven.
++ */
++#ifndef QJS_REGVM_FAST_COLD
++#define QJS_REGVM_FAST_COLD 1
++#endif
++
++/*
++ * The handler-table entry for the seven opcodes above. With the switch on each
++ * names its own `regvm_t_<name>`; off, all seven fall back to `regvm_t_cold`,
++ * which is exactly the old behaviour. Used in `regvm_threaded` (which reads the
++ * handler) and in `regvm_is_threaded` (which ignores it and writes 1), so it
++ * must stay a plain expression.
++ */
++#if QJS_REGVM_FAST_COLD
++#define REGVM_FAST_HANDLER(name) regvm_t_##name
++#else
++#define REGVM_FAST_HANDLER(name) regvm_t_cold
++#endif
++
+ /* Deferred reference counting. QJS_DRC enables the machinery (ZCT, reconcile,
+    register-root scanning); QJS_DRC_VALIDATE adds the debug root validator. */
+ #ifndef QJS_DRC
+@@ -25126,6 +25150,10 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
+ #define T_SZ_BU_IT  12   /* "buIt"  */
+ #define T_SZ_BURT   10   /* "burt"  */
+ #define T_SZ_RB     4    /* "rb"    */
++#define T_SZ_UR     5    /* "ur"    */
++#define T_SZ_RUAS   11   /* "ruas"  */
++#define T_SZ_RC     7    /* "rc"    */
++#define T_SZ_RA     7    /* "ra"    */
+ 
+ #define T_REG(o)  ((int)regvm_ld_u16(ip + (o)))
+ /* A register operand in the encoded stream is a byte offset into the
+@@ -25538,6 +25566,16 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_local_uninit(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS);
++#if QJS_REGVM_FAST_COLD
++static uint8_t *REGVM_CC regvm_t_get_arg_field(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_put_arg_xfer(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_put_local_s1(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_special_object(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_make_closure(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_set_name(REGVM_ARGS);
++#endif
+ static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_move_s(REGVM_ARGS);
+@@ -25796,7 +25834,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(array_from, regvm_t_array_from) \
+     X(binary_cpool, regvm_t_binary_cpool) \
+     X(branch_cmp_loc_loc, regvm_t_cold) \
+-    X(branch_cmp_loc_reg, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(branch_cmp_loc_reg, REGVM_FAST_HANDLER(branch_cmp_loc_reg)) \
+     X(branch_cmp_reg_loc, regvm_t_cold) \
+     X(catch_enter, regvm_t_cold) \
+     X(check_ctor, regvm_t_cold) \
+@@ -25823,7 +25862,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(for_in_next, regvm_t_cold) \
+     X(for_in_start, regvm_t_cold) \
+     X(get_arg_el, regvm_t_get_arg_el) \
+-    X(get_arg_field, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(get_arg_field, REGVM_FAST_HANDLER(get_arg_field)) \
+     X(get_length, regvm_t_get_length) \
+     X(get_local_field, regvm_t_cold) \
+     X(get_local_field_0, regvm_t_get_local_field_0) \
+@@ -25846,7 +25886,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(local_rmw_branch, regvm_t_local_rmw_branch) \
+     X(local_rmw_imm, regvm_t_cold) \
+     X(local_uninit, regvm_t_local_uninit) \
+-    X(make_closure, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(make_closure, REGVM_FAST_HANDLER(make_closure)) \
+     X(make_local_ref, regvm_t_cold) \
+     X(make_var_ref, regvm_t_cold) \
+     X(new_object, regvm_t_cold) \
+@@ -25855,14 +25896,16 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(object_template, regvm_t_object_template) \
+     X(private_symbol, regvm_t_cold) \
+     X(put_arg, regvm_t_cold) \
+-    X(put_arg_xfer, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(put_arg_xfer, REGVM_FAST_HANDLER(put_arg_xfer)) \
+     X(put_element, regvm_t_put_element) \
+     X(put_element_xfer, regvm_t_put_element_xfer) \
+     X(put_field_xfer, regvm_t_cold) \
+     X(put_global, regvm_t_put_global) \
+     X(put_local, regvm_t_cold) \
+     X(put_local_s0, regvm_t_put_local_s0) \
+-    X(put_local_s1, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(put_local_s1, REGVM_FAST_HANDLER(put_local_s1)) \
+     X(put_local_s2, regvm_t_cold) \
+     X(put_local_s3, regvm_t_cold) \
+     X(put_local_xfer, regvm_t_cold) \
+@@ -25876,10 +25919,12 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
+     X(put_var_ref, regvm_t_cold) \
+     X(regexp, regvm_t_cold) \
+     X(rest, regvm_t_cold) \
+-    X(set_name, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(set_name, REGVM_FAST_HANDLER(set_name)) \
+     X(set_name_computed, regvm_t_cold) \
+     X(set_proto, regvm_t_cold) \
+-    X(special_object, regvm_t_cold) \
++    /* QJS_REGVM_FAST_COLD */ \
++    X(special_object, REGVM_FAST_HANDLER(special_object)) \
+     X(sub_imm_s, regvm_t_sub_imm_s) \
+     X(sub_imm_self_s, regvm_t_sub_imm_self_s) \
+     X(super_get, regvm_t_cold) \
+@@ -27363,6 +27408,187 @@ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS)
+     T_SET_NEXT_P(d, val, 9);
+ }
+ 
++/*
++ * QJS_REGVM_FAST_COLD: dedicated handlers for seven opcodes that were
++ * dispatched through `regvm_t_cold` -> `regvm_t_cold_slow` -> `regvm_exec_one`.
++ * That path costs a call into `regvm_exec_one` and its own dispatch on top of
++ * the opcode, ~69 instructions per dispatch. Each body below is the
++ * `regvm_exec_one` arm (already written against the record `f`) with its
++ * operands decoded from the opcode's fixed format. The three that can allocate,
++ * throw or run user code (`special_object`, `make_closure`, `set_name`) keep
++ * their body in a `noinline` `_slow` half and tail-call into it, so the handler
++ * that sits on the dispatch path stays frameless -- the gate checks this.
++ */
++
++/* "ruas": d, receiver slot, atom, PIC site. Same body as get_local_field_0
++   with the receiver read from the argument area instead of var_buf[0]. */
++static uint8_t *REGVM_CC regvm_t_get_arg_field(REGVM_ARGS)
++{
++    int d = T_REG(1);
++    int slot = T_U16(3);
++    JSAtom atom = T_U32(5);
++    int site = T_U16(9);
++    JSValue recv = f->arg_buf[slot];
++    JSValue val;
++
++    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val))
++        T_SET_NEXT_B(d, val, T_SZ_RUAS);
++    if (site == REG_IC_NONE)
++        val = JS_GetProperty(ctx, recv, atom);
++    else
++        val = regvm_get_field_ic(ctx, f->b, &f->pic, recv, atom, site);
++    if (JS_IsException(val))
++        T_FAIL();
++    T_SET_NEXT_P(d, val, T_SZ_RUAS);
++}
++
++static uint8_t *REGVM_CC regvm_t_put_arg_xfer(REGVM_ARGS)
++{
++    int slot = T_U16(1);
++    int s = T_REG(3);
++#if QJS_DRC
++    regvm_put_arg(ctx, f->arg_buf, f->arg_owned, slot, FR(s));
++    FR(s) = JS_UNDEFINED;
++#else
++    set_value(ctx, &f->arg_buf[slot], FR(s));
++    FR(s) = JS_UNDEFINED;
++#endif
++    T_NEXT(T_SZ_UR);
++}
++
++static uint8_t *REGVM_CC regvm_t_put_local_s1(REGVM_ARGS)
++{
++    int s = T_REG(1);
++    set_value(ctx, &f->var_buf[1], js_dup(FR(s)));
++    T_NEXT(T_SZ_R);
++}
++
++/* "burt": sub, local slot, register, target. branch_cmp_reg_reg with the left
++   operand in a frame slot. */
++/* "burt": sub, local slot, register, target. The `_s` family's int fast path
++   inline; everything else is the generic slow half (`regvm_cmp_take`). */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg_slow(REGVM_ARGS)
++{
++    int sub = T_U8(1);
++    int lu = T_U16(2);
++    int rb = T_REG(4);
++    int32_t off = T_I32(6);
++    int take;
++
++    REGVM_CAPTURE_IP();
++    take = regvm_cmp_take(ctx, sub, f->var_buf[lu], FR(rb));
++    if (unlikely(take < 0))
++        T_FAIL();
++    T_NEXT(T_SZ_BURT + (take ? off : 0));
++}
++
++static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg(REGVM_ARGS)
++{
++    int sub = T_U8(1);
++    int lu = T_U16(2);
++    int rb = T_REG(4);
++    int32_t off = T_I32(6);
++    JSValue a = f->var_buf[lu], b = FR(rb);
++    int r;
++
++    if (likely(JS_VALUE_IS_BOTH_INT(a, b) &&
++               !((r = regvm_int_cmp(sub & ~REG_CMP_INVERT,
++                                    JS_VALUE_GET_INT(a),
++                                    JS_VALUE_GET_INT(b))) < 0))) {
++        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0))) {
++            REGVM_DRC_BACKEDGE(ctx, off);
++            T_NEXT(T_SZ_BURT + off);
++        }
++        T_NEXT(T_SZ_BURT);
++    }
++    __attribute__((musttail)) return regvm_t_branch_cmp_loc_reg_slow(REGVM_PASS);
++}
++
++/* "rb": d, kind. Can allocate or run user code (import meta), so the body is
++   out of line. */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_special_object_slow(REGVM_ARGS)
++{
++    int d = T_REG(1);
++    int kind = T_U8(3);
++    JSValue val;
++    /* The frame's function object, needed only by the home-object case. */
++    JSObject *p = JS_VALUE_GET_OBJ(f->sf->cur_func);
++    switch (kind) {
++    case OP_SPECIAL_OBJECT_ARGUMENTS:
++        val = js_build_arguments(ctx, f->argc, f->argv);
++        break;
++    case OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS:
++        val = js_build_mapped_arguments(ctx, f->argc, f->argv, f->sf,
++                                        min_int(f->argc, f->b->arg_count));
++        break;
++    case OP_SPECIAL_OBJECT_THIS_FUNC:
++        val = js_dup(f->sf->cur_func);
++        break;
++    case OP_SPECIAL_OBJECT_NEW_TARGET:
++        val = js_dup(f->new_target);
++        break;
++    case OP_SPECIAL_OBJECT_HOME_OBJECT:
++        val = p->u.func.home_object
++            ? js_dup(JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object))
++            : JS_UNDEFINED;
++        break;
++    case OP_SPECIAL_OBJECT_VAR_OBJECT:
++        val = JS_NewObjectProto(ctx, JS_NULL);
++        break;
++    case OP_SPECIAL_OBJECT_IMPORT_META:
++        val = js_import_meta(ctx);
++        break;
++    case OP_SPECIAL_OBJECT_NULL_PROTO:
++        val = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_OBJECT);
++        break;
++    case OP_SPECIAL_OBJECT_ARG_COUNT:
++        val = js_int32(f->argc);
++        break;
++    default:
++        JS_ThrowInternalError(ctx, "register VM: bad special object %d", kind);
++        T_FAIL();
++    }
++    if (JS_IsException(val))
++        T_FAIL();
++    T_SET_NEXT_P(d, val, T_SZ_RB);
++}
++
++static uint8_t *REGVM_CC regvm_t_special_object(REGVM_ARGS)
++{
++    __attribute__((musttail)) return regvm_t_special_object_slow(REGVM_PASS);
++}
++
++/* "rc": d, cpool index of the function to close. */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_make_closure_slow(REGVM_ARGS)
++{
++    int d = T_REG(1);
++    uint32_t idx = T_U32(3);
++    JSValue cl = js_closure(ctx, js_dup(f->b->cpool[idx]), f->var_refs, f->sf);
++    if (JS_IsException(cl))
++        T_FAIL();
++    T_SET_NEXT_P(d, cl, T_SZ_RC);
++}
++
++static uint8_t *REGVM_CC regvm_t_make_closure(REGVM_ARGS)
++{
++    __attribute__((musttail)) return regvm_t_make_closure_slow(REGVM_PASS);
++}
++
++/* "ra": function in a register, name atom. */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_ARGS)
++{
++    int r = T_REG(1);
++    JSAtom atom = T_U32(3);
++    if (JS_DefineObjectName(ctx, FR(r), atom, JS_PROP_CONFIGURABLE) < 0)
++        T_FAIL();
++    T_NEXT(T_SZ_RA);
++}
++
++static uint8_t *REGVM_CC regvm_t_set_name(REGVM_ARGS)
++{
++    __attribute__((musttail)) return regvm_t_set_name_slow(REGVM_PASS);
++}
++
+ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
+ {
+     int o = T_REG(1);
+@@ -58859,6 +59085,26 @@ static int regvm_code_light_safe(const uint8_t *code, int len)
+         unsafe[ROP_construct] = 1;
+         unsafe[ROP_tail_call] = 1;
+         unsafe[ROP_tail_call_method] = 1;
++#if QJS_REGVM_FAST_COLD
++        /*
++         * These seven have dedicated handlers under QJS_REGVM_FAST_COLD, but
++         * they were light-unsafe while they dispatched through regvm_t_cold
++         * (the `== regvm_t_cold` test above). Five read record-only frame
++         * fields -- sf, argv, arg_buf, arg_owned, new_target -- and all seven
++         * stay unsafe so this patch changes no function's frame kind. Widening
++         * eligibility for put_local_s1 or branch_cmp_loc_reg would be just as
++         * wrong: their handlers are frameless, but the point is that the set of
++         * light-eligible functions must be identical with the switch on and
++         * off.
++         */
++        unsafe[ROP_branch_cmp_loc_reg] = 1;
++        unsafe[ROP_special_object] = 1;
++        unsafe[ROP_make_closure] = 1;
++        unsafe[ROP_set_name] = 1;
++        unsafe[ROP_get_arg_field] = 1;
++        unsafe[ROP_put_arg_xfer] = 1;
++        unsafe[ROP_put_local_s1] = 1;
++#endif
+         ready = 1;
+     }
+     while (p < end) {

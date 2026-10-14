@@ -1,15 +1,29 @@
+Subject: Cut light-frame bookkeeping
+
+What this does
+  Cut light-frame bookkeeping.
+
+Why we need it
+  A light call still tested four fields to pick its path, filled and sized three generator handshake slots a light frame can never use (it never suspends), stored `undefined` into the returning frame's own register just before popping it, and reset `regvm_tail_chain` on a return that cannot end a tail chain (a light function never tail-calls).
+
+What it adds
+  Adds `regvm_light_fast` (light and no lazy PIC allocation needed, kept current by `regvm_set_call_desc`, `regvm_pic_ensure` and the PIC free) so the classifiers test one byte; sizes, fills and roots a light frame as header + registers with no handshake slots; drops the dead register store and the tail-chain reset from the fused trivial light returns.
+
+Needs a bytecode version bump
+  loop-subtracted, no-call and native rows unchanged
 diff --git a/quickjs.c b/quickjs.c
+index cf0a2be..767891a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1614,6 +1614,7 @@
-        size of a light frame: the 9-slot prefix, the variable area and the
-        register file (arguments are always borrowed when light). */
+@@ -1521,6 +1521,7 @@ typedef struct JSFunctionBytecode {
+        frame's arena size: the 9-slot prefix, the variable area and the register
+        file. */
      uint8_t regvm_light;
 +    uint8_t regvm_light_fast; /* light, and its PIC needs no lazy allocation */
      uint32_t regvm_light_need;
  #endif
  #if QJS_AOT_PROFILE
-@@ -7850,6 +7851,7 @@
+@@ -7726,6 +7727,7 @@ static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
          regvm_pic_entry_reset(rt, &b->regvm_pic[i], &b->regvm_pic_holder[i]);
      js_free_rt(rt, b->regvm_pic);
      b->regvm_pic = NULL;
@@ -17,7 +31,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_free_rt(rt, b->regvm_pic_holder);
      b->regvm_pic_holder = NULL;
  }
-@@ -7884,6 +7886,7 @@
+@@ -7757,6 +7759,7 @@ static JSRegPIC *regvm_pic_ensure(JSRuntime *rt, JSFunctionBytecode *b)
          }
          b->regvm_pic = t;
          b->regvm_pic_holder = h;
@@ -25,7 +39,7 @@ diff --git a/quickjs.c b/quickjs.c
          js_fnbc_gc_force_trace(rt, b); /* before the caller stores a JSShape */
      }
      return t;
-@@ -25040,7 +25043,7 @@
+@@ -24498,7 +24501,7 @@ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
           lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
          JSFunctionBytecode *b = lf->b;
          if (lf->fr && b->regvm_reg_count)
@@ -34,7 +48,7 @@ diff --git a/quickjs.c b/quickjs.c
      }
  }
  #endif
-@@ -26489,7 +26492,7 @@
+@@ -25823,7 +25826,7 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
              size_t top = (size_t)((uint8_t *)f
                                    - (uint8_t *)ctx->rt->regvm_frames);
  
@@ -43,7 +57,7 @@ diff --git a/quickjs.c b/quickjs.c
              ctx->rt->regvm_frames_top = top;
              if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev)) {
                  f->ret = v;
-@@ -26498,7 +26501,8 @@
+@@ -25832,7 +25835,8 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
              }
              ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
              *(JSValue *)((uint8_t *)c->fr + dst) = v;
@@ -53,7 +67,7 @@ diff --git a/quickjs.c b/quickjs.c
              f = c;
              __attribute__((musttail))
                  return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
-@@ -26566,7 +26570,8 @@
+@@ -25896,7 +25900,8 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
              }
              ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
              *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
@@ -63,7 +77,7 @@ diff --git a/quickjs.c b/quickjs.c
              f = c;
              __attribute__((musttail))
                  return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
-@@ -26810,15 +26815,12 @@
+@@ -26098,15 +26103,12 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
@@ -83,7 +97,7 @@ diff --git a/quickjs.c b/quickjs.c
              __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
          }
      }
-@@ -26837,15 +26839,12 @@
+@@ -26125,15 +26127,12 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
@@ -103,7 +117,7 @@ diff --git a/quickjs.c b/quickjs.c
              __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
          }
      }
-@@ -27126,7 +27125,8 @@
+@@ -26361,7 +26360,8 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      for (k = 0; k < vc; k++)
          nf->var_buf[k] = JS_UNDEFINED;
      regs = nf->fr;
@@ -113,15 +127,15 @@ diff --git a/quickjs.c b/quickjs.c
      for (k = 0; k + 1 < nregs; k += 2) {
          regs[k] = JS_UNDEFINED;
          regs[k + 1] = JS_UNDEFINED;
-@@ -30150,6 +30150,7 @@
-      * field or the (absent) JSStackFrame.
-      */
+@@ -29115,6 +29115,7 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
+        argument copy, no control records, and no opcode that reads a record-only
+        field or the JSStackFrame. */
      b->regvm_light = 0;
 +    b->regvm_light_fast = 0;
      b->regvm_light_need = 0;
  #if QJS_REGVM_RECORD
  #if QJS_DRC
-@@ -30169,7 +30170,9 @@
+@@ -29134,7 +29135,9 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
              b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
                  + sizeof(JSValue)
                      * (size_t)((lvc ? b->var_count : 0)

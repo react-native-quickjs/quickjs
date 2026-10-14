@@ -1,9 +1,23 @@
+Subject: Fold the light call into the classifier
+
+What this does
+  Fold the light call into the classifier.
+
+Why we need it
+  The out-of-line light handler re-decoded operand `c` and reloaded `FR(c)` and the function bytecode.
+
+What it adds
+  Which owns the `musttail` record fallback.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 7a13bf3..12edb12 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25919,8 +25919,10 @@
+@@ -25283,8 +25283,10 @@ static int regvm_record_eligible(JSFunctionBytecode *cb);
  #if QJS_REGVM_RECORD
- /* Plan 5.4: the encoded program contains only light-safe opcodes. */
+ /* The encoded program contains only light-safe opcodes. */
  static int regvm_code_light_safe(const uint8_t *code, int len);
 -static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS);
 -static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS);
@@ -14,7 +28,7 @@ diff --git a/quickjs.c b/quickjs.c
  static __attribute__((noinline)) uint8_t *REGVM_CC
  regvm_t_return_light_nested(REGVM_ARGS);
  static __attribute__((noinline)) uint8_t *REGVM_CC
-@@ -26844,9 +26846,20 @@
+@@ -26130,9 +26132,20 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
@@ -37,7 +51,7 @@ diff --git a/quickjs.c b/quickjs.c
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail))
                      return regvm_t_call_record(REGVM_PASS);
-@@ -26868,9 +26881,20 @@
+@@ -26154,9 +26167,20 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
@@ -60,7 +74,7 @@ diff --git a/quickjs.c b/quickjs.c
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail))
                      return regvm_t_call_method_record(REGVM_PASS);
-@@ -27174,52 +27198,27 @@
+@@ -26404,52 +26428,24 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
      return nf;
  }
  
@@ -87,12 +101,9 @@ diff --git a/quickjs.c b/quickjs.c
 -}
 -
 -static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS)
-+/*
-+ * Step 3: the light call's arena entry, folded into the classifiers so they do
-+ * not re-decode operand `c`, reload `FR(c)` or reload the function bytecode.
-+ * Returns the new frame, or NULL when the call must take the record path (the
-+ * classifier owns the `musttail` jump so this stays a plain inlined helper).
-+ */
++/* The light call's arena entry, folded into the classifiers so they do not
++   re-decode or reload the callee. Returns the new frame, or NULL for the
++   record path (the classifier owns the `musttail` jump). */
 +static __attribute__((always_inline)) inline JSRegRun *
 +regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
 +                    int ret_off, JSValueConst this_obj, JSValue *oargv,

@@ -1,0 +1,687 @@
+Subject: Compile the monolith bodies of chain-run opcodes out of threaded builds
+
+What this does
+  In a threaded register build, wraps the `js_regvm_execute` `L_ROP_*` body of
+  every opcode the threaded chain runs in `#if !QJS_REGVM_THREAD`, and points
+  their `regvm_dispatch` entries at one `L_mono_unreachable` trap that aborts.
+  Kept: the `REGVM_T_FALLBACK_LIST` opcodes (the loop is their executor),
+  `call`/`call_method` (the loop runs them when `QJS_REGVM_RECORD=0`), and
+  `return`, `return_undefined`, `tail_call`, `tail_call_method`, whose handlers
+  hand a generator frame back to the loop. Macro definitions inside the
+  wrapped regions stay outside the guards, since the step engine and the cold
+  arms use them. `pic` is declared only where its readers are compiled.
+
+Why we need it
+  The loop enters the chain whenever `regvm_is_threaded[*rpc]`, so in a
+  threaded build those bodies cannot run, yet they were compiled into every
+  register binary: 199 dispatch labels of dead code.
+
+What it adds
+  `REGVM_MONO_ENTRY` and the trap label. Monolith builds (`QJS_REGVM_THREAD=0`,
+  `QJS_AOT`, `QJS_REGVM_STEPCHECK`) preprocess to the same tokens as before.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 5de8852..2ebde52 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -30703,10 +30703,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             }
+         }
+         uint8_t *rpc;
++#if !QJS_REGVM_THREAD
+         /* The monolith's read-cache base; the threaded chain keeps its own in
+            `run.pic`. regvm_pic_ensure returns the table the bytecode already
+            owns. */
+         JSRegPIC *pic = b->regvm_pic;
++#endif
+ #if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
+         /* Filled once per activation. The handlers only read these, and all are
+            fixed for the activation (the var_refs pointer too, though not its
+@@ -30917,170 +30919,176 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         int op;
+         /* One dispatch site per handler (computed goto), as the stack
+            interpreter already has, in place of a shared switch jump table. */
++#if QJS_REGVM_THREAD
++/* The chain runs these opcodes, so their bodies here are compiled out. */
++#define REGVM_MONO_ENTRY(l) &&L_mono_unreachable
++#else
++#define REGVM_MONO_ENTRY(l) &&l
++#endif
+         __extension__ static const void * const regvm_dispatch[ROP_COUNT] = {
+             [ROP_invalid] = &&L_default,
+-            [ROP_load_const] = &&L_ROP_load_const,
+-            [ROP_private_symbol] = &&L_ROP_private_symbol,
+-            [ROP_load_i8] = &&L_ROP_load_i8,
+-            [ROP_load_i8_s] = &&L_ROP_load_i8_s,
+-            [ROP_load_i32] = &&L_ROP_load_i32,
+-            [ROP_load_undefined] = &&L_ROP_load_undefined,
+-            [ROP_load_null] = &&L_ROP_load_null,
+-            [ROP_load_true] = &&L_ROP_load_true,
+-            [ROP_load_false] = &&L_ROP_load_false,
+-            [ROP_load_this] = &&L_ROP_load_this,
+-            [ROP_load_bigint_i32] = &&L_ROP_load_bigint_i32,
+-            [ROP_new_object] = &&L_ROP_new_object,
+-            [ROP_object_template] = &&L_ROP_object_template,
+-            [ROP_move] = &&L_ROP_move,
+-            [ROP_move_s] = &&L_ROP_move_s,
+-            [ROP_move_xfer] = &&L_ROP_move_xfer,
+-            [ROP_put_local_xfer] = &&L_ROP_put_local_xfer,
+-            [ROP_put_local_xfer_s0] = &&L_ROP_put_local_xfer_s0,
+-            [ROP_put_local_xfer_s1] = &&L_ROP_put_local_xfer_s1,
+-            [ROP_put_local_xfer_s2] = &&L_ROP_put_local_xfer_s2,
+-            [ROP_put_local_xfer_s3] = &&L_ROP_put_local_xfer_s3,
+-            [ROP_local_rmw_imm] = &&L_ROP_local_rmw_imm,
+-            [ROP_branch_cmp_loc_loc] = &&L_ROP_branch_cmp_loc_loc,
+-            [ROP_branch_cmp_loc_reg] = &&L_ROP_branch_cmp_loc_reg,
+-            [ROP_branch_cmp_reg_loc] = &&L_ROP_branch_cmp_reg_loc,
+-            [ROP_branch_cmp_reg_reg] = &&L_ROP_branch_cmp_reg_reg,
+-            [ROP_local_rmw_branch] = &&L_ROP_local_rmw_branch,
+-
+-            [ROP_get_local] = &&L_ROP_get_local,
+-            [ROP_get_local_s0] = &&L_ROP_get_local_s0,
+-            [ROP_get_local_s1] = &&L_ROP_get_local_s1,
+-            [ROP_get_local_s2] = &&L_ROP_get_local_s2,
+-            [ROP_get_local_s3] = &&L_ROP_get_local_s3,
+-
+-            [ROP_put_local] = &&L_ROP_put_local,
+-            [ROP_put_local_s0] = &&L_ROP_put_local_s0,
+-            [ROP_put_local_s1] = &&L_ROP_put_local_s1,
+-            [ROP_put_local_s2] = &&L_ROP_put_local_s2,
+-            [ROP_put_local_s3] = &&L_ROP_put_local_s3,
+-
+-            [ROP_get_arg] = &&L_ROP_get_arg,
+-            [ROP_put_arg] = &&L_ROP_put_arg,
+-            [ROP_put_arg_xfer] = &&L_ROP_put_arg_xfer,
+-            [ROP_get_var_ref] = &&L_ROP_get_var_ref,
+-            [ROP_put_var_ref] = &&L_ROP_put_var_ref,
+-            [ROP_get_global] = &&L_ROP_get_global,
+-            [ROP_put_global] = &&L_ROP_put_global,
+-            [ROP_local_uninit] = &&L_ROP_local_uninit,
+-            [ROP_local_check] = &&L_ROP_local_check,
+-            [ROP_local_check_init] = &&L_ROP_local_check_init,
+-            [ROP_var_ref_check] = &&L_ROP_var_ref_check,
+-            [ROP_var_ref_check_init] = &&L_ROP_var_ref_check_init,
+-            [ROP_check_define] = &&L_ROP_check_define,
+-            [ROP_define_global] = &&L_ROP_define_global,
+-            [ROP_define_global_func] = &&L_ROP_define_global_func,
+-            [ROP_close_local] = &&L_ROP_close_local,
+-            [ROP_make_closure] = &&L_ROP_make_closure,
+-            [ROP_rest] = &&L_ROP_rest,
+-            [ROP_unary] = &&L_ROP_unary,
+-            [ROP_binary] = &&L_ROP_binary,
+-            [ROP_mul] = &&L_ROP_mul,
+-            [ROP_add] = &&L_ROP_add,
+-            [ROP_sub] = &&L_ROP_sub,
+-            [ROP_div] = &&L_ROP_div,
+-            [ROP_mod] = &&L_ROP_mod,
+-            [ROP_pow] = &&L_ROP_pow,
+-            [ROP_bitand] = &&L_ROP_bitand,
+-            [ROP_bitor] = &&L_ROP_bitor,
+-            [ROP_bitxor] = &&L_ROP_bitxor,
+-            [ROP_shl] = &&L_ROP_shl,
+-            [ROP_sar] = &&L_ROP_sar,
+-            [ROP_shr] = &&L_ROP_shr,
+-            [ROP_lt] = &&L_ROP_lt,
+-            [ROP_lte] = &&L_ROP_lte,
+-            [ROP_gt] = &&L_ROP_gt,
+-            [ROP_gte] = &&L_ROP_gte,
+-            [ROP_eq] = &&L_ROP_eq,
+-            [ROP_neq] = &&L_ROP_neq,
+-            [ROP_strict_eq] = &&L_ROP_strict_eq,
+-            [ROP_strict_neq] = &&L_ROP_strict_neq,
+-            [ROP_instanceof] = &&L_ROP_instanceof,
+-            [ROP_in] = &&L_ROP_in,
+-            [ROP_neg] = &&L_ROP_neg,
+-            [ROP_inc] = &&L_ROP_inc,
+-            [ROP_dec] = &&L_ROP_dec,
+-            [ROP_not] = &&L_ROP_not,
+-            [ROP_to_numeric] = &&L_ROP_to_numeric,
+-            [ROP_binary_loc_reg] = &&L_ROP_binary_loc_reg,
+-            [ROP_binary_reg_loc] = &&L_ROP_binary_reg_loc,
+-            [ROP_binary_loc_loc] = &&L_ROP_binary_loc_loc,
+-            [ROP_binary_imm] = &&L_ROP_binary_imm,
+-            [ROP_binary_cpool] = &&L_ROP_binary_cpool,
+-            [ROP_branch_cmp_reg_reg_s] = &&L_ROP_branch_cmp_reg_reg_s,
+-            [ROP_binary_imm_s] = &&L_ROP_binary_imm_s,
+-            [ROP_branch_s] = &&L_ROP_branch_s,
+-            [ROP_branch_lt_s] = &&L_ROP_branch_lt_s,
+-            [ROP_branch_nlt_s] = &&L_ROP_branch_nlt_s,
+-            [ROP_branch_lte_s] = &&L_ROP_branch_lte_s,
+-            [ROP_branch_nlte_s] = &&L_ROP_branch_nlte_s,
+-            [ROP_branch_gt_s] = &&L_ROP_branch_gt_s,
+-            [ROP_branch_ngt_s] = &&L_ROP_branch_ngt_s,
+-            [ROP_branch_gte_s] = &&L_ROP_branch_gte_s,
+-            [ROP_branch_ngte_s] = &&L_ROP_branch_ngte_s,
+-            [ROP_branch_eq_s] = &&L_ROP_branch_eq_s,
+-            [ROP_branch_neq_s] = &&L_ROP_branch_neq_s,
+-            [ROP_add_imm_s] = &&L_ROP_add_imm_s,
+-            [ROP_sub_imm_s] = &&L_ROP_sub_imm_s,
+-            [ROP_add_imm_self_s] = &&L_ROP_add_imm_self_s,
+-            [ROP_sub_imm_self_s] = &&L_ROP_sub_imm_self_s,
+-            [ROP_add_imm_self_branch] = &&L_ROP_add_imm_self_branch,
+-            [ROP_add_imm_self_branch_s] = &&L_ROP_add_imm_self_branch_s,
+-            [ROP_inc_branch_lt] = &&L_ROP_inc_branch_lt,
+-            [ROP_inc_branch_lt_s] = &&L_ROP_inc_branch_lt_s,
++            [ROP_load_const] = REGVM_MONO_ENTRY(L_ROP_load_const),
++            [ROP_private_symbol] = REGVM_MONO_ENTRY(L_ROP_private_symbol),
++            [ROP_load_i8] = REGVM_MONO_ENTRY(L_ROP_load_i8),
++            [ROP_load_i8_s] = REGVM_MONO_ENTRY(L_ROP_load_i8_s),
++            [ROP_load_i32] = REGVM_MONO_ENTRY(L_ROP_load_i32),
++            [ROP_load_undefined] = REGVM_MONO_ENTRY(L_ROP_load_undefined),
++            [ROP_load_null] = REGVM_MONO_ENTRY(L_ROP_load_null),
++            [ROP_load_true] = REGVM_MONO_ENTRY(L_ROP_load_true),
++            [ROP_load_false] = REGVM_MONO_ENTRY(L_ROP_load_false),
++            [ROP_load_this] = REGVM_MONO_ENTRY(L_ROP_load_this),
++            [ROP_load_bigint_i32] = REGVM_MONO_ENTRY(L_ROP_load_bigint_i32),
++            [ROP_new_object] = REGVM_MONO_ENTRY(L_ROP_new_object),
++            [ROP_object_template] = REGVM_MONO_ENTRY(L_ROP_object_template),
++            [ROP_move] = REGVM_MONO_ENTRY(L_ROP_move),
++            [ROP_move_s] = REGVM_MONO_ENTRY(L_ROP_move_s),
++            [ROP_move_xfer] = REGVM_MONO_ENTRY(L_ROP_move_xfer),
++            [ROP_put_local_xfer] = REGVM_MONO_ENTRY(L_ROP_put_local_xfer),
++            [ROP_put_local_xfer_s0] = REGVM_MONO_ENTRY(L_ROP_put_local_xfer_s0),
++            [ROP_put_local_xfer_s1] = REGVM_MONO_ENTRY(L_ROP_put_local_xfer_s1),
++            [ROP_put_local_xfer_s2] = REGVM_MONO_ENTRY(L_ROP_put_local_xfer_s2),
++            [ROP_put_local_xfer_s3] = REGVM_MONO_ENTRY(L_ROP_put_local_xfer_s3),
++            [ROP_local_rmw_imm] = REGVM_MONO_ENTRY(L_ROP_local_rmw_imm),
++            [ROP_branch_cmp_loc_loc] = REGVM_MONO_ENTRY(L_ROP_branch_cmp_loc_loc),
++            [ROP_branch_cmp_loc_reg] = REGVM_MONO_ENTRY(L_ROP_branch_cmp_loc_reg),
++            [ROP_branch_cmp_reg_loc] = REGVM_MONO_ENTRY(L_ROP_branch_cmp_reg_loc),
++            [ROP_branch_cmp_reg_reg] = REGVM_MONO_ENTRY(L_ROP_branch_cmp_reg_reg),
++            [ROP_local_rmw_branch] = REGVM_MONO_ENTRY(L_ROP_local_rmw_branch),
++
++            [ROP_get_local] = REGVM_MONO_ENTRY(L_ROP_get_local),
++            [ROP_get_local_s0] = REGVM_MONO_ENTRY(L_ROP_get_local_s0),
++            [ROP_get_local_s1] = REGVM_MONO_ENTRY(L_ROP_get_local_s1),
++            [ROP_get_local_s2] = REGVM_MONO_ENTRY(L_ROP_get_local_s2),
++            [ROP_get_local_s3] = REGVM_MONO_ENTRY(L_ROP_get_local_s3),
++
++            [ROP_put_local] = REGVM_MONO_ENTRY(L_ROP_put_local),
++            [ROP_put_local_s0] = REGVM_MONO_ENTRY(L_ROP_put_local_s0),
++            [ROP_put_local_s1] = REGVM_MONO_ENTRY(L_ROP_put_local_s1),
++            [ROP_put_local_s2] = REGVM_MONO_ENTRY(L_ROP_put_local_s2),
++            [ROP_put_local_s3] = REGVM_MONO_ENTRY(L_ROP_put_local_s3),
++
++            [ROP_get_arg] = REGVM_MONO_ENTRY(L_ROP_get_arg),
++            [ROP_put_arg] = REGVM_MONO_ENTRY(L_ROP_put_arg),
++            [ROP_put_arg_xfer] = REGVM_MONO_ENTRY(L_ROP_put_arg_xfer),
++            [ROP_get_var_ref] = REGVM_MONO_ENTRY(L_ROP_get_var_ref),
++            [ROP_put_var_ref] = REGVM_MONO_ENTRY(L_ROP_put_var_ref),
++            [ROP_get_global] = REGVM_MONO_ENTRY(L_ROP_get_global),
++            [ROP_put_global] = REGVM_MONO_ENTRY(L_ROP_put_global),
++            [ROP_local_uninit] = REGVM_MONO_ENTRY(L_ROP_local_uninit),
++            [ROP_local_check] = REGVM_MONO_ENTRY(L_ROP_local_check),
++            [ROP_local_check_init] = REGVM_MONO_ENTRY(L_ROP_local_check_init),
++            [ROP_var_ref_check] = REGVM_MONO_ENTRY(L_ROP_var_ref_check),
++            [ROP_var_ref_check_init] = REGVM_MONO_ENTRY(L_ROP_var_ref_check_init),
++            [ROP_check_define] = REGVM_MONO_ENTRY(L_ROP_check_define),
++            [ROP_define_global] = REGVM_MONO_ENTRY(L_ROP_define_global),
++            [ROP_define_global_func] = REGVM_MONO_ENTRY(L_ROP_define_global_func),
++            [ROP_close_local] = REGVM_MONO_ENTRY(L_ROP_close_local),
++            [ROP_make_closure] = REGVM_MONO_ENTRY(L_ROP_make_closure),
++            [ROP_rest] = REGVM_MONO_ENTRY(L_ROP_rest),
++            [ROP_unary] = REGVM_MONO_ENTRY(L_ROP_unary),
++            [ROP_binary] = REGVM_MONO_ENTRY(L_ROP_binary),
++            [ROP_mul] = REGVM_MONO_ENTRY(L_ROP_mul),
++            [ROP_add] = REGVM_MONO_ENTRY(L_ROP_add),
++            [ROP_sub] = REGVM_MONO_ENTRY(L_ROP_sub),
++            [ROP_div] = REGVM_MONO_ENTRY(L_ROP_div),
++            [ROP_mod] = REGVM_MONO_ENTRY(L_ROP_mod),
++            [ROP_pow] = REGVM_MONO_ENTRY(L_ROP_pow),
++            [ROP_bitand] = REGVM_MONO_ENTRY(L_ROP_bitand),
++            [ROP_bitor] = REGVM_MONO_ENTRY(L_ROP_bitor),
++            [ROP_bitxor] = REGVM_MONO_ENTRY(L_ROP_bitxor),
++            [ROP_shl] = REGVM_MONO_ENTRY(L_ROP_shl),
++            [ROP_sar] = REGVM_MONO_ENTRY(L_ROP_sar),
++            [ROP_shr] = REGVM_MONO_ENTRY(L_ROP_shr),
++            [ROP_lt] = REGVM_MONO_ENTRY(L_ROP_lt),
++            [ROP_lte] = REGVM_MONO_ENTRY(L_ROP_lte),
++            [ROP_gt] = REGVM_MONO_ENTRY(L_ROP_gt),
++            [ROP_gte] = REGVM_MONO_ENTRY(L_ROP_gte),
++            [ROP_eq] = REGVM_MONO_ENTRY(L_ROP_eq),
++            [ROP_neq] = REGVM_MONO_ENTRY(L_ROP_neq),
++            [ROP_strict_eq] = REGVM_MONO_ENTRY(L_ROP_strict_eq),
++            [ROP_strict_neq] = REGVM_MONO_ENTRY(L_ROP_strict_neq),
++            [ROP_instanceof] = REGVM_MONO_ENTRY(L_ROP_instanceof),
++            [ROP_in] = REGVM_MONO_ENTRY(L_ROP_in),
++            [ROP_neg] = REGVM_MONO_ENTRY(L_ROP_neg),
++            [ROP_inc] = REGVM_MONO_ENTRY(L_ROP_inc),
++            [ROP_dec] = REGVM_MONO_ENTRY(L_ROP_dec),
++            [ROP_not] = REGVM_MONO_ENTRY(L_ROP_not),
++            [ROP_to_numeric] = REGVM_MONO_ENTRY(L_ROP_to_numeric),
++            [ROP_binary_loc_reg] = REGVM_MONO_ENTRY(L_ROP_binary_loc_reg),
++            [ROP_binary_reg_loc] = REGVM_MONO_ENTRY(L_ROP_binary_reg_loc),
++            [ROP_binary_loc_loc] = REGVM_MONO_ENTRY(L_ROP_binary_loc_loc),
++            [ROP_binary_imm] = REGVM_MONO_ENTRY(L_ROP_binary_imm),
++            [ROP_binary_cpool] = REGVM_MONO_ENTRY(L_ROP_binary_cpool),
++            [ROP_branch_cmp_reg_reg_s] = REGVM_MONO_ENTRY(L_ROP_branch_cmp_reg_reg_s),
++            [ROP_binary_imm_s] = REGVM_MONO_ENTRY(L_ROP_binary_imm_s),
++            [ROP_branch_s] = REGVM_MONO_ENTRY(L_ROP_branch_s),
++            [ROP_branch_lt_s] = REGVM_MONO_ENTRY(L_ROP_branch_lt_s),
++            [ROP_branch_nlt_s] = REGVM_MONO_ENTRY(L_ROP_branch_nlt_s),
++            [ROP_branch_lte_s] = REGVM_MONO_ENTRY(L_ROP_branch_lte_s),
++            [ROP_branch_nlte_s] = REGVM_MONO_ENTRY(L_ROP_branch_nlte_s),
++            [ROP_branch_gt_s] = REGVM_MONO_ENTRY(L_ROP_branch_gt_s),
++            [ROP_branch_ngt_s] = REGVM_MONO_ENTRY(L_ROP_branch_ngt_s),
++            [ROP_branch_gte_s] = REGVM_MONO_ENTRY(L_ROP_branch_gte_s),
++            [ROP_branch_ngte_s] = REGVM_MONO_ENTRY(L_ROP_branch_ngte_s),
++            [ROP_branch_eq_s] = REGVM_MONO_ENTRY(L_ROP_branch_eq_s),
++            [ROP_branch_neq_s] = REGVM_MONO_ENTRY(L_ROP_branch_neq_s),
++            [ROP_add_imm_s] = REGVM_MONO_ENTRY(L_ROP_add_imm_s),
++            [ROP_sub_imm_s] = REGVM_MONO_ENTRY(L_ROP_sub_imm_s),
++            [ROP_add_imm_self_s] = REGVM_MONO_ENTRY(L_ROP_add_imm_self_s),
++            [ROP_sub_imm_self_s] = REGVM_MONO_ENTRY(L_ROP_sub_imm_self_s),
++            [ROP_add_imm_self_branch] = REGVM_MONO_ENTRY(L_ROP_add_imm_self_branch),
++            [ROP_add_imm_self_branch_s] = REGVM_MONO_ENTRY(L_ROP_add_imm_self_branch_s),
++            [ROP_inc_branch_lt] = REGVM_MONO_ENTRY(L_ROP_inc_branch_lt),
++            [ROP_inc_branch_lt_s] = REGVM_MONO_ENTRY(L_ROP_inc_branch_lt_s),
+             [ROP_to_number] = &&L_default,
+             [ROP_compare] = &&L_default,
+-            [ROP_get_field] = &&L_ROP_get_field,
+-            [ROP_get_field2] = &&L_ROP_get_field2,
++            [ROP_get_field] = REGVM_MONO_ENTRY(L_ROP_get_field),
++            [ROP_get_field2] = REGVM_MONO_ENTRY(L_ROP_get_field2),
+             /* The quickened forms are only written by the threaded interpreter;
+                they alias the generic labels so no slot dispatches through NULL.
+                */
+-            [ROP_get_field_own] = &&L_ROP_get_field,
+-            [ROP_get_field2_own] = &&L_ROP_get_field2,
++            [ROP_get_field_own] = REGVM_MONO_ENTRY(L_ROP_get_field),
++            [ROP_get_field2_own] = REGVM_MONO_ENTRY(L_ROP_get_field2),
+             /* The quickened spelling is only written by the threaded
+                interpreter; both aliases run the full kind-tested read pair. */
+-            [ROP_get_field_chain] = &&L_ROP_get_field_chain,
+-            [ROP_get_field_chain_own] = &&L_ROP_get_field_chain,
++            [ROP_get_field_chain] = REGVM_MONO_ENTRY(L_ROP_get_field_chain),
++            [ROP_get_field_chain_own] = REGVM_MONO_ENTRY(L_ROP_get_field_chain),
+             /* The fused arithmetic is emitted by the compiler, so the monolith
+                runs it too. */
+-            [ROP_mul_add] = &&L_ROP_mul_add,
+-            [ROP_mul_sub] = &&L_ROP_mul_sub,
+-            [ROP_add_mul] = &&L_ROP_add_mul,
+-            [ROP_sub_mul] = &&L_ROP_sub_mul,
+-            [ROP_debug] = &&L_ROP_debug,
+-            [ROP_put_field] = &&L_ROP_put_field,
+-            [ROP_put_field_xfer] = &&L_ROP_put_field_xfer,
+-            [ROP_define_field] = &&L_ROP_define_field,
+-            [ROP_object_fill] = &&L_ROP_object_fill,
+-            [ROP_get_private] = &&L_ROP_get_private,
+-            [ROP_put_private] = &&L_ROP_put_private,
+-            [ROP_get_element] = &&L_ROP_get_element,
+-            [ROP_put_element] = &&L_ROP_put_element,
+-            [ROP_put_element_xfer] = &&L_ROP_put_element_xfer,
+-            [ROP_define_element] = &&L_ROP_define_element,
+-            [ROP_get_length] = &&L_ROP_get_length,
+-            [ROP_super_get] = &&L_ROP_super_get,
++            [ROP_mul_add] = REGVM_MONO_ENTRY(L_ROP_mul_add),
++            [ROP_mul_sub] = REGVM_MONO_ENTRY(L_ROP_mul_sub),
++            [ROP_add_mul] = REGVM_MONO_ENTRY(L_ROP_add_mul),
++            [ROP_sub_mul] = REGVM_MONO_ENTRY(L_ROP_sub_mul),
++            [ROP_debug] = REGVM_MONO_ENTRY(L_ROP_debug),
++            [ROP_put_field] = REGVM_MONO_ENTRY(L_ROP_put_field),
++            [ROP_put_field_xfer] = REGVM_MONO_ENTRY(L_ROP_put_field_xfer),
++            [ROP_define_field] = REGVM_MONO_ENTRY(L_ROP_define_field),
++            [ROP_object_fill] = REGVM_MONO_ENTRY(L_ROP_object_fill),
++            [ROP_get_private] = REGVM_MONO_ENTRY(L_ROP_get_private),
++            [ROP_put_private] = REGVM_MONO_ENTRY(L_ROP_put_private),
++            [ROP_get_element] = REGVM_MONO_ENTRY(L_ROP_get_element),
++            [ROP_put_element] = REGVM_MONO_ENTRY(L_ROP_put_element),
++            [ROP_put_element_xfer] = REGVM_MONO_ENTRY(L_ROP_put_element_xfer),
++            [ROP_define_element] = REGVM_MONO_ENTRY(L_ROP_define_element),
++            [ROP_get_length] = REGVM_MONO_ENTRY(L_ROP_get_length),
++            [ROP_super_get] = REGVM_MONO_ENTRY(L_ROP_super_get),
+             [ROP_super_put] = &&L_default,
+-            [ROP_define_class] = &&L_ROP_define_class,
+-            [ROP_define_class_computed] = &&L_ROP_define_class_computed,
++            [ROP_define_class] = REGVM_MONO_ENTRY(L_ROP_define_class),
++            [ROP_define_class_computed] = REGVM_MONO_ENTRY(L_ROP_define_class_computed),
+             [ROP_define_method] = &&L_ROP_define_method,
+             [ROP_define_method_computed] = &&L_ROP_define_method_computed,
+-            [ROP_set_proto] = &&L_ROP_set_proto,
++            [ROP_set_proto] = REGVM_MONO_ENTRY(L_ROP_set_proto),
+             [ROP_set_home_object] = &&L_ROP_set_home_object,
+-            [ROP_get_super] = &&L_ROP_get_super,
+-            [ROP_check_ctor] = &&L_ROP_check_ctor,
++            [ROP_get_super] = REGVM_MONO_ENTRY(L_ROP_get_super),
++            [ROP_check_ctor] = REGVM_MONO_ENTRY(L_ROP_check_ctor),
+             [ROP_check_ctor_return] = &&L_ROP_check_ctor_return,
+-            [ROP_init_ctor] = &&L_ROP_init_ctor,
++            [ROP_init_ctor] = REGVM_MONO_ENTRY(L_ROP_init_ctor),
+             [ROP_check_brand] = &&L_ROP_check_brand,
+-            [ROP_add_brand] = &&L_ROP_add_brand,
+-            [ROP_define_private] = &&L_ROP_define_private,
+-            [ROP_branch] = &&L_ROP_branch,
+-            [ROP_branch_if] = &&L_ROP_branch_if,
+-            [ROP_branch_if_not] = &&L_ROP_branch_if_not,
++            [ROP_add_brand] = REGVM_MONO_ENTRY(L_ROP_add_brand),
++            [ROP_define_private] = REGVM_MONO_ENTRY(L_ROP_define_private),
++            [ROP_branch] = REGVM_MONO_ENTRY(L_ROP_branch),
++            [ROP_branch_if] = REGVM_MONO_ENTRY(L_ROP_branch_if),
++            [ROP_branch_if_not] = REGVM_MONO_ENTRY(L_ROP_branch_if_not),
+             [ROP_return] = &&L_ROP_return,
+             [ROP_return_undefined] = &&L_ROP_return_undefined,
+             [ROP_initial_yield] = &&L_ROP_initial_yield,
+@@ -31088,76 +31096,76 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             [ROP_yield_star] = &&L_ROP_yield_star,
+             [ROP_call] = &&L_ROP_call,
+             [ROP_call_method] = &&L_ROP_call_method,
+-            [ROP_construct] = &&L_ROP_construct,
++            [ROP_construct] = REGVM_MONO_ENTRY(L_ROP_construct),
+             [ROP_tail_call] = &&L_ROP_tail_call,
+             [ROP_tail_call_method] = &&L_ROP_tail_call_method,
+-            [ROP_array_from] = &&L_ROP_array_from,
+-            [ROP_apply] = &&L_ROP_apply,
+-            [ROP_apply_arguments] = &&L_ROP_apply_arguments,
+-            [ROP_append] = &&L_ROP_append,
+-            [ROP_eval] = &&L_ROP_eval,
++            [ROP_array_from] = REGVM_MONO_ENTRY(L_ROP_array_from),
++            [ROP_apply] = REGVM_MONO_ENTRY(L_ROP_apply),
++            [ROP_apply_arguments] = REGVM_MONO_ENTRY(L_ROP_apply_arguments),
++            [ROP_append] = REGVM_MONO_ENTRY(L_ROP_append),
++            [ROP_eval] = REGVM_MONO_ENTRY(L_ROP_eval),
+             [ROP_apply_eval] = &&L_ROP_apply_eval,
+-            [ROP_with_get] = &&L_ROP_with_get,
+-            [ROP_with_put] = &&L_ROP_with_put,
+-            [ROP_with_delete] = &&L_ROP_with_delete,
+-            [ROP_with_make_ref] = &&L_ROP_with_make_ref,
+-            [ROP_with_get_ref] = &&L_ROP_with_get_ref,
+-            [ROP_with_get_ref_undef] = &&L_ROP_with_get_ref_undef,
+-            [ROP_make_local_ref] = &&L_ROP_make_local_ref,
+-            [ROP_make_var_ref] = &&L_ROP_make_var_ref,
+-            [ROP_get_ref_value] = &&L_ROP_get_ref_value,
+-            [ROP_put_ref_value] = &&L_ROP_put_ref_value,
+-            [ROP_put_super_value] = &&L_ROP_put_super_value,
+-            [ROP_throw] = &&L_ROP_throw,
+-            [ROP_throw_error] = &&L_ROP_throw_error,
+-            [ROP_catch_enter] = &&L_ROP_catch_enter,
+-            [ROP_nip_catch] = &&L_ROP_nip_catch,
+-            [ROP_finally_enter] = &&L_ROP_finally_enter,
+-            [ROP_finally_leave] = &&L_ROP_finally_leave,
+-            [ROP_for_in_start] = &&L_ROP_for_in_start,
+-            [ROP_for_in_next] = &&L_ROP_for_in_next,
+-            [ROP_get_arg_el] = &&L_ROP_get_arg_el,
+-            [ROP_iter_start] = &&L_ROP_iter_start,
+-            [ROP_iter_next] = &&L_ROP_iter_next,
+-            [ROP_iter_close] = &&L_ROP_iter_close,
++            [ROP_with_get] = REGVM_MONO_ENTRY(L_ROP_with_get),
++            [ROP_with_put] = REGVM_MONO_ENTRY(L_ROP_with_put),
++            [ROP_with_delete] = REGVM_MONO_ENTRY(L_ROP_with_delete),
++            [ROP_with_make_ref] = REGVM_MONO_ENTRY(L_ROP_with_make_ref),
++            [ROP_with_get_ref] = REGVM_MONO_ENTRY(L_ROP_with_get_ref),
++            [ROP_with_get_ref_undef] = REGVM_MONO_ENTRY(L_ROP_with_get_ref_undef),
++            [ROP_make_local_ref] = REGVM_MONO_ENTRY(L_ROP_make_local_ref),
++            [ROP_make_var_ref] = REGVM_MONO_ENTRY(L_ROP_make_var_ref),
++            [ROP_get_ref_value] = REGVM_MONO_ENTRY(L_ROP_get_ref_value),
++            [ROP_put_ref_value] = REGVM_MONO_ENTRY(L_ROP_put_ref_value),
++            [ROP_put_super_value] = REGVM_MONO_ENTRY(L_ROP_put_super_value),
++            [ROP_throw] = REGVM_MONO_ENTRY(L_ROP_throw),
++            [ROP_throw_error] = REGVM_MONO_ENTRY(L_ROP_throw_error),
++            [ROP_catch_enter] = REGVM_MONO_ENTRY(L_ROP_catch_enter),
++            [ROP_nip_catch] = REGVM_MONO_ENTRY(L_ROP_nip_catch),
++            [ROP_finally_enter] = REGVM_MONO_ENTRY(L_ROP_finally_enter),
++            [ROP_finally_leave] = REGVM_MONO_ENTRY(L_ROP_finally_leave),
++            [ROP_for_in_start] = REGVM_MONO_ENTRY(L_ROP_for_in_start),
++            [ROP_for_in_next] = REGVM_MONO_ENTRY(L_ROP_for_in_next),
++            [ROP_get_arg_el] = REGVM_MONO_ENTRY(L_ROP_get_arg_el),
++            [ROP_iter_start] = REGVM_MONO_ENTRY(L_ROP_iter_start),
++            [ROP_iter_next] = REGVM_MONO_ENTRY(L_ROP_iter_next),
++            [ROP_iter_close] = REGVM_MONO_ENTRY(L_ROP_iter_close),
+             [ROP_sentinel_drop] = &&L_ROP_sentinel_drop,
+             [ROP_yield] = &&L_ROP_yield,
+             [ROP_await] = &&L_ROP_await,
+-            [ROP_iterator_next] = &&L_ROP_iterator_next,
+-            [ROP_for_await_of_start] = &&L_ROP_for_await_of_start,
++            [ROP_iterator_next] = REGVM_MONO_ENTRY(L_ROP_iterator_next),
++            [ROP_for_await_of_start] = REGVM_MONO_ENTRY(L_ROP_for_await_of_start),
+             [ROP_iter_value_done] = &&L_ROP_iter_value_done,
+-            [ROP_check_object] = &&L_ROP_check_object,
+-            [ROP_iterator_call] = &&L_ROP_iterator_call,
+-            [ROP_delete_var] = &&L_ROP_delete_var,
++            [ROP_check_object] = REGVM_MONO_ENTRY(L_ROP_check_object),
++            [ROP_iterator_call] = REGVM_MONO_ENTRY(L_ROP_iterator_call),
++            [ROP_delete_var] = REGVM_MONO_ENTRY(L_ROP_delete_var),
+             [ROP_get_ref] = &&L_default,
+             [ROP_put_ref] = &&L_default,
+-            [ROP_to_object] = &&L_ROP_to_object,
+-            [ROP_to_propkey] = &&L_ROP_to_propkey,
+-            [ROP_to_propkey2] = &&L_ROP_to_propkey2,
++            [ROP_to_object] = REGVM_MONO_ENTRY(L_ROP_to_object),
++            [ROP_to_propkey] = REGVM_MONO_ENTRY(L_ROP_to_propkey),
++            [ROP_to_propkey2] = REGVM_MONO_ENTRY(L_ROP_to_propkey2),
+             [ROP_make_ref] = &&L_default,
+-            [ROP_delete] = &&L_ROP_delete,
++            [ROP_delete] = REGVM_MONO_ENTRY(L_ROP_delete),
+             [ROP_typeof] = &&L_default,
+             [ROP_special] = &&L_default,
+-            [ROP_special_object] = &&L_ROP_special_object,
+-            [ROP_set_name] = &&L_ROP_set_name,
+-            [ROP_set_name_computed] = &&L_ROP_set_name_computed,
+-            [ROP_regexp] = &&L_ROP_regexp,
+-            [ROP_copy_props] = &&L_ROP_copy_props,
+-            [ROP_dynamic_import] = &&L_ROP_dynamic_import,
+-            [ROP_using_init] = &&L_ROP_using_init,
+-            [ROP_using_dispose] = &&L_ROP_using_dispose,
+-            [ROP_using_dispose_async] = &&L_ROP_using_dispose_async,
+-            [ROP_using_merge] = &&L_ROP_using_merge,
+-            [ROP_using_end] = &&L_ROP_using_end,
+-            [ROP_using_check] = &&L_ROP_using_check,
+-            [ROP_get_local_field] = &&L_ROP_get_local_field,
+-            [ROP_get_local_field_0] = &&L_ROP_get_local_field_0,
+-            [ROP_get_local_field_1] = &&L_ROP_get_local_field_1,
+-            [ROP_get_local_field_2] = &&L_ROP_get_local_field_2,
+-            [ROP_get_local_field_3] = &&L_ROP_get_local_field_3,
+-            [ROP_get_arg_field] = &&L_ROP_get_arg_field,
+-            [ROP_slot_get] = &&L_ROP_slot_get,
+-            [ROP_slot_put] = &&L_ROP_slot_put,
++            [ROP_special_object] = REGVM_MONO_ENTRY(L_ROP_special_object),
++            [ROP_set_name] = REGVM_MONO_ENTRY(L_ROP_set_name),
++            [ROP_set_name_computed] = REGVM_MONO_ENTRY(L_ROP_set_name_computed),
++            [ROP_regexp] = REGVM_MONO_ENTRY(L_ROP_regexp),
++            [ROP_copy_props] = REGVM_MONO_ENTRY(L_ROP_copy_props),
++            [ROP_dynamic_import] = REGVM_MONO_ENTRY(L_ROP_dynamic_import),
++            [ROP_using_init] = REGVM_MONO_ENTRY(L_ROP_using_init),
++            [ROP_using_dispose] = REGVM_MONO_ENTRY(L_ROP_using_dispose),
++            [ROP_using_dispose_async] = REGVM_MONO_ENTRY(L_ROP_using_dispose_async),
++            [ROP_using_merge] = REGVM_MONO_ENTRY(L_ROP_using_merge),
++            [ROP_using_end] = REGVM_MONO_ENTRY(L_ROP_using_end),
++            [ROP_using_check] = REGVM_MONO_ENTRY(L_ROP_using_check),
++            [ROP_get_local_field] = REGVM_MONO_ENTRY(L_ROP_get_local_field),
++            [ROP_get_local_field_0] = REGVM_MONO_ENTRY(L_ROP_get_local_field_0),
++            [ROP_get_local_field_1] = REGVM_MONO_ENTRY(L_ROP_get_local_field_1),
++            [ROP_get_local_field_2] = REGVM_MONO_ENTRY(L_ROP_get_local_field_2),
++            [ROP_get_local_field_3] = REGVM_MONO_ENTRY(L_ROP_get_local_field_3),
++            [ROP_get_arg_field] = REGVM_MONO_ENTRY(L_ROP_get_arg_field),
++            [ROP_slot_get] = REGVM_MONO_ENTRY(L_ROP_slot_get),
++            [ROP_slot_put] = REGVM_MONO_ENTRY(L_ROP_slot_put),
+         };
+ #ifdef QJS_REGVM_COUNT
+ #define REGVM_COUNT_INC(o) js_regvm_count[o]++
+@@ -31290,6 +31298,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         }
+         REGVM_NEXT();
+ #endif
++#if !QJS_REGVM_THREAD
+             L_ROP_load_i8:
+                 { int d = RD_REG(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i8_s:
+@@ -31486,6 +31495,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                This macro expands once per fused form, so anything larger
+                multiplies the interpreter's size and spill traffic; the rest
+                goes out of line. */
++#endif
+ #define REGVM_CMP_BRANCH(a_, b_) do { \
+                   const uint8_t *i_start = rpc - 1; \
+                   JSValue _a = (a_), _b = (b_); int take, _r = -1; \
+@@ -31517,6 +31527,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                   if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
+                   REGVM_NEXT(); \
+               } while (0)
++#if !QJS_REGVM_THREAD
+             L_ROP_branch_cmp_loc_loc:
+                 { int sub = RD_U8(); int lu = RD_U16(); int ru = RD_U16();
+                   int32_t off = RD_I32();
+@@ -32399,6 +32410,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+ #endif
+                 REGVM_NEXT();
+             }
++#endif
+             L_ROP_define_method:
+             L_ROP_define_method_computed: {
+                 int o = RD_REG();
+@@ -32450,6 +32462,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                    follows this instruction */
+                 REGVM_NEXT();
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_set_proto: {
+                 int o = RD_REG();
+                 int p2 = RD_REG();
+@@ -32460,12 +32473,14 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 }
+                 REGVM_NEXT();
+             }
++#endif
+             L_ROP_set_home_object: {
+                 int f = RD_REG();
+                 int h = RD_REG();
+                 js_method_set_home_object(ctx, regs[f], regs[h]);
+                 REGVM_NEXT();
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_get_super: {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -32501,6 +32516,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG_P(d, ret);
+                 REGVM_NEXT();
+             }
++#endif
+             L_ROP_check_ctor_return: {
+                 int d = RD_REG();
+                 int s = RD_REG();
+@@ -32521,6 +32537,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             /* for-of: the iterator and next method are staged in the window,
+                and the activation records them so an exception leaving the frame
+                closes them. */
++#if !QJS_REGVM_THREAD
+             L_ROP_catch_enter: {
+                 int d = RD_REG();
+                 int32_t off = RD_I32();
+@@ -32648,6 +32665,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             /* await: the resolved value replaces the awaited operand and the
+                frame's stack pointer does not move, so this is yield's shape
+                minus the second slot. */
++#endif
+             L_ROP_await: {
+                 /* Only the suspension handlers need the instruction's own
+                    address. */
+@@ -32672,6 +32690,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 pc = ip;
+                 REGVM_SUSPEND(js_int32(FUNC_RET_AWAIT));
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_iter_next:
+                 {
+                     REGVM_CAPTURE_IP_MONO(rpc - 1); int w = RD_REG();
+@@ -32740,6 +32759,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                iteration
+              * protocol, so no open iterator is lost.
+              */
++#endif
+             L_ROP_sentinel_drop: {
+                 if (regvm_nctl > 0 && regvm_ctl[regvm_nctl - 1].kind == REG_CTL_ITER) {
+                     JS_FreeValue(ctx, regvm_ctl[regvm_nctl - 1].next);
+@@ -32783,6 +32803,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                   REGVM_NEXT(); }
+             /* stack: iter_obj next catch_offset val. The helper reads sp[-4]
+                and sp[-1] and writes its flag at sp[0]. */
++#if !QJS_REGVM_THREAD
+             L_ROP_iterator_call: {
+                                      REGVM_CAPTURE_IP_MONO(rpc - 1);
+                 int w = RD_REG();
+@@ -33097,6 +33118,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
++#endif
+             L_ROP_apply_eval: {
+                 int d = RD_REG();
+                 int f = RD_REG();
+@@ -33120,6 +33142,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_apply: {
+                 int d = RD_REG();
+                 int w = RD_REG();
+@@ -33228,6 +33251,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG_P(d, v2);
+                 REGVM_NEXT();
+             }
++#endif
+             L_ROP_check_brand: {
+                 int t2 = RD_REG();
+                 int f = RD_REG();
+@@ -33240,6 +33264,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 }
+                 REGVM_NEXT();
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_regexp: {
+                 int d = RD_REG();
+                 int p2 = RD_REG();
+@@ -33887,6 +33912,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                which is passed as the callee's argv with the stack VM's flags.
+                The plain call's `this` and every call's new_target are
+                undefined. */
++#endif
+             L_ROP_call: {
+                 int d = RD_REG();
+                 int c = RD_REG();
+@@ -33928,6 +33954,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_construct: {
+                 int d = RD_REG();
+                 int c = RD_REG();
+@@ -33943,6 +33970,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG_P(d, ret_val);
+                 REGVM_NEXT();
+             }
++#endif
+             L_ROP_tail_call: {
+                 int c = RD_REG();
+                 int ab = RD_REG();
+@@ -33978,6 +34006,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                     goto exception;
+                 goto done;
+             }
++#if !QJS_REGVM_THREAD
+             L_ROP_array_from: {
+                 int d = RD_REG();
+                 int ab = RD_REG();
+@@ -34011,6 +34040,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                value off
+              * the frame.
+              */
++#endif
+             L_ROP_initial_yield:
+                 /* No continuation state of its own: re-enter after it.
+                    Parameter defaults may have left counted values in the
+@@ -34108,6 +34138,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 }
+                 ret_val = JS_UNDEFINED;
+                 goto done;
++#if QJS_REGVM_THREAD
++            L_mono_unreachable:
++                abort();
++#endif
+             L_default:
+                 JS_ThrowInternalError(caller_ctx,
+                                       "register VM: unimplemented opcode %d", op);

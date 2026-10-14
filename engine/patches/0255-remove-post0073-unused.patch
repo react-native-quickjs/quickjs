@@ -1,0 +1,318 @@
+Subject: Remove the warnings post-0073 code introduced
+
+What this does
+  Removes variables, functions and macros that post-0073 code left unused:
+  three `old1` locals read only under `#if !QJS_DRC` (hoisted into that
+  branch), an unused `imm`, an unused `it`/`nx` pair per iterator-close handler
+  (the decoding load stays), `np`/`ns`/`np2`/`ns2` in four liveness loops,
+  `k` in two fuse passes, `shift`, `opcode`/`nr_buf`/`var_refs`, `enc_ok`,
+  `encode_reg_count`, `deferred`, `nreg`, `n_edges` and `atom_count`; the
+  `regvm_t_get_field_chain_free1` and `js_scan_argv_safe` declarations that go
+  with their already-guarded definitions.
+
+Why we need it
+  Each is a `-Wunused-variable`, `-Wunused-function` or
+  `-Wunused-but-set-variable` warning in one or more configurations, and every
+  one is dead storage or a stale store. Removing them shrinks the source and
+  keeps the warning counts falling.
+
+What it adds
+  No new API. Runtime only.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 7cc552e..5de8852 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25827,7 +25827,9 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_field_chain_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_get_field_chain_second_slow(REGVM_ARGS);
++#if !QJS_DRC
+ static uint8_t *REGVM_CC regvm_t_get_field_chain_free1(REGVM_ARGS);
++#endif
+ static uint8_t *REGVM_CC regvm_t_mul_add(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_mul_sub(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_add_mul(REGVM_ARGS);
+@@ -28453,7 +28455,7 @@ regvm_t_get_field_chain_slow(REGVM_ARGS)
+     int r1 = T_REG(3);
+     JSAtom atom1 = (JSAtom)T_U32(5);
+     int site1 = T_REG(9);
+-    JSValue v1, old1;
++    JSValue v1;
+ 
+     if (site1 == REG_IC_NONE) {
+         v1 = JS_GetProperty(ctx, FR(r1), atom1);
+@@ -28466,7 +28468,7 @@ regvm_t_get_field_chain_slow(REGVM_ARGS)
+     FR(d1) = v1;
+     REG_ADOPT(ctx->rt, v1);
+ #else
+-    old1 = FR(d1);
++    JSValue old1 = FR(d1);
+     FR(d1) = v1;
+     if (unlikely(REGVM_HAS_COUNT(old1)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old1)) <= 0)) {
+@@ -28501,7 +28503,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS)
+     int site1 = T_REG(9);
+     int d2 = T_REG(11);
+     int site2 = T_REG(19);
+-    JSValue v1, v2, old1;
++    JSValue v1, v2;
+ 
+     if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r1),
+                                      site1, &v1)))
+@@ -28509,7 +28511,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS)
+ #if QJS_DRC
+     FR(d1) = v1;
+ #else
+-    old1 = FR(d1);
++    JSValue old1 = FR(d1);
+     FR(d1) = v1;
+     if (unlikely(REGVM_HAS_COUNT(old1)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old1)) <= 0)) {
+@@ -28530,7 +28532,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
+     int site1 = T_REG(9);
+     int d2 = T_REG(11);
+     int site2 = T_REG(19);
+-    JSValue recv = FR(r1), v1, old1, v2;
++    JSValue recv = FR(r1), v1, v2;
+ 
+     if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT)) {
+         JSObject *p = JS_VALUE_GET_OBJ(recv);
+@@ -28552,7 +28554,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
+ #if QJS_DRC
+     FR(d1) = v1;
+ #else
+-    old1 = FR(d1);
++    JSValue old1 = FR(d1);
+     FR(d1) = v1;
+     if (unlikely(REGVM_HAS_COUNT(old1)) &&
+         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old1)) <= 0)) {
+@@ -29579,7 +29581,6 @@ static uint8_t *REGVM_CC regvm_t_local_rmw_branch(REGVM_ARGS)
+ {
+     int sub = T_U8(1);
+     int slot = T_U16(2);
+-    int32_t imm = T_I32(4);
+     int32_t off = T_I32(8);
+ 
+     if (sub & REG_RMW_UNARY) {
+@@ -32688,8 +32689,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                   REGVM_NEXT(); }
+             L_ROP_iter_close: {
+                                   REGVM_CAPTURE_IP_MONO(rpc - 1);
+-                int it = RD_REG();
+-                int nx = RD_REG();
++                (void)RD_REG();     /* it */
++                (void)RD_REG();     /* nx */
+                 int k;
+                 /*
+                  * The entry this loop pushed is the innermost iterator entry,
+@@ -35167,8 +35168,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+         case ROP_iter_close:
+      {
+                                       f->cap_ip = rpc - 1;
+-                    int it = RD_REG();
+-                    int nx = RD_REG();
++                    (void)RD_REG();     /* it */
++                    (void)RD_REG();     /* nx */
+                     int k;
+                     /*
+                      * The entry this loop pushed is the innermost iterator
+@@ -36208,6 +36209,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ 
+ #if QJS_REGVM
+     regvm_throw_pending = 0;
++    /* Read only by the stack dispatch below, which a register build compiles
++       out; the prologue still assigns them. */
++    (void)opcode; (void)nr_buf; (void)var_refs;
+ #endif
+     if (js_poll_interrupts(caller_ctx))
+         return JS_EXCEPTION;
+@@ -63142,7 +63146,7 @@ static void regvm_fuse_local_rmw(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+                                  int n_pcs, int n_values,
+                                  const uint8_t *phi_uses)
+ {
+-    int n = ir->n_insns, i, k, out = 0;
++    int n = ir->n_insns, i, out = 0;
+     uint8_t *nref = NULL;
+     unsigned char *drop = NULL;
+     int *remap = NULL, *first = NULL;
+@@ -63273,7 +63277,7 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+                                 int n_pcs, int n_values,
+                                 const uint8_t *phi_uses)
+ {
+-    int n = ir->insns ? ir->n_insns : 0, i, k, out = 0;
++    int n = ir->insns ? ir->n_insns : 0, i, out = 0;
+     uint8_t *nref = NULL;
+     unsigned char *drop = NULL;
+     int *remap = NULL, *first = NULL;
+@@ -65253,13 +65257,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     int n_edges = 2 * n_blocks;
+     int n_moves = 0, n_stubs = 0, n_stubs_used = 0, unencodable = 0, rc = -1;
+     const char *unc_why = "?";
+-    int enc_ok = 0;             /* the rcc table is handed to the bytecode */
+     int cycle_reg = -1;
+     int pc_cap = 0;             /* capacity of pc_to_insn, in pcs */
+     int ctl_count = 0;          /* the frame's control-stack bound, from the IR */
+     /* The physical register count the IR was encoded against (values, scratch,
+        window); the baseline tier places its stack area above it. */
+-    int encode_reg_count = 0;
+     uint8_t *phi_in = NULL;
+     int *rcc_canon = NULL;
+     /* The baseline tier's stack-shape scratch, filled by the encoder's sim hook
+@@ -65270,7 +65272,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                               it by the spill temporaries */
+     int *bl_map = NULL;     /* the baseline's value+temp -> register map */
+     int *bl_val = NULL;     /* the baseline spill pass's value -> register map */
+-    int b, i, k, s, pos, d, np, ns, fall, target, u;
++    int b, i, k, s, pos, d, fall, target, u;
+ 
+     memset(&bscr, 0, sizeof(bscr));
+     /* The baseline tier's sim hook records stack shapers; other builds leave
+@@ -66056,7 +66058,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+        the slot and the operand is dropped, shifting the atom and site down. */
+     for (i = 0; i < ir.n_insns; i++) {
+         JSRegInsn *in = &ir.insns[i];
+-        int base = in->rop, slotpos = -1, shift = 0;
++        int base = in->rop, slotpos = -1;
+ 
+         switch (base) {
+         case ROP_get_local_field: slotpos = 1; break;
+@@ -66150,7 +66152,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     {
+         /* Size the argument window from the widest call; a call with no
+            arguments still names the base. */
+-        int win_size = regvm_win_size(&ir), nreg;
++        int win_size = regvm_win_size(&ir);
+ 
+         if (fd->regvm_baseline) {
+             /* The baseline tier puts its stack area above every value register,
+@@ -66203,8 +66205,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                 goto done;
+             }
+         }
+-        nreg = reg_count + regvm_reserved_regs(&ir, win_size);
+-        encode_reg_count = nreg + 1;
+         {
+             int er;
+             fd->regvm_rcc = NULL;
+@@ -66286,7 +66286,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+         }
+     }
+     js_regvm_stats.encoded_funcs++;
+-    enc_ok = 1;
+     rc = 0;
+     goto done;
+  refused:
+@@ -66422,7 +66421,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+     long long peak_live = 0;
+     int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
+     int retry = 0;
+-    int deferred = 0;
+     const char *defer_why = "?";
+     if (REGVM_KNOB("REGVM_BASELINE_ALL")) {
+         /* Force every function through the baseline tier. Return before any
+@@ -67468,7 +67466,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+         memset(live_out, 0, nbits);
+ 
+         for (b = 0; b < n_blocks; b++) {
+-            int d, np, ns;
++            int d;
+             uint64_t *U, *D;
+             if (in_depth[b] < 0)
+                 continue;
+@@ -68104,7 +68102,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+         }
+ 
+         for (b = 0; b < n_blocks; b++) {
+-            int np, ns, d2;
++            int d2;
+             if (in_depth[b] < 0)
+                 continue;
+             for (i = 0; i < in_depth[b]; i++)
+@@ -68214,7 +68212,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+         /* An interval ends at the instruction that last pops the value, so a
+            consumer can take an operand's register. */
+         for (b = 0; b < n_blocks; b++) {
+-            int np, ns;
+             if (in_depth[b] < 0)
+                 continue;
+             for (i = 0; i < in_depth[b]; i++)
+@@ -68518,7 +68515,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+                         if (istart[V] < istart[P] || iend[V] > iend[P])
+                             continue;
+                         {
+-                            int d2 = in_depth[pb2], np2, ns2, seen_def = 0;
++                            int d2 = in_depth[pb2], seen_def = 0;
+                             for (i = 0; i < d2; i++)
+                                 scratch[i] = ent[ent_off[pb2] + i];
+                             for (i = 0; i < ns_ok; i++)
+@@ -68668,7 +68665,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+                baseline tier. The dead-end check belongs to the baseline. */
+             regvm_report_refusal(ctx, fd, enc_why ? enc_why : "?");
+             *pdeferred = 1;
+-            deferred = 1;
+             rc = 0;
+             goto done;
+         }
+@@ -68746,7 +68742,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+        it. */
+     regvm_report_refusal(ctx, fd, defer_why);
+     *pdeferred = 1;
+-    deferred = 1;
+     rc = 0;
+  done:
+     js_free(ctx, bof);
+@@ -69114,7 +69109,7 @@ static int regvm_baseline_cfg(JSContext *ctx, JSFunctionDef *fd,
+     const uint8_t *bc = fd->byte_code.buf;
+     int bc_len = fd->byte_code.size;
+     int *bof = NULL;
+-    int n_blocks = 1, n_edges = 0, prepend_entry = 0, b, pos, i;
++    int n_blocks = 1, prepend_entry = 0, b, pos, i;
+ 
+     B->bc = bc;
+     B->bc_len = bc_len;
+@@ -69168,7 +69163,6 @@ static int regvm_baseline_cfg(JSContext *ctx, JSFunctionDef *fd,
+         B->out_depth[b] = -1;
+         if (prepend_entry && b == 0) {
+             B->succ[0] = 1;
+-            n_edges++;
+             continue;
+         }
+         last = B->bstart[b];
+@@ -69183,7 +69177,6 @@ static int regvm_baseline_cfg(JSContext *ctx, JSFunctionDef *fd,
+                 goto fail;
+             }
+             B->succ[b * 2] = tb;
+-            n_edges++;
+         }
+         if (fall && last + short_opcode_info(bc[last]).size < bc_len) {
+             int fb = bof[last + short_opcode_info(bc[last]).size];
+@@ -69192,7 +69185,6 @@ static int regvm_baseline_cfg(JSContext *ctx, JSFunctionDef *fd,
+                 goto fail;
+             }
+             B->succ[b * 2 + 1] = fb;
+-            n_edges++;
+         }
+     }
+     js_free(ctx, bof);
+@@ -70212,7 +70204,9 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
+ /* create a function object from a function definition. The function
+    definition is freed. All the child functions are also created. It
+    must be done this way to resolve all the variables. */
++#if !QJS_REGVM || QJS_AOT
+ static void js_scan_argv_safe(JSFunctionBytecode *b);
++#endif
+ static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
+                                   bool *argv_safe, bool *args_captured);
+ #if QJS_REGVM
+@@ -74071,7 +74065,6 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+     int *targets = NULL;
+     int exec = 0, n_targets = 0, n_atoms = 0, rc = -1, i;
+     bool argv_safe = true, args_captured = false;
+-    uint32_t atom_count = ctx->rt->atom_size;
+ #if QJS_REGVM_THREAD
+     bool all_threaded = true;
+ #endif

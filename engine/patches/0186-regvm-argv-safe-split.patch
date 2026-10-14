@@ -1,66 +1,21 @@
-From: quickjs-ng bundle work
-Subject: Register VM: split argv_safe from args_captured (P6)
+Subject: Split `argv_safe` from `args_captured`
 
 What this does
-  Fixes a memory-safety regression from 0182/0185. Those computed b->argv_safe
-  from regvm_scan_argv_safe, which only checked the args_captured conditions (a
-  var_ref onto a parameter, or the mapped arguments object). But argv_safe has a
-  second consumer: JS_CallInternal uses it
-  ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b)) to decide whether a C
-  caller's argv (JS_Call / JS_CallFree / JS_CallConstructor*) may be used in
-  place. A function that writes a parameter was therefore reported argv-safe,
-  its put_arg stored straight into the caller's borrowed array, and the caller
-  later freed a value it no longer owned (free_zero_refcount assertion).
-
-  regvm_scan_argv_safe is replaced by regvm_scan_arg_flags(code, len,
-  &argv_safe, &args_captured), which computes the two flags separately, as the
-  stack scan does:
-    args_captured  a var_ref onto a parameter slot (ROP_make_local_ref kind 1)
-                   or the mapped arguments object -- unchanged;
-    argv_safe      false for args_captured, or for any of ROP_put_arg,
-                   ROP_put_arg_xfer, ROP_eval, ROP_apply_eval, ROP_get_arg_el,
-                   ROP_apply_arguments -- the register counterparts of every
-                   opcode js_argv_safe_opcode rejects.
-  The fused decoder (P3) computes both in its single pass, and the three scan
-  sites (js_create_function, the eager read, materialization) use the new
-  function. The stack scan is refactored into js_scan_arg_flags_raw so the
-  debug cross-check can run on fd->byte_code even after P5 stops installing it.
+  Split `argv_safe` from `args_captured`.
 
 Why we need it
-  argv_safe is read in every build, not only by the stack VM as the P2 note
-  claimed. Reporting a parameter-writing function safe lets it clobber a C
-  caller's argv and corrupt reference counts.
+  But `JS_CallInternal` reads it in every build to decide whether a C caller's argv may be used in place; a parameter-writing callee then wrote straight into the caller's array and corrupted reference counts.
 
 What it adds
-  quickjs.c
-      regvm_arg_ref_op / regvm_op_writes_args / regvm_argv_safe_op /
-      regvm_scan_arg_flags; js_scan_arg_flags_raw + the js_scan_argv_safe
-      refactor; the decoder's two-flag computation; the js_create_function,
-      eager-read and materialization updates; the debug cross-check.
+  `regvm_scan_arg_flags` computes both flags separately (`argv_safe` also false for `ROP_put_arg`/`ROP_put_arg_xfer`/`ROP_eval`/`ROP_apply_eval`/`ROP_get_arg_el`/`ROP_apply_arguments`); the decoder computes both; `js_scan_arg_flags_raw` for the debug cross-check.
 
-  Repro/gate: .local/regvm-bundle/argv-clobber.c calls ten parameter-writing
-  shapes through JS_Call and checks argv[0]. Before: cases 1, 2 and 4 print
-  CLOBBERED and teardown aborts. After: all ten ok with clean ASan teardown, in
-  source, eager-bundle and lazy-bundle modes (the script is round-tripped
-  through JS_WriteObject/JS_ReadObject for the latter two).
-
-  Debug cross-check: the register scan may be MORE permissive than the stack
-  scan, because the lowering elides dead argument stores (a parameter the stack
-  code writes back to arg_buf but the register code keeps in a register, e.g.
-  `function(n){ var s=0; while(n>0){ s+=n; n--; } return s; }`). The check
-  therefore asserts the sound direction, `stack argv_safe => register
-  argv_safe`, plus exact args_captured equality; the P6 bug itself (a register
-  scan that misses a put_arg) is caught by the argv-clobber gate. Run over the
-  differential suite (400/0/0) and test262 in a debug build.
-
-  Gates: box2d 546.1008391043414 (source/eager/lazy); test262 50/81192 no
-  leaks; differential corpus 400/0/0; 13 Octane rows clean.
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index ff659ce..7b8ee72 100644
+index e98b401..39caa57 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -69632,8 +69632,11 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
+@@ -67087,8 +67087,11 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
     definition is freed. All the child functions are also created. It
     must be done this way to resolve all the variables. */
  static void js_scan_argv_safe(JSFunctionBytecode *b);
@@ -73,14 +28,15 @@ index ff659ce..7b8ee72 100644
  #endif
  
  static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
-@@ -69849,18 +69852,16 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -67303,19 +67306,16 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b->ic_entries = JS_IC_ENTRIES;
  
  #if QJS_REGVM && !QJS_AOT
-     /* D9: no stack bytecode. byte_code_buf stays NULL and byte_code_len 0; the
+-    /* No stack bytecode: byte_code_buf stays NULL and byte_code_len 0; the
 -       register program below is the only code this function has. */
-+       register program below is the only code this function has. fd->byte_code
-+       stays alive until the register block so a debug build can cross-check the
-+       register scan against the stack scan, then is freed. */
++    /* No stack bytecode: byte_code_buf stays NULL and byte_code_len 0.
++       fd->byte_code lives until the register block, for the cross-check below,
++       then is freed. */
      b->byte_code_buf = NULL;
      b->byte_code_len = 0;
 -    js_free(ctx, fd->byte_code.buf);
@@ -95,49 +51,36 @@ index ff659ce..7b8ee72 100644
  #endif
  
  #if QJS_REGVM
-@@ -69885,25 +69886,44 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -67340,23 +67340,33 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
          fd->regvm_code = NULL;
          fd->regvm_len = 0;
          {
 -            bool rs = regvm_scan_argv_safe(b->regvm_code, b->regvm_len);
 -#if !defined(NDEBUG) && (QJS_AOT)
--            /* Bundle plan 4.4: the stack scan js_scan_argv_safe ran must agree
--               on args_captured. (Only the AOT/stack paths run it; the non-AOT
--               register build has no stack bytecode.) */
+-            /* The stack scan js_scan_argv_safe ran must agree on
+-               args_captured (only the AOT path has stack bytecode). */
 -            assert(rs == (b->args_captured == 0));
 -#endif
 -#if QJS_REGVM && !QJS_AOT
--            /* D9: no stack bytecode, so the register scan is the only source of
--               argv_safe. It reproduces the register VM's borrow condition
--               (!args_captured); see the P2 note. */
+-            /* No stack bytecode, so the register scan is the only source of
+-               argv_safe. */
 -            b->argv_safe = rs;
 -#else
 -            (void)rs;
 +            bool rs_argv, rs_args;
 +            regvm_scan_arg_flags(b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
 +#if !defined(NDEBUG)
-+            /* Bundle plan 4.4 + P6: cross-check against the stack scan. The
-+               register scan may be STRICTER than the stack scan (it sees the
-+               lowered code), never more permissive:
-+                 - register argv_safe implies stack argv_safe;
-+                 - args_captured must match exactly.
-+               fd->byte_code is still alive here (freed below), so the stack
-+               scan can run in every build. */
++            /* Cross-check against the stack scan, which can still run here:
++               args_captured must match exactly, and the register scan may be
++               more permissive than the stack scan, never stricter (see below).
++               */
 +            {
 +                bool ss_argv, ss_args;
 +                js_scan_arg_flags_raw(fd->byte_code.buf, fd->byte_code.size,
 +                                      &ss_argv, &ss_args);
-+                /*
-+                 * P6: the register scan may be MORE permissive than the stack
-+                 * one, because the lowering elides dead argument stores (a
-+                 * parameter the stack code writes back to arg_buf but the
-+                 * register code keeps in a register). So the sound direction is
-+                 * the other one: if the stack program is safe, the register
-+                 * program (which has at most the stack's argument writes) must
-+                 * be safe too. The bug P6 fixed -- a register scan that misses
-+                 * a put_arg -- is caught by the argv-clobber gate, not by this
-+                 * cross-check.
-+                 */
++                /* The register scan may be more permissive than the stack scan,
++                   because the lowering drops dead argument stores. So if the
++                   stack program is safe the register program must be too. */
 +                assert(!ss_argv || rs_argv);
 +                assert(rs_args == ss_args);
 +            }
@@ -154,15 +97,15 @@ index ff659ce..7b8ee72 100644
      b->func_name = fd->func_name;
      if (fd->arg_count + fd->var_count > 0) {
          b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
-@@ -73200,72 +73220,124 @@ static bool js_arg_ref_opcode(const uint8_t *bc, int pos, int op)
+@@ -70636,69 +70646,117 @@ static bool js_arg_ref_opcode(const uint8_t *bc, int pos, int op)
           bc[pos + 1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS);
  }
  
 -static void js_scan_argv_safe(JSFunctionBytecode *b)
-+/* Scan a stack-bytecode buffer and compute both flags the way the stack VM
-+   does: `args_captured` for a var_ref onto a parameter slot, and `argv_safe`
-+   for "a C caller's argv may be used in place". Both stop at the first
-+   argv-unsafe opcode, exactly like js_scan_argv_safe always has. */
++/* Scan a stack-bytecode buffer and compute both flags as the stack VM does:
++   `args_captured` for a var_ref onto a parameter slot, `argv_safe` for "a C
++   caller's argv may be used in place". Both stop at the first argv-unsafe
++   opcode. */
 +static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
 +                                  bool *argv_safe, bool *args_captured)
  {
@@ -210,19 +153,15 @@ index ff659ce..7b8ee72 100644
  }
  
  #if QJS_REGVM
--/* Bundle plan D7: the register-code form of js_arg_ref_opcode -- does the
--   program create a var_ref onto a parameter slot, or materialise the mapped
--   `arguments` object? Those are the cases that make a register frame's
--   argument window unsafe to borrow (`regvm_args_borrowable`), because a write
--   through the ref frees the slot's old value. `ops` points at the first
--   operand byte. The two conditions are exactly the stack scan's
--   js_arg_ref_opcode, so the flag they compute is args_captured; a debug build
--   asserts the two agree (§4.4). */
--static bool regvm_argv_safe_op(int op, const uint8_t *ops)
+-/* The register-code form of js_arg_ref_opcode: does the program create a
 +/* The register-code form of js_arg_ref_opcode: does the instruction create a
-+   var_ref onto a parameter slot, or materialise the mapped `arguments` object?
-+   Those make a register frame's argument window unsafe to BORROW
-+   (`regvm_args_borrowable`). `ops` points at the first operand byte. */
+    var_ref onto a parameter slot or materialise the mapped `arguments` object?
+-   Either makes the argument window unsafe to borrow (`regvm_args_borrowable`):
+-   a write through the ref frees the slot's old value. `ops` points at the
+-   first operand byte. */
+-static bool regvm_argv_safe_op(int op, const uint8_t *ops)
++   Either makes the argument window unsafe to borrow. `ops` points at the first
++   operand byte. */
 +static bool regvm_arg_ref_op(int op, const uint8_t *ops)
  {
      switch (op) {
@@ -237,10 +176,8 @@ index ff659ce..7b8ee72 100644
 +    }
 +}
 +
-+/* Does the opcode write an argument slot or reach the `arguments` object? The
-+   register counterparts of the write/eval opcodes js_argv_safe_opcode rejects.
-+   `put_arg` and `put_arg_xfer` are the handlers that store into arg_buf; the
-+   rest reach the arguments object or run eval. */
++/* Does the opcode write an argument slot (`put_arg`, `put_arg_xfer`), reach
++   the `arguments` object, or run eval? */
 +static bool regvm_op_writes_args(int op)
 +{
 +    switch (op) {
@@ -261,24 +198,19 @@ index ff659ce..7b8ee72 100644
 -   every other encoded-code walk: the encoder narrows operands in place. */
 -static bool regvm_scan_argv_safe(const uint8_t *code, int len)
 +/* The register-code form of js_argv_safe_opcode: may a C caller's argv be used
-+   in place? False for an argument write, an argument var_ref, the mapped
-+   arguments object, or eval -- the same set the stack scan rejects. `ops`
-+   points at the first operand byte. */
++   in place? `ops` points at the first operand byte. */
 +static bool regvm_argv_safe_op(int op, const uint8_t *ops)
 +{
 +    return !regvm_op_writes_args(op) && !regvm_arg_ref_op(op, ops);
 +}
 +
-+/*
-+ * Walk a register program and compute the two flags separately, the way
-+ * js_scan_argv_safe does:
++/* Walk a register program and compute the two flags, as js_scan_argv_safe
++ * does:
 + *   args_captured  a var_ref onto a parameter slot, or the mapped arguments
-+ *                  object (the condition regvm_args_borrowable consults);
-+ *   argv_safe      a C caller's argv may be used in place -- JS_CallInternal
-+ *                  reads this in every build, so a parameter write must clear
-+ *                  it too, not just a capture.
-+ * `wide` is 1, as at every other encoded-code walk. A malformed program leaves
-+ * both flags false. */
++ *                  object (consulted by regvm_args_borrowable);
++ *   argv_safe      a C caller's argv may be used in place; JS_CallInternal
++ *                  reads it in every build, so a parameter write clears it.
++ * A malformed program leaves both flags false. */
 +static void regvm_scan_arg_flags(const uint8_t *code, int len,
 +                                 bool *argv_safe, bool *args_captured)
  {
@@ -308,7 +240,7 @@ index ff659ce..7b8ee72 100644
  }
  #endif
  
-@@ -73436,7 +73508,7 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+@@ -70863,7 +70921,7 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
      uint8_t *is_start = NULL;
      int *targets = NULL;
      int exec = 0, n_targets = 0, n_atoms = 0, rc = -1, i;
@@ -317,7 +249,7 @@ index ff659ce..7b8ee72 100644
      uint32_t atom_count = ctx->rt->atom_size;
  #if QJS_REGVM_THREAD
      bool all_threaded = true;
-@@ -73663,10 +73735,16 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71088,10 +71146,16 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
                  goto fail_ins;
              }
          }
@@ -336,9 +268,9 @@ index ff659ce..7b8ee72 100644
 +            argv_safe = false;
 +        }
  #if QJS_REGVM_THREAD
-         /* D13: the interpreter-eligibility flag is a property of the build, not
-            the bytecode, so it is recomputed here rather than serialized. Doing
-@@ -73726,8 +73804,8 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+         /* The eligibility flag is not serialized; computing it here saves a
+            second walk. */
+@@ -71150,8 +71214,8 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
              goto fail;
          }
      }
@@ -349,21 +281,17 @@ index ff659ce..7b8ee72 100644
  #if QJS_REGVM_THREAD
      b->regvm_all_threaded = all_threaded;
  #endif
-@@ -74672,23 +74750,23 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -72084,21 +72148,20 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+             b->regvm_owns_atoms = 0;
              goto fail_unregistered;
          }
-         /*
--         * Bundle plan D7: `argv_safe` is never serialized, and after P3 a
--         * register bundle carries no stack code to scan. Recompute it from the
--         * register program. The register scan reproduces the register VM's own
--         * borrow condition (`!args_captured`, see regvm_args_borrowable), which
--         * is the flag a register frame consults.
-+         * Bundle plan D7 + P6: `argv_safe` and `args_captured` are never
-+         * serialized. Recompute both from the register program. `argv_safe`
-+         * must clear on a parameter write as well as a capture, because
-+         * JS_CallInternal reads it in every build to decide whether a C
-+         * caller's argv can be used in place.
-          */
+-        /*
+-         * `argv_safe` is never serialized, and a register bundle carries no
+-         * stack code to scan, so recompute it from the register program.
+-         */
++        /* `argv_safe` and `args_captured` are never serialized: recompute both
++           from the register program. `argv_safe` clears on a parameter write as
++           well as a capture. */
          {
 -            bool rs = regvm_scan_argv_safe(b->regvm_code, b->regvm_len);
 +            bool rs_argv, rs_args;
@@ -377,8 +305,8 @@ index ff659ce..7b8ee72 100644
 -#endif
 -            b->args_captured = !rs;
 -            b->argv_safe = rs;
-+            /* 4.4 + P6: the stack scan JS_ReadFunctionBytecode ran must agree;
-+               the register scan may be stricter, never more permissive. */
++            /* The stack scan JS_ReadFunctionBytecode ran must agree, in the
++               same direction as at compile time. */
 +            assert(!rs_argv || b->argv_safe);
 +            assert(rs_args == (b->args_captured != 0));
 +#endif

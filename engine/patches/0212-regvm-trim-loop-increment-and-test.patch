@@ -1,7 +1,21 @@
+Subject: Trim the loop increment and test
+
+What this does
+  Trim the loop increment and test.
+
+Why we need it
+  `inc` and `branch_nlt_s` are the counted loop's hot pair; `inc` carried the float and overflow paths inline and `branch_nlt_s` used 8-byte xmm payload loads and two separate tag checks.
+
+What it adds
+  `inc` keeps only the int fast path and decodes `d`/`s` with one load; `branch_nlt_s` is hand-written: one 4-byte operand decode, one combined tag test, a 32-bit payload compare, everything else slow.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 4b215b8..6711ff3 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25662,7 +25662,7 @@
+@@ -25035,7 +25035,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
      X(instanceof, REG_BIN_INSTANCEOF) X(in, REG_BIN_IN)
  
  #define REGVM_T_UNARY_LIST(X) \
@@ -10,19 +24,19 @@ diff --git a/quickjs.c b/quickjs.c
      X(not, REG_UN_NOT) X(to_numeric, REG_UN_TO_NUMERIC)
  
  /* the cold halves: decode the shape, run the engine's slow routine, continue */
-@@ -25830,6 +25830,11 @@
+@@ -25188,6 +25188,11 @@ REGVM_T_BINARY_LIST(T_DECL)
  REGVM_T_UNARY_LIST(T_DECL)
  #undef T_DECL
  
-+/* Step 2.1: the counted loop's increment, with the float and overflow cases in
-+   the slow handler. */
++/* The counted loop's increment, with the float and overflow cases in the slow
++   handler. */
 +static uint8_t *REGVM_CC regvm_t_inc(REGVM_ARGS);
 +static uint8_t *REGVM_CC regvm_t_inc_slow(REGVM_ARGS);
 +
  static uint8_t *REGVM_CC regvm_t_binary(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_binary_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_binary_loc_reg(REGVM_ARGS);
-@@ -26314,6 +26319,7 @@
+@@ -25652,6 +25657,7 @@ static const regvm_handler regvm_threaded[ROP_COUNT] = {
      REGVM_T_BINARY_LIST(T_BINARY_ENTRY)
      REGVM_T_UNARY_LIST(T_BINARY_ENTRY)
  #undef T_BINARY_ENTRY
@@ -30,7 +44,7 @@ diff --git a/quickjs.c b/quickjs.c
  #define T_EXPLICIT_ENTRY(name, handler) [ROP_##name] = handler,
      REGVM_T_EXPLICIT_LIST(T_EXPLICIT_ENTRY)
  #undef T_EXPLICIT_ENTRY
-@@ -26334,6 +26340,7 @@
+@@ -25672,6 +25678,7 @@ static const uint8_t regvm_is_threaded[ROP_COUNT] = {
      REGVM_T_BINARY_LIST(T_BINARY_MARK)
      REGVM_T_UNARY_LIST(T_BINARY_MARK)
  #undef T_BINARY_MARK
@@ -38,15 +52,13 @@ diff --git a/quickjs.c b/quickjs.c
  #define T_EXPLICIT_MARK(name, handler) [ROP_##name] = 1,
      REGVM_T_EXPLICIT_LIST(T_EXPLICIT_MARK)
  #undef T_EXPLICIT_MARK
-@@ -27624,6 +27631,34 @@
+@@ -26818,6 +26825,32 @@ REGVM_T_BINARY_LIST(T_DEF_BIN)
  REGVM_T_UNARY_LIST(T_DEF_UN)
  #undef T_DEF_UN
  
-+/*
-+ * Step 2.1: `inc` is the counted loop's increment and is almost always an int.
-+ * The float case and the INT32_MAX overflow both belong to the slow handler, so
-+ * the fast path is a tag test, an overflow test, the increment and the store.
-+ */
++/* `inc` is almost always an int: the fast path is a tag test, an INT32_MAX
++   test, the increment and the store; the float case and overflow go to the
++   slow handler. */
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_inc_slow(REGVM_ARGS)
 +{ T_BODY_RR_UN(REG_UN_INC, T_SZ_RR); }
 +static uint8_t *REGVM_CC regvm_t_inc(REGVM_ARGS)
@@ -73,18 +85,14 @@ diff --git a/quickjs.c b/quickjs.c
  /* The generic forms: the kind is still an operand, so it is read in the body
     and passed on to the same slow routines. */
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_binary_slow(REGVM_ARGS)
-@@ -28996,8 +29031,43 @@
+@@ -28053,8 +28086,39 @@ T_DEF_CMP_BRANCH(branch_cmp_reg_reg_s, T_U8(1), T_REG8(2), T_REG8(3),
                   T_OFF8(4), T_SZ_BRRT_S)
  T_DEF_CMP_BRANCH(branch_lt_s,   REG_BIN_LT,  T_REG8(1), T_REG8(2), T_OFF8(3),
                   T_SZ_RRT_S)
 -T_DEF_CMP_BRANCH(branch_nlt_s,  REG_BIN_LT | REG_CMP_INVERT, T_REG8(1),
 -                 T_REG8(2), T_OFF8(3), T_SZ_RRT_S)
-+/*
-+ * Step 2.1: `branch_nlt_s` is the counted loop's test and is almost always two
-+ * ints. Decode the three operands with one load, test both tags together, and
-+ * compare the 32-bit payloads; the float, string and engine cases go to the
-+ * slow handler.
-+ */
++/* `branch_nlt_s` is almost always two ints: decode the three operands with
++   one load, test both tags together, and compare the 32-bit payloads. */
 +static __attribute__((noinline)) uint8_t *REGVM_CC
 +regvm_t_branch_nlt_s_slow(REGVM_ARGS)
 +{

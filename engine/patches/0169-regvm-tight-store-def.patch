@@ -1,31 +1,29 @@
-Subject: register VM tight-store analysis walks forward, not back
+Subject: Tight-store analysis walks forward
 
-What this does:
-  `regvm_tight_store_def` found the two bytecode positions immediately before a
-  store by scanning forward from the block start on every call. The caller
-  already walks the block in order, so it now threads `prev`/`prev2` in and the
-  pass is linear.
+What this does
+  Tight-store analysis walks forward.
 
-Why we need it:
-  The backward scan made the tight-store pass quadratic on functions with many
-  stores per block.
+Why we need it
+  `regvm_tight_store_def` rescanned forward from the block start on every store, quadratic on store-heavy blocks.
 
-Needs a bytecode version bump:
-  No. Lowering only.
+What it adds
+  Threads `prev`/`prev2` from the caller's in-order walk into `regvm_tight_store_def` instead of recomputing them.
 
----
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -61926,21 +62029,23 @@
+@@ -60078,23 +60078,22 @@ static int regvm_perm_of(int op, int out)
+     return map && out >= 0 && out < n ? map[out] : -1;
+ }
  
- /* Identify the result-producing instruction of a syntactically tight store.
-    The answer depends only on the bytecode sequence inside this basic block. */
-+/*
-+ * The definition position of a tight slot store at `store_pos`, given the two
-+ * positions immediately before it (`prev`, `prev2`). The caller walks the block
-+ * in order, so it already knows them; recomputing them by scanning back from the
-+ * block start for every store is what made this pass quadratic.
-+ */
+-/* Identify the result-producing instruction of a syntactically tight store.
+-   The answer depends only on the bytecode sequence inside this basic block. */
++/* Identify the result-producing instruction of a syntactically tight store,
++   from the bytecode sequence inside this basic block. */
++/* The definition position of a tight slot store at `store_pos`, given the two
++   positions before it (`prev`, `prev2`), which the in-order caller already
++   knows. */
  static int regvm_tight_store_def(const JSFunctionDef *fd, const uint8_t *bc,
                                   int block_start, int store_pos,
 +                                 int prev, int prev2,
@@ -47,15 +45,15 @@ Needs a bytecode version bump:
          return -1;
      dpos = prev;
      if (bc[dpos] == OP_dup) {
-@@ -65402,6 +65572,7 @@
-     /* Allocate the P4 home/split ids after instruction results and before
-        entry values and phis. This keeps every new id stable across phi solving. */
+@@ -63289,6 +63288,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+     /* Allocate the home/split ids after instruction results and before entry
+        values and phis, so they stay stable across phi solving. */
      for (b = 0; b < n_blocks; b++) {
 +        int tprev = -1, tprev2 = -1;
          if (in_depth[b] < 0)
              continue;
          for (pos = bstart[b]; pos < bstart[b + 1];
-@@ -65411,6 +65582,7 @@
+@@ -63298,6 +63298,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              if (k >= 0 && (role == REGVM_SLOT_WRITE || role == REGVM_SLOT_SET)) {
                  int tight_k = -1;
                  int dpos = regvm_tight_store_def(fd, bc, bstart[b], pos,
@@ -63,7 +61,7 @@ Needs a bytecode version bump:
                                                   slot_ok, ok_index, &tight_k);
                  if (dpos >= 0) {
                      home_slot_of_def[dpos] = tight_k;
-@@ -65432,6 +65604,8 @@
+@@ -63319,6 +63320,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  js_regvm_home_rmw++;
  #endif
              }
@@ -71,4 +69,4 @@ Needs a bytecode version bump:
 +            tprev = pos;
          }
      }
-     /*
+     /* Each promoted slot's entry value, numbered after the instruction results

@@ -1,44 +1,19 @@
-Subject: register VM: inline the frame release into the return path
+Subject: Inlines the register frame release into the return path
 
-What this does:
-  regvm_record_release is marked always_inline, so the two callers that walk a
-  finished frame -- regvm_t_return_nested, the hot return, and the other
-  release site -- no longer pay a call/ret pair for every return. The
-  var_ref arm, which only runs when the frame actually closed a closure, is
-  inlined with the rest and becomes part of the return handler's cold tail.
+What this does
+  Inlines the register frame release into the return path.
 
-Why we need it:
-  The return path is the tail of every call. At 10.6 M calls per box2d run the
-  call/ret pair is real work in a function that is otherwise a short walk over
-  about ten registers.
+Why we need it
+  The return path is the tail of every call and paid a call/ret pair for a function that is otherwise a short walk over about ten registers.
 
-Adds:
-  * quickjs.c: the forward declaration and the definition of
-    regvm_record_release gain __attribute__((always_inline)) inline.
+What it adds
+  `regvm_record_release` is marked `always_inline`, so `regvm_t_return_nested` and the other release site carry the walk directly and the symbol disappears; the closure `var_ref` arm only runs when the frame actually closed a closure and is inlined with the rest into the return handler's cold tail.
 
-Evidence:
-  box2d fixed.js, clang-19 -O3, perf stat -r7: 29.198 G to 29.167 G
-  instructions (-0.11%, -31 M), cycles -0.29%, wall -0.28%. The call micros
-  drop 3.0 instructions per call (call.js 355.0 to 352.0, meth.js 488.0 to
-  485.0). objdump: regvm_t_return_nested 35 to 131 instructions of code (the
-  inlined cold arm) and the regvm_record_release symbol is gone.
-  Box2d checksum 546.1008391043414 is unchanged and the register differential
-  suite is 398/0/0 in both mono and threaded modes; a -DQJS_REGVM_VERIFY=1 -O1
-  build is clean and prints the same checksum.
-
-  This is the only part of the plan's X5 call-protocol item that measured a
-  real reduction. The three other shapes tried there -- replacing the register
-  memset with an unrolled undefined-store loop, coalescing JSRegRun's
-  constant-zero clears, and merging the regs and var_refs clears -- all raised
-  instruction counts and were reverted. The remaining ~90 instructions per
-  call need a stack-allocated typed-register frame, not more hoisting.
-
-Bytecode bump:
-  No. No opcode, operand encoding or frame layout changes.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23769,7 +23769,8 @@
+@@ -23343,7 +23343,8 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
@@ -48,9 +23,9 @@ Bytecode bump:
  #endif
  
  /*
-@@ -25797,7 +25798,8 @@
-  * local_buf is var_buf in that case. The last handshake slot is excluded because
-  * it holds the control-stack depth as an integer rather than as a value.
+@@ -25186,7 +25187,8 @@ static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slot
+  * The last handshake slot holds the control-stack depth as an integer, so it
+  * is excluded.
   */
 -static void regvm_record_release(JSRuntime *rt, JSRegRun *rec)
 +static __attribute__((always_inline)) inline void

@@ -1,10 +1,25 @@
+Subject: Poll interrupts on the back edge
+
+What this does
+  Poll interrupts on the back edge.
+
+Why we need it
+  A loop with no calls never reached `JS_SetInterruptHandler`: the back edge only checked the DRC parked set, so `while (true) {}` and `for (;;) { i++; }` were uninterruptible.
+
+What it adds
+  The back edge decrements `ctx->interrupt_counter` and tail-calls a poll handler (which runs the DRC safepoint) at zero; a self-branch counts as a backward edge.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 6711ff3..0f2a8bd 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -10157,21 +10157,32 @@
+@@ -9978,22 +9978,28 @@ static void js_regvm_drc_resume(JSRuntime *rt, JSValue *regs, uint32_t nregs)
+  * call sites (a positive constant).
   */
  #if QJS_DRC
- /*
+-/*
 - * Checked inline at every backward branch, so the check costs three loads and a
 - * compare and, crucially, never makes the branch handler spill its state: the
 - * rare reconcile is a *tail call* into `regvm_t_safepoint_slow`, which runs the
@@ -18,14 +33,10 @@ diff --git a/quickjs.c b/quickjs.c
 -                      (rt_)->zct_limit)) {                                   \
 -        return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx); }            \
 -    } while (0)
-+ * Checked inline at every backward branch. A backward edge must also reach the
-+ * interrupt handler, or a loop with no calls is uninterruptible and a watchdog
-+ * cannot stop a runaway script: it decrements `interrupt_counter` and takes the
-+ * poll (which runs the deferred-reference-count safepoint too) when the counter
-+ * hits zero. The DRC check stays separate because its limit bounds the parked
-+ * set between polls. Both slow paths are tail calls, so the branch handlers
-+ * stay frameless.
-+ */
++/* At every backward branch: decrement `interrupt_counter` and poll at zero
++   (which also runs the deferred-RC safepoint), so a call-free loop stays
++   interruptible. The DRC check stays separate because its limit bounds the
++   parked set between polls. Both slow paths are tail calls. */
 +#define REGVM_DRC_BACKEDGE(ctx_, off_)                                       \
 +    do { if (unlikely((off_) <= 0)) {                                         \
 +        if (unlikely(--(ctx_)->interrupt_counter <= 0)) {                    \
@@ -48,16 +59,23 @@ diff --git a/quickjs.c b/quickjs.c
  #endif
  
  /* called with the ref_count of 'v' reaches zero. */
-@@ -25495,6 +25506,19 @@
-  * register file does not move across a reconcile, so re-entering the chain at
-  * `ip` (the branch target) is safe.
-  */
-+/*
-+ * The back-edge interrupt poll: the counter in `ctx` reached zero, so run the
-+ * handler (and the deferred-reference-count safepoint inside it) and re-enter
-+ * the chain at the branch target. A tail call, so the branch handlers stay
-+ * frameless.
-+ */
+@@ -24893,13 +24899,19 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
+     __attribute__((musttail)) return regvm_t_dispatch(ip, fr, f, ctx);
+ }
+ 
+-/*
+- * The back-edge reconcile, reached only from a branch whose target is behind it
+- * and only when the deferred-RC zero-count table has outgrown its limit. It is a
+- * tail call so the branch handlers stay frameless; see REGVM_DRC_BACKEDGE. The
+- * register file does not move across a reconcile, so re-entering the chain at
+- * `ip` (the branch target) is safe.
+- */
++/* The back-edge reconcile: reached from a backward branch when the zero-count
++   table has outgrown its limit. A tail call so the branch handlers stay
++   frameless; the register file does not move, so re-entering at `ip` (the
++   branch target) is safe. */
++/* The back-edge interrupt poll: run the handler (and the deferred-RC
++   safepoint inside it) and re-enter at the branch target. A tail call. */
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_interrupt_slow(REGVM_ARGS)
 +{
 +    if (__js_poll_interrupts(ctx) < 0)
@@ -68,8 +86,8 @@ diff --git a/quickjs.c b/quickjs.c
  #if QJS_DRC
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_ARGS)
  {
-@@ -25510,7 +25534,7 @@
-    itself, which counts it and executes it there. */
+@@ -24913,7 +24925,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
+    one to the dispatch loop. */
  #define T_NEXT(off) do { \
          int32_t _t_off = (off); \
 -        REGVM_DRC_BACKEDGE(ctx->rt, _t_off); \
@@ -77,7 +95,7 @@ diff --git a/quickjs.c b/quickjs.c
          __attribute__((musttail)) \
              return regvm_t_dispatch(ip + _t_off, fr, f, ctx); \
      } while (0)
-@@ -25533,7 +25557,7 @@
+@@ -24928,7 +24940,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
   */
  #define T_BR_NEXT(off) do { \
          int32_t _t_off = (off); \

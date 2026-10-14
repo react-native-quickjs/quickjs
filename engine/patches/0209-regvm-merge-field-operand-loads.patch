@@ -1,7 +1,21 @@
+Subject: Merge the field operand loads
+
+What this does
+  Merge the field operand loads.
+
+Why we need it
+  A named-field read decoded `d` and `r` with two separate 2-byte loads; they are adjacent in the instruction.
+
+What it adds
+  One 4-byte load plus two shifts for `d`/`r` in `get_field`/`get_field2`. The same trick for the store's `site`/`v` pair was and reverted.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 1b9398e..af9602d 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -28324,9 +28324,12 @@
+@@ -27448,9 +27448,12 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
      } \
      static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
      { \
@@ -17,8 +31,8 @@ diff --git a/quickjs.c b/quickjs.c
          JSValue val; \
          if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
              T_SET_NEXT_B(d, val, T_SZ_RRAS); \
-@@ -28341,9 +28344,12 @@
-        rewrite the opcode back if the site is no longer an own slot. */ \
+@@ -27463,9 +27466,12 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
+        opcode back. */ \
      static uint8_t *REGVM_CC regvm_t_##NAME##_own(REGVM_ARGS) \
      { \
 -        int d = T_REG(1); \

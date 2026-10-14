@@ -1,0 +1,138 @@
+Subject: Stop the AOT profiler's frame local shadowing the bytecode pointer
+
+What this does
+  In the two `inc_branch_lt` handlers the register holding the loop bound is
+  named `b`, which shadows the `JSFunctionBytecode *b` the AOT profiler macros
+  expect. Renames that local to `br`, and gives the extracted bodies in
+  quickjs-regvm-step.inc the `JSFunctionBytecode *b = rf->b` declaration their
+  siblings already have.
+
+Why we need it
+  A `QJS_AOT_PROFILE=1` build did not compile: the profiler received an int
+  where it wanted a JSFunctionBytecode *. tools/aot/digest-test.sh builds with
+  that flag, so the AOT profiler was broken while AOT itself is kept.
+
+What it adds
+  A rename and one declaration. No code changes.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index df69d4c..23f7aa8 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -2839,6 +2839,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc(uint8_t *ip, JSValue *fr, JSRegRun *rf,
+ 
+ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
++    JSFunctionBytecode *b = rf->b;
+     JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+@@ -2847,13 +2848,13 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSR
+     JSValue *regs = fr;
+     JSValue *arg_buf = rf->arg_buf;
+     int argc = rf->argc;
+-    (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 const uint8_t *i_start = rpc - 1;
+                 int d = RD_REG();
+-                int b = RD_REG();
++                int br = RD_REG();
+                 int32_t off = RD_I32();
+-                JSValue v = regs[d], bv = regs[b];
++                JSValue v = regs[d], bv = regs[br];
+                 int take;
+ 
+                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+@@ -2870,7 +2871,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSR
+                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
+                         goto exception;
+                     SET_REG_P(d, out);
+-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
++                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
+                     if (unlikely(take < 0))
+                         goto exception;
+                 }
+@@ -2884,6 +2885,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSR
+ 
+ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
++    JSFunctionBytecode *b = rf->b;
+     JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+@@ -2892,13 +2894,13 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, J
+     JSValue *regs = fr;
+     JSValue *arg_buf = rf->arg_buf;
+     int argc = rf->argc;
+-    (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
++    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+  {
+                 const uint8_t *i_start = rpc - 1;
+                 int d = RD_REG8();
+-                int b = RD_REG8();
++                int br = RD_REG8();
+                 int32_t off = RD_OFF8();
+-                JSValue v = regs[d], bv = regs[b];
++                JSValue v = regs[d], bv = regs[br];
+                 int take;
+ 
+                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+@@ -2915,7 +2917,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, J
+                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
+                         goto exception;
+                     SET_REG_P(d, out);
+-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
++                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
+                     if (unlikely(take < 0))
+                         goto exception;
+                 }
+diff --git a/quickjs.c b/quickjs.c
+index 8b397ca..838bd13 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -34670,9 +34670,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             L_ROP_inc_branch_lt: {
+                 const uint8_t *i_start = rpc - 1;
+                 int d = RD_REG();
+-                int b = RD_REG();
++                int br = RD_REG();
+                 int32_t off = RD_I32();
+-                JSValue v = regs[d], bv = regs[b];
++                JSValue v = regs[d], bv = regs[br];
+                 int take;
+ 
+                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+@@ -34689,7 +34689,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
+                         goto exception;
+                     SET_REG_P(d, out);
+-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
++                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
+                     if (unlikely(take < 0))
+                         goto exception;
+                 }
+@@ -34699,9 +34699,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             L_ROP_inc_branch_lt_s: {
+                 const uint8_t *i_start = rpc - 1;
+                 int d = RD_REG8();
+-                int b = RD_REG8();
++                int br = RD_REG8();
+                 int32_t off = RD_OFF8();
+-                JSValue v = regs[d], bv = regs[b];
++                JSValue v = regs[d], bv = regs[br];
+                 int take;
+ 
+                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+@@ -34718,7 +34718,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
+                         goto exception;
+                     SET_REG_P(d, out);
+-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
++                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
+                     if (unlikely(take < 0))
+                         goto exception;
+                 }

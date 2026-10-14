@@ -1,21 +1,28 @@
+Subject: Gives the register number paths their tag-specific fast cases: int32 bitwise/shift and inline double compare-branches
+
+What this does
+  Gives the register number paths their tag-specific fast cases: int32 bitwise/shift and inline double compare-branches.
+
+Why we need it
+  Every `&`/`\.
+
+What it adds
+  `/`^`/`<<`/`>>`/`>>>` on two int32 operands and every `<`/`<=`/`>`/`>=` on two doubles called the engine slow path, which re-tests tags the register VM had already tested.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21931,8 +21931,67 @@
+@@ -21762,8 +21762,59 @@ static inline int regvm_to_bool(JSContext *ctx, JSValue v)
      return JS_ToBool(ctx, v);
  }
  
 +/*
-+ * The bitwise and shift fast path. The engine's `js_binary_logic_slow` and
-+ * `js_shr_slow` convert both operands with JS_ToInt32/ToUint32 and then do the
-+ * 32-bit operation; for an operand that is already an int, or a double inside
-+ * the int32 range, that conversion is only a truncation, so it is done here. A
-+ * double outside the range, a BigInt, a string or anything else falls through
-+ * to the slow path, which owns the modular conversion, the BigInt cases and the
-+ * exceptions. Returns 0 for anything it does not handle.
-+ *
-+ * `(int32_t)d` is only defined for a `d` inside the int32 range, so the range is
-+ * checked rather than relied on; `2147483648.0` itself goes out of line, where
-+ * the modular conversion lives.
++ * The bitwise and shift fast path. For an int operand, or a double inside the
++ * int32 range, JS_ToInt32/ToUint32 is only a truncation, so it is done here.
++ * Anything else (out-of-range doubles included, since `(int32_t)d` is
++ * undefined there) goes to the slow path. Returns 0 for anything it does not
++ * handle.
 + */
 +static inline __attribute__((always_inline)) int regvm_to_int32_fast(JSValue v, int32_t *out)
 +{
@@ -59,24 +66,20 @@
 +
  static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue a, JSValue b, JSValue *out)
  {
-+    /* The bitwise and shift operations convert rather than promote, so they are
-+       a different shape from the arithmetic ones. `sub` is a constant at every
-+       leaf handler, so this test folds away there; the generic `ROP_binary`
-+       pays one predictable test. */
++    /* The bitwise and shift operations convert rather than promote. `sub` is a
++       constant at every leaf handler, so this test folds there. */
 +    if (sub >= REG_BIN_SHL && sub <= REG_BIN_OR)
 +        return regvm_bitwise_fast(sub, a, b, out);
      if (JS_VALUE_IS_BOTH_FLOAT(a, b)) {
          double d1 = JS_VALUE_GET_FLOAT64(a), d2 = JS_VALUE_GET_FLOAT64(b);
          switch (sub) {
-@@ -22539,6 +22598,25 @@
+@@ -22289,6 +22340,22 @@ static inline int regvm_int_cmp(int sub, int32_t a, int32_t b)
+     }
  }
  
- /*
-+ * The double case of a fused compare, the counterpart of regvm_int_cmp. Same
-+ * switch, same constant-fold at the per-sense opcodes. -1 means "not a double
-+ * comparison". The inverted forms stay inverted here: `!(a < b)` is true for
-+ * NaN where `a >= b` is false.
-+ */
++/* The double case of a fused compare, the counterpart of regvm_int_cmp. -1
++   means "not a double comparison". The inverted forms stay inverted: `!(a <
++   b)` is true for NaN where `a >= b` is false. */
 +static inline int regvm_double_cmp(int sub, double a, double b)
 +{
 +    switch (sub) {
@@ -90,11 +93,10 @@
 +    }
 +}
 +
-+/*
-  * Evaluate the operation a fused compare-and-branch carries and say whether the
-  * branch is taken. Exactly what the separate `ROP_binary*` + `ROP_branch_if*`
-  * pair did -- compute, then test the result's truthiness -- so any sub-operation
-@@ -24628,6 +24706,17 @@
+ /*
+  * Evaluate a fused compare-and-branch's operation and test the result's
+  * truthiness, as the separate `ROP_binary*` + `ROP_branch_if*` pair would.
+@@ -24154,6 +24221,17 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
              if (_take) { T_BR_NEXT((SZ_) + _off); } \
              T_NEXT((SZ_)); \
          } \
@@ -112,7 +114,7 @@
          __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
      }
  
-@@ -26241,6 +26330,12 @@
+@@ -25594,6 +25672,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                                                     JS_VALUE_GET_INT(_a), \
                                                     JS_VALUE_GET_INT(_b))) < 0))) { \
                        take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
@@ -125,10 +127,10 @@
                    } else { \
                        take = regvm_cmp_take(ctx, sub, _a, _b); \
                        if (unlikely(take < 0)) \
-@@ -29024,21 +29119,28 @@
-                  * the integer pair goes out of line, where the coercion and the
-                  * error cases live.
-                  */
+@@ -28066,21 +28150,28 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                    regvm_int_cmp. This macro expands once per fused form, so
+                    anything larger multiplies the interpreter's size and spill
+                    traffic; the rest goes out of line. */
 -    #define REGVM_CMP_BRANCH(a_, b_) do { \
 -                      JSValue _a = (a_), _b = (b_); int take, _r = -1; \
 -                      if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \

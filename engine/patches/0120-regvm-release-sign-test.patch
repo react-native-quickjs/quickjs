@@ -1,26 +1,30 @@
+Subject: Makes the register release test a single sign test, from the register-value classification
+
+What this does
+  Makes the register release test a single sign test, from the register-value classification.
+
+Why we need it
+  Every register store tested `JS_VALUE_HAS_REF_COUNT` on the value it overwrote - a two-term test (`tag != JS_TAG_LAZY_JSON && (unsigned)tag >= (unsigned)JS_TAG_FIRST`).
+
+What it adds
+  A register holds either an immediate or a counted pointer, and never the internal lazy-JSON marker, so `REGVM_HAS_COUNT(v)` is `JS_VALUE_GET_TAG(v) < 0` under the struct `JSValue`, with a `_Static_assert` pinning the tag order; applied to every register-store release site (`T_SET_NEXT`, `regvm_t_return_nested`, `regvm_t_move_xfer`, the monolith `SET_REG` and `REGVM_INLOOP_RETURN`, the ASM `regvm_hot_step`), while object-slot releases keep `JS_VALUE_HAS_REF_COUNT` because a slot *can* hold a marker.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22749,6 +22749,32 @@
+@@ -22493,6 +22493,23 @@ extern void regvm_asm_branch_nlt_s(void);
  extern void regvm_asm_add_imm_self_branch_s(void);
  #endif /* QJS_REGVM_ASM */
  
 +/*
 + * Whether a value held in a register carries a reference the frame owns.
 + *
-+ * The frame's registers hold two kinds of value and nothing else: an immediate
-+ * (tag >= 0 -- int, bool, null, undefined, uninitialized, catch offset, exception,
-+ * short BigInt, float64) or a counted pointer (tag < 0 -- object, string, string
-+ * rope, BigInt, module, bytecode function). The one negative tag that is *not*
-+ * counted is the internal lazy-JSON marker (JS_TAG_LAZY_JSON, -4), and no
-+ * register ever holds one: every read that can produce a marker materializes it
-+ * (js_lazy_materialize_slot) before the value reaches a register, and a marker
-+ * is not a value user code can name. So the reference-count test collapses to a
-+ * sign test, and the tag order it rests on is asserted here.
-+ *
-+ * This is the register-state classification of plan section 6.1 in its smallest
-+ * form: NONE (an immediate, no count) versus OWN (a counted pointer).
-+ * JS_VALUE_HAS_REF_COUNT stays the right test for a value read out of an object
-+ * slot, which *can* be a lazy marker, so the object paths keep it.
++ * A register holds an immediate (tag >= 0) or a counted pointer (tag < 0).
++ * The one uncounted negative tag, the lazy-JSON marker, never reaches a
++ * register: every read that can produce one materializes it first. So the
++ * test is a sign test. JS_VALUE_HAS_REF_COUNT stays the test for a value read
++ * from an object slot, which can be a marker.
 + */
 +#if !JS_NAN_BOXING
 +_Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
@@ -32,8 +36,8 @@
 +
  #if QJS_REGVM_THREAD
  /*
-  * --- P2: the threaded interpreter ---------------------------------------
-@@ -23034,7 +23060,7 @@
+  * --- the threaded interpreter -------------------------------------------
+@@ -22718,7 +22735,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  #define T_SET_NEXT(d, v, off) do { \
          JSValue _v = (v), _o = fr[d]; \
          fr[d] = _v; \
@@ -42,7 +46,7 @@
              unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(_o)) <= 0)) { \
              f->set_v = _o; \
              __attribute__((musttail)) \
-@@ -23716,7 +23742,7 @@
+@@ -23350,7 +23367,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
      old = c->fr[dst];
      c->fr[dst] = v;
      f = c;
@@ -51,7 +55,7 @@
          unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
          f->set_v = old;
          __attribute__((musttail)) return regvm_t_free_slow(rip, f->fr, f, ctx);
-@@ -24308,7 +24334,7 @@
+@@ -23877,7 +23894,7 @@ static uint8_t *REGVM_CC regvm_t_move_xfer(REGVM_ARGS)
  
          fr[d] = v;
          fr[s] = JS_UNDEFINED;
@@ -60,16 +64,16 @@
              unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
              f->set_v = old;
              __attribute__((musttail))
-@@ -25450,7 +25476,7 @@
-          * value's reference in the register. Without this the reference is
-          * stranded, which shows up as a leaked object when the runtime is freed.
-          */
+@@ -24880,7 +24897,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         /* Every register holds a primitive or an owned reference, and the
+            allocator reuses a register once its value is dead, so a definition
+            releases the value it overwrites. */
 -#define SET_REG(d, v) do { JSValue _old_rv = regs[d]; if (JS_VALUE_HAS_REF_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
 +#define SET_REG(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); } while (0)
  
  #define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
           * Leave the frame for the engine. The continuation is the register pc
-@@ -25858,7 +25884,7 @@
+@@ -25275,7 +25292,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          REGVM_RESTORE_CALLER(_rh); \
          _rold = *_rdst; \
          *_rdst = _rrv; \
@@ -78,7 +82,7 @@
              JS_FreeValue(ctx, _rold); \
          REGVM_NEXT(); \
      } while (0)
-@@ -30742,7 +30768,7 @@
+@@ -29739,7 +29756,7 @@ static void regvm_hot_step(JSRegAsmState *st)
              /* rpc is at the opcode; the operand follows it */
              int d = (int)regvm_ld_u16(st->rpc + 1);
              st->rpc += 3;

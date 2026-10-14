@@ -1,9 +1,23 @@
+Subject: 16-byte `undefined` fills
+
+What this does
+  16-byte `undefined` fills.
+
+Why we need it
+  Every frame register and variable slot was filled with a 4-byte and an 8-byte store.
+
+What it adds
+  `__builtin_memcpy` from the `undefined` constant (alignment- and aliasing-safe); the `memory` barrier keeps the loop out of `memset`.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index deef018..fe30b22 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -27202,17 +27202,24 @@
-      * all promoted fills none of the source `var_count`.
-      */
+@@ -26428,17 +26428,23 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
+     /* Fill the variable area and register file with `undefined`; only the
+        variable slots the promotion map still names are filled. */
      for (k = 0; k < vc; k++)
 -        nf->var_buf[k] = JS_UNDEFINED;
 +        __builtin_memcpy(&nf->var_buf[k], &regvm_undefined_value, sizeof(JSValue));
@@ -11,10 +25,9 @@ diff --git a/quickjs.c b/quickjs.c
      /* a light frame never suspends, so it has no handshake slots */
      nregs = cb->regvm_reg_count;
 +    /*
-+     * Step 7: one 16-byte `undefined` store per register (the old form wrote a
-+     * 4-byte payload and an 8-byte tag). `__builtin_memcpy` from the constant is
-+     * alignment- and aliasing-safe and lowers to `movups`; the barrier keeps the
-+     * loop from being rewritten into a `memset` call.
++     * One 16-byte `undefined` store per register. `__builtin_memcpy` from the
++     * constant is alignment- and aliasing-safe; the barrier keeps the loop from
++     * becoming a `memset` call.
 +     */
      for (k = 0; k + 1 < nregs; k += 2) {
 -        regs[k] = JS_UNDEFINED;

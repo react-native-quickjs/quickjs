@@ -1,0 +1,51 @@
+Subject: Guard the light-frame constructor path in the record-off build
+
+What this does
+  Wraps regvm_t_construct_light and its forward declaration in
+  `#if QJS_REGVM_RECORD`. When the record call path is off, regvm_t_construct
+  keeps its record branch and falls through to the nested
+  JS_CallConstructorInternal path, as it did before the light-construct path
+  was added.
+
+Why we need it
+  A `QJS_REGVM_RECORD=OFF` build did not compile. regvm_t_construct_light
+  calls js_create_from_ctor_cap and regvm_light_prepare, both defined only
+  under QJS_REGVM_RECORD, so the option was unusable even though cmake,
+  tools/regvm/gate.sh and tools/regvm/threadcover.py all set it.
+
+What it adds
+  Guards only. The record-on build is byte-identical.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 91b7376..8b397ca 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26274,7 +26274,9 @@ static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
++#if QJS_REGVM_RECORD
+ static uint8_t *REGVM_CC regvm_t_construct_light(REGVM_ARGS);
++#endif
+ static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
+ static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
+ static void js_learn_instance_cap(JSFunctionBytecode *nb, JSValueConst inst);
+@@ -28455,6 +28457,7 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
+     T_SET_NEXT_P(d, out, 11);
+ }
+ 
++#if QJS_REGVM_RECORD
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_light(REGVM_ARGS)
+ {
+     int c = T_REG(3), ab = T_REG(7);
+@@ -28492,6 +28495,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_light(REGVM
+     __attribute__((musttail))
+         return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
+ }
++#endif /* QJS_REGVM_RECORD */
+ 
+ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
+ {

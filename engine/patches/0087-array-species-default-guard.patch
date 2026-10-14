@@ -20,48 +20,25 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -49282,6 +49282,86 @@
+@@ -48966,6 +48966,63 @@ static JSValue js_get_this(JSContext *ctx, JSValueConst this_val)
      return js_dup(this_val);
  }
  
-+/* Is ArraySpeciesCreate(obj, len) provably equal to constructing a plain
-+ * Array(len), with none of the protocol's property reads observable?
++/* Is ArraySpeciesCreate(obj, len) provably equal to a plain Array(len), with
++ * none of the protocol's property reads observable? Re-derived on every call,
++ * so there is no cached state to invalidate:
 + *
-+ * The three facts, each re-derived from the objects on every call so that there
-+ * is no cached state and therefore no invalidation rule to get wrong:
++ *  1. `obj` is an ordinary Array whose prototype is this realm's
++ *     Array.prototype, with no own 'constructor'.
++ *  2. Array.prototype.constructor is still a data property holding this
++ *     realm's Array. A value check: it is writable and configurable.
++ *  3. Array[@@species] is still the original accessor (getter js_get_this).
++ *     A value check: JS_DefineProperty replaces a getter without a shape
++ *     change.
 + *
-+ *  1. `obj` is an ordinary Array (not a Proxy, not a subclass instance) whose
-+ *     direct prototype is this realm's Array.prototype and which has no own
-+ *     'constructor' property shadowing it. An Array's exotic behaviour covers
-+ *     integer indices and 'length' only, so a find_own_property miss on
-+ *     'constructor' means the property is genuinely absent and the Get walks to
-+ *     the prototype.
-+ *  2. Array.prototype's own 'constructor' is still a plain data property whose
-+ *     value is this realm's Array. (It is writable and configurable, so this
-+ *     must be a value check; a shape check would not see an assignment.)
-+ *  3. Array's own @@species is still the original accessor. Identified by its
-+ *     getter being the C function js_get_this, which returns its receiver -- so
-+ *     Get(Array, @@species) is Array, established without calling anything.
-+ *     Again a value check, because JS_DefineProperty replaces a configurable
-+ *     accessor's getter in place without changing the shape.
-+ *
-+ * Given all three, the protocol reduces to JS_CallConstructor(Array, [len]),
-+ * which for a plain C constructor is js_array_constructor(ctx, Array, 1, &len).
-+ * That differs from js_array_constructor(ctx, JS_UNDEFINED, 1, &len) only in
-+ * js_create_from_ctor's choice of prototype: Get(Array, "prototype") versus
-+ * ctx->class_proto[JS_CLASS_ARRAY]. Those are the same object for the lifetime
-+ * of the realm, because JS_SetConstructor2 defines Array.prototype with
-+ * proto_flags == 0 -- non-writable, non-configurable (see JS_SetConstructor at
-+ * the JS_NewCConstructor call site for Array). So the fast path can take the
-+ * cheaper new_target.
-+ *
-+ * The legacy-web-compatibility cross-realm step in the slow path is a no-op
-+ * here: it only fires when the constructor's realm differs from ctx, and fact
-+ * (2) pins the constructor to ctx->array_ctor, whose realm is ctx.
-+ *
-+ * MEASURED, deterministic Octane, share of ArraySpeciesCreate calls satisfying
-+ * all three: pdfjs 1,026,624/1,026,624 (100.00%), typescript 37,870/37,870,
-+ * codeload 4,800/4,800. No row in the suite has a single non-default call.
++ * Given all three the protocol is js_array_constructor(ctx, Array, 1, &len),
++ * and Array.prototype is non-writable and non-configurable, so new_target can
++ * be JS_UNDEFINED. The cross-realm step cannot fire: (2) pins the realm to ctx.
 + */
 +static bool js_array_species_is_default(JSContext *ctx, JSValueConst obj)
 +{
@@ -107,7 +84,7 @@ Needs a bytecode version bump
  static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
                                       JSValueConst len_val)
  {
-@@ -49289,6 +49369,11 @@
+@@ -48973,6 +49030,11 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
      int res;
      JSContext *realm;
  

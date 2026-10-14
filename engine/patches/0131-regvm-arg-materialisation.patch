@@ -1,54 +1,41 @@
-Materialises call arguments in place instead of staging copies (W3a)
+Subject: Materialises call arguments in place instead of staging copies
 
-Every register-VM call staged each argument into a window register with an
-explicit move before the call. For the common case of a freshly computed
-argument that move is the only reader of the value, so the producer can write
-the window slot directly and the move disappears.
+What this does
+  Materialises call arguments in place instead of staging copies.
 
-  * quickjs.c: regvm_arg_retarget proves a value can be retargeted -- it must be
-    a non-home version with no other reader, must not come from a phi, cycle,
-    split or home edge, and no instruction after its definition may name the
-    window; regvm_stage_args applies that across one call's operand list and
-    refuses when two arguments would share a producer; regvm_lower_insn gains
-    the home map and value count, and all six call lowerings (call, call_method,
-    call_constructor, tail_call, tail_call_method, array_from) use it.
+Why we need it
+  Every register-VM call staged each argument into a window register with an explicit move, and for a freshly computed argument that move is the only reader of the value.
 
-This patch does not change the register format or the bytecode version.
+What it adds
+  `regvm_arg_retarget` proves a value has no other reader and no window-naming instruction after its definition, `regvm_stage_args` applies that across one call's operand list and refuses a shared producer, and the six call lowerings retarget the producer instead of emitting a move.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -54114,6 +54114,116 @@
+@@ -52860,6 +52860,103 @@ static int regvm_slot_operand(const JSFunctionDef *fd, const uint8_t *bc, int po
                                const uint8_t *slot_ok, const int *ok_index,
                                int *p_role);
  
-+/* Forward declarations for the ownership helpers defined next to the
-+   register-state dataflow (section 6.1), which the W3a argument staging uses. */
++/* Forward declarations for the ownership helpers defined with the
++   register-state dataflow, used by the argument staging. */
 +static int regvm_own_has_dest(uint16_t rop);
 +static int regvm_own_dest_index(uint16_t rop);
 +static int regvm_own_second_dest_index(uint16_t rop);
 +
 +/*
-+ * W3a: which call arguments can be produced straight into the window.
++ * Which call arguments can be produced straight into the window, so the
++ * staging `ROP_move` into `REGVM_WIN(a)` disappears. Every refusal is a
++ * correctness rule:
++ *   - a version of a variable's home (`home_of[v] >= 0`): the home write
++ *     would be lost;
++ *   - a value any emitted instruction reads: the copy must be its only use;
++ *   - a value named by more than one of the call's operands;
++ *   - a producer that is an edge copy (phi, cycle break, split, home copy);
++ *   - a producer, or anything between it and here, that names the window:
++ *     a call in the interval would clobber a sibling argument.
 + *
-+ * A call stages its arguments by copying each one into the reserved window
-+ * (`REGVM_WIN(a)`) with a `ROP_move`. When an argument's value is read nowhere
-+ * else in the emitted IR, and its producer may take an arbitrary destination,
-+ * the producer can write the window slot itself and the copy disappears.
-+ *
-+ * The test is deliberately narrow, and every refusal is a correctness rule:
-+ *   - a value that is a version of a variable's home is refused: writing the
-+ *     window would strand the home write (`home_of[v] >= 0`);
-+ *   - a value read by any emitted instruction is refused: the staging copy is
-+ *     meant to be its one and only use;
-+ *   - a value named by more than one of the call's operands (the callee, the
-+ *     receiver, or a second argument) is refused;
-+ *   - a producer that is itself an edge copy (phi, cycle break, split, home
-+ *     copy) is refused, because it is shared positional glue;
-+ *   - a producer, or anything between it and here, that names the window is
-+ *     refused: a call in the interval would clobber a sibling argument's slot.
-+ *
-+ * The producer is the last instruction to write `v`, which is its definition
-+ * for a value the operand stack still names. Returns its index, or -1 to fall
-+ * back to the move.
++ * Returns the producer's index, or -1 to fall back to the move.
 + */
 +static int regvm_arg_retarget(const JSRegIR *ir, int v,
 +                              const int *home_of, int n_values)
@@ -98,13 +85,10 @@ This patch does not change the register format or the bytecode version.
 +    return def;
 +}
 +
-+/*
-+ * Decide, for one call's arguments, which ones can be produced in place. `pop`
-+ * names every operand the call reads (n_all of them), and the arguments are the
-+ * argc entries starting at arg_off. Fills defs[a] with the producer to retarget
-+ * for argument a, or -1 to stage it with a move. Two arguments never share a
-+ * producer.
-+ */
++/* Decide which of one call's arguments can be produced in place. `pop` names
++   the call's n_all operands; the arguments are argc entries from arg_off.
++   defs[a] is the producer to retarget, or -1. No two arguments share a
++   producer. */
 +static void regvm_stage_args(const JSRegIR *ir, const int *pop, int n_all,
 +                             int arg_off, int argc, const int *home_of,
 +                             int n_values, int *defs)
@@ -133,7 +117,7 @@ This patch does not change the register format or the bytecode version.
  /* Lower one stack instruction to register instructions, appending them to the
     IR. `pop` names the popped values (pop[0] is the deepest) and `dst` is the
     first pushed value. Returns 0 when lowered, -1 when the opcode has no
-@@ -54122,7 +54232,7 @@
+@@ -52868,7 +52965,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
                              int pos, const int *pop, const uint8_t *reuse,
                              int dst, int below, const JSFunctionDef *fd,
                              const uint8_t *slot_ok, const int *ok_index,
@@ -142,7 +126,7 @@ This patch does not change the register format or the bytecode version.
  {
      int op = bc[pos];
      int prom = REGVM_SLOT_NONE, prom_k = -1;
-@@ -54547,56 +54657,98 @@
+@@ -53245,56 +53342,98 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
      case OP_call0: case OP_call1: case OP_call2: case OP_call3:
      case OP_call: {
          int argc = (op == OP_call) ? get_u16(bc + pos + 1) : (op - OP_call0);
@@ -259,7 +243,7 @@ This patch does not change the register format or the bytecode version.
          ADD(ROP_array_from, dst, REGVM_WIN(0), argc);
          return 0;
      }
-@@ -57258,7 +57410,8 @@
+@@ -55707,7 +55846,8 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
      } else if (regvm_lower_insn(st->ctx, st->ir, bc, pos,
                                  scratch + (d - np), st->reuse,
                                  push_base[pos], d - np, st->fd,

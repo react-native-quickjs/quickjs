@@ -1,6 +1,19 @@
+Subject: Threads seven frequent cold opcodes
+
+What this does
+  Threads seven frequent cold opcodes.
+
+Why we need it
+  
+
+What it adds
+  Adds dedicated handlers for argument application, constant-pool arithmetic, construction, local field access, local initialization and two transfer/store forms; regenerates the remaining cold arms.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22804,6 +22804,7 @@
+@@ -22551,6 +22551,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
  #define T_SZ_RASR  11    /* "rasr"  */
  #define T_SZ_T      5    /* "t"     */
  #define T_SZ_T_S    2    /* "t"     narrow */
@@ -8,7 +21,7 @@
  #define T_SZ_RT     7    /* "rt"    */
  #define T_SZ_BRRT  10    /* "brrt"  */
  #define T_SZ_BRRT_S 5    /* "brrt"  narrow */
-@@ -22815,6 +22816,7 @@
+@@ -22562,6 +22563,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
  #define T_REG8(o) ((int)(uint8_t)ip[o])
  #define T_OFF8(o) ((int)(int8_t)ip[o])
  #define T_U8(o)   ((int)ip[o])
@@ -16,7 +29,7 @@
  #define T_I32(o)  ((int32_t)regvm_ld_u32(ip + (o)))
  #define T_U32(o)  ((uint32_t)regvm_ld_u32(ip + (o)))
  #if QJS_REGVM_RECORD
-@@ -23079,6 +23081,13 @@
+@@ -22790,6 +22792,13 @@ static uint8_t *REGVM_CC regvm_t_load_const(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_load_const_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_load_this(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_load_this_slow(REGVM_ARGS);
@@ -30,7 +43,7 @@
  static uint8_t *REGVM_CC regvm_t_move(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_move_xfer(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_get_local(REGVM_ARGS);
-@@ -23257,9 +23266,9 @@
+@@ -22944,9 +22953,9 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(add_imm_self_s, regvm_t_cold) \
      X(append, regvm_t_cold) \
      X(apply, regvm_t_cold) \
@@ -42,7 +55,7 @@
      X(branch_cmp_loc_loc, regvm_t_cold) \
      X(branch_cmp_loc_reg, regvm_t_cold) \
      X(branch_cmp_reg_loc, regvm_t_cold) \
-@@ -23268,7 +23277,7 @@
+@@ -22955,7 +22964,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(check_define, regvm_t_cold) \
      X(check_object, regvm_t_cold) \
      X(close_local, regvm_t_cold) \
@@ -51,7 +64,7 @@
      X(copy_props, regvm_t_cold) \
      X(define_class, regvm_t_cold) \
      X(define_class_computed, regvm_t_cold) \
-@@ -23290,7 +23299,7 @@
+@@ -22977,7 +22986,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(get_arg_field, regvm_t_cold) \
      X(get_length, regvm_t_cold) \
      X(get_local_field, regvm_t_cold) \
@@ -60,7 +73,7 @@
      X(get_local_field_1, regvm_t_cold) \
      X(get_local_field_2, regvm_t_cold) \
      X(get_local_field_3, regvm_t_cold) \
-@@ -23309,7 +23318,7 @@
+@@ -22996,7 +23005,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(local_check_init, regvm_t_cold) \
      X(local_rmw_branch, regvm_t_cold) \
      X(local_rmw_imm, regvm_t_cold) \
@@ -69,7 +82,7 @@
      X(make_closure, regvm_t_cold) \
      X(make_local_ref, regvm_t_cold) \
      X(make_var_ref, regvm_t_cold) \
-@@ -23321,11 +23330,11 @@
+@@ -23008,11 +23017,11 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
      X(put_arg, regvm_t_cold) \
      X(put_arg_xfer, regvm_t_cold) \
      X(put_element, regvm_t_cold) \
@@ -83,11 +96,10 @@
      X(put_local_s1, regvm_t_cold) \
      X(put_local_s2, regvm_t_cold) \
      X(put_local_s3, regvm_t_cold) \
-@@ -23964,6 +23973,121 @@
- 
+@@ -23579,6 +23588,121 @@ static uint8_t *REGVM_CC regvm_t_load_false(REGVM_ARGS)
  static uint8_t *REGVM_CC regvm_t_load_i8(REGVM_ARGS)
  { T_SET_NEXT(T_REG(1), js_int32((int8_t)ip[3]), T_SZ_RI); }
-+
+ 
 +/* Keep hot opcodes out of the shared cold-opcode switch. These bodies mirror
 +   their monolithic L_ROP_* cases; operand offsets come from regvm_rop_fmt. */
 +static uint8_t *REGVM_CC regvm_t_put_local_s0(REGVM_ARGS)
@@ -202,27 +214,44 @@
 +        T_FAIL();
 +    T_SET_NEXT(d, ret_val, 10);
 +}
- 
- /* cold: the operand is an atom, which is not a value until one is made for it,
-    and making one can allocate. The pool case is a js_dup, so the handler's
-@@ -28494,6 +28618,16 @@
- #undef REGVM_NEXT
++
+ /* cold: the operand is an atom, and making a value for it can allocate. */
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_load_const_slow(REGVM_ARGS)
+ {
+@@ -27755,31 +27879,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
  #define REGVM_NEXT() return rpc
  
-+    /*
-+     * The arms below are extracted from the monolith's `L_ROP_*` bodies by
-+     * `.local/regvm-build/emit-cold.py`, which is why their indentation is odd.
-+     * **Regenerate rather than hand-edit**: a hand-copied body is exactly how a
-+     * frame field gets missed. The emitter rewrites with a lookbehind (so
-+     * `sf->arg_buf` does not become `f->arg_buf`) and skips any body that
-+     * declares one of the names it would rewrite.
-+     *
-+     * Splice with `.local/regvm-build/splice-cold.py`.
-+     */
-     /*
-      * The arms below are extracted from the monolith's `L_ROP_*` bodies by
-      * `.local/regvm-build/emit-cold.py`, which is why their indentation is odd.
-@@ -28847,7 +28981,6 @@
+     /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
+-    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+-       frame fields spelled `f->`. */
++       frame fields spelled `f->`; keep them in step with the originals. */
+     switch (op) {
+ 
+         case ROP_load_i32:
+@@ -27976,7 +28076,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
      #endif
                        set_value(ctx, &f->var_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
  
@@ -230,7 +259,7 @@
          case ROP_put_local_s1:
          case ROP_put_local_s2:
          case ROP_put_local_s3:
-@@ -28871,11 +29004,6 @@
+@@ -28000,11 +28099,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      { int slot = RD_U16(); int s = RD_REG();
                        set_value(ctx, f->var_refs[slot]->pvalue, js_dup(regs[s])); REGVM_NEXT(); }
  
@@ -242,17 +271,17 @@
          case ROP_local_check:
       {
                      int slot = RD_U16();
-@@ -29045,7 +29173,6 @@
-                  * the stack interpreter's borrow-fusion reads it.
-                  */
+@@ -28170,7 +28264,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                 /* Borrowed frame read plus inline-cached named field read. The
+                    frame owns the slot for its lifetime. */
  
 -        case ROP_get_local_field_0:
          case ROP_get_local_field_1:
          case ROP_get_local_field_2:
          case ROP_get_local_field_3:
-@@ -29147,21 +29274,6 @@
-                  * because it may be read again.
-                  */
+@@ -28258,21 +28351,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                    on throw. The key is still duplicated because it may be read
+                    again. */
  
 -        case ROP_put_element_xfer:
 -     {
@@ -272,25 +301,48 @@
          case ROP_define_field:
       {
                      int o = RD_REG();
-@@ -29262,7 +29374,7 @@
+@@ -28371,12 +28449,9 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                         goto exception;
+                     REGVM_NEXT();
+                 }
+-                /*
+-                 * Classes. Each is the stack VM's handler with the operands named
+-                 * directly, so the same helpers run in the same order; a definition
+-                 * consumes the function it is given (and the key, when the name is
+-                 * computed), as it does there.
+-                 */
++                /* Classes: the stack VM's handlers with the operands named
++                   directly. A definition consumes the function it is given (and
++                   the key, when computed). */
+ 
+         case ROP_define_class:
+      {
+@@ -28659,15 +28734,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                     REGVM_NEXT();
                  }
                  /*
-                  * Classes. Each is the stack VM's handler with the operands named
--                 * directly, so the same helpers run in the same order; a definition
-+                 * directly, so the same helpers *f in the same order; a definition
-                  * consumes the function it is given (and the key, when the name is
-                  * computed), as it does there.
-                  */
-@@ -29567,7 +29679,7 @@
-                  * record. A for-of's entry owns the iterator and next method it
-                  * recorded, so those are released; a try's entry owns nothing.
-                  * Neither loses an iterator that is still open: the only code that
+-                 * OP_drop of a control-stack sentinel. The stack VM's sentinel is a
+-                 * stack value and dropping it just discards the tag; here the
+-                 * sentinel is the control-stack entry, so dropping it removes that
+-                 * record. A for-of's entry owns the iterator and next method it
+-                 * recorded, so those are released; a try's entry owns nothing.
+-                 * Neither loses an iterator that is still open: the only code that
 -                 * drops a sentinel by hand is a try about to run its finally (which
-+                 * drops a sentinel by hand is a try about to *f its finally (which
-                  * has no iterator of its own) and a delegation driving the iteration
-                  * protocol itself.
+-                 * has no iterator of its own) and a delegation driving the iteration
+-                 * protocol itself.
++                 * OP_drop of a control-stack sentinel removes that entry. A
++                   for-of's entry
++                 * owns the iterator and next method it recorded, so those are
++                   released; a
++                 * try's entry owns nothing. The only code that drops a sentinel
++                   by hand is a
++                 * try about to run its finally and a delegation driving the
++                   iteration
++                 * protocol, so no open iterator is lost.
                   */
-@@ -29922,29 +30034,6 @@
+ 
+         case ROP_iterator_call:
+@@ -29014,29 +29089,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      REGVM_NEXT();
                  }
  
@@ -320,9 +372,9 @@
          case ROP_add_brand:
       {
                      int o = RD_REG();
-@@ -30400,57 +30489,6 @@
-                  * emits these only when the add and the branch are adjacent.
-                  */
+@@ -29468,57 +29520,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                    branch, emitted only when the two are adjacent. dst == src,
+                    so no ownership test. */
  
 -        case ROP_binary_cpool:
 -     {

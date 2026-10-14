@@ -1,9 +1,23 @@
+Subject: Light helpers in the stack build
+
+What this does
+  Light helpers in the stack build.
+
+Why we need it
+  The stack-only build compiles the `regvm_cur` readers, so the new helpers must exist there too.
+
+What it adds
+  No-op `regvm_light_head`/`regvm_light_seal` when `QJS_REGVM` is off.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index b3912c8..d962a8e 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -830,6 +830,19 @@
- /* Step 10: raise the arena top over a light frame that is about to stop being
-    the innermost thing in the arena. */
+@@ -776,6 +776,19 @@ static struct JSRegRun *regvm_light_head(struct JSRegRun *p);
+ /* Raise the arena top over a light frame that is about to stop being the
+    innermost thing in the arena. */
  static void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf);
 +#else
 +/* `regvm_cur` is present in the stack-only build and always NULL there, but the

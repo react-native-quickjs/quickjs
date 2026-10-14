@@ -1,20 +1,29 @@
+Subject: An empty program is not a threaded one
+
+What this does
+  An empty program is not a threaded one.
+
+Why we need it
+  `regvm_code_all_threaded` formed `p + len` before checking the pointer, so the refusal path -- which leaves `regvm_code` NULL and `len` 0, and which the baseline tier makes routine -- applied a zero offset to a null pointer. Undefined behaviour.
+
+What it adds
+  An explicit `code == NULL \.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index e127fda..ade8486 100644
+index e2866a1..ca56d8d 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -60561,7 +60561,17 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
+@@ -58625,7 +58625,13 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
  #if QJS_REGVM_THREAD
  static int regvm_code_all_threaded(const uint8_t *code, int len)
  {
 -    const uint8_t *p = code, *end = p + len;
 +    const uint8_t *p = code, *end;
 +
-+    /*
-+     * The callers run this after an encode attempt whether or not it produced a
-+     * program -- the refusal path leaves `regvm_code` NULL and `len` 0. Forming
-+     * `NULL + 0` is undefined behaviour even though the loop would not run, so
-+     * an empty program is answered here.
-+     */
++    /* The callers run this even when the encode produced no program
++       (`regvm_code` NULL, `len` 0), and `NULL + 0` is undefined behaviour. */
 +    if (code == NULL || len <= 0)
 +        return 0;
 +    end = p + len;

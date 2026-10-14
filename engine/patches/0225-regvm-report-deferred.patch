@@ -1,7 +1,21 @@
+Subject: Report a refused function at compile time
+
+What this does
+  Report a refused function at compile time.
+
+Why we need it
+  A function the backend refuses is only visible as "function was not lowered" when it is first called, far from the cause, and there was no way to measure how often it happens.
+
+What it adds
+  Behind `QJS_REGVM_KNOBS` and `REGVM_REPORT_DEFERRED=1`, every `goto deferred` and `unencodable = 1` site carries a reason string and prints `regvm: refused <name> (<file>:<line>): <why>` at compile time; the reasons are the inventory's rows.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 6e01f66..fa59791 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -64160,7 +64160,8 @@
+@@ -61957,7 +61957,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                                     uint8_t **out_code, int *out_len,
                                     int *out_regs, const int *rcc_canon,
                                     JSRegRCC **out_rcc,
@@ -11,7 +25,7 @@ diff --git a/quickjs.c b/quickjs.c
  {
      uint8_t *code = NULL;
      int *insn_pc = NULL;
-@@ -64172,6 +64173,9 @@
+@@ -61969,6 +61970,9 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
      int di = 0;
      long long n_decoded = 0;
  
@@ -21,16 +35,16 @@ diff --git a/quickjs.c b/quickjs.c
      if (out_src_pc)
          *out_src_pc = NULL;
  
-@@ -64197,6 +64201,8 @@
-      * truncated.
-      */
+@@ -61985,6 +61989,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+     /* Register operands are byte offsets (register * sizeof(JSValue)); a
+        function with more than 4096 registers is refused. */
      if (reg_count > REGVM_WIDE_REG_MAX + 1) {
 +        if (out_why)
 +            *out_why = "more registers than the register operand can encode";
          rc = REGVM_REFUSED;
          goto done;
      }
-@@ -64335,12 +64341,16 @@
+@@ -62111,12 +62117,16 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                  ti = (in->ops[k] >= 0 && in->ops[k] < n_pcs)
                           ? pc_to_insn[in->ops[k]] : -1;
                  if (ti < 0 || ti >= ir->n_insns) {
@@ -47,16 +61,16 @@ diff --git a/quickjs.c b/quickjs.c
                          rc = REGVM_REFUSED;
                          goto done;
                      }
-@@ -64401,6 +64411,8 @@
+@@ -62177,6 +62187,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                  if (r < 0) {
-                     /* A value the allocator never saw: a modelling gap rather
-                        than a broken emitter, so the function is refused. */
+                     /* A value the allocator never saw: a modelling gap, so
+                        refuse. */
 +                    if (out_why)
 +                        *out_why = "a register operand names a value the allocator never saw";
                      rc = REGVM_REFUSED;
                      goto done;
                  }
-@@ -64430,6 +64442,8 @@
+@@ -62203,6 +62215,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                  int32_t off;
                  if (ti < 0 || ti >= ir->n_insns) {
                      /* the CFG and the lowering disagree about a target: refuse */
@@ -65,7 +79,7 @@ diff --git a/quickjs.c b/quickjs.c
                      rc = REGVM_REFUSED;
                      goto done;
                  }
-@@ -67680,6 +67694,49 @@
+@@ -65154,6 +65168,49 @@ static void regvm_rcc_free(JSContext *ctx, JSRegRCC *rcc)
  }
  #endif /* QJS_REGVM_RCCHECK */
  
@@ -115,7 +129,7 @@ diff --git a/quickjs.c b/quickjs.c
  static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                         const uint8_t *bc, int bc_len,
                                         const uint8_t *reuse,
-@@ -67714,6 +67771,7 @@
+@@ -65188,6 +65245,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      int *stub_edge = NULL, *stub_pc = NULL;
      int n_edges = 2 * n_blocks;
      int n_moves = 0, n_stubs = 0, n_stubs_used = 0, unencodable = 0, rc = -1;
@@ -123,7 +137,7 @@ diff --git a/quickjs.c b/quickjs.c
      int enc_ok = 0;             /* the rcc table is handed to the bytecode */
      int cycle_reg = -1;
      uint8_t *phi_in = NULL;
-@@ -67792,6 +67850,7 @@
+@@ -65264,6 +65322,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                              : senc[b * ns_ok + hk];
                          regvm_home_overlap_report(bstart[b], hk, expected, i);
                          js_free(ctx, seen);
@@ -131,7 +145,7 @@ diff --git a/quickjs.c b/quickjs.c
                          goto refused;
                      }
                      seen[hk] = i;
-@@ -67804,6 +67863,7 @@
+@@ -65276,6 +65335,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                      if (seen[k] != expected) {
                          regvm_home_overlap_report(bstart[b], k, expected, seen[k]);
                          js_free(ctx, seen);
@@ -139,7 +153,7 @@ diff --git a/quickjs.c b/quickjs.c
                          goto refused;
                      }
                  }
-@@ -68007,7 +68067,7 @@
+@@ -65471,7 +65531,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                      e = p * 2 + 1;
                  else {
                      /* a predecessor that does not name this block as an edge */
@@ -148,7 +162,7 @@ diff --git a/quickjs.c b/quickjs.c
                      continue;
                  }
                  ev_cnt[e]++;
-@@ -68037,7 +68097,7 @@
+@@ -65501,7 +65561,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                  else if (succ[p * 2 + 1] == b)
                      e = p * 2 + 1;
                  else {
@@ -157,7 +171,7 @@ diff --git a/quickjs.c b/quickjs.c
                      continue;
                  }
                  ev_cnt[e]++;
-@@ -68241,13 +68301,13 @@
+@@ -65691,13 +65751,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                  ops[0] = v;
                  ops[1] = u - fd->var_count;
                  if (regvm_ir_add(ctx, &ir, ROP_get_arg, 0, ops, 2)) {
@@ -173,7 +187,7 @@ diff --git a/quickjs.c b/quickjs.c
                      break;
                  }
              }
-@@ -68314,7 +68374,7 @@
+@@ -65759,7 +65819,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                      rc = -1;
                      goto done;
                  }
@@ -182,7 +196,7 @@ diff --git a/quickjs.c b/quickjs.c
                  break;
              }
              if (home_mode >= 2 && ns_ok > 0) {
-@@ -68323,7 +68383,7 @@
+@@ -65768,7 +65828,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                      int hk = (v >= 0 && v < n_home_values) ? home_of[v] : -1;
                      if (hk >= 0 && hk < ns_ok && sval[hk] != v) {
                          regvm_home_overlap_report(pos, hk, sval[hk], v);
@@ -191,7 +205,7 @@ diff --git a/quickjs.c b/quickjs.c
                          break;
                      }
                  }
-@@ -68337,7 +68397,7 @@
+@@ -65782,7 +65842,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          if (!term_branch && pre_e >= 0 &&
              regvm_emit_edge_moves(ctx, &ir, ireg, bstart[b], ev_dst, ev_src,
                               ev_off[pre_e], ev_off[pre_e + 1], cycle_reg)) {
@@ -199,8 +213,8 @@ diff --git a/quickjs.c b/quickjs.c
 +            REGVM_UNENCODABLE("IR allocation failed (fall-through edge moves)");
              break;
          }
-         /*
-@@ -68350,7 +68410,7 @@
+         /* The fall-through edge's moves run right after the terminator: the
+@@ -65792,7 +65852,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              if (regvm_emit_edge_moves(ctx, &ir, ireg, bstart[b], ev_dst, ev_src,
                                   ev_off[b * 2 + 1], ev_off[b * 2 + 2], cycle_reg) ||
                  regvm_ir_add(ctx, &ir, ROP_branch, bstart[b], &br, 1)) {
@@ -209,7 +223,7 @@ diff --git a/quickjs.c b/quickjs.c
                  break;
              }
          }
-@@ -68800,6 +68860,8 @@
+@@ -66198,6 +66258,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              fd->regvm_fill = NULL;
              fd->regvm_fill_count = 0;
              fd->regvm_src_pc = NULL;
@@ -218,7 +232,7 @@ diff --git a/quickjs.c b/quickjs.c
              er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
                                                                are two bytes */,
                                               reg_count,
-@@ -68811,7 +68873,8 @@
+@@ -66209,7 +66271,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                               &fd->regvm_reg_count,
                                               rcc_canon,
                                               &fd->regvm_rcc,
@@ -227,8 +241,8 @@ diff --git a/quickjs.c b/quickjs.c
 +                                             &enc_why);
  
  #if QJS_REGVM_THREAD
-             /*
-@@ -68824,8 +68887,11 @@
+             /* Whether every opcode has a threaded handler, read from the
+@@ -66218,8 +66281,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              fd->regvm_all_threaded =
                  regvm_code_all_threaded(fd->regvm_code, fd->regvm_len);
  #endif
@@ -240,8 +254,8 @@ diff --git a/quickjs.c b/quickjs.c
 +            }
              if (er)
                  goto done;
-             /*
-@@ -68885,6 +68951,7 @@
+             /* The `undefined` list. The area is zeroed first, so only registers
+@@ -66271,6 +66337,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      rc = 0;
      goto done;
   refused:
@@ -249,7 +263,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_regvm_stats.unencodable++;
      *p_refused = 1;
      rc = 0;
-@@ -68962,6 +69029,8 @@
+@@ -66341,6 +66408,8 @@ static int regvm_is_const_push(int op)
      }
  }
  
@@ -258,7 +272,7 @@ diff --git a/quickjs.c b/quickjs.c
  static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                            const uint8_t *is_leader,
                                            int *pdeferred)
-@@ -69032,6 +69101,7 @@
+@@ -66405,6 +66474,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      int pushes = 0, phi_base = 0, n_pushes = 0, n_values = 0, words = 0;
      long long peak_live = 0;
      int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
@@ -266,7 +280,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      if (bc_len <= 0)
          return 0;
-@@ -69217,7 +69287,7 @@
+@@ -66556,7 +66626,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  regvm_effect(fd, bc, pos, &np, &ns);
                  if (d < np) {
                      /* the declared stack shape does not balance here */
@@ -275,25 +289,25 @@ diff --git a/quickjs.c b/quickjs.c
                  }
                  d += ns - np;
                  /* the peak is interior to the block, not just its exit depth */
-@@ -69244,7 +69314,7 @@
-                     /* two paths reach the block at different depths: the stack
-                        VM's finally return address or catch sentinel is in the
-                        operand stack and the declared shape does not show it */
+@@ -66582,7 +66652,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+                     } else if (in_depth[s] != dd) {
+                     /* two paths reach the block at different depths, which the
+                        declared shape does not show */
 -                    goto deferred;
 +                    REGVM_DEFER("two paths reach a block at different stack depths");
                      }
                  }
              }
-@@ -69257,7 +69327,7 @@
-            express, not a broken emitter: refuse the function the same way a
-            depth disagreement does, so it fails closed rather than failing the
-            whole compilation with an internal error. */
+@@ -66593,7 +66663,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+     if (iter == REGVM_MAX_ITERS) {
+         /* A fixed point that does not settle is a shape the model cannot
+            express: refuse the function, as for a depth disagreement. */
 -        goto deferred;
 +        REGVM_DEFER("the depth dataflow did not settle");
      }
  
      for (b = 0; b < n_blocks; b++) {
-@@ -69947,7 +70017,7 @@
+@@ -67215,7 +67285,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                     pv, pdef, &ev, NULL, NULL))
@@ -302,7 +316,7 @@ diff --git a/quickjs.c b/quickjs.c
              }
              if (d != out_depth[b]) {
                  JS_ThrowInternalError(ctx, "regvm: CFG depth drifted at pc=%d", bstart[b]);
-@@ -69980,7 +70050,7 @@
+@@ -67248,7 +67318,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                   * would do.
                   */
                  if (out_depth[p] < depth) {
@@ -311,16 +325,16 @@ diff --git a/quickjs.c b/quickjs.c
                  }
                  if (first < 0)
                      first = p;
-@@ -70092,7 +70162,7 @@
+@@ -67360,7 +67430,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              break;
      }
      if (iter == REGVM_MAX_ITERS)
 -        goto deferred;
 +        REGVM_DEFER("the SSA did not settle");
  
-     /*
-      * Every reachable block must have a complete promoted-slot entry state.
-@@ -70105,10 +70175,10 @@
+     /* Every reachable block must have a complete promoted-slot entry state.
+        Convergence guarantees it; this is a failsafe that refuses the function.
+@@ -67370,10 +67440,10 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              if (in_depth[b] < 0)
                  continue;
              if (!sset[b])
@@ -333,7 +347,7 @@ diff --git a/quickjs.c b/quickjs.c
          }
      }
  
-@@ -70264,7 +70334,7 @@
+@@ -67516,7 +67586,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                     pv, pdef, &ev, NULL, NULL))
@@ -342,16 +356,16 @@ diff --git a/quickjs.c b/quickjs.c
                  prom_role = ev.slot_role;
                  prom_k = ev.slot_k;
                  if (sim.apply_homes && ev.split_v >= 0) {
-@@ -70289,7 +70359,7 @@
+@@ -67541,7 +67611,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      if (v < 0 || v >= n_values) {
                          /* not a value the SSA ever defined: refuse rather than
                             index a bitset with it */
 -                        goto deferred;
 +                        REGVM_DEFER("an operand names a value the SSA never defined");
                      }
-                     /* Every read is a use for consumption; only a read that no
-                        earlier definition in this block reaches is an
-@@ -70507,7 +70577,7 @@
+                     /* Every read is a use for consumption; only a read no
+                        earlier definition in this block reaches is
+@@ -67730,7 +67800,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  break;
          }
          if (iter == REGVM_MAX_ITERS)
@@ -360,7 +374,7 @@ diff --git a/quickjs.c b/quickjs.c
  
          for (b = 0; b < n_blocks; b++) {
              long long pc = 0, po = 0;
-@@ -70602,7 +70672,7 @@
+@@ -67819,7 +67889,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                           home_slot_of_def, home_mode >= 1, 0 };
                      if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base,
                                         &sim, pv, pdef, &ev, NULL, NULL))
@@ -369,7 +383,7 @@ diff --git a/quickjs.c b/quickjs.c
                      if (ev.split_v >= 0 && ev.split_src >= 0 &&
                          ev.split_src < n_values &&
                          val_owner[ev.split_v] != val_owner[ev.split_src]) {
-@@ -70872,7 +70942,7 @@
+@@ -68066,7 +68136,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          int n_vals_alloc = n_values > 0 ? n_values : 1;
  
          if (home_mode >= 2 && home_mode < 5 && ns_ok > n_values)
@@ -378,7 +392,7 @@ diff --git a/quickjs.c b/quickjs.c
  
          lin = js_malloc(ctx, bc_len * sizeof(int));
          if (!lin)
-@@ -70929,7 +70999,7 @@
+@@ -68123,7 +68193,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base, &sim,
                                     pv, pdef, &ev, NULL, NULL))
@@ -387,7 +401,7 @@ diff --git a/quickjs.c b/quickjs.c
                  if (sim.apply_homes && ev.split_v >= 0) {
                      if (lin[pos] < istart[ev.split_v])
                          istart[ev.split_v] = lin[pos];
-@@ -71047,7 +71117,7 @@
+@@ -68233,7 +68303,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                       home_mode >= 1, 0 };
                  if (regvm_sim_step(fd, bc, pos, scratch, &dd, push_base, &sim,
                                     pv, pdef, &ev, NULL, NULL))
@@ -396,7 +410,7 @@ diff --git a/quickjs.c b/quickjs.c
                  if (sim.apply_homes && ev.split_v >= 0 &&
                      ev.split_src >= 0 && ev.split_src < n_values &&
                      last_use[ev.split_src] < lin[pos])
-@@ -71586,6 +71656,7 @@
+@@ -68726,6 +68796,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      /* A shape the register model cannot express: counted, and the function is
         left without a register program so the interpreter refuses it at a call
         rather than running a program built from a guess. */

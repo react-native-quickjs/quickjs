@@ -1,47 +1,26 @@
-Subject: register VM inlines the floating-point C builtins in the call slow path
+Subject: Inlines the floating-point C builtins in the call slow path
 
-What this does:
-  A call to a fixed-arity floating-point builtin (the whole `Math` table uses
-  the `JS_CFUNC_f_f`/`JS_CFUNC_f_f_f` special calling conventions) reached
-  `js_call_c_function_fast`, which handed it to `js_call_c_function`. That
-  function builds a stack frame, checks for stack overflow, publishes
-  `current_stack_frame` and switches over the C-function prototype -- all of
-  which is unnecessary for these builtins: they never recurse, never use the
-  frame and allocate nothing.
+What this does
+  Inlines the floating-point C builtins in the call slow path.
 
-  `regvm_cfunc_fp_fast` now recognises exactly those two prototypes and
-  performs the same conversion and call inline (`JS_ToFloat64`, the real
-  `f_f`/`f_f_f` pointer, `js_number`, and the interrupt poll), returning the
-  result directly. It is placed in `regvm_t_call_slow`/`regvm_t_call_method_slow`
-  only, not in the shared `js_call_c_function_fast` choke point: the monolith's
-  call sites also use that choke point for ordinary JS calls, and a check there
-  is paid by every one of them (the earlier C6 prototype regressed Box2D by
-  0.27 % for exactly that reason). Here the check runs only on calls that
-  already missed the record fast path.
+Why we need it
+  A call to a fixed-arity floating-point builtin (`JS_CFUNC_f_f`/`JS_CFUNC_f_f_f`, the whole `Math` table) reached `js_call_c_function`, which builds a stack frame, checks for stack overflow, publishes `current_stack_frame` and switches over the C-function prototype -- all unnecessary since these builtins never recurse, never use the frame and allocate nothing.
 
-  Signature-generic, so no per-function identity table is needed; the
-  `cfunc.realm == ctx` test keeps the conversion-error realm faithful. Every
-  other C-function kind falls through to `js_call_c_function_fast` unchanged.
+What it adds
+  `regvm_cfunc_fp_fast` recognises those two prototypes and performs the conversion and call inline; placed in `regvm_t_call_slow`/`regvm_t_call_method_slow` only, not in the shared `js_call_c_function_fast` choke point the monolith also uses for ordinary JS calls; every other kind falls through unchanged.
 
-  Measured (`fixed.js`, i7-8700), interleaved against 0153: 22,480.9 M ->
-  22,383.6 M instructions (**-0.097 G, -0.43 %**), cycles 10,823.5 M ->
-  10,690.9 M (**-1.2 %**). Microbenchmarks (20 M calls): `Math.abs` -70
-  instructions/call, generic `parseInt` +12/call (the failed check). Full gate
-  8 pass / 0 fail: 22,380,411,581 / 10,657,572,005; box2d checksum exact;
-  diff-suite 398/0/0 mono and threaded; leak assertion clean; peak RSS
-  13188 KB; test262 errors 50 (<= 64).
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25421,6 +25421,53 @@
+@@ -24849,6 +24849,51 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
          return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
  }
  
-+/* C7: handle the fixed-arity floating-point C builtins (the whole Math table
-+   uses the f_f/f_f_f special calling conventions) directly in the slow call
-+   handlers, so a Math call does not pay the generic js_call_c_function frame
-+   setup. Only these builtins use these protos and they never recurse or use the
-+   stack frame, so no frame is needed; cfunc.realm == ctx keeps the conversion
-+   error realm faithful. Returns 1 when it produced `*pret`. */
++/* Call the f_f/f_f_f floating-point C builtins (the Math table) directly in
++   the slow call handlers, skipping js_call_c_function's frame setup. They
++   never recurse or use the stack frame; cfunc.realm == ctx keeps the error
++   realm right. Returns 1 when it produced `*pret`. */
 +static inline __attribute__((always_inline)) int
 +regvm_cfunc_fp_fast(JSContext *ctx, JSValueConst cf, int na,
 +                    JSValueConst *argv, JSValue *pret)
@@ -86,7 +65,7 @@ What this does:
  /* the unthreaded halves: exactly what the monolith's L_ROP_call did */
  static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
  {
-@@ -25428,7 +25475,8 @@
+@@ -24856,7 +24901,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
      JSValue *oargv = FRP(ab);
      JSValue rv;
  
@@ -96,7 +75,7 @@ What this does:
          rv = JS_CallInternal(ctx, FR(c), JS_UNDEFINED, JS_UNDEFINED, na,
                               vc(oargv), 0);
      if (JS_IsException(rv))
-@@ -25443,7 +25491,8 @@
+@@ -24871,7 +24917,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
      JSValue *oargv = FRP(ab);
      JSValue rv;
  

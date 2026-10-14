@@ -1,44 +1,21 @@
-Subject: register VM: constructors and apply on the record path
+Subject: Constructors and apply on the record path
 
-What this does:
-  ROP_construct now enters a plain (non-derived) bytecode constructor as a
-  record directly: `this` is made with js_create_from_ctor_cap (reusing the
-  cached prototype shape via inst_inline_cap), the frame gets two extra owned
-  slots holding the fresh object and new_target, and the return path
-  (regvm_t_return_nested) applies the legacy rule -- return `this` unless the
-  body returned an object, then js_learn_instance_cap. Natives, derived
-  constructors and ineligible frames keep JS_CallConstructorInternal.
+What this does
+  Constructors and apply on the record path.
 
-  ROP_apply_arguments now classifies its callee: when the arguments object is
-  the builtin and the callee is a record-eligible bytecode function, the callee
-  is entered as a record with `this` from the operand and the arguments
-  borrowed from the caller's window, instead of going out to JS_Call and back
-  into an activation. The reified path and non-JS callees are unchanged.
+Why we need it
+  `new` on plain JS constructors and `f.apply(this, arguments)` were the last call shapes that dropped out of the record path into `JS_Call`/`JS_CallInternal`.
 
-Why we need it:
-  Constructors and `f.apply(this, arguments)` were the two remaining call
-  shapes that dropped out of the record path. raytrace pays 7.07% fewer cycles
-  with the fast paths on, earleyboyer 2.37%, deltablue 1.67%, box2d 1.44%; no
-  row regresses.
+What it adds
+  `regvm_t_construct_record` (fresh `this` via `js_create_from_ctor_cap`, two extra owned slots for `this`/`new_target`, `JS_CALL_FLAG_CONSTRUCTOR`, return-value selection in `regvm_t_return_nested`); `regvm_t_apply_arguments_record` (callee record with `this` from the operand, args borrowed from the caller's window); both `noinline` and gate frame-exempt.
 
-Needs a bytecode version bump:
-  No. Runtime only.
-
-Notes:
-  Both record-creating halves (regvm_t_construct_record,
-  regvm_t_apply_arguments_record) are noinline and added to the gate's
-  --frame-exempt list. The perf evidence is a same-binary A/B (a runtime
-  REGVM_NO_FAST switch during development) because comparing two separately
-  linked binaries moves the layout and produced a spurious richards +2% in the
-  first cross-binary measurement. Box2d checksum 546.1008391043414, test262
-  threaded+record 50/81192 with no leaks, differential corpus 400/0/0, ASan
-  clean (test262 built-ins subset 0/2890, earleyboyer 699, pdfjs 1149).
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index 8e4ee63..07340fa 100644
+index 19ba0b0..997edcb 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25323,6 +25323,12 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
+@@ -24763,6 +24763,12 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
  static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
@@ -51,17 +28,13 @@ index 8e4ee63..07340fa 100644
  static __attribute__((always_inline)) inline void
  regvm_record_release(JSRuntime *rt, JSRegRun *rec);
  #endif
-@@ -25915,6 +25921,29 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
+@@ -25323,6 +25329,25 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
      JSValue old;
  #endif
  
-+    /*
-+     * R3: a constructor frame returns `this` unless the body returned an
-+     * object (the legacy-constructor rule JS_CallConstructorInternal applies
-+     * after JS_CallInternal). `this_obj` is the fresh object, borrowed from an
-+     * owned slot the release below frees, so it must be duplicated before the
-+     * release and the body's non-object return dropped.
-+     */
++    /* A constructor frame returns `this` unless the body returned an object.
++       `this_obj` is borrowed from a slot the release below frees, so it is
++       duplicated first and the body's non-object return dropped. */
 +    if (unlikely(f->flags & JS_CALL_FLAG_CONSTRUCTOR)) {
 +        JSFunctionBytecode *nb = js_new_target_bytecode(f->new_target);
 +
@@ -81,23 +54,16 @@ index 8e4ee63..07340fa 100644
      regvm_record_release(ctx->rt, f);
      ctx->rt->current_stack_frame = c->sf;
  #if QJS_DRC
-@@ -26121,6 +26150,94 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
+@@ -25500,6 +25525,87 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
          return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
  }
  
-+/*
-+ * R3: the construct fast path. Creates `this` from the constructor's
-+ * prototype (reusing the learned instance capacity, O2), then enters the
-+ * callee as a record whose `this_obj` is that fresh object and whose
-+ * `new_target` is the operand, with JS_CALL_FLAG_CONSTRUCTOR set so
-+ * `regvm_t_return_nested` applies the "return `this` unless an object was
-+ * returned" rule. Only reached for a non-derived bytecode constructor.
-+ *
-+ * The object and the new_target live in two owned slots between the argument
-+ * area and the variable area (the same trick the tail-call handlers use), so
-+ * the record's release walk frees them and `this_obj`/`new_target` merely
-+ * borrow them.
-+ */
++/* The construct fast path, for a non-derived bytecode constructor. Creates
++   `this` from the constructor's prototype (with the learned instance
++   capacity), then enters the callee as a record with that `this_obj`, the
++   operand as `new_target`, and JS_CALL_FLAG_CONSTRUCTOR set for the return
++   rule. The object and new_target live in two owned slots between the
++   argument and variable areas, freed by the release walk. */
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS)
 +{
 +    int d = T_REG(1), c = T_REG(3), nt = T_REG(5), ab = T_REG(7);
@@ -173,20 +139,16 @@ index 8e4ee63..07340fa 100644
 +        return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
 +}
 +
- /* C7: handle the fixed-arity floating-point C builtins (the whole Math table
-    uses the f_f/f_f_f special calling conventions) directly in the slow call
-    handlers, so a Math call does not pay the generic js_call_c_function frame
-@@ -26452,6 +26569,26 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
+ /* Call the f_f/f_f_f floating-point C builtins (the Math table) directly in
+    the slow call handlers, skipping js_call_c_function's frame setup. They
+    never recurse or use the stack frame; cfunc.realm == ctx keeps the error
+@@ -25801,6 +25907,22 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
                 (f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
          if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
              T_FAIL();
 +#if QJS_REGVM_RECORD
-+        /*
-+         * R3: `f.apply(this, arguments)` with a JS callee enters the callee's
-+         * record directly, with `this` from the operand and the arguments
-+         * borrowed straight from this frame's window, instead of going out to
-+         * `JS_Call` and back into an activation.
-+         */
++        /* `f.apply(this, arguments)` with a JS callee enters the callee's
++           record directly, borrowing the arguments from this frame's window. */
 +        {
 +            JSValue cf = sp[-3];
 +            if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -203,7 +165,7 @@ index 8e4ee63..07340fa 100644
          ret_val = JS_Call(ctx, sp[-3], sp[-1], f->argc, vc(f->arg_buf));
      } else {
          ret_val = js_args_apply_reified(ctx, &f->var_buf[idx], sp - 3,
-@@ -26463,6 +26600,46 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
+@@ -25812,6 +25934,46 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
      T_SET_NEXT_P(d, ret_val, 7);
  }
  
@@ -250,7 +212,7 @@ index 8e4ee63..07340fa 100644
  static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
  {
      int d = T_REG(1);
-@@ -26498,11 +26675,33 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
+@@ -25847,11 +26009,30 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
      int ab = T_REG(7);
      int na = T_U8(9);
      JSValue *argv = FRP(ab);
@@ -261,12 +223,9 @@ index 8e4ee63..07340fa 100644
 -    T_SET_NEXT_P(d, ret_val, 10);
 +    JSValue cf = FR(c);
 +#if QJS_REGVM_RECORD
-+    /*
-+     * R3: a plain (non-derived) bytecode constructor whose frame can be built
-+     * in the arena is entered directly, exactly like a normal record call.
-+     * Derived constructors, natives, and ineligible frames keep the nested
-+     * `JS_CallConstructorInternal` path.
-+     */
++    /* A non-derived bytecode constructor whose frame fits the arena is entered
++       as a record. Derived constructors, natives and ineligible frames take
++       `JS_CallConstructorInternal`. */
 +    if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
 +        JSObject *co = JS_VALUE_GET_OBJ(cf);
 +        if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION &&
@@ -288,4 +247,4 @@ index 8e4ee63..07340fa 100644
 +    }
  }
  
- /* cold: the operand is an atom, which is not a value until one is made for it,
+ /* cold: the operand is an atom, and making a value for it can allocate. */

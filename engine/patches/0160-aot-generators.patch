@@ -1,72 +1,81 @@
 Subject: AOT: total coverage, generator/async resume and the refusal census
 
 What this does
-  Turns the P2 skeleton into a step-only unit that covers every function the
-  register backend compiles, including generators and async functions, and
-  reports why anything was left out.
-
-  Binding and eligibility no longer require JS_FUNC_NORMAL: a generator or
-  async function whose bytecode is register-compiled is bound like any other.
-  When js_regvm_execute reaches a bound function it enters the generated body
-  with the interpreter's resume marker, and on every generator/async exit
-  (return, yield, await, uncaught throw) the generated body hands control back
-  through done_generator exactly as the interpreter does.
-
-  The unit generator now walks every function bytecode, not only the eligible
-  ones, and classifies each: eligible, still-lazy, refused by the register
-  backend, empty, or too big (AOT_GEN_MAX_LEN = 1<<18 register bytes). That
-  census is what qjsaot prints; nothing in the box2d or test262 corpus is
-  refused, so refused profiled ops are 0.008% on box2d (a single top-level
-  <eval>).
-
-  qjs_aot_unwind() also gains an AOT_MUT_SKIP_UNWIND hook: with that macro the
-  exception walk is skipped, which is the negative control the kernel gate
-  requires (a kernel must then fail, not silently pass).
+  AOT: total coverage, generator/async resume and the refusal census.
 
 Why we need it
-  P2 could only run straight-line leaf functions; the whole point of the phase
-  is that generators, async/await and exceptions survive the boundary. The
-  census is the evidence that coverage is total rather than merely sufficient
-  for the sample corpora.
+  Generators, async/await and exceptions must cross the generated/interpreter boundary, and coverage must be total rather than merely sufficient for the sample corpora.
 
 What it adds
-  quickjs.c
-      js_aot_bind()/aot_gen_eligible() accept every register-compiled
-      function; the AOT entry in js_regvm_execute carries the resume marker in
-      and routes every generator/async exit to done_generator; js_aot_gen_collect()
-      collects and classifies all function bytecodes; qjs_aot_unwind() gains the
-      AOT_MUT_SKIP_UNWIND hook.
-  quickjs-aot-gen.h
-      The AOT_GEN_REF_* reason enum, AOT_GEN_MAX_LEN and the eligible/stack_len
-      fields the census reports.
+  `js_aot_bind`/`aot_gen_eligible` accept every register-compiled function (dropped the `func_kind == JS_FUNC_NORMAL` gate); the AOT entry in `js_regvm_execute` carries the resume marker in and routes every generator/async exit (return, yield, await, uncaught throw) to `done_generator` exactly as the interpreter does; `js_aot_gen_collect` walks every function bytecode and classifies it so `qjsaot` can print a refusal census; `qjs_aot_unwind` gains an `AOT_MUT_SKIP_UNWIND` negative-control hook.
 
-  Nothing here is compiled without -DQJS_REGVM; QJS_AOT is off by default.
-  Box2D runs fully compiled with checksum 546.1008391043414, test262-fast stays
-  at 50/81192, and every kernel checksum matches the interpreter.
-
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
+index fccf565..4eb64b7 100644
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -7,7 +7,23 @@
+ #include <stdint.h>
+ #include "quickjs.h"
+ 
+-/* One AOT-eligible function, flattened out of the engine's bytecode. */
++/* Why a function did not make it into the unit. Only AOT_GEN_ELIGIBLE has
++   meaningful `code`/`len`; the others carry a stack-bytecode length for the
++   census. */
++enum {
++    AOT_GEN_ELIGIBLE = 0,
++    AOT_GEN_REF_LAZY,    /* body still in the source blob */
++    AOT_GEN_REF_REGVM,   /* register backend refused it (with/eval/complex) */
++    AOT_GEN_REF_EMPTY,   /* compiled, but an empty program */
++    AOT_GEN_REF_TOO_BIG, /* register program over AOT_GEN_MAX_LEN bytes */
++    AOT_GEN_REF_REASON_COUNT
++};
++
++/* Refuse very large bodies: one emitted step body per instruction would
++   balloon the unit. */
++#define AOT_GEN_MAX_LEN (1 << 18)
++
++/* One function flattened out of the engine's bytecode (eligible or refused). */
+ typedef struct JSAotGenFunc {
+     uint8_t digest[16];        /* the binding key */
+     uint32_t code_crc;         /* IRVERIFY hash of the register program */
+@@ -19,16 +35,16 @@ typedef struct JSAotGenFunc {
+     int var_count;
+     int defined_arg_count;
+     int func_kind;
++    int eligible;              /* AOT_GEN_ELIGIBLE or an AOT_GEN_REF_* reason */
++    int stack_len;             /* stack bytecode length when refused, else 0 */
+     const uint8_t *code;       /* the register program; owned by the runtime */
+     char name[128];
+     char file[256];
+ } JSAotGenFunc;
+ 
+-/*
+- * Collect every AOT-eligible function in `rt`. Returns the count and stores a
+- * malloc'd array in *pout (release with js_aot_gen_free). Zero with *pout NULL
+- * on allocation failure.
+- */
++/* Collect every function bytecode in `rt`, eligible or not. Returns the count
++   and a malloc'd array in *pout (release with js_aot_gen_free); zero with
++   *pout NULL on allocation failure. */
+ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout);
+ void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);
+ 
 diff --git a/quickjs.c b/quickjs.c
-index eb346f5..c9f7bc2 100644
+index 5cbb959..39ba535 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -28013,17 +28013,35 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-         }
+@@ -27129,11 +27129,25 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  #if QJS_AOT
-         /*
--         * AOT entry (P2). A bound function is never record-eligible, so a call
--         * to it always reaches this slow path and a non-AOT function pays
-+         * AOT entry (P2/P3). A bound function is never record-eligible, so a
-+         * call to it always reaches this slow path and a non-AOT function pays
-          * nothing. The generated unit owns the frame from here: it drives
-          * qjs_aot_step and its own exception unwinder and returns either a
--         * value or JS_EXCEPTION. On a value, `done` releases the frame; on an
--         * exception the unit has already walked the control stack, so
--         * `exception` sees an empty one and simply propagates.
-+         * value, JS_EXCEPTION, or -- for a generator/async body -- a parked
-+         * frame. A resume re-enters here too: the marker is an instruction
-+         * start, so the unit jumps straight to it and the yield/await step
-+         * consumes the handshake.
-          */
+         /* AOT entry. A bound function is never record-eligible, so its calls
+            reach this path. The generated unit owns the frame from here and
+-           returns a value or JS_EXCEPTION; on an exception it has already
+-           walked the control stack, so `exception` just propagates. */
 -        if (unlikely(b->aot_fn != NULL && regvm_resume_marker == NULL)) {
++           returns a value, JS_EXCEPTION, or a parked generator/async frame. A
++           resume re-enters here: the marker is an instruction start, so the
++           unit jumps to it. */
 +        if (unlikely(b->aot_fn != NULL)) {
 +            uint32_t aot_entry_pc = 0;
 +            if (regvm_resume_marker != NULL)
@@ -76,13 +85,9 @@ index eb346f5..c9f7bc2 100644
 +            run.resume_marker = regvm_resume_marker;
 +            ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
 +            regvm_resume_marker = run.resume_marker;
-+            /*
-+             * Every exit of a generator/async body -- return, yield, await,
-+             * or an uncaught throw -- hands the parked frame to the
-+             * machinery, exactly as the interpreter's done_generator does.
-+             * The test is the call flag, not the kind: a module body is not
-+             * JS_FUNC_NORMAL either but takes the ordinary exit.
-+             */
++            /* Every exit of a generator/async body hands the parked frame to
++               the machinery, as done_generator does. The test is the call flag,
++               not the kind: a module body takes the ordinary exit. */
 +            if (unlikely(run.flags & JS_CALL_FLAG_GENERATOR)) {
 +                pc = run.sf->cur_pc;
 +                sp = run.sf->cur_sp;
@@ -91,7 +96,7 @@ index eb346f5..c9f7bc2 100644
              if (likely(!JS_IsException(ret_val)))
                  goto done;
              goto exception;
-@@ -57065,8 +57083,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
+@@ -55545,8 +55559,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
      b->aot_state = 2;           /* known-absent until a match is found */
      if (!aot_unit_present())
          return;
@@ -101,14 +106,13 @@ index eb346f5..c9f7bc2 100644
          return;
      js_aot_digest(b, digest);
      lo = 0;
-@@ -57124,6 +57141,15 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+@@ -55601,6 +55614,14 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
      JSRuntime *rt = ctx->rt;
  
      (void)pc;
 +#ifdef AOT_MUT_SKIP_UNWIND
-+    /* Gate mutant (plan 5.4): never look for a handler. Every exception leaving
-+       an AOT body becomes uncaught, so any kernel that relies on try/catch or
-+       finally must fail loudly. Test-only. */
++    /* Gate mutant: never look for a handler, so every exception leaving an AOT
++       body is uncaught. Test-only. */
 +    (void)fr;
 +    (void)resume_pc;
 +    f->nctl = 0; /* drop the handlers so the exception cannot be caught */
@@ -117,7 +121,7 @@ index eb346f5..c9f7bc2 100644
      if (needs_backtrace(rt->current_exception)) {
          f->sf->cur_pc = NULL;
          build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
-@@ -57169,12 +57195,6 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+@@ -55646,12 +55667,6 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
  /* ------------------------------------------------------------------------ */
  #include "quickjs-aot-gen.h"
  
@@ -130,7 +134,7 @@ index eb346f5..c9f7bc2 100644
  int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
  {
      JSAotGenFunc *arr = NULL;
-@@ -57193,8 +57213,6 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
+@@ -55670,8 +55685,6 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
              if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
                  continue;
              b = (JSFunctionBytecode *)gp;
@@ -139,7 +143,7 @@ index eb346f5..c9f7bc2 100644
              if (n == cap) {
                  JSAotGenFunc *na;
                  cap = cap ? cap * 2 : 64;
-@@ -57207,20 +57225,40 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
+@@ -55684,20 +55697,39 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
              }
              g = &arr[n];
              memset(g, 0, sizeof(*g));
@@ -158,9 +162,8 @@ index eb346f5..c9f7bc2 100644
              if (b->filename != JS_ATOM_NULL)
                  JS_AtomGetStrRT(rt, g->file, sizeof(g->file), b->filename);
 +
-+            /* Classify for the census. Only an eligible body carries a usable
-+               register program; the digest is computed whenever the body has
-+               been materialized, so a profile can be joined by digest. */
++            /* Classify for the census. The digest is computed for every
++               materialized body, so a profile can be joined by digest. */
 +            if (b->is_lazy) {
 +                g->eligible = AOT_GEN_REF_LAZY;
 +            } else if (!b->regvm_compiled) {
@@ -187,57 +190,3 @@ index eb346f5..c9f7bc2 100644
              n++;
          }
      }
-diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
-index 7ed0e52..861e541 100644
---- a/quickjs-aot-gen.h
-+++ b/quickjs-aot-gen.h
-@@ -12,7 +12,26 @@
- #include <stdint.h>
- #include "quickjs.h"
- 
--/* One AOT-eligible function, flattened out of the engine's bytecode. */
-+/*
-+ * Why a function did not make it into the unit. AOT_GEN_ELIGIBLE is the only
-+ * value for which `code`/`len` are meaningful; every other value carries the
-+ * reason and a stack-bytecode length so the census can weigh it.
-+ */
-+enum {
-+    AOT_GEN_ELIGIBLE = 0,
-+    AOT_GEN_REF_LAZY,    /* body still in the source blob */
-+    AOT_GEN_REF_REGVM,   /* register backend refused it (with/eval/complex) */
-+    AOT_GEN_REF_EMPTY,   /* compiled, but an empty program */
-+    AOT_GEN_REF_TOO_BIG, /* register program over AOT_GEN_MAX_LEN bytes */
-+    AOT_GEN_REF_REASON_COUNT
-+};
-+
-+/* Refuse absurdly large bodies: one emitted step body per instruction, so a
-+   multi-hundred-KB register program would balloon the unit. Nothing in the
-+   box2d/test262 corpus approaches this. */
-+#define AOT_GEN_MAX_LEN (1 << 18)
-+
-+/* One function flattened out of the engine's bytecode (eligible or refused). */
- typedef struct JSAotGenFunc {
-     uint8_t digest[16];        /* the binding key */
-     uint32_t code_crc;         /* IRVERIFY hash of the register program */
-@@ -24,15 +43,18 @@ typedef struct JSAotGenFunc {
-     int var_count;
-     int defined_arg_count;
-     int func_kind;
-+    int eligible;              /* AOT_GEN_ELIGIBLE or an AOT_GEN_REF_* reason */
-+    int stack_len;             /* stack bytecode length when refused, else 0 */
-     const uint8_t *code;       /* the register program; owned by the runtime */
-     char name[128];
-     char file[256];
- } JSAotGenFunc;
- 
- /*
-- * Collect every AOT-eligible function in `rt`. Returns the count and stores a
-- * malloc'd array in *pout (release with js_aot_gen_free). Zero with *pout NULL
-- * on allocation failure.
-+ * Collect every function bytecode in `rt`, eligible or not, so the caller can
-+ * both emit the eligible ones and report a refusal census. Returns the count
-+ * and stores a malloc'd array in *pout (release with js_aot_gen_free). Zero
-+ * with *pout NULL on allocation failure.
-  */
- int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout);
- void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);

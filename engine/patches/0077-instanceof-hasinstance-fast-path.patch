@@ -26,15 +26,14 @@ Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -10407,6 +10407,19 @@
+@@ -10405,6 +10405,18 @@ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
  
      if (!JS_IsObject(obj))
          goto fail;
-+    /* A plain function whose [[Prototype]] is Function.prototype and which has
-+       no own @@hasInstance can only resolve @@hasInstance to the builtin
-+       js_function_hasInstance, whose whole body is a call to
-+       JS_OrdinaryIsInstanceOf. Function.prototype[@@hasInstance] is installed
-+       non-writable and non-configurable, so no invalidation is needed. */
++    /* A plain function with Function.prototype as [[Prototype]] and no own
++       @@hasInstance resolves to js_function_hasInstance, which is
++       JS_OrdinaryIsInstanceOf. That property is non-writable and
++       non-configurable, so no invalidation is needed. */
 +    {
 +        JSObject *p = JS_VALUE_GET_OBJ(obj);
 +        if ((p->class_id == JS_CLASS_BYTECODE_FUNCTION ||

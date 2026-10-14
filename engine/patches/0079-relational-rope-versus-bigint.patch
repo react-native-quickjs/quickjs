@@ -19,7 +19,7 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -17956,17 +17956,21 @@
+@@ -17949,17 +17949,19 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
          /* fast path for float64/int */
          goto float64_compare;
      } else {
@@ -28,10 +28,8 @@ Needs a bytecode version bump
 -             ((tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) &&
 -              tag1 == JS_TAG_STRING))) {
 -            if (tag1 == JS_TAG_STRING) {
-+        /* tag_is_string, not tag1 == JS_TAG_STRING: a rope is a String too.
-+           Testing the tag alone sends a rope/BigInt pair down the ToNumeric
-+           path below, which applies ToNumber to the string instead of
-+           StringToBigInt (ECMA-262 7.2.13 IsLessThan step 3.c/3.d). */
++        /* tag_is_string: a rope is a String too, and must take StringToBigInt
++           rather than ToNumber (IsLessThan step 3.c/3.d). */
 +        if (((tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT) &&
 +             tag_is_string(tag2)) ||
 +            ((tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) &&

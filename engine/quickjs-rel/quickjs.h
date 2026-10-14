@@ -520,13 +520,10 @@ JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
 JS_EXTERN uint64_t JS_GetDumpFlags(JSRuntime *rt);
 JS_EXTERN size_t JS_GetGCThreshold(JSRuntime *rt);
 JS_EXTERN void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
-/* Yield-aware collection pacing. The rearm after a collection normally uses a
-   fixed 1.5x of the size that collection left, which never asks whether it
-   reclaimed anything -- and in a reference-counted engine a collection finds
-   nothing at all unless the program built a cycle. `cap` is how many
-   consecutive unproductive collections may widen the trigger: each doubles the
-   growth step, bounded to a fraction of the live heap, and one productive
-   collection resets it. 0 restores the unmodified rule exactly. */
+/* Yield-aware collection pacing. `cap` is how many consecutive unproductive
+   collections may widen the trigger: each doubles the growth step, bounded to
+   a fraction of the live heap, and one productive collection resets it. 0
+   keeps the unmodified rule. */
 JS_EXTERN int JS_GetGCPacingCap(JSRuntime *rt);
 JS_EXTERN void JS_SetGCPacingCap(JSRuntime *rt, int cap);
 /* use 0 to disable maximum stack size check */
@@ -742,13 +739,8 @@ typedef struct JSMemoryUsage {
     int64_t c_func_count, array_count;
     int64_t fast_array_count, fast_array_elements;
     int64_t binary_object_count, binary_object_size;
-    /* The population the CYCLE COLLECTOR walks, and its composition.
-       `obj_count` is not it: JS_ComputeMemoryUsage increments that only for
-       JS_GC_OBJ_TYPE_JS_OBJECT and continues on every other GC type, so it is a
-       strict subset of gc_obj_list. Dividing a collection time by obj_count
-       therefore prices per-JSObject rather than per-traced-object, and the ratio
-       between the two is not constant across workloads: lazily-deserialized
-       function bytecodes are not traced while source-compiled ones are. */
+    /* The population the cycle collector walks (gc_obj_list), by type.
+       `obj_count` counts only JSObjects, so it is a strict subset. */
     int64_t traced_count, notrace_count;
     int64_t traced_js_object, traced_fnbc, traced_shape, traced_var_ref,
             traced_async, traced_other;

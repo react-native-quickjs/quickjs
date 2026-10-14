@@ -23,7 +23,7 @@ Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -17530,6 +17530,8 @@
+@@ -17448,6 +17448,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
      /* fast path for float64 */
      if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
          goto handle_float64;
@@ -32,7 +32,7 @@ Needs a bytecode version bump
      op1 = JS_ToNumericFree(ctx, op1);
      if (JS_IsException(op1))
          goto exception;
-@@ -17663,6 +17665,8 @@
+@@ -17581,6 +17583,8 @@ static __exception int js_post_inc_slow(JSContext *ctx,
  
      /* XXX: allow custom operators */
      op1 = sp[-1];
@@ -41,7 +41,7 @@ Needs a bytecode version bump
      op1 = JS_ToNumericFree(ctx, op1);
      if (JS_IsException(op1)) {
          sp[-1] = JS_UNDEFINED;
-@@ -17678,6 +17682,8 @@
+@@ -17596,6 +17600,8 @@ static no_inline int js_not_slow(JSContext *ctx, JSValue *sp)
      JSValue op1;
  
      op1 = sp[-1];
@@ -50,7 +50,7 @@ Needs a bytecode version bump
      op1 = JS_ToNumericFree(ctx, op1);
      if (JS_IsException(op1))
          goto exception;
-@@ -17763,11 +17769,14 @@
+@@ -17681,11 +17687,14 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
          }
          return 0;
      }
@@ -65,7 +65,7 @@ Needs a bytecode version bump
      op2 = JS_ToNumericFree(ctx, op2);
      if (JS_IsException(op2)) {
          JS_FreeValue(ctx, op1);
-@@ -18054,11 +18063,14 @@
+@@ -17972,11 +17981,14 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
      }
  
      if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
@@ -80,7 +80,7 @@ Needs a bytecode version bump
  
          op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
          if (JS_IsException(op2)) {
-@@ -18075,12 +18087,14 @@
+@@ -17993,12 +18005,14 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
              goto exception;
          return 0;
      }
@@ -95,7 +95,7 @@ Needs a bytecode version bump
      op2 = JS_ToNumericFree(ctx, op2);
      if (JS_IsException(op2)) {
          JS_FreeValue(ctx, op1);
-@@ -18204,11 +18218,14 @@
+@@ -18122,11 +18136,14 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
          sp[-2] = __JS_NewShortBigInt(ctx, v);
          return 0;
      }
@@ -110,7 +110,7 @@ Needs a bytecode version bump
      op2 = JS_ToNumericFree(ctx, op2);
      if (JS_IsException(op2)) {
          JS_FreeValue(ctx, op1);
-@@ -18406,11 +18423,15 @@
+@@ -18324,11 +18341,15 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
      tag1 = JS_VALUE_GET_NORM_TAG(op1);
      tag2 = JS_VALUE_GET_NORM_TAG(op2);
  
@@ -126,7 +126,7 @@ Needs a bytecode version bump
      op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NUMBER);
      if (JS_IsException(op2)) {
          JS_FreeValue(ctx, op1);
-@@ -18474,11 +18495,13 @@
+@@ -18390,11 +18411,13 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
                  }
              }
          } else {
@@ -140,7 +140,7 @@ Needs a bytecode version bump
              op2 = JS_ToNumericFree(ctx, op2);
              if (JS_IsException(op2)) {
                  JS_FreeValue(ctx, op1);
-@@ -18607,11 +18630,14 @@
+@@ -18523,11 +18546,14 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                  }
              }
          } else {
@@ -155,7 +155,7 @@ Needs a bytecode version bump
              op2 = JS_ToNumericFree(ctx, op2);
              if (JS_IsException(op2)) {
                  JS_FreeValue(ctx, op1);
-@@ -18631,11 +18657,13 @@
+@@ -18547,11 +18573,13 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                  (tag_is_number(tag2) || tag_is_string(tag2) || tag2 == JS_TAG_SYMBOL)) ||
                 (tag2 == JS_TAG_OBJECT &&
                  (tag_is_number(tag1) || tag_is_string(tag1) || tag1 == JS_TAG_SYMBOL))) {
@@ -169,7 +169,7 @@ Needs a bytecode version bump
          op2 = JS_ToPrimitiveFree(ctx, op2, HINT_NONE);
          if (JS_IsException(op2)) {
              JS_FreeValue(ctx, op1);
-@@ -18671,11 +18699,14 @@
+@@ -18587,11 +18615,14 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
  
      op1 = sp[-2];
      op2 = sp[-1];

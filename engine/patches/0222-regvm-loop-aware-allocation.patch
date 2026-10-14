@@ -1,12 +1,39 @@
+Subject: Keep a counted loop's bound register live across the loop
+
+What this does
+  Keep a counted loop's bound register live across the loop.
+
+Why we need it
+  The bound is a constant load at the loop header and the back edge re-executes it every iteration, so the value's live range ends at the header's compare and the allocator gives its register to a body value; the hoist then correctly refuses, and every ordinary loop kept the reload, the top test and no fused latch.
+
+What it adds
+  During the allocation liveness, grow the interval of a constant-push value that is defined and used in a block which is a back edge's target to the latch block's last instruction, so the allocator holds its register across the body; the post-allocation hoist and rotation then fire on the loops that already worked, and the B1 fusion follows.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index b3b8114..2b6fac0 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -68900,6 +68900,24 @@
-  * depth, a phi's arity must equal its predecessor count, and the simulation may
-  * not underflow the stack.
+@@ -66294,9 +66294,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+ /*
+  * The semantic CFG.
+  *
+- * Basic blocks come from the leaders the scan pass marked. Locals and
+- * arguments are addressable slots, so the virtual values cover the operand
+- * stack only. A join introduces a phi when two predecessors disagree at the
++ * Basic blocks come from the leaders the scan pass marked. Virtual values
++ * cover the operand stack; locals and arguments are slots (see the promoted
++ * slots below). A join introduces a phi when two predecessors disagree at the
+  * same stack position.
+  *
+  * A block inside a catch region gets the handler as an exceptional successor,
+@@ -66305,6 +66305,24 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+  * Verified as built: predecessors agree on the entry depth, a phi's arity
+  * equals its predecessor count, and the simulation never underflows.
   */
-+/* B2: the constant pushes whose value the hoist pass can lift out of a loop.
-+   Matches the register loads `regvm_hoist_loop_const` accepts. */
++/* The constant pushes the hoist pass can lift out of a loop; matches the
++   register loads `regvm_hoist_loop_const` accepts. */
 +static int regvm_is_const_push(int op)
 +{
 +    switch (op) {
@@ -26,15 +53,15 @@ diff --git a/quickjs.c b/quickjs.c
  static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                            const uint8_t *is_leader,
                                            int *pdeferred)
-@@ -68921,6 +68939,7 @@
+@@ -66326,6 +66344,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      uint64_t *seen = NULL;
      uint8_t *val_owner = NULL;
      int *consumed = NULL;
 +    uint8_t *is_const_push = NULL;
-     /*
-      * A function with a debugger trap keeps the frame authoritative for every
-      * slot: a trap is a point a debugger reads and writes locals from, so a
-@@ -70130,6 +70149,7 @@
+     /* In a function with a debugger trap the frame stays authoritative for
+        every slot: this gates the promotion scan and the block-local read
+        forwarding, and `regvm_fold_frame_reads` checks the emitted IR for the
+@@ -67410,6 +67429,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              goto done;
          }
          nbits = (size_t)n_blocks * words * sizeof(uint64_t);
@@ -42,7 +69,7 @@ diff --git a/quickjs.c b/quickjs.c
          use_bits = js_malloc(ctx, nbits);
          alluse_bits = js_malloc(ctx, nbits);
          phi_use_bits = js_malloc(ctx, nbits);
-@@ -70137,8 +70157,8 @@
+@@ -67417,8 +67437,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          live_in = js_malloc(ctx, nbits);
          live_out = js_malloc(ctx, nbits);
          seen = js_malloc(ctx, (size_t)words * sizeof(uint64_t));
@@ -53,7 +80,7 @@ diff --git a/quickjs.c b/quickjs.c
              goto done;
          memset(use_bits, 0, nbits);
          memset(alluse_bits, 0, nbits);
-@@ -70281,6 +70301,9 @@
+@@ -67549,6 +67569,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      if (pdef[i]) {
                          regvm_bitset_set(D, v);
                          regvm_bitset_set(seen, v);
@@ -62,28 +89,16 @@ diff --git a/quickjs.c b/quickjs.c
 +                            is_const_push[v] = 1;
                      }
                  }
-                 /*
-@@ -71078,6 +71101,47 @@
+                 /* A promoted read-modify-write defines its own value id without
+@@ -68280,6 +68303,35 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              }
          }
  
-+        /*
-+         * B2: a counted loop's bound is a constant load at the loop header, and
-+         * the back edge re-executes it every iteration, so its live range ends
-+         * at the header's compare and the allocator is free to give its
-+         * register to a body value. Retargeting the back edge past the load
-+         * (the hoist pass, which runs after allocation) would then compare
-+         * against a clobbered register, which is why the hoist refused every
-+         * ordinary loop. Grow the bound's interval to the latch instead, so the
-+         * allocator keeps its register live across the body; the hoist then
-+         * fires and the rotation follows.
-+         *
-+         * Only a constant value defined and used in a block that is a back
-+         * edge's target is grown -- exactly the hoistable shape -- so the cost
-+         * is one register held across a loop that can use it. A loop without a
-+         * single preheader is not special-cased here: the extension is
-+         * harmless, and the hoist still refuses it if its shape is wrong.
-+         */
++        /* A counted loop's bound is a constant load at the header. Grow its
++           interval to the latch so the allocator keeps its register live across
++           the body; otherwise the hoist pass (after allocation) would compare
++           against a clobbered register. Only a constant defined and used in a
++           back edge's target block is grown. */
 +        for (b = 0; b < n_blocks && is_const_push; b++) {
 +            int k2;
 +            if (in_depth[b] < 0)
@@ -111,7 +126,7 @@ diff --git a/quickjs.c b/quickjs.c
          if (home_mode >= 5 && ns_ok > 0) {
              home_reg_of_slot = js_malloc(ctx, (size_t)ns_ok * sizeof(int));
              if (!home_reg_of_slot)
-@@ -71515,6 +71579,7 @@
+@@ -68693,6 +68745,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      js_free(ctx, seen);
      js_free(ctx, val_owner);
      js_free(ctx, consumed);

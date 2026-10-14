@@ -1,6 +1,19 @@
+Subject: Makes the register frame release skip values that cannot hold a count
+
+What this does
+  Makes the register frame release skip values that cannot hold a count.
+
+Why we need it
+  `regvm_record_release` called `JS_FreeValueRT` on every slot of the frame's variable and register area, and that call begins with a reference-count test the caller could have made.
+
+What it adds
+  The walk reads each slot once and calls `JS_FreeValueRT` only when `REGVM_HAS_COUNT` (a single sign test on the tag) says the slot can hold a count. Pure call elision: `JS_FreeValueRT` opens with the same test, so behaviour is unchanged for every value, including a lazy-JSON marker.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25274,8 +25274,19 @@
+@@ -24748,8 +24748,13 @@ static void regvm_record_release(JSRuntime *rt, JSRegRun *rec)
          JSValue *buf = rec->local_buf;
          int n = rec->local_count;
  
@@ -8,14 +21,8 @@
 -            JS_FreeValueRT(rt, *pval);
 +        for (i = 0, pval = buf; i < n; i++, pval++) {
 +            JSValue v = *pval;
-+            /*
-+             * `JS_FreeValueRT` is a call, and the frame area is mostly
-+             * immediates: the fill writes JS_UNDEFINED over the whole of it, and
-+             * a register or local that never received a pointer stays one. The
-+             * guard is a pure call elision -- `JS_FreeValueRT` begins with the
-+             * same reference-count test -- so this is the section 6.1 NONE/OWN
-+             * distinction applied to the release walk itself.
-+             */
++            /* Skip the call for an uncounted value: most of the area holds
++               immediates, and `JS_FreeValueRT` starts with the same test. */
 +            if (REGVM_HAS_COUNT(v))
 +                JS_FreeValueRT(rt, v);
 +        }

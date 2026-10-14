@@ -26,7 +26,7 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -361,8 +361,9 @@
+@@ -361,8 +361,9 @@ typedef struct JSMallocBlockHeader {
      uint8_t  block_size_idx;
      /* GC/refcount header merged into the allocator header:
         the object body keeps only JSGCObjectHeader.link (no ref_count/flags). */
@@ -37,7 +37,7 @@ Needs a bytecode version bump
      int      ref_count;
      _Alignas(JS_ARENA_ALIGN) uint8_t user_data[];
  } JSMallocBlockHeader;
-@@ -434,6 +435,8 @@
+@@ -434,6 +435,8 @@ struct JSRuntime {
      /* list of JSGCObjectHeader.link. List of allocated GC objects (used
         by the garbage collector) */
      struct list_head gc_obj_list;
@@ -46,7 +46,7 @@ Needs a bytecode version bump
      /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
      struct list_head gc_zero_ref_count_list;
      struct list_head tmp_obj_list; /* used during GC */
-@@ -653,6 +656,7 @@
+@@ -630,6 +633,7 @@ static inline JSMallocBlockHeader *js_rc(const void *p) {
  #define JS_REF_COUNT(p) (js_rc(p)->ref_count)
  #define JS_GC_TYPE(p)   (js_rc(p)->gc_obj_type)
  #define JS_GC_MARK(p)   (js_rc(p)->mark)
@@ -54,7 +54,7 @@ Needs a bytecode version bump
  
  /* bigint */
  typedef int32_t js_slimb_t;
-@@ -2131,6 +2135,7 @@
+@@ -2108,6 +2112,7 @@ static no_inline void *arena_malloc_large(JSRuntime *rt, size_t size)
          return NULL;
      b->u.block_idx = JS_ARENA_FREE_NIL;
      b->block_size_idx = 0xff; /* fail safe */
@@ -62,7 +62,7 @@ Needs a bytecode version bump
      return b->user_data;
  }
  
-@@ -2143,6 +2148,7 @@
+@@ -2120,6 +2125,7 @@ static no_inline void *arena_calloc_large(JSRuntime *rt, size_t size)
          return NULL;
      b->u.block_idx = JS_ARENA_FREE_NIL;
      b->block_size_idx = 0xff; /* fail safe */
@@ -70,7 +70,7 @@ Needs a bytecode version bump
      return b->user_data;
  }
  
-@@ -2176,6 +2182,7 @@
+@@ -2153,6 +2159,7 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
          b = arena_get_block(ar, block_idx, block_size);
          ar->first_free_block = b->u.free_next;
          b->u.block_idx = block_idx;
@@ -78,7 +78,7 @@ Needs a bytecode version bump
          ar->n_used_blocks++;
          if (unlikely(ar->n_used_blocks == ar->n_blocks))
              list_del(&ar->free_link);
-@@ -2277,6 +2284,7 @@
+@@ -2254,6 +2261,7 @@ static void *js_arena_realloc(JSRuntime *rt, void *ptr, size_t size)
              JSMallocBlockHeader *nb = container_of(new_ptr, JSMallocBlockHeader, user_data);
              nb->gc_obj_type = b->gc_obj_type;
              nb->mark = b->mark;
@@ -86,7 +86,7 @@ Needs a bytecode version bump
              nb->ref_count = b->ref_count;
          }
          old_usable = block_size - sizeof(JSMallocBlockHeader);
-@@ -2683,6 +2691,8 @@
+@@ -2660,6 +2668,8 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
  
      init_list_head(&rt->context_list);
      init_list_head(&rt->gc_obj_list);
@@ -95,7 +95,7 @@ Needs a bytecode version bump
      init_list_head(&rt->gc_zero_ref_count_list);
      rt->gc_phase = JS_GC_PHASE_NONE;
  
-@@ -2993,6 +3003,7 @@
+@@ -2970,6 +2980,7 @@ void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled)
          rt->json_lazy_enabled = enabled;
  }
  
@@ -103,19 +103,18 @@ Needs a bytecode version bump
  void JS_FreeRuntime(JSRuntime *rt)
  {
      struct list_head *el, *el1;
-@@ -3024,6 +3035,11 @@
+@@ -3001,6 +3012,10 @@ void JS_FreeRuntime(JSRuntime *rt)
      }
      init_list_head(&rt->job_list);
  
-+    /* The final collection has to break ctx -> global -> closure -> fnbc ->
-+       ctx, whose last edge is counted but untraced.  Without this splice the
-+       assert below fires, and in NDEBUG the realm leaks at every teardown. */
++    /* The final collection must break ctx -> global -> closure -> fnbc -> ctx,
++       whose last edge is counted but untraced. */
 +    js_gc_promote_all_code(rt);
 +
      JS_RunGC(rt);
  
  #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-@@ -3067,6 +3083,7 @@
+@@ -3044,6 +3059,7 @@ void JS_FreeRuntime(JSRuntime *rt)
      }
  #endif
  
@@ -123,7 +122,7 @@ Needs a bytecode version bump
      assert(list_empty(&rt->gc_obj_list));
  
      /* free the classes */
-@@ -3270,6 +3287,8 @@
+@@ -3247,6 +3263,8 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
          return NULL;
      }
      ctx->rt = rt;
@@ -132,20 +131,16 @@ Needs a bytecode version bump
      list_add_tail(&ctx->link, &rt->context_list);
      for(i = 0; i < rt->class_count; i++)
          ctx->class_proto[i] = JS_NULL;
-@@ -6853,8 +6872,66 @@
-     e->to_shape = NULL;
-     e->offset = 0;
+@@ -6822,6 +6840,62 @@ static void ic_entry_reset(JSRuntime *rt, JSICEntry *e)
      e->flags = keep;
-+}
-+
+ }
+ 
 +/* ---- untraced acyclic function bytecodes ------------------------------- */
 +/* A JSFunctionBytecode qualifies when it holds no reference to a GC object
-+   that could be part of a cycle.  Its realm reference is excluded because it
-+   stays COUNTED, so b->realm can never dangle; the one configuration that is
-+   therefore uncollectable -- a context that is garbage only through a cycle --
-+   is handled by js_gc_promote_all_code() at teardown and on a second context.
-+   The default is TRACED: a missed demote costs speed, a missed promote would
-+   retain memory. */
++   that could be part of a cycle. Its realm reference stays counted; a context
++   that is garbage only through a cycle is handled by
++   js_gc_promote_all_code(). The default is traced: a missed demote costs
++   speed, a missed promote would retain memory. */
 +static int fnbc_is_acyclic(JSFunctionBytecode *b)
 +{
 +    return b->cpool_count == 0 && b->objlit_tab == NULL &&
@@ -178,8 +173,8 @@ Needs a bytecode version bump
 +    list_del(&b->header.link);
 +    JS_GC_NOTRACE(b) = 0;
 +    list_add_tail(&b->header.link, &rt->gc_obj_list);
- }
- 
++}
++
 +/* Splice the untraced population back onto gc_obj_list and stop demoting. */
 +static void js_gc_promote_all_code(JSRuntime *rt)
 +{
@@ -199,7 +194,7 @@ Needs a bytecode version bump
  /* Free the whole IC table of a function bytecode (finalizer path; RT-only). */
  static void js_free_ic_table(JSRuntime *rt, JSFunctionBytecode *b)
  {
-@@ -6896,7 +6973,9 @@
+@@ -6863,7 +6937,9 @@ static JSICEntry *ic_table_ensure(JSRuntime *rt, JSFunctionBytecode *b)
          b->ic_entries = JS_IC_ENTRIES;
      t = js_mallocz_rt(rt, sizeof(*t) *
                        (size_t)b->ic_count * b->ic_entries);
@@ -210,7 +205,7 @@ Needs a bytecode version bump
      return t;
  }
  
-@@ -7271,6 +7350,7 @@
+@@ -7212,6 +7288,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
          JS_REF_COUNT(sh) = JS_REF_COUNT(old_sh);
          JS_GC_TYPE(sh) = JS_GC_TYPE(old_sh);
          JS_GC_MARK(sh) = JS_GC_MARK(old_sh);
@@ -218,7 +213,7 @@ Needs a bytecode version bump
          new_hash_mask = new_hash_size - 1;
          sh->prop_hash_mask = new_hash_mask;
          memcpy(get_shape_prop(sh), get_shape_prop(old_sh),
-@@ -7339,6 +7419,7 @@
+@@ -7280,6 +7357,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
      JS_REF_COUNT(sh) = JS_REF_COUNT(old_sh);
      JS_GC_TYPE(sh) = JS_GC_TYPE(old_sh);
      JS_GC_MARK(sh) = JS_GC_MARK(old_sh);
@@ -226,7 +221,7 @@ Needs a bytecode version bump
  
      /* set the new hash mask before prop_hash_end()/get_shape_prop() are used,
         as their locations depend on it in the merged-header layout */
-@@ -8682,6 +8763,12 @@
+@@ -8626,6 +8704,12 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
                  if (rt->gc_phase == JS_GC_PHASE_NONE) {
                      free_zero_refcount(rt);
                  }
@@ -239,7 +234,7 @@ Needs a bytecode version bump
              }
          }
          break;
-@@ -8728,6 +8815,7 @@
+@@ -8672,6 +8756,7 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
  {
      JS_GC_MARK(h) = 0;
      JS_GC_TYPE(h) = type;
@@ -247,7 +242,7 @@ Needs a bytecode version bump
      list_add_tail(&h->link, &rt->gc_obj_list);
  }
  
-@@ -8932,7 +9020,7 @@
+@@ -8876,7 +8961,7 @@ static void gc_decref(JSRuntime *rt)
  static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
  {
      JS_REF_COUNT(p)++;
@@ -256,7 +251,7 @@ Needs a bytecode version bump
          /* ref_count was 0: remove from tmp_obj_list and add at the
             end of gc_obj_list */
          list_del(&p->link);
-@@ -9224,6 +9312,11 @@
+@@ -9168,6 +9253,11 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
          }
      }
  
@@ -268,7 +263,7 @@ Needs a bytecode version bump
      list_for_each(el, &rt->gc_obj_list) {
          JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
          JSObject *p;
-@@ -42635,6 +42728,7 @@
+@@ -41926,6 +42016,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->realm = JS_DupContext(ctx);
  
      add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
@@ -276,7 +271,7 @@ Needs a bytecode version bump
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
      if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_FINAL))
-@@ -46379,6 +46473,7 @@
+@@ -45665,6 +45756,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
          b->lazy_len = lazy_len;
          s->ptr = lazy_body_ptr + lazy_len;
          b->realm = JS_DupContext(ctx);
@@ -284,7 +279,7 @@ Needs a bytecode version bump
          return obj;
      }
  
-@@ -46386,6 +46481,7 @@
+@@ -45672,6 +45764,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                                     layout.byte_code_offset, has_debug_info))
          goto fail;
      b->realm = JS_DupContext(ctx);
@@ -292,19 +287,18 @@ Needs a bytecode version bump
      return obj;
  
   fail:
-@@ -47104,6 +47200,11 @@
- 
+@@ -46391,6 +46484,10 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
      assert(b->is_lazy);
      assert(src != NULL);
-+
-+    /* JS_ReadFunctionBody fills the constant pool, may allocate an objlit
-+       table, and can itself trigger a collection part-way, so the promote has
-+       to precede it. */
-+    js_fnbc_gc_force_trace(ctx->rt, b);
  
++    /* JS_ReadFunctionBody fills the constant pool and can trigger a collection,
++       so promote first. */
++    js_fnbc_gc_force_trace(ctx->rt, b);
++
      /* A previous attempt already consumed part of the region. Re-running it
         would double-fill cpool slots and double-count atom references, so this
-@@ -47149,6 +47250,7 @@
+        function is permanently unusable. */
+@@ -46435,6 +46532,7 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
      bc_reader_free(s);
  
      if (ret == 0) {

@@ -24,17 +24,13 @@
 #
 # When OFF the flag defines nothing at all, so the compile command line -- and
 # therefore the objects and binaries -- are exactly what they were before this
-# option existed. That identity is a Phase 0 requirement and a gate; adding a
-# `QJS_REGVM=0` define in the off case would put the flag into every compile
-# line for no benefit. The engine's `#if QJS_REGVM` reads an undefined macro as
-# 0, which is how the register-VM patches will use it.
+# option existed; adding a `QJS_REGVM=0` define in the off case would put the
+# flag into every compile line for no benefit. The engine's `#if QJS_REGVM`
+# reads an undefined macro as 0.
 option(QJS_REGVM "Build the experimental register VM engine" OFF)
 
 if(QJS_REGVM)
-  # The register VM's engine changes are not in engine/patches yet, so the
-  # shipping projection does not carry them: a register build compiles the
-  # submodule, which is where the work lives. Once it lands, both variants read
-  # the projection and this branch goes away.
+  # A register build compiles the patched submodule directly.
   set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng")
 else()
   set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-rel")
@@ -84,16 +80,15 @@ target_include_directories(quickjs PUBLIC "${QUICKJS_DIR}")
 target_compile_definitions(quickjs PRIVATE _GNU_SOURCE)
 
 if(QJS_REGVM)
-  # Production packaging stays on the stack VM until the Phase 10 acceptance
-  # gates pass (see `.local/reg_vm_design.md`). Failing here is the point: a
-  # register-VM Android or iOS artifact would be unusable if it were shipped by
-  # accident, because its bytecode is not loadable by the shipping engine and
-  # vice versa.
+  # Production packaging stays on the stack VM for now. Failing here is the
+  # point: a register-VM Android or iOS artifact would be unusable if it were
+  # shipped by accident, because its bytecode is not loadable by the shipping
+  # engine and vice versa.
   if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     message(FATAL_ERROR
       "QJS_REGVM=ON is not supported for Android or iOS yet.\n"
-      "Production builds are stack-only until the register VM passes the "
-      "Phase 10 acceptance gates; host builds may set QJS_REGVM=ON freely.")
+      "Production builds are stack-only for now; host builds may set "
+      "QJS_REGVM=ON freely.")
   endif()
   target_compile_definitions(quickjs PUBLIC QJS_REGVM=1)
 
@@ -207,4 +202,20 @@ else()
     -Wno-sign-compare
     -Wno-implicit-fallthrough
   )
+endif()
+
+# x86: keep branches off 32-byte boundaries. On Skylake-family cores (JCC
+# erratum) handler placement alone moved Octane rows by up to 16% at identical
+# instruction counts.
+include(CheckCCompilerFlag)
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$"
+   AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+  # clang takes the flag directly; GCC passes it to the GNU assembler.
+  check_c_compiler_flag(-mbranches-within-32B-boundaries QJS_HAVE_BRANCH_ALIGN)
+  check_c_compiler_flag(-Wa,-mbranches-within-32B-boundaries QJS_HAVE_AS_BRANCH_ALIGN)
+  if(QJS_HAVE_BRANCH_ALIGN)
+    target_compile_options(quickjs PRIVATE -mbranches-within-32B-boundaries)
+  elseif(QJS_HAVE_AS_BRANCH_ALIGN)
+    target_compile_options(quickjs PRIVATE -Wa,-mbranches-within-32B-boundaries)
+  endif()
 endif()

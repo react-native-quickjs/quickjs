@@ -1,41 +1,19 @@
-Subject: register VM: compute argv_safe from register code
+Subject: Compute `argv_safe` from register code
 
-What this does:
-  Adds regvm_argv_safe_op / regvm_scan_argv_safe, the register-code form of
-  js_arg_ref_opcode, and uses it on the bundle read path to set both
-  b->args_captured and b->argv_safe. A debug build asserts the register scan
-  agrees with the stack scan that JS_ReadFunctionBytecode ran.
+What this does
+  Compute `argv_safe` from register code.
 
-Why we need it:
-  `argv_safe` and `args_captured` are never serialized, and after the stack
-  bytecode stops being written into bundles there is no stack code to scan, so
-  the decoder must derive them from the register program. The register scan
-  reproduces exactly the register VM's own borrow condition
-  (regvm_args_borrowable: `!args_captured`): a var_ref onto a parameter slot
-  (ROP_make_local_ref with kind 1, lowered from OP_make_arg_ref) or the mapped
-  `arguments` object (ROP_special_object with
-  OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS). A wrong flag is a memory-safety bug
-  under DRC, and bundles are untrusted input.
+Why we need it
+  `argv_safe`/`args_captured` are never serialized; once bundles carry no stack code the decoder must derive them from the register program, and a wrong flag is a memory-safety bug under DRC.
 
-Needs a bytecode version bump:
-  No. No opcode, operand or serialized field changes.
+What it adds
+  `regvm_argv_safe_op`/`regvm_scan_argv_safe` (the register form of `js_arg_ref_opcode`); the read path sets `b->args_captured`/`b->argv_safe` from it, with a debug assert against the stack scan.
 
-Notes:
-  Bundle plan D7 plus the 4.4 cross-check.
-  Deviation, recorded in the plan's Findings: D7's two conditions are exactly
-  the stack scan's js_arg_ref_opcode, so the flag they compute is
-  `args_captured`, not the stack VM's broader `argv_safe`. The register
-  lowering elides dead argument stores, so the register code cannot reproduce
-  `argv_safe` exactly; it is strictly more permissive, which is safe because a
-  register frame borrows on `args_captured` (regvm_args_borrowable), and the
-  stack VM only consults `argv_safe` when it is the caller. The debug assert
-  therefore compares `args_captured` (the register VM's flag), and it agrees.
-  Gates: box2d 546.1008391043414; test262 50/81192; diff-suite 400/0/0; the
-  13-row Octane round trip source == eager == lazy; ASan round trip clean.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -69632,6 +69632,9 @@
+@@ -67087,6 +67087,9 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
     definition is freed. All the child functions are also created. It
     must be done this way to resolve all the variables. */
  static void js_scan_argv_safe(JSFunctionBytecode *b);
@@ -45,38 +23,31 @@ Notes:
  
  static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
  {
-@@ -69866,6 +69869,18 @@
+@@ -67321,6 +67324,14 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
          js_free(ctx, fd->regvm_code);
          fd->regvm_code = NULL;
          fd->regvm_len = 0;
 +#if !defined(NDEBUG)
-+        /* Bundle plan 4.4: the register scan must agree with the stack scan
-+           that js_scan_argv_safe just ran. The register VM borrows a caller's
-+           argument window on `!args_captured` (regvm_args_borrowable), and the
-+           register scan reproduces exactly that condition; a debug build
-+           asserts they agree. (`argv_safe` is the stack VM's broader flag and
-+           is not compared: the register lowering elides dead argument stores,
-+           so the register code is strictly more permissive, which is safe for
-+           the register VM.) */
++        /* The register scan must agree with the stack scan js_scan_argv_safe
++           just ran on args_captured, the condition regvm_args_borrowable uses;
++           a debug build asserts it. argv_safe is not compared: the register
++           lowering drops dead argument stores, so it may be more permissive. */
 +        assert(regvm_scan_argv_safe(b->regvm_code, b->regvm_len) ==
 +               (b->args_captured == 0));
 +#endif
      }
  #endif
  
-@@ -73041,6 +73056,49 @@
+@@ -70487,6 +70498,46 @@ static void js_scan_argv_safe(JSFunctionBytecode *b)
      b->argv_safe = 1;
  }
  
 +#if QJS_REGVM
-+/* Bundle plan D7: the register-code form of js_arg_ref_opcode -- does the
-+   program create a var_ref onto a parameter slot, or materialise the mapped
-+   `arguments` object? Those are the cases that make a register frame's
-+   argument window unsafe to borrow (`regvm_args_borrowable`), because a write
-+   through the ref frees the slot's old value. `ops` points at the first
-+   operand byte. The two conditions are exactly the stack scan's
-+   js_arg_ref_opcode, so the flag they compute is args_captured; a debug build
-+   asserts the two agree (§4.4). */
++/* The register-code form of js_arg_ref_opcode: does the program create a
++   var_ref onto a parameter slot or materialise the mapped `arguments` object?
++   Either makes the argument window unsafe to borrow (`regvm_args_borrowable`):
++   a write through the ref frees the slot's old value. `ops` points at the
++   first operand byte. */
 +static bool regvm_argv_safe_op(int op, const uint8_t *ops)
 +{
 +    switch (op) {
@@ -114,16 +85,13 @@ Notes:
  /* Interns atom `idx` from its recorded position in the payload and memoises it
     in idx_to_atom. Reads through a scratch cursor so the caller's parse position
     is untouched. */
-@@ -74004,6 +74062,25 @@
+@@ -71441,6 +71492,22 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
              b->regvm_owns_atoms = 0;
              goto fail_unregistered;
          }
 +        /*
-+         * Bundle plan D7: `argv_safe` is never serialized, and after P3 a
-+         * register bundle carries no stack code to scan. Recompute it from the
-+         * register program. The register scan reproduces the register VM's own
-+         * borrow condition (`!args_captured`, see regvm_args_borrowable), which
-+         * is the flag a register frame consults.
++         * `argv_safe` is never serialized, and a register bundle carries no
++         * stack code to scan, so recompute it from the register program.
 +         */
 +        {
 +            bool rs = regvm_scan_argv_safe(b->regvm_code, b->regvm_len);

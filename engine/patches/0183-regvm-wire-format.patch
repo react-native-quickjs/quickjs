@@ -1,85 +1,40 @@
-From: quickjs-ng bundle work
 Subject: Register bundles: compact wire format, fused decoder, no stack bytecode
 
 What this does
-  Splits the register bytecode into two encodings (bundle plan D1/D2). The exec
-  encoding is what the VM runs and does not change. The wire encoding is what
-  goes in a bundle: compact, variable length. JS_WriteFunctionTag converts
-  exec -> wire with regvm_wire_encode; JS_ReadFunctionBody converts wire -> exec
-  with regvm_wire_decode in one pass, interning atoms, validating every operand,
-  computing args_captured/argv_safe, building the instruction-start bitmap and
-  checking branch targets. That single pass replaces regvm_map_atoms2 x2 plus
-  regvm_validate_code on the read path.
-
-  The register program moves out of the function header into the lazy region
-  (D4), and the stack bytecode stops being written at all: a register bundle has
-  byte_code_len = 0, ic_count = 0 and stack_size = 0. The lazy region is now
-  vardefs, cpool, wire register code, objlit templates (no stack pc) and debug
-  (register-keyed pc2line). REGVM_FORMAT_VERSION goes 15 -> 16.
-
-  Wire operands (D3): opcode 1 byte; a register operand is a ULEB128 register
-  index for the wide form and the raw stored byte (a byte offset) for the narrow
-  form; an atom is the tagged-int/bundle-index ULEB that bc_put_atom/bc_get_atom
-  already use; a branch offset is the engine's zigzag "sleb128" of the same
-  relative offset; u/s and I/c are ULEB128/zigzag-LEB.
+  Register bundles: compact wire format, fused decoder, no stack bytecode.
 
 Why we need it
-  A register bundle used to embed both the stack bytecode and a copy of the exec
-  register program, so it was 1.45-1.62x the stack bundle and the reader walked
-  the register program several times (map atoms twice, validate twice). Moving
-  the code to the lazy region in a compact form and folding the reader's work
-  into one decode removes the stack bytecode from memory and the bundle, and
-  makes the read a single linear pass.
+  A register bundle embedded both the stack bytecode and a copy of the exec register program, and the reader walked the register program several times.
 
 What it adds
-  quickjs.c
-      regvm_wire_put_atom, regvm_wire_encode, regvm_wire_get_leb,
-      regvm_wire_get_sleb, regvm_wire_decode; the BCReaderState wire_is_start/
-      wire_targets/wire_scratch_len scratch (reused across functions); the
-      JS_WriteFunctionTag and JS_ReadFunctionBody/JS_ReadFunctionTag layout
-      changes; the objlit-without-pc reader/writer paths; the in-decode
-      regvm_all_threaded computation (D13).
-  quickjs-regvm.h
-      REGVM_FORMAT_VERSION 15 -> 16.
+  `regvm_wire_encode` (exec->wire) and `regvm_wire_decode` (wire->exec in one pass: atom interning, operand validation, `args_captured`/`argv_safe`, start bitmap, branch targets); register code moved to the lazy region; `byte_code_len`/`ic_count`/`stack_size` = 0; objlit without stack pc.
 
-  Measured on x86-64, clang-19 -O2, taskset -c 5, .local/coldoutline/octane-fixed
-  (stack sizes in parentheses):
-      pdfjs    4,264,731 bytes vs 3,872,207 stack = 1.101x
-      mandreel 9,167,743 bytes vs 8,476,587 stack = 1.081x
-      box2d      701,452 bytes vs   706,086 stack = 0.994x
-      pdfjs eager load, 30 loads, ldread: 0.37 s (was 0.77 s before this patch;
-      stack 0.20 s). pdfjs lazy load, 30 loads: 0.08 s (target 0.08 s).
-      The wire decode is ~0.25 s of the eager load; a no-decode build reads the
-      same bundle in 0.12 s.
-  Wire bytes per operand kind for pdfjs (from a temporary instrumentation of
-  regvm_wire_encode, not committed): total 1,228,306 = op 291,346, r 487,396,
-  I 193,163, a 162,238, u 29,842, b 26,491, i 13,022, c 11,465, t 6,779,
-  s 6,564.
-
-  Gates: box2d 546.1008391043414 from source, eager bundle and lazy bundle;
-  test262 50/81192 with no leaks; differential corpus 400/0/0; all 13 Octane
-  rows run in all three modes; ASan of run.c clean on box2d and six Octane rows
-  (eager and lazy). box2d run-time instructions 3.336 G vs 3.361 G before the
-  format change (G3 -0.76%); box2d eager vs source run-only instructions within
-  0.7% (D13 gate).
-
-  Deviations recorded in the plan's Findings: the pdfjs bundle is 1.101x rather
-  than the 1.10x target (the register pc2line and the wire are each a little
-  larger than the plan's estimate), and the pdfjs eager load is 0.37 s rather
-  than the 0.30 s target.
-
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs-regvm.h b/quickjs-regvm.h
+index 59a16e6..039f8ca 100644
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -616,7 +616,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
+ /* The register bytecode's format version, checked per function record before
+    any instruction is parsed. Bump it whenever an opcode is added, removed or
+    renumbered, or an operand's width or meaning changes. */
+-#define REGVM_FORMAT_VERSION 15
++#define REGVM_FORMAT_VERSION 16
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */
 diff --git a/quickjs.c b/quickjs.c
-index f6c8631..bbe4727 100644
+index 5d88a30..290033f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -72179,6 +72179,122 @@ static int regvm_writer_atom(void *opaque, uint32_t *patom)
+@@ -69622,6 +69622,117 @@ static int regvm_writer_atom(void *opaque, uint32_t *patom)
      *patom = v;
      return 0;
  }
 +
-+/* Wire form of an atom operand: the same tagged-int / bundle-index split as
-+   bc_put_atom, but appended to the caller's buffer. The register wire is
-+   staged in a temporary DynBuf so its length can be written in front of it. */
++/* Wire form of an atom operand: bc_put_atom's tagged-int / bundle-index
++   split, appended to the caller's buffer. */
 +static int regvm_wire_put_atom(BCWriterState *s, DynBuf *d, JSAtom atom)
 +{
 +    uint32_t v;
@@ -95,14 +50,10 @@ index f6c8631..bbe4727 100644
 +    return 0;
 +}
 +
-+/*
-+ * exec -> wire (bundle plan 3.2 / D3). Register operands become ULEB128
-+ * register indices (the narrow form's byte stays as it is), atoms become the
-+ * tagged-int / bundle-index ULEB, branch offsets become SLEB128 relative to
-+ * the instruction end, and the wide 32-bit operands become LEB128. The exec
-+ * width of every operand is still regvm_fmt_size's, so the walk is the same as
-+ * regvm_map_atoms2's. `wire_len` is written in front of the bytes.
-+ */
++/* exec -> wire. Register operands become ULEB128 register indices (a narrow
++   byte stays as it is), atoms the tagged-int / bundle-index ULEB, branch
++   offsets SLEB128 from the instruction end, wide 32-bit operands LEB128. The
++   walk is regvm_map_atoms2's. `wire_len` is written in front of the bytes. */
 +static int regvm_wire_encode(BCWriterState *s, const JSFunctionBytecode *b)
 +{
 +    const uint8_t *code = b->regvm_code;
@@ -195,13 +146,12 @@ index f6c8631..bbe4727 100644
  #endif
  
  static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
-@@ -72222,32 +72338,46 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -69664,32 +69775,44 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      bc_put_leb128(s, b->arg_count);
      bc_put_leb128(s, b->var_count);
      bc_put_leb128(s, b->defined_arg_count);
 +#if QJS_REGVM && !QJS_AOT
-+    /* D9: a register bundle carries no stack bytecode. The field stays in the
-+       shared header parse, but it is always zero. */
++    /* A register bundle carries no stack bytecode; the field is always zero. */
 +    bc_put_leb128(s, 0);            /* stack_size */
 +#else
      bc_put_leb128(s, b->stack_size);
@@ -232,9 +182,8 @@ index f6c8631..bbe4727 100644
 -       global or private name by atom. A function the backend refused is
 -       written as "not compiled" and fails closed on the other side; the
 -       explicit flag is what keeps a refusal distinct from an empty program. */
-+    /* The register program. A function the backend refused is written as "not
-+       compiled" and fails closed on the other side; the explicit flag is what
-+       keeps a refusal distinct from an empty program. */
++    /* The register program. A refused function is written as "not compiled",
++       which the flag keeps distinct from an empty program. */
      bc_put_u8(s, b->regvm_compiled ? 1 : 0);
      if (b->regvm_compiled) {
          bc_put_u8(s, REGVM_FORMAT_VERSION);
@@ -244,25 +193,25 @@ index f6c8631..bbe4727 100644
 -        bc_put_leb128(s, b->regvm_len);
 +        bc_put_leb128(s, b->regvm_len); /* exec_len: the decoded length */
 +#if QJS_AOT
-+        /* AOT keeps the old layout: the exec code in the header. */
++        /* AOT keeps the exec code in the header. */
          rbuf = js_malloc(s->ctx, b->regvm_len);
          if (!rbuf)
              goto fail;
-@@ -72258,6 +72388,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -69700,6 +69823,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
          dbuf_put(&s->dbuf, rbuf, b->regvm_len);
          js_free(s->ctx, rbuf);
          rbuf = NULL;
 +#endif
-+        /* Otherwise the program goes to the lazy region in wire form (D4). */
++        /* Otherwise the program goes to the lazy region in wire form. */
      }
  #endif
  
-@@ -72316,19 +72448,30 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -69758,19 +69883,30 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
              goto fail;
      }
  
 +#if QJS_REGVM && !QJS_AOT
-+    /* D4: the register program, in wire form, replaces the stack bytecode. */
++    /* The register program, in wire form, replaces the stack bytecode. */
 +    if (b->regvm_compiled && regvm_wire_encode(s, b))
 +        goto fail;
 +#else
@@ -276,8 +225,8 @@ index f6c8631..bbe4727 100644
          JSObjLitTemplate *tpl = &b->objlit_tab[i];
          uint16_t k;
 +#if QJS_REGVM && !QJS_AOT
-+        /* D4: the register program names its templates by order, so no stack
-+           pc is written. */
++        /* The register program names its templates by order, so no stack pc is
++           written. */
 +#else
          assert(tpl->pc < (uint32_t)b->byte_code_len);
          assert(i == 0 || tpl->pc > b->objlit_tab[i - 1].pc);
@@ -288,13 +237,12 @@ index f6c8631..bbe4727 100644
          bc_put_leb128(s, tpl->prop_count);
          for (k = 0; k < tpl->prop_count; k++)
              bc_put_atom(s, js_objlit_template_atom(tpl, k));
-@@ -72858,6 +73001,13 @@ typedef struct BCReaderState {
+@@ -70300,6 +70436,12 @@ typedef struct BCReaderState {
      /* used for JS_DUMP_READ_OBJECT */
      const uint8_t *ptr_last;
      int level;
 +#if QJS_REGVM
-+    /* regvm_wire_decode scratch, reused across the functions of one read
-+       instead of one js_malloc per function (bundle plan 3.3 step 1). */
++    /* regvm_wire_decode scratch, reused across the functions of one read. */
 +    uint8_t *wire_is_start;
 +    int *wire_targets;
 +    int wire_scratch_len;
@@ -302,7 +250,7 @@ index f6c8631..bbe4727 100644
  } BCReaderState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -73192,6 +73342,328 @@ static int bc_get_atom(BCReaderState *s, JSAtom *patom)
+@@ -70631,6 +70773,321 @@ static int bc_get_atom(BCReaderState *s, JSAtom *patom)
      }
  }
  
@@ -345,9 +293,8 @@ index f6c8631..bbe4727 100644
 +    return -1;
 +}
 +
-+/* The signed operands use the engine's existing "sleb128" pair, which is a
-+   zigzag ULEB (see dbuf_put_sleb128 / get_sleb128), not a two's-complement
-+   SLEB128. Decode it the same way. */
++/* The signed operands use the engine's "sleb128" pair, a zigzag ULEB (see
++   dbuf_put_sleb128 / get_sleb128). */
 +static inline __attribute__((always_inline)) int
 +regvm_wire_get_sleb(const uint8_t **pp, const uint8_t *end, int32_t *pv)
 +{
@@ -358,17 +305,12 @@ index f6c8631..bbe4727 100644
 +    return 0;
 +}
 +
-+/*
-+ * wire -> exec (bundle plan 3.3 / D1, D8). One pass: decode into b->regvm_code
-+ * (exec_len bytes, already allocated), interning atoms, checking every operand
-+ * range, marking instruction starts, and collecting branch targets. It also
-+ * computes args_captured / argv_safe (D7). On failure it throws SyntaxError,
-+ * releases every atom it interned, and returns -1.
-+ *
-+ * Instructions are validated before any of their bytes are written, so the
-+ * completed prefix is always instruction-aligned and can be unwound by
-+ * regvm_unmap_atoms.
-+ */
++/* wire -> exec, in one pass: decode into b->regvm_code (exec_len bytes),
++   interning atoms, range-checking operands, marking instruction starts,
++   collecting branch targets, and computing args_captured / argv_safe. On
++   failure it throws SyntaxError, releases every interned atom and returns -1.
++   Each instruction is validated before it is written, so the written prefix
++   is instruction-aligned for regvm_unmap_atoms. */
 +static __attribute__((noinline)) int
 +regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
 +                             const uint8_t *wire, uint32_t wire_len)
@@ -441,8 +383,8 @@ index f6c8631..bbe4727 100644
 +
 +            if (fmt[m] == 'r') {
 +                if (nar) {
-+                    /* The narrow form stores the byte offset as it is (D3), so
-+                       it is a raw byte, not a LEB. */
++                    /* The narrow form stores the byte offset as a raw byte, not
++                       a LEB. */
 +                    if (w >= w_end) {
 +                        JS_ThrowSyntaxError(ctx, "truncated register program");
 +                        goto fail_ins;
@@ -553,9 +495,8 @@ index f6c8631..bbe4727 100644
 +        if (op == ROP_special_object && ops[1] == OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS)
 +            borrowable = false;
 +#if QJS_REGVM_THREAD
-+        /* D13: the interpreter-eligibility flag is a property of the build, not
-+           the bytecode, so it is recomputed here rather than serialized. Doing
-+           it in the decode saves a second walk over the code. */
++        /* The eligibility flag is not serialized; computing it here saves a
++           second walk. */
 +        if (!regvm_is_threaded[op])
 +            all_threaded = false;
 +#endif
@@ -631,14 +572,13 @@ index f6c8631..bbe4727 100644
  static JSString *JS_ReadString(BCReaderState *s)
  {
      uint32_t len;
-@@ -73711,10 +74183,30 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71143,10 +71600,29 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
      }
      {
          bc_read_trace(s, "bytecode {\n");
 +#if QJS_REGVM && !QJS_AOT
-+        /* D4: the stack bytecode is gone. The register program is decoded from
-+           the wire here; the decoder interns atoms, validates, and sets
-+           args_captured/argv_safe. */
++        /* No stack bytecode: decode the register program from the wire, which
++           interns atoms, validates, and sets args_captured/argv_safe. */
 +        if (b->regvm_compiled) {
 +            uint32_t wire_len;
 +            if (bc_get_leb128(s, &wire_len))
@@ -662,7 +602,7 @@ index f6c8631..bbe4727 100644
          bc_read_trace(s, "}\n");
      }
      {
-@@ -73722,6 +74214,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71154,6 +71630,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
          uint32_t *template_pcs = NULL;
          if (bc_get_leb128(s, &template_count) || template_count > UINT16_MAX)
              return -1;
@@ -670,7 +610,7 @@ index f6c8631..bbe4727 100644
          if (template_count != 0) {
              template_pcs = js_malloc(s->ctx,
                                       sizeof(*template_pcs) * template_count);
-@@ -73764,6 +74257,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71196,6 +71673,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
                  goto objlit_fail;
              }
          }
@@ -678,13 +618,13 @@ index f6c8631..bbe4727 100644
          if (template_count != 0) {
              b->objlit_tab = js_mallocz(s->ctx,
                                         sizeof(*b->objlit_tab) * template_count);
-@@ -73772,10 +74266,19 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+@@ -71204,10 +71682,19 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
              b->objlit_count = (uint16_t)template_count;
          }
          for (i = 0; i < (int)template_count; i++) {
 +#if QJS_REGVM && !QJS_AOT
-+            /* D4: the register program names its templates by order, so no
-+               stack pc is written and there is no stack code to cross-check. */
++            /* Templates are named by order, so there is no stack pc to
++               cross-check. */
 +            pc = 0;
 +            if (bc_get_leb128(s, &prop_count) ||
 +                prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS)
@@ -698,7 +638,7 @@ index f6c8631..bbe4727 100644
              b->objlit_tab[i].pc = pc;
              b->objlit_tab[i].atoms = js_malloc(s->ctx,
                                                 sizeof(JSAtom) * prop_count);
-@@ -73973,10 +74476,26 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -71405,10 +71892,26 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
              if (reg_count <= 0 || ctl_count < 0 || regvm_len <= 0 ||
                  reg_count > REGVM_WIDE_REG_MAX + 1 || ctl_count > UINT16_MAX ||
                  pic_count < 0 || pic_count > UINT16_MAX ||
@@ -708,16 +648,16 @@ index f6c8631..bbe4727 100644
 +                goto fail;
 +            }
 +#if QJS_AOT
-+            /* The old layout keeps the exec code in the header, so it must fit
++            /* The AOT layout keeps the exec code in the header, so it must fit
 +               in the remaining input. */
 +            if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
 +                JS_ThrowSyntaxError(ctx, "invalid register program header");
 +                goto fail;
 +            }
 +#else
-+            /* D4: the exec code is decoded from the wire in the lazy region.
-+               The wire is never smaller than 1/16 of the decoded length, so
-+               this is the allocation bound. */
++            /* The exec code is decoded from the wire in the lazy region. The
++               wire is never smaller than 1/16 of the decoded length, which
++               bounds the allocation. */
 +            if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr) * 16) {
                  JS_ThrowSyntaxError(ctx, "invalid register program header");
                  goto fail;
@@ -726,7 +666,7 @@ index f6c8631..bbe4727 100644
              bc.regvm_compiled = 1;
              bc.regvm_reg_count = reg_count;
              bc.regvm_ctl_count = ctl_count;
-@@ -74019,10 +74538,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -71451,10 +71954,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      }
  #if QJS_REGVM
      if (b->regvm_compiled) {
@@ -741,29 +681,26 @@ index f6c8631..bbe4727 100644
          if (bc_get_buf(s, b->regvm_code, b->regvm_len)) {
              b->regvm_code = NULL;
              b->regvm_compiled = 0;
-@@ -74081,6 +74602,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -71508,6 +72013,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
              b->args_captured = !rs;
              b->argv_safe = rs;
          }
 +        }
 +#else
-+        /* D4: the exec code is decoded from the wire by JS_ReadFunctionBody,
-+           which also interns atoms, validates the program, and sets
-+           args_captured/argv_safe. Nothing is read from the header here. */
++        /* The exec code is decoded from the wire by JS_ReadFunctionBody, which
++           interns atoms, validates, and sets args_captured/argv_safe. */
 +#endif
      }
  #endif
  
-@@ -74169,12 +74696,14 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -71595,11 +72105,13 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+         goto fail;
      b->realm = JS_DupContext(ctx);
  #if QJS_REGVM_RECORD
-     /* D13: `regvm_all_threaded` is a property of the interpreter build, not of
--       the bytecode, so it is never serialized. Recompute it from the code just
--       read, or the function stays ineligible for the record call and tail-call
--       fast paths. */
-+       the bytecode, so it is never serialized. Under the new wire format
-+       regvm_wire_decode computes it in its single pass; only the old AOT layout
-+       needs the extra walk here. */
+-    /* `regvm_all_threaded` is never serialized: recompute it from the code
+-       just read, or the function stays off the record and tail-call paths. */
++    /* `regvm_all_threaded` is never serialized. regvm_wire_decode computes it;
++       only the AOT layout needs the extra walk here. */
 +#if QJS_AOT
      if (b->regvm_compiled && b->regvm_code)
          b->regvm_all_threaded =
@@ -772,7 +709,7 @@ index f6c8631..bbe4727 100644
      regvm_set_call_desc(b);
  #endif
  #if QJS_AOT
-@@ -74917,6 +75446,10 @@ static void bc_reader_free(BCReaderState *s)
+@@ -72338,6 +72850,10 @@ static void bc_reader_free(BCReaderState *s)
      }
      js_free(s->ctx, s->atom_offset);
      js_free(s->ctx, s->objects);
@@ -783,14 +720,14 @@ index f6c8631..bbe4727 100644
  }
  
  /* Deserializes a function body that was skipped at read time.
-@@ -74993,11 +75526,13 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
+@@ -72413,11 +72929,13 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
  
      if (ret == 0) {
  #if QJS_REGVM_RECORD
--        /* D13: recompute the interpreter-build property from the code just
--           materialized, exactly as the eager read path does. */
-+        /* D13: under the new wire format regvm_wire_decode already set the flag
-+           in its single pass; only the old AOT layout walks the code again. */
+-        /* recompute it from the code just materialized, as the eager read
+-           path does */
++        /* regvm_wire_decode already set the flag; only the AOT layout walks the
++           code again. */
 +#if QJS_AOT
          if (b->regvm_compiled && b->regvm_code)
              b->regvm_all_threaded =
@@ -799,16 +736,3 @@ index f6c8631..bbe4727 100644
          regvm_set_call_desc(b);
  #endif
  #if QJS_AOT
-diff --git a/quickjs-regvm.h b/quickjs-regvm.h
-index 12102ae..034748d 100644
---- a/quickjs-regvm.h
-+++ b/quickjs-regvm.h
-@@ -784,7 +784,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
-  * cross-VM one does. Bump it whenever an opcode is added, removed or
-  * renumbered, or an operand's width or meaning changes.
-  */
--#define REGVM_FORMAT_VERSION 15
-+#define REGVM_FORMAT_VERSION 16
- 
- /* ROP_get_field and ROP_put_field use this site index when the source
-    instruction has no inline cache. */

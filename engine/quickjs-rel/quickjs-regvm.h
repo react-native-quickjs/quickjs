@@ -6,45 +6,31 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Included by quickjs.c, under QJS_REGVM only. It is the exhaustive
- * classification of the frontend's emitted operations: every DEF in
- * quickjs-opcode.h has a REG_LOWERING_<id> line here, and quickjs.c builds
- * regvm_op_kind[] by including quickjs-opcode.h with DEF redefined to emit
- * REG_LOWERING_ ## id. An opcode added to quickjs-opcode.h without a line here
- * is an undeclared identifier and fails the build -- that is the completeness
- * gate, and it is a compile-time gate on purpose. n_pop, n_push and fmt
- * describe stack layout, not semantics, so they are never used to infer that
+ * Included by quickjs.c, under QJS_REGVM only. Every DEF in quickjs-opcode.h
+ * has a REG_LOWERING_<id> line here, and quickjs.c builds regvm_op_kind[] by
+ * including quickjs-opcode.h with DEF redefined to emit REG_LOWERING_ ## id, so
+ * an opcode without a line is an undeclared identifier and fails the build.
+ * n_pop, n_push and fmt describe stack layout and are never used to infer that
  * an opcode is supported.
  *
- * The register ISA is a separate numbering from the stack opcodes. A lowering
- * kind names the semantic family an operation belongs to; a family names the
- * register instruction shape that executes it. Stack shaping (dup, perm, rot,
- * ...) is REG_LOWER_ELIDED: it has no register instruction because lowering
- * removes it.
- *
- * See .local/reg_vm_design.md for the architecture this serves. Nothing here
- * executes yet; it is the frozen input's classification and the ISA inventory
- * the decoder, allocator and emitter are built against.
+ * The register ISA is numbered separately from the stack opcodes. A lowering
+ * kind names an operation's semantic family; a family names the register
+ * instruction shape that executes it. Stack shaping (dup, perm, rot, ...) is
+ * REG_LOWER_ELIDED: lowering removes it.
  */
 
 #ifndef QUICKJS_REGVM_H
 #define QUICKJS_REGVM_H
 
-/*
- * Ownership carried by a virtual value. The register frame owns only what is
- * tagged owned; primitives and borrowed references perform no RC operation.
- */
+/* Ownership carried by a virtual value. Only owned values are released. */
 typedef enum JSRegValueOwnership {
     REG_VALUE_PRIMITIVE = 0,
     REG_VALUE_BORROWED,
     REG_VALUE_OWNED,
 } JSRegValueOwnership;
 
-/*
- * What an emitted stack opcode lowers to. This is the inventory's value type.
- * UNSET is the sentinel a completeness failure leaves behind; it is never a
- * valid lowering and the verifier rejects it.
- */
+/* What an emitted stack opcode lowers to. UNSET, left by a completeness
+   failure, is never valid. */
 typedef enum JSRegLoweringKind {
     REG_LOWER_UNSET = 0,   /* unclassified: a completeness-gate failure */
     REG_LOWER_RESERVED,    /* reserved/unreachable: must never be emitted */
@@ -70,12 +56,7 @@ typedef enum JSRegLoweringKind {
     REG_LOWER_KIND_COUNT,
 } JSRegLoweringKind;
 
-/*
- * Register ISA families. A family is a shape of register instruction, not a
- * workload-specific recipe: one Call names destination, callee, receiver, an
- * argument window and a call kind; one property instruction names a
- * destination, a receiver, a key and an IC site.
- */
+/* Register ISA families: a family is a shape of register instruction. */
 typedef enum JSRegFamily {
     REG_FAMILY_NONE = 0, /* elided: no register instruction */
     REG_FAMILY_CONST,
@@ -100,16 +81,13 @@ typedef enum JSRegFamily {
 
 /* --- the inventory -------------------------------------------------------
  *
- * One line per opcode in quickjs-opcode.h, in file order. The order does not
- * matter to the generated array (initializers are positional, but the array is
- * built by re-including the opcode list), only completeness does. Grouped as
- * the opcode list groups them.
+ * One line per opcode in quickjs-opcode.h, grouped as the opcode list groups
+ * them.
  */
 
 /* escape prefix: a 2-byte prefix whose subop refines it. Subop 0/1 are the
-   debugger traps (0 -> 0, elided); subop 2 is the fused get_loc0 get_loc1
-   (0 -> 2 frame reads). The decoder dispatches on the subop; the table entry
-   is the conservative family, never used to skip the subop check. */
+   debugger traps (elided); subop 2 is the fused get_loc0 get_loc1 (two frame
+   reads). The table entry is the conservative family. */
 #define REG_LOWERING_esc1 REG_LOWER_SPECIAL
 
 /* push values */
@@ -338,8 +316,7 @@ typedef enum JSRegFamily {
 #define REG_LOWERING_nop                REG_LOWER_ELIDED
 
 /* --- short forms ---------------------------------------------------------
- * The same operations, selected by the final short-opcode pass. Their stack
- * effects match their long forms, so their lowering kind does too.
+ * Same stack effects as their long forms, so the same lowering kind.
  */
 
 #define REG_LOWERING_push_minus1        REG_LOWER_CONST
@@ -419,14 +396,10 @@ typedef enum JSRegFamily {
 /*
  * --- the register ISA ---------------------------------------------------
  *
- * The instruction set the backend emits. Operands are u8 registers by default;
- * a function whose allocator needs more than 255 sets the wide form once in its
- * header, so no handler decodes an operand width per operand. There is no
- * stack-shaping instruction: a REG_LOWER_ELIDED operation has no register form
- * because lowering removes it. Every instruction declares its operands
- * explicitly -- a Call names destination, callee, receiver, argument-window
- * start and count; a property instruction names destination, receiver, key and
- * IC site -- rather than leaving them implicit in a stack.
+ * The instruction set the backend emits. There is no stack-shaping
+ * instruction. Every instruction declares its operands explicitly: a Call
+ * names destination, callee, receiver, argument-window start and count; a
+ * property instruction names destination, receiver, key and IC site.
  */
 typedef enum JSRegOpcode {
     ROP_invalid = 0,
@@ -437,12 +410,8 @@ typedef enum JSRegOpcode {
     ROP_load_bigint_i32, ROP_new_object, ROP_object_template,
     ROP_move,
 
-    /*
-     * bindings: locals, arguments, closure cells, globals, and the lexical
-     * checks that guard a slot before it is read or written. A check is its own
-     * instruction rather than a flag on the read or write, so the read and write
-     * forms stay the ones the emitter already had.
-     */
+    /* bindings: locals, arguments, closure cells, globals, and the lexical
+       checks that guard a slot. A check is its own instruction. */
     ROP_get_local, ROP_put_local, ROP_get_arg, ROP_put_arg,
     ROP_get_var_ref, ROP_put_var_ref, ROP_get_global, ROP_put_global,
     ROP_local_uninit, ROP_local_check, ROP_local_check_init,
@@ -463,10 +432,8 @@ typedef enum JSRegOpcode {
     ROP_put_element, ROP_define_element, ROP_get_length, ROP_super_get,
     ROP_super_put,
 
-    /*
-     * classes: a method definition, the home object, the prototype link and the
-     * constructor checks a derived constructor runs before and after super()
-     */
+    /* classes: method definition, home object, prototype link, and the derived
+       constructor checks around super() */
     ROP_define_class, ROP_define_class_computed,
     ROP_define_method, ROP_define_method_computed, ROP_set_proto,
     ROP_set_home_object, ROP_get_super, ROP_check_ctor, ROP_check_ctor_return,
@@ -502,27 +469,16 @@ typedef enum JSRegOpcode {
     /* dynamic import: specifier and options in, a promise out */
     ROP_dynamic_import,
 
-    /*
-     * Explicit resource management (`using`, `await using`). The error state a
-     * dispose scope carries is an ordinary value here, so each of these is the
-     * stack VM's handler with its operands named instead of a stack pointer.
-     */
+    /* Explicit resource management (`using`, `await using`): the stack VM's
+       handlers, with the dispose scope's error state as a named operand. */
     ROP_using_init, ROP_using_dispose, ROP_using_dispose_async,
     ROP_using_merge, ROP_using_end, ROP_using_check,
 
-    /*
-     * A named field read whose receiver is a frame slot, borrowed rather than
-     * copied into the scratch register: the pair the fused local/argument
-     * receiver stack opcodes lower to, in one instruction.
-     */
+    /* A named field read whose receiver is a borrowed frame slot. */
     ROP_get_local_field, ROP_get_arg_field,
 
-    /*
-     * ROP_binary with one or both sources named as a local slot instead of a
-     * register. The frame read that would have produced the operand is folded
-     * into the operation, which borrows the slot directly: loc_reg has the lhs
-     * in a slot, reg_loc the rhs, loc_loc both.
-     */
+    /* ROP_binary with one or both sources a borrowed local slot: loc_reg has
+       the lhs in a slot, reg_loc the rhs, loc_loc both. */
     ROP_binary_loc_reg, ROP_binary_reg_loc, ROP_binary_loc_loc,
 
     /* A definition whose source is dead: the reference moves instead of being
@@ -530,92 +486,46 @@ typedef enum JSRegOpcode {
     ROP_move_xfer, ROP_put_local_xfer, ROP_put_arg_xfer,
     ROP_put_local_probe,
 
-    /* ROP_get_local_field with the slot in the opcode, for the slots that
-       dominate: the frame read names no operand at all. */
+    /* ROP_get_local_field with the slot in the opcode. */
     ROP_get_local_field_0, ROP_get_local_field_1,
     ROP_get_local_field_2, ROP_get_local_field_3,
 
-    /* Frame reads and writes with the slot in the opcode (0-3 cover 55% of
-       frame accesses): the slot operand is not in the stream at all. */
+    /* Frame reads and writes with the slot in the opcode. */
     ROP_get_local_s0, ROP_get_local_s1, ROP_get_local_s2, ROP_get_local_s3,
     ROP_put_local_s0, ROP_put_local_s1, ROP_put_local_s2, ROP_put_local_s3,
     ROP_put_local_xfer_s0, ROP_put_local_xfer_s1, ROP_put_local_xfer_s2, ROP_put_local_xfer_s3,
 
-    /*
-     * A local read-modify-write in one instruction: `slot = slot <subop> imm`,
-     * with the same sub-operation space and the same semantics as ROP_binary_imm
-     * but the destination is a frame slot, so no register is needed for the
-     * intermediate. The stack VM has this as one opcode (`inc_loc`, `add_loc`);
-     * lowering it as load / op / store costs three dispatches (four when the
-     * constant is a separate push), which is most of a loop's instruction count.
-     *
-     * Appended at the end so no existing opcode is renumbered.
-     */
+    /* A local read-modify-write in one instruction: `slot = slot <subop> imm`,
+       with ROP_binary_imm's sub-operations, writing the frame slot directly. */
     ROP_local_rmw_imm,
 
-    /*
-     * A comparison (or any binary) that only a branch consumes, fused with that
-     * branch: the boolean never needs a register and the dispatch that carried
-     * it goes away. One form per operand pair, as ROP_binary_* has. Bit
-     * REG_CMP_INVERT in the sub-op is the branch sense (`if_false` is the
-     * comparison inverted), which costs no operand of its own.
-     */
+    /* A binary that only a branch consumes, fused with it. One form per operand
+       pair. REG_CMP_INVERT in the sub-op is the branch sense. */
     ROP_branch_cmp_loc_loc, ROP_branch_cmp_loc_reg,
     ROP_branch_cmp_reg_loc, ROP_branch_cmp_reg_reg,
 
-    /* The loop's trailing read-modify-write and the unconditional branch that
-       follows it: a counted loop's back edge and its update in one instruction. */
+    /* A loop's trailing read-modify-write and its unconditional back edge. */
     ROP_local_rmw_branch,
 
-    /*
-     * A store whose value operand is dead: the reference moves into the
-     * container instead of being duplicated and retained, exactly as
-     * ROP_put_local_xfer moves it into a binding. Appended at the end so no
-     * existing opcode is renumbered.
-     */
+    /* A store whose value operand is dead: the reference moves into the
+       container, as ROP_put_local_xfer moves it into a binding. */
     ROP_put_element_xfer, ROP_put_field_xfer,
 
-    /*
-     * ROP_binary with its right operand named as a constant-pool entry or an
-     * atom rather than a register. The constant is borrowed -- a pool value is
-     * owned by the function bytecode and an atom value is materialised for the
-     * operation -- so no register holds it and no reference is duplicated, which
-     * is the case a string literal in an arithmetic loop is. Appended at the end
-     * so no existing opcode is renumbered.
-     */
+    /* ROP_binary with its right operand a borrowed constant-pool entry or atom
+       rather than a register. */
     ROP_binary_cpool,
 
-    /*
-     * The narrow encoding of three hot instructions: the same operations, with
-     * one-byte register operands and a one-byte relative branch target, and for
-     * the immediate form a one-byte immediate. A register program is a mix of
-     * the two encodings -- the encoder picks per instruction and falls back to
-     * the wide form when an operand does not fit -- so width is a property of
-     * the opcode, never of the function.
-     *
-     * These are appended, so every existing opcode keeps its number, its format
-     * and its width: a program serialized before them still parses, and no
-     * format version changes. Operands are the wide forms' operands, one byte
-     * each.
-     */
+    /* The narrow encoding of three hot instructions: one-byte register
+       operands, one-byte relative branch target, and a one-byte immediate. The
+       encoder picks per instruction, so width is a property of the opcode. */
     ROP_branch_cmp_reg_reg_s, ROP_binary_imm_s, ROP_branch_s,
 
-    /*
-     * The same two operations with the operation kind moved from an operand
-     * into the opcode. `ROP_branch_cmp_reg_reg_s` and `ROP_binary_imm_s` carry a
-     * `sub` operand their handler switches on at run time -- a second dispatch,
-     * on top of the one that selected the instruction. One opcode per kind
-     * makes that switch a constant the compiler folds into the handler.
-     *
-     * Each ordered comparison needs a `n` opcode for its inverted sense, because
-     * the sense cannot be folded into the comparison: IEEE comparisons are not
-     * complement-closed, and `!(a > b)` is *true* for NaN while `a <= b` is
-     * false. The inverted opcodes carry REG_CMP_INVERT in their constant sub-op,
-     * so the handler inverts the comparison's result exactly as the
-     * operand-carrying form does. Equality is complement-closed (`!(a == b)` is
-     * `a != b` for every value), so eq and neq serve both senses. Operands are
-     * two registers and a relative target, one byte each.
-     */
+    /* `ROP_branch_cmp_reg_reg_s` and `ROP_binary_imm_s` with the kind in the
+       opcode, so the handler's switch folds. Ordered comparisons need an `n`
+       opcode for the inverted sense (`!(a > b)` is true for NaN while `a <= b`
+       is false), which carries REG_CMP_INVERT in its constant sub-op; eq and
+       neq serve both senses. Operands: two registers and a relative target, one
+       byte each. */
     ROP_branch_lt_s, ROP_branch_nlt_s, ROP_branch_lte_s, ROP_branch_nlte_s,
     ROP_branch_gt_s, ROP_branch_ngt_s, ROP_branch_gte_s, ROP_branch_ngte_s,
     ROP_branch_eq_s, ROP_branch_neq_s,
@@ -623,148 +533,63 @@ typedef enum JSRegOpcode {
     /* The immediate arithmetic that loops use, with no kind operand. */
     ROP_add_imm_s, ROP_sub_imm_s,
 
-    /*
-     * The same, updating the source register in place -- the encoder emits
-     * these only when the destination and the source are the same register, so
-     * the operands are one register and the immediate.
-     *
-     * That equality is what lets the ownership check go: SET_REG has to test
-     * whether the value it overwrites is refcounted and release it if so, but
-     * here the overwritten value *is* the one the handler just loaded and
-     * tag-tested as a JS_TAG_INT, and an integer has no reference to release.
-     * The general path below still uses SET_REG, because a non-integer operand
-     * is an owned value. Worth a register operand and a byte as well as the
-     * test: the operands are read as one register and the immediate.
-     */
+    /* The same, updating the source register in place (dst == src). The
+       overwritten value is the one just tag-tested as a JS_TAG_INT, so no
+       ownership check is needed. Operands: one register and the immediate. */
     ROP_add_imm_self_s, ROP_sub_imm_self_s,
 
-    /*
-     * The in-place add with the block's trailing unconditional branch fused into
-     * it: the loop counter's update and its back edge in one instruction, which
-     * is one fewer dispatch per iteration and one fewer link in the chain from
-     * an instruction's operands to the next instruction's address.
-     *
-     * The encoder only fuses when the add and the branch are adjacent in the
-     * IR. That is the whole soundness condition: a phi copy for the edge is
-     * emitted between them, so if one were needed the two would not be adjacent
-     * and the fusion would not fire. Fusing across a copy would move the update
-     * to after the copy and the phi would read the pre-update value -- the
-     * reason an earlier attempt at this was reverted.
-     */
+    /* The in-place add fused with the block's trailing unconditional branch,
+       emitted only when the two are adjacent in the IR (see
+       regvm_fuse_self_branch). */
     ROP_add_imm_self_branch, ROP_add_imm_self_branch_s,
 
-    /*
-     * One opcode per arithmetic operation, for the register-register form of
-     * ROP_binary. The generic form carries its kind as an operand, so every
-     * execution pays a *second* indirect branch -- a jump table on that operand
-     * -- on top of the dispatch that selected the instruction, and the fast
-     * paths it reaches cannot fold, because they switch on a value the compiler
-     * does not know.
-     *
-     * Measured on box2d, per execution of the double multiply path: 60 native
-     * instructions, of which the kind's jump table is 8 and the dispatch that
-     * follows is 13. With the kind in the opcode the jump table is gone and the
-     * remaining switches fold to the cases that can run.
-     *
-     * The set is sized by measurement, not symmetry: on box2d MUL, ADD and SUB
-     * are 96.2% of all binary executions and NEG and INC are 93.0% of all
-     * unary executions, while MOD, the shifts, XOR and POW never execute at
-     * all (see .local/redesign/P1-ISA-AND-FAST-PATHS.md, section 1). The cold
-     * kinds are appended anyway: they are the same shape, and leaving them out
-     * would mean a second switch on the kind to decide which form to emit.
-     *
-     *
-     * Appended at the end, so no existing opcode is renumbered, no operand
-     * changes width or meaning, and REGVM_FORMAT_VERSION does not change: a
-     * register program written before these opcodes still parses, and the
-     * built-in blobs still contain the generic forms, which remain implemented.
-     * Operands are the generic form's without the kind: destination, left,
-     * right.
-     */
+    /* One opcode per operation for the register-register form of ROP_binary, so
+       the kind is not a second indirect branch and the fast paths fold.
+       Operands: destination, left, right. */
     ROP_mul, ROP_add, ROP_sub, ROP_div, ROP_mod, ROP_pow,
     ROP_bitand, ROP_bitor, ROP_bitxor, ROP_shl, ROP_sar, ROP_shr,
     ROP_lt, ROP_lte, ROP_gt, ROP_gte, ROP_eq, ROP_neq,
     ROP_strict_eq, ROP_strict_neq, ROP_instanceof, ROP_in,
     ROP_neg, ROP_inc, ROP_dec, ROP_not, ROP_to_numeric,
 
-    /*
-     * D6 compact register forms: the same operations with every register
-     * operand one byte wide. The D5 forms above remain available when a
-     * physical register does not fit. Appended so no earlier opcode moves.
-     */
+    /* Compact register forms: the same operations with every register operand
+       one byte wide, used when every physical register fits. */
     ROP_load_i8_s, ROP_move_s,
 
-    /*
-     * X3 quickened own-read forms. These are never emitted by the encoder:
-     * the threaded interpreter rewrites a site's opcode byte to one of these
-     * once its property cache is filled as an own data slot, and back to the
-     * generic form when the site is refilled as a prototype or goes dead.
-     * Appended at the very end so every existing opcode keeps its number and
-     * the serialized bytecode format is unchanged.
-     */
+    /* Quickened own-read forms, never emitted by the encoder: the threaded
+       interpreter rewrites a site's opcode to one of these when its cache holds
+       an own data slot, and back when it does not. */
     ROP_get_field_own, ROP_get_field2_own,
 
-    /*
-     * X3b fused chain read. A `get_field`/`get_field2` whose receiver is the
-     * immediately preceding `get_field`'s destination is emitted as this one
-     * instruction: both reads and both destinations, one dispatch. Like the
-     * own forms above it is appended at the very end, so no existing opcode
-     * number moves and the serialized bytecode format is unchanged. The `_own`
-     * spelling is produced only by the threaded interpreter's quickening
-     * rewrite; both are aliased to the generic monolith label.
-     */
+    /* Fused chain read: both reads and both destinations, one dispatch. The
+       `_own` spelling is produced only by the threaded interpreter's
+       quickening; both alias the generic monolith label. */
     ROP_get_field_chain, ROP_get_field_chain_own,
 
-    /*
-     * X6 fused three-operand arithmetic. A `mul` immediately followed by an
-     * `add`/`sub` that consumes the product as its left operand becomes one
-     * instruction with five register operands -- the product's own destination
-     * first, then the add's destination and its right operand. Only the left
-     * operand is fused, because `c + p` and `c - p` are not the same operations
-     * and the operand order of a JavaScript `+` is observable. Appended at the
-     * end like the other fusions, so no existing opcode number moves.
-     */
+    /* Fused arithmetic: a `mul` followed by an `add`/`sub` consuming the
+       product as its left operand. Operands: the product's destination, x, y,
+       the add's destination, its other operand. */
     ROP_mul_add, ROP_mul_sub,
-    /* X6: the mirror image, the product as the right operand. */
+    /* the product as the right operand */
     ROP_add_mul, ROP_sub_mul,
 
-    /*
-     * The debugger trap: the stack VM's `OP_esc1` debug sub-operations in
-     * register form, one instruction per trapped statement. The operand is the
-     * `JS_DEBUG_TRACE_*` flags byte; the handler captures the ip before calling
-     * the embedder's hook, so a backtrace taken inside the hook names the
-     * statement. It is a cold opcode and never emitted into a light-safe
-     * function (a frame the debugger stops in keeps its record). Appended at
-     * the very end so no existing opcode is renumbered.
-     */
+    /* The debugger trap: the stack VM's `OP_esc1` debug sub-operations, one
+       instruction per trapped statement, operand the `JS_DEBUG_TRACE_*` flags.
+       The handler captures the ip before calling the hook. Never emitted into a
+       light-safe function. */
     ROP_debug,
 
-    /*
-     * The counted loop's increment and its latch test in one instruction: the
-     * rotated loop ends in `inc r ; branch_lt r, bound, L_body`, two
-     * dispatches, and this is the pair fused. `r` is incremented in place
-     * (the encoder checks that the inc's destination and source are the same
-     * physical register and that the branch reads it), then `r < bound`
-     * selects the back edge; the taken arm carries the same back-edge
-     * interrupt poll every other backward branch does. Anything the int fast
-     * path cannot do -- a float or BigInt counter, `INT32_MAX`, a
-     * non-numeric bound -- tail-calls a slow half that performs the two
-     * operations in order. Appended at the very end so no existing opcode is
-     * renumbered.
-     */
+    /* The counted loop's increment and latch test in one instruction: `r` is
+       incremented in place, then `r < bound` selects the back edge, with the
+       back-edge interrupt poll. Anything the int fast path cannot do goes to a
+       slow half that runs the two operations in order. */
     ROP_inc_branch_lt, ROP_inc_branch_lt_s,
 
-    /*
-     * The baseline (frame-slot) tier's full-width stack access. Its operand
-     * stack can be deeper than the 16-bit register operand can name (4,096),
-     * so a value above that range is spilt to a slot at the top of the frame's
-     * register file and reached by an unscaled 16-bit slot index. slot_get
-     * reads that slot (u) into a low register (r); slot_put writes the register
-     * (r) back to the slot (u). Both borrow/copy exactly as ROP_move does, so
-     * the reference-count model is unchanged. They index `regs`, not `var_buf`,
-     * so no frame-layout change is needed. Appended at the very end so no
-     * existing opcode is renumbered.
-     */
+    /* The baseline tier's full-width stack access. Its operand stack can be
+       deeper than a 16-bit register operand can name, so deep values are spilt
+       to slots at the top of the register file. slot_get reads slot (u) into
+       register (r); slot_put writes (r) back to (u). Both behave as ROP_move.
+       */
     ROP_slot_get, ROP_slot_put,
 
     ROP_COUNT
@@ -773,18 +598,13 @@ typedef enum JSRegOpcode {
 /*
  * --- register instruction encoding --------------------------------------
  *
- * A register instruction is a one-byte opcode followed by its operands, in the
- * order the opcode's format names them. A register operand is one byte, or two
- * when the function's register count exceeds 255 and its header selects the
- * wide form; the width belongs to the function, so no handler branches on it
- * per operand. Every other operand is little-endian and fixed width. A branch
- * target is a signed byte offset from the end of the branch instruction to an
- * instruction boundary, and the reader rejects an offset that lands inside an
- * instruction.
+ * A one-byte opcode followed by its operands, in the order the opcode's format
+ * names them, little-endian and fixed width. A branch target is a signed byte
+ * offset from the end of the branch instruction to an instruction boundary.
  *
  * A format names one character per operand:
  *
- *   r  a physical register (u8, or u16 in the wide form)
+ *   r  a physical register (u16; u8 in the narrow forms)
  *   i  signed 8-bit immediate
  *   I  signed 32-bit immediate
  *   u  unsigned 16-bit slot index
@@ -792,11 +612,9 @@ typedef enum JSRegOpcode {
  *   c  unsigned 32-bit constant-pool index
  *   a  unsigned 32-bit atom index
  *   s  unsigned 16-bit inline-cache site index
- *   t  signed 32-bit branch target
+ *   t  signed 32-bit branch target (8-bit in the narrow forms)
  *
- * The per-opcode format table lives with the encoder in quickjs.c; a register
- * opcode with no format fails the encoder's completeness check, the same way
- * an unclassified stack opcode fails the lowering inventory.
+ * The per-opcode format table lives with the encoder in quickjs.c.
  */
 typedef enum JSRegOperandKind {
     REG_OPK_END = 0,
@@ -814,15 +632,9 @@ typedef enum JSRegOperandKind {
 /* ROP_load_const's kind field: where the named index points. */
 enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 
-/*
- * The register bytecode's own format version. A register program is decoded
- * with the format table, so a blob written by a build with a different
- * instruction set would decode into *something* -- possibly valid-looking and
- * wrong. The version is written once per function record and checked before a
- * single instruction is parsed, so a stale blob fails cleanly the way a
- * cross-VM one does. Bump it whenever an opcode is added, removed or
- * renumbered, or an operand's width or meaning changes.
- */
+/* The register bytecode's format version, checked per function record before
+   any instruction is parsed. Bump it whenever an opcode is added, removed or
+   renumbered, or an operand's width or meaning changes. */
 #define REGVM_FORMAT_VERSION 19
 
 /* ROP_get_field and ROP_put_field use this site index when the source
@@ -843,20 +655,16 @@ typedef enum JSRegUnaryOp {
 /* Bit set in a ROP_branch_cmp_* sub-op when the branch is taken on the negated
    result, which is how `if_false` differs from `if_true`. */
 #define REG_CMP_INVERT 0x40
-    /*
-     * ToNumeric, which is what the postfix forms publish as the value the
-     * expression evaluates to: `var y = "1"` then `x++` leaves y as the number
-     * 1, not the string. Not the same as unary plus, which rejects a BigInt.
-     */
+    /* ToNumeric, the value a postfix form evaluates to (`x++` on "1" gives 1).
+       Unlike unary plus it accepts a BigInt. */
     REG_UN_TO_NUMERIC,
     /* the number of sub-operations; see REG_BIN_COUNT */
     REG_UN_COUNT,
 } JSRegUnaryOp;
 
-/* Sub-operation field of ROP_binary, ROP_binary_imm and ROP_compare. The order
-   matches the engine's opcode order for the same operations (OP_mul .. OP_pow,
-   OP_shl .. OP_or, OP_lt .. OP_gte), so the interpreter can map a sub-operation
-   to the engine opcode the slow paths take by an offset. */
+/* Sub-operation field of ROP_binary, ROP_binary_imm and ROP_compare, in the
+   engine's opcode order (OP_mul .. OP_pow, OP_shl .. OP_or, OP_lt .. OP_gte)
+   so a sub-operation maps to its engine opcode by an offset. */
 typedef enum JSRegBinaryOp {
     REG_BIN_MUL = 0, REG_BIN_DIV, REG_BIN_MOD, REG_BIN_ADD, REG_BIN_SUB,
     REG_BIN_SHL, REG_BIN_SAR, REG_BIN_SHR, REG_BIN_AND, REG_BIN_XOR,
@@ -865,37 +673,23 @@ typedef enum JSRegBinaryOp {
     REG_BIN_INSTANCEOF, REG_BIN_IN,
     REG_BIN_EQ, REG_BIN_NEQ, REG_BIN_STRICT_EQ, REG_BIN_STRICT_NEQ,
     REG_BIN_PRIVATE_IN,
-    /*
-     * The number of sub-operations, for the arrays that are indexed by one.
-     * Appended after every real member, so no sub-operation changes value and
-     * nothing serialized is affected: a `sub` operand is a byte in the stream
-     * and these are compile-time only.
-     */
+    /* The number of sub-operations, for arrays indexed by one. Compile-time
+       only. */
     REG_BIN_COUNT,
 } JSRegBinaryOp;
 
-/*
- * Pseudo sub-operations of ROP_branch_cmp_*. A fused strict compare against a
- * compile-time-undefined operand carries no pair of values to compare: the
- * operand that was loaded with undefined is gone, and the remaining operand's
- * tag is the whole test. These name that test directly. Both sit below
- * REG_CMP_INVERT (0x40) and above every real REG_BIN_* member, so no real
- * sub-operation changes value and the sub byte stays a single comparison.
- * They are produced only by the branch fusion (regvm_fuse_branches), never by
- * the bytecode lowering.
- */
+/* Pseudo sub-operations of ROP_branch_cmp_*: a fused strict compare against a
+   just-loaded undefined, where the remaining operand's tag is the whole test.
+   They sit between the real REG_BIN_* members and REG_CMP_INVERT (0x40), and
+   only regvm_fuse_branches produces them. */
 #define REG_BIN_IS_UNDEF     0x3e
 #define REG_BIN_IS_NOT_UNDEF 0x3f
 
 /*
  * --- the register frame -------------------------------------------------
  *
- * What the register backend allocates per activation. The frame is
- * [arguments][locals][registers]: the first two are the addressable slots a
- * closure or eval can reach, the third is the allocator's physical registers,
- * which are not addressable and only ever hold live owned values. A temporary
- * register that was never defined is never initialized, marked or released, so
- * the frame costs its register count and not a zero-fill of the whole window.
+ * [arguments][locals][registers]: the first two are the slots a closure or
+ * eval can reach; the registers are the allocator's and only hold live values.
  */
 typedef struct JSRegFrameInfo {
     uint16_t arg_count;
@@ -916,13 +710,9 @@ typedef struct JSRegExceptionEntry {
     uint8_t kind;
 } JSRegExceptionEntry;
 
-/*
- * One entry of the register frame's control stack. It replaces the stack VM's
- * catch-offset sentinel: a catch handler to run on an exception, a finally
- * continuation for gosub/ret, or an open for-of whose iterator is closed when
- * an exception leaves the frame. They share one stack so their order is the
- * push order, which is what decides which one an exception meets first.
- */
+/* One entry of the register frame's control stack: a catch handler, a finally
+   continuation for gosub/ret, or an open for-of to close when an exception
+   leaves the frame. One stack, so an exception meets them in push order. */
 typedef struct JSRegCtl {
     uint32_t pc;    /* handler pc, or the continuation to return to */
     int32_t reg;    /* exception destination register, for a catch */

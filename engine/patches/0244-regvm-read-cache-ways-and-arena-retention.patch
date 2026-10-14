@@ -1,0 +1,477 @@
+Subject: Four-way named-read cache with a two-prototype entry, Array and rope-string receivers, and retained empty allocator arenas
+
+What this does
+  Four-way named-read cache with a two-prototype entry, Array and rope-string receivers, and retained empty allocator arenas.
+
+Why we need it
+  And what the allocator was doing. A read site held two shapes; 35,879 of them stub-cache hits. A site now has `REGVM_PIC_WAYS` = 4 ways, probed by `regvm_poly_read_hit` before the slow function, and a way that keeps hitting is promoted to the primary way, middle and holder shapes, all hashed and so immutable, and Array.prototype as a holder, were refused by the fill because Arrays are exotic, so every `arr.push` / `arr.join` read was a full lookup.
+
+What it adds
+  `REGVM_PIC_WAYS`, `REG_PIC_PROTO2`, `regvm_poly_read_hit`, `regvm_mega_read`, `regvm_get_field_ic_slow`, `JS_ARENA_EMPTY_MAX`, `JSArenaState.n_empty`, `js_arena_trim`; the PIC table is 4 entries per site and its holder array 8; test `tests/differential/corpus/read-cache-ways-and-receivers.js`.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs.c b/quickjs.c
+index f7f6cf7..91b7376 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -418,6 +418,9 @@ typedef struct JSMallocState {
+ #define JS_ARENA_BLOCK_SIZE_COUNT  31
+ #define JS_ARENA_MAX_SMALL_SIZE    512
+ #define JS_ARENA_FREE_NIL          0xffff
++/* Upper bound on empty arenas kept for reuse, runtime-wide, so small
++   allocations can reuse a block instead of asking the system allocator. */
++#define JS_ARENA_EMPTY_MAX         256
+ 
+ #if defined(__SANITIZE_ADDRESS__) || defined(FORCE_GC_AT_MALLOC)
+ /* Route every allocation through the backing malloc so each block is seen
+@@ -505,6 +508,9 @@ typedef struct JSArena {
+ typedef struct JSArenaState {
+     struct list_head arena_list[JS_ARENA_BLOCK_SIZE_COUNT];
+     struct list_head free_arena_list[JS_ARENA_BLOCK_SIZE_COUNT];
++    /* Empty arenas kept rather than returned to the system allocator, each on
++       its class's free_arena_list; see js_arena_free. */
++    uint32_t n_empty;
+     _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
+ } JSArenaState;
+ 
+@@ -2778,6 +2784,7 @@ static void js_arena_init(JSRuntime *rt)
+     JSArenaState *s = &rt->arena_state;
+     int i;
+     arena_zero_block(rt)->u.block_idx = JS_ARENA_FREE_NIL;
++    s->n_empty = 0;
+     for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
+         init_list_head(&s->arena_list[i]);
+         init_list_head(&s->free_arena_list[i]);
+@@ -2816,6 +2823,7 @@ static no_inline JSArena *arena_new(JSRuntime *rt, int block_size_idx)
+     b->block_size_idx = block_size_idx;
+     list_add(&ar->link, &rt->arena_state.arena_list[block_size_idx]);
+     list_add(&ar->free_link, &rt->arena_state.free_arena_list[block_size_idx]);
++    rt->arena_state.n_empty++;      /* empty until the caller takes a block */
+     return ar;
+ }
+ 
+@@ -2879,6 +2887,8 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
+         b->u.block_idx = block_idx;
+         b->gc_notrace = 0;
+     b->in_zct = 0;
++        if (unlikely(ar->n_used_blocks == 0))
++            rt->arena_state.n_empty--;
+         ar->n_used_blocks++;
+         if (unlikely(ar->n_used_blocks == ar->n_blocks))
+             list_del(&ar->free_link);
+@@ -2916,13 +2926,43 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
+                      &rt->arena_state.free_arena_list[block_size_idx]);
+         ar->n_used_blocks--;
+         if (unlikely(ar->n_used_blocks == 0)) {
+-            list_del(&ar->link);
+-            list_del(&ar->free_link);
+-            rt->mf.js_free(rt->malloc_state.opaque, ar);
++            /* Keep a bounded number of empty arenas: a batch of deferred frees
++               empties whole arenas and the allocations that follow need them
++               back. An empty arena stays on its class's free list;
++               js_arena_trim releases them after a full collection. */
++            if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
++                rt->arena_state.n_empty++;
++            } else {
++                list_del(&ar->link);
++                list_del(&ar->free_link);
++                rt->mf.js_free(rt->malloc_state.opaque, ar);
++            }
+         }
+     }
+ }
+ 
++/* Return every kept empty arena to the system allocator. */
++static void js_arena_trim(JSRuntime *rt)
++{
++    JSArenaState *s = &rt->arena_state;
++    struct list_head *el, *el1;
++    int i;
++
++    if (s->n_empty == 0)
++        return;
++    for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
++        list_for_each_safe(el, el1, &s->free_arena_list[i]) {
++            JSArena *ar = list_entry(el, JSArena, free_link);
++            if (ar->n_used_blocks == 0) {
++                list_del(&ar->link);
++                list_del(&ar->free_link);
++                rt->mf.js_free(rt->malloc_state.opaque, ar);
++            }
++        }
++    }
++    s->n_empty = 0;
++}
++
+ static size_t js_arena_usable_size(JSRuntime *rt, const void *ptr)
+ {
+     const JSMallocBlockHeader *b;
+@@ -7950,6 +7990,8 @@ struct JSRegPIC {
+    PROTO entry lives in regvm_pic_holder. */
+ _Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
+ 
++#define REGVM_PIC_WAYS 4
++#define REG_PIC_PROTO2 5  /* holder two prototypes up; ways >= 1 only */
+ #define REG_PIC_EMPTY 0
+ #define REG_PIC_OWN   1
+ #define REG_PIC_PROTO 2
+@@ -7978,8 +8020,11 @@ static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
+     uint32_t i;
+     if (!b->regvm_pic)
+         return;
+-    for (i = 0; i < 2u * b->regvm_pic_count; i++)
++    for (i = 0; i < (uint32_t)REGVM_PIC_WAYS * b->regvm_pic_count; i++) {
++        JSShape **pm = &b->regvm_pic_holder[(uint32_t)REGVM_PIC_WAYS * b->regvm_pic_count + i];
+         regvm_pic_entry_reset(rt, &b->regvm_pic[i], &b->regvm_pic_holder[i]);
++        if (*pm) { js_free_shape(rt, *pm); *pm = NULL; }
++    }
+     js_free_rt(rt, b->regvm_pic);
+     b->regvm_pic = NULL;
+     b->regvm_light_fast = b->regvm_light && b->regvm_pic_count == 0;
+@@ -7998,16 +8043,16 @@ static JSRegPIC *regvm_pic_ensure(JSRuntime *rt, JSFunctionBytecode *b)
+         return t;
+     if (b->regvm_pic_count == 0)
+         return NULL;
+-    /* Each site owns two ways: the primary at `site` (unchanged addressing)
+-       and a secondary at `regvm_pic_count + site` used by the two-way read
+-       cache. Both arrays are sized for both ways; the secondary is filled
+-       lazily, so a monomorphic site pays only the extra bytes. */
+-    t = js_mallocz_rt(rt, sizeof(*t) * 2 * (size_t)b->regvm_pic_count);
++    /* Each site owns REGVM_PIC_WAYS ways: the primary at `site` and way k at
++       `k * regvm_pic_count + site`. Way 1 is also a store site's add-transition
++       entry. The holder array has two halves: a holder shape per entry, then a
++       middle shape per entry for REG_PIC_PROTO2. */
++    t = js_mallocz_rt(rt, sizeof(*t) * REGVM_PIC_WAYS * (size_t)b->regvm_pic_count);
+     if (t) {
+         /* The holder array is allocated in the same step, so a non-NULL
+            regvm_pic always has one. On failure the cache is abandoned and
+            retried on the next fill. */
+-        JSShape **h = js_mallocz_rt(rt, sizeof(*h) * 2 * (size_t)b->regvm_pic_count);
++        JSShape **h = js_mallocz_rt(rt, sizeof(*h) * 2 * REGVM_PIC_WAYS * (size_t)b->regvm_pic_count);
+         if (!h) {
+             js_free_rt(rt, t);
+             return NULL;
+@@ -10466,12 +10511,15 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
+                exactly those. */
+             if (b->regvm_pic) {
+                 uint32_t j;
+-                for (j = 0; j < 2u * b->regvm_pic_count; j++) {
++                uint32_t nw = (uint32_t)REGVM_PIC_WAYS * b->regvm_pic_count;
++                for (j = 0; j < nw; j++) {
+                     JSRegPIC *e = &b->regvm_pic[j];
+                     if (e->shape)
+                         mark_func(rt, &e->shape->header);
+                     if (b->regvm_pic_holder && b->regvm_pic_holder[j])
+                         mark_func(rt, &b->regvm_pic_holder[j]->header);
++                    if (b->regvm_pic_holder && b->regvm_pic_holder[nw + j])
++                        mark_func(rt, &b->regvm_pic_holder[nw + j]->header);
+                 }
+             }
+ #endif
+@@ -10708,6 +10756,7 @@ void JS_RunGC(JSRuntime *rt)
+ 
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++    js_arena_trim(rt);
+ #if QJS_DRC
+     js_drc_unpin(rt);
+     rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
+@@ -10796,11 +10845,11 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
+     }
+ #if QJS_REGVM
+     if (b->regvm_pic) {
+-        js_func_size += 2 * (size_t)b->regvm_pic_count * sizeof(JSRegPIC);
++        js_func_size += REGVM_PIC_WAYS * (size_t)b->regvm_pic_count * sizeof(JSRegPIC);
+         memory_used_count++;
+     }
+     if (b->regvm_pic_holder) {
+-        js_func_size += 2 * (size_t)b->regvm_pic_count * sizeof(JSShape *);
++        js_func_size += 2 * REGVM_PIC_WAYS * (size_t)b->regvm_pic_count * sizeof(JSShape *);
+         memory_used_count++;
+     }
+ #endif
+@@ -23782,7 +23831,8 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+     p = JS_VALUE_GET_OBJ(recv);
+     /* A plain object only: an exotic object answers through its own handler,
+        which find_own_property would not see. */
+-    if (p->is_exotic)
++    if (p->is_exotic &&
++        !(p->class_id == JS_CLASS_ARRAY && !__JS_AtomIsTaggedInt(atom)))
+         return;
+ 
+     holder = p;
+@@ -23794,7 +23844,9 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+     if (!prs) {
+         /* The direct prototype, the depth a method load reaches. */
+         holder = p->shape->proto;
+-        if (!holder || holder->is_exotic)
++        if (!holder || (holder->is_exotic &&
++                        !(holder->class_id == JS_CLASS_ARRAY &&
++                          !__JS_AtomIsTaggedInt(atom))))
+             return;
+         prs = find_own_property(&pr, holder, atom);
+         if (!prs) {
+@@ -23835,6 +23887,10 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+         regvm_shape_hashify(rt, rsh);
+         if (hsh)
+             regvm_shape_hashify(rt, hsh);
++    } else {
++        regvm_shape_hashify(rt, rsh);
++        regvm_shape_hashify(rt, mid);
++        regvm_shape_hashify(rt, holder->shape);
+     }
+ 
+     /* The site's state before the install below, which can newly kill it. A
+@@ -23867,15 +23923,29 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+             *ppic = pic;            /* re-point the running frame's base */
+         }
+         if (pic[site].kind != REG_PIC_EMPTY && pic[site].shape != rsh) {
+-            /* Two-way read cache: the primary way already caches a different
+-               shape for this site, so install this shape in the secondary way
+-               instead of giving up. The primary is left alive, so a site that
+-               alternates between two shapes keeps both hits inline and only a
+-               genuinely polymorphic site loses it. The secondary's own miss
+-               counter drives its death (and the global-cache fallback) below;
+-               it is swapped into the primary by the promotion in
+-               regvm_get_field_ic once it proves to be the hot shape. */
+-            int s2 = b->regvm_pic_count + site;
++            /* The primary caches another shape, so use another way: the one
++               holding this shape, else the first live empty one, else the last
++               (whose miss counter drives the site to the global stub cache).
++               regvm_get_field_ic promotes a way that keeps hitting. */
++            uint32_t cnt = b->regvm_pic_count, nw = (uint32_t)REGVM_PIC_WAYS * cnt;
++            int k, s2 = -1;
++            for (k = 1; k < REGVM_PIC_WAYS; k++) {
++                int sk = (int)(k * cnt) + site;
++                if (pic[sk].shape == rsh ||
++                    (pic[sk].kind == REG_PIC_EMPTY &&
++                     pic[sk].misses < REG_PIC_MISS_LIMIT)) {
++                    s2 = sk;
++                    break;
++                }
++            }
++            if (s2 < 0)
++                s2 = (int)((REGVM_PIC_WAYS - 1) * cnt) + site;
++            /* a two-prototype entry being replaced gives up its middle shape */
++            if (b->regvm_pic_holder[nw + s2]) {
++                js_free_shape(rt, b->regvm_pic_holder[nw + s2]);
++                b->regvm_pic_holder[nw + s2] = NULL;
++                regvm_pic_entry_reset(rt, &pic[s2], &b->regvm_pic_holder[s2]);
++            }
+             regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+                               kind, rsh, hsh, slot);
+             if (!need_mega &&
+@@ -23894,6 +23964,49 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+         }
+     }
+ 
++    /* A holder two prototypes up. The entry holds counted references to three
++       hashed (immutable) shapes: the receiver's, which fixes the middle object
++       and proves the receiver lacks the property; the middle object's (in the
++       second half of regvm_pic_holder), which fixes the holder and rules out
++       shadowing; and the holder's, which proves the slot. Ways 1 and up only:
++       the quickened handlers read the primary with no kind test. */
++    if (depth == 2 && rsh->is_hashed && mid->is_hashed &&
++        holder->shape->is_hashed) {
++        if (!pic) {
++            pic = regvm_pic_ensure(rt, b);
++            if (pic)
++                *ppic = pic;
++        }
++        if (pic) {
++            uint32_t cnt = b->regvm_pic_count, nw = (uint32_t)REGVM_PIC_WAYS * cnt;
++            int k, s2 = -1;
++            for (k = 1; k < REGVM_PIC_WAYS; k++) {
++                int sk = (int)(k * cnt) + site;
++                if (pic[sk].shape == rsh ||
++                    (pic[sk].kind == REG_PIC_EMPTY &&
++                     pic[sk].misses < REG_PIC_MISS_LIMIT)) {
++                    s2 = sk;
++                    break;
++                }
++            }
++            if (s2 < 0)
++                s2 = (int)((REGVM_PIC_WAYS - 1) * cnt) + site;
++            if (!(pic[s2].kind == REG_PIC_PROTO2 && pic[s2].shape == rsh &&
++                  b->regvm_pic_holder[s2] == holder->shape &&
++                  b->regvm_pic_holder[nw + s2] == mid)) {
++                if (b->regvm_pic_holder[nw + s2]) {
++                    js_free_shape(rt, b->regvm_pic_holder[nw + s2]);
++                    b->regvm_pic_holder[nw + s2] = NULL;
++                }
++                if (pic[s2].shape == rsh)
++                    regvm_pic_entry_reset(rt, &pic[s2], &b->regvm_pic_holder[s2]);
++                regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
++                                  REG_PIC_PROTO2, rsh, holder->shape, slot);
++                if (pic[s2].kind == REG_PIC_PROTO2)
++                    b->regvm_pic_holder[nw + s2] = js_dup_shape(mid);
++            }
++        }
++    }
+     if (need_mega)
+         js_megacache_fill(rt, rsh, atom, slot, depth,
+                           depth == 2 ? mid : NULL, holder->shape);
+@@ -23936,12 +24049,18 @@ regvm_string_proto_get(JSContext *ctx, JSValue recv, JSAtom atom, JSValue *out)
+     unsigned h = atom & (JS_STRPROTO_HINTS - 1);
+     uint32_t idx;
+ 
+-    if (JS_VALUE_GET_TAG(recv) != JS_TAG_STRING || atom == JS_ATOM_length ||
+-        __JS_AtomIsTaggedInt(atom))
++    int cid;
++
++    if (JS_VALUE_GET_TAG(recv) == JS_TAG_STRING ||
++        JS_VALUE_GET_TAG(recv) == JS_TAG_STRING_ROPE)
++        cid = JS_CLASS_STRING;
++    else
+         return 0;
+-    if (JS_VALUE_GET_TAG(ctx->class_proto[JS_CLASS_STRING]) != JS_TAG_OBJECT)
++    if (atom == JS_ATOM_length || __JS_AtomIsTaggedInt(atom))
+         return 0;
+-    p = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_STRING]);
++    if (JS_VALUE_GET_TAG(ctx->class_proto[cid]) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(ctx->class_proto[cid]);
+     idx = rt->strproto_hint[h].idx;
+     if (likely(rt->strproto_hint[h].atom == atom &&
+                idx < (uint32_t)p->shape->prop_count)) {
+@@ -23958,7 +24077,106 @@ regvm_string_proto_get(JSContext *ctx, JSValue recv, JSAtom atom, JSValue *out)
+ 
+ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+     JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out);
+-static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
++static JSValue regvm_get_field_ic_slow(JSContext *ctx, JSFunctionBytecode *b,
++                                  JSRegPIC **ppic, JSValue recv, JSAtom atom,
++                                  int site);
++/* The polymorphic ways of a read site (1..REGVM_PIC_WAYS-1). Borrowed
++   value. */
++static inline __attribute__((always_inline)) int regvm_poly_read_hit(
++    JSRegPIC *pic, JSFunctionBytecode *b, JSValue recv, int site, JSValue *out,
++    JSRegPIC **phit)
++{
++    JSObject *p, *h;
++    JSShape *sh, **holders;
++    JSRegPIC *e;
++    uint32_t cnt;
++    JSValue v;
++
++    if (unlikely(JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT))
++        return 0;
++    p = JS_VALUE_GET_OBJ(recv);
++    sh = p->shape;
++    cnt = b->regvm_pic_count;
++    e = &pic[cnt + (uint32_t)site];
++    if (e->shape != sh) {
++        e += cnt;
++        if (e->shape != sh) {
++            e += cnt;
++            if (e->shape != sh)
++                return 0;
++        }
++    }
++    holders = b->regvm_pic_holder;
++    if (e->kind == REG_PIC_OWN) {
++        v = *(JSValue *)((char *)p->prop + e->slot_off);
++    } else if (e->kind == REG_PIC_PROTO) {
++        h = sh->proto;
++        if (unlikely(!h || h->shape != holders[e - pic]))
++            return 0;
++        v = *(JSValue *)((char *)h->prop + e->slot_off);
++    } else if (e->kind == REG_PIC_PROTO2) {
++        h = sh->proto;
++        if (unlikely(!h || h->shape != holders[(uint32_t)REGVM_PIC_WAYS * cnt + (e - pic)]))
++            return 0;
++        h = h->shape->proto;
++        if (unlikely(!h || h->shape != holders[e - pic]))
++            return 0;
++        v = *(JSValue *)((char *)h->prop + e->slot_off);
++    } else {
++        return 0;
++    }
++    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
++        return 0;
++    *out = v;
++    *phit = e;
++    return 1;
++}
++/* A megamorphic read: the runtime's stub cache, before the full slow path. */
++static __attribute__((noinline)) int regvm_mega_read(JSRuntime *rt, JSObject *p,
++                                                    JSAtom atom, JSValue *out)
++{
++    JSObject *holder;
++    uint32_t offset;
++
++    if (p->is_exotic &&
++        !(p->class_id == JS_CLASS_ARRAY && !__JS_AtomIsTaggedInt(atom)))
++        return 0;
++    if (js_megacache_probe(rt, p, atom, &holder, &offset) &&
++        !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
++        !js_lazy_marker_is(holder->prop[offset].u.value)) {
++        *out = holder->prop[offset].u.value;
++        return 1;
++    }
++    return 0;
++}
++static inline __attribute__((always_inline)) JSValue regvm_get_field_ic(
++    JSContext *ctx, JSFunctionBytecode *b, JSRegPIC **ppic, JSValue recv,
++    JSAtom atom, int site)
++{
++    JSValue v;
++    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT && *ppic &&
++        site != (int)REG_IC_NONE) {
++        JSRegPIC *p2;
++        if (regvm_poly_read_hit(*ppic, b, recv, site, &v, &p2)) {
++            JSRegPIC *p1 = &(*ppic)[site];
++            /* A way that keeps hitting is the dominant shape: swap it into the
++               primary, which the quickened handlers test inline. A
++               two-prototype entry never moves there. */
++            if (unlikely(++p1->misses >= 16) && p2->kind != REG_PIC_PROTO2) {
++                int s2 = (int)(p2 - *ppic);
++                JSRegPIC t = *p1; JSShape *th = b->regvm_pic_holder[site];
++                *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
++                *p2 = t; b->regvm_pic_holder[s2] = th;
++                p2->misses = p1->misses; p1->misses = 0;
++            }
++            return js_dup(v);
++        }
++        if (regvm_mega_read(ctx->rt, JS_VALUE_GET_OBJ(recv), atom, &v))
++            return js_dup(v);
++    }
++    return regvm_get_field_ic_slow(ctx, b, ppic, recv, atom, site);
++}
++static __attribute__((noinline)) JSValue regvm_get_field_ic_slow(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC **ppic, JSValue recv, JSAtom atom,
+                                   int site)
+ {
+@@ -23977,6 +24195,11 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+             return js_int32(JS_VALUE_GET_STRING(recv)->len);
+         if (regvm_string_proto_get(ctx, recv, atom, &val))
+             return val;
++    } else if (JS_VALUE_GET_TAG(recv) == JS_TAG_STRING_ROPE) {
++        if (atom == JS_ATOM_length)
++            return js_int32(JS_VALUE_GET_STRING_ROPE(recv)->len);
++        if (regvm_string_proto_get(ctx, recv, atom, &val))
++            return val;
+     } else if (atom == JS_ATOM_length && JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(recv)->class_id == JS_CLASS_ARRAY &&
+                JS_VALUE_GET_TAG(JS_VALUE_GET_OBJ(recv)->prop[0].u.value) == JS_TAG_INT) {
+@@ -23987,7 +24210,7 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+         JSValue v2;
+         if (regvm_own_read_hit(*ppic, b->regvm_pic_holder, recv, s2, &v2)) {
+             JSRegPIC *p1 = &(*ppic)[site], *p2 = &(*ppic)[s2];
+-            if (unlikely(++p1->misses >= 16)) {
++            if (unlikely(++p1->misses >= 16) && p2->kind != REG_PIC_PROTO2) {
+                 JSRegPIC t = *p1; JSShape *th = b->regvm_pic_holder[site];
+                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
+                 *p2 = t; b->regvm_pic_holder[s2] = th;
+@@ -24009,7 +24232,9 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+            kind, so another object of the same shape can pair the entry with an
+            unmaterialized slot. Trust the slot only when it is a non-TMASK data
+            property. */
+-        if (!recv_obj->is_exotic &&
++        if ((!recv_obj->is_exotic ||
++             (recv_obj->class_id == JS_CLASS_ARRAY &&
++              !__JS_AtomIsTaggedInt(atom))) &&
+             js_megacache_probe(ctx->rt, recv_obj, atom, &holder, &offset) &&
+             !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
+             !js_lazy_marker_is(holder->prop[offset].u.value))

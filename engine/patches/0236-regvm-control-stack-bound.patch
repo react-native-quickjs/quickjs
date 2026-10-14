@@ -1,8 +1,21 @@
+Subject: Size the frame's control stack from the emitted IR, not the stack bytecode
+
+What this does
+  Size the frame's control stack from the emitted IR, not the stack bytecode.
+
+Why we need it
+  The frame allocates `sizeof(JSRegCtl) * regvm_ctl_count`, where the liveness cap refused those functions first; the baseline tier exposed it.
+
+What it adds
+  The count is derived from the emitted IR, where the lowering has already turned the sentinel drop into `ROP_sentinel_drop`, so a push and its matching pop balance. `regvm_ctl_delta_rop` gives the per-register-instruction effect -- the four pushes `ROP_catch_enter`/`ROP_finally_enter`/`ROP_iter_start`/`ROP_for_await_of_start` and the four pops `ROP_finally_leave`/`ROP_nip_catch`/`ROP_iter_close`/`ROP_sentinel_drop` -- and `regvm_ctl_bound` sums it per source pc and runs the same block dataflow as before, with one correction: a `catch` block's handler edge enters with the unwinder having already popped the entry the `catch` pushed, so the handler starts one below the fall-through.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index 84e88ff..f75ec00 100644
+index 02760b5..e8bd27a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -59830,24 +59830,6 @@ static int regvm_with_edge_delta(int op, int k)
+@@ -57954,24 +57954,6 @@ static int regvm_with_edge_delta(int op, int k)
      }
  }
  
@@ -27,27 +40,15 @@ index 84e88ff..f75ec00 100644
  /* Set bit `v` in a liveness bitset. */
  static void regvm_bitset_set(uint64_t *bits, int v)
  {
-@@ -60109,6 +60091,137 @@ typedef struct JSRegIR {
+@@ -58195,6 +58177,112 @@ typedef struct JSRegIR {
  #endif
  } JSRegIR;
  
-+/*
-+ * Net control-stack effect of one *register* instruction.
-+ *
-+ * The frame's control stack holds one entry per live catch handler, finally
-+ * continuation or open for-of iterator. It has to be sized to the peak over
-+ * any path, but counting the effect per *stack* bytecode is wrong: a try's
-+ * `OP_catch` pushes a sentinel that the lowering turns into an explicit entry,
-+ * yet the `OP_drop` that discards that sentinel on the normal path carries no
-+ * bytecode-level marker saying so, so the bytecode walk counted the push and
-+ * never the pop and N *sequential* try/catch statements summed to depth N
-+ * (a 20,000-statement function demanded a 640 KB control stack and was
-+ * refused by the frame's stack-overflow check).
-+ *
-+ * The lowering has already decided exactly which drops are sentinel drops --
-+ * it emits `ROP_sentinel_drop` for them -- so the effect is read from the
-+ * emitted IR, where a push and its matching pop balance.
-+ */
++/* Net control-stack effect of one register instruction. Counting per stack
++   bytecode would count a try's `OP_catch` push but not the unmarked `OP_drop`
++   that pops it, so sequential try/catch statements would sum. The lowering
++   emits `ROP_sentinel_drop` for exactly those drops, so in the IR a push and
++   its pop balance. */
 +static int regvm_ctl_delta_rop(uint16_t rop)
 +{
 +    switch (rop) {
@@ -66,15 +67,11 @@ index 84e88ff..f75ec00 100644
 +    }
 +}
 +
-+/*
-+ * Size the frame's control stack from the emitted IR: the largest net control
-+ * depth over any path, computed by a block dataflow so a diamond cannot
-+ * double-count and a loop cannot accumulate. `blk_of_insn[i]` is the block each
-+ * IR instruction's source pc belongs to (the optimising path appends fusion
-+ * islands with the `src_pc` of their block, so `src_pc` -- not the emission
-+ * index -- is what identifies the block). An exception only ever pops, so the
-+ * normal paths bound the peak.
-+ */
++/* Size the frame's control stack from the emitted IR: the largest net depth
++   over any path, by a block dataflow so a diamond cannot double-count and a
++   loop cannot accumulate. `blk_of_insn[i]` comes from `src_pc`, since fusion
++   islands are appended with their block's pc. An exception only pops, so the
++   normal paths bound the peak. */
 +static int regvm_ctl_bound(JSContext *ctx, const JSRegIR *ir, const uint8_t *bc,
 +                           int bc_len, int n_blocks, const int *bstart,
 +                           const int *succ, int *ctl_out)
@@ -87,13 +84,8 @@ index 84e88ff..f75ec00 100644
 +    ddelta = js_malloc(ctx, (size_t)(bc_len + 1) * sizeof(int));
 +    if (!din || !dout || !ddelta)
 +        goto out;
-+    /*
-+     * Per-bytecode-pc control effect, from the emitted IR: only the lowering
-+     * knows that a drop is a sentinel drop, and it records the source pc of the
-+     * instruction it emitted. Several IR instructions can share a pc (a
-+     * shaper's copies sit beside the lowered op) and a fusion island carries
-+     * the pc of its block, so the effects at a pc are summed.
-+     */
++    /* Per-bytecode-pc control effect, summed over the IR instructions sharing a
++       pc (a shaper's copies, a fusion island). */
 +    for (i = 0; i <= bc_len; i++)
 +        ddelta[i] = 0;
 +    for (i = 0; i < ir->n_insns; i++) {
@@ -132,13 +124,9 @@ index 84e88ff..f75ec00 100644
 +            for (k = 0; k < 2; k++) {
 +                int s = succ[i * 2 + k];
 +                int dd = d;
-+                /*
-+                 * A `catch` edge enters the handler with the unwinder having
-+                 * already popped the entry the `catch` pushed, so the handler
-+                 * starts one below the fall-through. Without this the dataflow
-+                 * charges each handler the pushed entry again and N sequential
-+                 * try/catch statements accumulate.
-+                 */
++                /* The unwinder has already popped the `catch`'s entry when it
++                   enters the handler, so the handler starts one below the
++                   fall-through. */
 +                if (k == 0 && bc[term] == OP_catch)
 +                    dd = d - 1;
 +                if (dd < 0)
@@ -162,18 +150,18 @@ index 84e88ff..f75ec00 100644
 +}
 +
 +
- /*
-  * Move origins that are not a stack-VM opcode.
-  */
-@@ -68292,6 +68405,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+ /* Move origins that are not a stack-VM opcode. */
+ #define REGVM_ORIG_LOWER 0xFE   /* lowering, opcode not recorded */
+ #define REGVM_ORIG_PHI   0xFD   /* an edge's parallel copy */
+@@ -65666,6 +65754,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      int enc_ok = 0;             /* the rcc table is handed to the bytecode */
      int cycle_reg = -1;
      int pc_cap = 0;             /* capacity of pc_to_insn, in pcs */
 +    int ctl_count = 0;          /* the frame's control-stack bound, from the IR */
-     /* the physical register the IR was encoded against: value registers, then
-        the scratch, then the window. The baseline tier uses it to place its
-        stack area above the window and to size its spill rewrite. */
-@@ -68418,61 +68532,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     /* The physical register count the IR was encoded against (values, scratch,
+        window); the baseline tier places its stack area above it. */
+     int encode_reg_count = 0;
+@@ -65783,61 +65872,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          }
          js_free(ctx, seen);
      }
@@ -235,16 +223,12 @@ index 84e88ff..f75ec00 100644
      scratch = js_malloc(ctx, (bc_len + 8) * sizeof(int));
      popbuf = js_malloc(ctx, (bc_len + 8) * sizeof(int));
      ev_off = js_malloc(ctx, (size_t)(n_edges + 1) * sizeof(int));
-@@ -69000,6 +69059,18 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -66322,6 +66356,14 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              goto refused;
      }
  
-+    /*
-+     * Size the frame's control stack from the IR the lowering emitted, not
-+     * from the stack bytecode: only the lowering knows which drops are sentinel
-+     * drops, so only there does a `catch`'s push balance. See
-+     * `regvm_ctl_delta_rop`.
-+     */
++    /* Size the frame's control stack from the emitted IR, where a `catch`'s
++       push balances; see `regvm_ctl_delta_rop`. */
 +    if (regvm_ctl_bound(ctx, &ir, bc, bc_len, n_blocks, bstart, succ, &ctl_count)) {
 +        REGVM_UNENCODABLE("IR allocation failed (control-stack bound)");
 +        goto refused;

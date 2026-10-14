@@ -1,55 +1,25 @@
-Subject: register bundles: take the record path (D13)
+Subject: Register bundles: take the record path
 
-What this does:
-  Computes `regvm_all_threaded` from the encoded bytes with a shared helper,
-  `regvm_code_all_threaded`, used by the compiler and by the bundle read path
-  (both the eager read and lazy materialization), and materializes a lazy
-  callee before the record-eligibility test in the four call classifiers
-  (`regvm_t_call`, `regvm_t_call_method`, `regvm_t_tail_call`,
-  `regvm_t_tail_call_method`).
+What this does
+  Register bundles: take the record path.
 
-Why we need it:
-  `regvm_all_threaded` is a property of the interpreter build, not of the
-  bytecode, so it is never serialized. A function read from a bundle therefore
-  had `regvm_call_ready == 0` and every call to it took the C path: box2d run
-  from an eager bundle executed ~10% more instructions than the same source
-  run directly. Recomputing it on read makes bundled code meet the record call
-  and tail-call fast paths for the first time. Materializing the lazy callee
-  before the eligibility test is what makes a lazy bundle's Error.stack match
-  the source and eager bundle (bundle plan 4.3 case 2): otherwise the first
-  call is classified ineligible and its frame survives.
+Why we need it
+  `regvm_all_threaded` is a property of the interpreter build, never serialized.
 
-Needs a bytecode version bump:
-  No. The wire format is unchanged; this recomputes interpreter state on read.
+What it adds
+  Shared `regvm_code_all_threaded` helper used by the encoder and both read paths (eager + lazy materialization); lazy callee materialized before the record-eligibility test in the four call classifiers so a lazy bundle's `Error.stack` matches source.
 
-Notes:
-  box2d, register build, `.local/regvm-bundle/run.c`, `perf stat -e
-  instructions:u`, run-only (total minus a NOEVAL load):
-    source                    2,639,982,044
-    eager bundle, before D13  2,901,198,420  (+10.07% vs source)
-    eager bundle, after D13   2,650,720,853  (+0.41% vs source)
-    lazy bundle, after D13    2,641,301,782  (+0.05% vs source)
-  Gate is within 1%; box2d checksum 546.1008391043414.
-  Gates: `.local/redesign/drc/run-gates.sh p0tree p0 full` with
-  DRC_BASE_ERR=50 -> 8 pass / 0 fail (test262 50/81192, diff-suite 400/0/0
-  mono and threaded, box2d, leak, RSS). 13-row Octane round trip: source,
-  eager and lazy bundles produce identical output (scores aside). ASan build
-  of run.c over all 13 rows, eager and lazy: no memory errors.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -26213,9 +26213,18 @@
-     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
-         JSObject *co = JS_VALUE_GET_OBJ(cf);
-         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
+@@ -25585,6 +25585,13 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-+            /* D13: a lazy function becomes record-eligible only after it is
-+               materialized, and materialization otherwise happens inside the
-+               slow path on its first call. Materialize here so that first call
-+               takes the record path too -- otherwise a caller frame survives in
-+               Error.stack for a bundle but not for source. */
++            /* A lazy function becomes record-eligible only once materialized.
++               Materializing here keeps its first call on the record path, so
++               Error.stack is the same for a bundle and for source. */
 +            if (unlikely(cb->is_lazy) &&
 +                js_materialize_function_body(cb->realm, cb) == 0 &&
 +                regvm_record_eligible(cb))
@@ -57,7 +27,7 @@ Notes:
  #if defined(QJS_REGVM_COUNT)
              regvm_note_blockers(cb);
  #endif
-@@ -26235,6 +26312,11 @@
+@@ -25605,6 +25612,11 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
              if (likely(regvm_record_eligible(cb)))
                  __attribute__((musttail))
                      return regvm_t_call_method_record(REGVM_PASS);
@@ -69,7 +39,7 @@ Notes:
  #if defined(QJS_REGVM_COUNT)
              regvm_note_blockers(cb);
  #endif
-@@ -28413,6 +28498,11 @@
+@@ -27588,6 +27600,11 @@ static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS)
                  if (likely(regvm_record_eligible(cb) && f->caller != NULL))
                      __attribute__((musttail))
                          return regvm_t_tail_call_record(REGVM_PASS);
@@ -81,7 +51,7 @@ Notes:
              }
          }
      }
-@@ -28436,6 +28527,11 @@
+@@ -27611,6 +27628,11 @@ static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
                  if (likely(regvm_record_eligible(cb) && f->caller != NULL))
                      __attribute__((musttail))
                          return regvm_t_tail_call_method_record(REGVM_PASS);
@@ -93,19 +63,13 @@ Notes:
              }
          }
      }
-@@ -58246,6 +58343,35 @@
+@@ -56596,6 +56618,28 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
+     return n;
  }
  
- /*
-+ * Does every opcode in a register program have a threaded handler? Read out of
-+ * the encoded bytes rather than the IR because that is the final form -- the
-+ * encoder narrows operands as it emits -- and `wide` is a constant 1 at the
-+ * only compiler call site, so the walk is exact. The same walk runs on the
-+ * bundle read path: `regvm_all_threaded` is a property of the interpreter
-+ * build, never serialized, and a function loaded from a blob must recompute it
-+ * or it stays ineligible for the record call and tail-call fast paths (D13).
-+ * One function for both callers so they cannot diverge.
-+ */
++/* Does every opcode in a register program have a threaded handler? Read from
++   the encoded bytes, the final form. `regvm_all_threaded` is never serialized,
++   so the bundle read path runs the same walk. */
 +#if QJS_REGVM_THREAD
 +static int regvm_code_all_threaded(const uint8_t *code, int len)
 +{
@@ -125,20 +89,19 @@ Notes:
 +}
 +#endif
 +
-+/*
-  * Rewrite every atom operand of a register program in place. The register
-  * bytecode names property keys, globals and private names by atom, exactly as
-  * the stack bytecode does, so serialization has to pass them through the same
-@@ -66160,32 +66160,13 @@
+ /*
+  * Rewrite every atom operand of a register program in place, so serialization
+  * passes them through the atom table. `cb` returns each atom's replacement: a
+@@ -63873,34 +63917,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+                                              );
+ 
  #if QJS_REGVM_THREAD
-             /*
-              * Whether every opcode here has a threaded handler. Read out of the
-              * encoded bytes rather than the IR because that is the final form --
-              * the encoder narrows operands as it emits -- and `wide` is a
+-            /*
+-             * Whether every opcode here has a threaded handler. Read out of the
+-             * encoded bytes rather than the IR because that is the final form --
+-             * the encoder narrows operands as it emits -- and `wide` is a
 -             * constant 1 at the only call site, so the walk is exact.
-+             * constant 1 at the only call site, so the walk is exact. Shared
-+             * with the bundle read path so the two cannot diverge.
-              */
+-             */
 -            {
 -                const uint8_t *_p = fd->regvm_code;
 -                const uint8_t *_end = _p + fd->regvm_len;
@@ -161,35 +124,35 @@ Notes:
 -                }
 -                fd->regvm_all_threaded = (_all && _p == _end);
 -            }
++            /* Whether every opcode has a threaded handler, read from the
++               encoded bytes, which are the final form. Shared with the bundle
++               read path. */
 +            fd->regvm_all_threaded =
 +                regvm_code_all_threaded(fd->regvm_code, fd->regvm_len);
  #endif
              if (er == REGVM_REFUSED)
                  goto refused;
-@@ -73849,6 +74091,13 @@
+@@ -71312,6 +71333,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
          goto fail;
      b->realm = JS_DupContext(ctx);
  #if QJS_REGVM_RECORD
-+    /* D13: `regvm_all_threaded` is a property of the interpreter build, not of
-+       the bytecode, so it is never serialized. Recompute it from the code just
-+       read, or the function stays ineligible for the record call and tail-call
-+       fast paths. */
++    /* `regvm_all_threaded` is never serialized: recompute it from the code
++       just read, or the function stays off the record and tail-call paths. */
 +    if (b->regvm_compiled && b->regvm_code)
 +        b->regvm_all_threaded =
 +            regvm_code_all_threaded(b->regvm_code, b->regvm_len);
      regvm_set_call_desc(b);
  #endif
  #if QJS_AOT
-@@ -74667,6 +74916,11 @@
+@@ -72125,6 +72151,11 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
  
      if (ret == 0) {
  #if QJS_REGVM_RECORD
-+        /* D13: recompute the interpreter-build property from the code just
-+           materialized, exactly as the eager read path does. */
++        /* recompute it from the code just materialized, as the eager read
++           path does */
 +        if (b->regvm_compiled && b->regvm_code)
 +            b->regvm_all_threaded =
 +                regvm_code_all_threaded(b->regvm_code, b->regvm_len);
          regvm_set_call_desc(b);
  #endif
  #if QJS_AOT
-

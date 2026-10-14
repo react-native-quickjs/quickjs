@@ -1,33 +1,56 @@
+Subject: Fills the register PIC and reads it inline on the hot named-property path
+
+What this does
+  Fills the register PIC and reads it inline on the hot named-property path.
+
+Why we need it
+  The register backend had a per-function PIC with no owner, no fill and no hit, so every named read paid the generic engine lookup.
+
+What it adds
+  `regvm_pic_fill` fills one shape per site for a plain, non-exotic receiver with a counted-ref, hashed shape, a direct-prototype or own data property, no `JS_PROP_LENGTH` and no lazy slot, with an eight-miss megamorphic cutoff; `regvm_get_field_ic` keeps the engine lookup and fills from it; `regvm_own_read_hit` reads `f->pic`/`pic` with one shape compare and a kind test, inlined into `regvm_t_get_field`/`_get_field2`/`_get_local_field_0` and the monolith; the frame re-points its base after the lazy allocation.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22080,142 +22080,119 @@
-  * read and the caller stores the result with SET_REG. `recv` is therefore
-  * borrowed and every returned value is a new reference (or JS_EXCEPTION).
+@@ -21886,153 +21886,115 @@ static inline __attribute__((always_inline)) int regvm_unary_num_fast(
+ }
+ 
+ /*
+- * The stack VM's `OP_get_field_ic` read path, for a register operand pair.
++ * The stack VM's `OP_get_field_ic` read path, for a register operand pair:
++ * the same guards, prototype resolution, lazy-slot rule, chain-walk refill and
++ * megamorphic probe, in the same order. The receiver is a register this frame
++ * owns, so it is only read: `recv` is borrowed and every returned value is a
++ * new reference (or JS_EXCEPTION).
++ */
++/*
++ * The register read cache fill. The value is always the engine's:
++ * `regvm_get_field_ic` calls JS_GetPropertyInternal first and then records
++ * where the property was found, re-deriving holder and slot with
++ * find_own_property. The cache is only filled for cases the hit path can
++ * reproduce with no further check.
+  *
+- * Only reached when the encoder emitted a real site; a site-less read keeps the
+- * old generic route. The guards, the prototype resolution, the lazy-slot rule,
+- * the chain-walk refill and the megamorphic probe are the stack handler's, in
+- * its order. The one difference is ownership: the stack handler consumes the
+- * receiver's operand slot and replaces it with the value, while here the
+- * receiver is a register this frame owns until teardown, so the receiver is only
+- * read and the caller stores the result with SET_REG. `recv` is therefore
+- * borrowed and every returned value is a new reference (or JS_EXCEPTION).
++ * A receiver shape other than the cached one counts a miss; after
++ * REG_PIC_MISS_LIMIT misses the site goes empty and stays empty.
   */
 -static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
 -                                  JSValue recv, JSAtom atom, int ic_idx)
-+/*
-+ * The register read cache fill (A3).
-+ *
-+ * The value itself is always the engine's: `regvm_get_field_ic` calls
-+ * JS_GetPropertyInternal and only then records where the property was found.
-+ * The fill re-derives the holder and the slot with find_own_property instead of
-+ * walking the prototype chain in the handler, so the returned value is exactly
-+ * the engine's in every corner (getters, Proxies, strings, lazy JSON) while the
-+ * cache is only ever filled for the cases the hit path can reproduce with no
-+ * further check.
-+ *
-+ * A site holds one shape. A receiver shape other than the cached one counts a
-+ * miss; after REG_PIC_MISS_LIMIT misses the site goes empty and stays empty, so
-+ * a polymorphic or megamorphic site stops thrashing.
-+ */
 +#define REG_PIC_MISS_LIMIT 8
 +
 +static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
 +                           JSRegPIC **ppic, JSValue recv, JSAtom atom, int site)
  {
--    /* A1 gives register bytecode a separate dense PIC namespace. Until A3/A4
--       install fills and hits, always use the generic engine lookup here. */
+-    /* Register bytecode has its own dense PIC namespace; until the fills and
+-       hits exist, always use the generic engine lookup here. */
 -    (void)b;
 -    (void)ic_idx;
 -    return JS_GetPropertyInternal(ctx, recv, atom, recv, false);
@@ -94,12 +117,17 @@
 -            if (js_megacache_probe(ctx->rt, p, atom, &holder, &offset) &&
 -                !js_lazy_marker_is(holder->prop[offset].u.value))
 -                return js_dup(holder->prop[offset].u.value);
-+    /* A plain object only. An exotic one -- Array, typed array, arguments,
-+       Proxy, a string/number/boolean wrapper -- answers properties through its
-+       own handler, and find_own_property would not see that answer. */
+-        }
+-    }
+-#endif /* JS_ENABLE_IC */
++    /* A plain object only: an exotic object answers through its own handler,
++       which find_own_property would not see. */
 +    if (p->is_exotic)
 +        return;
-+
+ 
+-    {
+-        JSObject *recv_obj = p;
+-        uint32_t ic_depth = 0;
 +    holder = p;
 +    hsh = NULL;
 +    kind = REG_PIC_OWN;
@@ -123,53 +151,19 @@
 +    rsh = p->shape;
 +    if (!rsh->is_hashed || (hsh && !hsh->is_hashed))
 +        return;
-+    /* A data property: not a getter/setter, autoinit or var-ref, and not an
-+       array/string `length`, which is not a slot the hit path can read. */
++    /* A data property, and not an array/string `length`. */
 +    if (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))
 +        return;
-+    /* The hit path sends a lazy slot to the slow path, which materializes it,
-+       so caching one would only bounce. Refill on the materialized read. */
++    /* The hit path sends a lazy slot to the slow path, so caching one would
++       only bounce. */
 +    if (js_lazy_marker_is(pr->u.value))
 +        return;
-+
-+    slot = (uint32_t)(pr - holder->prop);
-+
-+    pic = *ppic;
-+    if (!pic) {
-+        pic = regvm_pic_ensure(rt, b);
-+        if (!pic)
-+            return;                 /* no table: the site simply does not cache */
-+        *ppic = pic;                /* re-point the running frame (A1's base) */
-+    }
-+    e = &pic[site];
-+    if (e->kind == kind && e->shape == rsh && e->holder_shape == hsh)
-+        return;                     /* already cached */
-+
-+    misses = e->misses;
-+    if (e->kind != REG_PIC_EMPTY) {
-+        if (++misses >= REG_PIC_MISS_LIMIT) {
-+            regvm_pic_entry_reset(rt, e);       /* drops the shape references */
-+            e->misses = REG_PIC_MISS_LIMIT;     /* EMPTY + limit means dead */
-+            return;
-         }
-     }
--#endif /* JS_ENABLE_IC */
--
--    {
--        JSObject *recv_obj = p;
--        uint32_t ic_depth = 0;
--
+ 
 -        for (;;) {
 -            JSProperty *pr;
 -            JSShapeProperty *prs;
 -            JSValue val;
-+    regvm_pic_entry_reset(rt, e);   /* release the entry this replaces */
-+    e->misses = misses;
-+    e->shape = js_dup_shape(rsh);
-+    e->holder_shape = hsh ? js_dup_shape(hsh) : NULL;
-+    e->slot = slot;
-+    e->kind = kind;
-+}
++    slot = (uint32_t)(pr - holder->prop);
  
 -            prs = find_own_property(&pr, p, atom);
 -            if (prs) {
@@ -225,20 +219,42 @@
 -            p = p->shape->proto;
 -            if (!p)
 -                return JS_UNDEFINED;
--        }
--    }
++    pic = *ppic;
++    if (!pic) {
++        pic = regvm_pic_ensure(rt, b);
++        if (!pic)
++            return;                 /* no table: the site simply does not cache */
++        *ppic = pic;                /* re-point the running frame's base */
++    }
++    e = &pic[site];
++    if (e->kind == kind && e->shape == rsh && e->holder_shape == hsh)
++        return;                     /* already cached */
++
++    misses = e->misses;
++    if (e->kind != REG_PIC_EMPTY) {
++        if (++misses >= REG_PIC_MISS_LIMIT) {
++            regvm_pic_entry_reset(rt, e);       /* drops the shape references */
++            e->misses = REG_PIC_MISS_LIMIT;     /* EMPTY + limit means dead */
++            return;
+         }
+     }
 - slow:
 -#ifdef QJS_REGVM_COUNT
 -    js_regvm_getfield_ic[2]++;
 -#endif
 -    return JS_GetPropertyInternal(ctx, recv, atom, recv, false);
 -#endif
-+/*
-+ * The register property read for a site-bearing instruction.
-+ *
-+ * The value is the engine's; the fill is the register PIC's. `*ppic` is the
-+ * running frame's cache base, updated here when the first fill allocates it.
-+ */
++    regvm_pic_entry_reset(rt, e);   /* release the entry this replaces */
++    e->misses = misses;
++    e->shape = js_dup_shape(rsh);
++    e->holder_shape = hsh ? js_dup_shape(hsh) : NULL;
++    e->slot = slot;
++    e->kind = kind;
++}
++
++/* The register property read for a site-bearing instruction. `*ppic` is the
++   running frame's cache base, updated here when the first fill allocates
++   it. */
 +static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
 +                                  JSRegPIC **ppic, JSValue recv, JSAtom atom,
 +                                  int site)
@@ -250,7 +266,7 @@
  }
  
  /*
-@@ -22384,48 +22361,40 @@
+@@ -22198,48 +22160,40 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue rec
  #endif
  }
  
@@ -300,11 +316,11 @@
      }
 -    if (ic[0].flags & (JS_IC_FLAG_TRANSITION | JS_IC_FLAG_PROTO |
 -                       JS_IC_FLAG_MEGAMORPHIC))
--        return 0;
--    v = p->prop[ic[0].offset].u.value;
--    if (js_lazy_marker_is(v))
 +    if (unlikely(js_lazy_marker_is(v)))
          return 0;
+-    v = p->prop[ic[0].offset].u.value;
+-    if (js_lazy_marker_is(v))
+-        return 0;
 -#ifdef QJS_REGVM_COUNT
 -    js_regvm_getfield_ic[0]++;
 -#endif
@@ -321,7 +337,7 @@
  }
  
  /*
-@@ -24131,12 +24100,13 @@
+@@ -23739,12 +23693,13 @@ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS)
      JSValue recv = f->var_buf[0];
      JSValue val;
  
@@ -337,7 +353,7 @@
      if (JS_IsException(val))
          T_FAIL();
      T_SET_NEXT(d, val, 9);
-@@ -24491,7 +24461,7 @@
+@@ -24076,7 +24031,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
          if (site == REG_IC_NONE) { \
              val = JS_GetProperty(ctx, fr[r], atom); \
          } else { \
@@ -346,7 +362,7 @@
          } \
          if (JS_IsException(val)) \
              T_FAIL(); \
-@@ -24503,8 +24473,8 @@
+@@ -24088,8 +24043,8 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
          int r = T_REG(3); \
          int site = T_REG(9); \
          JSValue val; \
@@ -357,19 +373,18 @@
              T_SET_NEXT(d, val, T_SZ_RRAS); \
          } \
          __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
-@@ -25381,6 +25351,11 @@
+@@ -24856,6 +24811,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
      {
          regs = stack_buf;
          uint8_t *rpc;
-+        /* The monolith's own read-cache base. The threaded chain keeps its own
-+           in `run.pic`; a fill re-points whichever frame it ran in, and the
-+           monolith re-points its own on its next fill (regvm_pic_ensure returns
-+           the table already owned by the bytecode). */
++        /* The monolith's read-cache base; the threaded chain keeps its own in
++           `run.pic`. regvm_pic_ensure returns the table the bytecode already
++           owns. */
 +        JSRegPIC *pic = b->regvm_pic;
  #if QJS_REGVM_INLOOP_CALL
          /* The innermost nested frame's header, or NULL at the activation's own
             frame. Every push and pop keeps it and rt->current_stack_frame in
-@@ -26606,14 +26581,15 @@
+@@ -25991,14 +25950,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int site = RD_U16();
                  JSValue recv = var_buf[slot];
                  JSValue val;
@@ -387,7 +402,7 @@
                  if (JS_IsException(val))
                      goto exception;
                  SET_REG(d, val);
-@@ -26628,14 +26604,15 @@
+@@ -26013,14 +25973,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSValue recv = (op == ROP_get_local_field) ? var_buf[slot]
                                                            : arg_buf[slot];
                  JSValue val;
@@ -405,8 +420,8 @@
                  if (JS_IsException(val))
                      goto exception;
                  SET_REG(d, val);
-@@ -26652,8 +26629,8 @@
-                    encoder emitted a site. */
+@@ -26036,8 +25997,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 /* Only where the encoder emitted a site. */
                  js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
  #endif
 -                if (site != REG_IC_NONE &&
@@ -416,8 +431,8 @@
                      SET_REG(d, val);
                      REGVM_NEXT();
                  }
-@@ -26661,7 +26638,7 @@
-                     /* no site: the generic route, unchanged */
+@@ -26045,7 +26006,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                     /* no site: the generic route */
                      val = JS_GetProperty(ctx, regs[r], atom);
                  } else {
 -                    val = regvm_get_field_ic(ctx, b, regs[r], atom, site);
@@ -425,7 +440,7 @@
                  }
                  if (JS_IsException(val))
                      goto exception;
-@@ -26674,15 +26651,15 @@
+@@ -26058,15 +26019,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSAtom atom = RD_U32();
                  int site = RD_U16();
                  JSValue val;
@@ -444,7 +459,7 @@
                  }
                  if (JS_IsException(val))
                      goto exception;
-@@ -29337,14 +29314,15 @@
+@@ -28422,14 +28383,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int site = RD_U16();
                      JSValue recv = f->var_buf[slot];
                      JSValue val;
@@ -462,7 +477,7 @@
                      if (JS_IsException(val))
                          goto exception;
                      SET_REG(d, val);
-@@ -29361,14 +29339,15 @@
+@@ -28446,14 +28408,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      JSValue recv = (op == ROP_get_local_field) ? f->var_buf[slot]
                                                                : f->arg_buf[slot];
                      JSValue val;

@@ -1,67 +1,35 @@
-From: quickjs-ng object-creation work
-Subject: Object creation: learned instance capacity (O2)
+Subject: Object creation: learned instance capacity (slack tracking)
 
 What this does
-  Slack-tracks instance layout per constructor. JS_CallConstructorInternal's
-  legacy branch now asks js_new_target_bytecode() for the new.target's
-  JSFunctionBytecode and passes its inst_inline_cap to js_create_from_ctor_cap()
-  -> JS_NewObjectProtoClassCap() -> JS_NewObjectFromShapeCap(), which reserves
-  that many inline property slots for JS_CLASS_OBJECT. After the constructor
-  returns, js_learn_instance_cap() records the largest instance shape->prop_size
-  seen; after JS_OBJ_LEARN_SAMPLES (8) constructions the constructor publishes
-  inst_inline_cap = max(seen), capped at JS_OBJ_LEARNED_INLINE_MAX (8).
-
-  Keying on new.target (not on the called constructor) makes a base constructor
-  learn the subclass layout, so new TextNode() reserves TextNode's final
-  capacity even though Node's constructor runs first.
+  Object creation: learned instance capacity (slack tracking).
 
 Why we need it
-  A fresh instance starts from the prototype's shape with prop_size
-  JS_PROP_INITIAL_SIZE (2) and the shape's prop_size doubles on growth, so
-  Node (4 properties) and TextNode (5 properties, prop_size 8) both grow out of
-  the 2-slot inline array. On the ProseMirror reproducer this is the entire
-  remaining property-array growth population: move_out_of_inline drops from
-  817,632 to 16,832 over 200 iterations of the M workload, and the 4-property
-  Node shape is now created inline (JS_CLASS_OBJECT prop_size 4: 124/124
-  inline). The learning is a measurement-driven deviation from the plan text,
-  which tied O2 to the N9 shape-keyed capacity: the per-object prop_inline_cap
-  mechanism is already sound here, and shape keying is only needed for the N9
-  constant-displacement read, which O2 does not add.
+  And the shape's `prop_size` doubles on growth, so the ProseMirror `Node` and `TextNode` both grow out of the 2-slot inline property array on every construction.
 
 What it adds
-  quickjs.c
-      JS_OBJ_LEARNED_INLINE_MAX / JS_OBJ_LEARN_SAMPLES; JSObject
-      prop_inline_cap widened 3->5 bits; JSFunctionBytecode
-      inst_inline_cap/inst_cap_seen/inst_cap_samples;
-      JS_NewObjectFromShapeCap + wrapper; JS_NewObjectProtoClassCap;
-      js_create_from_ctor_cap; js_new_target_bytecode; js_learn_instance_cap;
-      the learning hook in JS_CallConstructorInternal.
+  `JS_CallConstructorInternal`'s legacy branch asks `js_new_target_bytecode` for the `new.target`'s `JSFunctionBytecode` and passes its `inst_inline_cap` to `js_create_from_ctor_cap` -> `JS_NewObjectProtoClassCap` -> `JS_NewObjectFromShapeCap`, which reserves that many inline property slots for `JS_CLASS_OBJECT`; after the constructor returns `js_learn_instance_cap` records the largest instance `shape->prop_size` seen, and after `JS_OBJ_LEARN_SAMPLES` constructions the constructor publishes `inst_inline_cap = max(seen)` capped at `JS_OBJ_LEARNED_INLINE_MAX`. Keying on `new.target` lets a base constructor learn the subclass layout.
 
-  Box2D checksum 546.1008391043414, test262 50/81192 with no leaks,
-  differential corpus 398/0/0, ASan on test262-fast clean (one pre-existing
-  UBSan allocator-vtable report), peak RSS on box2d +0.04%. fj3000
-  instructions 254.62G -> 253.51G (-0.44%), cycles within noise.
-
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index 2b50ddb..bb0e9e8 100644
+index d5f6704..036ef3d 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1388,6 +1388,14 @@ typedef struct JSFunctionBytecode {
+@@ -1337,6 +1337,13 @@ typedef struct JSFunctionBytecode {
      /* some parameter is captured by a closure or the mapped arguments
         object: its var_ref would write into a borrowed argument window */
      uint8_t args_captured : 1;
-+    /* O2 slack tracking: when this function is used as a new.target, the inline
-+       capacity to reserve for its instances, learned from the instance shape at
-+       constructor return (see js_learn_instance_cap). 0 = not learned yet. The
-+       fields sit in the padding before byte_code_buf, so the struct does not
-+       grow. */
++    /* Slack tracking: when this function is used as new.target, the inline
++       capacity to reserve for its instances, learned at constructor return (see
++       js_learn_instance_cap). 0 = not learned yet. In the padding before
++       byte_code_buf. */
 +    uint8_t inst_inline_cap;
 +    uint8_t inst_cap_seen;
 +    uint8_t inst_cap_samples;
      uint8_t *byte_code_buf; /* (self pointer) */
      int byte_code_len;
      /* Runtime-only unified IC storage. It is allocated on first successful fill. */
-@@ -1876,9 +1884,12 @@ struct JSObject {
+@@ -1811,9 +1818,12 @@ struct JSObject {
      uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
      /* This object's property layout invalidates the OP_get_var cell cache. */
      uint8_t gv_watched : 1;
@@ -76,7 +44,7 @@ index 2b50ddb..bb0e9e8 100644
      uint16_t class_id; /* see JS_CLASS_x */
      /* byte offsets: 16/24 */
      JSShape *shape; /* prototype and property names + flag */
-@@ -8395,6 +8406,12 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
+@@ -8269,6 +8279,12 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
  }
  
  #define JS_OBJ_INLINE_PROPS 4
@@ -89,7 +57,7 @@ index 2b50ddb..bb0e9e8 100644
  
  static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
  {
-@@ -8424,9 +8441,11 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
+@@ -8298,9 +8314,11 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
  }
  
  /* 'props[]' is used to initialized the object properties. The number
@@ -104,7 +72,7 @@ index 2b50ddb..bb0e9e8 100644
  {
      JSObject *p;
      int i;
-@@ -8441,6 +8460,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
+@@ -8315,6 +8333,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
                                  class_id == JS_CLASS_MAPPED_ARGUMENTS) &&
                                 sh->prop_size <= JS_OBJ_INLINE_PROPS) ?
                                sh->prop_size : 0;
@@ -116,7 +84,7 @@ index 2b50ddb..bb0e9e8 100644
  #ifdef QJS_ALLOC_STATS
          qjs_st_obj_alloc++;
          {
-@@ -8596,6 +8620,12 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
+@@ -8470,6 +8493,12 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
      return JS_MKPTR(JS_TAG_OBJECT, p);
  }
  
@@ -129,7 +97,7 @@ index 2b50ddb..bb0e9e8 100644
  static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl)
  {
      JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
-@@ -8645,8 +8675,8 @@ static JSAtom js_objlit_template_atom(JSObjLitTemplate *tpl, int index)
+@@ -8519,8 +8548,8 @@ static JSAtom js_objlit_template_atom(JSObjLitTemplate *tpl, int index)
  }
  
  /* WARNING: proto must be an object or JS_NULL */
@@ -140,7 +108,7 @@ index 2b50ddb..bb0e9e8 100644
  {
      JSShape *sh;
      JSObject *proto;
-@@ -8660,7 +8690,13 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
+@@ -8534,7 +8563,13 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
          if (!sh)
              return JS_EXCEPTION;
      }
@@ -155,7 +123,7 @@ index 2b50ddb..bb0e9e8 100644
  }
  
  /* WARNING: the shape is not hashed. It is used for objects where
-@@ -37959,8 +37995,8 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
+@@ -36579,8 +36614,8 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
      return realm;
  }
  
@@ -166,7 +134,7 @@ index 2b50ddb..bb0e9e8 100644
  {
      JSValue proto, obj;
      JSContext *realm;
-@@ -37979,11 +38015,55 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
+@@ -36599,11 +36634,54 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
              proto = js_dup(realm->class_proto[class_id]);
          }
      }
@@ -182,9 +150,8 @@ index 2b50ddb..bb0e9e8 100644
 +    return js_create_from_ctor_cap(ctx, ctor, class_id, 0);
 +}
 +
-+/* O2 slack tracking. The learned capacity is keyed on new.target (not the
-+   called constructor), so a base constructor serving `new Sub()` learns the
-+   subclass instance layout. Only bytecode functions are tracked. */
++/* Slack tracking, keyed on new.target, so a base constructor serving
++   `new Sub()` learns the subclass layout. Bytecode functions only. */
 +static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target)
 +{
 +    JSObject *p;
@@ -223,7 +190,7 @@ index 2b50ddb..bb0e9e8 100644
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                            JSValueConst func_obj,
-@@ -38018,16 +38098,22 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
+@@ -36638,16 +36716,22 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
          return JS_CallInternal(ctx, func_obj, JS_UNDEFINED, new_target, argc, argv, flags);
      } else {
          JSValue obj, ret;

@@ -20,13 +20,13 @@ Needs a bytecode version bump
 
 Notes
   Homes are gated by REGVM_HOMES. Box2D move dispatches fall from 15.55% to
-  5.34%; the P4 gates pass with 343 differential cases and 2,000 fuzz cases.
+  5.34%.
 
 diff --git a/quickjs.c b/quickjs.c
-index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763daabadd7 100644
+index 31b6a40..729c89f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23357,6 +23357,7 @@ static const regvm_handler regvm_threaded[ROP_COUNT] = {
+@@ -23044,6 +23044,7 @@ static const regvm_handler regvm_threaded[ROP_COUNT] = {
      [ROP_with_get_ref] = regvm_t_cold,
      [ROP_with_get_ref_undef] = regvm_t_cold,
      [ROP_with_make_ref] = regvm_t_cold,
@@ -34,7 +34,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      [ROP_load_const] = regvm_t_load_const,
      [ROP_load_this] = regvm_t_load_this,
      [ROP_move] = regvm_t_move,
-@@ -26135,12 +26136,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -25535,12 +25536,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSAtom atom = RD_U32();
                  int s = RD_REG();
                  int flags = RD_U8();
@@ -48,7 +48,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  REGVM_NEXT();
              }
              L_ROP_close_local:
-@@ -26481,17 +26478,13 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -25848,17 +25845,13 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      goto exception;
                  REGVM_NEXT();
              }
@@ -69,7 +69,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  if (JS_VALUE_GET_TAG(regs[o]) == JS_TAG_OBJECT) {
                      JSObject *po = JS_VALUE_GET_OBJ(regs[o]);
                      if (likely(!po->is_exotic)) {
-@@ -26554,8 +26547,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -25921,8 +25914,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int o = RD_REG();
                  int key = RD_REG();
                  int v = RD_REG();
@@ -79,7 +79,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  if (JS_DefinePropertyValueValue(ctx, regs[o], js_dup(regs[key]),
                                                  val, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                      goto exception;
-@@ -26634,26 +26626,26 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -25998,26 +25990,26 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      flags |= JS_PROP_ENUMERABLE;
                  kind = op_flags & 3;
                  if (kind == 0) {
@@ -114,7 +114,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  }
                  if (ret < 0)
                      goto exception;
-@@ -26664,15 +26656,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26028,15 +26020,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_set_proto: {
                  int o = RD_REG();
                  int p2 = RD_REG();
@@ -132,7 +132,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  REGVM_NEXT();
              }
              L_ROP_set_home_object: {
-@@ -26684,12 +26672,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26048,12 +26036,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_get_super: {
                  int d = RD_REG();
                  int s = RD_REG();
@@ -146,7 +146,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  SET_REG(d, proto);
                  REGVM_NEXT();
              }
-@@ -26950,11 +26936,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26295,11 +26281,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                          JS_FreeValue(ctx, iter);
                      }
                  }
@@ -160,8 +160,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  REGVM_NEXT();
              }
              /*
-@@ -26985,20 +26968,30 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-              */
+@@ -26327,20 +26310,27 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                ROP_iter_next leaves. */
              L_ROP_iter_value_done:
                  { int w = RD_REG();
 -                  if (js_iterator_get_value_done(ctx, &regs[w + 4]))
@@ -174,21 +174,21 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +                      JS_FreeValue(ctx, tmp[3]);
 +                      JS_FreeValue(ctx, tmp[4]);
                        goto exception;
-+                  }
-+                  SET_REG(w + 3, tmp[3]);
-                   /*
-                    * On done the helper releases the iterator at sp[-4] and
+-                  /*
+-                   * On done the helper releases the iterator at sp[-4] and
 -                   * writes nothing in its place, so that window slot would be
 -                   * left holding a freed value -- and the next store into it
 -                   * would release it a second time. Clear it instead. sp[0]
 -                   * carries the done flag the helper just wrote.
-+                   * writes nothing in its place. The temporary window owns
-+                   * those stack-shaped mutations; the source registers remain
-+                   * live for any other aliases. The replacement result is at
-+                   * sp[-1] and the done flag is at sp[0].
-                    */
+-                   */
 -                  if (JS_ToBool(ctx, regs[w + 4])) {
 -                      regs[w] = JS_UNDEFINED;
++                  }
++                  SET_REG(w + 3, tmp[3]);
++                  /* On done the helper releases the iterator at sp[-4] and
++                     writes nothing in its place; the window absorbs that, and
++                     the source registers stay live. The result is at sp[-1] and
++                     the done flag at sp[0]. */
 +                  SET_REG(w + 4, tmp[4]);
 +                  if (JS_ToBool(ctx, tmp[4])) {
                        /* the slot is cleared, so nothing is left to close */
@@ -196,9 +196,9 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                    }
 +                  JS_FreeValue(ctx, tmp[0]);
                    REGVM_NEXT(); }
-             /*
-              * stack: iter_obj next catch_offset val. The helper reaches the
-@@ -27054,10 +27047,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             /* stack: iter_obj next catch_offset val. The helper reads sp[-4]
+                and sp[-1] and writes its flag at sp[0]. */
+@@ -26393,10 +26383,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSValue *sp = &regs[w + 3];
                  if (js_append_enumerate(ctx, sp))
                      goto exception;
@@ -208,8 +208,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 -                regs[w + 2] = JS_UNDEFINED;
                  REGVM_NEXT();
              }
-             /*
-@@ -27240,29 +27229,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             /* The with family. Each is a two-armed branch: if the name is in
+@@ -26574,29 +26560,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      taken = !taken;
                  }
                  if (taken) {
@@ -245,7 +245,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  }
                  REGVM_NEXT();
              }
-@@ -27382,10 +27359,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26714,10 +26688,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  }
                  if (JS_IsException(ret_val))
                      goto exception;
@@ -256,7 +256,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  SET_REG(d, ret_val);
                  REGVM_NEXT();
              }
-@@ -27394,10 +27367,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26726,10 +26696,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int home = RD_REG();
                  if (JS_AddBrand(ctx, regs[o], regs[home]) < 0)
                      goto exception;
@@ -267,7 +267,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  REGVM_NEXT();
              }
              L_ROP_define_private: {
-@@ -27405,15 +27374,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26737,15 +26703,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int o = RD_REG();
                  int k = RD_REG();
                  int v = RD_REG();
@@ -288,7 +288,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  SET_REG(d, obj);
                  if (unlikely(ret < 0))
                      goto exception;
-@@ -27423,12 +27388,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26755,12 +26717,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int o = RD_REG();
                  int v = RD_REG();
                  int k = RD_REG();
@@ -303,7 +303,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  if (unlikely(ret < 0))
                      goto exception;
                  REGVM_NEXT();
-@@ -27447,10 +27408,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26779,10 +26737,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int o = RD_REG();
                  int k = RD_REG();
                  JSValue val = JS_GetPrivateField(ctx, regs[o], regs[k]);
@@ -314,7 +314,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  if (JS_IsException(val))
                      goto exception;
                  SET_REG(d, val);
-@@ -27463,17 +27420,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26795,17 +26749,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSValue v2;
                  if (likely(JS_VALUE_GET_TAG(regs[s]) == JS_TAG_INT)) {
                      uint32_t i2 = (uint32_t)JS_VALUE_GET_INT(regs[s]);
@@ -335,7 +335,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  if (JS_IsException(v2))
                      goto exception;
                  SET_REG(d, v2);
-@@ -27495,11 +27450,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26827,11 +26779,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int d = RD_REG();
                  int p2 = RD_REG();
                  int f2 = RD_REG();
@@ -350,21 +350,22 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  SET_REG(d, js_regexp_constructor_internal(ctx, JS_UNDEFINED, pat, fl));
                  if (JS_IsException(regs[d]))
                      goto exception;
-@@ -27545,11 +27498,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26873,13 +26823,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 SET_REG(d, val);
                  REGVM_NEXT();
              }
-             /*
+-            /*
 -             * Dynamic import. js_dynamic_import borrows its operands -- the
 -             * stack VM frees its two slots after the call -- so both registers
 -             * are released here, and the destination is released before the
 -             * promise is stored (the allocator may have put it on one of the
 -             * operands).
-+             * Dynamic import borrows its operands. Registers retain ownership
-+             * until overwritten or the frame is released.
-              */
+-             */
++            /* Dynamic import borrows its operands. */
              L_ROP_dynamic_import: {
                  int d = RD_REG();
-@@ -27558,10 +27508,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 int spec = RD_REG();
+@@ -26887,10 +26831,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  JSValue val = js_dynamic_import(ctx, regs[spec], regs[opts]);
                  if (JS_IsException(val))
                      goto exception;
@@ -375,7 +376,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  SET_REG(d, val);
                  REGVM_NEXT();
              }
-@@ -27639,30 +27585,23 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -26964,30 +26904,23 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int e = RD_REG();
                  JSValue new_error = regs[e];
                  JSValue error_state = regs[s];
@@ -408,7 +409,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      goto exception;
                  }
                  REGVM_NEXT();
-@@ -28183,14 +28122,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -27469,14 +27402,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  int ab = RD_REG();
                  int na = RD_U8();
                  int k;
@@ -428,54 +429,22 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  if (JS_IsException(ret_val))
                      goto exception;
                  SET_REG(d, ret_val);
-@@ -28576,6 +28513,46 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
-      *
-      * Splice with `.local/regvm-build/splice-cold.py`.
-      */
-+    /*
-+     * The arms below are extracted from the monolith's `L_ROP_*` bodies by
-+     * `.local/regvm-build/emit-cold.py`, which is why their indentation is odd.
-+     * **Regenerate rather than hand-edit**: a hand-copied body is exactly how a
-+     * frame field gets missed. The emitter rewrites with a lookbehind (so
-+     * `sf->arg_buf` does not become `f->arg_buf`) and skips any body that
-+     * declares one of the names it would rewrite.
-+     *
-+     * Splice with `.local/regvm-build/splice-cold.py`.
-+     */
-+    /*
-+     * The arms below are extracted from the monolith's `L_ROP_*` bodies by
-+     * `.local/regvm-build/emit-cold.py`, which is why their indentation is odd.
-+     * **Regenerate rather than hand-edit**: a hand-copied body is exactly how a
-+     * frame field gets missed. The emitter rewrites with a lookbehind (so
-+     * `sf->arg_buf` does not become `f->arg_buf`) and skips any body that
-+     * declares one of the names it would rewrite.
-+     *
-+     * Splice with `.local/regvm-build/splice-cold.py`.
-+     */
-+    /*
-+     * The arms below are extracted from the monolith's `L_ROP_*` bodies by
-+     * `.local/regvm-build/emit-cold.py`, which is why their indentation is odd.
-+     * **Regenerate rather than hand-edit**: a hand-copied body is exactly how a
-+     * frame field gets missed. The emitter rewrites with a lookbehind (so
-+     * `sf->arg_buf` does not become `f->arg_buf`) and skips any body that
-+     * declares one of the names it would rewrite.
-+     *
-+     * Splice with `.local/regvm-build/splice-cold.py`.
-+     */
-+    /*
-+     * The arms below are extracted from the monolith's `L_ROP_*` bodies by
-+     * `.local/regvm-build/emit-cold.py`, which is why their indentation is odd.
-+     * **Regenerate rather than hand-edit**: a hand-copied body is exactly how a
-+     * frame field gets missed. The emitter rewrites with a lookbehind (so
-+     * `sf->arg_buf` does not become `f->arg_buf`) and skips any body that
-+     * declares one of the names it would rewrite.
-+     *
-+     * Splice with `.local/regvm-build/splice-cold.py`.
-+     */
+@@ -27770,6 +27701,14 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+        frame fields spelled `f->`. */
+     /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
+        frame fields spelled `f->`. */
++    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
++       frame fields spelled `f->`. */
++    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
++       frame fields spelled `f->`. */
++    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
++       frame fields spelled `f->`. */
++    /* The arms below are copies of the monolith's `L_ROP_*` bodies with the
++       frame fields spelled `f->`. */
      switch (op) {
  
          case ROP_load_i32:
-@@ -28892,12 +28869,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28059,12 +27998,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      JSAtom atom = RD_U32();
                      int s = RD_REG();
                      int flags = RD_U8();
@@ -489,7 +458,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      REGVM_NEXT();
                  }
  
-@@ -29115,19 +29088,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28264,19 +28199,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                          goto exception;
                      REGVM_NEXT();
                  }
@@ -512,7 +481,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (JS_VALUE_GET_TAG(regs[o]) == JS_TAG_OBJECT) {
                          JSObject *po = JS_VALUE_GET_OBJ(regs[o]);
                          if (likely(!po->is_exotic)) {
-@@ -29194,8 +29163,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28343,8 +28274,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int o = RD_REG();
                      int key = RD_REG();
                      int v = RD_REG();
@@ -522,7 +491,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (JS_DefinePropertyValueValue(ctx, regs[o], js_dup(regs[key]),
                                                      val, JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                          goto exception;
-@@ -29263,15 +29231,11 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28412,15 +28342,11 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
       {
                      int o = RD_REG();
                      int p2 = RD_REG();
@@ -540,7 +509,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      REGVM_NEXT();
                  }
  
-@@ -29279,12 +29243,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28428,12 +28354,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
       {
                      int d = RD_REG();
                      int s = RD_REG();
@@ -554,7 +523,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      SET_REG(d, proto);
                      REGVM_NEXT();
                  }
-@@ -29523,11 +29485,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28659,11 +28583,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                              JS_FreeValue(ctx, iter);
                          }
                      }
@@ -568,7 +537,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      REGVM_NEXT();
                  }
                  /*
-@@ -29600,10 +29559,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -28736,10 +28657,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      JSValue *sp = &regs[w + 3];
                      if (js_append_enumerate(ctx, sp))
                          goto exception;
@@ -578,8 +547,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 -                    regs[w + 2] = JS_UNDEFINED;
                      REGVM_NEXT();
                  }
-                 /*
-@@ -29782,6 +29737,39 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                 /* The with family. Each is a two-armed branch: if the name is
+@@ -28913,6 +28830,39 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      REGVM_NEXT();
                  }
  
@@ -619,7 +588,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          case ROP_with_get_ref:
          case ROP_with_get_ref_undef:
          case ROP_with_make_ref:
-@@ -29882,10 +29870,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29012,10 +28962,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      }
                      if (JS_IsException(ret_val))
                          goto exception;
@@ -630,7 +599,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      SET_REG(d, ret_val);
                      REGVM_NEXT();
                  }
-@@ -29896,10 +29880,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29026,10 +28972,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int home = RD_REG();
                      if (JS_AddBrand(ctx, regs[o], regs[home]) < 0)
                          goto exception;
@@ -641,7 +610,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      REGVM_NEXT();
                  }
  
-@@ -29909,15 +29889,11 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29039,15 +28981,11 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int o = RD_REG();
                      int k = RD_REG();
                      int v = RD_REG();
@@ -662,7 +631,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      SET_REG(d, obj);
                      if (unlikely(ret < 0))
                          goto exception;
-@@ -29929,12 +29905,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29059,12 +28997,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int o = RD_REG();
                      int v = RD_REG();
                      int k = RD_REG();
@@ -677,7 +646,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (unlikely(ret < 0))
                          goto exception;
                      REGVM_NEXT();
-@@ -29957,10 +29929,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29087,10 +29021,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int o = RD_REG();
                      int k = RD_REG();
                      JSValue val = JS_GetPrivateField(ctx, regs[o], regs[k]);
@@ -688,7 +657,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (JS_IsException(val))
                          goto exception;
                      SET_REG(d, val);
-@@ -29975,17 +29943,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29105,17 +29035,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      JSValue v2;
                      if (likely(JS_VALUE_GET_TAG(regs[s]) == JS_TAG_INT)) {
                          uint32_t i2 = (uint32_t)JS_VALUE_GET_INT(regs[s]);
@@ -709,7 +678,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (JS_IsException(v2))
                          goto exception;
                      SET_REG(d, v2);
-@@ -29997,11 +29963,9 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29127,11 +29055,9 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int d = RD_REG();
                      int p2 = RD_REG();
                      int f2 = RD_REG();
@@ -724,21 +693,22 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      SET_REG(d, js_regexp_constructor_internal(ctx, JS_UNDEFINED, pat, fl));
                      if (JS_IsException(regs[d]))
                          goto exception;
-@@ -30053,11 +30017,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29179,13 +29105,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                     SET_REG(d, val);
                      REGVM_NEXT();
                  }
-                 /*
+-                /*
 -                 * Dynamic import. js_dynamic_import borrows its operands -- the
 -                 * stack VM frees its two slots after the call -- so both registers
 -                 * are released here, and the destination is released before the
 -                 * promise is stored (the allocator may have put it on one of the
 -                 * operands).
-+                 * Dynamic import borrows its operands. Registers retain ownership
-+                 * until overwritten or the frame is released.
-                  */
+-                 */
++                /* Dynamic import borrows its operands. */
  
          case ROP_dynamic_import:
-@@ -30068,10 +30029,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+      {
+@@ -29195,10 +29115,6 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      JSValue val = js_dynamic_import(ctx, regs[spec], regs[opts]);
                      if (JS_IsException(val))
                          goto exception;
@@ -749,7 +719,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      SET_REG(d, val);
                      REGVM_NEXT();
                  }
-@@ -30157,21 +30114,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29280,21 +29196,15 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int e = RD_REG();
                      JSValue new_error = regs[e];
                      JSValue error_state = regs[s];
@@ -772,7 +742,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      }
                      REGVM_NEXT();
                  }
-@@ -30180,9 +30131,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29303,9 +29213,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
       {
                      int s = RD_REG();
                      JSValue error_state = regs[s];
@@ -783,7 +753,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                          goto exception;
                      }
                      REGVM_NEXT();
-@@ -30473,14 +30423,12 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -29582,14 +29491,12 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                      int ab = RD_REG();
                      int na = RD_U8();
                      int k;
@@ -803,13 +773,13 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (JS_IsException(ret_val))
                          goto exception;
                      SET_REG(d, ret_val);
-@@ -51958,6 +51906,15 @@ static __exception int compute_stack_size(JSContext *ctx,
+@@ -51029,6 +50936,15 @@ static __exception int compute_stack_size(JSContext *ctx,
  #define REGVM_KNOB(name) ((const char *)0)
  #endif
  
-+/* P4 homes experiment modes: 0 counts only, 1 materializes split/copy SSA
-+   values with the ordinary allocator, 2 enables fixed homes, 3 also allows
-+   transfer-at-last-use from a home (H4a), and 5 compacts used homes (H4b). */
++/* Variable-home modes: 0 counts only, 1 materializes split/copy SSA values
++   with the ordinary allocator, 2 enables fixed homes, 3 also allows
++   transfer-at-last-use from a home, and 5 compacts used homes. */
 +static int regvm_homes_mode(void)
 +{
 +    const char *mode = REGVM_KNOB("REGVM_HOMES");
@@ -819,7 +789,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  /*
   * The encoder's read-back pass re-decodes every instruction it just emitted and
   * compares every operand against the IR, then rebuilds the branch-target set.
-@@ -52356,6 +52313,8 @@ typedef struct JSRegIR {
+@@ -51370,6 +51286,8 @@ typedef struct JSRegIR {
  #define REGVM_ORIG_LOWER 0xFE   /* lowering, opcode not recorded */
  #define REGVM_ORIG_PHI   0xFD   /* an edge's parallel copy */
  #define REGVM_ORIG_CYCLE 0xFC   /* the copy that breaks a cycle */
@@ -828,7 +798,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  #ifdef QJS_REGVM_COUNT
  extern uint64_t js_regvm_move_by_origin[256];
  extern uint64_t js_regvm_moves_win;
-@@ -53382,108 +53341,14 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
+@@ -52319,108 +52237,14 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
      case OP_delete: ADD(ROP_delete, dst, pop[0], pop[1]); return 0;
      case OP_nop: return 0;
  
@@ -944,13 +914,13 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          return 0;
  
      /* frame reads */
-@@ -54952,6 +54817,34 @@ static int regvm_retarget_branch(JSRegIR *ir, int32_t target)
+@@ -53729,29 +53553,61 @@ static int regvm_retarget_branch(JSRegIR *ir, int32_t target)
   */
  #define REGVM_FOLD_SCAN 64
  
-+/* Count both explicit IR operands and values that flow directly into a phi.
-+   Phi inputs do not necessarily produce edge-copy instructions, so counting
-+   only the finished stream can otherwise make a multi-use value look unique. */
++/* Count both explicit IR operands and values that flow directly into a phi:
++   a phi input may produce no edge copy, so the finished stream alone can make
++   a multi-use value look unique. */
 +static void regvm_count_uses(const JSRegIR *ir, int n_values,
 +                             const uint8_t *phi_uses, uint8_t *nref,
 +                             uint8_t limit)
@@ -976,11 +946,9 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +    }
 +}
 +
- /*
-  * Transfer at last use. A source with no reference other than its definition and
-  * this store is dead once the store completes, so the store can move the
-@@ -54961,24 +54854,28 @@ static int regvm_retarget_branch(JSRegIR *ir, int32_t target)
-  */
+ /* Transfer at last use: a source referenced only by its definition and this
+    store is dead after the store, so the store moves the reference instead of
+    duplicating it. */
  static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
                                          int n_values, const uint8_t *phi_in,
 +                                        const uint8_t *phi_uses,
@@ -1010,7 +978,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      for (i = 0; i < n_values; i++)
          lastu[i] = -1;
      for (i = 0; i < n; i++) {
-@@ -54988,8 +54885,6 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
+@@ -53761,8 +53617,6 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
                  continue;
              v = ir->insns[i].ops[k];
              if (v >= 0 && v < n_values) {
@@ -1019,7 +987,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  lastu[v] = i;
              }
          }
-@@ -55023,6 +54918,11 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
+@@ -53793,6 +53647,11 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
              continue;
          }
          v = in->ops[vi];
@@ -1028,10 +996,10 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +        if (home_mode < 3 && home_of && v >= 0 && v < n_values &&
 +            home_of[v] >= 0)
 +            continue;
-         /*
-          * A phi input is a use that may leave no operand behind: when the phi
-          * coalesced with its input the encoder emits no edge move, so the input
-@@ -55067,13 +54967,14 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
+         /* A coalesced phi input gets no edge move, so it looks dead by
+            reference count while the phi's register is still its storage. Never
+            transferred. */
+@@ -53825,13 +53684,14 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
  }
  
  static int regvm_fold_slot(const JSFunctionDef *fd, const JSRegIR *ir,
@@ -1048,7 +1016,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          return 0;
      a_i = ri[v * 2];
      a_p = rp[v * 2];
-@@ -55112,27 +55013,30 @@ static int regvm_fold_slot(const JSFunctionDef *fd, const JSRegIR *ir,
+@@ -53870,27 +53730,30 @@ static int regvm_fold_slot(const JSFunctionDef *fd, const JSRegIR *ir,
  
  static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
                                     const JSFunctionDef *fd, int *pc_to_insn,
@@ -1076,14 +1044,14 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +    if (!nref || !seen || !ri || !rp || !drop || !remap || !first)
          goto done;
  
-     /* Every register operand of every instruction, so a value's references can
-        be counted and located. A value with more than two -- its definition and
-        one use -- is not foldable and is not tracked further. */
+     /* Every register operand of every instruction. A value with more than two
+        references (its definition and one use) is not foldable and is not
+        tracked further. */
 +    regvm_count_uses(ir, n_values, phi_uses, nref, 3);
      for (i = 0; i < n; i++) {
          const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
          for (k = 0; fmt && fmt[k]; k++) {
-@@ -55140,14 +55044,14 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
+@@ -53898,14 +53761,14 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
              if (fmt[k] != 'r')
                  continue;
              v = ir->insns[i].ops[k];
@@ -1104,7 +1072,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          }
      }
  
-@@ -55157,10 +55061,10 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
+@@ -53915,10 +53778,10 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
  
          if (in->rop != ROP_binary)
              continue;
@@ -1117,7 +1085,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                              &rslot, &rdef))
              rf = 1;
          if (!lf && !rf)
-@@ -55201,6 +55105,7 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
+@@ -53959,6 +53822,7 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
      }
   done:
      js_free(ctx, nref);
@@ -1125,7 +1093,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      js_free(ctx, ri);
      js_free(ctx, rp);
      js_free(ctx, drop);
-@@ -55228,11 +55133,12 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
+@@ -53978,11 +53842,12 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
   */
  static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
                                      const JSFunctionDef *fd, int *pc_to_insn,
@@ -1140,7 +1108,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      unsigned char *read_named = NULL, *drop = NULL;
      int *remap = NULL, *first = NULL;
  
-@@ -55248,7 +55154,7 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
+@@ -53993,7 +53858,7 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
      if (fd->has_eval_call || fd->var_object_idx >= 0 ||
          fd->arg_var_object_idx >= 0)
          return;
@@ -1149,7 +1117,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      read_named = js_mallocz(ctx, (size_t)nslots);
      drop = js_mallocz(ctx, (size_t)n);
      remap = js_malloc(ctx, (size_t)n * sizeof(int));
-@@ -55267,13 +55173,10 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
+@@ -54012,13 +53877,10 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
                  if (v >= 0 && v < nslots && rop != ROP_put_local &&
                      rop != ROP_put_local_xfer && rop != ROP_local_uninit)
                      read_named[v] = 1;
@@ -1164,8 +1132,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  
      for (i = 0; i < n; i++) {
          int slot, v;
-@@ -55341,34 +55244,24 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
-  * instruction-removing passes do.
+@@ -54080,34 +53942,24 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
+  * Remaps pc_to_insn like the other removing passes.
   */
  static void regvm_fuse_local_rmw(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 -                                 int n_pcs, int n_values)
@@ -1204,8 +1172,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  
      for (i = 0; i + 2 < n; i++) {
          JSRegInsn *ld = &ir->insns[i];
-@@ -55494,34 +55387,24 @@ static void regvm_fuse_local_rmw(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
-  * ROP_local_rmw_imm the second half matches.
+@@ -54221,34 +54073,24 @@ static void regvm_fuse_local_rmw(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+  * read-modify-write fold, which creates ROP_local_rmw_imm.
   */
  static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 -                                int n_pcs, int n_values)
@@ -1244,8 +1212,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  
      for (i = 0; i + 1 < n; i++) {
          JSRegInsn *prev = &ir->insns[i], *br = &ir->insns[i + 1];
-@@ -55621,10 +55504,11 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
-  * pc_to_insn the remap for the instruction it drops.
+@@ -54339,10 +54181,11 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+  * not `x + "v"`, and conversions run left first). Remaps pc_to_insn.
   */
  static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
 -                                     int *pc_to_insn, int n_pcs, int n_values)
@@ -1259,7 +1227,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      unsigned char *drop = NULL;
      int *remap = NULL, *first = NULL;
  
-@@ -55632,24 +55516,14 @@ static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
+@@ -54350,24 +54193,14 @@ static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
          return;
      if (REGVM_KNOB("REGVM_NOFOLD"))
          return;
@@ -1286,13 +1254,13 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  
      for (i = 0; i + 1 < n; i++) {
          JSRegInsn *ld = &ir->insns[i], *bn = &ir->insns[i + 1];
-@@ -55852,6 +55726,100 @@ static int regvm_keeps_receiver(int op)
+@@ -54540,6 +54373,100 @@ static int regvm_keeps_receiver(int op)
             op == OP_get_array_el2;
  }
  
-+/* Stack shapers only reorder references already present in the popped
-+   window. Return the source pop index for each pushed slot so the SSA model
-+   can carry those value ids directly, including the intentional duplicates. */
++/* Stack shapers only reorder references already in the popped window. Return
++   the source pop index of each pushed slot so the SSA carries those ids
++   directly, duplicates included. */
 +static int regvm_perm_of(int op, int out)
 +{
 +    static const int8_t dup[]      = { 0, 0 };
@@ -1387,7 +1355,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  static void regvm_pushed(const JSFunctionDef *fd, const uint8_t *bc, int pos,
                           const int *pop, int ns, const int *push_base,
                           const uint8_t *slot_ok, const int *ok_index,
-@@ -55863,6 +55831,15 @@ static void regvm_pushed(const JSFunctionDef *fd, const uint8_t *bc, int pos,
+@@ -54551,6 +54478,15 @@ static void regvm_pushed(const JSFunctionDef *fd, const uint8_t *bc, int pos,
          out[j] = push_base[pos] + j;
          isdef[j] = 1;
      }
@@ -1400,10 +1368,10 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +            }
 +        }
 +    }
-     /*
-      * A kept receiver is an alias of its input and not a new definition, exactly
-      * as a slot read is. Giving it a new value id is what forced the allocator to
-@@ -55919,13 +55896,34 @@ uint64_t js_regvm_ver_values;
+     /* A kept receiver is an alias of its input, like a slot read, so the
+        allocator does not copy it. */
+     if (ns == 2 && regvm_keeps_receiver(bc[pos])) {
+@@ -54595,12 +54531,31 @@ uint64_t js_regvm_ver_values;
  uint64_t js_regvm_ver_homeable;
  uint64_t js_regvm_ver_multi;
  uint64_t js_regvm_ver_none;
@@ -1416,6 +1384,10 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +uint64_t js_regvm_home_slots_after;
  #endif
  
+-/*
+- * The promoted-slot simulation's state. `version_of[v]` is the promoted slot
+- * `v` is a version of; a version of two slots is MULTI.
+- */
 +static void regvm_home_overlap_report(int pos, int k, int cur, int stale)
 +{
 +#ifdef QJS_REGVM_COUNT
@@ -1430,16 +1402,12 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +#endif
 +}
 +
- /*
-  * The promoted-slot simulation's state, bundled so that P4's collection step does
-  * not add an argument to every call site -- it already had ten.
-  *
-- * `version_of[v]` is P4 step 1: which promoted slot `v` is a version of. A value
-+ * `home_of[v]` is P4 step 1: which promoted slot `v` is a version of. A value
-  * that is a version of two slots cannot live in one of their homes (the design's
-  * case A), so it is marked MULTI; a value that is a version of none is ordinary.
-  */
-@@ -55936,25 +55934,58 @@ typedef struct JSRegSlotSim {
++/* The promoted-slot simulation's state. `home_of[v]` is the promoted slot `v`
++   is a version of; a version of two slots is MULTI. */
+ #define REGVM_VERSION_NONE  (-1)
+ #define REGVM_VERSION_MULTI (-2)
+ 
+@@ -54608,25 +54563,58 @@ typedef struct JSRegSlotSim {
      const uint8_t *slot_ok;
      const int *ok_index;
      int *sval;
@@ -1456,9 +1424,9 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 -static void regvm_note_version_raw(int8_t *version_of, int n_values, int v, int k)
 -{
 -    if (!version_of || v < 0 || v >= n_values)
-+/* The state observed at one bytecode step. Keeping the pops and promoted-slot
-+   input here lets the liveness and allocation walks do their local bookkeeping
-+   after the common stack/slot transition has run. */
++/* The state observed at one bytecode step, so the liveness and allocation
++   walks can do their own bookkeeping after the shared stack/slot
++   transition. */
 +typedef struct JSRegStepEv {
 +    int np, ns, depth;
 +    /* `call_method` has two fixed operands plus an 8-bit argument count. */
@@ -1507,7 +1475,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  /* Apply an instruction's write to the promoted-slot state. */
  static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int pos,
                                const int *pop, const int *push_base,
-@@ -55963,6 +55994,15 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
+@@ -54635,6 +54623,15 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
      int role = REGVM_SLOT_NONE, k;
      int *sval = sim->sval;
  
@@ -1523,7 +1491,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      if (!sim->slot_ok)
          return;
      k = regvm_slot_operand(fd, bc, pos, sim->slot_ok, sim->ok_index, &role);
-@@ -55986,8 +56026,14 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
+@@ -54658,8 +54655,14 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
              }
          }
  #endif
@@ -1540,14 +1508,14 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          break;
      case REGVM_SLOT_RMW:
          sval[k] = push_base[pos];
-@@ -55998,6 +56044,86 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
+@@ -54670,6 +54673,86 @@ static void regvm_slot_update(const JSFunctionDef *fd, const uint8_t *bc, int po
      }
  }
  
-+/* One canonical promoted-slot and operand-stack simulation step. The optional
-+   hook runs after result numbering and before the slot update; the encoder uses
-+   that point to lower against the old slot state. All analysis walks use the
-+   same transition and receive the same pre-instruction facts in `ev`. */
++/* One canonical promoted-slot and operand-stack simulation step, shared by
++   every analysis walk. The optional hook runs after result numbering and
++   before the slot update; the encoder lowers against the old slot state
++   there. */
 +static int regvm_sim_step(const JSFunctionDef *fd, const uint8_t *bc, int pos,
 +                          int *scratch, int *pd, const int *push_base,
 +                          JSRegSlotSim *sim, int32_t *pv, uint8_t *pdef,
@@ -1625,9 +1593,9 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +}
 +
  #ifdef QJS_REGVM_COUNT
- /* Instruction adjacency, counted on the finished IR at encode time: the input a
-    fusion pass needs. Static, so nothing has to be allocated or freed. */
-@@ -56033,6 +56159,86 @@ static void regvm_note_blockers(JSFunctionBytecode *cb)
+ /* Instruction adjacency, counted on the finished IR at encode time. */
+ static uint64_t js_regvm_adj[ROP_COUNT * ROP_COUNT];
+@@ -54701,6 +54784,86 @@ static void regvm_note_blockers(JSFunctionBytecode *cb)
  }
  #endif
  
@@ -1714,7 +1682,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                         const uint8_t *bc, int bc_len,
                                         const uint8_t *reuse,
-@@ -56043,11 +56249,16 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -54711,11 +54874,16 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                         const int *out_depth,
                                         const int *pred_off, const int *pred,
                                         const int *succ, const int *push_base,
@@ -1731,7 +1699,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                                         const uint64_t *live_out, int live_words,
                                         const int *ireg, int n_values,
                                         int reg_count, int *p_refused)
-@@ -56070,6 +56281,47 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -54738,6 +54906,47 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      ir.n_insns = 0;
      ir.cap = 0;
      *p_refused = 0;
@@ -1779,7 +1747,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      /*
       * How deep the frame's control stack has to be: the largest net push count
       * over any path, which is what the frame allocates for it. An exception
-@@ -56428,8 +56680,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -55078,8 +55287,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                      int p = pred[k];
                      if (out_depth[p] > i) {
                          int iv = out[out_off[p] + i];
@@ -1790,7 +1758,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      }
                  }
              }
-@@ -56442,8 +56694,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -55092,8 +55301,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                          continue;
                      {
                          int iv = sout[p * ns_ok + i];
@@ -1801,7 +1769,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      }
                  }
              }
-@@ -56530,50 +56782,33 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -55171,50 +55380,33 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              int is_term = (pos + short_opcode_info(bc[pos]).size >= bstart[b + 1]);
              int32_t pv[8];
              uint8_t pdef[8];
@@ -1874,7 +1842,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          }
          if (unencodable)
              break;
-@@ -56614,11 +56849,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -55252,11 +55444,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      }
  
      regvm_fold_frame_reads(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
@@ -1892,7 +1860,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      regvm_fuse_self_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                             n_values, ireg);
      /*
-@@ -56736,7 +56973,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -55369,7 +55563,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
          }
      }
      regvm_elide_dead_stores(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
@@ -1901,7 +1869,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  #if QJS_REGVM_COUNT
      {
          int _i;
-@@ -56754,7 +56991,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+@@ -55387,7 +55581,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
  #endif
      regvm_transfer_dead_sources(ctx, &ir, n_values,
                                  REGVM_KNOB("REGVM_NOPHIIN") ? NULL : phi_in,
@@ -1910,9 +1878,9 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +                                home_of, home_mode, live_out, live_words,
 +                                bstart, n_blocks);
  #ifdef QJS_REGVM_COUNT
-     /* Dump the finished register stream, so the compiler's output can be read
-        statically instead of inferred from counters. Numeric opcodes; the tool
-@@ -57038,6 +57277,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+     /* Dump the finished register stream with numeric opcodes. */
+     if (REGVM_KNOB("REGVM_DUMP")) {
+@@ -55650,6 +55846,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      int *phi_b = NULL, *phi_i = NULL, *scratch = NULL, *push_base = NULL;
      uint8_t *reuse = NULL;
      int *cont = NULL, n_cont = 0;
@@ -1920,17 +1888,17 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      uint8_t *ent_set = NULL, *ent_phi = NULL;
      uint64_t *use_bits = NULL, *alluse_bits = NULL, *phi_use_bits = NULL;
      uint64_t *def_bits = NULL;
-@@ -57057,7 +57297,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -55667,7 +55864,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      uint8_t *slot_ok = NULL, *sset = NULL, *sphi = NULL;
      int *ok_index = NULL, *ok_slot = NULL, *entry_val = NULL;
      int *senc = NULL, *sout = NULL, *sst = NULL;
--    int8_t *version_of = NULL;      /* P4 step 1: value -> promoted slot */
-+    int *home_of = NULL;      /* P4 step 1: value -> promoted slot */
-+    int *home_reg_of_slot = NULL; /* H4b: compact slot -> fixed register */
+-    int8_t *version_of = NULL;      /* value -> promoted slot */
++    int *home_of = NULL;      /* value -> promoted slot */
++    int *home_reg_of_slot = NULL; /* compact slot -> fixed register */
      int n_ver = 0;                  /* its capacity; an upper bound, see below */
      uint8_t *defined = NULL;
      int nslots = 0, ns_ok = 0, n_entry = 0;
-@@ -57071,7 +57312,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -55681,7 +55879,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      int ent_pool = 0, out_pool = 0, phi_counter = 0, n_phis = 0, unreachable = 0;
      int pushes = 0, phi_base = 0, n_pushes = 0, n_values = 0, words = 0;
      long long peak_live = 0;
@@ -1939,16 +1907,16 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  
      if (bc_len <= 0)
          return 0;
-@@ -57079,6 +57320,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -55689,6 +55887,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          JS_ThrowInternalError(ctx, "regvm: function too large for CFG analysis");
          return -1;
      }
 +    home_mode = regvm_homes_mode();
  
-     /*
-      * Defer the finally family. `gosub` pushes a return address and `ret` pops
-@@ -57475,10 +57717,15 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
-        dataflow happened to iterate. */
+     /* The finally family (gosub, ret, nip_catch) keeps its return addresses and
+        sentinels on the frame's control stack, so it is analysed like any other
+@@ -56030,10 +56229,15 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+        deterministically. */
      push_base = js_malloc(ctx, bc_len * sizeof(int));
      reuse = js_mallocz(ctx, bc_len);
 -    if (!push_base)
@@ -1965,12 +1933,12 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      {
          uint8_t *lexical = js_mallocz(ctx, (size_t)(fd->var_count + 1));
          int lb;
-@@ -57715,6 +57962,41 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56247,6 +56451,41 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              }
          }
      }
-+    /* Allocate the P4 home/split ids after instruction results and before
-+       entry values and phis. This keeps every new id stable across phi solving. */
++    /* Allocate the home/split ids after instruction results and before entry
++       values and phis, so they stay stable across phi solving. */
 +    for (b = 0; b < n_blocks; b++) {
 +        if (in_depth[b] < 0)
 +            continue;
@@ -2004,10 +1972,10 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 +            }
 +        }
 +    }
-     /*
-      * The value a promoted slot starts with, numbered after every instruction
-      * result and before the phis: one per promoted slot, in dense-slot order, so
-@@ -57731,21 +58013,15 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+     /* Each promoted slot's entry value, numbered after the instruction results
+        and before the phis: `n_pushes + ok_index[slot]`. */
+     if (ns_ok > 0) {
+@@ -56260,21 +56499,14 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          sst = js_malloc(ctx, (size_t)(ns_ok > 0 ? ns_ok : 1) * sizeof(int));
          sset = js_mallocz(ctx, n_blocks);
          sphi = js_mallocz(ctx, sn);
@@ -2023,9 +1991,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
 -        n_ver = n_pushes + n_entry + n_blocks * ns_ok;
 -        version_of = js_malloc(ctx, (size_t)(n_ver > 0 ? n_ver : 1));
 -        if (!senc || !sout || !sst || !sset || !sphi || !version_of)
-+        /* The version table must cover the final value-id range. Stack phis
-+           are bounded by the total block-entry stack depth (`ent_pool`), while
-+           promoted-slot phis are bounded by one per slot per block. */
++        /* The version table covers the final value-id range: stack phis are
++           bounded by `ent_pool`, slot phis by one per slot per block. */
 +        n_ver = n_pushes + n_entry + ent_pool + n_blocks * ns_ok;
 +        home_of = js_malloc(ctx, (size_t)(n_ver > 0 ? n_ver : 1) * sizeof(*home_of));
 +        if (!senc || !sout || !sst || !sset || !sphi || !home_of)
@@ -2036,7 +2003,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          for (i = 0; i < (int)sn; i++) {
              senc[i] = -1;
              sout[i] = -1;
-@@ -57753,7 +58029,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56282,7 +56514,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          /* block 0 holds each slot's entry value */
          for (i = 0; i < ns_ok; i++) {
              senc[i] = entry_val[ok_slot[i]];
@@ -2045,7 +2012,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          }
          sset[0] = 1;
      }
-@@ -57862,7 +58138,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56383,7 +56615,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          changed = 0;
          /* simulate every reachable block from its current entry state */
          for (b = 0; b < n_blocks; b++) {
@@ -2054,7 +2021,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
              if (d < 0)
                  continue;
              for (i = 0; i < d; i++)
-@@ -57873,16 +58149,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56394,16 +56626,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                   pos += short_opcode_info(bc[pos]).size) {
                  int32_t pv[8];
                  uint8_t pdef[8];
@@ -2078,7 +2045,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
              }
              if (d != out_depth[b]) {
                  JS_ThrowInternalError(ctx, "regvm: CFG depth drifted at pc=%d", bstart[b]);
-@@ -58014,7 +58287,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56535,7 +56764,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                              }
                          } else if (!sphi[b * ns_ok + i]) {
                              senc[b * ns_ok + i] = phi_base + phi_counter++;
@@ -2087,7 +2054,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                                                     senc[b * ns_ok + i], i);
                              sphi[b * ns_ok + i] = 1;
                              changed = 1;
-@@ -58191,14 +58464,35 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56696,14 +56925,35 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                   pos += short_opcode_info(bc[pos]).size) {
                  int32_t pv[8];
                  uint8_t pdef[8];
@@ -2130,7 +2097,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (v < 0 || v >= n_values) {
                          /* not a value the SSA ever defined: refuse rather than
                             index a bitset with it */
-@@ -58211,10 +58505,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56716,10 +56966,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      if (!regvm_bitset_test(seen, v))
                          regvm_bitset_set(U, v);
                  }
@@ -2141,7 +2108,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  /*
                   * A fused receiver read names the slot instead of pushing it,
                   * and a read-modify-write reads the slot it then rewrites: both
-@@ -58224,7 +58514,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56729,7 +56975,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                   */
                  if (prom_k >= 0 && (prom_role == REGVM_SLOT_INTERNAL ||
                                      prom_role == REGVM_SLOT_RMW)) {
@@ -2150,27 +2117,22 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      if (v >= 0 && v < n_values) {
                          regvm_bitset_set(alluse_bits + (size_t)b * words, v);
                          if (!regvm_bitset_test(seen, v))
-@@ -58232,7 +58522,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56737,24 +56983,20 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      }
                  }
                  {
 -                    int top_op = (np > 0) ? scratch[d - np] : -1;
 +                    int top_op = (ev.np > 0) ? ev.pop[0] : -1;
-                     /*
-                      * A stack-shaping opcode copies its operands instead of
-                      * consuming them, so its first result must not reuse an
-@@ -58243,7 +58533,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
-                      * are still live at this point, so the moves are safe in any
-                      * order.
-                      */
+                     /* A stack-shaping opcode copies its operands, emitted as
+                        moves, so its result must not reuse an operand's register
+                        or a later move would read a clobbered value. */
 -                    if (ns > 0 && np > 0 &&
 +                    if (ev.ns > 0 && ev.np > 0 &&
                          regvm_op_kind[bc[pos]] != REG_LOWER_ELIDED)
                          first_op[push_base[pos]] = top_op;
-                     /*
-@@ -58253,13 +58543,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
-                      * what keeps a loop's back-edge value on the phi's register.
-                      */
+                     /* Destructive reuse lets a promoted read-modify-write's
+                        destination take the slot's old register, which keeps a
+                        loop's back-edge value on the phi's register. */
                      else if (prom_k >= 0 && prom_role == REGVM_SLOT_RMW)
 -                        first_op[push_base[pos]] = sst[prom_k];
 +                        first_op[push_base[pos]] = ev.slot_value;
@@ -2184,16 +2146,14 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      int v = pv[i];
                      /* an alias defines nothing here: its value is defined
                         where it was produced */
-@@ -58267,20 +58553,18 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -56762,18 +57004,16 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                          regvm_bitset_set(D, v);
                          regvm_bitset_set(seen, v);
                      }
 -                    scratch[d + i] = v;
                  }
-                 /*
-                  * A promoted read-modify-write is a definition too, but it has
-                  * no operand-stack push to carry it: it defines its own value id.
-                  */
+                 /* A promoted read-modify-write defines its own value id without
+                    a push. */
 -                if (ns == 0 && prom_k >= 0 && prom_role == REGVM_SLOT_RMW) {
 +                if (ev.ns == 0 && prom_k >= 0 && prom_role == REGVM_SLOT_RMW) {
                      int v0b = push_base[pos];
@@ -2206,13 +2166,13 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
              }
          }
  
-@@ -58500,6 +58784,43 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
-            Iterated because an input can be another phi around a loop. */
+@@ -56970,6 +57210,43 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+            */
          for (pass = 0; pass < 8; pass++) {
              int again = 0;
-+            /* Split and home-copy ids inherit the reference class of their
-+               source. Resolve these in the same fixed point as phis because a
-+               source may itself be a stack or slot phi. */
++            /* Split and home-copy ids inherit their source's reference class,
++               resolved in the phi fixed point since a source may itself be a
++               phi. */
 +            for (b = 0; b < n_blocks; b++) {
 +                int d2;
 +                if (in_depth[b] < 0)
@@ -2250,7 +2210,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
              for (b = 0; b < n_blocks; b++) {
                  int depth = in_depth[b], off, any_owned, any_borrow;
                  if (depth < 0)
-@@ -58750,10 +59071,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57197,10 +57474,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          int *order = NULL, *active = NULL, *cnt = NULL, *last_end = NULL;
          int *last_use = NULL, *blk_last = NULL;
          uint8_t *used = NULL, *coal = NULL;
@@ -2265,7 +2225,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          lin = js_malloc(ctx, bc_len * sizeof(int));
          if (!lin)
              goto done;
-@@ -58803,13 +59127,27 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57250,13 +57530,27 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                   pos += short_opcode_info(bc[pos]).size) {
                  int32_t pv[8];
                  uint8_t pdef[8];
@@ -2300,7 +2260,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                      /* an alias is defined elsewhere; only a real definition
                         starts an interval here */
                      if (!pdef[i])
-@@ -58838,10 +59176,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57281,10 +57575,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                          }
                      }
                  }
@@ -2311,7 +2271,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
              }
              for (i = 0; i < in_depth[b]; i++) {
                  if (!ent_phi[ent_off[b] + i])
-@@ -58911,36 +59245,34 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57350,34 +57640,32 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                   pos += short_opcode_info(bc[pos]).size) {
                  int32_t pv[8];
                  uint8_t pdef[8];
@@ -2336,10 +2296,8 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  }
 -                regvm_pushed(fd, bc, pos, scratch + (dd - np), ns, push_base,
 -                             slot_ok, ok_index, sst, pv, pdef);
-                 /*
-                  * A fused receiver read and a read-modify-write read the slot
-                  * without popping it, so their use has to be recorded here too.
-                  */
+                 /* A fused receiver read and a read-modify-write use the slot
+                    without popping it. */
                  {
 -                    int role3 = REGVM_SLOT_NONE;
 -                    int rk3 = regvm_slot_operand(fd, bc, pos, slot_ok, ok_index,
@@ -2364,7 +2322,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
              }
          }
  
-@@ -59014,9 +59346,30 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57451,9 +57739,30 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              }
          }
  
@@ -2396,7 +2354,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  cnt[istart[i]]++;
          }
          {
-@@ -59028,15 +59381,34 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57465,15 +57774,34 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              }
          }
          for (i = 0; i < n_values; i++) {
@@ -2433,7 +2391,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
          for (jj = 0; jj < n_placed; jj++) {
              int vv = order[jj];
              aa = 0;
-@@ -59059,10 +59431,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57495,10 +57823,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                      hv = -1;
              if (hv >= 0) {
                  int hr = ireg[hv];
@@ -2449,7 +2407,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                             iend[hv] == istart[vv]) {
                      /* the operand is consumed by this very instruction, so its
                         register is free here */
-@@ -59079,7 +59454,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57515,7 +57846,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
              }
              }
              if (rr < 0) {
@@ -2459,19 +2417,38 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  while (rr < n_values && used[rr])
                      rr++;
              }
-@@ -59110,7 +59486,10 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
-          * reads the phi and sees the last value written, which is the input --
-          * the right value -- so the loop's exit is unaffected.
+@@ -57533,20 +57865,18 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+         /*
+          * --- back-edge coalescing -------------------------------------------
+          *
+-         * The linear scan places a loop phi before its back-edge input, so the
+-         * hint coalesces the phi with whichever input it meets first -- usually
+-         * the entry value -- and the back edge then carries a copy on every
+-         * iteration. Giving the back-edge input the phi's register instead moves
+-         * that copy to the entry edge, where it runs once.
++         * The linear scan coalesces a loop phi with the input it meets first,
++           usually
++         * the entry value, so the back edge copies every iteration. Giving the
++         * back-edge input the phi's register moves the copy to the entry edge.
+          *
+-         * It is sound only when the phi is not read between the input's
+-         * definition and the end of its block, and that block has exactly one
+-         * successor, the phi's block. Then no path observes the input's value
+-         * where the phi's current value is meant. A block reached after the loop
+-         * reads the phi and sees the last value written, which is the input --
+-         * the right value -- so the loop's exit is unaffected.
++         * Sound only when the phi is not read between the input's definition
++           and the
++         * end of its block, and that block's only successor is the phi's block.
           */
 -        if (ns_ok > 0 && !REGVM_KNOB("REGVM_NOCOAL")) {
-+        /* Fixed homes already place every slot phi and its incoming slot
-+           versions in the same register, so the back-edge copy rewrite is
-+           redundant once H3 is enabled. Keep it for H2's ordinary allocator. */
++        /* Fixed homes already put every slot phi and its incoming versions in
++           one register, so this is only needed without homes. */
 +        if (ns_ok > 0 && home_mode < 2 && !REGVM_KNOB("REGVM_NOCOAL")) {
              for (b = 0; b < n_blocks; b++) {
                  if (in_depth[b] < 0)
                      continue;
-@@ -59156,53 +59535,48 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57589,53 +57919,48 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                   pos += short_opcode_info(bc[pos]).size) {
                                  int32_t pv2[8];
                                  uint8_t pd2[8];
@@ -2549,7 +2526,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                              }
                              if (!seen_def)
                                  continue;               /* not defined here */
-@@ -59276,8 +59650,11 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57699,8 +58024,11 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          if (js_regvm_encode(ctx, fd, bc, bc_len, reuse, n_blocks, bstart, in_depth,
                              ent_off, ent, ent_phi, out_off, out, out_depth,
                              pred_off, pred, succ, push_base,
@@ -2562,7 +2539,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                              max_regs, &refused))
              goto done;
  
-@@ -59392,6 +59769,10 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57810,6 +58138,10 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      js_free(ctx, phi_b);
      js_free(ctx, phi_i);
      js_free(ctx, push_base);
@@ -2573,7 +2550,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      js_free(ctx, cont);
      js_free(ctx, use_bits);
      js_free(ctx, alluse_bits);
-@@ -59414,13 +59795,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57832,13 +58164,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
      js_free(ctx, ok_slot);
      js_free(ctx, entry_val);
  #ifdef QJS_REGVM_COUNT
@@ -2590,7 +2567,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
                  js_regvm_ver_none++;
              else
                  js_regvm_ver_homeable++;
-@@ -59428,10 +59809,11 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+@@ -57846,10 +58178,11 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          js_regvm_ver_values += n_values;
      }
  #endif
@@ -2603,7 +2580,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      js_free(ctx, sset);
      js_free(ctx, sphi);
      return rc;
-@@ -59666,6 +60048,8 @@ static const char *regvm_move_origin_name(int o)
+@@ -58058,6 +58391,8 @@ static const char *regvm_move_origin_name(int o)
      switch (o) {
      case REGVM_ORIG_PHI:   return "phi-copy";
      case REGVM_ORIG_CYCLE: return "cycle-break";
@@ -2612,7 +2589,7 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
      case REGVM_ORIG_LOWER: return "lowering";
      case OP_get_field2:    return "get_field2";
      case OP_dup:           return "dup";
-@@ -59721,6 +60105,17 @@ int js_regvm_count_dump(void)
+@@ -58113,6 +58448,17 @@ int js_regvm_count_dump(void)
              fprintf(stderr, "##SLOT## writes=%llu version-overlaps=%llu\n",
                      (unsigned long long)js_regvm_slot_writes,
                      (unsigned long long)js_regvm_slot_overlaps);
@@ -2630,6 +2607,3 @@ index 9a88a6562076b15b81b653755d9606524b2e1e13..4483a8eb4bbcbc3d7b6e1b7b664c8763
  #endif
              fprintf(stderr, "##BLOCK## bytecode-callee fallbacks=%llu\n",
                      (unsigned long long)js_regvm_fallback_calls);
- 
- typedef struct BCWriterState {
-     JSContext *ctx;

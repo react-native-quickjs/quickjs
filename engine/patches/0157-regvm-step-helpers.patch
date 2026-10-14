@@ -1,298 +1,23 @@
-Subject: adds regvm_step(), a one-instruction-at-a-time entry into the register interpreter
+Subject: Gives every register opcode a one-instruction step form
 
 What this does
-  Gives every register opcode a step form: a function that runs exactly one
-  instruction with the interpreter's semantics and returns the next ip instead
-  of dispatching further. The register interpreter's threaded handlers tail-call
-  into their successor, so they cannot be called for a single instruction; this
-  patch generates a step twin for each from the monolith (non-threaded) handler
-  bodies and adds regvm_step() to dispatch through a regvm_step_table.
-
-  Generated, not hand-written. tools are not shipped; the generator
-  (emit-step.py) reads quickjs.c, extracts each ROP's monolith body, rewrites
-  frame references to the JSRegRun passed in, and emits quickjs-regvm-step.inc,
-  which is #included at the end of js_regvm_execute. Hand-written step forms
-  cover the cases that are not one instruction: return (all three forms),
-  yield/yield_star, await, initial_yield, and the unimplemented-opcode trap.
-
-  QJS_REGVM_STEPCHECK=1 makes the monolith interpreter run every instruction
-  through regvm_step() instead of its own dispatch loop, so the step forms are
-  exercised under the full test262 suite before any native code is generated.
-  That build reproduces the plain register build's test262 result exactly and
-  the same box2d checksum.
+  Gives every register opcode a one-instruction step form.
 
 Why we need it
-  This is phase P1 of .local/aot-regvm-impl-plan.md. Compiled (AOT) code
-  interleaves generated instructions with interpreter instructions, so it needs
-  to run one ROP at a time and regain control after each; regvm_step() is that
-  entry point. The step table also makes coverage explicit:
-  regvm_step_uncovered() returns the count of ROPs with no step form (target 0).
+  Generated code has to interleave its own instructions with interpreted ones and take back control after each, but the register interpreter's handlers tail-call into their successor, so there is no way to run exactly one instruction and return.
 
 What it adds
-  quickjs-regvm-step.inc
-      One regvm_s_<op>() per register opcode plus regvm_step_table[],
-      regvm_step_covered[], regvm_step() and regvm_step_uncovered().
-  quickjs.c
-      Hoists the register-run types and REGVM_COLD_RET/REGVM_STEP_SUSPEND so
-      the step forms compile in a non-threaded build; adds JSRegRun.caller_ctx
-      (throws must use the caller's realm, not the callee's) and
-      JSRegRun.resume_marker (yield/await resume target); adds the STEPCHECK
-      loop at the monolith entry and the QJS_REGVM_STEPCHECK knob.
+  `regvm_step` dispatches through a per-opcode `regvm_step_table`: one function per opcode that runs a single instruction and returns the next `ip`. A generator extracts each opcode's monolith body and rewrites frame references to the run passed in; hand-written forms cover the cases that are not one instruction (return, yield/yield_star, await, initial yield, the unimplemented-opcode trap). `QJS_REGVM_STEPCHECK` routes the monolith interpreter through `regvm_step` so the step forms are exercised by the full suite; `regvm_step_uncovered` reports how many opcodes have no step form.
 
-Nothing here is compiled without -DQJS_REGVM; without it the build is
-unchanged.
-
-diff --git a/quickjs.c b/quickjs.c
-index 8ba7b2b..626f1ea 100644
---- a/quickjs.c
-+++ b/quickjs.c
-@@ -23921,7 +23921,6 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
- #define REGVM_HAS_COUNT(v) JS_VALUE_HAS_REF_COUNT(v)
- #endif
- 
--#if QJS_REGVM_THREAD
- /*
-  * --- P2: the threaded interpreter ---------------------------------------
-  *
-@@ -23970,7 +23969,7 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
-  * Off by default while the conversion is in progress: the default build
-  * compiles none of this and is unchanged.
-  */
--#if QJS_REGVM_ASM
-+#if QJS_REGVM_THREAD && QJS_REGVM_ASM
- #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
- #endif
- 
-@@ -23992,6 +23991,14 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
- 
- typedef struct JSRegRun {
-     JSContext *ctx;
-+    /*
-+     * The caller's realm. The monolith's bodies throw through this rather than
-+     * the callee's `ctx` -- a derived-constructor return check, for example,
-+     * must throw the TypeError in the realm of the code that ran `new C()`.
-+     * The step twins read it here; `regvm_exec_one`'s cold arms use the same
-+     * field so both engines agree.
-+     */
-+    JSContext *caller_ctx;
-     JSFunctionBytecode *b;
-     JSRegPIC *pic;              /* register VM property-cache base for this frame */
-     JSStackFrame *sf;
-@@ -24057,6 +24064,12 @@ typedef struct JSRegRun {
-     int       rcc_prev;         /* record index of the previous instruction */
-     const uint8_t *rcc_ip;      /* its code address, for the report */
- #endif
-+    /*
-+     * The step engine's view of the coroutine resume marker (the monolith keeps
-+     * its own in a local). A yield/await twin compares it against the
-+     * instruction's own address to tell a resume from a fresh suspension.
-+     */
-+    uint8_t *resume_marker;
- } JSRegRun;
- 
- #if REGVM_SLIM_FRAME
-@@ -24102,6 +24115,27 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
- #define REGVM_ARGS  uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx
- #define REGVM_PASS  ip, fr, f, ctx
- 
-+/*
-+ * Returned by `regvm_exec_one` for a *tail call*.
-+ *
-+ * A tail call does a C-level call and then leaves the frame. In the monolith that
-+ * is `goto done` -- leave the activation -- but a record frame has a caller, and
-+ * for it the same thing means "hand this value to my caller". `regvm_t_return_common`
-+ * is exactly that, so the arm sets `f->ret` and returns this sentinel. `NULL` is
-+ * already taken for a throw, and no real instruction pointer is 1.
-+ */
-+#define REGVM_COLD_RET ((uint8_t *)1)
-+
-+/*
-+ * Returned by a `regvm_step` twin that parks the frame (a yield, await, or a
-+ * generator's return). The frame's continuation is in `sf->cur_pc`, the
-+ * handshake slots are filled, and `rf->ret` holds the code the generator
-+ * machinery reads. The caller resumes through the ordinary suspension exit.
-+ */
-+#define REGVM_STEP_SUSPEND ((uint8_t *)2)
-+
-+#if QJS_REGVM_THREAD
-+
- /*
-  * Instruction sizes: one opcode byte plus the format's operands, two bytes per
-  * `r`/`u`/`s` and four per `I`/`c`/`a`, unless the opcode is one of the narrow
-@@ -24751,17 +24785,6 @@ regvm_record_release(JSRuntime *rt, JSRegRun *rec);
- static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
-                                JSContext *ctx);
- 
--/*
-- * Returned by `regvm_exec_one` for a *tail call*.
-- *
-- * A tail call does a C-level call and then leaves the frame. In the monolith that
-- * is `goto done` -- leave the activation -- but a record frame has a caller, and
-- * for it the same thing means "hand this value to my caller". `regvm_t_return_common`
-- * is exactly that, so the arm sets `f->ret` and returns this sentinel. `NULL` is
-- * already taken for a throw, and no real instruction pointer is 1.
-- */
--#define REGVM_COLD_RET ((uint8_t *)1)
--
- static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_cold_slow(REGVM_ARGS)
- {
-     uint8_t *next = regvm_exec_one(ip, fr, f, ctx);
-@@ -27611,6 +27634,14 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
- 
- #endif /* QJS_REGVM_INLOOP_CALL */
- 
-+/*
-+ * P1: the single-instruction entry. Defined by the generated
-+ * quickjs-regvm-step.inc, which is included after js_regvm_execute (the
-+ * RD_* and SET_REG_* macros are still defined there). Declared here because
-+ * the QJS_REGVM_STEPCHECK loop inside js_regvm_execute calls it.
-+ */
-+uint8_t *regvm_step(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx);
-+
- #if QJS_REGVM_ASM
- static __attribute__((used)) int js_regvm_execute(JSRegAsmState *ast)
- #else
-@@ -27717,7 +27748,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-            step. */
-         JSRegFrame *regvm_frame = NULL;
- #endif
--#if QJS_REGVM_THREAD
-+#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
-         /*
-          * Filled once per activation, not per dispatch. The converted handlers
-          * only read these (they write registers through `fr`), and every one of
-@@ -27726,6 +27757,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-          * *pointer* does not move even when its contents do.
-          */
-         JSRegRun run;
-+        run.caller_ctx = caller_ctx;
- #ifdef QJS_REGVM_RCCHECK
-         run.ctx = ctx;
- #endif
-@@ -27765,8 +27797,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-         run.local_buf = local_buf;
-         run.local_count = 0;
-         run.arg_owned = arg_owned;
-+        run.resume_marker = NULL;
-+#if QJS_REGVM_THREAD
-         REGVM_T_CHECK_SIZES();
- #endif
-+#endif
- /*
-  * Register operands are always two bytes. A function-wide width made every
-  * operand decode load the width, compare it and branch -- ten instructions for
-@@ -27907,7 +27942,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-         }
-         sp = regs + b->regvm_reg_count + REGVM_HS - 1;
-         regvm_ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
--#if QJS_REGVM_THREAD
-+#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
-         /*
-          * From here the monolith's control stack *is* the entry record's. It has
-          * to be: the dispatch below sends a cold opcode to the chain, the chain's
-@@ -27919,6 +27954,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-          */
-         run.ctl = regvm_ctl;
-         run.nctl = regvm_nctl;
-+        run.resume_marker = NULL;
- #define regvm_ctl (run.ctl)
- #define regvm_nctl (run.nctl)
- #endif
-@@ -28495,13 +28531,52 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
- #if QJS_REGVM_ASM
-      regvm_stretch:
- #endif
-+#if !QJS_REGVM_STEPCHECK
-         REGVM_NEXT();
-+#endif
-  regvm_resume:
-+#if QJS_REGVM_STEPCHECK
-+        /*
-+         * P1 self-check: the whole dispatch is one regvm_step call per
-+         * instruction. The monolith arms below are unreachable here, but they
-+         * stay compiled so the include and the frame setup are exercised.
-+         */
-+        for (;;) {
-+            uint8_t *nip;
-+
-+            if (regvm_resume_pending) {
-+                rpc = regvm_rpc;
-+                regvm_resume_pending = 0;
-+            }
-+            AOT_PROF_OP(b, rpc);
-+            run.resume_marker = regvm_resume_marker;
-+            nip = regvm_step(rpc, regs, &run, ctx);
-+            regvm_resume_marker = run.resume_marker;
-+            if (nip == NULL) {
-+                ret_val = run.ret;
-+                goto exception;
-+            }
-+            if (nip == REGVM_COLD_RET) {
-+                ret_val = run.ret;
-+                if (likely(!JS_IsException(ret_val)))
-+                    goto done;
-+                goto exception;
-+            }
-+            if (nip == REGVM_STEP_SUSPEND) {
-+                pc = sf->cur_pc;
-+                sp = sf->cur_sp;
-+                ret_val = run.ret;
-+                goto done_generator;
-+            }
-+            rpc = nip;
-+        }
-+#else
-         if (regvm_resume_pending) {
-             rpc = regvm_rpc;
-             regvm_resume_pending = 0;
-         }
-         REGVM_NEXT();
-+#endif
-             L_ROP_load_i8:
-                 { int d = RD_REG(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
-             L_ROP_load_i8_s:
-@@ -31457,6 +31532,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
-     }
- }
- 
-+/*
-+ * P1: the step engine. The generated twins are the monolith's own `L_ROP_*`
-+ * bodies recompiled with `REGVM_NEXT()` = `return rpc`, so each runs exactly
-+ * one instruction. It is included here, while the RD_* and SET_REG_* macros
-+ * and the frame layout are still in scope, and it must compile in every register
-+ * build (STEPCHECK runs the monolith build; compiled code falls back to it).
-+ */
-+#include "quickjs-regvm-step.inc"
-+
- #if QJS_REGVM_THREAD
- /*
-  * One cold instruction against the record.
-@@ -55104,6 +55188,19 @@ static int regvm_homes_mode(void)
- #define QJS_REGVM_THREAD 0
- #endif
- 
-+/*
-+ * The P1 self-check: the monolith's dispatch is replaced by one `regvm_step`
-+ * call per instruction, so every step helper is exercised under test262 before
-+ * any C is generated. Off by default -- it is a test configuration, not a
-+ * shipping one, and it is slower by design (each instruction pays a call).
-+ */
-+#ifndef QJS_REGVM_STEPCHECK
-+#define QJS_REGVM_STEPCHECK 0
-+#endif
-+#if QJS_REGVM_STEPCHECK && QJS_REGVM_THREAD
-+#error "QJS_REGVM_STEPCHECK replaces the monolith dispatch; it cannot be combined with QJS_REGVM_THREAD"
-+#endif
-+
- /*
-  * P3: call and return a register-compiled JS function without leaving the
-  * interpreter. On box2d 77.5% of the interpreter's activations are exactly
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
 new file mode 100644
+index 0000000..0f59830
 --- /dev/null
 +++ b/quickjs-regvm-step.inc
-@@ -0,0 +1,6126 @@
-+/* Generated by .local/regvm-build/emit-step.py -- do not edit.
+@@ -0,0 +1,5958 @@
++/* Generated from the monolith's `L_ROP_*` bodies -- do not edit by hand.
 + * Included by quickjs.c after js_regvm_execute; the RD_* and SET_REG_* macros
 + * are still defined at that point. */
 +
@@ -452,14 +177,10 @@ new file mode 100644
 +                rpc += off;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The same operation with its right operand a constant that is never
-+             * materialised in a register. A pool value is owned by the function
-+             * bytecode and outlives the operation, so it is borrowed directly and
-+             * no reference is duplicated or released -- the string literal in an
-+             * arithmetic loop. An atom is not a value yet; it is made for the
-+             * operation and released after it.
-+             */
++            /* The right operand is a constant never materialised in a register.
++               A pool value is owned by the function bytecode and borrowed; an
++               atom is made into a value for the operation and released after
++               it. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -551,14 +272,9 @@ new file mode 100644
 +                    goto exception;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The with family. Each is a two-armed branch: look the name up in
-+             * the object on top of the stack and, if it is there and not in
-+             * Symbol.unscopables, do the arm's work and jump to the with body;
-+             * otherwise drop the object and fall through to the non-with code.
-+             * Both arms are one instruction here, so "dropping the object" is
-+             * just not using its register any more.
-+             */
++            /* The with family. Each is a two-armed branch: if the name is in
++               the object and not in Symbol.unscopables, do the arm's work and
++               jump to the with body; otherwise fall through. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -578,9 +294,7 @@ new file mode 100644
 +                int d = RD_REG();
 +                int w = RD_REG();
 +                int magic = RD_U16();
-+                /* sp[-3] is the function, sp[-2] the this, sp[-1] the array --
-+                   borrowed, since the stack VM frees its slots only after the
-+                   call returns */
++                /* sp[-3] function, sp[-2] this, sp[-1] array, all borrowed */
 +                JSValue *sp = &regs[w + 3];
 +                ret_val = js_function_apply(ctx, sp[-3], 2, &sp[-2], magic);
 +                if (JS_IsException(ret_val))
@@ -723,12 +437,8 @@ new file mode 100644
 +                SET_REG_P(d, out);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The same operation with a source named as a local slot. The slot
-+             * is borrowed and read before the operation can *rf any user code
-+             * (regvm_num_fast reads its operands, and js_regvm_binary duplicates
-+             * them on entry), so nothing has to stabilize it first.
-+             */
++            /* The same operation with a local-slot source. The slot is read
++               before any user code can run, so it needs no stabilizing. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -769,14 +479,10 @@ new file mode 100644
 +                SET_REG_P(d, out);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * Calls. The arguments were moved into the contiguous window by the
-+             * encoder, so the handler passes the window straight through as the
-+             * callee's rf->argv -- the same borrowed window the stack VM hands over,
-+             * with the same rf->flags. A bytecode callee re-enters JS_CallInternal;
-+             * a native callable takes js_call_c_function_fast. The plain call's
-+             * `this` and every call's rf->new_target are undefined by construction.
-+             */
++            /* Calls. The encoder moved the arguments into a contiguous window,
++               which is passed as the callee's rf->argv with the stack VM's
++               rf->flags. The plain call's `this` and every call's
++               rf->new_target are undefined. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -831,18 +537,9 @@ new file mode 100644
 +                SET_REG_P(d, out);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The immediate arithmetic with its kind in the opcode, so
-+             * regvm_num_fast's switch folds to the one case and only the int
-+             * path and its fallback remain.
-+             *
-+             * The integer case is written out rather than left to the folded
-+             * helper: the helper produces the result *branchlessly*, selecting
-+             * between js_int32 and the float64 it precomputes with scvtf/fmov,
-+             * so the common path paid for an overflow that never happens. Here
-+             * the int result stores straight and the two rare cases branch
-+             * away.
-+             */
++            /* The immediate arithmetic with its kind in the opcode. The int
++               case is written out so the common path stores directly and the
++               two rare cases branch away. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -1084,15 +781,10 @@ new file mode 100644
 +                { int sub = RD_U8(); int la = RD_REG8(); int rb = RD_REG8();
 +                  int32_t off = RD_OFF8();
 +                  REGVM_CMP_BRANCH(regs[la], regs[rb]); }
-+            /*
-+             * The dedicated conditions. Same comparison and branch, with the
-+             * kind in the opcode rather than an operand, so `sub` is a constant
-+             * and the switch inside regvm_int_cmp folds to the one comparison.
-+             * The `n` forms keep REG_CMP_INVERT set rather than naming the
-+             * complementary comparison: IEEE comparisons are not
-+             * complement-closed, and `!(a > b)` is true for NaN where `a <= b`
-+             * is false.
-+             */
++            /* The dedicated conditions: the kind is in the opcode, so `sub` is
++               a constant. The `n` forms keep REG_CMP_INVERT instead of the
++               complementary comparison: `!(a > b)` is true for NaN where `a <=
++               b` is false. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -1190,12 +882,14 @@ new file mode 100644
 +                  REGVM_NEXT(); }
 +            /*
 +             * Suspension. The frame stays in the state and the body is
-+             * re-entered at the suspension point, so the exchange keeps the
-+             * shape the engine expects from the stack VM: the value out is at
-+             * cur_sp[-1], and the resume argument with its magic arrive at
-+             * cur_sp[-1] and cur_sp[0]. What is yielded and what is returned
-+             * are told apart by the code, so a returning body hands over
-+             * JS_UNDEFINED and lets the engine read the value off the frame.
++               re-entered at the
++             * suspension point, with the engine's stack-VM exchange: the value
++               out at
++             * cur_sp[-1], the resume argument and magic in at cur_sp[-1] and
++               cur_sp[0]. A
++             * returning body hands over JS_UNDEFINED and the engine reads the
++               value off
++             * the frame.
 +             */
 + exception:
 +    rf->ret = JS_EXCEPTION;
@@ -1254,9 +948,8 @@ new file mode 100644
 +                { int la = RD_REG8(); int rb = RD_REG8(); int32_t off = RD_OFF8();
 +                  const int sub = REG_BIN_NEQ;
 +                  REGVM_CMP_BRANCH(regs[la], regs[rb]); }
-+/* Kept defined: the cold trampoline's extracted arms for the fused compare
-+   branches use it, and they are emitted after the monolith's own group. */
-+/* #undef REGVM_CMP_BRANCH */
++/* Kept defined: the cold trampoline's arms for the fused compare branches use
++   it. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -1370,9 +1063,8 @@ new file mode 100644
 +                int c = RD_REG();
 +                int ab = RD_REG();
 +                int na = RD_U8();
-+                /* named `oargv`, not `rf->argv`: the activation's own argument
-+                   vector is the parameter `rf->argv`, and the nested-call code
-+                   saves it. */
++                /* `oargv`: `rf->argv` is the activation's own argument vector.
++                   */
 +                JSValue *oargv = &regs[ab];
 +                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
 +#ifdef QJS_REGVM_COUNT
@@ -1411,9 +1103,8 @@ new file mode 100644
 +                int r = RD_REG();
 +                int ab = RD_REG();
 +                int na = RD_U8();
-+                /* named `oargv`, not `rf->argv`: the activation's own argument
-+                   vector is the parameter `rf->argv`, and the nested-call code
-+                   saves it. */
++                /* `oargv`: `rf->argv` is the activation's own argument vector.
++                   */
 +                JSValue *oargv = &regs[ab];
 +                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
 +#ifdef QJS_REGVM_COUNT
@@ -1539,16 +1230,11 @@ new file mode 100644
 +                }
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * for-in. The step's helpers want a stack pointer, so the enumerator
-+             * sits in the window and sp names it; for_in_next writes the two
-+             * values it pushes into the window past it.
-+             */
-+            /*
-+             * for-of. The iterator and its next method are staged in the window
-+             * for the step, and the activation records them so an exception
-+             * leaving the frame can close what it passes.
-+             */
++            /* for-in: the helpers take a stack pointer, so the enumerator sits
++               in the window and for_in_next writes its two values past it. */
++            /* for-of: the iterator and next method are staged in the window,
++               and the activation records them so an exception leaving the frame
++               closes them. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -1967,12 +1653,8 @@ new file mode 100644
 +                int d = RD_REG();
 +                int robj = RD_REG();
 +                int rkey = RD_REG();
-+                /*
-+                 * js_operator_delete's body, against registers instead of a
-+                 * stack: its two operands there are stack temporaries it frees,
-+                 * but here they are SSA values with their own lifetime, so
-+                 * neither is consumed and no window is needed.
-+                 */
++                /* js_operator_delete's body on registers: the operands are SSA
++                   values, so neither is consumed. */
 +                JSAtom atom = JS_ValueToAtom(ctx, regs[rkey]);
 +                int ret;
 +                if (unlikely(atom == JS_ATOM_NULL))
@@ -2051,12 +1733,9 @@ new file mode 100644
 +                REGVM_NEXT();
 +            }
 +
-+            /*
-+             * Explicit resource management. The error state is carried in a
-+             * register: JS_UNINITIALIZED while nothing has thrown, or the
-+             * exception a dispose step produced. Each op mirrors the stack VM's
-+             * cold handler with its operands named.
-+             */
++            /* Explicit resource management. The error state is carried in a
++               register: JS_UNINITIALIZED while nothing has thrown, or the
++               exception a dispose step produced. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -2128,9 +1807,8 @@ new file mode 100644
 + {
 +                int d = RD_REG();
 +                int32_t off = RD_I32();
-+                /* the pushed slot is the return address: it is recorded on the
-+                   control stack, not written to a register, so the value in
-+                   that slot is a sentinel */
++                /* the return address goes on the control stack; the slot is a
++                   sentinel */
 +                (void)d;
 +                if (rf->nctl >= b->regvm_ctl_count) {
 +                    JS_ThrowInternalError(rf->caller_ctx,
@@ -2202,12 +1880,9 @@ new file mode 100644
 +                rf->nctl++;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * stack: iter_obj next catch_offset val -- the call's result
-+             * replaces val and the three below pass through, so the shape is
-+             * 4 -> 4. The catch offset is a control-stack entry here rather
-+             * than a value, so it passes through untouched.
-+             */
++            /* stack: iter_obj next catch_offset val -- the call's result
++               replaces val, so the shape is 4 -> 4. The catch offset is a
++               control-stack entry here. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -2381,8 +2056,7 @@ new file mode 100644
 +                int site = RD_U16();
 +                JSValue val;
 +#ifdef QJS_REGVM_COUNT
-+                /* Can the read IC path pay off here at all? Only where the
-+                   encoder emitted a site. */
++                /* Only where the encoder emitted a site. */
 +                js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
 +#endif
 +                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
@@ -2390,7 +2064,7 @@ new file mode 100644
 +                    REGVM_NEXT();
 +                }
 +                if (site == REG_IC_NONE) {
-+                    /* no site: the generic route, unchanged */
++                    /* no site: the generic route */
 +                    val = JS_GetProperty(ctx, regs[r], atom);
 +                } else {
 +                    val = regvm_get_field_ic(ctx, b, &pic, regs[r], atom, site);
@@ -2451,10 +2125,8 @@ new file mode 100644
 +    JSValue *regs = fr;
 +    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 + {
-+                /* X3b: two reads, two destinations, one dispatch. The second
-+                   receiver is the first destination, so it is read back after
-+                   the first SET_REG -- exactly the value the dropped second
-+                   instruction would have consumed. */
++                /* Two reads, two destinations, one dispatch. The second
++                   receiver is read back after the first SET_REG. */
 +                int d1 = RD_REG();
 +                int r1 = RD_REG();
 +                JSAtom atom1 = RD_U32();
@@ -2524,15 +2196,10 @@ new file mode 100644
 +                JSAtom atom = RD_U32();
 +                int throwing = RD_U8();
 +                JSValue val;
-+                /*
-+                 * The cell cache first, exactly as the stack VM's OP_get_var
-+                 * does before it calls JS_GetGlobalVar. A filled cell has
-+                 * already passed the TDZ test, and both a write of
-+                 * JS_UNINITIALIZED into global_var_obj and any change to the
-+                 * global object's shape bump the generation, so a hit needs no
-+                 * further check. This handler was the register VM's largest
-+                 * remaining per-dispatch engine call.
-+                 */
++                /* The cell cache first, as the stack VM's OP_get_var does. A
++                   filled cell has passed the TDZ test, and both a write of
++                   JS_UNINITIALIZED into global_var_obj and a change to the
++                   global object's shape bump the generation. */
 +                if (likely(js_gv_cell_probe(ctx, atom, &val))) {
 +                    SET_REG_P(d, val);
 +                    REGVM_NEXT();
@@ -2568,12 +2235,9 @@ new file mode 100644
 +                SET_REG_P(d, val);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * `super.prop`: the property is read from the home object with the
-+             * receiver, which is what makes an inherited getter see the derived
-+             * `this`. Mirrors js_cold_get_super_value, whose three stack slots
-+             * are this, the object and the key.
-+             */
++            /* `super.prop`: read from the home object with the receiver, so an
++               inherited getter sees the derived `this`. Mirrors
++               js_cold_get_super_value. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -2920,20 +2584,19 @@ new file mode 100644
 +                int nx = RD_REG();
 +                int k;
 +                /*
-+                 * The entry this loop pushed is the innermost iterator entry.
-+                 * It need not be on top: a finally that is running inside the
-+                 * loop has its continuation above it, and that continuation
-+                 * stays -- it belongs to code still on the stack, and the ret
-+                 * that ends it pops it. So the entry is found, and the entries
-+                 * above it move down over the gap the removal leaves.
++                 * The entry this loop pushed is the innermost iterator entry,
++                   but not
++                 * necessarily on top: a finally running inside the loop has its
++                   continuation
++                 * above it, and that stays. So the entry is found, and the
++                   entries above it
++                 * move down over the gap.
 +                 *
-+                 * Whether there is anything to close is the *entry's* answer,
-+                 * not the register's: the iterator value reached here through
-+                 * the loop's window, which is a copy the allocator need not have
-+                 * placed in the same register the step cleared. An entry whose
-+                 * iterator was forgotten by the step is one the loop already
-+                 * exhausted, which the stack VM expresses by clearing the single
-+                 * slot it has.
++                 * Whether there is anything to close is the entry's answer, not
++                   the
++                 * register's: the register holds a copy the allocator may have
++                   placed
++                 * elsewhere.
 +                 */
 +                for (k = rf->nctl - 1; k >= 0; k--)
 +                    if (rf->ctl[k].kind == REG_CTL_ITER)
@@ -2958,15 +2621,15 @@ new file mode 100644
 +                REGVM_NEXT();
 +            }
 +            /*
-+             * OP_drop of a control-stack sentinel. The stack VM's sentinel is a
-+             * stack value and dropping it just discards the tag; here the
-+             * sentinel is the control-stack entry, so dropping it removes that
-+             * record. A for-of's entry owns the iterator and next method it
-+             * recorded, so those are released; a try's entry owns nothing.
-+             * Neither loses an iterator that is still open: the only code that
-+             * drops a sentinel by hand is a try about to *rf its finally (which
-+             * has no iterator of its own) and a delegation driving the iteration
-+             * protocol itself.
++             * OP_drop of a control-stack sentinel removes that entry. A
++               for-of's entry
++             * owns the iterator and next method it recorded, so those are
++               released; a
++             * try's entry owns nothing. The only code that drops a sentinel by
++               hand is a
++             * try about to run its finally and a delegation driving the
++               iteration
++             * protocol, so no open iterator is lost.
 +             */
 + exception:
 +    rf->ret = JS_EXCEPTION;
@@ -2989,15 +2652,11 @@ new file mode 100644
 +                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
 +                      goto exception;
 +                  }
-+                  /*
-+                   * The helper clears the iterator slot when the step reported
-+                   * done -- including when `next` or the value step threw, which
-+                   * is how the stack VM's unwind ends up with nothing to close.
-+                   * The close entry holds its own reference to the iterator, so
-+                   * it has to be forgotten here too: otherwise an exception
-+                   * unwinding out of the loop would call `return` on an iterator
-+                   * whose own step threw, which the corpus says must not happen.
-+                   */
++                  /* The helper clears the iterator slot when the step reported
++                     done, including when `next` or the value step threw. The
++                     close entry holds its own reference, so it is forgotten
++                     too: an iterator whose own step threw must not have
++                     `return` called. */
 +                  if (JS_IsUndefined(regs[w]))
 +                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
 +                  REGVM_NEXT(); }
@@ -3062,30 +2721,23 @@ new file mode 100644
 +                      goto exception;
 +                  }
 +                  SET_REG_P(w + 3, tmp[3]);
-+                  /*
-+                   * On done the helper releases the iterator at sp[-4] and
-+                   * writes nothing in its place. The temporary window owns
-+                   * those stack-shaped mutations; the source registers remain
-+                   * live for any other aliases. The replacement result is at
-+                   * sp[-1] and the done flag is at sp[0].
-+                   */
++                  /* On done the helper releases the iterator at sp[-4] and
++                     writes nothing in its place; the window absorbs that, and
++                     the source registers stay live. The result is at sp[-1] and
++                     the done flag at sp[0]. */
 +                  SET_REG_P(w + 4, tmp[4]);
 +                  if (JS_ToBool(ctx, tmp[4])) {
-+                      /* the slot is cleared, so nothing is left to close: the
-+                         window's iterator register reads undefined, which the
-+                         lowering copies back to the loop's iterator slot so
-+                         the trailing async close skips return() (spec:
-+                         AsyncIteratorClose does not *rf on normal completion) */
++                      /* The slot is cleared, so nothing is left to close: the
++                         lowering copies the undefined iterator back so the
++                         trailing async close skips return() (AsyncIteratorClose
++                         does not run on normal completion). */
 +                      SET_REG_P(w, JS_UNDEFINED);
 +                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
 +                  }
 +                  JS_FreeValue(ctx, tmp[0]);
 +                  REGVM_NEXT(); }
-+            /*
-+             * stack: iter_obj next catch_offset val. The helper reaches the
-+             * iterator at sp[-4], the argument at sp[-1], and writes the flag
-+             * it returns at sp[0]; the window holds the four with sp above.
-+             */
++            /* stack: iter_obj next catch_offset val. The helper reads sp[-4]
++               and sp[-1] and writes its flag at sp[0]. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -3173,12 +2825,9 @@ new file mode 100644
 +                SET_REG_P(d3, ret_val);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * await. The async machinery leaves the resolved value where the
-+             * awaited operand was -- one value, no companion -- and does not
-+             * move the frame's stack pointer, so this is yield's shape minus
-+             * the second slot.
-+             */
++            /* await: the resolved value replaces the awaited operand and the
++               frame's stack pointer does not move, so this is yield's shape
++               minus the second slot. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -3221,13 +2870,9 @@ new file mode 100644
 +                    SET_REG_P(d, JS_AtomToValue(ctx, idx));
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * Property keys. The stack VM converts the top of its stack in
-+             * place; here the source is an SSA value with its own lifetime, so
-+             * the conversion produces a new value into the destination instead
-+             * of consuming the source. The common case -- an int, string or
-+             * symbol is already a key -- is a copy.
-+             */
++            /* Property keys. The source is an SSA value with its own lifetime,
++               so the conversion writes a new value to the destination instead
++               of consuming the source. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -3327,18 +2972,13 @@ new file mode 100644
 +    JSValue *regs = fr;
 +    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 + {
-+                /*
-+                 * A non-strict function's `this` is coerced on the way in:
-+                 * null and undefined become the global object and a primitive
-+                 * is boxed. The stack VM does this where it pushes `this`, so
-+                 * the coercion belongs to this instruction, not to the frame.
-+                 */
++                /* A non-strict function's `this` is coerced here (null and
++                   undefined become the global object, a primitive is boxed),
++                   where the stack VM pushes it. */
 +                int d = RD_REG();
-+                /*
-+                 * rf->this_obj and the global object outlive the instruction -- the
-+                 * frame owns one, the runtime the other -- so those cases only
-+                 * borrow. Boxing a primitive is the ordering edge that makes a
-+                 * new reference, and it can allocate and throw. */
++                /* rf->this_obj and the global object outlive the instruction,
++                   so they are borrowed; boxing a primitive makes a new
++                   reference and can throw. */
 +                if (!b->is_strict_mode) {
 +                    uint32_t tag = JS_VALUE_GET_TAG(rf->this_obj);
 +                    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
@@ -3457,12 +3097,8 @@ new file mode 100644
 +                  if (sub & REG_RMW_UNARY) {
 +                      int u = sub & ~REG_RMW_UNARY;
 +                      JSValue v = rf->var_buf[slot];
-+                      /*
-+                       * The int case, inline: js_regvm_unary is a call, and the
-+                       * numeric increment is the most common read-modify-write
-+                       * there is. The bounds are the ones the stack VM's
-+                       * inc_loc/dec_loc go slow at.
-+                       */
++                      /* The int case inline, with the stack VM's
++                         inc_loc/dec_loc bounds. */
 +                      if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
 +                          int32_t iv = JS_VALUE_GET_INT(v);
 +                          if (u == REG_UN_INC ? iv != INT32_MAX
@@ -3500,20 +3136,15 @@ new file mode 100644
 +    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 +
 +                /* `slot = slot <subop> imm`, the generic operation, so a string
-+                   local still concatenates. The slot is borrowed (js_regvm_binary
-+                   duplicates its operands) and the result takes the slot's
-+                   reference. */
++                   local still concatenates. The slot is borrowed and the result
++                   takes its reference. */
 +                { int sub = RD_U8(); int slot = RD_U16(); int32_t imm = RD_I32();
 +                  JSValue out;
 +                  if (sub & REG_RMW_UNARY) {
 +                      int u = sub & ~REG_RMW_UNARY;
 +                      JSValue v = rf->var_buf[slot];
-+                      /*
-+                       * The int case, inline: js_regvm_unary is a call, and the
-+                       * numeric increment is the most common read-modify-write
-+                       * there is. The bounds are the ones the stack VM's
-+                       * inc_loc/dec_loc go slow at.
-+                       */
++                      /* The int case inline, with the stack VM's
++                         inc_loc/dec_loc bounds. */
 +                      if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
 +                          int32_t iv = JS_VALUE_GET_INT(v);
 +                          if (u == REG_UN_INC ? iv != INT32_MAX
@@ -3533,30 +3164,15 @@ new file mode 100644
 +                  }
 +                  set_value(ctx, &rf->var_buf[slot], out);
 +                  REGVM_NEXT(); }
-+            /*
-+             * The numeric fast path is inlined here for the same reason the
-+             * standalone compare inlines it: regvm_cmp_take takes its operands
-+             * by value and is a real call, and paying one per iteration costs
-+             * more than the dispatch the fusion removes.
-+             *
-+             * Only the integer case is inline here, and only through
-+             * regvm_int_cmp. This macro expands once per fused form, so
-+             * whatever it inlines is multiplied by the number of forms: a
-+             * version that inlined the whole of regvm_num_fast quadrupled a
-+             * large function inside the interpreter, and a later version that
-+             * inlined a small switched double comparator into every form --
-+             * measured on box2d at 4.31 G instructions, then 4.45 G with it and
-+             * the element fast path together -- grew the function and its
-+             * spill traffic by more than the call it removed. Everything but
-+             * the integer pair goes out of line, where the coercion and the
-+             * error cases live.
-+             */
++            /* Only the integer pair is compared inline, through regvm_int_cmp.
++               This macro expands once per fused form, so anything larger
++               multiplies the interpreter's size and spill traffic; the rest
++               goes out of line. */
 +#define REGVM_CMP_BRANCH(a_, b_) do { \
 +                  JSValue _a = (a_), _b = (b_); int take, _r = -1; \
-+                  /* L3b: the fused strict compare against a just-loaded \
-+                     undefined. A single tag test replaces the comparison; the \
-+                     sub-op is only ever emitted by regvm_fuse_branches, which \
-+                     guarantees the other operand is the one to test. */ \
++                  /* The fused strict compare against a just-loaded undefined: a \
++                     single tag test, on the operand regvm_fuse_branches \
++                     guarantees. */ \
 +                  if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
 +                      if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
 +                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
@@ -3808,10 +3424,9 @@ new file mode 100644
 +    JSValue *regs = fr;
 +    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 +
-+                /* The source is dead here: move its reference rather than
-+                   duplicating it, and empty the source's register. Under
-+                   deferred RC the register only borrows, so this is a plain
-+                   copy and nothing is released. */
++                /* The source is dead here: move it and empty the source
++                   register. Registers only borrow under deferred RC, so nothing
++                   is released. */
 +                { int d = RD_REG(); int s = RD_REG();
 +                  if (d != s) {
 +#if QJS_DRC
@@ -3976,15 +3591,14 @@ new file mode 100644
 +                int d = RD_REG();
 +                int src = RD_REG();
 +                /*
-+                 * The sentinel this removes is the catch handler the try region
-+                 * pushed. A for-of's sentinel is a close entry, and the stack
-+                 * VM's nip_catch removes the catch offset whatever pushed it --
-+                 * but here that entry is also the unwinder's record that the
-+                 * loop is open, so it is left in place: the OP_iterator_close
-+                 * that follows in the abrupt-completion path closes the iterator
-+                 * and takes the entry with it, and if an exception happens in
-+                 * between, the unwinder still closes it. Only the value the
-+                 * return carries is produced here.
++                 * The sentinel this removes is the try region's catch handler.
++                   A for-of's
++                 * close entry is also the unwinder's record that the loop is
++                   open, so it is
++                 * left in place: the OP_iterator_close that follows closes the
++                   iterator and
++                 * takes the entry with it. Only the value the return carries is
++                   produced here.
 +                 */
 +                if (rf->nctl > 0 && rf->ctl[rf->nctl - 1].kind == REG_CTL_CATCH)
 +                    --rf->nctl;
@@ -4042,9 +3656,8 @@ new file mode 100644
 +                               (int)tpl->prop_count == n)) {
 +                        for (i2 = 0; i2 < n; i2++) {
 +#if QJS_DRC
-+                            /* The register only borrows its value: the property
-+                               has to take its own reference. Clearing the
-+                               register releases nothing. */
++                            /* The register only borrows: the property takes its
++                               own reference. */
 +                            set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
 +                            vals[i2] = JS_UNDEFINED;
 +#else
@@ -4059,8 +3672,8 @@ new file mode 100644
 +                    JSValue v2 = vals[i2];
 +                    vals[i2] = JS_UNDEFINED;
 +#if QJS_DRC
-+                    /* Owned transfer: duplicate the borrowed register value so
-+                       the property takes its own reference. */
++                    /* Owned transfer: duplicate the borrowed register value for
++                       the property. */
 +                    if (JS_DefinePropertyValue(ctx, regs[o],
 +                                               js_objlit_template_atom(tpl, i2), js_dup(v2),
 +                                               JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
@@ -4112,12 +3725,8 @@ new file mode 100644
 +                SET_REG_P(d, val);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * Borrowed frame read + inline-cached named field read, the pair
-+             * the fused local/argument receiver opcodes lower to. The slot is
-+             * read, not copied: the frame owns it for its lifetime, exactly as
-+             * the stack interpreter's borrow-fusion reads it.
-+             */
++            /* Borrowed frame read plus inline-cached named field read. The
++               frame owns the slot for its lifetime. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -4230,13 +3839,10 @@ new file mode 100644
 +                    goto exception;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The transfer form: the value is dead here, so the reference moves
-+             * into the container. JS_SetPropertyValue takes ownership of the
-+             * value it is handed, on success and on the throw path, so the source
-+             * is emptied without freeing it again. The key is still duplicated
-+             * because it may be read again.
-+             */
++            /* The transfer form: the value's reference moves into the
++               container. JS_SetPropertyValue takes ownership on success and on
++               throw. The key is still duplicated because it may be read again.
++               */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -4292,13 +3898,8 @@ new file mode 100644
 +                JSAtom atom = RD_U32();
 +                int site = RD_U16();
 +                int v = RD_REG();
-+                /*
-+                 * JS_PROP_THROW_STRICT, not JS_SetProperty's unconditional
-+                 * throw: a write to a read-only property is a silent no-op in
-+                 * sloppy code and a TypeError in strict code, and the stack
-+                 * VM's cold handler asks for exactly this. The receiver is the
-+                 * object itself, as there.
-+                 */
++                /* JS_PROP_THROW_STRICT: a write to a read-only property is a
++                   no-op in sloppy code and a TypeError in strict code. */
 +                {
 +                    if (JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
 +                        JSObject *p = JS_VALUE_GET_OBJ(regs[r]);
@@ -4323,15 +3924,11 @@ new file mode 100644
 +                    goto exception;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The transfer form: the value is dead here, so the reference moves
-+             * into the object rather than being duplicated and then released.
-+             * JS_SetPropertyInternal2 takes ownership of the value it is handed,
-+             * on success and on the throw path, so the source is emptied without
-+             * freeing it again. Only emitted when there is no inline cache: the
-+             * cached path borrows its value (it duplicates it itself), so a
-+             * transfer there would save nothing.
-+             */
++            /* The transfer form: the value is dead here, so its reference moves
++               into the object. JS_SetPropertyInternal2 takes ownership on
++               success and on throw, so the source is emptied without freeing.
++               Only emitted without an inline cache, whose path duplicates the
++               value itself. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -4367,26 +3964,15 @@ new file mode 100644
 +                REGVM_NEXT();
 +            }
 +            /*
-+             * The stack VM's `OP_get_array_el`, for a register operand triple.
-+             * The handler used to hand every element load to
-+             * `JS_GetPropertyValue`, which does have a fast-array path -- but
-+             * behind a call, and behind a `switch (p->class_id)` over every
-+             * fast-array class in the engine. On box2d that made the common
-+             * case, a plain array with an int index, the most expensive
-+             * instruction the register VM executed per call: the element load
-+             * is 1.5% of dispatches and `JS_GetPropertyValueConst` was 6.6% of
-+             * all native instructions.
-+             *
-+             * The shape is the stack handler's: test the plain array inline,
-+             * then let `js_get_fast_array_element` have the other classes, then
-+             * the generic path. A hole falls through both, because a hole must
-+             * still see the prototype chain.
-+             *
-+             * Both operands are borrowed -- the registers keep their
-+             * references -- and the result is a new reference. The key is not
-+             * duplicated: `JS_GetPropertyValueConst` never frees its property
-+             * argument, which is the same reason the stack VM's
-+             * `OP_get_arg8_array_el` can borrow an argument slot for it.
++             * Element load: a plain array with an int index inline, then
++             * `js_get_fast_array_element` for the other fast classes, then the
++               generic
++             * path. A hole falls through both, because it must see the
++             prototype chain. *
++             * Both operands are borrowed and the result is a new reference.
++             * `JS_GetPropertyValueConst` never frees its property argument, so
++               the key is
++             * not duplicated.
 +             */
 + exception:
 +    rf->ret = JS_EXCEPTION;
@@ -4466,8 +4052,7 @@ new file mode 100644
 +    JSValue *regs = fr;
 +    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 +
-+                /* The source is dead here: the binding takes its reference, as
-+                   the stack interpreter's put transfers the value it popped.
++                /* The source is dead here: the binding takes its reference.
 +                   Under deferred RC the register only borrows, so the binding
 +                   duplicates it. */
 +                { int slot = RD_U16(); int s = RD_REG();
@@ -4719,12 +4304,9 @@ new file mode 100644
 +                    --rf->nctl;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * stack: iter_obj next catch_offset result -- the helper is
-+             * stack-shaped, reading the result at sp[-1] and, on done, the
-+             * iterator at sp[-4]. The window holds that four with sp above it,
-+             * which is the layout ROP_iter_next leaves behind.
-+             */
++            /* stack: iter_obj next catch_offset result -- the helper reads the
++               result at sp[-1] and, on done, the iterator at sp[-4], the layout
++               ROP_iter_next leaves. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -4792,12 +4374,9 @@ new file mode 100644
 +                    goto exception;
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * Classes. Each is the stack VM's handler with the operands named
-+             * directly, so the same helpers *rf in the same order; a definition
-+             * consumes the function it is given (and the key, when the name is
-+             * computed), as it does there.
-+             */
++            /* Classes: the stack VM's handlers with the operands named
++               directly. A definition consumes the function it is given (and the
++               key, when computed). */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -5001,13 +4580,9 @@ new file mode 100644
 +                SET_REG_P(d, out);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The in-place forms, emitted only when dst and src are the same
-+             * register. The value being overwritten is the one just loaded and,
-+             * on the fast path, already proven to be a JS_TAG_INT -- so it holds
-+             * no reference and the store needs no ownership test. The general
-+             * path keeps SET_REG, because a non-integer operand is owned.
-+             */
++            /* The in-place forms (dst == src). The overwritten value was just
++               proven to be a JS_TAG_INT, so the store needs no ownership test;
++               the general path keeps SET_REG. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -5045,13 +4620,9 @@ new file mode 100644
 +                SET_REG_P(d, out);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The in-place add with the block's trailing unconditional branch:
-+             * dst == src, so the overwritten value is the one tag-tested here
-+             * and needs no ownership test, and the edge is unconditional, so the
-+             * advance is one add with no comparison feeding it. The encoder
-+             * emits these only when the add and the branch are adjacent.
-+             */
++            /* The in-place add with the block's trailing unconditional branch,
++               emitted only when the two are adjacent. dst == src, so no
++               ownership test. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -5115,10 +4686,7 @@ new file mode 100644
 +                SET_REG_P(d, val);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * Dynamic import borrows its operands. Registers retain ownership
-+             * until overwritten or the frame is released.
-+             */
++            /* Dynamic import borrows its operands. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -5150,9 +4718,9 @@ new file mode 100644
 +                if (JS_IsException(ret_val))
 +                    goto exception;
 +#if QJS_REGVM_INLOOP_CALL
-+                /* `return f()` is a tail call, so it leaves this frame exactly
-+                   as `return` does. Reaching `done` would leave the activation
-+                   and discard every nested frame under it. */
++                /* `return f()` is a tail call and leaves this frame as `return`
++                   does; reaching `done` would discard every nested frame under
++                   the activation. */
 +                if (regvm_frame != NULL)
 +                    REGVM_INLOOP_RETURN(ret_val);
 +#endif
@@ -5288,22 +4856,16 @@ new file mode 100644
 + {
 +                int d = RD_REG();
 +                int s = RD_REG();
-+                /* JS_ToObject does not consume its argument -- the stack VM
-+                   frees its slot explicitly afterwards -- so duplicating here
-+                   would leak a reference on every execution. The source is an
-+                   SSA value and keeps its own reference. */
++                /* JS_ToObject does not consume its argument, so no duplicate.
++                   */
 +                JSValue val = JS_ToObject(ctx, regs[s]);
 +                if (JS_IsException(val))
 +                    goto exception;
 +                SET_REG_P(d, val);
 +                REGVM_NEXT();
 +            }
-+            /*
-+             * The frame and realm values a function can read about itself. These
-+             * are the same helpers the stack VM's handler calls, and the frame's
-+             * arguments, function object and new target are in scope here just as
-+             * they are there.
-+             */
++            /* The frame and realm values a function can read about itself,
++               through the stack VM's helpers. */
 + exception:
 +    rf->ret = JS_EXCEPTION;
 +    return NULL;
@@ -5449,8 +5011,7 @@ new file mode 100644
 +                }
 +                REGVM_NEXT();
 +             passthrough:
-+                /* the state passes through, as it does on the stack side where
-+                   the slot the handler reads is the slot it leaves */
++                /* the state passes through */
 +                { JSValue v = js_dup(error_state); SET_REG_P(d, v); }
 +                REGVM_NEXT();
 +            }
@@ -5759,14 +5320,11 @@ new file mode 100644
 +}
 +
 +
-+/*
-+ * Hand-written twins.  These are the bodies the extractor refuses: they
-+ * suspend the frame, leave the activation, or use the monolith's stack
-+ * pointer.  They are the contract's edge cases (plan section 3.3).
-+ */
++/* Hand-written twins: the bodies that suspend the frame, leave the
++   activation, or use the monolith's stack pointer. */
 +
-+/* A throw-only opcode: the monolith's `L_default`.  The register backend
-+   never emits these, so the step engine reports them rather than running. */
++/* A throw-only opcode (the monolith's `L_default`). The register backend never
++   emits these, so the step engine reports them. */
 +static uint8_t *REGVM_CC regvm_s_default(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 +{
 +    (void)fr; (void)rf;
@@ -5775,9 +5333,8 @@ new file mode 100644
 +    return NULL;
 +}
 +
-+/* Park the frame the way REGVM_SUSPEND does, but return the sentinel instead
-+   of jumping to the monolith's done_generator.  `regs`, `b`, `ctx`, `rf` must
-+   be in scope. */
++/* Park the frame as REGVM_SUSPEND does, but return the sentinel. `regs`, `b`,
++   `ctx`, `rf` must be in scope. */
 +#define REGVM_STEP_SUSPEND_CODE(code_) do { \
 +        JSValue _sus_code = (code_); \
 +        rf->sf->rv_owns_regs = (JS_VALUE_GET_TAG(_sus_code) == JS_TAG_INT); \
@@ -6408,7 +5965,7 @@ new file mode 100644
 +    return regvm_step_table[*ip](ip, fr, rf, ctx);
 +}
 +
-+/* The P1 census: ROPs with no step form.  Target 0. */
++/* ROPs with no step form. Must be 0. */
 +int regvm_step_uncovered(void)
 +{
 +    int i, n = 0;
@@ -6418,3 +5975,213 @@ new file mode 100644
 +    return n;
 +}
 +
+diff --git a/quickjs.c b/quickjs.c
+index f176d2a..84a3c84 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23530,7 +23530,6 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+ #define REGVM_HAS_COUNT(v) JS_VALUE_HAS_REF_COUNT(v)
+ #endif
+ 
+-#if QJS_REGVM_THREAD
+ /*
+  * --- the threaded interpreter -------------------------------------------
+  *
+@@ -23553,7 +23552,7 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+  *
+  * Off by default: the default build compiles none of this.
+  */
+-#if QJS_REGVM_ASM
++#if QJS_REGVM_THREAD && QJS_REGVM_ASM
+ #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
+ #endif
+ 
+@@ -23574,6 +23573,11 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+ 
+ typedef struct JSRegRun {
+     JSContext *ctx;
++    /* The caller's realm. The monolith's bodies throw through it rather than
++       the callee's `ctx`: a derived-constructor return check throws in the
++       realm of the code that ran `new C()`. The step twins and
++       `regvm_exec_one`'s cold arms both read it here. */
++    JSContext *caller_ctx;
+     JSFunctionBytecode *b;
+     JSRegPIC *pic;              /* register VM property-cache base for this frame */
+     JSStackFrame *sf;
+@@ -23629,6 +23633,10 @@ typedef struct JSRegRun {
+     int       rcc_prev;         /* record index of the previous instruction */
+     const uint8_t *rcc_ip;      /* its code address, for the report */
+ #endif
++    /* The step engine's coroutine resume marker (the monolith keeps its own in
++       a local). A yield/await twin compares it with the instruction's address
++       to tell a resume from a fresh suspension. */
++    uint8_t *resume_marker;
+ } JSRegRun;
+ 
+ #if REGVM_SLIM_FRAME
+@@ -23674,6 +23682,20 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
+ #define REGVM_ARGS  uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx
+ #define REGVM_PASS  ip, fr, f, ctx
+ 
++/* Returned by `regvm_exec_one` for a tail call. A record frame has a caller,
++   so leaving it means handing the value in `f->ret` to the caller through
++   `regvm_t_return_common`. `NULL` already means a throw, and no real
++   instruction pointer is 1. */
++#define REGVM_COLD_RET ((uint8_t *)1)
++
++/* Returned by a `regvm_step` twin that parks the frame (yield, await, a
++   generator's return). The continuation is in `sf->cur_pc`, the handshake
++   slots are filled, and `rf->ret` holds the code the generator machinery
++   reads. */
++#define REGVM_STEP_SUSPEND ((uint8_t *)2)
++
++#if QJS_REGVM_THREAD
++
+ /*
+  * Instruction sizes: one opcode byte plus two bytes per `r`/`u`/`s` operand and
+  * four per `I`/`c`/`a`, except the narrow forms in regvm_rop_narrow.
+@@ -24230,12 +24252,6 @@ regvm_record_release(JSRuntime *rt, JSRegRun *rec);
+ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                                JSContext *ctx);
+ 
+-/* Returned by `regvm_exec_one` for a tail call. A record frame has a caller,
+-   so leaving it means handing the value in `f->ret` to the caller through
+-   `regvm_t_return_common`. `NULL` already means a throw, and no real
+-   instruction pointer is 1. */
+-#define REGVM_COLD_RET ((uint8_t *)1)
+-
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_cold_slow(REGVM_ARGS)
+ {
+     uint8_t *next = regvm_exec_one(ip, fr, f, ctx);
+@@ -26788,6 +26804,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+ 
+ #endif /* QJS_REGVM_INLOOP_CALL */
+ 
++/* The single-instruction entry, defined in quickjs-regvm-step.inc, which is
++   included after js_regvm_execute while the RD_* and SET_REG_* macros are
++   still defined. Declared here for the QJS_REGVM_STEPCHECK loop. */
++uint8_t *regvm_step(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx);
++
+ #if QJS_REGVM_ASM
+ static __attribute__((used)) int js_regvm_execute(JSRegAsmState *ast)
+ #else
+@@ -26885,11 +26906,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+            step. */
+         JSRegFrame *regvm_frame = NULL;
+ #endif
+-#if QJS_REGVM_THREAD
++#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
+         /* Filled once per activation. The handlers only read these, and all are
+            fixed for the activation (the var_refs pointer too, though not its
+            contents). */
+         JSRegRun run;
++        run.caller_ctx = caller_ctx;
+ #ifdef QJS_REGVM_RCCHECK
+         run.ctx = ctx;
+ #endif
+@@ -26924,8 +26946,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         run.local_buf = local_buf;
+         run.local_count = 0;
+         run.arg_owned = arg_owned;
++        run.resume_marker = NULL;
++#if QJS_REGVM_THREAD
+         REGVM_T_CHECK_SIZES();
+ #endif
++#endif
+ /* Register operands are always two bytes: a register operand is one load and
+    the advance is a constant. */
+ #define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) >> 4)
+@@ -27044,12 +27069,13 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         }
+         sp = regs + b->regvm_reg_count + REGVM_HS - 1;
+         regvm_ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
+-#if QJS_REGVM_THREAD
++#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
+         /* From here the monolith's control stack is the entry record's: cold
+            opcodes run in the chain's arms, which write `f->ctl`/`f->nctl` with
+            `f == &run`, so a separate copy of the depth would drift. */
+         run.ctl = regvm_ctl;
+         run.nctl = regvm_nctl;
++        run.resume_marker = NULL;
+ #define regvm_ctl (run.ctl)
+ #define regvm_nctl (run.nctl)
+ #endif
+@@ -27615,13 +27641,49 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+ #if QJS_REGVM_ASM
+      regvm_stretch:
+ #endif
++#if !QJS_REGVM_STEPCHECK
+         REGVM_NEXT();
++#endif
+  regvm_resume:
++#if QJS_REGVM_STEPCHECK
++        /* Step self-check: the dispatch is one regvm_step call per instruction.
++           The monolith arms below stay compiled but are unreachable. */
++        for (;;) {
++            uint8_t *nip;
++
++            if (regvm_resume_pending) {
++                rpc = regvm_rpc;
++                regvm_resume_pending = 0;
++            }
++            AOT_PROF_OP(b, rpc);
++            run.resume_marker = regvm_resume_marker;
++            nip = regvm_step(rpc, regs, &run, ctx);
++            regvm_resume_marker = run.resume_marker;
++            if (nip == NULL) {
++                ret_val = run.ret;
++                goto exception;
++            }
++            if (nip == REGVM_COLD_RET) {
++                ret_val = run.ret;
++                if (likely(!JS_IsException(ret_val)))
++                    goto done;
++                goto exception;
++            }
++            if (nip == REGVM_STEP_SUSPEND) {
++                pc = sf->cur_pc;
++                sp = sf->cur_sp;
++                ret_val = run.ret;
++                goto done_generator;
++            }
++            rpc = nip;
++        }
++#else
+         if (regvm_resume_pending) {
+             rpc = regvm_rpc;
+             regvm_resume_pending = 0;
+         }
+         REGVM_NEXT();
++#endif
+             L_ROP_load_i8:
+                 { int d = RD_REG(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
+             L_ROP_load_i8_s:
+@@ -30391,6 +30453,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+     }
+ }
+ 
++/* The step engine: the monolith's `L_ROP_*` bodies recompiled with
++   `REGVM_NEXT()` = `return rpc`, so each runs one instruction. Included here,
++   while the RD_* and SET_REG_* macros and the frame layout are in scope. */
++#include "quickjs-regvm-step.inc"
++
+ #if QJS_REGVM_THREAD
+ /*
+  * One cold instruction against the record.
+@@ -53742,6 +53809,16 @@ static int regvm_homes_mode(void)
+ #define QJS_REGVM_THREAD 0
+ #endif
+ 
++/* Step self-check: the monolith's dispatch is replaced by one `regvm_step`
++   call per instruction, so every step helper runs under test262. A test
++   configuration, off by default. */
++#ifndef QJS_REGVM_STEPCHECK
++#define QJS_REGVM_STEPCHECK 0
++#endif
++#if QJS_REGVM_STEPCHECK && QJS_REGVM_THREAD
++#error "QJS_REGVM_STEPCHECK replaces the monolith dispatch; it cannot be combined with QJS_REGVM_THREAD"
++#endif
++
+ #ifndef QJS_REGVM_INLOOP_CALL
+ #define QJS_REGVM_INLOOP_CALL 0
+ #endif

@@ -1,34 +1,44 @@
+Subject: Gives the register PIC's cached shapes counted references
+
+What this does
+  Gives the register PIC's cached shapes counted references.
+
+Why we need it
+  The cache is per-function storage whose entries outlive the object they describe, but an uncounted shape pointer lets `js_shape_prepare_update` mutate a hashed shape in place under the cache, so a hit reads a slot that has moved.
+
+What it adds
+  Defines `JSRegPIC`, an entry reset that releases both shape references, `js_free_regvm_pic` from `free_function_bytecode`, lazy `regvm_pic_ensure` that force-traces the bytecode before the first shape is stored, marking in the cycle collector, the `regvm_pic == NULL` term in `fnbc_is_acyclic`, memory accounting, and release on refill.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7033,7 +7033,14 @@
-        the pool before it installs byte_code_buf, so such a body is flagged lazy
-        with real references in its pool. */
+@@ -6995,7 +6995,13 @@ static int fnbc_is_acyclic(JSFunctionBytecode *b)
+        materialization failed is excluded: its pool was filled before
+        byte_code_buf was set. */
      return (b->cpool_count == 0 || (b->is_lazy && !b->lazy_failed)) &&
 -           b->objlit_tab == NULL && b->ic_table == NULL;
 +           b->objlit_tab == NULL && b->ic_table == NULL
 +#if QJS_REGVM
-+           /* The register PIC holds counted shape references too; an untraced
-+              bytecode must not stop marking them or the collector frees shapes
-+              still in use. */
++           /* The register PIC holds counted shape references; an untraced
++              bytecode must still mark them. */
 +           && b->regvm_pic == NULL
 +#endif
 +           ;
  }
  
  /* Idempotent: moves b between the two lists so the header bit and the list
-@@ -7093,6 +7100,77 @@
+@@ -7055,6 +7061,72 @@ static void js_free_ic_table(JSRuntime *rt, JSFunctionBytecode *b)
      b->ic_table = NULL;
  }
  
 +#if QJS_REGVM
-+/* ---- register-VM property cache ownership (A2) ------------------------- */
++/* ---- register-VM property cache ownership ------------------------------ */
 +
-+/* The register VM's per-function property cache: one entry per site, indexed
-+   by the dense site operand A1 assigns. The cached shapes are COUNTED
-+   references. js_shape_prepare_update mutates a hashed shape in place while
-+   its refcount is 1, so an uncounted cache pointer could observe a layout
-+   change underneath it and read a slot that has moved. Holding a reference
-+   forces copy-on-write and keeps the cached layout immutable. */
++/* The register VM's per-function property cache, one entry per dense site.
++   The cached shapes are counted references: js_shape_prepare_update mutates a
++   hashed shape in place at refcount 1, so holding a reference forces
++   copy-on-write and keeps the cached layout immutable. */
 +struct JSRegPIC {
 +    JSShape  *shape;         /* receiver shape; a counted reference */
 +    JSShape  *holder_shape;  /* NULL for own-slot entries; counted reference */
@@ -41,9 +51,8 @@
 +#define REG_PIC_OWN   1
 +#define REG_PIC_PROTO 2
 +
-+/* Release the shape references held by one entry and clear it. Used by the
-+   finalizer and by a refill, which must drop the entry it replaces before
-+   storing the new shapes. */
++/* Release one entry's shape references and clear it. Also used by a refill
++   before storing the new shapes. */
 +static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e)
 +{
 +    if (e->shape)
@@ -70,12 +79,10 @@
 +    b->regvm_pic = NULL;
 +}
 +
-+/* Lazy allocation of the register PIC, mirroring ic_table_ensure: allocated on
-+   the first fill, so a function that never caches pays nothing -- 97% of the
-+   functions in an RN bundle never fill an IC. Allocation failure is not an
-+   error; the site simply does not cache. The bytecode is force-traced BEFORE
-+   the caller stores a shape, because fnbc_is_acyclic() must not let an
-+   untraced bytecode stop marking references it now holds. */
++/* Allocate the register PIC on first fill, as ic_table_ensure does.
++   Allocation failure just leaves the site uncached. The bytecode is
++   force-traced before the caller stores a shape, so fnbc_is_acyclic() cannot
++   stop marking references it holds. */
 +static JSRegPIC *regvm_pic_ensure(JSRuntime *rt, JSFunctionBytecode *b)
 +{
 +    JSRegPIC *t = b->regvm_pic;
@@ -94,13 +101,13 @@
  #if JS_ENABLE_IC
  /* Lazy allocation of the IC table (docs/gc-pass-decomposition.md §7).
  
-@@ -9104,6 +9182,20 @@
+@@ -9030,6 +9102,20 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                          mark_func(rt, &e->to_shape->header);
                  }
              }
 +#if QJS_REGVM
-+            /* The register PIC holds counted shape references per site; marking
-+               must match exactly the references held (A2). */
++            /* The register PIC holds counted shape references per site; mark
++               exactly those. */
 +            if (b->regvm_pic) {
 +                uint32_t j;
 +                for (j = 0; j < b->regvm_pic_count; j++) {
@@ -115,7 +122,7 @@
          }
          break;
      case JS_GC_OBJ_TYPE_VAR_REF:
-@@ -9397,6 +9489,12 @@
+@@ -9323,6 +9409,12 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
          js_func_size += (size_t)b->ic_count * b->ic_entries * sizeof(JSICEntry);
          memory_used_count++;
      }
@@ -128,12 +135,12 @@
      memory_used_count++;
      js_func_size += b->source_len + 1;
      if (b->pc2line_len) {
-@@ -60884,6 +60982,11 @@
+@@ -59168,6 +59260,11 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
      /* release IC-held shape refs and free the table */
      js_free_ic_table(rt, b);
  
 +#if QJS_REGVM
-+    /* release register-PIC-held shape refs and free the table (A2) */
++    /* release register-PIC-held shape refs and free the table */
 +    js_free_regvm_pic(rt, b);
 +#endif
 +

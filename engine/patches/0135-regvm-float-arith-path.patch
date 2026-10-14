@@ -1,63 +1,25 @@
-Subject: register VM: a float-only arithmetic fast path
+Subject: Adds a float-only fast path to the register VM's add, sub and mul
 
-What this does:
-  The add, sub and mul opcodes gain a fast path that tests both operand tags
-  before either payload is loaded and reads the two operands straight out of
-  the register as doubles. The hit is movsd/mulsd/movsd instead of loading
-  both 16-byte values to GPRs, moving them into xmm, computing, moving back
-  and jumping to the shared int/float store merge. The result is stored by a
-  new tail (T_SET_NEXT_F64) that reads the destination's old tag alone and
-  fetches the full old value only when that tag says a reference count lives
-  there. Everything the test misses -- ints, mixed, bitwise, comparisons --
-  still goes through regvm_num_fast, so the semantics are unchanged.
+What this does
+  Adds a float-only fast path to the register VM's add, sub and mul.
 
-  Only the three operations whose result is the C arithmetic of the doubles
-  take the new path; the operation is a compile-time literal at each leaf
-  handler, so the selection folds away and the other opcodes are unchanged.
+Why we need it
+  The second-largest gap; moving them into xmm and jumping to the shared int/float store merge.
 
-Why we need it:
-  Arithmetic is 4.93 G instructions on box2d against Hermes' 2.27 G, the
-  second-largest gap after calls. The float hit was 27 instructions and spent
-  most of them on the GPR/xmm round trip.
+What it adds
+  The three opcodes test both operand tags before either payload is loaded and read the operands directly as doubles, so the hit is `movsd`/`mulsd`/`movsd`; a new `T_SET_NEXT_F64` tail reads the destination's old tag alone and fetches the full old value only when that tag says a reference count lives there; the operation is a compile-time literal so the selection folds away and `regvm_num_fast` still handles ints, mixed operands, bitwise and comparisons unchanged.
 
-Adds:
-  * quickjs.c: the T_SET_NEXT_F64 store tail, the REGVM_F64_BIN / REGVM_F64_OP
-    selectors, the T_FAST_RRR_F64 fast half and the T_FAST_BIN dispatcher;
-    T_DEF_BIN now uses T_FAST_BIN.
-
-Evidence:
-  box2d fixed.js, clang-19 -O3, perf stat -r7: 30.247 G to 29.199 G
-  instructions (-3.47%, -1.049 G), cycles -1.61%, wall -1.7%. The float hit
-  of regvm_t_mul, regvm_t_add and regvm_t_sub goes 27 to 20 instructions and
-  now emits `movsd 0x0(%r13,%rsi,1),%xmm0` / `mulsd 0x0(%r13,%rcx,1),%xmm0`.
-  The mul micro goes 27.0 to 20.0 instructions per multiply. box2d checksum
-  546.1008391043414 is unchanged; the register differential suite is 398/0/0
-  in both mono and threaded modes; a -DQJS_REGVM_VERIFY=1 -O1 build is clean
-  and prints the same checksum.
-
-  The integer path pays the float test first: an all-int loop goes +4.6%
-  instructions. box2d is float-dominated (the both-double path is taken 93%
-  of the time for MUL, 99% for ADD, 96% for SUB) so the net is the -1.05 G
-  above.
-
-Bytecode bump:
-  No. No opcode is added, removed or renumbered, and no operand encoding
-  changes.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23440,6 +23440,31 @@
+@@ -23038,6 +23038,25 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
+         T_NEXT(off); \
      } while (0)
  
- /*
-+ * X4: the float store tail. The result is already in a double, so the
-+ * destination's old tag alone is read first; the full old value is fetched
-+ * only when that tag says a reference count lives there, and it is fetched
-+ * before the overwrite. The release is the same discipline as T_SET_NEXT, but
-+ * the handler stays on the float path instead of joining the int/float store
-+ * merge. Writing the tag as the whole int64_t keeps the register's upper tag
-+ * bits defined; every reader of the register reads the low 32 bits.
-+ */
++/* The float store tail. Only the destination's old tag is read first; the
++   old value is fetched, before the overwrite, only when it is counted. The
++   tag is written as the whole int64_t so the upper bits stay defined. */
 +#define T_SET_NEXT_F64(d, r, off) do { \
 +        int64_t _ot = FR(d).tag; \
 +        JSValue _o; \
@@ -74,24 +36,17 @@ Bytecode bump:
 +        T_NEXT(off); \
 +    } while (0)
 +
-+/*
-  * One list per family, expanded for the declarations, the dispatch table's
-  * entries, and the definitions. One list means the table, the declarations and
-  * the bodies cannot disagree about which opcodes are converted -- the mistake a
-@@ -23559,6 +23584,45 @@
+ /* One list per family, expanded for the declarations, the dispatch table and
+    the definitions, so they cannot disagree about which opcodes are
+    converted. */
+@@ -23155,6 +23174,39 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
          __attribute__((musttail)) return SLOW_(REGVM_PASS); \
      } while (0)
  
-+/*
-+ * X4: the float-only arithmetic fast path. Both tags are tested before either
-+ * payload is loaded, and the operands are read straight out of the register as
-+ * doubles, so the hit is movsd/mulsd/movsd rather than GPR loads plus movq
-+ * moves through xmm. It has its own tail (T_SET_NEXT_F64) and never joins the
-+ * int/float merge point. Only the three operations whose result is the C
-+ * arithmetic of the doubles take it; SUB_ is a literal, so the selection folds
-+ * at compile time and everything the test misses (ints, mixed, bitwise,
-+ * comparisons) still goes through regvm_num_fast below it.
-+ */
++/* The float-only arithmetic fast path: both tags are tested, then the
++   operands are read as doubles, with its own tail (T_SET_NEXT_F64). SUB_ is a
++   literal, so only add, sub and mul select it at compile time; everything else
++   goes through regvm_num_fast. */
 +#define REGVM_F64_BIN(SUB_) \
 +    ((SUB_) == REG_BIN_ADD || (SUB_) == REG_BIN_SUB || (SUB_) == REG_BIN_MUL)
 +#define REGVM_F64_OP(SUB_, x, y) \
@@ -113,7 +68,7 @@ Bytecode bump:
 +        __attribute__((musttail)) return SLOW_(REGVM_PASS); \
 +    } while (0)
 +
-+/* pick the float-first path only for the ops it can take; the rest are unchanged */
++/* the float-first path only for the ops it can take */
 +#define T_FAST_BIN(SUB_, SZ_, SLOW_) do { \
 +        if (REGVM_F64_BIN(SUB_)) \
 +            T_FAST_RRR_F64(SUB_, SZ_, SLOW_); \
@@ -124,7 +79,7 @@ Bytecode bump:
  #define T_DECL(name, sub) \
      static uint8_t *REGVM_CC regvm_t_##name(REGVM_ARGS); \
      static uint8_t *REGVM_CC regvm_t_##name##_slow(REGVM_ARGS);
-@@ -24515,7 +24579,7 @@
+@@ -24036,7 +24088,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
      static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##name##_slow(REGVM_ARGS) \
      { T_BODY_RRR(sub, T_SZ_RRR); } \
      static uint8_t *REGVM_CC regvm_t_##name(REGVM_ARGS) \

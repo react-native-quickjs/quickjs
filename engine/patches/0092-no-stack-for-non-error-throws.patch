@@ -24,7 +24,8 @@ Needs a bytecode version bump
   No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -24605,7 +24605,6 @@
+@@ -24294,8 +24294,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         }
      }
   exception:
 -    if (needs_backtrace(rt->current_exception)

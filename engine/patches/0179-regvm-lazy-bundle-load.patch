@@ -1,31 +1,19 @@
-Subject: register VM: make lazy bundle loading work
+Subject: Makes lazy bundle loading work
 
-What this does:
-  Fixes two bugs that made every JS_READ_OBJ_LAZY read of a register bundle
-  fail (the path a React Native app ships):
+What this does
+  Makes lazy bundle loading work.
 
-  1. bc_intern_atom read the atom's record at s->buf_start + offset but bounded
-     the read by the lazy source's copy of the buffer. During the eager read
-     those are two different allocations (the caller's buffer and the copy), so
-     the read failed with "read after the end of the buffer". The stack VM
-     never hit this because it interns atoms only at materialization, when the
-     reader runs over the copy; the register program's atoms are mapped during
-     the eager read. Both pointers now come from the lazy source.
+Why we need it
+  Every `JS_READ_OBJ_LAZY` read of a register bundle -- the path a React Native app ships -- failed: `bc_intern_atom` read an atom record from the caller's buffer but bounded it by the lazy source's copy ("read after the end of the buffer"), because the register program's atoms are mapped during the eager read, unlike the stack VM's; and `regvm_validate_code` bounded atom operands by the live atom count instead of the table size, so lazily interned atoms in reused slots were rejected ("register atom out of range").
 
-  2. regvm_validate_code bounded atom operands by rt->atom_count, the number of
-     live atoms, but an atom index ranges over the whole table including free
-     slots (rt->atom_size). Lazy interning reuses free slots and hands out
-     indices above the live count, so valid programs were rejected with
-     "register atom out of range".
+What it adds
+  Both pointers taken from the lazy source; atom bound is `rt->atom_size`.
 
-Measured: pdfjs register bundle, 30 loads, x86-64 clang-19 -O2: eager 0.70 s,
-  lazy 0.11 s (failed before). All 13 Octane rows run from a lazy register
-  bundle with output identical to the eager bundle apart from scores; box2d
-  checksum 546.1008391043414.
-
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -73246,9 +73279,12 @@
+@@ -70283,9 +70283,12 @@ static int bc_intern_atom(BCReaderState *s, uint32_t idx)
      JSAtom atom;
      uint8_t type;
  
@@ -40,7 +28,7 @@ Measured: pdfjs register bundle, 30 loads, x86-64 clang-19 -O2: eager 0.70 s,
      s->ptr_last = NULL;
  
      if (bc_get_u8(s, &type))
-@@ -73631,7 +73667,9 @@
+@@ -70664,7 +70667,9 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
      const uint8_t *code = b->regvm_code;
      int len = b->regvm_len;
      int wide = 1;                       /* register operands are two bytes */

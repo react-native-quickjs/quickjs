@@ -1,0 +1,1651 @@
+Subject: Remove the debug and experiment switches nothing sets
+
+What this does
+  Drops `QJS_REGVM_ASM`, `QJS_REGVM_RCCHECK`, `QJS_REGVM_DYNADJ`,
+  `QJS_REGVM_ARGCHECK`, `QJS_ALLOC_STATS`, `QJS_DRC_NO_EAGER_LARGE` and
+  `QJS_DRC_NO_BACKEDGE` and their branches, keeping the default path: the
+  assembly dispatch core, the value-id shadow checker, the
+  dynamic-adjacency counter, the arg-retarget self-check, the allocation
+  counters and the two deferred-RC ablation switches are all gone, and the
+  constructors that only built them go with them.
+
+Why we need it
+  None of the seven is set by any build or tool, and each leaves an
+  alternative branch plus, for the larger ones, a self-contained subsystem in
+  the source. They were one-off diagnostics.
+
+What it adds
+  No new API. Runtime only.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index d80b9c2..58e733d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -82,7 +82,7 @@ typedef struct JSRegRCC JSRegRCC;
+  */
+ #ifndef QJS_REGVM_THREAD
+ #if QJS_REGVM && defined(__clang__) && \
+-    !QJS_REGVM_STEPCHECK && !QJS_REGVM_ASM && !QJS_AOT && !QJS_AOT_PROFILE
++    !QJS_REGVM_STEPCHECK && !QJS_AOT && !QJS_AOT_PROFILE
+ #define QJS_REGVM_THREAD 1
+ #else
+ #define QJS_REGVM_THREAD 0
+@@ -3770,68 +3770,6 @@ static void js_gc_promote_all_code(JSRuntime *rt);
+ int js_regvm_count_dump(void);
+ #endif
+ 
+-#ifdef QJS_ALLOC_STATS
+-/* Object-creation counters, enabled with -DQJS_ALLOC_STATS and dumped at
+-   runtime teardown when the env var QJS_ALLOC_STATS is set. */
+-static uint64_t qjs_st_obj_alloc;
+-static uint64_t qjs_st_obj_inline;
+-static uint64_t qjs_st_obj_propmalloc;
+-static uint64_t qjs_st_prop_size[64];
+-static uint64_t qjs_st_obj_class[32];
+-static uint64_t qjs_st_obj_class_inline[32];
+-static uint64_t qjs_st_obj_ps_obj[64]; /* JS_CLASS_OBJECT, all paths */
+-static uint64_t qjs_st_obj_ps_obj_inl[64];
+-static uint64_t qjs_st_shape_alloc;
+-static uint64_t qjs_st_grow_move;
+-static uint64_t qjs_st_grow_move_class[32];
+-static uint64_t qjs_st_grow_realloc;
+-static uint64_t qjs_st_gc_runs;
+-static uint64_t qjs_st_gc_walked;
+-static uint64_t qjs_st_forin_start;
+-static uint64_t qjs_st_forin_next;
+-static uint64_t qjs_st_forin_hasprop;
+-static void qjs_alloc_stats_dump(void)
+-{
+-    int i;
+-    printf("alloc-stats: obj=%llu inline=%llu propmalloc=%llu shape=%llu "
+-           "gc_runs=%llu gc_walked=%llu\n",
+-           (unsigned long long)qjs_st_obj_alloc,
+-           (unsigned long long)qjs_st_obj_inline,
+-           (unsigned long long)qjs_st_obj_propmalloc,
+-           (unsigned long long)qjs_st_shape_alloc,
+-           (unsigned long long)qjs_st_gc_runs,
+-           (unsigned long long)qjs_st_gc_walked);
+-    printf("alloc-stats grow: move_out_of_inline=%llu realloc=%llu\n",
+-           (unsigned long long)qjs_st_grow_move,
+-           (unsigned long long)qjs_st_grow_realloc);
+-    printf("alloc-stats forin: start=%llu next=%llu hasprop=%llu\n",
+-           (unsigned long long)qjs_st_forin_start,
+-           (unsigned long long)qjs_st_forin_next,
+-           (unsigned long long)qjs_st_forin_hasprop);
+-    printf("alloc-stats grow class(move):");
+-    for (i = 0; i < 32; i++)
+-        if (qjs_st_grow_move_class[i])
+-            printf(" %d:%llu", i, (unsigned long long)qjs_st_grow_move_class[i]);
+-    printf("\n");
+-    printf("alloc-stats prop_size(malloc path):");
+-    for (i = 0; i < 64; i++)
+-        if (qjs_st_prop_size[i])
+-            printf(" %d:%llu", i, (unsigned long long)qjs_st_prop_size[i]);
+-    printf("\nalloc-stats class(alloc/inline):");
+-    for (i = 0; i < 32; i++)
+-        if (qjs_st_obj_class[i])
+-            printf(" %d:%llu/%llu", i,
+-                   (unsigned long long)qjs_st_obj_class[i],
+-                   (unsigned long long)qjs_st_obj_class_inline[i]);
+-    printf("\nalloc-stats JS_CLASS_OBJECT prop_size(all/inline):");
+-    for (i = 0; i < 64; i++)
+-        if (qjs_st_obj_ps_obj[i])
+-            printf(" %d:%llu/%llu", i,
+-                   (unsigned long long)qjs_st_obj_ps_obj[i],
+-                   (unsigned long long)qjs_st_obj_ps_obj_inl[i]);
+-    printf("\n");
+-}
+-#endif
+ 
+ void JS_FreeRuntime(JSRuntime *rt)
+ {
+@@ -3846,10 +3784,6 @@ void JS_FreeRuntime(JSRuntime *rt)
+ #if QJS_AOT
+     if (getenv("QJS_AOT_STATS"))
+         js_aot_stats_dump(rt);
+-#endif
+-#ifdef QJS_ALLOC_STATS
+-    if (getenv("QJS_ALLOC_STATS"))
+-        qjs_alloc_stats_dump();
+ #endif
+     struct list_head *el, *el1;
+     bool leak = false;
+@@ -7665,9 +7599,6 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
+     sh_alloc = js_malloc(ctx, get_shape_size(hash_size, prop_size));
+     if (!sh_alloc)
+         return NULL;
+-#ifdef QJS_ALLOC_STATS
+-    qjs_st_shape_alloc++;
+-#endif
+     sh = get_shape_from_alloc(sh_alloc, hash_size);
+     JS_REF_COUNT(sh) = 1;
+     add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
+@@ -8700,13 +8631,6 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
+ 
+         if (nbytes <= p->prop_inline_cap * sizeof(JSProperty))
+             return p->prop;
+-#ifdef QJS_ALLOC_STATS
+-        qjs_st_grow_move++;
+-        {
+-            int _ci = p->class_id < 32 ? (int)p->class_id : 31;
+-            qjs_st_grow_move_class[_ci]++;
+-        }
+-#endif
+         np = js_malloc(ctx, nbytes);
+         if (np) {
+             memcpy(np, p->prop, p->prop_inline_cap * sizeof(JSProperty));
+@@ -8714,9 +8638,6 @@ static JSProperty *js_prop_grow(JSContext *ctx, JSObject *p, size_t nbytes)
+         }
+         return np;
+     }
+-#ifdef QJS_ALLOC_STATS
+-    qjs_st_grow_realloc++;
+-#endif
+     return js_realloc(ctx, p->prop, nbytes);
+ }
+ 
+@@ -8745,40 +8666,6 @@ static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID c
+                 req_cap = JS_OBJ_LEARNED_INLINE_MAX;
+             inline_cap = req_cap;
+         }
+-#ifdef QJS_ALLOC_STATS
+-        qjs_st_obj_alloc++;
+-        {
+-            int _ci = class_id < 32 ? (int)class_id : 31;
+-            int _ps = sh->prop_size;
+-            qjs_st_obj_class[_ci]++;
+-            if (_ps < 0)
+-                _ps = 0;
+-            if (_ps > 63)
+-                _ps = 63;
+-            if (class_id == JS_CLASS_OBJECT) {
+-                qjs_st_obj_ps_obj[_ps]++;
+-            }
+-        }
+-        if (inline_cap != 0) {
+-            int _ci = class_id < 32 ? (int)class_id : 31;
+-            qjs_st_obj_inline++;
+-            qjs_st_obj_class_inline[_ci]++;
+-            if (class_id == JS_CLASS_OBJECT) {
+-                int _ps = sh->prop_size;
+-                if (_ps < 0) _ps = 0;
+-                if (_ps > 63) _ps = 63;
+-                qjs_st_obj_ps_obj_inl[_ps]++;
+-            }
+-        } else {
+-            int _ps = sh->prop_size;
+-            qjs_st_obj_propmalloc++;
+-            if (_ps < 0)
+-                _ps = 0;
+-            if (_ps > 63)
+-                _ps = 63;
+-            qjs_st_prop_size[_ps]++;
+-        }
+-#endif
+         p = js_malloc(ctx, sizeof(JSObject) +
+                            inline_cap * sizeof(JSProperty));
+         if (unlikely(!p))
+@@ -9927,7 +9814,6 @@ static void js_drc_push(JSRuntime *rt, JSValue v)
+     rt->zct[rt->zct_len++] = v;
+ }
+ 
+-#ifndef QJS_DRC_NO_EAGER_LARGE
+ /* A parked value that retains at least this many bytes should force a
+    reconcile soon, rather than waiting for the count-based safepoint trigger. */
+ #define JS_DRC_LARGE_VALUE_MIN (64 * 1024)
+@@ -9986,7 +9872,6 @@ static bool js_drc_value_is_large(JSValue v)
+         return false;
+     }
+ }
+-#endif /* QJS_DRC_NO_EAGER_LARGE */
+ 
+ /* Park 'v' after its ref_count has reached zero. */
+ static void js_drc_zero(JSRuntime *rt, JSValue v)
+@@ -9997,13 +9882,11 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
+         js_free_value_rt(rt, v);
+         return;
+     }
+-#ifndef QJS_DRC_NO_EAGER_LARGE
+     if (js_drc_value_is_large(v)) {
+         /* One large value can dominate the parked memory before allocation
+            pressure is even felt; make the next safepoint reconcile. */
+         rt->zct_limit = 0;
+     }
+-#endif
+     switch (tag) {
+     case JS_TAG_OBJECT:
+     case JS_TAG_FUNCTION_BYTECODE:
+@@ -10553,9 +10436,6 @@ static void gc_decref(JSRuntime *rt)
+     list_for_each_safe(el, el1, &rt->gc_obj_list) {
+         p = list_entry(el, JSGCObjectHeader, link);
+         assert(JS_GC_MARK(p) == 0);
+-#ifdef QJS_ALLOC_STATS
+-        qjs_st_gc_walked++;
+-#endif
+         mark_children(rt, p, gc_decref_child);
+         JS_GC_MARK(p) = 1;
+         if (JS_REF_COUNT(p) == 0) {
+@@ -10693,9 +10573,6 @@ size_t JS_GetMallocSize(JSRuntime *rt)
+ 
+ void JS_RunGC(JSRuntime *rt)
+ {
+-#ifdef QJS_ALLOC_STATS
+-    qjs_st_gc_runs++;
+-#endif
+ #if QJS_REGVM && QJS_DRC_VALIDATE
+     js_drc_validate_roots(rt);
+ #endif
+@@ -21125,9 +21002,6 @@ static __attribute__((noinline)) JSValue build_for_in_iterator(JSContext *ctx, J
+ /* obj -> enum_obj */
+ static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
+ {
+-#ifdef QJS_ALLOC_STATS
+-    qjs_st_forin_start++;
+-#endif
+     sp[-1] = build_for_in_iterator(ctx, sp[-1]);
+     if (JS_IsException(sp[-1]))
+         return -1;
+@@ -21147,9 +21021,6 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+     /* fail safe */
+     if (JS_VALUE_GET_TAG(enum_obj) != JS_TAG_OBJECT)
+         goto done;
+-#ifdef QJS_ALLOC_STATS
+-    qjs_st_forin_next++;
+-#endif
+     p = JS_VALUE_GET_OBJ(enum_obj);
+     if (p->class_id != JS_CLASS_FOR_IN_ITERATOR)
+         goto done;
+@@ -21170,9 +21041,6 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+                 continue;
+             if (shape_live)
+                 break;
+-#ifdef QJS_ALLOC_STATS
+-            qjs_st_forin_hasprop++;
+-#endif
+             ret = JS_HasProperty(ctx, it->obj, prop);
+             if (ret < 0)
+                 return ret;
+@@ -21219,9 +21087,6 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
+             if (p->class_id == JS_CLASS_PROXY)
+                 break;
+         }
+-#ifdef QJS_ALLOC_STATS
+-        qjs_st_forin_hasprop++;
+-#endif
+         ret = JS_HasProperty(ctx, obj, prop);
+         if (ret < 0)
+             return ret;
+@@ -24933,10 +24798,6 @@ static __exception int regvm_cmp_take(JSContext *ctx, int sub, JSValue a,
+ 
+ #ifdef QJS_REGVM_COUNT
+ extern uint64_t js_regvm_count[ROP_COUNT];
+-#ifdef QJS_REGVM_DYNADJ
+-extern int js_regvm_prev_op;
+-extern uint64_t js_regvm_dyn_adj[ROP_COUNT * ROP_COUNT];
+-#endif
+ #if QJS_REGVM_COUNT
+ extern uint64_t js_regvm_ir_insns, js_regvm_ir_moves, js_regvm_ir_move_adj;
+ extern uint64_t js_regvm_own_plain, js_regvm_own_returns;
+@@ -24958,65 +24819,6 @@ extern uint64_t js_regvm_put_hit, js_regvm_put_direct, js_regvm_put_slow,
+                 js_regvm_put_nofill;
+ #endif
+ 
+-#if QJS_REGVM_ASM
+-/*
+- * One execution state, shared by the assembly dispatch core and the C
+- * interpreter. The asm core pins it in x19 (rpc in x20, the register-file base
+- * in x21, the dispatch table in x22); the first three fields below are at fixed
+- * offsets because the assembly reads them directly.
+- */
+-typedef struct JSRegAsmState {
+-    uint8_t *rpc;                 /* offset 0  */
+-    JSValue *regs;                /* offset 8  */
+-    JSValue ret;                  /* offset 16 (16 bytes) */
+-    /* entry state, filled once by JS_CallInternal */
+-    JSContext *caller_ctx;
+-    JSContext *ctx;
+-    JSFunctionBytecode *b;
+-    JSStackFrame *sf;
+-    JSValueConst func_obj;
+-    JSValueConst this_obj;
+-    JSValueConst new_target;
+-    int argc;
+-    JSValueConst *argv;
+-    JSValue *local_buf;
+-    JSValue *arg_buf;
+-    JSValue *var_buf;
+-    JSValue *stack_buf;
+-    JSVarRef **var_refs;
+-    int flags;
+-    int throw_pending;
+-    /* mutable state, carried across stretches */
+-    uint8_t *pc;
+-    JSValue *sp;
+-    int fresh;
+-    int exec_current_once;      /* one-op C entry */
+-    int asm_tx;                 /* transitions into C this activation */
+-    int asm_off;                /* selective entry: too mixed, stay in C */
+-    JSRegCtl *ctl;
+-    int nctl;
+-    uint8_t *resume_marker;
+-    int resume_pending;
+-    uint8_t *resume_rpc;
+-} JSRegAsmState;
+-
+-_Static_assert(offsetof(JSRegAsmState, rpc) == 0, "asm reads rpc at 0");
+-_Static_assert(offsetof(JSRegAsmState, regs) == 8, "asm reads regs at 8");
+-_Static_assert(offsetof(JSRegAsmState, ret) == 16, "asm reads ret at 16");
+-
+-enum {
+-    REGVM_EXIT_STRETCH = 0,       /* a hot opcode is next; rpc is at it */
+-    REGVM_EXIT_DONE = 1,          /* returned/unwound; ret holds the value */
+-};
+-
+-/* One entry per opcode: nonzero means the asm core implements it. */
+-static uint8_t regvm_asm_hot[ROP_COUNT];
+-JSValue js_regvm_asm_run(JSRegAsmState *st, void *const *table);
+-extern void regvm_asm_slow(void);
+-extern void regvm_asm_load_undefined(void);
+-extern void regvm_asm_branch_nlt_s(void);
+-extern void regvm_asm_add_imm_self_branch_s(void);
+-#endif /* QJS_REGVM_ASM */
+ 
+ /*
+  * Whether a value held in a register carries a reference the frame owns.
+@@ -25055,9 +24857,6 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+  *  - Cold halves out of line: the engine's slow routines are reached only
+  *    through noinline `*_slow` functions, so a handler has no prologue.
+  */
+-#if QJS_REGVM_THREAD && QJS_REGVM_ASM
+-#error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
+-#endif
+ 
+ /* Clang 19+ preserve_none makes every register-VM argument register
+    caller-saved; the handlers, their declarations and the dispatch type must
+@@ -25161,13 +24960,6 @@ typedef struct JSRegRun {
+     int       local_count;      /* how many JSValues the walk owns */
+     int       arg_owned;        /* 1 when the argument area holds our dups */
+     JSStackFrame sf_embed;      /* a nested frame's JSStackFrame lives here */
+-#ifdef QJS_REGVM_RCCHECK
+-    /* Section 6.2 checker state for this frame. */
+-    JSRegRCC *rcc;
+-    int32_t  *rcc_shadow;       /* one value id per register, -1 unwritten */
+-    int       rcc_prev;         /* record index of the previous instruction */
+-    const uint8_t *rcc_ip;      /* its code address, for the report */
+-#endif
+     /* The step engine's coroutine resume marker (the monolith keeps its own in
+        a local). A yield/await twin compares it with the instruction's address
+        to tell a resume from a fresh suspension. */
+@@ -25639,16 +25431,7 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS);
+ #define T_FAIL()  do { f->ret = JS_EXCEPTION; return NULL; } while (0)
+ #endif
+ #ifdef QJS_REGVM_COUNT
+-#ifdef QJS_REGVM_DYNADJ
+-#define T_COUNT_INC(o) do { \
+-            js_regvm_count[o]++; \
+-            if (js_regvm_prev_op >= 0) \
+-                js_regvm_dyn_adj[(size_t)js_regvm_prev_op * ROP_COUNT + (o)]++; \
+-            js_regvm_prev_op = (o); \
+-        } while (0)
+-#else
+ #define T_COUNT_INC(o) js_regvm_count[o]++
+-#endif
+ #else
+ #define T_COUNT_INC(o) ((void)0)
+ #endif
+@@ -26534,189 +26317,10 @@ static uint8_t *REGVM_CC regvm_t_to_loop(REGVM_ARGS)
+     return ip;
+ }
+ 
+-#ifdef QJS_REGVM_RCCHECK
+-/*
+- * Section 6.2, the value-id shadow checker.
+- *
+- * The section 6.1 analysis proves which registers may hold a count and where a
+- * plain store is safe; this is the runtime belt to that analysis' braces. The
+- * encoder emits one record per instruction -- its code offset, the value id its
+- * destination takes, the value ids its register operands must still hold, its
+- * plain-store claim and its return release set. The frame keeps one shadow
+- * value id per register. At each dispatch the previous instruction's store is
+- * applied to the shadow and the current instruction's reads are checked against
+- * it, so a register that holds the wrong value, a plain store onto a counted
+- * value, or a count outside a return's release set aborts with a report.
+- */
+-typedef struct JSRegRCCOp {
+-    int32_t reg;
+-    int32_t vid;
+-    uint8_t phi;            /* a coalesced phi: no instruction defines it */
+-} JSRegRCCOp;
+-
+-typedef struct JSRegRCCRec {
+-    uint32_t off;           /* code offset of the opcode byte */
+-    int32_t dst_reg;        /* -1 when the instruction has no register result */
+-    int32_t dst_vid;
+-    int32_t dst2_reg;       /* the second result of a yield/with ref form, or -1 */
+-    int32_t dst2_vid;
+-    int32_t rel;            /* release-set index, -1 when not a return/throw */
+-    uint8_t plain;          /* section 6.1: the destination was NONE */
+-    uint8_t n_src;
+-    JSRegRCCOp src[4];
+-} JSRegRCCRec;
+-
+-struct JSRegRCC {
+-    int n_recs;
+-    JSRegRCCRec *recs;      /* sorted by `off` (IR order) */
+-    int n_rels;
+-    int rel_bytes;          /* registers covered by each release set */
+-    uint8_t *rels;          /* n_rels * rel_bytes */
+-    int reg_count;          /* frame registers (the shadow's size) */
+-};
+-
+-static int regvm_rcc_uf_find(int *uf, int v);
+-static void regvm_rcc_uf_union(int *uf, int a, int b);
+-
+-static void regvm_rcc_fail(JSRegRun *f, JSRegRCCRec *r, const char *what, int reg,
+-                           long want, long got)
+-{
+-    long off = f->rcc_ip ? (long)(f->rcc_ip - f->b->regvm_code) : -1;
+-    (void)r;
+-    fprintf(stderr, "##RCCHECK## %s reg=%d want=%ld got=%ld off=%ld len=%d regs=%d line=%d col=%d\n",
+-            what, reg, want, got, off, f->b->regvm_len, f->b->regvm_reg_count,
+-            f->b->line_num, f->b->col_num);
+-    fflush(stderr);
+-    abort();
+-}
+-
+-static void regvm_rcc_check(JSRegRun *f, const uint8_t *ip)
+-{
+-    JSRegRCC *rcc = f->rcc;
+-    JSRegRCCRec *r;
+-    long off;
+-    int lo, hi, idx = -1, i;
+-
+-    if (!rcc || !rcc->recs)
+-        return;
+-    off = (long)(ip - f->b->regvm_code);
+-    lo = 0;
+-    hi = rcc->n_recs - 1;
+-    while (lo <= hi) {
+-        int mid = (lo + hi) >> 1;
+-        if ((long)rcc->recs[mid].off == off) { idx = mid; break; }
+-        if ((long)rcc->recs[mid].off < off) lo = mid + 1;
+-        else hi = mid - 1;
+-    }
+-    if (idx < 0)
+-        return;                 /* a stub, or bytecode with no side table */
+-    r = &rcc->recs[idx];
+-    f->rcc_ip = ip;             /* the failing instruction, for regvm_rcc_fail */
+-    if (!f->rcc_shadow) {
+-        f->rcc_shadow = js_malloc(f->ctx,
+-                                  (size_t)rcc->reg_count * sizeof(int32_t));
+-        if (!f->rcc_shadow) { f->rcc = NULL; return; }
+-        for (i = 0; i < rcc->reg_count; i++)
+-            f->rcc_shadow[i] = -1;
+-    }
+-    /* Apply the previous instruction's store: the shadow must reflect the state
+-       before this instruction, which is exactly the state after the last one. */
+-    if (f->rcc_prev >= 0) {
+-        JSRegRCCRec *pv = &rcc->recs[f->rcc_prev];
+-        if (pv->dst_reg >= 0)
+-            f->rcc_shadow[pv->dst_reg] = pv->dst_vid;
+-        if (pv->dst2_reg >= 0)
+-            f->rcc_shadow[pv->dst2_reg] = pv->dst2_vid;
+-    }
+-    /*
+-     * A suspend re-dispatches its own instruction on resume: the await/yield
+-     * reads and clears its operand on the first pass, and the resume delivers
+-     * the result into the destination. The same index twice therefore means the
+-     * frame was resumed, so the operands the first pass consumed are gone; forget
+-     * them and keep the destination the previous-store step just learned.
+-     */
+-    if (idx == f->rcc_prev) {
+-        for (i = 0; i < r->n_src; i++) {
+-            int reg = r->src[i].reg;
+-            if (reg >= 0 && reg < rcc->reg_count && reg != r->dst_reg &&
+-                reg != r->dst2_reg)
+-                f->rcc_shadow[reg] = -1;
+-        }
+-        return;
+-    }
+-    for (i = 0; i < r->n_src; i++) {
+-        int reg = r->src[i].reg;
+-        if (reg < 0 || reg >= rcc->reg_count)
+-            continue;
+-        /*
+-         * A coalesced phi is the one value a read may find under a different id:
+-         * the allocator gave the phi and its incoming value the same register and
+-         * dropped the edge copy, so the register still holds the incoming value's
+-         * id when the phi is read. The content is the phi's by construction.
+-         */
+-        if (r->src[i].phi)
+-            continue;
+-        if (f->rcc_shadow[reg] == -1) {
+-            /* A generator or async resume restores the register file without
+-               running its definitions, so the shadow has no history for the
+-               register; the encoder already proved the read defined. Learn the
+-               id on the first read. */
+-            f->rcc_shadow[reg] = r->src[i].vid;
+-            continue;
+-        }
+-        if (f->rcc_shadow[reg] != r->src[i].vid)
+-            regvm_rcc_fail(f, r, "read", reg, r->src[i].vid,
+-                           f->rcc_shadow[reg]);
+-    }
+-    if (r->plain && r->dst_reg >= 0 && JS_VALUE_HAS_REF_COUNT(f->fr[r->dst_reg]))
+-        regvm_rcc_fail(f, r, "plain", r->dst_reg, 0, 1);
+-    if (r->plain && r->dst2_reg >= 0 &&
+-        JS_VALUE_HAS_REF_COUNT(f->fr[r->dst2_reg]))
+-        regvm_rcc_fail(f, r, "plain", r->dst2_reg, 0, 1);
+-    if (r->rel >= 0) {
+-        const uint8_t *rs = rcc->rels + (size_t)r->rel * rcc->rel_bytes;
+-        for (i = 0; i < rcc->rel_bytes; i++) {
+-            if (!rs[i] && JS_VALUE_HAS_REF_COUNT(f->fr[i]))
+-                regvm_rcc_fail(f, r, "return", i, 0, 1);
+-        }
+-    }
+-    f->rcc_prev = idx;
+-    f->rcc_ip = ip;
+-}
+-
+-/* Forward declaration: the builder lives with the section 6.1 pass, after the
+-   physical-register map it needs is in scope. */
+-static JSRegRCC *regvm_rcc_build(JSContext *ctx, JSRegIR *ir,
+-                                 const int *insn_pc, int n_values,
+-                                 const int *ireg, int scratch_reg, int win_base,
+-                                 int cycle_reg, int reg_count,
+-                                 const int *rcc_canon);
+-static void regvm_rcc_free(JSContext *ctx, JSRegRCC *rcc);
+-
+-/* The section 6.2 hook, spelled so it can sit inside a macro definition. */
+-#define REGVM_RCC_HOOK(f_, ip_) regvm_rcc_check((f_), (ip_))
+-
+-static void js_free_regvm_rcc(JSRuntime *rt, JSFunctionBytecode *b)
+-{
+-    if (!b->regvm_rcc)
+-        return;
+-    js_free_rt(rt, b->regvm_rcc->recs);
+-    js_free_rt(rt, b->regvm_rcc->rels);
+-    js_free_rt(rt, b->regvm_rcc);
+-    b->regvm_rcc = NULL;
+-}
+-#endif /* QJS_REGVM_RCCHECK */
+-#ifndef QJS_REGVM_RCCHECK
+-#define REGVM_RCC_HOOK(f_, ip_) ((void)0)
+-#endif
+-
+ static uint8_t *REGVM_CC regvm_t_dispatch(REGVM_ARGS)
+ {
+     regvm_handler h = regvm_threaded[*ip];
+     T_COUNT_INC(*ip);
+-#ifdef QJS_REGVM_RCCHECK
+-    regvm_rcc_check(f, ip);
+-#endif
+     __attribute__((musttail)) return h(REGVM_PASS);
+ }
+ 
+@@ -30550,10 +30154,6 @@ regvm_record_release(JSRuntime *rt, JSRegRun *rec)
+     }
+     if (unlikely(sf->var_ref_count != 0))
+         js_closcyc_frame(rt, sf, true);
+-#ifdef QJS_REGVM_RCCHECK
+-    js_free_rt(rt, rec->rcc_shadow);
+-    rec->rcc_shadow = NULL;
+-#endif
+     regvm_arena_pop(rt, rec);
+ }
+ 
+@@ -30794,17 +30394,8 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
+     rec->caller = caller;
+     rec->ret_ip = ret_ip;
+     rec->ret_dst = ret_dst;
+-#ifdef QJS_REGVM_RCCHECK
+-    rec->ctx = cb->realm;
+-#endif
+     rec->b = cb;
+     rec->pic = cb->regvm_pic;
+-#ifdef QJS_REGVM_RCCHECK
+-    rec->rcc = cb->regvm_rcc;
+-    rec->rcc_shadow = NULL;
+-    rec->rcc_prev = -1;
+-    rec->rcc_ip = NULL;
+-#endif
+     rec->sf = sf;
+     rec->func = co;
+     rec->cap_ip = NULL;
+@@ -30981,17 +30572,8 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+     rec->caller = caller;
+     rec->ret_ip = ret_ip;
+     rec->ret_dst = ret_dst;
+-#ifdef QJS_REGVM_RCCHECK
+-    rec->ctx = cb->realm;
+-#endif
+     rec->b = cb;
+     rec->pic = cb->regvm_pic;
+-#ifdef QJS_REGVM_RCCHECK
+-    rec->rcc = cb->regvm_rcc;
+-    rec->rcc_shadow = NULL;
+-    rec->rcc_prev = -1;
+-    rec->rcc_ip = NULL;
+-#endif
+     rec->sf = sf;
+     rec->func = co;
+     rec->cap_ip = NULL;
+@@ -31088,9 +30670,6 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
+    still defined. Declared here for the QJS_REGVM_STEPCHECK loop. */
+ uint8_t *regvm_step(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx);
+ 
+-#if QJS_REGVM_ASM
+-static __attribute__((used)) int js_regvm_execute(JSRegAsmState *ast)
+-#else
+ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                                 JSValueConst this_obj, JSValueConst new_target,
+                                 int argc, JSValueConst *argv,
+@@ -31099,41 +30678,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                                 JSValue *var_buf, JSValue *stack_buf,
+                                 JSValue *sp, uint8_t *pc, int flags,
+                                 int regvm_throw_pending)
+-#endif
+ {
+-#if QJS_REGVM_ASM
+-    JSContext *caller_ctx = ast->caller_ctx;
+-    JSContext *ctx = ast->ctx;
+-    JSRuntime *rt = ctx->rt;
+-    JSObject *p = JS_VALUE_GET_OBJ(ast->sf->cur_func);
+-    JSVarRef **var_refs = ast->var_refs;
+-    JSFunctionBytecode *b = ast->b;
+-    JSStackFrame *sf = ast->sf;
+-    JSValueConst func_obj = ast->func_obj;
+-    JSValueConst this_obj = ast->this_obj;
+-    JSValueConst new_target = ast->new_target;
+-    int argc = ast->argc;
+-    JSValueConst *argv = ast->argv;
+-    JSValue *local_buf = ast->local_buf, *arg_buf = ast->arg_buf;
+-    JSValue *var_buf = ast->var_buf, *stack_buf = ast->stack_buf;
+-    int flags = ast->flags;
+-    /* a coroutine frame is resumed with argv == its own heap arg_buf, which
+-       async_func_init filled with owned references */
+-    int arg_owned = (arg_buf != (JSValue *)argv) ||
+-                    (flags & JS_CALL_FLAG_GENERATOR);
+-    int regvm_throw_pending = ast->throw_pending;
+-    JSValue *regs;
+-    uint8_t *pc = ast->pc;
+-    JSValue *sp = ast->sp;
+-    JSValue ret_val = JS_UNDEFINED;
+-    JSValue *pval;
+-    int i;
+-    JSRegCtl *regvm_ctl = NULL;
+-    int regvm_nctl = 0;
+-    uint8_t *regvm_rpc = NULL;
+-    int regvm_resume_pending = 0;
+-    uint8_t *regvm_resume_marker = NULL;
+-#else
+     JSContext *ctx = b->realm;
+     JSRuntime *rt = ctx->rt;
+     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+@@ -31156,7 +30701,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+ #if QJS_AOT_PROFILE
+     /* Previous op start, for backward-branch (loop) detection. */
+     uint8_t *aot_prev_rpc = NULL;
+-#endif
+ #endif
+  restart:
+     {
+@@ -31185,17 +30729,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+            contents). */
+         JSRegRun run;
+         run.caller_ctx = caller_ctx;
+-#ifdef QJS_REGVM_RCCHECK
+-        run.ctx = ctx;
+-#endif
+         run.b = b;
+         run.pic = b->regvm_pic;
+-#ifdef QJS_REGVM_RCCHECK
+-        run.rcc = b->regvm_rcc;
+-        run.rcc_shadow = NULL;
+-        run.rcc_prev = -1;
+-        run.rcc_ip = NULL;
+-#endif
+         run.sf = sf;
+         sf->rv_rec = &run;
+         run.func = JS_VALUE_GET_OBJ(sf->cur_func);
+@@ -31286,23 +30821,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         goto done_generator; \
+     } while (0)
+ 
+-#if QJS_REGVM_ASM
+-        if (!ast->fresh) {
+-            /* Re-entered by the driver for another cold stretch. The previous
+-               stretch saved its state; restore it. */
+-            regs = ast->regs;
+-            rpc = ast->rpc;
+-            sp = ast->sp;
+-            pc = ast->pc;
+-            regvm_ctl = ast->ctl;
+-            regvm_nctl = ast->nctl;
+-            regvm_rpc = ast->resume_rpc;
+-            regvm_resume_marker = ast->resume_marker;
+-            regvm_resume_pending = ast->resume_pending;
+-            goto regvm_stretch;
+-        }
+-        ast->fresh = 0;
+-#endif
+         if (!b->regvm_compiled) {
+             JS_ThrowInternalError(caller_ctx,
+                                   "register VM: function was not lowered "
+@@ -31658,16 +31176,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             [ROP_slot_put] = &&L_ROP_slot_put,
+         };
+ #ifdef QJS_REGVM_COUNT
+-#ifdef QJS_REGVM_DYNADJ
+-#define REGVM_COUNT_INC(o) do { \
+-            js_regvm_count[o]++; \
+-            if (js_regvm_prev_op >= 0) \
+-                js_regvm_dyn_adj[(size_t)js_regvm_prev_op * ROP_COUNT + (o)]++; \
+-            js_regvm_prev_op = (o); \
+-        } while (0)
+-#else
+ #define REGVM_COUNT_INC(o) js_regvm_count[o]++
+-#endif
+ #else
+ #define REGVM_COUNT_INC(o) ((void)0)
+ #endif
+@@ -31719,25 +31228,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             REGVM_NEXT(); \
+         } while (0)
+ 
+-#if QJS_REGVM_ASM
+-/* Stop *before* a hot opcode, leaving rpc at it, and hand it to the driver. */
+-#define REGVM_NEXT() do { \
+-            op = *rpc; \
+-            REGVM_COUNT_INC(op); \
+-            if (unlikely(ast->exec_current_once)) { \
+-                ast->exec_current_once = 0; \
+-            } else if (unlikely(regvm_asm_hot[op] && !ast->asm_off)) { \
+-                ast->regs = regs; ast->rpc = rpc; ast->pc = pc; ast->sp = sp; \
+-                ast->ctl = regvm_ctl; ast->nctl = regvm_nctl; \
+-                ast->resume_rpc = regvm_rpc; \
+-                ast->resume_marker = regvm_resume_marker; \
+-                ast->resume_pending = regvm_resume_pending; \
+-                return REGVM_EXIT_STRETCH; \
+-            } \
+-            rpc++; \
+-            goto *regvm_dispatch[op]; \
+-        } while (0)
+-#else
+ #if QJS_REGVM_THREAD
+ /*
+  * Run the threaded chain from here. It returns the address of an opcode with
+@@ -31756,7 +31246,6 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             } \
+             op = *rpc++; \
+             REGVM_COUNT_INC(op); \
+-            REGVM_RCC_HOOK(&run, rpc - 1); \
+             goto *regvm_dispatch[op]; \
+         } while (0)
+ #else
+@@ -31767,21 +31256,13 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             goto *regvm_dispatch[op]; \
+         } while (0)
+ #endif
+-#endif
+ 
+ /* Reconcile the deferred-free table on a backward branch. The threaded
+    handlers do this through REGVM_DRC_BACKEDGE; otherwise the monolith only
+    reaches a safepoint at a JS_Call boundary. Only taken back edges pay the
+    check. */
+-#ifdef QJS_DRC_NO_BACKEDGE
+-#define REGVM_MONO_BACKEDGE(off_) ((void)(off_))
+-#else
+ #define REGVM_MONO_BACKEDGE(off_) \
+     do { if (unlikely((off_) < 0)) js_drc_safepoint(ctx->rt); } while (0)
+-#endif
+-#if QJS_REGVM_ASM
+-     regvm_stretch:
+-#endif
+ #if !QJS_REGVM_STEPCHECK
+         REGVM_NEXT();
+ #endif
+@@ -34697,27 +34178,14 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+         goto done;
+ 
+      done_generator:
+-#if defined(QJS_REGVM_RCCHECK) && QJS_REGVM_THREAD
+-        js_free(ctx, run.rcc_shadow);
+-        run.rcc_shadow = NULL;
+-#endif
+         sf->cur_pc = pc;
+         sf->cur_sp = sp;
+         regs[b->regvm_reg_count] = js_int32(regvm_nctl);
+         rt->regvm_cur = sf->rv_light;
+         rt->current_stack_frame = sf->prev_frame;
+-#if QJS_REGVM_ASM
+-        ast->ret = ret_val;
+-        return REGVM_EXIT_DONE;
+-#else
+         return ret_val;
+-#endif
+ 
+      done:
+-#if defined(QJS_REGVM_RCCHECK) && QJS_REGVM_THREAD
+-        js_free(ctx, run.rcc_shadow);
+-        run.rcc_shadow = NULL;
+-#endif
+         if (unlikely(sf->var_ref_count != 0)) {
+             /* Close the variable references. A value still in the frame can own
+                the last closure over one of these cells, so hold a reference on
+@@ -34748,12 +34216,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+             js_closcyc_frame(rt, sf, true);
+         rt->regvm_cur = sf->rv_light;
+         rt->current_stack_frame = sf->prev_frame;
+-#if QJS_REGVM_ASM
+-        ast->ret = ret_val;
+-        return REGVM_EXIT_DONE;
+-#else
+         return ret_val;
+-#endif
+     }
+ }
+ 
+@@ -36695,247 +36158,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+ #undef RD_U32
+ #undef RD_I32
+ 
+-#if QJS_REGVM_ASM
+-/*
+- * The driver. It stands in for the assembly core so the protocol can be proven
+- * before the aarch64 core is written: run a C stretch, and when C stops at a hot
+- * opcode, execute exactly that opcode and go again. The assembly core replaces
+- * this function one handler at a time, and the hot set is what keeps the two
+- * sides in step.
+- */
+-void regvm_asm_driver_ready(void);
+-
+-static void regvm_hot_step(JSRegAsmState *st)
+-{
+-    switch (*st->rpc) {
+-    case ROP_load_undefined:
+-        {
+-            /* rpc is at the opcode; the operand follows it */
+-            int d = (int)regvm_ld_u16(st->rpc + 1);
+-            st->rpc += 3;
+-            if (REGVM_HAS_COUNT(st->regs[d]))
+-                JS_FreeValue(st->ctx, st->regs[d]);
+-            st->regs[d] = JS_UNDEFINED;
+-        }
+-        break;
+-    default:
+-        break;
+-    }
+-}
+-
+-static JSValue js_regvm_asm_driver(JSRegAsmState *st)
+-{
+-    static int inited;
+-    if (!inited) {
+-        inited = 1;
+-        regvm_asm_hot[ROP_load_undefined] = 1;
+-    }
+-    for (;;) {
+-        int r = js_regvm_execute(st);
+-        if (r != REGVM_EXIT_STRETCH)
+-            return st->ret;
+-        regvm_hot_step(st);
+-    }
+-}
+-#endif /* QJS_REGVM_ASM */
+-
+-#if QJS_REGVM_ASM
+-#if defined(__aarch64__)
+-/*
+- * The dispatch core. x19 holds the state, x20 the register pc, x21 the
+- * register-file base and x22 the dispatch table. All four are callee-saved
+- * under AAPCS64, so a C call preserves them and the core never saves or
+- * restores them around a stretch -- it only commits rpc on the way into C and
+- * reloads rpc/regs on the way out.
+- */
+-__asm__(
+-".text\n"
+-".p2align 2\n"
+-".globl js_regvm_asm_run\n"
+-".type js_regvm_asm_run, %function\n"
+-"js_regvm_asm_run:\n"
+-"  stp x29, x30, [sp, #-16]!\n"
+-"  mov x29, sp\n"
+-"  mov x19, x0\n"
+-"  mov x22, x1\n"
+-"  b regvm_asm_slow\n"
+-".globl regvm_asm_slow\n"
+-"regvm_asm_slow:\n"
+-"  str x20, [x19, #0]\n"          /* commit the cold opcode position */
+-"  mov x0, x19\n"
+-"  bl  regvm_asm_stretch\n"
+-"  cbnz w0, .Lasm_exit\n"
+-"  ldr x20, [x19, #0]\n"          /* C advanced the logical pc */
+-"  ldr x21, [x19, #8]\n"          /* and may have moved the window */
+-"  b .Lasm_dispatch\n"
+-".Lasm_dispatch:\n"
+-"  ldrb w23, [x20]\n"
+-"  ldr x23, [x22, x23, lsl #3]\n"
+-"  br x23\n"
+-".Lasm_exit:\n"
+-"  ldp x0, x1, [x19, #16]\n"
+-"  ldp x29, x30, [sp], #16\n"
+-"  ret\n"
+-".size js_regvm_asm_run, .-js_regvm_asm_run\n"
+-
+-/* ROP_load_undefined: dst = undefined, releasing the old value if it is
+-   refcounted. The tag test is inline; only the release leaves the core. */
+-".globl regvm_asm_load_undefined\n"
+-"regvm_asm_load_undefined:\n"
+-"  add x20, x20, #1\n"
+-"  ldrh w23, [x20], #2\n"
+-"  lsl w23, w23, #4\n"
+-"  add x9, x21, w23, uxtw\n"
+-"  ldr x10, [x9, #8]\n"
+-"  mov w11, #-9\n"                /* (unsigned)JS_TAG_FIRST */
+-"  cmp w10, w11\n"
+-"  b.lo .Lasm_ud_store\n"
+-"  mov x0, x19\n"
+-"  mov x1, x9\n"
+-"  bl regvm_asm_free_old\n"
+-".Lasm_ud_store:\n"
+-"  add x9, x21, w23, uxtw\n"
+-"  str xzr, [x9]\n"
+-"  mov w10, #3\n"                 /* JS_TAG_UNDEFINED */
+-"  str x10, [x9, #8]\n"
+-"  b .Lasm_dispatch\n"
+-
+-/* ROP_branch_nlt_s: if !(regs[la] < regs[rb]) goto +off. Both-int inline;
+-   anything else re-enters C with this opcode treated as cold. */
+-".globl regvm_asm_branch_nlt_s\n"
+-"regvm_asm_branch_nlt_s:\n"
+-"  mov x27, x20\n"
+-"  add x20, x20, #1\n"
+-"  ldrb w24, [x20], #1\n"
+-"  ldrb w25, [x20], #1\n"
+-"  ldrsb x26, [x20], #1\n"
+-"  lsl w9, w24, #4\n"
+-"  lsl w10, w25, #4\n"
+-"  add x9, x21, w9, uxtw\n"
+-"  add x10, x21, w10, uxtw\n"
+-"  ldr w11, [x9, #8]\n"
+-"  ldr w12, [x10, #8]\n"
+-"  orr w13, w11, w12\n"
+-"  cbnz w13, .Lasm_slow_cmp\n"
+-"  ldr w14, [x9]\n"
+-"  ldr w15, [x10]\n"
+-"  cmp w14, w15\n"
+-"  cset w16, lt\n"
+-"  eor w16, w16, #1\n"
+-"  cbz w16, .Lasm_dispatch\n"
+-"  add x20, x20, x26\n"
+-"  b .Lasm_dispatch\n"
+-".Lasm_slow_cmp:\n"
+-"  str x27, [x19, #0]\n"
+-"  mov x0, x19\n"
+-"  ldrb w1, [x27]\n"
+-"  bl regvm_asm_once\n"
+-"  cbnz w0, .Lasm_exit\n"
+-"  ldr x20, [x19, #0]\n"
+-"  ldr x21, [x19, #8]\n"
+-"  b .Lasm_dispatch\n"
+-
+-/* ROP_add_imm_self_branch_s: regs[d] += imm; goto +off. The int case is
+-   inline; the float-overflow and non-int cases fall back to C. */
+-".globl regvm_asm_add_imm_self_branch_s\n"
+-"regvm_asm_add_imm_self_branch_s:\n"
+-"  mov x27, x20\n"
+-"  add x20, x20, #1\n"
+-"  ldrb w24, [x20], #1\n"
+-"  ldrsb x25, [x20], #1\n"
+-"  ldrsb x26, [x20], #1\n"
+-"  lsl w9, w24, #4\n"
+-"  add x9, x21, w9, uxtw\n"
+-"  ldr w10, [x9, #8]\n"
+-"  cbnz w10, .Lasm_slow_add\n"
+-"  ldr w11, [x9]\n"
+-"  adds w12, w11, w25\n"
+-"  b.vs .Lasm_slow_add\n"
+-"  mov w12, w12\n"
+-"  str x12, [x9]\n"
+-"  str xzr, [x9, #8]\n"
+-"  add x20, x20, x26\n"
+-"  b .Lasm_dispatch\n"
+-".Lasm_slow_add:\n"
+-"  str x27, [x19, #0]\n"
+-"  mov x0, x19\n"
+-"  ldrb w1, [x27]\n"
+-"  bl regvm_asm_once\n"
+-"  cbnz w0, .Lasm_exit\n"
+-"  ldr x20, [x19, #0]\n"
+-"  ldr x21, [x19, #8]\n"
+-"  b .Lasm_dispatch\n"
+-);
+-/*
+- * Cold entry: C runs a stretch from st->rpc until the next hot opcode or exit.
+- *
+- * Selective entry lives here. A function whose hot opcodes are sparse bounces
+- * between the interpreters, and each bounce costs more than the hot instruction
+- * it was for -- Box2D at three hot opcodes is exactly that. A stretch that has
+- * to hand back too often gives up and lets C finish the activation: the loop
+- * that amortises its transitions never reaches the cap, mixed code pays it once
+- * and stops.
+- */
+-#define REGVM_ASM_TX_MAX 8
+-
+-static __attribute__((used)) int regvm_asm_stretch(JSRegAsmState *st)
+-{
+-    st->exec_current_once = 0;
+-    if (++st->asm_tx > REGVM_ASM_TX_MAX)
+-        st->asm_off = 1;
+-    return js_regvm_execute(st);
+-}
+-
+-/* One-op entry for a hot handler's own slow path: run the instruction at rpc
+-   once even though the core owns it, then carry on. C clears the flag at its
+-   first dispatch, so nothing is reclassified. */
+-static __attribute__((used)) int regvm_asm_once(JSRegAsmState *st)
+-{
+-    st->exec_current_once = 1;
+-    return js_regvm_execute(st);
+-}
+-
+-
+-/* Release the value a definition overwrites, out of line. */
+-static __attribute__((used)) void regvm_asm_free_old(JSRegAsmState *st,
+-                                                   JSValue *slot)
+-{
+-    if (JS_VALUE_HAS_REF_COUNT(*slot))
+-        JS_FreeValue(st->ctx, *slot);
+-}
+-
+-static void (*regvm_asm_table[ROP_COUNT])(void);
+-
+-static void regvm_asm_table_init(void)
+-{
+-    int i;
+-    for (i = 0; i < ROP_COUNT; i++)
+-        regvm_asm_table[i] = regvm_asm_slow;
+-    regvm_asm_table[ROP_load_undefined] = regvm_asm_load_undefined;
+-    regvm_asm_hot[ROP_load_undefined] = 1;
+-    regvm_asm_table[ROP_branch_nlt_s] = regvm_asm_branch_nlt_s;
+-    regvm_asm_hot[ROP_branch_nlt_s] = 1;
+-    regvm_asm_table[ROP_add_imm_self_branch_s] = regvm_asm_add_imm_self_branch_s;
+-    regvm_asm_hot[ROP_add_imm_self_branch_s] = 1;
+-}
+-
+-static JSValue regvm_asm_enter(JSRegAsmState *st)
+-{
+-    static int inited;
+-    if (!inited) {
+-        inited = 1;
+-        regvm_asm_table_init();
+-    }
+-    return js_regvm_asm_run(st, (void *const *)regvm_asm_table);
+-}
+-#else  /* !__aarch64__ */
+-static JSValue regvm_asm_enter(JSRegAsmState *st)
+-{
+-    return js_regvm_asm_driver(st);
+-}
+-#endif
+ 
+-#endif /* QJS_REGVM_ASM */
+ 
+ #endif /* QJS_REGVM */
+ 
+@@ -37173,50 +36396,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+        both arrive here; the interpreter tells them apart from the stack
+        pointer. */
+  regvm_handoff:
+-#if QJS_REGVM_ASM
+-    {
+-        JSRegAsmState ast;
+-        ast.rpc = NULL;
+-        ast.regs = NULL;
+-        ast.ret = JS_UNDEFINED;
+-        ast.caller_ctx = caller_ctx;
+-        ast.ctx = b->realm;
+-        ast.b = b;
+-        ast.sf = sf;
+-        ast.func_obj = func_obj;
+-        ast.this_obj = this_obj;
+-        ast.new_target = new_target;
+-        ast.argc = argc;
+-        ast.argv = argv;
+-        ast.local_buf = local_buf;
+-        ast.arg_buf = arg_buf;
+-        ast.var_buf = var_buf;
+-        ast.stack_buf = stack_buf;
+-        ast.var_refs = p->u.func.var_refs;
+-        ast.flags = flags;
+-        ast.throw_pending = regvm_throw_pending;
+-        ast.pc = pc;
+-        ast.sp = sp;
+-        ast.fresh = 1;
+-        ast.exec_current_once = 0;
+-        ast.asm_tx = 0;
+-        ast.asm_off = 0;
+-        ast.ctl = NULL;
+-        ast.nctl = 0;
+-        ast.resume_marker = NULL;
+-        ast.resume_pending = 0;
+-        ast.resume_rpc = NULL;
+-        {
+-            JSValue _r = regvm_asm_enter(&ast);
+-#if !defined(NDEBUG)
+-            if (argv_snapshot_n > 0)
+-                assert(memcmp(argv, argv_snapshot,
+-                              sizeof(JSValue) * argv_snapshot_n) == 0);
+-#endif
+-            return _r;
+-        }
+-    }
+-#else
+     {
+         JSValue _r = js_regvm_execute(caller_ctx, func_obj, this_obj,
+                                       new_target, argc, argv, sf, b, local_buf,
+@@ -37229,7 +36408,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #endif
+         return _r;
+     }
+-#endif
+ 
+ #else
+  restart:
+@@ -58377,11 +57555,6 @@ static int regvm_homes_mode(void)
+ 
+ /* The ownership shadow checker instruments the threaded dispatch and the
+    monolith's threaded entry, so it needs the threaded build. */
+-#if defined(QJS_REGVM_RCCHECK) && (!QJS_REGVM_THREAD || QJS_REGVM_ASM)
+-#error "QJS_REGVM_RCCHECK needs QJS_REGVM_THREAD=1 and QJS_REGVM_ASM=0"
+-#endif
+-
+-
+ 
+ #ifndef QJS_REGVM_VERIFY
+ #ifdef NDEBUG
+@@ -58393,8 +57566,8 @@ static int regvm_homes_mode(void)
+ 
+ /* The AOT profiler counts at the monolith's dispatch point, so it needs the
+    plain non-threaded build. */
+-#if QJS_AOT_PROFILE && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_ASM || QJS_REGVM_RECORD)
+-#error "QJS_AOT_PROFILE needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0"
++#if QJS_AOT_PROFILE && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_RECORD)
++#error "QJS_AOT_PROFILE needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_RECORD=0"
+ #endif
+ 
+ /*
+@@ -58416,8 +57589,8 @@ static int regvm_homes_mode(void)
+ #ifndef QJS_AOT_VERIFY
+ #define QJS_AOT_VERIFY 0
+ #endif
+-#if QJS_AOT && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_ASM || QJS_REGVM_RECORD)
+-#error "QJS_AOT needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_ASM=0 QJS_REGVM_RECORD=0"
++#if QJS_AOT && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_RECORD)
++#error "QJS_AOT needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_RECORD=0"
+ #endif
+ #if QJS_AOT_GEN && !QJS_REGVM
+ #error "QJS_AOT_GEN needs QJS_REGVM"
+@@ -58776,14 +57949,6 @@ typedef struct JSRegIR {
+     int aw_n;          /* number of values the index covers (0 = disabled) */
+     int aw_scanned;    /* instructions already folded into the index */
+     int aw_last_win;   /* last instruction naming the call window, or -1 */
+-#ifdef QJS_REGVM_RCCHECK
+-    /* Section 6.1 outputs the section 6.2 checker consumes, per instruction. */
+-    uint8_t *own_plain;     /* n_insns: 1 when the destination was NONE */
+-    int32_t *own_rel;       /* n_insns: release-set index, or -1 */
+-    uint8_t *own_relsets;   /* own_nrels * own_nreg bytes */
+-    int own_nrels;
+-    int own_nreg;
+-#endif
+ } JSRegIR;
+ 
+ /* Net control-stack effect of one register instruction. Counting per stack
+@@ -61548,16 +60713,6 @@ static int regvm_arg_retarget(JSRegIR *ir, int v,
+                 result = def;
+         }
+     }
+-#ifdef QJS_REGVM_ARGCHECK
+-    {
+-        int old = regvm_arg_retarget_scan(ir, v, home_of, n_values);
+-        if (old != result) {
+-            fprintf(stderr, "regvm ARGCHECK: v=%d fast=%d scan=%d\n",
+-                    v, result, old);
+-            abort();
+-        }
+-    }
+-#endif
+     return result;
+ }
+ 
+@@ -63132,17 +62287,6 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
+         if (!changed)
+             break;
+     }
+-#ifdef QJS_REGVM_RCCHECK
+-    /*
+-     * Built once, after the relaxation loop converges: `insn_pc[]` is final
+-     * here. Building it inside the loop (where the layout is recomputed each
+-     * iteration) leaked every table but the last whenever a branch widened.
+-     */
+-    if (out_rcc)
+-        *out_rcc = regvm_rcc_build(ctx, ir, insn_pc, n_values, ireg,
+-                                   scratch_reg, win_base, cycle_reg,
+-                                   reg_count, rcc_canon);
+-#endif
+ #ifdef QJS_REGVM_COUNT
+     if (REGVM_KNOB("REGVM_DUMP")) {
+         for (i = 0; i < ir->n_insns; i++)
+@@ -65249,7 +64393,7 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+ /* ======================= register-state dataflow ========================
+  *
+  * A forward, block-level dataflow over the final register IR that says, for
+- * every physical register at every point, whether it holds a reference count
++ * every physical register at every point, whether it holds a reference
+  * (OWN), provably does not (NONE), or might (MAYBE). Plain stores read a
+  * destination's state before it is written. It runs on physical registers,
+  * after allocation.
+@@ -65511,17 +64655,6 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+     /* Owned by the IR once the analysis completes; js_regvm_encode frees it. */
+     ir->own_init = NULL;
+     ir->own_undef = NULL;
+-#ifdef QJS_REGVM_RCCHECK
+-    /* The section 6.2 side-table pointers must be NULL on every path out of
+-       this function, including the early returns and the bails below:
+-       regvm_rcc_build reads them, and the done label in js_regvm_encode
+-       frees them. JSRegIR is a stack local that does not zero them. */
+-    ir->own_plain = NULL;
+-    ir->own_rel = NULL;
+-    ir->own_relsets = NULL;
+-    ir->own_nrels = 0;
+-    ir->own_nreg = 0;
+-#endif
+ 
+     if (n <= 0 || reg_count <= 0 || n_blocks <= 0)
+         return;
+@@ -65819,24 +64952,6 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+             memset(init_set, REG_INIT_INIT, nreg);
+             memset(undef_set, REG_INIT_INIT, nreg);
+         }
+-#ifdef QJS_REGVM_RCCHECK
+-        /* Section 6.2 consumes exactly what this replay already computes. */
+-        ir->own_nreg = nreg;
+-        ir->own_nrels = 0;
+-        ir->own_plain = js_malloc(ctx, n);
+-        ir->own_rel = js_malloc(ctx, (size_t)n * sizeof(int32_t));
+-        ir->own_relsets = NULL;
+-        if (!ir->own_plain || !ir->own_rel) {
+-            js_free(ctx, ir->own_plain);
+-            js_free(ctx, ir->own_rel);
+-            ir->own_plain = NULL;
+-            ir->own_rel = NULL;
+-        } else {
+-            memset(ir->own_plain, 0, n);
+-            for (i = 0; i < n; i++)
+-                ir->own_rel[i] = -1;
+-        }
+-#endif
+         for (b = 0; b < n_blocks; b++) {
+             if (bs[b] < 0)
+                 continue;
+@@ -65888,10 +65003,6 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+                     if (d >= 0 && st[d] == REG_OWN_NONE &&
+                         (d2 < 0 || st[d2] == REG_OWN_NONE)) {
+                         plain++;
+-#ifdef QJS_REGVM_RCCHECK
+-                        if (ir->own_plain)
+-                            ir->own_plain[i] = 1;
+-#endif
+                         if (dump)
+                             fprintf(stderr, "##OWN## i=%d r=%d plain\n", i, d);
+                     }
+@@ -65902,19 +65013,6 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+                         if (st[k] != REG_OWN_NONE)
+                             cnt++;
+                     nret++;
+-#ifdef QJS_REGVM_RCCHECK
+-                    if (ir->own_plain) {
+-                        uint8_t *ns = js_realloc(ctx, ir->own_relsets,
+-                                                 (size_t)(ir->own_nrels + 1) * nreg);
+-                        if (ns) {
+-                            uint8_t *dst = ns + (size_t)ir->own_nrels * nreg;
+-                            ir->own_relsets = ns;
+-                            for (k = 0; k < nreg; k++)
+-                                dst[k] = (st[k] != REG_OWN_NONE);
+-                            ir->own_rel[i] = ir->own_nrels++;
+-                        }
+-                    }
+-#endif
+                     if (cnt > owned_max)
+                         owned_max = cnt;
+                     ret_sum += cnt;
+@@ -66003,205 +65101,6 @@ done:
+     js_free(ctx, uni);
+ }
+ 
+-#ifdef QJS_REGVM_RCCHECK
+-/* The physical register an operand names, with the final scratch and window
+-   bases. `regvm_own_op_reg` above runs before those bases exist, so it sees
+-   neither; the checker wants them. */
+-static int regvm_own_op_reg_full(const JSRegInsn *in, int k, const int *ireg,
+-                                 int n_values, int scratch_reg, int win_base,
+-                                 int cycle_reg, int reg_count)
+-{
+-    int r;
+-    if (k >= in->n_ops || !regvm_rop_fmt[in->rop])
+-        return -1;
+-    r = regvm_reg_of(in, k, ireg, n_values, scratch_reg, win_base, cycle_reg);
+-    return (r >= 0 && r < reg_count) ? r : -1;
+-}
+-
+-/*
+- * Build the section 6.2 side table from the section 6.1 outputs and the final
+- * encoding. One record per IR instruction, in IR order, which is also
+- * increasing code offset, so the runtime can binary-search by offset.
+- */
+-static int regvm_rcc_uf_find(int *uf, int v)
+-{
+-    while (uf[v] != v) {
+-        uf[v] = uf[uf[v]];
+-        v = uf[v];
+-    }
+-    return v;
+-}
+-
+-static void regvm_rcc_uf_union(int *uf, int a, int b)
+-{
+-    a = regvm_rcc_uf_find(uf, a);
+-    b = regvm_rcc_uf_find(uf, b);
+-    if (a != b)
+-        uf[a] = b;
+-}
+-
+-static JSRegRCC *regvm_rcc_build(JSContext *ctx, JSRegIR *ir, const int *insn_pc,
+-                                 int n_values, const int *ireg, int scratch_reg,
+-                                 int win_base, int cycle_reg, int reg_count,
+-                                 const int *rcc_canon)
+-{
+-    int n = ir->insns ? ir->n_insns : 0, i, k;
+-    JSRegRCC *rcc;
+-
+-    if (n <= 0 || !ir->own_plain || !ir->own_rel)
+-        return NULL;
+-    rcc = js_malloc(ctx, sizeof(*rcc));
+-    if (!rcc)
+-        return NULL;
+-    memset(rcc, 0, sizeof(*rcc));
+-    rcc->n_recs = n;
+-    rcc->reg_count = reg_count;
+-    rcc->n_rels = ir->own_nrels;
+-    rcc->rel_bytes = ir->own_nreg;
+-    rcc->recs = js_malloc(ctx, (size_t)n * sizeof(JSRegRCCRec));
+-    if (!rcc->recs)
+-        goto fail;
+-    memset(rcc->recs, 0, (size_t)n * sizeof(JSRegRCCRec));
+-    if (rcc->n_rels > 0) {
+-        rcc->rels = js_malloc(ctx, (size_t)rcc->n_rels * rcc->rel_bytes);
+-        if (!rcc->rels)
+-            goto fail;
+-        memcpy(rcc->rels, ir->own_relsets,
+-               (size_t)rcc->n_rels * rcc->rel_bytes);
+-    }
+-    {
+-        uint8_t *has_def = js_mallocz(ctx,
+-                                      (size_t)(n_values > 0 ? n_values : 1));
+-        uint8_t *phi_def = js_mallocz(ctx,
+-                                      (size_t)(n_values > 0 ? n_values : 1));
+-        int *canon = js_malloc(ctx,
+-                               (size_t)(n_values > 0 ? n_values : 1) * sizeof(int));
+-        if (!has_def || !phi_def || !canon) {
+-            js_free(ctx, has_def);
+-            js_free(ctx, phi_def);
+-            js_free(ctx, canon);
+-            goto fail;
+-        }
+-        for (i = 0; i < n_values; i++)
+-            canon[i] = rcc_canon ? rcc_canon[i] : i;
+-        for (i = 0; i < n; i++) {
+-            const char *dfmt = regvm_rop_fmt[ir->insns[i].rop];
+-            int v;
+-            int di = regvm_own_dest_index(ir->insns[i].rop);
+-            if (!dfmt || dfmt[di] != 'r' || !regvm_own_has_dest(ir->insns[i].rop))
+-                continue;
+-            v = ir->insns[i].ops[di];
+-            if (v >= 0 && v < n_values) {
+-                has_def[v] = 1;
+-                /*
+-                 * A phi value is defined by the edge copies the allocator
+-                 * emits in the predecessors, and only where it did not
+-                 * coalesce them away. Where it did, the phi is read under the
+-                 * incoming value's id, so the id the register carries at the
+-                 * read is not the one the IR names and cannot be checked.
+-                 */
+-                if (ir->insns[i].origin == REGVM_ORIG_PHI)
+-                    phi_def[v] = 1;
+-            }
+-        }
+-        /*
+-         * A copy makes its destination name the same content as its source, and
+-         * the register allocator is free to coalesce the two into one register,
+-         * which turns the copy into a self move. Two value ids then name one
+-         * value, so a read of either is sound while the register still holds that
+-         * content. Canonicalise the ids over the copy relation; the shadow holds
+-         * the canonical id, so both names compare equal.
+-         */
+-        for (i = 0; i < n; i++) {
+-            int rop = ir->insns[i].rop;
+-            const char *cfmt = regvm_rop_fmt[rop];
+-            int a, b;
+-            if (!cfmt || cfmt[0] != 'r' || cfmt[1] != 'r')
+-                continue;
+-            if (rop != ROP_move && rop != ROP_move_s && rop != ROP_move_xfer)
+-                continue;
+-            a = ir->insns[i].ops[0];
+-            b = ir->insns[i].ops[1];
+-            if (a >= 0 && a < n_values && b >= 0 && b < n_values)
+-                regvm_rcc_uf_union(canon, a, b);
+-        }
+-        for (i = 0; i < n_values; i++)
+-            canon[i] = regvm_rcc_uf_find(canon, i);
+-        for (i = 0; i < n; i++) {
+-            JSRegInsn *in = &ir->insns[i];
+-            JSRegRCCRec *r = &rcc->recs[i];
+-            const char *fmt = regvm_rop_fmt[in->rop];
+-            int is_dest, di, di2, is_dest2;
+-
+-            r->off = (uint32_t)insn_pc[i];
+-            r->dst_reg = -1;
+-            r->dst_vid = -1;
+-            r->dst2_reg = -1;
+-            r->dst2_vid = -1;
+-            r->rel = ir->own_rel[i];
+-            r->plain = ir->own_plain[i];
+-            if (!fmt)
+-                continue;
+-            di = regvm_own_dest_index(in->rop);
+-            is_dest = regvm_own_has_dest(in->rop) && fmt[di] == 'r';
+-            if (is_dest) {
+-                int v = in->ops[di];
+-                r->dst_reg = regvm_own_op_reg_full(in, di, ireg, n_values,
+-                                                   scratch_reg, win_base,
+-                                                   cycle_reg, reg_count);
+-                r->dst_vid = (v >= 0 && v < n_values) ? canon[v] : v;
+-            }
+-            di2 = regvm_own_second_dest_index(in->rop);
+-            is_dest2 = is_dest && di2 >= 0 && di2 < in->n_ops && fmt[di2] == 'r';
+-            if (is_dest2) {
+-                int v = in->ops[di2];
+-                r->dst2_reg = regvm_own_op_reg_full(in, di2, ireg, n_values,
+-                                                    scratch_reg, win_base,
+-                                                    cycle_reg, reg_count);
+-                r->dst2_vid = (v >= 0 && v < n_values) ? canon[v] : v;
+-            }
+-            for (k = 0; fmt[k] && r->n_src < 4; k++) {
+-                int v;
+-                if (fmt[k] != 'r')
+-                    continue;
+-                if ((k == di && is_dest) || (k == di2 && is_dest2))
+-                    continue;   /* this operand is a destination, not a read */
+-                v = in->ops[k];
+-                r->src[r->n_src].reg = regvm_own_op_reg_full(in, k, ireg,
+-                                                             n_values,
+-                                                             scratch_reg, win_base,
+-                                                             cycle_reg, reg_count);
+-                r->src[r->n_src].vid = (v >= 0 && v < n_values) ? canon[v] : v;
+-                /* No instruction defines it: either a coalesced phi (whose
+-                   content the register already holds under its incoming value's
+-                   id) or a window/scratch/cycle pseudo-id, which the frame or
+-                   the caller owns rather than the IR. Either way the read is not
+-                   a claim the shadow can check. */
+-                r->src[r->n_src].phi =
+-                    !(v >= 0 && v < n_values && has_def[v]) ||
+-                    (v >= 0 && v < n_values && phi_def[v]);
+-                r->n_src++;
+-            }
+-        }
+-        js_free(ctx, has_def);
+-        js_free(ctx, phi_def);
+-        js_free(ctx, canon);
+-    }
+-    return rcc;
+-fail:
+-    regvm_rcc_free(ctx, rcc);
+-    return NULL;
+-}
+-
+-static void regvm_rcc_free(JSContext *ctx, JSRegRCC *rcc)
+-{
+-    if (!rcc)
+-        return;
+-    js_free(ctx, rcc->recs);
+-    js_free(ctx, rcc->rels);
+-    js_free(ctx, rcc);
+-}
+-#endif /* QJS_REGVM_RCCHECK */
+ 
+ /*
+  * Item 1.3 of the no-refusals plan: make a refused function visible at compile
+@@ -66470,13 +65369,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     }
+     fd->regvm_fill = NULL;
+     fd->regvm_fill_count = 0;
+-#ifdef QJS_REGVM_RCCHECK
+-    ir.own_plain = NULL;
+-    ir.own_rel = NULL;
+-    ir.own_relsets = NULL;
+-    ir.own_nrels = 0;
+-    ir.own_nreg = 0;
+-#endif
+     *p_refused = 0;
+     /* Call windows start at reg_count, so every assigned home must be below it. */
+     if (home_mode >= 2 && ns_ok > 0)
+@@ -66635,18 +65527,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+      */
+     for (k = 0; k <= n_edges; k++)
+         ev_cnt[k] = 0;
+-#ifdef QJS_REGVM_RCCHECK
+-    /* Seed the section 6.2 id canonicalisation with the phi edges. Where a
+-       predecessor's incoming value already sits in the phi's register the
+-       allocator drops the edge copy, and the phi is then read under the
+-       incoming value's id. */
+-    rcc_canon = js_malloc(ctx,
+-                          (size_t)(n_values > 0 ? n_values : 1) * sizeof(int));
+-    if (rcc_canon) {
+-        for (i = 0; i < n_values; i++)
+-            rcc_canon[i] = i;
+-    }
+-#endif
+     for (b = 0; b < n_blocks; b++) {
+         int depth = in_depth[b], off;
+         if (depth < 0)
+@@ -66659,13 +65539,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+             phi = ent[off + i];
+             for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
+                 int p = pred[k], e;
+-#ifdef QJS_REGVM_RCCHECK
+-                if (rcc_canon && out_depth[p] > i) {
+-                    int pv = out[out_off[p] + i];
+-                    if (phi >= 0 && phi < n_values && pv >= 0 && pv < n_values)
+-                        regvm_rcc_uf_union(rcc_canon, phi, pv);
+-                }
+-#endif
+                 if (out_depth[p] <= i || ireg[out[out_off[p] + i]] == ireg[phi])
+                     continue;
+                 if (succ[p * 2] == b)
+@@ -66688,13 +65561,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+             phi = senc[b * ns_ok + i];
+             for (k = pred_off[b]; k < pred_off[b + 1]; k++) {
+                 int p = pred[k], e;
+-#ifdef QJS_REGVM_RCCHECK
+-                if (rcc_canon && sout[p * ns_ok + i] >= 0) {
+-                    int pv = sout[p * ns_ok + i];
+-                    if (phi >= 0 && phi < n_values && pv >= 0 && pv < n_values)
+-                        regvm_rcc_uf_union(rcc_canon, phi, pv);
+-                }
+-#endif
+                 if (sout[p * ns_ok + i] < 0)
+                     continue;
+                 if (ireg[sout[p * ns_ok + i]] == ireg[phi])
+@@ -67501,19 +66367,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+     js_free(ctx, bl_val);
+     js_free(ctx, bl_map);
+     js_free(ctx, bscr.shapes);
+-#ifdef QJS_REGVM_RCCHECK
+-    js_free(ctx, ir.own_plain);
+-    js_free(ctx, ir.own_rel);
+-    js_free(ctx, ir.own_relsets);
+-    /* The table is owned by the bytecode once the encode succeeded;
+-       js_create_function moves fd->regvm_rcc into it. On any failure path it
+-       has no owner, so release it here. (fd->regvm_compiled is not the test:
+-       the scan sets it later, after this function returns.) */
+-    if (!enc_ok) {
+-        regvm_rcc_free(ctx, fd->regvm_rcc);
+-        fd->regvm_rcc = NULL;
+-    }
+-#endif
+     js_free(ctx, ir.insns);
+     js_free(ctx, ir.own_init);
+     js_free(ctx, ir.own_undef);
+@@ -71040,10 +69893,6 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
+    meaningless. */
+ #ifdef QJS_REGVM_COUNT
+ uint64_t js_regvm_count[ROP_COUNT];
+-#ifdef QJS_REGVM_DYNADJ
+-int js_regvm_prev_op = -1;
+-uint64_t js_regvm_dyn_adj[ROP_COUNT * ROP_COUNT];
+-#endif
+ #if QJS_REGVM_COUNT
+ /* The IR's view of the compiler's output: how many register instructions it
+    emits, how many are copies, and what precedes a copy. */
+@@ -71216,17 +70065,6 @@ int js_regvm_count_dump(void)
+                 fprintf(stderr, "##ADJ## %d %d %llu\n", i, j, (unsigned long long)cn);
+         }
+     }
+-#ifdef QJS_REGVM_DYNADJ
+-    for (i = 1; i < ROP_COUNT; i++) {
+-        int j;
+-        for (j = 1; j < ROP_COUNT; j++) {
+-            uint64_t cn = js_regvm_dyn_adj[(size_t)i * ROP_COUNT + j];
+-            if (cn > 100000)
+-                fprintf(stderr, "##DYN## %d %d %llu\n", i, j,
+-                        (unsigned long long)cn);
+-        }
+-    }
+-#endif
+     for (i = 0; i < 17; i++)
+         if (js_regvm_slot[i])
+             fprintf(stderr, "##SLOT## %d %llu\n", i, (unsigned long long)js_regvm_slot[i]);
+@@ -71917,9 +70755,6 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+     js_free_regvm_pic(rt, b);
+     js_free_rt(rt, b->regvm_fill);
+     b->regvm_fill = NULL;
+-#ifdef QJS_REGVM_RCCHECK
+-    js_free_regvm_rcc(rt, b);
+-#endif
+ #endif
+ 
+ #if QJS_AOT_PROFILE

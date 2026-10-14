@@ -1,6 +1,19 @@
+Subject: Gives the register store its own PIC fill and an inline hit
+
+What this does
+  Gives the register store its own PIC fill and an inline hit.
+
+Why we need it
+  `put_field` had no register cache: every store took `regvm_t_put_field_slow`, and `regvm_t_put_field`'s inline hit read the stack `ic_table`, which is NULL for register code.
+
+What it adds
+  `regvm_put_pic_fill` records the post-write own writable data slot on a plain non-exotic object with a hashed shape, sharing `regvm_pic_install` with the read fill; `regvm_put_field_ic` performs the engine write and fills on success; `regvm_t_put_field` and the monolith `L_ROP_put_field` hit `REG_PIC_OWN_W` with one shape compare and write the slot, releasing the old value inline. The PIC is runtime-only, so no format, opcode or blob changed.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7114,12 +7114,13 @@
+@@ -7073,12 +7073,13 @@ struct JSRegPIC {
      JSShape  *holder_shape;  /* NULL for own-slot entries; counted reference */
      uint32_t  slot;          /* property index in the receiver or holder */
      uint16_t  misses;        /* stop refilling at a limit: megamorphic */
@@ -13,9 +26,9 @@
  #define REG_PIC_PROTO 2
 +#define REG_PIC_OWN_W 3   /* own writable data slot: the store's hit */
  
- /* Release the shape references held by one entry and clear it. Used by the
-    finalizer and by a refill, which must drop the entry it replaces before
-@@ -22097,6 +22098,32 @@
+ /* Release one entry's shape references and clear it. Also used by a refill
+    before storing the new shapes. */
+@@ -21904,6 +21905,32 @@ static inline __attribute__((always_inline)) int regvm_unary_num_fast(
   */
  #define REG_PIC_MISS_LIMIT 8
  
@@ -48,7 +61,7 @@
  static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                             JSRegPIC **ppic, JSValue recv, JSAtom atom, int site)
  {
-@@ -22104,10 +22131,10 @@
+@@ -21911,10 +21938,10 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
      JSObject *p, *holder;
      JSProperty *pr;
      JSShapeProperty *prs;
@@ -61,9 +74,9 @@
  
      if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
          return;
-@@ -22159,24 +22186,7 @@
+@@ -21964,24 +21991,7 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
              return;                 /* no table: the site simply does not cache */
-         *ppic = pic;                /* re-point the running frame (A1's base) */
+         *ppic = pic;                /* re-point the running frame's base */
      }
 -    e = &pic[site];
 -    if (e->kind == kind && e->shape == rsh && e->holder_shape == hsh)
@@ -86,36 +99,47 @@
 +    regvm_pic_install(rt, &pic[site], kind, rsh, hsh, slot);
  }
  
+ /* The register property read for a site-bearing instruction. `*ppic` is the
+@@ -22006,158 +22016,70 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+ uint64_t js_regvm_put_hit, js_regvm_put_direct, js_regvm_put_slow, js_regvm_put_nofill;
+ #endif
  /*
-@@ -22218,147 +22228,70 @@
-  * references, so a store duplicates the value and never frees the receiver, where
-  * the stack handler transfers the value and frees the object.
+- * The named-field write, with the site the instruction carries. Two cached forms,
+- * as the stack handler has: an add-transition (the object is in the pre-add shape
+- * and `atom` is a fresh own data slot at the recorded offset) and an overwrite (the
+- * cached shape's writable data slot). Anything else -- a megamorphic site, a failed
+- * guard, a non-object receiver -- goes to the slow path, which stores generically
+- * and then caches the add if the store performed one.
+- *
+- * The receiver and the value are both borrowed: the registers keep their
+- * references, so a store duplicates the value and never frees the receiver, where
+- * the stack handler transfers the value and frees the object.
++ * The named-field write for a site-bearing instruction. Two cached forms, as
++ * in the stack handler: an add transition (pre-add shape, fresh own data slot
++ * at the recorded offset) and an overwrite (a writable data slot). Anything
++ * else goes to the slow path, which stores generically and caches the add if
++ * it made one. Receiver and value are borrowed: the store duplicates the
++ * value.
++ */
++/*
++ * The register store cache fill. The write is the engine's
++ * (JS_SetPropertyInternal2), recorded afterwards, so setters, Proxies,
++ * non-extensible adds, read-only slots and sloppy no-ops simply do not fill.
++ * Filling after the write also caches an add: the entry records the post-add
++ * shape and slot.
   */
 -static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue recv,
 -                              JSAtom atom, JSValue val, int ic_idx)
-+/*
-+ * The register store cache fill (A6b).
-+ *
-+ * The write itself is the engine's -- `regvm_put_field_ic` calls
-+ * JS_SetPropertyInternal2 and only then records where it landed -- so a setter,
-+ * a Proxy, a non-extensible add, a read-only slot or a sloppy-mode no-op all
-+ * keep the engine's behaviour and simply do not fill. What is cached is the
-+ * overwrite of an own writable data slot on a plain object, which the hit path
-+ * reproduces as a store plus the release of what was there.
-+ *
-+ * Filling after the write also warms the add case: the first write to a fresh
-+ * property creates it, and the entry records the *post-add* shape and slot, so
-+ * the next write to the same shape hits.
-+ */
-+static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
-+                               JSRegPIC **ppic, JSValue recv, JSAtom atom,
-+                               int site)
- {
+-{
 -    (void)b;
 -    (void)ic_idx;
 -    return JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
 -                                   JS_PROP_THROW_STRICT);
 -#if 0
++static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
++                               JSRegPIC **ppic, JSValue recv, JSAtom atom,
++                               int site)
++{
 +    JSRuntime *rt = ctx->rt;
      JSObject *p;
 -    JSShape *pre_sh = NULL;
@@ -187,29 +211,12 @@
 -        {
 -            JSProperty *pr;
 -            JSShapeProperty *prs = find_own_property(&pr, p, atom);
-+    JSProperty *pr;
-+    JSShapeProperty *prs;
-+    JSRegPIC *pic;
- 
+-
 -            if (prs && (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
 -                                      JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
 -                JSICEntry *ic = b->ic_table
 -                    ? &b->ic_table[(size_t)ic_idx * JS_IC_ENTRIES] : NULL;
-+    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
-+        return;
-+    p = JS_VALUE_GET_OBJ(recv);
-+    if (p->is_exotic)
-+        return;
-+    prs = find_own_property(&pr, p, atom);
-+    if (!prs)
-+        return;                     /* the write did not land as an own slot */
-+    if (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))
-+        return;                     /* accessor, var-ref, autoinit or length */
-+    if (!(prs->flags & JS_PROP_WRITABLE))
-+        return;                     /* the write is a no-op, not an overwrite */
-+    if (!p->shape->is_hashed)
-+        return;                     /* see regvm_pic_fill: only hashed is immutable */
- 
+-
 -#ifdef QJS_REGVM_COUNT
 -                js_regvm_put_direct++;
 -                if (!p->shape->is_hashed)
@@ -233,16 +240,39 @@
 -       The held reference keeps pre_sh alive across the call. */
 -    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
 -        JSObject *po = JS_VALUE_GET_OBJ(recv);
--
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    JSRegPIC *pic;
+ 
 -        if (po->extensible && !po->is_exotic && po->shape->is_hashed) {
 -            JSProperty *pr0;
--
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
++        return;
++    p = JS_VALUE_GET_OBJ(recv);
++    if (p->is_exotic)
++        return;
++    prs = find_own_property(&pr, p, atom);
++    if (!prs)
++        return;                     /* the write did not land as an own slot */
++    if (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))
++        return;                     /* accessor, var-ref, autoinit or length */
++    if (!(prs->flags & JS_PROP_WRITABLE))
++        return;                     /* the write is a no-op, not an overwrite */
++    if (!p->shape->is_hashed)
++        return;                     /* see regvm_pic_fill: only hashed is immutable */
+ 
 -            if (!find_own_property(&pr0, po, atom)) {
 -                pre_sh = js_dup_shape(po->shape);
 -                pre_count = po->shape->prop_count;
 -            }
 -        }
--    }
++    pic = *ppic;
++    if (!pic) {
++        pic = regvm_pic_ensure(rt, b);
++        if (!pic)
++            return;
++        *ppic = pic;
+     }
 -#endif
 -    ret = JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
 -                                  JS_PROP_THROW_STRICT);
@@ -255,28 +285,21 @@
 -        if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
 -            JSProperty *pr1;
 -            JSShapeProperty *prs1 = find_own_property(&pr1, po, atom);
--
++    regvm_pic_install(rt, &pic[site], REG_PIC_OWN_W, p->shape, NULL,
++                      (uint32_t)(pr - p->prop));
++}
+ 
 -            if (prs1 && (prs1->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
 -                                        JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
 -                ic_add_transition_update(ctx->rt, b, ic_idx, pre_sh, nsh,
 -                                         (uint32_t)(pr1 - po->prop));
 -        }
-+    pic = *ppic;
-+    if (!pic) {
-+        pic = regvm_pic_ensure(rt, b);
-+        if (!pic)
-+            return;
-+        *ppic = pic;
-     }
+-    }
 -    if (pre_sh)
 -        js_free_shape(ctx->rt, pre_sh);
 -#endif
 -    return ret < 0 ? -1 : 0;
 -#endif
-+    regvm_pic_install(rt, &pic[site], REG_PIC_OWN_W, p->shape, NULL,
-+                      (uint32_t)(pr - p->prop));
-+}
-+
 +/*
 + * The register store, for a site-bearing instruction. The engine performs the
 + * write; the fill records where it landed. `*ppic` is the running frame's cache
@@ -293,17 +316,17 @@
 +    return ret;
  }
  
- /*
-@@ -24542,7 +24475,7 @@
-        to a read-only property is a silent no-op in sloppy code and a TypeError
-        in strict code. The receiver is the object itself, as in the monolith. */
+ /* The tag assumption the hit path relies on: every negative tag is a pointer,
+@@ -24092,7 +24014,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_
+     /* JS_PROP_THROW_STRICT: a write to a read-only property is a no-op in
+        sloppy code and a TypeError in strict code. */
      if (site != REG_IC_NONE) {
 -        if (regvm_put_field_ic(ctx, f->b, fr[r], atom, fr[v], site) < 0)
 +        if (regvm_put_field_ic(ctx, f->b, &f->pic, fr[r], atom, fr[v], site) < 0)
              T_FAIL();
          T_NEXT(T_SZ_RASR);
      }
-@@ -24553,12 +24486,12 @@
+@@ -24103,16 +24025,10 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_
  }
  
  /*
@@ -313,16 +336,18 @@
 - * a megamorphic site is by definition not worth inlining, so both go cold. What
 - * is left is an overwrite of a writable own data slot, which is a store plus
 - * the release of what was there.
-+ * The store's register-PIC hit, which is what a repeated store to the same
-+ * property makes: the same receiver shape and an own writable data slot. A
-+ * different shape, an add transition, a non-writable slot and a megamorphic
-+ * site all fall through to the slow path, which performs the engine write and
-+ * refills the entry (see regvm_put_pic_fill). What is left is a store plus the
-+ * release of what was there.
-  *
-  * The release uses the same shape as T_SET_NEXT and for the same reason: store
-  * first, decrement inline, and leave the handler only when the count reaches
-@@ -24570,18 +24503,15 @@
+- *
+- * The release uses the same shape as T_SET_NEXT and for the same reason: store
+- * first, decrement inline, and leave the handler only when the count reaches
+- * zero. `set_value` would do this through a call on every overwrite.
++ * The store's PIC hit: the same receiver shape and an own writable data slot.
++ * Anything else falls through to the slow path, which writes and refills the
++ * entry (see regvm_put_pic_fill). The release of the old value follows
++ * T_SET_NEXT's shape.
+  */
+ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
+ {
+@@ -24120,18 +24036,15 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
      int site = T_REG(7);
      int v = T_REG(9);
  
@@ -345,9 +370,9 @@
                  JSValue old = *slot;
  
  #ifdef QJS_REGVM_COUNT
-@@ -26723,7 +26653,22 @@
-                  * object itself, as there.
-                  */
+@@ -26068,7 +25981,22 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                 /* JS_PROP_THROW_STRICT: a write to a read-only property is a
+                    no-op in sloppy code and a TypeError in strict code. */
                  if (site != REG_IC_NONE) {
 -                    if (regvm_put_field_ic(ctx, b, regs[r], atom, regs[v], site) < 0)
 +                    if (pic != NULL &&

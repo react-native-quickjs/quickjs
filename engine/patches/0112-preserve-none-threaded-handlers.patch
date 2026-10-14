@@ -1,13 +1,25 @@
+Subject: Uses Clang `preserve_none` for threaded handlers when available
+
+What this does
+  
+
+Why we need it
+  The platform ABI can make each hot handler save registers that the dispatch chain does not need preserved.
+
+What it adds
+  Applies one matching ABI to every handler declaration, definition, and indirect handler pointer; older and sanitizer builds keep their existing ABI.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22692,6 +22692,22 @@
+@@ -22440,6 +22440,21 @@ extern void regvm_asm_add_imm_self_branch_s(void);
  #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
  #endif
  
 +/* Clang 19+ preserve_none makes every register-VM argument register
-+   caller-saved. Keep the threaded handler ABI consistent across declarations,
-+   definitions, and the indirect dispatch type. Older compilers and
-+   sanitizer-instrumented builds retain the platform ABI. */
++   caller-saved; the handlers, their declarations and the dispatch type must
++   agree. Other compilers and sanitizer builds keep the platform ABI. */
 +#if defined(__has_attribute) && __has_attribute(preserve_none)
 +#define REGVM_CC __attribute__((preserve_none))
 +#else
@@ -23,7 +35,7 @@
  typedef struct JSRegRun {
      JSContext *ctx;
      JSRuntime *rt;
-@@ -22758,7 +22774,7 @@
+@@ -22507,7 +22522,7 @@ typedef struct JSRegRun {
  } JSRegRun;
  
  typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
@@ -32,7 +44,7 @@
  
  #define REGVM_ARGS  uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx
  #define REGVM_PASS  ip, fr, f, ctx
-@@ -22804,8 +22820,8 @@
+@@ -22552,8 +22567,8 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
  #if QJS_REGVM_RECORD
  /* A throw unwinds the record chain; see regvm_t_unwind for why it cannot simply
     return NULL. Declared here because every handler's T_FAIL needs it. */
@@ -43,7 +55,7 @@
  #define T_FAIL()  do { f->ret = JS_EXCEPTION; \
          __attribute__((musttail)) return regvm_t_unwind(REGVM_PASS); } while (0)
  #else
-@@ -22817,8 +22833,8 @@
+@@ -22565,8 +22580,8 @@ static uint8_t *regvm_t_unwind_loop(REGVM_ARGS);
  #define T_COUNT_INC(o) ((void)0)
  #endif
  
@@ -54,16 +66,16 @@
  
  /*
   * The overwrite, and the one place a handler can release an object.
-@@ -22853,7 +22869,7 @@
-  * --no-frame` reports no stack access in `get_field` -- and the measured effect
-  * is the largest single win in the phase: box2d 2788 -> 2441 ms.
+@@ -22578,7 +22593,7 @@ static uint8_t *regvm_t_dispatch(REGVM_ARGS);
+  * free itself is rare because an overwrite usually drops a count others still
+  * hold. Every handler depends on staying frameless this way.
   */
 -static __attribute__((noinline)) uint8_t *regvm_t_free_slow(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_free_slow(REGVM_ARGS)
  {
      js_free_value_rt(ctx->rt, f->set_v);
      __attribute__((musttail)) return regvm_t_dispatch(ip, fr, f, ctx);
-@@ -23033,96 +23049,96 @@
+@@ -22745,96 +22760,96 @@ static __attribute__((noinline)) uint8_t *regvm_t_free_slow(REGVM_ARGS)
      } while (0)
  
  #define T_DECL(name, sub) \
@@ -89,21 +101,7 @@
 -static uint8_t *regvm_t_binary_imm_s_slow(REGVM_ARGS);
 -static uint8_t *regvm_t_unary(REGVM_ARGS);
 -static uint8_t *regvm_t_unary_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_loc_reg(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_loc_reg_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_reg_loc(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_reg_loc_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_loc_loc(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_loc_loc_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_imm(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_imm_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_imm_s(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_binary_imm_s_slow(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_unary(REGVM_ARGS);
-+static uint8_t *REGVM_CC regvm_t_unary_slow(REGVM_ARGS);
- 
+-
 -static uint8_t *regvm_t_load_undefined(REGVM_ARGS);
 -static uint8_t *regvm_t_load_null(REGVM_ARGS);
 -static uint8_t *regvm_t_load_true(REGVM_ARGS);
@@ -170,6 +168,21 @@
 -static uint8_t *regvm_t_return(REGVM_ARGS);
 -static uint8_t *regvm_t_return_undefined(REGVM_ARGS);
 -static uint8_t *regvm_t_return_common(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_loc_reg(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_loc_reg_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_reg_loc(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_reg_loc_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_loc_loc(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_loc_loc_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_imm(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_imm_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_imm_s(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_binary_imm_s_slow(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_unary(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_unary_slow(REGVM_ARGS);
++
 +static uint8_t *REGVM_CC regvm_t_load_undefined(REGVM_ARGS);
 +static uint8_t *REGVM_CC regvm_t_load_null(REGVM_ARGS);
 +static uint8_t *REGVM_CC regvm_t_load_true(REGVM_ARGS);
@@ -243,8 +256,8 @@
 +static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
  #endif
  #if QJS_REGVM_RECORD
- /* Where each region of a nested frame sits. The record is at the base and the
-@@ -23161,12 +23177,12 @@
+ /* Where each region of a nested frame sits. The JSStackFrame is inside the
+@@ -22863,12 +22878,12 @@ static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
                                int ret_dst, uint8_t *ret_ip,
                                JSValueConst this_obj, const JSValue *oargv,
                                int na, int slots);
@@ -263,8 +276,8 @@
  static void regvm_record_release(JSRuntime *rt, JSRegRun *rec);
  #endif
  
-@@ -23205,7 +23221,7 @@
-  */
+@@ -22893,7 +22908,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+    instruction pointer is 1. */
  #define REGVM_COLD_RET ((uint8_t *)1)
  
 -static __attribute__((noinline)) uint8_t *regvm_t_cold_slow(REGVM_ARGS)
@@ -272,7 +285,7 @@
  {
      uint8_t *next = regvm_exec_one(ip, fr, f, ctx);
  
-@@ -23216,7 +23232,7 @@
+@@ -22904,7 +22919,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_cold_slow(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_dispatch(next, fr, f, ctx);
  }
  
@@ -281,7 +294,7 @@
  {
      __attribute__((musttail)) return regvm_t_cold_slow(REGVM_PASS);
  }
-@@ -23450,7 +23466,7 @@
+@@ -23138,7 +23153,7 @@ static const uint8_t regvm_is_threaded[ROP_COUNT] = {
  #undef REGVM_T_EXPLICIT_LIST
  #undef REGVM_T_FALLBACK_LIST
  
@@ -290,7 +303,7 @@
  {
  #ifdef QJS_REGVM_COUNT
      /* The monolithic loop counts an opcode after this trampoline returns it. */
-@@ -23459,7 +23475,7 @@
+@@ -23147,7 +23162,7 @@ static uint8_t *regvm_t_to_loop(REGVM_ARGS)
      return ip;
  }
  
@@ -299,16 +312,16 @@
  {
      regvm_handler h = regvm_threaded[*ip];
      T_COUNT_INC(*ip);
-@@ -23490,7 +23506,7 @@
-  * hand back, so the deferral has to give the first count back or the
-  * `-DQJS_REGVM_COUNT` build double-counts every generator return.
+@@ -23167,7 +23182,7 @@ static uint8_t *regvm_t_dispatch(REGVM_ARGS)
+  * already counted the opcode and the monolith counts it again, so the
+  * deferral gives the first count back.
   */
 -static uint8_t *regvm_t_return(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
  {
      int s;
  
-@@ -23506,7 +23522,7 @@
+@@ -23183,7 +23198,7 @@ static uint8_t *regvm_t_return(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
  }
  
@@ -317,34 +330,34 @@
  {
      if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR)) {
  #ifdef QJS_REGVM_COUNT
-@@ -23537,7 +23553,7 @@
-  * zero, so the handler has no prologue. The tail call is made with the
-  * *caller's* resume state, which is what carries the chain on past the release.
+@@ -23207,7 +23222,7 @@ static uint8_t *regvm_t_return_undefined(REGVM_ARGS)
+  * The caller's state is in the caller's record, so nothing is saved or
+  * restored. The caller's destination is overwritten in `T_SET_NEXT`'s shape.
   */
 -static uint8_t *regvm_t_return_common(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS)
  {
      if (likely(f->caller == NULL))
          return NULL;
-@@ -23561,7 +23577,7 @@
-  * release only when a count reaches zero. The tail call carries the *caller's*
-  * resume state, which is what continues the chain past the release.
+@@ -23226,7 +23241,7 @@ static uint8_t *regvm_t_return_common(REGVM_ARGS)
+  * `return`'s own path. The overwrite uses `T_SET_NEXT`'s shape, with the
+  * caller's resume state.
   */
 -static __attribute__((noinline)) uint8_t *regvm_t_return_nested(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_ARGS)
  {
      JSRegRun *c = f->caller;
      int dst = f->ret_dst;
-@@ -23598,7 +23614,7 @@
-  * resume address is `ip + 8` and `ip + 10`. The receiver is read before the
-  * switch, out of the *caller's* file, for the reason the report gives.
+@@ -23260,7 +23275,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_return_nested(REGVM_ARGS)
+  * "rrrb" (8 bytes) and `ROP_call_method` is "rrrrb" (10), so the resume
+  * address is `ip + 8` or `ip + 10`.
   */
 -static uint8_t *regvm_t_call(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
  {
      int c = T_REG(3);
      JSValue cf = fr[c];
-@@ -23617,7 +23633,7 @@
+@@ -23279,7 +23294,7 @@ static uint8_t *regvm_t_call(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
  }
  
@@ -353,16 +366,16 @@
  {
      int c = T_REG(3);
      JSValue cf = fr[c];
-@@ -23648,7 +23664,7 @@
-  * The gate's frame check exempts these two by name for exactly that reason; the
-  * handlers themselves are frameless and are not exempt. See tools/regvm/gate.sh.
+@@ -23305,7 +23320,7 @@ static uint8_t *regvm_t_call_method(REGVM_ARGS)
+  * them so that frame stays off every dispatch. They end in a musttail
+  * dispatch, so the chain still does not grow the C stack.
   */
 -static __attribute__((noinline)) uint8_t *regvm_t_call_record(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS)
  {
      int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
      JSValue cf = fr[c];
-@@ -23693,7 +23709,7 @@
+@@ -23343,7 +23358,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_call_record(REGVM_ARGS)
          return regvm_t_dispatch(f->b->regvm_code, f->fr, f, ctx);
  }
  
@@ -371,7 +384,7 @@
  {
      int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
      int na = T_U8(9);
-@@ -23741,7 +23757,7 @@
+@@ -23384,7 +23399,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_call_method_record(REGVM_ARGS)
  }
  
  /* the unthreaded halves: exactly what the monolith's L_ROP_call did */
@@ -380,7 +393,7 @@
  {
      int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
      JSValue *oargv = &fr[ab];
-@@ -23755,7 +23771,7 @@
+@@ -23398,7 +23413,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_call_slow(REGVM_ARGS)
      T_SET_NEXT(d, rv, 8);
  }
  
@@ -389,7 +402,7 @@
  {
      int d = T_REG(1), c = T_REG(3), r = T_REG(5), ab = T_REG(7);
      int na = T_U8(9);
-@@ -23771,31 +23787,31 @@
+@@ -23414,31 +23429,31 @@ static __attribute__((noinline)) uint8_t *regvm_t_call_method_slow(REGVM_ARGS)
  #endif /* QJS_REGVM_RECORD */
  
  #define T_DEF_BIN(name, sub) \
@@ -429,7 +442,7 @@
  {
      int d = T_REG(1);
      int sub = T_U8(3);
-@@ -23809,9 +23825,9 @@
+@@ -23452,9 +23467,9 @@ static uint8_t *regvm_t_binary_loc_reg(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_binary_loc_reg_slow(REGVM_PASS);
  }
  
@@ -441,7 +454,7 @@
  {
      int d = T_REG(1);
      int sub = T_U8(3);
-@@ -23825,9 +23841,9 @@
+@@ -23468,9 +23483,9 @@ static uint8_t *regvm_t_binary_reg_loc(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_binary_reg_loc_slow(REGVM_PASS);
  }
  
@@ -453,7 +466,7 @@
  {
      int d = T_REG(1);
      int sub = T_U8(3);
-@@ -23841,9 +23857,9 @@
+@@ -23484,9 +23499,9 @@ static uint8_t *regvm_t_binary_loc_loc(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_binary_loc_loc_slow(REGVM_PASS);
  }
  
@@ -465,7 +478,7 @@
  {
      int d = T_REG(1);
      int sub = T_U8(3);
-@@ -23857,9 +23873,9 @@
+@@ -23500,9 +23515,9 @@ static uint8_t *regvm_t_binary_imm(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS);
  }
  
@@ -477,7 +490,7 @@
  {
      int d = T_REG8(1);
      int sub = T_U8(2);
-@@ -23873,9 +23889,9 @@
+@@ -23516,9 +23531,9 @@ static uint8_t *regvm_t_binary_imm_s(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS);
  }
  
@@ -489,8 +502,8 @@
  {
      int d = T_REG(1);
      int sub = T_U8(3);
-@@ -23934,30 +23950,30 @@
-  * `JS_SetPropertyInternal2` -- so no splitting can remove their frames.
+@@ -23549,28 +23564,28 @@ static uint8_t *regvm_t_unary(REGVM_ARGS)
+  * are the exceptions: their hot path is itself an engine call.
   */
  
 -static uint8_t *regvm_t_load_undefined(REGVM_ARGS)
@@ -513,9 +526,7 @@
 +static uint8_t *REGVM_CC regvm_t_load_i8(REGVM_ARGS)
  { T_SET_NEXT(T_REG(1), js_int32((int8_t)ip[3]), T_SZ_RI); }
  
- /* cold: the operand is an atom, which is not a value until one is made for it,
-    and making one can allocate. The pool case is a js_dup, so the handler's
-    only call is this one. */
+ /* cold: the operand is an atom, and making a value for it can allocate. */
 -static __attribute__((noinline)) uint8_t *regvm_t_load_const_slow(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_load_const_slow(REGVM_ARGS)
  {
@@ -527,7 +538,7 @@
  {
      int d = T_REG(1);
      int kind = T_U8(3);
-@@ -23969,7 +23985,7 @@
+@@ -23582,7 +23597,7 @@ static uint8_t *regvm_t_load_const(REGVM_ARGS)
  
  /* cold: a non-strict `this` that is a primitive has to be boxed, and boxing
     can allocate and throw. null/undefined and an object are js_dups. */
@@ -536,7 +547,7 @@
  {
      JSValue val = JS_ToObject(ctx, f->this_obj);
      if (JS_IsException(val))
-@@ -23977,7 +23993,7 @@
+@@ -23590,7 +23605,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_load_this_slow(REGVM_ARGS)
      T_SET_NEXT(T_REG(1), val, T_SZ_R);
  }
  
@@ -545,7 +556,7 @@
  {
      int d = T_REG(1);
      JSValue val;
-@@ -23998,7 +24014,7 @@
+@@ -23611,7 +23626,7 @@ static uint8_t *regvm_t_load_this(REGVM_ARGS)
      T_SET_NEXT(d, val, T_SZ_R);
  }
  
@@ -554,16 +565,16 @@
  {
      int d = T_REG(1);
      int s = T_REG(3);
-@@ -24027,7 +24043,7 @@
-  * `d == s` is nothing to do: the value never moves and clearing the source would
-  * lose it.
-  */
+@@ -23627,7 +23642,7 @@ static uint8_t *regvm_t_move(REGVM_ARGS)
+    clears the source after the move. */
+ /* The transfer form: move without a dup, clearing the source. `d == s` is a
+    no-op: clearing the source would lose the value. */
 -static uint8_t *regvm_t_move_xfer(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_move_xfer(REGVM_ARGS)
  {
      int d = T_REG(1);
      int s = T_REG(3);
-@@ -24047,7 +24063,7 @@
+@@ -23647,7 +23662,7 @@ static uint8_t *regvm_t_move_xfer(REGVM_ARGS)
      T_NEXT(T_SZ_RR);
  }
  
@@ -572,7 +583,7 @@
  {
      int d = T_REG(1);
      int slot = T_REG(3);
-@@ -24058,7 +24074,7 @@
+@@ -23658,7 +23673,7 @@ static uint8_t *regvm_t_get_local(REGVM_ARGS)
  }
  
  #define T_DEF_GET_LOCAL_S(n) \
@@ -581,7 +592,7 @@
      { T_SET_NEXT(T_REG(1), js_dup(f->var_buf[n]), T_SZ_R); }
  T_DEF_GET_LOCAL_S(0)
  T_DEF_GET_LOCAL_S(1)
-@@ -24066,14 +24082,14 @@
+@@ -23666,14 +23681,14 @@ T_DEF_GET_LOCAL_S(2)
  T_DEF_GET_LOCAL_S(3)
  #undef T_DEF_GET_LOCAL_S
  
@@ -598,25 +609,25 @@
  {
      int d = T_REG(1);
      int slot = T_REG(3);
-@@ -24083,7 +24099,7 @@
- /* cold: the cell cache missed, so the engine's own lookup owns the generic
-    path -- the global_var_obj probe, the TDZ test, the global object probe, and
-    the fill of the cell for next time. */
+@@ -23682,7 +23697,7 @@ static uint8_t *regvm_t_get_var_ref(REGVM_ARGS)
+ 
+ /* cold: the cell cache missed; the engine's lookup does the TDZ test, the
+    global object probe and the cell fill. */
 -static __attribute__((noinline)) uint8_t *regvm_t_get_global_slow(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_global_slow(REGVM_ARGS)
  {
      int d = T_REG(1);
      JSAtom atom = (JSAtom)T_U32(3);
-@@ -24105,7 +24121,7 @@
-  * needs no other check. `js_gv_cell_probe` is call-free, so the fast path stays
-  * frameless, and on box2d it is the common case: 13.5M global reads.
+@@ -23701,7 +23716,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_get_global_slow(REGVM_ARGS)
+  * to the global object's shape. `js_gv_cell_probe` is call-free, so the fast
+  * path stays frameless.
   */
 -static uint8_t *regvm_t_get_global(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_get_global(REGVM_ARGS)
  {
      int d = T_REG(1);
      JSAtom atom = (JSAtom)T_U32(3);
-@@ -24118,7 +24134,7 @@
+@@ -23714,7 +23729,7 @@ static uint8_t *regvm_t_get_global(REGVM_ARGS)
  
  /* cold: the remaining fast-array classes (arguments, mapped arguments, the
     typed arrays), and the fully generic route. */
@@ -625,16 +636,16 @@
  {
      int d = T_REG(1);
      int o = T_REG(3);
-@@ -24155,7 +24171,7 @@
- /* cold: a lazy-JSON slot has to be materialised before it is read, and that
-    can recurse and allocate. It is the only reason the array case has a
-    branch, so it is worth its own tail of the chain name. */
+@@ -23750,7 +23765,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_get_element_slow(REGVM_ARGS)
+ 
+ /* cold: a lazy-JSON slot must be materialised before it is read, which can
+    recurse and allocate. */
 -static __attribute__((noinline)) uint8_t *regvm_t_get_element_lazy_slow(
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_lazy_slow(
      REGVM_ARGS)
  {
      int d = T_REG(1);
-@@ -24165,7 +24181,7 @@
+@@ -23760,7 +23775,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_get_element_lazy_slow(
      T_SET_NEXT(d, val, T_SZ_RRR);
  }
  
@@ -643,16 +654,16 @@
  {
      int d = T_REG(1);
      int o = T_REG(3);
-@@ -24198,7 +24214,7 @@
-  * path is frameless; the miss is the engine's, and is a tail call.
-  */
+@@ -23790,7 +23805,7 @@ static uint8_t *regvm_t_get_element(REGVM_ARGS)
+ /* The three named-property forms. The IC hit is call-free (shape compare,
+    flags test, lazy-marker test, js_dup); the miss is a tail call. */
  #define T_GET_FIELD_BODY(NAME) \
 -    static __attribute__((noinline)) uint8_t *regvm_t_##NAME##_slow(REGVM_ARGS) \
 +    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
      { \
          int d = T_REG(1); \
          int r = T_REG(3); \
-@@ -24214,7 +24230,7 @@
+@@ -23806,7 +23821,7 @@ static uint8_t *regvm_t_get_element(REGVM_ARGS)
              T_FAIL(); \
          T_SET_NEXT(d, val, T_SZ_RRAS); \
      } \
@@ -661,16 +672,16 @@
      { \
          int d = T_REG(1); \
          int r = T_REG(3); \
-@@ -24234,7 +24250,7 @@
-    routine owns everything else -- the other entries, the add transition that
-    has to grow the property array, an exotic receiver, a read-only slot, or no
-    table at all. */
+@@ -23825,7 +23840,7 @@ T_GET_FIELD_BODY(get_field2)
+ /* cold: not a cached overwrite of this shape; the engine handles the other
+    entries, add transitions, exotic receivers, read-only slots and empty
+    tables. */
 -static __attribute__((noinline)) uint8_t *regvm_t_put_field_slow(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_put_field_slow(REGVM_ARGS)
  {
      int r = T_REG(1);
      JSAtom atom = (JSAtom)T_U32(3);
-@@ -24267,7 +24283,7 @@
+@@ -23857,7 +23872,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_put_field_slow(REGVM_ARGS)
   * first, decrement inline, and leave the handler only when the count reaches
   * zero. `set_value` would do this through a call on every overwrite.
   */
@@ -679,10 +690,10 @@
  {
      int r = T_REG(1);
      int site = T_REG(7);
-@@ -24309,13 +24325,13 @@
-  * dispatch; here it is a different argument to the same tail call, so a taken
-  * and an untaken branch cost the same and neither needs the loop.
-  */
+@@ -23896,13 +23911,13 @@ static uint8_t *regvm_t_put_field(REGVM_ARGS)
+ 
+ /* The branches. A taken branch is a different argument to the same tail
+    call, so taken and untaken cost the same. */
 -static uint8_t *regvm_t_branch(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_branch(REGVM_ARGS)
  {
@@ -695,10 +706,10 @@
  {
      int32_t off = T_OFF8(1);
      T_NEXT(T_SZ_T_S + off);
-@@ -24324,14 +24340,14 @@
- /* cold: a condition that is not already a primitive needs JS_ToBool, which can
-    call valueOf/toString and throw. The test the fast path does is the one
-    regvm_to_bool does first, so the split cannot change a result. */
+@@ -23910,14 +23925,14 @@ static uint8_t *regvm_t_branch_s(REGVM_ARGS)
+ 
+ /* cold: a non-primitive condition needs JS_ToBool, which can run user code
+    and throw. The fast path's test is regvm_to_bool's first test. */
 -static __attribute__((noinline)) uint8_t *regvm_t_branch_if_slow(REGVM_ARGS)
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_branch_if_slow(REGVM_ARGS)
  {
@@ -712,7 +723,7 @@
  {
      int c = T_REG(1);
      int32_t off = T_I32(3);
-@@ -24345,14 +24361,14 @@
+@@ -23931,14 +23946,14 @@ static uint8_t *regvm_t_branch_if(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_branch_if_slow(REGVM_PASS);
  }
  
@@ -729,8 +740,8 @@
  {
      int c = T_REG(1);
      int32_t off = T_I32(3);
-@@ -24376,7 +24392,7 @@
-  * more than the call it removed.
+@@ -23959,7 +23974,7 @@ static uint8_t *regvm_t_branch_if_not(REGVM_ARGS)
+  * the cold half.
   */
  #define T_DEF_CMP_BRANCH(NAME, SUBEXPR, LAEXPR, RBEXPR, OFFEXPR, SZ_) \
 -    static __attribute__((noinline)) uint8_t *regvm_t_##NAME##_slow(REGVM_ARGS) \
@@ -738,7 +749,7 @@
      { \
          int _sub = (SUBEXPR); \
          int _la = (LAEXPR), _rb = (RBEXPR); \
-@@ -24386,7 +24402,7 @@
+@@ -23969,7 +23984,7 @@ static uint8_t *regvm_t_branch_if_not(REGVM_ARGS)
              T_FAIL(); \
          T_NEXT((SZ_) + (_take ? _off : 0)); \
      } \
@@ -747,16 +758,16 @@
      { \
          int _sub = (SUBEXPR); \
          int _la = (LAEXPR), _rb = (RBEXPR); \
-@@ -24446,7 +24462,7 @@
-  * in the cold half, by tail call -- see the note at the head of this section
-  * for what an ordinary call here costs.
+@@ -24020,7 +24035,7 @@ T_DEF_CMP_BRANCH(branch_neq_s,  REG_BIN_NEQ, T_REG8(1), T_REG8(2), T_OFF8(3),
+  * format letter. Only an int operand is added inline; anything else is the
+  * engine's coercion in the cold half, by tail call.
   */
 -static __attribute__((noinline)) uint8_t *regvm_t_add_imm_self_branch_slow(
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_add_imm_self_branch_slow(
      REGVM_ARGS)
  {
      int d = T_REG(1);
-@@ -24460,7 +24476,7 @@
+@@ -24034,7 +24049,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_add_imm_self_branch_slow(
      T_SET_NEXT(d, out, T_SZ_RIT + off);
  }
  
@@ -765,7 +776,7 @@
  {
      int d = T_REG(1);
      int32_t imm = T_OFF8(3);
-@@ -24481,7 +24497,7 @@
+@@ -24055,7 +24070,7 @@ static uint8_t *regvm_t_add_imm_self_branch(REGVM_ARGS)
          return regvm_t_add_imm_self_branch_slow(REGVM_PASS);
  }
  
@@ -774,7 +785,7 @@
      REGVM_ARGS)
  {
      int d = T_REG8(1);
-@@ -24495,7 +24511,7 @@
+@@ -24069,7 +24084,7 @@ static __attribute__((noinline)) uint8_t *regvm_t_add_imm_self_branch_s_slow(
      T_SET_NEXT(d, out, T_SZ_RIT_S + off);
  }
  
@@ -783,25 +794,25 @@
  {
      int d = T_REG8(1);
      int32_t imm = T_OFF8(2);
-@@ -24791,7 +24807,7 @@
-  * The entry record is not released here. It belongs to C, and the monolith's
-  * `exception:` path is what has always torn it down.
+@@ -24324,7 +24339,7 @@ static void regvm_record_release(JSRuntime *rt, JSRegRun *rec)
+  * exception and returns NULL so the monolith's `exception:` block runs. The
+  * entry record is not released here.
   */
 -static uint8_t *regvm_t_unwind_loop(REGVM_ARGS);
 +static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS);
  
  /*
-  * The unwinder's public entry, reached from T_FAIL with the record the throwing
-@@ -24813,7 +24829,7 @@
-  * trace is set, so the entry activation's `exception:` block does not build a
-  * second one.
+  * The unwinder's public entry, reached from T_FAIL with the record the
+@@ -24337,7 +24352,7 @@ static uint8_t *regvm_t_unwind_loop(REGVM_ARGS);
+  * `needs_backtrace` returns false once the trace is set, so the `exception:`
+  * block does not build a second one.
   */
 -static uint8_t *regvm_t_unwind(REGVM_ARGS)
 +static uint8_t *REGVM_CC regvm_t_unwind(REGVM_ARGS)
  {
      JSValue exc = ctx->rt->current_exception;
  
-@@ -24824,7 +24840,7 @@
+@@ -24348,7 +24363,7 @@ static uint8_t *regvm_t_unwind(REGVM_ARGS)
      __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
  }
  

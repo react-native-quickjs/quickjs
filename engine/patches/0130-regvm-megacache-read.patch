@@ -1,59 +1,48 @@
-Serves register-VM named-property reads from the runtime's global stub cache (W2a)
+Subject: Serves register-VM named-property reads from the runtime's global stub cache
 
-The register backend's per-function property cache refuses to install a site
-whose receiver shape is unhashed, or whose holder sits more than one hop up the
-prototype chain. Built-in objects -- Math, Number, the prototypes -- have
-unhashed shapes, so every read of one of their properties left the inline cache
-and re-walked the chain on every execution. The runtime already carries a
-reference-free global stub cache (rt->mega_cache) that the stack VM uses for
-exactly this; the register backend did not consult it.
+What this does
+  Serves register-VM named-property reads from the runtime's global stub cache.
 
-  * quickjs.c: regvm_get_field_ic probes js_megacache_probe before the generic
-    property walk and returns the slot on a hit; regvm_pic_fill resolves a
-    holder at depth 0, 1 or 2 and calls js_megacache_fill when, and only when,
-    the per-function cache refuses the site. A hit still requires a non-TMASK
-    slot, because an autoinit slot holds a raw realm/id descriptor rather than a
-    value.
-  * quickjs.c: the cache's stale-address guard was incomplete --
-    resize_properties and compact_properties free or move a shape allocation
-    without bumping rt->shape_free_epoch, so an entry could alias a different
-    shape at the same address. Three epoch bumps were added, and the stack VM's
-    probe gained the same non-TMASK guard.
+Why we need it
+  The per-function register property cache refuses a receiver whose shape is unhashed or a holder more than one hop away, and the built-in objects are unhashed, so every read of `Math.PI`, `Number.MAX_VALUE` or a prototype method left the cache and re-walked the chain; the runtime already carried a reference-free global stub cache that only the stack VM consulted.
 
-This patch does not change the register format or the bytecode version.
+What it adds
+  `regvm_get_field_ic` probes `js_megacache_probe` before the generic walk and `regvm_pic_fill` resolves a holder at depth 0/1/2 and calls `js_megacache_fill` exactly when the per-function cache refuses the site; a hit still requires a non-TMASK slot, because an autoinit slot holds a raw realm/id descriptor rather than a value; the cache's stale-address guard was also completed with three `rt->shape_free_epoch` bumps (`resize_properties`, `compact_properties`) and the same non-TMASK guard on the stack VM's probe.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7620,6 +7620,11 @@
+@@ -7540,6 +7540,10 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
              }
          }
          js_free(ctx, get_alloc_from_shape(old_sh));
-+        /* HARDEN (W2a): a shape allocation was just released outside
-+           js_free_shape0, so the global stub cache's stale-address guard
-+           (shape_free_epoch) must advance too, or an entry keyed on this
-+           address can alias whatever shape is allocated here next. */
++        /* A shape allocation was released outside js_free_shape0, so advance
++           shape_free_epoch too, or a stub cache entry keyed on this address
++           could alias the next shape allocated here. */
 +        ctx->rt->shape_free_epoch++;
      } else {
          /* only resize the properties */
          list_del(&sh->header.link);
-@@ -7632,6 +7637,8 @@
+@@ -7552,6 +7556,8 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
          }
          sh = get_shape_from_alloc(sh_alloc, new_hash_size);
          list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
-+        /* HARDEN (W2a): js_realloc may have moved the shape allocation. */
++        /* js_realloc may have moved the shape allocation. */
 +        ctx->rt->shape_free_epoch++;
      }
      *psh = sh;
      sh->prop_size = new_size;
-@@ -7707,6 +7714,8 @@
+@@ -7627,6 +7633,8 @@ static int compact_properties(JSContext *ctx, JSObject *p)
  
      p->shape = sh;
      js_free(ctx, get_alloc_from_shape(old_sh));
-+    /* HARDEN (W2a): see resize_properties above. */
++    /* see resize_properties above */
 +    ctx->rt->shape_free_epoch++;
  
      /* reduce the size of the object properties */
      new_prop = js_prop_grow(ctx, p, sizeof(new_prop[0]) * new_size);
-@@ -22206,9 +22215,10 @@
+@@ -22004,9 +22012,10 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
      JSProperty *pr;
      JSShapeProperty *prs;
      JSRegPIC *pic;
@@ -66,7 +55,7 @@ This patch does not change the register format or the bytecode version.
  
      if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
          return;
-@@ -22221,27 +22231,40 @@
+@@ -22018,27 +22027,36 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
  
      holder = p;
      hsh = NULL;
@@ -77,8 +66,7 @@ This patch does not change the register format or the bytecode version.
      if (!prs) {
 -        /* The direct prototype only. That is what a method load reaches, and
 -           the entry expresses exactly this one depth. */
-+        /* The direct prototype. That is what a method load reaches, and the
-+           per-function entry expresses exactly this one depth. */
++        /* The direct prototype, the depth a method load reaches. */
          holder = p->shape->proto;
          if (!holder || holder->is_exotic)
              return;
@@ -88,13 +76,10 @@ This patch does not change the register format or the bytecode version.
 -        hsh = holder->shape;
 -        kind = REG_PIC_PROTO;
 +        if (!prs) {
-+            /*
-+             * W2a: one prototype deeper. The per-function PIC expresses only
-+             * depth 0 and 1, but the runtime's global stub cache can hold a
-+             * depth-2 holder, so resolve it here and hand it to the fill below
-+             * instead of giving up. `mid` is the depth-1 holder's shape, which
-+             * js_megacache_fill/probe need to revalidate the middle link.
-+             */
++            /* One prototype deeper. The per-function PIC holds depth 0 and 1
++               only, but the global stub cache can hold a depth-2 holder. `mid`
++               is the depth-1 holder's shape, which js_megacache_fill/probe use
++               to revalidate the middle link. */
 +            JSObject *holder2 = holder->shape->proto;
 +            if (!holder2 || holder2->is_exotic)
 +                return;
@@ -117,49 +102,39 @@ This patch does not change the register format or the bytecode version.
 -    rsh = p->shape;
 -    if (!rsh->is_hashed || (hsh && !hsh->is_hashed))
 -        return;
-     /* A data property: not a getter/setter, autoinit or var-ref, and not an
-        array/string `length`, which is not a slot the hit path can read. */
+     /* A data property, and not an array/string `length`. */
      if (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))
-@@ -22251,16 +22274,58 @@
+         return;
+@@ -22047,16 +22065,50 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
      if (js_lazy_marker_is(pr->u.value))
          return;
  
 +    rsh = p->shape;
      slot = (uint32_t)(pr - holder->prop);
  
-+    /* The site's state before the install below; the install is what can newly
-+       set the dead state, so sample it first. A site with no table yet (pic
-+       NULL) is not dead. */
++    /* The site's state before the install below, which can newly kill it. A
++       site with no table yet is not dead. */
      pic = *ppic;
 -    if (!pic) {
 -        pic = regvm_pic_ensure(rt, b);
 -        if (!pic)
 -            return;                 /* no table: the site simply does not cache */
--        *ppic = pic;                /* re-point the running frame (A1's base) */
--    }
--    regvm_pic_install(rt, &pic[site], kind, rsh, hsh, slot);
+-        *ppic = pic;                /* re-point the running frame's base */
 +    site_dead = pic && pic[site].kind == REG_PIC_EMPTY &&
 +                pic[site].misses >= REG_PIC_MISS_LIMIT;
 +
 +    /*
-+     * The per-function install below holds COUNTED references to the cached
-+     * shapes, so it can only cache a HASHED receiver (and holder) -- an
-+     * unhashed shape is mutated in place whatever its refcount -- and only at
-+     * depth 0 or 1. When none of those hold, or when the site has already
-+     * given up, the runtime's global stub cache can still serve the site: it
-+     * stores RAW shape pointers and revalidates by pointer comparison, so it
-+     * accepts an unhashed shape and a depth-2 holder. Fill it only for those
-+     * refused cases -- a site the per-function PIC can serve is left alone --
-+     * mirroring the stack VM, which fills the global cache only when a site is
-+     * megamorphic.
++     * The per-function PIC holds counted references, so it caches only hashed
++     * shapes, at depth 0 or 1. For the cases it refuses, or a dead site, the
++     * global stub cache can serve: it stores raw shape pointers and revalidates
++       by
++     * pointer compare, so it accepts unhashed shapes and depth-2 holders.
 +     *
-+     * Safety of the raw pointers: an operation that can MOVE a property offset
-+     * allocates a new shape object -- compact_properties mallocs a fresh shape,
-+     * and js_shape_prepare_update clones when a hashed shape is shared -- so
-+     * the probe's `e->shape == recv->shape` (and the mid/holder shape compares)
-+     * revalidate by pointer and drop a stale entry. The probe never
-+     * dereferences a cached shape, so a freed one cannot dangle; freeing a
-+     * shape also bumps shape_free_epoch, which retires every entry.
++     * Raw pointers are safe: moving a property offset allocates a new shape
++     * (compact_properties, the clone in js_shape_prepare_update), so the
++       probe's
++     * shape compares drop a stale entry; the probe never dereferences a cached
++     * shape; and freeing a shape bumps shape_free_epoch, retiring every entry.
 +     */
 +    need_mega = (depth > 1 || !rsh->is_hashed || (hsh && !hsh->is_hashed) ||
 +                 site_dead);
@@ -169,7 +144,7 @@ This patch does not change the register format or the bytecode version.
 +            pic = regvm_pic_ensure(rt, b);
 +            if (!pic)
 +                return;             /* no table: the site simply does not cache */
-+            *ppic = pic;            /* re-point the running frame (A1's base) */
++            *ppic = pic;            /* re-point the running frame's base */
 +        }
 +        regvm_pic_install(rt, &pic[site], kind, rsh, hsh, slot);
 +        /* The install may have just pushed a live site over the miss limit;
@@ -178,38 +153,33 @@ This patch does not change the register format or the bytecode version.
 +            pic[site].kind == REG_PIC_EMPTY &&
 +            pic[site].misses >= REG_PIC_MISS_LIMIT)
 +            need_mega = 1;
-+    }
+     }
+-    regvm_pic_install(rt, &pic[site], kind, rsh, hsh, slot);
 +
 +    if (need_mega)
 +        js_megacache_fill(rt, rsh, atom, slot, depth,
 +                          depth == 2 ? mid : NULL, holder->shape);
  }
  
- /*
-@@ -22273,7 +22338,32 @@
+ /* The register property read for a site-bearing instruction. `*ppic` is the
+@@ -22066,7 +22118,26 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
                                    JSRegPIC **ppic, JSValue recv, JSAtom atom,
                                    int site)
  {
 -    JSValue val = JS_GetPropertyInternal(ctx, recv, atom, recv, false);
 +    JSValue val;
-+    /* W2a: the per-function PIC refuses an unhashed receiver/holder shape and a
-+       holder deeper than one prototype, so a hot monomorphic site can stay dead
-+       and pay a full lookup forever. The runtime's global stub cache does not
-+       require a hashed shape; probe it before the engine lookup. */
++    /* The per-function PIC refuses unhashed shapes and holders deeper than one
++       prototype; the global stub cache does not, so probe it before the engine
++       lookup. */
 +    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
 +        JSObject *recv_obj = JS_VALUE_GET_OBJ(recv);
 +        JSObject *holder;
 +        uint32_t offset;
-+        /* Correctness guard (W2a, found by the box2d gate): an AUTOINIT slot --
-+           e.g. a bytecode function's lazily-created `prototype` -- holds a raw
-+           realm/id descriptor, not a JSValue, until the engine materializes it
-+           on read. `js_lazy_marker_is` does not recognize that encoding, and the
-+           mega key (receiver shape pointer + atom) records no property KIND, so
-+           a shape that read as a normal data property for one object can still
-+           pair with an unmaterialized autoinit slot for another object sharing
-+           it; the probe would then hand back the raw descriptor (box2d read
-+           `fn.prototype` and passed a non-object to Object.defineProperty).
-+           Trust the slot only when it is a non-TMASK data property. */
++        /* An AUTOINIT slot (a function's lazy `prototype`) holds a raw
++           descriptor until materialized, and the mega key records no property
++           kind, so another object of the same shape can pair the entry with an
++           unmaterialized slot. Trust the slot only when it is a non-TMASK data
++           property. */
 +        if (!recv_obj->is_exotic &&
 +            js_megacache_probe(ctx->rt, recv_obj, atom, &holder, &offset) &&
 +            !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
@@ -220,7 +190,7 @@ This patch does not change the register format or the bytecode version.
      if (likely(!JS_IsException(val)))
          regvm_pic_fill(ctx, b, ppic, recv, atom, site);
      return val;
-@@ -32766,6 +32856,7 @@
+@@ -31671,6 +31742,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                  uint32_t offset;
                                  if (js_megacache_probe(ctx->rt, recv, atom,
                                                         &holder, &offset) &&
@@ -228,7 +198,7 @@ This patch does not change the register format or the bytecode version.
                                      !js_lazy_marker_is(holder->prop[offset].u.value)) {
                                      *sp++ = js_dup(holder->prop[offset].u.value);
                                      BREAK;
-@@ -33512,6 +33603,7 @@
+@@ -32417,6 +32489,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                              uint32_t offset;
                              if (js_megacache_probe(ctx->rt, recv, atom,
                                                     &holder, &offset) &&
@@ -236,7 +206,7 @@ This patch does not change the register format or the bytecode version.
                                  !js_lazy_marker_is(holder->prop[offset].u.value)) {
                                  val = js_dup(holder->prop[offset].u.value);
                                  JS_FreeValue(ctx, sp[-1]);
-@@ -33654,6 +33746,7 @@
+@@ -32559,6 +32632,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                              uint32_t offset;
                              if (js_megacache_probe(ctx->rt, recv, atom,
                                                     &holder, &offset) &&

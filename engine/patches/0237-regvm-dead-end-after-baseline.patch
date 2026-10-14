@@ -1,44 +1,49 @@
+Subject: The dead-end abort may fire only when the baseline tier fails
+
+What this does
+  The dead-end abort may fire only when the baseline tier fails.
+
+Why we need it
+  `REGVM_VERIFY_DEAD_END` aborted in `js_regvm_encode` when the optimising pass refused a shape a second time -- before the baseline tier ran. That refusal now *selects* the baseline, so a non-`NDEBUG` build aborted on any large call site, wide `switch`, 5,000-parameter function or 70,000-property literal: 21 of the 189 generated programs killed the host.
+
+What it adds
+  The abort is removed from the optimising refusal (it reports and defers) and moved to the baseline tier's own refusal path, which is the only remaining place the invariant can fire. A release build is unchanged (`REGVM_VERIFY_DEAD_END` is a no-op there).
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
-index f75ec00..5a2b09c 100644
+index e8bd27a..798f1f7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -60221,7 +60221,6 @@ static int regvm_ctl_bound(JSContext *ctx, const JSRegIR *ir, const uint8_t *bc,
+@@ -58282,7 +58282,6 @@ static int regvm_ctl_bound(JSContext *ctx, const JSRegIR *ir, const uint8_t *bc,
      return rc;
  }
  
 -
- /*
-  * Move origins that are not a stack-VM opcode.
-  */
-@@ -72317,7 +72316,13 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
+ /* Move origins that are not a stack-VM opcode. */
+ #define REGVM_ORIG_LOWER 0xFE   /* lowering, opcode not recorded */
+ #define REGVM_ORIG_PHI   0xFD   /* an edge's parallel copy */
+@@ -69250,7 +69249,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  rc = 0;
                  goto done;
              }
 -            REGVM_VERIFY_DEAD_END(enc_why ? enc_why : "the encoder refused");
-+            /*
-+             * The optimising lowering has now refused this shape twice. That
-+             * is an expected event this round: `*pdeferred = 1` hands the
-+             * function to the baseline tier, which refuses nothing. The
-+             * dead-end check belongs to the baseline, not here -- a refusal by
-+             * the first two tiers selects the third.
-+             */
++            /* Refused twice: `*pdeferred = 1` hands the function to the
++               baseline tier. The dead-end check belongs to the baseline. */
              regvm_report_refusal(ctx, fd, enc_why ? enc_why : "?");
              *pdeferred = 1;
              deferred = 1;
-@@ -73507,9 +73512,15 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
+@@ -70337,10 +70337,10 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
+         if (rc)
              goto done;
          if (refused) {
-             /*
+-            /*
 -             * The baseline is the last tier; a refusal here is a modelling gap
 -             * the caller must surface, not a shape to hand on.
-+             * The baseline is the last tier: a refusal here is a modelling gap
-+             * the caller must surface, not a shape to hand on. This is the only
-+             * point at which the dead-end invariant may fire under
-+             * QJS_REGVM_VERIFY -- a refusal by the first two tiers now selects
-+             * the baseline rather than aborting (the abort used to fire there
-+             * and killed every large call site or wide switch in a debug
-+             * build).
-              */
+-             */
++            /* The baseline is the last tier: a refusal here is a modelling gap
++               the caller must surface, and the only point where the dead-end
++               check may fire under QJS_REGVM_VERIFY. */
 +            REGVM_VERIFY_DEAD_END(why ? why : "the baseline refused");
              if (regvm_report_deferred_on())
                  fprintf(stderr, "regvm: BASELINE refused: %s\n",

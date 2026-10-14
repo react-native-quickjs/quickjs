@@ -1,36 +1,46 @@
+Subject: Merges the register read hit's lazy-marker and reference-count tests into one negative-tag test
+
+What this does
+  Merges the register read hit's lazy-marker and reference-count tests into one negative-tag test.
+
+Why we need it
+  
+
+What it adds
+  `regvm_own_read_hit` now tests `tag < 0` once; an immediate is stored as it is, while a negative tag takes one lazy-marker compare and an inline increment in the same branch, never `js_dup` of a lazy marker. Adds a `static_assert` that `JS_TAG_FIRST < 0` and `JS_TAG_INT == 0`. A `noinline` side path was built and first and rejected: +18% cycles, because object- and string-valued reads are common and the call is not cheaper than the inlined test.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22362,13 +22362,28 @@
+@@ -22160,14 +22160,20 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue rec
+ #endif
  }
  
- /*
-+ * A5's tag assumption, asserted here so a future tag change breaks the build
-+ * rather than the hit path: every negative tag names a pointer, every tag from
-+ * zero up is an immediate (int, bool, null, undefined, uninitialized, exception,
-+ * float64), and the only negative tag that is not reference counted is the
-+ * lazy-JSON marker handled explicitly below.
-+ */
++/* The tag assumption the hit path relies on: every negative tag is a pointer,
++   every tag from zero up is an immediate, and the only uncounted negative tag
++   is the lazy-JSON marker handled below. */
 +_Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
 +               "regvm read hit assumes negative tags are pointers and tags >= 0 are immediates");
 +
-+/*
-  * The register read hit. One shape compare and one kind test, then the slot.
+ /*
+- * The register read hit. One shape compare and one kind test, then the slot.
++ * The register read hit: one shape compare and one kind test, then the slot.
   *
-  * The cached shape is a counted reference, so an equal shape pointer means the
-  * cached layout is immutable and `slot` still names the requested atom. A hit
-  * returns a new reference. The prototype form reads the receiver shape's own
-  * prototype, which the receiver shape keeps alive, and checks the cached holder
+- * The cached shape is a counted reference, so an equal shape pointer means the
+- * cached layout is immutable and `slot` still names the requested atom. A hit
+- * returns a new reference. The prototype form reads the receiver shape's own
+- * prototype, which the receiver shape keeps alive, and checks the cached holder
 - * shape. A lazy slot is left to the slow path, which materializes it.
-+ * shape.
-+ *
-+ * The slot value then takes one test, `tag < 0`. An immediate is stored as it
-+ * is; a pointer is reference counted, except the immediate lazy-JSON marker,
-+ * which is left to the slow path to materialize. This replaces A3/A4's separate
-+ * lazy-marker test and reference-count test with one.
++ * The cached shape is a counted reference, so an equal pointer means `slot`
++ * still names the atom. The prototype form reads the receiver shape's own
++ * prototype (kept alive by the shape) and checks the cached holder shape. A
++ * slot value then takes one test, `tag < 0`: a pointer is counted, except the
++ * lazy-JSON marker, which goes to the slow path.
   */
  static inline __attribute__((always_inline)) int regvm_own_read_hit(
      JSRegPIC *pic, JSValue recv, int site, JSValue *out)
-@@ -22391,9 +22406,12 @@
+@@ -22190,9 +22196,12 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
              return 0;
          v = holder->prop[e->slot].u.value;
      }

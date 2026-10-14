@@ -1,26 +1,27 @@
-Adds a per-function register PIC site namespace (A1)
+Subject: Gives the register backend its own dense per-function PIC site numbering
 
-The register backend's named-property instructions carried the shared stack
-inline-cache slot index. A1 gives them their own dense per-function numbering,
-a JSFunctionBytecode field to hold the count, a per-frame base pointer carried
-on every execution and resume path, and serialization of the count.
+What this does
+  Gives the register backend its own dense per-function PIC site numbering.
 
-  * quickjs.c: JSRegPIC forward declaration; JSFunctionBytecode.regvm_pic and
-    .regvm_pic_count; JSRegRun.pic set at record fill, entry and threaded
-    rebind; dense site assignment derived from the ROP format string; site
-    operands validated against regvm_pic_count; regvm_pic_count written and
-    read in the register program header; ROP_get_length gains a site operand;
-    the stack-IC helpers are bypassed for register code until A3/A4 install
-    fills and hits.
-  * quickjs-regvm.h: REGVM_FORMAT_VERSION 11 -> 12.
+Why we need it
+  Register property instructions carried the shared stack inline-cache slot index, so there was no register-owned place to put a cache.
 
-The site position is taken from regvm_rop_fmt rather than hard-coded, because
-it differs between the generic and fused spellings of one operation:
-get_field is "rras" (site at index 3) while get_local_field_0 is "ras" (site
-at index 2). A fixed index wrote the dense number over the atom for every
-"rras"/"ruas" opcode and left the real site stale.
+What it adds
+  Adds `JSFunctionBytecode.regvm_pic`/`regvm_pic_count`, a `pic` base on `JSRegRun` set at record fill, entry and threaded rebind, dense site assignment for `get_field`/`get_field2`/`get_arg_field`/`put_field`/`put_field_xfer`/`get_local_field`/`get_length`, site validation against the new count, and `regvm_pic_count` in the register program header; `ROP_get_length` gains a site operand.
 
-Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
+Needs a bytecode version bump
+  Yes. Regenerated register blobs are in 9999. `BC_VERSION` is unchanged.
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -599,7 +599,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
+ /* The register bytecode's format version, checked per function record before
+    any instruction is parsed. Bump it whenever an opcode is added, removed or
+    renumbered, or an operand's width or meaning changes. */
+-#define REGVM_FORMAT_VERSION 11
++#define REGVM_FORMAT_VERSION 12
+ 
+ /* ROP_get_field and ROP_put_field use this site index when the source
+    instruction has no inline cache. */
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -58,6 +58,7 @@
@@ -31,17 +32,17 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
  #endif
  
  #if defined(EMSCRIPTEN) || defined(_MSC_VER)
-@@ -1175,6 +1176,7 @@
+@@ -1154,6 +1155,7 @@ typedef struct JSFunctionBytecode {
      int regvm_len;
      int regvm_reg_count;
      int regvm_ctl_count;   /* entries the frame's control stack needs */
 +    uint16_t regvm_pic_count;
-     /* "Compiled" is a state of its own. `regvm_len == 0` used to mean both
-        "refused" and "the program is empty", which the interpreter cannot tell
-        apart; an empty body is now one `return_undefined`, but the flag is the
-@@ -1191,6 +1193,9 @@
-        while a compiled function's register code borrows the atoms the stack
-        bytecode already owns. */
+     /* A refused function is serialized with no register program, an empty one
+        with a one-instruction program, so "compiled" needs its own flag. */
+     uint8_t regvm_compiled;
+@@ -1163,6 +1165,9 @@ typedef struct JSFunctionBytecode {
+     /* The atoms in regvm_code are owned references: true for a function read
+        from a blob; compiled code borrows the stack bytecode's atoms. */
      uint8_t regvm_owns_atoms;
 +    /* Runtime-only property cache owned by the register VM. Its entries hold
 +       counted shape references; stack-VM inline caches remain in ic_table. */
@@ -49,12 +50,12 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
  #endif
  } JSFunctionBytecode;
  
-@@ -21980,6 +21985,12 @@
+@@ -21803,6 +21808,12 @@ static inline __attribute__((always_inline)) int regvm_unary_num_fast(
  static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
                                    JSValue recv, JSAtom atom, int ic_idx)
  {
-+    /* A1 gives register bytecode a separate dense PIC namespace. Until A3/A4
-+       install fills and hits, always use the generic engine lookup here. */
++    /* Register bytecode has its own dense PIC namespace; until the fills and
++       hits exist, always use the generic engine lookup here. */
 +    (void)b;
 +    (void)ic_idx;
 +    return JS_GetPropertyInternal(ctx, recv, atom, recv, false);
@@ -62,7 +63,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
      JSObject *p;
      int k;
  
-@@ -22106,6 +22117,7 @@
+@@ -21929,6 +21940,7 @@ static JSValue regvm_get_field_ic(JSContext *ctx, JSFunctionBytecode *b,
      js_regvm_getfield_ic[2]++;
  #endif
      return JS_GetPropertyInternal(ctx, recv, atom, recv, false);
@@ -70,7 +71,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
  }
  
  /*
-@@ -22134,6 +22146,11 @@
+@@ -21954,6 +21966,11 @@ uint64_t js_regvm_put_hit, js_regvm_put_direct, js_regvm_put_slow, js_regvm_put_
  static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue recv,
                                JSAtom atom, JSValue val, int ic_idx)
  {
@@ -82,7 +83,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
      JSObject *p;
      JSShape *pre_sh = NULL;
      uint32_t pre_count = 0;
-@@ -22266,11 +22283,18 @@
+@@ -22086,11 +22103,18 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue rec
          js_free_shape(ctx->rt, pre_sh);
  #endif
      return ret < 0 ? -1 : 0;
@@ -101,7 +102,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
  #if JS_ENABLE_IC
      JSObject *p;
      JSICEntry *ic;
-@@ -22303,6 +22327,7 @@
+@@ -22123,6 +22147,7 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
      (void)out;
      return 0;
  #endif
@@ -109,7 +110,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
  }
  
  /*
-@@ -22712,6 +22737,7 @@
+@@ -22459,6 +22484,7 @@ typedef struct JSRegRun {
      JSContext *ctx;
      JSRuntime *rt;
      JSFunctionBytecode *b;
@@ -117,7 +118,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
      JSStackFrame *sf;
      JSVarRef **var_refs;
      JSValueConst this_obj;
-@@ -25101,6 +25127,7 @@
+@@ -24597,6 +24623,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      rec->ctx = cb->realm;
      rec->rt = rt;
      rec->b = cb;
@@ -125,7 +126,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
      rec->sf = sf;
      rec->fr = lay->regs;
      rec->var_refs = co->u.func.var_refs;
-@@ -25274,6 +25301,7 @@
+@@ -24751,6 +24778,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          run.ctx = ctx;
          run.rt = rt;
          run.b = b;
@@ -133,7 +134,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
          run.sf = sf;
          run.var_refs = var_refs;
          run.this_obj = this_obj;
-@@ -25698,6 +25726,7 @@
+@@ -25146,6 +25174,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          run.ctx = ctx; \
          run.rt = rt; \
          run.b = b; \
@@ -141,7 +142,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
          run.sf = sf; \
          run.var_refs = var_refs; \
          run.this_obj = this_obj; \
-@@ -27690,6 +27719,7 @@
+@@ -27019,6 +27048,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_get_length: {
                  int d = RD_REG();
                  int r = RD_REG();
@@ -149,7 +150,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                  JSValue val = JS_GetProperty(ctx, regs[r], JS_ATOM_length);
                  if (JS_IsException(val))
                      goto exception;
-@@ -30172,6 +30202,7 @@
+@@ -29227,6 +29257,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
       {
                      int d = RD_REG();
                      int r = RD_REG();
@@ -157,7 +158,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                      JSValue val = JS_GetProperty(ctx, regs[r], JS_ATOM_length);
                      if (JS_IsException(val))
                          goto exception;
-@@ -35997,6 +36028,7 @@
+@@ -35010,6 +35041,7 @@ typedef struct JSFunctionDef {
      int regvm_len;
      int regvm_reg_count;
      int regvm_ctl_count;
@@ -165,7 +166,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
      uint8_t regvm_compiled; /* the backend lowered this function */
      uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
  #endif
-@@ -52627,7 +52659,7 @@
+@@ -51555,7 +51587,7 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
      [ROP_put_element_xfer] = "rrr",
      [ROP_put_field_xfer] = "rasr",
      [ROP_define_element] = "rrr",
@@ -174,16 +175,16 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
      [ROP_super_get] = "rrrr",
      [ROP_super_put] = "rrrr",
      /* the class builder takes a stack pointer, so its operands are staged into
-@@ -53763,7 +53795,7 @@
+@@ -52597,7 +52629,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          ADD(ROP_put_field, pop[0], (int32_t)get_u32(bc + pos + 1), REG_IC_NONE, pop[1]); return 0;
      case OP_put_field_ic:
          ADD(ROP_put_field, pop[0], (int32_t)get_u32(bc + pos + 1), get_u16(bc + pos + 5), pop[1]); return 0;
 -    case OP_get_length: ADD(ROP_get_length, dst, pop[0]); return 0;
 +    case OP_get_length: ADD(ROP_get_length, dst, pop[0], REG_IC_NONE); return 0;
  
-     /*
-      * Object construction. define_field, set_name and the element define leave
-@@ -54302,7 +54334,7 @@
+     /* Object construction. define_field, set_name and the element define leave
+        the object (and the element's key) on the stack, so the results are
+@@ -53051,7 +53083,7 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
  }
  
  static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
@@ -192,7 +193,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                                     int atom_count, int n_values, const int *ireg,
                                     const int *pc_to_insn, int n_pcs,
                                     int win_size, int cycle_reg,
-@@ -54696,8 +54728,8 @@
+@@ -53426,8 +53458,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                      }
                      break;
                  case 's':
@@ -203,28 +204,14 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                          goto done;
                      }
                      break;
-@@ -57222,7 +57254,42 @@
-             in->ops[2] = in->ops[3];
-         } else if (slotpos == 0) {
-             in->ops[0] = in->ops[1];
-+        }
-+    }
-+
-+    /* Register property sites have their own dense namespace. They must never
-+       index the shared stack VM IC table.
-+     *
-+     * The site's operand position is read from the format string rather than
-+     * written as a constant, because it differs between the generic and fused
-+     * spellings of the same operation. `get_field` is "rras" -- site in ops[3]
-+     * -- while the slot-in-opcode form the pass above produces,
-+     * `get_local_field_0`, is "ras" with the site in ops[2]. A fixed position
-+     * put the dense index over the *atom* for every "rras"/"ruas" opcode
-+     * (get_field, get_field2, get_arg_field) and left the real site stale.
-+     *
-+     * Deriving it also covers the two site-bearing opcodes with no specialized
-+     * form, which a hand-written list missed: the generic `get_local_field`
-+     * (a slot above 3, which is emitted) and `put_field_xfer`.
-+     */
+@@ -55772,6 +55804,30 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
+         }
+     }
+ 
++    /* Register property sites have their own dense namespace and never index
++       the stack VM's IC table. The site's operand position comes from the
++       format string: it differs between the generic and fused spellings
++       (`get_field` is "rras", `get_local_field_0` is "ras"). */
 +    fd->regvm_pic_count = 0;
 +    for (i = 0; i < ir.n_insns; i++) {
 +        JSRegInsn *in = &ir.insns[i];
@@ -241,12 +228,14 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
 +        if (fd->regvm_pic_count >= UINT16_MAX) {
 +            JS_ThrowInternalError(ctx, "regvm: too many PIC sites");
 +            goto done;
-         }
++        }
 +        in->ops[sitepos] = fd->regvm_pic_count++;
-     }
- 
++    }
++
  #ifdef QJS_REGVM_COUNT
-@@ -57346,7 +57413,7 @@
+     for (i = 0; i + 1 < ir.n_insns; i++)
+         js_regvm_adj[(size_t)ir.insns[i].rop * ROP_COUNT + ir.insns[i + 1].rop]++;
+@@ -55885,7 +55941,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
              int er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
                                                                are two bytes */,
                                               reg_count,
@@ -255,7 +244,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                                               ctx->rt->atom_size, n_values, ireg,
                                               pc_to_insn, bc_len + n_stubs_used,
                                               win_size, cycle_reg, &fd->regvm_code,
-@@ -60705,6 +60772,7 @@
+@@ -59000,6 +59056,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
          b->regvm_len = fd->regvm_len;
          b->regvm_reg_count = fd->regvm_reg_count;
          b->regvm_ctl_count = fd->regvm_ctl_count;
@@ -263,7 +252,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
          b->regvm_compiled = 1;
          b->regvm_all_threaded = fd->regvm_all_threaded;
          memcpy(b->regvm_code, fd->regvm_code, fd->regvm_len);
-@@ -63031,6 +63099,7 @@
+@@ -61320,6 +61377,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
          bc_put_u8(s, REGVM_FORMAT_VERSION);
          bc_put_leb128(s, b->regvm_reg_count);
          bc_put_leb128(s, b->regvm_ctl_count);
@@ -271,7 +260,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
          bc_put_leb128(s, b->regvm_len);
          rbuf = js_malloc(s->ctx, b->regvm_len);
          if (!rbuf)
-@@ -64318,8 +64387,8 @@
+@@ -62603,8 +62661,8 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
                      goto done;
                  }
              } else if (fmt[m] == 's') {
@@ -282,7 +271,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                      goto done;
                  }
              }
-@@ -64670,7 +64739,7 @@
+@@ -62955,7 +63013,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
          if (bc_get_u8(s, &compiled))
              goto fail;
          if (compiled) {
@@ -291,7 +280,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
              uint8_t version;
              if (bc_get_u8(s, &version))
                  goto fail;
-@@ -64682,10 +64751,12 @@
+@@ -62967,10 +63025,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
              }
              if (bc_get_leb128_int(s, &reg_count) ||
                  bc_get_leb128_int(s, &ctl_count) ||
@@ -304,7 +293,7 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
                  (size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
                  JS_ThrowSyntaxError(ctx, "invalid register program header");
                  goto fail;
-@@ -64693,6 +64764,7 @@
+@@ -62978,6 +63038,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
              bc.regvm_compiled = 1;
              bc.regvm_reg_count = reg_count;
              bc.regvm_ctl_count = ctl_count;
@@ -312,14 +301,3 @@ Shape ownership, cache fill and hit paths are A2-A4 and are not in this patch.
              bc.regvm_len = regvm_len;
          }
      }
---- a/quickjs-regvm.h
-+++ b/quickjs-regvm.h
-@@ -750,7 +750,7 @@
-  * cross-VM one does. Bump it whenever an opcode is added, removed or
-  * renumbered, or an operand's width or meaning changes.
-  */
--#define REGVM_FORMAT_VERSION 11
-+#define REGVM_FORMAT_VERSION 12
- 
- /* ROP_get_field and ROP_put_field use this site index when the source
-    instruction has no inline cache. */

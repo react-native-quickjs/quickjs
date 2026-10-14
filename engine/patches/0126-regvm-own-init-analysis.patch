@@ -1,6 +1,19 @@
+Subject: Adds the init dimension to the register ownership analysis
+
+What this does
+  Adds the init dimension to the register ownership analysis.
+
+Why we need it
+  The ownership analysis tracked only whether a register held a count, not whether it had ever been written; filling only the registers a function can read before writing needs the second dimension.
+
+What it adds
+  `regvm_own_analyze` gains a parallel must-analysis (`REG_INIT_UNINIT`/`REG_INIT_INIT`) seeded from the argument registers, AND-joined at merges, forced UNINIT at exception-handler entries, and advanced by a new `regvm_own_init_step`; the report pass emits the per-function init set (operand reads, non-plain definitions, returns and throws with `own != NONE`), plus `ret_sum`, a function-wide union and `uninit_ret`.
+
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23699,8 +23699,9 @@
+@@ -23325,8 +23325,9 @@ static void regvm_rcc_fail(JSRegRun *f, JSRegRCCRec *r, const char *what, int re
  {
      long off = f->rcc_ip ? (long)(f->rcc_ip - f->b->regvm_code) : -1;
      (void)r;
@@ -12,25 +25,13 @@
      fflush(stderr);
      abort();
  }
-@@ -56991,15 +56992,30 @@
+@@ -55492,24 +55493,22 @@ static int regvm_own_op_reg(const JSRegInsn *in, int k, const int *ireg,
+     return (r >= 0 && r < reg_count) ? r : -1;
  }
  
- /*
-+ * The init lattice, the second dimension section 6.1 needs for C1. `INIT` means
-+ * the register has definitely been written in this frame; `UNINIT` means it may
-+ * not have, so it must be filled at entry before anything can read it. It is a
-+ * must-analysis: the entry block and every exception entry are UNINIT, a
-+ * definition makes its destination INIT, and the join at a merge is AND (INIT
-+ * only if INIT on every predecessor).
-+ */
-+enum {
-+    REG_INIT_UNINIT = 0,
-+    REG_INIT_INIT = 1,
-+};
-+
-+/*
-  * One instruction's transfer over `st` (reg_count bytes).
-  *
+-/*
+- * One instruction's transfer over `st` (reg_count bytes).
+- *
 - * The update joins with the register's current state rather than overwriting
 - * it. That is deliberate: a strong update would make the transfer non-monotone
 - * (a `move` of a NONE source can lower a register that a loop already carried in
@@ -38,19 +39,34 @@
 - * join is the sound direction for a may-hold-a-count analysis: it can only
 - * over-approximate, and it reaches the fixed point. Strong updates, which need
 - * the SSA value to know the previous definition is dead, are a later refinement.
-+ * A strong update: a write replaces the register's state outright, because the
-+ * value that was there is gone. `regvm_own_result_class` gives the new state
-+ * (NONE for the count-free constants and the boolean comparisons, MAYBE for
-+ * everything else), and a `move` copies its source's state. The transfer is
-+ * monotone in `st` -- a constant, or a copy of one register into another -- and
-+ * the join at a merge is monotone, so the block worklist still reaches a fixed
-+ * point from bottom. The join this replaces was there because a strong update
-+ * was believed to oscillate; it does not, because a definition's new state does
-+ * not depend on the state it replaces.
-  */
- /*
-  * The index in `ops` of an instruction's destination. Almost always the first
-@@ -57046,12 +57062,13 @@
+- */
+-/*
+- * The index in `ops` of an instruction's destination. Almost always the first
+- * operand, but `await`, `yield`/`yield_star` and `apply_arguments` lower with
+- * the destination second -- `ADD(ROP_await, pop[0], dst)`. A checker that
+- * assumed the first operand would read the source as a write and the write as
+- * a read, which is exactly the async-resume failure it then reports.
+- */
++/* The init lattice: `INIT` means the register has definitely been written in
++   this frame; `UNINIT` means it may not have been, so it must be filled at
++   entry. A must-analysis: the entry block and every exception entry are
++   UNINIT, a definition makes its destination INIT, and the join is AND. */
++enum {
++    REG_INIT_UNINIT = 0,
++    REG_INIT_INIT = 1,
++};
++
++/* One instruction's transfer over `st` (reg_count bytes). A strong update: a
++   write replaces the register's state with `regvm_own_result_class`'s, and a
++   `move` copies its source's state. A definition's new state does not depend
++   on the old one, so the worklist still reaches a fixed point. */
++/* The index in `ops` of an instruction's destination. Usually the first, but
++   `await`, `yield`/`yield_star` and `apply_arguments` put it second
++   (`ADD(ROP_await, pop[0], dst)`). */
+ static int regvm_own_dest_index(uint16_t rop)
+ {
+     switch (rop) {
+@@ -55542,12 +55541,13 @@ static int regvm_own_second_dest_index(uint16_t rop)
  }
  
  static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
@@ -62,11 +78,11 @@
      int di = regvm_own_dest_index(rop);
 -    int d, s;
 +    int d, s = -1;
-+    (void)weak;   /* strong updates are deferred; see HP-S51-2026-10-01.md */
++    (void)weak;   /* unused: every update here is strong */
  
      if (regvm_own_has_dest(rop) && f && f[di] == 'r') {
          d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
-@@ -57064,6 +57081,10 @@
+@@ -55560,6 +55560,10 @@ static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
                  cls = regvm_own_result_class(rop);
              }
              st[d] = regvm_own_join(st[d], cls);
@@ -77,23 +93,23 @@
          }
          di = regvm_own_second_dest_index(rop);
          if (di >= 0) {
-@@ -57074,13 +57095,46 @@
+@@ -55569,14 +55573,43 @@ static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
+         }
          return;
      }
-     /*
+-    /*
 -     * A `*_xfer` store hands its value to a slot that now owns the count, so the
 -     * register no longer does. Under the join transfer the clear is the identity
 -     * (`join(x, NONE) == x`), so it is not applied: leaving the register counted
 -     * is the sound direction. The strong-update refinement will apply it.
-+     * The four store forms that hand their value to a slot which now owns the
-+     * count, so the register no longer does. `move_xfer` is a destination form
-+     * and was handled above. The value operand is the one the transfer pass
-+     * chose in `regvm_transfer_dead_sources`: `put_element_xfer` takes ops[2],
-+     * `put_field_xfer` ops[3], and the two binding stores ops[1] (their ops[0]
-+     * is the slot index, not a register).
-      */
+-     */
 -    (void)rop;
 -    (void)s;
++    /* The four store forms that hand their value to a slot, so the register no
++       longer owns the count. The value operand is the one
++       `regvm_transfer_dead_sources` chose: `put_element_xfer` ops[2],
++       `put_field_xfer` ops[3], the two binding stores ops[1] (ops[0] is the
++       slot index). */
 +    if (rop == ROP_put_element_xfer)
 +        s = regvm_own_op_reg(in, 2, ireg, n_values, reg_count, cycle_reg);
 +    else if (rop == ROP_put_field_xfer)
@@ -104,9 +120,8 @@
 +        st[s] = regvm_own_join(st[s], REG_OWN_NONE);
 +}
 +
-+/* The init transfer: a definition marks its destination written; everything
-+   else leaves the frame as it was. The `*_xfer` stores write a slot, not a
-+   register, so they do not appear here. */
++/* The init transfer: a definition marks its destination written. The `*_xfer`
++   stores write a slot, not a register. */
 +static void regvm_own_init_step(const JSRegInsn *in, uint8_t *st,
 +                                const int *ireg, int n_values, int reg_count,
 +                                int cycle_reg, int weak)
@@ -129,8 +144,8 @@
 +    }
  }
  
- /*
-@@ -57099,6 +57153,10 @@
+ /* Run the dataflow. Under `QJS_REGVM_COUNT` it also counts the plain-store
+@@ -55591,6 +55624,10 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
      int *bs = NULL, *be = NULL, *sx = NULL, *sxn = NULL;
      uint8_t *blkin = NULL, *blkout = NULL, *inq = NULL, *tmp = NULL;
      uint8_t *ex_entry = NULL;
@@ -141,7 +156,7 @@
      int i, b, k, e, ne = 0, sp = 0;
      const char *ownknob = REGVM_KNOB("REGVM_OWN");
      int dump = ownknob != NULL;
-@@ -57132,8 +57190,19 @@
+@@ -55624,8 +55661,19 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
      sx = js_malloc(ctx, (size_t)n_blocks * 4 * sizeof(int));
      sxn = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
      ex_entry = js_malloc(ctx, (size_t)n_blocks);
@@ -161,19 +176,14 @@
 +        !init_set || !uni)
          goto done;
  
-     /*
-@@ -57161,12 +57230,50 @@
+     /* Block membership by source pc: the fusion passes append branch islands
+@@ -55645,12 +55693,45 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          }
          blk[i] = mb;
      }
-+    /*
-+     * The INIT half of the entry state. A register is INIT at entry when some
-+     * value with no defining instruction in this function maps to it: the
-+     * incoming arguments, which the caller's frame setup has already written
-+     * (and `regvm_record_fill` has already filled when the call passed fewer
-+     * arguments than the callee declares). Every other register starts UNINIT,
-+     * so C1 leaves it as garbage until it is written.
-+     */
++    /* The INIT half of the entry state: a register is INIT at entry when an
++       incoming argument maps to it (the caller's setup, or `regvm_record_fill`,
++       has written it). Every other register starts UNINIT. */
 +    memset(has_def, 0, (size_t)(n_values > 0 ? n_values : 1));
 +    for (i = 0; i < n; i++) {
 +        const JSRegInsn *in = &ir->insns[i];
@@ -213,28 +223,21 @@
          inq[b] = 0;
          ex_entry[b] = 0;
      }
-@@ -57177,6 +57284,20 @@
+@@ -55660,6 +55741,13 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
+             bs[b] = i;
          be[b] = i + 1;
      }
-     /*
-+     * A block whose IR indices are not contiguous is one the fusion passes
-+     * appended an island into, and its straight-line transfer is then not the
-+     * block's execution order: an instruction attributed to the block by its
-+     * `src_pc` can sit at the end of the IR and be on a different edge. A
-+     * strong update there lowers a register the block never actually cleared,
-+     * so such a block keeps the joining update. Joining is the safe direction:
-+     * it can only raise a register's state, which costs precision, never
-+     * soundness.
-+     */
++    /* A block whose IR indices are not contiguous contains an appended island,
++       so its straight-line transfer is not its execution order; it keeps the
++       joining update, which only costs precision. */
 +    for (b = 0; b < n_blocks; b++) {
 +        for (i = bs[b]; bs[b] >= 0 && i < be[b]; i++)
 +            if (blk[i] != b) { weak[b] = 1; break; }
 +    }
-+    /*
-      * Successors, re-derived from the final IR. `succ` predates the fusion
-      * passes, which append a branch island -- edge copies followed by the branch
-      * -- that the original CFG never named as a block; and a branch whose target
-@@ -57270,7 +57391,7 @@
+     /* Successors, re-derived from the final IR: the fusion passes add branch
+        islands the CFG never named, and a branch to its own block is not in
+        `succ`. Over-approximating is sound; a missing edge is not. */
+@@ -55733,7 +55821,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
          inq[b] = 1;
      }
      while (sp > 0) {
@@ -243,19 +246,14 @@
          b = queue[--sp];
          inq[b] = 0;
          in = blkin + (size_t)b * nreg;
-@@ -57291,19 +57412,61 @@
+@@ -55750,18 +55838,55 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
              for (i = 0; i < nreg; i++)
                  in[i] = REG_OWN_MAYBE;
          }
-+        /*
-+         * The init half of the entry state, recomputed from the predecessors
-+         * each visit. It is a must-analysis, so unlike the own half it can fall
-+         * as well as rise; recomputing is what lets it do that. The join is AND
-+         * (INIT only if INIT on every predecessor). The entry block starts from
-+         * the argument registers, and an exception entry is all UNINIT -- the
-+         * registers there hold whatever the protected region left, which the
-+         * exception edge does not describe.
-+         */
++        /* The init half of the entry state, recomputed from the predecessors on
++           each visit, since a must-analysis can fall as well as rise. The entry
++           block starts from the argument registers; an exception entry is all
++           UNINIT. */
 +        in_i = blkin_i + (size_t)b * nreg;
 +        if (b == 0) {
 +            memcpy(in_i, entry_i, nreg);
@@ -278,10 +276,9 @@
 +        }
          out = blkout + (size_t)b * nreg;
 +        out_i = blkout_i + (size_t)b * nreg;
-         /* Transfer into a scratch buffer, then compare with the block's last
-            output. Comparing with `in` instead would miss a growth that came
-            from a predecessor but that this block's own transfer did not add to,
-            and the successors would never be revisited. */
+         /* Transfer into scratch and compare with the block's last output;
+            comparing with `in` would miss growth that came from a predecessor.
+            */
          memcpy(tmp, in, nreg);
 -        for (i = bs[b]; i >= 0 && i < be[b]; i++)
 -            if (blk[i] == b)
@@ -311,7 +308,7 @@
                  for (k = 0; k < sxn[b]; k++) {
                      int sb = sx[b * 4 + k];
                      if (sb >= 0 && sb < n_blocks && !inq[sb]) {
-@@ -57311,7 +57474,6 @@
+@@ -55769,7 +55894,6 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                          inq[sb] = 1;
                      }
                  }
@@ -319,7 +316,7 @@
              }
          }
      }
-@@ -57321,8 +57483,13 @@
+@@ -55779,8 +55903,13 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
      {
          int plain = 0, nret = 0, owned_max = 0;
          uint8_t *st = js_malloc(ctx, nreg);
@@ -334,7 +331,7 @@
  #ifdef QJS_REGVM_RCCHECK
          /* Section 6.2 consumes exactly what this replay already computes. */
          ir->own_nreg = nreg;
-@@ -57345,11 +57512,33 @@
+@@ -55803,11 +55932,30 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
              if (bs[b] < 0)
                  continue;
              memcpy(st, blkin + (size_t)b * nreg, nreg);
@@ -344,11 +341,8 @@
                  uint16_t rop = in->rop;
                  if (blk[i] != b)
                      continue;
-+                /*
-+                 * Kind 1: an operand read. Every `r` operand that is not a
-+                 * destination is read here, and a register that may be UNINIT
-+                 * when it is read must be filled at entry.
-+                 */
++                /* An operand read: a register that may be UNINIT here must be
++                   filled at entry. */
 +                {
 +                    const char *ff = regvm_rop_fmt[rop];
 +                    int di_ = regvm_own_dest_index(rop);
@@ -368,19 +362,15 @@
                  if (regvm_own_has_dest(rop) && regvm_rop_fmt[rop] &&
                      regvm_rop_fmt[rop][regvm_own_dest_index(rop)] == 'r') {
                      int d = regvm_own_op_reg(in, regvm_own_dest_index(rop), ireg,
-@@ -57358,6 +57547,20 @@
+@@ -55816,6 +55964,16 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                      int d2 = di2 >= 0 ? regvm_own_op_reg(in, di2, ireg, n_values,
                                                           reg_count, cycle_reg)
                                        : -1;
 +                    if (!(d >= 0 && st[d] == REG_OWN_NONE &&
 +                          (d2 < 0 || st[d2] == REG_OWN_NONE))) {
-+                        /*
-+                         * Kind 2: a definition that will be emitted non-plain
-+                         * reads its destination's old value. If the destination
-+                         * may be UNINIT, that read would touch garbage, so the
-+                         * register is filled. (Once a plain variant exists for
-+                         * the opcode, the definition stops needing the fill.)
-+                         */
++                        /* A definition emitted non-plain reads its
++                           destination's old value, so an UNINIT destination
++                           must be filled. */
 +                        if (d >= 0 && init_st[d] == REG_INIT_UNINIT)
 +                            init_set[d] = REG_INIT_INIT;
 +                        if (d2 >= 0 && init_st[d2] == REG_INIT_UNINIT)
@@ -389,18 +379,16 @@
                      if (d >= 0 && st[d] == REG_OWN_NONE &&
                          (d2 < 0 || st[d2] == REG_OWN_NONE)) {
                          plain++;
-@@ -57390,6 +57593,21 @@
+@@ -55848,6 +56006,19 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
  #endif
                      if (cnt > owned_max)
                          owned_max = cnt;
 +                    ret_sum += cnt;
 +                    /*
-+                     * Kind 3-4: the release walk at a return, and the
-+                     * unwinder's walk when the frame is abandoned. Every
-+                     * register it may free must hold a real value or a filled
-+                     * one. `uninit_ret` counts the registers the *full* walk
-+                     * would touch while they are still UNINIT -- the set C2's
-+                     * narrowed walk removes from the fill.
++                     * The release walk at a return and the unwinder's walk
++                     * free registers, which must hold real or filled values.
++                     * `uninit_ret` counts the registers the full walk touches
++                     * while they are still UNINIT.
 +                     */
 +                    for (k = 0; k < nreg; k++)
 +                        if (st[k] != REG_OWN_NONE && init_st[k] == REG_INIT_UNINIT)
@@ -411,7 +399,7 @@
                      if (dump) {
                          fprintf(stderr, "##OWNRET## i=%d rop=%d n=%d:", i, rop,
                                  cnt);
-@@ -57400,15 +57618,29 @@
+@@ -55858,15 +56029,29 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                          fprintf(stderr, "\n");
                      }
                  }
@@ -444,7 +432,7 @@
  #ifdef QJS_REGVM_COUNT
          js_regvm_own_plain += plain;
          js_regvm_own_returns += nret;
-@@ -57430,6 +57662,14 @@
+@@ -55888,6 +56073,14 @@ done:
      js_free(ctx, sx);
      js_free(ctx, sxn);
      js_free(ctx, ex_entry);

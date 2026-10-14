@@ -1,0 +1,210 @@
+Subject: Break closure self-cycles under deferred counting
+
+What this does
+  Break closure self-cycles under deferred counting.
+
+Why we need it
+  `var loop = function{ . Loop . }` is a two-object cycle: the cell holds the closure and the closure holds the cell.
+
+What it adds
+  `js_closcyc_frame`'s DRC branch records any detached cell that holds its own closure -- the count is NOT tested there, because dead sibling closures over the same cell may still be parked and still hold it. `js_closcyc_resolve` runs at the *end* of `js_drc_reconcile_locked`, after the parked lists are drained and while registers are still pinned, and makes the exact count test there: it breaks a cell whose count is exactly the list's plus the closure's own and whose closure is held only there. `QJS_DRC_CLOSCYC=0` restores the old `continue`.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs.c b/quickjs.c
+index 358ec43..a7f3028 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -125,6 +125,16 @@ typedef struct JSRegRCC JSRegRCC;
+ #define QJS_CTOR_PROTO_FAST 1
+ #endif
+ 
++/*
++ * QJS_DRC_CLOSCYC: under deferred reference counting, break a frame's
++ * closure -> cell self-cycle at the next reconcile instead of leaving it to the
++ * full collector. Off restores the old `continue` (every such cycle waits for a
++ * mark-sweep).
++ */
++#ifndef QJS_DRC_CLOSCYC
++#define QJS_DRC_CLOSCYC 1
++#endif
++
+ /*
+  * The handler-table entry for the seven opcodes above. With the switch on each
+  * names its own `regvm_t_<name>`; off, all seven fall back to `regvm_t_cold`,
+@@ -149,6 +159,9 @@ typedef struct JSRegRCC JSRegRCC;
+ 
+ #if QJS_DRC
+ static void js_drc_reconcile(JSRuntime *rt);
++#if QJS_DRC && QJS_DRC_CLOSCYC
++static void js_closcyc_resolve(JSRuntime *rt);
++#endif
+ #endif
+ 
+ #if defined(EMSCRIPTEN) || defined(_MSC_VER)
+@@ -372,6 +385,9 @@ typedef struct JSString JSString;
+ typedef struct JSString JSAtomStruct;
+ typedef struct JSStringRope JSStringRope;
+ typedef struct JSMegaEntry JSMegaEntry;
++/* QJS_DRC_CLOSCYC: the runtime's candidate list needs the name before the
++   struct definition below. */
++typedef struct JSVarRef JSVarRef;
+ 
+ #define JS_VALUE_GET_OBJ(v) ((JSObject *)JS_VALUE_GET_PTR(v))
+ #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
+@@ -581,6 +597,14 @@ struct JSRuntime {
+        very large parked values cannot ratchet the heap up. */
+     size_t drc_malloc_mark;
+     uint8_t drc_in_reconcile;
++#if QJS_DRC && QJS_DRC_CLOSCYC
++    /* Detached cells whose closure is still in flight (a
++       `var loop = function() { ... loop() ... }` self-cycle), collected by
++       `js_closcyc_frame` and resolved at the next reconcile once every live
++       register is pinned. The list holds one reference on each cell. */
++    JSVarRef *closcyc_cand[1024];
++    int closcyc_n;
++#endif
+     struct list_head tmp_obj_list; /* used during GC */
+     JSGCPhaseEnum gc_phase : 8;
+     size_t malloc_gc_threshold;
+@@ -3876,6 +3900,15 @@ void JS_FreeRuntime(JSRuntime *rt)
+ 
+     JS_RunGC(rt);
+ 
++#if QJS_DRC && QJS_DRC_CLOSCYC
++    /* The final JS_RunGC reconciles and drains the candidates; drop anything
++       recorded after it before the leak checks. */
++    while (rt->closcyc_n > 0) {
++        JSVarRef *vr = rt->closcyc_cand[--rt->closcyc_n];
++        free_var_ref(rt, vr);
++    }
++#endif
++
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     /* leaking objects */
+     if (check_dump_flag(rt, JS_DUMP_LEAKS)) {
+@@ -10062,6 +10095,13 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
+     rt->zct_nobj = 0;
+     if (!list_empty(&rt->gc_zero_ref_count_list))
+         free_zero_refcount(rt);
++#if QJS_DRC_CLOSCYC
++    /* Break the recorded closure -> cell self-cycles last: registers are still
++       pinned, so counts are exact, and the parked lists are drained, so the
++       closure free's free_zero_refcount only sees objects at count zero. */
++    js_closcyc_resolve(rt);
++    assert(list_empty(&rt->gc_zero_ref_count_list));
++#endif
+ 
+     rt->drc_in_reconcile = 0;
+ }
+@@ -23275,13 +23315,52 @@ js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf, bool guarded)
+             }
+             JS_REF_COUNT(vr)--;
+         }
++#if QJS_DRC && QJS_DRC_CLOSCYC
++        /* Dead closures over this cell may still be parked and hold it, so its
++           count is not exact here. Record the cell when it holds its own
++           closure; js_closcyc_resolve tests the count once the parked values
++           are drained. */
++        if (!vr->is_detached)
++            continue;
++#else
+         if (!vr->is_detached || JS_REF_COUNT(vr) != 1)
+             continue;
++#endif
+ #if QJS_DRC
+-        /* Deferred RC: a register can hold this closure without owning it, so
+-           "only the cell refers to the closure" no longer proves the cycle is
+-           dead. Leave it for the cycle collector, which can see the
+-           closure -> var_ref edge. */
++        /* A register can hold this closure without owning it, so "only the cell
++           refers to the closure" proves nothing yet. Hand the cell to
++           `js_closcyc_resolve`, which runs in the next reconcile with every
++           register pinned. The `owns` test is the non-DRC branch's. */
++#if QJS_DRC_CLOSCYC
++        {
++            JSObject *o;
++            JSFunctionBytecode *b;
++            int j, n, owns;
++
++            if (JS_VALUE_GET_TAG(vr->value) != JS_TAG_OBJECT)
++                continue;
++            o = JS_VALUE_GET_OBJ(vr->value);
++            if (o->class_id != JS_CLASS_BYTECODE_FUNCTION)
++                continue;
++            b = o->u.func.function_bytecode;
++            if (!b || !o->u.func.var_refs)
++                continue;
++            n = b->closure_var_count;
++            owns = 0;
++            for (j = 0; j < n; j++)
++                if (o->u.func.var_refs[j] == vr) { owns = 1; break; }
++            if (!owns)
++                continue;
++            if (rt->closcyc_n == (int)countof(rt->closcyc_cand)) {
++                /* full: force a reconcile at the next safepoint and let this
++                   cell wait */
++                rt->zct_limit = 0;
++                continue;
++            }
++            JS_REF_COUNT(vr)++;
++            rt->closcyc_cand[rt->closcyc_n++] = vr;
++        }
++#endif /* QJS_DRC_CLOSCYC */
+         continue;
+ #else
+         if (JS_VALUE_GET_TAG(vr->value) != JS_TAG_OBJECT)
+@@ -23311,6 +23390,53 @@ js_closcyc_frame(JSRuntime *rt, JSStackFrame *sf, bool guarded)
+     }
+ }
+ 
++#if QJS_DRC && QJS_DRC_CLOSCYC
++/* Resolve the cells `js_closcyc_frame` handed over. Runs at the end of
++   `js_drc_reconcile_locked`, after the parked lists are drained, with every
++   register pinned, so a count of 2 (the list's reference plus the closure's)
++   is exact; with the closure as the only holder, the
++   `var f = function(){ ... f() ... }` cycle is unreachable and is broken here.
++   The list is reset before the loop, so a re-entrant free cannot lose a nested
++   push. */
++static void js_closcyc_resolve(JSRuntime *rt)
++{
++    JSVarRef **cand = rt->closcyc_cand;
++    int n = rt->closcyc_n;
++    int i;
++
++    rt->closcyc_n = 0;
++    for (i = 0; i < n; i++) {
++        JSVarRef *vr = cand[i];
++
++        if (JS_REF_COUNT(vr) == 2 && JS_VALUE_GET_TAG(vr->value) == JS_TAG_OBJECT) {
++            JSObject *o = JS_VALUE_GET_OBJ(vr->value);
++
++            if (o->class_id == JS_CLASS_BYTECODE_FUNCTION &&
++                JS_REF_COUNT(o) == 1) {
++                JSFunctionBytecode *b = o->u.func.function_bytecode;
++                int j, owns = 0;
++
++                if (b && o->u.func.var_refs) {
++                    int cn = b->closure_var_count;
++
++                    for (j = 0; j < cn; j++)
++                        if (o->u.func.var_refs[j] == vr) { owns = 1; break; }
++                }
++                if (owns) {
++                    JSValue t = vr->value;
++
++                    vr->value = JS_UNDEFINED;
++                    vr->pvalue = &vr->value;
++                    JS_FreeValueRT(rt, t);
++                }
++            }
++        }
++        /* drop the list's reference in every case */
++        free_var_ref(rt, vr);
++    }
++}
++#endif /* QJS_DRC && QJS_DRC_CLOSCYC */
++
+ #if QJS_REGVM
+ /* How many for-of loops one activation can be inside at once. A function with
+    more for-of sites is refused at compile time. */

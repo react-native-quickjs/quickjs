@@ -19,25 +19,22 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -458,6 +458,17 @@
-     bool in_free;
+@@ -459,6 +459,14 @@ struct JSRuntime {
  
      struct JSStackFrame *current_stack_frame;
-+
-+    /* for-in element-load memo: "in shape forin_shape, the property named
-+       forin_atom lives at index forin_idx". That is a property of the SHAPE
-+       alone, not of any object or loop, which is what makes it self-validating:
-+       a reader that observes the same shape may trust the index. The reference
-+       is load-bearing -- without it a shape update mutates in place at the same
-+       address and pointer equality would match a layout that has changed. It
-+       also transitively keeps forin_atom alive. */
+ 
++    /* for-in element-load memo: in forin_shape, forin_atom is at forin_idx. A
++       property of the shape alone, so a reader that sees the same shape may
++       trust the index. The counted reference keeps the shape from being mutated
++       in place and keeps forin_atom alive. */
 +    JSShape *forin_shape;
 +    JSAtom forin_atom;
 +    uint32_t forin_idx;
- 
++
      JSInterruptHandler *interrupt_handler;
      void *interrupt_opaque;
-@@ -2957,6 +2968,11 @@
+ 
+@@ -2957,6 +2965,11 @@ void JS_FreeRuntime(JSRuntime *rt)
      bool leak = false;
      int i;
  
@@ -49,38 +46,31 @@ Needs a bytecode version bump
      rt->in_free = true;
  #ifdef QJS_ICSTAT
      js_icstat_dump();
-@@ -3845,6 +3861,12 @@
-     if (--JS_REF_COUNT(ctx) > 0)
+@@ -3846,6 +3859,12 @@ void JS_FreeContext(JSContext *ctx)
          return;
      assert(JS_REF_COUNT(ctx) == 0);
-+
+ 
 +    if (rt->forin_shape) {
 +        js_free_shape(rt, rt->forin_shape);
 +        rt->forin_shape = NULL;
 +        rt->forin_atom = JS_ATOM_NULL;
 +    }
- 
++
  #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
      if (check_dump_flag(rt, JS_DUMP_ATOMS))
-@@ -11603,6 +11625,39 @@
+         JS_DumpAtoms(ctx->rt);
+@@ -11579,6 +11598,32 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
      }
  }
  
-+/* for-in element-load memo, read side.  Returns true and stores the value when
-+   the receiver's shape is the memoized shape and the key is the memoized atom,
-+   in which case the index within that shape is already known and a direct read
-+   replaces JS_ValueToAtom (which scans the key for a numeric string),
-+   find_own_property's hash probe and the prototype walk.
-+
-+   Guards, shortest first.  The shape compare is first so an empty memo
-+   short-circuits before atom_array is indexed.  The key pointer compare proves
-+   this is the key whose index was recorded, not merely a key in a matching
-+   object; it is exact because JS_AtomToValue on a string atom returns that
-+   atom's own JSString.  The class test is belt-and-braces.  The final two are
-+   load-bearing: re-deriving the atom from the shape degrades a bookkeeping bug
-+   into a miss, and the TMASK test is reachable from ordinary JavaScript because
-+   two objects carrying an accessor at the same slot have equal shapes, so the
-+   memoized index can name a getter slot whose union is not a value. */
++/* for-in element-load memo, read side. On a shape and key match the index is
++ * already known, replacing JS_ValueToAtom, the hash probe and the prototype
++ * walk.
++ *
++ * The key pointer compare is exact because JS_AtomToValue on a string atom
++ * returns that atom's own JSString. Re-deriving the atom from the shape turns a
++ * bookkeeping bug into a miss, and the TMASK test is required: two objects with
++ * an accessor at the same slot share a shape. */
 +static bool js_forinreg_lookup(JSRuntime *rt, JSObject *p, JSValueConst prop,
 +                               JSValue *pval)
 +{
@@ -102,14 +92,13 @@ Needs a bytecode version bump
  static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
                                          JSValueConst prop)
  {
-@@ -11619,6 +11674,14 @@
+@@ -11595,6 +11640,13 @@ static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
              /* fast path for array and typed array access */
              if (js_get_fast_array_element(ctx, p, idx, &val))
                  return val;
 +        } else if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING) {
-+            /* One site, not the interpreter's CASE bodies: with the fused
-+               element load every load on the prop rows funnels through here,
-+               and adding live values to a CASE body costs recursion depth. */
++            /* One site rather than in the interpreter's CASE bodies: extra live
++               values there cost recursion depth. */
 +            JSValue val;
 +            if (js_forinreg_lookup(ctx->rt, JS_VALUE_GET_OBJ(this_obj), prop,
 +                                   &val))
@@ -117,11 +106,10 @@ Needs a bytecode version bump
          }
      } else if (unlikely(tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)) {
          // per spec: not allowed to call ToPropertyKey before ToObject
-@@ -19111,6 +19174,16 @@
-                 return ret;
+@@ -19022,6 +19074,16 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
              if (ret)
                  break;
-+        }
+         }
 +        {
 +            JSRuntime *rt = ctx->rt;
 +            if (rt->forin_shape != pin) {
@@ -131,6 +119,7 @@ Needs a bytecode version bump
 +            }
 +            rt->forin_atom = prop;
 +            rt->forin_idx = it->idx - 1;
-         }
++        }
          sp[0] = JS_AtomToValue(ctx, prop);
          sp[1] = JS_FALSE;
+         return 0;

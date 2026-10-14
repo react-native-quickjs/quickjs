@@ -1,36 +1,46 @@
+Subject: Take the hot fixed-address loads out of the frame stores' shadow
+
+What this does
+  Take the hot fixed-address loads out of the frame stores' shadow.
+
+Why we need it
+  At some arena offsets a light call or return cost about 20 extra cycles.
+
+What it adds
+  Four reorderings that hold at every offset: the odd-register `undefined` fill moves before the loop (the constant is loaded once, before any store); the trivial light return stores the value into the caller's register before the `regvm_cur` update, which removes the compiler's stack spill, and hoists `ctx->rt` above the store; the light call and method call hoist `ctx->rt`, `cb->realm` and `cb->regvm_code` above `regvm_light_prepare` and dispatch through them.
+
+Needs a bytecode version bump
+  No.
 diff --git a/quickjs.c b/quickjs.c
+index 0785a02..6e01f66 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -26974,14 +26974,25 @@
+@@ -26238,14 +26238,17 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
              JSRegRun *c = f->caller;
              int dst = (uint16_t)hp;
              uint8_t *rip = f->ret_ip;
 -            JSValue v = FR(s);
  
-             /*
-              * Step 10: a light frame lives above the arena top, so popping it
-              * is only dropping the pointer -- no top store, no chunk pop.
-+             *
-+             * The value moves into the caller's register *before* the
-+             * `regvm_cur` update. Both orders are the same program, but with
-+             * the store first the compiler's live range for the value is the
-+             * load and the store alone -- no spill to the C stack in between.
-+             * A spill there is a fixed store that a later arena load can
-+             * 4K-alias, which is what made a return cost 15 extra cycles at
-+             * some arena offsets.
-              */
+-            /*
+-             * A light frame lives above the arena top, so popping it only drops
+-             * the pointer: no top store, no chunk pop.
+-             */
 -            ctx->rt->regvm_cur = c;
 -            *(JSValue *)((uint8_t *)c->fr + dst) = v;
++            /* A light frame lives above the arena top, so popping it only drops
++               the pointer. The value is stored to the caller's register before
++               the `regvm_cur` update so it is never spilled: a spill can
++               4K-alias a later arena load. */
 +            {
 +                JSRuntime *rt = ctx->rt;
 +
 +                *(JSValue *)((uint8_t *)c->fr + dst) = FR(s);
 +                rt->regvm_cur = c;
 +            }
-             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
-                its return does not end the caller's chain. */
-             /* Step 13: keep `ctx` when the caller shares the callee's realm. */
-@@ -27314,6 +27325,7 @@
+             /* A light frame never tail-calls, so the caller's
+                `regvm_tail_chain` is kept. */
+             /* keep `ctx` when the caller shares the callee's realm */
+@@ -26531,6 +26534,7 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
              if (likely(cb->regvm_light_fast)) {
                  int ab = T_REG(5), na = T_U8(7);
                  JSValue *regs;
@@ -38,23 +48,19 @@ diff --git a/quickjs.c b/quickjs.c
                  JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 8,
                                                     FRP(ab), na, &regs);
                  if (unlikely(nf == NULL))
-@@ -27321,7 +27333,14 @@
+@@ -26538,7 +26542,10 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                          return regvm_t_call_record(REGVM_PASS);
                  memcpy(&nf->this_obj, &regvm_undefined_value,
                         sizeof(JSValue));
 -                ctx->rt->regvm_cur = nf;
 +                rt->regvm_cur = nf;
-+                /*
-+                 * The dispatch stays split in two here. Hoisting
-+                 * `cb->realm`/`cb->regvm_code` into locals widens the live
-+                 * ranges across the `musttail` enough that clang saves `%rbp`,
-+                 * and PUSHCHECK refuses a framed fast path; the `ctx->rt`
-+                 * hoist above is the aliasing fix and stays.
-+                 */
++                /* The dispatch stays split: hoisting
++                   `cb->realm`/`cb->regvm_code` widens the live ranges across
++                   the `musttail` until clang saves `%rbp`. */
                  if (likely(cb->realm == ctx)) {
                      __attribute__((musttail))
                          return regvm_t_dispatch(cb->regvm_code, regs, nf, ctx);
-@@ -27365,13 +27384,21 @@
+@@ -26579,13 +26586,17 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                  int r = T_REG(5), ab = T_REG(7), na = T_U8(9);
                  JSValue tv = FR(r);
                  JSValue *regs;
@@ -67,28 +73,26 @@ diff --git a/quickjs.c b/quickjs.c
                  nf->this_obj = tv;
 -                ctx->rt->regvm_cur = nf;
 +                rt->regvm_cur = nf;
-+                /*
-+                 * The receiver keeps the dispatch split in two here: hoisting
-+                 * `cb->realm`/`cb->regvm_code` into locals widens the live
-+                 * ranges across the `musttail` enough that clang saves `%rbp`,
-+                 * and the gate's PUSHCHECK refuses a framed fast path. The
-+                 * `ctx->rt` hoist above is the aliasing fix and stays.
-+                 */
++                /* The dispatch stays split: hoisting
++                   `cb->realm`/`cb->regvm_code` widens the live ranges across
++                   the `musttail` until clang saves `%rbp`. */
                  if (likely(cb->realm == ctx)) {
                      __attribute__((musttail))
                          return regvm_t_dispatch(cb->regvm_code, regs, nf, ctx);
-@@ -27744,14 +27771,23 @@
-      * alignment- and aliasing-safe and lowers to `movups`; the barrier keeps the
-      * loop from being rewritten into a `memset` call.
-      */
-+    /*
-+     * The odd register is filled *first*. The constant lives in read-only data,
-+     * so a reload of it after the fill stores can 4K-alias the frame and stall
-+     * (the alias event points at exactly that reload); loading it once, before
-+     * any store, and reusing the register across the loop keeps the load out of
-+     * the stores' shadow at every arena offset. The fill order is not
-+     * observable: every register ends up the same `undefined`.
-+     */
+@@ -26880,19 +26891,20 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
+     regs = nf->fr;
+     /* a light frame never suspends, so it has no handshake slots */
+     nregs = cb->regvm_reg_count;
+-    /*
+-     * One 16-byte `undefined` store per register. `__builtin_memcpy` from the
+-     * constant is alignment- and aliasing-safe; the barrier keeps the loop from
+-     * becoming a `memset` call.
+-     */
++    /* One 16-byte `undefined` store per register. `__builtin_memcpy` from the
++       constant is alignment- and aliasing-safe; the barrier keeps the loop from
++       becoming a `memset` call. */
++    /* The odd register is filled first so the constant is loaded once, before
++       any store: a reload after the stores can 4K-alias the frame. */
 +    if (nregs & 1)
 +        __builtin_memcpy(&regs[nregs - 1], &regvm_undefined_value,
 +                         sizeof(JSValue));

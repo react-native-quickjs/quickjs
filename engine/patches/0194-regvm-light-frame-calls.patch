@@ -1,7 +1,52 @@
+Subject: Light-frame calls
+
+What this does
+  Light-frame calls.
+
+Why we need it
+  Every JS-to-JS call built a full heap-style record: a `JSRegRun`, an embedded `JSStackFrame`, a `memcpy` undefined fill.
+
+What it adds
+  A light frame is only the 9-slot `JSRegRun` prefix plus the variable area and register file, laid in the frame arena; no `JSStackFrame` and no record tail. `JSRegRun` is reordered so the prefix is first and `ret_dst`/`argc`/`flags`/`nctl` pack into one word; `cap_ip` carries the frame's pc and a `JSStackFrame.rv_rec` back-pointer lets `regvm_frame_pc` reach an activation's C-stack entry record (which `regvm_rec_of_sf` cannot map back from an arena frame); `rt->regvm_cur` plus `JSStackFrame.rv_light` publish the light chain and every real-frame push/pop saves and restores it, including all three `js_regvm_execute` exit paths (`done`, `done_generator` and the nested unwind) that bypass `JS_CallInternal`'s pop; the DRC root walk, `build_backtrace`, `is_strict_mode` and `JS_GetActiveFunction` walk the logical stack. New frameless `regvm_t_call_light`/`_call_method_light`; the trivial light return is fused into `regvm_t_return` and `regvm_t_return_undefined` so the value moves straight into the caller's register instead of round-tripping through the frame's `ret` slot, and `regvm_t_return_light_nested`/`regvm_t_return_light_chunk` and the unwinder arm release the variable area.
+
+Needs a bytecode version bump
+  No.
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index 1fdd073..4f3f499 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -2844,7 +2844,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_next(uint8_t *ip, JSValue *fr, JSRegRu
+ 
+                 { int w = RD_REG();
+                   if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
+-                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
++                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
+                       goto exception;
+                   }
+                   /* The helper clears the iterator slot when the step reported
+@@ -2853,7 +2853,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_next(uint8_t *ip, JSValue *fr, JSRegRu
+                      too: an iterator whose own step threw must not have
+                      `return` called. */
+                   if (JS_IsUndefined(regs[w]))
+-                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
++                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
+                   REGVM_NEXT(); }
+  exception:
+     rf->ret = JS_EXCEPTION;
+@@ -2931,7 +2931,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_value_done(uint8_t *ip, JSValue *fr, J
+                          trailing async close skips return() (AsyncIteratorClose
+                          does not run on normal completion). */
+                       SET_REG_P(w, JS_UNDEFINED);
+-                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
++                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
+                   }
+                   JS_FreeValue(ctx, tmp[0]);
+                   REGVM_NEXT(); }
 diff --git a/quickjs.c b/quickjs.c
+index 4ddcb2c..a019b94 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -460,6 +460,9 @@
+@@ -450,6 +450,9 @@ typedef struct JSArenaState {
      _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
  } JSArenaState;
  
@@ -11,66 +56,55 @@ diff --git a/quickjs.c b/quickjs.c
  typedef struct JSRuntimeFinalizerState {
      struct JSRuntimeFinalizerState *next;
      JSRuntimeFinalizer *finalizer;
-@@ -694,6 +697,15 @@
+@@ -659,6 +662,11 @@ struct JSRuntime {
      struct JSRegArenaChunk *regvm_chunk;
      size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
  #endif
-+    /*
-+     * Plan 5.5: the innermost *light* register frame, or NULL when no light
-+     * frame is running. Published eagerly on every light call and cleared on
-+     * every push of a real JSStackFrame (which saves the previous value in
-+     * `JSStackFrame.rv_light`), so a walker can rebuild the logical stack.
-+     * Always present, so the C-frame push/pop sites compile in the stack-only
-+     * build too (where it stays NULL).
-+     */
++    /* The innermost light register frame, or NULL. Published on every light
++       call and cleared on every push of a real JSStackFrame (which saves it in
++       `JSStackFrame.rv_light`), so a walker can rebuild the logical stack.
++       Present in the stack-only build too, where it stays NULL. */
 +    struct JSRegRun *regvm_cur;
      JSMegaEntry *mega_cache;
      uint32_t shape_free_epoch;
      void *user_opaque;
-@@ -765,6 +777,22 @@
-        a stack pc), so the trace readers use this through regvm_frame_pc. NULL
-        means the frame is not in a register call and renders without a line. */
+@@ -726,6 +734,15 @@ typedef struct JSStackFrame {
+        NULL for a register frame). Read through regvm_frame_pc; NULL renders
+        without a line. */
      const uint8_t *regvm_ip;
-+    /*
-+     * Plan 5.5: the value of `rt->regvm_cur` when this JSStackFrame was pushed.
-+     * A pusher saves it and clears `regvm_cur`; the matching popper restores it,
-+     * so the light frames that were running below this frame stay reachable
-+     * from the stack-frame chain.
-+     */
++    /* `rt->regvm_cur` when this JSStackFrame was pushed. The pusher saves it
++       and clears `regvm_cur`; the popper restores it. */
 +    struct JSRegRun *rv_light;
-+    /*
-+     * The `JSRegRun` this JSStackFrame belongs to. A record's embedded frame
-+     * and a light frame's header both set it; an activation's C-stack frame
-+     * (created by `JS_CallInternal`, entered through `js_regvm_execute`) is
-+     * linked to its entry record here, which `regvm_rec_of_sf` cannot find
-+     * because that record is not in the arena. `regvm_frame_pc` reads the
-+     * captured ip through it.
-+     */
++    /* The `JSRegRun` this JSStackFrame belongs to. Set by a record's embedded
++       frame and a light frame's header; an activation's C-stack frame is linked
++       to its entry record here, which `regvm_rec_of_sf` cannot find because it
++       is not in the arena. `regvm_frame_pc` reads the captured ip through it.
++       */
 +    struct JSRegRun *rv_rec;
  } JSStackFrame;
  
- /*
-@@ -788,7 +816,14 @@
+ /* A nested record's JSStackFrame lives in the arena at `rec->sf_embed`, and
+@@ -745,7 +762,14 @@ static inline void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
  }
  #endif
  
 -#if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
 +#if QJS_REGVM
-+/* Plan 5.5: the strictness and function of the innermost light frame, read
-+   before the real-frame chain so a light function's own strict mode wins. */
++/* The strictness and function of the innermost light frame, read before the
++   real-frame chain so a light function's own strict mode wins. */
 +static bool regvm_cur_strict(JSRuntime *rt);
 +static JSValueConst regvm_cur_func(JSRuntime *rt);
 +#endif
 +
 +#if QJS_DRC || QJS_DRC_VALIDATE
  /*
-  * D1 root registry (HP-S3-DEFERRED-RC-PLAN-2026-10-02.md section 3, stage D1).
-  *
-@@ -800,16 +835,27 @@
+  * Register root registry. A register-VM frame publishes its live register
+  * window on its JSStackFrame (`rv_regs`, NULL for every other frame), and
+@@ -754,16 +778,27 @@ static inline void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
   */
  typedef void (*JSRegRootFn)(void *opaque, JSValue *regs, uint32_t nregs);
  
-+/* Plan 5.5: walk one light chain (innermost first). Defined after JSRegRun. */
++/* Walk one light chain (innermost first). Defined after JSRegRun. */
 +static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque);
 +
  static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
@@ -93,24 +127,23 @@ diff --git a/quickjs.c b/quickjs.c
 -#endif /* QJS_REGVM */
 +#endif
  
- /* Publish a frame's live register window as a GC root range. Inert (a no-op) in
-    builds that do not use the deferred-RC collector, so the root registry costs
-@@ -1561,6 +1607,14 @@
-        struct keeps its size and offsets. */
+ /* Publish a frame's live register window as a GC root range. A no-op without
+    the deferred-RC collector. */
+@@ -1480,6 +1515,13 @@ typedef struct JSFunctionBytecode {
+        only) and functions with more than 255 slots use `var_count`. */
      uint8_t regvm_var_count;
      uint32_t regvm_frame_need;
-+    /* Plan 5.4: light-frame eligibility. Set by regvm_set_call_desc() when the
-+       function is call_ready, owns no captured locals and no owned arguments,
-+       has no control records, and every opcode is light-safe (no handler reads
-+       a record-only field or a JSStackFrame). `regvm_light_need` is the arena
-+       size of a light frame: the 9-slot prefix, the variable area and the
-+       register file (arguments are always borrowed when light). */
++    /* Light-frame eligibility, set by regvm_set_call_desc() when the function
++       is call_ready, owns no captured locals or arguments, has no control
++       records, and uses only light-safe opcodes. `regvm_light_need` is a light
++       frame's arena size: the 9-slot prefix, the variable area and the register
++       file. */
 +    uint8_t regvm_light;
 +    uint32_t regvm_light_need;
  #endif
  #if QJS_AOT_PROFILE
-     /* AOT profiler record (P0). Lazily allocated, owned by this bytecode. */
-@@ -2580,7 +2634,8 @@
+     /* AOT profiler record. Lazily allocated, owned by this bytecode. */
+@@ -2490,7 +2532,8 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
  #endif
      if (force_gc) {
          /* deferred: collect at the next safepoint, not under running JS */
@@ -120,7 +153,7 @@ diff --git a/quickjs.c b/quickjs.c
              (rt->malloc_state.malloc_size + size) < rt->gc_deferred_limit) {
              rt->gc_pending = true;
              rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
-@@ -4458,12 +4513,16 @@
+@@ -4360,12 +4403,16 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
  
      JSRuntime *rt = ctx->rt;
      JSStackFrame *saved = rt->current_stack_frame;
@@ -137,7 +170,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = saved;
      return ret;
  }
-@@ -4777,6 +4836,10 @@
+@@ -4679,6 +4726,10 @@ void JS_UpdateStackTop(JSRuntime *rt)
  
  static inline bool is_strict_mode(JSContext *ctx)
  {
@@ -148,7 +181,7 @@ diff --git a/quickjs.c b/quickjs.c
      JSStackFrame *sf = ctx->rt->current_stack_frame;
      if (!sf)
          return false;
-@@ -9216,6 +9279,9 @@
+@@ -9064,6 +9115,9 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
      }
      prev_sf = rt->current_stack_frame;
      sf->prev_frame = prev_sf;
@@ -158,7 +191,7 @@ diff --git a/quickjs.c b/quickjs.c
      REGVM_SET_ROOT(sf, NULL, 0);
      rt->current_stack_frame = sf;
      // TODO(bnoordhuis) switch realms like js_call_c_function does
-@@ -9224,6 +9290,7 @@
+@@ -9072,6 +9126,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
      sf->cur_func = unsafe_unconst(func_obj);
      sf->arg_count = argc;
      ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
@@ -166,7 +199,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf->prev_frame;
      return ret;
  }
-@@ -9343,6 +9410,9 @@
+@@ -9191,6 +9246,9 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
  
      prev_sf = rt->current_stack_frame;
      sf->prev_frame = prev_sf;
@@ -176,7 +209,7 @@ diff --git a/quickjs.c b/quickjs.c
      REGVM_SET_ROOT(sf, NULL, 0);
      rt->current_stack_frame = sf;
      // TODO(bnoordhuis) switch realms like js_call_c_function does
-@@ -9351,6 +9421,7 @@
+@@ -9199,6 +9257,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
      sf->cur_func = unsafe_unconst(func_obj);
      sf->arg_count = argc;
      ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
@@ -184,7 +217,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf->prev_frame;
  
      return ret;
-@@ -9862,37 +9933,43 @@
+@@ -9707,37 +9766,43 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
      }
  }
  
@@ -246,7 +279,7 @@ diff --git a/quickjs.c b/quickjs.c
  /* Frees every parked value that no live register refers to. The caller must
     have pinned the register windows first. */
  static void js_drc_reconcile_locked(JSRuntime *rt)
-@@ -10499,7 +10576,7 @@
+@@ -10333,7 +10398,7 @@ void JS_RunPendingGC(JSRuntime *rt)
  {
      if (!rt->gc_pending)
          return;
@@ -255,11 +288,11 @@ diff --git a/quickjs.c b/quickjs.c
      rt->gc_pending = false;
      JS_RunGC(rt);
      rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
-@@ -11399,15 +11476,61 @@
+@@ -11232,15 +11297,61 @@ static JSValue js_error_stack_format(JSContext *ctx, JSErrorStackData *esd)
  #if QJS_REGVM
  static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
                            JSFunctionBytecode *b);
-+/* Plan 5.5: the register pc a light frame's captured ip names. */
++/* The register pc a light frame's captured ip names. */
 +static int regvm_ip_pc(JSFunctionBytecode *b, const uint8_t *ip)
 +{
 +    if (!ip)
@@ -318,37 +351,20 @@ diff --git a/quickjs.c b/quickjs.c
      JSValue stack, prepare, saved_exception, error_obj;
      DynBuf dbuf;
      const char *func_name_str;
-@@ -11488,104 +11611,123 @@
+@@ -11321,104 +11432,120 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      if (filename && (backtrace_flags & JS_BACKTRACE_FLAG_SINGLE_LEVEL))
          goto done;
  
 -    sf_start = rt->current_stack_frame;
-+    /*
-+     * Plan 5.5: walk the logical stack, not just the JSStackFrame chain. Light
-+     * frames interleave with real ones; a light frame's function is `f->func`
-+     * and its register pc comes from its captured `cap_ip` (every frame that
-+     * makes a call captures one, and the throw path captures the innermost).
-+     */
++    /* Walk the logical stack, in which light frames interleave with real ones.
++       A light frame's function is `f->func` and its pc comes from its captured
++       `cap_ip`. */
 +    {
 +        JSRegBtFrame bt[64];
 +        int nb, bi;
- 
--    /* Find the frame we want to start from. Note that when a filter is used the filter
--       function will be the first, but we also specify we want to skip the first one. */
--    if (has_filter_func) {
--        for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
--            if (js_same_value(ctx, sf->cur_func, filter_func)) {
--                sf_start = sf;
--                break;
--            }
--        }
--    }
++
 +        nb = regvm_fill_backtrace_frames(rt, bt, (int)stack_trace_limit);
- 
--    for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
--        if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
--            backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
--            continue;
++
 +        /* Find the frame we want to start from. Note that when a filter is used
 +           the filter function will be the first, but we also specify we want to
 +           skip the first one. */
@@ -359,7 +375,31 @@ diff --git a/quickjs.c b/quickjs.c
 +                    break;
 +            if (bi == nb)
 +                bi = 0;
-         }
++        }
+ 
+-    /* Find the frame we want to start from. Note that when a filter is used the filter
+-       function will be the first, but we also specify we want to skip the first one. */
+-    if (has_filter_func) {
+-        for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
+-            if (js_same_value(ctx, sf->cur_func, filter_func)) {
+-                sf_start = sf;
+-                break;
++        for (; bi < nb && i < stack_trace_limit; bi++) {
++            if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
++                backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
++                continue;
+             }
+-        }
+-    }
+ 
+-    for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
+-        if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
+-            backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
+-            continue;
+-        }
++            p = JS_VALUE_GET_OBJ(bt[bi].func);
++            b = NULL;
++            backtrace_barrier = false;
  
 -        p = JS_VALUE_GET_OBJ(sf->cur_func);
 -        b = NULL;
@@ -369,22 +409,29 @@ diff --git a/quickjs.c b/quickjs.c
 -            b = p->u.func.function_bytecode;
 -            backtrace_barrier = b->backtrace_barrier;
 -        }
-+        for (; bi < nb && i < stack_trace_limit; bi++) {
-+            if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
-+                backtrace_flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
-+                continue;
++            if (js_class_has_bytecode(p->class_id)) {
++                b = p->u.func.function_bytecode;
++                backtrace_barrier = b->backtrace_barrier;
 +            }
++            rpc = bt[bi].rpc;
  
 -        if (lazy) {
 -            JSErrorStackFrame *lf = &lazy_frames[i];
 -            int rpc = (b && !sf->cur_pc) ? regvm_frame_pc(rt, sf, b) : -1;
--
++            if (lazy) {
++                JSErrorStackFrame *lzf = &lazy_frames[i];
+ 
 -            lf->func_name = get_func_name_value(ctx, sf->cur_func);
 -            if (b && (sf->cur_pc || rpc >= 0)) {
 -                uint32_t pc = sf->cur_pc
 -                    ? (uint32_t)(sf->cur_pc - b->byte_code_buf - 1)
 -                    : (uint32_t)rpc;
--
++                lzf->func_name = get_func_name_value(ctx, bt[bi].func);
++                if (b && (bt[bi].cur_pc || rpc >= 0)) {
++                    uint32_t pc = bt[bi].cur_pc
++                        ? (uint32_t)(bt[bi].cur_pc - b->byte_code_buf - 1)
++                        : (uint32_t)rpc;
+ 
 -                lf->kind = 0;
 -                lf->line_num = find_line_num(ctx, b, pc, &lf->col_num);
 -                lf->filename = JS_DupAtom(ctx, b->filename);
@@ -435,25 +482,6 @@ diff --git a/quickjs.c b/quickjs.c
 -                // handler in JS_CallInternal. Almost never user observable
 -                // except with intercepting JS proxies that throw exceptions.
 -                dbuf_printf(&dbuf, " (missing)");
-+            p = JS_VALUE_GET_OBJ(bt[bi].func);
-+            b = NULL;
-+            backtrace_barrier = false;
-+
-+            if (js_class_has_bytecode(p->class_id)) {
-+                b = p->u.func.function_bytecode;
-+                backtrace_barrier = b->backtrace_barrier;
-+            }
-+            rpc = bt[bi].rpc;
-+
-+            if (lazy) {
-+                JSErrorStackFrame *lzf = &lazy_frames[i];
-+
-+                lzf->func_name = get_func_name_value(ctx, bt[bi].func);
-+                if (b && (bt[bi].cur_pc || rpc >= 0)) {
-+                    uint32_t pc = bt[bi].cur_pc
-+                        ? (uint32_t)(bt[bi].cur_pc - b->byte_code_buf - 1)
-+                        : (uint32_t)rpc;
-+
 +                    lzf->kind = 0;
 +                    lzf->line_num = find_line_num(ctx, b, pc, &lzf->col_num);
 +                    lzf->filename = JS_DupAtom(ctx, b->filename);
@@ -532,7 +560,7 @@ diff --git a/quickjs.c b/quickjs.c
      }
   done:
      if (lazy) {
-@@ -21809,6 +21951,10 @@
+@@ -21569,6 +21696,10 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  /* only valid inside C functions */
  static JSValueConst JS_GetActiveFunction(JSContext *ctx)
  {
@@ -543,7 +571,7 @@ diff --git a/quickjs.c b/quickjs.c
      return ctx->rt->current_stack_frame->cur_func;
  }
  
-@@ -22274,6 +22420,9 @@
+@@ -22034,6 +22165,9 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
  
      prev_sf = rt->current_stack_frame;
      sf->prev_frame = prev_sf;
@@ -553,7 +581,7 @@ diff --git a/quickjs.c b/quickjs.c
      REGVM_SET_ROOT(sf, NULL, 0);
      rt->current_stack_frame = sf;
      ctx = p->u.cfunc.realm; /* change the current realm */
-@@ -22379,6 +22528,7 @@
+@@ -22139,6 +22273,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
          abort();
      }
  
@@ -561,8 +589,8 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf->prev_frame;
      return ret_val;
  }
-@@ -23101,10 +23251,10 @@
-  * it is also the record that the loop is open, and the close or the sentinel
+@@ -22859,10 +22994,10 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose(JSContext *ctx, uin
+  * stays: it also records that the loop is open, and the close or the sentinel
   * drop that follows removes it.
   */
 -static void regvm_ctl_iter_forget(JSContext *ctx, JSRegCtl *ctl, int *pn)
@@ -574,17 +602,15 @@ diff --git a/quickjs.c b/quickjs.c
          if (ctl[k].kind == REG_CTL_ITER) {
              JS_FreeValue(ctx, ctl[k].iter);
              ctl[k].iter = JS_UNDEFINED;
-@@ -24749,7 +24899,83 @@
+@@ -24253,23 +24388,79 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
  #endif
  #endif
  
 +/*
-+ * Light-frame header prefix (call-cost plan 5.2). The first nine 16-byte slots
-+ * (144 bytes) are everything a handler running in a *light* function may read.
-+ * A light frame is exactly this prefix laid into the register stack by
-+ * `regvm_t_call_light`; a full record is this prefix followed by the
-+ * record-only tail. Every existing handler keeps working on either, because the
-+ * layout below is a reordering of the same fields, not a new set.
++ * Light-frame header prefix. The first nine 16-byte slots (144 bytes) are
++ * everything a handler running in a light function may read. A light frame is
++ * just this prefix, laid into the register stack by `regvm_t_call_light`; a
++ * full record is this prefix followed by the record-only tail.
 + *
 + *   slot  word 0                                word 1
 + *   0     caller                                ret_ip
@@ -597,22 +623,17 @@ diff --git a/quickjs.c b/quickjs.c
 + *   7     ret
 + *   8     set_v
 + *
-+ * `REGVM_LIGHT_PREFIX_SLOTS` is the plan's invariant; the encoder and the light
-+ * handlers both depend on it. The tail is record-only: a light function never
-+ * executes a handler that reads a tail field, which is what light eligibility
-+ * guarantees.
++ * The encoder and the light handlers depend on `REGVM_LIGHT_PREFIX_SLOTS`.
++ * Light eligibility guarantees a light function never runs a handler that
++ * reads the tail.
 + */
 +#define REGVM_LIGHT_PREFIX_SLOTS 9
 +#define REGVM_LIGHT_PREFIX_BYTES (REGVM_LIGHT_PREFIX_SLOTS * 16)
 +
  typedef struct JSRegRun {
 +    /* ---- light header prefix (must stay first, in this order) ---- */
-+    /*
-+     * The frame record. Unconditional, not `#if QJS_REGVM_RECORD`, so that one
-+     * version of the return handler compiles in every threaded build: with
-+     * QJS_REGVM_RECORD off `caller` is simply always NULL and the handler
-+     * degenerates to exiting the chain, which is R1's behaviour exactly.
-+     */
++    /* The frame record. Unconditional, so the return handler compiles in every
++       threaded build; without QJS_REGVM_RECORD `caller` is always NULL. */
 +    struct JSRegRun *caller;    /* NULL at the activation's entry record */
 +    uint8_t  *ret_ip;           /* where the caller resumes */
 +    JSFunctionBytecode *b;
@@ -621,13 +642,10 @@ diff --git a/quickjs.c b/quickjs.c
 +    JSVarRef **var_refs;
 +    JSValue  *var_buf;
 +    JSValue  *arg_buf;
-+    /*
-+     * The four narrow header fields, composed into one 64-bit word that a light
-+     * call writes with a single store. `ret_dst` is already a 16-bit operand;
-+     * functions with more than 65535 arguments or control records simply are
-+     * not light and not record-eligible. Anonymous so every existing
-+     * `f->ret_dst` / `f->argc` / `f->flags` / `f->nctl` keeps working.
-+     */
++    /* The four narrow header fields, one 64-bit word a light call writes with a
++       single store. Functions with more than 65535 arguments or control records
++       are neither light nor record-eligible. Anonymous, so `f->ret_dst` and
++       friends still work. */
 +    union {
 +        struct {
 +            uint16_t ret_dst;   /* the caller's destination register */
@@ -638,48 +656,40 @@ diff --git a/quickjs.c b/quickjs.c
 +        uint64_t hdr_pack;
 +    };
 +    JSObject *func;             /* callee function object (slot 4 word 1) */
-+    /*
-+     * The register-bytecode address of the instruction this frame is executing,
-+     * captured on the slow paths that can build a backtrace. Replaces the
-+     * per-frame `sf->regvm_ip` store, so a light frame (which has no
-+     * JSStackFrame) can still be described. NULL means "not captured".
-+     */
++    /* The register-bytecode address of the instruction this frame is executing,
++       captured on the slow paths that can build a backtrace, so a light frame
++       (with no JSStackFrame) can be described. NULL means "not captured". */
 +    const uint8_t *cap_ip;
 +    JSStackFrame *sf;
 +    /* `this_obj` is `undefined` for a plain call and the receiver for a method. */
 +    JSValueConst this_obj;
 +    JSValue ret;                /* JS_EXCEPTION when a handler had to stop */
 +    /* `set_v` is the value whose count reached zero, handed to
-+       regvm_t_free_slow so that a cold path can be a tail call, which is what
-+       keeps the handler frameless. */
++       regvm_t_free_slow so a cold path can be a tail call. */
 +    JSValue set_v;
 +
 +    /* ---- record-only tail: no light function may read these ---- */
      JSContext *ctx;
-     /*
-      * The caller's realm. The monolith's bodies throw through this rather than
-@@ -24759,11 +24985,6 @@
-      * field so both engines agree.
-      */
+     /* The caller's realm. The monolith's bodies throw through it rather than
+        the callee's `ctx`: a derived-constructor return check throws in the
+        realm of the code that ran `new C()`. The step twins and
+        `regvm_exec_one`'s cold arms both read it here. */
      JSContext *caller_ctx;
 -    JSFunctionBytecode *b;
 -    JSRegPIC *pic;              /* register VM property-cache base for this frame */
 -    JSStackFrame *sf;
 -    JSVarRef **var_refs;
 -    JSValueConst this_obj;
-     /*
-      * The activation's own call state, which the cold trampoline's arms need:
-      * `rest` and `special_object` build `arguments` from `argc`/`argv`,
-@@ -24778,7 +24999,6 @@
-      * a class constructor never enters through the chain.
-      */
+     /* The activation's call state, read by the cold arms (`rest`,
+        `special_object`, `check_ctor`, `init_ctor`). Borrowed: the caller's
+        frame owns it for the call. */
      JSValueConst new_target;
 -    int argc;
      JSValue *argv;
      /*
-      * This frame's own control stack: the catch/finally/iterator entries a cold
-@@ -24788,31 +25008,6 @@
-      * its own locals and its `exception:` label already walks it.
+      * This frame's own control stack (catch, finally and iterator entries), so
+@@ -24280,30 +24471,6 @@ typedef struct JSRegRun {
+      * frame's control stack in its own locals.
       */
      JSRegCtl *ctl;
 -    int nctl;
@@ -687,8 +697,7 @@ diff --git a/quickjs.c b/quickjs.c
 -    JSValue *var_buf;
 -    JSValue ret;                /* JS_EXCEPTION when a handler had to stop */
 -    /* `set_v` is the value whose count reached zero, handed to
--       regvm_t_free_slow so that a cold path can be a tail call, which is what
--       keeps the handler frameless. */
+-       regvm_t_free_slow so a cold path can be a tail call. */
 -    JSValue set_v;
 -    /*
 -     * The frame's call flags. Fixed for the activation and set once, so it does
@@ -701,7 +710,7 @@ diff --git a/quickjs.c b/quickjs.c
 -     * The frame record. Unconditional, not `#if QJS_REGVM_RECORD`, so that one
 -     * version of the return handler compiles in every threaded build: with
 -     * QJS_REGVM_RECORD off `caller` is simply always NULL and the handler
--     * degenerates to exiting the chain, which is R1's behaviour exactly.
+-     * degenerates to exiting the chain.
 -     */
 -    struct JSRegRun *caller;    /* NULL at the activation's entry record */
 -    uint8_t  *ret_ip;           /* where the caller resumes */
@@ -710,17 +719,14 @@ diff --git a/quickjs.c b/quickjs.c
      JSValue  *local_buf;        /* the release walk's start */
      int       local_count;      /* how many JSValues the walk owns */
      int       arg_owned;        /* 1 when the argument area holds our dups */
-@@ -24832,6 +25027,89 @@
+@@ -24321,10 +24488,89 @@ typedef struct JSRegRun {
      uint8_t *resume_marker;
  } JSRegRun;
  
 +#if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
-+/*
-+ * Plan 5.5: walk one light chain, innermost first, publishing each frame's
-+ * register window as a root range. A frame is light exactly when it has no
-+ * JSStackFrame, so the chain ends at the first frame whose caller is real (or
-+ * NULL). The registers borrow under DRC, which is why they are roots at all.
-+ */
++/* Walk one light chain, innermost first, publishing each frame's register
++   window as a root range (registers borrow under DRC). The chain ends at the
++   first frame whose caller is real or NULL. */
 +static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
 +{
 +    for (; lf != NULL;
@@ -733,10 +739,10 @@ diff --git a/quickjs.c b/quickjs.c
 +#endif
 +
 +/*
-+ * Plan 5.5: the logical stack, innermost first, for a backtrace. Light frames
-+ * interleave with real ones: the chain at `regvm_cur` sits above
-+ * `current_stack_frame`, and each real frame may have a light chain saved below
-+ * it in `rv_light`. A light frame's pc is its captured `cap_ip`.
++ * The logical stack for a backtrace, innermost first. The chain at
++ * `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
++ * light chain saved below it in `rv_light`. A light frame's pc is its captured
++ * `cap_ip`.
 + */
 +static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
 +{
@@ -778,11 +784,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    return nb;
 +}
 +
-+/*
-+ * Plan 5.5: the innermost light frame's strictness and function. Defined here,
-+ * after JSRegRun, so `is_strict_mode` and `JS_GetActiveFunction` can read a
-+ * light frame before the real-frame chain.
-+ */
++/* The innermost light frame's strictness and function, defined after
++   JSRegRun so `is_strict_mode` and `JS_GetActiveFunction` can read it. */
 +static bool regvm_cur_strict(JSRuntime *rt)
 +{
 +    JSRegRun *lf = rt->regvm_cur;
@@ -797,19 +800,16 @@ diff --git a/quickjs.c b/quickjs.c
 +    return lf ? JS_MKPTR(JS_TAG_OBJECT, lf->func) : JS_UNDEFINED;
 +}
 +
- /*
-  * S3: a record frame that owns nothing to release -- an empty release walk and
-  * no captured-variable cells. With S2's walk bound in place most frames are of
-@@ -24839,6 +25117,8 @@
-  * `return` can hand the value back without the framed release path.
-  */
+ /* A record frame with nothing to release: an empty release walk and no
+    captured-variable cells. Most frames are like this, so `return` can hand
+    the value back without the framed release path. */
  #define REGVM_FLAG_TRIVIAL_RET (1 << 8)
-+/* Plan 5.4: the frame is a light frame (no JSStackFrame, no record tail). */
++/* The frame is a light frame (no JSStackFrame, no record tail). */
 +#define REGVM_FLAG_LIGHT (1 << 9)
  
  #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
  typedef struct JSRegArenaChunk {
-@@ -24916,9 +25196,15 @@
+@@ -24402,9 +24648,15 @@ static void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
  static int regvm_frame_pc(JSRuntime *rt, JSStackFrame *sf,
                            JSFunctionBytecode *b)
  {
@@ -827,21 +827,21 @@ diff --git a/quickjs.c b/quickjs.c
      if (!ip)
          return -1;
      if (ip < b->regvm_code || ip >= b->regvm_code + b->regvm_len)
-@@ -24947,7 +25233,7 @@
-  * operands at offsets from it and never advance it), so the saved value needs
-  * no adjustment. Fast paths must not call this.
-  */
+@@ -24430,7 +24682,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
+ /* Record the instruction address on a frame before a call that can build a
+    backtrace. `ip` is the instruction start, so no adjustment. Fast paths must
+    not call this. */
 -#define REGVM_CAPTURE_IP() (f->sf->regvm_ip = ip)
 +#define REGVM_CAPTURE_IP() (f->cap_ip = ip)
  
- /*
-  * Returned by `regvm_exec_one` for a *tail call*.
-@@ -25600,6 +25886,16 @@
+ /* Returned by `regvm_exec_one` for a tail call. A record frame has a caller,
+    so leaving it means handing the value in `f->ret` to the caller through
+@@ -25000,6 +25252,16 @@ typedef struct JSRegRecordLayout {
  static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b,
                                int arg_slots, JSRegRecordLayout *out);
  static int regvm_record_eligible(JSFunctionBytecode *cb);
 +#if QJS_REGVM_RECORD
-+/* Plan 5.4: the encoded program contains only light-safe opcodes. */
++/* The encoded program contains only light-safe opcodes. */
 +static int regvm_code_light_safe(const uint8_t *code, int len);
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_light(REGVM_ARGS);
 +static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_light(REGVM_ARGS);
@@ -851,20 +851,17 @@ diff --git a/quickjs.c b/quickjs.c
 +regvm_t_return_light_chunk(REGVM_ARGS);
 +#endif
  #if defined(QJS_REGVM_COUNT)
- /*
-  * Which cold opcodes block a *called* function from taking the record path,
-@@ -26177,6 +26473,47 @@
+ /* Which cold opcodes keep a called function off the record path, weighted by
+    how often that function is called. A function is eligible only when every
+@@ -25548,6 +25810,44 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
      }
      s = T_REG(1);
  #if QJS_REGVM_RECORD
-+    /* Plan 5.6: a light frame has no JSStackFrame and no record release walk. */
++    /* A light frame has no JSStackFrame and no record release walk. */
 +    if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
-+        /*
-+         * A frame that owns nothing moves the value straight into the caller's
-+         * register. The separate `regvm_t_return_light` round-trips it through
-+         * `f->ret` and needs a tail call; fusing the trivial case here keeps
-+         * the value in a register and drops both.
-+         */
++        /* A frame that owns nothing moves the value straight into the caller's
++           register, without the round trip through `f->ret` and
++           `regvm_t_return_light`. */
 +        if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
 +            JSRegRun *c = f->caller;
 +            int dst = f->ret_dst;
@@ -898,14 +895,14 @@ diff --git a/quickjs.c b/quickjs.c
 +        __attribute__((musttail))
 +            return regvm_t_return_light_nested(REGVM_PASS);
 +    }
-     /*
-      * S3: a frame that owns nothing moves the value straight into the caller's
-      * register. The general path's `js_dup` is balanced by the `REG_ADOPT` in
-@@ -26210,6 +26547,34 @@
+     /* A frame that owns nothing moves the value straight into the caller's
+        register. The general path's `js_dup`/`REG_ADOPT` pair has nothing to
+        free in between, so it is skipped and the handler stays frameless. */
+@@ -25577,6 +25877,34 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
          return ip;
      }
  #if QJS_REGVM_RECORD
-+    /* Plan 5.6: a light frame returns through its own handlers. */
++    /* A light frame returns through its own handlers. */
 +    if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
 +        /* Same fusion as `regvm_t_return`: a frame that owns nothing moves
 +           `undefined` straight into the caller's register. */
@@ -933,10 +930,10 @@ diff --git a/quickjs.c b/quickjs.c
 +        __attribute__((musttail))
 +            return regvm_t_return_light_nested(REGVM_PASS);
 +    }
-     /*
-      * Fast exit for the implicit `return undefined`, the common ending of a
-      * small function and 20% of the empty-call micro. A frame that owns nothing
-@@ -26231,7 +26596,8 @@
+     /* Fast exit for the implicit `return undefined`: a frame that owns nothing
+        writes `undefined` into the caller's destination in line. The rare arena
+        chunk pop keeps its out-of-line helper. */
+@@ -25592,7 +25920,8 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
              __attribute__((musttail))
                  return regvm_t_return_trivial_chunk(REGVM_PASS);
          }
@@ -946,7 +943,7 @@ diff --git a/quickjs.c b/quickjs.c
          *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
          ctx->rt->regvm_tail_chain = 0;
          f = c;
-@@ -26322,8 +26688,14 @@
+@@ -25667,8 +25996,14 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
          }
      }
  
@@ -961,21 +958,21 @@ diff --git a/quickjs.c b/quickjs.c
 +        ctx->rt->current_stack_frame = prev_sf;
 +    }
  #if QJS_DRC
-     /* v already carries its own reference (regvm_t_return duplicated it), so
-        the caller's register borrows it and the producer's reference is given
-@@ -26380,7 +26752,8 @@
+     /* v carries its own reference (regvm_t_return duplicated it); the caller's
+        register borrows it and the producer's reference is given up. */
+@@ -25711,7 +26046,8 @@ regvm_t_return_trivial(REGVM_ARGS)
      if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
          __attribute__((musttail)) return regvm_t_return_trivial_chunk(REGVM_PASS);
  
 -    ctx->rt->current_stack_frame = c->sf;
 +    ctx->rt->regvm_cur = f->sf->rv_light;
 +    ctx->rt->current_stack_frame = f->sf->prev_frame;
-     /* no `REG_ADOPT`: the caller's register borrows, exactly as the general
-        path leaves it after its balanced dup/adopt */
+     /* no `REG_ADOPT`: the caller's register borrows */
      *(JSValue *)((uint8_t *)c->fr + dst) = v;
-@@ -26400,7 +26773,8 @@
-     /* the guard established top == 0 and a previous chunk, which is exactly
-        when the chunk is popped */
+     ctx->rt->regvm_tail_chain = 0;
+@@ -25729,7 +26065,8 @@ regvm_t_return_trivial_chunk(REGVM_ARGS)
+ 
+     /* top == 0 with a previous chunk: the chunk is popped */
      regvm_arena_pop_chunk(ctx->rt);
 -    ctx->rt->current_stack_frame = c->sf;
 +    ctx->rt->regvm_cur = f->sf->rv_light;
@@ -983,7 +980,7 @@ diff --git a/quickjs.c b/quickjs.c
      *(JSValue *)((uint8_t *)c->fr + dst) = v;
      ctx->rt->regvm_tail_chain = 0;
      f = c;
-@@ -26436,8 +26810,15 @@
+@@ -25761,8 +26098,15 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
@@ -1001,7 +998,7 @@ diff --git a/quickjs.c b/quickjs.c
              __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
          }
      }
-@@ -26456,9 +26837,15 @@
+@@ -25781,9 +26125,15 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
          JSObject *co = JS_VALUE_GET_OBJ(cf);
          if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
              JSFunctionBytecode *cb = co->u.func.function_bytecode;
@@ -1018,27 +1015,22 @@ diff --git a/quickjs.c b/quickjs.c
              __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
          }
      }
-@@ -26644,6 +27031,212 @@
+@@ -25934,6 +26284,205 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
          return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
  }
  
 +#if QJS_REGVM_RECORD
 +/*
-+ * Plan 5.3/5.5: the light-frame fast call.
++ * The light-frame fast call. A light frame is the 9-slot header prefix plus
++ * the variable area and register file, laid into the frame arena above the
++ * caller, with no JSStackFrame and no record tail. Arguments are always
++ * borrowed from the caller's outgoing window (eligibility requires
++ * !args_captured and the handler checks na >= arg_count).
 + *
-+ * A light frame is only the 9-slot header prefix (144 bytes) plus the variable
-+ * area and register file, laid into the frame arena above the caller. It has no
-+ * JSStackFrame and no record tail: the fields a handler in a light function can
-+ * read are exactly the prefix, and light eligibility (5.4) guarantees no
-+ * handler reads beyond it. Arguments are always borrowed from the caller's
-+ * outgoing window (eligibility requires !args_captured; the handler checks
-+ * na >= arg_count), so there is no argument copy and no `arg_owned`.
-+ *
-+ * Allocation is the arena's bump, inline: one compare against the current
-+ * chunk's end. If it does not fit, the record path runs instead (which grows
-+ * the arena); a light frame never spans chunks. The top is implicit --
-+ * `regvm_frames_top` is the frame top -- so a record pushed later lands above
-+ * it automatically.
++ * Allocation is an inline bump against the current chunk's end; if it does
++ * not fit, the record path runs and grows the arena, so a light frame never
++ * spans chunks. `regvm_frames_top` is the frame top, so a later record lands
++ * above it.
 + */
 +static __attribute__((always_inline)) inline JSRegRun *
 +regvm_light_alloc(JSRuntime *rt, JSFunctionBytecode *cb)
@@ -1054,8 +1046,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    return nf;
 +}
 +
-+/* Build the callee light frame and return it, or NULL when the arena chunk is
-+   full. Inline into the two handlers so neither carries a frame. */
++/* Build the callee light frame and return it, or NULL when the chunk is full.
++   Inlined into both handlers. */
 +static __attribute__((always_inline)) inline JSRegRun *
 +regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
 +                  JSRegRun *f, int d, uint8_t *ret_ip, JSValueConst this_obj,
@@ -1163,13 +1155,11 @@ diff --git a/quickjs.c b/quickjs.c
 +}
 +
 +/*
-+ * Plan 5.6: leaving a light frame. A light frame owns only its variable area
-+ * (arguments are borrowed, registers borrow under DRC, there are no cells and
-+ * no control records). The trivial form has an empty variable area and no
-+ * release at all, so it stays frameless; the nested form runs the walk. The
-+ * arena top is restored to the frame's own header, which is exactly where the
-+ * caller's window ends, and `regvm_cur` falls back to the caller when the
-+ * caller is itself light.
++ * Leaving a light frame. It owns only its variable area (arguments and
++ * registers borrow, and it has no cells or control records). The trivial form
++ * releases nothing and stays frameless; the nested form runs the walk. The
++ * arena top is restored to the frame's header, where the caller's window ends,
++ * and `regvm_cur` falls back to the caller when the caller is light.
 + */
 +static __attribute__((noinline)) uint8_t *REGVM_CC
 +regvm_t_return_light_chunk(REGVM_ARGS)
@@ -1218,7 +1208,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    *(JSValue *)((uint8_t *)c->fr + dst) = v;
 +#if QJS_DRC
 +    /* `regvm_t_return` duplicated `v` before the release walk; the caller's
-+       register borrows, so the producer's reference is given up here. */
++       register borrows, so the producer's reference is given up. */
 +    REG_ADOPT(ctx->rt, v);
 +#endif
 +    ctx->rt->regvm_tail_chain = 0;
@@ -1228,10 +1218,10 @@ diff --git a/quickjs.c b/quickjs.c
 +}
 +#endif /* QJS_REGVM_RECORD */
 +
- /*
-  * R3: the construct fast path. Creates `this` from the constructor's
-  * prototype (reusing the learned instance capacity, O2), then enters the
-@@ -28855,8 +29448,14 @@
+ /* The construct fast path, for a non-derived bytecode constructor. Creates
+    `this` from the constructor's prototype (with the learned instance
+    capacity), then enters the callee as a record with that `this_obj`, the
+@@ -27961,8 +28510,14 @@ regvm_t_tail_call_record(REGVM_ARGS)
      for (k = 0; k < na; k++)
          args[k] = js_dup(FRP(ab)[k]);
      cfd = js_dup(cf);
@@ -1248,7 +1238,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 1, &lay) != 0)) {
          for (k = 0; k < na; k++)
              JS_FreeValue(ctx, args[k]);
-@@ -28916,8 +29515,14 @@
+@@ -28022,8 +28577,14 @@ regvm_t_tail_call_method_record(REGVM_ARGS)
          args[k] = js_dup(FRP(ab)[k]);
      tv = js_dup(tv);
      cfd = js_dup(cf);
@@ -1265,7 +1255,7 @@ diff --git a/quickjs.c b/quickjs.c
      /* two slots past the arguments: the receiver, then the callee object */
      if (unlikely(regvm_record_alloc(ctx->rt, cb, slots + 2, &lay) != 0)) {
          for (k = 0; k < na; k++)
-@@ -29370,7 +29975,8 @@
+@@ -28418,7 +28979,8 @@ static uint8_t *REGVM_CC regvm_t_unwind(REGVM_ARGS)
      JSValue exc = ctx->rt->current_exception;
  
      if (needs_backtrace(exc)) {
@@ -1275,15 +1265,13 @@ diff --git a/quickjs.c b/quickjs.c
          REGVM_CAPTURE_IP();
          build_backtrace(ctx, exc, JS_UNDEFINED, NULL, 0, 0, 0);
      }
-@@ -29386,6 +29992,39 @@
+@@ -28433,6 +28995,36 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
+         f->ret = JS_EXCEPTION;
          return NULL;
      }
-     /*
-+     * Plan 5.6: a light frame has no control records (eligibility guarantees
-+     * it), so a throw always propagates. Release its variable area, pop the
-+     * arena back to its header and continue in the caller. `current_stack_frame`
-+     * is untouched: a light frame never changed it.
-+     */
++    /* A light frame has no control records, so a throw always propagates:
++       release its variable area, pop the arena to its header and continue in
++       the caller. `current_stack_frame` was never changed. */
 +    if (unlikely(f->sf == NULL)) {
 +        JSFunctionBytecode *b = f->b;
 +        JSValue *p, *end;
@@ -1311,11 +1299,10 @@ diff --git a/quickjs.c b/quickjs.c
 +        fr = c->fr;
 +        __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
 +    }
-+    /*
-      * The backtrace was already built -- at the throw, by the public entry above.
-      * Releasing the records is what used to remove them from it, and that is why
-      * the trace is not built here. Nothing in this loop publishes anything, and
-@@ -29446,8 +30085,14 @@
+     /* The backtrace was already built by the public entry above. Nothing here
+        may publish a nested frame's cur_pc: it is a register-bytecode pointer.
+        */
+@@ -28483,8 +29075,14 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
          }
      }
      c = f->caller;
@@ -1332,16 +1319,13 @@ diff --git a/quickjs.c b/quickjs.c
      f = c;
      fr = c->fr;                 /* the caller's register file, for its own walk */
      __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
-@@ -29486,6 +30131,27 @@
+@@ -28514,6 +29112,24 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
          + sizeof(JSValue) * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS)
          + sizeof(JSVarRef *) * (size_t)b->var_ref_count
          + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
-+    /*
-+     * Plan 5.4: light eligibility. `regvm_call_ready` is the record test;
-+     * light additionally owns nothing to close, owns no argument copy, has no
-+     * control records, and names no opcode whose handler reads a record-only
-+     * field or the (absent) JSStackFrame.
-+     */
++    /* Light eligibility: the record test, plus nothing to close, no owned
++       argument copy, no control records, and no opcode that reads a record-only
++       field or the JSStackFrame. */
 +    b->regvm_light = 0;
 +    b->regvm_light_need = 0;
 +#if QJS_REGVM_RECORD
@@ -1358,9 +1342,9 @@ diff --git a/quickjs.c b/quickjs.c
 +#endif
 +#endif
  #if QJS_AOT
-     /* Bind the generated entry, if any, now that the bytecode is final. A
-        bound function is excluded from the record path below so that a call to
-@@ -29547,6 +30213,8 @@
+     /* Bind the generated entry, if any. A bound function is kept off the record
+        path so its calls reach js_regvm_execute's AOT entry. */
+@@ -28561,6 +29177,8 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      rec->rcc_ip = NULL;
  #endif
      rec->sf = sf;
@@ -1369,7 +1353,7 @@ diff --git a/quickjs.c b/quickjs.c
      rec->fr = lay->regs;
      rec->var_refs = co->u.func.var_refs;
      rec->var_buf = lay->var_buf;
-@@ -29645,8 +30313,9 @@
+@@ -28652,8 +29270,9 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
      sf->cur_gc_obj = NULL;
  #endif
      sf->cur_pc = NULL;
@@ -1381,7 +1365,7 @@ diff --git a/quickjs.c b/quickjs.c
      REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
  
  #if !REGVM_SLIM_FRAME
-@@ -29705,6 +30374,7 @@
+@@ -28707,6 +29326,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
  #endif
      }
  
@@ -1389,7 +1373,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf;
  }
  
-@@ -29741,6 +30411,8 @@
+@@ -28738,6 +29358,8 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
      rec->rcc_ip = NULL;
  #endif
      rec->sf = sf;
@@ -1398,7 +1382,7 @@ diff --git a/quickjs.c b/quickjs.c
      rec->fr = lay->regs;
      rec->var_refs = co->u.func.var_refs;
      rec->var_buf = lay->var_buf;
-@@ -29790,8 +30462,9 @@
+@@ -28787,8 +29409,9 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
      sf->cur_gc_obj = NULL;
  #endif
      sf->cur_pc = NULL;
@@ -1410,7 +1394,7 @@ diff --git a/quickjs.c b/quickjs.c
      REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
  
  #if !REGVM_SLIM_FRAME
-@@ -29820,6 +30493,7 @@
+@@ -28817,6 +29440,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
          }
      }
  
@@ -1418,7 +1402,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf;
  }
  #endif /* QJS_REGVM_RECORD */
-@@ -29962,6 +30636,9 @@
+@@ -28943,6 +29567,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          run.rcc_ip = NULL;
  #endif
          run.sf = sf;
@@ -1428,7 +1412,7 @@ diff --git a/quickjs.c b/quickjs.c
          run.var_refs = var_refs;
          run.this_obj = this_obj;
          run.new_target = new_target;
-@@ -32262,7 +32939,7 @@
+@@ -31077,7 +31704,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              L_ROP_iter_next:
                  { int w = RD_REG();
                    if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
@@ -1436,26 +1420,26 @@ diff --git a/quickjs.c b/quickjs.c
 +                      regvm_ctl_iter_forget(ctx, regvm_ctl, regvm_nctl);
                        goto exception;
                    }
-                   /*
-@@ -32275,7 +32952,7 @@
-                    * whose own step threw, which the corpus says must not happen.
-                    */
+                   /* The helper clears the iterator slot when the step reported
+@@ -31086,7 +31713,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                      too: an iterator whose own step threw must not have
+                      `return` called. */
                    if (JS_IsUndefined(regs[w]))
 -                      regvm_ctl_iter_forget(ctx, regvm_ctl, &regvm_nctl);
 +                      regvm_ctl_iter_forget(ctx, regvm_ctl, regvm_nctl);
                    REGVM_NEXT(); }
              L_ROP_iter_close: {
                  int it = RD_REG();
-@@ -32373,7 +33050,7 @@
-                          the trailing async close skips return() (spec:
-                          AsyncIteratorClose does not run on normal completion) */
+@@ -31176,7 +31803,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+                          trailing async close skips return() (AsyncIteratorClose
+                          does not run on normal completion). */
                        SET_REG_P(w, JS_UNDEFINED);
 -                      regvm_ctl_iter_forget(ctx, regvm_ctl, &regvm_nctl);
 +                      regvm_ctl_iter_forget(ctx, regvm_ctl, regvm_nctl);
                    }
                    JS_FreeValue(ctx, tmp[0]);
                    REGVM_NEXT(); }
-@@ -33751,6 +34428,7 @@
+@@ -32488,6 +33115,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
              JSRegFrame *_h = regvm_frame;
  
              regvm_frame_release(rt, sf, b, local_buf, regs);
@@ -1463,7 +1447,7 @@ diff --git a/quickjs.c b/quickjs.c
              rt->current_stack_frame = sf->prev_frame;
              REGVM_RESTORE_CALLER(_h);
              goto exception;
-@@ -33769,6 +34447,7 @@
+@@ -32506,6 +33134,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          sf->cur_pc = pc;
          sf->cur_sp = sp;
          regs[b->regvm_reg_count] = js_int32(regvm_nctl);
@@ -1471,7 +1455,7 @@ diff --git a/quickjs.c b/quickjs.c
          rt->current_stack_frame = sf->prev_frame;
  #if QJS_REGVM_ASM
          ast->ret = ret_val;
-@@ -33841,6 +34520,7 @@
+@@ -32568,6 +33197,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          if (unlikely(sf->var_ref_count != 0))
              js_closcyc_frame(rt, sf, true);
  #endif /* QJS_REGVM_INLOOP_CALL */
@@ -1479,7 +1463,7 @@ diff --git a/quickjs.c b/quickjs.c
          rt->current_stack_frame = sf->prev_frame;
  #if QJS_REGVM_ASM
          ast->ret = ret_val;
-@@ -34989,7 +35669,7 @@
+@@ -33500,7 +34130,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
  
                      { int w = RD_REG();
                        if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
@@ -1487,17 +1471,17 @@ diff --git a/quickjs.c b/quickjs.c
 +                          regvm_ctl_iter_forget(ctx, f->ctl, f->nctl);
                            goto exception;
                        }
-                       /*
-@@ -35002,7 +35682,7 @@
-                        * whose own step threw, which the corpus says must not happen.
-                        */
+                       /* The helper clears the iterator slot when the step
+@@ -33509,7 +34139,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+                          is forgotten too: an iterator whose own step threw must
+                          not have `return` called. */
                        if (JS_IsUndefined(regs[w]))
 -                          regvm_ctl_iter_forget(ctx, f->ctl, &f->nctl);
 +                          regvm_ctl_iter_forget(ctx, f->ctl, f->nctl);
                        REGVM_NEXT(); }
  
          case ROP_iter_close:
-@@ -36277,6 +36957,9 @@
+@@ -34749,6 +35379,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
              pc = sf->cur_pc;
              sf->prev_frame = rt->current_stack_frame;
@@ -1507,7 +1491,7 @@ diff --git a/quickjs.c b/quickjs.c
              rt->current_stack_frame = sf;
              if (s->throw_flag) {
  #if QJS_REGVM
-@@ -36413,6 +37096,9 @@
+@@ -34879,6 +35512,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
      sf->cur_pc = NULL;
      sf->prev_frame = rt->current_stack_frame;
@@ -1517,7 +1501,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf;
      ctx = b->realm; /* set the current realm */
  
-@@ -39906,6 +40592,7 @@
+@@ -38366,6 +39002,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          if (unlikely(sf->var_ref_count != 0))
              js_closcyc_frame(rt, sf, false);
      }
@@ -1525,7 +1509,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf->prev_frame;
      return ret_val;
  }
-@@ -39916,7 +40603,7 @@
+@@ -38376,7 +39013,7 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
      JSValue res = JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
                                    argc, argv, JS_CALL_FLAG_COPY_ARGV);
  #if QJS_DRC
@@ -1534,7 +1518,7 @@ diff --git a/quickjs.c b/quickjs.c
          js_drc_safepoint(ctx->rt);
  #endif
      return res;
-@@ -40154,6 +40841,7 @@
+@@ -38613,6 +39250,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
      size_t alloc_size;
  
      sf = &s->frame;
@@ -1542,23 +1526,17 @@ diff --git a/quickjs.c b/quickjs.c
      p = JS_VALUE_GET_OBJ(func_obj);
      b = p->u.func.function_bytecode;
      /* Async and generator functions set up their frame here and then enter
-@@ -58657,6 +59345,49 @@
+@@ -56947,6 +57585,43 @@ static int regvm_code_all_threaded(const uint8_t *code, int len)
      }
      return p == end;
  }
 +
 +/*
-+ * Plan 5.4: is every opcode of this program safe to run in a light frame?
-+ *
-+ * A light frame carries only the 9-slot prefix: no JSStackFrame, no `argv`,
-+ * no `new_target`, no control stack. A handler that reads one of those would
-+ * crash or corrupt. `regvm_t_cold` dispatches through `regvm_exec_one`, whose
-+ * arms are exactly the ones that touch that state (closures, classes, super,
-+ * `arguments`, eval, control records), so any cold opcode disqualifies. Among
-+ * the dedicated hot handlers only two read record-only state: `get_arg_el`
-+ * (its slow path reads `f->sf`/`f->argv`) and `apply_arguments`. Construct and
-+ * tail calls are excluded too so a light frame never has to reuse its own
-+ * header for a nested activation.
++ * Is every opcode of this program safe to run in a light frame? A light frame
++ * has only the 9-slot prefix: no JSStackFrame, `argv`, `new_target` or control
++ * stack. Any cold opcode disqualifies (`regvm_exec_one`'s arms touch that
++ * state), as do `get_arg_el` and `apply_arguments`, which read record-only
++ * state. Construct and tail calls are excluded too.
 + */
 +static int regvm_code_light_safe(const uint8_t *code, int len)
 +{
@@ -1592,7 +1570,7 @@ diff --git a/quickjs.c b/quickjs.c
  #endif
  
  /*
-@@ -60075,6 +60806,9 @@
+@@ -58327,6 +59002,9 @@ int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
      pc = b->byte_code_buf;
      sf->cur_pc = NULL;
      sf->prev_frame = rt->current_stack_frame;
@@ -1602,7 +1580,7 @@ diff --git a/quickjs.c b/quickjs.c
      rt->current_stack_frame = sf;
      ret_val = js_regvm_execute(caller_ctx, callee, this_obj, JS_UNDEFINED, na, argv,
                                 sf, b, local_buf, arg_buf, var_buf, stack_buf, sp, pc,
-@@ -71532,7 +72266,7 @@
+@@ -68917,7 +69595,7 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
      if (unlikely(!ctx->eval_internal)) {
          return JS_ThrowTypeError(ctx, "eval is not supported");
      }
@@ -1611,33 +1589,3 @@ diff --git a/quickjs.c b/quickjs.c
          JS_FreeValueRT(rt, ctx->error_back_trace);
          ctx->error_back_trace = JS_UNDEFINED;
      }
-diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
---- a/quickjs-regvm-step.inc
-+++ b/quickjs-regvm-step.inc
-@@ -2906,7 +2906,7 @@
- 
-                 { int w = RD_REG();
-                   if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
--                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
-+                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
-                       goto exception;
-                   }
-                   /*
-@@ -2919,7 +2919,7 @@
-                    * whose own step threw, which the corpus says must not happen.
-                    */
-                   if (JS_IsUndefined(regs[w]))
--                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
-+                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
-                   REGVM_NEXT(); }
-  exception:
-     rf->ret = JS_EXCEPTION;
-@@ -3001,7 +3001,7 @@
-                          the trailing async close skips return() (spec:
-                          AsyncIteratorClose does not *rf on normal completion) */
-                       SET_REG_P(w, JS_UNDEFINED);
--                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
-+                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
-                   }
-                   JS_FreeValue(ctx, tmp[0]);
-                   REGVM_NEXT(); }

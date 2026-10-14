@@ -1,0 +1,48 @@
+Subject: Read the TDZ rollback switch only in a knobs build
+
+What this does
+  Moves the `QJS_TDZ_KEEP_CHECKS` getenv under `#ifdef QJS_REGVM_KNOBS`. Without
+  the knobs, js_tdz_elim_on returns true and every TDZ check is eliminated, the
+  shipped default.
+
+Why we need it
+  A shipped build read an environment variable that changes compiler output, so
+  two runs of the same binary could emit different bytecode. The variable is an
+  ablation control, not an application-facing option, and belongs with the other
+  knobs.
+
+What it adds
+  Nothing. The knobs build keeps the rollback switch; every other build has the
+  fixed default.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 838bd13..6fd0be3 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -56970,16 +56970,20 @@ static int js_args_elide_scan(JSFunctionDef *s, uint8_t *bc_buf, int bc_len,
+         prologue_put_idx = (var_idx);                   \
+     } while (0)
+ 
+-/* Rollback and same-binary control leg: QJS_TDZ_KEEP_CHECKS=1 keeps every TDZ
+-   check, which is what the compiler emitted before. */
+-static int js_tdz_keep_v = -1;
++/* QJS_TDZ_KEEP_CHECKS=1 keeps every TDZ check, for comparison. Read only in a
++   build with the ablation knobs; otherwise the checks are eliminated. */
+ static inline bool js_tdz_elim_on(void)
+ {
++#ifdef QJS_REGVM_KNOBS
++    static int js_tdz_keep_v = -1;
+     if (unlikely(js_tdz_keep_v < 0)) {
+         const char *e = getenv("QJS_TDZ_KEEP_CHECKS");
+         js_tdz_keep_v = (e != NULL && e[0] == '1');
+     }
+     return !js_tdz_keep_v;
++#else
++    return true;
++#endif
+ }
+ 
+ /* Rewrites OP_get_loc_check to OP_get_loc for lexical locals already known to

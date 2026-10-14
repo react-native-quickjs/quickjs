@@ -22,7 +22,7 @@ Needs a bytecode version bump
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22279,12 +22279,10 @@
+@@ -21767,12 +21767,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          }
                      } else {
                      get_loc_field_nr_slow:
@@ -31,9 +31,9 @@ Needs a bytecode version bump
 -                           The receiver is the borrowed local, so we pass it directly
 -                           and never free it. */
                          sf->cur_pc = pc;
+-                        val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
 +                        /* owns neither argument; the receiver is the slot, not
 +                           obj, which the prototype walk may have reassigned */
--                        val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
 +                        val = JS_GetPropertyInternal(ctx, obj, atom, nr_buf[loc], false);
                          if (unlikely(JS_IsException(val)))
                              goto exception;

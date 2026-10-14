@@ -1,43 +1,26 @@
-Subject: register VM argument staging uses an incremental index
+Subject: Argument staging uses an incremental index
 
-What this does:
-  `regvm_arg_retarget` decided whether a call argument's producer may write
-  the call window directly by scanning the whole IR for the value's definition
-  and for any non-destination read of it. Every call argument did that scan, so
-  lowering was quadratic in the IR size and dominated encode time on large
-  functions (pdf.js).
+What this does
+  Argument staging uses an incremental index.
 
-  The pass now keeps `aw_def` (last destination write per value), `aw_reads`
-  (non-destination `r` operand read count) and `aw_last_win` (last instruction
-  naming the call window) in `JSRegIR`, folded lazily by `regvm_arg_index_sync`
-  as instructions are appended. The per-argument test is O(1). The six call
-  lowerings that retarget a producer into the window go through
-  `regvm_arg_retarget_insn`, which keeps the index exact. A value outside the
-  index (allocation failed, or beyond it) falls back to the original full scan
-  `regvm_arg_retarget_scan`, and `QJS_REGVM_ARGCHECK` (debug) cross-checks the
-  fast path against that scan and aborts on a mismatch.
+Why we need it
+  So lowering a large function (pdf.js) was quadratic in the IR size and encode-time bound.
 
-Why we need it:
-  Encode time on pdf.js and other large inputs was dominated by this quadratic
-  scan; the register VM has to lower big functions in reasonable time.
+What it adds
+  `JSRegIR` gains `aw_def` (last destination write per value), `aw_reads` (non-destination read count) and `aw_last_win`, folded lazily by `regvm_arg_index_sync` as instructions are appended; `regvm_arg_retarget` makes the per-argument test O, `regvm_arg_retarget_insn` records the six call lowerings that retarget a producer into the call window, and a value outside the index falls back to the original `regvm_arg_retarget_scan` (`QJS_REGVM_ARGCHECK` cross-checks the two).
 
-Needs a bytecode version bump:
-  No. Lowering only; the emitted bytecode is unchanged.
-
----
+Needs a bytecode version bump
+  No.
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -56233,6 +56233,18 @@
-        freed, and all-bits-zero is a valid uncounted value for that, so the
-        encoder's `undefined` list is this narrower set. */
+@@ -54741,6 +54741,15 @@ typedef struct JSRegIR {
+        written: an operand read, or an init-all function. The rest is only ever
+        released, for which all-bits-zero suffices. */
      uint8_t *own_undef;
-+    /*
-+     * W3a argument-staging index (see regvm_arg_retarget). Per value: the last
-+     * instruction whose destination writes it (-1 if none), and the number of
-+     * non-destination `r` operand reads. It is folded lazily as instructions are
-+     * appended, so the per-argument test is O(1) instead of a scan of the whole
-+     * IR. `aw_last_win` is the last instruction naming the call window.
-+     */
++    /* The argument-staging index (see regvm_arg_retarget). Per value: the last
++       instruction writing it (-1 if none) and its count of non-destination `r`
++       reads, folded lazily as instructions are appended so each test is O(1).
++       `aw_last_win` is the last instruction naming the call window. */
 +    int32_t *aw_def;
 +    int32_t *aw_reads;
 +    int aw_n;          /* number of values the index covers (0 = disabled) */
@@ -46,9 +29,9 @@ Needs a bytecode version bump:
  #ifdef QJS_REGVM_RCCHECK
      /* Section 6.1 outputs the section 6.2 checker consumes, per instruction. */
      uint8_t *own_plain;     /* n_insns: 1 when the destination was NONE */
-@@ -58742,8 +58754,8 @@
-  * for a value the operand stack still names. Returns its index, or -1 to fall
-  * back to the move.
+@@ -57139,8 +57148,8 @@ static int regvm_own_second_dest_index(uint16_t rop);
+  *
+  * Returns the producer's index, or -1 to fall back to the move.
   */
 -static int regvm_arg_retarget(const JSRegIR *ir, int v,
 -                              const int *home_of, int n_values)
@@ -57,16 +40,13 @@ Needs a bytecode version bump:
  {
      int i, def = -1, reads = 0;
      if (v < 0 || (home_of && v < n_values && home_of[v] >= 0))
-@@ -58791,6 +58803,103 @@
+@@ -57187,13 +57196,103 @@ static int regvm_arg_retarget(const JSRegIR *ir, int v,
+     return def;
  }
  
- /*
-+ * Fold newly appended instructions into the W3a argument index. Called lazily
-+ * from regvm_arg_retarget, so each instruction is folded once and the whole
-+ * lowering stays linear instead of quadratic. The per-instruction logic mirrors
-+ * the first pass of regvm_arg_retarget_scan exactly; `aw_last_win` replaces its
-+ * second pass.
-+ */
++/* Fold newly appended instructions into the argument index, once each, so the
++   lowering stays linear. Mirrors the first pass of regvm_arg_retarget_scan;
++   `aw_last_win` replaces its second pass. */
 +static void regvm_arg_index_sync(JSRegIR *ir)
 +{
 +    int i;
@@ -101,11 +81,8 @@ Needs a bytecode version bump:
 +    ir->aw_scanned = ir->n_insns;
 +}
 +
-+/*
-+ * Record that the producer at `def` was retargeted to write the call window
-+ * instead of the value `v` (the six call lowerings below). The index must forget
-+ * v's old definition and note that `def` now names the window.
-+ */
++/* Record that the producer at `def` now writes the call window instead of
++   `v`: forget v's old definition and note that `def` names the window. */
 +static void regvm_arg_retarget_insn(JSRegIR *ir, int def, int win, int v)
 +{
 +    JSRegInsn *d = &ir->insns[def];
@@ -157,12 +134,10 @@ Needs a bytecode version bump:
 +    return result;
 +}
 +
-+/*
-  * Decide, for one call's arguments, which ones can be produced in place. `pop`
-  * names every operand the call reads (n_all of them), and the arguments are the
-  * argc entries starting at arg_off. Fills defs[a] with the producer to retarget
-@@ -58799,7 +58908,7 @@
-  */
+ /* Decide which of one call's arguments can be produced in place. `pop` names
+    the call's n_all operands; the arguments are argc entries from arg_off.
+    defs[a] is the producer to retarget, or -1. No two arguments share a
+    producer. */
  static int regvm_stack_has(const int *stack, int n, int v);
  
 -static void regvm_stage_args(const JSRegIR *ir, const int *pop, int n_all,
@@ -170,7 +145,7 @@ Needs a bytecode version bump:
                               int arg_off, int argc, const int *home_of,
                               int n_values, int below, int *defs)
  {
-@@ -59298,8 +59407,7 @@
+@@ -57634,8 +57733,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
@@ -180,7 +155,7 @@ Needs a bytecode version bump:
              } else {
                  ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
              }
-@@ -59314,8 +59422,7 @@
+@@ -57650,8 +57748,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
@@ -190,7 +165,7 @@ Needs a bytecode version bump:
              } else {
                  ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
              }
-@@ -59330,8 +59437,7 @@
+@@ -57666,8 +57763,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
@@ -200,7 +175,7 @@ Needs a bytecode version bump:
              } else {
                  ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
              }
-@@ -59346,8 +59452,7 @@
+@@ -57682,8 +57778,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          regvm_stage_args(ir, pop, argc + 1, 1, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
@@ -210,7 +185,7 @@ Needs a bytecode version bump:
              } else {
                  ADD(ROP_move, REGVM_WIN(a), pop[1 + a]);
              }
-@@ -59362,8 +59467,7 @@
+@@ -57698,8 +57793,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          regvm_stage_args(ir, pop, argc + 2, 2, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
@@ -220,7 +195,7 @@ Needs a bytecode version bump:
              } else {
                  ADD(ROP_move, REGVM_WIN(a), pop[2 + a]);
              }
-@@ -59378,8 +59482,7 @@
+@@ -57714,8 +57808,7 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
          regvm_stage_args(ir, pop, argc, 0, argc, home_of, n_values, below, defs);
          for (a = 0; a < argc; a++) {
              if (defs[a] >= 0) {
@@ -230,7 +205,7 @@ Needs a bytecode version bump:
              } else {
                  ADD(ROP_move, REGVM_WIN(a), pop[a]);
              }
-@@ -63518,6 +63623,27 @@
+@@ -61448,6 +61541,27 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      ir.cap = 0;
      ir.own_init = NULL;
      ir.own_undef = NULL;
@@ -258,7 +233,7 @@ Needs a bytecode version bump:
      fd->regvm_fill = NULL;
      fd->regvm_fill_count = 0;
  #ifdef QJS_REGVM_RCCHECK
-@@ -64632,6 +64800,8 @@
+@@ -62493,6 +62607,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
      js_free(ctx, ir.insns);
      js_free(ctx, ir.own_init);
      js_free(ctx, ir.own_undef);
