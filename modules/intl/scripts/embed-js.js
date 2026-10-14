@@ -137,12 +137,17 @@ function parseArgs(argv) {
      * Comments and whitespace do not appear here, so this number moves only
      * when *code or data* is added, which is the thing the budget is for.
      *
+     * The ceiling follows the register-VM compiler: a QJS_REGVM=ON qjsc emits
+     * register bytecode, which is larger than the stack form of the same
+     * source (121,722 B against 101,617 B for the current js/intl.js). One
+     * ceiling has to admit the larger of the two forms.
+     *
      * The ceiling is set at measured + ~5%. It is deliberately tight: a budget
      * with 40% headroom does not fire until the thing it was protecting against
      * has already happened. It is only checked when a qjsc-ng is available; a
      * build with no compiler embeds source and has no blob to measure.
      */
-    maxBlob: 106 * 1000,
+    maxBlob: 128 * 1000,
     embedSource: true,
   };
   for (let i = 2; i < argv.length; i++) {
