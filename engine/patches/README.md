@@ -273,6 +273,7 @@ what we changed and why without opening a single `.patch` file.
 | `0261` | Gives each binary immediate operation its own threaded handler | `binary_imm` switched on its operation operand inside the fast path on every execution, 29 instructions each on Octane mandreel | The handler tail-calls a per-operation handler from an operand-indexed table, so each fast path is compiled for one operation | No. |
 | `0262` | Stops clearing the source register of a transfer move under deferred RC | Registers do not own their values under deferred RC, so emptying the dead source of `move_xfer` released nothing and cost two stores per execution | The transfer is a plain copy under deferred RC; the non-DRC build is unchanged | No. |
 | `0263` | Gives the register VM's global reads a per-instruction cache | `get_global` hashed into a shared 2-way cell cache on every execution, 22 instructions each and 21% of Octane mandreel's register instructions, with globals in one set evicting each other | `get_global` gains a cache site holding the global's slot and generation, checked with one compare | Yes (9999 holds the version and the rebuilt register blobs) |
+| `0264` | Initializes an object's global-watch flag when it is created | `gv_watched` was never cleared on a new object, so a reused allocator block could leave it set and every property add on that object invalidated all global caches | The bit is cleared with the other flags; register global sites also allocate their cache table before probing the cell | No. |
 
 
 ## Reading the patches

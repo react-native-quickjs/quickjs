@@ -1035,12 +1035,16 @@
       "sha256": "af678b7cdaf76d7ca52ec72bf599490f103ccebae9923d3d94378eb6498aae33"
     },
     {
+      "name": "0264-init-gv-watched.patch",
+      "sha256": "fecbb9eb9fcd041a079911a8528adccaf4fec6ce228d0aa194d8d824fdbeac08"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "0d4224760b76db65765bec6b4667915a72e0d71f29d4e13aa02374f4499a95b6"
     }
   ],
   "files": {
-    "quickjs.c": "f2739aa33bcec6e1f226280d27d89e4ba8278c74a7395af20acca1fc67550a78",
+    "quickjs.c": "04a5114524552cb771de65073b5120cb3616d1586cbe28a87fa220a853810720",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -8714,6 +8714,7 @@ static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID c
     p->is_uncatchable_error = 0;
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
+    p->gv_watched = 0;
     p->is_prototype = 0;
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
@@ -15568,12 +15569,6 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
     JSProperty *slot;
     JSRegPIC *pic, *e;
 
-    if (gvc[0].atom == atom && gvc[0].gen == gen)
-        slot = gvc[0].slot;
-    else if (gvc[1].atom == atom && gvc[1].gen == gen)
-        slot = gvc[1].slot;
-    else
-        return;
     if ((unsigned)site >= b->regvm_pic_count)
         return;
     pic = *ppic;
@@ -15583,6 +15578,12 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
             return;
         *ppic = pic;
     }
+    if (gvc[0].atom == atom && gvc[0].gen == gen)
+        slot = gvc[0].slot;
+    else if (gvc[1].atom == atom && gvc[1].gen == gen)
+        slot = gvc[1].slot;
+    else
+        return;
     e = &pic[site];
     if (e->kind != REG_PIC_GLOBAL && e->kind != REG_PIC_EMPTY)
         return;
