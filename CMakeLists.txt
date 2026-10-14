@@ -78,6 +78,10 @@ if(QJS_REGVM)
     engine/quickjs-ng/quickjs-libc.c)
   target_link_libraries(run-test262-regvm PRIVATE quickjs)
   target_include_directories(run-test262-regvm PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-ng")
+  # quickjs-libc.c reads `environ` and `sighandler_t`, which glibc declares only
+  # under _GNU_SOURCE; the quickjs target defines it privately, so it does not
+  # reach this one.
+  target_compile_definitions(run-test262-regvm PRIVATE _GNU_SOURCE)
 endif()
 
 add_subdirectory(tests)
