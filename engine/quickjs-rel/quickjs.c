@@ -11603,10 +11603,19 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
        A light frame's function is `f->func` and its pc comes from its captured
        `cap_ip`. */
     {
-        JSRegBtFrame bt[64];
-        int nb, bi;
+        /* One more than csd, for the frame SKIP_FIRST_LEVEL drops. */
+        JSRegBtFrame bt[countof(csd) + 1];
+        int nb, bi, max_bt;
 
-        nb = regvm_fill_backtrace_frames(rt, bt, (int)stack_trace_limit);
+        /* The limit counts the frames that are printed, so collect the frame
+           the loop skips on top of it. A filter function may sit anywhere in
+           the stack, so its search gets every frame that fits. */
+        max_bt = stack_trace_limit;
+        if (has_filter_func)
+            max_bt = countof(bt);
+        else if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL)
+            max_bt++;
+        nb = regvm_fill_backtrace_frames(rt, bt, min_int(max_bt, countof(bt)));
 
         /* Find the frame we want to start from. Note that when a filter is used
            the filter function will be the first, but we also specify we want to

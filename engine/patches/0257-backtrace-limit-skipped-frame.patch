@@ -1,0 +1,51 @@
+Subject: Keep Error.stackTraceLimit frames when the first level is skipped
+
+What this does
+  Collects one frame more than the stack trace limit when the backtrace skips
+  its first level, and every frame that fits when a filter function is given.
+
+Why we need it
+  The logical stack walk stops collecting at the limit, and the loop that
+  prints the frames then drops the first one: the Error constructor's own frame
+  for `new Error()`. So `Error.stackTraceLimit = N` gave N - 1 frames where node
+  and the stock engine give N. A filter function deeper than the limit was not
+  found at all, and the trace started from the innermost frame instead.
+
+What it adds
+  Nothing new. The collection bound changes, the frames printed do not.
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  The frame buffer grows by one so a limit at its maximum still has room for
+  the skipped frame. tests/differential/corpus/throw.js covers it.
+
+diff --git a/quickjs.c b/quickjs.c
+index 5a94df1..3994a9b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11603,10 +11603,19 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+        A light frame's function is `f->func` and its pc comes from its captured
+        `cap_ip`. */
+     {
+-        JSRegBtFrame bt[64];
+-        int nb, bi;
+-
+-        nb = regvm_fill_backtrace_frames(rt, bt, (int)stack_trace_limit);
++        /* One more than csd, for the frame SKIP_FIRST_LEVEL drops. */
++        JSRegBtFrame bt[countof(csd) + 1];
++        int nb, bi, max_bt;
++
++        /* The limit counts the frames that are printed, so collect the frame
++           the loop skips on top of it. A filter function may sit anywhere in
++           the stack, so its search gets every frame that fits. */
++        max_bt = stack_trace_limit;
++        if (has_filter_func)
++            max_bt = countof(bt);
++        else if (backtrace_flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL)
++            max_bt++;
++        nb = regvm_fill_backtrace_frames(rt, bt, min_int(max_bt, countof(bt)));
+ 
+         /* Find the frame we want to start from. Note that when a filter is used
+            the filter function will be the first, but we also specify we want to
