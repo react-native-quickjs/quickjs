@@ -1011,12 +1011,16 @@
       "sha256": "f64d838d38d084335d9de8c63534d75715975502e6bfa38f2f285a0457fa1000"
     },
     {
+      "name": "0258-regvm-audit-fixes.patch",
+      "sha256": "eb2e025fcabee1e9d8a67f76d5cd0f3b3e1e0a1ca76ddc38f81c7f3132c241c4"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "ce61d62495071bde3edc141fde05e488f8c4492fdd7f465cc204fb12a1baa031",
+    "quickjs.c": "3f998a55c3065bbc59462e3c1ca4f6f96f23bcc629d7354e6cb96297ca029cb4",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
