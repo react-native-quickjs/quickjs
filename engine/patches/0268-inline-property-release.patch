@@ -1,0 +1,56 @@
+Subject: Release an object's plain properties and array elements inline
+
+What this does
+  Freeing an object releases each plain data property in the loop itself:
+  a tag test, an inline reference-count decrement, and the out-of-line free
+  only when the count reaches zero. Accessor, variable-reference and
+  auto-init properties still go through free_property(). An array's
+  finalizer releases its elements the same way.
+
+Why we need it
+  Every property and every element went through an exported call, even an
+  int that holds no reference. Freeing dominates Octane splay, which drops a
+  node, its payload object and its array on every operation.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2256,6 +2256,7 @@
+ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv, int magic);
+ static int check_function(JSContext *ctx, JSValueConst obj);
++static void js_free_value_rt(JSRuntime *rt, JSValue v);
+ static void js_array_finalizer(JSRuntime *rt, JSValueConst val);
+ static void js_array_mark(JSRuntime *rt, JSValueConst val,
+                           JS_MarkFunc *mark_func);
+@@ -9624,7 +9625,10 @@
+     uint32_t i;
+ 
+     for(i = 0; i < p->u.array.count; i++) {
+-        JS_FreeValueRT(rt, p->u.array.u.values[i]);
++        JSValue v = p->u.array.u.values[i];
++        if (JS_VALUE_HAS_REF_COUNT(v) &&
++            --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
++            js_free_value_rt(rt, v);
+     }
+     if (!p->values_inline)
+         js_free_rt(rt, p->u.array.u.values);
+@@ -9788,7 +9792,14 @@
+     sh = p->shape;
+     pr = get_shape_prop(sh);
+     for(i = 0; i < sh->prop_count; i++) {
+-        free_property(rt, &p->prop[i], pr->flags);
++        if (likely(!(pr->flags & JS_PROP_TMASK))) {
++            JSValue v = p->prop[i].u.value;
++            if (JS_VALUE_HAS_REF_COUNT(v) &&
++                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
++                js_free_value_rt(rt, v);
++        } else {
++            free_property(rt, &p->prop[i], pr->flags);
++        }
+         pr++;
+     }
+     if (p->prop_inline_cap == 0)

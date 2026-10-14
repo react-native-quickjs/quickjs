@@ -1051,12 +1051,16 @@
       "sha256": "2d087a92a77cdd20d5a106fcbf141ea55788ee924c6d7f5071e3337fd719bca4"
     },
     {
+      "name": "0268-inline-property-release.patch",
+      "sha256": "7a2722e5c4b24c0e546a39ccaabc6b81497fd8e216fcb065c39cb77a6e4ff527"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "e7d794e10a7d1b4ea932116e94c47b23980e177be9f99b6e8d1e85132e75ff7c"
     }
   ],
   "files": {
-    "quickjs.c": "5d3ce7eb0f6a45b9d59cf3040823e7dc0d05099a26bf6365d168756f424f1208",
+    "quickjs.c": "ba7b94459a97813e661826b0624aa8238a0f150594470987b74a359b142396ec",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
