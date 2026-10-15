@@ -1,0 +1,60 @@
+Subject: Poll the interrupt handler on every compiled back edge
+
+What this does
+  `qjs_aot_poll` decrements the context's interrupt counter and runs the
+  embedder's handler at zero, the same poll an interpreter back edge runs. The
+  generator emits it on every backward branch, including the back edge of a
+  typed loop region, whose body is a tight native loop with nothing else in it.
+
+Why we need it
+  `JS_SetInterruptHandler` is how an embedder stops runaway script (the React
+  Native watchdog), and patch 0213 made every interpreter back edge poll it. A
+  compiled loop that neither allocates nor calls -- `while (true) {}`, or a
+  numeric loop lowered to a typed region -- had no poll, so it could not be
+  stopped. That is the loophole the design names in 6.8.
+
+What it adds
+  `qjs_aot_poll` in the engine and its declaration, and the poll at every
+  backward branch and region back edge in the generator.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index d1eefc4..2042afa 100644
+@@ -87,6 +87,13 @@
+    execution to fail. Only such a unit calls it; a normal unit has no sweep. */
+ QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site);
+ 
++/* A compiled loop's back edge polls the embedder's interrupt handler here, the
++   way every interpreter back edge does, so a compiled `while (true) {}` can
++   still be stopped. The counter is the context's own, so a compiled loop and
++   an interpreted one share the same budget. Returns 0 to continue, -1 after
++   throwing. */
++QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx);
++
+ /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
+    REGVM_STEP_SUSPEND in quickjs.c. */
+ #define QJS_AOT_COLD_RET ((uint8_t *)1)
+
+diff --git a/quickjs.c b/quickjs.c
+index 215135d..befb14b 100644
+@@ -60751,6 +60751,18 @@
+ /* the bound callee (and its C prototype) per runtime.                       */
+ /* ------------------------------------------------------------------------ */
+ 
++/* A compiled loop's back edge polls the embedder's interrupt handler here, the
++   way every interpreter back edge does, so a compiled `while (true) {}` can
++   still be stopped. The counter is the context's own, so a compiled loop and
++   an interpreted one share the same budget. Returns 0 to continue, -1 after
++   throwing. */
++QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx)
++{
++    if (unlikely(--ctx->interrupt_counter <= 0))
++        return __js_poll_interrupts(ctx);
++    return 0;
++}
++
+ QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx)
+ {
+     return ctx->rt->ic_watchpoint_epoch;

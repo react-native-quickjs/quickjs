@@ -1063,12 +1063,16 @@
       "sha256": "fd127f08d0f2b4c1072947356f4944e97acdaecce4e65487008e509c5eb6a776"
     },
     {
+      "name": "0271-regvm-aot-interrupt-poll.patch",
+      "sha256": "baef0abd574f01c15d782fdb602b97b046d51d8c678304d4cd37cdd68ca452e1"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "6a658d64b13dc08342c6926b51aee52134a4f05ce51acade79afc96e1f12329a",
+    "quickjs.c": "baf050e18c436be316c24e90f9b05e941695f1caa75af291c742fe0a34062737",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

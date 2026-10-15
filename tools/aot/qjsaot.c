@@ -542,6 +542,19 @@ static void print_census(
   fprintf(stderr, "\n");
 }
 
+/* A backward jump is a loop back edge: poll the interrupt handler first, the
+   way every interpreter back edge does, so a compiled loop is stoppable. */
+static void emit_branch(FILE *f, int off, int tgt) {
+  if (tgt < off) {
+    fprintf(
+        f,
+        "    if (__builtin_expect(qjs_aot_poll(ctx) < 0, 0)) { pc = %d; goto "
+        "exception; }\n",
+        off);
+  }
+  fprintf(f, "    goto pc_%d;\n", tgt);
+}
+
 /* The slow path for one instruction. Under a deopt-everywhere sweep a guard
    miss leaves compiled code here (`guard_miss`), before the instruction has
    had any effect, so the interpreter re-executes it; an operation the unit
@@ -1082,7 +1095,7 @@ static int emit_template(
     /* branch / branch_s: always taken. */
     case ROP_branch:
     case ROP_branch_s:
-      fprintf(f, "    goto pc_%d;\n", next + (int)in->arg[0].val);
+      emit_branch(f, off, next + (int)in->arg[0].val);
       return 1;
 
     /* branch_if / branch_if_not: regvm_to_bool, else the step. */
@@ -1092,10 +1105,10 @@ static int emit_template(
       int tgt = next + (int)in->arg[1].val;
       a = (int)in->arg[0].val;
       fprintf(
-          f,
-          "    if ((qjs_aot_to_bool(ctx, AOT_REG(fr, %d)) != 0) == %d) goto "
-          "pc_%d; else goto pc_%d;\n",
-          a, want_true, tgt, next);
+          f, "    if ((qjs_aot_to_bool(ctx, AOT_REG(fr, %d)) != 0) == %d) {\n",
+          a, want_true);
+      emit_branch(f, off, tgt);
+      fprintf(f, "    } else goto pc_%d;\n", next);
       return 1;
     }
 
@@ -1112,9 +1125,9 @@ static int emit_template(
             "      if (qjs_aot_branch_cmp(%d, AOT_REG(fr, %d), AOT_REG(fr, "
             "%d), &_t)) {\n",
             sub, a, b);
-        fprintf(
-            f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt,
-            next);
+        fprintf(f, "          if (_t) {\n");
+        emit_branch(f, off, tgt);
+        fprintf(f, "          } else goto pc_%d; } }\n", next);
         emit_fallback(f, off, next, last, 1);
         return 1;
       }
@@ -1978,9 +1991,15 @@ static void rg_elem(RgCtx *c, int d, int base, RgVal key, int pc) {
 }
 
 /* Emit `goto` for a branch target: loop head, region exit, or leave the
-   region (boxing first). */
+   region (boxing first). The loop head is a back edge, so it polls the
+   interrupt handler first, the way an interpreter back edge does. */
 static void rg_goto_target(RgCtx *c, int tgt) {
   if (tgt == c->head_pc) {
+    rg_out(
+        c,
+        "        if (__builtin_expect(qjs_aot_poll(ctx) < 0, 0)) { pc = "
+        "%d; goto exception; }\n",
+        c->head_pc);
     rg_out(c, "        goto rg_%d_loop;\n", c->head_pc);
   } else if (tgt == c->exit_pc) {
     rg_out(c, "        goto rg_%d_exit;\n", c->head_pc);

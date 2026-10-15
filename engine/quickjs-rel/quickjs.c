@@ -60751,6 +60751,18 @@ QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
 /* the bound callee (and its C prototype) per runtime.                       */
 /* ------------------------------------------------------------------------ */
 
+/* A compiled loop's back edge polls the embedder's interrupt handler here, the
+   way every interpreter back edge does, so a compiled `while (true) {}` can
+   still be stopped. The counter is the context's own, so a compiled loop and
+   an interpreted one share the same budget. Returns 0 to continue, -1 after
+   throwing. */
+QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx)
+{
+    if (unlikely(--ctx->interrupt_counter <= 0))
+        return __js_poll_interrupts(ctx);
+    return 0;
+}
+
 QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx)
 {
     return ctx->rt->ic_watchpoint_epoch;
