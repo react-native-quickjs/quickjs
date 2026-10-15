@@ -1059,12 +1059,16 @@
       "sha256": "ce599d2a669dd1ac585cddeebf4f2f9c25130b3c085dbda94b29fe6994a55132"
     },
     {
+      "name": "0270-regvm-aot-deopt.patch",
+      "sha256": "fd127f08d0f2b4c1072947356f4944e97acdaecce4e65487008e509c5eb6a776"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "b8130919f12c35e30058d693a6330fce35fb7aa0b2196ee9abc433f59e6027b3",
+    "quickjs.c": "6a658d64b13dc08342c6926b51aee52134a4f05ce51acade79afc96e1f12329a",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

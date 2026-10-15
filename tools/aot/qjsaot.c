@@ -165,7 +165,52 @@ typedef struct {
 static const ProfEntry *g_prof = NULL;
 static int g_nprof = 0;
 static const ProfEntry *g_cur_prof = NULL;
+/* Call-binding site ids (the engine's per-runtime binding array is indexed by
+   one). A deopt site has its own id space, handed out by `g_deopt_site_next`,
+   because a deopt site needs a failure counter and a function to disable while
+   a binding site needs neither. */
 static int g_site_next = 0;
+static int g_deopt_site_next = 0;
+/* Deopt site -> index of its function in the emitted table, so the engine can
+   disable a function whose guards keep failing. Grown with the site count. */
+static int *g_deopt_site_func = NULL;
+static int g_deopt_site_func_cap = 0;
+/* The index of the function `emit_func` is currently emitting, and the running
+   count of table entries before it. */
+static int g_cur_func_idx = 0;
+static int g_emit_func_base = 0;
+/* Deopt-everywhere: every operation the unit does not lower leaves compiled
+   code at its own instruction. Sweeping every entry exercises every frame state
+   against the interpreter. */
+static int g_deopt_everywhere = 0;
+
+/* Record that deopt site `sid` belongs to the function being emitted. */
+static void deopt_site_note(int sid) {
+  if (sid >= g_deopt_site_func_cap) {
+    int nc = g_deopt_site_func_cap ? g_deopt_site_func_cap : 64;
+    int *np;
+    while (nc <= sid) nc *= 2;
+    np = realloc(g_deopt_site_func, sizeof(*np) * (size_t)nc);
+    if (!np) return;
+    g_deopt_site_func = np;
+    g_deopt_site_func_cap = nc;
+  }
+  g_deopt_site_func[sid] = g_cur_func_idx;
+}
+
+/* The deopt site of the instruction `emit_func` is currently emitting, or -1.
+   Under a deopt-everywhere sweep every instruction gets one, so a forced
+   failure has somewhere to land and the fallback reuses the same site. */
+static int g_cur_deopt_site = -1;
+
+/* A fresh deopt site for the current function, or -1 when not sweeping. */
+static int deopt_site_new(void) {
+  int sid;
+  if (!g_deopt_everywhere) return -1;
+  sid = g_deopt_site_next++;
+  deopt_site_note(sid);
+  return sid;
+}
 
 static unsigned prof_type_bit(const char *name) {
   if (!strcmp(name, "float")) return PT_FLOAT;
@@ -239,16 +284,21 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
       const char *p = strstr(line, "abi=");
       const char *fp = strstr(line, "fmt=");
       if (p && strtoul(p + 4, NULL, 10) != (unsigned long)QJS_AOT_ABI) {
-        fprintf(stderr, "qjsaot: %s: ABI mismatch (profile %lu, engine %lu); "
-                        "collect the profile with this engine build\n",
-                path, strtoul(p + 4, NULL, 10), (unsigned long)QJS_AOT_ABI);
+        fprintf(
+            stderr,
+            "qjsaot: %s: ABI mismatch (profile %lu, engine %lu); "
+            "collect the profile with this engine build\n",
+            path, strtoul(p + 4, NULL, 10), (unsigned long)QJS_AOT_ABI);
         fclose(f);
         return NULL;
       }
-      if (fp && strtoul(fp + 4, NULL, 10) != (unsigned long)REGVM_FORMAT_VERSION) {
-        fprintf(stderr, "qjsaot: %s: register-format mismatch (profile %lu, "
-                        "engine %u); collect the profile with this engine build\n",
-                path, strtoul(fp + 4, NULL, 10), (unsigned)REGVM_FORMAT_VERSION);
+      if (fp &&
+          strtoul(fp + 4, NULL, 10) != (unsigned long)REGVM_FORMAT_VERSION) {
+        fprintf(
+            stderr,
+            "qjsaot: %s: register-format mismatch (profile %lu, "
+            "engine %u); collect the profile with this engine build\n",
+            path, strtoul(fp + 4, NULL, 10), (unsigned)REGVM_FORMAT_VERSION);
         fclose(f);
         return NULL;
       }
@@ -492,9 +542,20 @@ static void print_census(
   fprintf(stderr, "\n");
 }
 
-/* The shared step slow path for one instruction: run the op through the step
-   engine and route the result (the slow path is always the step). */
-static void emit_fallback(FILE *f, int off, int next, int last) {
+/* The slow path for one instruction. Under a deopt-everywhere sweep a guard
+   miss leaves compiled code here (`guard_miss`), before the instruction has
+   had any effect, so the interpreter re-executes it; an operation the unit
+   does not lower still runs through the shared step routine, which handles
+   every type. */
+static void emit_fallback(
+    FILE *f, int off, int next, int last, int guard_miss) {
+  if (g_deopt_everywhere && guard_miss) {
+    int sid = g_cur_deopt_site >= 0 ? g_cur_deopt_site : deopt_site_new();
+    (void)next;
+    (void)last;
+    fprintf(f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d);\n", off, sid);
+    return;
+  }
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", off);
   fprintf(
       f,
@@ -652,7 +713,7 @@ static int emit_template(
       fprintf(
           f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d,
           next);
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
 
     /* get_field / get_field_own / get_field2 / get_field2_own: own_read_hit.
@@ -690,7 +751,7 @@ static int emit_template(
       fprintf(
           f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d,
           next);
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
 
     /* call / call_method: the specialised C-call path when the profile shows
@@ -746,7 +807,7 @@ static int emit_template(
             dc, next);
         fprintf(f, "      if (_h < 0) { pc = %d; goto exception; } }\n", off);
       }
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
     }
 
@@ -839,7 +900,7 @@ static int emit_template(
           "AOT_REG(fr, %d)))\n"
           "        goto pc_%d;\n",
           a, site, b, next);
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
 
     /* get_element: the plain-array fast path, else the step. */
@@ -856,7 +917,7 @@ static int emit_template(
       fprintf(
           f, "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n",
           d, next);
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
 
     /* Fused multiply-add family: mul then add/sub, exactly as the handler. */
@@ -923,7 +984,7 @@ static int emit_template(
       fprintf(
           f, "          AOT_SET_B(ctx, fr, %d, _v2); goto pc_%d; } }\n", d2,
           next);
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
     }
 
@@ -941,7 +1002,7 @@ static int emit_template(
           s, la, rb);
       fprintf(
           f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt, next);
-      emit_fallback(f, off, next, last);
+      emit_fallback(f, off, next, last, 1);
       return 1;
     }
 
@@ -1054,7 +1115,7 @@ static int emit_template(
         fprintf(
             f, "          if (_t) goto pc_%d; else goto pc_%d; } }\n", tgt,
             next);
-        emit_fallback(f, off, next, last);
+        emit_fallback(f, off, next, last, 1);
         return 1;
       }
       sub = binop_subop(in->op);
@@ -2622,13 +2683,24 @@ static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
       int last = nxts[i] >= g->len;
       int is_region = 0;
       fprintf(f, "pc_%d:\n", offs[i]);
-      if (rb && rb[i] >= 0) {
+      /* Under a deopt-everywhere sweep every instruction is a guard site: a
+         forced failure leaves compiled code here, before the instruction has
+         had any effect, and the interpreter re-executes it. */
+      g_cur_deopt_site = deopt_site_new();
+      if (g_cur_deopt_site >= 0)
+        fprintf(
+            f,
+            "    if (qjs_aot_should_deopt(ctx, %d)) return qjs_aot_deopt(ctx, "
+            "f, fr, %d, %d);\n",
+            g_cur_deopt_site, offs[i], g_cur_deopt_site);
+      if (rb && rb[i] >= 0 && !g_deopt_everywhere) {
         is_region =
             emit_region(f, g, ins, offs, nxts, n, i, rb[i], nxts[rb[i]]);
         if (is_region) fprintf(f, "pc_%d_la:\n", offs[i]);
       }
       if (!emit_template(f, &ins[i], offs[i], nxts[i], last))
-        emit_fallback(f, offs[i], nxts[i], last);
+        emit_fallback(f, offs[i], nxts[i], last, 0);
+      g_cur_deopt_site = -1;
     }
     free(rb);
   }
@@ -2739,6 +2811,8 @@ int main(int argc, char **argv) {
       min_ops = strtol(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "--layout-header") == 0 && i + 1 < argc) {
       aot_layout_header = argv[++i];
+    } else if (strcmp(argv[i], "--deopt-everywhere") == 0) {
+      g_deopt_everywhere = 1;
     } else if (strcmp(argv[i], "--mut") == 0 && i + 1 < argc) {
       g_mut = argv[++i];
     } else if (argv[i][0] == '-') {
@@ -2849,6 +2923,7 @@ int main(int argc, char **argv) {
           memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
         continue; /* duplicate bytecode: one body serves both */
       hex16(funcs[i].digest, hex);
+      g_cur_func_idx = i;
       mf = open_memstream(&eb[i].buf, &eb[i].len);
       if (!mf) {
         fails++;
@@ -3029,10 +3104,10 @@ int main(int argc, char **argv) {
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
           lay.off_object_class_id, lay.off_object_shape, lay.off_object_prop,
           lay.off_object_prop_inline_cap_byte, lay.off_shape_prop_size,
-          lay.off_shape_prop_count, lay.off_shape_proto, lay.off_shape_hash_table,
-          lay.off_property_u_value, lay.off_shape_property_flags_atom,
-          lay.off_string_len_bits, lay.off_string_strv, lay.off_jsvalue_tag,
-          lay.off_jsvalue_u);
+          lay.off_shape_prop_count, lay.off_shape_proto,
+          lay.off_shape_hash_table, lay.off_property_u_value,
+          lay.off_shape_property_flags_atom, lay.off_string_len_bits,
+          lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u);
       fclose(lf);
     }
 
@@ -3064,19 +3139,40 @@ int main(int argc, char **argv) {
     }
 
     fprintf(f, "const JSAotEntry qjs_aot_table[] = {\n");
-    for (i = 0; i < nfuncs; i++) {
-      char hex[33];
-      if (!sel[i]) continue;
-      hex16(funcs[i].digest, hex);
-      fprintf(f, "    { {");
-      {
-        int k;
-        for (k = 0; k < 16; k++)
-          fprintf(f, "%s0x%02x", k ? ", " : "", funcs[i].digest[k]);
+    {
+      int *tbl_idx = malloc(sizeof(int) * (size_t)(nfuncs > 0 ? nfuncs : 1));
+      int ti = 0;
+      for (i = 0; i < nfuncs; i++) tbl_idx[i] = -1;
+      for (i = 0; i < nfuncs; i++) {
+        char hex[33];
+        if (!sel[i]) continue;
+        tbl_idx[i] = ti++;
+        hex16(funcs[i].digest, hex);
+        fprintf(f, "    { {");
+        {
+          int k;
+          for (k = 0; k < 16; k++)
+            fprintf(f, "%s0x%02x", k ? ", " : "", funcs[i].digest[k]);
+        }
+        fprintf(f, "}, aot_f_%s, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
       }
-      fprintf(f, "}, aot_f_%s, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
+      fprintf(f, "};\n");
+      /* Deopt site -> its function's index in the emitted table. A site whose
+         function was not selected cannot run, so it maps to no function. */
+      fprintf(f, "const uint32_t qjs_aot_deopt_site_func[] = {");
+      if (g_deopt_site_next == 0) {
+        fprintf(f, " 0u };\n");
+      } else {
+        for (i = 0; i < g_deopt_site_next; i++) {
+          int fi = g_deopt_site_func ? g_deopt_site_func[i] : -1;
+          int t = (fi >= 0 && fi < nfuncs) ? tbl_idx[fi] : -1;
+          fprintf(
+              f, "%s%du", i ? ", " : " ", t < 0 ? 0xffffffffu : (unsigned)t);
+        }
+        fprintf(f, " };\n");
+      }
+      free(tbl_idx);
     }
-    fprintf(f, "};\n");
     fprintf(
         f,
         "const uint32_t qjs_aot_count = "
@@ -3084,7 +3180,7 @@ int main(int argc, char **argv) {
     fprintf(f, "const uint32_t qjs_aot_abi = QJS_AOT_ABI;\n");
     fprintf(f, "const uint32_t qjs_aot_layout = QJS_AOT_LAYOUT_HASH;\n");
     fprintf(f, "const uint32_t qjs_aot_cell_count = 0u;\n");
-    fprintf(f, "const uint32_t qjs_aot_site_count = %du;\n", g_site_next);
+    fprintf(f, "const uint32_t qjs_aot_site_count = %du;\n", g_deopt_site_next);
     fclose(f);
 
     fprintf(

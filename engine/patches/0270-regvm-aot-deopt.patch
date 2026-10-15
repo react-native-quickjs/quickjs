@@ -1,0 +1,326 @@
+Subject: Add the AOT deoptimiser and the guard sweep
+
+What this does
+  `qjs_aot_deopt` leaves compiled code: it records the pc to resume at and
+  returns, and the AOT entry in `js_regvm_execute` starts the **threaded**
+  interpreter at that pc with the same record and register file, so the rest of
+  the activation runs the way it would have without compiled code. It never
+  re-enters compiled code and never runs the step engine.
+
+  Under `--deopt-everywhere` every instruction becomes a deopt site and a guard
+  miss deopts instead of rejoining; `QJS_AOT_SWEEP=<site>:<n>` then forces
+  guard <site> to fail on its <n>-th execution regardless of its condition
+  ("all:<n>" sweeps every site, "off" disables the sweep), so a per-site sweep
+  exercises every frame state and compares the result with the interpreter.
+
+Why we need it
+  A guard that fails must not branch to a slow path that rejoins compiled code:
+  that is what forces state into memory at every op boundary and makes a
+  re-entering unit slower than the interpreter. A deopt needs nothing built,
+  because a compiled frame and an interpreter frame share the same register
+  array, but it must continue on the interpreter the shipping build uses, and
+  its guards must be testable one by one.
+
+What it adds
+  `qjs_aot_deopt`, `qjs_aot_should_deopt`, `QJS_AOT_NO_DEOPT`, `JSRegRun.deopt_pc`
+  in the engine; the generator's `--deopt-everywhere` and the `QJS_AOT_SWEEP`
+  sweep. `QJS_AOT_SWEEP` reports its coverage in the `QJS_AOT_STATS` line.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index 4aa63f2..d1eefc4 100644
+@@ -78,14 +78,23 @@
+ uint8_t *qjs_aot_cells(JSContext *ctx);
+ int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn);
+ /* A failed guard: count it against its deopt site, and disable the site's
+-   function once the count reaches the limit. */
+-void qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
++   function once the count reaches the limit. Returns 1 when this call disabled
++   the function. */
++int qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
++QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
++                                   uint32_t pc, uint32_t site);
++/* A deopt-everywhere unit asks before a guard whether the sweep wants this
++   execution to fail. Only such a unit calls it; a normal unit has no sweep. */
++QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site);
+ 
+ /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
+    REGVM_STEP_SUSPEND in quickjs.c. */
+ #define QJS_AOT_COLD_RET ((uint8_t *)1)
+ #define QJS_AOT_SUSPEND  ((uint8_t *)2)
+ 
++/* `JSRegRun.deopt_pc` holds this when the activation is not deopting. */
++#define QJS_AOT_NO_DEOPT 0xffffffffu
++
+ /* One generated function: digest, entry, reserved flags. The table is sorted
+    by `digest`. */
+ typedef JSValue (*JSAotFn)(JSContext *ctx, JSRegRun *f, JSValue *fr,
+
+diff --git a/quickjs.c b/quickjs.c
+index 0f9b80a..215135d 100644
+@@ -509,6 +509,18 @@
+     uint8_t *disabled;      /* one bit per compiled function: route to interp */
+     uint32_t func_count;
+     uint32_t deopt_limit;   /* hits before a site's function is disabled (K) */
++    /* Guard sweep (QJS_AOT_SWEEP): force a guard to fail regardless of its
++       condition, so its deopt path runs. `sweep_all` targets every site,
++       otherwise `sweep_site` names one; `sweep_count` is the execution of that
++       site to fail on (0 = always). `sweep_runs` counts executions per site and
++       `sweep_fires` the forced failures, so a run reports its coverage. Off
++       unless the environment names a sweep. */
++    uint32_t *sweep_runs;
++    uint32_t sweep_site;
++    uint32_t sweep_count;
++    uint32_t sweep_fires;
++    uint8_t sweep_all;
++    uint8_t sweep_on;
+ } JSAotRun;
+ #endif
+ 
+@@ -1746,6 +1758,10 @@
+        regvm_record_eligible. */
+     void *aot_fn;
+     uint32_t aot_index;
++    /* The record and light eligibility a bound function had before binding:
++       js_aot_unbind restores them, so a disabled function runs the interpreter
++       through its normal call path. */
++    uint8_t aot_call_ready, aot_light, aot_light_fast;
+     uint8_t aot_state;
+ #endif
+ } JSFunctionBytecode;
+@@ -25084,6 +25100,12 @@
+        a local). A yield/await twin compares it with the instruction's address
+        to tell a resume from a fresh suspension. */
+     uint8_t *resume_marker;
++#if QJS_AOT
++    /* A deopt left compiled code: the interpreter must resume this activation
++       at this register pc. Set by qjs_aot_deopt, consumed by the AOT entry in
++       js_regvm_execute, which starts the threaded dispatch there. */
++    uint32_t deopt_pc;
++#endif
+ } JSRegRun;
+ 
+ /* `hdr_pack` is composed by explicit shifts, which assumes the four narrow
+@@ -30497,9 +30519,13 @@
+ #endif
+ #if QJS_AOT
+     /* Bind the generated entry, if any. A bound function is kept off the record
+-       and light paths so its calls reach js_regvm_execute's AOT entry. */
++       and light paths so its calls reach js_regvm_execute's AOT entry; the
++       saved flags let js_aot_unbind put it back on them. */
+     js_aot_bind(b);
+     if (b->aot_fn != NULL) {
++        b->aot_call_ready = b->regvm_call_ready;
++        b->aot_light = b->regvm_light;
++        b->aot_light_fast = b->regvm_light_fast;
+         b->regvm_call_ready = 0;
+         b->regvm_light = 0;
+         b->regvm_light_fast = 0;
+@@ -30903,6 +30929,9 @@
+         run.local_count = 0;
+         run.arg_owned = arg_owned;
+         run.resume_marker = NULL;
++#if QJS_AOT
++        run.deopt_pc = QJS_AOT_NO_DEOPT;
++#endif
+ #if QJS_REGVM_THREAD
+         REGVM_T_CHECK_SIZES();
+ #endif
+@@ -31068,6 +31097,16 @@
+                 run.resume_marker = regvm_resume_marker;
+                 ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
+                 regvm_resume_marker = run.resume_marker;
++                /* Compiled code left a guard to this frame: resume the
++                   threaded interpreter at the recorded pc, with this record
++                   and its register file, and never re-enter compiled code for
++                   this activation. */
++                if (unlikely(run.deopt_pc != QJS_AOT_NO_DEOPT)) {
++                    regvm_rpc = b->regvm_code + run.deopt_pc;
++                    regvm_resume_pending = 1;
++                    run.deopt_pc = QJS_AOT_NO_DEOPT;
++                    goto regvm_resume;
++                }
+                 /* Every exit of a generator/async body hands the parked frame
+                    to the machinery, as done_generator does. The test is the
+                    call flag, not the kind: a module body takes the ordinary
+@@ -60080,6 +60119,33 @@
+         if (!r->deopt_hits)
+             goto fail;
+     }
++    {
++        /* The guard sweep. QJS_AOT_SWEEP=<site>:<n> forces guard <site> to
++           fail on its <n>-th execution (0 = every execution); "all:<n>" sweeps
++           every site; "off" leaves the guards alone; unset means "all:0", so
++           every guard of a deopt-everywhere unit fails on every execution and
++           the activation leaves compiled code at its first guard. Only a
++           deopt-everywhere unit consults the sweep. Read once, at first use. */
++        const char *sw = getenv("QJS_AOT_SWEEP");
++        int sweep_off = sw != NULL && strcmp(sw, "off") == 0;
++
++        if (sw == NULL || sw[0] == '\0')
++            sw = "all:0";
++        if (!sweep_off && nsite) {
++            r->sweep_runs = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)nsite);
++            if (!r->sweep_runs)
++                goto fail;
++            if (strncmp(sw, "all", 3) == 0) {
++                r->sweep_all = 1;
++                r->sweep_count = sw[3] == ':' ? (uint32_t)strtoul(sw + 4, NULL, 10) : 1;
++            } else {
++                char *end;
++                r->sweep_site = (uint32_t)strtoul(sw, &end, 10);
++                r->sweep_count = *end == ':' ? (uint32_t)strtoul(end + 1, NULL, 10) : 1;
++            }
++            r->sweep_on = 1;
++        }
++    }
+     if (r->func_count) {
+         r->disabled = js_mallocz_rt(rt, ((size_t)r->func_count + 7) / 8);
+         if (!r->disabled)
+@@ -60090,6 +60156,7 @@
+ fail:
+     js_free_rt(rt, r->cells);
+     js_free_rt(rt, r->deopt_hits);
++    js_free_rt(rt, r->sweep_runs);
+     js_free_rt(rt, r->disabled);
+     js_free_rt(rt, r);
+     return NULL;
+@@ -60103,6 +60170,7 @@
+         return;
+     js_free_rt(rt, r->cells);
+     js_free_rt(rt, r->deopt_hits);
++    js_free_rt(rt, r->sweep_runs);
+     js_free_rt(rt, r->disabled);
+     js_free_rt(rt, r);
+     rt->aot_run = NULL;
+@@ -60130,22 +60198,44 @@
+ /* A guard failed: count it against its deopt site, and when the count reaches
+    the limit disable that site's function so its later calls run in the
+    interpreter. The site -> function map is the unit's, dense over deopt sites. */
+-void qjs_aot_note_deopt(JSContext *ctx, uint32_t site)
++int qjs_aot_note_deopt(JSContext *ctx, uint32_t site)
+ {
+     JSAotRun *r = aot_run_ensure(ctx->rt);
+     uint32_t fn;
+ 
+     if (!r || r->deopt_hits == NULL || site >= r->deopt_count)
+-        return;
++        return 0;
+     if (r->deopt_hits[site] < 0xffff)
+         r->deopt_hits[site]++;
+     if (r->deopt_hits[site] < r->deopt_limit || r->disabled == NULL)
+-        return;
++        return 0;
+     if (&qjs_aot_deopt_site_func == NULL)
+-        return;
++        return 0;
+     fn = qjs_aot_deopt_site_func[site];
+-    if (fn < r->func_count)
+-        r->disabled[fn >> 3] |= (uint8_t)(1u << (fn & 7));
++    if (fn >= r->func_count)
++        return 0;
++    r->disabled[fn >> 3] |= (uint8_t)(1u << (fn & 7));
++    return 1;
++}
++
++/* A sweep decision: 1 when this execution of the guard site must fail
++   regardless of its condition. Called by deopt-everywhere units only. */
++QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site)
++{
++    JSAotRun *r = aot_run_ensure(ctx->rt);
++
++    if (r == NULL || !r->sweep_on || r->sweep_runs == NULL ||
++        site >= r->deopt_count)
++        return 0;
++    if (!r->sweep_all && site != r->sweep_site)
++        return 0;
++    if (r->sweep_runs[site] != 0xffffffffu)
++        r->sweep_runs[site]++;
++    if (r->sweep_count == 0 || r->sweep_runs[site] == r->sweep_count) {
++        r->sweep_fires++;
++        return 1;
++    }
++    return 0;
+ }
+ 
+ /* Binding/entry counters, printed at teardown under QJS_AOT_STATS. */
+@@ -60159,6 +60249,7 @@
+     JSAotRun *r = rt->aot_run;
+     uint32_t cells_set = 0, disabled = 0;
+     uint32_t i;
++    char swbuf[64];
+ 
+     if (r) {
+         for (i = 0; i < r->cell_count; i++)
+@@ -60168,13 +60259,35 @@
+             if ((r->disabled[i >> 3] >> (i & 7)) & 1)
+                 disabled++;
+     }
++    swbuf[0] = '\0';
++    if (r && r->sweep_on) {
++        uint32_t reached = 0;
++        for (i = 0; i < r->deopt_count; i++)
++            if (r->sweep_runs[i])
++                reached++;
++        snprintf(swbuf, sizeof(swbuf), " sweep=%u/%u fired=%u",
++                 reached, r->deopt_count, r->sweep_fires);
++    }
+     fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu "
+-            "cells=%u/%u disabled=%u\n",
++            "cells=%u/%u disabled=%u%s\n",
+             present, count,
+             (unsigned long long)js_aot_bound_count,
+             (unsigned long long)js_aot_enter_count,
+             (unsigned long long)rt->aot_epoch_bumps,
+-            cells_set, r ? r->cell_count : 0u, disabled);
++            cells_set, r ? r->cell_count : 0u, disabled, swbuf);
++}
++
++/* Stop using the unit for one function: drop the binding and recompute the
++   call descriptor, so its calls take the record or light path instead of the
++   AOT entry's path. A function reaches this when its guards keep failing. */
++static void js_aot_unbind(JSFunctionBytecode *b)
++{
++    if (b->aot_index == UINT32_MAX)
++        return;
++    b->aot_fn = NULL;
++    b->regvm_call_ready = b->aot_call_ready;
++    b->regvm_light = b->aot_light;
++    b->regvm_light_fast = b->aot_light_fast;
+ }
+ 
+ /* Bind a function to its generated entry. The table is sorted by digest;
+@@ -60607,6 +60720,31 @@
+     return JS_EXCEPTION;
+ }
+ 
++/* Deoptimise: leave compiled code and let the interpreter finish this
++   activation from `pc`. The activation's frame already holds every value in
++   its register file, so nothing is materialised: the compiled code and the
++   interpreter share the same register array, and a compiled frame is a record
++   frame because a bound function is never record- or light-eligible.
++
++   Recording the resume pc and returning lets the AOT entry in
++   js_regvm_execute start the threaded interpreter at that pc with this same
++   frame, so the rest of the activation runs the way it would have without
++   compiled code. `site` counts the failed guard against its deopt site.
++
++   A compiled function is entered only from js_regvm_execute, so `f` is always
++   the entry record: `f->caller` is NULL and `f->sf` is set. A light frame has
++   `sf == NULL`, so this cannot be reached with one. */
++QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
++                                   uint32_t pc, uint32_t site)
++{
++    (void)fr;
++    assert(f->caller == NULL && f->sf != NULL);
++    if (qjs_aot_note_deopt(ctx, site))
++        js_aot_unbind(f->b);
++    f->deopt_pc = pc;
++    return JS_UNDEFINED;
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* The prototype watchpoint epoch and the per-runtime AOT call-site          */
+ /* bindings. The unit embeds one descriptor per call site; the engine keeps  */
