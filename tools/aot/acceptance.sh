@@ -62,8 +62,8 @@ build_unit() {
   if [ "$tag" = box2d ] && [ -n "$PROFILE" ]; then
     pargs="--profile $PROFILE"; sargs=""
   fi
-  "$O/qjsaot" --out "$O/$tag.c" $sargs $pargs "$js" 2>"$O/$tag.census"
-  "$CLANG" -O0 $BASE -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/$tag.c" -o "$O/obj/$tag.o" || return 1
+  "$O/qjsaot" --out "$O/$tag.c" --layout-header "$O/$tag-layout.h" $sargs $pargs "$js" 2>"$O/$tag.census"
+  "$CLANG" -O0 $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/$tag.c" -o "$O/obj/$tag.o" || return 1
   "$CLANG" -o "$O/bench-$tag" "$O/obj/qjs-bench.o" "$O/obj/$tag.o" \
     "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || return 1
 }
@@ -141,8 +141,9 @@ ASAN="not run (--full to include)"
 if [ "$FULL" = 1 ]; then
   log "test262 (--all, AOT harness unit)"
   # The harness is a glob of files, so build the unit by hand.
-  "$O/qjsaot" --out "$O/t262.c" --all $S/test262/harness/*.js "$BOX2D" 2>"$O/t262.census"
-  "$CLANG" -O0 $BASE -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/t262.c" -o "$O/obj/t262.o"
+  "$O/qjsaot" --out "$O/t262.c" --layout-header "$O/t262-layout.h" --all \
+    $S/test262/harness/*.js "$BOX2D" 2>"$O/t262.census"
+  "$CLANG" -O0 $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/t262.c" -o "$O/obj/t262.o"
   "$CLANG" -O2 $BASE -c $S/run-test262.c -o "$O/obj/run-test262.o"
   "$CLANG" -O2 $BASE -c $S/quickjs-libc.c -o "$O/obj/quickjs-libc.o"
   "$CLANG" -o "$O/aot-test262" "$O/obj/run-test262.o" "$O/obj/quickjs-libc.o" \

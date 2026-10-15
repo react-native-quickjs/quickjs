@@ -1043,12 +1043,16 @@
       "sha256": "7e3f81eec96f8263817dcc33c86d1e40b97413d5d955f6e25cb369735b0872e0"
     },
     {
+      "name": "0266-regvm-aot-layout-header.patch",
+      "sha256": "1600e478eba116de92dcad00fba582eff31c41abd2b1f26ba3ce37cc613de223"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "ddaa1cbac428949a8c6596531148cc58da49c7de21190174f7fa59f30bbb3baf",
+    "quickjs.c": "aa7f8f7cb3d27599d3f2868fcf5cc52f46ccd05e658903c8aebaae8c42bcf9c5",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -1487,6 +1487,14 @@ struct JSMegaEntry {
 #define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
 #endif
 
+/* The layout facts the generated unit is compiled against. The struct and its
+   hash live in quickjs-aot-rt.h so the engine and the unit share one definition;
+   the runtime header is included as soon as any AOT feature is on. */
+#if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
+#include "quickjs-aot-rt.h"
+void js_aot_gen_layout(JSAotGenLayout *out);
+#endif
+
 #if QJS_AOT_PROFILE
 /* AOT profiler, built with `-DQJS_AOT_PROFILE=1`. Records attach lazily to
    their bytecode and are dumped at runtime teardown when QJS_AOT_PROFILE_OUT
@@ -58943,6 +58951,36 @@ static void aot_hash_bytes(uint64_t *h0, uint64_t *h1, const void *p, size_t n)
     *h1 = b;
 }
 
+/* The layout facts the generated unit is compiled against, filled from the
+   engine's own structs. Shared by the generator (which writes them into
+   quickjs-aot-layout.h and exports the hash) and the runtime (which re-derives
+   the hash at bind). */
+void js_aot_gen_layout(JSAotGenLayout *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->sizeof_JSObject = (uint32_t)sizeof(JSObject);
+    out->sizeof_JSShape = (uint32_t)sizeof(JSShape);
+    out->sizeof_JSProperty = (uint32_t)sizeof(JSProperty);
+    out->sizeof_JSString = (uint32_t)sizeof(JSString);
+    out->sizeof_JSValue = (uint32_t)sizeof(JSValue);
+    out->off_object_class_id = (uint32_t)offsetof(JSObject, class_id);
+    out->off_object_shape = (uint32_t)offsetof(JSObject, shape);
+    out->off_object_prop = (uint32_t)offsetof(JSObject, prop);
+    out->off_object_prop_inline_cap_byte =
+        (uint32_t)(offsetof(JSObject, class_id) - 1);
+    out->off_shape_prop_size = (uint32_t)offsetof(JSShape, prop_size);
+    out->off_shape_prop_count = (uint32_t)offsetof(JSShape, prop_count);
+    out->off_shape_proto = (uint32_t)offsetof(JSShape, proto);
+    out->off_shape_hash_table = (uint32_t)offsetof(JSShape, hash_table);
+    out->off_property_u_value = (uint32_t)offsetof(JSProperty, u.value);
+    out->off_shape_property_flags_atom = (uint32_t)sizeof(uint32_t);
+    out->off_string_len_bits = 0;
+    out->off_string_strv = (uint32_t)sizeof(JSString);
+    out->off_jsvalue_tag = (uint32_t)offsetof(JSValue, tag);
+    out->off_jsvalue_u = (uint32_t)offsetof(JSValue, u);
+    out->hash = qjs_aot_layout_hash(out);
+}
+
 static void aot_hash_u32(uint64_t *h0, uint64_t *h1, uint32_t v)
 {
     aot_hash_bytes(h0, h1, &v, 4);
@@ -59945,12 +59983,25 @@ void js_aot_prof_dump(JSRuntime *rt)
 extern const JSAotEntry qjs_aot_table[] __attribute__((weak));
 extern const uint32_t qjs_aot_count __attribute__((weak));
 extern const uint32_t qjs_aot_abi __attribute__((weak));
+extern const uint32_t qjs_aot_layout __attribute__((weak));
 #endif
+
+/* The engine's layout hash, from the same function the generator used, so the
+   two agree field for field. */
+static uint32_t js_aot_unit_layout_hash(void)
+{
+    JSAotGenLayout l;
+
+    js_aot_gen_layout(&l);
+    return l.hash;
+}
 
 static int aot_unit_present(void)
 {
 #if defined(__GNUC__)
-    return (&qjs_aot_count != NULL) && qjs_aot_abi == QJS_AOT_ABI;
+    return (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL) &&
+           qjs_aot_abi == QJS_AOT_ABI &&
+           qjs_aot_layout == js_aot_unit_layout_hash();
 #else
     return 0;
 #endif

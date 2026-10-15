@@ -125,6 +125,9 @@ if(QJS_AOT)
       message(FATAL_ERROR "QJS_AOT_UNIT does not exist: ${QJS_AOT_UNIT}")
     endif()
     target_sources(quickjs PRIVATE "${QJS_AOT_UNIT}")
+    # The unit includes quickjs-aot-layout.h, which qjsaot writes next to it.
+    get_filename_component(QJS_AOT_UNIT_DIR "${QJS_AOT_UNIT}" DIRECTORY)
+    target_include_directories(quickjs PRIVATE "${QJS_AOT_UNIT_DIR}")
   endif()
 endif()
 

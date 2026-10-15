@@ -55,8 +55,8 @@ done
   "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || exit 1
 
 log "generate unit from bundle A"
-"$O/qjsaot" --out "$O/unitA.c" --all "$O/bundleA.js" 2>"$O/unitA.census" || exit 1
-"$CLANG" -O0 $BASE -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/unitA.c" -o "$O/obj/unitA.o" || exit 1
+"$O/qjsaot" --out "$O/unitA.c" --layout-header "$O/unitA-layout.h" --all "$O/bundleA.js" 2>"$O/unitA.census" || exit 1
+"$CLANG" -O2 $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/unitA.c" -o "$O/obj/unitA.o" || exit 1
 "$CLANG" -o "$O/bench-A" "$O/obj/qjs-bench.o" "$O/obj/unitA.o" \
   "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || exit 1
 
