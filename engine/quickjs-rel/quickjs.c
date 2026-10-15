@@ -1129,6 +1129,7 @@ struct JSContext {
        - the prototype of Object.prototype is null (always true as it is immutable)
     */
     uint8_t std_array_prototype : 1;
+    uint32_t regvm_ta_len_epoch;
 
     JSShape *array_shape;   /* initial shape for Array objects */
     JSShape *arguments_shape;  /* shape for arguments objects */
@@ -4114,6 +4115,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
         return NULL;
     }
     ctx->rt = rt;
+    ctx->regvm_ta_len_epoch = UINT32_MAX;
     if (!list_empty(&rt->context_list))
         js_gc_promote_all_code(rt);
     list_add_tail(&ctx->link, &rt->context_list);
@@ -29792,6 +29794,38 @@ static uint8_t *REGVM_CC regvm_t_put_global(REGVM_ARGS)
 
 /* `.length` is the engine's to answer (the array case is exotic, the string
    case a code-unit count). */
+static __attribute__((noinline)) bool regvm_ta_len_validate(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *base = NULL, *cp, *g;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    int cid;
+
+    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
+        return false;
+    for (cid = JS_CLASS_UINT8C_ARRAY; cid <= JS_CLASS_FLOAT64_ARRAY; cid++) {
+        if (JS_VALUE_GET_TAG(ctx->class_proto[cid]) != JS_TAG_OBJECT)
+            return false;
+        cp = JS_VALUE_GET_OBJ(ctx->class_proto[cid]);
+        if (find_own_property(&pr, cp, JS_ATOM_length))
+            return false;
+        if (!cp->shape->proto || (base && cp->shape->proto != base))
+            return false;
+        base = cp->shape->proto;
+    }
+    prs = find_own_property(&pr, base, JS_ATOM_length);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET ||
+        !pr->u.getset.getter)
+        return false;
+    g = pr->u.getset.getter;
+    if (g->class_id != JS_CLASS_C_FUNCTION ||
+        g->u.cfunc.c_function.getter != js_typed_array_get_length)
+        return false;
+    ctx->regvm_ta_len_epoch = rt->ic_watchpoint_epoch;
+    return true;
+}
+
 static uint8_t *REGVM_CC regvm_t_get_length(REGVM_ARGS)
 {
     int d = T_REG(1);
@@ -29809,6 +29843,14 @@ static uint8_t *REGVM_CC regvm_t_get_length(REGVM_ARGS)
                 JSValue lv_ = p_->prop[0].u.value;
                 if (likely(JS_VALUE_GET_TAG(lv_) == JS_TAG_INT))
                     T_SET_NEXT_B(d, lv_, T_SZ_RRS);
+            } else if (p_->class_id >= JS_CLASS_UINT8C_ARRAY &&
+                       p_->class_id <= JS_CLASS_FLOAT64_ARRAY &&
+                       p_->shape->prop_count == 0 &&
+                       p_->shape->proto ==
+                           JS_VALUE_GET_PTR(ctx->class_proto[p_->class_id]) &&
+                       (ctx->regvm_ta_len_epoch == ctx->rt->ic_watchpoint_epoch ||
+                        regvm_ta_len_validate(ctx))) {
+                T_SET_NEXT_B(d, js_int32(p_->u.array.count), T_SZ_RRS);
             }
         }
     }
