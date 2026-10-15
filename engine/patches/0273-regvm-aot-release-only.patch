@@ -1,0 +1,35 @@
+Subject: Refuse to build the AOT runtime with the debugger interface
+
+What this does
+  A release-only guard: `QJS_AOT=1` together with `JS_ENABLE_DEBUGGER=1` is a
+  compile error, and the same combination is a configure error in CMake.
+
+Why we need it
+  When a debugger is attached at parse time the parser emits a trap per
+  statement, and a trap changes the register bytecode and its digest. A unit
+  generated from a release parse would then bind against a different program
+  than the one that runs, so the mismatch must be refused at build time rather
+  than surface as a missing binding.
+
+What it adds
+  `#if QJS_AOT && JS_ENABLE_DEBUGGER` -> `#error` in the engine.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 2370f26..d45df0f 100644
+@@ -57812,6 +57812,13 @@
+ #if QJS_AOT && !QJS_REGVM
+ #error "QJS_AOT needs QJS_REGVM"
+ #endif
++/* The parser emits a debugger trap per statement when a debugger is attached
++   at parse time, and a trap changes the register bytecode and its digest, so a
++   unit built with the interface on binds against a different program than the
++   one that runs. AOT is release-only. */
++#if QJS_AOT && JS_ENABLE_DEBUGGER
++#error "QJS_AOT cannot be combined with JS_ENABLE_DEBUGGER"
++#endif
+ #if QJS_AOT_GEN && !QJS_REGVM
+ #error "QJS_AOT_GEN needs QJS_REGVM"
+ #endif

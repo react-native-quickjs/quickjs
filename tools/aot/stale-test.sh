@@ -46,7 +46,7 @@ fi
 log "build generator + engine + plain interpreter"
 "$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -o "$O/qjsaot" \
   tools/aot/qjsaot.c $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c -lm || exit 1
-"$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT=1 -c $S/quickjs.c -o "$O/obj/quickjs.o" || exit 1
+"$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT=1 -DJS_ENABLE_DEBUGGER=0 -c $S/quickjs.c -o "$O/obj/quickjs.o" || exit 1
 for f in libregexp libunicode dtoa; do
   "$CLANG" -O2 $BASE -c $S/$f.c -o "$O/obj/$f.o" || exit 1
 done

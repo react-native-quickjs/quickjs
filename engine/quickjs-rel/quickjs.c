@@ -57820,6 +57820,13 @@ static int regvm_homes_mode(void)
 #if QJS_AOT && !QJS_REGVM
 #error "QJS_AOT needs QJS_REGVM"
 #endif
+/* The parser emits a debugger trap per statement when a debugger is attached
+   at parse time, and a trap changes the register bytecode and its digest, so a
+   unit built with the interface on binds against a different program than the
+   one that runs. AOT is release-only. */
+#if QJS_AOT && JS_ENABLE_DEBUGGER
+#error "QJS_AOT cannot be combined with JS_ENABLE_DEBUGGER"
+#endif
 #if QJS_AOT_GEN && !QJS_REGVM
 #error "QJS_AOT_GEN needs QJS_REGVM"
 #endif
