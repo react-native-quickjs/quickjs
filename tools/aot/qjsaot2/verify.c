@@ -1,0 +1,202 @@
+/*
+ * Copyright (c) Ammar Ahmed.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/*
+ * The IR verifier: the checks the design puts in the compiler because a
+ * speculative compiler that gets them wrong corrupts quietly.
+ *
+ *   - SSA dominance: every use is dominated by its definition (a value used
+ *     in a block is either defined there before the use, or is a parameter of
+ *     that block);
+ *   - block parameters match predecessors: every edge passes exactly one
+ *     value per successor parameter, for the same register, defined in the
+ *     edge's source block;
+ *   - effects: a pure instruction is not a fallback (a fallback may do
+ *     anything, so it must declare Heap/Control);
+ *   - representations: every value's representation is one the IR knows.
+ *
+ * The frame-state check lands with frame states (2.10).
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "ir.h"
+
+#define Q2_VERIFY_FAIL(...)                     \
+  do {                                          \
+    snprintf(v.msg, v.msg_len, __VA_ARGS__);    \
+    free(v.dom);                                \
+    return -1;                                  \
+  } while (0)
+
+typedef struct Q2Verify {
+  char *msg;
+  size_t msg_len;
+  const Q2Func *f;
+  uint64_t *dom; /* nblocks * bwords */
+} Q2Verify;
+
+static int q2_vbits_words(int nblocks) { return (nblocks + 63) / 64; }
+
+/* Reverse postorder over the block order (blocks are ordered by pc, which is
+   already a topological order for everything except back edges). */
+static int q2_dominators(Q2Verify *v) {
+  const Q2Func *f = v->f;
+  int nb = f->nblocks, words = q2_vbits_words(nb);
+  uint64_t *tmp = malloc(sizeof(uint64_t) * (size_t)words);
+  int i, changed = 1, pass = 0;
+
+  if (!tmp) return -1;
+  v->dom = malloc(sizeof(uint64_t) * (size_t)words * (size_t)nb);
+  if (!v->dom) {
+    free(tmp);
+    return -1;
+  }
+  memset(v->dom, 0xff, (size_t)words * (size_t)nb * 8);
+  memset(v->dom, 0, (size_t)words * 8); /* block 0 dominates only itself */
+  v->dom[0] |= 1ull;
+  while (changed && pass++ < nb + 4) {
+    changed = 0;
+    for (i = 1; i < nb; i++) {
+      uint64_t *d = v->dom + (size_t)i * words;
+      int b, first = 1, w;
+      for (w = 0; w < words; w++) tmp[w] = ~0ull;
+      for (b = 0; b < nb; b++) {
+        int s, has_edge = 0;
+        if (b == i) continue;
+        for (s = 0; s < f->blocks[b].nsucc; s++)
+          if (f->blocks[b].succ_block[s] == i) has_edge = 1;
+        if (!has_edge) continue;
+        if (first) {
+          memcpy(tmp, v->dom + (size_t)b * words, (size_t)words * 8);
+          first = 0;
+        } else {
+          for (w = 0; w < words; w++)
+            tmp[w] &= v->dom[(size_t)b * words + w];
+        }
+      }
+      if (first) { /* unreachable block: only itself */
+        for (w = 0; w < words; w++) tmp[w] = 0;
+      }
+      tmp[i >> 6] |= 1ull << (i & 63);
+      {
+        int same = 1;
+        for (w = 0; w < words; w++)
+          if (tmp[w] != d[w]) same = 0;
+        if (!same) {
+          memcpy(d, tmp, (size_t)words * 8);
+          changed = 1;
+        }
+      }
+    }
+  }
+  free(tmp);
+  return 0;
+}
+
+static int q2_block_dominates(const Q2Verify *v, int dom_block, int of_block) {
+  int words = q2_vbits_words(v->f->nblocks);
+  return (int)((v->dom[(size_t)of_block * words + (dom_block >> 6)] >>
+                (dom_block & 63)) &
+               1);
+}
+
+/* The value a block's parameter index stands for, or -1. */
+static int q2_param_index(const Q2Block *b, Q2ValueId val) {
+  int i;
+  for (i = 0; i < b->nparams; i++)
+    if (b->param_val[i] == val) return i;
+  return -1;
+}
+
+int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
+  Q2Verify v;
+  int b, i, k;
+
+  memset(&v, 0, sizeof(v));
+  v.msg = msg;
+  v.msg_len = msg_len;
+  v.f = f;
+  msg[0] = 0;
+
+  if (!f->ok) Q2_VERIFY_FAIL("build failed: %s", f->why ? f->why : "?");
+  if (q2_dominators(&v)) {
+    v.dom = NULL;
+    snprintf(msg, msg_len, "out of memory");
+    return -1;
+  }
+
+  for (b = 0; b < f->nblocks; b++) {
+    const Q2Block *blk = &f->blocks[b];
+    for (i = 0; i < blk->ninsns; i++) {
+      const Q2Insn *in = &f->insns[blk->first_insn + i];
+      const Q2RopInfo *ri = q2_rop_info(in->rop);
+
+      if (in->op == Q2_OP_FALLBACK) {
+        if (ri->reads == 0 && ri->writes == 0)
+          Q2_VERIFY_FAIL(
+              "block %d pc %d: a pure instruction is a fallback", b, in->pc);
+      } else if (in->op != ri->op) {
+        Q2_VERIFY_FAIL(
+            "block %d pc %d: operation %s does not match the table's %s", b,
+            in->pc, q2_op_name(in->op), q2_op_name(ri->op));
+      }
+
+      for (k = 0; k < in->ndef; k++) {
+        Q2ValueId val = in->def[k];
+        if (val >= (Q2ValueId)f->nvalues)
+          Q2_VERIFY_FAIL("block %d pc %d: definition out of range", b, in->pc);
+        if (f->values[val].block != b || f->values[val].insn != blk->first_insn + i)
+          Q2_VERIFY_FAIL("block %d pc %d: definition not owned here", b, in->pc);
+        if (f->values[val].rep >= Q2_R_COUNT)
+          Q2_VERIFY_FAIL("block %d pc %d: bad representation", b, in->pc);
+      }
+      for (k = 0; k < in->nuse; k++) {
+        Q2ValueId val = in->use[k];
+        const Q2Value *pv;
+        if (val >= (Q2ValueId)f->nvalues)
+          Q2_VERIFY_FAIL("block %d pc %d: use out of range", b, in->pc);
+        pv = &f->values[val];
+        /* A use is dominated by its definition: either a parameter of this
+           block, or a definition in a block that dominates this one. */
+        if (pv->block == b && q2_param_index(blk, val) >= 0) continue;
+        if (!q2_block_dominates(&v, pv->block, b))
+          Q2_VERIFY_FAIL(
+              "block %d pc %d: use of a value from block %d, which does not "
+              "dominate",
+              b, in->pc, pv->block);
+      }
+    }
+    /* edges */
+    for (i = 0; i < blk->nsucc; i++) {
+      int sb = blk->succ_block[i];
+      const Q2Block *s;
+      if (sb >= f->nblocks) continue; /* the exit */
+      s = &f->blocks[sb];
+      if (blk->nedge_args[i] != s->nparams)
+        Q2_VERIFY_FAIL(
+            "edge %d->%d: %d arguments for %d parameters", b, sb,
+            blk->nedge_args[i], s->nparams);
+      for (k = 0; k < s->nparams; k++) {
+        Q2ValueId val = blk->edge_arg[i][k];
+        if (val >= (Q2ValueId)f->nvalues)
+          Q2_VERIFY_FAIL("edge %d->%d: argument out of range", b, sb);
+        if (f->values[val].reg != s->param_reg[k])
+          Q2_VERIFY_FAIL(
+              "edge %d->%d: argument %d is register %d, parameter wants %d", b,
+              sb, k, f->values[val].reg, s->param_reg[k]);
+        if (f->values[val].block != b && q2_param_index(blk, val) < 0)
+          Q2_VERIFY_FAIL(
+              "edge %d->%d: argument %d is not defined in the source block", b,
+              sb, k);
+      }
+    }
+  }
+  free(v.dom);
+  return 0;
+}

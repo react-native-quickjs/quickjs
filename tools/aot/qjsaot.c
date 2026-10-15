@@ -2992,6 +2992,8 @@ int main(int argc, char **argv) {
   long min_ops = 1000;
   int all = 0;
   int i, fails = 0;
+  JSValue *keep = NULL;
+  int nkeep = 0;
   FILE *f;
   long long total_insns = 0;
   int emitted = 0;
@@ -3054,6 +3056,19 @@ int main(int argc, char **argv) {
   rt = JS_NewRuntime();
   ctx = JS_NewContext(rt);
 
+  /* The compiled scripts are kept alive until after js_aot_gen_collect: the
+     collector enumerates the runtime's function list, and a collection in the
+     middle of a multi-file build would drop the earlier inputs' functions
+     from the unit. */
+  keep = malloc(sizeof(*keep) * (size_t)(ninputs > 0 ? ninputs : 1));
+  nkeep = 0;
+  if (!keep) {
+    free(inputs);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 2;
+  }
+
   for (i = 0; i < ninputs; i++) {
     long len = 0;
     char *src = read_file(inputs[i], &len);
@@ -3080,12 +3095,14 @@ int main(int argc, char **argv) {
       JS_FreeValue(ctx, e);
       fails++;
     }
-    JS_FreeValue(ctx, v);
+    keep[nkeep++] = v;
     free(src);
   }
   free(inputs);
 
   nfuncs = js_aot_gen_collect(rt, &funcs);
+  for (i = 0; i < nkeep; i++) JS_FreeValue(ctx, keep[i]);
+  free(keep);
   qsort(funcs, (size_t)nfuncs, sizeof(*funcs), digest_cmp);
 
   if (g_dump_ir) {

@@ -35,7 +35,11 @@ GOLDEN=$K2/golden
 CC=${CC:-clang}
 WORK=${WORK:-/tmp/qjs-check}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
-if [ -f tools/aot/qjsaot2/main.c ]; then GEN=${GEN:-qjsaot2}; else GEN=${GEN:-qjsaot}; fi
+# qjsaot2 is preferred once it can emit a unit; while only the IR stage exists
+# it is still used for --verify-ir (GEN_IRBIN) and qjsaot builds the units.
+if [ -z "${GEN:-}" ]; then
+  if [ -f tools/aot/qjsaot2/main.c ]; then GEN=qjsaot2; else GEN=qjsaot; fi
+fi
 BOX2D=${BOX2D:-.local/box2d-gap/check.js}
 [ -f "$BOX2D" ] || BOX2D=""
 BASE="-g -std=gnu11 -D_GNU_SOURCE -I$S"
@@ -57,14 +61,18 @@ die()  { printf 'check: %s\n' "$*" >&2; exit 2; }
 hash_of() { sha256sum "$@" 2>/dev/null | sha256sum | cut -c1-16; }
 
 ENG_HASH=$(hash_of $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c $S/*.h)
-if [ "$GEN" = qjsaot2 ]; then
-  GEN_SRC=(tools/aot/qjsaot2/*.c tools/aot/qjsaot2/*.h)
-else
-  GEN_SRC=(tools/aot/qjsaot.c)
-fi
-GEN_HASH=$(hash_of "${GEN_SRC[@]}" tools/benchmark/qjs-bench.c "$S/quickjs.h")
+select_gen() {
+  if [ "$GEN" = qjsaot2 ]; then
+    GEN_SRC=(tools/aot/qjsaot2/*.c)
+  else
+    GEN_SRC=(tools/aot/qjsaot.c)
+  fi
+  GEN_HASH=$(hash_of "${GEN_SRC[@]}" tools/benchmark/qjs-bench.c "$S/quickjs.h")
+  BIN="$WORK/gen/$GEN_HASH/$GEN"
+  GEN_BASE="$WORK/gen/$GEN_HASH"
+}
+select_gen
 UNIT_ARGS="--all"
-BIN="$WORK/gen/$GEN_HASH/$GEN"
 
 # ---- builds (cached) -------------------------------------------------------
 build_gen() {
@@ -154,11 +162,37 @@ run_kernels() { # [extra flags...]
   done
 }
 
+# The IR build and verifier over whole inputs: cheap (box2d is 0.1 s) and the
+# gate the graph build has to pass before anything is emitted from it.
+run_ir_verify() {
+  local res
+  [ -n "${GEN_IRBIN:-}" ] || return 0
+  if ! "${GEN_IRBIN:-$BIN}" --verify-ir "$@" > "$WORK/out/verify-ir.log" 2>&1; then
+    fail=$((fail + 1)); log "FAIL --verify-ir $*"
+    grep -v '^qjsaot2: [0-9/]* functions' "$WORK/out/verify-ir.log" | head -5
+    return 1
+  fi
+  res=$(grep -o '[0-9]*/[0-9]* functions verified.*' "$WORK/out/verify-ir.log" | tail -1)
+  log "ok   ir $res"
+}
+
 t0() {
   local start end
   start=$(date +%s)
   build_gen || die "cannot build $GEN"
   build_rt  || die "cannot build the runtime engine"
+  GEN_IRBIN=""
+  if "$BIN" --verify-ir /dev/null > /dev/null 2>&1; then
+    GEN_IRBIN="$BIN"
+  fi
+  if [ "$GEN" = qjsaot2 ] &&
+     ! "$BIN" --out "$WORK/units/probe.c" --layout-header "$WORK/units/probe-layout.h" \
+          "$K2/01-arith.js" > /dev/null 2>&1; then
+    warn "qjsaot2 has no unit emitter yet: units from qjsaot, IR from qjsaot2"
+    GEN=qjsaot
+    select_gen
+    build_gen || die "cannot build $GEN"
+  fi
 
   # Golden register-program dumps: the generator's reading of the lowering is
   # part of what a review has to see, so it is diffed, not eyeballed.
@@ -182,6 +216,7 @@ t0() {
   fi
 
   run_kernels
+  run_ir_verify "$K2"/*.js
   end=$(date +%s)
   t0_time=$((end - start))
   log "T0: ${t0_time}s (gate 15s)"
@@ -301,6 +336,9 @@ t1() {
   # The corpora and the diff-suite are independent and each runs for a minute
   # or more of wall clock, so they overlap; failures are collected by exit
   # status because each runs in its own subshell.
+  run_ir_verify "$K2"/*.js tools/benchmark/kernels/*.js \
+    tests/differential/corpus/*.js "$S"/test262/harness/*.js
+  [ -n "$BOX2D" ] && run_ir_verify "$BOX2D"
   run_corpora & local p1=$!
   run_diff_suite & local p2=$!
   run_box2d
