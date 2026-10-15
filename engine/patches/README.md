@@ -286,6 +286,7 @@ what we changed and why without opening a single `.patch` file.
 | `0274` | Builds a constant array literal from a template in one instruction | A literal such as `[0, 1, ..., 9]` took one load per element plus `array_from` (10.4% of Octane splay's dispatches) | `array_const` copies a constant-pool template; the post-allocation fusions run only where the lowering saw a candidate | Yes (adds a register opcode; covered by 9999). |
 | `0275` | Serves polymorphic property-read hits before the slow handler | Hits on the secondary ways of a read site went through the noinline slow handler, which duplicated and parked the value and rewrote the opcode (about 10% of Octane deltablue) | A probe handler serves them borrowed and sends misses to a slow copy that skips the probed ways | No. |
 | `0276` | Pops small arena blocks inline in `js_malloc` and warms the next one | Every allocation paid an out-of-line arena call and a header re-read, and the popped block was usually cold (15-30% of L1 write misses on allocation-heavy Octane rows) | An always-inline pop shared with `js_arena_malloc`, size-class accounting, and a write prefetch of the next free block | No. |
+| `0277` | Reads two arguments into registers with one instruction | Every function's prologue took one `get_arg` dispatch per promoted parameter (`get_arg` is 8-12% of dispatches on Octane earleyboyer, raytrace and splay) | `get_arg2` copies two argument slots; adjacent `get_arg`s are paired after allocation | Yes (adds a register opcode; covered by 9999). |
 
 
 ## Reading the patches

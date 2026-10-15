@@ -25671,6 +25671,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
 #define T_SZ_UR     5    /* "ur"    */
 #define T_SZ_RUAS   11   /* "ruas"  */
 #define T_SZ_RC     7    /* "rc"    */
+#define T_SZ_RURU   9
 #define T_SZ_RA     7    /* "ra"    */
 
 #define T_REG(o)  ((int)regvm_ld_u16(ip + (o)))
@@ -26122,6 +26123,7 @@ static uint8_t *REGVM_CC regvm_t_mul_add(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_post_inc(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_post_dec(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_array_const(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_get_arg2(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_mul_sub(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_mul(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_sub_mul(REGVM_ARGS);
@@ -26359,6 +26361,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(apply_arguments, regvm_t_apply_arguments) \
     X(array_from, regvm_t_array_from) \
     X(array_const, regvm_t_array_const) \
+    X(get_arg2, regvm_t_get_arg2) \
     X(binary_cpool, regvm_t_binary_cpool) \
     X(branch_cmp_loc_loc, regvm_t_cold) \
     /* dedicated handler */ \
@@ -28536,6 +28539,27 @@ static uint8_t *REGVM_CC regvm_t_get_arg(REGVM_ARGS)
     int d = T_REG(1);
     int slot = T_REG(3);
     T_SET_NEXT_B(d,f->arg_buf[slot], T_SZ_RU);
+}
+
+static inline void regvm_store_borrowed(JSRuntime *rt, JSValue *slot, JSValue v)
+{
+#if QJS_DRC
+    (void)rt;
+    *slot = v;
+#else
+    regvm_store_intermediate(rt, slot, js_dup(v));
+#endif
+}
+
+static uint8_t *REGVM_CC regvm_t_get_arg2(REGVM_ARGS)
+{
+    int d1 = T_REG(1);
+    int s1 = T_REG(3);
+    int d2 = T_REG(5);
+    int s2 = T_REG(7);
+
+    regvm_store_borrowed(ctx->rt, &FR(d1), f->arg_buf[s1]);
+    T_SET_NEXT_B(d2, f->arg_buf[s2], T_SZ_RURU);
 }
 
 static uint8_t *REGVM_CC regvm_t_get_var_ref(REGVM_ARGS)
@@ -31607,6 +31631,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             [ROP_put_local_s3] = REGVM_MONO_ENTRY(L_ROP_put_local_s3),
 
             [ROP_get_arg] = REGVM_MONO_ENTRY(L_ROP_get_arg),
+            [ROP_get_arg2] = REGVM_MONO_ENTRY(L_ROP_get_arg2),
             [ROP_put_arg] = REGVM_MONO_ENTRY(L_ROP_put_arg),
             [ROP_put_arg_xfer] = REGVM_MONO_ENTRY(L_ROP_put_arg_xfer),
             [ROP_get_var_ref] = REGVM_MONO_ENTRY(L_ROP_get_var_ref),
@@ -32304,7 +32329,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 { int slot = op - ROP_put_local_s0; int s = RD_REG();
                   set_value(ctx, &var_buf[slot], js_dup(regs[s])); REGVM_NEXT(); }
             L_ROP_get_arg:
-                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,arg_buf[slot]); REGVM_NEXT(); }            L_ROP_put_arg_xfer:
+                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,arg_buf[slot]); REGVM_NEXT(); }
+            L_ROP_get_arg2:
+                { int d1 = RD_REG(); int s1 = RD_U16(); int d2 = RD_REG(); int s2 = RD_U16();
+                  SET_REG_B(d1, arg_buf[s1]); SET_REG_B(d2, arg_buf[s2]); REGVM_NEXT(); }            L_ROP_put_arg_xfer:
                 { int slot = RD_U16(); int s = RD_REG();
 #if QJS_DRC
                   regvm_put_arg(ctx, arg_buf, arg_owned, slot, regs[s]);
@@ -58937,6 +58965,7 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
     [ROP_put_local_s2] = "r",
     [ROP_put_local_s3] = "r",
     [ROP_get_arg] = "ru",
+    [ROP_get_arg2] = "ruru",
     [ROP_put_arg] = "ur",
     [ROP_put_arg_xfer] = "ur",
     [ROP_get_var_ref] = "ru",
@@ -64741,6 +64770,25 @@ static void regvm_fuse_arith_pair(JSContext *ctx, JSFunctionDef *fd,
             regvm_try_array_const(ctx, fd, ir, i, drop, is_target, &is_bpc,
                                   n_pcs, bstart, n_blocks);
             continue;
+        }
+        if (a->rop == ROP_get_arg && b->rop == ROP_get_arg &&
+            a->n_ops == 2 && b->n_ops == 2 && !drop[i + 1] && !is_target[i + 1]) {
+            int bh = 0;
+            if (b->src_pc != a->src_pc)
+                for (k = 0; k < n_blocks; k++)
+                    if (bstart[k] == b->src_pc) {
+                        bh = 1;
+                        break;
+                    }
+            if (!bh) {
+                a->rop = ROP_get_arg2;
+                a->n_ops = 4;
+                a->ops[2] = b->ops[0];
+                a->ops[3] = b->ops[1];
+                drop[i + 1] = 1;
+                i++;
+                continue;
+            }
         }
         if ((ir->fuse_hint & 1) && a->rop == ROP_unary && i + 2 < n &&
             regvm_try_post_inc(ctx, ir, i, drop, is_target, bstart, n_blocks,
@@ -75221,6 +75269,7 @@ static bool regvm_slot_operands_ok(const JSFunctionBytecode *b, int op,
     case ROP_get_local_field:
         slot = ops[1]; bound = b->var_count; break;
     case ROP_get_arg_field:
+    case ROP_get_arg2:
         slot = ops[1]; bound = b->arg_count; break;
     case ROP_put_local_xfer:
     case ROP_local_rmw_imm:
@@ -75243,6 +75292,8 @@ static bool regvm_slot_operands_ok(const JSFunctionBytecode *b, int op,
         break;
     }
     if (slot >= 0 && (uint32_t)slot >= bound)
+        return false;
+    if (op == ROP_get_arg2 && (uint32_t)ops[3] >= b->arg_count)
         return false;
     /* The forms with a second local operand. */
     if ((op == ROP_binary_loc_reg || op == ROP_binary_loc_loc) &&

@@ -601,6 +601,8 @@ typedef enum JSRegOpcode {
 
     ROP_array_const,
 
+    ROP_get_arg2,
+
     ROP_COUNT
 } JSRegOpcode;
 

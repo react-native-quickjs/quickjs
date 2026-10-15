@@ -1087,21 +1087,25 @@
       "sha256": "67d3345d1d35f31dd00aefab97a1eb2ac9e035641832999062539e73d5811239"
     },
     {
+      "name": "0277-regvm-get-arg-pair.patch",
+      "sha256": "7d1bd0052350a36704d831bdc4e98f9c8b702fa1d47d3cb02f41cffee765b5a8"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "fcaa5f40361ca3858d8636d338f53e99d18b833430dec94cb55817c393e542cf"
+      "sha256": "ccd8bc3cad66455982d9dddd1e5a615cb53ceaa9047b64ace9f37024a77d0306"
     }
   ],
   "files": {
-    "quickjs.c": "fcd965a79e8d346a00d40bbada927388f9a6a4f5cc06d840f86180abe8265a18",
+    "quickjs.c": "b66961914c5be4226a158e41394f63614e2604e609ee4dd6eac3c145154e80d2",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
     "builtin-array-fromasync.regvm.h": "481b1fcc19c8a439f9c8ace3b309e83fe3c01ecdb3e9a0e833f10b5b81027874",
     "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
-    "builtin-iterator-zip-keyed.regvm.h": "d6222df2a984a23888e669612b072911562def74b5c29e5dee61903b6ebec593",
+    "builtin-iterator-zip-keyed.regvm.h": "23d12bec48360b3113f2011ce3dcf65dd9fe22e323643fd33193b7405916ee2a",
     "builtin-iterator-zip.h": "1133567b87c8af0d6c3c680ec1a8fcfcba65acc975885477c2c688ac55f149bc",
-    "builtin-iterator-zip.regvm.h": "aabc0848702d35892e9473d7db0af235d5765633cd3c256cbf577464579459d7",
+    "builtin-iterator-zip.regvm.h": "70a328de159c17661c0d9c07b591adfeee2a40fa4e9ba52550c04a8d5ec4213e",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
@@ -1113,7 +1117,7 @@
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
-    "quickjs-regvm.h": "dcf133337c23f07d98d9ca91a864647444663af4ba0cc24a9a746d9ab3433f89",
+    "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
     "quickjs.h": "fd585b9de76f67f56a26abb5782790c2b2f3626f9f17cb77293c4ea173fa98ad",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
