@@ -2818,6 +2818,40 @@ static no_inline void *arena_calloc_large(JSRuntime *rt, size_t size)
     return b->user_data;
 }
 
+static inline __attribute__((always_inline)) void *
+js_arena_pop(JSRuntime *rt, int block_size_idx, unsigned int block_size)
+{
+    unsigned int block_idx, next;
+    JSMallocBlockHeader *b;
+    JSArena *ar;
+    struct list_head *el, *head;
+
+    head = &rt->arena_state.free_arena_list[block_size_idx];
+    el = head->next;
+    if (unlikely(el == head)) {
+        ar = arena_new(rt, block_size_idx);
+        if (!ar)
+            return NULL;
+    } else {
+        ar = list_entry(el, JSArena, free_link);
+    }
+    block_idx = ar->first_free_block;
+    b = arena_get_block(ar, block_idx, block_size);
+    next = b->u.free_next;
+    ar->first_free_block = next;
+    if (likely(next != JS_ARENA_FREE_NIL))
+        __builtin_prefetch(arena_get_block(ar, next, block_size), 1, 3);
+    b->u.block_idx = block_idx;
+    b->gc_notrace = 0;
+    b->in_zct = 0;
+    if (unlikely(ar->n_used_blocks == 0))
+        rt->arena_state.n_empty--;
+    ar->n_used_blocks++;
+    if (unlikely(ar->n_used_blocks == ar->n_blocks))
+        list_del(&ar->free_link);
+    return b->user_data;
+}
+
 static void *js_arena_malloc(JSRuntime *rt, size_t size)
 {
     size_t total_size;
@@ -2827,35 +2861,8 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
     total_size = ((size + JS_ARENA_ALIGN - 1) & ~(size_t)(JS_ARENA_ALIGN - 1)) +
         sizeof(JSMallocBlockHeader);
     if (!JS_ARENA_LARGE_BLOCKS_ONLY && total_size <= JS_ARENA_MAX_SMALL_SIZE) {
-        int block_size_idx;
-        unsigned int block_idx, block_size;
-        JSMallocBlockHeader *b;
-        JSArena *ar;
-        struct list_head *el, *head;
-
-        block_size_idx = arena_get_size_index(total_size);
-        block_size = arena_block_sizes[block_size_idx];
-        head = &rt->arena_state.free_arena_list[block_size_idx];
-        el = head->next;
-        if (unlikely(el == head)) {
-            ar = arena_new(rt, block_size_idx);
-            if (!ar)
-                return NULL;
-        } else {
-            ar = list_entry(el, JSArena, free_link);
-        }
-        block_idx = ar->first_free_block;
-        b = arena_get_block(ar, block_idx, block_size);
-        ar->first_free_block = b->u.free_next;
-        b->u.block_idx = block_idx;
-        b->gc_notrace = 0;
-    b->in_zct = 0;
-        if (unlikely(ar->n_used_blocks == 0))
-            rt->arena_state.n_empty--;
-        ar->n_used_blocks++;
-        if (unlikely(ar->n_used_blocks == ar->n_blocks))
-            list_del(&ar->free_link);
-        return b->user_data;
+        int block_size_idx = arena_get_size_index(total_size);
+        return js_arena_pop(rt, block_size_idx, arena_block_sizes[block_size_idx]);
     } else {
         return arena_malloc_large(rt, size);
     }
@@ -3087,6 +3094,24 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
     if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
         return NULL;
+
+    if (!JS_ARENA_LARGE_BLOCKS_ONLY &&
+        size <= JS_ARENA_MAX_SMALL_SIZE - sizeof(JSMallocBlockHeader)) {
+        size_t total_size = ((size + JS_ARENA_ALIGN - 1) &
+                             ~(size_t)(JS_ARENA_ALIGN - 1)) +
+                            sizeof(JSMallocBlockHeader);
+        int block_size_idx = arena_get_size_index(total_size);
+        unsigned int block_size = arena_block_sizes[block_size_idx];
+
+        ptr = js_arena_pop(rt, block_size_idx, block_size);
+        if (!ptr)
+            return NULL;
+        s->malloc_count++;
+        s->malloc_size += block_size - sizeof(JSMallocBlockHeader) +
+                          MALLOC_OVERHEAD;
+        js_drc_malloc_pressure(rt);
+        return ptr;
+    }
 
     ptr = js_arena_malloc(rt, size);
     if (!ptr)
