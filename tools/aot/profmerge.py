@@ -31,7 +31,8 @@ FORMAT = None
 
 
 class Func:
-    __slots__ = ("digest", "name", "file", "line", "ops", "entries", "us", "len",
+    __slots__ = ("digest", "name", "file", "line", "ops", "entries", "us",
+                 "inst_cap", "inst_seen", "len",
                  "loops", "regs", "pcs", "ins", "uncovered", "branches",
                  "tpc", "sites", "calls")
 
@@ -43,6 +44,8 @@ class Func:
         self.ops = 0
         self.entries = 0
         self.us = 0              # sampled self time, microseconds
+        self.inst_cap = 0        # learned instance inline capacity (constructor)
+        self.inst_seen = 0       # highest instance property count seen
         self.len = 0
         self.loops = {}          # pc -> iters
         self.regs = {}           # reg -> set(types)
@@ -156,6 +159,8 @@ def parse_file(path, verbose=False):
                 fr.ops += int(kv.get("ops", 0))
                 fr.entries += int(kv.get("entries", 0))
                 fr.us += int(kv.get("us", 0))
+                fr.inst_cap = max(fr.inst_cap, int(kv.get("inst_cap", 0)))
+                fr.inst_seen = max(fr.inst_seen, int(kv.get("inst_seen", 0)))
                 fr.len = int(kv.get("len", fr.len))
             elif kind == "L":
                 kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
@@ -178,10 +183,12 @@ def parse_file(path, verbose=False):
                 if ent is None:
                     ent = fr.pcs[pc] = {"types": set(), "min": None, "max": None,
                                         "frac": 0, "negzero": 0, "elem": 0,
-                                        "src": kv.get("src", "?:?")}
+                                        "props": 0, "src": kv.get("src", "?:?")}
                 ent["types"].update(kv.get("types", "").split("|"))
                 if "elem" in kv:
                     ent["elem"] |= int(kv["elem"])
+                if "props" in kv:
+                    ent["props"] = max(ent["props"], int(kv["props"]))
                 if "num" in kv:
                     lo, _, hi = kv["num"].partition("..")
                     lo, hi = float(lo), float(hi)
@@ -291,6 +298,8 @@ def merge(into, fr):
     g.ops += fr.ops
     g.entries += fr.entries
     g.us += fr.us
+    g.inst_cap = max(g.inst_cap, fr.inst_cap)
+    g.inst_seen = max(g.inst_seen, fr.inst_seen)
     g.len = fr.len or g.len
     if fr.name not in ("?", "<null>") and g.name in ("?", "<null>"):
         g.name = fr.name
@@ -312,7 +321,7 @@ def merge(into, fr):
             g.pcs[pc] = {"types": set(e["types"]), "min": e["min"],
                          "max": e["max"], "frac": e["frac"],
                          "negzero": e["negzero"], "elem": e["elem"],
-                         "src": e["src"]}
+                         "props": e["props"], "src": e["src"]}
             continue
         ge["types"].update(e["types"])
         if e["min"] is not None:
@@ -321,6 +330,7 @@ def merge(into, fr):
         ge["frac"] |= e["frac"]
         ge["negzero"] |= e["negzero"]
         ge["elem"] |= e["elem"]
+        ge["props"] = max(ge["props"], e["props"])
     g.ins = max(g.ins, fr.ins)
     if not g.uncovered:
         g.uncovered = list(fr.uncovered)
@@ -373,8 +383,10 @@ def write(out, funcs):
                  FORMAT if FORMAT is not None else "?"))
     for fr in funcs.values():
         name = fr.name if fr.name else "<null>"
-        out.write("F %s name=%s file=%s:%d ops=%d entries=%d len=%d us=%d\n" % (
-            fr.digest, name, fr.file, fr.line, fr.ops, fr.entries, fr.len, fr.us))
+        out.write("F %s name=%s file=%s:%d ops=%d entries=%d len=%d us=%d "
+                  "inst_cap=%d inst_seen=%d\n" % (
+            fr.digest, name, fr.file, fr.line, fr.ops, fr.entries, fr.len, fr.us,
+            fr.inst_cap, fr.inst_seen))
         for pc in sorted(fr.loops):
             iters, src = fr.loops[pc]
             out.write("L %s pc=%d iters=%d src=%s\n" % (fr.digest, pc, iters, src))
@@ -393,6 +405,9 @@ def write(out, funcs):
             elif e["elem"]:
                 out.write("P %s pc=%d types=%s elem=%d src=%s\n"
                           % (fr.digest, pc, ts, e["elem"], e["src"]))
+            elif e["props"]:
+                out.write("P %s pc=%d types=%s props=%d src=%s\n"
+                          % (fr.digest, pc, ts, e["props"], e["src"]))
             else:
                 out.write("P %s pc=%d types=%s src=%s\n"
                           % (fr.digest, pc, ts, e["src"]))

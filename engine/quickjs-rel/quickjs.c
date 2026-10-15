@@ -1525,6 +1525,7 @@ typedef struct JSAotProfPc {
     uint8_t frac;          /* a non-integral number was seen */
     uint8_t negzero;       /* -0 was seen */
     uint8_t elem_kinds;    /* AOT_ELEM_* stored/loaded at an element pc */
+    uint16_t alloc_props;  /* final property count at an allocation pc */
     double num_min;
     double num_max;
 } JSAotProfPc;
@@ -1728,6 +1729,7 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape);
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
 static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey);
+static void js_aot_prof_alloc(JSFunctionBytecode *b, uint32_t props);
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
 #if QJS_REGVM_THREAD
@@ -1757,6 +1759,8 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
 #define AOT_PROF_ELEM(b_, v_, h_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_elem((b_), (v_), (h_)); } while (0)
+#define AOT_PROF_ALLOC(b_, n_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_alloc((b_), (n_)); } while (0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
         do { if (unlikely(AOT_PROF_ON(b_))) \
                  js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_)); } while (0)
@@ -1787,6 +1791,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
 #define AOT_PROF_TAKEN(f_, ip_)     ((void)0)
 #define AOT_PROF_ELEM(b_, v_, h_)   ((void)0)
+#define AOT_PROF_ALLOC(b_, n_)      ((void)0)
 #endif
 #endif
 
@@ -29490,6 +29495,7 @@ static uint8_t *REGVM_CC regvm_t_object_template(REGVM_ARGS)
     val = js_new_object_from_template(ctx, &f->b->objlit_tab[index]);
     if (JS_IsException(val))
         T_FAIL();
+    AOT_PROF_ALLOC(f->b, f->b->objlit_tab[index].prop_count);
     T_SET_NEXT_P(d, val, T_SZ_RU);
 }
 
@@ -59455,6 +59461,24 @@ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
     pf->pcs[pc].elem_kinds |= kind;
 }
 
+/* The final property count an allocation site reaches, so compiled code can
+   allocate in the final shape and capacity with no transitions. */
+static void js_aot_prof_alloc(JSFunctionBytecode *b, uint32_t props)
+{
+    JSAotProfFunc *pf = b->aot_prof;
+    int pc;
+
+    if (!pf)
+        return;
+    pc = pf->last_pc;
+    if (pc < 0 || pc >= pf->pc_n)
+        return;
+    if (props > 0xffff)
+        props = 0xffff;
+    if (props > pf->pcs[pc].alloc_props)
+        pf->pcs[pc].alloc_props = (uint16_t)props;
+}
+
 static JSAotProfCall *aot_call_slot(JSRuntime *rt, JSAotProfFunc *pf, uint32_t pc)
 {
     JSAotProfCall *c;
@@ -59730,10 +59754,12 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     aot_digest_hex(dg, dgt);
     JS_AtomGetStrRT(rt, name, sizeof(name), b->func_name);
     JS_AtomGetStrRT(rt, file, sizeof(file), b->filename);
-    fprintf(f, "F %s name=%s file=%s:%d ops=%llu entries=%u len=%d us=%llu\n",
+    fprintf(f, "F %s name=%s file=%s:%d ops=%llu entries=%u len=%d us=%llu "
+            "inst_cap=%u inst_seen=%u\n",
             dgt, name, file, b->line_num,
             (unsigned long long)pf->ops, pf->entries, b->regvm_len,
-            (unsigned long long)pf->sample_us);
+            (unsigned long long)pf->sample_us, b->inst_inline_cap,
+            b->inst_cap_seen);
     for (i = 0; i < pf->loop_n; i++)
         if (pf->loop_iters[i]) {
             aot_src_str(b, i, src, sizeof(src));
@@ -59751,13 +59777,16 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
         JSAotProfPc *e = &pf->pcs[i];
         char ts[128];
 
-        if (!e->types && !e->elem_kinds)
+        if (!e->types && !e->elem_kinds && !e->alloc_props)
             continue;
         aot_type_str(e->types, ts, sizeof(ts));
         aot_src_str(b, i, src, sizeof(src));
         if (e->elem_kinds)
             fprintf(f, "P %s pc=%d types=%s elem=%u src=%s\n",
                     dgt, i, ts, e->elem_kinds, src);
+        else if (e->alloc_props)
+            fprintf(f, "P %s pc=%d types=%s props=%u src=%s\n",
+                    dgt, i, ts, e->alloc_props, src);
         else if (e->has_num)
             fprintf(f, "P %s pc=%d types=%s num=%g..%g frac=%u negzero=%u src=%s\n",
                     dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, src);
