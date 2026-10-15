@@ -9106,6 +9106,19 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
     p->prop[0].u.value = js_int32(count);
     return obj;
 }
+
+static JSValue regvm_array_from_const(JSContext *ctx, JSValueConst tv)
+{
+    JSObject *tp;
+
+    if (likely(JS_VALUE_GET_TAG(tv) == JS_TAG_OBJECT)) {
+        tp = JS_VALUE_GET_OBJ(tv);
+        if (likely(tp->class_id == JS_CLASS_ARRAY && tp->fast_array))
+            return regvm_array_from_regs(ctx, tp->u.array.u.values,
+                                         tp->u.array.count);
+    }
+    return JS_ThrowInternalError(ctx, "regvm: bad array template");
+}
 #endif /* QJS_REGVM */
 
 /* Take ownership of an already allocated dense value buffer. */
@@ -26077,6 +26090,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_free1(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_mul_add(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_post_inc(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_post_dec(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_array_const(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_mul_sub(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_mul(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_sub_mul(REGVM_ARGS);
@@ -26313,6 +26327,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(apply, regvm_t_cold) \
     X(apply_arguments, regvm_t_apply_arguments) \
     X(array_from, regvm_t_array_from) \
+    X(array_const, regvm_t_array_const) \
     X(binary_cpool, regvm_t_binary_cpool) \
     X(branch_cmp_loc_loc, regvm_t_cold) \
     /* dedicated handler */ \
@@ -29899,6 +29914,16 @@ static uint8_t *REGVM_CC regvm_t_array_from(REGVM_ARGS)
     T_SET_NEXT_P(d, val, T_SZ_RRB);
 }
 
+static uint8_t *REGVM_CC regvm_t_array_const(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    JSValue val = regvm_array_from_const(ctx, f->b->cpool[T_U32(3)]);
+
+    if (JS_IsException(val))
+        T_FAIL();
+    T_SET_NEXT_P(d, val, T_SZ_RC);
+}
+
 static uint8_t *REGVM_CC regvm_t_put_global(REGVM_ARGS)
 {
     JSAtom atom = (JSAtom)T_U32(1);
@@ -31651,6 +31676,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             [ROP_tail_call] = &&L_ROP_tail_call,
             [ROP_tail_call_method] = &&L_ROP_tail_call_method,
             [ROP_array_from] = REGVM_MONO_ENTRY(L_ROP_array_from),
+            [ROP_array_const] = REGVM_MONO_ENTRY(L_ROP_array_const),
             [ROP_apply] = REGVM_MONO_ENTRY(L_ROP_apply),
             [ROP_apply_arguments] = REGVM_MONO_ENTRY(L_ROP_apply_arguments),
             [ROP_append] = REGVM_MONO_ENTRY(L_ROP_append),
@@ -34626,6 +34652,15 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int ab = RD_REG();
                 int na = RD_U8();
                 ret_val = regvm_array_from_regs(ctx, regs + ab, na);
+                if (JS_IsException(ret_val))
+                    goto exception;
+                SET_REG_P(d, ret_val);
+                REGVM_NEXT();
+            }
+            L_ROP_array_const: {
+                int d = RD_REG();
+                uint32_t idx = RD_U32();
+                ret_val = regvm_array_from_const(ctx, b->cpool[idx]);
                 if (JS_IsException(ret_val))
                     goto exception;
                 SET_REG_P(d, ret_val);
@@ -58627,6 +58662,7 @@ typedef struct JSRegIR {
        it once per stack-VM opcode; the edge-move emitter overrides it for its
        phi copies. */
     uint8_t next_origin;
+    uint8_t fuse_hint;
     /* Set when a call with more than 255 arguments was lowered through the
        apply path, whose window needs 262 slots (callable, receiver, array,
        chunk array, a 255-value staging chunk and the append triple). */
@@ -58982,6 +59018,7 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
     [ROP_tail_call_method] = "rrrb",
     /* dst, arg-base, argc: builds an array from the contiguous window. */
     [ROP_array_from] = "rrb",
+    [ROP_array_const] = "rc",
     [ROP_apply] = "rru",
     [ROP_eval] = "rrrub",
     [ROP_apply_eval] = "rrru",
@@ -61819,10 +61856,12 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
        and the increment is computed from it: ToNumeric can run user code, so it
        must run once. */
     case OP_post_inc:
+        ir->fuse_hint |= 1;
         ADD(ROP_unary, dst + 0, REG_UN_TO_NUMERIC, pop[0]);
         ADD(ROP_unary, dst + 1, REG_UN_INC, dst + 0);
         return 0;
     case OP_post_dec:
+        ir->fuse_hint |= 1;
         ADD(ROP_unary, dst + 0, REG_UN_TO_NUMERIC, pop[0]);
         ADD(ROP_unary, dst + 1, REG_UN_DEC, dst + 0);
         return 0;
@@ -62056,6 +62095,17 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
             return 0;
         }
         regvm_stage_args(ir, pop, argc, 0, argc, home_of, n_values, below, defs);
+        if (argc >= 2 && argc <= JS_ARRAY_INLINE_MAX) {
+            for (a = 0; a < argc; a++) {
+                int r = defs[a] >= 0 ? ir->insns[defs[a]].rop : -1;
+                if (r != ROP_load_i8 && r != ROP_load_i32 && r != ROP_load_const &&
+                    r != ROP_load_true && r != ROP_load_false &&
+                    r != ROP_load_null && r != ROP_load_undefined)
+                    break;
+            }
+            if (a == argc)
+                ir->fuse_hint |= 2;
+        }
         for (a = 0; a < argc; a++) {
             if (defs[a] >= 0) {
                 regvm_arg_retarget_insn(ir, defs[a], REGVM_WIN(a), pop[a]);
@@ -64440,123 +64490,153 @@ static uint8_t *regvm_value_read_counts(JSContext *ctx, const JSRegIR *ir,
     return cnt;
 }
 
-static void regvm_fuse_post_inc(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
-                                int n_pcs, const int *bstart, int n_blocks)
+static int regvm_const_load_value(JSFunctionDef *fd, const JSRegInsn *in,
+                                  JSValue *pv)
 {
-    int n = ir->n_insns, i, k, out = 0, n_cnt = 0;
-    unsigned char *drop = NULL, *is_target = NULL;
-    uint8_t *cnt = NULL;
-    int *remap = NULL, *first = NULL;
-
-    if (n < 3)
-        return;
-    for (i = 0; i + 1 < n; i++)
-        if (ir->insns[i].rop == ROP_unary &&
-            ir->insns[i].ops[1] == REG_UN_TO_NUMERIC &&
-            ir->insns[i + 1].rop == ROP_unary)
-            break;
-    if (i + 1 >= n)
-        return;
-    drop = js_mallocz(ctx, (size_t)n);
-    is_target = js_mallocz(ctx, (size_t)n);
-    remap = js_malloc(ctx, (size_t)n * sizeof(int));
-    first = js_malloc(ctx, (size_t)(n + 1) * sizeof(int));
-    if (!drop || !is_target || !remap || !first)
-        goto done;
-
-    for (i = 0; i < n; i++) {
-        const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
-        for (k = 0; fmt && fmt[k]; k++) {
-            int32_t pc;
-            int ti;
-            if (fmt[k] != 't')
-                continue;
-            pc = ir->insns[i].ops[k];
-            ti = (pc >= 0 && pc < n_pcs) ? pc_to_insn[pc] : -1;
-            if (ti >= 0 && ti < n)
-                is_target[ti] = 1;
-        }
+    switch (in->rop) {
+    case ROP_load_i8:
+    case ROP_load_i32:
+        if (in->n_ops != 2)
+            return 0;
+        *pv = js_int32(in->ops[1]);
+        return 1;
+    case ROP_load_true:  *pv = JS_TRUE; return in->n_ops == 1;
+    case ROP_load_false: *pv = JS_FALSE; return in->n_ops == 1;
+    case ROP_load_null:  *pv = JS_NULL; return in->n_ops == 1;
+    case ROP_load_undefined: *pv = JS_UNDEFINED; return in->n_ops == 1;
+    case ROP_load_const:
+        if (in->n_ops != 3 || in->ops[1] != REG_CONST_CPOOL ||
+            in->ops[2] < 0 || in->ops[2] >= fd->cpool_count ||
+            JS_VALUE_GET_TAG(fd->cpool[in->ops[2]]) != JS_TAG_FLOAT64)
+            return 0;
+        *pv = fd->cpool[in->ops[2]];
+        return 1;
+    default:
+        return 0;
     }
+}
 
-    for (i = 0; i + 2 < n; i++) {
-        JSRegInsn *a = &ir->insns[i], *b = &ir->insns[i + 1],
-                  *c = &ir->insns[i + 2];
-        int bstart_hit = 0, nv;
+static int regvm_try_array_const(JSContext *ctx, JSFunctionDef *fd,
+                                 JSRegIR *ir, int i, unsigned char *drop,
+                                 const unsigned char *is_target,
+                                 unsigned char **pbpc, int n_pcs,
+                                 const int *bstart, int n_blocks)
+{
+    JSRegInsn *af = &ir->insns[i];
+    JSValue vals[JS_ARRAY_INLINE_MAX], arr;
+    uint32_t seen = 0;
+    int na, s, j, k, idx;
 
-        if (a->rop != ROP_unary || a->n_ops != 3 ||
-            a->ops[1] != REG_UN_TO_NUMERIC)
-            continue;
-        if (b->rop != ROP_unary || b->n_ops != 3 ||
-            (b->ops[1] != REG_UN_INC && b->ops[1] != REG_UN_DEC) ||
-            b->ops[2] != a->ops[0])
-            continue;
-        if (c->rop != ROP_move_xfer || c->n_ops != 2 || c->ops[1] != b->ops[0])
-            continue;
-        nv = b->ops[0];
-        if (nv < 0 || nv == a->ops[0] || nv == a->ops[2] || nv == c->ops[0])
-            continue;
-        if (is_target[i + 1] || is_target[i + 2])
-            continue;
+    if (af->n_ops != 3 || af->ops[1] != REGVM_WIN(0))
+        return 0;
+    na = af->ops[2];
+    if (na < 2 || na > JS_ARRAY_INLINE_MAX || i < na)
+        return 0;
+    s = i - na;
+    for (j = s; j < i; j++) {
+        JSRegInsn *ld = &ir->insns[j];
+        int w;
+        JSValue v;
+
+        if (drop[j] || ld->n_ops < 1 || !regvm_const_load_value(fd, ld, &v))
+            return 0;
+        w = REGVM_WIN(0) - ld->ops[0];
+        if (w < 0 || w >= na || (seen & (1u << w)))
+            return 0;
+        seen |= 1u << w;
+        vals[w] = v;
+    }
+    if (seen != (1u << na) - 1)
+        return 0;
+    if (!*pbpc) {
+        *pbpc = js_mallocz(ctx, (size_t)n_pcs + 1);
+        if (!*pbpc)
+            return 0;
         for (k = 0; k < n_blocks; k++)
-            if (bstart[k] == b->src_pc || bstart[k] == c->src_pc) {
-                bstart_hit = 1;
-                break;
-            }
-        if (bstart_hit)
-            continue;
-        if (!cnt) {
-            cnt = regvm_value_read_counts(ctx, ir, &n_cnt);
-            if (!cnt)
-                break;
-        }
-        if (nv >= n_cnt || cnt[nv] != 2)
-            continue;
+            if (bstart[k] >= 0 && bstart[k] < n_pcs)
+                (*pbpc)[bstart[k]] = 1;
+    }
+    for (j = s + 1; j <= i; j++) {
+        int pc = ir->insns[j].src_pc;
+        if (is_target[j] || pc < 0 || pc >= n_pcs ||
+            ((*pbpc)[pc] && pc != ir->insns[s].src_pc))
+            return 0;
+    }
+    arr = regvm_array_from_regs(ctx, vals, na);
+    if (JS_IsException(arr)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 0;
+    }
+    if (js_resize_array(ctx, (void *)&fd->cpool, sizeof(fd->cpool[0]),
+                        &fd->cpool_size, fd->cpool_count + 1)) {
+        JS_FreeValue(ctx, arr);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 0;
+    }
+    idx = fd->cpool_count++;
+    fd->cpool[idx] = arr;
+    ir->insns[s].rop = ROP_array_const;
+    ir->insns[s].src_pc = af->src_pc;
+    ir->insns[s].n_ops = 2;
+    ir->insns[s].ops[0] = af->ops[0];
+    ir->insns[s].ops[1] = idx;
+    for (j = s + 1; j <= i; j++)
+        drop[j] = 1;
+    return 1;
+}
 
-        a->rop = b->ops[1] == REG_UN_INC ? ROP_post_inc : ROP_post_dec;
-        a->n_ops = 3;
-        a->ops[1] = a->ops[2];
-        a->ops[2] = c->ops[0];
-        drop[i + 1] = 1;
-        drop[i + 2] = 1;
-        i += 2;
-    }
+static int regvm_try_post_inc(JSContext *ctx, JSRegIR *ir, int i,
+                              unsigned char *drop,
+                              const unsigned char *is_target,
+                              const int *bstart, int n_blocks,
+                              uint8_t **pcnt, int *pn_cnt)
+{
+    JSRegInsn *a = &ir->insns[i], *b = &ir->insns[i + 1],
+              *c = &ir->insns[i + 2];
+    int k, nv;
 
-    for (i = 0; i < n; i++) {
-        if (!drop[i]) {
-            if (out != i)
-                ir->insns[out] = ir->insns[i];
-            remap[i] = out;
-            out++;
-        }
+    if (a->n_ops != 3 || a->ops[1] != REG_UN_TO_NUMERIC)
+        return 0;
+    if (b->rop != ROP_unary || b->n_ops != 3 ||
+        (b->ops[1] != REG_UN_INC && b->ops[1] != REG_UN_DEC) ||
+        b->ops[2] != a->ops[0])
+        return 0;
+    if (c->rop != ROP_move_xfer || c->n_ops != 2 || c->ops[1] != b->ops[0])
+        return 0;
+    nv = b->ops[0];
+    if (nv < 0 || nv == a->ops[0] || nv == a->ops[2] || nv == c->ops[0])
+        return 0;
+    if (drop[i + 1] || drop[i + 2] || is_target[i + 1] || is_target[i + 2])
+        return 0;
+    for (k = 0; k < n_blocks; k++)
+        if (bstart[k] == b->src_pc || bstart[k] == c->src_pc)
+            return 0;
+    if (!*pcnt) {
+        *pcnt = regvm_value_read_counts(ctx, ir, pn_cnt);
+        if (!*pcnt)
+            return 0;
     }
-    if (out == n)
-        goto done;
-    ir->n_insns = out;
-    first[n] = out;
-    for (i = n - 1; i >= 0; i--)
-        first[i] = drop[i] ? first[i + 1] : remap[i];
-    for (i = 0; i < n_pcs; i++) {
-        int old = pc_to_insn[i];
-        if (old < 0 || old > n)
-            old = 0;
-        pc_to_insn[i] = first[old];
-    }
- done:
-    js_free(ctx, cnt);
-    js_free(ctx, drop);
-    js_free(ctx, is_target);
-    js_free(ctx, remap);
-    js_free(ctx, first);
+    if (nv >= *pn_cnt || (*pcnt)[nv] != 2)
+        return 0;
+    a->rop = b->ops[1] == REG_UN_INC ? ROP_post_inc : ROP_post_dec;
+    a->n_ops = 3;
+    a->ops[1] = a->ops[2];
+    a->ops[2] = c->ops[0];
+    drop[i + 1] = 1;
+    drop[i + 2] = 1;
+    return 3;
 }
 
 /* Fuse `mul dm, x, y` with an immediately following `add`/`sub` of `dm`. The
    fused instruction still writes `dm`. It drops the second instruction, so a
    branch, catch or finally target or a block start there is refused. */
-static void regvm_fuse_arith_pair(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+static void regvm_fuse_arith_pair(JSContext *ctx, JSFunctionDef *fd,
+                                  JSRegIR *ir, int *pc_to_insn,
                                   int n_pcs, const int *bstart, int n_blocks)
 {
-    int n = ir->n_insns, i, k, out = 0;
-    unsigned char *drop = NULL, *is_target = NULL;
+    int n = ir->n_insns, i, k, out = 0, n_cnt = 0;
+    unsigned char *drop = NULL, *is_target = NULL, *is_bpc = NULL;
+    uint8_t *cnt = NULL;
     int *remap = NULL, *first = NULL;
 
     if (n < 2)
@@ -64586,7 +64666,20 @@ static void regvm_fuse_arith_pair(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
         JSRegInsn *a = &ir->insns[i], *b = &ir->insns[i + 1];
         int bstart_hit = 0, rev, c;
 
-        if (drop[i] || drop[i + 1])
+        if (drop[i])
+            continue;
+        if ((ir->fuse_hint & 2) && a->rop == ROP_array_from) {
+            regvm_try_array_const(ctx, fd, ir, i, drop, is_target, &is_bpc,
+                                  n_pcs, bstart, n_blocks);
+            continue;
+        }
+        if ((ir->fuse_hint & 1) && a->rop == ROP_unary && i + 2 < n &&
+            regvm_try_post_inc(ctx, ir, i, drop, is_target, bstart, n_blocks,
+                               &cnt, &n_cnt)) {
+            i += 2;
+            continue;
+        }
+        if (drop[i + 1])
             continue;
         /* The product must be formed by a plain multiply. */
         if (a->rop != ROP_binary || a->n_ops != 4 || a->ops[1] != REG_BIN_MUL)
@@ -64651,6 +64744,8 @@ static void regvm_fuse_arith_pair(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
         pc_to_insn[i] = first[old];
     }
  done:
+    js_free(ctx, cnt);
+    js_free(ctx, is_bpc);
     js_free(ctx, drop);
     js_free(ctx, is_target);
     js_free(ctx, remap);
@@ -65353,6 +65448,7 @@ static int regvm_own_has_dest(uint16_t rop)
     case ROP_get_super: case ROP_get_ref_value: case ROP_get_arg_el:
     case ROP_call: case ROP_call_method: case ROP_construct:
     case ROP_tail_call: case ROP_tail_call_method: case ROP_array_from:
+    case ROP_array_const:
     case ROP_apply: case ROP_eval: case ROP_apply_eval: case ROP_apply_arguments:
     case ROP_with_get: case ROP_with_make_ref: case ROP_with_get_ref:
     case ROP_with_get_ref_undef: case ROP_with_put: case ROP_with_delete:
@@ -66228,6 +66324,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
 
     ir.insns = NULL;
     ir.n_insns = 0;
+    ir.fuse_hint = 0;
     ir.cap = 0;
     ir.big_args = 0;
     ir.own_init = NULL;
@@ -66996,11 +67093,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     /* Fuse `mul` into the `add`/`sub` that consumes its product, beside the
        chain fusion and skipped by the baseline tier for the same reason. */
     if (!fd->regvm_baseline)
-        regvm_fuse_arith_pair(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+        regvm_fuse_arith_pair(ctx, fd, &ir, pc_to_insn, bc_len + n_stubs_used,
                               bstart, n_blocks);
-    if (!fd->regvm_baseline)
-        regvm_fuse_post_inc(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
-                            bstart, n_blocks);
     /* Slot-in-opcode for the fused frame read: for small slots the opcode names
        the slot and the operand is dropped, shifting the atom and site down. */
     for (i = 0; i < ir.n_insns; i++) {

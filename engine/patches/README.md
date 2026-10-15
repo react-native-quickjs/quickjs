@@ -283,6 +283,7 @@ what we changed and why without opening a single `.patch` file.
 | `0271` | Answers a typed array's length in the register VM's `get_length` | A typed array's `length` is an accessor on %TypedArray%.prototype, so every read took the full lookup and a C getter call (about 13% of Octane gbemu) | An epoch-guarded check of the typed-array prototypes lets `get_length` read the element count directly | No. |
 | `0272` | Branches on null and nullish values with one register instruction | A null test took a constant load, a generic loose compare and a branch (the null load alone is 7.7% of Octane richards' dispatches) | Four new opcodes test the tag, and IsHTMLDDA for the loose forms, and branch | Yes (adds register opcodes; covered by 9999). |
 | `0273` | Fuses a postfix increment whose old value is used | `a[j++] = v` took three dispatches (`to_numeric`, `inc`, `move_xfer`), about 6% of Octane crypto's executed instructions | `post_inc`/`post_dec` write the converted old value and the new one in one instruction | Yes (adds register opcodes; covered by 9999). |
+| `0274` | Builds a constant array literal from a template in one instruction | A literal such as `[0, 1, ..., 9]` took one load per element plus `array_from` (10.4% of Octane splay's dispatches) | `array_const` copies a constant-pool template; the post-allocation fusions run only where the lowering saw a candidate | Yes (adds a register opcode; covered by 9999). |
 
 
 ## Reading the patches
