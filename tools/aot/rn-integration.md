@@ -16,10 +16,30 @@ QJS_AOT_PROFILE_OUT=app.qjsprof  ./MyApp
 ```
 
 `QJS_AOT_PROFILE_OUT` makes the profiler dump every function's 128-bit
-bytecode digest, dynamic op count, loop trip counts, per-register type sets,
-PIC shapes and call sites at teardown. Merge several runs with
+bytecode digest, dynamic op count, loop trip counts, per-register and
+per-instruction type sets with numeric ranges, PIC shapes, call sites, coverage,
+branch bias and sampled self time at teardown. Merge several runs with
 `tools/aot/profmerge.py`; a merged profile is a superset of what the selector
 needs.
+
+Two conditions keep a profile's digests identical to what ships:
+
+- **the release JS bundle.** The profiled bundle must be the one that ships
+  (Metro `--dev false`, minified, `__DEV__` false). A development bundle is
+  different code and its digests match nothing.
+- **no debugger attached while the code loads.** The parser emits a trap per
+  statement only when a debugger is attached at parse time, and those traps
+  change the register bytecode. The profiler marks such a function `dbg=1` on
+  its `F` line, so it is visible rather than silent.
+
+Either engine build works: the facts are counts, types, shapes and targets, not
+timings. A release build is preferred for a long session, because the app runs
+at full speed and the developer exercises more of it.
+
+The generator reports the **bound fraction** at build time -- of the profile's
+function records, how many the built bundle still has by digest. A low number
+means the profile is stale or foreign (a changed bundle, another engine, another
+build configuration), which would otherwise be silent.
 
 Commit `app.qjsprof` next to the bundle. It is data, not code, and it is only
 a hint: the unit is correct for any input, and a function the profile never

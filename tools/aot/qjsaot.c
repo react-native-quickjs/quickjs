@@ -3027,6 +3027,27 @@ int main(int argc, char **argv) {
         total_ops ? 100.0 * (double)cov_ops / (double)total_ops : 100.0,
         cov_ops, total_ops, est_bytes, actual_bytes, out);
 
+    /* The bound fraction: of the profile's function records, how many the
+       built bundle still has by digest. A changed bundle or a foreign profile
+       drops its functions out silently, and this is the number that shows it. */
+    if (g_nprof > 0) {
+      int present = 0, hi;
+      unsigned long long present_ops = 0, all_ops = 0;
+      for (hi = 0; hi < g_nprof; hi++) {
+        int ui = find_unit(funcs, nfuncs, g_prof[hi].digest);
+        all_ops += g_prof[hi].ops;
+        if (ui >= 0) {
+          present++;
+          present_ops += g_prof[hi].ops;
+        }
+      }
+      fprintf(
+          stderr,
+          "qjsaot: bound %d/%d profile records (%.1f%% of profiled ops)\n",
+          present, g_nprof,
+          all_ops ? 100.0 * (double)present_ops / (double)all_ops : 100.0);
+    }
+
     for (i = 0; i < nfuncs; i++) free(eb[i].buf);
     free(eb);
     free(uniq);

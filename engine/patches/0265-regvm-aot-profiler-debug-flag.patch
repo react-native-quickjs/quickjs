@@ -1,0 +1,66 @@
+Subject: Mark a function whose bytecode carries debugger traps in the profile
+
+What this does
+  Writes `dbg=1` on a function's `F` line when its register program contains a
+  trap opcode.
+
+Why we need it
+  The parser emits a trap per statement only when a debugger is attached at
+  parse time, and those traps change the register bytecode and therefore its
+  digest. A profile taken with a debugger attached silently matches nothing in
+  the shipping bundle; this makes it visible.
+
+What it adds
+  `aot_code_has_debug` and the `dbg=` field.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 82ba82e..d20d44a 100644
+@@ -59721,6 +59721,30 @@
+     snprintf(out, n, "%d:%d", line, col);
+ }
+ 
++/* Does the register program contain a trap opcode? A profile taken with a
++   debugger attached has them and its digests differ from the shipping ones. */
++static int aot_code_has_debug(const JSFunctionBytecode *b)
++{
++    const uint8_t *p = b->regvm_code, *end;
++    int len = b->regvm_len;
++
++    if (p == NULL || len <= 0)
++        return 0;
++    end = p + len;
++    while (p < end) {
++        int op = *p, sz;
++        if (op == ROP_debug)
++            return 1;
++        if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
++            return 0;
++        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
++        if (sz < 0)
++            return 0;
++        p += 1 + sz;
++    }
++    return 0;
++}
++
+ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     JSAotProfFunc *pf = b->aot_prof;
+@@ -59737,11 +59761,12 @@
+     JS_AtomGetStrRT(rt, name, sizeof(name), b->func_name);
+     JS_AtomGetStrRT(rt, file, sizeof(file), b->filename);
+     fprintf(f, "F %s name=%s file=%s:%d ops=%llu entries=%u len=%d us=%llu "
+-            "inst_cap=%u inst_seen=%u\n",
++            "inst_cap=%u inst_seen=%u dbg=%d\n",
+             dgt, name, file, b->line_num,
+             (unsigned long long)pf->ops, pf->entries, b->regvm_len,
+             (unsigned long long)pf->sample_us, b->inst_inline_cap,
+-            b->inst_cap_seen);
++            b->inst_cap_seen,
++            aot_code_has_debug(b));
+     for (i = 0; i < pf->loop_n; i++)
+         if (pf->loop_iters[i]) {
+             aot_src_str(b, i, src, sizeof(src));
