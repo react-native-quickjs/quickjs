@@ -767,6 +767,45 @@ static int emit_template(
       emit_fallback(f, off, next, last, 1);
       return 1;
 
+    /* get_this_field / get_this_field2: the fused `this` load and the read
+       that consumes it, exactly as the interpreter's fused handler: the load
+       writes the receiver register and the read then tests the PIC. The
+       load's register write is repeated by the step when the read misses, so
+       it has no lasting effect. */
+    case ROP_get_this_field:
+    case ROP_get_this_field2: {
+      int rr = (int)in->arg[1].val;
+      d = (int)in->arg[0].val;
+      site = (int)in->arg[3].val;
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      fprintf(
+          f, "    { JSValue _o; int _r = qjs_aot_load_this(ctx, f, &_o);\n");
+      fprintf(f, "      if (_r < 0) goto exception;\n");
+      fprintf(f, "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", rr);
+      fprintf(f, "      else AOT_SET_B(ctx, fr, %d, _o);\n", rr);
+      if (in->op == ROP_get_this_field2) {
+        int sid = g_site_next++;
+        fprintf(
+            f,
+            "      if (qjs_aot_proto_fold(ctx, f, pic, %d, AOT_REG(fr, %d), "
+            "%d, &_o)) {\n",
+            sid, rr, site);
+        fprintf(
+            f, "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n",
+            d, next);
+      }
+      fprintf(
+          f,
+          "      if (qjs_aot_own_read_hit(f, pic, AOT_REG(fr, %d), %d, &_o)) "
+          "{\n",
+          rr, site);
+      fprintf(
+          f, "          AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n", d,
+          next);
+      emit_fallback(f, off, next, last, 1);
+      return 1;
+    }
+
     /* call / call_method: the specialised C-call path when the profile shows
      a C callee at this pc; the direct compiled path when it shows a bytecode
      callee; otherwise (and on a miss) the step engine. */
@@ -866,6 +905,17 @@ static int emit_template(
           (int)in->arg[1].val, next);
       return 1;
 
+    /* get_arg2: two argument slots into their registers. */
+    case ROP_get_arg2:
+      d = (int)in->arg[0].val;
+      a = (int)in->arg[1].val;
+      b = (int)in->arg[2].val;
+      site = (int)in->arg[3].val;
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n", d, a);
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n", b, site);
+      fprintf(f, "    goto pc_%d;\n", next);
+      return 1;
+
     /* put_local / put_local_s0..s3: set_value(ctx, &var_buf[slot], dup(regs[s])). */
     case ROP_put_local:
       fprintf(
@@ -885,20 +935,26 @@ static int emit_template(
           in->op - ROP_put_local_s0, (int)in->arg[0].val, next);
       return 1;
 
-    /* get_global: cell-cache probe then JS_GetGlobalVar (full semantics). The
-     atom is runtime-remapped, so re-read it from the live code rather than
-     baking the generator's atom id. */
+    /* get_global: the handler's per-instruction site cache, then the cell
+     cache, then JS_GetGlobalVar. The atom is runtime-remapped, so re-read it
+     from the live code rather than baking the generator's atom id. A site hit
+     borrows the slot's value; the fallbacks return an owned one. */
     case ROP_get_global:
       d = (int)in->arg[0].val;
-      fprintf(f, "    { JSValue _o;\n");
+      site = (int)in->arg[3].val;
+      /* No site (a baseline-tier function has no PIC table): the step does the
+         generic read, as the interpreter handler does. */
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      fprintf(f, "    { JSValue _o; int _r =\n");
       fprintf(
           f,
-          "      if (qjs_aot_get_global(ctx, (int)qjs_aot_ld_u32(code + %d), "
-          "%d, &_o) < 0) goto exception;\n",
-          in->arg[1].off, (int)in->arg[2].val);
-      fprintf(
-          f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", d,
-          next);
+          "        qjs_aot_get_global_site(ctx, f, %d, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &_o);\n",
+          site, in->arg[1].off, (int)in->arg[2].val);
+      fprintf(f, "      if (_r < 0) goto exception;\n");
+      fprintf(f, "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", d);
+      fprintf(f, "      else AOT_SET_B(ctx, fr, %d, _o);\n", d);
+      fprintf(f, "      goto pc_%d; }\n", next);
       return 1;
 
     /* put_field: the REG_PIC_OWN_W direct-slot store, else the step. */
@@ -931,6 +987,19 @@ static int emit_template(
           f, "          qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n",
           d, next);
       emit_fallback(f, off, next, last, 1);
+      return 1;
+
+    /* array_const: a fresh array from the function's constant-pool template. */
+    case ROP_array_const:
+      d = (int)in->arg[0].val;
+      fprintf(f, "    { JSValue _o;\n");
+      fprintf(
+          f,
+          "      if (qjs_aot_array_const(ctx, f, %du, &_o) < 0) goto "
+          "exception;\n",
+          (uint32_t)in->arg[1].val);
+      fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", d);
+      fprintf(f, "      goto pc_%d; }\n", next);
       return 1;
 
     /* Fused multiply-add family: mul then add/sub, exactly as the handler. */
@@ -1052,6 +1121,34 @@ static int emit_template(
             a, next);
       return 1;
 
+    /* post_inc / post_dec: the converted old value into the first register
+       and the new value into the second, exactly as the interpreter's fused
+       pair (to_numeric, then inc/dec, both with the ordinary slow paths). */
+    case ROP_post_inc:
+    case ROP_post_dec: {
+      int sub2 = in->op == ROP_post_inc ? REG_UN_INC : REG_UN_DEC;
+      int t = (int)in->arg[0].val, s = (int)in->arg[1].val,
+          h = (int)in->arg[2].val;
+      fprintf(f, "    { JSValue _o;\n");
+      fprintf(
+          f,
+          "      if (!qjs_aot_unary_num_fast(%d, AOT_REG(fr, %d), &_o) &&\n"
+          "          qjs_aot_unary(ctx, %d, AOT_REG(fr, %d), &_o))\n"
+          "          goto exception;\n",
+          REG_UN_TO_NUMERIC, s, REG_UN_TO_NUMERIC, s);
+      fprintf(f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", t);
+      fprintf(
+          f,
+          "      if (!qjs_aot_unary_num_fast(%d, AOT_REG(fr, %d), &_o) &&\n"
+          "          qjs_aot_unary(ctx, %d, AOT_REG(fr, %d), &_o))\n"
+          "          goto exception;\n",
+          sub2, t, sub2, t);
+      fprintf(
+          f, "      qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n", h,
+          next);
+      return 1;
+    }
+
     /* load_undefined / load_null / load_true / load_false: SET_REG_P(d, const). */
     case ROP_load_undefined:
     case ROP_load_null:
@@ -1109,6 +1206,44 @@ static int emit_template(
           a, want_true);
       emit_branch(f, off, tgt);
       fprintf(f, "    } else goto pc_%d;\n", next);
+      return 1;
+    }
+
+    /* branch_null / branch_not_null: one tag test, no fallback. */
+    case ROP_branch_null:
+    case ROP_branch_not_null: {
+      int want_null = (in->op == ROP_branch_null);
+      int tgt = next + (int)in->arg[1].val;
+      a = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    if ((JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_NULL) == %d) "
+          "{\n",
+          a, want_null);
+      emit_branch(f, off, tgt);
+      fprintf(f, "    } else goto pc_%d;\n", next);
+      return 1;
+    }
+
+    /* branch_nullish / branch_not_nullish: null and undefined by tag; the
+       IsHTMLDDA case asks the engine. No fallback. */
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish: {
+      int want_nullish = (in->op == ROP_branch_nullish);
+      int tgt = next + (int)in->arg[1].val;
+      a = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    { JSValue _v = AOT_REG(fr, %d); uint32_t _t = "
+          "JS_VALUE_GET_TAG(_v);\n",
+          a);
+      fprintf(
+          f,
+          "      int _n = (_t == JS_TAG_NULL || _t == JS_TAG_UNDEFINED) ||\n"
+          "                (_t == JS_TAG_OBJECT && qjs_aot_nullish(_v));\n");
+      fprintf(f, "      if (_n == %d) {\n", want_nullish);
+      emit_branch(f, off, tgt);
+      fprintf(f, "      } else goto pc_%d; }\n", next);
       return 1;
     }
 

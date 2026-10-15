@@ -1159,12 +1159,16 @@
       "sha256": "7d1bd0052350a36704d831bdc4e98f9c8b702fa1d47d3cb02f41cffee765b5a8"
     },
     {
+      "name": "0295-regvm-aot-after-fast-path-series.patch",
+      "sha256": "d1bac0aac2057d5604307595df096d0e81e2444a1eb4741af779ec6c417255dc"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "9f8ff5885624ab4f8b8c83365e5447bc7225bfb70fb439667397bcd889c6cb4e",
+    "quickjs.c": "b6f893a454d1571279e60812c055dc7e8096dc75aa1106ca42795d99a42b76f7",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

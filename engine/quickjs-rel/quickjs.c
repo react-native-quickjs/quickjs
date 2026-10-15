@@ -26755,6 +26755,8 @@ static const uint8_t regvm_is_threaded[ROP_COUNT] = {
    untaken fall-through are the two outcomes of exactly these opcodes. */
 static const uint8_t regvm_is_cond_branch[ROP_COUNT] = {
     [ROP_branch_if] = 1, [ROP_branch_if_not] = 1,
+    [ROP_branch_null] = 1, [ROP_branch_not_null] = 1,
+    [ROP_branch_nullish] = 1, [ROP_branch_not_nullish] = 1,
     [ROP_branch_cmp_loc_loc] = 1, [ROP_branch_cmp_loc_reg] = 1,
     [ROP_branch_cmp_reg_loc] = 1, [ROP_branch_cmp_reg_reg] = 1,
     [ROP_branch_cmp_reg_reg_s] = 1,
@@ -28731,6 +28733,7 @@ static uint8_t *REGVM_CC regvm_t_get_arg2(REGVM_ARGS)
     int s2 = T_REG(7);
 
     regvm_store_borrowed(ctx->rt, &FR(d1), f->arg_buf[s1]);
+    AOT_PROF_REG_T(f, d1, FR(d1));
     T_SET_NEXT_B(d2, f->arg_buf[s2], T_SZ_RURU);
 }
 
@@ -29010,6 +29013,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_this_field_slow(R
     } else {
         FR(r) = t;
     }
+    AOT_PROF_REG_T(f, r, FR(r));
     if (regvm_string_proto_get(ctx, FR(r), atom, &val)) {
         T_SET_NEXT_P(d, val, T_SZ_RRAS);
     }
@@ -29045,6 +29049,7 @@ static uint8_t *REGVM_CC regvm_t_get_this_field(REGVM_ARGS)
     r = (int)(dr >> 16);
     site = T_REG(9);
     FR(r) = t;
+    AOT_PROF_REG_T(f, r, t);
     if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, t, site, &val)) {
         T_SET_NEXT_B(d, val, T_SZ_RRAS);
     }
@@ -61273,6 +61278,17 @@ JSValue *qjs_aot_arg_buf(JSRegRun *f)
     return f->arg_buf;
 }
 
+/* Mirror array_const: build a fresh array from the function's constant-pool
+   template. 0 with an owned *out, -1 on exception. */
+QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
+                                     JSValue *out)
+{
+    *out = regvm_array_from_const(ctx, f->b->cpool[idx]);
+    if (JS_IsException(*out))
+        return -1;
+    return 0;
+}
+
 QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
 {
     set_value(ctx, &vb[slot], js_dup(v));
@@ -61286,6 +61302,34 @@ QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSVa
     if (JS_IsException(*out))
         return -1;
     return 0;
+}
+
+/* Mirror the register get_global handler's per-instruction site cache: a
+   filled site names the global's property slot and the generation it was
+   filled at. A site hit borrows the slot's value, so the caller stores it with
+   AOT_SET_B; the cell probe and JS_GetGlobalVar return an owned value for
+   AOT_SET_P. */
+QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
+                                         int atom, int throwing, JSValue *out)
+{
+    JSRegPIC *pic = f->pic;
+
+    if (likely(pic != NULL)) {
+        JSRegPIC *e = &pic[site];
+
+        if (likely(e->slot_off == ctx->rt->gv_cell_gen)) {
+            *out = e->gslot->u.value;
+            return 0;
+        }
+    }
+    if (likely(js_gv_cell_probe(ctx, (JSAtom)atom, out))) {
+        regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
+        return 1;
+    }
+    *out = JS_GetGlobalVar(ctx, (JSAtom)atom, throwing);
+    if (JS_IsException(*out))
+        return -1;
+    return 1;
 }
 
 __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v)
@@ -61367,8 +61411,9 @@ __attribute__((always_inline)) void qjs_aot_move_xfer(JSContext *ctx, JSValue *f
     dst = (JSValue *)((uint8_t *)fr + d);
     src = (JSValue *)((uint8_t *)fr + s);
 #if QJS_DRC
+    /* Registers do not own under deferred counting, so the dead source is
+       left as it is, exactly as the interpreter handler does. */
     *dst = *src;
-    *src = JS_UNDEFINED;
 #else
     set_value(ctx, dst, *src);
     *src = JS_UNDEFINED;
@@ -61383,6 +61428,12 @@ __attribute__((always_inline)) int qjs_aot_unary(JSContext *ctx, int sub, JSValu
 __attribute__((always_inline)) int qjs_aot_to_bool(JSContext *ctx, JSValue v)
 {
     return regvm_to_bool(ctx, v);
+}
+
+/* Mirror regvm_is_nullish_loose: null, undefined or the IsHTMLDDA object. */
+__attribute__((always_inline)) int qjs_aot_nullish(JSValue v)
+{
+    return regvm_is_nullish_loose(v);
 }
 
 /* --- AOT typed-region helpers ----------------------------------------------

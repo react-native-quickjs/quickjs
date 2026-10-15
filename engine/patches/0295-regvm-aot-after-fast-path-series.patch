@@ -1,0 +1,202 @@
+Subject: Carry the AOT layer over the register VM's fast-path series
+
+What this does
+  Follows the register VM's new fast paths in the generator and in the
+  engine-side AOT helpers. The fused `this`-property read, the fused pair of
+  argument reads, the fused postfix increment, the constant array literal,
+  the null and nullish branches and the global read's per-instruction cache
+  all get templates; the profiler records the new opcodes and the register
+  stores the fusions introduce.
+
+Why we need it
+  The series replaced sequences the generator lowered before with single
+  instructions (a `this` load plus a property read, two argument reads, a
+  postfix increment, an array literal's element loads, a null test on a
+  constant), so leaving them to the shared step routine would cost more
+  dispatches than the old lowering did. Two helpers also stopped matching the
+  handlers they mirror: `move_xfer` clears its dead source only where
+  registers own their values, and `get_global` reads its per-instruction site
+  cache before the cell cache.
+
+What it adds
+  qjs_aot_move_xfer()      - under deferred counting the transfer leaves the
+                             source register as the handler does
+  qjs_aot_get_global_site() - the site cache, then the cell probe, then the
+                             global lookup; a site hit borrows the slot's value
+  qjs_aot_nullish()        - null, undefined or the IsHTMLDDA object
+  qjs_aot_array_const()    - a fresh array from a constant-pool template
+  templates                - get_this_field, get_this_field2, get_arg2,
+                             post_inc, post_dec, branch_null, branch_not_null,
+                             branch_nullish, branch_not_nullish, array_const
+  profile hooks            - the four null branches count as conditional
+                             branches; get_arg2's first store and the fused
+                             `this` read's receiver record register facts
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  A bound unit on box2d still matches 307/308 profile records (100.0% of
+  profiled ops), the digest test is 3/3 and box2d's checksum is unchanged in
+  every mode. After the hooks the profile's register facts and branch totals
+  are equal to the pre-series values; the per-pc facts fall by 142 lines
+  because the profiled functions are 162 instructions shorter after the
+  fusions, not because a hook was lost.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index 2042afa..ffd397c 100644
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -194,6 +194,12 @@ JSValue *qjs_aot_arg_buf(JSRegRun *f);
+ /* Mirror put_local: set_value(ctx, &vb[slot], js_dup(v)). */
+ QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
+ 
++/* Mirror the get_global handler: its per-instruction site cache, then the cell
++   probe, then JS_GetGlobalVar. 0 = borrowed *out (the site hit; store with
++   AOT_SET_B), 1 = owned *out (store with AOT_SET_P), -1 = exception. */
++QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
++                                         int atom, int throwing, JSValue *out);
++
+ /* Mirror the get_global cell-cache fast path then JS_GetGlobalVar: 0 on
+    success with an owned *out, -1 on exception. */
+ QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
+@@ -213,7 +219,8 @@ JSValue qjs_aot_get_var_ref(JSRegRun *f, int slot);
+    (store with AOT_SET_P), -1 = exception. */
+ int qjs_aot_load_this(JSContext *ctx, JSRegRun *f, JSValue *out);
+ 
+-/* Mirror move_xfer: move d<-s and clear s, honouring the DRC ownership model. */
++/* Mirror move_xfer: move d<-s, honouring the DRC ownership model (the source
++   is cleared only where registers own their values). */
+ void qjs_aot_move_xfer(JSContext *ctx, JSValue *fr, int d, int s);
+ 
+ /* Mirror js_regvm_unary (exception-capable): 0 with an owned *out, -1 on
+@@ -223,6 +230,15 @@ int qjs_aot_unary(JSContext *ctx, int sub, JSValue a, JSValue *out);
+ /* Mirror regvm_to_bool: 0/1, or -1 on exception. */
+ int qjs_aot_to_bool(JSContext *ctx, JSValue v);
+ 
++/* Mirror regvm_is_nullish_loose: 1 for null, undefined and the IsHTMLDDA
++   object. */
++int qjs_aot_nullish(JSValue v);
++
++/* Mirror array_const: 0 with an owned *out (a fresh array built from the
++   function's constant-pool template), -1 on exception. */
++QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
++                                     JSValue *out);
++
+ /* --- AOT typed-region helpers ----------------------------------------------
+  *
+  * A region carries a value as (double, isint) and boxes only at an exit or a
+diff --git a/quickjs.c b/quickjs.c
+index 3dcfb1e..4a0cdfe 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -26755,6 +26755,8 @@ static const uint8_t regvm_is_threaded[ROP_COUNT] = {
+    untaken fall-through are the two outcomes of exactly these opcodes. */
+ static const uint8_t regvm_is_cond_branch[ROP_COUNT] = {
+     [ROP_branch_if] = 1, [ROP_branch_if_not] = 1,
++    [ROP_branch_null] = 1, [ROP_branch_not_null] = 1,
++    [ROP_branch_nullish] = 1, [ROP_branch_not_nullish] = 1,
+     [ROP_branch_cmp_loc_loc] = 1, [ROP_branch_cmp_loc_reg] = 1,
+     [ROP_branch_cmp_reg_loc] = 1, [ROP_branch_cmp_reg_reg] = 1,
+     [ROP_branch_cmp_reg_reg_s] = 1,
+@@ -28731,6 +28733,7 @@ static uint8_t *REGVM_CC regvm_t_get_arg2(REGVM_ARGS)
+     int s2 = T_REG(7);
+ 
+     regvm_store_borrowed(ctx->rt, &FR(d1), f->arg_buf[s1]);
++    AOT_PROF_REG_T(f, d1, FR(d1));
+     T_SET_NEXT_B(d2, f->arg_buf[s2], T_SZ_RURU);
+ }
+ 
+@@ -29010,6 +29013,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_this_field_slow(R
+     } else {
+         FR(r) = t;
+     }
++    AOT_PROF_REG_T(f, r, FR(r));
+     if (regvm_string_proto_get(ctx, FR(r), atom, &val)) {
+         T_SET_NEXT_P(d, val, T_SZ_RRAS);
+     }
+@@ -29045,6 +29049,7 @@ static uint8_t *REGVM_CC regvm_t_get_this_field(REGVM_ARGS)
+     r = (int)(dr >> 16);
+     site = T_REG(9);
+     FR(r) = t;
++    AOT_PROF_REG_T(f, r, t);
+     if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, t, site, &val)) {
+         T_SET_NEXT_B(d, val, T_SZ_RRAS);
+     }
+@@ -61273,6 +61278,17 @@ JSValue *qjs_aot_arg_buf(JSRegRun *f)
+     return f->arg_buf;
+ }
+ 
++/* Mirror array_const: build a fresh array from the function's constant-pool
++   template. 0 with an owned *out, -1 on exception. */
++QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
++                                     JSValue *out)
++{
++    *out = regvm_array_from_const(ctx, f->b->cpool[idx]);
++    if (JS_IsException(*out))
++        return -1;
++    return 0;
++}
++
+ QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
+ {
+     set_value(ctx, &vb[slot], js_dup(v));
+@@ -61288,6 +61304,34 @@ QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSVa
+     return 0;
+ }
+ 
++/* Mirror the register get_global handler's per-instruction site cache: a
++   filled site names the global's property slot and the generation it was
++   filled at. A site hit borrows the slot's value, so the caller stores it with
++   AOT_SET_B; the cell probe and JS_GetGlobalVar return an owned value for
++   AOT_SET_P. */
++QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
++                                         int atom, int throwing, JSValue *out)
++{
++    JSRegPIC *pic = f->pic;
++
++    if (likely(pic != NULL)) {
++        JSRegPIC *e = &pic[site];
++
++        if (likely(e->slot_off == ctx->rt->gv_cell_gen)) {
++            *out = e->gslot->u.value;
++            return 0;
++        }
++    }
++    if (likely(js_gv_cell_probe(ctx, (JSAtom)atom, out))) {
++        regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
++        return 1;
++    }
++    *out = JS_GetGlobalVar(ctx, (JSAtom)atom, throwing);
++    if (JS_IsException(*out))
++        return -1;
++    return 1;
++}
++
+ __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v)
+ {
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+@@ -61367,8 +61411,9 @@ __attribute__((always_inline)) void qjs_aot_move_xfer(JSContext *ctx, JSValue *f
+     dst = (JSValue *)((uint8_t *)fr + d);
+     src = (JSValue *)((uint8_t *)fr + s);
+ #if QJS_DRC
++    /* Registers do not own under deferred counting, so the dead source is
++       left as it is, exactly as the interpreter handler does. */
+     *dst = *src;
+-    *src = JS_UNDEFINED;
+ #else
+     set_value(ctx, dst, *src);
+     *src = JS_UNDEFINED;
+@@ -61385,6 +61430,12 @@ __attribute__((always_inline)) int qjs_aot_to_bool(JSContext *ctx, JSValue v)
+     return regvm_to_bool(ctx, v);
+ }
+ 
++/* Mirror regvm_is_nullish_loose: null, undefined or the IsHTMLDDA object. */
++__attribute__((always_inline)) int qjs_aot_nullish(JSValue v)
++{
++    return regvm_is_nullish_loose(v);
++}
++
+ /* --- AOT typed-region helpers ----------------------------------------------
+  *
+  * A value in flight inside a region is a double plus an is-int flag, boxed
