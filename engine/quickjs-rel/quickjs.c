@@ -1530,6 +1530,8 @@ typedef struct JSAotProfFunc {
     uint16_t *reg_types;   /* bitmask by register; size reg_n */
     int32_t *reg_pc;       /* regvm offset of the first write to each register */
     JSAotProfPc *pcs;      /* by defining instruction; size pc_n */
+    uint8_t *cov;          /* executed-instruction bitmap; size (len+7)/8 */
+    int32_t cov_n;         /* regvm_len */
     JSAotProfSite *sites;  /* size nsites */
     JSAotProfCall *calls;
     int ncalls;
@@ -59145,6 +59147,10 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
         pf->pcs = js_mallocz_rt(rt, sizeof(JSAotProfPc) * (size_t)pf->pc_n);
         if (!pf->pcs)
             goto fail;
+        pf->cov_n = pf->loop_n;
+        pf->cov = js_mallocz_rt(rt, (size_t)(pf->cov_n + 7) / 8);
+        if (!pf->cov)
+            goto fail;
     }
     if (pf->reg_n > 0) {
         pf->reg_types = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)pf->reg_n);
@@ -59164,6 +59170,7 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
 fail:
     js_free_rt(rt, pf->loop_iters);
     js_free_rt(rt, pf->pcs);
+    js_free_rt(rt, pf->cov);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -59195,6 +59202,8 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
     }
     pf->ops++;
     pf->last_pc = (int32_t)(rpc - b->regvm_code);
+    if (pf->last_pc >= 0 && pf->last_pc < pf->cov_n)
+        pf->cov[pf->last_pc >> 3] |= (uint8_t)(1u << (pf->last_pc & 7));
     if (*pprev && rpc < *pprev) {
         int off = (int)(rpc - b->regvm_code);
         if (off >= 0 && off < pf->loop_n)
@@ -59218,6 +59227,8 @@ static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc)
     }
     pf->ops++;
     pf->last_pc = (int32_t)(rpc - b->regvm_code);
+    if (pf->last_pc >= 0 && pf->last_pc < pf->cov_n)
+        pf->cov[pf->last_pc >> 3] |= (uint8_t)(1u << (pf->last_pc & 7));
 }
 
 static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target)
@@ -59412,6 +59423,7 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
         return;
     js_free_rt(rt, pf->loop_iters);
     js_free_rt(rt, pf->pcs);
+    js_free_rt(rt, pf->cov);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -59613,6 +59625,35 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
                     dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, src);
         else
             fprintf(f, "P %s pc=%d types=%s src=%s\n", dgt, i, ts, src);
+    }
+    if (pf->cov && pf->cov_n > 0) {
+        int nins = 0, ncov = 0, prev_un = -1;
+
+        for (i = 0; i < pf->cov_n; i++) {
+            int sz;
+            int covered = (pf->cov[i >> 3] >> (i & 7)) & 1;
+
+            nins++;
+            if (covered) {
+                ncov++;
+                if (prev_un >= 0) {
+                    fprintf(f, "U %s pc=%d..%d\n", dgt, prev_un, i - 1);
+                    prev_un = -1;
+                }
+            } else if (prev_un < 0) {
+                prev_un = i;
+            }
+            if (b->regvm_code == NULL)
+                break;
+            sz = regvm_fmt_size(regvm_rop_fmt[b->regvm_code[i]], 1,
+                                (uint16_t)b->regvm_code[i]);
+            if (sz < 0)
+                break;
+            i += sz;
+        }
+        if (prev_un >= 0)
+            fprintf(f, "U %s pc=%d..%d\n", dgt, prev_un, i - 1);
+        fprintf(f, "V %s ins=%d covered=%d\n", dgt, nins, ncov);
     }
     for (i = 0; i < pf->nsites; i++) {
         JSAotProfSite *s = &pf->sites[i];

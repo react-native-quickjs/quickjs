@@ -31,7 +31,7 @@ ABI = None
 
 class Func:
     __slots__ = ("digest", "name", "file", "line", "ops", "entries", "len",
-                 "loops", "regs", "pcs", "sites", "calls")
+                 "loops", "regs", "pcs", "ins", "uncovered", "sites", "calls")
 
     def __init__(self, digest):
         self.digest = digest
@@ -44,6 +44,8 @@ class Func:
         self.loops = {}          # pc -> iters
         self.regs = {}           # reg -> set(types)
         self.pcs = {}            # defining pc -> {types, min, max, frac, negzero, src}
+        self.ins = 0             # instructions in the function
+        self.uncovered = []      # [(lo, hi)] never-executed pc ranges
         self.sites = {}          # site -> [count, shape_map]
         self.calls = OrderedDict()  # pc -> Call
 
@@ -173,6 +175,13 @@ def parse_file(path, verbose=False):
                     ent["frac"] = 1
                 if kv.get("negzero") == "1":
                     ent["negzero"] = 1
+            elif kind == "V":
+                kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
+                fr.ins = max(fr.ins, int(kv.get("ins", 0)))
+            elif kind == "U":
+                kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
+                lo, _, hi = kv["pc"].partition("..")
+                fr.uncovered.append((int(lo), int(hi or lo)))
             elif kind == "S":
                 toks = rest.split(" ")
                 site = None
@@ -265,6 +274,17 @@ def merge(into, fr):
         if ent is None:
             ent = g.regs[reg] = [set(), src]
         ent[0].update(ts)
+    g.ins = max(g.ins, fr.ins)
+    if not g.uncovered:
+        g.uncovered = list(fr.uncovered)
+    else:
+        # intersect: a range covered by one session is covered in the merge
+        keep = []
+        for lo, hi in g.uncovered:
+            for blo, bhi in fr.uncovered:
+                if max(lo, blo) <= min(hi, bhi):
+                    keep.append((max(lo, blo), min(hi, bhi)))
+        g.uncovered = keep
     for site, (count, shapes, src) in fr.sites.items():
         ent = g.sites.get(site)
         if ent is None:
@@ -303,6 +323,21 @@ def write(out, funcs):
             if ts:
                 out.write("R %s reg=%d types=%s src=%s\n" % (
                     fr.digest, reg, "|".join(sorted(ts)), src))
+        for pc in sorted(fr.pcs):
+            e = fr.pcs[pc]
+            ts = "|".join(sorted(e["types"]))
+            if e["min"] is not None:
+                out.write("P %s pc=%d types=%s num=%g..%g frac=%d negzero=%d src=%s\n"
+                          % (fr.digest, pc, ts, e["min"], e["max"],
+                             e["frac"], e["negzero"], e["src"]))
+            else:
+                out.write("P %s pc=%d types=%s src=%s\n"
+                          % (fr.digest, pc, ts, e["src"]))
+        if fr.ins:
+            out.write("V %s ins=%d covered=%d\n" % (fr.digest, fr.ins,
+                      fr.ins - sum(hi - lo + 1 for lo, hi in fr.uncovered)))
+        for lo, hi in fr.uncovered:
+            out.write("U %s pc=%d..%d\n" % (fr.digest, lo, hi))
         for site in sorted(fr.sites):
             count, shapes, src = fr.sites[site]
             out.write("S %s site=%d count=%d src=%s shapes=%d" % (
