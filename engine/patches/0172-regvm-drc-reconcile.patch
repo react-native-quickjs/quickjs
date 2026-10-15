@@ -7,10 +7,12 @@ Why we need it
   Deferred reference counting parked zero-refcount values until a safepoint, but the safepoint trigger counted values rather than the bytes they retained, and the monolith register VM had no safepoint on taken back-edges at all - so a few multi-megabyte parked values (the linearized strings pdf.js produces) ratcheted the heap to 1.46 GB.
 
 What it adds
-  Adds `rt->drc_malloc_mark` (rearmed after every reconcile to `malloc_size + max`); `js_drc_malloc_pressure` in `js_malloc_rt`/`js_realloc_rt` sets `zct_limit = 0` when allocation crosses the mark with parked values; large BigInt, or object owning a large array buffer / typed array; `js_trigger_gc`'s deferred branch sets `zct_limit = 0`; and `REGVM_MONO_BACKEDGE` calls `js_drc_safepoint` on every taken backward branch in the monolith.
+  Adds `rt->drc_malloc_mark` (rearmed after every reconcile to `malloc_size + max`); `js_drc_malloc_pressure` in `js_malloc_rt`/`js_realloc_rt` sets `zct_limit = 0` when allocation crosses the mark with parked values; large BigInt, or object owning a large array buffer / typed array; `js_trigger_gc` reconciles before collecting - its deferred branch sets `zct_limit = 0`, and its immediate path drains the parked values first and skips the collection when they bring the heap back under the threshold; and `REGVM_MONO_BACKEDGE` calls `js_drc_safepoint` on every taken backward branch in the monolith.
 
 Needs a bytecode version bump
   No.
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index c2be1a4..d0ab41b 100644
 --- a/quickjs-regvm-step.inc
 +++ b/quickjs-regvm-step.inc
 @@ -103,10 +103,12 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch(uint8_t *ip, JSValue *f
@@ -182,7 +184,30 @@ Needs a bytecode version bump
              return;
          }
  #ifdef ENABLE_DUMPS // JS_DUMP_GC
-@@ -2767,6 +2776,23 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
+@@ -2448,6 +2457,22 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
+         {
+             size_t before = rt->malloc_state.malloc_size;
+ 
++#if QJS_DRC && !defined(FORCE_GC_AT_MALLOC)
++            /* Parked values are usually what grew the heap, and draining them
++               is far cheaper than a collection.  When the reconcile brings the
++               heap back under the threshold nothing was owed; values only the
++               collector can free push it up again, and collect then. */
++            if (!rt->drc_in_reconcile &&
++                (rt->zct_len != 0 || rt->zct_nobj != 0)) {
++                js_drc_reconcile(rt);
++                if (rt->malloc_state.malloc_size + size <=
++                    rt->malloc_gc_threshold) {
++                    js_gc_rearm_pace(rt, before,
++                                     rt->malloc_state.malloc_size);
++                    return;
++                }
++            }
++#endif
+             JS_RunGC(rt);
+             rt->gc_pending = false;
+             js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
+@@ -2767,6 +2792,23 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
      return ptr;
  }
  
@@ -206,7 +231,7 @@ Needs a bytecode version bump
  void *js_malloc_rt(JSRuntime *rt, size_t size)
  {
      void *ptr;
-@@ -2787,6 +2813,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
+@@ -2787,6 +2829,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
  
      s->malloc_count++;
      s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
@@ -214,7 +239,7 @@ Needs a bytecode version bump
      return ptr;
  }
  
-@@ -2833,6 +2860,7 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
+@@ -2833,6 +2876,7 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
          return NULL;
  
      s->malloc_size += js_arena_usable_size(rt, ptr) - old_size;
@@ -222,7 +247,7 @@ Needs a bytecode version bump
      return ptr;
  }
  
-@@ -3113,7 +3141,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+@@ -3113,7 +3157,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
      rt->zct_cap = 0;
      rt->zct_nobj = 0;
      rt->zct_limit = 4096;
@@ -234,7 +259,7 @@ Needs a bytecode version bump
  #endif
  
  #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-@@ -6773,7 +6805,6 @@ static JSValue js_new_string_rope(JSContext *ctx, JSValue op1, JSValue op2)
+@@ -6773,7 +6821,6 @@ static JSValue js_new_string_rope(JSContext *ctx, JSValue op1, JSValue op2)
      int is_wide_char, depth;
      JSStringRope *r;
      JSValue res;
@@ -242,7 +267,7 @@ Needs a bytecode version bump
      if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING) {
          JSString *p1 = JS_VALUE_GET_STRING(op1);
          len = p1->len;
-@@ -6950,7 +6981,6 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValueConst rope)
+@@ -6950,7 +6997,6 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValueConst rope)
      JSValue ret;
  
      r = JS_VALUE_GET_STRING_ROPE(rope);
@@ -250,7 +275,7 @@ Needs a bytecode version bump
      /* check whether it is already linearized */
      if (JS_VALUE_GET_TAG(r->right) == JS_TAG_STRING &&
          JS_VALUE_GET_STRING(r->right)->len == 0) {
-@@ -6962,7 +6992,10 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValueConst rope)
+@@ -6962,7 +7008,10 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValueConst rope)
      if (string_buffer_concat_value(b, rope))
          goto fail;
      ret = string_buffer_end(b);
@@ -262,7 +287,7 @@ Needs a bytecode version bump
          /* update the rope so that it won't need to be linearized again */
          JS_FreeValue(ctx, r->left);
          JS_FreeValue(ctx, r->right);
-@@ -9516,6 +9549,67 @@ static void js_drc_push(JSRuntime *rt, JSValue v)
+@@ -9516,6 +9565,67 @@ static void js_drc_push(JSRuntime *rt, JSValue v)
      rt->zct[rt->zct_len++] = v;
  }
  
@@ -330,7 +355,7 @@ Needs a bytecode version bump
  /* Park 'v' after its ref_count has reached zero. */
  static void js_drc_zero(JSRuntime *rt, JSValue v)
  {
-@@ -9525,6 +9619,13 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
+@@ -9525,6 +9635,13 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
          js_free_value_rt(rt, v);
          return;
      }
@@ -344,7 +369,7 @@ Needs a bytecode version bump
      switch (tag) {
      case JS_TAG_OBJECT:
      case JS_TAG_FUNCTION_BYTECODE:
-@@ -9618,6 +9719,8 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
+@@ -9618,6 +9735,8 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
      rt->drc_in_reconcile = 0;
  }
  
@@ -353,7 +378,7 @@ Needs a bytecode version bump
  static void js_drc_reconcile(JSRuntime *rt)
  {
      js_drc_pin(rt);
-@@ -9627,6 +9730,22 @@ static void js_drc_reconcile(JSRuntime *rt)
+@@ -9627,6 +9746,22 @@ static void js_drc_reconcile(JSRuntime *rt)
      rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
      if (rt->zct_limit < 4096)
          rt->zct_limit = 4096;
@@ -376,7 +401,7 @@ Needs a bytecode version bump
  }
  
  static inline void js_drc_safepoint(JSRuntime *rt)
-@@ -10194,6 +10313,10 @@ void JS_RunGC(JSRuntime *rt)
+@@ -10194,6 +10329,10 @@ void JS_RunGC(JSRuntime *rt)
      rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
      if (rt->zct_limit < 4096)
          rt->zct_limit = 4096;
@@ -387,7 +412,7 @@ Needs a bytecode version bump
  #endif
  }
  
-@@ -28130,6 +28253,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -28130,6 +28269,17 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
          } while (0)
  #endif
  #endif
@@ -405,7 +430,7 @@ Needs a bytecode version bump
  #if QJS_REGVM_ASM
       regvm_stretch:
  #endif
-@@ -28377,7 +28511,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -28377,7 +28527,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                       guarantees. */ \
                    if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
                        if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
@@ -414,7 +439,7 @@ Needs a bytecode version bump
                        REGVM_NEXT(); \
                    } \
                    if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
-@@ -28396,7 +28530,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -28396,7 +28546,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                        if (unlikely(take < 0)) \
                            goto exception; \
                    } \
@@ -423,7 +448,7 @@ Needs a bytecode version bump
                    REGVM_NEXT(); \
                } while (0)
              L_ROP_branch_cmp_loc_loc:
-@@ -28480,6 +28614,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -28480,6 +28630,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                                                : iv != INT32_MIN) {
                                var_buf[slot] = js_int32(u == REG_UN_INC ? iv + 1
                                                                         : iv - 1);
@@ -431,7 +456,7 @@ Needs a bytecode version bump
                                rpc += off;; REGVM_NEXT();
                            }
                        }
-@@ -28492,6 +28627,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -28492,6 +28643,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                        goto exception;
                    }
                    set_value(ctx, &var_buf[slot], out);
@@ -439,7 +464,7 @@ Needs a bytecode version bump
                    rpc += off;;
                    REGVM_NEXT(); }
              L_ROP_put_local:
-@@ -29364,6 +29500,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29364,6 +29516,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  regvm_ctl[regvm_nctl].reg = -1;
                  regvm_ctl[regvm_nctl].pc = (uint32_t)(rpc - b->regvm_code);
                  regvm_nctl++;
@@ -447,7 +472,7 @@ Needs a bytecode version bump
                  rpc += off;
                  REGVM_NEXT();
              }
-@@ -29784,6 +29921,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29784,6 +29937,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      if (unlikely(JS_IsException(val)))
                          goto exception;
                      SET_REG_P(d, val);
@@ -455,7 +480,7 @@ Needs a bytecode version bump
                      rpc += off;
                  }
                  REGVM_NEXT();
-@@ -29811,6 +29949,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29811,6 +29965,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      if (unlikely(JS_SetPropertyInternal(ctx, regs[o], atom, val,
                                                          JS_PROP_THROW_STRICT) < 0))
                          goto exception;
@@ -463,7 +488,7 @@ Needs a bytecode version bump
                      rpc += off;
                  } else {
                      /* The fall-through result is another reference to value. */
-@@ -29854,6 +29993,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -29854,6 +30009,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                                                            : JS_UNDEFINED);
                      }
                      SET_REG_P(d1, val);
@@ -471,7 +496,7 @@ Needs a bytecode version bump
                      rpc += off;
                  }
                  REGVM_NEXT();
-@@ -30467,10 +30607,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -30467,10 +30623,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  
                      if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
                          regs[d] = js_int32((int32_t)sum);
@@ -484,7 +509,7 @@ Needs a bytecode version bump
                      rpc += off;
                      REGVM_NEXT();
                  }
-@@ -30478,6 +30620,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -30478,6 +30636,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                      goto exception;
                  SET_REG_P(d, out);
@@ -492,7 +517,7 @@ Needs a bytecode version bump
                  rpc += off;
                  REGVM_NEXT();
              }
-@@ -30493,10 +30636,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -30493,10 +30652,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
  
                      if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
                          regs[d] = js_int32((int32_t)sum);
@@ -505,7 +530,7 @@ Needs a bytecode version bump
                      rpc += off;
                      REGVM_NEXT();
                  }
-@@ -30504,6 +30649,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -30504,6 +30665,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                      js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                      goto exception;
                  SET_REG_P(d, out);
@@ -513,7 +538,7 @@ Needs a bytecode version bump
                  rpc += off;
                  REGVM_NEXT();
              }
-@@ -30659,16 +30805,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -30659,16 +30821,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                  REGVM_NEXT();
              }
              L_ROP_branch:
@@ -534,7 +559,7 @@ Needs a bytecode version bump
                    REGVM_NEXT(); }
              /*
               * Suspension. The frame stays in the state and the body is
-@@ -31134,7 +31280,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -31134,7 +31296,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                       guarantees. */ \
                    if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
                        if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
@@ -543,7 +568,7 @@ Needs a bytecode version bump
                        REGVM_NEXT(); \
                    } \
                    if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
-@@ -31153,7 +31299,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
+@@ -31153,7 +31315,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                        if (unlikely(take < 0)) \
                            goto exception; \
                    } \

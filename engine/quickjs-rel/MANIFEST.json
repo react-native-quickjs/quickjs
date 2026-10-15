@@ -668,7 +668,7 @@
     },
     {
       "name": "0172-regvm-drc-reconcile.patch",
-      "sha256": "39b7bd9d25ffefbd8053e25e81ece46ddc7b4096d14cdb3c527f15050c976b82"
+      "sha256": "0fc6da6d857613a4cc49eff4861291eb62980ee669333c8e46ac3a672c38e146"
     },
     {
       "name": "0173-regvm-thread-default.patch",
@@ -1172,7 +1172,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "dfa30cf32713f1569a8264b4562dae6596c6d3c587a4df9e6a3c7c8c83da7999",
+    "quickjs.c": "a49a92e0d1a9df3b2c047a60695360658ffb877403e37c973ad93eeb22b77fbc",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

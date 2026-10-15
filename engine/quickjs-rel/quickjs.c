@@ -2834,6 +2834,22 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
         {
             size_t before = rt->malloc_state.malloc_size;
 
+#if QJS_DRC && !defined(FORCE_GC_AT_MALLOC)
+            /* Parked values are usually what grew the heap, and draining them
+               is far cheaper than a collection.  When the reconcile brings the
+               heap back under the threshold nothing was owed; values only the
+               collector can free push it up again, and collect then. */
+            if (!rt->drc_in_reconcile &&
+                (rt->zct_len != 0 || rt->zct_nobj != 0)) {
+                js_drc_reconcile(rt);
+                if (rt->malloc_state.malloc_size + size <=
+                    rt->malloc_gc_threshold) {
+                    js_gc_rearm_pace(rt, before,
+                                     rt->malloc_state.malloc_size);
+                    return;
+                }
+            }
+#endif
             JS_RunGC(rt);
             rt->gc_pending = false;
             js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
