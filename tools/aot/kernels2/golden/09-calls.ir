@@ -1,0 +1,83 @@
+F 0672ed3ae03db61a7d567d22203ee246 name=fact insns=11
+     0 pc=0    op=16 sz=5 r0 u0
+     1 pc=5    op=216 sz=3 r16 i1
+     2 pc=8    op=176 sz=4 r0 r16 t6
+     3 pc=12   op=216 sz=3 r16 i1
+     4 pc=15   op=67 sz=3 r16
+     5 pc=18   op=20 sz=10 r16 a592 b1 s0
+     6 pc=28   op=184 sz=4 r64 r0 i1
+     7 pc=32   op=72 sz=8 r16 r16 r64 b1
+     8 pc=40   op=189 sz=7 r32 r0 r16
+     9 pc=47   op=171 sz=5 r32 b10 r32 i0
+    10 pc=52   op=67 sz=3 r32
+F 628cae8d66edb26ab86ca3e147c5d598 name=k insns=54
+     0 pc=0    op=16 sz=5 r48 u0
+     1 pc=5    op=216 sz=3 r0 i0
+     2 pc=8    op=216 sz=3 r16 i0
+     3 pc=11   op=174 sz=4 r16 r48 t125
+     4 pc=15   op=20 sz=10 r64 a112 b1 s0
+     5 pc=25   op=216 sz=3 r192 i2
+     6 pc=28   op=217 sz=3 r176 r16
+     7 pc=31   op=72 sz=8 r64 r64 r176 b2
+     8 pc=39   op=190 sz=7 r80 r0 r64
+     9 pc=46   op=171 sz=5 r0 b10 r80 i0
+    10 pc=51   op=20 sz=10 r64 a595 b1 s1
+    11 pc=61   op=216 sz=3 r192 i1
+    12 pc=64   op=217 sz=3 r176 r16
+    13 pc=67   op=72 sz=8 r64 r64 r176 b2
+    14 pc=75   op=190 sz=7 r80 r0 r64
+    15 pc=82   op=171 sz=5 r0 b10 r80 i0
+    16 pc=87   op=20 sz=10 r64 a594 b1 s2
+    17 pc=97   op=72 sz=8 r64 r64 r176 b0
+    18 pc=105  op=170 sz=5 b63 r64 r64 t8
+    19 pc=110  op=216 sz=3 r64 i1
+    20 pc=113  op=217 sz=3 r80 r64
+    21 pc=116  op=172 sz=2 t6
+    22 pc=118  op=216 sz=3 r64 i0
+    23 pc=121  op=217 sz=3 r80 r64
+    24 pc=124  op=190 sz=7 r64 r0 r80
+    25 pc=131  op=171 sz=5 r0 b10 r64 i0
+    26 pc=136  op=228 sz=4 r16 r48 t-125
+    27 pc=140  op=12 sz=5 r64 u0
+    28 pc=145  op=20 sz=10 r80 a112 b1 s3
+    29 pc=155  op=141 sz=5 r176 r80
+    30 pc=160  op=42 sz=8 r64 r176 b1 u0
+    31 pc=168  op=217 sz=3 r32 r64
+    32 pc=171  op=20 sz=10 r64 a592 b1 s4
+    33 pc=181  op=216 sz=3 r176 i10
+    34 pc=184  op=72 sz=8 r64 r64 r176 b1
+    35 pc=192  op=39 sz=11 r80 r32 a601 s5
+    36 pc=203  op=216 sz=3 r176 i4
+    37 pc=206  op=216 sz=3 r192 i5
+    38 pc=209  op=73 sz=10 r128 r80 r32 r176 b2
+    39 pc=219  op=20 sz=10 r80 a112 b1 s6
+    40 pc=229  op=216 sz=3 r176 i1
+    41 pc=232  op=72 sz=8 r80 r80 r176 b1
+    42 pc=240  op=20 sz=10 r96 a112 b1 s7
+    43 pc=250  op=216 sz=3 r176 i1
+    44 pc=253  op=216 sz=3 r192 i2
+    45 pc=256  op=216 sz=3 r208 i3
+    46 pc=259  op=72 sz=8 r96 r96 r176 b3
+    47 pc=267  op=141 sz=5 r176 r0
+    48 pc=272  op=141 sz=5 r192 r64
+    49 pc=277  op=141 sz=5 r208 r128
+    50 pc=282  op=141 sz=5 r224 r80
+    51 pc=287  op=141 sz=5 r240 r96
+    52 pc=292  op=77 sz=6 r112 r176 b5
+    53 pc=298  op=67 sz=3 r112
+F 6c02edd819fbe01c5ba8a884f1e63dbe name=ret insns=1
+     0 pc=0    op=68 sz=1
+F b5069f6e8464122c5d1a692ab47e7027 name=many insns=8
+     0 pc=0    op=240 sz=9 r0 u0 r16 u1
+     1 pc=9    op=16 sz=5 r32 u2
+     2 pc=14   op=171 sz=5 r64 b10 r0 i0
+     3 pc=19   op=171 sz=5 r80 b10 r16 i0
+     4 pc=24   op=190 sz=7 r64 r64 r80
+     5 pc=31   op=171 sz=5 r80 b10 r32 i0
+     6 pc=36   op=190 sz=7 r64 r64 r80
+     7 pc=43   op=67 sz=3 r64
+F edfd72179b260a7d24122f25cefedf3b name=add insns=4
+     0 pc=0    op=240 sz=9 r0 u0 r16 u1
+     1 pc=9    op=190 sz=7 r32 r0 r16
+     2 pc=16   op=171 sz=5 r32 b10 r32 i0
+     3 pc=21   op=67 sz=3 r32

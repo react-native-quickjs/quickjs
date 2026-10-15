@@ -1,0 +1,66 @@
+F 0327ac1e89d11303c7687daef9aa82ea name=k insns=49
+     0 pc=0    op=16 sz=5 r80 u0
+     1 pc=5    op=20 sz=10 r96 a590 b1 s0
+     2 pc=15   op=216 sz=3 r192 i3
+     3 pc=18   op=72 sz=8 r0 r96 r192 b1
+     4 pc=26   op=20 sz=10 r96 a590 b1 s1
+     5 pc=36   op=216 sz=3 r192 i5
+     6 pc=39   op=72 sz=8 r16 r96 r192 b1
+     7 pc=47   op=216 sz=3 r32 i0
+     8 pc=50   op=216 sz=3 r48 i0
+     9 pc=53   op=174 sz=4 r48 r80 t24
+    10 pc=57   op=72 sz=8 r96 r0 r192 b0
+    11 pc=65   op=190 sz=7 r112 r32 r96
+    12 pc=72   op=171 sz=5 r32 b10 r112 i0
+    13 pc=77   op=228 sz=4 r48 r80 t-24
+    14 pc=81   op=216 sz=3 r48 i0
+    15 pc=84   op=174 sz=4 r48 r80 t24
+    16 pc=88   op=72 sz=8 r96 r16 r192 b0
+    17 pc=96   op=190 sz=7 r112 r32 r96
+    18 pc=103  op=171 sz=5 r32 b10 r112 i0
+    19 pc=108  op=228 sz=4 r48 r80 t-24
+    20 pc=112  op=77 sz=6 r64 r192 b0
+    21 pc=118  op=216 sz=3 r96 i0
+    22 pc=121  op=142 sz=5 u5 r96
+    23 pc=126  op=14 sz=5 r96 u5
+    24 pc=131  op=216 sz=3 r112 i3
+    25 pc=134  op=174 sz=4 r96 r112 t40
+    26 pc=138  op=39 sz=11 r96 r64 a316 s2
+    27 pc=149  op=31 sz=7 r192 c0
+    28 pc=156  op=73 sz=10 r144 r96 r64 r192 b1
+    29 pc=166  op=166 sz=12 b138 u5 I0 t-52
+    30 pc=178  op=72 sz=8 r96 r0 r192 b0
+    31 pc=186  op=72 sz=8 r112 r16 r192 b0
+    32 pc=194  op=216 sz=3 r128 i0
+    33 pc=197  op=45 sz=7 r144 r64 r128
+    34 pc=204  op=73 sz=10 r128 r144 r64 r192 b0
+    35 pc=214  op=216 sz=3 r144 i1
+    36 pc=217  op=45 sz=7 r160 r64 r144
+    37 pc=224  op=73 sz=10 r144 r160 r64 r192 b0
+    38 pc=234  op=216 sz=3 r160 i2
+    39 pc=237  op=45 sz=7 r176 r64 r160
+    40 pc=244  op=73 sz=10 r160 r176 r64 r192 b0
+    41 pc=254  op=217 sz=3 r192 r32
+    42 pc=257  op=141 sz=5 r208 r96
+    43 pc=262  op=141 sz=5 r224 r112
+    44 pc=267  op=141 sz=5 r240 r128
+    45 pc=272  op=141 sz=5 r256 r144
+    46 pc=277  op=141 sz=5 r272 r160
+    47 pc=282  op=77 sz=6 r176 r192 b6
+    48 pc=288  op=67 sz=3 r176
+F 4124d84f3bfe85678f4c0e07e3ceb40f name=make insns=4
+     0 pc=0    op=216 sz=3 r0 i0
+     1 pc=3    op=157 sz=3 r0
+     2 pc=6    op=31 sz=7 r0 c0
+     3 pc=13   op=67 sz=3 r0
+F 4f602236fb6a2e84eaf095a3607dd482 name=<null> insns=7
+     0 pc=0    op=18 sz=5 r0 u0
+     1 pc=5    op=18 sz=5 r16 u1
+     2 pc=10   op=190 sz=7 r0 r0 r16
+     3 pc=17   op=171 sz=5 r0 b10 r0 i0
+     4 pc=22   op=19 sz=5 u0 r0
+     5 pc=27   op=217 sz=3 r0 r0
+     6 pc=30   op=67 sz=3 r0
+F 947a287f2c60beae7e8be46a3a47b807 name=<null> insns=2
+     0 pc=0    op=18 sz=5 r0 u0
+     1 pc=5    op=67 sz=3 r0

@@ -1,0 +1,66 @@
+F 19d4e53108527b5d2765f42e1e941bcd name=k insns=65
+     0 pc=0    op=16 sz=5 r128 u0
+     1 pc=5    op=239 sz=7 r0 c0
+     2 pc=12   op=216 sz=3 r16 i0
+     3 pc=15   op=216 sz=3 r32 i0
+     4 pc=18   op=174 sz=4 r32 r128 t60
+     5 pc=22   op=171 sz=5 r160 b8 r32 i3
+     6 pc=27   op=45 sz=7 r160 r0 r160
+     7 pc=34   op=190 sz=7 r144 r16 r160
+     8 pc=41   op=171 sz=5 r16 b10 r144 i0
+     9 pc=46   op=171 sz=5 r160 b8 r32 i3
+    10 pc=51   op=171 sz=5 r176 b8 r32 i3
+    11 pc=56   op=45 sz=7 r144 r0 r176
+    12 pc=63   op=185 sz=3 r144 i1
+    13 pc=66   op=171 sz=5 r144 b10 r144 i0
+    14 pc=71   op=167 sz=7 r0 r160 r144
+    15 pc=78   op=228 sz=4 r32 r128 t-60
+    16 pc=82   op=77 sz=6 r48 r240 b0
+    17 pc=88   op=216 sz=3 r32 i0
+    18 pc=91   op=216 sz=3 r144 i10
+    19 pc=94   op=174 sz=4 r32 r144 t35
+    20 pc=98   op=39 sz=11 r160 r48 a316 s0
+    21 pc=109  op=189 sz=7 r240 r32 r32
+    22 pc=116  op=73 sz=10 r192 r160 r48 r240 b1
+    23 pc=126  op=212 sz=5 r32 r32
+    24 pc=131  op=172 sz=2 t-42
+    25 pc=133  op=39 sz=11 r144 r48 a315 s1
+    26 pc=144  op=73 sz=10 r64 r144 r48 r240 b0
+    27 pc=154  op=20 sz=10 r144 a180 b1 s2
+    28 pc=164  op=216 sz=3 r240 i8
+    29 pc=167  op=74 sz=10 r80 r144 r144 r240 b1
+    30 pc=177  op=216 sz=3 r32 i0
+    31 pc=180  op=216 sz=3 r144 i8
+    32 pc=183  op=174 sz=4 r32 r144 t19
+    33 pc=187  op=171 sz=5 r176 b0 r32 i3
+    34 pc=192  op=167 sz=7 r80 r32 r176
+    35 pc=199  op=212 sz=5 r32 r32
+    36 pc=204  op=172 sz=2 t-26
+    37 pc=206  op=216 sz=3 r96 i0
+    38 pc=209  op=216 sz=3 r32 i0
+    39 pc=212  op=48 sz=7 r144 r80 s3
+    40 pc=219  op=174 sz=4 r32 r144 t26
+    41 pc=223  op=45 sz=7 r144 r80 r32
+    42 pc=230  op=190 sz=7 r160 r96 r144
+    43 pc=237  op=171 sz=5 r96 b10 r160 i0
+    44 pc=242  op=212 sz=5 r32 r32
+    45 pc=247  op=172 sz=2 t-37
+    46 pc=249  op=216 sz=3 r240 i1
+    47 pc=252  op=77 sz=6 r144 r240 b1
+    48 pc=258  op=216 sz=3 r160 i3
+    49 pc=261  op=41 sz=9 r144 a-2147483646 r160
+    50 pc=270  op=217 sz=3 r112 r144
+    51 pc=273  op=39 sz=11 r144 r0 a99 s4
+    52 pc=284  op=1 sz=8 r240 b1 c600
+    53 pc=292  op=73 sz=10 r176 r144 r0 r240 b1
+    54 pc=302  op=48 sz=7 r272 r48 s5
+    55 pc=309  op=48 sz=7 r320 r80 s6
+    56 pc=316  op=216 sz=3 r192 i1
+    57 pc=319  op=210 sz=7 r336 r192 r112
+    58 pc=326  op=48 sz=7 r352 r112 s7
+    59 pc=333  op=217 sz=3 r240 r16
+    60 pc=336  op=141 sz=5 r256 r176
+    61 pc=341  op=141 sz=5 r288 r64
+    62 pc=346  op=141 sz=5 r304 r96
+    63 pc=351  op=77 sz=6 r224 r240 b8
+    64 pc=357  op=67 sz=3 r224

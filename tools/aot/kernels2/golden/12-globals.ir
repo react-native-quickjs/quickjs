@@ -1,0 +1,25 @@
+F 61861fec44a9d8874e6a3a7cefaef7ad name=bump insns=5
+     0 pc=0    op=20 sz=10 r0 a590 b1 s0
+     1 pc=10   op=185 sz=3 r0 i1
+     2 pc=13   op=171 sz=5 r0 b10 r0 i0
+     3 pc=18   op=21 sz=8 a590 r0 b0
+     4 pc=26   op=68 sz=1
+F c9f3d79cfb74feca015291d861b1f264 name=k insns=18
+     0 pc=0    op=16 sz=5 r32 u0
+     1 pc=5    op=216 sz=3 r0 i0
+     2 pc=8    op=216 sz=3 r16 i0
+     3 pc=11   op=174 sz=4 r16 r32 t44
+     4 pc=15   op=20 sz=10 r48 a590 b1 s0
+     5 pc=25   op=190 sz=7 r64 r0 r48
+     6 pc=32   op=171 sz=5 r0 b10 r64 i0
+     7 pc=37   op=20 sz=10 r48 a593 b1 s1
+     8 pc=47   op=72 sz=8 r48 r48 r128 b0
+     9 pc=55   op=228 sz=4 r16 r32 t-44
+    10 pc=59   op=20 sz=10 r144 a590 b1 s2
+    11 pc=69   op=20 sz=10 r160 a591 b1 s3
+    12 pc=79   op=20 sz=10 r176 a592 b1 s4
+    13 pc=89   op=20 sz=10 r96 a598 b0 s5
+    14 pc=99   op=33 sz=6 r192 b7 r96
+    15 pc=105  op=141 sz=5 r128 r0
+    16 pc=110  op=77 sz=6 r112 r128 b5
+    17 pc=116  op=67 sz=3 r112

@@ -1,0 +1,56 @@
+F a1c9fbbcdd3dd0d9b94d8ed655970ad3 name=k insns=55
+     0 pc=0    op=216 sz=3 r0 i7
+     1 pc=3    op=216 sz=3 r16 i3
+     2 pc=6    op=216 sz=3 r32 i0
+     3 pc=9    op=216 sz=3 r48 i0
+     4 pc=12   op=4 sz=7 r144 I1000
+     5 pc=19   op=174 sz=4 r48 r144 t67
+     6 pc=23   op=224 sz=11 r160 r0 r16 r176 r32
+     7 pc=34   op=171 sz=5 r32 b10 r176 i0
+     8 pc=39   op=171 sz=5 r176 b8 r48 i15
+     9 pc=44   op=191 sz=7 r160 r32 r176
+    10 pc=51   op=171 sz=5 r32 b10 r160 i0
+    11 pc=56   op=171 sz=5 r176 b5 r48 i1
+    12 pc=61   op=197 sz=7 r160 r32 r176
+    13 pc=68   op=171 sz=5 r32 b10 r160 i0
+    14 pc=73   op=171 sz=5 r176 b7 r32 i3
+    15 pc=78   op=171 sz=5 r32 b10 r176 i0
+    16 pc=83   op=212 sz=5 r48 r48
+    17 pc=88   op=172 sz=2 t-78
+    18 pc=90   op=1 sz=8 r64 b0 c0
+    19 pc=98   op=216 sz=3 r48 i0
+    20 pc=101  op=216 sz=3 r144 i100
+    21 pc=104  op=174 sz=4 r48 r144 t29
+    22 pc=108  op=169 sz=11 r176 b0 r64 b0 c1
+    23 pc=119  op=169 sz=11 r64 b3 r176 b0 c2
+    24 pc=130  op=212 sz=5 r48 r48
+    25 pc=135  op=172 sz=2 t-36
+    26 pc=137  op=4 sz=7 r80 I2147483632
+    27 pc=144  op=183 sz=4 r160 r80 i32
+    28 pc=148  op=171 sz=5 r80 b10 r160 i0
+    29 pc=153  op=4 sz=7 r144 I2147483647
+    30 pc=160  op=183 sz=4 r96 r144 i1
+    31 pc=164  op=216 sz=3 r144 i0
+    32 pc=167  op=211 sz=5 r112 r144
+    33 pc=172  op=216 sz=3 r144 i1
+    34 pc=175  op=171 sz=5 r128 b1 r144 i0
+    35 pc=180  op=216 sz=3 r144 i1
+    36 pc=183  op=192 sz=7 r144 r144 r112
+    37 pc=190  op=20 sz=10 r160 a341 b1 s0
+    38 pc=200  op=211 sz=5 r160 r160
+    39 pc=205  op=207 sz=7 r144 r144 r160
+    40 pc=212  op=20 sz=10 r160 a341 b1 s1
+    41 pc=222  op=207 sz=7 r176 r128 r160
+    42 pc=229  op=216 sz=3 r160 i5
+    43 pc=232  op=171 sz=5 r160 b2 r160 i3
+    44 pc=237  op=216 sz=3 r192 i-7
+    45 pc=240  op=35 sz=10 r336 b2 r192 I3
+    46 pc=250  op=217 sz=3 r224 r32
+    47 pc=253  op=141 sz=5 r240 r64
+    48 pc=258  op=141 sz=5 r256 r80
+    49 pc=263  op=141 sz=5 r272 r96
+    50 pc=268  op=141 sz=5 r288 r144
+    51 pc=273  op=141 sz=5 r304 r176
+    52 pc=278  op=141 sz=5 r320 r160
+    53 pc=283  op=77 sz=6 r208 r224 b8
+    54 pc=289  op=67 sz=3 r208

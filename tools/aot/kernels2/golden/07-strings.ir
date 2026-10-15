@@ -1,0 +1,45 @@
+F 2c281a6f54c23c2d1e396f1245828bed name=k insns=44
+     0 pc=0    op=16 sz=5 r48 u0
+     1 pc=5    op=1 sz=8 r0 b1 c48
+     2 pc=13   op=216 sz=3 r16 i0
+     3 pc=16   op=174 sz=4 r16 r48 t16
+     4 pc=20   op=171 sz=5 r80 b8 r16 i7
+     5 pc=25   op=190 sz=7 r0 r0 r80
+     6 pc=32   op=228 sz=4 r16 r48 t-16
+     7 pc=36   op=77 sz=6 r32 r192 b0
+     8 pc=42   op=216 sz=3 r16 i0
+     9 pc=45   op=216 sz=3 r64 i5
+    10 pc=48   op=174 sz=4 r16 r64 t43
+    11 pc=52   op=39 sz=11 r80 r32 a316 s0
+    12 pc=63   op=1 sz=8 r96 b1 c595
+    13 pc=71   op=190 sz=7 r192 r96 r16
+    14 pc=78   op=73 sz=10 r112 r80 r32 r192 b1
+    15 pc=88   op=212 sz=5 r16 r16
+    16 pc=93   op=172 sz=2 t-50
+    17 pc=95   op=48 sz=7 r64 r0 s1
+    18 pc=102  op=39 sz=11 r80 r0 a355 s2
+    19 pc=113  op=216 sz=3 r192 i3
+    20 pc=116  op=73 sz=10 r112 r80 r0 r192 b1
+    21 pc=126  op=39 sz=11 r80 r0 a313 s3
+    22 pc=137  op=1 sz=8 r192 b0 c0
+    23 pc=145  op=73 sz=10 r128 r80 r0 r192 b1
+    24 pc=155  op=39 sz=11 r80 r32 a99 s4
+    25 pc=166  op=1 sz=8 r192 b1 c596
+    26 pc=174  op=73 sz=10 r144 r80 r32 r192 b1
+    27 pc=184  op=1 sz=8 r80 b1 c597
+    28 pc=192  op=39 sz=11 r96 r80 a323 s5
+    29 pc=203  op=216 sz=3 r192 i1
+    30 pc=206  op=73 sz=10 r80 r96 r80 r192 b1
+    31 pc=216  op=1 sz=8 r96 b1 c598
+    32 pc=224  op=39 sz=11 r160 r96 a379 s6
+    33 pc=235  op=73 sz=10 r96 r160 r96 r192 b0
+    34 pc=245  op=1 sz=8 r160 b1 c597
+    35 pc=253  op=169 sz=11 r288 b12 r160 b1 c599
+    36 pc=264  op=141 sz=5 r192 r64
+    37 pc=269  op=141 sz=5 r208 r112
+    38 pc=274  op=141 sz=5 r224 r128
+    39 pc=279  op=141 sz=5 r240 r144
+    40 pc=284  op=141 sz=5 r256 r80
+    41 pc=289  op=141 sz=5 r272 r96
+    42 pc=294  op=77 sz=6 r64 r192 b7
+    43 pc=300  op=67 sz=3 r64

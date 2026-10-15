@@ -184,6 +184,56 @@ static int g_emit_func_base = 0;
    against the interpreter. */
 static int g_deopt_everywhere = 0;
 
+static long long count_insns(const uint8_t *code, int len);
+
+/* --dump-ir: print the register program of every unique eligible function,
+   one line per instruction, so a change to the lowering or the generator's
+   reading of it shows up as a golden-file diff. The new generator replaces
+   this with its SSA dump. */
+static int g_dump_ir = 0;
+static const char *g_ir_path = NULL;
+
+static void dump_ir_func(FILE *f, const JSAotGenFunc *g) {
+  char hex[33];
+  int off = 0, n = 0;
+  JSAotGenInsn in;
+
+  hex16(g->digest, hex);
+  fprintf(
+      f, "F %s name=%s insns=%lld\n", hex, g->name[0] ? g->name : "<anon>",
+      count_insns(g->code, g->len));
+  while (off < g->len &&
+         js_aot_gen_decode_insn(g->code, g->len, off, &in) == 0) {
+    int k;
+    fprintf(f, "  %4d pc=%-4d op=%d sz=%d", n, off, in.op, in.size);
+    for (k = 0; k < in.nargs; k++)
+      fprintf(f, " %c%d", in.arg[k].kind, (int)in.arg[k].val);
+    fputc('\n', f);
+    off += in.size;
+    n++;
+  }
+}
+
+static void dump_ir(const JSAotGenFunc *funcs, int nfuncs) {
+  FILE *f = stdout;
+  int i;
+
+  if (g_ir_path) {
+    f = fopen(g_ir_path, "w");
+    if (!f) {
+      fprintf(stderr, "qjsaot: cannot write %s\n", g_ir_path);
+      return;
+    }
+  }
+  for (i = 0; i < nfuncs; i++) {
+    if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
+    if (i + 1 < nfuncs && memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
+      continue;
+    dump_ir_func(f, &funcs[i]);
+  }
+  if (g_ir_path) fclose(f);
+}
+
 /* Record that deopt site `sid` belongs to the function being emitted. */
 static void deopt_site_note(int sid) {
   if (sid >= g_deopt_site_func_cap) {
@@ -2968,6 +3018,11 @@ int main(int argc, char **argv) {
       aot_layout_header = argv[++i];
     } else if (strcmp(argv[i], "--deopt-everywhere") == 0) {
       g_deopt_everywhere = 1;
+    } else if (strcmp(argv[i], "--dump-ir") == 0) {
+      g_dump_ir = 1;
+    } else if (strcmp(argv[i], "--dump-ir-out") == 0 && i + 1 < argc) {
+      g_dump_ir = 1;
+      g_ir_path = argv[++i];
     } else if (strcmp(argv[i], "--mut") == 0 && i + 1 < argc) {
       g_mut = argv[++i];
     } else if (argv[i][0] == '-') {
@@ -3032,6 +3087,14 @@ int main(int argc, char **argv) {
 
   nfuncs = js_aot_gen_collect(rt, &funcs);
   qsort(funcs, (size_t)nfuncs, sizeof(*funcs), digest_cmp);
+
+  if (g_dump_ir) {
+    dump_ir(funcs, nfuncs);
+    js_aot_gen_free(rt, funcs);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return 0;
+  }
 
   {
     ProfEntry *prof = NULL;
