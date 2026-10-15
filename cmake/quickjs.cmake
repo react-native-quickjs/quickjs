@@ -108,11 +108,13 @@ if(QJS_REGVM)
 endif()
 
 # Ahead-of-time compilation of the register VM (`QJS_AOT=1`). The generator
-# (`tools/aot/qjsaot`) turns a profiled bundle into one C translation unit of
-# straight-line `qjs_aot_step` calls, which is linked into the engine and bound
-# lazily by bytecode digest. QJS_AOT_UNIT names that generated unit; with no
-# unit the engine still builds (the table is a weak symbol) and simply runs
-# everything through the interpreter.
+# (`tools/aot/qjsaot`) turns a profiled bundle into one C translation unit,
+# which is linked into the engine and bound lazily by bytecode digest.
+# QJS_AOT_UNIT names that generated unit; with no unit the engine still builds
+# (the table is a weak symbol) and simply runs everything through the
+# interpreter. The unit runs in the shipping executor (the threaded dispatch
+# plus the record call path), whose activation record the generated code is
+# entered against.
 option(QJS_AOT "Build the register VM with an AOT unit" OFF)
 set(QJS_AOT_UNIT "" CACHE FILEPATH "Generated AOT unit (aot_unit.c) to link into quickjs")
 if(QJS_AOT)

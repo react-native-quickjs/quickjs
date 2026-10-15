@@ -72,18 +72,15 @@ typedef struct JSRegRCC JSRegRCC;
 /*
  * The register VM's default executor is the threaded dispatch plus the record
  * call path. They need Clang's `musttail` and `preserve_none` and computed-goto
- * dispatch; STEPCHECK and the AOT runtime are defined against the monolith, so
- * on those, and on other compilers, the default is 0. The AOT profiler has
- * hooks in the threaded chain, so it keeps the threaded default. Pass
- * `-DQJS_REGVM_THREAD=0` for the monolith, `-DQJS_REGVM_RECORD=0` for the
- * threaded dispatch without the record call path.
+ * dispatch; STEPCHECK is defined against the monolith, so on it, and on other
+ * compilers, the default is 0. Pass `-DQJS_REGVM_THREAD=0` for the monolith,
+ * `-DQJS_REGVM_RECORD=0` for the threaded dispatch without the record call path.
  *
  * Defaulted at the top because both the frame arena and the interpreter read
  * them, and a `#ifndef` default only affects code after it.
  */
 #ifndef QJS_REGVM_THREAD
-#if QJS_REGVM && defined(__clang__) && \
-    !QJS_REGVM_STEPCHECK && !QJS_AOT
+#if QJS_REGVM && defined(__clang__) && !QJS_REGVM_STEPCHECK
 #define QJS_REGVM_THREAD 1
 #else
 #define QJS_REGVM_THREAD 0
@@ -30473,10 +30470,13 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
 #endif
 #if QJS_AOT
     /* Bind the generated entry, if any. A bound function is kept off the record
-       path so its calls reach js_regvm_execute's AOT entry. */
+       and light paths so its calls reach js_regvm_execute's AOT entry. */
     js_aot_bind(b);
-    if (b->aot_fn != NULL)
+    if (b->aot_fn != NULL) {
         b->regvm_call_ready = 0;
+        b->regvm_light = 0;
+        b->regvm_light_fast = 0;
+    }
 #endif
 }
 
@@ -57722,8 +57722,9 @@ static int regvm_homes_mode(void)
 /*
  * AOT runtime. The generated unit is a separate translation unit; the engine
  * binds a register-compiled function to its entry by digest and enters it
- * from js_regvm_execute. It is defined against the monolith's bytecode and
- * control stack, so it needs the monolith build.
+ * from js_regvm_execute, in either executor. `js_regvm_execute` builds the
+ * activation record in every configuration, so the entry point and the frame
+ * construction are the same on the monolith and on the threaded chain.
  *
  * `QJS_AOT_GEN` builds the generator's helpers (tools/aot/qjsaot.c) into the
  * engine. `QJS_AOT_VERIFY` also checks a per-function code CRC at bind, to
@@ -57738,8 +57739,8 @@ static int regvm_homes_mode(void)
 #ifndef QJS_AOT_VERIFY
 #define QJS_AOT_VERIFY 0
 #endif
-#if QJS_AOT && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_RECORD)
-#error "QJS_AOT needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_RECORD=0"
+#if QJS_AOT && !QJS_REGVM
+#error "QJS_AOT needs QJS_REGVM"
 #endif
 #if QJS_AOT_GEN && !QJS_REGVM
 #error "QJS_AOT_GEN needs QJS_REGVM"
@@ -71106,8 +71107,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         b->regvm_light_fast = 0;
     }
 #endif
-#if QJS_AOT
-    /* Bytecode is final here; bind the generated entry if one exists. */
+#if QJS_AOT && !QJS_REGVM_RECORD
+    /* Bytecode is final here; bind the generated entry if one exists. The
+       record build binds from regvm_set_call_desc, which runs just above. */
     js_aot_bind(b);
 #endif
 
@@ -75941,7 +75943,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 #endif
     regvm_set_call_desc(b);
 #endif
-#if QJS_AOT
+#if QJS_AOT && !QJS_REGVM_RECORD
     js_aot_bind(b);
 #endif
     js_fnbc_gc_update(ctx->rt, b);
@@ -76765,7 +76767,7 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
 #endif
         regvm_set_call_desc(b);
 #endif
-#if QJS_AOT
+#if QJS_AOT && !QJS_REGVM_RECORD
         js_aot_bind(b);
 #endif
         js_fnbc_gc_update(ctx->rt, b);
