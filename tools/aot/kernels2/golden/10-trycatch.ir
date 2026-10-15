@@ -88,3 +88,17 @@ F a11dd24cf15078d420b51de62d62ccd7 name=k insns=79
     76 pc=352  op=217 sz=3 r64 r32
     77 pc=355  op=217 sz=3 r80 r0
     78 pc=358  op=64 sz=5 t-183
+F f439fff09be6b6e03d953bdbf22fcf46 name=<eval> insns=13
+     0 pc=0    op=27 sz=6 a590 b64
+     1 pc=6    op=27 sz=6 a593 b64
+     2 pc=12   op=31 sz=7 r16 c0
+     3 pc=19   op=29 sz=8 a590 r16 b0
+     4 pc=27   op=31 sz=7 r16 c1
+     5 pc=34   op=29 sz=8 a593 r16 b0
+     6 pc=42   op=20 sz=10 r16 a599 b1 s0
+     7 pc=52   op=20 sz=10 r32 a593 b1 s1
+     8 pc=62   op=4 sz=7 r64 I5000
+     9 pc=69   op=72 sz=8 r32 r32 r64 b1
+    10 pc=77   op=141 sz=5 r64 r32
+    11 pc=82   op=72 sz=8 r0 r16 r64 b1
+    12 pc=90   op=67 sz=3 r0

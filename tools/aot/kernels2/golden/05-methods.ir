@@ -3,6 +3,30 @@ F 429bf13db9a6272894f21cb1deb9b75f name=<null> insns=4
      1 pc=5    op=231 sz=11 r32 r0 a591 s0
      2 pc=16   op=190 sz=7 r32 r32 r16
      3 pc=23   op=67 sz=3 r32
+F 639e2df0804458c5848236e9dddb7ada name=<eval> insns=23
+     0 pc=0    op=27 sz=6 a590 b64
+     1 pc=6    op=27 sz=6 a593 b64
+     2 pc=12   op=31 sz=7 r16 c0
+     3 pc=19   op=29 sz=8 a590 r16 b0
+     4 pc=27   op=31 sz=7 r16 c3
+     5 pc=34   op=29 sz=8 a593 r16 b0
+     6 pc=42   op=20 sz=10 r16 a590 b1 s0
+     7 pc=52   op=38 sz=11 r16 r16 a63 s1
+     8 pc=63   op=31 sz=7 r32 c1
+     9 pc=70   op=40 sz=11 r16 a69 s2 r32
+    10 pc=81   op=217 sz=3 r0 r32
+    11 pc=84   op=20 sz=10 r16 a590 b1 s3
+    12 pc=94   op=38 sz=11 r16 r16 a63 s4
+    13 pc=105  op=31 sz=7 r32 c2
+    14 pc=112  op=40 sz=11 r16 a112 s5 r32
+    15 pc=123  op=217 sz=3 r0 r32
+    16 pc=126  op=20 sz=10 r16 a601 b1 s6
+    17 pc=136  op=20 sz=10 r32 a593 b1 s7
+    18 pc=146  op=4 sz=7 r64 I10000
+    19 pc=153  op=72 sz=8 r32 r32 r64 b1
+    20 pc=161  op=141 sz=5 r64 r32
+    21 pc=166  op=72 sz=8 r0 r16 r64 b1
+    22 pc=174  op=67 sz=3 r0
 F 9659f71b48a034d3c5afc4575665428d name=P insns=4
      0 pc=0    op=16 sz=5 r16 u0
      1 pc=5    op=9 sz=3 r0

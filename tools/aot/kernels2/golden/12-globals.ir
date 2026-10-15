@@ -4,6 +4,32 @@ F 61861fec44a9d8874e6a3a7cefaef7ad name=bump insns=5
      2 pc=13   op=171 sz=5 r0 b10 r0 i0
      3 pc=18   op=21 sz=8 a590 r0 b0
      4 pc=26   op=68 sz=1
+F b136a1dd5ecbe6fbad145b0d82e5cfe3 name=<eval> insns=25
+     0 pc=0    op=27 sz=6 a590 b0
+     1 pc=6    op=27 sz=6 a591 b128
+     2 pc=12   op=27 sz=6 a592 b128
+     3 pc=18   op=27 sz=6 a593 b64
+     4 pc=24   op=27 sz=6 a594 b64
+     5 pc=30   op=28 sz=6 a590 b0
+     6 pc=36   op=28 sz=6 a591 b130
+     7 pc=42   op=28 sz=6 a592 b128
+     8 pc=48   op=31 sz=7 r16 c0
+     9 pc=55   op=29 sz=8 a593 r16 b0
+    10 pc=63   op=31 sz=7 r16 c1
+    11 pc=70   op=29 sz=8 a594 r16 b0
+    12 pc=78   op=216 sz=3 r16 i11
+    13 pc=81   op=21 sz=8 a590 r16 b0
+    14 pc=89   op=216 sz=3 r16 i3
+    15 pc=92   op=21 sz=8 a591 r16 b1
+    16 pc=100  op=216 sz=3 r16 i4
+    17 pc=103  op=21 sz=8 a592 r16 b1
+    18 pc=111  op=20 sz=10 r16 a599 b1 s0
+    19 pc=121  op=20 sz=10 r32 a594 b1 s1
+    20 pc=131  op=4 sz=7 r64 I3000
+    21 pc=138  op=72 sz=8 r32 r32 r64 b1
+    22 pc=146  op=141 sz=5 r64 r32
+    23 pc=151  op=72 sz=8 r0 r16 r64 b1
+    24 pc=159  op=67 sz=3 r0
 F c9f3d79cfb74feca015291d861b1f264 name=k insns=18
      0 pc=0    op=16 sz=5 r32 u0
      1 pc=5    op=216 sz=3 r0 i0

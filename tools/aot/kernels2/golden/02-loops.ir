@@ -46,3 +46,14 @@ F 10963fb8844d18b4f3545fe120be4cb9 name=k insns=47
     44 pc=203  op=141 sz=5 r288 r192
     45 pc=208  op=77 sz=6 r160 r224 b5
     46 pc=214  op=67 sz=3 r160
+F 83b0ded0fcb343f2fe98076962d701c8 name=<eval> insns=10
+     0 pc=0    op=27 sz=6 a590 b64
+     1 pc=6    op=31 sz=7 r16 c0
+     2 pc=13   op=29 sz=8 a590 r16 b0
+     3 pc=21   op=20 sz=10 r16 a602 b1 s0
+     4 pc=31   op=20 sz=10 r32 a590 b1 s1
+     5 pc=41   op=4 sz=7 r64 I100000
+     6 pc=48   op=72 sz=8 r32 r32 r64 b1
+     7 pc=56   op=141 sz=5 r64 r32
+     8 pc=61   op=72 sz=8 r0 r16 r64 b1
+     9 pc=69   op=67 sz=3 r0

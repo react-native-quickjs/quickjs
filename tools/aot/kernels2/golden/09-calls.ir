@@ -10,6 +10,29 @@ F 0672ed3ae03db61a7d567d22203ee246 name=fact insns=11
      8 pc=40   op=189 sz=7 r32 r0 r16
      9 pc=47   op=171 sz=5 r32 b10 r32 i0
     10 pc=52   op=67 sz=3 r32
+F 0ecd49641b95ee98ba7c10d7354cd481 name=<eval> insns=22
+     0 pc=0    op=27 sz=6 a112 b64
+     1 pc=6    op=27 sz=6 a592 b64
+     2 pc=12   op=27 sz=6 a594 b64
+     3 pc=18   op=27 sz=6 a595 b64
+     4 pc=24   op=27 sz=6 a597 b64
+     5 pc=30   op=31 sz=7 r16 c0
+     6 pc=37   op=29 sz=8 a112 r16 b0
+     7 pc=45   op=31 sz=7 r16 c1
+     8 pc=52   op=29 sz=8 a592 r16 b0
+     9 pc=60   op=31 sz=7 r16 c2
+    10 pc=67   op=29 sz=8 a594 r16 b0
+    11 pc=75   op=31 sz=7 r16 c3
+    12 pc=82   op=29 sz=8 a595 r16 b0
+    13 pc=90   op=31 sz=7 r16 c4
+    14 pc=97   op=29 sz=8 a597 r16 b0
+    15 pc=105  op=20 sz=10 r16 a602 b1 s0
+    16 pc=115  op=20 sz=10 r32 a597 b1 s1
+    17 pc=125  op=4 sz=7 r64 I20000
+    18 pc=132  op=72 sz=8 r32 r32 r64 b1
+    19 pc=140  op=141 sz=5 r64 r32
+    20 pc=145  op=72 sz=8 r0 r16 r64 b1
+    21 pc=153  op=67 sz=3 r0
 F 628cae8d66edb26ab86ca3e147c5d598 name=k insns=54
      0 pc=0    op=16 sz=5 r48 u0
      1 pc=5    op=216 sz=3 r0 i0

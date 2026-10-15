@@ -54,3 +54,16 @@ F a1c9fbbcdd3dd0d9b94d8ed655970ad3 name=k insns=55
     52 pc=278  op=141 sz=5 r320 r160
     53 pc=283  op=77 sz=6 r208 r224 b8
     54 pc=289  op=67 sz=3 r208
+F cc6c82be78290c22a2c239bdc1c1b2be name=<eval> insns=12
+     0 pc=0    op=27 sz=6 a590 b64
+     1 pc=6    op=31 sz=7 r16 c0
+     2 pc=13   op=29 sz=8 a590 r16 b0
+     3 pc=21   op=20 sz=10 r16 a599 b1 s0
+     4 pc=31   op=20 sz=10 r32 a590 b1 s1
+     5 pc=41   op=72 sz=8 r32 r32 r80 b0
+     6 pc=49   op=39 sz=11 r48 r32 a99 s2
+     7 pc=60   op=1 sz=8 r80 b1 c600
+     8 pc=68   op=73 sz=10 r32 r48 r32 r80 b1
+     9 pc=78   op=141 sz=5 r80 r32
+    10 pc=83   op=72 sz=8 r0 r16 r80 b1
+    11 pc=91   op=67 sz=3 r0
