@@ -1524,6 +1524,7 @@ typedef struct JSAotProfPc {
     uint8_t has_num;
     uint8_t frac;          /* a non-integral number was seen */
     uint8_t negzero;       /* -0 was seen */
+    uint8_t elem_kinds;    /* AOT_ELEM_* stored/loaded at an element pc */
     double num_min;
     double num_max;
 } JSAotProfPc;
@@ -1561,6 +1562,13 @@ typedef struct JSAotProfFunc {
 #define AOT_TYPE_UNDEF   (1u << 5)
 #define AOT_TYPE_BIGINT  (1u << 6)
 #define AOT_TYPE_OTHER   (1u << 7)
+
+/* Element kinds seen at an element access site. */
+#define AOT_ELEM_INT    (1u << 0)
+#define AOT_ELEM_FLOAT  (1u << 1)
+#define AOT_ELEM_OBJECT (1u << 2)
+#define AOT_ELEM_MIXED  (1u << 3)
+#define AOT_ELEM_HOLEY  (1u << 4)
 #endif /* QJS_AOT_PROFILE */
 
 typedef struct JSFunctionBytecode {
@@ -1719,6 +1727,7 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
 #endif
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape);
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
+static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey);
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
 #if QJS_REGVM_THREAD
@@ -1746,6 +1755,8 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_pic((b_), (s_), (sh_)); } while (0)
 #define AOT_PROF_REG(b_, d_, v_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
+#define AOT_PROF_ELEM(b_, v_, h_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_elem((b_), (v_), (h_)); } while (0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
         do { if (unlikely(AOT_PROF_ON(b_))) \
                  js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_)); } while (0)
@@ -1775,6 +1786,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
 #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
 #define AOT_PROF_TAKEN(f_, ip_)     ((void)0)
+#define AOT_PROF_ELEM(b_, v_, h_)   ((void)0)
 #endif
 #endif
 
@@ -27858,6 +27870,7 @@ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
     int o = T_REG(1);
     int key = T_REG(3);
     int v = T_REG(5);
+    AOT_PROF_ELEM(f->b, FR(v), 0);
 #if QJS_DRC
     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
         T_NEXT(T_SZ_RRR);
@@ -28404,6 +28417,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
             if (unlikely(js_lazy_marker_is(p->u.array.u.values[idx])))
                 __attribute__((musttail))
                     return regvm_t_get_element_lazy_slow(REGVM_PASS);
+            AOT_PROF_ELEM(f->b, p->u.array.u.values[idx], 0);
             T_SET_NEXT_B(d,p->u.array.u.values[idx], T_SZ_RRR);
         }
         {
@@ -29540,6 +29554,7 @@ static uint8_t *REGVM_CC regvm_t_put_element(REGVM_ARGS)
     int o = T_REG(1);
     int key = T_REG(3);
     int v = T_REG(5);
+    AOT_PROF_ELEM(f->b, FR(v), 0);
 #if QJS_DRC
     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
         T_NEXT(T_SZ_RRR);
@@ -59414,6 +59429,32 @@ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
     }
 }
 
+/* Element kinds at the access site's pc, so the compiler can seed an array's
+   kind and drop the tag check under it. */
+static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
+{
+    JSAotProfFunc *pf = b->aot_prof;
+    uint8_t kind;
+    int pc;
+
+    if (!pf)
+        return;
+    pc = pf->last_pc;
+    if (pc < 0 || pc >= pf->pc_n)
+        return;
+    if (holey)
+        kind = AOT_ELEM_HOLEY;
+    else if (JS_VALUE_GET_TAG(v) == JS_TAG_INT)
+        kind = AOT_ELEM_INT;
+    else if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64)
+        kind = AOT_ELEM_FLOAT;
+    else if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
+        kind = AOT_ELEM_OBJECT;
+    else
+        kind = AOT_ELEM_MIXED;
+    pf->pcs[pc].elem_kinds |= kind;
+}
+
 static JSAotProfCall *aot_call_slot(JSRuntime *rt, JSAotProfFunc *pf, uint32_t pc)
 {
     JSAotProfCall *c;
@@ -59710,11 +59751,14 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
         JSAotProfPc *e = &pf->pcs[i];
         char ts[128];
 
-        if (!e->types)
+        if (!e->types && !e->elem_kinds)
             continue;
         aot_type_str(e->types, ts, sizeof(ts));
         aot_src_str(b, i, src, sizeof(src));
-        if (e->has_num)
+        if (e->elem_kinds)
+            fprintf(f, "P %s pc=%d types=%s elem=%u src=%s\n",
+                    dgt, i, ts, e->elem_kinds, src);
+        else if (e->has_num)
             fprintf(f, "P %s pc=%d types=%s num=%g..%g frac=%u negzero=%u src=%s\n",
                     dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, src);
         else

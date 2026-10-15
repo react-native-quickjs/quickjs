@@ -177,9 +177,11 @@ def parse_file(path, verbose=False):
                 ent = fr.pcs.get(pc)
                 if ent is None:
                     ent = fr.pcs[pc] = {"types": set(), "min": None, "max": None,
-                                        "frac": 0, "negzero": 0,
+                                        "frac": 0, "negzero": 0, "elem": 0,
                                         "src": kv.get("src", "?:?")}
                 ent["types"].update(kv.get("types", "").split("|"))
+                if "elem" in kv:
+                    ent["elem"] |= int(kv["elem"])
                 if "num" in kv:
                     lo, _, hi = kv["num"].partition("..")
                     lo, hi = float(lo), float(hi)
@@ -304,6 +306,21 @@ def merge(into, fr):
         if ent is None:
             ent = g.regs[reg] = [set(), src]
         ent[0].update(ts)
+    for pc, e in fr.pcs.items():
+        ge = g.pcs.get(pc)
+        if ge is None:
+            g.pcs[pc] = {"types": set(e["types"]), "min": e["min"],
+                         "max": e["max"], "frac": e["frac"],
+                         "negzero": e["negzero"], "elem": e["elem"],
+                         "src": e["src"]}
+            continue
+        ge["types"].update(e["types"])
+        if e["min"] is not None:
+            ge["min"] = e["min"] if ge["min"] is None else min(ge["min"], e["min"])
+            ge["max"] = e["max"] if ge["max"] is None else max(ge["max"], e["max"])
+        ge["frac"] |= e["frac"]
+        ge["negzero"] |= e["negzero"]
+        ge["elem"] |= e["elem"]
     g.ins = max(g.ins, fr.ins)
     if not g.uncovered:
         g.uncovered = list(fr.uncovered)
@@ -373,6 +390,9 @@ def write(out, funcs):
                 out.write("P %s pc=%d types=%s num=%g..%g frac=%d negzero=%d src=%s\n"
                           % (fr.digest, pc, ts, e["min"], e["max"],
                              e["frac"], e["negzero"], e["src"]))
+            elif e["elem"]:
+                out.write("P %s pc=%d types=%s elem=%d src=%s\n"
+                          % (fr.digest, pc, ts, e["elem"], e["src"]))
             else:
                 out.write("P %s pc=%d types=%s src=%s\n"
                           % (fr.digest, pc, ts, e["src"]))
