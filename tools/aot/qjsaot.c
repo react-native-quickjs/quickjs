@@ -2819,6 +2819,22 @@ static int emit_region(
    with its own lowering. NULL means the template emitter below. */
 int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
+/* The deopt-everywhere sweep and its site ids, shared with the emitter: under
+   the sweep every instruction is a guard site, and the ids have to come from
+   the driver's single id space. */
+/* The AOT proto-fold site ids are a second id space, handed out per emitted
+   `get_field2`; the emitter needs it for the fold it emits too. */
+int qjs_aot_site_new(void) {
+  return g_site_next++;
+}
+
+int qjs_aot_sweep_on(void) {
+  return g_deopt_everywhere;
+}
+int qjs_aot_sweep_site(void) {
+  return deopt_site_new();
+}
+
 static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   int off = 0, n = 0, i;
   int *offs = NULL;

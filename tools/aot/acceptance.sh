@@ -45,8 +45,9 @@ log() { echo "== $* =="; }
 
 # ---- build -----------------------------------------------------------------
 log "build generator"
-"$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -o "$O/qjsaot" \
-  tools/aot/qjsaot.c $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c -lm || exit 1
+"$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -DQJS_AOT_NO_MAIN \
+  -o "$O/qjsaot2" tools/aot/qjsaot.c tools/aot/qjsaot2/*.c \
+  $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c -lm || exit 1
 
 log "build engine"
 "$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT=1 -DJS_ENABLE_DEBUGGER=0 -c $S/quickjs.c -o "$O/obj/quickjs.o" || exit 1
@@ -66,7 +67,7 @@ build_unit() {
   if [ "$tag" = box2d ] && [ -n "$PROFILE" ]; then
     pargs="--profile $PROFILE"; sargs=""
   fi
-  "$O/qjsaot" --out "$O/$tag.c" --layout-header "$O/$tag-layout.h" $sargs $pargs "$js" 2>"$O/$tag.census"
+  "$O/qjsaot2" --out "$O/$tag.c" --layout-header "$O/$tag-layout.h" $sargs $pargs "$js" 2>"$O/$tag.census"
   "$CLANG" $UNIT_OPT $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/$tag.c" -o "$O/obj/$tag.o" || return 1
   "$CLANG" -o "$O/bench-$tag" "$O/obj/qjs-bench.o" "$O/obj/$tag.o" \
     "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || return 1
@@ -145,7 +146,7 @@ ASAN="not run (--full to include)"
 if [ "$FULL" = 1 ]; then
   log "test262 (--all, AOT harness unit)"
   # The harness is a glob of files, so build the unit by hand.
-  "$O/qjsaot" --out "$O/t262.c" --layout-header "$O/t262-layout.h" --all \
+  "$O/qjsaot2" --out "$O/t262.c" --layout-header "$O/t262-layout.h" --all \
     $S/test262/harness/*.js "$BOX2D" 2>"$O/t262.census"
   "$CLANG" $UNIT_OPT $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/t262.c" -o "$O/obj/t262.o"
   "$CLANG" -O2 $BASE -c $S/run-test262.c -o "$O/obj/run-test262.o"

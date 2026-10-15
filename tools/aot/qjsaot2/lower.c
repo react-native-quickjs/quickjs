@@ -6,34 +6,27 @@
  */
 
 /*
- * The first lowering: the IR's control flow drives the emitted C.
- *
- * What this pass is, and what it is not:
+ * The lowering: the IR's control flow drives the emitted C.
  *
  *   - Control flow is the CFG's own. A branch becomes a real `goto` between
- *     blocks and a loop becomes a real loop; the unit has no per-instruction
- *     dispatch and no `switch (pc)` after an instruction. The only switch left
- *     is the entry one (a resumed or deoptimised frame lands on a block start)
- *     plus a slow-dispatch safety net for a control transfer the graph does not
- *     model.
- *   - An operation the classifier does not know is a fallback: it runs through
- *     the engine's own step routine. That is one generic helper on tagged
- *     values, which is what this stage calls for; the specialised helpers come
- *     with types.
- *   - `fr` stays the home of every value. Under DRC the frame's register range
- *     is the engine's root range (`REGVM_SET_ROOT`), so a value that must
- *     survive a call has to be reachable from it; holding values only in C
- *     locals is a change that comes with the allocator and its ownership rule,
- *     not with the graph build. The liveness this IR computes is therefore
- *     exact rather than decorative: it is what a later pass needs to know
- *     before it moves a value out of the frame.
- *   - Returns go through the step engine for now. A native return needs an ABI
- *     entry point that hands the value out of the frame (the frame handle is
- *     opaque to the unit and `qjs_aot_ret` only reads it).
- *
- * The lowering is deliberately uniform: one shape for every instruction, so
- * there is nothing to get subtly wrong per opcode before the IR verifier and
- * the gates are looking at it.
+ *     blocks and a loop becomes a real loop; there is no per-instruction
+ *     dispatch and no `switch (pc)` after an instruction. Fallbacks share one
+ *     step exit, and the entry dispatch covers every pc for a deoptimised or
+ *     resumed frame and the control transfers the graph does not model.
+ *   - The operations the profile is made of are lowered natively, through the
+ *     same ABI helpers the interpreter's own fast paths use, on the frame's
+ *     registers. Those lowerings are also where guards live: in a sweep build
+ *     a guard miss leaves to the interpreter with a deopt taken *before* the
+ *     instruction, so the interpreter re-executes it.
+ *   - Everything else runs through the engine's step routine, one generic
+ *     helper on tagged values.
+ *   - `fr` stays the home of every value. Under DRC the register range is the
+ *     engine's root range, so a value that must survive a collection has to be
+ *     reachable from it; holding values only in C locals arrives with the
+ *     allocator, and `fr` going stale is what a frame state is for. The IR's
+ *     liveness is exact and verifier-checked for that pass. A guard thus
+ *     re-executes rather than reconstructing: it misses before its
+ *     instruction, where the frame still holds the interpreter's state.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,10 +36,30 @@
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
 
-/* The value of a register operand, as the frame holds it. */
-/* Registers are byte offsets into the frame; AOT_REG is the ABI's accessor. */
+/* The driver's id spaces and sweep flag (qjsaot.c): the deopt sites and the
+   proto-fold sites are allocated from the unit's global counters, so the
+   emitter has to take its ids from the same place the driver does. */
+int qjs_aot_sweep_on(void);
+int qjs_aot_sweep_site(void);
+int qjs_aot_site_new(void);
 
-/* The branch target of an instruction: an operand is relative to the end. */
+/* A fresh deopt site, or -1 when not sweeping. */
+static int q2_site(void) {
+  return qjs_aot_sweep_on() ? qjs_aot_sweep_site() : -1;
+}
+
+/* The guard exit: a miss leaves compiled code *before* the instruction and the
+   interpreter re-executes it there. The frame already holds the state it
+   expects, so nothing is written back. */
+static void q2_guard(FILE *f, int off, int sid) {
+  if (sid >= 0)
+    fprintf(
+        f,
+        "      if (__builtin_expect(qjs_aot_should_deopt(ctx, %d), 0)) "
+        "return qjs_aot_deopt(ctx, f, fr, %d, %d);\n",
+        sid, off, sid);
+}
+
 static int q2_target(const Q2Insn *in, int arg, int *tgt) {
   if (arg >= in->narg || in->arg[arg].kind != 't') return 0;
   *tgt = in->next + (int)in->arg[arg].val;
@@ -54,9 +67,7 @@ static int q2_target(const Q2Insn *in, int arg, int *tgt) {
 }
 
 /* A back edge polls the embedder's interrupt handler, the way every
-   interpreted back edge does, so a compiled loop can still be stopped. The
-   caller has already opened the arm this lands in, so it emits only the poll
-   and the branch. */
+   interpreted back edge does. The caller opened the arm this lands in. */
 static void q2_emit_edge(FILE *f, int off, int tgt) {
   if (tgt <= off)
     fprintf(
@@ -67,36 +78,275 @@ static void q2_emit_edge(FILE *f, int off, int tgt) {
   fprintf(f, " goto pc_%d;", tgt);
 }
 
-/* One instruction that runs through the shared step routine. */
-static void q2_emit_fallback(FILE *f, const Q2Insn *in) {
+/* One instruction through the shared step routine: the common case is a return
+   of the next pc, everything else leaves through `step_exit`. */
+static void q2_emit_fallback(FILE *f, const Q2Insn *in, int exit_pc) {
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
   fprintf(
       f,
       "    if (__builtin_expect(ip == NULL, 0)) { pc = %d; goto "
       "exception; }\n",
       in->pc);
-  fprintf(f, "    if (ip == QJS_AOT_COLD_RET) return qjs_aot_ret(f);\n");
-  fprintf(
-      f,
-      "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return "
-      "qjs_aot_ret(f);\n");
-  /* A yield or await resumes at its own pc: the twin detects the resume
-     marker and returns the ip it was given, so the instruction runs again and
-     takes its resumed arm. That is not a new location, so it loops back rather
-     than leaving through the dispatch. */
-  fprintf(
-      f, "    if (__builtin_expect(ip == code + %d, 0)) goto pc_%d;\n", in->pc,
-      in->pc);
-  fprintf(
-      f,
-      "    if (__builtin_expect(ip != code + %d, 0)) { pc = (uint32_t)(ip "
-      "- code); goto dispatch_ip; }\n",
-      in->next);
+  if (in->next >= exit_pc)
+    fprintf(
+        f, "    if (__builtin_expect(ip == code + %d, 1)) goto pc_end;\n",
+        in->next);
+  else
+    fprintf(
+        f, "    if (__builtin_expect(ip == code + %d, 1)) goto pc_%d;\n",
+        in->next, in->next);
+  fprintf(f, "    pc = (uint32_t)(ip - code);\n    goto step_exit;\n");
 }
 
-/* Try to lower one instruction natively. Returns 1 when it did. */
+/* SET_REG_P: the destination takes over the value. */
+static void q2_set_p(FILE *f, int d, const char *val) {
+  fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, %s);\n", d, val);
+}
+
+/* 1 lowered it, 0 to fall back, 2 when the fast path is lowered and a miss
+   still needs the step. */
 static int q2_emit_native(FILE *f, const Q2Insn *in) {
   switch (in->rop) {
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false: {
+      int d = (int)in->arg[0].val;
+      q2_set_p(
+          f, d,
+          in->rop == ROP_load_undefined ? "JS_UNDEFINED"
+          : in->rop == ROP_load_null    ? "JS_NULL"
+          : in->rop == ROP_load_true    ? "JS_TRUE"
+                                        : "JS_FALSE");
+      return 1;
+    }
+    case ROP_load_i8:
+    case ROP_load_i8_s: {
+      int d = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    qjs_aot_set_reg_p(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, "
+          "%d));\n",
+          d, (int)(int8_t)in->arg[1].val);
+      return 1;
+    }
+    case ROP_load_i32: {
+      int d = (int)in->arg[0].val;
+      fprintf(
+          f,
+          "    qjs_aot_set_reg_p(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, "
+          "(int32_t)%d));\n",
+          d, (int32_t)in->arg[1].val);
+      return 1;
+    }
+    case ROP_move:
+    case ROP_move_s: {
+      int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
+      if (d != a)
+        fprintf(f, "    AOT_SET_B(ctx, fr, %d, AOT_REG(fr, %d));\n", d, a);
+      return 1;
+    }
+    case ROP_move_xfer: {
+      int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
+      q2_guard(f, in->pc, q2_site());
+      fprintf(f, "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n", d, a);
+      return 1;
+    }
+
+    case ROP_get_local: {
+      int d = (int)in->arg[0].val, slot = (int)in->arg[1].val;
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, vb[%d]);\n", d, slot);
+      return 1;
+    }
+    case ROP_put_local:
+    case ROP_put_local_xfer: {
+      int slot = (int)in->arg[0].val, s = (int)in->arg[1].val;
+      fprintf(
+          f, "    qjs_aot_put_local(ctx, vb, %d, AOT_REG(fr, %d));\n", slot, s);
+      return 1;
+    }
+    case ROP_get_arg: {
+      int d = (int)in->arg[0].val, slot = (int)in->arg[1].val;
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n", d, slot);
+      return 1;
+    }
+    case ROP_get_arg2: {
+      int d = (int)in->arg[0].val, s1 = (int)in->arg[1].val;
+      int d2 = (int)in->arg[2].val, s2 = (int)in->arg[3].val;
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n", d, s1);
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, ab[%d]);\n", d2, s2);
+      return 1;
+    }
+
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul: {
+      int d = (int)in->arg[0].val, a = (int)in->arg[1].val,
+          b = (int)in->arg[2].val;
+      int sub = in->rop == ROP_add   ? REG_BIN_ADD
+                : in->rop == ROP_sub ? REG_BIN_SUB
+                                     : REG_BIN_MUL;
+      fprintf(f, "    { JSValue _o;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_o)) "
+          "{ AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n",
+          sub, a, b, d, in->next);
+      return 2;
+    }
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+    case ROP_binary_imm:
+    case ROP_binary_imm_s: {
+      int d = (int)in->arg[0].val;
+      int sub = (in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s)
+                    ? (int)in->arg[1].val
+                    : (in->rop == ROP_add_imm_s ? REG_BIN_ADD : REG_BIN_SUB);
+      int a = (in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s)
+                  ? (int)in->arg[2].val
+                  : (int)in->arg[1].val;
+      int32_t imm = (in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s)
+                        ? (int32_t)in->arg[3].val
+                        : (int32_t)in->arg[2].val;
+      fprintf(f, "    { JSValue _o;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), "
+          "JS_MKVAL(JS_TAG_INT, %d), &_o)) { AOT_SET_B(ctx, fr, %d, _o); "
+          "goto pc_%d; } }\n",
+          sub, a, imm, d, in->next);
+      return 2;
+    }
+
+    /* the fused multiply-add family: mul then add/sub, as the handler does;
+       both operands are read before either register is written */
+    case ROP_mul_add:
+    case ROP_mul_sub:
+    case ROP_add_mul:
+    case ROP_sub_mul: {
+      int dm = (int)in->arg[0].val, x = (int)in->arg[1].val,
+          y = (int)in->arg[2].val;
+      int da = (int)in->arg[3].val, c = (int)in->arg[4].val;
+      int mul_first = (in->rop == ROP_mul_add || in->rop == ROP_mul_sub);
+      int sub2 = (in->rop == ROP_mul_add || in->rop == ROP_add_mul)
+                     ? REG_BIN_ADD
+                     : REG_BIN_SUB;
+      int lhs2 = mul_first ? dm : c;
+      int rhs2 = mul_first ? c : dm;
+      fprintf(f, "    { JSValue _t, _r;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_t)) "
+          "{\n",
+          REG_BIN_MUL, x, y);
+      fprintf(f, "        AOT_SET_B(ctx, fr, %d, _t);\n", dm);
+      fprintf(
+          f,
+          "        if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_r)) "
+          "{ AOT_SET_B(ctx, fr, %d, _r); goto pc_%d; } }\n",
+          sub2, lhs2, rhs2, da, in->next);
+      fprintf(f, "    }\n");
+      return 2;
+    }
+
+    /* property reads and the chain form: the shape-guarded own read */
+    case ROP_get_field:
+    case ROP_get_field_own: {
+      int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
+      int site = (int)in->arg[3].val;
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      fprintf(f, "    { JSValue _o;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_o)) "
+          "{ AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n",
+          a, site, d, in->next);
+      return 2;
+    }
+    case ROP_get_field_chain:
+    case ROP_get_field_chain_own: {
+      int d1 = (int)in->arg[0].val, r1 = (int)in->arg[1].val;
+      int s1 = (int)in->arg[3].val, d2 = (int)in->arg[4].val;
+      int s2 = (int)in->arg[7].val;
+      if (s1 == REG_IC_NONE || s2 == REG_IC_NONE) return 0;
+      fprintf(f, "    { JSValue _v1, _v2;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_v1) && "
+          "qjs_aot_own_read_hit(f, pic, _v1, %d, &_v2)) { AOT_SET_B(ctx, "
+          "fr, %d, _v1); AOT_SET_B(ctx, fr, %d, _v2); goto pc_%d; } }\n",
+          r1, s1, s2, d1, d2, in->next);
+      return 2;
+    }
+    /* get_field2 is the "load a method for a call" form: the folded prototype
+       read first (its own site id space), then the own read */
+    case ROP_get_field2:
+    case ROP_get_field2_own: {
+      int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
+      int site = (int)in->arg[3].val;
+      int sid;
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      sid = qjs_aot_site_new();
+      fprintf(f, "    { JSValue _o;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_proto_fold(ctx, f, pic, %d, Q2_REG(%d), %d, "
+          "&_o)) { qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n",
+          sid, a, site, d, in->next);
+      fprintf(
+          f,
+          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_o)) "
+          "{ AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n",
+          a, site, d, in->next);
+      return 2;
+    }
+
+    /* get_element: the plain-array fast path, which returns an owned value */
+    case ROP_get_element: {
+      int d = (int)in->arg[0].val, a = (int)in->arg[1].val,
+          b = (int)in->arg[2].val;
+      fprintf(f, "    { JSValue _o;\n");
+      q2_guard(f, in->pc, q2_site());
+      fprintf(
+          f,
+          "      if (qjs_aot_get_element(Q2_REG(%d), Q2_REG(%d), &_o)) "
+          "{ qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n",
+          a, b, d, in->next);
+      return 2;
+    }
+
+    /* the tests with no coercion: no guard, no step */
+    case ROP_branch_null:
+    case ROP_branch_not_null: {
+      int a = (int)in->arg[0].val, tgt;
+      int want = (in->rop == ROP_branch_null);
+      if (!q2_target(in, 1, &tgt)) return 0;
+      fprintf(
+          f,
+          "    if ((JS_VALUE_GET_TAG(Q2_REG(%d)) == JS_TAG_NULL) == %d) "
+          "{",
+          a, want);
+      q2_emit_edge(f, in->pc, tgt);
+      fprintf(f, " } else goto pc_%d;\n", in->next);
+      return 1;
+    }
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish: {
+      int a = (int)in->arg[0].val, tgt;
+      int want = (in->rop == ROP_branch_nullish);
+      if (!q2_target(in, 1, &tgt)) return 0;
+      fprintf(f, "    if (qjs_aot_nullish(Q2_REG(%d)) == %d) {", a, want);
+      q2_emit_edge(f, in->pc, tgt);
+      fprintf(f, " } else goto pc_%d;\n", in->next);
+      return 1;
+    }
+
     case ROP_branch:
     case ROP_branch_s: {
       int tgt;
@@ -114,8 +364,7 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       fprintf(f, "      if (_b < 0) { pc = %d; goto exception; }\n", in->pc);
       fprintf(f, "      if (_b == %d) {", want_true);
       q2_emit_edge(f, in->pc, tgt);
-      fprintf(f, " }\n");
-      fprintf(f, "      goto pc_%d; }\n", in->next);
+      fprintf(f, " } else goto pc_%d; }\n", in->next);
       return 1;
     }
     case ROP_branch_cmp_reg_reg:
@@ -133,8 +382,6 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       fprintf(f, "        if (_t) {");
       q2_emit_edge(f, in->pc, tgt);
       fprintf(f, " } else goto pc_%d; } }\n", in->next);
-      /* The generic comparison stays in the step engine, as the template
-         does. */
       return 2;
     }
     default:
@@ -142,13 +389,11 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
   }
 }
 
-/* The entry dispatch: a fresh entry (pc 0), a deoptimised or resumed frame and
-   an unwind all arrive here with a pc, and every instruction has a label, so
-   the switch covers them all. It is reached on entry and on the rare control
-   transfers the graph does not model, never per instruction. */
-static void q2_emit_dispatch(FILE *f, const Q2Func *fn) {
+/* A fresh entry, a deoptimised or resumed frame and an unwind all arrive with
+   a pc, and every instruction has a label. */
+static void q2_emit_pc_switch(FILE *f, const Q2Func *fn) {
   int i;
-  fprintf(f, "dispatch_ip:\n    switch (pc) {\n");
+  fprintf(f, "    switch (pc) {\n");
   for (i = 0; i < fn->ninsns; i++)
     fprintf(f, "    case %d: goto pc_%d;\n", fn->insns[i].pc, fn->insns[i].pc);
   fprintf(f, "    case %d: goto pc_end;\n", fn->exit_pc);
@@ -156,7 +401,7 @@ static void q2_emit_dispatch(FILE *f, const Q2Func *fn) {
 }
 
 static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
-  int i, k;
+  int i;
 
   fprintf(
       f,
@@ -169,9 +414,9 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    JSValue *vb = qjs_aot_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = qjs_aot_arg_buf(f);\n");
   fprintf(f, "    const void *pic = qjs_aot_pic(f);\n");
-  fprintf(f, "    (void)code; (void)vb; (void)ab; (void)pic;\n");
-  /* Registers are byte offsets into the frame. */
+  fprintf(f, "    (void)code; (void)ip; (void)vb; (void)ab; (void)pic;\n");
   fprintf(f, "#define Q2_REG(off) AOT_REG(fr, off)\n");
+  fprintf(f, "    (void)qjs_aot_should_deopt;\n");
   fprintf(f, "    goto dispatch_ip;\n");
 
   for (i = 0; i < fn->ninsns; i++) {
@@ -179,14 +424,21 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
     int done;
     fprintf(f, "pc_%d:\n", in->pc);
     done = q2_emit_native(f, in);
-    if (done == 2) {
-      q2_emit_fallback(f, in);
-    } else if (!done) {
-      q2_emit_fallback(f, in);
-    }
+    if (done != 1) q2_emit_fallback(f, in, fn->exit_pc);
   }
   fprintf(f, "pc_end:\n    return qjs_aot_ret(f);\n");
-  q2_emit_dispatch(f, fn);
+  fprintf(f, "step_exit:\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_COLD_RET, 0)) return "
+      "qjs_aot_ret(f);\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return "
+      "qjs_aot_ret(f);\n");
+  q2_emit_pc_switch(f, fn);
+  fprintf(f, "dispatch_ip:\n");
+  q2_emit_pc_switch(f, fn);
   fprintf(f, "exception: {\n");
   fprintf(f, "        uint32_t rp;\n");
   fprintf(f, "        JSValue ex = qjs_aot_unwind(ctx, f, fr, pc, &rp);\n");
@@ -195,7 +447,6 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "        return JS_EXCEPTION;\n    }\n}\n\n");
 }
 
-/* The driver's body-emitter entry point. */
 int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   Q2Func fn;
   char msg[256];
