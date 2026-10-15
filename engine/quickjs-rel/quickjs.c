@@ -23499,6 +23499,15 @@ extern uint64_t js_regvm_getfield_ic[3];
  * integer payload (int, boolean, zeroed null and undefined); only a tag above
  * JS_TAG_UNDEFINED needs the out-of-line conversion.
  */
+static inline int regvm_is_nullish_loose(JSValue v)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(v);
+
+    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
+        return 1;
+    return tag == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(v)->is_HTMLDDA;
+}
+
 static inline __attribute__((always_inline)) int regvm_truthy_fast(JSValue v)
 {
     int tag = JS_VALUE_GET_TAG(v);
@@ -26077,6 +26086,10 @@ static uint8_t *REGVM_CC regvm_t_branch_if(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_if_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_if_not_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_branch_null(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_branch_not_null(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_branch_nullish(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_branch_not_nullish(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_cmp_reg_reg(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_cmp_reg_reg_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_cmp_reg_reg_s(REGVM_ARGS);
@@ -26446,6 +26459,10 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(branch_s, regvm_t_branch_s) \
     X(branch_if, regvm_t_branch_if) \
     X(branch_if_not, regvm_t_branch_if_not) \
+    X(branch_null, regvm_t_branch_null) \
+    X(branch_not_null, regvm_t_branch_not_null) \
+    X(branch_nullish, regvm_t_branch_nullish) \
+    X(branch_not_nullish, regvm_t_branch_not_nullish) \
     X(branch_cmp_reg_reg, regvm_t_branch_cmp_reg_reg) \
     X(branch_cmp_reg_reg_s, regvm_t_branch_cmp_reg_reg_s) \
     X(branch_lt_s, regvm_t_branch_lt_s) \
@@ -29185,6 +29202,54 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
     __attribute__((musttail)) return regvm_t_branch_if_not_slow(REGVM_PASS);
 }
 
+static uint8_t *REGVM_CC regvm_t_branch_null(REGVM_ARGS)
+{
+    int c = T_REG(1);
+    int32_t off = T_I32(3);
+    JSValue v = FR(c);
+
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_NULL) {
+        T_BR_NEXT(T_SZ_RT + off);
+    }
+    T_NEXT(T_SZ_RT);
+}
+
+static uint8_t *REGVM_CC regvm_t_branch_not_null(REGVM_ARGS)
+{
+    int c = T_REG(1);
+    int32_t off = T_I32(3);
+    JSValue v = FR(c);
+
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_NULL) {
+        T_BR_NEXT(T_SZ_RT + off);
+    }
+    T_NEXT(T_SZ_RT);
+}
+
+static uint8_t *REGVM_CC regvm_t_branch_nullish(REGVM_ARGS)
+{
+    int c = T_REG(1);
+    int32_t off = T_I32(3);
+    JSValue v = FR(c);
+
+    if (regvm_is_nullish_loose(v)) {
+        T_BR_NEXT(T_SZ_RT + off);
+    }
+    T_NEXT(T_SZ_RT);
+}
+
+static uint8_t *REGVM_CC regvm_t_branch_not_nullish(REGVM_ARGS)
+{
+    int c = T_REG(1);
+    int32_t off = T_I32(3);
+    JSValue v = FR(c);
+
+    if (!regvm_is_nullish_loose(v)) {
+        T_BR_NEXT(T_SZ_RT + off);
+    }
+    T_NEXT(T_SZ_RT);
+}
+
 /*
  * The compare-and-branch forms: a fast path and a cold half each. `sub` may be
  * a constant, so the switch inside regvm_int_cmp folds away at ten of the
@@ -31514,6 +31579,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             [ROP_branch] = REGVM_MONO_ENTRY(L_ROP_branch),
             [ROP_branch_if] = REGVM_MONO_ENTRY(L_ROP_branch_if),
             [ROP_branch_if_not] = REGVM_MONO_ENTRY(L_ROP_branch_if_not),
+            [ROP_branch_null] = REGVM_MONO_ENTRY(L_ROP_branch_null),
+            [ROP_branch_not_null] = REGVM_MONO_ENTRY(L_ROP_branch_not_null),
+            [ROP_branch_nullish] = REGVM_MONO_ENTRY(L_ROP_branch_nullish),
+            [ROP_branch_not_nullish] = REGVM_MONO_ENTRY(L_ROP_branch_not_nullish),
             [ROP_return] = &&L_ROP_return,
             [ROP_return_undefined] = &&L_ROP_return_undefined,
             [ROP_initial_yield] = &&L_ROP_initial_yield,
@@ -34493,6 +34562,22 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             L_ROP_branch_if_not:
                 { int c = RD_REG(); int32_t off = RD_I32();
                   if (!regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
+                  REGVM_NEXT(); }
+            L_ROP_branch_null:
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (JS_VALUE_GET_TAG(regs[c]) == JS_TAG_NULL) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+            L_ROP_branch_not_null:
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (JS_VALUE_GET_TAG(regs[c]) != JS_TAG_NULL) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+            L_ROP_branch_nullish:
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (regvm_is_nullish_loose(regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+            L_ROP_branch_not_nullish:
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (!regvm_is_nullish_loose(regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off; }
                   REGVM_NEXT(); }
             /*
              * Suspension. The frame stays in the state and the body is
@@ -58797,6 +58882,10 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
     [ROP_branch] = "t",
     [ROP_branch_if] = "rt",
     [ROP_branch_if_not] = "rt",
+    [ROP_branch_null] = "rt",
+    [ROP_branch_not_null] = "rt",
+    [ROP_branch_nullish] = "rt",
+    [ROP_branch_not_nullish] = "rt",
     [ROP_return] = "r",
     [ROP_return_undefined] = "",
     [ROP_initial_yield] = "",
@@ -63895,6 +63984,44 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
                     br->ops[1] = other;
                     br->ops[2] = other;
                     br->ops[3] = target;
+                    drop[i] = 1;
+                    drop[i - 1] = 1;
+                    continue;
+                }
+            }
+            if (prev->rop == ROP_unary && prev->n_ops == 3 &&
+                prev->ops[1] == REG_UN_IS_NULL) {
+                br->rop = inv ? ROP_branch_not_null : ROP_branch_null;
+                br->n_ops = 2;
+                br->ops[0] = prev->ops[2];
+                br->ops[1] = target;
+                drop[i] = 1;
+                continue;
+            }
+            if (i >= 1 && prev->rop == ROP_binary && prev->n_ops == 4 &&
+                prev->ops[2] != prev->ops[3] &&
+                (ir->insns[i - 1].rop == ROP_load_null ||
+                 ir->insns[i - 1].rop == ROP_load_undefined) &&
+                ir->insns[i - 1].n_ops == 1) {
+                int u = ir->insns[i - 1].ops[0];
+                int base = sub & ~REG_CMP_INVERT;
+                int is_null = ir->insns[i - 1].rop == ROP_load_null;
+                int loose = base == REG_BIN_EQ || base == REG_BIN_NEQ;
+                int strict = base == REG_BIN_STRICT_EQ || base == REG_BIN_STRICT_NEQ;
+                if (u >= 0 && u < n_values && nref[u] == 2 &&
+                    (prev->ops[2] == u || prev->ops[3] == u) &&
+                    (loose || (strict && is_null))) {
+                    int other = (prev->ops[2] == u) ? prev->ops[3] : prev->ops[2];
+                    int k = (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ)
+                                ^ ((sub & REG_CMP_INVERT) != 0)
+                                ^ (inv != 0);
+                    if (loose)
+                        br->rop = k ? ROP_branch_not_nullish : ROP_branch_nullish;
+                    else
+                        br->rop = k ? ROP_branch_not_null : ROP_branch_null;
+                    br->n_ops = 2;
+                    br->ops[0] = other;
+                    br->ops[1] = target;
                     drop[i] = 1;
                     drop[i - 1] = 1;
                     continue;

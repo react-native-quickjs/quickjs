@@ -1067,21 +1067,25 @@
       "sha256": "dad33ea84fda966d42cff806bcd1631ec425085dec06e07b05c21e4aead20328"
     },
     {
+      "name": "0272-regvm-null-branches.patch",
+      "sha256": "fb3ab436d4e85deeb638e4277d8b2365271d0264268c49d66fd084d7047fd86a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "e7d794e10a7d1b4ea932116e94c47b23980e177be9f99b6e8d1e85132e75ff7c"
+      "sha256": "c447218bac7e10b77f9de7e92acf9b67964a6a571818a82e952115509fba8ff2"
     }
   ],
   "files": {
-    "quickjs.c": "88cb73fcc1d5a80dd37aff5e7b4c905d1eedd5efe2805cfe0950d6ea8d21b338",
+    "quickjs.c": "001552e9cc718debe2ab0f51ab46c6a1e794423acc0578e9eb677323751f44e5",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
-    "builtin-array-fromasync.regvm.h": "5851f9666ee83d9a907c2e664ce1ac8ce43ee9853513eec43107b65f864f722d",
+    "builtin-array-fromasync.regvm.h": "481b1fcc19c8a439f9c8ace3b309e83fe3c01ecdb3e9a0e833f10b5b81027874",
     "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
-    "builtin-iterator-zip-keyed.regvm.h": "b8ad9f005f08f831617da827d3be4d6311f02c0d90163caa2e9adb5a6dc33afb",
+    "builtin-iterator-zip-keyed.regvm.h": "d6222df2a984a23888e669612b072911562def74b5c29e5dee61903b6ebec593",
     "builtin-iterator-zip.h": "1133567b87c8af0d6c3c680ec1a8fcfcba65acc975885477c2c688ac55f149bc",
-    "builtin-iterator-zip.regvm.h": "b5a84fd2dff1aa5dccb5b97caaaf81bf111b3f72076daf0f905b2b8bbc379212",
+    "builtin-iterator-zip.regvm.h": "aabc0848702d35892e9473d7db0af235d5765633cd3c256cbf577464579459d7",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
@@ -1093,7 +1097,7 @@
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
-    "quickjs-regvm.h": "b63d690f873fe47ffbbb5b6ec6bf35f21659657707f74bc2c7e2431ce213e260",
+    "quickjs-regvm.h": "c1fa33d5ec4d482c5bb6b61c2d20093a88ed9074fd190efce935bb33207daf38",
     "quickjs.h": "fd585b9de76f67f56a26abb5782790c2b2f3626f9f17cb77293c4ea173fa98ad",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }

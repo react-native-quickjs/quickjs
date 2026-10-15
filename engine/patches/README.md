@@ -281,6 +281,7 @@ what we changed and why without opening a single `.patch` file.
 | `0269` | Lays out a plain object's inline properties over its unused union | A plain object carried JSObject's 24-byte class union it never uses, so its shape and first property sat in different cache lines | JS_CLASS_OBJECT is allocated up to the union and its inline slots start there; the union is never written for it | No. |
 | `0270` | Trims the register VM's light call frame setup | The variable-area pointer was reloaded per filled slot and the receiver was spilled across frame setup on every method call | The fill uses a local pointer and four slots per iteration; `this` is read after the frame is built | No. |
 | `0271` | Answers a typed array's length in the register VM's `get_length` | A typed array's `length` is an accessor on %TypedArray%.prototype, so every read took the full lookup and a C getter call (about 13% of Octane gbemu) | An epoch-guarded check of the typed-array prototypes lets `get_length` read the element count directly | No. |
+| `0272` | Branches on null and nullish values with one register instruction | A null test took a constant load, a generic loose compare and a branch (the null load alone is 7.7% of Octane richards' dispatches) | Four new opcodes test the tag, and IsHTMLDDA for the loose forms, and branch | Yes (adds register opcodes; covered by 9999). |
 
 
 ## Reading the patches
