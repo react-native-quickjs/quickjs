@@ -43,6 +43,7 @@ Why we need it
                              operand
     0265-regvm-this-field-fusion adds two register opcodes
     0272-regvm-null-branches  adds four register opcodes
+    0273-regvm-post-inc-fusion adds two register opcodes
 
   A patch that needs the version raised says so in its own header and in its
   row of README.md, and changes nothing itself.

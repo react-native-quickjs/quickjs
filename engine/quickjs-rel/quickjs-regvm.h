@@ -597,6 +597,8 @@ typedef enum JSRegOpcode {
     ROP_branch_null, ROP_branch_not_null,
     ROP_branch_nullish, ROP_branch_not_nullish,
 
+    ROP_post_inc, ROP_post_dec,
+
     ROP_COUNT
 } JSRegOpcode;
 
