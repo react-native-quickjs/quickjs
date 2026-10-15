@@ -1019,12 +1019,16 @@
       "sha256": "a5cc61003f8908496517875afe5e18e32077ee28b93cf268ce7850c638e4e4a3"
     },
     {
+      "name": "0260-regvm-aot-profiler-branch-bias.patch",
+      "sha256": "50d14437ffc4cd730bb842a398092d446efb46e689be6dd0ac7e363a631ea4ec"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "694d1cf661f2a3e9ce7e354d87d518a49fed0407b362d154d34018989d11da59",
+    "quickjs.c": "2b7d20bcab70f8ba45b09c36c33cd2c1d088df2e6f89c508f1e16876c3646524",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -1,0 +1,167 @@
+Subject: Record branch bias
+
+What this does
+  Counts, for every conditional branch, how many times it executed and how many
+  of those took the branch target, and dumps them as a `B` line.
+
+Why we need it
+  The compiler lays out hot and cold blocks and needs to know which arm of each
+  branch is hot. The profile recorded nothing about it.
+
+What it adds
+  `JSAotProfFunc.br_taken`/`br_total`, a static conditional-branch opcode table
+  and the `B` line; `profmerge.py` sums the pair across sessions.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index c133556..fe8e2cc 100644
+@@ -1532,6 +1532,8 @@
+     JSAotProfPc *pcs;      /* by defining instruction; size pc_n */
+     uint8_t *cov;          /* executed-instruction bitmap; size (len+7)/8 */
+     int32_t cov_n;         /* regvm_len */
++    uint32_t *br_taken;    /* taken count by branch pc; size pc_n */
++    uint32_t *br_total;    /* executions by branch pc; size pc_n */
+     JSAotProfSite *sites;  /* size nsites */
+     JSAotProfCall *calls;
+     int ncalls;
+@@ -1713,6 +1715,7 @@
+                              JSValue fn, int argc);
+ #if QJS_REGVM_THREAD
+ static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc);
++static void js_aot_prof_taken(JSFunctionBytecode *b, uint8_t *rpc);
+ static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target);
+ #endif
+ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b);
+@@ -1744,9 +1747,13 @@
+ #define AOT_PROF_EDGE(f_, ip_, off_) \
+         do { if ((off_) < 0 && unlikely(AOT_PROF_ON((f_)->b))) \
+                  js_aot_prof_edge((f_)->b, (ip_) + (off_)); } while (0)
++/* `d_` is a register operand, encoded as index * 16. */
+ #define AOT_PROF_REG_T(f_, d_, v_) \
+         do { if (unlikely(AOT_PROF_ON((f_)->b))) \
+                  js_aot_prof_reg((f_)->b, (d_) >> 4, (v_)); } while (0)
++#define AOT_PROF_TAKEN(f_, ip_) \
++        do { if (unlikely(AOT_PROF_ON((f_)->b))) \
++                 js_aot_prof_taken((f_)->b, (ip_)); } while (0)
+ #else
+ /* Only register code expands these, so a stack-only build never needs them. */
+ #if QJS_REGVM
+@@ -1758,6 +1765,7 @@
+ #define AOT_PROF_TICK(f_, ip_)      ((void)0)
+ #define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
+ #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
++#define AOT_PROF_TAKEN(f_, ip_)     ((void)0)
+ #endif
+ #endif
+ 
+@@ -25536,6 +25544,7 @@
+         int32_t _t_off = (off); \
+         REGVM_DRC_BACKEDGE(ctx, _t_off); \
+         AOT_PROF_EDGE(f, ip, _t_off); \
++        AOT_PROF_TAKEN(f, ip); \
+         uint8_t *_nip = ip + _t_off; \
+         __asm__ volatile("" : "+r"(_nip)); \
+         __attribute__((musttail)) \
+@@ -26352,6 +26361,21 @@
+ #undef REGVM_T_EXPLICIT_LIST
+ #undef REGVM_T_FALLBACK_LIST
+ 
++/* Conditional branches, for the profiler's bias record. A taken edge and an
++   untaken fall-through are the two outcomes of exactly these opcodes. */
++static const uint8_t regvm_is_cond_branch[ROP_COUNT] = {
++    [ROP_branch_if] = 1, [ROP_branch_if_not] = 1,
++    [ROP_branch_cmp_loc_loc] = 1, [ROP_branch_cmp_loc_reg] = 1,
++    [ROP_branch_cmp_reg_loc] = 1, [ROP_branch_cmp_reg_reg] = 1,
++    [ROP_branch_cmp_reg_reg_s] = 1,
++    [ROP_branch_lt_s] = 1, [ROP_branch_nlt_s] = 1,
++    [ROP_branch_lte_s] = 1, [ROP_branch_nlte_s] = 1,
++    [ROP_branch_gt_s] = 1, [ROP_branch_ngt_s] = 1,
++    [ROP_branch_gte_s] = 1, [ROP_branch_ngte_s] = 1,
++    [ROP_branch_eq_s] = 1, [ROP_branch_neq_s] = 1,
++    [ROP_inc_branch_lt] = 1, [ROP_inc_branch_lt_s] = 1,
++};
++
+ static uint8_t *REGVM_CC regvm_t_to_loop(REGVM_ARGS)
+ {
+ #ifdef QJS_REGVM_COUNT
+@@ -59133,6 +59157,12 @@
+         pf->cov = js_mallocz_rt(rt, (size_t)(pf->cov_n + 7) / 8);
+         if (!pf->cov)
+             goto fail;
++        pf->br_taken = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->pc_n);
++        if (!pf->br_taken)
++            goto fail;
++        pf->br_total = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->pc_n);
++        if (!pf->br_total)
++            goto fail;
+     }
+     if (pf->reg_n > 0) {
+         pf->reg_types = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)pf->reg_n);
+@@ -59153,6 +59183,8 @@
+     js_free_rt(rt, pf->loop_iters);
+     js_free_rt(rt, pf->pcs);
+     js_free_rt(rt, pf->cov);
++    js_free_rt(rt, pf->br_taken);
++    js_free_rt(rt, pf->br_total);
+     js_free_rt(rt, pf->reg_types);
+     js_free_rt(rt, pf->reg_pc);
+     js_free_rt(rt, pf->sites);
+@@ -59201,6 +59233,7 @@
+ static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc)
+ {
+     JSAotProfFunc *pf = b->aot_prof;
++    int pc;
+ 
+     if (unlikely(!pf)) {
+         pf = js_aot_prof_ensure(b->realm->rt, b);
+@@ -59208,9 +59241,20 @@
+             return;
+     }
+     pf->ops++;
+-    pf->last_pc = (int32_t)(rpc - b->regvm_code);
+-    if (pf->last_pc >= 0 && pf->last_pc < pf->cov_n)
+-        pf->cov[pf->last_pc >> 3] |= (uint8_t)(1u << (pf->last_pc & 7));
++    pc = pf->last_pc = (int32_t)(rpc - b->regvm_code);
++    if (pc >= 0 && pc < pf->cov_n)
++        pf->cov[pc >> 3] |= (uint8_t)(1u << (pc & 7));
++    if (pc >= 0 && pc < pf->pc_n && regvm_is_cond_branch[*rpc])
++        pf->br_total[pc]++;
++}
++
++static void js_aot_prof_taken(JSFunctionBytecode *b, uint8_t *rpc)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    int pc = (int)(rpc - b->regvm_code);
++
++    if (pf && pc >= 0 && pc < pf->pc_n)
++        pf->br_taken[pc]++;
+ }
+ 
+ static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target)
+@@ -59406,6 +59450,8 @@
+     js_free_rt(rt, pf->loop_iters);
+     js_free_rt(rt, pf->pcs);
+     js_free_rt(rt, pf->cov);
++    js_free_rt(rt, pf->br_taken);
++    js_free_rt(rt, pf->br_total);
+     js_free_rt(rt, pf->reg_types);
+     js_free_rt(rt, pf->reg_pc);
+     js_free_rt(rt, pf->sites);
+@@ -59608,6 +59654,15 @@
+         else
+             fprintf(f, "P %s pc=%d types=%s src=%s\n", dgt, i, ts, src);
+     }
++    if (pf->br_total) {
++        for (i = 0; i < pf->pc_n; i++) {
++            if (pf->br_total[i]) {
++                aot_src_str(b, i, src, sizeof(src));
++                fprintf(f, "B %s pc=%d taken=%u total=%u src=%s\n",
++                        dgt, i, pf->br_taken[i], pf->br_total[i], src);
++            }
++        }
++    }
+     if (pf->cov && pf->cov_n > 0) {
+         int nins = 0, ncov = 0, prev_un = -1;
+ 

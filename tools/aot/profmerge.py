@@ -31,7 +31,8 @@ ABI = None
 
 class Func:
     __slots__ = ("digest", "name", "file", "line", "ops", "entries", "len",
-                 "loops", "regs", "pcs", "ins", "uncovered", "sites", "calls")
+                 "loops", "regs", "pcs", "ins", "uncovered", "branches",
+                 "sites", "calls")
 
     def __init__(self, digest):
         self.digest = digest
@@ -46,6 +47,7 @@ class Func:
         self.pcs = {}            # defining pc -> {types, min, max, frac, negzero, src}
         self.ins = 0             # instructions in the function
         self.uncovered = []      # [(lo, hi)] never-executed pc ranges
+        self.branches = {}       # branch pc -> [taken, total, src]
         self.sites = {}          # site -> [count, shape_map]
         self.calls = OrderedDict()  # pc -> Call
 
@@ -182,6 +184,14 @@ def parse_file(path, verbose=False):
                 kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
                 lo, _, hi = kv["pc"].partition("..")
                 fr.uncovered.append((int(lo), int(hi or lo)))
+            elif kind == "B":
+                kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
+                pc = int(kv["pc"])
+                ent = fr.branches.get(pc)
+                if ent is None:
+                    ent = fr.branches[pc] = [0, 0, kv.get("src", "?:?")]
+                ent[0] += int(kv["taken"])
+                ent[1] += int(kv["total"])
             elif kind == "S":
                 toks = rest.split(" ")
                 site = None
@@ -285,6 +295,12 @@ def merge(into, fr):
                 if max(lo, blo) <= min(hi, bhi):
                     keep.append((max(lo, blo), min(hi, bhi)))
         g.uncovered = keep
+    for pc, (taken, total, src) in fr.branches.items():
+        ent = g.branches.get(pc)
+        if ent is None:
+            ent = g.branches[pc] = [0, 0, src]
+        ent[0] += taken
+        ent[1] += total
     for site, (count, shapes, src) in fr.sites.items():
         ent = g.sites.get(site)
         if ent is None:
@@ -338,6 +354,10 @@ def write(out, funcs):
                       fr.ins - sum(hi - lo + 1 for lo, hi in fr.uncovered)))
         for lo, hi in fr.uncovered:
             out.write("U %s pc=%d..%d\n" % (fr.digest, lo, hi))
+        for pc in sorted(fr.branches):
+            taken, total, src = fr.branches[pc]
+            out.write("B %s pc=%d taken=%d total=%d src=%s\n"
+                      % (fr.digest, pc, taken, total, src))
         for site in sorted(fr.sites):
             count, shapes, src = fr.sites[site]
             out.write("S %s site=%d count=%d src=%s shapes=%d" % (
