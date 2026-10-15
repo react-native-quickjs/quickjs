@@ -59760,7 +59760,9 @@ void js_aot_prof_dump(JSRuntime *rt)
         if (!f)
             f = stderr;
     }
-    fprintf(f, "qjsprof 1 abi=%u\n", QJS_AOT_ABI);
+    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u\n",
+            QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
+            QJS_REGVM_THREAD, QJS_REGVM_RECORD);
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)

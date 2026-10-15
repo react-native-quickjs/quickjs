@@ -1,0 +1,34 @@
+Subject: Put the engine identity in the profile header and refuse a mismatch
+
+What this does
+  The `.qjsprof` header now carries the register-format version and the build
+  configuration beside the ABI, and the generator refuses a profile whose ABI or
+  register format does not match the engine it was built with.
+
+Why we need it
+  A profile is keyed by a function digest, which is a hash of its register
+  bytecode. That bytecode depends on the engine version and on how the function
+  was lowered, so a profile from another engine matched nothing and said
+  nothing -- the build silently compiled nothing and the app ran slowly with no
+  explanation.
+
+What it adds
+  `fmt=`, `drc=`, `thr=` and `rec=` in the header; `parse_profile` checks `abi`
+  and `fmt`; `profmerge.py` checks and re-emits the format.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index fe8e2cc..46d051f 100644
+@@ -59742,7 +59742,9 @@
+         if (!f)
+             f = stderr;
+     }
+-    fprintf(f, "qjsprof 1 abi=%u\n", QJS_AOT_ABI);
++    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u\n",
++            QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
++            QJS_REGVM_THREAD, QJS_REGVM_RECORD);
+     list_for_each(el, &rt->gc_obj_list) {
+         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)

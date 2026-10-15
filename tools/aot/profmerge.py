@@ -27,6 +27,7 @@ import sys
 from collections import OrderedDict
 
 ABI = None
+FORMAT = None
 
 
 class Func:
@@ -102,7 +103,7 @@ def parse_call_kv(tok):
 
 
 def parse_file(path, verbose=False):
-    global ABI
+    global ABI, FORMAT
     funcs = OrderedDict()
     with open(path, "r", errors="replace") as fh:
         for lineno, raw in enumerate(fh, 1):
@@ -110,7 +111,7 @@ def parse_file(path, verbose=False):
             if not line:
                 continue
             if line.startswith("qjsprof "):
-                # qjsprof 1 abi=N
+                # qjsprof 1 abi=N fmt=N drc=N thr=N rec=N
                 toks = line.split()
                 for t in toks:
                     if t.startswith("abi="):
@@ -120,6 +121,14 @@ def parse_file(path, verbose=False):
                         elif ABI != abi:
                             raise SystemExit(
                                 "%s: ABI %d does not match %d" % (path, abi, ABI))
+                    elif t.startswith("fmt="):
+                        fmt = int(t[4:])
+                        if FORMAT is None:
+                            FORMAT = fmt
+                        elif FORMAT != fmt:
+                            raise SystemExit(
+                                "%s: register format %d does not match %d"
+                                % (path, fmt, FORMAT))
                 continue
             kind, _, rest = line.partition(" ")
             if not rest:
@@ -326,7 +335,9 @@ def merge(into, fr):
 
 
 def write(out, funcs):
-    out.write("qjsprof 1 abi=%s\n" % (ABI if ABI is not None else "?"))
+    out.write("qjsprof 1 abi=%s fmt=%s\n"
+              % (ABI if ABI is not None else "?",
+                 FORMAT if FORMAT is not None else "?"))
     for fr in funcs.values():
         name = fr.name if fr.name else "<null>"
         out.write("F %s name=%s file=%s:%d ops=%d entries=%d len=%d\n" % (

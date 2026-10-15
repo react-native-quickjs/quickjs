@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "quickjs-aot-gen.h"
+#include "quickjs-aot-rt.h"
 #include "quickjs-regvm.h"
 #include "quickjs.h"
 
@@ -222,8 +223,10 @@ static ProfEntry *prof_get(
 }
 
 /* Parse a .qjsprof file: `F` (function + ops), `L` (loop pc + trip count) and
-   `R` (register type set) lines, summed/merged per digest. Returns a malloc'd
-   array (may be empty) or NULL. */
+   `R` (register type set) lines, summed/merged per digest. The header carries
+   the engine identity; a profile from another engine or build configuration is
+   refused rather than silently matching nothing. Returns a malloc'd array (may
+   be empty) or NULL. */
 static ProfEntry *parse_profile(const char *path, int *pn) {
   FILE *f = fopen(path, "r");
   ProfEntry *arr = NULL;
@@ -231,6 +234,26 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   char line[8192];
   *pn = 0;
   if (!f) return NULL;
+  if (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, "qjsprof ", 8) == 0) {
+      const char *p = strstr(line, "abi=");
+      const char *fp = strstr(line, "fmt=");
+      if (p && strtoul(p + 4, NULL, 10) != (unsigned long)QJS_AOT_ABI) {
+        fprintf(stderr, "qjsaot: %s: ABI mismatch (profile %lu, engine %lu); "
+                        "collect the profile with this engine build\n",
+                path, strtoul(p + 4, NULL, 10), (unsigned long)QJS_AOT_ABI);
+        fclose(f);
+        return NULL;
+      }
+      if (fp && strtoul(fp + 4, NULL, 10) != (unsigned long)REGVM_FORMAT_VERSION) {
+        fprintf(stderr, "qjsaot: %s: register-format mismatch (profile %lu, "
+                        "engine %u); collect the profile with this engine build\n",
+                path, strtoul(fp + 4, NULL, 10), (unsigned)REGVM_FORMAT_VERSION);
+        fclose(f);
+        return NULL;
+      }
+    }
+  }
   while (fgets(line, sizeof(line), f)) {
     uint8_t dg[16];
     ProfEntry *e;
@@ -2781,7 +2804,13 @@ int main(int argc, char **argv) {
   {
     ProfEntry *prof = NULL;
     int nprof = 0;
-    if (profile) prof = parse_profile(profile, &nprof);
+    if (profile) {
+      prof = parse_profile(profile, &nprof);
+      if (!prof) {
+        fprintf(stderr, "qjsaot: cannot use profile %s\n", profile);
+        return 1;
+      }
+    }
     g_prof = prof;
     g_nprof = nprof;
     print_census(funcs, nfuncs, prof, nprof);

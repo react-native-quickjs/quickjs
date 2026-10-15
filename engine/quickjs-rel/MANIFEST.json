@@ -1023,12 +1023,16 @@
       "sha256": "50d14437ffc4cd730bb842a398092d446efb46e689be6dd0ac7e363a631ea4ec"
     },
     {
+      "name": "0261-regvm-aot-profiler-identity.patch",
+      "sha256": "68a5dccaff33fc51785d9dd238340bfaa458762630d2be0d6fb9e9afee4a8ae1"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "2b7d20bcab70f8ba45b09c36c33cd2c1d088df2e6f89c508f1e16876c3646524",
+    "quickjs.c": "4540a6719a9d642894c1f122212fc41956a1a78fc242a92e08f05b33cb9c6f30",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
