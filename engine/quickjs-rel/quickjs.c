@@ -24223,15 +24223,15 @@ static __attribute__((noinline)) int regvm_mega_read(JSRuntime *rt, JSObject *p,
     }
     return 0;
 }
-static inline __attribute__((always_inline)) JSValue regvm_get_field_ic(
+static inline __attribute__((always_inline)) JSValue regvm_get_field_ic_x(
     JSContext *ctx, JSFunctionBytecode *b, JSRegPIC **ppic, JSValue recv,
-    JSAtom atom, int site)
+    JSAtom atom, int site, int poly)
 {
     JSValue v;
     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT && *ppic &&
         site != (int)REG_IC_NONE) {
         JSRegPIC *p2;
-        if (regvm_poly_read_hit(*ppic, b, recv, site, &v, &p2)) {
+        if (poly && regvm_poly_read_hit(*ppic, b, recv, site, &v, &p2)) {
             JSRegPIC *p1 = &(*ppic)[site];
             /* A way that keeps hitting is the dominant shape: swap it into the
                primary, which the quickened handlers test inline. A
@@ -24249,6 +24249,12 @@ static inline __attribute__((always_inline)) JSValue regvm_get_field_ic(
             return js_dup(v);
     }
     return regvm_get_field_ic_slow(ctx, b, ppic, recv, atom, site);
+}
+static inline __attribute__((always_inline)) JSValue regvm_get_field_ic(
+    JSContext *ctx, JSFunctionBytecode *b, JSRegPIC **ppic, JSValue recv,
+    JSAtom atom, int site)
+{
+    return regvm_get_field_ic_x(ctx, b, ppic, recv, atom, site, 1);
 }
 static __attribute__((noinline)) JSValue regvm_get_field_ic_slow(JSContext *ctx, JSFunctionBytecode *b,
                                   JSRegPIC **ppic, JSValue recv, JSAtom atom,
@@ -28640,8 +28646,22 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
 /* The three named-property forms. The IC hit is call-free (shape compare,
    flags test, lazy-marker test, js_dup); the miss is a tail call. */
 
-#define T_GET_FIELD_BODY(NAME) \
-    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_slow(REGVM_ARGS) \
+#define T_POLY_READ(R_, SITE_, D_, SZ_, SLOW_, SLOW_NP_) do { \
+        JSValue pv_; \
+        JSRegPIC *pe_; \
+        if ((SITE_) != (int)REG_IC_NONE && \
+            regvm_poly_read_hit(f->pic, f->b, (R_), (SITE_), &pv_, &pe_)) { \
+            if (pe_->kind == REG_PIC_PROTO2 || \
+                likely(++f->pic[SITE_].misses < 16)) { \
+                T_SET_NEXT_B(D_, pv_, SZ_); \
+            } \
+            __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+        } \
+        __attribute__((musttail)) return SLOW_NP_(REGVM_PASS); \
+    } while (0)
+
+#define T_GET_FIELD_SLOW(NAME, SFX, POLY) \
+    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##SFX(REGVM_ARGS) \
     { \
         int d = T_REG(1); \
         int r = T_REG(3); \
@@ -28657,21 +28677,35 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
         if (site == REG_IC_NONE) { \
             val = JS_GetProperty(ctx, FR(r), atom); \
         } else { \
-            val = regvm_get_field_ic(ctx, f->b, &f->pic, FR(r), atom, site); \
+            val = regvm_get_field_ic_x(ctx, f->b, &f->pic, FR(r), atom, site, POLY); \
             /* Quickening. Once the site is filled, rewrite this instruction's \
                opcode byte: an own data slot gets the kind-test-free handler, \
                anything else gets the generic handler back. That else branch is \
                what lets the own handler skip the kind test. Rewrites are \
                single-threaded per runtime. */ \
             if (likely(!JS_IsException(val)) && f->pic != NULL) { \
-                *ip = (f->pic[site].kind == REG_PIC_OWN) \
-                          ? (uint8_t)ROP_##NAME##_own \
-                          : (uint8_t)ROP_##NAME; \
+                uint8_t q_ = (f->pic[site].kind == REG_PIC_OWN) \
+                                 ? (uint8_t)ROP_##NAME##_own \
+                                 : (uint8_t)ROP_##NAME; \
+                if (*ip != q_) \
+                    *ip = q_; \
             } \
         } \
         if (JS_IsException(val)) \
             T_FAIL(); \
         T_SET_NEXT_P(d, val, T_SZ_RRAS); \
+    }
+
+#define T_GET_FIELD_BODY(NAME) \
+    T_GET_FIELD_SLOW(NAME, _slow, 1) \
+    T_GET_FIELD_SLOW(NAME, _slow_np, 0) \
+    static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_##NAME##_poly(REGVM_ARGS) \
+    { \
+        int d = T_REG(1); \
+        int r = T_REG(3); \
+        int site = T_REG(9); \
+        T_POLY_READ(FR(r), site, d, T_SZ_RRAS, regvm_t_##NAME##_slow, \
+                    regvm_t_##NAME##_slow_np); \
     } \
     static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
     { \
@@ -28685,7 +28719,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
         if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
             T_SET_NEXT_B(d, val, T_SZ_RRAS); \
         } \
-        __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+        __attribute__((musttail)) return regvm_t_##NAME##_poly(REGVM_PASS); \
     } \
     /* The quickened own-read hit, valid only while the cache holds an own data \
        slot for a hashed (immutable) shape, so the shape compare proves the \
@@ -28712,7 +28746,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
                 } \
             } \
         } \
-        __attribute__((musttail)) return regvm_t_##NAME##_slow(REGVM_PASS); \
+        __attribute__((musttail)) return regvm_t_##NAME##_poly(REGVM_PASS); \
     }
 T_GET_FIELD_BODY(get_field)
 T_GET_FIELD_BODY(get_field2)
@@ -28766,6 +28800,16 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_this_field_slow(R
     T_SET_NEXT_P(d, val, T_SZ_RRAS);
 }
 
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_this_field_poly(REGVM_ARGS)
+{
+    int d = T_REG(1);
+    int r = T_REG(3);
+    int site = T_REG(9);
+
+    T_POLY_READ(FR(r), site, d, T_SZ_RRAS, regvm_t_get_this_field_slow,
+                regvm_t_get_this_field_slow);
+}
+
 static uint8_t *REGVM_CC regvm_t_get_this_field(REGVM_ARGS)
 {
     uint32_t dr;
@@ -28782,7 +28826,7 @@ static uint8_t *REGVM_CC regvm_t_get_this_field(REGVM_ARGS)
     if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, t, site, &val)) {
         T_SET_NEXT_B(d, val, T_SZ_RRAS);
     }
-    __attribute__((musttail)) return regvm_t_get_this_field_slow(REGVM_PASS);
+    __attribute__((musttail)) return regvm_t_get_this_field_poly(REGVM_PASS);
 }
 #endif
 
