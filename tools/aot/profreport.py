@@ -53,11 +53,16 @@ def main(argv):
     order = sorted(funcs.values(), key=lambda f: f.ops, reverse=True)
     total = sum(f.ops for f in order)
     nfunc = sum(1 for f in order if f.ops)
+    total_us = sum(f.us for f in order)
+    nhot_us = sum(1 for f in order if f.us)
 
     out = sys.stdout
     out.write("qjsprof report: %s\n" % args.profile)
     out.write("  abi=%s  functions-with-ops=%d  total ops=%s (%d)\n"
               % (profmerge.ABI, nfunc, human(total), total))
+    if total_us:
+        out.write("  sampled self time=%.1f ms across %d functions\n"
+                  % (total_us / 1000.0, nhot_us))
 
     # Cumulative coverage is the whole point of a profile-guided AOT: how few
     # functions do we need to compile to cover most dispatches?
@@ -94,6 +99,18 @@ def main(argv):
         out.write("  %-34s %-24s ops=%-9s len=%-4d entries=%d\n"
                   % (f.digest, (f.name or "<null>")[:23], human(f.ops),
                      f.len, f.entries))
+
+    if total_us:
+        by_time = sorted((f for f in order if f.us),
+                         key=lambda f: f.us, reverse=True)
+        out.write("\ntop %d by sampled self time\n" % args.top)
+        out.write("  %-4s %-34s %-28s %12s %8s\n"
+                  % ("#", "digest", "name", "self ms", "samples"))
+        for i, f in enumerate(by_time[:args.top]):
+            samples = sum(s for s, _ in f.tpc.values())
+            out.write("  %-4d %-34s %-28s %12.2f %8d   %s:%d\n"
+                      % (i + 1, f.digest, (f.name or "<null>")[:27],
+                         f.us / 1000.0, samples, f.file, f.line))
 
     # Call graph aggregates.
     bc_edges = Counter()

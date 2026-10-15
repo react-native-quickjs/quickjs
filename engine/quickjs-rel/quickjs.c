@@ -672,6 +672,12 @@ struct JSRuntime {
 #if QJS_AOT_PROFILE
     /* Nonzero when QJS_AOT_PROFILE_OUT named a file: the profiler's switch. */
     uint8_t aot_prof_on;
+    /* Sampling state: the location at the previous sample and when it was
+       taken, so the interval is attributed to the code that ran in it. */
+    void *aot_prof_prev;
+    int32_t aot_prof_prev_pc;
+    int64_t aot_prof_prev_us;
+    uint8_t aot_prof_prev_valid;
 #endif
 
 #if QJS_AOT
@@ -1534,6 +1540,8 @@ typedef struct JSAotProfFunc {
     int32_t cov_n;         /* regvm_len */
     uint32_t *br_taken;    /* taken count by branch pc; size pc_n */
     uint32_t *br_total;    /* executions by branch pc; size pc_n */
+    uint32_t *pc_samples;  /* sampler hits by pc; size pc_n */
+    uint64_t sample_us;    /* total sampled self time, microseconds */
     JSAotProfSite *sites;  /* size nsites */
     JSAotProfCall *calls;
     int ncalls;
@@ -1721,6 +1729,7 @@ static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target);
 static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b);
 static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
 void js_aot_prof_dump(JSRuntime *rt);
+void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 
 /* `aot_prev_rpc`: per-activation local in js_regvm_execute, for loop detection. */
 #define AOT_PROF_ON(b_)             ((b_)->realm->rt->aot_prof_on)
@@ -59181,6 +59190,9 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
         pf->br_total = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->pc_n);
         if (!pf->br_total)
             goto fail;
+        pf->pc_samples = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->pc_n);
+        if (!pf->pc_samples)
+            goto fail;
     }
     if (pf->reg_n > 0) {
         pf->reg_types = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)pf->reg_n);
@@ -59203,6 +59215,7 @@ fail:
     js_free_rt(rt, pf->cov);
     js_free_rt(rt, pf->br_taken);
     js_free_rt(rt, pf->br_total);
+    js_free_rt(rt, pf->pc_samples);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -59236,6 +59249,8 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
     pf->last_pc = (int32_t)(rpc - b->regvm_code);
     if (pf->last_pc >= 0 && pf->last_pc < pf->cov_n)
         pf->cov[pf->last_pc >> 3] |= (uint8_t)(1u << (pf->last_pc & 7));
+    if (unlikely((pf->ops & 0x3ff) == 0))
+        js_aot_prof_sample(b->realm->rt, b, pf->last_pc);
     if (*pprev && rpc < *pprev) {
         int off = (int)(rpc - b->regvm_code);
         if (off >= 0 && off < pf->loop_n)
@@ -59264,6 +59279,8 @@ static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc)
         pf->cov[pc >> 3] |= (uint8_t)(1u << (pc & 7));
     if (pc >= 0 && pc < pf->pc_n && regvm_is_cond_branch[*rpc])
         pf->br_total[pc]++;
+    if (unlikely((pf->ops & 0x3ff) == 0))
+        js_aot_prof_sample(b->realm->rt, b, pc);
 }
 
 static void js_aot_prof_taken(JSFunctionBytecode *b, uint8_t *rpc)
@@ -59290,6 +59307,35 @@ static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target)
         pf->loop_iters[off]++;
 }
 #endif
+
+/* The sampler. Called from the dispatched-op hook; a 1 ms wall-clock tick
+   attributes the interval since the last tick to the instruction that was
+   running through it. On a single-threaded runtime that is self time. */
+void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc)
+{
+    int64_t now = js__gettimeofday_us();
+
+    if (rt->aot_prof_prev_valid) {
+        JSFunctionBytecode *pb = rt->aot_prof_prev;
+        JSAotProfFunc *ppf = pb->aot_prof;
+        int ppc = rt->aot_prof_prev_pc;
+
+        if (ppf && ppc >= 0 && ppc < ppf->pc_n) {
+            int64_t dt = now - rt->aot_prof_prev_us;
+
+            if (dt < 0)
+                dt = 0;
+            else if (dt > 100000)
+                dt = 100000;
+            ppf->sample_us += (uint64_t)dt;
+            ppf->pc_samples[ppc]++;
+        }
+    }
+    rt->aot_prof_prev = b;
+    rt->aot_prof_prev_pc = pc;
+    rt->aot_prof_prev_us = now;
+    rt->aot_prof_prev_valid = 1;
+}
 
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape)
 {
@@ -59470,6 +59516,7 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
     js_free_rt(rt, pf->cov);
     js_free_rt(rt, pf->br_taken);
     js_free_rt(rt, pf->br_total);
+    js_free_rt(rt, pf->pc_samples);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -59642,9 +59689,10 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     aot_digest_hex(dg, dgt);
     JS_AtomGetStrRT(rt, name, sizeof(name), b->func_name);
     JS_AtomGetStrRT(rt, file, sizeof(file), b->filename);
-    fprintf(f, "F %s name=%s file=%s:%d ops=%llu entries=%u len=%d\n",
+    fprintf(f, "F %s name=%s file=%s:%d ops=%llu entries=%u len=%d us=%llu\n",
             dgt, name, file, b->line_num,
-            (unsigned long long)pf->ops, pf->entries, b->regvm_len);
+            (unsigned long long)pf->ops, pf->entries, b->regvm_len,
+            (unsigned long long)pf->sample_us);
     for (i = 0; i < pf->loop_n; i++)
         if (pf->loop_iters[i]) {
             aot_src_str(b, i, src, sizeof(src));
@@ -59678,6 +59726,15 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
                 aot_src_str(b, i, src, sizeof(src));
                 fprintf(f, "B %s pc=%d taken=%u total=%u src=%s\n",
                         dgt, i, pf->br_taken[i], pf->br_total[i], src);
+            }
+        }
+    }
+    if (pf->pc_samples) {
+        for (i = 0; i < pf->pc_n; i++) {
+            if (pf->pc_samples[i]) {
+                aot_src_str(b, i, src, sizeof(src));
+                fprintf(f, "T %s pc=%d samples=%u src=%s\n",
+                        dgt, i, pf->pc_samples[i], src);
             }
         }
     }

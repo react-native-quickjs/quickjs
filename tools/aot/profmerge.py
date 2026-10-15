@@ -31,9 +31,9 @@ FORMAT = None
 
 
 class Func:
-    __slots__ = ("digest", "name", "file", "line", "ops", "entries", "len",
+    __slots__ = ("digest", "name", "file", "line", "ops", "entries", "us", "len",
                  "loops", "regs", "pcs", "ins", "uncovered", "branches",
-                 "sites", "calls")
+                 "tpc", "sites", "calls")
 
     def __init__(self, digest):
         self.digest = digest
@@ -42,6 +42,7 @@ class Func:
         self.line = 0
         self.ops = 0
         self.entries = 0
+        self.us = 0              # sampled self time, microseconds
         self.len = 0
         self.loops = {}          # pc -> iters
         self.regs = {}           # reg -> set(types)
@@ -49,6 +50,7 @@ class Func:
         self.ins = 0             # instructions in the function
         self.uncovered = []      # [(lo, hi)] never-executed pc ranges
         self.branches = {}       # branch pc -> [taken, total, src]
+        self.tpc = {}            # sampled pc -> [samples, src]
         self.sites = {}          # site -> [count, shape_map]
         self.calls = OrderedDict()  # pc -> Call
 
@@ -153,6 +155,7 @@ def parse_file(path, verbose=False):
                     fr.file = f
                 fr.ops += int(kv.get("ops", 0))
                 fr.entries += int(kv.get("entries", 0))
+                fr.us += int(kv.get("us", 0))
                 fr.len = int(kv.get("len", fr.len))
             elif kind == "L":
                 kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
@@ -201,6 +204,13 @@ def parse_file(path, verbose=False):
                     ent = fr.branches[pc] = [0, 0, kv.get("src", "?:?")]
                 ent[0] += int(kv["taken"])
                 ent[1] += int(kv["total"])
+            elif kind == "T":
+                kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
+                pc = int(kv["pc"])
+                ent = fr.tpc.get(pc)
+                if ent is None:
+                    ent = fr.tpc[pc] = [0, kv.get("src", "?:?")]
+                ent[0] += int(kv["samples"])
             elif kind == "S":
                 toks = rest.split(" ")
                 site = None
@@ -278,6 +288,7 @@ def merge(into, fr):
         return
     g.ops += fr.ops
     g.entries += fr.entries
+    g.us += fr.us
     g.len = fr.len or g.len
     if fr.name not in ("?", "<null>") and g.name in ("?", "<null>"):
         g.name = fr.name
@@ -310,6 +321,11 @@ def merge(into, fr):
             ent = g.branches[pc] = [0, 0, src]
         ent[0] += taken
         ent[1] += total
+    for pc, (samples, src) in fr.tpc.items():
+        ent = g.tpc.get(pc)
+        if ent is None:
+            ent = g.tpc[pc] = [0, src]
+        ent[0] += samples
     for site, (count, shapes, src) in fr.sites.items():
         ent = g.sites.get(site)
         if ent is None:
@@ -340,8 +356,8 @@ def write(out, funcs):
                  FORMAT if FORMAT is not None else "?"))
     for fr in funcs.values():
         name = fr.name if fr.name else "<null>"
-        out.write("F %s name=%s file=%s:%d ops=%d entries=%d len=%d\n" % (
-            fr.digest, name, fr.file, fr.line, fr.ops, fr.entries, fr.len))
+        out.write("F %s name=%s file=%s:%d ops=%d entries=%d len=%d us=%d\n" % (
+            fr.digest, name, fr.file, fr.line, fr.ops, fr.entries, fr.len, fr.us))
         for pc in sorted(fr.loops):
             iters, src = fr.loops[pc]
             out.write("L %s pc=%d iters=%d src=%s\n" % (fr.digest, pc, iters, src))
@@ -369,6 +385,10 @@ def write(out, funcs):
             taken, total, src = fr.branches[pc]
             out.write("B %s pc=%d taken=%d total=%d src=%s\n"
                       % (fr.digest, pc, taken, total, src))
+        for pc in sorted(fr.tpc):
+            samples, src = fr.tpc[pc]
+            out.write("T %s pc=%d samples=%d src=%s\n"
+                      % (fr.digest, pc, samples, src))
         for site in sorted(fr.sites):
             count, shapes, src = fr.sites[site]
             out.write("S %s site=%d count=%d src=%s shapes=%d" % (
