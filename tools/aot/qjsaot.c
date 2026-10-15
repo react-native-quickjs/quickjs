@@ -2828,11 +2828,16 @@ int qjs_aot_site_new(void) {
   return g_site_next++;
 }
 
+/* A deopt site for a real guard: allocated in every build, so a site id never
+   depends on whether the sweep is on. */
+int qjs_aot_site_alloc(void) {
+  int sid = g_deopt_site_next++;
+  deopt_site_note(sid);
+  return sid;
+}
+
 int qjs_aot_sweep_on(void) {
   return g_deopt_everywhere;
-}
-int qjs_aot_sweep_site(void) {
-  return deopt_site_new();
 }
 
 static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {

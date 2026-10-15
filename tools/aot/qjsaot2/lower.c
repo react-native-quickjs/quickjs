@@ -40,19 +40,26 @@
    proto-fold sites are allocated from the unit's global counters, so the
    emitter has to take its ids from the same place the driver does. */
 int qjs_aot_sweep_on(void);
-int qjs_aot_sweep_site(void);
+int qjs_aot_site_alloc(void);
 int qjs_aot_site_new(void);
 
 /* A fresh deopt site, or -1 when not sweeping. */
 static int q2_site(void) {
-  return qjs_aot_sweep_on() ? qjs_aot_sweep_site() : -1;
+  return qjs_aot_site_alloc();
 }
 
 /* The guard exit: a miss leaves compiled code *before* the instruction and the
    interpreter re-executes it there. The frame already holds the state it
    expects, so nothing is written back. */
+/* The miss of a guard: leave to the interpreter at this pc. */
+static void q2_miss(FILE *f, int off, int sid) {
+  fprintf(f, "        return qjs_aot_deopt(ctx, f, fr, %d, %d);\n", off, sid);
+}
+
 static void q2_guard(FILE *f, int off, int sid) {
-  if (sid >= 0)
+  /* The sweep test exists only in a deopt-everywhere build: a normal unit has
+     no sweep and would pay a call per guard. */
+  if (qjs_aot_sweep_on())
     fprintf(
         f,
         "      if (__builtin_expect(qjs_aot_should_deopt(ctx, %d), 0)) "
@@ -75,27 +82,36 @@ static void q2_emit_edge(FILE *f, int off, int tgt) {
         " if (__builtin_expect(qjs_aot_poll(ctx) < 0, 0)) { pc = %d; "
         "goto exception; }",
         off);
-  fprintf(f, " goto pc_%d;", tgt);
+  fprintf(f, " goto b_%d;", tgt);
 }
 
 /* One instruction through the shared step routine: the common case is a return
    of the next pc, everything else leaves through `step_exit`. */
 static void q2_emit_fallback(FILE *f, const Q2Insn *in, int exit_pc) {
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
-  fprintf(
-      f,
-      "    if (__builtin_expect(ip == NULL, 0)) { pc = %d; goto "
-      "exception; }\n",
-      in->pc);
+  fprintf(f, "    if (__builtin_expect(ip == NULL, 0)) goto exception;\n");
   if (in->next >= exit_pc)
     fprintf(
-        f, "    if (__builtin_expect(ip == code + %d, 1)) goto pc_end;\n",
+        f,
+        "    if (__builtin_expect(ip == code + %d, 1)) return "
+        "qjs_aot_ret(f);\n",
         in->next);
   else
     fprintf(
-        f, "    if (__builtin_expect(ip == code + %d, 1)) goto pc_%d;\n",
+        f, "    if (__builtin_expect(ip == code + %d, 1)) goto b_%d;\n",
         in->next, in->next);
-  fprintf(f, "    pc = (uint32_t)(ip - code);\n    goto step_exit;\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_COLD_RET, 0)) return "
+      "qjs_aot_ret(f);\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return "
+      "qjs_aot_ret(f);\n");
+  fprintf(
+      f,
+      "    return qjs_aot_deopt(ctx, f, fr, (uint32_t)(ip - code), "
+      "QJS_AOT_NO_SITE);\n");
 }
 
 /* SET_REG_P: the destination takes over the value. */
@@ -186,13 +202,17 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       int sub = in->rop == ROP_add   ? REG_BIN_ADD
                 : in->rop == ROP_sub ? REG_BIN_SUB
                                      : REG_BIN_MUL;
-      fprintf(f, "    { JSValue _o;\n");
-      q2_guard(f, in->pc, q2_site());
+      int sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { JSValue _o%d;\n", in->pc);
       fprintf(
           f,
-          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_o)) "
-          "{ AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n",
-          sub, a, b, d, in->next);
+          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_o%d)) "
+          "{ AOT_SET_B(ctx, fr, %d, _o%d); goto b_%d; }\n",
+          sub, a, b, in->pc, d, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
     case ROP_add_imm_s:
@@ -209,14 +229,18 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       int32_t imm = (in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s)
                         ? (int32_t)in->arg[3].val
                         : (int32_t)in->arg[2].val;
-      fprintf(f, "    { JSValue _o;\n");
-      q2_guard(f, in->pc, q2_site());
+      int sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { JSValue _o%d;\n", in->pc);
       fprintf(
           f,
           "      if (qjs_aot_num_fast(%d, Q2_REG(%d), "
-          "JS_MKVAL(JS_TAG_INT, %d), &_o)) { AOT_SET_B(ctx, fr, %d, _o); "
-          "goto pc_%d; } }\n",
-          sub, a, imm, d, in->next);
+          "JS_MKVAL(JS_TAG_INT, %d), &_o%d)) { AOT_SET_B(ctx, fr, %d, _o%d); "
+          "goto b_%d; }\n",
+          sub, a, imm, in->pc, d, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
 
@@ -235,20 +259,24 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
                      : REG_BIN_SUB;
       int lhs2 = mul_first ? dm : c;
       int rhs2 = mul_first ? c : dm;
-      fprintf(f, "    { JSValue _t, _r;\n");
-      q2_guard(f, in->pc, q2_site());
+      int sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      /* The second operation reads `dm` as the handler does, so the first
+         store happens between the two predicate calls. */
+      fprintf(f, "    { JSValue _t%d, _r%d;\n", in->pc, in->pc);
       fprintf(
           f,
-          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_t)) "
-          "{\n",
-          REG_BIN_MUL, x, y);
-      fprintf(f, "        AOT_SET_B(ctx, fr, %d, _t);\n", dm);
+          "      if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_t%d)) "
+          "{ AOT_SET_B(ctx, fr, %d, _t%d);\n",
+          REG_BIN_MUL, x, y, in->pc, dm, in->pc);
       fprintf(
           f,
-          "        if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_r)) "
-          "{ AOT_SET_B(ctx, fr, %d, _r); goto pc_%d; } }\n",
-          sub2, lhs2, rhs2, da, in->next);
-      fprintf(f, "    }\n");
+          "        if (qjs_aot_num_fast(%d, Q2_REG(%d), Q2_REG(%d), &_r%d)) "
+          "{ AOT_SET_B(ctx, fr, %d, _r%d); goto b_%d; } }\n",
+          sub2, lhs2, rhs2, in->pc, da, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
 
@@ -258,13 +286,17 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
       int site = (int)in->arg[3].val;
       if ((unsigned)site == REG_IC_NONE) return 0;
-      fprintf(f, "    { JSValue _o;\n");
-      q2_guard(f, in->pc, q2_site());
+      int sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { JSValue _o%d;\n", in->pc);
       fprintf(
           f,
-          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_o)) "
-          "{ AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n",
-          a, site, d, in->next);
+          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_o%d)) "
+          "{ AOT_SET_B(ctx, fr, %d, _o%d); goto b_%d; }\n",
+          a, site, in->pc, d, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
     case ROP_get_field_chain:
@@ -273,14 +305,18 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       int s1 = (int)in->arg[3].val, d2 = (int)in->arg[4].val;
       int s2 = (int)in->arg[7].val;
       if (s1 == REG_IC_NONE || s2 == REG_IC_NONE) return 0;
-      fprintf(f, "    { JSValue _v1, _v2;\n");
-      q2_guard(f, in->pc, q2_site());
+      int sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { JSValue _v%d, _w%d;\n", in->pc, in->pc);
       fprintf(
           f,
-          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_v1) && "
-          "qjs_aot_own_read_hit(f, pic, _v1, %d, &_v2)) { AOT_SET_B(ctx, "
-          "fr, %d, _v1); AOT_SET_B(ctx, fr, %d, _v2); goto pc_%d; } }\n",
-          r1, s1, s2, d1, d2, in->next);
+          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_v%d) && "
+          "qjs_aot_own_read_hit(f, pic, _v%d, %d, &_w%d)) { AOT_SET_B(ctx, "
+          "fr, %d, _v%d); AOT_SET_B(ctx, fr, %d, _w%d); goto b_%d; }\n",
+          r1, s1, in->pc, in->pc, s2, in->pc, d1, in->pc, d2, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
     /* get_field2 is the "load a method for a call" form: the folded prototype
@@ -289,21 +325,25 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
     case ROP_get_field2_own: {
       int d = (int)in->arg[0].val, a = (int)in->arg[1].val;
       int site = (int)in->arg[3].val;
-      int sid;
+      int fsid, sid;
       if ((unsigned)site == REG_IC_NONE) return 0;
-      sid = qjs_aot_site_new();
-      fprintf(f, "    { JSValue _o;\n");
-      q2_guard(f, in->pc, q2_site());
+      fsid = qjs_aot_site_new();
+      sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { JSValue _o%d;\n", in->pc);
       fprintf(
           f,
           "      if (qjs_aot_proto_fold(ctx, f, pic, %d, Q2_REG(%d), %d, "
-          "&_o)) { qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; }\n",
-          sid, a, site, d, in->next);
+          "&_o%d)) { qjs_aot_set_reg_p(ctx, fr, %d, _o%d); goto b_%d; }\n",
+          fsid, a, site, in->pc, d, in->pc, in->next);
       fprintf(
           f,
-          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_o)) "
-          "{ AOT_SET_B(ctx, fr, %d, _o); goto pc_%d; } }\n",
-          a, site, d, in->next);
+          "      if (qjs_aot_own_read_hit(f, pic, Q2_REG(%d), %d, &_o%d)) "
+          "{ AOT_SET_B(ctx, fr, %d, _o%d); goto b_%d; }\n",
+          a, site, in->pc, d, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
 
@@ -311,13 +351,17 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
     case ROP_get_element: {
       int d = (int)in->arg[0].val, a = (int)in->arg[1].val,
           b = (int)in->arg[2].val;
-      fprintf(f, "    { JSValue _o;\n");
-      q2_guard(f, in->pc, q2_site());
+      int sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { JSValue _o%d;\n", in->pc);
       fprintf(
           f,
-          "      if (qjs_aot_get_element(Q2_REG(%d), Q2_REG(%d), &_o)) "
-          "{ qjs_aot_set_reg_p(ctx, fr, %d, _o); goto pc_%d; } }\n",
-          a, b, d, in->next);
+          "      if (qjs_aot_get_element(Q2_REG(%d), Q2_REG(%d), &_o%d)) "
+          "{ qjs_aot_set_reg_p(ctx, fr, %d, _o%d); goto b_%d; }\n",
+          a, b, in->pc, d, in->pc, in->next);
+      fprintf(f, "      else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
 
@@ -333,7 +377,7 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
           "{",
           a, want);
       q2_emit_edge(f, in->pc, tgt);
-      fprintf(f, " } else goto pc_%d;\n", in->next);
+      fprintf(f, " } else goto b_%d;\n", in->next);
       return 1;
     }
     case ROP_branch_nullish:
@@ -343,7 +387,7 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       if (!q2_target(in, 1, &tgt)) return 0;
       fprintf(f, "    if (qjs_aot_nullish(Q2_REG(%d)) == %d) {", a, want);
       q2_emit_edge(f, in->pc, tgt);
-      fprintf(f, " } else goto pc_%d;\n", in->next);
+      fprintf(f, " } else goto b_%d;\n", in->next);
       return 1;
     }
 
@@ -364,24 +408,29 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
       fprintf(f, "      if (_b < 0) { pc = %d; goto exception; }\n", in->pc);
       fprintf(f, "      if (_b == %d) {", want_true);
       q2_emit_edge(f, in->pc, tgt);
-      fprintf(f, " } else goto pc_%d; }\n", in->next);
+      fprintf(f, " } else goto b_%d; }\n", in->next);
       return 1;
     }
     case ROP_branch_cmp_reg_reg:
     case ROP_branch_cmp_reg_reg_s: {
       int s = (int)in->arg[0].val;
       int la = (int)in->arg[1].val, rb = (int)in->arg[2].val;
-      int tgt;
+      int tgt, sid;
       if (!q2_target(in, 3, &tgt)) return 0;
-      fprintf(f, "    { int _t;\n");
+      sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      fprintf(f, "    { int _t%d;\n", in->pc);
       fprintf(
           f,
           "      if (qjs_aot_branch_cmp(%d, Q2_REG(%d), Q2_REG(%d), "
-          "&_t)) {\n",
-          s, la, rb);
-      fprintf(f, "        if (_t) {");
+          "&_t%d)) {\n",
+          s, la, rb, in->pc);
+      fprintf(f, "        if (_t%d) {", in->pc);
       q2_emit_edge(f, in->pc, tgt);
-      fprintf(f, " } else goto pc_%d; } }\n", in->next);
+      fprintf(f, " } else goto b_%d;\n", in->next);
+      fprintf(f, "      } else {\n");
+      q2_miss(f, in->pc, sid);
+      fprintf(f, "      } }\n");
       return 2;
     }
     default:
@@ -389,19 +438,8 @@ static int q2_emit_native(FILE *f, const Q2Insn *in) {
   }
 }
 
-/* A fresh entry, a deoptimised or resumed frame and an unwind all arrive with
-   a pc, and every instruction has a label. */
-static void q2_emit_pc_switch(FILE *f, const Q2Func *fn) {
-  int i;
-  fprintf(f, "    switch (pc) {\n");
-  for (i = 0; i < fn->ninsns; i++)
-    fprintf(f, "    case %d: goto pc_%d;\n", fn->insns[i].pc, fn->insns[i].pc);
-  fprintf(f, "    case %d: goto pc_end;\n", fn->exit_pc);
-  fprintf(f, "    default: __builtin_unreachable();\n    }\n");
-}
-
 static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
-  int i;
+  int i, j;
 
   fprintf(
       f,
@@ -410,41 +448,76 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       "{\n",
       hex);
   fprintf(f, "    uint8_t *code = qjs_aot_code(f);\n");
-  fprintf(f, "    uint8_t *ip;\n    uint32_t pc = entry_pc;\n");
+  fprintf(f, "    uint8_t *ip;\n    uint32_t pc = 0;\n");
   fprintf(f, "    JSValue *vb = qjs_aot_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = qjs_aot_arg_buf(f);\n");
   fprintf(f, "    const void *pic = qjs_aot_pic(f);\n");
   fprintf(f, "    (void)code; (void)ip; (void)vb; (void)ab; (void)pic;\n");
   fprintf(f, "#define Q2_REG(off) AOT_REG(fr, off)\n");
-  fprintf(f, "    (void)qjs_aot_should_deopt;\n");
-  fprintf(f, "    goto dispatch_ip;\n");
+  /* Only pc 0 runs compiled; anything else is the interpreter's, from that pc
+     on. That covers a generator resume and a frame re-entered after an
+     unwind. */
+  fprintf(
+      f,
+      "    if (__builtin_expect(entry_pc != 0, 0)) return "
+      "qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
 
+  /* The fast paths keep their results in locals declared once, so a goto never
+     crosses a declaration. */
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
-    int done;
-    fprintf(f, "pc_%d:\n", in->pc);
-    done = q2_emit_native(f, in);
-    if (done != 1) q2_emit_fallback(f, in, fn->exit_pc);
+    switch (in->rop) {
+      case ROP_add:
+      case ROP_sub:
+      case ROP_mul:
+      case ROP_add_imm_s:
+      case ROP_sub_imm_s:
+      case ROP_binary_imm:
+      case ROP_binary_imm_s:
+      case ROP_get_field:
+      case ROP_get_field_own:
+      case ROP_get_element:
+      case ROP_get_field2:
+      case ROP_get_field2_own:
+        fprintf(f, "    JSValue _o%d;\n", in->pc);
+        break;
+      case ROP_get_field_chain:
+      case ROP_get_field_chain_own:
+        fprintf(f, "    JSValue _v%d, _w%d;\n", in->pc, in->pc);
+        break;
+      case ROP_mul_add:
+      case ROP_mul_sub:
+      case ROP_add_mul:
+      case ROP_sub_mul:
+        fprintf(f, "    JSValue _t%d, _r%d;\n", in->pc, in->pc);
+        break;
+      default:
+        break;
+    }
   }
-  fprintf(f, "pc_end:\n    return qjs_aot_ret(f);\n");
-  fprintf(f, "step_exit:\n");
-  fprintf(
-      f,
-      "    if (__builtin_expect(ip == QJS_AOT_COLD_RET, 0)) return "
-      "qjs_aot_ret(f);\n");
-  fprintf(
-      f,
-      "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return "
-      "qjs_aot_ret(f);\n");
-  q2_emit_pc_switch(f, fn);
-  fprintf(f, "dispatch_ip:\n");
-  q2_emit_pc_switch(f, fn);
+
+  for (i = 0; i < fn->nblocks; i++) {
+    const Q2Block *blk = &fn->blocks[i];
+    fprintf(f, "b_%d:\n", blk->start_pc);
+    for (j = 0; j < blk->ninsns; j++) {
+      const Q2Insn *in = &fn->insns[blk->first_insn + j];
+      /* The unwind and every deopt read `pc`, and an operation may throw from
+         anywhere, so it tracks the instruction. */
+      fprintf(f, "    pc = %d;\n", in->pc);
+      /* 1 and 2 are lowered (2 emits its own deopt on a miss); 0 falls back to
+         the step routine. */
+      if (q2_emit_native(f, in) == 0) q2_emit_fallback(f, in, fn->exit_pc);
+    }
+  }
+  fprintf(f, "    return qjs_aot_ret(f);\n");
   fprintf(f, "exception: {\n");
-  fprintf(f, "        uint32_t rp;\n");
+  fprintf(f, "        uint32_t rp = 0;\n");
   fprintf(f, "        JSValue ex = qjs_aot_unwind(ctx, f, fr, pc, &rp);\n");
+  fprintf(f, "        if (JS_IsException(ex)) return JS_EXCEPTION;\n");
   fprintf(
-      f, "        if (!JS_IsException(ex)) { pc = rp; goto dispatch_ip; }\n");
-  fprintf(f, "        return JS_EXCEPTION;\n    }\n}\n\n");
+      f,
+      "        return qjs_aot_deopt(ctx, f, fr, rp, QJS_AOT_NO_SITE);\n"
+      "    }\n}\n\n");
 }
 
 int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {

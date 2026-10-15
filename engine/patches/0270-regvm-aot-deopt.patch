@@ -31,14 +31,14 @@ Needs a bytecode version bump
 
 diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
 index 4aa63f2..d1eefc4 100644
-@@ -78,14 +78,23 @@
+@@ -78,14 +78,29 @@
  uint8_t *qjs_aot_cells(JSContext *ctx);
  int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn);
  /* A failed guard: count it against its deopt site, and disable the site's
 -   function once the count reaches the limit. */
 -void qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
 +   function once the count reaches the limit. Returns 1 when this call disabled
-+   the function. */
++   the function. `QJS_AOT_NO_SITE` is never counted. */
 +int qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
 +QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
 +                                   uint32_t pc, uint32_t site);
@@ -53,6 +53,12 @@ index 4aa63f2..d1eefc4 100644
  
 +/* `JSRegRun.deopt_pc` holds this when the activation is not deopting. */
 +#define QJS_AOT_NO_DEOPT 0xffffffffu
++
++/* A deopt with no guard site: an entry that is not pc 0, a control transfer
++   the compiled graph does not model, or an unwind that resumes in the
++   interpreter. It is not counted against any guard, so nothing gets disabled
++   for leaving compiled code on a path it never compiled. */
++#define QJS_AOT_NO_SITE 0xffffffffu
 +
  /* One generated function: digest, entry, reserved flags. The table is sorted
     by `digest`. */

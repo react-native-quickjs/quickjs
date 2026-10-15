@@ -541,9 +541,10 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
 
   /* 2. block starts: pc 0, every branch target, and after a terminator */
   {
-    /* every instruction can contribute a target and a fall-through, so the
-       raw list is at most twice the instruction count plus the endpoints */
-    int32_t *tmp = malloc(sizeof(*tmp) * (size_t)(2 * f->ninsns + 2));
+    /* every instruction contributes its own pc, and one with a target adds
+       the target and the fall-through, so three per instruction plus the two
+       endpoints is the bound */
+    int32_t *tmp = malloc(sizeof(*tmp) * (size_t)(3 * f->ninsns + 2));
     if (!tmp) {
       f->why = "out of memory";
       return -1;
@@ -551,13 +552,23 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     tmp[nstarts++] = 0;
     for (i = 0; i < f->ninsns; i++) {
       Q2Insn *in = &f->insns[i];
+      /* every instruction is its own block: a fallback returns an ip that may
+         be any instruction, and only label-per-block keeps the graph honest
+         without a switch */
+      tmp[nstarts++] = in->pc;
       int term =
           (in->op == Q2_OP_BRANCH || in->op == Q2_OP_BRANCH_CMP ||
            in->op == Q2_OP_RETURN || in->op == Q2_OP_RETURN_UNDEF ||
            q2_ends_control(in->rop));
       for (n = 0; n < in->narg; n++) {
+        int has_target = 0;
         if (in->arg[n].kind != 't') continue;
         tmp[nstarts++] = in->next + (int32_t)in->arg[n].val;
+        has_target = 1;
+        /* The fall-through of a branch is a block too: the lowering needs a
+           label for each edge it can `goto` to. */
+        tmp[nstarts++] = in->next;
+        (void)has_target;
       }
       if (term) tmp[nstarts++] = in->next;
     }
