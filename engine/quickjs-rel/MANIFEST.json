@@ -1163,12 +1163,16 @@
       "sha256": "d1bac0aac2057d5604307595df096d0e81e2444a1eb4741af779ec6c417255dc"
     },
     {
+      "name": "0296-regvm-aot-disabled-light-path.patch",
+      "sha256": "86994b6df9a762a44d1913f02f2c300f2e1a74585204f8dc9c04be96868a211a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "b6f893a454d1571279e60812c055dc7e8096dc75aa1106ca42795d99a42b76f7",
+    "quickjs.c": "dfa30cf32713f1569a8264b4562dae6596c6d3c587a4df9e6a3c7c8c83da7999",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

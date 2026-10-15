@@ -1,0 +1,65 @@
+Subject: Recompute a disabled function's light-path flag when it is unbound
+
+What this does
+  `js_aot_unbind` recomputes `regvm_light_fast` from the PIC table it finds
+  instead of restoring the byte saved at bind time; the saved byte and its
+  field are removed.
+
+Why we need it
+  A bound function cannot use the light call path. The flag that opens the
+  path again (`regvm_light_fast`) is only true once the function's PIC table
+  exists, and that table is allocated lazily on the site's first fill, so the
+  value saved when the function was bound is usually 0. Restoring it left a
+  disabled function on the record path for the rest of its life, and every
+  function with a property site is in that position.
+
+What it adds
+  js_aot_unbind()          - recomputes the flag from the table it finds:
+                             light, and the PIC either allocated or absent
+
+Needs a bytecode version bump
+  No.
+
+Notes
+  A disabled function's calls then take the light path its bytecode is
+  eligible for, which is what the saved flags are for.
+
+diff --git a/quickjs.c b/quickjs.c
+index 4a0cdfe..2b54ebe 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1765,8 +1765,10 @@ typedef struct JSFunctionBytecode {
+     uint32_t aot_index;
+     /* The record and light eligibility a bound function had before binding:
+        js_aot_unbind restores them, so a disabled function runs the interpreter
+-       through its normal call path. */
+-    uint8_t aot_call_ready, aot_light, aot_light_fast;
++       through its normal call path. The light path's own flag is not saved;
++       its PIC table can be allocated while the function is bound, so unbind
++       recomputes it from the table it finds. */
++    uint8_t aot_call_ready, aot_light;
+     uint8_t aot_state;
+ #endif
+ } JSFunctionBytecode;
+@@ -31196,7 +31198,6 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
+     if (b->aot_fn != NULL) {
+         b->aot_call_ready = b->regvm_call_ready;
+         b->aot_light = b->regvm_light;
+-        b->aot_light_fast = b->regvm_light_fast;
+         b->regvm_call_ready = 0;
+         b->regvm_light = 0;
+         b->regvm_light_fast = 0;
+@@ -61135,7 +61136,12 @@ static void js_aot_unbind(JSFunctionBytecode *b)
+     b->aot_fn = NULL;
+     b->regvm_call_ready = b->aot_call_ready;
+     b->regvm_light = b->aot_light;
+-    b->regvm_light_fast = b->aot_light_fast;
++    /* A light frame carries the PIC pointer, so the light path is only open
++       once the table exists. The flag is the one eligibility bit that can
++       change while the function is bound (the table is allocated on its first
++       fill), so recompute it instead of restoring the bind-time byte. */
++    b->regvm_light_fast = b->regvm_light != 0 &&
++                          (b->regvm_pic != NULL || b->regvm_pic_count == 0);
+ }
+ 
+ /* Bind a function to its generated entry. The table is sorted by digest;
