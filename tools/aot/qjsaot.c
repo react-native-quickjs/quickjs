@@ -3083,6 +3083,8 @@ int main(int argc, char **argv) {
         "sizeof(qjs_aot_table) / sizeof(qjs_aot_table[0]);\n");
     fprintf(f, "const uint32_t qjs_aot_abi = QJS_AOT_ABI;\n");
     fprintf(f, "const uint32_t qjs_aot_layout = QJS_AOT_LAYOUT_HASH;\n");
+    fprintf(f, "const uint32_t qjs_aot_cell_count = 0u;\n");
+    fprintf(f, "const uint32_t qjs_aot_site_count = %du;\n", g_site_next);
     fclose(f);
 
     fprintf(

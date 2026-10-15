@@ -494,6 +494,22 @@ typedef struct JSAotSite {
     uint8_t kind;        /* 0 unbound, 1 bytecode, 2 C, 3 folded proto value */
     uint8_t cproto;
 } JSAotSite;
+
+/* The runtime's AOT run state, allocated at first use and sized by the counts
+   the unit exports. Everything here is per runtime, never in the unit's static
+   data: the assumption cells are registered against this runtime's objects, the
+   failure counters and the disable bits are written while it runs, and a
+   process can run several runtimes on different threads. The unit declares the
+   layout (how many of each), the runtime allocates them. */
+typedef struct JSAotRun {
+    uint8_t *cells;         /* one byte per assumption group; never cleared */
+    uint32_t cell_count;
+    uint16_t *deopt_hits;   /* deopts at each guard site, saturating */
+    uint32_t deopt_count;
+    uint8_t *disabled;      /* one bit per compiled function: route to interp */
+    uint32_t func_count;
+    uint32_t deopt_limit;   /* hits before a site's function is disabled (K) */
+} JSAotRun;
 #endif
 
 #define JS_INTSTR_MAX 256
@@ -681,6 +697,13 @@ struct JSRuntime {
     /* AOT call-site bindings, indexed by the unit's site id. Lazily grown. */
     JSAotSite *aot_sites;
     uint32_t aot_site_count;
+    /* The runtime's AOT run state, allocated at first use. It holds the
+       assumption cells, the per-site deopt failure counters and the
+       per-function disable bits, all keyed by the unit's ids, all per runtime:
+       shapes, prototypes and globals belong to one runtime, and a process can
+       run several on different threads, so a cell in the unit's static data
+       would be unsound and racy. */
+    struct JSAotRun *aot_run;
 #endif
 
 #if QJS_REGVM_RECORD
@@ -1716,11 +1739,13 @@ typedef struct JSFunctionBytecode {
     int32_t *regvm_src_pc;
 #endif
 #if QJS_AOT
-    /* AOT runtime: the generated entry bound to this function, or NULL.
-       `aot_state` is 0 unknown, 1 bound, 2 known-absent, set once by
-       js_aot_bind() when the bytecode is final. A bound function is not
+    /* AOT runtime: the generated entry bound to this function, or NULL, and
+       its index in the unit's table so a disabled function can be recognised
+       at the entry. `aot_state` is 0 unknown, 1 bound, 2 known-absent, set
+       once by js_aot_bind() when the bytecode is final. A bound function is not
        regvm_record_eligible. */
     void *aot_fn;
+    uint32_t aot_index;
     uint8_t aot_state;
 #endif
 } JSFunctionBytecode;
@@ -1811,6 +1836,7 @@ static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
 #endif
 static void js_aot_bind(JSFunctionBytecode *b);
 void js_aot_stats_dump(JSRuntime *rt);
+static void aot_run_free(JSRuntime *rt);
 extern uint64_t js_aot_bound_count;
 extern uint64_t js_aot_enter_count;
 #endif
@@ -3920,6 +3946,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         rt->aot_sites = NULL;
         rt->aot_site_count = 0;
     }
+    aot_run_free(rt);
 #endif
 
     /* The final collection must break ctx -> global -> closure -> fnbc -> ctx,
@@ -31025,26 +31052,35 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
            reach this path. The generated unit owns the frame from here and
            returns a value, JS_EXCEPTION, or a parked generator/async frame. A
            resume re-enters here: the marker is an instruction start, so the
-           unit jumps to it. */
+           unit jumps to it. A function whose guards have failed too many times
+           is disabled: its calls fall through to the interpreter below. */
         if (unlikely(b->aot_fn != NULL)) {
-            uint32_t aot_entry_pc = 0;
-            if (regvm_resume_marker != NULL)
-                aot_entry_pc = (uint32_t)(regvm_resume_marker - b->regvm_code);
-            js_aot_enter_count++;
-            run.resume_marker = regvm_resume_marker;
-            ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
-            regvm_resume_marker = run.resume_marker;
-            /* Every exit of a generator/async body hands the parked frame to
-               the machinery, as done_generator does. The test is the call flag,
-               not the kind: a module body takes the ordinary exit. */
-            if (unlikely(run.flags & JS_CALL_FLAG_GENERATOR)) {
-                pc = run.sf->cur_pc;
-                sp = run.sf->cur_sp;
-                goto done_generator;
+            JSAotRun *ar = rt->aot_run;
+
+            if (likely(ar == NULL || ar->disabled == NULL ||
+                       !((ar->disabled[b->aot_index >> 3] >>
+                          (b->aot_index & 7)) & 1))) {
+                uint32_t aot_entry_pc = 0;
+                if (regvm_resume_marker != NULL)
+                    aot_entry_pc =
+                        (uint32_t)(regvm_resume_marker - b->regvm_code);
+                js_aot_enter_count++;
+                run.resume_marker = regvm_resume_marker;
+                ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
+                regvm_resume_marker = run.resume_marker;
+                /* Every exit of a generator/async body hands the parked frame
+                   to the machinery, as done_generator does. The test is the
+                   call flag, not the kind: a module body takes the ordinary
+                   exit. */
+                if (unlikely(run.flags & JS_CALL_FLAG_GENERATOR)) {
+                    pc = run.sf->cur_pc;
+                    sp = run.sf->cur_sp;
+                    goto done_generator;
+                }
+                if (likely(!JS_IsException(ret_val)))
+                    goto done;
+                goto exception;
             }
-            if (likely(!JS_IsException(ret_val)))
-                goto done;
-            goto exception;
         }
 #endif
 
@@ -59985,6 +60021,9 @@ extern const JSAotEntry qjs_aot_table[] __attribute__((weak));
 extern const uint32_t qjs_aot_count __attribute__((weak));
 extern const uint32_t qjs_aot_abi __attribute__((weak));
 extern const uint32_t qjs_aot_layout __attribute__((weak));
+extern const uint32_t qjs_aot_cell_count __attribute__((weak));
+extern const uint32_t qjs_aot_site_count __attribute__((weak));
+extern const uint32_t qjs_aot_deopt_site_func[] __attribute__((weak));
 #endif
 
 /* The engine's layout hash, from the same function the generator used, so the
@@ -60008,6 +60047,107 @@ static int aot_unit_present(void)
 #endif
 }
 
+/* The runtime's AOT run state. Allocated on first use in the sizes the unit
+   declares, so the run-time arrays are per runtime while the unit stays
+   read-only. */
+#define QJS_AOT_DEOPT_LIMIT 8u
+
+static JSAotRun *aot_run_ensure(JSRuntime *rt)
+{
+    JSAotRun *r = rt->aot_run;
+    uint32_t ncell, nsite;
+
+    if (r != NULL)
+        return r;
+    if (!aot_unit_present())
+        return NULL;
+    ncell = qjs_aot_cell_count;
+    nsite = qjs_aot_site_count;
+    r = js_mallocz_rt(rt, sizeof(*r));
+    if (!r)
+        return NULL;
+    r->cell_count = ncell;
+    r->deopt_count = nsite;
+    r->func_count = qjs_aot_count;
+    r->deopt_limit = QJS_AOT_DEOPT_LIMIT;
+    if (ncell) {
+        r->cells = js_mallocz_rt(rt, ncell);
+        if (!r->cells)
+            goto fail;
+    }
+    if (nsite) {
+        r->deopt_hits = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)nsite);
+        if (!r->deopt_hits)
+            goto fail;
+    }
+    if (r->func_count) {
+        r->disabled = js_mallocz_rt(rt, ((size_t)r->func_count + 7) / 8);
+        if (!r->disabled)
+            goto fail;
+    }
+    rt->aot_run = r;
+    return r;
+fail:
+    js_free_rt(rt, r->cells);
+    js_free_rt(rt, r->deopt_hits);
+    js_free_rt(rt, r->disabled);
+    js_free_rt(rt, r);
+    return NULL;
+}
+
+static void aot_run_free(JSRuntime *rt)
+{
+    JSAotRun *r = rt->aot_run;
+
+    if (!r)
+        return;
+    js_free_rt(rt, r->cells);
+    js_free_rt(rt, r->deopt_hits);
+    js_free_rt(rt, r->disabled);
+    js_free_rt(rt, r);
+    rt->aot_run = NULL;
+}
+
+/* The assumption cells for this runtime, or NULL with no unit. */
+uint8_t *qjs_aot_cells(JSContext *ctx)
+{
+    JSAotRun *r = aot_run_ensure(ctx->rt);
+
+    return r ? r->cells : NULL;
+}
+
+/* One bit per compiled function: set once a site's guards have failed K times,
+   so the function's entry routes to the interpreter from then on. */
+int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn)
+{
+    JSAotRun *r = aot_run_ensure(ctx->rt);
+
+    if (!r || r->disabled == NULL || fn >= r->func_count)
+        return 0;
+    return (r->disabled[fn >> 3] >> (fn & 7)) & 1;
+}
+
+/* A guard failed: count it against its deopt site, and when the count reaches
+   the limit disable that site's function so its later calls run in the
+   interpreter. The site -> function map is the unit's, dense over deopt sites. */
+void qjs_aot_note_deopt(JSContext *ctx, uint32_t site)
+{
+    JSAotRun *r = aot_run_ensure(ctx->rt);
+    uint32_t fn;
+
+    if (!r || r->deopt_hits == NULL || site >= r->deopt_count)
+        return;
+    if (r->deopt_hits[site] < 0xffff)
+        r->deopt_hits[site]++;
+    if (r->deopt_hits[site] < r->deopt_limit || r->disabled == NULL)
+        return;
+    if (&qjs_aot_deopt_site_func == NULL)
+        return;
+    fn = qjs_aot_deopt_site_func[site];
+    if (fn < r->func_count)
+        r->disabled[fn >> 3] |= (uint8_t)(1u << (fn & 7));
+}
+
 /* Binding/entry counters, printed at teardown under QJS_AOT_STATS. */
 uint64_t js_aot_bound_count;
 uint64_t js_aot_enter_count;
@@ -60016,12 +60156,25 @@ void js_aot_stats_dump(JSRuntime *rt)
 {
     int present = aot_unit_present();
     unsigned count = present ? (unsigned)qjs_aot_count : 0u;
+    JSAotRun *r = rt->aot_run;
+    uint32_t cells_set = 0, disabled = 0;
+    uint32_t i;
 
-    fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu\n",
+    if (r) {
+        for (i = 0; i < r->cell_count; i++)
+            if (r->cells[i])
+                cells_set++;
+        for (i = 0; i < r->func_count; i++)
+            if ((r->disabled[i >> 3] >> (i & 7)) & 1)
+                disabled++;
+    }
+    fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu "
+            "cells=%u/%u disabled=%u\n",
             present, count,
             (unsigned long long)js_aot_bound_count,
             (unsigned long long)js_aot_enter_count,
-            (unsigned long long)rt->aot_epoch_bumps);
+            (unsigned long long)rt->aot_epoch_bumps,
+            cells_set, r ? r->cell_count : 0u, disabled);
 }
 
 /* Bind a function to its generated entry. The table is sorted by digest;
@@ -60033,6 +60186,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
     uint32_t lo, hi;
 
     b->aot_fn = NULL;
+    b->aot_index = UINT32_MAX;
     b->aot_state = 2;           /* known-absent until a match is found */
     if (!aot_unit_present())
         return;
@@ -60053,6 +60207,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
             }
 #endif
             b->aot_fn = (void *)qjs_aot_table[mid].fn;
+            b->aot_index = mid;
             b->aot_state = 1;   /* bound */
             js_aot_bound_count++;
             return;
