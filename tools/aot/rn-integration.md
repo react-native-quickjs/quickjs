@@ -15,6 +15,12 @@ clang ... -DQJS_REGVM=1 -DQJS_AOT_PROFILE=1 -no-pie ...
 QJS_AOT_PROFILE_OUT=app.qjsprof  ./MyApp
 ```
 
+`QJS_AOT_PROFILE` is a compile-time flag, not a runtime switch: a build without
+it contains no profiling code, and a build with it and no `QJS_AOT_PROFILE_OUT`
+skips every hook at run time. Add it to the dev build that records the profile
+and drop it for shipping; the shipping `.text` is byte-identical with the flag
+off.
+
 `QJS_AOT_PROFILE_OUT` makes the profiler dump every function's 128-bit
 bytecode digest, dynamic op count, loop trip counts, per-register and
 per-instruction type sets with numeric ranges, PIC shapes, call sites, coverage,
