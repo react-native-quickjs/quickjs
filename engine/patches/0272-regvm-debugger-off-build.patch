@@ -1,0 +1,73 @@
+Subject: Build the register VM without the debugger interface
+
+What this does
+  Moves the light frame's variable-area bound out of the `JS_ENABLE_DEBUGGER`
+  block, so the debugger-off configuration compiles.
+
+Why we need it
+  `regvm_debug_eval_light` uses `regvm_light_var_bound` and is compiled for
+  every register VM, but the helper was defined inside the debugger block, so
+  `JS_ENABLE_DEBUGGER=0` failed with an undeclared function. The debugger-off
+  build is what the AOT runtime requires.
+
+What it adds
+  The helper (and its `!QJS_REGVM` macro) above the debugger block; nothing
+  else moves.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+index 78c2b8f..2370f26 100644
+@@ -4337,6 +4337,23 @@
+     return js_dup(ctx->function_proto);
+ }
+ 
++#if QJS_REGVM
++/* A light frame's variable-area bound, as used by the light fill and the
++   release walks. Slots at or above it live in registers, not `var_buf`. */
++static int regvm_light_var_bound(JSFunctionBytecode *b)
++{
++    int vc = b->var_count;
++
++#if QJS_DRC
++    if (b->var_count <= 255)
++        vc = b->regvm_var_count;
++#endif
++    return vc;
++}
++#else
++#define regvm_light_var_bound(b) ((int)(b)->var_count)
++#endif
++
+ #if JS_ENABLE_DEBUGGER
+ 
+ void JS_SetDebugTraceHandler(JSContext *ctx, JSDebugTraceFunc *cb, void *opaque)
+@@ -4354,19 +4371,6 @@
+ }
+ 
+ #if QJS_REGVM
+-/* A light frame's variable-area bound, as used by the light fill and the
+-   release walks. Slots at or above it live in registers, not `var_buf`. */
+-static int regvm_light_var_bound(JSFunctionBytecode *b)
+-{
+-    int vc = b->var_count;
+-
+-#if QJS_DRC
+-    if (b->var_count <= 255)
+-        vc = b->regvm_var_count;
+-#endif
+-    return vc;
+-}
+-
+ /* The register pc of a debugger frame: the callee's resume address names this
+    frame's call site; the frame's captured ip is the fallback and the innermost
+    frame's only source. */
+@@ -4374,7 +4378,6 @@
+                                 JSFunctionBytecode *b,
+                                 const uint8_t *callee_ret);
+ #else
+-#define regvm_light_var_bound(b) ((int)(b)->var_count)
+ #define regvm_debug_frame_pc(rt, sf, b, callee_ret) (-1)
+ #endif
+ 

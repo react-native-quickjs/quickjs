@@ -358,3 +358,4 @@ patch other than `9999` touches `BC_VERSION`, or if a patch says it needs a
 bump while `9999` is missing.
 
 | `0271` | Polls the interrupt handler on every compiled back edge | `JS_SetInterruptHandler` is how an embedder stops runaway script, and every interpreter back edge polls it; a compiled loop that neither allocates nor calls (`while (true) {}`, or a typed region) had no poll and could not be stopped | `qjs_aot_poll` in the engine and its declaration, emitted at every backward branch and typed-region back edge | No. |
+| `0272` | Builds the register VM without the debugger interface | `regvm_debug_eval_light` uses `regvm_light_var_bound` and is compiled for every register VM, but the helper sat inside the `JS_ENABLE_DEBUGGER` block, so `JS_ENABLE_DEBUGGER=0` failed with an undeclared function; that build is what the AOT runtime requires | The helper (and its `!QJS_REGVM` macro) moved above the debugger block | No. |

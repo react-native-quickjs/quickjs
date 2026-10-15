@@ -4341,6 +4341,23 @@ JSValue JS_GetFunctionProto(JSContext *ctx)
     return js_dup(ctx->function_proto);
 }
 
+#if QJS_REGVM
+/* A light frame's variable-area bound, as used by the light fill and the
+   release walks. Slots at or above it live in registers, not `var_buf`. */
+static int regvm_light_var_bound(JSFunctionBytecode *b)
+{
+    int vc = b->var_count;
+
+#if QJS_DRC
+    if (b->var_count <= 255)
+        vc = b->regvm_var_count;
+#endif
+    return vc;
+}
+#else
+#define regvm_light_var_bound(b) ((int)(b)->var_count)
+#endif
+
 #if JS_ENABLE_DEBUGGER
 
 void JS_SetDebugTraceHandler(JSContext *ctx, JSDebugTraceFunc *cb, void *opaque)
@@ -4358,19 +4375,6 @@ void JS_SetDebugTraceArmed(JSContext *ctx, bool armed)
 }
 
 #if QJS_REGVM
-/* A light frame's variable-area bound, as used by the light fill and the
-   release walks. Slots at or above it live in registers, not `var_buf`. */
-static int regvm_light_var_bound(JSFunctionBytecode *b)
-{
-    int vc = b->var_count;
-
-#if QJS_DRC
-    if (b->var_count <= 255)
-        vc = b->regvm_var_count;
-#endif
-    return vc;
-}
-
 /* The register pc of a debugger frame: the callee's resume address names this
    frame's call site; the frame's captured ip is the fallback and the innermost
    frame's only source. */
@@ -4378,7 +4382,6 @@ static int regvm_debug_frame_pc(JSRuntime *rt, JSStackFrame *sf,
                                 JSFunctionBytecode *b,
                                 const uint8_t *callee_ret);
 #else
-#define regvm_light_var_bound(b) ((int)(b)->var_count)
 #define regvm_debug_frame_pc(rt, sf, b, callee_ret) (-1)
 #endif
 
