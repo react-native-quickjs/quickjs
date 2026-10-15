@@ -1,0 +1,479 @@
+Subject: Fix a stack leak, a capture-flag leak and unchecked slot operands in the register VM
+
+What this does
+  Six fixes found by an audit of the register VM and the bytecode reader.
+
+  1. A loop's backward branch that drains the deferred reference-count table
+     now reaches the drain as a guaranteed tail call. It was a plain call, so
+     every drain left one interpreter frame on the native stack until the
+     function returned. Optimized builds happened to turn it into a jump;
+     unoptimized and sanitizer builds did not, and a long loop that
+     accumulates into an object property overflowed the native stack.
+
+  2. Loading a function from bytecode no longer clears its "an argument is
+     captured" flag. The variable definitions are read first and set the flag
+     for a parameter an inner closure captures; the register program decode
+     then assigned the flag from the program alone, which cannot see that
+     capture. The function then borrowed its caller's argument window while a
+     closure cell referenced it, and the reference counts no longer balanced:
+     an assertion in debug builds, a leak in release builds.
+
+  3. Every register opcode operand that indexes a frame's locals, arguments,
+     closure references or registers is now bounded when bytecode is loaded.
+     Twelve opcodes were missing from the check, among them get_local_field,
+     put_local_xfer, local_rmw_imm, slot_get, slot_put, using_dispose and the
+     branch_cmp_*_loc forms, and their handlers index without checking.
+     using_dispose also reads the slot after its operand, so that one must be
+     in range too. The check is one function shared by the wire decoder and
+     the ahead-of-time verifier, which had none of these checks at all.
+
+  4. Reading a truncated BigInt no longer leaks the partly filled value.
+
+  5. A stack-shaping instruction with more results than the baseline tier's
+     fixed copy arrays hold is refused instead of being truncated on record
+     and overrun on expansion. Today's shapers produce at most six, so this
+     only keeps a future one from overflowing the arrays. The unused is_perm
+     field is gone.
+
+  6. Whether a light frame may run an opcode is computed per opcode instead
+     of from a static table filled on first use with no synchronization, which
+     two runtimes on different threads could race on.
+
+Why we need it
+  1 is a hard crash in any build the optimizer does not rescue. 2 is a leak in
+  shipping builds for any function whose captured parameter is read through a
+  computed property access with a side-effecting key. 3 lets malformed or
+  corrupted bytecode read and write outside a frame. 4 is a leak on malformed
+  input. 5 and 6 are latent.
+
+What it adds
+  regvm_slot_operands_ok()  - says whether every slot operand of one register
+                              instruction is in range for its function.
+  REGVM_SHAPE_MAX           - the most results one stack shaper may produce.
+
+Needs a bytecode version bump
+  No. The format is unchanged; the reader only refuses more malformed input.
+
+Notes
+  The argument-capture flag now combines with the variable definitions the way
+  the ahead-of-time load path already did.
+
+diff --git a/quickjs.c b/quickjs.c
+index 3994a9b..73b0af7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -10112,7 +10112,8 @@ static void js_regvm_drc_resume(JSRuntime *rt, JSValue *regs, uint32_t nregs)
+         }                                                                    \
+         if (unlikely((ctx_)->rt->zct_len + (ctx_)->rt->zct_nobj >            \
+                       (ctx_)->rt->zct_limit)) {                              \
+-            return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx_);         \
++            __attribute__((musttail))                                        \
++                return regvm_t_safepoint_slow(ip + (off_), fr, f, ctx_);     \
+         }                                                                    \
+     } } while (0)
+ #else
+@@ -57893,12 +57894,14 @@ typedef struct JSRegInsn {
+    explicit parallel copy, which the spill pass expands once the stack area is
+    known. `at_insn` is the placeholder's index, so a branch landing after the
+    shaper keeps a distinct target. */
++/* The most results a stack shaper produces (dup3's six), with headroom. */
++#define REGVM_SHAPE_MAX 8
++
+ typedef struct JSRegBShape {
+     int at_insn;
+-    int is_perm;        /* 1: replace the placeholder; 0: the lowering still runs */
+     int np, ns;
+-    int32_t src_id[8];  /* the value each target slot copies */
+-    int32_t dst_id[8];  /* the value each target slot defines (== its depth) */
++    int32_t src_id[REGVM_SHAPE_MAX];  /* the value each target slot copies */
++    int32_t dst_id[REGVM_SHAPE_MAX];  /* the value each target slot defines (== its depth) */
+ } JSRegBShape;
+ 
+ /* The baseline tier's per-instruction scratch, threaded through `sim->owner`
+@@ -58668,49 +58671,58 @@ static int regvm_code_has_op(const uint8_t *code, int len, int want)
+     return 0;
+ }
+ 
++/*
++ * May a light frame run `op`? Computed per opcode rather than cached in a
++ * lazily filled static table: the table was global state written on first use
++ * with no synchronization, so two runtimes on different threads could race on
++ * it, and a reader could see the ready flag before the entries. This runs once
++ * per instruction when a function's light eligibility is decided, not per
++ * call.
++ *
++ * Every opcode whose handler is the cold trampoline is unsafe. Of the rest,
++ * these stay light-unsafe:
++ *
++ *   Read a record-only field, so a light frame cannot run them:
++ *     special_object  `new_target`, `argv`, `argc`
++ *     make_closure    `sf`, passed to js_closure
++ *     put_arg_xfer    `arg_owned`
++ *   Read only prefix fields; unsafe only to keep the set of light-eligible
++ *   functions fixed:
++ *     branch_cmp_loc_reg, put_local_s1, get_arg_field, set_name
++ *   get_arg_el, tail_call and tail_call_method.
++ *
++ * apply_arguments and construct are light-safe whatever their handler.
++ */
++static bool regvm_op_light_unsafe(int op)
++{
++    switch (op) {
++    case ROP_apply_arguments:
++    case ROP_construct:
++        return false;
++    case ROP_get_arg_el:
++    case ROP_tail_call:
++    case ROP_tail_call_method:
++    case ROP_branch_cmp_loc_reg:
++    case ROP_special_object:
++    case ROP_make_closure:
++    case ROP_set_name:
++    case ROP_get_arg_field:
++    case ROP_put_arg_xfer:
++    case ROP_put_local_s1:
++        return true;
++    default:
++        return !regvm_is_threaded[op] || regvm_threaded[op] == regvm_t_cold;
++    }
++}
++
+ static int regvm_code_light_safe(const uint8_t *code, int len)
+ {
+-    static uint8_t unsafe[ROP_COUNT];
+-    static int ready;
+     const uint8_t *p = code, *end = p + len;
+ 
+-    if (!ready) {
+-        int op;
+-        for (op = 0; op < ROP_COUNT; op++)
+-            unsafe[op] = !regvm_is_threaded[op]
+-                || regvm_threaded[op] == regvm_t_cold;
+-        unsafe[ROP_get_arg_el] = 1;
+-        unsafe[ROP_apply_arguments] = 0;
+-        unsafe[ROP_construct] = 0;
+-        unsafe[ROP_tail_call] = 1;
+-        unsafe[ROP_tail_call_method] = 1;
+-        /*
+-         * The `unsafe[]` test above already marks every opcode whose handler is
+-           the
+-         * cold trampoline. These seven have their own handlers but stay
+-         light-unsafe. *
+-         * Read a record-only field, so a light frame cannot run them:
+-         *   special_object  `new_target`, `argv`, `argc`
+-         *   make_closure    `sf`, passed to js_closure
+-         *   put_arg_xfer    `arg_owned`
+-         *
+-         * Read only prefix fields; unsafe only to keep the set of
+-           light-eligible
+-         * functions fixed:
+-         *   branch_cmp_loc_reg, put_local_s1, get_arg_field, set_name
+-         */
+-        unsafe[ROP_branch_cmp_loc_reg] = 1;
+-        unsafe[ROP_special_object] = 1;
+-        unsafe[ROP_make_closure] = 1;
+-        unsafe[ROP_set_name] = 1;
+-        unsafe[ROP_get_arg_field] = 1;
+-        unsafe[ROP_put_arg_xfer] = 1;
+-        unsafe[ROP_put_local_s1] = 1;
+-        ready = 1;
+-    }
+     while (p < end) {
+         int op = *p, sz;
+-        if (op >= ROP_COUNT || unsafe[op] || regvm_rop_fmt[op] == NULL)
++        if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL ||
++            regvm_op_light_unsafe(op))
+             return 0;
+         sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+         if (sz < 0)
+@@ -64339,13 +64351,13 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+        added. */
+     if (super_hook && regvm_baseline_is_shaper(bc, pos)) {
+         JSRegBScratch *bs = sim->owner;
+-        int32_t dst_ids[8];
++        int32_t dst_ids[REGVM_SHAPE_MAX];
+         int j, at;
+         /* A pure permutation has no lowering; a placeholder keeps its position
+            an instruction boundary, and the spill pass replaces it with the
+            copies. `pv[j]` is each pushed slot's source, `dst_ids[j]` the slot's
+            own depth. */
+-        for (j = 0; j < ev->ns && j < 8; j++)
++        for (j = 0; j < ev->ns && j < REGVM_SHAPE_MAX; j++)
+             dst_ids[j] = push_base[pos] + j;
+         at = st->ir->n_insns;
+         if (regvm_ir_add(st->ctx, st->ir, ROP_move, pos, NULL, 0))
+@@ -64357,7 +64369,7 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
+            alias: after the baseline's parallel copy the destination register,
+            which is the depth's register, holds the value. The shape record
+            keeps the true source ids for the copy. */
+-        for (j = 0; j < ev->ns && j < 8; j++)
++        for (j = 0; j < ev->ns && j < REGVM_SHAPE_MAX; j++)
+             pv[j] = dst_ids[j];
+     } else if (bc[pos] == OP_drop && np == 1 && d >= 1 && st->sentinel_bits &&
+         scratch[d - 1] >= 0 && scratch[d - 1] < st->n_values &&
+@@ -65252,10 +65264,16 @@ static int regvm_baseline_record_shape(JSContext *ctx, JSRegBScratch *bs,
+         bs->shapes = ns2;
+         bs->cap_shapes = nc;
+     }
++    /* regvm_baseline_expand_shape copies through fixed arrays of
++       REGVM_SHAPE_MAX, so a larger shape is refused, not truncated. */
++    if (ns < 0 || ns > REGVM_SHAPE_MAX) {
++        JS_ThrowInternalError(ctx, "regvm: stack shaper with %d results", ns);
++        return -1;
++    }
+     sh.at_insn = at;
+     sh.np = np;
+     sh.ns = ns;
+-    for (j = 0; j < ns && j < 8; j++) {
++    for (j = 0; j < ns; j++) {
+         sh.src_id[j] = src_id[j];
+         sh.dst_id[j] = dst_id[j];
+     }
+@@ -69462,8 +69480,10 @@ static int regvm_baseline_expand_shape(JSContext *ctx, JSRegBlOut *o,
+                                        const JSRegBlCtx *C,
+                                        const JSRegBShape *sh, int src_pc)
+ {
+-    int sreg[8], dreg[8], sdeep[8], ddeep[8], stmp[8], dtmp[8];
+-    int srslot[8];
++    int sreg[REGVM_SHAPE_MAX], dreg[REGVM_SHAPE_MAX];
++    int sdeep[REGVM_SHAPE_MAX], ddeep[REGVM_SHAPE_MAX];
++    int stmp[REGVM_SHAPE_MAX], dtmp[REGVM_SHAPE_MAX];
++    int srslot[REGVM_SHAPE_MAX];
+     int n = sh->ns, j, k2, npre = 0;
+     int V = C->V;
+ 
+@@ -69504,7 +69524,7 @@ static int regvm_baseline_expand_shape(JSContext *ctx, JSRegBlOut *o,
+             regvm_bl_op2(in, ROP_slot_get, src_pc, sreg[j], srslot[j]);
+         }
+     {
+-        int done[8], rem = n;
++        int done[REGVM_SHAPE_MAX], rem = n;
+         int cyc = C->base + (C->K > 0 ? C->K - 1 : 0);
+         for (j = 0; j < n; j++)
+             done[j] = 0;
+@@ -74090,6 +74110,97 @@ regvm_wire_get_sleb(const uint8_t **pp, const uint8_t *end, int32_t *pv)
+     return 0;
+ }
+ 
++/*
++ * Slot operands index the frame's local, argument, closure-ref or register
++ * arrays, which the handlers dereference unchecked, so every one is bounded
++ * here. Shared by the wire decoder and the AOT verifier so the two lists cannot
++ * drift apart. A var_ref slot may name a captured local or a closure variable,
++ * so its bound is the larger of var_ref_count and closure_var_count.
++ */
++static bool regvm_slot_operands_ok(const JSFunctionBytecode *b, int op,
++                                   const int32_t *ops)
++{
++    uint32_t vr_bound = b->var_ref_count > b->closure_var_count
++                            ? b->var_ref_count : b->closure_var_count;
++    int slot = -1;
++    uint32_t bound = 0;
++    switch (op) {
++    case ROP_get_local:
++        slot = ops[1]; bound = b->var_count; break;
++    case ROP_put_local:
++    case ROP_local_check:
++    case ROP_local_check_init:
++    case ROP_local_uninit:
++    case ROP_close_local:
++        slot = ops[0]; bound = b->var_count; break;
++    case ROP_get_local_s0: case ROP_get_local_s1:
++    case ROP_get_local_s2: case ROP_get_local_s3:
++        slot = op - ROP_get_local_s0; bound = b->var_count; break;
++    case ROP_put_local_s0: case ROP_put_local_s1:
++    case ROP_put_local_s2: case ROP_put_local_s3:
++        slot = op - ROP_put_local_s0; bound = b->var_count; break;
++    case ROP_get_arg:
++        slot = ops[1]; bound = b->arg_count; break;
++    case ROP_put_arg:
++    case ROP_put_arg_xfer:
++        slot = ops[0]; bound = b->arg_count; break;
++    case ROP_get_arg_el:
++        /* `u` names the `arguments` object's var_buf slot, not an
++           argument index (see regvm_t_get_arg_el_slow). */
++        slot = ops[1]; bound = b->var_count; break;
++    case ROP_get_var_ref:
++        slot = ops[1]; bound = vr_bound; break;
++    case ROP_put_var_ref:
++    case ROP_var_ref_check:
++    case ROP_var_ref_check_init:
++        slot = ops[0]; bound = vr_bound; break;
++    case ROP_make_local_ref:
++        slot = ops[3];
++        bound = ops[4] == 0 ? b->var_count
++              : ops[4] == 1 ? b->arg_count : vr_bound;
++        break;
++    case ROP_get_local_field:
++        slot = ops[1]; bound = b->var_count; break;
++    case ROP_get_arg_field:
++        slot = ops[1]; bound = b->arg_count; break;
++    case ROP_put_local_xfer:
++    case ROP_local_rmw_imm:
++    case ROP_local_rmw_branch:
++        slot = op == ROP_put_local_xfer ? ops[0] : ops[1];
++        bound = b->var_count;
++        break;
++    case ROP_slot_get:
++        slot = ops[1]; bound = (uint32_t)b->regvm_reg_count; break;
++    case ROP_slot_put:
++        slot = ops[0]; bound = (uint32_t)b->regvm_reg_count; break;
++    case ROP_using_dispose:
++    case ROP_using_dispose_async:
++        /* The handler reads the value at `slot` and its dispose
++           method at `slot + 1`. */
++        slot = op == ROP_using_dispose ? ops[2] : ops[1];
++        bound = b->var_count > 0 ? b->var_count - 1 : 0;
++        break;
++    default:
++        break;
++    }
++    if (slot >= 0 && (uint32_t)slot >= bound)
++        return false;
++    /* The forms with a second local operand. */
++    if ((op == ROP_binary_loc_reg || op == ROP_binary_loc_loc) &&
++        (uint32_t)ops[2] >= (uint32_t)b->var_count)
++        return false;
++    if ((op == ROP_binary_reg_loc || op == ROP_binary_loc_loc) &&
++        (uint32_t)ops[3] >= (uint32_t)b->var_count)
++        return false;
++    if ((op == ROP_branch_cmp_loc_loc || op == ROP_branch_cmp_loc_reg) &&
++        (uint32_t)ops[1] >= (uint32_t)b->var_count)
++        return false;
++    if ((op == ROP_branch_cmp_loc_loc || op == ROP_branch_cmp_reg_loc) &&
++        (uint32_t)ops[2] >= (uint32_t)b->var_count)
++        return false;
++    return true;
++}
++
+ /* wire -> exec, in one pass: decode into b->regvm_code (exec_len bytes),
+    interning atoms, range-checking operands, marking instruction starts,
+    collecting branch targets, and computing args_captured / argv_safe. On
+@@ -74263,73 +74374,14 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+             q += need;
+         }
+ 
+-        if ((op == ROP_binary_loc_reg || op == ROP_binary_loc_loc) &&
+-            (uint32_t)ops[2] >= (uint32_t)b->var_count) {
+-            JS_ThrowSyntaxError(ctx, "register local slot out of range");
+-            goto fail_ins;
+-        }
+-        if ((op == ROP_binary_reg_loc || op == ROP_binary_loc_loc) &&
+-            (uint32_t)ops[3] >= (uint32_t)b->var_count) {
+-            JS_ThrowSyntaxError(ctx, "register local slot out of range");
+-            goto fail_ins;
+-        }
+         if (op == ROP_load_const &&
+             ops[1] != REG_CONST_CPOOL && ops[1] != REG_CONST_ATOM) {
+             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
+             goto fail_ins;
+         }
+-        {
+-            /* Slot operands index the frame's local, argument or closure-ref
+-               arrays, which the runtime dereferences unchecked, so bound every
+-               one here. A var_ref slot may name a captured local or a closure
+-               variable, so its bound is the larger of var_ref_count and
+-               closure_var_count. */
+-            uint32_t vr_bound = b->var_ref_count > b->closure_var_count
+-                                    ? b->var_ref_count : b->closure_var_count;
+-            int slot = -1;
+-            uint32_t bound = 0;
+-            switch (op) {
+-            case ROP_get_local:
+-                slot = ops[1]; bound = b->var_count; break;
+-            case ROP_put_local:
+-            case ROP_local_check:
+-            case ROP_local_check_init:
+-            case ROP_local_uninit:
+-            case ROP_close_local:
+-                slot = ops[0]; bound = b->var_count; break;
+-            case ROP_get_local_s0: case ROP_get_local_s1:
+-            case ROP_get_local_s2: case ROP_get_local_s3:
+-                slot = op - ROP_get_local_s0; bound = b->var_count; break;
+-            case ROP_put_local_s0: case ROP_put_local_s1:
+-            case ROP_put_local_s2: case ROP_put_local_s3:
+-                slot = op - ROP_put_local_s0; bound = b->var_count; break;
+-            case ROP_get_arg:
+-                slot = ops[1]; bound = b->arg_count; break;
+-            case ROP_put_arg:
+-            case ROP_put_arg_xfer:
+-                slot = ops[0]; bound = b->arg_count; break;
+-            case ROP_get_arg_el:
+-                /* `u` names the `arguments` object's var_buf slot, not an
+-                   argument index (see regvm_t_get_arg_el_slow). */
+-                slot = ops[1]; bound = b->var_count; break;
+-            case ROP_get_var_ref:
+-                slot = ops[1]; bound = vr_bound; break;
+-            case ROP_put_var_ref:
+-            case ROP_var_ref_check:
+-            case ROP_var_ref_check_init:
+-                slot = ops[0]; bound = vr_bound; break;
+-            case ROP_make_local_ref:
+-                slot = ops[3];
+-                bound = ops[4] == 0 ? b->var_count
+-                      : ops[4] == 1 ? b->arg_count : vr_bound;
+-                break;
+-            default:
+-                break;
+-            }
+-            if (slot >= 0 && (uint32_t)slot >= bound) {
+-                JS_ThrowSyntaxError(ctx, "register slot out of range");
+-                goto fail_ins;
+-            }
++        if (!regvm_slot_operands_ok(b, op, ops)) {
++            JS_ThrowSyntaxError(ctx, "register slot out of range");
++            goto fail_ins;
+         }
+         if (regvm_op_writes_args(op))
+             argv_safe = false;
+@@ -74399,7 +74451,11 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
+             goto fail;
+         }
+     }
+-    b->args_captured = args_captured ? 1 : 0;
++    /* OR, not assign: the vardefs were read first and already set
++       args_captured for a parameter an inner closure captures, which the
++       register program cannot show. */
++    if (args_captured)
++        b->args_captured = 1;
+     b->argv_safe = argv_safe ? 1 : 0;
+     /* The promotion map is compile-time only, so a blob function keeps
+        `var_count`, clamped to the one-byte field. */
+@@ -74537,9 +74593,9 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
+ 
+ static JSValue JS_ReadBigInt(BCReaderState *s)
+ {
+-    JSValue obj = JS_UNDEFINED;
+     uint32_t len, i, n;
+-    JSBigInt *p;
++    /* Owned until JS_CompactBigInt takes it; freed on every failure below. */
++    JSBigInt *p = NULL;
+     js_limb_t v;
+     uint8_t v8;
+ 
+@@ -74578,7 +74634,7 @@ static JSValue JS_ReadBigInt(BCReaderState *s)
+     bc_read_trace(s, "}\n");
+     return JS_CompactBigInt(s->ctx, p);
+  fail:
+-    JS_FreeValue(s->ctx, obj);
++    js_free(s->ctx, p);
+     return JS_EXCEPTION;
+ }
+ 
+@@ -74828,14 +74884,8 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
+                 }
+             }
+         }
+-        if ((op == ROP_binary_loc_reg || op == ROP_binary_loc_loc) &&
+-            (uint32_t)ops[2] >= (uint32_t)b->var_count) {
+-            JS_ThrowSyntaxError(ctx, "register local slot out of range");
+-            goto done;
+-        }
+-        if ((op == ROP_binary_reg_loc || op == ROP_binary_loc_loc) &&
+-            (uint32_t)ops[3] >= (uint32_t)b->var_count) {
+-            JS_ThrowSyntaxError(ctx, "register local slot out of range");
++        if (!regvm_slot_operands_ok(b, op, ops)) {
++            JS_ThrowSyntaxError(ctx, "register slot out of range");
+             goto done;
+         }
+         if (op == ROP_load_const &&

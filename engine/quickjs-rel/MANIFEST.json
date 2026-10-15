@@ -1075,21 +1075,105 @@
       "sha256": "ff0f8d433f9902c64bc81af5bbd22dd0ba5ce3ef15f5753949178a0214000834"
     },
     {
+      "name": "0274-backtrace-limit-skipped-frame.patch",
+      "sha256": "f64d838d38d084335d9de8c63534d75715975502e6bfa38f2f285a0457fa1000"
+    },
+    {
+      "name": "0275-regvm-audit-fixes.patch",
+      "sha256": "eb2e025fcabee1e9d8a67f76d5cd0f3b3e1e0a1ca76ddc38f81c7f3132c241c4"
+    },
+    {
+      "name": "0276-regvm-inline-loose-eq.patch",
+      "sha256": "e248319bac034dc86d8f85e31005ff000ab496a0ef6dc25d243af3186ce0d5fb"
+    },
+    {
+      "name": "0277-regvm-inline-div-mod.patch",
+      "sha256": "1072a49741a8b92dedb187b061cdf819204f10c3325e1b247e9117cf184567b2"
+    },
+    {
+      "name": "0278-regvm-binary-imm-per-op.patch",
+      "sha256": "b15c8c94b6dea9e61d4716071dc7a1a940ad29aba49c4167e8ad70ece0f973fe"
+    },
+    {
+      "name": "0279-regvm-drc-move-xfer-no-clear.patch",
+      "sha256": "9859740ce833bcb5d714e9e38b1c5840142608744e1ffdf1dae8046f58db0257"
+    },
+    {
+      "name": "0280-regvm-global-site-cache.patch",
+      "sha256": "af678b7cdaf76d7ca52ec72bf599490f103ccebae9923d3d94378eb6498aae33"
+    },
+    {
+      "name": "0281-init-gv-watched.patch",
+      "sha256": "fecbb9eb9fcd041a079911a8528adccaf4fec6ce228d0aa194d8d824fdbeac08"
+    },
+    {
+      "name": "0282-regvm-this-field-fusion.patch",
+      "sha256": "55761c13834994585ab10601ca743e1d4bbb7e0a06b5b3b9ff1cca204880c802"
+    },
+    {
+      "name": "0283-ctor-instance-shape-cache.patch",
+      "sha256": "dc3d45f3317e8083b6982a187a8c47d0dbc9f3915231ffae16db2c8e9e6ecc63"
+    },
+    {
+      "name": "0284-inline-array-elements.patch",
+      "sha256": "2d087a92a77cdd20d5a106fcbf141ea55788ee924c6d7f5071e3337fd719bca4"
+    },
+    {
+      "name": "0285-inline-property-release.patch",
+      "sha256": "7a2722e5c4b24c0e546a39ccaabc6b81497fd8e216fcb065c39cb77a6e4ff527"
+    },
+    {
+      "name": "0286-compact-plain-object.patch",
+      "sha256": "694963d1c36fdc7e8dfac7136b4c2a5e0826a9205e74f39d013a7119a14353ad"
+    },
+    {
+      "name": "0287-regvm-light-frame-setup.patch",
+      "sha256": "b17263b23e05c1ec28476f205df8e43ddefa3396491b10b29061cebd34734a3d"
+    },
+    {
+      "name": "0288-regvm-typed-array-length.patch",
+      "sha256": "dad33ea84fda966d42cff806bcd1631ec425085dec06e07b05c21e4aead20328"
+    },
+    {
+      "name": "0289-regvm-null-branches.patch",
+      "sha256": "fb3ab436d4e85deeb638e4277d8b2365271d0264268c49d66fd084d7047fd86a"
+    },
+    {
+      "name": "0290-regvm-post-inc-fusion.patch",
+      "sha256": "3858abb894388841a038a6fb04a601e38baa47b1ca383c1b6176f0802d02dbf6"
+    },
+    {
+      "name": "0291-regvm-array-const.patch",
+      "sha256": "65c05aa50cdc2cc2ef88696812ffdf9ee60f8cc23bcb50ff5e5baaba67347962"
+    },
+    {
+      "name": "0292-regvm-poly-read-fast.patch",
+      "sha256": "f4aabf04bca685564d7e64fe91d484632b46692c7deed6dc9ad740bec8863ec4"
+    },
+    {
+      "name": "0293-arena-inline-pop.patch",
+      "sha256": "67d3345d1d35f31dd00aefab97a1eb2ac9e035641832999062539e73d5811239"
+    },
+    {
+      "name": "0294-regvm-get-arg-pair.patch",
+      "sha256": "7d1bd0052350a36704d831bdc4e98f9c8b702fa1d47d3cb02f41cffee765b5a8"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
-      "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
+      "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "09cfac53ae7e32cb9e4557f390e030acc1943ab226608c8676048b4efd0e7156",
+    "quickjs.c": "9f8ff5885624ab4f8b8c83365e5447bc7225bfb70fb439667397bcd889c6cb4e",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
-    "builtin-array-fromasync.regvm.h": "5851f9666ee83d9a907c2e664ce1ac8ce43ee9853513eec43107b65f864f722d",
+    "builtin-array-fromasync.regvm.h": "481b1fcc19c8a439f9c8ace3b309e83fe3c01ecdb3e9a0e833f10b5b81027874",
     "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
-    "builtin-iterator-zip-keyed.regvm.h": "0d4301cf1c823a109cb14db98e48b602750253911deec9fd34c07b272010cf20",
+    "builtin-iterator-zip-keyed.regvm.h": "23d12bec48360b3113f2011ce3dcf65dd9fe22e323643fd33193b7405916ee2a",
     "builtin-iterator-zip.h": "1133567b87c8af0d6c3c680ec1a8fcfcba65acc975885477c2c688ac55f149bc",
-    "builtin-iterator-zip.regvm.h": "06f3c1ee10a46c67b87b6d0b792c824c6cb074911fe4685b47b05c1eb50b3260",
+    "builtin-iterator-zip.regvm.h": "70a328de159c17661c0d9c07b591adfeee2a40fa4e9ba52550c04a8d5ec4213e",
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
@@ -1101,7 +1185,7 @@
     "quickjs-atom.h": "66654ae6533d15073ea527979c453709d7ed83162142c656095a10dcef737a60",
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
-    "quickjs-regvm.h": "8550a6cf86571d09d5bf9e9bb4752dd6f227be0ad611abe102c3c39511e5ae28",
+    "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
     "quickjs.h": "fd585b9de76f67f56a26abb5782790c2b2f3626f9f17cb77293c4ea173fa98ad",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }

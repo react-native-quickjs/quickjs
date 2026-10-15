@@ -1,0 +1,110 @@
+Subject: Give each binary immediate operation its own threaded handler
+
+What this does
+  `binary_imm` and `binary_imm_s` carry their operation as an operand. Their
+  threaded handlers now tail-call a handler chosen by that operand from a
+  256-entry table, one per operation, each compiled with the operation as a
+  constant. A byte that names no operation lands on the slow handler.
+
+Why we need it
+  The shared handler switched on the operation inside the arithmetic fast
+  path on every execution: 29 instructions per `binary_imm` on Octane
+  mandreel, where it is 28% of all executed register instructions, and 18% on
+  crypto. With the operation fixed, the type tests and the arithmetic fold to
+  the one case.
+
+What it adds
+  regvm_t_binary_imm_<op>, regvm_t_binary_imm_s_<op> - one handler per operation.
+  regvm_binary_imm_sub, regvm_binary_imm_s_sub        - the operand-indexed tables.
+
+Needs a bytecode version bump
+  No. The encoding is unchanged.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27456,34 +27456,64 @@
+ 
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_binary_imm_slow(REGVM_ARGS)
+ { T_BODY_RBR_I(T_SZ_RBR_I); }
++static uint8_t *REGVM_CC regvm_t_binary_imm_s_slow(REGVM_ARGS);
++#define T_DEF_BINARY_IMM_SUB(NAME, SUB_) \
++    static uint8_t *REGVM_CC regvm_t_binary_imm_##NAME(REGVM_ARGS) \
++    { \
++        int d = T_REG(1); \
++        JSValue out; \
++        if (likely(regvm_num_fast(SUB_, FR(T_REG(4)), js_int32(T_I32(6)), &out))) { \
++            T_SET_NEXT_B(d, out, T_SZ_RBR_I); \
++        } \
++        __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS); \
++    } \
++    static uint8_t *REGVM_CC regvm_t_binary_imm_s_##NAME(REGVM_ARGS) \
++    { \
++        int d = T_REG8(1); \
++        JSValue out; \
++        if (likely(regvm_num_fast(SUB_, FR(T_REG8(3)), js_int32(T_OFF8(4)), &out))) { \
++            T_SET_NEXT_B(d, out, T_SZ_RBRI_S); \
++        } \
++        __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS); \
++    }
++REGVM_T_BINARY_LIST(T_DEF_BINARY_IMM_SUB)
++#undef T_DEF_BINARY_IMM_SUB
++
++#define T_BINARY_IMM_ENTRY(NAME, SUB_) [SUB_] = regvm_t_binary_imm_##NAME,
++#define T_BINARY_IMM_S_ENTRY(NAME, SUB_) [SUB_] = regvm_t_binary_imm_s_##NAME,
++#if defined(__clang__)
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Winitializer-overrides"
++#elif defined(__GNUC__)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Woverride-init"
++#endif
++static const regvm_handler regvm_binary_imm_sub[256] = {
++    [0 ... 255] = regvm_t_binary_imm_slow,
++    REGVM_T_BINARY_LIST(T_BINARY_IMM_ENTRY)
++};
++static const regvm_handler regvm_binary_imm_s_sub[256] = {
++    [0 ... 255] = regvm_t_binary_imm_s_slow,
++    REGVM_T_BINARY_LIST(T_BINARY_IMM_S_ENTRY)
++};
++#undef T_BINARY_IMM_ENTRY
++#undef T_BINARY_IMM_S_ENTRY
++#if defined(__clang__)
++#pragma clang diagnostic pop
++#elif defined(__GNUC__)
++#pragma GCC diagnostic pop
++#endif
++
+ static uint8_t *REGVM_CC regvm_t_binary_imm(REGVM_ARGS)
+ {
+-    int d = T_REG(1);
+-    int sub = T_U8(3);
+-    int a = T_REG(4);
+-    int32_t imm = T_I32(6);
+-    JSValue out;
+-
+-    if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+-        T_SET_NEXT_B(d, out, T_SZ_RBR_I);
+-    }
+-    __attribute__((musttail)) return regvm_t_binary_imm_slow(REGVM_PASS);
++    __attribute__((musttail)) return regvm_binary_imm_sub[T_U8(3)](REGVM_PASS);
+ }
+ 
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_binary_imm_s_slow(REGVM_ARGS)
+ { T_BODY_RBRI_S(T_SZ_RBRI_S); }
+ static uint8_t *REGVM_CC regvm_t_binary_imm_s(REGVM_ARGS)
+ {
+-    int d = T_REG8(1);
+-    int sub = T_U8(2);
+-    int a = T_REG8(3);
+-    int32_t imm = T_OFF8(4);
+-    JSValue out;
+-
+-    if (likely(regvm_num_fast(sub, FR(a), js_int32(imm), &out))) {
+-        T_SET_NEXT_B(d, out, T_SZ_RBRI_S);
+-    }
+-    __attribute__((musttail)) return regvm_t_binary_imm_s_slow(REGVM_PASS);
++    __attribute__((musttail)) return regvm_binary_imm_s_sub[T_U8(2)](REGVM_PASS);
+ }
+ 
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_unary_slow(REGVM_ARGS)

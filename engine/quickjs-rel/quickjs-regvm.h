@@ -592,6 +592,17 @@ typedef enum JSRegOpcode {
        */
     ROP_slot_get, ROP_slot_put,
 
+    ROP_get_this_field, ROP_get_this_field2,
+
+    ROP_branch_null, ROP_branch_not_null,
+    ROP_branch_nullish, ROP_branch_not_nullish,
+
+    ROP_post_inc, ROP_post_dec,
+
+    ROP_array_const,
+
+    ROP_get_arg2,
+
     ROP_COUNT
 } JSRegOpcode;
 

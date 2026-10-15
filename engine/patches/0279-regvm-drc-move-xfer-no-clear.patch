@@ -1,0 +1,37 @@
+Subject: Stop clearing the source register of a transfer move under deferred RC
+
+What this does
+  Under deferred reference counting `move_xfer` copies its source to its
+  destination and leaves the source as it was, in the threaded handler and in
+  the interpreter loop.
+
+Why we need it
+  Registers do not own their values under deferred RC, so emptying the source
+  released nothing; it was two stores on an opcode that is 6 to 7% of the
+  executed register instructions on Octane crypto and splay. The compiler
+  emits the transfer form only when the source is dead, so the stale copy is
+  never read; it only roots its value until the register is reused, which a
+  live register would do anyway.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -28268,7 +28268,6 @@
+         /* A transfer is a plain copy plus clearing the source; the value stays
+            rooted. */
+         FR(d) = FR(s);
+-        FR(s) = JS_UNDEFINED;
+ #else
+         JSValue v = FR(s), old = FR(d);
+ 
+@@ -31576,7 +31575,6 @@
+                   if (d != s) {
+ #if QJS_DRC
+                       regs[d] = regs[s];
+-                      regs[s] = JS_UNDEFINED;
+ #else
+                       set_value(ctx, &regs[d], regs[s]);
+                       regs[s] = JS_UNDEFINED;

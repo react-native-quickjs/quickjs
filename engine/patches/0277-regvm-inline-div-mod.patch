@@ -1,0 +1,55 @@
+Subject: Divide and take remainders inline in the register VM
+
+What this does
+  The register VM's arithmetic fast path now handles `/` and `%` for two
+  ints, two doubles, and an int with a double. Two ints divide as doubles and
+  keep an int result when it is exact; a non-negative int remainder by a
+  positive int stays an int, and every other case uses fmod, as the engine's
+  slow routine does.
+
+Why we need it
+  Every `/` and `%` went through the generic binary routine and its ToNumber
+  conversion, even on two small ints. Octane mandreel divides by an
+  immediate millions of times and gbemu takes many int remainders.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23490,6 +23490,8 @@
+         case REG_BIN_ADD: *out = js_float64(d1 + d2); return 1;
+         case REG_BIN_SUB: *out = js_float64(d1 - d2); return 1;
+         case REG_BIN_MUL: *out = js_float64(d1 * d2); return 1;
++        case REG_BIN_DIV: *out = js_float64(d1 / d2); return 1;
++        case REG_BIN_MOD: *out = js_float64(fmod(d1, d2)); return 1;
+         case REG_BIN_LT: *out = js_bool(d1 < d2); return 1;
+         case REG_BIN_LTE: *out = js_bool(d1 <= d2); return 1;
+         case REG_BIN_GT: *out = js_bool(d1 > d2); return 1;
+@@ -23518,6 +23520,16 @@
+             }
+             *out = js_int32((int32_t)r);
+             return 1;
++        case REG_BIN_DIV:
++            *out = js_number((double)v1 / (double)v2);
++            return 1;
++        case REG_BIN_MOD:
++            if (likely(v1 >= 0 && v2 > 0)) {
++                *out = js_int32(v1 % v2);
++                return 1;
++            }
++            *out = js_number(fmod(v1, v2));
++            return 1;
+         case REG_BIN_LT: *out = js_bool(v1 < v2); return 1;
+         case REG_BIN_LTE: *out = js_bool(v1 <= v2); return 1;
+         case REG_BIN_GT: *out = js_bool(v1 > v2); return 1;
+@@ -23543,6 +23555,8 @@
+         case REG_BIN_ADD: *out = js_float64(d1 + d2); return 1;
+         case REG_BIN_SUB: *out = js_float64(d1 - d2); return 1;
+         case REG_BIN_MUL: *out = js_float64(d1 * d2); return 1;
++        case REG_BIN_DIV: *out = js_float64(d1 / d2); return 1;
++        case REG_BIN_MOD: *out = js_float64(fmod(d1, d2)); return 1;
+         case REG_BIN_LT: *out = js_bool(d1 < d2); return 1;
+         case REG_BIN_LTE: *out = js_bool(d1 <= d2); return 1;
+         case REG_BIN_GT: *out = js_bool(d1 > d2); return 1;

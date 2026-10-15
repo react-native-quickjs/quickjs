@@ -1,0 +1,131 @@
+Subject: Pop small arena blocks inline in js_malloc and warm the next one
+
+What this does
+  The small-block pop of the arena allocator becomes an always-inline helper
+  shared by js_arena_malloc and a new fast path in js_malloc_rt. A small
+  request takes its block straight from the size class and accounts the
+  class's usable size without reading the block header back. After a pop
+  the allocator prefetches the next free block of the same class for
+  writing, so the following allocation's free-list read and the object
+  initialization find the line in cache. Large and zero-size requests, and
+  the sanitizer configuration that routes everything to the backing
+  allocator, are unchanged.
+
+Why we need it
+  Object creation goes through js_malloc for every object. The out-of-line
+  arena call and the header re-read cost instructions on every allocation,
+  and the freshly popped block is usually cold: the object-creation path
+  takes 15-30% of the L1 write misses in Octane raytrace, earleyboyer and
+  splay, and js_arena_malloc 9-13% of their read misses.
+
+Needs a bytecode version bump
+  No.
+
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2818,6 +2818,40 @@
+     return b->user_data;
+ }
+ 
++static inline __attribute__((always_inline)) void *
++js_arena_pop(JSRuntime *rt, int block_size_idx, unsigned int block_size)
++{
++    unsigned int block_idx, next;
++    JSMallocBlockHeader *b;
++    JSArena *ar;
++    struct list_head *el, *head;
++
++    head = &rt->arena_state.free_arena_list[block_size_idx];
++    el = head->next;
++    if (unlikely(el == head)) {
++        ar = arena_new(rt, block_size_idx);
++        if (!ar)
++            return NULL;
++    } else {
++        ar = list_entry(el, JSArena, free_link);
++    }
++    block_idx = ar->first_free_block;
++    b = arena_get_block(ar, block_idx, block_size);
++    next = b->u.free_next;
++    ar->first_free_block = next;
++    if (likely(next != JS_ARENA_FREE_NIL))
++        __builtin_prefetch(arena_get_block(ar, next, block_size), 1, 3);
++    b->u.block_idx = block_idx;
++    b->gc_notrace = 0;
++    b->in_zct = 0;
++    if (unlikely(ar->n_used_blocks == 0))
++        rt->arena_state.n_empty--;
++    ar->n_used_blocks++;
++    if (unlikely(ar->n_used_blocks == ar->n_blocks))
++        list_del(&ar->free_link);
++    return b->user_data;
++}
++
+ static void *js_arena_malloc(JSRuntime *rt, size_t size)
+ {
+     size_t total_size;
+@@ -2827,35 +2861,8 @@
+     total_size = ((size + JS_ARENA_ALIGN - 1) & ~(size_t)(JS_ARENA_ALIGN - 1)) +
+         sizeof(JSMallocBlockHeader);
+     if (!JS_ARENA_LARGE_BLOCKS_ONLY && total_size <= JS_ARENA_MAX_SMALL_SIZE) {
+-        int block_size_idx;
+-        unsigned int block_idx, block_size;
+-        JSMallocBlockHeader *b;
+-        JSArena *ar;
+-        struct list_head *el, *head;
+-
+-        block_size_idx = arena_get_size_index(total_size);
+-        block_size = arena_block_sizes[block_size_idx];
+-        head = &rt->arena_state.free_arena_list[block_size_idx];
+-        el = head->next;
+-        if (unlikely(el == head)) {
+-            ar = arena_new(rt, block_size_idx);
+-            if (!ar)
+-                return NULL;
+-        } else {
+-            ar = list_entry(el, JSArena, free_link);
+-        }
+-        block_idx = ar->first_free_block;
+-        b = arena_get_block(ar, block_idx, block_size);
+-        ar->first_free_block = b->u.free_next;
+-        b->u.block_idx = block_idx;
+-        b->gc_notrace = 0;
+-    b->in_zct = 0;
+-        if (unlikely(ar->n_used_blocks == 0))
+-            rt->arena_state.n_empty--;
+-        ar->n_used_blocks++;
+-        if (unlikely(ar->n_used_blocks == ar->n_blocks))
+-            list_del(&ar->free_link);
+-        return b->user_data;
++        int block_size_idx = arena_get_size_index(total_size);
++        return js_arena_pop(rt, block_size_idx, arena_block_sizes[block_size_idx]);
+     } else {
+         return arena_malloc_large(rt, size);
+     }
+@@ -3088,6 +3095,24 @@
+     if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
+         return NULL;
+ 
++    if (!JS_ARENA_LARGE_BLOCKS_ONLY &&
++        size <= JS_ARENA_MAX_SMALL_SIZE - sizeof(JSMallocBlockHeader)) {
++        size_t total_size = ((size + JS_ARENA_ALIGN - 1) &
++                             ~(size_t)(JS_ARENA_ALIGN - 1)) +
++                            sizeof(JSMallocBlockHeader);
++        int block_size_idx = arena_get_size_index(total_size);
++        unsigned int block_size = arena_block_sizes[block_size_idx];
++
++        ptr = js_arena_pop(rt, block_size_idx, block_size);
++        if (!ptr)
++            return NULL;
++        s->malloc_count++;
++        s->malloc_size += block_size - sizeof(JSMallocBlockHeader) +
++                          MALLOC_OVERHEAD;
++        js_drc_malloc_pressure(rt);
++        return ptr;
++    }
++
+     ptr = js_arena_malloc(rt, size);
+     if (!ptr)
+         return NULL;
