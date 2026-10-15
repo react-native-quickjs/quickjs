@@ -1482,10 +1482,9 @@ struct JSMegaEntry {
 #endif
 
 #if QJS_AOT_PROFILE
-/* AOT profiler, built only with `-DQJS_AOT_PROFILE=1`, which also needs the
-   non-threaded monolith so every opcode passes through REGVM_NEXT. Records
-   attach lazily to their bytecode and are dumped at runtime teardown when
-   QJS_AOT_PROFILE_OUT names a file. */
+/* AOT profiler, built with `-DQJS_AOT_PROFILE=1`. Records attach lazily to
+   their bytecode and are dumped at runtime teardown when QJS_AOT_PROFILE_OUT
+   names a file. */
 
 /* One property site: the receiver shapes observed and how often each was seen.
    Identity only; the profiler holds no shape references. */
@@ -1514,6 +1513,15 @@ typedef struct JSAotProfCall {
     JSAotProfCallee callee[4];
 } JSAotProfCall;
 
+typedef struct JSAotProfPc {
+    uint16_t types;        /* AOT_TYPE_* of the value defined at this pc */
+    uint8_t has_num;
+    uint8_t frac;          /* a non-integral number was seen */
+    uint8_t negzero;       /* -0 was seen */
+    double num_min;
+    double num_max;
+} JSAotProfPc;
+
 typedef struct JSAotProfFunc {
     uint64_t ops;
     uint32_t entries;
@@ -1521,12 +1529,14 @@ typedef struct JSAotProfFunc {
     uint32_t *loop_iters;  /* indexed by regvm offset; size loop_n */
     uint16_t *reg_types;   /* bitmask by register; size reg_n */
     int32_t *reg_pc;       /* regvm offset of the first write to each register */
+    JSAotProfPc *pcs;      /* by defining instruction; size pc_n */
     JSAotProfSite *sites;  /* size nsites */
     JSAotProfCall *calls;
     int ncalls;
     int calls_cap;
     int loop_n;
     int reg_n;
+    int pc_n;
     int nsites;
 } JSAotProfFunc;
 
@@ -59126,10 +59136,14 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
         return NULL;
     pf->loop_n = b->regvm_len > 0 ? b->regvm_len : 0;
     pf->reg_n = b->regvm_reg_count > 0 ? b->regvm_reg_count : 0;
+    pf->pc_n = pf->loop_n;
     pf->nsites = b->regvm_pic_count;
     if (pf->loop_n > 0) {
         pf->loop_iters = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->loop_n);
         if (!pf->loop_iters)
+            goto fail;
+        pf->pcs = js_mallocz_rt(rt, sizeof(JSAotProfPc) * (size_t)pf->pc_n);
+        if (!pf->pcs)
             goto fail;
     }
     if (pf->reg_n > 0) {
@@ -59149,6 +59163,7 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
     return pf;
 fail:
     js_free_rt(rt, pf->loop_iters);
+    js_free_rt(rt, pf->pcs);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -59250,6 +59265,7 @@ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
 {
     JSAotProfFunc *pf = b->aot_prof;
     uint16_t bit;
+    int pc;
 
     if (reg < 0 || !pf || reg >= pf->reg_n)
         return;
@@ -59257,6 +59273,44 @@ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
     if (pf->reg_types[reg] == 0)
         pf->reg_pc[reg] = pf->last_pc;
     pf->reg_types[reg] |= bit;
+
+    pc = pf->last_pc;
+    if (pc < 0 || pc >= pf->pc_n)
+        return;
+    {
+        JSAotProfPc *e = &pf->pcs[pc];
+
+        e->types |= bit;
+        if (bit == AOT_TYPE_INT) {
+            double d = (double)JS_VALUE_GET_INT(v);
+
+            if (!e->has_num) {
+                e->num_min = e->num_max = d;
+                e->has_num = 1;
+            } else {
+                if (d < e->num_min)
+                    e->num_min = d;
+                if (d > e->num_max)
+                    e->num_max = d;
+            }
+        } else if (bit == AOT_TYPE_FLOAT) {
+            double d = JS_VALUE_GET_FLOAT64(v);
+
+            if (d != trunc(d))
+                e->frac = 1;
+            if (d == 0.0 && 1.0 / d < 0.0)
+                e->negzero = 1;
+            if (!e->has_num) {
+                e->num_min = e->num_max = d;
+                e->has_num = 1;
+            } else {
+                if (d < e->num_min)
+                    e->num_min = d;
+                if (d > e->num_max)
+                    e->num_max = d;
+            }
+        }
+    }
 }
 
 static JSAotProfCall *aot_call_slot(JSRuntime *rt, JSAotProfFunc *pf, uint32_t pc)
@@ -59357,6 +59411,7 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
     if (!pf)
         return;
     js_free_rt(rt, pf->loop_iters);
+    js_free_rt(rt, pf->pcs);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -59544,6 +59599,20 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
             aot_src_str(b, pf->reg_pc[i], src, sizeof(src));
             fprintf(f, "R %s reg=%d types=%s src=%s\n", dgt, i, ts, src);
         }
+    }
+    for (i = 0; i < pf->pc_n; i++) {
+        JSAotProfPc *e = &pf->pcs[i];
+        char ts[128];
+
+        if (!e->types)
+            continue;
+        aot_type_str(e->types, ts, sizeof(ts));
+        aot_src_str(b, i, src, sizeof(src));
+        if (e->has_num)
+            fprintf(f, "P %s pc=%d types=%s num=%g..%g frac=%u negzero=%u src=%s\n",
+                    dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, src);
+        else
+            fprintf(f, "P %s pc=%d types=%s src=%s\n", dgt, i, ts, src);
     }
     for (i = 0; i < pf->nsites; i++) {
         JSAotProfSite *s = &pf->sites[i];

@@ -31,7 +31,7 @@ ABI = None
 
 class Func:
     __slots__ = ("digest", "name", "file", "line", "ops", "entries", "len",
-                 "loops", "regs", "sites", "calls")
+                 "loops", "regs", "pcs", "sites", "calls")
 
     def __init__(self, digest):
         self.digest = digest
@@ -43,6 +43,7 @@ class Func:
         self.len = 0
         self.loops = {}          # pc -> iters
         self.regs = {}           # reg -> set(types)
+        self.pcs = {}            # defining pc -> {types, min, max, frac, negzero, src}
         self.sites = {}          # site -> [count, shape_map]
         self.calls = OrderedDict()  # pc -> Call
 
@@ -154,6 +155,24 @@ def parse_file(path, verbose=False):
                 if ent is None:
                     ent = fr.regs[reg] = [set(), kv.get("src", "?:?")]
                 ent[0].update(kv.get("types", "").split("|"))
+            elif kind == "P":
+                kv = dict(tok.split("=", 1) for tok in rest.split(" ") if "=" in tok)
+                pc = int(kv["pc"])
+                ent = fr.pcs.get(pc)
+                if ent is None:
+                    ent = fr.pcs[pc] = {"types": set(), "min": None, "max": None,
+                                        "frac": 0, "negzero": 0,
+                                        "src": kv.get("src", "?:?")}
+                ent["types"].update(kv.get("types", "").split("|"))
+                if "num" in kv:
+                    lo, _, hi = kv["num"].partition("..")
+                    lo, hi = float(lo), float(hi)
+                    ent["min"] = lo if ent["min"] is None else min(ent["min"], lo)
+                    ent["max"] = hi if ent["max"] is None else max(ent["max"], hi)
+                if kv.get("frac") == "1":
+                    ent["frac"] = 1
+                if kv.get("negzero") == "1":
+                    ent["negzero"] = 1
             elif kind == "S":
                 toks = rest.split(" ")
                 site = None

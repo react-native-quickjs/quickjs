@@ -1011,12 +1011,16 @@
       "sha256": "913406d9a8a108fab20a7d721128567c07a77787b7885e9f7eee2db96acc8ce7"
     },
     {
+      "name": "0258-regvm-aot-profiler-per-pc.patch",
+      "sha256": "8f32d52df097b70d2daf161e31e7b9b71f7feb4bd63e46ef03be2e3f6b186df9"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "d3367117942f9c42fd537cb83a46133f7fc995efe02ae7dca14dced4747a4b53"
     }
   ],
   "files": {
-    "quickjs.c": "2c41c2a93fd927d05e07b46f9af0bbd4e2b07796d5ddee6c7d049fda0abcb39c",
+    "quickjs.c": "0a95751afe825a60a9f898026099079774a167a0496b678447ab44a927490756",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
