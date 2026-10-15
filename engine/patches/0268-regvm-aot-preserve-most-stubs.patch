@@ -1,0 +1,242 @@
+Subject: Mark the shared AOT runtime stubs preserve_most
+
+What this does
+  Every out-of-line runtime stub the generated code calls -- the step engine,
+  the unwinder, the call helpers, the field and element helpers, the epoch and
+  site accessors -- is declared and defined `preserve_most`.
+
+Why we need it
+  Without it, each call from generated code to a shared stub forces the caller
+  to spill every caller-saved register it still needs, which is the main size
+  and speed cost of a slow path. `preserve_most` says the stub clobbers almost
+  none of them, so live values stay in registers across the call. This is the
+  design's main size lever with decision 5 (`E11`).
+
+What it adds
+  `QJS_AOT_STUB` in `quickjs-aot-rt.h`, on the declarations of the shared stubs
+  and on their definitions. A compiler without `preserve_most` gets an empty
+  macro and the build is unchanged.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index 994e9de..f3cc452 100644
+@@ -10,6 +10,18 @@
+ /* The register-frame handle. Opaque here; defined in quickjs.c. */
+ typedef struct JSRegRun JSRegRun;
+ 
++/* The calling convention for the shared runtime stubs the generated code calls
++   on a slow path, an IC miss or a generic operation. Clang's `preserve_most`
++   says the stub clobbers almost no caller-saved registers, so generated code
++   keeps its live values in registers across the call instead of spilling them.
++   Declarations and definitions both use it, so the compiler checks that they
++   agree; without the attribute the two sides still link and run. */
++#if defined(__has_attribute) && __has_attribute(preserve_most)
++#define QJS_AOT_STUB __attribute__((preserve_most))
++#else
++#define QJS_AOT_STUB
++#endif
++
+ /* QJS_DRC changes the ownership rule for a register store, so it is part of
+    the ABI: a unit built with a different -DQJS_DRC is refused at bind. */
+ #ifndef QJS_DRC
+@@ -79,10 +91,10 @@
+ extern const uint32_t qjs_aot_abi;
+ 
+ /* ABI entry points implemented by the engine. */
+-uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
++QJS_AOT_STUB uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
+ uint8_t *qjs_aot_code(JSRegRun *f);
+ JSValue qjs_aot_ret(JSRegRun *f);
+-JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
++QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                        uint32_t pc, uint32_t *resume_pc);
+ 
+ /* --- AOT fast-path helpers ------------------------------------------------
+@@ -143,11 +155,11 @@
+ JSValue *qjs_aot_arg_buf(JSRegRun *f);
+ 
+ /* Mirror put_local: set_value(ctx, &vb[slot], js_dup(v)). */
+-void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
++QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
+ 
+ /* Mirror the get_global cell-cache fast path then JS_GetGlobalVar: 0 on
+    success with an owned *out, -1 on exception. */
+-int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
++QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
+ 
+ /* Mirror put_field's REG_PIC_OWN_W direct-slot fast path (borrowed v): 1 when
+    the store happened, 0 when the caller must take the slow path. */
+@@ -182,15 +194,15 @@
+ int qjs_aot_fitsi(double d);
+ JSValue qjs_aot_box_num(double d, int isint);
+ int qjs_aot_to_num(JSValue v, double *out, int *isint);
+-int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
+-int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
++QJS_AOT_STUB int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
++QJS_AOT_STUB int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
+ 
+ /* hoisted field guard + own-data-property read */
+-int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off);
+-JSValue qjs_aot_field_read(JSValue recv, int slot_off);
++QJS_AOT_STUB int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off);
++QJS_AOT_STUB JSValue qjs_aot_field_read(JSValue recv, int slot_off);
+ 
+ /* array length and captured-variable cell accessors */
+-int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
++QJS_AOT_STUB int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
+ JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
+ 
+ /* --- AOT call-site helpers ------------------------------------------------
+@@ -198,22 +210,22 @@
+  * The prototype watchpoint epoch: the unit reads it at function entry; a
+  * change means folded values must be re-read.
+  */
+-uint32_t qjs_aot_epoch(JSContext *ctx);
+-JSValue qjs_aot_site_expect(JSContext *ctx, int site);
++QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx);
++QJS_AOT_STUB JSValue qjs_aot_site_expect(JSContext *ctx, int site);
+ 
+ /* The specialised C-call path: 1 with an owned *out, 0 to fall back to the
+    step engine, -1 on exception. `cproto` is the profile's prototype. */
+-int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
++QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
+                    JSValue this_obj, JSValue *argv, JSValue *out);
+ 
+ /* Direct compiled call: 1 with an owned *out, 0 to fall back to the step
+    engine, -1 on exception. Only the no-copy frame case is handled. */
+-int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
++QJS_AOT_STUB int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
+                    JSValue *argv, JSValue *out);
+ 
+ /* Folded prototype read: 1 with an owned *out while the PIC site still
+    resolves to the same prototype slot and the epoch is unchanged. */
+-int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
++QJS_AOT_STUB int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
+                        JSValue recv, int pic_site, JSValue *out);
+ 
+ #endif /* QUICKJS_AOT_RT_H */
+
+diff --git a/quickjs.c b/quickjs.c
+index 53b1d35..e083640 100644
+@@ -60047,7 +60047,7 @@
+ }
+ 
+ /* ABI entry points for the generated unit. */
+-uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx)
++QJS_AOT_STUB uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx)
+ {
+     return regvm_step(ip, fr, f, ctx);
+ }
+@@ -60144,12 +60144,12 @@
+     return f->arg_buf;
+ }
+ 
+-void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
++QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
+ {
+     set_value(ctx, &vb[slot], js_dup(v));
+ }
+ 
+-int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out)
++QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out)
+ {
+     if (likely(js_gv_cell_probe(ctx, (JSAtom)atom, out)))
+         return 0;
+@@ -60295,7 +60295,7 @@
+ }
+ 
+ /* The element storage of a plain fast array; 0 for any other receiver. */
+-int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len)
++QJS_AOT_STUB int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len)
+ {
+     JSObject *p;
+ 
+@@ -60311,7 +60311,7 @@
+ 
+ /* Read a dense element as an unboxed number. A hole, a lazy marker or a
+    non-numeric value returns 0 (the caller deopts). */
+-int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint)
++QJS_AOT_STUB int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint)
+ {
+     JSValue v = data[i];
+ 
+@@ -60323,7 +60323,7 @@
+ /* Hoisted field guard: check `recv`'s shape against the PIC entry at `site`
+    as an own data property and return the slot offset. The receiver is
+    loop-invariant and the region call-free, so one check covers the loop. */
+-int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off)
++QJS_AOT_STUB int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off)
+ {
+     JSObject *p;
+     JSRegPIC *e;
+@@ -60339,14 +60339,14 @@
+ }
+ 
+ /* Borrowed read of an own data property at a slot offset (registers borrow). */
+-JSValue qjs_aot_field_read(JSValue recv, int slot_off)
++QJS_AOT_STUB JSValue qjs_aot_field_read(JSValue recv, int slot_off)
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(recv);
+     return *(JSValue *)((char *)p->prop + slot_off);
+ }
+ 
+ /* array `length` as an unboxed int for a plain fast array; 0 otherwise */
+-int qjs_aot_get_length_num(JSValue v, double *out, int *isint)
++QJS_AOT_STUB int qjs_aot_get_length_num(JSValue v, double *out, int *isint)
+ {
+     JSObject *p;
+ 
+@@ -60382,7 +60382,7 @@
+    js_regvm_execute). Closes every for-of it passes and resumes at the
+    innermost catch. Returns JS_UNDEFINED with *resume_pc set when caught,
+    otherwise JS_EXCEPTION. */
+-JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
++QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                        uint32_t pc, uint32_t *resume_pc)
+ {
+     JSRuntime *rt = ctx->rt;
+@@ -60440,13 +60440,13 @@
+ /* the bound callee (and its C prototype) per runtime.                       */
+ /* ------------------------------------------------------------------------ */
+ 
+-uint32_t qjs_aot_epoch(JSContext *ctx)
++QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx)
+ {
+     return ctx->rt->ic_watchpoint_epoch;
+ }
+ 
+ /* Borrowed bound value for a site, or JS_UNDEFINED when unbound. */
+-JSValue qjs_aot_site_expect(JSContext *ctx, int site)
++QJS_AOT_STUB JSValue qjs_aot_site_expect(JSContext *ctx, int site)
+ {
+     JSRuntime *rt = ctx->rt;
+ 
+@@ -60499,7 +60499,7 @@
+    the register interpreter. Only for a non-lazy JS_FUNC_NORMAL body with
+    uncaptured arguments and argc >= arg_count. Returns 1 with an owned *out, 0
+    to fall back to the step engine, -1 on exception. */
+-int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
++QJS_AOT_STUB int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
+                    JSValue this_obj, JSValue *argv, JSValue *out)
+ {
+     JSRuntime *rt = caller_ctx->rt;
+@@ -60571,7 +60571,7 @@
+    the C prototype the profile saw (-1 = any). Returns 1 with *out, 0 to fall
+    back, -1 on exception. The f_f / f_f_f paths call the bound pointer, so the
+    identity guard keeps them sound. */
+-int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
++QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
+                    JSValue this_obj, JSValue *argv, JSValue *out)
+ {
+     JSRuntime *rt = ctx->rt;
+@@ -60657,7 +60657,7 @@
+  * between holders with the same shape (two one-property prototypes) without
+  * an epoch change. `e->rshape` is only compared, never dereferenced.
+  */
+-int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
++QJS_AOT_STUB int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
+                        JSValue recv, int pic_site, JSValue *out)
+ {
+     JSRuntime *rt = ctx->rt;
