@@ -72,8 +72,9 @@ typedef struct JSRegRCC JSRegRCC;
 /*
  * The register VM's default executor is the threaded dispatch plus the record
  * call path. They need Clang's `musttail` and `preserve_none` and computed-goto
- * dispatch; STEPCHECK, the AOT runtime and the AOT profiler are defined against
- * the monolith, so on those, and on other compilers, the default is 0. Pass
+ * dispatch; STEPCHECK and the AOT runtime are defined against the monolith, so
+ * on those, and on other compilers, the default is 0. The AOT profiler has
+ * hooks in the threaded chain, so it keeps the threaded default. Pass
  * `-DQJS_REGVM_THREAD=0` for the monolith, `-DQJS_REGVM_RECORD=0` for the
  * threaded dispatch without the record call path.
  *
@@ -82,7 +83,7 @@ typedef struct JSRegRCC JSRegRCC;
  */
 #ifndef QJS_REGVM_THREAD
 #if QJS_REGVM && defined(__clang__) && \
-    !QJS_REGVM_STEPCHECK && !QJS_AOT && !QJS_AOT_PROFILE
+    !QJS_REGVM_STEPCHECK && !QJS_AOT
 #define QJS_REGVM_THREAD 1
 #else
 #define QJS_REGVM_THREAD 0
@@ -667,6 +668,11 @@ struct JSRuntime {
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
+
+#if QJS_AOT_PROFILE
+    /* Nonzero when QJS_AOT_PROFILE_OUT named a file: the profiler's switch. */
+    uint8_t aot_prof_on;
+#endif
 
 #if QJS_AOT
     /* AOT call-site bindings, indexed by the unit's site id. Lazily grown. */
@@ -1686,23 +1692,49 @@ typedef struct JSFunctionBytecode {
 #if QJS_AOT_PROFILE
 static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b);
 static int js_aot_prof_enter(JSFunctionBytecode *b);
+#if !QJS_REGVM_THREAD
 static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev);
+#endif
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape);
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
+#if QJS_REGVM_THREAD
+static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc);
+static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target);
+#endif
 static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b);
 static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
 void js_aot_prof_dump(JSRuntime *rt);
 
-/* `aot_prev_rpc` is a per-activation local in js_regvm_execute; a backward
-   branch is detected as a pointer comparison against it. */
-#define AOT_PROF_OP(b_, rpc_)       js_aot_prof_op((b_), (rpc_), &aot_prev_rpc)
-#define AOT_PROF_ENTER(b_)          js_aot_prof_enter(b_)
-#define AOT_PROF_PIC(b_, s_, sh_)   js_aot_prof_pic((b_), (s_), (sh_))
-#define AOT_PROF_REG(b_, d_, v_)    js_aot_prof_reg((b_), (d_), (v_))
+/* `aot_prev_rpc`: per-activation local in js_regvm_execute, for loop detection. */
+#define AOT_PROF_ON(b_)             ((b_)->realm->rt->aot_prof_on)
+#if !QJS_REGVM_THREAD
+#define AOT_PROF_OP(b_, rpc_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) \
+                 js_aot_prof_op((b_), (rpc_), &aot_prev_rpc); } while (0)
+#else
+#define AOT_PROF_OP(b_, rpc_)       ((void)0)
+#endif
+#define AOT_PROF_ENTER(b_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_enter(b_); } while (0)
+#define AOT_PROF_PIC(b_, s_, sh_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_pic((b_), (s_), (sh_)); } while (0)
+#define AOT_PROF_REG(b_, d_, v_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
-        js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_))
+        do { if (unlikely(AOT_PROF_ON(b_))) \
+                 js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_)); } while (0)
+/* The threaded chain. `d_` is a register operand, encoded as index * 16. */
+#define AOT_PROF_TICK(f_, ip_) \
+        do { if (unlikely(AOT_PROF_ON((f_)->b))) \
+                 js_aot_prof_tick((f_)->b, (ip_)); } while (0)
+#define AOT_PROF_EDGE(f_, ip_, off_) \
+        do { if ((off_) < 0 && unlikely(AOT_PROF_ON((f_)->b))) \
+                 js_aot_prof_edge((f_)->b, (ip_) + (off_)); } while (0)
+#define AOT_PROF_REG_T(f_, d_, v_) \
+        do { if (unlikely(AOT_PROF_ON((f_)->b))) \
+                 js_aot_prof_reg((f_)->b, (d_) >> 4, (v_)); } while (0)
 #else
 /* Only register code expands these, so a stack-only build never needs them. */
 #if QJS_REGVM
@@ -1711,6 +1743,9 @@ void js_aot_prof_dump(JSRuntime *rt);
 #define AOT_PROF_PIC(b_, s_, sh_)   ((void)0)
 #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
+#define AOT_PROF_TICK(f_, ip_)      ((void)0)
+#define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
+#define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
 #endif
 #endif
 
@@ -3427,6 +3462,13 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 #endif
     rt->drc_in_reconcile = 0;
     rt->drc_malloc_mark = rt->malloc_state.malloc_size + ((size_t)4 << 20);
+#endif
+
+#if QJS_AOT_PROFILE
+    {
+        const char *prof_out = getenv("QJS_AOT_PROFILE_OUT");
+        rt->aot_prof_on = (prof_out && prof_out[0]) ? 1 : 0;
+    }
 #endif
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -25465,6 +25507,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 #define T_NEXT(off) do { \
         int32_t _t_off = (off); \
         REGVM_DRC_BACKEDGE(ctx, _t_off); \
+        AOT_PROF_EDGE(f, ip, _t_off); \
         __attribute__((musttail)) \
             return regvm_t_dispatch(ip + _t_off, fr, f, ctx); \
     } while (0)
@@ -25480,6 +25523,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 #define T_BR_NEXT(off) do { \
         int32_t _t_off = (off); \
         REGVM_DRC_BACKEDGE(ctx, _t_off); \
+        AOT_PROF_EDGE(f, ip, _t_off); \
         uint8_t *_nip = ip + _t_off; \
         __asm__ volatile("" : "+r"(_nip)); \
         __attribute__((musttail)) \
@@ -25497,6 +25541,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 #if QJS_DRC
 #define T_SET_NEXT_B(d, v, off) do { \
         FR(d) = (v); \
+        AOT_PROF_REG_T(f, d, FR(d)); \
         T_NEXT(off); \
     } while (0)
 
@@ -25504,6 +25549,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
         JSValue _v = (v); \
         FR(d) = _v; \
         REG_ADOPT(ctx->rt, _v); \
+        AOT_PROF_REG_T(f, d, _v); \
         T_NEXT(off); \
     } while (0)
 
@@ -25512,6 +25558,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 #define T_SET_NEXT_F64(d, r, off) do { \
         FR(d).u.float64 = (r); \
         FR(d).tag = JS_TAG_FLOAT64; \
+        AOT_PROF_REG_T(f, d, FR(d)); \
         T_NEXT(off); \
     } while (0)
 #else
@@ -26306,6 +26353,7 @@ static uint8_t *REGVM_CC regvm_t_dispatch(REGVM_ARGS)
 {
     regvm_handler h = regvm_threaded[*ip];
     T_COUNT_INC(*ip);
+    AOT_PROF_TICK(f, ip);
     __attribute__((musttail)) return h(REGVM_PASS);
 }
 
@@ -26631,6 +26679,7 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
+    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 8, cf, T_U8(7));
     /* Kept a pure classify-and-jump: the lazy materialize, and its call, live
        in `regvm_t_call_lazy`, so no C frame lands on every call. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -26682,6 +26731,7 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
+    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, T_U8(9));
     /* Pure classify-and-jump; the lazy materialize is in
        `regvm_t_call_method_lazy`. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -26953,6 +27003,7 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
 
     if (unlikely(nf == NULL))
         return NULL;
+    AOT_PROF_ENTER(cb);
     nf->caller = f;
     nf->ret_ip = ret_ip;
     nf->b = cb;
@@ -28034,6 +28085,7 @@ static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
     int na = T_U8(9);
     JSValue *argv = FRP(ab);
     JSValue cf = FR(c);
+    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, na);
     REGVM_CAPTURE_IP();
 #if QJS_REGVM_RECORD
     /* A non-derived bytecode constructor whose frame fits the arena is entered
@@ -29614,6 +29666,7 @@ static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS)
 {
     if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
         return ip;
+    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 6, FR(T_REG(1)), T_U8(5));
     REGVM_CAPTURE_IP();
 #if QJS_REGVM_RECORD
     {
@@ -29646,6 +29699,7 @@ static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
 {
     if (unlikely(f->flags & JS_CALL_FLAG_GENERATOR))
         return ip;
+    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 8, FR(T_REG(1)), T_U8(6));
     REGVM_CAPTURE_IP();
 #if QJS_REGVM_RECORD
     {
@@ -30375,6 +30429,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
     JSStackFrame *sf = lay->sf;
     int k;
 
+    AOT_PROF_ENTER(cb);
     rec->caller = caller;
     rec->ret_ip = ret_ip;
     rec->ret_dst = ret_dst;
@@ -30553,6 +30608,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
     JSStackFrame *sf = lay->sf;
     int k;
 
+    AOT_PROF_ENTER(cb);
     rec->caller = caller;
     rec->ret_ip = ret_ip;
     rec->ret_dst = ret_dst;
@@ -30682,14 +30738,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t *regvm_rpc = NULL;
     int regvm_resume_pending = 0;
     uint8_t *regvm_resume_marker = NULL;
-#if QJS_AOT_PROFILE
+#if QJS_AOT_PROFILE && !QJS_REGVM_THREAD
     /* Previous op start, for backward-branch (loop) detection. */
     uint8_t *aot_prev_rpc = NULL;
 #endif
  restart:
     {
 #if QJS_AOT_PROFILE
+#if !QJS_REGVM_THREAD
         aot_prev_rpc = NULL;
+#endif
         AOT_PROF_ENTER(b);
 #endif
         regs = stack_buf;
@@ -57582,12 +57640,11 @@ static int regvm_homes_mode(void)
 #endif
 #endif
 
-/* The AOT profiler counts at the monolith's dispatch point, so it needs the
-   plain non-threaded build. */
-#if QJS_AOT_PROFILE && (!QJS_REGVM || QJS_REGVM_THREAD || QJS_REGVM_RECORD)
-#error "QJS_AOT_PROFILE needs the register-VM monolith: build with QJS_REGVM=1 QJS_REGVM_THREAD=0 QJS_REGVM_RECORD=0"
+/* The AOT profiler has hooks in both executors: the monolith's dispatch point
+   and the threaded chain's dispatch. */
+#if QJS_AOT_PROFILE && !QJS_REGVM
+#error "QJS_AOT_PROFILE needs QJS_REGVM"
 #endif
-
 /*
  * AOT runtime. The generated unit is a separate translation unit; the engine
  * binds a register-compiled function to its entry by digest and enters it
@@ -58838,6 +58895,22 @@ static void aot_hash_str(uint64_t *h0, uint64_t *h1, const char *s)
         aot_hash_bytes(h0, h1, s, (size_t)n);
 }
 
+/* The opcode a quickened instruction was rewritten from. The threaded
+   interpreter rewrites an opcode byte in place once a property site is filled,
+   so the same function holds different bytes before and after it runs. The
+   digest must name the program, not the cache state, so it hashes the original
+   opcode. Every quickened form has the same length and operand format as its
+   original, so only the opcode byte needs mapping. */
+static int regvm_rop_canonical(int op)
+{
+    switch (op) {
+    case ROP_get_field_own:      return ROP_get_field;
+    case ROP_get_field2_own:     return ROP_get_field2;
+    case ROP_get_field_chain_own: return ROP_get_field_chain;
+    default:                     return op;
+    }
+}
+
 /* Hash the register program with atom operands replaced by their strings, so
    the digest is independent of interning order. */
 static void aot_digest_code(uint64_t *h0, uint64_t *h1, JSFunctionBytecode *b)
@@ -58849,6 +58922,7 @@ static void aot_digest_code(uint64_t *h0, uint64_t *h1, JSFunctionBytecode *b)
 
     while (p < len) {
         int op = code[p];
+        int cop;
         const char *fmt;
         int q, m, kind = -1;
 
@@ -58856,12 +58930,13 @@ static void aot_digest_code(uint64_t *h0, uint64_t *h1, JSFunctionBytecode *b)
             aot_hash_u32(h0, h1, 0xdeadbeefu);
             break;
         }
+        cop = regvm_rop_canonical(op);
         fmt = regvm_rop_fmt[op];
         if (!fmt) {
             aot_hash_u32(h0, h1, 0xbeefdeadu);
             break;
         }
-        aot_hash_u32(h0, h1, (uint32_t)op);
+        aot_hash_u32(h0, h1, (uint32_t)cop);
         q = p + 1;
         for (m = 0; fmt[m]; m++) {
             int need, v, nar = regvm_rop_narrow((uint16_t)op);
@@ -59091,6 +59166,7 @@ static int js_aot_prof_enter(JSFunctionBytecode *b)
     return 1;
 }
 
+#if !QJS_REGVM_THREAD
 static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
 {
     JSAotProfFunc *pf = b->aot_prof;
@@ -59111,6 +59187,39 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
     }
     *pprev = rpc;
 }
+#endif
+
+#if QJS_REGVM_THREAD
+/* Threaded chain: one call per dispatched op. Loop trip counts come from
+   AOT_PROF_EDGE at the branch, so no previous-pc state is kept here. */
+static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc)
+{
+    JSAotProfFunc *pf = b->aot_prof;
+
+    if (unlikely(!pf)) {
+        pf = js_aot_prof_ensure(b->realm->rt, b);
+        if (!pf)
+            return;
+    }
+    pf->ops++;
+    pf->last_pc = (int32_t)(rpc - b->regvm_code);
+}
+
+static void js_aot_prof_edge(JSFunctionBytecode *b, uint8_t *target)
+{
+    JSAotProfFunc *pf = b->aot_prof;
+    int off;
+
+    if (unlikely(!pf)) {
+        pf = js_aot_prof_ensure(b->realm->rt, b);
+        if (!pf)
+            return;
+    }
+    off = (int)(target - b->regvm_code);
+    if (off >= 0 && off < pf->loop_n)
+        pf->loop_iters[off]++;
+}
+#endif
 
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape)
 {

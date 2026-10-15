@@ -128,6 +128,20 @@ if(QJS_AOT)
   endif()
 endif()
 
+# The AOT profiler (`QJS_AOT_PROFILE=1`). It records per-function op counts,
+# loop trip counts, per-register type sets, property-site shapes and call
+# targets, and dumps them at teardown to the file named by `QJS_AOT_PROFILE_OUT`.
+# The hooks live in the shipping executor (the threaded dispatch plus the record
+# call path) and are gated by that file being named, so with no
+# `QJS_AOT_PROFILE_OUT` the interpreter runs unchanged.
+option(QJS_AOT_PROFILE "Build the register VM with the AOT profiler" OFF)
+if(QJS_AOT_PROFILE)
+  if(NOT QJS_REGVM)
+    message(FATAL_ERROR "QJS_AOT_PROFILE=ON requires QJS_REGVM=ON")
+  endif()
+  target_compile_definitions(quickjs PUBLIC QJS_AOT_PROFILE=1)
+endif()
+
 # Lazy JSON is opt-in for applications. Android and CocoaPods derive this
 # option from the consuming app's package.json; host builds can override it
 # with -DRNQJS_JSON_LAZY_DEFAULT=ON or QJS_JSON_LAZY at runtime for tests.
