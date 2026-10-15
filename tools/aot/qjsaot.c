@@ -542,10 +542,11 @@ static void print_census(
   fprintf(stderr, "\n");
 }
 
-/* A backward jump is a loop back edge: poll the interrupt handler first, the
-   way every interpreter back edge does, so a compiled loop is stoppable. */
+/* A branch to itself or to an earlier instruction is a loop back edge: poll
+   the interrupt handler first, the way every interpreter back edge does (a
+   self-branch counts there too), so a compiled loop is stoppable. */
 static void emit_branch(FILE *f, int off, int tgt) {
-  if (tgt < off) {
+  if (tgt <= off) {
     fprintf(
         f,
         "    if (__builtin_expect(qjs_aot_poll(ctx) < 0, 0)) { pc = %d; goto "
