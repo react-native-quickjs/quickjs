@@ -22,6 +22,10 @@ What it adds
   regvm_global_site_fill()  - records a filled cell in an instruction's site.
   js_gv_site_flush()        - clears global sites when the generation wraps.
   regvm_t_get_global_cell() - the cell-cache half of the threaded read.
+  The step twin reads the site operand it skips as well: the one-instruction
+  form keeps no cache, but the operand is still there, and reading only the
+  three before it left `regvm_step` returning an ip two bytes inside the
+  instruction.
 
 Needs a bytecode version bump
   Yes. `get_global`'s encoding gains an operand. The register builtin blobs
@@ -234,3 +238,15 @@ diff --git a/quickjs.c b/quickjs.c
  #undef T_CHK
      if (bad)
          abort();
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -2471,6 +2471,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_global(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+  {
+                 int d = RD_REG();
+                 JSAtom atom = RD_U32();
+                 int throwing = RD_U8();
++                (void)RD_U16();
+                 JSValue val;
+                 /* The cell cache first, as the stack VM's OP_get_var does. A
+                    filled cell has passed the TDZ test, and both a write of

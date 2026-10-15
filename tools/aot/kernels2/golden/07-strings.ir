@@ -1,56 +1,64 @@
-F 2c281a6f54c23c2d1e396f1245828bed name=k insns=44
-     0 pc=0    op=16 sz=5 r48 u0
-     1 pc=5    op=1 sz=8 r0 b1 c48
-     2 pc=13   op=216 sz=3 r16 i0
-     3 pc=16   op=174 sz=4 r16 r48 t16
-     4 pc=20   op=171 sz=5 r80 b8 r16 i7
-     5 pc=25   op=190 sz=7 r0 r0 r80
-     6 pc=32   op=228 sz=4 r16 r48 t-16
-     7 pc=36   op=77 sz=6 r32 r192 b0
-     8 pc=42   op=216 sz=3 r16 i0
-     9 pc=45   op=216 sz=3 r64 i5
-    10 pc=48   op=174 sz=4 r16 r64 t43
-    11 pc=52   op=39 sz=11 r80 r32 a316 s0
-    12 pc=63   op=1 sz=8 r96 b1 c595
-    13 pc=71   op=190 sz=7 r192 r96 r16
-    14 pc=78   op=73 sz=10 r112 r80 r32 r192 b1
-    15 pc=88   op=212 sz=5 r16 r16
-    16 pc=93   op=172 sz=2 t-50
-    17 pc=95   op=48 sz=7 r64 r0 s1
-    18 pc=102  op=39 sz=11 r80 r0 a355 s2
-    19 pc=113  op=216 sz=3 r192 i3
-    20 pc=116  op=73 sz=10 r112 r80 r0 r192 b1
-    21 pc=126  op=39 sz=11 r80 r0 a313 s3
-    22 pc=137  op=1 sz=8 r192 b0 c0
-    23 pc=145  op=73 sz=10 r128 r80 r0 r192 b1
-    24 pc=155  op=39 sz=11 r80 r32 a99 s4
-    25 pc=166  op=1 sz=8 r192 b1 c596
-    26 pc=174  op=73 sz=10 r144 r80 r32 r192 b1
-    27 pc=184  op=1 sz=8 r80 b1 c597
-    28 pc=192  op=39 sz=11 r96 r80 a323 s5
-    29 pc=203  op=216 sz=3 r192 i1
-    30 pc=206  op=73 sz=10 r80 r96 r80 r192 b1
-    31 pc=216  op=1 sz=8 r96 b1 c598
-    32 pc=224  op=39 sz=11 r160 r96 a379 s6
-    33 pc=235  op=73 sz=10 r96 r160 r96 r192 b0
-    34 pc=245  op=1 sz=8 r160 b1 c597
-    35 pc=253  op=169 sz=11 r288 b12 r160 b1 c599
-    36 pc=264  op=141 sz=5 r192 r64
-    37 pc=269  op=141 sz=5 r208 r112
-    38 pc=274  op=141 sz=5 r224 r128
-    39 pc=279  op=141 sz=5 r240 r144
-    40 pc=284  op=141 sz=5 r256 r80
-    41 pc=289  op=141 sz=5 r272 r96
-    42 pc=294  op=77 sz=6 r64 r192 b7
-    43 pc=300  op=67 sz=3 r64
-F 91d8ab4d672bff4dabd6b3836583d500 name=<eval> insns=10
-     0 pc=0    op=27 sz=6 a590 b64
-     1 pc=6    op=31 sz=7 r16 c0
-     2 pc=13   op=29 sz=8 a590 r16 b0
-     3 pc=21   op=20 sz=10 r16 a600 b1 s0
-     4 pc=31   op=20 sz=10 r32 a590 b1 s1
-     5 pc=41   op=4 sz=7 r64 I2000
-     6 pc=48   op=72 sz=8 r32 r32 r64 b1
-     7 pc=56   op=141 sz=5 r64 r32
-     8 pc=61   op=72 sz=8 r0 r16 r64 b1
-     9 pc=69   op=67 sz=3 r0
+F k blocks=5 insns=44 values=237 regs=19 ctl_max=0
+  digest=2c281a6f54c23c2d1e396f1245828bed
+B0 pc=0..20 ctl=0 params=v0=r0,v1=r1,v2=r3 succ=20(v56,v57,v58,v59)
+      0 get_arg          rop=16   def=47 use=-
+      5 fallback         rop=1    def=- use=v0(r0:tagged)
+     13 fallback         rop=216  def=- use=v49(r1:tagged)
+     16 fallback         rop=174  def=- use=v53(r1:tagged),v54(r3:tagged)
+B1 pc=20..36 ctl=0 params=v3=r0,v4=r1,v5=r3,v6=r5 succ=36(v66,v67,v68)
+     20 fallback         rop=171  def=- use=v6(r5:tagged),v4(r1:tagged)
+     25 fallback         rop=190  def=- use=v3(r0:tagged),v3(r0:tagged),v6(r5:tagged)
+     32 fallback         rop=228  def=- use=v63(r1:tagged),v5(r3:tagged)
+B2 pc=36..45 ctl=0 params=v7=r1,v8=r2,v9=r12 succ=45(v87,v88,v89,v90,v91,v92,v93,v94,v95,v96,v97,v98,v99,v100,v101,v102,v103,v104)
+     36 fallback         rop=77   def=- use=v8(r2:tagged),v9(r12:tagged)
+     42 fallback         rop=216  def=- use=v69(r1:tagged)
+B3 pc=45..95 ctl=0 params=v10=r1,v11=r2,v12=r3,v13=r4,v14=r5,v15=r6,v16=r7,v17=r8,v18=r9,v19=r10,v20=r11,v21=r12,v22=r13,v23=r14,v24=r15,v25=r16,v26=r17,v27=r18 succ=95(v202,v203,v204,v205,v206,v207,v208,v209,v210,v211,v212,v213,v214,v215,v216,v217,v218,v219,v220)
+     45 fallback         rop=216  def=- use=v13(r4:tagged)
+     48 fallback         rop=174  def=- use=v106(r1:tagged),v109(r4:tagged)
+     52 get_field        rop=39   def=143 use=v126(r2:tagged)
+     63 fallback         rop=1    def=- use=v130(r6:tagged)
+     71 fallback         rop=190  def=- use=v156(r12:tagged),v150(r6:tagged),v145(r1:tagged)
+     78 call             rop=73   def=182 use=v168(r5:tagged),v165(r2:tagged)
+     88 fallback         rop=212  def=- use=v164(r1:tagged),v164(r1:tagged)
+     93 fallback         rop=172  def=- use=-
+B4 pc=95..303 ctl=0 params=v28=r0,v29=r1,v30=r2,v31=r3,v32=r4,v33=r5,v34=r6,v35=r7,v36=r8,v37=r9,v38=r10,v39=r11,v40=r12,v41=r13,v42=r14,v43=r15,v44=r16,v45=r17,v46=r18 succ=-
+     95 fallback         rop=48   def=- use=v32(r4:tagged),v28(r0:tagged)
+    102 get_field        rop=39   def=221 use=v28(r0:tagged)
+    113 fallback         rop=216  def=- use=v40(r12:tagged)
+    116 call             rop=73   def=222 use=v221(r5:tagged),v28(r0:tagged)
+    126 get_field        rop=39   def=223 use=v28(r0:tagged)
+    137 fallback         rop=1    def=- use=v40(r12:tagged)
+    145 call             rop=73   def=224 use=v223(r5:tagged),v28(r0:tagged)
+    155 get_field        rop=39   def=225 use=v30(r2:tagged)
+    166 fallback         rop=1    def=- use=v40(r12:tagged)
+    174 call             rop=73   def=226 use=v225(r5:tagged),v30(r2:tagged)
+    184 fallback         rop=1    def=- use=v225(r5:tagged)
+    192 get_field        rop=39   def=227 use=v225(r5:tagged)
+    203 fallback         rop=216  def=- use=v40(r12:tagged)
+    206 call             rop=73   def=228 use=v227(r6:tagged),v225(r5:tagged)
+    216 fallback         rop=1    def=- use=v227(r6:tagged)
+    224 get_field        rop=39   def=229 use=v227(r6:tagged)
+    235 call             rop=73   def=230 use=v229(r10:tagged),v227(r6:tagged)
+    245 fallback         rop=1    def=- use=v229(r10:tagged)
+    253 fallback         rop=169  def=- use=v46(r18:tagged),v229(r10:tagged)
+    264 move             rop=141  def=231 use=v32(r4:tagged)
+    269 move             rop=141  def=232 use=v222(r7:tagged)
+    274 move             rop=141  def=233 use=v224(r8:tagged)
+    279 move             rop=141  def=234 use=v226(r9:tagged)
+    284 move             rop=141  def=235 use=v228(r5:tagged)
+    289 move             rop=141  def=236 use=v230(r6:tagged)
+    294 fallback         rop=77   def=- use=v32(r4:tagged),v231(r12:tagged)
+    300 return           rop=67   def=- use=v32(r4:tagged)
+F <eval> blocks=1 insns=10 values=11 regs=5 ctl_max=0
+  digest=91d8ab4d672bff4dabd6b3836583d500
+B0 pc=0..72 ctl=0 params=v0=r0,v1=r1,v2=r2,v3=r3,v4=r4 succ=-
+      0 fallback         rop=27   def=- use=-
+      6 fallback         rop=31   def=- use=v1(r1:tagged)
+     13 fallback         rop=29   def=- use=v1(r1:tagged)
+     21 get_global       rop=20   def=5 use=-
+     31 get_global       rop=20   def=6 use=-
+     41 const            rop=4    def=7 use=-
+     48 call             rop=72   def=8 use=v6(r2:tagged)
+     56 move             rop=141  def=9 use=v8(r2:tagged)
+     61 call             rop=72   def=10 use=v5(r1:tagged)
+     69 return           rop=67   def=- use=v10(r0:tagged)

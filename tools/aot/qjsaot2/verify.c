@@ -27,11 +27,11 @@
 
 #include "ir.h"
 
-#define Q2_VERIFY_FAIL(...)                     \
-  do {                                          \
-    snprintf(v.msg, v.msg_len, __VA_ARGS__);    \
-    free(v.dom);                                \
-    return -1;                                  \
+#define Q2_VERIFY_FAIL(...)                  \
+  do {                                       \
+    snprintf(v.msg, v.msg_len, __VA_ARGS__); \
+    free(v.dom);                             \
+    return -1;                               \
   } while (0)
 
 typedef struct Q2Verify {
@@ -41,7 +41,9 @@ typedef struct Q2Verify {
   uint64_t *dom; /* nblocks * bwords */
 } Q2Verify;
 
-static int q2_vbits_words(int nblocks) { return (nblocks + 63) / 64; }
+static int q2_vbits_words(int nblocks) {
+  return (nblocks + 63) / 64;
+}
 
 /* Reverse postorder over the block order (blocks are ordered by pc, which is
    already a topological order for everything except back edges). */
@@ -76,8 +78,7 @@ static int q2_dominators(Q2Verify *v) {
           memcpy(tmp, v->dom + (size_t)b * words, (size_t)words * 8);
           first = 0;
         } else {
-          for (w = 0; w < words; w++)
-            tmp[w] &= v->dom[(size_t)b * words + w];
+          for (w = 0; w < words; w++) tmp[w] &= v->dom[(size_t)b * words + w];
         }
       }
       if (first) { /* unreachable block: only itself */
@@ -151,8 +152,10 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
         Q2ValueId val = in->def[k];
         if (val >= (Q2ValueId)f->nvalues)
           Q2_VERIFY_FAIL("block %d pc %d: definition out of range", b, in->pc);
-        if (f->values[val].block != b || f->values[val].insn != blk->first_insn + i)
-          Q2_VERIFY_FAIL("block %d pc %d: definition not owned here", b, in->pc);
+        if (f->values[val].block != b ||
+            f->values[val].insn != blk->first_insn + i)
+          Q2_VERIFY_FAIL(
+              "block %d pc %d: definition not owned here", b, in->pc);
         if (f->values[val].rep >= Q2_R_COUNT)
           Q2_VERIFY_FAIL("block %d pc %d: bad representation", b, in->pc);
       }

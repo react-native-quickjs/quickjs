@@ -58,12 +58,16 @@ die()  { printf 'check: %s\n' "$*" >&2; exit 2; }
 
 # ---- hashing ---------------------------------------------------------------
 # hash_of <files...>: a short content hash, stable across checkouts.
-hash_of() { sha256sum "$@" 2>/dev/null | sha256sum | cut -c1-16; }
+# `--` so a compile flag in the list is hashed as data, not read as an option.
+hash_of() { sha256sum -- "$@" 2>/dev/null | sha256sum | cut -c1-16; }
 
 ENG_HASH=$(hash_of $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c $S/*.h)
 select_gen() {
   if [ "$GEN" = qjsaot2 ]; then
-    GEN_SRC=(tools/aot/qjsaot2/*.c)
+    # qjsaot2 links the shared unit builder (selection, profile, table and
+    # layout emission) and supplies its own lowering, so the driver is compiled
+    # once, without its main.
+    GEN_SRC=(-DQJS_AOT_NO_MAIN tools/aot/qjsaot.c tools/aot/qjsaot2/*.c)
   else
     GEN_SRC=(tools/aot/qjsaot.c)
   fi
@@ -184,14 +188,6 @@ t0() {
   GEN_IRBIN=""
   if "$BIN" --verify-ir /dev/null > /dev/null 2>&1; then
     GEN_IRBIN="$BIN"
-  fi
-  if [ "$GEN" = qjsaot2 ] &&
-     ! "$BIN" --out "$WORK/units/probe.c" --layout-header "$WORK/units/probe-layout.h" \
-          "$K2/01-arith.js" > /dev/null 2>&1; then
-    warn "qjsaot2 has no unit emitter yet: units from qjsaot, IR from qjsaot2"
-    GEN=qjsaot
-    select_gen
-    build_gen || die "cannot build $GEN"
   fi
 
   # Golden register-program dumps: the generator's reading of the lowering is

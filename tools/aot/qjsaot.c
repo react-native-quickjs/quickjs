@@ -2815,6 +2815,10 @@ static int emit_region(
 
 /* Emit one function's body (templates, step for the rest). Returns the
    instruction count, or -1 on a malformed program. */
+/* The body emitter, overridable so qjsaot2 can drive this same unit builder
+   with its own lowering. NULL means the template emitter below. */
+int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
+
 static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   int off = 0, n = 0, i;
   int *offs = NULL;
@@ -2980,7 +2984,7 @@ static int unit_ops_cmp(const void *a, const void *b) {
   return ia < ib ? -1 : (ia > ib ? 1 : 0);
 }
 
-int main(int argc, char **argv) {
+int qjsaot_driver_main(int argc, char **argv) {
   JSRuntime *rt;
   JSContext *ctx;
   JSAotGenFunc *funcs = NULL;
@@ -3164,7 +3168,8 @@ int main(int argc, char **argv) {
         fails++;
         continue;
       }
-      ninsn = emit_func(mf, &funcs[i], hex);
+      ninsn = (qjs_aot_emit_body ? qjs_aot_emit_body : emit_func)(
+          mf, &funcs[i], hex);
       fclose(mf);
       if (ninsn < 0) {
         fprintf(
@@ -3459,3 +3464,9 @@ int main(int argc, char **argv) {
   JS_FreeRuntime(rt);
   return fails == 0 ? 0 : 1;
 }
+
+#ifndef QJS_AOT_NO_MAIN
+int main(int argc, char **argv) {
+  return qjsaot_driver_main(argc, argv);
+}
+#endif

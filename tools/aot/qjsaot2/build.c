@@ -33,27 +33,39 @@
 
 #define Q2_NONE8 ((int8_t)-1)
 
-static int q2_ri(int off) { return off >> 4; }
+static int q2_ri(int off) {
+  return off >> 4;
+}
 
 /* ---- names --------------------------------------------------------------- */
 const char *q2_rep_name(int rep) {
   switch (rep) {
-    case Q2_R_TAGGED: return "tagged";
-    case Q2_R_I32: return "i32";
-    case Q2_R_F64: return "f64";
-    case Q2_R_BOOL: return "bool";
-    case Q2_R_OBJ: return "obj";
-    case Q2_R_STR: return "str";
-    default: return "?";
+    case Q2_R_TAGGED:
+      return "tagged";
+    case Q2_R_I32:
+      return "i32";
+    case Q2_R_F64:
+      return "f64";
+    case Q2_R_BOOL:
+      return "bool";
+    case Q2_R_OBJ:
+      return "obj";
+    case Q2_R_STR:
+      return "str";
+    default:
+      return "?";
   }
 }
 
 void q2_type_str(uint32_t t, char *out, size_t n) {
-  static const struct { uint32_t bit; const char *name; } names[] = {
-      {Q2_T_UNDEF, "undef"}, {Q2_T_NULL, "null"},   {Q2_T_BOOL, "bool"},
-      {Q2_T_INT32, "int32"}, {Q2_T_NUM, "num"},     {Q2_T_STR, "str"},
-      {Q2_T_OBJ, "obj"},     {Q2_T_FUNC, "func"},   {Q2_T_SYMBOL, "sym"},
-      {Q2_T_BIGINT, "bigint"},{Q2_T_HOLE, "hole"},
+  static const struct {
+    uint32_t bit;
+    const char *name;
+  } names[] = {
+      {Q2_T_UNDEF, "undef"},   {Q2_T_NULL, "null"}, {Q2_T_BOOL, "bool"},
+      {Q2_T_INT32, "int32"},   {Q2_T_NUM, "num"},   {Q2_T_STR, "str"},
+      {Q2_T_OBJ, "obj"},       {Q2_T_FUNC, "func"}, {Q2_T_SYMBOL, "sym"},
+      {Q2_T_BIGINT, "bigint"}, {Q2_T_HOLE, "hole"},
   };
   size_t used = 0;
   int i;
@@ -65,8 +77,9 @@ void q2_type_str(uint32_t t, char *out, size_t n) {
   for (i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
     int len;
     if (!(t & names[i].bit)) continue;
-    len = snprintf(out + used, used < n ? n - used : 0, "%s%s",
-                   used ? "|" : "", names[i].name);
+    len = snprintf(
+        out + used, used < n ? n - used : 0, "%s%s", used ? "|" : "",
+        names[i].name);
     if (len < 0) break;
     used += (size_t)len;
     if (used >= n) break;
@@ -76,24 +89,44 @@ void q2_type_str(uint32_t t, char *out, size_t n) {
 
 const char *q2_op_name(int op) {
   switch (op) {
-    case Q2_OP_FALLBACK: return "fallback";
-    case Q2_OP_CONST: return "const";
-    case Q2_OP_MOVE: return "move";
-    case Q2_OP_GET_LOCAL: return "get_local";
-    case Q2_OP_PUT_LOCAL: return "put_local";
-    case Q2_OP_GET_ARG: return "get_arg";
-    case Q2_OP_PUT_ARG: return "put_arg";
-    case Q2_OP_GET_GLOBAL: return "get_global";
-    case Q2_OP_BINARY: return "binary";
-    case Q2_OP_COMPARE: return "compare";
-    case Q2_OP_UNARY: return "unary";
-    case Q2_OP_BRANCH: return "branch";
-    case Q2_OP_BRANCH_CMP: return "branch_cmp";
-    case Q2_OP_RETURN: return "return";
-    case Q2_OP_RETURN_UNDEF: return "return_undefined";
-    case Q2_OP_GET_FIELD: return "get_field";
-    case Q2_OP_PUT_FIELD: return "put_field";
-    default: return "?";
+    case Q2_OP_FALLBACK:
+      return "fallback";
+    case Q2_OP_CONST:
+      return "const";
+    case Q2_OP_MOVE:
+      return "move";
+    case Q2_OP_GET_LOCAL:
+      return "get_local";
+    case Q2_OP_PUT_LOCAL:
+      return "put_local";
+    case Q2_OP_GET_ARG:
+      return "get_arg";
+    case Q2_OP_PUT_ARG:
+      return "put_arg";
+    case Q2_OP_GET_GLOBAL:
+      return "get_global";
+    case Q2_OP_BINARY:
+      return "binary";
+    case Q2_OP_COMPARE:
+      return "compare";
+    case Q2_OP_UNARY:
+      return "unary";
+    case Q2_OP_BRANCH:
+      return "branch";
+    case Q2_OP_BRANCH_CMP:
+      return "branch_cmp";
+    case Q2_OP_RETURN:
+      return "return";
+    case Q2_OP_RETURN_UNDEF:
+      return "return_undefined";
+    case Q2_OP_GET_FIELD:
+      return "get_field";
+    case Q2_OP_PUT_FIELD:
+      return "put_field";
+    case Q2_OP_CALL:
+      return "call";
+    default:
+      return "?";
   }
 }
 
@@ -105,6 +138,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
   static Q2RopInfo info;
 
   info.ndef = info.nuse = 0;
+  info.window = -1;
   info.reads = Q2_E_HEAP;
   info.writes = Q2_E_HEAP | Q2_E_CONTROL;
   info.op = Q2_OP_FALLBACK;
@@ -273,6 +307,59 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = Q2_E_SLOT | Q2_E_SHAPE;
       info.writes = Q2_E_SHAPE | Q2_E_CONTROL; /* a getter may run */
       return &info;
+    case ROP_put_field: /* "rasr": receiver, atom, site, value */
+      info.op = Q2_OP_PUT_FIELD;
+      info.nuse = 2;
+      info.use[0] = 0;
+      info.use[1] = 3;
+      info.reads = Q2_E_SLOT | Q2_E_SHAPE;
+      info.writes = Q2_E_SLOT | Q2_E_SHAPE | Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_get_element:       /* "rrr": d, object, key */
+    case ROP_get_length:        /* "rrs": d, object, site */
+      info.op = Q2_OP_FALLBACK; /* roles known, but no lowering yet */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = Q2_E_ELEMENTS | Q2_E_SLOT;
+      info.writes = Q2_E_ELEMENTS | Q2_E_SHAPE | Q2_E_CONTROL;
+      return &info;
+    case ROP_put_element: /* "rrr": object, key, value */
+      info.op = Q2_OP_FALLBACK;
+      info.nuse = 3;
+      info.use[0] = 0;
+      info.use[1] = 1;
+      info.use[2] = 2;
+      info.reads = Q2_E_ELEMENTS;
+      info.writes = Q2_E_ELEMENTS | Q2_E_SLOT | Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+
+    /* calls: the destination, the callee, the receiver and the argument
+       window, every register of which the callee may read */
+    case ROP_call: /* "rrrb": d, callee, window, argc */
+      info.op = Q2_OP_CALL;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.window = 2;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
+                    Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
+      return &info;
+    case ROP_call_method: /* "rrrrb": d, callee, receiver, window, argc */
+      info.op = Q2_OP_CALL;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 2;
+      info.use[0] = 1;
+      info.use[1] = 2;
+      info.window = 3;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
+                    Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
+      return &info;
     default:
       return &info;
   }
@@ -285,7 +372,9 @@ static uint64_t *bits_new(int nwords) {
 static int bits_test(const uint64_t *b, int i) {
   return (int)((b[i >> 6] >> (i & 63)) & 1);
 }
-static void bits_set(uint64_t *b, int i) { b[i >> 6] |= 1ull << (i & 63); }
+static void bits_set(uint64_t *b, int i) {
+  b[i >> 6] |= 1ull << (i & 63);
+}
 static void bits_or(uint64_t *d, const uint64_t *a, int nwords) {
   int i;
   for (i = 0; i < nwords; i++) d[i] |= a[i];
@@ -316,13 +405,18 @@ static Q2ValueId q2_new_value(Q2Func *f) {
 /* The type a constant instruction produces. */
 static uint32_t q2_const_type(uint16_t rop) {
   switch (rop) {
-    case ROP_load_undefined: return Q2_T_UNDEF;
-    case ROP_load_null: return Q2_T_NULL;
+    case ROP_load_undefined:
+      return Q2_T_UNDEF;
+    case ROP_load_null:
+      return Q2_T_NULL;
     case ROP_load_true:
-    case ROP_load_false: return Q2_T_BOOL;
+    case ROP_load_false:
+      return Q2_T_BOOL;
     case ROP_load_i8:
-    case ROP_load_i32: return Q2_T_INT32 | Q2_T_NUM;
-    default: return Q2_T_ANY;
+    case ROP_load_i32:
+      return Q2_T_INT32 | Q2_T_NUM;
+    default:
+      return Q2_T_ANY;
   }
 }
 
@@ -415,6 +509,28 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
         in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
     }
     if (in->ndef == 0 && ri->ndef != 0) in->op = Q2_OP_FALLBACK;
+    if (in->op == Q2_OP_FALLBACK) {
+      /* The step engine reads every register operand of the instruction, so
+         every one of them is a use; which of them is the destination is
+         unknown, and is modelled by the instruction redefining the whole
+         live set instead. */
+      in->ndef = 0;
+      in->nuse = 0;
+      for (n = 0; n < in->narg && in->nuse < 8; n++)
+        if (in->arg[n].kind == 'r')
+          in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[n].val);
+    } else if (ri->window >= 0 && ri->window < in->narg) {
+      /* A call: the callee reads the whole argument window, so every register
+         in it is live at the call and must be current in the frame. */
+      int na = (int)in->arg[ri->window].val;
+      int ab = (int)in->arg[ri->window - 1].val;
+      if (na < 0 || na > 255) na = 0;
+      in->win_reg = q2_ri(ab);
+      in->win_n = na;
+      if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
+        in->win_n = g->reg_count - in->win_reg;
+      if (in->win_n < 0) in->win_n = 0;
+    }
     f->ninsns++;
     i += cur.size;
   }
@@ -435,9 +551,10 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     tmp[nstarts++] = 0;
     for (i = 0; i < f->ninsns; i++) {
       Q2Insn *in = &f->insns[i];
-      int term = (in->op == Q2_OP_BRANCH || in->op == Q2_OP_BRANCH_CMP ||
-                  in->op == Q2_OP_RETURN || in->op == Q2_OP_RETURN_UNDEF ||
-                  q2_ends_control(in->rop));
+      int term =
+          (in->op == Q2_OP_BRANCH || in->op == Q2_OP_BRANCH_CMP ||
+           in->op == Q2_OP_RETURN || in->op == Q2_OP_RETURN_UNDEF ||
+           q2_ends_control(in->rop));
       for (n = 0; n < in->narg; n++) {
         if (in->arg[n].kind != 't') continue;
         tmp[nstarts++] = in->next + (int32_t)in->arg[n].val;
@@ -470,8 +587,10 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
   pc_to_block = malloc(sizeof(*pc_to_block) * (size_t)(f->exit_pc + 1));
   f->live_in = bits_new(words * f->nblocks);
   f->live_out = bits_new(words * f->nblocks);
-  f->reg_def = malloc(sizeof(*f->reg_def) * (size_t)(f->nregs > 0 ? f->nregs : 1));
-  if (!f->blocks || !pc_to_block || !f->live_in || !f->live_out || !f->reg_def) {
+  f->reg_def =
+      malloc(sizeof(*f->reg_def) * (size_t)(f->nregs > 0 ? f->nregs : 1));
+  if (!f->blocks || !pc_to_block || !f->live_in || !f->live_out ||
+      !f->reg_def) {
     f->why = "out of memory";
     goto fail;
   }
@@ -488,7 +607,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
 
   /* instruction -> block, and block extents */
   for (i = 0, n = 0; i < f->ninsns; i++) {
-    while (n + 1 < f->nblocks && f->blocks[n + 1].start_pc <= f->insns[i].pc) n++;
+    while (n + 1 < f->nblocks && f->blocks[n + 1].start_pc <= f->insns[i].pc)
+      n++;
     if (f->blocks[n].first_insn < 0) f->blocks[n].first_insn = i;
     f->blocks[n].ninsns++;
     if (f->insns[i].next > f->blocks[n].end_pc) {
@@ -531,7 +651,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       b->nsucc = 1;
     }
     for (n = 0; n < b->nsucc; n++) {
-      Q2Block *s = b->succ_block[n] < f->nblocks ? &f->blocks[b->succ_block[n]] : NULL;
+      Q2Block *s =
+          b->succ_block[n] < f->nblocks ? &f->blocks[b->succ_block[n]] : NULL;
       if (s && s->npreds < 2) s->preds[s->npreds] = i;
       if (s) s->npreds++;
     }
@@ -568,6 +689,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             for (n = 0; n < in2->ndef; n++) bits_set(def, (int)in2->def[n]);
           }
           for (n = 0; n < in2->nuse; n++) bits_set(use, (int)in2->use[n]);
+          for (n = 0; n < in2->win_n; n++) bits_set(use, in2->win_reg + n);
         }
         for (w = 0; w < words; w++) in[w] = use[w] | (in[w] & ~def[w]);
         if (!bits_equal(in, f->live_in + (size_t)i * words, words)) {
@@ -595,7 +717,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       for (k = 0; k < f->nregs; k++)
         if (bits_test(f->live_in + (size_t)b * words, k)) nreg++;
       blk->param_reg = malloc(sizeof(int32_t) * (size_t)(nreg > 0 ? nreg : 1));
-      blk->param_val = malloc(sizeof(Q2ValueId) * (size_t)(nreg > 0 ? nreg : 1));
+      blk->param_val =
+          malloc(sizeof(Q2ValueId) * (size_t)(nreg > 0 ? nreg : 1));
       blk->edge_arg = calloc(2, sizeof(*blk->edge_arg));
       if (!blk->param_reg || !blk->param_val || !blk->edge_arg) {
         f->why = "out of memory";
@@ -623,7 +746,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       Q2Block *blk = &f->blocks[b];
       int k;
       for (k = 0; k < f->nregs; k++) def_at[k] = Q2_NO_VALUE;
-      for (k = 0; k < blk->nparams; k++) def_at[blk->param_reg[k]] = blk->param_val[k];
+      for (k = 0; k < blk->nparams; k++)
+        def_at[blk->param_reg[k]] = blk->param_val[k];
       for (k = 0; k < blk->ninsns; k++) {
         Q2Insn *in2 = &f->insns[blk->first_insn + k];
         int m;
@@ -634,6 +758,22 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             goto fail;
           }
           in2->use[m] = def_at[r]; /* now a value id */
+        }
+        if (in2->win_n > 0) {
+          int w;
+          in2->win_val = malloc(sizeof(Q2ValueId) * (size_t)in2->win_n);
+          if (!in2->win_val) {
+            f->why = "out of memory";
+            goto fail;
+          }
+          for (w = 0; w < in2->win_n; w++) {
+            int r = in2->win_reg + w;
+            if (def_at[r] == Q2_NO_VALUE) {
+              f->why = "call window register with no definition";
+              goto fail;
+            }
+            in2->win_val[w] = def_at[r];
+          }
         }
         if (in2->op == Q2_OP_FALLBACK) {
           /* redefine every register live after the instruction */
@@ -667,11 +807,12 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             f->values[v].insn = blk->first_insn + k;
             if (in2->op == Q2_OP_CONST) {
               f->values[v].type = q2_const_type(in2->rop);
-            } else if (in2->op == Q2_OP_BINARY || in2->op == Q2_OP_UNARY ||
-                       in2->op == Q2_OP_COMPARE) {
-              f->values[v].type = Q2_T_NUM | Q2_T_STR | Q2_T_OBJ |
-                                  Q2_T_BOOL | Q2_T_BIGINT | Q2_T_UNDEF |
-                                  Q2_T_NULL | Q2_T_SYMBOL;
+            } else if (
+                in2->op == Q2_OP_BINARY || in2->op == Q2_OP_UNARY ||
+                in2->op == Q2_OP_COMPARE) {
+              f->values[v].type = Q2_T_NUM | Q2_T_STR | Q2_T_OBJ | Q2_T_BOOL |
+                                  Q2_T_BIGINT | Q2_T_UNDEF | Q2_T_NULL |
+                                  Q2_T_SYMBOL;
             } else {
               f->values[v].type = Q2_T_ANY;
             }
@@ -683,10 +824,13 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       }
       /* edge arguments */
       for (n = 0; n < blk->nsucc; n++) {
-        Q2Block *s = blk->succ_block[n] < f->nblocks ? &f->blocks[blk->succ_block[n]] : NULL;
+        Q2Block *s = blk->succ_block[n] < f->nblocks
+                         ? &f->blocks[blk->succ_block[n]]
+                         : NULL;
         int m;
         if (!s) continue;
-        blk->edge_arg[n] = malloc(sizeof(Q2ValueId) * (size_t)(s->nparams > 0 ? s->nparams : 1));
+        blk->edge_arg[n] = malloc(
+            sizeof(Q2ValueId) * (size_t)(s->nparams > 0 ? s->nparams : 1));
         blk->nedge_args[n] = s->nparams;
         if (!blk->edge_arg[n]) {
           f->why = "out of memory";
@@ -732,10 +876,11 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
           }
         }
         if (d > f->max_ctl - b->ctl_in) f->max_ctl = b->ctl_in + d;
-        if (d < 0 && b->ctl_in + d < 0)
-          f->why = "control stack underflow";
+        if (d < 0 && b->ctl_in + d < 0) f->why = "control stack underflow";
         for (n = 0; n < b->nsucc; n++) {
-          Q2Block *s = b->succ_block[n] < f->nblocks ? &f->blocks[b->succ_block[n]] : NULL;
+          Q2Block *s = b->succ_block[n] < f->nblocks
+                           ? &f->blocks[b->succ_block[n]]
+                           : NULL;
           if (!s) continue;
           if (s->ctl_in < 0) {
             s->ctl_in = b->ctl_in + d;
@@ -768,6 +913,10 @@ void q2_free(Q2Func *f) {
     free(f->blocks[i].edge_arg);
   }
   free(f->blocks);
+  if (f->insns) {
+    int i;
+    for (i = 0; i < f->ninsns; i++) free(f->insns[i].win_val);
+  }
   free(f->insns);
   free(f->values);
   free(f->live_in);

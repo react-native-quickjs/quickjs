@@ -61,11 +61,11 @@ enum {
   Q2_E_SLOT = 1u << 1,     /* named property slots */
   Q2_E_ELEMENTS = 1u << 2, /* array / typed-array elements */
   Q2_E_LENGTH = 1u << 3,
-  Q2_E_GLOBAL = 1u << 4,   /* global bindings */
-  Q2_E_PROTO = 1u << 5,    /* prototype epoch */
-  Q2_E_VARREF = 1u << 6,   /* captured cells */
-  Q2_E_HEAP = 1u << 7,     /* everything a call can touch */
-  Q2_E_CONTROL = 1u << 8,  /* may throw, may transfer control */
+  Q2_E_GLOBAL = 1u << 4,  /* global bindings */
+  Q2_E_PROTO = 1u << 5,   /* prototype epoch */
+  Q2_E_VARREF = 1u << 6,  /* captured cells */
+  Q2_E_HEAP = 1u << 7,    /* everything a call can touch */
+  Q2_E_CONTROL = 1u << 8, /* may throw, may transfer control */
 };
 
 /* ---- operations ---------------------------------------------------------- */
@@ -78,15 +78,16 @@ enum {
   Q2_OP_GET_ARG,
   Q2_OP_PUT_ARG,
   Q2_OP_GET_GLOBAL,
-  Q2_OP_BINARY,    /* dst = a op b (numbers, the generic helper on a miss) */
-  Q2_OP_COMPARE,   /* dst = bool of a compare */
-  Q2_OP_UNARY,     /* dst = op a */
-  Q2_OP_BRANCH,    /* conditional branch on a register */
-  Q2_OP_BRANCH_CMP,/* conditional compare of two registers */
+  Q2_OP_BINARY,     /* dst = a op b (numbers, the generic helper on a miss) */
+  Q2_OP_COMPARE,    /* dst = bool of a compare */
+  Q2_OP_UNARY,      /* dst = op a */
+  Q2_OP_BRANCH,     /* conditional branch on a register */
+  Q2_OP_BRANCH_CMP, /* conditional compare of two registers */
   Q2_OP_RETURN,
   Q2_OP_RETURN_UNDEF,
   Q2_OP_GET_FIELD,
   Q2_OP_PUT_FIELD,
+  Q2_OP_CALL,
   Q2_OP_COUNT
 };
 
@@ -97,8 +98,9 @@ const char *q2_op_name(int op);
    read/write set; only classified ops are ever lowered natively. */
 typedef struct Q2RopInfo {
   int op;
-  int ndef, nuse;     /* entries in def[]/use[] (operand indices) */
-  int def[2], use[3];
+  int ndef, nuse; /* entries in def[]/use[] (operand indices) */
+  int def[2], use[8];
+  int8_t window; /* operand index of a call's argument count, else -1 */
   uint32_t reads, writes;
 } Q2RopInfo;
 
@@ -109,38 +111,48 @@ typedef uint32_t Q2ValueId;
 #define Q2_NO_VALUE ((Q2ValueId)-1)
 
 typedef struct Q2Value {
-  uint32_t type;      /* Q2_T_* set */
-  uint8_t rep;        /* Q2_R_* */
-  uint8_t is_const;   /* the value is a constant folded at build time */
-  int32_t con_kind;   /* Q2_CON_* when is_const */
-  int64_t con;        /* the constant payload (int or double bits) */
-  int32_t reg;        /* register this value was read from / written to */
-  int32_t block;      /* defining block */
-  int32_t insn;       /* defining instruction, -1 for a block parameter */
-  int32_t param_of;   /* parameter index in its block, else -1 */
+  uint32_t type;    /* Q2_T_* set */
+  uint8_t rep;      /* Q2_R_* */
+  uint8_t is_const; /* the value is a constant folded at build time */
+  int32_t con_kind; /* Q2_CON_* when is_const */
+  int64_t con;      /* the constant payload (int or double bits) */
+  int32_t reg;      /* register this value was read from / written to */
+  int32_t block;    /* defining block */
+  int32_t insn;     /* defining instruction, -1 for a block parameter */
+  int32_t param_of; /* parameter index in its block, else -1 */
 } Q2Value;
 
-enum { Q2_CON_INT = 0, Q2_CON_DOUBLE, Q2_CON_TRUE, Q2_CON_FALSE, Q2_CON_NULL, Q2_CON_UNDEF };
+enum {
+  Q2_CON_INT = 0,
+  Q2_CON_DOUBLE,
+  Q2_CON_TRUE,
+  Q2_CON_FALSE,
+  Q2_CON_NULL,
+  Q2_CON_UNDEF
+};
 
 /* ---- instructions -------------------------------------------------------- */
 typedef struct Q2Arg {
-  char kind;    /* the decoded operand kind: r,a,b,u,i,I,s,c,t */
+  char kind; /* the decoded operand kind: r,a,b,u,i,I,s,c,t */
   int64_t val;
-  int off;      /* byte offset inside the instruction; -1 for derived values */
+  int off; /* byte offset inside the instruction; -1 for derived values */
 } Q2Arg;
 
 typedef struct Q2Insn {
   uint16_t rop;
-  int8_t op;          /* Q2_OP_* */
-  int32_t pc;         /* instruction start in the register program */
-  int32_t next;       /* pc + size */
+  int8_t op;    /* Q2_OP_* */
+  int32_t pc;   /* instruction start in the register program */
+  int32_t next; /* pc + size */
   int32_t narg;
   Q2Arg arg[8];
   int8_t nuse;
-  Q2ValueId use[3];
+  Q2ValueId use[8];
+  /* A call's argument window, if any: the registers the callee reads. Kept
+     beside `use` because the count is dynamic (up to 255). */
+  int32_t win_reg, win_n;
+  Q2ValueId *win_val; /* one value per window register, after resolution */
   int8_t ndef;
   Q2ValueId def[2];
-  int32_t fallback;    /* for Q2_OP_FALLBACK: the live registers it redefines */
 } Q2Insn;
 
 /* ---- blocks -------------------------------------------------------------- */
@@ -154,17 +166,17 @@ typedef struct Q2Block {
   int32_t succ_pc[2]; /* successor pcs; a target may leave the function */
   int32_t succ_block[2];
   int32_t nedge_args[2];
-  Q2ValueId **edge_arg;  /* per successor: one value per successor param */
-  int32_t preds[2];      /* the block's predecessors (for the verifier) */
+  Q2ValueId **edge_arg; /* per successor: one value per successor param */
+  int32_t preds[2];     /* the block's predecessors (for the verifier) */
   int32_t npreds;
-  int32_t ctl_in;        /* control-stack depth on entry */
+  int32_t ctl_in; /* control-stack depth on entry */
 } Q2Block;
 
 /* ---- functions ----------------------------------------------------------- */
 typedef struct Q2Func {
   const struct JSAotGenFunc *g;
-  int ok;             /* the build succeeded */
-  const char *why;    /* when it did not */
+  int ok;          /* the build succeeded */
+  const char *why; /* when it did not */
   int32_t nregs;
   Q2Block *blocks;
   int32_t nblocks;
@@ -178,7 +190,7 @@ typedef struct Q2Func {
   int32_t lwords;
   int32_t max_ctl;
   int32_t entry_block;
-  int32_t exit_pc;    /* the function's length */
+  int32_t exit_pc; /* the function's length */
 } Q2Func;
 
 /* Build the IR for one function. Returns 0 on success, -1 with why set. */

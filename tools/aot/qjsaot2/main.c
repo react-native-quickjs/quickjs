@@ -25,6 +25,14 @@
 #include "quickjs-aot-gen.h"
 #include "quickjs.h"
 
+/* The unit builder (selection, profile, table emission and the layout header)
+   lives in qjsaot.c. qjsaot2 drives it with its own body emitter so the ABI
+   and the selection are shared rather than copied. Emission mode therefore
+   hands over to it; --verify-ir and --dump-ir stay here, where the IR lives. */
+int qjsaot_driver_main(int argc, char **argv);
+int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
+extern int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
+
 static char *read_file(const char *path, long *len_out) {
   FILE *f = fopen(path, "rb");
   long len;
@@ -60,14 +68,26 @@ int main(int argc, char **argv) {
   long nblocks = 0, ninsns = 0, nvalues = 0, nfuncs_ok = 0, nfuncs_uniq = 0;
 
   for (i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--verify-ir") == 0) verify = 1;
-    else if (strcmp(argv[i], "--dump-ir") == 0) dump = 1;
-    else if (argv[i][0] == '-') {
+    if (strcmp(argv[i], "--verify-ir") == 0)
+      verify = 1;
+    else if (strcmp(argv[i], "--dump-ir") == 0)
+      dump = 1;
+  }
+  if (!verify && !dump) {
+    /* The unit-builder mode: the same CLI as qjsaot, with the SSA body
+       emitter. Options are the driver's, so nothing is validated here. */
+    qjs_aot_emit_body = qjsaot2_emit_body;
+    return qjsaot_driver_main(argc, argv);
+  }
+  for (i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--verify-ir") == 0 ||
+        strcmp(argv[i], "--dump-ir") == 0)
+      continue;
+    if (argv[i][0] == '-') {
       fprintf(stderr, "qjsaot2: unknown option %s\n", argv[i]);
       return 2;
-    } else {
-      ninputs++;
     }
+    ninputs++;
   }
   if (ninputs == 0) {
     fprintf(stderr, "usage: qjsaot2 --verify-ir|--dump-ir bundle.js ...\n");
@@ -92,12 +112,14 @@ int main(int argc, char **argv) {
       fails++;
       continue;
     }
-    v = JS_Eval(ctx, src, (size_t)len, argv[i],
-                JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    v = JS_Eval(
+        ctx, src, (size_t)len, argv[i],
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(v)) {
       JS_FreeValue(ctx, JS_GetException(ctx));
-      v = JS_Eval(ctx, src, (size_t)len, argv[i],
-                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+      v = JS_Eval(
+          ctx, src, (size_t)len, argv[i],
+          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     }
     if (JS_IsException(v)) {
       JSValue e = JS_GetException(ctx);
@@ -124,16 +146,17 @@ int main(int argc, char **argv) {
       continue; /* one body serves both */
     nfuncs_uniq++;
     if (q2_build(&funcs[i], &f) < 0) {
-      fprintf(stderr, "qjsaot2: %s: build failed: %s\n",
-              funcs[i].name[0] ? funcs[i].name : "<anon>",
-              f.why ? f.why : "?");
+      fprintf(
+          stderr, "qjsaot2: %s: build failed: %s\n",
+          funcs[i].name[0] ? funcs[i].name : "<anon>", f.why ? f.why : "?");
       q2_free(&f);
       fails++;
       continue;
     }
     if (verify && q2_verify(&f, msg, sizeof(msg)) < 0) {
-      fprintf(stderr, "qjsaot2: %s: verify failed: %s\n",
-              funcs[i].name[0] ? funcs[i].name : "<anon>", msg);
+      fprintf(
+          stderr, "qjsaot2: %s: verify failed: %s\n",
+          funcs[i].name[0] ? funcs[i].name : "<anon>", msg);
       q2_free(&f);
       fails++;
       continue;
@@ -146,10 +169,11 @@ int main(int argc, char **argv) {
     q2_free(&f);
   }
 
-  fprintf(stderr,
-          "qjsaot2: %ld/%ld functions%s, %ld blocks, %ld insns, %ld values\n",
-          nfuncs_ok, nfuncs_uniq, verify ? " verified" : " built", nblocks,
-          ninsns, nvalues);
+  fprintf(
+      stderr,
+      "qjsaot2: %ld/%ld functions%s, %ld blocks, %ld insns, %ld values\n",
+      nfuncs_ok, nfuncs_uniq, verify ? " verified" : " built", nblocks, ninsns,
+      nvalues);
   js_aot_gen_free(rt, funcs);
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);

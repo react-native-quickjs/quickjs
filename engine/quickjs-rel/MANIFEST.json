@@ -1100,7 +1100,7 @@
     },
     {
       "name": "0280-regvm-global-site-cache.patch",
-      "sha256": "af678b7cdaf76d7ca52ec72bf599490f103ccebae9923d3d94378eb6498aae33"
+      "sha256": "7434dc1d2a8252e872e0f03374c3a03b5bc5a693e4db7f9e5c46a85a192b1c7f"
     },
     {
       "name": "0281-init-gv-watched.patch",
