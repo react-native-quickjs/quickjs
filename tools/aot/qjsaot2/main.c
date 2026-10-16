@@ -64,6 +64,7 @@ int main(int argc, char **argv) {
   JSAotGenFunc *funcs = NULL;
   int nfuncs = 0, i;
   int verify = 0, dump = 0, stats = 0;
+  const char *profile = NULL;
   int ninputs = 0, fails = 0, nkeep = 0;
   JSValue *keep = NULL;
   long nblocks = 0, ninsns = 0, nvalues = 0, nfuncs_ok = 0, nfuncs_uniq = 0;
@@ -86,6 +87,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--verify-ir") == 0 ||
         strcmp(argv[i], "--dump-ir") == 0 || strcmp(argv[i], "--stats") == 0)
       continue;
+    if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+      profile = argv[++i];
+      continue;
+    }
     if (argv[i][0] == '-') {
       fprintf(stderr, "qjsaot2: unknown option %s\n", argv[i]);
       return 2;
@@ -100,6 +105,13 @@ int main(int argc, char **argv) {
 
   rt = JS_NewRuntime();
   ctx = JS_NewContext(rt);
+  if (profile) {
+    extern int qjs_aot_prof_load(const char *path);
+    if (qjs_aot_prof_load(profile) < 0) {
+      fprintf(stderr, "qjsaot2: cannot use profile %s\n", profile);
+      return 1;
+    }
+  }
   /* Keep every compiled script alive until after the collection: the
      enumerator walks the runtime's live function list, so a collection in the
      middle of a multi-file build would drop the earlier inputs. */
@@ -109,7 +121,11 @@ int main(int argc, char **argv) {
     long len = 0;
     char *src;
     JSValue v;
-    if (argv[i][0] == '-') continue;
+    if (argv[i][0] == '-') {
+      /* skip the value of a two-token option */
+      if (strcmp(argv[i], "--profile") == 0) i++;
+      continue;
+    }
     src = read_file(argv[i], &len);
     if (!src) {
       fprintf(stderr, "qjsaot2: cannot read %s\n", argv[i]);
@@ -175,6 +191,8 @@ int main(int argc, char **argv) {
 
   if (stats) {
     long nfb = 0, nunk = 0, nparams = 0, nparams_before = 0;
+    long ndefs = 0, nrec = 0, nrec_int = 0, nrec_float = 0, nrec_num = 0;
+    long nrec_other = 0, nrec_none = 0, nprof_hit = 0;
     long byrop[ROP_COUNT];
     int k2;
     memset(byrop, 0, sizeof(byrop));
@@ -186,7 +204,26 @@ int main(int argc, char **argv) {
           memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
         continue;
       if (q2_build(&funcs[i], &sf) < 0) continue;
+      if (sf.prof) nprof_hit++;
       nparams_before += sf.nparams_before;
+      for (k = 0; k < sf.nvalues; k++) {
+        const Q2Value *v = &sf.values[k];
+        if (v->insn < 0) continue;
+        ndefs++;
+        if (!v->has_prof) {
+          nrec_none++;
+          continue;
+        }
+        nrec++;
+        if (v->ptypes == Q2_T_INT32)
+          nrec_int++;
+        else if (v->ptypes == Q2_T_NUM)
+          nrec_float++;
+        else if (v->ptypes == (Q2_T_INT32 | Q2_T_NUM))
+          nrec_num++;
+        else
+          nrec_other++;
+      }
       for (b = 0; b < sf.nblocks; b++) {
         nparams += sf.blocks[b].nparams;
         (void)0;
@@ -204,10 +241,16 @@ int main(int argc, char **argv) {
       }
       q2_free(&sf);
     }
+    fprintf(stderr, "qjsaot2: prof-hit %ld\n", nprof_hit);
     fprintf(
         stderr,
         "qjsaot2: fallbacks %ld, unknown-role %ld, params %ld (was %ld)\n", nfb,
         nunk, nparams, nparams_before);
+    fprintf(
+        stderr,
+        "qjsaot2: defs %ld, records %ld (int %ld, float %ld, int|float "
+        "%ld, other %ld), no record %ld\n",
+        ndefs, nrec, nrec_int, nrec_float, nrec_num, nrec_other, nrec_none);
     for (k2 = 0; k2 < ROP_COUNT; k2++)
       if (byrop[k2] > 0)
         fprintf(stderr, "qjsaot2:   unknown rop %d x%ld\n", k2, byrop[k2]);

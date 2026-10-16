@@ -33,6 +33,26 @@
 
 #define Q2_NONE8 ((int8_t)-1)
 
+/* The driver's profile lookup (qjsaot.c): the sorted `P` records of a function
+   digest, or NULL. */
+const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n);
+
+/* The profile's type set mapped to the IR's. Anything that is not a number
+   maps to TAGGED, which is what the inference needs to see. */
+static uint32_t prof_to_q2(unsigned types) {
+  uint32_t t = 0;
+  if (types & PT_INT) t |= Q2_T_INT32;
+  if (types & PT_FLOAT) t |= Q2_T_NUM;
+  if (types & PT_OBJECT) t |= Q2_T_OBJ;
+  if (types & PT_STRING) t |= Q2_T_STR;
+  if (types & PT_BOOL) t |= Q2_T_BOOL;
+  if (types & PT_UNDEF) t |= Q2_T_UNDEF;
+  if (types & PT_BIGINT) t |= Q2_T_BIGINT;
+  if (types & PT_OTHER) t |= Q2_T_ANY;
+  if (t == 0) t = Q2_T_ANY;
+  return t;
+}
+
 static int q2_ri(int off) {
   return off >> 4;
 }
@@ -1404,6 +1424,45 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
   }
 
   f->ok = 1;
+
+  /* 8. the profile's per-pc type sets, mapped onto each definition */
+  {
+    int n = 0;
+    f->prof = qjs_aot_prof_pcs(g->digest, &n);
+    f->nprof = n;
+    if (f->prof && f->nprof > 0) {
+      for (i = 0; i < f->nvalues; i++) {
+        Q2Value *v = &f->values[i];
+        const ProfPc *p;
+        int lo, hi, found = -1;
+        int32_t dpc;
+        if (v->insn < 0) continue;
+        dpc = f->insns[v->insn].pc;
+        lo = 0;
+        hi = f->nprof - 1;
+        while (lo <= hi) {
+          int mid = (lo + hi) / 2;
+          if (f->prof[mid].pc == dpc) {
+            found = mid;
+            break;
+          }
+          if (f->prof[mid].pc < dpc)
+            lo = mid + 1;
+          else
+            hi = mid - 1;
+        }
+        if (found < 0) continue;
+        p = &f->prof[found];
+        v->has_prof = 1;
+        v->ptypes = prof_to_q2(p->types);
+        v->frac = p->frac;
+        v->negzero = p->negzero;
+        v->nmin = p->num_min;
+        v->nmax = p->num_max;
+      }
+    }
+  }
+
   free(starts);
   free(pc_to_block);
   return 0;

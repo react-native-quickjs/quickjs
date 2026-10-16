@@ -131,6 +131,8 @@ static int hex_to_bytes16(const char *s, uint8_t out[16]) {
 #define PT_OTHER 0x80u
 #define PT_ARITH (PT_FLOAT | PT_INT)
 
+#include "qjsaot2/prof.h"
+
 typedef struct {
   int pc;
   long long iters;
@@ -148,6 +150,10 @@ typedef struct {
   char digest[33]; /* kind 1: the callee digest hex */
 } ProfCall;
 
+/* A `P` record: the type set of every register the instruction at `pc` writes,
+   the same one record shared by the two destinations of a fused op. Its shape
+   lives in qjsaot2/prof.h so the IR reads the same struct. */
+
 typedef struct {
   uint8_t digest[16];
   unsigned long long ops;
@@ -157,6 +163,8 @@ typedef struct {
   int nregs, capregs;
   ProfCall *calls;
   int ncalls, capcalls;
+  ProfPc *pcs;
+  int npcs, cappcs;
 } ProfEntry;
 
 /* The parsed profile (for call-site specialisation) and the current function's
@@ -278,14 +286,16 @@ static unsigned prof_parse_types(const char *s) {
   unsigned t = 0;
   char buf[64];
   int j = 0;
+  /* The token runs to whitespace or end of line; anything past it (`num=`,
+     `src=`) is a different field and must not be read as a type name. */
   for (;; s++) {
-    if (*s == '|' || *s == '\0' || *s == '\n' || *s == ' ') {
+    if (*s == '|' || *s == '\0' || *s == '\n' || *s == ' ' || *s == '\t') {
       if (j) {
         buf[j] = '\0';
         t |= prof_type_bit(buf);
         j = 0;
       }
-      if (*s == '\0' || *s == '\n') break;
+      if (*s == '\0' || *s == '\n' || *s == ' ' || *s == '\t') break;
     } else if (j < (int)sizeof(buf) - 1) {
       buf[j++] = *s;
     }
@@ -322,10 +332,15 @@ static ProfEntry *prof_get(
    the engine identity; a profile from another engine or build configuration is
    refused rather than silently matching nothing. Returns a malloc'd array (may
    be empty) or NULL. */
+static int cmp_profpc(const void *a, const void *b) {
+  const ProfPc *x = a, *y = b;
+  return (x->pc > y->pc) - (x->pc < y->pc);
+}
+
 static ProfEntry *parse_profile(const char *path, int *pn) {
   FILE *f = fopen(path, "r");
   ProfEntry *arr = NULL;
-  int n = 0, cap = 0;
+  int n = 0, cap = 0, i;
   char line[8192];
   *pn = 0;
   if (!f) return NULL;
@@ -357,8 +372,8 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   while (fgets(line, sizeof(line), f)) {
     uint8_t dg[16];
     ProfEntry *e;
-    if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' &&
-         line[0] != 'C') ||
+    if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
+         line[0] != 'P') ||
         line[1] != ' ')
       continue;
     if (hex_to_bytes16(line + 2, dg) < 0) continue;
@@ -435,6 +450,54 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           snprintf(e->calls[k].digest, sizeof(e->calls[k].digest), "%s", cd);
         }
       }
+    } else if (line[0] == 'P') {
+      /* P <hex> pc=<n> types=<a|b> [num=<min>..<max> frac=<0|1>
+         negzero=<0|1>] [elem=..|props=..] src=..; merge by pc. */
+      char *p = strstr(line + 2, "pc=");
+      char *q = strstr(line + 2, "types=");
+      if (p && q) {
+        int pc = (int)strtol(p + 3, NULL, 10);
+        unsigned t = prof_parse_types(q + 6);
+        const char *nm = strstr(line + 2, "num=");
+        const char *fm = strstr(line + 2, "frac=");
+        const char *nz = strstr(line + 2, "negzero=");
+        int k;
+        double nmin = 0, nmax = 0;
+        int has_num = 0, frac = 0, negzero = 0;
+        if (nm) {
+          has_num = 1;
+          sscanf(nm + 4, "%lf..%lf", &nmin, &nmax);
+        }
+        if (fm) frac = (int)strtol(fm + 5, NULL, 10) != 0;
+        if (nz) negzero = (int)strtol(nz + 8, NULL, 10) != 0;
+        for (k = 0; k < e->npcs; k++)
+          if (e->pcs[k].pc == pc) break;
+        if (k == e->npcs) {
+          if (e->npcs == e->cappcs) {
+            ProfPc *np;
+            e->cappcs = e->cappcs ? e->cappcs * 2 : 16;
+            np = realloc(e->pcs, sizeof(*np) * (size_t)e->cappcs);
+            if (!np) return NULL;
+            e->pcs = np;
+          }
+          e->npcs++;
+          memset(&e->pcs[k], 0, sizeof(e->pcs[k]));
+          e->pcs[k].pc = pc;
+        }
+        e->pcs[k].types |= t;
+        e->pcs[k].frac |= (uint8_t)frac;
+        e->pcs[k].negzero |= (uint8_t)negzero;
+        if (has_num) {
+          if (!e->pcs[k].has_num) {
+            e->pcs[k].num_min = nmin;
+            e->pcs[k].num_max = nmax;
+          } else {
+            if (nmin < e->pcs[k].num_min) e->pcs[k].num_min = nmin;
+            if (nmax > e->pcs[k].num_max) e->pcs[k].num_max = nmax;
+          }
+          e->pcs[k].has_num = 1;
+        }
+      }
     } else { /* R */
       char *p = strstr(line + 2, "reg=");
       char *q = strstr(line + 2, "types=");
@@ -463,6 +526,10 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
     }
   }
   fclose(f);
+  for (i = 0; i < n; i++) {
+    if (arr[i].npcs > 1)
+      qsort(arr[i].pcs, (size_t)arr[i].npcs, sizeof(arr[i].pcs[0]), cmp_profpc);
+  }
   *pn = n;
   return arr;
 }
@@ -2838,6 +2905,28 @@ int qjs_aot_site_alloc(void) {
 
 int qjs_aot_sweep_on(void) {
   return g_deopt_everywhere;
+}
+
+/* The `P` records of the function with this digest, sorted by pc, or NULL.
+   `*n` receives the count. The `qjsaot2` IR reads a definition's profile from
+   the record at its defining instruction's pc. */
+const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
+  const ProfEntry *e;
+  *n = 0;
+  if (!g_prof) return NULL;
+  e = prof_entry(g_prof, g_nprof, dg);
+  if (!e) return NULL;
+  *n = e->npcs;
+  return e->pcs;
+}
+
+/* Load a profile for the verify/dump/stats modes (the unit-builder mode loads
+   its own from its own option parsing). */
+int qjs_aot_prof_load(const char *path) {
+  ProfEntry *prof = parse_profile(path, &g_nprof);
+  if (!prof) return -1;
+  g_prof = prof;
+  return 0;
 }
 
 static int emit_func(FILE *f, const JSAotGenFunc *g, char hex[33]) {

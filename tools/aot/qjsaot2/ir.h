@@ -23,6 +23,7 @@
 #include <stdio.h>
 
 #include "quickjs-aot-gen.h"
+#include "prof.h"
 
 /* ---- representations ----------------------------------------------------- */
 enum {
@@ -128,6 +129,15 @@ typedef struct Q2Value {
   int32_t block;    /* defining block */
   int32_t insn;     /* defining instruction, -1 for a block parameter */
   int32_t param_of; /* parameter index in its block, else -1 */
+  /* The profile's view of the definition's register set, mapped to Q2_T_*.
+     Zero when the defining instruction has no record. */
+  uint32_t ptypes;
+  uint8_t has_prof, frac, negzero;
+  double nmin, nmax;
+  /* Representation planning (the inference fills these; see types.c). */
+  uint8_t spec;   /* a speculated load: needs a tag guard at its definition */
+  uint8_t synced; /* the register slot holds this value boxed */
+  uint8_t ovf;    /* an i32 arithmetic result needing an overflow/-0 guard */
 } Q2Value;
 
 enum {
@@ -210,6 +220,8 @@ typedef struct Q2Func {
   int32_t nparams_before; /* block parameters before trivial removal */
   int32_t entry_block;
   int32_t exit_pc; /* the function's length */
+  const ProfPc *prof; /* the function's P records, sorted by pc, or NULL */
+  int32_t nprof;
 } Q2Func;
 
 /* Build the IR for one function. Returns 0 on success, -1 with why set. */
