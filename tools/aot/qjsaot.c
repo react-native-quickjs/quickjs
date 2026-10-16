@@ -2929,6 +2929,26 @@ const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
   return e->pcs;
 }
 
+/* The dominant profiled call at `pc` of the function with this digest. Returns
+   1 and fills `*kind` (1 for a bytecode callee, 2 for a C function, 3 for
+   anything else), `*cproto` (-1 unless a C callee) and `hex` (the bytecode
+   callee's digest hex, 33 bytes including the terminator), or 0 when the
+   function or pc has no call record. Exposed for the SSA emitter's call
+   lowering. */
+int qjs_aot_prof_call(const uint8_t dg[16], int pc, int *kind, int *cproto,
+                      char hex[33]) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  const ProfCall *c = prof_call_at(e, pc);
+  if (!c) return 0;
+  *kind = c->kind;
+  *cproto = c->cproto;
+  if (hex) {
+    memcpy(hex, c->digest, 33);
+    hex[32] = 0;
+  }
+  return 1;
+}
+
 /* Load a profile for the verify/dump/stats modes (the unit-builder mode loads
    its own from its own option parsing). */
 int qjs_aot_prof_load(const char *path) {

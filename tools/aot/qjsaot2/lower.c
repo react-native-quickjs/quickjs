@@ -50,6 +50,10 @@ int qjs_aot_sweep_on(void);
 int qjs_aot_site_alloc(void);
 int qjs_aot_site_new(void);
 int qjs_aot_check_locals(void);
+/* The dominant profiled call at `pc` of the function with this digest: 1 and
+   *kind (1 bytecode, 2 C), *cproto and the callee digest hex, or 0. */
+int qjs_aot_prof_call(const uint8_t dg[16], int pc, int *kind, int *cproto,
+                      char hex[33]);
 
 /* The ROPs with a native lowering. The verifier checks the classifier against
    this, so a lowered op the IR calls a fallback is a build failure. */
@@ -562,14 +566,14 @@ static int q2_target(const Q2Insn *in, int arg, int *tgt) {
   return 1;
 }
 
+static void q2_emit_fallback(
+    FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in, int exit_pc);
+
 /* One instruction through the shared step routine. The frame is current, so
    the step sees the state it expects; afterwards the locals of whatever it may
    have written are reloaded from the frame. */
-static void q2_emit_fallback(
-    FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in, int exit_pc) {
-  int i, w;
-  /* The step reads its own uses, and if it throws or leaves, the unwind or
-     deopt reads the rest: write back every live value, before and after. */
+static void q2_emit_fallback_liveb(const Q2Func *fn, const Q2Insn *in) {
+  int w;
   for (w = 0; w < fn->lwords; w++)
     g_em.liveb[w] |= q2_live_after(g_em.cur_insn)[w];
   {
@@ -580,7 +584,17 @@ static void q2_emit_fallback(
         ri->window < 0)
       for (w = 0; w < fn->lwords; w++) g_em.liveb[w] = ~0ull;
   }
-  q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+}
+
+/* The step itself and everything after it: reload, speculation guard, the
+   successor edge the returned ip selects, and the deopt for anything else.
+   The caller has already written the live values back. When `hit_pc` is not
+   -1, a label `q2hit_<hit_pc>:` is emitted after the reload so a specialised
+   call that already produced the result jumps straight to the edge. */
+static void q2_emit_step_body(
+    FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in, int exit_pc,
+    int hit_pc) {
+  int i;
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
   fprintf(
       f,
@@ -596,7 +610,10 @@ static void q2_emit_fallback(
       "    if (__builtin_expect(ip == QJS_AOT_SUSPEND, 0)) return "
       "qjs_aot_ret(f);\n");
   /* An unknown-role fallback may write any register live after it; a known-role
-     one writes only its own destinations. */
+     one writes only its own destinations. A specialised call that already
+     produced its result jumps here: it stored the frame, and the reload makes
+     the local current. */
+  if (hit_pc >= 0) fprintf(f, "q2hit_%d:\n", hit_pc);
   if (in->nredef > 0) {
     for (i = 0; i < in->nredef; i++)
       fprintf(
@@ -640,6 +657,69 @@ static void q2_emit_fallback(
       f,
       "    return qjs_aot_deopt(ctx, f, fr, (uint32_t)(ip - code), "
       "QJS_AOT_NO_SITE);\n");
+}
+
+static void q2_emit_fallback(
+    FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in, int exit_pc) {
+  q2_emit_fallback_liveb(fn, in);
+  q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+  q2_emit_step_body(f, fn, blk_index, in, exit_pc, -1);
+}
+
+/* A call the profile shows as one known callee: the engine's specialised call
+   helper instead of the step. The frame is written back first (the callee runs
+   user code), the helper runs, a hit stores the owned result in the frame and
+   jumps to the edge the step body would have taken, a miss falls through to
+   the step. Returns 1 when it emitted an attempt. A typed result is left to
+   the step so its speculation guard stays in one place. */
+static int q2_emit_call_special(
+    FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in) {
+  int is_m, kind = 0, cproto = -1, sid, na, abc, off, cc;
+  char hex[33];
+  Q2ValueId dv;
+
+  (void)blk_index;
+  if (in->rop != ROP_call && in->rop != ROP_call_method) return 0;
+  dv = in->def[0];
+  if (fn->values[dv].rep != Q2_R_TAGGED) return 0;
+  if (in->nuse < 1 || in->win_n < 0) return 0;
+  if (!qjs_aot_prof_call(fn->g->digest, in->next, &kind, &cproto, hex))
+    return 0;
+  if (kind != 1 && kind != 2) return 0;
+  if ((unsigned)(in->win_reg + in->win_n) > (unsigned)fn->nregs) return 0;
+
+  is_m = (in->rop == ROP_call_method);
+  na = in->win_n;
+  abc = (int)in->arg[is_m ? 3 : 2].val; /* window base register offset */
+  cc = (int)in->arg[1].val;             /* callee register offset */
+  off = fn->values[dv].reg * 16;
+
+  q2_emit_fallback_liveb(fn, in);
+  q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+
+  /* The callee and `this` are read from the frame: write-through already put
+     their tagged values there, and the window holds the arguments. */
+  fprintf(f, "    { JSValue _o; int _h;\n");
+  if (kind == 2) {
+    sid = qjs_aot_site_new();
+    fprintf(f, "      _h = qjs_aot_call_c(ctx, %d, %d, %d, AOT_REG(fr, %d), ",
+            sid, cproto, na, cc);
+  } else {
+    fprintf(f, "      _h = qjs_aot_call_b(ctx, %d, AOT_REG(fr, %d), ", na, cc);
+  }
+  if (is_m)
+    fprintf(f, "AOT_REG(fr, %d), ", (int)in->arg[2].val);
+  else
+    fprintf(f, "JS_UNDEFINED, ");
+  fprintf(f, "&AOT_REG(fr, %d), &_o);\n", abc);
+  fprintf(
+      f,
+      "      if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); ip = code + %d; "
+      "goto q2hit_%d; }\n"
+      "      if (_h < 0) { pc = %d; goto exception; }\n",
+      off, in->next, in->pc, in->pc);
+  fprintf(f, "    }\n");
+  return 1;
 }
 
 /* A binary/compare whose result is typed, dispatched before the opcode switch
@@ -1623,8 +1703,13 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
         q2_cur_def(&g_em.cur, in->redef_reg[k], in->redef_val[k]);
       /* The live-before set is the write-back set of a pre-instruction leave. */
       q2_live_before(fn, g_em.cur_insn, g_em.liveb);
-      if (q2_emit_native(f, fn, b, in) == 0)
+      if (q2_emit_native(f, fn, b, in) != 0) {
+        /* lowered */
+      } else if (q2_emit_call_special(f, fn, b, in)) {
+        q2_emit_step_body(f, fn, b, in, fn->exit_pc, in->pc);
+      } else {
         q2_emit_fallback(f, fn, b, in, fn->exit_pc);
+      }
       for (k = 0; k < in->ndef; k++) q2_spec_after(f, fn, in, k);
     }
     /* The fall-through edge. A block with one successor that did not transfer
