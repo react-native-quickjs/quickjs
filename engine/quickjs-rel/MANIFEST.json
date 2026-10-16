@@ -1167,12 +1167,16 @@
       "sha256": "86994b6df9a762a44d1913f02f2c300f2e1a74585204f8dc9c04be96868a211a"
     },
     {
+      "name": "0297-aot-inline-fast-path-offsets.patch",
+      "sha256": "d5ca0ce9a3ff12a04d1fd26f0297dc0dffb7c920efa5e2af0aed6531aecee362"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "62cf0c1ae02c2dd4fef19f5a6feb48773a860af762f3b7d5dff65d0b4352a360",
+    "quickjs.c": "fa90e9ae0a9c1ebe9d9f64075844db0a3fefe8286e6327bbadc56065b4a0852e",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -78,6 +78,11 @@ static int q2_is_load(int op) {
   }
 }
 
+int q2_def_from_record(const Q2Insn *in) {
+  return q2_is_load(in->op) || (in->op == Q2_OP_FALLBACK && in->ndef > 0) ||
+         in->rop == ROP_neg || in->rop == ROP_inc;
+}
+
 /* A load's representation from its record. Only an exactly-numeric set
    speculates; anything else stays tagged. */
 static int q2_load_lb(const Q2Value *v) {
@@ -180,12 +185,20 @@ int q2_infer(Q2Func *fn) {
       }
       continue;
     }
-    if (q2_is_load(in->op) || (in->op == Q2_OP_FALLBACK && in->ndef > 0)) {
+    if (q2_def_from_record(in)) {
       /* A load, or a fallback with declared destinations (a call). Its
          destinations speculate from their record, else stay tagged. */
       for (k = 0; k < in->ndef; k++) {
         Q2ValueId v = in->def[k];
-        w[v] = q2_load_lb(&fn->values[v]);
+        /* A chain's first link is the receiver of its second read. The
+           profiler records only the second link at this pc, so the record
+           says nothing about the first. */
+        if (k == 0 && in->ndef == 2 &&
+            (in->rop == ROP_get_field_chain ||
+             in->rop == ROP_get_field_chain_own))
+          w[v] = LB_TAG;
+        else
+          w[v] = q2_load_lb(&fn->values[v]);
         fixed[v] = 1;
       }
       continue;
@@ -328,7 +341,7 @@ int q2_infer(Q2Func *fn) {
     if (v->insn >= 0) {
       const Q2Insn *in = &fn->insns[v->insn];
       int k;
-      if (q2_is_load(in->op) || (in->op == Q2_OP_FALLBACK && in->ndef > 0)) {
+      if (q2_def_from_record(in)) {
         v->spec = 1;
         v->synced = 1;
       } else if (in->op == Q2_OP_CONST) {

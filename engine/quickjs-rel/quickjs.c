@@ -59919,6 +59919,50 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_string_strv = (uint32_t)sizeof(JSString);
     out->off_jsvalue_tag = (uint32_t)offsetof(JSValue, tag);
     out->off_jsvalue_u = (uint32_t)offsetof(JSValue, u);
+    out->sizeof_JSRegPIC = (uint32_t)sizeof(JSRegPIC);
+    out->off_regpic_shape = (uint32_t)offsetof(JSRegPIC, shape);
+    out->off_regpic_slot_off = (uint32_t)offsetof(JSRegPIC, slot_off);
+    out->off_regpic_kind = (uint32_t)offsetof(JSRegPIC, kind);
+    out->reg_pic_own = REG_PIC_OWN;
+    out->reg_pic_proto = REG_PIC_PROTO;
+    out->reg_ic_none = REG_IC_NONE;
+    out->tag_lazy_json = (uint32_t)(int32_t)JS_TAG_LAZY_JSON;
+    out->reg_bin_add = REG_BIN_ADD;
+    out->reg_bin_sub = REG_BIN_SUB;
+    out->reg_bin_mul = REG_BIN_MUL;
+    out->reg_bin_div = REG_BIN_DIV;
+    out->reg_bin_mod = REG_BIN_MOD;
+    out->reg_bin_lt = REG_BIN_LT;
+    out->reg_bin_lte = REG_BIN_LTE;
+    out->reg_bin_gt = REG_BIN_GT;
+    out->reg_bin_gte = REG_BIN_GTE;
+    out->reg_bin_strict_eq = REG_BIN_STRICT_EQ;
+    out->reg_bin_strict_neq = REG_BIN_STRICT_NEQ;
+    out->reg_bin_eq = REG_BIN_EQ;
+    out->reg_bin_neq = REG_BIN_NEQ;
+    out->reg_cmp_invert = REG_CMP_INVERT;
+    out->reg_bin_is_undef = REG_BIN_IS_UNDEF;
+    out->reg_bin_is_not_undef = REG_BIN_IS_NOT_UNDEF;
+    out->reg_pic_own_w = REG_PIC_OWN_W;
+    out->reg_un_neg = REG_UN_NEG;
+    out->reg_un_inc = REG_UN_INC;
+    {
+        /* is_prototype is a bit-field: find its byte and mask by setting it in
+           a zeroed object. */
+        JSObject o;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+
+        memset(&o, 0, sizeof(o));
+        o.is_prototype = 1;
+        for (i = 0; i < sizeof(o); i++) {
+            if (q[i] != 0) {
+                out->off_object_flags_byte = (uint32_t)i;
+                out->object_is_prototype_mask = q[i];
+                break;
+            }
+        }
+    }
     out->hash = qjs_aot_layout_hash(out);
 }
 
@@ -61227,6 +61271,11 @@ const void *qjs_aot_pic(JSRegRun *f)
     return f->pic;
 }
 
+void *const *qjs_aot_pic_holder(JSRegRun *f)
+{
+    return (void *const *)f->b->regvm_pic_holder;
+}
+
 __attribute__((always_inline)) int qjs_aot_num_fast(int sub, JSValue a, JSValue b, JSValue *out)
 {
     return regvm_num_fast(sub, a, b, out);
@@ -61244,10 +61293,57 @@ __attribute__((always_inline)) int qjs_aot_own_read_hit(JSRegRun *f, const void 
                               site, out);
 }
 
+static int regvm_rop_canonical(int op);
+
+/* The miss path of a compiled named read: the engine's cache-filling read, so
+   the next execution takes the inline hit instead of leaving compiled code.
+   0 with an owned *out, -1 on exception. */
+QJS_AOT_STUB int qjs_aot_read_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip,
+                                         JSValue recv, int atom, int site,
+                                         JSValue *out)
+{
+    *out = regvm_get_field_ic(ctx, f->b, &f->pic, recv, (JSAtom)atom, site);
+    if (JS_IsException(*out))
+        return -1;
+    /* The fill can change the site's kind: a new entry, or a polymorphic way
+       swapped into the primary. The interpreter's quickened `_own` handlers
+       trust the opcode and read an own slot without testing the kind, so a
+       site that is no longer an own slot goes back to its generic opcode,
+       which requickens from the cache the next time it runs. */
+    if (*ip != regvm_rop_canonical(*ip) &&
+        (f->pic == NULL || f->pic[site].kind != REG_PIC_OWN))
+        *ip = (uint8_t)regvm_rop_canonical(*ip);
+    return 0;
+}
+
+/* The miss path of a compiled named store: the engine's cache-filling write, so
+   the next execution takes the inline own-slot hit. 0 on success (the store
+   landed), -1 on exception. The value is borrowed. */
+QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip,
+                                        JSValue recv, int atom, int site,
+                                        JSValue v)
+{
+    f->cap_ip = ip;
+    if (f->pic != NULL && JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+        int ah = regvm_put_field_add_hit(ctx, f->b, f->pic,
+                                         JS_VALUE_GET_OBJ(recv), v, site);
+        if (ah != 0)
+            return ah < 0 ? -1 : 0;
+    }
+    return regvm_put_field_ic(ctx, f->b, &f->pic, recv, (JSAtom)atom, v, site) < 0
+               ? -1
+               : 0;
+}
+
 __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take)
 {
     int r;
 
+    /* The fused strict compare against undefined is a tag test on `a`. */
+    if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) {
+        *take = (JS_VALUE_GET_TAG(a) == JS_TAG_UNDEFINED) == (sub == REG_BIN_IS_UNDEF);
+        return 1;
+    }
     if (likely(JS_VALUE_IS_BOTH_INT(a, b)) &&
         (r = regvm_int_cmp(sub & ~REG_CMP_INVERT,
                            JS_VALUE_GET_INT(a), JS_VALUE_GET_INT(b))) >= 0) {
@@ -61263,6 +61359,14 @@ __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValu
         return 1;
     }
     return 0;
+}
+
+/* The slow half of a compiled compare branch: the interpreter's generic
+   compare, which can run valueOf/toString. The branch sense (`take`), or -1 on
+   exception. */
+QJS_AOT_STUB int qjs_aot_cmp_take(JSContext *ctx, int sub, JSValue a, JSValue b)
+{
+    return regvm_cmp_take(ctx, sub, a, b);
 }
 
 #if !QJS_DRC
@@ -61330,6 +61434,17 @@ QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSVa
     return 0;
 }
 
+int qjs_aot_get_global_hit(JSContext *ctx, JSRegRun *f, int site, JSValue *out)
+{
+    JSRegPIC *pic = f->pic;
+
+    if (likely(pic != NULL) && likely(pic[site].slot_off == ctx->rt->gv_cell_gen)) {
+        *out = pic[site].gslot->u.value;
+        return 1;
+    }
+    return 0;
+}
+
 /* Mirror the register get_global handler's per-instruction site cache: a
    filled site names the global's property slot and the generation it was
    filled at. A site hit borrows the slot's value, so the caller stores it with
@@ -61360,7 +61475,7 @@ QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
 
 __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v)
 {
-    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT && f->pic != NULL) {
         JSObject *p = JS_VALUE_GET_OBJ(recv);
         JSRegPIC *e = &f->pic[site];
 
@@ -61469,18 +61584,9 @@ __attribute__((always_inline)) int qjs_aot_nullish(JSValue v)
  * interpreter's. `fitsi`: the double is integral, in int32 range, and not -0.
  */
 
-int qjs_aot_fitsi(double d)
-{
-    return d >= -2147483648.0 && d <= 2147483647.0 &&
-           (double)(int32_t)d == d && !(d == 0.0 && signbit(d));
-}
-
-JSValue qjs_aot_box_num(double d, int isint)
-{
-    if (isint)
-        return JS_MKVAL(JS_TAG_INT, (int32_t)d);
-    return js_float64(d);
-}
+/* qjs_aot_fitsi and qjs_aot_box_num are static inline in quickjs-aot-rt.h, so a
+   boxing site in generated code is the test and the constructor rather than a
+   call across the unit boundary. */
 
 /* Unbox an int or a float into (double, isint); 0 for anything else. */
 int qjs_aot_to_num(JSValue v, double *out, int *isint)

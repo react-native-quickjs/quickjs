@@ -100,6 +100,10 @@ int q2_lowered(uint16_t rop) {
     case ROP_branch_if_not:
     case ROP_branch_cmp_reg_reg:
     case ROP_branch_cmp_reg_reg_s:
+    case ROP_put_field:
+    case ROP_get_global:
+    case ROP_neg:
+    case ROP_inc:
       return 1;
     default:
       return 0;
@@ -229,8 +233,8 @@ static void q2_cur_block(const Q2Func *fn, Q2Cur *c, int b) {
   int k;
   c->fn = fn;
   for (k = 0; k < fn->nregs; k++) c->cur[k] = Q2_NO_VALUE;
-  for (k = 0; k < fn->blocks[b].nparams; k++)
-    c->cur[fn->blocks[b].param_reg[k]] = fn->blocks[b].param_val[k];
+  for (k = 0; k < fn->blocks[b].nlive_in; k++)
+    c->cur[fn->blocks[b].in_reg[k]] = fn->blocks[b].in_val[k];
 }
 
 static void q2_cur_def(Q2Cur *c, int reg, Q2ValueId v) {
@@ -534,9 +538,19 @@ static void q2_emit_edge(FILE *f, const Q2Func *fn, int b, int si) {
       case Q2_R_BOOL:
         fprintf(f, " b%u = eb%d;", pv, k);
         break;
-      default:
+      default: {
+        /* Tagged values are written through. An argument from the same
+           register that is itself in the frame needs no store; anything else
+           (a number boxed on this edge, or another register's value) does, or
+           the slot stays stale for every later leave. */
+        Q2ValueId av = blk->edge_arg[si][k];
         fprintf(f, " v%u = ev%d;", pv, k);
+        if (av == Q2_NO_VALUE || q2_typed(&fn->values[av]) ||
+            !fn->values[av].synced ||
+            fn->values[av].reg != fn->values[pv].reg)
+          fprintf(f, " AOT_SET_B(ctx, fr, %d, v%u);", s->param_reg[k] * 16, pv);
         break;
+      }
     }
   }
   fprintf(f, " goto b_%d;", s->start_pc);
@@ -558,6 +572,14 @@ static void q2_emit_fallback(
      deopt reads the rest: write back every live value, before and after. */
   for (w = 0; w < fn->lwords; w++)
     g_em.liveb[w] |= q2_live_after(g_em.cur_insn)[w];
+  {
+    /* A step whose roles are unknown may read any register, a window
+       included, so every value this point holds goes back to the frame. */
+    const Q2RopInfo *ri = q2_rop_info(in->rop);
+    if (ri->op == Q2_OP_FALLBACK && ri->ndef == 0 && ri->nuse == 0 &&
+        ri->window < 0)
+      for (w = 0; w < fn->lwords; w++) g_em.liveb[w] = ~0ull;
+  }
   q2_writeback(f, fn, &g_em.pre, g_em.liveb);
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
   fprintf(
@@ -819,15 +841,39 @@ static int q2_emit_native(
     case ROP_move:
     case ROP_move_s: {
       int d = (int)in->arg[0].val, s = (int)in->arg[1].val;
+      Q2ValueId dv = in->def[0];
+      const Q2Value *dval = &fn->values[dv];
       if (d != s) {
-        Q2ValueId dv = in->def[0];
-        const Q2Value *dval = &fn->values[dv];
         if (dval->rep != Q2_R_TAGGED) {
           char e[64];
           q2_use(fn, in->use[0], dval->rep, e, sizeof(e));
           q2_def_typed(f, fn, in, 0, e);
         } else {
           q2_def(f, fn, in, 0, q2_op(in, 1, a, sizeof(a)), 0);
+        }
+        return 1;
+      }
+      /* A self-move is a no-op in the frame, but the IR still gives it a fresh
+         definition that later instructions read, so that local must hold the
+         value the register already has. The frame slot already does, so assign
+         the local only: storing would strand a reference under an owning build,
+         which is why the interpreter skips the store too. */
+      {
+        char e[64];
+        q2_use(fn, in->use[0], dval->rep, e, sizeof(e));
+        switch (dval->rep) {
+          case Q2_R_I32:
+            fprintf(f, "    i%u = %s;\n", dv, e);
+            break;
+          case Q2_R_F64:
+            fprintf(f, "    d%u = %s;\n", dv, e);
+            break;
+          case Q2_R_BOOL:
+            fprintf(f, "    b%u = %s;\n", dv, e);
+            break;
+          default:
+            fprintf(f, "    v%u = %s;\n", dv, e);
+            break;
         }
       }
       return 1;
@@ -950,7 +996,7 @@ static int q2_emit_native(
       q2_guard(f, in->pc, sid);
       fprintf(
           f,
-          "    if (__builtin_expect(!qjs_aot_num_fast(%d, %s, %s, &v%u), "
+          "    if (__builtin_expect(!q2_arith(%d, %s, %s, &v%u), "
           "0))\n",
           sub, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)), dv);
       q2_miss(f, in->pc, sid);
@@ -993,7 +1039,7 @@ static int q2_emit_native(
       q2_guard(f, in->pc, sid);
       fprintf(
           f,
-          "    if (__builtin_expect(!qjs_aot_num_fast(%d, %s, "
+          "    if (__builtin_expect(!q2_arith(%d, %s, "
           "JS_MKVAL(JS_TAG_INT, %d), &v%u), 0))\n",
           sub, q2_op(in, ai, a, sizeof(a)), imm, dv);
       q2_miss(f, in->pc, sid);
@@ -1095,7 +1141,7 @@ static int q2_emit_native(
       q2_guard(f, in->pc, sid);
       fprintf(
           f,
-          "    if (__builtin_expect(!qjs_aot_num_fast(%d, %s, %s, &v%u), "
+          "    if (__builtin_expect(!q2_arith(%d, %s, %s, &v%u), "
           "0))\n",
           REG_BIN_MUL, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)),
           in->def[0]);
@@ -1113,7 +1159,7 @@ static int q2_emit_native(
         }
         fprintf(
             f,
-            "      if (__builtin_expect(!qjs_aot_num_fast(%d, %s, %s, "
+            "      if (__builtin_expect(!q2_arith(%d, %s, %s, "
             "&v%u), 0))\n",
             sub2, l, r, in->def[1]);
       }
@@ -1130,13 +1176,27 @@ static int q2_emit_native(
       sid = q2_site();
       off = fn->values[in->def[0]].reg * 16;
       q2_guard(f, in->pc, sid);
+      q2_op(in, 1, a, sizeof(a));
       fprintf(
           f,
-          "    if (__builtin_expect(!qjs_aot_own_read_hit(f, pic, %s, %d, "
-          "&v%u), 0))\n",
-          q2_op(in, 1, a, sizeof(a)), site, in->def[0]);
-      q2_miss(f, in->pc, sid);
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off, in->def[0]);
+          "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
+          "&v%u), 0)) {\n",
+          a, site, in->def[0]);
+      /* A miss fills the cache and continues compiled rather than leaving for
+         the interpreter, so a cold or polymorphic site never disables the
+         function. The read may run a getter, so it can throw; it returns an
+         owned value, so the store adopts it. */
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
+          in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off, in->def[0]);
+      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off,
+              in->def[0]);
       return 1;
     }
     case ROP_get_field_chain:
@@ -1148,15 +1208,42 @@ static int q2_emit_native(
       off0 = fn->values[in->def[0]].reg * 16;
       off1 = fn->values[in->def[1]].reg * 16;
       q2_guard(f, in->pc, sid);
+      q2_op(in, 1, a, sizeof(a));
+      /* The second receiver is the first link's result, as in the handler. Each
+         link is stored as it is produced, so the next reads it from the frame
+         and a miss on either fills that link's cache and continues. */
       fprintf(
           f,
-          "    if (__builtin_expect(!(qjs_aot_own_read_hit(f, pic, %s, %d, "
-          "&v%u) && qjs_aot_own_read_hit(f, pic, v%u, %d, &v%u)), 0))\n",
-          q2_op(in, 1, a, sizeof(a)), s1, in->def[0], in->def[0], s2,
-          in->def[1]);
-      q2_miss(f, in->pc, sid);
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off0, in->def[0]);
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off1, in->def[1]);
+          "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
+          "&v%u), 0)) {\n",
+          a, s1, in->def[0]);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
+          in->pc, a, in->arg[2].off, s1, in->def[0], in->pc, off0, in->def[0]);
+      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off0,
+              in->def[0]);
+      fprintf(
+          f,
+          "    if (__builtin_expect(!q2_own_read_hit(pic, holders, v%u, %d, "
+          "&v%u), 0)) {\n",
+          in->def[0], s2, in->def[1]);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, v%u, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
+          in->pc, in->def[0], in->arg[6].off, s2, in->def[1], in->pc, off1, in->def[1]);
+      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off1,
+              in->def[1]);
       return 1;
     }
     case ROP_get_field2:
@@ -1168,18 +1255,105 @@ static int q2_emit_native(
       sid = q2_site();
       off = fn->values[in->def[0]].reg * 16;
       q2_guard(f, in->pc, sid);
+      q2_op(in, 1, a, sizeof(a));
       fprintf(
           f,
           "    if (qjs_aot_proto_fold(ctx, f, pic, %d, %s, %d, &v%u)) {\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
-          "    } else if (__builtin_expect(!qjs_aot_own_read_hit(f, pic, "
+          "    } else if (__builtin_expect(!q2_own_read_hit(pic, holders, "
           "%s, %d, &v%u), 0)) {\n",
-          fsid, q2_op(in, 1, a, sizeof(a)), site, in->def[0], off, in->def[0],
-          q2_op(in, 1, b, sizeof(b)), site, in->def[0]);
-      q2_miss(f, in->pc, sid);
+          fsid, a, site, in->def[0], off, in->def[0], a, site, in->def[0]);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
       fprintf(
-          f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off,
-          in->def[0]);
+          f,
+          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
+          in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off, in->def[0]);
+      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off,
+              in->def[0]);
+      return 1;
+    }
+    case ROP_put_field: { /* "rasr": receiver, atom, site, value */
+      int site = (int)in->arg[2].val;
+      char v[64];
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      q2_guard(f, in->pc, q2_site());
+      q2_op(in, 0, a, sizeof(a));
+      q2_op(in, 3, v, sizeof(v));
+      /* The own-slot overwrite inline; a counted value or a prototype receiver
+         takes the engine's hit. A miss runs the engine's store, which can call
+         a setter and throw, fills the cache and continues compiled. */
+      fprintf(
+          f,
+          "    if (__builtin_expect(!q2_put_field_hit(pic, %s, %d, %s), 0) &&\n"
+          "        !qjs_aot_put_field_own(ctx, f, %s, %d, %s)) {\n",
+          a, site, v, a, site, v);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_put_field_slow(ctx, f, code + %d, %s, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, %s) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "    }\n",
+          in->pc, a, in->arg[1].off, site, v, in->pc);
+      return 1;
+    }
+    case ROP_get_global: { /* "rabs": d, atom, throwing, site */
+      int site = (int)in->arg[3].val;
+      int off = fn->values[in->def[0]].reg * 16;
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      q2_guard(f, in->pc, q2_site());
+      /* The site-cache hit borrows the global's slot. A miss probes the cell
+         cache and then reads the global, which can throw. */
+      fprintf(
+          f,
+          "    if (__builtin_expect(qjs_aot_get_global_hit(ctx, f, %d, &v%u), 1)) "
+          "{\n"
+          "      AOT_SET_B(ctx, fr, %d, v%u);\n"
+          "    } else {\n"
+          "      int _r;\n",
+          site, in->def[0], off, in->def[0]);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      _r = qjs_aot_get_global_site(ctx, f, %d, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u);\n"
+          "      if (_r < 0) { pc = %d; goto exception; }\n"
+          "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
+          "      else AOT_SET_B(ctx, fr, %d, v%u);\n"
+          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "    }\n",
+          site, in->arg[1].off, (int)in->arg[2].val, in->def[0], in->pc, off,
+          in->def[0], off, in->def[0]);
+      return 1;
+    }
+    case ROP_neg:
+    case ROP_inc: { /* "rr": d, a */
+      int sub = in->rop == ROP_neg ? REG_UN_NEG : REG_UN_INC;
+      int off = fn->values[in->def[0]].reg * 16;
+      q2_guard(f, in->pc, q2_site());
+      q2_op(in, 1, a, sizeof(a));
+      /* An int or a float64 inline; -0, an int overflow and a coercion take
+         the engine's unary, which can run valueOf and throw. */
+      fprintf(
+          f,
+          "    if (__builtin_expect(q2_unary_fast(%d, %s, &v%u), 1)) {\n"
+          "      AOT_SET_B(ctx, fr, %d, v%u);\n"
+          "    } else {\n",
+          sub, a, in->def[0], off, in->def[0]);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (!qjs_aot_unary_num_fast(%d, %s, &v%u) &&\n"
+          "          qjs_aot_unary(ctx, %d, %s, &v%u) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
+          "    }\n",
+          sub, a, in->def[0], sub, a, in->def[0], in->pc, off, in->def[0]);
       return 1;
     }
     case ROP_get_element: {
@@ -1269,8 +1443,22 @@ static int q2_emit_native(
       int sub = s & ~REG_CMP_INVERT;
       int invert = (s & REG_CMP_INVERT) != 0;
       if (!q2_target(in, 3, &tgt)) return 0;
+      /* `=== undefined` / `!== undefined` tests `a` alone. A typed value is a
+         number or a boolean, never undefined, so the branch is decided. */
+      if ((unsigned)(s - REG_BIN_IS_UNDEF) < 2 && in->nuse >= 1 &&
+          fn->values[in->use[0]].rep != Q2_R_TAGGED) {
+        if (s == REG_BIN_IS_NOT_UNDEF) {
+          fprintf(f, "    {");
+          q2_emit_edge(f, fn, cur_block, 0);
+          fprintf(f, " }\n");
+        }
+        return 1;
+      }
       if (in->nuse >= 2 && fn->values[in->use[0]].rep != Q2_R_TAGGED &&
-          fn->values[in->use[1]].rep != Q2_R_TAGGED) {
+          fn->values[in->use[1]].rep != Q2_R_TAGGED &&
+          (sub == REG_BIN_LT || sub == REG_BIN_LTE || sub == REG_BIN_GT ||
+           sub == REG_BIN_GTE || sub == REG_BIN_EQ || sub == REG_BIN_NEQ ||
+           sub == REG_BIN_STRICT_EQ || sub == REG_BIN_STRICT_NEQ)) {
         const char *opx = sub == REG_BIN_LT    ? "<"
                           : sub == REG_BIN_LTE ? "<="
                           : sub == REG_BIN_GT  ? ">"
@@ -1295,12 +1483,23 @@ static int q2_emit_native(
       sid = q2_site();
       q2_guard(f, in->pc, sid);
       fprintf(f, "    { int _t = 0;\n");
+      q2_op(in, 1, a, sizeof(a));
+      q2_op(in, 2, b, sizeof(b));
+      /* A miss is not a deopt: mixed tags, strings, objects and `==` coercion
+         take the interpreter's generic compare and stay compiled. It can run
+         valueOf, so the frame is written back first and it can throw. */
       fprintf(
           f,
-          "      if (__builtin_expect(!qjs_aot_branch_cmp(%d, %s, %s, "
-          "&_t), 0))\n",
-          s, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)));
-      q2_miss(f, in->pc, sid);
+          "      if (__builtin_expect(!q2_branch_cmp(%d, %s, %s, "
+          "&_t), 0)) {\n",
+          s, a, b);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      _t = qjs_aot_cmp_take(ctx, %d, %s, %s);\n"
+          "      if (_t < 0) { pc = %d; goto exception; }\n"
+          "      }\n",
+          s, a, b, in->pc);
       fprintf(f, "      if (_t) {");
       q2_emit_edge(f, fn, cur_block, 0);
       fprintf(f, " } }\n");
@@ -1329,7 +1528,11 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    JSValue *vb = qjs_aot_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = qjs_aot_arg_buf(f);\n");
   fprintf(f, "    const void *pic = qjs_aot_pic(f);\n");
-  fprintf(f, "    (void)code; (void)ip; (void)vb; (void)ab; (void)pic;\n");
+  fprintf(f, "    void *const *holders = qjs_aot_pic_holder(f);\n");
+  fprintf(
+      f,
+      "    (void)code; (void)ip; (void)vb; (void)ab; (void)pic; "
+      "(void)holders;\n");
   fprintf(f, "#define Q2_REG(off) AOT_REG(fr, off)\n");
   /* Only pc 0 runs compiled; anything else is the interpreter's, from that pc
      on. */
@@ -1403,6 +1606,9 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
     const Q2Block *blk = &fn->blocks[b];
     fprintf(f, "b_%d:\n", blk->start_pc);
     g_em.cur_block = b;
+    /* Each block starts from its own live-in values, never from whatever block
+       happened to be emitted before it. */
+    q2_cur_block(fn, &g_em.cur, b);
     for (j = 0; j < blk->ninsns; j++) {
       const Q2Insn *in = &fn->insns[blk->first_insn + j];
       int k;

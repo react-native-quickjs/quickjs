@@ -3460,6 +3460,35 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_JSSTRING_STRV %uu\n"
           "#define QJS_AOT_OFF_JSVALUE_TAG %uu\n"
           "#define QJS_AOT_OFF_JSVALUE_U %uu\n\n"
+          "#define QJS_AOT_SIZEOF_JSREGPIC %uu\n"
+          "#define QJS_AOT_OFF_JSREGPIC_SHAPE %uu\n"
+          "#define QJS_AOT_OFF_JSREGPIC_SLOT_OFF %uu\n"
+          "#define QJS_AOT_OFF_JSREGPIC_KIND %uu\n"
+          "#define QJS_AOT_REG_PIC_OWN %uu\n"
+          "#define QJS_AOT_REG_PIC_PROTO %uu\n"
+          "#define QJS_AOT_REG_IC_NONE %uu\n"
+          "#define QJS_AOT_TAG_LAZY_JSON %uu\n"
+          "#define QJS_AOT_REG_BIN_ADD %uu\n"
+          "#define QJS_AOT_REG_BIN_SUB %uu\n"
+          "#define QJS_AOT_REG_BIN_MUL %uu\n"
+          "#define QJS_AOT_REG_BIN_DIV %uu\n"
+          "#define QJS_AOT_REG_BIN_MOD %uu\n"
+          "#define QJS_AOT_REG_BIN_LT %uu\n"
+          "#define QJS_AOT_REG_BIN_LTE %uu\n"
+          "#define QJS_AOT_REG_BIN_GT %uu\n"
+          "#define QJS_AOT_REG_BIN_GTE %uu\n"
+          "#define QJS_AOT_REG_BIN_STRICT_EQ %uu\n"
+          "#define QJS_AOT_REG_BIN_STRICT_NEQ %uu\n"
+          "#define QJS_AOT_REG_BIN_EQ %uu\n"
+          "#define QJS_AOT_REG_BIN_NEQ %uu\n"
+          "#define QJS_AOT_REG_CMP_INVERT %uu\n"
+          "#define QJS_AOT_REG_BIN_IS_UNDEF %uu\n"
+          "#define QJS_AOT_REG_BIN_IS_NOT_UNDEF %uu\n"
+          "#define QJS_AOT_REG_PIC_OWN_W %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE %uu\n"
+          "#define QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK %uu\n"
+          "#define QJS_AOT_REG_UN_NEG %uu\n"
+          "#define QJS_AOT_REG_UN_INC %uu\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
           lay.hash, lay.sizeof_JSObject, lay.sizeof_JSShape,
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
@@ -3468,7 +3497,17 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_shape_prop_count, lay.off_shape_proto,
           lay.off_shape_hash_table, lay.off_property_u_value,
           lay.off_shape_property_flags_atom, lay.off_string_len_bits,
-          lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u);
+          lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u,
+          lay.sizeof_JSRegPIC, lay.off_regpic_shape, lay.off_regpic_slot_off,
+          lay.off_regpic_kind, lay.reg_pic_own, lay.reg_pic_proto,
+          lay.reg_ic_none, lay.tag_lazy_json,
+          lay.reg_bin_add, lay.reg_bin_sub, lay.reg_bin_mul, lay.reg_bin_div,
+          lay.reg_bin_mod, lay.reg_bin_lt, lay.reg_bin_lte, lay.reg_bin_gt,
+          lay.reg_bin_gte, lay.reg_bin_strict_eq, lay.reg_bin_strict_neq,
+          lay.reg_bin_eq, lay.reg_bin_neq, lay.reg_cmp_invert,
+          lay.reg_bin_is_undef, lay.reg_bin_is_not_undef, lay.reg_pic_own_w,
+          lay.off_object_flags_byte, lay.object_is_prototype_mask,
+          lay.reg_un_neg, lay.reg_un_inc);
       fclose(lf);
     }
 
@@ -3495,6 +3534,226 @@ int qjsaot_driver_main(int argc, char **argv) {
       fprintf(
           f, "#include <string.h>\n#include <stdio.h>\n#include <stdlib.h>\n");
     fprintf(f, "\n");
+    /* The inline own-read hit: the engine's regvm_own_read_hit predicate
+       against the layout header's offsets, so a compiled field read is a couple
+       of loads rather than a call across the unit boundary. A miss returns 0 and
+       the caller takes the cache-filling slow path and continues. */
+    fprintf(
+        f,
+        "static inline int q2_own_read_hit(const void *pic, void *const *holders,\n"
+        "                       JSValue recv, int site, JSValue *out)\n"
+        "{\n"
+        "  const unsigned char *obj, *e, *holder, *prop;\n"
+        "  uint32_t slot_off;\n"
+        "  JSValue v;\n"
+        "\n"
+        "  if (pic == NULL || (unsigned)site == QJS_AOT_REG_IC_NONE) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  obj = (const unsigned char *)JS_VALUE_GET_PTR(recv);\n"
+        "  e = (const unsigned char *)pic + (size_t)site * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "  if (*(const void *const *)e !=\n"
+        "      *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE)) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) !=\n"
+        "      QJS_AOT_REG_PIC_OWN) {\n"
+        "    holder = *(const unsigned char *const *)(*(const unsigned char *const *)(\n"
+        "                 obj + QJS_AOT_OFF_JSOBJECT_SHAPE) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "    if (holder == NULL ||\n"
+        "        *(const void *const *)(holder + QJS_AOT_OFF_JSOBJECT_SHAPE) !=\n"
+        "            holders[site]) {\n"
+        "      return 0;\n"
+        "    }\n"
+        "    obj = holder;\n"
+        "  }\n"
+        "  prop = *(const unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+        "  slot_off = *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF);\n"
+        "  v = *(const JSValue *)(prop + slot_off);\n"
+        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "#if !QJS_DRC\n"
+        "  if (JS_VALUE_GET_TAG(v) < 0) {\n"
+        "    return 0; /* registers own: the slow path takes the reference */\n"
+        "  }\n"
+        "#endif\n"
+        "  *out = v;\n"
+        "  return 1;\n"
+        "}\n\n");
+    /* The inline own-slot store hit: the interpreter's REG_PIC_OWN_W test,
+       for the overwrite of an uncounted value with an uncounted value on an
+       object that is not a prototype. A counted value, a prototype receiver
+       (whose store invalidates the prototype epoch) or a miss returns 0 and
+       the caller takes the engine's store. */
+    fprintf(
+        f,
+        "static inline int q2_put_field_hit(const void *pic, JSValue recv, int site,\n"
+        "                                   JSValue v)\n"
+        "{\n"
+        "  const unsigned char *obj, *e;\n"
+        "  JSValue *slot;\n"
+        "\n"
+        "  if (pic == NULL || (unsigned)site == QJS_AOT_REG_IC_NONE) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) < 0) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  obj = (const unsigned char *)JS_VALUE_GET_PTR(recv);\n"
+        "  e = (const unsigned char *)pic + (size_t)site * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "  if (*(const void *const *)e !=\n"
+        "          *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE) ||\n"
+        "      *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) !=\n"
+        "          QJS_AOT_REG_PIC_OWN_W ||\n"
+        "      (obj[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] &\n"
+        "       QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK) != 0) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  slot = (JSValue *)(*(unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
+        "                     *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
+        "  if (JS_VALUE_GET_TAG(*slot) < 0) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  *slot = v;\n"
+        "  return 1;\n"
+        "}\n\n");
+    /* The inline unary fast path for neg and inc: an int whose result stays an
+       int, or a float64. Anything else (-0, an overflow, a coercion) returns 0
+       and the caller takes the engine's unary. */
+    fprintf(
+        f,
+        "static inline int q2_unary_fast(int sub, JSValue a, JSValue *out)\n"
+        "{\n"
+        "  if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {\n"
+        "    int32_t i = JS_VALUE_GET_INT(a);\n"
+        "    if (sub == QJS_AOT_REG_UN_NEG) {\n"
+        "      if (i == 0 || i == INT32_MIN) return 0;\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, -i);\n"
+        "      return 1;\n"
+        "    }\n"
+        "    if (sub == QJS_AOT_REG_UN_INC) {\n"
+        "      if (i == INT32_MAX) return 0;\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, i + 1);\n"
+        "      return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(a))) {\n"
+        "    double d = JS_VALUE_GET_FLOAT64(a);\n"
+        "    if (sub == QJS_AOT_REG_UN_NEG) { *out = __JS_NewFloat64(-d); return 1; }\n"
+        "    if (sub == QJS_AOT_REG_UN_INC) { *out = __JS_NewFloat64(d + 1); return 1; }\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n\n");
+    /* The inline tagged-arithmetic fast path: both operands int, or both
+       float64, for the sub-operations the profile shows. Anything else (a
+       coercion, a bitwise/shift or a loose compare) returns 0 and the caller
+       takes the engine's regvm_num_fast. `sub` is a constant at every call, so
+       the switches fold. */
+    fprintf(
+        f,
+        "static inline int q2_num_fast(int sub, JSValue a, JSValue b, JSValue *out)\n"
+        "{\n"
+        "  if (JS_VALUE_IS_BOTH_FLOAT(a, b)) {\n"
+        "    double d1 = JS_VALUE_GET_FLOAT64(a), d2 = JS_VALUE_GET_FLOAT64(b);\n"
+        "    switch (sub) {\n"
+        "    case QJS_AOT_REG_BIN_ADD: *out = __JS_NewFloat64(d1 + d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_SUB: *out = __JS_NewFloat64(d1 - d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_MUL: *out = __JS_NewFloat64(d1 * d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_DIV: *out = __JS_NewFloat64(d1 / d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_LT: *out = JS_MKVAL(JS_TAG_BOOL, d1 < d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_LTE: *out = JS_MKVAL(JS_TAG_BOOL, d1 <= d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_GT: *out = JS_MKVAL(JS_TAG_BOOL, d1 > d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_GTE: *out = JS_MKVAL(JS_TAG_BOOL, d1 >= d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_STRICT_EQ: *out = JS_MKVAL(JS_TAG_BOOL, d1 == d2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_STRICT_NEQ: *out = JS_MKVAL(JS_TAG_BOOL, d1 != d2); return 1;\n"
+        "    default: return 0;\n"
+        "    }\n"
+        "  }\n"
+        "  if (JS_VALUE_IS_BOTH_INT(a, b)) {\n"
+        "    int32_t v1 = JS_VALUE_GET_INT(a), v2 = JS_VALUE_GET_INT(b);\n"
+        "    int64_t r;\n"
+        "    switch (sub) {\n"
+        "    case QJS_AOT_REG_BIN_ADD: r = (int64_t)v1 + v2; break;\n"
+        "    case QJS_AOT_REG_BIN_SUB: r = (int64_t)v1 - v2; break;\n"
+        "    case QJS_AOT_REG_BIN_MUL:\n"
+        "      r = (int64_t)v1 * v2;\n"
+        "      if (__builtin_expect((int32_t)r != r, 0)) { *out = __JS_NewFloat64((double)r); return 1; }\n"
+        "      if (__builtin_expect(r == 0 && (v1 | v2) < 0, 0)) { *out = __JS_NewFloat64(-0.0); return 1; }\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, (int32_t)r); return 1;\n"
+        "    case QJS_AOT_REG_BIN_LT: *out = JS_MKVAL(JS_TAG_BOOL, v1 < v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_LTE: *out = JS_MKVAL(JS_TAG_BOOL, v1 <= v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_GT: *out = JS_MKVAL(JS_TAG_BOOL, v1 > v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_GTE: *out = JS_MKVAL(JS_TAG_BOOL, v1 >= v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_STRICT_EQ: *out = JS_MKVAL(JS_TAG_BOOL, v1 == v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_STRICT_NEQ: *out = JS_MKVAL(JS_TAG_BOOL, v1 != v2); return 1;\n"
+        "    default: return 0;\n"
+        "    }\n"
+        "    if (__builtin_expect(r < INT32_MIN || r > INT32_MAX, 0)) {\n"
+        "      *out = __JS_NewFloat64((double)r);\n"
+        "    } else {\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, (int32_t)r);\n"
+        "    }\n"
+        "    return 1;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n\n"
+        "static inline int q2_arith(int sub, JSValue a, JSValue b, JSValue *out)\n"
+        "{\n"
+        "  return q2_num_fast(sub, a, b, out) || qjs_aot_num_fast(sub, a, b, out);\n"
+        "}\n\n"
+        "static inline int q2_cmp_int(int sub, int32_t a, int32_t b)\n"
+        "{\n"
+        "  switch (sub) {\n"
+        "  case QJS_AOT_REG_BIN_LT: return a < b;\n"
+        "  case QJS_AOT_REG_BIN_LTE: return a <= b;\n"
+        "  case QJS_AOT_REG_BIN_GT: return a > b;\n"
+        "  case QJS_AOT_REG_BIN_GTE: return a >= b;\n"
+        "  case QJS_AOT_REG_BIN_EQ: case QJS_AOT_REG_BIN_STRICT_EQ: return a == b;\n"
+        "  case QJS_AOT_REG_BIN_NEQ: case QJS_AOT_REG_BIN_STRICT_NEQ: return a != b;\n"
+        "  default: return -1;\n"
+        "  }\n"
+        "}\n\n"
+        "static inline int q2_cmp_double(int sub, double a, double b)\n"
+        "{\n"
+        "  switch (sub) {\n"
+        "  case QJS_AOT_REG_BIN_LT: return a < b;\n"
+        "  case QJS_AOT_REG_BIN_LTE: return a <= b;\n"
+        "  case QJS_AOT_REG_BIN_GT: return a > b;\n"
+        "  case QJS_AOT_REG_BIN_GTE: return a >= b;\n"
+        "  case QJS_AOT_REG_BIN_EQ: case QJS_AOT_REG_BIN_STRICT_EQ: return a == b;\n"
+        "  case QJS_AOT_REG_BIN_NEQ: case QJS_AOT_REG_BIN_STRICT_NEQ: return a != b;\n"
+        "  default: return -1;\n"
+        "  }\n"
+        "}\n\n"
+        "static inline int q2_branch_cmp(int sub, JSValue a, JSValue b, int *take)\n"
+        "{\n"
+        "  int r;\n"
+        "  if (__builtin_expect((unsigned)(sub - QJS_AOT_REG_BIN_IS_UNDEF) < 2, 0)) {\n"
+        "    *take = (JS_VALUE_GET_TAG(a) == JS_TAG_UNDEFINED) ==\n"
+        "            (sub == QJS_AOT_REG_BIN_IS_UNDEF);\n"
+        "    return 1;\n"
+        "  }\n"
+        "  if (JS_VALUE_IS_BOTH_INT(a, b) &&\n"
+        "      (r = q2_cmp_int(sub & ~QJS_AOT_REG_CMP_INVERT,\n"
+        "                      JS_VALUE_GET_INT(a), JS_VALUE_GET_INT(b))) >= 0) {\n"
+        "    *take = r ^ ((sub & QJS_AOT_REG_CMP_INVERT) != 0);\n"
+        "    return 1;\n"
+        "  }\n"
+        "  if (JS_VALUE_GET_TAG(a) == JS_TAG_FLOAT64 &&\n"
+        "      JS_VALUE_GET_TAG(b) == JS_TAG_FLOAT64 &&\n"
+        "      (r = q2_cmp_double(sub & ~QJS_AOT_REG_CMP_INVERT,\n"
+        "                         JS_VALUE_GET_FLOAT64(a),\n"
+        "                         JS_VALUE_GET_FLOAT64(b))) >= 0) {\n"
+        "    *take = r ^ ((sub & QJS_AOT_REG_CMP_INVERT) != 0);\n"
+        "    return 1;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n\n");
 
     for (i = 0; i < nfuncs; i++) {
       if (!sel[i] || !eb[i].buf) continue;

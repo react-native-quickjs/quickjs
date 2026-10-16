@@ -259,8 +259,7 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
               in->op == Q2_OP_GET_FIELD || in->op == Q2_OP_GET_ELEMENT ||
               in->op == Q2_OP_GET_VAR_REF || in->op == Q2_OP_GET_ARG ||
               in->op == Q2_OP_GET_ARG2 || in->op == Q2_OP_GET_LOCAL ||
-              in->op == Q2_OP_GET_GLOBAL || in->op == Q2_OP_CALL ||
-              (in->op == Q2_OP_FALLBACK && in->ndef > 0))
+              q2_def_from_record(in))
             ok = 1;
           if (!ok)
             Q2_VERIFY_FAIL(

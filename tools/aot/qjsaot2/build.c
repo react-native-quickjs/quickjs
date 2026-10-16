@@ -659,10 +659,12 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
       return &info;
     case ROP_get_this_field: /* "rras": d, recv, atom, site */
-      info.ndef = 1;
+      /* The handler stores `this` into `recv` and then reads the field from
+         it, so both operands are destinations and neither is read. */
+      info.ndef = 2;
       info.def[0] = 0;
-      info.nuse = 1;
-      info.use[0] = 1;
+      info.def[1] = 1;
+      info.nuse = 0;
       info.reads = Q2_E_SLOT | Q2_E_SHAPE;
       info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
       return &info;
@@ -706,6 +708,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_div: /* "rrr": d, a, b */
     case ROP_neg: /* "rr": d, a */
     case ROP_inc: /* "rr" */
+      if (rop != ROP_div) info.op = Q2_OP_UNARY;
       info.ndef = 1;
       info.def[0] = 0;
       info.nuse = (rop == ROP_div) ? 2 : 1;
@@ -770,6 +773,39 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
 
     /* calls: the destination, the callee, the receiver and the argument
        window, every register of which the callee may read */
+    /* The steps that read a register window: the window is a use of every
+       register in it, or a typed value there would never reach the frame. */
+    case ROP_array_from: /* "rrb": d, window, count */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.window = 2;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_object_fill: /* "rrbu": object (filled in place), window, count, template */
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.window = 2;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_SHAPE | Q2_E_SLOT | Q2_E_CONTROL;
+      return &info;
+    case ROP_tail_call: /* "rrb": callee, window, argc */
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.window = 2;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
+                    Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
+      return &info;
+    case ROP_tail_call_method: /* "rrrb": callee, receiver, window, argc */
+      info.nuse = 2;
+      info.use[0] = 0;
+      info.use[1] = 1;
+      info.window = 3;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
+                    Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
+      return &info;
     case ROP_call: /* "rrrb": d, callee, window, argc */
       info.op = Q2_OP_CALL;
       info.ndef = 1;
@@ -921,6 +957,19 @@ static int q2_prune_params(Q2Func *f) {
   int changed = 1, b, i, guard = 0;
   if (!repl) return -1;
   for (i = 0; i < f->nvalues; i++) repl[i] = (Q2ValueId)i;
+  for (b = 0; b < f->nblocks; b++) {
+    Q2Block *blk = &f->blocks[b];
+    int n = blk->nparams > 0 ? blk->nparams : 1;
+    blk->in_reg = malloc(sizeof(int32_t) * (size_t)n);
+    blk->in_val = malloc(sizeof(Q2ValueId) * (size_t)n);
+    if (!blk->in_reg || !blk->in_val) {
+      free(repl);
+      return -1;
+    }
+    memcpy(blk->in_reg, blk->param_reg, sizeof(int32_t) * (size_t)blk->nparams);
+    memcpy(blk->in_val, blk->param_val, sizeof(Q2ValueId) * (size_t)blk->nparams);
+    blk->nlive_in = blk->nparams;
+  }
   while (changed && guard++ < f->nblocks + 8) {
     changed = 0;
     for (b = 1; b < f->nblocks; b++) { /* the entry block's params stay */
@@ -996,6 +1045,8 @@ static int q2_prune_params(Q2Func *f) {
     int n, k;
     for (k = 0; k < blk->nparams; k++)
       blk->param_val[k] = q2_find(repl, blk->param_val[k]);
+    for (k = 0; k < blk->nlive_in; k++)
+      blk->in_val[k] = q2_find(repl, blk->in_val[k]);
     for (n = 0; n < blk->nsucc; n++)
       for (k = 0; k < blk->nedge_args[n]; k++)
         if (blk->edge_arg[n][k] != Q2_NO_VALUE)
@@ -1330,8 +1381,10 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
               f->insn_live + (size_t)(b->first_insn + k) * words, cur,
               (size_t)words * 8);
           if (in2->op == Q2_OP_FALLBACK && in2->ndef == 0) {
-            /* unknown roles: the step may write any register live after it */
-            memset(cur, 0, (size_t)words * 8);
+            /* Unknown roles: the step may write any register live after it,
+               and the lowering reloads all of them. It kills none, though: a
+               register it leaves alone keeps its value, so that value must be
+               in the frame before the step, which needs it live there. */
           } else {
             for (m = 0; m < in2->ndef; m++) {
               int r = (int)in2->def[m];
@@ -1662,6 +1715,8 @@ void q2_free(Q2Func *f) {
   for (i = 0; i < f->nblocks; i++) {
     free(f->blocks[i].preds);
     free(f->blocks[i].param_reg);
+    free(f->blocks[i].in_reg);
+    free(f->blocks[i].in_val);
     free(f->blocks[i].param_val);
     free(f->blocks[i].edge_arg[0]);
     free(f->blocks[i].edge_arg[1]);

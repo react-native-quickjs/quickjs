@@ -191,6 +191,13 @@ typedef struct Q2Block {
   int32_t nparams;
   Q2ValueId *param_val; /* one per live-in register, aligned with param_reg */
   int32_t *param_reg;
+  /* Every live-in register and the value it holds on entry, parameter or not:
+     trivial-parameter removal drops a parameter in favour of a dominating
+     value, and code that needs a register's current value at a block start
+     (the frame write-back) reads it here. */
+  int32_t nlive_in;
+  int32_t *in_reg;
+  Q2ValueId *in_val;
   int32_t nsucc;
   int32_t succ_pc[2]; /* successor pcs; a target may leave the function */
   int32_t succ_block[2];
@@ -235,6 +242,10 @@ void q2_dump(FILE *f, const Q2Func *fn);
 /* Decide each value's representation from the profile (types.c). Fills rep,
    spec, synced and ovf. Returns 0, or -1 on allocation failure. */
 int q2_infer(Q2Func *fn);
+/* Whether an instruction's destinations take their representation from the
+   profile record (a load, a call, or another op the interpreter runs whose
+   result is guarded after it), rather than from their operands. */
+int q2_def_from_record(const Q2Insn *in);
 /* Verify a built function: SSA dominance, edge arguments, representations and
    the effect table. Returns 0, or -1 with a message in msg. */
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len);
