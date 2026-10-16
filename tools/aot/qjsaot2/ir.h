@@ -183,7 +183,7 @@ typedef struct Q2Block {
   int32_t succ_block[2];
   int32_t nedge_args[2];
   Q2ValueId **edge_arg; /* per successor: one value per successor param */
-  int32_t preds[2];     /* the block's predecessors (for the verifier) */
+  int32_t *preds;       /* the block's predecessors, sized by a counting pass */
   int32_t npreds;
   int32_t ctl_in; /* control-stack depth on entry */
 } Q2Block;
@@ -207,6 +207,7 @@ typedef struct Q2Func {
                           it, from which the frame write-back set follows */
   int32_t lwords;
   int32_t max_ctl;
+  int32_t nparams_before; /* block parameters before trivial removal */
   int32_t entry_block;
   int32_t exit_pc; /* the function's length */
 } Q2Func;

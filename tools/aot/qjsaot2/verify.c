@@ -145,9 +145,11 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
             "block %d pc %d: rop %u is lowered but classified as a fallback", b,
             in->pc, in->rop);
       if (in->op == Q2_OP_FALLBACK) {
-        if (ri->reads == 0 && ri->writes == 0)
+        /* A fallback with known roles runs through the step for its effects;
+           one with no roles at all must still declare what it may touch. */
+        if (ri->ndef == 0 && ri->nuse == 0 && ri->reads == 0 && ri->writes == 0)
           Q2_VERIFY_FAIL(
-              "block %d pc %d: a pure instruction is a fallback", b, in->pc);
+              "block %d pc %d: a fallback declares no effects", b, in->pc);
       } else if (in->op != ri->op) {
         Q2_VERIFY_FAIL(
             "block %d pc %d: operation %s does not match the table's %s", b,
@@ -199,9 +201,13 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
           Q2_VERIFY_FAIL(
               "edge %d->%d: argument %d is register %d, parameter wants %d", b,
               sb, k, f->values[val].reg, s->param_reg[k]);
-        if (f->values[val].block != b && q2_param_index(blk, val) < 0)
+        /* The argument is either defined in the source block, one of its
+           parameters, or a value whose definition dominates the source (which
+           is what trivial-parameter removal produces). */
+        if (f->values[val].block != b && q2_param_index(blk, val) < 0 &&
+            !q2_block_dominates(&v, f->values[val].block, b))
           Q2_VERIFY_FAIL(
-              "edge %d->%d: argument %d is not defined in the source block", b,
+              "edge %d->%d: argument %d does not dominate the source block", b,
               sb, k);
       }
     }

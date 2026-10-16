@@ -23,6 +23,7 @@
 
 #include "ir.h"
 #include "quickjs-aot-gen.h"
+#include "quickjs-regvm.h"
 #include "quickjs.h"
 
 /* The unit builder (selection, profile, table emission and the layout header)
@@ -62,7 +63,7 @@ int main(int argc, char **argv) {
   JSContext *ctx;
   JSAotGenFunc *funcs = NULL;
   int nfuncs = 0, i;
-  int verify = 0, dump = 0;
+  int verify = 0, dump = 0, stats = 0;
   int ninputs = 0, fails = 0, nkeep = 0;
   JSValue *keep = NULL;
   long nblocks = 0, ninsns = 0, nvalues = 0, nfuncs_ok = 0, nfuncs_uniq = 0;
@@ -72,8 +73,10 @@ int main(int argc, char **argv) {
       verify = 1;
     else if (strcmp(argv[i], "--dump-ir") == 0)
       dump = 1;
+    else if (strcmp(argv[i], "--stats") == 0)
+      stats = 1;
   }
-  if (!verify && !dump) {
+  if (!verify && !dump && !stats) {
     /* The unit-builder mode: the same CLI as qjsaot, with the SSA body
        emitter. Options are the driver's, so nothing is validated here. */
     qjs_aot_emit_body = qjsaot2_emit_body;
@@ -81,7 +84,7 @@ int main(int argc, char **argv) {
   }
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--verify-ir") == 0 ||
-        strcmp(argv[i], "--dump-ir") == 0)
+        strcmp(argv[i], "--dump-ir") == 0 || strcmp(argv[i], "--stats") == 0)
       continue;
     if (argv[i][0] == '-') {
       fprintf(stderr, "qjsaot2: unknown option %s\n", argv[i]);
@@ -90,7 +93,8 @@ int main(int argc, char **argv) {
     ninputs++;
   }
   if (ninputs == 0) {
-    fprintf(stderr, "usage: qjsaot2 --verify-ir|--dump-ir bundle.js ...\n");
+    fprintf(
+        stderr, "usage: qjsaot2 --verify-ir|--dump-ir|--stats bundle.js ...\n");
     return 2;
   }
 
@@ -169,6 +173,45 @@ int main(int argc, char **argv) {
     q2_free(&f);
   }
 
+  if (stats) {
+    long nfb = 0, nunk = 0, nparams = 0, nparams_before = 0;
+    long byrop[ROP_COUNT];
+    int k2;
+    memset(byrop, 0, sizeof(byrop));
+    for (i = 0; i < nfuncs; i++) {
+      Q2Func sf;
+      int b, k;
+      if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
+      if (i + 1 < nfuncs &&
+          memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
+        continue;
+      if (q2_build(&funcs[i], &sf) < 0) continue;
+      nparams_before += sf.nparams_before;
+      for (b = 0; b < sf.nblocks; b++) {
+        nparams += sf.blocks[b].nparams;
+        (void)0;
+        for (k = 0; k < sf.blocks[b].ninsns; k++) {
+          const Q2Insn *in = &sf.insns[sf.blocks[b].first_insn + k];
+          if (in->op == Q2_OP_FALLBACK) {
+            const Q2RopInfo *ri = q2_rop_info(in->rop);
+            nfb++;
+            if (ri->ndef == 0 && ri->nuse == 0) {
+              nunk++;
+              byrop[in->rop]++;
+            }
+          }
+        }
+      }
+      q2_free(&sf);
+    }
+    fprintf(
+        stderr,
+        "qjsaot2: fallbacks %ld, unknown-role %ld, params %ld (was %ld)\n", nfb,
+        nunk, nparams, nparams_before);
+    for (k2 = 0; k2 < ROP_COUNT; k2++)
+      if (byrop[k2] > 0)
+        fprintf(stderr, "qjsaot2:   unknown rop %d x%ld\n", k2, byrop[k2]);
+  }
   fprintf(
       stderr,
       "qjsaot2: %ld/%ld functions%s, %ld blocks, %ld insns, %ld values\n",

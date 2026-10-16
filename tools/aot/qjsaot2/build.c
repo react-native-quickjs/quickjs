@@ -246,6 +246,15 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
 
     /* arithmetic, logic and comparison */
     /* "rbrr": d, sub, a, b; "rbr": d, sub, s; "rbrI": d, sub, a, imm */
+    case ROP_binary_cpool: /* "rbrbc": d, sub, a, kind, idx (a const) */
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 2;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
     case ROP_add: /* "rrr": d, a, b */
     case ROP_sub:
     case ROP_mul:
@@ -366,6 +375,202 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       return &info;
     case ROP_return_undefined:
       info.op = Q2_OP_RETURN_UNDEF;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+
+    /* branch_cmp_loc_reg / _reg_loc family are already covered; the short
+       compare branches are "rrt": two registers, the compare in the opcode. */
+    /* roles for the rest of the profile's fallbacks */
+    case ROP_local_uninit: /* "u": slot (no register operand) */
+    case ROP_local_check:  /* "u" */
+    case ROP_local_check_init:
+    case ROP_var_ref_check:
+    case ROP_var_ref_check_init:
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 0;
+      info.nuse = 0;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_set_home_object: /* "rr": this, home (both read) */
+      info.op = Q2_OP_FALLBACK;
+      info.nuse = 2;
+      info.use[0] = 0;
+      info.use[1] = 1;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP;
+      return &info;
+    case ROP_branch_nlt_s: /* "rrt": a, b, target */
+    case ROP_branch_ngt_s:
+    case ROP_branch_nlte_s:
+    case ROP_branch_ngte_s:
+    case ROP_branch_eq_s:
+    case ROP_branch_neq_s:
+    case ROP_branch_lt_s:
+    case ROP_branch_lte_s:
+    case ROP_branch_gt_s:
+    case ROP_branch_gte_s:
+      info.op = Q2_OP_BRANCH;
+      info.nuse = 2;
+      info.use[0] = 0;
+      info.use[1] = 1;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_bitand: /* "rrr": d, a, b */
+    case ROP_bitor:
+    case ROP_bitxor:
+    case ROP_shl:
+    case ROP_sar:
+    case ROP_shr:
+    case ROP_mod:
+    case ROP_pow:
+    case ROP_eq:
+    case ROP_neq:
+    case ROP_strict_eq:
+    case ROP_strict_neq:
+    case ROP_lt:
+    case ROP_lte:
+    case ROP_gt:
+    case ROP_gte:
+    case ROP_instanceof:
+    case ROP_in:
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 2;
+      info.use[0] = 1;
+      info.use[1] = 2;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_put_element_xfer: /* "rrr": object, key, value */
+      info.op = Q2_OP_FALLBACK;
+      info.nuse = 3;
+      info.use[0] = 0;
+      info.use[1] = 1;
+      info.use[2] = 2;
+      info.reads = Q2_E_ELEMENTS;
+      info.writes = Q2_E_ELEMENTS | Q2_E_SLOT | Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_catch_enter: /* "rt": catches; the target is a handler pc */
+    case ROP_finally_enter:
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 0;
+      info.nuse = 0;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_inc_branch_lt: /* "rrt" */
+    case ROP_inc_branch_lt_s:
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 0;
+      info.nuse = 0; /* conservative: unknown roles */
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_add_imm_self_branch: /* "rit": d, imm, target; d defined */
+    case ROP_add_imm_self_branch_s:
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_local_rmw_imm: /* "buI": bool, slot, imm: no register operand */
+    case ROP_local_rmw_branch:
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 0;
+      info.nuse = 0;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+
+    /* Roles for the fallbacks that dominate the profile: known operands, so
+       the step redefines only its own destinations instead of the whole live
+       set. The lowering still runs them through the step. */
+    case ROP_make_closure: /* "rc": d, cpool */
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_load_const: /* "rbc": d, kind, cpool */
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_get_local_field: /* "ruas": d, slot, atom, site */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = Q2_E_SLOT | Q2_E_SHAPE;
+      info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
+      return &info;
+    case ROP_get_local_field_0: /* "ras": d, atom, site */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = Q2_E_SLOT | Q2_E_SHAPE;
+      info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
+      return &info;
+    case ROP_get_this_field: /* "rras": d, recv, atom, site */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = Q2_E_SLOT | Q2_E_SHAPE;
+      info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
+      return &info;
+    case ROP_get_local_s0: /* "r": d */
+    case ROP_get_local_s1:
+    case ROP_get_local_s2:
+    case ROP_get_local_s3:
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = 0;
+      info.writes = 0;
+      return &info;
+    case ROP_put_local_s0: /* "r": value */
+    case ROP_put_local_s1:
+    case ROP_put_local_s2:
+    case ROP_put_local_s3:
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP;
+      return &info;
+    case ROP_construct: /* "rrrrb": d, callee, newtarget, window, argc */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 2;
+      info.use[0] = 1;
+      info.use[1] = 2;
+      info.window = 3;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
+                    Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
+      return &info;
+    case ROP_apply_arguments: /* "rru": d, callee, window */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_div: /* "rrr": d, a, b */
+    case ROP_neg: /* "rr": d, a */
+    case ROP_inc: /* "rr" */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = (rop == ROP_div) ? 2 : 1;
+      info.use[0] = 1;
+      info.use[1] = 2;
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
@@ -530,9 +735,118 @@ static int q2_ends_control(uint16_t rop) {
   }
 }
 
+static int q2_has_target(const Q2Insn *in) {
+  int n;
+  for (n = 0; n < in->narg; n++)
+    if (in->arg[n].kind == 't') return 1;
+  return 0;
+}
+static int64_t q2_first_target(const Q2Insn *in) {
+  int n;
+  for (n = 0; n < in->narg; n++)
+    if (in->arg[n].kind == 't') return in->arg[n].val;
+  return 0;
+}
+
 static int cmp_i32(const void *a, const void *b) {
   int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
   return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* Trivial block-parameter removal (Braun et al. 2013): a parameter whose
+   incoming arguments are all the same value becomes that value, so the
+   parameter goes away and every use names it directly. The entry block's
+   parameters stay: they are the frame loads. */
+static Q2ValueId q2_find(const Q2ValueId *repl, Q2ValueId v) {
+  while (repl[v] != v) v = repl[v];
+  return v;
+}
+
+static int q2_prune_params(Q2Func *f) {
+  Q2ValueId *repl =
+      malloc(sizeof(Q2ValueId) * (size_t)(f->nvalues > 0 ? f->nvalues : 1));
+  int changed = 1, b, i, guard = 0;
+  if (!repl) return -1;
+  for (i = 0; i < f->nvalues; i++) repl[i] = (Q2ValueId)i;
+  while (changed && guard++ < f->nblocks + 8) {
+    changed = 0;
+    for (b = 1; b < f->nblocks; b++) { /* the entry block's params stay */
+      Q2Block *blk = &f->blocks[b];
+      int p = 0;
+      while (p < blk->nparams) {
+        Q2ValueId pv = blk->param_val[p];
+        Q2ValueId common = Q2_NO_VALUE;
+        int consistent = 1, e;
+        for (e = 0; e < blk->npreds; e++) {
+          Q2Block *pr = &f->blocks[blk->preds[e]];
+          int n, si = -1;
+          Q2ValueId av;
+          for (n = 0; n < pr->nsucc; n++)
+            if (pr->succ_block[n] == b) {
+              si = n;
+              break;
+            }
+          if (si < 0 || p >= pr->nedge_args[si]) continue;
+          av = q2_find(repl, pr->edge_arg[si][p]);
+          if (av == pv) continue; /* this edge passes the parameter itself */
+          if (common == Q2_NO_VALUE)
+            common = av;
+          else if (q2_find(repl, common) != av) {
+            consistent = 0;
+            break;
+          }
+        }
+        if (consistent && common != Q2_NO_VALUE) {
+          repl[pv] = common;
+          for (i = p; i + 1 < blk->nparams; i++) {
+            blk->param_val[i] = blk->param_val[i + 1];
+            blk->param_reg[i] = blk->param_reg[i + 1];
+          }
+          blk->nparams--;
+          for (e = 0; e < blk->npreds; e++) {
+            Q2Block *pr = &f->blocks[blk->preds[e]];
+            int n, k;
+            for (n = 0; n < pr->nsucc; n++) {
+              int si = n;
+              if (pr->succ_block[si] != b) continue;
+              if (p >= pr->nedge_args[si]) continue;
+              for (k = p; k + 1 < pr->nedge_args[si]; k++)
+                pr->edge_arg[si][k] = pr->edge_arg[si][k + 1];
+              pr->nedge_args[si]--;
+            }
+          }
+          changed = 1;
+        } else {
+          p++;
+        }
+      }
+    }
+  }
+  /* rewrite every reference through the replacement map */
+  for (i = 0; i < f->ninsns; i++) {
+    Q2Insn *in = &f->insns[i];
+    int k;
+    for (k = 0; k < in->nuse; k++) in->use[k] = q2_find(repl, in->use[k]);
+    for (k = 0; k < in->narg; k++)
+      if (in->argval[k] != Q2_NO_VALUE)
+        in->argval[k] = q2_find(repl, in->argval[k]);
+    for (k = 0; k < in->win_n; k++)
+      in->win_val[k] = q2_find(repl, in->win_val[k]);
+    for (k = 0; k < in->nredef; k++)
+      in->redef_val[k] = q2_find(repl, in->redef_val[k]);
+  }
+  for (b = 0; b < f->nblocks; b++) {
+    Q2Block *blk = &f->blocks[b];
+    int n, k;
+    for (k = 0; k < blk->nparams; k++)
+      blk->param_val[k] = q2_find(repl, blk->param_val[k]);
+    for (n = 0; n < blk->nsucc; n++)
+      for (k = 0; k < blk->nedge_args[n]; k++)
+        if (blk->edge_arg[n][k] != Q2_NO_VALUE)
+          blk->edge_arg[n][k] = q2_find(repl, blk->edge_arg[n][k]);
+  }
+  free(repl);
+  return 0;
 }
 
 int q2_build(const JSAotGenFunc *g, Q2Func *f) {
@@ -596,11 +910,11 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
         in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
     }
     if (in->ndef == 0 && ri->ndef != 0) in->op = Q2_OP_FALLBACK;
-    if (in->op == Q2_OP_FALLBACK) {
-      /* The step engine reads every register operand of the instruction, so
-         every one of them is a use; which of them is the destination is
-         unknown, and is modelled by the instruction redefining the whole
-         live set instead. */
+    if (in->op == Q2_OP_FALLBACK && ri->ndef == 0 && ri->nuse == 0) {
+      /* Unknown roles: the step engine reads every register operand of the
+         instruction, so every one of them is a use, and which is the
+         destination is unknown, so the instruction redefines the whole live
+         set instead. A fallback that declares roles keeps them. */
       in->ndef = 0;
       in->nuse = 0;
       for (n = 0; n < in->narg && in->nuse < 8; n++)
@@ -628,9 +942,11 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
 
   /* 2. block starts: pc 0, every branch target, and after a terminator */
   {
-    /* every instruction contributes its own pc, and one with a target adds
-       the target and the fall-through, so three per instruction plus the two
-       endpoints is the bound */
+    /* A block starts at pc 0, at every branch target, at the fall-through of
+       an instruction with a target, and after a terminator. A fallback is not a
+       terminator: since a fallback that does not fall through leaves compiled
+       code, it cannot re-enter at an arbitrary pc, so there is no reason to
+       split at one. */
     int32_t *tmp = malloc(sizeof(*tmp) * (size_t)(3 * f->ninsns + 2));
     if (!tmp) {
       f->why = "out of memory";
@@ -639,25 +955,32 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     tmp[nstarts++] = 0;
     for (i = 0; i < f->ninsns; i++) {
       Q2Insn *in = &f->insns[i];
-      /* every instruction is its own block: a fallback returns an ip that may
-         be any instruction, and only label-per-block keeps the graph honest
-         without a switch */
-      tmp[nstarts++] = in->pc;
+      /* A fallback ends its block: it may leave compiled code, and its
+         fall-through (the reloads after the step) is the next block. */
       int term =
           (in->op == Q2_OP_BRANCH || in->op == Q2_OP_BRANCH_CMP ||
            in->op == Q2_OP_RETURN || in->op == Q2_OP_RETURN_UNDEF ||
+           in->op == Q2_OP_FALLBACK || !q2_lowered(in->rop) ||
            q2_ends_control(in->rop));
+      int ntargets = 0;
       for (n = 0; n < in->narg; n++) {
-        int has_target = 0;
         if (in->arg[n].kind != 't') continue;
+        ntargets++;
         tmp[nstarts++] = in->next + (int32_t)in->arg[n].val;
-        has_target = 1;
-        /* The fall-through of a branch is a block too: the lowering needs a
-           label for each edge it can `goto` to. */
+        /* the fall-through of a branch is a block too */
         tmp[nstarts++] = in->next;
-        (void)has_target;
+      }
+      if (ntargets > 1) {
+        f->why = "branch with two targets";
+        free(tmp);
+        return -1;
       }
       if (term) tmp[nstarts++] = in->next;
+      /* An instruction the lowering will not handle runs through the step and
+         its fall-through is a block start: that is where the reloads after the
+         step land, and where the step's next pc is labelled. */
+      if (in->op == Q2_OP_FALLBACK || !q2_lowered(in->rop))
+        tmp[nstarts++] = in->next;
     }
     tmp[nstarts++] = f->exit_pc;
     qsort(tmp, (size_t)nstarts, sizeof(*tmp), cmp_i32);
@@ -698,7 +1021,6 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     f->blocks[i].end_pc = starts[i + 1];
     f->blocks[i].first_insn = -1;
     f->blocks[i].ctl_in = -1;
-    f->blocks[i].preds[0] = f->blocks[i].preds[1] = -1;
     pc_to_block[starts[i]] = i;
   }
   pc_to_block[f->exit_pc] = f->nblocks; /* the exit block */
@@ -743,6 +1065,19 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       b->nsucc++;
     } else if (q2_ends_control(last->rop)) {
       b->nsucc = 0;
+    } else if (
+        (last->op == Q2_OP_FALLBACK || !q2_lowered(last->rop)) &&
+        q2_has_target(last)) {
+      /* A fallback that is a branch (a fused increment-branch and the like)
+         keeps both edges: the taken target first, then the fall-through, so
+         the lowering can route the step's returned ip. */
+      int32_t tgt = last->next + (int32_t)q2_first_target(last);
+      b->succ_pc[0] = tgt;
+      b->succ_block[0] = pc_to_block[tgt];
+      b->nsucc = 1;
+      b->succ_pc[b->nsucc] = last->next;
+      b->succ_block[b->nsucc] = pc_to_block[last->next];
+      b->nsucc++;
     } else {
       b->succ_pc[0] = last->next;
       b->succ_block[0] = pc_to_block[last->next];
@@ -751,18 +1086,47 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     for (n = 0; n < b->nsucc; n++) {
       Q2Block *s =
           b->succ_block[n] < f->nblocks ? &f->blocks[b->succ_block[n]] : NULL;
-      if (s && s->npreds < 2) s->preds[s->npreds] = i;
-      if (s) s->npreds++;
+      if (s) s->npreds++; /* counted here, filled below */
     }
   }
   f->entry_block = 0;
 
-  /* 4. liveness over the whole register file */
+  /* 3b. the predecessor lists, sized by the count above */
+  for (i = 0; i < f->nblocks; i++) {
+    if (f->blocks[i].npreds > 0) {
+      f->blocks[i].preds =
+          malloc(sizeof(int32_t) * (size_t)f->blocks[i].npreds);
+      if (!f->blocks[i].preds) {
+        f->why = "out of memory";
+        goto fail;
+      }
+    }
+    f->blocks[i].npreds = 0;
+  }
+  for (i = 0; i < f->nblocks; i++) {
+    Q2Block *b = &f->blocks[i];
+    for (n = 0; n < b->nsucc; n++) {
+      Q2Block *s =
+          b->succ_block[n] < f->nblocks ? &f->blocks[b->succ_block[n]] : NULL;
+      if (s) s->preds[s->npreds++] = i;
+    }
+  }
+
+  /* 4. liveness over the whole register file, one backward walk per block, so
+     the live set at each instruction is exact. A fallback with known roles
+     defines only its own destinations; one with unknown roles may write any
+     register live after it. */
   {
     int changed = 1, pass = 0;
     uint64_t *use = bits_new(words), *def = bits_new(words);
-    uint64_t *in = bits_new(words), *out = bits_new(words);
-    if (!use || !def || !in || !out) {
+    uint64_t *in = bits_new(words), *out = bits_new(words),
+             *cur = bits_new(words);
+    if (!use || !def || !in || !out || !cur) {
+      f->why = "out of memory";
+      goto fail;
+    }
+    f->insn_live = calloc((size_t)f->ninsns * (size_t)words, sizeof(uint64_t));
+    if (!f->insn_live) {
       f->why = "out of memory";
       goto fail;
     }
@@ -770,68 +1134,37 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       changed = 0;
       for (i = f->nblocks - 1; i >= 0; i--) {
         Q2Block *b = &f->blocks[i];
-        int k, w;
-        memset(use, 0, (size_t)words * 8);
-        memset(def, 0, (size_t)words * 8);
+        int k;
         memset(out, 0, (size_t)words * 8);
         for (n = 0; n < b->nsucc; n++)
           if (b->succ_block[n] < f->nblocks)
             bits_or(out, f->live_in + (size_t)b->succ_block[n] * words, words);
-        memcpy(in, out, (size_t)words * 8); /* running: live after the insn */
+        memcpy(cur, out, (size_t)words * 8);
         for (k = b->ninsns - 1; k >= 0; k--) {
           Q2Insn *in2 = &f->insns[b->first_insn + k];
-          if (in2->op == Q2_OP_FALLBACK) {
-            /* The step engine may write any register live after it. */
-            for (w = 0; w < words; w++) def[w] |= in[w];
+          int m;
+          memcpy(
+              f->insn_live + (size_t)(b->first_insn + k) * words, cur,
+              (size_t)words * 8);
+          if (in2->op == Q2_OP_FALLBACK && in2->ndef == 0) {
+            /* unknown roles: the step may write any register live after it */
+            memset(cur, 0, (size_t)words * 8);
           } else {
-            for (n = 0; n < in2->ndef; n++) bits_set(def, (int)in2->def[n]);
-          }
-          for (n = 0; n < in2->nuse; n++) bits_set(use, (int)in2->use[n]);
-          for (n = 0; n < in2->win_n; n++) bits_set(use, in2->win_reg + n);
-        }
-        for (w = 0; w < words; w++) in[w] = use[w] | (in[w] & ~def[w]);
-        /* The live set just after each instruction, from which the frame
-           write-back set follows: a write-back needs the registers live before
-           the instruction, which is (live_after \ defs) | uses. */
-        if (!f->insn_live) {
-          f->insn_live =
-              calloc((size_t)f->ninsns * (size_t)words, sizeof(uint64_t));
-          if (!f->insn_live) {
-            f->why = "out of memory";
-            goto fail;
-          }
-        }
-        {
-          uint64_t *cur = bits_new(words);
-          int k2;
-          if (!cur) {
-            f->why = "out of memory";
-            goto fail;
-          }
-          memcpy(cur, out, (size_t)words * 8);
-          for (k2 = b->ninsns - 1; k2 >= 0; k2--) {
-            Q2Insn *in2 = &f->insns[b->first_insn + k2];
-            int m2;
-            memcpy(
-                f->insn_live + (size_t)(b->first_insn + k2) * words, cur,
-                (size_t)words * 8);
-            /* cur becomes live-before: drop what this instruction defines,
-               add what it uses. A fallback defines the whole live set. */
-            if (in2->op == Q2_OP_FALLBACK) {
-              memset(cur, 0, (size_t)words * 8);
-            } else {
-              for (m2 = 0; m2 < in2->ndef; m2++) {
-                int r = (int)in2->def[m2];
-                cur[r >> 6] &= ~(1ull << (r & 63));
-              }
-            }
-            for (m2 = 0; m2 < in2->nuse; m2++) {
-              int r = (int)in2->use[m2];
-              cur[r >> 6] |= 1ull << (r & 63);
+            for (m = 0; m < in2->ndef; m++) {
+              int r = (int)in2->def[m];
+              cur[r >> 6] &= ~(1ull << (r & 63));
             }
           }
-          free(cur);
+          for (m = 0; m < in2->nuse; m++) {
+            int r = (int)in2->use[m];
+            cur[r >> 6] |= 1ull << (r & 63);
+          }
+          for (m = 0; m < in2->win_n; m++) {
+            int r = in2->win_reg + m;
+            cur[r >> 6] |= 1ull << (r & 63);
+          }
         }
+        memcpy(in, cur, (size_t)words * 8);
         if (!bits_equal(in, f->live_in + (size_t)i * words, words)) {
           memcpy(f->live_in + (size_t)i * words, in, (size_t)words * 8);
           changed = 1;
@@ -843,6 +1176,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     free(def);
     free(in);
     free(out);
+    free(cur);
   }
 
   /* 5. values: block parameters, then one definition per write */
@@ -924,10 +1258,11 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             in2->win_val[w] = def_at[r];
           }
         }
-        if (in2->op == Q2_OP_FALLBACK) {
-          /* Redefine every register live after the instruction, and remember
-             which, so the lowering reloads exactly these from the frame. */
-          uint64_t *lo = f->live_out + (size_t)b * words;
+        if (in2->op == Q2_OP_FALLBACK && in2->ndef == 0) {
+          /* Unknown roles: the step may write any register live after this
+             instruction (not the block), so redefine those and remember which,
+             for the lowering to reload from the frame. */
+          uint64_t *lo = f->insn_live + (size_t)(blk->first_insn + k) * words;
           int nlive = 0;
           for (m = 0; m < f->nregs; m++)
             if (bits_test(lo, m)) nlive++;
@@ -1011,6 +1346,19 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     }
   }
 
+  {
+    int pb, pk;
+    for (pb = 0; pb < f->nblocks; pb++)
+      f->nparams_before += f->blocks[pb].nparams;
+    (void)pk;
+  }
+
+  /* 5b. drop the block parameters that are the same value on every edge */
+  if (!getenv("Q2_NO_PRUNE") && q2_prune_params(f) < 0) {
+    f->why = "out of memory";
+    goto fail;
+  }
+
   /* 6. control-stack depth per block */
   {
     int changed = 1, guard = 0;
@@ -1070,6 +1418,7 @@ void q2_free(Q2Func *f) {
   int i;
   if (!f) return;
   for (i = 0; i < f->nblocks; i++) {
+    free(f->blocks[i].preds);
     free(f->blocks[i].param_reg);
     free(f->blocks[i].param_val);
     free(f->blocks[i].edge_arg[0]);
