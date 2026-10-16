@@ -1077,9 +1077,19 @@ static int q2_emit_native(
       fprintf(
           f,
           "    if (__builtin_expect(!q2_arith(%d, %s, %s, &v%u), "
-          "0))\n",
+          "0)) {\n",
           sub, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)), dv);
-      q2_miss(f, in->pc, sid);
+      /* A miss is not a deopt: a string concatenation, a coercion or a mixed
+         tag takes the interpreter's generic binary and continues. It can run
+         valueOf/toString, so the frame is written back first. */
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_binary(ctx, %d, %s, %s, &v%u)) { pc = %d; goto "
+          "exception; }\n"
+          "    }\n",
+          sub, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)), dv,
+          in->pc);
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off, dv);
       return 1;
     }
@@ -1120,9 +1130,15 @@ static int q2_emit_native(
       fprintf(
           f,
           "    if (__builtin_expect(!q2_arith(%d, %s, "
-          "JS_MKVAL(JS_TAG_INT, %d), &v%u), 0))\n",
+          "JS_MKVAL(JS_TAG_INT, %d), &v%u), 0)) {\n",
           sub, q2_op(in, ai, a, sizeof(a)), imm, dv);
-      q2_miss(f, in->pc, sid);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_binary(ctx, %d, %s, JS_MKVAL(JS_TAG_INT, %d), "
+          "&v%u)) { pc = %d; goto exception; }\n"
+          "    }\n",
+          sub, q2_op(in, ai, a, sizeof(a)), imm, dv, in->pc);
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off, dv);
       return 1;
     }
@@ -1219,13 +1235,22 @@ static int q2_emit_native(
         return 1;
       }
       q2_guard(f, in->pc, sid);
+      /* As the interpreter's fused form: the first half through the generic
+         binary on a miss, then the second. Neither half is a deopt. */
       fprintf(
           f,
           "    if (__builtin_expect(!q2_arith(%d, %s, %s, &v%u), "
-          "0))\n",
+          "0)) {\n",
           REG_BIN_MUL, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)),
           in->def[0]);
-      q2_miss(f, in->pc, sid);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (qjs_aot_binary(ctx, %d, %s, %s, &v%u)) { pc = %d; goto "
+          "exception; }\n"
+          "    }\n",
+          REG_BIN_MUL, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)),
+          in->def[0], in->pc);
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", dm_off, in->def[0]);
       q2_guard(f, in->pc, q2_site());
       {
@@ -1240,10 +1265,16 @@ static int q2_emit_native(
         fprintf(
             f,
             "      if (__builtin_expect(!q2_arith(%d, %s, %s, "
-            "&v%u), 0))\n",
+            "&v%u), 0)) {\n",
             sub2, l, r, in->def[1]);
+        q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+        fprintf(
+            f,
+            "        if (qjs_aot_binary(ctx, %d, %s, %s, &v%u)) { pc = %d; goto "
+            "exception; }\n"
+            "      }\n",
+            sub2, l, r, in->def[1], in->pc);
       }
-      q2_miss(f, in->pc, sid);
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", da_off, in->def[1]);
       return 1;
     }
