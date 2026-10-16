@@ -86,6 +86,10 @@ enum {
   Q2_OP_RETURN,
   Q2_OP_RETURN_UNDEF,
   Q2_OP_GET_FIELD,
+  Q2_OP_GET_ELEMENT,
+  Q2_OP_GET_ARG2,
+  Q2_OP_GET_VAR_REF,
+  Q2_OP_LOAD_THIS,
   Q2_OP_PUT_FIELD,
   Q2_OP_CALL,
   Q2_OP_COUNT
@@ -105,6 +109,10 @@ typedef struct Q2RopInfo {
 } Q2RopInfo;
 
 const Q2RopInfo *q2_rop_info(uint16_t rop);
+
+/* The ROPs the lowering lowers natively. The classifier must classify every one
+   of them (the IR verifier checks it), so the two cannot drift apart. */
+int q2_lowered(uint16_t rop);
 
 /* ---- values -------------------------------------------------------------- */
 typedef uint32_t Q2ValueId;
@@ -145,6 +153,9 @@ typedef struct Q2Insn {
   int32_t next; /* pc + size */
   int32_t narg;
   Q2Arg arg[8];
+  /* The SSA value each operand holds at this instruction: for an 'r' operand
+     the value currently defined for that register, else Q2_NO_VALUE. */
+  Q2ValueId argval[8];
   int8_t nuse;
   Q2ValueId use[8];
   /* A call's argument window, if any: the registers the callee reads. Kept
@@ -153,6 +164,11 @@ typedef struct Q2Insn {
   Q2ValueId *win_val; /* one value per window register, after resolution */
   int8_t ndef;
   Q2ValueId def[2];
+  /* For a fallback: the registers it redefines and the value each becomes, so
+     the lowering can reload them from the frame after the step. */
+  int32_t nredef;
+  int32_t *redef_reg;
+  Q2ValueId *redef_val;
 } Q2Insn;
 
 /* ---- blocks -------------------------------------------------------------- */
@@ -187,6 +203,8 @@ typedef struct Q2Func {
   Q2ValueId *reg_def; /* per register: the value defined at the current point */
   uint64_t *live_in;  /* per block, nregs bits */
   uint64_t *live_out;
+  uint64_t *insn_live; /* per instruction, nregs bits: the live set just after
+                          it, from which the frame write-back set follows */
   int32_t lwords;
   int32_t max_ctl;
   int32_t entry_block;

@@ -138,6 +138,12 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
       const Q2Insn *in = &f->insns[blk->first_insn + i];
       const Q2RopInfo *ri = q2_rop_info(in->rop);
 
+      /* A natively lowered operation must be classified, and a classified one
+         must not need the step for its operands. */
+      if (q2_lowered(in->rop) && in->op == Q2_OP_FALLBACK)
+        Q2_VERIFY_FAIL(
+            "block %d pc %d: rop %u is lowered but classified as a fallback", b,
+            in->pc, in->rop);
       if (in->op == Q2_OP_FALLBACK) {
         if (ri->reads == 0 && ri->writes == 0)
           Q2_VERIFY_FAIL(

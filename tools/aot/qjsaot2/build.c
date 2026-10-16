@@ -146,6 +146,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
   switch (rop) {
     /* constants and moves */
     case ROP_load_i8:
+    case ROP_load_i8_s:
     case ROP_load_i32:
     case ROP_load_undefined:
     case ROP_load_null:
@@ -158,6 +159,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.writes = 0;
       return &info;
     case ROP_move:
+    case ROP_move_s:
     case ROP_move_xfer:
       info.op = Q2_OP_MOVE;
       info.ndef = 1;
@@ -191,6 +193,28 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
+    case ROP_get_arg2: /* "ruru": d1, slot1, d2, slot2 */
+      info.op = Q2_OP_GET_ARG2;
+      info.ndef = 2;
+      info.def[0] = 0;
+      info.def[1] = 2;
+      info.reads = 0;
+      info.writes = 0;
+      return &info;
+    case ROP_get_var_ref: /* "ru": d, slot */
+      info.op = Q2_OP_GET_VAR_REF;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = Q2_E_VARREF;
+      info.writes = 0;
+      return &info;
+    case ROP_load_this: /* "r" */
+      info.op = Q2_OP_LOAD_THIS;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = 0;
+      info.writes = 0;
+      return &info;
     case ROP_get_arg:
       info.op = Q2_OP_GET_ARG;
       info.ndef = 1;
@@ -222,6 +246,9 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
 
     /* arithmetic, logic and comparison */
     /* "rbrr": d, sub, a, b; "rbr": d, sub, s; "rbrI": d, sub, a, imm */
+    case ROP_add: /* "rrr": d, a, b */
+    case ROP_sub:
+    case ROP_mul:
     case ROP_binary:
       info.op = Q2_OP_BINARY;
       info.ndef = 1;
@@ -232,12 +259,25 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
+    /* "rbrI": d, sub, a, imm; the short immediates are "rbri"/"rri", with the
+       source at operand 1 for the plain forms and operand 2 for "rbrI" */
     case ROP_binary_imm:
+    case ROP_binary_imm_s:
       info.op = Q2_OP_BINARY;
       info.ndef = 1;
       info.def[0] = 0;
       info.nuse = 1;
-      info.use[0] = 2;
+      info.use[0] = (rop == ROP_binary_imm) ? 2 : 2;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+      info.op = Q2_OP_BINARY;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 1; /* "rri": d, src, imm */
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
@@ -261,8 +301,41 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.writes = Q2_E_CONTROL;
       return &info;
 
+    case ROP_mul_add: /* "rrrrr": dm, x, y, da, c */
+    case ROP_mul_sub:
+    case ROP_add_mul:
+    case ROP_sub_mul:
+      info.op = Q2_OP_BINARY;
+      info.ndef = 2;
+      info.def[0] = 0;
+      info.def[1] = 3;
+      info.nuse = 3;
+      info.use[0] = 1;
+      info.use[1] = 2;
+      info.use[2] = 4;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_branch_null:
+    case ROP_branch_not_null: /* "rt": reg, target */
+      info.op = Q2_OP_BRANCH;
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish:
+      info.op = Q2_OP_BRANCH;
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+
     /* control flow */
     case ROP_branch:
+    case ROP_branch_s:
       info.op = Q2_OP_BRANCH;
       info.reads = 0;
       info.writes = 0;
@@ -276,6 +349,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.writes = Q2_E_CONTROL;
       return &info;
     case ROP_branch_cmp_reg_reg:
+    case ROP_branch_cmp_reg_reg_s:
       info.op = Q2_OP_BRANCH_CMP;
       info.nuse = 2;
       info.use[0] = 0;
@@ -298,7 +372,9 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
 
     /* properties */
     case ROP_get_field:
+    case ROP_get_field_own:
     case ROP_get_field2:
+    case ROP_get_field2_own:
       info.op = Q2_OP_GET_FIELD;
       info.ndef = 1;
       info.def[0] = 0;
@@ -315,9 +391,20 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = Q2_E_SLOT | Q2_E_SHAPE;
       info.writes = Q2_E_SLOT | Q2_E_SHAPE | Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
-    case ROP_get_element:       /* "rrr": d, object, key */
-    case ROP_get_length:        /* "rrs": d, object, site */
-      info.op = Q2_OP_FALLBACK; /* roles known, but no lowering yet */
+    case ROP_get_field_chain: /* "rrasrras": two own reads */
+    case ROP_get_field_chain_own:
+      info.op = Q2_OP_GET_FIELD;
+      info.ndef = 2;
+      info.def[0] = 0;
+      info.def[1] = 4;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = Q2_E_SLOT | Q2_E_SHAPE;
+      info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
+      return &info;
+    case ROP_get_element: /* "rrr": d, object, key */
+    case ROP_get_length:  /* "rrs": d, object, site */
+      info.op = Q2_OP_GET_ELEMENT;
       info.ndef = 1;
       info.def[0] = 0;
       info.nuse = 1;
@@ -703,6 +790,48 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
           for (n = 0; n < in2->win_n; n++) bits_set(use, in2->win_reg + n);
         }
         for (w = 0; w < words; w++) in[w] = use[w] | (in[w] & ~def[w]);
+        /* The live set just after each instruction, from which the frame
+           write-back set follows: a write-back needs the registers live before
+           the instruction, which is (live_after \ defs) | uses. */
+        if (!f->insn_live) {
+          f->insn_live =
+              calloc((size_t)f->ninsns * (size_t)words, sizeof(uint64_t));
+          if (!f->insn_live) {
+            f->why = "out of memory";
+            goto fail;
+          }
+        }
+        {
+          uint64_t *cur = bits_new(words);
+          int k2;
+          if (!cur) {
+            f->why = "out of memory";
+            goto fail;
+          }
+          memcpy(cur, out, (size_t)words * 8);
+          for (k2 = b->ninsns - 1; k2 >= 0; k2--) {
+            Q2Insn *in2 = &f->insns[b->first_insn + k2];
+            int m2;
+            memcpy(
+                f->insn_live + (size_t)(b->first_insn + k2) * words, cur,
+                (size_t)words * 8);
+            /* cur becomes live-before: drop what this instruction defines,
+               add what it uses. A fallback defines the whole live set. */
+            if (in2->op == Q2_OP_FALLBACK) {
+              memset(cur, 0, (size_t)words * 8);
+            } else {
+              for (m2 = 0; m2 < in2->ndef; m2++) {
+                int r = (int)in2->def[m2];
+                cur[r >> 6] &= ~(1ull << (r & 63));
+              }
+            }
+            for (m2 = 0; m2 < in2->nuse; m2++) {
+              int r = (int)in2->use[m2];
+              cur[r >> 6] |= 1ull << (r & 63);
+            }
+          }
+          free(cur);
+        }
         if (!bits_equal(in, f->live_in + (size_t)i * words, words)) {
           memcpy(f->live_in + (size_t)i * words, in, (size_t)words * 8);
           changed = 1;
@@ -762,6 +891,15 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       for (k = 0; k < blk->ninsns; k++) {
         Q2Insn *in2 = &f->insns[blk->first_insn + k];
         int m;
+        /* The value each register operand holds, before this instruction's own
+           definitions: what the lowering reads. */
+        for (m = 0; m < in2->narg; m++) {
+          in2->argval[m] = Q2_NO_VALUE;
+          if (in2->arg[m].kind == 'r') {
+            int r = q2_ri((int)in2->arg[m].val);
+            if (r >= 0 && r < f->nregs) in2->argval[m] = def_at[r];
+          }
+        }
         for (m = 0; m < in2->nuse; m++) {
           int r = (int)in2->use[m];
           if (def_at[r] == Q2_NO_VALUE) {
@@ -787,8 +925,20 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
           }
         }
         if (in2->op == Q2_OP_FALLBACK) {
-          /* redefine every register live after the instruction */
+          /* Redefine every register live after the instruction, and remember
+             which, so the lowering reloads exactly these from the frame. */
           uint64_t *lo = f->live_out + (size_t)b * words;
+          int nlive = 0;
+          for (m = 0; m < f->nregs; m++)
+            if (bits_test(lo, m)) nlive++;
+          if (nlive > 0) {
+            in2->redef_reg = malloc(sizeof(int32_t) * (size_t)nlive);
+            in2->redef_val = malloc(sizeof(Q2ValueId) * (size_t)nlive);
+            if (!in2->redef_reg || !in2->redef_val) {
+              f->why = "out of memory";
+              goto fail;
+            }
+          }
           for (m = 0; m < f->nregs; m++) {
             Q2ValueId v;
             if (!bits_test(lo, m)) continue;
@@ -802,6 +952,9 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             f->values[v].insn = blk->first_insn + k;
             f->values[v].type = Q2_T_ANY;
             f->values[v].rep = Q2_R_TAGGED;
+            in2->redef_reg[in2->nredef] = m;
+            in2->redef_val[in2->nredef] = v;
+            in2->nredef++;
             def_at[m] = v;
           }
           in2->ndef = 0;
@@ -926,12 +1079,17 @@ void q2_free(Q2Func *f) {
   free(f->blocks);
   if (f->insns) {
     int i;
-    for (i = 0; i < f->ninsns; i++) free(f->insns[i].win_val);
+    for (i = 0; i < f->ninsns; i++) {
+      free(f->insns[i].win_val);
+      free(f->insns[i].redef_reg);
+      free(f->insns[i].redef_val);
+    }
   }
   free(f->insns);
   free(f->values);
   free(f->live_in);
   free(f->live_out);
+  free(f->insn_live);
   free(f->reg_def);
   memset(f, 0, sizeof(*f));
 }

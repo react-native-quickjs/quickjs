@@ -44,6 +44,62 @@ int qjs_aot_site_alloc(void);
 int qjs_aot_site_new(void);
 
 /* A fresh deopt site, or -1 when not sweeping. */
+/* The ROPs with a native lowering. The IR verifier checks the classifier
+   against this, so a lowered op the IR calls a fallback is a build failure
+   rather than a wrong read. */
+int q2_lowered(uint16_t rop) {
+  switch (rop) {
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false:
+    case ROP_load_i8:
+    case ROP_load_i8_s:
+    case ROP_load_i32:
+    case ROP_move:
+    case ROP_move_s:
+    case ROP_move_xfer:
+    case ROP_get_local:
+    case ROP_put_local:
+    case ROP_put_local_xfer:
+    case ROP_get_arg:
+    case ROP_get_arg2:
+    case ROP_get_var_ref:
+    case ROP_load_this:
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul:
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+    case ROP_mul_add:
+    case ROP_mul_sub:
+    case ROP_add_mul:
+    case ROP_sub_mul:
+    case ROP_get_field:
+    case ROP_get_field_own:
+    case ROP_get_field_chain:
+    case ROP_get_field_chain_own:
+    case ROP_get_field2:
+    case ROP_get_field2_own:
+    case ROP_get_element:
+    case ROP_branch_null:
+    case ROP_branch_not_null:
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish:
+    case ROP_branch:
+    case ROP_branch_s:
+    case ROP_branch_if:
+    case ROP_branch_if_not:
+    case ROP_branch_cmp_reg_reg:
+    case ROP_branch_cmp_reg_reg_s:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 static int q2_site(void) {
   return qjs_aot_site_alloc();
 }
