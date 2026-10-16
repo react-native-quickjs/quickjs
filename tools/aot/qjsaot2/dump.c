@@ -19,7 +19,9 @@ static void dump_value(FILE *f, const Q2Func *fn, Q2ValueId v) {
     return;
   }
   fprintf(
-      f, "v%u(r%d:%s)", v, fn->values[v].reg, q2_rep_name(fn->values[v].rep));
+      f, "v%u(r%d:%s%s%s%s)", v, fn->values[v].reg,
+      q2_rep_name(fn->values[v].rep), fn->values[v].spec ? ",spec" : "",
+      fn->values[v].synced ? ",sync" : "", fn->values[v].ovf ? ",ovf" : "");
 }
 
 void q2_dump(FILE *f, const Q2Func *fn) {
@@ -58,7 +60,9 @@ void q2_dump(FILE *f, const Q2Func *fn) {
           f, "  %5d %-16s rop=%-4u def=", in->pc, q2_op_name(in->op), in->rop);
       if (in->ndef == 0) fputc('-', f);
       for (k = 0; k < in->ndef; k++)
-        fprintf(f, "%s%u", k ? "," : "", in->def[k]);
+        fprintf(
+            f, "%s%u(%s)", k ? "," : "", in->def[k],
+            q2_rep_name(fn->values[in->def[k]].rep));
       fputs(" use=", f);
       if (in->nuse == 0) fputc('-', f);
       for (k = 0; k < in->nuse; k++) {

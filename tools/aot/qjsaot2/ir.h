@@ -22,8 +22,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "quickjs-aot-gen.h"
 #include "prof.h"
+#include "quickjs-aot-gen.h"
 
 /* ---- representations ----------------------------------------------------- */
 enum {
@@ -138,6 +138,7 @@ typedef struct Q2Value {
   uint8_t spec;   /* a speculated load: needs a tag guard at its definition */
   uint8_t synced; /* the register slot holds this value boxed */
   uint8_t ovf;    /* an i32 arithmetic result needing an overflow/-0 guard */
+  uint8_t lbrep;  /* the inference's lattice result, before finalisation */
 } Q2Value;
 
 enum {
@@ -159,6 +160,8 @@ typedef struct Q2Arg {
 typedef struct Q2Insn {
   uint16_t rop;
   int8_t op;    /* Q2_OP_* */
+  int8_t sub;   /* REG_BIN_* of a binary/compare, -1 for none */
+  int8_t sub2;  /* REG_BIN_* of a fused op's second half, else -1 */
   int32_t pc;   /* instruction start in the register program */
   int32_t next; /* pc + size */
   int32_t narg;
@@ -219,7 +222,7 @@ typedef struct Q2Func {
   int32_t max_ctl;
   int32_t nparams_before; /* block parameters before trivial removal */
   int32_t entry_block;
-  int32_t exit_pc; /* the function's length */
+  int32_t exit_pc;    /* the function's length */
   const ProfPc *prof; /* the function's P records, sorted by pc, or NULL */
   int32_t nprof;
 } Q2Func;
@@ -229,6 +232,9 @@ int q2_build(const struct JSAotGenFunc *g, Q2Func *out);
 void q2_free(Q2Func *f);
 void q2_dump(FILE *f, const Q2Func *fn);
 
+/* Decide each value's representation from the profile (types.c). Fills rep,
+   spec, synced and ovf. Returns 0, or -1 on allocation failure. */
+int q2_infer(Q2Func *fn);
 /* Verify a built function: SSA dominance, edge arguments, representations and
    the effect table. Returns 0, or -1 with a message in msg. */
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len);

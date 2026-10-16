@@ -173,6 +173,15 @@ int main(int argc, char **argv) {
       fails++;
       continue;
     }
+    nfuncs_ok++;
+    nblocks += f.nblocks;
+    ninsns += f.ninsns;
+    nvalues += f.nvalues;
+    if (verify && q2_infer(&f) < 0) {
+      q2_free(&f);
+      fails++;
+      continue;
+    }
     if (verify && q2_verify(&f, msg, sizeof(msg)) < 0) {
       fprintf(
           stderr, "qjsaot2: %s: verify failed: %s\n",
@@ -181,11 +190,10 @@ int main(int argc, char **argv) {
       fails++;
       continue;
     }
-    nfuncs_ok++;
-    nblocks += f.nblocks;
-    ninsns += f.ninsns;
-    nvalues += f.nvalues;
-    if (dump) q2_dump(stdout, &f);
+    if (dump) {
+      q2_infer(&f);
+      q2_dump(stdout, &f);
+    }
     q2_free(&f);
   }
 
@@ -193,6 +201,10 @@ int main(int argc, char **argv) {
     long nfb = 0, nunk = 0, nparams = 0, nparams_before = 0;
     long ndefs = 0, nrec = 0, nrec_int = 0, nrec_float = 0, nrec_num = 0;
     long nrec_other = 0, nrec_none = 0, nprof_hit = 0;
+    long vrep[Q2_R_COUNT];
+    long nspec = 0, novf = 0, ntyped_param = 0, ntbin = 0, ntbin_typed = 0,
+         ntcmp = 0;
+    memset(vrep, 0, sizeof(vrep));
     long byrop[ROP_COUNT];
     int k2;
     memset(byrop, 0, sizeof(byrop));
@@ -205,31 +217,45 @@ int main(int argc, char **argv) {
         continue;
       if (q2_build(&funcs[i], &sf) < 0) continue;
       if (sf.prof) nprof_hit++;
+      if (q2_infer(&sf) < 0) {
+        q2_free(&sf);
+        continue;
+      }
       nparams_before += sf.nparams_before;
       for (k = 0; k < sf.nvalues; k++) {
         const Q2Value *v = &sf.values[k];
-        if (v->insn < 0) continue;
-        ndefs++;
-        if (!v->has_prof) {
-          nrec_none++;
-          continue;
+        if (v->insn >= 0) {
+          ndefs++;
+          if (!v->has_prof) {
+            nrec_none++;
+          } else {
+            nrec++;
+            if (v->ptypes == Q2_T_INT32)
+              nrec_int++;
+            else if (v->ptypes == Q2_T_NUM)
+              nrec_float++;
+            else if (v->ptypes == (Q2_T_INT32 | Q2_T_NUM))
+              nrec_num++;
+            else
+              nrec_other++;
+          }
         }
-        nrec++;
-        if (v->ptypes == Q2_T_INT32)
-          nrec_int++;
-        else if (v->ptypes == Q2_T_NUM)
-          nrec_float++;
-        else if (v->ptypes == (Q2_T_INT32 | Q2_T_NUM))
-          nrec_num++;
-        else
-          nrec_other++;
+        vrep[v->rep]++;
+        if (v->spec) nspec++;
+        if (v->ovf) novf++;
+        if (v->rep != Q2_R_TAGGED && v->insn < 0) ntyped_param++;
       }
       for (b = 0; b < sf.nblocks; b++) {
         nparams += sf.blocks[b].nparams;
-        (void)0;
         for (k = 0; k < sf.blocks[b].ninsns; k++) {
           const Q2Insn *in = &sf.insns[sf.blocks[b].first_insn + k];
-          if (in->op == Q2_OP_FALLBACK) {
+          if (in->op == Q2_OP_BINARY) {
+            ntbin++;
+            if (in->ndef > 0 && sf.values[in->def[0]].rep != Q2_R_TAGGED)
+              ntbin_typed++;
+          } else if (in->op == Q2_OP_COMPARE) {
+            ntcmp++;
+          } else if (in->op == Q2_OP_FALLBACK) {
             const Q2RopInfo *ri = q2_rop_info(in->rop);
             nfb++;
             if (ri->ndef == 0 && ri->nuse == 0) {
@@ -251,6 +277,15 @@ int main(int argc, char **argv) {
         "qjsaot2: defs %ld, records %ld (int %ld, float %ld, int|float "
         "%ld, other %ld), no record %ld\n",
         ndefs, nrec, nrec_int, nrec_float, nrec_num, nrec_other, nrec_none);
+    fprintf(
+        stderr,
+        "qjsaot2: reps tagged %ld, i32 %ld, f64 %ld, bool %ld; spec %ld, "
+        "ovf %ld, typed params %ld\n",
+        vrep[Q2_R_TAGGED], vrep[Q2_R_I32], vrep[Q2_R_F64], vrep[Q2_R_BOOL],
+        nspec, novf, ntyped_param);
+    fprintf(
+        stderr, "qjsaot2: binaries %ld (typed %ld), compares %ld\n", ntbin,
+        ntbin_typed, ntcmp);
     for (k2 = 0; k2 < ROP_COUNT; k2++)
       if (byrop[k2] > 0)
         fprintf(stderr, "qjsaot2:   unknown rop %d x%ld\n", k2, byrop[k2]);

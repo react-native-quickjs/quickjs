@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "ir.h"
+#include "quickjs-regvm.h"
 
 #define Q2_VERIFY_FAIL(...)                  \
   do {                                       \
@@ -115,6 +116,38 @@ static int q2_param_index(const Q2Block *b, Q2ValueId val) {
   return -1;
 }
 
+/* A typed binary's operands must all be typed: a tagged input would need a
+   guard this step does not emit, so the lowering falls back instead. The fused
+   family has two halves with different operand sets, so check each half. */
+static char q2_dbg_why[128];
+static int q2_in_types_ok(const Q2Func *f, const Q2Insn *in) {
+  int d, k;
+  int fused =
+      (in->rop == ROP_mul_add || in->rop == ROP_mul_sub ||
+       in->rop == ROP_add_mul || in->rop == ROP_sub_mul);
+  for (d = 0; d < in->ndef; d++) {
+    if (f->values[in->def[d]].rep == Q2_R_TAGGED) continue;
+    snprintf(
+        q2_dbg_why, sizeof(q2_dbg_why), "def v%u is %s", in->def[d],
+        q2_rep_name(f->values[in->def[d]].rep));
+    if (fused) {
+      if (d == 0) {
+        if (in->nuse < 2) return 0;
+        if (f->values[in->use[0]].rep == Q2_R_TAGGED) return 0;
+        if (f->values[in->use[1]].rep == Q2_R_TAGGED) return 0;
+      } else {
+        if (f->values[in->def[0]].rep == Q2_R_TAGGED) return 0;
+        if (in->nuse < 3) return 0;
+        if (f->values[in->use[2]].rep == Q2_R_TAGGED) return 0;
+      }
+    } else {
+      for (k = 0; k < in->nuse; k++)
+        if (f->values[in->use[k]].rep == Q2_R_TAGGED) return 0;
+    }
+  }
+  return 1;
+}
+
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
   Q2Verify v;
   int b, i, k;
@@ -156,6 +189,52 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
             in->pc, q2_op_name(in->op), q2_op_name(ri->op));
       }
 
+      /* The role table must agree with the decoded operands. After the build,
+         `def[]`/`use[]` hold value ids, so the check is by register: every
+         register operand of a classified operation is named (a def, a use or
+         the call window base). A hand-written table that drifts here used to
+         hide as a silent frame read in the lowering. */
+      if (in->op != Q2_OP_FALLBACK) {
+        int m;
+        for (m = 0; m < in->narg; m++) {
+          int named = 0, r;
+          if (in->arg[m].kind != 'r') continue;
+          r = (int)in->arg[m].val >> 4;
+          if (in->win_n > 0 && r >= in->win_reg && r < in->win_reg + in->win_n)
+            named = 1;
+          /* the window base register is the frame address the callee reads
+             from, even when the argument count is zero */
+          if (ri->window >= 1 && m == ri->window - 1) named = 1;
+          for (k = 0; !named && k < in->ndef; k++) {
+            Q2ValueId val = in->def[k];
+            if (val >= (Q2ValueId)f->nvalues)
+              Q2_VERIFY_FAIL("block %d pc %d: def out of range", b, in->pc);
+            if (f->values[val].reg == r) named = 1;
+          }
+          for (k = 0; !named && k < in->nuse; k++) {
+            Q2ValueId val = in->use[k];
+            if (val >= (Q2ValueId)f->nvalues)
+              Q2_VERIFY_FAIL("block %d pc %d: use out of range", b, in->pc);
+            if (f->values[val].reg == r) named = 1;
+          }
+          if (!named)
+            Q2_VERIFY_FAIL(
+                "block %d pc %d rop=%u: register operand %d (r%d) is not a "
+                "def, "
+                "a use or the window",
+                b, in->pc, in->rop, m, r);
+        }
+      }
+      if (ri->window >= 0) {
+        if (ri->window >= in->narg || ri->window < 1 ||
+            in->arg[ri->window].kind == 'r' ||
+            in->arg[ri->window - 1].kind != 'r')
+          Q2_VERIFY_FAIL(
+              "block %d pc %d: window operand %d is not a count after a "
+              "register",
+              b, in->pc, ri->window);
+      }
+
       for (k = 0; k < in->ndef; k++) {
         Q2ValueId val = in->def[k];
         if (val >= (Q2ValueId)f->nvalues)
@@ -166,7 +245,34 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
               "block %d pc %d: definition not owned here", b, in->pc);
         if (f->values[val].rep >= Q2_R_COUNT)
           Q2_VERIFY_FAIL("block %d pc %d: bad representation", b, in->pc);
+        /* A speculated load must have a record: speculation without a profile
+           is exactly what this step forbids. */
+        if (f->values[val].spec && !f->values[val].has_prof)
+          Q2_VERIFY_FAIL(
+              "block %d pc %d: a speculated load has no profile record", b,
+              in->pc);
+        /* A typed value must be producible by its instruction. */
+        if (f->values[val].rep != Q2_R_TAGGED) {
+          int ok = 0;
+          if (in->op == Q2_OP_CONST || in->op == Q2_OP_MOVE ||
+              in->op == Q2_OP_BINARY || in->op == Q2_OP_COMPARE ||
+              in->op == Q2_OP_GET_FIELD || in->op == Q2_OP_GET_ELEMENT ||
+              in->op == Q2_OP_GET_VAR_REF || in->op == Q2_OP_GET_ARG ||
+              in->op == Q2_OP_GET_ARG2 || in->op == Q2_OP_GET_LOCAL ||
+              in->op == Q2_OP_GET_GLOBAL || in->op == Q2_OP_CALL ||
+              (in->op == Q2_OP_FALLBACK && in->ndef > 0))
+            ok = 1;
+          if (!ok)
+            Q2_VERIFY_FAIL(
+                "block %d pc %d: a typed result from an untyped operation", b,
+                in->pc);
+        }
       }
+      /* A natively typed operation may not consume a tagged operand. */
+      if (in->op == Q2_OP_BINARY && !q2_in_types_ok(f, in))
+        Q2_VERIFY_FAIL(
+            "block %d pc %d: typed binary with a tagged input (%s)", b, in->pc,
+            q2_dbg_why);
       for (k = 0; k < in->nuse; k++) {
         Q2ValueId val = in->use[k];
         const Q2Value *pv;
@@ -201,6 +307,29 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
           Q2_VERIFY_FAIL(
               "edge %d->%d: argument %d is register %d, parameter wants %d", b,
               sb, k, f->values[val].reg, s->param_reg[k]);
+        /* The representation must convert: I32 -> F64 and typed -> tagged (by
+           boxing) are fine; tagged -> typed is not. */
+        if (f->values[s->param_val[k]].rep != Q2_R_TAGGED &&
+            f->values[val].rep == Q2_R_TAGGED)
+          Q2_VERIFY_FAIL(
+              "edge %d->%d: argument %d is tagged, parameter wants %s", b, sb,
+              k, q2_rep_name(f->values[s->param_val[k]].rep));
+        if (f->values[val].rep != Q2_R_TAGGED) {
+          int pr = f->values[s->param_val[k]].rep;
+          if (pr == Q2_R_TAGGED) {
+            /* boxing is fine */
+          } else if (pr == Q2_R_I32 && f->values[val].rep != Q2_R_I32) {
+            Q2_VERIFY_FAIL(
+                "edge %d->%d: argument %d is %s, parameter wants i32", b, sb, k,
+                q2_rep_name(f->values[val].rep));
+          } else if (pr == Q2_R_F64 && f->values[val].rep == Q2_R_BOOL) {
+            Q2_VERIFY_FAIL(
+                "edge %d->%d: argument %d is bool, parameter wants f64", b, sb,
+                k);
+          } else if (pr == Q2_R_BOOL && f->values[val].rep != Q2_R_BOOL) {
+            Q2_VERIFY_FAIL("edge %d->%d: argument %d is not bool", b, sb, k);
+          }
+        }
         /* The argument is either defined in the source block, one of its
            parameters, or a value whose definition dominates the source (which
            is what trivial-parameter removal produces). */

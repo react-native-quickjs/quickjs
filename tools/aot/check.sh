@@ -130,6 +130,18 @@ build_unit() {
     > /dev/null 2> "$u.census" || { warn "generator failed on $js"; return 1; }
   "$CC" -fsyntax-only $BASE -DQJS_REGVM=1 -DQJS_AOT=1 "$u.c" || {
     warn "emitted C does not parse: $u.c"; return 1; }
+  # A brace-less `if (...)` followed by a statement makes only that statement
+  # conditional. The lowering's leaves print a write-back then a return, so a
+  # brace-less guard would make the write-back conditional and the deopt
+  # unconditional. Flag an `if (...)` line whose next line does not open a
+  # block.
+  if awk '/^[[:space:]]*if \(.*\)[[:space:]]*$/ { n = NR; getline nxt;
+        if (nxt !~ /^[[:space:]]*\{/) { print n ": " $0; bad = 1 } }
+        END { exit bad ? 0 : 1 }' "$u.c" > "$u.braceif"; then
+    warn "emitted C has a brace-less if: $u.c"
+    head -3 "$u.braceif"
+    return 1
+  fi
   "$CC" -O2 $BASE -I"$WORK/units" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 \
     -c "$u.c" -o "$u.o" || return 1
   local o="$WORK/eng/$ENG_HASH/rt"

@@ -1060,7 +1060,7 @@
     },
     {
       "name": "0270-regvm-aot-deopt.patch",
-      "sha256": "0f17e5a75807c894076479aa1df30258f2d42b11a95f89213673880ba22bc0f8"
+      "sha256": "39d8c0f2312ff553ad26a6a9faa1e8de175b0c96de84fe6dc18265721da0dfd3"
     },
     {
       "name": "0271-regvm-aot-interrupt-poll.patch",
@@ -1172,7 +1172,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "a49a92e0d1a9df3b2c047a60695360658ffb877403e37c973ad93eeb22b77fbc",
+    "quickjs.c": "62cf0c1ae02c2dd4fef19f5a6feb48773a860af762f3b7d5dff65d0b4352a360",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -61115,6 +61115,7 @@ void js_aot_stats_dump(JSRuntime *rt)
     uint32_t cells_set = 0, disabled = 0;
     uint32_t i;
     char swbuf[64];
+    uint64_t sw = 0;
 
     if (r) {
         for (i = 0; i < r->cell_count; i++)
@@ -61133,13 +61134,16 @@ void js_aot_stats_dump(JSRuntime *rt)
         snprintf(swbuf, sizeof(swbuf), " sweep=%u/%u fired=%u",
                  reached, r->deopt_count, r->sweep_fires);
     }
+    for (i = 0; r && i < r->deopt_count; i++)
+        sw += r->deopt_hits[i];
     fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu "
-            "cells=%u/%u disabled=%u%s\n",
+            "cells=%u/%u disabled=%u deopts=%llu%s\n",
             present, count,
             (unsigned long long)js_aot_bound_count,
             (unsigned long long)js_aot_enter_count,
             (unsigned long long)rt->aot_epoch_bumps,
-            cells_set, r ? r->cell_count : 0u, disabled, swbuf);
+            cells_set, r ? r->cell_count : 0u, disabled,
+            (unsigned long long)sw, swbuf);
 }
 
 /* Stop using the unit for one function: drop the binding and recompute the

@@ -57,6 +57,117 @@ static int q2_ri(int off) {
   return off >> 4;
 }
 
+/* The REG_BIN_* sub-operation of a binary, compare or unary, or -1 when the
+   opcode does not carry one. The immediate-heavy ops fold the sub-op into the
+   opcode, so the table lists those explicitly. */
+static int q2_rop_sub(uint16_t rop, const Q2Insn *in) {
+  switch (rop) {
+    case ROP_binary:
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+    case ROP_compare:
+    case ROP_unary:
+      /* operand 1 is the 'b' sub-op byte */
+      if (in->narg > 1 && in->arg[1].kind == 'b') return (int)in->arg[1].val;
+      return -1;
+    case ROP_branch_cmp_reg_reg:
+    case ROP_branch_cmp_reg_reg_s:
+      if (in->narg > 0 && in->arg[0].kind == 'b') return (int)in->arg[0].val;
+      return -1;
+    case ROP_neg:
+      return REG_UN_NEG;
+    case ROP_inc:
+      return REG_UN_INC;
+    case ROP_add:
+      return REG_BIN_ADD;
+    case ROP_sub:
+      return REG_BIN_SUB;
+    case ROP_mul:
+      return REG_BIN_MUL;
+    case ROP_div:
+      return REG_BIN_DIV;
+    case ROP_mod:
+      return REG_BIN_MOD;
+    case ROP_pow:
+      return REG_BIN_POW;
+    case ROP_bitand:
+      return REG_BIN_AND;
+    case ROP_bitor:
+      return REG_BIN_OR;
+    case ROP_bitxor:
+      return REG_BIN_XOR;
+    case ROP_shl:
+      return REG_BIN_SHL;
+    case ROP_sar:
+      return REG_BIN_SAR;
+    case ROP_shr:
+      return REG_BIN_SHR;
+    case ROP_lt:
+      return REG_BIN_LT;
+    case ROP_lte:
+      return REG_BIN_LTE;
+    case ROP_gt:
+      return REG_BIN_GT;
+    case ROP_gte:
+      return REG_BIN_GTE;
+    case ROP_eq:
+      return REG_BIN_EQ;
+    case ROP_neq:
+      return REG_BIN_NEQ;
+    case ROP_strict_eq:
+      return REG_BIN_STRICT_EQ;
+    case ROP_strict_neq:
+      return REG_BIN_STRICT_NEQ;
+    case ROP_add_imm_s:
+    case ROP_add_imm_self_s:
+    case ROP_add_imm_self_branch:
+    case ROP_add_imm_self_branch_s:
+      return REG_BIN_ADD;
+    case ROP_sub_imm_s:
+    case ROP_sub_imm_self_s:
+      return REG_BIN_SUB;
+    case ROP_branch_lt_s:
+      return REG_BIN_LT;
+    case ROP_branch_nlt_s:
+      return REG_BIN_LT | REG_CMP_INVERT;
+    case ROP_branch_lte_s:
+      return REG_BIN_LTE;
+    case ROP_branch_nlte_s:
+      return REG_BIN_LTE | REG_CMP_INVERT;
+    case ROP_branch_gt_s:
+      return REG_BIN_GT;
+    case ROP_branch_ngt_s:
+      return REG_BIN_GT | REG_CMP_INVERT;
+    case ROP_branch_gte_s:
+      return REG_BIN_GTE;
+    case ROP_branch_ngte_s:
+      return REG_BIN_GTE | REG_CMP_INVERT;
+    case ROP_branch_eq_s:
+      return REG_BIN_EQ;
+    case ROP_branch_neq_s:
+      return REG_BIN_NEQ;
+    case ROP_inc_branch_lt:
+    case ROP_inc_branch_lt_s:
+      return REG_BIN_LT;
+    default:
+      return -1;
+  }
+}
+
+/* The second half of a fused operation, else -1. */
+static int q2_rop_sub2(uint16_t rop) {
+  switch (rop) {
+    case ROP_mul_add:
+    case ROP_add_mul:
+      return REG_BIN_ADD;
+    case ROP_mul_sub:
+    case ROP_sub_mul:
+      return REG_BIN_SUB;
+    default:
+      return -1;
+  }
+}
+
 /* ---- names --------------------------------------------------------------- */
 const char *q2_rep_name(int rep) {
   switch (rep) {
@@ -278,7 +389,16 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_add: /* "rrr": d, a, b */
     case ROP_sub:
     case ROP_mul:
-    case ROP_binary:
+      info.op = Q2_OP_BINARY;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 2;
+      info.use[0] = 1;
+      info.use[1] = 2;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_binary: /* "rbrr": d, sub, a, b */
       info.op = Q2_OP_BINARY;
       info.ndef = 1;
       info.def[0] = 0;
@@ -381,8 +501,8 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_branch_cmp_reg_reg_s:
       info.op = Q2_OP_BRANCH_CMP;
       info.nuse = 2;
-      info.use[0] = 0;
-      info.use[1] = 1;
+      info.use[0] = 1;
+      info.use[1] = 2;
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
@@ -446,14 +566,14 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_shr:
     case ROP_mod:
     case ROP_pow:
-    case ROP_eq:
-    case ROP_neq:
-    case ROP_strict_eq:
-    case ROP_strict_neq:
     case ROP_lt:
     case ROP_lte:
     case ROP_gt:
     case ROP_gte:
+    case ROP_eq:
+    case ROP_neq:
+    case ROP_strict_eq:
+    case ROP_strict_neq:
     case ROP_instanceof:
     case ROP_in:
       info.op = Q2_OP_FALLBACK;
@@ -570,7 +690,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.nuse = 2;
       info.use[0] = 1;
       info.use[1] = 2;
-      info.window = 3;
+      info.window = 4;
       info.reads = 0;
       info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
                     Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
@@ -632,8 +752,9 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.op = Q2_OP_GET_ELEMENT;
       info.ndef = 1;
       info.def[0] = 0;
-      info.nuse = 1;
+      info.nuse = rop == ROP_get_element ? 2 : 1;
       info.use[0] = 1;
+      info.use[1] = 2;
       info.reads = Q2_E_ELEMENTS | Q2_E_SLOT;
       info.writes = Q2_E_ELEMENTS | Q2_E_SHAPE | Q2_E_CONTROL;
       return &info;
@@ -655,7 +776,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.def[0] = 0;
       info.nuse = 1;
       info.use[0] = 1;
-      info.window = 2;
+      info.window = 3;
       info.reads = 0;
       info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
                     Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
@@ -667,7 +788,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.nuse = 2;
       info.use[0] = 1;
       info.use[1] = 2;
-      info.window = 3;
+      info.window = 4;
       info.reads = 0;
       info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
                     Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
@@ -755,6 +876,18 @@ static int q2_ends_control(uint16_t rop) {
   }
 }
 
+/* Whether a branch ROP can fall through. An unconditional `branch` cannot;
+   the compare-branches and the `branch_if`/`branch_null*` family can. */
+static int q2_branch_is_conditional(uint16_t rop) {
+  switch (rop) {
+    case ROP_branch:
+    case ROP_branch_s:
+      return 0;
+    default:
+      return 1;
+  }
+}
+
 static int q2_has_target(const Q2Insn *in) {
   int n;
   for (n = 0; n < in->narg; n++)
@@ -799,22 +932,25 @@ static int q2_prune_params(Q2Func *f) {
         int consistent = 1, e;
         for (e = 0; e < blk->npreds; e++) {
           Q2Block *pr = &f->blocks[blk->preds[e]];
-          int n, si = -1;
+          int n;
           Q2ValueId av;
-          for (n = 0; n < pr->nsucc; n++)
-            if (pr->succ_block[n] == b) {
-              si = n;
+          for (n = 0; n < pr->nsucc; n++) {
+            int si = n;
+            if (pr->succ_block[si] != b) continue;
+            if (p >= pr->nedge_args[si]) {
+              consistent = 0;
               break;
             }
-          if (si < 0 || p >= pr->nedge_args[si]) continue;
-          av = q2_find(repl, pr->edge_arg[si][p]);
-          if (av == pv) continue; /* this edge passes the parameter itself */
-          if (common == Q2_NO_VALUE)
-            common = av;
-          else if (q2_find(repl, common) != av) {
-            consistent = 0;
-            break;
+            av = q2_find(repl, pr->edge_arg[si][p]);
+            if (av == pv) continue; /* this edge passes the parameter itself */
+            if (common == Q2_NO_VALUE)
+              common = av;
+            else if (q2_find(repl, common) != av) {
+              consistent = 0;
+              break;
+            }
           }
+          if (!consistent) break;
         }
         if (consistent && common != Q2_NO_VALUE) {
           repl[pv] = common;
@@ -917,6 +1053,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     }
     ri = q2_rop_info(in->rop);
     in->op = (int8_t)ri->op;
+    in->sub = q2_rop_sub(in->rop, in);
+    in->sub2 = q2_rop_sub2(in->rop);
     for (n = 0; n < ri->ndef && n < 2; n++) {
       int idx = ri->def[n];
       if (idx < in->narg && in->arg[idx].kind == 'r')
@@ -1070,6 +1208,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     if (last->op == Q2_OP_RETURN || last->op == Q2_OP_RETURN_UNDEF) {
       b->nsucc = 0;
     } else if (last->op == Q2_OP_BRANCH || last->op == Q2_OP_BRANCH_CMP) {
+      int is_cmp = (last->op == Q2_OP_BRANCH_CMP);
       for (n = 0; n < last->narg; n++) {
         int32_t tgt;
         if (last->arg[n].kind != 't') continue;
@@ -1080,9 +1219,14 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
         b->nsucc++;
         break;
       }
-      b->succ_pc[b->nsucc] = last->next;
-      b->succ_block[b->nsucc] = pc_to_block[last->next];
-      b->nsucc++;
+      /* Only a *conditional* branch has a fall-through. An unconditional
+         `branch` transfers, so its fall-through is dead and its edge (which
+         could carry a parameter) must not be required. */
+      if (is_cmp || q2_branch_is_conditional(last->rop)) {
+        b->succ_pc[b->nsucc] = last->next;
+        b->succ_block[b->nsucc] = pc_to_block[last->next];
+        b->nsucc++;
+      }
     } else if (q2_ends_control(last->rop)) {
       b->nsucc = 0;
     } else if (
@@ -1130,6 +1274,25 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
           b->succ_block[n] < f->nblocks ? &f->blocks[b->succ_block[n]] : NULL;
       if (s) s->preds[s->npreds++] = i;
     }
+  }
+
+  /* A predecessor with two successors that are the same block (a conditional
+     branch whose target is its fall-through) appears once: pruning walks a
+     predecessor's successor slots directly, so a duplicate entry would remove
+     a parameter's argument twice. */
+  for (i = 0; i < f->nblocks; i++) {
+    Q2Block *b = &f->blocks[i];
+    int x, y, w = 0;
+    for (x = 0; x < b->npreds; x++) {
+      int dup = 0;
+      for (y = 0; y < w; y++)
+        if (b->preds[y] == b->preds[x]) {
+          dup = 1;
+          break;
+        }
+      if (!dup) b->preds[w++] = b->preds[x];
+    }
+    b->npreds = w;
   }
 
   /* 4. liveness over the whole register file, one backward walk per block, so
@@ -1326,6 +1489,26 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             f->values[v].insn = blk->first_insn + k;
             if (in2->op == Q2_OP_CONST) {
               f->values[v].type = q2_const_type(in2->rop);
+              switch (in2->rop) {
+                case ROP_load_i8:
+                case ROP_load_i8_s:
+                case ROP_load_i32:
+                  f->values[v].con_kind = Q2_CON_INT;
+                  break;
+                case ROP_load_true:
+                case ROP_load_false:
+                  f->values[v].con_kind = Q2_CON_TRUE;
+                  break;
+                case ROP_load_null:
+                  f->values[v].con_kind = Q2_CON_NULL;
+                  break;
+                case ROP_load_undefined:
+                  f->values[v].con_kind = Q2_CON_UNDEF;
+                  break;
+                default:
+                  f->values[v].con_kind = Q2_CON_UNDEF;
+                  break;
+              }
             } else if (
                 in2->op == Q2_OP_BINARY || in2->op == Q2_OP_UNARY ||
                 in2->op == Q2_OP_COMPARE) {
@@ -1374,7 +1557,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
   }
 
   /* 5b. drop the block parameters that are the same value on every edge */
-  if (!getenv("Q2_NO_PRUNE") && q2_prune_params(f) < 0) {
+  if (q2_prune_params(f) < 0) {
     f->why = "out of memory";
     goto fail;
   }
