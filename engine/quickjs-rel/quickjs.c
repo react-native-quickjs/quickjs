@@ -8130,17 +8130,6 @@ static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
     }
     js_free_rt(rt, b->regvm_pic);
     b->regvm_pic = NULL;
-#if QJS_AOT || QJS_AOT_GEN
-    if (b->aot_poly != NULL) {
-        uint32_t i, n = b->aot_poly_sites * AOT_POLY_WAYS;
-        for (i = 0; i < n; i++)
-            if (b->aot_poly[i].shape != NULL)
-                js_free_shape(rt, b->aot_poly[i].shape);
-        js_free_rt(rt, b->aot_poly);
-        b->aot_poly = NULL;
-        b->aot_poly_sites = 0;
-    }
-#endif
     b->regvm_light_fast = b->regvm_light && b->regvm_pic_count == 0;
     js_free_rt(rt, b->regvm_pic_holder);
     b->regvm_pic_holder = NULL;
@@ -61358,10 +61347,13 @@ static int js_aot_poly_lookup(JSObject *obj, JSAtom atom, int write, uint32_t *o
     prs = find_own_property(&pr, obj, atom);
     if (prs == NULL)
         return 0;
+    /* A getter/setter, a closure variable or an auto-init property stores
+       something that is not a JSValue in the same slot; reading it as one
+       would produce a value the engine never made. */
+    if (prs->flags & JS_PROP_TMASK)
+        return 0;
     if (write) {
         if (!(prs->flags & JS_PROP_WRITABLE))
-            return 0;
-        if (!(prs->flags & JS_PROP_CONFIGURABLE) && !(prs->flags & JS_PROP_WRITABLE))
             return 0;
         if (obj->is_prototype)
             return 0;
@@ -61389,16 +61381,21 @@ int qjs_aot_poly_fill(
     if (!js_aot_poly_lookup(JS_VALUE_GET_OBJ(obj), atom, write, &off2))
         return 0;
     if (b->aot_poly == NULL || (uint32_t)site >= b->aot_poly_sites) {
+        /* Grow to cover `site`, carrying the existing entries (and the shape
+           references they own) across. */
         uint32_t n = (uint32_t)site + 8, i;
         JSAotPolyEntry *ne =
             js_mallocz_rt(ctx->rt, sizeof(JSAotPolyEntry) * n * AOT_POLY_WAYS);
         if (ne == NULL)
             return 0;
-        for (i = 0; i < b->aot_poly_sites * AOT_POLY_WAYS; i++) {
-            ne[i] = b->aot_poly[i];
-            b->aot_poly[i].shape = NULL;
+        /* Move the entries, references and all: the old block is freed with
+           js_free_rt, which does not release shapes, so the copies must own
+           them and the originals must not be released either. */
+        if (b->aot_poly != NULL) {
+            uint32_t old_n = b->aot_poly_sites * AOT_POLY_WAYS;
+            for (i = 0; i < old_n; i++) ne[i] = b->aot_poly[i];
+            js_free_rt(ctx->rt, b->aot_poly);
         }
-        js_free_rt(ctx->rt, b->aot_poly);
         b->aot_poly = ne;
         b->aot_poly_sites = n;
     }
@@ -61411,7 +61408,10 @@ int qjs_aot_poly_fill(
             *off = off2;
             return 1;
         }
-        if (slot < 0 || (e[k].shape == NULL && e[slot].shape != NULL))
+        /* Prefer an empty way; among full ones, the oldest fill stamp. */
+        if (slot < 0)
+            slot = k;
+        else if (e[slot].shape != NULL && e[k].shape == NULL)
             slot = k;
         else if (e[slot].shape != NULL && e[k].shape != NULL &&
                  e[k].fill < e[slot].fill)
@@ -73324,6 +73324,20 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 #if QJS_REGVM
     /* release register-PIC-held shape refs and free the table */
     js_free_regvm_pic(rt, b);
+#if QJS_AOT || QJS_AOT_GEN
+    /* The polymorphic property cache is independent of the register PIC, so it
+       is released here rather than in js_free_regvm_pic, which returns early
+       when a function has no PIC at all. */
+    if (b->aot_poly != NULL) {
+        uint32_t pi, pn = b->aot_poly_sites * AOT_POLY_WAYS;
+        for (pi = 0; pi < pn; pi++)
+            if (b->aot_poly[pi].shape != NULL)
+                js_free_shape(rt, b->aot_poly[pi].shape);
+        js_free_rt(rt, b->aot_poly);
+        b->aot_poly = NULL;
+        b->aot_poly_sites = 0;
+    }
+#endif
     js_free_rt(rt, b->regvm_fill);
     b->regvm_fill = NULL;
 #endif

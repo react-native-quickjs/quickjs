@@ -1188,7 +1188,7 @@
     },
     {
       "name": "0302-aot-poly-cache.patch",
-      "sha256": "e9168e8eb642b23b852bec0be21a42e7fcc249860355d5e97530893629159090"
+      "sha256": "237bd871b8b1d019bc9c4bb49dccaee70bd698b321a90a870c263fd81f70eca8"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1196,7 +1196,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "9c2a525fe8b093e50e88dedeeb1bbe8a8ee3bef9fa9fa8f82936960188a1b9b8",
+    "quickjs.c": "f77d518f8ed88fa1ab6e5f16a27d0403dd6466ff5c4c943c9b67e7bf4edcd165",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
