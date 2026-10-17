@@ -1,8 +1,8 @@
 Subject: Add a per-site polymorphic property cache to a compiled function
 
 What this does
-  Gives JSFunctionBytecode an on-demand table of four (shape, offset, kind)
-  entries per property site, filled from compiled code by qjs_aot_poly_fill.
+  Gives JSFunctionBytecode a table of four (shape, offset, kind) entries per
+  property site, filled from compiled code by qjs_aot_poly_fill.
 
 Why we need it
   A property site the profile saw with 2-4 shapes cannot use the single
@@ -18,6 +18,10 @@ The table is allocated when the function binds to its compiled entry and
 released with the bytecode, so filling a site from compiled code never
 allocates: an allocation there would be a safepoint mid-instruction, and
 the compiled frame is not prepared for one.
+
+The entries hold weak shape pointers. Each hit is a compare against a live
+object's shape, so a stale entry can only miss, never match: no reference
+is taken and none has to be released.
 
 Bytecode version
   No.

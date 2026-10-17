@@ -1188,7 +1188,7 @@
     },
     {
       "name": "0302-aot-poly-cache.patch",
-      "sha256": "66c030d1919a25b4f4ee2c5a874514837cf70d05d40421914c5f780a3450af04"
+      "sha256": "a9384526387d6b31500b1b1f3c3660fe5dd7714596bd39d82b629cfc7686a041"
     },
     {
       "name": "9999-bc-version-bump.patch",

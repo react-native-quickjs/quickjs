@@ -229,6 +229,11 @@ typedef struct Q2Emit {
   int32_t *fact_val, *fact_grp;
   uint64_t *fact_in, *fact_out, *fact_scratch;
   uint64_t *fact_cur; /* the facts true at the instruction being emitted */
+  /* Per value: the polymorphic way its shape matched in this block, or -1.
+     A later poly site on the same receiver tries that way first, which is the
+     "one shape check per object" the monomorphic groups get, for the
+     polymorphic case. Cleared at a block start and by a call. */
+  int8_t *poly_way;
   /* While a frame store or an exit stub is being printed. A value that reaches
      the frame must be canonical, because the interpreter and the engine's
      helpers read frame slots; a value that stays in a C local need not be. */
@@ -2406,17 +2411,33 @@ static int q2_emit_native(
              JavaScript, so the chain keeps the function compiled; a property
              that is not own data exits instead. */
           int k = g_em.next_poly++;
+          Q2ValueId rcv = in->argval[1];
+          /* The receiver's known way, if a previous poly site matched it in
+             this block, else -1. */
+          fprintf(
+              f, "    _pw = %d;\n",
+              (g_em.poly_way && rcv != Q2_NO_VALUE && rcv < (Q2ValueId)fn->nvalues)
+                  ? g_em.poly_way[rcv]
+                  : -1);
           fprintf(
               f,
               "    _pe = q2_poly(f, %d);\n"
               "    _psh = q2_shape_of(%s);\n"
               "    if (__builtin_expect(_pe == NULL || _psh == NULL, 0)) "
               "{ goto pfill%d; }\n"
-              "    if (q2_poly_shape(_pe, 0) == _psh) _po = q2_poly_off(_pe, 0);\n"
+              /* A receiver already matched here tries its known way first. */
+              "    if (_pw >= 0 && q2_poly_shape(_pe, _pw) == _psh) _po = "
+              "q2_poly_off(_pe, _pw);\n"
+              "    else if (q2_poly_shape(_pe, 0) == _psh) _po = q2_poly_off(_pe, 0);\n"
               "    else if (q2_poly_shape(_pe, 1) == _psh) _po = q2_poly_off(_pe, 1);\n"
               "    else if (q2_poly_shape(_pe, 2) == _psh) _po = q2_poly_off(_pe, 2);\n"
               "    else if (q2_poly_shape(_pe, 3) == _psh) _po = q2_poly_off(_pe, 3);\n"
               "    else { goto pfill%d; }\n"
+              /* Remember the way for the rest of the block, so the next site
+                 on this receiver checks one entry, not four. */
+              "    _pw = q2_poly_shape(_pe, 0) == _psh ? 0\n"
+              "        : q2_poly_shape(_pe, 1) == _psh ? 1\n"
+              "        : q2_poly_shape(_pe, 2) == _psh ? 2 : 3;\n"
               "    goto pdone%d;\n"
               "pfill%d: {\n",
               site, a, k, k, k, k);
@@ -3103,6 +3124,8 @@ static void q2_emit_block(FILE *f, const Q2Func *fn, int b) {
         (size_t)g_em.fact_words * 8);
   else if (g_em.fact_cur && g_em.fact_words > 0)
     memset(g_em.fact_cur, 0, (size_t)g_em.fact_words * 8);
+  if (g_em.poly_way && fn->nvalues > 0)
+    memset(g_em.poly_way, 0xff, (size_t)fn->nvalues);
   /* The frame cache survives into a block only when that block has exactly
      one predecessor and it is the block just emitted, i.e. a plain
      fall-through. Any other entry (a branch target, a loop header) can be
@@ -3144,8 +3167,11 @@ static void q2_emit_block(FILE *f, const Q2Func *fn, int b) {
     /* A call or a step can replace every shape a fact is about. */
     if (g_em.fact_cur && g_em.fact_words > 0 &&
         (in->rop == ROP_call || in->rop == ROP_call_method ||
-         in->rop == ROP_throw || in->op == Q2_OP_FALLBACK))
+         in->rop == ROP_throw || in->op == Q2_OP_FALLBACK)) {
       memset(g_em.fact_cur, 0, (size_t)g_em.fact_words * 8);
+      if (g_em.poly_way && fn->nvalues > 0)
+        memset(g_em.poly_way, 0xff, (size_t)fn->nvalues);
+    }
     if (q2_emit_native(f, fn, b, in) != 0) {
       /* lowered */
     } else if (q2_emit_call_special(f, fn, b, in)) {
@@ -3744,6 +3770,9 @@ static void q2_emit_one(
   if (spec) {
     q2_groups(fn);
     q2_facts_build(fn);
+    g_em.poly_way = malloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1));
+    if (g_em.poly_way)
+      memset(g_em.poly_way, 0xff, (size_t)(fn->nvalues > 0 ? fn->nvalues : 1));
     g_em.fact_cur = calloc(
         (size_t)(g_em.fact_words > 0 ? g_em.fact_words : 1), sizeof(uint64_t));
   }
@@ -3785,7 +3814,7 @@ static void q2_emit_one(
      before the next instruction starts, so one set serves them all. */
   fprintf(
       f,
-      "    const void *_pe; uint32_t _po; const void *_psh;\n");
+      "    const void *_pe; uint32_t _po; int _pw; const void *_psh;\n");
   fprintf(f, "    JSValue *vb = q2_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = q2_arg_buf(f);\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n");
