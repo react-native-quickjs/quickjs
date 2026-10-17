@@ -212,6 +212,9 @@ typedef struct Q2Emit {
      have been at the arm's start, so collect them before switching streams. */
   Q2Cold *colds;
   int ncolds, capcolds;
+  /* The specialised emission (T1.4+): misses exit instead of taking a slow
+     arm, and the facts the profile established are available. */
+  int spec;
   /* While an arm is being emitted: the stream it writes to, and the number of
      arms already finished (its label is that index). */
   FILE *cold_stream;
@@ -3317,11 +3320,16 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
   return ok;
 }
 
-static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
+/* One emission: `name` is the C function to define (`aot_g_<hex>` or, later,
+   the specialised body), and `spec` selects the specialised rules. Everything
+   it collects (exits, cold arms) is per emission. */
+static void q2_emit_one(
+    FILE *f, const Q2Func *fn, char hex[33], const char *name, int spec) {
   int b, i, j;
 
   memset(&g_em, 0, sizeof(g_em));
   g_em.fn = fn;
+  g_em.spec = spec;
   g_em.liveb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
   if (g_em.fb)
@@ -3339,14 +3347,12 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (who[k] == '*' || who[k] == '\n') who[k] = '_';
     fprintf(f, "/* %s */\n", who);
   }
-  /* The generic body is `aot_g_`; `aot_f_` is the entry the table names, and
-     it is where the specialised body will live. */
   fprintf(
       f,
-      "static JSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n"
+      "static JSValue %s_%s(JSContext *ctx, JSRegRun *f,\n"
       "                                 JSValue *fr, uint32_t entry_pc)\n"
       "{\n",
-      hex);
+      name, hex);
   fprintf(f, "    uint8_t *code = q2_code(f);\n");
   fprintf(f, "    uint8_t *ip;\n    uint32_t pc = 0;\n");
   /* The compare result: written by a hot path and, when its slow arm is out of
@@ -3475,19 +3481,6 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       f,
       "        return qjs_aot_deopt(ctx, f, fr, rp, QJS_AOT_NO_SITE);\n"
       "    }\n}\n\n");
-  /* The entry: this builds, it only forwards. The switch and the specialised
-     body come next; keeping the name stable now means the table, the leaf
-     checks and the call sites never have to move again. */
-  fprintf(
-      f,
-      "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
-      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
-      "                                 JSValue *fr, uint32_t entry_pc)\n"
-      "{\n"
-      "    (void)q2_spec_off_%s; (void)q2_spec_fail_%s;\n"
-      "    return aot_g_%s(ctx, f, fr, entry_pc);\n"
-      "}\n\n",
-      hex, hex, hex, hex, hex, hex);
   free(g_em.liveb);
   g_em.liveb = NULL;
   free(g_em.fb);
@@ -3516,6 +3509,26 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   free(g_em.colds);
   g_em.colds = NULL;
   g_em.ncolds = g_em.capcolds = 0;
+}
+
+/* A function's two bodies. `aot_g_` is today's emitter, the one every fact
+   still holds for; `aot_f_` is the entry the table names. Until the
+   specialised emission exists it only forwards, governed by the A/B switch and
+   by the exit-rate trip. */
+static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
+  q2_emit_one(f, fn, hex, "aot_g", 0);
+  fprintf(
+      f,
+      "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
+      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "                                 JSValue *fr, uint32_t entry_pc)\n"
+      "{\n"
+      "    (void)q2_spec_fail_%s;\n"
+      "    if (q2_no_spec || q2_spec_off_%s) return aot_g_%s(ctx, f, fr, "
+      "entry_pc);\n"
+      "    return aot_g_%s(ctx, f, fr, entry_pc);\n"
+      "}\n\n",
+      hex, hex, hex, hex, hex, hex, hex);
 }
 
 
