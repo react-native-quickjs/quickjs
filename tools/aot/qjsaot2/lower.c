@@ -54,6 +54,12 @@ int qjs_aot_check_locals(void);
    *kind (1 bytecode, 2 C), *cproto and the callee digest hex, or 0. */
 int qjs_aot_prof_call(const uint8_t dg[16], int pc, int *kind, int *cproto,
                       char hex[33]);
+/* The shapes one property site saw (its `S` record): 1 and up to four shapes,
+   or 0 when the site has no record. Values are profile addresses. */
+int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes,
+                      uint64_t shapes[4]);
+/* Whether the profiler never executed the instruction at `pc`. */
+int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
 /* Whether the digest's body is emitted in this unit, so a call to it can be a
    direct call rather than a fresh interpreter activation. */
 int qjs_aot_unit_has(const char hex[33]);

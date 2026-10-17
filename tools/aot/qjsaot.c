@@ -154,6 +154,21 @@ typedef struct {
    the same one record shared by the two destinations of a fused op. Its shape
    lives in qjsaot2/prof.h so the IR reads the same struct. */
 
+/* An `S` record: the shapes one property site's inline cache saw. Shape values
+   are addresses from the profiling process; they only say "the same shape as
+   another site in this profile", never a runtime address. */
+#define PROF_MAX_SHAPES 4
+typedef struct {
+  int site;
+  int nshapes;
+  uint64_t shape[PROF_MAX_SHAPES];
+} ProfSite;
+
+/* A `U` record: a pc range the profiler never saw executed, inclusive. */
+typedef struct {
+  int lo, hi;
+} ProfUnused;
+
 typedef struct {
   uint8_t digest[16];
   unsigned long long ops;
@@ -165,6 +180,10 @@ typedef struct {
   int ncalls, capcalls;
   ProfPc *pcs;
   int npcs, cappcs;
+  ProfSite *sites;
+  int nsites, capsites;
+  ProfUnused *unused;
+  int nunused, capunused;
 } ProfEntry;
 
 /* The parsed profile (for call-site specialisation) and the current function's
@@ -381,7 +400,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
     uint8_t dg[16];
     ProfEntry *e;
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
-         line[0] != 'P') ||
+         line[0] != 'P' && line[0] != 'S' && line[0] != 'U') ||
         line[1] != ' ')
       continue;
     if (hex_to_bytes16(line + 2, dg) < 0) continue;
@@ -504,6 +523,68 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
             if (nmax > e->pcs[k].num_max) e->pcs[k].num_max = nmax;
           }
           e->pcs[k].has_num = 1;
+        }
+      }
+    } else if (line[0] == 'S') {
+      /* S <hex> site=<k> count=<n> src=.. shapes=<m> shape0=0x.. hits=..
+         [shape1=..]. The shapes are process addresses; only equality across
+         sites of the same profile is meaningful. */
+      char *p = strstr(line + 2, "site=");
+      char *q = strstr(line + 2, "shapes=");
+      if (p && q) {
+        int site = (int)strtol(p + 5, NULL, 10);
+        int nshapes = (int)strtol(q + 7, NULL, 10);
+        ProfSite *ps = NULL;
+        int j, k;
+        if (nshapes > PROF_MAX_SHAPES) nshapes = PROF_MAX_SHAPES;
+        if (nshapes < 0) nshapes = 0;
+        for (j = 0; j < e->nsites; j++)
+          if (e->sites[j].site == site) {
+            ps = &e->sites[j];
+            break;
+          }
+        if (!ps) {
+          if (e->nsites == e->capsites) {
+            ProfSite *ns;
+            e->capsites = e->capsites ? e->capsites * 2 : 16;
+            ns = realloc(e->sites, sizeof(*ns) * (size_t)e->capsites);
+            if (!ns) return NULL;
+            e->sites = ns;
+          }
+          ps = &e->sites[e->nsites++];
+          memset(ps, 0, sizeof(*ps));
+          ps->site = site;
+        }
+        for (k = 0; k < nshapes; k++) {
+          char key[24];
+          char *s;
+          uint64_t sh;
+          snprintf(key, sizeof(key), "shape%d=", k);
+          s = strstr(line + 2, key);
+          if (!s) continue;
+          sh = strtoull(s + strlen(key), NULL, 16);
+          for (j = 0; j < ps->nshapes; j++)
+            if (ps->shape[j] == sh) break;
+          if (j < ps->nshapes) continue;
+          if (ps->nshapes < PROF_MAX_SHAPES) ps->shape[ps->nshapes++] = sh;
+        }
+      }
+    } else if (line[0] == 'U') {
+      /* U <hex> pc=<a>..<b>: a range the profiler never executed. */
+      char *p = strstr(line + 2, "pc=");
+      if (p) {
+        int lo = 0, hi = 0;
+        if (sscanf(p + 3, "%d..%d", &lo, &hi) == 2) {
+          if (e->nunused == e->capunused) {
+            ProfUnused *nu;
+            e->capunused = e->capunused ? e->capunused * 2 : 8;
+            nu = realloc(e->unused, sizeof(*nu) * (size_t)e->capunused);
+            if (!nu) return NULL;
+            e->unused = nu;
+          }
+          e->unused[e->nunused].lo = lo;
+          e->unused[e->nunused].hi = hi;
+          e->nunused++;
         }
       }
     } else { /* R */
@@ -2955,6 +3036,36 @@ int qjs_aot_prof_call(const uint8_t dg[16], int pc, int *kind, int *cproto,
     hex[32] = 0;
   }
   return 1;
+}
+
+/* The shapes one property site saw, from its `S` record. `site` is the site
+   index the emitter uses (the k-th property access in source order). Returns 1
+   and fills `nshapes`/`shapes` (at most PROF_MAX_SHAPES entries) when there is
+   a record, 0 otherwise. The shape values are profile-process addresses: they
+   compare only against other shapes of the same profile. */
+int qjs_aot_prof_site(
+    const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k;
+  if (!e) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    if (e->sites[i].site != site) continue;
+    *nshapes = e->sites[i].nshapes;
+    for (k = 0; k < PROF_MAX_SHAPES; k++) shapes[k] = e->sites[i].shape[k];
+    return 1;
+  }
+  return 0;
+}
+
+/* Whether the profiler never executed the instruction at `pc` (a `U` record).
+   Such a block is emitted as an exit in a specialised body. */
+int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i;
+  if (!e) return 0;
+  for (i = 0; i < e->nunused; i++)
+    if (pc >= e->unused[i].lo && pc <= e->unused[i].hi) return 1;
+  return 0;
 }
 
 /* Load a profile for the verify/dump/stats modes (the unit-builder mode loads
