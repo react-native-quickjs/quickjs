@@ -167,6 +167,15 @@ typedef struct Q2Exit {
   Q2ValueId *chk_val;
 } Q2Exit;
 
+/* One out-of-line slow arm: the code a fast path jumps to when it misses and
+   then continues from. The arm's text is collected in a memory stream, because
+   it is printed after the body: the hot path keeps only the branch. */
+typedef struct Q2Cold {
+  FILE *m; /* the arm's stream while it is being built */
+  char *buf;
+  size_t len;
+} Q2Cold;
+
 typedef struct Q2Emit {
   const Q2Func *fn;
   Q2Cur cur; /* the value current after the instruction being emitted */
@@ -198,6 +207,16 @@ typedef struct Q2Emit {
      write-back would have emitted, so the hot path is only a `goto`. */
   Q2Exit *exits;
   int nexits, capexits;
+  /* The out-of-line slow arms, printed after the exits. `cold_buf` is the frame
+     cache saved for the arm: within an arm the stores are printed as they would
+     have been at the arm's start, so collect them before switching streams. */
+  Q2Cold *colds;
+  int ncolds, capcolds;
+  /* While an arm is being emitted: the stream it writes to, and the number of
+     arms already finished (its label is that index). */
+  FILE *cold_stream;
+  int cold_active;
+  Q2ValueId *cold_seen; /* the arm's private frame cache */
 } Q2Emit;
 
 /* One emitter runs at a time, so the state is a file static rather than a
@@ -683,6 +702,52 @@ static void q2_emit_exits(FILE *f, const Q2Func *fn) {
     fprintf(
         f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d);\n    }\n", e->pc,
         e->sid);
+  }
+}
+
+/* The arm's stream is closed by q2_cold_end; a failure here only costs the
+   out-of-line form, never correctness. */
+static FILE *q2_cold_begin(FILE *f, const char *cond, int wb, int *k) {
+  FILE *m;
+  Q2Cold *c;
+  if (g_em.ncolds == g_em.capcolds) {
+    int nc = g_em.capcolds ? g_em.capcolds * 2 : 16;
+    Q2Cold *nn = realloc(g_em.colds, sizeof(*nn) * (size_t)nc);
+    if (!nn) return NULL;
+    g_em.colds = nn;
+    g_em.capcolds = nc;
+  }
+  *k = g_em.ncolds;
+  c = &g_em.colds[*k];
+  c->m = open_memstream(&c->buf, &c->len);
+  if (!c->m) return NULL;
+  g_em.ncolds++;
+  /* The braced branch: a brace-less `if (cond)` would make only the `goto`
+     conditional and let the hot path fall into the label. */
+  fprintf(f, "    if (__builtin_expect(!(%s), 0)) { goto s_%d; }\n", cond, *k);
+  fprintf(f, " r_%d:;\n", *k);
+  if (wb) q2_writeback(c->m, g_em.fn, &g_em.pre, g_em.liveb);
+  return c->m;
+}
+
+/* Finish an arm: return to the hot path's continuation label. */
+static void q2_cold_end(int k) {
+  Q2Cold *c;
+  if (k < 0 || k >= g_em.ncolds) return;
+  c = &g_em.colds[k];
+  if (!c->m) return;
+  fprintf(c->m, "    { goto r_%d; }\n", k);
+  fclose(c->m);
+  c->m = NULL;
+}
+
+/* The arms, printed after the exits so they sit out of the hot layout. */
+static void q2_emit_colds(FILE *f) {
+  int i;
+  for (i = 0; i < g_em.ncolds; i++) {
+    Q2Cold *c = &g_em.colds[i];
+    if (!c->buf) continue;
+    fprintf(f, "s_%d: {\n%s    }\n", i, c->buf);
   }
 }
 
@@ -1711,6 +1776,7 @@ static int q2_typed_binary(FILE *f, const Q2Func *fn, const Q2Insn *in) {
 static int q2_emit_native(
     FILE *f, const Q2Func *fn, int cur_block, const Q2Insn *in) {
   char a[64], b[64];
+  FILE *m;
   if (q2_typed_binary(f, fn, in)) return 1;
   switch (in->rop) {
     case ROP_load_undefined:
@@ -2163,25 +2229,51 @@ static int q2_emit_native(
             a, site, in->def[0]);
         return 1;
       }
-      fprintf(
-          f,
-          "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
-          "&v%u), 0)) {\n",
-          a, site, in->def[0]);
       /* A miss fills the cache and continues compiled rather than leaving for
          the interpreter, so a cold or polymorphic site never disables the
          function. The read may run a getter, so it can throw; it returns an
-         owned value, so the store adopts it. */
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
-          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
-          "exception; }\n"
-          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
-          in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off, in->def[0]);
-      fprintf(f, "    }\n");
+         owned value, so the store adopts it. The arm is out of line: the hot
+         path pays only the branch. */
+      {
+        char cond[160];
+        int k, ok = 0;
+        snprintf(
+            cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, &v%u)",
+            a, site, in->def[0]);
+        m = q2_cold_begin(f, cond, 1, &k);
+        if (m) {
+          fprintf(
+              m,
+              "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+              "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+              "exception; }\n"
+              "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
+              "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
+              in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off,
+              in->def[0]);
+          q2_cold_end(k);
+          ok = 1;
+        }
+        if (!ok) {
+          /* Without a usable stream, keep the inline miss arm. */
+          fprintf(
+              f,
+              "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
+              "&v%u), 0)) {\n",
+              a, site, in->def[0]);
+          q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+          fprintf(
+              f,
+              "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+              "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+              "exception; }\n"
+              "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
+              "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
+              "    }\n",
+              in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off,
+              in->def[0]);
+        }
+      }
       return 1;
     }
     case ROP_get_field_chain:
@@ -3142,10 +3234,10 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
   g_em.fast_hi = hi;
   q2_fast_hoist(fn);
   g_em.fast = 1;
-  /* A loop-copy trial may collect exits; if the copy is rejected they are
-     abandoned along with its text. */
+  /* A loop-copy trial may collect exits and cold arms; if the copy is
+     rejected they are abandoned along with its text. */
   {
-    int ex0 = g_em.nexits;
+    int ex0 = g_em.nexits, c0 = g_em.ncolds;
     for (b = lo; b <= hi; b++) {
       fprintf(m, "ff_%d:\n", fn->blocks[b].start_pc);
       q2_emit_block(m, fn, b);
@@ -3162,6 +3254,11 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
         free(g_em.exits[i].chk_val);
       }
       g_em.nexits = ex0;
+      for (i = c0; i < g_em.ncolds; i++) {
+        if (g_em.colds[i].m) fclose(g_em.colds[i].m);
+        free(g_em.colds[i].buf);
+      }
+      g_em.ncolds = c0;
     }
   }
   if (ok) {
@@ -3326,6 +3423,7 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   }
   fprintf(f, "    return qjs_aot_ret(f);\n");
   q2_emit_exits(f, fn);
+  q2_emit_colds(f);
   fprintf(f, "exception: {\n");
   fprintf(f, "        uint32_t rp = 0;\n");
   fprintf(f, "        JSValue ex = qjs_aot_unwind(ctx, f, fr, pc, &rp);\n");
@@ -3353,6 +3451,15 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   free(g_em.exits);
   g_em.exits = NULL;
   g_em.nexits = g_em.capexits = 0;
+  /* A cold arm that never got q2_cold_end (an emitter that returned early)
+     still owns its stream; closing it keeps the buffer valid and freed. */
+  for (i = 0; i < g_em.ncolds; i++) {
+    if (g_em.colds[i].m) fclose(g_em.colds[i].m);
+    free(g_em.colds[i].buf);
+  }
+  free(g_em.colds);
+  g_em.colds = NULL;
+  g_em.ncolds = g_em.capcolds = 0;
 }
 
 
