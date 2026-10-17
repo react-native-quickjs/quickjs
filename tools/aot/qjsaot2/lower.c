@@ -224,6 +224,11 @@ typedef struct Q2Emit {
   int32_t *sgroup; /* nsites entries */
   int ngroups;
   int *gfirst; /* ngroups entries: the first site of each group */
+  /* Shape facts: pair -> (receiver value, group), and the per-block bitsets. */
+  int nfacts, fact_words;
+  int32_t *fact_val, *fact_grp;
+  uint64_t *fact_in, *fact_out, *fact_scratch;
+  uint64_t *fact_cur; /* the facts true at the instruction being emitted */
   /* Per site, whether the site's pc was ever executed; an unexecuted site must
      not be validated at entry. */
   uint8_t *sexec;
@@ -2369,6 +2374,14 @@ static int q2_emit_native(
               in->def[0], a, site, in->def[0]);
           q2_miss(f, in->pc, sid);
           fprintf(f, "    }\n");
+          /* The check just established this pair for the rest of the block. */
+          if (g_em.fact_cur) {
+            int k;
+            Q2ValueId rv = in->argval[1 - (in->rop == ROP_put_field ? 1 : 0)];
+            for (k = 0; k < g_em.nfacts; k++)
+              if (g_em.fact_val[k] == (int32_t)rv && g_em.fact_grp[k] == g)
+                g_em.fact_cur[k >> 6] |= 1ull << (k & 63);
+          }
           return 1;
         }
         {
@@ -3025,6 +3038,14 @@ static void q2_emit_block(FILE *f, const Q2Func *fn, int b) {
      reason: a block can be reached from any predecessor, so what the slot
      holds is unknown until this block writes it. */
   q2_cur_block(fn, &g_em.cur, b);
+  /* The facts true at this block's entry; q2_emit_native adds the ones each
+     instruction establishes as it emits. */
+  if (g_em.fact_cur && g_em.fact_in && g_em.fact_words > 0)
+    memcpy(
+        g_em.fact_cur, g_em.fact_in + (size_t)b * g_em.fact_words,
+        (size_t)g_em.fact_words * 8);
+  else if (g_em.fact_cur && g_em.fact_words > 0)
+    memset(g_em.fact_cur, 0, (size_t)g_em.fact_words * 8);
   /* The frame cache survives into a block only when that block has exactly
      one predecessor and it is the block just emitted, i.e. a plain
      fall-through. Any other entry (a branch target, a loop header) can be
@@ -3063,6 +3084,11 @@ static void q2_emit_block(FILE *f, const Q2Func *fn, int b) {
       }
       fprintf(f, "gi_%d:\n", g_em.cur_insn);
     }
+    /* A call or a step can replace every shape a fact is about. */
+    if (g_em.fact_cur && g_em.fact_words > 0 &&
+        (in->rop == ROP_call || in->rop == ROP_call_method ||
+         in->rop == ROP_throw || in->op == Q2_OP_FALLBACK))
+      memset(g_em.fact_cur, 0, (size_t)g_em.fact_words * 8);
     if (q2_emit_native(f, fn, b, in) != 0) {
       /* lowered */
     } else if (q2_emit_call_special(f, fn, b, in)) {
@@ -3412,6 +3438,161 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
    its profile record is monomorphic, its pc ran, and its cache cell is an own
    or own-writable hit; sites whose receiver shares the profile shape share the
    group, so one entry check can serve all of them. */
+/* Whether the pair (value, group) is known at the instruction being emitted. */
+static int q2_fact_has(const Q2Insn *in, Q2ValueId v, int g) {
+  int k;
+  (void)in;
+  if (!g_em.fact_cur || v == Q2_NO_VALUE) return 0;
+  for (k = 0; k < g_em.nfacts; k++)
+    if (g_em.fact_val[k] == (int32_t)v && g_em.fact_grp[k] == g)
+      return (g_em.fact_cur[k >> 6] >> (k & 63)) & 1;
+  return 0;
+}
+
+/* Shape facts (T1.7): a (receiver value, group) pair that a check has already
+   established. The pairs are numbered once per function, and each block carries
+   a bitset of the pairs true at its entry: the intersection over its
+   predecessors, since a fact may only be relied on if every way in
+   established it. A read in a group generates its pair; a call or a step
+   kills them all (either can replace the shape the pair is about). */
+static void q2_facts_build(const Q2Func *fn) {
+  int i, b, npairs = 0, words;
+  int32_t *pair_val = NULL; /* pair -> receiver value */
+  int32_t *pair_grp = NULL; /* pair -> group */
+  g_em.nfacts = 0;
+  g_em.fact_words = (fn->ninsns > 0 ? 1 : 0);
+  if (!g_em.sgroup) return;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    int site = -1;
+    if (in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+        in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own)
+      site = (int)in->arg[3].val;
+    else if (in->rop == ROP_put_field)
+      site = (int)in->arg[2].val;
+    if ((unsigned)site == REG_IC_NONE || site >= fn->ninsns) continue;
+    if (g_em.sgroup[site] < 0 || !g_em.sexec[site]) continue;
+    if (in->narg < 1 || in->arg[1 - (in->rop == ROP_put_field ? 1 : 0)].kind != 'r')
+      continue;
+    npairs++;
+  }
+  if (npairs <= 0) return;
+  pair_val = malloc(sizeof(*pair_val) * (size_t)npairs);
+  pair_grp = malloc(sizeof(*pair_grp) * (size_t)npairs);
+  if (!pair_val || !pair_grp) {
+    free(pair_val);
+    free(pair_grp);
+    return;
+  }
+  npairs = 0;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    int site = -1, op;
+    Q2ValueId rv;
+    if (in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+        in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own) {
+      site = (int)in->arg[3].val;
+      op = 1;
+    } else if (in->rop == ROP_put_field) {
+      site = (int)in->arg[2].val;
+      op = 0;
+    } else
+      continue;
+    if ((unsigned)site == REG_IC_NONE || site >= fn->ninsns) continue;
+    if (g_em.sgroup[site] < 0 || !g_em.sexec[site]) continue;
+    if (op >= in->narg || in->arg[op].kind != 'r') continue;
+    rv = in->argval[op];
+    if (rv == Q2_NO_VALUE) continue;
+    pair_val[npairs] = (int32_t)rv;
+    pair_grp[npairs] = g_em.sgroup[site];
+    npairs++;
+  }
+  words = (npairs + 63) / 64;
+  g_em.nfacts = npairs;
+  g_em.fact_words = words;
+  g_em.fact_val = pair_val;
+  g_em.fact_grp = pair_grp;
+  /* Per block: the facts true at entry, and the ones leaving it. */
+  g_em.fact_in = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1) *
+                            (size_t)words,
+                        sizeof(uint64_t));
+  g_em.fact_out = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1) *
+                             (size_t)words,
+                         sizeof(uint64_t));
+  g_em.fact_scratch = calloc((size_t)words, sizeof(uint64_t));
+  if (!g_em.fact_in || !g_em.fact_out || !g_em.fact_scratch) {
+    free(g_em.fact_in);
+    free(g_em.fact_out);
+    free(g_em.fact_scratch);
+    g_em.fact_in = g_em.fact_out = g_em.fact_scratch = NULL;
+    g_em.nfacts = 0;
+    return;
+  }
+  /* out[b] = (in[b] U gen) - kill, over the block's instructions in order. */
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    uint64_t *out = g_em.fact_out + (size_t)b * words;
+    int j, k;
+    for (j = 0; j < blk->ninsns; j++) {
+      const Q2Insn *in = &fn->insns[blk->first_insn + j];
+      if (in->rop == ROP_call || in->rop == ROP_call_method) {
+        memset(out, 0, (size_t)words * 8);
+        continue;
+      }
+      {
+        int site = -1, op = 1;
+        if (in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+            in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own)
+          site = (int)in->arg[3].val;
+        else if (in->rop == ROP_put_field) {
+          site = (int)in->arg[2].val;
+          op = 0;
+        }
+        if ((unsigned)site == REG_IC_NONE || site >= fn->ninsns) continue;
+        if (g_em.sgroup[site] < 0 || !g_em.sexec[site]) continue;
+        if (op >= in->narg || in->arg[op].kind != 'r') continue;
+        for (k = 0; k < npairs; k++)
+          if (g_em.fact_val[k] == (int32_t)in->argval[op] &&
+              g_em.fact_grp[k] == g_em.sgroup[site])
+            out[k >> 6] |= 1ull << (k & 63);
+      }
+    }
+  }
+  /* The intersection fixpoint. Entry starts from nothing (a fact must be
+     established on every path), and the other blocks from all-ones. */
+  {
+    int changed = 1, guard = 0;
+    for (b = 1; b < fn->nblocks; b++)
+      memset(
+          g_em.fact_in + (size_t)b * words, 0xff, (size_t)words * 8);
+    while (changed && guard++ < 64) {
+      changed = 0;
+      for (b = 0; b < fn->nblocks; b++) {
+        uint64_t *in = g_em.fact_in + (size_t)b * words;
+        const Q2Block *blk = &fn->blocks[b];
+        int p, w;
+        if (b == 0) continue;
+        if (blk->npreds <= 0) continue;
+        for (w = 0; w < words; w++) {
+          uint64_t m = ~0ull;
+          for (p = 0; p < blk->npreds; p++) {
+            int pb = blk->preds[p];
+            if (pb < 0 || pb >= fn->nblocks) {
+              m = 0;
+              break;
+            }
+            m &= g_em.fact_out[(size_t)pb * words + w];
+          }
+          if (in[w] != m) {
+            in[w] = m;
+            changed = 1;
+          }
+        }
+      }
+    }
+  }
+}
+
 static void q2_groups(const Q2Func *fn) {
   int i, k, nsites = 0, n = 0;
   g_em.sgroup = NULL;
@@ -3492,7 +3673,12 @@ static void q2_emit_one(
   g_em.fn = fn;
   g_em.spec = spec;
   g_em.hex = hex;
-  if (spec) q2_groups(fn);
+  if (spec) {
+    q2_groups(fn);
+    q2_facts_build(fn);
+    g_em.fact_cur = calloc(
+        (size_t)(g_em.fact_words > 0 ? g_em.fact_words : 1), sizeof(uint64_t));
+  }
   g_em.liveb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
   if (g_em.fb)
@@ -3720,6 +3906,16 @@ static void q2_emit_one(
   free(g_em.gfirst);
   g_em.gfirst = NULL;
   g_em.ngroups = 0;
+  free(g_em.fact_val);
+  free(g_em.fact_grp);
+  free(g_em.fact_in);
+  free(g_em.fact_out);
+  free(g_em.fact_scratch);
+  free(g_em.fact_cur);
+  g_em.fact_val = g_em.fact_grp = NULL;
+  g_em.fact_in = g_em.fact_out = g_em.fact_scratch = NULL;
+  g_em.fact_cur = NULL;
+  g_em.nfacts = g_em.fact_words = 0;
 }
 
 /* A function's two bodies. `aot_g_` is today's emitter, the one every fact
