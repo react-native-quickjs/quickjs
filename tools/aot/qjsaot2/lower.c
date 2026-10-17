@@ -1436,12 +1436,17 @@ static int q2_typed_binary(FILE *f, const Q2Func *fn, const Q2Insn *in) {
   dval = &fn->values[dv];
   if (dval->rep == Q2_R_TAGGED) return 0;
   /* Every register operand must be typed: a tagged one would need a guard the
-     typed path does not emit, so fall back instead. */
+     typed path does not emit, so fall back instead. A boolean is not a
+     number — it has no unboxed numeric form that `===`/`<` agree with — so a
+     boolean operand also falls back to the generic binary. */
   {
     int k;
-    for (k = 0; k < in->nuse; k++)
-      if (fn->values[in->use[k]].rep == Q2_R_TAGGED) return 0;
+    for (k = 0; k < in->nuse; k++) {
+      int r = fn->values[in->use[k]].rep;
+      if (r == Q2_R_TAGGED || r == Q2_R_BOOL) return 0;
+    }
   }
+  if (dval->rep == Q2_R_BOOL) return 0;
 
   is_imm =
       (in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s ||
@@ -1535,26 +1540,6 @@ static int q2_typed_binary(FILE *f, const Q2Func *fn, const Q2Insn *in) {
         sub != REG_BIN_DIV)
       return 0;
     fprintf(f, "    d%u = %s %s %s;\n", dv, x, opx, y);
-    return 1;
-  }
-  if (dval->rep == Q2_R_BOOL) {
-    char x[48], y[48];
-    const char *opx = sub == REG_BIN_LT                                 ? "<"
-                      : sub == REG_BIN_LTE                              ? "<="
-                      : sub == REG_BIN_GT                               ? ">"
-                      : sub == REG_BIN_GTE                              ? ">="
-                      : sub == REG_BIN_NEQ || sub == REG_BIN_STRICT_NEQ ? "!="
-                                                                        : "==";
-    int want = (fn->values[in->use[0]].rep == Q2_R_F64 ||
-                (in->nuse > 1 && fn->values[in->use[1]].rep == Q2_R_F64))
-                   ? Q2_R_F64
-                   : Q2_R_I32;
-    q2_use_arg(fn, in, aoff, want, x, sizeof(x));
-    if (is_imm)
-      snprintf(y, sizeof(y), "%d", imm);
-    else
-      q2_use_arg(fn, in, boff, want, y, sizeof(y));
-    fprintf(f, "    b%u = (%s %s %s);\n", dv, x, opx, y);
     return 1;
   }
   return 0;
@@ -2585,8 +2570,15 @@ static int q2_emit_native(
         }
         return 1;
       }
-      if (in->nuse >= 2 && fn->values[in->use[0]].rep != Q2_R_TAGGED &&
+      /* A boolean is not a number: `1 === true` is false while `1 == 1` is
+         true, and `true < 2` compares as 1 but is not an int. A boolean
+         operand stays tagged and takes the generic compare, which decides by
+         tag. */
+      if (in->nuse >= 2 &&
+          fn->values[in->use[0]].rep != Q2_R_TAGGED &&
+          fn->values[in->use[0]].rep != Q2_R_BOOL &&
           fn->values[in->use[1]].rep != Q2_R_TAGGED &&
+          fn->values[in->use[1]].rep != Q2_R_BOOL &&
           (sub == REG_BIN_LT || sub == REG_BIN_LTE || sub == REG_BIN_GT ||
            sub == REG_BIN_GTE || sub == REG_BIN_EQ || sub == REG_BIN_NEQ ||
            sub == REG_BIN_STRICT_EQ || sub == REG_BIN_STRICT_NEQ)) {
