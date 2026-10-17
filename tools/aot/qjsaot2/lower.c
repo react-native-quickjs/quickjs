@@ -153,6 +153,20 @@ typedef struct Q2Cur {
 
 /* The lowering's per-function state, threaded through the instruction
    emitters: the write-back cursor and its scratch. */
+/* One out-of-line exit: the write-back it performs, then the deopt. The store
+   list is fixed when the leave is emitted, because the live set and the frame
+   cache are only valid then. */
+typedef struct Q2Exit {
+  int pc, sid;
+  int nst;
+  int *st_reg;
+  Q2ValueId *st_val;
+  /* The --check-locals assertion, run in the stub after the stores. */
+  int nchk;
+  int *chk_reg;
+  Q2ValueId *chk_val;
+} Q2Exit;
+
 typedef struct Q2Emit {
   const Q2Func *fn;
   Q2Cur cur; /* the value current after the instruction being emitted */
@@ -179,6 +193,11 @@ typedef struct Q2Emit {
      double the last write stored. */
   int32_t *fgroup;
   uint8_t *fdbl;
+  /* The out-of-line exit stubs: every leave in the body appends one, and they
+     are printed once after the body. A stub repeats the store list its
+     write-back would have emitted, so the hot path is only a `goto`. */
+  Q2Exit *exits;
+  int nexits, capexits;
 } Q2Emit;
 
 /* One emitter runs at a time, so the state is a file static rather than a
@@ -405,6 +424,60 @@ static void q2_store_slot(FILE *f, const Q2Func *fn, Q2ValueId v, int mark) {
   if (mark && g_em.fb != NULL) g_em.fb[r] = v;
 }
 
+/* Whether a leave's write-back stores `v`, under the same rules q2_store_slot
+   applies: a value already in its slot is skipped. `seen` is the frame cache as
+   the leave sees it, so a value stored earlier in the same write-back is not
+   stored twice. */
+static int q2_wb_wants(const Q2Func *fn, Q2ValueId v, Q2ValueId *seen) {
+  int r;
+  if (v == Q2_NO_VALUE || v >= (Q2ValueId)fn->nvalues) return 0;
+  r = fn->values[v].reg;
+  if (r >= fn->nregs) return 0;
+  return seen[r] != v;
+}
+
+/* Collect the exact store list a leave's write-back would emit, for an
+   out-of-line exit stub: it must not depend on the frame cache or the live set
+   still being what they were where the leave was. `seen` starts as the frame
+   cache copy and is updated as pairs are collected, exactly like the inline
+   write-back. */
+static void q2_writeback_collect(
+    const Q2Func *fn, const Q2Cur *c, const uint64_t *bits, Q2ValueId *seen,
+    int *nst, int **st_reg, Q2ValueId **st_val) {
+  int w, words = fn->lwords, n = 0, cap = 0;
+  int *regs = NULL;
+  Q2ValueId *vals = NULL;
+  for (w = 0; w < words; w++) {
+    uint64_t m = bits[w];
+    while (m) {
+      int r = w * 64 + __builtin_ctzll(m);
+      Q2ValueId v;
+      m &= m - 1;
+      if (r >= fn->nregs) continue;
+      v = c->cur[r];
+      if (!q2_wb_wants(fn, v, seen)) continue;
+      if (n == cap) {
+        int nc = cap ? cap * 2 : 8;
+        int *nr = realloc(regs, sizeof(*nr) * (size_t)nc);
+        Q2ValueId *nv;
+        if (!nr) break;
+        regs = nr;
+        nv = realloc(vals, sizeof(*nv) * (size_t)nc);
+        if (!nv) break;
+        vals = nv;
+        cap = nc;
+      }
+      regs[n] = r;
+      vals[n] = v;
+      seen[r] = v;
+      n++;
+    }
+  }
+  *nst = n;
+  *st_reg = regs;
+  *st_val = vals;
+}
+
 static void q2_writeback_kind(FILE *f, const Q2Func *fn, const Q2Cur *c,
                               const uint64_t *bits, int all) {
   (void)all;
@@ -491,10 +564,14 @@ static void q2_call_need_bits(
 /* The debug check (--check-locals): at a leave, every live value's boxed form
    must equal its frame slot bitwise. A mismatch is a missing write-back or a
    stale local. It covers the call window too, which `insn_live` alone would
-   miss. */
-static void q2_check_locals(
-    FILE *f, const Q2Func *fn, const Q2Cur *c, const uint64_t *bits) {
-  int w, words = fn->lwords;
+   miss. Collected with the leave's stores so the check runs in the stub, after
+   the write-back, where the values are read from the same locals. */
+static void q2_check_collect(
+    const Q2Func *fn, const Q2Cur *c, const uint64_t *bits, int *nchk,
+    int **chk_reg, Q2ValueId **chk_val) {
+  int w, words = fn->lwords, n = 0, cap = 0;
+  int *regs = NULL;
+  Q2ValueId *vals = NULL;
   for (w = 0; w < words; w++) {
     uint64_t m = bits[w];
     while (m) {
@@ -505,34 +582,108 @@ static void q2_check_locals(
       v = c->cur[r];
       if (v == Q2_NO_VALUE || v >= (Q2ValueId)fn->nvalues) continue;
       if (fn->values[v].synced) continue;
-      {
-        char e[64];
-        q2_use(fn, v, Q2_R_TAGGED, e, sizeof(e));
-        fprintf(
-            f,
-            "    { JSValue _c = %s; if (memcmp(&_c, &AOT_REG(fr, %d), "
-            "sizeof(JSValue)) != 0) { fprintf(stderr, \"check-locals: pc %%d r "
-            "%%d v%u\\n\", __LINE__, %d); abort(); } }\n",
-            e, fn->values[v].reg * 16, v, fn->values[v].reg);
+      if (n == cap) {
+        int nc = cap ? cap * 2 : 8;
+        int *nr = realloc(regs, sizeof(*nr) * (size_t)nc);
+        Q2ValueId *nv;
+        if (!nr) break;
+        regs = nr;
+        nv = realloc(vals, sizeof(*nv) * (size_t)nc);
+        if (!nv) break;
+        vals = nv;
+        cap = nc;
       }
+      regs[n] = r;
+      vals[n] = v;
+      n++;
     }
   }
+  *nchk = n;
+  *chk_reg = regs;
+  *chk_val = vals;
 }
 
 /* A leave: write back the live values in `bits`, then deopt at
-   `pc`. `cur` may be NULL when no write-back is needed. */
+   `pc`. `cur` may be NULL when no write-back is needed. The stores go to an
+   out-of-line stub, so the hot path is `goto x_N`; the stub is printed once,
+   after the body, by q2_emit_exits. */
 static void q2_emit_leave(
     FILE *f, const Q2Func *fn, const Q2Cur *c, const uint64_t *bits, int pc,
     int sid) {
+  Q2Exit *e;
   if (g_em.pure) {
     /* Nothing has happened yet: the caller makes the call instead. */
     fprintf(f, "    { return 0; }\n");
     return;
   }
-  fprintf(f, "    {\n");
-  if (c && bits) q2_writeback(f, fn, c, bits);
-  if (c && bits && qjs_aot_check_locals()) q2_check_locals(f, fn, c, bits);
-  fprintf(f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d); }\n", pc, sid);
+  if (g_em.nexits == g_em.capexits) {
+    int nc = g_em.capexits ? g_em.capexits * 2 : 16;
+    Q2Exit *ne = realloc(g_em.exits, sizeof(*ne) * (size_t)nc);
+    if (!ne) {
+      /* Out of memory is not a reason to emit a wrong body: fall back to the
+         inline form. */
+      fprintf(f, "    {\n");
+      if (c && bits) q2_writeback(f, fn, c, bits);
+      fprintf(f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d); }\n", pc, sid);
+      return;
+    }
+    g_em.exits = ne;
+    g_em.capexits = nc;
+  }
+  e = &g_em.exits[g_em.nexits];
+  e->pc = pc;
+  e->sid = sid;
+  e->nst = 0;
+  e->st_reg = NULL;
+  e->st_val = NULL;
+  e->nchk = 0;
+  e->chk_reg = NULL;
+  e->chk_val = NULL;
+  if (c && bits) {
+    Q2ValueId *seen =
+        malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    if (seen) {
+      /* The frame cache as the leave sees it: a value already there is not
+         stored, exactly as the inline write-back decided. */
+      memcpy(seen, g_em.fb, sizeof(Q2ValueId) * (size_t)fn->nregs);
+      q2_writeback_collect(
+          fn, c, bits, seen, &e->nst, &e->st_reg, &e->st_val);
+      free(seen);
+    }
+    if (qjs_aot_check_locals())
+      q2_check_collect(fn, c, bits, &e->nchk, &e->chk_reg, &e->chk_val);
+  }
+  fprintf(f, "    { goto x_%d; }\n", g_em.nexits);
+  g_em.nexits++;
+}
+
+/* The stubs q2_emit_leave collected, printed after the body. */
+static void q2_emit_exits(FILE *f, const Q2Func *fn) {
+  int i, k;
+  for (i = 0; i < g_em.nexits; i++) {
+    Q2Exit *e = &g_em.exits[i];
+    fprintf(f, "x_%d: {\n", i);
+    for (k = 0; k < e->nst; k++) {
+      char buf[64];
+      Q2ValueId v = e->st_val[k];
+      q2_use(fn, v, Q2_R_TAGGED, buf, sizeof(buf));
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s);\n", e->st_reg[k] * 16, buf);
+    }
+    for (k = 0; k < e->nchk; k++) {
+      char buf[64];
+      Q2ValueId v = e->chk_val[k];
+      q2_use(fn, v, Q2_R_TAGGED, buf, sizeof(buf));
+      fprintf(
+          f,
+          "    { JSValue _c = %s; if (memcmp(&_c, &AOT_REG(fr, %d), "
+          "sizeof(JSValue)) != 0) { fprintf(stderr, \"check-locals: pc %%d r "
+          "%%d v%u\\n\", __LINE__, %d); abort(); } }\n",
+          buf, e->chk_reg[k] * 16, v, e->chk_reg[k]);
+    }
+    fprintf(
+        f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d);\n    }\n", e->pc,
+        e->sid);
+  }
 }
 
 /* The frame as the interpreter must see it on the way out of an exception:
@@ -2991,13 +3142,28 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
   g_em.fast_hi = hi;
   q2_fast_hoist(fn);
   g_em.fast = 1;
-  for (b = lo; b <= hi; b++) {
-    fprintf(m, "ff_%d:\n", fn->blocks[b].start_pc);
-    q2_emit_block(m, fn, b);
+  /* A loop-copy trial may collect exits; if the copy is rejected they are
+     abandoned along with its text. */
+  {
+    int ex0 = g_em.nexits;
+    for (b = lo; b <= hi; b++) {
+      fprintf(m, "ff_%d:\n", fn->blocks[b].start_pc);
+      q2_emit_block(m, fn, b);
+    }
+    g_em.fast = 0;
+    fclose(m);
+    ok = buf && q2_fast_scan(buf);
+    if (!ok) {
+      int i;
+      for (i = ex0; i < g_em.nexits; i++) {
+        free(g_em.exits[i].st_reg);
+        free(g_em.exits[i].st_val);
+        free(g_em.exits[i].chk_reg);
+        free(g_em.exits[i].chk_val);
+      }
+      g_em.nexits = ex0;
+    }
   }
-  g_em.fast = 0;
-  fclose(m);
-  ok = buf && q2_fast_scan(buf);
   if (ok) {
     fprintf(f, "b_%d:\n", pc);
     q2_emit_preheader(f, fn);
@@ -3159,6 +3325,7 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
     q2_emit_block(f, fn, b);
   }
   fprintf(f, "    return qjs_aot_ret(f);\n");
+  q2_emit_exits(f, fn);
   fprintf(f, "exception: {\n");
   fprintf(f, "        uint32_t rp = 0;\n");
   fprintf(f, "        JSValue ex = qjs_aot_unwind(ctx, f, fr, pc, &rp);\n");
@@ -3177,6 +3344,15 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   g_em.fdbl = NULL;
   free(g_em.fgroup);
   g_em.fgroup = NULL;
+  for (i = 0; i < g_em.nexits; i++) {
+    free(g_em.exits[i].st_reg);
+    free(g_em.exits[i].st_val);
+    free(g_em.exits[i].chk_reg);
+    free(g_em.exits[i].chk_val);
+  }
+  free(g_em.exits);
+  g_em.exits = NULL;
+  g_em.nexits = g_em.capexits = 0;
 }
 
 
@@ -3269,6 +3445,9 @@ static char *q2_pure_text(Q2Func *fn, size_t *lenp) {
   g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
   if (g_em.fb)
     for (i = 0; i < fn->nregs; i++) g_em.fb[i] = Q2_NO_VALUE;
+  /* A leaf body has no exits (a failed guard returns 0); anything collected
+     here would belong to another emission. */
+  g_em.nexits = 0;
   g_operand_err = 0;
   for (i = 0; i < fn->nvalues; i++) {
     const Q2Value *v = &fn->values[i];
