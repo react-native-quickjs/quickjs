@@ -3623,6 +3623,10 @@ static char *q2_pure_text(Q2Func *fn, size_t *lenp) {
       fprintf(m, "    JSValue ev%d; int32_t ei%d = 0; double ed%d = 0.0; "
                  "int eb%d = 0;\n", i, i, i, i);
   }
+  /* The generic compare writes this, and a leaf body reaches it too; its slow
+     arm stays inline there (q2_cold_begin refuses a leaf), so the variable is
+     local to the body's own text. */
+  fprintf(m, "    int _t;\n");
   for (b = 0; b < fn->nblocks; b++) {
     fprintf(m, "b_%d:\n", fn->blocks[b].start_pc);
     q2_emit_block(m, fn, b);
