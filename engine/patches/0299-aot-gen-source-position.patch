@@ -1,0 +1,41 @@
+Subject: Give each generated function its source position
+
+What this does
+  Adds the definition's line and column to `JSAotGenFunc`, filled from the
+  bytecode's own position.
+
+Why we need it
+  The generator names a compiled function by its bytecode digest. Most hot
+  functions are anonymous (`X.prototype.f = function () {...}`) and the
+  sources are often minified onto a few lines, so neither the name nor the
+  file says which function a profile entry is. Line and column do.
+
+What it adds
+  JSAotGenFunc.line, .col   - the definition's source position, or 0
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -53,6 +53,7 @@
+     int light_need;
+     char name[128];
+     char file[256];
++    int line, col;             /* the definition's source position, or 0 */
+ } JSAotGenFunc;
+ 
+ /* Collect every function bytecode in `rt`, eligible or not. Returns the count
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62462,6 +62462,8 @@
+             JS_AtomGetStrRT(rt, g->name, sizeof(g->name), b->func_name);
+             if (b->filename != JS_ATOM_NULL)
+                 JS_AtomGetStrRT(rt, g->file, sizeof(g->file), b->filename);
++            g->line = b->line_num;
++            g->col = b->col_num;
+ 
+             /* Classify for the census. The digest is computed for every
+                materialized body, so a profile can be joined by digest. */

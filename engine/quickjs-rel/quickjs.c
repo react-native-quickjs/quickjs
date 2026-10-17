@@ -62462,6 +62462,8 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
             JS_AtomGetStrRT(rt, g->name, sizeof(g->name), b->func_name);
             if (b->filename != JS_ATOM_NULL)
                 JS_AtomGetStrRT(rt, g->file, sizeof(g->file), b->filename);
+            g->line = b->line_num;
+            g->col = b->col_num;
 
             /* Classify for the census. The digest is computed for every
                materialized body, so a profile can be joined by digest. */

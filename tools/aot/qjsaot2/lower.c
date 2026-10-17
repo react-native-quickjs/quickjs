@@ -3024,6 +3024,18 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   if (g_em.fb)
     for (i = 0; i < fn->nregs; i++) g_em.fb[i] = Q2_NO_VALUE;
 
+  {
+    /* Where the function is defined, so a profile of the unit names it. */
+    const char *file = strrchr(fn->g->file, '/');
+    char who[160];
+    size_t k;
+    snprintf(who, sizeof(who), "%s %s:%d:%d",
+             fn->g->name[0] ? fn->g->name : "<anon>",
+             file ? file + 1 : fn->g->file, fn->g->line, fn->g->col);
+    for (k = 0; who[k]; k++)
+      if (who[k] == '*' || who[k] == '\n') who[k] = '_';
+    fprintf(f, "/* %s */\n", who);
+  }
   fprintf(
       f,
       "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
