@@ -3339,9 +3339,11 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (who[k] == '*' || who[k] == '\n') who[k] = '_';
     fprintf(f, "/* %s */\n", who);
   }
+  /* The generic body is `aot_g_`; `aot_f_` is the entry the table names, and
+     it is where the specialised body will live. */
   fprintf(
       f,
-      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "static JSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n"
       "                                 JSValue *fr, uint32_t entry_pc)\n"
       "{\n",
       hex);
@@ -3473,6 +3475,19 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       f,
       "        return qjs_aot_deopt(ctx, f, fr, rp, QJS_AOT_NO_SITE);\n"
       "    }\n}\n\n");
+  /* The entry: this builds, it only forwards. The switch and the specialised
+     body come next; keeping the name stable now means the table, the leaf
+     checks and the call sites never have to move again. */
+  fprintf(
+      f,
+      "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
+      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "                                 JSValue *fr, uint32_t entry_pc)\n"
+      "{\n"
+      "    (void)q2_spec_off_%s; (void)q2_spec_fail_%s;\n"
+      "    return aot_g_%s(ctx, f, fr, entry_pc);\n"
+      "}\n\n",
+      hex, hex, hex, hex, hex, hex);
   free(g_em.liveb);
   g_em.liveb = NULL;
   free(g_em.fb);
