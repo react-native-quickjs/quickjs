@@ -2437,25 +2437,26 @@ static int q2_emit_native(
       if (g_em.fast && q2_fast_field(f, fn, in, 1)) return 1;
       q2_guard(f, in->pc, q2_site());
       /* The site-cache hit borrows the global's slot. A miss probes the cell
-         cache and then reads the global, which can throw. */
-      fprintf(
-          f,
-          "    if (__builtin_expect(q2_global_hit(ctx, pic, %d, &v%u), 1)) {\n"
-          "    } else {\n"
-          "      int _r;\n",
-          site, in->def[0]);
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      _r = qjs_aot_get_global_site(ctx, f, %d, "
-          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u);\n"
-          "      if (_r < 0) { pc = %d; goto exception; }\n"
-          "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
-          "      else AOT_SET_B(ctx, fr, %d, v%u);\n"
-          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-          "    }\n",
-          site, in->arg[1].off, (int)in->arg[2].val, in->def[0], in->pc, off,
-          in->def[0], off, in->def[0]);
+         cache and then reads the global, which can throw; that arm is out of
+         line. */
+      {
+        char cond[160], body[320];
+        snprintf(
+            cond, sizeof(cond), "q2_global_hit(ctx, pic, %d, &v%u)", site,
+            in->def[0]);
+        snprintf(
+            body, sizeof(body),
+            "      int _r;\n"
+            "      _r = qjs_aot_get_global_site(ctx, f, %d, "
+            "(int)qjs_aot_ld_u32(code + %d), %d, &v%u);\n"
+            "      if (_r < 0) { pc = %d; goto exception; }\n"
+            "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
+            "      else AOT_SET_B(ctx, fr, %d, v%u);\n"
+            "      pic = q2_pic(f); holders = q2_pic_holder(f);\n",
+            site, in->arg[1].off, (int)in->arg[2].val, in->def[0], in->pc, off,
+            in->def[0], off, in->def[0]);
+        q2_cold_arm(f, fn, cond, body);
+      }
       return 1;
     }
     case ROP_return: {
@@ -2894,27 +2895,28 @@ static int q2_emit_native(
       }
       sid = q2_site();
       q2_guard(f, in->pc, sid);
-      fprintf(f, "    { int _t = 0;\n");
       q2_op(in, 1, a, sizeof(a));
       q2_op(in, 2, b, sizeof(b));
       /* A miss is not a deopt: mixed tags, strings, objects and `==` coercion
          take the interpreter's generic compare and stay compiled. It can run
-         valueOf, so the frame is written back first and it can throw. */
-      fprintf(
-          f,
-          "      if (__builtin_expect(!q2_branch_cmp(%d, %s, %s, "
-          "&_t), 0)) {\n",
-          s, a, b);
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      _t = qjs_aot_cmp_take(ctx, %d, %s, %s);\n"
-          "      if (_t < 0) { pc = %d; goto exception; }\n"
-          "      }\n",
-          s, a, b, in->pc);
+         valueOf, so the frame is written back first and it can throw. The arm
+         is out of line; `_t` is the result either way. */
+      {
+        char cond[160], body[224];
+        /* `_t` must live in the function scope, not this block: the out-of-line
+           arm is printed after the body and writes the same variable. */
+        snprintf(
+            cond, sizeof(cond), "q2_branch_cmp(%d, %s, %s, &_t)", s, a, b);
+        snprintf(
+            body, sizeof(body),
+            "      _t = qjs_aot_cmp_take(ctx, %d, %s, %s);\n"
+            "      if (_t < 0) { pc = %d; goto exception; }\n",
+            s, a, b, in->pc);
+        q2_cold_arm(f, fn, cond, body);
+      }
       fprintf(f, "      if (_t) {");
       q2_emit_edge(f, fn, cur_block, 0);
-      fprintf(f, " } }\n");
+      fprintf(f, " }\n");
       return 1;
     }
     default:
@@ -3345,6 +3347,9 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       hex);
   fprintf(f, "    uint8_t *code = q2_code(f);\n");
   fprintf(f, "    uint8_t *ip;\n    uint32_t pc = 0;\n");
+  /* The compare result: written by a hot path and, when its slow arm is out of
+     line, by the arm too, so it is function-scoped. */
+  fprintf(f, "    int _t;\n");
   fprintf(f, "    JSValue *vb = q2_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = q2_arg_buf(f);\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n");
