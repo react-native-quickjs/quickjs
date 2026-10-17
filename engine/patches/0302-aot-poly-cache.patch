@@ -2,17 +2,22 @@ Subject: Add a per-site polymorphic property cache to a compiled function
 
 What this does
   Gives JSFunctionBytecode an on-demand table of four (shape, offset, kind)
-  entries per property site, and qjs_aot_poly_fill to fill one.
+  entries per property site, filled from compiled code by qjs_aot_poly_fill.
 
 Why we need it
   A property site the profile saw with 2-4 shapes cannot use the single
-  shape cell a monomorphic site uses. Without a cache it exits every time,
-  which is what makes polymorphic sites pay interpreter cost.
+  shape cell a monomorphic site uses, so it exited every time.
 
 What it adds
   JSAotPolyEntry, JSFunctionBytecode.aot_poly/.aot_poly_sites
   qjs_aot_poly_fill(ctx, f, site, obj, atom, write, *off)
+  js_aot_poly_free_all, for teardown
   JSAotGenLayout.off_fnbc_aot_poly, .off_fnbc_aot_poly_sites, .aot_poly_ways
+
+The table is allocated when the function binds to its compiled entry and
+released with the bytecode, so filling a site from compiled code never
+allocates: an allocation there would be a safepoint mid-instruction, and
+the compiled frame is not prepared for one.
 
 Bytecode version
   No.
@@ -82,7 +87,57 @@ diff --git a/quickjs.c b/quickjs.c
      /* The record and light eligibility a bound function had before binding:
         js_aot_unbind restores them, so a disabled function runs the interpreter
         through its normal call path. The light path's own flag is not saved;
-@@ -60033,6 +60054,10 @@
+@@ -1773,6 +1794,10 @@
+ #endif
+ } JSFunctionBytecode;
+ 
++#if QJS_AOT || QJS_AOT_GEN
++void js_aot_poly_free_all(JSRuntime *rt);
++#endif
++
+ #if QJS_AOT_PROFILE
+ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b);
+ static int js_aot_prof_enter(JSFunctionBytecode *b);
+@@ -8097,6 +8122,38 @@
+ 
+ /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
+    Mirrors js_free_ic_table and is called from the same place. */
++#if QJS_AOT || QJS_AOT_GEN
++/* Release every polymorphic property cache still attached to a live bytecode,
++   at runtime teardown. A bytecode can outlive the objects whose shapes its
++   cache pinned, so those references must go before the runtime checks that
++   nothing is left; the caches are never used again. */
++void js_aot_poly_free_all(JSRuntime *rt)
++{
++    struct list_head *el, *en;
++    /* Iterating with the saved `next` is required: releasing a shape can drop
++       the last reference to the object that owned it, which unlinks it. */
++    list_for_each_safe(el, en, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSFunctionBytecode *b;
++        uint32_t i, n;
++        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
++            continue;
++        b = (JSFunctionBytecode *)gp;
++        if (b->aot_poly == NULL)
++            continue;
++        n = b->aot_poly_sites * AOT_POLY_WAYS;
++        for (i = 0; i < n; i++)
++            if (b->aot_poly[i].shape != NULL) {
++                js_free_shape(rt, b->aot_poly[i].shape);
++                b->aot_poly[i].shape = NULL;
++            }
++        js_free_rt(rt, b->aot_poly);
++        b->aot_poly = NULL;
++        b->aot_poly_sites = 0;
++    }
++}
++#endif
++
+ static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     uint32_t i;
+@@ -60033,6 +60090,10 @@
          (uint32_t)offsetof(JSObject, u.func.function_bytecode);
      out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
  #if QJS_AOT || QJS_AOT_GEN
@@ -93,7 +148,7 @@ diff --git a/quickjs.c b/quickjs.c
      out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
      out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
      out->class_array = JS_CLASS_ARRAY;
-@@ -61309,6 +61334,100 @@
+@@ -61309,6 +61370,87 @@
  /* Bind a function to its generated entry. The table is sorted by digest;
     `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
     bytecode is final. */
@@ -144,26 +199,15 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (!js_aot_poly_lookup(JS_VALUE_GET_OBJ(obj), atom, write, &off2))
 +        return 0;
 +    if (b->aot_poly == NULL || (uint32_t)site >= b->aot_poly_sites) {
-+        /* Grow to cover `site`, carrying the existing entries (and the shape
-+           references they own) across. */
-+        uint32_t n = (uint32_t)site + 8, i;
-+        JSAotPolyEntry *ne =
-+            js_mallocz_rt(ctx->rt, sizeof(JSAotPolyEntry) * n * AOT_POLY_WAYS);
-+        if (ne == NULL)
-+            return 0;
-+        /* Move the entries, references and all: the old block is freed with
-+           js_free_rt, which does not release shapes, so the copies must own
-+           them and the originals must not be released either. */
-+        if (b->aot_poly != NULL) {
-+            uint32_t old_n = b->aot_poly_sites * AOT_POLY_WAYS;
-+            for (i = 0; i < old_n; i++) ne[i] = b->aot_poly[i];
-+            js_free_rt(ctx->rt, b->aot_poly);
-+        }
-+        b->aot_poly = ne;
-+        b->aot_poly_sites = n;
++        /* Binding sized the cache for every site; a site beyond it means the
++           unit and the engine disagree, so refuse rather than allocate here
++           (this call must not reach a safepoint). */
++        return 0;
 +    }
 +    e = b->aot_poly + (size_t)site * AOT_POLY_WAYS;
 +    sh = JS_VALUE_GET_OBJ(obj)->shape;
++    /* The entries hold weak shape pointers, so every hit is revalidated by the
++       caller's shape compare against a live object; nothing is released. */
 +    for (k = 0; k < AOT_POLY_WAYS; k++) {
 +        if (e[k].shape == sh) {
 +            e[k].off = off2;
@@ -180,9 +224,7 @@ diff --git a/quickjs.c b/quickjs.c
 +                 e[k].fill < e[slot].fill)
 +            slot = k;
 +    }
-+    if (e[slot].shape != NULL)
-+        js_free_shape(ctx->rt, e[slot].shape);
-+    e[slot].shape = js_dup_shape(sh);
++    e[slot].shape = sh; /* weak: the entry is revalidated before use */
 +    e[slot].off = off2;
 +    e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
 +    e[slot].fill = (uint16_t)(e[slot].fill + 1);
@@ -194,7 +236,27 @@ diff --git a/quickjs.c b/quickjs.c
  static void js_aot_bind(JSFunctionBytecode *b)
  {
      uint8_t digest[16];
-@@ -73205,6 +73324,20 @@
+@@ -61338,6 +61480,19 @@
+             b->aot_fn = (void *)qjs_aot_table[mid].fn;
+             b->aot_index = mid;
+             b->aot_state = 1;   /* bound */
++            /* Allocate the polymorphic cache now, so filling a site from
++               compiled code never allocates: an allocation there would be a
++               safepoint, and the compiled body's frame is not prepared for
++               one mid-instruction. One site per instruction is the upper
++               bound, since a site number is an operand copied from the
++               bytecode. */
++            if (b->aot_poly == NULL && b->regvm_len > 0) {
++                uint32_t n = (uint32_t)b->regvm_len + 8;
++                b->aot_poly = js_mallocz_rt(
++                    b->realm->rt, sizeof(JSAotPolyEntry) * n * AOT_POLY_WAYS);
++                if (b->aot_poly != NULL)
++                    b->aot_poly_sites = n;
++            }
+             js_aot_bound_count++;
+             return;
+         }
+@@ -73205,6 +73360,19 @@
  #if QJS_REGVM
      /* release register-PIC-held shape refs and free the table */
      js_free_regvm_pic(rt, b);
@@ -203,10 +265,9 @@ diff --git a/quickjs.c b/quickjs.c
 +       is released here rather than in js_free_regvm_pic, which returns early
 +       when a function has no PIC at all. */
 +    if (b->aot_poly != NULL) {
-+        uint32_t pi, pn = b->aot_poly_sites * AOT_POLY_WAYS;
-+        for (pi = 0; pi < pn; pi++)
-+            if (b->aot_poly[pi].shape != NULL)
-+                js_free_shape(rt, b->aot_poly[pi].shape);
++        /* The entries hold weak shape pointers: each hit is revalidated by the
++           compiled body's shape compare against a live object, so there is no
++           reference to release here. */
 +        js_free_rt(rt, b->aot_poly);
 +        b->aot_poly = NULL;
 +        b->aot_poly_sites = 0;
