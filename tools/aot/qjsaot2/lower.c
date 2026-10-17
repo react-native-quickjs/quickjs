@@ -2425,19 +2425,11 @@ static int q2_emit_native(
               "    _psh = q2_shape_of(%s);\n"
               "    if (__builtin_expect(_pe == NULL || _psh == NULL, 0)) "
               "{ goto pfill%d; }\n"
-              /* A receiver already matched here tries its known way first. */
-              "    if (_pw >= 0 && q2_poly_shape(_pe, _pw) == _psh) _po = "
-              "q2_poly_off(_pe, _pw);\n"
               "    else if (q2_poly_shape(_pe, 0) == _psh) _po = q2_poly_off(_pe, 0);\n"
               "    else if (q2_poly_shape(_pe, 1) == _psh) _po = q2_poly_off(_pe, 1);\n"
               "    else if (q2_poly_shape(_pe, 2) == _psh) _po = q2_poly_off(_pe, 2);\n"
               "    else if (q2_poly_shape(_pe, 3) == _psh) _po = q2_poly_off(_pe, 3);\n"
               "    else { goto pfill%d; }\n"
-              /* Remember the way for the rest of the block, so the next site
-                 on this receiver checks one entry, not four. */
-              "    _pw = q2_poly_shape(_pe, 0) == _psh ? 0\n"
-              "        : q2_poly_shape(_pe, 1) == _psh ? 1\n"
-              "        : q2_poly_shape(_pe, 2) == _psh ? 2 : 3;\n"
               "    goto pdone%d;\n"
               "pfill%d: {\n",
               site, a, k, k, k, k);
@@ -3527,6 +3519,10 @@ static int q2_poly_site(const Q2Func *fn, int site) {
   int ns = 0;
   uint64_t shapes[4];
   if (!g_em.spec || !g_em.sexec) return 0;
+  /* Off until the fill path is sound: with it enabled, DeltaBlue's compiled
+     body reports a constraint cycle the interpreter does not. A polymorphic
+     site falls back to the cache-filling cold arm, which is correct. */
+  return 0;
   if ((unsigned)site >= (unsigned)fn->ninsns || !g_em.sexec[site]) return 0;
   if (!qjs_aot_prof_site(fn->g->digest, site, &ns, shapes)) return 0;
   return ns >= 2 && ns <= 4;
