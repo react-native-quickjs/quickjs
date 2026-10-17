@@ -3907,16 +3907,16 @@ int qjsaot_driver_main(int argc, char **argv) {
            body. */
         "#define Q2_SPEC_FAIL_MAX 64\n"
         /* The A/B switch, and the enable switch for the specialised body. The
-           body is emitted and correct, but with no profile facts yet every
-           field read exits, so it is off unless asked for: the facts that make
-           it a win arrive with the shape groups. */
+           specialised body is the default now that the shape groups make its
+           reads hit; QJS_AOT_SPEC=0 runs every function through the generic
+           one for comparison. */
         "static int q2_no_spec, q2_spec_on;\n"
         "static void __attribute__((constructor)) q2_no_spec_init(void)\n"
         "{\n"
         "  const char *e = getenv(\"QJS_AOT_NO_SPEC\");\n"
         "  const char *s = getenv(\"QJS_AOT_SPEC\");\n"
         "  q2_no_spec = (e != NULL && e[0] != '0');\n"
-        "  q2_spec_on = (s != NULL && s[0] != '0');\n"
+        "  q2_spec_on = (s == NULL || s[0] != '0');\n"
         "}\n\n"
         /* A site's cache cell, read at the specialised body's entry: the
            receiver shape the profile established and the slot offset that came
