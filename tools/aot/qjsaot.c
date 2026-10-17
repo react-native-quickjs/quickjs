@@ -3826,7 +3826,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_FNBC_REGVM_PIC %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES %uu\n"
-          "#define QJS_AOT_CLASS_ARRAY %uu\n\n"
+          "#define QJS_AOT_CLASS_ARRAY %uu\n"
+          "#define QJS_AOT_OFF_FNBC_AOT_POLY %uu\n"
+          "#define QJS_AOT_OFF_FNBC_AOT_POLY_SITES %uu\n"
+          "#define QJS_AOT_AOT_POLY_WAYS %uu\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
           lay.hash, lay.sizeof_JSObject, lay.sizeof_JSShape,
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
@@ -3857,7 +3860,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_object_func_bytecode,
           lay.class_bytecode_function, lay.off_fnbc_aot_fn,
           lay.off_fnbc_regvm_pic, lay.off_object_array_count,
-          lay.off_object_array_values, lay.class_array);
+          lay.off_object_array_values, lay.class_array, lay.off_fnbc_aot_poly,
+          lay.off_fnbc_aot_poly_sites, lay.aot_poly_ways);
       fclose(lf);
     }
 

@@ -1,0 +1,204 @@
+Subject: Add a per-site polymorphic property cache to a compiled function
+
+What this does
+  Gives JSFunctionBytecode an on-demand table of four (shape, offset,
+  kind) entries per property site, and qjs_aot_poly_fill to fill one.
+
+Why we need it
+  A property site the profile saw with 2-4 shapes cannot use the single
+  shape cell a monomorphic site uses. Without a cache it exits every time,
+  which is what makes polymorphic sites (5% of box2d's, all of crypto's
+  and splay's hot reads) pay interpreter cost.
+
+What it adds
+  JSAotPolyEntry, JSFunctionBytecode.aot_poly/.aot_poly_sites
+  qjs_aot_poly_fill(ctx, f, site, obj, atom, write, *off)
+  JSAotGenLayout.off_fnbc_aot_poly, .off_fnbc_aot_poly_sites, .aot_poly_ways
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -95,6 +95,9 @@
+        the class id of an ordinary array. Read inline so a compiled `a[i]` is
+        a class check, a bounds check and a load. */
+     uint32_t off_object_array_count, off_object_array_values, class_array;
++    /* The per-site polymorphic property cache: where the bytecode's allocation
++       is, the stride between sites, and the ways per site. */
++    uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+@@ -223,6 +226,13 @@
+    old and move in the owning build). Used where the handler uses SET_REG_P. */
+ void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v);
+ 
++/* Fill one site's polymorphic property cache from an object the compiled body
++   just checked. Returns 1 with the slot offset, or 0 when the property is not
++   own data (or not writable, for a write) and the body must exit. Runs no
++   JavaScript, so a caller needs no safepoint first. */
++int qjs_aot_poly_fill(JSContext *ctx, JSRegRun *f, int site, JSValue obj,
++                      JSAtom atom, int write, uint32_t *off);
++
+ /* Cache the variable buffer once at function entry: AOT_VAR(vb, slot). */
+ JSValue *qjs_aot_var_buf(JSRegRun *f);
+ 
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1613,6 +1613,20 @@
+ #define AOT_ELEM_HOLEY  (1u << 4)
+ #endif /* QJS_AOT_PROFILE */
+ 
++/* One polymorphic property cache entry: the receiver shape, the property's
++   byte offset in its object, and whether it may be written (kind 1 = readable
++   own data, 2 = writable own data on a non-prototype). */
++typedef struct JSAotPolyEntry {
++    JSShape *shape;
++    uint32_t off;
++    uint16_t kind;
++    uint16_t fill;
++} JSAotPolyEntry;
++
++#define AOT_POLY_WAYS 4
++#define AOT_POLY_READ 1
++#define AOT_POLY_WRITE 2
++
+ typedef struct JSFunctionBytecode {
+     JSGCObjectHeader header; /* must come first */
+     uint8_t is_strict_mode : 1;
+@@ -1763,6 +1777,13 @@
+        regvm_record_eligible. */
+     void *aot_fn;
+     uint32_t aot_index;
++    /* The per-site polymorphic property cache a specialised body fills: four
++       entries of (shape, offset, kind) per site, allocated on demand and freed
++       with the bytecode. The entries hold counted shape references, so a shape
++       cannot be freed and its address reused while the cache names it. */
++    struct JSAotPolyEntry *aot_poly;
++    uint32_t aot_poly_sites;
++    uint32_t aot_poly_stride; /* the allocation's slot stride, for realloc-free fill */
+     /* The record and light eligibility a bound function had before binding:
+        js_aot_unbind restores them, so a disabled function runs the interpreter
+        through its normal call path. The light path's own flag is not saved;
+@@ -8109,6 +8130,17 @@
+     }
+     js_free_rt(rt, b->regvm_pic);
+     b->regvm_pic = NULL;
++#if QJS_AOT || QJS_AOT_GEN
++    if (b->aot_poly != NULL) {
++        uint32_t i, n = b->aot_poly_sites * AOT_POLY_WAYS;
++        for (i = 0; i < n; i++)
++            if (b->aot_poly[i].shape != NULL)
++                js_free_shape(rt, b->aot_poly[i].shape);
++        js_free_rt(rt, b->aot_poly);
++        b->aot_poly = NULL;
++        b->aot_poly_sites = 0;
++    }
++#endif
+     b->regvm_light_fast = b->regvm_light && b->regvm_pic_count == 0;
+     js_free_rt(rt, b->regvm_pic_holder);
+     b->regvm_pic_holder = NULL;
+@@ -60033,6 +60065,10 @@
+         (uint32_t)offsetof(JSObject, u.func.function_bytecode);
+     out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
+ #if QJS_AOT || QJS_AOT_GEN
++    out->off_fnbc_aot_poly = (uint32_t)offsetof(JSFunctionBytecode, aot_poly);
++    out->off_fnbc_aot_poly_sites =
++        (uint32_t)offsetof(JSFunctionBytecode, aot_poly_sites);
++    out->aot_poly_ways = AOT_POLY_WAYS;
+     out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
+     out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
+     out->class_array = JS_CLASS_ARRAY;
+@@ -61309,6 +61345,89 @@
+ /* Bind a function to its generated entry. The table is sorted by digest;
+    `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
+    bytecode is final. */
++/* Look a property up as an own data slot of `obj`, for the polymorphic cache.
++   Returns 1 and the byte offset when it is one, 0 otherwise. A write also
++   needs the slot to be writable and the object not to be a prototype. It never
++   runs JavaScript, so a compiled body may call it without a safepoint. */
++#if QJS_AOT || QJS_AOT_GEN
++static int js_aot_poly_lookup(JSObject *obj, JSAtom atom, int write, uint32_t *off)
++{
++    JSShape *sh = obj->shape;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    prs = find_own_property(&pr, obj, atom);
++    if (prs == NULL)
++        return 0;
++    if (write) {
++        if (!(prs->flags & JS_PROP_WRITABLE))
++            return 0;
++        if (!(prs->flags & JS_PROP_CONFIGURABLE) && !(prs->flags & JS_PROP_WRITABLE))
++            return 0;
++        if (obj->is_prototype)
++            return 0;
++    }
++    (void)sh;
++    *off = (uint32_t)((const unsigned char *)&pr->u.value - (const unsigned char *)obj->prop);
++    return 1;
++}
++
++/* Fill one site's polymorphic cache with `obj`'s shape and the property's
++   offset. Round-robin: a full set replaces the entry whose fill stamp is oldest.
++   Returns 1 with *off on success, 0 when the property is not own data (or not
++   writable, for a write) and the caller must exit. Runs no JavaScript. */
++int qjs_aot_poly_fill(
++    JSContext *ctx, JSRegRun *f, int site, JSValue obj, JSAtom atom, int write,
++    uint32_t *off)
++{
++    JSFunctionBytecode *b = f->b;
++    JSAotPolyEntry *e;
++    JSShape *sh;
++    int k, slot = -1;
++    uint32_t off2;
++    if (b == NULL || site < 0 || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return 0;
++    if (!js_aot_poly_lookup(JS_VALUE_GET_OBJ(obj), atom, write, &off2))
++        return 0;
++    if (b->aot_poly == NULL || (uint32_t)site >= b->aot_poly_sites) {
++        uint32_t n = (uint32_t)site + 8, i;
++        JSAotPolyEntry *ne =
++            js_mallocz_rt(ctx->rt, sizeof(JSAotPolyEntry) * n * AOT_POLY_WAYS);
++        if (ne == NULL)
++            return 0;
++        for (i = 0; i < b->aot_poly_sites * AOT_POLY_WAYS; i++) {
++            ne[i] = b->aot_poly[i];
++            b->aot_poly[i].shape = NULL;
++        }
++        js_free_rt(ctx->rt, b->aot_poly);
++        b->aot_poly = ne;
++        b->aot_poly_sites = n;
++    }
++    e = b->aot_poly + (size_t)site * AOT_POLY_WAYS;
++    sh = JS_VALUE_GET_OBJ(obj)->shape;
++    for (k = 0; k < AOT_POLY_WAYS; k++) {
++        if (e[k].shape == sh) {
++            e[k].off = off2;
++            e[k].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
++            *off = off2;
++            return 1;
++        }
++        if (slot < 0 || (e[k].shape == NULL && e[slot].shape != NULL))
++            slot = k;
++        else if (e[slot].shape != NULL && e[k].shape != NULL &&
++                 e[k].fill < e[slot].fill)
++            slot = k;
++    }
++    if (e[slot].shape != NULL)
++        js_free_shape(ctx->rt, e[slot].shape);
++    e[slot].shape = js_dup_shape(sh);
++    e[slot].off = off2;
++    e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
++    e[slot].fill = (uint16_t)(e[slot].fill + 1);
++    *off = off2;
++    return 1;
++}
++#endif /* QJS_AOT || QJS_AOT_GEN */
++
+ static void js_aot_bind(JSFunctionBytecode *b)
+ {
+     uint8_t digest[16];
