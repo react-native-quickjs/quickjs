@@ -751,6 +751,41 @@ static void q2_emit_colds(FILE *f) {
   }
 }
 
+/* A field read that misses: fill the site's cache and continue compiled, out of
+   line. `cond` is the hit test the caller already printed; the arm repeats the
+   pre-instruction write-back, runs the engine's read (which may run a getter
+   and throw) and adopts the owned result. If the stream cannot be opened the
+   arm is emitted inline, which is slower but identical. */
+static void q2_cold_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const char *cond, int atom_off,
+    int site, const char *recv, Q2ValueId defv, int off) {
+  int k;
+  FILE *m = q2_cold_begin(f, cond, 1, &k);
+  if (m) {
+    fprintf(
+        m,
+        "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+        "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+        "exception; }\n"
+        "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
+        "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
+        in->pc, recv, atom_off, site, defv, in->pc, off, defv);
+    q2_cold_end(k);
+    return;
+  }
+  fprintf(f, "    if (__builtin_expect(!(%s), 0)) {\n", cond);
+  q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+  fprintf(
+      f,
+      "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
+      "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+      "exception; }\n"
+      "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
+      "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
+      "    }\n",
+      in->pc, recv, atom_off, site, defv, in->pc, off, defv);
+}
+
 /* The frame as the interpreter must see it on the way out of an exception:
    every value that is live anywhere in the function, stored to
    its slot. Emitted once, at the function's `exception:` label, because the
@@ -2231,48 +2266,14 @@ static int q2_emit_native(
       }
       /* A miss fills the cache and continues compiled rather than leaving for
          the interpreter, so a cold or polymorphic site never disables the
-         function. The read may run a getter, so it can throw; it returns an
-         owned value, so the store adopts it. The arm is out of line: the hot
-         path pays only the branch. */
+         function. The arm is out of line: the hot path pays only the branch. */
       {
         char cond[160];
-        int k, ok = 0;
         snprintf(
             cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, &v%u)",
             a, site, in->def[0]);
-        m = q2_cold_begin(f, cond, 1, &k);
-        if (m) {
-          fprintf(
-              m,
-              "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
-              "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
-              "exception; }\n"
-              "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-              "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
-              in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off,
-              in->def[0]);
-          q2_cold_end(k);
-          ok = 1;
-        }
-        if (!ok) {
-          /* Without a usable stream, keep the inline miss arm. */
-          fprintf(
-              f,
-              "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
-              "&v%u), 0)) {\n",
-              a, site, in->def[0]);
-          q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-          fprintf(
-              f,
-              "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
-              "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
-              "exception; }\n"
-              "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-              "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
-              "    }\n",
-              in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off,
-              in->def[0]);
-        }
+        q2_cold_read(
+            f, fn, in, cond, in->arg[2].off, site, a, in->def[0], off);
       }
       return 1;
     }
@@ -2289,36 +2290,23 @@ static int q2_emit_native(
       /* The second receiver is the first link's result, as in the handler. Each
          link is stored as it is produced, so the next reads it from the frame
          and a miss on either fills that link's cache and continues. */
-      fprintf(
-          f,
-          "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
-          "&v%u), 0)) {\n",
-          a, s1, in->def[0]);
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
-          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
-          "exception; }\n"
-          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
-          in->pc, a, in->arg[2].off, s1, in->def[0], in->pc, off0, in->def[0]);
-      fprintf(f, "    }\n");
-      fprintf(
-          f,
-          "    if (__builtin_expect(!q2_own_read_hit(pic, holders, v%u, %d, "
-          "&v%u), 0)) {\n",
-          in->def[0], s2, in->def[1]);
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      if (qjs_aot_read_field_slow(ctx, f, code + %d, v%u, "
-          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
-          "exception; }\n"
-          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-          "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
-          in->pc, in->def[0], in->arg[6].off, s2, in->def[1], in->pc, off1, in->def[1]);
-      fprintf(f, "    }\n");
+      {
+        char cond[160], recv[16];
+        snprintf(
+            cond, sizeof(cond),
+            "q2_own_read_hit(pic, holders, %s, %d, &v%u)", a, s1,
+            in->def[0]);
+        q2_cold_read(
+            f, fn, in, cond, in->arg[2].off, s1, a, in->def[0], off0);
+        /* The second receiver is the first link's fresh value. */
+        snprintf(recv, sizeof(recv), "v%u", in->def[0]);
+        snprintf(
+            cond, sizeof(cond),
+            "q2_own_read_hit(pic, holders, %s, %d, &v%u)", recv, s2,
+            in->def[1]);
+        q2_cold_read(
+            f, fn, in, cond, in->arg[6].off, s2, recv, in->def[1], off1);
+      }
       return 1;
     }
     case ROP_get_field2:
@@ -2367,6 +2355,8 @@ static int q2_emit_native(
       fprintf(f, "    }\n");
       return 1;
     }
+    /* (get_field2 keeps its proto-fold chain inline: the fold and the engine's
+       read share one arm, which is already cold for a plain own read.) */
     case ROP_put_field: { /* "rasr": receiver, atom, site, value */
       int site = (int)in->arg[2].val;
       char v[64];
@@ -2377,21 +2367,35 @@ static int q2_emit_native(
       q2_op(in, 3, v, sizeof(v));
       /* The own-slot overwrite inline; a counted value or a prototype receiver
          takes the engine's hit. A miss runs the engine's store, which can call
-         a setter and throw, fills the cache and continues compiled. */
-      fprintf(
-          f,
-          "    if (__builtin_expect(!q2_put_field_hit(pic, %s, %d, %s), 0) &&\n"
-          "        !qjs_aot_put_field_own(ctx, f, %s, %d, %s)) {\n",
-          a, site, v, a, site, v);
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      if (qjs_aot_put_field_slow(ctx, f, code + %d, %s, "
-          "(int)qjs_aot_ld_u32(code + %d), %d, %s) < 0) { pc = %d; goto "
-          "exception; }\n"
-          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
-          "    }\n",
-          in->pc, a, in->arg[1].off, site, v, in->pc);
+         a setter and throw, fills the cache and continues compiled. Both
+         fallbacks are one out-of-line arm. */
+      {
+        char cond[256], arm[256];
+        int k;
+        FILE *m;
+        snprintf(
+            cond, sizeof(cond),
+            "q2_put_field_hit(pic, %s, %d, %s) || "
+            "qjs_aot_put_field_own(ctx, f, %s, %d, %s)",
+            a, site, v, a, site, v);
+        snprintf(
+            arm, sizeof(arm),
+            "      if (qjs_aot_put_field_slow(ctx, f, code + %d, %s, "
+            "(int)qjs_aot_ld_u32(code + %d), %d, %s) < 0) { pc = %d; goto "
+            "exception; }\n"
+            "      pic = q2_pic(f); holders = q2_pic_holder(f);\n",
+            in->pc, a, in->arg[1].off, site, v, in->pc);
+        m = q2_cold_begin(f, cond, 1, &k);
+        if (m) {
+          fputs(arm, m);
+          q2_cold_end(k);
+        } else {
+          fprintf(f, "    if (__builtin_expect(!(%s), 0)) {\n", cond);
+          q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+          fputs(arm, f);
+          fprintf(f, "    }\n");
+        }
+      }
       return 1;
     }
     case ROP_get_global: { /* "rabs": d, atom, throwing, site */
