@@ -710,6 +710,10 @@ static void q2_emit_exits(FILE *f, const Q2Func *fn) {
 static FILE *q2_cold_begin(FILE *f, const char *cond, int wb, int *k) {
   FILE *m;
   Q2Cold *c;
+  /* A leaf body has no labels and no continuation to return to: a failing
+     guard there returns 0 and its caller makes the call. So it never takes an
+     out-of-line arm; the caller keeps its inline form. */
+  if (g_em.pure) return NULL;
   if (g_em.ncolds == g_em.capcolds) {
     int nc = g_em.capcolds ? g_em.capcolds * 2 : 16;
     Q2Cold *nn = realloc(g_em.colds, sizeof(*nn) * (size_t)nc);
@@ -746,7 +750,13 @@ static void q2_emit_colds(FILE *f) {
   int i;
   for (i = 0; i < g_em.ncolds; i++) {
     Q2Cold *c = &g_em.colds[i];
-    if (!c->buf) continue;
+    /* A label is always printed: an arm whose stream was lost must still give
+       its branch somewhere to land, and an empty arm re-joins the hot path at
+       its `r_` label, which is exactly what the inline form did. */
+    if (!c->buf) {
+      fprintf(f, "s_%d: {\n    { goto r_%d; }\n    }\n", i, i);
+      continue;
+    }
     fprintf(f, "s_%d: {\n%s    }\n", i, c->buf);
   }
 }
@@ -784,6 +794,25 @@ static void q2_cold_read(
       "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
       "    }\n",
       in->pc, recv, atom_off, site, defv, in->pc, off, defv);
+}
+
+/* A generic slow arm for an operation that continues compiled when it
+   succeeds and throws when it fails: the hot path tests `cond`, and the arm is
+   the text `body` (already formatted with the arm's stream in mind). Used for
+   the binary, global and compare paths, whose arms all end by continuing. */
+static void q2_cold_arm(
+    FILE *f, const Q2Func *fn, const char *cond, const char *body) {
+  int k;
+  FILE *m = q2_cold_begin(f, cond, 1, &k);
+  if (m) {
+    fputs(body, m);
+    q2_cold_end(k);
+    return;
+  }
+  fprintf(f, "    if (__builtin_expect(!(%s), 0)) {\n", cond);
+  q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+  fputs(body, f);
+  fprintf(f, "    }\n");
 }
 
 /* The frame as the interpreter must see it on the way out of an exception:
@@ -2041,22 +2070,23 @@ static int q2_emit_native(
         return 1;
       }
       q2_guard(f, in->pc, sid);
-      fprintf(
-          f,
-          "    if (__builtin_expect(!q2_arith(%d, %s, %s, &v%u), "
-          "0)) {\n",
-          sub, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)), dv);
       /* A miss is not a deopt: a string concatenation, a coercion or a mixed
          tag takes the interpreter's generic binary and continues. It can run
-         valueOf/toString, so the frame is written back first. */
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      if (qjs_aot_binary(ctx, %d, %s, %s, &v%u)) { pc = %d; goto "
-          "exception; }\n"
-          "    }\n",
-          sub, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)), dv,
-          in->pc);
+         valueOf/toString, so the frame is written back first; the arm is out
+         of line. */
+      {
+        char cond[200], body[256];
+        const char *la = q2_op(in, 1, a, sizeof(a));
+        const char *lb = q2_op(in, 2, b, sizeof(b));
+        snprintf(
+            cond, sizeof(cond), "q2_arith(%d, %s, %s, &v%u)", sub, la, lb, dv);
+        snprintf(
+            body, sizeof(body),
+            "      if (qjs_aot_binary(ctx, %d, %s, %s, &v%u)) { pc = %d; goto "
+            "exception; }\n",
+            sub, la, lb, dv, in->pc);
+        q2_cold_arm(f, fn, cond, body);
+      }
       return 1;
     }
     case ROP_add_imm_s:
@@ -2093,18 +2123,20 @@ static int q2_emit_native(
         return 1;
       }
       q2_guard(f, in->pc, sid);
-      fprintf(
-          f,
-          "    if (__builtin_expect(!q2_arith(%d, %s, "
-          "JS_MKVAL(JS_TAG_INT, %d), &v%u), 0)) {\n",
-          sub, q2_op(in, ai, a, sizeof(a)), imm, dv);
-      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
-      fprintf(
-          f,
-          "      if (qjs_aot_binary(ctx, %d, %s, JS_MKVAL(JS_TAG_INT, %d), "
-          "&v%u)) { pc = %d; goto exception; }\n"
-          "    }\n",
-          sub, q2_op(in, ai, a, sizeof(a)), imm, dv, in->pc);
+      {
+        char cond[200], body[256];
+        const char *la = q2_op(in, ai, a, sizeof(a));
+        snprintf(
+            cond, sizeof(cond), "q2_arith(%d, %s, JS_MKVAL(JS_TAG_INT, %d), "
+            "&v%u)",
+            sub, la, imm, dv);
+        snprintf(
+            body, sizeof(body),
+            "      if (qjs_aot_binary(ctx, %d, %s, JS_MKVAL(JS_TAG_INT, %d), "
+            "&v%u)) { pc = %d; goto exception; }\n",
+            sub, la, imm, dv, in->pc);
+        q2_cold_arm(f, fn, cond, body);
+      }
       return 1;
     }
     case ROP_mul_add:
