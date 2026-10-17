@@ -3823,7 +3823,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_OBJECT_FUNC_BYTECODE %uu\n"
           "#define QJS_AOT_CLASS_BYTECODE_FUNCTION %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_FN %uu\n"
-          "#define QJS_AOT_OFF_FNBC_REGVM_PIC %uu\n\n"
+          "#define QJS_AOT_OFF_FNBC_REGVM_PIC %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES %uu\n"
+          "#define QJS_AOT_CLASS_ARRAY %uu\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
           lay.hash, lay.sizeof_JSObject, lay.sizeof_JSShape,
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
@@ -3853,7 +3856,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_ctx_interrupt_counter, lay.off_ctx_rt,
           lay.off_object_func_bytecode,
           lay.class_bytecode_function, lay.off_fnbc_aot_fn,
-          lay.off_fnbc_regvm_pic);
+          lay.off_fnbc_regvm_pic, lay.off_object_array_count,
+          lay.off_object_array_values, lay.class_array);
       fclose(lf);
     }
 
@@ -3913,6 +3917,30 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  const char *s = getenv(\"QJS_AOT_SPEC\");\n"
         "  q2_no_spec = (e != NULL && e[0] != '0');\n"
         "  q2_spec_on = (s != NULL && s[0] != '0');\n"
+        "}\n\n"
+        /* A fast array's element read: class, bounds, hole and lazy-JSON
+           checks, then the element itself, borrowed. No reference is taken,
+           so the caller must consume it before the next safepoint, exactly
+           like the cache-hit field read. */
+        "static inline __attribute__((always_inline)) int q2_elem_hit(JSValue arr, JSValue k, JSValue *out)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  uint32_t i;\n"
+        "  JSValue v;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(k) != JS_TAG_INT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_ARRAY)\n"
+        "    return 0;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT))\n"
+        "    return 0;\n"
+        "  v = (*(JSValue *const *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
+        "  if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  *out = v;\n"
+        "  return 1;\n"
         "}\n\n"
         "static inline const void *q2_pic(JSRegRun *f)\n"
         "{\n"

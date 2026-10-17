@@ -60033,6 +60033,9 @@ void js_aot_gen_layout(JSAotGenLayout *out)
         (uint32_t)offsetof(JSObject, u.func.function_bytecode);
     out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
 #if QJS_AOT || QJS_AOT_GEN
+    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
+    out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
+    out->class_array = JS_CLASS_ARRAY;
     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
 #endif
     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);

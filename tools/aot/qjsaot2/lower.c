@@ -2794,6 +2794,24 @@ static int q2_emit_native(
       int sid = q2_site();
       int off = fn->values[in->def[0]].reg * 16;
       q2_guard(f, in->pc, sid);
+      /* The specialised body reads a plain fast array's element inline: a
+         class check, a bounds check, and the hole and lazy-marker tests. A
+         miss (another class, out of bounds, a hole, a lazy JSON marker, or the
+         object array underneath) exits at this instruction. */
+      if (g_em.spec) {
+        fprintf(
+            f,
+            "    if (__builtin_expect(!q2_elem_hit(%s, %s, &v%u), 0)) {\n",
+            q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)),
+            in->def[0]);
+        q2_miss(f, in->pc, sid);
+        fprintf(f, "    }\n");
+        /* The element is borrowed from the array, so nothing is adopted here:
+           the local holds it and the next write-back duplicates it, exactly as
+           the inline field-read hit leaves its slot alone. */
+        (void)off;
+        return 1;
+      }
       fprintf(
           f,
           "    if (__builtin_expect(!qjs_aot_get_element(%s, %s, &v%u), "

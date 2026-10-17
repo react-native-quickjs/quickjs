@@ -1,0 +1,46 @@
+Subject: Publish the array layout an inline element read needs
+
+What this does
+  Adds the fast array's element count and element vector offsets, and
+  the class id of an ordinary array, to `JSAotGenLayout`.
+
+Why we need it
+  A compiled `a[i]` on a hot array currently calls back into the engine
+  for the whole read. With these offsets it is a class check, a bounds
+  check, a hole and lazy-marker test, and a load.
+
+What it adds
+  JSAotGenLayout.off_object_array_count   - offsetof(JSObject, u.array.u1.size)
+  JSAotGenLayout.off_object_array_values  - offsetof(JSObject, u.array.u.values)
+  JSAotGenLayout.class_array              - JS_CLASS_ARRAY
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -91,6 +91,10 @@
+        object's bytecode, that bytecode's compiled entry, and its caches. */
+     uint32_t off_object_func_bytecode, class_bytecode_function;
+     uint32_t off_fnbc_aot_fn, off_fnbc_regvm_pic;
++    /* The array element read: a fast array's length and element vector, and
++       the class id of an ordinary array. Read inline so a compiled `a[i]` is
++       a class check, a bounds check and a load. */
++    uint32_t off_object_array_count, off_object_array_values, class_array;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60033,6 +60033,9 @@
+         (uint32_t)offsetof(JSObject, u.func.function_bytecode);
+     out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
+ #if QJS_AOT || QJS_AOT_GEN
++    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
++    out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
++    out->class_array = JS_CLASS_ARRAY;
+     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
+ #endif
+     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
