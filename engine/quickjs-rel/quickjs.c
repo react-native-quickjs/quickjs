@@ -61241,6 +61241,7 @@ QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site)
 }
 
 /* Binding/entry counters, printed at teardown under QJS_AOT_STATS. */
+uint64_t qjs_aot_spec_refused, qjs_aot_spec_exits;
 uint64_t js_aot_bound_count;
 uint64_t js_aot_enter_count;
 
@@ -61281,6 +61282,10 @@ void js_aot_stats_dump(JSRuntime *rt)
             (unsigned long long)rt->aot_epoch_bumps,
             cells_set, r ? r->cell_count : 0u, disabled,
             (unsigned long long)sw, swbuf);
+    if (qjs_aot_spec_refused || qjs_aot_spec_exits)
+        fprintf(stderr, "aot: spec refused=%llu exits=%llu\n",
+                (unsigned long long)qjs_aot_spec_refused,
+                (unsigned long long)qjs_aot_spec_exits);
 }
 
 /* Stop using the unit for one function: drop the binding and recompute the

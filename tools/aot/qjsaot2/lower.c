@@ -737,6 +737,7 @@ static void q2_emit_exits(FILE *f, const Q2Func *fn) {
     if (g_em.spec)
       fprintf(
           f,
+          "    qjs_aot_spec_exits++;\n"
           "    if (++q2_spec_fail_%s > Q2_SPEC_FAIL_MAX) { q2_spec_off_%s = "
           "1; q2_spec_fail_%s = 0; }\n",
           g_em.hex, g_em.hex, g_em.hex);
@@ -3742,7 +3743,8 @@ static void q2_emit_one(
         f,
         "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || "
         "q2_no_spec || q2_spec_off_%s, 0))\n"
-        "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
+        "        { qjs_aot_spec_refused++; return aot_g_%s(ctx, f, fr, "
+        "entry_pc); }\n",
         hex, hex);
   else
     /* The generic body still has to refuse a mid-function entry: the

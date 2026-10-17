@@ -1,0 +1,54 @@
+Subject: Count specialised-body refusals and exits under QJS_AOT_STATS
+
+What this does
+  Adds two counters the unit bumps directly: how often a specialised body
+  was refused at entry, and how many exits it took.
+
+Why we need it
+  Phase 1's gate asks how often the specialised body is refused and how
+  often it switches itself off. Without these the answer needs a rebuilt
+  unit with printf instrumentation; with them it is one environment
+  variable.
+
+What it adds
+  qjs_aot_spec_refused, qjs_aot_spec_exits - "aot: spec refused=N exits=M"
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -199,6 +199,10 @@
+ /* The register file holds JSValues at byte offsets; operands are byte offsets. */
+ #define AOT_REG(fr, off) (*(JSValue *)((uint8_t *)(fr) + (off)))
+ 
++/* How often a specialised body was refused at entry, and how many exits it
++   took, under QJS_AOT_STATS. The unit bumps these directly. */
++extern uint64_t qjs_aot_spec_refused, qjs_aot_spec_exits;
++
+ /* Re-read a 32-bit little-endian operand (an atom) from the live bytecode. */
+ static inline uint32_t qjs_aot_ld_u32(const uint8_t *p)
+ {
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61241,6 +61241,7 @@
+ }
+ 
+ /* Binding/entry counters, printed at teardown under QJS_AOT_STATS. */
++uint64_t qjs_aot_spec_refused, qjs_aot_spec_exits;
+ uint64_t js_aot_bound_count;
+ uint64_t js_aot_enter_count;
+ 
+@@ -61281,6 +61282,10 @@
+             (unsigned long long)rt->aot_epoch_bumps,
+             cells_set, r ? r->cell_count : 0u, disabled,
+             (unsigned long long)sw, swbuf);
++    if (qjs_aot_spec_refused || qjs_aot_spec_exits)
++        fprintf(stderr, "aot: spec refused=%llu exits=%llu\n",
++                (unsigned long long)qjs_aot_spec_refused,
++                (unsigned long long)qjs_aot_spec_exits);
+ }
+ 
+ /* Stop using the unit for one function: drop the binding and recompute the
