@@ -3911,16 +3911,18 @@ int qjsaot_driver_main(int argc, char **argv) {
            body. */
         "#define Q2_SPEC_FAIL_MAX 64\n"
         /* The A/B switch, and the enable switch for the specialised body. The
-           specialised body is the default now that the shape groups make its
-           reads hit; QJS_AOT_SPEC=0 runs every function through the generic
-           one for comparison. */
+           specialised body is emitted and passes the inner loop, but it still
+           miscompiles DeltaBlue (the blue-constraint bookkeeping sees a cycle
+           that is not there), so it stays off until that is fixed: a wrong
+           answer costs more than the speed it buys. QJS_AOT_SPEC=1 turns it on
+           for the investigation. */
         "static int q2_no_spec, q2_spec_on;\n"
         "static void __attribute__((constructor)) q2_no_spec_init(void)\n"
         "{\n"
         "  const char *e = getenv(\"QJS_AOT_NO_SPEC\");\n"
         "  const char *s = getenv(\"QJS_AOT_SPEC\");\n"
         "  q2_no_spec = (e != NULL && e[0] != '0');\n"
-        "  q2_spec_on = (s == NULL || s[0] != '0');\n"
+        "  q2_spec_on = (s != NULL && s[0] != '0');\n"
         "}\n\n"
         /* A site's polymorphic cache: four (shape, offset, kind) entries the
            compiled body fills on demand; NULL until the function has used the
