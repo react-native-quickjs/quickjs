@@ -33,6 +33,8 @@
 int qjsaot_driver_main(int argc, char **argv);
 int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 extern int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
+int qjsaot2_emit_pure(FILE *f, const JSAotGenFunc *g, char hex[33]);
+extern int (*qjs_aot_emit_pure)(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
 static char *read_file(const char *path, long *len_out) {
   FILE *f = fopen(path, "rb");
@@ -81,6 +83,7 @@ int main(int argc, char **argv) {
     /* The unit-builder mode: the same CLI as qjsaot, with the SSA body
        emitter. Options are the driver's, so nothing is validated here. */
     qjs_aot_emit_body = qjsaot2_emit_body;
+    qjs_aot_emit_pure = qjsaot2_emit_pure;
     return qjsaot_driver_main(argc, argv);
   }
   for (i = 1; i < argc; i++) {
@@ -295,7 +298,7 @@ int main(int argc, char **argv) {
       "qjsaot2: %ld/%ld functions%s, %ld blocks, %ld insns, %ld values\n",
       nfuncs_ok, nfuncs_uniq, verify ? " verified" : " built", nblocks, ninsns,
       nvalues);
-  js_aot_gen_free(rt, funcs);
+  js_aot_gen_free(rt, funcs, nfuncs);
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
   return fails ? 1 : 0;

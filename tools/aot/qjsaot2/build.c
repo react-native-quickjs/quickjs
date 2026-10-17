@@ -378,7 +378,7 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     /* arithmetic, logic and comparison */
     /* "rbrr": d, sub, a, b; "rbr": d, sub, s; "rbrI": d, sub, a, imm */
     case ROP_binary_cpool: /* "rbrbc": d, sub, a, kind, idx (a const) */
-      info.op = Q2_OP_FALLBACK;
+      info.op = Q2_OP_BINARY;
       info.ndef = 1;
       info.def[0] = 0;
       info.nuse = 1;
@@ -602,17 +602,20 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
-    case ROP_inc_branch_lt: /* "rrt" */
+    case ROP_inc_branch_lt: /* "rrt": d, bound, target; d is read and updated */
     case ROP_inc_branch_lt_s:
-      info.op = Q2_OP_FALLBACK;
-      info.ndef = 0;
-      info.nuse = 0; /* conservative: unknown roles */
-      info.reads = Q2_E_HEAP;
-      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      info.op = Q2_OP_BRANCH_CMP;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 2; /* the register incremented in place, and the bound */
+      info.use[0] = 0;
+      info.use[1] = 1;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
       return &info;
-    case ROP_add_imm_self_branch: /* "rit": d, imm, target; d defined */
+    case ROP_add_imm_self_branch: /* "rit": d, imm, target; d is updated */
     case ROP_add_imm_self_branch_s:
-      info.op = Q2_OP_FALLBACK;
+      info.op = Q2_OP_BRANCH;
       info.ndef = 1;
       info.def[0] = 0;
       info.nuse = 1;
@@ -659,8 +662,10 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.writes = Q2_E_SHAPE | Q2_E_CONTROL;
       return &info;
     case ROP_get_this_field: /* "rras": d, recv, atom, site */
+    case ROP_get_this_field2:
       /* The handler stores `this` into `recv` and then reads the field from
          it, so both operands are destinations and neither is read. */
+      info.op = Q2_OP_GET_FIELD;
       info.ndef = 2;
       info.def[0] = 0;
       info.def[1] = 1;
@@ -697,11 +702,11 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.writes = Q2_E_HEAP | Q2_E_SLOT | Q2_E_ELEMENTS | Q2_E_SHAPE |
                     Q2_E_GLOBAL | Q2_E_VARREF | Q2_E_CONTROL;
       return &info;
-    case ROP_apply_arguments: /* "rru": d, callee, window */
+    case ROP_apply_arguments: /* "rru": window, d, arguments slot */
+      /* The window is three registers from operand 0 (the callee, `apply` and
+         the receiver); the decoder sets it, since it has no count operand. */
       info.ndef = 1;
-      info.def[0] = 0;
-      info.nuse = 1;
-      info.use[0] = 1;
+      info.def[0] = 1;
       info.reads = 0;
       info.writes = Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
@@ -1138,6 +1143,13 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       in->win_reg = q2_ri(ab);
       in->win_n = na;
       if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
+        in->win_n = g->reg_count - in->win_reg;
+      if (in->win_n < 0) in->win_n = 0;
+    } else if (in->rop == ROP_apply_arguments && in->narg >= 1 &&
+               in->arg[0].kind == 'r') {
+      in->win_reg = q2_ri((int)in->arg[0].val);
+      in->win_n = 3;
+      if (in->win_reg + in->win_n > g->reg_count)
         in->win_n = g->reg_count - in->win_reg;
       if (in->win_n < 0) in->win_n = 0;
     }

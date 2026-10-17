@@ -53,29 +53,29 @@ B16 pc=146..159 ctl=0 params=- succ=159()
     151 call             rop=72   def=15(tagged) use=v10(r1:tagged,sync)
 B17 pc=159..162 ctl=0 params=- succ=-
     159 return           rop=67   def=- use=v15(r0:tagged,sync)
-F k blocks=6 insns=18 values=31 regs=13 ctl_max=0
+F k blocks=6 insns=18 values=29 regs=13 ctl_max=0
   digest=c9f3d79cfb74feca015291d861b1f264
-B0 pc=0..15 ctl=0 params=- succ=59(v14),15(v14,v15,v13)
+B0 pc=0..15 ctl=0 params=- succ=59(v14),15(v14,v15)
       0 get_arg          rop=16   def=13(tagged) use=-
       5 const            rop=216  def=14(i32) use=-
       8 const            rop=216  def=15(i32) use=-
      11 branch           rop=174  def=- use=v15(r1:i32,sync),v13(r2:tagged,sync)
-B1 pc=15..55 ctl=0 params=v0=r0,v1=r1,v2=r2 succ=55()
+B1 pc=15..55 ctl=0 params=v0=r0,v1=r1 succ=55()
      15 get_global       rop=20   def=16(tagged) use=-
      25 binary           rop=190  def=17(tagged) use=v0(r0:tagged,sync),v16(r3:tagged,sync)
      32 binary           rop=171  def=18(tagged) use=v17(r4:tagged,sync)
      37 get_global       rop=20   def=19(tagged) use=-
      47 call             rop=72   def=20(tagged) use=v19(r3:tagged,sync)
-B2 pc=55..59 ctl=0 params=- succ=15(v21,v22,v23),59(v21)
-     55 fallback         rop=228  def=- use=v1(r1:tagged,sync),v2(r2:tagged,sync)
+B2 pc=55..59 ctl=0 params=- succ=15(v18,v21),59(v18)
+     55 branch_cmp       rop=228  def=21(i32) use=v1(r1:i32),v13(r2:tagged,sync)
 B3 pc=59..105 ctl=0 params=v6=r0 succ=105()
-     59 get_global       rop=20   def=24(tagged) use=-
-     69 get_global       rop=20   def=25(tagged) use=-
-     79 get_global       rop=20   def=26(tagged) use=-
-     89 get_global       rop=20   def=27(tagged) use=-
-     99 unary            rop=33   def=28(tagged) use=v27(r6:tagged,sync)
+     59 get_global       rop=20   def=22(tagged) use=-
+     69 get_global       rop=20   def=23(tagged) use=-
+     79 get_global       rop=20   def=24(tagged) use=-
+     89 get_global       rop=20   def=25(tagged) use=-
+     99 unary            rop=33   def=26(tagged) use=v25(r6:tagged,sync)
 B4 pc=105..116 ctl=0 params=- succ=116()
-    105 move             rop=141  def=29(tagged) use=v6(r0:tagged,sync)
-    110 fallback         rop=77   def=30(tagged) use=-
+    105 move             rop=141  def=27(tagged) use=v6(r0:tagged,sync)
+    110 fallback         rop=77   def=28(tagged) use=-
 B5 pc=116..119 ctl=0 params=- succ=-
-    116 return           rop=67   def=- use=v30(r7:tagged,sync)
+    116 return           rop=67   def=- use=v28(r7:tagged,sync)

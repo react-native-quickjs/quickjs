@@ -1755,7 +1755,7 @@ typedef struct JSFunctionBytecode {
        once that is built; a profile build keeps it. */
     int32_t *regvm_src_pc;
 #endif
-#if QJS_AOT
+#if QJS_AOT || QJS_AOT_GEN
     /* AOT runtime: the generated entry bound to this function, or NULL, and
        its index in the unit's table so a disabled function can be recognised
        at the entry. `aot_state` is 0 unknown, 1 bound, 2 known-absent, set
@@ -25640,6 +25640,13 @@ static JSValueConst regvm_cur_func(JSRuntime *rt)
    applies the this-unless-an-object-was-returned rule. Never set with
    TRIVIAL_RET. */
 #define REGVM_FLAG_LIGHT_CTOR (1 << 11)
+/* A light frame entered from compiled code, which is a C caller rather than a
+   threaded handler: its `return` hands the value back to that C frame instead
+   of tail-calling into a caller's dispatch. */
+#define REGVM_FLAG_C_ENTRY (1 << 12)
+/* A C-entered light frame whose storage is on the compiled caller's C stack,
+   not in the arena: a nested light frame cannot be laid after it. */
+#define REGVM_FLAG_STACK (1 << 13)
 
 #if QJS_REGVM_RECORD
 typedef struct JSRegArenaChunk {
@@ -25775,6 +25782,11 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
    `regvm_t_return_common`. `NULL` already means a throw, and no real
    instruction pointer is 1. */
 #define REGVM_COLD_RET ((uint8_t *)1)
+
+/* Returned by a light frame entered from compiled code: the activation has
+   returned, `f->ret` holds the value and no threaded caller is waiting. The C
+   frame that entered it does the release. */
+#define REGVM_C_RET ((uint8_t *)3)
 
 /* Returned by a `regvm_step` twin that parks the frame (yield, await, a
    generator's return). The continuation is in `sf->cur_pc`, the handshake
@@ -26407,6 +26419,11 @@ static __attribute__((always_inline)) inline JSRegRun *
 regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
                     int ret_off, JSValue *oargv,
                     int na, JSValue **out_regs);
+static __attribute__((always_inline)) inline void
+regvm_light_fill(JSContext *ctx, JSRegRun *nf, JSObject *co,
+                 JSFunctionBytecode *cb, JSRegRun *f, int d, uint8_t *ret_ip,
+                 JSValue *oargv, int na, JSValueConst this_obj,
+                 JSValue **out_regs);
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_return_light_nested(REGVM_ARGS);
 #endif
@@ -26831,6 +26848,18 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
     /* A light frame has no JSStackFrame and no record release walk. */
     if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
         uint64_t hp = f->hdr_pack;
+        /* An activation entered from compiled code hands its value back to the
+           C frame that entered it: the frame is released there, once, on both
+           the return and the throw path. */
+        if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
+#if QJS_DRC
+            f->ret = js_dup(FR(s));
+#else
+            f->ret = FR(s);
+#endif
+            FR(s) = JS_UNDEFINED;
+            return REGVM_C_RET;
+        }
         /* A frame that owns nothing moves the value straight into the caller's
            register, without the round trip through `f->ret` and
            `regvm_t_return_light`. */
@@ -26907,6 +26936,11 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
     /* A light frame returns through its own handlers. */
     if (unlikely(f->flags & REGVM_FLAG_LIGHT)) {
         uint64_t hp = f->hdr_pack;
+        /* A C-entered activation hands `undefined` back to its C frame. */
+        if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
+            f->ret = JS_UNDEFINED;
+            return REGVM_C_RET;
+        }
         /* Same fusion as `regvm_t_return`: a frame that owns nothing moves
            `undefined` straight into the caller's register. */
         if (likely((uint16_t)(hp >> 32) & REGVM_FLAG_TRIVIAL_RET)) {
@@ -27385,9 +27419,9 @@ regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
 {
     JSRegRun *nf;
 
-    if (unlikely(f->caller == NULL)) {
-        /* The entry record lives on the C stack, not in the arena, so take the
-           frame from the arena top. Before the first record call there is no
+    if (unlikely(f->caller == NULL || (f->flags & REGVM_FLAG_STACK))) {
+        /* The entry record, or a compiled caller's stack frame, lives on the C
+           stack, not in the arena, so take the frame from the arena top. Before the first record call there is no
            arena at all; fall back to the record path, which allocates it. */
         size_t top;
 
@@ -27443,11 +27477,25 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
                   JSValue *oargv, int na, JSValue **out_regs)
 {
     JSRegRun *nf = regvm_light_alloc(ctx->rt, f, cb);
-    JSValue *regs, *vb;
-    int k, vc, nregs;
 
     if (unlikely(nf == NULL))
         return NULL;
+    regvm_light_fill(ctx, nf, co, cb, f, d, ret_ip, oargv, na, JS_UNDEFINED,
+                     out_regs);
+    return nf;
+}
+
+/* Fill a light frame `nf` for `cb`, which regvm_light_alloc placed. `d` and
+   `ret_ip` name the caller's destination and resume address; a frame entered
+   from compiled code has neither, and `this_obj` comes from the call. */
+static __attribute__((always_inline)) inline void regvm_light_fill(
+    JSContext *ctx, JSRegRun *nf, JSObject *co, JSFunctionBytecode *cb,
+    JSRegRun *f, int d, uint8_t *ret_ip, JSValue *oargv, int na,
+    JSValueConst this_obj, JSValue **out_regs)
+{
+    JSValue *regs, *vb;
+    int k, vc, nregs;
+
     AOT_PROF_ENTER(cb);
     nf->caller = f;
     nf->ret_ip = ret_ip;
@@ -27458,6 +27506,7 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     nf->func = co;
     nf->cap_ip = NULL;
     nf->sf = NULL;
+    nf->this_obj = this_obj;
     /* `ret` and `set_v` are written before they are read on every path a light
        function can take, so they are not initialised here. */
     vc = cb->var_count;
@@ -27519,7 +27568,6 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
         __asm__ volatile("" ::: "memory");
     }
     *out_regs = regs;
-    return nf;
 }
 
 /* The light call's arena entry, folded into the classifiers so they do not
@@ -28323,6 +28371,50 @@ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
     T_NEXT(T_SZ_RRR);
 }
 
+/* `f.apply(this, arguments)` on a light frame whose `apply` is not the
+   builtin, so the callee needs a real `arguments` object. Light eligibility
+   admits only functions that declare no parameters, so every element is
+   unmapped, as js_build_mapped_arguments makes past `arg_count`. Its `callee`
+   (taken from the innermost JSStackFrame, an outer function's here) is replaced
+   with this frame's function. Memoized in the record path's variable slot and
+   freed by the release walk. `sp` is the window's end. Shared by the threaded
+   and the single-step handler. */
+static JSValue regvm_light_apply_arguments(JSContext *ctx, JSRegRun *f,
+                                           JSValue *sp, int idx)
+{
+    JSFunctionBytecode *lb = f->b;
+    JSValue args2[2], ao, ret_val;
+    JSValue *slot = NULL;
+    int lvc = lb->var_count;
+
+#if QJS_DRC
+    if (lb->var_count <= 255)
+        lvc = lb->regvm_var_count;
+#endif
+    if (idx < lvc)
+        slot = &f->var_buf[idx];
+    if (slot && JS_VALUE_GET_TAG(*slot) != JS_TAG_UNINITIALIZED) {
+        ao = *slot;
+    } else {
+        JSObject *ap;
+
+        ao = js_build_mapped_arguments(ctx, f->argc, vc(f->arg_buf), NULL, 0);
+        if (JS_IsException(ao))
+            return ao;
+        ap = JS_VALUE_GET_OBJ(ao);
+        JS_FreeValue(ctx, ap->prop[2].u.value);
+        ap->prop[2].u.value = js_dup(JS_MKPTR(JS_TAG_OBJECT, f->func));
+        if (slot)
+            *slot = ao;
+    }
+    args2[0] = sp[-1];
+    args2[1] = ao;
+    ret_val = JS_Call(ctx, sp[-2], sp[-3], 2, vc(args2));
+    if (!slot)
+        JS_FreeValue(ctx, ao);
+    return ret_val;
+}
+
 static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
 {
     int w = T_REG(1);
@@ -28334,44 +28426,7 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
 
     REGVM_CAPTURE_IP();
     if (unlikely(f->flags & REGVM_FLAG_LIGHT) && pa == NULL) {
-        /* `apply` is not the builtin, so the callee needs a real `arguments`
-           object. Light eligibility admits only functions that declare no
-           parameters, so every element is unmapped, as
-           js_build_mapped_arguments makes past `arg_count`. Its `callee` (taken
-           from the innermost JSStackFrame, an outer function's here) is
-           replaced with this frame's function. Memoized in the record path's
-           variable slot and freed by the release walk. */
-        JSFunctionBytecode *lb = f->b;
-        JSValue args2[2], ao;
-        JSValue *slot = NULL;
-        int lvc = lb->var_count;
-
-#if QJS_DRC
-        if (lb->var_count <= 255)
-            lvc = lb->regvm_var_count;
-#endif
-        if (idx < lvc)
-            slot = &f->var_buf[idx];
-        if (slot && JS_VALUE_GET_TAG(*slot) != JS_TAG_UNINITIALIZED) {
-            ao = *slot;
-        } else {
-            JSObject *ap;
-
-            ao = js_build_mapped_arguments(ctx, f->argc, vc(f->arg_buf),
-                                           NULL, 0);
-            if (JS_IsException(ao))
-                T_FAIL();
-            ap = JS_VALUE_GET_OBJ(ao);
-            JS_FreeValue(ctx, ap->prop[2].u.value);
-            ap->prop[2].u.value = js_dup(JS_MKPTR(JS_TAG_OBJECT, f->func));
-            if (slot)
-                *slot = ao;
-        }
-        args2[0] = sp[-1];
-        args2[1] = ao;
-        ret_val = JS_Call(ctx, sp[-2], sp[-3], 2, vc(args2));
-        if (!slot)
-            JS_FreeValue(ctx, ao);
+        ret_val = regvm_light_apply_arguments(ctx, f, sp, idx);
         if (JS_IsException(ret_val))
             T_FAIL();
         T_SET_NEXT_P(d, ret_val, 7);
@@ -31041,6 +31096,12 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
     JSRegRun *c;
 
     if (f->caller == NULL) {
+        /* A C-entered activation is released by the C frame that entered it, on
+           both the return and the throw path. */
+        if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
+            f->ret = JS_EXCEPTION;
+            return REGVM_C_RET;
+        }
         f->ret = JS_EXCEPTION;
         return NULL;
     }
@@ -59946,6 +60007,35 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->reg_pic_own_w = REG_PIC_OWN_W;
     out->reg_un_neg = REG_UN_NEG;
     out->reg_un_inc = REG_UN_INC;
+    out->off_regrun_b = (uint32_t)offsetof(JSRegRun, b);
+    out->off_regrun_pic = (uint32_t)offsetof(JSRegRun, pic);
+    out->off_regrun_var_buf = (uint32_t)offsetof(JSRegRun, var_buf);
+    out->off_regrun_arg_buf = (uint32_t)offsetof(JSRegRun, arg_buf);
+    out->off_regrun_func = (uint32_t)offsetof(JSRegRun, func);
+    out->off_regrun_this_obj = (uint32_t)offsetof(JSRegRun, this_obj);
+    out->off_regrun_flags = (uint32_t)offsetof(JSRegRun, flags);
+    out->off_regrun_sf = (uint32_t)offsetof(JSRegRun, sf);
+    out->off_regrun_caller = (uint32_t)offsetof(JSRegRun, caller);
+    out->off_fnbc_regvm_code = (uint32_t)offsetof(JSFunctionBytecode, regvm_code);
+    out->off_fnbc_regvm_pic_holder =
+        (uint32_t)offsetof(JSFunctionBytecode, regvm_pic_holder);
+    out->off_fnbc_var_count = (uint32_t)offsetof(JSFunctionBytecode, var_count);
+    out->off_fnbc_arg_count = (uint32_t)offsetof(JSFunctionBytecode, arg_count);
+    out->off_fnbc_regvm_reg_count =
+        (uint32_t)offsetof(JSFunctionBytecode, regvm_reg_count);
+    out->off_fnbc_var_ref_count =
+        (uint32_t)offsetof(JSFunctionBytecode, var_ref_count);
+    out->off_rt_gv_cell_gen = (uint32_t)offsetof(JSRuntime, gv_cell_gen);
+    out->off_ctx_interrupt_counter =
+        (uint32_t)offsetof(JSContext, interrupt_counter);
+    out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);
+    out->off_object_func_bytecode =
+        (uint32_t)offsetof(JSObject, u.func.function_bytecode);
+    out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
+#if QJS_AOT || QJS_AOT_GEN
+    out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
+#endif
+    out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
     {
         /* is_prototype is a bit-field: find its byte and mask by setting it in
            a zeroed object. */
@@ -61403,6 +61493,36 @@ __attribute__((always_inline)) int qjs_aot_binary(JSContext *ctx, int sub, JSVal
     return js_regvm_binary(ctx, sub, a, b, out);
 }
 
+/* `a <sub> const` where the constant comes from the function's pool (kind
+   REG_CONST_CPOOL) or the atom table. Mirrors the interpreter's
+   ROP_binary_cpool: a pool value is borrowed, an atom is made and released.
+   Returns 1 with an owned *out, 0 when a pool constant stays borrowed, -1 on
+   exception. */
+QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
+                                      uint32_t idx, int kind, JSValue a,
+                                      JSValue *out)
+{
+    JSValue cst;
+
+    if (kind == REG_CONST_CPOOL) {
+        cst = f->b->cpool[idx];
+        if (regvm_num_fast(sub, a, cst, out))
+            return 1;
+        if (js_regvm_binary(ctx, sub, a, cst, out))
+            return -1;
+        return 1;
+    }
+    cst = JS_AtomToValue(ctx, (JSAtom)idx);
+    if (JS_IsException(cst))
+        return -1;
+    if (js_regvm_binary(ctx, sub, a, cst, out) < 0) {
+        JS_FreeValue(ctx, cst);
+        return -1;
+    }
+    JS_FreeValue(ctx, cst);
+    return 1;
+}
+
 JSValue *qjs_aot_arg_buf(JSRegRun *f)
 {
     return f->arg_buf;
@@ -61432,6 +61552,11 @@ QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSVa
     if (JS_IsException(*out))
         return -1;
     return 0;
+}
+
+uint32_t qjs_aot_gv_gen(JSContext *ctx)
+{
+    return ctx->rt->gv_cell_gen;
 }
 
 int qjs_aot_get_global_hit(JSContext *ctx, JSRegRun *f, int site, JSValue *out)
@@ -61684,6 +61809,26 @@ uint8_t *qjs_aot_code(JSRegRun *f)
     return f->b->regvm_code;
 }
 
+/* A compiled function's own return. The value moves out of its register into
+   the caller and the register is cleared, exactly as the interpreter's
+   `return` handler does before leaving the frame. A generator's return
+   suspends, which needs state a compiled body does not carry, so those stay on
+   the step path. */
+QJS_AOT_STUB JSValue qjs_aot_return(JSValue *fr, int off)
+{
+    JSValue *slot = (JSValue *)((uint8_t *)fr + off);
+    JSValue rv = *slot;
+
+#if QJS_DRC
+    /* the register borrows, so the value is handed over with its own
+       reference */
+    if (JS_VALUE_HAS_REF_COUNT(rv))
+        JS_REF_COUNT(JS_VALUE_GET_PTR(rv))++;
+#endif
+    *slot = JS_UNDEFINED;
+    return rv;
+}
+
 JSValue qjs_aot_ret(JSRegRun *f)
 {
     return f->ret;
@@ -61746,27 +61891,30 @@ QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
     return JS_EXCEPTION;
 }
 
+/* Forward: the C-entered finish path, defined with the direct-call helpers. */
+static JSValue regvm_aot_run_to_end(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                                    uint32_t pc);
+
 /* Deoptimise: leave compiled code and let the interpreter finish this
-   activation from `pc`. The activation's frame already holds every value in
-   its register file, so nothing is materialised: the compiled code and the
-   interpreter share the same register array, and a compiled frame is a record
-   frame because a bound function is never record- or light-eligible.
+   activation from `pc`.
 
-   Recording the resume pc and returning lets the AOT entry in
-   js_regvm_execute start the threaded interpreter at that pc with this same
-   frame, so the rest of the activation runs the way it would have without
-   compiled code. `site` counts the failed guard against its deopt site.
+   A compiled function entered from js_regvm_execute has an entry record with a
+   JSStackFrame: recording the resume pc and returning lets that entry start
+   the threaded interpreter at that pc with this same frame.
 
-   A compiled function is entered only from js_regvm_execute, so `f` is always
-   the entry record: `f->caller` is NULL and `f->sf` is set. A light frame has
-   `sf == NULL`, so this cannot be reached with one. */
+   A compiled function entered on a light frame (from compiled code or from the
+   interpreter's light call path) has no threaded caller to resume on, so the
+   rest of the activation runs here, to its return, and its value goes back to
+   the C frame that entered it. `site` counts the failed guard against its
+   deopt site. */
 QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                    uint32_t pc, uint32_t site)
 {
-    (void)fr;
-    assert(f->caller == NULL && f->sf != NULL);
     if (qjs_aot_note_deopt(ctx, site))
         js_aot_unbind(f->b);
+    if (unlikely(f->flags & REGVM_FLAG_C_ENTRY))
+        return regvm_aot_run_to_end(ctx, f, fr, pc);
+    assert(f->caller == NULL && f->sf != NULL);
     f->deopt_pc = pc;
     return JS_UNDEFINED;
 }
@@ -61841,6 +61989,194 @@ static void aot_site_store(JSRuntime *rt, JSAotSite *e, int kind, JSValue v,
     e->cproto = (uint8_t)cproto;
     e->epoch = rt->ic_watchpoint_epoch;
     JS_FreeValueRT(rt, old);
+}
+
+/* Run the threaded interpreter on `f` from register pc `pc` until it returns.
+   The frame is a light frame with REGVM_FLAG_C_ENTRY, so its return and unwind
+   handlers hand the value back through REGVM_C_RET. */
+static JSValue regvm_aot_run_to_end(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                                    uint32_t pc)
+{
+    ctx->rt->regvm_cur = f;
+    regvm_t_dispatch(f->b->regvm_code + pc, fr, f, f->b->realm);
+    return f->ret;
+}
+
+static __attribute__((always_inline)) inline void regvm_light_free(
+    JSRuntime *rt, JSRegRun *f)
+{
+    JSFunctionBytecode *b = f->b;
+    JSValue *p, *end;
+    int vc = b->var_count;
+
+#if QJS_DRC
+    if (b->var_count <= 255)
+        vc = b->regvm_var_count;
+#endif
+    end = vc > 0 ? f->var_buf + vc : f->var_buf;
+    for (p = f->var_buf; p < end; p++)
+        if (REGVM_HAS_COUNT(*p))
+            JS_FreeValueRT(rt, *p);
+    if (unlikely(f->flags & REGVM_FLAG_LIGHT_CTOR))
+        JS_FreeValueRT(rt, f->this_obj);
+}
+
+/* A compiled function calling another compiled function, with no interpreter
+   activation in between. The callee runs on a light frame, which is also an
+   interpreter frame, so a deopt or an uncaught throw inside it is finished by
+   the threaded interpreter on that same frame (regvm_aot_run_to_end) and the
+   caller gets one value back.
+
+   Returns 1 with an owned *out, 0 when the callee is not one this can enter
+   (the caller then takes the generic path), -1 on exception. */
+int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
+                        JSValue callee, JSValue this_obj, JSValue *argv,
+                        JSValue *out)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *co;
+    JSFunctionBytecode *cb;
+    JSRegRun *nf, *prev;
+    JSValue *regs;
+    JSValue ret;
+
+    if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT)
+        return 0;
+    co = JS_VALUE_GET_OBJ(callee);
+    if (co->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    cb = co->u.func.function_bytecode;
+    /* The bind block clears `regvm_light`/`regvm_light_fast` on a bound
+       function, so the saved eligibility is the test. The frame shape and size
+       it implies are kept either way. */
+    if (cb->aot_fn == NULL || !cb->aot_light)
+        return 0;
+    if (cb->func_kind != JS_FUNC_NORMAL || na < cb->arg_count)
+        return 0;
+    if (unlikely(js_poll_interrupts(ctx)))
+        return -1;
+    /* The callee's inline-cached handlers read their PIC base with no NULL
+       test, so the table must exist before the frame is published. */
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    if (caller_f != NULL)
+        regvm_light_seal(rt, caller_f);
+    if (unlikely(rt->regvm_frames == NULL)) {
+        /* No arena yet: this activation's record is on the C stack, so the
+           callee's frame needs the first chunk. Reserve room for it, then let
+           the frame land at the chunk's base. */
+        if (regvm_arena_push_slow(rt, cb->regvm_light_need) == NULL)
+            return 0;
+        rt->regvm_frames_top = 0;
+    }
+    nf = regvm_light_alloc(rt, caller_f, cb);
+    if (nf == NULL)
+        return 0;
+    regvm_light_fill(ctx, nf, co, cb, caller_f, 0, NULL, argv, na, this_obj,
+                     &regs);
+    nf->flags |= REGVM_FLAG_C_ENTRY;
+    prev = rt->regvm_cur;
+    rt->regvm_cur = nf;
+    ret = ((JSAotFn)cb->aot_fn)(cb->realm, nf, regs, 0);
+    rt->regvm_cur = prev;
+    {
+        size_t top = (size_t)((uint8_t *)nf - rt->regvm_frames);
+
+        regvm_light_free(rt, nf);
+        rt->regvm_frames_top = top;
+        if (unlikely(top == 0 && rt->regvm_chunk->prev))
+            regvm_arena_pop_chunk(rt);
+    }
+    *out = ret;
+    return JS_IsException(ret) ? -1 : 1;
+}
+
+/* A compiled function calling a compiled **leaf**: a callee whose cross-call
+   state is a frame on the C stack instead of the arena. That removes the
+   arena bump, the caller seal, the push/pop and the free walk that
+   `qjs_aot_call_light` pays per call. The frame is a fully valid light frame,
+   so a deopt or an uncaught throw inside the callee still finishes through
+   `regvm_aot_run_to_end` on it.
+
+   The caller provides the frame storage and says how many bytes it has; a
+   callee whose frame does not fit, or that is already its own ancestor, is
+   declined so the caller can take the arena path.
+
+   Returns 1 with an owned *out, 0 when this callee cannot be entered this way,
+   -1 on exception. */
+int qjs_aot_call_leaf(JSContext *ctx, JSRegRun *caller_f, int na,
+                      JSValue callee, JSValue this_obj, JSValue *argv,
+                      JSValue *out, void *frame, size_t frame_bytes)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *co;
+    JSFunctionBytecode *cb;
+    JSRegRun *nf = (JSRegRun *)frame;
+    JSValue *regs;
+    JSValue ret;
+
+    if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT)
+        return 0;
+    co = JS_VALUE_GET_OBJ(callee);
+    if (co->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    cb = co->u.func.function_bytecode;
+    if (cb->aot_fn == NULL || !cb->aot_light)
+        return 0;
+    if (cb->func_kind != JS_FUNC_NORMAL || na < cb->arg_count)
+        return 0;
+    if (unlikely(cb->regvm_light_need > frame_bytes))
+        return 0;
+    /* A stack frame recurses on the C stack, so a callee that is already an
+       ancestor cannot be entered this way without risking the process's stack:
+       fall back to the arena path, which tail-dispatches inside one
+       activation. The depth check below then throws the interpreter's
+       RangeError rather than faulting. */
+    {
+        JSRegRun *up;
+        int depth = 0;
+
+        for (up = caller_f; up != NULL; up = up->caller) {
+            if (up->b == cb)
+                return 0;
+            if (++depth > 64)
+                break;
+        }
+    }
+    if (unlikely(js_check_stack_overflow(rt, frame_bytes + 4096))) {
+        JS_ThrowStackOverflow(ctx);
+        return -1;
+    }
+    if (unlikely(js_poll_interrupts(ctx)))
+        return -1;
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    /* The caller may be a light frame above the arena top. Anything the callee
+       allocates from the arena must land above it. */
+    if (caller_f != NULL)
+        regvm_light_seal(rt, caller_f);
+    regvm_light_fill(ctx, nf, co, cb, caller_f, 0, NULL, argv, na, this_obj,
+                     &regs);
+    nf->flags |= REGVM_FLAG_C_ENTRY | REGVM_FLAG_STACK;
+    /* A stack frame is not in the arena, and nothing below depends on
+       `regvm_cur` pointing at it: the fill already rooted the register window
+       for the collector through `fr`, and a deopt publishes it itself. */
+    {
+        JSRegRun *prev = rt->regvm_cur;
+
+        rt->regvm_cur = nf;
+        ret = ((JSAotFn)cb->aot_fn)(cb->realm, nf, regs, 0);
+        rt->regvm_cur = prev;
+    }
+    regvm_light_free(rt, nf);
+    *out = ret;
+    return JS_IsException(ret) ? -1 : 1;
 }
 
 /* Direct compiled call: when the callee is compiled into this unit, build its
@@ -61996,6 +62332,34 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
     return 0;
 }
 
+/* `this` as a value for a compiled field read: the frame's receiver, boxed for
+   a non-strict function exactly as the interpreter's handler boxes it. 1 with
+   an owned *out, 0 when the value is borrowed (its register store is then a
+   plain one), -1 on exception. */
+QJS_AOT_STUB int qjs_aot_this(JSContext *ctx, JSRegRun *f, JSValue *out)
+{
+    JSValue t = f->this_obj;
+
+    if (unlikely(JS_VALUE_GET_TAG(t) != JS_TAG_OBJECT)) {
+        uint32_t tag = JS_VALUE_GET_TAG(t);
+
+        if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+            *out = ctx->global_obj;
+            return 0;
+        }
+        if (!f->b->is_strict_mode) {
+            JSValue o = JS_ToObject(ctx, t);
+
+            if (JS_IsException(o))
+                return -1;
+            *out = o;
+            return 1;
+        }
+    }
+    *out = t;
+    return 0;
+}
+
 /*
  * Fold a prototype property read to a bind-time value. Only a read the PIC
  * resolved to a prototype folds: the epoch bump on a prototype data write
@@ -62123,6 +62487,35 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                 g->ctl_count = b->regvm_ctl_count;
                 g->pic_count = b->regvm_pic_count;
                 g->code = b->regvm_code;
+                g->light_ok = b->regvm_light != 0;
+                g->light_need = (int)b->regvm_light_need;
+                /* The numeric pool entries, so a folded `binary_cpool` on one
+                   can be a C literal at generation time. */
+                if (b->cpool_count > 0 && b->cpool != NULL) {
+                    double *nums = js_malloc_rt(rt, sizeof(double) * (size_t)b->cpool_count);
+                    uint8_t *mark = js_malloc_rt(rt, (size_t)b->cpool_count);
+                    if (nums && mark) {
+                        int ci;
+                        for (ci = 0; ci < b->cpool_count; ci++) {
+                            JSValue cv = b->cpool[ci];
+                            mark[ci] = 0;
+                            nums[ci] = 0;
+                            if (JS_VALUE_GET_TAG(cv) == JS_TAG_INT) {
+                                nums[ci] = (double)JS_VALUE_GET_INT(cv);
+                                mark[ci] = 1;
+                            } else if (JS_VALUE_GET_TAG(cv) == JS_TAG_FLOAT64) {
+                                nums[ci] = JS_VALUE_GET_FLOAT64(cv);
+                                mark[ci] = 1;
+                            }
+                        }
+                        g->cpool_count = b->cpool_count;
+                        g->cpool_num = nums;
+                        g->cpool_numeric = mark;
+                    } else {
+                        js_free_rt(rt, nums);
+                        js_free_rt(rt, mark);
+                    }
+                }
             }
             n++;
         }
@@ -62131,8 +62524,16 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
     return n;
 }
 
-void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr)
+void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr, int n)
 {
+    int i;
+
+    if (arr != NULL) {
+        for (i = 0; i < n; i++) {
+            js_free_rt(rt, (void *)arr[i].cpool_num);
+            js_free_rt(rt, (void *)arr[i].cpool_numeric);
+        }
+    }
     js_free_rt(rt, arr);
 }
 

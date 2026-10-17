@@ -16,29 +16,29 @@
  *     instruction;
  *   - a branch is a real `goto`, and the not-taken path falls through;
  *   - every fast path that can miss is a guard, and a miss returns
- *     `qjs_aot_deopt(ctx, f, fr, pc, site)` before the instruction, so the
+ *     `qjs_aot_deopt(ctx, fr, pc, site)` before the instruction, so the
  *     interpreter re-executes it there;
  *   - an operation the classifier does not know runs through the engine's step
  *     routine.
  *
- * Every SSA value is a C local, and every definition is **also** written to its
- * register's frame slot, with the same setter the interpreter's handler uses
- * (`qjs_aot_set_reg_p` when the handler adopts, `AOT_SET_B` when it borrows).
- * So:
+ * Native state is canonical (R1/R2 in `.local/STEP5-REPORT.md` §10.4). Every
+ * SSA value lives in a C local; the register slot is written only at a
+ * safepoint -- a call, an allocation, a slow path that can allocate, free or
+ * run user code, the poll, a deopt leave, a return, and the exception exit --
+ * and never on a pure fast path. So:
  *
- *   - the invariant: a local and its register's `fr` slot are equal at every
- *     fallback, deopt, call and exception exit;
- *   - `fr` is the GC's root set under DRC: one store per definition, never
- *     reloaded, keeps a live heap pointer reachable;
- *   - a deopt needs no write-back, because the frame is already current: a
- *     guard misses before its instruction, so the interpreter sees the state it
- *     expects;
- *   - what would break it: an SSA value used after its register is redefined.
- *     The IR is built from the register program, which never does that, but a
- *     later pass that reorders or extends live ranges must preserve it.
+ *   - the frame is current exactly where something can observe it;
+ *   - `fr` is the GC's root set under DRC at every such point, because the
+ *     write-back is what puts a live value there;
+ *   - a guard miss writes back before it leaves, which is why the miss path
+ *     costs more than the hit path;
+ *   - what would break it: a helper that can allocate or free but is not
+ *     marked as a safepoint. `q2_nosafepoint` is an allow-list and the default
+ *     is safepoint, so a missing entry costs speed, never correctness.
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 #include "ir.h"
@@ -54,6 +54,17 @@ int qjs_aot_check_locals(void);
    *kind (1 bytecode, 2 C), *cproto and the callee digest hex, or 0. */
 int qjs_aot_prof_call(const uint8_t dg[16], int pc, int *kind, int *cproto,
                       char hex[33]);
+/* Whether the digest's body is emitted in this unit, so a call to it can be a
+   direct call rather than a fresh interpreter activation. */
+int qjs_aot_unit_has(const char hex[33]);
+/* The argument count of a unit function with a leaf body, else -1. */
+int qjs_aot_leaf_argc(const char hex[33]);
+/* The callee's light-frame size when a compiled caller may enter it on the C
+   stack, else 0. */
+int qjs_aot_light_need(const char hex[33]);
+/* The function's numeric constant-pool entry `idx`: 1 with *out when the pool
+   entry is an int or a float64, so `binary_cpool` on it can be a C literal. */
+int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
 
 /* The ROPs with a native lowering. The verifier checks the classifier against
    this, so a lowered op the IR calls a fallback is a build failure. */
@@ -108,6 +119,15 @@ int q2_lowered(uint16_t rop) {
     case ROP_get_global:
     case ROP_neg:
     case ROP_inc:
+    case ROP_inc_branch_lt:
+    case ROP_inc_branch_lt_s:
+    case ROP_add_imm_self_branch:
+    case ROP_add_imm_self_branch_s:
+    case ROP_return:
+    case ROP_return_undefined:
+    case ROP_get_this_field:
+    case ROP_get_this_field2:
+    case ROP_binary_cpool:
       return 1;
     default:
       return 0;
@@ -128,13 +148,58 @@ typedef struct Q2Emit {
   Q2Cur cur; /* the value current after the instruction being emitted */
   Q2Cur pre; /* the value current before it, for a pre-instruction write-back */
   uint64_t *liveb; /* scratch: the live-before set */
+  /* The value each register's slot is known to hold, so a store of a value
+     already there is dropped. Valid only within a region with no branch and no
+     safepoint: both are reset points. */
+  Q2ValueId *fb;
   int cur_block;
   int cur_insn;
+  /* The loop copy being emitted (see q2_emit_fast_loop): field accesses read
+     and write the slot pointers its preheader resolved, and the back edge
+     returns to the copy. */
+  int fast, fast_lo, fast_hi; /* the copy being emitted, and its blocks */
+  int gen_loop; /* the generic copy of a loop that has a fast copy */
+  /* The leaf body (qjsaot2_emit_pure): no frame, so a guard that fails
+     returns 0 and the caller makes the call it replaced. */
+  int pure;
+  uint8_t *fhoist; /* per instruction: the read is loop-invariant */
+  /* Per instruction: the write group a read or write of the loop copy belongs
+     to (the first write of the same receiver and property), else -1; and per
+     group, whether every write stores a typed number, so a read of it takes the
+     double the last write stored. */
+  int32_t *fgroup;
+  uint8_t *fdbl;
 } Q2Emit;
 
 /* One emitter runs at a time, so the state is a file static rather than a
    parameter on every native case. */
 static Q2Emit g_em;
+
+/* A leaf whose field reads are all of its `this` or its arguments has a
+   second body, `aot_r_<digest>`, that reads them through slots its caller
+   resolved: the receiver (-1 `this`, else the argument) and the callee's cache
+   site of each, in order. */
+#define Q2_LEAF_SITES 16
+#define Q2_MAX_LEAVES 4096
+typedef struct Q2Leaf {
+  char hex[33];
+  int used, bad, n;
+  int8_t recv[Q2_LEAF_SITES];
+  int32_t site[Q2_LEAF_SITES];
+} Q2Leaf;
+static Q2Leaf g_leafrec;
+static Q2Leaf g_leaves[Q2_MAX_LEAVES];
+static int g_nleaves;
+
+static void q2_leaf_slot_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
+                              Q2ValueId recv, int site, Q2ValueId d);
+
+static const Q2Leaf *q2_leaf_find(const char hex[33]) {
+  int i;
+  for (i = 0; i < g_nleaves; i++)
+    if (!memcmp(g_leaves[i].hex, hex, 32)) return &g_leaves[i];
+  return NULL;
+}
 
 /* A fresh deopt site. */
 static int q2_site(void) {
@@ -245,10 +310,94 @@ static void q2_cur_def(Q2Cur *c, int reg, Q2ValueId v) {
   c->cur[reg] = v;
 }
 
-/* Store every not-synced value live in `bits` back to its register, boxed.
-   `cur` is the value current in each register at this point. */
-static void q2_writeback(
-    FILE *f, const Q2Func *fn, const Q2Cur *c, const uint64_t *bits) {
+/* The ROPs whose lowering runs no code that can allocate, free or observe the
+   frame: an inline cache hit, an arithmetic fast path, a compare, a branch.
+   Everything else is a safepoint by default (see R1 in the step-5 report),
+   which is why a missing entry costs speed and never correctness. */
+static int q2_nosafepoint(uint16_t rop) {
+  switch (rop) {
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false:
+    case ROP_load_i8:
+    case ROP_load_i8_s:
+    case ROP_load_i32:
+    case ROP_move:
+    case ROP_move_s:
+    case ROP_get_local:
+    case ROP_get_arg:
+    case ROP_get_arg2:
+    case ROP_branch:
+    case ROP_branch_s:
+    case ROP_branch_if:
+    case ROP_branch_if_not:
+    case ROP_branch_null:
+    case ROP_branch_not_null:
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish:
+    case ROP_branch_cmp_reg_reg:
+    case ROP_branch_cmp_reg_reg_s:
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul:
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+    case ROP_mul_add:
+    case ROP_mul_sub:
+    case ROP_add_mul:
+    case ROP_sub_mul:
+    case ROP_inc_branch_lt:
+    case ROP_inc_branch_lt_s:
+    case ROP_add_imm_self_branch:
+    case ROP_add_imm_self_branch_s:
+    case ROP_get_field:
+    case ROP_get_field_own:
+    case ROP_get_field2:
+    case ROP_get_field2_own:
+    case ROP_get_field_chain:
+    case ROP_get_field_chain_own:
+    case ROP_get_this_field:
+    case ROP_get_this_field2:
+    case ROP_put_field:
+    case ROP_load_this:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* Store every value live in `bits` back to its register, boxed. `cur` is the
+   value current in each register at this point. */
+/* Forget what the frame slots hold. Called at every branch target and after
+   every safepoint: from then on the slot's value is not something this
+   straight-line region put there. */
+static void q2_fb_reset(const Q2Func *fn) {
+  int i;
+  if (g_em.fb == NULL) return;
+  for (i = 0; i < fn->nregs; i++) g_em.fb[i] = Q2_NO_VALUE;
+}
+
+/* Store one value to its slot, unless the slot already holds that same value
+   and nothing since put it there. `mark` records the store in the cache, which
+   is right only for a store every later instruction runs after: a store on a
+   slow-path arm or a leave must not, or the fast path that skipped the arm
+   would skip the store too. */
+static void q2_store_slot(FILE *f, const Q2Func *fn, Q2ValueId v, int mark) {
+  char e[64];
+  int r = fn->values[v].reg;
+  if (g_em.fb != NULL && g_em.fb[r] == v) return;
+  q2_use(fn, v, Q2_R_TAGGED, e, sizeof(e));
+  fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s); /* wb v%u */\n",
+          fn->values[v].reg * 16, e, v);
+  if (mark && g_em.fb != NULL) g_em.fb[r] = v;
+}
+
+static void q2_writeback_kind(FILE *f, const Q2Func *fn, const Q2Cur *c,
+                              const uint64_t *bits, int all) {
+  (void)all;
   int w, words = fn->lwords;
   for (w = 0; w < words; w++) {
     uint64_t m = bits[w];
@@ -260,17 +409,72 @@ static void q2_writeback(
       v = c->cur[r];
       if (v == Q2_NO_VALUE) continue;
       if (v >= (Q2ValueId)fn->nvalues) continue;
-      if (!q2_typed(&fn->values[v])) continue;
-      if (fn->values[v].synced) continue;
-      {
-        char e[64], o[64];
-        q2_use(fn, v, Q2_R_TAGGED, e, sizeof(e));
-        fprintf(
-            f, "    AOT_SET_B(ctx, fr, %d, %s); /* wb v%u */\n",
-            fn->values[v].reg * 16, e, v);
-        (void)o;
-      }
+      q2_store_slot(f, fn, v, 0);
     }
+  }
+}
+
+/* The write-back before a safepoint (or a leave): every live value. */
+static void q2_writeback(
+    FILE *f, const Q2Func *fn, const Q2Cur *c, const uint64_t *bits) {
+  q2_writeback_kind(f, fn, c, bits, 1);
+}
+
+/* The write-back before a call. A callee reads the caller's argument window
+   and the helper reads the callee and receiver registers, so those are stored
+   whatever their representation; plus every tagged value, which may be a heap
+   reference the collector must see. An unboxed number elsewhere is not a root
+   and is not boxed just to make a call. `need` names the registers the call
+   itself reads (callee, receiver, window) as a bit set. */
+static void q2_writeback_call(FILE *f, const Q2Func *fn, const Q2Cur *c,
+                             const uint64_t *bits, const uint64_t *need) {
+  int w, words = fn->lwords;
+  for (w = 0; w < words; w++) {
+    uint64_t m = bits[w];
+    while (m) {
+      int r = w * 64 + __builtin_ctzll(m);
+      Q2ValueId v;
+      int forced;
+      m &= m - 1;
+      if (r >= fn->nregs) continue;
+      v = c->cur[r];
+      if (v == Q2_NO_VALUE || v >= (Q2ValueId)fn->nvalues) continue;
+      forced = (need[w] >> (r & 63)) & 1;
+      if (q2_typed(&fn->values[v]) && !forced) continue;
+      /* A register the call itself reads must be in its slot whatever the
+         cache says: the caller wrote it with the owning store, which the cache
+         does not track. */
+      if (forced) {
+        char e[64];
+        q2_use(fn, v, Q2_R_TAGGED, e, sizeof(e));
+        fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s); /* wb v%u */\n",
+                fn->values[v].reg * 16, e, v);
+        if (g_em.fb) g_em.fb[r] = v;
+        continue;
+      }
+      q2_store_slot(f, fn, v, 1);
+    }
+  }
+}
+
+/* The registers a call instruction reads on its own: the callee, the receiver,
+   and the argument window. */
+static void q2_call_need_bits(
+    const Q2Func *fn, const Q2Insn *in, uint64_t *need) {
+  int words = fn->lwords, k;
+  int is_m = (in->rop == ROP_call_method);
+  memset(need, 0, (size_t)words * 8);
+  {
+    int c = (int)in->arg[1].val >> 4;
+    if (c >= 0 && c < fn->nregs) need[c >> 6] |= 1ull << (c & 63);
+  }
+  if (is_m) {
+    int r = (int)in->arg[2].val >> 4;
+    if (r >= 0 && r < fn->nregs) need[r >> 6] |= 1ull << (r & 63);
+  }
+  for (k = 0; k < in->win_n; k++) {
+    int r = in->win_reg + k;
+    if (r < fn->nregs) need[r >> 6] |= 1ull << (r & 63);
   }
 }
 
@@ -290,7 +494,6 @@ static void q2_check_locals(
       if (r >= fn->nregs) continue;
       v = c->cur[r];
       if (v == Q2_NO_VALUE || v >= (Q2ValueId)fn->nvalues) continue;
-      if (!q2_typed(&fn->values[v])) continue;
       if (fn->values[v].synced) continue;
       {
         char e[64];
@@ -306,15 +509,50 @@ static void q2_check_locals(
   }
 }
 
-/* A leave: write back the not-synced values live in `bits`, then deopt at
+/* A leave: write back the live values in `bits`, then deopt at
    `pc`. `cur` may be NULL when no write-back is needed. */
 static void q2_emit_leave(
     FILE *f, const Q2Func *fn, const Q2Cur *c, const uint64_t *bits, int pc,
     int sid) {
+  if (g_em.pure) {
+    /* Nothing has happened yet: the caller makes the call instead. */
+    fprintf(f, "    { return 0; }\n");
+    return;
+  }
   fprintf(f, "    {\n");
   if (c && bits) q2_writeback(f, fn, c, bits);
   if (c && bits && qjs_aot_check_locals()) q2_check_locals(f, fn, c, bits);
   fprintf(f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d); }\n", pc, sid);
+}
+
+/* The frame as the interpreter must see it on the way out of an exception:
+   every value that is live anywhere in the function, stored to
+   its slot. Emitted once, at the function's `exception:` label, because the
+   unwind can resume the interpreter at a catch pc whose live set is a
+   different instruction's -- a union over the function is a correct superset,
+   and it only runs on the throw path. */
+static void q2_exception_sync(FILE *f, const Q2Func *fn, const Q2Cur *c) {
+  int w, words = fn->lwords;
+  for (w = 0; w < words; w++) {
+    uint64_t m = 0;
+    int i;
+    for (i = 0; i < fn->ninsns; i++)
+      m |= fn->insn_live[(size_t)i * words + w];
+    while (m) {
+      int r = w * 64 + __builtin_ctzll(m);
+      Q2ValueId v;
+      m &= m - 1;
+      if (r >= fn->nregs) continue;
+      v = c->cur[r];
+      if (v == Q2_NO_VALUE || v >= (Q2ValueId)fn->nvalues) continue;
+      {
+        char e[64];
+        q2_use(fn, v, Q2_R_TAGGED, e, sizeof(e));
+        fprintf(f, "      AOT_SET_B(ctx, fr, %d, %s); /* xsync v%u */\n",
+                fn->values[v].reg * 16, e, v);
+      }
+    }
+  }
 }
 
 /* The live set before an instruction: (insn_live \ defs) | uses. */
@@ -373,6 +611,12 @@ static const char *q2_op(const Q2Insn *in, int k, char *buf, size_t n) {
   return buf;
 }
 
+/* A definition: the C local, then the frame slot. A tagged value is written
+   through as it always was, because a block reached later reads slot state
+   rather than this block's locals. A **typed** value is not: it carries no
+   reference, so nothing needs to see it, and the write-back before a safepoint
+   or a leave boxes it once. That split is R1's win on `mb-loop`, which is all
+   typing and no heap traffic. */
 static void q2_def(
     FILE *f, const Q2Func *fn, const Q2Insn *in, int defi, const char *expr,
     int adopt) {
@@ -381,18 +625,20 @@ static void q2_def(
   fprintf(f, "    v%u = %s;\n", v, expr);
   if (adopt)
     fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n", off, v);
-  else
+  else if (!g_em.fast) /* the loop copy keeps no frame; see q2_emit_edge */
     fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off, v);
 }
 
-/* A definition of a typed value: assign its unboxed local, and store the boxed
-   form only when the value is synced (a constant, a move of a synced value, a
-   speculated load). A typed computed value is written back at a leave. */
+/* A definition of a typed value: assign its unboxed local, and its boxed form
+   too when the value is *synced* (a constant, a move of a synced value, a
+   speculated load). A computed typed value is not stored: it is boxed once by
+   the write-back before the next safepoint or leave, which is R1 in the step-5
+   report. The synced case must keep its store -- a successor block reads slot
+   state, not this block's locals. */
 static void q2_def_typed(
     FILE *f, const Q2Func *fn, const Q2Insn *in, int defi, const char *expr) {
   Q2ValueId v = in->def[defi];
   const Q2Value *val = &fn->values[v];
-  int off = val->reg * 16;
   switch (val->rep) {
     case Q2_R_I32:
       fprintf(f, "    i%u = %s;\n", v, expr);
@@ -407,10 +653,10 @@ static void q2_def_typed(
       fprintf(f, "    v%u = %s;\n", v, expr);
       break;
   }
-  if (val->synced) {
+  if (val->synced && !g_em.fast) {
     char e[64];
     q2_use(fn, v, Q2_R_TAGGED, e, sizeof(e));
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s);\n", off, e);
+    fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s);\n", val->reg * 16, e);
   }
 }
 
@@ -475,20 +721,36 @@ static void q2_emit_edge(FILE *f, const Q2Func *fn, int b, int si) {
                          ? &fn->blocks[blk->succ_block[si]]
                          : NULL;
   int k, np;
+  /* In the loop copy, an edge to a block of the loop stays in the copy; the
+     back edge to its header is `fself`. */
+  int fin = g_em.fast && blk->succ_block[si] >= g_em.fast_lo &&
+            blk->succ_block[si] <= g_em.fast_hi;
+  int fself = fin && blk->succ_block[si] == g_em.fast_lo;
   if (!s) {
     fprintf(f, " return qjs_aot_ret(f);");
     return;
   }
-  if (s->start_pc <= blk->start_pc)
+  /* The loop copy keeps no frame (its leaves and the generic copy's calls
+     write back what they need), so an edge out of it stores what the code
+     after it may read from the slots. */
+  if (g_em.fast && !fin)
+    q2_writeback(f, fn, &g_em.cur, q2_live_after(g_em.cur_insn));
+  /* A back edge polls as the interpreter's does: an inline decrement, and the
+     engine only when the counter runs out. */
+  if (s->start_pc <= blk->start_pc && !fself)
     fprintf(
         f,
-        " if (__builtin_expect(qjs_aot_poll(ctx) < 0, 0)) { pc = %d; "
-        "goto exception; }",
+        " if (__builtin_expect(--*(int *)((unsigned char *)ctx + "
+        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {"
+        " ++*(int *)((unsigned char *)ctx + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);"
+        " if (qjs_aot_poll(ctx) < 0) { pc = %d; goto exception; } }",
         blk->start_pc);
   /* The parameters of a successor that was not an edge when the arguments were
      built (the exit, or a dead target) have no arguments: read them from the
-     frame, which is the same value. */
+     frame, which is the same value. Those values may be tagged and therefore
+     not in the frame right now, so the live set is stored first. */
   if (si >= 2 || !blk->edge_arg[si]) {
+    q2_writeback(f, fn, &g_em.cur, q2_live_after(g_em.cur_insn));
     for (k = 0; k < s->nparams; k++) {
       Q2ValueId pv = s->param_val[k];
       fprintf(f, " v%u = AOT_REG(fr, %d);", pv, s->param_reg[k] * 16);
@@ -501,7 +763,7 @@ static void q2_emit_edge(FILE *f, const Q2Func *fn, int b, int si) {
             "JS_VALUE_GET_INT(v%u) : JS_VALUE_GET_FLOAT64(v%u);",
             pv, pv, pv, pv);
     }
-    fprintf(f, " goto b_%d;", s->start_pc);
+    fprintf(f, fin ? " goto ff_%d;" : " goto b_%d;", s->start_pc);
     return;
   }
   np = s->nparams;
@@ -543,21 +805,33 @@ static void q2_emit_edge(FILE *f, const Q2Func *fn, int b, int si) {
         fprintf(f, " b%u = eb%d;", pv, k);
         break;
       default: {
-        /* Tagged values are written through. An argument from the same
-           register that is itself in the frame needs no store; anything else
-           (a number boxed on this edge, or another register's value) does, or
-           the slot stays stale for every later leave. */
-        Q2ValueId av = blk->edge_arg[si][k];
+        /* Tagged parameters are locals now: nothing is stored on the edge. A
+           later safepoint or leave writes the live ones back. */
         fprintf(f, " v%u = ev%d;", pv, k);
-        if (av == Q2_NO_VALUE || q2_typed(&fn->values[av]) ||
-            !fn->values[av].synced ||
-            fn->values[av].reg != fn->values[pv].reg)
-          fprintf(f, " AOT_SET_B(ctx, fr, %d, v%u);", s->param_reg[k] * 16, pv);
         break;
       }
     }
   }
-  fprintf(f, " goto b_%d;", s->start_pc);
+  if (fself) {
+    /* The back edge of the loop copy: the interpreter's poll, inline. Its slow
+       arm is a collector safepoint and can run the interrupt handler, so the
+       live values are stored first, and the loop goes back through its
+       preheader afterwards and re-checks every guard. */
+    fprintf(
+        f,
+        " if (__builtin_expect(--*(int *)((unsigned char *)ctx + "
+        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {"
+        " ++*(int *)((unsigned char *)ctx + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n");
+    q2_writeback(f, fn, &g_em.cur, q2_live_after(g_em.cur_insn));
+    fprintf(
+        f,
+        " if (qjs_aot_poll(ctx) < 0) { pc = %d; goto exception; }"
+        " goto b_%d; }"
+        " goto ff_%d;",
+        blk->start_pc, s->start_pc, s->start_pc);
+    return;
+  }
+  fprintf(f, fin ? " goto ff_%d;" : " goto b_%d;", s->start_pc);
 }
 
 static int q2_target(const Q2Insn *in, int arg, int *tgt) {
@@ -573,9 +847,14 @@ static void q2_emit_fallback(
    the step sees the state it expects; afterwards the locals of whatever it may
    have written are reloaded from the frame. */
 static void q2_emit_fallback_liveb(const Q2Func *fn, const Q2Insn *in) {
-  int w;
+  int w, r;
   for (w = 0; w < fn->lwords; w++)
     g_em.liveb[w] |= q2_live_after(g_em.cur_insn)[w];
+  /* The step reads a call's argument window from the frame. Its registers were
+     stored when the arguments were moved there, except on a way in from a
+     loop copy, which keeps no frame, so they are stored here. */
+  for (r = in->win_reg; in->win_n > 0 && r < in->win_reg + in->win_n; r++)
+    if (r >= 0 && r < fn->nregs) g_em.liveb[r >> 6] |= 1ull << (r & 63);
   {
     /* A step whose roles are unknown may read any register, a window
        included, so every value this point holds goes back to the frame. */
@@ -662,6 +941,7 @@ static void q2_emit_step_body(
 static void q2_emit_fallback(
     FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in, int exit_pc) {
   q2_emit_fallback_liveb(fn, in);
+  q2_fb_reset(fn);
   q2_writeback(f, fn, &g_em.pre, g_em.liveb);
   q2_emit_step_body(f, fn, blk_index, in, exit_pc, -1);
 }
@@ -674,7 +954,7 @@ static void q2_emit_fallback(
    the step so its speculation guard stays in one place. */
 static int q2_emit_call_special(
     FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in) {
-  int is_m, kind = 0, cproto = -1, sid, na, abc, off, cc;
+  int is_m, kind = 0, cproto = -1, sid, na, abc, off, cc, leaf = 0;
   char hex[33];
   Q2ValueId dv;
 
@@ -694,11 +974,106 @@ static int q2_emit_call_special(
   cc = (int)in->arg[1].val;             /* callee register offset */
   off = fn->values[dv].reg * 16;
 
-  q2_emit_fallback_liveb(fn, in);
-  q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+  /* A callee with a leaf body runs in place of the call: no frame, no
+     write-back, nothing for the collector to see. It returns 0 before doing
+     anything when one of its guards fails, and the call below runs instead. */
+  {
+    int largc = kind == 1 ? qjs_aot_leaf_argc(hex) : -1;
+    leaf = largc >= 0 && largc <= na && in->win_val && !g_em.pure;
+    if (leaf) {
+      char cal[64], th[64], e[64];
+      int k;
+      q2_op(in, 1, cal, sizeof(cal));
+      if (is_m)
+        q2_op(in, 2, th, sizeof(th));
+      else
+        snprintf(th, sizeof(th), "JS_UNDEFINED");
+      fprintf(f, "#ifdef Q2_SEL_%s\n", hex);
+      fprintf(
+          f,
+          "    { JSValue _o, _a[%d]; const void *_lp; void *const *_lh;\n",
+          na > 0 ? na : 1);
+      for (k = 0; k < na; k++) {
+        if (in->win_val[k] == Q2_NO_VALUE) {
+          fprintf(f, "      _a[%d] = JS_UNDEFINED;\n", k);
+          continue;
+        }
+        q2_use(fn, in->win_val[k], Q2_R_TAGGED, e, sizeof(e));
+        fprintf(f, "      _a[%d] = %s;\n", k, e);
+      }
+      fprintf(
+          f,
+          "      if (q2_leaf_callee(%s, (const void *)aot_f_%s, &_lp, &_lh) &&\n"
+          "          aot_p_%s(ctx, _lp, _lh, %s, %d, _a, &_o)) {\n"
+          "        AOT_SET_B(ctx, fr, %d, _o);\n"
+          "        ip = code + %d; goto q2hit_%d;\n"
+          "      }\n"
+          "    }\n#endif\n",
+          cal, hex, hex, th, na, off, in->next, in->pc);
+    }
+  }
 
-  /* The callee and `this` are read from the frame: write-through already put
-     their tagged values there, and the window holds the arguments. */
+  /* A call is a safepoint: the callee runs user code and can allocate. Only
+     what the call reads and the heap references live here are stored. The
+     callee cannot write the caller's frame, so the cache survives the call. */
+  q2_emit_fallback_liveb(fn, in);
+  {
+    uint64_t *need = calloc((size_t)fn->lwords, 8);
+    if (need) {
+      q2_call_need_bits(fn, in, need);
+      q2_writeback_call(f, fn, &g_em.pre, g_em.liveb, need);
+      free(need);
+    } else {
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+    }
+  }
+
+  /* The callee and `this` are read from the frame, and the window holds the
+     arguments. */
+  if (kind == 1 && qjs_aot_unit_has(hex)) {
+    /* A callee compiled into this unit is called directly, on a light frame the
+       engine builds: no interpreter activation in between. A miss (a different
+       closure, a disabled callee, an arena that cannot supply the frame) falls
+       through to the generic helper.
+
+       When the callee's frame fits a stack buffer the caller allocates, the
+       frame is built there instead (R2): no arena bump, no seal, no free walk.
+       A deopt or an uncaught throw inside the callee still finishes through the
+       interpreter on that same frame. */
+    int leaf = qjs_aot_light_need(hex);
+    fprintf(f, "    { JSValue _o; int _h;\n");
+    if (leaf > 0) {
+      fprintf(
+          f,
+          "      struct { unsigned long long a[%d]; } _fb;\n",
+          (leaf + 7) / 8);
+      fprintf(f, "      _h = qjs_aot_call_leaf(ctx, f, %d, AOT_REG(fr, %d), ",
+              na, cc);
+      if (is_m)
+        fprintf(f, "AOT_REG(fr, %d), ", (int)in->arg[2].val);
+      else
+        fprintf(f, "JS_UNDEFINED, ");
+      fprintf(f, "&AOT_REG(fr, %d), &_o, &_fb, sizeof(_fb));\n", abc);
+    } else {
+      fprintf(f, "      _h = qjs_aot_call_light(ctx, f, %d, AOT_REG(fr, %d), ",
+              na, cc);
+      if (is_m)
+        fprintf(f, "AOT_REG(fr, %d), ", (int)in->arg[2].val);
+      else
+        fprintf(f, "JS_UNDEFINED, ");
+      fprintf(f, "&AOT_REG(fr, %d), &_o);\n", abc);
+    }
+    fprintf(
+        f,
+        "      if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); ip = code + "
+        "%d; goto q2hit_%d; }\n"
+        "      if (_h < 0) { pc = %d; goto exception; }\n",
+        off, in->next, in->pc, in->pc);
+    fprintf(f, "    }\n");
+  }
+  /* The result is stored by the engine's owning store, so forget what this
+     slot held. */
+  if (g_em.fb && off / 16 < fn->nregs) g_em.fb[off / 16] = Q2_NO_VALUE;
   fprintf(f, "    { JSValue _o; int _h;\n");
   if (kind == 2) {
     sid = qjs_aot_site_new();
@@ -719,12 +1094,330 @@ static int q2_emit_call_special(
       "      if (_h < 0) { pc = %d; goto exception; }\n",
       off, in->next, in->pc, in->pc);
   fprintf(f, "    }\n");
+  /* A leaf hit joins after the call having skipped its write-back, so what
+     the write-back stored is not known to be in the frame after it. */
+  if (leaf) q2_fb_reset(fn);
   return 1;
 }
 
 /* A binary/compare whose result is typed, dispatched before the opcode switch
    so the generic ROP_binary and the immediate forms share one path. Returns 1
    when it emitted the instruction. */
+/* ---- the loop copy ------------------------------------------------------ */
+/* A loop -- a header block and the blocks up to its one back edge, entered only
+   through the header -- runs as two copies when its field accesses all hit
+   data properties of receivers defined outside it. The preheader checks every
+   access's cache entry against its receiver's shape once and resolves the slot
+   each one reads or writes (an own slot, or the prototype holder's for a
+   method), and reads the globals the loop reads; the copy then loads and
+   stores through those pointers with no per-iteration check. A read whose slot
+   no write in the loop can reach is loaded once, and a read of a slot the loop
+   writes takes the value last written. A call to a leaf runs the leaf; when it
+   declines, the copy continues in the generic copy at that call. When a
+   preheader check fails the generic copy runs.
+
+   The copy is sound only if nothing in it can change a shape, a slot's
+   address, a global, or a written slot's kind between iterations: it runs no
+   user code, calls no engine helper that returns into the loop, its writes are
+   own data stores of non-counted values to objects that are not prototypes,
+   and a leaf writes nothing. q2_fast_scan checks the emitted copy for any call
+   outside a small set of pure ones, and the copy is dropped if it finds one.
+   A guard that fails inside the copy leaves to the interpreter as it would in
+   the generic copy. */
+
+/* Whether value `v` is defined outside the loop being copied. */
+static int q2_fast_outside(const Q2Func *fn, Q2ValueId v) {
+  int b = fn->values[v].block;
+  return b < g_em.fast_lo || b > g_em.fast_hi;
+}
+
+/* What the loop copy's preheader resolves for `in`: 1 a field read, 0 a field
+   write, 2 a global read, -1 nothing. */
+static int q2_fast_access(const Q2Func *fn, const Q2Insn *in) {
+  int read, k, site;
+  Q2ValueId r;
+  if (in->rop == ROP_get_global) {
+    site = (int)in->arg[3].val;
+    if ((unsigned)site == REG_IC_NONE || in->ndef < 1) return -1;
+    return 2;
+  }
+  if (in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+      in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own)
+    read = 1;
+  else if (in->rop == ROP_put_field)
+    read = 0;
+  else
+    return -1;
+  k = read ? 1 : 0;
+  site = (int)in->arg[read ? 3 : 2].val;
+  if ((unsigned)site == REG_IC_NONE || k >= in->narg ||
+      in->arg[k].kind != 'r')
+    return -1;
+  r = in->argval[k];
+  if (r == Q2_NO_VALUE || !q2_fast_outside(fn, r)) return -1;
+  if (!read && (3 >= in->narg || in->arg[3].kind != 'r' ||
+                in->argval[3] == Q2_NO_VALUE))
+    return -1;
+  return read;
+}
+
+/* Whether a read of the loop copy takes a double already known, in place of a
+   tag guard. */
+static int q2_fast_direct(const Q2Func *fn, const Q2Insn *in) {
+  int ix = (int)(in - fn->insns), g, acc;
+  if (!g_em.fast || !g_em.fgroup || in->ndef < 1) return 0;
+  acc = q2_fast_access(fn, in);
+  if (acc != 1 && acc != 2) return 0;
+  if (!fn->values[in->def[0]].spec || fn->values[in->def[0]].rep != Q2_R_F64)
+    return 0;
+  /* An invariant read was unboxed by the preheader. */
+  if (g_em.fhoist[ix]) return 1;
+  g = g_em.fgroup[ix];
+  return g >= 0 && g_em.fdbl[g];
+}
+
+/* A field or global access inside the loop copy: a load or store through the
+   slot the preheader resolved, or the value it read. Returns 0 to emit the
+   generic access (the scan then drops the copy). */
+static int q2_fast_field(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int read) {
+  int ix = (int)(in - fn->insns), sid, acc = q2_fast_access(fn, in);
+  char v[64];
+  if (acc < 0 || (acc == 0) != (read == 0)) return 0;
+  if (read) {
+    int g = g_em.fgroup[ix];
+    q2_guard(f, in->pc, q2_site());
+    if (g_em.fhoist[ix])
+      fprintf(f, "    v%u = fv%d;\n", in->def[0], ix);
+    else if (g >= 0)
+      fprintf(f, "    v%u = fc%d;\n", in->def[0], g);
+    else
+      fprintf(f, "    v%u = *fs%d;\n", in->def[0], ix);
+    /* The number's double is already known -- the preheader unboxed an
+       invariant read, or the last write stored it -- so the read takes it and
+       its tag guard, which that number passes, is not emitted. */
+    if (q2_fast_direct(fn, in)) {
+      if (g_em.fhoist[ix])
+        fprintf(f, "    d%u = fvd%d;\n", in->def[0], ix);
+      else
+        fprintf(f, "    d%u = fcd%d;\n", in->def[0], g);
+    }
+    return 1;
+  }
+  /* The old value is not counted (the preheader checked it, and every write in
+     the loop keeps it so); a counted new value leaves before the store. */
+  sid = q2_site();
+  q2_guard(f, in->pc, sid);
+  q2_op(in, 3, v, sizeof(v));
+  fprintf(f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) < 0, 0))\n", v);
+  q2_miss(f, in->pc, sid);
+  fprintf(f, "    *fs%d = %s;\n", ix, v);
+  if (g_em.fgroup[ix] >= 0) {
+    fprintf(f, "    fc%d = %s;\n", g_em.fgroup[ix], v);
+    if (g_em.fdbl[g_em.fgroup[ix]]) {
+      q2_use(fn, in->argval[3], Q2_R_F64, v, sizeof(v));
+      fprintf(f, "    fcd%d = %s;\n", g_em.fgroup[ix], v);
+    }
+  }
+  return 1;
+}
+
+static void q2_emit_edge(FILE *f, const Q2Func *fn, int b, int si);
+
+/* The C expression of value `v` in the loop copy's preheader, when the value
+   is fixed for the whole loop: defined before it, a move of such a value, or
+   a read the preheader made. Returns 0 when it is not. */
+static int q2_fast_inv(const Q2Func *fn, Q2ValueId v, char *buf, size_t n) {
+  int depth;
+  for (depth = 0; depth < 8 && v != Q2_NO_VALUE; depth++) {
+    int ix, acc;
+    const Q2Insn *in;
+    if (q2_fast_outside(fn, v)) {
+      q2_use(fn, v, Q2_R_TAGGED, buf, n);
+      return 1;
+    }
+    ix = fn->values[v].insn;
+    if (ix < 0 || ix >= fn->ninsns) return 0;
+    in = &fn->insns[ix];
+    if (in->op == Q2_OP_MOVE && in->nuse >= 1) {
+      v = in->use[0];
+      continue;
+    }
+    acc = q2_fast_access(fn, in);
+    if ((acc == 1 || acc == 2) && g_em.fhoist[ix] && in->def[0] == v) {
+      snprintf(buf, n, "fv%d", ix);
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Whether call `in` of the loop copy runs a leaf with its callee and its
+   field reads' receivers fixed for the loop, so the preheader resolves both;
+   *leaf is the leaf's record and hex its digest. */
+static int q2_fast_rcall(const Q2Func *fn, const Q2Insn *in,
+                         const Q2Leaf **leaf, char hex[33]) {
+  int kind = 0, cproto = -1, k, is_m;
+  char e[64];
+  const Q2Leaf *lf;
+  if (in->rop != ROP_call && in->rop != ROP_call_method) return 0;
+  if (in->ndef < 1 || fn->values[in->def[0]].rep != Q2_R_TAGGED ||
+      in->nuse < 1 || in->win_n < 0 || !in->win_val)
+    return 0;
+  if (!qjs_aot_prof_call(fn->g->digest, in->next, &kind, &cproto, hex) ||
+      kind != 1 || qjs_aot_leaf_argc(hex) < 0 ||
+      qjs_aot_leaf_argc(hex) > in->win_n)
+    return 0;
+  lf = q2_leaf_find(hex);
+  if (!lf) return 0;
+  is_m = (in->rop == ROP_call_method);
+  if (in->arg[1].kind != 'r' || !q2_fast_inv(fn, in->argval[1], e, sizeof(e)))
+    return 0;
+  for (k = 0; k < lf->n; k++) {
+    int r = lf->recv[k];
+    if (r == -1) {
+      if (!is_m || in->arg[2].kind != 'r' ||
+          !q2_fast_inv(fn, in->argval[2], e, sizeof(e)))
+        return 0;
+    } else if (r >= in->win_n || in->win_val[r] == Q2_NO_VALUE ||
+               !q2_fast_inv(fn, in->win_val[r], e, sizeof(e))) {
+      return 0;
+    }
+  }
+  *leaf = lf;
+  return 1;
+}
+
+/* The preheader's half of a resolved leaf call: the callee checked once, and
+   each of the leaf's reads resolved against the callee's cache to its slot,
+   own or the prototype holder's. */
+static void q2_fast_rcall_pre(FILE *f, const Q2Func *fn, const Q2Insn *in,
+                              int ix, int pc) {
+  const Q2Leaf *lf;
+  char hex[33], cal[64], r[64];
+  int k;
+  if (!q2_fast_rcall(fn, in, &lf, hex)) return;
+  q2_fast_inv(fn, in->argval[1], cal, sizeof(cal));
+  fprintf(f, "#ifdef Q2_SEL_%s\n", hex);
+  /* A leaf with no field reads has no cache to resolve against. */
+  fprintf(
+      f,
+      "      if (!q2_leaf_callee(%s, (const void *)aot_f_%s, &flp%d, &flh%d) ||\n"
+      "          (%d && flp%d == NULL)) goto fx_%d;\n",
+      cal, hex, ix, ix, lf->n > 0, ix, pc);
+  for (k = 0; k < lf->n; k++) {
+    if (lf->recv[k] == -1)
+      q2_fast_inv(fn, in->argval[2], r, sizeof(r));
+    else
+      q2_fast_inv(fn, in->win_val[lf->recv[k]], r, sizeof(r));
+    fprintf(
+        f,
+        "      if (JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT) goto fx_%d;\n"
+        "      _o = (const unsigned char *)JS_VALUE_GET_PTR(%s);\n"
+        "      _e = (const unsigned char *)flp%d + (size_t)%d * "
+        "QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "      if (*(const void *const *)_e != *(const void *const *)(_o + "
+        "QJS_AOT_OFF_JSOBJECT_SHAPE)) goto fx_%d;\n"
+        "      if (*(const uint16_t *)(_e + QJS_AOT_OFF_JSREGPIC_KIND) != "
+        "QJS_AOT_REG_PIC_OWN) {\n"
+        "        _o = *(const unsigned char *const *)(*(const unsigned char "
+        "*const *)(_o + QJS_AOT_OFF_JSOBJECT_SHAPE) + "
+        "QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "        if (_o == NULL || flh%d == NULL || *(const void *const *)(_o + "
+        "QJS_AOT_OFF_JSOBJECT_SHAPE) != flh%d[%d]) goto fx_%d;\n"
+        "      }\n"
+        "      fls%d[%d] = (JSValue *)(*(unsigned char *const *)(_o + "
+        "QJS_AOT_OFF_JSOBJECT_PROP) + *(const uint32_t *)(_e + "
+        "QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n",
+        r, pc, r, ix, lf->site[k], pc, ix, ix, lf->site[k], pc, ix, k);
+  }
+  fprintf(f, "#endif\n");
+}
+
+/* A call inside the loop copy: the callee's leaf, and on a hit the block's
+   edge, which stays in the copy. A leaf that declines, a callee with no leaf,
+   or any other callee continues in the generic copy at this call, whose state
+   is the copy's: the same locals, and the same frame stores before it. */
+static void q2_fast_call(FILE *f, const Q2Func *fn, int b, const Q2Insn *in) {
+  int ix = (int)(in - fn->insns), kind = 0, cproto = -1, na, largc, k, is_m;
+  int off;
+  char hex[33], cal[64], th[64], e[64];
+  Q2ValueId dv = in->ndef >= 1 ? in->def[0] : Q2_NO_VALUE;
+  const Q2Leaf *lf;
+
+  if (fn->blocks[b].nsucc == 1 &&
+      ix == fn->blocks[b].first_insn + fn->blocks[b].ninsns - 1 &&
+      q2_fast_rcall(fn, in, &lf, hex)) {
+    /* The callee and the leaf's slots were resolved by the preheader. */
+    is_m = (in->rop == ROP_call_method);
+    na = in->win_n;
+    if (is_m)
+      q2_op(in, 2, th, sizeof(th));
+    else
+      snprintf(th, sizeof(th), "JS_UNDEFINED");
+    fprintf(f, "#ifdef Q2_SEL_%s\n", hex);
+    fprintf(f, "    { JSValue _o, _a[%d];\n", na > 0 ? na : 1);
+    for (k = 0; k < na; k++) {
+      if (in->win_val[k] == Q2_NO_VALUE) {
+        fprintf(f, "      _a[%d] = JS_UNDEFINED;\n", k);
+        continue;
+      }
+      q2_use(fn, in->win_val[k], Q2_R_TAGGED, e, sizeof(e));
+      fprintf(f, "      _a[%d] = %s;\n", k, e);
+    }
+    fprintf(f,
+            "      if (aot_r_%s(ctx, %s, %d, _a, fls%d, &_o)) {\n"
+            "        v%u = _o;\n"
+            "       ",
+            hex, th, na, ix, dv);
+    q2_emit_edge(f, fn, b, 0);
+    fprintf(f, "\n      }\n    }\n#endif\n");
+    fprintf(f, "    goto gi_%d;\n", ix);
+    return;
+  }
+  if (dv != Q2_NO_VALUE && fn->values[dv].rep == Q2_R_TAGGED &&
+      in->nuse >= 1 && in->win_n >= 0 && in->win_val &&
+      qjs_aot_prof_call(fn->g->digest, in->next, &kind, &cproto, hex) &&
+      kind == 1 && fn->blocks[b].nsucc == 1 &&
+      ix == fn->blocks[b].first_insn + fn->blocks[b].ninsns - 1 &&
+      (largc = qjs_aot_leaf_argc(hex)) >= 0 && largc <= in->win_n) {
+    is_m = (in->rop == ROP_call_method);
+    na = in->win_n;
+    off = fn->values[dv].reg * 16;
+    q2_op(in, 1, cal, sizeof(cal));
+    if (is_m)
+      q2_op(in, 2, th, sizeof(th));
+    else
+      snprintf(th, sizeof(th), "JS_UNDEFINED");
+    fprintf(f, "#ifdef Q2_SEL_%s\n", hex);
+    fprintf(
+        f,
+        "    { JSValue _o, _a[%d]; const void *_lp; void *const *_lh;\n",
+        na > 0 ? na : 1);
+    for (k = 0; k < na; k++) {
+      if (in->win_val[k] == Q2_NO_VALUE) {
+        fprintf(f, "      _a[%d] = JS_UNDEFINED;\n", k);
+        continue;
+      }
+      q2_use(fn, in->win_val[k], Q2_R_TAGGED, e, sizeof(e));
+      fprintf(f, "      _a[%d] = %s;\n", k, e);
+    }
+    fprintf(
+        f,
+        "      if (q2_leaf_callee(%s, (const void *)aot_f_%s, &_lp, &_lh) &&\n"
+        "          aot_p_%s(ctx, _lp, _lh, %s, %d, _a, &_o)) {\n"
+        "        v%u = _o;\n"
+        "       ",
+        cal, hex, hex, th, na, dv);
+    (void)off;
+    if (g_em.fb && off / 16 < fn->nregs) g_em.fb[off / 16] = Q2_NO_VALUE;
+    q2_emit_edge(f, fn, b, 0);
+    fprintf(f, "\n      }\n    }\n#endif\n");
+  }
+  fprintf(f, "    goto gi_%d;\n", ix);
+}
+
 static int q2_typed_binary(FILE *f, const Q2Func *fn, const Q2Insn *in) {
   Q2ValueId dv;
   const Q2Value *dval;
@@ -733,6 +1426,8 @@ static int q2_typed_binary(FILE *f, const Q2Func *fn, const Q2Insn *in) {
   int is_imm;
 
   if (in->op != Q2_OP_BINARY || in->ndef < 1) return 0;
+  /* a constant-pool operand has its own lowering, which folds the literal */
+  if (in->rop == ROP_binary_cpool) return 0;
   /* the fused family has its own lowering (two definitions) */
   if (in->rop == ROP_mul_add || in->rop == ROP_mul_sub ||
       in->rop == ROP_add_mul || in->rop == ROP_sub_mul)
@@ -971,7 +1666,18 @@ static int q2_emit_native(
       }
       q2_guard(f, in->pc, q2_site());
       fprintf(f, "    v%u = %s;\n", dv, q2_op(in, 1, a, sizeof(a)));
-      fprintf(f, "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n", d, s);
+      /* The destination slot takes the value, not the source slot: a value
+         read on a fast path (a field, a chained field) is in its local but
+         not necessarily in its slot. Registers do not own under deferred
+         counting, so that is a plain store; the counted form stores the
+         source first and moves it with the handler's ownership transfer. */
+      if (d != s && !g_em.fast)
+        fprintf(
+            f,
+            "#if QJS_DRC\n    AOT_REG(fr, %d) = v%u;\n#else\n"
+            "    AOT_SET_B(ctx, fr, %d, v%u);\n"
+            "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n#endif\n",
+            d, dv, s, dv, d, s);
       return 1;
     }
     case ROP_get_local: {
@@ -1007,15 +1713,29 @@ static int q2_emit_native(
       return 1;
     }
     case ROP_load_this: {
+      /* A strict function's `this` is the frame's, borrowed; a non-strict one
+         may box a primitive, which allocates, so it is a safepoint. The pair
+         is inlined because the common case is one tag test. */
+      char t[64];
       int off = fn->values[in->def[0]].reg * 16;
+      if (g_em.pure) {
+        fprintf(
+            f,
+            "    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT) return 0;\n"
+            "    v%u = this_obj;\n",
+            in->def[0]);
+        return 1;
+      }
       fprintf(
           f,
-          "    { JSValue _o; int _r = qjs_aot_load_this(ctx, f, &_o);\n"
+          "    { JSValue _o; int _r;\n"
+          "      _r = qjs_aot_load_this(ctx, f, &_o);\n"
           "      if (_r < 0) { pc = %d; goto exception; }\n"
-          "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
-          "      else AOT_SET_B(ctx, fr, %d, _o);\n"
-          "      v%u = _o; }\n",
-          in->pc, off, off, in->def[0]);
+          "      v%u = _o;\n",
+          in->pc, in->def[0]);
+      (void)t;
+      (void)off;
+      fprintf(f, "    }\n");
       return 1;
     }
 
@@ -1090,7 +1810,6 @@ static int q2_emit_native(
           "    }\n",
           sub, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)), dv,
           in->pc);
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off, dv);
       return 1;
     }
     case ROP_add_imm_s:
@@ -1139,7 +1858,6 @@ static int q2_emit_native(
           "&v%u)) { pc = %d; goto exception; }\n"
           "    }\n",
           sub, q2_op(in, ai, a, sizeof(a)), imm, dv, in->pc);
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", off, dv);
       return 1;
     }
     case ROP_mul_add:
@@ -1251,7 +1969,6 @@ static int q2_emit_native(
           "    }\n",
           REG_BIN_MUL, q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)),
           in->def[0], in->pc);
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", dm_off, in->def[0]);
       q2_guard(f, in->pc, q2_site());
       {
         char l[64], r[64];
@@ -1275,7 +1992,6 @@ static int q2_emit_native(
             "      }\n",
             sub2, l, r, in->def[1], in->pc);
       }
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", da_off, in->def[1]);
       return 1;
     }
 
@@ -1284,10 +2000,23 @@ static int q2_emit_native(
       int site = (int)in->arg[3].val;
       int sid, off;
       if ((unsigned)site == REG_IC_NONE) return 0;
+      if (g_em.fast && q2_fast_field(f, fn, in, 1)) return 1;
       sid = q2_site();
       off = fn->values[in->def[0]].reg * 16;
       q2_guard(f, in->pc, sid);
       q2_op(in, 1, a, sizeof(a));
+      if (g_em.pure == 2) {
+        q2_leaf_slot_read(f, fn, in, in->argval[1], site, in->def[0]);
+        return 1;
+      }
+      if (g_em.pure) {
+        fprintf(
+            f,
+            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
+            "&v%u), 0)) return 0;\n",
+            a, site, in->def[0]);
+        return 1;
+      }
       fprintf(
           f,
           "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
@@ -1303,11 +2032,10 @@ static int q2_emit_native(
           "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
           "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
           "exception; }\n"
-          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
           in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off, in->def[0]);
-      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off,
-              in->def[0]);
+      fprintf(f, "    }\n");
       return 1;
     }
     case ROP_get_field_chain:
@@ -1334,11 +2062,10 @@ static int q2_emit_native(
           "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
           "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
           "exception; }\n"
-          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
           in->pc, a, in->arg[2].off, s1, in->def[0], in->pc, off0, in->def[0]);
-      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off0,
-              in->def[0]);
+      fprintf(f, "    }\n");
       fprintf(
           f,
           "    if (__builtin_expect(!q2_own_read_hit(pic, holders, v%u, %d, "
@@ -1350,11 +2077,10 @@ static int q2_emit_native(
           "      if (qjs_aot_read_field_slow(ctx, f, code + %d, v%u, "
           "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
           "exception; }\n"
-          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
           in->pc, in->def[0], in->arg[6].off, s2, in->def[1], in->pc, off1, in->def[1]);
-      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off1,
-              in->def[1]);
+      fprintf(f, "    }\n");
       return 1;
     }
     case ROP_get_field2:
@@ -1362,35 +2088,52 @@ static int q2_emit_native(
       int site = (int)in->arg[3].val;
       int fsid, sid, off;
       if ((unsigned)site == REG_IC_NONE) return 0;
+      if (g_em.fast && q2_fast_field(f, fn, in, 1)) return 1;
       fsid = qjs_aot_site_new();
       sid = q2_site();
       off = fn->values[in->def[0]].reg * 16;
       q2_guard(f, in->pc, sid);
       q2_op(in, 1, a, sizeof(a));
+      if (g_em.pure == 2) {
+        q2_leaf_slot_read(f, fn, in, in->argval[1], site, in->def[0]);
+        return 1;
+      }
+      if (g_em.pure) {
+        fprintf(
+            f,
+            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, "
+            "&v%u), 0)) return 0;\n",
+            a, site, in->def[0]);
+        return 1;
+      }
+      /* The inline hit first: it checks the receiver's and the prototype
+         holder's shapes, which is what the fold checks before it reads the
+         same slot. */
       fprintf(
           f,
-          "    if (qjs_aot_proto_fold(ctx, f, pic, %d, %s, %d, &v%u)) {\n"
+          "    if (__builtin_expect(q2_own_read_hit(pic, holders, %s, %d, "
+          "&v%u), 1)) {\n"
+          "    } else if (qjs_aot_proto_fold(ctx, f, pic, %d, %s, %d, &v%u)) {\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
-          "    } else if (__builtin_expect(!q2_own_read_hit(pic, holders, "
-          "%s, %d, &v%u), 0)) {\n",
-          fsid, a, site, in->def[0], off, in->def[0], a, site, in->def[0]);
+          "    } else {\n",
+          a, site, in->def[0], fsid, a, site, in->def[0], off, in->def[0]);
       q2_writeback(f, fn, &g_em.pre, g_em.liveb);
       fprintf(
           f,
           "      if (qjs_aot_read_field_slow(ctx, f, code + %d, %s, "
           "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
           "exception; }\n"
-          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n",
           in->pc, a, in->arg[2].off, site, in->def[0], in->pc, off, in->def[0]);
-      fprintf(f, "    } else {\n      AOT_SET_B(ctx, fr, %d, v%u);\n    }\n", off,
-              in->def[0]);
+      fprintf(f, "    }\n");
       return 1;
     }
     case ROP_put_field: { /* "rasr": receiver, atom, site, value */
       int site = (int)in->arg[2].val;
       char v[64];
       if ((unsigned)site == REG_IC_NONE) return 0;
+      if (g_em.fast && q2_fast_field(f, fn, in, 0)) return 1;
       q2_guard(f, in->pc, q2_site());
       q2_op(in, 0, a, sizeof(a));
       q2_op(in, 3, v, sizeof(v));
@@ -1408,7 +2151,7 @@ static int q2_emit_native(
           "      if (qjs_aot_put_field_slow(ctx, f, code + %d, %s, "
           "(int)qjs_aot_ld_u32(code + %d), %d, %s) < 0) { pc = %d; goto "
           "exception; }\n"
-          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
           "    }\n",
           in->pc, a, in->arg[1].off, site, v, in->pc);
       return 1;
@@ -1417,17 +2160,16 @@ static int q2_emit_native(
       int site = (int)in->arg[3].val;
       int off = fn->values[in->def[0]].reg * 16;
       if ((unsigned)site == REG_IC_NONE) return 0;
+      if (g_em.fast && q2_fast_field(f, fn, in, 1)) return 1;
       q2_guard(f, in->pc, q2_site());
       /* The site-cache hit borrows the global's slot. A miss probes the cell
          cache and then reads the global, which can throw. */
       fprintf(
           f,
-          "    if (__builtin_expect(qjs_aot_get_global_hit(ctx, f, %d, &v%u), 1)) "
-          "{\n"
-          "      AOT_SET_B(ctx, fr, %d, v%u);\n"
+          "    if (__builtin_expect(q2_global_hit(ctx, pic, %d, &v%u), 1)) {\n"
           "    } else {\n"
           "      int _r;\n",
-          site, in->def[0], off, in->def[0]);
+          site, in->def[0]);
       q2_writeback(f, fn, &g_em.pre, g_em.liveb);
       fprintf(
           f,
@@ -1436,10 +2178,229 @@ static int q2_emit_native(
           "      if (_r < 0) { pc = %d; goto exception; }\n"
           "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
           "      else AOT_SET_B(ctx, fr, %d, v%u);\n"
-          "      pic = qjs_aot_pic(f); holders = qjs_aot_pic_holder(f);\n"
+          "      pic = q2_pic(f); holders = q2_pic_holder(f);\n"
           "    }\n",
           site, in->arg[1].off, (int)in->arg[2].val, in->def[0], in->pc, off,
           in->def[0], off, in->def[0]);
+      return 1;
+    }
+    case ROP_return: {
+      /* The returned value may be typed and therefore not in its slot, so it is
+         stored first, along with whatever else is live: the value then moves
+         out of its register and the frame is finished by the entry that called
+         it. */
+      int k;
+      Q2ValueId rv = in->use[0];
+      if (g_em.pure) {
+        /* An uncounted result, so the caller's slot need not own it. */
+        char r[64];
+        q2_use(fn, rv, Q2_R_TAGGED, r, sizeof(r));
+        fprintf(
+            f,
+            "    *out = %s;\n"
+            "    if (__builtin_expect(JS_VALUE_GET_TAG(*out) < 0, 0)) return 0;\n"
+            "    return 1;\n",
+            r);
+        return 1;
+      }
+      q2_live_before(fn, g_em.cur_insn, g_em.liveb);
+      for (k = 0; k < in->nuse; k++) {
+        int r = fn->values[in->use[k]].reg;
+        g_em.liveb[r >> 6] |= 1ull << (r & 63);
+      }
+      /* `cur` names the returned value in its register; `pre` does not, and the
+         return reads the slot. */
+      q2_writeback(f, fn, &g_em.cur, g_em.liveb);
+      fprintf(
+          f,
+          "    return qjs_aot_return(fr, %d);\n",
+          fn->values[rv].reg * 16);
+      return 1;
+    }
+    case ROP_return_undefined: {
+      if (g_em.pure) {
+        fprintf(f, "    *out = JS_UNDEFINED;\n    return 1;\n");
+        return 1;
+      }
+      fprintf(f, "    return JS_UNDEFINED;\n");
+      return 1;
+    }
+    case ROP_inc_branch_lt:
+    case ROP_inc_branch_lt_s: {
+      /* `d = d + 1; if (d < bound) goto target`. The int fast path is the whole
+         loop; anything else takes the engine's increment and compare and
+         continues compiled. */
+      int tgt, sid;
+      Q2ValueId dv = in->def[0];
+      const Q2Value *dval = &fn->values[dv];
+      int off = dval->reg * 16;
+      if (!q2_target(in, 2, &tgt)) return 0;
+      sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      if (dval->rep == Q2_R_I32 && in->nuse >= 2 &&
+          fn->values[in->use[1]].rep == Q2_R_I32) {
+        /* The bound is an int, so the whole test is one compare. A bound of
+           any other kind takes the generic path below, where the engine's
+           compare handles it. The result is a fresh SSA value, so the
+           increment reads the operand, not the destination. */
+        char x[64], y[64];
+        q2_use_arg(fn, in, 0, Q2_R_I32, x, sizeof(x));
+        q2_use_arg(fn, in, 1, Q2_R_I32, y, sizeof(y));
+        fprintf(f, "    if (__builtin_expect(%s == INT32_MAX, 0))\n", x);
+        q2_miss(f, in->pc, sid);
+        fprintf(f, "    i%u = %s + 1;\n", dv, x);
+        fprintf(f, "    if (i%u < %s) {", dv, y);
+        q2_emit_edge(f, fn, cur_block, 0);
+        fprintf(f, " }\n");
+        return 1;
+      }
+      /* Tagged or typed: the engine's increment and compare, which both
+         continue compiled on a non-int. The frame is written back first because
+         both can call. */
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      q2_op(in, 0, a, sizeof(a));
+      q2_op(in, 1, b, sizeof(b));
+      fprintf(
+          f,
+          "    { JSValue _n; int _t;\n"
+          "      if (qjs_aot_unary(ctx, QJS_AOT_REG_UN_INC, %s, &_n) < 0) { pc "
+          "= %d; goto exception; }\n"
+          "      qjs_aot_set_reg_p(ctx, fr, %d, _n);\n",
+          a, in->pc, off);
+      if (dval->rep == Q2_R_I32)
+        fprintf(f, "      i%u = JS_VALUE_GET_INT(_n);\n", dv);
+      else if (dval->rep == Q2_R_F64)
+        fprintf(f, "      d%u = JS_VALUE_GET_FLOAT64(_n);\n", dv);
+      else
+        fprintf(f, "      v%u = _n;\n", dv);
+      fprintf(
+          f,
+          "      _t = qjs_aot_cmp_take(ctx, QJS_AOT_REG_BIN_LT, "
+          "AOT_REG(fr, %d), %s);\n"
+          "      if (_t < 0) { pc = %d; goto exception; }\n",
+          off, b, in->pc);
+      fprintf(f, "      if (_t) {");
+      q2_emit_edge(f, fn, cur_block, 0);
+      fprintf(f, " } }\n");
+      return 1;
+    }
+    case ROP_add_imm_self_branch:
+    case ROP_add_imm_self_branch_s: {
+      /* `d = d + imm; goto target`, with the int fast path first. */
+      int tgt, sid;
+      Q2ValueId dv = in->def[0];
+      const Q2Value *dval = &fn->values[dv];
+      int off = dval->reg * 16;
+      int32_t imm = (int32_t)in->arg[1].val;
+      if (!q2_target(in, 2, &tgt)) return 0;
+      sid = q2_site();
+      q2_guard(f, in->pc, sid);
+      if (dval->rep == Q2_R_I32) {
+        char x[64];
+        q2_use_arg(fn, in, 0, Q2_R_I32, x, sizeof(x));
+        fprintf(
+            f,
+            "    if (__builtin_expect(__builtin_add_overflow(%s, %d, &i%u), "
+            "0))\n",
+            x, imm, dv);
+        q2_miss(f, in->pc, sid);
+        q2_emit_edge(f, fn, cur_block, 0);
+        fputc('\n', f);
+        return 1;
+      }
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      q2_op(in, 0, a, sizeof(a));
+      fprintf(
+          f,
+          "    if (qjs_aot_binary(ctx, QJS_AOT_REG_BIN_ADD, %s, "
+          "JS_MKVAL(JS_TAG_INT, %d), &v%u)) { pc = %d; goto exception; }\n",
+          a, imm, dv, in->pc);
+      fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n", off, dv);
+      q2_emit_edge(f, fn, cur_block, 0);
+      fputc('\n', f);
+      return 1;
+    }
+    case ROP_binary_cpool: {
+      /* `d = a <sub> const`: the second operand is a constant-pool entry or an
+         atom named by the instruction, so it has no register to read. A numeric
+         pool entry folds to a C literal here (R4); anything else goes through
+         the engine and continues compiled. An atom is remapped when the
+         bytecode is loaded, so it is re-read from the live code, as
+         `get_global` does. */
+      int sub = (int)in->arg[1].val;
+      int kind = (int)in->arg[3].val;
+      uint32_t idx = (uint32_t)in->arg[4].val;
+      Q2ValueId dv = in->def[0];
+      const Q2Value *dval = &fn->values[dv];
+      int off = dval->reg * 16;
+      double cnum;
+      char x[64];
+      if (kind == REG_CONST_CPOOL && qjs_aot_pool_num(fn->g, idx, &cnum) &&
+          in->nuse >= 1 && fn->values[in->use[0]].rep != Q2_R_TAGGED &&
+          (sub == REG_BIN_ADD || sub == REG_BIN_SUB || sub == REG_BIN_MUL ||
+           sub == REG_BIN_DIV)) {
+        char lit[48];
+        const char *opx = sub == REG_BIN_ADD   ? "+"
+                          : sub == REG_BIN_SUB ? "-"
+                          : sub == REG_BIN_MUL ? "*"
+                                               : "/";
+        int rep = fn->values[in->use[0]].rep;
+        /* The literal keeps every digit: %.17g round-trips a double. */
+        snprintf(lit, sizeof(lit), "%.17g", cnum);
+        /* An int constant is only an int operation when it *is* an int: 0.5 on
+           an int operand is a float multiply, so it takes the generic path. */
+        if (rep == Q2_R_I32 && (dval->rep == Q2_R_I32 ||
+                                dval->rep == Q2_R_TAGGED) &&
+            (cnum != (double)(int32_t)cnum || cnum == 0.0 ||
+             !(sub == REG_BIN_ADD || sub == REG_BIN_SUB || sub == REG_BIN_MUL))) {
+          goto cpool_generic;
+        }
+        q2_guard(f, in->pc, q2_site());
+        if (dval->rep == Q2_R_F64 || dval->rep == Q2_R_I32) {
+          if (dval->rep == Q2_R_F64) {
+            q2_use_arg(fn, in, 2, Q2_R_F64, x, sizeof(x));
+            fprintf(f, "    d%u = %s %s %s;\n", dv, x, opx, lit);
+          } else {
+            q2_use_arg(fn, in, 2, Q2_R_I32, x, sizeof(x));
+            fprintf(f, "    i%u = %s %s (int32_t)%s;\n", dv, x, opx, lit);
+          }
+        } else {
+          /* Tagged result from a typed operand: compute in the operand's
+             representation and box, with no engine call. */
+          if (rep == Q2_R_I32) {
+            q2_use_arg(fn, in, 2, Q2_R_I32, x, sizeof(x));
+            fprintf(f, "    v%u = qjs_aot_box_num((double)(%s %s (int32_t)%s), 1);\n",
+                    dv, x, opx, lit);
+          } else {
+            q2_use_arg(fn, in, 2, Q2_R_F64, x, sizeof(x));
+            fprintf(
+                f,
+                "    { double _c = %s %s %s; v%u = qjs_aot_box_num(_c, "
+                "qjs_aot_fitsi(_c)); }\n",
+                x, opx, lit, dv);
+          }
+        }
+        return 1;
+      }
+    cpool_generic:
+      q2_guard(f, in->pc, q2_site());
+      q2_op(in, 2, a, sizeof(a));
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      if (kind == REG_CONST_CPOOL) {
+        fprintf(
+            f,
+            "    if (qjs_aot_binary_cpool(ctx, f, %d, %u, %d, %s, &v%u) < 0) { "
+            "pc = %d; goto exception; }\n",
+            sub, idx, kind, a, dv, in->pc);
+      } else {
+        fprintf(
+            f,
+            "    if (qjs_aot_binary_cpool(ctx, f, %d, "
+            "(int)qjs_aot_ld_u32(code + %d), %d, %s, &v%u) < 0) { pc = %d; goto "
+            "exception; }\n",
+            sub, in->arg[4].off, kind, a, dv, in->pc);
+      }
+      fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n", off, dv);
       return 1;
     }
     case ROP_neg:
@@ -1465,6 +2426,65 @@ static int q2_emit_native(
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
           "    }\n",
           sub, a, in->def[0], sub, a, in->def[0], in->pc, off, in->def[0]);
+      return 1;
+    }
+    case ROP_get_this_field:
+    case ROP_get_this_field2: {
+      /* `recv = this; d = recv.atom`. The read is the same inline own-slot hit
+         as `get_field`, on a receiver that is the frame's `this`. */
+      int site = (int)in->arg[3].val;
+      int offr = fn->values[in->def[1]].reg * 16;
+      int offd = fn->values[in->def[0]].reg * 16;
+      if ((unsigned)site == REG_IC_NONE) return 0;
+      q2_guard(f, in->pc, q2_site());
+      if (g_em.pure == 2) {
+        fprintf(
+            f,
+            "    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT) return 0;\n"
+            "    v%u = this_obj;\n",
+            in->def[1]);
+        q2_leaf_slot_read(f, fn, in, in->def[1], site, in->def[0]);
+        (void)offr;
+        (void)offd;
+        return 1;
+      }
+      if (g_em.pure) {
+        /* An object `this` is the same strict or not. */
+        fprintf(
+            f,
+            "    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT) return 0;\n"
+            "    v%u = this_obj;\n"
+            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, this_obj, "
+            "%d, &v%u), 0)) return 0;\n",
+            in->def[1], site, in->def[0]);
+        (void)offr;
+        (void)offd;
+        return 1;
+      }
+      fprintf(
+          f,
+          "    { JSValue _t; int _r = qjs_aot_this(ctx, f, &_t);\n"
+          "      if (_r < 0) { pc = %d; goto exception; }\n",
+          in->pc);
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+      fprintf(
+          f,
+          "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n"
+          "      else AOT_SET_B(ctx, fr, %d, _t);\n"
+          "      v%u = _t;\n"
+          "      if (__builtin_expect(!q2_own_read_hit(pic, holders, _t, %d, "
+          "&v%u), 0)) {\n"
+          "        if (qjs_aot_read_field_slow(ctx, f, code + %d, _t, "
+          "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
+          "exception; }\n"
+          "        pic = q2_pic(f); holders = q2_pic_holder(f);\n"
+          "        qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
+          "      } else {\n"
+          "        AOT_SET_B(ctx, fr, %d, v%u);\n"
+          "      }\n"
+          "    }\n",
+          offr, offr, in->def[1], site, in->def[0], in->pc, in->arg[2].off,
+          site, in->def[0], in->pc, offd, in->def[0], offd, in->def[0]);
       return 1;
     }
     case ROP_get_element: {
@@ -1621,12 +2641,388 @@ static int q2_emit_native(
   }
 }
 
+/* One block's instructions and its fall-through edge, after its label. */
+static void q2_emit_block(FILE *f, const Q2Func *fn, int b) {
+  const Q2Block *blk = &fn->blocks[b];
+  int j;
+  g_em.cur_block = b;
+  /* Each block starts from its own live-in values, never from whatever block
+     happened to be emitted before it. The frame cache is reset for the same
+     reason: a block can be reached from any predecessor, so what the slot
+     holds is unknown until this block writes it. */
+  q2_cur_block(fn, &g_em.cur, b);
+  /* The frame cache survives into a block only when that block has exactly
+     one predecessor and it is the block just emitted, i.e. a plain
+     fall-through. Any other entry (a branch target, a loop header) can be
+     reached from somewhere the cache knows nothing about. */
+  {
+    const Q2Block *pb = &fn->blocks[b];
+    int keep = 0;
+    if (b > 0 && pb->npreds == 1 && pb->preds[0] == b - 1 &&
+        fn->blocks[b - 1].nsucc >= 1 &&
+        fn->blocks[b - 1].succ_block[0] == b &&
+        fn->blocks[b - 1].end_pc == pb->start_pc)
+      keep = 1;
+    if (!keep) q2_fb_reset(fn);
+  }
+  for (j = 0; j < blk->ninsns; j++) {
+    const Q2Insn *in = &fn->insns[blk->first_insn + j];
+    int k;
+    g_em.cur_insn = blk->first_insn + j;
+    /* `pre` is the state before this instruction; `cur` gains its
+       definitions before the emitter runs, because a fallback's write-back
+       stores what `cur` names. */
+    g_em.pre = g_em.cur;
+    for (k = 0; k < in->ndef; k++)
+      q2_cur_def(&g_em.cur, fn->values[in->def[k]].reg, in->def[k]);
+    for (k = 0; k < in->nredef; k++)
+      q2_cur_def(&g_em.cur, in->redef_reg[k], in->redef_val[k]);
+    /* The live-before set is the write-back set of a pre-instruction leave. */
+    q2_live_before(fn, g_em.cur_insn, g_em.liveb);
+    if ((in->rop == ROP_call || in->rop == ROP_call_method) &&
+        (g_em.fast || g_em.gen_loop)) {
+      /* A call of a copied loop: the leaf in the copy, and the place the copy
+         continues from in the generic one. */
+      if (g_em.fast) {
+        q2_fast_call(f, fn, b, in);
+        continue;
+      }
+      fprintf(f, "gi_%d:\n", g_em.cur_insn);
+    }
+    if (q2_emit_native(f, fn, b, in) != 0) {
+      /* lowered */
+    } else if (q2_emit_call_special(f, fn, b, in)) {
+      q2_emit_step_body(f, fn, b, in, fn->exit_pc, in->pc);
+    } else {
+      q2_emit_fallback(f, fn, b, in, fn->exit_pc);
+    }
+    if (!q2_fast_direct(fn, in))
+      for (k = 0; k < in->ndef; k++) q2_spec_after(f, fn, in, k);
+  }
+  /* The fall-through edge. A block with one successor that did not transfer
+     falls into it; a conditional branch already emitted its taken arm and
+     still has to assign the not-taken successor's parameters. */
+  if (blk->nsucc == 2) {
+    fprintf(f, "    ");
+    q2_emit_edge(f, fn, b, 1);
+    fputc('\n', f);
+  } else if (blk->nsucc == 1 && !q2_block_ends_with_goto(fn, b)) {
+    fprintf(f, "    ");
+    q2_emit_edge(f, fn, b, 0);
+    fputc('\n', f);
+  }
+}
+
+/* Whether block `h` heads a loop the copy can take: blocks h..*hi, whose last
+   ends with the one back edge to h, that are entered only through h and hold
+   no other back edge. */
+static int q2_loop_range(const Q2Func *fn, int h, int *hi) {
+  int b, k, last = -1;
+  for (b = h; b < fn->nblocks; b++)
+    for (k = 0; k < fn->blocks[b].nsucc; k++)
+      if (fn->blocks[b].succ_block[k] == h) last = b;
+  if (last < 0) return 0;
+  for (b = h; b <= last; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    if (b > h)
+      for (k = 0; k < blk->npreds; k++)
+        if (blk->preds[k] < h || blk->preds[k] > last) return 0;
+    for (k = 0; k < blk->nsucc; k++) {
+      int t = blk->succ_block[k];
+      if (t >= h && t <= last && t <= b && t != h) return 0;
+      if (t == h && b != last) return 0;
+    }
+  }
+  *hi = last;
+  return 1;
+}
+
+/* Whether the emitted loop copy calls only what cannot run user code or
+   return into the loop with a shape changed: the tag and box macros, the pure
+   inline number helpers, and the exits (a leave, the poll, the exception
+   path). Anything else -- an engine helper, a cache refill, a step -- drops the
+   copy. */
+static int q2_scan(const char *t, const char *const *ok);
+/* Whether the scan running accepts calls to leaf bodies (the loop copy's). */
+static int q2_scan_leaves;
+
+static int q2_fast_scan(const char *t) {
+  int r;
+  static const char *const ok[] = {
+      "JS_VALUE_GET_TAG", "JS_VALUE_GET_INT", "JS_VALUE_GET_FLOAT64",
+      "JS_VALUE_GET_PTR", "JS_VALUE_GET_BOOL", "JS_MKVAL", "JS_TAG_IS_FLOAT64",
+      "JS_VALUE_IS_BOTH_INT", "JS_VALUE_IS_BOTH_FLOAT", "__JS_NewFloat64",
+      "AOT_SET_B", "AOT_REG", "__builtin_expect", "__builtin_add_overflow",
+      "__builtin_sub_overflow", "__builtin_mul_overflow", "if", "while",
+      "for", "return", "sizeof", "qjs_aot_ret", "qjs_aot_deopt",
+      "qjs_aot_ld_u32", "qjs_aot_fitsi", "qjs_aot_box_num",
+      "qjs_aot_should_deopt", "qjs_aot_poll", "q2_num_fast", "q2_unary_fast",
+      "q2_cmp_int", "q2_cmp_double", "q2_branch_cmp", "int", "double",
+      "int32_t", "uint32_t", "JSValue", "unsigned", "q2_leaf_callee",
+      /* the counted build's register move: a release, never user code */
+      "qjs_aot_move_xfer", NULL};
+  q2_scan_leaves = 1;
+  r = q2_scan(t, ok);
+  q2_scan_leaves = 0;
+  return r;
+}
+
+/* Whether every call in `t` names one of `ok`. */
+static int q2_scan(const char *t, const char *const *ok) {
+  const char *p;
+  for (p = t; *p; p++) {
+    const char *q;
+    size_t n;
+    int i, good = 0;
+    if (*p != '(') continue;
+    q = p;
+    while (q > t && (q[-1] == ' ')) q--;
+    n = 0;
+    while (q > t && (isalnum((unsigned char)q[-1]) || q[-1] == '_')) q--, n++;
+    if (n == 0) continue; /* a parenthesis, not a call */
+    for (i = 0; ok[i]; i++)
+      if (strlen(ok[i]) == n && !memcmp(ok[i], q, n)) good = 1;
+    /* a leaf body: it passed the same kind of scan when it was emitted */
+    if (q2_scan_leaves && n > 6 &&
+        (!memcmp(q, "aot_p_", 6) || !memcmp(q, "aot_r_", 6)))
+      good = 1;
+    if (!good) return 0;
+  }
+  return 1;
+}
+
+/* The instructions of the loop being copied: [*lo, *hi). */
+static void q2_fast_insns(const Q2Func *fn, int *lo, int *hi) {
+  *lo = fn->blocks[g_em.fast_lo].first_insn;
+  *hi = fn->blocks[g_em.fast_hi].first_insn + fn->blocks[g_em.fast_hi].ninsns;
+}
+
+/* The preheader of the loop copy at `b_<pc>`: check every field access's cache
+   entry, resolve its slot, read the globals and the invariant reads, and enter
+   the copy at `ff_<pc>`; anything unexpected runs the generic copy at
+   `g_<pc>`. A small budget per activation stops a loop whose guards never
+   hold from paying the checks on every iteration. */
+static void q2_emit_preheader(FILE *f, const Q2Func *fn) {
+  int pc = fn->blocks[g_em.fast_lo].start_pc, ix, w, lo, hi;
+  char a[64];
+  q2_fast_insns(fn, &lo, &hi);
+  fprintf(f, "    if (fl_%d > 0) {\n", pc);
+  fprintf(f, "      const unsigned char *_e, *_o;\n");
+  fprintf(f, "      if (pic == NULL) goto fx_%d;\n", pc);
+  for (ix = lo; ix < hi; ix++) {
+    const Q2Insn *in = &fn->insns[ix];
+    int read = q2_fast_access(fn, in), site;
+    if (read < 0) continue;
+    if (read == 2) {
+      /* A global the loop reads: nothing in the copy can write it. */
+      fprintf(f, "      if (!q2_global_hit(ctx, pic, %d, &fv%d)) goto fx_%d;\n",
+              (int)in->arg[3].val, ix, pc);
+      continue;
+    }
+    site = (int)in->arg[read ? 3 : 2].val;
+    q2_use(fn, in->argval[read ? 1 : 0], Q2_R_TAGGED, a, sizeof(a));
+    fprintf(
+        f,
+        "      if (JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT) goto fx_%d;\n"
+        "      _o = (const unsigned char *)JS_VALUE_GET_PTR(%s);\n"
+        "      _e = (const unsigned char *)pic + (size_t)%d * "
+        "QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "      if (*(const void *const *)_e != *(const void *const *)(_o + "
+        "QJS_AOT_OFF_JSOBJECT_SHAPE)) goto fx_%d;\n",
+        a, pc, a, site, pc);
+    if (read)
+      /* An own slot, or the prototype holder's, as the inline hit reads. */
+      fprintf(
+          f,
+          "      if (*(const uint16_t *)(_e + QJS_AOT_OFF_JSREGPIC_KIND) != "
+          "QJS_AOT_REG_PIC_OWN) {\n"
+          "        _o = *(const unsigned char *const *)(*(const unsigned char "
+          "*const *)(_o + QJS_AOT_OFF_JSOBJECT_SHAPE) + "
+          "QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+          "        if (_o == NULL || holders == NULL || *(const void *const "
+          "*)(_o + QJS_AOT_OFF_JSOBJECT_SHAPE) != holders[%d]) goto fx_%d;\n"
+          "      }\n",
+          site, pc);
+    else
+      fprintf(
+          f,
+          "      if (*(const uint16_t *)(_e + QJS_AOT_OFF_JSREGPIC_KIND) != "
+          "QJS_AOT_REG_PIC_OWN_W ||\n"
+          "          (_o[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] & "
+          "QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK) != 0) goto fx_%d;\n",
+          pc);
+    fprintf(
+        f,
+        "      fs%d = (JSValue *)(*(unsigned char *const *)(_o + "
+        "QJS_AOT_OFF_JSOBJECT_PROP) + *(const uint32_t *)(_e + "
+        "QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n",
+        ix);
+    if (read)
+      fprintf(
+          f,
+          "      if (JS_VALUE_GET_TAG(*fs%d) == QJS_AOT_TAG_LAZY_JSON) goto "
+          "fx_%d;\n"
+          "#if !QJS_DRC\n"
+          "      if (JS_VALUE_GET_TAG(*fs%d) < 0) goto fx_%d;\n"
+          "#endif\n",
+          ix, pc, ix, pc);
+    else
+      fprintf(f, "      if (JS_VALUE_GET_TAG(*fs%d) < 0) goto fx_%d;\n", ix, pc);
+  }
+  /* An invariant read must not share its slot with any write in the loop. */
+  for (ix = lo; ix < hi; ix++) {
+    const Q2Insn *in = &fn->insns[ix];
+    int acc = q2_fast_access(fn, in);
+    if ((acc != 1 && acc != 2) || !g_em.fhoist[ix]) continue;
+    if (acc == 1) {
+      for (w = lo; w < hi; w++) {
+        if (q2_fast_access(fn, &fn->insns[w]) != 0) continue;
+        fprintf(f, "      if (fs%d == fs%d) goto fx_%d;\n", ix, w, pc);
+      }
+      fprintf(f, "      fv%d = *fs%d;\n", ix, ix);
+    }
+    if (fn->values[in->def[0]].spec && fn->values[in->def[0]].rep == Q2_R_F64)
+      fprintf(
+          f,
+          "      if (JS_VALUE_GET_TAG(fv%d) == JS_TAG_INT) fvd%d = "
+          "JS_VALUE_GET_INT(fv%d);\n"
+          "      else if (JS_VALUE_GET_TAG(fv%d) == JS_TAG_FLOAT64) fvd%d = "
+          "JS_VALUE_GET_FLOAT64(fv%d);\n"
+          "      else goto fx_%d;\n",
+          ix, ix, ix, ix, ix, ix, pc);
+  }
+  /* The leaf calls whose callee and receivers the loop holds fixed. */
+  for (ix = lo; ix < hi; ix++) q2_fast_rcall_pre(f, fn, &fn->insns[ix], ix, pc);
+  /* A forwarded read shares its group's slot; the group starts from what the
+     slot holds now, a number when its reads take the double. */
+  for (ix = lo; ix < hi; ix++) {
+    int g = g_em.fgroup[ix], acc;
+    if (g < 0) continue;
+    acc = q2_fast_access(fn, &fn->insns[ix]);
+    if (acc == 1) {
+      fprintf(f, "      if (fs%d != fs%d) goto fx_%d;\n", ix, g, pc);
+    } else if (acc == 0 && g == ix) {
+      fprintf(f, "      fc%d = *fs%d;\n", ix, ix);
+      if (g_em.fdbl[ix])
+        fprintf(
+            f,
+            "      if (JS_VALUE_GET_TAG(fc%d) == JS_TAG_INT) fcd%d = "
+            "JS_VALUE_GET_INT(fc%d);\n"
+            "      else if (JS_VALUE_GET_TAG(fc%d) == JS_TAG_FLOAT64) fcd%d = "
+            "JS_VALUE_GET_FLOAT64(fc%d);\n"
+            "      else goto fx_%d;\n",
+            ix, ix, ix, ix, ix, ix, pc);
+    }
+  }
+  fprintf(f, "      goto ff_%d;\n", pc);
+  fprintf(f, "    fx_%d:\n      fl_%d--;\n    }\n", pc, pc);
+  fprintf(f, "    goto g_%d;\n", pc);
+}
+
+/* Which reads of the loop copy are invariant, and which take a written value.
+   A read of a receiver and property that a write in the loop names takes the
+   value that write group last stored; any other read is invariant, and the
+   preheader rules out a write to the same property of another receiver that
+   is the same object by comparing the slots. */
+static void q2_fast_hoist(const Q2Func *fn) {
+  int lo, hi, ix, w;
+  q2_fast_insns(fn, &lo, &hi);
+  for (ix = lo; ix < hi; ix++) {
+    g_em.fhoist[ix] = 0;
+    g_em.fgroup[ix] = -1;
+    g_em.fdbl[ix] = 0;
+  }
+  /* Writes: the group is the first write of the same receiver and property. */
+  for (ix = lo; ix < hi; ix++) {
+    const Q2Insn *in = &fn->insns[ix];
+    if (q2_fast_access(fn, in) != 0) continue;
+    for (w = lo; w <= ix; w++) {
+      const Q2Insn *wn = &fn->insns[w];
+      if (q2_fast_access(fn, wn) != 0) continue;
+      if (wn->argval[0] == in->argval[0] && wn->arg[1].val == in->arg[1].val) {
+        g_em.fgroup[ix] = w;
+        break;
+      }
+    }
+  }
+  for (ix = lo; ix < hi; ix++) {
+    if (q2_fast_access(fn, &fn->insns[ix]) == 0 && g_em.fgroup[ix] == ix) {
+      int typed = 1;
+      for (w = lo; w < hi; w++)
+        if (g_em.fgroup[w] == ix && q2_fast_access(fn, &fn->insns[w]) == 0 &&
+            !q2_typed(&fn->values[fn->insns[w].argval[3]]))
+          typed = 0;
+      g_em.fdbl[ix] = (uint8_t)typed;
+    }
+  }
+  for (ix = lo; ix < hi; ix++) {
+    const Q2Insn *in = &fn->insns[ix];
+    int acc = q2_fast_access(fn, in), hoist = 1;
+    if (acc == 2) {
+      g_em.fhoist[ix] = 1;
+      continue;
+    }
+    if (acc != 1) continue;
+    for (w = lo; w < hi; w++) {
+      const Q2Insn *wn = &fn->insns[w];
+      if (q2_fast_access(fn, wn) != 0) continue;
+      if (wn->argval[0] == in->argval[1] && wn->arg[1].val == in->arg[2].val) {
+        hoist = 0;
+        g_em.fgroup[ix] = g_em.fgroup[w];
+      }
+    }
+    g_em.fhoist[ix] = (uint8_t)hoist;
+  }
+}
+
+/* Emit blocks lo..hi as a loop copy and a generic copy if the copy passes the
+   scan; returns 0, having emitted nothing, if it does not. */
+static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
+  char *buf = NULL;
+  size_t len = 0;
+  FILE *m;
+  int pc = fn->blocks[lo].start_pc, ok, b;
+  if (qjs_aot_check_locals()) return 0;
+  m = open_memstream(&buf, &len);
+  if (!m) return 0;
+  g_em.fast_lo = lo;
+  g_em.fast_hi = hi;
+  q2_fast_hoist(fn);
+  g_em.fast = 1;
+  for (b = lo; b <= hi; b++) {
+    fprintf(m, "ff_%d:\n", fn->blocks[b].start_pc);
+    q2_emit_block(m, fn, b);
+  }
+  g_em.fast = 0;
+  fclose(m);
+  ok = buf && q2_fast_scan(buf);
+  if (ok) {
+    fprintf(f, "b_%d:\n", pc);
+    q2_emit_preheader(f, fn);
+    fputs(buf, f);
+    g_em.gen_loop = 1;
+    for (b = lo; b <= hi; b++) {
+      if (b == lo)
+        fprintf(f, "g_%d:\n", pc);
+      else
+        fprintf(f, "b_%d:\n", fn->blocks[b].start_pc);
+      q2_emit_block(f, fn, b);
+    }
+    g_em.gen_loop = 0;
+  }
+  free(buf);
+  return ok;
+}
+
 static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int b, i, j;
 
   memset(&g_em, 0, sizeof(g_em));
   g_em.fn = fn;
   g_em.liveb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+  if (g_em.fb)
+    for (i = 0; i < fn->nregs; i++) g_em.fb[i] = Q2_NO_VALUE;
 
   fprintf(
       f,
@@ -1634,12 +3030,12 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       "                                 JSValue *fr, uint32_t entry_pc)\n"
       "{\n",
       hex);
-  fprintf(f, "    uint8_t *code = qjs_aot_code(f);\n");
+  fprintf(f, "    uint8_t *code = q2_code(f);\n");
   fprintf(f, "    uint8_t *ip;\n    uint32_t pc = 0;\n");
-  fprintf(f, "    JSValue *vb = qjs_aot_var_buf(f);\n");
-  fprintf(f, "    JSValue *ab = qjs_aot_arg_buf(f);\n");
-  fprintf(f, "    const void *pic = qjs_aot_pic(f);\n");
-  fprintf(f, "    void *const *holders = qjs_aot_pic_holder(f);\n");
+  fprintf(f, "    JSValue *vb = q2_var_buf(f);\n");
+  fprintf(f, "    JSValue *ab = q2_arg_buf(f);\n");
+  fprintf(f, "    const void *pic = q2_pic(f);\n");
+  fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
   fprintf(
       f,
       "    (void)code; (void)ip; (void)vb; (void)ab; (void)pic; "
@@ -1671,11 +3067,9 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
         fprintf(f, "    JSValue v%d = JS_UNDEFINED;\n", i);
         break;
     }
-    /* A synced typed value keeps its boxed form in a JSValue local, so a
-       tagged consumer reads it instead of re-boxing, and a write-back never
-       touches it. */
-    if (v->spec || (v->rep != Q2_R_TAGGED && v->synced))
-      fprintf(f, "    JSValue v%d = JS_UNDEFINED;\n", i);
+    /* A speculated load keeps the JSValue it produced alongside the unboxed
+       one, so a tagged consumer reads it and no re-boxing is needed. */
+    if (v->spec) fprintf(f, "    JSValue v%d = JS_UNDEFINED;\n", i);
   }
   {
     int maxp = 0;
@@ -1686,6 +3080,34 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    int32_t ei%d = 0;\n", i);
       fprintf(f, "    double ed%d = 0.0;\n", i);
       fprintf(f, "    int eb%d = 0;\n", i);
+    }
+  }
+
+  /* The loop copies' slot pointers, invariant reads and entry budgets. */
+  g_em.fhoist = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  g_em.fdbl = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  g_em.fgroup = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int32_t));
+  for (b = 0; b < fn->nblocks; b++) {
+    int hi, lo_i, hi_i, ix;
+    if (!q2_loop_range(fn, b, &hi)) continue;
+    fprintf(f, "    int fl_%d = 8;\n", fn->blocks[b].start_pc);
+    g_em.fast_lo = b;
+    g_em.fast_hi = hi;
+    q2_fast_hoist(fn);
+    q2_fast_insns(fn, &lo_i, &hi_i);
+    for (ix = lo_i; ix < hi_i; ix++) {
+      const Q2Leaf *lf;
+      char lhex[33];
+      if (q2_fast_rcall(fn, &fn->insns[ix], &lf, lhex))
+        fprintf(f, "    const void *flp%d = NULL; void *const *flh%d = NULL; "
+                   "JSValue *fls%d[%d];\n",
+                ix, ix, ix, lf->n > 0 ? lf->n : 1);
+      if (q2_fast_access(fn, &fn->insns[ix]) < 0) continue;
+      fprintf(f, "    JSValue *fs%d = NULL;\n    JSValue fv%d = JS_UNDEFINED;\n",
+              ix, ix);
+      fprintf(f, "    JSValue fc%d = JS_UNDEFINED;\n    double fcd%d = 0.0, "
+                 "fvd%d = 0.0;\n",
+              ix, ix, ix);
     }
   }
 
@@ -1714,47 +3136,13 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   }
 
   for (b = 0; b < fn->nblocks; b++) {
-    const Q2Block *blk = &fn->blocks[b];
-    fprintf(f, "b_%d:\n", blk->start_pc);
-    g_em.cur_block = b;
-    /* Each block starts from its own live-in values, never from whatever block
-       happened to be emitted before it. */
-    q2_cur_block(fn, &g_em.cur, b);
-    for (j = 0; j < blk->ninsns; j++) {
-      const Q2Insn *in = &fn->insns[blk->first_insn + j];
-      int k;
-      g_em.cur_insn = blk->first_insn + j;
-      /* `pre` is the state before this instruction; `cur` gains its
-         definitions before the emitter runs, because a fallback's write-back
-         stores what `cur` names. */
-      g_em.pre = g_em.cur;
-      for (k = 0; k < in->ndef; k++)
-        q2_cur_def(&g_em.cur, fn->values[in->def[k]].reg, in->def[k]);
-      for (k = 0; k < in->nredef; k++)
-        q2_cur_def(&g_em.cur, in->redef_reg[k], in->redef_val[k]);
-      /* The live-before set is the write-back set of a pre-instruction leave. */
-      q2_live_before(fn, g_em.cur_insn, g_em.liveb);
-      if (q2_emit_native(f, fn, b, in) != 0) {
-        /* lowered */
-      } else if (q2_emit_call_special(f, fn, b, in)) {
-        q2_emit_step_body(f, fn, b, in, fn->exit_pc, in->pc);
-      } else {
-        q2_emit_fallback(f, fn, b, in, fn->exit_pc);
-      }
-      for (k = 0; k < in->ndef; k++) q2_spec_after(f, fn, in, k);
+    int hi;
+    if (q2_loop_range(fn, b, &hi) && q2_emit_fast_loop(f, fn, b, hi)) {
+      b = hi;
+      continue;
     }
-    /* The fall-through edge. A block with one successor that did not transfer
-       falls into it; a conditional branch already emitted its taken arm and
-       still has to assign the not-taken successor's parameters. */
-    if (blk->nsucc == 2) {
-      fprintf(f, "    ");
-      q2_emit_edge(f, fn, b, 1);
-      fputc('\n', f);
-    } else if (blk->nsucc == 1 && !q2_block_ends_with_goto(fn, b)) {
-      fprintf(f, "    ");
-      q2_emit_edge(f, fn, b, 0);
-      fputc('\n', f);
-    }
+    fprintf(f, "b_%d:\n", fn->blocks[b].start_pc);
+    q2_emit_block(f, fn, b);
   }
   fprintf(f, "    return qjs_aot_ret(f);\n");
   fprintf(f, "exception: {\n");
@@ -1767,6 +3155,238 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
       "    }\n}\n\n");
   free(g_em.liveb);
   g_em.liveb = NULL;
+  free(g_em.fb);
+  g_em.fb = NULL;
+  free(g_em.fhoist);
+  g_em.fhoist = NULL;
+  free(g_em.fdbl);
+  g_em.fdbl = NULL;
+  free(g_em.fgroup);
+  g_em.fgroup = NULL;
+}
+
+
+/* ---- leaf bodies -------------------------------------------------------- */
+/* A function whose compiled body has no side effect, no safepoint and no loop
+   on its fast path gets a second body, `aot_p_<digest>`, which a compiled
+   caller runs in place of the call: `this` and the arguments are C values,
+   there is no frame, and the result is returned uncounted. Every guard of the
+   function returns 0 before anything has happened, so the caller then makes
+   the call it replaced and the function runs from its start. The body is
+   static and small, so the C compiler inlines it into its callers.
+
+   The emitted text is checked the way the loop copy is: any call outside the
+   tag macros, the pure inline number helpers and the cache-hit test drops the
+   leaf, as does any read of the frame or the variable area. */
+static int q2_pure_scan(const char *t) {
+  static const char *const ok[] = {
+      "JS_VALUE_GET_TAG", "JS_VALUE_GET_INT", "JS_VALUE_GET_FLOAT64",
+      "JS_VALUE_GET_PTR", "JS_VALUE_GET_BOOL", "JS_MKVAL", "JS_TAG_IS_FLOAT64",
+      "JS_VALUE_IS_BOTH_INT", "JS_VALUE_IS_BOTH_FLOAT", "__JS_NewFloat64",
+      "AOT_SET_B", "__builtin_expect", "__builtin_add_overflow",
+      "__builtin_sub_overflow", "__builtin_mul_overflow", "if", "while",
+      "for", "return", "sizeof", "qjs_aot_fitsi", "qjs_aot_box_num",
+      "qjs_aot_should_deopt", "q2_own_read_hit", "q2_num_fast", "q2_arith",
+      "qjs_aot_binary",
+      "q2_unary_fast", "q2_cmp_int", "q2_cmp_double", "q2_branch_cmp", "int",
+      "double", "int32_t", "uint32_t", "JSValue", "unsigned", NULL};
+  if (strstr(t, "vb[") || strstr(t, "code")) return 0;
+  return q2_scan(t, ok);
+}
+
+/* The receiver of a leaf's field read: -1 its `this`, k >= 0 its argument k,
+   -2 anything else. */
+static int q2_leaf_recv(const Q2Func *fn, Q2ValueId r) {
+  int depth;
+  for (depth = 0; depth < 8 && r != Q2_NO_VALUE; depth++) {
+    const Q2Insn *in;
+    int ix = fn->values[r].insn;
+    if (ix < 0 || ix >= fn->ninsns) return -2;
+    in = &fn->insns[ix];
+    if (in->rop == ROP_get_arg) return (int)in->arg[1].val;
+    if (in->rop == ROP_get_arg2)
+      return (int)(in->def[0] == r ? in->arg[1].val : in->arg[3].val);
+    if (in->rop == ROP_load_this) return -1;
+    if ((in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2) &&
+        in->ndef >= 2 && in->def[1] == r)
+      return -1;
+    if (in->op == Q2_OP_MOVE && in->nuse >= 1) {
+      r = in->use[0];
+      continue;
+    }
+    return -2;
+  }
+  return -2;
+}
+
+/* A field read of the resolved-slot leaf (aot_r_): the slot the caller's loop
+   preheader resolved for this site. */
+static void q2_leaf_slot_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
+                              Q2ValueId recv, int site, Q2ValueId d) {
+  int k = g_leafrec.n, rk = q2_leaf_recv(fn, recv);
+  if (k >= Q2_LEAF_SITES || rk == -2) {
+    g_leafrec.bad = 1;
+    return;
+  }
+  g_leafrec.recv[k] = (int8_t)rk;
+  g_leafrec.site[k] = site;
+  g_leafrec.n++;
+  (void)in;
+  fprintf(
+      f,
+      "    v%u = *fls[%d];\n"
+      "    if (JS_VALUE_GET_TAG(v%u) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+      "#if !QJS_DRC\n"
+      "    if (JS_VALUE_GET_TAG(v%u) < 0) return 0;\n"
+      "#endif\n",
+      d, k, d, d);
+}
+
+/* One leaf body's text in the current mode (g_em.pure), or NULL. */
+static char *q2_pure_text(Q2Func *fn, size_t *lenp) {
+  char *buf = NULL;
+  size_t len = 0;
+  FILE *m;
+  int b, i;
+  m = open_memstream(&buf, &len);
+  if (!m) return NULL;
+  g_em.fn = fn;
+  g_em.liveb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+  if (g_em.fb)
+    for (i = 0; i < fn->nregs; i++) g_em.fb[i] = Q2_NO_VALUE;
+  g_operand_err = 0;
+  for (i = 0; i < fn->nvalues; i++) {
+    const Q2Value *v = &fn->values[i];
+    switch (v->rep) {
+      case Q2_R_I32:
+        fprintf(m, "    int32_t i%d = 0;\n", i);
+        break;
+      case Q2_R_F64:
+        fprintf(m, "    double d%d = 0.0;\n", i);
+        break;
+      case Q2_R_BOOL:
+        fprintf(m, "    int b%d = 0;\n", i);
+        break;
+      default:
+        fprintf(m, "    JSValue v%d = JS_UNDEFINED;\n", i);
+        break;
+    }
+    if (v->spec) fprintf(m, "    JSValue v%d = JS_UNDEFINED;\n", i);
+  }
+  {
+    int maxp = 0;
+    for (b = 0; b < fn->nblocks; b++)
+      if (fn->blocks[b].nparams > maxp) maxp = fn->blocks[b].nparams;
+    for (i = 0; i < maxp; i++)
+      fprintf(m, "    JSValue ev%d; int32_t ei%d = 0; double ed%d = 0.0; "
+                 "int eb%d = 0;\n", i, i, i, i);
+  }
+  for (b = 0; b < fn->nblocks; b++) {
+    fprintf(m, "b_%d:\n", fn->blocks[b].start_pc);
+    q2_emit_block(m, fn, b);
+  }
+  fclose(m);
+  free(g_em.liveb);
+  g_em.liveb = NULL;
+  free(g_em.fb);
+  g_em.fb = NULL;
+  if (!buf || g_operand_err || !q2_pure_scan(buf)) {
+    free(buf);
+    return NULL;
+  }
+  *lenp = len;
+  return buf;
+}
+
+/* The leaf bodies, after the frame-free macros a leaf's text relies on. */
+static void q2_pure_out(FILE *out, const char *name, const char *hex,
+                        const char *params, int argc, const char *buf,
+                        size_t len) {
+  fprintf(
+      out,
+      "#pragma push_macro(\"AOT_SET_B\")\n#undef AOT_SET_B\n"
+      "#define AOT_SET_B(c, r, o, v) ((void)0)\n"
+      "#pragma push_macro(\"q2_arith\")\n"
+      "#define q2_arith(s, a, b, o) q2_num_fast(s, a, b, o)\n"
+      "#pragma push_macro(\"qjs_aot_binary\")\n"
+      "#define qjs_aot_binary(c, s, a, b, o) 1\n"
+      "static inline %sint %s_%s(%s)\n"
+      "{\n"
+      "    uint32_t pc = 0;\n"
+      "    (void)ctx; (void)this_obj; (void)ab;\n"
+      "    (void)pc;\n"
+      "    if (argc < %d) return 0;\n",
+      /* A small leaf is inlined into every caller, which is where its
+         argument array and result pointer go away. */
+      len < 8192 ? "__attribute__((always_inline)) " : "", name, hex, params,
+      argc);
+  fputs(buf, out);
+  /* A miss of the generic arithmetic lands here, having done nothing. */
+  fprintf(out,
+          "    return 0;\n"
+          "exception: __attribute__((unused));\n"
+          "    return 0;\n}\n"
+          "#pragma pop_macro(\"qjs_aot_binary\")\n"
+          "#pragma pop_macro(\"q2_arith\")\n"
+          "#pragma pop_macro(\"AOT_SET_B\")\n\n");
+}
+
+int qjsaot2_emit_pure(FILE *out, const JSAotGenFunc *g, char hex[33]) {
+  Q2Func fn;
+  char msg[256], *buf, *rbuf;
+  size_t len = 0, rlen = 0;
+  int b;
+
+  if (qjs_aot_check_locals()) return 0;
+  if (q2_build(g, &fn) < 0) return 0;
+  if (q2_infer(&fn) < 0 || q2_verify(&fn, msg, sizeof(msg)) < 0 ||
+      fn.blocks[0].nparams > 0) {
+    q2_free(&fn);
+    return 0;
+  }
+  /* No loop: a block reached from itself or from later in the function. */
+  for (b = 0; b < fn.nblocks; b++) {
+    int k;
+    for (k = 0; k < fn.blocks[b].nsucc; k++)
+      if (fn.blocks[b].succ_block[k] < fn.nblocks &&
+          fn.blocks[fn.blocks[b].succ_block[k]].start_pc <= fn.blocks[b].start_pc) {
+        q2_free(&fn);
+        return 0;
+      }
+  }
+  memset(&g_em, 0, sizeof(g_em));
+  g_em.pure = 1;
+  buf = q2_pure_text(&fn, &len);
+  if (!buf) {
+    g_em.pure = 0;
+    q2_free(&fn);
+    return 0;
+  }
+  /* The same body reading the slots its caller resolved, for a caller whose
+     loop holds the receivers fixed. */
+  memset(&g_leafrec, 0, sizeof(g_leafrec));
+  g_em.pure = 2;
+  rbuf = q2_pure_text(&fn, &rlen);
+  g_em.pure = 0;
+  q2_pure_out(out, "aot_p", hex,
+              "JSContext *ctx, const void *pic, void *const *holders,\n"
+              "    JSValue this_obj, int argc, const JSValue *ab, JSValue *out",
+              g->arg_count, buf, len);
+  if (rbuf && !g_leafrec.bad && !strstr(rbuf, "q2_own_read_hit") &&
+      g_nleaves < Q2_MAX_LEAVES) {
+    q2_pure_out(out, "aot_r", hex,
+                "JSContext *ctx, JSValue this_obj, int argc, const JSValue *ab,\n"
+                "    JSValue *const *fls, JSValue *out",
+                g->arg_count, rbuf, rlen);
+    g_leafrec.used = 1;
+    memcpy(g_leafrec.hex, hex, 33);
+    g_leaves[g_nleaves++] = g_leafrec;
+  }
+  free(buf);
+  free(rbuf);
+  q2_free(&fn);
+  return 1;
 }
 
 int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {

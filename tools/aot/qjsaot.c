@@ -187,6 +187,10 @@ static int g_deopt_site_func_cap = 0;
    count of table entries before it. */
 static int g_cur_func_idx = 0;
 static int g_emit_func_base = 0;
+/* The unit's functions and selection, so the emitter can tell whether a
+   profiled callee is emitted in this same translation unit. */
+static const JSAotGenFunc *g_unit_funcs = NULL;
+static int g_unit_nfuncs = 0;
 /* Deopt-everywhere: every operation the unit does not lower leaves compiled
    code at its own instruction. Sweeping every entry exercises every frame state
    against the interpreter. */
@@ -2889,6 +2893,10 @@ static int emit_region(
 /* The body emitter, overridable so qjsaot2 can drive this same unit builder
    with its own lowering. NULL means the template emitter below. */
 int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
+/* The leaf emitter: a frameless body for a function a compiled caller can run
+   in place of a call. Returns 1 with the body written, 0 when the function is
+   not such a leaf. NULL means no leaves. */
+int (*qjs_aot_emit_pure)(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
 /* The deopt-everywhere sweep and its site ids, shared with the emitter: under
    the sweep every instruction is a guard site, and the ids have to come from
@@ -2955,6 +2963,43 @@ int qjs_aot_prof_load(const char *path) {
   ProfEntry *prof = parse_profile(path, &g_nprof);
   if (!prof) return -1;
   g_prof = prof;
+  return 0;
+}
+
+/* Whether the unit emits a body for this digest. The emitter asks before
+   lowering a call to it as a direct call: only then does the callee have an
+   `aot_f_` this translation unit can name. */
+int qjs_aot_pool_num(const JSAotGenFunc *g, uint32_t idx, double *out) {
+  if (!g || idx >= (uint32_t)g->cpool_count) return 0;
+  if (!g->cpool_numeric || !g->cpool_numeric[idx]) return 0;
+  *out = g->cpool_num[idx];
+  return 1;
+}
+
+/* The light-frame size of the unit function with this digest, when a compiled
+   caller can enter it directly: 0 when it cannot. */
+int qjs_aot_light_need(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
+      return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE &&
+                     g_unit_funcs[i].light_ok
+                 ? g_unit_funcs[i].light_need
+                 : 0;
+  return 0;
+}
+
+int qjs_aot_unit_has(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
+      return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE;
   return 0;
 }
 
@@ -3081,6 +3126,25 @@ typedef struct {
   char *buf; /* memstream body, or NULL when the function failed */
   size_t len;
 } EmitBuf;
+
+/* Per unit function: the leaf body, when it has one. */
+static EmitBuf *g_pure_eb;
+
+/* The argument count of the unit function with this digest when it has a leaf
+   body, else -1. */
+int qjs_aot_leaf_argc(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || !g_pure_eb || hex_to_bytes16(hex, dg) < 0) return -1;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
+      return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE && g_pure_eb[i].buf
+                 ? g_unit_funcs[i].arg_count
+                 : -1;
+  return -1;
+}
+
 
 static unsigned long long prof_ops_of(
     const ProfEntry *prof, int nprof, const uint8_t dg[16]) {
@@ -3252,7 +3316,7 @@ int qjsaot_driver_main(int argc, char **argv) {
 
   if (g_dump_ir) {
     dump_ir(funcs, nfuncs);
-    js_aot_gen_free(rt, funcs);
+    js_aot_gen_free(rt, funcs, nfuncs);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return 0;
@@ -3286,12 +3350,35 @@ int qjsaot_driver_main(int argc, char **argv) {
       free(eb);
       free(uniq);
       free(sel);
-      js_aot_gen_free(rt, funcs);
+      js_aot_gen_free(rt, funcs, nfuncs);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
       return 2;
     }
 
+    g_unit_funcs = funcs;
+    g_unit_nfuncs = nfuncs;
+    /* The leaves first: a caller asks whether its callee has one while its own
+       body is emitted. */
+    g_pure_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_pure_eb));
+    for (i = 0; qjs_aot_emit_pure && g_pure_eb && i < nfuncs; i++) {
+      char hex[33];
+      FILE *mf;
+      int r;
+
+      if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
+      hex16(funcs[i].digest, hex);
+      g_cur_func_idx = i;
+      mf = open_memstream(&g_pure_eb[i].buf, &g_pure_eb[i].len);
+      if (!mf) continue;
+      r = qjs_aot_emit_pure(mf, &funcs[i], hex);
+      fclose(mf);
+      if (r != 1) {
+        free(g_pure_eb[i].buf);
+        g_pure_eb[i].buf = NULL;
+        g_pure_eb[i].len = 0;
+      }
+    }
     for (i = 0; i < nfuncs; i++) {
       char hex[33];
       int ninsn;
@@ -3341,7 +3428,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         free(eb);
         free(uniq);
         free(sel);
-        js_aot_gen_free(rt, funcs);
+        js_aot_gen_free(rt, funcs, nfuncs);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
         return 2;
@@ -3449,7 +3536,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         free(eb);
         free(uniq);
         free(sel);
-        js_aot_gen_free(rt, funcs);
+        js_aot_gen_free(rt, funcs, nfuncs);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
         return 2;
@@ -3509,6 +3596,28 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK %uu\n"
           "#define QJS_AOT_REG_UN_NEG %uu\n"
           "#define QJS_AOT_REG_UN_INC %uu\n\n"
+          "#define QJS_AOT_OFF_REGRUN_B %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_PIC %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_VAR_BUF %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_ARG_BUF %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_FUNC %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_THIS_OBJ %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_FLAGS %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_SF %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_CALLER %uu\n"
+          "#define QJS_AOT_OFF_FNBC_REGVM_CODE %uu\n"
+          "#define QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER %uu\n"
+          "#define QJS_AOT_OFF_FNBC_VAR_COUNT %uu\n"
+          "#define QJS_AOT_OFF_FNBC_ARG_COUNT %uu\n"
+          "#define QJS_AOT_OFF_FNBC_REGVM_REG_COUNT %uu\n"
+          "#define QJS_AOT_OFF_FNBC_VAR_REF_COUNT %uu\n"
+          "#define QJS_AOT_OFF_RT_GV_CELL_GEN %uu\n"
+          "#define QJS_AOT_OFF_CTX_INTERRUPT_COUNTER %uu\n"
+          "#define QJS_AOT_OFF_CTX_RT %uu\n"
+          "#define QJS_AOT_OFF_OBJECT_FUNC_BYTECODE %uu\n"
+          "#define QJS_AOT_CLASS_BYTECODE_FUNCTION %uu\n"
+          "#define QJS_AOT_OFF_FNBC_AOT_FN %uu\n"
+          "#define QJS_AOT_OFF_FNBC_REGVM_PIC %uu\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
           lay.hash, lay.sizeof_JSObject, lay.sizeof_JSShape,
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
@@ -3527,7 +3636,18 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.reg_bin_eq, lay.reg_bin_neq, lay.reg_cmp_invert,
           lay.reg_bin_is_undef, lay.reg_bin_is_not_undef, lay.reg_pic_own_w,
           lay.off_object_flags_byte, lay.object_is_prototype_mask,
-          lay.reg_un_neg, lay.reg_un_inc);
+          lay.reg_un_neg, lay.reg_un_inc,
+          lay.off_regrun_b, lay.off_regrun_pic,
+          lay.off_regrun_var_buf, lay.off_regrun_arg_buf, lay.off_regrun_func,
+          lay.off_regrun_this_obj, lay.off_regrun_flags, lay.off_regrun_sf,
+          lay.off_regrun_caller, lay.off_fnbc_regvm_code,
+          lay.off_fnbc_regvm_pic_holder, lay.off_fnbc_var_count,
+          lay.off_fnbc_arg_count, lay.off_fnbc_regvm_reg_count,
+          lay.off_fnbc_var_ref_count, lay.off_rt_gv_cell_gen,
+          lay.off_ctx_interrupt_counter, lay.off_ctx_rt,
+          lay.off_object_func_bytecode,
+          lay.class_bytecode_function, lay.off_fnbc_aot_fn,
+          lay.off_fnbc_regvm_pic);
       fclose(lf);
     }
 
@@ -3538,7 +3658,7 @@ int qjsaot_driver_main(int argc, char **argv) {
       free(eb);
       free(uniq);
       free(sel);
-      js_aot_gen_free(rt, funcs);
+      js_aot_gen_free(rt, funcs, nfuncs);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
       return 2;
@@ -3554,13 +3674,71 @@ int qjsaot_driver_main(int argc, char **argv) {
       fprintf(
           f, "#include <string.h>\n#include <stdio.h>\n#include <stdlib.h>\n");
     fprintf(f, "\n");
-    /* The inline own-read hit: the engine's regvm_own_read_hit predicate
+    /* The frame reads a compiled entry performs: the same fields the engine's
+       accessors return, read inline from the layout header's offsets, so the
+       prologue does not pay a call across the unit boundary for each. */
+    fprintf(
+        f,
+        "static inline void *q2_b(JSRegRun *f)\n"
+        "{\n"
+        "  return *(void **)((unsigned char *)f + QJS_AOT_OFF_REGRUN_B);\n"
+        "}\n\n"
+        "static inline uint8_t *q2_code(JSRegRun *f)\n"
+        "{\n"
+        "  return *(uint8_t **)((unsigned char *)q2_b(f) +\n"
+        "                       QJS_AOT_OFF_FNBC_REGVM_CODE);\n"
+        "}\n\n"
+        "static inline const void *q2_pic(JSRegRun *f)\n"
+        "{\n"
+        "  return *(const void **)((unsigned char *)f +\n"
+        "                          QJS_AOT_OFF_REGRUN_PIC);\n"
+        "}\n\n"
+        "static inline JSValue *q2_var_buf(JSRegRun *f)\n"
+        "{\n"
+        "  return *(JSValue **)((unsigned char *)f +\n"
+        "                       QJS_AOT_OFF_REGRUN_VAR_BUF);\n"
+        "}\n\n"
+        "static inline JSValue *q2_arg_buf(JSRegRun *f)\n"
+        "{\n"
+        "  return *(JSValue **)((unsigned char *)f +\n"
+        "                       QJS_AOT_OFF_REGRUN_ARG_BUF);\n"
+        "}\n\n"
+        "static inline void *const *q2_pic_holder(JSRegRun *f)\n"
+        "{\n"
+        "  return *(void *const **)((unsigned char *)q2_b(f) +\n"
+        "                           QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER);\n"
+        "}\n\n"
+        /* The global-read site cache hit: the site names the global's property
+           slot and the generation it was filled at, and a hit borrows the
+           slot's value. Runs no user code and allocates nothing. */
+        "static inline __attribute__((always_inline)) int q2_global_hit(JSContext *ctx, const void *pic,\n"
+        "                                int site, JSValue *out)\n"
+        "{\n"
+        "  const unsigned char *e;\n"
+        "  const unsigned char *slot;\n"
+        "  uint32_t gen;\n"
+        "\n"
+        "  if (pic == NULL) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  e = (const unsigned char *)pic +\n"
+        "      (size_t)site * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "  gen = *(const uint32_t *)(*(const unsigned char *const *)(\n"
+        "            (const unsigned char *)ctx + QJS_AOT_OFF_CTX_RT) +\n"
+        "        QJS_AOT_OFF_RT_GV_CELL_GEN);\n"
+        "  if (*(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF) != gen) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  slot = *(const unsigned char *const *)e;\n"
+        "  *out = *(const JSValue *)(slot + QJS_AOT_OFF_JSPROPERTY_U_VALUE);\n"
+        "  return 1;\n"
+        "}\n\n");    /* The inline own-read hit: the engine's regvm_own_read_hit predicate
        against the layout header's offsets, so a compiled field read is a couple
        of loads rather than a call across the unit boundary. A miss returns 0 and
        the caller takes the cache-filling slow path and continues. */
     fprintf(
         f,
-        "static inline int q2_own_read_hit(const void *pic, void *const *holders,\n"
+        "static inline __attribute__((always_inline)) int q2_own_read_hit(const void *pic, void *const *holders,\n"
         "                       JSValue recv, int site, JSValue *out)\n"
         "{\n"
         "  const unsigned char *obj, *e, *holder, *prop;\n"
@@ -3611,7 +3789,7 @@ int qjsaot_driver_main(int argc, char **argv) {
        the caller takes the engine's store. */
     fprintf(
         f,
-        "static inline int q2_put_field_hit(const void *pic, JSValue recv, int site,\n"
+        "static inline __attribute__((always_inline)) int q2_put_field_hit(const void *pic, JSValue recv, int site,\n"
         "                                   JSValue v)\n"
         "{\n"
         "  const unsigned char *obj, *e;\n"
@@ -3641,12 +3819,38 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *slot = v;\n"
         "  return 1;\n"
         "}\n\n");
+    /* A direct call to a leaf compiled into this unit: the callee must be the
+       bytecode function whose bound entry is `entry`, which only a function
+       with that digest can be. Its caches are the leaf's. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) int q2_leaf_callee(JSValue fnv, const void *entry,\n"
+        "                                 const void **pic, void *const **holders)\n"
+        "{\n"
+        "  const unsigned char *o, *b;\n"
+        "\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
+        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_BYTECODE_FUNCTION) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  b = *(const unsigned char *const *)(o + QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "  if (*(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) != entry) {\n"
+        "    return 0;\n"
+        "  }\n"
+        "  *pic = *(const void *const *)(b + QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
+        "  *holders = *(void *const *const *)(b + QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER);\n"
+        "  return 1;\n"
+        "}\n\n");
     /* The inline unary fast path for neg and inc: an int whose result stays an
        int, or a float64. Anything else (-0, an overflow, a coercion) returns 0
        and the caller takes the engine's unary. */
     fprintf(
         f,
-        "static inline int q2_unary_fast(int sub, JSValue a, JSValue *out)\n"
+        "static inline __attribute__((always_inline)) int q2_unary_fast(int sub, JSValue a, JSValue *out)\n"
         "{\n"
         "  if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {\n"
         "    int32_t i = JS_VALUE_GET_INT(a);\n"
@@ -3676,7 +3880,7 @@ int qjsaot_driver_main(int argc, char **argv) {
        the switches fold. */
     fprintf(
         f,
-        "static inline int q2_num_fast(int sub, JSValue a, JSValue b, JSValue *out)\n"
+        "static inline __attribute__((always_inline)) int q2_num_fast(int sub, JSValue a, JSValue b, JSValue *out)\n"
         "{\n"
         "  if (JS_VALUE_IS_BOTH_FLOAT(a, b)) {\n"
         "    double d1 = JS_VALUE_GET_FLOAT64(a), d2 = JS_VALUE_GET_FLOAT64(b);\n"
@@ -3722,11 +3926,11 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  return 0;\n"
         "}\n\n"
-        "static inline int q2_arith(int sub, JSValue a, JSValue b, JSValue *out)\n"
+        "static inline __attribute__((always_inline)) int q2_arith(int sub, JSValue a, JSValue b, JSValue *out)\n"
         "{\n"
         "  return q2_num_fast(sub, a, b, out) || qjs_aot_num_fast(sub, a, b, out);\n"
         "}\n\n"
-        "static inline int q2_cmp_int(int sub, int32_t a, int32_t b)\n"
+        "static inline __attribute__((always_inline)) int q2_cmp_int(int sub, int32_t a, int32_t b)\n"
         "{\n"
         "  switch (sub) {\n"
         "  case QJS_AOT_REG_BIN_LT: return a < b;\n"
@@ -3738,7 +3942,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  default: return -1;\n"
         "  }\n"
         "}\n\n"
-        "static inline int q2_cmp_double(int sub, double a, double b)\n"
+        "static inline __attribute__((always_inline)) int q2_cmp_double(int sub, double a, double b)\n"
         "{\n"
         "  switch (sub) {\n"
         "  case QJS_AOT_REG_BIN_LT: return a < b;\n"
@@ -3750,7 +3954,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  default: return -1;\n"
         "  }\n"
         "}\n\n"
-        "static inline int q2_branch_cmp(int sub, JSValue a, JSValue b, int *take)\n"
+        "static inline __attribute__((always_inline)) int q2_branch_cmp(int sub, JSValue a, JSValue b, int *take)\n"
         "{\n"
         "  int r;\n"
         "  if (__builtin_expect((unsigned)(sub - QJS_AOT_REG_BIN_IS_UNDEF) < 2, 0)) {\n"
@@ -3775,6 +3979,24 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return 0;\n"
         "}\n\n");
 
+    /* Forward declarations, so a compiled body can name a callee that is
+       emitted later in this file. */
+    for (i = 0; i < nfuncs; i++) {
+      char hex[33];
+      if (!sel[i] || !eb[i].buf) continue;
+      hex16(funcs[i].digest, hex);
+      fprintf(
+          f,
+          "static JSValue aot_f_%s(JSContext *, JSRegRun *, JSValue *, "
+          "uint32_t);\n#define Q2_SEL_%s 1\n",
+          hex, hex);
+    }
+    fprintf(f, "\n");
+    /* The leaves of the selected functions, before any caller. */
+    for (i = 0; g_pure_eb && i < nfuncs; i++) {
+      if (!sel[i] || !eb[i].buf || !g_pure_eb[i].buf) continue;
+      fwrite(g_pure_eb[i].buf, 1, g_pure_eb[i].len, f);
+    }
     for (i = 0; i < nfuncs; i++) {
       if (!sel[i] || !eb[i].buf) continue;
       fwrite(eb[i].buf, 1, eb[i].len, f);
@@ -3863,7 +4085,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     free(sel);
   }
 
-  js_aot_gen_free(rt, funcs);
+  js_aot_gen_free(rt, funcs, nfuncs);
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
   return fails == 0 ? 0 : 1;

@@ -1171,12 +1171,16 @@
       "sha256": "d5ca0ce9a3ff12a04d1fd26f0297dc0dffb7c920efa5e2af0aed6531aecee362"
     },
     {
+      "name": "0298-aot-compiled-calls-and-returns.patch",
+      "sha256": "0fb26caafec5ac5427508e39d3005f09669e57fd5402fdd87f12c7c5fe2c5173"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "fa90e9ae0a9c1ebe9d9f64075844db0a3fefe8286e6327bbadc56065b4a0852e",
+    "quickjs.c": "1627af66edd57831f086632756f9d8036cb0ff08da5e6a383563a058d6fc3a37",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

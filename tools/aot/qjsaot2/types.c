@@ -34,6 +34,9 @@
 #include "ir.h"
 #include "quickjs-regvm.h"
 
+/* Whether constant-pool entry `idx` is a number (qjsaot.c). */
+int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
+
 /* The working lattice. */
 enum { LB_BOT = 0, LB_BOOL, LB_I32, LB_F64, LB_TAG };
 
@@ -215,6 +218,46 @@ int q2_infer(Q2Func *fn) {
     w[fn->blocks[0].param_val[b]] = LB_TAG;
     fixed[fn->blocks[0].param_val[b]] = 1;
   }
+  /* A loop counter: a block parameter whose only incoming argument is the
+     result of the in-place increment, which itself is int when the parameter
+     is. The cycle has no least fixpoint, so it is broken here, by the same
+     rule the lowering applies (an int that overflows leaves compiled code). */
+  for (b = 1; b < fn->nblocks; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    int k;
+    for (k = 0; k < blk->nparams; k++) {
+      Q2ValueId pv = blk->param_val[k];
+      int e, only_inc = 1, seen = 0;
+      for (e = 0; e < blk->npreds && only_inc; e++) {
+        const Q2Block *pr = &fn->blocks[blk->preds[e]];
+        int n, m;
+        for (n = 0; n < pr->nsucc && only_inc; n++) {
+          if (pr->succ_block[n] != b || k >= pr->nedge_args[n]) continue;
+          for (m = 0; m < pr->nedge_args[n]; m++) {
+            Q2ValueId av;
+            const Q2Insn *ai;
+            if (m != k) continue;
+            av = pr->edge_arg[n][m];
+            if (av >= (Q2ValueId)fn->nvalues) continue;
+            seen = 1;
+            if (fn->values[av].insn < 0) {
+              if (av != pv) only_inc = 0;
+              continue;
+            }
+            ai = &fn->insns[fn->values[av].insn];
+            if (!((ai->op == Q2_OP_BRANCH_CMP &&
+                   (ai->rop == ROP_inc_branch_lt ||
+                    ai->rop == ROP_inc_branch_lt_s)) ||
+                  (ai->op == Q2_OP_BRANCH &&
+                   (ai->rop == ROP_add_imm_self_branch ||
+                    ai->rop == ROP_add_imm_self_branch_s))))
+              only_inc = 0;
+          }
+        }
+      }
+      if (seen && only_inc && !fixed[pv]) w[pv] = LB_I32;
+    }
+  }
   for (pass = 0; pass < fn->nblocks + 8; pass++) {
     changed = 0;
     for (b = 0; b < fn->nblocks; b++) {
@@ -303,6 +346,35 @@ int q2_infer(Q2Func *fn) {
             } else {
               lb = LB_TAG; /* MOD, POW, SHR and the rest stay tagged */
             }
+            /* A constant-pool right operand is typed only when the pool entry
+               is a number, which the lowering then folds to a literal: the
+               result is a double, boxed with the interpreter's tag where it
+               escapes. Anything else keeps the helper's tagged form. */
+            if (in->rop == ROP_binary_cpool) {
+              double c;
+              int ua = in->nuse >= 1 ? w[in->use[0]] : LB_TAG;
+              int sb = (int)in->arg[1].val;
+              lb = LB_TAG;
+              if (in->arg[3].val == REG_CONST_CPOOL &&
+                  qjs_aot_pool_num(fn->g, (uint32_t)in->arg[4].val, &c) &&
+                  (ua == LB_I32 || ua == LB_F64) &&
+                  (sb == REG_BIN_ADD || sb == REG_BIN_SUB ||
+                   sb == REG_BIN_MUL || sb == REG_BIN_DIV))
+                lb = LB_F64;
+            }
+          } else if (in->op == Q2_OP_BRANCH_CMP && in->ndef >= 1 &&
+                     (in->rop == ROP_inc_branch_lt ||
+                      in->rop == ROP_inc_branch_lt_s)) {
+            /* `d = d + 1` in place: an int stays an int. An increment past
+               INT32_MAX is a genuine misprediction, and the lowering guards
+               it. `use[0]` is the value register `d` held before the
+               instruction. */
+            lb = (in->nuse >= 1 && w[in->use[0]] == LB_I32) ? LB_I32 : LB_TAG;
+          } else if (in->op == Q2_OP_BRANCH_CMP && in->ndef >= 1 &&
+                     (in->rop == ROP_add_imm_self_branch ||
+                      in->rop == ROP_add_imm_self_branch_s)) {
+            /* the same in-place add, with an immediate */
+            lb = (in->nuse >= 1 && w[in->use[0]] == LB_I32) ? LB_I32 : LB_TAG;
           } else if (in->op == Q2_OP_COMPARE) {
             int a, bb;
             if (q2_binary_operands(fn, in, w, &a, &bb) && q2_is_set(a) &&
@@ -331,55 +403,25 @@ int q2_infer(Q2Func *fn) {
     v->rep = lb_rep(lb);
     v->spec = 0;
     v->ovf = 0;
+    /* R1: nothing is in its frame slot until a write-back puts it there. A
+       tagged value is no exception: it lives in its C local, and the
+       write-back before a safepoint, a leave or a return stores it. */
     v->synced = 0;
-    if (v->rep == Q2_R_TAGGED) {
-      v->synced = 1; /* tagged values are written through, as in step 2 */
-      continue;
-    }
-    /* A speculated load keeps the JSValue the load produced, already written
-       through, so a tagged consumer never re-boxes it. */
+    /* A tagged value is written through: its slot is current as soon as it is
+       defined. A typed one is not, and is boxed at a safepoint or a leave. */
+    if (v->rep == Q2_R_TAGGED) { v->synced = 1; continue; }
+    /* A load's record also decides whether the value keeps the JSValue it
+       produced, so a tagged consumer never re-boxes it. */
     if (v->insn >= 0) {
       const Q2Insn *in = &fn->insns[v->insn];
-      int k;
-      if (q2_def_from_record(in)) {
-        v->spec = 1;
-        v->synced = 1;
-      } else if (in->op == Q2_OP_CONST) {
-        v->synced = 1; /* a constant is written through, as in step 2 */
-      } else if (
-          in->op == Q2_OP_MOVE && in->nuse >= 1 &&
-          fn->values[in->use[0]].synced) {
-        v->synced = 1; /* the move writes the boxed form through */
-      } else if (
+      if (q2_def_from_record(in)) v->spec = 1;
+      else if (in->op == Q2_OP_CONST || in->op == Q2_OP_MOVE) v->synced = 1;
+      else if (
           in->op == Q2_OP_BINARY &&
           (in->sub == REG_BIN_ADD || in->sub == REG_BIN_SUB ||
            in->sub == REG_BIN_MUL) &&
-          v->rep == Q2_R_I32) {
+          v->rep == Q2_R_I32)
         v->ovf = 1;
-      }
-      for (k = 0; k < in->nredef; k++)
-        if (in->redef_val[k] == (Q2ValueId)i) v->synced = 1;
-    }
-    /* A typed block parameter: the slot may hold an older boxed value, unless
-       every incoming argument is the value in that same register (which the
-       builder guarantees) -- then it is current too. */
-    if (v->param_of >= 0) {
-      const Q2Block *blk = &fn->blocks[v->block];
-      int e, all_same = 1;
-      for (e = 0; e < blk->npreds; e++) {
-        const Q2Block *pr = &fn->blocks[blk->preds[e]];
-        int n, m;
-        for (n = 0; n < pr->nsucc; n++) {
-          if (pr->succ_block[n] != v->block) continue;
-          for (m = 0; m < pr->nedge_args[n]; m++) {
-            if (m != v->param_of) continue;
-            if (pr->edge_arg[n][m] != Q2_NO_VALUE &&
-                fn->values[pr->edge_arg[n][m]].reg != v->reg)
-              all_same = 0;
-          }
-        }
-      }
-      if (all_same && v->rep == Q2_R_TAGGED) v->synced = 1;
     }
   }
 

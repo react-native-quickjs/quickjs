@@ -259,6 +259,12 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
               in->op == Q2_OP_GET_FIELD || in->op == Q2_OP_GET_ELEMENT ||
               in->op == Q2_OP_GET_VAR_REF || in->op == Q2_OP_GET_ARG ||
               in->op == Q2_OP_GET_ARG2 || in->op == Q2_OP_GET_LOCAL ||
+              (in->op == Q2_OP_BRANCH_CMP &&
+               (in->rop == ROP_inc_branch_lt ||
+                in->rop == ROP_inc_branch_lt_s)) ||
+              (in->op == Q2_OP_BRANCH &&
+               (in->rop == ROP_add_imm_self_branch ||
+                in->rop == ROP_add_imm_self_branch_s)) ||
               q2_def_from_record(in))
             ok = 1;
           if (!ok)
