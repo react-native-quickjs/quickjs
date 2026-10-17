@@ -60,6 +60,10 @@ int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes,
                       uint64_t shapes[4]);
 /* Whether the profiler never executed the instruction at `pc`. */
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
+/* Every callee one call site saw, up to four, hottest first: the count (0
+   when there is no record) and parallel kind/digest/hits arrays. */
+int qjs_aot_prof_callees(const uint8_t dg[16], int pc, int *n, char hex[4][33],
+                         int kind[4], unsigned long long hits[4]);
 /* Whether the digest's body is emitted in this unit, so a call to it can be a
    direct call rather than a fresh interpreter activation. */
 int qjs_aot_unit_has(const char hex[33]);

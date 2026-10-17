@@ -150,6 +150,21 @@ typedef struct {
   char digest[33]; /* kind 1: the callee digest hex */
 } ProfCall;
 
+/* Every callee a call site saw, for polymorphic dispatch. The dominant callee
+   above is kept as it was so existing callers do not change. */
+#define PROF_MAX_CALLEES 4
+typedef struct {
+  int kind;
+  int cproto;
+  char digest[33];
+  unsigned long long hits;
+} ProfCallee;
+typedef struct {
+  int pc;
+  int n;
+  ProfCallee c[PROF_MAX_CALLEES];
+} ProfCallSite;
+
 /* A `P` record: the type set of every register the instruction at `pc` writes,
    the same one record shared by the two destinations of a fused op. Its shape
    lives in qjsaot2/prof.h so the IR reads the same struct. */
@@ -178,6 +193,8 @@ typedef struct {
   int nregs, capregs;
   ProfCall *calls;
   int ncalls, capcalls;
+  ProfCallSite *callsites;
+  int ncallsites, capcallsites;
   ProfPc *pcs;
   int npcs, cappcs;
   ProfSite *sites;
@@ -475,6 +492,57 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           e->calls[k].argc_min = amin;
           e->calls[k].argc_max = amax;
           snprintf(e->calls[k].digest, sizeof(e->calls[k].digest), "%s", cd);
+        }
+        /* And the whole callee set of this site, for polymorphic dispatch. */
+        {
+          ProfCallSite *cs = NULL;
+          int j;
+          for (j = 0; j < e->ncallsites; j++)
+            if (e->callsites[j].pc == pc) {
+              cs = &e->callsites[j];
+              break;
+            }
+          if (!cs) {
+            if (e->ncallsites == e->capcallsites) {
+              ProfCallSite *ncs;
+              e->capcallsites = e->capcallsites ? e->capcallsites * 2 : 16;
+              ncs = realloc(
+                  e->callsites,
+                  sizeof(*ncs) * (size_t)e->capcallsites);
+              if (!ncs) return NULL;
+              e->callsites = ncs;
+            }
+            cs = &e->callsites[e->ncallsites++];
+            memset(cs, 0, sizeof(*cs));
+            cs->pc = pc;
+          }
+          /* The same callee can appear on more than one line (one per proto
+             or per argc range): keep the highest hit count. */
+          for (j = 0; j < cs->n; j++) {
+            if (cs->c[j].kind != kind) continue;
+            if (strcmp(cs->c[j].digest, cd) != 0) continue;
+            if (hits > cs->c[j].hits) cs->c[j].hits = hits;
+            break;
+          }
+          if (j == cs->n && cs->n < PROF_MAX_CALLEES) {
+            cs->c[cs->n].kind = kind;
+            cs->c[cs->n].cproto = cproto;
+            snprintf(cs->c[cs->n].digest, sizeof(cs->c[cs->n].digest), "%s", cd);
+            cs->c[cs->n].hits = hits;
+            cs->n++;
+          } else if (j == cs->n) {
+            /* Full: replace the least-hit entry when this one is hotter. */
+            int lo = 0;
+            for (j = 1; j < cs->n; j++)
+              if (cs->c[j].hits < cs->c[lo].hits) lo = j;
+            if (hits > cs->c[lo].hits) {
+              cs->c[lo].kind = kind;
+              cs->c[lo].cproto = cproto;
+              snprintf(
+                  cs->c[lo].digest, sizeof(cs->c[lo].digest), "%s", cd);
+              cs->c[lo].hits = hits;
+            }
+          }
         }
       }
     } else if (line[0] == 'P') {
@@ -3065,6 +3133,33 @@ int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc) {
   if (!e) return 0;
   for (i = 0; i < e->nunused; i++)
     if (pc >= e->unused[i].lo && pc <= e->unused[i].hi) return 1;
+  return 0;
+}
+
+/* Every callee one call site saw, up to PROF_MAX_CALLEES, for polymorphic call
+   dispatch. Returns the count (0 when the function or pc has no call record)
+   and fills the parallel arrays; `hex[k]` is 33 bytes and is empty for a C or
+   unknown callee. `hits[k]` is that callee's hit count at the site. */
+int qjs_aot_prof_callees(
+    const uint8_t dg[16], int pc, int *n, char hex[4][33], int kind[4],
+    unsigned long long hits[4]) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k;
+  *n = 0;
+  if (!e) return 0;
+  for (i = 0; i < e->ncallsites; i++) {
+    if (e->callsites[i].pc != pc) continue;
+    *n = e->callsites[i].n;
+    for (k = 0; k < *n && k < PROF_MAX_CALLEES; k++) {
+      kind[k] = e->callsites[i].c[k].kind;
+      hits[k] = e->callsites[i].c[k].hits;
+      if (hex) {
+        memcpy(hex[k], e->callsites[i].c[k].digest, 33);
+        hex[k][32] = 0;
+      }
+    }
+    return *n;
+  }
   return 0;
 }
 
