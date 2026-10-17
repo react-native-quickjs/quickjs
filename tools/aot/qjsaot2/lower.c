@@ -229,6 +229,10 @@ typedef struct Q2Emit {
   int32_t *fact_val, *fact_grp;
   uint64_t *fact_in, *fact_out, *fact_scratch;
   uint64_t *fact_cur; /* the facts true at the instruction being emitted */
+  /* While a frame store or an exit stub is being printed. A value that reaches
+     the frame must be canonical, because the interpreter and the engine's
+     helpers read frame slots; a value that stays in a C local need not be. */
+  int in_wb;
   /* Per site, whether the site's pc was ever executed; an unexecuted site must
      not be validated at entry. */
   uint8_t *sexec;
@@ -336,8 +340,16 @@ static const char *q2_use(
       snprintf(buf, n, "v%u", vv);
     else if (v->rep == Q2_R_I32)
       snprintf(buf, n, "JS_MKVAL(JS_TAG_INT, i%u)", vv);
-    else if (v->rep == Q2_R_F64)
-      snprintf(buf, n, "qjs_aot_box_num(d%u, qjs_aot_fitsi(d%u))", vv, vv);
+    else if (v->rep == Q2_R_F64) {
+      /* A specialised body's hot path boxes with the float64 constructor: the
+         value stays in a C local, and no fitsi is needed to pick a tag. A frame
+         store, an exit stub and the generic body keep the canonical form,
+         because the interpreter and the engine's helpers read frame slots. */
+      if (g_em.spec && !g_em.in_wb)
+        snprintf(buf, n, "__JS_NewFloat64(d%u)", vv);
+      else
+        snprintf(buf, n, "qjs_aot_box_num(d%u, qjs_aot_fitsi(d%u))", vv, vv);
+    }
     else
       snprintf(buf, n, "JS_MKVAL(JS_TAG_BOOL, b%u)", vv);
     return buf;
