@@ -233,6 +233,7 @@ typedef struct Q2Emit {
      the frame must be canonical, because the interpreter and the engine's
      helpers read frame slots; a value that stays in a C local need not be. */
   int in_wb;
+  int next_poly; /* a unique number for each polymorphic compare chain */
   /* Per site, whether the site's pc was ever executed; an unexecuted site must
      not be validated at entry. */
   uint8_t *sexec;
@@ -804,6 +805,7 @@ static void q2_emit_colds(FILE *f) {
 }
 
 static void q2_miss(FILE *f, int off, int sid);
+static int q2_poly_site(const Q2Func *fn, int site);
 
 /* A field read that misses: fill the site's cache and continue compiled, out of
    line. `cond` is the hit test the caller already printed; the arm repeats the
@@ -2397,6 +2399,48 @@ static int q2_emit_native(
           }
           return 1;
         }
+        if (g_em.spec && q2_poly_site(fn, site)) {
+          /* A site with a 2-4 shape profile record: resolve it with a compare
+             chain over the polymorphic cache instead of leaving for the
+             interpreter. The fill arm calls the engine, which runs no
+             JavaScript, so the chain keeps the function compiled; a property
+             that is not own data exits instead. */
+          int k = g_em.next_poly++;
+          fprintf(
+              f,
+              "    _pe = q2_poly(f, %d);\n"
+              "    _psh = q2_shape_of(%s);\n"
+              "    if (__builtin_expect(_pe == NULL || _psh == NULL, 0)) "
+              "{ goto pfill%d; }\n"
+              "    if (q2_poly_shape(_pe, 0) == _psh) _po = q2_poly_off(_pe, 0);\n"
+              "    else if (q2_poly_shape(_pe, 1) == _psh) _po = q2_poly_off(_pe, 1);\n"
+              "    else if (q2_poly_shape(_pe, 2) == _psh) _po = q2_poly_off(_pe, 2);\n"
+              "    else if (q2_poly_shape(_pe, 3) == _psh) _po = q2_poly_off(_pe, 3);\n"
+              "    else { goto pfill%d; }\n"
+              "    goto pdone%d;\n"
+              "pfill%d: {\n",
+              site, a, k, k, k, k);
+          /* The fill may allocate the cache, which is a safepoint: every live
+             tagged value must be in the frame before it runs. */
+          q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+          fprintf(
+              f,
+              "      if (!qjs_aot_poly_fill(ctx, f, %d, %s, "
+              "(int)qjs_aot_ld_u32(code + %d), 0, &_po)) {\n",
+              site, a, in->arg[2].off);
+          q2_miss(f, in->pc, sid);
+          fprintf(f, "      }\n    }\n");
+          fprintf(f, "pdone%d:;\n", k);
+          fprintf(
+              f,
+              "    v%u = *q2_slotp(%s, _po);\n"
+              "    if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == "
+              "QJS_AOT_TAG_LAZY_JSON, 0)) {\n",
+              in->def[0], a, in->def[0]);
+          q2_miss(f, in->pc, sid);
+          fprintf(f, "    }\n");
+          return 1;
+        }
         {
           char cond[160];
           snprintf(
@@ -3451,6 +3495,17 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
    its profile record is monomorphic, its pc ran, and its cache cell is an own
    or own-writable hit; sites whose receiver shares the profile shape share the
    group, so one entry check can serve all of them. */
+/* Whether a site should use the polymorphic cache: the profile saw 2-4 shapes
+   there, and the site's pc ran. */
+static int q2_poly_site(const Q2Func *fn, int site) {
+  int ns = 0;
+  uint64_t shapes[4];
+  if (!g_em.spec || !g_em.sexec) return 0;
+  if ((unsigned)site >= (unsigned)fn->ninsns || !g_em.sexec[site]) return 0;
+  if (!qjs_aot_prof_site(fn->g->digest, site, &ns, shapes)) return 0;
+  return ns >= 2 && ns <= 4;
+}
+
 /* Whether the pair (value, group) is known at the instruction being emitted. */
 static int q2_fact_has(const Q2Insn *in, Q2ValueId v, int g) {
   int k;
@@ -3725,6 +3780,12 @@ static void q2_emit_one(
   /* The compare result: written by a hot path and, when its slow arm is out of
      line, by the arm too, so it is function-scoped. */
   fprintf(f, "    int _t;\n");
+  /* A polymorphic compare chain's temporaries. They are function-scoped
+     because the chain's fill arm is reached by a goto; each chain finishes
+     before the next instruction starts, so one set serves them all. */
+  fprintf(
+      f,
+      "    const void *_pe; uint32_t _po; const void *_psh;\n");
   fprintf(f, "    JSValue *vb = q2_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = q2_arg_buf(f);\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n");

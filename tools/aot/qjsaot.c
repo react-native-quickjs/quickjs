@@ -3922,6 +3922,27 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  q2_no_spec = (e != NULL && e[0] != '0');\n"
         "  q2_spec_on = (s == NULL || s[0] != '0');\n"
         "}\n\n"
+        /* A site's polymorphic cache: four (shape, offset, kind) entries the
+           compiled body fills on demand; NULL until the function has used the
+           site. */
+        "static inline const void *q2_poly(JSRegRun *f, int site)\n"
+        "{\n"
+        "  const unsigned char *b = *(const unsigned char *const *)q2_b(f);\n"
+        "  const void *p = *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_POLY);\n"
+        "  if (p == NULL) return NULL;\n"
+        "  if ((uint32_t)site >= *(const uint32_t *)(b + "
+        "QJS_AOT_OFF_FNBC_AOT_POLY_SITES))\n"
+        "    return NULL;\n"
+        "  return (const unsigned char *)p + (size_t)site * QJS_AOT_AOT_POLY_WAYS * 16;\n"
+        "}\n\n"
+        "static inline const void *q2_poly_shape(const void *e, int k)\n"
+        "{\n"
+        "  return *(const void *const *)((const unsigned char *)e + (size_t)k * 16);\n"
+        "}\n\n"
+        "static inline uint32_t q2_poly_off(const void *e, int k)\n"
+        "{\n"
+        "  return *(const uint32_t *)((const unsigned char *)e + (size_t)k * 16 + 8);\n"
+        "}\n\n"
         /* A site's cache cell, read at the specialised body's entry: the
            receiver shape the profile established and the slot offset that came
            with it. NULL/0 unless the cell is an own (read) or own-writable
