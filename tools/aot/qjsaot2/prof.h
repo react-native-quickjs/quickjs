@@ -32,6 +32,10 @@ typedef struct ProfPc {
   int32_t pc;     /* the register-program offset of the defining instruction */
   unsigned types; /* the PT_* set */
   uint8_t has_num, frac, negzero;
+  /* AOT_ELEM_*: what an element pc stored or loaded. INT or FLOAT alone means
+     every element there was a number, so a compiled read needs no hole or lazy
+     test. */
+  uint8_t elem;
   double num_min, num_max;
 } ProfPc;
 

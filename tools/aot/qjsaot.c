@@ -556,15 +556,17 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         const char *nm = strstr(line + 2, "num=");
         const char *fm = strstr(line + 2, "frac=");
         const char *nz = strstr(line + 2, "negzero=");
+        const char *el = strstr(line + 2, "elem=");
         int k;
         double nmin = 0, nmax = 0;
-        int has_num = 0, frac = 0, negzero = 0;
+        int has_num = 0, frac = 0, negzero = 0, elem = 0;
         if (nm) {
           has_num = 1;
           sscanf(nm + 4, "%lf..%lf", &nmin, &nmax);
         }
         if (fm) frac = (int)strtol(fm + 5, NULL, 10) != 0;
         if (nz) negzero = (int)strtol(nz + 8, NULL, 10) != 0;
+        if (el) elem = (uint8_t)strtoul(el + 5, NULL, 10);
         for (k = 0; k < e->npcs; k++)
           if (e->pcs[k].pc == pc) break;
         if (k == e->npcs) {
@@ -582,6 +584,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         e->pcs[k].types |= t;
         e->pcs[k].frac |= (uint8_t)frac;
         e->pcs[k].negzero |= (uint8_t)negzero;
+        e->pcs[k].elem |= (uint8_t)elem;
         if (has_num) {
           if (!e->pcs[k].has_num) {
             e->pcs[k].num_min = nmin;
@@ -3922,6 +3925,28 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  const char *s = getenv(\"QJS_AOT_SPEC\");\n"
         "  q2_no_spec = (e != NULL && e[0] != '0');\n"
         "  q2_spec_on = (s == NULL || s[0] != '0');\n"
+        "}\n\n"
+        /* A numeric element read: the profile saw only ints (or only doubles)
+           at this pc, so a class check, a bounds check and the load are enough;
+           a hole cannot be there or the profile would say so. */
+        "static inline __attribute__((always_inline)) int q2_elem_num(JSValue arr, JSValue k, JSValue *out)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  uint32_t i;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(k) != JS_TAG_INT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_ARRAY)\n"
+        "    return 0;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT))\n"
+        "    return 0;\n"
+        "  *out = (*(JSValue *const *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
+        "  if (JS_VALUE_GET_TAG(*out) != JS_TAG_INT &&\n"
+        "      JS_VALUE_GET_TAG(*out) != JS_TAG_FLOAT64)\n"
+        "    return 0;\n"
+        "  return 1;\n"
         "}\n\n"
         /* A site's polymorphic cache: four (shape, offset, kind) entries the
            compiled body fills on demand; NULL until the function has used the

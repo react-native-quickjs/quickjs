@@ -43,6 +43,7 @@
 
 #include "ir.h"
 #include "quickjs-aot-gen.h"
+#include "prof.h"
 #include "quickjs-regvm.h"
 
 /* The driver's id spaces and sweep flag (qjsaot.c). */
@@ -56,6 +57,7 @@ int qjs_aot_prof_call(const uint8_t dg[16], int pc, int *kind, int *cproto,
                       char hex[33]);
 /* The shapes one property site saw (its `S` record): 1 and up to four shapes,
    or 0 when the site has no record. Values are profile addresses. */
+const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n);
 int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes,
                       uint64_t shapes[4]);
 /* Whether the profiler never executed the instruction at `pc`. */
@@ -2920,6 +2922,7 @@ static int q2_emit_native(
     }
     case ROP_get_element: {
       int sid = q2_site();
+      int ns_pcs = 0;
       int off = fn->values[in->def[0]].reg * 16;
       q2_guard(f, in->pc, sid);
       /* The specialised body reads a plain fast array's element inline: a
@@ -2927,11 +2930,24 @@ static int q2_emit_native(
          miss (another class, out of bounds, a hole, a lazy JSON marker, or the
          object array underneath) exits at this instruction. */
       if (g_em.spec) {
+        /* A pc whose profile says every element was a number reads with the
+           numeric hit: no hole test, no lazy test, one tag check for the
+           number itself. */
+        const ProfPc *pp = qjs_aot_prof_pcs(fn->g->digest, &ns_pcs);
+        int numeric = 0;
+        {
+          int q;
+          for (q = 0; q < ns_pcs; q++)
+            if (pp[q].pc == in->pc) {
+              numeric = (pp[q].elem == 1u || pp[q].elem == 2u);
+              break;
+            }
+        }
         fprintf(
             f,
-            "    if (__builtin_expect(!q2_elem_hit(%s, %s, &v%u), 0)) {\n",
-            q2_op(in, 1, a, sizeof(a)), q2_op(in, 2, b, sizeof(b)),
-            in->def[0]);
+            "    if (__builtin_expect(!%s(%s, %s, &v%u), 0)) {\n",
+            numeric ? "q2_elem_num" : "q2_elem_hit", q2_op(in, 1, a, sizeof(a)),
+            q2_op(in, 2, b, sizeof(b)), in->def[0]);
         q2_miss(f, in->pc, sid);
         fprintf(f, "    }\n");
         /* The element is borrowed from the array, so nothing is adopted here:
