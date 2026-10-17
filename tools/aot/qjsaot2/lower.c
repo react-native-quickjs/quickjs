@@ -215,6 +215,7 @@ typedef struct Q2Emit {
   /* The specialised emission (T1.4+): misses exit instead of taking a slow
      arm, and the facts the profile established are available. */
   int spec;
+  const char *hex; /* the function's digest, for its per-function statics */
   /* While an arm is being emitted: the stream it writes to, and the number of
      arms already finished (its label is that index). */
   FILE *cold_stream;
@@ -702,6 +703,15 @@ static void q2_emit_exits(FILE *f, const Q2Func *fn) {
           "%%d v%u\\n\", __LINE__, %d); abort(); } }\n",
           buf, e->chk_reg[k] * 16, v, e->chk_reg[k]);
     }
+    /* A specialised body that keeps leaving is slower than the generic one,
+       so after a burst of exits it switches itself off. The generic body has
+       no counter: its misses continue in compiled code. */
+    if (g_em.spec)
+      fprintf(
+          f,
+          "    if (++q2_spec_fail_%s > Q2_SPEC_FAIL_MAX) { q2_spec_off_%s = "
+          "1; q2_spec_fail_%s = 0; }\n",
+          g_em.hex, g_em.hex, g_em.hex);
     fprintf(
         f, "    return qjs_aot_deopt(ctx, f, fr, %d, %d);\n    }\n", e->pc,
         e->sid);
@@ -764,6 +774,8 @@ static void q2_emit_colds(FILE *f) {
   }
 }
 
+static void q2_miss(FILE *f, int off, int sid);
+
 /* A field read that misses: fill the site's cache and continue compiled, out of
    line. `cond` is the hit test the caller already printed; the arm repeats the
    pre-instruction write-back, runs the engine's read (which may run a getter
@@ -773,7 +785,20 @@ static void q2_cold_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const char *cond, int atom_off,
     int site, const char *recv, Q2ValueId defv, int off) {
   int k;
-  FILE *m = q2_cold_begin(f, cond, 1, &k);
+  FILE *m;
+  /* The specialised body has no slow reads: a miss is an exit to the
+     interpreter, which fills the cache and resumes. That is the whole point of
+     the second body -- the generic one keeps the cache-filling arm so it never
+     has to leave. */
+  if (g_em.spec) {
+    /* Nothing has happened yet, so the exit resumes at this instruction and
+       the interpreter does the read itself. */
+    fprintf(f, "    if (__builtin_expect(!(%s), 0)) {\n", cond);
+    q2_miss(f, in->pc, q2_site());
+    fprintf(f, "    }\n");
+    return;
+  }
+  m = q2_cold_begin(f, cond, 1, &k);
   if (m) {
     fprintf(
         m,
@@ -3330,6 +3355,7 @@ static void q2_emit_one(
   memset(&g_em, 0, sizeof(g_em));
   g_em.fn = fn;
   g_em.spec = spec;
+  g_em.hex = hex;
   g_em.liveb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
   if (g_em.fb)
@@ -3347,6 +3373,11 @@ static void q2_emit_one(
       if (who[k] == '*' || who[k] == '\n') who[k] = '_';
     fprintf(f, "/* %s */\n", who);
   }
+  if (!spec)
+    fprintf(
+        f,
+        "static int q2_spec_off_%s, q2_spec_fail_%s;\n",
+        hex, hex);
   fprintf(
       f,
       "static JSValue %s_%s(JSContext *ctx, JSRegRun *f,\n"
@@ -3368,11 +3399,21 @@ static void q2_emit_one(
       "(void)holders;\n");
   fprintf(f, "#define Q2_REG(off) AOT_REG(fr, off)\n");
   /* Only pc 0 runs compiled; anything else is the interpreter's, from that pc
-     on. */
-  fprintf(
-      f,
-      "    if (__builtin_expect(entry_pc != 0, 0)) return "
-      "qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
+     on. The specialised body also refuses to run once it has exited too often
+     or when the A/B switch is on: its refusals go to the generic body, which
+     serves the same frame. */
+  if (spec)
+    fprintf(
+        f,
+        "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || "
+        "q2_no_spec || q2_spec_off_%s, 0))\n"
+        "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
+        hex, hex);
+  else
+    fprintf(
+        f,
+        "    if (__builtin_expect(entry_pc != 0, 0)) return "
+        "qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
 
   /* Every SSA value is a C local, declared once so a goto never crosses a
      declaration: a boxed `JSValue` for a tagged value, an `int32_t`/`double`
@@ -3517,18 +3558,7 @@ static void q2_emit_one(
    by the exit-rate trip. */
 static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   q2_emit_one(f, fn, hex, "aot_g", 0);
-  fprintf(
-      f,
-      "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
-      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
-      "                                 JSValue *fr, uint32_t entry_pc)\n"
-      "{\n"
-      "    (void)q2_spec_fail_%s;\n"
-      "    if (q2_no_spec || q2_spec_off_%s) return aot_g_%s(ctx, f, fr, "
-      "entry_pc);\n"
-      "    return aot_g_%s(ctx, f, fr, entry_pc);\n"
-      "}\n\n",
-      hex, hex, hex, hex, hex, hex, hex);
+  q2_emit_one(f, fn, hex, "aot_f", 1);
 }
 
 
