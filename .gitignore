@@ -61,3 +61,4 @@ __pycache__/
 
 # misc
 .local.scratch/
+.local/
