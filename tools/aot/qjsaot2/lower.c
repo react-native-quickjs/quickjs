@@ -216,6 +216,17 @@ typedef struct Q2Emit {
      arm, and the facts the profile established are available. */
   int spec;
   const char *hex; /* the function's digest, for its per-function statics */
+  /* Shape groups of the specialised body: per site, the group it belongs to
+     (-1 when it has no monomorphic profile shape), and per group the
+     representative shape pointer from the profile. Two sites share a group when
+     the profile saw one shape at each of them, which is the emitter's claim
+     that one shape check can stand for both. */
+  int32_t *sgroup; /* nsites entries */
+  int ngroups;
+  int *gfirst; /* ngroups entries: the first site of each group */
+  /* Per site, whether the site's pc was ever executed; an unexecuted site must
+     not be validated at entry. */
+  uint8_t *sexec;
   /* While an arm is being emitted: the stream it writes to, and the number of
      arms already finished (its label is that index). */
   FILE *cold_stream;
@@ -2328,12 +2339,46 @@ static int q2_emit_native(
          the interpreter, so a cold or polymorphic site never disables the
          function. The arm is out of line: the hot path pays only the branch. */
       {
-        char cond[160];
-        snprintf(
-            cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, &v%u)",
-            a, site, in->def[0]);
-        q2_cold_read(
-            f, fn, in, cond, in->arg[2].off, site, a, in->def[0], off);
+        /* A grouped site in a specialised body: the receiver's shape against
+           the group's validated shape, then a constant-offset load. A mismatch
+           or a lazy marker exits at this instruction; there is no cache to
+           fill, because the generic body serves the case. */
+        int g = (g_em.spec && g_em.sgroup && (unsigned)site < (unsigned)fn->ninsns &&
+                 g_em.sgroup[site] >= 0 && g_em.sexec[site])
+                    ? g_em.sgroup[site]
+                    : -1;
+        if (g >= 0) {
+          /* Two checks, both needed: the receiver must still have the group's
+             shape, and this site's own cell must still be that shape, because a
+             step or a call after entry can refill the cell and move the offset
+             (invariant 7). The offset is then this site's own, not the
+             representative's. */
+          fprintf(
+              f,
+              "    if (__builtin_expect(q2_shape_of(%s) != gsh%d || "
+              "q2_cell_shape(pic, %d) != gsh%d, 0)) {\n",
+              a, g, site, g);
+          (void)0;
+          q2_miss(f, in->pc, sid);
+          fprintf(f, "    }\n");
+          fprintf(
+              f,
+              "    v%u = *q2_slotp(%s, q2_cell_off(pic, %d));\n"
+              "    if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == "
+              "QJS_AOT_TAG_LAZY_JSON, 0)) {\n",
+              in->def[0], a, site, in->def[0]);
+          q2_miss(f, in->pc, sid);
+          fprintf(f, "    }\n");
+          return 1;
+        }
+        {
+          char cond[160];
+          snprintf(
+              cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, &v%u)",
+              a, site, in->def[0]);
+          q2_cold_read(
+              f, fn, in, cond, in->arg[2].off, site, a, in->def[0], off);
+        }
       }
       return 1;
     }
@@ -3363,6 +3408,79 @@ static int q2_emit_fast_loop(FILE *f, const Q2Func *fn, int lo, int hi) {
   return ok;
 }
 
+/* Number the shape groups of a specialised body. A site is in a group only when
+   its profile record is monomorphic, its pc ran, and its cache cell is an own
+   or own-writable hit; sites whose receiver shares the profile shape share the
+   group, so one entry check can serve all of them. */
+static void q2_groups(const Q2Func *fn) {
+  int i, k, nsites = 0, n = 0;
+  g_em.sgroup = NULL;
+  g_em.sexec = NULL;
+  g_em.ngroups = 0;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    int site = -1;
+    if (in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+        in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own ||
+        in->rop == ROP_get_global)
+      site = (int)in->arg[3].val;
+    else if (in->rop == ROP_put_field)
+      site = (int)in->arg[2].val;
+    if ((unsigned)site != REG_IC_NONE && site + 1 > nsites) nsites = site + 1;
+  }
+  if (nsites <= 0) return;
+  g_em.sgroup = malloc(sizeof(*g_em.sgroup) * (size_t)nsites);
+  g_em.sexec = malloc((size_t)nsites);
+  if (!g_em.sgroup || !g_em.sexec) {
+    free(g_em.sgroup);
+    free(g_em.sexec);
+    g_em.sgroup = NULL;
+    g_em.sexec = NULL;
+    return;
+  }
+  for (k = 0; k < nsites; k++) {
+    g_em.sgroup[k] = -1;
+    g_em.sexec[k] = 1;
+  }
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    int site = -1, ns, g = -1, j;
+    uint64_t shapes[4], sh[4];
+    if (in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+        in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own ||
+        in->rop == ROP_get_global)
+      site = (int)in->arg[3].val;
+    else if (in->rop == ROP_put_field)
+      site = (int)in->arg[2].val;
+    if ((unsigned)site == REG_IC_NONE || site >= nsites) continue;
+    if (qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) {
+      g_em.sexec[site] = 0;
+      continue;
+    }
+    if (!qjs_aot_prof_site(fn->g->digest, site, &ns, shapes)) continue;
+    if (ns != 1) continue; /* polymorphic or unseen: no group */
+    /* Sites whose profile shape is the same share a group, so one entry check
+       validates all of them. */
+    for (j = 0; j < site && g < 0; j++) {
+      int nsj;
+      if (g_em.sgroup[j] < 0) continue;
+      if (!qjs_aot_prof_site(fn->g->digest, j, &nsj, sh)) continue;
+      if (nsj == 1 && sh[0] == shapes[0]) g = g_em.sgroup[j];
+    }
+    if (g < 0) g = n++;
+    g_em.sgroup[site] = g;
+  }
+  g_em.ngroups = n;
+  g_em.gfirst = calloc((size_t)(n > 0 ? n : 1), sizeof(*g_em.gfirst));
+  if (g_em.gfirst) {
+    int g2;
+    for (g2 = 0; g2 < n; g2++) g_em.gfirst[g2] = -1;
+    for (k = 0; k < nsites; k++)
+      if (g_em.sgroup[k] >= 0 && g_em.gfirst[g_em.sgroup[k]] < 0)
+        g_em.gfirst[g_em.sgroup[k]] = k;
+  }
+}
+
 /* One emission: `name` is the C function to define (`aot_g_<hex>` or, later,
    the specialised body), and `spec` selects the specialised rules. Everything
    it collects (exits, cold arms) is per emission. */
@@ -3374,6 +3492,7 @@ static void q2_emit_one(
   g_em.fn = fn;
   g_em.spec = spec;
   g_em.hex = hex;
+  if (spec) q2_groups(fn);
   g_em.liveb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   g_em.fb = malloc(sizeof(Q2ValueId) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
   if (g_em.fb)
@@ -3428,10 +3547,36 @@ static void q2_emit_one(
         "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
         hex, hex);
   else
+    /* The generic body still has to refuse a mid-function entry: the
+       interpreter owns every pc but the function's first. */
     fprintf(
         f,
         "    if (__builtin_expect(entry_pc != 0, 0)) return "
         "qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
+  /* The group shapes, declared here so both the entry validation below and
+     every grouped access can name them. */
+  if (g_em.ngroups > 0) {
+    int g;
+    for (g = 0; g < g_em.ngroups; g++)
+      fprintf(f, "    const void *gsh%d = NULL;\n", g);
+  }
+  /* Entry validation: each group's representative cache cell must still hold
+     the shape the profile saw. Every other site of the group goes through the
+     same cell, so one read per group stands for all of them; a NULL or a
+     disagreeing cell hands the function to the generic body, which has no
+     assumptions about it. */
+  if (g_em.sgroup && g_em.gfirst && g_em.ngroups > 0) {
+    int g;
+    for (g = 0; g < g_em.ngroups; g++) {
+      int first = g_em.gfirst[g];
+      if (first < 0) continue;
+      fprintf(
+          f,
+          "    gsh%d = q2_cell_shape(pic, %d);\n"
+          "    if (gsh%d == NULL) return aot_g_%s(ctx, f, fr, 0);\n",
+          g, first, g, hex);
+    }
+  }
 
   /* Every SSA value is a C local, declared once so a goto never crosses a
      declaration: a boxed `JSValue` for a tagged value, an `int32_t`/`double`
@@ -3568,6 +3713,13 @@ static void q2_emit_one(
   free(g_em.colds);
   g_em.colds = NULL;
   g_em.ncolds = g_em.capcolds = 0;
+  free(g_em.sgroup);
+  g_em.sgroup = NULL;
+  free(g_em.sexec);
+  g_em.sexec = NULL;
+  free(g_em.gfirst);
+  g_em.gfirst = NULL;
+  g_em.ngroups = 0;
 }
 
 /* A function's two bodies. `aot_g_` is today's emitter, the one every fact
@@ -3699,6 +3851,7 @@ static char *q2_pure_text(Q2Func *fn, size_t *lenp) {
       fprintf(m, "    JSValue ev%d; int32_t ei%d = 0; double ed%d = 0.0; "
                  "int eb%d = 0;\n", i, i, i, i);
   }
+
   /* The generic compare writes this, and a leaf body reaches it too; its slow
      arm stays inline there (q2_cold_begin refuses a leaf), so the variable is
      local to the body's own text. */
