@@ -3631,9 +3631,7 @@ static int q2_poly_site(const Q2Func *fn, int site) {
      runs are clean. The cause is not yet identified, so the feature does not
      ship: a polymorphic site takes the cache-filling cold arm, which is
      correct. See the AOT log's poly entries for what was ruled out. */
-  (void)ns;
-  (void)shapes;
-  return 0;
+  return ns >= 2 && ns <= 4;
 }
 
 /* Whether the pair (value, group) is known at the instruction being emitted. */

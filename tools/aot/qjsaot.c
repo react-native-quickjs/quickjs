@@ -3972,7 +3972,9 @@ int qjsaot_driver_main(int argc, char **argv) {
            site. */
         "static inline const void *q2_poly(JSRegRun *f, int site)\n"
         "{\n"
-        "  const unsigned char *b = *(const unsigned char *const *)q2_b(f);\n"
+        "  /* q2_b(f) is already the bytecode pointer; dereferencing it again reads\n"
+        "     the struct's GC header as an address. */\n"
+        "  const unsigned char *b = (const unsigned char *)q2_b(f);\n"
         "  const void *p = *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_POLY);\n"
         "  if (p == NULL) return NULL;\n"
         "  if ((uint32_t)site >= *(const uint32_t *)(b + "
