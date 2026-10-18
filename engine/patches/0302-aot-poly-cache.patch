@@ -17,14 +17,9 @@ What it adds
 The table is allocated when the function binds to its compiled entry, so
 filling a site from compiled code never allocates: an allocation there
 would be a safepoint mid-instruction, and the compiled frame is not
-prepared for one.
-
-The fill hashes the shape and takes a reference before caching it. An
-unhashed shape can be mutated in place under a reference, which moves the
-slot a cached byte offset names; a hashed shape with a reference is
-copy-on-write, which is the invariant the compiled comparison needs. The
-references are released with the bytecode, and at teardown before the
-final collection, since a bytecode collected there cannot release them.
+prepared for one. For the same reason the fill refuses an unhashed shape
+instead of hashing it: hashing can resize the runtime's shape table, and
+an unhashed shape can be mutated in place under the cached offset.
 
 Bytecode version
   No.
@@ -169,7 +164,7 @@ diff --git a/quickjs.c b/quickjs.c
      out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
      out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
      out->class_array = JS_CLASS_ARRAY;
-@@ -61309,6 +61377,95 @@
+@@ -61309,6 +61377,100 @@
  /* Bind a function to its generated entry. The table is sorted by digest;
     `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
     bytecode is final. */
@@ -247,12 +242,17 @@ diff --git a/quickjs.c b/quickjs.c
 +                 e[k].fill < e[slot].fill)
 +            slot = k;
 +    }
-+    /* Hash the shape and take a reference. A hashed shape with a reference is
-+       copy-on-write, so it cannot be mutated under the cached offset; an
-+       unhashed one can be, which is what made the compiled offset stale. The
-+       reference is released with the bytecode (free_function_bytecode) and, at
-+       teardown, by js_aot_poly_free_all. */
-+    regvm_shape_hashify(ctx->rt, sh);
++    /* Only a hashed shape may be cached, and it is cached with a reference: a
++       hashed shape with a reference is copy-on-write, so it cannot be mutated
++       under the offset cached beside it. An unhashed shape can be mutated in
++       place, which moves the slot that offset names -- that was the DeltaBlue
++       miscompile. It is refused rather than hashed here, because hashing can
++       resize the runtime's shape table, i.e. allocate, and this call is made
++       from compiled code where an allocation is a safepoint mid-instruction.
++       The caller exits, the interpreter runs the read, and the shape is hashed
++       by the engine's own paths before the next attempt. */
++    if (!sh->is_hashed)
++        return 0;
 +    e[slot].shape = js_dup_shape(sh);
 +    e[slot].off = off2;
 +    e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
@@ -265,7 +265,7 @@ diff --git a/quickjs.c b/quickjs.c
  static void js_aot_bind(JSFunctionBytecode *b)
  {
      uint8_t digest[16];
-@@ -61338,6 +61495,19 @@
+@@ -61338,6 +61500,19 @@
              b->aot_fn = (void *)qjs_aot_table[mid].fn;
              b->aot_index = mid;
              b->aot_state = 1;   /* bound */
@@ -285,7 +285,7 @@ diff --git a/quickjs.c b/quickjs.c
              js_aot_bound_count++;
              return;
          }
-@@ -73188,6 +73358,19 @@
+@@ -73188,6 +73363,19 @@
  static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
  {
      int i;
@@ -305,7 +305,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      /* release IC-held shape refs and free the table */
      js_free_ic_table(rt, b);
-@@ -73205,6 +73388,19 @@
+@@ -73205,6 +73393,19 @@
  #if QJS_REGVM
      /* release register-PIC-held shape refs and free the table */
      js_free_regvm_pic(rt, b);

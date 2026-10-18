@@ -61451,12 +61451,17 @@ int qjs_aot_poly_fill(
                  e[k].fill < e[slot].fill)
             slot = k;
     }
-    /* Hash the shape and take a reference. A hashed shape with a reference is
-       copy-on-write, so it cannot be mutated under the cached offset; an
-       unhashed one can be, which is what made the compiled offset stale. The
-       reference is released with the bytecode (free_function_bytecode) and, at
-       teardown, by js_aot_poly_free_all. */
-    regvm_shape_hashify(ctx->rt, sh);
+    /* Only a hashed shape may be cached, and it is cached with a reference: a
+       hashed shape with a reference is copy-on-write, so it cannot be mutated
+       under the offset cached beside it. An unhashed shape can be mutated in
+       place, which moves the slot that offset names -- that was the DeltaBlue
+       miscompile. It is refused rather than hashed here, because hashing can
+       resize the runtime's shape table, i.e. allocate, and this call is made
+       from compiled code where an allocation is a safepoint mid-instruction.
+       The caller exits, the interpreter runs the read, and the shape is hashed
+       by the engine's own paths before the next attempt. */
+    if (!sh->is_hashed)
+        return 0;
     e[slot].shape = js_dup_shape(sh);
     e[slot].off = off2;
     e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
