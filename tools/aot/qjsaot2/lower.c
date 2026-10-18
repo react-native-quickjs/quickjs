@@ -3626,11 +3626,6 @@ static int q2_poly_site(const Q2Func *fn, int site) {
   if (!g_em.spec || !g_em.sexec) return 0;
   if ((unsigned)site >= (unsigned)fn->ninsns || !g_em.sexec[site]) return 0;
   if (!qjs_aot_prof_site(fn->g->digest, site, &ns, shapes)) return 0;
-  /* Off. With the chain enabled the unit crashes intermittently at -O2
-     (2 runs in 6 on smoke.js) and miscompiles DeltaBlue; with it off, 6 of 6
-     runs are clean. The cause is not yet identified, so the feature does not
-     ship: a polymorphic site takes the cache-filling cold arm, which is
-     correct. See the AOT log's poly entries for what was ruled out. */
   return ns >= 2 && ns <= 4;
 }
 
