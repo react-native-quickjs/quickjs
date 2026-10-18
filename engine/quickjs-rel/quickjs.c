@@ -4039,6 +4039,13 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     aot_run_free(rt);
 #endif
+#if QJS_AOT || QJS_AOT_GEN
+    /* Release the polymorphic caches' shape references before the final
+       collection, like the site callee references above: a bytecode that is
+       collected below cannot release them itself, and a counted shape would
+       keep its whole object graph reachable. */
+    js_aot_poly_free_all(rt);
+#endif
 
     /* The final collection must break ctx -> global -> closure -> fnbc -> ctx,
        whose last edge is counted but untraced. */
@@ -4107,11 +4114,6 @@ void JS_FreeRuntime(JSRuntime *rt)
     /* Teardown: no register window exists any more, so a count reaching zero is
        freed at once rather than parked. */
     rt->drc_in_reconcile = 1;
-#endif
-#if QJS_AOT || QJS_AOT_GEN
-    /* A bytecode can outlive the objects whose shapes its polymorphic cache
-       pinned; drop those references before the leak checks below. */
-    js_aot_poly_free_all(rt);
 #endif
     assert(list_empty(&rt->gc_notrace_list));
     assert(list_empty(&rt->gc_obj_list));

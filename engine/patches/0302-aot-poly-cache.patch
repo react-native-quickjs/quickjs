@@ -11,7 +11,7 @@ Why we need it
 What it adds
   JSAotPolyEntry, JSFunctionBytecode.aot_poly/.aot_poly_sites
   qjs_aot_poly_fill(ctx, f, site, obj, atom, write, *off)
-  js_aot_poly_free_all, for teardown
+  js_aot_poly_free_all, called before the final collection
   JSAotGenLayout.off_fnbc_aot_poly, .off_fnbc_aot_poly_sites, .aot_poly_ways
 
 The table is allocated when the function binds to its compiled entry, so
@@ -22,7 +22,9 @@ prepared for one.
 The fill hashes the shape and takes a reference before caching it. An
 unhashed shape can be mutated in place under a reference, which moves the
 slot a cached byte offset names; a hashed shape with a reference is
-copy-on-write, which is the invariant the compiled comparison needs.
+copy-on-write, which is the invariant the compiled comparison needs. The
+references are released with the bytecode, and at teardown before the
+final collection, since a bytecode collected there cannot release them.
 
 Bytecode version
   No.
@@ -103,19 +105,21 @@ diff --git a/quickjs.c b/quickjs.c
  #if QJS_AOT_PROFILE
  static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b);
  static int js_aot_prof_enter(JSFunctionBytecode *b);
-@@ -4083,6 +4108,11 @@
-        freed at once rather than parked. */
-     rt->drc_in_reconcile = 1;
+@@ -4014,6 +4039,13 @@
+     }
+     aot_run_free(rt);
  #endif
 +#if QJS_AOT || QJS_AOT_GEN
-+    /* A bytecode can outlive the objects whose shapes its polymorphic cache
-+       pinned; drop those references before the leak checks below. */
++    /* Release the polymorphic caches' shape references before the final
++       collection, like the site callee references above: a bytecode that is
++       collected below cannot release them itself, and a counted shape would
++       keep its whole object graph reachable. */
 +    js_aot_poly_free_all(rt);
 +#endif
-     assert(list_empty(&rt->gc_notrace_list));
-     assert(list_empty(&rt->gc_obj_list));
  
-@@ -8097,6 +8127,38 @@
+     /* The final collection must break ctx -> global -> closure -> fnbc -> ctx,
+        whose last edge is counted but untraced. */
+@@ -8097,6 +8129,38 @@
  
  /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
     Mirrors js_free_ic_table and is called from the same place. */
@@ -154,7 +158,7 @@ diff --git a/quickjs.c b/quickjs.c
  static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
  {
      uint32_t i;
-@@ -60033,6 +60095,10 @@
+@@ -60033,6 +60097,10 @@
          (uint32_t)offsetof(JSObject, u.func.function_bytecode);
      out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
  #if QJS_AOT || QJS_AOT_GEN
@@ -165,7 +169,7 @@ diff --git a/quickjs.c b/quickjs.c
      out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
      out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
      out->class_array = JS_CLASS_ARRAY;
-@@ -61309,6 +61375,95 @@
+@@ -61309,6 +61377,95 @@
  /* Bind a function to its generated entry. The table is sorted by digest;
     `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
     bytecode is final. */
@@ -261,7 +265,7 @@ diff --git a/quickjs.c b/quickjs.c
  static void js_aot_bind(JSFunctionBytecode *b)
  {
      uint8_t digest[16];
-@@ -61338,6 +61493,19 @@
+@@ -61338,6 +61495,19 @@
              b->aot_fn = (void *)qjs_aot_table[mid].fn;
              b->aot_index = mid;
              b->aot_state = 1;   /* bound */
@@ -281,7 +285,7 @@ diff --git a/quickjs.c b/quickjs.c
              js_aot_bound_count++;
              return;
          }
-@@ -73188,6 +73356,19 @@
+@@ -73188,6 +73358,19 @@
  static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
  {
      int i;
@@ -301,7 +305,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      /* release IC-held shape refs and free the table */
      js_free_ic_table(rt, b);
-@@ -73205,6 +73386,19 @@
+@@ -73205,6 +73388,19 @@
  #if QJS_REGVM
      /* release register-PIC-held shape refs and free the table */
      js_free_regvm_pic(rt, b);
