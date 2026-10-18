@@ -2639,7 +2639,10 @@ static int q2_emit_native(
       /* The own-slot overwrite inline; a counted value or a prototype receiver
          takes the engine's hit. A miss runs the engine's store, which can call
          a setter and throw, fills the cache and continues compiled. Both
-         fallbacks are one out-of-line arm. */
+         fallbacks are one out-of-line arm. This arm stays even in a specialised
+         body: making the miss an exit instead crashed earleyboyer (6 of 6) with
+         a dangling receiver in the interpreter's own read, so the store's cache
+         refill is what keeps the frame and the site consistent. */
       {
         char cond[256], arm[256];
         int k;
