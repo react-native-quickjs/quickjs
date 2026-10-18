@@ -69,6 +69,7 @@ int qjs_aot_prof_callees(const uint8_t dg[16], int pc, int *n, char hex[4][33],
 /* Whether the digest's body is emitted in this unit, so a call to it can be a
    direct call rather than a fresh interpreter activation. */
 int qjs_aot_unit_has(const char hex[33]);
+int qjs_aot_body_over_budget(int ninsns);
 /* The argument count of a unit function with a leaf body, else -1. */
 int qjs_aot_leaf_argc(const char hex[33]);
 /* The callee's light-frame size when a compiled caller may enter it on the C
@@ -224,6 +225,7 @@ typedef struct Q2Emit {
      the profile saw one shape at each of them, which is the emitter's claim
      that one shape check can stand for both. */
   int32_t *sgroup; /* nsites entries */
+  size_t nsites;   /* the length of sgroup/sexec */
   int ngroups;
   int *gfirst; /* ngroups entries: the first site of each group */
   /* Shape facts: pair -> (receiver value, group), and the per-block bitsets. */
@@ -3664,7 +3666,8 @@ static void q2_facts_build(const Q2Func *fn) {
       site = (int)in->arg[3].val;
     else if (in->rop == ROP_put_field)
       site = (int)in->arg[2].val;
-    if ((unsigned)site == REG_IC_NONE || site >= fn->ninsns) continue;
+    if ((unsigned)site == REG_IC_NONE || site < 0) continue;
+    if (!g_em.sgroup || (size_t)site >= g_em.nsites) continue;
     if (g_em.sgroup[site] < 0 || !g_em.sexec[site]) continue;
     if (in->narg < 1 || in->arg[1 - (in->rop == ROP_put_field ? 1 : 0)].kind != 'r')
       continue;
@@ -3692,7 +3695,8 @@ static void q2_facts_build(const Q2Func *fn) {
       op = 0;
     } else
       continue;
-    if ((unsigned)site == REG_IC_NONE || site >= fn->ninsns) continue;
+    if ((unsigned)site == REG_IC_NONE || site < 0) continue;
+    if (!g_em.sgroup || (size_t)site >= g_em.nsites) continue;
     if (g_em.sgroup[site] < 0 || !g_em.sexec[site]) continue;
     if (op >= in->narg || in->arg[op].kind != 'r') continue;
     rv = in->argval[op];
@@ -3742,7 +3746,8 @@ static void q2_facts_build(const Q2Func *fn) {
           site = (int)in->arg[2].val;
           op = 0;
         }
-        if ((unsigned)site == REG_IC_NONE || site >= fn->ninsns) continue;
+        if ((unsigned)site == REG_IC_NONE || site < 0) continue;
+        if (!g_em.sgroup || (size_t)site >= g_em.nsites) continue;
         if (g_em.sgroup[site] < 0 || !g_em.sexec[site]) continue;
         if (op >= in->narg || in->arg[op].kind != 'r') continue;
         for (k = 0; k < npairs; k++)
@@ -3791,6 +3796,7 @@ static void q2_groups(const Q2Func *fn) {
   int i, k, nsites = 0, n = 0;
   g_em.sgroup = NULL;
   g_em.sexec = NULL;
+  g_em.nsites = 0;
   g_em.ngroups = 0;
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
@@ -3804,6 +3810,7 @@ static void q2_groups(const Q2Func *fn) {
     if ((unsigned)site != REG_IC_NONE && site + 1 > nsites) nsites = site + 1;
   }
   if (nsites <= 0) return;
+  g_em.nsites = (size_t)nsites;
   g_em.sgroup = malloc(sizeof(*g_em.sgroup) * (size_t)nsites);
   g_em.sexec = malloc((size_t)nsites);
   if (!g_em.sgroup || !g_em.sexec) {
@@ -3827,8 +3834,13 @@ static void q2_groups(const Q2Func *fn) {
       site = (int)in->arg[3].val;
     else if (in->rop == ROP_put_field)
       site = (int)in->arg[2].val;
-    if ((unsigned)site == REG_IC_NONE || site >= nsites) continue;
+    if ((unsigned)site == REG_IC_NONE || site < 0) continue;
     if (qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) {
+      if ((size_t)site >= g_em.nsites) {
+        fprintf(stderr, "GROUPS OOB site=%d nsites=%zu ninsns=%d\n", site,
+                g_em.nsites, fn->ninsns);
+        continue;
+      }
       g_em.sexec[site] = 0;
       continue;
     }
@@ -3838,12 +3850,13 @@ static void q2_groups(const Q2Func *fn) {
        validates all of them. */
     for (j = 0; j < site && g < 0; j++) {
       int nsj;
+      if ((size_t)j >= g_em.nsites) break;
       if (g_em.sgroup[j] < 0) continue;
       if (!qjs_aot_prof_site(fn->g->digest, j, &nsj, sh)) continue;
       if (nsj == 1 && sh[0] == shapes[0]) g = g_em.sgroup[j];
     }
     if (g < 0) g = n++;
-    g_em.sgroup[site] = g;
+    if ((size_t)site < g_em.nsites) g_em.sgroup[site] = g;
   }
   g_em.ngroups = n;
   g_em.gfirst = calloc((size_t)(n > 0 ? n : 1), sizeof(*g_em.gfirst));
@@ -4107,6 +4120,7 @@ static void q2_emit_one(
   g_em.sgroup = NULL;
   free(g_em.sexec);
   g_em.sexec = NULL;
+  g_em.nsites = 0;
   free(g_em.gfirst);
   g_em.gfirst = NULL;
   g_em.ngroups = 0;
@@ -4128,8 +4142,25 @@ static void q2_emit_one(
    by the exit-rate trip. */
 static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   q2_emit_one(f, fn, hex, "aot_g", 0);
-  q2_emit_one(f, fn, hex, "aot_f", 1);
+  /* A function over the code-size budget keeps the generic body only: the
+     second copy would cost more I-cache than the shape checks save. The entry
+     still exists and forwards, so nothing else changes. */
+  if (!qjs_aot_body_over_budget(fn->ninsns)) {
+    q2_emit_one(f, fn, hex, "aot_f", 1);
+    return;
+  }
+  fprintf(
+      f,
+      "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
+      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "                                 JSValue *fr, uint32_t entry_pc)\n"
+      "{\n"
+      "    (void)q2_spec_off_%s; (void)q2_spec_fail_%s;\n"
+      "    return aot_g_%s(ctx, f, fr, entry_pc);\n"
+      "}\n\n",
+      hex, hex, hex, hex, hex, hex);
 }
+
 
 
 /* ---- leaf bodies -------------------------------------------------------- */

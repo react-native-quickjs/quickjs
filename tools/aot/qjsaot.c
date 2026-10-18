@@ -152,6 +152,11 @@ typedef struct {
 
 /* Every callee a call site saw, for polymorphic dispatch. The dominant callee
    above is kept as it was so existing callers do not change. */
+/* A compiled function's body above this many bytes gets no specialised copy:
+   the code is a cost of its own (I-cache, and a second body doubles it), and
+   SVC, the largest function box2d has, is 423 KB. */
+#define QJS_AOT_BODY_BUDGET (1024u * 1024u)
+
 #define PROF_MAX_CALLEES 4
 typedef struct {
   int kind;
@@ -3045,6 +3050,20 @@ static int emit_region(
 /* The body emitter, overridable so qjsaot2 can drive this same unit builder
    with its own lowering. NULL means the template emitter below. */
 int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
+
+/* A compiled function's code is a cost of its own (I-cache, and a second body
+   doubles it). A function over this many instructions keeps the generic body
+   only, which is what box2d's SVC-sized functions would get if the threshold
+   were ever reached: SVC is 5,000-odd instructions and 423 KB. */
+int qjs_aot_body_over_budget(int ninsns) {
+  const char *e = getenv("QJS_AOT_BODY_BUDGET");
+  int budget = e ? atoi(e) : 6000;
+  return ninsns > budget;
+}
+/* Whether a function is large enough that a second body is not worth it. The
+   lowering calls this before emitting; the count is the function's instruction
+   count, which tracks its code size closely and needs no measurement. */
+int qjs_aot_body_over_budget(int ninsns);
 /* The leaf emitter: a frameless body for a function a compiled caller can run
    in place of a call. Returns 1 with the body written, 0 when the function is
    not such a leaf. NULL means no leaves. */
