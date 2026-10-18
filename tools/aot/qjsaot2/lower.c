@@ -1308,6 +1308,80 @@ static void q2_emit_fallback(
    jumps to the edge the step body would have taken, a miss falls through to
    the step. Returns 1 when it emitted an attempt. A typed result is left to
    the step so its speculation guard stays in one place. */
+/* Dispatch a call whose site saw 2-4 bytecode callees. Each branch checks the
+   callee's bound entry against one of the known digests and calls it on a light
+   frame; a callee that matches none falls through to the generic helper, which
+   is what the single-callee path does on a miss anyway. `qjs_aot_call_light`
+   revalidates the callee's eligibility, so a wrong guess is safe. */
+static void q2_emit_poly_call_impl(FILE *f, const Q2Func *fn, const Q2Insn *in) {
+  int n = 0, kind[4], k, nb = 0, is_m = (in->rop == ROP_call_method);
+  int na = in->win_n;
+  int abc = (int)in->arg[is_m ? 3 : 2].val;
+  int cc = (int)in->arg[1].val;
+  int off = fn->values[in->def[0]].reg * 16;
+  char hex[4][33];
+  unsigned long long hits[4];
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, hex, kind, hits))
+    return;
+  /* A call is a safepoint: store what the call reads and the live heap
+     references, exactly as the single-callee path does. */
+  q2_emit_fallback_liveb(fn, in);
+  {
+    uint64_t *need = calloc((size_t)fn->lwords, 8);
+    if (need) {
+      q2_call_need_bits(fn, in, need);
+      q2_writeback_call(f, fn, &g_em.pre, g_em.liveb, need);
+      free(need);
+    } else {
+      q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+    }
+  }
+  fprintf(f, "    { JSValue _o; int _h;\n");
+  for (k = 0; k < n && nb < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(hex[k])) continue;
+    fprintf(f, "#ifdef Q2_SEL_%s\n", hex[k]);
+    fprintf(
+        f,
+        "      if (q2_entry_is(AOT_REG(fr, %d), (const void *)aot_f_%s)) {\n"
+        "        _h = qjs_aot_call_light(ctx, f, %d, AOT_REG(fr, %d), ",
+        cc, hex[k], na, cc);
+    if (is_m)
+      fprintf(f, "AOT_REG(fr, %d), ", (int)in->arg[2].val);
+    else
+      fprintf(f, "JS_UNDEFINED, ");
+    fprintf(
+        f,
+        "&AOT_REG(fr, %d), &_o);\n"
+        "        if (_h > 0) { qjs_aot_set_reg_p(ctx, fr, %d, _o); ip = code + "
+        "%d; goto q2hit_%d; }\n"
+        "        if (_h < 0) { pc = %d; goto exception; }\n"
+        "      }\n"
+        "#endif\n",
+        abc, off, in->next, in->pc, in->pc);
+    nb++;
+  }
+  fprintf(f, "    }\n");
+}
+
+/* Whether a call site has 2-4 bytecode callees, so it can be dispatched by a
+   compare chain instead of the dominant-callee path. */
+static int q2_poly_call_site(const Q2Func *fn, const Q2Insn *in) {
+  int n = 0, kind[4], k, nbc = 0;
+  char hex[4][33];
+  unsigned long long hits[4];
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, hex, kind, hits))
+    return 0;
+  if (n < 2) return 0;
+  for (k = 0; k < n; k++)
+    if (kind[k] == 1 && qjs_aot_unit_has(hex[k])) nbc++;
+  return nbc >= 2;
+}
+
+static int q2_emit_poly_call(FILE *f, const Q2Func *fn, const Q2Insn *in) {
+  q2_emit_poly_call_impl(f, fn, in);
+  return 1;
+}
+
 static int q2_emit_call_special(
     FILE *f, const Q2Func *fn, int blk_index, const Q2Insn *in) {
   int is_m, kind = 0, cproto = -1, sid, na, abc, off, cc, leaf = 0;
@@ -1319,9 +1393,14 @@ static int q2_emit_call_special(
   dv = in->def[0];
   if (fn->values[dv].rep != Q2_R_TAGGED) return 0;
   if (in->nuse < 1 || in->win_n < 0) return 0;
-  if (!qjs_aot_prof_call(fn->g->digest, in->next, &kind, &cproto, hex))
-    return 0;
-  if (kind != 1 && kind != 2) return 0;
+  if (!qjs_aot_prof_call(fn->g->digest, in->next, &kind, &cproto, hex)) {
+    /* No dominant-callee record, but the site may still have one: the
+       polymorphic list below covers a site whose callees tie or whose record
+       the merge dropped. */
+    kind = 0;
+  }
+  if (kind != 1 && kind != 2 && !q2_poly_call_site(fn, in)) return 0;
+  if (kind != 1 && kind != 2) return q2_emit_poly_call(f, fn, in);
   if ((unsigned)(in->win_reg + in->win_n) > (unsigned)fn->nregs) return 0;
 
   is_m = (in->rop == ROP_call_method);

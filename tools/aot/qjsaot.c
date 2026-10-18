@@ -4169,6 +4169,22 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *slot = v;\n"
         "  return 1;\n"
         "}\n\n");
+    /* Whether the callee is the function whose bound entry is `entry`. Only
+       that function's digest produces that entry, so this is an exact identity
+       test, cheap enough for a dispatch chain. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) int q2_entry_is(JSValue fnv, const void *entry)\n"
+        "{\n"
+        "  const unsigned char *o, *b;\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return 0;\n"
+        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
+        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_BYTECODE_FUNCTION)\n"
+        "    return 0;\n"
+        "  b = *(const unsigned char *const *)(o + QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == entry;\n"
+        "}\n\n");
     /* A direct call to a leaf compiled into this unit: the callee must be the
        bytecode function whose bound entry is `entry`, which only a function
        with that digest can be. Its caches are the leaf's. */
