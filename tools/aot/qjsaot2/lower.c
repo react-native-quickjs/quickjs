@@ -3535,12 +3535,14 @@ static int q2_poly_site(const Q2Func *fn, int site) {
   int ns = 0;
   uint64_t shapes[4];
   if (!g_em.spec || !g_em.sexec) return 0;
-  /* Off until the fill path is sound: with it enabled, DeltaBlue's compiled
-     body reports a constraint cycle the interpreter does not. A polymorphic
-     site falls back to the cache-filling cold arm, which is correct. */
-  return 0;
+
   if ((unsigned)site >= (unsigned)fn->ninsns || !g_em.sexec[site]) return 0;
   if (!qjs_aot_prof_site(fn->g->digest, site, &ns, shapes)) return 0;
+  /* Correct with hashified, referenced shapes (see qjs_aot_poly_fill), but its
+     cache outlives the objects whose shapes it pins, so enabling it leaks at
+     teardown until the release path is fixed. Off by default; Q2_POLY=1 turns
+     it on for the investigation. */
+  if (getenv("Q2_POLY") == NULL) return 0;
   return ns >= 2 && ns <= 4;
 }
 
