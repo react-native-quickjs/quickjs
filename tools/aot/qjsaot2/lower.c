@@ -3241,6 +3241,14 @@ static void q2_emit_block(FILE *f, const Q2Func *fn, int b) {
       q2_cur_def(&g_em.cur, in->redef_reg[k], in->redef_val[k]);
     /* The live-before set is the write-back set of a pre-instruction leave. */
     q2_live_before(fn, g_em.cur_insn, g_em.liveb);
+    /* A pc the profiler never executed needs no body: the specialised body
+       exits at it and the interpreter runs it. This is Phase 6's code-size
+       rule, and it is also a correctness neutral win -- the first execution
+       pays one deopt. */
+    if (g_em.spec && !g_em.fast && qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) {
+      q2_miss(f, in->pc, q2_site());
+      continue;
+    }
     if ((in->rop == ROP_call || in->rop == ROP_call_method) &&
         (g_em.fast || g_em.gen_loop)) {
       /* A call of a copied loop: the leaf in the copy, and the place the copy
