@@ -4108,6 +4108,11 @@ void JS_FreeRuntime(JSRuntime *rt)
        freed at once rather than parked. */
     rt->drc_in_reconcile = 1;
 #endif
+#if QJS_AOT || QJS_AOT_GEN
+    /* A bytecode can outlive the objects whose shapes its polymorphic cache
+       pinned; drop those references before the leak checks below. */
+    js_aot_poly_free_all(rt);
+#endif
     assert(list_empty(&rt->gc_notrace_list));
     assert(list_empty(&rt->gc_obj_list));
 
@@ -61375,6 +61380,8 @@ static void js_aot_unbind(JSFunctionBytecode *b)
    needs the slot to be writable and the object not to be a prototype. It never
    runs JavaScript, so a compiled body may call it without a safepoint. */
 #if QJS_AOT || QJS_AOT_GEN
+static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh);
+
 static int js_aot_poly_lookup(JSObject *obj, JSAtom atom, int write, uint32_t *off)
 {
     JSShape *sh = obj->shape;
@@ -61442,7 +61449,13 @@ int qjs_aot_poly_fill(
                  e[k].fill < e[slot].fill)
             slot = k;
     }
-    e[slot].shape = sh; /* weak: the entry is revalidated before use */
+    /* Hash the shape and take a reference. A hashed shape with a reference is
+       copy-on-write, so it cannot be mutated under the cached offset; an
+       unhashed one can be, which is what made the compiled offset stale. The
+       reference is released with the bytecode (free_function_bytecode) and, at
+       teardown, by js_aot_poly_free_all. */
+    regvm_shape_hashify(ctx->rt, sh);
+    e[slot].shape = js_dup_shape(sh);
     e[slot].off = off2;
     e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
     e[slot].fill = (uint16_t)(e[slot].fill + 1);
@@ -73343,6 +73356,19 @@ static int regvm_free_atom(void *opaque, uint32_t *patom)
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
     int i;
+#if QJS_AOT || QJS_AOT_GEN
+    /* Release the polymorphic cache's shape references; it is allocated at bind
+       time and is independent of the register PIC. */
+    if (b->aot_poly != NULL) {
+        uint32_t pi, pn = b->aot_poly_sites * AOT_POLY_WAYS;
+        for (pi = 0; pi < pn; pi++)
+            if (b->aot_poly[pi].shape != NULL)
+                js_free_shape(rt, b->aot_poly[pi].shape);
+        js_free_rt(rt, b->aot_poly);
+        b->aot_poly = NULL;
+        b->aot_poly_sites = 0;
+    }
+#endif
 
     /* release IC-held shape refs and free the table */
     js_free_ic_table(rt, b);

@@ -14,14 +14,15 @@ What it adds
   js_aot_poly_free_all, for teardown
   JSAotGenLayout.off_fnbc_aot_poly, .off_fnbc_aot_poly_sites, .aot_poly_ways
 
-The table is allocated when the function binds to its compiled entry and
-released with the bytecode, so filling a site from compiled code never
-allocates: an allocation there would be a safepoint mid-instruction, and
-the compiled frame is not prepared for one.
+The table is allocated when the function binds to its compiled entry, so
+filling a site from compiled code never allocates: an allocation there
+would be a safepoint mid-instruction, and the compiled frame is not
+prepared for one.
 
-The entries hold weak shape pointers. Each hit is a compare against a live
-object's shape, so a stale entry can only miss, never match: no reference
-is taken and none has to be released.
+The fill hashes the shape and takes a reference before caching it. An
+unhashed shape can be mutated in place under a reference, which moves the
+slot a cached byte offset names; a hashed shape with a reference is
+copy-on-write, which is the invariant the compiled comparison needs.
 
 Bytecode version
   No.
@@ -102,7 +103,19 @@ diff --git a/quickjs.c b/quickjs.c
  #if QJS_AOT_PROFILE
  static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b);
  static int js_aot_prof_enter(JSFunctionBytecode *b);
-@@ -8097,6 +8122,38 @@
+@@ -4083,6 +4108,11 @@
+        freed at once rather than parked. */
+     rt->drc_in_reconcile = 1;
+ #endif
++#if QJS_AOT || QJS_AOT_GEN
++    /* A bytecode can outlive the objects whose shapes its polymorphic cache
++       pinned; drop those references before the leak checks below. */
++    js_aot_poly_free_all(rt);
++#endif
+     assert(list_empty(&rt->gc_notrace_list));
+     assert(list_empty(&rt->gc_obj_list));
+ 
+@@ -8097,6 +8127,38 @@
  
  /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
     Mirrors js_free_ic_table and is called from the same place. */
@@ -141,7 +154,7 @@ diff --git a/quickjs.c b/quickjs.c
  static void js_free_regvm_pic(JSRuntime *rt, JSFunctionBytecode *b)
  {
      uint32_t i;
-@@ -60033,6 +60090,10 @@
+@@ -60033,6 +60095,10 @@
          (uint32_t)offsetof(JSObject, u.func.function_bytecode);
      out->class_bytecode_function = JS_CLASS_BYTECODE_FUNCTION;
  #if QJS_AOT || QJS_AOT_GEN
@@ -152,7 +165,7 @@ diff --git a/quickjs.c b/quickjs.c
      out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
      out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
      out->class_array = JS_CLASS_ARRAY;
-@@ -61309,6 +61370,87 @@
+@@ -61309,6 +61375,95 @@
  /* Bind a function to its generated entry. The table is sorted by digest;
     `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
     bytecode is final. */
@@ -161,6 +174,8 @@ diff --git a/quickjs.c b/quickjs.c
 +   needs the slot to be writable and the object not to be a prototype. It never
 +   runs JavaScript, so a compiled body may call it without a safepoint. */
 +#if QJS_AOT || QJS_AOT_GEN
++static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh);
++
 +static int js_aot_poly_lookup(JSObject *obj, JSAtom atom, int write, uint32_t *off)
 +{
 +    JSShape *sh = obj->shape;
@@ -228,7 +243,13 @@ diff --git a/quickjs.c b/quickjs.c
 +                 e[k].fill < e[slot].fill)
 +            slot = k;
 +    }
-+    e[slot].shape = sh; /* weak: the entry is revalidated before use */
++    /* Hash the shape and take a reference. A hashed shape with a reference is
++       copy-on-write, so it cannot be mutated under the cached offset; an
++       unhashed one can be, which is what made the compiled offset stale. The
++       reference is released with the bytecode (free_function_bytecode) and, at
++       teardown, by js_aot_poly_free_all. */
++    regvm_shape_hashify(ctx->rt, sh);
++    e[slot].shape = js_dup_shape(sh);
 +    e[slot].off = off2;
 +    e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
 +    e[slot].fill = (uint16_t)(e[slot].fill + 1);
@@ -240,7 +261,7 @@ diff --git a/quickjs.c b/quickjs.c
  static void js_aot_bind(JSFunctionBytecode *b)
  {
      uint8_t digest[16];
-@@ -61338,6 +61480,19 @@
+@@ -61338,6 +61493,19 @@
              b->aot_fn = (void *)qjs_aot_table[mid].fn;
              b->aot_index = mid;
              b->aot_state = 1;   /* bound */
@@ -260,7 +281,27 @@ diff --git a/quickjs.c b/quickjs.c
              js_aot_bound_count++;
              return;
          }
-@@ -73205,6 +73360,19 @@
+@@ -73188,6 +73356,19 @@
+ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     int i;
++#if QJS_AOT || QJS_AOT_GEN
++    /* Release the polymorphic cache's shape references; it is allocated at bind
++       time and is independent of the register PIC. */
++    if (b->aot_poly != NULL) {
++        uint32_t pi, pn = b->aot_poly_sites * AOT_POLY_WAYS;
++        for (pi = 0; pi < pn; pi++)
++            if (b->aot_poly[pi].shape != NULL)
++                js_free_shape(rt, b->aot_poly[pi].shape);
++        js_free_rt(rt, b->aot_poly);
++        b->aot_poly = NULL;
++        b->aot_poly_sites = 0;
++    }
++#endif
+ 
+     /* release IC-held shape refs and free the table */
+     js_free_ic_table(rt, b);
+@@ -73205,6 +73386,19 @@
  #if QJS_REGVM
      /* release register-PIC-held shape refs and free the table */
      js_free_regvm_pic(rt, b);
