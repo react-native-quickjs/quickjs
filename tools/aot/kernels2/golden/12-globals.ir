@@ -2,7 +2,7 @@ F bump blocks=3 insns=5 values=4 regs=2 ctl_max=0
   digest=61861fec44a9d8874e6a3a7cefaef7ad
 B0 pc=0..13 ctl=0 params=- succ=13()
       0 get_global       rop=20   def=1(tagged) use=-
-     10 fallback         rop=185  def=- use=v1(r0:tagged,sync)
+     10 unary            rop=185  def=2(tagged) use=v1(r0:tagged,sync)
 B1 pc=13..26 ctl=0 params=- succ=26()
      13 binary           rop=171  def=3(tagged) use=v2(r0:tagged,sync)
      18 fallback         rop=21   def=- use=v3(r0:tagged,sync)

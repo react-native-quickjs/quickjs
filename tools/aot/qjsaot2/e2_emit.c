@@ -236,8 +236,22 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   char msg[256];
   int rc, ninsns;
 
-  if (q2_build(g, &fn) < 0) return -1;
+  /* Every failure below names its own reason. The caller only knows the body
+     emitter returned -1, and reports that as "malformed program" -- which is
+     true of none of these cases. `q2_build` and `q2_infer` set `fn.why`, and a
+     diagnostic that says only "malformed" sends the reader to the decoder when
+     the cause may be a role table, a verify rule or a lowered switch. */
+  if (q2_build(g, &fn) < 0) {
+    fprintf(
+        stderr, "e2: %s: the IR could not be built: %s\n",
+        g->name[0] ? g->name : "?", fn.why ? fn.why : "(no reason recorded)");
+    q2_free(&fn);
+    return -1;
+  }
   if (q2_infer(&fn) < 0) {
+    fprintf(
+        stderr, "e2: %s: the IR could not be inferred: %s\n",
+        g->name[0] ? g->name : "?", fn.why ? fn.why : "(no reason recorded)");
     q2_free(&fn);
     return -1;
   }
@@ -252,7 +266,18 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   /* The generic body first: the speculative body forwards to it, and until E8
      the speculative body is that forward. */
   rc = e2_emit_generic_body(f, &fn, hex);
-  if (rc == 0) rc = e2_emit_spec_body(f, &fn, hex);
+  if (rc != 0) {
+    fprintf(
+        stderr, "e2: %s: the generic body emitter returned %d\n",
+        g->name[0] ? g->name : "?", rc);
+  } else {
+    rc = e2_emit_spec_body(f, &fn, hex);
+    if (rc != 0) {
+      fprintf(
+          stderr, "e2: %s: the speculative body emitter returned %d\n",
+          g->name[0] ? g->name : "?", rc);
+    }
+  }
   /* The unit builder must know a native entry exists, because a call site
      elsewhere in the unit may only name an `aot_n_` that some body defines. */
   if (rc == 0 && g->light_ok) {
