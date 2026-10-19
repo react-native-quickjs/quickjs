@@ -1,0 +1,481 @@
+Subject: Sample functions on wall time, for the per-function table
+
+What this does
+  Adds an optional sampler (QJS_FNSAMPLE=1) that takes a SIGPROF sample every
+  200 us, records which bytecode function was innermost, and keeps each
+  sample's program counter so the reader can say which kind of time it was.
+  The table is written to QJS_FNSAMPLE_OUT when the runtime goes away.
+
+Why we need it
+  The compiled build cannot be improved without knowing which functions the
+  time is in and, for each, how much of that time is inside the generated code,
+  in an AOT helper, in the interpreter running a function the emitter did not
+  compile, or in engine work such as GC. Whole-program timing separates none of
+  these, and the existing per-op counters weight by op count rather than by
+  time. A single in-unit bit is not enough either: it counts helper time and
+  interpreter time as "engine", which are exactly what a better emitter removes.
+
+  The period has to be the one that was asked for, or a function's share of the
+  samples is not its share of the run. `setitimer` rounds up to the kernel tick
+  (1 ms here), and a POSIX timer on CLOCK_PROCESS_CPUTIME_ID is clamped to the
+  same tick: a 200 us request is delivered every ~1000 us, measured. The same
+  request on CLOCK_MONOTONIC is delivered every 200 us, so the timer runs on
+  wall time. The cost is that a sample taken while the process is not running
+  JS is counted as no-JS rather than deferred; that count is written out so the
+  bias is visible, and so is the wall time covered, so a reader can verify
+  total samples x period instead of assuming it.
+
+What it adds
+  QJS_FNSAMPLE               - 0 by default; 1 builds the sampler
+  QJS_FNSAMPLE_OUT           - the table's path; unset means no sampling
+  fn_sample_tab[]            - 8192 open-addressed entries, no allocation
+  fn_sample_pcs[]            - a 2^20 ring of {slot, pc}, filled by the handler
+  T <total> <nojs>           - sample counts
+  W <seconds>                - wall time the table covers
+  B <hex> <object>           - a load base per mapped object (exe, libm,
+                               libc, ld.so), for resolving PCs
+  F <samples> <in_unit> key=<k> state=<bound|disabled|absent|unbound> <name>
+    <file>:<line>:<col>
+  P <key> <pc hex>           - one per sample, key 0xffffffff for no-JS
+  O <dropped>                - samples the ring could not hold
+
+  The `state` field is not a boolean because "no native entry" has three
+  causes: the function was never offered (unbound), it is not in the unit
+  (absent), or it was bound and then switched off (disabled). Only the last is
+  an exit-policy outcome, so the reader can tell a function the emitter failed
+  to cover from one the old policy gave up on.
+
+Bytecode version
+  No.
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -37,6 +37,20 @@
+ #include <link.h>  /* dl_iterate_phdr, for the image load base */
+ #endif
+ 
++#ifndef QJS_FNSAMPLE
++#define QJS_FNSAMPLE 0
++#endif
++
++#if QJS_FNSAMPLE && !defined(_WIN32)
++#include <signal.h>
++#include <ucontext.h>
++#include <sys/time.h>
++#include <time.h>
++#if !defined(_WIN32) && (QJS_AOT_PROFILE || QJS_FNSAMPLE)
++#include <link.h>  /* dl_iterate_phdr, for the executable's load base */
++#endif
++#endif
++
+ #ifndef QJS_JSON_LAZY_DEFAULT
+ #define QJS_JSON_LAZY_DEFAULT 0
+ #endif
+@@ -56,6 +70,12 @@
+ #include "cutils.h"
+ #include "list.h"
+ #include "quickjs.h"
++#if QJS_FNSAMPLE && !defined(_WIN32)
++static int fn_sample_start(JSRuntime *rt);
++static void fn_sample_stop(JSRuntime *rt);
++struct JSFunctionBytecode;
++static void fn_sample_name(const struct JSFunctionBytecode *b);
++#endif
+ 
+ #include "libregexp.h"
+ #include "dtoa.h"
+@@ -3675,6 +3695,9 @@
+ 
+     rt->current_exception = JS_UNINITIALIZED;
+ 
++#if QJS_FNSAMPLE && !defined(_WIN32)
++    fn_sample_start(rt);
++#endif
+     return rt;
+  fail:
+     JS_FreeRuntime(rt);
+@@ -3995,6 +4018,12 @@
+     if (getenv("QJS_AOT_STATS"))
+         js_aot_stats_dump(rt);
+ #endif
++#if QJS_FNSAMPLE && !defined(_WIN32)
++    /* Stop the timer and write the table before any function is freed: the
++       entries name functions by bytecode address, and an address reused by a
++       later function would be misattributed. */
++    fn_sample_stop(rt);
++#endif
+     struct list_head *el, *el1;
+     bool leak = false;
+     int i;
+@@ -25490,6 +25519,358 @@
+     return (p != NULL && p->sf == NULL) ? p : NULL;
+ }
+ 
++#if QJS_FNSAMPLE && !defined(_WIN32)
++/*
++ * Per-function sampling profiler. A `SIGPROF` timer takes the innermost
++ * function's bytecode from the logical stack and one sample for it. The table
++ * has no allocation and no lock, so the handler touches only fixed storage.
++ *
++ * `in_unit` alone is too coarse to say why a function is slow: "outside the
++ * generated text" covers the AOT helper functions, the interpreter (which runs
++ * a function the emitter refused or switched off) and genuine engine work such
++ * as GC or allocation, and only the last is out of an emitter's reach. So the
++ * sample's program counter is kept as well, and the reader resolves it to a
++ * symbol. The frame still decides which function a sample belongs to, because
++ * mapping a program counter back to a function needs the unit's symbols and
++ * they are not always present.
++ */
++#define FNSAMPLE_SLOTS 8192
++/* The PC ring: one sample's program counter per entry. A million entries
++   covers a two-minute run at 200 us. When it fills, recording stops and the
++   number dropped is written out, so a truncated table is visible. */
++#define FNSAMPLE_PCS (1024 * 1024)
++/* The sampling period. It has to be delivered as asked, which is what turns a
++   function's sample share into its share of the run; see fn_sample_start for
++   why the request lands on wall time and not on the CPU clock. */
++#define FNSAMPLE_PERIOD_NS 200000L
++typedef struct FnSampleEntry {
++    const JSFunctionBytecode *b;
++    char name[120];
++    char pos[80];
++    uint32_t samples;
++    uint32_t in_unit;
++    uint8_t named;
++    /* Whether the bytecode had a native entry at teardown. A function without
++       one was never compiled or was switched off, which is a different problem
++       from being slow inside the generated code. */
++    uint8_t aot_fn;
++} FnSampleEntry;
++
++/* One sample: its program counter and the table slot it was charged to. The
++   slot is an index, not a pointer, so the dump needs no lookup. */
++typedef struct FnSamplePc {
++    uintptr_t pc;
++    uint32_t slot;
++} FnSamplePc;
++
++static FnSampleEntry fn_sample_tab[FNSAMPLE_SLOTS];
++static FnSamplePc fn_sample_pcs[FNSAMPLE_PCS];
++static uint32_t fn_sample_npc;      /* entries used in the ring */
++static uint64_t fn_sample_pc_drop;  /* samples taken after it filled */
++static JSRuntime *fn_sample_rt;
++static uint64_t fn_sample_total, fn_sample_nojs;
++static struct timeval fn_sample_t0;
++
++extern char __start_e2text[] __attribute__((weak));
++extern char __stop_e2text[] __attribute__((weak));
++
++/* The executable's load base: a sample's program counter is relative to where
++   the loader put the image, and the symbols `nm` prints are not. The first
++   entry of the phdr walk is the main executable. */
++/* The objects a sample's program counter can fall in: the executable, then
++   every shared library the loader mapped. A sample in libc is allocator time,
++   not "other", so the reader needs a base and a name for each. */
++#define FNSAMPLE_OBJS 32
++typedef struct FnSampleObj {
++    uintptr_t addr;     /* the load base */
++    char name[96];      /* the mapped path, or "exe" */
++} FnSampleObj;
++
++static FnSampleObj fn_sample_objs[FNSAMPLE_OBJS];
++static int fn_sample_nobj;
++
++static int fn_sample_phdr(struct dl_phdr_info *info, size_t size, void *data)
++{
++    FnSampleObj *o;
++    const char *nm = info->dlpi_name;
++
++    (void)size;
++    (void)data;
++    if (fn_sample_nobj >= FNSAMPLE_OBJS)
++        return 1;
++    o = &fn_sample_objs[fn_sample_nobj++];
++    o->addr = (uintptr_t)info->dlpi_addr;
++    /* The first entry is the main executable, whose dlpi_name is empty. */
++    if (nm == NULL || nm[0] == '\0')
++        snprintf(o->name, sizeof(o->name), "exe");
++    else
++        snprintf(o->name, sizeof(o->name), "%s", nm);
++    /* A vDSO or a preloaded object has no file to nm; mark it so the reader
++       does not try. */
++    return 0; /* keep walking: every object is a candidate */
++}
++
++static FnSampleEntry *fn_sample_slot(const JSFunctionBytecode *b)
++{
++    size_t h = ((size_t)(uintptr_t)b >> 4) & (FNSAMPLE_SLOTS - 1);
++    size_t i;
++
++    for (i = 0; i < FNSAMPLE_SLOTS; i++) {
++        FnSampleEntry *e = &fn_sample_tab[(h + i) & (FNSAMPLE_SLOTS - 1)];
++        if (e->b == b)
++            return e;
++        if (e->b == NULL)
++            return e;
++    }
++    return NULL;
++}
++
++/* The innermost function, by the same rule the debugger and the stack
++   unwinder use: the topmost light frame if one is running, else the innermost
++   real frame. */
++static const JSFunctionBytecode *fn_sample_current(void)
++{
++    JSRuntime *rt = fn_sample_rt;
++    JSRegRun *lf;
++    JSStackFrame *sf;
++
++    if (rt == NULL)
++        return NULL;
++    lf = regvm_light_head(rt->regvm_cur);
++    if (lf != NULL)
++        return lf->b;
++    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
++        JSValue f = sf->cur_func;
++        if (JS_VALUE_GET_TAG(f) == JS_TAG_OBJECT) {
++            JSObject *p = JS_VALUE_GET_OBJ(f);
++            if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
++                return p->u.func.function_bytecode;
++        }
++        return NULL;
++    }
++    return NULL;
++}
++
++/* The key reserved for a sample with no JS function on the stack. */
++#define FNSAMPLE_NOJS_KEY 0xffffffffu
++
++/* Append one sample to the PC ring. A plain increment against a fixed bound:
++   no allocation, no lock, nothing that a signal handler must not do. */
++static void fn_sample_record(uint32_t key, uintptr_t pc)
++{
++    if (pc == 0)
++        return;
++    if (fn_sample_npc < FNSAMPLE_PCS) {
++        FnSamplePc *r = &fn_sample_pcs[fn_sample_npc++];
++
++        r->pc = pc;
++        r->slot = key;
++    } else {
++        fn_sample_pc_drop++;
++    }
++}
++
++static void fn_sample_handler(int sig, siginfo_t *info, void *uc)
++{
++    const JSFunctionBytecode *b = fn_sample_current();
++    FnSampleEntry *e;
++    uintptr_t pc = 0;
++
++    (void)sig;
++    (void)info;
++    fn_sample_total++;
++#if defined(__linux__) && defined(__x86_64__)
++    pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
++#endif
++    if (b == NULL) {
++        /* A "no JS" sample still records its program counter under the
++           reserved key, so the reader can say which C code was running
++           (GC, allocation, a builtin) rather than lumping it all together. */
++        fn_sample_nojs++;
++        fn_sample_record(FNSAMPLE_NOJS_KEY, pc);
++        return;
++    }
++    e = fn_sample_slot(b);
++    if (e == NULL)
++        return;
++    e->b = b;
++    e->samples++;
++    if (__start_e2text != NULL && pc >= (uintptr_t)__start_e2text &&
++        pc < (uintptr_t)__stop_e2text)
++        e->in_unit++;
++    /* Keep the program counter too, so the reader can say which kind of time
++       this was: inside the unit, an AOT helper, the interpreter, or engine
++       work such as GC. */
++    fn_sample_record((uint32_t)(e - fn_sample_tab), pc);
++}
++
++/* The timer id while sampling is on, so the timer is deleted and not leaked
++   when the runtime goes away. */
++static timer_t fn_sample_timer;
++
++/* Install the timer and handler when the runtime starts and the output is
++   named. Returns 1 when sampling is on.
++
++   The period must actually be 200 us, or a sample's share of the total is not
++   a share of the run. `setitimer` rounds up to the kernel tick (1 ms here), and
++   so does a POSIX timer on either the process's CPU clock or `CLOCK_MONOTONIC`
++   on this kernel's `ITIMER_PROF` path: measured on the development machine, a
++   200 us request on `CLOCK_PROCESS_CPUTIME_ID` is delivered every ~1000 us,
++   while the same request on `CLOCK_MONOTONIC` is delivered every 200 us.
++
++   So the timer runs on wall time, and its samples answer "which function is
++   running" at the granularity the measurement needs. Wall time measured over
++   the run is written out as `W`, so a reader converts samples to seconds with
++   the delivery that actually happened rather than with the request. The cost is
++   that a sample taken while the process is not running JS lands in `no_js`
++   instead of being deferred: for a benchmark that keeps the CPU busy that is
++   the honest answer, and `no_js` is reported so the bias is visible. */
++static int fn_sample_start(JSRuntime *rt)
++{
++    struct sigaction sa;
++    struct itimerspec its;
++    struct sigevent sev;
++
++    if (getenv("QJS_FNSAMPLE_OUT") == NULL || getenv("QJS_FNSAMPLE_OUT")[0] == '\0')
++        return 0;
++    fn_sample_rt = rt;
++    gettimeofday(&fn_sample_t0, NULL);
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_sigaction = fn_sample_handler;
++    sa.sa_flags = SA_SIGINFO | SA_RESTART;
++    sigemptyset(&sa.sa_mask);
++    if (sigaction(SIGPROF, &sa, NULL) < 0)
++        return 0;
++    memset(&sev, 0, sizeof(sev));
++    sev.sigev_notify = SIGEV_SIGNAL;
++    sev.sigev_signo = SIGPROF;
++    sev.sigev_value.sival_ptr = rt;
++    if (timer_create(CLOCK_MONOTONIC, &sev, &fn_sample_timer) == 0) {
++        its.it_interval.tv_sec = 0;
++        its.it_interval.tv_nsec = FNSAMPLE_PERIOD_NS;
++        its.it_value = its.it_interval;
++        if (timer_settime(fn_sample_timer, 0, &its, NULL) == 0)
++            return 1;
++        timer_delete(fn_sample_timer);
++    }
++    /* No POSIX timer: the tick-resolution fallback. */
++    {
++        struct itimerval it;
++
++        memset(&it, 0, sizeof(it));
++        it.it_interval.tv_usec = 200;
++        it.it_value.tv_usec = 200;
++        return setitimer(ITIMER_PROF, &it, NULL) == 0;
++    }
++}
++
++/* Name the entries. Called when a bytecode is freed, while its name and
++   position are still readable, and again at runtime teardown for the rest. */
++static void fn_sample_name(const struct JSFunctionBytecode *b)
++{
++    FnSampleEntry *e = fn_sample_slot(b);
++    char *p;
++    const char *file;
++
++    if (e == NULL || e->b == NULL || e->b != b || e->named)
++        return;
++    file = JS_AtomGetStrRT(fn_sample_rt, e->pos, sizeof(e->pos), b->filename);
++    p = e->pos + strlen(e->pos);
++    snprintf(p, sizeof(e->pos) - (size_t)(p - e->pos), ":%d:%d", b->line_num,
++             b->col_num);
++    if (b->func_name != JS_ATOM_NULL)
++        JS_AtomGetStrRT(fn_sample_rt, e->name, sizeof(e->name), b->func_name);
++    else
++        snprintf(e->name, sizeof(e->name), "<anon>");
++    e->named = 1;
++}
++
++static void fn_sample_stop(JSRuntime *rt)
++{
++    struct itimerval it;
++    int i;
++
++    if (rt != fn_sample_rt)
++        return;
++    memset(&it, 0, sizeof(it));
++    timer_delete(fn_sample_timer);
++    setitimer(ITIMER_PROF, &it, NULL);
++    {
++        const char *out = getenv("QJS_FNSAMPLE_OUT");
++        FILE *f = out != NULL ? fopen(out, "w") : NULL;
++
++        if (f != NULL) {
++            struct timeval t1;
++            double secs;
++            const char *st;
++
++            gettimeofday(&t1, NULL);
++            secs = (double)(t1.tv_sec - fn_sample_t0.tv_sec) +
++                   (double)(t1.tv_usec - fn_sample_t0.tv_usec) * 1e-6;
++            fprintf(f, "T %" PRIu64 " %" PRIu64 "\n", fn_sample_total,
++                    fn_sample_nojs);
++            /* The wall time the table covers, so a reader can check the
++               delivered period (total / W) instead of trusting the request,
++               and turn a share into seconds. */
++            fprintf(f, "W %.6f\n", secs);
++            /* The PC ring is written first so a reader can bucket samples
++               before it needs the function table, and so the load base it
++               resolves against is already known. Reading /proc/self/maps here
++               and never in the handler keeps the handler allocation-free. */
++            fn_sample_nobj = 0;
++            dl_iterate_phdr(fn_sample_phdr, NULL);
++            for (i = 0; i < fn_sample_nobj; i++)
++                fprintf(f, "B %" PRIxPTR " %s\n", fn_sample_objs[i].addr,
++                        fn_sample_objs[i].name);
++            for (i = 0; i < FNSAMPLE_SLOTS; i++) {
++                FnSampleEntry *e = &fn_sample_tab[i];
++                if (e->b == NULL || e->samples == 0)
++                    continue;
++                if (!e->named)
++                    fn_sample_name(e->b);
++                /* Why the function is not running generated code, which is
++                   not the same question as whether it has a native entry:
++
++                     bound     the unit's entry is in use;
++                     disabled  it was bound and then switched off, because its
++                               guards kept failing (the exit policy D4
++                               replaces);
++                     absent    it is not in the unit at all;
++                     unbound   it was never offered for binding.
++
++                   The distinction matters because `disabled` is a policy
++                   outcome that a better exit policy fixes, while `absent`
++                   means the unit was built without it. `aot_state` is 0
++                   unknown, 1 bound, 2 known-absent, and stays 1 after an
++                   unbind, which is what separates disabled from absent. */
++#if QJS_AOT || QJS_AOT_GEN
++                if (e->b->aot_fn != NULL)
++                    st = "bound";
++                else if (e->b->aot_state == 1)
++                    st = "disabled";
++                else if (e->b->aot_state == 2)
++                    st = "absent";
++                else
++                    st = "unbound";
++#else
++                st = "absent";
++#endif
++                fprintf(f, "F %u %u key=%d state=%s %s %s\n", e->samples,
++                        e->in_unit, i, st,
++                        e->named ? e->name : "<anon>", e->pos);
++            }
++            /* P <key> <pc hex>, one per in-JS sample, in sample order. */
++            for (i = 0; i < (int)fn_sample_npc; i++)
++                fprintf(f, "P %u %" PRIxPTR "\n", fn_sample_pcs[i].slot,
++                        fn_sample_pcs[i].pc);
++            fprintf(f, "O %" PRIu64 "\n", fn_sample_pc_drop);
++            fclose(f);
++        }
++    }
++    fn_sample_rt = NULL;
++}
++#endif /* QJS_FNSAMPLE */
++
+ /* The debugger entry points walk the logical stack, innermost first: the light
+    frames above `current_stack_frame`, then each real frame followed by the
+    light chain saved under it in `rv_light`. */
+@@ -73432,6 +73813,11 @@
+ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     int i;
++#if QJS_FNSAMPLE && !defined(_WIN32)
++    /* Copy the name and source position out while they are still valid; the
++       entry's key is the address, which a later function can reuse. */
++    fn_sample_name(b);
++#endif
+ #if QJS_AOT || QJS_AOT_GEN
+     /* Release the polymorphic cache's shape references; it is allocated at bind
+        time and is independent of the register PIC. */

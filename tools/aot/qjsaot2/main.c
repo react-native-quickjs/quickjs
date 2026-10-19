@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "e2_analysis.h"
 #include "ir.h"
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
@@ -65,21 +66,43 @@ int main(int argc, char **argv) {
   JSContext *ctx;
   JSAotGenFunc *funcs = NULL;
   int nfuncs = 0, i;
-  int verify = 0, dump = 0, stats = 0;
+  int verify = 0, dump = 0, stats = 0, types = 0;
+  const char *types_out = NULL;
   const char *profile = NULL;
   int ninputs = 0, fails = 0, nkeep = 0;
   JSValue *keep = NULL;
   long nblocks = 0, ninsns = 0, nvalues = 0, nfuncs_ok = 0, nfuncs_uniq = 0;
+  FILE *types_fp = NULL;
 
   for (i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--verify-ir") == 0)
+    if (strcmp(argv[i], "--dump-ropinfo") == 0) {
+      int r;
+      for (r = 0; r < ROP_COUNT; r++) {
+        const Q2RopInfo *ri = q2_rop_info((uint16_t)r);
+        int k;
+        /* An op the IR does not model has no operand roles here, which is not
+           the same as having none: leave it to the format. */
+        if (ri->op == Q2_OP_FALLBACK) continue;
+        printf("%d %d %d", r, ri->ndef, ri->nuse);
+        for (k = 0; k < ri->ndef; k++) printf(" %d", ri->def[k]);
+        for (k = 0; k < ri->nuse; k++) printf(" %d", ri->use[k]);
+        printf(" %d\n", ri->window);
+      }
+      return 0;
+    } else if (strcmp(argv[i], "--verify-ir") == 0)
       verify = 1;
     else if (strcmp(argv[i], "--dump-ir") == 0)
       dump = 1;
     else if (strcmp(argv[i], "--stats") == 0)
       stats = 1;
+    else if (strcmp(argv[i], "--emit2-types") == 0)
+      types = 1;
+    else if (strcmp(argv[i], "--emit2-types-out") == 0 && i + 1 < argc) {
+      types = 1;
+      types_out = argv[++i];
+    }
   }
-  if (!verify && !dump && !stats) {
+  if (!verify && !dump && !stats && !types) {
     /* The unit-builder mode: the same CLI as qjsaot, with the SSA body
        emitter. Options are the driver's, so nothing is validated here. */
     qjs_aot_emit_body = qjsaot2_emit_body;
@@ -88,8 +111,14 @@ int main(int argc, char **argv) {
   }
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--verify-ir") == 0 ||
-        strcmp(argv[i], "--dump-ir") == 0 || strcmp(argv[i], "--stats") == 0)
+        strcmp(argv[i], "--dump-ir") == 0 ||
+        strcmp(argv[i], "--stats") == 0 ||
+        strcmp(argv[i], "--emit2-types") == 0)
       continue;
+    if (strcmp(argv[i], "--emit2-types-out") == 0 && i + 1 < argc) {
+      i++;
+      continue;
+    }
     if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
       profile = argv[++i];
       continue;
@@ -102,10 +131,19 @@ int main(int argc, char **argv) {
   }
   if (ninputs == 0) {
     fprintf(
-        stderr, "usage: qjsaot2 --verify-ir|--dump-ir|--stats bundle.js ...\n");
+        stderr,
+        "usage: qjsaot2 --verify-ir|--dump-ir|--stats|--emit2-types "
+        "bundle.js ...\n");
     return 2;
   }
 
+  if (types_out != NULL) {
+    types_fp = fopen(types_out, "w");
+    if (types_fp == NULL) {
+      fprintf(stderr, "qjsaot2: cannot write %s\n", types_out);
+      return 1;
+    }
+  }
   rt = JS_NewRuntime();
   ctx = JS_NewContext(rt);
   if (profile) {
@@ -196,6 +234,17 @@ int main(int argc, char **argv) {
     if (dump) {
       q2_infer(&f);
       q2_dump(stdout, &f);
+    }
+    if (types) {
+      char hex[33];
+      int h;
+      for (h = 0; h < 16; h++)
+        snprintf(hex + h * 2, 3, "%02x", funcs[i].digest[h]);
+      if (e2_analysis_dump(types_out ? types_fp : stdout, &f, hex, 0.0) < 0) {
+        q2_free(&f);
+        fails++;
+        continue;
+      }
     }
     q2_free(&f);
   }

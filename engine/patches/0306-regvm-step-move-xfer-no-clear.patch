@@ -1,0 +1,29 @@
+Subject: Stop clearing the source register of a transfer move in its step form
+
+What this does
+  Under deferred reference counting the step form of `move_xfer` copies its
+  source to its destination and leaves the source as it was, the same as the
+  interpreter loop and the threaded handler.
+
+Why we need it
+  `0279` removed the clear from the interpreter loop and the threaded handler
+  but not from the generated step form, so an instruction run one at a time
+  (compiled code's op call) wrote a register the other two executors leave
+  alone. The result was the same because the source is dead, but compiled code
+  relies on a handler writing only the registers its format declares, and its
+  register-write check reported this one at every transfer move.
+
+Needs a bytecode version bump
+  No.
+
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -4081,7 +4081,6 @@
+                   if (d != s) {
+ #if QJS_DRC
+                       regs[d] = regs[s];
+-                      regs[s] = JS_UNDEFINED;
+ #else
+                       set_value(ctx, &regs[d], regs[s]);
+                       regs[s] = JS_UNDEFINED;

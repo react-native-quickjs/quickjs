@@ -58,7 +58,7 @@ F <null> blocks=1 insns=2 values=2 regs=2 ctl_max=0
 B0 pc=0..14 ctl=0 params=- succ=-
       0 get_field        rop=231  def=0(tagged),1(tagged) use=-
      11 return           rop=67   def=- use=v0(r1:tagged,sync)
-F k blocks=16 insns=43 values=113 regs=17 ctl_max=0
+F k blocks=16 insns=43 values=110 regs=17 ctl_max=0
   digest=e8e537479022b01939af00e37c6be5d6
 B0 pc=0..28 ctl=0 params=- succ=28()
       0 get_arg          rop=16   def=64(tagged) use=-
@@ -68,7 +68,7 @@ B0 pc=0..28 ctl=0 params=- succ=28()
 B1 pc=28..38 ctl=0 params=- succ=113(v68,v65),38(v68,v69)
      28 const            rop=216  def=68(i32) use=-
      31 const            rop=216  def=69(i32) use=-
-     34 branch           rop=174  def=- use=v69(r2:i32,sync),v64(r4:tagged,sync)
+     34 branch_cmp       rop=170  def=- use=v69(r2:i32,sync),v64(r4:tagged,sync)
 B2 pc=38..59 ctl=0 params=v4=r1,v5=r2 succ=59()
      38 get_field        rop=39   def=70(tagged) use=v67(r0:tagged,sync)
      49 call             rop=73   def=71(tagged) use=v70(r5:tagged,sync),v67(r0:tagged,sync)
@@ -95,27 +95,27 @@ B8 pc=135..156 ctl=0 params=- succ=156()
     143 move             rop=141  def=92(tagged) use=v90(r7:tagged,sync)
     148 fallback         rop=42   def=- use=v87(r5:tagged,sync)
 B9 pc=156..180 ctl=0 params=- succ=180()
-    156 move             rop=217  def=96(tagged) use=v95(r5:tagged,sync)
-    159 get_field        rop=39   def=97(tagged) use=v93(r0:tagged,sync)
-    170 call             rop=73   def=98(tagged) use=v97(r5:tagged,sync),v93(r0:tagged,sync)
+    156 move             rop=217  def=93(tagged) use=v87(r5:tagged,sync)
+    159 get_field        rop=39   def=94(tagged) use=v85(r0:tagged,sync)
+    170 call             rop=73   def=95(tagged) use=v94(r5:tagged,sync),v85(r0:tagged,sync)
 B10 pc=180..204 ctl=0 params=- succ=204()
-    180 get_field        rop=39   def=99(tagged) use=v93(r0:tagged,sync)
-    191 const            rop=216  def=100(i32) use=-
-    194 call             rop=73   def=101(tagged) use=v99(r5:tagged,sync),v93(r0:tagged,sync)
+    180 get_field        rop=39   def=96(tagged) use=v85(r0:tagged,sync)
+    191 const            rop=216  def=97(i32) use=-
+    194 call             rop=73   def=98(tagged) use=v96(r5:tagged,sync),v85(r0:tagged,sync)
 B11 pc=204..225 ctl=0 params=- succ=225()
-    204 get_field        rop=39   def=102(tagged) use=v96(r3:tagged,sync)
-    215 call             rop=73   def=103(tagged) use=v102(r5:tagged,sync),v96(r3:tagged,sync)
+    204 get_field        rop=39   def=99(tagged) use=v93(r3:tagged,sync)
+    215 call             rop=73   def=100(tagged) use=v99(r5:tagged,sync),v93(r3:tagged,sync)
 B12 pc=225..242 ctl=0 params=- succ=242()
-    225 get_global       rop=20   def=104(tagged) use=-
-    235 fallback         rop=209  def=105(tagged) use=v96(r3:tagged,sync),v104(r5:tagged,sync)
+    225 get_global       rop=20   def=101(tagged) use=-
+    235 fallback         rop=209  def=102(tagged) use=v93(r3:tagged,sync),v101(r5:tagged,sync)
 B13 pc=242..259 ctl=0 params=- succ=259()
-    242 get_global       rop=20   def=106(tagged) use=-
-    252 fallback         rop=209  def=107(tagged) use=v93(r0:tagged,sync),v106(r5:tagged,sync)
+    242 get_global       rop=20   def=103(tagged) use=-
+    252 fallback         rop=209  def=104(tagged) use=v85(r0:tagged,sync),v103(r5:tagged,sync)
 B14 pc=259..285 ctl=0 params=- succ=285()
-    259 move             rop=141  def=108(tagged) use=v94(r1:tagged,sync)
-    264 move             rop=141  def=109(tagged) use=v98(r6:tagged,sync)
-    269 move             rop=141  def=110(tagged) use=v101(r8:tagged,sync)
-    274 move             rop=141  def=111(tagged) use=v103(r7:tagged,sync)
-    279 fallback         rop=77   def=112(tagged) use=-
+    259 move             rop=141  def=105(tagged) use=v86(r1:tagged,sync)
+    264 move             rop=141  def=106(tagged) use=v95(r6:tagged,sync)
+    269 move             rop=141  def=107(tagged) use=v98(r8:tagged,sync)
+    274 move             rop=141  def=108(tagged) use=v100(r7:tagged,sync)
+    279 fallback         rop=77   def=109(tagged) use=-
 B15 pc=285..288 ctl=0 params=- succ=-
-    285 return           rop=67   def=- use=v112(r5:tagged,sync)
+    285 return           rop=67   def=- use=v109(r5:tagged,sync)

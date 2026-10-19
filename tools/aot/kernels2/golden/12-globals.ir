@@ -59,7 +59,7 @@ B0 pc=0..15 ctl=0 params=- succ=59(v14),15(v14,v15)
       0 get_arg          rop=16   def=13(tagged) use=-
       5 const            rop=216  def=14(i32) use=-
       8 const            rop=216  def=15(i32) use=-
-     11 branch           rop=174  def=- use=v15(r1:i32,sync),v13(r2:tagged,sync)
+     11 branch_cmp       rop=170  def=- use=v15(r1:i32,sync),v13(r2:tagged,sync)
 B1 pc=15..55 ctl=0 params=v0=r0,v1=r1 succ=55()
      15 get_global       rop=20   def=16(tagged) use=-
      25 binary           rop=190  def=17(tagged) use=v0(r0:tagged,sync),v16(r3:tagged,sync)

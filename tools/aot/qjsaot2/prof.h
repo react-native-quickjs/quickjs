@@ -32,11 +32,27 @@ typedef struct ProfPc {
   int32_t pc;     /* the register-program offset of the defining instruction */
   unsigned types; /* the PT_* set */
   uint8_t has_num, frac, negzero;
+  /* What an element pc stored or loaded. Same values the profiler writes
+     (AOT_ELEM_* in quickjs.c); they are repeated here because the generator
+     does not include the engine. */
+#define Q2_ELEM_INT    (1u << 0)
+#define Q2_ELEM_FLOAT  (1u << 1)
+#define Q2_ELEM_OBJECT (1u << 2)
+#define Q2_ELEM_MIXED  (1u << 3)
   /* AOT_ELEM_*: what an element pc stored or loaded. INT or FLOAT alone means
      every element there was a number, so a compiled read needs no hole or lazy
      test. */
   uint8_t elem;
   double num_min, num_max;
 } ProfPc;
+
+/* One instruction's execution count, as the profile's per-pc sample record
+   gives it (`T` lines: one sample per 1024 dispatches of that pc). It is kept
+   apart from ProfPc because a pc can have a sample record without a type
+   record, and the IR must not see a type-less entry as "profiled". */
+typedef struct ProfCount {
+  int32_t pc;
+  unsigned long long count;
+} ProfCount;
 
 #endif /* QJSAOT2_PROF_H */

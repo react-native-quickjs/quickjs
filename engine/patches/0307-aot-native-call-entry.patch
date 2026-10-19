@@ -1,0 +1,443 @@
+Subject: Give a generated native entry the light frame it must build itself, and the pieces around it
+
+What this does
+  Adds the layout fields a compiled unit's hand-written native entry needs to
+  build a callee's light frame on the C stack without calling back into the
+  engine, and the four helpers that are more than a plain store: sealing the
+  arena over the activation's frame, throwing the interpreter's stack-overflow
+  RangeError, releasing a frame's variable area on return, and a check build
+  that rebuilds the frame the engine would have built and compares.
+
+Why we need it
+  A compiled caller's direct call is a plain C call into the callee's
+  speculative body, so the frame that body runs on is the caller's stack
+  buffer. That frame has to be the one `regvm_light_fill` builds, field for
+  field: every handler, every cold arm and every deopt path reads it, and a
+  field the caller forgets is a crash much later rather than an error here.
+  Most of it is offsets and plain stores, which the unit does itself, but four
+  pieces are not: `regvm_light_seal` and `regvm_light_free` are static engine
+  functions, the stack-overflow throw must be the same RangeError the
+  interpreter raises, and only the engine can cross-check a hand-built frame
+  against the one it would have built.
+
+  Measured cost, from the experiments the call path was designed from: an
+  interpreted call is 10.8-11.9 ns, and a framed native call through these
+  pieces is 7.0-8.8 ns, against 11.0 ns for the previous call path.
+
+What it adds
+  JSAotGenFunc              - `light_var_count`: the variable area's size, from
+                              the engine's own promotion-map rule. `light_need`
+                              bakes it in without saying whether the area exists,
+                              so without this a native entry cannot fill and
+                              release exactly the slots the engine does.
+
+  JSAotGenLayout            - off_regrun_ret_ip, _fr, _var_refs, _hdr_pack,
+                              _cap_ip, off_fnbc_realm, off_rt_regvm_cur,
+                              off_rt_stack_limit, off_object_func_var_refs,
+                              light_prefix_slots, regvm_flag_light,
+                              _c_entry, _stack, _trivial_ret, _same_realm
+  qjs_aot_seal              - raises the arena top over an activation's frame,
+                              once, so a callee that allocates lands above it
+  qjs_aot_throw_stack_overflow
+                            - the interpreter's stack-overflow RangeError, for
+                              a native entry that finds the C stack nearly
+                              exhausted
+  qjs_aot_light_release     - releases the counted values of a native frame's
+                              variable area, which is the whole teardown when
+                              the frame is the caller's stack buffer
+  qjs_aot_frame_check       - check builds only (E2_CHECK): rebuild the frame
+                              the engine would have built for this call and
+                              abort if a header field differs
+  qjs_aot_pic_ensure        - allocate the callee's property-cache table before
+                              a native entry publishes its frame. The callee's
+                              inline handlers read the table with no NULL test,
+                              so it must exist first; allocating is a safepoint,
+                              which is exactly why it happens before the frame
+                              exists rather than inside a body that has already
+                              published one
+
+  JSRuntime                 - `regvm_cur` moves above the `#if QJS_AOT` block.
+                              The generator is built with QJS_AOT_GEN but not
+                              QJS_AOT, so a field placed after a build-dependent
+                              member has one offset in the generator and another
+                              in the runtime's own object. The layout hash
+                              covers every field, so the two disagreed and the
+                              engine refused every unit at bind -- silently,
+                              with no diagnostic: `aot: unit=0 bound=0 enter=0`
+                              and the whole unit ran interpreted while still
+                              producing correct output. The invariant the move
+                              states is that every field the unit reads an
+                              offset of precedes every `#if` in the struct.
+
+  regvm_s_ROP_get_global    - fills the instruction's PIC site on both the cell
+                              hit and the slow path, as the threaded handler
+                              does. Without it a compiled body that runs this
+                              op as an op call never fills the site, so its
+                              inline global-read hit test compares against an
+                              empty entry and misses on every execution: a
+                              permanent 0% hit rate.
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -102,6 +102,21 @@
+        array, as the engine's own fast store does, since filling a hole has
+        bookkeeping the inline path does not do. */
+     uint32_t off_object_holey_byte, object_holey_mask;
++    /* The rest of the light-frame header a generated native entry writes, so
++       it can build the frame the engine's own light call builds. The header is
++       the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
++       the register file starts, and `off_regrun_hdr_pack` is the one 64-bit
++       store that sets the destination, the argument count and the flag word
++       together. */
++    uint32_t off_regrun_ret_ip, off_regrun_fr, off_regrun_var_refs;
++    uint32_t off_regrun_hdr_pack, off_regrun_cap_ip;
++    uint32_t off_fnbc_realm;
++    uint32_t off_rt_regvm_cur, off_rt_stack_limit;
++    uint32_t off_object_func_var_refs;
++    uint32_t light_prefix_slots;
++    /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
++    uint32_t regvm_flag_light, regvm_flag_c_entry, regvm_flag_stack;
++    uint32_t regvm_flag_trivial_ret, regvm_flag_same_realm;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+@@ -194,6 +209,22 @@
+ QJS_AOT_STUB JSValue qjs_aot_return(JSValue *fr, int off);
+ QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                        uint32_t pc, uint32_t *resume_pc);
++/* Raise the arena top over this activation's frame, so frames its callees
++   allocate land above it. Idempotent and monotonic. */
++QJS_AOT_STUB void qjs_aot_seal(JSContext *ctx, JSRegRun *f);
++/* Throw the interpreter's stack-overflow RangeError, so a native entry that
++   finds the C stack nearly exhausted fails the way a deep interpreter call
++   does. Always returns JS_EXCEPTION. */
++QJS_AOT_STUB JSValue qjs_aot_throw_stack_overflow(JSContext *ctx);
++/* Release the counted values of a native frame's variable area, for a callee
++   that has one. The frame itself is the caller's stack buffer, so this is the
++   whole teardown. */
++QJS_AOT_STUB void qjs_aot_light_release(JSContext *ctx, JSRegRun *f);
++/* Check build only (E2_CHECK=1): rebuild the frame the engine would have built
++   for this call and abort if any header field differs from `nf`. */
++QJS_AOT_STUB void qjs_aot_frame_check(JSContext *ctx, JSRegRun *nf, JSObject *co,
++                       JSRegRun *caller_f, JSValue *argv, int argc,
++                       JSValue this_obj);
+ 
+ /* --- AOT fast-path helpers ------------------------------------------------
+  *
+@@ -406,6 +437,14 @@
+                         JSValue callee, JSValue this_obj, JSValue *argv,
+                         JSValue *out);
+ 
++/* Make sure the callee's property-cache table exists before a native entry
++   publishes its frame. The engine's own light call does this; a native entry
++   that builds the frame itself must too, because the callee's inline handlers
++   read `pic` with no NULL test. Allocating here is a safepoint, which is why it
++   happens before the frame is published rather than inside the callee.
++   Returns 0, or -1 with an out-of-memory exception thrown. */
++QJS_AOT_STUB int qjs_aot_pic_ensure(JSContext *ctx, JSObject *co);
++
+ /* A compiled call to a compiled leaf: same contract, but the callee's frame is
+    the caller's stack buffer, so no arena traffic. `frame_bytes` must be at
+    least the callee's light-frame size. */
+diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -51,6 +51,14 @@
+        eligible. */
+     int light_ok;
+     int light_need;
++    /* How many variable slots a light frame fills and releases: the highest
++       slot the promotion map leaves in the variable area, plus one, which the
++       engine holds as `regvm_var_count`. It is not `var_count` when promotion
++       moved slots into registers, and `light_need` bakes it in without saying
++       which of the two it used, so the generator cannot recover it. A native
++       entry needs it to size the variable area and to release exactly what the
++       engine would. */
++    int light_var_count;
+     char name[128];
+     char file[256];
+     int line, col;             /* the definition's source position, or 0 */
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -725,6 +725,21 @@
+     uint8_t aot_prof_prev_valid;
+ #endif
+ 
++    /* The innermost light register frame, or NULL. Published on every light
++       call and cleared on every push of a real JSStackFrame (which saves it in
++       `JSStackFrame.rv_light`), so a walker can rebuild the logical stack.
++       Present in the stack-only build too, where it stays NULL.
++
++       It sits before the conditional blocks below on purpose. The generated
++       unit needs its offset (a native entry publishes the frame it builds),
++       and the generator is built with QJS_AOT_GEN but not QJS_AOT, so a field
++       placed after a build-dependent member would have two different offsets
++       and the layout hash would disagree between the two builds. That
++       disagreement is silent: the engine simply refuses every unit at bind and
++       the whole unit runs interpreted. Everything the unit reads an offset of
++       must therefore precede every `#if` in this struct. */
++    struct JSRegRun *regvm_cur;
++
+ #if QJS_AOT
+     /* AOT call-site bindings, indexed by the unit's site id. Lazily grown. */
+     JSAotSite *aot_sites;
+@@ -759,11 +774,6 @@
+     struct JSRegArenaChunk *regvm_chunk;
+     size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
+ #endif
+-    /* The innermost light register frame, or NULL. Published on every light
+-       call and cleared on every push of a real JSStackFrame (which saves it in
+-       `JSStackFrame.rv_light`), so a walker can rebuild the logical stack.
+-       Present in the stack-only build too, where it stays NULL. */
+-    struct JSRegRun *regvm_cur;
+     JSMegaEntry *mega_cache;
+     uint32_t shape_free_epoch;
+     void *user_opaque;
+@@ -60574,6 +60584,24 @@
+             }
+         }
+     }
++    /* The light-frame header a generated native entry writes itself. It builds
++       the same frame `regvm_light_fill` builds, field for field, so the
++       offsets are the frame's own and the flag values are the engine's. */
++    out->off_regrun_ret_ip = (uint32_t)offsetof(JSRegRun, ret_ip);
++    out->off_regrun_fr = (uint32_t)offsetof(JSRegRun, fr);
++    out->off_regrun_var_refs = (uint32_t)offsetof(JSRegRun, var_refs);
++    out->off_regrun_hdr_pack = (uint32_t)offsetof(JSRegRun, hdr_pack);
++    out->off_regrun_cap_ip = (uint32_t)offsetof(JSRegRun, cap_ip);
++    out->off_fnbc_realm = (uint32_t)offsetof(JSFunctionBytecode, realm);
++    out->off_rt_regvm_cur = (uint32_t)offsetof(JSRuntime, regvm_cur);
++    out->off_rt_stack_limit = (uint32_t)offsetof(JSRuntime, stack_limit);
++    out->off_object_func_var_refs = (uint32_t)offsetof(JSObject, u.func.var_refs);
++    out->light_prefix_slots = REGVM_LIGHT_PREFIX_SLOTS;
++    out->regvm_flag_light = REGVM_FLAG_LIGHT;
++    out->regvm_flag_c_entry = REGVM_FLAG_C_ENTRY;
++    out->regvm_flag_stack = REGVM_FLAG_STACK;
++    out->regvm_flag_trivial_ret = REGVM_FLAG_TRIVIAL_RET;
++    out->regvm_flag_same_realm = REGVM_FLAG_SAME_REALM;
+     out->hash = qjs_aot_layout_hash(out);
+ }
+ 
+@@ -62727,6 +62755,27 @@
+     return JS_IsException(ret) ? -1 : 1;
+ }
+ 
++/* Allocate the callee's property-cache table if it has none, so a generated
++   native entry can publish a frame whose inline handlers read the table with no
++   NULL test. The engine's own light call checks this before it fills the frame;
++   a native entry that fills the frame itself has to do the same. Allocating is a
++   safepoint, which is exactly why it belongs here, before the frame exists,
++   rather than inside a body that has already published one. */
++QJS_AOT_STUB int qjs_aot_pic_ensure(JSContext *ctx, JSObject *co)
++{
++    JSFunctionBytecode *cb;
++
++    if (JS_VALUE_GET_TAG(JS_MKPTR(JS_TAG_OBJECT, co)) != JS_TAG_OBJECT)
++        return 0;
++    cb = co->u.func.function_bytecode;
++    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
++        JS_ThrowOutOfMemory(ctx);
++        return -1;
++    }
++    return 0;
++}
++
+ /* A compiled function calling a compiled **leaf**: a callee whose cross-call
+    state is a frame on the C stack instead of the arena. That removes the
+    arena bump, the caller seal, the push/pop and the free walk that
+@@ -63050,6 +63099,169 @@
+     *out = js_dup(v);
+     return 1;
+ }
++
++/* ------------------------------------------------------------------------ */
++/* The pieces a generated native entry needs to build a light frame itself.  */
++/*                                                                          */
++/* A compiled call to a compiled callee that the generator emitted a native  */
++/* entry for is a plain C call: the caller builds the callee's light frame   */
++/* in its own stack buffer and calls the callee's speculative body. The     */
++/* frame has to be the one `regvm_light_fill` builds, because every handler  */
++/* and every cold path that can run on it reads it, and a field the engine   */
++/* writes but the caller forgets is a crash much later. So the few pieces    */
++/* that are not a plain store live here, and `qjs_aot_frame_check` exists to  */
++/* prove the stores agree with the fill.                                    */
++/* ------------------------------------------------------------------------ */
++
++/* Nothing lowers the arena top below a sealed frame while the activation runs,
++   so a callee that allocates lands above the caller's frame instead of over
++   it. Idempotent and monotonic; a no-op for a frame outside the arena. */
++QJS_AOT_STUB void qjs_aot_seal(JSContext *ctx, JSRegRun *f)
++{
++#if QJS_REGVM_RECORD
++    regvm_light_seal(ctx->rt, f);
++#else
++    (void)ctx;
++    (void)f;
++#endif
++}
++
++/* A native entry checks the C stack itself, so a deep recursion of compiled
++   functions raises the interpreter's own RangeError instead of running into
++   the guard page. The message and the constructor must match the
++   interpreter's exactly: a test compares them. */
++QJS_AOT_STUB JSValue qjs_aot_throw_stack_overflow(JSContext *ctx)
++{
++    return JS_ThrowStackOverflow(ctx);
++}
++
++/* The callee's frame is the caller's stack buffer, so returning is just the
++   release of what the variable area owns. A function with no variable area has
++   nothing to release; `regvm_light_free` handles both and also frees the
++   receiver of a derived construction. */
++QJS_AOT_STUB void qjs_aot_light_release(JSContext *ctx, JSRegRun *f)
++{
++#if QJS_REGVM_RECORD
++    regvm_light_free(ctx->rt, f);
++#else
++    (void)ctx;
++    (void)f;
++#endif
++}
++
++/* Check builds only (`E2_CHECK=1`): build the frame the engine would have
++   built for this call and abort if the native entry's stores disagree with it.
++   Compared field by field rather than byte for byte, because the native entry
++   legitimately differs from `regvm_light_fill` in three places: it has no
++   destination register (a compiled caller has none), it has no resume address
++   (a compiled call returns to C), and it marks its frame `REGVM_FLAG_C_ENTRY`
++   and `REGVM_FLAG_STACK` so a deopt or a throw inside it finishes on this very
++   frame and the seal knows the frame is on the C stack rather than in the
++   arena. Those three are checked separately; everything else must match. */
++QJS_AOT_STUB void qjs_aot_frame_check(JSContext *ctx, JSRegRun *nf, JSObject *co,
++                                      JSRegRun *caller_f, JSValue *argv, int argc,
++                                      JSValue this_obj)
++{
++#if QJS_REGVM_RECORD && defined(E2_CHECK)
++    JSFunctionBytecode *cb = co->u.func.function_bytecode;
++    uint8_t *mem;
++    JSRegRun *ref;
++    JSValue *regs;
++    size_t need;
++    int k, vc, base;
++    uint16_t want_flags;
++
++    need = (size_t)cb->regvm_light_need + 16;
++    mem = alloca(need);
++    ref = (JSRegRun *)(((uintptr_t)mem + 15) & ~(uintptr_t)15);
++    regvm_light_fill(ctx, ref, co, cb, caller_f, 0, NULL, argv, argc,
++                     this_obj, &regs);
++#define E2_CHK(field)                                                          \
++    do {                                                                       \
++        if (nf->field != ref->field) {                                          \
++            fprintf(stderr,                                                     \
++                    "E2 frame check: %s differs for %s (native %p, engine %p)\n", \
++                    #field, cb->func_name ? "fn" : "?", (void *)(uintptr_t)nf->field, \
++                    (void *)(uintptr_t)ref->field);                             \
++            abort();                                                            \
++        }                                                                       \
++    } while (0)
++    E2_CHK(caller);
++    E2_CHK(b);
++    E2_CHK(pic);
++    E2_CHK(fr);
++    E2_CHK(var_refs);
++    E2_CHK(var_buf);
++    E2_CHK(arg_buf);
++    E2_CHK(func);
++    E2_CHK(cap_ip);
++    E2_CHK(sf);
++#undef E2_CHK
++    if (nf->ret_ip != NULL) {
++        fprintf(stderr, "E2 frame check: ret_ip is set for a compiled call\n");
++        abort();
++    }
++    if (JS_VALUE_GET_TAG(nf->this_obj) != JS_VALUE_GET_TAG(ref->this_obj) ||
++        JS_VALUE_GET_PTR(nf->this_obj) != JS_VALUE_GET_PTR(ref->this_obj)) {
++        fprintf(stderr, "E2 frame check: this_obj differs\n");
++        abort();
++    }
++    if (nf->argc != (uint16_t)argc) {
++        fprintf(stderr, "E2 frame check: argc is %u, not %d\n",
++                (unsigned)nf->argc, argc);
++        abort();
++    }
++    /* ret_dst: a compiled caller has no destination register. */
++    if (nf->ret_dst != 0) {
++        fprintf(stderr, "E2 frame check: ret_dst is %u, not 0\n",
++                (unsigned)nf->ret_dst);
++        abort();
++    }
++    if (nf->nctl != 0) {
++        fprintf(stderr, "E2 frame check: nctl is %u, not 0\n",
++                (unsigned)nf->nctl);
++        abort();
++    }
++    /* The flag word must also carry the two bits the native entry adds, and
++       nothing else may differ. */
++    want_flags = ref->flags | REGVM_FLAG_C_ENTRY | REGVM_FLAG_STACK;
++    if (nf->flags != want_flags) {
++        fprintf(stderr, "E2 frame check: flags are 0x%x, not 0x%x\n",
++                (unsigned)nf->flags, (unsigned)want_flags);
++        abort();
++    }
++    /* The variable area and the register file must be filled with undefined,
++       or a handler reads a stale stack word. */
++    vc = cb->var_count;
++#if QJS_DRC
++    if (cb->var_count <= 255)
++        vc = cb->regvm_var_count;
++#endif
++    if (vc != 0) {
++        if (nf->var_buf == NULL) {
++            fprintf(stderr, "E2 frame check: var_buf is NULL but vc is %d\n", vc);
++            abort();
++        }
++        for (k = 0; k < vc; k++) {
++            if (JS_VALUE_GET_TAG(nf->var_buf[k]) != JS_TAG_UNDEFINED) {
++                fprintf(stderr, "E2 frame check: variable %d is not undefined\n", k);
++                abort();
++            }
++        }
++    }
++    base = 0;
++    for (k = 0; k < cb->regvm_reg_count; k++) {
++        if (JS_VALUE_GET_TAG(nf->fr[k]) != JS_TAG_UNDEFINED) {
++            fprintf(stderr, "E2 frame check: register %d is not undefined\n",
++                    k + base);
++            abort();
++        }
++    }
++#else
++    (void)ctx; (void)nf; (void)co; (void)caller_f; (void)argv; (void)argc;
++    (void)this_obj;
++#endif
++}
+ #endif /* QJS_AOT */
+ 
+ #if QJS_AOT_GEN
+@@ -63124,6 +63336,19 @@
+                 g->code = b->regvm_code;
+                 g->light_ok = b->regvm_light != 0;
+                 g->light_need = (int)b->regvm_light_need;
++                /* The variable area's size, from the engine's own rule, so a
++                   native entry fills and releases exactly the slots the engine
++                   does. `light_need` already accounts for it but does not say
++                   whether the area exists at all. */
++                {
++                    int lvc = b->var_count;
++
++#if QJS_DRC
++                    if (b->var_count <= 255)
++                        lvc = b->regvm_var_count;
++#endif
++                    g->light_var_count = lvc;
++                }
+                 /* The numeric pool entries, so a folded `binary_cpool` on one
+                    can be a C literal at generation time. */
+                 if (b->cpool_count > 0 && b->cpool != NULL) {

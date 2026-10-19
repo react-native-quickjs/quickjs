@@ -1191,12 +1191,36 @@
       "sha256": "6ee95b668bb0503a8d7ba1504fef0263dae61764649e61e65d710ef89e2732e9"
     },
     {
+      "name": "0303-aot-direct-call-entry-and-array-bounds.patch",
+      "sha256": "044691314532c9cb42ad22df4502d9665d9e9b2ee80e21401cb7641582caf37a"
+    },
+    {
+      "name": "0304-aot-function-sampler.patch",
+      "sha256": "d67b8861a98d70c8cc1e810bc8e6785d9471dd3dfc29d1abe8a9dfeaeb52d6b6"
+    },
+    {
+      "name": "0305-regvm-one-wire-format.patch",
+      "sha256": "c0ade3a51b8e7c910ffb30f401701240e9d8c6d614d2cc177fa1c0b4f25480d2"
+    },
+    {
+      "name": "0306-regvm-step-move-xfer-no-clear.patch",
+      "sha256": "1412600b84d272b497423042712ef82776073b39badb10b3b6ac0ff0dedcc79b"
+    },
+    {
+      "name": "0307-aot-native-call-entry.patch",
+      "sha256": "02ba493abd0625287f0cf3e95323141dc838a9177ae2672a5e8fe9fef1aa3fa1"
+    },
+    {
+      "name": "0308-regvm-step-frame-func.patch",
+      "sha256": "d3dc2d1776e1534a5f07647e3e4bd4d5292ecd36a3c221eb2a1df29714330e1e"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "ab192788f3d63e65a25b8f3e099d204dc12162b893201c49605dab1cb86fb980",
+    "quickjs.c": "ff24cc84307e494f2ae03cdec90a9ebdc28fab3dbe7460fe0a7996c25595f3d9",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

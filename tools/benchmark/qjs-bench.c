@@ -115,6 +115,19 @@ static double now_ms(void) {
   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
+/* QJS_BENCH_INTERRUPT=N: throw on the Nth interrupt, counting down, so a
+   script's poll path is exercised and can be compared between the interpreter
+   and a unit. The exception is the ordinary "interrupted" error, which the
+   script sees as a throw. */
+static int bench_interrupt_left;
+
+static int bench_interrupt_cb(JSRuntime *rt, void *opaque) {
+  (void)rt;
+  (void)opaque;
+  if (bench_interrupt_left > 0 && --bench_interrupt_left == 0) return 1;
+  return 0;
+}
+
 int main(int argc, char **argv) {
   int mem = 0;
   int stats = 0;
@@ -158,6 +171,16 @@ int main(int argc, char **argv) {
 
   double t_boot = now_ms();
   JSRuntime *rt = JS_NewRuntime();
+  /* An interrupt every N polls, so a poll can be tested the way the
+     interpreter's is: the same script must stop at the same point. Driven by
+     the environment so the poll test needs no separate harness. */
+  {
+    const char *ip = getenv("QJS_BENCH_INTERRUPT");
+    if (ip && *ip) {
+      bench_interrupt_left = atoi(ip);
+      JS_SetInterruptHandler(rt, bench_interrupt_cb, NULL);
+    }
+  }
   JSContext *ctx = JS_NewContext(rt);
   JSValue global = JS_GetGlobalObject(ctx);
   JS_SetPropertyStr(

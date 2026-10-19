@@ -111,6 +111,10 @@ typedef struct Q2RopInfo {
 
 const Q2RopInfo *q2_rop_info(uint16_t rop);
 
+/* The branch target of an instruction: the value of its first 't' operand. */
+struct Q2Insn;
+int64_t q2_first_target_pub(const struct Q2Insn *in);
+
 /* The ROPs the lowering lowers natively. The classifier must classify every one
    of them (the IR verifier checks it), so the two cannot drift apart. */
 int q2_lowered(uint16_t rop);
@@ -246,6 +250,8 @@ int q2_infer(Q2Func *fn);
    profile record (a load, a call, or another op the interpreter runs whose
    result is guarded after it), rather than from their operands. */
 int q2_def_from_record(const Q2Insn *in);
+/* `inc` with no profile record: typed from its operand, not speculated. */
+int q2_inc_by_operand(const Q2Func *fn, const Q2Insn *in);
 /* Verify a built function: SSA dominance, edge arguments, representations and
    the effect table. Returns 0, or -1 with a message in msg. */
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len);

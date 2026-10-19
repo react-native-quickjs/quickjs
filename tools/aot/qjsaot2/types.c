@@ -86,6 +86,15 @@ int q2_def_from_record(const Q2Insn *in) {
          in->rop == ROP_neg || in->rop == ROP_inc;
 }
 
+/* The profiler writes no record for `inc`, so its representation follows its
+   operand instead: an int stays an int (the lowering exits on overflow) and a
+   double stays a double. Only when there is no record; a record still
+   speculates. */
+int q2_inc_by_operand(const Q2Func *fn, const Q2Insn *in) {
+  return in->rop == ROP_inc && in->ndef == 1 && in->nuse >= 1 &&
+         !fn->values[in->def[0]].has_prof;
+}
+
 /* A load's representation from its record. Only an exactly-numeric set
    speculates; anything else stays tagged. */
 static int q2_load_lb(const Q2Value *v) {
@@ -188,7 +197,7 @@ int q2_infer(Q2Func *fn) {
       }
       continue;
     }
-    if (q2_def_from_record(in)) {
+    if (q2_def_from_record(in) && !q2_inc_by_operand(fn, in)) {
       /* A load, or a fallback with declared destinations (a call). Its
          destinations speculate from their record, else stay tagged. */
       for (k = 0; k < in->ndef; k++) {
@@ -296,6 +305,10 @@ int q2_infer(Q2Func *fn) {
           int lb = LB_TAG, old = w[v];
           if (in->op == Q2_OP_MOVE && in->nuse >= 1) {
             lb = w[in->use[0]];
+          } else if (q2_inc_by_operand(fn, in)) {
+            lb = w[in->use[0]] == LB_I32 || w[in->use[0]] == LB_F64
+                     ? w[in->use[0]]
+                     : LB_TAG;
           } else if (in->op == Q2_OP_BINARY) {
             int a, bb;
             if (in->rop == ROP_mul_add || in->rop == ROP_mul_sub ||
@@ -414,7 +427,7 @@ int q2_infer(Q2Func *fn) {
        produced, so a tagged consumer never re-boxes it. */
     if (v->insn >= 0) {
       const Q2Insn *in = &fn->insns[v->insn];
-      if (q2_def_from_record(in)) v->spec = 1;
+      if (q2_def_from_record(in) && !q2_inc_by_operand(fn, in)) v->spec = 1;
       else if (in->op == Q2_OP_CONST || in->op == Q2_OP_MOVE) v->synced = 1;
       else if (
           in->op == Q2_OP_BINARY &&

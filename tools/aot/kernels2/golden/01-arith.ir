@@ -7,20 +7,20 @@ B0 pc=0..12 ctl=0 params=- succ=12(v44,v45)
       9 const            rop=216  def=45(i32) use=-
 B1 pc=12..23 ctl=0 params=v2=r2,v3=r3 succ=90(),23()
      12 const            rop=4    def=46(i32) use=-
-     19 branch           rop=174  def=- use=v3(r3:tagged,sync),v46(r9:i32,sync)
+     19 branch_cmp       rop=170  def=- use=v3(r3:i32),v46(r9:i32,sync)
 B2 pc=23..68 ctl=0 params=- succ=68()
      23 binary           rop=224  def=47(tagged),48(tagged) use=v42(r0:i32,sync),v43(r1:i32,sync),v2(r2:tagged,sync)
      34 binary           rop=171  def=49(tagged) use=v48(r11:tagged,sync)
-     39 binary           rop=171  def=50(tagged) use=v3(r3:tagged,sync)
-     44 binary           rop=191  def=51(tagged) use=v49(r2:tagged,sync),v50(r11:tagged,sync)
+     39 binary           rop=171  def=50(i32) use=v3(r3:i32)
+     44 binary           rop=191  def=51(tagged) use=v49(r2:tagged,sync),v50(r11:i32)
      51 binary           rop=171  def=52(tagged) use=v51(r10:tagged,sync)
-     56 binary           rop=171  def=53(tagged) use=v3(r3:tagged,sync)
-     61 fallback         rop=197  def=54(tagged) use=v52(r2:tagged,sync),v53(r11:tagged,sync)
+     56 binary           rop=171  def=53(i32) use=v3(r3:i32)
+     61 fallback         rop=197  def=54(tagged) use=v52(r2:tagged,sync),v53(r11:i32)
 B3 pc=68..90 ctl=0 params=- succ=12(v57,v58)
      68 binary           rop=171  def=55(tagged) use=v54(r10:tagged,sync)
      73 binary           rop=171  def=56(tagged) use=v55(r2:tagged,sync)
      78 binary           rop=171  def=57(tagged) use=v56(r11:tagged,sync)
-     83 unary            rop=212  def=58(tagged) use=v3(r3:tagged,sync)
+     83 unary            rop=212  def=58(i32) use=v3(r3:i32)
      88 branch           rop=172  def=- use=-
 B4 pc=90..98 ctl=0 params=- succ=98()
      90 fallback         rop=1    def=59(tagged) use=-
@@ -28,11 +28,11 @@ B5 pc=98..101 ctl=0 params=- succ=101(v60,v59)
      98 const            rop=216  def=60(i32) use=-
 B6 pc=101..108 ctl=0 params=v16=r3,v17=r4 succ=137(),108()
     101 const            rop=216  def=61(i32) use=-
-    104 branch           rop=174  def=- use=v16(r3:tagged,sync),v61(r9:i32,sync)
+    104 branch_cmp       rop=170  def=- use=v16(r3:i32),v61(r9:i32,sync)
 B7 pc=108..137 ctl=0 params=- succ=101(v64,v63)
     108 binary           rop=169  def=62(tagged) use=v17(r4:tagged,sync)
     119 binary           rop=169  def=63(tagged) use=v62(r11:tagged,sync)
-    130 unary            rop=212  def=64(tagged) use=v16(r3:tagged,sync)
+    130 unary            rop=212  def=64(i32) use=v16(r3:i32)
     135 branch           rop=172  def=- use=-
 B8 pc=137..190 ctl=0 params=- succ=190()
     137 const            rop=4    def=65(i32) use=-

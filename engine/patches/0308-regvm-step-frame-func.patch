@@ -1,0 +1,1865 @@
+Subject: Read the frame's function object from the frame, not from a JSStackFrame the frame may not have
+
+What this does
+  Every generated step form began with
+  `JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);`. It now reads
+  `rf->func`, the same function object, which every frame fill already stores
+  (the record fill, the light fill and the entry record all set it).
+
+Why we need it
+  `rf->sf` is the frame's JSStackFrame, and a light frame deliberately has
+  none: it is the frame a compiled call builds on its own C stack, and its
+  `sf` is NULL by construction. Dereferencing `rf->sf->cur_func` therefore
+  read through a null pointer the first time a compiled body ran an instruction
+  as an op call on a light frame, which is every op the compiled body does not
+  lower natively. `rf->func` names the same object, is already part of the
+  light prefix, and is what the backtrace walk reads for the same reason.
+
+  The three step forms that genuinely need the JSStackFrame -- `get_arg_el`,
+  `make_closure`, `special_object`'s mapped-arguments case, the lexical and
+  class ops, `put_arg_xfer` and the suspend paths -- keep their `rf->sf` use
+  and are excluded from light frames by `regvm_code_light_safe`, so a frame
+  that reaches them always has one.
+
+What it adds
+  Nothing: the same object, read from the frame instead of from a stack frame
+  the light path does not have.
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -14,7 +14,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -32,7 +32,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add_brand(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -56,7 +56,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -98,7 +98,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -146,7 +146,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -198,7 +198,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -239,7 +239,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_add_mul(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -273,7 +273,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_append(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -301,7 +301,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_apply(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -330,7 +330,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_apply_arguments(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -373,7 +373,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_apply_eval(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -413,7 +413,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_array_from(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -440,7 +440,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -477,7 +477,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary_cpool(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -547,7 +547,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary_imm(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -579,7 +579,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary_imm_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -614,7 +614,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary_loc_loc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -646,7 +646,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary_loc_reg(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -678,7 +678,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_binary_reg_loc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -710,7 +710,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_bitand(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -728,7 +728,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_bitor(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -746,7 +746,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_bitxor(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -764,7 +764,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -783,7 +783,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_loc_loc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -804,7 +804,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_loc_reg(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -825,7 +825,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_reg_loc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -846,7 +846,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_reg_reg(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -867,7 +867,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_cmp_reg_reg_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -892,7 +892,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_eq_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -913,7 +913,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_gt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -934,7 +934,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_gte_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -955,7 +955,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_if(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -976,7 +976,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_null(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -997,7 +997,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_not_null(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1018,7 +1018,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_nullish(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1039,7 +1039,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_not_nullish(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1060,7 +1060,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_if_not(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1092,7 +1092,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_lt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1113,7 +1113,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_lte_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1134,7 +1134,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_neq_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1157,7 +1157,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_ngt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1178,7 +1178,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_ngte_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1199,7 +1199,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_nlt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1220,7 +1220,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_nlte_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1241,7 +1241,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_branch_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1260,7 +1260,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_call(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1301,7 +1301,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_call_method(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1343,7 +1343,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_catch_enter(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1374,7 +1374,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_check_brand(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1403,7 +1403,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_check_ctor(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1427,7 +1427,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_check_ctor_return(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1464,7 +1464,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_check_define(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1488,7 +1488,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_check_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1512,7 +1512,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_close_local(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1531,7 +1531,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_construct(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1563,7 +1563,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_copy_props(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1589,7 +1589,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_debug(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1646,7 +1646,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_dec(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1664,7 +1664,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_class(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1700,7 +1700,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_class_computed(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1734,7 +1734,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_element(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1761,7 +1761,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_field(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1801,7 +1801,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_global(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1825,7 +1825,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_global_func(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1850,7 +1850,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_method(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1917,7 +1917,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_define_private(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1949,7 +1949,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_delete(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -1985,7 +1985,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_delete_var(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2012,7 +2012,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_div(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2030,7 +2030,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_dynamic_import(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2061,7 +2061,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_eq(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2079,7 +2079,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_eval(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2118,7 +2118,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_finally_enter(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2154,7 +2154,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_finally_leave(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2181,7 +2181,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_for_await_of_start(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2220,7 +2220,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2242,7 +2242,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_for_in_start(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2264,7 +2264,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_arg2(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2284,7 +2284,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_arg(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2312,7 +2312,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_arg_el(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2414,7 +2414,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_field(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2458,7 +2458,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_field2(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2497,7 +2497,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_this_field(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2551,7 +2551,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_field_chain(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2622,7 +2622,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_global(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2635,19 +2635,28 @@
+                 int d = RD_REG();
+                 JSAtom atom = RD_U32();
+                 int throwing = RD_U8();
+-                (void)RD_U16();
++                int site = RD_U16();
+                 JSValue val;
+                 /* The cell cache first, as the stack VM's OP_get_var does. A
+                    filled cell has passed the TDZ test, and both a write of
+                    JS_UNINITIALIZED into global_var_obj and a change to the
+                    global object's shape bump the generation. */
+                 if (likely(js_gv_cell_probe(ctx, atom, &val))) {
++                    /* Fill this instruction's PIC site, as the threaded handler
++                       does. Without it a compiled body that runs this op as an
++                       op call never sees the site filled, so its inline
++                       global-read hit test compares against an empty entry and
++                       misses on every execution: a permanent 0% hit rate. The
++                       fill is the site's own; a second execution rewrites the
++                       same entry. */
++                    regvm_global_site_fill(ctx, b, &rf->pic, atom, site);
+                     SET_REG_P(d, val);
+                     REGVM_NEXT();
+                 }
+                 val = JS_GetGlobalVar(ctx, atom, throwing);
+                 if (JS_IsException(val))
+                     goto exception;
++                regvm_global_site_fill(ctx, b, &rf->pic, atom, site);
+                 SET_REG_P(d, val);
+                 REGVM_NEXT();
+             }
+@@ -2659,7 +2668,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_length(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2689,7 +2698,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_local(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2712,7 +2721,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2755,7 +2764,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2797,7 +2806,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_local_s0(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2817,7 +2826,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_private(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2845,7 +2854,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_ref_value(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2882,7 +2891,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_super(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2909,7 +2918,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_get_var_ref(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2932,7 +2941,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_gt(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2950,7 +2959,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_gte(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2968,7 +2977,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_in(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -2986,7 +2995,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_inc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3004,7 +3013,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3050,7 +3059,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3100,7 +3109,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_init_ctor(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3135,7 +3144,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_instanceof(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3153,7 +3162,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_iter_close(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3223,7 +3232,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3255,7 +3264,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_iter_start(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3290,7 +3299,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_iter_value_done(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3338,7 +3347,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_iterator_call(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3391,7 +3400,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_iterator_next(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3434,7 +3443,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_bigint_i32(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3453,7 +3462,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_const(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3483,7 +3492,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_false(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3501,7 +3510,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_i32(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3520,7 +3529,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_i8(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3539,7 +3548,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_i8_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3558,7 +3567,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_null(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3576,7 +3585,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_this(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3618,7 +3627,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_true(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3636,7 +3645,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_load_undefined(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3654,7 +3663,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_local_check(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3679,7 +3688,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_local_check_init(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3705,7 +3714,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_branch(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3753,7 +3762,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_imm(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3835,7 +3844,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_local_uninit(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3855,7 +3864,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_lt(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3873,7 +3882,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_lte(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3891,7 +3900,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_make_closure(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3918,7 +3927,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_make_local_ref(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -3974,7 +3983,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_make_var_ref(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4003,7 +4012,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_mod(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4021,7 +4030,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_move(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4044,7 +4053,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_move_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4064,7 +4073,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_move_xfer(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4094,7 +4103,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_mul(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4112,7 +4121,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_post_inc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4130,7 +4139,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_post_dec(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4148,7 +4157,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_array_const(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4174,7 +4183,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_mul_add(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4208,7 +4217,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_mul_sub(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4242,7 +4251,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_neg(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4260,7 +4269,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_neq(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4278,7 +4287,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_new_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4303,7 +4312,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_nip_catch(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4338,7 +4347,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_not(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4356,7 +4365,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_object_fill(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4432,7 +4441,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_object_template(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4466,7 +4475,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_pow(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4484,7 +4493,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_private_symbol(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4510,7 +4519,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_arg(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4535,7 +4544,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_arg_xfer(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4562,7 +4571,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_element(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4594,7 +4603,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_element_xfer(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4698,7 +4707,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_field_xfer(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4747,7 +4756,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_global(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4772,7 +4781,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_local(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4795,7 +4804,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_local_s0(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4815,7 +4824,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_local_xfer(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4844,7 +4853,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_local_xfer_s0(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4870,7 +4879,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_private(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4898,7 +4907,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_ref_value(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4944,7 +4953,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_super_value(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -4983,7 +4992,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_put_var_ref(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5003,7 +5012,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_regexp(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5032,7 +5041,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_rest(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5060,7 +5069,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_sar(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5078,7 +5087,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_sentinel_drop(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5107,7 +5116,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_set_home_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5130,7 +5139,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_set_name(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5155,7 +5164,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_set_name_computed(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5183,7 +5192,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_set_proto(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5210,7 +5219,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_shl(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5228,7 +5237,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_shr(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5246,7 +5255,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_slot_get(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5266,7 +5275,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_slot_put(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5286,7 +5295,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_special_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5348,7 +5357,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_strict_eq(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5366,7 +5375,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_strict_neq(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5384,7 +5393,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_sub(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5402,7 +5411,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_sub_imm_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5447,7 +5456,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_sub_imm_self_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5491,7 +5500,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_sub_mul(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5525,7 +5534,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_super_get(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5560,7 +5569,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_tail_call(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5601,7 +5610,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_tail_call_method(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5640,7 +5649,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_throw(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5669,7 +5678,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_throw_error(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5703,7 +5712,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_to_numeric(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5721,7 +5730,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_to_object(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5751,7 +5760,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_to_propkey(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5796,7 +5805,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_unary(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5830,7 +5839,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_using_check(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5856,7 +5865,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_using_dispose(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5912,7 +5921,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_using_dispose_async(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5946,7 +5955,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_using_end(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5972,7 +5981,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_using_init(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -5993,7 +6002,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_using_merge(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -6028,7 +6037,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_var_ref_check(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -6053,7 +6062,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_var_ref_check_init(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -6078,7 +6087,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_with_get(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -6128,7 +6137,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_with_make_ref(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;
+@@ -6183,7 +6192,7 @@
+ static uint8_t *REGVM_CC regvm_s_ROP_with_put(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+ {
+     JSFunctionBytecode *b = rf->b;
+-    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
++    JSObject *p = rf->func;   /* not rf->sf->cur_func: a light frame has no JSStackFrame */
+     JSRegPIC *pic = rf->pic;
+     uint8_t *rpc = ip;
+     int op = *rpc++;

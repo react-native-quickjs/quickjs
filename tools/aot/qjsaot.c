@@ -131,6 +131,7 @@ static int hex_to_bytes16(const char *s, uint8_t out[16]) {
 #define PT_OTHER 0x80u
 #define PT_ARITH (PT_FLOAT | PT_INT)
 
+#include "qjsaot2/e2.h"
 #include "qjsaot2/prof.h"
 
 typedef struct {
@@ -206,6 +207,10 @@ typedef struct {
   int nsites, capsites;
   ProfUnused *unused;
   int nunused, capunused;
+  /* The `T` records: sampler hits by pc, kept as the per-instruction execution
+     count the op-call weight sums over. Sorted by pc after parsing. */
+  ProfCount *counts;
+  int ncounts, capcounts;
 } ProfEntry;
 
 /* The parsed profile (for call-site specialisation) and the current function's
@@ -249,6 +254,17 @@ static long long count_insns(const uint8_t *code, int len);
    this with its SSA dump. */
 static int g_dump_ir = 0;
 static const char *g_ir_path = NULL;
+
+/* --emit2: build the unit with the E2 emitter. --emit2-only HEX restricts it to
+   one function so the two emitters can be compared function by function, and
+   --emit2-report FILE writes one line per function saying which emitter
+   produced its body. */
+static const char *g_emit2_report = NULL;
+
+/* --emit2-nocall: emit the generic body with no native call sites, so the
+   call-cost benchmark can separate the entry's own cost from the call site's.
+   A/B switch only; the shipped path always lowers call sites. */
+static int e2_nocall;
 
 static void dump_ir_func(FILE *f, const JSAotGenFunc *g) {
   char hex[33];
@@ -386,6 +402,11 @@ static int cmp_profpc(const void *a, const void *b) {
   return (x->pc > y->pc) - (x->pc < y->pc);
 }
 
+static int cmp_profcount(const void *a, const void *b) {
+  const ProfCount *x = a, *y = b;
+  return (x->pc > y->pc) - (x->pc < y->pc);
+}
+
 static ProfEntry *parse_profile(const char *path, int *pn) {
   FILE *f = fopen(path, "r");
   ProfEntry *arr = NULL;
@@ -422,7 +443,8 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
     uint8_t dg[16];
     ProfEntry *e;
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
-         line[0] != 'P' && line[0] != 'S' && line[0] != 'U') ||
+         line[0] != 'P' && line[0] != 'S' && line[0] != 'U' &&
+         line[0] != 'T') ||
         line[1] != ' ')
       continue;
     if (hex_to_bytes16(line + 2, dg) < 0) continue;
@@ -645,6 +667,35 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           if (ps->nshapes < PROF_MAX_SHAPES) ps->shape[ps->nshapes++] = sh;
         }
       }
+    } else if (line[0] == 'T') {
+      /* T <hex> pc=<n> samples=<s>: the sampler charged `s` ticks to the
+         instruction at `n`. The profiler takes one sample per 1024 dispatches,
+         so `s * 1024` estimates that pc's execution count, which is what the
+         op-call weight needs; the scaling happens in the accessor so a merged
+         profile sums ticks before it scales. Kept apart from the type records
+         because a hot pc can have a sample record and no types. */
+      char *p = strstr(line + 2, "pc=");
+      char *smp = strstr(line + 2, "samples=");
+      if (p && smp) {
+        int pc = (int)strtol(p + 3, NULL, 10);
+        unsigned long long n = strtoull(smp + 8, NULL, 10);
+        int k;
+        for (k = 0; k < e->ncounts; k++)
+          if (e->counts[k].pc == pc) break;
+        if (k == e->ncounts) {
+          if (e->ncounts == e->capcounts) {
+            ProfCount *nc;
+            e->capcounts = e->capcounts ? e->capcounts * 2 : 16;
+            nc = realloc(e->counts, sizeof(*nc) * (size_t)e->capcounts);
+            if (!nc) return NULL;
+            e->counts = nc;
+          }
+          e->ncounts++;
+          e->counts[k].pc = pc;
+          e->counts[k].count = 0;
+        }
+        e->counts[k].count += n;
+      }
     } else if (line[0] == 'U') {
       /* U <hex> pc=<a>..<b>: a range the profiler never executed. */
       char *p = strstr(line + 2, "pc=");
@@ -694,6 +745,9 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   for (i = 0; i < n; i++) {
     if (arr[i].npcs > 1)
       qsort(arr[i].pcs, (size_t)arr[i].npcs, sizeof(arr[i].pcs[0]), cmp_profpc);
+    if (arr[i].ncounts > 1)
+      qsort(arr[i].counts, (size_t)arr[i].ncounts, sizeof(arr[i].counts[0]),
+            cmp_profcount);
   }
   *pn = n;
   return arr;
@@ -3108,6 +3162,29 @@ const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
   return e->pcs;
 }
 
+/* The instruction at `pc` of the function with this digest, as an estimated
+   execution count, or 0 when the profile has no sample there. The profiler
+   charges one tick per 1024 dispatches, so the count is the sample count
+   scaled back up; it is an estimate and is reported as one. */
+unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int lo, hi;
+
+  if (!e || e->ncounts == 0) return 0;
+  lo = 0;
+  hi = e->ncounts - 1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (e->counts[mid].pc == pc)
+      return e->counts[mid].count * 1024ull;
+    if (e->counts[mid].pc < pc)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return 0;
+}
+
 /* The dominant profiled call at `pc` of the function with this digest. Returns
    1 and fills `*kind` (1 for a bytecode callee, 2 for a C function, 3 for
    anything else), `*cproto` (-1 unless a C callee) and `hex` (the bytecode
@@ -3218,6 +3295,24 @@ int qjs_aot_light_need(const char hex[33]) {
                  ? g_unit_funcs[i].light_need
                  : 0;
   return 0;
+}
+
+/* The declared argument count of the unit function with this digest, or -1 when
+   it is not in the unit. A direct call must supply at least this many: the
+   callee's frame publishes `argc` and its body reads its parameters from the
+   argument window, so a short window would read a register the caller never
+   wrote. */
+int qjs_aot_unit_argc(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return -1;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
+      return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE
+                 ? g_unit_funcs[i].arg_count
+                 : -1;
+  return -1;
 }
 
 int qjs_aot_unit_has(const char hex[33]) {
@@ -3358,6 +3453,24 @@ typedef struct {
 /* Per unit function: the leaf body, when it has one. */
 static EmitBuf *g_pure_eb;
 
+/* Which functions this run's E2 emitter gave a native entry. A call site may
+   only name an `aot_n_` that some body in this unit defines, and a unit built
+   with `--emit2-only` emits the *other* functions with the old emitter, which
+   emits no native entry. Keyed by unit index. */
+static uint8_t *g_e2_native;
+
+/* The E2 emitter's hook, so the unit builder knows which bodies it produced. */
+void qjs_aot_note_native_entry(int index) {
+  if (g_e2_native && index >= 0) g_e2_native[index] = 1;
+}
+
+/* The unit index of the function being emitted, for the hook above. */
+int qjs_aot_cur_func_idx(void) { return g_cur_func_idx; }
+
+int qjs_aot_has_native_entry(int index) {
+  return g_e2_native && index >= 0 ? g_e2_native[index] : 0;
+}
+
 /* The argument count of the unit function with this digest when it has a leaf
    body, else -1. */
 int qjs_aot_leaf_argc(const char hex[33]) {
@@ -3373,6 +3486,21 @@ int qjs_aot_leaf_argc(const char hex[33]) {
   return -1;
 }
 
+
+/* A function's share of the profile's executed ops, in percent: the report's
+   `weight`. Without a profile every function is 0 %, which is honest — nothing
+   was measured, so nothing is known to matter. */
+double qjs_aot_prof_weight(const uint8_t dg[16]) {
+  int i;
+  unsigned long long mine = 0, all = 0;
+
+  if (!g_prof || g_nprof == 0) return 0.0;
+  for (i = 0; i < g_nprof; i++) {
+    all += g_prof[i].ops;
+    if (memcmp(g_prof[i].digest, dg, 16) == 0) mine = g_prof[i].ops;
+  }
+  return all ? 100.0 * (double)mine / (double)all : 0.0;
+}
 
 static unsigned long long prof_ops_of(
     const ProfEntry *prof, int nprof, const uint8_t dg[16]) {
@@ -3457,6 +3585,26 @@ int qjsaot_driver_main(int argc, char **argv) {
       g_deopt_everywhere = 1;
     } else if (strcmp(argv[i], "--check-locals") == 0) {
       g_check_locals = 1;
+    } else if (strcmp(argv[i], "--emit2-nocall") == 0) {
+      e2_on = 1;
+      e2_set_nocall(1);
+    } else if (strcmp(argv[i], "--emit2-poison") == 0) {
+      e2_on = 1;
+      e2_set_poison(1);
+    } else if (strcmp(argv[i], "--emit2") == 0) {
+      e2_on = 1;
+    } else if (strcmp(argv[i], "--emit2-report") == 0 && i + 1 < argc) {
+      g_emit2_report = argv[++i];
+    } else if (strcmp(argv[i], "--emit2-only") == 0 && i + 1 < argc) {
+      const char *h = argv[++i];
+      e2_on = 1;
+      if (strlen(h) != 32 || strspn(h, "0123456789abcdef") != 32) {
+        fprintf(stderr, "qjsaot: --emit2-only wants a 32-digit hex digest\n");
+        free(inputs);
+        return 2;
+      }
+      memcpy(e2_only_hex, h, 32);
+      e2_only_hex[32] = 0;
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       g_dump_ir = 1;
     } else if (strcmp(argv[i], "--dump-ir-out") == 0 && i + 1 < argc) {
@@ -3589,6 +3737,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     /* The leaves first: a caller asks whether its callee has one while its own
        body is emitted. */
     g_pure_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_pure_eb));
+    g_e2_native = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     for (i = 0; qjs_aot_emit_pure && g_pure_eb && i < nfuncs; i++) {
       char hex[33];
       FILE *mf;
@@ -3607,6 +3756,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         g_pure_eb[i].len = 0;
       }
     }
+    if (qjs_aot_emit2_on()) e2_roles_check();
+    e2_report_open(g_emit2_report);
     for (i = 0; i < nfuncs; i++) {
       char hex[33];
       int ninsn;
@@ -3640,6 +3791,7 @@ int qjsaot_driver_main(int argc, char **argv) {
       total_insns += ninsn;
       uniq[nuniq++] = i;
     }
+    e2_report_close();
 
     /* --- selection --- */
     if (all || !profile || g_nprof == 0) {
@@ -3851,7 +4003,24 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_CLASS_ARRAY %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_POLY %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_POLY_SITES %uu\n"
-          "#define QJS_AOT_AOT_POLY_WAYS %uu\n\n"
+          "#define QJS_AOT_AOT_POLY_WAYS %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE %uu\n"
+          "#define QJS_AOT_JSOBJECT_HOLEY_MASK %uu\n\n"
+          "#define QJS_AOT_OFF_REGRUN_RET_IP %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_FR %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_VAR_REFS %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_HDR_PACK %uu\n"
+          "#define QJS_AOT_OFF_REGRUN_CAP_IP %uu\n"
+          "#define QJS_AOT_OFF_FNBC_REALM %uu\n"
+          "#define QJS_AOT_OFF_RT_REGVM_CUR %uu\n"
+          "#define QJS_AOT_OFF_RT_STACK_LIMIT %uu\n"
+          "#define QJS_AOT_OFF_OBJECT_FUNC_VAR_REFS %uu\n"
+          "#define QJS_AOT_LIGHT_PREFIX_SLOTS %uu\n"
+          "#define QJS_AOT_REGVM_FLAG_LIGHT %uu\n"
+          "#define QJS_AOT_REGVM_FLAG_C_ENTRY %uu\n"
+          "#define QJS_AOT_REGVM_FLAG_STACK %uu\n"
+          "#define QJS_AOT_REGVM_FLAG_TRIVIAL_RET %uu\n"
+          "#define QJS_AOT_REGVM_FLAG_SAME_REALM %uu\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
           lay.hash, lay.sizeof_JSObject, lay.sizeof_JSShape,
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
@@ -3883,7 +4052,14 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.class_bytecode_function, lay.off_fnbc_aot_fn,
           lay.off_fnbc_regvm_pic, lay.off_object_array_count,
           lay.off_object_array_values, lay.class_array, lay.off_fnbc_aot_poly,
-          lay.off_fnbc_aot_poly_sites, lay.aot_poly_ways);
+          lay.off_fnbc_aot_poly_sites, lay.aot_poly_ways,
+          lay.off_object_holey_byte, lay.object_holey_mask,
+          lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
+          lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
+          lay.off_rt_regvm_cur, lay.off_rt_stack_limit,
+          lay.off_object_func_var_refs, lay.light_prefix_slots,
+          lay.regvm_flag_light, lay.regvm_flag_c_entry, lay.regvm_flag_stack,
+          lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm);
       fclose(lf);
     }
 
@@ -3906,6 +4082,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         "*/\n");
     fprintf(f, "#include \"quickjs-aot-rt.h\"\n");
     fprintf(f, "#include \"%s\"\n", aot_layout_header);
+    /* Every compiled body goes in its own section, so the sampler can tell a
+       sample in compiled code from one in the engine. The symbols are declared
+       weak, so a unit without the section still links. */
+    fprintf(f,
+            "#define E2_TEXT __attribute__((section(\"e2text\")))\n"
+            "extern char __start_e2text[] __attribute__((weak));\n"
+            "extern char __stop_e2text[] __attribute__((weak));\n");
     /* Unconditional: the A/B switch reads the environment, and a unit that is
        compiled without the debug checks still has to do that. */
     fprintf(f, "#include <stdlib.h>\n");
@@ -3938,6 +4121,192 @@ int qjsaot_driver_main(int argc, char **argv) {
            chain is disabled (see q2_poly_site): with it, DeltaBlue's compiled
            body reported a constraint cycle the interpreter does not. */
         "static int q2_no_spec, q2_spec_on;\n"
+        /* E2 unit counters (D14 part 2). `e2_g8_hits` counts a dispatch to a
+           pc that is not an instruction start; it must stay 0. */
+        "static unsigned long e2_g8_hits;\n"
+        /* The D12 dynamic check, compiled into the unit only with -DE2_POISON.
+           It compares every register an op call was not allowed to write
+           against a copy taken before the call, by tag and then by kind, so a
+           handler that writes a register it did not declare is caught at the
+           site rather than as a wrong answer later. */
+        "#if defined(E2_POISON) && E2_POISON\n"
+        "#include <stdio.h>\n"
+        "#include <stdlib.h>\n"
+        "/* Equal as values: the tag decides how the payload is compared, so a\n"
+        "   NaN payload or a pointer is never memcmp'd (invariant 12). */\n"
+        "static int e2_same_value(JSValue a, JSValue b)\n"
+        "{\n"
+        "  int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);\n"
+        "  if (ta != tb) return 0;\n"
+        "  switch (ta) {\n"
+        "  case JS_TAG_INT: return JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b);\n"
+        "  case JS_TAG_BOOL: return JS_VALUE_GET_BOOL(a) == JS_VALUE_GET_BOOL(b);\n"
+        "  case JS_TAG_FLOAT64: {\n"
+        "    double x = JS_VALUE_GET_FLOAT64(a), y = JS_VALUE_GET_FLOAT64(b);\n"
+        "    return x == y && !(x != x) && !(y != y) ? 1 : (x != x && y != y);\n"
+        "  }\n"
+        "  case JS_TAG_STRING: case JS_TAG_STRING_ROPE: case JS_TAG_OBJECT:\n"
+        "    return JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);\n"
+        "  default:\n"
+        "    /* null, undefined, uninitialized and the internal tags carry no\n"
+        "       payload; the tag comparison was the whole test. */\n"
+        "    return 1;\n"
+        "  }\n"
+        "}\n"
+        "#define E2_SENTINEL JS_MKVAL(JS_TAG_INT, 0x5e5e5e5e)\n"
+        "static long e2_poison_seen;\n"
+        "static void e2_poison_abort(const char *op, int pc, int reg,\n"
+        "                            JSValue got)\n"
+        "{\n"
+        "  if (e2_poison_seen++ < 200) {\n"
+        "    int tg = JS_VALUE_GET_TAG(got);\n"
+        "    fprintf(stderr, \"e2 poison: %%s pc %%d wrote r%%d (now tag %%d int %%d)\\n\",\n"
+        "            op, pc, reg, tg, tg == JS_TAG_INT ? JS_VALUE_GET_INT(got) : -1);\n"
+        "  }\n"
+
+        "#ifdef E2_POISON_QUIET\n"
+        "  /* Report and keep going, so one run lists every disagreement. */\n"
+        "  (void)op; (void)pc; (void)reg;\n"
+        "#else\n"
+        "  abort();\n"
+        "#endif\n"
+        "}\n"
+        /* The two halves of the check. `pm[r]` is '1' for a register the op
+           neither reads nor writes and that is dead after it; `wm[r]` is '1'
+           for a register it may write. Only uncounted values are replaced: a
+           register can be the only root of a counted one. The counters are
+           printed at exit so a check that poisons nothing is visible. */
+        "static unsigned long e2_poison_calls, e2_poison_regs;\n"
+        "static __attribute__((noinline)) void e2_poison_pre(JSValue *fr, int n,\n"
+        "    JSValue *copy, uint8_t *pz, const char *pm)\n"
+        "{\n"
+        "  e2_poison_calls++;\n"
+        "  for (int r = 0; r < n; r++) {\n"
+        "    copy[r] = AOT_REG(fr, r * 16);\n"
+        "    pz[r] = 0;\n"
+        "    if (pm[r] == '1' && !JS_VALUE_HAS_REF_COUNT(copy[r])) {\n"
+        "      AOT_REG(fr, r * 16) = E2_SENTINEL;\n"
+        "      pz[r] = 1;\n"
+        "      e2_poison_regs++;\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+        "static __attribute__((noinline)) void e2_poison_post(JSValue *fr, int n,\n"
+        "    const JSValue *copy, const uint8_t *pz, const char *wm,\n"
+        "    const char *op, int pc)\n"
+        "{\n"
+        "  for (int r = 0; r < n; r++) {\n"
+        "    if (wm[r] == '1') continue;\n"
+        "    if (!e2_same_value(AOT_REG(fr, r * 16), pz[r] ? E2_SENTINEL : copy[r]))\n"
+        "      e2_poison_abort(op, pc, r, AOT_REG(fr, r * 16));\n"
+        "    else if (pz[r])\n"
+        "      AOT_REG(fr, r * 16) = copy[r];\n"
+        "  }\n"
+        "}\n"
+        "static void __attribute__((destructor)) e2_poison_stats(void)\n"
+        "{\n"
+        "  fprintf(stderr, \"e2 poison-stats: calls=%%lu poisoned=%%lu\\n\",\n"
+        "          e2_poison_calls, e2_poison_regs);\n"
+        "}\n"
+        "#endif\n"
+        /* Per-site hit/miss counters (compiled with -DE2_COUNT=1). One pair per
+           inline fast path, so a lowering that never hits is visible as data
+           rather than inferred from a benchmark. A site is named by its
+           function's digest, the instruction's pc and the op, which is what the
+           generator's op-call weight lines use, so the two can be read side by
+           side. Disabled by default: the counters are a diagnostic, not a gate,
+           and the lookup is linear because a function has only a few sites. */
+        "#if defined(E2_COUNT) && E2_COUNT\n"
+        "#include <stdio.h>\n"
+        "#include <string.h>\n"
+        "typedef struct { const char *hex; unsigned pc; uint16_t rop;\n"
+        "                 unsigned long long hit, miss; } E2SiteCtr;\n"
+        "static E2SiteCtr e2_sites[8192];\n"
+        "static unsigned e2_nsites;\n"
+        "static const char *const e2_rop_names[] = {\n");
+    {
+      int r;
+      for (r = 0; r < ROP_COUNT; r++) {
+        char nm[64];
+        e2_rop_name((uint16_t)r, nm, sizeof(nm));
+        fprintf(f, "  \"%s\",%s", nm, (r % 8 == 7) ? "\n" : " ");
+      }
+    }
+    fprintf(f,
+        "\n};\n"
+        "static void e2_count_note(const char *hex, unsigned pc, unsigned rop,\n"
+        "                          int hit)\n"
+        "{\n"
+        "  unsigned i;\n"
+        "  for (i = 0; i < e2_nsites; i++)\n"
+        "    if (e2_sites[i].pc == pc && e2_sites[i].rop == rop &&\n"
+        "        e2_sites[i].hex == hex) {\n"
+        "      if (hit) e2_sites[i].hit++; else e2_sites[i].miss++;\n"
+        "      return;\n"
+        "    }\n"
+        "  if (e2_nsites >= sizeof(e2_sites) / sizeof(e2_sites[0])) return;\n"
+        "  i = e2_nsites++;\n"
+        "  e2_sites[i].hex = hex; e2_sites[i].pc = pc;\n"
+        "  e2_sites[i].rop = (uint16_t)rop;\n"
+        "  e2_sites[i].hit = hit ? 1 : 0; e2_sites[i].miss = hit ? 0 : 1;\n"
+        "}\n"
+        "static void __attribute__((destructor)) e2_count_dump(void)\n"
+        "{\n"
+        "  unsigned i;\n"
+        "  for (i = 0; i < e2_nsites; i++)\n"
+        "    fprintf(stderr, \"e2 site %%s pc %%u %%s hit=%%llu miss=%%llu\\n\",\n"
+        "            e2_sites[i].hex, e2_sites[i].pc,\n"
+        "            e2_rop_names[e2_sites[i].rop],\n"
+        "            e2_sites[i].hit, e2_sites[i].miss);\n"
+        "}\n"
+        "#define E2_CTR(hex, pc, rop, hit) e2_count_note((hex), (pc), (rop), (hit))\n"
+        /* Why q2_put_field_hit declined, so a store site that never hits can
+           be explained rather than guessed at. */
+        "#define E2_PUT_SHAPE   0\n"
+        "#define E2_PUT_KIND    1\n"
+        "#define E2_PUT_PROTO   2\n"
+        "#define E2_PUT_N 3\n"
+        "static unsigned long long e2_put_why[E2_PUT_N];\n"
+        "static void e2_put_why_note(int why) { e2_put_why[why]++; }\n"
+        "static const char *const e2_put_why_names[E2_PUT_N] = {\n"
+        "  \"shape\", \"kind-not-own-w\", \"receiver-prototype\"\n"
+        "};\n"
+        "static void __attribute__((destructor)) e2_put_why_dump(void)\n"
+        "{\n"
+        "  int i; unsigned long long tot = 0;\n"
+        "  for (i = 0; i < E2_PUT_N; i++) tot += e2_put_why[i];\n"
+        "  if (!tot) return;\n"
+        "  for (i = 0; i < E2_PUT_N; i++)\n"
+        "    if (e2_put_why[i])\n"
+        "      fprintf(stderr, \"e2 putfield-why %%s %%llu (%%llu%%%%)\\n\",\n"
+        "              e2_put_why_names[i], e2_put_why[i],\n"
+        "              100ull * e2_put_why[i] / tot);\n"
+        "}\n"
+        "#define E2_PUTWHY(w) e2_put_why_note(w)\n"
+        "#else\n"
+        "#define E2_CTR(hex, pc, rop, hit) ((void)0)\n"
+        "#define E2_PUTWHY(w) ((void)0)\n"
+        "#endif\n"
+        /* D10's frame seal. The engine's frame area has a top marker, and a
+           compiled function may be running on a frame above it; a native call
+           made from there lets the callee's own calls into the engine allocate
+           a frame at that marker, writing over the caller's registers. Sealing
+           publishes this activation's frame so the marker sits above it.
+           A frame on the C stack needs no seal: the marker already accounts for
+           it. Once per activation, not per `goto dispatch`. */
+        "#ifndef E2_SEAL\n"
+        "#define E2_SEAL(ctx, f) do { if (!(*(uint16_t *)((uint8_t *)(f) + QJS_AOT_OFF_REGRUN_FLAGS) & QJS_AOT_REGVM_FLAG_STACK)) qjs_aot_seal(ctx, f); } while (0)\n"
+        "#endif\n"
+        /* The stack margin a native entry keeps free for the throw it may have
+           to perform. 4 KB crashed before; 64 KB is what the call-path
+           experiments used and what the design states. */
+        "#ifndef E2_STACK_MARGIN\n"
+        "#define E2_STACK_MARGIN (64 * 1024)\n"
+        "#endif\n"
+        /* The `undefined` word a native entry fills its frame with, as one
+           static constant so the fill is a copy of a known word. */
+        "static const JSValue e2_undefined_value = { { .int32 = 0 }, "
+        "JS_TAG_UNDEFINED };\n"
         "static void __attribute__((constructor)) q2_no_spec_init(void)\n"
         "{\n"
         "  const char *e = getenv(\"QJS_AOT_NO_SPEC\");\n"
@@ -3959,8 +4328,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
         "    return 0;\n"
-        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT))\n"
-        "    return 0;\n"
+        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) return 0;\n"
         "  *out = (*(JSValue *const *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
         "  if (JS_VALUE_GET_TAG(*out) != JS_TAG_INT &&\n"
         "      JS_VALUE_GET_TAG(*out) != JS_TAG_FLOAT64)\n"
@@ -3978,8 +4347,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  const void *p = *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_POLY);\n"
         "  if (p == NULL) return NULL;\n"
         "  if ((uint32_t)site >= *(const uint32_t *)(b + "
-        "QJS_AOT_OFF_FNBC_AOT_POLY_SITES))\n"
-        "    return NULL;\n"
+        "QJS_AOT_OFF_FNBC_AOT_POLY_SITES)) return NULL;\n"
         "  return (const unsigned char *)p + (size_t)site * QJS_AOT_AOT_POLY_WAYS * 16;\n"
         "}\n\n"
         "static inline const void *q2_poly_shape(const void *e, int k)\n"
@@ -4001,8 +4369,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (pic == NULL || (unsigned)k == QJS_AOT_REG_IC_NONE) return NULL;\n"
         "  e = (const unsigned char *)pic + (size_t)k * QJS_AOT_SIZEOF_JSREGPIC;\n"
         "  kind = *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND);\n"
-        "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W)\n"
-        "    return NULL;\n"
+        "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W) return NULL;\n"
         "  return *(const void *const *)e;\n"
         "}\n\n"
         "static inline const void *q2_cell_wshape(const void *pic, int k)\n"
@@ -4051,12 +4418,37 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
         "    return 0;\n"
-        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT))\n"
-        "    return 0;\n"
+        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) return 0;\n"
         "  v = (*(JSValue *const *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
         "  if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
         "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
         "  *out = v;\n"
+        "  return 1;\n"
+        "}\n\n"
+        /* A store into an existing element of a dense array, when neither
+           the old nor the new value is counted, so no reference changes hands.
+           A hole is refused: writing one creates a property, which a setter
+           on a prototype could see. */
+        "static inline __attribute__((always_inline)) int q2_elem_put(JSValue arr, JSValue k, JSValue v)\n"
+        "{\n"
+        "  unsigned char *p;\n"
+        "  uint32_t i;\n"
+        "  JSValue *slot;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(k) != JS_TAG_INT || JS_VALUE_GET_TAG(v) < 0) return 0;\n"
+        "  p = (unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_ARRAY)\n"
+        "    return 0;\n"
+        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) return 0;\n"
+        "  slot = &(*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
+        "  if (JS_VALUE_GET_TAG(*slot) < 0 ||\n"
+        "      JS_VALUE_GET_TAG(*slot) == JS_TAG_UNINITIALIZED)\n"
+        "    return 0;\n"
+        "  *slot = v;\n"
         "  return 1;\n"
         "}\n\n"
         "static inline const void *q2_pic(JSRegRun *f)\n"
@@ -4082,6 +4474,33 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The global-read site cache hit: the site names the global's property
            slot and the generation it was filled at, and a hit borrows the
            slot's value. Runs no user code and allocates nothing. */
+        /* A dense array's `length`, read the way the engine stores it: for a
+           non-holey fast array the element count *is* the length, and prop[0]
+           holds the same number. A holey array (or any array with a gap between
+           its count and its length) does not satisfy that, so the test is
+           structural -- class, fast array, not holey -- and the value comes from
+           the length property itself, which is prop[0] for every array. */
+        "static inline __attribute__((always_inline)) int q2_array_length(JSValue v, double *out)\n"
+        "{\n"
+        "  const unsigned char *p, *prop;\n"
+        "  JSValue len;\n"
+        "  if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(v);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_ARRAY)\n"
+        "    return 0;\n"
+        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  prop = *(const unsigned char *const *)(p + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+        "  len = *(const JSValue *)(prop + QJS_AOT_OFF_JSPROPERTY_U_VALUE);\n"
+        "  if (JS_VALUE_GET_TAG(len) != JS_TAG_INT || JS_VALUE_GET_INT(len) < 0) return 0;\n"
+        "  /* A non-holey array's count is its length; a gap would make them differ,\n"
+        "     and `holey` is set for that case, so the count must match. */\n"
+        "  if ((uint32_t)JS_VALUE_GET_INT(len) !=\n"
+        "      *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT))\n"
+        "    return 0;\n"
+        "  *out = (double)JS_VALUE_GET_INT(len);\n"
+        "  return 1;\n"
+        "}\n\n"
         "static inline __attribute__((always_inline)) int q2_global_hit(JSContext *ctx, const void *pic,\n"
         "                                int site, JSValue *out)\n"
         "{\n"
@@ -4153,15 +4572,17 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *out = v;\n"
         "  return 1;\n"
         "}\n\n");
-    /* The inline own-slot store hit: the interpreter's REG_PIC_OWN_W test,
-       for the overwrite of an uncounted value with an uncounted value on an
-       object that is not a prototype. A counted value, a prototype receiver
-       (whose store invalidates the prototype epoch) or a miss returns 0 and
-       the caller takes the engine's store. */
+    /* The inline own-slot store hit: the interpreter's REG_PIC_OWN_W test on
+       an object that is not a prototype, and the store the engine's own fast
+       path makes (`*slot = js_dup(v); JS_FreeValue(ctx, old)`). The new value
+       is duplicated before the old one is released, so storing a slot's own
+       value cannot free it. A prototype receiver (whose store invalidates the
+       prototype epoch) or a miss returns 0 and the caller takes the engine's
+       store. */
     fprintf(
         f,
-        "static inline __attribute__((always_inline)) int q2_put_field_hit(const void *pic, JSValue recv, int site,\n"
-        "                                   JSValue v)\n"
+        "static inline __attribute__((always_inline)) int q2_put_field_hit(JSContext *ctx, const void *pic,\n"
+        "                                   JSValue recv, int site, JSValue v)\n"
         "{\n"
         "  const unsigned char *obj, *e;\n"
         "  JSValue *slot;\n"
@@ -4169,26 +4590,59 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (pic == NULL || (unsigned)site == QJS_AOT_REG_IC_NONE) {\n"
         "    return 0;\n"
         "  }\n"
-        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) < 0) {\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) {\n"
         "    return 0;\n"
         "  }\n"
         "  obj = (const unsigned char *)JS_VALUE_GET_PTR(recv);\n"
         "  e = (const unsigned char *)pic + (size_t)site * QJS_AOT_SIZEOF_JSREGPIC;\n"
         "  if (*(const void *const *)e !=\n"
-        "          *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE) ||\n"
-        "      *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) !=\n"
-        "          QJS_AOT_REG_PIC_OWN_W ||\n"
-        "      (obj[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] &\n"
+        "          *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE)) {\n"
+        "    E2_PUTWHY(E2_PUT_SHAPE);\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) !=\n"
+        "          QJS_AOT_REG_PIC_OWN_W) {\n"
+        "    E2_PUTWHY(E2_PUT_KIND);\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if ((obj[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] &\n"
         "       QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK) != 0) {\n"
+        "    E2_PUTWHY(E2_PUT_PROTO);\n"
         "    return 0;\n"
         "  }\n"
         "  slot = (JSValue *)(*(unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
         "                     *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
-        "  if (JS_VALUE_GET_TAG(*slot) < 0) {\n"
-        "    return 0;\n"
+        "  {\n"
+        "    JSValue old = *slot;\n"
+        "    if (JS_VALUE_HAS_REF_COUNT(v))\n"
+        "      JS_DupValue(ctx, v);\n"
+        "    *slot = v;\n"
+        "    if (JS_VALUE_HAS_REF_COUNT(old))\n"
+        "      JS_FreeValue(ctx, old);\n"
         "  }\n"
-        "  *slot = v;\n"
         "  return 1;\n"
+        "}\n\n");
+    /* Whether an argument-window call can be a plain C call into a compiled
+       callee: the value is a bytecode function whose bound entry is `entry`,
+       which only that function's digest produces. The same test `q2_entry_is`
+       makes; named separately because a call also reads the function object's
+       pointer out of the value, and doing both here keeps the call site one
+       line. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) int q2_call_entry("
+        "JSValue fnv, const void *entry)\n"
+        "{\n"
+        "  const unsigned char *o, *b;\n"
+        "\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return 0;\n"
+        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
+        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_BYTECODE_FUNCTION)\n"
+        "    return 0;\n"
+        "  b = *(const unsigned char *const *)(o + "
+        "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == entry;\n"
         "}\n\n");
     /* Whether the callee is the function whose bound entry is `entry`. Only
        that function's digest produces that entry, so this is an exact identity
@@ -4251,12 +4705,21 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      *out = JS_MKVAL(JS_TAG_INT, i + 1);\n"
         "      return 1;\n"
         "    }\n"
+        /* QJS_AOT_REG_UN_DEC is INC + 1: the engine's enum is NEG, PLUS, NOT,
+           LNOT, TYPEOF, ... INC, DEC, and the layout header carries NEG and INC
+           because they are the two the old templates needed. */
+        "    if (sub == QJS_AOT_REG_UN_INC + 1) {\n"
+        "      if (i == INT32_MIN) return 0;\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, i - 1);\n"
+        "      return 1;\n"
+        "    }\n"
         "    return 0;\n"
         "  }\n"
         "  if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(a))) {\n"
         "    double d = JS_VALUE_GET_FLOAT64(a);\n"
         "    if (sub == QJS_AOT_REG_UN_NEG) { *out = __JS_NewFloat64(-d); return 1; }\n"
         "    if (sub == QJS_AOT_REG_UN_INC) { *out = __JS_NewFloat64(d + 1); return 1; }\n"
+        "    if (sub == QJS_AOT_REG_UN_INC + 1) { *out = __JS_NewFloat64(d - 1); return 1; }\n"
         "  }\n"
         "  return 0;\n"
         "}\n\n");
@@ -4367,7 +4830,15 @@ int qjsaot_driver_main(int argc, char **argv) {
         "}\n\n");
 
     /* Forward declarations, so a compiled body can name a callee that is
-       emitted later in this file. */
+       emitted later in this file. A call site names the callee's `aot_f_` for
+       its identity check and its `aot_n_` for the call, and either may be
+       emitted after the caller, so both are declared here for every selected
+       function rather than only the ones the caller happens to precede.
+
+       `aot_n_` exists only for a function a compiled caller can enter on the
+       C stack (`light_ok`); a call to anything else takes the generic path.
+       Declaring the prototype unconditionally for a light function is what
+       lets a call site in an earlier body name it. */
     for (i = 0; i < nfuncs; i++) {
       char hex[33];
       if (!sel[i] || !eb[i].buf) continue;
@@ -4377,6 +4848,18 @@ int qjsaot_driver_main(int argc, char **argv) {
           "static JSValue aot_f_%s(JSContext *, JSRegRun *, JSValue *, "
           "uint32_t);\n#define Q2_SEL_%s 1\n",
           hex, hex);
+      /* `Q2_SEL_` says the function's *body* is in this unit. A call site needs
+         more: the native *entry*, which exists only for a body the E2 emitter
+         produced for a light-eligible function. A unit built with
+         `--emit2-only` emits every other function with the old emitter, which
+         emits no entry, so the two must be distinguished or a call site names
+         an `aot_n_` nothing defines. */
+      if (qjs_aot_has_native_entry(i))
+        fprintf(f,
+                "#define Q2_NATIVE_%s 1\n"
+                "static JSValue aot_n_%s(JSContext *, JSRegRun *, JSObject *, "
+                "JSValue, JSValue *, int);\n",
+                hex, hex);
     }
     fprintf(f, "\n");
     /* The leaves of the selected functions, before any caller. */

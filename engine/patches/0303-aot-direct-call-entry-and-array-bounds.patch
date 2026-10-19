@@ -1,0 +1,155 @@
+Subject: Enter compiled functions directly from interpreter calls, and fix the inline array bounds
+
+What this does
+  Lets the register interpreter's call and method-call handlers run a callee
+  that has a compiled body on a light frame, through `qjs_aot_call_light`,
+  instead of `JS_CallInternal`. Corrects the element-count offset the compiled
+  unit's inline array accesses use, and adds the `holey` flag's byte and mask
+  to the generator layout.
+
+Why we need it
+  Binding a compiled body clears the callee's light-call flags, so every call
+  into it from interpreted code took `JS_CallInternal`, `js_regvm_execute` and
+  the compiled entry. Measured on a 5M-call loop, that was 256 ms against 131 ms
+  for the same calls interpreted: compiling a small function made calling it
+  twice as slow. With the direct entry it is 150 ms.
+
+  The layout's `off_object_array_count` was `u.array.u1.size`, the allocated
+  capacity, not the element count. An inline read or store bounded by it
+  reached slots past the array's end: an append leaves the capacity above the
+  count, and those slots are uninitialized.
+
+What it adds
+  regvm_t_call_aot, regvm_t_call_method_aot
+                            - the call handlers' path for a light-eligible
+                              callee with a compiled body; a refused entry or a
+                              nearly full C stack takes the slow call
+  JSAotGenLayout            - `off_object_array_count` is the element count;
+                              new `off_object_holey_byte`, `object_holey_mask`
+
+Bytecode version
+  No.
+
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -98,6 +98,10 @@
+     /* The per-site polymorphic property cache: where the bytecode's allocation
+        is, the stride between sites, and the ways per site. */
+     uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
++    /* The byte and mask of `holey`: an inline array access refuses a holey
++       array, as the engine's own fast store does, since filling a hole has
++       bookkeeping the inline path does not do. */
++    uint32_t off_object_holey_byte, object_holey_mask;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27218,6 +27218,50 @@
+  * "rrrb" (8 bytes) and `ROP_call_method` is "rrrrb" (10), so the resume
+  * address is `ip + 8` or `ip + 10`.
+  */
++#if QJS_AOT
++/* A call whose callee has a compiled body. Binding keeps such a callee off the
++   light paths, so without this the call took `JS_CallInternal`, then
++   `js_regvm_execute`, then the compiled entry: several times the cost of the
++   interpreter's own call. The compiled body runs on a light frame laid after
++   this one, as a compiled caller's call does, and returns its value here. A
++   callee that cannot be entered that way, or a nearly exhausted C stack, takes
++   the slow call, which raises the proper error. */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_aot(REGVM_ARGS)
++{
++    int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
++    JSValue rv;
++    int r;
++
++    REGVM_CAPTURE_IP();
++    if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
++        __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
++    r = qjs_aot_call_light(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
++    if (r == 0)
++        __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
++    if (r < 0)
++        T_FAIL();
++    T_SET_NEXT_P(d, rv, 8);
++}
++
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_aot(REGVM_ARGS)
++{
++    int d = T_REG(1), c = T_REG(3), t = T_REG(5), ab = T_REG(7);
++    int na = T_U8(9);
++    JSValue rv;
++    int r;
++
++    REGVM_CAPTURE_IP();
++    if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
++        __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
++    r = qjs_aot_call_light(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
++    if (r == 0)
++        __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
++    if (r < 0)
++        T_FAIL();
++    T_SET_NEXT_P(d, rv, 10);
++}
++#endif
++
+ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
+ {
+     int c = T_REG(3);
+@@ -27256,6 +27300,10 @@
+                                                 realm);
+                 }
+             }
++#if QJS_AOT
++            if (cb->aot_fn != NULL && cb->aot_light)
++                __attribute__((musttail)) return regvm_t_call_aot(REGVM_PASS);
++#endif
+             /* A light callee's header carries `ret_ip`, which locates the
+                caller. Record, lazy and slow calls can fail before a callee
+                header exists, so they keep the explicit capture. */
+@@ -27307,6 +27355,11 @@
+                                                 realm);
+                 }
+             }
++#if QJS_AOT
++            if (cb->aot_fn != NULL && cb->aot_light)
++                __attribute__((musttail))
++                    return regvm_t_call_method_aot(REGVM_PASS);
++#endif
+             /* see `regvm_t_call`; non-light paths keep the capture */
+             REGVM_CAPTURE_IP();
+             if (likely(regvm_record_eligible(cb)))
+@@ -60101,7 +60154,7 @@
+     out->off_fnbc_aot_poly_sites =
+         (uint32_t)offsetof(JSFunctionBytecode, aot_poly_sites);
+     out->aot_poly_ways = AOT_POLY_WAYS;
+-    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
++    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.count);
+     out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
+     out->class_array = JS_CLASS_ARRAY;
+     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
+@@ -60123,6 +60176,22 @@
+                 break;
+             }
+         }
++    }
++    {
++        /* `holey` likewise. */
++        JSObject o;
++        const uint8_t *q = (const uint8_t *)&o;
++        size_t i;
++
++        memset(&o, 0, sizeof(o));
++        o.holey = 1;
++        for (i = 0; i < sizeof(o); i++) {
++            if (q[i] != 0) {
++                out->off_object_holey_byte = (uint32_t)i;
++                out->object_holey_mask = q[i];
++                break;
++            }
++        }
+     }
+     out->hash = qjs_aot_layout_hash(out);
+ }

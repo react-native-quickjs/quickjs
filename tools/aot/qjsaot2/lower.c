@@ -41,6 +41,7 @@
 #include <ctype.h>
 #include <string.h>
 
+#include "e2.h"
 #include "ir.h"
 #include "quickjs-aot-gen.h"
 #include "prof.h"
@@ -734,11 +735,17 @@ static void q2_emit_exits(FILE *f, const Q2Func *fn) {
       char buf[64];
       Q2ValueId v = e->chk_val[k];
       q2_use(fn, v, Q2_R_TAGGED, buf, sizeof(buf));
+      /* Compared by kind, not with memcmp: an int or a special value
+         initialises only the union's int32, so the rest of its payload bytes
+         are unspecified and two equal values can differ there. */
       fprintf(
           f,
-          "    { JSValue _c = %s; if (memcmp(&_c, &AOT_REG(fr, %d), "
-          "sizeof(JSValue)) != 0) { fprintf(stderr, \"check-locals: pc %%d r "
-          "%%d v%u\\n\", __LINE__, %d); abort(); } }\n",
+          "    { JSValue _c = %s, _r = AOT_REG(fr, %d); int _t = JS_VALUE_GET_TAG(_c), _bad;\n"
+          "      if (_t != JS_VALUE_GET_TAG(_r)) _bad = 1;\n"
+          "      else if (_t < 0) _bad = JS_VALUE_GET_PTR(_c) != JS_VALUE_GET_PTR(_r);\n"
+          "      else if (_t == JS_TAG_FLOAT64) { double _x = JS_VALUE_GET_FLOAT64(_c), _y = JS_VALUE_GET_FLOAT64(_r); _bad = memcmp(&_x, &_y, sizeof(double)) != 0; }\n"
+          "      else _bad = JS_VALUE_GET_INT(_c) != JS_VALUE_GET_INT(_r);\n"
+          "      if (_bad) { fprintf(stderr, \"check-locals: pc %%d r %%d v%u\\n\", __LINE__, %d); abort(); } }\n",
           buf, e->chk_reg[k] * 16, v, e->chk_reg[k]);
     }
     /* A specialised body that keeps leaving is slower than the generic one,
@@ -1984,6 +1991,8 @@ static int q2_typed_binary(FILE *f, const Q2Func *fn, const Q2Insn *in) {
 
 /* 1 lowered it fully, 2 lowered its fast path and deopts on a miss, 0 to fall
    back to the step routine. */
+static int q2_fact_has(const Q2Insn *in, Q2ValueId v, int g);
+
 static int q2_emit_native(
     FILE *f, const Q2Func *fn, int cur_block, const Q2Insn *in) {
   char a[64], b[64];
@@ -2451,7 +2460,7 @@ static int q2_emit_native(
            the group's validated shape, then a constant-offset load. A mismatch
            or a lazy marker exits at this instruction; there is no cache to
            fill, because the generic body serves the case. */
-        int g = (g_em.spec && g_em.sgroup && (unsigned)site < (unsigned)fn->ninsns &&
+        int g = (g_em.spec && g_em.sgroup && (size_t)site < g_em.nsites &&
                  g_em.sgroup[site] >= 0 && g_em.sexec[site])
                     ? g_em.sgroup[site]
                     : -1;
@@ -2461,12 +2470,20 @@ static int q2_emit_native(
              step or a call after entry can refill the cell and move the offset
              (invariant 7). The offset is then this site's own, not the
              representative's. */
-          fprintf(
-              f,
-              "    if (__builtin_expect(q2_shape_of(%s) != gsh%d || "
-              "q2_cell_shape(pic, %d) != gsh%d, 0)) {\n",
-              a, g, site, g);
-          (void)0;
+          Q2ValueId rv0 = in->argval[in->rop == ROP_put_field ? 0 : 1];
+          if (q2_fact_has(in, rv0, g))
+            /* The receiver's shape was checked earlier in this region (no call
+               or step since): only this site's own cell is checked. */
+            fprintf(
+                f,
+                "    if (__builtin_expect(q2_cell_shape(pic, %d) != gsh%d, 0)) {\n",
+                site, g);
+          else
+            fprintf(
+                f,
+                "    if (__builtin_expect(q2_shape_of(%s) != gsh%d || "
+                "q2_cell_shape(pic, %d) != gsh%d, 0)) {\n",
+                a, g, site, g);
           q2_miss(f, in->pc, sid);
           fprintf(f, "    }\n");
           fprintf(
@@ -2636,7 +2653,7 @@ static int q2_emit_native(
       q2_guard(f, in->pc, q2_site());
       q2_op(in, 0, a, sizeof(a));
       q2_op(in, 3, v, sizeof(v));
-      /* The own-slot overwrite inline; a counted value or a prototype receiver
+      /* The own-slot overwrite inline; a prototype receiver
          takes the engine's hit. A miss runs the engine's store, which can call
          a setter and throw, fills the cache and continues compiled. Both
          fallbacks are one out-of-line arm. This arm stays even in a specialised
@@ -2649,7 +2666,7 @@ static int q2_emit_native(
         FILE *m;
         snprintf(
             cond, sizeof(cond),
-            "q2_put_field_hit(pic, %s, %d, %s) || "
+            "q2_put_field_hit(ctx, pic, %s, %d, %s) || "
             "qjs_aot_put_field_own(ctx, f, %s, %d, %s)",
             a, site, v, a, site, v);
         snprintf(
@@ -2771,6 +2788,42 @@ static int q2_emit_native(
         fprintf(f, " }\n");
         return 1;
       }
+      if (dval->rep == Q2_R_I32 && in->nuse >= 2 &&
+          fn->values[in->use[1]].rep == Q2_R_TAGGED) {
+        /* An int counter against a bound of unknown type (typically an
+           argument): test the bound's tag inline, so a number bound costs a
+           compare, as in the interpreter's handler. Only a bound that is not a
+           number takes the engine's compare below, which can call. */
+        char x[64];
+        q2_use_arg(fn, in, 0, Q2_R_I32, x, sizeof(x));
+        q2_op(in, 1, b, sizeof(b));
+        fprintf(f, "    if (__builtin_expect(%s == INT32_MAX, 0))\n", x);
+        q2_miss(f, in->pc, sid);
+        fprintf(f,
+                "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) == JS_TAG_INT, 1) ||\n"
+                "        JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) {\n"
+                "      i%u = %s + 1;\n"
+                "      if (JS_VALUE_GET_TAG(%s) == JS_TAG_INT ? i%u < JS_VALUE_GET_INT(%s) : (double)i%u < JS_VALUE_GET_FLOAT64(%s)) {",
+                b, b, dv, x, b, dv, b, dv, b);
+        q2_emit_edge(f, fn, cur_block, 0);
+        fprintf(f, " }\n    } else {\n");
+        q2_writeback(f, fn, &g_em.pre, g_em.liveb);
+        q2_op(in, 0, a, sizeof(a));
+        fprintf(
+            f,
+            "    { JSValue _n; int _t;\n"
+            "      if (qjs_aot_unary(ctx, QJS_AOT_REG_UN_INC, %s, &_n) < 0) { pc "
+            "= %d; goto exception; }\n"
+            "      qjs_aot_set_reg_p(ctx, fr, %d, _n);\n"
+            "      i%u = JS_VALUE_GET_INT(_n);\n"
+            "      _t = qjs_aot_cmp_take(ctx, QJS_AOT_REG_BIN_LT, _n, %s);\n"
+            "      if (_t < 0) { pc = %d; goto exception; }\n"
+            "      if (_t) {",
+            a, in->pc, off, dv, b, in->pc);
+        q2_emit_edge(f, fn, cur_block, 0);
+        fprintf(f, " } }\n    }\n");
+        return 1;
+      }
       /* Tagged or typed: the engine's increment and compare, which both
          continue compiled on a non-int. The frame is written back first because
          both can call. */
@@ -2787,15 +2840,18 @@ static int q2_emit_native(
       if (dval->rep == Q2_R_I32)
         fprintf(f, "      i%u = JS_VALUE_GET_INT(_n);\n", dv);
       else if (dval->rep == Q2_R_F64)
-        fprintf(f, "      d%u = JS_VALUE_GET_FLOAT64(_n);\n", dv);
+        /* the engine returns an int when the result fits */
+        fprintf(f,
+                "      d%u = JS_VALUE_GET_TAG(_n) == JS_TAG_INT ? "
+                "(double)JS_VALUE_GET_INT(_n) : JS_VALUE_GET_FLOAT64(_n);\n",
+                dv);
       else
         fprintf(f, "      v%u = _n;\n", dv);
       fprintf(
           f,
-          "      _t = qjs_aot_cmp_take(ctx, QJS_AOT_REG_BIN_LT, "
-          "AOT_REG(fr, %d), %s);\n"
+          "      _t = qjs_aot_cmp_take(ctx, QJS_AOT_REG_BIN_LT, _n, %s);\n"
           "      if (_t < 0) { pc = %d; goto exception; }\n",
-          off, b, in->pc);
+          b, in->pc);
       fprintf(f, "      if (_t) {");
       q2_emit_edge(f, fn, cur_block, 0);
       fprintf(f, " } }\n");
@@ -2920,10 +2976,58 @@ static int q2_emit_native(
       fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n", off, dv);
       return 1;
     }
+    case ROP_put_element:
+    case ROP_put_element_xfer: { /* "rrr": object, key, value */
+      /* A dense array's existing element, stored inline; anything else
+         (a hole, a counted value, another class, a setter) is the step. */
+      char c[64];
+      if (g_em.pure || g_em.fast) return 0;
+      q2_op(in, 0, a, sizeof(a));
+      q2_op(in, 1, b, sizeof(b));
+      q2_op(in, 2, c, sizeof(c));
+      fprintf(f, "    if (__builtin_expect(!q2_elem_put(%s, %s, %s), 0)) {\n",
+              a, b, c);
+      q2_emit_fallback(f, fn, cur_block, in, fn->exit_pc);
+      fprintf(f, "    }\n");
+      /* the step's write-back ran only on the slow arm */
+      q2_fb_reset(fn);
+      /* A step ends its block: the slow arm left through the block's edge, so
+         the inline store must take the same edge, with its parameter moves. */
+      {
+        const Q2Block *blk = &fn->blocks[cur_block];
+        if (in == &fn->insns[blk->first_insn + blk->ninsns - 1]) {
+          if (blk->nsucc >= 1) {
+            fprintf(f, "    {");
+            q2_emit_edge(f, fn, cur_block, 0);
+            fprintf(f, " }\n");
+          } else if (in->next >= fn->exit_pc) {
+            fprintf(f, "    return qjs_aot_ret(f);\n");
+          }
+        }
+      }
+      return 1;
+    }
     case ROP_neg:
     case ROP_inc: { /* "rr": d, a */
       int sub = in->rop == ROP_neg ? REG_UN_NEG : REG_UN_INC;
       int off = fn->values[in->def[0]].reg * 16;
+      int rep = fn->values[in->def[0]].rep;
+      if (q2_inc_by_operand(fn, in) && (rep == Q2_R_I32 || rep == Q2_R_F64)) {
+        /* Typed from its operand: an int increment that exits on overflow, or
+           a double one. Nothing goes to the frame. */
+        int sid = q2_site();
+        char x[64];
+        q2_guard(f, in->pc, sid);
+        q2_use_arg(fn, in, 1, rep, x, sizeof(x));
+        if (rep == Q2_R_I32) {
+          fprintf(f, "    if (__builtin_expect(%s == INT32_MAX, 0)) {\n", x);
+          q2_miss(f, in->pc, sid);
+          fprintf(f, "    }\n    i%u = %s + 1;\n", in->def[0], x);
+        } else {
+          fprintf(f, "    d%u = %s + 1.0;\n", in->def[0], x);
+        }
+        return 1;
+      }
       q2_guard(f, in->pc, q2_site());
       q2_op(in, 1, a, sizeof(a));
       /* An int or a float64 inline; -0, an int overflow and a coercion take
@@ -3911,7 +4015,7 @@ static void q2_emit_one(
         hex, hex);
   fprintf(
       f,
-      "static JSValue %s_%s(JSContext *ctx, JSRegRun *f,\n"
+      "E2_TEXT static JSValue %s_%s(JSContext *ctx, JSRegRun *f,\n"
       "                                 JSValue *fr, uint32_t entry_pc)\n"
       "{\n",
       name, hex);
@@ -4150,7 +4254,7 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(
       f,
       "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
-      "static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "E2_TEXT static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
       "                                 JSValue *fr, uint32_t entry_pc)\n"
       "{\n"
       "    (void)q2_spec_off_%s; (void)q2_spec_fail_%s;\n"
@@ -4392,7 +4496,9 @@ int qjsaot2_emit_pure(FILE *out, const JSAotGenFunc *g, char hex[33]) {
   return 1;
 }
 
-int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
+/* The old emitter. `qjsaot2_emit_body` below chooses between this and the E2
+   emitter per function. */
+int q2_old_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   Q2Func fn;
   char msg[256];
   int rc;
@@ -4422,3 +4528,11 @@ int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   q2_free(&fn);
   return rc;
 }
+
+/* The unit builder's per-function hook. With `--emit2` off this is the old
+   emitter and nothing changes. With it on, the function goes to the E2 emitter,
+   which decides for itself whether it can produce a body yet. */
+int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
+  return e2_emit_body_if_on(f, g, hex);
+}
+

@@ -12,7 +12,7 @@ B1 pc=26..47 ctl=0 params=- succ=47()
 B2 pc=47..57 ctl=0 params=- succ=81(v93),57(v93,v94)
      47 const            rop=216  def=93(i32) use=-
      50 const            rop=216  def=94(i32) use=-
-     53 branch           rop=174  def=- use=v94(r3:i32,sync),v86(r5:tagged,sync)
+     53 branch_cmp       rop=170  def=- use=v94(r3:i32,sync),v86(r5:tagged,sync)
 B3 pc=57..65 ctl=0 params=v7=r2,v8=r3 succ=65()
      57 call             rop=72   def=95(tagged) use=v89(r0:tagged,sync)
 B4 pc=65..81 ctl=0 params=- succ=57(v97,v98),81(v97)
@@ -21,7 +21,7 @@ B4 pc=65..81 ctl=0 params=- succ=57(v97,v98),81(v97)
      77 branch_cmp       rop=228  def=98(i32) use=v8(r3:i32),v86(r5:tagged,sync)
 B5 pc=81..88 ctl=0 params=v18=r2 succ=112(v18),88(v18,v99)
      81 const            rop=216  def=99(i32) use=-
-     84 branch           rop=174  def=- use=v99(r3:i32,sync),v86(r5:tagged,sync)
+     84 branch_cmp       rop=170  def=- use=v99(r3:i32,sync),v86(r5:tagged,sync)
 B6 pc=88..96 ctl=0 params=v22=r2,v23=r3 succ=96()
      88 call             rop=72   def=100(tagged) use=v92(r1:tagged,sync)
 B7 pc=96..112 ctl=0 params=- succ=88(v102,v103),112(v102)
@@ -36,7 +36,7 @@ B9 pc=118..126 ctl=0 params=- succ=126(v89,v92,v33,v104)
 B10 pc=126..138 ctl=0 params=v38=r0,v39=r1,v40=r2,v41=r4 succ=178(v38,v39,v40,v41),138()
     126 get_local        rop=14   def=106(tagged) use=-
     131 const            rop=216  def=107(i32) use=-
-    134 branch           rop=174  def=- use=v106(r6:tagged,sync),v107(r7:i32,sync)
+    134 branch_cmp       rop=170  def=- use=v106(r6:tagged,sync),v107(r7:i32,sync)
 B11 pc=138..156 ctl=0 params=- succ=156()
     138 get_field        rop=39   def=108(tagged) use=v41(r4:tagged,sync)
     149 fallback         rop=31   def=109(tagged) use=-

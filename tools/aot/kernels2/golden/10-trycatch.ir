@@ -3,7 +3,7 @@ F inner blocks=5 insns=9 values=10 regs=4 ctl_max=0
 B0 pc=0..12 ctl=0 params=- succ=43(),12()
       0 get_arg          rop=16   def=4(tagged) use=-
       5 const            rop=216  def=5(i32) use=-
-      8 branch           rop=174  def=- use=v4(r0:tagged,sync),v5(r1:i32,sync)
+      8 branch_cmp       rop=170  def=- use=v4(r0:tagged,sync),v5(r1:i32,sync)
 B1 pc=12..30 ctl=0 params=- succ=30()
      12 get_global       rop=20   def=6(tagged) use=-
      22 fallback         rop=1    def=7(tagged) use=-

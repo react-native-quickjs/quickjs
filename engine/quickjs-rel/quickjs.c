@@ -37,6 +37,20 @@
 #include <link.h>  /* dl_iterate_phdr, for the image load base */
 #endif
 
+#ifndef QJS_FNSAMPLE
+#define QJS_FNSAMPLE 0
+#endif
+
+#if QJS_FNSAMPLE && !defined(_WIN32)
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/time.h>
+#include <time.h>
+#if !defined(_WIN32) && (QJS_AOT_PROFILE || QJS_FNSAMPLE)
+#include <link.h>  /* dl_iterate_phdr, for the executable's load base */
+#endif
+#endif
+
 #ifndef QJS_JSON_LAZY_DEFAULT
 #define QJS_JSON_LAZY_DEFAULT 0
 #endif
@@ -56,6 +70,12 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+#if QJS_FNSAMPLE && !defined(_WIN32)
+static int fn_sample_start(JSRuntime *rt);
+static void fn_sample_stop(JSRuntime *rt);
+struct JSFunctionBytecode;
+static void fn_sample_name(const struct JSFunctionBytecode *b);
+#endif
 
 #include "libregexp.h"
 #include "dtoa.h"
@@ -705,6 +725,21 @@ struct JSRuntime {
     uint8_t aot_prof_prev_valid;
 #endif
 
+    /* The innermost light register frame, or NULL. Published on every light
+       call and cleared on every push of a real JSStackFrame (which saves it in
+       `JSStackFrame.rv_light`), so a walker can rebuild the logical stack.
+       Present in the stack-only build too, where it stays NULL.
+
+       It sits before the conditional blocks below on purpose. The generated
+       unit needs its offset (a native entry publishes the frame it builds),
+       and the generator is built with QJS_AOT_GEN but not QJS_AOT, so a field
+       placed after a build-dependent member would have two different offsets
+       and the layout hash would disagree between the two builds. That
+       disagreement is silent: the engine simply refuses every unit at bind and
+       the whole unit runs interpreted. Everything the unit reads an offset of
+       must therefore precede every `#if` in this struct. */
+    struct JSRegRun *regvm_cur;
+
 #if QJS_AOT
     /* AOT call-site bindings, indexed by the unit's site id. Lazily grown. */
     JSAotSite *aot_sites;
@@ -739,11 +774,6 @@ struct JSRuntime {
     struct JSRegArenaChunk *regvm_chunk;
     size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
 #endif
-    /* The innermost light register frame, or NULL. Published on every light
-       call and cleared on every push of a real JSStackFrame (which saves it in
-       `JSStackFrame.rv_light`), so a walker can rebuild the logical stack.
-       Present in the stack-only build too, where it stays NULL. */
-    struct JSRegRun *regvm_cur;
     JSMegaEntry *mega_cache;
     uint32_t shape_free_epoch;
     void *user_opaque;
@@ -3675,6 +3705,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     rt->current_exception = JS_UNINITIALIZED;
 
+#if QJS_FNSAMPLE && !defined(_WIN32)
+    fn_sample_start(rt);
+#endif
     return rt;
  fail:
     JS_FreeRuntime(rt);
@@ -3994,6 +4027,12 @@ void JS_FreeRuntime(JSRuntime *rt)
 #if QJS_AOT
     if (getenv("QJS_AOT_STATS"))
         js_aot_stats_dump(rt);
+#endif
+#if QJS_FNSAMPLE && !defined(_WIN32)
+    /* Stop the timer and write the table before any function is freed: the
+       entries name functions by bytecode address, and an address reused by a
+       later function would be misattributed. */
+    fn_sample_stop(rt);
 #endif
     struct list_head *el, *el1;
     bool leak = false;
@@ -25490,6 +25529,358 @@ static inline JSRegRun *regvm_light_head(JSRegRun *p)
     return (p != NULL && p->sf == NULL) ? p : NULL;
 }
 
+#if QJS_FNSAMPLE && !defined(_WIN32)
+/*
+ * Per-function sampling profiler. A `SIGPROF` timer takes the innermost
+ * function's bytecode from the logical stack and one sample for it. The table
+ * has no allocation and no lock, so the handler touches only fixed storage.
+ *
+ * `in_unit` alone is too coarse to say why a function is slow: "outside the
+ * generated text" covers the AOT helper functions, the interpreter (which runs
+ * a function the emitter refused or switched off) and genuine engine work such
+ * as GC or allocation, and only the last is out of an emitter's reach. So the
+ * sample's program counter is kept as well, and the reader resolves it to a
+ * symbol. The frame still decides which function a sample belongs to, because
+ * mapping a program counter back to a function needs the unit's symbols and
+ * they are not always present.
+ */
+#define FNSAMPLE_SLOTS 8192
+/* The PC ring: one sample's program counter per entry. A million entries
+   covers a two-minute run at 200 us. When it fills, recording stops and the
+   number dropped is written out, so a truncated table is visible. */
+#define FNSAMPLE_PCS (1024 * 1024)
+/* The sampling period. It has to be delivered as asked, which is what turns a
+   function's sample share into its share of the run; see fn_sample_start for
+   why the request lands on wall time and not on the CPU clock. */
+#define FNSAMPLE_PERIOD_NS 200000L
+typedef struct FnSampleEntry {
+    const JSFunctionBytecode *b;
+    char name[120];
+    char pos[80];
+    uint32_t samples;
+    uint32_t in_unit;
+    uint8_t named;
+    /* Whether the bytecode had a native entry at teardown. A function without
+       one was never compiled or was switched off, which is a different problem
+       from being slow inside the generated code. */
+    uint8_t aot_fn;
+} FnSampleEntry;
+
+/* One sample: its program counter and the table slot it was charged to. The
+   slot is an index, not a pointer, so the dump needs no lookup. */
+typedef struct FnSamplePc {
+    uintptr_t pc;
+    uint32_t slot;
+} FnSamplePc;
+
+static FnSampleEntry fn_sample_tab[FNSAMPLE_SLOTS];
+static FnSamplePc fn_sample_pcs[FNSAMPLE_PCS];
+static uint32_t fn_sample_npc;      /* entries used in the ring */
+static uint64_t fn_sample_pc_drop;  /* samples taken after it filled */
+static JSRuntime *fn_sample_rt;
+static uint64_t fn_sample_total, fn_sample_nojs;
+static struct timeval fn_sample_t0;
+
+extern char __start_e2text[] __attribute__((weak));
+extern char __stop_e2text[] __attribute__((weak));
+
+/* The executable's load base: a sample's program counter is relative to where
+   the loader put the image, and the symbols `nm` prints are not. The first
+   entry of the phdr walk is the main executable. */
+/* The objects a sample's program counter can fall in: the executable, then
+   every shared library the loader mapped. A sample in libc is allocator time,
+   not "other", so the reader needs a base and a name for each. */
+#define FNSAMPLE_OBJS 32
+typedef struct FnSampleObj {
+    uintptr_t addr;     /* the load base */
+    char name[96];      /* the mapped path, or "exe" */
+} FnSampleObj;
+
+static FnSampleObj fn_sample_objs[FNSAMPLE_OBJS];
+static int fn_sample_nobj;
+
+static int fn_sample_phdr(struct dl_phdr_info *info, size_t size, void *data)
+{
+    FnSampleObj *o;
+    const char *nm = info->dlpi_name;
+
+    (void)size;
+    (void)data;
+    if (fn_sample_nobj >= FNSAMPLE_OBJS)
+        return 1;
+    o = &fn_sample_objs[fn_sample_nobj++];
+    o->addr = (uintptr_t)info->dlpi_addr;
+    /* The first entry is the main executable, whose dlpi_name is empty. */
+    if (nm == NULL || nm[0] == '\0')
+        snprintf(o->name, sizeof(o->name), "exe");
+    else
+        snprintf(o->name, sizeof(o->name), "%s", nm);
+    /* A vDSO or a preloaded object has no file to nm; mark it so the reader
+       does not try. */
+    return 0; /* keep walking: every object is a candidate */
+}
+
+static FnSampleEntry *fn_sample_slot(const JSFunctionBytecode *b)
+{
+    size_t h = ((size_t)(uintptr_t)b >> 4) & (FNSAMPLE_SLOTS - 1);
+    size_t i;
+
+    for (i = 0; i < FNSAMPLE_SLOTS; i++) {
+        FnSampleEntry *e = &fn_sample_tab[(h + i) & (FNSAMPLE_SLOTS - 1)];
+        if (e->b == b)
+            return e;
+        if (e->b == NULL)
+            return e;
+    }
+    return NULL;
+}
+
+/* The innermost function, by the same rule the debugger and the stack
+   unwinder use: the topmost light frame if one is running, else the innermost
+   real frame. */
+static const JSFunctionBytecode *fn_sample_current(void)
+{
+    JSRuntime *rt = fn_sample_rt;
+    JSRegRun *lf;
+    JSStackFrame *sf;
+
+    if (rt == NULL)
+        return NULL;
+    lf = regvm_light_head(rt->regvm_cur);
+    if (lf != NULL)
+        return lf->b;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+        JSValue f = sf->cur_func;
+        if (JS_VALUE_GET_TAG(f) == JS_TAG_OBJECT) {
+            JSObject *p = JS_VALUE_GET_OBJ(f);
+            if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+                return p->u.func.function_bytecode;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* The key reserved for a sample with no JS function on the stack. */
+#define FNSAMPLE_NOJS_KEY 0xffffffffu
+
+/* Append one sample to the PC ring. A plain increment against a fixed bound:
+   no allocation, no lock, nothing that a signal handler must not do. */
+static void fn_sample_record(uint32_t key, uintptr_t pc)
+{
+    if (pc == 0)
+        return;
+    if (fn_sample_npc < FNSAMPLE_PCS) {
+        FnSamplePc *r = &fn_sample_pcs[fn_sample_npc++];
+
+        r->pc = pc;
+        r->slot = key;
+    } else {
+        fn_sample_pc_drop++;
+    }
+}
+
+static void fn_sample_handler(int sig, siginfo_t *info, void *uc)
+{
+    const JSFunctionBytecode *b = fn_sample_current();
+    FnSampleEntry *e;
+    uintptr_t pc = 0;
+
+    (void)sig;
+    (void)info;
+    fn_sample_total++;
+#if defined(__linux__) && defined(__x86_64__)
+    pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+#endif
+    if (b == NULL) {
+        /* A "no JS" sample still records its program counter under the
+           reserved key, so the reader can say which C code was running
+           (GC, allocation, a builtin) rather than lumping it all together. */
+        fn_sample_nojs++;
+        fn_sample_record(FNSAMPLE_NOJS_KEY, pc);
+        return;
+    }
+    e = fn_sample_slot(b);
+    if (e == NULL)
+        return;
+    e->b = b;
+    e->samples++;
+    if (__start_e2text != NULL && pc >= (uintptr_t)__start_e2text &&
+        pc < (uintptr_t)__stop_e2text)
+        e->in_unit++;
+    /* Keep the program counter too, so the reader can say which kind of time
+       this was: inside the unit, an AOT helper, the interpreter, or engine
+       work such as GC. */
+    fn_sample_record((uint32_t)(e - fn_sample_tab), pc);
+}
+
+/* The timer id while sampling is on, so the timer is deleted and not leaked
+   when the runtime goes away. */
+static timer_t fn_sample_timer;
+
+/* Install the timer and handler when the runtime starts and the output is
+   named. Returns 1 when sampling is on.
+
+   The period must actually be 200 us, or a sample's share of the total is not
+   a share of the run. `setitimer` rounds up to the kernel tick (1 ms here), and
+   so does a POSIX timer on either the process's CPU clock or `CLOCK_MONOTONIC`
+   on this kernel's `ITIMER_PROF` path: measured on the development machine, a
+   200 us request on `CLOCK_PROCESS_CPUTIME_ID` is delivered every ~1000 us,
+   while the same request on `CLOCK_MONOTONIC` is delivered every 200 us.
+
+   So the timer runs on wall time, and its samples answer "which function is
+   running" at the granularity the measurement needs. Wall time measured over
+   the run is written out as `W`, so a reader converts samples to seconds with
+   the delivery that actually happened rather than with the request. The cost is
+   that a sample taken while the process is not running JS lands in `no_js`
+   instead of being deferred: for a benchmark that keeps the CPU busy that is
+   the honest answer, and `no_js` is reported so the bias is visible. */
+static int fn_sample_start(JSRuntime *rt)
+{
+    struct sigaction sa;
+    struct itimerspec its;
+    struct sigevent sev;
+
+    if (getenv("QJS_FNSAMPLE_OUT") == NULL || getenv("QJS_FNSAMPLE_OUT")[0] == '\0')
+        return 0;
+    fn_sample_rt = rt;
+    gettimeofday(&fn_sample_t0, NULL);
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fn_sample_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, NULL) < 0)
+        return 0;
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGPROF;
+    sev.sigev_value.sival_ptr = rt;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &fn_sample_timer) == 0) {
+        its.it_interval.tv_sec = 0;
+        its.it_interval.tv_nsec = FNSAMPLE_PERIOD_NS;
+        its.it_value = its.it_interval;
+        if (timer_settime(fn_sample_timer, 0, &its, NULL) == 0)
+            return 1;
+        timer_delete(fn_sample_timer);
+    }
+    /* No POSIX timer: the tick-resolution fallback. */
+    {
+        struct itimerval it;
+
+        memset(&it, 0, sizeof(it));
+        it.it_interval.tv_usec = 200;
+        it.it_value.tv_usec = 200;
+        return setitimer(ITIMER_PROF, &it, NULL) == 0;
+    }
+}
+
+/* Name the entries. Called when a bytecode is freed, while its name and
+   position are still readable, and again at runtime teardown for the rest. */
+static void fn_sample_name(const struct JSFunctionBytecode *b)
+{
+    FnSampleEntry *e = fn_sample_slot(b);
+    char *p;
+    const char *file;
+
+    if (e == NULL || e->b == NULL || e->b != b || e->named)
+        return;
+    file = JS_AtomGetStrRT(fn_sample_rt, e->pos, sizeof(e->pos), b->filename);
+    p = e->pos + strlen(e->pos);
+    snprintf(p, sizeof(e->pos) - (size_t)(p - e->pos), ":%d:%d", b->line_num,
+             b->col_num);
+    if (b->func_name != JS_ATOM_NULL)
+        JS_AtomGetStrRT(fn_sample_rt, e->name, sizeof(e->name), b->func_name);
+    else
+        snprintf(e->name, sizeof(e->name), "<anon>");
+    e->named = 1;
+}
+
+static void fn_sample_stop(JSRuntime *rt)
+{
+    struct itimerval it;
+    int i;
+
+    if (rt != fn_sample_rt)
+        return;
+    memset(&it, 0, sizeof(it));
+    timer_delete(fn_sample_timer);
+    setitimer(ITIMER_PROF, &it, NULL);
+    {
+        const char *out = getenv("QJS_FNSAMPLE_OUT");
+        FILE *f = out != NULL ? fopen(out, "w") : NULL;
+
+        if (f != NULL) {
+            struct timeval t1;
+            double secs;
+            const char *st;
+
+            gettimeofday(&t1, NULL);
+            secs = (double)(t1.tv_sec - fn_sample_t0.tv_sec) +
+                   (double)(t1.tv_usec - fn_sample_t0.tv_usec) * 1e-6;
+            fprintf(f, "T %" PRIu64 " %" PRIu64 "\n", fn_sample_total,
+                    fn_sample_nojs);
+            /* The wall time the table covers, so a reader can check the
+               delivered period (total / W) instead of trusting the request,
+               and turn a share into seconds. */
+            fprintf(f, "W %.6f\n", secs);
+            /* The PC ring is written first so a reader can bucket samples
+               before it needs the function table, and so the load base it
+               resolves against is already known. Reading /proc/self/maps here
+               and never in the handler keeps the handler allocation-free. */
+            fn_sample_nobj = 0;
+            dl_iterate_phdr(fn_sample_phdr, NULL);
+            for (i = 0; i < fn_sample_nobj; i++)
+                fprintf(f, "B %" PRIxPTR " %s\n", fn_sample_objs[i].addr,
+                        fn_sample_objs[i].name);
+            for (i = 0; i < FNSAMPLE_SLOTS; i++) {
+                FnSampleEntry *e = &fn_sample_tab[i];
+                if (e->b == NULL || e->samples == 0)
+                    continue;
+                if (!e->named)
+                    fn_sample_name(e->b);
+                /* Why the function is not running generated code, which is
+                   not the same question as whether it has a native entry:
+
+                     bound     the unit's entry is in use;
+                     disabled  it was bound and then switched off, because its
+                               guards kept failing (the exit policy D4
+                               replaces);
+                     absent    it is not in the unit at all;
+                     unbound   it was never offered for binding.
+
+                   The distinction matters because `disabled` is a policy
+                   outcome that a better exit policy fixes, while `absent`
+                   means the unit was built without it. `aot_state` is 0
+                   unknown, 1 bound, 2 known-absent, and stays 1 after an
+                   unbind, which is what separates disabled from absent. */
+#if QJS_AOT || QJS_AOT_GEN
+                if (e->b->aot_fn != NULL)
+                    st = "bound";
+                else if (e->b->aot_state == 1)
+                    st = "disabled";
+                else if (e->b->aot_state == 2)
+                    st = "absent";
+                else
+                    st = "unbound";
+#else
+                st = "absent";
+#endif
+                fprintf(f, "F %u %u key=%d state=%s %s %s\n", e->samples,
+                        e->in_unit, i, st,
+                        e->named ? e->name : "<anon>", e->pos);
+            }
+            /* P <key> <pc hex>, one per in-JS sample, in sample order. */
+            for (i = 0; i < (int)fn_sample_npc; i++)
+                fprintf(f, "P %u %" PRIxPTR "\n", fn_sample_pcs[i].slot,
+                        fn_sample_pcs[i].pc);
+            fprintf(f, "O %" PRIu64 "\n", fn_sample_pc_drop);
+            fclose(f);
+        }
+    }
+    fn_sample_rt = NULL;
+}
+#endif /* QJS_FNSAMPLE */
+
 /* The debugger entry points walk the logical stack, innermost first: the light
    frames above `current_stack_frame`, then each real frame followed by the
    light chain saved under it in `rv_light`. */
@@ -27218,6 +27609,50 @@ static const JSValue regvm_undefined_value = { { .int32 = 0 }, JS_TAG_UNDEFINED 
  * "rrrb" (8 bytes) and `ROP_call_method` is "rrrrb" (10), so the resume
  * address is `ip + 8` or `ip + 10`.
  */
+#if QJS_AOT
+/* A call whose callee has a compiled body. Binding keeps such a callee off the
+   light paths, so without this the call took `JS_CallInternal`, then
+   `js_regvm_execute`, then the compiled entry: several times the cost of the
+   interpreter's own call. The compiled body runs on a light frame laid after
+   this one, as a compiled caller's call does, and returns its value here. A
+   callee that cannot be entered that way, or a nearly exhausted C stack, takes
+   the slow call, which raises the proper error. */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_aot(REGVM_ARGS)
+{
+    int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
+    JSValue rv;
+    int r;
+
+    REGVM_CAPTURE_IP();
+    if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
+        __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+    r = qjs_aot_call_light(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
+    if (r == 0)
+        __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+    if (r < 0)
+        T_FAIL();
+    T_SET_NEXT_P(d, rv, 8);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_aot(REGVM_ARGS)
+{
+    int d = T_REG(1), c = T_REG(3), t = T_REG(5), ab = T_REG(7);
+    int na = T_U8(9);
+    JSValue rv;
+    int r;
+
+    REGVM_CAPTURE_IP();
+    if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
+        __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+    r = qjs_aot_call_light(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
+    if (r == 0)
+        __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+    if (r < 0)
+        T_FAIL();
+    T_SET_NEXT_P(d, rv, 10);
+}
+#endif
+
 static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
 {
     int c = T_REG(3);
@@ -27256,6 +27691,10 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                                                 realm);
                 }
             }
+#if QJS_AOT
+            if (cb->aot_fn != NULL && cb->aot_light)
+                __attribute__((musttail)) return regvm_t_call_aot(REGVM_PASS);
+#endif
             /* A light callee's header carries `ret_ip`, which locates the
                caller. Record, lazy and slow calls can fail before a callee
                header exists, so they keep the explicit capture. */
@@ -27307,6 +27746,11 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                                                 realm);
                 }
             }
+#if QJS_AOT
+            if (cb->aot_fn != NULL && cb->aot_light)
+                __attribute__((musttail))
+                    return regvm_t_call_method_aot(REGVM_PASS);
+#endif
             /* see `regvm_t_call`; non-light paths keep the capture */
             REGVM_CAPTURE_IP();
             if (likely(regvm_record_eligible(cb)))
@@ -60101,7 +60545,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_fnbc_aot_poly_sites =
         (uint32_t)offsetof(JSFunctionBytecode, aot_poly_sites);
     out->aot_poly_ways = AOT_POLY_WAYS;
-    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
+    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.count);
     out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
     out->class_array = JS_CLASS_ARRAY;
     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
@@ -60124,6 +60568,40 @@ void js_aot_gen_layout(JSAotGenLayout *out)
             }
         }
     }
+    {
+        /* `holey` likewise. */
+        JSObject o;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+
+        memset(&o, 0, sizeof(o));
+        o.holey = 1;
+        for (i = 0; i < sizeof(o); i++) {
+            if (q[i] != 0) {
+                out->off_object_holey_byte = (uint32_t)i;
+                out->object_holey_mask = q[i];
+                break;
+            }
+        }
+    }
+    /* The light-frame header a generated native entry writes itself. It builds
+       the same frame `regvm_light_fill` builds, field for field, so the
+       offsets are the frame's own and the flag values are the engine's. */
+    out->off_regrun_ret_ip = (uint32_t)offsetof(JSRegRun, ret_ip);
+    out->off_regrun_fr = (uint32_t)offsetof(JSRegRun, fr);
+    out->off_regrun_var_refs = (uint32_t)offsetof(JSRegRun, var_refs);
+    out->off_regrun_hdr_pack = (uint32_t)offsetof(JSRegRun, hdr_pack);
+    out->off_regrun_cap_ip = (uint32_t)offsetof(JSRegRun, cap_ip);
+    out->off_fnbc_realm = (uint32_t)offsetof(JSFunctionBytecode, realm);
+    out->off_rt_regvm_cur = (uint32_t)offsetof(JSRuntime, regvm_cur);
+    out->off_rt_stack_limit = (uint32_t)offsetof(JSRuntime, stack_limit);
+    out->off_object_func_var_refs = (uint32_t)offsetof(JSObject, u.func.var_refs);
+    out->light_prefix_slots = REGVM_LIGHT_PREFIX_SLOTS;
+    out->regvm_flag_light = REGVM_FLAG_LIGHT;
+    out->regvm_flag_c_entry = REGVM_FLAG_C_ENTRY;
+    out->regvm_flag_stack = REGVM_FLAG_STACK;
+    out->regvm_flag_trivial_ret = REGVM_FLAG_TRIVIAL_RET;
+    out->regvm_flag_same_realm = REGVM_FLAG_SAME_REALM;
     out->hash = qjs_aot_layout_hash(out);
 }
 
@@ -62277,6 +62755,27 @@ int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
     return JS_IsException(ret) ? -1 : 1;
 }
 
+/* Allocate the callee's property-cache table if it has none, so a generated
+   native entry can publish a frame whose inline handlers read the table with no
+   NULL test. The engine's own light call checks this before it fills the frame;
+   a native entry that fills the frame itself has to do the same. Allocating is a
+   safepoint, which is exactly why it belongs here, before the frame exists,
+   rather than inside a body that has already published one. */
+QJS_AOT_STUB int qjs_aot_pic_ensure(JSContext *ctx, JSObject *co)
+{
+    JSFunctionBytecode *cb;
+
+    if (JS_VALUE_GET_TAG(JS_MKPTR(JS_TAG_OBJECT, co)) != JS_TAG_OBJECT)
+        return 0;
+    cb = co->u.func.function_bytecode;
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(ctx->rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    return 0;
+}
+
 /* A compiled function calling a compiled **leaf**: a callee whose cross-call
    state is a frame on the C stack instead of the arena. That removes the
    arena bump, the caller seal, the push/pop and the free walk that
@@ -62600,6 +63099,169 @@ QJS_AOT_STUB int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic
     *out = js_dup(v);
     return 1;
 }
+
+/* ------------------------------------------------------------------------ */
+/* The pieces a generated native entry needs to build a light frame itself.  */
+/*                                                                          */
+/* A compiled call to a compiled callee that the generator emitted a native  */
+/* entry for is a plain C call: the caller builds the callee's light frame   */
+/* in its own stack buffer and calls the callee's speculative body. The     */
+/* frame has to be the one `regvm_light_fill` builds, because every handler  */
+/* and every cold path that can run on it reads it, and a field the engine   */
+/* writes but the caller forgets is a crash much later. So the few pieces    */
+/* that are not a plain store live here, and `qjs_aot_frame_check` exists to  */
+/* prove the stores agree with the fill.                                    */
+/* ------------------------------------------------------------------------ */
+
+/* Nothing lowers the arena top below a sealed frame while the activation runs,
+   so a callee that allocates lands above the caller's frame instead of over
+   it. Idempotent and monotonic; a no-op for a frame outside the arena. */
+QJS_AOT_STUB void qjs_aot_seal(JSContext *ctx, JSRegRun *f)
+{
+#if QJS_REGVM_RECORD
+    regvm_light_seal(ctx->rt, f);
+#else
+    (void)ctx;
+    (void)f;
+#endif
+}
+
+/* A native entry checks the C stack itself, so a deep recursion of compiled
+   functions raises the interpreter's own RangeError instead of running into
+   the guard page. The message and the constructor must match the
+   interpreter's exactly: a test compares them. */
+QJS_AOT_STUB JSValue qjs_aot_throw_stack_overflow(JSContext *ctx)
+{
+    return JS_ThrowStackOverflow(ctx);
+}
+
+/* The callee's frame is the caller's stack buffer, so returning is just the
+   release of what the variable area owns. A function with no variable area has
+   nothing to release; `regvm_light_free` handles both and also frees the
+   receiver of a derived construction. */
+QJS_AOT_STUB void qjs_aot_light_release(JSContext *ctx, JSRegRun *f)
+{
+#if QJS_REGVM_RECORD
+    regvm_light_free(ctx->rt, f);
+#else
+    (void)ctx;
+    (void)f;
+#endif
+}
+
+/* Check builds only (`E2_CHECK=1`): build the frame the engine would have
+   built for this call and abort if the native entry's stores disagree with it.
+   Compared field by field rather than byte for byte, because the native entry
+   legitimately differs from `regvm_light_fill` in three places: it has no
+   destination register (a compiled caller has none), it has no resume address
+   (a compiled call returns to C), and it marks its frame `REGVM_FLAG_C_ENTRY`
+   and `REGVM_FLAG_STACK` so a deopt or a throw inside it finishes on this very
+   frame and the seal knows the frame is on the C stack rather than in the
+   arena. Those three are checked separately; everything else must match. */
+QJS_AOT_STUB void qjs_aot_frame_check(JSContext *ctx, JSRegRun *nf, JSObject *co,
+                                      JSRegRun *caller_f, JSValue *argv, int argc,
+                                      JSValue this_obj)
+{
+#if QJS_REGVM_RECORD && defined(E2_CHECK)
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+    uint8_t *mem;
+    JSRegRun *ref;
+    JSValue *regs;
+    size_t need;
+    int k, vc, base;
+    uint16_t want_flags;
+
+    need = (size_t)cb->regvm_light_need + 16;
+    mem = alloca(need);
+    ref = (JSRegRun *)(((uintptr_t)mem + 15) & ~(uintptr_t)15);
+    regvm_light_fill(ctx, ref, co, cb, caller_f, 0, NULL, argv, argc,
+                     this_obj, &regs);
+#define E2_CHK(field)                                                          \
+    do {                                                                       \
+        if (nf->field != ref->field) {                                          \
+            fprintf(stderr,                                                     \
+                    "E2 frame check: %s differs for %s (native %p, engine %p)\n", \
+                    #field, cb->func_name ? "fn" : "?", (void *)(uintptr_t)nf->field, \
+                    (void *)(uintptr_t)ref->field);                             \
+            abort();                                                            \
+        }                                                                       \
+    } while (0)
+    E2_CHK(caller);
+    E2_CHK(b);
+    E2_CHK(pic);
+    E2_CHK(fr);
+    E2_CHK(var_refs);
+    E2_CHK(var_buf);
+    E2_CHK(arg_buf);
+    E2_CHK(func);
+    E2_CHK(cap_ip);
+    E2_CHK(sf);
+#undef E2_CHK
+    if (nf->ret_ip != NULL) {
+        fprintf(stderr, "E2 frame check: ret_ip is set for a compiled call\n");
+        abort();
+    }
+    if (JS_VALUE_GET_TAG(nf->this_obj) != JS_VALUE_GET_TAG(ref->this_obj) ||
+        JS_VALUE_GET_PTR(nf->this_obj) != JS_VALUE_GET_PTR(ref->this_obj)) {
+        fprintf(stderr, "E2 frame check: this_obj differs\n");
+        abort();
+    }
+    if (nf->argc != (uint16_t)argc) {
+        fprintf(stderr, "E2 frame check: argc is %u, not %d\n",
+                (unsigned)nf->argc, argc);
+        abort();
+    }
+    /* ret_dst: a compiled caller has no destination register. */
+    if (nf->ret_dst != 0) {
+        fprintf(stderr, "E2 frame check: ret_dst is %u, not 0\n",
+                (unsigned)nf->ret_dst);
+        abort();
+    }
+    if (nf->nctl != 0) {
+        fprintf(stderr, "E2 frame check: nctl is %u, not 0\n",
+                (unsigned)nf->nctl);
+        abort();
+    }
+    /* The flag word must also carry the two bits the native entry adds, and
+       nothing else may differ. */
+    want_flags = ref->flags | REGVM_FLAG_C_ENTRY | REGVM_FLAG_STACK;
+    if (nf->flags != want_flags) {
+        fprintf(stderr, "E2 frame check: flags are 0x%x, not 0x%x\n",
+                (unsigned)nf->flags, (unsigned)want_flags);
+        abort();
+    }
+    /* The variable area and the register file must be filled with undefined,
+       or a handler reads a stale stack word. */
+    vc = cb->var_count;
+#if QJS_DRC
+    if (cb->var_count <= 255)
+        vc = cb->regvm_var_count;
+#endif
+    if (vc != 0) {
+        if (nf->var_buf == NULL) {
+            fprintf(stderr, "E2 frame check: var_buf is NULL but vc is %d\n", vc);
+            abort();
+        }
+        for (k = 0; k < vc; k++) {
+            if (JS_VALUE_GET_TAG(nf->var_buf[k]) != JS_TAG_UNDEFINED) {
+                fprintf(stderr, "E2 frame check: variable %d is not undefined\n", k);
+                abort();
+            }
+        }
+    }
+    base = 0;
+    for (k = 0; k < cb->regvm_reg_count; k++) {
+        if (JS_VALUE_GET_TAG(nf->fr[k]) != JS_TAG_UNDEFINED) {
+            fprintf(stderr, "E2 frame check: register %d is not undefined\n",
+                    k + base);
+            abort();
+        }
+    }
+#else
+    (void)ctx; (void)nf; (void)co; (void)caller_f; (void)argv; (void)argc;
+    (void)this_obj;
+#endif
+}
 #endif /* QJS_AOT */
 
 #if QJS_AOT_GEN
@@ -62674,6 +63336,19 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                 g->code = b->regvm_code;
                 g->light_ok = b->regvm_light != 0;
                 g->light_need = (int)b->regvm_light_need;
+                /* The variable area's size, from the engine's own rule, so a
+                   native entry fills and releases exactly the slots the engine
+                   does. `light_need` already accounts for it but does not say
+                   whether the area exists at all. */
+                {
+                    int lvc = b->var_count;
+
+#if QJS_DRC
+                    if (b->var_count <= 255)
+                        lvc = b->regvm_var_count;
+#endif
+                    g->light_var_count = lvc;
+                }
                 /* The numeric pool entries, so a folded `binary_cpool` on one
                    can be a C literal at generation time. */
                 if (b->cpool_count > 0 && b->cpool != NULL) {
@@ -72931,7 +73606,7 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
 /* create a function object from a function definition. The function
    definition is freed. All the child functions are also created. It
    must be done this way to resolve all the variables. */
-#if !QJS_REGVM || QJS_AOT
+#if !QJS_REGVM
 static void js_scan_argv_safe(JSFunctionBytecode *b);
 #endif
 static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
@@ -73099,10 +73774,11 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     closure_var_offset = function_size;
     function_size += fd->closure_var_count * sizeof(*fd->closure_var);
     byte_code_offset = function_size;
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     /* A register build keeps no stack bytecode after lowering; the slot stays
        in the struct, empty. args_captured/argv_safe come from the register
-       program below. */
+       program below. Keyed on QJS_REGVM alone: the bundle format does not
+       depend on whether AOT is enabled. */
 #else
     function_size += fd->byte_code.size;
 #endif
@@ -73166,7 +73842,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->ic_count = fd->ic_count;
     b->ic_entries = JS_IC_ENTRIES;
 
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     /* No stack bytecode: byte_code_buf stays NULL and byte_code_len 0.
        fd->byte_code lives until the register block, for the cross-check below,
        then is freed. */
@@ -73363,6 +74039,11 @@ static int regvm_free_atom(void *opaque, uint32_t *patom)
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
     int i;
+#if QJS_FNSAMPLE && !defined(_WIN32)
+    /* Copy the name and source position out while they are still valid; the
+       entry's key is the address, which a later function can reuse. */
+    fn_sample_name(b);
+#endif
 #if QJS_AOT || QJS_AOT_GEN
     /* Release the polymorphic cache's shape references; it is allocated at bind
        time and is independent of the register PIC. */
@@ -75712,8 +76393,11 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_put_leb128(s, b->arg_count);
     bc_put_leb128(s, b->var_count);
     bc_put_leb128(s, b->defined_arg_count);
-#if QJS_REGVM && !QJS_AOT
-    /* A register bundle carries no stack bytecode; the field is always zero. */
+#if QJS_REGVM
+    /* A register bundle carries no stack bytecode; the field is always zero.
+       Keyed on QJS_REGVM alone: the bundle format must not depend on whether
+       the build that wrote it also had AOT enabled, or a bundle written by one
+       build cannot be read by the other. */
     bc_put_leb128(s, 0);            /* stack_size */
 #else
     bc_put_leb128(s, b->stack_size);
@@ -75721,14 +76405,14 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_put_leb128(s, b->var_ref_count);
     bc_put_leb128(s, b->closure_var_count);
     bc_put_leb128(s, b->cpool_count);
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     bc_put_leb128(s, 0);            /* byte_code_len */
 #else
     bc_put_leb128(s, b->byte_code_len);
 #endif
     /* IC table size only; contents are runtime-only (doc/ic-design.md §1). The
        _ic opcodes are already in byte_code, so a nonzero count round-trips. */
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     bc_put_leb128(s, 0);            /* ic_count */
 #else
     bc_put_leb128(s, b->ic_count);
@@ -75748,20 +76432,10 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_leb128(s, b->regvm_ctl_count);
         bc_put_leb128(s, b->regvm_pic_count);
         bc_put_leb128(s, b->regvm_len); /* exec_len: the decoded length */
-#if QJS_AOT
-        /* AOT keeps the exec code in the header. */
-        rbuf = js_malloc(s->ctx, b->regvm_len);
-        if (!rbuf)
-            goto fail;
-        memcpy(rbuf, b->regvm_code, b->regvm_len);
-        if (regvm_map_atoms(rbuf, b->regvm_len, 1 /* register operands are two bytes */,
-                            regvm_writer_atom, s))
-            goto fail;
-        dbuf_put(&s->dbuf, rbuf, b->regvm_len);
-        js_free(s->ctx, rbuf);
-        rbuf = NULL;
-#endif
-        /* Otherwise the program goes to the lazy region in wire form. */
+        /* The program goes to the lazy region in wire form, in every build.
+           Inlining the exec code in the header for AOT made the bundle format
+           depend on the writer's build, so a bundle written without AOT (every
+           checked-in `builtin-*.regvm.h`) could not be read with it. */
     }
 #endif
 
@@ -75820,7 +76494,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
             goto fail;
     }
 
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     /* The register program, in wire form, replaces the stack bytecode. */
     if (b->regvm_compiled && regvm_wire_encode(s, b))
         goto fail;
@@ -75834,7 +76508,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     for (i = 0; i < b->objlit_count; i++) {
         JSObjLitTemplate *tpl = &b->objlit_tab[i];
         uint16_t k;
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
         /* The register program names its templates by order, so no stack pc is
            written. */
 #else
@@ -76578,7 +77252,7 @@ static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
     *argv_safe = true;
 }
 
-#if !QJS_REGVM || QJS_AOT
+#if !QJS_REGVM
 static void js_scan_argv_safe(JSFunctionBytecode *b)
 {
     bool argv_safe, args_captured;
@@ -77695,9 +78369,10 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
     }
     {
         bc_read_trace(s, "bytecode {\n");
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
         /* No stack bytecode: decode the register program from the wire, which
-           interns atoms, validates, and sets args_captured/argv_safe. */
+           interns atoms, validates, and sets args_captured/argv_safe. Keyed on
+           QJS_REGVM alone, to match the writer. */
         if (b->regvm_compiled) {
             uint32_t wire_len;
             if (bc_get_leb128(s, &wire_len))
@@ -77725,7 +78400,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
         uint32_t *template_pcs = NULL;
         if (bc_get_leb128(s, &template_count) || template_count > UINT16_MAX)
             return -1;
-#if !QJS_REGVM || QJS_AOT
+#if !QJS_REGVM
         if (template_count != 0) {
             template_pcs = js_malloc(s->ctx,
                                      sizeof(*template_pcs) * template_count);
@@ -77777,9 +78452,9 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
             b->objlit_count = (uint16_t)template_count;
         }
         for (i = 0; i < (int)template_count; i++) {
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
             /* Templates are named by order, so there is no stack pc to
-               cross-check. */
+               cross-check. Keyed on QJS_REGVM alone, to match the writer. */
             pc = 0;
             if (bc_get_leb128(s, &prop_count) ||
                 prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS)
@@ -77997,22 +78672,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                 JS_ThrowSyntaxError(ctx, "invalid register program header");
                 goto fail;
             }
-#if QJS_AOT
-            /* The AOT layout keeps the exec code in the header, so it must fit
-               in the remaining input. */
-            if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
-                JS_ThrowSyntaxError(ctx, "invalid register program header");
-                goto fail;
-            }
-#else
-            /* The exec code is decoded from the wire in the lazy region. The
-               wire is never smaller than 1/16 of the decoded length, which
-               bounds the allocation. */
+            /* `regvm_len` is the *decoded* length and the wire that follows is
+               shorter, so the bound is 16x it, in every build. */
             if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr) * 16) {
                 JS_ThrowSyntaxError(ctx, "invalid register program header");
                 goto fail;
             }
-#endif
             bc.regvm_compiled = 1;
             bc.regvm_reg_count = reg_count;
             bc.regvm_ctl_count = ctl_count;
@@ -78057,67 +78722,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     if (b->regvm_compiled) {
         b->regvm_code = (void *)((uint8_t*)b + layout.byte_code_offset +
                                  b->byte_code_len);
-#if QJS_AOT
-        {
-        int wide = 1;                   /* register operands are two bytes */
-        int acquired = 0;
-        if (bc_get_buf(s, b->regvm_code, b->regvm_len)) {
-            b->regvm_code = NULL;
-            b->regvm_compiled = 0;
-            goto fail_unregistered;
-        }
-        /*
-         * Intern the program's atoms, which the function then owns, and
-           validate the
-         * program before anything can run it.
-         *
-         * Both steps can fail on untrusted input, and `b` is neither a GC
-           object nor
-         * `obj` yet, so failures unwind by hand. A dry walk first leaves the
-           rewriting
-         * walk's only failure an allocation inside the interning callback,
-           which is
-         * undone by walking the same prefix again; regvm_owns_atoms is then
-           cleared.
-         */
-        if (regvm_map_atoms2(b->regvm_code, b->regvm_len, wide, NULL, NULL,
-                             1, NULL))
-            goto fail_unregistered;
-        b->regvm_owns_atoms = 1;
-        if (regvm_map_atoms2(b->regvm_code, b->regvm_len, wide,
-                             regvm_reader_atom, s, 0, &acquired)) {
-            regvm_unmap_atoms(b->regvm_code, b->regvm_len, wide, acquired,
-                              ctx->rt);
-            b->regvm_owns_atoms = 0;
-            goto fail_unregistered;
-        }
-        if (regvm_validate_code(ctx, b)) {
-            /* every atom in the program was interned, so all of them go back */
-            regvm_map_atoms(b->regvm_code, b->regvm_len, wide,
-                            regvm_free_atom, ctx->rt);
-            b->regvm_owns_atoms = 0;
-            goto fail_unregistered;
-        }
-        /* `argv_safe` and `args_captured` are never serialized: recompute both
-           from the register program. `argv_safe` clears on a parameter write as
-           well as a capture. */
-        {
-            bool rs_argv, rs_args;
-            regvm_scan_arg_flags(b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
-#if !defined(NDEBUG)
-            /* The stack scan JS_ReadFunctionBytecode ran must agree, in the
-               same direction as at compile time. */
-            assert(!rs_argv || b->argv_safe);
-            assert(rs_args == (b->args_captured != 0));
-#endif
-            b->args_captured |= rs_args;
-            b->argv_safe = rs_argv;
-        }
-        }
-#else
-        /* The exec code is decoded from the wire by JS_ReadFunctionBody, which
-           interns atoms, validates, and sets args_captured/argv_safe. */
-#endif
+
     }
 #endif
 

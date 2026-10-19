@@ -942,6 +942,8 @@ static int64_t q2_first_target(const Q2Insn *in) {
   return 0;
 }
 
+int64_t q2_first_target_pub(const Q2Insn *in) { return q2_first_target(in); }
+
 static int cmp_i32(const void *a, const void *b) {
   int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
   return x < y ? -1 : (x > y ? 1 : 0);
@@ -1061,6 +1063,37 @@ static int q2_prune_params(Q2Func *f) {
   return 0;
 }
 
+/* The compare-and-branch opcodes with the comparison in the opcode
+   (`branch_lt_s` .. `branch_neq_s`, "rrt") are rewritten into the operand form
+   of `branch_cmp_reg_reg_s` ("brrt"): the comparison becomes a synthetic `b`
+   operand ahead of the registers, so they share its roles and lowering. Only
+   the IR changes; a step still runs the real instruction at its pc. */
+static void q2_canon_cmp_branch(Q2Insn *in) {
+  int sub, k;
+  switch (in->rop) {
+    case ROP_branch_lt_s: sub = REG_BIN_LT; break;
+    case ROP_branch_nlt_s: sub = REG_BIN_LT | REG_CMP_INVERT; break;
+    case ROP_branch_lte_s: sub = REG_BIN_LTE; break;
+    case ROP_branch_nlte_s: sub = REG_BIN_LTE | REG_CMP_INVERT; break;
+    case ROP_branch_gt_s: sub = REG_BIN_GT; break;
+    case ROP_branch_ngt_s: sub = REG_BIN_GT | REG_CMP_INVERT; break;
+    case ROP_branch_gte_s: sub = REG_BIN_GTE; break;
+    case ROP_branch_ngte_s: sub = REG_BIN_GTE | REG_CMP_INVERT; break;
+    case ROP_branch_eq_s: sub = REG_BIN_EQ; break;
+    case ROP_branch_neq_s: sub = REG_BIN_NEQ; break;
+    default: return;
+  }
+  if (in->narg != 3 || in->arg[0].kind != 'r' || in->arg[1].kind != 'r' ||
+      in->arg[2].kind != 't')
+    return;
+  for (k = 3; k > 0; k--) in->arg[k] = in->arg[k - 1];
+  in->arg[0].kind = 'b';
+  in->arg[0].val = sub;
+  in->arg[0].off = -1;
+  in->narg = 4;
+  in->rop = ROP_branch_cmp_reg_reg_s;
+}
+
 int q2_build(const JSAotGenFunc *g, Q2Func *f) {
   int i, n, words;
   int32_t *starts = NULL;
@@ -1107,6 +1140,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       in->arg[n].val = cur.arg[n].val;
       in->arg[n].off = cur.arg[n].off;
     }
+    q2_canon_cmp_branch(in);
     ri = q2_rop_info(in->rop);
     in->op = (int8_t)ri->op;
     in->sub = q2_rop_sub(in->rop, in);
@@ -1506,10 +1540,13 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             in2->win_val[w] = def_at[r];
           }
         }
-        if (in2->op == Q2_OP_FALLBACK && in2->ndef == 0) {
+        if (in2->op == Q2_OP_FALLBACK && in2->ndef == 0 &&
+            q2_rop_info(in2->rop)->nuse == 0) {
           /* Unknown roles: the step may write any register live after this
              instruction (not the block), so redefine those and remember which,
-             for the lowering to reload from the frame. */
+             for the lowering to reload from the frame. A fallback whose roles
+             are declared (a store: uses, no destination) writes no register,
+             so the values live across it keep their representation. */
           uint64_t *lo = f->insn_live + (size_t)(blk->first_insn + k) * words;
           int nlive = 0;
           for (m = 0; m < f->nregs; m++)
