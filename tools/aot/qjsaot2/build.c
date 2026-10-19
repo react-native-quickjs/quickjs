@@ -256,6 +256,14 @@ const char *q2_op_name(int op) {
       return "put_field";
     case Q2_OP_CALL:
       return "call";
+    case Q2_OP_POST_INC:
+      return "post_inc";
+    case Q2_OP_PUT_VAR_REF:
+      return "put_var_ref";
+    case Q2_OP_TO_PROPKEY:
+      return "to_propkey";
+    case Q2_OP_SET_NAME:
+      return "set_name";
     default:
       return "?";
   }
@@ -713,6 +721,13 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_div: /* "rrr": d, a, b */
     case ROP_neg: /* "rr": d, a */
     case ROP_inc: /* "rr" */
+    /* `dec`, `not` and `to_numeric` belong to this same family. They were
+       absent, so they fell back to a roles-free instruction that redefined
+       every live register -- which boxed the arithmetic after them. `dec` alone
+       accounted for 58 boxed values in crypto and `post_inc` for 53. */
+    case ROP_dec:
+    case ROP_not:
+    case ROP_to_numeric:
       if (rop != ROP_div) info.op = Q2_OP_UNARY;
       info.ndef = 1;
       info.def[0] = 0;
@@ -721,6 +736,59 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.use[1] = 2;
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
+      return &info;
+
+    /* "rrr": t, s, h -- h = ++s (or --s), t = the value s had before. Two
+       registers are written, which is why this cannot be Q2_OP_UNARY. */
+    case ROP_post_inc:
+    case ROP_post_dec:
+      info.op = Q2_OP_POST_INC;
+      info.ndef = 2;
+      info.def[0] = 0;
+      info.def[1] = 2;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+
+    /* "ur": slot, s -- the closure cell takes a copy of register s. The cell is
+       a heap location, so this writes a variable reference rather than a
+       register; naming it stops it redefining every live register. */
+    case ROP_put_var_ref:
+      info.op = Q2_OP_PUT_VAR_REF;
+      info.ndef = 0;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = Q2_E_VARREF;
+      info.writes = Q2_E_VARREF | Q2_E_CONTROL;
+      return &info;
+
+    /* "rr": d, src (and "rrr": d, src, chk -- the propkey2 form, whose third
+       register is only tested for null/undefined). Keys are strings, symbols or
+       ints, all of which are already keys, so the result is a register the IR
+       can name. */
+    case ROP_to_propkey:
+    case ROP_to_propkey2:
+      info.op = Q2_OP_TO_PROPKEY;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = (rop == ROP_to_propkey2) ? 2 : 1;
+      info.use[0] = 1;
+      info.use[1] = 2;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+
+    /* "ra": r, atom -- JS_DefineObjectName on the register. It can run a
+       setter, so it is a control-effect instruction that writes no register. */
+    case ROP_set_name:
+      info.op = Q2_OP_SET_NAME;
+      info.ndef = 0;
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
 
     /* properties */
@@ -942,7 +1010,9 @@ static int64_t q2_first_target(const Q2Insn *in) {
   return 0;
 }
 
-int64_t q2_first_target_pub(const Q2Insn *in) { return q2_first_target(in); }
+int64_t q2_first_target_pub(const Q2Insn *in) {
+  return q2_first_target(in);
+}
 
 static int cmp_i32(const void *a, const void *b) {
   int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
@@ -974,7 +1044,8 @@ static int q2_prune_params(Q2Func *f) {
       return -1;
     }
     memcpy(blk->in_reg, blk->param_reg, sizeof(int32_t) * (size_t)blk->nparams);
-    memcpy(blk->in_val, blk->param_val, sizeof(Q2ValueId) * (size_t)blk->nparams);
+    memcpy(
+        blk->in_val, blk->param_val, sizeof(Q2ValueId) * (size_t)blk->nparams);
     blk->nlive_in = blk->nparams;
   }
   while (changed && guard++ < f->nblocks + 8) {
@@ -1071,17 +1142,38 @@ static int q2_prune_params(Q2Func *f) {
 static void q2_canon_cmp_branch(Q2Insn *in) {
   int sub, k;
   switch (in->rop) {
-    case ROP_branch_lt_s: sub = REG_BIN_LT; break;
-    case ROP_branch_nlt_s: sub = REG_BIN_LT | REG_CMP_INVERT; break;
-    case ROP_branch_lte_s: sub = REG_BIN_LTE; break;
-    case ROP_branch_nlte_s: sub = REG_BIN_LTE | REG_CMP_INVERT; break;
-    case ROP_branch_gt_s: sub = REG_BIN_GT; break;
-    case ROP_branch_ngt_s: sub = REG_BIN_GT | REG_CMP_INVERT; break;
-    case ROP_branch_gte_s: sub = REG_BIN_GTE; break;
-    case ROP_branch_ngte_s: sub = REG_BIN_GTE | REG_CMP_INVERT; break;
-    case ROP_branch_eq_s: sub = REG_BIN_EQ; break;
-    case ROP_branch_neq_s: sub = REG_BIN_NEQ; break;
-    default: return;
+    case ROP_branch_lt_s:
+      sub = REG_BIN_LT;
+      break;
+    case ROP_branch_nlt_s:
+      sub = REG_BIN_LT | REG_CMP_INVERT;
+      break;
+    case ROP_branch_lte_s:
+      sub = REG_BIN_LTE;
+      break;
+    case ROP_branch_nlte_s:
+      sub = REG_BIN_LTE | REG_CMP_INVERT;
+      break;
+    case ROP_branch_gt_s:
+      sub = REG_BIN_GT;
+      break;
+    case ROP_branch_ngt_s:
+      sub = REG_BIN_GT | REG_CMP_INVERT;
+      break;
+    case ROP_branch_gte_s:
+      sub = REG_BIN_GTE;
+      break;
+    case ROP_branch_ngte_s:
+      sub = REG_BIN_GTE | REG_CMP_INVERT;
+      break;
+    case ROP_branch_eq_s:
+      sub = REG_BIN_EQ;
+      break;
+    case ROP_branch_neq_s:
+      sub = REG_BIN_NEQ;
+      break;
+    default:
+      return;
   }
   if (in->narg != 3 || in->arg[0].kind != 'r' || in->arg[1].kind != 'r' ||
       in->arg[2].kind != 't')
@@ -1179,8 +1271,9 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
         in->win_n = g->reg_count - in->win_reg;
       if (in->win_n < 0) in->win_n = 0;
-    } else if (in->rop == ROP_apply_arguments && in->narg >= 1 &&
-               in->arg[0].kind == 'r') {
+    } else if (
+        in->rop == ROP_apply_arguments && in->narg >= 1 &&
+        in->arg[0].kind == 'r') {
       in->win_reg = q2_ri((int)in->arg[0].val);
       in->win_n = 3;
       if (in->win_reg + in->win_n > g->reg_count)

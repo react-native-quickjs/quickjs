@@ -79,17 +79,17 @@ B1 pc=6..13 ctl=0 params=- succ=13()
       6 fallback         rop=31   def=2(tagged) use=-
 B2 pc=13..16 ctl=0 params=- succ=-
      13 return           rop=67   def=- use=v2(r0:tagged,sync)
-F <null> blocks=2 insns=7 values=7 regs=2 ctl_max=0
+F <null> blocks=2 insns=7 values=6 regs=2 ctl_max=0
   digest=4f602236fb6a2e84eaf095a3607dd482
 B0 pc=0..27 ctl=0 params=- succ=27()
       0 ?                rop=18   def=1(tagged) use=-
       5 ?                rop=18   def=2(tagged) use=-
      10 binary           rop=190  def=3(tagged) use=v1(r0:tagged,sync),v2(r1:tagged,sync)
      17 binary           rop=171  def=4(tagged) use=v3(r0:tagged,sync)
-     22 fallback         rop=19   def=- use=v4(r0:tagged,sync)
+     22 put_var_ref      rop=19   def=- use=v4(r0:tagged,sync)
 B1 pc=27..33 ctl=0 params=- succ=-
-     27 move             rop=217  def=6(tagged) use=v5(r0:tagged,sync)
-     30 return           rop=67   def=- use=v6(r0:tagged,sync)
+     27 move             rop=217  def=5(tagged) use=v4(r0:tagged,sync)
+     30 return           rop=67   def=- use=v5(r0:tagged,sync)
 F <null> blocks=1 insns=2 values=1 regs=1 ctl_max=0
   digest=947a287f2c60beae7e8be46a3a47b807
 B0 pc=0..8 ctl=0 params=- succ=-

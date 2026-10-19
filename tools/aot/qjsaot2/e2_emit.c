@@ -24,10 +24,16 @@ char e2_only_hex[33];
 
 /* The call-site A/B switch (--emit2-nocall). */
 static int e2_nocall;
-void e2_set_nocall(int on) { e2_nocall = on ? 1 : 0; }
-int e2_nocall_on(void) { return e2_nocall; }
+void e2_set_nocall(int on) {
+  e2_nocall = on ? 1 : 0;
+}
+int e2_nocall_on(void) {
+  return e2_nocall;
+}
 
-int qjs_aot_emit2_on(void) { return e2_on; }
+int qjs_aot_emit2_on(void) {
+  return e2_on;
+}
 
 /* Whether this function is one the new emitter should handle. A function is in
    scope when `--emit2-only` names it, or when no name was given. */
@@ -86,54 +92,59 @@ void e2_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
 
   e2_report_entry(g, hex, 0, call_site, check);
 
-  fprintf(f,
-          "/* The native entry: the whole call is this C call. NEED = %d bytes,\n"
-          "   %d slots, variable area %s (%d of %d slots), %d registers. */\n",
-          g->light_need, slots, has_var ? "present" : "absent",
-          has_var ? vc : 0, g->var_count, nregs);
+  fprintf(
+      f,
+      "/* The native entry: the whole call is this C call. NEED = %d bytes,\n"
+      "   %d slots, variable area %s (%d of %d slots), %d registers. */\n",
+      g->light_need, slots, has_var ? "present" : "absent", has_var ? vc : 0,
+      g->var_count, nregs);
 
-  fprintf(f,
-          "E2_TEXT static JSValue aot_n_%s(JSContext *ctx, JSRegRun *caller_f,\n"
-          "                               JSObject *co, JSValue this_obj,\n"
-          "                               JSValue *argv, int argc)\n"
-          "{\n",
-          hex);
+  fprintf(
+      f,
+      "E2_TEXT static JSValue aot_n_%s(JSContext *ctx, JSRegRun *caller_f,\n"
+      "                               JSObject *co, JSValue this_obj,\n"
+      "                               JSValue *argv, int argc)\n"
+      "{\n",
+      hex);
   /* The frame. Over-aligned because the register file inside it is read as
      JSValue and the engine's own frames are 16-byte aligned. */
-  fprintf(f,
-          "    JSValue mem[%d] __attribute__((aligned(16)));\n"
-          "    uint8_t *nf = (uint8_t *)mem;\n"
-          "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
-          "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
-          "    JSContext *realm = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
-          "    uint8_t *rt = *(uint8_t **)((uint8_t *)ctx + QJS_AOT_OFF_CTX_RT);\n"
-          "    JSValue *vb = mem + QJS_AOT_LIGHT_PREFIX_SLOTS;\n"
-          "    JSValue *regs = vb + %d;\n"
-          "    JSRegRun *prev;\n"
-          "    JSValue ret;\n"
-          "    int k;\n"
-          "\n",
-          slots, has_var ? g->var_count : 0);
+  fprintf(
+      f,
+      "    JSValue mem[%d] __attribute__((aligned(16)));\n"
+      "    uint8_t *nf = (uint8_t *)mem;\n"
+      "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
+      "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+      "    JSContext *realm = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+      "    uint8_t *rt = *(uint8_t **)((uint8_t *)ctx + QJS_AOT_OFF_CTX_RT);\n"
+      "    JSValue *vb = mem + QJS_AOT_LIGHT_PREFIX_SLOTS;\n"
+      "    JSValue *regs = vb + %d;\n"
+      "    JSRegRun *prev;\n"
+      "    JSValue ret;\n"
+      "    int k;\n"
+      "\n",
+      slots, has_var ? g->var_count : 0);
 
   /* Rule K: the stack check. The margin leaves room for the throw itself; a
      4 KB margin crashed before, and 64 KB is what the E0 experiments used. */
   if (check) {
-    fprintf(f,
-            "    if (__builtin_expect((uintptr_t)__builtin_frame_address(0) <\n"
-            "            *(uintptr_t *)(rt + QJS_AOT_OFF_RT_STACK_LIMIT) + "
-            "E2_STACK_MARGIN, 0))\n"
-            "        return qjs_aot_throw_stack_overflow(ctx);\n");
+    fprintf(
+        f,
+        "    if (__builtin_expect((uintptr_t)__builtin_frame_address(0) <\n"
+        "            *(uintptr_t *)(rt + QJS_AOT_OFF_RT_STACK_LIMIT) + "
+        "E2_STACK_MARGIN, 0))\n"
+        "        return qjs_aot_throw_stack_overflow(ctx);\n");
   }
   /* Rule P: the poll. `qjs_aot_poll` decrements the counter itself, so undo
      this one first: the counter must drop by exactly one per call. */
   if (call_site) {
-    fprintf(f,
-            "    if (__builtin_expect(--*(int *)((uint8_t *)ctx + "
-            "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n"
-            "        ++*(int *)((uint8_t *)ctx + "
-            "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
-            "        if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n"
-            "    }\n");
+    fprintf(
+        f,
+        "    if (__builtin_expect(--*(int *)((uint8_t *)ctx + "
+        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n"
+        "        ++*(int *)((uint8_t *)ctx + "
+        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
+        "        if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n"
+        "    }\n");
   }
 
   /* The callee's inline handlers read its property-cache table with no NULL
@@ -142,67 +153,75 @@ void e2_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
   /* The common case is a table that already exists (a bound function with
      sites gets one at bind), so the test is inline and the helper -- a
      cross-unit call -- runs only when the table is actually missing. */
-  fprintf(f,
-          "    if (__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
-          "NULL, 0))\n"
-          "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
+      "NULL, 0)) {\n"
+      "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n"
+      "    }\n");
 
   /* The header, in the engine's own field order. `ret_ip` is NULL and the
      destination field of `hdr_pack` is 0: a compiled call returns to C, not
      into a register of an interpreted caller. */
-  fprintf(f,
-          "    *(JSRegRun **)(nf + QJS_AOT_OFF_REGRUN_CALLER) = caller_f;\n"
-          "    *(void **)(nf + QJS_AOT_OFF_REGRUN_RET_IP) = NULL;\n"
-          "    *(void **)(nf + QJS_AOT_OFF_REGRUN_B) = cb;\n"
-          "    *(void **)(nf + QJS_AOT_OFF_REGRUN_PIC) = *(void **)(cb + "
-          "QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
-          "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_FR) = regs;\n"
-          "    *(void **)(nf + QJS_AOT_OFF_REGRUN_VAR_REFS) =\n"
-          "        *(void **)((uint8_t *)co + QJS_AOT_OFF_OBJECT_FUNC_VAR_REFS);\n"
-          "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_VAR_BUF) = %s;\n"
-          "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_ARG_BUF) = argv;\n"
-          "    *(uint64_t *)(nf + QJS_AOT_OFF_REGRUN_HDR_PACK) =\n"
-          "        ((uint64_t)(uint16_t)argc << 16) |\n"
-          "        ((uint64_t)(uint32_t)(QJS_AOT_REGVM_FLAG_LIGHT |\n"
-          "                    QJS_AOT_REGVM_FLAG_C_ENTRY |\n"
-          "                    QJS_AOT_REGVM_FLAG_STACK | %s |\n"
-          "                    (realm == ctx ? QJS_AOT_REGVM_FLAG_SAME_REALM : 0)) << 32);\n"
-          "    *(JSObject **)(nf + QJS_AOT_OFF_REGRUN_FUNC) = co;\n"
-          "    *(void **)(nf + QJS_AOT_OFF_REGRUN_CAP_IP) = NULL;\n"
-          "    *(void **)(nf + QJS_AOT_OFF_REGRUN_SF) = NULL;\n"
-          "    *(JSValue *)(nf + QJS_AOT_OFF_REGRUN_THIS_OBJ) = this_obj;\n",
-          has_var ? "vb" : "NULL",
-          has_var ? "0" : "QJS_AOT_REGVM_FLAG_TRIVIAL_RET");
+  fprintf(
+      f,
+      "    *(JSRegRun **)(nf + QJS_AOT_OFF_REGRUN_CALLER) = caller_f;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_RET_IP) = NULL;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_B) = cb;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_PIC) = *(void **)(cb + "
+      "QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_FR) = regs;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_VAR_REFS) =\n"
+      "        *(void **)((uint8_t *)co + QJS_AOT_OFF_OBJECT_FUNC_VAR_REFS);\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_VAR_BUF) = %s;\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_ARG_BUF) = argv;\n"
+      "    *(uint64_t *)(nf + QJS_AOT_OFF_REGRUN_HDR_PACK) =\n"
+      "        ((uint64_t)(uint16_t)argc << 16) |\n"
+      "        ((uint64_t)(uint32_t)(QJS_AOT_REGVM_FLAG_LIGHT |\n"
+      "                    QJS_AOT_REGVM_FLAG_C_ENTRY |\n"
+      "                    QJS_AOT_REGVM_FLAG_STACK | %s |\n"
+      "                    (realm == ctx ? QJS_AOT_REGVM_FLAG_SAME_REALM : 0)) "
+      "<< 32);\n"
+      "    *(JSObject **)(nf + QJS_AOT_OFF_REGRUN_FUNC) = co;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_CAP_IP) = NULL;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_SF) = NULL;\n"
+      "    *(JSValue *)(nf + QJS_AOT_OFF_REGRUN_THIS_OBJ) = this_obj;\n",
+      has_var ? "vb" : "NULL",
+      has_var ? "0" : "QJS_AOT_REGVM_FLAG_TRIVIAL_RET");
 
   /* Fill the variable area and the register file with `undefined`: a handler
      reads every register its format declares, so a stale stack word would be a
      value out of nowhere. Only the promoted variable slots are filled, as the
      engine fills only those. */
-  fprintf(f,
-          "    for (k = 0; k < %d; k++)\n"
-          "        __builtin_memcpy(&vb[k], &e2_undefined_value, "
-          "sizeof(JSValue));\n",
-          has_var ? g->var_count : 0);
-  fprintf(f,
-          "    for (k = 0; k < %d; k++)\n"
-          "        __builtin_memcpy(&regs[k], &e2_undefined_value, "
-          "sizeof(JSValue));\n",
-          nregs);
+  fprintf(
+      f,
+      "    for (k = 0; k < %d; k++)\n"
+      "        __builtin_memcpy(&vb[k], &e2_undefined_value, "
+      "sizeof(JSValue));\n",
+      has_var ? g->var_count : 0);
+  fprintf(
+      f,
+      "    for (k = 0; k < %d; k++)\n"
+      "        __builtin_memcpy(&regs[k], &e2_undefined_value, "
+      "sizeof(JSValue));\n",
+      nregs);
   fprintf(f, "    (void)k; (void)vb; (void)cb;\n");
-  fprintf(f,
-          "#if E2_CHECK\n"
-          "    qjs_aot_frame_check(ctx, (JSRegRun *)nf, co, caller_f, argv, argc,\n"
-          "                        this_obj);\n"
-          "#endif\n");
+  fprintf(
+      f,
+      "#if E2_CHECK\n"
+      "    qjs_aot_frame_check(ctx, (JSRegRun *)nf, co, caller_f, argv, argc,\n"
+      "                        this_obj);\n"
+      "#endif\n");
   /* `regvm_cur` names the innermost light frame, so the collector finds its
      register window and a deopt or an uncaught throw inside the callee finds
      the chain. Restored on the way out. */
-  fprintf(f,
-          "    prev = *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR);\n"
-          "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = (JSRegRun *)nf;\n"
-          "    ret = aot_f_%s(realm, (JSRegRun *)nf, regs, 0);\n"
-          "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n",
-          hex);
+  fprintf(
+      f,
+      "    prev = *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR);\n"
+      "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = (JSRegRun *)nf;\n"
+      "    ret = aot_f_%s(realm, (JSRegRun *)nf, regs, 0);\n"
+      "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n",
+      hex);
   /* The frame is the caller's buffer, so the teardown is the release of what
      the variable area owns and nothing else. */
   if (has_var)
@@ -223,8 +242,9 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     return -1;
   }
   if (q2_verify(&fn, msg, sizeof(msg)) < 0) {
-    fprintf(stderr, "e2: %s: the IR failed to verify: %s\n",
-            g->name[0] ? g->name : "?", msg);
+    fprintf(
+        stderr, "e2: %s: the IR failed to verify: %s\n",
+        g->name[0] ? g->name : "?", msg);
     q2_free(&fn);
     return -1;
   }

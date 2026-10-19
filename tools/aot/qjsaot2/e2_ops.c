@@ -46,16 +46,17 @@ static void note_opcall(const Q2Func *fn, const Q2Insn *in, int missarm) {
 /* The driver's profile and unit queries (qjsaot.c). A call site asks the
    profile which callees it saw and the unit whether each is compiled here and
    can be entered on the C stack. */
-int qjs_aot_prof_callees(const uint8_t dg[16], int pc, int *n, char hex[4][33],
-                         int kind[4], unsigned long long hits[4]);
+int qjs_aot_prof_callees(
+    const uint8_t dg[16], int pc, int *n, char hex[4][33], int kind[4],
+    unsigned long long hits[4]);
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
 int qjs_aot_unit_argc(const char hex[33]);
 
 /* Whether register `r` may be written by this instruction: its declared
    destinations, plus `writes_regs` ops. */
-static int role_writes_reg(const Q2Func *fn, const E2Role *role,
-                           const Q2Insn *in, int r) {
+static int role_writes_reg(
+    const Q2Func *fn, const E2Role *role, const Q2Insn *in, int r) {
   int i;
   /* The role table indexes its def[]/use[] by *operand*, so a register that is
      both a destination and a source (a move the allocator coalesced onto one
@@ -101,8 +102,12 @@ static int role_reads_reg(const E2Role *role, const Q2Insn *in, int r) {
 /* Whether the unit being generated will be compiled with -DE2_POISON. The
    emitter sets it from the environment so `m1.sh e2` can build both units. */
 static int g_poison;
-int e2_poison_on(void) { return g_poison; }
-void e2_set_poison(int on) { g_poison = on; }
+int e2_poison_on(void) {
+  return g_poison;
+}
+void e2_set_poison(int on) {
+  g_poison = on;
+}
 
 /* Whether an op call gets the check at all. A fallback reads and writes
    whatever its handler needs, so there is nothing to declare or compare. A
@@ -110,8 +115,7 @@ void e2_set_poison(int on) { g_poison = on; }
    cannot be compared or restored afterwards. */
 static int poison_applies(const Q2Insn *in, const E2Role *role) {
   if (in->op == Q2_OP_FALLBACK) return 0;
-  if (role->control == E2_CF_RETURN || role->control == E2_CF_SUSPEND)
-    return 0;
+  if (role->control == E2_CF_RETURN || role->control == E2_CF_SUSPEND) return 0;
   return 1;
 }
 
@@ -131,15 +135,18 @@ static int poison_applies(const Q2Insn *in, const E2Role *role) {
    if it was poisoned. Then the poisoned registers get their values back, so
    the sentinel never outlives the call: a wrong answer can only come from a
    read inside the op, never from a liveness approximation later on. */
-static void emit_poison_masks(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                              const E2Role *role) {
+static void emit_poison_masks(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Role *role) {
   int r, insn = (int)(in - fn->insns);
 
   fprintf(f, "    static const char e2_pm_%d[] = \"", in->pc);
   for (r = 0; r < fn->nregs; r++)
-    fputc(!role_writes_reg(fn, role, in, r) && !role_reads_reg(role, in, r) &&
-                  !reg_live_after(fn, insn, r)
-              ? '1' : '0', f);
+    fputc(
+        !role_writes_reg(fn, role, in, r) && !role_reads_reg(role, in, r) &&
+                !reg_live_after(fn, insn, r)
+            ? '1'
+            : '0',
+        f);
   fprintf(f, "\";\n");
   fprintf(f, "    static const char e2_wm_%d[] = \"", in->pc);
   for (r = 0; r < fn->nregs; r++)
@@ -147,8 +154,8 @@ static void emit_poison_masks(FILE *f, const Q2Func *fn, const Q2Insn *in,
   fprintf(f, "\";\n");
 }
 
-static void emit_opcall(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                        int is_last, int with_label) {
+static void emit_opcall(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last, int with_label) {
   const E2Role *role = e2_roles[in->rop];
   char opname[64];
 
@@ -160,17 +167,26 @@ static void emit_opcall(FILE *f, const Q2Func *fn, const Q2Insn *in,
   if (poison && with_label) emit_poison_masks(f, fn, in, role);
   if (with_label) fprintf(f, "g_%d:\n", in->pc);
   if (poison) {
-    fprintf(f, "    e2_poison_pre(fr, %d, e2_poison_copy, e2_pz, e2_pm_%d);\n",
-            fn->nregs, in->pc);
+    fprintf(
+        f, "    e2_poison_pre(fr, %d, e2_poison_copy, e2_pz, e2_pm_%d);\n",
+        fn->nregs, in->pc);
   }
   fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
   if (poison)
-    fprintf(f, "    e2_poison_post(fr, %d, e2_poison_copy, e2_pz, e2_wm_%d, "
-               "\"%s\", %d);\n", fn->nregs, in->pc, opname, in->pc);
-  fprintf(f, "    if (__builtin_expect(ip == NULL, 0)) { pc = %d; "
-             "goto exception; }\n", in->pc);
-  fprintf(f, "    if (__builtin_expect(ip == QJS_AOT_COLD_RET || "
-             "ip == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
+    fprintf(
+        f,
+        "    e2_poison_post(fr, %d, e2_poison_copy, e2_pz, e2_wm_%d, "
+        "\"%s\", %d);\n",
+        fn->nregs, in->pc, opname, in->pc);
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == NULL, 0)) { pc = %d; "
+      "goto exception; }\n",
+      in->pc);
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_COLD_RET || "
+      "ip == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
   /* The handler returns the next pc, which for a branch is the target and for
      anything else is the following instruction. Going through the switch in
      both cases needs no special case for either. */
@@ -231,7 +247,8 @@ static const char *g_cur_hex = "";
    one `E2_CTR(..., 0)` at the top of that block records it. `hex` names the
    function the site belongs to. */
 static void emit_site_hit(FILE *f, const Q2Insn *in) {
-  fprintf(f, "        E2_CTR(\"%s\", %d, %d, 1);\n", g_cur_hex, in->pc, in->rop);
+  fprintf(
+      f, "        E2_CTR(\"%s\", %d, %d, 1);\n", g_cur_hex, in->pc, in->rop);
 }
 static void emit_site_miss(FILE *f, const Q2Insn *in) {
   fprintf(f, "    E2_CTR(\"%s\", %d, %d, 0);\n", g_cur_hex, in->pc, in->rop);
@@ -243,8 +260,8 @@ static void emit_site_miss(FILE *f, const Q2Insn *in) {
    into the op call below, which runs the interpreter's handler.
 
    `sub` is the engine's REG_BIN_* value, carried by the IR. */
-static int emit_native_binary(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                              int is_last) {
+static int emit_native_binary(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, a, b;
 
@@ -264,13 +281,14 @@ static int emit_native_binary(FILE *f, const Q2Func *fn, const Q2Insn *in,
      branch, not a value to compute. Falling through to `next` would skip the
      branch, so only ops with no control effect are lowered here. */
   if (role == NULL || role->control != E2_CF_NONE) return 0;
-  if (in->sub < 0 || in->sub >= 0x40) return 0;   /* real REG_BIN_*, not a pseudo */
+  if (in->sub < 0 || in->sub >= 0x40)
+    return 0; /* real REG_BIN_*, not a pseudo */
   if (in->sub == REG_BIN_INSTANCEOF || in->sub == REG_BIN_IN ||
       in->sub == REG_BIN_PRIVATE_IN)
     return 0;
-  if (in->op == Q2_OP_FALLBACK && (in->sub == REG_BIN_INSTANCEOF ||
-                                    in->sub == REG_BIN_IN ||
-                                    in->sub == REG_BIN_PRIVATE_IN))
+  if (in->op == Q2_OP_FALLBACK &&
+      (in->sub == REG_BIN_INSTANCEOF || in->sub == REG_BIN_IN ||
+       in->sub == REG_BIN_PRIVATE_IN))
     return 0;
 
   d = dest_off(fn, in);
@@ -284,8 +302,11 @@ static int emit_native_binary(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _r;\n");
-  fprintf(f, "    if (__builtin_expect(q2_arith(%d, AOT_REG(fr, %d), "
-             "AOT_REG(fr, %d), &_r), 1)) {\n", in->sub, a, b);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_arith(%d, AOT_REG(fr, %d), "
+      "AOT_REG(fr, %d), &_r), 1)) {\n",
+      in->sub, a, b);
   emit_site_hit(f, in);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _r);\n", d);
   fprintf(f, "        goto g_%d;\n", in->next);
@@ -310,28 +331,28 @@ static int emit_native_binary(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
    The `add_imm_s`/`sub_imm_s` forms ("rri": d, a, imm) are separate opcodes
    with the kind in the opcode; they go through the same arm. */
-static int emit_native_binary_imm(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                  int is_last) {
+static int emit_native_binary_imm(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, a, imm_idx, sub;
 
   switch (in->rop) {
-  case ROP_binary_imm:
-  case ROP_binary_imm_s:
-    if (in->narg < 4 || in->arg[1].kind != 'b') return 0;
-    sub = (int)in->arg[1].val;
-    a = operand_off(in, 2);
-    imm_idx = 3;
-    break;
-  case ROP_add_imm_s:
-  case ROP_sub_imm_s:
-    if (in->narg < 3) return 0;
-    sub = in->rop == ROP_add_imm_s ? REG_BIN_ADD : REG_BIN_SUB;
-    a = operand_off(in, 1);
-    imm_idx = 2;
-    break;
-  default:
-    return 0;
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+      if (in->narg < 4 || in->arg[1].kind != 'b') return 0;
+      sub = (int)in->arg[1].val;
+      a = operand_off(in, 2);
+      imm_idx = 3;
+      break;
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+      if (in->narg < 3) return 0;
+      sub = in->rop == ROP_add_imm_s ? REG_BIN_ADD : REG_BIN_SUB;
+      a = operand_off(in, 1);
+      imm_idx = 2;
+      break;
+    default:
+      return 0;
   }
   if (role == NULL || role->control != E2_CF_NONE) return 0;
   if (in->ndef != 1 || a < 0 || imm_idx >= in->narg) return 0;
@@ -339,16 +360,19 @@ static int emit_native_binary_imm(FILE *f, const Q2Func *fn, const Q2Insn *in,
   /* The same exclusions as the two-register arm: only a real REG_BIN_* that
      `q2_arith` has a fast path for. */
   if (sub < 0 || sub >= 0x40) return 0;
-  if (sub == REG_BIN_INSTANCEOF || sub == REG_BIN_IN || sub == REG_BIN_PRIVATE_IN)
+  if (sub == REG_BIN_INSTANCEOF || sub == REG_BIN_IN ||
+      sub == REG_BIN_PRIVATE_IN)
     return 0;
   d = dest_off(fn, in);
   if (d < 0) return 0;
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _r;\n");
-  fprintf(f, "    if (__builtin_expect(q2_arith(%d, AOT_REG(fr, %d), "
-             "JS_MKVAL(JS_TAG_INT, %d), &_r), 1)) {\n",
-          sub, a, (int32_t)in->arg[imm_idx].val);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_arith(%d, AOT_REG(fr, %d), "
+      "JS_MKVAL(JS_TAG_INT, %d), &_r), 1)) {\n",
+      sub, a, (int32_t)in->arg[imm_idx].val);
   emit_site_hit(f, in);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _r);\n", d);
   fprintf(f, "        goto g_%d;\n", in->next);
@@ -369,8 +393,8 @@ static int emit_native_binary_imm(FILE *f, const Q2Func *fn, const Q2Insn *in,
    lowering used and `get_field` the one the register form prefers, but a
    function can contain either. The site selects the PIC entry the profile
    filled. */
-static int emit_native_field_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                  int is_last) {
+static int emit_native_field_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, recv, site;
 
@@ -387,8 +411,11 @@ static int emit_native_field_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _f;\n");
-  fprintf(f, "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-             "AOT_REG(fr, %d), %d, &_f), 1)) {\n", recv, site);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
+      "AOT_REG(fr, %d), %d, &_f), 1)) {\n",
+      recv, site);
   emit_site_hit(f, in);
   /* The value is borrowed from the object's slot, so the store duplicates it
      (AOT_SET_B does that in an owning build and is a plain assignment under
@@ -415,8 +442,8 @@ static int emit_native_field_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
    the thing that is missing the fill; this arm does not depend on it.
 
    `get_global` is "rabs": destination, atom, throwing flag, site. */
-static int emit_native_global_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                   int is_last) {
+static int emit_native_global_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, site;
   int atom_off, throwing;
@@ -434,8 +461,9 @@ static int emit_native_global_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _g;\n");
-  fprintf(f, "    if (__builtin_expect(q2_global_hit(ctx, pic, %d, &_g), 1)) {\n",
-          site);
+  fprintf(
+      f, "    if (__builtin_expect(q2_global_hit(ctx, pic, %d, &_g), 1)) {\n",
+      site);
   emit_site_hit(f, in);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", d);
   fprintf(f, "        goto g_%d;\n", in->next);
@@ -446,9 +474,11 @@ static int emit_native_global_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
      engine's accessor documents. `pic` is re-read because the fill may have
      allocated the entry. */
   fprintf(f, "    {\n");
-  fprintf(f, "        int _r = qjs_aot_get_global_site(ctx, f, %d,\n"
-             "            (int)qjs_aot_ld_u32(code + %d), %d, &_g);\n",
-          site, atom_off, throwing);
+  fprintf(
+      f,
+      "        int _r = qjs_aot_get_global_site(ctx, f, %d,\n"
+      "            (int)qjs_aot_ld_u32(code + %d), %d, &_g);\n",
+      site, atom_off, throwing);
   fprintf(f, "        if (_r < 0) { pc = %d; goto exception; }\n", in->pc);
   fprintf(f, "        if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _g);\n", d);
   fprintf(f, "        else AOT_SET_B(ctx, fr, %d, _g);\n", d);
@@ -474,13 +504,12 @@ static int emit_native_global_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
    The read itself is the same own-slot hit as `get_field`, on that receiver; a
    miss falls into the op call, which boxes (again) and reads the slow way. */
-static int emit_native_this_field(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                  int is_last) {
+static int emit_native_this_field(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int dfield, drecv, site;
 
-  if (in->rop != ROP_get_this_field && in->rop != ROP_get_this_field2)
-    return 0;
+  if (in->rop != ROP_get_this_field && in->rop != ROP_get_this_field2) return 0;
   if (role == NULL || role->control != E2_CF_NONE) return 0;
   if (in->narg < 4 || in->arg[3].kind != 's') return 0;
   site = (int)in->arg[3].val;
@@ -495,14 +524,20 @@ static int emit_native_this_field(FILE *f, const Q2Func *fn, const Q2Insn *in,
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _t, _v;\n");
   fprintf(f, "    int _own = qjs_aot_load_this(ctx, f, &_t);\n");
-  fprintf(f, "    if (__builtin_expect(_own < 0, 0)) { pc = %d; "
-             "goto exception; }\n", in->pc);
+  fprintf(
+      f,
+      "    if (__builtin_expect(_own < 0, 0)) { pc = %d; "
+      "goto exception; }\n",
+      in->pc);
   /* The receiver register is a destination first: the read below uses `_t`
      directly, so this store is what makes the register hold `this`. */
   fprintf(f, "    if (_own) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n", drecv);
   fprintf(f, "    else AOT_SET_B(ctx, fr, %d, _t);\n", drecv);
-  fprintf(f, "    if (__builtin_expect(q2_own_read_hit(pic, holders, _t, %d, "
-             "&_v), 1)) {\n", site);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_own_read_hit(pic, holders, _t, %d, "
+      "&_v), 1)) {\n",
+      site);
   emit_site_hit(f, in);
   /* Borrowed from the object's slot, so the store duplicates it. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _v);\n", dfield);
@@ -521,8 +556,8 @@ static int emit_native_this_field(FILE *f, const Q2Func *fn, const Q2Insn *in,
    Both results are borrowed from their objects' slots, so both stores duplicate.
 
    Format "rrasrras": d1, recv, atom1, site1, d2, recv2, atom2, site2. */
-static int emit_native_field_chain(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                   int is_last) {
+static int emit_native_field_chain(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d0, d1, recv, s1, s2;
 
@@ -533,7 +568,7 @@ static int emit_native_field_chain(FILE *f, const Q2Func *fn, const Q2Insn *in,
     return 0;
   s1 = (int)in->arg[3].val;
   s2 = (int)in->arg[7].val;
-  if (s1 == 0xffff || s2 == 0xffff) return 0;   /* REG_IC_NONE */
+  if (s1 == 0xffff || s2 == 0xffff) return 0; /* REG_IC_NONE */
   d0 = dest_off(fn, in);
   recv = operand_off(in, role->use[0]);
   if (d0 < 0 || recv < 0) return 0;
@@ -543,13 +578,19 @@ static int emit_native_field_chain(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _c0, _c1;\n");
-  fprintf(f, "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-             "AOT_REG(fr, %d), %d, &_c0), 1)) {\n", recv, s1);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
+      "AOT_REG(fr, %d), %d, &_c0), 1)) {\n",
+      recv, s1);
   /* Link 1 goes to its register, so link 2's receiver is available even if
      link 2 misses; both are borrowed, so the store duplicates. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _c0);\n", d0);
-  fprintf(f, "        if (__builtin_expect(q2_own_read_hit(pic, holders, "
-             "_c0, %d, &_c1), 1)) {\n", s2);
+  fprintf(
+      f,
+      "        if (__builtin_expect(q2_own_read_hit(pic, holders, "
+      "_c0, %d, &_c1), 1)) {\n",
+      s2);
   emit_site_hit(f, in);
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _c1);\n", d1);
   fprintf(f, "            goto g_%d;\n", in->next);
@@ -573,8 +614,8 @@ static int emit_native_field_chain(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
    `put_field` is "rasr": receiver, atom, site, value. The op has no
    destination, so its fast path only has to continue. */
-static int emit_native_field_write(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                   int is_last) {
+static int emit_native_field_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int recv, val, site;
 
@@ -587,8 +628,11 @@ static int emit_native_field_write(FILE *f, const Q2Func *fn, const Q2Insn *in,
   if (recv < 0 || val < 0) return 0;
 
   fprintf(f, "g_%d: {\n", in->pc);
-  fprintf(f, "    if (__builtin_expect(q2_put_field_hit(ctx, pic, AOT_REG(fr, %d), "
-             "%d, AOT_REG(fr, %d)), 1)) {\n", recv, site, val);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_put_field_hit(ctx, pic, AOT_REG(fr, %d), "
+      "%d, AOT_REG(fr, %d)), 1)) {\n",
+      recv, site, val);
   emit_site_hit(f, in);
   fprintf(f, "        goto g_%d;\n", in->next);
   fprintf(f, "    }\n");
@@ -617,8 +661,8 @@ static int elem_pc_is_numeric(const Q2Func *fn, const Q2Insn *in) {
 /* An element read: `q2_elem_hit` inlines the array fast path (class, not
    holey, index in bounds, element not a hole or lazy marker). A miss falls into
    the op call, which handles a getter, a string key, a proxy, everything. */
-static int emit_native_elem_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                 int is_last) {
+static int emit_native_elem_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, arr, key;
 
@@ -634,8 +678,11 @@ static int emit_native_elem_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _e;\n");
-  fprintf(f, "    if (__builtin_expect(q2_elem_hit(AOT_REG(fr, %d), "
-             "AOT_REG(fr, %d), &_e), 1)) {\n", arr, key);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_elem_hit(AOT_REG(fr, %d), "
+      "AOT_REG(fr, %d), &_e), 1)) {\n",
+      arr, key);
   emit_site_hit(f, in);
   /* Borrowed from the array, so the store duplicates it. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", d);
@@ -649,8 +696,8 @@ static int emit_native_elem_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
 /* An element write: the same fast path, storing in place. The op has no
    destination. */
-static int emit_native_elem_write(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                  int is_last) {
+static int emit_native_elem_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int arr, key, val;
 
@@ -677,8 +724,11 @@ static int emit_native_elem_write(FILE *f, const Q2Func *fn, const Q2Insn *in,
   if (arr < 0 || key < 0 || val < 0) return 0;
 
   fprintf(f, "g_%d: {\n", in->pc);
-  fprintf(f, "    if (__builtin_expect(q2_elem_put(AOT_REG(fr, %d), "
-             "AOT_REG(fr, %d), AOT_REG(fr, %d)), 1)) {\n", arr, key, val);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_elem_put(AOT_REG(fr, %d), "
+      "AOT_REG(fr, %d), AOT_REG(fr, %d)), 1)) {\n",
+      arr, key, val);
   emit_site_hit(f, in);
   fprintf(f, "        goto g_%d;\n", in->next);
   fprintf(f, "    }\n");
@@ -697,8 +747,8 @@ static int emit_native_elem_write(FILE *f, const Q2Func *fn, const Q2Insn *in,
    `JS_ToBool` for them, which can run `valueOf` and throw.
 
    The target is a relative offset from the instruction's end. */
-static int emit_native_branch_bool(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                   int is_last) {
+static int emit_native_branch_bool(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int a, tgt, neg;
 
@@ -711,8 +761,10 @@ static int emit_native_branch_bool(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _v = AOT_REG(fr, %d);\n", a);
-  fprintf(f, "    if (__builtin_expect((uint32_t)JS_VALUE_GET_TAG(_v) <= "
-             "JS_TAG_UNDEFINED, 1)) {\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect((uint32_t)JS_VALUE_GET_TAG(_v) <= "
+      "JS_TAG_UNDEFINED, 1)) {\n");
   fprintf(f, "        int _t = JS_VALUE_GET_INT(_v) != 0;\n");
   emit_site_hit(f, in);
   fprintf(f, "        if (_t%s) goto g_%d;\n", neg ? " == 0" : "", tgt);
@@ -726,22 +778,22 @@ static int emit_native_branch_bool(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
 /* The branch family that is a pure test: an unconditional `branch`, and the
    null/undefined family, which compares a tag and cannot run JS. */
-static int emit_native_branch(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                              int is_last) {
+static int emit_native_branch(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int a, tgt;
 
   if (role == NULL || role->control != E2_CF_BRANCH) return 0;
   switch (in->rop) {
-  case ROP_branch:
-  case ROP_branch_s:
-  case ROP_branch_null:
-  case ROP_branch_not_null:
-  case ROP_branch_nullish:
-  case ROP_branch_not_nullish:
-    break;
-  default:
-    return 0;
+    case ROP_branch:
+    case ROP_branch_s:
+    case ROP_branch_null:
+    case ROP_branch_not_null:
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish:
+      break;
+    default:
+      return 0;
   }
   /* The 't' operand is a relative offset from the instruction's end. */
   tgt = (int)(in->next + q2_first_target_pub(in));
@@ -764,11 +816,15 @@ static int emit_native_branch(FILE *f, const Q2Func *fn, const Q2Insn *in,
   }
   {
     const char *test =
-        in->rop == ROP_branch_null        ? "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_NULL"
-        : in->rop == ROP_branch_not_null  ? "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_NULL"
+        in->rop == ROP_branch_null
+            ? "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_NULL"
+        : in->rop == ROP_branch_not_null
+            ? "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_NULL"
         : in->rop == ROP_branch_nullish
-            ? "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_NULL || JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_UNDEFINED)"
-            : "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_NULL && JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_UNDEFINED)";
+            ? "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_NULL || "
+              "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_UNDEFINED)"
+            : "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_NULL && "
+              "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_UNDEFINED)";
     char buf[256];
     snprintf(buf, sizeof(buf), test, a, a);
     fprintf(f, "    if (%s) goto g_%d;\n", buf, tgt);
@@ -788,8 +844,8 @@ static int emit_native_branch(FILE *f, const Q2Func *fn, const Q2Insn *in,
    `dec` carries no sub-op byte in the IR and `q2_rop_sub` has no case for it,
    so its operation is spelled out here from the opcode itself; the handler's
    `REGVM_UN_OP(REG_UN_DEC)` is the same call this emits. */
-static int emit_native_unary(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                             int is_last) {
+static int emit_native_unary(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, a, sub;
 
@@ -819,8 +875,11 @@ static int emit_native_unary(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _u;\n");
-  fprintf(f, "    if (__builtin_expect(q2_unary_fast(%d, AOT_REG(fr, %d), &_u), 1)) {\n",
-          sub, a);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_unary_fast(%d, AOT_REG(fr, %d), &_u), 1)) "
+      "{\n",
+      sub, a);
   emit_site_hit(f, in);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _u);\n", d);
   fprintf(f, "        goto g_%d;\n", in->next);
@@ -840,8 +899,8 @@ static int emit_native_unary(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
    The two results are uncounted numbers, so `AOT_SET_B` is the right store: the
    helper's output is a value, not a reference the frame should adopt. */
-static int emit_native_post(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                            int is_last) {
+static int emit_native_post(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d0, d1, src, sign;
 
@@ -866,10 +925,13 @@ static int emit_native_post(FILE *f, const Q2Func *fn, const Q2Insn *in,
      after `REG_UN_DEC`; the layout header carries only `REG_UN_NEG` and
      `REG_UN_INC`, so the value is spelled out here and checked against the one
      constant the header does give (INC), which pins the enum's numbering. */
-  fprintf(f, "    if (__builtin_expect((q2_unary_fast(%d, "
-             "AOT_REG(fr, %d), &_n) &&\n", Q2_REG_UN_TO_NUMERIC, src);
-  fprintf(f, "                        q2_unary_fast(%d, _n, &_m)), 1)) {\n",
-          sign);
+  fprintf(
+      f,
+      "    if (__builtin_expect((q2_unary_fast(%d, "
+      "AOT_REG(fr, %d), &_n) &&\n",
+      Q2_REG_UN_TO_NUMERIC, src);
+  fprintf(
+      f, "                        q2_unary_fast(%d, _n, &_m)), 1)) {\n", sign);
   emit_site_hit(f, in);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _n);\n", d0);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _m);\n", d1);
@@ -889,8 +951,8 @@ static int emit_native_post(FILE *f, const Q2Func *fn, const Q2Insn *in,
    A generator's `return` is not this: the handler suspends with an undefined
    code and parks the frame instead of leaving, so a generator keeps the op call.
    `JS_FUNC_GENERATOR` is bit 0 of the function kind. */
-static int emit_native_return(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                              int is_last) {
+static int emit_native_return(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int a;
 
@@ -899,14 +961,15 @@ static int emit_native_return(FILE *f, const Q2Func *fn, const Q2Insn *in,
     if (fn->g->func_kind != E2_FUNC_NORMAL) return 0;
     fprintf(f, "g_%d:\n", in->pc);
     fprintf(f, "    return JS_UNDEFINED;\n");
-    (void)a; (void)is_last;
+    (void)a;
+    (void)is_last;
     return 1;
   }
   if (in->rop != ROP_return) return 0;
   if (role == NULL || role->control != E2_CF_RETURN) return 0;
   /* The generator check, and the same for the returned value: an op call would
      have taken the suspend path, which this direct return cannot. */
-    if (fn->g->func_kind != E2_FUNC_NORMAL) return 0;
+  if (fn->g->func_kind != E2_FUNC_NORMAL) return 0;
   a = operand_off(in, role->use[0]);
   if (a < 0) return 0;
   fprintf(f, "g_%d:\n", in->pc);
@@ -930,19 +993,31 @@ static int emit_native_return(FILE *f, const Q2Func *fn, const Q2Insn *in,
    `dm` is stored even when the second half misses, because the handler stores it
    too and a fallback that re-runs the whole instruction reads it back from the
    frame. */
-static int emit_native_fused(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                             int is_last) {
+static int emit_native_fused(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int dm, x, y, da, c, second;
   int c_first;
 
   switch (in->rop) {
-  case ROP_mul_add: second = 1; c_first = 0; break;  /* the layout's ADD */
-  case ROP_mul_sub: second = 2; c_first = 0; break;  /* the layout's SUB */
-  case ROP_add_mul: second = 1; c_first = 1; break;
-  case ROP_sub_mul: second = 2; c_first = 1; break;
-  default:
-    return 0;
+    case ROP_mul_add:
+      second = 1;
+      c_first = 0;
+      break; /* the layout's ADD */
+    case ROP_mul_sub:
+      second = 2;
+      c_first = 0;
+      break; /* the layout's SUB */
+    case ROP_add_mul:
+      second = 1;
+      c_first = 1;
+      break;
+    case ROP_sub_mul:
+      second = 2;
+      c_first = 1;
+      break;
+    default:
+      return 0;
   }
   if (role == NULL || role->control != E2_CF_NONE) return 0;
   if (in->narg < 5 || in->arg[0].kind != 'r' || in->arg[1].kind != 'r' ||
@@ -960,17 +1035,24 @@ static int emit_native_fused(FILE *f, const Q2Func *fn, const Q2Insn *in,
   /* The sub-op numbers are the layout header's constants, not the engine's enum
      names: the unit is compiled against the header, and `QJS_AOT_REG_BIN_MUL` is
      0 (the engine's enum starts at MUL). */
-  fprintf(f, "    if (__builtin_expect(q2_arith(QJS_AOT_REG_BIN_MUL, "
-             "AOT_REG(fr, %d), AOT_REG(fr, %d), &_t), 1)) {\n", x, y);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_arith(QJS_AOT_REG_BIN_MUL, "
+      "AOT_REG(fr, %d), AOT_REG(fr, %d), &_t), 1)) {\n",
+      x, y);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _t);\n", dm);
   if (c_first)
-    fprintf(f, "        if (__builtin_expect(q2_arith(%s, AOT_REG(fr, %d), "
-               "AOT_REG(fr, %d), &_r), 1)) {\n",
-            second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", c, dm);
+    fprintf(
+        f,
+        "        if (__builtin_expect(q2_arith(%s, AOT_REG(fr, %d), "
+        "AOT_REG(fr, %d), &_r), 1)) {\n",
+        second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", c, dm);
   else
-    fprintf(f, "        if (__builtin_expect(q2_arith(%s, AOT_REG(fr, %d), "
-               "AOT_REG(fr, %d), &_r), 1)) {\n",
-            second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", dm, c);
+    fprintf(
+        f,
+        "        if (__builtin_expect(q2_arith(%s, AOT_REG(fr, %d), "
+        "AOT_REG(fr, %d), &_r), 1)) {\n",
+        second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", dm, c);
   emit_site_hit(f, in);
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _r);\n", da);
   fprintf(f, "            goto g_%d;\n", in->next);
@@ -993,8 +1075,8 @@ static int emit_native_fused(FILE *f, const Q2Func *fn, const Q2Insn *in,
    by using the complementary comparison.
 
    The target is a relative offset from the instruction's end. */
-static int emit_native_branch_cmp(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                  int is_last) {
+static int emit_native_branch_cmp(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int a, b, sub, tgt, inv;
   unsigned base;
@@ -1010,7 +1092,8 @@ static int emit_native_branch_cmp(FILE *f, const Q2Func *fn, const Q2Insn *in,
   base = (unsigned)sub & ~(unsigned)REG_CMP_INVERT;
   /* The fused undefined tests are their own single-tag path (see the handler);
      they are not a compare of two values and are left as op calls. */
-  if (base >= (unsigned)REG_BIN_IS_UNDEF && base < (unsigned)REG_BIN_IS_UNDEF + 2)
+  if (base >= (unsigned)REG_BIN_IS_UNDEF &&
+      base < (unsigned)REG_BIN_IS_UNDEF + 2)
     return 0;
   a = E2_ROFF(in->arg[1]);
   b = E2_ROFF(in->arg[2]);
@@ -1020,13 +1103,24 @@ static int emit_native_branch_cmp(FILE *f, const Q2Func *fn, const Q2Insn *in,
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _a = AOT_REG(fr, %d), _b = AOT_REG(fr, %d);\n", a, b);
   fprintf(f, "    int _c = -1, _take;\n");
-  fprintf(f, "    if (__builtin_expect(JS_VALUE_IS_BOTH_INT(_a, _b), 1))\n");
-  fprintf(f, "        _c = q2_cmp_int(%d, JS_VALUE_GET_INT(_a), "
-             "JS_VALUE_GET_INT(_b));\n", base);
-  fprintf(f, "    else if (JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 &&\n");
-  fprintf(f, "             JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64)\n");
-  fprintf(f, "        _c = q2_cmp_double(%d, JS_VALUE_GET_FLOAT64(_a), "
-             "JS_VALUE_GET_FLOAT64(_b));\n", base);
+  /* Braced throughout: the harness refuses a brace-less `if` in emitted C,
+     because a guard without a block can silently swallow the statement after
+     it -- which for a write-back means an unconditional write turning
+     conditional. */
+  fprintf(f, "    if (__builtin_expect(JS_VALUE_IS_BOTH_INT(_a, _b), 1)) {\n");
+  fprintf(
+      f,
+      "        _c = q2_cmp_int(%d, JS_VALUE_GET_INT(_a), "
+      "JS_VALUE_GET_INT(_b));\n",
+      base);
+  fprintf(f, "    } else if (JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 &&\n");
+  fprintf(f, "             JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64) {\n");
+  fprintf(
+      f,
+      "        _c = q2_cmp_double(%d, JS_VALUE_GET_FLOAT64(_a), "
+      "JS_VALUE_GET_FLOAT64(_b));\n",
+      base);
+  fprintf(f, "    }\n");
   fprintf(f, "    if (__builtin_expect(_c >= 0, 1)) {\n");
   emit_site_hit(f, in);
   fprintf(f, "        _take = _c ^ %d;\n", inv ? 1 : 0);
@@ -1047,8 +1141,8 @@ static int emit_native_branch_cmp(FILE *f, const Q2Func *fn, const Q2Insn *in,
    `move_xfer` ("rr": d, s): copy and empty the source. Under DRC a register
    borrows, so nothing is released and `qjs_aot_move_xfer` is the same two lines
    the handler runs. It cannot fail. */
-static int emit_native_frame_ops(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                 int is_last) {
+static int emit_native_frame_ops(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, s;
 
@@ -1059,8 +1153,11 @@ static int emit_native_frame_ops(FILE *f, const Q2Func *fn, const Q2Insn *in,
     fprintf(f, "g_%d: {\n", in->pc);
     fprintf(f, "    JSValue _t;\n");
     fprintf(f, "    int _own = qjs_aot_load_this(ctx, f, &_t);\n");
-    fprintf(f, "    if (__builtin_expect(_own < 0, 0)) { pc = %d; "
-               "goto exception; }\n", in->pc);
+    fprintf(
+        f,
+        "    if (__builtin_expect(_own < 0, 0)) { pc = %d; "
+        "goto exception; }\n",
+        in->pc);
     fprintf(f, "    if (_own) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n", d);
     fprintf(f, "    else AOT_SET_B(ctx, fr, %d, _t);\n", d);
     fprintf(f, "    goto g_%d;\n", in->next);
@@ -1096,8 +1193,8 @@ static int emit_native_frame_ops(FILE *f, const Q2Func *fn, const Q2Insn *in,
    `new Array(n)` has `count == 0` and `length == n`, so a count-based arm
    returned 0 for it -- a wrong answer, not a missed fast path (`e2ops`
    `call-00.js` caught it). */
-static int emit_native_arg_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                int is_last) {
+static int emit_native_arg_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d0, d1, s0, s1;
 
@@ -1131,8 +1228,8 @@ static int emit_native_arg_read(FILE *f, const Q2Func *fn, const Q2Insn *in,
   return 0;
 }
 
-static int emit_native_length(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                              int is_last) {
+static int emit_native_length(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
   int d, recv;
 
@@ -1144,11 +1241,15 @@ static int emit_native_length(FILE *f, const Q2Func *fn, const Q2Insn *in,
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    double _len;\n");
-  fprintf(f, "    if (__builtin_expect(q2_array_length(AOT_REG(fr, %d), "
-             "&_len), 1)) {\n", recv);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_array_length(AOT_REG(fr, %d), "
+      "&_len), 1)) {\n",
+      recv);
   emit_site_hit(f, in);
-  fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, (int)_len));\n",
-          d);
+  fprintf(
+      f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, (int)_len));\n",
+      d);
   fprintf(f, "        goto g_%d;\n", in->next);
   fprintf(f, "    }\n");
   emit_site_miss(f, in);
@@ -1161,18 +1262,18 @@ static int emit_native_length(FILE *f, const Q2Func *fn, const Q2Insn *in,
    way to fail. Everything else is an op call for now. */
 static int is_trivial(const Q2Insn *in) {
   switch (in->rop) {
-  case ROP_move:
-  case ROP_move_s:
-  case ROP_load_i8:
-  case ROP_load_i8_s:
-  case ROP_load_i32:
-  case ROP_load_undefined:
-  case ROP_load_null:
-  case ROP_load_true:
-  case ROP_load_false:
-    return 1;
-  default:
-    return 0;
+    case ROP_move:
+    case ROP_move_s:
+    case ROP_load_i8:
+    case ROP_load_i8_s:
+    case ROP_load_i32:
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false:
+      return 1;
+    default:
+      return 0;
   }
 }
 
@@ -1181,37 +1282,37 @@ static int is_trivial(const Q2Insn *in) {
 static void emit_trivial(FILE *f, const Q2Insn *in, const E2Role *role) {
   fprintf(f, "g_%d:\n", in->pc);
   switch (in->rop) {
-  case ROP_move:
-  case ROP_move_s: {
-    /* move: dst = src. Both are registers, so the copy is one frame store. */
-    int d = E2_ROFF(in->arg[0]), s = E2_ROFF(in->arg[1]);
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, AOT_REG(fr, %d));\n", d, s);
-    break;
-  }
-  case ROP_load_i8:
-  case ROP_load_i8_s:
-  case ROP_load_i32: {
-    int d = E2_ROFF(in->arg[0]);
-    int32_t v = (int32_t)in->arg[1].val;
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, %d));\n",
-            d, v);
-    break;
-  }
-  case ROP_load_undefined:
-  case ROP_load_null:
-  case ROP_load_true:
-  case ROP_load_false: {
-    int d = E2_ROFF(in->arg[0]);
-    const char *v = in->rop == ROP_load_undefined ? "JS_UNDEFINED"
-                    : in->rop == ROP_load_null    ? "JS_NULL"
-                    : in->rop == ROP_load_true    ? "JS_TRUE"
-                                                  : "JS_FALSE";
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s);\n", d, v);
-    break;
-  }
-  default:
-    fprintf(f, "    /* unhandled trivial op %d */\n", in->rop);
-    break;
+    case ROP_move:
+    case ROP_move_s: {
+      /* move: dst = src. Both are registers, so the copy is one frame store. */
+      int d = E2_ROFF(in->arg[0]), s = E2_ROFF(in->arg[1]);
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, AOT_REG(fr, %d));\n", d, s);
+      break;
+    }
+    case ROP_load_i8:
+    case ROP_load_i8_s:
+    case ROP_load_i32: {
+      int d = E2_ROFF(in->arg[0]);
+      int32_t v = (int32_t)in->arg[1].val;
+      fprintf(
+          f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, %d));\n", d, v);
+      break;
+    }
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false: {
+      int d = E2_ROFF(in->arg[0]);
+      const char *v = in->rop == ROP_load_undefined ? "JS_UNDEFINED"
+                      : in->rop == ROP_load_null    ? "JS_NULL"
+                      : in->rop == ROP_load_true    ? "JS_TRUE"
+                                                    : "JS_FALSE";
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, %s);\n", d, v);
+      break;
+    }
+    default:
+      fprintf(f, "    /* unhandled trivial op %d */\n", in->rop);
+      break;
   }
   (void)role;
 }
@@ -1236,7 +1337,9 @@ static void emit_trivial(FILE *f, const Q2Insn *in, const E2Role *role) {
    "rrrb" (destination, callee, window start, count) and `call_method` is
    "rrrrb" (destination, callee, receiver, window start, count), so the callee
    is operand 1 and a method's receiver is operand 2. */
-static int call_callee_off(const Q2Insn *in) { return (int)in->arg[1].val; }
+static int call_callee_off(const Q2Insn *in) {
+  return (int)in->arg[1].val;
+}
 static int call_this_off(const Q2Insn *in) {
   return in->rop == ROP_call_method ? (int)in->arg[2].val : -1;
 }
@@ -1260,8 +1363,8 @@ static int call_site_shaped(const Q2Func *fn, const Q2Insn *in) {
    leaves the entry bound: a direct call still enters a callee the engine
    disabled. E2 bodies do not use that switch (D4), so the callee is always a
    body that may run. A miss falls through to the next link of the chain. */
-static void emit_one_direct_call(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                                 const char *hex, int next) {
+static void emit_one_direct_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const char *hex, int next) {
   int cc = call_callee_off(in);
   int th = call_this_off(in);
   int off = dest_off(fn, in);
@@ -1279,24 +1382,27 @@ static void emit_one_direct_call(FILE *f, const Q2Func *fn, const Q2Insn *in,
      not define. The macro exists for exactly this and is set for every emitted
      function. */
   fprintf(f, "#ifdef Q2_NATIVE_%s\n", hex);
-  fprintf(f,
-          "    if (__builtin_expect(q2_call_entry(AOT_REG(fr, %d), "
-          "(const void *)aot_f_%s), 1)) {\n",
-          cc, hex);
+  fprintf(
+      f,
+      "    if (__builtin_expect(q2_call_entry(AOT_REG(fr, %d), "
+      "(const void *)aot_f_%s), 1)) {\n",
+      cc, hex);
   /* The callee's realm is the context its body runs in, which the entry takes
      from the bytecode; `ctx` here is only the caller's. */
-  fprintf(f,
-          "        JSValue _o = aot_n_%s(ctx, f,\n"
-          "            (JSObject *)JS_VALUE_GET_PTR(AOT_REG(fr, %d)), %s,\n"
-          "            &AOT_REG(fr, %d), %d);\n",
-          hex, cc, recv, w, na);
-  fprintf(f,
-          "        if (__builtin_expect(JS_IsException(_o), 0)) { pc = %d; "
-          "goto exception; }\n"
-          "        qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
-          "        goto g_%d;\n"
-          "    }\n",
-          in->pc, off, next);
+  fprintf(
+      f,
+      "        JSValue _o = aot_n_%s(ctx, f,\n"
+      "            (JSObject *)JS_VALUE_GET_PTR(AOT_REG(fr, %d)), %s,\n"
+      "            &AOT_REG(fr, %d), %d);\n",
+      hex, cc, recv, w, na);
+  fprintf(
+      f,
+      "        if (__builtin_expect(JS_IsException(_o), 0)) { pc = %d; "
+      "goto exception; }\n"
+      "        qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+      "        goto g_%d;\n"
+      "    }\n",
+      in->pc, off, next);
   fprintf(f, "#endif\n");
 }
 
@@ -1305,8 +1411,8 @@ static void emit_one_direct_call(FILE *f, const Q2Func *fn, const Q2Insn *in,
    one callee emits one link; a site with two to four emits one per callee, in
    the profile's order (hottest first). The chain's last arm falls into the op
    call, which is the engine's own handler for the instruction. */
-static int emit_native_call(FILE *f, const Q2Func *fn, const Q2Insn *in,
-                            int is_last) {
+static int emit_native_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   char hex[4][33];
   unsigned long long hits[4];
   int kind[4], n = 0, k, nb = 0;
@@ -1364,8 +1470,10 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   if (!fn->ok) return -1;
   has_ctl = fn->g->ctl_count > 0;
 
-  fprintf(f, "E2_TEXT static JSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n", hex);
-  fprintf(f, "                                 JSValue *fr, uint32_t entry_pc)\n");
+  fprintf(
+      f, "E2_TEXT static JSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n", hex);
+  fprintf(
+      f, "                                 JSValue *fr, uint32_t entry_pc)\n");
   fprintf(f, "{\n");
   fprintf(f, "    uint8_t *code = q2_code(f);\n");
   fprintf(f, "    uint8_t *ip;\n");
@@ -1394,11 +1502,16 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
      it polls: an inline decrement of the interrupt counter, and the engine only
      when the counter runs out. Without this a compiled loop never yields. */
   fprintf(f, "    if (__builtin_expect(entry_pc <= e2_from_pc, 0)) {\n");
-  fprintf(f, "        if (__builtin_expect(--*(int *)((unsigned char *)ctx +\n");
-  fprintf(f, "                QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n");
+  fprintf(
+      f, "        if (__builtin_expect(--*(int *)((unsigned char *)ctx +\n");
+  fprintf(
+      f, "                QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n");
   fprintf(f, "            ++*(int *)((unsigned char *)ctx +\n");
   fprintf(f, "                QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n");
-  fprintf(f, "            if (qjs_aot_poll(ctx) < 0) { pc = e2_from_pc; goto exception; }\n");
+  fprintf(
+      f,
+      "            if (qjs_aot_poll(ctx) < 0) { pc = e2_from_pc; goto "
+      "exception; }\n");
   fprintf(f, "        }\n");
   fprintf(f, "    }\n");
   fprintf(f, "    e2_from_pc = entry_pc;\n");
@@ -1410,7 +1523,9 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
      counters count it so the gate can require zero. */
   fprintf(f, "    default:\n");
   fprintf(f, "        e2_g8_hits++;\n");
-  fprintf(f, "        return qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
+  fprintf(
+      f,
+      "        return qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
   fprintf(f, "    }\n");
 
   for (i = 0; i < fn->ninsns; i++) {
@@ -1497,11 +1612,18 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
    generic body is the thing being built. */
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   (void)fn;
-  fprintf(f, "E2_TEXT static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n", hex);
-  fprintf(f, "                                 JSValue *fr, uint32_t entry_pc)\n");
+  fprintf(
+      f, "E2_TEXT static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n", hex);
+  fprintf(
+      f, "                                 JSValue *fr, uint32_t entry_pc)\n");
   fprintf(f, "{\n");
-  fprintf(f, "    /* The speculative body arrives in E8; until then every entry is\n");
-  fprintf(f, "       the generic body's, which has a label for every instruction. */\n");
+  fprintf(
+      f,
+      "    /* The speculative body arrives in E8; until then every entry is\n");
+  fprintf(
+      f,
+      "       the generic body's, which has a label for every instruction. "
+      "*/\n");
   fprintf(f, "    return aot_g_%s(ctx, f, fr, entry_pc);\n", hex);
   fprintf(f, "}\n\n");
   return 0;

@@ -70,7 +70,9 @@ static int lb_join(int a, int b) {
 
 /* Whether a representation is a number held in a C number type. BOT is *not*
    one: an uncomputed value is unknown, not boxed. */
-static int lb_num(int lb) { return lb == E2_LB_I32 || lb == E2_LB_F64; }
+static int lb_num(int lb) {
+  return lb == E2_LB_I32 || lb == E2_LB_F64;
+}
 
 /* ---- the profile's record for a definition ------------------------------ */
 
@@ -166,8 +168,7 @@ static int inc_by_operand(const Q2Insn *in) {
    instruction describes only the second link. */
 static int chain_first_link(const Q2Insn *in, int k) {
   return k == 0 && in->ndef == 2 &&
-         (in->rop == ROP_get_field_chain ||
-          in->rop == ROP_get_field_chain_own);
+         (in->rop == ROP_get_field_chain || in->rop == ROP_get_field_chain_own);
 }
 
 /* ---- the transfer ------------------------------------------------------- */
@@ -397,8 +398,7 @@ static int transfer_def(
       a = w[in->use[0]];
       if (sub == REG_UN_NEG) {
         if (a == E2_LB_BOT) return E2_LB_BOT;
-        if (a == E2_LB_I32)
-          return record_int_only(dv) ? E2_LB_I32 : E2_LB_F64;
+        if (a == E2_LB_I32) return record_int_only(dv) ? E2_LB_I32 : E2_LB_F64;
         if (a == E2_LB_F64) return E2_LB_F64;
         *whyp = E2_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];
@@ -414,6 +414,13 @@ static int transfer_def(
       }
       *whyp = E2_WHY_UNKNOWN_RESULT;
       return E2_LB_TAG;
+    case Q2_OP_POST_INC:
+      /* "rrr": t, s, h -- h is s after the increment, t is the value s had
+         before it. Both are the operand's representation, so both follow
+         `rep_inc`; the integer case keeps i32 because the lowering guards the
+         overflow. */
+      if (in->nuse < 1) return E2_LB_TAG;
+      return rep_inc(w[in->use[0]]);
     case Q2_OP_BRANCH_CMP:
       /* `inc_branch_lt`: `d = d + 1` in place, then compare. An int stays an
          int (the lowering guards the overflow). */
@@ -559,7 +566,8 @@ static int arith_kind(const Q2Insn *in) {
    the seed pass's answer, which is why this runs right after it. The lowering
    guards the overflow and exits before the instruction if the initial value is
    not a number, so the optimism is checked at run time. */
-static int loop_counter_param(const Q2Func *fn, const uint8_t *w, int b, int k) {
+static int loop_counter_param(
+    const Q2Func *fn, const uint8_t *w, int b, int k) {
   const Q2Block *blk = &fn->blocks[b];
   Q2ValueId pv = blk->param_val[k];
   int p, saw_self_inc = 0;
@@ -686,8 +694,8 @@ static int why_tagged(
       int lb;
       Q2ValueId whyv = Q2_NO_VALUE;
       if (in->def[d] != v) continue;
-      lb = transfer_def(fn, facts, in, val->insn, d, t->lb, &whyp, &whyv,
-                        &from_opcall);
+      lb = transfer_def(
+          fn, facts, in, val->insn, d, t->lb, &whyp, &whyv, &from_opcall);
       if (whyp != E2_WHY_NONE) {
         *src = whyv;
         return whyp;
@@ -883,8 +891,8 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
             Q2ValueId src = facts->fwd[insn];
             lb = src < (Q2ValueId)nv ? w[src] : E2_LB_TAG;
           } else {
-            lb = transfer_def(fn, facts, in, insn, d, w, &whyp, &whyv,
-                              &from_opcall);
+            lb = transfer_def(
+                fn, facts, in, insn, d, w, &whyp, &whyv, &from_opcall);
           }
           if (lb != w[v]) {
             w[v] = (uint8_t)lb;
@@ -926,7 +934,8 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
      the final state, so a reason cannot describe an intermediate step. */
   for (i = 0; i < nv; i++) {
     if (out->lb[i] != E2_LB_TAG) continue;
-    out->why[i] = (uint8_t)why_tagged(fn, facts, out, (Q2ValueId)i, &out->whyv[i]);
+    out->why[i] =
+        (uint8_t)why_tagged(fn, facts, out, (Q2ValueId)i, &out->whyv[i]);
     if (out->why[i] == E2_WHY_NONE) out->why[i] = E2_WHY_UNREACHABLE;
   }
 
@@ -968,7 +977,8 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     int d;
     for (d = 0; d < in->ndef; d++) {
       Q2ValueId v = in->def[d];
-      if (out->arith[v] != E2_AK_ARITH && out->arith[v] != E2_AK_FUSED) continue;
+      if (out->arith[v] != E2_AK_ARITH && out->arith[v] != E2_AK_FUSED)
+        continue;
       out->arithv_total++;
       if (out->lb[v] != E2_LB_TAG) out->arithv_typed++;
     }
@@ -1163,7 +1173,8 @@ static int rootcmp(const void *a, const void *b) {
   return (int)x->v - (int)y->v;
 }
 
-int e2_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight) {
+int e2_analysis_dump(
+    FILE *f, const Q2Func *fn, const char *hex, double weight) {
   E2Facts facts;
   E2Types types;
   int b, k, i, rc = -1;
@@ -1206,8 +1217,8 @@ int e2_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight) 
   for (i = 0; i < facts.ngroups; i++) {
     const E2Group *g = &facts.groups[i];
     fprintf(
-        f, "T     G%d shape=%lld first=%d sites=", i,
-        (long long)g->shape, g->first_site);
+        f, "T     G%d shape=%lld first=%d sites=", i, (long long)g->shape,
+        g->first_site);
     for (k = 0; k < g->nsites; k++)
       fprintf(f, "%s%d", k ? "," : "", g->sites[k]);
     fputc('\n', f);
@@ -1276,11 +1287,9 @@ int e2_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight) 
         }
         if (rep[0] == 't' && rep[1] == 'a') {
           Q2ValueId whyv = types.whyv[v];
-          fprintf(
-              f, " why=%s", why_name(types.why[v]));
-          if (whyv != Q2_NO_VALUE &&
-              (types.why[v] == E2_WHY_OPERAND_TAGGED ||
-               types.why[v] == E2_WHY_PHI_TAGGED))
+          fprintf(f, " why=%s", why_name(types.why[v]));
+          if (whyv != Q2_NO_VALUE && (types.why[v] == E2_WHY_OPERAND_TAGGED ||
+                                      types.why[v] == E2_WHY_PHI_TAGGED))
             fprintf(f, "(v%u)", whyv);
         } else if (types.exits[v] != 0) {
           fprintf(f, " exits=");
@@ -1350,7 +1359,8 @@ int e2_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight) 
      results" or its op counts. */
   fprintf(
       f,
-      "T   summary i32=%d f64=%d bool=%d tag=%d live=%d arith=%d/%d arithv=%d/%d "
+      "T   summary i32=%d f64=%d bool=%d tag=%d live=%d arith=%d/%d "
+      "arithv=%d/%d "
       "fwd=%d skip=%d\n",
       types.ntyped[2], types.ntyped[3], types.ntyped[1], types.ntagged,
       types.nlive, types.arith_typed, types.arith_total, types.arithv_typed,

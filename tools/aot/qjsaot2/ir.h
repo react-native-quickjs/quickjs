@@ -93,6 +93,15 @@ enum {
   Q2_OP_LOAD_THIS,
   Q2_OP_PUT_FIELD,
   Q2_OP_CALL,
+  /* Ops the E2 projection named as unmodelled (`.local/E2-PROJECTION.md`
+     recommendation 1). Before these existed, q2_rop_info returned FALLBACK
+     with no operands, so the IR treated the instruction as redefining every
+     live register and the arithmetic after it was boxed. */
+  Q2_OP_POST_INC,    /* t, s, h: h = ++s, t = the value before -- 2 dests */
+  Q2_OP_PUT_VAR_REF, /* slot, s: the closure cell takes s */
+  Q2_OP_TO_PROPKEY,  /* d = ToPropertyKey(src); the 2-operand form adds a
+                         null/undefined check on a third register */
+  Q2_OP_SET_NAME,    /* sets the function name; writes nothing to a register */
   Q2_OP_COUNT
 };
 
