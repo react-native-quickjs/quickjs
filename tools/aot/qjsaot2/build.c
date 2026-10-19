@@ -438,6 +438,19 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
+    /* "ri": one register, both source and destination -- `regs[d] = regs[d] +
+       imm`. A read-modify-write, so the same operand is one def and one use.
+       The projection counted 48 of these boxed in navierstokes. */
+    case ROP_add_imm_self_s:
+    case ROP_sub_imm_self_s:
+      info.op = Q2_OP_UNARY;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_CONTROL;
+      return &info;
     case ROP_compare:
       info.op = Q2_OP_COMPARE;
       info.ndef = 1;

@@ -859,9 +859,11 @@ static int emit_native_unary(
   else
     return 0;
   if (sub < 0) return 0;
-  /* The IR classifies `dec` as a plain fallback with no declared operands, so
-     for it the instruction's own decoded operands are the only source: "rr" is
-     destination then source, which is also what the handler reads. */
+  /* Both branches below are kept: `dec`, `not` and `to_numeric` used to reach
+     here as operands-free fallbacks and are now modelled in the IR with roles,
+     but an op whose role the table does not describe still has to fall back to
+     the instruction's own decoded operands. "rr" is destination then source,
+     which is also what the handler reads. */
   if (role->nuse > 0 && in->nuse == 1 && in->ndef == 1) {
     d = dest_off(fn, in);
     a = operand_off(in, role->use[0]);
@@ -906,9 +908,11 @@ static int emit_native_post(
 
   if (in->rop != ROP_post_inc && in->rop != ROP_post_dec) return 0;
   if (role == NULL || role->control != E2_CF_NONE) return 0;
-  /* The IR classifies this as a plain fallback with no declared operands, so the
-     instruction's own operands are the only source. "rrr" is typed, source,
-     numeric, which is the order the handler reads (`REGVM_POST_OP`). */
+  /* The operand order comes from the instruction, not the role table: "rrr" is
+     typed, source, numeric, which is the order the handler reads
+     (`REGVM_POST_OP`). The role table now agrees (`def = {0,2}`, `use = {1}`),
+     but reading the op's own operands is what keeps this correct for any op the
+     table has not been taught. */
   if (in->narg < 3 || in->arg[0].kind != 'r' || in->arg[1].kind != 'r' ||
       in->arg[2].kind != 'r')
     return 0;
