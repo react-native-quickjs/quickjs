@@ -1229,6 +1229,23 @@ static int emit_native_arg_read(
     (void)is_last;
     return 1;
   }
+  /* "ru": a closure variable read. The engine's own helper is always_inline and
+     is exactly `*f->var_refs[slot]->pvalue`, so this is a load through two
+     pointers rather than an op call. The value is borrowed from the cell (the
+     cell owns it), so the store duplicates. */
+  if (in->rop == ROP_get_var_ref) {
+    if (role == NULL || role->control != E2_CF_NONE) return 0;
+    if (in->narg < 2 || in->arg[0].kind != 'r' || in->arg[1].kind != 'u')
+      return 0;
+    d0 = E2_ROFF(in->arg[0]);
+    s0 = (int)in->arg[1].val;
+    fprintf(f, "g_%d:\n", in->pc);
+    fprintf(
+        f, "    AOT_SET_B(ctx, fr, %d, qjs_aot_get_var_ref(f, %d));\n", d0, s0);
+    fprintf(f, "    goto g_%d;\n", in->next);
+    (void)is_last;
+    return 1;
+  }
   return 0;
 }
 
