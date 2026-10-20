@@ -1963,9 +1963,20 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   return 0;
 }
 
-/* Overflow-exit pcs seen while emitting: each gets a stub after the blocks. */
+/* Overflow exits seen while emitting: each gets a stub after the blocks. The
+   `cur[]` snapshot is the block-local state AT that instruction -- the stub must
+   sync from it, or it writes nothing and the generic body reads the frame's old
+   contents (which is what made a deleted overflow check look harmless: the
+   resumed body then recomputed from stale-but-correct arguments). */
 static int g_e2_ox[256];
+static Q2ValueId *g_e2_ox_cur[256];
+static int g_e2_ox_regs = 0;
 static int g_e2_ox_n = 0;
+/* Argument-guard exits: same treatment, but the sync set is empty -- the guard
+   fires before anything is in a local, so the frame still holds what the caller
+   wrote and the generic body's g_<pc> reloads the arguments itself. */
+static int g_e2_ax[256];
+static int g_e2_ax_n = 0;
 
 /* The function being emitted, for the helpers that need its value table. */
 static const Q2Func *g_e2_fn = NULL;
@@ -2001,14 +2012,39 @@ static void e2_local_name(char *buf, size_t n, Q2ValueId v) {
 /* Load an argument slot into a value's local, converting by the value's
    representation: the argument buffer holds a JSValue, and a typed local is not
    one. */
-static void e2_load_arg_to_local(FILE *f, Q2ValueId v, int slot) {
+static void e2_load_arg_to_local(FILE *f, Q2ValueId v, int slot, int pc) {
   char dn[32];
   e2_local_name(dn, sizeof(dn), v);
+  if (e2_rep_prefix(v)[0] != 'v' &&
+      g_e2_ax_n < (int)(sizeof(g_e2_ax) / sizeof(g_e2_ax[0]))) {
+    /* One guard per pc, not per destination: get_arg2 has two and both jump to
+       the same label. */
+    int q, seen = 0;
+    for (q = 0; q < g_e2_ax_n; q++)
+      if (g_e2_ax[q] == pc) seen = 1;
+    if (!seen) g_e2_ax[g_e2_ax_n++] = pc;
+  }
+  /* An argument the analysis typed needs its TAG CHECK here: the profile said
+     this slot holds an int, but the caller may pass a double, a string or
+     nothing at all. Reading the payload without checking would use garbage bits
+     as an integer. The exit is at this instruction's pc, which is safe because
+     nothing has been written to the frame yet. */
   switch (e2_rep_prefix(v)[0]) {
     case 'i':
+      fprintf(
+          f,
+          "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
+          "JS_TAG_INT, 0)) goto ax_%d;\n",
+          slot, pc);
       fprintf(f, "    %s = JS_VALUE_GET_INT(q2_arg_buf(f)[%d]);\n", dn, slot);
       break;
     case 'd':
+      fprintf(
+          f,
+          "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
+          "JS_TAG_INT && JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
+          "JS_TAG_FLOAT64, 0)) goto ax_%d;\n",
+          slot, slot, pc);
       fprintf(
           f,
           "    %s = JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) == JS_TAG_INT ? "
@@ -2017,6 +2053,11 @@ static void e2_load_arg_to_local(FILE *f, Q2ValueId v, int slot) {
           dn, slot, slot, slot);
       break;
     case 'b':
+      fprintf(
+          f,
+          "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
+          "JS_TAG_BOOL, 0)) goto ax_%d;\n",
+          slot, pc);
       fprintf(f, "    %s = JS_VALUE_GET_BOOL(q2_arg_buf(f)[%d]);\n", dn, slot);
       break;
     default:
@@ -2096,8 +2137,15 @@ static int emit_typed_arith(
         "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
         "goto ox_%d;\n",
         in->pc);
-    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])))
-      g_e2_ox[g_e2_ox_n++] = in->pc;
+    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
+      Q2ValueId *snap = malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+      if (snap != NULL) {
+        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+        g_e2_ox[g_e2_ox_n] = in->pc;
+        g_e2_ox_cur[g_e2_ox_n] = snap;
+        g_e2_ox_n++;
+      }
+    }
   }
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -2201,7 +2249,8 @@ static void emit_trivial_own(
       break;
     }
     case ROP_get_arg:
-      if (d != Q2_NO_VALUE) e2_load_arg_to_local(f, d, (int)in->arg[1].val);
+      if (d != Q2_NO_VALUE)
+        e2_load_arg_to_local(f, d, (int)in->arg[1].val, in->pc);
       break;
     case ROP_get_arg2: {
       /* Two argument slots in one instruction: the form nearly every function
@@ -2211,11 +2260,11 @@ static void emit_trivial_own(
       char n0[32], n1[32];
       if (in->narg >= 4) {
         if (d0 != Q2_NO_VALUE) {
-          e2_load_arg_to_local(f, d0, (int)in->arg[1].val);
+          e2_load_arg_to_local(f, d0, (int)in->arg[1].val, in->pc);
           cur[g_e2_fn->values[d0].reg < g_e2_fn->nregs ? g_e2_fn->values[d0].reg : 0] = d0;
         }
         if (d1 != Q2_NO_VALUE) {
-          e2_load_arg_to_local(f, d1, (int)in->arg[3].val);
+          e2_load_arg_to_local(f, d1, (int)in->arg[3].val, in->pc);
           cur[g_e2_fn->values[d1].reg < g_e2_fn->nregs ? g_e2_fn->values[d1].reg : 0] = d1;
         }
       }
@@ -2320,9 +2369,9 @@ static void e2_emit_exit(
 /* An exit at an instruction's pc, computing the live set here. The arithmetic
    exit uses it: the operands are live, the result is not yet. */
 static void e2_emit_exit_at(
-    FILE *f, const Q2Func *fn, int ins, int pc, char hex[33], int fi) {
+    FILE *f, const Q2Func *fn, int ins, int pc, char hex[33], int fi,
+    const Q2ValueId *cur) {
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
-  Q2ValueId *cur = NULL;
   if (lb != NULL) q2_live_before(fn, ins, lb);
   e2_emit_exit(f, fn, pc, hex, fi, cur, lb);
   free(lb);
@@ -2412,13 +2461,20 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    const void *pic = q2_pic(f);\n");
   fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
   fprintf(f, "    (void)q2_ns;\n");
-  fprintf(
-      f,
-      "    if (__builtin_expect(pic == NULL, 0)) {\n"
-      "        E2_REFUSE_NOTE(%d);\n"
-      "        return aot_g_%s(ctx, f, fr, 0);\n"
-      "    }\n",
-      fi, hex);
+  /* A function with no PIC sites -- a leaf arithmetic function, say -- has no
+     PIC table at all, so `pic` is NULL on EVERY call. Refusing on that refused
+     every such function for good (E2_REFUSE_NOTE switches a function off after
+     enough entries), and the speculative body never ran once. The table is only
+     needed by accesses, so the check is emitted only when the function has
+     sites; and the count is known here, at generation time. */
+  if (e2_pic_sites(fn) > 0)
+    fprintf(
+        f,
+        "    if (__builtin_expect(pic == NULL, 0)) {\n"
+        "        E2_REFUSE_NOTE(%d);\n"
+        "        return aot_g_%s(ctx, f, fr, 0);\n"
+        "    }\n",
+        fi, hex);
 
   /* S1. One C local per value, by representation. A value that is not live is
      not declared: the IR keeps values that trivial-parameter removal dropped. */
@@ -2533,6 +2589,21 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     free(cur);
   }
+  /* The argument-guard exits: a typed argument arrived with the wrong tag, so
+     nothing is in a local yet and the frame still holds the caller's values. The
+     stub is a plain exit with an empty sync set. */
+  {
+    int o;
+    for (o = 0; o < g_e2_ax_n; o++) {
+      int pc2 = g_e2_ax[o], ii, ins = -1;
+      for (ii = 0; ii < fn->ninsns; ii++)
+        if (fn->insns[ii].pc == pc2) { ins = ii; break; }
+      if (ins < 0) continue;
+      fprintf(f, "    ax_%d:;\n", pc2);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
+    }
+    g_e2_ax_n = 0;
+  }
   /* The overflow exits: the arithmetic check jumps here, and the exit does the
      sync and the hand-over. Nothing was written to the frame by the arithmetic
      itself, so the generic body redoes the operation in full precision. */
@@ -2544,10 +2615,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ox_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o]);
     }
+    for (o = 0; o < g_e2_ox_n; o++) free(g_e2_ox_cur[o]);
+    g_e2_ox_n = 0;
   }
-  g_e2_ox_n = 0;
   fprintf(f, "    }\n");
   fprintf(f, "}\n\n");
   (void)k;
