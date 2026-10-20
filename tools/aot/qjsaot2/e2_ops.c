@@ -1213,6 +1213,63 @@ static int emit_native_branch_cmp(
   return 1;
 }
 
+/* `inc_branch_lt_s` ("rrt": d, b, off): `d = d + 1`, then branch to the target
+   when the new value is still `< b`. It is the fused loop increment-and-test, so
+   in a loop with an empty body it *is* the body.
+
+   The destination is the same operand as the first use: the increment is in
+   place. The IR assigns the definition to that operand's register, so storing to
+   it is the edge copy -- the target block's parameter is that same register, and
+   the label is emitted after the store, so the jump does not reload a stale
+   value. The interrupt poll that every back edge needs is emitted inline before
+   the jump, because a self-loop's target is its own pc and would otherwise skip
+   the dispatch that polls.
+
+   The fast path is the handler's: both operands `int` and `d` not `INT32_MAX`
+   (that one value would overflow). Anything else goes to the op call, which does
+   the generic `++` and compare. The store is `AOT_SET_B`: `js_int32` yields a new
+   int and a register borrows under DRC, so nothing is released. */
+static int emit_native_inc_branch(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
+  const E2Role *role = e2_roles[in->rop];
+  int d, b, tgt;
+
+  if (in->rop != ROP_inc_branch_lt_s) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (in->narg < 3 || in->arg[0].kind != 'r' || in->arg[1].kind != 'r')
+    return 0;
+  d = E2_ROFF(in->arg[0]);
+  b = E2_ROFF(in->arg[1]);
+  tgt = (int)(in->next + q2_first_target_pub(in));
+  if (tgt < 0) return 0;
+
+  fprintf(f, "g_%d: {\n", in->pc);
+  fprintf(f, "    JSValue _v = AOT_REG(fr, %d), _b = AOT_REG(fr, %d);\n", d, b);
+  fprintf(f, "    if (__builtin_expect(JS_VALUE_GET_TAG(_v) == JS_TAG_INT &&\n");
+  fprintf(f, "                            JS_VALUE_GET_TAG(_b) == JS_TAG_INT &&\n");
+  fprintf(f, "                            JS_VALUE_GET_INT(_v) != INT32_MAX, 1)) {\n");
+  fprintf(f, "        int32_t _n = JS_VALUE_GET_INT(_v) + 1;\n");
+  emit_site_hit(f, in);
+  /* In-place: this is the edge copy into the target block's parameter. */
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, _n));\n", d);
+  fprintf(f, "        if (_n < JS_VALUE_GET_INT(_b)) {\n");
+  /* The back edge polls before it jumps, as the dispatch would. */
+  fprintf(f, "            if (__builtin_expect(--*(int *)((unsigned char *)ctx +\n");
+  fprintf(f, "                    QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n");
+  fprintf(f, "                ++*(int *)((unsigned char *)ctx +\n");
+  fprintf(f, "                    QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n");
+  fprintf(f, "                if (qjs_aot_poll(ctx) < 0) { pc = %d; goto exception; }\n", in->pc);
+  fprintf(f, "            }\n");
+  fprintf(f, "            goto g_%d;\n", tgt);
+  fprintf(f, "        }\n");
+  fprintf(f, "        goto g_%d;\n", in->next);
+  fprintf(f, "    }\n");
+  emit_site_miss(f, in);
+  fprintf(f, "}\n");
+  (void)is_last;
+  return 0 == 0;
+}
+
 /* `load_this` ("r": d): the frame's receiver, boxed for a non-strict function
    exactly as the handler boxes it. `qjs_aot_load_this` is the same code, so the
    fast path is one call and there is no miss arm; only a boxing failure (which
@@ -1686,6 +1743,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
         emit_native_unary(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_post(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_length(f, fn, in, i + 1 == fn->ninsns) ||
+        emit_native_inc_branch(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_branch_cmp(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_fused(f, fn, in, i + 1 == fn->ninsns)) {
       note_opcall(fn, in, 1);
