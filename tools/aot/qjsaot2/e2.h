@@ -120,6 +120,12 @@ void e2_set_poison(int on);
 /* --emit2-nocall: omit the native call sites, so the call-cost benchmark can
    measure the entry without them. A/B switch, not a shipping mode. */
 void e2_set_nocall(int on);
+
+/* Split units: compiled functions get hidden external linkage, and the caller
+   writes one .c per function. */
+void e2_set_split(int on);
+int e2_split_on(void);
+const char *e2_linkage(void);
 int e2_nocall_on(void);
 
 /* --- the report ------------------------------------------------------- */

@@ -4259,13 +4259,13 @@ static void q2_emit_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(
       f,
       "static int q2_spec_off_%s, q2_spec_fail_%s;\n"
-      "E2_TEXT static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
       "                                 JSValue *fr, uint32_t entry_pc)\n"
       "{\n"
       "    (void)q2_spec_off_%s; (void)q2_spec_fail_%s;\n"
       "    return aot_g_%s(ctx, f, fr, entry_pc);\n"
       "}\n\n",
-      hex, hex, hex, hex, hex, hex);
+      hex, hex, e2_linkage(), hex, hex, hex, hex);
 }
 
 

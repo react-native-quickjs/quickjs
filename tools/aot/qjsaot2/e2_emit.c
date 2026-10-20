@@ -22,6 +22,20 @@
 int e2_on;
 char e2_only_hex[33];
 
+/* When set, compiled functions get external (hidden) linkage instead of
+   `static`, so a unit split across files can call between them. Set by the
+   unit builder for `--emit2-split`. */
+static int e2_split;
+void e2_set_split(int on) {
+  e2_split = on ? 1 : 0;
+}
+int e2_split_on(void) {
+  return e2_split;
+}
+const char *e2_linkage(void) {
+  return e2_split ? "__attribute__((visibility(\"hidden\"))) " : "static ";
+}
+
 /* The call-site A/B switch (--emit2-nocall). */
 static int e2_nocall;
 void e2_set_nocall(int on) {
@@ -101,11 +115,11 @@ void e2_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
 
   fprintf(
       f,
-      "E2_TEXT static JSValue aot_n_%s(JSContext *ctx, JSRegRun *caller_f,\n"
+      "E2_TEXT %sJSValue aot_n_%s(JSContext *ctx, JSRegRun *caller_f,\n"
       "                               JSObject *co, JSValue this_obj,\n"
       "                               JSValue *argv, int argc)\n"
       "{\n",
-      hex);
+      e2_linkage(), hex);
   /* The frame. Over-aligned because the register file inside it is read as
      JSValue and the engine's own frames are 16-byte aligned. */
   fprintf(

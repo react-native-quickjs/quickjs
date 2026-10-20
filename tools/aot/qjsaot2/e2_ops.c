@@ -1586,7 +1586,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   has_ctl = fn->g->ctl_count > 0;
 
   fprintf(
-      f, "E2_TEXT static JSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n", hex);
+      f, "E2_TEXT %sJSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n", e2_linkage(), hex);
   fprintf(
       f, "                                 JSValue *fr, uint32_t entry_pc)\n");
   fprintf(f, "{\n");
@@ -1728,7 +1728,8 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   (void)fn;
   fprintf(
-      f, "E2_TEXT static JSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n", hex);
+      f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
+      e2_linkage(), hex);
   fprintf(
       f, "                                 JSValue *fr, uint32_t entry_pc)\n");
   fprintf(f, "{\n");
