@@ -1175,8 +1175,26 @@ static int emit_native_frame_ops(
       return 0;
     d = E2_ROFF(in->arg[0]);
     s = E2_ROFF(in->arg[1]);
+    /* Emitted inline rather than as a call: under QJS_DRC the engine's helper
+       is `*dst = *src` (registers borrow, so the dead source is left alone),
+       and a call to a function that does one two-word copy is pure overhead --
+       the unit is a separate translation unit, so the engine's always_inline
+       has no effect here. A coalesced move (d == s) still needs no code. */
     fprintf(f, "g_%d:\n", in->pc);
-    fprintf(f, "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n", d, s);
+    /* The DRC test is emitted *into* the unit, so the unit's own build decides
+       it -- the generator's flags say nothing about how the unit is compiled.
+       Under DRC a register borrows and the helper is one two-word copy; without
+       it the source is emptied, which is `AOT_SET_B` plus the helper. A
+       coalesced move (d == s) writes nothing in either build. */
+    if (d != s) {
+      fprintf(
+          f,
+          "#if QJS_DRC\n    AOT_REG(fr, %d) = AOT_REG(fr, %d);\n#else\n"
+          "    AOT_SET_B(ctx, fr, %d, AOT_REG(fr, %d));\n"
+          "    qjs_aot_move_xfer(ctx, fr, %d, %d);\n#endif\n",
+          d, s, d, s, d, s);
+    }
+    (void)is_last;
     (void)is_last;
     return 1;
   }

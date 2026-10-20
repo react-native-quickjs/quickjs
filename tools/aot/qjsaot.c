@@ -4860,6 +4860,34 @@ int qjsaot_driver_main(int argc, char **argv) {
         "== v2); return 1;\n"
         "    case QJS_AOT_REG_BIN_STRICT_NEQ: *out = JS_MKVAL(JS_TAG_BOOL, v1 "
         "!= v2); return 1;\n"
+        /* The bitwise and shift sub-operations. Without these every `&`, `|`,
+           `^`, `<<`, `>>` and `>>>` fell through to qjs_aot_num_fast -- an
+           out-of-line call, since the unit is a separate translation unit and
+           its `always_inline` on the engine side has no effect here. That is
+           why the integer kernel's gap (1.78x) is bigger than the double
+           kernel's (1.44x): 12 of its 16 arithmetic ops are bitwise.
+
+           The sub-op values are contiguous in JSRegBinaryOp (MUL, DIV, MOD,
+           ADD, SUB, SHL, SAR, SHR, AND, XOR, OR, POW) and only ADD is exposed
+           to the unit, so the rest are derived from it by offset. */
+        "    case QJS_AOT_REG_BIN_ADD + 2: /* SHL */\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, (int32_t)((uint32_t)v1 << (v2 & "
+        "31))); return 1;\n"
+        "    case QJS_AOT_REG_BIN_ADD + 3: /* SAR */\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, v1 >> (v2 & 31)); return 1;\n"
+        "    case QJS_AOT_REG_BIN_ADD + 4: /* SHR: above INT32_MAX it is a "
+        "double */\n"
+        "      { uint32_t u = (uint32_t)v1 >> (v2 & 31);\n"
+        "        *out = u <= (uint32_t)INT32_MAX\n"
+        "                   ? JS_MKVAL(JS_TAG_INT, (int32_t)u)\n"
+        "                   : __JS_NewFloat64((double)u);\n"
+        "        return 1; }\n"
+        "    case QJS_AOT_REG_BIN_ADD + 5: /* AND */\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, v1 & v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_ADD + 6: /* XOR */\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, v1 ^ v2); return 1;\n"
+        "    case QJS_AOT_REG_BIN_ADD + 7: /* OR */\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, v1 | v2); return 1;\n"
         "    default: return 0;\n"
         "    }\n"
         "    if (__builtin_expect(r < INT32_MIN || r > INT32_MAX, 0)) {\n"
