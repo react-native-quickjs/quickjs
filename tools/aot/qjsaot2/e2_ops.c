@@ -2452,7 +2452,6 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(
       f, "    _Static_assert(%d < QJS_AOT_E2_NFUNCS, \"e2: function index\");\n",
       fi);
-  fprintf(f, "    E2_ENTER_NOTE(%d);\n", fi);
   fprintf(f, "    E2_SEAL(ctx, f);\n");
 
   /* D9's group cells arrive in E9; until then a NULL pic means there is no
@@ -2475,6 +2474,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         "        return aot_g_%s(ctx, f, fr, 0);\n"
         "    }\n",
         fi, hex);
+  /* Counted only now: everything that could refuse the entry has been passed, so
+     this measures speculative bodies that ACTUALLY RAN. */
+  fprintf(f, "    E2_ENTER_NOTE(%d);\n", fi);
 
   /* S1. One C local per value, by representation. A value that is not live is
      not declared: the IR keeps values that trivial-parameter removal dropped. */

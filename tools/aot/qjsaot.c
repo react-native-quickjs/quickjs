@@ -4275,6 +4275,27 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) t += e2_ent[i];\n"
         "  return t;\n"
         "}\n"
+        "/* With QJS_AOT_E2_STATS=1 in the environment, print the E2 counters at\n"
+        "   teardown so a test can prove the speculative body actually ran. Without\n"
+        "   it a case that means to exercise a spec path passes even when the body\n"
+        "   is never entered -- which is exactly how the entry-refusal bug survived\n"
+        "   a whole step. */\n"
+        "#ifdef QJS_AOT_SPLIT_UNIT\n"
+        "void e2_stats_dump(void);\n"
+        "#else\n"
+        "static void __attribute__((destructor)) e2_stats_dump(void)\n"
+        "{\n"
+        "  unsigned long long en = 0, ex = 0, rf = 0, off = 0;\n"
+        "  const char *e = getenv(\"QJS_AOT_E2_STATS\");\n"
+        "  int i;\n"
+        "  if (e == NULL || e[0] != '1') return;\n"
+        "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
+        "    en += e2_ent[i]; ex += e2_exi[i]; rf += e2_ref[i]; off += e2_off[i];\n"
+        "  }\n"
+        "  fprintf(stderr, \"e2-stats enters=%%llu exits=%%llu refuses=%%llu off=%%llu\\n\",\n"
+        "          en, ex, rf, off);\n"
+        "}\n"
+        "#endif\n"
         "#endif\n"
         "#define E2_ENTER_NOTE(fi) (e2_ent[fi]++)\n"
         "/* More than 256 exits and in more than 1/16 of the calls: the guards do\n"
@@ -5294,7 +5315,22 @@ int qjsaot_driver_main(int argc, char **argv) {
           f,
           "uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
           "uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
-          "uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n");
+          "uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
+          /* Defined here, once, so the destructor is linked: a definition in a
+             header included by every part is dropped as unused in each. */
+          "void __attribute__((destructor)) e2_stats_dump(void)\n"
+          "{\n"
+          "  unsigned long long en = 0, ex = 0, rf = 0, off = 0;\n"
+          "  const char *e = getenv(\"QJS_AOT_E2_STATS\");\n"
+          "  int i;\n"
+          "  if (e == NULL || e[0] != '1') return;\n"
+          "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
+          "    en += e2_ent[i]; ex += e2_exi[i]; rf += e2_ref[i]; off += e2_off[i];\n"
+          "  }\n"
+          "  fprintf(stderr, \"e2-stats enters=%%llu exits=%%llu refuses=%%llu off=%%llu\\n\",\n"
+          "          en, ex, rf, off);\n"
+          "}\n"
+          );
     }
     fprintf(f, "const JSAotEntry qjs_aot_table[] = {\n");
     {
