@@ -399,6 +399,16 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_add: /* "rrr": d, a, b */
     case ROP_sub:
     case ROP_mul:
+    /* The bitwise and shift operations have the same "rrr" layout and the same
+       lowering: q2_num_fast handles the int/int case (and the double case for
+       the comparisons), and qjs_aot_num_fast the rest. Lowering them keeps a
+       `(a ^ b) | 0` chain compiled instead of an op call per operator. */
+    case ROP_bitand:
+    case ROP_bitor:
+    case ROP_bitxor:
+    case ROP_shl:
+    case ROP_sar:
+    case ROP_shr:
       info.op = Q2_OP_BINARY;
       info.ndef = 1;
       info.def[0] = 0;
@@ -581,12 +591,6 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
-    case ROP_bitand: /* "rrr": d, a, b */
-    case ROP_bitor:
-    case ROP_bitxor:
-    case ROP_shl:
-    case ROP_sar:
-    case ROP_shr:
     case ROP_mod:
     case ROP_pow:
     case ROP_lt:
