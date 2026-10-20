@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "ir.h"
+#include "e2.h"
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
 
@@ -1200,6 +1201,31 @@ static void q2_canon_cmp_branch(Q2Insn *in) {
   in->rop = ROP_branch_cmp_reg_reg_s;
 }
 
+/* Whether an instruction's destination takes its type from a profile record
+   rather than from its operands. Kept in step with `def_from_record` in
+   e2_types.c, which decides the same set for the inference; a destination not
+   in this set must not be typed from an `R` record here. */
+static int def_from_record_insn(const Q2Insn *in) {
+  switch (in->op) {
+    case Q2_OP_GET_FIELD:
+    case Q2_OP_GET_ELEMENT:
+    case Q2_OP_GET_VAR_REF:
+    case Q2_OP_GET_ARG:
+    case Q2_OP_GET_ARG2:
+    case Q2_OP_GET_LOCAL:
+    case Q2_OP_GET_GLOBAL:
+    case Q2_OP_CALL:
+    case Q2_OP_LOAD_THIS:
+      return 1;
+    case Q2_OP_FALLBACK:
+      return in->ndef > 0;
+    case Q2_OP_UNARY:
+      return in->rop == ROP_neg;
+    default:
+      return 0;
+  }
+}
+
 int q2_build(const JSAotGenFunc *g, Q2Func *f) {
   int i, n, words;
   int32_t *starts = NULL;
@@ -1823,8 +1849,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     f->prof = qjs_aot_prof_pcs(g->digest, &n);
     f->nprof = n;
     /* The per-register `R` records, kept for the per-destination lookup. A
-       register with no record is simply absent: nregs counts only registers
-       the profiler actually saw. */
+       register with no record is simply absent: nprof_regs counts only
+       registers the profiler actually saw. */
     {
       int nr = 0;
       f->prof_regs = qjs_aot_prof_regs(g->digest, &nr);
@@ -1861,6 +1887,146 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
         v->nmax = p->num_max;
       }
     }
+  }
+
+  /* 9. the profile's per-register `R` records, for a destination the `P` record
+     could not type. An `R` record covers the whole function, so it describes a
+     destination exactly only when that register is written once; a register
+     written more than once may hold a different value's history, and then the
+     record is at best imprecise. This is a *precision* rule (a reused register's
+     record is wide anyway, and the threaded build records both `get_arg2`
+     results every time it runs), kept because it is cheap. It is only sound at
+     all because the profile's header said `thr=1`, which
+     `qjs_aot_prof_regs` enforces by returning nothing otherwise. */
+  if (f->prof_regs != NULL && f->nprof_regs > 0 && f->nregs > 0 &&
+      strcmp(getenv("E2_R_RULE") ?: "", "off")) {
+    int32_t *nwrites = calloc((size_t)f->nregs, sizeof(*nwrites));
+    if (nwrites == NULL) goto fail;
+    for (i = 0; i < f->ninsns; i++) {
+      const Q2Insn *in = &f->insns[i];
+      int k;
+      for (k = 0; k < in->ndef; k++) {
+        const Q2Value *dv = &f->values[in->def[k]];
+        if (dv->reg >= 0 && dv->reg < f->nregs) nwrites[dv->reg]++;
+      }
+      for (k = 0; k < in->nredef; k++) {
+        int32_t r = in->redef_reg[k];
+        if (r >= 0 && r < f->nregs) nwrites[r]++;
+      }
+      if (in->win_reg >= 0 && in->win_n > 0 &&
+          in->win_reg + in->win_n <= f->nregs) {
+        for (k = 0; k < in->win_n; k++) nwrites[in->win_reg + k]++;
+      }
+    }
+    for (i = 0; i < f->nvalues; i++) {
+      Q2Value *v = &f->values[i];
+      const Q2Insn *in;
+      int lo, hi, found = -1;
+      /* Only where the `P` record could not type it: a destination with no
+         record at all, or one whose record is mixed. An `R` record is a
+         per-register union over the whole function, so it can only help when
+         the per-pc view is unusable -- and then only if the register is written
+         once, which the write count below checks. */
+      if (v->insn < 0) continue;
+      in = &f->insns[v->insn];
+      if (!def_from_record_insn(in)) continue;
+      if (v->has_prof && v->ptypes != 0) {
+        continue;
+      }
+
+      if (v->reg < 0 || v->reg >= f->nregs) continue;
+      if (getenv("E2_DEBUG_CAND")) {
+        int w, rtypes = -1;
+        for (w = 0; w < f->nprof_regs; w++)
+          if (f->prof_regs[w].reg == v->reg) rtypes = (int)f->prof_regs[w].types;
+        fprintf(stderr, "CAND %s v%u reg=r%d ptypes=0x%x R=0x%x writes=%d pcs:",
+                g->name && g->name[0] ? g->name : "?", i, v->reg, v->ptypes,
+                rtypes < 0 ? -1 : rtypes, nwrites[v->reg]);
+        for (w = 0; w < f->ninsns; w++) {
+          const Q2Insn *wi = &f->insns[w];
+          int k, hit = 0;
+          for (k = 0; k < wi->ndef; k++) {
+            const Q2Value *dv = &f->values[wi->def[k]];
+            if (dv->reg == v->reg) hit = 1;
+          }
+          for (k = 0; k < wi->nredef; k++)
+            if (wi->redef_reg[k] == v->reg) hit = 1;
+          if (wi->win_reg >= 0 && wi->win_n > 0 &&
+              v->reg >= wi->win_reg && v->reg < wi->win_reg + wi->win_n)
+            hit = 1;
+          if (hit) {
+            char nm[32];
+            e2_rop_name((uint16_t)wi->rop, nm, sizeof(nm));
+            fprintf(stderr, " %d:%s", wi->pc, nm);
+          }
+        }
+        fprintf(stderr, "\n");
+      }
+      /* The three preconditions for using an `R` record. Together they say:
+         the record is complete, this pc is part of it, and the register has
+         one. `E2_R_REUSE=off` drops the completeness argument below and
+         `E2_R_RULE=off` drops the whole pass, so a test can show each does
+         something; a count that does not move when they are off is measuring
+         nothing.
+
+         1. `thr=1` in the profile header. Enforced by `qjs_aot_prof_regs`,
+            which returns nothing for any other build. Only the threaded build
+            records `R` completely: its `regvm_t_get_arg2` writes both
+            destinations every time it runs, so a register's record contains
+            every type its `get_arg2` result ever had. A monolith profile writes
+            no `R` for a value, so a record it emits would describe only the
+            *other* values a reused register held and would type the result from
+            the wrong history.
+         2. the `get_arg2` pc has a `P` record, so the instruction ran during
+            profiling and its writes are in the `R` record. Without that the
+            record could predate the value entirely.
+         3. the destination register has an `R` record at all.
+
+         Given those, the result takes its type from its own register's record.
+         A reused register whose record is mixed types nothing -- that is the
+         correct answer, not a failure: the record says more than one kind of
+         value was in that register, and the compiled code must box. */
+      if (strcmp(getenv("E2_R_REUSE") ?: "", "off")) {
+        int pc_found = 0;
+        int32_t dpc = in->pc;
+        lo = 0;
+        hi = f->nprof - 1;
+        while (lo <= hi) {
+          int mid = (lo + hi) / 2;
+          if (f->prof[mid].pc == dpc) {
+            pc_found = 1;
+            break;
+          }
+          if (f->prof[mid].pc < dpc)
+            lo = mid + 1;
+          else
+            hi = mid - 1;
+        }
+        if (!pc_found) continue;
+      }
+      lo = 0;
+      hi = f->nprof_regs - 1;
+      while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (f->prof_regs[mid].reg == v->reg) {
+          found = mid;
+          break;
+        }
+        if (f->prof_regs[mid].reg < v->reg)
+          lo = mid + 1;
+        else
+          hi = mid - 1;
+      }
+      if (found < 0) continue;
+      v->has_prof = 1;
+      v->ptypes = prof_to_q2(f->prof_regs[found].types);
+      v->frac = 0;
+      v->negzero = 0;
+      v->nmin = 0;
+      v->nmax = 0;
+      v->prof_src = 1; /* R */
+    }
+    free(nwrites);
   }
 
   free(starts);

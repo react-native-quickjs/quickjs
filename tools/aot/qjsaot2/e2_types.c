@@ -1274,6 +1274,11 @@ int e2_analysis_dump(
         Q2ValueId v = in->def[d];
         const char *rep = e2_types_rep_name(&types, v);
         fprintf(f, "T   v%u rep=%s def=%d:%s", v, rep, in->pc, opname);
+        /* Which profile record this destination's type came from, so a test can
+           assert `src=P` for a reused register (E7d's N1) rather than infer it
+           from the representation. */
+        if (fn->values[v].has_prof)
+          fprintf(f, " src=%s", fn->values[v].prof_src ? "R" : "P");
         /* The analysis's own classification: the gate reads this rather than
            guessing from the operation's name. */
         if (types.arith[v] == E2_AK_ARITH || types.arith[v] == E2_AK_FUSED)

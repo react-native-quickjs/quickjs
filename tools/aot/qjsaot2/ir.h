@@ -146,6 +146,10 @@ typedef struct Q2Value {
      Zero when the defining instruction has no record. */
   uint32_t ptypes;
   uint8_t has_prof, frac, negzero;
+  /* Which profile record `has_prof` came from: 0 for the per-pc `P` record,
+     1 for the per-register `R` record. Reported by `--emit2-types` so a test
+     can assert which one a destination used. */
+  uint8_t prof_src;
   double nmin, nmax;
   /* Representation planning (the inference fills these; see types.c). */
   uint8_t spec;   /* a speculated load: needs a tag guard at its definition */

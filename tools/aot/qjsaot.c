@@ -218,6 +218,9 @@ typedef struct {
    call site (the engine's per-runtime binding array is indexed by it). */
 static const ProfEntry *g_prof = NULL;
 static int g_nprof = 0;
+/* Whether the profile's header said `thr=1`, i.e. it came from the threaded
+   build whose `R` records are complete. See parse_profile. */
+static int g_prof_thr = 0;
 static const ProfEntry *g_cur_prof = NULL;
 /* Call-binding site ids (the engine's per-runtime binding array is indexed by
    one). A deopt site has its own id space, handed out by `g_deopt_site_next`,
@@ -436,6 +439,17 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
             path, strtoul(fp + 4, NULL, 10), (unsigned)REGVM_FORMAT_VERSION);
         fclose(f);
         return NULL;
+      }
+      /* `thr=1` means the profile came from the threaded (feature-table)
+         build, the only one whose `R` records are complete: they are written
+         by the threaded `regvm_t_get_arg2`/`SET_REG_B` handlers. A monolith
+         build writes no `R` record for a value, so a record it does emit would
+         describe only the *other* values a reused register held and would type
+         a result from the wrong history. So the records are used only when the
+         header says `thr=1`; otherwise every `R` line is ignored. */
+      {
+        const char *tp = strstr(line, "thr=");
+        g_prof_thr = tp && strtoul(tp + 4, NULL, 10) != 0;
       }
     }
   }
@@ -3168,7 +3182,10 @@ const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
 const ProfReg *qjs_aot_prof_regs(const uint8_t dg[16], int *n) {
   const ProfEntry *e;
   *n = 0;
-  if (!g_prof) return NULL;
+  /* Only the threaded build records `R` completely; on any other profile the
+     records would describe a register's *other* values and mis-type a reused
+     destination, so none are offered. */
+  if (!g_prof || !g_prof_thr) return NULL;
   e = prof_entry(g_prof, g_nprof, dg);
   if (!e) return NULL;
   *n = e->nregs;
