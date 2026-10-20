@@ -284,4 +284,8 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len);
    refused for the speculative body. */
 int q2_is_reducible(const Q2Func *f);
 
+/* Whether u -> v is a back edge, by reverse postorder position. The single
+   definition: nothing else compares pcs or block indices to decide this. */
+int q2_is_back_edge(const Q2Func *f, int u, int v);
+
 #endif /* QJSAOT2_IR_H */

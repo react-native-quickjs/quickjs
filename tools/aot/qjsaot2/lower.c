@@ -1102,7 +1102,7 @@ static void q2_emit_edge(FILE *f, const Q2Func *fn, int b, int si) {
     q2_writeback(f, fn, &g_em.cur, q2_live_after(g_em.cur_insn));
   /* A back edge polls as the interpreter's does: an inline decrement, and the
      engine only when the counter runs out. */
-  if (s->start_pc <= blk->start_pc && !fself)
+  if (q2_is_back_edge(fn, b, blk->succ_block[si]) && !fself)
     fprintf(
         f,
         " if (__builtin_expect(--*(int *)((unsigned char *)ctx + "
@@ -4462,12 +4462,11 @@ int qjsaot2_emit_pure(FILE *out, const JSAotGenFunc *g, char hex[33]) {
     q2_free(&fn);
     return 0;
   }
-  /* No loop: a block reached from itself or from later in the function. */
+  /* No loop: no back edge anywhere in the function. */
   for (b = 0; b < fn.nblocks; b++) {
     int k;
     for (k = 0; k < fn.blocks[b].nsucc; k++)
-      if (fn.blocks[b].succ_block[k] < fn.nblocks &&
-          fn.blocks[fn.blocks[b].succ_block[k]].start_pc <= fn.blocks[b].start_pc) {
+      if (q2_is_back_edge(&fn, b, fn.blocks[b].succ_block[k])) {
         q2_free(&fn);
         return 0;
       }

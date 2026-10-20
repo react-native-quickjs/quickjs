@@ -747,7 +747,7 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
 int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
   FactSet cur;
   FactSet *outs = NULL;
-  int b, i, k, rc = -1;
+  int b, bi, i, k, rc = -1;
 
   memset(out, 0, sizeof(*out));
   memset(&cur, 0, sizeof(cur));
@@ -767,11 +767,15 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
   if (build_groups(fn, out) < 0) goto done;
 
-  /* The blocks are in pc order, which is a reverse postorder: a block starts at
-     every branch target and after every terminator, so only a back edge points
-     at a lower index. A forward edge into a block the pass has not visited yet
-     therefore cannot happen, and any unvisited predecessor is a back edge. */
-  for (b = 0; b < fn->nblocks; b++) {
+  /* The blocks are visited in DFS reverse postorder, so every forward
+     predecessor has been visited first and only a back edge can reach an
+     unvisited block. The pass is a SINGLE SWEEP, not a fixpoint: a block with a
+     back-edge predecessor starts from "nothing known" rather than waiting for
+     the back edge's out-set, which is exactly the in-set the emitter can
+     establish on entry (the back edge carries nothing the first time round).
+     Loop-invariant facts are hoisting's job, not this pass's. */
+  for (bi = 0; bi < fn->nrpo; bi++) {
+    int b = fn->rpo[bi];
     const Q2Block *blk = &fn->blocks[b];
     int p, first = 1, back_edge = 0;
 
@@ -779,7 +783,8 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
       fs_clear(&cur);
     } else {
       for (p = 0; p < blk->npreds; p++) {
-        if (blk->preds[p] < 0 || blk->preds[p] >= b) {
+        if (blk->preds[p] < 0) continue;
+        if (q2_is_back_edge(fn, blk->preds[p], b)) {
           back_edge = 1;
           break;
         }

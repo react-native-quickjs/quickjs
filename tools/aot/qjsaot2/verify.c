@@ -155,6 +155,18 @@ static int q2_in_types_ok(const Q2Func *f, const Q2Insn *in) {
    speculative body and keeps the generic one.
 
    Returns 1 when reducible, 0 when not, -1 on allocation failure. */
+/* Whether the edge u -> v is a back edge. The one definition: the target is at
+   or before the source in the reverse postorder. Nothing compares pcs or block
+   indices for this purpose, because neither is a topological order of the
+   forward edges -- a merge block can be laid out before some of its
+   predecessors. */
+int q2_is_back_edge(const Q2Func *f, int u, int v) {
+  if (u < 0 || v < 0 || u >= f->nblocks || v >= f->nblocks) return 0;
+  if (f->rpo_pos == NULL) return 0;
+  if (f->rpo_pos[u] < 0 || f->rpo_pos[v] < 0) return 0;
+  return f->rpo_pos[v] <= f->rpo_pos[u];
+}
+
 int q2_is_reducible(const Q2Func *f) {
   Q2Verify v;
   int i, words = q2_vbits_words(f->nblocks), rc = 1;
