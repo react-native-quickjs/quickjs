@@ -734,11 +734,96 @@ static int elem_pc_is_numeric(const Q2Func *fn, const Q2Insn *in) {
   return 0;
 }
 
+/* ---- guarded element regions ---------------------------------------------
+   A block that accesses one array several times re-validates the receiver and
+   reloads the array's `count` and `values` pointers on every access, because the
+   compiler cannot prove a store into the elements did not change them -- a store
+   can grow the array and move the storage. That is the elem class's cost:
+   measured, 20 % of its cycles are memory stalls against the interpreter's 6.5 %,
+   with IPC 1.56 against 3.44 and 43 % fewer instructions.
+
+   The region keeps the validated storage and count in C locals across a run of
+   consecutive element accesses to the same register. It is dropped whenever
+   anything could change the array.
+
+   `elem_run_len` answers: starting at instruction `i` of `fn`, how many
+   consecutive instructions form a run over one array register, and which
+   register is it? 0 means this instruction starts no run. */
+
+/* The array register an element access reads, or -1. */
+static int elem_arr_reg(const Q2Insn *in) {
+  const E2Role *role = e2_roles[in->rop];
+  if (in->rop != ROP_get_element && in->rop != ROP_put_element &&
+      in->rop != ROP_put_element_xfer)
+    return -1;
+  /* `get_element` is "rrr" = destination, object, key, so the array is the
+     second operand; `put_element` is "rrr" = object, key, value, so it is the
+     first. The IR's use[0] names the same one for either. */
+  if (role != NULL && role->nuse > 0) {
+    int a = operand_off(in, role->use[0]);
+    if (a >= 0) return a;
+  }
+  if (in->narg >= 3 && in->arg[0].kind == 'r') return E2_ROFF(in->arg[0]);
+  return -1;
+}
+
+/* Whether `in` could change what a region holds: it runs JavaScript, it writes
+   the array's register, or it may grow the array. */
+static int elem_breaks_run(const Q2Func *fn, const Q2Insn *in, int arr) {
+  const E2Role *role = e2_roles[in->rop];
+  int k;
+  if (role == NULL) return 1;
+  if (in->op == Q2_OP_FALLBACK || role->runs_js || in->op == Q2_OP_CALL)
+    return 1;
+  if (role->control != E2_CF_NONE) return 1;
+  for (k = 0; k < in->ndef; k++) {
+    Q2ValueId v = in->def[k];
+    if (v != Q2_NO_VALUE && fn->values[v].reg == arr) return 1;
+  }
+  for (k = 0; k < in->nredef; k++)
+    if (in->redef_reg[k] == arr) return 1;
+  if (in->win_reg >= 0 && in->win_n > 0 && arr >= in->win_reg &&
+      arr < in->win_reg + in->win_n)
+    return 1;
+  /* An element store that is not proven in bounds may grow the array. */
+  if (in->rop == ROP_put_element || in->rop == ROP_put_element_xfer) {
+    if (!elem_pc_is_numeric(fn, in)) return 1;
+  }
+  return 0;
+}
+
+/* How many consecutive instructions starting at `i` form a run over one array
+   register, and which register through *arrp. 0 when there is no run.
+
+   The run stops at the first instruction that could change the array, at a
+   different array, and at the end of the block: the region's C locals live in
+   one emitted block, and a block boundary is emitted as a label that other code
+   can jump into, so a value held across it would not be defined. */
+static int elem_run_len(const Q2Func *fn, int i, int block_last, int *arrp) {
+  int arr = elem_arr_reg(&fn->insns[i]);
+  int j, n = 0;
+  if (arr < 0) return 0;
+  for (j = i; j < fn->ninsns; j++) {
+    const Q2Insn *in = &fn->insns[j];
+    if (j > block_last) break;
+    if (elem_arr_reg(in) == arr) {
+      if (!elem_pc_is_numeric(fn, in)) break;
+      n++;
+      continue;
+    }
+    if (elem_arr_reg(in) >= 0) break; /* a different array */
+    if (elem_breaks_run(fn, in, arr)) break;
+  }
+  if (n < 2) return 0;
+  *arrp = arr;
+  return n;
+}
+
 /* An element read: `q2_elem_hit` inlines the array fast path (class, not
    holey, index in bounds, element not a hole or lazy marker). A miss falls into
    the op call, which handles a getter, a string key, a proxy, everything. */
 static int emit_native_elem_read(
-    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last, int run) {
   const E2Role *role = e2_roles[in->rop];
   int d, arr, key;
 
@@ -754,11 +839,21 @@ static int emit_native_elem_read(
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _e;\n");
-  fprintf(
-      f,
-      "    if (__builtin_expect(q2_elem_hit(AOT_REG(fr, %d), "
-      "AOT_REG(fr, %d), &_e), 1)) {\n",
-      arr, key);
+  if (run > 0) {
+    /* Inside a run: the storage and count are already validated and in C
+       locals, so this is a bounds test against the stored count and a load. */
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_elem_region_get(&_reg, "
+        "AOT_REG(fr, %d), &_e), 1)) {\n",
+        key);
+  } else {
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_elem_hit(AOT_REG(fr, %d), "
+        "AOT_REG(fr, %d), &_e), 1)) {\n",
+        arr, key);
+  }
   emit_site_hit(f, in);
   /* Borrowed from the array, so the store duplicates it. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", d);
@@ -773,7 +868,7 @@ static int emit_native_elem_read(
 /* An element write: the same fast path, storing in place. The op has no
    destination. */
 static int emit_native_elem_write(
-    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last, int run) {
   const E2Role *role = e2_roles[in->rop];
   int arr, key, val;
 
@@ -800,11 +895,19 @@ static int emit_native_elem_write(
   if (arr < 0 || key < 0 || val < 0) return 0;
 
   fprintf(f, "g_%d: {\n", in->pc);
-  fprintf(
-      f,
-      "    if (__builtin_expect(q2_elem_put(AOT_REG(fr, %d), "
-      "AOT_REG(fr, %d), AOT_REG(fr, %d)), 1)) {\n",
-      arr, key, val);
+  if (run > 0) {
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_elem_region_put(&_reg, "
+        "AOT_REG(fr, %d), AOT_REG(fr, %d)), 1)) {\n",
+        key, val);
+  } else {
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_elem_put(AOT_REG(fr, %d), "
+        "AOT_REG(fr, %d), AOT_REG(fr, %d)), 1)) {\n",
+        arr, key, val);
+  }
   emit_site_hit(f, in);
   fprintf(f, "        goto g_%d;\n", in->next);
   fprintf(f, "    }\n");
@@ -1700,6 +1803,12 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
       "        return qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n");
   fprintf(f, "    }\n");
 
+  /* Guarded element regions: run_left counts the accesses still served by the
+     region opened for this run, run_arr is its array register, and run_open says
+     whether the block's opening brace and the `_reg` declaration have been
+     emitted for it. */
+  {
+    int run_left = 0, run_arr = -1, run_open = 0, blk_last = -1;
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     const E2Role *role = e2_roles[in->rop];
@@ -1729,8 +1838,42 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
       emit_opcall(f, fn, in, i + 1 == fn->ninsns, 0);
       continue;
     }
-    if (emit_native_elem_read(f, fn, in, i + 1 == fn->ninsns) ||
-        emit_native_elem_write(f, fn, in, i + 1 == fn->ninsns) ||
+    /* The block this instruction belongs to, for the run planner: a region's C
+       locals live in one emitted block, so a run never crosses a boundary. */
+    if (i > blk_last) {
+      int b;
+      blk_last = fn->ninsns - 1;
+      for (b = 0; b < fn->nblocks; b++)
+        if (i >= fn->blocks[b].first_insn &&
+            i < fn->blocks[b].first_insn + fn->blocks[b].ninsns) {
+          blk_last = fn->blocks[b].first_insn + fn->blocks[b].ninsns - 1;
+          break;
+        }
+    }
+    if (run_left == 0) {
+      /* Start a guarded region over this array for the run beginning here, so
+         the count and the element storage are read once instead of after every
+         store. The run ends at the first instruction that could change the
+         array (see elem_breaks_run). */
+      int n = elem_run_len(fn, i, blk_last, &run_arr);
+      if (n > 0) {
+        run_left = n;
+        /* No label here: the emitter that lowers this instruction emits its own
+           `g_<pc>`, and the region's body is the block that follows it. */
+        fprintf(f, "    Q2ElemRegion _reg;\n");
+        fprintf(
+            f,
+            "    if (__builtin_expect(q2_elem_open(AOT_REG(fr, %d), &_reg), "
+            "1)) {\n",
+            run_arr);
+        emit_site_hit(f, in);
+        run_open = 1;
+      }
+    }
+    if (emit_native_elem_read(f, fn, in, i + 1 == fn->ninsns,
+                              run_left > 0 ? 1 : 0) ||
+        emit_native_elem_write(f, fn, in, i + 1 == fn->ninsns,
+                               run_left > 0 ? 1 : 0) ||
         emit_native_field_read(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_field_write(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_field_chain(f, fn, in, i + 1 == fn->ninsns) ||
@@ -1759,6 +1902,21 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
     if (emit_native_arg_read(f, fn, in, i + 1 == fn->ninsns)) continue;
     note_opcall(fn, in, 0);
     emit_opcall(f, fn, in, i + 1 == fn->ninsns, 1);
+    /* End the guarded region when its run is used up, and close the brace it
+       opened. A region also ends before any instruction that could change the
+       array, which is why the run length was computed over exactly that span. */
+    if (run_left > 0) {
+      run_left--;
+      if (run_left == 0) {
+        fprintf(f, "    }\n");
+        run_open = 0;
+      }
+    }
+  }
+  if (run_open) {
+    /* The run reached the end of the function with the region still open. */
+    fprintf(f, "    }\n");
+  }
   }
 
   /* G5: with no control records nothing can catch and there is nothing to
