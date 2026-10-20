@@ -573,8 +573,12 @@ static int loop_counter_param(
   int p, saw_self_inc = 0;
 
   for (p = 0; p < blk->npreds; p++) {
-    const Q2Block *pr = &fn->blocks[blk->preds[p]];
+    const Q2Block *pr;
     int n, m;
+    /* A dead predecessor's edge argument never reaches this block, so it must
+       not widen a type or disqualify the cycle. */
+    if (blk->preds[p] < 0 || fn->rpo_pos[blk->preds[p]] < 0) continue;
+    pr = &fn->blocks[blk->preds[p]];
     for (n = 0; n < pr->nsucc; n++) {
       if (pr->succ_block[n] != b) continue;
       for (m = 0; m < pr->nedge_args[n]; m++) {

@@ -784,6 +784,7 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
     } else {
       for (p = 0; p < blk->npreds; p++) {
         if (blk->preds[p] < 0) continue;
+        if (fn->rpo_pos[blk->preds[p]] < 0) continue; /* dead: not an edge */
         if (q2_is_back_edge(fn, blk->preds[p], b)) {
           back_edge = 1;
           break;
@@ -795,7 +796,15 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
         fs_clear(&cur);
       } else {
         for (p = 0; p < blk->npreds; p++) {
-          const FactSet *o = &outs[blk->preds[p]];
+          const FactSet *o;
+          /* A dead predecessor never executes, so it must not constrain the
+             merge: its out-set was never computed and intersecting an empty set
+             would wipe every fact in this live block. A negative pred is not
+             produced today; skipped for the same reason as in the back-edge
+             scan above, so neither loop can index outs[-1]. */
+          if (blk->preds[p] < 0) continue;
+          if (fn->rpo_pos[blk->preds[p]] < 0) continue;
+          o = &outs[blk->preds[p]];
           if (first) {
             for (k = 0; k < o->nshape; k++)
               if (fs_add_shape(&cur, o->shape_val[k], o->shape_grp[k]) < 0)

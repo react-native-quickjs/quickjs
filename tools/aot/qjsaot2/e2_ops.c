@@ -25,6 +25,7 @@
 
 #include "e2.h"
 #include "ir.h"
+#include "e2_analysis.h"
 
 /* The number of PIC sites the function uses: one more than the largest site
    index. The per-site stride in the PIC table is this count, because site `k`'s
@@ -1983,12 +1984,28 @@ int e2_irreducible = 0;
 
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
+  E2Facts facts;
+  E2Types types;
   int b, k;
+  int have_types = 0;
 
   /* The speculative body emits blocks in reverse postorder and relies on every
      back edge going to a dominator; a function that is irreducible keeps the
      generic body. Checked, not assumed. */
-  if (q2_is_reducible(fn) != 1) {
+  if (q2_is_reducible(fn) == 1) {
+    /* The analyses the typed lowerings read. The emitter never reads
+       Q2Value.rep/spec or Q2Insn.fwd: those hold the old lowering's inference,
+       which treats BOT as TAG. E8's facts mode is the continuing-miss one, so a
+       grouped field access is an ordinary safepoint. */
+    if (e2_facts_run(fn, &facts, 0) == 0) {
+      if (e2_types_run(fn, &facts, &types) == 0) {
+        have_types = 1;
+      } else {
+        e2_facts_free(&facts);
+      }
+    }
+  }
+  if (!have_types) {
     e2_irreducible++;
     fprintf(
         f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
