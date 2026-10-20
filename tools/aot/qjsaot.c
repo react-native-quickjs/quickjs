@@ -4238,6 +4238,25 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* E2 unit counters (D14 part 2). `e2_g8_hits` counts a dispatch to a
            pc that is not an instruction start; it must stay 0. */
         "static unsigned long e2_g8_hits;\n"
+        /* The D4 switch-off counters, one entry per emitted function. A function
+           whose speculative body keeps exiting, or keeps refusing at entry, is
+           switched off for good and its calls go straight to the generic body. */
+        "#ifndef QJS_AOT_E2_NFUNCS\n"
+        "/* The unit builder sets this to its function count; a hand-written or\n"
+        "   partial unit without one gets a fixed bound. */\n"
+        "#define QJS_AOT_E2_NFUNCS 4096\n"
+        "#endif\n"
+        "static uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
+        "static uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
+        "static uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
+        "#define E2_ENTER_NOTE(fi) (e2_ent[fi]++)\n"
+        "/* More than 256 exits and in more than 1/16 of the calls: the guards do\n"
+        "   not match the data this function sees. */\n"
+        "#define E2_EXIT_NOTE(fi) do { if (++e2_exi[fi] > 256 && \\\n"
+        "    (uint64_t)e2_exi[fi] * 16 > e2_ent[fi]) e2_off[fi] = 1; } while (0)\n"
+        "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
+        "#define E2_REFUSE_NOTE(fi) do { if (++e2_ref[fi] > 256 && \\\n"
+        "    (uint64_t)e2_ref[fi] * 2 > e2_ent[fi]) e2_off[fi] = 1; } while (0)\n"
         /* The D12 dynamic check, compiled into the unit only with -DE2_POISON.
            It compares every register an op call was not allowed to write
            against a copy taken before the call, by tag and then by kind, so a

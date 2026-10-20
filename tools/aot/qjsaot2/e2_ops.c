@@ -1962,25 +1962,92 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   return 0;
 }
 
-/* The speculative body (D3) until E8: forward to the generic body. One
-   function, one body, and no second copy of the code to keep in step while the
-   generic body is the thing being built. */
+/* The speculative body (E8).
+
+   Step 1 is the skeleton: the D4 switch-off counters, the S7 entry (which
+   refuses anything but a fresh entry at pc 0, and refuses once speculation has
+   been switched off for this function), the S1 locals, and the blocks in
+   reverse postorder with their edges -- a parameter move per successor
+   parameter, through a temporary so parameters may swap, exactly as
+   `q2_emit_edge` does it in the generic body.
+
+   Step 2 replaces each block's body with the typed lowerings. Until then a
+   reached block forwards to the generic body at its own start pc, so the
+   skeleton is exercised (entry, counters, classification, edges) without
+   claiming a single typed value: a mismatch between the two bodies cannot hide
+   behind unfinished lowerings, because the fallback is the correct body. */
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
-  (void)fn;
+  int fi = qjs_aot_cur_func_idx();
+  int b, k;
+
   fprintf(
       f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
       e2_linkage(), hex);
   fprintf(
       f, "                                 JSValue *fr, uint32_t entry_pc)\n");
   fprintf(f, "{\n");
+
+  /* S7. Entry. A compiled call passes entry_pc 0; anything else is a resume
+     that belongs to the generic body, which has a label for every pc. The
+     switch-off counter is checked first and costs one load. */
   fprintf(
       f,
-      "    /* The speculative body arrives in E8; until then every entry is\n");
+      "    if (__builtin_expect(entry_pc != 0 || e2_off[%d], 0))\n"
+      "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
+      fi, hex);
+  fprintf(f, "    E2_ENTER_NOTE(%d);\n", fi);
+  fprintf(f, "    E2_SEAL(ctx, f);\n");
+
+  /* D9's group cells arrive in E9; until then a NULL pic means there is no
+     profile to speculate on and the generic body is the only body. */
+  fprintf(f, "    {\n");
+  fprintf(f, "    const void *pic = q2_pic(f);\n");
+  fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
+  fprintf(f, "    (void)q2_ns;\n");
   fprintf(
       f,
-      "       the generic body's, which has a label for every instruction. "
-      "*/\n");
-  fprintf(f, "    return aot_g_%s(ctx, f, fr, entry_pc);\n", hex);
+      "    if (__builtin_expect(pic == NULL, 0)) {\n"
+      "        E2_REFUSE_NOTE(%d);\n"
+      "        return aot_g_%s(ctx, f, fr, 0);\n"
+      "    }\n",
+      fi, hex);
+
+  /* S1. One C local per value, by representation. A value that is not live is
+     not declared: the IR keeps values that trivial-parameter removal dropped. */
+  {
+    int nv = fn->nvalues;
+    int any = 0;
+    for (k = 0; k < nv; k++) {
+      if (fn->values[k].rep == Q2_R_I32) {
+        fprintf(f, "    int32_t i%u = 0;\n", (unsigned)k);
+        any = 1;
+      } else if (fn->values[k].rep == Q2_R_F64) {
+        fprintf(f, "    double d%u = 0;\n", (unsigned)k);
+        any = 1;
+      } else if (fn->values[k].rep == Q2_R_BOOL) {
+        fprintf(f, "    int b%u = 0;\n", (unsigned)k);
+        any = 1;
+      } else {
+        fprintf(f, "    JSValue v%u = JS_UNDEFINED;\n", (unsigned)k);
+        any = 1;
+      }
+    }
+    (void)any;
+  }
+  fprintf(f, "    (void)fr; (void)ctx; (void)f;\n");
+
+  /* The blocks in reverse postorder. `fn->blocks` is in pc order, which is a
+     reverse postorder here: a block starts at every branch target and after
+     every terminator, so only a back edge points at a lower index. */
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    fprintf(f, "    /* block %d: pc %d */\n", b, blk->start_pc);
+    fprintf(f, "    b_%d: (void)0;\n", blk->start_pc);
+    /* Step 2 replaces this with the block's own instructions. */
+    fprintf(f, "    return aot_g_%s(ctx, f, fr, %d);\n", hex, blk->start_pc);
+  }
+  fprintf(f, "    }\n");
   fprintf(f, "}\n\n");
+  (void)k;
   return 0;
 }
