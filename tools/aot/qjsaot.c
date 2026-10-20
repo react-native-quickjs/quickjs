@@ -5359,13 +5359,11 @@ int qjsaot_driver_main(int argc, char **argv) {
           present, g_nprof,
           all_ops ? 100.0 * (double)present_ops / (double)all_ops : 100.0);
     }
-    /* The speculative body emits blocks in pc order and relies on that being a
-       reverse postorder. Counted here, after the bodies are built. */
-    if (e2_rpo_failures)
+    /* Functions the speculative body refused as irreducible. */
+    if (e2_irreducible)
       fprintf(
-          stderr,
-          "qjsaot: pc order is not a reverse postorder in %d function(s)\n",
-          e2_rpo_failures);
+          stderr, "qjsaot: irreducible (refused for the speculative body): %d\n",
+          e2_irreducible);
 
     for (i = 0; i < nfuncs; i++) free(eb[i].buf);
     free(eb);

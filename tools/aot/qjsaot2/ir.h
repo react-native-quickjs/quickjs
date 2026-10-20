@@ -227,6 +227,12 @@ typedef struct Q2Block {
 
 /* ---- functions ----------------------------------------------------------- */
 typedef struct Q2Func {
+  /* The blocks in DFS reverse postorder, as block indices. Unreachable blocks
+     are absent: they are never emitted. `rpo_pos[b]` is b's position in this
+     order, or -1 when b is unreachable. */
+  int32_t *rpo;
+  int32_t nrpo;
+  int32_t *rpo_pos;
   const struct JSAotGenFunc *g;
   int ok;          /* the build succeeded */
   const char *why; /* when it did not */
@@ -273,8 +279,9 @@ int q2_inc_by_operand(const Q2Func *fn, const Q2Insn *in);
    the effect table. Returns 0, or -1 with a message in msg. */
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len);
 
-/* Whether pc order is a reverse postorder: every edge to a lower-pc block goes
-   to a block that dominates its source. The speculative body relies on it. */
-int q2_pc_order_is_rpo(const Q2Func *f);
+/* Whether every back edge (per the reverse postorder) goes to a dominator. 1
+   reducible, 0 irreducible, -1 out of memory. An irreducible function is
+   refused for the speculative body. */
+int q2_is_reducible(const Q2Func *f);
 
 #endif /* QJSAOT2_IR_H */

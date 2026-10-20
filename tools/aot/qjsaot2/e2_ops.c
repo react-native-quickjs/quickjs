@@ -1976,17 +1976,28 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
    skeleton is exercised (entry, counters, classification, edges) without
    claiming a single typed value: a mismatch between the two bodies cannot hide
    behind unfinished lowerings, because the fallback is the correct body. */
-/* How many emitted functions had a back edge that is not to a dominator, so pc
-   order was not a reverse postorder. The report prints it; it must stay 0. */
-int e2_rpo_failures = 0;
+/* How many functions were refused for the speculative body because they are
+   irreducible (a back edge to a block that does not dominate its source). The
+   report prints it; it should stay 0 for structured bytecode. */
+int e2_irreducible = 0;
 
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   int b, k;
 
-  /* The blocks are emitted in pc order and the typed lowerings of step 2 rely
-     on that being a reverse postorder. Checked, not assumed. */
-  if (q2_pc_order_is_rpo(fn) != 1) e2_rpo_failures++;
+  /* The speculative body emits blocks in reverse postorder and relies on every
+     back edge going to a dominator; a function that is irreducible keeps the
+     generic body. Checked, not assumed. */
+  if (q2_is_reducible(fn) != 1) {
+    e2_irreducible++;
+    fprintf(
+        f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
+        e2_linkage(), hex);
+    fprintf(
+        f, "                                 JSValue *fr, uint32_t entry_pc)\n");
+    fprintf(f, "{\n    return aot_g_%s(ctx, f, fr, entry_pc);\n}\n\n", hex);
+    return 0;
+  }
 
   fprintf(
       f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
@@ -2052,8 +2063,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   /* The blocks in reverse postorder. `fn->blocks` is in pc order, which is a
      reverse postorder here: a block starts at every branch target and after
      every terminator, so only a back edge points at a lower index. */
-  for (b = 0; b < fn->nblocks; b++) {
-    const Q2Block *blk = &fn->blocks[b];
+  for (b = 0; b < fn->nrpo; b++) {
+    const Q2Block *blk = &fn->blocks[fn->rpo[b]];
     fprintf(f, "    /* block %d: pc %d */\n", b, blk->start_pc);
     fprintf(f, "    b_%d: (void)0;\n", blk->start_pc);
     /* Step 2 replaces this with the block's own instructions. */

@@ -32,6 +32,8 @@
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
 
+static void q2_build_rpo(Q2Func *f);
+
 #define Q2_NONE8 ((int8_t)-1)
 
 /* The driver's profile lookup (qjsaot.c): the sorted `P` records of a function
@@ -2047,12 +2049,69 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
 
   free(starts);
   free(pc_to_block);
+  q2_build_rpo(f);
   return 0;
 
 fail:
   free(starts);
   free(pc_to_block);
   return -1;
+}
+
+/* ---- the block order ---------------------------------------------------- */
+
+/* Compute the blocks in DFS reverse postorder, from the entry block, with the
+   IR's successor order so the result is deterministic (an unchanged function
+   must produce byte-identical output, which is what makes an incremental build
+   possible). Unreachable blocks are left out: they are not emitted.
+
+   Why DFS RPO rather than pc order: pc order is NOT a reverse postorder in
+   general. A merge block can be laid out before some of its predecessors -- a
+   shared `return v0` with out-of-line tails placed after it that jump back --
+   so a block has a successor at a lower pc without being in a loop. The
+   speculative body needs a real topological order of the forward edges. */
+static void q2_build_rpo(Q2Func *f) {
+  int nb = f->nblocks, i, sp = 0;
+  int *iter = calloc((size_t)(nb > 0 ? nb : 1), sizeof(int));
+  int *stack = calloc((size_t)(nb > 0 ? nb : 1), sizeof(int));
+  uint8_t *seen = calloc((size_t)(nb > 0 ? nb : 1), 1);
+
+  f->rpo = calloc((size_t)(nb > 0 ? nb : 1), sizeof(int32_t));
+  f->rpo_pos = malloc(sizeof(int32_t) * (size_t)(nb > 0 ? nb : 1));
+  f->nrpo = 0;
+  for (i = 0; i < nb; i++) f->rpo_pos[i] = -1;
+  if (!iter || !stack || !seen || !f->rpo || !f->rpo_pos) goto done;
+
+  /* Iterative DFS: a block is appended after all its successors, so the array
+     built in visit order, reversed, is a reverse postorder. */
+  stack[sp++] = 0;
+  seen[0] = 1;
+  while (sp > 0) {
+    int b = stack[sp - 1];
+    const Q2Block *blk = &f->blocks[b];
+    if (iter[b] < blk->nsucc) {
+      int s = blk->succ_block[iter[b]++];
+      if (s >= 0 && s < nb && !seen[s]) {
+        seen[s] = 1;
+        stack[sp++] = s;
+      }
+    } else {
+      sp--;
+      f->rpo[f->nrpo++] = b; /* postorder */
+    }
+  }
+  /* Reverse into postorder -> reverse postorder. */
+  for (i = 0; i < f->nrpo / 2; i++) {
+    int32_t t = f->rpo[i];
+    f->rpo[i] = f->rpo[f->nrpo - 1 - i];
+    f->rpo[f->nrpo - 1 - i] = t;
+  }
+  for (i = 0; i < f->nrpo; i++) f->rpo_pos[f->rpo[i]] = i;
+
+done:
+  free(iter);
+  free(stack);
+  free(seen);
 }
 
 void q2_free(Q2Func *f) {
@@ -2069,6 +2128,8 @@ void q2_free(Q2Func *f) {
     free(f->blocks[i].edge_arg);
   }
   free(f->blocks);
+  free(f->rpo);
+  free(f->rpo_pos);
   if (f->insns) {
     int i;
     for (i = 0; i < f->ninsns; i++) {
