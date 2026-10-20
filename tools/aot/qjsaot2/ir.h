@@ -245,6 +245,10 @@ typedef struct Q2Func {
   int32_t exit_pc;    /* the function's length */
   const ProfPc *prof; /* the function's P records, sorted by pc, or NULL */
   int32_t nprof;
+  /* The function's R records, sorted by register. A register absent from this
+     array has no record at all; do not read a missing register as types == 0. */
+  const Q2ProfReg *prof_regs;
+  int32_t nprof_regs;
 } Q2Func;
 
 /* Build the IR for one function. Returns 0 on success, -1 with why set. */

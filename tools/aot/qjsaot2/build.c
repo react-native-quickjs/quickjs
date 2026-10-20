@@ -36,6 +36,7 @@
 /* The driver's profile lookup (qjsaot.c): the sorted `P` records of a function
    digest, or NULL. */
 const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n);
+const Q2ProfReg *qjs_aot_prof_regs(const uint8_t dg[16], int *n);
 
 /* The profile's type set mapped to the IR's. Anything that is not a number
    maps to TAGGED, which is what the inference needs to see. */
@@ -1821,6 +1822,14 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     int n = 0;
     f->prof = qjs_aot_prof_pcs(g->digest, &n);
     f->nprof = n;
+    /* The per-register `R` records, kept for the per-destination lookup. A
+       register with no record is simply absent: nregs counts only registers
+       the profiler actually saw. */
+    {
+      int nr = 0;
+      f->prof_regs = qjs_aot_prof_regs(g->digest, &nr);
+      f->nprof_regs = nr;
+    }
     if (f->prof && f->nprof > 0) {
       for (i = 0; i < f->nvalues; i++) {
         Q2Value *v = &f->values[i];

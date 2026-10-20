@@ -3161,6 +3161,20 @@ const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
   return e->pcs;
 }
 
+/* The function's `R` records: one merged type set per register, over the whole
+   function. A register the profiler never saw has no entry, so `*n` is the
+   number of registers that *have* a record -- a caller must not treat the
+   absence of a register as a record with no types. */
+const ProfReg *qjs_aot_prof_regs(const uint8_t dg[16], int *n) {
+  const ProfEntry *e;
+  *n = 0;
+  if (!g_prof) return NULL;
+  e = prof_entry(g_prof, g_nprof, dg);
+  if (!e) return NULL;
+  *n = e->nregs;
+  return e->regs;
+}
+
 /* The instruction at `pc` of the function with this digest, as an estimated
    execution count, or 0 when the profile has no sample there. The profiler
    charges one tick per 1024 dispatches, so the count is the sample count

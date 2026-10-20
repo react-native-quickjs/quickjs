@@ -46,6 +46,19 @@ typedef struct ProfPc {
   double num_min, num_max;
 } ProfPc;
 
+/* One register's `R` record: the merged PT_* set over the whole function.
+   A register with no record has no entry at all here -- the IR must be able to
+   tell "no record" from "a record saying nothing", so an absent register is
+   absent, never an entry with types == 0. (Same reasoning as ProfCount below.) */
+typedef struct Q2ProfReg {
+  int32_t reg;
+  unsigned types;
+} Q2ProfReg;
+/* `qjs_aot_prof_regs` hands back the generator's own ProfReg as a Q2ProfReg*.
+   The two are layout-identical ({int, unsigned} and {int32_t, unsigned}); this
+   makes a future divergence a compile error rather than a silent misread. */
+_Static_assert(sizeof(Q2ProfReg) == 8, "ProfReg/Q2ProfReg must stay 8 bytes");
+
 /* One instruction's execution count, as the profile's per-pc sample record
    gives it (`T` lines: one sample per 1024 dispatches of that pc). It is kept
    apart from ProfPc because a pc can have a sample record without a type
