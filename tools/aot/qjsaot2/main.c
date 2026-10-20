@@ -163,8 +163,12 @@ int main(int argc, char **argv) {
     char *src;
     JSValue v;
     if (argv[i][0] == '-') {
-      /* skip the value of a two-token option */
-      if (strcmp(argv[i], "--profile") == 0) i++;
+      /* Skip the value of a two-token option. This must know every such
+         option: `keep[]` is sized by `ninputs`, so a value counted as an
+         input here writes past the array. */
+      if (strcmp(argv[i], "--profile") == 0 ||
+          strcmp(argv[i], "--emit2-types-out") == 0)
+        i++;
       continue;
     }
     src = read_file(argv[i], &len);
