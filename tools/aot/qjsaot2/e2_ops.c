@@ -816,7 +816,11 @@ static int elem_run_len(const Q2Func *fn, int i, int block_last, int *arrp) {
   }
   if (n < 2) return 0;
   *arrp = arr;
-  return n;
+  /* The last instruction index of the run. Returning the index rather than a
+     count keeps the close point independent of how the emitter walks the loop:
+     an index test at the top of each iteration cannot be skipped by one of the
+     emitter's many `continue`s, which a decremented counter silently was. */
+  return j - 1;
 }
 
 /* An element read: `q2_elem_hit` inlines the array fast path (class, not
@@ -1808,7 +1812,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
      whether the block's opening brace and the `_reg` declaration have been
      emitted for it. */
   {
-    int run_left = 0, run_arr = -1, run_open = 0, blk_last = -1;
+    int run_last = -1, run_arr = -1, run_open = 0, blk_last = -1;
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     const E2Role *role = e2_roles[in->rop];
@@ -1816,6 +1820,15 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
     if (role == NULL) {
       fprintf(stderr, "e2: no role for op %d\n", in->rop);
       return -1;
+    }
+    /* Close a guarded region as soon as the instruction after its last access
+       is reached. Done first, so every path through the body below -- including
+       the emitters that `continue` -- sees the closed brace before emitting the
+       instruction that ends the run (a call, a store that can grow the array,
+       a write to the array's register). */
+    if (run_open && i > run_last) {
+      fprintf(f, "    }\n");
+      run_open = 0;
     }
     if (is_trivial(in)) {
       emit_trivial(f, in, role);
@@ -1850,14 +1863,14 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
           break;
         }
     }
-    if (run_left == 0) {
+    if (!run_open) {
       /* Start a guarded region over this array for the run beginning here, so
          the count and the element storage are read once instead of after every
          store. The run ends at the first instruction that could change the
          array (see elem_breaks_run). */
-      int n = elem_run_len(fn, i, blk_last, &run_arr);
-      if (n > 0) {
-        run_left = n;
+      int last = elem_run_len(fn, i, blk_last, &run_arr);
+      if (last > 0) {
+        run_last = last;
         /* No label here: the emitter that lowers this instruction emits its own
            `g_<pc>`, and the region's body is the block that follows it. */
         fprintf(f, "    Q2ElemRegion _reg;\n");
@@ -1870,10 +1883,8 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
         run_open = 1;
       }
     }
-    if (emit_native_elem_read(f, fn, in, i + 1 == fn->ninsns,
-                              run_left > 0 ? 1 : 0) ||
-        emit_native_elem_write(f, fn, in, i + 1 == fn->ninsns,
-                               run_left > 0 ? 1 : 0) ||
+    if (emit_native_elem_read(f, fn, in, i + 1 == fn->ninsns, run_open) ||
+        emit_native_elem_write(f, fn, in, i + 1 == fn->ninsns, run_open) ||
         emit_native_field_read(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_field_write(f, fn, in, i + 1 == fn->ninsns) ||
         emit_native_field_chain(f, fn, in, i + 1 == fn->ninsns) ||
@@ -1902,20 +1913,11 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
     if (emit_native_arg_read(f, fn, in, i + 1 == fn->ninsns)) continue;
     note_opcall(fn, in, 0);
     emit_opcall(f, fn, in, i + 1 == fn->ninsns, 1);
-    /* End the guarded region when its run is used up, and close the brace it
-       opened. A region also ends before any instruction that could change the
-       array, which is why the run length was computed over exactly that span. */
-    if (run_left > 0) {
-      run_left--;
-      if (run_left == 0) {
-        fprintf(f, "    }\n");
-        run_open = 0;
-      }
-    }
   }
+  /* A run that reached the last instruction leaves the region open. */
   if (run_open) {
-    /* The run reached the end of the function with the region still open. */
     fprintf(f, "    }\n");
+    run_open = 0;
   }
   }
 
