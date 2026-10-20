@@ -148,6 +148,45 @@ static int q2_in_types_ok(const Q2Func *f, const Q2Insn *in) {
   return 1;
 }
 
+/* Whether every edge u -> v with a lower target pc goes to a block v that
+   dominates u. If it does, pc order is a reverse postorder, which the
+   speculative body relies on: a value defined in a dominating block must be
+   emitted before the blocks that use it, and the type and exit state flows
+   forward in that order.
+
+   It holds for the loop shapes QuickJS emits (a `for` loop's increment is moved
+   after the body, and the test still precedes it). Nothing enforces it, so this
+   checks it rather than assuming it. Returns 1 when the order is an RPO, 0 when
+   some back edge is not to a dominator, -1 on allocation failure. */
+int q2_pc_order_is_rpo(const Q2Func *f) {
+  Q2Verify v;
+  int b, s, words = q2_vbits_words(f->nblocks), rc = 1;
+
+  memset(&v, 0, sizeof(v));
+  v.f = f;
+  v.msg = NULL;
+  v.msg_len = 0;
+  if (q2_dominators(&v)) return -1;
+  for (b = 0; b < f->nblocks && rc == 1; b++) {
+    const Q2Block *blk = &f->blocks[b];
+    for (s = 0; s < blk->nsucc; s++) {
+      int t = blk->succ_block[s];
+      if (t < 0 || t >= f->nblocks) continue;
+      if (f->blocks[t].start_pc >= blk->start_pc) continue; /* a forward edge */
+      /* A back edge: the target must dominate this block. `dom[i]` is the set
+         of blocks that dominate i, so the question is whether bit `t` is set in
+         dom[b]. */
+      if (!(v.dom[(size_t)b * (size_t)words + (size_t)(t >> 6)] &
+            (1ull << (t & 63)))) {
+        rc = 0;
+        break;
+      }
+    }
+  }
+  free(v.dom);
+  return rc;
+}
+
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
   Q2Verify v;
   int b, i, k;

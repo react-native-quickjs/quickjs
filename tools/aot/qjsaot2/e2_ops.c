@@ -1976,9 +1976,17 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
    skeleton is exercised (entry, counters, classification, edges) without
    claiming a single typed value: a mismatch between the two bodies cannot hide
    behind unfinished lowerings, because the fallback is the correct body. */
+/* How many emitted functions had a back edge that is not to a dominator, so pc
+   order was not a reverse postorder. The report prints it; it must stay 0. */
+int e2_rpo_failures = 0;
+
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   int b, k;
+
+  /* The blocks are emitted in pc order and the typed lowerings of step 2 rely
+     on that being a reverse postorder. Checked, not assumed. */
+  if (q2_pc_order_is_rpo(fn) != 1) e2_rpo_failures++;
 
   fprintf(
       f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
@@ -1995,6 +2003,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       "    if (__builtin_expect(entry_pc != 0 || e2_off[%d], 0))\n"
       "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
       fi, hex);
+  /* The index must be inside the D4 arrays; the generator sized them from the
+     function count, so this can only fail if the two disagree. */
+  fprintf(
+      f, "    _Static_assert(%d < QJS_AOT_E2_NFUNCS, \"e2: function index\");\n",
+      fi);
   fprintf(f, "    E2_ENTER_NOTE(%d);\n", fi);
   fprintf(f, "    E2_SEAL(ctx, f);\n");
 

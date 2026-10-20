@@ -273,4 +273,8 @@ int q2_inc_by_operand(const Q2Func *fn, const Q2Insn *in);
    the effect table. Returns 0, or -1 with a message in msg. */
 int q2_verify(const Q2Func *f, char *msg, size_t msg_len);
 
+/* Whether pc order is a reverse postorder: every edge to a lower-pc block goes
+   to a block that dominates its source. The speculative body relies on it. */
+int q2_pc_order_is_rpo(const Q2Func *f);
+
 #endif /* QJSAOT2_IR_H */

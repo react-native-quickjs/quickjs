@@ -882,6 +882,7 @@ static void print_census(
   fprintf(
       stderr, "  %-14s %8d %12lld %12lld %12lld\n", "total", nfuncs, tot_insns,
       tot_stack, tot_pops);
+
   fprintf(
       stderr, "qjsaot: refused functions %lld/%d (%.2f%%)", ref_funcs, nfuncs,
       nfuncs ? 100.0 * (double)ref_funcs / nfuncs : 0.0);
@@ -4201,6 +4202,13 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(f, "#include <stdlib.h>\n");
     if (g_check_locals) fprintf(f, "#include <string.h>\n#include <stdio.h>\n");
     fprintf(f, "\n");
+    /* The unit's function count, so the D4 counter arrays are sized exactly
+       rather than to a guessed bound. In a split unit this text is the shared
+       header, and the arrays are declared there and defined once in reg.c. */
+    fprintf(f, "#define QJS_AOT_E2_NFUNCS %uu\n",
+            nfuncs > 0 ? (unsigned)nfuncs : 1u);
+    if (split_dir != NULL) fprintf(f, "#define QJS_AOT_SPLIT_UNIT 1\n");
+    fprintf(f, "\n");
     /* The frame reads a compiled entry performs: the same fields the engine's
        accessors return, read inline from the layout header's offsets, so the
        prologue does not pay a call across the unit boundary for each. */
@@ -4238,17 +4246,25 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* E2 unit counters (D14 part 2). `e2_g8_hits` counts a dispatch to a
            pc that is not an instruction start; it must stay 0. */
         "static unsigned long e2_g8_hits;\n"
-        /* The D4 switch-off counters, one entry per emitted function. A function
-           whose speculative body keeps exiting, or keeps refusing at entry, is
-           switched off for good and its calls go straight to the generic body. */
-        "#ifndef QJS_AOT_E2_NFUNCS\n"
-        "/* The unit builder sets this to its function count; a hand-written or\n"
-        "   partial unit without one gets a fixed bound. */\n"
-        "#define QJS_AOT_E2_NFUNCS 4096\n"
-        "#endif\n"
+        /* The D4 switch-off counters, exactly one entry per function in the
+           table. A function whose speculative body keeps exiting, or keeps
+           refusing at entry, is switched off for good and its calls go straight
+           to the generic body.
+
+           In a split unit this text goes into the shared header, which every
+           part includes, so the arrays must be declared here and defined once
+           (in reg.c) rather than being `static` -- otherwise each part gets its
+           own copy and its own counters. */
+
+        "#ifdef QJS_AOT_SPLIT_UNIT\n"
+        "extern uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
+        "extern uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
+        "extern uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
+        "#else\n"
         "static uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
         "static uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
         "static uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
+        "#endif\n"
         "#define E2_ENTER_NOTE(fi) (e2_ent[fi]++)\n"
         "/* More than 256 exits and in more than 1/16 of the calls: the guards do\n"
         "   not match the data this function sees. */\n"
@@ -5261,6 +5277,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         return 2;
       }
       fprintf(f, "#include \"quickjs-aot-rt.h\"\n#include \"u.h\"\n");
+      /* The D4 counters are declared in the shared header, so they are defined
+         exactly once, here. */
+      fprintf(
+          f,
+          "uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
+          "uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
+          "uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n");
     }
     fprintf(f, "const JSAotEntry qjs_aot_table[] = {\n");
     {
@@ -5336,6 +5359,13 @@ int qjsaot_driver_main(int argc, char **argv) {
           present, g_nprof,
           all_ops ? 100.0 * (double)present_ops / (double)all_ops : 100.0);
     }
+    /* The speculative body emits blocks in pc order and relies on that being a
+       reverse postorder. Counted here, after the bodies are built. */
+    if (e2_rpo_failures)
+      fprintf(
+          stderr,
+          "qjsaot: pc order is not a reverse postorder in %d function(s)\n",
+          e2_rpo_failures);
 
     for (i = 0; i < nfuncs; i++) free(eb[i].buf);
     free(eb);
