@@ -169,7 +169,7 @@ static const E2Role e2_role_data[] = {
   /* move_xfer: a register copy */
   [141] = { .rop = 141, .fmt = "rr", .ndef = 1, .def = {0}, .nuse = 1, .use = {1}, .window = -1, .tier = E2_NATIVE, .can_throw = 0, .runs_js = 0, .allocates = 0, .mem = E2_MEM_NONE, .control = E2_CF_NONE, .writes_regs = 0, .pure = 1 },
   [142] = { .rop = 142, .fmt = "ur", .ndef = 0, .def = {0}, .nuse = 1, .use = {1}, .window = -1, .tier = E2_OPCALL, .can_throw = 1, .runs_js = 1, .allocates = 1, .mem = E2_MEM_LOCAL, .control = E2_CF_NONE, .writes_regs = 0, .pure = 0 },
-  [143] = { .rop = 143, .fmt = "ur", .ndef = 0, .def = {0}, .nuse = 1, .use = {1}, .window = -1, .tier = E2_OPCALL, .can_throw = 1, .runs_js = 1, .allocates = 1, .mem = E2_MEM_ARG, .control = E2_CF_NONE, .writes_regs = 0, .pure = 0 },
+  [143] = { .rop = 143, .fmt = "ur", .ndef = 0, .def = {0}, .nuse = 1, .use = {1}, .window = -1, .tier = E2_OPCALL, .can_throw = 1, .runs_js = 1, .allocates = 1, .mem = E2_MEM_ARG, .control = E2_CF_NONE, .writes_regs = 1, .pure = 0 },
   [144] = { .rop = 144, .fmt = "-", .ndef = 0, .def = {0}, .nuse = 0, .use = {0}, .window = -1, .tier = E2_OPCALL, .can_throw = 1, .runs_js = 1, .allocates = 1, .mem = E2_MEM_LOCAL, .control = E2_CF_NONE, .writes_regs = 0, .pure = 0 },
   [145] = { .rop = 145, .fmt = "ras", .ndef = 1, .def = {0}, .nuse = 0, .use = {0}, .window = -1, .tier = E2_OPCALL, .can_throw = 1, .runs_js = 1, .allocates = 1, .mem = E2_MEM_LOCAL, .control = E2_CF_NONE, .writes_regs = 0, .pure = 0 },
   [146] = { .rop = 146, .fmt = "ras", .ndef = 1, .def = {0}, .nuse = 0, .use = {0}, .window = -1, .tier = E2_OPCALL, .can_throw = 1, .runs_js = 1, .allocates = 1, .mem = E2_MEM_LOCAL, .control = E2_CF_NONE, .writes_regs = 0, .pure = 0 },
