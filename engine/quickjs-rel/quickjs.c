@@ -60490,6 +60490,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_jsvalue_u = (uint32_t)offsetof(JSValue, u);
     out->sizeof_JSRegPIC = (uint32_t)sizeof(JSRegPIC);
     out->reg_pic_ways = (uint32_t)REGVM_PIC_WAYS;
+    out->off_fnbc_pic_count = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic_count);
     out->off_regpic_shape = (uint32_t)offsetof(JSRegPIC, shape);
     out->off_regpic_slot_off = (uint32_t)offsetof(JSRegPIC, slot_off);
     out->off_regpic_kind = (uint32_t)offsetof(JSRegPIC, kind);

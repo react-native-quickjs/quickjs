@@ -4011,6 +4011,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_JSVALUE_U %uu\n\n"
           "#define QJS_AOT_SIZEOF_JSREGPIC %uu\n"
           "#define QJS_AOT_REG_PIC_WAYS %uu\n"
+          "#define QJS_AOT_OFF_FNBC_PIC_COUNT %uu\n"
           "#define QJS_AOT_OFF_JSREGPIC_SHAPE %uu\n"
           "#define QJS_AOT_OFF_JSREGPIC_SLOT_OFF %uu\n"
           "#define QJS_AOT_OFF_JSREGPIC_KIND %uu\n"
@@ -4104,7 +4105,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_shape_hash_table, lay.off_property_u_value,
           lay.off_shape_property_flags_atom, lay.off_string_len_bits,
           lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u,
-          lay.sizeof_JSRegPIC, lay.reg_pic_ways,
+          lay.sizeof_JSRegPIC, lay.reg_pic_ways, lay.off_fnbc_pic_count,
           lay.off_regpic_shape, lay.off_regpic_slot_off,
           lay.off_regpic_kind, lay.reg_pic_own, lay.reg_pic_proto,
           lay.reg_ic_none, lay.tag_lazy_json, lay.reg_bin_add,
@@ -4200,6 +4201,14 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static inline void *q2_b(JSRegRun *f)\n"
         "{\n"
         "  return *(void **)((unsigned char *)f + QJS_AOT_OFF_REGRUN_B);\n"
+        "}\n\n"
+        /* The number of PIC sites in the running function: the stride between a
+           site's caching ways. Read from the bytecode rather than baked into
+           the unit, so the two can never disagree. */
+        "static inline int q2_pic_sites(JSRegRun *f)\n"
+        "{\n"
+        "  return (int)*(const uint16_t *)((const unsigned char *)q2_b(f) +\n"
+        "                                  QJS_AOT_OFF_FNBC_PIC_COUNT);\n"
         "}\n\n"
         "static inline uint8_t *q2_code(JSRegRun *f)\n"
         "{\n"

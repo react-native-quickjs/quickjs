@@ -24,7 +24,7 @@ Measured
 
 --- a/quickjs-aot-rt.h
 +++ b/quickjs-aot-rt.h
-@@ -54,6 +54,10 @@
+@@ -54,6 +54,14 @@
         ABI constants it compares against (the entry kind, the no-site marker and
         the lazy-JSON tag). */
      uint32_t sizeof_JSRegPIC;
@@ -32,16 +32,21 @@ Measured
 +       later shapes in way 1 and up, so a reader that looks only at way 0 misses
 +       them; the inline read probes every way, as the interpreter does. */
 +    uint32_t reg_pic_ways;
++    /* Where JSFunctionBytecode holds the number of PIC sites: the stride
++       between a site's ways, read from the running function rather than
++       baked in, so a unit cannot disagree with its bytecode. */
++    uint32_t off_fnbc_pic_count;
      uint32_t off_regpic_shape, off_regpic_slot_off, off_regpic_kind;
      uint32_t reg_pic_own, reg_pic_proto, reg_ic_none, tag_lazy_json;
      /* The binary sub-operations the inline arithmetic path names, from
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -60489,6 +60489,7 @@
+@@ -60489,6 +60489,8 @@
      out->off_jsvalue_tag = (uint32_t)offsetof(JSValue, tag);
      out->off_jsvalue_u = (uint32_t)offsetof(JSValue, u);
      out->sizeof_JSRegPIC = (uint32_t)sizeof(JSRegPIC);
 +    out->reg_pic_ways = (uint32_t)REGVM_PIC_WAYS;
++    out->off_fnbc_pic_count = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic_count);
      out->off_regpic_shape = (uint32_t)offsetof(JSRegPIC, shape);
      out->off_regpic_slot_off = (uint32_t)offsetof(JSRegPIC, slot_off);
      out->off_regpic_kind = (uint32_t)offsetof(JSRegPIC, kind);

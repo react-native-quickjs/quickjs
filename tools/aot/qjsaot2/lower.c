@@ -2447,9 +2447,9 @@ static int q2_emit_native(
       if (g_em.pure) {
         fprintf(
             f,
-            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, %d, "
+            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), "
             "&v%u), 0)) return 0;\n",
-            a, site, e2_pic_sites(fn), in->def[0]);
+            a, site, in->def[0]);
         return 1;
       }
       /* A miss fills the cache and continues compiled rather than leaving for
@@ -2557,8 +2557,8 @@ static int q2_emit_native(
         {
           char cond[160];
           snprintf(
-              cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, %d, &v%u)",
-              a, site, e2_pic_sites(fn), in->def[0]);
+              cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), &v%u)",
+              a, site, in->def[0]);
           q2_cold_read(
               f, fn, in, cond, in->arg[2].off, site, a, in->def[0], off);
         }
@@ -2582,16 +2582,16 @@ static int q2_emit_native(
         char cond[160], recv[16];
         snprintf(
             cond, sizeof(cond),
-            "q2_own_read_hit(pic, holders, %s, %d, %d, &v%u)", a, s1,
-            e2_pic_sites(fn), in->def[0]);
+            "q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), &v%u)", a, s1,
+            in->def[0]);
         q2_cold_read(
             f, fn, in, cond, in->arg[2].off, s1, a, in->def[0], off0);
         /* The second receiver is the first link's fresh value. */
         snprintf(recv, sizeof(recv), "v%u", in->def[0]);
         snprintf(
             cond, sizeof(cond),
-            "q2_own_read_hit(pic, holders, %s, %d, %d, &v%u)", recv, s2,
-            e2_pic_sites(fn), in->def[1]);
+            "q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), &v%u)", recv, s2,
+            in->def[1]);
         q2_cold_read(
             f, fn, in, cond, in->arg[6].off, s2, recv, in->def[1], off1);
       }
@@ -2615,9 +2615,9 @@ static int q2_emit_native(
       if (g_em.pure) {
         fprintf(
             f,
-            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, %d, "
+            "    if (__builtin_expect(!q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), "
             "&v%u), 0)) return 0;\n",
-            a, site, e2_pic_sites(fn), in->def[0]);
+            a, site, in->def[0]);
         return 1;
       }
       /* The inline hit first: it checks the receiver's and the prototype
@@ -2625,13 +2625,12 @@ static int q2_emit_native(
          same slot. */
       fprintf(
           f,
-          "    if (__builtin_expect(q2_own_read_hit(pic, holders, %s, %d, %d, "
+          "    if (__builtin_expect(q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), "
           "&v%u), 1)) {\n"
           "    } else if (qjs_aot_proto_fold(ctx, f, pic, %d, %s, %d, &v%u)) {\n"
           "      qjs_aot_set_reg_p(ctx, fr, %d, v%u);\n"
           "    } else {\n",
-          a, site, e2_pic_sites(fn), in->def[0], fsid, a, site, in->def[0], off,
-          in->def[0]);
+          a, site, in->def[0], fsid, a, site, in->def[0], off, in->def[0]);
       q2_writeback(f, fn, &g_em.pre, g_em.liveb);
       fprintf(
           f,
@@ -3082,8 +3081,8 @@ static int q2_emit_native(
             "    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT) return 0;\n"
             "    v%u = this_obj;\n"
             "    if (__builtin_expect(!q2_own_read_hit(pic, holders, this_obj, "
-            "%d, e2_pic_sites(fn), %d, &v%u), 0)) return 0;\n",
-            in->def[1], site, e2_pic_sites(fn), in->def[0]);
+            "%d, q2_pic_sites(f), &v%u), 0)) return 0;\n",
+            in->def[1], site, in->def[0]);
         (void)offr;
         (void)offd;
         return 1;
@@ -3099,7 +3098,7 @@ static int q2_emit_native(
           "      if (_r) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n"
           "      else AOT_SET_B(ctx, fr, %d, _t);\n"
           "      v%u = _t;\n"
-          "      if (__builtin_expect(!q2_own_read_hit(pic, holders, _t, %d, %d, "
+          "      if (__builtin_expect(!q2_own_read_hit(pic, holders, _t, %d, q2_pic_sites(f), "
           "&v%u), 0)) {\n"
           "        if (qjs_aot_read_field_slow(ctx, f, code + %d, _t, "
           "(int)qjs_aot_ld_u32(code + %d), %d, &v%u) < 0) { pc = %d; goto "
@@ -3110,7 +3109,7 @@ static int q2_emit_native(
           "        AOT_SET_B(ctx, fr, %d, v%u);\n"
           "      }\n"
           "    }\n",
-          offr, offr, in->def[1], site, e2_pic_sites(fn), in->def[0], in->pc,
+          offr, offr, in->def[1], site, in->def[0], in->pc,
           in->arg[2].off, site, in->def[0], in->pc, offd, in->def[0], offd,
           in->def[0]);
       return 1;

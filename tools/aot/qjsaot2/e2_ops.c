@@ -31,15 +31,11 @@
    way `w` lives at `w * count + k`, so the read helper needs it to step between
    ways. */
 int e2_pic_sites(const Q2Func *fn) {
-  int i, n = 0;
-  for (i = 0; i < fn->ninsns; i++) {
-    const Q2Insn *in = &fn->insns[i];
-    if (in->narg >= 4 && in->arg[3].kind == 's') {
-      int v = (int)in->arg[3].val;
-      if (v >= n) n = v + 1;
-    }
-  }
-  return n;
+  /* Unused: the stride is read from the running function's bytecode at runtime
+     (q2_pic_sites in the prelude), so a unit cannot disagree with the bytecode
+     it was compiled from. Kept only so the call sites keep their shape. */
+  (void)fn;
+  return 0;
 }
 
 /* The opcode's name, for the poison abort message. The role table already
@@ -498,8 +494,8 @@ static int emit_native_field_read(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "AOT_REG(fr, %d), %d, %d, &_f), 1)) {\n",
-      recv, site, nsites);
+      "AOT_REG(fr, %d), %d, q2_pic_sites(f), &_f), 1)) {\n",
+      recv, site);
   emit_site_hit(f, in);
   /* The value is borrowed from the object's slot, so the store duplicates it
      (AOT_SET_B does that in an owning build and is a plain assignment under
@@ -622,8 +618,8 @@ static int emit_native_this_field(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, _t, %d, "
-      "%d, &_v), 1)) {\n",
-      site, nsites);
+      "q2_pic_sites(f), &_v), 1)) {\n",
+      site);
   emit_site_hit(f, in);
   /* Borrowed from the object's slot, so the store duplicates it. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _v);\n", dfield);
@@ -670,8 +666,8 @@ static int emit_native_field_chain(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "AOT_REG(fr, %d), %d, %d, &_c0), 1)) {\n",
-      recv, s1, nsites);
+      "AOT_REG(fr, %d), %d, q2_pic_sites(f), &_c0), 1)) {\n",
+      recv, s1);
   /* Link 1 goes to its register, so link 2's receiver is available even if
      link 2 misses; both are borrowed, so the store duplicates.
 
@@ -685,8 +681,8 @@ static int emit_native_field_chain(
   fprintf(
       f,
       "        if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "_c0, %d, %d, &_c1), 1)) {\n",
-      s2, nsites);
+      "_c0, %d, q2_pic_sites(f), &_c1), 1)) {\n",
+      s2);
   emit_site_hit(f, in);
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _c1);\n", d1);
   fprintf(f, "            goto g_%d;\n", in->next);
