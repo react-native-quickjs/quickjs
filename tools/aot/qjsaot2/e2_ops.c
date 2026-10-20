@@ -1782,6 +1782,11 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
      frame goes through a pointer, so the compiler cannot prove those stores
      leave the bytecode alone and would reload it at each probe. */
   fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
+  /* The element region: ONE declaration for the whole body, zeroed so that a
+     count of 0 means "closed" and every access misses (correct, just slower).
+     A mid-body declaration could be bypassed by any entry that skipped its open,
+     leaving a wild `vals` pointer. */
+  fprintf(f, "    Q2ElemRegion _reg = { 0 };\n");
   fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
   fprintf(f, "    (void)ip; (void)pc; (void)pic; (void)holders;\n");
   if (g_poison) {
@@ -1818,6 +1823,12 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    }\n");
   fprintf(f, "    e2_from_pc = entry_pc;\n");
   fprintf(f, "dispatch_switch:\n");
+  /* A jump here may land inside an element region that is no longer open: a spec
+     body exit at a mid-run pc, or a resume whose ip fell inside a run. The
+     region's cached count is only valid while its run is executing, so it is
+     closed here; a closed region misses and takes the op call, which is correct
+     and merely slower. */
+  fprintf(f, "    _reg.count = 0;\n");
   fprintf(f, "    switch (entry_pc) {\n");
   for (i = 0; i < fn->ninsns; i++)
     fprintf(f, "    case %d: goto g_%d;\n", fn->insns[i].pc, fn->insns[i].pc);
@@ -1872,6 +1883,10 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
          call still happens, through the op call, and the site simply never
          runs. */
       emit_opcall(f, fn, in, i + 1 == fn->ninsns, 0);
+      /* The op call may have resized the array (a growth or shrink goes through
+         the engine), so the region's cached storage and count are stale: close it
+         and let the run's remaining accesses miss to the op call. */
+      if (run_open) fprintf(f, "    _reg.count = 0;\n");
       continue;
     }
     /* The block this instruction belongs to, for the run planner: a region's C
@@ -1896,7 +1911,11 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
         run_last = last;
         /* No label here: the emitter that lowers this instruction emits its own
            `g_<pc>`, and the region's body is the block that follows it. */
-        fprintf(f, "    Q2ElemRegion _reg;\n");
+        /* Nothing here: `_reg` is declared ONCE at the top of the body, zeroed.
+           A mid-body declaration meant any entry that bypassed this open (a spec
+           exit at a mid-run pc, or a dispatch resume landing inside the run) saw
+           an uninitialised region -- a wild `vals` pointer that corrupted the
+           interpreter several frames away. */
         fprintf(
             f,
             "    if (__builtin_expect(q2_elem_open(AOT_REG(fr, %d), &_reg), "
@@ -2527,11 +2546,6 @@ static int emit_typed_branch(
   sb_take = blk->succ_block[si_take];
   sb_else = blk->succ_block[si_else];
   if (sb_take < 0 || sb_take >= fn->nblocks) return 0;
-  /* Neither arm may target a block the generic body opens an element region at:
-     the spec body has no region, so entering there would use `_reg` unopened. */
-  if (block_opens_region(fn, sb_take)) return 0;
-  if (sb_else >= 0 && sb_else < fn->nblocks && block_opens_region(fn, sb_else))
-    return 0;
 
   e2_local_name(an, sizeof(an), av);
   e2_local_name(bn, sizeof(bn), bv);
