@@ -652,7 +652,14 @@ static int emit_native_field_chain(
       "AOT_REG(fr, %d), %d, &_c0), 1)) {\n",
       recv, s1);
   /* Link 1 goes to its register, so link 2's receiver is available even if
-     link 2 misses; both are borrowed, so the store duplicates. */
+     link 2 misses; both are borrowed, so the store duplicates.
+
+     When the destination register *is* the receiver -- which the IR does
+     whenever the chain's first result is written back over its own operand --
+     that store overwrites the receiver before the op-call fallback. The op call
+     re-executes `get_field_chain` from the start and would then read the wrong
+     receiver, so the original is saved and put back on a link-2 miss. */
+  fprintf(f, "        JSValue _rcv = AOT_REG(fr, %d);\n", recv);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _c0);\n", d0);
   fprintf(
       f,
@@ -663,6 +670,7 @@ static int emit_native_field_chain(
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _c1);\n", d1);
   fprintf(f, "            goto g_%d;\n", in->next);
   fprintf(f, "        }\n");
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _rcv);\n", recv);
   fprintf(f, "    }\n");
   emit_site_miss(f, in);
   fprintf(f, "}\n");
