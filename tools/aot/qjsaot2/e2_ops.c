@@ -1998,6 +1998,34 @@ static void e2_local_name(char *buf, size_t n, Q2ValueId v) {
   snprintf(buf, n, "%s%u", e2_rep_prefix(v), (unsigned)v);
 }
 
+/* Load an argument slot into a value's local, converting by the value's
+   representation: the argument buffer holds a JSValue, and a typed local is not
+   one. */
+static void e2_load_arg_to_local(FILE *f, Q2ValueId v, int slot) {
+  char dn[32];
+  e2_local_name(dn, sizeof(dn), v);
+  switch (e2_rep_prefix(v)[0]) {
+    case 'i':
+      fprintf(f, "    %s = JS_VALUE_GET_INT(q2_arg_buf(f)[%d]);\n", dn, slot);
+      break;
+    case 'd':
+      fprintf(
+          f,
+          "    %s = JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) == JS_TAG_INT ? "
+          "JS_VALUE_GET_INT(q2_arg_buf(f)[%d]) : "
+          "JS_VALUE_GET_FLOAT64(q2_arg_buf(f)[%d]);\n",
+          dn, slot, slot, slot);
+      break;
+    case 'b':
+      fprintf(f, "    %s = JS_VALUE_GET_BOOL(q2_arg_buf(f)[%d]);\n", dn, slot);
+      break;
+    default:
+      fprintf(f, "    %s = q2_arg_buf(f)[%d];\n", dn, slot);
+      break;
+  }
+}
+
+
 /* Copy one local to another across representations. The destination is a JSValue
    local unless both sides agree, so a typed source is boxed on the way -- the
    same conversion the interpreter would perform on the frame. */
@@ -2173,11 +2201,26 @@ static void emit_trivial_own(
       break;
     }
     case ROP_get_arg:
-      if (d != Q2_NO_VALUE)
-        fprintf(
-            f, "    v%u = q2_arg_buf(f)[%d];\n", (unsigned)d,
-            (int)in->arg[1].val);
+      if (d != Q2_NO_VALUE) e2_load_arg_to_local(f, d, (int)in->arg[1].val);
       break;
+    case ROP_get_arg2: {
+      /* Two argument slots in one instruction: the form nearly every function
+         begins with, so without it no block's prefix reaches its arithmetic. */
+      Q2ValueId d0 = in->ndef > 0 ? in->def[0] : Q2_NO_VALUE;
+      Q2ValueId d1 = in->ndef > 1 ? in->def[1] : Q2_NO_VALUE;
+      char n0[32], n1[32];
+      if (in->narg >= 4) {
+        if (d0 != Q2_NO_VALUE) {
+          e2_load_arg_to_local(f, d0, (int)in->arg[1].val);
+          cur[g_e2_fn->values[d0].reg < g_e2_fn->nregs ? g_e2_fn->values[d0].reg : 0] = d0;
+        }
+        if (d1 != Q2_NO_VALUE) {
+          e2_load_arg_to_local(f, d1, (int)in->arg[3].val);
+          cur[g_e2_fn->values[d1].reg < g_e2_fn->nregs ? g_e2_fn->values[d1].reg : 0] = d1;
+        }
+      }
+      return;
+    }
     /* The constants below name a local, and which name depends on the value's
        representation: the analysis may hold `true` as an `int bN`, and writing
        `vN` would be both undefined and a different local. */
@@ -2442,7 +2485,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
       if (role != NULL && role->control != E2_CF_NONE) break;
-      if (is_trivial(in)) {
+      if (is_trivial(in) || in->rop == ROP_get_arg2) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
       } else if (have_types &&
