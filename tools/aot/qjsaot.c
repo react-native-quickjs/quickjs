@@ -3955,6 +3955,17 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_REG_IC_NONE %uu\n"
           "#define QJS_AOT_TAG_LAZY_JSON %uu\n"
           "#define QJS_AOT_REG_BIN_ADD %uu\n"
+          /* The bitwise and shift sub-operations, printed with the engine's own
+             enum values rather than derived by offset from BIN_ADD. The enum is
+             contiguous today, but an offset would silently compute the wrong
+             operation if anyone reordered it; a define that comes from the enum
+             either stays correct or fails to compile if the name disappears. */
+          "#define QJS_AOT_REG_BIN_SHL %uu\n"
+          "#define QJS_AOT_REG_BIN_SAR %uu\n"
+          "#define QJS_AOT_REG_BIN_SHR %uu\n"
+          "#define QJS_AOT_REG_BIN_AND %uu\n"
+          "#define QJS_AOT_REG_BIN_XOR %uu\n"
+          "#define QJS_AOT_REG_BIN_OR %uu\n"
           "#define QJS_AOT_REG_BIN_SUB %uu\n"
           "#define QJS_AOT_REG_BIN_MUL %uu\n"
           "#define QJS_AOT_REG_BIN_DIV %uu\n"
@@ -4031,7 +4042,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u,
           lay.sizeof_JSRegPIC, lay.off_regpic_shape, lay.off_regpic_slot_off,
           lay.off_regpic_kind, lay.reg_pic_own, lay.reg_pic_proto,
-          lay.reg_ic_none, lay.tag_lazy_json, lay.reg_bin_add, lay.reg_bin_sub,
+          lay.reg_ic_none, lay.tag_lazy_json, lay.reg_bin_add,
+          (unsigned)REG_BIN_SHL, (unsigned)REG_BIN_SAR, (unsigned)REG_BIN_SHR,
+          (unsigned)REG_BIN_AND, (unsigned)REG_BIN_XOR, (unsigned)REG_BIN_OR,
+          lay.reg_bin_sub,
           lay.reg_bin_mul, lay.reg_bin_div, lay.reg_bin_mod, lay.reg_bin_lt,
           lay.reg_bin_lte, lay.reg_bin_gt, lay.reg_bin_gte,
           lay.reg_bin_strict_eq, lay.reg_bin_strict_neq, lay.reg_bin_eq,
@@ -4860,33 +4874,27 @@ int qjsaot_driver_main(int argc, char **argv) {
         "== v2); return 1;\n"
         "    case QJS_AOT_REG_BIN_STRICT_NEQ: *out = JS_MKVAL(JS_TAG_BOOL, v1 "
         "!= v2); return 1;\n"
-        /* The bitwise and shift sub-operations. Without these every `&`, `|`,
-           `^`, `<<`, `>>` and `>>>` fell through to qjs_aot_num_fast -- an
-           out-of-line call, since the unit is a separate translation unit and
-           its `always_inline` on the engine side has no effect here. That is
-           why the integer kernel's gap (1.78x) is bigger than the double
-           kernel's (1.44x): 12 of its 16 arithmetic ops are bitwise.
-
-           The sub-op values are contiguous in JSRegBinaryOp (MUL, DIV, MOD,
-           ADD, SUB, SHL, SAR, SHR, AND, XOR, OR, POW) and only ADD is exposed
-           to the unit, so the rest are derived from it by offset. */
-        "    case QJS_AOT_REG_BIN_ADD + 2: /* SHL */\n"
+        /* The bitwise and shift sub-operations, handled inline. Without these
+           cases they fall through to `qjs_aot_num_fast`, which is an
+           out-of-line call: the unit is a separate translation unit, so the
+           engine side's `always_inline` does not reach it. */
+        "    case QJS_AOT_REG_BIN_SHL: /* SHL */\n"
         "      *out = JS_MKVAL(JS_TAG_INT, (int32_t)((uint32_t)v1 << (v2 & "
         "31))); return 1;\n"
-        "    case QJS_AOT_REG_BIN_ADD + 3: /* SAR */\n"
+        "    case QJS_AOT_REG_BIN_SAR: /* SAR */\n"
         "      *out = JS_MKVAL(JS_TAG_INT, v1 >> (v2 & 31)); return 1;\n"
-        "    case QJS_AOT_REG_BIN_ADD + 4: /* SHR: above INT32_MAX it is a "
+        "    case QJS_AOT_REG_BIN_SHR: /* SHR: above INT32_MAX it is a "
         "double */\n"
         "      { uint32_t u = (uint32_t)v1 >> (v2 & 31);\n"
         "        *out = u <= (uint32_t)INT32_MAX\n"
         "                   ? JS_MKVAL(JS_TAG_INT, (int32_t)u)\n"
         "                   : __JS_NewFloat64((double)u);\n"
         "        return 1; }\n"
-        "    case QJS_AOT_REG_BIN_ADD + 5: /* AND */\n"
+        "    case QJS_AOT_REG_BIN_AND: /* AND */\n"
         "      *out = JS_MKVAL(JS_TAG_INT, v1 & v2); return 1;\n"
-        "    case QJS_AOT_REG_BIN_ADD + 6: /* XOR */\n"
+        "    case QJS_AOT_REG_BIN_XOR: /* XOR */\n"
         "      *out = JS_MKVAL(JS_TAG_INT, v1 ^ v2); return 1;\n"
-        "    case QJS_AOT_REG_BIN_ADD + 7: /* OR */\n"
+        "    case QJS_AOT_REG_BIN_OR: /* OR */\n"
         "      *out = JS_MKVAL(JS_TAG_INT, v1 | v2); return 1;\n"
         "    default: return 0;\n"
         "    }\n"
