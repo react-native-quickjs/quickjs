@@ -34,6 +34,11 @@ void e2_rop_name(uint16_t rop, char *out, size_t n);
 /* The profile's execution count at one pc (qjsaot.c): the op-call weight. */
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
 
+/* A numeric constant-pool entry, exactly as the bytecode holds it. Lets
+   `binary_cpool` fold `x * 0.999` to a comparison and a multiply against a C
+   double literal instead of op-calling the engine. */
+int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
+
 /* Report one instruction the body leaves as an op call, weighted by the
    profile's count there. A pc that also has an inline fast path reports its
    weight as `missarm`: only its misses reach the op call, so counting it in the
@@ -351,6 +356,44 @@ static int emit_native_binary_imm(
       a = operand_off(in, 1);
       imm_idx = 2;
       break;
+    case ROP_binary_cpool: {
+      /* "rbrbc": d, sub, a, kind, idx -- the second operand is a pool entry,
+         not a register. A numeric entry folds to a C double literal; anything
+         else stays an op call. This is the form every float literal in a
+         numeric loop takes, and leaving it as an op call made
+         `regvm_s_ROP_binary_cpool` about half of that kernel's instructions. */
+      double c;
+      uint32_t kind, idx;
+      if (in->narg < 5) return 0;
+      sub = (int)in->arg[1].val;
+      a = operand_off(in, 2);
+      kind = (uint32_t)in->arg[3].val;
+      idx = (uint32_t)in->arg[4].val;
+      if (kind != REG_CONST_CPOOL) return 0;
+      if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
+      if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL &&
+          sub != REG_BIN_DIV)
+        return 0;
+      if (role == NULL || role->control != E2_CF_NONE) return 0;
+      if (in->ndef != 1 || a < 0) return 0;
+      d = dest_off(fn, in);
+      if (d < 0) return 0;
+      fprintf(f, "g_%d: {\n", in->pc);
+      fprintf(f, "    JSValue _r;\n");
+      fprintf(
+          f,
+          "    if (__builtin_expect(q2_arith(%d, AOT_REG(fr, %d), "
+          "__JS_NewFloat64(%.17g), &_r), 1)) {\n",
+          sub, a, c);
+      emit_site_hit(f, in);
+      fprintf(f, "        AOT_SET_B(ctx, fr, %d, _r);\n", d);
+      fprintf(f, "        goto g_%d;\n", in->next);
+      fprintf(f, "    }\n");
+      emit_site_miss(f, in);
+      fprintf(f, "}\n");
+      (void)is_last;
+      return 1;
+    }
     default:
       return 0;
   }
