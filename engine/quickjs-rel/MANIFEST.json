@@ -1215,12 +1215,16 @@
       "sha256": "d3dc2d1776e1534a5f07647e3e4bd4d5292ecd36a3c221eb2a1df29714330e1e"
     },
     {
+      "name": "0309-aot-pic-ways.patch",
+      "sha256": "4d23378cf7f0021fd52124f612e083df8213315fc69d4248d162b86739a87814"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "840901a3312bc28a81561f71dcf9edefbd054108ccf55b746bb36ef580ec593f",
+    "quickjs.c": "c398666013761c31091164d8572cf4f58b6c9f6572f5d1533db839b7e63f8b44",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

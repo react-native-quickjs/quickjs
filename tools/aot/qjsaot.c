@@ -4010,6 +4010,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_JSVALUE_TAG %uu\n"
           "#define QJS_AOT_OFF_JSVALUE_U %uu\n\n"
           "#define QJS_AOT_SIZEOF_JSREGPIC %uu\n"
+          "#define QJS_AOT_REG_PIC_WAYS %uu\n"
           "#define QJS_AOT_OFF_JSREGPIC_SHAPE %uu\n"
           "#define QJS_AOT_OFF_JSREGPIC_SLOT_OFF %uu\n"
           "#define QJS_AOT_OFF_JSREGPIC_KIND %uu\n"
@@ -4103,7 +4104,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_shape_hash_table, lay.off_property_u_value,
           lay.off_shape_property_flags_atom, lay.off_string_len_bits,
           lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u,
-          lay.sizeof_JSRegPIC, lay.off_regpic_shape, lay.off_regpic_slot_off,
+          lay.sizeof_JSRegPIC, lay.reg_pic_ways,
+          lay.off_regpic_shape, lay.off_regpic_slot_off,
           lay.off_regpic_kind, lay.reg_pic_own, lay.reg_pic_proto,
           lay.reg_ic_none, lay.tag_lazy_json, lay.reg_bin_add,
           (unsigned)REG_BIN_SHL, (unsigned)REG_BIN_SAR, (unsigned)REG_BIN_SHR,
@@ -4743,7 +4745,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         f,
         "static inline __attribute__((always_inline)) int "
         "q2_own_read_hit(const void *pic, void *const *holders,\n"
-        "                       JSValue recv, int site, JSValue *out)\n"
+        "                       JSValue recv, int site, int nsites,\n"
+        "                       JSValue *out)\n"
         "{\n"
         "  const unsigned char *obj, *e, *holder, *prop;\n"
         "  uint32_t slot_off;\n"
@@ -4758,9 +4761,20 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  obj = (const unsigned char *)JS_VALUE_GET_PTR(recv);\n"
         "  e = (const unsigned char *)pic + (size_t)site * "
         "QJS_AOT_SIZEOF_JSREGPIC;\n"
-        "  if (*(const void *const *)e !=\n"
-        "      *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE)) {\n"
-        "    return 0;\n"
+        "  /* A polymorphic site puts its later shapes in way 1 and up, not at\n"
+        "     `site`, so probing only the primary misses them forever. Walk the\n"
+        "     ways exactly as regvm_get_field_ic does. */\n"
+        "  {\n"
+        "    const unsigned char *w = e;\n"
+        "    unsigned k;\n"
+        "    for (k = 0; k < QJS_AOT_REG_PIC_WAYS; k++) {\n"
+        "      if (*(const void *const *)w ==\n"
+        "          *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE))\n"
+        "        break;\n"
+        "      w += (size_t)nsites * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "    }\n"
+        "    if (k == QJS_AOT_REG_PIC_WAYS) return 0;\n"
+        "    e = w;\n"
         "  }\n"
         "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) !=\n"
         "      QJS_AOT_REG_PIC_OWN) {\n"

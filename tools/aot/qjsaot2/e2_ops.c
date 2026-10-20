@@ -26,6 +26,22 @@
 #include "e2.h"
 #include "ir.h"
 
+/* The number of PIC sites the function uses: one more than the largest site
+   index. The per-site stride in the PIC table is this count, because site `k`'s
+   way `w` lives at `w * count + k`, so the read helper needs it to step between
+   ways. */
+int e2_pic_sites(const Q2Func *fn) {
+  int i, n = 0;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    if (in->narg >= 4 && in->arg[3].kind == 's') {
+      int v = (int)in->arg[3].val;
+      if (v >= n) n = v + 1;
+    }
+  }
+  return n;
+}
+
 /* The opcode's name, for the poison abort message. The role table already
    carries the engine's format; the name comes from the same generated source so
    a reader sees the op the way the engine does. */
@@ -464,7 +480,7 @@ static int emit_native_binary_imm(
 static int emit_native_field_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const E2Role *role = e2_roles[in->rop];
-  int d, recv, site;
+  int d, recv, site, nsites = e2_pic_sites(fn);
 
   if (in->op != Q2_OP_GET_FIELD) return 0;
   if (role == NULL || role->control != E2_CF_NONE) return 0;
@@ -482,8 +498,8 @@ static int emit_native_field_read(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "AOT_REG(fr, %d), %d, &_f), 1)) {\n",
-      recv, site);
+      "AOT_REG(fr, %d), %d, %d, &_f), 1)) {\n",
+      recv, site, nsites);
   emit_site_hit(f, in);
   /* The value is borrowed from the object's slot, so the store duplicates it
      (AOT_SET_B does that in an owning build and is a plain assignment under
@@ -588,6 +604,8 @@ static int emit_native_this_field(
     return 0;
   dfield = E2_ROFF(in->arg[0]);
   drecv = E2_ROFF(in->arg[1]);
+  {
+    int nsites = e2_pic_sites(fn);
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _t, _v;\n");
@@ -604,8 +622,8 @@ static int emit_native_this_field(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, _t, %d, "
-      "&_v), 1)) {\n",
-      site);
+      "%d, &_v), 1)) {\n",
+      site, nsites);
   emit_site_hit(f, in);
   /* Borrowed from the object's slot, so the store duplicates it. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _v);\n", dfield);
@@ -614,6 +632,7 @@ static int emit_native_this_field(
   emit_site_miss(f, in);
   fprintf(f, "}\n");
   (void)is_last;
+  }
   return 1;
 }
 
@@ -643,14 +662,16 @@ static int emit_native_field_chain(
   /* The second destination is the second defined value. */
   if (in->ndef < 2) return 0;
   d1 = fn->values[in->def[1]].reg * 16;
+  {
+    int nsites = e2_pic_sites(fn);
 
   fprintf(f, "g_%d: {\n", in->pc);
   fprintf(f, "    JSValue _c0, _c1;\n");
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "AOT_REG(fr, %d), %d, &_c0), 1)) {\n",
-      recv, s1);
+      "AOT_REG(fr, %d), %d, %d, &_c0), 1)) {\n",
+      recv, s1, nsites);
   /* Link 1 goes to its register, so link 2's receiver is available even if
      link 2 misses; both are borrowed, so the store duplicates.
 
@@ -664,8 +685,8 @@ static int emit_native_field_chain(
   fprintf(
       f,
       "        if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "_c0, %d, &_c1), 1)) {\n",
-      s2);
+      "_c0, %d, %d, &_c1), 1)) {\n",
+      s2, nsites);
   emit_site_hit(f, in);
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _c1);\n", d1);
   fprintf(f, "            goto g_%d;\n", in->next);
@@ -675,6 +696,7 @@ static int emit_native_field_chain(
   emit_site_miss(f, in);
   fprintf(f, "}\n");
   (void)is_last;
+  }
   return 1;
 }
 

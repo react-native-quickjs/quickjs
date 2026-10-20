@@ -1,0 +1,47 @@
+Subject: Read every PIC way in the compiled field fast path
+
+What this does
+  Adds the number of caching ways a PIC site owns to the AOT layout and probes
+  all of them in the generated field-read fast path, not just the primary.
+
+Why we need it
+  A polymorphic site installs its second and later shapes in way 1 and up, at
+  `way * site_count + site`, so the primary entry keeps the first shape. The
+  compiled fast path looked only at the primary, so on a two-shape site it
+  missed on every access to the other shape and took the op call into the
+  engine's handler. That is why a polymorphic field read was the slowest class:
+  callgrind showed 58% of a compiled `field_poly` run in
+  `regvm_s_ROP_get_field` and 10% in `qjs_aot_step`, against 21% in the compiled
+  body itself.
+
+  The interpreter's `regvm_get_field_ic` already walks the ways (`e += cnt`
+  twice), so this makes the compiled path match it. The stride is the function's
+  site count, which the generated code takes from `e2_pic_sites()`.
+
+Measured
+  `field_poly` 1.65x -> 0.40x against the interpreter (m1.sh classes, full
+  micro.js unit): the class now beats the interpreter instead of losing to it.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -54,6 +54,10 @@
+        ABI constants it compares against (the entry kind, the no-site marker and
+        the lazy-JSON tag). */
+     uint32_t sizeof_JSRegPIC;
++    /* The number of caching ways a site owns. A polymorphic site installs its
++       later shapes in way 1 and up, so a reader that looks only at way 0 misses
++       them; the inline read probes every way, as the interpreter does. */
++    uint32_t reg_pic_ways;
+     uint32_t off_regpic_shape, off_regpic_slot_off, off_regpic_kind;
+     uint32_t reg_pic_own, reg_pic_proto, reg_ic_none, tag_lazy_json;
+     /* The binary sub-operations the inline arithmetic path names, from
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60489,6 +60489,7 @@
+     out->off_jsvalue_tag = (uint32_t)offsetof(JSValue, tag);
+     out->off_jsvalue_u = (uint32_t)offsetof(JSValue, u);
+     out->sizeof_JSRegPIC = (uint32_t)sizeof(JSRegPIC);
++    out->reg_pic_ways = (uint32_t)REGVM_PIC_WAYS;
+     out->off_regpic_shape = (uint32_t)offsetof(JSRegPIC, shape);
+     out->off_regpic_slot_off = (uint32_t)offsetof(JSRegPIC, slot_off);
+     out->off_regpic_kind = (uint32_t)offsetof(JSRegPIC, kind);

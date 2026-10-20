@@ -43,6 +43,10 @@ void e2_emit_native_entry(FILE *f, const struct Q2Func *fn, char hex[33]);
    checks the stack (rule K). */
 int e2_has_call_site(const struct Q2Func *fn);
 
+/* One more than the largest PIC site index the function uses: the stride between
+   one site's caching ways in the PIC table. */
+int e2_pic_sites(const struct Q2Func *fn);
+
 /* `e2_undefined_value`: the `undefined` word the entry fills the frame with,
    defined once in the unit prelude. */
 
