@@ -2308,9 +2308,10 @@ static void emit_trivial_own(
    representation. A TAG value is already a JSValue, so it is a plain store; an
    i32 or f64 is boxed the way the interpreter would have it. */
 static void e2_exit_store(FILE *f, Q2ValueId v, int reg) {
-  /* The slot to write is the one for the REGISTER being synced, not the register
-     the value happened to be defined in: an edge can move a value into another
-     register's parameter, and those are different slots. */
+  /* The register to write is the one being synced, NOT the one the value was
+     defined in: an edge can move a value into another register's param, and
+     those are different slots. Writing val->reg here silently left the slot the
+     generic body actually reads holding its previous contents. */
   int off = reg * 16;
   switch (e2_rep_prefix(v)[0]) {
     case 'i':
@@ -2382,6 +2383,175 @@ static void e2_emit_exit_at(
   if (lb != NULL) q2_live_before(fn, ins, lb);
   e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0);
   free(lb);
+}
+
+/* One edge u->s as a PARALLEL move: temps first, then assign, so a swap is
+   order-independent. Pure locals -- only exits write the frame. */
+static void e2_emit_edge_moves(
+    FILE *f, const Q2Func *fn, int b, int si, Q2ValueId *cur) {
+  const Q2Block *blk = &fn->blocks[b];
+  const Q2Block *s = blk->succ_block[si] >= 0 && blk->succ_block[si] < fn->nblocks
+                         ? &fn->blocks[blk->succ_block[si]]
+                         : NULL;
+  int k, np;
+  if (s == NULL) return;
+  np = s->nparams;
+  if (blk->nedge_args[si] >= 0 && blk->nedge_args[si] < np)
+    np = blk->nedge_args[si];
+  if (np <= 0) return;
+  fprintf(f, "    {\n");
+  for (k = 0; k < np; k++) {
+    Q2ValueId pv = s->param_val[k];
+    if (blk->edge_arg[si][k] == Q2_NO_VALUE) continue;
+    switch (e2_rep_prefix(pv)[0]) {
+      case 'i': fprintf(f, "      int32_t %s_t%d = ", e2_rep_prefix(pv), k); break;
+      case 'd': fprintf(f, "      double %s_t%d = ", e2_rep_prefix(pv), k); break;
+      case 'b': fprintf(f, "      int %s_t%d = ", e2_rep_prefix(pv), k); break;
+      default: fprintf(f, "      JSValue %s_t%d = ", e2_rep_prefix(pv), k); break;
+    }
+    {
+      Q2ValueId av = blk->edge_arg[si][k];
+      char sn[32];
+      const char *sp = e2_rep_prefix(av), *dp = e2_rep_prefix(pv);
+      e2_local_name(sn, sizeof(sn), av);
+      /* Convert from the SOURCE's representation to the destination's, using
+         the value each side actually is: a typed source is a C scalar, only a
+         TAG source is a JSValue. */
+      if (sp[0] == dp[0]) fprintf(f, "%s;\n", sn);
+      /* numeric <-> numeric is a cast */
+      else if (sp[0] == 'i' && dp[0] == 'd') fprintf(f, "(double)%s;\n", sn);
+      else if (sp[0] == 'd' && dp[0] == 'i') fprintf(f, "(int32_t)%s;\n", sn);
+      else if (sp[0] == 'i' && dp[0] == 'b') fprintf(f, "(%s != 0);\n", sn);
+      else if (sp[0] == 'b' && dp[0] == 'i') fprintf(f, "(int32_t)%s;\n", sn);
+      else if (sp[0] == 'b' && dp[0] == 'd') fprintf(f, "(double)%s;\n", sn);
+      else if (sp[0] == 'd' && dp[0] == 'b') fprintf(f, "(%s != 0);\n", sn);
+      /* a TAG source can be read as any typed local, with the tag checked */
+      else if (sp[0] == 'v' && dp[0] == 'i')
+        fprintf(f, "(int32_t)JS_VALUE_GET_INT(%s);\n", sn);
+      else if (sp[0] == 'v' && dp[0] == 'd')
+        fprintf(f, "JS_VALUE_GET_TAG(%s) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(%s) : JS_VALUE_GET_FLOAT64(%s);\n", sn, sn, sn);
+      else if (sp[0] == 'v' && dp[0] == 'b')
+        fprintf(f, "JS_VALUE_GET_BOOL(%s);\n", sn);
+      /* a typed source boxed into a JSValue destination */
+      else if (sp[0] == 'i') fprintf(f, "JS_MKVAL(JS_TAG_INT, %s);\n", sn);
+      else if (sp[0] == 'd') fprintf(f, "qjs_aot_box_num(%s, qjs_aot_fitsi(%s));\n", sn, sn);
+      else if (sp[0] == 'b') fprintf(f, "JS_MKVAL(JS_TAG_BOOL, %s);\n", sn);
+      else fprintf(f, "%s;\n", sn);
+    }
+  }
+  for (k = 0; k < np; k++) {
+    Q2ValueId pv = s->param_val[k];
+    char pn[32];
+    if (blk->edge_arg[si][k] == Q2_NO_VALUE) continue;
+    e2_local_name(pn, sizeof(pn), pv);
+    fprintf(f, "      %s = %s_t%d;\n", pn, e2_rep_prefix(pv), k);
+  }
+  fprintf(f, "    }\n");
+}
+
+/* One arm of a lowered branch: the edge moves for successor k, then the jump to
+   THAT successor. One function taking k, so the (succ_block, edge_arg) pairing
+   cannot drift between the condition's sense and the moves it is paired with. */
+static void e2_emit_arm(
+    FILE *f, const Q2Func *fn, int b, int k, Q2ValueId *cur) {
+  const Q2Block *blk = &fn->blocks[b];
+  int sb = blk->succ_block[k];
+  if (sb < 0 || sb >= fn->nblocks) {
+    /* A target that leaves the function: the caller hands off instead. */
+    fprintf(f, "      /* arm %d leaves the function */\n", k);
+    return;
+  }
+  e2_emit_edge_moves(f, fn, b, k, cur);
+  fprintf(f, "      goto s_%d;\n", fn->blocks[sb].start_pc);
+}
+
+/* A typed compare-and-branch on two i32 locals.
+
+   The sense is the reference lowering's, not re-derived: REG_CMP_INVERT in the
+   sub-op means the branch is taken on the NEGATED result, so with the invert bit
+   set the taken arm is on `!(a op b)`. Successor order is the IR builder's --
+   succ[0] is the branch's target, succ[1] the fall-through (build.c), and
+   edge_arg[] is per successor in that same order. */
+/* Whether the generic body opens an element region at this block's start. Such a
+   block cannot be entered by a spec-body label: the generic body declares and
+   opens its `_reg` inside `g_<start_pc>`, and jumping to `s_<start_pc>` would
+   skip the open and use an uninitialised region -- which showed up as a wild
+   pointer in `_reg.vals` and an opcode-0 error deep in the interpreter. */
+static int block_opens_region(const Q2Func *fn, int b) {
+  const Q2Block *blk = &fn->blocks[b];
+  int run_arr = -1;
+  int last;
+  if (blk->ninsns <= 0) return 0;
+  last = blk->first_insn + blk->ninsns - 1;
+  /* Does an element region open ANYWHERE in this block? If so, the block's
+     instructions after that point read `_reg`, which the generic body declared
+     and opened in this block -- so neither a `goto s_<start>` nor an exit at a
+     later pc can enter it safely. */
+  {
+    int i;
+    for (i = blk->first_insn; i <= last; i++) {
+      if (elem_arr_reg(&fn->insns[i]) >= 0 &&
+          elem_run_len(fn, i, last, &run_arr) > 0)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+static int emit_typed_branch(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33], int fi) {
+  static const char *const ops[4] = {"<", "<=", ">", ">="};
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  int sub, inv, base, av, bv, si_take, si_else, sb_take, sb_else;
+  char an[32], bn[32];
+  (void)hex;
+  (void)fi;
+
+  if (in->rop != ROP_branch_cmp_reg_reg && in->rop != ROP_branch_cmp_reg_reg_s)
+    return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (in->narg < 4 || in->arg[0].kind != 'b' || in->nuse < 2) return 0;
+  if (blk->nsucc < 2 || !have_types || t == NULL) return 0;
+  sub = (int)in->arg[0].val;
+  inv = (sub & REG_CMP_INVERT) != 0;
+  base = sub & ~REG_CMP_INVERT;
+  if (base < REG_BIN_LT || base > REG_BIN_GTE) return 0;
+  av = in->use[0];
+  bv = in->use[1];
+  if (t->lb[av] != E2_LB_I32 || t->lb[bv] != E2_LB_I32) return 0;
+  /* succ[0] is where the branch GOES when taken; succ[1] is the fall-through. */
+  si_take = 0;
+  si_else = 1;
+  sb_take = blk->succ_block[si_take];
+  sb_else = blk->succ_block[si_else];
+  if (sb_take < 0 || sb_take >= fn->nblocks) return 0;
+  /* Neither arm may target a block the generic body opens an element region at:
+     the spec body has no region, so entering there would use `_reg` unopened. */
+  if (block_opens_region(fn, sb_take)) return 0;
+  if (sb_else >= 0 && sb_else < fn->nblocks && block_opens_region(fn, sb_else))
+    return 0;
+
+  e2_local_name(an, sizeof(an), av);
+  e2_local_name(bn, sizeof(bn), bv);
+  /* `if (a op b)` is the TAKEN condition when not inverted; when inverted the
+     taken arm is on the negated result. */
+  if (!inv) {
+    fprintf(f, "    if (%s %s %s) {\n", an, ops[base - REG_BIN_LT], bn);
+    e2_emit_arm(f, fn, b, si_take, cur);
+    fprintf(f, "    } else {\n");
+    e2_emit_arm(f, fn, b, si_else, cur);
+    fprintf(f, "    }\n");
+  } else {
+    fprintf(f, "    if (!(%s %s %s)) {\n", an, ops[base - REG_BIN_LT], bn);
+    e2_emit_arm(f, fn, b, si_take, cur);
+    fprintf(f, "    } else {\n");
+    e2_emit_arm(f, fn, b, si_else, cur);
+    fprintf(f, "    }\n");
+  }
+  (void)sb_else;
+  return 1;
 }
 
 /* The speculative body (E8).
@@ -2519,7 +2689,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
      every terminator, so only a back edge points at a lower index. */
   for (b = 0; b < fn->nrpo; b++) {
     const Q2Block *blk = &fn->blocks[fn->rpo[b]];
-    int i2, lowered_to = blk->first_insn;
+    int i2, lowered_to = blk->first_insn, term_lowered = 0;
     Q2ValueId *cur = NULL;
     int r0;
 
@@ -2559,7 +2729,14 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       const E2Role *role = e2_roles[in->rop];
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
-      if (role != NULL && role->control != E2_CF_NONE) break;
+      if (role != NULL && role->control != E2_CF_NONE) {
+        if (emit_typed_branch(
+                f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi)) {
+          lowered_to = i2 + 1;
+          term_lowered = 1;
+        }
+        break;
+      }
       if (is_trivial(in) || in->rop == ROP_get_arg2) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
@@ -2570,6 +2747,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         break;
       }
       lowered_to = i2 + 1;
+    }
+    if (term_lowered) {
+      free(cur);
+      continue;
     }
     if (lowered_to < blk->first_insn + blk->ninsns) {
       /* EXIT AT an instruction's pc: that instruction has not run, so the live
