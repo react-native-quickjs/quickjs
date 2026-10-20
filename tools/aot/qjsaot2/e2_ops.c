@@ -2342,7 +2342,7 @@ static void e2_exit_store(FILE *f, Q2ValueId v) {
    reads the frame unconditionally. */
 static void e2_emit_exit(
     FILE *f, const Q2Func *fn, int pc, char hex[33], int fi,
-    const Q2ValueId *cur, const uint64_t *live_set) {
+    const Q2ValueId *cur, const uint64_t *live_set, int handoff) {
   int words = fn->lwords, w, r;
 
   fprintf(f, "    {\n");
@@ -2361,7 +2361,12 @@ static void e2_emit_exit(
       }
     }
   }
-  fprintf(f, "    E2_EXIT_NOTE(%d);\n", fi);
+  /* A hand-off is the planned exit at an instruction the spec body does not lower
+     yet, not a failed speculation. Counting it as a deopt switched nearly every
+     spec body off after 257 calls while E8 is incomplete, which would have made
+     every measurement in this step time the generic body. */
+  fprintf(
+      f, "    %s(%d);\n", handoff ? "E2_HANDOFF_NOTE" : "E2_EXIT_NOTE", fi);
   fprintf(f, "    return aot_g_%s(ctx, f, fr, %d);\n", hex, pc);
   fprintf(f, "    }\n");
 }
@@ -2373,7 +2378,7 @@ static void e2_emit_exit_at(
     const Q2ValueId *cur) {
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (lb != NULL) q2_live_before(fn, ins, lb);
-  e2_emit_exit(f, fn, pc, hex, fi, cur, lb);
+  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0);
   free(lb);
 }
 
@@ -2562,7 +2567,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    /* exit at the first unlowered instruction */\n");
       if (lb != NULL) q2_live_before(fn, lowered_to, lb);
       e2_emit_exit(
-          f, fn, fn->insns[lowered_to].pc, hex, fi, cur, lb);
+          f, fn, fn->insns[lowered_to].pc, hex, fi, cur, lb, 1);
       free(lb);
     } else {
       /* The whole non-terminator prefix was lowered. Two sub-cases, and they
@@ -2581,11 +2586,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (set != NULL) q2_live_before(fn, last, set);
       if (is_term) {
         fprintf(f, "    /* the terminator is 2b's: exit at its own pc */\n");
-        e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set);
+        e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1);
       } else {
         const uint64_t *lo = q2_live_out(fn, last);
         fprintf(f, "    /* fall through: the last instruction ran */\n");
-        e2_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo);
+        e2_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo, 1);
       }
       free(set);
     }
