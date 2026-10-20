@@ -2522,21 +2522,31 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     int r0;
 
     fprintf(f, "    s_%d: (void)0;\n", blk->start_pc);
-    /* Entries: the block's live-in registers are loaded from the frame into
-       their locals, so the block's own code works on locals (S1) and the exit
-       has something to write back. A live-in that is not a parameter is read
-       from the frame: it was current on entry to the function or written there
-       by the generic body. */
+    /* The state a block starts with: which value each register holds. The IR
+       already knows this exactly -- blk->in_reg/in_val list every live-in
+       register and its value, parameter or not -- so `cur` is seeded from it
+       rather than by reloading the frame.
+
+       No block needs a frame reload. The spec body is entered at exactly one
+       point (aot_f_* sends entry_pc != 0 to the generic body) and is never
+       re-entered after an exit, so every spec block is reached through edges the
+       spec body itself emitted. In SSA every value a block uses is either one of
+       its own parameters or was defined in a block that dominates it, so on every
+       path into the block the defining code has already run and set its local.
+       The frame is therefore never the source of truth for a block's state, and
+       reading it here was what let a stale frame slot overwrite a value an edge
+       had just moved.
+
+       The entry block needs nothing special either: its arguments arrive as
+       get_arg/get_arg2 instructions inside it, which the prefix lowers (with
+       their tag guards), and its other live-ins are undefined at function start,
+       which the local initialisers already are. */
     cur = malloc(sizeof(*cur) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
     if (cur != NULL) {
       for (r0 = 0; r0 < fn->nregs; r0++) cur[r0] = Q2_NO_VALUE;
       for (r0 = 0; r0 < blk->nlive_in; r0++) {
         int rr = blk->in_reg[r0];
-        Q2ValueId v = blk->in_val[r0];
-        if (rr < 0 || rr >= fn->nregs) continue;
-        if (v == Q2_NO_VALUE) continue;
-        e2_load_local_from_frame(f, v, rr, have_types ? &types : NULL);
-        cur[rr] = v;
+        if (rr >= 0 && rr < fn->nregs) cur[rr] = blk->in_val[r0];
       }
     }
     /* 2a-2: the block's lowered prefix, then an exit at the first instruction
