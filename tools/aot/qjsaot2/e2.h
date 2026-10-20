@@ -43,6 +43,16 @@ void e2_emit_native_entry(FILE *f, const struct Q2Func *fn, char hex[33]);
    checks the stack (rule K). */
 int e2_has_call_site(const struct Q2Func *fn);
 
+/* The registers live immediately BEFORE an instruction: live-out minus the
+   instruction's own definitions, plus its uses and window. Use this when the exit
+   is AT an instruction's pc, because that instruction has not run yet. */
+void q2_live_before(const struct Q2Func *fn, int insn, uint64_t *out);
+
+/* The registers live immediately AFTER an instruction (build.c stores them per
+   instruction). Use this when the exit is at end_pc, after the last instruction
+   ran: live-before would drop whatever that instruction defines. */
+const uint64_t *q2_live_out(const struct Q2Func *fn, int insn);
+
 /* Functions refused for the speculative body as irreducible. */
 extern int e2_irreducible;
 

@@ -921,7 +921,13 @@ static void q2_exception_sync(FILE *f, const Q2Func *fn, const Q2Cur *c) {
 }
 
 /* The live set before an instruction: (insn_live \ defs) | uses. */
-static void q2_live_before(const Q2Func *fn, int insn, uint64_t *out) {
+/* The live set immediately after an instruction: what build.c computed and
+   stored. Equal to the successor's live-in for a fall-through edge. */
+const uint64_t *q2_live_out(const Q2Func *fn, int insn) {
+  return fn->insn_live + (size_t)insn * (size_t)fn->lwords;
+}
+
+void q2_live_before(const Q2Func *fn, int insn, uint64_t *out) {
   int words = fn->lwords, w, k;
   const Q2Insn *in = &fn->insns[insn];
   memcpy(out, fn->insn_live + (size_t)insn * words, (size_t)words * 8);
