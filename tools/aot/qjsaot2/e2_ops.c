@@ -1963,8 +1963,30 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   return 0;
 }
 
+/* Overflow-exit pcs seen while emitting: each gets a stub after the blocks. */
+static int g_e2_ox[256];
+static int g_e2_ox_n = 0;
+
 /* The function being emitted, for the helpers that need its value table. */
 static const Q2Func *g_e2_fn = NULL;
+/* The analysis for the function being emitted. The spec body's representations
+   come from HERE (E2Types.lb), never from Q2Value.rep: that holds the old
+   emitter's inference, whose BOT reads as TAG and which disagrees with the
+   analysis on values like a block parameter. */
+static const E2Types *g_e2_types = NULL;
+
+/* The local-name prefix for a value, from the analysis. */
+static const char *e2_rep_prefix(Q2ValueId v) {
+  int lb = (g_e2_types != NULL && v < (Q2ValueId)g_e2_types->nvalues)
+               ? g_e2_types->lb[v]
+               : E2_LB_TAG;
+  switch (lb) {
+    case E2_LB_I32: return "i";
+    case E2_LB_F64: return "d";
+    case E2_LB_BOOL: return "b";
+    default: return "v";
+  }
+}
 
 /* A trivial instruction lowered by the spec body. Rule R1: it emits no `g_`
    label -- those belong to the generic body -- and it never calls the generic
@@ -1973,14 +1995,7 @@ static const Q2Func *g_e2_fn = NULL;
 /* The name of a value's local, by its own representation: `i<v>`, `d<v>`,
    `b<v>` or `v<v>`. */
 static void e2_local_name(char *buf, size_t n, Q2ValueId v) {
-  const char *pre;
-  switch (g_e2_fn->values[v].rep) {
-    case Q2_R_I32: pre = "i"; break;
-    case Q2_R_F64: pre = "d"; break;
-    case Q2_R_BOOL: pre = "b"; break;
-    default: pre = "v"; break;
-  }
-  snprintf(buf, n, "%s%u", pre, (unsigned)v);
+  snprintf(buf, n, "%s%u", e2_rep_prefix(v), (unsigned)v);
 }
 
 /* Copy one local to another across representations. The destination is a JSValue
@@ -1988,44 +2003,93 @@ static void e2_local_name(char *buf, size_t n, Q2ValueId v) {
    same conversion the interpreter would perform on the frame. */
 static void e2_copy_local(FILE *f, Q2ValueId d, Q2ValueId sv) {
   char dn[32], sn[32];
-  uint8_t dr = g_e2_fn->values[d].rep, sr = g_e2_fn->values[sv].rep;
+  const char *dp = e2_rep_prefix(d), *sp = e2_rep_prefix(sv);
   e2_local_name(dn, sizeof(dn), d);
   e2_local_name(sn, sizeof(sn), sv);
-  if (dr == sr) {
+  if (dp[0] == sp[0]) {
     fprintf(f, "    %s = %s;\n", dn, sn);
     return;
   }
-  if (dr == Q2_R_I32) {
+  if (dp[0] == 'i') {
     /* to i32: a JSValue source can only be narrowed when it is an int, which
        the spec body cannot assume -- so this copy is not lowerable. */
     fprintf(f, "    %s = (int32_t)JS_VALUE_GET_INT(%s);\n", dn, sn);
     return;
   }
-  if (dr == Q2_R_F64) {
+  if (dp[0] == 'd') {
     fprintf(f, "    %s = (double)JS_VALUE_GET_INT(%s);\n", dn, sn);
     return;
   }
   /* to a JSValue local: box by the source's representation. */
-  if (sr == Q2_R_I32)
+  if (sp[0] == 'i')
     fprintf(f, "    %s = JS_MKVAL(JS_TAG_INT, %s);\n", dn, sn);
-  else if (sr == Q2_R_F64)
+  else if (sp[0] == 'd')
     fprintf(f, "    %s = qjs_aot_box_num(%s, qjs_aot_fitsi(%s));\n", dn, sn, sn);
-  else if (sr == Q2_R_BOOL)
+  else if (sp[0] == 'b')
     fprintf(f, "    %s = JS_MKVAL(JS_TAG_BOOL, %s);\n", dn, sn);
   else
     fprintf(f, "    %s = %s;\n", dn, sn);
 }
 
+/* A typed binary arithmetic instruction, speculatively: both operands are i32
+   locals and the result fits, so the addition is the machine's. The overflow
+   check is the exit `exits[v]` names -- when it fires, nothing has been written
+   to the frame yet (the store happens at an exit or an op call), so the generic
+   body resumes at this instruction and redoes it in full precision.
+
+   Returns 1 when it emitted the instruction, 0 when the operands or the result
+   are not typed i32 and the caller must exit instead. */
+static int emit_typed_arith(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur) {
+  Q2ValueId d, a, b;
+  const char *op;
+  int ld;
+
+  if (in->rop != ROP_add && in->rop != ROP_sub && in->rop != ROP_mul) return 0;
+  if (in->ndef < 1 || in->nuse < 2) return 0;
+  d = in->def[0];
+  a = in->use[0];
+  b = in->use[1];
+  if (d >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[d] != E2_LB_I32) return 0;
+  if (t->lb[a] != E2_LB_I32 || t->lb[b] != E2_LB_I32) return 0;
+  ld = fn->values[d].reg;
+  op = in->rop == ROP_add ? "+" : (in->rop == ROP_sub ? "-" : "*");
+  /* add/sub/mul in int64, then check the result fits: one widening op and one
+     compare, and the compare is the exit condition the analysis recorded. */
+  fprintf(
+      f,
+      "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n",
+      (unsigned)in->use[0], op, (unsigned)in->use[1]);
+  if (t->exits != NULL && (t->exits[d] & E2_EX_OVF)) {
+    fprintf(
+        f,
+        "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+        "goto ox_%d;\n",
+        in->pc);
+    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])))
+      g_e2_ox[g_e2_ox_n++] = in->pc;
+  }
+  fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
+  if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  return 1;
+}
+
 /* Load a block's live-in register from the frame into the value's local. This is
    the block's entry load (S1): after it the block works on locals only. */
-static void e2_load_local_from_frame(FILE *f, Q2ValueId v, int reg) {
+static void e2_load_local_from_frame(
+    FILE *f, Q2ValueId v, int reg, const E2Types *t) {
   int off = reg * 16;
-  switch (g_e2_fn->values[v].rep) {
-    case Q2_R_I32:
+  /* The representation comes from the analysis (E2Types.lb), never from
+     Q2Value.rep: that holds the OLD emitter's inference, whose BOT means TAG. */
+  int lb = (t != NULL && v < (Q2ValueId)t->nvalues) ? t->lb[v] : E2_LB_TAG;
+  switch (lb) {
+    case E2_LB_I32:
       fprintf(f, "    i%u = JS_VALUE_GET_INT(AOT_REG(fr, %d));\n", (unsigned)v,
               off);
       break;
-    case Q2_R_F64:
+    case E2_LB_F64:
       fprintf(
           f,
           "    d%u = JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_INT ? "
@@ -2033,7 +2097,7 @@ static void e2_load_local_from_frame(FILE *f, Q2ValueId v, int reg) {
           "JS_VALUE_GET_FLOAT64(AOT_REG(fr, %d));\n",
           (unsigned)v, off, off, off);
       break;
-    case Q2_R_BOOL:
+    case E2_LB_BOOL:
       fprintf(f, "    b%u = JS_VALUE_GET_BOOL(AOT_REG(fr, %d));\n", (unsigned)v,
               off);
       break;
@@ -2057,8 +2121,8 @@ static int trivial_is_lowerable(const Q2Insn *in, const Q2ValueId *cur) {
   if (in->rop == ROP_load_undefined || in->rop == ROP_load_null ||
       in->rop == ROP_load_true || in->rop == ROP_load_false) {
     if (in->ndef > 0) {
-      uint8_t r = g_e2_fn->values[in->def[0]].rep;
-      if (r == Q2_R_I32 || r == Q2_R_F64) return 0;
+      const char *p = e2_rep_prefix(in->def[0]);
+      if (p[0] == 'i' || p[0] == 'd') return 0;
     }
   }
   return 1;
@@ -2092,14 +2156,14 @@ static void emit_trivial_own(
       if (d == Q2_NO_VALUE) break;
       /* The local's name follows the value's representation, which the analysis
          may have set to TAG even for an integer constant. */
-      switch (g_e2_fn->values[d].rep) {
-        case Q2_R_I32:
+      switch (e2_rep_prefix(d)[0]) {
+        case 'i':
           fprintf(f, "    i%u = %d;\n", (unsigned)d, cv);
           break;
-        case Q2_R_F64:
+        case 'd':
           fprintf(f, "    d%u = %d;\n", (unsigned)d, cv);
           break;
-        case Q2_R_BOOL:
+        case 'b':
           fprintf(f, "    b%u = %d;\n", (unsigned)d, cv);
           break;
         default:
@@ -2128,7 +2192,7 @@ static void emit_trivial_own(
     case ROP_load_false: {
       int t = in->rop == ROP_load_true;
       if (d == Q2_NO_VALUE) break;
-      if (g_e2_fn->values[d].rep == Q2_R_BOOL)
+      if (e2_rep_prefix(d)[0] == 'b')
         fprintf(f, "    b%u = %d;\n", (unsigned)d, t);
       else
         fprintf(f, "    v%u = %s;\n", (unsigned)d, t ? "JS_TRUE" : "JS_FALSE");
@@ -2154,19 +2218,19 @@ static void emit_trivial_own(
 static void e2_exit_store(FILE *f, Q2ValueId v) {
   const Q2Value *val = &g_e2_fn->values[v];
   int off = val->reg * 16;
-  switch (val->rep) {
-    case Q2_R_I32:
+  switch (e2_rep_prefix(v)[0]) {
+    case 'i':
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", off,
               (unsigned)v);
       break;
-    case Q2_R_F64:
+    case 'd':
       fprintf(
           f,
           "    AOT_SET_B(ctx, fr, %d, "
           "qjs_aot_box_num(d%u, qjs_aot_fitsi(d%u)));\n",
           off, (unsigned)v, (unsigned)v);
       break;
-    case Q2_R_BOOL:
+    case 'b':
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
               off, (unsigned)v);
       break;
@@ -2210,6 +2274,17 @@ static void e2_emit_exit(
   fprintf(f, "    }\n");
 }
 
+/* An exit at an instruction's pc, computing the live set here. The arithmetic
+   exit uses it: the operands are live, the result is not yet. */
+static void e2_emit_exit_at(
+    FILE *f, const Q2Func *fn, int ins, int pc, char hex[33], int fi) {
+  uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  Q2ValueId *cur = NULL;
+  if (lb != NULL) q2_live_before(fn, ins, lb);
+  e2_emit_exit(f, fn, pc, hex, fi, cur, lb);
+  free(lb);
+}
+
 /* The speculative body (E8).
 
    Step 1 is the skeleton: the D4 switch-off counters, the S7 entry (which
@@ -2248,6 +2323,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     if (e2_facts_run(fn, &facts, 0) == 0) {
       if (e2_types_run(fn, &facts, &types) == 0) {
         have_types = 1;
+        g_e2_types = &types;
       } else {
         e2_facts_free(&facts);
       }
@@ -2307,19 +2383,24 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     int nv = fn->nvalues;
     int any = 0;
     for (k = 0; k < nv; k++) {
-      if (fn->values[k].rep == Q2_R_I32) {
-        fprintf(f, "    int32_t i%u = 0;\n", (unsigned)k);
-        any = 1;
-      } else if (fn->values[k].rep == Q2_R_F64) {
-        fprintf(f, "    double d%u = 0;\n", (unsigned)k);
-        any = 1;
-      } else if (fn->values[k].rep == Q2_R_BOOL) {
-        fprintf(f, "    int b%u = 0;\n", (unsigned)k);
-        any = 1;
-      } else {
-        fprintf(f, "    JSValue v%u = JS_UNDEFINED;\n", (unsigned)k);
-        any = 1;
+      /* Declared by the ANALYSIS's representation, the same source the emitters
+         read: a declaration and a use that disagreed on a value's local name was
+         the `b79`/`v79` class of bug. */
+      switch (e2_rep_prefix((Q2ValueId)k)[0]) {
+        case 'i':
+          fprintf(f, "    int32_t i%u = 0;\n", (unsigned)k);
+          break;
+        case 'd':
+          fprintf(f, "    double d%u = 0;\n", (unsigned)k);
+          break;
+        case 'b':
+          fprintf(f, "    int b%u = 0;\n", (unsigned)k);
+          break;
+        default:
+          fprintf(f, "    JSValue v%u = JS_UNDEFINED;\n", (unsigned)k);
+          break;
       }
+      any = 1;
     }
     (void)any;
   }
@@ -2348,7 +2429,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         Q2ValueId v = blk->in_val[r0];
         if (rr < 0 || rr >= fn->nregs) continue;
         if (v == Q2_NO_VALUE) continue;
-        e2_load_local_from_frame(f, v, rr);
+        e2_load_local_from_frame(f, v, rr, have_types ? &types : NULL);
         cur[rr] = v;
       }
     }
@@ -2361,9 +2442,15 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
       if (role != NULL && role->control != E2_CF_NONE) break;
-      if (!is_trivial(in)) break;
-      if (!trivial_is_lowerable(in, cur)) break;
-      emit_trivial_own(f, in, role, cur);
+      if (is_trivial(in)) {
+        if (!trivial_is_lowerable(in, cur)) break;
+        emit_trivial_own(f, in, role, cur);
+      } else if (have_types &&
+                 emit_typed_arith(f, fn, in, &types, cur)) {
+        /* lowered */
+      } else {
+        break;
+      }
       lowered_to = i2 + 1;
     }
     if (lowered_to < blk->first_insn + blk->ninsns) {
@@ -2403,6 +2490,21 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     free(cur);
   }
+  /* The overflow exits: the arithmetic check jumps here, and the exit does the
+     sync and the hand-over. Nothing was written to the frame by the arithmetic
+     itself, so the generic body redoes the operation in full precision. */
+  {
+    int o;
+    for (o = 0; o < g_e2_ox_n; o++) {
+      int pc2 = g_e2_ox[o], ii, ins = -1;
+      for (ii = 0; ii < fn->ninsns; ii++)
+        if (fn->insns[ii].pc == pc2) { ins = ii; break; }
+      if (ins < 0) continue;
+      fprintf(f, "    ox_%d:;\n", pc2);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi);
+    }
+  }
+  g_e2_ox_n = 0;
   fprintf(f, "    }\n");
   fprintf(f, "}\n\n");
   (void)k;
