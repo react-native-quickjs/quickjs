@@ -2918,8 +2918,13 @@ static int q2_emit_native(
                           : sub == REG_BIN_MUL ? "*"
                                                : "/";
         int rep = fn->values[in->use[0]].rep;
-        /* The literal keeps every digit: %.17g round-trips a double. */
-        snprintf(lit, sizeof(lit), "%.17g", cnum);
+        /* %a prints an exact hex float, which round-trips every double
+           including -0.0. `%.17g` would print negative zero as "-0", which C
+           reads as the integer 0 and so loses the sign, and infinities or NaN
+           as "inf"/"nan", which do not compile: those are refused below and
+           take the generic path. */
+        if (!__builtin_isfinite(cnum)) goto cpool_generic;
+        snprintf(lit, sizeof(lit), "%a", cnum);
         /* An int constant is only an int operation when it *is* an int: 0.5 on
            an int operand is a float multiply, so it takes the generic path. */
         if (rep == Q2_R_I32 && (dval->rep == Q2_R_I32 ||

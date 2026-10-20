@@ -63362,10 +63362,10 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                             nums[ci] = 0;
                             if (JS_VALUE_GET_TAG(cv) == JS_TAG_INT) {
                                 nums[ci] = (double)JS_VALUE_GET_INT(cv);
-                                mark[ci] = 1;
+                                mark[ci] = (uint8_t)JS_TAG_INT;
                             } else if (JS_VALUE_GET_TAG(cv) == JS_TAG_FLOAT64) {
                                 nums[ci] = JS_VALUE_GET_FLOAT64(cv);
-                                mark[ci] = 1;
+                                mark[ci] = (uint8_t)JS_TAG_FLOAT64;
                             }
                         }
                         g->cpool_count = b->cpool_count;

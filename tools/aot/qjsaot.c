@@ -3272,11 +3272,30 @@ int qjs_aot_prof_load(const char *path) {
 /* Whether the unit emits a body for this digest. The emitter asks before
    lowering a call to it as a direct call: only then does the callee have an
    `aot_f_` this translation unit can name. */
+/* The two kinds a constant-pool entry can fold as. JS_TAG_INT is 0 in the
+   engine, so these are their own values rather than the tag values. */
+enum { QJS_AOT_POOL_INT = 1, QJS_AOT_POOL_DOUBLE = 2 };
+
 int qjs_aot_pool_num(const JSAotGenFunc *g, uint32_t idx, double *out) {
   if (!g || idx >= (uint32_t)g->cpool_count) return 0;
   if (!g->cpool_numeric || !g->cpool_numeric[idx]) return 0;
   *out = g->cpool_num[idx];
   return 1;
+}
+
+/* The entry's tag when it is a foldable number (JS_TAG_INT or
+   JS_TAG_FLOAT64), else 0. The generator needs it to pick an int literal or a
+   double literal; `qjs_aot_pool_num` alone cannot say, because it returns the
+   value already widened to double. */
+int qjs_aot_pool_tag(const JSAotGenFunc *g, uint32_t idx) {
+  if (!g || idx >= (uint32_t)g->cpool_count) return 0;
+  if (!g->cpool_numeric) return 0;
+  /* JS_TAG_INT is 0, which would be indistinguishable from "not numeric", so
+     the two foldable kinds are reported as their own small codes. */
+  if (g->cpool_numeric[idx] == (uint8_t)JS_TAG_INT) return QJS_AOT_POOL_INT;
+  if (g->cpool_numeric[idx] == (uint8_t)JS_TAG_FLOAT64)
+    return QJS_AOT_POOL_DOUBLE;
+  return 0;
 }
 
 /* The light-frame size of the unit function with this digest, when a compiled

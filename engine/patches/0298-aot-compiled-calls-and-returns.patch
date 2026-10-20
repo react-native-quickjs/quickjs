@@ -83,14 +83,18 @@ diff --git a/quickjs-aot-gen.h b/quickjs-aot-gen.h
 index 59c7b13..f8650af 100644
 --- a/quickjs-aot-gen.h
 +++ b/quickjs-aot-gen.h
-@@ -39,6 +39,18 @@ typedef struct JSAotGenFunc {
+@@ -39,6 +39,22 @@ typedef struct JSAotGenFunc {
      int eligible;              /* AOT_GEN_ELIGIBLE or an AOT_GEN_REF_* reason */
      int stack_len;             /* stack bytecode length when refused, else 0 */
      const uint8_t *code;       /* the register program; owned by the runtime */
 +    /* The numeric constant-pool entries, so the generator can fold a
 +       `binary_cpool` on one into a C literal instead of an out-of-line call.
-+       `cpool_numeric[i]` is 1 when `cpool_num[i]` is that entry's exact
-+       value. */
++       `cpool_numeric[i]` is 0 when entry i is not a foldable number, and
++       otherwise the entry's tag -- JS_TAG_INT or JS_TAG_FLOAT64 -- so the fold
++       can emit an int literal for an int and a double for a double. A bool
++       would lose that distinction and make `i + 100000` an int-plus-float,
++       which misses both inline paths and yields a float where the interpreter
++       yields an int. */
 +    int cpool_count;
 +    const double *cpool_num;
 +    const uint8_t *cpool_numeric;
@@ -859,10 +863,10 @@ index ccb20a9..9769d16 100644
 +                            nums[ci] = 0;
 +                            if (JS_VALUE_GET_TAG(cv) == JS_TAG_INT) {
 +                                nums[ci] = (double)JS_VALUE_GET_INT(cv);
-+                                mark[ci] = 1;
++                                mark[ci] = (uint8_t)JS_TAG_INT;
 +                            } else if (JS_VALUE_GET_TAG(cv) == JS_TAG_FLOAT64) {
 +                                nums[ci] = JS_VALUE_GET_FLOAT64(cv);
-+                                mark[ci] = 1;
++                                mark[ci] = (uint8_t)JS_TAG_FLOAT64;
 +                            }
 +                        }
 +                        g->cpool_count = b->cpool_count;

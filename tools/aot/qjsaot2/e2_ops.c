@@ -39,6 +39,13 @@ unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
    double literal instead of op-calling the engine. */
 int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
 
+/* The entry's tag when it is a foldable number: E2_POOL_INT or
+   E2_POOL_DOUBLE, else 0. (The generator does not include the engine's headers,
+   so the two values it can see are named here.) */
+int qjs_aot_pool_tag(const struct JSAotGenFunc *g, uint32_t idx);
+#define E2_POOL_INT 1    /* QJS_AOT_POOL_INT */
+#define E2_POOL_DOUBLE 2 /* QJS_AOT_POOL_DOUBLE */
+
 /* Report one instruction the body leaves as an op call, weighted by the
    profile's count there. A pc that also has an inline fast path reports its
    weight as `missarm`: only its misses reach the op call, so counting it in the
@@ -358,12 +365,12 @@ static int emit_native_binary_imm(
       break;
     case ROP_binary_cpool: {
       /* "rbrbc": d, sub, a, kind, idx -- the second operand is a pool entry,
-         not a register. A numeric entry folds to a C double literal; anything
-         else stays an op call. This is the form every float literal in a
-         numeric loop takes, and leaving it as an op call made
-         `regvm_s_ROP_binary_cpool` about half of that kernel's instructions. */
+         not a register. A foldable numeric entry becomes a C literal; anything
+         else stays an op call. */
       double c;
       uint32_t kind, idx;
+      int tag;
+      char lit[64];
       if (in->narg < 5) return 0;
       sub = (int)in->arg[1].val;
       a = operand_off(in, 2);
@@ -371,6 +378,7 @@ static int emit_native_binary_imm(
       idx = (uint32_t)in->arg[4].val;
       if (kind != REG_CONST_CPOOL) return 0;
       if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
+      tag = qjs_aot_pool_tag(fn->g, idx);
       if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL &&
           sub != REG_BIN_DIV)
         return 0;
@@ -378,13 +386,30 @@ static int emit_native_binary_imm(
       if (in->ndef != 1 || a < 0) return 0;
       d = dest_off(fn, in);
       if (d < 0) return 0;
+      /* An integer entry must stay an integer: `i + 100000` with a double
+         literal would miss both inline paths, produce a float where the
+         interpreter produces an int, and make later `a[i + 100000]` miss its
+         integer element path. */
+      if (tag == E2_POOL_INT) {
+        snprintf(lit, sizeof(lit), "JS_MKVAL(JS_TAG_INT, %d)", (int32_t)c);
+      } else if (tag == E2_POOL_DOUBLE) {
+        /* %a prints an exact hex float, which round-trips every double
+           including -0.0. `%.17g` would print negative zero as "-0" (which C
+           reads as the integer 0, losing the sign) and infinity/NaN as
+           "inf"/"nan", which do not compile. A non-finite entry is therefore
+           refused and stays an op call. */
+        if (!__builtin_isfinite(c)) return 0;
+        snprintf(lit, sizeof(lit), "__JS_NewFloat64(%a)", c);
+      } else {
+        return 0;
+      }
       fprintf(f, "g_%d: {\n", in->pc);
       fprintf(f, "    JSValue _r;\n");
       fprintf(
           f,
           "    if (__builtin_expect(q2_arith(%d, AOT_REG(fr, %d), "
-          "__JS_NewFloat64(%.17g), &_r), 1)) {\n",
-          sub, a, c);
+          "%s, &_r), 1)) {\n",
+          sub, a, lit);
       emit_site_hit(f, in);
       fprintf(f, "        AOT_SET_B(ctx, fr, %d, _r);\n", d);
       fprintf(f, "        goto g_%d;\n", in->next);

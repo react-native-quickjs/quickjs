@@ -1172,7 +1172,7 @@
     },
     {
       "name": "0298-aot-compiled-calls-and-returns.patch",
-      "sha256": "0fb26caafec5ac5427508e39d3005f09669e57fd5402fdd87f12c7c5fe2c5173"
+      "sha256": "529de2fbbcf97b40659221eafe48d8850db65f559f9e0ecd616a6b1e16cd158d"
     },
     {
       "name": "0299-aot-gen-source-position.patch",
@@ -1220,7 +1220,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "ff24cc84307e494f2ae03cdec90a9ebdc28fab3dbe7460fe0a7996c25595f3d9",
+    "quickjs.c": "840901a3312bc28a81561f71dcf9edefbd054108ccf55b746bb36ef580ec593f",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
