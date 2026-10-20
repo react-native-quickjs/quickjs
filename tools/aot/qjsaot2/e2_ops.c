@@ -2406,6 +2406,11 @@ static void e2_emit_exit_at(
 
 /* One edge u->s as a PARALLEL move: temps first, then assign, so a swap is
    order-independent. Pure locals -- only exits write the frame. */
+/* An edge's parameter moves are correct by construction: every moved source is
+   copied into its own temp FIRST, and only then is every parameter assigned from
+   the temps. "All reads before any write" is right for any permutation, including
+   a swap or a rotation -- so there is no symbolic check and no "skip the temp when
+   it looks safe" case. The extra temps are free: the C compiler removes them. */
 static void e2_emit_edge_moves(
     FILE *f, const Q2Func *fn, int b, int si, Q2ValueId *cur) {
   const Q2Block *blk = &fn->blocks[b];
@@ -2472,7 +2477,8 @@ static void e2_emit_edge_moves(
    THAT successor. One function taking k, so the (succ_block, edge_arg) pairing
    cannot drift between the condition's sense and the moves it is paired with. */
 static void e2_emit_arm(
-    FILE *f, const Q2Func *fn, int b, int k, Q2ValueId *cur) {
+    FILE *f, const Q2Func *fn, int b, int k, Q2ValueId *cur,
+    const char *hex) {
   const Q2Block *blk = &fn->blocks[b];
   int sb = blk->succ_block[k];
   if (sb < 0 || sb >= fn->nblocks) {
@@ -2482,6 +2488,73 @@ static void e2_emit_arm(
   }
   e2_emit_edge_moves(f, fn, b, k, cur);
   fprintf(f, "      goto s_%d;\n", fn->blocks[sb].start_pc);
+}
+
+/* `inc_branch_lt_s` ("rrt": d, b, off) as a loop counter: `d = d + 1`, branch
+   to the target while `d < b`. It is the fused increment-and-test, so in a loop
+   with an empty body it *is* the body.
+
+   The increment is in place and the destination is the same value as the first
+   use, so the block's parameter is the counter and the arm's edge move carries
+   the incremented value round the back edge. `INT32_MAX` is the one value whose
+   increment overflows, and it takes the deopt exit (not a hand-off: the analysis
+   said this is an int counter and it is not), which the generic body redoes in
+   full precision. */
+static int emit_typed_inc_branch(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33], int fi) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  Q2ValueId dv;
+  int bv, si_take, si_else;
+  char cn[32], bn[32];
+
+  if (in->rop != ROP_inc_branch_lt_s) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (!have_types || t == NULL || blk->nsucc < 2) return 0;
+  if (in->ndef < 1 || in->nuse < 2) return 0;
+  dv = in->def[0];
+  bv = in->use[1];
+  if (t->lb[dv] != E2_LB_I32 || t->lb[bv] != E2_LB_I32) return 0;
+  e2_local_name(cn, sizeof(cn), dv);
+  e2_local_name(bn, sizeof(bn), bv);
+  /* succ[0] is the branch target: taken while the incremented counter is still
+     below the bound. */
+  si_take = 0;
+  si_else = 1;
+  fprintf(f, "    if (__builtin_expect(%s != INT32_MAX, 1)) {\n", cn);
+  fprintf(f, "      %s = %s + 1;\n", cn, cn);
+  fprintf(f, "    } else {\n");
+  /* The counter would overflow: exit at this instruction's own pc, before the
+     increment, so the generic body redoes it as a double. */
+  fprintf(f, "      /* counter overflow */\n");
+  {
+    uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+    if (lb != NULL) q2_live_before(fn, blk->first_insn + blk->ninsns - 1, lb);
+    fprintf(f, "      goto ox_%d;\n", in->pc);
+    free(lb);
+  }
+  fprintf(f, "    }\n");
+  fprintf(f, "    if (%s < %s) {\n", cn, bn);
+  e2_emit_arm(f, fn, b, si_take, cur, hex);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, si_else, cur, hex);
+  fprintf(f, "    }\n");
+  /* The overflow exit lives after the block, keyed by this pc. */
+  if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0]))) {
+    Q2ValueId *snap =
+        malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    if (snap != NULL && cur != NULL) {
+      memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+      g_e2_ox[g_e2_ox_n] = in->pc;
+      g_e2_ox_cur[g_e2_ox_n] = snap;
+      g_e2_ox_n++;
+    } else {
+      free(snap);
+    }
+  }
+  (void)fi;
+  return 1;
 }
 
 /* A typed compare-and-branch on two i32 locals.
@@ -2553,15 +2626,15 @@ static int emit_typed_branch(
      taken arm is on the negated result. */
   if (!inv) {
     fprintf(f, "    if (%s %s %s) {\n", an, ops[base - REG_BIN_LT], bn);
-    e2_emit_arm(f, fn, b, si_take, cur);
+    e2_emit_arm(f, fn, b, si_take, cur, hex);
     fprintf(f, "    } else {\n");
-    e2_emit_arm(f, fn, b, si_else, cur);
+    e2_emit_arm(f, fn, b, si_else, cur, hex);
     fprintf(f, "    }\n");
   } else {
     fprintf(f, "    if (!(%s %s %s)) {\n", an, ops[base - REG_BIN_LT], bn);
-    e2_emit_arm(f, fn, b, si_take, cur);
+    e2_emit_arm(f, fn, b, si_take, cur, hex);
     fprintf(f, "    } else {\n");
-    e2_emit_arm(f, fn, b, si_else, cur);
+    e2_emit_arm(f, fn, b, si_else, cur, hex);
     fprintf(f, "    }\n");
   }
   (void)sb_else;
@@ -2744,7 +2817,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
       if (role != NULL && role->control != E2_CF_NONE) {
-        if (emit_typed_branch(
+        if (emit_typed_inc_branch(
+                f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi) ||
+            emit_typed_branch(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi)) {
           lowered_to = i2 + 1;
           term_lowered = 1;
