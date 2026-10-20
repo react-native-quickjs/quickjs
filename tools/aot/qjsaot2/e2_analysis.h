@@ -123,13 +123,18 @@ typedef struct E2Facts {
 
 /* Run the facts pass (D7) and build the site groups (D9 step 1). Returns 0, or
    -1 on allocation failure. */
-/* E8 runs the pass WITHOUT grouped exits: in the speculative body a grouped
-   field access's miss continues into the generic lowering rather than exiting,
-   so the access is a safepoint like any other and `miss_exits` stays 0. E9
-   turns this on in the same change that emits those misses as exits. */
-extern int e2_facts_grouped_exit;
+/* `grouped_exit` selects the mode. 0: a grouped field access is an ordinary
+   safepoint and `miss_exits` stays 0 -- in the speculative body its miss
+   continues into the generic lowering, so whatever the access ran may have
+   broken every fact. 1: a grouped access's miss exits, so the access is a
+   safepoint-free fast path. E8's body passes 0; `--emit2-types` passes 1 so its
+   numbers describe the E9 mode.
 
-int e2_facts_run(const Q2Func *fn, E2Facts *out);
+   A parameter rather than a global on purpose: a run that both dumps types and
+   emits would otherwise leave the flag set for the functions emitted after the
+   first dump, and the body would be emitted with facts that assume misses exit
+   while its code continues on a miss. */
+int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit);
 void e2_facts_free(E2Facts *f);
 
 /* The group a site index belongs to, or E2_GROUP_NONE. */

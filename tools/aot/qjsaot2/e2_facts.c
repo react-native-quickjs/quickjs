@@ -624,7 +624,8 @@ oom:
 /* ---- the transfer ------------------------------------------------------- */
 
 /* Apply one instruction's transfer to `s`. */
-static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s) {
+static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
+                    int grouped_exit) {
   const Q2Insn *in = &fn->insns[insn];
   Access ld, st;
   int kind = insn_kind(in);
@@ -653,10 +654,10 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s) {
   if (kind == E2_SK_FIELD) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r, grouped = nr > 0;
-    /* Without E2_FACTS_GROUPED_EXIT a grouped access is a safepoint: its miss
+    /* Without `grouped_exit` a grouped access is a safepoint: its miss
        continues into the generic lowering instead of exiting, so whatever it
-       ran may have broken every fact. E8 runs in that mode. */
-    if (!e2_facts_grouped_exit) grouped = 0;
+       ran may have broken every fact. E8's body runs in that mode. */
+    if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
       if (ref[r].site < 0 || ref[r].recv < 0 ||
           e2_facts_site_group(f, ref[r].site) < 0)
@@ -743,11 +744,7 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s) {
   return 0;
 }
 
-/* Off by default: the speculative body (E8) emits a grouped access's miss as a
-   continuing fast path, so the access is a safepoint. E9 turns it on. */
-int e2_facts_grouped_exit = 0;
-
-int e2_facts_run(const Q2Func *fn, E2Facts *out) {
+int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
   FactSet cur;
   FactSet *outs = NULL;
   int b, i, k, rc = -1;
@@ -841,7 +838,8 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out) {
     }
 
     for (k = 0; k < blk->ninsns; k++) {
-      if (transfer(fn, out, blk->first_insn + k, &cur) < 0) goto done;
+      if (transfer(fn, out, blk->first_insn + k, &cur, grouped_exit) < 0)
+        goto done;
     }
 
     for (k = 0; k < cur.nshape; k++)

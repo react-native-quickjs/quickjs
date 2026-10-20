@@ -3669,6 +3669,14 @@ int qjsaot_driver_main(int argc, char **argv) {
       g_ir_path = argv[++i];
     } else if (strcmp(argv[i], "--mut") == 0 && i + 1 < argc) {
       g_mut = argv[++i];
+    } else if (strcmp(argv[i], "--emit2-types") == 0) {
+      /* Analysis flags the wrapper consumed; tolerated here so that generating
+         and dumping types in one run works. */
+    } else if (strcmp(argv[i], "--emit2-types-out") == 0 && i + 1 < argc) {
+      i++;
+    } else if (strcmp(argv[i], "--verify-ir") == 0 ||
+               strcmp(argv[i], "--stats") == 0) {
+      /* ditto */
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "qjsaot: unknown option %s\n", argv[i]);
       free(inputs);

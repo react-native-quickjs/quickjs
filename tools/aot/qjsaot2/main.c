@@ -102,6 +102,18 @@ int main(int argc, char **argv) {
       types_out = argv[++i];
     }
   }
+  /* Generating and dumping types in one run: the driver builds the unit, and the
+     types dump above/below uses its own facts call, so the two never share one
+     E2Facts and the body is always emitted in the continuing-miss mode. */
+  {
+    int gen = 0, j;
+    for (j = 1; j < argc; j++)
+      if (strcmp(argv[j], "--emit2") == 0 ||
+          strcmp(argv[j], "--emit2-split") == 0 ||
+          strcmp(argv[j], "--out") == 0)
+        gen = 1;
+    if (gen) types = 0;
+  }
   if (!verify && !dump && !stats && !types) {
     /* The unit-builder mode: the same CLI as qjsaot, with the SSA body
        emitter. Options are the driver's, so nothing is validated here. */
@@ -241,10 +253,6 @@ int main(int argc, char **argv) {
     }
     if (types) {
       char hex[33];
-      /* --emit2-types reports the mode E9 will emit in (grouped misses exit), so
-         its numbers stay comparable across E8. The body E8 emits runs without
-         that flag, so its field accesses are safepoints. */
-      e2_facts_grouped_exit = 1;
       int h;
       for (h = 0; h < 16; h++)
         snprintf(hex + h * 2, 3, "%02x", funcs[i].digest[h]);
