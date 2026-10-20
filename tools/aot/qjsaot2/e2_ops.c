@@ -2307,9 +2307,11 @@ static void emit_trivial_own(
 /* Write one value's local back to its frame register, in the frame's
    representation. A TAG value is already a JSValue, so it is a plain store; an
    i32 or f64 is boxed the way the interpreter would have it. */
-static void e2_exit_store(FILE *f, Q2ValueId v) {
-  const Q2Value *val = &g_e2_fn->values[v];
-  int off = val->reg * 16;
+static void e2_exit_store(FILE *f, Q2ValueId v, int reg) {
+  /* The slot to write is the one for the REGISTER being synced, not the register
+     the value happened to be defined in: an edge can move a value into another
+     register's parameter, and those are different slots. */
+  int off = reg * 16;
   switch (e2_rep_prefix(v)[0]) {
     case 'i':
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", off,
@@ -2357,7 +2359,7 @@ static void e2_emit_exit(
            never touched already has the right contents in the frame, so it is
            left alone. Writing a stale definition would corrupt exactly that. */
         if (cur == NULL || cur[r] == Q2_NO_VALUE) continue;
-        e2_exit_store(f, cur[r]);
+        e2_exit_store(f, cur[r], r);
       }
     }
   }
