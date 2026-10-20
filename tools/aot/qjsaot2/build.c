@@ -1930,8 +1930,19 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       if (v->insn < 0) continue;
       in = &f->insns[v->insn];
       if (!def_from_record_insn(in)) continue;
-      if (v->has_prof && v->ptypes != 0) {
-        continue;
+      /* Which values the `R` record may type.
+         - A `get_arg2` destination whose `P` record holds **more than one**
+           type. That record is merged across both destinations by
+           construction (`get_arg2` is "ruru": two results at one pc), so it is
+           never more precise than the destination's own register record. This
+           is the case E7d was written for.
+         - A value with no `P` record at all.
+         A single-type `P` record is already exact, so an `R` record could only
+         widen it; leave those alone. */
+      {
+        int multi = v->ptypes != 0 && (v->ptypes & (v->ptypes - 1)) != 0;
+        int want = v->has_prof ? (in->op == Q2_OP_GET_ARG2 && multi) : 1;
+        if (!want) continue;
       }
 
       if (v->reg < 0 || v->reg >= f->nregs) continue;
@@ -1964,9 +1975,10 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       }
       /* The three preconditions for using an `R` record. Together they say:
          the record is complete, this pc is part of it, and the register has
-         one. `E2_R_REUSE=off` drops the completeness argument below and
-         `E2_R_RULE=off` drops the whole pass, so a test can show each does
-         something; a count that does not move when they are off is measuring
+         block the rule for the values it targets, so it was removed. The
+         write count is still computed for the `E2_DEBUG_CAND` report.
+         `E2_R_RULE=off` drops the whole pass, so a test can show it does
+         something; a count that does not move when it is off is measuring
          nothing.
 
          1. `thr=1` in the profile header. Enforced by `qjs_aot_prof_regs`,
@@ -1986,7 +1998,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
          A reused register whose record is mixed types nothing -- that is the
          correct answer, not a failure: the record says more than one kind of
          value was in that register, and the compiled code must box. */
-      if (strcmp(getenv("E2_R_REUSE") ?: "", "off")) {
+      {
         int pc_found = 0;
         int32_t dpc = in->pc;
         lo = 0;
