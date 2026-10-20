@@ -494,7 +494,7 @@ static int emit_native_field_read(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "AOT_REG(fr, %d), %d, q2_pic_sites(f), &_f), 1)) {\n",
+      "AOT_REG(fr, %d), %d, q2_ns, &_f), 1)) {\n",
       recv, site);
   emit_site_hit(f, in);
   /* The value is borrowed from the object's slot, so the store duplicates it
@@ -618,7 +618,7 @@ static int emit_native_this_field(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, _t, %d, "
-      "q2_pic_sites(f), &_v), 1)) {\n",
+      "q2_ns, &_v), 1)) {\n",
       site);
   emit_site_hit(f, in);
   /* Borrowed from the object's slot, so the store duplicates it. */
@@ -666,7 +666,7 @@ static int emit_native_field_chain(
   fprintf(
       f,
       "    if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "AOT_REG(fr, %d), %d, q2_pic_sites(f), &_c0), 1)) {\n",
+      "AOT_REG(fr, %d), %d, q2_ns, &_c0), 1)) {\n",
       recv, s1);
   /* Link 1 goes to its register, so link 2's receiver is available even if
      link 2 misses; both are borrowed, so the store duplicates.
@@ -681,7 +681,7 @@ static int emit_native_field_chain(
   fprintf(
       f,
       "        if (__builtin_expect(q2_own_read_hit(pic, holders, "
-      "_c0, %d, q2_pic_sites(f), &_c1), 1)) {\n",
+      "_c0, %d, q2_ns, &_c1), 1)) {\n",
       s2);
   emit_site_hit(f, in);
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _c1);\n", d1);
@@ -1777,6 +1777,10 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    uint32_t pc = 0;\n");
   fprintf(f, "    uint32_t e2_from_pc = entry_pc;\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n");
+  /* The PIC way stride, read once per activation. Every compiled store into the
+     frame goes through a pointer, so the compiler cannot prove those stores
+     leave the bytecode alone and would reload it at each probe. */
+  fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
   fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
   fprintf(f, "    (void)ip; (void)pc; (void)pic; (void)holders;\n");
   if (g_poison) {

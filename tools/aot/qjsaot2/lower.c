@@ -2557,7 +2557,7 @@ static int q2_emit_native(
         {
           char cond[160];
           snprintf(
-              cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), &v%u)",
+              cond, sizeof(cond), "q2_own_read_hit(pic, holders, %s, %d, q2_ns, &v%u)",
               a, site, in->def[0]);
           q2_cold_read(
               f, fn, in, cond, in->arg[2].off, site, a, in->def[0], off);
@@ -2582,7 +2582,7 @@ static int q2_emit_native(
         char cond[160], recv[16];
         snprintf(
             cond, sizeof(cond),
-            "q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), &v%u)", a, s1,
+            "q2_own_read_hit(pic, holders, %s, %d, q2_ns, &v%u)", a, s1,
             in->def[0]);
         q2_cold_read(
             f, fn, in, cond, in->arg[2].off, s1, a, in->def[0], off0);
@@ -2590,7 +2590,7 @@ static int q2_emit_native(
         snprintf(recv, sizeof(recv), "v%u", in->def[0]);
         snprintf(
             cond, sizeof(cond),
-            "q2_own_read_hit(pic, holders, %s, %d, q2_pic_sites(f), &v%u)", recv, s2,
+            "q2_own_read_hit(pic, holders, %s, %d, q2_ns, &v%u)", recv, s2,
             in->def[1]);
         q2_cold_read(
             f, fn, in, cond, in->arg[6].off, s2, recv, in->def[1], off1);
@@ -3081,7 +3081,7 @@ static int q2_emit_native(
             "    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT) return 0;\n"
             "    v%u = this_obj;\n"
             "    if (__builtin_expect(!q2_own_read_hit(pic, holders, this_obj, "
-            "%d, q2_pic_sites(f), &v%u), 0)) return 0;\n",
+            "%d, (uint32_t)q2_pic_sites(f), &v%u), 0)) return 0;\n",
             in->def[1], site, in->def[0]);
         (void)offr;
         (void)offd;
@@ -4039,6 +4039,10 @@ static void q2_emit_one(
   fprintf(f, "    JSValue *vb = q2_var_buf(f);\n");
   fprintf(f, "    JSValue *ab = q2_arg_buf(f);\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n");
+  /* The PIC way stride, read once per activation. Every compiled store into the
+     frame goes through a pointer, so the compiler cannot prove those stores
+     leave the bytecode alone and would reload it at each probe. */
+  fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
   fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
   fprintf(
       f,
