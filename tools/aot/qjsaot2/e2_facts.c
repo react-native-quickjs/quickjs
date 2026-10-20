@@ -653,6 +653,10 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s) {
   if (kind == E2_SK_FIELD) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r, grouped = nr > 0;
+    /* Without E2_FACTS_GROUPED_EXIT a grouped access is a safepoint: its miss
+       continues into the generic lowering instead of exiting, so whatever it
+       ran may have broken every fact. E8 runs in that mode. */
+    if (!e2_facts_grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
       if (ref[r].site < 0 || ref[r].recv < 0 ||
           e2_facts_site_group(f, ref[r].site) < 0)
@@ -738,6 +742,10 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s) {
   (void)fn;
   return 0;
 }
+
+/* Off by default: the speculative body (E8) emits a grouped access's miss as a
+   continuing fast path, so the access is a safepoint. E9 turns it on. */
+int e2_facts_grouped_exit = 0;
 
 int e2_facts_run(const Q2Func *fn, E2Facts *out) {
   FactSet cur;

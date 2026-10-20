@@ -241,6 +241,10 @@ int main(int argc, char **argv) {
     }
     if (types) {
       char hex[33];
+      /* --emit2-types reports the mode E9 will emit in (grouped misses exit), so
+         its numbers stay comparable across E8. The body E8 emits runs without
+         that flag, so its field accesses are safepoints. */
+      e2_facts_grouped_exit = 1;
       int h;
       for (h = 0; h < 16; h++)
         snprintf(hex + h * 2, 3, "%02x", funcs[i].digest[h]);
