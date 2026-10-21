@@ -2665,7 +2665,7 @@ static void e2_emit_exit(
    exit uses it: the operands are live, the result is not yet. */
 static void e2_emit_exit_at(
     FILE *f, const Q2Func *fn, int ins, int pc, char hex[33], int fi,
-    const Q2ValueId *cur, int blkidx) {
+    const Q2ValueId *cur, int blkidx, int handoff) {
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (cur == NULL) {
     fprintf(
@@ -2673,7 +2673,7 @@ static void e2_emit_exit_at(
     abort();
   }
   if (lb != NULL) q2_live_before(fn, ins, lb);
-  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0, blkidx);
+  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, handoff, blkidx);
   free(lb);
 }
 
@@ -5431,7 +5431,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ax_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_ax_cur[o], g_e2_ax_blk[o]);
+      e2_emit_exit_at(
+          f, fn, ins, pc2, hex, fi, g_e2_ax_cur[o], g_e2_ax_blk[o], 0);
     }
     for (o = 0; o < g_e2_ax_n; o++) free(g_e2_ax_cur[o]);
     g_e2_ax_n = 0;
@@ -5447,7 +5448,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    vx_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_vx_cur[o], g_e2_vx_blk[o]);
+      e2_emit_exit_at(
+          f, fn, ins, pc2, hex, fi, g_e2_vx_cur[o], g_e2_vx_blk[o], 0);
     }
     for (o = 0; o < g_e2_vx_n; o++) free(g_e2_vx_cur[o]);
     g_e2_vx_n = 0;
@@ -5463,7 +5465,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    dx_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_dx_cur[o], g_e2_dx_blk[o]);
+      e2_emit_exit_at(
+          f, fn, ins, pc2, hex, fi, g_e2_dx_cur[o], g_e2_dx_blk[o], 0);
     }
     for (o = 0; o < g_e2_dx_n; o++) free(g_e2_dx_cur[o]);
     g_e2_dx_n = 0;
@@ -5479,7 +5482,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ox_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o], g_e2_ox_blk[o]);
+      e2_emit_exit_at(
+          f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o], g_e2_ox_blk[o], 0);
     }
     for (o = 0; o < g_e2_ox_n; o++) free(g_e2_ox_cur[o]);
     g_e2_ox_n = 0;
@@ -5497,8 +5501,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    hx_%d:;\n", pc2);
-      fprintf(f, "    E2_HANDOFF_NOTE(%d);\n", fi);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_hx_cur[o], g_e2_hx_blk[o]);
+      e2_emit_exit_at(
+          f, fn, ins, pc2, hex, fi, g_e2_hx_cur[o], g_e2_hx_blk[o], 1);
     }
     for (o = 0; o < g_e2_hx_n; o++) free(g_e2_hx_cur[o]);
     g_e2_hx_n = 0;
