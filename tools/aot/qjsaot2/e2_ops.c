@@ -1997,14 +1997,17 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   return 0;
 }
 
+/* The guard-stub tables' size. A large top-level function has hundreds of guard
+   pcs; running out aborts rather than leave a goto without its label. */
+#define E2_MAX_STUBS 4096
 /* Overflow exits seen while emitting: each gets a stub after the blocks. The
    `cur[]` snapshot is the block-local state AT that instruction -- the stub must
    sync from it, or it writes nothing and the generic body reads the frame's old
    contents (which is what made a deleted overflow check look harmless: the
    resumed body then recomputed from stale-but-correct arguments). */
-static int g_e2_ox[256];
-static Q2ValueId *g_e2_ox_cur[256];
-static int g_e2_ox_regs = 0;
+static int g_e2_ox[E2_MAX_STUBS];
+static Q2ValueId *g_e2_ox_cur[E2_MAX_STUBS];
+static int g_e2_ox_blk[E2_MAX_STUBS];
 static int g_e2_ox_n = 0;
 /* Hand-off histogram: which rop a spec block gave up at, weighted by the profile's
    count for that pc. One line per rop in the generator report, sorted by weight, so
@@ -2056,16 +2059,21 @@ void e2_handoff_report(FILE *f) {
   }
   g_e2_ho_n = 0;
 }
-/* Argument-guard exits: same treatment, but the sync set is empty -- the guard
-   fires before anything is in a local, so the frame still holds what the caller
-   wrote and the generic body's g_<pc> reloads the arguments itself. */
-static int g_e2_ax[256];
+/* Argument-guard exits: same treatment. The guard fires before the argument is in
+   a local and the generic body's g_<pc> reloads it, but anything defined earlier in
+   the prefix is only in a local, so the stub syncs from its snapshot. */
+static int g_e2_ax[E2_MAX_STUBS];
+static Q2ValueId *g_e2_ax_cur[E2_MAX_STUBS];
+static int g_e2_ax_blk[E2_MAX_STUBS];
 /* The compare COLD ARM: a TAG operand whose tag is neither INT nor FLOAT64. It is a
    hand-off at the branch's own pc, not a deopt. */
-static int g_e2_hx[256];
-static Q2ValueId *g_e2_hx_cur[256];
+static int g_e2_hx[E2_MAX_STUBS];
+static Q2ValueId *g_e2_hx_cur[E2_MAX_STUBS];
+static int g_e2_hx_blk[E2_MAX_STUBS];
 static int g_e2_hx_n;
-static int g_e2_vx[256];
+static int g_e2_vx[E2_MAX_STUBS];
+static Q2ValueId *g_e2_vx_cur[E2_MAX_STUBS];
+static int g_e2_vx_blk[E2_MAX_STUBS];
 /* QJS_AOT_E2_SPEC_MAXPC=<n>: do not lower any instruction at pc >= n. A planned
    hand-off, so the unit stays correct -- it just speculates less -- which is what
    makes it usable as a bisect probe INSIDE one function. Read once per process. */
@@ -2082,13 +2090,58 @@ static int e2_spec_maxpc_get(void) {
   return e2_spec_maxpc;
 }
 
-static int g_e2_dx[256];
+static int g_e2_dx[E2_MAX_STUBS];
+static Q2ValueId *g_e2_dx_cur[E2_MAX_STUBS];
+static int g_e2_dx_blk[E2_MAX_STUBS];
 static int g_e2_dx_n;
 static int g_e2_vx_n;
 static int g_e2_ax_n = 0;
 
 /* The function being emitted, for the helpers that need its value table. */
 static const Q2Func *g_e2_fn = NULL;
+/* The block being emitted, recorded with each guard stub's snapshot. */
+static int g_e2_blk = -1;
+/* The function index of the body being emitted; every exit's note must name it,
+   or its exits are counted against another function's switch-off. */
+static int g_e2_fi = -1;
+
+/* A register an op has already written to the frame: its raw result, before the
+   guard that types it. Not a value id; the exit sync leaves the slot alone. */
+#define E2_INFRAME ((Q2ValueId)-3)
+
+/* Register a guard stub at `pc` ONCE per body, with a copy of cur[] at the guard.
+   The stub syncs from that copy: a NULL sync set drops every value the prefix holds
+   only in a local. `wrote`, when given, is the op whose defs are already in the
+   frame -- its registers are marked E2_INFRAME, since the stub would otherwise
+   write a typed local the failed guard never assigned. */
+static void e2_note_stub(
+    int *pcs, Q2ValueId **curs, int *blks, int *n, int pc, const Q2ValueId *cur,
+    const Q2Insn *wrote) {
+  Q2ValueId *snap;
+  int q, nr = g_e2_fn->nregs;
+  for (q = 0; q < *n; q++)
+    if (pcs[q] == pc) return;
+  if (*n >= E2_MAX_STUBS || cur == NULL) {
+    fprintf(stderr, "e2: guard stub at pc %d has no sync set (%s)\n", pc,
+            cur == NULL ? "no cur" : "table full");
+    abort();
+  }
+  snap = malloc(sizeof(*snap) * (size_t)(nr > 0 ? nr : 1));
+  if (snap == NULL) abort();
+  memcpy(snap, cur, sizeof(*snap) * (size_t)nr);
+  if (wrote != NULL)
+    for (q = 0; q < wrote->ndef; q++) {
+      Q2ValueId v = wrote->def[q];
+      int r;
+      if (v == Q2_NO_VALUE) continue;
+      r = g_e2_fn->values[v].reg;
+      if (r >= 0 && r < nr) snap[r] = E2_INFRAME;
+    }
+  pcs[*n] = pc;
+  curs[*n] = snap;
+  blks[*n] = g_e2_blk;
+  (*n)++;
+}
 /* The analysis for the function being emitted. The spec body's representations
    come from HERE (E2Types.lb), never from Q2Value.rep: that holds the old
    emitter's inference, whose BOT reads as TAG and which disagrees with the
@@ -2121,18 +2174,14 @@ static void e2_local_name(char *buf, size_t n, Q2ValueId v) {
 /* Load an argument slot into a value's local, converting by the value's
    representation: the argument buffer holds a JSValue, and a typed local is not
    one. */
-static void e2_load_arg_to_local(FILE *f, Q2ValueId v, int slot, int pc) {
+static void e2_load_arg_to_local(
+    FILE *f, Q2ValueId v, int slot, int pc, const Q2ValueId *cur) {
   char dn[32];
   e2_local_name(dn, sizeof(dn), v);
-  if (e2_rep_prefix(v)[0] != 'v' &&
-      g_e2_ax_n < (int)(sizeof(g_e2_ax) / sizeof(g_e2_ax[0]))) {
-    /* One guard per pc, not per destination: get_arg2 has two and both jump to
-       the same label. */
-    int q, seen = 0;
-    for (q = 0; q < g_e2_ax_n; q++)
-      if (g_e2_ax[q] == pc) seen = 1;
-    if (!seen) g_e2_ax[g_e2_ax_n++] = pc;
-  }
+  /* One guard per pc, not per destination: get_arg2 has two and both jump to
+     the same label, synced from the snapshot taken before the first. */
+  if (e2_rep_prefix(v)[0] != 'v')
+    e2_note_stub(g_e2_ax, g_e2_ax_cur, g_e2_ax_blk, &g_e2_ax_n, pc, cur, NULL);
   /* An argument the analysis typed needs its TAG CHECK here: the profile said
      this slot holds an int, but the caller may pass a double, a string or
      nothing at all. Reading the payload without checking would use garbage bits
@@ -2261,15 +2310,7 @@ static int emit_typed_arith(
         "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
         "goto ox_%d;\n",
         in->pc);
-    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
-      Q2ValueId *snap = malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-      if (snap != NULL) {
-        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-        g_e2_ox[g_e2_ox_n] = in->pc;
-        g_e2_ox_cur[g_e2_ox_n] = snap;
-        g_e2_ox_n++;
-      }
-    }
+    e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   }
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -2426,7 +2467,7 @@ static void emit_trivial_own(
     }
     case ROP_get_arg:
       if (d != Q2_NO_VALUE)
-        e2_load_arg_to_local(f, d, (int)in->arg[1].val, in->pc);
+        e2_load_arg_to_local(f, d, (int)in->arg[1].val, in->pc, cur);
       break;
     case ROP_get_arg2: {
       /* Two argument slots in one instruction: the form nearly every function
@@ -2436,11 +2477,11 @@ static void emit_trivial_own(
       char n0[32], n1[32];
       if (in->narg >= 4) {
         if (d0 != Q2_NO_VALUE) {
-          e2_load_arg_to_local(f, d0, (int)in->arg[1].val, in->pc);
+          e2_load_arg_to_local(f, d0, (int)in->arg[1].val, in->pc, cur);
           cur[g_e2_fn->values[d0].reg < g_e2_fn->nregs ? g_e2_fn->values[d0].reg : 0] = d0;
         }
         if (d1 != Q2_NO_VALUE) {
-          e2_load_arg_to_local(f, d1, (int)in->arg[3].val, in->pc);
+          e2_load_arg_to_local(f, d1, (int)in->arg[3].val, in->pc, cur);
           cur[g_e2_fn->values[d1].reg < g_e2_fn->nregs ? g_e2_fn->values[d1].reg : 0] = d1;
         }
       }
@@ -2524,6 +2565,10 @@ static void e2_emit_exit(
     const Q2ValueId *cur, const uint64_t *live_set, int handoff, int blkidx) {
   int words = fn->lwords, w, r;
 
+  if (fi != g_e2_fi) {
+    fprintf(stderr, "e2: exit names function %d inside function %d's body\n", fi, g_e2_fi);
+    abort();
+  }
   fprintf(f, "    {\n");
   if (live_set != NULL) {
     for (w = 0; w < words; w++) {
@@ -2535,7 +2580,7 @@ static void e2_emit_exit(
         /* A register the spec body holds in a local is written from it; one it
            never touched already has the right contents in the frame, so it is
            left alone. Writing a stale definition would corrupt exactly that. */
-        if (cur == NULL) continue;
+        if (cur == NULL || cur[r] == E2_INFRAME) continue;
         if (cur[r] == E2_UNDEF) {
           fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_UNDEFINED);\n", r * 16);
           continue;
@@ -2571,10 +2616,14 @@ static void e2_emit_exit(
    exit uses it: the operands are live, the result is not yet. */
 static void e2_emit_exit_at(
     FILE *f, const Q2Func *fn, int ins, int pc, char hex[33], int fi,
-    const Q2ValueId *cur) {
+    const Q2ValueId *cur, int blkidx) {
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  if (cur == NULL) {
+    fprintf(stderr, "e2: exit stub at pc %d has no sync set (fn %s)\n", pc, hex);
+    abort();
+  }
   if (lb != NULL) q2_live_before(fn, ins, lb);
-  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0, -1);
+  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0, blkidx);
   free(lb);
 }
 
@@ -2736,13 +2785,8 @@ static int emit_typed_var_ref_load(
   ld = fn->values[d].reg;
 
   /* Register the exit pc ONCE per function body, so the vx_ label below is
-     emitted exactly once. */
-  if (g_e2_vx_n < (int)(sizeof(g_e2_vx) / sizeof(g_e2_vx[0]))) {
-    int q, seen = 0;
-    for (q = 0; q < g_e2_vx_n; q++)
-      if (g_e2_vx[q] == in->pc) seen = 1;
-    if (!seen) g_e2_vx[g_e2_vx_n++] = in->pc;
-  }
+     emitted exactly once. The snapshot is from before the load. */
+  e2_note_stub(g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
   if (t->lb[d] == E2_LB_I32) {
     fprintf(
         f,
@@ -2878,12 +2922,7 @@ static int emit_typed_opcall(
   /* 5. Reload the defs the role says it wrote, by value id, with the tag guard. */
   /* The guard exits land at the NEXT pc: the op has run, so its result is already in
      the frame and the generic body resumes after it. */
-  if (g_e2_dx_n < (int)(sizeof(g_e2_dx) / sizeof(g_e2_dx[0]))) {
-    int q, seen = 0;
-    for (q = 0; q < g_e2_dx_n; q++)
-      if (g_e2_dx[q] == in->next) seen = 1;
-    if (!seen) g_e2_dx[g_e2_dx_n++] = in->next;
-  }
+  e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
   any = 0;
   for (r = 0; r < in->ndef; r++) {
     Q2ValueId v = in->def[r];
@@ -3141,16 +3180,7 @@ static int emit_typed_fused(
     }
     (void)is_add;
     (void)op;
-    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
-      Q2ValueId *snap =
-          malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-      if (snap != NULL) {
-        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-        g_e2_ox[g_e2_ox_n] = in->pc;
-        g_e2_ox_cur[g_e2_ox_n] = snap;
-        g_e2_ox_n++;
-      }
-    }
+    e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
     if (cur != NULL) {
       cur[ldm] = dv;
       cur[ld] = rv;
@@ -3383,13 +3413,8 @@ static int emit_typed_call(
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   /* A typed def's guard exits at the NEXT pc (the call has run), so that exit must
      exist; the same registration the op-call wrapper uses. */
-  if (t->lb[dv] != E2_LB_TAG &&
-      g_e2_dx_n < (int)(sizeof(g_e2_dx) / sizeof(g_e2_dx[0]))) {
-    int q, seen = 0;
-    for (q = 0; q < g_e2_dx_n; q++)
-      if (g_e2_dx[q] == in->next) seen = 1;
-    if (!seen) g_e2_dx[g_e2_dx_n++] = in->next;
-  }
+  if (t->lb[dv] != E2_LB_TAG)
+    e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
   if (th >= 0)
     snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
   else
@@ -3625,16 +3650,7 @@ static int emit_typed_strict_eq(
         "          _e = %s;\n",
         (unsigned)tv, ex);
     fprintf(f, "      else goto hx_%d;\n", in->pc);
-    if (g_e2_hx_n < (int)(sizeof(g_e2_hx) / sizeof(g_e2_hx[0])) && cur != NULL) {
-      Q2ValueId *snap =
-          malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-      if (snap != NULL) {
-        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-        g_e2_hx[g_e2_hx_n] = in->pc;
-        g_e2_hx_cur[g_e2_hx_n] = snap;
-        g_e2_hx_n++;
-      }
-    }
+    e2_note_stub(g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
     fprintf(f, "      b%u = %s_e;\n", (unsigned)dv, neg ? "!" : "");
     fprintf(f, "    }\n");
   } else {
@@ -3888,12 +3904,7 @@ static int emit_typed_field_read(
   if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
 
   /* Register the guard exits' pcs ONCE per body, like the other dx_ users. */
-  if (g_e2_dx_n < (int)(sizeof(g_e2_dx) / sizeof(g_e2_dx[0]))) {
-    int q, seen = 0;
-    for (q = 0; q < g_e2_dx_n; q++)
-      if (g_e2_dx[q] == in->next) seen = 1;
-    if (!seen) g_e2_dx[g_e2_dx_n++] = in->next;
-  }
+  e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
   fprintf(f, "    { JSValue _f;\n");
   fprintf(
       f,
@@ -4005,16 +4016,7 @@ static int emit_typed_arith_cpool(
         "goto ox_%d;\n"
         "      i%u = (int32_t)_t; }\n",
         (unsigned)a, op, ic, in->pc, (unsigned)d);
-    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
-      Q2ValueId *snap =
-          malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-      if (snap != NULL) {
-        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-        g_e2_ox[g_e2_ox_n] = in->pc;
-        g_e2_ox_cur[g_e2_ox_n] = snap;
-        g_e2_ox_n++;
-      }
-    }
+    e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
     return 1;
   }
@@ -4179,16 +4181,7 @@ static int emit_typed_add_imm_branch(
       "        goto ox_%d;\n"
       "      i%u = _s; }\n",
       (unsigned)a, imm, in->pc, (unsigned)d);
-  if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
-    Q2ValueId *snap =
-        malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-    if (snap != NULL) {
-      memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-      g_e2_ox[g_e2_ox_n] = in->pc;
-      g_e2_ox_cur[g_e2_ox_n] = snap;
-      g_e2_ox_n++;
-    }
-  }
+  e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
   fprintf(f, "    /* fused update, then the unconditional back edge */\n");
   e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
@@ -4255,18 +4248,7 @@ static int emit_typed_inc_branch(
   e2_emit_arm(f, fn, b, si_else, cur, hex, blk->succ_block[si_else]);
   fprintf(f, "    }\n");
   /* The overflow exit lives after the block, keyed by this pc. */
-  if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0]))) {
-    Q2ValueId *snap =
-        malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-    if (snap != NULL && cur != NULL) {
-      memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-      g_e2_ox[g_e2_ox_n] = in->pc;
-      g_e2_ox_cur[g_e2_ox_n] = snap;
-      g_e2_ox_n++;
-    } else {
-      free(snap);
-    }
-  }
+  e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   (void)fi;
   return 1;
 }
@@ -4375,17 +4357,7 @@ static int emit_typed_arith_imm(
                 "goto ox_%d;\n"
                 "      i%u = (int32_t)_u; }\n",
                 xn, imm, in->pc, (unsigned)d);
-            if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) &&
-                cur != NULL) {
-              Q2ValueId *snap = malloc(
-                  sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-              if (snap != NULL) {
-                memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-                g_e2_ox[g_e2_ox_n] = in->pc;
-                g_e2_ox_cur[g_e2_ox_n] = snap;
-                g_e2_ox_n++;
-              }
-            }
+            e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
           } else if (t->lb[d] == E2_LB_F64) {
             fprintf(f, "    d%u = (double)((uint32_t)%s >> (%d & 31));\n",
                     (unsigned)d, xn, imm);
@@ -4433,16 +4405,7 @@ static int emit_typed_arith_imm(
       in->pc);
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
-  if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
-    Q2ValueId *snap =
-        malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-    if (snap) {
-      memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-      g_e2_ox[g_e2_ox_n] = in->pc;
-      g_e2_ox_cur[g_e2_ox_n] = snap;
-      g_e2_ox_n++;
-    }
-  }
+  e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   return 1;
 }
 
@@ -4686,17 +4649,7 @@ static int emit_typed_branch(
               (unsigned)tv, ex);
         }
         fprintf(f, "    else goto hx_%d;\n", in->pc);
-        if (g_e2_hx_n < (int)(sizeof(g_e2_hx) / sizeof(g_e2_hx[0])) &&
-            cur != NULL) {
-          Q2ValueId *snap =
-              malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-          if (snap != NULL) {
-            memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-            g_e2_hx[g_e2_hx_n] = in->pc;
-            g_e2_hx_cur[g_e2_hx_n] = snap;
-            g_e2_hx_n++;
-          }
-        }
+        e2_note_stub(g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
         fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       }
     }
@@ -4776,16 +4729,7 @@ static int emit_typed_unary(
           "        goto ox_%d;\n"
           "      %s = _s; }\n",
           an, in->rop == ROP_add_imm_self_s ? k : -k, in->pc, dn);
-      if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
-        Q2ValueId *snap =
-            malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-        if (snap) {
-          memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-          g_e2_ox[g_e2_ox_n] = in->pc;
-          g_e2_ox_cur[g_e2_ox_n] = snap;
-          g_e2_ox_n++;
-        }
-      }
+      e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
@@ -4800,16 +4744,7 @@ static int emit_typed_unary(
           "    if (__builtin_expect(%s != %s, 1)) { %s = %s %s 1; }\n", an,
           is_inc ? "INT32_MAX" : "INT32_MIN", dn, an, is_inc ? "+" : "-");
       fprintf(f, "    else { goto ox_%d; }\n", in->pc);
-      if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
-        Q2ValueId *snap =
-            malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-        if (snap) {
-          memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-          g_e2_ox[g_e2_ox_n] = in->pc;
-          g_e2_ox_cur[g_e2_ox_n] = snap;
-          g_e2_ox_n++;
-        }
-      }
+      e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
@@ -4828,16 +4763,7 @@ static int emit_typed_unary(
           "{ %s = -%s; }\n",
           an, an, dn, an);
       fprintf(f, "    else { goto ox_%d; }\n", in->pc);
-      if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
-        Q2ValueId *snap =
-            malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
-        if (snap) {
-          memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
-          g_e2_ox[g_e2_ox_n] = in->pc;
-          g_e2_ox_cur[g_e2_ox_n] = snap;
-          g_e2_ox_n++;
-        }
-      }
+      e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
@@ -5033,6 +4959,7 @@ static int e2_dispatch_rop(
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e2_fn = fn;
+  g_e2_fi = fi;
   E2Facts facts;
   /* STATIC on purpose: `g_e2_types` publishes `&types` for the whole emission, and
      the helpers that name locals read it. As a stack local the address escaped this
@@ -5173,6 +5100,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
        and the arm jump to another (bnpFromString returned early, which is what
        broke crypto). */
     b = fn->rpo[bi];
+    g_e2_blk = b;
     const Q2Block *blk = &fn->blocks[b];
     int i2, lowered_to = blk->first_insn, term_lowered = 0;
     Q2ValueId *cur = NULL;
@@ -5363,9 +5291,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     free(cur);
   }
-  /* The argument-guard exits: a typed argument arrived with the wrong tag, so
-     nothing is in a local yet and the frame still holds the caller's values. The
-     stub is a plain exit with an empty sync set. */
+  /* The argument-guard exits: a typed argument arrived with the wrong tag. The
+     frame still holds the caller's arguments; the stub syncs what the prefix
+     defined before the guard. */
   {
     int o;
     for (o = 0; o < g_e2_ax_n; o++) {
@@ -5374,8 +5302,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ax_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_ax_cur[o], g_e2_ax_blk[o]);
     }
+    for (o = 0; o < g_e2_ax_n; o++) free(g_e2_ax_cur[o]);
     g_e2_ax_n = 0;
   }
   /* The closure-cell load's deopt exits: the cell holds a value whose tag the
@@ -5389,12 +5318,14 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    vx_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_vx_cur[o], g_e2_vx_blk[o]);
     }
+    for (o = 0; o < g_e2_vx_n; o++) free(g_e2_vx_cur[o]);
     g_e2_vx_n = 0;
   }
   /* The op-call reload guards: the handler returned a JSValue whose tag the site's
-     representation does not accept. The op has run, so the exit is at the NEXT pc. */
+     representation does not accept. The op has run, so the exit is at the NEXT pc,
+     and the op's result is already in the frame (E2_INFRAME in the snapshot). */
   {
     int o;
     for (o = 0; o < g_e2_dx_n; o++) {
@@ -5403,8 +5334,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    dx_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_dx_cur[o], g_e2_dx_blk[o]);
     }
+    for (o = 0; o < g_e2_dx_n; o++) free(g_e2_dx_cur[o]);
     g_e2_dx_n = 0;
   }
   /* The overflow exits: the arithmetic check jumps here, and the exit does the
@@ -5418,7 +5350,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ox_%d:;\n", pc2);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o]);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o], g_e2_ox_blk[o]);
     }
     for (o = 0; o < g_e2_ox_n; o++) free(g_e2_ox_cur[o]);
     g_e2_ox_n = 0;
@@ -5437,7 +5369,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (ins < 0) continue;
       fprintf(f, "    hx_%d:;\n", pc2);
       fprintf(f, "    E2_HANDOFF_NOTE(%d);\n", fi);
-      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_hx_cur[o]);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_hx_cur[o], g_e2_hx_blk[o]);
     }
     for (o = 0; o < g_e2_hx_n; o++) free(g_e2_hx_cur[o]);
     g_e2_hx_n = 0;
