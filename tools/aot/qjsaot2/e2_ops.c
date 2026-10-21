@@ -5018,6 +5018,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         have_types = 1;
         g_e2_types = &types;
       } else {
+        /* CLEAR the global when this function has no analysis. Leaving the previous
+           function's types in place made e2_rep_prefix name locals with ANOTHER
+           function's reps, so a `dec` wrote an int into what the emitter thought was
+           a TAG local and the unit failed to compile (measured: crypto.js). */
+        g_e2_types = NULL;
         e2_facts_free(&facts);
       }
     }
