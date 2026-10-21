@@ -2066,6 +2066,22 @@ static int g_e2_hx[256];
 static Q2ValueId *g_e2_hx_cur[256];
 static int g_e2_hx_n;
 static int g_e2_vx[256];
+/* QJS_AOT_E2_SPEC_MAXPC=<n>: do not lower any instruction at pc >= n. A planned
+   hand-off, so the unit stays correct -- it just speculates less -- which is what
+   makes it usable as a bisect probe INSIDE one function. Read once per process. */
+static int e2_spec_maxpc = -2;
+static int e2_spec_maxpc_get(void) {
+  if (e2_spec_maxpc == -2) {
+    const char *v = getenv("QJS_AOT_E2_SPEC_MAXPC");
+    e2_spec_maxpc = -1;
+    if (v != NULL && v[0] != 0) {
+      int n = -1;
+      if (sscanf(v, "%d", &n) == 1 && n >= 0) e2_spec_maxpc = n;
+    }
+  }
+  return e2_spec_maxpc;
+}
+
 static int g_e2_dx[256];
 static int g_e2_dx_n;
 static int g_e2_vx_n;
@@ -5234,6 +5250,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
         e2_note_defs(cur, fn, in);
+      } else if (e2_spec_maxpc_get() >= 0 && in->pc >= e2_spec_maxpc_get()) {
+        /* The maxpc probe: a planned hand-off at this pc. Correctness is
+           unaffected, so a bisect over `pc` cannot produce a wrong answer. */
+        break;
       } else {
         /* RULE: an emitter either emits or declines -- never both. An emitter that
            writes and then returns 0 makes the dispatcher ALSO hand off, so an op
