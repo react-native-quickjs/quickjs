@@ -3359,6 +3359,111 @@ static int emit_typed_global_read(
   return 1;
 }
 
+static void e2_cmp_expr(
+    char *out, size_t cap, int base, const E2Types *t, Q2ValueId av, Q2ValueId bv,
+    int f64rep, int tag_arm);
+/* A speculative-body `load_this` ("r", no operands): `this` comes from the
+   function's own this-slot through `qjs_aot_load_this`, exactly as the generic
+   emitter does. `_own` says whether the value is owned (then it must be stored with
+   qjs_aot_set_reg_p) or borrowed (a plain store). */
+static int emit_typed_load_this(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId dv;
+  int ld;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_load_this) return 0;
+  if (in->ndef < 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[dv] != E2_LB_TAG) return 0;
+  ld = fn->values[dv].reg;
+  if (ld < 0 || ld >= fn->nregs) return 0;
+
+  fprintf(f, "    { JSValue _t;\n");
+  fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
+  fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
+  fprintf(f, "      v%u = _t;\n", (unsigned)dv);
+  fprintf(f, "      (void)_own;\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[ld] = dv;
+  return 1;
+}
+
+/* A speculative-body `strict_eq` / `strict_neq` producing a BOOL value (not a
+   branch). `===` never coerces, so: two typed operands compare directly (as
+   doubles when either is f64 -- `==` is false for NaN, which is JS `===`), and a
+   TAG operand is dispatched on its tag with a COLD ARM that hands off, because
+   `"1" === 1` and `{} === {}` cannot be answered from a tag alone. */
+static int emit_typed_strict_eq(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  Q2ValueId dv, av, bv;
+  int ld, neg, f64;
+  char xa[48], xb[48], ex[128];
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_strict_eq && in->rop != ROP_strict_neq) return 0;
+  if (in->ndef < 1 || in->nuse < 2) return 0;
+  dv = in->def[0];
+  av = in->use[0];
+  bv = in->use[1];
+  if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
+      bv >= (Q2ValueId)t->nvalues)
+    return 0;
+  if (t->lb[dv] != E2_LB_BOOL) return 0;
+  neg = in->rop == ROP_strict_neq;
+  ld = fn->values[dv].reg;
+  if (ld < 0 || ld >= fn->nregs) return 0;
+  f64 = t->lb[av] == E2_LB_F64 || t->lb[bv] == E2_LB_F64;
+
+  e2_cmp_expr(ex, sizeof(ex), REG_BIN_STRICT_EQ, t, av, bv, f64, 2);
+
+  if (t->lb[av] == E2_LB_TAG || t->lb[bv] == E2_LB_TAG) {
+    Q2ValueId tv = t->lb[av] == E2_LB_TAG ? av : bv;
+    int treg = fn->values[tv].reg;
+    if (treg < 0 || treg >= fn->nregs) return 0;
+    /* A second TAG operand makes the dispatch two-deep; decline rather than emit a
+       half-answer, which is the shape that cost us two rounds on slice 2d. */
+    if (t->lb[av] == E2_LB_TAG && t->lb[bv] == E2_LB_TAG) return 0;
+    e2_cmp_expr(ex, sizeof(ex), REG_BIN_STRICT_EQ, t, av, bv, f64, 0);
+    fprintf(f, "    { int _e;\n");
+    fprintf(
+        f,
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_INT, 1))\n"
+        "          _e = %s;\n",
+        (unsigned)tv, ex);
+    e2_cmp_expr(ex, sizeof(ex), REG_BIN_STRICT_EQ, t, av, bv, 1, 1);
+    fprintf(
+        f,
+        "      else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64)\n"
+        "          _e = %s;\n",
+        (unsigned)tv, ex);
+    fprintf(f, "      else goto hx_%d;\n", in->pc);
+    if (g_e2_hx_n < (int)(sizeof(g_e2_hx) / sizeof(g_e2_hx[0])) && cur != NULL) {
+      Q2ValueId *snap =
+          malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+      if (snap != NULL) {
+        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+        g_e2_hx[g_e2_hx_n] = in->pc;
+        g_e2_hx_cur[g_e2_hx_n] = snap;
+        g_e2_hx_n++;
+      }
+    }
+    fprintf(f, "      b%u = %s_e;\n", (unsigned)dv, neg ? "!" : "");
+    fprintf(f, "    }\n");
+  } else {
+    /* Both typed. `==` on doubles is false for NaN, which is JS `===`. */
+    fprintf(f, "    { int _e = %s;\n", ex);
+    fprintf(f, "      b%u = %s_e; }\n", (unsigned)dv, neg ? "!" : "");
+  }
+  if (cur != NULL) cur[ld] = dv;
+  (void)xa; (void)xb;
+  (void)hex; (void)fi; (void)b;
+  return 1;
+}
+
 /* A speculative-body `this` FIELD READ: `get_this_field` / `get_this_field2`
    ("rras", but BOTH register operands are destinations -- def[0] is the read and
    def[1] the receiver -- so there is no use to take a receiver from). `this` comes
@@ -4701,6 +4806,14 @@ static int e2_dispatch_rop(
       return emit_typed_elem_write(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_get_length:
       return emit_typed_length(f, fn, in, t, cur, have_types, hex, fi, b);
+
+    /* -- this, and strict equality as a value -- */
+    case ROP_load_this:
+      /* DISABLED: see the note on emit_typed_load_this. */
+      return 0;
+    case ROP_strict_eq:
+    case ROP_strict_neq:
+      return emit_typed_strict_eq(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- globals and closure cells -- */
     case ROP_get_global:
