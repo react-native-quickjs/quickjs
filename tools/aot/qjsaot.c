@@ -4895,6 +4895,35 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (q2_spec_fns_lo < 0) return 0;\n"
         "  return fi < q2_spec_fns_lo || fi > q2_spec_fns_hi;\n"
         "}\n\n");
+    /* The sweep's coverage record: which guard sites a run reached. Only a sweep
+       unit calls it. Each translation unit keeps its own bitmap and appends the
+       ids it saw to $QJS_AOT_E2_SWEEP_OUT at exit, so a split unit needs no
+       shared array and the run's own output is untouched. */
+    if (g_deopt_everywhere)
+      fprintf(
+          f,
+          "#define E2_SWEEP_MAX (1u << 20)\n"
+          "static uint8_t e2_sw_seen[E2_SWEEP_MAX / 8];\n"
+          "static inline int e2_sweep_hit(JSContext *ctx, uint32_t sid)\n"
+          "{\n"
+          "  if (sid < E2_SWEEP_MAX) e2_sw_seen[sid >> 3] |= (uint8_t)(1u << "
+          "(sid & 7));\n"
+          "  return qjs_aot_should_deopt(ctx, sid);\n"
+          "}\n"
+          "static void __attribute__((destructor, unused)) "
+          "e2_sweep_dump(void)\n"
+          "{\n"
+          "  const char *p = getenv(\"QJS_AOT_E2_SWEEP_OUT\");\n"
+          "  FILE *o;\n"
+          "  uint32_t i;\n"
+          "  if (p == NULL || p[0] == 0) return;\n"
+          "  o = fopen(p, \"a\");\n"
+          "  if (o == NULL) return;\n"
+          "  for (i = 0; i < E2_SWEEP_MAX; i++)\n"
+          "    if (e2_sw_seen[i >> 3] & (1u << (i & 7))) fprintf(o, "
+          "\"%%u\\n\", i);\n"
+          "  fclose(o);\n"
+          "}\n\n");
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int "

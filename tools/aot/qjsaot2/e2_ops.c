@@ -1999,20 +1999,6 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   return 0;
 }
 
-/* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
-   forced to fail, so its stub runs even where the speculation always holds. It
-   sits where the guard's own exit would be taken -- for dx_, after the op's raw
-   result is in the frame. A normal build emits nothing. hx_ is a hand-off, not a
-   deopt, and is not swept. */
-static void e2_sweep_guard(FILE *f, const char *kind, int pc) {
-  if (!qjs_aot_sweep_on()) return;
-  fprintf(
-      f,
-      "    if (__builtin_expect(qjs_aot_should_deopt(ctx, %d), 0)) goto "
-      "%s_%d;\n",
-      qjs_aot_site_alloc(), kind, pc);
-}
-
 /* The guard-stub tables' size. A large top-level function has hundreds of guard
    pcs; running out aborts rather than leave a goto without its label. */
 #define E2_MAX_STUBS 4096
@@ -2120,6 +2106,30 @@ static int g_e2_blk = -1;
 /* The function index of the body being emitted; every exit's note must name it,
    or its exits are counted against another function's switch-off. */
 static int g_e2_fi = -1;
+
+/* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
+   forced to fail, so its stub runs even where the speculation always holds. It
+   sits where the guard's own exit would be taken -- for dx_, after the op's raw
+   result is in the frame. A normal build emits nothing. hx_ is a hand-off, not a
+   deopt, and is not swept. */
+static void e2_sweep_guard(FILE *f, const char *kind, int pc) {
+  int sid;
+  if (!qjs_aot_sweep_on()) return;
+  sid = qjs_aot_site_alloc();
+  /* The unit's coverage bitmap is this size; a site past it would read as never
+     reached. */
+  if (sid >= (1 << 20)) {
+    fprintf(stderr, "e2: sweep site %d is past the coverage bitmap\n", sid);
+    abort();
+  }
+  /* The trailing comment is the site map: the harness reads it from the unit to
+     name an unreached site by function, kind and pc. */
+  fprintf(
+      f,
+      "    if (__builtin_expect(e2_sweep_hit(ctx, %d), 0)) goto %s_%d;"
+      " /* e2-sweep-site %d %s %d %d %s */\n",
+      sid, kind, pc, sid, kind, pc, g_e2_fi, g_cur_hex);
+}
 
 /* A register an op has already written to the frame: its raw result, before the
    guard that types it. Not a value id; the exit sync leaves the slot alone. */
