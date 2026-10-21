@@ -5010,7 +5010,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
      from another function's reps (`v28 = i27 - 1`). Static gives it the lifetime the
      published pointer requires. */
   static E2Types types;
-  int b, k;
+  int b, k, bi;
   int have_types = 0;
 
   /* `types` is static, so it survives between calls: reset it before each function
@@ -5137,8 +5137,13 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   /* The blocks in reverse postorder. `fn->blocks` is in pc order, which is a
      reverse postorder here: a block starts at every branch target and after
      every terminator, so only a back edge points at a lower index. */
-  for (b = 0; b < fn->nrpo; b++) {
-    const Q2Block *blk = &fn->blocks[fn->rpo[b]];
+  for (bi = 0; bi < fn->nrpo; bi++) {
+    /* `bi` is the RPO POSITION; `b` is the BLOCK INDEX, which is what every
+       callee takes. Conflating them made the fall-through comment name one block
+       and the arm jump to another (bnpFromString returned early, which is what
+       broke crypto). */
+    b = fn->rpo[bi];
+    const Q2Block *blk = &fn->blocks[b];
     int i2, lowered_to = blk->first_insn, term_lowered = 0;
     Q2ValueId *cur = NULL;
     int r0;
@@ -5190,19 +5195,19 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
           term_lowered = 1;
           break;
         }
-        if (emit_typed_goto(f, fn, in, fn->rpo[b], cur, hex)) {
+        if (emit_typed_goto(f, fn, in, b, cur, hex)) {
           lowered_to = i2 + 1;
           term_lowered = 1;
           break;
         }
         if (emit_typed_branch_bool(
-                f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
+                f, fn, in, &types, b, cur, have_types, hex) ||
             emit_typed_add_imm_branch(
-                f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
+                f, fn, in, &types, b, cur, have_types, hex) ||
             emit_typed_inc_branch(
-                f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi) ||
+                f, fn, in, &types, b, cur, have_types, hex, fi) ||
             emit_typed_branch(
-                f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi)) {
+                f, fn, in, &types, b, cur, have_types, hex, fi)) {
           lowered_to = i2 + 1;
           term_lowered = 1;
         }
