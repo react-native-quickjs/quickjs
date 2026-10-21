@@ -4436,7 +4436,7 @@ int qjsaot_driver_main(int argc, char **argv) {
            unit's reg.c does. A hand-off is CORRECT, merely slower, so a fix that
            only makes things faster can ONLY be tested by counting one function. */
         "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
-        "    if (e2_ent[i] == 0) continue;\n"
+        "    if (e2_ent[i] == 0 && e2_ref[i] == 0) continue;\n"
         "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d\\n\",\n"
         "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
         "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
@@ -5649,7 +5649,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "  fprintf(stderr, \"e2-stats enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%llu\\n\",\n"
           "          en, ex, hn, rf, off);\n"
           "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
-          "    if (e2_ent[i] == 0) continue;\n"
+          "    if (e2_ent[i] == 0 && e2_ref[i] == 0) continue;\n"
           "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d\\n\",\n"
           "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
           "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
