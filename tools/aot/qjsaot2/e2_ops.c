@@ -2931,6 +2931,42 @@ static int emit_typed_unary(
   return 0;
 }
 
+/* `return` in the spec body: box the returned value from its local into its frame
+   slot, then use the generic body's own return path (`qjs_aot_return` reads a
+   frame slot). Freeing nothing else is correct: frame registers are released by
+   the caller exactly as for the generic body. `return_undefined` needs no slot.
+
+   This is what the hand/ent column has been showing as 8/8 -- every call handed
+   off at its return, so no function ever completed on the spec path. */
+static int emit_typed_return(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  const E2Role *role = e2_roles[in->rop];
+  (void)fn;
+  (void)t;
+  (void)cur;
+  (void)have_types;
+  if (in->rop == ROP_return_undefined) {
+    if (role == NULL || role->control != E2_CF_RETURN) return 0;
+    fprintf(f, "    return JS_UNDEFINED;\n");
+    return 1;
+  }
+  if (in->rop != ROP_return) return 0;
+  if (role == NULL || role->control != E2_CF_RETURN) return 0;
+  if (in->nuse < 1) return 0;
+  {
+    Q2ValueId v = in->use[0];
+    int r;
+    if (v >= (Q2ValueId)g_e2_fn->nvalues) return 0;
+    r = g_e2_fn->values[v].reg;
+    if (r < 0 || r >= g_e2_fn->nregs) return 0;
+    /* Box into the frame slot the generic return reads, by representation. */
+    e2_exit_store(f, v, r);
+    fprintf(f, "    return qjs_aot_return(fr, %d);\n", r * 16);
+  }
+  return 1;
+}
+
 /* The speculative body (E8).
 
    Step 1 is the skeleton: the D4 switch-off counters, the S7 entry (which
@@ -3107,6 +3143,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
       if (role != NULL && role->control != E2_CF_NONE) {
+        if (emit_typed_return(f, fn, in, &types, cur, have_types)) {
+          lowered_to = i2 + 1;
+          term_lowered = 1;
+          break;
+        }
         if (emit_typed_branch_bool(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
             emit_typed_inc_branch(
