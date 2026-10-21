@@ -2938,7 +2938,7 @@ static int emit_typed_load_const(
   if (!have_types || t == NULL) return 0;
   if (in->rop != ROP_load_const) return 0;
   if (in->ndef < 1 || in->narg < 3) return 0;
-  if (in->arg[2].kind != 'i' && in->arg[2].kind != 'I') return 0;
+  if (in->arg[2].kind != 'c') return 0;  /* "rbc": the pool index */
   idx = (uint32_t)in->arg[2].val;
   if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
   tag = qjs_aot_pool_tag(fn->g, idx);
