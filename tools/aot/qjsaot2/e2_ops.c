@@ -2061,6 +2061,8 @@ void e2_handoff_report(FILE *f) {
    wrote and the generic body's g_<pc> reloads the arguments itself. */
 static int g_e2_ax[256];
 static int g_e2_vx[256];
+static int g_e2_dx[256];
+static int g_e2_dx_n;
 static int g_e2_vx_n;
 static int g_e2_ax_n = 0;
 
@@ -2738,6 +2740,152 @@ static int emit_typed_var_ref_load(
     fprintf(f, "    v%u = qjs_aot_get_var_ref(f, %d);\n", (unsigned)d, slot);
   }
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  return 1;
+}
+
+/* THE SPEC-BODY OP CALL (step 5). The D12 contract in generated code.
+   Unused at the moment: the first user is 5b's field miss path. It is committed
+   ahead of its user so that path is a thin wrapper, as the plan said.
+
+   An op call is a SAFEPOINT, so the order is fixed:
+     1. R6 sync: every live TAG value in cur[] is written to the frame FIRST. The call
+        can run JS, allocate and collect, and a TAG value held only in a C local is
+        invisible to the GC.
+     2. Store the typed operands to the frame, since the handler reads its arguments
+        from the register file.
+     3. `ip = qjs_aot_step(code + pc, fr, f, ctx)` -- the generic body's own slow path,
+        which already decodes every instruction and handles every type.
+     4. The three sentinels, and the control-transfer test: an ip that is NOT
+        `code + next` means a handler took an exception or the op jumped, which is the
+        D11 try rule. The frame is already synced, so that is an ordinary exit.
+     5. Reload ONLY what the role may have written, BY VALUE ID, each with the tag
+        guard at its definition: the handler returned a JSValue, so a def the analysis
+        typed i32/f64/bool is not safe to read blindly. A mismatch is a deopt exit at
+        the NEXT pc, because the op has run and its result is in the frame.
+   Nothing is forwarded across the call. */
+static int emit_typed_opcall(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    const uint64_t *live, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  int r, any;
+
+  if (role == NULL || role->tier != E2_OPCALL) return 0;
+  if (role->control != E2_CF_NONE) return 0;
+  /* An op that may write ANY register cannot be reloaded selectively here; the caller
+     leaves it to the generic body. (The reload loop below handles the known set.) */
+  (void)hex;
+  (void)fi;
+  (void)b;
+
+  /* 1. R6 sync: every live TAG value to the frame before the call. */
+  fprintf(f, "    /* R6: sync live TAG values before the op call (a safepoint) */\n");
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v;
+    if (cur == NULL) break;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF) continue;
+    if (v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] != E2_LB_TAG) continue;
+    fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", r * 16, (unsigned)v);
+  }
+  (void)live;
+
+  /* 2. Typed operands to the frame (the handler reads the register file). */
+  for (r = 0; r < role->nuse; r++) {
+    Q2ValueId v = in->nuse > r ? in->use[r] : Q2_NO_VALUE;
+    int reg;
+    if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) continue;
+    reg = fn->values[v].reg;
+    if (reg < 0 || reg >= fn->nregs) continue;
+    if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
+              reg * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", reg * 16,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
+              reg * 16, (unsigned)v);
+  }
+
+  /* 3. The call, and 4. the sentinels plus the control-transfer test. */
+  fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == NULL, 0)) return JS_EXCEPTION;\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip == QJS_AOT_COLD_RET || "
+      "ip == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
+  /* D11: a handler that caught the exception (or an op that jumped) returns an ip
+     that is not the next instruction. In the SPEC body this must be an ordinary exit
+     (rule R1): there is no `dispatch` label in aot_f_<hex> -- that is the generic
+     body's -- so the earlier version compiled only because nothing emitted this yet.
+     No further sync is needed: R6 ran before the call and the op wrote its own
+     results to the frame. */
+  fprintf(f, "    if (__builtin_expect(ip != code + %d, 0)) {\n", in->next);
+  fprintf(f, "        E2_HANDOFF_NOTE(%d);\n", fi);
+  fprintf(
+      f, "        return aot_g_%s(ctx, f, fr, (uint32_t)(ip - code));\n", hex);
+  fprintf(f, "    }\n");
+
+  /* 5. Reload the defs the role says it wrote, by value id, with the tag guard. */
+  /* The guard exits land at the NEXT pc: the op has run, so its result is already in
+     the frame and the generic body resumes after it. */
+  if (g_e2_dx_n < (int)(sizeof(g_e2_dx) / sizeof(g_e2_dx[0]))) {
+    int q, seen = 0;
+    for (q = 0; q < g_e2_dx_n; q++)
+      if (g_e2_dx[q] == in->next) seen = 1;
+    if (!seen) g_e2_dx[g_e2_dx_n++] = in->next;
+  }
+  any = 0;
+  for (r = 0; r < in->ndef; r++) {
+    Q2ValueId v = in->def[r];
+    int reg;
+    if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) continue;
+    reg = fn->values[v].reg;
+    if (reg < 0 || reg >= fn->nregs) continue;
+    switch (t->lb[v]) {
+      case E2_LB_I32:
+        fprintf(
+            f,
+            "    { JSValue _r = AOT_REG(fr, %d);\n"
+            "      if (__builtin_expect(JS_VALUE_GET_TAG(_r) != JS_TAG_INT, 0)) "
+            "goto dx_%d;\n"
+            "      i%u = JS_VALUE_GET_INT(_r); }\n",
+            reg * 16, in->next, (unsigned)v);
+        any = 1;
+        break;
+      case E2_LB_F64:
+        fprintf(
+            f,
+            "    { JSValue _r = AOT_REG(fr, %d); int _tg = JS_VALUE_GET_TAG(_r);\n"
+            "      if (_tg == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_r);\n"
+            "      else if (_tg == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_r);\n"
+            "      else goto dx_%d; }\n",
+            reg * 16, (unsigned)v, (unsigned)v, in->next);
+        any = 1;
+        break;
+      case E2_LB_BOOL:
+        fprintf(
+            f,
+            "    { JSValue _r = AOT_REG(fr, %d);\n"
+            "      if (__builtin_expect(JS_VALUE_GET_TAG(_r) != JS_TAG_BOOL, 0)) "
+            "goto dx_%d;\n"
+            "      b%u = JS_VALUE_GET_BOOL(_r); }\n",
+            reg * 16, in->next, (unsigned)v);
+        any = 1;
+        break;
+      case E2_LB_TAG:
+        fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)v, reg * 16);
+        any = 1;
+        break;
+      default:
+        break;
+    }
+    if (cur != NULL) cur[reg] = v;
+  }
+  if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
   return 1;
 }
 
@@ -3897,6 +4045,20 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
     }
     g_e2_vx_n = 0;
+  }
+  /* The op-call reload guards: the handler returned a JSValue whose tag the site's
+     representation does not accept. The op has run, so the exit is at the NEXT pc. */
+  {
+    int o;
+    for (o = 0; o < g_e2_dx_n; o++) {
+      int pc2 = g_e2_dx[o], ii, ins = -1;
+      for (ii = 0; ii < fn->ninsns; ii++)
+        if (fn->insns[ii].pc == pc2) { ins = ii; break; }
+      if (ins < 0) continue;
+      fprintf(f, "    dx_%d:;\n", pc2);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
+    }
+    g_e2_dx_n = 0;
   }
   /* The overflow exits: the arithmetic check jumps here, and the exit does the
      sync and the hand-over. Nothing was written to the frame by the arithmetic
