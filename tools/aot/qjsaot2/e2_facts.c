@@ -795,6 +795,12 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
            time round, so none may be assumed. */
         fs_clear(&cur);
       } else {
+        /* `cur` still holds the previous block's out-set; the merge below
+           starts from the first predecessor's, not from that. Without this a
+           block inherited the facts of its neighbour in reverse postorder --
+           invisible while only the types read the facts, a wrong forwarded load
+           once the emitter did. */
+        fs_clear(&cur);
         for (p = 0; p < blk->npreds; p++) {
           const FactSet *o;
           /* A dead predecessor never executes, so it must not constrain the
