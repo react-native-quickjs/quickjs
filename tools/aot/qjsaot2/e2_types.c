@@ -396,6 +396,18 @@ static int transfer_def(
     case Q2_OP_UNARY:
       if (in->nuse < 1) return E2_LB_TAG;
       a = w[in->use[0]];
+      /* `add_imm_self_s` / `sub_imm_self_s` ("ri") arrive here with their OWN rop, so
+         the sub-based checks below never see them. They are an in-place add/sub of a
+         small constant: the inc rule applies (an int stays an int, the lowering's
+         overflow exit covers the rest). */
+      if (in->rop == ROP_add_imm_self_s || in->rop == ROP_sub_imm_self_s) {
+        if (a == E2_LB_BOT) return E2_LB_BOT;
+        if (a == E2_LB_I32) return rep_inc(a);
+        if (a == E2_LB_F64) return E2_LB_F64;
+        *whyp = E2_WHY_OPERAND_TAGGED;
+        *whyvp = in->use[0];
+        return E2_LB_TAG;
+      }
       if (sub == REG_UN_NEG) {
         if (a == E2_LB_BOT) return E2_LB_BOT;
         if (a == E2_LB_I32) return record_int_only(dv) ? E2_LB_I32 : E2_LB_F64;

@@ -2741,6 +2741,67 @@ static int emit_typed_var_ref_load(
   return 1;
 }
 
+/* A closure-cell STORE in the spec body: `put_var_ref` (rop 19, "ur"). The engine
+   handler is
+       set_value(ctx, var_refs[slot]->pvalue, js_dup(regs[s]));
+   and `set_value` is `{ old = *pval; *pval = new; JS_FreeValue(ctx, old); }`. So this
+   is the handler spelled with public names:
+       { JSValue *p_ = qjs_aot_var_ref_ptr(f, slot);
+         JSValue old_ = *p_;
+         *p_ = JS_DupValue(ctx, <boxed>);
+         JS_FreeValue(ctx, old_); }
+   R6: no sync is needed before this store. Freeing the old value does not call into
+   JS (a free never runs a finalizer inline here, and DRC parks objects anyway), and
+   JS_DupValue allocates nothing. The box is a JS_MKVAL or the float64 constructor,
+   neither of which can GC. If that ever changes, the sync must come FIRST.
+   `JS_DupValue` is a no-op for ints, bools and doubles; the call is kept so the shape
+   is uniform with the TAG case. */
+static int emit_typed_var_ref_store(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId a;
+  int slot;
+  char box[64];
+
+  (void)fn;
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_put_var_ref) return 0;
+  /* "ur": arg[0] is the SLOT and arg[1] the value register (build.c sets use[0]=1),
+     so the slot is arg[0] -- reading arg[1] took the value register as the slot. */
+  if (in->nuse < 1 || in->narg < 2) return 0;
+  if (in->arg[0].kind != 'u' && in->arg[0].kind != 'i') return 0;
+  a = in->use[0];
+  slot = (int)in->arg[0].val;
+  if (a >= (Q2ValueId)t->nvalues) return 0;
+  switch (t->lb[a]) {
+    case E2_LB_I32:
+      snprintf(box, sizeof(box), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)a);
+      break;
+    case E2_LB_F64:
+      snprintf(box, sizeof(box), "__JS_NewFloat64(d%u)", (unsigned)a);
+      break;
+    case E2_LB_BOOL:
+      snprintf(box, sizeof(box), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)a);
+      break;
+    case E2_LB_TAG:
+      snprintf(box, sizeof(box), "v%u", (unsigned)a);
+      break;
+    default:
+      return 0;
+  }
+  /* The cell's OLD value is not forwarded: a later read of the cell is a fresh load
+     with its own value id, so the IR already says the old value is gone. */
+  fprintf(
+      f,
+      "    { JSValue *_p = qjs_aot_var_ref_ptr(f, %d);\n"
+      "      JSValue _old = *_p;\n"
+      "      *_p = JS_DupValue(ctx, %s);\n"
+      "      JS_FreeValue(ctx, _old); }\n",
+      slot, box);
+  (void)cur;
+  return 1;
+}
+
 /* The i32 bitwise and shift group: `bitand`/`bitor`/`bitxor`/`shl`/`sar`/`shr`.
    A typed f64 operand is converted with ToInt32 first (q2_toi32, total, no exit);
    a typed i32 operand is used as is. The result is always i32, which is what the
@@ -2958,6 +3019,7 @@ static int emit_typed_arith_imm(
       have_imm = 1;
       break;
     case ROP_add_imm_s:
+    case ROP_add_imm_self_s:
       sub = REG_BIN_ADD;
       if (in->narg < 3 || (in->arg[2].kind != 'i' && in->arg[2].kind != 'I'))
         return 0;
@@ -2965,6 +3027,7 @@ static int emit_typed_arith_imm(
       have_imm = 1;
       break;
     case ROP_sub_imm_s:
+    case ROP_sub_imm_self_s:
       sub = REG_BIN_SUB;
       if (in->narg < 3 || (in->arg[2].kind != 'i' && in->arg[2].kind != 'I'))
         return 0;
@@ -3298,7 +3361,11 @@ static int emit_typed_unary(
   is_neg = in->rop == ROP_neg;
   is_not = in->rop == ROP_not;
   is_bitnot = 0;  /* bitwise not is a binary op (REG_BIN_NOT), not a unary rop */
-  if (!is_inc && !is_dec && !is_neg && !is_not) return 0;
+  /* `add_imm_self_s`/`sub_imm_self_s` are Q2_OP_UNARY with their own rops, so they
+     must be admitted here or the branch below is unreachable. */
+  if (!is_inc && !is_dec && !is_neg && !is_not &&
+      in->rop != ROP_add_imm_self_s && in->rop != ROP_sub_imm_self_s)
+    return 0;
   if (in->ndef < 1 || in->nuse < 1) return 0;
   d = in->def[0];
   a = in->use[0];
@@ -3320,6 +3387,34 @@ static int emit_typed_unary(
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
       fprintf(f, "    %s = ~%s;\n", dn, an);
+      if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+    if (in->rop == ROP_add_imm_self_s || in->rop == ROP_sub_imm_self_s) {
+      /* "ri": arg[0] is the register (def AND use), arg[1] a SIGNED 8-bit immediate
+         (RD_OFF8). `i = i +/- k` with the int32 overflow deopt -- the inc path with
+         a constant instead of 1. This is add_imm_self_branch without the jump. */
+      int32_t k = (int32_t)(int8_t)(in->narg > 1 ? (in->arg[1].val & 0xff) : 1);
+      if (t->lb[d] != E2_LB_I32) return 0;
+      e2_local_name(dn, sizeof(dn), d);
+      e2_local_name(an, sizeof(an), a);
+      fprintf(
+          f,
+          "    { int32_t _s;\n"
+          "      if (__builtin_expect(__builtin_add_overflow(%s, (int32_t)%d, &_s), 0))\n"
+          "        goto ox_%d;\n"
+          "      %s = _s; }\n",
+          an, in->rop == ROP_add_imm_self_s ? k : -k, in->pc, dn);
+      if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
+        Q2ValueId *snap =
+            malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+        if (snap) {
+          memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+          g_e2_ox[g_e2_ox_n] = in->pc;
+          g_e2_ox_cur[g_e2_ox_n] = snap;
+          g_e2_ox_n++;
+        }
+      }
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
@@ -3625,6 +3720,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_unary(
                      f, fn, in, &types, cur, have_types, hex, fi)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_var_ref_store(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_var_ref_load(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
