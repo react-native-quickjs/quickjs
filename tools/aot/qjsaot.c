@@ -4207,6 +4207,21 @@ int qjsaot_driver_main(int argc, char **argv) {
        header, and the arrays are declared there and defined once in reg.c. */
     fprintf(f, "#define QJS_AOT_E2_NFUNCS %uu\n",
             nfuncs > 0 ? (unsigned)nfuncs : 1u);
+    /* The function names, indexed the same way as the D4 counter arrays, so the
+       teardown line can print one row per function and a test can assert on one
+       by name. */
+    {
+      int ni;
+      if (split_dir != NULL) {
+        fprintf(f, "extern const char *const qjs_aot_e2_names[];\n");
+      } else {
+        fprintf(f, "static const char *const qjs_aot_e2_names[] = {\n");
+        for (ni = 0; ni < nfuncs; ni++)
+          fprintf(f, "  \"%s\",\n", funcs[ni].name[0] ? funcs[ni].name : "?");
+        if (nfuncs == 0) fprintf(f, "  \"?\",\n");
+        fprintf(f, "};\n");
+      }
+    }
     if (split_dir != NULL) fprintf(f, "#define QJS_AOT_SPLIT_UNIT 1\n");
     fprintf(f, "\n");
     /* The frame reads a compiled entry performs: the same fields the engine's
@@ -5348,8 +5363,21 @@ int qjsaot_driver_main(int argc, char **argv) {
           "uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
           "uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
           "uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
+          "const char *const qjs_aot_e2_names[] = {\n"
+          );
+      {
+        int ni;
+        for (ni = 0; ni < nfuncs; ni++)
+          fprintf(f, "  \"%s\",\n", funcs[ni].name[0] ? funcs[ni].name : "?");
+        if (nfuncs == 0) fprintf(f, "  \"?\",\n");
+      }
+      fprintf(f,
+          "};\n"
           /* Defined here, once, so the destructor is linked: a definition in a
              header included by every part is dropped as unused in each. */
+          "/* One line per function, so a case can assert on ONE function's\n"
+          "   hand-offs. The whole-script total cannot express remote\"a\"\n"
+          "   counts, which is what a faster-not-just-correct fix needs. */\n"
           "void __attribute__((destructor)) e2_stats_dump(void)\n"
           "{\n"
           "  unsigned long long en = 0, ex = 0, rf = 0, off = 0, hn = 0;\n"
@@ -5358,10 +5386,18 @@ int qjsaot_driver_main(int argc, char **argv) {
           "  if (e == NULL || e[0] != '1') return;\n"
           "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
           "    en += e2_ent[i]; ex += e2_exi[i]; rf += e2_ref[i]; off += e2_off[i];\n"
-        "    hn += e2_han[i];\n"
+          "    hn += e2_han[i];\n"
           "  }\n"
           "  fprintf(stderr, \"e2-stats enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%llu\\n\",\n"
           "          en, ex, hn, rf, off);\n"
+          "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
+          "    if (e2_ent[i] == 0) continue;\n"
+          "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u\\n\",\n"
+          "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
+          "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
+          "            (unsigned long long)e2_han[i], (unsigned long long)e2_ref[i],\n"
+          "            (unsigned)e2_off[i]);\n"
+          "  }\n"
           "}\n"
           );
     }
