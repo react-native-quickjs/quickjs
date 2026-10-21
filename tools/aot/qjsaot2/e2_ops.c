@@ -3226,7 +3226,7 @@ static void e2_emit_arm(
       /* Not noted: an interrupt is neither a hand-off nor a failed speculation. */
       fprintf(
           f,
-          "          E2Nx x_ = { %d, -100, NULL, lv, offs, %d, argc };\n"
+          "          E2Nx x_ = { %d, -100, \"poll\", lv, offs, %d, argc };\n"
           "          return aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
           "&x_);\n          }\n",
           t->start_pc, nlv, hex);
