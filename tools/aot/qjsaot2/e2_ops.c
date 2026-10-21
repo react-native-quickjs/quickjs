@@ -5069,10 +5069,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
      before this line was measuring the spec bodies. */
   fprintf(
       f,
-      "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || q2_no_spec || "
-      "e2_off[%d], 0))\n"
+      "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || q2_no_spec ||\n"
+      "                         q2_spec_fns_out(%d) || e2_off[%d], 0))\n"
       "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
-      fi, hex);
+      fi, fi, hex);
   /* The index must be inside the D4 arrays; the generator sized them from the
      function count, so this can only fail if the two disagree. */
   fprintf(

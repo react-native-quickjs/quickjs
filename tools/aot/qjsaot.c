@@ -4873,7 +4873,26 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return v != NULL && v[0] == '1';\n"
         "}\n"
         "#define q2_force_miss q2_force_miss_cache\n"
-        "#define Q2_FORCE_MISS (q2_force_miss > 0)\n\n");
+        "#define Q2_FORCE_MISS (q2_force_miss > 0)\n"
+        /* QJS_AOT_E2_SPEC_FNS="<lo>-<hi>" allows the spec body only for function
+           indices in that range, so a miscompile can be pinned to ONE function by
+           halving the range. A run-time test, so a stale unit cannot fake it. */
+        "static int q2_spec_fns_lo = -2, q2_spec_fns_hi = -2;\n"
+        "static inline __attribute__((always_inline)) int q2_spec_fns_out(int fi)\n"
+        "{\n"
+        "  if (q2_spec_fns_lo == -2) {\n"
+        "    const char *v = getenv(\"QJS_AOT_E2_SPEC_FNS\");\n"
+        "    q2_spec_fns_lo = -1; q2_spec_fns_hi = -1;\n"
+        "    if (v != NULL && v[0] != 0) {\n"
+        "      int lo = -1, hi = -1;\n"
+        "      if (sscanf(v, \"%d-%d\", &lo, &hi) == 2) {\n"
+        "        q2_spec_fns_lo = lo; q2_spec_fns_hi = hi;\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  if (q2_spec_fns_lo < 0) return 0;\n"
+        "  return fi < q2_spec_fns_lo || fi > q2_spec_fns_hi;\n"
+        "}\n\n");
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int "
