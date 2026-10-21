@@ -1012,6 +1012,13 @@ static int q2_branch_is_conditional(uint16_t rop) {
   switch (rop) {
     case ROP_branch:
     case ROP_branch_s:
+    /* `add_imm_self_branch(_s)` ALWAYS jumps: every path of its engine handler
+       (quickjs.c L_ROP_add_imm_self_branch) ends in `rpc += off`. Treating it as
+       conditional added a phantom fall-through edge to the next instruction,
+       which made the IR think the pc after it was reachable from here -- that
+       edge loosened liveness and blocked the lowering of the loop it belongs to. */
+    case ROP_add_imm_self_branch:
+    case ROP_add_imm_self_branch_s:
       return 0;
     default:
       return 1;

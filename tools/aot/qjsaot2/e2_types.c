@@ -434,7 +434,12 @@ static int transfer_def(
         if (in->nuse < 1) return E2_LB_TAG;
         a = w[in->use[0]];
         if (a == E2_LB_BOT) return E2_LB_BOT;
-        if (a == E2_LB_I32) return record_int_only(dv) ? E2_LB_I32 : E2_LB_F64;
+        /* An in-place add of a small constant IS an increment, so it takes the
+           inc rule: an int stays an int and the lowering guards the overflow.
+           Widening to f64 because there is no profile record was wrong -- a loop
+           counter's record is for its own def, and the fused add's def has none,
+           so `i += 3` was typed f64 while `i++` was typed i32. */
+        if (a == E2_LB_I32) return rep_inc(a);
         if (a == E2_LB_F64) return E2_LB_F64;
         *whyp = E2_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];

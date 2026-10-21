@@ -2799,6 +2799,61 @@ static int emit_typed_bitwise(
    increment overflows, and it takes the deopt exit (not a hand-off: the analysis
    said this is an int counter and it is not), which the generic body redoes in
    full precision. */
+/* `add_imm_self_branch(_s)` ("rit": d, imm, off). Read the engine handler
+   (quickjs.c L_ROP_add_imm_self_branch): it does
+       d = d + imm;  BACKEDGE(off); goto target;
+   -- there is NO compare. It is the loop UPDATE fused with the UNCONDITIONAL back
+   edge; the `i < e` test is a separate instruction at the target block. Treating it
+   as a counter test (like inc_branch_lt, which DOES compare) invented a comparison
+   and produced a wrong count. So: the i32 add with its overflow deopt, then the one
+   successor edge through the arm emitter (edge moves, back-edge poll, goto).
+   `imm` is a SIGNED 8-bit operand (RD_OFF8). */
+static int emit_typed_add_imm_branch(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33]) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  Q2ValueId d, a;
+  int32_t imm;
+  int ld;
+
+  if (in->rop != ROP_add_imm_self_branch &&
+      in->rop != ROP_add_imm_self_branch_s)
+    return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (!have_types || t == NULL) return 0;
+  if (in->ndef < 1 || in->nuse < 1 || in->narg < 3) return 0;
+  if (blk->nsucc != 1) return 0;
+  d = in->def[0];
+  a = in->use[0];
+  if (d >= (Q2ValueId)t->nvalues || a >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[d] != E2_LB_I32 || t->lb[a] != E2_LB_I32) return 0;
+  /* RD_OFF8: a signed 8-bit immediate. */
+  imm = (int32_t)(int8_t)(in->arg[1].val & 0xff);
+  ld = fn->values[d].reg;
+  fprintf(
+      f,
+      "    { int32_t _s;\n"
+      "      if (__builtin_expect(__builtin_add_overflow(i%u, (int32_t)%d, &_s), 0))\n"
+      "        goto ox_%d;\n"
+      "      i%u = _s; }\n",
+      (unsigned)a, imm, in->pc, (unsigned)d);
+  if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
+    Q2ValueId *snap =
+        malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    if (snap != NULL) {
+      memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+      g_e2_ox[g_e2_ox_n] = in->pc;
+      g_e2_ox_cur[g_e2_ox_n] = snap;
+      g_e2_ox_n++;
+    }
+  }
+  if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  fprintf(f, "    /* fused update, then the unconditional back edge */\n");
+  e2_emit_arm(f, fn, b, 0, cur, hex);
+  return 1;
+}
+
 static int emit_typed_inc_branch(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
     Q2ValueId *cur, int have_types, char hex[33], int fi) {
@@ -2811,12 +2866,7 @@ static int emit_typed_inc_branch(
   /* Both forms of the counter test: `_s` (short offset) and the register form.
      Also `add_imm_self_branch(_s)` -- `i += k` fused with the same test, which is
      how `for (i = s; i < e; i += 3)` compiles. */
-  {
-    int is_inc = in->rop == ROP_inc_branch_lt_s || in->rop == ROP_inc_branch_lt;
-    int is_addi = in->rop == ROP_add_imm_self_branch ||
-                  in->rop == ROP_add_imm_self_branch_s;
-    if (!is_inc && !is_addi) return 0;
-  }
+  if (in->rop != ROP_inc_branch_lt_s && in->rop != ROP_inc_branch_lt) return 0;
   if (role == NULL || role->control != E2_CF_BRANCH) return 0;
   if (!have_types || t == NULL || blk->nsucc < 2) return 0;
   if (in->ndef < 1 || in->nuse < 2) return 0;
@@ -2834,9 +2884,10 @@ static int emit_typed_inc_branch(
      below the bound. */
   si_take = 0;
   si_else = 1;
-  if (in->rop == ROP_add_imm_self_branch || in->rop == ROP_add_imm_self_branch_s) {
-    /* The immediate is arg[2] for this shape; arg[1] is the sub-op. */
-    int32_t k = in->narg > 2 ? (int32_t)in->arg[2].val : 1;
+  if (0) {
+    /* "rit": arg[0] is the destination register, arg[1] the immediate, arg[2]
+       the branch target. Reading arg[2] here would use the TARGET as the step. */
+    int32_t k = in->narg > 1 ? (int32_t)in->arg[1].val : 1;
     fprintf(
         f, "    if (__builtin_expect((int64_t)%s + (int64_t)%d <= INT32_MAX &&\n"
            "                             (int64_t)%s + (int64_t)%d >= INT32_MIN, 1)) {\n",
@@ -3550,6 +3601,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
           break;
         }
         if (emit_typed_branch_bool(
+                f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
+            emit_typed_add_imm_branch(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
             emit_typed_inc_branch(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi) ||
