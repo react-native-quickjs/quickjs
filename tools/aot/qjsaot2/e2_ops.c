@@ -2968,8 +2968,10 @@ static int emit_typed_opcall(
       default:
         break;
     }
-    if (cur != NULL) cur[reg] = v;
   }
+  /* The defs are in their locals now; cur[] is NOT updated here. The dispatcher's
+     e2_note_defs does that once the whole instruction is lowered, so an emitter
+     with two miss paths gives the second one the pre-instruction state. */
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
   return 1;
 }
@@ -3786,7 +3788,12 @@ static int emit_typed_field_chain(
   fprintf(f, "        }\n");
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  /* The same wrapper on the same instruction: having emitted once, it cannot
+     decline now, and a decline here would leave half an instruction written. */
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    fprintf(stderr, "e2: field chain at pc %d: second wrapper declined\n", in->pc);
+    abort();
+  }
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) {
