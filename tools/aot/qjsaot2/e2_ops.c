@@ -2927,6 +2927,50 @@ static int e2_is_call_family(uint16_t rop) {
   }
 }
 
+/* `div` / `mod` ("rrr": dest, a, b) as typed arithmetic. The f64 form needs no
+   exit: a double division cannot trap, and `1/0` is Infinity exactly as JS says.
+   `mod` on doubles is `fmod`, which IS JavaScript's `%` for doubles (the sign
+   follows the dividend). An i32 result declines to the wrapper: JS integer
+   division can produce a fraction, and `x % 0` is NaN, so there is no int32 form
+   that is correct in general. */
+static int emit_typed_divmod(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b,
+    int (*opcall)(FILE *, const Q2Func *, const Q2Insn *, const E2Types *,
+                  Q2ValueId *, const uint64_t *, char[33], int, int)) {
+  Q2ValueId dv, av, bv;
+  int ld;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_div && in->rop != ROP_mod) return 0;
+  if (in->ndef < 1 || in->nuse < 2) return 0;
+  dv = in->def[0];
+  av = in->use[0];
+  bv = in->use[1];
+  if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
+      bv >= (Q2ValueId)t->nvalues)
+    return 0;
+  /* f64 only: both operands and the result must be doubles. */
+  if (t->lb[dv] != E2_LB_F64 || t->lb[av] != E2_LB_F64 ||
+      t->lb[bv] != E2_LB_F64)
+    return 0;
+  ld = fn->values[dv].reg;
+  if (ld < 0 || ld >= fn->nregs) return 0;
+  if (in->rop == ROP_div) {
+    fprintf(f, "    d%u = d%u / d%u;\n", (unsigned)dv, (unsigned)av, (unsigned)bv);
+  } else {
+    /* fmod is JS `%` for doubles. It is in math.h, which the unit prelude already
+       includes for fabs/floor. */
+    fprintf(f, "    d%u = fmod(d%u, d%u);\n", (unsigned)dv, (unsigned)av, (unsigned)bv);
+  }
+  if (cur != NULL) cur[ld] = dv;
+  (void)opcall;
+  (void)hex;
+  (void)fi;
+  (void)b;
+  return 1;
+}
+
 /* `load_const` ("rbc": d, kind, cpool index). A NUMERIC pool entry is a constant,
    not an op call: decode it with the same accessors `binary_cpool` uses and load it
    straight into the typed local -- an int entry into an i32 local, a double into an
@@ -4601,6 +4645,9 @@ static int e2_dispatch_rop(
       return emit_typed_fused(f, fn, in, t, cur, have_types);
 
     /* -- arithmetic -- */
+    case ROP_div:
+    case ROP_mod:
+      return emit_typed_divmod(f, fn, in, t, cur, have_types, hex, fi, b, NULL);
     case ROP_add:
     case ROP_sub:
     case ROP_mul:
