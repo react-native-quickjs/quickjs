@@ -2901,6 +2901,64 @@ static int emit_typed_opcall(
   return 1;
 }
 
+/* The CALL family: `call`, `call_method`, `call_constructor`, `tail_call`, the
+   apply forms and anything else that runs JS through a callee frame. The generic
+   wrapper must NOT take these -- its step+reload does not reproduce a call's return
+   handling and produced `undefined` on the first attempt -- so they hand off until
+   Batch 4's (b), a spec version shaped like `emit_native_call`. */
+static int e2_is_call_family(uint16_t rop) {
+  switch (rop) {
+    case ROP_call:
+    case ROP_call_method:
+    case ROP_construct:      /* `new`: a callee frame like the calls */
+    case ROP_tail_call:
+    case ROP_tail_call_method:
+    case ROP_apply:
+    case ROP_apply_arguments:
+    case ROP_eval:           /* runs arbitrary JS in a fresh frame */
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* `load_const` ("rbc": d, kind, cpool index). A NUMERIC pool entry is a constant,
+   not an op call: decode it with the same accessors `binary_cpool` uses and load it
+   straight into the typed local -- an int entry into an i32 local, a double into an
+   f64 local with an exact `%a` literal. Anything else (a string, an object, a
+   non-finite double) declines to the wrapper. */
+static int emit_typed_load_const(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId dv;
+  double c;
+  uint32_t idx;
+  int tag, ld;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_load_const) return 0;
+  if (in->ndef < 1 || in->narg < 3) return 0;
+  if (in->arg[2].kind != 'i' && in->arg[2].kind != 'I') return 0;
+  idx = (uint32_t)in->arg[2].val;
+  if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
+  tag = qjs_aot_pool_tag(fn->g, idx);
+  if (tag != E2_POOL_INT && tag != E2_POOL_DOUBLE) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  ld = fn->values[dv].reg;
+  if (ld < 0 || ld >= fn->nregs) return 0;
+  if (t->lb[dv] == E2_LB_I32 && tag == E2_POOL_INT) {
+    fprintf(f, "    i%u = %d;\n", (unsigned)dv, (int32_t)c);
+  } else if (t->lb[dv] == E2_LB_F64) {
+    if (tag == E2_POOL_DOUBLE && !__builtin_isfinite(c)) return 0;
+    fprintf(f, "    d%u = (%a);\n", (unsigned)dv, c);
+  } else {
+    return 0;
+  }
+  if (cur != NULL) cur[ld] = dv;
+  return 1;
+}
+
 /* The FUSED arithmetic ops as typed arithmetic in the spec body:
    `add_mul` ("rrrrr": dm, x, y, da, c) is `t = x * y; r = c + t`, exactly as the
    engine handler does it -- TWO operations, never an fma (the unit already builds
@@ -4487,6 +4545,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     /* 2a-2: the block's lowered prefix, then an exit at the first instruction
        the spec body does not lower. Rule R3: an instruction is either lowered
        here or IS the exit point -- never "emitted as nothing". */
+    /* DISPATCH ORDER: MOST SPECIFIC FIRST. The chain below goes from the narrowest
+       emitter to the widest, and the generic op-call wrapper is LAST, as the
+       catch-all. This order has been the bug three times (add_imm_self_s, the
+       wrapper's tier gate, the fused ops), always silently: an op taken by an
+       earlier, narrower test just stops lowering. */
     for (i2 = blk->first_insn; i2 < blk->first_insn + blk->ninsns; i2++) {
       const Q2Insn *in = &fn->insns[i2];
       const E2Role *role = e2_roles[in->rop];
