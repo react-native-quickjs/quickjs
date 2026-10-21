@@ -2260,6 +2260,10 @@ static const E2Facts *g_e2_facts;
 static uint8_t *g_e2_group_used;
 /* The report counts: shape tests emitted and skipped, loads forwarded. */
 static int g_e2_n_shape, g_e2_n_skip, g_e2_n_fwd;
+/* Set around an op-call wrapper whose caller has already written the live TAG
+   values and the operands to the frame (a call site does that once for all its
+   arms), so the wrapper does not write them again. */
+static int g_e2_presynced;
 /* Set by a grouped emitter, so the dispatcher can check that an instruction the
    facts classed as a miss-exit was in fact emitted as one. */
 static int g_e2_miss_exit_seen;
@@ -3078,8 +3082,12 @@ static int emit_typed_opcall(
   (void)b;
 
   /* 1. R6 sync: every live TAG value to the frame before the call. */
-  fprintf(f, "    /* R6: sync live TAG values before the op call (a safepoint) */\n");
-  for (r = 0; r < fn->nregs; r++) {
+  if (!g_e2_presynced)
+    fprintf(
+        f,
+        "    /* R6: sync live TAG values before the op call (a safepoint) "
+        "*/\n");
+  for (r = 0; !g_e2_presynced && r < fn->nregs; r++) {
     Q2ValueId v;
     if (cur == NULL) break;
     v = cur[r];
@@ -3091,7 +3099,7 @@ static int emit_typed_opcall(
   (void)live;
 
   /* 2. Typed operands to the frame (the handler reads the register file). */
-  for (r = 0; r < role->nuse; r++) {
+  for (r = 0; !g_e2_presynced && r < role->nuse; r++) {
     Q2ValueId v = in->nuse > r ? in->use[r] : Q2_NO_VALUE;
     int reg;
     if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) continue;
@@ -3629,7 +3637,10 @@ static int emit_typed_call(
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     nb++;
   }
-  if (nb == 0) return 0;
+  /* No compiled callee to call directly is no reason to leave: the call is the
+     wrapper alone, which any callee satisfies. The wrapper needs the role. */
+  if (e2_roles[in->rop] == NULL || e2_roles[in->rop]->control != E2_CF_NONE)
+    return 0;
   cc = call_callee_off(in);
   th = call_this_off(in);
   off = dest_off(fn, in);
@@ -3640,7 +3651,7 @@ static int emit_typed_call(
   if (dv >= (Q2ValueId)t->nvalues) return 0;
   /* A TAG def is a plain local copy; a typed def needs the post-call tag guard. */
   if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
-      t->lb[dv] != E2_LB_F64)
+      t->lb[dv] != E2_LB_F64 && t->lb[dv] != E2_LB_BOOL)
     return 0;
   dreg = off / 16;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
@@ -3722,6 +3733,15 @@ static int emit_typed_call(
           "goto dx_%d;\n"
           "        i%u = JS_VALUE_GET_INT(_o);\n",
           in->next, (unsigned)dv);
+    } else if (t->lb[dv] == E2_LB_BOOL) {
+      e2_sweep_guard(f, "dx", in->next);
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, "
+          "0)) "
+          "goto dx_%d;\n"
+          "        b%u = JS_VALUE_GET_BOOL(_o);\n",
+          in->next, (unsigned)dv);
     } else {
       e2_sweep_guard(f, "dx", in->next);
       fprintf(
@@ -3737,9 +3757,18 @@ static int emit_typed_call(
     fprintf(f, "    }\n");
     fprintf(f, "#endif\n");
   }
-  /* No candidate matched: the call has NOT run, so hand off AT this pc. */
-  fprintf(f, "    E2_HANDOFF_NOTE(%d);\n", fi);
-  fprintf(f, "    return aot_g_%s(ctx, f, fr, %d);\n", hex, in->pc);
+  /* No candidate matched (or none was offered): the call has NOT run, so the
+     engine's own call handler does it, through the op-call wrapper. The live
+     values and the window are already in the frame. Any callee takes this path,
+     compiled or not, and the body continues. */
+  g_e2_presynced = 1;
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    fprintf(
+        stderr, "e2: call at pc %d: the wrapper declined after output\n",
+        in->pc);
+    abort();
+  }
+  g_e2_presynced = 0;
   fprintf(f, "    cd_%d: ;\n", in->pc);
   if (cur != NULL) cur[dreg] = dv;
   return 1;
