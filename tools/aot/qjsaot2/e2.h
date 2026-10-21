@@ -130,6 +130,10 @@ void e2_roles_check(void);
 /* The opcode's name, for diagnostics. */
 void e2_rop_name(uint16_t rop, char *out, size_t n);
 
+/* Print the hand-off histogram (which rop a spec block gave up at, weighted
+   by the profile) to the generator report. */
+void e2_handoff_report(FILE *f);
+
 /* --emit2-poison: generate the units with D12's dynamic register check. The
    unit must also be compiled with -DE2_POISON, which the poison run does. */
 void e2_set_poison(int on);

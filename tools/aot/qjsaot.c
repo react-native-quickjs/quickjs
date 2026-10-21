@@ -5417,6 +5417,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           present, g_nprof,
           all_ops ? 100.0 * (double)present_ops / (double)all_ops : 100.0);
     }
+    /* Which rop each spec block gave up at, weighted by the profile: the next
+       thing to lower, chosen by data. */
+    e2_handoff_report(stderr);
     /* Functions the speculative body refused as irreducible. */
     if (e2_irreducible)
       fprintf(

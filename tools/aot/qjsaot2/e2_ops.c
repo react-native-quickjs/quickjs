@@ -1991,6 +1991,56 @@ static int g_e2_ox[256];
 static Q2ValueId *g_e2_ox_cur[256];
 static int g_e2_ox_regs = 0;
 static int g_e2_ox_n = 0;
+/* Hand-off histogram: which rop a spec block gave up at, weighted by the profile's
+   count for that pc. One line per rop in the generator report, sorted by weight, so
+   the next thing to lower is chosen by data instead of found one at a time. */
+#define E2_HANDOFF_MAX 512
+typedef struct E2HandoffStat {
+  uint16_t rop;
+  unsigned long long weight;
+  int blocks;
+} E2HandoffStat;
+static E2HandoffStat g_e2_ho[E2_HANDOFF_MAX];
+static int g_e2_ho_n = 0;
+
+static void e2_handoff_note(const Q2Func *fn, const Q2Insn *in) {
+  int i;
+  if (in == NULL) return;
+  for (i = 0; i < g_e2_ho_n; i++) {
+    if (g_e2_ho[i].rop == in->rop) {
+      g_e2_ho[i].weight += qjs_aot_prof_pc_count(fn->g->digest, in->pc);
+      g_e2_ho[i].blocks++;
+      return;
+    }
+  }
+  if (g_e2_ho_n < E2_HANDOFF_MAX) {
+    g_e2_ho[g_e2_ho_n].rop = in->rop;
+    g_e2_ho[g_e2_ho_n].weight = qjs_aot_prof_pc_count(fn->g->digest, in->pc);
+    g_e2_ho[g_e2_ho_n].blocks = 1;
+    g_e2_ho_n++;
+  }
+}
+
+/* The report: `e2 handoff rop=<n> name=<..> weight=<..> blocks=<..>`, heaviest
+   first. */
+void e2_handoff_report(FILE *f) {
+  int i, j;
+  for (i = 0; i < g_e2_ho_n; i++)
+    for (j = i + 1; j < g_e2_ho_n; j++)
+      if (g_e2_ho[j].weight > g_e2_ho[i].weight) {
+        E2HandoffStat t = g_e2_ho[i];
+        g_e2_ho[i] = g_e2_ho[j];
+        g_e2_ho[j] = t;
+      }
+  for (i = 0; i < g_e2_ho_n; i++) {
+    char nm[64];
+    e2_rop_name(g_e2_ho[i].rop, nm, sizeof(nm));
+    fprintf(
+        f, "e2 handoff rop=%u name=%s weight=%llu blocks=%d\n",
+        (unsigned)g_e2_ho[i].rop, nm, g_e2_ho[i].weight, g_e2_ho[i].blocks);
+  }
+  g_e2_ho_n = 0;
+}
 /* Argument-guard exits: same treatment, but the sync set is empty -- the guard
    fires before anything is in a local, so the frame still holds what the caller
    wrote and the generic body's g_<pc> reloads the arguments itself. */
@@ -2641,6 +2691,107 @@ static int emit_typed_branch(
   return 1;
 }
 
+/* The D8 unary operations the spec body lowers.
+
+   `inc`/`dec` on an i32 local: the machine's `+ 1` / `- 1`, with the one value
+   that overflows (`INT32_MAX` / `INT32_MIN`) taking the deopt exit at this
+   instruction, so the generic body redoes it as a double. `neg` likewise
+   (`INT32_MIN` overflows; `-0` is a double and comes out of the f64 form).
+   `not` on a bool is a `!`, `bitnot` on an i32 is a `~`, neither can fail.
+   Returns 1 when it emitted the instruction. */
+static int emit_typed_unary(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi) {
+  Q2ValueId d, a;
+  int is_inc, is_dec, is_neg, is_not, is_bitnot;
+  (void)fi;
+
+  if (!have_types || t == NULL) return 0;
+  is_inc = in->rop == ROP_inc;
+  is_dec = in->rop == ROP_dec;
+  is_neg = in->rop == ROP_neg;
+  is_not = in->rop == ROP_not;
+  is_bitnot = 0;  /* bitwise not is a binary op (REG_BIN_NOT), not a unary rop */
+  if (!is_inc && !is_dec && !is_neg && !is_not) return 0;
+  if (in->ndef < 1 || in->nuse < 1) return 0;
+  d = in->def[0];
+  a = in->use[0];
+  if (d >= (Q2ValueId)t->nvalues || a >= (Q2ValueId)t->nvalues) return 0;
+  {
+    char dn[32], an[32];
+    int ld = fn->values[d].reg;
+    /* not: a bool in, a bool out. */
+    if (is_not) {
+      if (t->lb[a] != E2_LB_BOOL) return 0;
+      e2_local_name(dn, sizeof(dn), d);
+      e2_local_name(an, sizeof(an), a);
+      fprintf(f, "    %s = !%s;\n", dn, an);
+      if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+    if (is_bitnot) {
+      if (t->lb[a] != E2_LB_I32) return 0;
+      e2_local_name(dn, sizeof(dn), d);
+      e2_local_name(an, sizeof(an), a);
+      fprintf(f, "    %s = ~%s;\n", dn, an);
+      if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+    if (is_inc || is_dec) {
+      if (t->lb[a] != E2_LB_I32) return 0;
+      e2_local_name(dn, sizeof(dn), d);
+      e2_local_name(an, sizeof(an), a);
+      fprintf(
+          f,
+          "    if (__builtin_expect(%s != %s, 1)) { %s = %s %s 1; }\n", an,
+          is_inc ? "INT32_MAX" : "INT32_MIN", dn, an, is_inc ? "+" : "-");
+      fprintf(f, "    else { goto ox_%d; }\n", in->pc);
+      if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
+        Q2ValueId *snap =
+            malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+        if (snap) {
+          memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+          g_e2_ox[g_e2_ox_n] = in->pc;
+          g_e2_ox_cur[g_e2_ox_n] = snap;
+          g_e2_ox_n++;
+        }
+      }
+      if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+    /* neg: i32 overflows only on INT32_MIN; the f64 form cannot fail. */
+    if (t->lb[a] == E2_LB_I32) {
+      e2_local_name(dn, sizeof(dn), d);
+      e2_local_name(an, sizeof(an), a);
+      fprintf(
+          f, "    if (__builtin_expect(%s != INT32_MIN, 1)) { %s = -%s; }\n",
+          an, dn, an);
+      fprintf(f, "    else { goto ox_%d; }\n", in->pc);
+      if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
+        Q2ValueId *snap =
+            malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+        if (snap) {
+          memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+          g_e2_ox[g_e2_ox_n] = in->pc;
+          g_e2_ox_cur[g_e2_ox_n] = snap;
+          g_e2_ox_n++;
+        }
+      }
+      if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+    if (t->lb[a] == E2_LB_F64) {
+      e2_local_name(dn, sizeof(dn), d);
+      e2_local_name(an, sizeof(an), a);
+      fprintf(f, "    %s = -%s;\n", dn, an);
+      if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+  }
+  (void)hex;
+  return 0;
+}
+
 /* The speculative body (E8).
 
    Step 1 is the skeleton: the D4 switch-off counters, the S7 entry (which
@@ -2829,6 +2980,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (is_trivial(in) || in->rop == ROP_get_arg2) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
+      } else if (emit_typed_unary(
+                     f, fn, in, &types, cur, have_types, hex, fi)) {
+        /* lowered */
       } else if (have_types &&
                  emit_typed_arith(f, fn, in, &types, cur)) {
         /* lowered */
@@ -2846,6 +3000,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
          set is its live-before (live-out minus its defs, plus its uses). */
       uint64_t *lb =
           calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+      e2_handoff_note(fn, &fn->insns[lowered_to]);
       fprintf(f, "    /* exit at the first unlowered instruction */\n");
       if (lb != NULL) q2_live_before(fn, lowered_to, lb);
       e2_emit_exit(
@@ -2867,6 +3022,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
           e2_roles[fn->insns[last].rop]->control != E2_CF_NONE;
       if (set != NULL) q2_live_before(fn, last, set);
       if (is_term) {
+        e2_handoff_note(fn, &fn->insns[last]);
         fprintf(f, "    /* the terminator is 2b's: exit at its own pc */\n");
         e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1);
       } else {
