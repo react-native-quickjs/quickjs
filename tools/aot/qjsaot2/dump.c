@@ -58,6 +58,10 @@ void q2_dump(FILE *f, const Q2Func *fn) {
       const Q2Insn *in = &fn->insns[blk->first_insn + i];
       fprintf(
           f, "  %5d %-16s rop=%-4u def=", in->pc, q2_op_name(in->op), in->rop);
+        /* The SUB field: a branch's compare kind, an op's sub-operation. Without
+           it a `branch_cmp`'s sense is invisible, which cost a wrong theory. */
+        if (in->narg > 0 && in->arg[0].kind == 'b')
+          fprintf(f, "sub=%d ", (int)in->arg[0].val);
       if (in->ndef == 0) fputc('-', f);
       for (k = 0; k < in->ndef; k++)
         fprintf(

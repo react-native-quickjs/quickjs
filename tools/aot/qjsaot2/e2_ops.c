@@ -2724,7 +2724,8 @@ static int emit_typed_inc_branch(
   int bv, si_take, si_else;
   char cn[32], cn2[32], bn[32];
 
-  if (in->rop != ROP_inc_branch_lt_s) return 0;
+  /* Both forms of the counter test: `_s` (short offset) and the register form. */
+  if (in->rop != ROP_inc_branch_lt_s && in->rop != ROP_inc_branch_lt) return 0;
   if (role == NULL || role->control != E2_CF_BRANCH) return 0;
   if (!have_types || t == NULL || blk->nsucc < 2) return 0;
   if (in->ndef < 1 || in->nuse < 2) return 0;
@@ -3051,10 +3052,23 @@ static int emit_typed_branch(
   sub = (int)in->arg[0].val;
   inv = (sub & REG_CMP_INVERT) != 0;
   base = sub & ~REG_CMP_INVERT;
-  if (base < REG_BIN_LT || base > REG_BIN_GTE) return 0;
+  /* Ordering compares, equalities, and the BIT-TEST kinds: `if (i & 1)` fuses
+     the `&` and the truthiness test into the branch, so its sub is a bitwise
+     kind. Declining those kept every `if (i & 1)` off the spec path. */
+  {
+    int is_order = base >= REG_BIN_LT && base <= REG_BIN_GTE;
+    int is_eq = base == REG_BIN_EQ || base == REG_BIN_NEQ ||
+                base == REG_BIN_STRICT_EQ || base == REG_BIN_STRICT_NEQ;
+    int is_bit = base == REG_BIN_AND || base == REG_BIN_OR ||
+                 base == REG_BIN_XOR;
+    if (!is_order && !is_eq && !is_bit) return 0;
+  }
   av = in->use[0];
   bv = in->use[1];
-  if (t->lb[av] != E2_LB_I32 || t->lb[bv] != E2_LB_I32) return 0;
+  if (av >= (Q2ValueId)t->nvalues || bv >= (Q2ValueId)t->nvalues) return 0;
+  if ((t->lb[av] != E2_LB_I32 && t->lb[av] != E2_LB_F64) ||
+      (t->lb[bv] != E2_LB_I32 && t->lb[bv] != E2_LB_F64))
+    return 0;
   /* succ[0] is where the branch GOES when taken; succ[1] is the fall-through. */
   si_take = 0;
   si_else = 1;
@@ -3062,22 +3076,50 @@ static int emit_typed_branch(
   sb_else = blk->succ_block[si_else];
   if (sb_take < 0 || sb_take >= fn->nblocks) return 0;
 
-  e2_local_name(an, sizeof(an), av);
-  e2_local_name(bn, sizeof(bn), bv);
-  /* `if (a op b)` is the TAKEN condition when not inverted; when inverted the
-     taken arm is on the negated result. */
-  if (!inv) {
-    fprintf(f, "    if (%s %s %s) {\n", an, ops[base - REG_BIN_LT], bn);
+  /* The operand expressions, converted to the shared rep: f64 when either side
+     is a double, else i32. A bit-test on f64 goes through q2_toi32 first. */
+  {
+    int want_f64 = t->lb[av] == E2_LB_F64 || t->lb[bv] == E2_LB_F64;
+    char xa[48], xb[48];
+    if (want_f64 && (base == REG_BIN_AND || base == REG_BIN_OR ||
+                     base == REG_BIN_XOR)) {
+      snprintf(xa, sizeof(xa), "q2_toi32(%s%u)", t->lb[av] == E2_LB_F64 ? "d" : "i", (unsigned)av);
+      snprintf(xb, sizeof(xb), "q2_toi32(%s%u)", t->lb[bv] == E2_LB_F64 ? "d" : "i", (unsigned)bv);
+      want_f64 = 0;
+    } else if (want_f64) {
+      snprintf(xa, sizeof(xa), "%s%u", t->lb[av] == E2_LB_F64 ? "d" : "(double)i", (unsigned)av);
+      snprintf(xb, sizeof(xb), "%s%u", t->lb[bv] == E2_LB_F64 ? "d" : "(double)i", (unsigned)bv);
+    } else {
+      snprintf(xa, sizeof(xa), "i%u", (unsigned)av);
+      snprintf(xb, sizeof(xb), "i%u", (unsigned)bv);
+    }
+    {
+      const char *cop;
+      switch (base) {
+        case REG_BIN_LT: cop = "<"; break;
+        case REG_BIN_LTE: cop = "<="; break;
+        case REG_BIN_GT: cop = ">"; break;
+        case REG_BIN_GTE: cop = ">="; break;
+        case REG_BIN_EQ: cop = "=="; break;
+        case REG_BIN_NEQ: cop = "!="; break;
+        case REG_BIN_STRICT_EQ: cop = "=="; break;
+        case REG_BIN_STRICT_NEQ: cop = "!="; break;
+        default: cop = "!="; break;  /* bit-test: (a & b) != 0 */
+      }
+      if (base == REG_BIN_AND)
+        fprintf(f, "    if (%s((%s & %s) != 0)) {\n", inv ? "!" : "", xa, xb);
+      else if (base == REG_BIN_OR)
+        fprintf(f, "    if (%s((%s | %s) != 0)) {\n", inv ? "!" : "", xa, xb);
+      else if (base == REG_BIN_XOR)
+        fprintf(f, "    if (%s((%s ^ %s) != 0)) {\n", inv ? "!" : "", xa, xb);
+      else
+        fprintf(f, "    if (%s(%s %s %s)) {\n", inv ? "!" : "", xa, cop, xb);
+    }
     e2_emit_arm(f, fn, b, si_take, cur, hex);
     fprintf(f, "    } else {\n");
     e2_emit_arm(f, fn, b, si_else, cur, hex);
     fprintf(f, "    }\n");
-  } else {
-    fprintf(f, "    if (!(%s %s %s)) {\n", an, ops[base - REG_BIN_LT], bn);
-    e2_emit_arm(f, fn, b, si_take, cur, hex);
-    fprintf(f, "    } else {\n");
-    e2_emit_arm(f, fn, b, si_else, cur, hex);
-    fprintf(f, "    }\n");
+    (void)an; (void)bn; (void)ops;
   }
   (void)sb_else;
   return 1;
