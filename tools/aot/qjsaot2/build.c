@@ -39,6 +39,7 @@ static void q2_build_rpo(Q2Func *f);
 /* The driver's profile lookup (qjsaot.c): the sorted `P` records of a function
    digest, or NULL. */
 const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n);
+const ProfPc *qjs_aot_prof_cres(const uint8_t dg[16], int *n);
 const Q2ProfReg *qjs_aot_prof_regs(const uint8_t dg[16], int *n);
 
 /* The profile's type set mapped to the IR's. Anything that is not a number
@@ -1861,6 +1862,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     int n = 0;
     f->prof = qjs_aot_prof_pcs(g->digest, &n);
     f->nprof = n;
+    f->cres = qjs_aot_prof_cres(g->digest, &n);
+    f->ncres = n;
     /* The per-register `R` records, kept for the per-destination lookup. A
        register with no record is simply absent: nprof_regs counts only
        registers the profiler actually saw. */

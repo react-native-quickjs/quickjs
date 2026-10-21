@@ -35,7 +35,9 @@
  *
  * Three profile-lookup rules are bugs the old emitter had and this pass fixes:
  *
- *   1. a call's result is recorded at the pc *after* the call, not at the call;
+ *   1. a call's result is its own call-result record (the `K` line), keyed by
+ *      the pc after the call; the `P` record at that pc is the next
+ *      instruction's, so it is never read for a call;
  *   2. `inc`/`dec`/`post_inc`/`post_dec` have no record of their own, so their
  *      representation follows their operand;
  *   3. a `get_field_chain`'s first link has no record, only its second has one.
@@ -106,14 +108,19 @@ static int prof_at(const Q2Func *fn, int pc, unsigned *types) {
   return 0;
 }
 
-/* Whether the instruction at `in`'s fall-through pc defines a value, so the
-   profile record at that pc belongs to it. */
-static int next_defines(const Q2Func *fn, const Q2Insn *in) {
-  int lo = 0, hi = fn->ninsns - 1;
+/* The call-result (`K`) record of the call that ends at `pc`: what the site's
+   calls returned, believed only when every call that entered it returned a
+   recorded value. A site with no record stays untyped. */
+static int cres_at(const Q2Func *fn, int pc, unsigned *types) {
+  int lo = 0, hi = fn->ncres - 1;
+  if (fn->cres == NULL) return 0;
   while (lo <= hi) {
     int mid = (lo + hi) / 2;
-    if (fn->insns[mid].pc == in->next) return fn->insns[mid].ndef > 0;
-    if (fn->insns[mid].pc < in->next)
+    if (fn->cres[mid].pc == pc) {
+      *types = fn->cres[mid].types;
+      return 1;
+    }
+    if (fn->cres[mid].pc < pc)
       lo = mid + 1;
     else
       hi = mid - 1;
@@ -840,15 +847,15 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
         uint32_t t = 0;
         int has = 0;
         if (in->op == Q2_OP_CALL) {
-          /* Rule 1: a call's result is recorded at the pc after the call --
-             but that pc is also the NEXT instruction's own, and when that
-             instruction defines a value the record there is its, not the
-             call's (box2d: a `const 0` after a call that returns undefined
-             typed the call i32, and its guard failed on every entry). The
-             record keeps no source position to tell them apart, so a call
-             followed by a defining instruction has no record. */
+          /* Rule 1: a call's result comes from its own call-result record,
+             keyed by the pc just past the call. The P record at that pc is the
+             NEXT instruction's own and says nothing about the call (box2d: a
+             `const 0` after a call that returns undefined typed the call i32,
+             and its guard failed on every entry). No record -- an old profile,
+             a call that threw, a path the profiler does not see -- leaves the
+             result boxed. */
           unsigned types = 0;
-          has = !next_defines(fn, in) && prof_at(fn, in->next, &types);
+          has = cres_at(fn, in->next, &types);
           t = has ? prof_to_q2(types) : 0;
         } else if (chain_first_link(in, d)) {
           /* Rule 3: a chain's first link has no record. */

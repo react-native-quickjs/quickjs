@@ -44,6 +44,9 @@ typedef struct ProfPc {
      test. */
   uint8_t elem;
   double num_min, num_max;
+  /* A call-result (`K`) record only: the calls that entered the site and the
+     returns recorded for it. Zero in a `P` record. */
+  unsigned calls, results;
 } ProfPc;
 
 /* One register's `R` record: the merged PT_* set over the whole function.

@@ -203,6 +203,10 @@ typedef struct {
   int ncallsites, capcallsites;
   ProfPc *pcs;
   int npcs, cappcs;
+  /* The `K` records: what each call site returned, keyed by the pc just past
+     the call. Only complete records survive loading (see parse_profile). */
+  ProfPc *cres;
+  int ncres, capcres;
   ProfSite *sites;
   int nsites, capsites;
   ProfUnused *unused;
@@ -221,6 +225,9 @@ static int g_nprof = 0;
 /* Whether the profile's header said `thr=1`, i.e. it came from the threaded
    build whose `R` records are complete. See parse_profile. */
 static int g_prof_thr = 0;
+/* Whether the header said `callres=1`: the profile records call results on
+   every instrumented return path. Without it no `K` record is believed. */
+static int g_prof_callres = 0;
 static const ProfEntry *g_cur_prof = NULL;
 /* Call-binding site ids (the engine's per-runtime binding array is indexed by
    one). A deopt site has its own id space, handed out by `g_deopt_site_next`,
@@ -451,14 +458,18 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         const char *tp = strstr(line, "thr=");
         g_prof_thr = tp && strtoul(tp + 4, NULL, 10) != 0;
       }
+      {
+        const char *cp = strstr(line, "callres=");
+        g_prof_callres = cp && strtoul(cp + 8, NULL, 10) != 0;
+      }
     }
   }
   while (fgets(line, sizeof(line), f)) {
     uint8_t dg[16];
     ProfEntry *e;
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
-         line[0] != 'P' && line[0] != 'S' && line[0] != 'U' &&
-         line[0] != 'T') ||
+         line[0] != 'P' && line[0] != 'S' && line[0] != 'U' && line[0] != 'T' &&
+         line[0] != 'K') ||
         line[1] != ' ')
       continue;
     if (hex_to_bytes16(line + 2, dg) < 0) continue;
@@ -636,6 +647,51 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           e->pcs[k].has_num = 1;
         }
       }
+    } else if (line[0] == 'K') {
+      /* K <hex> pc=<n> types=<a|b> [num=<min>..<max> frac=.. negzero=..]
+         calls=<n> results=<n>; merge by pc. */
+      char *p = strstr(line + 2, "pc=");
+      char *q = strstr(line + 2, "types=");
+      char *cl = strstr(line + 2, "calls=");
+      char *rs = strstr(line + 2, "results=");
+      if (p && q && cl && rs) {
+        int pc = (int)strtol(p + 3, NULL, 10);
+        const char *nm = strstr(line + 2, "num=");
+        const char *fm = strstr(line + 2, "frac=");
+        const char *nz = strstr(line + 2, "negzero=");
+        double nmin = 0, nmax = 0;
+        int k;
+        if (nm) sscanf(nm + 4, "%lf..%lf", &nmin, &nmax);
+        for (k = 0; k < e->ncres; k++)
+          if (e->cres[k].pc == pc) break;
+        if (k == e->ncres) {
+          if (e->ncres == e->capcres) {
+            ProfPc *np;
+            e->capcres = e->capcres ? e->capcres * 2 : 16;
+            np = realloc(e->cres, sizeof(*np) * (size_t)e->capcres);
+            if (!np) return NULL;
+            e->cres = np;
+          }
+          e->ncres++;
+          memset(&e->cres[k], 0, sizeof(e->cres[k]));
+          e->cres[k].pc = pc;
+        }
+        e->cres[k].types |= prof_parse_types(q + 6);
+        e->cres[k].calls += (unsigned)strtoul(cl + 6, NULL, 10);
+        e->cres[k].results += (unsigned)strtoul(rs + 8, NULL, 10);
+        if (fm) e->cres[k].frac |= (strtol(fm + 5, NULL, 10) != 0);
+        if (nz) e->cres[k].negzero |= (strtol(nz + 8, NULL, 10) != 0);
+        if (nm) {
+          if (!e->cres[k].has_num) {
+            e->cres[k].num_min = nmin;
+            e->cres[k].num_max = nmax;
+          } else {
+            if (nmin < e->cres[k].num_min) e->cres[k].num_min = nmin;
+            if (nmax > e->cres[k].num_max) e->cres[k].num_max = nmax;
+          }
+          e->cres[k].has_num = 1;
+        }
+      }
     } else if (line[0] == 'S') {
       /* S <hex> site=<k> count=<n> src=.. shapes=<m> shape0=0x.. hits=..
          [shape1=..]. The shapes are process addresses; only equality across
@@ -762,6 +818,22 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
       qsort(
           arr[i].counts, (size_t)arr[i].ncounts, sizeof(arr[i].counts[0]),
           cmp_profcount);
+    /* A call site's result record is believed only when the header says the
+       profile records them and every call that entered the site returned a
+       recorded value. A call that threw, or one that returned through a path
+       the profiler does not see, leaves `results` short, and the site stays
+       untyped. */
+    {
+      int k, m = 0;
+      for (k = 0; k < arr[i].ncres; k++) {
+        const ProfPc *c = &arr[i].cres[k];
+        if (g_prof_callres && c->calls > 0 && c->results == c->calls)
+          arr[i].cres[m++] = *c;
+      }
+      arr[i].ncres = m;
+      if (m > 1)
+        qsort(arr[i].cres, (size_t)m, sizeof(arr[i].cres[0]), cmp_profpc);
+    }
   }
   *pn = n;
   return arr;
@@ -3174,6 +3246,18 @@ const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
   if (!e) return NULL;
   *n = e->npcs;
   return e->pcs;
+}
+
+/* The function's complete call-result (`K`) records, sorted by pc, or NULL. The
+   pc is the one just past the call, so it is the call instruction's `next`. */
+const ProfPc *qjs_aot_prof_cres(const uint8_t dg[16], int *n) {
+  const ProfEntry *e;
+  *n = 0;
+  if (!g_prof) return NULL;
+  e = prof_entry(g_prof, g_nprof, dg);
+  if (!e) return NULL;
+  *n = e->ncres;
+  return e->cres;
 }
 
 /* The function's `R` records: one merged type set per register, over the whole
