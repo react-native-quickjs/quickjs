@@ -3641,8 +3641,10 @@ static void e2_cmp_expr(
     int f64rep, int tag_arm);
 /* A speculative-body `load_this` ("r", no operands): `this` comes from the
    function's own this-slot through `qjs_aot_load_this`, exactly as the generic
-   emitter does. `_own` says whether the value is owned (then it must be stored with
-   qjs_aot_set_reg_p) or borrowed (a plain store). */
+   emitter does. `_own` says whether the value is owned (a sloppy-mode function's
+   boxed primitive): then the frame slot adopts it with qjs_aot_set_reg_p, as the
+   generic body does, and the local is a borrowed view of a value the frame keeps
+   alive -- like every other TAG local. A borrowed value is a plain store. */
 static int emit_typed_load_this(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
     int have_types) {
@@ -3661,8 +3663,12 @@ static int emit_typed_load_this(
   fprintf(f, "    { JSValue _t;\n");
   fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
   fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
+  fprintf(
+      f,
+      "      if (_own) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n"
+      "      else AOT_SET_B(ctx, fr, %d, _t);\n",
+      ld * 16, ld * 16);
   fprintf(f, "      v%u = _t;\n", (unsigned)dv);
-  fprintf(f, "      (void)_own;\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[ld] = dv;
   return 1;
@@ -5025,8 +5031,7 @@ static int e2_dispatch_rop(
 
     /* -- this, and strict equality as a value -- */
     case ROP_load_this:
-      /* DISABLED: see the note on emit_typed_load_this. */
-      return 0;
+      return emit_typed_load_this(f, fn, in, t, cur, have_types);
     case ROP_strict_eq:
     case ROP_strict_neq:
       return emit_typed_strict_eq(f, fn, in, t, cur, have_types, hex, fi, b);
