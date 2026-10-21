@@ -2205,10 +2205,25 @@ static int emit_typed_arith(
   a = in->use[0];
   b = in->use[1];
   if (d >= (Q2ValueId)t->nvalues) return 0;
-  if (t->lb[d] != E2_LB_I32) return 0;
-  if (t->lb[a] != E2_LB_I32 || t->lb[b] != E2_LB_I32) return 0;
   ld = fn->values[d].reg;
   op = in->rop == ROP_add ? "+" : (in->rop == ROP_sub ? "-" : "*");
+  /* (a) The f64 form: the result is a double, so the machine's op is exact and
+     cannot overflow -- no exit. An i32 operand converts with (double), which is
+     what the interpreter does for a mixed pair. */
+  if (t->lb[d] == E2_LB_F64 &&
+      (t->lb[a] == E2_LB_F64 || t->lb[a] == E2_LB_I32) &&
+      (t->lb[b] == E2_LB_F64 || t->lb[b] == E2_LB_I32)) {
+    char an[48], bn[48];
+    if (t->lb[a] == E2_LB_F64) snprintf(an, sizeof(an), "d%u", (unsigned)a);
+    else snprintf(an, sizeof(an), "(double)i%u", (unsigned)a);
+    if (t->lb[b] == E2_LB_F64) snprintf(bn, sizeof(bn), "d%u", (unsigned)b);
+    else snprintf(bn, sizeof(bn), "(double)i%u", (unsigned)b);
+    fprintf(f, "    d%u = %s %s %s;\n", (unsigned)d, an, op, bn);
+    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+    return 1;
+  }
+  if (t->lb[d] != E2_LB_I32) return 0;
+  if (t->lb[a] != E2_LB_I32 || t->lb[b] != E2_LB_I32) return 0;
   /* add/sub/mul in int64, then check the result fits: one widening op and one
      compare, and the compare is the exit condition the analysis recorded. */
   fprintf(
@@ -2759,10 +2774,28 @@ static int emit_typed_arith_imm(
   if (!have_imm) return 0;
   if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL) return 0;
   d = in->def[0];
-  if (d >= (Q2ValueId)t->nvalues || t->lb[d] != E2_LB_I32) return 0;
+  if (d >= (Q2ValueId)t->nvalues) return 0;
   if (in->nuse < 1) return 0;
   a = in->use[0];
-  if (a >= (Q2ValueId)t->nvalues || t->lb[a] != E2_LB_I32) return 0;
+  if (a >= (Q2ValueId)t->nvalues) return 0;
+  /* The f64 form (no exit: doubles cannot overflow). */
+  if (t->lb[d] == E2_LB_F64 &&
+      (t->lb[a] == E2_LB_F64 || t->lb[a] == E2_LB_I32)) {
+    const char *fop = sub == REG_BIN_ADD ? "+"
+                      : sub == REG_BIN_SUB ? "-"
+                                           : "*";
+    ld = fn->values[d].reg;
+    if (t->lb[a] == E2_LB_F64)
+      fprintf(f, "    d%u = d%u %s (double)%d;\n", (unsigned)d, (unsigned)a,
+              fop, imm);
+    else
+      fprintf(f, "    d%u = (double)i%u %s (double)%d;\n", (unsigned)d,
+              (unsigned)a, fop, imm);
+    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+    return 1;
+  }
+  if (t->lb[d] != E2_LB_I32) return 0;
+  if (t->lb[a] != E2_LB_I32) return 0;
   op = sub == REG_BIN_ADD ? "+" : (sub == REG_BIN_SUB ? "-" : "*");
   ld = fn->values[d].reg;
   fprintf(
