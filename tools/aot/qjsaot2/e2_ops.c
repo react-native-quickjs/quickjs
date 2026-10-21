@@ -2901,6 +2901,175 @@ static int emit_typed_opcall(
   return 1;
 }
 
+/* A speculative-body ARRAY LENGTH: `get_length` ("rr": dest, receiver). The hit
+   helper is `q2_array_length`, which returns a double in an int range; the result is
+   an i32 local (that is the only shape the analysis uses for it). A miss goes to the
+   wrapper -- `.length` on a non-array can run a getter. */
+static int emit_typed_length(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId dv, rv;
+  int dreg, rreg;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_get_length) return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->ndef < 1 || in->nuse < 1) return 0;
+  dv = in->def[0];
+  rv = in->use[0];
+  if (dv >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[rv] != E2_LB_TAG || t->lb[dv] != E2_LB_I32) return 0;
+  dreg = fn->values[dv].reg;
+  rreg = fn->values[rv].reg;
+  if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
+
+  fprintf(f, "    { double _len;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_array_length(v%u, &_len), 1)) {\n",
+      (unsigned)rv);
+  fprintf(f, "        i%u = (int32_t)_len;\n", (unsigned)dv);
+  fprintf(f, "      } else {\n");
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", rreg * 16, (unsigned)rv);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  return 1;
+}
+
+/* A speculative-body ELEMENT READ: `get_element` ("rrr": dest, array, key). The
+   SPEC body does NOT open the generic body's element region -- a region caches the
+   array's storage and count for a run of accesses, and a spec block has no place to
+   drop it. So this uses the plain `q2_elem_hit`, which revalidates per access.
+   The array must be a TAG local; an i32 key is packed for the helper, a TAG key
+   declines (it would need ToPropertyKey, i.e. the wrapper). */
+static int emit_typed_elem_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId dv, av, kv;
+  int dreg, areg, kreg;
+  char kb[48];
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_get_element) return 0;
+  if (role == NULL || role->control != E2_CF_NONE || role->nuse != 2) return 0;
+  if (in->ndef < 1 || in->nuse < 2) return 0;
+  dv = in->def[0];
+  av = in->use[0];
+  kv = in->use[1];
+  if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
+      kv >= (Q2ValueId)t->nvalues)
+    return 0;
+  if (t->lb[av] != E2_LB_TAG) return 0;
+  if (t->lb[kv] == E2_LB_I32)
+    snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
+  else
+    return 0;  /* a TAG key needs ToPropertyKey: the wrapper's job */
+  dreg = fn->values[dv].reg;
+  areg = fn->values[av].reg;
+  kreg = fn->values[kv].reg;
+  if (dreg < 0 || dreg >= fn->nregs || areg < 0 || areg >= fn->nregs ||
+      kreg < 0 || kreg >= fn->nregs)
+    return 0;
+
+  fprintf(f, "    { JSValue _e;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_elem_hit(v%u, %s, &_e), 1)) {\n",
+      (unsigned)av, kb);
+  if (t->lb[dv] == E2_LB_TAG) {
+    fprintf(f, "        v%u = _e;\n", (unsigned)dv);
+  } else {
+    /* Raw result to the frame first, so a guard miss leaves the op's result where
+       the generic body will look for it. */
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
+    if (t->lb[dv] == E2_LB_I32)
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT, 0)) "
+          "goto dx_%d;\n"
+          "        i%u = JS_VALUE_GET_INT(_e);\n",
+          in->next, (unsigned)dv);
+    else if (t->lb[dv] == E2_LB_F64)
+      fprintf(
+          f,
+          "        if (JS_VALUE_GET_TAG(_e) == JS_TAG_INT) d%u = "
+          "(double)JS_VALUE_GET_INT(_e);\n"
+          "        else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = "
+          "JS_VALUE_GET_FLOAT64(_e);\n"
+          "        else goto dx_%d;\n",
+          (unsigned)dv, (unsigned)dv, in->next);
+    else
+      return 0;
+  }
+  fprintf(f, "      } else {\n");
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", areg * 16, (unsigned)av);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", kreg * 16, kb);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  return 1;
+}
+
+/* A speculative-body ELEMENT WRITE: `put_element` / `put_element_xfer` ("rrr":
+   array, key, value). Under DRC the xfer form is the same store. */
+static int emit_typed_elem_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId av, kv, vv;
+  int areg, kreg, vreg;
+  char kb[48], vb[48];
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_put_element && in->rop != ROP_put_element_xfer) return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->nuse < 3) return 0;
+  av = in->use[0];
+  kv = in->use[1];
+  vv = in->use[2];
+  if (av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues ||
+      vv >= (Q2ValueId)t->nvalues)
+    return 0;
+  if (t->lb[av] != E2_LB_TAG) return 0;
+  if (t->lb[kv] == E2_LB_I32)
+    snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
+  else
+    return 0;
+  if (t->lb[vv] == E2_LB_I32)
+    snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)vv);
+  else if (t->lb[vv] == E2_LB_F64)
+    snprintf(vb, sizeof(vb), "__JS_NewFloat64(d%u)", (unsigned)vv);
+  else if (t->lb[vv] == E2_LB_BOOL)
+    snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
+  else
+    snprintf(vb, sizeof(vb), "v%u", (unsigned)vv);
+  areg = fn->values[av].reg;
+  kreg = fn->values[kv].reg;
+  vreg = fn->values[vv].reg;
+  if (areg < 0 || areg >= fn->nregs || kreg < 0 || kreg >= fn->nregs ||
+      vreg < 0 || vreg >= fn->nregs)
+    return 0;
+
+  fprintf(f, "    {\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_elem_put(v%u, %s, %s), 1)) {\n",
+      (unsigned)av, kb, vb);
+  fprintf(f, "      } else {\n");
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", areg * 16, (unsigned)av);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", kreg * 16, kb);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", vreg * 16, vb);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  return 1;
+}
+
 /* A speculative-body `this` FIELD READ: `get_this_field` / `get_this_field2`
    ("rras", but BOTH register operands are destinations -- def[0] is the read and
    def[1] the receiver -- so there is no use to take a receiver from). `this` comes
@@ -4266,6 +4435,15 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
                  emit_typed_arith(f, fn, in, &types, cur)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_field_read(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_length(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_elem_read(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_elem_write(
                      f, fn, in, &types, cur, have_types, hex, fi, b)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_this_field(
