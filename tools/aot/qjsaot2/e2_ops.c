@@ -3511,6 +3511,8 @@ static int emit_typed_fused(
   const E2Role *role = e2_roles[in->rop];
   Q2ValueId dv, xv, yv, cv;
   int is_add, ld, ldm;
+  /* add_mul / sub_mul: da = c <op> dm; mul_add / mul_sub: da = dm <op> c. */
+  int c_first = in->rop == ROP_add_mul || in->rop == ROP_sub_mul;
   char op[2];
 
   if (!have_types || t == NULL) return 0;
@@ -3568,7 +3570,10 @@ static int emit_typed_fused(
         if (t->lb[dv] == E2_LB_F64) snprintf(mb, sizeof(mb), "d%u", (unsigned)dv);
         else snprintf(mb, sizeof(mb), "(double)i%u", (unsigned)dv);
         fprintf(f, "    %s = %s * %s;\n", mb, xb, yb);
-        fprintf(f, "    d%u = %s %s %s;\n", (unsigned)rv, cb, op, mb);
+        if (c_first)
+          fprintf(f, "    d%u = %s %s %s;\n", (unsigned)rv, cb, op, mb);
+        else
+          fprintf(f, "    d%u = %s %s %s;\n", (unsigned)rv, mb, op, cb);
       }
     } else if (t->lb[xv] == E2_LB_I32 && t->lb[yv] == E2_LB_I32 &&
                t->lb[cv] == E2_LB_I32 && t->lb[dv] == E2_LB_I32 &&
@@ -3592,8 +3597,8 @@ static int emit_typed_fused(
           "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
           "goto ox_%d;\n"
           "      i%u = (int32_t)_t; }\n",
-          is_add ? cv : cv, is_add ? "+" : "-", (unsigned)dv, in->pc,
-          (unsigned)rv);
+          (unsigned)(c_first ? cv : dv), is_add ? "+" : "-",
+          (unsigned)(c_first ? dv : cv), in->pc, (unsigned)rv);
     } else {
       return 0;
     }
