@@ -5315,6 +5315,19 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
            function ever completed on the spec path. */
         fprintf(f, "    /* fall through to s_%d */\n",
                 fn->blocks[blk->succ_block[0]].start_pc);
+        /* The arm must target the SAME block the comment named. `b` is a block
+           index (see the loop head); passing an RPO position here silently jumped
+           to another block -- the bug that made bnpFromString return early and broke
+           crypto's RSA. An abort here is worth more than a wrong unit. */
+        if (&fn->blocks[b] != blk) {
+          fprintf(
+              stderr,
+              "e2: fall-through arm: b=%d is not the block just lowered "
+              "(start_pc %d); the RPO position and the block index have been "
+              "conflated\n",
+              b, blk->start_pc);
+          abort();
+        }
         e2_emit_arm(f, fn, b, 0, cur, hex);
       } else {
         const uint64_t *lo = q2_live_out(fn, last);
