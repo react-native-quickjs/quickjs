@@ -2555,25 +2555,30 @@ static int emit_typed_inc_branch(
     Q2ValueId *cur, int have_types, char hex[33], int fi) {
   const E2Role *role = e2_roles[in->rop];
   const Q2Block *blk = &fn->blocks[b];
-  Q2ValueId dv;
+  Q2ValueId dv, av;
   int bv, si_take, si_else;
-  char cn[32], bn[32];
+  char cn[32], cn2[32], bn[32];
 
   if (in->rop != ROP_inc_branch_lt_s) return 0;
   if (role == NULL || role->control != E2_CF_BRANCH) return 0;
   if (!have_types || t == NULL || blk->nsucc < 2) return 0;
   if (in->ndef < 1 || in->nuse < 2) return 0;
   dv = in->def[0];
+  /* The counter's PREVIOUS value is use[0] -- the block parameter that carries it
+     round the loop. def[0] is the NEW value. Reading def as the source emitted
+     `i5 = i5 + 1` on an uninitialised local (R5: a def is not a use). */
+  av = in->use[0];
   bv = in->use[1];
   if (t->lb[dv] != E2_LB_I32 || t->lb[bv] != E2_LB_I32) return 0;
   e2_local_name(cn, sizeof(cn), dv);
+  e2_local_name(cn2, sizeof(cn2), av);
   e2_local_name(bn, sizeof(bn), bv);
   /* succ[0] is the branch target: taken while the incremented counter is still
      below the bound. */
   si_take = 0;
   si_else = 1;
-  fprintf(f, "    if (__builtin_expect(%s != INT32_MAX, 1)) {\n", cn);
-  fprintf(f, "      %s = %s + 1;\n", cn, cn);
+  fprintf(f, "    if (__builtin_expect(%s != INT32_MAX, 1)) {\n", cn2);
+  fprintf(f, "      %s = %s + 1;\n", cn, cn2);
   fprintf(f, "    } else {\n");
   /* The counter would overflow: exit at this instruction's own pc, before the
      increment, so the generic body redoes it as a double. */
@@ -3085,7 +3090,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         }
         break;
       }
-      if (is_trivial(in) || in->rop == ROP_get_arg2) {
+      if (is_trivial(in) || in->rop == ROP_get_arg ||
+          in->rop == ROP_get_arg2) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
       } else if (emit_typed_arith_imm(f, fn, in, &types, cur, have_types)) {
