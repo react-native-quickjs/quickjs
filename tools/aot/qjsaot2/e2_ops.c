@@ -5060,6 +5060,30 @@ static int emit_typed_branch(
   sub = (int)in->arg[0].val;
   inv = (sub & REG_CMP_INVERT) != 0;
   base = sub & ~REG_CMP_INVERT;
+  /* The fused strict compare against undefined: the first operand's tag is the
+     whole test (the handler's `take = (tag == UNDEFINED) == (sub == IS_UNDEF)`).
+     A typed operand is a number or a bool, never undefined, so the branch is
+     constant for it. */
+  if (base == REG_BIN_IS_UNDEF || base == REG_BIN_IS_NOT_UNDEF) {
+    Q2ValueId uv = in->use[0];
+    char ex[96];
+    if (blk->nsucc < 2 || !have_types || t == NULL) return 0;
+    if (uv >= (Q2ValueId)t->nvalues) return 0;
+    sb_take = blk->succ_block[0];
+    if (sb_take < 0 || sb_take >= fn->nblocks) return 0;
+    if (t->lb[uv] == E2_LB_TAG)
+      snprintf(
+          ex, sizeof(ex), "(JS_VALUE_GET_TAG(v%u) == JS_TAG_UNDEFINED) == %d",
+          (unsigned)uv, base == REG_BIN_IS_UNDEF);
+    else
+      snprintf(ex, sizeof(ex), "%d", base != REG_BIN_IS_UNDEF);
+    fprintf(f, "    if (%s) {\n", ex);
+    e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+    fprintf(f, "    } else {\n");
+    e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+    fprintf(f, "    }\n");
+    return 1;
+  }
   /* Ordering compares, equalities, and the BIT-TEST kinds: `if (i & 1)` fuses
      the `&` and the truthiness test into the branch, so its sub is a bitwise
      kind. Declining those kept every `if (i & 1)` off the spec path. */
