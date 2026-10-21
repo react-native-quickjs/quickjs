@@ -2657,6 +2657,54 @@ static void e2_emit_arm(
   fprintf(f, "      goto s_%d;\n", fn->blocks[sb].start_pc);
 }
 
+/* The i32 bitwise and shift group: `bitand`/`bitor`/`bitxor`/`shl`/`sar`/`shr`.
+   A typed f64 operand is converted with ToInt32 first (q2_toi32, total, no exit);
+   a typed i32 operand is used as is. The result is always i32, which is what the
+   interpreter produces. `shr` is the logical shift, so it needs `(uint32_t)`
+   operands to fill with zeros rather than sign bits. */
+static int emit_typed_bitwise(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  const char *op;
+  Q2ValueId d, a, b;
+  int ld;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->ndef < 1 || in->nuse < 2) return 0;
+  d = in->def[0];
+  a = in->use[0];
+  b = in->use[1];
+  if (d >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[d] != E2_LB_I32) return 0;
+  switch (in->rop) {
+    case ROP_bitand: op = "&"; break;
+    case ROP_bitor: op = "|"; break;
+    case ROP_bitxor: op = "^"; break;
+    case ROP_shl: op = "<<"; break;
+    case ROP_sar: op = ">>"; break;
+    case ROP_shr: op = NULL; break;  /* logical: needs the unsigned cast */
+    default: return 0;
+  }
+  if (t->lb[a] != E2_LB_I32 && t->lb[a] != E2_LB_F64) return 0;
+  if (t->lb[b] != E2_LB_I32 && t->lb[b] != E2_LB_F64) return 0;
+  {
+    char an[48], bn[48];
+    if (t->lb[a] == E2_LB_F64) snprintf(an, sizeof(an), "q2_toi32(d%u)", (unsigned)a);
+    else snprintf(an, sizeof(an), "i%u", (unsigned)a);
+    if (t->lb[b] == E2_LB_F64) snprintf(bn, sizeof(bn), "q2_toi32(d%u)", (unsigned)b);
+    else snprintf(bn, sizeof(bn), "i%u", (unsigned)b);
+    ld = fn->values[d].reg;
+    if (op != NULL)
+      fprintf(f, "    i%u = %s %s %s;\n", (unsigned)d, an, op, bn);
+    else
+      fprintf(
+          f, "    i%u = (int32_t)((uint32_t)%s >> ((uint32_t)%s & 31));\n",
+          (unsigned)d, an, bn);
+    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  }
+  return 1;
+}
+
 /* `inc_branch_lt_s` ("rrt": d, b, off) as a loop counter: `d = d + 1`, branch
    to the target while `d < b`. It is the fused increment-and-test, so in a loop
    with an empty body it *is* the body.
@@ -2752,19 +2800,21 @@ static int emit_typed_arith_imm(
     case ROP_binary_imm:
       if (in->narg < 4 || in->arg[1].kind != 'b') return 0;
       sub = (int)in->arg[1].val;
-      if (in->arg[3].kind != 'i') return 0;
+      if (in->arg[3].kind != 'i' && in->arg[3].kind != 'I') return 0;
       imm = (int32_t)in->arg[3].val;
       have_imm = 1;
       break;
     case ROP_add_imm_s:
       sub = REG_BIN_ADD;
-      if (in->narg < 3 || in->arg[2].kind != 'i') return 0;
+      if (in->narg < 3 || (in->arg[2].kind != 'i' && in->arg[2].kind != 'I'))
+        return 0;
       imm = (int32_t)in->arg[2].val;
       have_imm = 1;
       break;
     case ROP_sub_imm_s:
       sub = REG_BIN_SUB;
-      if (in->narg < 3 || in->arg[2].kind != 'i') return 0;
+      if (in->narg < 3 || (in->arg[2].kind != 'i' && in->arg[2].kind != 'I'))
+        return 0;
       imm = (int32_t)in->arg[2].val;
       have_imm = 1;
       break;
@@ -2791,6 +2841,18 @@ static int emit_typed_arith_imm(
     else
       fprintf(f, "    d%u = (double)i%u %s (double)%d;\n", (unsigned)d,
               (unsigned)a, fop, imm);
+    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+    return 1;
+  }
+  /* i32 RESULT from an f64 operand: compute in double, then ToInt32 -- the
+     interpreter's `x | 0` on a double. Total, so no exit. */
+  if (t->lb[d] == E2_LB_I32 && t->lb[a] == E2_LB_F64) {
+    const char *fop = sub == REG_BIN_ADD ? "+"
+                      : sub == REG_BIN_SUB ? "-"
+                                           : "*";
+    ld = fn->values[d].reg;
+    fprintf(f, "    i%u = q2_toi32(d%u %s (double)%d);\n", (unsigned)d,
+            (unsigned)a, fop, imm);
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
     return 1;
   }
@@ -3278,6 +3340,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_unary(
                      f, fn, in, &types, cur, have_types, hex, fi)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_bitwise(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (have_types &&
                  emit_typed_arith(f, fn, in, &types, cur)) {

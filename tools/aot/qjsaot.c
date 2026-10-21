@@ -5171,6 +5171,23 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return q2_num_fast(sub, a, b, out) || qjs_aot_num_fast(sub, a, b, "
         "out);\n"
         "}\n\n"
+        /* ToInt32 for a double: JS's exact conversion, and total (no exit).
+           Strictly inside (-2147483649.0, 2147483648.0) C's truncation toward
+           zero IS ToInt32 -- fractions included, and -0.x becomes 0. NaN fails
+           both compares and falls to the modulo, which yields 0. Outside the
+           range the value is reduced modulo 2^32 with the sign applied, which is
+           what the spec says and what the interpreter computes. */
+        "static inline __attribute__((always_inline)) int32_t q2_toi32(double d)\n"
+        "{\n"
+        "  if (d > -2147483649.0 && d < 2147483648.0) return (int32_t)d;\n"
+        "  {\n"
+        "    double m;\n"
+        "    if (isnan(d) || isinf(d)) return 0;\n"
+        "    m = fmod(d < 0 ? -d : d, 4294967296.0);\n"
+        "    if (m < 0) m += 4294967296.0;\n"
+        "    return (int32_t)(uint32_t)m;\n"
+        "  }\n"
+        "}\n"
         "static inline __attribute__((always_inline)) int q2_cmp_int(int sub, "
         "int32_t a, int32_t b)\n"
         "{\n"
