@@ -2147,6 +2147,33 @@ static void e2_sweep_guard(FILE *f, const char *kind, int pc) {
    guard that types it. Not a value id; the exit sync leaves the slot alone. */
 #define E2_INFRAME ((Q2ValueId)-3)
 
+/* For QJS_AOT_E2_EXIT_LOG: the C expression of the value a guard stub's guard
+   tested, by (kind, pc), so the stub can print the tag it actually saw. The first
+   guard registered at a pc names it. Reset per spec body. */
+static struct {
+  char kind;
+  int pc;
+  char expr[64];
+} g_e2_xtag[E2_MAX_STUBS];
+static int g_e2_xtag_n;
+static void e2_note_tag(char kind, int pc, const char *expr) {
+  int q;
+  for (q = 0; q < g_e2_xtag_n; q++)
+    if (g_e2_xtag[q].kind == kind && g_e2_xtag[q].pc == pc) return;
+  if (g_e2_xtag_n >= E2_MAX_STUBS) return;
+  g_e2_xtag[g_e2_xtag_n].kind = kind;
+  g_e2_xtag[g_e2_xtag_n].pc = pc;
+  snprintf(g_e2_xtag[g_e2_xtag_n].expr, sizeof(g_e2_xtag[0].expr), "%s", expr);
+  g_e2_xtag_n++;
+}
+static const char *e2_tag_expr(char kind, int pc) {
+  int q;
+  for (q = 0; q < g_e2_xtag_n; q++)
+    if (g_e2_xtag[q].kind == kind && g_e2_xtag[q].pc == pc)
+      return g_e2_xtag[q].expr;
+  return NULL;
+}
+
 /* Register a guard stub at `pc` ONCE per body, with a copy of cur[] at the guard.
    The stub syncs from that copy: a NULL sync set drops every value the prefix holds
    only in a local. `wrote`, when given, is the op whose defs are already in the
@@ -2168,6 +2195,13 @@ static void e2_note_stub(
   snap = malloc(sizeof(*snap) * (size_t)(nr > 0 ? nr : 1));
   if (snap == NULL) abort();
   memcpy(snap, cur, sizeof(*snap) * (size_t)nr);
+  if (wrote != NULL && wrote->ndef > 0 && wrote->def[0] != Q2_NO_VALUE) {
+    char ex[64];
+    snprintf(
+        ex, sizeof(ex), "AOT_REG(fr, %d)",
+        g_e2_fn->values[wrote->def[0]].reg * 16);
+    e2_note_tag('d', pc, ex);
+  }
   if (wrote != NULL)
     for (q = 0; q < wrote->ndef; q++) {
       Q2ValueId v = wrote->def[q];
@@ -2219,8 +2253,12 @@ static void e2_load_arg_to_local(
   e2_local_name(dn, sizeof(dn), v);
   /* One guard per pc, not per destination: get_arg2 has two and both jump to
      the same label, synced from the snapshot taken before the first. */
-  if (e2_rep_prefix(v)[0] != 'v')
+  if (e2_rep_prefix(v)[0] != 'v') {
+    char ex[64];
     e2_note_stub(g_e2_ax, g_e2_ax_cur, g_e2_ax_blk, &g_e2_ax_n, pc, cur, NULL);
+    snprintf(ex, sizeof(ex), "q2_arg_buf(f)[%d]", slot);
+    e2_note_tag('a', pc, ex);
+  }
   /* An argument the analysis typed needs its TAG CHECK here: the profile said
      this slot holds an int, but the caller may pass a double, a string or
      nothing at all. Reading the payload without checking would use garbage bits
@@ -2838,6 +2876,11 @@ static int emit_typed_var_ref_load(
      emitted exactly once. The snapshot is from before the load. */
   e2_note_stub(
       g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+  {
+    char ex[64];
+    snprintf(ex, sizeof(ex), "qjs_aot_get_var_ref(f, %d)", slot);
+    e2_note_tag('v', in->pc, ex);
+  }
   if (t->lb[d] == E2_LB_I32) {
     e2_sweep_guard(f, "vx", in->pc);
     fprintf(
@@ -5069,6 +5112,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e2_n_typed = g_e2_n_opcall = 0;
   memset(g_e2_n_guard, 0, sizeof(g_e2_n_guard));
   g_e2_n_exit = g_e2_n_handoff = 0;
+  g_e2_xtag_n = 0;
   int n_left = 0;
   FILE *out = NULL;
   char *mbuf = NULL;
@@ -5441,6 +5485,13 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ax_%d:;\n", pc2);
+      {
+        const char *tx = e2_tag_expr('a', pc2);
+        fprintf(
+            f, "    E2_EXIT_LOG(\"%s\", \"ax\", %d, %s%s%s);\n", hex, pc2,
+            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
+            tx != NULL ? ")" : "");
+      }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_ax_cur[o], g_e2_ax_blk[o], 0);
     }
@@ -5458,6 +5509,13 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    vx_%d:;\n", pc2);
+      {
+        const char *tx = e2_tag_expr('v', pc2);
+        fprintf(
+            f, "    E2_EXIT_LOG(\"%s\", \"vx\", %d, %s%s%s);\n", hex, pc2,
+            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
+            tx != NULL ? ")" : "");
+      }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_vx_cur[o], g_e2_vx_blk[o], 0);
     }
@@ -5475,6 +5533,13 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    dx_%d:;\n", pc2);
+      {
+        const char *tx = e2_tag_expr('d', pc2);
+        fprintf(
+            f, "    E2_EXIT_LOG(\"%s\", \"dx\", %d, %s%s%s);\n", hex, pc2,
+            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
+            tx != NULL ? ")" : "");
+      }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_dx_cur[o], g_e2_dx_blk[o], 0);
     }
@@ -5492,6 +5557,13 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    ox_%d:;\n", pc2);
+      {
+        const char *tx = e2_tag_expr('o', pc2);
+        fprintf(
+            f, "    E2_EXIT_LOG(\"%s\", \"ox\", %d, %s%s%s);\n", hex, pc2,
+            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
+            tx != NULL ? ")" : "");
+      }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o], g_e2_ox_blk[o], 0);
     }
