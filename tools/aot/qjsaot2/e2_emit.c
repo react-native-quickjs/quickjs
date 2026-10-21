@@ -243,6 +243,113 @@ void e2_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    return ret;\n}\n\n");
 }
 
+/* --- the frameless entry (card E9) -------------------------------------- */
+
+/* `aot_nx_HEX`: the exit of a frameless body. It builds the frame the framed
+   native entry builds, field for field, puts the live registers the body hands
+   over (`x->lv`, at the frame offsets `x->offs`) where the generic body reads
+   them, and continues in the generic body at `x->pc`. Cold: the fast path never
+   gets here. The function has no variable area and no call site (rules 2 and 3),
+   so there is no stack check, no poll and no release; the frame is small (rule 1).
+   It takes ONE pointer for everything about the exit, so that leaving costs the
+   body no more arguments than entering did. */
+void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
+  const JSAotGenFunc *g = fn->g;
+  int nregs = g->reg_count;
+  int slots = (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
+
+  fprintf(
+      f,
+      "/* The exit of the frameless body: builds the frame and runs the generic\n"
+      "   body from x->pc with the registers' values handed over in x->lv. */\n"
+      "E2_TEXT static __attribute__((noinline, cold)) JSValue aot_nx_%s(\n"
+      "    JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue this_obj,\n"
+      "    JSValue *argv, const E2Nx *x)\n"
+      "{\n"
+      "    JSValue mem[%d] __attribute__((aligned(16)));\n"
+      "    uint8_t *nf = (uint8_t *)mem;\n"
+      "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
+      "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+      "    JSContext *realm = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+      "    uint8_t *rt = *(uint8_t **)((uint8_t *)ctx + QJS_AOT_OFF_CTX_RT);\n"
+      "    JSValue *regs = mem + QJS_AOT_LIGHT_PREFIX_SLOTS;\n"
+      "    int argc = x->argc;\n"
+      "    JSRegRun *prev;\n"
+      "    JSValue ret;\n"
+      "    int k;\n"
+      "\n"
+      "    if (__builtin_expect(e2_exit_log_v != 0, 0) && x->kind != NULL) {\n"
+      "        static int seen_[1024];\n"
+      "        e2_exit_log(\"%s\", x->kind, x->pc, x->tag,\n"
+      "                    &seen_[(x->pc * 7 + x->kind[0]) & 1023]);\n"
+      "    }\n"
+      "    if (__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
+      "NULL, 0)) {\n"
+      "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n"
+      "    }\n"
+      "    *(JSRegRun **)(nf + QJS_AOT_OFF_REGRUN_CALLER) = caller_f;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_RET_IP) = NULL;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_B) = cb;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_PIC) = *(void **)(cb + "
+      "QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_FR) = regs;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_VAR_REFS) =\n"
+      "        *(void **)((uint8_t *)co + QJS_AOT_OFF_OBJECT_FUNC_VAR_REFS);\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_VAR_BUF) = NULL;\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_ARG_BUF) = argv;\n"
+      "    *(uint64_t *)(nf + QJS_AOT_OFF_REGRUN_HDR_PACK) =\n"
+      "        ((uint64_t)(uint16_t)argc << 16) |\n"
+      "        ((uint64_t)(uint32_t)(QJS_AOT_REGVM_FLAG_LIGHT |\n"
+      "                    QJS_AOT_REGVM_FLAG_C_ENTRY |\n"
+      "                    QJS_AOT_REGVM_FLAG_STACK |\n"
+      "                    QJS_AOT_REGVM_FLAG_TRIVIAL_RET |\n"
+      "                    (realm == ctx ? QJS_AOT_REGVM_FLAG_SAME_REALM : 0)) "
+      "<< 32);\n"
+      "    *(JSObject **)(nf + QJS_AOT_OFF_REGRUN_FUNC) = co;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_CAP_IP) = NULL;\n"
+      "    *(void **)(nf + QJS_AOT_OFF_REGRUN_SF) = NULL;\n"
+      "    *(JSValue *)(nf + QJS_AOT_OFF_REGRUN_THIS_OBJ) = this_obj;\n"
+      "    for (k = 0; k < %d; k++)\n"
+      "        __builtin_memcpy(&regs[k], &e2_undefined_value, "
+      "sizeof(JSValue));\n"
+      "    for (k = 0; k < x->n; k++) AOT_REG(regs, x->offs[k]) = x->lv[k];\n"
+      "#if E2_CHECK\n"
+      "    qjs_aot_frame_check(ctx, (JSRegRun *)nf, co, caller_f, argv, argc,\n"
+      "                        this_obj);\n"
+      "#endif\n"
+      "    prev = *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR);\n"
+      "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = (JSRegRun *)nf;\n"
+      "    ret = aot_g_%s(realm, (JSRegRun *)nf, regs, (uint32_t)x->pc);\n"
+      "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
+      "    return ret;\n"
+      "}\n\n",
+      hex, slots, hex, nregs, hex);
+}
+
+/* `aot_f_HEX` for a frameless function: the engine still enters through it with a
+   frame of its own, and there is no second speculative body, so it forwards to
+   `aot_n_HEX` with what the frame holds. The frame's header is the engine's:
+   `hdr_pack` carries the argument count in bits 16..31, and `arg_buf` points at
+   the arguments the caller passed (`argc` of them). A call with fewer than the
+   declared arguments, or a resume at a pc, takes the generic body. */
+void e2_emit_frameless_forward(FILE *f, const Q2Func *fn, char hex[33]) {
+  fprintf(
+      f,
+      "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
+      "                                 JSValue *fr, uint32_t entry_pc)\n"
+      "{\n"
+      "    int argc = (uint16_t)(*(uint64_t *)((uint8_t *)f +\n"
+      "                          QJS_AOT_OFF_REGRUN_HDR_PACK) >> 16);\n"
+      "    if (__builtin_expect(entry_pc != 0 || argc < %d, 0))\n"
+      "        return aot_g_%s(ctx, f, fr, entry_pc);\n"
+      "    return aot_n_%s(ctx, f,\n"
+      "        *(JSObject **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_FUNC),\n"
+      "        *(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ),\n"
+      "        *(JSValue **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_ARG_BUF), argc);\n"
+      "}\n\n",
+      e2_linkage(), hex, fn->g->arg_count, hex, hex);
+}
+
 /* --- the driver --------------------------------------------------------- */
 
 int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
@@ -294,7 +401,12 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   }
   /* The unit builder must know a native entry exists, because a call site
      elsewhere in the unit may only name an `aot_n_` that some body defines. */
-  if (rc == 0 && g->light_ok) {
+  if (rc == 0 && g->light_ok && e2_fl_was_chosen()) {
+    /* The body IS the native entry: it was emitted as `aot_n_`, with its exit
+       function and the forwarding `aot_f_`. */
+    e2_report_entry(g, hex, 1, 0, 0);
+    e2_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
+  } else if (rc == 0 && g->light_ok) {
     e2_emit_native_entry(f, &fn, hex);
     e2_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
   } else if (rc == 0) {

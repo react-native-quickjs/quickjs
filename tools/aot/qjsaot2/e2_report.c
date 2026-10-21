@@ -85,11 +85,16 @@ void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
   /* One line per entry, so a reader sees which of rules P and K a function's
      entry carries and can check the rule's assumption (only functions that
      call, plus frames over 16 KB, poll and check). */
-  fprintf(e2_rep, "E2 entry %s %s (P%s)(K%s)%s\n",
-          g->name[0] ? g->name : "<anon>",
-          frameless ? "frameless" : "framed",
-          poll ? "" : "-", stack_check ? "" : "-",
-          e2_only_hex[0] ? " scope" : "");
+  if (frameless)
+    fprintf(e2_rep, "E2 entry %s frameless%s\n",
+            g->name[0] ? g->name : "<anon>",
+            e2_only_hex[0] ? " scope" : "");
+  else
+    fprintf(e2_rep, "E2 entry %s framed (P%s)(K%s) blocked-by=%s%s\n",
+            g->name[0] ? g->name : "<anon>",
+            poll ? "" : "-", stack_check ? "" : "-",
+            e2_fl_why_not()[0] ? e2_fl_why_not() : "-",
+            e2_only_hex[0] ? " scope" : "");
 }
 
 void e2_report_spec(

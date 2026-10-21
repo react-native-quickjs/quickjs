@@ -42,6 +42,10 @@ void e2_emit_native_entry(FILE *f, const struct Q2Func *fn, char hex[33]);
 /* Whether the function contains a call site, so its entry polls (rule P) and
    checks the stack (rule K). */
 int e2_has_call_site(const struct Q2Func *fn);
+void e2_emit_frameless_exit_fn(FILE *f, const struct Q2Func *fn, char hex[33]);
+void e2_emit_frameless_forward(FILE *f, const struct Q2Func *fn, char hex[33]);
+int e2_fl_was_chosen(void);
+const char *e2_fl_why_not(void);
 
 /* The registers live immediately BEFORE an instruction: live-out minus the
    instruction's own definitions, plus its uses and window. Use this when the exit

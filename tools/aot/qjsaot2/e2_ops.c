@@ -2038,9 +2038,10 @@ typedef struct E2HandoffStat {
 static E2HandoffStat g_e2_ho[E2_HANDOFF_MAX];
 static int g_e2_ho_n = 0;
 
+static int g_e2_quiet;
 static void e2_handoff_note(const Q2Func *fn, const Q2Insn *in) {
   int i;
-  if (in == NULL) return;
+  if (in == NULL || g_e2_quiet) return;
   for (i = 0; i < g_e2_ho_n; i++) {
     if (g_e2_ho[i].rop == in->rop) {
       g_e2_ho[i].weight += qjs_aot_prof_pc_count(fn->g->digest, in->pc);
@@ -2129,6 +2130,31 @@ static int g_e2_n_typed, g_e2_n_opcall;
 static int g_e2_n_guard[4];
 static int g_e2_n_exit, g_e2_n_handoff;
 
+/* The frameless body (card E9, D10): the speculative body written for a function
+   that has no frame. `g_e2_fl` is set while one is being emitted; the first reason
+   it cannot be one (an op that needs the engine's handler, an unlowered
+   instruction) is `g_e2_fl_block`, and the caller falls back to the framed body.
+   `g_e2_quiet` marks the trial emission whose output is thrown away: it must not
+   print, count or take a sweep site. */
+static int g_e2_fl;
+static char g_e2_fl_block[160];
+/* The reason the LAST function was not frameless, for the entry report line. */
+static char g_e2_fl_why[160];
+/* Set by the spec body when it emitted a frameless function, read by the driver
+   that decides which entry to emit. */
+static int g_e2_fl_chosen;
+
+static void e2_fl_block(const char *what, const Q2Insn *in) {
+  char nm[64];
+  if (!g_e2_fl || g_e2_fl_block[0] != 0) return;
+  if (in != NULL) {
+    e2_rop_name(in->rop, nm, sizeof(nm));
+    snprintf(g_e2_fl_block, sizeof(g_e2_fl_block), "%s %s@%d", what, nm, in->pc);
+  } else {
+    snprintf(g_e2_fl_block, sizeof(g_e2_fl_block), "%s", what);
+  }
+}
+
 /* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
    forced to fail, so its stub runs even where the speculation always holds. It
    sits where the guard's own exit would be taken -- for dx_, after the op's raw
@@ -2141,7 +2167,7 @@ static void e2_sweep_guard(FILE *f, const char *kind, int pc) {
        : kind[0] == 'v' ? 1
        : kind[0] == 'd' ? 2
                         : 3]++;
-  if (!qjs_aot_sweep_on()) return;
+  if (!qjs_aot_sweep_on() || g_e2_quiet) return;
   sid = qjs_aot_site_alloc();
   /* The unit's coverage bitmap is this size; a site past it would read as never
      reached. */
@@ -2181,6 +2207,96 @@ static void e2_note_tag(char kind, int pc, const char *expr) {
   snprintf(g_e2_xtag[g_e2_xtag_n].expr, sizeof(g_e2_xtag[0].expr), "%s", expr);
   g_e2_xtag_n++;
 }
+/* A frameless body's TAG values are invisible to the collector, so a safepoint
+   with one live is only safe when the value is kept alive by someone else. The
+   caller's argument window and receiver are: `get_arg`, `get_arg2`, `load_this`
+   and moves of those, and a block parameter whose every incoming value is one of
+   them. A function that stores to an argument gives up the argument half (the
+   window slot no longer holds what was read). Filled before the blocks are
+   emitted; NULL in a framed body. */
+static uint8_t *g_e2_rooted;
+
+static void e2_compute_rooted(const Q2Func *fn) {
+  int nv = fn->nvalues, i, b, k, si, changed;
+  int has_put_arg = 0;
+  free(g_e2_rooted);
+  g_e2_rooted = calloc((size_t)(nv > 0 ? nv : 1), 1);
+  if (g_e2_rooted == NULL) abort();
+  for (i = 0; i < fn->ninsns; i++)
+    if (fn->insns[i].rop == ROP_put_arg || fn->insns[i].rop == ROP_put_arg_xfer)
+      has_put_arg = 1;
+  for (i = 0; i < nv; i++) {
+    int ins = fn->values[i].insn;
+    if (ins < 0) {
+      g_e2_rooted[i] = 1; /* a parameter: optimistic, lowered below */
+      continue;
+    }
+    switch (fn->insns[ins].rop) {
+      case ROP_get_arg:
+      case ROP_get_arg2:
+        g_e2_rooted[i] = !has_put_arg;
+        break;
+      case ROP_load_this:
+        g_e2_rooted[i] = 1;
+        break;
+      case ROP_move:
+      case ROP_move_s:
+        g_e2_rooted[i] = 2; /* decided from its source below */
+        break;
+      default:
+        g_e2_rooted[i] = 0;
+        break;
+    }
+  }
+  do {
+    changed = 0;
+    /* moves follow their source */
+    for (i = 0; i < nv; i++) {
+      int ins = fn->values[i].insn;
+      if (ins >= 0 && g_e2_rooted[i] != 0 &&
+          (fn->insns[ins].rop == ROP_move || fn->insns[ins].rop == ROP_move_s)) {
+        Q2ValueId src =
+            fn->insns[ins].nuse > 0 ? fn->insns[ins].use[0] : Q2_NO_VALUE;
+        uint8_t r = (src != Q2_NO_VALUE && src < (Q2ValueId)nv &&
+                     g_e2_rooted[src] == 1)
+                        ? 1
+                        : 0;
+        if (g_e2_rooted[i] != r) {
+          g_e2_rooted[i] = r;
+          changed = 1;
+        }
+      }
+    }
+    /* a parameter is rooted only if every incoming value is */
+    for (b = 0; b < fn->nblocks; b++) {
+      const Q2Block *blk = &fn->blocks[b];
+      for (si = 0; si < 2; si++) {
+        const Q2Block *sb;
+        int np;
+        if (si >= blk->nsucc || blk->succ_block[si] < 0 ||
+            blk->succ_block[si] >= fn->nblocks)
+          continue;
+        sb = &fn->blocks[blk->succ_block[si]];
+        np = sb->nparams;
+        if (blk->nedge_args[si] >= 0 && blk->nedge_args[si] < np)
+          np = blk->nedge_args[si];
+        for (k = 0; k < np; k++) {
+          Q2ValueId pv = sb->param_val[k], av = blk->edge_arg[si][k];
+          if (pv == Q2_NO_VALUE || pv >= (Q2ValueId)nv) continue;
+          if (g_e2_rooted[pv] == 1 &&
+              (av == Q2_NO_VALUE || av >= (Q2ValueId)nv ||
+               g_e2_rooted[av] != 1)) {
+            g_e2_rooted[pv] = 0;
+            changed = 1;
+          }
+        }
+      }
+    }
+  } while (changed);
+  for (i = 0; i < nv; i++)
+    if (g_e2_rooted[i] == 2) g_e2_rooted[i] = 0;
+}
+
 /* Whether a typed def is dead: its register is not live after the defining
    instruction. That is the set every exit syncs from, and it counts a call's
    argument window, so nothing -- no instruction, no exit -- reads such a local.
@@ -2758,11 +2874,73 @@ static void e2_exit_store(FILE *f, Q2ValueId v, int reg) {
    The sync writes every register live at `pc`, not only the ones that changed:
    a typed local may hold a value the frame has never seen, and the generic body
    reads the frame unconditionally. */
+/* The expression that boxes value `v` for an exit, in the frame's representation:
+   what e2_exit_store would store. */
+static void e2_exit_expr(char *buf, size_t n, Q2ValueId v) {
+  switch (e2_rep_prefix(v)[0]) {
+    case 'i':
+      snprintf(buf, n, "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)v);
+      break;
+    case 'd':
+      snprintf(
+          buf, n, "qjs_aot_box_num(d%u, qjs_aot_fitsi(d%u))", (unsigned)v,
+          (unsigned)v);
+      break;
+    case 'b':
+      snprintf(buf, n, "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)v);
+      break;
+    default:
+      snprintf(buf, n, "v%u", (unsigned)v);
+      break;
+  }
+}
+
+/* The guard that is about to exit, for the exit log: a framed body logs it in
+   line; a frameless one hands the kind and tag to its exit function through the
+   exit record, so the body keeps no call of its own on the way out. */
+static char g_e2_xk[16], g_e2_xt[160];
+static void e2_emit_exit_log(
+    FILE *f, char hex[33], const char *kind, int pc, const char *tagexpr) {
+  if (g_e2_fl) {
+    snprintf(g_e2_xk, sizeof(g_e2_xk), "\"%s\"", kind);
+    snprintf(g_e2_xt, sizeof(g_e2_xt), "%s", tagexpr);
+    return;
+  }
+  fprintf(f, "    E2_EXIT_LOG(\"%s\", \"%s\", %d, %s);\n", hex, kind, pc, tagexpr);
+}
+
+/* The generic body entered at `pc` from the speculative body. In a framed body
+   that is a tail call on the live frame. A frameless body has none: the live
+   registers travel as (offset, value) pairs and `aot_nx_` builds the frame. */
+static void e2_emit_generic_call(
+    FILE *f, char hex[33], int pc, int nlv, const char *indent) {
+  if (!g_e2_fl) {
+    fprintf(f, "%sreturn aot_g_%s(ctx, f, fr, %d);\n", indent, hex, pc);
+    return;
+  }
+  fprintf(
+      f,
+      "%sE2Nx x_ = { %d, %s, %s, %s, %s, %d, argc };\n"
+      "%sreturn aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &x_);\n",
+      indent, pc, g_e2_xt[0] ? g_e2_xt : "-100", g_e2_xk[0] ? g_e2_xk : "NULL",
+      nlv > 0 ? "lv" : "NULL", nlv > 0 ? "offs" : "NULL", nlv, indent, hex);
+  g_e2_xk[0] = g_e2_xt[0] = 0;
+}
+
 static void e2_emit_exit(
     FILE *f, const Q2Func *fn, int pc, char hex[33], int fi,
     const Q2ValueId *cur, const uint64_t *live_set, int handoff, int blkidx) {
   int words = fn->lwords, w, r;
+  /* Frameless: the values are collected, not stored. */
+  int nlv = 0;
+  int *loff = NULL;
+  char (*lex)[160] = NULL;
 
+  if (g_e2_fl) {
+    loff = malloc(sizeof(int) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    lex = malloc(sizeof(*lex) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    if (loff == NULL || lex == NULL) abort();
+  }
   if (handoff)
     g_e2_n_handoff++;
   else
@@ -2784,9 +2962,25 @@ static void e2_emit_exit(
         /* A register the spec body holds in a local is written from it; one it
            never touched already has the right contents in the frame, so it is
            left alone. Writing a stale definition would corrupt exactly that. */
-        if (cur == NULL || cur[r] == E2_INFRAME) continue;
+        if (cur == NULL) continue;
+        if (cur[r] == E2_INFRAME) {
+          /* The op left its result in the frame. A frameless body's "frame" is
+             its register array, which the new frame has to be given. */
+          if (g_e2_fl) {
+            loff[nlv] = r * 16;
+            snprintf(lex[nlv], sizeof(lex[0]), "AOT_REG(fr, %d)", r * 16);
+            nlv++;
+          }
+          continue;
+        }
         if (cur[r] == E2_UNDEF) {
-          fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_UNDEFINED);\n", r * 16);
+          if (g_e2_fl) {
+            loff[nlv] = r * 16;
+            snprintf(lex[nlv], sizeof(lex[0]), "JS_UNDEFINED");
+            nlv++;
+          } else {
+            fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_UNDEFINED);\n", r * 16);
+          }
           continue;
         }
         if (cur[r] == Q2_NO_VALUE) {
@@ -2802,17 +2996,34 @@ static void e2_emit_exit(
           }
           continue;
         }
-        e2_exit_store(f, cur[r], r);
+        if (g_e2_fl) {
+          loff[nlv] = r * 16;
+          e2_exit_expr(lex[nlv], sizeof(lex[0]), cur[r]);
+          nlv++;
+        } else {
+          e2_exit_store(f, cur[r], r);
+        }
       }
     }
   }
+  if (nlv > 0) {
+    int q;
+    fprintf(f, "    JSValue lv[%d] = {\n", nlv);
+    for (q = 0; q < nlv; q++)
+      fprintf(f, "        %s%s\n", lex[q], q + 1 < nlv ? "," : "");
+    fprintf(f, "    };\n    static const uint16_t offs[%d] = {", nlv);
+    for (q = 0; q < nlv; q++) fprintf(f, "%s%d", q ? ", " : " ", loff[q]);
+    fprintf(f, " };\n");
+  }
+  free(loff);
+  free(lex);
   /* A hand-off is the planned exit at an instruction the spec body does not lower
      yet, not a failed speculation. Counting it as a deopt switched nearly every
      spec body off after 257 calls while E8 is incomplete, which would have made
      every measurement in this step time the generic body. */
   fprintf(
       f, "    %s(%d);\n", handoff ? "E2_HANDOFF_NOTE" : "E2_EXIT_NOTE", fi);
-  fprintf(f, "    return aot_g_%s(ctx, f, fr, %d);\n", hex, pc);
+  e2_emit_generic_call(f, hex, pc, nlv, "    ");
   fprintf(f, "    }\n");
 }
 
@@ -2970,14 +3181,65 @@ static void e2_emit_arm(
         f,
         "          ++*(int *)((unsigned char *)ctx +\n"
         "              QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n");
-    for (q = 0; q < t->nlive_in; q++) {
-      int rr = t->in_reg[q];
-      Q2ValueId vv = t->in_val[q];
-      if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
-      if (cur != NULL && cur[rr] != Q2_NO_VALUE) e2_exit_store(f, cur[rr], rr);
-      else e2_exit_store(f, vv, rr);
+    int unsafe_tag = 0;
+    if (g_e2_fl)
+      for (q = 0; q < t->nlive_in; q++) {
+        int rr = t->in_reg[q];
+        Q2ValueId vv = t->in_val[q];
+        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        if (e2_rep_prefix(vv)[0] == 'v' &&
+            !(g_e2_rooted != NULL && vv < (Q2ValueId)fn->nvalues &&
+              g_e2_rooted[vv] == 1))
+          unsafe_tag = 1;
+      }
+    if (g_e2_fl && !unsafe_tag) {
+      /* Every live TAG value is kept alive by the caller (an argument, the
+         receiver): the poll may run an interrupt handler and the collector
+         without a frame to scan. */
+      fprintf(
+          f, "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
+    } else if (g_e2_fl) {
+      /* A borrowed value only this body holds: leave at the loop header, where
+         the generic body has a frame, and let it poll at its own next back edge
+         (this body is not re-entered, so the rest of the call runs there). */
+      int nlv = 0;
+      char ex[160];
+      fprintf(f, "          {\n          JSValue lv[%d] = {\n", t->nlive_in + 1);
+      for (q = 0; q < t->nlive_in; q++) {
+        int rr = t->in_reg[q];
+        Q2ValueId vv = t->in_val[q];
+        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        e2_exit_expr(
+            ex, sizeof(ex), cur != NULL && cur[rr] != Q2_NO_VALUE ? cur[rr] : vv);
+        fprintf(f, "              %s,\n", ex);
+        nlv++;
+      }
+      fprintf(f, "              JS_UNDEFINED };\n");
+      fprintf(f, "          static const uint16_t offs[%d] = {", nlv + 1);
+      for (q = 0; q < t->nlive_in; q++) {
+        int rr = t->in_reg[q];
+        Q2ValueId vv = t->in_val[q];
+        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        fprintf(f, " %d,", rr * 16);
+      }
+      fprintf(f, " 0 };\n");
+      /* Not noted: an interrupt is neither a hand-off nor a failed speculation. */
+      fprintf(
+          f,
+          "          E2Nx x_ = { %d, -100, NULL, lv, offs, %d, argc };\n"
+          "          return aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
+          "&x_);\n          }\n",
+          t->start_pc, nlv, hex);
+    } else {
+      for (q = 0; q < t->nlive_in; q++) {
+        int rr = t->in_reg[q];
+        Q2ValueId vv = t->in_val[q];
+        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        if (cur != NULL && cur[rr] != Q2_NO_VALUE) e2_exit_store(f, cur[rr], rr);
+        else e2_exit_store(f, vv, rr);
+      }
+      fprintf(f, "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
     }
-    fprintf(f, "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
     fprintf(f, "      }\n");
   }
   fprintf(f, "      goto s_%d;\n", fn->blocks[sb].start_pc);
@@ -3191,6 +3453,22 @@ static int emit_typed_opcall(
   (void)fi;
   (void)b;
 
+  /* A frameless body has no handler to step. Its callers use this as the miss arm
+     of an access that has a fast path, so the miss is an exit before the
+     instruction (the generic body redoes it). An instruction that has NO fast path
+     never gets here: the dispatcher declines to wrap it and the function is not
+     frameless. */
+  if (g_e2_fl) {
+    e2_note_stub(
+        g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+    /* The hit's typed guard exits at the next pc with the raw result in the
+       register array, exactly as after a wrapper. */
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    fprintf(f, "        goto vx_%d;\n", in->pc);
+    return 1;
+  }
+
   e2_emit_presync(f, fn, in, t, cur);
   (void)live;
 
@@ -3338,6 +3616,7 @@ static int e2_xfer_src_off(const Q2Insn *in) {
 }
 
 static int e2_wrappable(const Q2Func *fn, const Q2Insn *in, const E2Role *role) {
+  if (g_e2_fl) return 0; /* a frameless body has no handler to step */
   if (role == NULL || role->control != E2_CF_NONE) return 0;
   /* The call family has its own site emitter for call/call_method; construct and
      apply_arguments run synchronously through the step (the callee's frame is
@@ -3385,6 +3664,7 @@ static void e2_emit_term_step(
    nothing, whose both successors are blocks of this function. */
 static int e2_term_wrappable(
     const Q2Func *fn, const Q2Insn *in, const E2Role *role, const Q2Block *blk) {
+  if (g_e2_fl) return 0; /* a frameless body has no handler to step */
   if (role == NULL || role->control != E2_CF_BRANCH) return 0;
   if (in->ndef != 0 || in->nredef != 0 || e2_is_call_family(in->rop)) return 0;
   if (blk->nsucc < 2) return 0;
@@ -3748,6 +4028,7 @@ static int emit_typed_elem_write(
 
   if (!have_types || t == NULL) return 0;
   if (in->rop != ROP_put_element && in->rop != ROP_put_element_xfer) return 0;
+  if (g_e2_fl) return 0; /* the inline element store counts references */
   if (role == NULL || role->control != E2_CF_NONE) return 0;
   if (in->nuse < 3) return 0;
   av = in->use[0];
@@ -3905,8 +4186,11 @@ static int emit_typed_call(
     fprintf(
         f,
         "        if (__builtin_expect(JS_IsException(_o), 0)) return JS_EXCEPTION;\n"
-        "        qjs_aot_set_reg_p(ctx, fr, %d, _o);\n",
-        off);
+        "        /* Adopting an owned result drops its reference; a value that has\n"
+        "           none (an int, a double, a bool) is a plain store. */\n"
+        "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+        "        else AOT_SET_B(ctx, fr, %d, _o);\n",
+        off, off);
     /* The call ran JS: re-read the groups before anything reads a field. */
     e2_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E2_LB_TAG) {
@@ -4055,6 +4339,21 @@ static int emit_typed_load_this(
   ld = fn->values[dv].reg;
   if (ld < 0 || ld >= fn->nregs) return 0;
 
+  if (g_e2_fl) {
+    /* An object `this` is the same in strict and sloppy code; anything else
+       may need boxing or the global object, which allocates, so it exits. */
+    e2_note_stub(
+        g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+    fprintf(
+        f,
+        "    if (__builtin_expect(JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT, "
+        "0)) goto vx_%d;\n"
+        "    v%u = this_obj;\n"
+        "    AOT_SET_B(ctx, fr, %d, this_obj);\n",
+        in->pc, (unsigned)dv, ld * 16);
+    if (cur != NULL) cur[ld] = dv;
+    return 1;
+  }
   fprintf(f, "    { JSValue _t;\n");
   fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
   fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
@@ -4161,6 +4460,29 @@ static int emit_typed_this_field(
   rreg = fn->values[rv].reg;
   if (freg < 0 || freg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
 
+  if (g_e2_fl) {
+    e2_note_stub(
+        g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+    fprintf(
+        f,
+        "    if (__builtin_expect(JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT, "
+        "0)) goto vx_%d;\n"
+        "    { JSValue _t = this_obj, _v;\n"
+        "      v%u = _t;\n"
+        "      AOT_SET_B(ctx, fr, %d, _t);\n"
+        "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, "
+        "holders, _t, %d, (int)q2_ns, &_v), 1)) {\n"
+        "        v%u = _v;\n"
+        "      } else {\n",
+        in->pc, (unsigned)rv, rreg * 16, site, (unsigned)fv);
+    if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+    fprintf(f, "      }\n    }\n");
+    if (cur != NULL) {
+      cur[freg] = fv;
+      cur[rreg] = rv;
+    }
+    return 1;
+  }
   fprintf(f, "    { JSValue _t, _v;\n");
   fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
   fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
@@ -4332,6 +4654,8 @@ static int emit_typed_field_write(
       int g = e2_exit_group(fn, in, site);
       if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
       if (e2_must_exit(fn, in)) return 0;
+      /* The inline store counts references. */
+      if (g_e2_fl) return 0;
     }
   fprintf(f, "    {\n");
   fprintf(
@@ -4541,9 +4865,24 @@ static int emit_group_write(
   fprintf(
       f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
       test, recv, in->pc);
-  fprintf(
-      f, "      q2_put_slot(ctx, %s, q2_cell_off(pic, %d), %s);\n", recv, site,
-      boxed);
+  if (g_e2_fl) {
+    /* No reference counting inline: the store goes ahead only when neither the
+       old nor the new value is counted (so it is a plain store), otherwise the
+       generic body does it. A local first: the boxed value may be a compound
+       literal, whose commas would split a macro argument. */
+    fprintf(
+        f,
+        "      JSValue _nv = %s;\n"
+        "      JSValue *_sp = q2_slotp(%s, q2_cell_off(pic, %d));\n"
+        "      if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_nv) || "
+        "JS_VALUE_HAS_REF_COUNT(*_sp), 0)) goto vx_%d;\n"
+        "      *_sp = _nv;\n",
+        boxed, recv, site, in->pc);
+  } else {
+    fprintf(
+        f, "      q2_put_slot(ctx, %s, q2_cell_off(pic, %d), %s);\n", recv, site,
+        boxed);
+  }
   fprintf(f, "    }\n");
   g_e2_miss_exit_seen = 1;
   return 1;
@@ -4741,6 +5080,21 @@ static int emit_typed_var_ref_store(
       break;
     default:
       return 0;
+  }
+  if (g_e2_fl) {
+    /* No reference counting inline: the store goes ahead only when neither the
+       old nor the new value is counted, otherwise the generic body does it. */
+    e2_note_stub(
+        g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+    fprintf(
+        f,
+        "    { JSValue *_p = qjs_aot_var_ref_ptr(f, %d);\n"
+        "      JSValue _nv = %s;\n"
+        "      if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_nv) || "
+        "JS_VALUE_HAS_REF_COUNT(*_p), 0)) goto vx_%d;\n"
+        "      *_p = _nv; }\n",
+        slot, box, in->pc);
+    return 1;
   }
   /* The cell's OLD value is not forwarded: a later read of the cell is a fresh load
      with its own value id, so the IR already says the old value is gone. */
@@ -5736,7 +6090,7 @@ static int e2_dispatch_rop(
   return 0;
 }
 
-int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
+static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e2_fn = fn;
   g_e2_fi = fi;
@@ -5750,6 +6104,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e2_group_used = NULL;
   g_e2_n_shape = g_e2_n_skip = g_e2_n_fwd = 0;
   int n_left = 0;
+  char gen0[400], gene[160];
   FILE *out = NULL;
   char *mbuf = NULL;
   size_t mlen = 0;
@@ -5793,6 +6148,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     }
   }
   if (!have_types) {
+    if (g_e2_fl) {
+      e2_fl_block("no analysis", NULL);
+      return 0;
+    }
     e2_irreducible++;
     fprintf(
         f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
@@ -5811,12 +6170,43 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     f = out;
     out = NULL;
   }
-  fprintf(
-      f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
-      e2_linkage(), hex);
-  fprintf(
-      f, "                                 JSValue *fr, uint32_t entry_pc)\n");
-  fprintf(f, "{\n");
+  /* What the body returns through to enter the generic body at pc 0 (a refusal at
+     entry, or speculation switched off). */
+  if (g_e2_fl)
+    snprintf(
+        gen0, sizeof(gen0),
+        "aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
+        "&(E2Nx){ 0, -100, NULL, NULL, NULL, 0, argc })",
+        hex);
+  else
+    snprintf(gen0, sizeof(gen0), "aot_g_%s(ctx, f, fr, 0)", hex);
+  snprintf(gene, sizeof(gene), "aot_g_%s(ctx, f, fr, entry_pc)", hex);
+  if (g_e2_fl) {
+    /* The exit function comes first: the body names it. */
+    e2_emit_frameless_exit_fn(out != NULL ? out : f, fn, hex);
+    fprintf(
+        f,
+        "#define q2_arg_buf(f_) (argv)\n"
+        "#define qjs_aot_get_var_ref(f_, i_) q2_vref_get(co, (i_))\n"
+        "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(co, (i_))\n"
+        "E2_TEXT %sJSValue aot_n_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
+        "                               JSObject *co, JSValue this_obj,\n"
+        "                               JSValue *argv, int argc)\n"
+        "{\n"
+        "    _Static_assert(QJS_DRC, \"a frameless body needs deferred counting\");\n"
+        "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
+        "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+        "    JSValue fr[%d];\n",
+        e2_linkage(), hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1);
+  } else {
+    fprintf(
+        f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
+        e2_linkage(), hex);
+    fprintf(
+        f, "                                 JSValue *fr, uint32_t entry_pc)\n");
+    fprintf(f, "{\n");
+  }
 
   /* S7. Entry. A compiled call passes entry_pc 0; anything else is a resume that
      belongs to the generic body, which has a label for every pc. The switch-off
@@ -5827,25 +6217,42 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
      reader -- so the E8 spec body ran even with QJS_AOT_SPEC=0, and the harness's
      "nospec" pass was never a generic-only run. Every nospec result on this card
      before this line was measuring the spec bodies. */
-  fprintf(
-      f,
-      "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || q2_no_spec ||\n"
-      "                         q2_spec_fns_out(%d) || e2_off[%d], 0))\n"
-      "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
-      fi, fi, hex);
+  if (g_e2_fl)
+    fprintf(
+        f,
+        "    if (__builtin_expect(e2_off[%d] | e2_dis[%d], 0))\n"
+        "        return %s;\n",
+        fi, fi, gen0);
+  else
+    fprintf(
+        f,
+        "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || q2_no_spec ||\n"
+        "                         q2_spec_fns_out(%d) || e2_off[%d], 0))\n"
+        "        return %s;\n",
+        fi, fi, gene);
   /* The index must be inside the D4 arrays; the generator sized them from the
      function count, so this can only fail if the two disagree. */
   fprintf(
       f, "    _Static_assert(%d < QJS_AOT_E2_NFUNCS, \"e2: function index\");\n",
       fi);
-  fprintf(f, "    E2_SEAL(ctx, f);\n");
+  if (!g_e2_fl) fprintf(f, "    E2_SEAL(ctx, f);\n");
 
   /* D9's group cells arrive in E9; until then a NULL pic means there is no
      profile to speculate on and the generic body is the only body. */
   fprintf(f, "    {\n");
-  fprintf(f, "    const void *pic = q2_pic(f);\n");
-  fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
-  fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
+  if (g_e2_fl) {
+    fprintf(
+        f,
+        "    const void *pic = *(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
+        "    void *const *holders = *(void *const **)(cb +\n"
+        "                               QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER);\n"
+        "    const uint32_t q2_ns = (uint32_t)*(const uint16_t *)(cb +\n"
+        "                               QJS_AOT_OFF_FNBC_PIC_COUNT);\n");
+  } else {
+    fprintf(f, "    const void *pic = q2_pic(f);\n");
+    fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
+    fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
+  }
   fprintf(f, "    (void)q2_ns; (void)holders;\n");
   /* A function with no PIC sites -- a leaf arithmetic function, say -- has no
      PIC table at all, so `pic` is NULL on EVERY call. Refusing on that refused
@@ -5858,9 +6265,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         f,
         "    if (__builtin_expect(pic == NULL, 0)) {\n"
         "        E2_REFUSE_NOTE(%d);\n"
-        "        return aot_g_%s(ctx, f, fr, 0);\n"
+        "        return %s;\n"
         "    }\n",
-        fi, hex);
+        fi, gen0);
   /* D9 step 2. Entry: each group some access uses takes the shape its first
      site's cell holds, and every other site's cell must agree. A NULL first cell
      means the profile's shape is not in the cache yet (the generic body will
@@ -5887,9 +6294,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
               f,
               "    if (__builtin_expect(pic == NULL, 0)) {\n"
               "        E2_REFUSE_NOTE(%d);\n"
-              "        return aot_g_%s(ctx, f, fr, 0);\n"
+              "        return %s;\n"
               "    }\n",
-              fi, hex);
+              fi, gen0);
           break;
         }
     for (g = 0; g < ng; g++) {
@@ -5916,14 +6323,15 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
             "      if (__builtin_expect(_s != NULL && _s != gsh%d, 0)) {\n"
             "        E2_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
             "        E2_REFUSE_NOTE(%d);\n"
-            "        return aot_g_%s(ctx, f, fr, 0);\n"
+            "        return %s;\n"
             "      } }\n",
-            gr->sites[q], g, hex, gr->sites[q], fi, hex);
+            gr->sites[q], g, hex, gr->sites[q], fi, gen0);
     }
   }
   /* Counted only now: everything that could refuse the entry has been passed, so
      this measures speculative bodies that ACTUALLY RAN. */
   fprintf(f, "    E2_ENTER_NOTE(%d);\n", fi);
+
 
   /* S1. One C local per value, by representation. A value that is not live is
      not declared: the IR keeps values that trivial-parameter removal dropped. */
@@ -5952,7 +6360,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     (void)any;
   }
-  fprintf(f, "    (void)fr; (void)ctx; (void)f;\n");
+  if (g_e2_fl) e2_compute_rooted(fn);
+  if (g_e2_fl)
+    fprintf(f, "    (void)fr; (void)ctx; (void)caller_f; (void)this_obj;\n");
+  else
+    fprintf(f, "    (void)fr; (void)ctx; (void)f;\n");
 
   /* The blocks in reverse postorder. `fn->blocks` is in pc order, which is a
      reverse postorder here: a block starts at every branch target and after
@@ -6144,10 +6556,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       uint64_t *lb =
           calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
       e2_handoff_note(fn, &fn->insns[lowered_to]);
+      e2_fl_block("unlowered", &fn->insns[lowered_to]);
       /* NAME THE REASON. The reps come from E2Types.lb -- never Q2Value.rep,
          which holds the old emitter's inference and reads BOT as TAG. A decline is
          almost always a representation some emitter will not accept. */
-      {
+      if (!g_e2_quiet || getenv("QJS_AOT_E2_FL_VERBOSE")) {
         const Q2Insn *hi = &fn->insns[lowered_to];
         char nm[64];
         int u, dd;
@@ -6192,6 +6605,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (set != NULL) q2_live_before(fn, last, set);
       if (is_term) {
         e2_handoff_note(fn, &fn->insns[last]);
+        e2_fl_block("terminator", &fn->insns[last]);
         fprintf(f, "    /* the terminator is 2b's: exit at its own pc */\n");
         e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1, b);
       } else if (blk->nsucc == 1 && blk->succ_block[0] >= 0 &&
@@ -6209,6 +6623,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
       } else {
         const uint64_t *lo = q2_live_out(fn, last);
+        e2_fl_block("no single successor", NULL);
         fprintf(f, "    /* fall through, no single successor: exit */\n");
         e2_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo, 1, b);
       }
@@ -6229,10 +6644,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    ax_%d:;\n", pc2);
       {
         const char *tx = e2_tag_expr('a', pc2);
-        fprintf(
-            f, "    E2_EXIT_LOG(\"%s\", \"ax\", %d, %s%s%s);\n", hex, pc2,
-            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
-            tx != NULL ? ")" : "");
+        char te[200];
+        snprintf(
+            te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
+            tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
+        e2_emit_exit_log(f, hex, "ax", pc2, te);
       }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_ax_cur[o], g_e2_ax_blk[o], 0);
@@ -6253,10 +6669,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    vx_%d:;\n", pc2);
       {
         const char *tx = e2_tag_expr('v', pc2);
-        fprintf(
-            f, "    E2_EXIT_LOG(\"%s\", \"vx\", %d, %s%s%s);\n", hex, pc2,
-            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
-            tx != NULL ? ")" : "");
+        char te[200];
+        snprintf(
+            te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
+            tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
+        e2_emit_exit_log(f, hex, "vx", pc2, te);
       }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_vx_cur[o], g_e2_vx_blk[o], 0);
@@ -6277,10 +6694,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    dx_%d:;\n", pc2);
       {
         const char *tx = e2_tag_expr('d', pc2);
-        fprintf(
-            f, "    E2_EXIT_LOG(\"%s\", \"dx\", %d, %s%s%s);\n", hex, pc2,
-            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
-            tx != NULL ? ")" : "");
+        char te[200];
+        snprintf(
+            te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
+            tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
+        e2_emit_exit_log(f, hex, "dx", pc2, te);
       }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_dx_cur[o], g_e2_dx_blk[o], 0);
@@ -6301,10 +6719,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    ox_%d:;\n", pc2);
       {
         const char *tx = e2_tag_expr('o', pc2);
-        fprintf(
-            f, "    E2_EXIT_LOG(\"%s\", \"ox\", %d, %s%s%s);\n", hex, pc2,
-            tx != NULL ? "JS_VALUE_GET_TAG(" : "", tx != NULL ? tx : "-100",
-            tx != NULL ? ")" : "");
+        char te[200];
+        snprintf(
+            te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
+            tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
+        e2_emit_exit_log(f, hex, "ox", pc2, te);
       }
       e2_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e2_ox_cur[o], g_e2_ox_blk[o], 0);
@@ -6333,7 +6752,19 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   }
 
   fprintf(f, "    }\n");
-  fprintf(f, "}\n\n");
+  fprintf(f, "}\n");
+  if (g_e2_fl)
+    fprintf(
+        f,
+        "#undef q2_arg_buf\n#undef qjs_aot_get_var_ref\n"
+        "#undef qjs_aot_var_ref_ptr\n");
+  if (g_e2_fl)
+    fprintf(
+        f,
+        "static void __attribute__((constructor)) e2_fl_reg_%s(void)\n"
+        "{ e2_nfl[%d] = 1; }\n",
+        hex, fi);
+  fprintf(f, "\n");
   (void)k;
 
   /* Step 8's report lines for this function. */
@@ -6378,9 +6809,100 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       free(mbuf);
       f = out;
     }
-    e2_report_spec(hex, vals, tiers, checks, lines, bytes);
+    if (g_e2_fl) e2_emit_frameless_forward(f, fn, hex);
+    if (!g_e2_quiet) e2_report_spec(hex, vals, tiers, checks, lines, bytes);
   }
   e2_facts_free(&facts);
   g_e2_facts = NULL;
   return 0;
 }
+
+/* Whether a function is worth trying as a frameless one: the static rules of D10.
+   1. a native entry exists at all (`light_ok`) and its frame is small;
+   2. no variable area (it holds counted values that must be released);
+   3. no call site (a call needs the caller's frame, and rules P and K stay off);
+   4. no op that allocates.
+   Rules 5 and 6 (every instruction has a fast path whose slow paths are exits)
+   are decided by emitting the body and seeing whether anything needed a handler. */
+static const char *e2_fl_prefilter(const Q2Func *fn) {
+  const JSAotGenFunc *g = fn->g;
+  int i;
+  if (!g->light_ok) return "not light";
+  if (g->light_need > 16 * 1024) return "frame over 16 KB";
+  if (g->light_var_count > 0) return "variable area";
+  if (g->func_kind != E2_FUNC_NORMAL) return "not a plain function";
+  if (e2_has_call_site(fn)) return "call site";
+  /* The ops whose fast path allocates. The role table's `allocates` bit is not
+     the test: it is set for every op that CAN reach an allocating slow path
+     (get_arg, get_var_ref, ...), and those have a fast path that does not. */
+  for (i = 0; i < fn->ninsns; i++) {
+    static const char *const names[] = {
+        "new_object",   "object_template", "array_const",  "array_from",
+        "make_closure", "define_class",    "define_class_computed",
+        "regexp",       "special_object",  "to_object",    "object_fill"};
+    char nm[64];
+    size_t k;
+    e2_rop_name(fn->insns[i].rop, nm, sizeof(nm));
+    for (k = 0; k < sizeof(names) / sizeof(names[0]); k++)
+      if (strcmp(nm, names[k]) == 0) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "allocates %s@%d", nm, fn->insns[i].pc);
+        return buf;
+      }
+  }
+  return NULL;
+}
+
+static int e2_fl_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("QJS_AOT_E2_NOFRAMELESS");
+    cached = !(v != NULL && v[0] != '0');
+  }
+  return cached;
+}
+
+/* The speculative body. A function that qualifies is emitted frameless: tried
+   first into a buffer whose output is discarded, and kept only if nothing in it
+   needed the engine's handler. Otherwise the framed body is emitted as before. */
+int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
+  const char *why;
+  int rc;
+  g_e2_fl_chosen = 0;
+  g_e2_fl_why[0] = 0;
+  if (!e2_fl_enabled()) {
+    snprintf(g_e2_fl_why, sizeof(g_e2_fl_why), "disabled");
+    return e2_emit_spec_body_pass(f, fn, hex);
+  }
+  why = e2_fl_prefilter(fn);
+  if (why != NULL) {
+    snprintf(g_e2_fl_why, sizeof(g_e2_fl_why), "%s", why);
+    return e2_emit_spec_body_pass(f, fn, hex);
+  }
+  {
+    char *mb = NULL;
+    size_t ml = 0;
+    FILE *m = open_memstream(&mb, &ml);
+    if (m == NULL) return e2_emit_spec_body_pass(f, fn, hex);
+    g_e2_fl = 1;
+    g_e2_quiet = 1;
+    g_e2_fl_block[0] = 0;
+    rc = e2_emit_spec_body_pass(m, fn, hex);
+    fclose(m);
+    free(mb);
+    g_e2_quiet = 0;
+    if (rc == 0 && g_e2_fl_block[0] == 0) {
+      g_e2_fl_chosen = 1;
+      rc = e2_emit_spec_body_pass(f, fn, hex);
+      g_e2_fl = 0;
+      return rc;
+    }
+    g_e2_fl = 0;
+    snprintf(g_e2_fl_why, sizeof(g_e2_fl_why), "%s", g_e2_fl_block);
+  }
+  return e2_emit_spec_body_pass(f, fn, hex);
+}
+
+/* Whether the body just emitted is a frameless one, and why not otherwise. */
+int e2_fl_was_chosen(void) { return g_e2_fl_chosen; }
+const char *e2_fl_why_not(void) { return g_e2_fl_why; }
