@@ -2256,10 +2256,13 @@ static void e2_load_local_from_frame(
    locals. A move whose source is in no local cannot: its value lives only in the
    frame (or nowhere yet), so the block must exit at the move instead. */
 static int trivial_is_lowerable(const Q2Insn *in, const Q2ValueId *cur) {
+  (void)cur;
+  /* R5: a move's source is use[0] and its destination is def[0]; both are named
+     by VALUE ID. Consulting cur[] (register -> value) for an operand was wrong:
+     cur[] exists only to decide what an EXIT writes back, and it is not
+     populated for a value the block itself just defined. */
   if (in->rop == ROP_move || in->rop == ROP_move_s) {
-    int src = E2_ROFF(in->arg[1]) / 16;
-    if (cur == NULL || src >= g_e2_fn->nregs) return 0;
-    if (cur[src] == Q2_NO_VALUE) return 0;
+    if (in->nuse < 1 || in->ndef < 1) return 0;
   }
   /* A constant only has a local of its own representation: undefined, null and
      the booleans are a JSValue or an int, never an i32/f64. */
@@ -2281,11 +2284,8 @@ static void emit_trivial_own(
   switch (in->rop) {
     case ROP_move:
     case ROP_move_s: {
-      /* The source is a register, whose current value is `cur[src]`; copy that
-         local. Reading the frame instead would defeat S1: the frame is written
-         only at exits, so the slot may be stale. */
-      int src = E2_ROFF(in->arg[1]) / 16;
-      Q2ValueId sv = src < g_e2_fn->nregs ? cur[src] : Q2_NO_VALUE;
+      /* The source is use[0], named by value id (R5). */
+      Q2ValueId sv = in->nuse > 0 ? in->use[0] : Q2_NO_VALUE;
       /* The source must already be in a local; if it is not, this move is not
          lowerable here and the block must exit at it instead. Each side is
          named by ITS OWN representation (S1): a value held as i32 is `i<v>`, not
