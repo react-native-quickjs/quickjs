@@ -1,0 +1,208 @@
+Subject: Record what a call returns, in the profile
+
+What this does
+  The AOT profiler keeps a record per call site (the `C` record, keyed by the
+  offset just past the call). This adds what the site's calls returned: the
+  type set and numeric range, written on the return path into the caller, and
+  dumped as a `K` line with how many calls and how many recorded returns the
+  site saw. The profile header says `callres=1`.
+
+Why we need it
+  The profiler recorded a call's result only where the handler stored it
+  through the profiled register write. A bytecode callee returns through the
+  return handlers, which wrote the caller's destination register with no
+  profile call, so nearly every call had no result record (box2d: 77 of 1649).
+  The generator then typed a call's result from the record at the next
+  instruction, which is that instruction's own, and the guard it produced
+  failed on every entry.
+
+  A return only records into a call site that already exists (a getter's or a
+  callback's return lands on none), a tail call's result belongs to the
+  original caller's site, and a site whose recorded returns do not match its
+  calls is not trusted by the reader. The macro is empty without
+  QJS_AOT_PROFILE, so the engine proper is unchanged.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1588,6 +1588,14 @@
+     uint8_t argc_min, argc_max;
+     uint8_t ncallee;
+     JSAotProfCallee callee[4];
++    /* What the calls at this site returned, recorded on the return path into
++       the caller. `res_count` is how many returns were seen; a site is only
++       trustworthy when it equals `count` (a call that threw, or a path that is
++       not instrumented, leaves it short). */
++    uint32_t res_count;
++    uint16_t res_types;    /* AOT_TYPE_* of the returned values */
++    uint8_t res_has_num, res_frac, res_negzero;
++    double res_min, res_max;
+ } JSAotProfCall;
+ 
+ typedef struct JSAotProfPc {
+@@ -1840,6 +1848,8 @@
+ static void js_aot_prof_alloc(JSFunctionBytecode *b, uint32_t props);
+ static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
+                              JSValue fn, int argc);
++static void js_aot_prof_call_result(JSFunctionBytecode *b, uint8_t *rip,
++                                    JSValue v);
+ #if QJS_REGVM_THREAD
+ static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc);
+ static void js_aot_prof_taken(JSFunctionBytecode *b, uint8_t *rpc);
+@@ -1872,6 +1882,11 @@
+ #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
+         do { if (unlikely(AOT_PROF_ON(b_))) \
+                  js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_)); } while (0)
++/* A bytecode callee returned `v_` into frame `c_` (a regvm frame) resuming at
++   `rip_`: record it against the call site that ends there. */
++#define AOT_PROF_CALL_RESULT(c_, rip_, v_) \
++        do { if (unlikely(AOT_PROF_ON((c_)->b))) \
++                 js_aot_prof_call_result((c_)->b, (rip_), (v_)); } while (0)
+ /* The threaded chain. `d_` is a register operand, encoded as index * 16. */
+ #define AOT_PROF_TICK(f_, ip_) \
+         do { if (unlikely(AOT_PROF_ON((f_)->b))) \
+@@ -1894,6 +1909,7 @@
+ #define AOT_PROF_PIC(b_, s_, sh_)   ((void)0)
+ #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
+ #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
++#define AOT_PROF_CALL_RESULT(c_, rip_, v_) ((void)0)
+ #define AOT_PROF_TICK(f_, ip_)      ((void)0)
+ #define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
+ #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
+@@ -27330,6 +27346,7 @@
+             {
+                 JSRuntime *rt = ctx->rt;
+ 
++                AOT_PROF_CALL_RESULT(c, rip, FR(s));
+                 *(JSValue *)((uint8_t *)c->fr + dst) = FR(s);
+                 rt->regvm_cur = c;
+             }
+@@ -27405,6 +27422,7 @@
+ 
+             /* dropping a light frame does not touch the arena top */
+             ctx->rt->regvm_cur = c;
++            AOT_PROF_CALL_RESULT(c, rip, JS_UNDEFINED);
+             *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
+             /* A light frame never tail-calls, so the caller's
+                `regvm_tail_chain` is kept. */
+@@ -27442,6 +27460,7 @@
+         }
+         ctx->rt->regvm_cur = f->sf->rv_light;
+     ctx->rt->current_stack_frame = f->sf->prev_frame;
++        AOT_PROF_CALL_RESULT(c, rip, JS_UNDEFINED);
+         *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
+         ctx->rt->regvm_tail_chain = 0;
+         f = c;
+@@ -27527,6 +27546,7 @@
+ #if QJS_DRC
+     /* v carries its own reference (regvm_t_return duplicated it); the caller's
+        register borrows it and the producer's reference is given up. */
++    AOT_PROF_CALL_RESULT(c, rip, v);
+     *(JSValue *)((uint8_t *)c->fr + dst) = v;
+     REG_ADOPT(ctx->rt, v);
+ #else
+@@ -27569,6 +27589,7 @@
+     ctx->rt->regvm_cur = f->sf->rv_light;
+     ctx->rt->current_stack_frame = f->sf->prev_frame;
+     /* no `REG_ADOPT`: the caller's register borrows */
++    AOT_PROF_CALL_RESULT(c, rip, v);
+     *(JSValue *)((uint8_t *)c->fr + dst) = v;
+     ctx->rt->regvm_tail_chain = 0;
+     f = c;
+@@ -27587,6 +27608,7 @@
+     regvm_arena_pop_chunk(ctx->rt);
+     ctx->rt->regvm_cur = f->sf->rv_light;
+     ctx->rt->current_stack_frame = f->sf->prev_frame;
++    AOT_PROF_CALL_RESULT(c, rip, v);
+     *(JSValue *)((uint8_t *)c->fr + dst) = v;
+     ctx->rt->regvm_tail_chain = 0;
+     f = c;
+@@ -28134,6 +28156,7 @@
+     /* A light frame is above the arena top, so releasing it only drops the
+        pointer: no top store, no chunk pop. */
+     ctx->rt->regvm_cur = c;
++    AOT_PROF_CALL_RESULT(c, rip, v);
+     *(JSValue *)((uint8_t *)c->fr + dst) = v;
+ #if QJS_DRC
+     /* `regvm_t_return` duplicated `v` before the release walk; the caller's
+@@ -61239,6 +61262,53 @@
+         ce->hits++;
+ }
+ 
++/* Record a returned value against the call site that ends at `rip`. Find only:
++   a return into a frame whose resume address is not a profiled call site
++   (a getter, a callback) records nothing. */
++static void js_aot_prof_call_result(JSFunctionBytecode *b, uint8_t *rip,
++                                    JSValue v)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    JSAotProfCall *c = NULL;
++    uint32_t pc;
++    uint16_t bit;
++    int i;
++
++    if (!pf || !rip)
++        return;
++    pc = (uint32_t)(rip - b->regvm_code);
++    for (i = 0; i < pf->ncalls; i++)
++        if (pf->calls[i].pc == pc) {
++            c = &pf->calls[i];
++            break;
++        }
++    if (!c)
++        return;
++    bit = aot_tag_class(v);
++    c->res_count++;
++    c->res_types |= bit;
++    if (bit == AOT_TYPE_INT || bit == AOT_TYPE_FLOAT) {
++        double d = bit == AOT_TYPE_INT ? (double)JS_VALUE_GET_INT(v)
++                                       : JS_VALUE_GET_FLOAT64(v);
++
++        if (bit == AOT_TYPE_FLOAT) {
++            if (d != trunc(d))
++                c->res_frac = 1;
++            if (d == 0.0 && 1.0 / d < 0.0)
++                c->res_negzero = 1;
++        }
++        if (!c->res_has_num) {
++            c->res_min = c->res_max = d;
++            c->res_has_num = 1;
++        } else {
++            if (d < c->res_min)
++                c->res_min = d;
++            if (d > c->res_max)
++                c->res_max = d;
++        }
++    }
++}
++
+ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
+ {
+     JSAotProfFunc *pf = b->aot_prof;
+@@ -61572,6 +61642,18 @@
+             }
+             fprintf(f, " hits=%u\n", ce->hits);
+         }
++        /* The site's returned values, once per site. `calls` and `results`
++           let the reader tell a complete record from a partial one. */
++        if (c->res_count) {
++            char ts[96];
++
++            aot_type_str(c->res_types, ts, sizeof(ts));
++            fprintf(f, "K %s pc=%u types=%s", dgt, c->pc, ts);
++            if (c->res_has_num)
++                fprintf(f, " num=%g..%g frac=%u negzero=%u", c->res_min,
++                        c->res_max, c->res_frac, c->res_negzero);
++            fprintf(f, " calls=%u results=%u\n", c->count, c->res_count);
++        }
+     }
+ }
+ 
+@@ -61586,7 +61668,7 @@
+         if (!f)
+             f = stderr;
+     }
+-    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u\n",
++    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1\n",
+             QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
+             QJS_REGVM_THREAD, QJS_REGVM_RECORD);
+     list_for_each(el, &rt->gc_obj_list) {
