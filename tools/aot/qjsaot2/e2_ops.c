@@ -3689,6 +3689,7 @@ static int emit_typed_this_field(
       site);
   fprintf(f, "        v%u = _v;\n", (unsigned)fv);
   fprintf(f, "      } else {\n");
+  fprintf(f, "        if (_own) JS_FreeValue(ctx, _t);\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
