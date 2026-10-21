@@ -4042,7 +4042,6 @@ static int emit_typed_elem_write(
 
   if (!have_types || t == NULL) return 0;
   if (in->rop != ROP_put_element && in->rop != ROP_put_element_xfer) return 0;
-  if (g_e2_fl) return 0; /* the inline element store counts references */
   if (role == NULL || role->control != E2_CF_NONE) return 0;
   if (in->nuse < 3) return 0;
   av = in->use[0];
@@ -4051,6 +4050,14 @@ static int emit_typed_elem_write(
   if (av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues ||
       vv >= (Q2ValueId)t->nvalues)
     return 0;
+  /* The inline store (`q2_elem_put`) is a plain store: it takes a new value and
+     an old one that carry no reference, and does no counting. A frameless body
+     leaves on the other cases, so only a number or a bool is stored there: an
+     object stored over a slot would leave on every execution. */
+  if (g_e2_fl && t->lb[vv] == E2_LB_TAG) {
+    e2_fl_block("an element store of a TAG value", in);
+    return 0;
+  }
   if (t->lb[av] != E2_LB_TAG) return 0;
   if (t->lb[kv] == E2_LB_I32)
     snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
@@ -5652,6 +5659,88 @@ static int e2_tag_numeric_shape(
   return 2;
 }
 
+/* `post_inc` / `post_dec` ("rrr": the ToNumeric value, the source, the value plus
+   or minus one) on a TAG source: ToNumeric of a number is the number, so the
+   first result is the source itself and the second is the unary fast path's. Both
+   results reach the frame before either guard, because an exit at the next pc
+   finds them there (the dx stub marks both registers as already stored). */
+static int emit_tag_post(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, char hex[33], int fi, int b) {
+  Q2ValueId d0 = in->def[0], d1 = in->def[1], src = in->use[0];
+  int r0, r1, k, sign;
+  char sn[64];
+
+  if (in->ndef != 2 || in->nuse != 1) return 0;
+  if (d0 >= (Q2ValueId)t->nvalues || d1 >= (Q2ValueId)t->nvalues ||
+      src >= (Q2ValueId)t->nvalues)
+    return 0;
+  if (t->lb[src] != E2_LB_TAG || !e2_operand_numeric(fn, src)) return 0;
+  r0 = fn->values[d0].reg;
+  r1 = fn->values[d1].reg;
+  if (r0 < 0 || r0 >= fn->nregs || r1 < 0 || r1 >= fn->nregs) return 0;
+  for (k = 0; k < 2; k++) {
+    int lb = t->lb[k ? d1 : d0];
+    if (lb != E2_LB_TAG && lb != E2_LB_I32 && lb != E2_LB_F64 && lb != E2_LB_BOOL)
+      return 0;
+  }
+  if (e2_must_exit(fn, in)) return 0;
+  sign = in->rop == ROP_post_inc ? REG_UN_INC : REG_UN_DEC;
+  e2_boxed_operand(sn, sizeof(sn), t, src);
+  e2_note_stub(
+      g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  fprintf(f, "    { JSValue _n = %s, _m;\n", sn);
+  fprintf(
+      f,
+      "      if (__builtin_expect((JS_VALUE_GET_TAG(_n) == JS_TAG_INT ||\n"
+      "                            JS_VALUE_GET_TAG(_n) == JS_TAG_FLOAT64) &&\n"
+      "                           q2_unary_fast(%d, _n, &_m), 1)) {\n",
+      sign);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _n);\n", r0 * 16);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _m);\n", r1 * 16);
+  for (k = 0; k < 2; k++) {
+    Q2ValueId dv = k ? d1 : d0;
+    const char *raw = k ? "_m" : "_n";
+    if (t->lb[dv] == E2_LB_TAG) {
+      fprintf(f, "        v%u = %s;\n", (unsigned)dv, raw);
+      continue;
+    }
+    if (e2_def_dead(in, dv)) continue;
+    e2_sweep_guard(f, "dx", in->next);
+    if (t->lb[dv] == E2_LB_I32)
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) "
+          "goto dx_%d;\n"
+          "        i%u = JS_VALUE_GET_INT(%s);\n",
+          raw, in->next, (unsigned)dv, raw);
+    else if (t->lb[dv] == E2_LB_F64)
+      fprintf(
+          f,
+          "        if (JS_VALUE_GET_TAG(%s) == JS_TAG_INT) d%u = "
+          "(double)JS_VALUE_GET_INT(%s);\n"
+          "        else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) d%u = "
+          "JS_VALUE_GET_FLOAT64(%s);\n"
+          "        else goto dx_%d;\n",
+          raw, (unsigned)dv, raw, raw, (unsigned)dv, raw, in->next);
+    else
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_BOOL, 0)) "
+          "goto dx_%d;\n"
+          "        b%u = JS_VALUE_GET_BOOL(%s);\n",
+          raw, in->next, (unsigned)dv, raw);
+  }
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n    }\n");
+  if (cur != NULL) {
+    cur[r0] = d0;
+    cur[r1] = d1;
+  }
+  return 1;
+}
+
 static int emit_tag_numeric(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
     Q2ValueId *cur, int have_types, char hex[33], int fi, int b) {
@@ -5662,6 +5751,9 @@ static int emit_tag_numeric(
   char aa[64], bb[64];
 
   if (!have_types || t == NULL) return 0;
+  if ((in->rop == ROP_post_inc || in->rop == ROP_post_dec) && role != NULL &&
+      role->control == E2_CF_NONE)
+    return emit_tag_post(f, fn, in, t, cur, hex, fi, b);
   shape = e2_tag_numeric_shape(in, role, &sub, &imm);
   if (shape == 0) return 0;
   /* `**` has no fast path in the engine's predicate at all: it would leave on
@@ -6234,6 +6326,56 @@ static int emit_typed_unary(
   return 0;
 }
 
+/* `post_inc` / `post_dec` ("rrr": the ToNumeric value, the source, the source plus
+   or minus one) on a typed source: the first result is the source, the second is
+   the source stepped. An i32 source leaves at INT32_MAX / INT32_MIN (the result is
+   no int); an f64 source cannot overflow. */
+static int emit_typed_post(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, int have_types) {
+  Q2ValueId d0, d1, a;
+  int r0, r1, inc;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_post_inc && in->rop != ROP_post_dec) return 0;
+  if (in->ndef != 2 || in->nuse != 1) return 0;
+  d0 = in->def[0];
+  d1 = in->def[1];
+  a = in->use[0];
+  if (d0 >= (Q2ValueId)t->nvalues || d1 >= (Q2ValueId)t->nvalues ||
+      a >= (Q2ValueId)t->nvalues)
+    return 0;
+  r0 = fn->values[d0].reg;
+  r1 = fn->values[d1].reg;
+  if (r0 < 0 || r0 >= fn->nregs || r1 < 0 || r1 >= fn->nregs) return 0;
+  inc = in->rop == ROP_post_inc;
+  if (t->lb[a] == E2_LB_I32 && t->lb[d0] == E2_LB_I32 &&
+      t->lb[d1] == E2_LB_I32) {
+    e2_sweep_guard(f, "ox", in->pc);
+    fprintf(
+        f,
+        "    if (__builtin_expect(i%u == %s, 0)) goto ox_%d;\n"
+        "    i%u = i%u %s 1;\n"
+        "    i%u = i%u;\n",
+        (unsigned)a, inc ? "INT32_MAX" : "INT32_MIN", in->pc, (unsigned)d1,
+        (unsigned)a, inc ? "+" : "-", (unsigned)d0, (unsigned)a);
+    e2_note_stub(
+        g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+  } else if (t->lb[a] == E2_LB_F64 && t->lb[d0] == E2_LB_F64 &&
+             t->lb[d1] == E2_LB_F64) {
+    fprintf(
+        f, "    d%u = d%u %s 1;\n    d%u = d%u;\n", (unsigned)d1, (unsigned)a,
+        inc ? "+" : "-", (unsigned)d0, (unsigned)a);
+  } else {
+    return 0;
+  }
+  if (cur != NULL) {
+    cur[r0] = d0;
+    cur[r1] = d1;
+  }
+  return 1;
+}
+
 /* `return` in the spec body: box the returned value from its local into its frame
    slot, then use the generic body's own return path (`qjs_aot_return` reads a
    frame slot). Freeing nothing else is correct: frame registers are released by
@@ -6346,6 +6488,9 @@ static int e2_dispatch_rop(
     case ROP_neg:
     case ROP_not:
       return emit_typed_unary(f, fn, in, t, cur, have_types, hex, fi);
+    case ROP_post_inc:
+    case ROP_post_dec:
+      return emit_typed_post(f, fn, in, t, cur, have_types);
     case ROP_bitand:
     case ROP_bitor:
     case ROP_bitxor:
