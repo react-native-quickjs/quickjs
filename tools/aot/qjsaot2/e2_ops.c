@@ -3299,6 +3299,155 @@ static int emit_typed_elem_write(
   return 1;
 }
 
+/* A SPECULATIVE-BODY CALL, mirroring `emit_native_call` + `emit_one_direct_call`:
+   same eligibility, same call sequence, and the result taken with
+   `qjs_aot_set_reg_p` because `aot_n_` hands back an OWNED reference.
+
+   RULE (E8): an emitter decides EVERYTHING before it writes a byte. This one used to
+   emit the call and then return 0 for an unrepresentable def, so the dispatcher ALSO
+   handed off -- and the callee ran twice. (Measured: smoke.js's `lc4` was one extra
+   `lf1` call, i.e. exactly 2.5 too high per iteration.) So every check runs first.
+
+   CONTROL FLOW: each candidate's success path ends at `cd_<pc>:`; the slow path -- no
+   candidate matched, so the call has NOT run -- hands off at this pc, and `cd_<pc>:`
+   follows. A failed `q2_call_entry` must never fall through with no call at all. */
+static int emit_typed_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k, nb = 0, cc, th, off, na, w, r;
+  char recv[64];
+  Q2ValueId dv;
+  int dreg;
+
+  /* ---- every check, before any output ---- */
+  if (!have_types || t == NULL) return 0;
+  if (e2_nocall_on()) return 0;
+  if (!call_site_shaped(fn, in)) return 0;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits))
+    return 0;
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1) continue;
+    if (!qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    nb++;
+  }
+  if (nb == 0) return 0;
+  cc = call_callee_off(in);
+  th = call_this_off(in);
+  off = dest_off(fn, in);
+  na = in->win_n;
+  w = in->win_reg * 16;
+  if (off < 0 || cc < 0 || in->ndef < 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  /* A TAG def is a plain local copy; a typed def needs the post-call tag guard. */
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64)
+    return 0;
+  dreg = off / 16;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  /* A typed def's guard exits at the NEXT pc (the call has run), so that exit must
+     exist; the same registration the op-call wrapper uses. */
+  if (t->lb[dv] != E2_LB_TAG &&
+      g_e2_dx_n < (int)(sizeof(g_e2_dx) / sizeof(g_e2_dx[0]))) {
+    int q, seen = 0;
+    for (q = 0; q < g_e2_dx_n; q++)
+      if (g_e2_dx[q] == in->next) seen = 1;
+    if (!seen) g_e2_dx[g_e2_dx_n++] = in->next;
+  }
+  if (th >= 0)
+    snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
+  else
+    snprintf(recv, sizeof(recv), "JS_UNDEFINED");
+
+  /* ---- output starts here; it must not be abandoned ---- */
+  fprintf(f, "    /* R6: sync live TAG values before the call */\n");
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v;
+    if (cur == NULL) break;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF) continue;
+    if (v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] != E2_LB_TAG) continue;
+    fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", r * 16, (unsigned)v);
+  }
+  /* The argument window: every slot the callee reads must be current. */
+  for (r = 0; r < na; r++) {
+    Q2ValueId v;
+    int wr = in->win_reg + r;
+    if (cur == NULL || wr >= fn->nregs) continue;
+    v = cur[wr];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E2_LB_TAG)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
+              wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", wr * 16,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
+              wr * 16, (unsigned)v);
+  }
+
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1) continue;
+    if (!qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_call_entry(AOT_REG(fr, %d), "
+        "(const void *)aot_f_%s), 1)) {\n",
+        cc, callee[k]);
+    fprintf(
+        f,
+        "        JSValue _o = aot_n_%s(ctx, f,\n"
+        "            (JSObject *)JS_VALUE_GET_PTR(AOT_REG(fr, %d)), %s,\n"
+        "            &AOT_REG(fr, %d), %d);\n",
+        callee[k], cc, recv, w, na);
+    fprintf(
+        f,
+        "        if (__builtin_expect(JS_IsException(_o), 0)) return JS_EXCEPTION;\n"
+        "        qjs_aot_set_reg_p(ctx, fr, %d, _o);\n",
+        off);
+    if (t->lb[dv] == E2_LB_TAG) {
+      fprintf(f, "        v%u = _o;\n", (unsigned)dv);
+    } else if (t->lb[dv] == E2_LB_I32) {
+      /* The call has run, so a failed guard is an ordinary exit at the NEXT pc. */
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) "
+          "goto dx_%d;\n"
+          "        i%u = JS_VALUE_GET_INT(_o);\n",
+          in->next, (unsigned)dv);
+    } else {
+      fprintf(
+          f,
+          "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = "
+          "(double)JS_VALUE_GET_INT(_o);\n"
+          "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = "
+          "JS_VALUE_GET_FLOAT64(_o);\n"
+          "        else goto dx_%d;\n",
+          (unsigned)dv, (unsigned)dv, in->next);
+    }
+    fprintf(f, "        goto cd_%d;\n", in->pc);
+    fprintf(f, "    }\n");
+    fprintf(f, "#endif\n");
+  }
+  /* No candidate matched: the call has NOT run, so hand off AT this pc. */
+  fprintf(f, "    E2_HANDOFF_NOTE(%d);\n", fi);
+  fprintf(f, "    return aot_g_%s(ctx, f, fr, %d);\n", hex, in->pc);
+  fprintf(f, "    cd_%d: ;\n", in->pc);
+  if (cur != NULL) cur[dreg] = dv;
+  return 1;
+}
+
 /* A speculative-body GLOBAL READ: `get_global` ("rabs": dest, atom offset, throw
    flag, site). `q2_global_hit` is the same inline test the generic body uses; a
    miss goes to the wrapper, which performs the real lookup (that path can run a
@@ -3321,6 +3470,11 @@ static int emit_typed_global_read(
   if (dv >= (Q2ValueId)t->nvalues) return 0;
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
+  /* EVERY check before the first byte: a TAG def is a plain copy, an i32/f64 def
+     gets the post-hit tag guard. */
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64)
+    return 0;
 
   fprintf(f, "    { JSValue _g;\n");
   fprintf(
@@ -3348,8 +3502,6 @@ static int emit_typed_global_read(
           "JS_VALUE_GET_FLOAT64(_g);\n"
           "        else goto dx_%d;\n",
           (unsigned)dv, (unsigned)dv, in->next);
-    else
-      return 0;
   }
   fprintf(f, "      } else {\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
@@ -4462,6 +4614,11 @@ static int emit_typed_branch(
     char ex[128];
     if (t->lb[av] == E2_LB_TAG) { tag_side = 0; ntags++; }
     if (t->lb[bv] == E2_LB_TAG) { tag_side = 1; ntags++; }
+    /* A bit-test on a TAG operand would need a toi32 of a JSValue payload; decline
+       instead of emitting `&` on doubles. */
+    if (ntags > 0 && (base == REG_BIN_AND || base == REG_BIN_OR ||
+                      base == REG_BIN_XOR))
+      return 0;
     {
       int want_f64 = (t->lb[av] == E2_LB_F64 || t->lb[bv] == E2_LB_F64);
       if (ntags == 0) {
@@ -4807,6 +4964,11 @@ static int e2_dispatch_rop(
     case ROP_get_length:
       return emit_typed_length(f, fn, in, t, cur, have_types, hex, fi, b);
 
+    /* -- calls -- */
+    case ROP_call:
+    case ROP_call_method:
+      return emit_typed_call(f, fn, in, t, cur, have_types, hex, fi, b);
+
     /* -- this, and strict equality as a value -- */
     case ROP_load_this:
       /* DISABLED: see the note on emit_typed_load_this. */
@@ -5029,11 +5191,29 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
         e2_note_defs(cur, fn, in);
-      } else if (e2_dispatch_rop(
-                     f, fn, in, &types, cur, have_types, hex, fi, b, role)) {
-        e2_note_defs(cur, fn, in);
       } else {
-        break;
+        /* RULE: an emitter either emits or declines -- never both. An emitter that
+           writes and then returns 0 makes the dispatcher ALSO hand off, so an op
+           runs twice (measured: one extra call per iteration in smoke.js's `lc4`).
+           The output position is the witness, so a violation aborts here instead of
+           producing a wrong unit. */
+        long before = ftell(f);
+        int emitted =
+            e2_dispatch_rop(f, fn, in, &types, cur, have_types, hex, fi, b, role);
+        if (!emitted) {
+          if (ftell(f) != before) {
+            fprintf(
+                stderr,
+                "e2: emitter for rop %u (%s, pc %d) wrote %ld bytes and then "
+                "declined; it must decide everything before emitting\n",
+                (unsigned)in->rop,
+                e2_roles[in->rop] ? "see the role table" : "?", in->pc,
+                ftell(f) - before);
+            abort();
+          }
+          break;
+        }
+        e2_note_defs(cur, fn, in);
       }
       lowered_to = i2 + 1;
     }
