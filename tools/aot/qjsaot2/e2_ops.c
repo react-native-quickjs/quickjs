@@ -2537,6 +2537,34 @@ static void e2_emit_arm(
     return;
   }
   e2_emit_edge_moves(f, fn, b, k, cur);
+  /* RULE P / R6: every back edge polls, like the generic dispatch. Without it a
+     loop in the spec body cannot be interrupted, and clang proves the loop to be
+     side-effect free and replaces it with a closed form -- which is why an
+     "empty" loop measured 0 instructions per iteration.
+     The sync before the poll is REQUIRED: qjs_aot_poll can run the interrupt
+     handler and the GC, and a TAG value held only in a C local is invisible to
+     the GC, so the frame must own every live value before the call. */
+  if (q2_is_back_edge(fn, b, sb)) {
+    const Q2Block *t = &fn->blocks[sb];
+    int q;
+    fprintf(
+        f,
+        "      if (__builtin_expect(--*(int *)((unsigned char *)ctx +\n"
+        "              QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n");
+    fprintf(
+        f,
+        "          ++*(int *)((unsigned char *)ctx +\n"
+        "              QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n");
+    for (q = 0; q < t->nlive_in; q++) {
+      int rr = t->in_reg[q];
+      Q2ValueId vv = t->in_val[q];
+      if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+      if (cur != NULL && cur[rr] != Q2_NO_VALUE) e2_exit_store(f, cur[rr], rr);
+      else e2_exit_store(f, vv, rr);
+    }
+    fprintf(f, "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
+    fprintf(f, "      }\n");
+  }
   fprintf(f, "      goto s_%d;\n", fn->blocks[sb].start_pc);
 }
 
