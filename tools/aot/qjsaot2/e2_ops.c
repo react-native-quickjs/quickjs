@@ -2901,6 +2901,148 @@ static int emit_typed_opcall(
   return 1;
 }
 
+/* A speculative-body CHAINED FIELD READ: `get_field_chain` ("rrasrras": recv,
+   atom1, site1, recv2, atom2, site2, ...). Two hit tests; a miss at EITHER link
+   goes through the op-call wrapper for the WHOLE instruction, which re-executes it
+   from the start. That is why the receiver is saved before link 1 writes its
+   result over it: when the destination register IS the receiver (which the IR does
+   whenever the chain's first result is written back over its own operand), the
+   wrapper would otherwise re-read the wrong receiver -- the `71901cd` bug. */
+static int emit_typed_field_chain(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId rv, d0v, d1v;
+  int s1, s2, rreg, d0reg, d1reg;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_get_field_chain && in->rop != ROP_get_field_chain_own)
+    return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->narg < 8 || in->arg[3].kind != 's' || in->arg[7].kind != 's')
+    return 0;
+  s1 = (int)in->arg[3].val;
+  s2 = (int)in->arg[7].val;
+  if (s1 == 0xffff || s2 == 0xffff) return 0;
+  if (in->ndef < 2 || in->nuse < 1) return 0;
+  rv = in->use[0];
+  d0v = in->def[0];
+  d1v = in->def[1];
+  if (rv >= (Q2ValueId)t->nvalues || d0v >= (Q2ValueId)t->nvalues ||
+      d1v >= (Q2ValueId)t->nvalues)
+    return 0;
+  /* All three are JSValues: the receiver is borrowed from its cell and the
+     results are borrowed from the object's slots, so TAG locals throughout. */
+  if (t->lb[rv] != E2_LB_TAG || t->lb[d0v] != E2_LB_TAG ||
+      t->lb[d1v] != E2_LB_TAG)
+    return 0;
+  rreg = fn->values[rv].reg;
+  d0reg = fn->values[d0v].reg;
+  d1reg = fn->values[d1v].reg;
+  if (rreg < 0 || rreg >= fn->nregs || d0reg < 0 || d0reg >= fn->nregs ||
+      d1reg < 0 || d1reg >= fn->nregs)
+    return 0;
+
+  fprintf(f, "    { JSValue _c0, _c1;\n");
+  fprintf(f, "      JSValue _rcv = v%u;\n", (unsigned)rv);
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+      "_rcv, %d, (int)q2_ns, &_c0), 1)) {\n",
+      s1);
+  /* Link 1's result goes to its local; the frame slot is written too, because a
+     link-2 miss hands the WHOLE instruction to the wrapper. */
+  fprintf(f, "        v%u = _c0;\n", (unsigned)d0v);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _c0);\n", d0reg * 16);
+  fprintf(
+      f,
+      "        if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+      "_c0, %d, (int)q2_ns, &_c1), 1)) {\n",
+      s2);
+  fprintf(f, "          v%u = _c1;\n", (unsigned)d1v);
+  fprintf(f, "        } else {\n");
+  /* Link 2 missed: restore the receiver and hand the whole instruction over. */
+  fprintf(f, "          AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "        }\n");
+  fprintf(f, "      } else {\n");
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) {
+    cur[d0reg] = d0v;
+    cur[d1reg] = d1v;
+  }
+  return 1;
+}
+
+/* A speculative-body FIELD WRITE: `put_field` ("rasr": receiver, atom, value,
+   site). The hit helper is a plain store (`q2_put_field_hit`), so under DRC there
+   is no ownership question on the hit path -- the same call the generic body makes.
+   A miss goes to the op-call wrapper: the store may be a setter, which runs JS.
+   Operand registers are read from their LOCALS (R4/R5): a TAG operand is synced to
+   its frame slot first because the helper takes JSValues from the frame. */
+static int emit_typed_field_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId rv, vv;
+  int site, rreg, vreg, r;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_put_field) return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->nuse < 2 || in->narg < 4 || in->arg[2].kind != 's') return 0;
+  site = (int)in->arg[2].val;
+  rv = in->use[0];
+  vv = in->use[1];
+  if (rv >= (Q2ValueId)t->nvalues || vv >= (Q2ValueId)t->nvalues) return 0;
+  /* The RECEIVER must be a TAG local (a number receiver misses the PIC anyway), but
+     the VALUE may be typed: it is boxed for the frame slot the helper reads. */
+  if (t->lb[rv] != E2_LB_TAG) return 0;
+  rreg = fn->values[rv].reg;
+  vreg = fn->values[vv].reg;
+  if (rreg < 0 || rreg >= fn->nregs || vreg < 0 || vreg >= fn->nregs) return 0;
+
+  {
+    char boxed[64];
+    if (t->lb[vv] == E2_LB_I32)
+      snprintf(boxed, sizeof(boxed), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)vv);
+    else if (t->lb[vv] == E2_LB_F64)
+      snprintf(boxed, sizeof(boxed), "__JS_NewFloat64(d%u)", (unsigned)vv);
+    else if (t->lb[vv] == E2_LB_BOOL)
+      snprintf(boxed, sizeof(boxed), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
+    else
+      snprintf(boxed, sizeof(boxed), "v%u", (unsigned)vv);
+  fprintf(f, "    {\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_put_field_hit(ctx, pic, "
+      "v%u, %d, %s), 1)) {\n",
+      (unsigned)rv, site, boxed);
+  fprintf(f, "      } else {\n");
+  /* The frame must hold the operands before the wrapper syncs and steps. */
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", rreg * 16, (unsigned)rv);
+  if (t->lb[vv] == E2_LB_I32)
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
+            vreg * 16, (unsigned)vv);
+  else if (t->lb[vv] == E2_LB_F64)
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n",
+            vreg * 16, (unsigned)vv);
+  else if (t->lb[vv] == E2_LB_BOOL)
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
+            vreg * 16, (unsigned)vv);
+  else
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", vreg * 16, (unsigned)vv);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  }
+  (void)r;
+  return 1;
+}
+
 /* A speculative-body FIELD READ: `get_field` / `get_field2` ("rras": dest,
    receiver, atom, site). This is a SEPARATE emitter from the generic body's, on
    purpose: the shared part is the runtime helper (q2_own_read_hit), not the emitted
@@ -4069,6 +4211,12 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
                  emit_typed_arith(f, fn, in, &types, cur)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_field_read(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_field_chain(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_field_write(
                      f, fn, in, &types, cur, have_types, hex, fi, b)) {
         e2_note_defs(cur, fn, in);
       } else {
