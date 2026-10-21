@@ -2221,6 +2221,36 @@ static int emit_typed_arith(
   return 1;
 }
 
+/* A register whose slot a transfer EMPTIED. E2_UNDEF is not a value id, so it
+   cannot collide with one; the exit sync writes JS_UNDEFINED for it. */
+#define E2_UNDEF ((Q2ValueId)-2)
+
+/* THE bookkeeping for a lowered instruction: which value each register holds now.
+   Called once, from the dispatcher, after every lowered instruction -- not from
+   inside each lowering. Ten scattered updates meant a new lowering could silently
+   forget its own, leaving cur[] pointing at an older value, and cur[] is what an
+   exit syncs to the frame.
+   A def whose register is out of range is a generator bug, never a reason to
+   index register 0. */
+static void e2_note_defs(Q2ValueId *cur, const Q2Func *fn, const Q2Insn *in) {
+  int k;
+  if (cur == NULL) return;
+  for (k = 0; k < in->ndef; k++) {
+    Q2ValueId d = in->def[k];
+    int r;
+    if (d == Q2_NO_VALUE || d >= (Q2ValueId)fn->nvalues) continue;
+    r = fn->values[d].reg;
+    if (r < 0 || r >= fn->nregs) {
+      fprintf(
+          stderr,
+          "e2: def v%d of rop %d has register %d outside 0..%d\n", (int)d,
+          in->rop, r, fn->nregs - 1);
+      abort();
+    }
+    cur[r] = d;
+  }
+}
+
 /* Load a block's live-in register from the frame into the value's local. This is
    the block's entry load (S1): after it the block works on locals only. */
 static void e2_load_local_from_frame(
@@ -2261,7 +2291,8 @@ static int trivial_is_lowerable(const Q2Insn *in, const Q2ValueId *cur) {
      by VALUE ID. Consulting cur[] (register -> value) for an operand was wrong:
      cur[] exists only to decide what an EXIT writes back, and it is not
      populated for a value the block itself just defined. */
-  if (in->rop == ROP_move || in->rop == ROP_move_s) {
+  if (in->rop == ROP_move || in->rop == ROP_move_s ||
+      in->rop == ROP_move_xfer) {
     if (in->nuse < 1 || in->ndef < 1) return 0;
   }
   /* A constant only has a local of its own representation: undefined, null and
@@ -2283,8 +2314,15 @@ static void emit_trivial_own(
   if (in->ndef > 0) d = in->def[0];
   switch (in->rop) {
     case ROP_move:
-    case ROP_move_s: {
-      /* The source is use[0], named by value id (R5). */
+    case ROP_move_s:
+    case ROP_move_xfer: {
+      /* The source is use[0], named by value id (R5).
+         move_xfer is the TRANSFER form: the generic body also EMPTIES the source
+         register, so the source slot must be marked empty here or an exit that
+         syncs it writes the old value back (for an object, a second frame
+         reference with no dup). Under QJS_DRC registers borrow, so there is no
+         dup or free to mirror -- the copy plus the empty marker is the whole
+         effect. */
       Q2ValueId sv = in->nuse > 0 ? in->use[0] : Q2_NO_VALUE;
       /* The source must already be in a local; if it is not, this move is not
          lowerable here and the block must exit at it instead. Each side is
@@ -2292,6 +2330,10 @@ static void emit_trivial_own(
          `v<v>`. */
       if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE)
         e2_copy_local(f, d, sv);
+      if (in->rop == ROP_move_xfer && sv != Q2_NO_VALUE) {
+        int sr = g_e2_fn->values[sv].reg;
+        if (sr >= 0 && sr < g_e2_fn->nregs && cur != NULL) cur[sr] = E2_UNDEF;
+      }
       break;
     }
     case ROP_load_i8:
@@ -2414,7 +2456,7 @@ static void e2_exit_store(FILE *f, Q2ValueId v, int reg) {
    reads the frame unconditionally. */
 static void e2_emit_exit(
     FILE *f, const Q2Func *fn, int pc, char hex[33], int fi,
-    const Q2ValueId *cur, const uint64_t *live_set, int handoff) {
+    const Q2ValueId *cur, const uint64_t *live_set, int handoff, int blkidx) {
   int words = fn->lwords, w, r;
 
   fprintf(f, "    {\n");
@@ -2428,7 +2470,24 @@ static void e2_emit_exit(
         /* A register the spec body holds in a local is written from it; one it
            never touched already has the right contents in the frame, so it is
            left alone. Writing a stale definition would corrupt exactly that. */
-        if (cur == NULL || cur[r] == Q2_NO_VALUE) continue;
+        if (cur == NULL) continue;
+        if (cur[r] == E2_UNDEF) {
+          fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_UNDEFINED);\n", r * 16);
+          continue;
+        }
+        if (cur[r] == Q2_NO_VALUE) {
+          /* The entry block legitimately has function-start state; anywhere
+             else a live register with no value means the bookkeeping lost it. */
+          if (blkidx != 0) {
+            fprintf(
+                stderr,
+                "e2: live register %d has no value at an exit in a non-entry "
+                "block (fn %s)\n",
+                r, hex);
+            abort();
+          }
+          continue;
+        }
         e2_exit_store(f, cur[r], r);
       }
     }
@@ -2450,7 +2509,7 @@ static void e2_emit_exit_at(
     const Q2ValueId *cur) {
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (lb != NULL) q2_live_before(fn, ins, lb);
-  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0);
+  e2_emit_exit(f, fn, pc, hex, fi, cur, lb, 0, -1);
   free(lb);
 }
 
@@ -3159,18 +3218,22 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         }
         break;
       }
+      /* The spec body's OWN list. `is_trivial` is shared with the generic
+         emitter, which has no case for these, so adding one there emits nothing
+         and silently drops the instruction. */
       if (is_trivial(in) || in->rop == ROP_get_arg ||
-          in->rop == ROP_get_arg2) {
+          in->rop == ROP_get_arg2 || in->rop == ROP_move_xfer) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
+        e2_note_defs(cur, fn, in);
       } else if (emit_typed_arith_imm(f, fn, in, &types, cur, have_types)) {
-        /* lowered */
+        e2_note_defs(cur, fn, in);
       } else if (emit_typed_unary(
                      f, fn, in, &types, cur, have_types, hex, fi)) {
-        /* lowered */
+        e2_note_defs(cur, fn, in);
       } else if (have_types &&
                  emit_typed_arith(f, fn, in, &types, cur)) {
-        /* lowered */
+        e2_note_defs(cur, fn, in);
       } else {
         break;
       }
@@ -3189,7 +3252,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    /* exit at the first unlowered instruction */\n");
       if (lb != NULL) q2_live_before(fn, lowered_to, lb);
       e2_emit_exit(
-          f, fn, fn->insns[lowered_to].pc, hex, fi, cur, lb, 1);
+          f, fn, fn->insns[lowered_to].pc, hex, fi, cur, lb, 1, b);
       free(lb);
     } else {
       /* The whole non-terminator prefix was lowered. Two sub-cases, and they
@@ -3209,11 +3272,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (is_term) {
         e2_handoff_note(fn, &fn->insns[last]);
         fprintf(f, "    /* the terminator is 2b's: exit at its own pc */\n");
-        e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1);
+        e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1, b);
       } else {
         const uint64_t *lo = q2_live_out(fn, last);
         fprintf(f, "    /* fall through: the last instruction ran */\n");
-        e2_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo, 1);
+        e2_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo, 1, b);
       }
       free(set);
     }
