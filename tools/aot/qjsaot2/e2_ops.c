@@ -2155,6 +2155,20 @@ static void e2_fl_block(const char *what, const Q2Insn *in) {
   }
 }
 
+/* In a frameless body a miss is an exit, and a site whose reads the profile saw
+   hit anything but the object's own property (a method on the prototype, a getter)
+   misses the inline own-property test on EVERY execution: the function would leave
+   every time and the 257-exit rule would switch it off. Such a read keeps the
+   function framed, where the miss continues. */
+int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
+static int e2_fl_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
+  if (!g_e2_fl) return 1;
+  if (qjs_aot_prof_site_own(fn->g->digest, site)) return 1;
+  e2_fl_block("a read that is not an own hit", in);
+  return 0;
+}
+
+
 /* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
    forced to fail, so its stub runs even where the speculation always holds. It
    sits where the guard's own exit would be taken -- for dx_, after the op's raw
@@ -4484,6 +4498,7 @@ static int emit_typed_this_field(
   rreg = fn->values[rv].reg;
   if (freg < 0 || freg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
 
+  if (!e2_fl_site_ok(fn, in, site)) return 0;
   if (g_e2_fl) {
     e2_note_stub(
         g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
@@ -4602,6 +4617,7 @@ static int emit_typed_field_chain(
        the block hands off (an exit) rather than emit the wrapper. */
     if (e2_must_exit(fn, in)) return 0;
   }
+  if (!e2_fl_site_ok(fn, in, s1) || !e2_fl_site_ok(fn, in, s2)) return 0;
   fprintf(f, "    { JSValue _c0, _c1;\n");
   fprintf(f, "      JSValue _rcv = v%u;\n", (unsigned)rv);
   fprintf(
@@ -4682,6 +4698,12 @@ static int emit_typed_field_write(
       snprintf(boxed, sizeof(boxed), "v%u", (unsigned)vv);
     {
       int g = e2_exit_group(fn, in, site);
+      /* No reference counting inline: a store of a TAG value (an object, null)
+         over what is usually a reference leaves on nearly every execution. */
+      if (g_e2_fl && t->lb[vv] == E2_LB_TAG) {
+        e2_fl_block("a store of a TAG value", in);
+        return 0;
+      }
       if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
       if (e2_must_exit(fn, in)) return 0;
       /* The inline store counts references. */
@@ -4971,6 +4993,7 @@ static int emit_typed_field_read(
     }
     if (e2_must_exit(fn, in)) return 0;
   }
+  if (!e2_fl_site_ok(fn, in, site)) return 0;
   /* Register the guard exits' pcs ONCE per body, like the other dx_ users. */
   e2_note_stub(
       g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
@@ -5110,6 +5133,10 @@ static int emit_typed_var_ref_store(
       break;
     default:
       return 0;
+  }
+  if (g_e2_fl && t->lb[a] == E2_LB_TAG) {
+    e2_fl_block("a cell store of a TAG value", in);
+    return 0;
   }
   if (g_e2_fl) {
     /* No reference counting inline: the store goes ahead only when neither the
@@ -5976,6 +6003,14 @@ static int emit_typed_branch(
     char ex[128];
     if (t->lb[av] == E2_LB_TAG) { tag_side = 0; ntags++; }
     if (t->lb[bv] == E2_LB_TAG) { tag_side = 1; ntags++; }
+    /* A frameless body leaves at the cold arm. An operand the profile says is not
+       a number (strings, objects) reaches it on most executions, which would be
+       an exit per call: such a compare keeps the function framed. */
+    if (g_e2_fl && ((t->lb[av] == E2_LB_TAG && !e2_operand_numeric(fn, av)) ||
+                    (t->lb[bv] == E2_LB_TAG && !e2_operand_numeric(fn, bv)))) {
+      e2_fl_block("a compare of non-numbers", in);
+      return 0;
+    }
     /* A bit-test on a TAG operand would need a toi32 of a JSValue payload; decline
        instead of emitting `&` on doubles. */
     if (ntags > 0 && (base == REG_BIN_AND || base == REG_BIN_OR ||
