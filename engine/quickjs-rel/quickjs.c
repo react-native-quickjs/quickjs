@@ -28343,6 +28343,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
                              vc(oargv), 0);
     if (JS_IsException(rv))
         T_FAIL();
+    AOT_PROF_CALL_RESULT(f, ip + 8, rv);
     T_SET_NEXT_P(d, rv, 8);
 }
 
@@ -28366,6 +28367,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
             JSString *sp_ = JS_VALUE_GET_STRING(FR(r));
             uint32_t i_ = (uint32_t)JS_VALUE_GET_INT(oargv[0]);
             rv = i_ < sp_->len ? js_int32(string_get(sp_, i_)) : JS_NAN;
+            AOT_PROF_CALL_RESULT(f, ip + 10, rv);
             T_SET_NEXT_P(d, rv, 10);
         }
     }
@@ -28374,6 +28376,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
         rv = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na, vc(oargv), 0);
     if (JS_IsException(rv))
         T_FAIL();
+    AOT_PROF_CALL_RESULT(f, ip + 10, rv);
     T_SET_NEXT_P(d, rv, 10);
 }
 #endif /* QJS_REGVM_RECORD */

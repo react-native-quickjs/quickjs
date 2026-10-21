@@ -124,6 +124,28 @@ Why we need it
      *(JSValue *)((uint8_t *)c->fr + dst) = v;
  #if QJS_DRC
      /* `regvm_t_return` duplicated `v` before the release walk; the caller's
+@@ -28190,6 +28213,7 @@
+                              vc(oargv), 0);
+     if (JS_IsException(rv))
+         T_FAIL();
++    AOT_PROF_CALL_RESULT(f, ip + 8, rv);
+     T_SET_NEXT_P(d, rv, 8);
+ }
+ 
+@@ -28215,4 +28239,5 @@
+             rv = i_ < sp_->len ? js_int32(string_get(sp_, i_)) : JS_NAN;
++            AOT_PROF_CALL_RESULT(f, ip + 10, rv);
+             T_SET_NEXT_P(d, rv, 10);
+         }
+     }
+@@ -28225,6 +28250,7 @@
+         rv = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na, vc(oargv), 0);
+     if (JS_IsException(rv))
+         T_FAIL();
++    AOT_PROF_CALL_RESULT(f, ip + 10, rv);
+     T_SET_NEXT_P(d, rv, 10);
+ }
+ #endif /* QJS_REGVM_RECORD */
 @@ -61239,6 +61262,53 @@
          ce->hits++;
  }
