@@ -93,7 +93,7 @@ void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
 }
 
 void e2_report_spec(
-    const char *hex, const int vals[4], const int tiers[4], const int checks[6],
+    const char *hex, const int vals[4], const int tiers[4], const int checks[9],
     long lines, long bytes) {
   if (e2_rep == NULL) return;
   fprintf(
@@ -103,8 +103,11 @@ void e2_report_spec(
       e2_rep, "e2 tiers hex=%s typed=%d opcall=%d handoff=%d other=%d\n", hex,
       tiers[0], tiers[1], tiers[2], tiers[3]);
   fprintf(
-      e2_rep, "e2 checks hex=%s ax=%d vx=%d dx=%d ox=%d exits=%d handoffs=%d\n",
-      hex, checks[0], checks[1], checks[2], checks[3], checks[4], checks[5]);
+      e2_rep,
+      "e2 checks hex=%s ax=%d vx=%d dx=%d ox=%d exits=%d handoffs=%d "
+      "shapes=%d skipped=%d fwd=%d\n",
+      hex, checks[0], checks[1], checks[2], checks[3], checks[4], checks[5],
+      checks[6], checks[7], checks[8]);
   fprintf(e2_rep, "e2 code hex=%s lines=%ld bytes=%ld\n", hex, lines, bytes);
 }
 

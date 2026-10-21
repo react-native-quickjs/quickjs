@@ -2247,6 +2247,73 @@ static void e2_note_stub(
   blks[*n] = g_e2_blk;
   (*n)++;
 }
+
+/* ---- monomorphic groups in the speculative body (D9) ------------------- */
+
+/* The facts of the body being emitted, run in the grouped-exit mode: an access
+   the pass marks `miss_exits` is emitted with its miss as an EXIT before the
+   instruction, never as the op-call wrapper, because the pass treated it as no
+   safepoint. NULL when the body has no analysis. */
+static const E2Facts *g_e2_facts;
+/* Which groups some access uses: only those are validated at entry and
+   re-checked after a safepoint. */
+static uint8_t *g_e2_group_used;
+/* The report counts: shape tests emitted and skipped, loads forwarded. */
+static int g_e2_n_shape, g_e2_n_skip, g_e2_n_fwd;
+/* Set by a grouped emitter, so the dispatcher can check that an instruction the
+   facts classed as a miss-exit was in fact emitted as one. */
+static int g_e2_miss_exit_seen;
+
+static int e2_insn_idx(const Q2Func *fn, const Q2Insn *in) {
+  return (int)(in - fn->insns);
+}
+
+/* The group `site` belongs to when the facts say this instruction's miss exits,
+   else -1. */
+static int e2_exit_group(const Q2Func *fn, const Q2Insn *in, int site) {
+  if (g_e2_facts == NULL || !g_e2_facts->miss_exits[e2_insn_idx(fn, in)])
+    return -1;
+  return e2_facts_site_group(g_e2_facts, site);
+}
+
+/* Whether the facts classed this instruction as a miss-exit: its miss must be
+   an exit, so no emitter may give it the op-call wrapper. */
+static int e2_must_exit(const Q2Func *fn, const Q2Insn *in) {
+  return g_e2_facts != NULL && g_e2_facts->miss_exits[e2_insn_idx(fn, in)];
+}
+
+/* After a safepoint (an op call, a call): a group whose cell no longer holds
+   the shape taken at entry has been refilled, so the speculation about it is
+   over. Exit at the next instruction, with the op's results already in the
+   frame (the dx_ stub). One helper for every safepoint emitter. */
+static void e2_emit_group_recheck(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur) {
+  int g;
+  (void)fn;
+  if (g_e2_facts == NULL) return;
+  for (g = 0; g < g_e2_facts->ngroups; g++) {
+    if (g_e2_group_used == NULL || !g_e2_group_used[g]) continue;
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    e2_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_cell_shape(pic, %d) != gsh%d, 0)) goto "
+        "dx_%d;\n",
+        g_e2_facts->groups[g].first_site, g, in->next);
+  }
+}
+
+/* Defined with the other field emitters below; the chain and write emitters
+   above them call these. */
+static int emit_group_chain(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g1, int s1,
+    int g2, int s2, Q2ValueId rv, Q2ValueId d0v, Q2ValueId d1v, int d0reg,
+    int d1reg);
+static int emit_group_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g,
+    int site, Q2ValueId rv, const char *boxed);
+
 /* The analysis for the function being emitted. The spec body's representations
    come from HERE (E2Types.lb), never from Q2Value.rep: that holds the old
    emitter's inference, whose BOT reads as TAG and which disagrees with the
@@ -2747,6 +2814,54 @@ static void e2_emit_exit_at(
   free(lb);
 }
 
+/* The C expression that converts value `src` to the representation of value
+   `dst`: a typed source is a C scalar, only a TAG source is a JSValue, and a
+   TAG source read as a typed local has its tag checked by the caller's guard.
+   Shared by the edge moves and by a forwarded load, which is a copy. The result
+   is a static buffer: use it before the next call. */
+static const char *e2_copy_expr(Q2ValueId src, Q2ValueId dst) {
+  static char buf[192];
+  char sn[32];
+  const char *sp = e2_rep_prefix(src), *dp = e2_rep_prefix(dst);
+  e2_local_name(sn, sizeof(sn), src);
+  if (sp[0] == dp[0]) snprintf(buf, sizeof(buf), "%s", sn);
+  /* numeric <-> numeric is a cast */
+  else if (sp[0] == 'i' && dp[0] == 'd')
+    snprintf(buf, sizeof(buf), "(double)%s", sn);
+  else if (sp[0] == 'd' && dp[0] == 'i')
+    snprintf(buf, sizeof(buf), "(int32_t)%s", sn);
+  else if (sp[0] == 'i' && dp[0] == 'b')
+    snprintf(buf, sizeof(buf), "(%s != 0)", sn);
+  else if (sp[0] == 'b' && dp[0] == 'i')
+    snprintf(buf, sizeof(buf), "(int32_t)%s", sn);
+  else if (sp[0] == 'b' && dp[0] == 'd')
+    snprintf(buf, sizeof(buf), "(double)%s", sn);
+  else if (sp[0] == 'd' && dp[0] == 'b')
+    snprintf(buf, sizeof(buf), "(%s != 0)", sn);
+  /* a TAG source can be read as any typed local, with the tag checked */
+  else if (sp[0] == 'v' && dp[0] == 'i')
+    snprintf(buf, sizeof(buf), "(int32_t)JS_VALUE_GET_INT(%s)", sn);
+  else if (sp[0] == 'v' && dp[0] == 'd')
+    snprintf(
+        buf, sizeof(buf),
+        "JS_VALUE_GET_TAG(%s) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(%s) : "
+        "JS_VALUE_GET_FLOAT64(%s)",
+        sn, sn, sn);
+  else if (sp[0] == 'v' && dp[0] == 'b')
+    snprintf(buf, sizeof(buf), "JS_VALUE_GET_BOOL(%s)", sn);
+  /* a typed source boxed into a JSValue destination */
+  else if (sp[0] == 'i')
+    snprintf(buf, sizeof(buf), "JS_MKVAL(JS_TAG_INT, %s)", sn);
+  else if (sp[0] == 'd')
+    snprintf(
+        buf, sizeof(buf), "qjs_aot_box_num(%s, qjs_aot_fitsi(%s))", sn, sn);
+  else if (sp[0] == 'b')
+    snprintf(buf, sizeof(buf), "JS_MKVAL(JS_TAG_BOOL, %s)", sn);
+  else
+    snprintf(buf, sizeof(buf), "%s", sn);
+  return buf;
+}
+
 /* One edge u->s as a PARALLEL move: temps first, then assign, so a swap is
    order-independent. Pure locals -- only exits write the frame. */
 /* An edge's parameter moves are correct by construction: every moved source is
@@ -2776,35 +2891,7 @@ static void e2_emit_edge_moves(
       case 'b': fprintf(f, "      int %s_t%d = ", e2_rep_prefix(pv), k); break;
       default: fprintf(f, "      JSValue %s_t%d = ", e2_rep_prefix(pv), k); break;
     }
-    {
-      Q2ValueId av = blk->edge_arg[si][k];
-      char sn[32];
-      const char *sp = e2_rep_prefix(av), *dp = e2_rep_prefix(pv);
-      e2_local_name(sn, sizeof(sn), av);
-      /* Convert from the SOURCE's representation to the destination's, using
-         the value each side actually is: a typed source is a C scalar, only a
-         TAG source is a JSValue. */
-      if (sp[0] == dp[0]) fprintf(f, "%s;\n", sn);
-      /* numeric <-> numeric is a cast */
-      else if (sp[0] == 'i' && dp[0] == 'd') fprintf(f, "(double)%s;\n", sn);
-      else if (sp[0] == 'd' && dp[0] == 'i') fprintf(f, "(int32_t)%s;\n", sn);
-      else if (sp[0] == 'i' && dp[0] == 'b') fprintf(f, "(%s != 0);\n", sn);
-      else if (sp[0] == 'b' && dp[0] == 'i') fprintf(f, "(int32_t)%s;\n", sn);
-      else if (sp[0] == 'b' && dp[0] == 'd') fprintf(f, "(double)%s;\n", sn);
-      else if (sp[0] == 'd' && dp[0] == 'b') fprintf(f, "(%s != 0);\n", sn);
-      /* a TAG source can be read as any typed local, with the tag checked */
-      else if (sp[0] == 'v' && dp[0] == 'i')
-        fprintf(f, "(int32_t)JS_VALUE_GET_INT(%s);\n", sn);
-      else if (sp[0] == 'v' && dp[0] == 'd')
-        fprintf(f, "JS_VALUE_GET_TAG(%s) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(%s) : JS_VALUE_GET_FLOAT64(%s);\n", sn, sn, sn);
-      else if (sp[0] == 'v' && dp[0] == 'b')
-        fprintf(f, "JS_VALUE_GET_BOOL(%s);\n", sn);
-      /* a typed source boxed into a JSValue destination */
-      else if (sp[0] == 'i') fprintf(f, "JS_MKVAL(JS_TAG_INT, %s);\n", sn);
-      else if (sp[0] == 'd') fprintf(f, "qjs_aot_box_num(%s, qjs_aot_fitsi(%s));\n", sn, sn);
-      else if (sp[0] == 'b') fprintf(f, "JS_MKVAL(JS_TAG_BOOL, %s);\n", sn);
-      else fprintf(f, "%s;\n", sn);
-    }
+    fprintf(f, "%s;\n", e2_copy_expr(blk->edge_arg[si][k], pv));
   }
   for (k = 0; k < np; k++) {
     Q2ValueId pv = s->param_val[k];
@@ -3108,6 +3195,7 @@ static int emit_typed_opcall(
      e2_note_defs does that once the whole instruction is lowered, so an emitter
      with two miss paths gives the second one the pre-instruction state. */
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
+  e2_emit_group_recheck(f, fn, in, cur);
   g_e2_opcalls++;
   return 1;
 }
@@ -3929,6 +4017,15 @@ static int emit_typed_field_chain(
       d1reg < 0 || d1reg >= fn->nregs)
     return 0;
 
+  {
+    int g1 = e2_exit_group(fn, in, s1), g2 = e2_exit_group(fn, in, s2);
+    if (g1 >= 0 && g2 >= 0)
+      return emit_group_chain(
+          f, fn, in, cur, g1, s1, g2, s2, rv, d0v, d1v, d0reg, d1reg);
+    /* Classed as a miss-exit by the facts but not groupable here: decline, so
+       the block hands off (an exit) rather than emit the wrapper. */
+    if (e2_must_exit(fn, in)) return 0;
+  }
   fprintf(f, "    { JSValue _c0, _c1;\n");
   fprintf(f, "      JSValue _rcv = v%u;\n", (unsigned)rv);
   fprintf(
@@ -4007,6 +4104,11 @@ static int emit_typed_field_write(
       snprintf(boxed, sizeof(boxed), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
     else
       snprintf(boxed, sizeof(boxed), "v%u", (unsigned)vv);
+    {
+      int g = e2_exit_group(fn, in, site);
+      if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
+      if (e2_must_exit(fn, in)) return 0;
+    }
   fprintf(f, "    {\n");
   fprintf(
       f,
@@ -4032,6 +4134,181 @@ static int emit_typed_field_write(
   fprintf(f, "    }\n");
   }
   (void)r;
+  return 1;
+}
+
+/* A field read's raw result `_f` becomes the def's local: a TAG def is a plain
+   copy (borrowed under DRC); a typed def writes `_f` to the frame slot FIRST --
+   so the generic body finds the op's result there if the guard fails -- then
+   guards it into the local, a mismatch exiting at the NEXT pc. Returns 0 when
+   the def's representation has no guard. */
+static int emit_hit_result(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId dv,
+    int dreg) {
+  (void)fn;
+  if (t->lb[dv] == E2_LB_TAG) {
+    fprintf(f, "        v%u = _f;\n", (unsigned)dv);
+    return 1;
+  }
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _f);\n", dreg * 16);
+  /* Nothing reads the result: the frame write above is all it needs. */
+  if (e2_def_dead(in, dv)) return 1;
+  e2_sweep_guard(f, "dx", in->next);
+  if (t->lb[dv] == E2_LB_I32)
+    fprintf(
+        f,
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_INT, 0)) "
+        "goto dx_%d;\n"
+        "        i%u = JS_VALUE_GET_INT(_f);\n",
+        in->next, (unsigned)dv);
+  else if (t->lb[dv] == E2_LB_F64)
+    fprintf(
+        f,
+        "        if (JS_VALUE_GET_TAG(_f) == JS_TAG_INT) d%u = "
+        "(double)JS_VALUE_GET_INT(_f);\n"
+        "        else if (JS_VALUE_GET_TAG(_f) == JS_TAG_FLOAT64) d%u = "
+        "JS_VALUE_GET_FLOAT64(_f);\n"
+        "        else goto dx_%d;\n",
+        (unsigned)dv, (unsigned)dv, in->next);
+  else if (t->lb[dv] == E2_LB_BOOL)
+    fprintf(
+        f,
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_BOOL, 0)) "
+        "goto dx_%d;\n"
+        "        b%u = JS_VALUE_GET_BOOL(_f);\n",
+        in->next, (unsigned)dv);
+  else
+    return 0;
+  return 1;
+}
+
+/* The exit stub of a grouped access: its guard failed BEFORE the instruction, so
+   the generic body redoes it (a `vx_` stub, state from before the access). The
+   tag logged is the receiver's. */
+static void e2_group_exit_stub(
+    FILE *f, const Q2Insn *in, const Q2ValueId *cur, Q2ValueId rv) {
+  char ex[64];
+  e2_note_stub(
+      g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+  snprintf(ex, sizeof(ex), "v%u", (unsigned)rv);
+  e2_note_tag('v', in->pc, ex);
+  e2_sweep_guard(f, "vx", in->pc);
+}
+
+/* The test that sends a grouped access to its exit: the receiver must be an
+   object of the group's shape (skipped when the facts already hold that), and
+   this site's own cell must still say the same (a refill after entry would move
+   the offset). `write` selects the own-writable cell kind. */
+static void e2_group_test(
+    char *out, size_t n, int skip, const char *recv, int g, int site,
+    int write) {
+  snprintf(
+      out, n, "%s(pic, %d) != gsh%d",
+      write ? "q2_cell_wshape" : "q2_cell_shape", site, g);
+  if (!skip) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "q2_shape_of(%s) != gsh%d || %s", recv, g, out);
+    snprintf(out, n, "%s", tmp);
+  }
+  if (skip)
+    g_e2_n_skip++;
+  else
+    g_e2_n_shape++;
+}
+
+/* A grouped field READ: tag and shape test (unless implied), the slot load at
+   the group's offset, the lazy-JSON test; every failure exits before the
+   instruction. */
+static int emit_group_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, int g, int site, Q2ValueId dv, Q2ValueId rv, int dreg) {
+  char test[320], recv[32];
+  int skip = g_e2_facts->skip[e2_insn_idx(fn, in)];
+  /* Decide everything before writing a byte. */
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64 && t->lb[dv] != E2_LB_BOOL)
+    return 0;
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  e2_group_exit_stub(f, in, cur, rv);
+  e2_group_test(test, sizeof(test), skip, recv, g, site, 0);
+  fprintf(f, "    { JSValue _f;\n");
+  fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  fprintf(f, "      _f = *q2_slotp(%s, q2_cell_off(pic, %d));\n", recv, site);
+  fprintf(
+      f,
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == "
+      "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
+      in->pc);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg)) {
+    fprintf(
+        stderr, "e2: grouped read at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  g_e2_miss_exit_seen = 1;
+  return 1;
+}
+
+/* A grouped CHAINED read (`get_field_chain`: o.a.b): two grouped reads, the
+   second on the first's result. Any failure exits before the instruction, so
+   neither result is written until both loads have passed. The facts' skip flag
+   is per instruction, not per link, so both receivers are always tested. */
+static int emit_group_chain(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g1, int s1,
+    int g2, int s2, Q2ValueId rv, Q2ValueId d0v, Q2ValueId d1v, int d0reg,
+    int d1reg) {
+  char test[320], recv[32];
+  (void)fn;
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  e2_group_exit_stub(f, in, cur, rv);
+  fprintf(f, "    { JSValue _c0, _c1;\n");
+  e2_group_test(test, sizeof(test), 0, recv, g1, s1, 0);
+  fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  fprintf(f, "      _c0 = *q2_slotp(%s, q2_cell_off(pic, %d));\n", recv, s1);
+  fprintf(
+      f,
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
+      "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
+      in->pc);
+  e2_group_test(test, sizeof(test), 0, "_c0", g2, s2, 0);
+  fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  fprintf(f, "      _c1 = *q2_slotp(_c0, q2_cell_off(pic, %d));\n", s2);
+  fprintf(
+      f,
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_c1) == "
+      "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
+      in->pc);
+  fprintf(
+      f, "      v%u = _c0;\n      v%u = _c1;\n    }\n", (unsigned)d0v,
+      (unsigned)d1v);
+  if (cur != NULL) {
+    cur[d0reg] = d0v;
+    cur[d1reg] = d1v;
+  }
+  g_e2_miss_exit_seen = 1;
+  return 1;
+}
+
+/* A grouped field WRITE: the same tests, plus the prototype flag, then the
+   engine's own store order (duplicate the new value, store, free the old one). */
+static int emit_group_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g,
+    int site, Q2ValueId rv, const char *boxed) {
+  char test[320], recv[32];
+  int skip = g_e2_facts->skip[e2_insn_idx(fn, in)];
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  e2_group_exit_stub(f, in, cur, rv);
+  e2_group_test(test, sizeof(test), skip, recv, g, site, 1);
+  fprintf(f, "    {\n");
+  fprintf(
+      f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
+      test, recv, in->pc);
+  fprintf(
+      f, "      q2_put_slot(ctx, %s, q2_cell_off(pic, %d), %s);\n", recv, site,
+      boxed);
+  fprintf(f, "    }\n");
+  g_e2_miss_exit_seen = 1;
   return 1;
 }
 
@@ -4076,6 +4353,18 @@ static int emit_typed_field_read(
   rreg = fn->values[rv].reg;
   if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
 
+  /* A grouped access (the facts say its miss exits) takes the group path: the
+     op-call wrapper below would make it a safepoint the facts did not assume. */
+  {
+    int g = e2_exit_group(fn, in, site);
+    if (g >= 0) {
+      /* Register the guard exits' pcs ONCE per body, like the other dx_ users. */
+      e2_note_stub(
+          g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+      return emit_group_read(f, fn, in, t, cur, g, site, dv, rv, dreg);
+    }
+    if (e2_must_exit(fn, in)) return 0;
+  }
   /* Register the guard exits' pcs ONCE per body, like the other dx_ users. */
   e2_note_stub(
       g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
@@ -4085,44 +4374,7 @@ static int emit_typed_field_read(
       "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
       "v%u, %d, (int)q2_ns, &_f), 1)) {\n",
       (unsigned)rv, site);
-  if (t->lb[dv] == E2_LB_TAG) {
-    fprintf(f, "        v%u = _f;\n", (unsigned)dv);
-  } else {
-    /* Write the raw result to the frame FIRST: on a guard mismatch the exit is at
-       the next pc and the generic body must find the op's result there. */
-    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _f);\n", dreg * 16);
-    /* Nothing reads the result: the frame write above is all it needs. */
-    if (!e2_def_dead(in, dv)) {
-      e2_sweep_guard(f, "dx", in->next);
-      if (t->lb[dv] == E2_LB_I32)
-        fprintf(
-            f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_INT, "
-            "0)) "
-            "goto dx_%d;\n"
-            "        i%u = JS_VALUE_GET_INT(_f);\n",
-            in->next, (unsigned)dv);
-      else if (t->lb[dv] == E2_LB_F64)
-        fprintf(
-            f,
-            "        if (JS_VALUE_GET_TAG(_f) == JS_TAG_INT) d%u = "
-            "(double)JS_VALUE_GET_INT(_f);\n"
-            "        else if (JS_VALUE_GET_TAG(_f) == JS_TAG_FLOAT64) d%u = "
-            "JS_VALUE_GET_FLOAT64(_f);\n"
-            "        else goto dx_%d;\n",
-            (unsigned)dv, (unsigned)dv, in->next);
-      else if (t->lb[dv] == E2_LB_BOOL)
-        fprintf(
-            f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_BOOL, "
-            "0)) "
-            "goto dx_%d;\n"
-            "        b%u = JS_VALUE_GET_BOOL(_f);\n",
-            in->next, (unsigned)dv);
-      else
-        return 0;
-    }
-  }
+  if (!emit_hit_result(f, fn, in, t, dv, dreg)) return 0;
   /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
      inlined duplicate (the reviewer's ruling). */
   fprintf(f, "      } else {\n");
@@ -5162,6 +5414,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   memset(g_e2_n_guard, 0, sizeof(g_e2_n_guard));
   g_e2_n_exit = g_e2_n_handoff = 0;
   g_e2_xtag_n = 0;
+  g_e2_facts = NULL;
+  free(g_e2_group_used);
+  g_e2_group_used = NULL;
+  g_e2_n_shape = g_e2_n_skip = g_e2_n_fwd = 0;
   int n_left = 0;
   FILE *out = NULL;
   char *mbuf = NULL;
@@ -5187,12 +5443,14 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   if (q2_is_reducible(fn) == 1) {
     /* The analyses the typed lowerings read. The emitter never reads
        Q2Value.rep/spec or Q2Insn.fwd: those hold the old lowering's inference,
-       which treats BOT as TAG. E8's facts mode is the continuing-miss one, so a
-       grouped field access is an ordinary safepoint. */
-    if (e2_facts_run(fn, &facts, 0) == 0) {
+       which treats BOT as TAG. The facts run in the grouped-exit mode: a grouped
+       field access is no safepoint because its miss is an exit, and the field
+       emitters emit it that way (a check in the dispatcher enforces it). */
+    if (e2_facts_run(fn, &facts, 1) == 0) {
       if (e2_types_run(fn, &facts, &types) == 0) {
         have_types = 1;
         g_e2_types = &types;
+        g_e2_facts = &facts;
       } else {
         /* CLEAR the global when this function has no analysis. Leaving the previous
            function's types in place made e2_rep_prefix name locals with ANOTHER
@@ -5272,6 +5530,52 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         "        return aot_g_%s(ctx, f, fr, 0);\n"
         "    }\n",
         fi, hex);
+  /* D9 step 2. Entry: each group some access uses takes the shape its first
+     site's cell holds, and every other site's cell must agree. A NULL first cell
+     means the profile's shape is not in the cache yet (the generic body will
+     fill it); a filled cell that names ANOTHER shape means this run does not
+     see the profiled one. Either refuses, and the generic body serves the call.
+     An unfilled cell on a later site is tolerated: that access misses and exits
+     until the generic body fills it. */
+  {
+    int g, q;
+    int ng = g_e2_facts != NULL ? g_e2_facts->ngroups : 0;
+    g_e2_group_used = calloc((size_t)(ng > 0 ? ng : 1), 1);
+    for (q = 0; g_e2_group_used != NULL && q < g_e2_facts->nsites; q++) {
+      const E2SiteInfo *si = &g_e2_facts->sites[q];
+      if (si->group >= 0 && g_e2_facts->miss_exits[si->insn])
+        g_e2_group_used[si->group] = 1;
+    }
+    for (g = 0; g < ng; g++) {
+      const E2Group *gr = &g_e2_facts->groups[g];
+      if (!g_e2_group_used[g]) continue;
+      /* The shape is the first filled cell among the group's sites. */
+      fprintf(f, "    const void *gsh%d = NULL;\n", g);
+      for (q = 0; q < gr->nsites; q++)
+        fprintf(
+            f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(pic, %d);\n", g, g,
+            gr->sites[q]);
+      fprintf(
+          f,
+          "    if (__builtin_expect(gsh%d == NULL, 0)) {\n"
+          "        E2_EXIT_LOG(\"%s\", \"refuse-first\", %d, "
+          "q2_cell_kind(pic, %d));\n"
+          "        E2_REFUSE_NOTE(%d);\n"
+          "        return aot_g_%s(ctx, f, fr, 0);\n"
+          "    }\n",
+          g, hex, gr->first_site, gr->first_site, fi, hex);
+      for (q = 0; q < gr->nsites; q++)
+        fprintf(
+            f,
+            "    { const void *_s = q2_cell_shape(pic, %d);\n"
+            "      if (__builtin_expect(_s != NULL && _s != gsh%d, 0)) {\n"
+            "        E2_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
+            "        E2_REFUSE_NOTE(%d);\n"
+            "        return aot_g_%s(ctx, f, fr, 0);\n"
+            "      } }\n",
+            gr->sites[q], g, hex, gr->sites[q], fi, hex);
+    }
+  }
   /* Counted only now: everything that could refuse the entry has been passed, so
      this measures speculative bodies that ACTUALLY RAN. */
   fprintf(f, "    E2_ENTER_NOTE(%d);\n", fi);
@@ -5398,6 +5702,22 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         }
         break;
       }
+      /* A load the facts forward is a copy of the value the location already
+         holds: no access, no shape test, no tag guard. The result is current in
+         its register through cur[] like any other def. */
+      if (g_e2_facts != NULL && in->ndef == 1 && in->def[0] != Q2_NO_VALUE &&
+          g_e2_facts->fwd[i2] != Q2_NO_VALUE) {
+        char dn[32];
+        e2_local_name(dn, sizeof(dn), in->def[0]);
+        fprintf(
+            f, "    %s = %s;\n", dn,
+            e2_copy_expr(g_e2_facts->fwd[i2], in->def[0]));
+        e2_note_defs(cur, fn, in);
+        g_e2_n_fwd++;
+        g_e2_n_typed++;
+        lowered_to = i2 + 1;
+        continue;
+      }
       /* The spec body's OWN list. `generic_is_trivial` is shared with the generic
          emitter, which has no case for these, so adding one there emits nothing and
          silently drops the instruction. */
@@ -5417,8 +5737,21 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
            The output position is the witness, so a violation aborts here instead of
            producing a wrong unit. */
         long before = ftell(f);
-        int emitted =
-            e2_dispatch_rop(f, fn, in, &types, cur, have_types, hex, fi, b, role);
+        int must_exit = e2_must_exit(fn, in), emitted;
+        g_e2_miss_exit_seen = 0;
+        emitted = e2_dispatch_rop(
+            f, fn, in, &types, cur, have_types, hex, fi, b, role);
+        /* The facts treated this access as no safepoint only because its miss
+           exits; an emitter that gave it a continuing miss would leave facts the
+           miss may have broken. */
+        if (emitted && must_exit && !g_e2_miss_exit_seen) {
+          fprintf(
+              stderr,
+              "e2: pc %d (rop %u) is a miss-exit access but was not emitted as "
+              "one\n",
+              in->pc, (unsigned)in->rop);
+          abort();
+        }
         if (!emitted) {
           if (ftell(f) != before) {
             fprintf(
@@ -5645,7 +5978,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
 
   /* Step 8's report lines for this function. */
   {
-    int vals[4] = {0, 0, 0, 0}, tiers[4], checks[6], v;
+    int vals[4] = {0, 0, 0, 0}, tiers[4], checks[9], v;
     long lines = -1, bytes = -1;
     for (v = 0; v < types.nvalues; v++) switch (types.lb[v]) {
         case E2_LB_I32:
@@ -5671,6 +6004,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     checks[3] = g_e2_n_guard[3];
     checks[4] = g_e2_n_exit;
     checks[5] = g_e2_n_handoff;
+    checks[6] = g_e2_n_shape;
+    checks[7] = g_e2_n_skip;
+    checks[8] = g_e2_n_fwd;
     if (out != NULL) {
       size_t i;
       fclose(f);
@@ -5684,5 +6020,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     e2_report_spec(hex, vals, tiers, checks, lines, bytes);
   }
+  e2_facts_free(&facts);
+  g_e2_facts = NULL;
   return 0;
 }

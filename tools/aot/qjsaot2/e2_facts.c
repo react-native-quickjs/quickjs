@@ -77,6 +77,7 @@
 /* The profile's site and coverage records, from qjsaot.c. */
 int qjs_aot_prof_site(
     const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
+int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
 
 /* ---- the fact set -------------------------------------------------------- */
@@ -571,6 +572,8 @@ static int build_groups(const Q2Func *fn, E2Facts *f) {
     const Q2Insn *in = &fn->insns[sites[k].insn];
     if (!qjs_aot_prof_site(fn->g->digest, sites[k].site, &ns, shapes)) continue;
     if (ns != 1) continue; /* polymorphic or never filled: no group */
+    /* Only an own readable or writable slot has a fixed offset to group on. */
+    if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) continue;
     if (qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) continue;
     for (j = 0; j < ng; j++) {
       if (gshape[j] == (int64_t)shapes[0]) {

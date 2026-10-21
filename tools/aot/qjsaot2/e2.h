@@ -178,7 +178,7 @@ void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
    (ax, vx, dx, ox) and exits (deopt, hand-off); `code`, the body's size in lines
    and bytes (-1 when unknown). */
 void e2_report_spec(
-    const char *hex, const int vals[4], const int tiers[4], const int checks[6],
+    const char *hex, const int vals[4], const int tiers[4], const int checks[9],
     long lines, long bytes);
 
 /* --- the unit builder's native-entry registry --------------------------- */

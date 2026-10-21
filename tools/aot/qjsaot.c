@@ -183,6 +183,9 @@ typedef struct {
   int site;
   int nshapes;
   uint64_t shape[PROF_MAX_SHAPES];
+  /* Which cache kinds the site's fills installed, one bit per REG_PIC_* value
+     (only meaningful when the header said `sitekinds=1`). */
+  unsigned kinds;
 } ProfSite;
 
 /* A `U` record: a pc range the profiler never saw executed, inclusive. */
@@ -228,6 +231,9 @@ static int g_prof_thr = 0;
 /* Whether the header said `callres=1`: the profile records call results on
    every instrumented return path. Without it no `K` record is believed. */
 static int g_prof_callres = 0;
+/* Whether the header said `sitekinds=1`: the `S` records carry the cache kinds,
+   so a site can be told apart as an own slot, a prototype read or an add. */
+static int g_prof_sitekinds = 0;
 static const ProfEntry *g_cur_prof = NULL;
 /* Call-binding site ids (the engine's per-runtime binding array is indexed by
    one). A deopt site has its own id space, handed out by `g_deopt_site_next`,
@@ -461,6 +467,10 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
       {
         const char *cp = strstr(line, "callres=");
         g_prof_callres = cp && strtoul(cp + 8, NULL, 10) != 0;
+      }
+      {
+        const char *kp = strstr(line, "sitekinds=");
+        g_prof_sitekinds = kp && strtoul(kp + 10, NULL, 10) != 0;
       }
     }
   }
@@ -721,6 +731,10 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           ps = &e->sites[e->nsites++];
           memset(ps, 0, sizeof(*ps));
           ps->site = site;
+        }
+        {
+          const char *kd = strstr(line + 2, "kinds=");
+          if (kd) ps->kinds |= (unsigned)strtoul(kd + 6, NULL, 10);
         }
         for (k = 0; k < nshapes; k++) {
           char key[24];
@@ -3338,6 +3352,25 @@ int qjs_aot_prof_site(
   return 0;
 }
 
+/* Whether a property site can be grouped: every fill installed an own readable
+   slot or an own writable one, nothing else. A prototype read or an add-
+   transition store can never hit an own slot at a fixed offset, so a group made
+   of one would exit (or refuse) forever. Without `sitekinds` the profile cannot
+   say, and no site qualifies. */
+int qjs_aot_prof_site_own(const uint8_t dg[16], int site) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i;
+  if (!e || !g_prof_sitekinds) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    unsigned k;
+    if (e->sites[i].site != site) continue;
+    k = e->sites[i].kinds;
+    /* bits: 1 = REG_PIC_OWN, 3 = REG_PIC_OWN_W; anything else disqualifies */
+    return k != 0 && (k & ~((1u << 1) | (1u << 3))) == 0;
+  }
+  return 0;
+}
+
 /* Whether the profiler never executed the instruction at `pc` (a `U` record).
    Such a block is emitted as an exit in a specialised body. */
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc) {
@@ -4404,11 +4437,11 @@ int qjsaot_driver_main(int argc, char **argv) {
            only makes things faster can ONLY be tested by counting one function. */
         "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
         "    if (e2_ent[i] == 0) continue;\n"
-        "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u\\n\",\n"
+        "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d\\n\",\n"
         "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
         "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
         "            (unsigned long long)e2_han[i], (unsigned long long)e2_ref[i],\n"
-        "            (unsigned)e2_off[i]);\n"
+        "            (unsigned)e2_off[i], i);\n"
         "  }\n"
         "}\n"
         "#endif\n"
@@ -4726,6 +4759,12 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W) "
         "return NULL;\n"
         "  return *(const void *const *)e;\n"
+        "}\n\n"
+        "static inline int q2_cell_kind(const void *pic, int k)\n"
+        "{\n"
+        "  if (pic == NULL || (unsigned)k == QJS_AOT_REG_IC_NONE) return -1;\n"
+        "  return *(const uint16_t *)((const unsigned char *)pic + (size_t)k "
+        "* QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_KIND);\n"
         "}\n\n"
         "static inline const void *q2_cell_wshape(const void *pic, int k)\n"
         "{\n"
@@ -5107,6 +5146,32 @@ int qjsaot_driver_main(int argc, char **argv) {
         "{\n"
         "  if (JS_VALUE_HAS_REF_COUNT(v))\n"
         "    ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
+        "}\n\n");
+    /* A grouped field store, after the caller has checked the shape: the same
+       store the engine's fast path makes, minus the cache lookup (the offset
+       comes from the group's cell). The new value is duplicated before the old
+       one is released, so storing a slot's own value cannot free it. A
+       prototype receiver goes to the engine, which invalidates the prototype
+       epoch, so the caller exits on it first. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) int q2_is_proto(JSValue "
+        "v)\n"
+        "{\n"
+        "  return (((const unsigned char *)JS_VALUE_GET_PTR(v))"
+        "[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] &\n"
+        "          QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK) != 0;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) void "
+        "q2_put_slot(JSContext *ctx, JSValue recv,\n"
+        "                                                   uint32_t off, "
+        "JSValue v)\n"
+        "{\n"
+        "  JSValue *slot = q2_slotp(recv, off);\n"
+        "  JSValue old = *slot;\n"
+        "  q2_dup(v);\n"
+        "  *slot = v;\n"
+        "  if (JS_VALUE_HAS_REF_COUNT(old)) JS_FreeValue(ctx, old);\n"
         "}\n\n");
     /* The inline own-slot store hit: the interpreter's REG_PIC_OWN_W test on
        an object that is not a prototype, and the store the engine's own fast
@@ -5585,11 +5650,11 @@ int qjsaot_driver_main(int argc, char **argv) {
           "          en, ex, hn, rf, off);\n"
           "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
           "    if (e2_ent[i] == 0) continue;\n"
-          "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u\\n\",\n"
+          "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d\\n\",\n"
           "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
           "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
           "            (unsigned long long)e2_han[i], (unsigned long long)e2_ref[i],\n"
-          "            (unsigned)e2_off[i]);\n"
+          "            (unsigned)e2_off[i], i);\n"
           "  }\n"
           "}\n"
           );
