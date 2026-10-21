@@ -2309,9 +2309,9 @@ static void e2_emit_group_recheck(
     e2_sweep_guard(f, "dx", in->next);
     fprintf(
         f,
-        "    if (__builtin_expect(q2_cell_shape(pic, %d) != gsh%d, 0)) goto "
-        "dx_%d;\n",
-        g_e2_facts->groups[g].first_site, g, in->next);
+        "    if (__builtin_expect(gsh%d != E2_NO_SHAPE && "
+        "q2_cell_shape(pic, %d) != gsh%d, 0)) goto dx_%d;\n",
+        g, g_e2_facts->groups[g].first_site, g, in->next);
   }
 }
 
@@ -5886,15 +5886,14 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         fprintf(
             f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(pic, %d);\n", g, g,
             gr->sites[q]);
+      /* Every cell empty: no site of the group has run yet, which is no reason
+         to refuse the entry. The shape becomes one no object has, so each access
+         of the group takes its miss exit if it is ever reached (and the 257-exit
+         rule switches the function off if that turns out to be common). */
       fprintf(
           f,
-          "    if (__builtin_expect(gsh%d == NULL, 0)) {\n"
-          "        E2_EXIT_LOG(\"%s\", \"refuse-first\", %d, "
-          "q2_cell_kind(pic, %d));\n"
-          "        E2_REFUSE_NOTE(%d);\n"
-          "        return aot_g_%s(ctx, f, fr, 0);\n"
-          "    }\n",
-          g, hex, gr->first_site, gr->first_site, fi, hex);
+          "    if (__builtin_expect(gsh%d == NULL, 0)) gsh%d = E2_NO_SHAPE;\n", g,
+          g);
       for (q = 0; q < gr->nsites; q++)
         fprintf(
             f,

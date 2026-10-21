@@ -4683,6 +4683,9 @@ int qjsaot_driver_main(int argc, char **argv) {
            boxed as the interpreter's arithmetic would box it: an integral
            value that fits int32 (and is not -0) is an INT, so a guard typed
            from the profile does not see FLOAT64 for the same number. */
+        /* The shape of a monomorphic group whose cells were all empty at entry:
+           no object has it, so every access of the group exits. */
+        "#define E2_NO_SHAPE ((const void *)1)\n"
         "#define E2_BOX_F64(d) ({ double d_ = (d); "
         "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
         /* The `undefined` word a native entry fills its frame with, as one
