@@ -1227,12 +1227,16 @@
       "sha256": "f8be13e02148afb01f41f97ca6d3064137c65ec594528be4cdc8a60642668d3c"
     },
     {
+      "name": "0312-aot-profile-pic-kinds.patch",
+      "sha256": "37ac07064d814dc0484258e1d8a9443f277006edbe74c43c0520cfc818153f46"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "82cca1ee35d03da13b1a8f37255a951b28f03c5cb97d2ea923c720ef91edf500",
+    "quickjs.c": "7f2fa5195688a4e25c1b59d44f6c18b29e0ff493f16323a5a1318a1ba3be343e",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
