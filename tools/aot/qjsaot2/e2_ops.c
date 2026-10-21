@@ -2144,6 +2144,15 @@ static char g_e2_fl_why[160];
    that decides which entry to emit. */
 static int g_e2_fl_chosen;
 
+/* Which blocks sit in a loop, and whether some loop of the function may run long
+   (set by the prefilter). A miss exit emitted in such a block, for an access the
+   profile cannot vouch for, keeps the function framed. */
+static uint8_t *g_e2_loop_blk;
+static int g_e2_fl_longloop;
+/* Set around a miss exit whose cause the profile CAN vouch for (a number test on an
+   operand it saw as a number, a global's cache). */
+static int g_e2_fl_miss_ok;
+
 static void e2_fl_block(const char *what, const Q2Insn *in) {
   char nm[64];
   if (!g_e2_fl || g_e2_fl_block[0] != 0) return;
@@ -3473,6 +3482,9 @@ static int emit_typed_opcall(
      never gets here: the dispatcher declines to wrap it and the function is not
      frameless. */
   if (g_e2_fl) {
+    if (g_e2_fl_longloop && !g_e2_fl_miss_ok && g_e2_loop_blk != NULL &&
+        g_e2_blk >= 0 && g_e2_loop_blk[g_e2_blk])
+      e2_fl_block("a miss-exit access in a loop", in);
     e2_note_stub(
         g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
     /* The hit's typed guard exits at the next pc with the raw result in the
@@ -4345,7 +4357,13 @@ static int emit_typed_global_read(
     }
   }
   fprintf(f, "      } else {\n");
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  /* A global's cache hit holds until a global changes: not a systematic miss. */
+  g_e2_fl_miss_ok = 1;
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    g_e2_fl_miss_ok = 0;
+    return 0;
+  }
+  g_e2_fl_miss_ok = 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
@@ -5732,7 +5750,12 @@ static int emit_tag_post(
           raw, in->next, (unsigned)dv, raw);
   }
   fprintf(f, "      } else {\n");
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  g_e2_fl_miss_ok = 1;
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    g_e2_fl_miss_ok = 0;
+    return 0;
+  }
+  g_e2_fl_miss_ok = 0;
   fprintf(f, "      }\n    }\n");
   if (cur != NULL) {
     cur[r0] = d0;
@@ -5799,7 +5822,12 @@ static int emit_tag_numeric(
         "q2_arith", sub, aa, bb);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_r")) return 0;
   fprintf(f, "      } else {\n");
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  g_e2_fl_miss_ok = 1;
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    g_e2_fl_miss_ok = 0;
+    return 0;
+  }
+  g_e2_fl_miss_ok = 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
@@ -6662,8 +6690,10 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
         "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
         "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
-        "    JSValue fr[%d];\n",
-        e2_linkage(), hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1);
+        "    JSValue fr[%d];\n"
+        "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
+        e2_linkage(), hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1,
+        fn->g->reg_count > 0 ? fn->g->reg_count : 1);
   } else {
     fprintf(
         f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
@@ -7295,6 +7325,17 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
    4. no op that allocates.
    Rules 5 and 6 (every instruction has a fast path whose slow paths are exits)
    are decided by emitting the body and seeing whether anything needed a handler. */
+/* QJS_AOT_E2_FL_LOOPS=1 lifts the loop rule, for the cases that exercise the
+   in-loop poll of a frameless body. */
+static int e2_fl_loops(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("QJS_AOT_E2_FL_LOOPS");
+    cached = v != NULL && v[0] == '1';
+  }
+  return cached;
+}
+
 static const char *e2_fl_prefilter(const Q2Func *fn) {
   const JSAotGenFunc *g = fn->g;
   int i;
@@ -7303,9 +7344,47 @@ static const char *e2_fl_prefilter(const Q2Func *fn) {
   if (g->light_var_count > 0) return "variable area";
   if (g->func_kind != E2_FUNC_NORMAL) return "not a plain function";
   if (e2_has_call_site(fn)) return "call site";
-  /* The ops whose fast path allocates. The role table's `allocates` bit is not
-     the test: it is set for every op that CAN reach an allocating slow path
-     (get_arg, get_var_ref, ...), and those have a fast path that does not. */
+  /* A frameless body cannot go back: an exit hands the REST of the call to the
+     generic body, so one miss inside a long loop costs every remaining iteration.
+     So the body keeps out any access that can miss for a reason the profile cannot
+     see (an element, an ungrouped field, a length) when it sits in a loop that is
+     not known to be short: the profile's tick samples give the trips per call (the
+     busiest sampled instruction of the loop against the busiest one of the entry
+     block, both samples at one rate). The loop blocks and the verdict are set up
+     here and consulted where the miss exit is emitted. */
+  {
+    unsigned long long entries = 0;
+    int b, si, q;
+    free(g_e2_loop_blk);
+    g_e2_loop_blk = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), 1);
+    if (g_e2_loop_blk == NULL) abort();
+    g_e2_fl_longloop = 0;
+    for (q = 0; q < fn->ninsns; q++) {
+      const Q2Insn *ii = &fn->insns[q];
+      unsigned long long c;
+      if (ii->pc >= fn->blocks[0].end_pc) break;
+      c = qjs_aot_prof_pc_count(g->digest, ii->pc);
+      if (c > entries) entries = c;
+    }
+    for (b = 0; b < fn->nblocks; b++) {
+      const Q2Block *blk = &fn->blocks[b];
+      for (si = 0; si < blk->nsucc && si < 2; si++) {
+        int sb = blk->succ_block[si], m;
+        unsigned long long hdr = 0;
+        if (sb < 0 || sb >= fn->nblocks || !q2_is_back_edge(fn, b, sb)) continue;
+        for (m = sb; m <= b; m++) g_e2_loop_blk[m] = 1;
+        for (q = 0; q < fn->ninsns; q++) {
+          const Q2Insn *ii = &fn->insns[q];
+          unsigned long long c;
+          if (ii->pc < fn->blocks[sb].start_pc || ii->pc >= blk->end_pc) continue;
+          c = qjs_aot_prof_pc_count(g->digest, ii->pc);
+          if (c > hdr) hdr = c;
+        }
+        if (entries == 0 || hdr > 16 * entries) g_e2_fl_longloop = 1;
+      }
+    }
+    if (e2_fl_loops()) g_e2_fl_longloop = 0;
+  }
   for (i = 0; i < fn->ninsns; i++) {
     static const char *const names[] = {
         "new_object",   "object_template", "array_const",  "array_from",
