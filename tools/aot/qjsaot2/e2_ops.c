@@ -2016,7 +2016,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
 
 /* The guard-stub tables' size. A large top-level function has hundreds of guard
    pcs; running out aborts rather than leave a goto without its label. */
-#define E2_MAX_STUBS 4096
+#define E2_MAX_STUBS 65536
 /* Overflow exits seen while emitting: each gets a stub after the blocks. The
    `cur[]` snapshot is the block-local state AT that instruction -- the stub must
    sync from it, or it writes nothing and the generic body reads the frame's old
@@ -2539,6 +2539,13 @@ static void e2_note_defs(Q2ValueId *cur, const Q2Func *fn, const Q2Insn *in) {
     }
     cur[r] = d;
   }
+  /* The registers an op-call fallback rewrote beyond its declared defs: the
+     wrapper reloads each into its value's local, so the block holds it now. */
+  for (k = 0; k < in->nredef; k++) {
+    int r = in->redef_reg[k];
+    if (in->redef_val[k] == Q2_NO_VALUE || r < 0 || r >= fn->nregs) continue;
+    cur[r] = in->redef_val[k];
+  }
 }
 
 /* Load a block's live-in register from the frame into the value's local. This is
@@ -3041,6 +3048,102 @@ static int emit_typed_var_ref_load(
   return 1;
 }
 
+/* Everything an op call must have in the frame before the engine's handler
+   runs: the live TAG values (R6), the typed source operands, the typed values of
+   the registers the op may rewrite, and a call-shaped op's argument window. */
+static void e2_emit_presync(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur) {
+  int r;
+  /* 1. R6 sync: every live TAG value to the frame before the call. */
+  if (!g_e2_presynced)
+    fprintf(
+        f,
+        "    /* R6: sync live TAG values before the op call (a safepoint) "
+        "*/\n");
+  for (r = 0; !g_e2_presynced && r < fn->nregs; r++) {
+    Q2ValueId v;
+    if (cur == NULL) break;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF) continue;
+    if (v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] != E2_LB_TAG) continue;
+    fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", r * 16, (unsigned)v);
+  }
+
+  /* 2. Typed operands to the frame (the handler reads the register file). The
+     operands are the IR's decoded register operands, each with the SSA value it
+     holds here: the role table's use list is not authoritative (it gives
+     put_local_xfer_s1 a destination and no source), so a typed source named only
+     by the table never reached the frame. */
+  for (r = 0; !g_e2_presynced && r < in->narg; r++) {
+    Q2ValueId v = in->argval[r];
+    int is_def = 0, d, reg;
+    if (in->arg[r].kind != 'r' || v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues)
+      continue;
+    reg = E2_ROFF(in->arg[r]);
+    if (reg < 0 || reg >= fn->nregs * 16) continue;
+    /* A source is the value the register HOLDS here; an operand holding a value
+       the op itself defines is its destination. (A read-modify-write operand,
+       like post_inc's counter, is named twice: once as the source it holds, once
+       as the destination.) */
+    for (d = 0; d < in->ndef; d++)
+      if (in->def[d] == v) is_def = 1;
+    if (is_def) continue;
+    if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", reg,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", reg,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", reg,
+              (unsigned)v);
+  }
+
+  /* An op whose roles the IR does not know may rewrite any register live after
+     it, and the reload below takes every one of them from the frame. A register
+     it does NOT in fact write must still hold its value there: a typed local
+     (TAG ones went with the sync above) is boxed into its register first. */
+  for (r = 0; !g_e2_presynced && r < in->nredef; r++) {
+    int reg = in->redef_reg[r];
+    Q2ValueId v;
+    if (cur == NULL || reg < 0 || reg >= fn->nregs) continue;
+    v = cur[reg];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
+              reg * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", reg * 16,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
+              reg * 16, (unsigned)v);
+  }
+
+  /* The argument window of a call-shaped op: the registers it reads that no
+     operand names. TAG values were written by the sync above; typed ones are
+     boxed here. */
+  for (r = 0; !g_e2_presynced && in->win_n > 0 && r < in->win_n; r++) {
+    Q2ValueId v;
+    int wr = in->win_reg + r;
+    if (cur == NULL || wr < 0 || wr >= fn->nregs) continue;
+    v = cur[wr];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
+              wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", wr * 16,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
+              wr * 16, (unsigned)v);
+  }
+
+}
+
 /* THE SPEC-BODY OP CALL (step 5). The D12 contract in generated code.
    Unused at the moment: the first user is 5b's field miss path. It is committed
    ahead of its user so that path is a thin wrapper, as the plan said.
@@ -3081,40 +3184,8 @@ static int emit_typed_opcall(
   (void)fi;
   (void)b;
 
-  /* 1. R6 sync: every live TAG value to the frame before the call. */
-  if (!g_e2_presynced)
-    fprintf(
-        f,
-        "    /* R6: sync live TAG values before the op call (a safepoint) "
-        "*/\n");
-  for (r = 0; !g_e2_presynced && r < fn->nregs; r++) {
-    Q2ValueId v;
-    if (cur == NULL) break;
-    v = cur[r];
-    if (v == Q2_NO_VALUE || v == E2_UNDEF) continue;
-    if (v >= (Q2ValueId)t->nvalues) continue;
-    if (t->lb[v] != E2_LB_TAG) continue;
-    fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", r * 16, (unsigned)v);
-  }
+  e2_emit_presync(f, fn, in, t, cur);
   (void)live;
-
-  /* 2. Typed operands to the frame (the handler reads the register file). */
-  for (r = 0; !g_e2_presynced && r < role->nuse; r++) {
-    Q2ValueId v = in->nuse > r ? in->use[r] : Q2_NO_VALUE;
-    int reg;
-    if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) continue;
-    reg = fn->values[v].reg;
-    if (reg < 0 || reg >= fn->nregs) continue;
-    if (t->lb[v] == E2_LB_I32)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
-              reg * 16, (unsigned)v);
-    else if (t->lb[v] == E2_LB_F64)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", reg * 16,
-              (unsigned)v);
-    else if (t->lb[v] == E2_LB_BOOL)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
-              reg * 16, (unsigned)v);
-  }
 
   /* 3. The call, and 4. the sentinels plus the control-transfer test. */
   /* The spec body has no `code`/`ip` locals -- those names belong to the generic
@@ -3199,6 +3270,16 @@ static int emit_typed_opcall(
         break;
     }
   }
+  /* The registers the op rewrote beyond its defs (the fallback's live set): each
+     becomes a TAG local again from the frame. */
+  for (r = 0; r < in->nredef; r++) {
+    Q2ValueId v = in->redef_val[r];
+    int reg = in->redef_reg[r];
+    if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) continue;
+    if (reg < 0 || reg >= fn->nregs || t->lb[v] != E2_LB_TAG) continue;
+    fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)v, reg * 16);
+    any = 1;
+  }
   /* The defs are in their locals now; cur[] is NOT updated here. The dispatcher's
      e2_note_defs does that once the whole instruction is lowered, so an emitter
      with two miss paths gives the second one the pre-instruction state. */
@@ -3227,6 +3308,102 @@ static int e2_is_call_family(uint16_t rop) {
     default:
       return 0;
   }
+}
+
+/* Whether the op-call wrapper may run this instruction when no typed emitter took
+   it: the role says it can be called (control NONE), it is not a call (those have
+   their own site emitter), the facts did not require its miss to be an exit, and
+   every register it writes is one the wrapper reloads (its defs and the IR's
+   redefined set). A jump the op takes at run time is the wrapper's own `ip` test. */
+/* The transfer stores move their source operand's reference into the container
+   and empty the register; that is the whole of their "writes registers". The
+   operand's register offset, or -1 for any other op. */
+static int e2_xfer_src_off(const Q2Insn *in) {
+  int idx;
+  switch (in->rop) {
+    case ROP_put_arg_xfer: idx = 1; break;
+    case ROP_put_element_xfer: idx = 2; break;
+    case ROP_put_field_xfer: idx = 2; break;
+    default: return -1;
+  }
+  if (idx >= in->narg || in->arg[idx].kind != 'r') return -1;
+  return E2_ROFF(in->arg[idx]);
+}
+
+static int e2_wrappable(const Q2Func *fn, const Q2Insn *in, const E2Role *role) {
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  /* The call family has its own site emitter for call/call_method; construct and
+     apply_arguments run synchronously through the step (the callee's frame is
+     the engine's), so the wrapper does them; tail calls, eval and the rest of
+     the family leave the function. */
+  if (e2_is_call_family(in->rop) && in->rop != ROP_construct &&
+      in->rop != ROP_apply_arguments)
+    return 0;
+  if (e2_must_exit(fn, in)) return 0;
+  if (role->writes_regs && in->nredef == 0 && e2_xfer_src_off(in) < 0) return 0;
+  return 1;
+}
+
+/* A conditional terminator through the engine's own handler, deciding which way
+   it went. The caller has an `int c_` in scope; this sets it to 1 when the step
+   left `ip` at the branch target (successor 0) and 0 at the fall-through
+   (successor 1), XORed with `inv` so a caller that tests `c_` against an
+   inverted sense gets its own convention. Anything else -- an exception handler's
+   address -- hands off at that ip, as the op-call wrapper does. The live values
+   and the typed operands are written to the frame first. A terminator that
+   defines nothing writes no register, so the locals stay as they are and both
+   edges can take them as they are. */
+static void e2_emit_term_step(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    const Q2Block *blk, Q2ValueId *cur, char hex[33], int fi, int inv) {
+  if (!g_e2_presynced) e2_emit_presync(f, fn, in, t, cur);
+  fprintf(
+      f,
+      "    { uint8_t *code_ = q2_code(f), *ip_;\n"
+      "    ip_ = qjs_aot_step(code_ + %d, fr, f, ctx);\n"
+      "    if (__builtin_expect(ip_ == NULL, 0)) return JS_EXCEPTION;\n"
+      "    if (__builtin_expect(ip_ == QJS_AOT_COLD_RET || "
+      "ip_ == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n"
+      "    if (ip_ == code_ + %d) c_ = %d;\n"
+      "    else if (ip_ == code_ + %d) c_ = %d;\n"
+      "    else {\n"
+      "        E2_HANDOFF_NOTE(%d);\n"
+      "        return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_));\n"
+      "    } }\n",
+      in->pc, blk->succ_pc[0], inv ? 0 : 1, blk->succ_pc[1], inv ? 1 : 0, fi,
+      hex);
+}
+
+/* Whether a terminator can run through the wrapper: a two-way branch that defines
+   nothing, whose both successors are blocks of this function. */
+static int e2_term_wrappable(
+    const Q2Func *fn, const Q2Insn *in, const E2Role *role, const Q2Block *blk) {
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (in->ndef != 0 || in->nredef != 0 || e2_is_call_family(in->rop)) return 0;
+  if (blk->nsucc < 2) return 0;
+  if (blk->succ_block[0] < 0 || blk->succ_block[0] >= fn->nblocks) return 0;
+  if (blk->succ_block[1] < 0 || blk->succ_block[1] >= fn->nblocks) return 0;
+  return 1;
+}
+
+/* A terminator no typed emitter took (a truthiness test on a TAG value, a compare
+   the typed forms decline): the whole branch runs through the step and both edges
+   are the ordinary arms. Counts as an op call, not a hand-off. */
+static int emit_term_wrapper(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, char hex[33], int fi) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  if (t == NULL || !e2_term_wrappable(fn, in, role, blk)) return 0;
+  fprintf(f, "    { int c_;\n");
+  e2_emit_term_step(f, fn, in, t, blk, cur, hex, fi, 0);
+  g_e2_opcalls++;
+  fprintf(f, "    if (c_) {\n");
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+  fprintf(f, "    }\n    }\n");
+  return 1;
 }
 
 /* `div` / `mod` ("rrr": dest, a, b) as typed arithmetic. The f64 form needs no
@@ -4694,7 +4871,11 @@ static int emit_typed_inc_branch(
      `i5 = i5 + 1` on an uninitialised local (R5: a def is not a use). */
   av = in->use[0];
   bv = in->use[1];
-  if (t->lb[dv] != E2_LB_I32 || t->lb[bv] != E2_LB_I32) return 0;
+  /* The bound may be TAG (a field or a length read the profile saw as mixed): its
+     tag is tested below, and a non-number goes to the cold arm. */
+  if (t->lb[dv] != E2_LB_I32 || t->lb[av] != E2_LB_I32 ||
+      (t->lb[bv] != E2_LB_I32 && t->lb[bv] != E2_LB_TAG))
+    return 0;
   e2_local_name(cn, sizeof(cn), dv);
   e2_local_name(cn2, sizeof(cn2), av);
   e2_local_name(bn, sizeof(bn), bv);
@@ -4727,11 +4908,30 @@ static int emit_typed_inc_branch(
     free(lb);
   }
   fprintf(f, "    }\n");
-  fprintf(f, "    if (%s < %s) {\n", cn, bn);
+  if (t->lb[bv] == E2_LB_TAG) {
+    /* INT and FLOAT64 compare; anything else hands off at this instruction, with
+       the state from before the increment (the counter's register still holds
+       the old value), so the generic body redoes it. */
+    fprintf(f, "    { int c_;\n");
+    fprintf(
+        f,
+        "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) == JS_TAG_INT, 1))\n"
+        "        c_ = (%s < JS_VALUE_GET_INT(%s));\n"
+        "    else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64)\n"
+        "        c_ = ((double)%s < JS_VALUE_GET_FLOAT64(%s));\n"
+        "    else goto hx_%d;\n",
+        bn, cn, bn, bn, cn, bn, in->pc);
+    e2_note_stub(
+        g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+    fprintf(f, "    if (c_) {\n");
+  } else {
+    fprintf(f, "    if (%s < %s) {\n", cn, bn);
+  }
   e2_emit_arm(f, fn, b, si_take, cur, hex, blk->succ_block[si_take]);
   fprintf(f, "    } else {\n");
   e2_emit_arm(f, fn, b, si_else, cur, hex, blk->succ_block[si_else]);
   fprintf(f, "    }\n");
+  if (t->lb[bv] == E2_LB_TAG) fprintf(f, "    }\n");
   /* The overflow exit lives after the block, keyed by this pc. */
   e2_note_stub(
       g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
@@ -5135,6 +5335,44 @@ static int emit_typed_branch(
       if (ntags == 0) {
         e2_cmp_expr(ex, sizeof(ex), base, t, av, bv, want_f64, 2);
         fprintf(f, "    if (%s%s) {\n", inv ? "!" : "", ex);
+      } else if (ntags == 2) {
+        /* Both operands are TAG: each tag is tested. Two ints compare as ints,
+           any two numbers as doubles; everything else (strings, objects) is the
+           engine's own handler. */
+        const char *cop = base == REG_BIN_LT    ? "<"
+                          : base == REG_BIN_LTE ? "<="
+                          : base == REG_BIN_GT  ? ">"
+                          : base == REG_BIN_GTE ? ">="
+                          : (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ)
+                              ? "!="
+                              : "==";
+        fprintf(f, "    { int c_;\n");
+        fprintf(
+            f,
+            "    if (__builtin_expect(JS_VALUE_IS_BOTH_INT(v%u, v%u), 1))\n"
+            "        c_ = (JS_VALUE_GET_INT(v%u) %s JS_VALUE_GET_INT(v%u));\n"
+            "    else if ((JS_VALUE_GET_TAG(v%u) == JS_TAG_INT || "
+            "JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64) &&\n"
+            "             (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT || "
+            "JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64))\n"
+            "        c_ = ((JS_VALUE_GET_TAG(v%u) == JS_TAG_INT ? "
+            "(double)JS_VALUE_GET_INT(v%u) : JS_VALUE_GET_FLOAT64(v%u)) %s\n"
+            "              (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT ? "
+            "(double)JS_VALUE_GET_INT(v%u) : JS_VALUE_GET_FLOAT64(v%u)));\n",
+            (unsigned)av, (unsigned)bv, (unsigned)av, cop, (unsigned)bv,
+            (unsigned)av, (unsigned)av, (unsigned)bv, (unsigned)bv, (unsigned)av,
+            (unsigned)av, (unsigned)av, cop, (unsigned)bv, (unsigned)bv,
+            (unsigned)bv);
+        if (e2_term_wrappable(fn, in, role, blk)) {
+          fprintf(f, "    else {\n");
+          e2_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
+          fprintf(f, "    }\n");
+        } else {
+          fprintf(f, "    else goto hx_%d;\n", in->pc);
+          e2_note_stub(
+              g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+        }
+        fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       } else {
         Q2ValueId tv = tag_side == 0 ? av : bv;
         int treg = fn->values[tv].reg;
@@ -5163,9 +5401,18 @@ static int emit_typed_branch(
               "        c_ = %s;\n",
               (unsigned)tv, ex);
         }
-        fprintf(f, "    else goto hx_%d;\n", in->pc);
-        e2_note_stub(
-            g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+        /* Neither number: a string compare, an object with valueOf. The engine's
+           own handler decides which way the branch goes (it may run JS, so the
+           live values are in the frame first) and the arms below take it. */
+        if (e2_term_wrappable(fn, in, role, blk)) {
+          fprintf(f, "    else {\n");
+          e2_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
+          fprintf(f, "    }\n");
+        } else {
+          fprintf(f, "    else goto hx_%d;\n", in->pc);
+          e2_note_stub(
+              g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+        }
         fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       }
     }
@@ -5764,7 +6011,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
             emit_typed_inc_branch(
                 f, fn, in, &types, b, cur, have_types, hex, fi) ||
             emit_typed_branch(
-                f, fn, in, &types, b, cur, have_types, hex, fi)) {
+                f, fn, in, &types, b, cur, have_types, hex, fi) ||
+            (have_types &&
+             emit_term_wrapper(f, fn, in, &types, b, cur, hex, fi))) {
           lowered_to = i2 + 1;
           if (g_e2_opcalls != oc0)
             g_e2_n_opcall++;
@@ -5813,6 +6062,19 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         g_e2_miss_exit_seen = 0;
         emitted = e2_dispatch_rop(
             f, fn, in, &types, cur, have_types, hex, fi, b, role);
+        /* DECLINE MEANS "TRY THE NEXT EMITTER", and the op-call wrapper is the
+           last: a typed emitter that declined (a TAG operand, an unsupported
+           representation) or an op with no emitter at all runs through the
+           engine's own handler and the block goes on. Only an op the wrapper
+           cannot run hands off. */
+        if (!emitted && have_types && e2_wrappable(fn, in, role)) {
+          emitted = emit_typed_opcall(f, fn, in, &types, cur, NULL, hex, fi, b);
+          /* A transfer store emptied its source register. */
+          if (emitted && cur != NULL && e2_xfer_src_off(in) >= 0) {
+            int sr = e2_xfer_src_off(in) / 16;
+            if (sr >= 0 && sr < fn->nregs) cur[sr] = E2_UNDEF;
+          }
+        }
         /* The facts treated this access as no safepoint only because its miss
            exits; an emitter that gave it a continuing miss would leave facts the
            miss may have broken. */
