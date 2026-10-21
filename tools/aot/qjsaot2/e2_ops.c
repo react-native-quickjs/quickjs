@@ -3255,6 +3255,66 @@ static int emit_typed_elem_write(
   return 1;
 }
 
+/* A speculative-body GLOBAL READ: `get_global` ("rabs": dest, atom offset, throw
+   flag, site). `q2_global_hit` is the same inline test the generic body uses; a
+   miss goes to the wrapper, which performs the real lookup (that path can run a
+   getter, throw, and fill the cache -- none of which a spec body may do inline).
+   The result is a JSValue: a TAG def is a plain copy, a typed def writes the raw
+   result to the frame first and then guards into the local. */
+static int emit_typed_global_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId dv;
+  int site, dreg;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_get_global) return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->ndef < 1 || in->narg < 4 || in->arg[3].kind != 's') return 0;
+  site = (int)in->arg[3].val;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+
+  fprintf(f, "    { JSValue _g;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_global_hit(ctx, pic, %d, "
+      "&_g), 1)) {\n",
+      site);
+  if (t->lb[dv] == E2_LB_TAG) {
+    fprintf(f, "        v%u = _g;\n", (unsigned)dv);
+  } else {
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", dreg * 16);
+    if (t->lb[dv] == E2_LB_I32)
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, 0)) "
+          "goto dx_%d;\n"
+          "        i%u = JS_VALUE_GET_INT(_g);\n",
+          in->next, (unsigned)dv);
+    else if (t->lb[dv] == E2_LB_F64)
+      fprintf(
+          f,
+          "        if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = "
+          "(double)JS_VALUE_GET_INT(_g);\n"
+          "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = "
+          "JS_VALUE_GET_FLOAT64(_g);\n"
+          "        else goto dx_%d;\n",
+          (unsigned)dv, (unsigned)dv, in->next);
+    else
+      return 0;
+  }
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  return 1;
+}
+
 /* A speculative-body `this` FIELD READ: `get_this_field` / `get_this_field2`
    ("rras", but BOTH register operands are destinations -- def[0] is the read and
    def[1] the receiver -- so there is no use to take a receiver from). `this` comes
@@ -4726,6 +4786,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
                  emit_typed_arith(f, fn, in, &types, cur)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_field_read(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_global_read(
                      f, fn, in, &types, cur, have_types, hex, fi, b)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_length(
