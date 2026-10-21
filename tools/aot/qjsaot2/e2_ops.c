@@ -4300,7 +4300,9 @@ static int emit_typed_unary(
       return 1;
     }
     if (is_inc || is_dec) {
-      if (t->lb[a] != E2_LB_I32) return 0;
+      /* The DEF's rep must be i32 too, not just the operand's: writing an i32
+         result into a TAG or f64 local is a miscompile. */
+      if (t->lb[a] != E2_LB_I32 || t->lb[d] != E2_LB_I32) return 0;
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
       fprintf(
@@ -4321,13 +4323,20 @@ static int emit_typed_unary(
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
-    /* neg: i32 overflows only on INT32_MIN; the f64 form cannot fail. */
-    if (t->lb[a] == E2_LB_I32) {
+    /* neg. The DEF's rep decides, not the operand's: `-0` of integer 0 is NOT an
+       int32 -- JS gives -0 and an int32 holds +0, so an i32 form would make
+       `1 / -0` +Infinity instead of -Infinity. The analysis already records
+       NEGZERO in neg's exit set; this emitter used to ignore it. So an I32 def
+       exits on 0 (NEGZERO) as well as INT32_MIN (SIGNEDMIN), and an F64 def simply
+       negates, which produces -0.0 for 0 with no exit at all. */
+    if (t->lb[a] == E2_LB_I32 && t->lb[d] == E2_LB_I32) {
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
       fprintf(
-          f, "    if (__builtin_expect(%s != INT32_MIN, 1)) { %s = -%s; }\n",
-          an, dn, an);
+          f,
+          "    if (__builtin_expect(%s != INT32_MIN && %s != 0, 1)) "
+          "{ %s = -%s; }\n",
+          an, an, dn, an);
       fprintf(f, "    else { goto ox_%d; }\n", in->pc);
       if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
         Q2ValueId *snap =
@@ -4342,7 +4351,7 @@ static int emit_typed_unary(
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
-    if (t->lb[a] == E2_LB_F64) {
+    if (t->lb[a] == E2_LB_F64 && t->lb[d] == E2_LB_F64) {
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
       fprintf(f, "    %s = -%s;\n", dn, an);
