@@ -2311,9 +2311,9 @@ static void e2_emit_group_recheck(
 /* Defined with the other field emitters below; the chain and write emitters
    above them call these. */
 static int emit_group_chain(
-    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g1, int s1,
-    int g2, int s2, Q2ValueId rv, Q2ValueId d0v, Q2ValueId d1v, int d0reg,
-    int d1reg);
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, int g1, int s1, int g2, int s2, Q2ValueId rv, Q2ValueId d0v,
+    Q2ValueId d1v, int d0reg, int d1reg);
 static int emit_group_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g,
     int site, Q2ValueId rv, const char *boxed);
@@ -4038,8 +4038,12 @@ static int emit_typed_field_chain(
      register holds an int; storing the raw JSValue there is a miscompile (measured:
      21 -> 12), and doing it properly needs the same guard machinery the other
      emitters use. Decline, so the block hands off -- correct, merely slower. */
-  if (t->lb[rv] != E2_LB_TAG || t->lb[d0v] != E2_LB_TAG ||
-      t->lb[d1v] != E2_LB_TAG)
+  if (t->lb[rv] != E2_LB_TAG || t->lb[d0v] != E2_LB_TAG) return 0;
+  /* A typed SECOND def is a guard on the second link's raw result (the first
+     link and the raw result go to the frame first, so an exit at the next
+     instruction finds both). Only the grouped form has that guard. */
+  if (t->lb[d1v] != E2_LB_TAG &&
+      !(e2_exit_group(fn, in, s1) >= 0 && e2_exit_group(fn, in, s2) >= 0))
     return 0;
   rreg = fn->values[rv].reg;
   d0reg = fn->values[d0v].reg;
@@ -4052,7 +4056,7 @@ static int emit_typed_field_chain(
     int g1 = e2_exit_group(fn, in, s1), g2 = e2_exit_group(fn, in, s2);
     if (g1 >= 0 && g2 >= 0)
       return emit_group_chain(
-          f, fn, in, cur, g1, s1, g2, s2, rv, d0v, d1v, d0reg, d1reg);
+          f, fn, in, t, cur, g1, s1, g2, s2, rv, d0v, d1v, d0reg, d1reg);
     /* Classed as a miss-exit by the facts but not groupable here: decline, so
        the block hands off (an exit) rather than emit the wrapper. */
     if (e2_must_exit(fn, in)) return 0;
@@ -4175,39 +4179,39 @@ static int emit_typed_field_write(
    the def's representation has no guard. */
 static int emit_hit_result(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId dv,
-    int dreg) {
+    int dreg, const char *raw) {
   (void)fn;
   if (t->lb[dv] == E2_LB_TAG) {
-    fprintf(f, "        v%u = _f;\n", (unsigned)dv);
+    fprintf(f, "        v%u = %s;\n", (unsigned)dv, raw);
     return 1;
   }
-  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _f);\n", dreg * 16);
+  fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", dreg * 16, raw);
   /* Nothing reads the result: the frame write above is all it needs. */
   if (e2_def_dead(in, dv)) return 1;
   e2_sweep_guard(f, "dx", in->next);
   if (t->lb[dv] == E2_LB_I32)
     fprintf(
         f,
-        "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_INT, 0)) "
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) "
         "goto dx_%d;\n"
-        "        i%u = JS_VALUE_GET_INT(_f);\n",
-        in->next, (unsigned)dv);
+        "        i%u = JS_VALUE_GET_INT(%s);\n",
+        raw, in->next, (unsigned)dv, raw);
   else if (t->lb[dv] == E2_LB_F64)
     fprintf(
         f,
-        "        if (JS_VALUE_GET_TAG(_f) == JS_TAG_INT) d%u = "
-        "(double)JS_VALUE_GET_INT(_f);\n"
-        "        else if (JS_VALUE_GET_TAG(_f) == JS_TAG_FLOAT64) d%u = "
-        "JS_VALUE_GET_FLOAT64(_f);\n"
+        "        if (JS_VALUE_GET_TAG(%s) == JS_TAG_INT) d%u = "
+        "(double)JS_VALUE_GET_INT(%s);\n"
+        "        else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) d%u = "
+        "JS_VALUE_GET_FLOAT64(%s);\n"
         "        else goto dx_%d;\n",
-        (unsigned)dv, (unsigned)dv, in->next);
+        raw, (unsigned)dv, raw, raw, (unsigned)dv, raw, in->next);
   else if (t->lb[dv] == E2_LB_BOOL)
     fprintf(
         f,
-        "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_BOOL, 0)) "
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_BOOL, 0)) "
         "goto dx_%d;\n"
-        "        b%u = JS_VALUE_GET_BOOL(_f);\n",
-        in->next, (unsigned)dv);
+        "        b%u = JS_VALUE_GET_BOOL(%s);\n",
+        raw, in->next, (unsigned)dv, raw);
   else
     return 0;
   return 1;
@@ -4270,7 +4274,7 @@ static int emit_group_read(
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
       in->pc);
-  if (!emit_hit_result(f, fn, in, t, dv, dreg)) {
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(
         stderr, "e2: grouped read at pc %d: no guard for its def\n", in->pc);
     abort();
@@ -4286,9 +4290,9 @@ static int emit_group_read(
    neither result is written until both loads have passed. The facts' skip flag
    is per instruction, not per link, so both receivers are always tested. */
 static int emit_group_chain(
-    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g1, int s1,
-    int g2, int s2, Q2ValueId rv, Q2ValueId d0v, Q2ValueId d1v, int d0reg,
-    int d1reg) {
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, int g1, int s1, int g2, int s2, Q2ValueId rv, Q2ValueId d0v,
+    Q2ValueId d1v, int d0reg, int d1reg) {
   char test[320], recv[32];
   (void)fn;
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
@@ -4310,9 +4314,22 @@ static int emit_group_chain(
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c1) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
       in->pc);
-  fprintf(
-      f, "      v%u = _c0;\n      v%u = _c1;\n    }\n", (unsigned)d0v,
-      (unsigned)d1v);
+  fprintf(f, "      v%u = _c0;\n", (unsigned)d0v);
+  if (t->lb[d1v] == E2_LB_TAG) {
+    fprintf(f, "      v%u = _c1;\n    }\n", (unsigned)d1v);
+  } else {
+    /* The first link's result is current in the frame before the second def's
+       guard can exit at the next instruction. */
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    fprintf(f, "      AOT_SET_B(ctx, fr, %d, _c0);\n", d0reg * 16);
+    if (!emit_hit_result(f, fn, in, t, d1v, d1reg, "_c1")) {
+      fprintf(
+          stderr, "e2: grouped chain at pc %d: no guard for its def\n", in->pc);
+      abort();
+    }
+    fprintf(f, "    }\n");
+  }
   if (cur != NULL) {
     cur[d0reg] = d0v;
     cur[d1reg] = d1v;
@@ -4405,7 +4422,7 @@ static int emit_typed_field_read(
       "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
       "v%u, %d, (int)q2_ns, &_f), 1)) {\n",
       (unsigned)rv, site);
-  if (!emit_hit_result(f, fn, in, t, dv, dreg)) return 0;
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
   /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
      inlined duplicate (the reviewer's ruling). */
   fprintf(f, "      } else {\n");
