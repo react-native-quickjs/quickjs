@@ -60658,6 +60658,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
                    "aot: q2_dup writes an int");
     out->off_rc_back = (uint32_t)(offsetof(JSMallocBlockHeader, user_data) -
                                   offsetof(JSMallocBlockHeader, ref_count));
+    out->off_varref_pvalue = (uint32_t)offsetof(JSVarRef, pvalue);
     out->hash = qjs_aot_layout_hash(out);
 }
 

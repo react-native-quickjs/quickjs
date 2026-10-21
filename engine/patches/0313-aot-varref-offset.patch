@@ -1,0 +1,38 @@
+Subject: Publish the closure cell's value offset in the AOT layout
+
+What this does
+  Adds the offset of a closure cell's value pointer (`JSVarRef::pvalue`) to the
+  AOT layout.
+
+Why we need it
+  A compiled function reads a captured variable through the cell vector of its
+  function object. Without the offset the read is a call into the engine
+  (`qjs_aot_get_var_ref`), which also needs the callee's whole frame as an
+  argument, so a function that has no frame cannot read a captured variable at
+  all. With the offset the read is two dependent loads, in line.
+
+  The field is folded into the layout hash like every other field, so a unit
+  generated without it is refused at bind.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -129,6 +129,9 @@
+        the allocator's block header, js_rc()), so a unit counts a reference
+        inline instead of calling JS_DupValue. */
+     uint32_t off_rc_back;
++    /* Where a closure cell keeps the pointer to its value, so a unit reads a
++       captured variable through the function object's cell vector inline. */
++    uint32_t off_varref_pvalue;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60658,6 +60658,7 @@
+                    "aot: q2_dup writes an int");
+     out->off_rc_back = (uint32_t)(offsetof(JSMallocBlockHeader, user_data) -
+                                   offsetof(JSMallocBlockHeader, ref_count));
++    out->off_varref_pvalue = (uint32_t)offsetof(JSVarRef, pvalue);
+     out->hash = qjs_aot_layout_hash(out);
+ }
+ 
