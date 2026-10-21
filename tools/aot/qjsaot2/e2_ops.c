@@ -2765,11 +2765,17 @@ static int emit_typed_var_ref_load(
    Nothing is forwarded across the call. */
 static int emit_typed_opcall(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    const uint64_t *live, char hex[33], int fi, int b);
+static int emit_typed_opcall(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
     const uint64_t *live, char hex[33], int fi, int b) {
   const E2Role *role = e2_roles[in->rop];
   int r, any;
 
-  if (role == NULL || role->tier != E2_OPCALL) return 0;
+  /* The CALLER decides when to use this: a native spec emitter calls it on its
+     miss path, and Batch 4's general rule calls it for any non-lowered instruction.
+     So the tier test lives there, not here -- one copy of the op-call sequence. */
+  if (role == NULL) return 0;
   if (role->control != E2_CF_NONE) return 0;
   /* An op that may write ANY register cannot be reloaded selectively here; the caller
      leaves it to the generic body. (The reload loop below handles the known set.) */
@@ -2809,25 +2815,31 @@ static int emit_typed_opcall(
   }
 
   /* 3. The call, and 4. the sentinels plus the control-transfer test. */
-  fprintf(f, "    ip = qjs_aot_step(code + %d, fr, f, ctx);\n", in->pc);
+  /* The spec body has no `code`/`ip` locals -- those names belong to the generic
+     body -- so the wrapper brings its own. */
   fprintf(
       f,
-      "    if (__builtin_expect(ip == NULL, 0)) return JS_EXCEPTION;\n");
+      "    { uint8_t *code_ = q2_code(f), *ip_;\n"
+      "    ip_ = qjs_aot_step(code_ + %d, fr, f, ctx);\n",
+      in->pc);
   fprintf(
       f,
-      "    if (__builtin_expect(ip == QJS_AOT_COLD_RET || "
-      "ip == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
+      "    if (__builtin_expect(ip_ == NULL, 0)) return JS_EXCEPTION;\n");
+  fprintf(
+      f,
+      "    if (__builtin_expect(ip_ == QJS_AOT_COLD_RET || "
+      "ip_ == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
   /* D11: a handler that caught the exception (or an op that jumped) returns an ip
      that is not the next instruction. In the SPEC body this must be an ordinary exit
      (rule R1): there is no `dispatch` label in aot_f_<hex> -- that is the generic
      body's -- so the earlier version compiled only because nothing emitted this yet.
      No further sync is needed: R6 ran before the call and the op wrote its own
      results to the frame. */
-  fprintf(f, "    if (__builtin_expect(ip != code + %d, 0)) {\n", in->next);
+  fprintf(f, "    if (__builtin_expect(ip_ != code_ + %d, 0)) {\n", in->next);
   fprintf(f, "        E2_HANDOFF_NOTE(%d);\n", fi);
   fprintf(
-      f, "        return aot_g_%s(ctx, f, fr, (uint32_t)(ip - code));\n", hex);
-  fprintf(f, "    }\n");
+      f, "        return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_));\n", hex);
+  fprintf(f, "    } }\n");
 
   /* 5. Reload the defs the role says it wrote, by value id, with the tag guard. */
   /* The guard exits land at the NEXT pc: the op has run, so its result is already in
@@ -2886,6 +2898,102 @@ static int emit_typed_opcall(
     if (cur != NULL) cur[reg] = v;
   }
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
+  return 1;
+}
+
+/* A speculative-body FIELD READ: `get_field` / `get_field2` ("rras": dest,
+   receiver, atom, site). This is a SEPARATE emitter from the generic body's, on
+   purpose: the shared part is the runtime helper (q2_own_read_hit), not the emitted
+   text, and refactoring the generic emitter to share its continuation broke the
+   generic body the one time it was tried. So rule R1 is honoured by construction --
+   no g_<pc> label, no jump to a generic label:
+       hit  -> store into the def's local (TAG: plain copy, borrowed under DRC;
+               typed: write _f to the frame slot FIRST so the generic body sees the
+               result, then guard into the local, mismatch -> deopt at the NEXT pc)
+       miss -> emit_typed_opcall, which syncs, stores operands, steps, and reloads.
+   The receiver must already be a TAG local (R4: never AOT_REG in the spec body); a
+   typed receiver declines, because a number receiver misses the PIC anyway. */
+static int emit_typed_field_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId dv, rv;
+  int site, dreg, rreg;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->op != Q2_OP_GET_FIELD) return 0;
+  if (in->rop != ROP_get_field && in->rop != ROP_get_field_own &&
+      in->rop != ROP_get_field2 && in->rop != ROP_get_field2_own)
+    return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->ndef < 1 || in->nuse < 1 || in->narg < 4 || in->arg[3].kind != 's')
+    return 0;
+  site = (int)in->arg[3].val;
+  if (getenv("E2_DBG5"))
+    fprintf(stderr, "pc%d get_field: site=%d role=%p nuse=%d ndef=%d\n", in->pc, site,
+            (void *)role, in->nuse, in->ndef);
+  dv = in->def[0];
+  rv = in->use[0];
+  if (dv >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues) return 0;
+  /* The receiver is a JSValue; a typed receiver would be a number, which misses
+     the PIC, so decline and let the op-call path take it. */
+  if (t->lb[rv] != E2_LB_TAG) return 0;
+  dreg = fn->values[dv].reg;
+  rreg = fn->values[rv].reg;
+  if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
+
+  /* Register the guard exits' pcs ONCE per body, like the other dx_ users. */
+  if (g_e2_dx_n < (int)(sizeof(g_e2_dx) / sizeof(g_e2_dx[0]))) {
+    int q, seen = 0;
+    for (q = 0; q < g_e2_dx_n; q++)
+      if (g_e2_dx[q] == in->next) seen = 1;
+    if (!seen) g_e2_dx[g_e2_dx_n++] = in->next;
+  }
+  fprintf(f, "    { JSValue _f;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+      "v%u, %d, (int)q2_ns, &_f), 1)) {\n",
+      (unsigned)rv, site);
+  if (t->lb[dv] == E2_LB_TAG) {
+    fprintf(f, "        v%u = _f;\n", (unsigned)dv);
+  } else {
+    /* Write the raw result to the frame FIRST: on a guard mismatch the exit is at
+       the next pc and the generic body must find the op's result there. */
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _f);\n", dreg * 16);
+    if (t->lb[dv] == E2_LB_I32)
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_INT, 0)) "
+          "goto dx_%d;\n"
+          "        i%u = JS_VALUE_GET_INT(_f);\n",
+          in->next, (unsigned)dv);
+    else if (t->lb[dv] == E2_LB_F64)
+      fprintf(
+          f,
+          "        if (JS_VALUE_GET_TAG(_f) == JS_TAG_INT) d%u = "
+          "(double)JS_VALUE_GET_INT(_f);\n"
+          "        else if (JS_VALUE_GET_TAG(_f) == JS_TAG_FLOAT64) d%u = "
+          "JS_VALUE_GET_FLOAT64(_f);\n"
+          "        else goto dx_%d;\n",
+          (unsigned)dv, (unsigned)dv, in->next);
+    else if (t->lb[dv] == E2_LB_BOOL)
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_BOOL, 0)) "
+          "goto dx_%d;\n"
+          "        b%u = JS_VALUE_GET_BOOL(_f);\n",
+          in->next, (unsigned)dv);
+    else
+      return 0;
+  }
+  /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
+     inlined duplicate (the reviewer's ruling). */
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
   return 1;
 }
 
@@ -3817,8 +3925,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
      profile to speculate on and the generic body is the only body. */
   fprintf(f, "    {\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n");
+  fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
   fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
-  fprintf(f, "    (void)q2_ns;\n");
+  fprintf(f, "    (void)q2_ns; (void)holders;\n");
   /* A function with no PIC sites -- a leaf arithmetic function, say -- has no
      PIC table at all, so `pic` is NULL on EVERY call. Refusing on that refused
      every such function for good (E2_REFUSE_NOTE switches a function off after
@@ -3958,6 +4067,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_note_defs(cur, fn, in);
       } else if (have_types &&
                  emit_typed_arith(f, fn, in, &types, cur)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_field_read(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
         e2_note_defs(cur, fn, in);
       } else {
         break;

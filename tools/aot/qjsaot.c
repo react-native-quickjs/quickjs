@@ -4860,6 +4860,20 @@ int qjsaot_driver_main(int argc, char **argv) {
        against the layout header's offsets, so a compiled field read is a couple
        of loads rather than a call across the unit boundary. A miss returns 0 and
        the caller takes the cache-filling slow path and continues. */
+    /* QJS_AOT_E2_FORCE_MISS: forces every spec-body inline cache hit to fail, so
+       the miss path (the op-call wrapper) runs on the EXISTING tests. The test is
+       a static load, so it costs nothing when unset, and the environment is read
+       once per process on the first spec-body entry. */
+    fprintf(
+        f,
+        "static int q2_force_miss_cache = -1;\n"
+        "static inline __attribute__((always_inline)) int q2_env1(const char *n)\n"
+        "{\n"
+        "  const char *v = getenv(n);\n"
+        "  return v != NULL && v[0] == '1';\n"
+        "}\n"
+        "#define q2_force_miss q2_force_miss_cache\n"
+        "#define Q2_FORCE_MISS (q2_force_miss > 0)\n\n");
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int "
