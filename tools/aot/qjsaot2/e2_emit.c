@@ -167,12 +167,15 @@ void e2_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
   /* The common case is a table that already exists (a bound function with
      sites gets one at bind), so the test is inline and the helper -- a
      cross-unit call -- runs only when the table is actually missing. */
-  fprintf(
-      f,
-      "    if (__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
-      "NULL, 0)) {\n"
-      "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n"
-      "    }\n");
+  /* Only a function with property-cache sites has a table to ensure: for any other
+     the pointer is NULL on every call and the helper would run on every call. */
+  if (g->pic_count > 0)
+    fprintf(
+        f,
+        "    if (__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
+        "NULL, 0)) {\n"
+        "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n"
+        "    }\n");
 
   /* The header, in the engine's own field order. `ret_ip` is NULL and the
      destination field of `hdr_pack` is 0: a compiled call returns to C, not
@@ -283,7 +286,7 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "        int *sp_ = &seen_[(x->pc * 7 + x->kind[0]) & 1023];\n"
       "        if (!*sp_) e2_exit_log(\"%s\", x->kind, x->pc, x->tag, sp_);\n"
       "    }\n"
-      "    if (__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
+      "    if (%s__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
       "NULL, 0)) {\n"
       "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n"
       "    }\n"
@@ -323,7 +326,7 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
       "    return ret;\n"
       "}\n\n",
-      hex, slots, hex, nregs, hex);
+      hex, slots, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
 }
 
 /* `aot_f_HEX` for a frameless function: the engine still enters through it with a

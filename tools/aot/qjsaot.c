@@ -4472,7 +4472,10 @@ int qjsaot_driver_main(int argc, char **argv) {
            -O0 every inline copy took its own stack slots, and the stubs of a big
            function grew its frame enough to overflow earleyboyer's recursion. */
         "static int e2_exit_log_v = -1;\n"
-        "static void __attribute__((noinline, cold, unused))\n"
+        /* preserve_most: the call preserves every register, so a body that
+           reaches it in an exit does not give up its caller-saved registers (and
+           push seven callee-saved ones in its prologue) for a log nobody asked for. */
+        "static void __attribute__((noinline, cold, unused, preserve_most))\n"
         "e2_exit_log(const char *hex, const char *kind, int pc, int tag, int *seen)\n"
         "{\n"
         "  if (e2_exit_log_v < 0) {\n"

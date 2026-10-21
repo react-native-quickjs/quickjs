@@ -4090,7 +4090,7 @@ static int emit_typed_call(
   char callee[4][33];
   unsigned long long hits[4];
   int kind[4], n = 0, k, nb = 0, cc, th, off, na, w, r;
-  char recv[64];
+  char recv[64], cexp[64];
   Q2ValueId dv;
   int dreg;
 
@@ -4130,10 +4130,26 @@ static int emit_typed_call(
   if (t->lb[dv] != E2_LB_TAG)
     e2_note_stub(
         g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
-  if (th >= 0)
-    snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
-  else
-    snprintf(recv, sizeof(recv), "JS_UNDEFINED");
+  /* The callee and the receiver are TAG locals when the block holds them in one:
+     test and pass those, not the frame slots just stored from them (a load that
+     follows a store of the same bytes waits for it). */
+  {
+    Q2ValueId cv = cur != NULL && cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+    Q2ValueId tv =
+        th >= 0 && cur != NULL && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
+    if (cv != Q2_NO_VALUE && cv != E2_UNDEF && cv != E2_INFRAME &&
+        cv < (Q2ValueId)t->nvalues && t->lb[cv] == E2_LB_TAG)
+      snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+    else
+      snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    if (th < 0)
+      snprintf(recv, sizeof(recv), "JS_UNDEFINED");
+    else if (tv != Q2_NO_VALUE && tv != E2_UNDEF && tv != E2_INFRAME &&
+             tv < (Q2ValueId)t->nvalues && t->lb[tv] == E2_LB_TAG)
+      snprintf(recv, sizeof(recv), "v%u", (unsigned)tv);
+    else
+      snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
+  }
 
   /* ---- output starts here; it must not be abandoned ---- */
   fprintf(f, "    /* R6: sync live TAG values before the call */\n");
@@ -4174,15 +4190,15 @@ static int emit_typed_call(
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
     fprintf(
         f,
-        "    if (__builtin_expect(q2_call_entry(AOT_REG(fr, %d), "
+        "    if (__builtin_expect(q2_call_entry(%s, "
         "(const void *)aot_f_%s), 1)) {\n",
-        cc, callee[k]);
+        cexp, callee[k]);
     fprintf(
         f,
         "        JSValue _o = aot_n_%s(ctx, f,\n"
-        "            (JSObject *)JS_VALUE_GET_PTR(AOT_REG(fr, %d)), %s,\n"
+        "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "            &AOT_REG(fr, %d), %d);\n",
-        callee[k], cc, recv, w, na);
+        callee[k], cexp, recv, w, na);
     fprintf(
         f,
         "        if (__builtin_expect(JS_IsException(_o), 0)) return JS_EXCEPTION;\n"
@@ -4354,9 +4370,17 @@ static int emit_typed_load_this(
     if (cur != NULL) cur[ld] = dv;
     return 1;
   }
-  fprintf(f, "    { JSValue _t;\n");
-  fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
-  fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
+  /* An object `this` is what qjs_aot_load_this returns for it, strict or sloppy:
+     read in line; anything else takes the engine's helper (it may box). */
+  fprintf(
+      f,
+      "    { JSValue _t = *(JSValue *)((uint8_t *)f + "
+      "QJS_AOT_OFF_REGRUN_THIS_OBJ);\n"
+      "      int _own = 0;\n"
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) {\n"
+      "        _own = qjs_aot_load_this(ctx, f, &_t);\n"
+      "        if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n"
+      "      }\n");
   fprintf(
       f,
       "      if (_own) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n"
@@ -4483,9 +4507,15 @@ static int emit_typed_this_field(
     }
     return 1;
   }
-  fprintf(f, "    { JSValue _t, _v;\n");
-  fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
-  fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
+  fprintf(
+      f,
+      "    { JSValue _t = *(JSValue *)((uint8_t *)f + "
+      "QJS_AOT_OFF_REGRUN_THIS_OBJ), _v;\n"
+      "      int _own = 0;\n"
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) {\n"
+      "        _own = qjs_aot_load_this(ctx, f, &_t);\n"
+      "        if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n"
+      "      }\n");
   /* The receiver's local is the second def, and the frame slot is what the
      wrapper reads if the hit below misses. */
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
@@ -6226,8 +6256,7 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   else
     fprintf(
         f,
-        "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || q2_no_spec ||\n"
-        "                         q2_spec_fns_out(%d) || e2_off[%d], 0))\n"
+        "    if (__builtin_expect(entry_pc != 0 || (e2_off[%d] | e2_dis[%d]), 0))\n"
         "        return %s;\n",
         fi, fi, gene);
   /* The index must be inside the D4 arrays; the generator sized them from the
