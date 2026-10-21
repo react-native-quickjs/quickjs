@@ -3204,6 +3204,11 @@ static int emit_typed_elem_read(
       kreg < 0 || kreg >= fn->nregs)
     return 0;
 
+  /* EVERY check before the first byte (see the rule at the dispatcher): a TAG def is
+     a plain copy, an i32/f64 def gets the post-hit tag guard. */
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64)
+    return 0;
   fprintf(f, "    { JSValue _e;\n");
   fprintf(
       f,
@@ -3231,8 +3236,6 @@ static int emit_typed_elem_read(
           "JS_VALUE_GET_FLOAT64(_e);\n"
           "        else goto dx_%d;\n",
           (unsigned)dv, (unsigned)dv, in->next);
-    else
-      return 0;
   }
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", areg * 16, (unsigned)av);
