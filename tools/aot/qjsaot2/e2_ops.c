@@ -2982,6 +2982,23 @@ static int emit_typed_branch_bool(
   return 1;
 }
 
+/* An UNCONDITIONAL branch (`branch`, `branch_s`): one successor, no condition, so
+   it is arm 0 and nothing else. Loops whose back edge is a plain goto still handed
+   off at this instruction, which is a large part of the remaining hand-off weight. */
+static int emit_typed_goto(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, int b, Q2ValueId *cur,
+    const char *hex) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  if (in->rop != ROP_branch && in->rop != ROP_branch_s) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (blk->nsucc < 1) return 0;
+  if (blk->succ_block[0] < 0 || blk->succ_block[0] >= fn->nblocks) return 0;
+  fprintf(f, "    /* unconditional branch */\n");
+  e2_emit_arm(f, fn, b, 0, cur, hex);
+  return 1;
+}
+
 /* A typed compare-and-branch on two i32 locals.
 
    The sense is the reference lowering's, not re-derived: REG_CMP_INVERT in the
@@ -3384,6 +3401,11 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
           term_lowered = 1;
           break;
         }
+        if (emit_typed_goto(f, fn, in, fn->rpo[b], cur, hex)) {
+          lowered_to = i2 + 1;
+          term_lowered = 1;
+          break;
+        }
         if (emit_typed_branch_bool(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
             emit_typed_inc_branch(
@@ -3452,9 +3474,18 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_handoff_note(fn, &fn->insns[last]);
         fprintf(f, "    /* the terminator is 2b's: exit at its own pc */\n");
         e2_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1, b);
+      } else if (blk->nsucc == 1 && blk->succ_block[0] >= 0 &&
+                 blk->succ_block[0] < fn->nblocks) {
+        /* Fall-through: the block has ONE successor and no terminator, so this is
+           a lowered edge like any other. Handing off here instead -- which is what
+           this case used to do -- meant a fully lowered block still exited, so no
+           function ever completed on the spec path. */
+        fprintf(f, "    /* fall through to s_%d */\n",
+                fn->blocks[blk->succ_block[0]].start_pc);
+        e2_emit_arm(f, fn, b, 0, cur, hex);
       } else {
         const uint64_t *lo = q2_live_out(fn, last);
-        fprintf(f, "    /* fall through: the last instruction ran */\n");
+        fprintf(f, "    /* fall through, no single successor: exit */\n");
         e2_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo, 1, b);
       }
       free(set);
