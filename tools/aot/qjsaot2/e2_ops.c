@@ -2808,8 +2808,15 @@ static int emit_typed_inc_branch(
   int bv, si_take, si_else;
   char cn[32], cn2[32], bn[32];
 
-  /* Both forms of the counter test: `_s` (short offset) and the register form. */
-  if (in->rop != ROP_inc_branch_lt_s && in->rop != ROP_inc_branch_lt) return 0;
+  /* Both forms of the counter test: `_s` (short offset) and the register form.
+     Also `add_imm_self_branch(_s)` -- `i += k` fused with the same test, which is
+     how `for (i = s; i < e; i += 3)` compiles. */
+  {
+    int is_inc = in->rop == ROP_inc_branch_lt_s || in->rop == ROP_inc_branch_lt;
+    int is_addi = in->rop == ROP_add_imm_self_branch ||
+                  in->rop == ROP_add_imm_self_branch_s;
+    if (!is_inc && !is_addi) return 0;
+  }
   if (role == NULL || role->control != E2_CF_BRANCH) return 0;
   if (!have_types || t == NULL || blk->nsucc < 2) return 0;
   if (in->ndef < 1 || in->nuse < 2) return 0;
@@ -2827,8 +2834,18 @@ static int emit_typed_inc_branch(
      below the bound. */
   si_take = 0;
   si_else = 1;
-  fprintf(f, "    if (__builtin_expect(%s != INT32_MAX, 1)) {\n", cn2);
-  fprintf(f, "      %s = %s + 1;\n", cn, cn2);
+  if (in->rop == ROP_add_imm_self_branch || in->rop == ROP_add_imm_self_branch_s) {
+    /* The immediate is arg[2] for this shape; arg[1] is the sub-op. */
+    int32_t k = in->narg > 2 ? (int32_t)in->arg[2].val : 1;
+    fprintf(
+        f, "    if (__builtin_expect((int64_t)%s + (int64_t)%d <= INT32_MAX &&\n"
+           "                             (int64_t)%s + (int64_t)%d >= INT32_MIN, 1)) {\n",
+        cn2, k, cn2, k);
+    fprintf(f, "      %s = %s + %d;\n", cn, cn2, k);
+  } else {
+    fprintf(f, "    if (__builtin_expect(%s != INT32_MAX, 1)) {\n", cn2);
+    fprintf(f, "      %s = %s + 1;\n", cn, cn2);
+  }
   fprintf(f, "    } else {\n");
   /* The counter would overflow: exit at this instruction's own pc, before the
      increment, so the generic body redoes it as a double. */
