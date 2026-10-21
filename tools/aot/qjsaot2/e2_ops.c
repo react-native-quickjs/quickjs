@@ -3779,6 +3779,11 @@ static int emit_typed_this_field(
       "_t, %d, (int)q2_ns, &_v), 1)) {\n",
       site);
   fprintf(f, "        v%u = _v;\n", (unsigned)fv);
+  /* The hit keeps `this`: an owned one is adopted by its frame slot, as the
+     generic body's load_this does (the slot already holds it borrowed). The miss
+     releases it instead, because the wrapper loads `this` again itself. */
+  fprintf(
+      f, "        if (_own) qjs_aot_set_reg_p(ctx, fr, %d, _t);\n", rreg * 16);
   fprintf(f, "      } else {\n");
   fprintf(f, "        if (_own) JS_FreeValue(ctx, _t);\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
