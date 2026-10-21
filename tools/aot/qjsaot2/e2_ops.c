@@ -4569,6 +4569,112 @@ static int emit_typed_return(
    report prints it; it should stay 0 for structured bytecode. */
 int e2_irreducible = 0;
 
+/* ============================ the rop -> emitter table ====================
+   ONE emitter per rop. This replaces the long `else if` chain whose ORDER was the
+   bug five times in E8 (add_imm_self_s, the wrapper's tier gate, the fused ops, and
+   load_const twice): with a chain, an op silently stops lowering when an earlier,
+   wider test claims it, and a restructure can resurrect one of these without any
+   test noticing. Here an op appears exactly once and the compiler checks the cases.
+
+   The emitters keep their own rep checks (they are what decides `decline`); only
+   the "is this my rop" question is answered by the table. Anything the table does
+   not name falls to the op-call wrapper, which is still the catch-all.
+
+   Returns 1 when the instruction was emitted, 0 to hand off at this pc. */
+
+/* Emitters whose rop test is now redundant with the table still keep it: the same
+   function is called from more than one place (the generic body, tests). */
+static int e2_dispatch_rop(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b, const E2Role *role) {
+  switch (in->rop) {
+    /* -- the spec body's own trivial forms, separate because they are shared with
+          the generic emitter and must not be added there -- */
+    case ROP_load_const:
+      return emit_typed_load_const(f, fn, in, t, cur, have_types);
+
+    /* -- fused arithmetic (Q2_OP_BINARY, but a five-operand shape) -- */
+    case ROP_add_mul:
+    case ROP_mul_add:
+    case ROP_mul_sub:
+    case ROP_sub_mul:
+      return emit_typed_fused(f, fn, in, t, cur, have_types);
+
+    /* -- arithmetic -- */
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul:
+      return have_types && emit_typed_arith(f, fn, in, t, cur);
+    case ROP_binary_cpool:
+      return emit_typed_arith_cpool(f, fn, in, t, cur, have_types);
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+      return emit_typed_arith_imm(f, fn, in, t, cur, have_types);
+    case ROP_add_imm_self_s:
+    case ROP_sub_imm_self_s:
+      /* Both emit_typed_arith_imm and emit_typed_unary accept these; the arith
+         form is the one that was reached first in the old chain, so keep it. */
+      return emit_typed_arith_imm(f, fn, in, t, cur, have_types) ||
+             emit_typed_unary(f, fn, in, t, cur, have_types, hex, fi);
+    case ROP_inc:
+    case ROP_dec:
+    case ROP_neg:
+    case ROP_not:
+      return emit_typed_unary(f, fn, in, t, cur, have_types, hex, fi);
+    case ROP_bitand:
+    case ROP_bitor:
+    case ROP_bitxor:
+    case ROP_shl:
+    case ROP_shr:
+    case ROP_sar:
+      return emit_typed_bitwise(f, fn, in, t, cur, have_types);
+
+    /* -- fields -- */
+    case ROP_get_field:
+    case ROP_get_field2:
+    case ROP_get_field_own:
+    case ROP_get_field2_own:
+      return emit_typed_field_read(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_put_field:
+      return emit_typed_field_write(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_get_field_chain:
+    case ROP_get_field_chain_own:
+      return emit_typed_field_chain(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_get_this_field:
+    case ROP_get_this_field2:
+      return emit_typed_this_field(f, fn, in, t, cur, have_types, hex, fi, b);
+
+    /* -- elements and length -- */
+    case ROP_get_element:
+      return emit_typed_elem_read(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_put_element:
+    case ROP_put_element_xfer:
+      return emit_typed_elem_write(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_get_length:
+      return emit_typed_length(f, fn, in, t, cur, have_types, hex, fi, b);
+
+    /* -- globals and closure cells -- */
+    case ROP_get_global:
+      return emit_typed_global_read(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_get_var_ref:
+      return emit_typed_var_ref_load(f, fn, in, t, cur, have_types);
+    case ROP_put_var_ref:
+      return emit_typed_var_ref_store(f, fn, in, t, cur, have_types);
+
+    default:
+      break;
+  }
+  (void)role;
+  /* NO CATCH-ALL YET. This is a REFACTOR: the histogram must be identical before
+     and after, and adding the general op-call fallback here would lower ops
+     (object_fill, object_template, make_closure, ...) that the chain handed off --
+     which is Batch 4's (c) decision to make explicitly, not a side effect of
+     making the dispatch table-driven. */
+  return 0;
+}
+
 int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e2_fn = fn;
@@ -4756,58 +4862,15 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         break;
       }
       /* The spec body's OWN list. `generic_is_trivial` is shared with the generic
-         emitter, which has no case for these, so adding one there emits nothing
-         and silently drops the instruction. */
+         emitter, which has no case for these, so adding one there emits nothing and
+         silently drops the instruction. */
       if (generic_is_trivial(in) || in->rop == ROP_get_arg ||
           in->rop == ROP_get_arg2 || in->rop == ROP_move_xfer) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
         e2_note_defs(cur, fn, in);
-      } else if (emit_typed_arith_cpool(f, fn, in, &types, cur, have_types)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_arith_imm(f, fn, in, &types, cur, have_types)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_unary(
-                     f, fn, in, &types, cur, have_types, hex, fi)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_var_ref_store(f, fn, in, &types, cur, have_types)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_var_ref_load(f, fn, in, &types, cur, have_types)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_bitwise(f, fn, in, &types, cur, have_types)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_load_const(f, fn, in, &types, cur, have_types)) {
-        /* FIRST among the value producers: a load_const is Q2_OP_FALLBACK and
-           reaches no other emitter (fifth dispatch-order incident of E8). */
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_fused(f, fn, in, &types, cur, have_types)) {
-        e2_note_defs(cur, fn, in);
-      } else if (have_types &&
-                 emit_typed_arith(f, fn, in, &types, cur)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_field_read(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_global_read(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_length(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_elem_read(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_elem_write(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_this_field(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_field_chain(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
-        e2_note_defs(cur, fn, in);
-      } else if (emit_typed_field_write(
-                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+      } else if (e2_dispatch_rop(
+                     f, fn, in, &types, cur, have_types, hex, fi, b, role)) {
         e2_note_defs(cur, fn, in);
       } else {
         break;
