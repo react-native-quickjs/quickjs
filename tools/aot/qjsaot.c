@@ -5361,13 +5361,18 @@ int qjsaot_driver_main(int argc, char **argv) {
         "{\n"
         "  if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {\n"
         "    int32_t i = JS_VALUE_GET_INT(a);\n"
+        /* The edges are the interpreter's: -0 is a double, and the magnitude of
+           INT32_MIN (and one past INT32_MAX / below INT32_MIN) is not an int. */
         "    if (sub == QJS_AOT_REG_UN_NEG) {\n"
-        "      if (i == 0 || i == INT32_MIN) return 0;\n"
+        "      if (i == 0) { *out = __JS_NewFloat64(-0.0); return 1; }\n"
+        "      if (i == INT32_MIN) { *out = __JS_NewFloat64(2147483648.0); "
+        "return 1; }\n"
         "      *out = JS_MKVAL(JS_TAG_INT, -i);\n"
         "      return 1;\n"
         "    }\n"
         "    if (sub == QJS_AOT_REG_UN_INC) {\n"
-        "      if (i == INT32_MAX) return 0;\n"
+        "      if (i == INT32_MAX) { *out = __JS_NewFloat64(2147483648.0); "
+        "return 1; }\n"
         "      *out = JS_MKVAL(JS_TAG_INT, i + 1);\n"
         "      return 1;\n"
         "    }\n"
@@ -5375,7 +5380,8 @@ int qjsaot_driver_main(int argc, char **argv) {
            LNOT, TYPEOF, ... INC, DEC, and the layout header carries NEG and INC
            because they are the two the old templates needed. */
         "    if (sub == QJS_AOT_REG_UN_INC + 1) {\n"
-        "      if (i == INT32_MIN) return 0;\n"
+        "      if (i == INT32_MIN) { *out = __JS_NewFloat64(-2147483649.0); "
+        "return 1; }\n"
         "      *out = JS_MKVAL(JS_TAG_INT, i - 1);\n"
         "      return 1;\n"
         "    }\n"
