@@ -3101,7 +3101,7 @@ static void e2_emit_presync(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", reg,
               (unsigned)v);
     else if (t->lb[v] == E2_LB_F64)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", reg,
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", reg,
               (unsigned)v);
     else if (t->lb[v] == E2_LB_BOOL)
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", reg,
@@ -3122,7 +3122,7 @@ static void e2_emit_presync(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
               reg * 16, (unsigned)v);
     else if (t->lb[v] == E2_LB_F64)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", reg * 16,
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", reg * 16,
               (unsigned)v);
     else if (t->lb[v] == E2_LB_BOOL)
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
@@ -3142,7 +3142,7 @@ static void e2_emit_presync(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
               wr * 16, (unsigned)v);
     else if (t->lb[v] == E2_LB_F64)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", wr * 16,
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", wr * 16,
               (unsigned)v);
     else if (t->lb[v] == E2_LB_BOOL)
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
@@ -3759,7 +3759,7 @@ static int emit_typed_elem_write(
   if (t->lb[vv] == E2_LB_I32)
     snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)vv);
   else if (t->lb[vv] == E2_LB_F64)
-    snprintf(vb, sizeof(vb), "__JS_NewFloat64(d%u)", (unsigned)vv);
+    snprintf(vb, sizeof(vb), "E2_BOX_F64(d%u)", (unsigned)vv);
   else if (t->lb[vv] == E2_LB_BOOL)
     snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
   else
@@ -3873,7 +3873,7 @@ static int emit_typed_call(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
               wr * 16, (unsigned)v);
     else if (t->lb[v] == E2_LB_F64)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n", wr * 16,
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", wr * 16,
               (unsigned)v);
     else if (t->lb[v] == E2_LB_BOOL)
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
@@ -4318,7 +4318,7 @@ static int emit_typed_field_write(
     if (t->lb[vv] == E2_LB_I32)
       snprintf(boxed, sizeof(boxed), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)vv);
     else if (t->lb[vv] == E2_LB_F64)
-      snprintf(boxed, sizeof(boxed), "__JS_NewFloat64(d%u)", (unsigned)vv);
+      snprintf(boxed, sizeof(boxed), "E2_BOX_F64(d%u)", (unsigned)vv);
     else if (t->lb[vv] == E2_LB_BOOL)
       snprintf(boxed, sizeof(boxed), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
     else
@@ -4341,7 +4341,7 @@ static int emit_typed_field_write(
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
             vreg * 16, (unsigned)vv);
   else if (t->lb[vv] == E2_LB_F64)
-    fprintf(f, "        AOT_SET_B(ctx, fr, %d, __JS_NewFloat64(d%u));\n",
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n",
             vreg * 16, (unsigned)vv);
   else if (t->lb[vv] == E2_LB_BOOL)
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
@@ -4726,7 +4726,7 @@ static int emit_typed_var_ref_store(
       snprintf(box, sizeof(box), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)a);
       break;
     case E2_LB_F64:
-      snprintf(box, sizeof(box), "__JS_NewFloat64(d%u)", (unsigned)a);
+      snprintf(box, sizeof(box), "E2_BOX_F64(d%u)", (unsigned)a);
       break;
     case E2_LB_BOOL:
       snprintf(box, sizeof(box), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)a);

@@ -4679,6 +4679,12 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#ifndef E2_STACK_MARGIN\n"
         "#define E2_STACK_MARGIN (64 * 1024)\n"
         "#endif\n"
+        /* A double local stored where another function or entry can see it is
+           boxed as the interpreter's arithmetic would box it: an integral
+           value that fits int32 (and is not -0) is an INT, so a guard typed
+           from the profile does not see FLOAT64 for the same number. */
+        "#define E2_BOX_F64(d) ({ double d_ = (d); "
+        "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
         /* The `undefined` word a native entry fills its frame with, as one
            static constant so the fill is a copy of a known word. */
         "static const JSValue e2_undefined_value = { { .int32 = 0 }, "
