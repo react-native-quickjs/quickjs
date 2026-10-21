@@ -5877,6 +5877,21 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (si->group >= 0 && g_e2_facts->miss_exits[si->insn])
         g_e2_group_used[si->group] = 1;
     }
+    /* A table that is not there refuses the entry. Stating it here, once, tells
+       the compiler every cell read below has a table, which a non-NULL shape used
+       to imply and the all-empty sentinel does not. */
+    if (e2_pic_sites(fn) == 0)
+      for (g = 0; g < ng; g++)
+        if (g_e2_group_used[g]) {
+          fprintf(
+              f,
+              "    if (__builtin_expect(pic == NULL, 0)) {\n"
+              "        E2_REFUSE_NOTE(%d);\n"
+              "        return aot_g_%s(ctx, f, fr, 0);\n"
+              "    }\n",
+              fi, hex);
+          break;
+        }
     for (g = 0; g < ng; g++) {
       const E2Group *gr = &g_e2_facts->groups[g];
       if (!g_e2_group_used[g]) continue;
