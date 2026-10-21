@@ -4104,7 +4104,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_REGVM_FLAG_C_ENTRY %uu\n"
           "#define QJS_AOT_REGVM_FLAG_STACK %uu\n"
           "#define QJS_AOT_REGVM_FLAG_TRIVIAL_RET %uu\n"
-          "#define QJS_AOT_REGVM_FLAG_SAME_REALM %uu\n\n"
+          "#define QJS_AOT_REGVM_FLAG_SAME_REALM %uu\n"
+          "#define QJS_AOT_RC_BACK %uu\n"
+          "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
+          "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
           lay.hash, lay.sizeof_JSObject, lay.sizeof_JSShape,
           lay.sizeof_JSProperty, lay.sizeof_JSString, lay.sizeof_JSValue,
@@ -4115,12 +4118,11 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_shape_property_flags_atom, lay.off_string_len_bits,
           lay.off_string_strv, lay.off_jsvalue_tag, lay.off_jsvalue_u,
           lay.sizeof_JSRegPIC, lay.reg_pic_ways, lay.off_fnbc_pic_count,
-          lay.off_regpic_shape, lay.off_regpic_slot_off,
-          lay.off_regpic_kind, lay.reg_pic_own, lay.reg_pic_proto,
-          lay.reg_ic_none, lay.tag_lazy_json, lay.reg_bin_add,
-          (unsigned)REG_BIN_SHL, (unsigned)REG_BIN_SAR, (unsigned)REG_BIN_SHR,
-          (unsigned)REG_BIN_AND, (unsigned)REG_BIN_XOR, (unsigned)REG_BIN_OR,
-          lay.reg_bin_sub,
+          lay.off_regpic_shape, lay.off_regpic_slot_off, lay.off_regpic_kind,
+          lay.reg_pic_own, lay.reg_pic_proto, lay.reg_ic_none,
+          lay.tag_lazy_json, lay.reg_bin_add, (unsigned)REG_BIN_SHL,
+          (unsigned)REG_BIN_SAR, (unsigned)REG_BIN_SHR, (unsigned)REG_BIN_AND,
+          (unsigned)REG_BIN_XOR, (unsigned)REG_BIN_OR, lay.reg_bin_sub,
           lay.reg_bin_mul, lay.reg_bin_div, lay.reg_bin_mod, lay.reg_bin_lt,
           lay.reg_bin_lte, lay.reg_bin_gt, lay.reg_bin_gte,
           lay.reg_bin_strict_eq, lay.reg_bin_strict_neq, lay.reg_bin_eq,
@@ -4145,7 +4147,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_rt_regvm_cur, lay.off_rt_stack_limit,
           lay.off_object_func_var_refs, lay.light_prefix_slots,
           lay.regvm_flag_light, lay.regvm_flag_c_entry, lay.regvm_flag_stack,
-          lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm);
+          lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm,
+          lay.off_rc_back);
       fclose(lf);
     }
 
@@ -5010,6 +5013,17 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *out = v;\n"
         "  return 1;\n"
         "}\n\n");
+    /* A reference taken inline: the count is an int QJS_AOT_RC_BACK bytes before
+       the object (the layout publishes the offset), and this is js_dup()'s body,
+       so a counted store or a return costs no call into the engine. Release
+       stays JS_FreeValue, whose zero path parks the value. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) void q2_dup(JSValue v)\n"
+        "{\n"
+        "  if (JS_VALUE_HAS_REF_COUNT(v))\n"
+        "    ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
+        "}\n\n");
     /* The inline own-slot store hit: the interpreter's REG_PIC_OWN_W test on
        an object that is not a prototype, and the store the engine's own fast
        path makes (`*slot = js_dup(v); JS_FreeValue(ctx, old)`). The new value
@@ -5058,9 +5072,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
         "  {\n"
         "    JSValue old = *slot;\n"
-        "    if (JS_VALUE_HAS_REF_COUNT(v)) {\n"
-        "      JS_DupValue(ctx, v);\n"
-        "    }\n"
+        "    q2_dup(v);\n"
         "    *slot = v;\n"
         "    if (JS_VALUE_HAS_REF_COUNT(old)) {\n"
         "      JS_FreeValue(ctx, old);\n"

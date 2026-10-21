@@ -1151,6 +1151,21 @@ static int emit_native_post(
   return 1;
 }
 
+/* `return` of the value in frame slot `off`: qjs_aot_return's body inline. The
+   register borrows under DRC, so the caller gets its own reference (q2_dup, the
+   inline count), and the slot is cleared. */
+static void e2_emit_return(FILE *f, int off) {
+  fprintf(
+      f,
+      "    { JSValue _rv = AOT_REG(fr, %d);\n"
+      "#if QJS_DRC\n"
+      "      q2_dup(_rv);\n"
+      "#endif\n"
+      "      AOT_REG(fr, %d) = JS_UNDEFINED;\n"
+      "      return _rv; }\n",
+      off, off);
+}
+
 /* `return` ("r": value): the body leaves with the register's value. The engine's
    `qjs_aot_return` is the whole lowering -- it takes the reference the frame's
    register was borrowing and clears the slot -- so the fast path is one call and
@@ -1181,7 +1196,7 @@ static int emit_native_return(
   a = operand_off(in, role->use[0]);
   if (a < 0) return 0;
   fprintf(f, "g_%d:\n", in->pc);
-  fprintf(f, "    return qjs_aot_return(fr, %d);\n", a);
+  e2_emit_return(f, a);
   (void)is_last;
   return 1;
 }
@@ -4993,7 +5008,7 @@ static int emit_typed_return(
     if (r < 0 || r >= g_e2_fn->nregs) return 0;
     /* Box into the frame slot the generic return reads, by representation. */
     e2_exit_store(f, v, r);
-    fprintf(f, "    return qjs_aot_return(fr, %d);\n", r * 16);
+    e2_emit_return(f, r * 16);
   }
   return 1;
 }
