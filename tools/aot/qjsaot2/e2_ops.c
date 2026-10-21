@@ -3707,6 +3707,8 @@ static int emit_typed_call(
         "        if (__builtin_expect(JS_IsException(_o), 0)) return JS_EXCEPTION;\n"
         "        qjs_aot_set_reg_p(ctx, fr, %d, _o);\n",
         off);
+    /* The call ran JS: re-read the groups before anything reads a field. */
+    e2_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E2_LB_TAG) {
       fprintf(f, "        v%u = _o;\n", (unsigned)dv);
     } else if (e2_def_dead(in, dv)) {
