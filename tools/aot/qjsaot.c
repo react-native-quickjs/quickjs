@@ -4332,16 +4332,25 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* QJS_AOT_E2_EXIT_LOG=1: the first time each guard stub is taken, one
            line naming it and the tag its guard saw (-100 where there is no
            value: an overflow exit, or a stub whose guard named none). Read
-           once; one load and a branch when off. */
+           once; one load and a branch when off. The work is out of line: at
+           -O0 every inline copy took its own stack slots, and the stubs of a big
+           function grew its frame enough to overflow earleyboyer's recursion. */
         "static int e2_exit_log_v = -1;\n"
+        "static void __attribute__((noinline, cold, unused))\n"
+        "e2_exit_log(const char *hex, const char *kind, int pc, int tag, int *seen)\n"
+        "{\n"
+        "  if (e2_exit_log_v < 0) {\n"
+        "    const char *e_ = getenv(\"QJS_AOT_E2_EXIT_LOG\");\n"
+        "    e2_exit_log_v = e_ != NULL && e_[0] == '1';\n"
+        "  }\n"
+        "  if (!e2_exit_log_v) return;\n"
+        "  *seen = 1;\n"
+        "  fprintf(stderr, \"e2-exit fn=%%s kind=%%s pc=%%d tag=%%d\\n\", hex, kind,\n"
+        "          pc, tag);\n"
+        "}\n"
         "#define E2_EXIT_LOG(hex, kind, pc, tag) do { static int e2_xl_; \\\n"
-        "    if (__builtin_expect(e2_exit_log_v != 0, 0) && !e2_xl_) { \\\n"
-        "      if (e2_exit_log_v < 0) { \\\n"
-        "        const char *e_ = getenv(\"QJS_AOT_E2_EXIT_LOG\"); \\\n"
-        "        e2_exit_log_v = e_ != NULL && e_[0] == '1'; } \\\n"
-        "      if (e2_exit_log_v) { e2_xl_ = 1; \\\n"
-        "        fprintf(stderr, \"e2-exit fn=%%s kind=%%s pc=%%d tag=%%d\\n\", \\\n"
-        "                hex, kind, pc, (int)(tag)); } } } while (0)\n"
+        "    if (__builtin_expect(e2_exit_log_v != 0, 0) && !e2_xl_) \\\n"
+        "      e2_exit_log((hex), (kind), (pc), (int)(tag), &e2_xl_); } while (0)\n"
         "#define E2_EXIT_NOTE(fi) do { if (++e2_exi[fi] > 256 && \\\n"
         "    (uint64_t)e2_exi[fi] * 16 > e2_ent[fi]) e2_off[fi] = 1; } while (0)\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
