@@ -2901,6 +2901,112 @@ static int emit_typed_opcall(
   return 1;
 }
 
+/* The FUSED arithmetic ops as typed arithmetic in the spec body:
+   `add_mul` ("rrrrr": dm, x, y, da, c) is `t = x * y; r = c + t`, exactly as the
+   engine handler does it -- TWO operations, never an fma (the unit already builds
+   with -ffp-contract=off; emitting two statements keeps it that way by construction).
+   `mul_add` is the same pair with the add's operands swapped; `mul_sub`/`sub_mul`
+   subtract instead.
+
+   f64: both steps are the machine's, and a product or sum of doubles cannot
+   overflow, so no exit. i32: each step is a widening int64 operation with its own
+   overflow deopt at this pc, and the multiply also carries mul's -0 exit -- an int32
+   cannot hold -0, so `0 * -1` must leave for the generic body. */
+static int emit_typed_fused(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId dv, xv, yv, cv;
+  int is_add, ld, ldm;
+  char op[2];
+
+  if (!have_types || t == NULL) return 0;
+  switch (in->rop) {
+    case ROP_add_mul:
+    case ROP_mul_add:
+      is_add = 1;
+      op[0] = '+';
+      break;
+    case ROP_sub_mul:
+    case ROP_mul_sub:
+      is_add = 0;
+      op[0] = '-';
+      break;
+    default:
+      return 0;
+  }
+  op[1] = 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->ndef < 2 || in->nuse < 3) return 0;
+  dv = in->def[0];   /* the product register (dm) */
+  xv = in->use[0];
+  yv = in->use[1];
+  cv = in->use[2];
+  if (dv >= (Q2ValueId)t->nvalues || xv >= (Q2ValueId)t->nvalues ||
+      yv >= (Q2ValueId)t->nvalues || cv >= (Q2ValueId)t->nvalues)
+    return 0;
+  ldm = fn->values[dv].reg;
+  /* The instruction's SECOND def is where the sum/multiply result goes. */
+  {
+    Q2ValueId rv = in->def[1];
+    if (rv >= (Q2ValueId)t->nvalues) return 0;
+    ld = fn->values[rv].reg;
+    if (ld < 0 || ld >= fn->nregs || ldm < 0 || ldm >= fn->nregs) return 0;
+
+    if (t->lb[xv] == E2_LB_F64 && t->lb[yv] == E2_LB_F64 &&
+        t->lb[cv] == E2_LB_F64 && t->lb[dv] == E2_LB_F64 &&
+        t->lb[rv] == E2_LB_F64) {
+      /* Two statements, in the engine's order. */
+      fprintf(f, "    d%u = d%u * d%u;\n", (unsigned)dv, (unsigned)xv,
+              (unsigned)yv);
+      fprintf(f, "    d%u = d%u %s d%u;\n", (unsigned)rv, (unsigned)cv, op,
+              (unsigned)dv);
+    } else if (t->lb[xv] == E2_LB_I32 && t->lb[yv] == E2_LB_I32 &&
+               t->lb[cv] == E2_LB_I32 && t->lb[dv] == E2_LB_I32 &&
+               t->lb[rv] == E2_LB_I32) {
+      /* Step 1: the product, with the -0 exit the multiply already has. */
+      fprintf(
+          f,
+          "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n"
+          "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+          "goto ox_%d;\n"
+          "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) "
+          "goto ox_%d;\n"
+          "      i%u = (int32_t)_t; }\n",
+          (unsigned)xv, (unsigned)yv, in->pc, (unsigned)xv, (unsigned)yv,
+          in->pc, (unsigned)dv);
+      /* Step 2: the sum or difference. */
+      fprintf(
+          f,
+          "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n"
+          "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+          "goto ox_%d;\n"
+          "      i%u = (int32_t)_t; }\n",
+          is_add ? cv : cv, is_add ? "+" : "-", (unsigned)dv, in->pc,
+          (unsigned)rv);
+    } else {
+      return 0;
+    }
+    (void)is_add;
+    (void)op;
+    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
+      Q2ValueId *snap =
+          malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+      if (snap != NULL) {
+        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+        g_e2_ox[g_e2_ox_n] = in->pc;
+        g_e2_ox_cur[g_e2_ox_n] = snap;
+        g_e2_ox_n++;
+      }
+    }
+    if (cur != NULL) {
+      cur[ldm] = dv;
+      cur[ld] = rv;
+    }
+  }
+  return 1;
+}
+
 /* A speculative-body ARRAY LENGTH: `get_length` ("rr": dest, receiver). The hit
    helper is `q2_array_length`, which returns a double in an int range; the result is
    an i32 local (that is the only shape the analysis uses for it). A miss goes to the
@@ -4430,6 +4536,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       } else if (emit_typed_var_ref_load(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_bitwise(f, fn, in, &types, cur, have_types)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_fused(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (have_types &&
                  emit_typed_arith(f, fn, in, &types, cur)) {
