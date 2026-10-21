@@ -5637,21 +5637,10 @@ static int emit_tag_numeric(
   if (!have_types || t == NULL) return 0;
   shape = e2_tag_numeric_shape(in, role, &sub, &imm);
   if (shape == 0) return 0;
-  /* A frameless body has only the inline cases of the engine's predicate: an op
-     whose sub-operation always leaves it (a loose compare, a modulus, `**`)
-     would exit on every execution. */
-  if (g_e2_fl && shape != 3) {
-    switch (sub) {
-      case REG_BIN_ADD: case REG_BIN_SUB: case REG_BIN_MUL:
-      case REG_BIN_LT: case REG_BIN_LTE: case REG_BIN_GT: case REG_BIN_GTE:
-      case REG_BIN_STRICT_EQ: case REG_BIN_STRICT_NEQ:
-      case REG_BIN_AND: case REG_BIN_OR: case REG_BIN_XOR:
-      case REG_BIN_SHL: case REG_BIN_SAR: case REG_BIN_SHR:
-        break;
-      default:
-        return 0;
-    }
-  }
+  /* `**` has no fast path in the engine's predicate at all: it would leave on
+     every execution. (The rest is pure arithmetic with no allocation, so even the
+     out-of-line part of `q2_arith` is fine in a frameless body.) */
+  if (shape != 3 && sub == REG_BIN_POW) return 0;
   dv = in->def[0];
   if (dv >= (Q2ValueId)t->nvalues) return 0;
   dreg = fn->values[dv].reg;
@@ -5688,7 +5677,7 @@ static int emit_tag_numeric(
   else
     fprintf(
         f, "      if (__builtin_expect(%s(%d, %s, %s, &_r), 1)) {\n",
-        g_e2_fl ? "q2_num_fast" : "q2_arith", sub, aa, bb);
+        "q2_arith", sub, aa, bb);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_r")) return 0;
   fprintf(f, "      } else {\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
@@ -5744,6 +5733,49 @@ static int emit_tag_branch_truthy(
       return 0;
   }
   fprintf(f, "    if (%sc_) {\n", neg ? "!" : "");
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+  fprintf(f, "    }\n    }\n");
+  return 1;
+}
+
+/* `branch_null` / `branch_not_null` (the tag is null) and `branch_nullish` /
+   `branch_not_nullish` (null or undefined, or the HTMLDDA object, which the
+   engine's `qjs_aot_nullish` decides and which runs no JS): a tag test with no
+   miss path. A typed operand is a number or a bool, so the answer is constant. */
+static int emit_tag_branch_null(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33]) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  Q2ValueId a;
+  int nullish, want;
+
+  switch (in->rop) {
+    case ROP_branch_null: nullish = 0; want = 1; break;
+    case ROP_branch_not_null: nullish = 0; want = 0; break;
+    case ROP_branch_nullish: nullish = 1; want = 1; break;
+    case ROP_branch_not_nullish: nullish = 1; want = 0; break;
+    default: return 0;
+  }
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (!have_types || t == NULL || blk->nsucc < 2 || in->nuse < 1) return 0;
+  a = in->use[0];
+  if (a >= (Q2ValueId)t->nvalues) return 0;
+  fprintf(f, "    { int c_;\n");
+  if (t->lb[a] != E2_LB_TAG)
+    fprintf(f, "    c_ = 0;\n");
+  else if (nullish)
+    fprintf(
+        f,
+        "    { uint32_t tg_ = (uint32_t)JS_VALUE_GET_TAG(v%u);\n"
+        "      c_ = tg_ == JS_TAG_NULL || tg_ == JS_TAG_UNDEFINED ||\n"
+        "           (tg_ == (uint32_t)JS_TAG_OBJECT && qjs_aot_nullish(v%u)); }\n",
+        (unsigned)a, (unsigned)a);
+  else
+    fprintf(f, "    c_ = JS_VALUE_GET_TAG(v%u) == JS_TAG_NULL;\n", (unsigned)a);
+  fprintf(f, "    if (c_ == %d) {\n", want);
   e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
   fprintf(f, "    } else {\n");
   e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
@@ -6703,6 +6735,8 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
             emit_typed_branch(
                 f, fn, in, &types, b, cur, have_types, hex, fi) ||
             emit_tag_branch_truthy(
+                f, fn, in, &types, b, cur, have_types, hex) ||
+            emit_tag_branch_null(
                 f, fn, in, &types, b, cur, have_types, hex) ||
             (have_types &&
              emit_term_wrapper(f, fn, in, &types, b, cur, hex, fi))) {
