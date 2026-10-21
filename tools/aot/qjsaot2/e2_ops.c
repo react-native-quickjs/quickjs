@@ -5004,9 +5004,19 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e2_fn = fn;
   E2Facts facts;
-  E2Types types;
+  /* STATIC on purpose: `g_e2_types` publishes `&types` for the whole emission, and
+     the helpers that name locals read it. As a stack local the address escaped this
+     call and the next function's e2_rep_prefix read a reused slot -- naming locals
+     from another function's reps (`v28 = i27 - 1`). Static gives it the lifetime the
+     published pointer requires. */
+  static E2Types types;
   int b, k;
   int have_types = 0;
+
+  /* `types` is static, so it survives between calls: reset it before each function
+     or the previous function's reps would be visible where this one has none. */
+  memset(&types, 0, sizeof(types));
+  g_e2_types = NULL;
 
   /* The speculative body emits blocks in reverse postorder and relies on every
      back edge going to a dominator; a function that is irreducible keeps the
