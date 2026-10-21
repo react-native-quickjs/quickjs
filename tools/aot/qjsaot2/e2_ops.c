@@ -2060,6 +2060,8 @@ void e2_handoff_report(FILE *f) {
    fires before anything is in a local, so the frame still holds what the caller
    wrote and the generic body's g_<pc> reloads the arguments itself. */
 static int g_e2_ax[256];
+static int g_e2_vx[256];
+static int g_e2_vx_n;
 static int g_e2_ax_n = 0;
 
 /* The function being emitted, for the helpers that need its value table. */
@@ -2669,6 +2671,74 @@ static void e2_emit_arm(
     fprintf(f, "      }\n");
   }
   fprintf(f, "      goto s_%d;\n", fn->blocks[sb].start_pc);
+}
+
+/* A closure-cell LOAD in the spec body: `get_var_ref` (rop 18, "ru"). The cell is
+   heap and owns its value, so this BORROWS it -- no dup, no free (DRC also parks
+   any free until a safepoint). R6 still applies: a TAG local that survives a later
+   poll or op call is synced to the frame at that point, like every other TAG local.
+   A typed site checks the TAG directly rather than calling qjs_aot_to_num, because
+   on an object that can run JS (valueOf) and allocate in the middle of the body --
+   which would need the sync R6 is not yet doing mid-block. A tag that does not
+   match the site's representation is a DEOPT exit at the load's own pc, not a
+   conversion: the cell may legitimately hold anything profiling did not see.
+   JS_TAG_UNINITIALIZED (TDZ) exits too, so the generic body raises the
+   ReferenceError the language requires. */
+static int emit_typed_var_ref_load(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId d;
+  int slot, ld;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_get_var_ref) return 0;
+  if (in->ndef < 1 || in->narg < 2) return 0;
+  if (in->arg[1].kind != 'u' && in->arg[1].kind != 'i') return 0;
+  d = in->def[0];
+  slot = (int)in->arg[1].val;
+  if (d >= (Q2ValueId)t->nvalues) return 0;
+  ld = fn->values[d].reg;
+
+  /* Register the exit pc ONCE per function body, so the vx_ label below is
+     emitted exactly once. */
+  if (g_e2_vx_n < (int)(sizeof(g_e2_vx) / sizeof(g_e2_vx[0]))) {
+    int q, seen = 0;
+    for (q = 0; q < g_e2_vx_n; q++)
+      if (g_e2_vx[q] == in->pc) seen = 1;
+    if (!seen) g_e2_vx[g_e2_vx_n++] = in->pc;
+  }
+  if (t->lb[d] == E2_LB_I32) {
+    fprintf(
+        f,
+        "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_c) != JS_TAG_INT, 0)) "
+        "goto vx_%d;\n"
+        "      i%u = JS_VALUE_GET_INT(_c); }\n",
+        slot, in->pc, (unsigned)d);
+  } else if (t->lb[d] == E2_LB_F64) {
+    fprintf(
+        f,
+        "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
+        "      int _tg = JS_VALUE_GET_TAG(_c);\n"
+        "      if (_tg == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_c);\n"
+        "      else if (_tg == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_c);\n"
+        "      else goto vx_%d; }\n",
+        slot, (unsigned)d, (unsigned)d, in->pc);
+  } else if (t->lb[d] == E2_LB_BOOL) {
+    fprintf(
+        f,
+        "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_c) != JS_TAG_BOOL, 0)) "
+        "goto vx_%d;\n"
+        "      b%u = JS_VALUE_GET_BOOL(_c); }\n",
+        slot, in->pc, (unsigned)d);
+  } else {
+    /* TAG: borrow the cell's value into a TAG local. No dup (the cell owns it),
+       and R6 syncs it before any later safepoint. */
+    fprintf(f, "    v%u = qjs_aot_get_var_ref(f, %d);\n", (unsigned)d, slot);
+  }
+  if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  return 1;
 }
 
 /* The i32 bitwise and shift group: `bitand`/`bitor`/`bitxor`/`shl`/`sar`/`shr`.
@@ -3486,6 +3556,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       } else if (emit_typed_unary(
                      f, fn, in, &types, cur, have_types, hex, fi)) {
         e2_note_defs(cur, fn, in);
+      } else if (emit_typed_var_ref_load(f, fn, in, &types, cur, have_types)) {
+        e2_note_defs(cur, fn, in);
       } else if (emit_typed_bitwise(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (have_types &&
@@ -3562,6 +3634,21 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
     }
     g_e2_ax_n = 0;
+  }
+  /* The closure-cell load's deopt exits: the cell holds a value whose tag the
+     site does not accept, which is an EXPECTED outcome (profiling cannot promise
+     what a cell holds), so the exit syncs and hands over like any other. */
+  {
+    int o;
+    for (o = 0; o < g_e2_vx_n; o++) {
+      int pc2 = g_e2_vx[o], ii, ins = -1;
+      for (ii = 0; ii < fn->ninsns; ii++)
+        if (fn->insns[ii].pc == pc2) { ins = ii; break; }
+      if (ins < 0) continue;
+      fprintf(f, "    vx_%d:;\n", pc2);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, NULL);
+    }
+    g_e2_vx_n = 0;
   }
   /* The overflow exits: the arithmetic check jumps here, and the exit does the
      sync and the hand-over. Nothing was written to the frame by the arithmetic
