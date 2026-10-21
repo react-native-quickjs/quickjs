@@ -106,6 +106,21 @@ static int prof_at(const Q2Func *fn, int pc, unsigned *types) {
   return 0;
 }
 
+/* Whether the instruction at `in`'s fall-through pc defines a value, so the
+   profile record at that pc belongs to it. */
+static int next_defines(const Q2Func *fn, const Q2Insn *in) {
+  int lo = 0, hi = fn->ninsns - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    if (fn->insns[mid].pc == in->next) return fn->insns[mid].ndef > 0;
+    if (fn->insns[mid].pc < in->next)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return 0;
+}
+
 /* The profile's type set mapped to the IR's kinds, as build.c maps it. */
 static uint32_t prof_to_q2(unsigned types) {
   uint32_t t = 0;
@@ -825,9 +840,15 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
         uint32_t t = 0;
         int has = 0;
         if (in->op == Q2_OP_CALL) {
-          /* Rule 1: a call's result is recorded at the pc after the call. */
+          /* Rule 1: a call's result is recorded at the pc after the call --
+             but that pc is also the NEXT instruction's own, and when that
+             instruction defines a value the record there is its, not the
+             call's (box2d: a `const 0` after a call that returns undefined
+             typed the call i32, and its guard failed on every entry). The
+             record keeps no source position to tell them apart, so a call
+             followed by a defining instruction has no record. */
           unsigned types = 0;
-          has = prof_at(fn, in->next, &types);
+          has = !next_defines(fn, in) && prof_at(fn, in->next, &types);
           t = has ? prof_to_q2(types) : 0;
         } else if (chain_first_link(in, d)) {
           /* Rule 3: a chain's first link has no record. */
