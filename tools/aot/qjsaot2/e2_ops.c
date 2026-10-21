@@ -2242,6 +2242,13 @@ static void e2_note_stub(
       r = g_e2_fn->values[v].reg;
       if (r >= 0 && r < nr) snap[r] = E2_INFRAME;
     }
+  /* The registers an op call rewrote beyond its defs hold the op's value in the
+     frame too; the block's local for them is the old value. */
+  if (wrote != NULL)
+    for (q = 0; q < wrote->nredef; q++) {
+      int r = wrote->redef_reg[q];
+      if (r >= 0 && r < nr) snap[r] = E2_INFRAME;
+    }
   pcs[*n] = pc;
   curs[*n] = snap;
   blks[*n] = g_e2_blk;
@@ -3289,11 +3296,11 @@ static int emit_typed_opcall(
   return 1;
 }
 
-/* The CALL family: `call`, `call_method`, `call_constructor`, `tail_call`, the
-   apply forms and anything else that runs JS through a callee frame. The generic
-   wrapper must NOT take these -- its step+reload does not reproduce a call's return
-   handling and produced `undefined` on the first attempt -- so they hand off until
-   Batch 4's (b), a spec version shaped like `emit_native_call`. */
+/* The CALL family: `call`, `call_method`, `construct`, `tail_call`, the apply forms
+   and anything else that runs JS through a callee frame. `call` and `call_method`
+   have their own site emitter, tail calls and `eval` leave the function, and
+   `construct` and `apply_arguments` are the two the wrapper may run (see
+   `e2_wrappable`). */
 static int e2_is_call_family(uint16_t rop) {
   switch (rop) {
     case ROP_call:
