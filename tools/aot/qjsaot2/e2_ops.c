@@ -2607,6 +2607,112 @@ static int emit_typed_inc_branch(
   return 1;
 }
 
+/* A typed binary with an IMMEDIATE operand: `binary_imm_s`, `add_imm_s`,
+   `sub_imm_s` and `binary_cpool` whose pool entry is a foldable number. One
+   operand is a local, the other a C literal, so the operation is the machine's
+   with the same int64 overflow check as the register form. Returns 1 when it
+   emitted the instruction. */
+static int emit_typed_arith_imm(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId d, a;
+  int sub, ld;
+  int32_t imm = 0;
+  const char *op;
+  int have_imm = 0;
+
+  if (!have_types || t == NULL) return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->ndef < 1) return 0;
+  switch (in->rop) {
+    case ROP_binary_imm_s:
+    case ROP_binary_imm:
+      if (in->narg < 4 || in->arg[1].kind != 'b') return 0;
+      sub = (int)in->arg[1].val;
+      if (in->arg[3].kind != 'i') return 0;
+      imm = (int32_t)in->arg[3].val;
+      have_imm = 1;
+      break;
+    case ROP_add_imm_s:
+      sub = REG_BIN_ADD;
+      if (in->narg < 3 || in->arg[2].kind != 'i') return 0;
+      imm = (int32_t)in->arg[2].val;
+      have_imm = 1;
+      break;
+    case ROP_sub_imm_s:
+      sub = REG_BIN_SUB;
+      if (in->narg < 3 || in->arg[2].kind != 'i') return 0;
+      imm = (int32_t)in->arg[2].val;
+      have_imm = 1;
+      break;
+    default:
+      return 0;
+  }
+  if (!have_imm) return 0;
+  if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL) return 0;
+  d = in->def[0];
+  if (d >= (Q2ValueId)t->nvalues || t->lb[d] != E2_LB_I32) return 0;
+  if (in->nuse < 1) return 0;
+  a = in->use[0];
+  if (a >= (Q2ValueId)t->nvalues || t->lb[a] != E2_LB_I32) return 0;
+  op = sub == REG_BIN_ADD ? "+" : (sub == REG_BIN_SUB ? "-" : "*");
+  ld = fn->values[d].reg;
+  fprintf(
+      f, "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n", (unsigned)a, op,
+      imm);
+  fprintf(
+      f,
+      "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+      "goto ox_%d;\n",
+      in->pc);
+  fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
+  if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur) {
+    Q2ValueId *snap =
+        malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    if (snap) {
+      memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+      g_e2_ox[g_e2_ox_n] = in->pc;
+      g_e2_ox_cur[g_e2_ox_n] = snap;
+      g_e2_ox_n++;
+    }
+  }
+  return 1;
+}
+
+/* `branch_if` / `branch_if_not` on a value the analysis holds as a BOOL: the
+   local is already 0 or 1, so the test is the machine's. Both arms go through the
+   one-function arm emitter. A TAG value needs a truthiness test (the generic
+   body's `JS_VALUE_GET_INT(v) != 0` after a tag range check), which can run
+   getters for an object -- not this lowering. */
+static int emit_typed_branch_bool(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, const char *hex) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  Q2ValueId a;
+  int neg, si_take, si_else;
+  char an[32];
+
+  if (in->rop != ROP_branch_if && in->rop != ROP_branch_if_not) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (!have_types || t == NULL || blk->nsucc < 2) return 0;
+  if (in->nuse < 1) return 0;
+  a = in->use[0];
+  if (a >= (Q2ValueId)t->nvalues || t->lb[a] != E2_LB_BOOL) return 0;
+  neg = in->rop == ROP_branch_if_not;
+  si_take = 0;
+  si_else = 1;
+  e2_local_name(an, sizeof(an), a);
+  fprintf(f, "    if (%s%s) {\n", neg ? "!" : "", an);
+  e2_emit_arm(f, fn, b, si_take, cur, hex);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, si_else, cur, hex);
+  fprintf(f, "    }\n");
+  return 1;
+}
+
 /* A typed compare-and-branch on two i32 locals.
 
    The sense is the reference lowering's, not re-derived: REG_CMP_INVERT in the
@@ -2968,7 +3074,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
       if (role != NULL && role->control != E2_CF_NONE) {
-        if (emit_typed_inc_branch(
+        if (emit_typed_branch_bool(
+                f, fn, in, &types, fn->rpo[b], cur, have_types, hex) ||
+            emit_typed_inc_branch(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi) ||
             emit_typed_branch(
                 f, fn, in, &types, fn->rpo[b], cur, have_types, hex, fi)) {
@@ -2980,6 +3088,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       if (is_trivial(in) || in->rop == ROP_get_arg2) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
+      } else if (emit_typed_arith_imm(f, fn, in, &types, cur, have_types)) {
+        /* lowered */
       } else if (emit_typed_unary(
                      f, fn, in, &types, cur, have_types, hex, fi)) {
         /* lowered */
