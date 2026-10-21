@@ -2166,6 +2166,23 @@ static void e2_note_tag(char kind, int pc, const char *expr) {
   snprintf(g_e2_xtag[g_e2_xtag_n].expr, sizeof(g_e2_xtag[0].expr), "%s", expr);
   g_e2_xtag_n++;
 }
+/* Whether a typed def is dead: its register is not live after the defining
+   instruction. That is the set every exit syncs from, and it counts a call's
+   argument window, so nothing -- no instruction, no exit -- reads such a local.
+   Its guard is skipped: the op's raw result is already in the frame, which is all
+   the generic body needs. (Use lists alone are not enough: a call reads its
+   arguments through the window, which no use list names.) */
+static int e2_def_dead(const Q2Insn *in, Q2ValueId v) {
+  const uint64_t *lo;
+  int r;
+  if (v >= (Q2ValueId)g_e2_fn->nvalues) return 0;
+  r = g_e2_fn->values[v].reg;
+  if (r < 0 || r >= g_e2_fn->nregs) return 0;
+  lo = q2_live_out(g_e2_fn, (int)(in - g_e2_fn->insns));
+  if (lo == NULL) return 0;
+  return !((lo[r >> 6] >> (r & 63)) & 1);
+}
+
 static const char *e2_tag_expr(char kind, int pc) {
   int q;
   for (q = 0; q < g_e2_xtag_n; q++)
@@ -3028,6 +3045,8 @@ static int emit_typed_opcall(
     if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) continue;
     reg = fn->values[v].reg;
     if (reg < 0 || reg >= fn->nregs) continue;
+    /* Nothing reads it: the op left it in the frame, and that is enough. */
+    if (t->lb[v] != E2_LB_TAG && e2_def_dead(in, v)) continue;
     switch (t->lb[v]) {
       case E2_LB_I32:
         e2_sweep_guard(f, "dx", in->next);
@@ -3385,23 +3404,27 @@ static int emit_typed_elem_read(
     /* Raw result to the frame first, so a guard miss leaves the op's result where
        the generic body will look for it. */
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
-    e2_sweep_guard(f, "dx", in->next);
-    if (t->lb[dv] == E2_LB_I32)
-      fprintf(
-          f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT, 0)) "
-          "goto dx_%d;\n"
-          "        i%u = JS_VALUE_GET_INT(_e);\n",
-          in->next, (unsigned)dv);
-    else if (t->lb[dv] == E2_LB_F64)
-      fprintf(
-          f,
-          "        if (JS_VALUE_GET_TAG(_e) == JS_TAG_INT) d%u = "
-          "(double)JS_VALUE_GET_INT(_e);\n"
-          "        else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = "
-          "JS_VALUE_GET_FLOAT64(_e);\n"
-          "        else goto dx_%d;\n",
-          (unsigned)dv, (unsigned)dv, in->next);
+    /* Nothing reads the result: the frame write above is all it needs. */
+    if (!e2_def_dead(in, dv)) {
+      e2_sweep_guard(f, "dx", in->next);
+      if (t->lb[dv] == E2_LB_I32)
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT, "
+            "0)) "
+            "goto dx_%d;\n"
+            "        i%u = JS_VALUE_GET_INT(_e);\n",
+            in->next, (unsigned)dv);
+      else if (t->lb[dv] == E2_LB_F64)
+        fprintf(
+            f,
+            "        if (JS_VALUE_GET_TAG(_e) == JS_TAG_INT) d%u = "
+            "(double)JS_VALUE_GET_INT(_e);\n"
+            "        else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = "
+            "JS_VALUE_GET_FLOAT64(_e);\n"
+            "        else goto dx_%d;\n",
+            (unsigned)dv, (unsigned)dv, in->next);
+    }
   }
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", areg * 16, (unsigned)av);
@@ -3583,6 +3606,8 @@ static int emit_typed_call(
         off);
     if (t->lb[dv] == E2_LB_TAG) {
       fprintf(f, "        v%u = _o;\n", (unsigned)dv);
+    } else if (e2_def_dead(in, dv)) {
+      /* Nothing reads the result: set_reg_p above left it in the frame. */
     } else if (t->lb[dv] == E2_LB_I32) {
       /* The call has run, so a failed guard is an ordinary exit at the NEXT pc. */
       e2_sweep_guard(f, "dx", in->next);
@@ -3653,23 +3678,27 @@ static int emit_typed_global_read(
     fprintf(f, "        v%u = _g;\n", (unsigned)dv);
   } else {
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", dreg * 16);
-    e2_sweep_guard(f, "dx", in->next);
-    if (t->lb[dv] == E2_LB_I32)
-      fprintf(
-          f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, 0)) "
-          "goto dx_%d;\n"
-          "        i%u = JS_VALUE_GET_INT(_g);\n",
-          in->next, (unsigned)dv);
-    else if (t->lb[dv] == E2_LB_F64)
-      fprintf(
-          f,
-          "        if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = "
-          "(double)JS_VALUE_GET_INT(_g);\n"
-          "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = "
-          "JS_VALUE_GET_FLOAT64(_g);\n"
-          "        else goto dx_%d;\n",
-          (unsigned)dv, (unsigned)dv, in->next);
+    /* Nothing reads the result: the frame write above is all it needs. */
+    if (!e2_def_dead(in, dv)) {
+      e2_sweep_guard(f, "dx", in->next);
+      if (t->lb[dv] == E2_LB_I32)
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, "
+            "0)) "
+            "goto dx_%d;\n"
+            "        i%u = JS_VALUE_GET_INT(_g);\n",
+            in->next, (unsigned)dv);
+      else if (t->lb[dv] == E2_LB_F64)
+        fprintf(
+            f,
+            "        if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = "
+            "(double)JS_VALUE_GET_INT(_g);\n"
+            "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = "
+            "JS_VALUE_GET_FLOAT64(_g);\n"
+            "        else goto dx_%d;\n",
+            (unsigned)dv, (unsigned)dv, in->next);
+    }
   }
   fprintf(f, "      } else {\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
@@ -4047,32 +4076,37 @@ static int emit_typed_field_read(
     /* Write the raw result to the frame FIRST: on a guard mismatch the exit is at
        the next pc and the generic body must find the op's result there. */
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _f);\n", dreg * 16);
-    e2_sweep_guard(f, "dx", in->next);
-    if (t->lb[dv] == E2_LB_I32)
-      fprintf(
-          f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_INT, 0)) "
-          "goto dx_%d;\n"
-          "        i%u = JS_VALUE_GET_INT(_f);\n",
-          in->next, (unsigned)dv);
-    else if (t->lb[dv] == E2_LB_F64)
-      fprintf(
-          f,
-          "        if (JS_VALUE_GET_TAG(_f) == JS_TAG_INT) d%u = "
-          "(double)JS_VALUE_GET_INT(_f);\n"
-          "        else if (JS_VALUE_GET_TAG(_f) == JS_TAG_FLOAT64) d%u = "
-          "JS_VALUE_GET_FLOAT64(_f);\n"
-          "        else goto dx_%d;\n",
-          (unsigned)dv, (unsigned)dv, in->next);
-    else if (t->lb[dv] == E2_LB_BOOL)
-      fprintf(
-          f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_BOOL, 0)) "
-          "goto dx_%d;\n"
-          "        b%u = JS_VALUE_GET_BOOL(_f);\n",
-          in->next, (unsigned)dv);
-    else
-      return 0;
+    /* Nothing reads the result: the frame write above is all it needs. */
+    if (!e2_def_dead(in, dv)) {
+      e2_sweep_guard(f, "dx", in->next);
+      if (t->lb[dv] == E2_LB_I32)
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_INT, "
+            "0)) "
+            "goto dx_%d;\n"
+            "        i%u = JS_VALUE_GET_INT(_f);\n",
+            in->next, (unsigned)dv);
+      else if (t->lb[dv] == E2_LB_F64)
+        fprintf(
+            f,
+            "        if (JS_VALUE_GET_TAG(_f) == JS_TAG_INT) d%u = "
+            "(double)JS_VALUE_GET_INT(_f);\n"
+            "        else if (JS_VALUE_GET_TAG(_f) == JS_TAG_FLOAT64) d%u = "
+            "JS_VALUE_GET_FLOAT64(_f);\n"
+            "        else goto dx_%d;\n",
+            (unsigned)dv, (unsigned)dv, in->next);
+      else if (t->lb[dv] == E2_LB_BOOL)
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) != JS_TAG_BOOL, "
+            "0)) "
+            "goto dx_%d;\n"
+            "        b%u = JS_VALUE_GET_BOOL(_f);\n",
+            in->next, (unsigned)dv);
+      else
+        return 0;
+    }
   }
   /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
      inlined duplicate (the reviewer's ruling). */
