@@ -1557,8 +1557,14 @@ static int emit_native_length(
 }
 
 /* A move or a constant writes the frame directly: no helper, no call, and no
-   way to fail. Everything else is an op call for now. */
-static int is_trivial(const Q2Insn *in) {
+   way to fail. Everything else is an op call for now.
+
+   READ BY THE GENERIC EMITTER ONLY. The spec body has its own predicate at its
+   block-prefix loop. Adding an op here whose lowering exists only in the SPEC body
+   makes this emitter drop it silently -- that produced four miscompiles
+   (get_arg, get_arg2, move_xfer, and the original get_arg NaN). If a new op is
+   spec-body-only, add it to that loop's condition, not here. */
+static int generic_is_trivial(const Q2Insn *in) {
   switch (in->rop) {
     case ROP_move:
     case ROP_move_s:
@@ -1609,7 +1615,16 @@ static void emit_trivial(FILE *f, const Q2Insn *in, const E2Role *role) {
       break;
     }
     default:
-      fprintf(f, "    /* unhandled trivial op %d */\n", in->rop);
+      /* NEVER a comment in place of an instruction. ``generic_is_trivial` said this op is
+         trivial and this switch has no case for it, so the generated body would
+         silently drop it -- which is how move_xfer lost a transfer and produced
+         four separate miscompiles. Abort at generation instead. */
+      fprintf(
+          stderr,
+          "e2: GENERIC emitter: generic_is_trivial accepted rop %d but emit_trivial has "
+          "no case for it (pc %d)\n",
+          in->rop, in->pc);
+      abort();
       break;
   }
   (void)role;
@@ -1864,7 +1879,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
       fprintf(f, "    }\n");
       run_open = 0;
     }
-    if (is_trivial(in)) {
+    if (generic_is_trivial(in)) {
       emit_trivial(f, in, role);
       continue;
     }
@@ -3218,10 +3233,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         }
         break;
       }
-      /* The spec body's OWN list. `is_trivial` is shared with the generic
+      /* The spec body's OWN list. `generic_is_trivial` is shared with the generic
          emitter, which has no case for these, so adding one there emits nothing
          and silently drops the instruction. */
-      if (is_trivial(in) || in->rop == ROP_get_arg ||
+      if (generic_is_trivial(in) || in->rop == ROP_get_arg ||
           in->rop == ROP_get_arg2 || in->rop == ROP_move_xfer) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
