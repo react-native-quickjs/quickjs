@@ -2741,6 +2741,85 @@ static int emit_typed_var_ref_load(
   return 1;
 }
 
+/* `binary_cpool` (rop 169, "rbrbc": d, sub, a, kind, idx): the second operand is
+   a constant-POOL entry, not a register. The decoding below is the generic body's
+   (see its ROP_binary_cpool arm) -- same arg positions, same pool accessors, same
+   refusal of a non-finite double -- so the two cannot drift apart on the layout.
+   Keyed on E2Types: an f64 result takes the double form (no exit; doubles cannot
+   overflow), an i32 result takes the int64 form with the overflow exit, and
+   anything else declines so the block hands off. */
+static int emit_typed_arith_cpool(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId d, a;
+  const char *op;
+  double c;
+  uint32_t kind, idx;
+  int tag, ld, sub;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_binary_cpool) return 0;
+  if (in->narg < 5 || in->ndef < 1 || in->nuse < 1) return 0;
+  sub = (int)in->arg[1].val;
+  kind = (uint32_t)in->arg[3].val;
+  idx = (uint32_t)in->arg[4].val;
+  if (kind != REG_CONST_CPOOL) return 0;
+  if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL &&
+      sub != REG_BIN_DIV)
+    return 0;
+  if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
+  tag = qjs_aot_pool_tag(fn->g, idx);
+  if (tag != E2_POOL_INT && tag != E2_POOL_DOUBLE) return 0;
+  d = in->def[0];
+  a = in->use[0];
+  if (d >= (Q2ValueId)t->nvalues || a >= (Q2ValueId)t->nvalues) return 0;
+  ld = fn->values[d].reg;
+  op = sub == REG_BIN_ADD ? "+"
+       : sub == REG_BIN_SUB ? "-"
+       : sub == REG_BIN_MUL ? "*"
+                            : "/";
+  /* f64 result: the machine's op on a double literal. %a prints an exact hex
+     float, which round-trips every double including -0.0; a non-finite entry is
+     refused (it does not compile as a literal) and the block hands off. */
+  if (t->lb[d] == E2_LB_F64) {
+    if (tag == E2_POOL_DOUBLE && !__builtin_isfinite(c)) return 0;
+    if (t->lb[a] == E2_LB_F64)
+      fprintf(f, "    d%u = d%u %s (%a);\n", (unsigned)d, (unsigned)a, op, c);
+    else if (t->lb[a] == E2_LB_I32)
+      fprintf(f, "    d%u = (double)i%u %s (%a);\n", (unsigned)d, (unsigned)a, op,
+              c);
+    else
+      return 0;
+    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+    return 1;
+  }
+  /* i32 result: only an INT pool entry can keep the value an int. */
+  if (t->lb[d] == E2_LB_I32 && tag == E2_POOL_INT &&
+      t->lb[a] == E2_LB_I32) {
+    int32_t ic = (int32_t)c;
+    fprintf(
+        f,
+        "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n"
+        "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+        "goto ox_%d;\n"
+        "      i%u = (int32_t)_t; }\n",
+        (unsigned)a, op, ic, in->pc, (unsigned)d);
+    if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) && cur != NULL) {
+      Q2ValueId *snap =
+          malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+      if (snap != NULL) {
+        memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+        g_e2_ox[g_e2_ox_n] = in->pc;
+        g_e2_ox_cur[g_e2_ox_n] = snap;
+        g_e2_ox_n++;
+      }
+    }
+    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+    return 1;
+  }
+  return 0;
+}
+
 /* A closure-cell STORE in the spec body: `put_var_ref` (rop 19, "ur"). The engine
    handler is
        set_value(ctx, var_refs[slot]->pvalue, js_dup(regs[s]));
@@ -3715,6 +3794,8 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
           in->rop == ROP_get_arg2 || in->rop == ROP_move_xfer) {
         if (!trivial_is_lowerable(in, cur)) break;
         emit_trivial_own(f, in, role, cur);
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_arith_cpool(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_arith_imm(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
