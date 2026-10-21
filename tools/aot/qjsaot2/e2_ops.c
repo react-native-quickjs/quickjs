@@ -2901,6 +2901,57 @@ static int emit_typed_opcall(
   return 1;
 }
 
+/* A speculative-body `this` FIELD READ: `get_this_field` / `get_this_field2`
+   ("rras", but BOTH register operands are destinations -- def[0] is the read and
+   def[1] the receiver -- so there is no use to take a receiver from). `this` comes
+   from the function's own this-slot via `qjs_aot_load_this`, exactly as the generic
+   emitter does; the value is owned when `_own` is set, otherwise borrowed. */
+static int emit_typed_this_field(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  Q2ValueId fv, rv;
+  int site, freg, rreg;
+
+  if (!have_types || t == NULL) return 0;
+  if (in->rop != ROP_get_this_field && in->rop != ROP_get_this_field2) return 0;
+  if (role == NULL || role->control != E2_CF_NONE) return 0;
+  if (in->narg < 4 || in->arg[3].kind != 's') return 0;
+  site = (int)in->arg[3].val;
+  if ((unsigned)site == REG_IC_NONE) return 0;
+  if (in->ndef < 2) return 0;
+  fv = in->def[0];
+  rv = in->def[1];
+  if (fv >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[fv] != E2_LB_TAG) return 0;
+  freg = fn->values[fv].reg;
+  rreg = fn->values[rv].reg;
+  if (freg < 0 || freg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
+
+  fprintf(f, "    { JSValue _t, _v;\n");
+  fprintf(f, "      int _own = qjs_aot_load_this(ctx, f, &_t);\n");
+  fprintf(f, "      if (__builtin_expect(_own < 0, 0)) return JS_EXCEPTION;\n");
+  /* The receiver's local is the second def, and the frame slot is what the
+     wrapper reads if the hit below misses. */
+  fprintf(f, "      v%u = _t;\n", (unsigned)rv);
+  fprintf(f, "      AOT_SET_B(ctx, fr, %d, _t);\n", rreg * 16);
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+      "_t, %d, (int)q2_ns, &_v), 1)) {\n",
+      site);
+  fprintf(f, "        v%u = _v;\n", (unsigned)fv);
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) {
+    cur[freg] = fv;
+    cur[rreg] = rv;
+  }
+  return 1;
+}
+
 /* A speculative-body CHAINED FIELD READ: `get_field_chain` ("rrasrras": recv,
    atom1, site1, recv2, atom2, site2, ...). Two hit tests; a miss at EITHER link
    goes through the op-call wrapper for the WHOLE instruction, which re-executes it
@@ -2933,6 +2984,10 @@ static int emit_typed_field_chain(
     return 0;
   /* All three are JSValues: the receiver is borrowed from its cell and the
      results are borrowed from the object's slots, so TAG locals throughout. */
+  /* All three must be TAG. A typed second def means the IR decided the receiver
+     register holds an int; storing the raw JSValue there is a miscompile (measured:
+     21 -> 12), and doing it properly needs the same guard machinery the other
+     emitters use. Decline, so the block hands off -- correct, merely slower. */
   if (t->lb[rv] != E2_LB_TAG || t->lb[d0v] != E2_LB_TAG ||
       t->lb[d1v] != E2_LB_TAG)
     return 0;
@@ -4211,6 +4266,9 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
                  emit_typed_arith(f, fn, in, &types, cur)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_field_read(
+                     f, fn, in, &types, cur, have_types, hex, fi, b)) {
+        e2_note_defs(cur, fn, in);
+      } else if (emit_typed_this_field(
                      f, fn, in, &types, cur, have_types, hex, fi, b)) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_field_chain(
