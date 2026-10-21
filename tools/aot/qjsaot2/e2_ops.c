@@ -2822,8 +2822,87 @@ static int emit_typed_arith_imm(
       return 0;
   }
   if (!have_imm) return 0;
-  if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL) return 0;
   d = in->def[0];
+  if (d >= (Q2ValueId)t->nvalues) return 0;
+  if (in->nuse < 1) return 0;
+  a = in->use[0];
+  if (a >= (Q2ValueId)t->nvalues) return 0;
+  /* A BITWISE or SHIFT immediate (`| 0`, `& 3`, `>> 1`, `>>> 0`, ...) is not an
+     arithmetic op: the operand is ToInt32-converted, then the integer op runs
+     with the immediate. Branching here, BEFORE the add/sub/mul filter, is what
+     makes those reachable -- the filter used to reject every one of them, which
+     is why q2_toi32 had no call sites anywhere. */
+  {
+    int is_bit = sub == REG_BIN_OR || sub == REG_BIN_AND || sub == REG_BIN_XOR ||
+                 sub == REG_BIN_SHL || sub == REG_BIN_SAR || sub == REG_BIN_SHR;
+    if (is_bit) {
+      char xn[48];
+      char xrep;
+      if (t->lb[a] == E2_LB_I32) {
+        snprintf(xn, sizeof(xn), "i%u", (unsigned)a);
+        xrep = 'i';
+      } else if (t->lb[a] == E2_LB_F64) {
+        snprintf(xn, sizeof(xn), "q2_toi32(d%u)", (unsigned)a);
+        xrep = 'd';
+      } else {
+        return 0;
+      }
+      (void)xrep;
+      ld = fn->values[d].reg;
+      switch (sub) {
+        case REG_BIN_OR:
+        case REG_BIN_AND:
+        case REG_BIN_XOR: {
+          const char *bop = sub == REG_BIN_OR  ? "|"
+                            : sub == REG_BIN_AND ? "&"
+                                                 : "^";
+          if (t->lb[d] != E2_LB_I32) return 0;
+          fprintf(f, "    i%u = %s %s %d;\n", (unsigned)d, xn, bop, imm);
+          break;
+        }
+        case REG_BIN_SHL:
+          if (t->lb[d] != E2_LB_I32) return 0;
+          fprintf(
+              f, "    i%u = (int32_t)((uint32_t)%s << ((uint32_t)%d & 31));\n",
+              (unsigned)d, xn, imm);
+          break;
+        case REG_BIN_SAR:
+          if (t->lb[d] != E2_LB_I32) return 0;
+          fprintf(f, "    i%u = %s >> (%d & 31);\n", (unsigned)d, xn, imm);
+          break;
+        default: /* REG_BIN_SHR */
+          if (t->lb[d] == E2_LB_I32) {
+            fprintf(
+                f,
+                "    { uint32_t _u = (uint32_t)%s >> (%d & 31);\n"
+                "      if (__builtin_expect(_u > (uint32_t)INT32_MAX, 0)) "
+                "goto ox_%d;\n"
+                "      i%u = (int32_t)_u; }\n",
+                xn, imm, in->pc, (unsigned)d);
+            if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0])) &&
+                cur != NULL) {
+              Q2ValueId *snap = malloc(
+                  sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+              if (snap != NULL) {
+                memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+                g_e2_ox[g_e2_ox_n] = in->pc;
+                g_e2_ox_cur[g_e2_ox_n] = snap;
+                g_e2_ox_n++;
+              }
+            }
+          } else if (t->lb[d] == E2_LB_F64) {
+            fprintf(f, "    d%u = (double)((uint32_t)%s >> (%d & 31));\n",
+                    (unsigned)d, xn, imm);
+          } else {
+            return 0;
+          }
+          break;
+      }
+      if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+  }
+  if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL) return 0;
   if (d >= (Q2ValueId)t->nvalues) return 0;
   if (in->nuse < 1) return 0;
   a = in->use[0];
@@ -2841,18 +2920,6 @@ static int emit_typed_arith_imm(
     else
       fprintf(f, "    d%u = (double)i%u %s (double)%d;\n", (unsigned)d,
               (unsigned)a, fop, imm);
-    if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
-    return 1;
-  }
-  /* i32 RESULT from an f64 operand: compute in double, then ToInt32 -- the
-     interpreter's `x | 0` on a double. Total, so no exit. */
-  if (t->lb[d] == E2_LB_I32 && t->lb[a] == E2_LB_F64) {
-    const char *fop = sub == REG_BIN_ADD ? "+"
-                      : sub == REG_BIN_SUB ? "-"
-                                           : "*";
-    ld = fn->values[d].reg;
-    fprintf(f, "    i%u = q2_toi32(d%u %s (double)%d);\n", (unsigned)d,
-            (unsigned)a, fop, imm);
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
     return 1;
   }
