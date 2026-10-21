@@ -2634,11 +2634,24 @@ static void e2_emit_edge_moves(
 /* One arm of a lowered branch: the edge moves for successor k, then the jump to
    THAT successor. One function taking k, so the (succ_block, edge_arg) pairing
    cannot drift between the condition's sense and the moves it is paired with. */
+/* `want_succ` is the block the CALLER believes this arm targets (it knows it:
+   blk->succ_block[k] from the block it just lowered). The arm resolves its own
+   successor from `b`, so comparing the two is the real check: if `b` is not the
+   block the caller meant, they differ and generation aborts. (Comparing `b` with
+   `&fn->blocks[b]` would be a tautology.) Pass -1 to skip. */
 static void e2_emit_arm(
     FILE *f, const Q2Func *fn, int b, int k, Q2ValueId *cur,
-    const char *hex) {
+    const char *hex, int want_succ) {
   const Q2Block *blk = &fn->blocks[b];
   int sb = blk->succ_block[k];
+  if (want_succ >= 0 && sb != want_succ) {
+    fprintf(
+        stderr,
+        "e2: arm %d of block %d targets block %d but the caller meant %d -- the "
+        "RPO position and the block index have been conflated\n",
+        k, b, sb, want_succ);
+    abort();
+  }
   if (sb < 0 || sb >= fn->nblocks) {
     /* A target that leaves the function: the caller hands off instead. */
     fprintf(f, "      /* arm %d leaves the function */\n", k);
@@ -4161,7 +4174,7 @@ static int emit_typed_add_imm_branch(
   }
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
   fprintf(f, "    /* fused update, then the unconditional back edge */\n");
-  e2_emit_arm(f, fn, b, 0, cur, hex);
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
   return 1;
 }
 
@@ -4220,9 +4233,9 @@ static int emit_typed_inc_branch(
   }
   fprintf(f, "    }\n");
   fprintf(f, "    if (%s < %s) {\n", cn, bn);
-  e2_emit_arm(f, fn, b, si_take, cur, hex);
+  e2_emit_arm(f, fn, b, si_take, cur, hex, blk->succ_block[si_take]);
   fprintf(f, "    } else {\n");
-  e2_emit_arm(f, fn, b, si_else, cur, hex);
+  e2_emit_arm(f, fn, b, si_else, cur, hex, blk->succ_block[si_else]);
   fprintf(f, "    }\n");
   /* The overflow exit lives after the block, keyed by this pc. */
   if (g_e2_ox_n < (int)(sizeof(g_e2_ox) / sizeof(g_e2_ox[0]))) {
@@ -4441,9 +4454,9 @@ static int emit_typed_branch_bool(
   si_else = 1;
   e2_local_name(an, sizeof(an), a);
   fprintf(f, "    if (%s%s) {\n", neg ? "!" : "", an);
-  e2_emit_arm(f, fn, b, si_take, cur, hex);
+  e2_emit_arm(f, fn, b, si_take, cur, hex, blk->succ_block[si_take]);
   fprintf(f, "    } else {\n");
-  e2_emit_arm(f, fn, b, si_else, cur, hex);
+  e2_emit_arm(f, fn, b, si_else, cur, hex, blk->succ_block[si_else]);
   fprintf(f, "    }\n");
   return 1;
 }
@@ -4461,7 +4474,7 @@ static int emit_typed_goto(
   if (blk->nsucc < 1) return 0;
   if (blk->succ_block[0] < 0 || blk->succ_block[0] >= fn->nblocks) return 0;
   fprintf(f, "    /* unconditional branch */\n");
-  e2_emit_arm(f, fn, b, 0, cur, hex);
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
   return 1;
 }
 
@@ -4670,9 +4683,9 @@ static int emit_typed_branch(
         fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       }
     }
-    e2_emit_arm(f, fn, b, si_take, cur, hex);
+    e2_emit_arm(f, fn, b, si_take, cur, hex, blk->succ_block[si_take]);
     fprintf(f, "    } else {\n");
-    e2_emit_arm(f, fn, b, si_else, cur, hex);
+    e2_emit_arm(f, fn, b, si_else, cur, hex, blk->succ_block[si_else]);
     fprintf(f, "    }\n");
     if (t->lb[av] == E2_LB_TAG || t->lb[bv] == E2_LB_TAG) fprintf(f, "    }\n");
     (void)an; (void)bn; (void)ops;
@@ -5319,16 +5332,7 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
            index (see the loop head); passing an RPO position here silently jumped
            to another block -- the bug that made bnpFromString return early and broke
            crypto's RSA. An abort here is worth more than a wrong unit. */
-        if (&fn->blocks[b] != blk) {
-          fprintf(
-              stderr,
-              "e2: fall-through arm: b=%d is not the block just lowered "
-              "(start_pc %d); the RPO position and the block index have been "
-              "conflated\n",
-              b, blk->start_pc);
-          abort();
-        }
-        e2_emit_arm(f, fn, b, 0, cur, hex);
+        e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
       } else {
         const uint64_t *lo = q2_live_out(fn, last);
         fprintf(f, "    /* fall through, no single successor: exit */\n");
