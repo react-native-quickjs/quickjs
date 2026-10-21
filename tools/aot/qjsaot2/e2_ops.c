@@ -2060,6 +2060,11 @@ void e2_handoff_report(FILE *f) {
    fires before anything is in a local, so the frame still holds what the caller
    wrote and the generic body's g_<pc> reloads the arguments itself. */
 static int g_e2_ax[256];
+/* The compare COLD ARM: a TAG operand whose tag is neither INT nor FLOAT64. It is a
+   hand-off at the branch's own pc, not a deopt. */
+static int g_e2_hx[256];
+static Q2ValueId *g_e2_hx_cur[256];
+static int g_e2_hx_n;
 static int g_e2_vx[256];
 static int g_e2_dx[256];
 static int g_e2_dx_n;
@@ -4129,6 +4134,65 @@ static int block_opens_region(const Q2Func *fn, int b) {
   return 0;
 }
 
+/* One comparison expression for the operand rep `f64`. A TAG side is read as its
+   int payload (converted when the rep is f64) or as a double, depending on which
+   tag arm the caller is in: `tag_arm` is 0 for INT, 1 for FLOAT64, 2 for "not TAG". */
+static void e2_cmp_expr(
+    char *out, size_t cap, int base, const E2Types *t, Q2ValueId av, Q2ValueId bv,
+    int f64rep, int tag_arm) {
+  char xa[48], xb[48];
+  int a_tag = t->lb[av] == E2_LB_TAG;
+  int b_tag = t->lb[bv] == E2_LB_TAG;
+  const char *cop;
+
+  /* A bit-test reads both sides as i32, so an f64 goes through q2_toi32. */
+  if (f64rep && (base == REG_BIN_AND || base == REG_BIN_OR || base == REG_BIN_XOR))
+    f64rep = 0;
+
+  if (a_tag) {
+    /* In the FLOAT64 arm a TAG side reads its double payload; in the INT arm (and
+       for a bit-test) it reads the int payload, converted when the rep is f64. */
+    if (tag_arm == 1)
+      snprintf(xa, sizeof(xa), "JS_VALUE_GET_FLOAT64(v%u)", (unsigned)av);
+    else if (f64rep)
+      snprintf(xa, sizeof(xa), "(double)JS_VALUE_GET_INT(v%u)", (unsigned)av);
+    else
+      snprintf(xa, sizeof(xa), "JS_VALUE_GET_INT(v%u)", (unsigned)av);
+  } else if (t->lb[av] == E2_LB_F64)
+    snprintf(xa, sizeof(xa), f64rep ? "d%u" : "q2_toi32(d%u)", (unsigned)av);
+  else
+    snprintf(xa, sizeof(xa), f64rep ? "(double)i%u" : "i%u", (unsigned)av);
+
+  if (b_tag) {
+    if (tag_arm == 1)
+      snprintf(xb, sizeof(xb), "JS_VALUE_GET_FLOAT64(v%u)", (unsigned)bv);
+    else if (f64rep)
+      snprintf(xb, sizeof(xb), "(double)JS_VALUE_GET_INT(v%u)", (unsigned)bv);
+    else
+      snprintf(xb, sizeof(xb), "JS_VALUE_GET_INT(v%u)", (unsigned)bv);
+  } else if (t->lb[bv] == E2_LB_F64)
+    snprintf(xb, sizeof(xb), f64rep ? "d%u" : "q2_toi32(d%u)", (unsigned)bv);
+  else
+    snprintf(xb, sizeof(xb), f64rep ? "(double)i%u" : "i%u", (unsigned)bv);
+
+  switch (base) {
+    case REG_BIN_LT: cop = "<"; break;
+    case REG_BIN_LTE: cop = "<="; break;
+    case REG_BIN_GT: cop = ">"; break;
+    case REG_BIN_GTE: cop = ">="; break;
+    case REG_BIN_AND: cop = "&"; break;
+    case REG_BIN_OR: cop = "|"; break;
+    case REG_BIN_XOR: cop = "^"; break;
+    default: cop = "=="; break;
+  }
+  if (base == REG_BIN_AND || base == REG_BIN_OR || base == REG_BIN_XOR)
+    snprintf(out, cap, "((%s %s %s) != 0)", xa, cop, xb);
+  else if (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ)
+    snprintf(out, cap, "(%s != %s)", xa, xb);
+  else
+    snprintf(out, cap, "(%s %s %s)", xa, cop, xb);
+}
+
 static int emit_typed_branch(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
     Q2ValueId *cur, int have_types, char hex[33], int fi) {
@@ -4162,8 +4226,11 @@ static int emit_typed_branch(
   av = in->use[0];
   bv = in->use[1];
   if (av >= (Q2ValueId)t->nvalues || bv >= (Q2ValueId)t->nvalues) return 0;
-  if ((t->lb[av] != E2_LB_I32 && t->lb[av] != E2_LB_F64) ||
-      (t->lb[bv] != E2_LB_I32 && t->lb[bv] != E2_LB_F64))
+  /* TAG is admitted: the dispatch below handles it (E8 slice 2d). */
+  if ((t->lb[av] != E2_LB_I32 && t->lb[av] != E2_LB_F64 &&
+       t->lb[av] != E2_LB_TAG) ||
+      (t->lb[bv] != E2_LB_I32 && t->lb[bv] != E2_LB_F64 &&
+       t->lb[bv] != E2_LB_TAG))
     return 0;
   /* succ[0] is where the branch GOES when taken; succ[1] is the fall-through. */
   si_take = 0;
@@ -4172,49 +4239,73 @@ static int emit_typed_branch(
   sb_else = blk->succ_block[si_else];
   if (sb_take < 0 || sb_take >= fn->nblocks) return 0;
 
-  /* The operand expressions, converted to the shared rep: f64 when either side
-     is a double, else i32. A bit-test on f64 goes through q2_toi32 first. */
+  /* THE COMPARISON IS COMPUTED ONCE into an int, then the two arms are emitted
+     ONCE through e2_emit_arm -- so edge moves, back-edge polls and R6 syncs are
+     exactly as before and only the way `c_` is computed changes.
+
+     A TAG operand is dispatched on its tag (E8 slice 2d): INT compares as i32 (or
+     as a double when the other side is f64), FLOAT64 compares as a double, and
+     anything else jumps to the function's COLD ARM `hx_<pc>`, a hand-off at the
+     branch's own pc. It is a hand-off, not a deopt: a string compare is not a
+     failed speculation and must not count toward D4's switch-off. */
   {
-    int want_f64 = t->lb[av] == E2_LB_F64 || t->lb[bv] == E2_LB_F64;
-    char xa[48], xb[48];
-    if (want_f64 && (base == REG_BIN_AND || base == REG_BIN_OR ||
-                     base == REG_BIN_XOR)) {
-      snprintf(xa, sizeof(xa), "q2_toi32(%s%u)", t->lb[av] == E2_LB_F64 ? "d" : "i", (unsigned)av);
-      snprintf(xb, sizeof(xb), "q2_toi32(%s%u)", t->lb[bv] == E2_LB_F64 ? "d" : "i", (unsigned)bv);
-      want_f64 = 0;
-    } else if (want_f64) {
-      snprintf(xa, sizeof(xa), "%s%u", t->lb[av] == E2_LB_F64 ? "d" : "(double)i", (unsigned)av);
-      snprintf(xb, sizeof(xb), "%s%u", t->lb[bv] == E2_LB_F64 ? "d" : "(double)i", (unsigned)bv);
-    } else {
-      snprintf(xa, sizeof(xa), "i%u", (unsigned)av);
-      snprintf(xb, sizeof(xb), "i%u", (unsigned)bv);
-    }
+    int tag_side = -1, ntags = 0;
+    char ex[128];
+    if (t->lb[av] == E2_LB_TAG) { tag_side = 0; ntags++; }
+    if (t->lb[bv] == E2_LB_TAG) { tag_side = 1; ntags++; }
     {
-      const char *cop;
-      switch (base) {
-        case REG_BIN_LT: cop = "<"; break;
-        case REG_BIN_LTE: cop = "<="; break;
-        case REG_BIN_GT: cop = ">"; break;
-        case REG_BIN_GTE: cop = ">="; break;
-        case REG_BIN_EQ: cop = "=="; break;
-        case REG_BIN_NEQ: cop = "!="; break;
-        case REG_BIN_STRICT_EQ: cop = "=="; break;
-        case REG_BIN_STRICT_NEQ: cop = "!="; break;
-        default: cop = "!="; break;  /* bit-test: (a & b) != 0 */
+      int want_f64 = (t->lb[av] == E2_LB_F64 || t->lb[bv] == E2_LB_F64);
+      if (ntags == 0) {
+        e2_cmp_expr(ex, sizeof(ex), base, t, av, bv, want_f64, 2);
+        fprintf(f, "    if (%s%s) {\n", inv ? "!" : "", ex);
+      } else {
+        Q2ValueId tv = tag_side == 0 ? av : bv;
+        int treg = fn->values[tv].reg;
+        if (treg < 0 || treg >= fn->nregs) return 0;
+        e2_cmp_expr(ex, sizeof(ex), base, t, av, bv, want_f64, 0);
+        fprintf(f, "    { int c_;\n");
+        fprintf(
+            f,
+            "    if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_INT, 1))\n"
+            "        c_ = %s;\n",
+            (unsigned)tv, ex);
+        if (want_f64) {
+          /* The other side is a double, so INT converts -- and FLOAT64 is the
+             only other numeric tag. */
+          e2_cmp_expr(ex, sizeof(ex), base, t, av, bv, 1, 1);
+          fprintf(
+              f,
+              "    else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64)\n"
+              "        c_ = %s;\n",
+              (unsigned)tv, ex);
+        } else {
+          e2_cmp_expr(ex, sizeof(ex), base, t, av, bv, 1, 1);
+          fprintf(
+              f,
+              "    else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64)\n"
+              "        c_ = %s;\n",
+              (unsigned)tv, ex);
+        }
+        fprintf(f, "    else goto hx_%d;\n", in->pc);
+        if (g_e2_hx_n < (int)(sizeof(g_e2_hx) / sizeof(g_e2_hx[0])) &&
+            cur != NULL) {
+          Q2ValueId *snap =
+              malloc(sizeof(*snap) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+          if (snap != NULL) {
+            memcpy(snap, cur, sizeof(*snap) * (size_t)fn->nregs);
+            g_e2_hx[g_e2_hx_n] = in->pc;
+            g_e2_hx_cur[g_e2_hx_n] = snap;
+            g_e2_hx_n++;
+          }
+        }
+        fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       }
-      if (base == REG_BIN_AND)
-        fprintf(f, "    if (%s((%s & %s) != 0)) {\n", inv ? "!" : "", xa, xb);
-      else if (base == REG_BIN_OR)
-        fprintf(f, "    if (%s((%s | %s) != 0)) {\n", inv ? "!" : "", xa, xb);
-      else if (base == REG_BIN_XOR)
-        fprintf(f, "    if (%s((%s ^ %s) != 0)) {\n", inv ? "!" : "", xa, xb);
-      else
-        fprintf(f, "    if (%s(%s %s %s)) {\n", inv ? "!" : "", xa, cop, xb);
     }
     e2_emit_arm(f, fn, b, si_take, cur, hex);
     fprintf(f, "    } else {\n");
     e2_emit_arm(f, fn, b, si_else, cur, hex);
     fprintf(f, "    }\n");
+    if (t->lb[av] == E2_LB_TAG || t->lb[bv] == E2_LB_TAG) fprintf(f, "    }\n");
     (void)an; (void)bn; (void)ops;
   }
   (void)sb_else;
@@ -4625,6 +4716,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_note_defs(cur, fn, in);
       } else if (emit_typed_bitwise(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
+      } else if (emit_typed_load_const(f, fn, in, &types, cur, have_types)) {
+        /* FIRST among the value producers: a load_const is Q2_OP_FALLBACK and
+           reaches no other emitter (fifth dispatch-order incident of E8). */
+        e2_note_defs(cur, fn, in);
       } else if (emit_typed_fused(f, fn, in, &types, cur, have_types)) {
         e2_note_defs(cur, fn, in);
       } else if (have_types &&
@@ -4794,6 +4889,26 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     for (o = 0; o < g_e2_ox_n; o++) free(g_e2_ox_cur[o]);
     g_e2_ox_n = 0;
   }
+  /* The compare COLD ARM: a TAG operand whose tag is neither INT nor FLOAT64 jumps
+     here. A hand-off at the branch's own pc -- the arithmetic has not run and the
+     branch has not been taken, so the generic body redoes the compare -- and NOT a
+     deopt: a string compare is not a failed speculation and must not count toward
+     D4's switch-off. */
+  {
+    int o;
+    for (o = 0; o < g_e2_hx_n; o++) {
+      int pc2 = g_e2_hx[o], ii, ins = -1;
+      for (ii = 0; ii < fn->ninsns; ii++)
+        if (fn->insns[ii].pc == pc2) { ins = ii; break; }
+      if (ins < 0) continue;
+      fprintf(f, "    hx_%d:;\n", pc2);
+      fprintf(f, "    E2_HANDOFF_NOTE(%d);\n", fi);
+      e2_emit_exit_at(f, fn, ins, pc2, hex, fi, g_e2_hx_cur[o]);
+    }
+    for (o = 0; o < g_e2_hx_n; o++) free(g_e2_hx_cur[o]);
+    g_e2_hx_n = 0;
+  }
+
   fprintf(f, "    }\n");
   fprintf(f, "}\n\n");
   (void)k;
