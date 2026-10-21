@@ -1,0 +1,46 @@
+Subject: Publish the reference count's offset in the AOT layout
+
+What this does
+  Adds the distance from an object pointer back to its reference count (an int
+  in the allocator's block header, reached through js_rc()) to the AOT layout,
+  with a compile-time check that the count is an int.
+
+Why we need it
+  A compiled unit takes a reference on every counted field store and on every
+  return. JS_DupValue is out of line here, so each one is a call into the
+  engine whose body is a single increment. With the offset a unit increments
+  the count inline, exactly as js_dup() does. Release stays JS_FreeValue, whose
+  zero path parks the value.
+
+  The field is folded into the layout hash like every other field, so a unit
+  generated without it is refused at bind.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -125,6 +125,10 @@
+     /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
+     uint32_t regvm_flag_light, regvm_flag_c_entry, regvm_flag_stack;
+     uint32_t regvm_flag_trivial_ret, regvm_flag_same_realm;
++    /* How far before an object pointer its reference count lives (an int in
++       the allocator's block header, js_rc()), so a unit counts a reference
++       inline instead of calling JS_DupValue. */
++    uint32_t off_rc_back;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60604,6 +60604,13 @@
+     out->regvm_flag_stack = REGVM_FLAG_STACK;
+     out->regvm_flag_trivial_ret = REGVM_FLAG_TRIVIAL_RET;
+     out->regvm_flag_same_realm = REGVM_FLAG_SAME_REALM;
++    /* A unit increments the count as an int at this distance before the
++       object pointer, so a change to its type must break this build, not the
++       units. */
++    _Static_assert(sizeof(((JSMallocBlockHeader *)0)->ref_count) == sizeof(int),
++                   "aot: q2_dup writes an int");
++    out->off_rc_back = (uint32_t)(offsetof(JSMallocBlockHeader, user_data) -
++                                  offsetof(JSMallocBlockHeader, ref_count));
+     out->hash = qjs_aot_layout_hash(out);
+ }
+ 

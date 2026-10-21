@@ -60604,6 +60604,13 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->regvm_flag_stack = REGVM_FLAG_STACK;
     out->regvm_flag_trivial_ret = REGVM_FLAG_TRIVIAL_RET;
     out->regvm_flag_same_realm = REGVM_FLAG_SAME_REALM;
+    /* A unit increments the count as an int at this distance before the
+       object pointer, so a change to its type must break this build, not the
+       units. */
+    _Static_assert(sizeof(((JSMallocBlockHeader *)0)->ref_count) == sizeof(int),
+                   "aot: q2_dup writes an int");
+    out->off_rc_back = (uint32_t)(offsetof(JSMallocBlockHeader, user_data) -
+                                  offsetof(JSMallocBlockHeader, ref_count));
     out->hash = qjs_aot_layout_hash(out);
 }
 
