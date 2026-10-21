@@ -92,6 +92,22 @@ void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
           e2_only_hex[0] ? " scope" : "");
 }
 
+void e2_report_spec(
+    const char *hex, const int vals[4], const int tiers[4], const int checks[6],
+    long lines, long bytes) {
+  if (e2_rep == NULL) return;
+  fprintf(
+      e2_rep, "e2 values hex=%s i32=%d f64=%d bool=%d tag=%d\n", hex, vals[0],
+      vals[1], vals[2], vals[3]);
+  fprintf(
+      e2_rep, "e2 tiers hex=%s typed=%d opcall=%d handoff=%d other=%d\n", hex,
+      tiers[0], tiers[1], tiers[2], tiers[3]);
+  fprintf(
+      e2_rep, "e2 checks hex=%s ax=%d vx=%d dx=%d ox=%d exits=%d handoffs=%d\n",
+      hex, checks[0], checks[1], checks[2], checks[3], checks[4], checks[5]);
+  fprintf(e2_rep, "e2 code hex=%s lines=%ld bytes=%ld\n", hex, lines, bytes);
+}
+
 void e2_report_close(void) {
   int r, n = 0;
   if (e2_rep == NULL) return;

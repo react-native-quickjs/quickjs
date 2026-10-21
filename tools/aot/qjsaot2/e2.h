@@ -171,6 +171,16 @@ void e2_report_opcall(uint16_t rop, double weight, int missarm);
 void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
                      int poll, int stack_check);
 
+/* The spec body's four report lines (step 8), keyed by digest: `values` by
+   representation (i32, f64, bool, tag); `tiers`, instructions lowered typed,
+   through an op-call wrapper, left to a hand-off, and other (fused into a
+   neighbour, or in a block the body never reaches); `checks`, guard sites by kind
+   (ax, vx, dx, ox) and exits (deopt, hand-off); `code`, the body's size in lines
+   and bytes (-1 when unknown). */
+void e2_report_spec(
+    const char *hex, const int vals[4], const int tiers[4], const int checks[6],
+    long lines, long bytes);
+
 /* --- the unit builder's native-entry registry --------------------------- */
 
 /* Tell the unit builder that the function at unit index `i` got a native entry,

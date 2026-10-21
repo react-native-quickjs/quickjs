@@ -2106,6 +2106,13 @@ static int g_e2_blk = -1;
 /* The function index of the body being emitted; every exit's note must name it,
    or its exits are counted against another function's switch-off. */
 static int g_e2_fi = -1;
+/* The per-function report counts (step 8), reset at each spec body: op-call
+   wrappers emitted, instructions lowered typed or through a wrapper, guard sites
+   by kind (ax, vx, dx, ox), and exits by kind (deopt, hand-off). */
+static unsigned g_e2_opcalls;
+static int g_e2_n_typed, g_e2_n_opcall;
+static int g_e2_n_guard[4];
+static int g_e2_n_exit, g_e2_n_handoff;
 
 /* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
    forced to fail, so its stub runs even where the speculation always holds. It
@@ -2114,6 +2121,11 @@ static int g_e2_fi = -1;
    deopt, and is not swept. */
 static void e2_sweep_guard(FILE *f, const char *kind, int pc) {
   int sid;
+  g_e2_n_guard
+      [kind[0] == 'a'   ? 0
+       : kind[0] == 'v' ? 1
+       : kind[0] == 'd' ? 2
+                        : 3]++;
   if (!qjs_aot_sweep_on()) return;
   sid = qjs_aot_site_alloc();
   /* The unit's coverage bitmap is this size; a site past it would read as never
@@ -2596,6 +2608,10 @@ static void e2_emit_exit(
     const Q2ValueId *cur, const uint64_t *live_set, int handoff, int blkidx) {
   int words = fn->lwords, w, r;
 
+  if (handoff)
+    g_e2_n_handoff++;
+  else
+    g_e2_n_exit++;
   if (fi != g_e2_fi) {
     fprintf(
         stderr, "e2: exit names function %d inside function %d's body\n", fi,
@@ -3015,6 +3031,7 @@ static int emit_typed_opcall(
      e2_note_defs does that once the whole instruction is lowered, so an emitter
      with two miss paths gives the second one the pre-instruction state. */
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
+  g_e2_opcalls++;
   return 1;
 }
 
@@ -5038,6 +5055,14 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e2_fn = fn;
   g_e2_fi = fi;
+  g_e2_opcalls = 0;
+  g_e2_n_typed = g_e2_n_opcall = 0;
+  memset(g_e2_n_guard, 0, sizeof(g_e2_n_guard));
+  g_e2_n_exit = g_e2_n_handoff = 0;
+  int n_left = 0;
+  FILE *out = NULL;
+  char *mbuf = NULL;
+  size_t mlen = 0;
   E2Facts facts;
   /* STATIC on purpose: `g_e2_types` publishes `&types` for the whole emission, and
      the helpers that name locals read it. As a stack local the address escaped this
@@ -5086,6 +5111,14 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     return 0;
   }
 
+  /* The body is written to memory first and copied out at the end, so the report
+     can give its size in lines. */
+  out = f;
+  f = open_memstream(&mbuf, &mlen);
+  if (f == NULL) {
+    f = out;
+    out = NULL;
+  }
   fprintf(
       f, "E2_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
       e2_linkage(), hex);
@@ -5222,17 +5255,26 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
        earlier, narrower test just stops lowering. */
     for (i2 = blk->first_insn; i2 < blk->first_insn + blk->ninsns; i2++) {
       const Q2Insn *in = &fn->insns[i2];
+      unsigned oc0 = g_e2_opcalls;
       const E2Role *role = e2_roles[in->rop];
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
       if (role != NULL && role->control != E2_CF_NONE) {
         if (emit_typed_return(f, fn, in, &types, cur, have_types)) {
           lowered_to = i2 + 1;
+          if (g_e2_opcalls != oc0)
+            g_e2_n_opcall++;
+          else
+            g_e2_n_typed++;
           term_lowered = 1;
           break;
         }
         if (emit_typed_goto(f, fn, in, b, cur, hex)) {
           lowered_to = i2 + 1;
+          if (g_e2_opcalls != oc0)
+            g_e2_n_opcall++;
+          else
+            g_e2_n_typed++;
           term_lowered = 1;
           break;
         }
@@ -5245,6 +5287,10 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
             emit_typed_branch(
                 f, fn, in, &types, b, cur, have_types, hex, fi)) {
           lowered_to = i2 + 1;
+          if (g_e2_opcalls != oc0)
+            g_e2_n_opcall++;
+          else
+            g_e2_n_typed++;
           term_lowered = 1;
         }
         break;
@@ -5286,7 +5332,12 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
         e2_note_defs(cur, fn, in);
       }
       lowered_to = i2 + 1;
+      if (g_e2_opcalls != oc0)
+        g_e2_n_opcall++;
+      else
+        g_e2_n_typed++;
     }
+    n_left += blk->first_insn + blk->ninsns - lowered_to;
     if (term_lowered) {
       free(cur);
       continue;
@@ -5456,5 +5507,47 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    }\n");
   fprintf(f, "}\n\n");
   (void)k;
+
+  /* Step 8's report lines for this function. */
+  {
+    int vals[4] = {0, 0, 0, 0}, tiers[4], checks[6], v;
+    long lines = -1, bytes = -1;
+    for (v = 0; v < types.nvalues; v++) switch (types.lb[v]) {
+        case E2_LB_I32:
+          vals[0]++;
+          break;
+        case E2_LB_F64:
+          vals[1]++;
+          break;
+        case E2_LB_BOOL:
+          vals[2]++;
+          break;
+        default:
+          vals[3]++;
+          break;
+      }
+    tiers[0] = g_e2_n_typed;
+    tiers[1] = g_e2_n_opcall;
+    tiers[2] = n_left;
+    tiers[3] = fn->ninsns - g_e2_n_typed - g_e2_n_opcall - n_left;
+    checks[0] = g_e2_n_guard[0];
+    checks[1] = g_e2_n_guard[1];
+    checks[2] = g_e2_n_guard[2];
+    checks[3] = g_e2_n_guard[3];
+    checks[4] = g_e2_n_exit;
+    checks[5] = g_e2_n_handoff;
+    if (out != NULL) {
+      size_t i;
+      fclose(f);
+      lines = 0;
+      for (i = 0; i < mlen; i++)
+        if (mbuf[i] == '\n') lines++;
+      bytes = (long)mlen;
+      fwrite(mbuf, 1, mlen, out);
+      free(mbuf);
+      f = out;
+    }
+    e2_report_spec(hex, vals, tiers, checks, lines, bytes);
+  }
   return 0;
 }
