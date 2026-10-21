@@ -5058,12 +5058,19 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       f, "                                 JSValue *fr, uint32_t entry_pc)\n");
   fprintf(f, "{\n");
 
-  /* S7. Entry. A compiled call passes entry_pc 0; anything else is a resume
-     that belongs to the generic body, which has a label for every pc. The
-     switch-off counter is checked first and costs one load. */
+  /* S7. Entry. A compiled call passes entry_pc 0; anything else is a resume that
+     belongs to the generic body, which has a label for every pc. The switch-off
+     counter is checked first and costs one load.
+
+     THE SPEC SWITCHES MUST BE HONOURED HERE TOO. `q2_spec_on`/`q2_no_spec` are set
+     from QJS_AOT_SPEC/QJS_AOT_NO_SPEC, but the OLD emitter's spec entry was the only
+     reader -- so the E8 spec body ran even with QJS_AOT_SPEC=0, and the harness's
+     "nospec" pass was never a generic-only run. Every nospec result on this card
+     before this line was measuring the spec bodies. */
   fprintf(
       f,
-      "    if (__builtin_expect(entry_pc != 0 || e2_off[%d], 0))\n"
+      "    if (__builtin_expect(entry_pc != 0 || !q2_spec_on || q2_no_spec || "
+      "e2_off[%d], 0))\n"
       "        return aot_g_%s(ctx, f, fr, entry_pc);\n",
       fi, hex);
   /* The index must be inside the D4 arrays; the generator sized them from the
