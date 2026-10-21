@@ -5528,6 +5528,229 @@ static int emit_typed_branch_bool(
   return 1;
 }
 
+/* ---- TAG-operand fast paths (card E9) ------------------------------------
+
+   An arithmetic, bitwise, compare or unary op whose operand the analysis left
+   TAG (the profile has no record for it, or saw only numbers through a path the
+   typing could not use) used to be an op call. This is the one place that gives
+   it the engine's own number fast path instead: box the operands, run
+   `q2_arith` / `q2_unary_fast` (the interpreter's predicate, int and float64
+   tags inline; in a frameless body only the inline cases), and on a hit move the
+   result to the def's local exactly as a field read's hit does. A miss is the
+   op-call wrapper in a framed body and an exit before the instruction in a
+   frameless one -- the same `emit_typed_opcall` every accessor's miss arm uses.
+
+   A TAG operand the profile says is not a number (a string it concatenates, an
+   object) is declined here: its miss path would be the common case. */
+
+/* Whether a value may be tested for a number at its use: no profile record, or a
+   record that names a number and no string, big integer or symbol. An object in
+   the set is allowed: the fused `get_this_field` and field-chain ops write one
+   record for all their destinations, so the receiver's type is in the field's. */
+static int e2_operand_numeric(const Q2Func *fn, Q2ValueId v) {
+  const Q2Value *x;
+  if (v >= (Q2ValueId)fn->nvalues) return 0;
+  x = &fn->values[v];
+  if (!x->has_prof) return 1;
+  if (x->ptypes & (Q2_T_STR | Q2_T_BIGINT | Q2_T_SYMBOL)) return 0;
+  return (x->ptypes & (Q2_T_INT32 | Q2_T_NUM)) != 0;
+}
+
+/* The JSValue expression of a value, whatever its representation. */
+static void e2_boxed_operand(
+    char *buf, size_t n, const E2Types *t, Q2ValueId v) {
+  switch (t->lb[v]) {
+    case E2_LB_I32:
+      snprintf(buf, n, "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)v);
+      break;
+    case E2_LB_F64:
+      snprintf(buf, n, "E2_BOX_F64(d%u)", (unsigned)v);
+      break;
+    case E2_LB_BOOL:
+      snprintf(buf, n, "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)v);
+      break;
+    default:
+      snprintf(buf, n, "v%u", (unsigned)v);
+      break;
+  }
+}
+
+/* The shape of the op, if it is one this handles: 0 none, 1 two-operand, 2 one
+   operand and an immediate, 3 unary. Fills `sub` and the immediate. */
+static int e2_tag_numeric_shape(
+    const Q2Insn *in, const E2Role *role, int *sub, int32_t *imm) {
+  if (role == NULL || role->control != E2_CF_NONE || in->ndef != 1) return 0;
+  switch (in->rop) {
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+      if (in->narg < 4 || in->arg[1].kind != 'b' || in->nuse != 1) return 0;
+      if (in->arg[3].kind != 'i' && in->arg[3].kind != 'I') return 0;
+      *sub = (int)in->arg[1].val;
+      *imm = (int32_t)in->arg[3].val;
+      break;
+    case ROP_add_imm_s:
+    case ROP_add_imm_self_s:
+    case ROP_sub_imm_s:
+    case ROP_sub_imm_self_s:
+      if (in->narg < 3 || in->nuse != 1) return 0;
+      if (in->arg[2].kind != 'i' && in->arg[2].kind != 'I') return 0;
+      *sub = (in->rop == ROP_add_imm_s || in->rop == ROP_add_imm_self_s)
+                 ? REG_BIN_ADD
+                 : REG_BIN_SUB;
+      *imm = (int32_t)in->arg[2].val;
+      break;
+    case ROP_dec:
+      *sub = REG_UN_DEC;
+      return in->nuse == 1 ? 3 : 0;
+    case ROP_neg:
+    case ROP_inc:
+    case ROP_not:
+      if (in->sub < 0 || in->nuse != 1) return 0;
+      *sub = in->sub;
+      return 3;
+    default:
+      /* The two-register arithmetic, bitwise and compare ops: a real REG_BIN_*. */
+      if (in->nuse != 2 || role->nuse != 2) return 0;
+      if (in->sub < 0 || in->sub >= 0x40) return 0;
+      *sub = in->sub;
+      if (*sub == REG_BIN_INSTANCEOF || *sub == REG_BIN_IN ||
+          *sub == REG_BIN_PRIVATE_IN)
+        return 0;
+      return 1;
+  }
+  if (*sub < 0 || *sub >= 0x40) return 0;
+  if (*sub == REG_BIN_INSTANCEOF || *sub == REG_BIN_IN ||
+      *sub == REG_BIN_PRIVATE_IN)
+    return 0;
+  return 2;
+}
+
+static int emit_tag_numeric(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, int have_types, char hex[33], int fi, int b) {
+  const E2Role *role = e2_roles[in->rop];
+  int sub = 0, shape, ntag = 0, k, dreg;
+  int32_t imm = 0;
+  Q2ValueId dv;
+  char aa[64], bb[64];
+
+  if (!have_types || t == NULL) return 0;
+  shape = e2_tag_numeric_shape(in, role, &sub, &imm);
+  if (shape == 0) return 0;
+  /* A frameless body has only the inline cases of the engine's predicate: an op
+     whose sub-operation always leaves it (a loose compare, a modulus, `**`)
+     would exit on every execution. */
+  if (g_e2_fl && shape != 3) {
+    switch (sub) {
+      case REG_BIN_ADD: case REG_BIN_SUB: case REG_BIN_MUL:
+      case REG_BIN_LT: case REG_BIN_LTE: case REG_BIN_GT: case REG_BIN_GTE:
+      case REG_BIN_STRICT_EQ: case REG_BIN_STRICT_NEQ:
+      case REG_BIN_AND: case REG_BIN_OR: case REG_BIN_XOR:
+      case REG_BIN_SHL: case REG_BIN_SAR: case REG_BIN_SHR:
+        break;
+      default:
+        return 0;
+    }
+  }
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64 && t->lb[dv] != E2_LB_BOOL)
+    return 0;
+  for (k = 0; k < in->nuse; k++) {
+    Q2ValueId v = in->use[k];
+    if (v >= (Q2ValueId)t->nvalues) return 0;
+    if (t->lb[v] == E2_LB_TAG) {
+      ntag++;
+      if (!e2_operand_numeric(fn, v)) return 0;
+    }
+  }
+  /* Only reached where every typed lowering declined: an operand or the result
+     is TAG, or the combination has no typed form. */
+  (void)ntag;
+  if (e2_must_exit(fn, in)) return 0;
+
+  e2_boxed_operand(aa, sizeof(aa), t, in->use[0]);
+  if (shape == 1)
+    e2_boxed_operand(bb, sizeof(bb), t, in->use[1]);
+  else if (shape == 2)
+    snprintf(bb, sizeof(bb), "JS_MKVAL(JS_TAG_INT, %d)", imm);
+  if (t->lb[dv] != E2_LB_TAG)
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  fprintf(f, "    { JSValue _r;\n");
+  if (shape == 3)
+    fprintf(
+        f, "      if (__builtin_expect(q2_unary_fast(%d, %s, &_r), 1)) {\n", sub,
+        aa);
+  else
+    fprintf(
+        f, "      if (__builtin_expect(%s(%d, %s, %s, &_r), 1)) {\n",
+        g_e2_fl ? "q2_num_fast" : "q2_arith", sub, aa, bb);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_r")) return 0;
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  return 1;
+}
+
+/* `branch_if` / `branch_if_not` on a value of any representation but BOOL (the
+   typed form takes that): the interpreter's `regvm_to_bool`. The tags up to
+   undefined (int, bool, null, undefined) are `payload != 0`; a float64 is
+   `d != 0 && d == d`; the rest -- an object (the one HTMLDDA bit), a string, a
+   symbol -- is the engine's `qjs_aot_to_bool`, which cannot fail and runs no JS,
+   so there is no miss path and no hand-off. */
+static int emit_tag_branch_truthy(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33]) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  Q2ValueId a;
+  int neg;
+
+  if (in->rop != ROP_branch_if && in->rop != ROP_branch_if_not) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH) return 0;
+  if (!have_types || t == NULL || blk->nsucc < 2 || in->nuse < 1) return 0;
+  a = in->use[0];
+  if (a >= (Q2ValueId)t->nvalues) return 0;
+  neg = in->rop == ROP_branch_if_not;
+  fprintf(f, "    { int c_;\n");
+  switch (t->lb[a]) {
+    case E2_LB_TAG:
+      fprintf(
+          f,
+          "    if (__builtin_expect((uint32_t)JS_VALUE_GET_TAG(v%u) <= "
+          "JS_TAG_UNDEFINED, 1))\n"
+          "        c_ = JS_VALUE_GET_INT(v%u) != 0;\n"
+          "    else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64)\n"
+          "        c_ = JS_VALUE_GET_FLOAT64(v%u) != 0 && "
+          "JS_VALUE_GET_FLOAT64(v%u) == JS_VALUE_GET_FLOAT64(v%u);\n"
+          "    else c_ = qjs_aot_to_bool(ctx, v%u) != 0;\n",
+          (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a,
+          (unsigned)a, (unsigned)a);
+      break;
+    case E2_LB_I32:
+      fprintf(f, "    c_ = i%u != 0;\n", (unsigned)a);
+      break;
+    case E2_LB_F64:
+      fprintf(f, "    c_ = d%u != 0 && d%u == d%u;\n", (unsigned)a, (unsigned)a,
+              (unsigned)a);
+      break;
+    default:
+      return 0;
+  }
+  fprintf(f, "    if (%sc_) {\n", neg ? "!" : "");
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+  fprintf(f, "    }\n    }\n");
+  return 1;
+}
+
 /* An UNCONDITIONAL branch (`branch`, `branch_s`): one successor, no condition, so
    it is arm 0 and nothing else. Loops whose back edge is a plain goto still handed
    off at this instruction, which is a large part of the remaining hand-off weight. */
@@ -6479,6 +6702,8 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
                 f, fn, in, &types, b, cur, have_types, hex, fi) ||
             emit_typed_branch(
                 f, fn, in, &types, b, cur, have_types, hex, fi) ||
+            emit_tag_branch_truthy(
+                f, fn, in, &types, b, cur, have_types, hex) ||
             (have_types &&
              emit_term_wrapper(f, fn, in, &types, b, cur, hex, fi))) {
           lowered_to = i2 + 1;
@@ -6529,6 +6754,9 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         g_e2_miss_exit_seen = 0;
         emitted = e2_dispatch_rop(
             f, fn, in, &types, cur, have_types, hex, fi, b, role);
+        if (!emitted)
+          emitted = emit_tag_numeric(
+              f, fn, in, &types, cur, have_types, hex, fi, b);
         /* DECLINE MEANS "TRY THE NEXT EMITTER", and the op-call wrapper is the
            last: a typed emitter that declined (a TAG operand, an unsupported
            representation) or an op with no emitter at all runs through the
