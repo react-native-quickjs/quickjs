@@ -3011,14 +3011,30 @@ static int emit_typed_fused(
     ld = fn->values[rv].reg;
     if (ld < 0 || ld >= fn->nregs || ldm < 0 || ldm >= fn->nregs) return 0;
 
-    if (t->lb[xv] == E2_LB_F64 && t->lb[yv] == E2_LB_F64 &&
-        t->lb[cv] == E2_LB_F64 && t->lb[dv] == E2_LB_F64 &&
-        t->lb[rv] == E2_LB_F64) {
+    /* A MIXED pair is fine in the f64 form: an i32 operand converts with
+       (double), exactly as the register arithmetic form does. A product or sum of
+       doubles cannot overflow, so still no exit. */
+    if ((t->lb[dv] == E2_LB_F64 || t->lb[dv] == E2_LB_I32) &&
+        (t->lb[rv] == E2_LB_F64 || t->lb[rv] == E2_LB_I32) &&
+        (t->lb[xv] == E2_LB_F64 || t->lb[xv] == E2_LB_I32) &&
+        (t->lb[yv] == E2_LB_F64 || t->lb[yv] == E2_LB_I32) &&
+        (t->lb[cv] == E2_LB_F64 || t->lb[cv] == E2_LB_I32) &&
+        (t->lb[xv] == E2_LB_F64 || t->lb[yv] == E2_LB_F64 ||
+         t->lb[cv] == E2_LB_F64 || t->lb[dv] == E2_LB_F64)) {
       /* Two statements, in the engine's order. */
-      fprintf(f, "    d%u = d%u * d%u;\n", (unsigned)dv, (unsigned)xv,
-              (unsigned)yv);
-      fprintf(f, "    d%u = d%u %s d%u;\n", (unsigned)rv, (unsigned)cv, op,
-              (unsigned)dv);
+      {
+        char xb[32], yb[32], cb[32], mb[32];
+        if (t->lb[xv] == E2_LB_F64) snprintf(xb, sizeof(xb), "d%u", (unsigned)xv);
+        else snprintf(xb, sizeof(xb), "(double)i%u", (unsigned)xv);
+        if (t->lb[yv] == E2_LB_F64) snprintf(yb, sizeof(yb), "d%u", (unsigned)yv);
+        else snprintf(yb, sizeof(yb), "(double)i%u", (unsigned)yv);
+        if (t->lb[cv] == E2_LB_F64) snprintf(cb, sizeof(cb), "d%u", (unsigned)cv);
+        else snprintf(cb, sizeof(cb), "(double)i%u", (unsigned)cv);
+        if (t->lb[dv] == E2_LB_F64) snprintf(mb, sizeof(mb), "d%u", (unsigned)dv);
+        else snprintf(mb, sizeof(mb), "(double)i%u", (unsigned)dv);
+        fprintf(f, "    %s = %s * %s;\n", mb, xb, yb);
+        fprintf(f, "    d%u = %s %s %s;\n", (unsigned)rv, cb, op, mb);
+      }
     } else if (t->lb[xv] == E2_LB_I32 && t->lb[yv] == E2_LB_I32 &&
                t->lb[cv] == E2_LB_I32 && t->lb[dv] == E2_LB_I32 &&
                t->lb[rv] == E2_LB_I32) {
@@ -4641,6 +4657,32 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
       uint64_t *lb =
           calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
       e2_handoff_note(fn, &fn->insns[lowered_to]);
+      /* NAME THE REASON. The reps come from E2Types.lb -- never Q2Value.rep,
+         which holds the old emitter's inference and reads BOT as TAG. A decline is
+         almost always a representation some emitter will not accept. */
+      {
+        const Q2Insn *hi = &fn->insns[lowered_to];
+        char nm[64];
+        int u, dd;
+        e2_rop_name(hi->rop, nm, sizeof(nm));
+        fprintf(
+            stderr,
+            "e2 handoff-at hex=%s pc=%d rop=%u name=%s tier=%d defs=",
+            g_cur_hex, hi->pc, (unsigned)hi->rop, nm,
+            e2_roles[hi->rop] ? (int)e2_roles[hi->rop]->tier : -1);
+        for (dd = 0; dd < hi->ndef; dd++) {
+          Q2ValueId v = hi->def[dd];
+          fprintf(stderr, "%s%d:%s", dd ? "," : "",
+                  (int)v, v < (Q2ValueId)types.nvalues ? e2_rep_prefix(v) : "?");
+        }
+        fprintf(stderr, " uses=");
+        for (u = 0; u < hi->nuse; u++) {
+          Q2ValueId v = hi->use[u];
+          fprintf(stderr, "%s%d:%s", u ? "," : "",
+                  (int)v, v < (Q2ValueId)types.nvalues ? e2_rep_prefix(v) : "?");
+        }
+        fprintf(stderr, "\n");
+      }
       fprintf(f, "    /* exit at the first unlowered instruction */\n");
       if (lb != NULL) q2_live_before(fn, lowered_to, lb);
       e2_emit_exit(
