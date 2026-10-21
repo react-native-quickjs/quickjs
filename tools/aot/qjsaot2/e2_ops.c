@@ -77,6 +77,8 @@ int qjs_aot_prof_callees(
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
 int qjs_aot_unit_argc(const char hex[33]);
+int qjs_aot_sweep_on(void);
+int qjs_aot_site_alloc(void);
 
 /* Whether register `r` may be written by this instruction: its declared
    destinations, plus `writes_regs` ops. */
@@ -1997,6 +1999,20 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   return 0;
 }
 
+/* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
+   forced to fail, so its stub runs even where the speculation always holds. It
+   sits where the guard's own exit would be taken -- for dx_, after the op's raw
+   result is in the frame. A normal build emits nothing. hx_ is a hand-off, not a
+   deopt, and is not swept. */
+static void e2_sweep_guard(FILE *f, const char *kind, int pc) {
+  if (!qjs_aot_sweep_on()) return;
+  fprintf(
+      f,
+      "    if (__builtin_expect(qjs_aot_should_deopt(ctx, %d), 0)) goto "
+      "%s_%d;\n",
+      qjs_aot_site_alloc(), kind, pc);
+}
+
 /* The guard-stub tables' size. A large top-level function has hundreds of guard
    pcs; running out aborts rather than leave a goto without its label. */
 #define E2_MAX_STUBS 4096
@@ -2122,8 +2138,9 @@ static void e2_note_stub(
   for (q = 0; q < *n; q++)
     if (pcs[q] == pc) return;
   if (*n >= E2_MAX_STUBS || cur == NULL) {
-    fprintf(stderr, "e2: guard stub at pc %d has no sync set (%s)\n", pc,
-            cur == NULL ? "no cur" : "table full");
+    fprintf(
+        stderr, "e2: guard stub at pc %d has no sync set (%s)\n", pc,
+        cur == NULL ? "no cur" : "table full");
     abort();
   }
   snap = malloc(sizeof(*snap) * (size_t)(nr > 0 ? nr : 1));
@@ -2189,6 +2206,7 @@ static void e2_load_arg_to_local(
      nothing has been written to the frame yet. */
   switch (e2_rep_prefix(v)[0]) {
     case 'i':
+      e2_sweep_guard(f, "ax", pc);
       fprintf(
           f,
           "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
@@ -2197,6 +2215,7 @@ static void e2_load_arg_to_local(
       fprintf(f, "    %s = JS_VALUE_GET_INT(q2_arg_buf(f)[%d]);\n", dn, slot);
       break;
     case 'd':
+      e2_sweep_guard(f, "ax", pc);
       fprintf(
           f,
           "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
@@ -2211,6 +2230,7 @@ static void e2_load_arg_to_local(
           dn, slot, slot, slot);
       break;
     case 'b':
+      e2_sweep_guard(f, "ax", pc);
       fprintf(
           f,
           "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
@@ -2223,7 +2243,6 @@ static void e2_load_arg_to_local(
       break;
   }
 }
-
 
 /* Copy one local to another across representations. The destination is a JSValue
    local unless both sides agree, so a typed source is boxed on the way -- the
@@ -2305,12 +2324,14 @@ static int emit_typed_arith(
       "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n",
       (unsigned)in->use[0], op, (unsigned)in->use[1]);
   if (t->exits != NULL && (t->exits[d] & E2_EX_OVF)) {
+    e2_sweep_guard(f, "ox", in->pc);
     fprintf(
         f,
         "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
         "goto ox_%d;\n",
         in->pc);
-    e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+    e2_note_stub(
+        g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   }
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -2566,7 +2587,9 @@ static void e2_emit_exit(
   int words = fn->lwords, w, r;
 
   if (fi != g_e2_fi) {
-    fprintf(stderr, "e2: exit names function %d inside function %d's body\n", fi, g_e2_fi);
+    fprintf(
+        stderr, "e2: exit names function %d inside function %d's body\n", fi,
+        g_e2_fi);
     abort();
   }
   fprintf(f, "    {\n");
@@ -2619,7 +2642,8 @@ static void e2_emit_exit_at(
     const Q2ValueId *cur, int blkidx) {
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (cur == NULL) {
-    fprintf(stderr, "e2: exit stub at pc %d has no sync set (fn %s)\n", pc, hex);
+    fprintf(
+        stderr, "e2: exit stub at pc %d has no sync set (fn %s)\n", pc, hex);
     abort();
   }
   if (lb != NULL) q2_live_before(fn, ins, lb);
@@ -2786,8 +2810,10 @@ static int emit_typed_var_ref_load(
 
   /* Register the exit pc ONCE per function body, so the vx_ label below is
      emitted exactly once. The snapshot is from before the load. */
-  e2_note_stub(g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+  e2_note_stub(
+      g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
   if (t->lb[d] == E2_LB_I32) {
+    e2_sweep_guard(f, "vx", in->pc);
     fprintf(
         f,
         "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
@@ -2796,6 +2822,7 @@ static int emit_typed_var_ref_load(
         "      i%u = JS_VALUE_GET_INT(_c); }\n",
         slot, in->pc, (unsigned)d);
   } else if (t->lb[d] == E2_LB_F64) {
+    e2_sweep_guard(f, "vx", in->pc);
     fprintf(
         f,
         "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
@@ -2805,6 +2832,7 @@ static int emit_typed_var_ref_load(
         "      else goto vx_%d; }\n",
         slot, (unsigned)d, (unsigned)d, in->pc);
   } else if (t->lb[d] == E2_LB_BOOL) {
+    e2_sweep_guard(f, "vx", in->pc);
     fprintf(
         f,
         "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
@@ -2922,7 +2950,8 @@ static int emit_typed_opcall(
   /* 5. Reload the defs the role says it wrote, by value id, with the tag guard. */
   /* The guard exits land at the NEXT pc: the op has run, so its result is already in
      the frame and the generic body resumes after it. */
-  e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  e2_note_stub(
+      g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
   any = 0;
   for (r = 0; r < in->ndef; r++) {
     Q2ValueId v = in->def[r];
@@ -2932,6 +2961,7 @@ static int emit_typed_opcall(
     if (reg < 0 || reg >= fn->nregs) continue;
     switch (t->lb[v]) {
       case E2_LB_I32:
+        e2_sweep_guard(f, "dx", in->next);
         fprintf(
             f,
             "    { JSValue _r = AOT_REG(fr, %d);\n"
@@ -2942,6 +2972,7 @@ static int emit_typed_opcall(
         any = 1;
         break;
       case E2_LB_F64:
+        e2_sweep_guard(f, "dx", in->next);
         fprintf(
             f,
             "    { JSValue _r = AOT_REG(fr, %d); int _tg = JS_VALUE_GET_TAG(_r);\n"
@@ -2952,6 +2983,7 @@ static int emit_typed_opcall(
         any = 1;
         break;
       case E2_LB_BOOL:
+        e2_sweep_guard(f, "dx", in->next);
         fprintf(
             f,
             "    { JSValue _r = AOT_REG(fr, %d);\n"
@@ -3158,6 +3190,7 @@ static int emit_typed_fused(
                t->lb[cv] == E2_LB_I32 && t->lb[dv] == E2_LB_I32 &&
                t->lb[rv] == E2_LB_I32) {
       /* Step 1: the product, with the -0 exit the multiply already has. */
+      e2_sweep_guard(f, "ox", in->pc);
       fprintf(
           f,
           "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n"
@@ -3182,7 +3215,8 @@ static int emit_typed_fused(
     }
     (void)is_add;
     (void)op;
-    e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+    e2_note_stub(
+        g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
     if (cur != NULL) {
       cur[ldm] = dv;
       cur[ld] = rv;
@@ -3281,6 +3315,7 @@ static int emit_typed_elem_read(
     /* Raw result to the frame first, so a guard miss leaves the op's result where
        the generic body will look for it. */
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
+    e2_sweep_guard(f, "dx", in->next);
     if (t->lb[dv] == E2_LB_I32)
       fprintf(
           f,
@@ -3416,7 +3451,8 @@ static int emit_typed_call(
   /* A typed def's guard exits at the NEXT pc (the call has run), so that exit must
      exist; the same registration the op-call wrapper uses. */
   if (t->lb[dv] != E2_LB_TAG)
-    e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
   if (th >= 0)
     snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
   else
@@ -3479,6 +3515,7 @@ static int emit_typed_call(
       fprintf(f, "        v%u = _o;\n", (unsigned)dv);
     } else if (t->lb[dv] == E2_LB_I32) {
       /* The call has run, so a failed guard is an ordinary exit at the NEXT pc. */
+      e2_sweep_guard(f, "dx", in->next);
       fprintf(
           f,
           "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) "
@@ -3486,6 +3523,7 @@ static int emit_typed_call(
           "        i%u = JS_VALUE_GET_INT(_o);\n",
           in->next, (unsigned)dv);
     } else {
+      e2_sweep_guard(f, "dx", in->next);
       fprintf(
           f,
           "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = "
@@ -3545,6 +3583,7 @@ static int emit_typed_global_read(
     fprintf(f, "        v%u = _g;\n", (unsigned)dv);
   } else {
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", dreg * 16);
+    e2_sweep_guard(f, "dx", in->next);
     if (t->lb[dv] == E2_LB_I32)
       fprintf(
           f,
@@ -3652,7 +3691,8 @@ static int emit_typed_strict_eq(
         "          _e = %s;\n",
         (unsigned)tv, ex);
     fprintf(f, "      else goto hx_%d;\n", in->pc);
-    e2_note_stub(g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+    e2_note_stub(
+        g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
     fprintf(f, "      b%u = %s_e;\n", (unsigned)dv, neg ? "!" : "");
     fprintf(f, "    }\n");
   } else {
@@ -3791,7 +3831,8 @@ static int emit_typed_field_chain(
   /* The same wrapper on the same instruction: having emitted once, it cannot
      decline now, and a decline here would leave half an instruction written. */
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
-    fprintf(stderr, "e2: field chain at pc %d: second wrapper declined\n", in->pc);
+    fprintf(
+        stderr, "e2: field chain at pc %d: second wrapper declined\n", in->pc);
     abort();
   }
   fprintf(f, "      }\n");
@@ -3911,7 +3952,8 @@ static int emit_typed_field_read(
   if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
 
   /* Register the guard exits' pcs ONCE per body, like the other dx_ users. */
-  e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  e2_note_stub(
+      g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
   fprintf(f, "    { JSValue _f;\n");
   fprintf(
       f,
@@ -3924,6 +3966,7 @@ static int emit_typed_field_read(
     /* Write the raw result to the frame FIRST: on a guard mismatch the exit is at
        the next pc and the generic body must find the op's result there. */
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _f);\n", dreg * 16);
+    e2_sweep_guard(f, "dx", in->next);
     if (t->lb[dv] == E2_LB_I32)
       fprintf(
           f,
@@ -4016,6 +4059,7 @@ static int emit_typed_arith_cpool(
   if (t->lb[d] == E2_LB_I32 && tag == E2_POOL_INT &&
       t->lb[a] == E2_LB_I32) {
     int32_t ic = (int32_t)c;
+    e2_sweep_guard(f, "ox", in->pc);
     fprintf(
         f,
         "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n"
@@ -4023,7 +4067,8 @@ static int emit_typed_arith_cpool(
         "goto ox_%d;\n"
         "      i%u = (int32_t)_t; }\n",
         (unsigned)a, op, ic, in->pc, (unsigned)d);
-    e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+    e2_note_stub(
+        g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
     return 1;
   }
@@ -4181,6 +4226,7 @@ static int emit_typed_add_imm_branch(
   /* RD_OFF8: a signed 8-bit immediate. */
   imm = (int32_t)(int8_t)(in->arg[1].val & 0xff);
   ld = fn->values[d].reg;
+  e2_sweep_guard(f, "ox", in->pc);
   fprintf(
       f,
       "    { int32_t _s;\n"
@@ -4188,7 +4234,8 @@ static int emit_typed_add_imm_branch(
       "        goto ox_%d;\n"
       "      i%u = _s; }\n",
       (unsigned)a, imm, in->pc, (unsigned)d);
-  e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+  e2_note_stub(
+      g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
   fprintf(f, "    /* fused update, then the unconditional back edge */\n");
   e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
@@ -4225,6 +4272,7 @@ static int emit_typed_inc_branch(
      below the bound. */
   si_take = 0;
   si_else = 1;
+  e2_sweep_guard(f, "ox", in->pc);
   if (0) {
     /* "rit": arg[0] is the destination register, arg[1] the immediate, arg[2]
        the branch target. Reading arg[2] here would use the TARGET as the step. */
@@ -4255,7 +4303,8 @@ static int emit_typed_inc_branch(
   e2_emit_arm(f, fn, b, si_else, cur, hex, blk->succ_block[si_else]);
   fprintf(f, "    }\n");
   /* The overflow exit lives after the block, keyed by this pc. */
-  e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+  e2_note_stub(
+      g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   (void)fi;
   return 1;
 }
@@ -4357,6 +4406,7 @@ static int emit_typed_arith_imm(
           break;
         default: /* REG_BIN_SHR */
           if (t->lb[d] == E2_LB_I32) {
+            e2_sweep_guard(f, "ox", in->pc);
             fprintf(
                 f,
                 "    { uint32_t _u = (uint32_t)%s >> (%d & 31);\n"
@@ -4364,7 +4414,9 @@ static int emit_typed_arith_imm(
                 "goto ox_%d;\n"
                 "      i%u = (int32_t)_u; }\n",
                 xn, imm, in->pc, (unsigned)d);
-            e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+            e2_note_stub(
+                g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur,
+                NULL);
           } else if (t->lb[d] == E2_LB_F64) {
             fprintf(f, "    d%u = (double)((uint32_t)%s >> (%d & 31));\n",
                     (unsigned)d, xn, imm);
@@ -4405,6 +4457,7 @@ static int emit_typed_arith_imm(
   fprintf(
       f, "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n", (unsigned)a, op,
       imm);
+  e2_sweep_guard(f, "ox", in->pc);
   fprintf(
       f,
       "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
@@ -4412,7 +4465,8 @@ static int emit_typed_arith_imm(
       in->pc);
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
-  e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+  e2_note_stub(
+      g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
   return 1;
 }
 
@@ -4656,7 +4710,8 @@ static int emit_typed_branch(
               (unsigned)tv, ex);
         }
         fprintf(f, "    else goto hx_%d;\n", in->pc);
-        e2_note_stub(g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+        e2_note_stub(
+            g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
         fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       }
     }
@@ -4729,6 +4784,7 @@ static int emit_typed_unary(
       if (t->lb[d] != E2_LB_I32) return 0;
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
+      e2_sweep_guard(f, "ox", in->pc);
       fprintf(
           f,
           "    { int32_t _s;\n"
@@ -4736,7 +4792,8 @@ static int emit_typed_unary(
           "        goto ox_%d;\n"
           "      %s = _s; }\n",
           an, in->rop == ROP_add_imm_self_s ? k : -k, in->pc, dn);
-      e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+      e2_note_stub(
+          g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
@@ -4746,12 +4803,14 @@ static int emit_typed_unary(
       if (t->lb[a] != E2_LB_I32 || t->lb[d] != E2_LB_I32) return 0;
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
+      e2_sweep_guard(f, "ox", in->pc);
       fprintf(
           f,
           "    if (__builtin_expect(%s != %s, 1)) { %s = %s %s 1; }\n", an,
           is_inc ? "INT32_MAX" : "INT32_MIN", dn, an, is_inc ? "+" : "-");
       fprintf(f, "    else { goto ox_%d; }\n", in->pc);
-      e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+      e2_note_stub(
+          g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
@@ -4764,13 +4823,15 @@ static int emit_typed_unary(
     if (t->lb[a] == E2_LB_I32 && t->lb[d] == E2_LB_I32) {
       e2_local_name(dn, sizeof(dn), d);
       e2_local_name(an, sizeof(an), a);
+      e2_sweep_guard(f, "ox", in->pc);
       fprintf(
           f,
           "    if (__builtin_expect(%s != INT32_MIN && %s != 0, 1)) "
           "{ %s = -%s; }\n",
           an, an, dn, an);
       fprintf(f, "    else { goto ox_%d; }\n", in->pc);
-      e2_note_stub(g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
+      e2_note_stub(
+          g_e2_ox, g_e2_ox_cur, g_e2_ox_blk, &g_e2_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
       return 1;
     }
