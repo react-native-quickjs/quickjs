@@ -2251,6 +2251,16 @@ static int emit_typed_arith(
   return 1;
 }
 
+/* Generation-time switch: omit the spec back-edge poll (see the call site). */
+static int e2_nopoll(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("QJS_AOT_E2_NOPOLL");
+    cached = (v != NULL && v[0] == '1');
+  }
+  return cached;
+}
+
 /* A register whose slot a transfer EMPTIED. E2_UNDEF is not a value id, so it
    cannot collide with one; the exit sync writes JS_UNDEFINED for it. */
 #define E2_UNDEF ((Q2ValueId)-2)
@@ -2633,7 +2643,11 @@ static void e2_emit_arm(
      The sync before the poll is REQUIRED: qjs_aot_poll can run the interrupt
      handler and the GC, and a TAG value held only in a C local is invisible to
      the GC, so the frame must own every live value before the call. */
-  if (q2_is_back_edge(fn, b, sb)) {
+  /* QJS_AOT_E2_NOPOLL=1 omits the SPEC back-edge poll only (the generic body keeps
+     its own). It exists so `m1.sh gates` can build a variant and prove that the
+     poll is what stops a spec-body loop; it is a GENERATION switch, so it is part
+     of the unit cache key. */
+  if (q2_is_back_edge(fn, b, sb) && !e2_nopoll()) {
     const Q2Block *t = &fn->blocks[sb];
     int q;
     fprintf(
