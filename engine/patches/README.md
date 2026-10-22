@@ -415,3 +415,4 @@ bump while `9999` is missing.
 | `0327` | Gives compiled code typed-array element access | A loop over a typed array ran every access through the step handler, slower than the interpreter | layout class ids for the typed arrays; `qjs_aot_typed_put` | No. |
 | `0328` | Throws the `to_propkey2` error in the step's own context | The handler read `rf->caller_ctx` from the record-only tail, which a light or compiled frame lacks | `to_propkey2` throws in `ctx` | No. |
 | `0329` | Appends a string in place from compiled code | The compiled `s += 'x'` built a new string every time | `qjs_aot_binary_cpool` takes the register indexes and runs `regvm_accum_append` | No. |
+| `0330` | Gives compiled code string length, character reads and the String.prototype method load | `s.charCodeAt(i)` and `s.length` ran through the step handler, slower than the interpreter | layout masks and offsets; `qjs_aot_strproto_slot`; intrinsic ids for charCodeAt/codePointAt/charAt | No. |

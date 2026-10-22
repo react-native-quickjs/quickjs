@@ -1295,12 +1295,16 @@
       "sha256": "e7288d47166afbf5e819059ad4459e1e8935aae2d3bf301dad6731df47dd2ff6"
     },
     {
+      "name": "0330-aot-string-reads.patch",
+      "sha256": "9f3b4d0c0318ecb0bceeefab615f1f79b520be6c5796799f4f5e4e3279abe85e"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "63b5c130ac0442bcc682b52230e71a0a2f23c22718c1555e069df0c8ba3a3cb0",
+    "quickjs.c": "fffe9606af5e33cc0cbac89e0a88a854fd49926309eb0a0fddaa74c2131aa0bd",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

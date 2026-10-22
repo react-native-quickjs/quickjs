@@ -60755,6 +60755,33 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->class_uint32_array = JS_CLASS_UINT32_ARRAY;
     out->class_float32_array = JS_CLASS_FLOAT32_ARRAY;
     out->class_float64_array = JS_CLASS_FLOAT64_ARRAY;
+    {
+        JSString probe;
+
+        memset(&probe, 0, sizeof(probe));
+        probe.len = 0x7fffffff;
+        out->string_len_mask = *(uint32_t *)&probe;
+        probe.len = 0;
+        probe.is_wide_char = 1;
+        out->string_wide_mask = ((uint32_t *)&probe)[0];
+        probe.is_wide_char = 0;
+        probe.kind = 3;
+        out->string_kind_mask = ((uint32_t *)&probe)[1];
+        assert(out->string_len_mask != 0 && out->string_wide_mask != 0 &&
+               (out->string_len_mask & out->string_wide_mask) == 0 &&
+               out->string_kind_mask != 0 && ((uint32_t *)&probe)[0] == 0);
+    }
+    {
+        JSShapeProperty sp;
+
+        memset(&sp, 0, sizeof(sp));
+        sp.flags = JS_PROP_TMASK;
+        out->shape_prop_tmask = *(uint32_t *)&sp;
+        assert(out->shape_prop_tmask != 0 && offsetof(JSShapeProperty, atom) == 4);
+    }
+    out->off_ctx_class_proto = (uint32_t)offsetof(JSContext, class_proto);
+    out->off_rt_onechar = (uint32_t)offsetof(JSRuntime, onechar);
+    out->class_string = JS_CLASS_STRING;
     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
 #endif
     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
@@ -62512,6 +62539,26 @@ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
                         int n, int ti)
 {
     return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
+}
+
+int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
+                          const void **prs_out, uint32_t *off)
+{
+    JSValue pv = ctx->class_proto[JS_CLASS_STRING];
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(pv);
+    prs = find_own_property(&pr, p, (JSAtom)atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    *shape = p->shape;
+    *prs_out = prs;
+    *off = (uint32_t)((uint8_t *)pr - (uint8_t *)p->prop);
+    return 1;
 }
 
 /* A store of a number into an element of a typed array that is in range: 1 when done.
@@ -89035,6 +89082,9 @@ void *qjs_aot_intrinsic_fn(int id)
     case QJS_AOT_INTR_MIN:
     case QJS_AOT_INTR_MAX: return (void *)js_math_min_max;
     case QJS_AOT_INTR_PARSEINT: return (void *)js_parseInt;
+    case QJS_AOT_INTR_STR_CHARCODEAT: return (void *)js_string_charCodeAt;
+    case QJS_AOT_INTR_STR_CODEPOINTAT: return (void *)js_string_codePointAt;
+    case QJS_AOT_INTR_STR_CHARAT: return (void *)js_string_charAt;
     }
     return NULL;
 }

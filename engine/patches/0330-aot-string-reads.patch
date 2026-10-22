@@ -1,0 +1,134 @@
+Subject: String reads for compiled code: length, characters, and the method load
+
+What this does
+  - The unit layout carries the string header's length, wide-character and kind masks, the
+    flag mask of a shape property entry, the offset of the context's class-prototype table,
+    the String class id and the offset of the runtime's one-character string table.
+  - `qjs_aot_strproto_slot` returns where `atom` lives in this realm's String.prototype when
+    it is a plain data property: the prototype's shape, the property's entry in that shape and
+    its byte offset. A compiled method load on a string receiver keeps the three per site and
+    reads the current value while the shape, the entry's atom and its flags are unchanged.
+  - `String.prototype.charCodeAt`, `codePointAt` and `charAt` get intrinsic ids and function
+    pointers (`qjs_aot_intrinsic_fn`), so a compiled call checks the callee against the builtin
+    and reads the character in place.
+
+Why we need it
+  `s.charCodeAt(i)` and `s.length` in a loop went through the step handler three times
+  per iteration (the method load, the call, the length), 1.4 times slower than the interpreter.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60755,6 +60755,33 @@
+     out->class_uint32_array = JS_CLASS_UINT32_ARRAY;
+     out->class_float32_array = JS_CLASS_FLOAT32_ARRAY;
+     out->class_float64_array = JS_CLASS_FLOAT64_ARRAY;
++    {
++        JSString probe;
++
++        memset(&probe, 0, sizeof(probe));
++        probe.len = 0x7fffffff;
++        out->string_len_mask = *(uint32_t *)&probe;
++        probe.len = 0;
++        probe.is_wide_char = 1;
++        out->string_wide_mask = ((uint32_t *)&probe)[0];
++        probe.is_wide_char = 0;
++        probe.kind = 3;
++        out->string_kind_mask = ((uint32_t *)&probe)[1];
++        assert(out->string_len_mask != 0 && out->string_wide_mask != 0 &&
++               (out->string_len_mask & out->string_wide_mask) == 0 &&
++               out->string_kind_mask != 0 && ((uint32_t *)&probe)[0] == 0);
++    }
++    {
++        JSShapeProperty sp;
++
++        memset(&sp, 0, sizeof(sp));
++        sp.flags = JS_PROP_TMASK;
++        out->shape_prop_tmask = *(uint32_t *)&sp;
++        assert(out->shape_prop_tmask != 0 && offsetof(JSShapeProperty, atom) == 4);
++    }
++    out->off_ctx_class_proto = (uint32_t)offsetof(JSContext, class_proto);
++    out->off_rt_onechar = (uint32_t)offsetof(JSRuntime, onechar);
++    out->class_string = JS_CLASS_STRING;
+     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
+ #endif
+     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
+@@ -62514,6 +62541,26 @@
+     return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
+ }
+ 
++int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
++                          const void **prs_out, uint32_t *off)
++{
++    JSValue pv = ctx->class_proto[JS_CLASS_STRING];
++    JSObject *p;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++
++    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(pv);
++    prs = find_own_property(&pr, p, (JSAtom)atom);
++    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return 0;
++    *shape = p->shape;
++    *prs_out = prs;
++    *off = (uint32_t)((uint8_t *)pr - (uint8_t *)p->prop);
++    return 1;
++}
++
+ /* A store of a number into an element of a typed array that is in range: 1 when done.
+    An integer goes to any element type (converted as the engine's own fast path does),
+    a double only to the float types; anything else is the caller's slow path. */
+@@ -89035,6 +89082,9 @@
+     case QJS_AOT_INTR_MIN:
+     case QJS_AOT_INTR_MAX: return (void *)js_math_min_max;
+     case QJS_AOT_INTR_PARSEINT: return (void *)js_parseInt;
++    case QJS_AOT_INTR_STR_CHARCODEAT: return (void *)js_string_charCodeAt;
++    case QJS_AOT_INTR_STR_CODEPOINTAT: return (void *)js_string_codePointAt;
++    case QJS_AOT_INTR_STR_CHARAT: return (void *)js_string_charAt;
+     }
+     return NULL;
+ }
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -121,6 +121,16 @@
+     uint32_t class_uint8c_array, class_int8_array, class_uint8_array, class_int16_array;
+     uint32_t class_uint16_array, class_int32_array, class_uint32_array;
+     uint32_t class_float32_array, class_float64_array;
++    /* A string value's length word, the context's per-class prototype table and the class
++       of String.prototype's holder. */
++    uint32_t string_len_mask, off_ctx_class_proto, class_string;
++    /* In a flat string's header: the wide-character bit (first word) and the kind bits
++       (second word). */
++    uint32_t string_wide_mask, string_kind_mask;
++    /* The flag bits of a shape property entry (first word; the atom is the second). */
++    uint32_t shape_prop_tmask;
++    /* The runtime's table of one-character strings (code units below 256). */
++    uint32_t off_rt_onechar;
+     /* The per-site polymorphic property cache: where the bytecode's allocation
+        is, the stride between sites, and the ways per site. */
+     uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
+@@ -302,7 +312,8 @@
+ enum {
+     QJS_AOT_INTR_SQRT, QJS_AOT_INTR_ABS, QJS_AOT_INTR_FLOOR, QJS_AOT_INTR_CEIL,
+     QJS_AOT_INTR_ROUND, QJS_AOT_INTR_SIN, QJS_AOT_INTR_COS, QJS_AOT_INTR_MIN,
+-    QJS_AOT_INTR_MAX, QJS_AOT_INTR_PARSEINT, QJS_AOT_INTR_COUNT
++    QJS_AOT_INTR_MAX, QJS_AOT_INTR_PARSEINT, QJS_AOT_INTR_STR_CHARCODEAT,
++    QJS_AOT_INTR_STR_CODEPOINTAT, QJS_AOT_INTR_STR_CHARAT, QJS_AOT_INTR_COUNT
+ };
+ void *qjs_aot_intrinsic_fn(int id);
+ 
+@@ -387,6 +398,13 @@
+ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
+ int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue obj, JSValue *vals,
+                           int n, int ti);
++/* The slot of `atom` in this realm's String.prototype when it is a plain data property:
++   1 with the prototype's shape, the property's entry in that shape and its byte offset
++   in the property array, 0 otherwise. A compiled method load on a string receiver keeps
++   them and reads the current value while the shape, the entry's atom and its flags are
++   unchanged. */
++int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
++                          const void **prs, uint32_t *off);
+ /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
+ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
+ /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
