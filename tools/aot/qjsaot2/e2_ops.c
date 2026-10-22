@@ -36,6 +36,7 @@
    text). Implies g_e2_fl. */
 static int g_e2_fi = -1;
 static int g_e2_inl;
+static const E2Facts *g_e2_facts;
 /* Set when a body emitted in inline mode needs more than inline mode can give. */
 static char g_e2_inl_why[160];
 /* Inline mode, effects so far. Once the body has stored or called, an exit can no
@@ -2379,7 +2380,15 @@ static int e2_def_dead(const Q2Insn *in, Q2ValueId v) {
   if (r < 0 || r >= g_e2_fn->nregs) return 0;
   lo = q2_live_out(g_e2_fn, (int)(in - g_e2_fn->insns));
   if (lo == NULL) return 0;
-  return !((lo[r >> 6] >> (r & 63)) & 1);
+  if ((lo[r >> 6] >> (r & 63)) & 1) return 0;
+  /* A later load the facts forward is a copy of this value's local: the register
+     being overwritten does not make the value unused. */
+  if (g_e2_facts != NULL && g_e2_facts->fwd != NULL) {
+    int k;
+    for (k = 0; k < g_e2_fn->ninsns; k++)
+      if (g_e2_facts->fwd[k] == v) return 0;
+  }
+  return 1;
 }
 
 static const char *e2_tag_expr(char kind, int pc) {
