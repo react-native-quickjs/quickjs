@@ -6656,8 +6656,9 @@ static int emit_typed_field_write(
   /* An add-property store replays its cached transition first: that only grows the
      property array, so the registers need not be published. */
   if (!g_e_fl && in->narg > 1 && in->arg[1].kind == 'a')
-    fprintf(f, "        int _ar = Q2_FORCE_MISS ? 0 : qjs_aot_put_add(ctx, f, v%u, %s, %d);\n"
-               "        if (_ar <= 0) {\n", (unsigned)rv, boxed, site);
+    fprintf(f, "        int _ar = Q2_FORCE_MISS ? 0 : (q2_put_add(ctx, pic, holders, q2_ns, v%u, %d, %s) ? 1 :\n"
+               "            qjs_aot_put_add(ctx, f, v%u, %s, %d));\n"
+               "        if (_ar <= 0) {\n", (unsigned)rv, site, boxed, (unsigned)rv, boxed, site);
   /* A miss (an add-property store, a prototype receiver, a polymorphic site) runs
      the engine's cache-filling store directly, as the generic body does, instead of
      stepping the handler: the same safepoint, without the step. */

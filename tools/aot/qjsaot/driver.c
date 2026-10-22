@@ -1898,6 +1898,14 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_CLASS_C_FUNCTION %uu\n"
           "#define QJS_AOT_OFF_CFUNC_C_FUNCTION %uu\n"
           "#define QJS_AOT_OFF_CFUNC_MAGIC %uu\n"
+          "#define QJS_AOT_OFF_JSREGPIC_MISSES %uu\n"
+          "#define QJS_AOT_REG_PIC_ADD_W %uu\n"
+          "#define QJS_AOT_OFF_RT_IC_EPOCH %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_FLAGS16 %uu\n"
+          "#define QJS_AOT_JSOBJECT_EXTENSIBLE_MASK %uu\n"
+          "#define QJS_AOT_JSOBJECT_NOADD_MASK %uu\n"
+          "#define QJS_AOT_JSOBJECT_INLINE_CAP_MASK %uu\n"
+          "#define QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT %uu\n"
           "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
           "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
@@ -1946,7 +1954,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.regvm_flag_light, lay.regvm_flag_c_entry, lay.regvm_flag_stack,
           lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm,
           lay.off_rc_back, lay.off_varref_pvalue, lay.class_c_function,
-          lay.off_cfunc_c_function, lay.off_cfunc_magic);
+          lay.off_cfunc_c_function, lay.off_cfunc_magic, lay.off_regpic_misses,
+          lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_object_flags16,
+          lay.object_extensible_mask, lay.object_noadd_mask,
+          lay.object_inline_cap_mask, lay.object_inline_cap_shift);
       fclose(lf);
     }
 
@@ -3201,6 +3212,47 @@ int qjsaot_driver_main(int argc, char **argv) {
        value cannot free it. A prototype receiver (whose store invalidates the
        prototype epoch) or a miss returns 0 and the caller takes the engine's
        store. */
+    /* The cached add-transition store, replayed inline: the cell holds the shape the
+       object has now and the shape it gets (the holder), the new slot's offset, and
+       the epoch stamp that says no prototype interceptor has appeared. Taken only when
+       the new shape fits the slots the object has (no growth), the object is extensible
+       and not exotic or watched; the old shape is dropped by count and only while another
+       reference holds it, so nothing is freed here. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) int "
+        "q2_put_add(JSContext *ctx, const void *pic, void *const *holders,\n"
+        "                                  uint32_t ns, JSValue recv, int site, JSValue v)\n"
+        "{\n"
+        "  unsigned char *obj; const unsigned char *e; unsigned char *osh, *nsh;\n"
+        "  uint16_t fl; int npsz; JSValue *slot;\n"
+        "  if (pic == NULL || (unsigned)site == QJS_AOT_REG_IC_NONE) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
+        "  obj = (unsigned char *)JS_VALUE_GET_PTR(recv);\n"
+        "  e = (const unsigned char *)pic + (size_t)(ns + (uint32_t)site) * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "  osh = *(unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+        "  if (*(unsigned char *const *)e != osh) return 0;\n"
+        "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) != QJS_AOT_REG_PIC_ADD_W) return 0;\n"
+        "  fl = *(const uint16_t *)(obj + QJS_AOT_OFF_JSOBJECT_FLAGS16);\n"
+        "  if ((fl & (QJS_AOT_JSOBJECT_EXTENSIBLE_MASK | QJS_AOT_JSOBJECT_NOADD_MASK)) !=\n"
+        "      QJS_AOT_JSOBJECT_EXTENSIBLE_MASK) return 0;\n"
+        "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_MISSES) !=\n"
+        "      (uint16_t)*(const uint32_t *)(*(const unsigned char *const *)((const unsigned char *)ctx +\n"
+        "          QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_IC_EPOCH)) return 0;\n"
+        "  nsh = (unsigned char *)holders[ns + (uint32_t)site];\n"
+        "  npsz = *(const int *)(nsh + QJS_AOT_OFF_JSSHAPE_PROP_SIZE);\n"
+        "  if (npsz != *(const int *)(osh + QJS_AOT_OFF_JSSHAPE_PROP_SIZE) &&\n"
+        "      (unsigned)npsz > ((fl & QJS_AOT_JSOBJECT_INLINE_CAP_MASK) >> QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT)) return 0;\n"
+        "  if (*(const int *)(osh - QJS_AOT_RC_BACK) <= 1) return 0;\n"
+        "  slot = (JSValue *)(*(unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
+        "      *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
+        "  ++*(int *)(nsh - QJS_AOT_RC_BACK);\n"
+        "  *(unsigned char **)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE) = nsh;\n"
+        "  --*(int *)(osh - QJS_AOT_RC_BACK);\n"
+        "  q2_dup(v);\n"
+        "  *slot = v;\n"
+        "  return 1;\n"
+        "}\n");
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int "
