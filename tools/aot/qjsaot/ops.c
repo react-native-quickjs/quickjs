@@ -4437,8 +4437,9 @@ static int emit_typed_elem_read(
   fprintf(f, "    { JSValue _e;\n");
   fprintf(
       f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_elem_hit(v%u, %s, &_e), 1)) {\n",
-      (unsigned)av, kb);
+      "      if (__builtin_expect(!Q2_FORCE_MISS && (q2_elem_hit(v%u, %s, &_e) ||\n"
+      "          q2_str_elem(ctx, v%u, %s, &_e)), 1)) {\n",
+      (unsigned)av, kb, (unsigned)av, kb);
   if (t->lb[dv] == E_LB_TAG) {
     fprintf(f, "        v%u = _e;\n", (unsigned)dv);
   } else {
@@ -4779,7 +4780,16 @@ static int emit_intrinsic_call(
         f,
         "      if (__builtin_expect(!q2_intr_str(ctx, %d, %s, %s, &_o), 0)) goto vx_%d;\n",
         id, rexp, a0, in->pc);
-  else
+  else if (na == 3 && (id == QJS_AOT_INTR_MIN || id == QJS_AOT_INTR_MAX)) {
+    /* min(a, b, c) is min(min(a, b), c), NaN and the sign of zero included. */
+    char a2[128];
+    intr_num(a2, sizeof(a2), fn, t, cur, in->win_reg + 2);
+    fprintf(
+        f,
+        "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o) ||\n"
+        "          !q2_intr(%d, q2_numv(_o), %s, &_o), 0)) goto vx_%d;\n",
+        id, a0, a1, id, a2, in->pc);
+  } else
     fprintf(
         f,
         "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o), 0)) goto vx_%d;\n",
@@ -8323,6 +8333,14 @@ static int emit_typed_branch(
             (unsigned)av, (unsigned)av, (unsigned)bv, (unsigned)bv, (unsigned)av,
             (unsigned)av, (unsigned)av, cop, (unsigned)bv, (unsigned)bv,
             (unsigned)bv);
+        if (base == REG_BIN_EQ || base == REG_BIN_NEQ || base == REG_BIN_STRICT_EQ ||
+            base == REG_BIN_STRICT_NEQ)
+          fprintf(
+              f,
+              "    else if (q2_str_eq(v%u, v%u, &c_))\n"
+              "        c_ = %sc_;\n",
+              (unsigned)av, (unsigned)bv,
+              (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ) ? "!" : "");
         if (e_term_wrappable(fn, in, role, blk)) {
           fprintf(f, "    else {\n");
           e_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
