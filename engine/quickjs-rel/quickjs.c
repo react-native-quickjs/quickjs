@@ -25570,6 +25570,11 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
 #define REGVM_LIGHT_PREFIX_SLOTS 9
 #define REGVM_LIGHT_PREFIX_BYTES (REGVM_LIGHT_PREFIX_SLOTS * 16)
 
+/* A record in the arena that a compiled body runs on, entered from C: `aot_anchor` is the
+   C stack address it was entered at, so a backtrace can order it among the compiled
+   frames that live on the C stack. */
+#define REGVM_FLAG_AOT_REC (1 << 14)
+
 typedef struct JSRegRun {
     /* ---- light header prefix (must stay first, in this order) ---- */
     /* The frame record. Unconditional, so the return handler compiles in every
@@ -25643,6 +25648,8 @@ typedef struct JSRegRun {
        js_regvm_execute, which starts the threaded dispatch there. */
     uint32_t deopt_pc;
 #endif
+    /* The C stack address a record run by aot_call_record was entered at. */
+    uintptr_t aot_anchor;
 } JSRegRun;
 
 /* `hdr_pack` is composed by explicit shifts, which assumes the four narrow
@@ -26213,6 +26220,7 @@ static int regvm_merge_fl_records(JSRuntime *rt, JSRegBtFrame *bt, uintptr_t *an
 }
 #endif
 
+static JSRegRun *regvm_rec_of_sf(JSRuntime *rt, JSStackFrame *sf);
 static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
 {
     JSRegDebugIter it;
@@ -26251,6 +26259,14 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
                 bt[nb].rpc = regvm_frame_pc(rt, sf, fb);
             bt[nb].sf = sf;
             anc[nb] = regvm_on_c_stack(rt, (uintptr_t)sf) ? (uintptr_t)sf : 0;
+#if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
+            if (anc[nb] == 0) {
+                JSRegRun *ar = regvm_rec_of_sf(rt, sf);
+
+                if (ar != NULL && (ar->flags & REGVM_FLAG_AOT_REC))
+                    anc[nb] = ar->aot_anchor;
+            }
+#endif
         }
         nb++;
     }
@@ -37953,6 +37969,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
 
 #endif /* QJS_REGVM */
 
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+static int aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
+                           JSValueConst this_obj, int argc, JSValueConst *argv, JSValue *out);
+#endif
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -38084,7 +38104,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        entry builds the light frame on the C stack, so the call needs neither a stack frame
        nor the interpreter's activation. The arguments are used in place, which the
        callee only does when it never writes them. */
-    if (b->aot_nfn != NULL && flags == JS_CALL_FLAG_COPY_ARGV && b->argv_safe &&
+    if (b->aot_nfn != NULL && (flags & ~JS_CALL_FLAG_COPY_ARGV) == 0 && b->argv_safe &&
         !b->args_captured && argc >= b->arg_count && b->func_kind == JS_FUNC_NORMAL &&
         !b->is_lazy && JS_IsUndefined(new_target)) {
         JSAotRun *ar = rt->aot_run;
@@ -38093,6 +38113,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))
             return ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
                                           (JSValue *)argv, argc);
+    }
+    /* A compiled function with no native entry because its frame needs the record's
+       tail (it reads `arguments`, the new target, the home object): the interpreter's
+       own record frame, here on the C stack, runs the compiled body without the
+       activation JS_CallInternal and js_regvm_execute would build. */
+    if (b->aot_fn != NULL && b->aot_nfn == NULL && b->aot_call_ready &&
+        (flags & ~JS_CALL_FLAG_COPY_ARGV) == 0 && b->func_kind == JS_FUNC_NORMAL && !b->is_lazy &&
+        b->regvm_ctl_count == 0 && JS_IsUndefined(new_target)) {
+        JSAotRun *ar = rt->aot_run;
+
+        if (likely(ar == NULL || ar->disabled == NULL ||
+                   !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1))) {
+            JSValue out;
+            int r = aot_call_record(caller_ctx, p, b, this_obj, argc, argv, &out);
+
+            if (r != 0)
+                return r < 0 ? JS_EXCEPTION : out;
+        }
     }
 #endif
 
@@ -63590,6 +63628,71 @@ aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
     *out = ret;
     return JS_IsException(ret) ? -1 : 1;
 }
+
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+/* Run a compiled function that needs a record frame, on a record in the interpreter's
+   frame arena: the same allocation and fill the interpreter's record call does, so every
+   handler and cold arm sees the frame it expects (and `regvm_rec_of_sf` finds it). The
+   record is an entry record (no caller), so a return or a throw leaves to here, and a
+   deopt resumes the threaded interpreter on it. The function has no control records (a
+   try keeps the full activation). Returns 1 with an owned *out, -1 on exception, 0 when
+   there is no arena room (the caller takes the full activation). */
+static __attribute__((noinline)) int
+aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
+                JSValueConst this_obj, int argc, JSValueConst *argv, JSValue *out)
+{
+    JSRuntime *rt = caller_ctx->rt;
+    JSRegRecordLayout lay;
+    JSRegRun *rec;
+    JSStackFrame *sf;
+    JSValue ret;
+    int slots = regvm_args_borrowable(cb, argc) ? 0
+        : (argc > cb->arg_count ? argc : cb->arg_count);
+
+    /* the C stack the compiled body and its callees will use, as JS_CallInternal checks */
+    if (js_check_stack_overflow(rt, sizeof(JSValue) * (size_t)(cb->var_count +
+                                    cb->regvm_reg_count + REGVM_HS) + 1024)) {
+        JS_ThrowStackOverflow(caller_ctx);
+        return -1;
+    }
+    if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+        && regvm_pic_ensure(rt, cb) == NULL) {
+        JS_ThrowOutOfMemory(caller_ctx);
+        return -1;
+    }
+    regvm_light_seal(rt, rt->regvm_cur);
+    if (unlikely(regvm_record_alloc(rt, cb, slots, &lay) != 0))
+        return 0;
+    regvm_record_fill(rt, &lay, JS_MKPTR(JS_TAG_OBJECT, co), co, cb, NULL, 0, NULL,
+                      this_obj, argv, argc, slots);
+    rec = lay.rec;
+    sf = lay.sf;
+    rec->caller_ctx = caller_ctx;
+    rec->ctx = cb->realm;
+    rec->flags |= REGVM_FLAG_AOT_REC;
+    rec->aot_anchor = (uintptr_t)__builtin_frame_address(0);
+    rec->deopt_pc = QJS_AOT_NO_DEOPT;
+    rec->resume_marker = NULL;
+    js_aot_enter_count++;
+    ret = ((JSAotFn)cb->aot_fn)(cb->realm, rec, rec->fr, 0);
+    if (unlikely(rec->deopt_pc != QJS_AOT_NO_DEOPT)) {
+        uint32_t pc = rec->deopt_pc;
+
+        rec->deopt_pc = QJS_AOT_NO_DEOPT;
+        regvm_t_dispatch(cb->regvm_code + pc, rec->fr, rec, cb->realm);
+        ret = rec->ret;
+    }
+    if (JS_IsException(ret) && needs_backtrace(rt->current_exception)) {
+        sf->cur_pc = NULL;
+        build_backtrace(cb->realm, rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+    }
+    rt->regvm_cur = sf->rv_light;
+    rt->current_stack_frame = sf->prev_frame;
+    regvm_record_release(rt, rec);
+    *out = ret;
+    return JS_IsException(ret) ? -1 : 1;
+}
+#endif
 
 int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
                         JSValue callee, JSValue this_obj, JSValue *argv,
