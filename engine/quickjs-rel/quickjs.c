@@ -63793,6 +63793,30 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
         *out = js_number(((double (*)(double, double))e->cfn)(d1, d2));
         return 1;
     }
+    if (e->cproto == JS_CFUNC_generic_magic && e->cfn == (void *)js_array_push &&
+        e->magic == 0 && na == 1 && JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
+        /* The callee is identity-bound to the builtin: `p` is a C function whose pointer is
+           js_array_push (a replaced Array.prototype.push, a JS function or an own `push`
+           never reaches here with this pointer and magic).
+           `array.push(x)` on a dense array with the standard prototype: the builtin's
+           own fast path, which runs no JS, so it needs neither the native frame nor the
+           padded argument list. Any other receiver takes the full call below. */
+        JSObject *ap = JS_VALUE_GET_OBJ(this_obj);
+
+        if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array && ap->extensible &&
+                   ap->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
+                   ctx->std_array_prototype && p->u.cfunc.realm == ctx &&
+                   JS_VALUE_GET_TAG(ap->prop[0].u.value) == JS_TAG_INT &&
+                   (get_shape_prop(ap->shape)->flags & JS_PROP_WRITABLE) &&
+                   (uint32_t)JS_VALUE_GET_INT(ap->prop[0].u.value) == ap->u.array.count)) {
+            JSValue rv = js_array_push(ctx, this_obj, 1, argv, 0);
+
+            if (JS_IsException(rv))
+                return -1;
+            *out = rv;
+            return 1;
+        }
+    }
     if (e->cproto == JS_CFUNC_generic || e->cproto == JS_CFUNC_generic_magic) {
         JSValue rv;
 #ifdef AOT_MUT_NO_ARG_PAD

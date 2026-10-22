@@ -1,0 +1,48 @@
+Subject: Call the built-in push on a dense array without the native frame
+
+What this does
+  - `qjs_aot_call_c` recognises `Array.prototype.push` with one argument on a dense extensible
+    array that has the standard prototype and a writable integer length, and runs the builtin's
+    own fast path directly (`js_array_push`) instead of `js_call_c_function`. Every other
+    receiver (a frozen or non-extensible array, a subclass, a Proxy, holes in the length, an
+    array-like) takes the full call as before.
+
+Why we need it
+  `c.push(x)` in a compiled loop paid the native call's stack frame, stack check and argument
+  padding on every call: 17 percent of an edit-distance loop (js_call_c_function plus the
+  site lookup), for a builtin whose fast path runs no JS and cannot throw except on
+  out-of-memory.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63793,6 +63793,30 @@
+         *out = js_number(((double (*)(double, double))e->cfn)(d1, d2));
+         return 1;
+     }
++    if (e->cproto == JS_CFUNC_generic_magic && e->cfn == (void *)js_array_push &&
++        e->magic == 0 && na == 1 && JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
++        /* The callee is identity-bound to the builtin: `p` is a C function whose pointer is
++           js_array_push (a replaced Array.prototype.push, a JS function or an own `push`
++           never reaches here with this pointer and magic).
++           `array.push(x)` on a dense array with the standard prototype: the builtin's
++           own fast path, which runs no JS, so it needs neither the native frame nor the
++           padded argument list. Any other receiver takes the full call below. */
++        JSObject *ap = JS_VALUE_GET_OBJ(this_obj);
++
++        if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array && ap->extensible &&
++                   ap->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
++                   ctx->std_array_prototype && p->u.cfunc.realm == ctx &&
++                   JS_VALUE_GET_TAG(ap->prop[0].u.value) == JS_TAG_INT &&
++                   (get_shape_prop(ap->shape)->flags & JS_PROP_WRITABLE) &&
++                   (uint32_t)JS_VALUE_GET_INT(ap->prop[0].u.value) == ap->u.array.count)) {
++            JSValue rv = js_array_push(ctx, this_obj, 1, argv, 0);
++
++            if (JS_IsException(rv))
++                return -1;
++            *out = rv;
++            return 1;
++        }
++    }
+     if (e->cproto == JS_CFUNC_generic || e->cproto == JS_CFUNC_generic_magic) {
+         JSValue rv;
+ #ifdef AOT_MUT_NO_ARG_PAD

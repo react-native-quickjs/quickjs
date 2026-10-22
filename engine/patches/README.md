@@ -422,3 +422,4 @@ bump while `9999` is missing.
 | `0334` | Enters a compiled function called from C through its native entry | A builtin calling a compiled callback paid the interpreter activation per call | `JS_CallInternal` fast head | No. |
 | `0335` | Exposes what compiled code needs to replay a cached add-transition store inline | A constructor setting its fields called into the engine per property | layout: epoch stamp, flag word, runtime epoch | Yes (layout hash). |
 | `0336` | Lets a compiled `new` teach the constructor its instance capacity | Constructors reached only through compiled `new` grew their property array on every construction | `qjs_aot_construct_done` | No. |
+| `0337` | Calls the built-in push on a dense array without the native frame | `c.push(x)` paid a native frame, stack check and argument padding per call | `qjs_aot_call_c` special case | No. |
