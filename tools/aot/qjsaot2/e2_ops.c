@@ -2486,6 +2486,32 @@ static int e2_must_exit(const Q2Func *fn, const Q2Insn *in) {
   return g_e2_facts != NULL && g_e2_facts->miss_exits[e2_insn_idx(fn, in)];
 }
 
+/* Whether an access that SKIPS its shape test (so relies on the entry check of group
+   `g` still holding) can run after `in`: one later in the code, or any at all when `in`
+   sits in a loop. An access that tests the cell itself needs no recheck before it, so
+   a call whose group is never relied on afterwards can change the cell freely. */
+static int e2_group_relied_on_after(const Q2Func *fn, const Q2Insn *in, int g) {
+  int k, here = (int)(in - fn->insns);
+  int in_loop = 0, b, si;
+  /* Loop membership comes from the function itself, not from the frameless trial's
+     tables, which are only set up when that trial runs. */
+  for (b = 0; b < fn->nblocks && !in_loop; b++)
+    for (si = 0; si < fn->blocks[b].nsucc && si < 2; si++) {
+      int sb = fn->blocks[b].succ_block[si];
+      if (sb >= 0 && sb < fn->nblocks && q2_is_back_edge(fn, b, sb) && g_e2_blk >= sb &&
+          g_e2_blk <= b)
+        in_loop = 1;
+    }
+  if (g_e2_facts->skip == NULL) return 1;
+  for (k = 0; k < g_e2_facts->nsites; k++) {
+    const E2SiteInfo *si = &g_e2_facts->sites[k];
+    if (si->group != g || si->insn < 0 || si->insn >= g_e2_facts->ninsns) continue;
+    if (!g_e2_facts->skip[si->insn]) continue;
+    if (in_loop || si->insn > here) return 1;
+  }
+  return 0;
+}
+
 /* After a safepoint (an op call, a call): a group whose cell no longer holds
    the shape taken at entry has been refilled, so the speculation about it is
    over. Exit at the next instruction, with the op's results already in the
@@ -2497,6 +2523,7 @@ static void e2_emit_group_recheck(
   if (g_e2_facts == NULL) return;
   for (g = 0; g < g_e2_facts->ngroups; g++) {
     if (g_e2_group_used == NULL || !g_e2_group_used[g]) continue;
+    if (!e2_group_relied_on_after(fn, in, g)) continue;
     e2_note_stub(
         g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
     e2_sweep_guard(f, "dx", in->next);
@@ -8684,7 +8711,10 @@ static void e2_fl_loop_setup(const Q2Func *fn) {
           c = qjs_aot_prof_pc_count(g->digest, ii->pc);
           if (c > hdr) hdr = c;
         }
-        if (entries == 0 || hdr > 16 * entries) g_e2_fl_longloop = 1;
+        /* A loop is long past 16 iterations per entry. Profile counts for a kernel near
+           16 move with every re-profile, so the 12..20 band is decided on the safe
+           (long) side and only a loop clearly below it is short. */
+        if (entries == 0 || hdr > 12 * entries) g_e2_fl_longloop = 1;
       }
     }
     if (e2_fl_loops()) g_e2_fl_longloop = 0;
