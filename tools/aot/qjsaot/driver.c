@@ -123,8 +123,8 @@ static int hex_to_bytes16(const char *s, uint8_t out[16]) {
 #define PT_OTHER 0x80u
 #define PT_ARITH (PT_FLOAT | PT_INT)
 
-#include "qjsaot2/e2.h"
-#include "qjsaot2/prof.h"
+#include "emit.h"
+#include "prof.h"
 
 typedef struct {
   int pc;
@@ -165,7 +165,7 @@ typedef struct {
 
 /* A `P` record: the type set of every register the instruction at `pc` writes,
    the same one record shared by the two destinations of a fused op. Its shape
-   lives in qjsaot2/prof.h so the IR reads the same struct. */
+   lives in qjsaot/prof.h so the IR reads the same struct. */
 
 /* An `S` record: the shapes one property site's inline cache saw. Shape values
    are addresses from the profiling process; they only say "the same shape as
@@ -989,7 +989,7 @@ int qjs_aot_check_locals(void) {
 }
 
 /* The `P` records of the function with this digest, sorted by pc, or NULL.
-   `*n` receives the count. The `qjsaot2` IR reads a definition's profile from
+   `*n` receives the count. The `qjsaot` IR reads a definition's profile from
    the record at its defining instruction's pc. */
 const ProfPc *qjs_aot_prof_pcs(const uint8_t dg[16], int *n) {
   const ProfEntry *e;
@@ -1279,7 +1279,7 @@ typedef struct {
   size_t len;
 } EmitBuf;
 
-/* The inline forms (`e2i_HEX`) of the unit's small leaves, by unit index (card E15). */
+/* The inline forms (`ei_HEX`) of the unit's small leaves, by unit index (card E15). */
 static EmitBuf *g_inl_eb;
 static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
 
@@ -1287,11 +1287,11 @@ static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
    only name an `aot_n_` that some body in this unit defines, and a unit built
    with `--emit2-only` emits the *other* functions with the old emitter, which
    emits no native entry. Keyed by unit index. */
-static uint8_t *g_e2_native;
+static uint8_t *g_e_native;
 
 /* The E2 emitter's hook, so the unit builder knows which bodies it produced. */
 void qjs_aot_note_native_entry(int index) {
-  if (g_e2_native && index >= 0) g_e2_native[index] = 1;
+  if (g_e_native && index >= 0) g_e_native[index] = 1;
 }
 
 /* The unit index of the function being emitted, for the hook above. */
@@ -1300,7 +1300,7 @@ int qjs_aot_cur_func_idx(void) {
 }
 
 int qjs_aot_has_native_entry(int index) {
-  return g_e2_native && index >= 0 ? g_e2_native[index] : 0;
+  return g_e_native && index >= 0 ? g_e_native[index] : 0;
 }
 
 /* Whether the unit function with this digest has an inline form a caller can run
@@ -1429,9 +1429,9 @@ int qjsaot_driver_main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--check-locals") == 0) {
       g_check_locals = 1;
     } else if (strcmp(argv[i], "--nocall") == 0) {
-      e2_set_nocall(1);
+      e_set_nocall(1);
     } else if (strcmp(argv[i], "--poison") == 0) {
-      e2_set_poison(1);
+      e_set_poison(1);
     } else if (strcmp(argv[i], "--split") == 0 && i + 1 < argc) {
       split_dir = argv[++i];
     } else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
@@ -1571,14 +1571,14 @@ int qjsaot_driver_main(int argc, char **argv) {
 
     g_unit_funcs = funcs;
     g_unit_nfuncs = nfuncs;
-    g_e2_native = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
+    g_e_native = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     /* The bodies are emitted into memory buffers before the output file is
      opened, so the linkage decision has to be made before that: a split unit
      gives every compiled function hidden external linkage so the parts can
      call each other. */
-  if (split_dir != NULL) e2_set_split(1);
-  e2_roles_check();
-    e2_report_open(g_emit2_report);
+  if (split_dir != NULL) e_set_split(1);
+  e_roles_check();
+    e_report_open(g_emit2_report);
     /* The inline forms first: a caller asks whether its callee has one while its own
        body is emitted. */
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
@@ -1595,10 +1595,10 @@ int qjsaot_driver_main(int argc, char **argv) {
       g_cur_func_idx = i;
       mf = open_memstream(&g_inl_eb[i].buf, &g_inl_eb[i].len);
       if (!mf) continue;
-      ok = e2_emit_inline_func(mf, &funcs[i], hex, why, sizeof(why));
+      ok = e_emit_inline_func(mf, &funcs[i], hex, why, sizeof(why));
       fclose(mf);
-      e2_report_inline(hex, ok, why);
-      if (ok && g_inl_nx) g_inl_nx[i] = (uint8_t)e2_inline_used_nx();
+      e_report_inline(hex, ok, why);
+      if (ok && g_inl_nx) g_inl_nx[i] = (uint8_t)e_inline_used_nx();
       if (!ok) {
         free(g_inl_eb[i].buf);
         g_inl_eb[i].buf = NULL;
@@ -1622,7 +1622,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         fails++;
         continue;
       }
-      ninsn = e2_emit_body(mf, &funcs[i], hex);
+      ninsn = e_emit_body(mf, &funcs[i], hex);
       fclose(mf);
       if (ninsn < 0) {
         fprintf(
@@ -1637,7 +1637,7 @@ int qjsaot_driver_main(int argc, char **argv) {
       total_insns += ninsn;
       uniq[nuniq++] = i;
     }
-    e2_report_close();
+    e_report_close();
 
     /* --- selection --- */
     if (all || !profile || g_nprof == 0) {
@@ -1977,9 +1977,9 @@ int qjsaot_driver_main(int argc, char **argv) {
        weak, so a unit without the section still links. */
     fprintf(
         f,
-        "#define E2_TEXT __attribute__((section(\"e2text\")))\n"
-        "extern char __start_e2text[] __attribute__((weak));\n"
-        "extern char __stop_e2text[] __attribute__((weak));\n");
+        "#define E_TEXT __attribute__((section(\"aottext\")))\n"
+        "extern char __start_aottext[] __attribute__((weak));\n"
+        "extern char __stop_aottext[] __attribute__((weak));\n");
     /* Unconditional: the A/B switch reads the environment, and a unit that is
        compiled without the debug checks still has to do that. */
     fprintf(f, "#include <stdlib.h>\n");
@@ -1988,7 +1988,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     /* The unit's function count, so the D4 counter arrays are sized exactly
        rather than to a guessed bound. In a split unit this text is the shared
        header, and the arrays are declared there and defined once in reg.c. */
-    fprintf(f, "#define QJS_AOT_E2_NFUNCS %uu\n",
+    fprintf(f, "#define QJS_AOT_NFUNCS %uu\n",
             nfuncs > 0 ? (unsigned)nfuncs : 1u);
     /* The function names, indexed the same way as the D4 counter arrays, so the
        teardown line can print one row per function and a test can assert on one
@@ -1996,9 +1996,9 @@ int qjsaot_driver_main(int argc, char **argv) {
     {
       int ni;
       if (split_dir != NULL) {
-        fprintf(f, "extern const char *const qjs_aot_e2_names[];\n");
+        fprintf(f, "extern const char *const qjs_aot_e_names[];\n");
       } else {
-        fprintf(f, "static const char *const qjs_aot_e2_names[] = {\n");
+        fprintf(f, "static const char *const qjs_aot_e_names[] = {\n");
         for (ni = 0; ni < nfuncs; ni++)
           fprintf(f, "  \"%s\",\n", funcs[ni].name[0] ? funcs[ni].name : "?");
         if (nfuncs == 0) fprintf(f, "  \"?\",\n");
@@ -2035,9 +2035,9 @@ int qjsaot_driver_main(int argc, char **argv) {
            chain is disabled (see q2_poly_site): with it, DeltaBlue's compiled
            body reported a constraint cycle the interpreter does not. */
         "static int q2_no_spec, q2_spec_on;\n"
-        /* E2 unit counters (D14 part 2). `e2_g8_hits` counts a dispatch to a
+        /* E2 unit counters (D14 part 2). `e_g8_hits` counts a dispatch to a
            pc that is not an instruction start; it must stay 0. */
-        "static unsigned long e2_g8_hits;\n"
+        "static unsigned long e_g8_hits;\n"
         /* The D4 switch-off counters, exactly one entry per function in the
            table. A function whose speculative body keeps exiting, or keeps
            refusing at entry, is switched off for good and its calls go straight
@@ -2049,140 +2049,140 @@ int qjsaot_driver_main(int argc, char **argv) {
            own copy and its own counters. */
 
         "#ifdef QJS_AOT_SPLIT_UNIT\n"
-        "extern uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint8_t e2_nfl[QJS_AOT_E2_NFUNCS], e2_dis[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint64_t e2_inl[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint32_t e2_inx[QJS_AOT_E2_NFUNCS];\n"
-        "extern uint8_t e2_ioff[QJS_AOT_E2_NFUNCS];\n"
+        "extern uint64_t e_ent[QJS_AOT_NFUNCS];\n"
+        "extern uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
+        "extern uint8_t e_off[QJS_AOT_NFUNCS];\n"
+        "extern uint32_t e_han[QJS_AOT_NFUNCS];\n"
+        "extern uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
+        "extern uint64_t e_inl[QJS_AOT_NFUNCS];\n"
+        "extern uint32_t e_inx[QJS_AOT_NFUNCS];\n"
+        "extern uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
         "#else\n"
-        "static uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
-        "static uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
-        "static uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
-        "static uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
-        "static uint8_t e2_nfl[QJS_AOT_E2_NFUNCS], e2_dis[QJS_AOT_E2_NFUNCS];\n"
-        "static uint64_t e2_inl[QJS_AOT_E2_NFUNCS];\n"
-        "static uint32_t e2_inx[QJS_AOT_E2_NFUNCS];\n"
-        "static uint8_t e2_ioff[QJS_AOT_E2_NFUNCS];\n"
+        "static uint64_t e_ent[QJS_AOT_NFUNCS];\n"
+        "static uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
+        "static uint8_t e_off[QJS_AOT_NFUNCS];\n"
+        "static uint32_t e_han[QJS_AOT_NFUNCS];\n"
+        "static uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
+        "static uint64_t e_inl[QJS_AOT_NFUNCS];\n"
+        "static uint32_t e_inx[QJS_AOT_NFUNCS];\n"
+        "static uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
         "/* How many times the speculative bodies have been entered. A case that\n"
         "   means to exercise a spec path asserts this is non-zero: a body that is\n"
         "   never entered passes every check for the wrong reason, which is how\n"
         "   the entry-refusal bug survived a whole step. */\n"
-        "unsigned long long qjs_aot_e2_enters(void)\n"
+        "unsigned long long qjs_aot_e_enters(void)\n"
         "{\n"
         "  unsigned long long t = 0;\n"
         "  int i;\n"
-        "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) t += e2_ent[i];\n"
+        "  for (i = 0; i < QJS_AOT_NFUNCS; i++) t += e_ent[i];\n"
         "  return t;\n"
         "}\n"
-        "/* With QJS_AOT_E2_STATS=1 in the environment, print the E2 counters at\n"
+        "/* With QJS_AOT_UNIT_STATS=1 in the environment, print the E2 counters at\n"
         "   teardown so a test can prove the speculative body actually ran. Without\n"
         "   it a case that means to exercise a spec path passes even when the body\n"
         "   is never entered -- which is exactly how the entry-refusal bug survived\n"
         "   a whole step. */\n"
         "#ifdef QJS_AOT_SPLIT_UNIT\n"
-        "void e2_stats_dump(void);\n"
+        "void e_stats_dump(void);\n"
         "#else\n"
-        "static void __attribute__((destructor)) e2_stats_dump(void)\n"
+        "static void __attribute__((destructor)) e_stats_dump(void)\n"
         "{\n"
         "  unsigned long long en = 0, ex = 0, rf = 0, off = 0, hn = 0, fl = 0, il = 0;\n"
-        "  const char *e = getenv(\"QJS_AOT_E2_STATS\");\n"
+        "  const char *e = getenv(\"QJS_AOT_UNIT_STATS\");\n"
         "  int i;\n"
         "  if (e == NULL || e[0] != '1') return;\n"
-        "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
-        "    en += e2_ent[i]; ex += e2_exi[i]; rf += e2_ref[i]; off += e2_off[i];\n"
-        "    hn += e2_han[i]; il += e2_inl[i]; if (e2_nfl[i]) fl += e2_ent[i];\n"
+        "  for (i = 0; i < QJS_AOT_NFUNCS; i++) {\n"
+        "    en += e_ent[i]; ex += e_exi[i]; rf += e_ref[i]; off += e_off[i];\n"
+        "    hn += e_han[i]; il += e_inl[i]; if (e_nfl[i]) fl += e_ent[i];\n"
         "  }\n"
-        "  fprintf(stderr, \"e2-stats enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%llu frameless=%%llu inlined=%%llu\\n\",\n"
+        "  fprintf(stderr, \"unit-stats enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%llu frameless=%%llu inlined=%%llu\\n\",\n"
         "          en, ex, hn, rf, off, fl, il);\n"
         /* Per function too, so the single unit answers the same question the split
            unit's reg.c does. A hand-off is CORRECT, merely slower, so a fix that
            only makes things faster can ONLY be tested by counting one function. */
-        "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
-        "    if (e2_ent[i] == 0 && e2_ref[i] == 0) continue;\n"
-        "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d frameless=%%llu inlined=%%llu\\n\",\n"
-        "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
-        "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
-        "            (unsigned long long)e2_han[i], (unsigned long long)e2_ref[i],\n"
-        "            (unsigned)e2_off[i], i, e2_nfl[i] ? (unsigned long long)e2_ent[i] : 0ull,\n            (unsigned long long)e2_inl[i]);\n"
+        "  for (i = 0; i < QJS_AOT_NFUNCS; i++) {\n"
+        "    if (e_ent[i] == 0 && e_ref[i] == 0) continue;\n"
+        "    fprintf(stderr, \"unit-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d frameless=%%llu inlined=%%llu\\n\",\n"
+        "            qjs_aot_e_names[i] ? qjs_aot_e_names[i] : \"?\",\n"
+        "            (unsigned long long)e_ent[i], (unsigned long long)e_exi[i],\n"
+        "            (unsigned long long)e_han[i], (unsigned long long)e_ref[i],\n"
+        "            (unsigned)e_off[i], i, e_nfl[i] ? (unsigned long long)e_ent[i] : 0ull,\n            (unsigned long long)e_inl[i]);\n"
         "  }\n"
         "}\n"
         "#endif\n"
         "#endif\n"
         /* What a frameless body hands its exit function: where to resume, which
            registers to restore from `lv` (at the frame offsets in `offs`), the
-           arguments' count, and for QJS_AOT_E2_EXIT_LOG the guard that failed. One
+           arguments' count, and for QJS_AOT_EXIT_LOG the guard that failed. One
            pointer, so the exit is a call with no more arguments than the entry. */
-        "typedef struct E2Nx {\n"
+        "typedef struct ENx {\n"
         "  int pc, tag;\n"
         "  const char *kind;\n"
         "  const JSValue *lv;\n"
         "  const uint16_t *offs;\n"
         "  int n, argc;\n"
-        "} E2Nx;\n"
-        "#define E2_ENTER_NOTE(fi) (e2_ent[fi]++)\n"
-        "#define E2_INL_NOTE(fi) (e2_inl[fi]++)\n"
+        "} ENx;\n"
+        "#define E_ENTER_NOTE(fi) (e_ent[fi]++)\n"
+        "#define E_INL_NOTE(fi) (e_inl[fi]++)\n"
         /* An inline body that cannot run (its nested callee is another function than
            the profiled one, say) leaves with nothing done and the native call takes
            over; that is not a failed speculation, so it does not count toward
            switching the function off, but a body that does it on more than 1/16 of
            its attempts stops being tried. */
-        "#define E2_INL_EXIT_NOTE(fi) do { if (++e2_inx[fi] > 256 && \\\n"
-        "    (uint64_t)e2_inx[fi] * 16 > e2_inl[fi] + e2_inx[fi]) e2_ioff[fi] = 1; } while (0)\n"
-        /* A frameless function marks itself at load (e2_nfl), so its entries
+        "#define E_INL_EXIT_NOTE(fi) do { if (++e_inx[fi] > 256 && \\\n"
+        "    (uint64_t)e_inx[fi] * 16 > e_inl[fi] + e_inx[fi]) e_ioff[fi] = 1; } while (0)\n"
+        /* A frameless function marks itself at load (e_nfl), so its entries
            are counted by the one counter every spec body bumps. */
         "/* More than 256 exits and in more than 1/16 of the calls: the guards do\n"
         "   not match the data this function sees. */\n"
-        /* QJS_AOT_E2_EXIT_LOG=1: the first time each guard stub is taken, one
+        /* QJS_AOT_EXIT_LOG=1: the first time each guard stub is taken, one
            line naming it and the tag its guard saw (-100 where there is no
            value: an overflow exit, or a stub whose guard named none). Read
            once; one load and a branch when off. The work is out of line: at
            -O0 every inline copy took its own stack slots, and the stubs of a big
            function grew its frame enough to overflow earleyboyer's recursion. */
-        "static int e2_exit_log_v = -1;\n"
+        "static int e_exit_log_v = -1;\n"
         /* preserve_most: the call preserves every register, so a body that
            reaches it in an exit does not give up its caller-saved registers (and
            push seven callee-saved ones in its prologue) for a log nobody asked for. */
         "static void __attribute__((noinline, cold, unused, preserve_most))\n"
-        "e2_exit_log(const char *hex, const char *kind, int pc, int tag, int *seen)\n"
+        "e_exit_log(const char *hex, const char *kind, int pc, int tag, int *seen)\n"
         "{\n"
-        "  if (e2_exit_log_v < 0) {\n"
-        "    const char *e_ = getenv(\"QJS_AOT_E2_EXIT_LOG\");\n"
-        "    e2_exit_log_v = e_ != NULL ? (e_[0] == '2' ? 2 : e_[0] == '1') : 0;\n"
+        "  if (e_exit_log_v < 0) {\n"
+        "    const char *e_ = getenv(\"QJS_AOT_EXIT_LOG\");\n"
+        "    e_exit_log_v = e_ != NULL ? (e_[0] == '2' ? 2 : e_[0] == '1') : 0;\n"
         "  }\n"
-        "  if (!e2_exit_log_v) return;\n"
-        "  *seen = e2_exit_log_v != 2;\n"
-        "  fprintf(stderr, \"e2-exit fn=%%s kind=%%s pc=%%d tag=%%d\\n\", hex, kind,\n"
+        "  if (!e_exit_log_v) return;\n"
+        "  *seen = e_exit_log_v != 2;\n"
+        "  fprintf(stderr, \"unit-exit fn=%%s kind=%%s pc=%%d tag=%%d\\n\", hex, kind,\n"
         "          pc, tag);\n"
         "}\n"
-        "#define E2_EXIT_LOG(hex, kind, pc, tag) do { static int e2_xl_; \\\n"
-        "    if (__builtin_expect(e2_exit_log_v != 0, 0) && !e2_xl_) \\\n"
-        "      e2_exit_log((hex), (kind), (pc), (int)(tag), &e2_xl_); } while (0)\n"
-        "#define E2_EXIT_NOTE(fi) do { if (++e2_exi[fi] > 256 && \\\n"
-        "    (uint64_t)e2_exi[fi] * 16 > e2_ent[fi]) e2_off[fi] = 1; } while (0)\n"
+        "#define E_EXIT_LOG(hex, kind, pc, tag) do { static int e_xl_; \\\n"
+        "    if (__builtin_expect(e_exit_log_v != 0, 0) && !e_xl_) \\\n"
+        "      e_exit_log((hex), (kind), (pc), (int)(tag), &e_xl_); } while (0)\n"
+        "#define E_EXIT_NOTE(fi) do { if (++e_exi[fi] > 256 && \\\n"
+        "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
         "   body does not lower yet (or at a terminator 2b has not reached). While\n"
         "   E8 is incomplete almost every function has one, so feeding those to\n"
         "   D4 switched every spec body off after 257 calls and every measurement\n"
         "   timed the generic body. They are counted, never acted on. */\n"
-        "#define E2_HANDOFF_NOTE(fi) (e2_han[fi]++)\n"
+        "#define E_HANDOFF_NOTE(fi) (e_han[fi]++)\n"
         "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
-        "#define E2_REFUSE_NOTE(fi) do { if (++e2_ref[fi] > 256 && \\\n"
-        "    (uint64_t)e2_ref[fi] * 2 > e2_ent[fi]) e2_off[fi] = 1; } while (0)\n"
+        "#define E_REFUSE_NOTE(fi) do { if (++e_ref[fi] > 256 && \\\n"
+        "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
         /* The D12 dynamic check, compiled into the unit only with -DE2_POISON.
            It compares every register an op call was not allowed to write
            against a copy taken before the call, by tag and then by kind, so a
            handler that writes a register it did not declare is caught at the
            site rather than as a wrong answer later. */
-        "#if defined(E2_POISON) && E2_POISON\n"
+        "#if defined(E_POISON) && E_POISON\n"
         "#include <stdio.h>\n"
         "#include <stdlib.h>\n"
         "/* Equal as values: the tag decides how the payload is compared, so "
         "a\n"
         "   NaN payload or a pointer is never memcmp'd (invariant 12). */\n"
-        "static int e2_same_value(JSValue a, JSValue b)\n"
+        "static int e_same_value(JSValue a, JSValue b)\n"
         "{\n"
         "  int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);\n"
         "  if (ta != tb) return 0;\n"
@@ -2204,20 +2204,20 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    return 1;\n"
         "  }\n"
         "}\n"
-        "#define E2_SENTINEL JS_MKVAL(JS_TAG_INT, 0x5e5e5e5e)\n"
-        "static long e2_poison_seen;\n"
-        "static void e2_poison_abort(const char *op, int pc, int reg,\n"
+        "#define E_SENTINEL JS_MKVAL(JS_TAG_INT, 0x5e5e5e5e)\n"
+        "static long e_poison_seen;\n"
+        "static void e_poison_abort(const char *op, int pc, int reg,\n"
         "                            JSValue got)\n"
         "{\n"
-        "  if (e2_poison_seen++ < 200) {\n"
+        "  if (e_poison_seen++ < 200) {\n"
         "    int tg = JS_VALUE_GET_TAG(got);\n"
-        "    fprintf(stderr, \"e2 poison: %%s pc %%d wrote r%%d (now tag %%d "
+        "    fprintf(stderr, \"poison: %%s pc %%d wrote r%%d (now tag %%d "
         "int %%d)\\n\",\n"
         "            op, pc, reg, tg, tg == JS_TAG_INT ? JS_VALUE_GET_INT(got) "
         ": -1);\n"
         "  }\n"
 
-        "#ifdef E2_POISON_QUIET\n"
+        "#ifdef E_POISON_QUIET\n"
         "  /* Report and keep going, so one run lists every disagreement. */\n"
         "  (void)op; (void)pc; (void)reg;\n"
         "#else\n"
@@ -2229,41 +2229,41 @@ int qjsaot_driver_main(int argc, char **argv) {
            for a register it may write. Only uncounted values are replaced: a
            register can be the only root of a counted one. The counters are
            printed at exit so a check that poisons nothing is visible. */
-        "static unsigned long e2_poison_calls, e2_poison_regs;\n"
-        "static __attribute__((noinline)) void e2_poison_pre(JSValue *fr, int "
+        "static unsigned long e_poison_calls, e_poison_regs;\n"
+        "static __attribute__((noinline)) void e_poison_pre(JSValue *fr, int "
         "n,\n"
         "    JSValue *copy, uint8_t *pz, const char *pm)\n"
         "{\n"
-        "  e2_poison_calls++;\n"
+        "  e_poison_calls++;\n"
         "  for (int r = 0; r < n; r++) {\n"
         "    copy[r] = AOT_REG(fr, r * 16);\n"
         "    pz[r] = 0;\n"
         "    if (pm[r] == '1' && !JS_VALUE_HAS_REF_COUNT(copy[r])) {\n"
-        "      AOT_REG(fr, r * 16) = E2_SENTINEL;\n"
+        "      AOT_REG(fr, r * 16) = E_SENTINEL;\n"
         "      pz[r] = 1;\n"
-        "      e2_poison_regs++;\n"
+        "      e_poison_regs++;\n"
         "    }\n"
         "  }\n"
         "}\n"
-        "static __attribute__((noinline)) void e2_poison_post(JSValue *fr, int "
+        "static __attribute__((noinline)) void e_poison_post(JSValue *fr, int "
         "n,\n"
         "    const JSValue *copy, const uint8_t *pz, const char *wm,\n"
         "    const char *op, int pc)\n"
         "{\n"
         "  for (int r = 0; r < n; r++) {\n"
         "    if (wm[r] == '1') continue;\n"
-        "    if (!e2_same_value(AOT_REG(fr, r * 16), pz[r] ? E2_SENTINEL : "
+        "    if (!e_same_value(AOT_REG(fr, r * 16), pz[r] ? E_SENTINEL : "
         "copy[r])) {\n"
-        "      e2_poison_abort(op, pc, r, AOT_REG(fr, r * 16));\n"
+        "      e_poison_abort(op, pc, r, AOT_REG(fr, r * 16));\n"
         "    } else if (pz[r]) {\n"
         "      AOT_REG(fr, r * 16) = copy[r];\n"
         "    }\n"
         "  }\n"
         "}\n"
-        "static void __attribute__((destructor)) e2_poison_stats(void)\n"
+        "static void __attribute__((destructor)) e_poison_stats(void)\n"
         "{\n"
-        "  fprintf(stderr, \"e2 poison-stats: calls=%%lu poisoned=%%lu\\n\",\n"
-        "          e2_poison_calls, e2_poison_regs);\n"
+        "  fprintf(stderr, \"poison-stats: calls=%%lu poisoned=%%lu\\n\",\n"
+        "          e_poison_calls, e_poison_regs);\n"
         "}\n"
         "#endif\n"
         /* Per-site hit/miss counters (compiled with -DE2_COUNT=1). One pair per
@@ -2273,82 +2273,82 @@ int qjsaot_driver_main(int argc, char **argv) {
            generator's op-call weight lines use, so the two can be read side by
            side. Disabled by default: the counters are a diagnostic, not a gate,
            and the lookup is linear because a function has only a few sites. */
-        "#if defined(E2_COUNT) && E2_COUNT\n"
+        "#if defined(E_COUNT) && E_COUNT\n"
         "#include <stdio.h>\n"
         "#include <string.h>\n"
         "typedef struct { const char *hex; unsigned pc; uint16_t rop;\n"
-        "                 unsigned long long hit, miss; } E2SiteCtr;\n"
-        "static E2SiteCtr e2_sites[8192];\n"
-        "static unsigned e2_nsites;\n"
-        "static const char *const e2_rop_names[] = {\n");
+        "                 unsigned long long hit, miss; } ESiteCtr;\n"
+        "static ESiteCtr e_sites[8192];\n"
+        "static unsigned e_nsites;\n"
+        "static const char *const e_rop_names[] = {\n");
     {
       int r;
       for (r = 0; r < ROP_COUNT; r++) {
         char nm[64];
-        e2_rop_name((uint16_t)r, nm, sizeof(nm));
+        e_rop_name((uint16_t)r, nm, sizeof(nm));
         fprintf(f, "  \"%s\",%s", nm, (r % 8 == 7) ? "\n" : " ");
       }
     }
     fprintf(
         f,
         "\n};\n"
-        "static void e2_count_note(const char *hex, unsigned pc, unsigned "
+        "static void e_count_note(const char *hex, unsigned pc, unsigned "
         "rop,\n"
         "                          int hit)\n"
         "{\n"
         "  unsigned i;\n"
-        "  for (i = 0; i < e2_nsites; i++)\n"
-        "    if (e2_sites[i].pc == pc && e2_sites[i].rop == rop &&\n"
-        "        e2_sites[i].hex == hex) {\n"
-        "      if (hit) e2_sites[i].hit++; else e2_sites[i].miss++;\n"
+        "  for (i = 0; i < e_nsites; i++)\n"
+        "    if (e_sites[i].pc == pc && e_sites[i].rop == rop &&\n"
+        "        e_sites[i].hex == hex) {\n"
+        "      if (hit) e_sites[i].hit++; else e_sites[i].miss++;\n"
         "      return;\n"
         "    }\n"
-        "  if (e2_nsites >= sizeof(e2_sites) / sizeof(e2_sites[0])) return;\n"
-        "  i = e2_nsites++;\n"
-        "  e2_sites[i].hex = hex; e2_sites[i].pc = pc;\n"
-        "  e2_sites[i].rop = (uint16_t)rop;\n"
-        "  e2_sites[i].hit = hit ? 1 : 0; e2_sites[i].miss = hit ? 0 : 1;\n"
+        "  if (e_nsites >= sizeof(e_sites) / sizeof(e_sites[0])) return;\n"
+        "  i = e_nsites++;\n"
+        "  e_sites[i].hex = hex; e_sites[i].pc = pc;\n"
+        "  e_sites[i].rop = (uint16_t)rop;\n"
+        "  e_sites[i].hit = hit ? 1 : 0; e_sites[i].miss = hit ? 0 : 1;\n"
         "}\n"
-        "static void __attribute__((destructor)) e2_count_dump(void)\n"
+        "static void __attribute__((destructor)) e_count_dump(void)\n"
         "{\n"
         "  unsigned i;\n"
-        "  for (i = 0; i < e2_nsites; i++)\n"
-        "    fprintf(stderr, \"e2 site %%s pc %%u %%s hit=%%llu "
+        "  for (i = 0; i < e_nsites; i++)\n"
+        "    fprintf(stderr, \"site %%s pc %%u %%s hit=%%llu "
         "miss=%%llu\\n\",\n"
-        "            e2_sites[i].hex, e2_sites[i].pc,\n"
-        "            e2_rop_names[e2_sites[i].rop],\n"
-        "            e2_sites[i].hit, e2_sites[i].miss);\n"
+        "            e_sites[i].hex, e_sites[i].pc,\n"
+        "            e_rop_names[e_sites[i].rop],\n"
+        "            e_sites[i].hit, e_sites[i].miss);\n"
         "}\n"
-        "#define E2_CTR(hex, pc, rop, hit) e2_count_note((hex), (pc), (rop), "
+        "#define E_CTR(hex, pc, rop, hit) e_count_note((hex), (pc), (rop), "
         "(hit))\n"
         /* Why q2_put_field_hit declined, so a store site that never hits can
            be explained rather than guessed at. */
-        "#define E2_PUT_SHAPE   0\n"
-        "#define E2_PUT_KIND    1\n"
-        "#define E2_PUT_PROTO   2\n"
-        "#define E2_PUT_N 3\n"
-        "static unsigned long long e2_put_why[E2_PUT_N];\n"
-        "static void e2_put_why_note(int why) { e2_put_why[why]++; }\n"
-        "static const char *const e2_put_why_names[E2_PUT_N] = {\n"
+        "#define E_PUT_SHAPE   0\n"
+        "#define E_PUT_KIND    1\n"
+        "#define E_PUT_PROTO   2\n"
+        "#define E_PUT_N 3\n"
+        "static unsigned long long e_put_why[E_PUT_N];\n"
+        "static void e_put_why_note(int why) { e_put_why[why]++; }\n"
+        "static const char *const e_put_why_names[E_PUT_N] = {\n"
         "  \"shape\", \"kind-not-own-w\", \"receiver-prototype\"\n"
         "};\n"
-        "static void __attribute__((destructor)) e2_put_why_dump(void)\n"
+        "static void __attribute__((destructor)) e_put_why_dump(void)\n"
         "{\n"
         "  int i; unsigned long long tot = 0;\n"
-        "  for (i = 0; i < E2_PUT_N; i++) tot += e2_put_why[i];\n"
+        "  for (i = 0; i < E_PUT_N; i++) tot += e_put_why[i];\n"
         "  if (!tot) return;\n"
-        "  for (i = 0; i < E2_PUT_N; i++) {\n"
-        "    if (e2_put_why[i]) {\n"
-        "      fprintf(stderr, \"e2 putfield-why %%s %%llu (%%llu%%%%)\\n\",\n"
-        "              e2_put_why_names[i], e2_put_why[i],\n"
-        "              100ull * e2_put_why[i] / tot);\n"
+        "  for (i = 0; i < E_PUT_N; i++) {\n"
+        "    if (e_put_why[i]) {\n"
+        "      fprintf(stderr, \"putfield-why %%s %%llu (%%llu%%%%)\\n\",\n"
+        "              e_put_why_names[i], e_put_why[i],\n"
+        "              100ull * e_put_why[i] / tot);\n"
         "    }\n"
         "  }\n"
         "}\n"
-        "#define E2_PUTWHY(w) e2_put_why_note(w)\n"
+        "#define E_PUTWHY(w) e_put_why_note(w)\n"
         "#else\n"
-        "#define E2_CTR(hex, pc, rop, hit) ((void)0)\n"
-        "#define E2_PUTWHY(w) ((void)0)\n"
+        "#define E_CTR(hex, pc, rop, hit) ((void)0)\n"
+        "#define E_PUTWHY(w) ((void)0)\n"
         "#endif\n"
         /* D10's frame seal. The engine's frame area has a top marker, and a
            compiled function may be running on a frame above it; a native call
@@ -2357,16 +2357,16 @@ int qjsaot_driver_main(int argc, char **argv) {
            publishes this activation's frame so the marker sits above it.
            A frame on the C stack needs no seal: the marker already accounts for
            it. Once per activation, not per `goto dispatch`. */
-        "#ifndef E2_SEAL\n"
-        "#define E2_SEAL(ctx, f) do { if (!(*(uint16_t *)((uint8_t *)(f) + "
+        "#ifndef E_SEAL\n"
+        "#define E_SEAL(ctx, f) do { if (!(*(uint16_t *)((uint8_t *)(f) + "
         "QJS_AOT_OFF_REGRUN_FLAGS) & QJS_AOT_REGVM_FLAG_STACK)) "
         "qjs_aot_seal(ctx, f); } while (0)\n"
         "#endif\n"
         /* The stack margin a native entry keeps free for the throw it may have
            to perform. 4 KB crashed before; 64 KB is what the call-path
            experiments used and what the design states. */
-        "#ifndef E2_STACK_MARGIN\n"
-        "#define E2_STACK_MARGIN (64 * 1024)\n"
+        "#ifndef E_STACK_MARGIN\n"
+        "#define E_STACK_MARGIN (64 * 1024)\n"
         "#endif\n"
         /* A double local stored where another function or entry can see it is
            boxed as the interpreter's arithmetic would box it: an integral
@@ -2403,13 +2403,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define qjs_aot_load_this(ctx, f, out) q2_load_this(ctx, f, out)\n"
         /* The caller's position at a native call, for a backtrace: the callee's frame
            carries no return address. */
-        "#define E2_CAP(f, pc) (*(const uint8_t **)((uint8_t *)(f) + QJS_AOT_OFF_REGRUN_CAP_IP) = e2cb + (pc))\n"
-        "#define E2_NO_SHAPE ((const void *)1)\n"
-        "#define E2_BOX_F64(d) ({ double d_ = (d); "
+        "#define E_CAP(f, pc) (*(const uint8_t **)((uint8_t *)(f) + QJS_AOT_OFF_REGRUN_CAP_IP) = ecb + (pc))\n"
+        "#define E_NO_SHAPE ((const void *)1)\n"
+        "#define E_BOX_F64(d) ({ double d_ = (d); "
         "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
         /* The `undefined` word a native entry fills its frame with, as one
            static constant so the fill is a copy of a known word. */
-        "static const JSValue e2_undefined_value = { { .int32 = 0 }, "
+        "static const JSValue e_undefined_value = { { .int32 = 0 }, "
         "JS_TAG_UNDEFINED };\n"
         "static inline int q2_spec_fns_out(int fi);\n"
         "static void __attribute__((constructor)) q2_no_spec_init(void)\n"
@@ -2421,19 +2421,19 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  q2_spec_on = (s == NULL || s[0] != '0');\n"
         /* The switches folded per function, so a body that must be as short as
            a call can afford (a frameless one) tests one byte, not four globals. */
-        "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++)\n"
-        "    e2_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
+        "  for (i = 0; i < QJS_AOT_NFUNCS; i++)\n"
+        "    e_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
         "}\n\n"
         /* The builtins a unit lowers inline (card E15): the engine's own
            function pointers, filled once, and the number view the inline C
            works on (k: 0 not a number, 1 int, 2 double, 3 undefined). */
         "typedef struct { int k; int i; double d; } Q2Num;\n"
-        "static void *e2_intr_fn[QJS_AOT_INTR_COUNT];\n"
+        "static void *e_intr_fn[QJS_AOT_INTR_COUNT];\n"
         "static void __attribute__((constructor)) q2_intr_init(void)\n"
         "{\n"
         "  int i;\n"
         "  for (i = 0; i < QJS_AOT_INTR_COUNT; i++)\n"
-        "    e2_intr_fn[i] = qjs_aot_intrinsic_fn(i);\n"
+        "    e_intr_fn[i] = qjs_aot_intrinsic_fn(i);\n"
         "}\n"
         "static inline __attribute__((always_inline)) Q2Num q2_numv(JSValue v)\n"
         "{\n"
@@ -2461,7 +2461,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      QJS_AOT_CLASS_C_FUNCTION)\n"
         "    return 0;\n"
         "  if (*(void *const *)(p + QJS_AOT_OFF_CFUNC_C_FUNCTION) !=\n"
-        "      e2_intr_fn[id])\n"
+        "      e_intr_fn[id])\n"
         "    return 0;\n"
         "  return magic < 0 || *(const int16_t *)(p + QJS_AOT_OFF_CFUNC_MAGIC) == "
         "magic;\n"
@@ -2541,7 +2541,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    r = a.d + 0.0; break;\n"
         "  default: return 0;\n"
         "  }\n"
-        "  *out = E2_BOX_F64(r);\n"
+        "  *out = E_BOX_F64(r);\n"
         "  return 1;\n"
         "}\n\n"
         /* A site's polymorphic cache: four (shape, offset, kind) entries the
@@ -2850,7 +2850,7 @@ int qjsaot_driver_main(int argc, char **argv) {
        against the layout header's offsets, so a compiled field read is a couple
        of loads rather than a call across the unit boundary. A miss returns 0 and
        the caller takes the cache-filling slow path and continues. */
-    /* QJS_AOT_E2_FORCE_MISS: forces every spec-body inline cache hit to fail, so
+    /* QJS_AOT_FORCE_MISS: forces every spec-body inline cache hit to fail, so
        the miss path (the op-call wrapper) runs on the EXISTING tests. The test is
        a static load, so it costs nothing when unset, and the environment is read
        once per process on the first spec-body entry. */
@@ -2859,21 +2859,21 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static int q2_force_miss_cache = -1;\n"
         "#define q2_force_miss q2_force_miss_cache\n"
         "#define Q2_FORCE_MISS (q2_force_miss > 0)\n"
-        /* QJS_AOT_E2_SPEC_FNS="<lo>-<hi>" allows the spec body only for function
+        /* QJS_AOT_SPEC_FNS="<lo>-<hi>" allows the spec body only for function
            indices in that range, so a miscompile can be pinned to ONE function by
            halving the range. A run-time test, so a stale unit cannot fake it. */
         "static int q2_spec_fns_lo = -2, q2_spec_fns_hi = -2;\n"
         "static inline __attribute__((always_inline)) int q2_spec_fns_out(int fi)\n"
         "{\n"
         "  if (q2_spec_fns_lo == -2) {\n"
-        "    const char *v = getenv(\"QJS_AOT_E2_SPEC_FNS\");\n"
+        "    const char *v = getenv(\"QJS_AOT_SPEC_FNS\");\n"
         "    q2_spec_fns_lo = -1; q2_spec_fns_hi = -1;\n"
         "    if (v != NULL && v[0] != 0) {\n"
         "      int lo = -1, hi = -1;\n"
         "      if (sscanf(v, \"%%d-%%d\", &lo, &hi) == 2) {\n"
         "        q2_spec_fns_lo = lo; q2_spec_fns_hi = hi;\n"
-        "        if (getenv(\"QJS_AOT_E2_SPEC_FNS_VERBOSE\"))\n"
-        "          fprintf(stderr, \"e2 spec-fns %%d..%%d\\n\", lo, hi);\n"
+        "        if (getenv(\"QJS_AOT_SPEC_FNS_VERBOSE\"))\n"
+        "          fprintf(stderr, \"spec-fns %%d..%%d\\n\", lo, hi);\n"
         "      }\n"
         "    }\n"
         "  }\n"
@@ -2882,30 +2882,30 @@ int qjsaot_driver_main(int argc, char **argv) {
         "}\n\n");
     /* The sweep's coverage record: which guard sites a run reached. Only a sweep
        unit calls it. Each translation unit keeps its own bitmap and appends the
-       ids it saw to $QJS_AOT_E2_SWEEP_OUT at exit, so a split unit needs no
+       ids it saw to $QJS_AOT_SWEEP_OUT at exit, so a split unit needs no
        shared array and the run's own output is untouched. */
     if (g_deopt_everywhere)
       fprintf(
           f,
-          "#define E2_SWEEP_MAX (1u << 20)\n"
-          "static uint8_t e2_sw_seen[E2_SWEEP_MAX / 8];\n"
-          "static inline int e2_sweep_hit(JSContext *ctx, uint32_t sid)\n"
+          "#define E_SWEEP_MAX (1u << 20)\n"
+          "static uint8_t e_sw_seen[E_SWEEP_MAX / 8];\n"
+          "static inline int e_sweep_hit(JSContext *ctx, uint32_t sid)\n"
           "{\n"
-          "  if (sid < E2_SWEEP_MAX) e2_sw_seen[sid >> 3] |= (uint8_t)(1u << "
+          "  if (sid < E_SWEEP_MAX) e_sw_seen[sid >> 3] |= (uint8_t)(1u << "
           "(sid & 7));\n"
           "  return qjs_aot_should_deopt(ctx, sid);\n"
           "}\n"
           "static void __attribute__((destructor, unused)) "
-          "e2_sweep_dump(void)\n"
+          "e_sweep_dump(void)\n"
           "{\n"
-          "  const char *p = getenv(\"QJS_AOT_E2_SWEEP_OUT\");\n"
+          "  const char *p = getenv(\"QJS_AOT_SWEEP_OUT\");\n"
           "  FILE *o;\n"
           "  uint32_t i;\n"
           "  if (p == NULL || p[0] == 0) return;\n"
           "  o = fopen(p, \"a\");\n"
           "  if (o == NULL) return;\n"
-          "  for (i = 0; i < E2_SWEEP_MAX; i++)\n"
-          "    if (e2_sw_seen[i >> 3] & (1u << (i & 7))) fprintf(o, "
+          "  for (i = 0; i < E_SWEEP_MAX; i++)\n"
+          "    if (e_sw_seen[i >> 3] & (1u << (i & 7))) fprintf(o, "
           "\"%%u\\n\", i);\n"
           "  fclose(o);\n"
           "}\n\n");
@@ -3066,17 +3066,17 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (*(const void *const *)e !=\n"
         "          *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE)) "
         "{\n"
-        "    E2_PUTWHY(E2_PUT_SHAPE);\n"
+        "    E_PUTWHY(E_PUT_SHAPE);\n"
         "    return 0;\n"
         "  }\n"
         "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) !=\n"
         "          QJS_AOT_REG_PIC_OWN_W) {\n"
-        "    E2_PUTWHY(E2_PUT_KIND);\n"
+        "    E_PUTWHY(E_PUT_KIND);\n"
         "    return 0;\n"
         "  }\n"
         "  if ((obj[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] &\n"
         "       QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK) != 0) {\n"
-        "    E2_PUTWHY(E2_PUT_PROTO);\n"
+        "    E_PUTWHY(E_PUT_PROTO);\n"
         "    return 0;\n"
         "  }\n"
         "  slot = (JSValue *)(*(unsigned char *const *)(obj + "
@@ -3354,7 +3354,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           f,
           "%sJSValue aot_f_%s(JSContext *, JSRegRun *, JSValue *, "
           "uint32_t);\n#define Q2_SEL_%s 1\n",
-          e2_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
+          e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
           hex, hex);
       /* `Q2_SEL_` says the function's *body* is in this unit. A call site needs
          more: the native *entry*, which exists only for a body the E2 emitter
@@ -3369,7 +3369,7 @@ int qjsaot_driver_main(int argc, char **argv) {
             "%sJSValue aot_n_%s(JSContext *, JSRegRun *, JSObject *, "
             "JSValue, JSValue *, int);\n",
             hex,
-            e2_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
+            e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
             hex);
     }
     fprintf(f, "\n");
@@ -3386,8 +3386,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         fprintf(
             f,
             "%sJSValue aot_nx_%s(JSContext *, JSRegRun *, JSObject *, JSValue, "
-            "JSValue *, const E2Nx *);\n",
-            e2_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
+            "JSValue *, const ENx *);\n",
+            e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
             hex);
       fwrite(g_inl_eb[i].buf, 1, g_inl_eb[i].len, f);
     }
@@ -3411,9 +3411,9 @@ int qjsaot_driver_main(int argc, char **argv) {
         fprintf(pf, "#include \"quickjs-aot-rt.h\"\n#include %s\n", inc);
         fprintf(
             pf,
-            "#define E2_TEXT __attribute__((section(\"e2text\")))\n"
-            "extern char __start_e2text[] __attribute__((weak));\n"
-            "extern char __stop_e2text[] __attribute__((weak));\n");
+            "#define E_TEXT __attribute__((section(\"aottext\")))\n"
+            "extern char __start_aottext[] __attribute__((weak));\n"
+            "extern char __stop_aottext[] __attribute__((weak));\n");
         /* The pure leaf helpers are `static inline` and are written once, to
            the shared header above; repeating them in each part would be a
            redefinition. Only the function's own bodies go here. */
@@ -3442,15 +3442,15 @@ int qjsaot_driver_main(int argc, char **argv) {
          exactly once, here. */
       fprintf(
           f,
-          "uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
-          "uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
-          "uint8_t e2_off[QJS_AOT_E2_NFUNCS];\n"
-          "uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
-          "uint8_t e2_nfl[QJS_AOT_E2_NFUNCS], e2_dis[QJS_AOT_E2_NFUNCS];\n"
-          "uint64_t e2_inl[QJS_AOT_E2_NFUNCS];\n"
-          "uint32_t e2_inx[QJS_AOT_E2_NFUNCS];\n"
-          "uint8_t e2_ioff[QJS_AOT_E2_NFUNCS];\n"
-          "const char *const qjs_aot_e2_names[] = {\n"
+          "uint64_t e_ent[QJS_AOT_NFUNCS];\n"
+          "uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
+          "uint8_t e_off[QJS_AOT_NFUNCS];\n"
+          "uint32_t e_han[QJS_AOT_NFUNCS];\n"
+          "uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
+          "uint64_t e_inl[QJS_AOT_NFUNCS];\n"
+          "uint32_t e_inx[QJS_AOT_NFUNCS];\n"
+          "uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
+          "const char *const qjs_aot_e_names[] = {\n"
           );
       {
         int ni;
@@ -3465,25 +3465,25 @@ int qjsaot_driver_main(int argc, char **argv) {
           "/* One line per function, so a case can assert on ONE function's\n"
           "   hand-offs. The whole-script total cannot express remote\"a\"\n"
           "   counts, which is what a faster-not-just-correct fix needs. */\n"
-          "void __attribute__((destructor)) e2_stats_dump(void)\n"
+          "void __attribute__((destructor)) e_stats_dump(void)\n"
           "{\n"
           "  unsigned long long en = 0, ex = 0, rf = 0, off = 0, hn = 0, fl = 0, il = 0;\n"
-          "  const char *e = getenv(\"QJS_AOT_E2_STATS\");\n"
+          "  const char *e = getenv(\"QJS_AOT_UNIT_STATS\");\n"
           "  int i;\n"
           "  if (e == NULL || e[0] != '1') return;\n"
-          "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
-          "    en += e2_ent[i]; ex += e2_exi[i]; rf += e2_ref[i]; off += e2_off[i];\n"
-          "    hn += e2_han[i]; il += e2_inl[i]; if (e2_nfl[i]) fl += e2_ent[i];\n"
+          "  for (i = 0; i < QJS_AOT_NFUNCS; i++) {\n"
+          "    en += e_ent[i]; ex += e_exi[i]; rf += e_ref[i]; off += e_off[i];\n"
+          "    hn += e_han[i]; il += e_inl[i]; if (e_nfl[i]) fl += e_ent[i];\n"
           "  }\n"
-          "  fprintf(stderr, \"e2-stats enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%llu frameless=%%llu inlined=%%llu\\n\",\n"
+          "  fprintf(stderr, \"unit-stats enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%llu frameless=%%llu inlined=%%llu\\n\",\n"
           "          en, ex, hn, rf, off, fl, il);\n"
-          "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++) {\n"
-          "    if (e2_ent[i] == 0 && e2_ref[i] == 0) continue;\n"
-          "    fprintf(stderr, \"e2-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d frameless=%%llu inlined=%%llu\\n\",\n"
-          "            qjs_aot_e2_names[i] ? qjs_aot_e2_names[i] : \"?\",\n"
-          "            (unsigned long long)e2_ent[i], (unsigned long long)e2_exi[i],\n"
-          "            (unsigned long long)e2_han[i], (unsigned long long)e2_ref[i],\n"
-          "            (unsigned)e2_off[i], i, e2_nfl[i] ? (unsigned long long)e2_ent[i] : 0ull,\n            (unsigned long long)e2_inl[i]);\n"
+          "  for (i = 0; i < QJS_AOT_NFUNCS; i++) {\n"
+          "    if (e_ent[i] == 0 && e_ref[i] == 0) continue;\n"
+          "    fprintf(stderr, \"unit-stats fn=%%s enters=%%llu exits=%%llu handoffs=%%llu refuses=%%llu off=%%u idx=%%d frameless=%%llu inlined=%%llu\\n\",\n"
+          "            qjs_aot_e_names[i] ? qjs_aot_e_names[i] : \"?\",\n"
+          "            (unsigned long long)e_ent[i], (unsigned long long)e_exi[i],\n"
+          "            (unsigned long long)e_han[i], (unsigned long long)e_ref[i],\n"
+          "            (unsigned)e_off[i], i, e_nfl[i] ? (unsigned long long)e_ent[i] : 0ull,\n            (unsigned long long)e_inl[i]);\n"
           "  }\n"
           "}\n"
           );
@@ -3504,7 +3504,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           for (k = 0; k < 16; k++)
             fprintf(f, "%s0x%02x", k ? ", " : "", funcs[i].digest[k]);
         }
-        if (qjs_aot_has_native_entry(i) && getenv("QJS_AOT_E2_NONFN") == NULL)
+        if (qjs_aot_has_native_entry(i) && getenv("QJS_AOT_NONFN") == NULL)
           fprintf(f, "}, aot_f_%s, aot_n_%s, 0u, 0x%08xu },\n", hex, hex, funcs[i].code_crc);
         else
           fprintf(f, "}, aot_f_%s, NULL, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
@@ -3567,12 +3567,12 @@ int qjsaot_driver_main(int argc, char **argv) {
     }
     /* Which rop each spec block gave up at, weighted by the profile: the next
        thing to lower, chosen by data. */
-    e2_handoff_report(stderr);
+    e_handoff_report(stderr);
     /* Functions the speculative body refused as irreducible. */
-    if (e2_irreducible)
+    if (e_irreducible)
       fprintf(
           stderr, "qjsaot: irreducible (refused for the speculative body): %d\n",
-          e2_irreducible);
+          e_irreducible);
 
     for (i = 0; i < nfuncs; i++) free(eb[i].buf);
     free(eb);
@@ -3585,9 +3585,3 @@ int qjsaot_driver_main(int argc, char **argv) {
   JS_FreeRuntime(rt);
   return fails == 0 ? 0 : 1;
 }
-
-#ifndef QJS_AOT_NO_MAIN
-int main(int argc, char **argv) {
-  return qjsaot_driver_main(argc, argv);
-}
-#endif

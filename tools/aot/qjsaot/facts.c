@@ -70,8 +70,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "e2_analysis.h"
-#include "e2.h"
+#include "analysis.h"
+#include "emit.h"
 #include "quickjs-regvm.h"
 
 /* The profile's site and coverage records, from qjsaot.c. */
@@ -90,7 +90,7 @@ typedef struct FactSet {
   int *shape_val; /* the receiver value */
   int *shape_grp; /* the group */
   int navail, capavail;
-  E2Avail *avail;
+  EAvail *avail;
 } FactSet;
 
 static void fs_clear(FactSet *s) {
@@ -137,11 +137,11 @@ static int fs_add_shape(FactSet *s, int val, int grp) {
   return 0;
 }
 
-static int key_eq(const E2Key *a, const E2Key *b) {
+static int key_eq(const EKey *a, const EKey *b) {
   return a->kind == b->kind && a->a == b->a && a->b == b->b;
 }
 
-static Q2ValueId fs_get_avail(const FactSet *s, const E2Key *k) {
+static Q2ValueId fs_get_avail(const FactSet *s, const EKey *k) {
   int i;
   for (i = 0; i < s->navail; i++) {
     if (key_eq(&s->avail[i].key, k)) return s->avail[i].val;
@@ -150,7 +150,7 @@ static Q2ValueId fs_get_avail(const FactSet *s, const E2Key *k) {
 }
 
 /* Add or replace. One fact per location: a location holds one value. */
-static int fs_set_avail(FactSet *s, const E2Key *k, Q2ValueId v) {
+static int fs_set_avail(FactSet *s, const EKey *k, Q2ValueId v) {
   int i;
   if (v == Q2_NO_VALUE) return 0;
   for (i = 0; i < s->navail; i++) {
@@ -161,7 +161,7 @@ static int fs_set_avail(FactSet *s, const E2Key *k, Q2ValueId v) {
   }
   if (s->navail >= s->capavail) {
     int cap = s->capavail > 0 ? s->capavail * 2 : 8;
-    E2Avail *q = realloc(s->avail, sizeof(*q) * (size_t)cap);
+    EAvail *q = realloc(s->avail, sizeof(*q) * (size_t)cap);
     if (q == NULL) return -1;
     s->avail = q;
     s->capavail = cap;
@@ -173,7 +173,7 @@ static int fs_set_avail(FactSet *s, const E2Key *k, Q2ValueId v) {
 }
 
 /* Drop every AVAIL fact the predicate accepts. */
-typedef int (*KeyPred)(void *arg, const E2Key *k);
+typedef int (*KeyPred)(void *arg, const EKey *k);
 
 static void fs_kill(FactSet *s, KeyPred pred, void *arg) {
   int i, w = 0;
@@ -204,39 +204,39 @@ static int fs_intersect(FactSet *dst, const FactSet *a, const FactSet *b) {
 
 /* ---- kill predicates ----------------------------------------------------- */
 
-static int kp_arg_slot(void *arg, const E2Key *k) {
-  return k->kind == E2_K_ARG && k->a == *(const int64_t *)arg;
+static int kp_arg_slot(void *arg, const EKey *k) {
+  return k->kind == E_K_ARG && k->a == *(const int64_t *)arg;
 }
 
-static int kp_local_slot(void *arg, const E2Key *k) {
-  return k->kind == E2_K_LOCAL && k->a == *(const int64_t *)arg;
+static int kp_local_slot(void *arg, const EKey *k) {
+  return k->kind == E_K_LOCAL && k->a == *(const int64_t *)arg;
 }
 
-static int kp_varref_slot(void *arg, const E2Key *k) {
-  return k->kind == E2_K_VARREF && k->a == *(const int64_t *)arg;
+static int kp_varref_slot(void *arg, const EKey *k) {
+  return k->kind == E_K_VARREF && k->a == *(const int64_t *)arg;
 }
 
-static int kp_global_atom(void *arg, const E2Key *k) {
-  return k->kind == E2_K_GLOBAL && k->a == *(const int64_t *)arg;
+static int kp_global_atom(void *arg, const EKey *k) {
+  return k->kind == E_K_GLOBAL && k->a == *(const int64_t *)arg;
 }
 
 /* Two different atoms never alias, so a store kills only its own atom -- on any
    receiver, because two receivers may be the same object (D6). */
-static int kp_field_atom(void *arg, const E2Key *k) {
-  return k->kind == E2_K_FIELD && k->b == *(const int64_t *)arg;
+static int kp_field_atom(void *arg, const EKey *k) {
+  return k->kind == E_K_FIELD && k->b == *(const int64_t *)arg;
 }
 
-static int kp_elem(void *arg, const E2Key *k) {
+static int kp_elem(void *arg, const EKey *k) {
   (void)arg;
-  return k->kind == E2_K_ELEM;
+  return k->kind == E_K_ELEM;
 }
 
 /* A safepoint: everything reachable from the heap may have changed, and a
    refill may have freed a shape and handed its address to another one. `this`
    is fixed for the activation and survives (D6). */
-static int kp_safepoint(void *arg, const E2Key *k) {
+static int kp_safepoint(void *arg, const EKey *k) {
   (void)arg;
-  return k->kind != E2_K_THIS;
+  return k->kind != E_K_THIS;
 }
 
 /* ---- the operands of a property access ---------------------------------- */
@@ -263,7 +263,7 @@ static int arg_nearest(const Q2Insn *in, int idx, char kind) {
    writes. */
 typedef struct SiteRef {
   int site;     /* the PIC index, or REG_IC_NONE */
-  int64_t recv; /* a value id, E2_RECV_THIS or E2_RECV_LOCAL(slot) */
+  int64_t recv; /* a value id, E_RECV_THIS or E_RECV_LOCAL(slot) */
   int64_t atom;
   int is_store;
 } SiteRef;
@@ -284,7 +284,7 @@ static int64_t site_recv(const Q2Insn *in, int si, Q2ValueId def_recv) {
          `this` into it, so the receiver is `this`; a chain's second link reads
          its receiver from the first link's result. */
       if (in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2)
-        return E2_RECV_THIS;
+        return E_RECV_THIS;
       if (def_recv != Q2_NO_VALUE) return (int64_t)def_recv;
       return -1;
     }
@@ -293,22 +293,22 @@ static int64_t site_recv(const Q2Insn *in, int si, Q2ValueId def_recv) {
   /* "ruas": the receiver is a local slot, not a register. */
   if (in->rop == ROP_get_local_field) {
     int u = arg_nearest(in, si - 1, 'u');
-    if (u >= 0) return E2_RECV_LOCAL(in->arg[u].val);
+    if (u >= 0) return E_RECV_LOCAL(in->arg[u].val);
   }
   if (in->rop >= ROP_get_local_field_0 && in->rop <= ROP_get_local_field_3)
-    return E2_RECV_LOCAL((int64_t)(in->rop - ROP_get_local_field_0));
+    return E_RECV_LOCAL((int64_t)(in->rop - ROP_get_local_field_0));
   if (in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2)
-    return E2_RECV_THIS;
+    return E_RECV_THIS;
   return -1;
 }
 
 /* Collect the property accesses of one instruction (a chain has two). Returns
    the count, 0 to 2. */
 static int site_refs(const Q2Insn *in, SiteRef out[2]) {
-  const E2Role *role = e2_roles[in->rop];
+  const ERole *role = e_roles[in->rop];
   int n = 0, i;
 
-  if (role == NULL || role->mem != E2_MEM_FIELD) return 0;
+  if (role == NULL || role->mem != E_MEM_FIELD) return 0;
   for (i = 0; i < in->narg && n < 2; i++) {
     Q2ValueId def_recv = Q2_NO_VALUE;
     int ai;
@@ -334,25 +334,25 @@ static int site_refs(const Q2Insn *in, SiteRef out[2]) {
 
 /* The kind of an instruction for the pass.
  *
- * E2_SK_PURE     no safepoint: it cannot run JS or allocate.
- * E2_SK_NOJS     a memory access that cannot run JS: no safepoint.
- * E2_SK_FIELD    a field access: no safepoint when every site it uses is
+ * E_SK_PURE     no safepoint: it cannot run JS or allocate.
+ * E_SK_NOJS     a memory access that cannot run JS: no safepoint.
+ * E_SK_FIELD    a field access: no safepoint when every site it uses is
  *                grouped (its miss then exits), a safepoint otherwise.
- * E2_SK_SAFE     a safepoint.
+ * E_SK_SAFE     a safepoint.
  */
-#define E2_SK_PURE 0
-#define E2_SK_NOJS 1
-#define E2_SK_FIELD 2
-#define E2_SK_SAFE 3
+#define E_SK_PURE 0
+#define E_SK_NOJS 1
+#define E_SK_FIELD 2
+#define E_SK_SAFE 3
 
 static int insn_kind(const Q2Insn *in) {
-  const E2Role *role = e2_roles[in->rop];
-  if (role == NULL) return E2_SK_SAFE;
-  if (role->pure) return E2_SK_PURE;
+  const ERole *role = e_roles[in->rop];
+  if (role == NULL) return E_SK_SAFE;
+  if (role->pure) return E_SK_PURE;
   switch (in->op) {
     case Q2_OP_GET_FIELD:
     case Q2_OP_PUT_FIELD:
-      return E2_SK_FIELD;
+      return E_SK_FIELD;
     case Q2_OP_GET_LOCAL:
     case Q2_OP_PUT_LOCAL:
     case Q2_OP_GET_ARG:
@@ -365,17 +365,17 @@ static int insn_kind(const Q2Insn *in) {
       /* Each only reads or writes a frame slot, an argument or a closure
          cell, and cannot run JS. A TDZ read throws and leaves the activation,
          so no fact is needed past it. */
-      return E2_SK_NOJS;
+      return E_SK_NOJS;
     default:
-      return E2_SK_SAFE;
+      return E_SK_SAFE;
   }
 }
 
 /* ---- loads and stores the pass tracks ----------------------------------- */
 
 typedef struct Access {
-  int kind;      /* E2_K_*, or 0 when the instruction is neither */
-  E2Key key;     /* the location */
+  int kind;      /* E_K_*, or 0 when the instruction is neither */
+  EKey key;     /* the location */
   Q2ValueId val; /* the value read (load) or written (store) */
   int is_store;
   int fwd_ok;    /* the whole instruction is this one location's load */
@@ -385,8 +385,8 @@ static int insn_load(const Q2Insn *in, Access *a) {
   memset(a, 0, sizeof(*a));
   switch (in->rop) {
     case ROP_get_arg:
-      a->kind = E2_K_ARG;
-      a->key.kind = E2_K_ARG;
+      a->kind = E_K_ARG;
+      a->key.kind = E_K_ARG;
       a->key.a = in->narg > 1 ? in->arg[1].val : -1;
       break;
     case ROP_get_arg2:
@@ -394,39 +394,39 @@ static int insn_load(const Q2Insn *in, Access *a) {
          instruction would have to pick one). */
       return 0;
     case ROP_get_local:
-      a->kind = E2_K_LOCAL;
-      a->key.kind = E2_K_LOCAL;
+      a->kind = E_K_LOCAL;
+      a->key.kind = E_K_LOCAL;
       a->key.a = in->narg > 1 ? in->arg[1].val : -1;
       break;
     case ROP_get_local_s0:
     case ROP_get_local_s1:
     case ROP_get_local_s2:
     case ROP_get_local_s3:
-      a->kind = E2_K_LOCAL;
-      a->key.kind = E2_K_LOCAL;
+      a->kind = E_K_LOCAL;
+      a->key.kind = E_K_LOCAL;
       a->key.a = in->rop - ROP_get_local_s0;
       break;
     case ROP_get_var_ref:
-      a->kind = E2_K_VARREF;
-      a->key.kind = E2_K_VARREF;
+      a->kind = E_K_VARREF;
+      a->key.kind = E_K_VARREF;
       a->key.a = in->narg > 1 ? in->arg[1].val : -1;
       break;
     case ROP_get_global: {
       int ai = arg_nearest(in, in->narg - 1, 'a');
-      a->kind = E2_K_GLOBAL;
-      a->key.kind = E2_K_GLOBAL;
+      a->kind = E_K_GLOBAL;
+      a->key.kind = E_K_GLOBAL;
       a->key.a = ai >= 0 ? in->arg[ai].val : -1;
       break;
     }
     case ROP_load_this:
-      a->kind = E2_K_THIS;
-      a->key.kind = E2_K_THIS;
+      a->kind = E_K_THIS;
+      a->key.kind = E_K_THIS;
       break;
     case ROP_get_element: {
       Q2ValueId obj = regval(in, 1), idx = regval(in, 2);
       if (obj == Q2_NO_VALUE || idx == Q2_NO_VALUE) return 0;
-      a->kind = E2_K_ELEM;
-      a->key.kind = E2_K_ELEM;
+      a->kind = E_K_ELEM;
+      a->key.kind = E_K_ELEM;
       a->key.a = (int64_t)obj;
       a->key.b = (int64_t)idx;
       break;
@@ -434,10 +434,10 @@ static int insn_load(const Q2Insn *in, Access *a) {
     case ROP_get_length: {
       Q2ValueId obj = regval(in, 1);
       if (obj == Q2_NO_VALUE) return 0;
-      a->kind = E2_K_ELEM;
-      a->key.kind = E2_K_ELEM;
+      a->kind = E_K_ELEM;
+      a->key.kind = E_K_ELEM;
       a->key.a = (int64_t)obj;
-      a->key.b = E2_ELEM_LEN;
+      a->key.b = E_ELEM_LEN;
       break;
     }
     default: {
@@ -447,8 +447,8 @@ static int insn_load(const Q2Insn *in, Access *a) {
       if (nr != 1) return 0; /* a chain: two locations, no single move */
       if (ref[0].site < 0 || (unsigned)ref[0].site == REG_IC_NONE) return 0;
       if (ref[0].recv < 0 || ref[0].atom == 0) return 0;
-      a->kind = E2_K_FIELD;
-      a->key.kind = E2_K_FIELD;
+      a->kind = E_K_FIELD;
+      a->key.kind = E_K_FIELD;
       a->key.a = ref[0].recv;
       a->key.b = ref[0].atom;
       break;
@@ -466,15 +466,15 @@ static int insn_store(const Q2Insn *in, Access *a) {
   switch (in->rop) {
     case ROP_put_arg:
     case ROP_put_arg_xfer:
-      a->kind = E2_K_ARG;
-      a->key.kind = E2_K_ARG;
+      a->kind = E_K_ARG;
+      a->key.kind = E_K_ARG;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
     case ROP_put_local:
     case ROP_put_local_xfer:
-      a->kind = E2_K_LOCAL;
-      a->key.kind = E2_K_LOCAL;
+      a->kind = E_K_LOCAL;
+      a->key.kind = E_K_LOCAL;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
@@ -482,20 +482,20 @@ static int insn_store(const Q2Insn *in, Access *a) {
     case ROP_put_local_s1:
     case ROP_put_local_s2:
     case ROP_put_local_s3:
-      a->kind = E2_K_LOCAL;
-      a->key.kind = E2_K_LOCAL;
+      a->kind = E_K_LOCAL;
+      a->key.kind = E_K_LOCAL;
       a->key.a = in->rop - ROP_put_local_s0;
       a->val = regval(in, 0);
       break;
     case ROP_put_var_ref:
-      a->kind = E2_K_VARREF;
-      a->key.kind = E2_K_VARREF;
+      a->kind = E_K_VARREF;
+      a->key.kind = E_K_VARREF;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
     case ROP_put_global:
-      a->kind = E2_K_GLOBAL;
-      a->key.kind = E2_K_GLOBAL;
+      a->kind = E_K_GLOBAL;
+      a->key.kind = E_K_GLOBAL;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
@@ -503,8 +503,8 @@ static int insn_store(const Q2Insn *in, Access *a) {
     case ROP_put_element_xfer: {
       Q2ValueId obj = regval(in, 0), idx = regval(in, 1);
       if (obj == Q2_NO_VALUE || idx == Q2_NO_VALUE) return 0;
-      a->kind = E2_K_ELEM;
-      a->key.kind = E2_K_ELEM;
+      a->kind = E_K_ELEM;
+      a->key.kind = E_K_ELEM;
       a->key.a = (int64_t)obj;
       a->key.b = (int64_t)idx;
       a->val = regval(in, 2);
@@ -517,8 +517,8 @@ static int insn_store(const Q2Insn *in, Access *a) {
       int vi = arg_nearest(in, in->narg - 1, 'r');
       if (nr != 1) return 0;
       if (ref[0].recv < 0 || ref[0].atom == 0) return 0;
-      a->kind = E2_K_FIELD;
-      a->key.kind = E2_K_FIELD;
+      a->kind = E_K_FIELD;
+      a->key.kind = E_K_FIELD;
       a->key.a = ref[0].recv;
       a->key.b = ref[0].atom;
       a->val = vi >= 0 ? regval(in, vi) : Q2_NO_VALUE;
@@ -532,10 +532,10 @@ static int insn_store(const Q2Insn *in, Access *a) {
 
 /* ---- site groups (D9 step 1) -------------------------------------------- */
 
-static int build_groups(const Q2Func *fn, E2Facts *f) {
+static int build_groups(const Q2Func *fn, EFacts *f) {
   int i, k, n = 0, cap = 0, ng = 0;
-  E2SiteInfo *sites = NULL;
-  E2Group *groups = NULL;
+  ESiteInfo *sites = NULL;
+  EGroup *groups = NULL;
   int64_t *gshape = NULL;
 
   for (i = 0; i < fn->ninsns; i++) {
@@ -554,21 +554,21 @@ static int build_groups(const Q2Func *fn, E2Facts *f) {
       if (dup) continue; /* one entry per PIC cell */
       if (n == cap) {
         int nc = cap > 0 ? cap * 2 : 16;
-        E2SiteInfo *q = realloc(sites, sizeof(*q) * (size_t)nc);
+        ESiteInfo *q = realloc(sites, sizeof(*q) * (size_t)nc);
         if (q == NULL) goto oom;
         sites = q;
         cap = nc;
       }
       sites[n].site = ref[r].site;
       sites[n].insn = i;
-      sites[n].group = E2_GROUP_NONE;
+      sites[n].group = E_GROUP_NONE;
       sites[n].recv = ref[r].recv < 0 ? Q2_NO_VALUE : (Q2ValueId)ref[r].recv;
       sites[n].poly = 0;
       n++;
     }
   }
   for (k = 0; k < n; k++) {
-    int ns = 0, g = E2_GROUP_NONE, j;
+    int ns = 0, g = E_GROUP_NONE, j;
     uint64_t shapes[4];
     const Q2Insn *in = &fn->insns[sites[k].insn];
     if (!qjs_aot_prof_site(fn->g->digest, sites[k].site, &ns, shapes)) continue;
@@ -587,8 +587,8 @@ static int build_groups(const Q2Func *fn, E2Facts *f) {
         break;
       }
     }
-    if (g == E2_GROUP_NONE) {
-      E2Group *q = realloc(groups, sizeof(*q) * (size_t)(ng + 1));
+    if (g == E_GROUP_NONE) {
+      EGroup *q = realloc(groups, sizeof(*q) * (size_t)(ng + 1));
       int64_t *s2;
       if (q == NULL) goto oom;
       groups = q;
@@ -603,7 +603,7 @@ static int build_groups(const Q2Func *fn, E2Facts *f) {
       g = ng++;
     }
     {
-      E2Group *gr = &groups[g];
+      EGroup *gr = &groups[g];
       int *q = realloc(gr->sites, sizeof(*q) * (size_t)(gr->nsites + 1));
       if (q == NULL) goto oom;
       gr->sites = q;
@@ -637,34 +637,34 @@ oom:
 static void apply_store_kills(FactSet *s, const Access *stp) {
   const Access st = *stp;
   switch (st.kind) {
-    case E2_K_ARG: {
+    case E_K_ARG: {
       int64_t slot = st.key.a;
       fs_kill(s, kp_arg_slot, &slot);
       break;
     }
-    case E2_K_LOCAL: {
+    case E_K_LOCAL: {
       int64_t slot = st.key.a;
       fs_kill(s, kp_local_slot, &slot);
       break;
     }
-    case E2_K_VARREF: {
+    case E_K_VARREF: {
       int64_t slot = st.key.a;
       fs_kill(s, kp_varref_slot, &slot);
       break;
     }
-    case E2_K_GLOBAL: {
+    case E_K_GLOBAL: {
       int64_t atom = st.key.a;
       fs_kill(s, kp_global_atom, &atom);
       break;
     }
-    case E2_K_FIELD: {
+    case E_K_FIELD: {
       /* Different atoms never alias; the same atom on another receiver may be
          the same object, so it kills them all (D6). */
       int64_t atom = st.key.b;
       fs_kill(s, kp_field_atom, &atom);
       break;
     }
-    case E2_K_ELEM: {
+    case E_K_ELEM: {
       /* Any element store may move, extend or reshape the store. */
       fs_kill(s, kp_elem, NULL);
       break;
@@ -676,35 +676,35 @@ static void apply_store_kills(FactSet *s, const Access *stp) {
 
 /* Whether the instruction is a safepoint, ignoring forwarding (a forwarded load is
    never one): the classification `transfer` applies, for the loop eligibility test. */
-static int is_safepoint(const Q2Func *fn, E2Facts *f, const Q2Insn *in, int grouped_exit) {
+static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int grouped_exit) {
   int kind = insn_kind(in);
-  if (kind == E2_SK_FIELD) {
+  if (kind == E_SK_FIELD) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r, grouped = nr > 0;
     if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
       if (ref[r].site < 0 || ref[r].recv < 0 ||
-          (e2_facts_site_group(f, ref[r].site) < 0 &&
-           !(e2_facts_poly_on && nr == 1 && e2_facts_poly_op(in) &&
-             e2_facts_site_poly(f, ref[r].site))))
+          (e_facts_site_group(f, ref[r].site) < 0 &&
+           !(e_facts_poly_on && nr == 1 && e_facts_poly_op(in) &&
+             e_facts_site_poly(f, ref[r].site))))
         grouped = 0;
-    kind = grouped ? E2_SK_NOJS : E2_SK_SAFE;
+    kind = grouped ? E_SK_NOJS : E_SK_SAFE;
   }
-  if (kind == E2_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
-      e2_intrinsic_lowerable(fn, in))
-    kind = E2_SK_NOJS;
-  return kind == E2_SK_SAFE;
+  if (kind == E_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
+      e_intrinsic_lowerable(fn, in))
+    kind = E_SK_NOJS;
+  return kind == E_SK_SAFE;
 }
 
-static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
+static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
                     int grouped_exit) {
   const Q2Insn *in = &fn->insns[insn];
   /* The fused local read-modify-write ops update a local slot in memory. */
   if ((in->rop == ROP_local_rmw_branch || in->rop == ROP_local_rmw_imm) && in->narg > 1) {
     Access lk;
     memset(&lk, 0, sizeof(lk));
-    lk.kind = E2_K_LOCAL;
-    lk.key.kind = E2_K_LOCAL;
+    lk.kind = E_K_LOCAL;
+    lk.key.kind = E_K_LOCAL;
     lk.key.a = (int64_t)in->arg[1].val;
     apply_store_kills(s, &lk);
   }
@@ -732,7 +732,7 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
 
   /* A field access is no safepoint only when every site it uses is grouped:
      only then is its miss an exit. */
-  if (kind == E2_SK_FIELD) {
+  if (kind == E_SK_FIELD) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r, grouped = nr > 0;
     /* Without `grouped_exit` a grouped access is a safepoint: its miss
@@ -741,30 +741,30 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
     if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
       if (ref[r].site < 0 || ref[r].recv < 0 ||
-          (e2_facts_site_group(f, ref[r].site) < 0 &&
-           !(e2_facts_poly_on && nr == 1 && e2_facts_poly_op(in) &&
-             e2_facts_site_poly(f, ref[r].site))))
+          (e_facts_site_group(f, ref[r].site) < 0 &&
+           !(e_facts_poly_on && nr == 1 && e_facts_poly_op(in) &&
+             e_facts_site_poly(f, ref[r].site))))
         grouped = 0;
-    kind = grouped ? E2_SK_NOJS : E2_SK_SAFE;
+    kind = grouped ? E_SK_NOJS : E_SK_SAFE;
     f->miss_exits[insn] = (uint8_t)grouped;
   }
 
   /* An intrinsic call (a builtin on numbers) cannot run JS: with the exit
      fallback it is no safepoint, so the facts survive it. Without
      `grouped_exit` its miss would continue into the real call. */
-  if (kind == E2_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
-      e2_intrinsic_lowerable(fn, in)) {
-    kind = E2_SK_NOJS;
+  if (kind == E_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
+      e_intrinsic_lowerable(fn, in)) {
+    kind = E_SK_NOJS;
     f->miss_exits[insn] = 1;
   }
 
   /* 2. A guarded access of a receiver whose shape is known skips its tag and
      shape test; either way the shape is known afterwards. */
-  if (kind != E2_SK_SAFE) {
+  if (kind != E_SK_SAFE) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r;
     for (r = 0; r < nr; r++) {
-      int g = ref[r].site >= 0 ? e2_facts_site_group(f, ref[r].site) : -1;
+      int g = ref[r].site >= 0 ? e_facts_site_group(f, ref[r].site) : -1;
       int rv;
       if (g < 0 || ref[r].recv < 0) continue;
       f->access[insn] = 1;
@@ -799,7 +799,7 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
      `this`. It applies after the instruction's own load or store, so an
      ungrouped read does not leave a fact behind either: its miss may have run
      a getter. */
-  if (kind == E2_SK_SAFE) {
+  if (kind == E_SK_SAFE) {
     fs_kill(s, kp_safepoint, NULL);
     s->nshape = 0;
   }
@@ -818,7 +818,7 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
    hoisted: a hoisted load needs a new value in the IR (deferred). */
 static int in_loop(const uint8_t *loop, int b) { return b >= 0 && loop[b]; }
 
-static int plan_hoists(const Q2Func *fn, E2Facts *out, int grouped_exit) {
+static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
   int b, bi, k, q, p;
   uint8_t *loop = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), 1);
   int *stack = malloc(sizeof(int) * (size_t)(fn->nblocks > 0 ? fn->nblocks : 1));
@@ -827,7 +827,7 @@ static int plan_hoists(const Q2Func *fn, E2Facts *out, int grouped_exit) {
     free(stack);
     return -1;
   }
-  if (getenv("QJS_AOT_E2_NOHOIST") != NULL) goto done;
+  if (getenv("QJS_AOT_NOHOIST") != NULL) goto done;
   for (b = 0; b < fn->nblocks; b++) {
     const Q2Block *lt = &fn->blocks[b];
     int si;
@@ -866,7 +866,7 @@ static int plan_hoists(const Q2Func *fn, E2Facts *out, int grouped_exit) {
         for (k = 0; k < fn->blocks[bi].ninsns; k++)
           /* Negative control: "unsafe" hoists past a safepoint. */
           if (is_safepoint(fn, out, &fn->insns[fn->blocks[bi].first_insn + k], grouped_exit) &&
-              getenv("QJS_AOT_E2_HOIST_CONTROL_SAFE") == NULL) {
+              getenv("QJS_AOT_HOIST_CONTROL_SAFE") == NULL) {
             safe = 0;
             break;
           }
@@ -905,12 +905,12 @@ static int plan_hoists(const Q2Func *fn, E2Facts *out, int grouped_exit) {
           const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
           SiteRef ref[2];
           int nr = site_refs(in, ref), r;
-          if (insn_kind(in) != E2_SK_FIELD) continue;
+          if (insn_kind(in) != E_SK_FIELD) continue;
           for (r = 0; r < nr; r++) {
             int g, dup = 0, db;
             Q2ValueId v;
             if (ref[r].site < 0 || ref[r].recv < 0) continue;
-            g = e2_facts_site_group(out, ref[r].site);
+            g = e_facts_site_group(out, ref[r].site);
             if (g < 0) continue;
             v = (Q2ValueId)ref[r].recv;
             if (v >= (Q2ValueId)fn->nvalues) continue;
@@ -952,7 +952,7 @@ done:
   return 0;
 }
 
-int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
+int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   FactSet cur;
   FactSet *outs = NULL;
   int b, bi, i, k, rc = -1;
@@ -1019,7 +1019,7 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
               Access st2;
               /* Negative control: "nokill" carries facts past a store that kills them. */
               if (insn_store(&fn->insns[fn->blocks[bb].first_insn + ii], &st2) &&
-                  getenv("QJS_AOT_E2_HOIST_CONTROL") == NULL)
+                  getenv("QJS_AOT_HOIST_CONTROL") == NULL)
                 apply_store_kills(&cur, &st2);
             }
           }
@@ -1089,11 +1089,11 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
     }
     if (cur.navail > 0) {
       out->blocks[b].navail = cur.navail;
-      out->blocks[b].avail = malloc(sizeof(E2Avail) * (size_t)cur.navail);
+      out->blocks[b].avail = malloc(sizeof(EAvail) * (size_t)cur.navail);
       if (out->blocks[b].avail == NULL) goto done;
       memcpy(
           out->blocks[b].avail, cur.avail,
-          sizeof(E2Avail) * (size_t)cur.navail);
+          sizeof(EAvail) * (size_t)cur.navail);
     }
 
     for (k = 0; k < blk->ninsns; k++) {
@@ -1115,11 +1115,11 @@ done:
     free(outs);
   }
   fs_free(&cur);
-  if (rc < 0) e2_facts_free(out);
+  if (rc < 0) e_facts_free(out);
   return rc;
 }
 
-void e2_facts_free(E2Facts *f) {
+void e_facts_free(EFacts *f) {
   int i;
   if (f == NULL) return;
   for (i = 0; i < f->nloops; i++) free(f->loop_mem[i]);
@@ -1150,9 +1150,9 @@ void e2_facts_free(E2Facts *f) {
   memset(f, 0, sizeof(*f));
 }
 
-int e2_facts_poly_on;
+int e_facts_poly_on;
 
-int e2_facts_site_poly(const E2Facts *f, int site) {
+int e_facts_site_poly(const EFacts *f, int site) {
   int i;
   if (f == NULL || f->sites == NULL) return 0;
   for (i = 0; i < f->nsites; i++)
@@ -1160,17 +1160,17 @@ int e2_facts_site_poly(const E2Facts *f, int site) {
   return 0;
 }
 
-int e2_facts_poly_op(const Q2Insn *in) {
+int e_facts_poly_op(const Q2Insn *in) {
   return in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
          in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own ||
          in->rop == ROP_put_field;
 }
 
-int e2_facts_site_group(const E2Facts *f, int site) {
+int e_facts_site_group(const EFacts *f, int site) {
   int i;
-  if (f == NULL || f->sites == NULL) return E2_GROUP_NONE;
+  if (f == NULL || f->sites == NULL) return E_GROUP_NONE;
   for (i = 0; i < f->nsites; i++) {
     if (f->sites[i].site == site) return f->sites[i].group;
   }
-  return E2_GROUP_NONE;
+  return E_GROUP_NONE;
 }

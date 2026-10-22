@@ -20,7 +20,6 @@
 #   CC             clang
 #   WORK           build and cache directory (default /tmp/qjs-check)
 #   JOBS           parallel compiles (default: nproc)
-#   GEN            qjsaot2 when tools/aot/qjsaot2/main.c exists, else qjsaot
 #   BOX2D          box2d checksum script for t1+ (default .local/box2d-gap/check.js)
 #   OCTANE=1       run the Octane rows in t3
 #   UPDATE_GOLDEN=1  refresh tools/aot/kernels2/golden/*.ir in t0
@@ -35,11 +34,7 @@ GOLDEN=$K2/golden
 CC=${CC:-clang}
 WORK=${WORK:-/tmp/qjs-check}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
-# qjsaot2 is preferred once it can emit a unit; while only the IR stage exists
-# it is still used for --verify-ir (GEN_IRBIN) and qjsaot builds the units.
-if [ -z "${GEN:-}" ]; then
-  if [ -f tools/aot/qjsaot2/main.c ]; then GEN=qjsaot2; else GEN=qjsaot; fi
-fi
+GEN=qjsaot
 BOX2D=${BOX2D:-.local/box2d-gap/check.js}
 [ -f "$BOX2D" ] || BOX2D=""
 BASE="-g -std=gnu11 -D_GNU_SOURCE -I$S"
@@ -63,14 +58,7 @@ hash_of() { sha256sum -- "$@" 2>/dev/null | sha256sum | cut -c1-16; }
 
 ENG_HASH=$(hash_of $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c $S/*.h)
 select_gen() {
-  if [ "$GEN" = qjsaot2 ]; then
-    # qjsaot2 links the shared unit builder (selection, profile, table and
-    # layout emission) and supplies its own lowering, so the driver is compiled
-    # once, without its main.
-    GEN_SRC=(-DQJS_AOT_NO_MAIN tools/aot/qjsaot.c tools/aot/qjsaot2/*.c)
-  else
-    GEN_SRC=(tools/aot/qjsaot.c)
-  fi
+  GEN_SRC=(tools/aot/qjsaot/*.c)
   GEN_HASH=$(hash_of "${GEN_SRC[@]}" tools/benchmark/qjs-bench.c "$S/quickjs.h")
   BIN="$WORK/gen/$GEN_HASH/$GEN"
   GEN_BASE="$WORK/gen/$GEN_HASH"
@@ -185,7 +173,7 @@ run_ir_verify() {
   [ -n "${GEN_IRBIN:-}" ] || return 0
   if ! "${GEN_IRBIN:-$BIN}" --verify-ir "$@" > "$WORK/out/verify-ir.log" 2>&1; then
     fail=$((fail + 1)); log "FAIL --verify-ir $*"
-    grep -v '^qjsaot2: [0-9/]* functions' "$WORK/out/verify-ir.log" | head -5
+    grep -v '^qjsaot: [0-9/]* functions' "$WORK/out/verify-ir.log" | head -5
     return 1
   fi
   res=$(grep -o '[0-9]*/[0-9]* functions verified.*' "$WORK/out/verify-ir.log" | tail -1)

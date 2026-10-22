@@ -6,7 +6,7 @@
  */
 
 /*
- * Builds qjsaot2's IR from one function's register program.
+ * Builds qjsaot's IR from one function's register program.
  *
  * The program is the encoded bytecode the engine runs, decoded with the
  * engine's own decoder. The graph is a CFG of blocks with parameters:
@@ -28,7 +28,7 @@
 #include <string.h>
 
 #include "ir.h"
-#include "e2.h"
+#include "emit.h"
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
 
@@ -1243,7 +1243,7 @@ static void q2_canon_cmp_branch(Q2Insn *in) {
 
 /* Whether an instruction's destination takes its type from a profile record
    rather than from its operands. Kept in step with `def_from_record` in
-   e2_types.c, which decides the same set for the inference; a destination not
+   e_types.c, which decides the same set for the inference; a destination not
    in this set must not be typed from an `R` record here. */
 static int def_from_record_insn(const Q2Insn *in) {
   switch (in->op) {
@@ -1941,7 +1941,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
      all because the profile's header said `thr=1`, which
      `qjs_aot_prof_regs` enforces by returning nothing otherwise. */
   if (f->prof_regs != NULL && f->nprof_regs > 0 && f->nregs > 0 &&
-      strcmp(getenv("E2_R_RULE") ?: "", "off")) {
+      strcmp(getenv("E_R_RULE") ?: "", "off")) {
     int32_t *nwrites = calloc((size_t)f->nregs, sizeof(*nwrites));
     if (nwrites == NULL) goto fail;
     for (i = 0; i < f->ninsns; i++) {
@@ -1988,7 +1988,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       }
 
       if (v->reg < 0 || v->reg >= f->nregs) continue;
-      if (getenv("E2_DEBUG_CAND")) {
+      if (getenv("E_DEBUG_CAND")) {
         int w, rtypes = -1;
         for (w = 0; w < f->nprof_regs; w++)
           if (f->prof_regs[w].reg == v->reg) rtypes = (int)f->prof_regs[w].types;
@@ -2009,7 +2009,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
             hit = 1;
           if (hit) {
             char nm[32];
-            e2_rop_name((uint16_t)wi->rop, nm, sizeof(nm));
+            e_rop_name((uint16_t)wi->rop, nm, sizeof(nm));
             fprintf(stderr, " %d:%s", wi->pc, nm);
           }
         }
@@ -2018,8 +2018,8 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       /* The three preconditions for using an `R` record. Together they say:
          the record is complete, this pc is part of it, and the register has
          block the rule for the values it targets, so it was removed. The
-         write count is still computed for the `E2_DEBUG_CAND` report.
-         `E2_R_RULE=off` drops the whole pass, so a test can show it does
+         write count is still computed for the `E_DEBUG_CAND` report.
+         `E_R_RULE=off` drops the whole pass, so a test can show it does
          something; a count that does not move when it is off is measuring
          nothing.
 

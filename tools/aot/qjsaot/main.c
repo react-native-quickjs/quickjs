@@ -6,13 +6,13 @@
  */
 
 /*
- * qjsaot2 -- the SSA generator. This driver compiles the inputs, enumerates
+ * qjsaot -- the SSA generator. This driver compiles the inputs, enumerates
  * every function's register program and puts it through the IR build and the
  * verifier. The unit emitter lands on top of the same graph (the lowering);
  * until then this mode is how the IR is checked over whole corpora:
  *
- *   qjsaot2 --verify-ir bundle.js ...      build and verify every function
- *   qjsaot2 --dump-ir bundle.js ...        print the SSA of every function
+ *   qjsaot --verify-ir bundle.js ...      build and verify every function
+ *   qjsaot --dump-ir bundle.js ...        print the SSA of every function
  *
  * Exit status is non-zero when a function fails to build or verify, so the
  * harness can gate on it.
@@ -21,14 +21,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "e2_analysis.h"
+#include "analysis.h"
 #include "ir.h"
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
 #include "quickjs.h"
 
 /* The unit builder (selection, profile, table emission and the layout header)
-   lives in qjsaot.c. qjsaot2 drives it with its own body emitter so the ABI
+   lives in qjsaot.c. qjsaot drives it with its own body emitter so the ABI
    and the selection are shared rather than copied. Emission mode therefore
    hands over to it; --verify-ir and --dump-ir stay here, where the IR lives. */
 int qjsaot_driver_main(int argc, char **argv);
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
   }
   /* Generating and dumping types in one run: the driver builds the unit, and the
      types dump above/below uses its own facts call, so the two never share one
-     E2Facts and the body is always emitted in the continuing-miss mode. */
+     EFacts and the body is always emitted in the continuing-miss mode. */
   {
     int gen = 0, j;
     for (j = 1; j < argc; j++)
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
       continue;
     }
     if (argv[i][0] == '-') {
-      fprintf(stderr, "qjsaot2: unknown option %s\n", argv[i]);
+      fprintf(stderr, "qjsaot: unknown option %s\n", argv[i]);
       return 2;
     }
     ninputs++;
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
   if (ninputs == 0) {
     fprintf(
         stderr,
-        "usage: qjsaot2 --verify-ir|--dump-ir|--stats|--types "
+        "usage: qjsaot --verify-ir|--dump-ir|--stats|--types "
         "bundle.js ...\n");
     return 2;
   }
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
   if (types_out != NULL) {
     types_fp = fopen(types_out, "w");
     if (types_fp == NULL) {
-      fprintf(stderr, "qjsaot2: cannot write %s\n", types_out);
+      fprintf(stderr, "qjsaot: cannot write %s\n", types_out);
       return 1;
     }
   }
@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
   if (profile) {
     extern int qjs_aot_prof_load(const char *path);
     if (qjs_aot_prof_load(profile) < 0) {
-      fprintf(stderr, "qjsaot2: cannot use profile %s\n", profile);
+      fprintf(stderr, "qjsaot: cannot use profile %s\n", profile);
       return 1;
     }
   }
@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
     }
     src = read_file(argv[i], &len);
     if (!src) {
-      fprintf(stderr, "qjsaot2: cannot read %s\n", argv[i]);
+      fprintf(stderr, "qjsaot: cannot read %s\n", argv[i]);
       fails++;
       continue;
     }
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
     if (JS_IsException(v)) {
       JSValue e = JS_GetException(ctx);
       const char *s = JS_ToCString(ctx, e);
-      fprintf(stderr, "qjsaot2: %s: %s\n", argv[i], s ? s : "(unprintable)");
+      fprintf(stderr, "qjsaot: %s: %s\n", argv[i], s ? s : "(unprintable)");
       JS_FreeCString(ctx, s);
       JS_FreeValue(ctx, e);
       fails++;
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
     nfuncs_uniq++;
     if (q2_build(&funcs[i], &f) < 0) {
       fprintf(
-          stderr, "qjsaot2: %s: build failed: %s\n",
+          stderr, "qjsaot: %s: build failed: %s\n",
           funcs[i].name[0] ? funcs[i].name : "<anon>", f.why ? f.why : "?");
       q2_free(&f);
       fails++;
@@ -234,7 +234,7 @@ int main(int argc, char **argv) {
     }
     if (verify && q2_verify(&f, msg, sizeof(msg)) < 0) {
       fprintf(
-          stderr, "qjsaot2: %s: verify failed: %s\n",
+          stderr, "qjsaot: %s: verify failed: %s\n",
           funcs[i].name[0] ? funcs[i].name : "<anon>", msg);
       q2_free(&f);
       fails++;
@@ -249,7 +249,7 @@ int main(int argc, char **argv) {
       int h;
       for (h = 0; h < 16; h++)
         snprintf(hex + h * 2, 3, "%02x", funcs[i].digest[h]);
-      if (e2_analysis_dump(types_out ? types_fp : stdout, &f, hex, 0.0) < 0) {
+      if (e_analysis_dump(types_out ? types_fp : stdout, &f, hex, 0.0) < 0) {
         q2_free(&f);
         fails++;
         continue;
@@ -328,32 +328,32 @@ int main(int argc, char **argv) {
       }
       q2_free(&sf);
     }
-    fprintf(stderr, "qjsaot2: prof-hit %ld\n", nprof_hit);
+    fprintf(stderr, "qjsaot: prof-hit %ld\n", nprof_hit);
     fprintf(
         stderr,
-        "qjsaot2: fallbacks %ld, unknown-role %ld, params %ld (was %ld)\n", nfb,
+        "qjsaot: fallbacks %ld, unknown-role %ld, params %ld (was %ld)\n", nfb,
         nunk, nparams, nparams_before);
     fprintf(
         stderr,
-        "qjsaot2: defs %ld, records %ld (int %ld, float %ld, int|float "
+        "qjsaot: defs %ld, records %ld (int %ld, float %ld, int|float "
         "%ld, other %ld), no record %ld\n",
         ndefs, nrec, nrec_int, nrec_float, nrec_num, nrec_other, nrec_none);
     fprintf(
         stderr,
-        "qjsaot2: reps tagged %ld, i32 %ld, f64 %ld, bool %ld; spec %ld, "
+        "qjsaot: reps tagged %ld, i32 %ld, f64 %ld, bool %ld; spec %ld, "
         "ovf %ld, typed params %ld\n",
         vrep[Q2_R_TAGGED], vrep[Q2_R_I32], vrep[Q2_R_F64], vrep[Q2_R_BOOL],
         nspec, novf, ntyped_param);
     fprintf(
-        stderr, "qjsaot2: binaries %ld (typed %ld), compares %ld\n", ntbin,
+        stderr, "qjsaot: binaries %ld (typed %ld), compares %ld\n", ntbin,
         ntbin_typed, ntcmp);
     for (k2 = 0; k2 < ROP_COUNT; k2++)
       if (byrop[k2] > 0)
-        fprintf(stderr, "qjsaot2:   unknown rop %d x%ld\n", k2, byrop[k2]);
+        fprintf(stderr, "qjsaot:   unknown rop %d x%ld\n", k2, byrop[k2]);
   }
   fprintf(
       stderr,
-      "qjsaot2: %ld/%ld functions%s, %ld blocks, %ld insns, %ld values\n",
+      "qjsaot: %ld/%ld functions%s, %ld blocks, %ld insns, %ld values\n",
       nfuncs_ok, nfuncs_uniq, verify ? " verified" : " built", nblocks, ninsns,
       nvalues);
   js_aot_gen_free(rt, funcs, nfuncs);

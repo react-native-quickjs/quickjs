@@ -4,7 +4,7 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * The SSA dump behind `qjsaot2 --dump-ir`. It is the golden file for the
+ * The SSA dump behind `qjsaot --dump-ir`. It is the golden file for the
  * graph build: a change to the lowering, to the decoder or to the builder
  * shows up as a diff, and the layout is stable (pc order, one line per
  * instruction, values named by index).

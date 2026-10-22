@@ -25,7 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "e2.h"
+#include "emit.h"
 #include "quickjs-aot-rt.h"
 
 /* Result kinds: the type a lowering gives the call's result from its argument
@@ -33,39 +33,39 @@
    integral value becomes an int); `RES_SAME` is an i32 for an i32 argument and
    an f64 otherwise; `RES_ABS` is `RES_SAME` except that abs(INT32_MIN) is an f64,
    so an i32 result needs an exit or a double. */
-enum { E2_RES_F64, E2_RES_SAME, E2_RES_ABS, E2_RES_MINMAX, E2_RES_PARSEINT };
+enum { E_RES_F64, E_RES_SAME, E_RES_ABS, E_RES_MINMAX, E_RES_PARSEINT };
 
-typedef struct E2Intrinsic {
+typedef struct EIntrinsic {
   int id;
   const char *name;   /* Math.floor */
   const char *sym;    /* js_math_floor: the profile's symbol */
   int magic;          /* the magic number the callee must carry, or -1 */
   int argc_min, argc_max;
-  int result;         /* E2_RES_* */
+  int result;         /* E_RES_* */
   /* For numeric arguments: */
   uint8_t runs_js, allocs, writes;
-} E2Intrinsic;
+} EIntrinsic;
 
-static const E2Intrinsic e2_intr[QJS_AOT_INTR_COUNT] = {
-    {QJS_AOT_INTR_SQRT, "Math.sqrt", "js_math_sqrt", 0, 1, 1, E2_RES_F64, 0, 0, 0},
-    {QJS_AOT_INTR_ABS, "Math.abs", "js_math_fabs", 0, 1, 1, E2_RES_ABS, 0, 0, 0},
-    {QJS_AOT_INTR_FLOOR, "Math.floor", "js_math_floor", 0, 1, 1, E2_RES_SAME, 0, 0, 0},
-    {QJS_AOT_INTR_CEIL, "Math.ceil", "js_math_ceil", 0, 1, 1, E2_RES_SAME, 0, 0, 0},
-    {QJS_AOT_INTR_ROUND, "Math.round", "js_math_round", 0, 1, 1, E2_RES_SAME, 0, 0, 0},
-    {QJS_AOT_INTR_SIN, "Math.sin", "js_math_sin", 0, 1, 1, E2_RES_F64, 0, 0, 0},
-    {QJS_AOT_INTR_COS, "Math.cos", "js_math_cos", 0, 1, 1, E2_RES_F64, 0, 0, 0},
-    {QJS_AOT_INTR_MIN, "Math.min", "js_math_min_max", 0, 2, 2, E2_RES_MINMAX, 0, 0, 0},
-    {QJS_AOT_INTR_MAX, "Math.max", "js_math_min_max", 1, 2, 2, E2_RES_MINMAX, 0, 0, 0},
-    {QJS_AOT_INTR_PARSEINT, "parseInt", "js_parseInt", 0, 1, 2, E2_RES_PARSEINT, 0, 0, 0},
+static const EIntrinsic e_intr[QJS_AOT_INTR_COUNT] = {
+    {QJS_AOT_INTR_SQRT, "Math.sqrt", "js_math_sqrt", 0, 1, 1, E_RES_F64, 0, 0, 0},
+    {QJS_AOT_INTR_ABS, "Math.abs", "js_math_fabs", 0, 1, 1, E_RES_ABS, 0, 0, 0},
+    {QJS_AOT_INTR_FLOOR, "Math.floor", "js_math_floor", 0, 1, 1, E_RES_SAME, 0, 0, 0},
+    {QJS_AOT_INTR_CEIL, "Math.ceil", "js_math_ceil", 0, 1, 1, E_RES_SAME, 0, 0, 0},
+    {QJS_AOT_INTR_ROUND, "Math.round", "js_math_round", 0, 1, 1, E_RES_SAME, 0, 0, 0},
+    {QJS_AOT_INTR_SIN, "Math.sin", "js_math_sin", 0, 1, 1, E_RES_F64, 0, 0, 0},
+    {QJS_AOT_INTR_COS, "Math.cos", "js_math_cos", 0, 1, 1, E_RES_F64, 0, 0, 0},
+    {QJS_AOT_INTR_MIN, "Math.min", "js_math_min_max", 0, 2, 2, E_RES_MINMAX, 0, 0, 0},
+    {QJS_AOT_INTR_MAX, "Math.max", "js_math_min_max", 1, 2, 2, E_RES_MINMAX, 0, 0, 0},
+    {QJS_AOT_INTR_PARSEINT, "parseInt", "js_parseInt", 0, 1, 2, E_RES_PARSEINT, 0, 0, 0},
 };
 
-const char *e2_intrinsic_name(int id) {
-  return id >= 0 && id < QJS_AOT_INTR_COUNT ? e2_intr[id].name : "?";
+const char *e_intrinsic_name(int id) {
+  return id >= 0 && id < QJS_AOT_INTR_COUNT ? e_intr[id].name : "?";
 }
 
 /* The id for a profile callee key "symbol:magic", or -1. Only `min`/`max` carry
    a meaningful magic; for every other row it is whatever the profile saw (0). */
-int e2_intrinsic_id_for_key(const char *key) {
+int e_intrinsic_id_for_key(const char *key) {
   char sym[40];
   const char *colon = strrchr(key, ':');
   int magic, i;
@@ -77,9 +77,9 @@ int e2_intrinsic_id_for_key(const char *key) {
   sym[n] = 0;
   magic = (int)strtol(colon + 1, NULL, 10);
   for (i = 0; i < QJS_AOT_INTR_COUNT; i++)
-    if (strcmp(e2_intr[i].sym, sym) == 0 &&
-        (e2_intr[i].id == QJS_AOT_INTR_MIN || e2_intr[i].id == QJS_AOT_INTR_MAX
-             ? e2_intr[i].magic == magic
+    if (strcmp(e_intr[i].sym, sym) == 0 &&
+        (e_intr[i].id == QJS_AOT_INTR_MIN || e_intr[i].id == QJS_AOT_INTR_MAX
+             ? e_intr[i].magic == magic
              : 1))
       return i;
   return -1;
@@ -89,7 +89,7 @@ int e2_intrinsic_id_for_key(const char *key) {
    is an intrinsic site: every callee the profile saw is a C function that maps to
    the same id, and the set was not cut short (a full callee list may have lost
    one). Returns the id, or -1. */
-int e2_intrinsic_site(const uint8_t digest[16], int pc) {
+int e_intrinsic_site(const uint8_t digest[16], int pc) {
   char hex[4][33];
   int kind[4], n = 0, k, id = -1;
   unsigned long long hits[4];
@@ -98,27 +98,27 @@ int e2_intrinsic_site(const uint8_t digest[16], int pc) {
   for (k = 0; k < n; k++) {
     int i;
     if (kind[k] != 2) return -1;
-    i = e2_intrinsic_id_for_key(hex[k]);
+    i = e_intrinsic_id_for_key(hex[k]);
     if (i < 0 || (id >= 0 && i != id)) return -1;
     id = i;
   }
   return id;
 }
 
-int e2_intrinsic_argc_ok(int id, int argc) {
-  return id >= 0 && id < QJS_AOT_INTR_COUNT && argc >= e2_intr[id].argc_min &&
-         argc <= e2_intr[id].argc_max;
+int e_intrinsic_argc_ok(int id, int argc) {
+  return id >= 0 && id < QJS_AOT_INTR_COUNT && argc >= e_intr[id].argc_min &&
+         argc <= e_intr[id].argc_max;
 }
 
 /* The flags for numeric arguments (all 0 today; a row that cannot promise that
    must not be in the table). */
-int e2_intrinsic_pure(int id) {
-  return id >= 0 && id < QJS_AOT_INTR_COUNT && !e2_intr[id].runs_js &&
-         !e2_intr[id].allocs && !e2_intr[id].writes;
+int e_intrinsic_pure(int id) {
+  return id >= 0 && id < QJS_AOT_INTR_COUNT && !e_intr[id].runs_js &&
+         !e_intr[id].allocs && !e_intr[id].writes;
 }
 
 /* The magic a callee must carry for `id`, or -1 when none is checked. */
-int e2_intrinsic_magic(int id) {
+int e_intrinsic_magic(int id) {
   if (id == QJS_AOT_INTR_MIN) return 0;
   if (id == QJS_AOT_INTR_MAX) return 1;
   return -1;

@@ -51,8 +51,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "e2.h"
-#include "e2_analysis.h"
+#include "emit.h"
+#include "analysis.h"
 #include "quickjs-regvm.h"
 
 /* Whether constant-pool entry `idx` is a number (qjsaot.c). */
@@ -61,19 +61,19 @@ int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
 /* ---- the lattice -------------------------------------------------------- */
 
 static int lb_join(int a, int b) {
-  if (a == E2_LB_BOT) return b;
-  if (b == E2_LB_BOT) return a;
+  if (a == E_LB_BOT) return b;
+  if (b == E_LB_BOT) return a;
   if (a == b) return a;
-  if (a == E2_LB_BOOL || b == E2_LB_BOOL) return E2_LB_TAG;
-  if (a == E2_LB_I32 && b == E2_LB_F64) return E2_LB_F64;
-  if (a == E2_LB_F64 && b == E2_LB_I32) return E2_LB_F64;
-  return E2_LB_TAG;
+  if (a == E_LB_BOOL || b == E_LB_BOOL) return E_LB_TAG;
+  if (a == E_LB_I32 && b == E_LB_F64) return E_LB_F64;
+  if (a == E_LB_F64 && b == E_LB_I32) return E_LB_F64;
+  return E_LB_TAG;
 }
 
 /* Whether a representation is a number held in a C number type. BOT is *not*
    one: an uncomputed value is unknown, not boxed. */
 static int lb_num(int lb) {
-  return lb == E2_LB_I32 || lb == E2_LB_F64;
+  return lb == E_LB_I32 || lb == E_LB_F64;
 }
 
 /* ---- the profile's record for a definition ------------------------------ */
@@ -82,12 +82,12 @@ static int lb_num(int lb) {
    bool). A record holding a string, an object or undefined means the
    speculative body's guard would fail too often to pay for itself. */
 static int lb_from_q2_types(uint32_t t, int has) {
-  if (!has) return E2_LB_TAG;
-  if (t == Q2_T_INT32) return E2_LB_I32;
-  if (t == Q2_T_NUM) return E2_LB_F64;
-  if (t == (Q2_T_INT32 | Q2_T_NUM)) return E2_LB_F64;
-  if (t == Q2_T_BOOL) return E2_LB_BOOL;
-  return E2_LB_TAG;
+  if (!has) return E_LB_TAG;
+  if (t == Q2_T_INT32) return E_LB_I32;
+  if (t == Q2_T_NUM) return E_LB_F64;
+  if (t == (Q2_T_INT32 | Q2_T_NUM)) return E_LB_F64;
+  if (t == Q2_T_BOOL) return E_LB_BOOL;
+  return E_LB_TAG;
 }
 
 /* The profile's `P` record at `pc`, or 0 when the function has none there. */
@@ -200,36 +200,36 @@ static int chain_first_link(const Q2Insn *in, int k) {
    computed yet, else TAG. This is the shape of add, sub, mul, div, mod and the
    unsigned shift. */
 static int rep_exact(int a, int b, int rec_int_only) {
-  if (a == E2_LB_BOT || b == E2_LB_BOT) return E2_LB_BOT;
-  if (a == E2_LB_I32 && b == E2_LB_I32)
-    return rec_int_only ? E2_LB_I32 : E2_LB_F64;
-  if (lb_num(a) && lb_num(b)) return E2_LB_F64;
-  return E2_LB_TAG;
+  if (a == E_LB_BOT || b == E_LB_BOT) return E_LB_BOT;
+  if (a == E_LB_I32 && b == E_LB_I32)
+    return rec_int_only ? E_LB_I32 : E_LB_F64;
+  if (lb_num(a) && lb_num(b)) return E_LB_F64;
+  return E_LB_TAG;
 }
 
 /* The bitwise operations and the two arithmetic shifts: ToInt32 of a number is
    total, so two numbers give an exact i32 and no record is needed. */
 static int rep_bit(int a, int b) {
-  if (a == E2_LB_BOT || b == E2_LB_BOT) return E2_LB_BOT;
-  return (lb_num(a) && lb_num(b)) ? E2_LB_I32 : E2_LB_TAG;
+  if (a == E_LB_BOT || b == E_LB_BOT) return E_LB_BOT;
+  return (lb_num(a) && lb_num(b)) ? E_LB_I32 : E_LB_TAG;
 }
 
 /* A compare: BOOL when both sides are numbers, and for strict equality also when
    both are bools (the tags are the whole test). */
 static int rep_cmp(int sub, int a, int b) {
-  if (a == E2_LB_BOT || b == E2_LB_BOT) return E2_LB_BOT;
-  if (lb_num(a) && lb_num(b)) return E2_LB_BOOL;
+  if (a == E_LB_BOT || b == E_LB_BOT) return E_LB_BOT;
+  if (lb_num(a) && lb_num(b)) return E_LB_BOOL;
   if ((sub == REG_BIN_STRICT_EQ || sub == REG_BIN_STRICT_NEQ) &&
-      a == E2_LB_BOOL && b == E2_LB_BOOL)
-    return E2_LB_BOOL;
-  return E2_LB_TAG;
+      a == E_LB_BOOL && b == E_LB_BOOL)
+    return E_LB_BOOL;
+  return E_LB_TAG;
 }
 
 /* An increment keeps the operand's representation: an int stays an int (the
    lowering guards the overflow) and a double stays a double. A bool becomes an
    exact int, since `true++` is 1 and 2 does not fit a bool. */
 static int rep_inc(int a) {
-  if (a == E2_LB_BOOL) return E2_LB_I32;
+  if (a == E_LB_BOOL) return E_LB_I32;
   return a;
 }
 
@@ -248,21 +248,21 @@ static uint8_t exits_for(int rop, int sub, int from_opcall) {
     case ROP_add_imm_self_branch_s:
     case ROP_inc:
     case ROP_dec:
-      return E2_EX_OVF;
+      return E_EX_OVF;
     case ROP_mul:
       /* overflow, and -0: a zero product with a negative operand is -0 in JS,
          which an int32 cannot hold. */
-      return E2_EX_OVF | E2_EX_NEGZERO;
+      return E_EX_OVF | E_EX_NEGZERO;
     case ROP_div:
-      return E2_EX_ZERODIV | E2_EX_NOTEXACT | E2_EX_INTMIN | E2_EX_NEGZERO;
+      return E_EX_ZERODIV | E_EX_NOTEXACT | E_EX_INTMIN | E_EX_NEGZERO;
     case ROP_mod:
-      return E2_EX_ZERODIV | E2_EX_INTMIN | E2_EX_SIGNEDMIN;
+      return E_EX_ZERODIV | E_EX_INTMIN | E_EX_SIGNEDMIN;
     case ROP_shr:
-      return E2_EX_SHRBIG;
+      return E_EX_SHRBIG;
     case ROP_neg:
     case ROP_post_inc:
     case ROP_post_dec:
-      return E2_EX_OVF;
+      return E_EX_OVF;
     default:
       break;
   }
@@ -271,21 +271,21 @@ static uint8_t exits_for(int rop, int sub, int from_opcall) {
     switch (sub & ~REG_CMP_INVERT) {
       case REG_BIN_ADD:
       case REG_BIN_SUB:
-        return E2_EX_OVF;
+        return E_EX_OVF;
       case REG_BIN_MUL:
-        return E2_EX_OVF | E2_EX_NEGZERO;
+        return E_EX_OVF | E_EX_NEGZERO;
       case REG_BIN_DIV:
-        return E2_EX_ZERODIV | E2_EX_NOTEXACT | E2_EX_INTMIN | E2_EX_NEGZERO;
+        return E_EX_ZERODIV | E_EX_NOTEXACT | E_EX_INTMIN | E_EX_NEGZERO;
       case REG_BIN_MOD:
-        return E2_EX_ZERODIV | E2_EX_INTMIN | E2_EX_SIGNEDMIN;
+        return E_EX_ZERODIV | E_EX_INTMIN | E_EX_SIGNEDMIN;
       case REG_BIN_SHR:
-        return E2_EX_SHRBIG;
+        return E_EX_SHRBIG;
       default:
         return 0;
     }
   }
   if (rop == ROP_unary && (sub & ~REG_CMP_INVERT) == REG_UN_NEG)
-    return E2_EX_OVF | E2_EX_NEGZERO | E2_EX_SIGNEDMIN;
+    return E_EX_OVF | E_EX_NEGZERO | E_EX_SIGNEDMIN;
   return 0;
 }
 
@@ -297,12 +297,12 @@ static int binary_operands(const Q2Insn *in, const uint8_t *w, int *a, int *b) {
     case ROP_sub_imm_s:
     case ROP_binary_imm:
     case ROP_binary_imm_s:
-      *a = in->nuse >= 1 ? w[in->use[0]] : E2_LB_BOT;
-      *b = E2_LB_I32;
+      *a = in->nuse >= 1 ? w[in->use[0]] : E_LB_BOT;
+      *b = E_LB_I32;
       return 1;
     case ROP_binary_cpool:
-      *a = in->nuse >= 1 ? w[in->use[0]] : E2_LB_BOT;
-      *b = E2_LB_BOT; /* the pool entry decides, in the transfer */
+      *a = in->nuse >= 1 ? w[in->use[0]] : E_LB_BOT;
+      *b = E_LB_BOT; /* the pool entry decides, in the transfer */
       return 1;
     default:
       break;
@@ -314,7 +314,7 @@ static int binary_operands(const Q2Insn *in, const uint8_t *w, int *a, int *b) {
   }
   if (in->nuse == 1) {
     *a = w[in->use[0]];
-    *b = E2_LB_I32;
+    *b = E_LB_I32;
     return 1;
   }
   return 0;
@@ -330,7 +330,7 @@ static int record_int_only(const Q2Value *v) {
    they are) and TAG when no rule applies. `whyp`/`whyvp` name the operand or
    operation that forced TAG. */
 static int transfer_def(
-    const Q2Func *fn, const E2Facts *facts, const Q2Insn *in, int insn, int d,
+    const Q2Func *fn, const EFacts *facts, const Q2Insn *in, int insn, int d,
     const uint8_t *w, int *whyp, Q2ValueId *whyvp, int *from_opcall) {
   const Q2Value *dv = &fn->values[in->def[d]];
   int sub = in->sub & ~REG_CMP_INVERT;
@@ -339,18 +339,18 @@ static int transfer_def(
   *from_opcall = 0;
   switch (in->op) {
     case Q2_OP_MOVE:
-      return in->nuse >= 1 ? w[in->use[0]] : E2_LB_TAG;
+      return in->nuse >= 1 ? w[in->use[0]] : E_LB_TAG;
     case Q2_OP_CONST:
       switch (dv->con_kind) {
         case Q2_CON_INT:
-          return E2_LB_I32;
+          return E_LB_I32;
         case Q2_CON_DOUBLE:
-          return E2_LB_F64;
+          return E_LB_F64;
         case Q2_CON_TRUE:
         case Q2_CON_FALSE:
-          return E2_LB_BOOL;
+          return E_LB_BOOL;
         default:
-          return E2_LB_TAG;
+          return E_LB_TAG;
       }
     case Q2_OP_BINARY:
       if (in->rop == ROP_mul_add || in->rop == ROP_mul_sub ||
@@ -360,7 +360,7 @@ static int transfer_def(
            does not plan for. The first half is a multiply of use[0] and use[1];
            the second is an add or subtract of the first half and use[2]. */
         int p, q, rec_int;
-        if (in->nuse < 3 || in->ndef < 2) return E2_LB_TAG;
+        if (in->nuse < 3 || in->ndef < 2) return E_LB_TAG;
         p = rep_exact(
             w[in->use[0]], w[in->use[1]],
             record_int_only(&fn->values[in->def[0]]));
@@ -369,7 +369,7 @@ static int transfer_def(
         if (d == 0) return p;
         return q;
       }
-      if (!binary_operands(in, w, &a, &b)) return E2_LB_TAG;
+      if (!binary_operands(in, w, &a, &b)) return E_LB_TAG;
       if (in->rop == ROP_binary_cpool) {
         /* "rbrbc": d, sub, a, kind, index. A constant-pool right operand folds
            to a C literal only when the pool entry is a number, and a number
@@ -381,16 +381,16 @@ static int transfer_def(
         int ki = in->narg > 3 ? 3 : -1, ui = in->narg > 4 ? 4 : -1;
         if (ki < 0 || in->arg[ki].val != REG_CONST_CPOOL || ui < 0 ||
             !qjs_aot_pool_num(fn->g, (uint32_t)in->arg[ui].val, &c)) {
-          *whyp = E2_WHY_UNKNOWN_RESULT;
-          return E2_LB_TAG;
+          *whyp = E_WHY_UNKNOWN_RESULT;
+          return E_LB_TAG;
         }
-        if (a == E2_LB_BOT) return E2_LB_BOT;
+        if (a == E_LB_BOT) return E_LB_BOT;
         if (!lb_num(a)) {
-          *whyp = E2_WHY_OPERAND_TAGGED;
+          *whyp = E_WHY_OPERAND_TAGGED;
           *whyvp = in->use[0];
-          return E2_LB_TAG;
+          return E_LB_TAG;
         }
-        return E2_LB_F64;
+        return E_LB_F64;
       }
       switch (sub) {
         case REG_BIN_ADD:
@@ -409,92 +409,92 @@ static int transfer_def(
         case REG_BIN_SHR:
           return rep_exact(a, b, record_int_only(dv));
         default:
-          *whyp = E2_WHY_UNKNOWN_RESULT;
-          return E2_LB_TAG;
+          *whyp = E_WHY_UNKNOWN_RESULT;
+          return E_LB_TAG;
       }
     case Q2_OP_COMPARE:
-      if (!binary_operands(in, w, &a, &b)) return E2_LB_TAG;
+      if (!binary_operands(in, w, &a, &b)) return E_LB_TAG;
       return rep_cmp(sub, a, b);
     case Q2_OP_UNARY:
-      if (in->nuse < 1) return E2_LB_TAG;
+      if (in->nuse < 1) return E_LB_TAG;
       a = w[in->use[0]];
       /* `add_imm_self_s` / `sub_imm_self_s` ("ri") arrive here with their OWN rop, so
          the sub-based checks below never see them. They are an in-place add/sub of a
          small constant: the inc rule applies (an int stays an int, the lowering's
          overflow exit covers the rest). */
       if (in->rop == ROP_add_imm_self_s || in->rop == ROP_sub_imm_self_s) {
-        if (a == E2_LB_BOT) return E2_LB_BOT;
-        if (a == E2_LB_I32) return rep_inc(a);
-        if (a == E2_LB_F64) return E2_LB_F64;
-        *whyp = E2_WHY_OPERAND_TAGGED;
+        if (a == E_LB_BOT) return E_LB_BOT;
+        if (a == E_LB_I32) return rep_inc(a);
+        if (a == E_LB_F64) return E_LB_F64;
+        *whyp = E_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];
-        return E2_LB_TAG;
+        return E_LB_TAG;
       }
       if (sub == REG_UN_NEG) {
-        if (a == E2_LB_BOT) return E2_LB_BOT;
-        if (a == E2_LB_I32) return record_int_only(dv) ? E2_LB_I32 : E2_LB_F64;
-        if (a == E2_LB_F64) return E2_LB_F64;
-        *whyp = E2_WHY_OPERAND_TAGGED;
+        if (a == E_LB_BOT) return E_LB_BOT;
+        if (a == E_LB_I32) return record_int_only(dv) ? E_LB_I32 : E_LB_F64;
+        if (a == E_LB_F64) return E_LB_F64;
+        *whyp = E_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];
-        return E2_LB_TAG;
+        return E_LB_TAG;
       }
       if (sub == REG_UN_INC || sub == REG_UN_DEC) return rep_inc(a);
       if (sub == REG_UN_NOT || sub == REG_UN_LNOT) {
-        if (a == E2_LB_BOT) return E2_LB_BOT;
-        if (a == E2_LB_BOOL || lb_num(a)) return E2_LB_BOOL;
-        *whyp = E2_WHY_OPERAND_TAGGED;
+        if (a == E_LB_BOT) return E_LB_BOT;
+        if (a == E_LB_BOOL || lb_num(a)) return E_LB_BOOL;
+        *whyp = E_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];
-        return E2_LB_TAG;
+        return E_LB_TAG;
       }
-      *whyp = E2_WHY_UNKNOWN_RESULT;
-      return E2_LB_TAG;
+      *whyp = E_WHY_UNKNOWN_RESULT;
+      return E_LB_TAG;
     case Q2_OP_POST_INC:
       /* "rrr": t, s, h -- h is s after the increment, t is the value s had
          before it. Both are the operand's representation, so both follow
          `rep_inc`; the integer case keeps i32 because the lowering guards the
          overflow. */
-      if (in->nuse < 1) return E2_LB_TAG;
+      if (in->nuse < 1) return E_LB_TAG;
       return rep_inc(w[in->use[0]]);
     case Q2_OP_BRANCH_CMP:
       /* `inc_branch_lt`: `d = d + 1` in place, then compare. An int stays an
          int (the lowering guards the overflow). */
       if (in->rop == ROP_inc_branch_lt || in->rop == ROP_inc_branch_lt_s)
-        return in->nuse >= 1 ? rep_inc(w[in->use[0]]) : E2_LB_TAG;
-      return E2_LB_TAG;
+        return in->nuse >= 1 ? rep_inc(w[in->use[0]]) : E_LB_TAG;
+      return E_LB_TAG;
     case Q2_OP_BRANCH:
       /* `add_imm_self_branch`: the same in-place add with an immediate. */
       if (in->rop == ROP_add_imm_self_branch ||
           in->rop == ROP_add_imm_self_branch_s) {
-        if (in->nuse < 1) return E2_LB_TAG;
+        if (in->nuse < 1) return E_LB_TAG;
         a = w[in->use[0]];
-        if (a == E2_LB_BOT) return E2_LB_BOT;
+        if (a == E_LB_BOT) return E_LB_BOT;
         /* An in-place add of a small constant IS an increment, so it takes the
            inc rule: an int stays an int and the lowering guards the overflow.
            Widening to f64 because there is no profile record was wrong -- a loop
            counter's record is for its own def, and the fused add's def has none,
            so `i += 3` was typed f64 while `i++` was typed i32. */
-        if (a == E2_LB_I32) return rep_inc(a);
-        if (a == E2_LB_F64) return E2_LB_F64;
-        *whyp = E2_WHY_OPERAND_TAGGED;
+        if (a == E_LB_I32) return rep_inc(a);
+        if (a == E_LB_F64) return E_LB_F64;
+        *whyp = E_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];
-        return E2_LB_TAG;
+        return E_LB_TAG;
       }
-      return E2_LB_TAG;
+      return E_LB_TAG;
     case Q2_OP_FALLBACK: {
       /* An op call. Its result is exact (the interpreter computed it), so an
          integer result needs no exit of its own; the tag guard at the
          definition is the whole check. */
       *from_opcall = 1;
-      if (d < in->ndef) return E2_LB_TAG; /* replaced by the seed below */
-      return E2_LB_TAG;
+      if (d < in->ndef) return E_LB_TAG; /* replaced by the seed below */
+      return E_LB_TAG;
     }
     default:
       break;
   }
   (void)insn;
   (void)facts;
-  *whyp = E2_WHY_UNKNOWN_RESULT;
-  return E2_LB_TAG;
+  *whyp = E_WHY_UNKNOWN_RESULT;
+  return E_LB_TAG;
 }
 
 /* ---- arithmetic classification, for the counters and the gate ------------ */
@@ -527,7 +527,7 @@ static int arith_kind(const Q2Insn *in) {
     case ROP_mul_sub:
     case ROP_add_mul:
     case ROP_sub_mul:
-      return E2_AK_FUSED;
+      return E_AK_FUSED;
     case ROP_add:
     case ROP_sub:
     case ROP_mul:
@@ -558,17 +558,17 @@ static int arith_kind(const Q2Insn *in) {
     case ROP_binary_cpool:
     case ROP_to_number:
     case ROP_to_numeric:
-      return E2_AK_ARITH;
+      return E_AK_ARITH;
     case ROP_binary:
-      return is_cmp_sub(sub) ? E2_AK_CMP : E2_AK_ARITH;
+      return is_cmp_sub(sub) ? E_AK_CMP : E_AK_ARITH;
     case ROP_unary:
       /* Only negate and the two in-place increments produce a number. The
          typeof/null/undefined tests produce a bool or a string and must not be
          counted as arithmetic results: the gate's "no UNKNOWN_RESULT root on an
          arithmetic op" would otherwise fail on `x === undefined`'s own test. */
       if (sub == REG_UN_NEG || sub == REG_UN_INC || sub == REG_UN_DEC)
-        return E2_AK_ARITH;
-      return E2_AK_CMP;
+        return E_AK_ARITH;
+      return E_AK_CMP;
     case ROP_compare:
     case ROP_lt:
     case ROP_lte:
@@ -581,9 +581,9 @@ static int arith_kind(const Q2Insn *in) {
     case ROP_instanceof:
     case ROP_in:
     case ROP_not:
-      return E2_AK_CMP;
+      return E_AK_CMP;
     default:
-      return E2_AK_NONE;
+      return E_AK_NONE;
   }
 }
 
@@ -632,12 +632,12 @@ static int loop_counter_param(
           continue;
         }
         if (fn->values[av].insn < 0) {
-          if (w[av] == E2_LB_TAG) return 0;
+          if (w[av] == E_LB_TAG) return 0;
           continue;
         }
         /* An incoming argument that is already known to be boxed means the
            register really does hold a JSValue on that path. */
-        if (w[av] == E2_LB_TAG) return 0;
+        if (w[av] == E_LB_TAG) return 0;
         ai = &fn->insns[fn->values[av].insn];
         if (ai->rop == ROP_inc_branch_lt || ai->rop == ROP_inc_branch_lt_s ||
             ai->rop == ROP_add_imm_self_branch ||
@@ -660,7 +660,7 @@ static int loop_counter_param(
    fixpoint sees intermediate lattice values; a reason must describe the final
    answer. */
 static int why_tagged(
-    const Q2Func *fn, const E2Facts *facts, const E2Types *t, Q2ValueId v,
+    const Q2Func *fn, const EFacts *facts, const ETypes *t, Q2ValueId v,
     Q2ValueId *src) {
   const Q2Value *val = &fn->values[v];
 
@@ -676,7 +676,7 @@ static int why_tagged(
         Q2ValueId pv = blk->param_val[k];
         int p, n, m;
         if (pv != v) continue;
-        if (b == 0) return E2_WHY_INCOMING;
+        if (b == 0) return E_WHY_INCOMING;
         for (p = 0; p < blk->npreds; p++) {
           const Q2Block *pr = &fn->blocks[blk->preds[p]];
           for (n = 0; n < pr->nsucc; n++) {
@@ -686,33 +686,33 @@ static int why_tagged(
               if (m != k) continue;
               av = pr->edge_arg[n][m];
               if (av >= (Q2ValueId)fn->nvalues) continue;
-              if (t->lb[av] == E2_LB_TAG) {
+              if (t->lb[av] == E_LB_TAG) {
                 *src = av;
-                return E2_WHY_PHI_TAGGED;
+                return E_WHY_PHI_TAGGED;
               }
             }
           }
         }
-        return E2_WHY_UNKNOWN_RESULT;
+        return E_WHY_UNKNOWN_RESULT;
       }
     }
-    return E2_WHY_UNREACHABLE;
+    return E_WHY_UNREACHABLE;
   }
   {
     const Q2Insn *in = &fn->insns[val->insn];
     int d, from_opcall = 0;
     /* A constant that is not a number has no unboxed form to be held in. */
-    if (in->op == Q2_OP_CONST) return E2_WHY_CONST_NONNUM;
+    if (in->op == Q2_OP_CONST) return E_WHY_CONST_NONNUM;
     /* An op call whose destinations the role table does not declare rewrote the
        whole live set: the value is boxed because the interpreter stored it, not
        because of any operand. */
     for (d = 0; d < in->nredef; d++) {
-      if (in->redef_val[d] == v) return E2_WHY_OPCALL_REDEF;
+      if (in->redef_val[d] == v) return E_WHY_OPCALL_REDEF;
     }
     /* A forwarded instruction is a boxed copy of a boxed value. */
     if (facts != NULL && facts->fwd[val->insn] != Q2_NO_VALUE) {
       *src = facts->fwd[val->insn];
-      return E2_WHY_OPERAND_TAGGED;
+      return E_WHY_OPERAND_TAGGED;
     }
     /* A speculated definition whose record was not numeric: no profile, or a
        mixed record. */
@@ -720,48 +720,48 @@ static int why_tagged(
       int k;
       for (k = 0; k < in->ndef; k++) {
         if (in->def[k] != v) continue;
-        if (chain_first_link(in, k)) return E2_WHY_NO_PROFILE;
+        if (chain_first_link(in, k)) return E_WHY_NO_PROFILE;
         if (t->spec[v]) {
           unsigned types = 0;
           if (in->op == Q2_OP_CALL)
-            return prof_at(fn, in->next, &types) ? E2_WHY_MIXED
-                                                 : E2_WHY_NO_PROFILE;
-          return val->has_prof ? E2_WHY_MIXED : E2_WHY_NO_PROFILE;
+            return prof_at(fn, in->next, &types) ? E_WHY_MIXED
+                                                 : E_WHY_NO_PROFILE;
+          return val->has_prof ? E_WHY_MIXED : E_WHY_NO_PROFILE;
         }
         break;
       }
     }
     /* Otherwise the result follows its operands: name the first boxed one. */
     for (d = 0; d < in->ndef; d++) {
-      int whyp = E2_WHY_NONE;
+      int whyp = E_WHY_NONE;
       int lb;
       Q2ValueId whyv = Q2_NO_VALUE;
       if (in->def[d] != v) continue;
       lb = transfer_def(
           fn, facts, in, val->insn, d, t->lb, &whyp, &whyv, &from_opcall);
-      if (whyp != E2_WHY_NONE) {
+      if (whyp != E_WHY_NONE) {
         *src = whyv;
         return whyp;
       }
       /* No reason from the transfer: the result is boxed because one of its
          operands is. */
-      if (lb == E2_LB_TAG) {
+      if (lb == E_LB_TAG) {
         int k;
         for (k = 0; k < in->nuse; k++) {
           Q2ValueId u = in->use[k];
-          if (u < (Q2ValueId)fn->nvalues && t->lb[u] == E2_LB_TAG) {
+          if (u < (Q2ValueId)fn->nvalues && t->lb[u] == E_LB_TAG) {
             *src = u;
-            return E2_WHY_OPERAND_TAGGED;
+            return E_WHY_OPERAND_TAGGED;
           }
         }
-        return E2_WHY_UNKNOWN_RESULT;
+        return E_WHY_UNKNOWN_RESULT;
       }
     }
   }
-  return E2_WHY_UNKNOWN_RESULT;
+  return E_WHY_UNKNOWN_RESULT;
 }
 
-int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
+int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   uint8_t *w = NULL;
   uint8_t *fixed = NULL;
   int nv, i, b, k, pass, changed;
@@ -785,7 +785,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
       w == NULL || fixed == NULL) {
     free(w);
     free(fixed);
-    e2_types_free(out);
+    e_types_free(out);
     return -1;
   }
   for (i = 0; i < nv; i++) out->whyv[i] = Q2_NO_VALUE;
@@ -807,7 +807,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
   /* The function's incoming registers are boxed: the frame holds JSValues. */
   for (k = 0; k < fn->blocks[0].nparams; k++) {
     Q2ValueId v = fn->blocks[0].param_val[k];
-    w[v] = E2_LB_TAG;
+    w[v] = E_LB_TAG;
     fixed[v] = 1;
   }
 
@@ -823,17 +823,17 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
         Q2ValueId v = in->def[d];
         switch (fn->values[v].con_kind) {
           case Q2_CON_INT:
-            w[v] = E2_LB_I32;
+            w[v] = E_LB_I32;
             break;
           case Q2_CON_DOUBLE:
-            w[v] = E2_LB_F64;
+            w[v] = E_LB_F64;
             break;
           case Q2_CON_TRUE:
           case Q2_CON_FALSE:
-            w[v] = E2_LB_BOOL;
+            w[v] = E_LB_BOOL;
             break;
           default:
-            w[v] = E2_LB_TAG;
+            w[v] = E_LB_TAG;
             break;
         }
         fixed[v] = 1;
@@ -874,9 +874,9 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     /* An op-call fallback that rewrites a live set: the interpreter wrote those
        registers, so they are boxed until a reload says otherwise. */
     for (d = 0; d < in->nredef; d++) {
-      w[in->redef_val[d]] = E2_LB_TAG;
+      w[in->redef_val[d]] = E_LB_TAG;
       fixed[in->redef_val[d]] = 1;
-      out->why[in->redef_val[d]] = E2_WHY_OPCALL_REDEF;
+      out->why[in->redef_val[d]] = E_WHY_OPCALL_REDEF;
     }
   }
 
@@ -887,7 +887,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     for (k = 0; k < fn->blocks[b].nparams; k++) {
       Q2ValueId pv = fn->blocks[b].param_val[k];
       if (!fixed[pv] && loop_counter_param(fn, w, b, k)) {
-        w[pv] = E2_LB_I32;
+        w[pv] = E_LB_I32;
         fixed[pv] = 1;
         out->loopcnt[pv] = 1;
       }
@@ -932,13 +932,13 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
         if (fixed[in->def[0]]) continue;
         for (d = 0; d < in->ndef; d++) {
           Q2ValueId v = in->def[d];
-          int whyp = E2_WHY_NONE, from_opcall = 0;
+          int whyp = E_WHY_NONE, from_opcall = 0;
           Q2ValueId whyv = Q2_NO_VALUE;
           int lb;
           if (fixed[v]) continue;
           if (facts != NULL && facts->fwd[insn] != Q2_NO_VALUE) {
             Q2ValueId src = facts->fwd[insn];
-            lb = src < (Q2ValueId)nv ? w[src] : E2_LB_TAG;
+            lb = src < (Q2ValueId)nv ? w[src] : E_LB_TAG;
           } else {
             lb = transfer_def(
                 fn, facts, in, insn, d, w, &whyp, &whyv, &from_opcall);
@@ -956,7 +956,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
   /* ---- the final walk: representations, reasons, exits, counters ---- */
   for (i = 0; i < nv; i++) {
     int lb = w[i];
-    if (lb == E2_LB_BOT) lb = E2_LB_TAG;
+    if (lb == E_LB_BOT) lb = E_LB_TAG;
     out->lb[i] = (uint8_t)lb;
   }
   for (i = 0; i < fn->ninsns; i++) {
@@ -964,7 +964,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     int d;
     for (d = 0; d < in->ndef; d++) {
       Q2ValueId v = in->def[d];
-      if (out->arith[v] == E2_AK_NONE) out->arith[v] = (uint8_t)arith_kind(in);
+      if (out->arith[v] == E_AK_NONE) out->arith[v] = (uint8_t)arith_kind(in);
     }
   }
   for (i = 0; i < fn->ninsns; i++) {
@@ -974,7 +974,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
        came out of an op call is already exact and needs none. */
     for (d = 0; d < in->ndef; d++) {
       Q2ValueId v = in->def[d];
-      if (out->lb[v] != E2_LB_I32) continue;
+      if (out->lb[v] != E_LB_I32) continue;
       out->exits[v] = exits_for(in->rop, in->sub, in->op == Q2_OP_FALLBACK);
     }
   }
@@ -982,10 +982,10 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
   /* Why each value that stays boxed stays boxed. The chain is re-derived from
      the final state, so a reason cannot describe an intermediate step. */
   for (i = 0; i < nv; i++) {
-    if (out->lb[i] != E2_LB_TAG) continue;
+    if (out->lb[i] != E_LB_TAG) continue;
     out->why[i] =
         (uint8_t)why_tagged(fn, facts, out, (Q2ValueId)i, &out->whyv[i]);
-    if (out->why[i] == E2_WHY_NONE) out->why[i] = E2_WHY_UNREACHABLE;
+    if (out->why[i] == E_WHY_NONE) out->why[i] = E_WHY_UNREACHABLE;
   }
 
   /* Counters, over the live values only. */
@@ -993,13 +993,13 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     if (!out->live[i]) continue;
     out->nlive++;
     switch (out->lb[i]) {
-      case E2_LB_BOOL:
+      case E_LB_BOOL:
         out->ntyped[1]++;
         break;
-      case E2_LB_I32:
+      case E_LB_I32:
         out->ntyped[2]++;
         break;
-      case E2_LB_F64:
+      case E_LB_F64:
         out->ntyped[3]++;
         break;
       default:
@@ -1011,11 +1011,11 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     const Q2Insn *in = &fn->insns[i];
     int d, all_typed = 1;
     if (in->ndef <= 0) continue;
-    if (arith_kind(in) == E2_AK_NONE) continue;
-    if (in->op == Q2_OP_COMPARE || arith_kind(in) == E2_AK_CMP) continue;
+    if (arith_kind(in) == E_AK_NONE) continue;
+    if (in->op == Q2_OP_COMPARE || arith_kind(in) == E_AK_CMP) continue;
     out->arith_total++;
     for (d = 0; d < in->ndef; d++) {
-      if (out->lb[in->def[d]] == E2_LB_TAG) all_typed = 0;
+      if (out->lb[in->def[d]] == E_LB_TAG) all_typed = 0;
     }
     if (all_typed) out->arith_typed++;
   }
@@ -1026,10 +1026,10 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
     int d;
     for (d = 0; d < in->ndef; d++) {
       Q2ValueId v = in->def[d];
-      if (out->arith[v] != E2_AK_ARITH && out->arith[v] != E2_AK_FUSED)
+      if (out->arith[v] != E_AK_ARITH && out->arith[v] != E_AK_FUSED)
         continue;
       out->arithv_total++;
-      if (out->lb[v] != E2_LB_TAG) out->arithv_typed++;
+      if (out->lb[v] != E_LB_TAG) out->arithv_typed++;
     }
   }
   free(w);
@@ -1037,7 +1037,7 @@ int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out) {
   return 0;
 }
 
-void e2_types_free(E2Types *t) {
+void e_types_free(ETypes *t) {
   if (t == NULL) return;
   free(t->lb);
   free(t->spec);
@@ -1050,19 +1050,19 @@ void e2_types_free(E2Types *t) {
   memset(t, 0, sizeof(*t));
 }
 
-int e2_types_typed(const E2Types *t, Q2ValueId v) {
+int e_types_typed(const ETypes *t, Q2ValueId v) {
   if (t == NULL || t->lb == NULL || v >= (Q2ValueId)t->nvalues) return 0;
-  return t->lb[v] != E2_LB_TAG;
+  return t->lb[v] != E_LB_TAG;
 }
 
-const char *e2_types_rep_name(const E2Types *t, Q2ValueId v) {
+const char *e_types_rep_name(const ETypes *t, Q2ValueId v) {
   if (t == NULL || t->lb == NULL || v >= (Q2ValueId)t->nvalues) return "tag";
   switch (t->lb[v]) {
-    case E2_LB_I32:
+    case E_LB_I32:
       return "i32";
-    case E2_LB_F64:
+    case E_LB_F64:
       return "f64";
-    case E2_LB_BOOL:
+    case E_LB_BOOL:
       return "bool";
     default:
       return "tag";
@@ -1073,23 +1073,23 @@ const char *e2_types_rep_name(const E2Types *t, Q2ValueId v) {
 
 static const char *why_name(int why) {
   switch (why) {
-    case E2_WHY_NO_PROFILE:
+    case E_WHY_NO_PROFILE:
       return "NO_PROFILE";
-    case E2_WHY_MIXED:
+    case E_WHY_MIXED:
       return "MIXED";
-    case E2_WHY_OPERAND_TAGGED:
+    case E_WHY_OPERAND_TAGGED:
       return "OPERAND_TAGGED";
-    case E2_WHY_UNKNOWN_RESULT:
+    case E_WHY_UNKNOWN_RESULT:
       return "UNKNOWN_RESULT";
-    case E2_WHY_PHI_TAGGED:
+    case E_WHY_PHI_TAGGED:
       return "PHI_TAGGED";
-    case E2_WHY_UNREACHABLE:
+    case E_WHY_UNREACHABLE:
       return "UNREACHABLE";
-    case E2_WHY_INCOMING:
+    case E_WHY_INCOMING:
       return "INCOMING";
-    case E2_WHY_OPCALL_REDEF:
+    case E_WHY_OPCALL_REDEF:
       return "OPCALL_REDEF";
-    case E2_WHY_CONST_NONNUM:
+    case E_WHY_CONST_NONNUM:
       return "CONST_NONNUM";
     default:
       return "?";
@@ -1099,14 +1099,14 @@ static const char *why_name(int why) {
 /* The root of a value's reason chain: follow OPERAND_TAGGED/PHI_TAGGED links
    until one has a reason that does not name another value. */
 static Q2ValueId why_root(
-    const Q2Func *fn, const E2Types *t, Q2ValueId v, int *hops) {
+    const Q2Func *fn, const ETypes *t, Q2ValueId v, int *hops) {
   int guard = 0;
   *hops = 0;
   while (guard++ < 64) {
     int why = t->why[v];
     Q2ValueId next = t->whyv[v];
     if (next == Q2_NO_VALUE || next >= (Q2ValueId)fn->nvalues) break;
-    if (why != E2_WHY_OPERAND_TAGGED && why != E2_WHY_PHI_TAGGED) break;
+    if (why != E_WHY_OPERAND_TAGGED && why != E_WHY_PHI_TAGGED) break;
     v = next;
     (*hops)++;
   }
@@ -1164,42 +1164,42 @@ static const char *insn_opname(const Q2Insn *in) {
     default:
       break;
   }
-  e2_rop_name(in->rop, buf, sizeof(buf));
+  e_rop_name(in->rop, buf, sizeof(buf));
   return buf;
 }
 
 /* The location a fact names, for the dump. */
-static void key_str(const E2Key *k, char *out, size_t n) {
+static void key_str(const EKey *k, char *out, size_t n) {
   switch (k->kind) {
-    case E2_K_ARG:
+    case E_K_ARG:
       snprintf(out, n, "A%" PRId64, k->a);
       break;
-    case E2_K_LOCAL:
+    case E_K_LOCAL:
       snprintf(out, n, "L%" PRId64, k->a);
       break;
-    case E2_K_VARREF:
+    case E_K_VARREF:
       snprintf(out, n, "V%" PRId64, k->a);
       break;
-    case E2_K_FIELD:
-      if (k->a == E2_RECV_THIS) {
+    case E_K_FIELD:
+      if (k->a == E_RECV_THIS) {
         snprintf(out, n, "this.a%" PRId64, k->b);
-      } else if (k->a <= E2_RECV_LOCAL(0)) {
+      } else if (k->a <= E_RECV_LOCAL(0)) {
         snprintf(out, n, "L%" PRId64 ".a%" PRId64, -(k->a + 3), k->b);
       } else {
         snprintf(out, n, "v%" PRId64 ".a%" PRId64, k->a, k->b);
       }
       break;
-    case E2_K_ELEM:
-      if (k->b == E2_ELEM_LEN) {
+    case E_K_ELEM:
+      if (k->b == E_ELEM_LEN) {
         snprintf(out, n, "len(v%" PRId64 ")", k->a);
       } else {
         snprintf(out, n, "v%" PRId64 "[v%" PRId64 "]", k->a, k->b);
       }
       break;
-    case E2_K_GLOBAL:
+    case E_K_GLOBAL:
       snprintf(out, n, "G%" PRId64, k->a);
       break;
-    case E2_K_THIS:
+    case E_K_THIS:
       snprintf(out, n, "this");
       break;
     default:
@@ -1222,16 +1222,16 @@ static int rootcmp(const void *a, const void *b) {
   return (int)x->v - (int)y->v;
 }
 
-int e2_analysis_dump(
+int e_analysis_dump(
     FILE *f, const Q2Func *fn, const char *hex, double weight) {
-  E2Facts facts;
-  E2Types types;
+  EFacts facts;
+  ETypes types;
   int b, k, i, rc = -1;
   RootCount *roots = NULL;
   int nroots = 0, caproots = 0;
   int nfwd = 0, nskip = 0, naccess = 0;
 
-  if (e2_analyze(fn, &facts, &types) < 0) return -1;
+  if (e_analyze(fn, &facts, &types) < 0) return -1;
 
   {
     /* The header names the function the way the E2 report does: `name
@@ -1260,7 +1260,7 @@ int e2_analysis_dump(
   /* Groups. */
   fprintf(f, "T   groups %d sites %d\n", facts.ngroups, facts.nsites);
   for (i = 0; i < facts.ngroups; i++) {
-    const E2Group *g = &facts.groups[i];
+    const EGroup *g = &facts.groups[i];
     fprintf(
         f, "T     G%d shape=%lld first=%d sites=", i, (long long)g->shape,
         g->first_site);
@@ -1275,7 +1275,7 @@ int e2_analysis_dump(
      there. */
   for (b = 0; b < fn->nblocks; b++) {
     const Q2Block *blk = &fn->blocks[b];
-    const E2BlockFacts *bf = &facts.blocks[b];
+    const EBlockFacts *bf = &facts.blocks[b];
     fprintf(
         f, "T B%d pc=%d..%d ctl=%d\n", b, blk->start_pc, blk->end_pc,
         blk->ctl_in);
@@ -1295,12 +1295,12 @@ int e2_analysis_dump(
       if (!types.live[v]) continue;
       fprintf(
           f, "T   v%u rep=%s def=param:B%d:r%d%s", v,
-          e2_types_rep_name(&types, v), b, fn->values[v].reg,
+          e_types_rep_name(&types, v), b, fn->values[v].reg,
           types.loopcnt[v] ? " loop=1" : "");
       /* A parameter is boxed for one of two reasons, both of which the dump
          has to name: it arrives in a JSValue (the entry block), or an incoming
          edge carries a boxed value. */
-      if (types.lb[v] == E2_LB_TAG)
+      if (types.lb[v] == E_LB_TAG)
         fprintf(f, " why=%s", why_name(types.why[v]));
       fputc('\n', f);
     }
@@ -1317,7 +1317,7 @@ int e2_analysis_dump(
       if (ndef <= 0) continue;
       for (d = 0; d < ndef; d++) {
         Q2ValueId v = in->def[d];
-        const char *rep = e2_types_rep_name(&types, v);
+        const char *rep = e_types_rep_name(&types, v);
         fprintf(f, "T   v%u rep=%s def=%d:%s", v, rep, in->pc, opname);
         /* Which profile record this destination's type came from, so a test can
            assert `src=P` for a reused register (E7d's N1) rather than infer it
@@ -1326,9 +1326,9 @@ int e2_analysis_dump(
           fprintf(f, " src=%s", fn->values[v].prof_src ? "R" : "P");
         /* The analysis's own classification: the gate reads this rather than
            guessing from the operation's name. */
-        if (types.arith[v] == E2_AK_ARITH || types.arith[v] == E2_AK_FUSED)
+        if (types.arith[v] == E_AK_ARITH || types.arith[v] == E_AK_FUSED)
           fprintf(f, " arith=1");
-        else if (types.arith[v] == E2_AK_CMP)
+        else if (types.arith[v] == E_AK_CMP)
           fprintf(f, " arith=cmp");
         if (facts.fwd[insn] != Q2_NO_VALUE) {
           fprintf(f, " fwd=v%u", facts.fwd[insn]);
@@ -1338,18 +1338,18 @@ int e2_analysis_dump(
         if (rep[0] == 't' && rep[1] == 'a') {
           Q2ValueId whyv = types.whyv[v];
           fprintf(f, " why=%s", why_name(types.why[v]));
-          if (whyv != Q2_NO_VALUE && (types.why[v] == E2_WHY_OPERAND_TAGGED ||
-                                      types.why[v] == E2_WHY_PHI_TAGGED))
+          if (whyv != Q2_NO_VALUE && (types.why[v] == E_WHY_OPERAND_TAGGED ||
+                                      types.why[v] == E_WHY_PHI_TAGGED))
             fprintf(f, "(v%u)", whyv);
         } else if (types.exits[v] != 0) {
           fprintf(f, " exits=");
-          if (types.exits[v] & E2_EX_OVF) fputc('o', f);
-          if (types.exits[v] & E2_EX_ZERODIV) fputc('z', f);
-          if (types.exits[v] & E2_EX_NOTEXACT) fputc('e', f);
-          if (types.exits[v] & E2_EX_INTMIN) fputc('i', f);
-          if (types.exits[v] & E2_EX_NEGZERO) fputc('n', f);
-          if (types.exits[v] & E2_EX_SHRBIG) fputc('s', f);
-          if (types.exits[v] & E2_EX_SIGNEDMIN) fputc('m', f);
+          if (types.exits[v] & E_EX_OVF) fputc('o', f);
+          if (types.exits[v] & E_EX_ZERODIV) fputc('z', f);
+          if (types.exits[v] & E_EX_NOTEXACT) fputc('e', f);
+          if (types.exits[v] & E_EX_INTMIN) fputc('i', f);
+          if (types.exits[v] & E_EX_NEGZERO) fputc('n', f);
+          if (types.exits[v] & E_EX_SHRBIG) fputc('s', f);
+          if (types.exits[v] & E_EX_SIGNEDMIN) fputc('m', f);
         }
         fputc('\n', f);
       }
@@ -1361,7 +1361,7 @@ int e2_analysis_dump(
     Q2ValueId root;
     int hops;
     int m, found = -1;
-    if (types.lb[i] != E2_LB_TAG || !types.live[i]) continue;
+    if (types.lb[i] != E_LB_TAG || !types.live[i]) continue;
     root = why_root(fn, &types, (Q2ValueId)i, &hops);
     for (m = 0; m < nroots; m++) {
       if (roots[m].v == root) {
@@ -1418,7 +1418,7 @@ int e2_analysis_dump(
   rc = 0;
 done:
   free(roots);
-  e2_types_free(&types);
-  e2_facts_free(&facts);
+  e_types_free(&types);
+  e_facts_free(&facts);
   return rc;
 }

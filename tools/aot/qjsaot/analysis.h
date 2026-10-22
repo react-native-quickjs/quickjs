@@ -8,11 +8,11 @@
 /*
  * The two analyses the speculative body is built on, and their dump.
  *
- *   e2_facts.c  forward dataflow over the speculative body's blocks: which
+ *   e_facts.c  forward dataflow over the speculative body's blocks: which
  *               object shapes are already checked (SHAPE) and which memory
  *               location still holds which SSA value (AVAIL), plus the
  *               monomorphic site groups they are expressed in.
- *   e2_types.c  representation inference over the same blocks: which C type
+ *   e_types.c  representation inference over the same blocks: which C type
  *               each SSA value is held in, why a value that stays boxed stays
  *               boxed, and which guard its definition needs.
  *
@@ -26,8 +26,8 @@
  * the speculative body, wrong) answers. An instruction's forwarding source is
  * therefore `facts->fwd[insn]`, not `insn->fwd`.
  */
-#ifndef QJSAOT2_E2_ANALYSIS_H
-#define QJSAOT2_E2_ANALYSIS_H
+#ifndef QJSAOT2_E_ANALYSIS_H
+#define QJSAOT2_E_ANALYSIS_H
 
 #include <stdio.h>
 
@@ -35,72 +35,72 @@
 
 /* ---- monomorphic groups ------------------------------------------------- */
 
-#define E2_GROUP_NONE (-1)
+#define E_GROUP_NONE (-1)
 
 /* One property site the speculator knows a PIC cell for. `site` is the PIC
    index the encoder assigned; `insn` is the defining instruction so diagnostics
    can name a pc. */
-typedef struct E2SiteInfo {
+typedef struct ESiteInfo {
   int site;
   int insn;
-  int group;      /* index into E2Facts.groups, or E2_GROUP_NONE */
+  int group;      /* index into EFacts.groups, or E_GROUP_NONE */
   Q2ValueId recv; /* the receiver value, or Q2_NO_VALUE */
   int poly;       /* the profile saw 2-4 shapes, all own slots: polymorphic cache */
-} E2SiteInfo;
+} ESiteInfo;
 
 /* A group: every site whose profile saw exactly one shape, sharing it, so the
    speculative body validates the shape once at entry and then checks only the
    per-site slot offset. */
-typedef struct E2Group {
+typedef struct EGroup {
   int64_t shape;  /* the profile's shape id (an address in the profiled process) */
   int first_site; /* the site whose cell is read first at entry */
   int nsites;
   int *sites;
-} E2Group;
+} EGroup;
 
 /* ---- memory locations (the design's D6 table) ---------------------------- */
 
-#define E2_K_ARG 1    /* (ARG, slot) */
-#define E2_K_LOCAL 2  /* (LOC, slot) */
-#define E2_K_VARREF 3 /* (VREF, slot) */
-#define E2_K_FIELD 4  /* (FIELD, receiver, atom) */
-#define E2_K_ELEM 5   /* (ELEM, array, index) */
-#define E2_K_GLOBAL 6 /* (GLOB, atom) */
-#define E2_K_THIS 7   /* THIS */
+#define E_K_ARG 1    /* (ARG, slot) */
+#define E_K_LOCAL 2  /* (LOC, slot) */
+#define E_K_VARREF 3 /* (VREF, slot) */
+#define E_K_FIELD 4  /* (FIELD, receiver, atom) */
+#define E_K_ELEM 5   /* (ELEM, array, index) */
+#define E_K_GLOBAL 6 /* (GLOB, atom) */
+#define E_K_THIS 7   /* THIS */
 
 /* The receiver of a field access that does not come from a register. A field
    fact keyed on one of these is killed by the store that replaces it, exactly
    as the register-keyed ones are killed by their store. */
-#define E2_RECV_THIS (-2)  /* `this`, fixed for the activation */
-#define E2_RECV_LOCAL(slot) (-3 - (slot)) /* the object in var_buf[slot] */
+#define E_RECV_THIS (-2)  /* `this`, fixed for the activation */
+#define E_RECV_LOCAL(slot) (-3 - (slot)) /* the object in var_buf[slot] */
 /* `get_length` has no index: it reads the element store's length. */
-#define E2_ELEM_LEN (-2)
+#define E_ELEM_LEN (-2)
 
-typedef struct E2Key {
-  uint8_t kind; /* E2_K_* */
-  int64_t a;    /* a value id, a slot, an atom, or an E2_RECV_* pseudo-id */
-  int64_t b;    /* a value id, an atom, or E2_ELEM_LEN; 0 when unused */
-} E2Key;
+typedef struct EKey {
+  uint8_t kind; /* E_K_* */
+  int64_t a;    /* a value id, a slot, an atom, or an E_RECV_* pseudo-id */
+  int64_t b;    /* a value id, an atom, or E_ELEM_LEN; 0 when unused */
+} EKey;
 
-typedef struct E2Avail {
-  E2Key key;
+typedef struct EAvail {
+  EKey key;
   Q2ValueId val; /* the SSA value the location holds */
-} E2Avail;
+} EAvail;
 
 /* The facts true on entry to a block: the intersection of its predecessors'
    out-sets. A loop header starts empty, because its back edge is not visited
    when the single forward pass reaches it (loop-invariant facts are hoisting's
    job, not this pass's). */
-typedef struct E2BlockFacts {
+typedef struct EBlockFacts {
   int nshape;
   int *shape_val;
   int *shape_grp;
   int navail;
-  E2Avail *avail;
-} E2BlockFacts;
+  EAvail *avail;
+} EBlockFacts;
 
 /* The result of the facts pass. */
-typedef struct E2Facts {
+typedef struct EFacts {
   int ninsns;
   /* Per instruction: the value it is a copy of, or Q2_NO_VALUE. A forwarded
      load reads nothing, checks nothing and (for a tagged value) still stores. */
@@ -113,11 +113,11 @@ typedef struct E2Facts {
      and invalidate every fact this pass carried past it. */
   uint8_t *miss_exits;
   int ngroups;
-  E2Group *groups;
+  EGroup *groups;
   int nsites;
-  E2SiteInfo *sites;
+  ESiteInfo *sites;
   int nblocks;
-  E2BlockFacts *blocks; /* the in-set of each block, for the dump */
+  EBlockFacts *blocks; /* the in-set of each block, for the dump */
   /* Shape checks hoisted to a loop preheader (card E13): the loop header, its
      preheader, the receiver value and the group. */
   int nloops, loop_cap, *loop_hdr, *loop_pre;
@@ -126,7 +126,7 @@ typedef struct E2Facts {
   int *hoist_hdr, *hoist_pre, *hoist_val, *hoist_grp;
   int nfwd;             /* loads forwarded, for the report */
   int nskip;            /* shape checks skipped, for the report */
-} E2Facts;
+} EFacts;
 
 /* Run the facts pass (D7) and build the site groups (D9 step 1). Returns 0, or
    -1 on allocation failure. */
@@ -141,69 +141,69 @@ typedef struct E2Facts {
    emits would otherwise leave the flag set for the functions emitted after the
    first dump, and the body would be emitted with facts that assume misses exit
    while its code continues on a miss. */
-int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit);
+int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);
 /* Whether polymorphic sites are served by the polymorphic cache in this body (a
-   framed speculative body; set by the caller around e2_facts_run). */
-extern int e2_facts_poly_on;
-int e2_facts_site_poly(const E2Facts *f, int site);
+   framed speculative body; set by the caller around e_facts_run). */
+extern int e_facts_poly_on;
+int e_facts_site_poly(const EFacts *f, int site);
 /* The instructions a polymorphic site may be served by: a plain read or store. */
-int e2_facts_poly_op(const Q2Insn *in);void e2_facts_free(E2Facts *f);
+int e_facts_poly_op(const Q2Insn *in);void e_facts_free(EFacts *f);
 
-/* The group a site index belongs to, or E2_GROUP_NONE. */
-int e2_facts_site_group(const E2Facts *f, int site);
+/* The group a site index belongs to, or E_GROUP_NONE. */
+int e_facts_site_group(const EFacts *f, int site);
 
 /* ---- representations ---------------------------------------------------- */
 
 /* D8's lattice: BOT is "not computed yet", never "tagged". */
-#define E2_LB_BOT 0
-#define E2_LB_BOOL 1
-#define E2_LB_I32 2
-#define E2_LB_F64 3
-#define E2_LB_TAG 4
+#define E_LB_BOT 0
+#define E_LB_BOOL 1
+#define E_LB_I32 2
+#define E_LB_F64 3
+#define E_LB_TAG 4
 
 /* Why a value ends up boxed. The report follows these back to a root. */
 enum {
-  E2_WHY_NONE = 0,
-  E2_WHY_NO_PROFILE,     /* a speculated definition with no P record */
-  E2_WHY_MIXED,          /* the record holds more than numbers */
-  E2_WHY_OPERAND_TAGGED, /* an operand is tagged */
-  E2_WHY_UNKNOWN_RESULT, /* no transfer rule for the operation */
-  E2_WHY_PHI_TAGGED,     /* a block parameter joins a tagged incoming value */
-  E2_WHY_UNREACHABLE,    /* still BOT: nothing defines it on any path */
-  E2_WHY_INCOMING,       /* a parameter of the entry block: the caller passed
+  E_WHY_NONE = 0,
+  E_WHY_NO_PROFILE,     /* a speculated definition with no P record */
+  E_WHY_MIXED,          /* the record holds more than numbers */
+  E_WHY_OPERAND_TAGGED, /* an operand is tagged */
+  E_WHY_UNKNOWN_RESULT, /* no transfer rule for the operation */
+  E_WHY_PHI_TAGGED,     /* a block parameter joins a tagged incoming value */
+  E_WHY_UNREACHABLE,    /* still BOT: nothing defines it on any path */
+  E_WHY_INCOMING,       /* a parameter of the entry block: the caller passed
                             it in a JSValue, so the frame holds a JSValue */
-  E2_WHY_OPCALL_REDEF,   /* an op call whose destinations the role table does
+  E_WHY_OPCALL_REDEF,   /* an op call whose destinations the role table does
                             not declare: the interpreter wrote the whole live
                             set, so which register holds what is not a
                             question about one operation's result */
-  E2_WHY_CONST_NONNUM    /* a constant that is not a number: null, undefined,
+  E_WHY_CONST_NONNUM    /* a constant that is not a number: null, undefined,
                             a string or a bigint */
 };
 
 /* The exits an i32 result needs (D8's "exits" column), so the emitter does not
    have to re-derive them from the operation. */
-#define E2_EX_OVF (1u << 0)      /* add/sub/mul/inc/dec overflow */
-#define E2_EX_ZERODIV (1u << 1)  /* b == 0 */
-#define E2_EX_NOTEXACT (1u << 2) /* a % b != 0 */
-#define E2_EX_INTMIN (1u << 3)   /* INT32_MIN / -1 */
-#define E2_EX_NEGZERO (1u << 4)  /* a zero result with a negative operand */
-#define E2_EX_SHRBIG (1u << 5)   /* a >>> result >= 2^31 */
-#define E2_EX_SIGNEDMIN (1u << 6) /* neg(INT32_MIN), mod(a<0, 0) */
+#define E_EX_OVF (1u << 0)      /* add/sub/mul/inc/dec overflow */
+#define E_EX_ZERODIV (1u << 1)  /* b == 0 */
+#define E_EX_NOTEXACT (1u << 2) /* a % b != 0 */
+#define E_EX_INTMIN (1u << 3)   /* INT32_MIN / -1 */
+#define E_EX_NEGZERO (1u << 4)  /* a zero result with a negative operand */
+#define E_EX_SHRBIG (1u << 5)   /* a >>> result >= 2^31 */
+#define E_EX_SIGNEDMIN (1u << 6) /* neg(INT32_MIN), mod(a<0, 0) */
 
 /* What an instruction turned out to be, for the counters and the gate. */
-#define E2_AK_NONE 0
-#define E2_AK_ARITH 1 /* a binary/unary arithmetic result: the gate counts these */
-#define E2_AK_CMP 2
-#define E2_AK_FUSED 3
+#define E_AK_NONE 0
+#define E_AK_ARITH 1 /* a binary/unary arithmetic result: the gate counts these */
+#define E_AK_CMP 2
+#define E_AK_FUSED 3
 
-typedef struct E2Types {
+typedef struct ETypes {
   int nvalues;
-  uint8_t *lb;    /* the final lattice value: E2_LB_* */
+  uint8_t *lb;    /* the final lattice value: E_LB_* */
   uint8_t *spec;  /* the representation came from a record: guard at its def */
-  uint8_t *exits; /* E2_EX_* for an i32 result */
-  uint8_t *why;   /* E2_WHY_* for a value that stays TAG */
+  uint8_t *exits; /* E_EX_* for an i32 result */
+  uint8_t *why;   /* E_WHY_* for a value that stays TAG */
   Q2ValueId *whyv; /* the operand/parameter a WHY_*_TAGGED names */
-  uint8_t *arith; /* per value: E2_AK_* of its defining instruction */
+  uint8_t *arith; /* per value: E_AK_* of its defining instruction */
   /* A block parameter the analysis classified as a loop counter: every incoming
      argument is an increment of the parameter itself. It has no seed, so the
      cycle has no least fixpoint above BOT and the pass breaks it optimistically
@@ -223,27 +223,27 @@ typedef struct E2Types {
   int ntyped[4]; /* by lattice value: bool, i32, f64 (index 1..3) */
   int ntagged;
   int nlive;     /* live values, i.e. what the counters above sum to */
-} E2Types;
+} ETypes;
 
 /* Run representation inference (D8) over a built IR, reading the facts pass's
    forwarding decisions. Returns 0, or -1 on allocation failure. */
-int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out);
-void e2_types_free(E2Types *t);
+int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out);
+void e_types_free(ETypes *t);
 /* Facts then types, with the intrinsic sites whose arguments are not numbers
-   dropped (e2_ops.c). 0 on success; on failure nothing is left allocated. */
-int e2_analyze(const Q2Func *fn, E2Facts *facts, E2Types *types);
+   dropped (e_ops.c). 0 on success; on failure nothing is left allocated. */
+int e_analyze(const Q2Func *fn, EFacts *facts, ETypes *types);
 
 
 /* Whether the value is held unboxed (i32, f64 or bool). */
-int e2_types_typed(const E2Types *t, Q2ValueId v);
+int e_types_typed(const ETypes *t, Q2ValueId v);
 /* The C representation name: i32, f64, bool or tag. */
-const char *e2_types_rep_name(const E2Types *t, Q2ValueId v);
+const char *e_types_rep_name(const ETypes *t, Q2ValueId v);
 
 /* ---- the dump ----------------------------------------------------------- */
 
 /* `--emit2-types`: one block per function with the groups, the facts on entry
    to each block, one line per value, the loop counters and the tagged roots.
    Returns 0, or -1 on allocation failure. */
-int e2_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight);
+int e_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight);
 
-#endif /* QJSAOT2_E2_ANALYSIS_H */
+#endif /* QJSAOT2_E_ANALYSIS_H */

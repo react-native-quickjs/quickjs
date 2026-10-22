@@ -6,7 +6,7 @@
  */
 
 /*
- * qjsaot2's IR: a control-flow graph of blocks with parameters, in SSA form.
+ * qjsaot's IR: a control-flow graph of blocks with parameters, in SSA form.
  *
  * Values carry a type set (what the value may be) and a representation (how it
  * is held). Operations carry a read and a write set over abstract locations;
