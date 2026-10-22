@@ -2567,7 +2567,7 @@ static const char *e_rep_prefix(Q2ValueId v) {
   }
 }
 
-/* A trivial instruction lowered by the spec body. Rule R1: it emits no `g_`
+/* A trivial instruction lowered by the spec body. It emits no `g_`
    label -- those belong to the generic body -- and it never calls the generic
    emitter's per-instruction functions. It is the same store `emit_trivial`
    makes, keyed on the role table so the operands are never decoded here. */
@@ -2779,7 +2779,7 @@ static void e_note_defs(Q2ValueId *cur, const Q2Func *fn, const Q2Insn *in) {
 }
 
 /* Load a block's live-in register from the frame into the value's local. This is
-   the block's entry load (S1): after it the block works on locals only. */
+   the block's entry load: after it the block works on locals only. */
 static void e_load_local_from_frame(
     FILE *f, Q2ValueId v, int reg, const ETypes *t) {
   int off = reg * 16;
@@ -2814,7 +2814,7 @@ static void e_load_local_from_frame(
    frame (or nowhere yet), so the block must exit at the move instead. */
 static int trivial_is_lowerable(const Q2Insn *in, const Q2ValueId *cur) {
   (void)cur;
-  /* R5: a move's source is use[0] and its destination is def[0]; both are named
+  /* A move's source is use[0] and its destination is def[0]; both are named
      by VALUE ID. Consulting cur[] (register -> value) for an operand was wrong:
      cur[] exists only to decide what an EXIT writes back, and it is not
      populated for a value the block itself just defined. */
@@ -2843,7 +2843,7 @@ static void emit_trivial_own(
     case ROP_move:
     case ROP_move_s:
     case ROP_move_xfer: {
-      /* The source is use[0], named by value id (R5).
+      /* The source is use[0], named by value id.
          move_xfer is the TRANSFER form: the generic body also EMPTIES the source
          register, so the source slot must be marked empty here or an exit that
          syncs it writes the old value back (for an object, a second frame
@@ -2853,7 +2853,7 @@ static void emit_trivial_own(
       Q2ValueId sv = in->nuse > 0 ? in->use[0] : Q2_NO_VALUE;
       /* The source must already be in a local; if it is not, this move is not
          lowerable here and the block must exit at it instead. Each side is
-         named by ITS OWN representation (S1): a value held as i32 is `i<v>`, not
+         named by ITS OWN representation: a value held as i32 is `i<v>`, not
          `v<v>`. */
       if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE)
         e_copy_local(f, d, sv);
@@ -2975,7 +2975,7 @@ static void e_exit_store(FILE *f, Q2ValueId v, int reg) {
 
 /* The exit: sync the state the generic body will read, count it, and hand the
    frame to the generic body at `pc`. This is the ONLY bridge from the spec body
-   to the generic one (rule R1), and it is correct at any instruction pc because
+   to the generic one, and it is correct at any instruction pc because
    the generic body has a label for every instruction.
 
    The sync writes every register live at `pc`, not only the ones that changed:
@@ -3332,7 +3332,7 @@ static void e_emit_arm(
       }
     }
   }
-  /* RULE P / R6: every back edge polls, like the generic dispatch. Without it a
+  /* The poll and the pre-safepoint sync: every back edge polls, like the generic dispatch. Without it a
      loop in the spec body cannot be interrupted, and clang proves the loop to be
      side-effect free and replaces it with a closed form -- which is why an
      "empty" loop measured 0 instructions per iteration.
@@ -3423,11 +3423,11 @@ static void e_emit_arm(
 
 /* A closure-cell LOAD in the spec body: `get_var_ref` (rop 18, "ru"). The cell is
    heap and owns its value, so this BORROWS it -- no dup, no free (DRC also parks
-   any free until a safepoint). R6 still applies: a TAG local that survives a later
+   any free until a safepoint). The pre-safepoint sync still applies: a TAG local that survives a later
    poll or op call is synced to the frame at that point, like every other TAG local.
    A typed site checks the TAG directly rather than calling qjs_aot_to_num, because
    on an object that can run JS (valueOf) and allocate in the middle of the body --
-   which would need the sync R6 is not yet doing mid-block. A tag that does not
+   which would need the sync that is not yet done mid-block. A tag that does not
    match the site's representation is a DEOPT exit at the load's own pc, not a
    conversion: the cell may legitimately hold anything profiling did not see.
    JS_TAG_UNINITIALIZED (TDZ) exits too, so the generic body raises the
@@ -3486,7 +3486,7 @@ static int emit_typed_var_ref_load(
         slot, in->pc, (unsigned)d);
   } else {
     /* TAG: borrow the cell's value into a TAG local. No dup (the cell owns it),
-       and R6 syncs it before any later safepoint. */
+       and the pre-safepoint sync writes it to the frame before any later safepoint. */
     fprintf(f, "    v%u = qjs_aot_get_var_ref(f, %d);\n", (unsigned)d, slot);
   }
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -3494,17 +3494,17 @@ static int emit_typed_var_ref_load(
 }
 
 /* Everything an op call must have in the frame before the engine's handler
-   runs: the live TAG values (R6), the typed source operands, the typed values of
+   runs: the live TAG values (synced to the frame), the typed source operands, the typed values of
    the registers the op may rewrite, and a call-shaped op's argument window. */
 static void e_emit_presync(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t,
     Q2ValueId *cur) {
   int r;
-  /* 1. R6 sync: every live TAG value to the frame before the call. */
+  /* 1. Sync every live TAG value to the frame before the call. */
   if (!g_e_presynced)
     fprintf(
         f,
-        "    /* R6: sync live TAG values before the op call (a safepoint) "
+        "    /* sync live TAG values to the frame before the op call (a safepoint) "
         "*/\n");
   for (r = 0; !g_e_presynced && r < fn->nregs; r++) {
     Q2ValueId v;
@@ -3593,7 +3593,7 @@ static void e_emit_presync(
    The native emitters call it on their miss path, so that path is a thin wrapper.
 
    An op call is a SAFEPOINT, so the order is fixed:
-     1. R6 sync: every live TAG value in cur[] is written to the frame FIRST. The call
+     1. Sync: every live TAG value in cur[] is written to the frame FIRST. The call
         can run JS, allocate and collect, and a TAG value held only in a C local is
         invisible to the GC.
      2. Store the typed operands to the frame, since the handler reads its arguments
@@ -3667,9 +3667,9 @@ static int emit_typed_opcall(
       "ip_ == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
   /* A handler that caught the exception (or an op that jumped) returns an ip
      that is not the next instruction. In the SPEC body this must be an ordinary exit
-     (rule R1): there is no `dispatch` label in aot_f_<hex> -- that is the generic
+     (the spec body has no generic labels): there is no `dispatch` label in aot_f_<hex> -- that is the generic
      body's -- so the earlier version compiled only because nothing emitted this yet.
-     No further sync is needed: R6 ran before the call and the op wrote its own
+     No further sync is needed: the sync ran before the call and the op wrote its own
      results to the frame. */
   fprintf(f, "    if (__builtin_expect(ip_ != code_ + %d, 0)) {\n", in->next);
   fprintf(f, "        E_HANDOFF_NOTE(%d);\n", fi);
@@ -4836,7 +4836,7 @@ static int emit_typed_construct(
     snprintf(ntexp, sizeof(ntexp), "AOT_REG(fr, %d)", nt);
 
   /* ---- output ---- */
-  fprintf(f, "    /* R6: sync live TAG values before the construct */\n");
+  fprintf(f, "    /* sync live TAG values to the frame before the construct */\n");
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
@@ -5096,7 +5096,7 @@ static int emit_alloc_op(
   }
 
   /* ---- output ---- */
-  fprintf(f, "    /* R6: sync live TAG values before the allocation */\n");
+  fprintf(f, "    /* sync live TAG values to the frame before the allocation */\n");
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
@@ -5277,7 +5277,7 @@ static int emit_typed_call(
   }
 
   /* ---- output starts here; it must not be abandoned ---- */
-  fprintf(f, "    /* R6: sync live TAG values before the call */\n");
+  fprintf(f, "    /* sync live TAG values to the frame before the call */\n");
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v;
     if (cur == NULL) break;
@@ -5808,7 +5808,7 @@ static int emit_typed_field_chain(
    site). The hit helper is a plain store (`q2_put_field_hit`), so under DRC there
    is no ownership question on the hit path -- the same call the generic body makes.
    A miss goes to the op-call wrapper: the store may be a setter, which runs JS.
-   Operand registers are read from their LOCALS (R4/R5): a TAG operand is synced to
+   Operand registers are read from their LOCALS (a def is not a use): a TAG operand is synced to
    its frame slot first because the helper takes JSValues from the frame. */
 static int e_poly_site_ok(const Q2Func *fn, const Q2Insn *in, int site);
 static int emit_poly_write(
@@ -6272,13 +6272,13 @@ static int emit_typed_local_field(
    receiver, atom, site). This is a SEPARATE emitter from the generic body's, on
    purpose: the shared part is the runtime helper (q2_own_read_hit), not the emitted
    text, and refactoring the generic emitter to share its continuation broke the
-   generic body the one time it was tried. So rule R1 is honoured by construction --
+   generic body the one time it was tried. So the body never reads a frame slot another body owns, by construction --
    no g_<pc> label, no jump to a generic label:
        hit  -> store into the def's local (TAG: plain copy, borrowed under DRC;
                typed: write _f to the frame slot FIRST so the generic body sees the
                result, then guard into the local, mismatch -> deopt at the NEXT pc)
        miss -> emit_typed_opcall, which syncs, stores operands, steps, and reloads.
-   The receiver must already be a TAG local (R4: never AOT_REG in the spec body); a
+   The receiver must already be a TAG local (never AOT_REG in the spec body); a
    typed receiver declines, because a number receiver misses the PIC anyway. */
 static int emit_typed_field_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
@@ -6428,7 +6428,7 @@ static int emit_typed_arith_cpool(
          JSValue old_ = *p_;
          *p_ = JS_DupValue(ctx, <boxed>);
          JS_FreeValue(ctx, old_); }
-   R6: no sync is needed before this store. Freeing the old value does not call into
+   No sync is needed before this store. Freeing the old value does not call into
    JS (a free never runs a finalizer inline here, and DRC parks objects anyway), and
    JS_DupValue allocates nothing. The box is a JS_MKVAL or the float64 constructor,
    neither of which can GC. If that ever changes, the sync must come FIRST.
@@ -6612,7 +6612,7 @@ static int emit_typed_inc_branch(
   dv = in->def[0];
   /* The counter's PREVIOUS value is use[0] -- the block parameter that carries it
      round the loop. def[0] is the NEW value. Reading def as the source emitted
-     `i5 = i5 + 1` on an uninitialised local (R5: a def is not a use). */
+     `i5 = i5 + 1` on an uninitialised local (a def is not a use). */
   av = in->use[0];
   bv = in->use[1];
   /* The bound may be TAG (a field or a length read the profile saw as mixed): its
@@ -7446,7 +7446,7 @@ static int emit_typed_branch(
   if (sb_take < 0 || sb_take >= fn->nblocks) return 0;
 
   /* THE COMPARISON IS COMPUTED ONCE into an int, then the two arms are emitted
-     ONCE through e_emit_arm -- so edge moves, back-edge polls and R6 syncs are
+     ONCE through e_emit_arm -- so edge moves, back-edge polls and pre-safepoint syncs are
      exactly as before and only the way `c_` is computed changes.
 
      A TAG operand is dispatched on its tag: INT compares as i32 (or
@@ -8090,7 +8090,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     fprintf(f, "{\n");
   }
 
-  /* S7. Entry. A compiled call passes entry_pc 0; anything else is a resume that
+  /* Entry. A compiled call passes entry_pc 0; anything else is a resume that
      belongs to the generic body, which has a label for every pc. The switch-off
      counter is checked first and costs one load.
 
@@ -8219,7 +8219,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    E_ENTER_NOTE(%d);\n", fi);
 
 
-  /* S1. One C local per value, by representation. A value that is not live is
+  /* One C local per value, by representation. A value that is not live is
      not declared: the IR keeps values that trivial-parameter removal dropped. */
   {
     int nv = fn->nvalues;
@@ -8296,7 +8296,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       }
     }
     /* 2a-2: the block's lowered prefix, then an exit at the first instruction
-       the spec body does not lower. Rule R3: an instruction is either lowered
+       the spec body does not lower. An instruction is either lowered
        here or IS the exit point -- never "emitted as nothing". */
     /* DISPATCH ORDER: MOST SPECIFIC FIRST. The chain below goes from the narrowest
        emitter to the widest, and the generic op-call wrapper is LAST, as the

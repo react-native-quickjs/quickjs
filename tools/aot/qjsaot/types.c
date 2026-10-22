@@ -416,7 +416,7 @@ int q2_infer(Q2Func *fn) {
     v->rep = lb_rep(lb);
     v->spec = 0;
     v->ovf = 0;
-    /* R1: nothing is in its frame slot until a write-back puts it there. A
+    /* Nothing is in its frame slot until a write-back puts it there. A
        tagged value is no exception: it lives in its C local, and the
        write-back before a safepoint, a leave or a return stores it. */
     v->synced = 0;

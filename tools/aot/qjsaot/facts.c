@@ -724,7 +724,7 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
   }
   if (forwarded) {
     /* The copy still has to be current in its register: the emitter stores a
-       tagged value there (S2). Nothing ran, so the instruction is no safepoint
+       tagged value there. Nothing ran, so the instruction is no safepoint
        and no fact changes. */
     return 0;
   }

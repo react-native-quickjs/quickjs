@@ -67,11 +67,10 @@ int e_has_call_site(const Q2Func *fn) {
    The frame is the one `regvm_light_fill` builds, field for field, because
    every handler, cold arm and deopt path reads it. The few pieces that are not
    a plain store come from the engine (patch 0307): the seal, the stack-overflow
-   RangeError, the variable-area release and, in check builds, the frame
-   cross-check.
+   RangeError and the variable-area release.
 
-   Rule P (poll) and rule K (stack check) are emitted only for a function that
-   contains a call site, or, for rule K, when its own frame is over 16 KB.
+   The poll (an interrupt-counter decrement) and the stack check are emitted only for a function that
+   contains a call site, or, for the stack check, when its own frame is over 16 KB.
    Recursion needs a call site in every function on the cycle, so every cycle
    still polls once per round; loops poll on their back edges; an op call that
    runs JS polls inside the engine. */
@@ -120,7 +119,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
       "\n",
       slots, has_var ? g->var_count : 0);
 
-  /* Rule K: the stack check. The margin leaves room for the throw itself; a
+  /* The stack check. The margin leaves room for the throw itself; a
      4 KB margin crashed before; 64 KB has held. */
   if (check) {
     fprintf(
@@ -130,7 +129,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
         "E_STACK_MARGIN, 0))\n"
         "        return qjs_aot_throw_stack_overflow(ctx);\n");
   }
-  /* Rule P: the poll. `qjs_aot_poll` decrements the counter itself, so undo
+  /* The poll. `qjs_aot_poll` decrements the counter itself, so undo
      this one first: the counter must drop by exactly one per call. */
   if (call_site) {
     fprintf(
