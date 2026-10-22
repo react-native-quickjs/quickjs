@@ -62703,7 +62703,7 @@ __attribute__((always_inline)) int qjs_aot_binary(JSContext *ctx, int sub, JSVal
    exception. */
 QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
                                       uint32_t idx, int kind, JSValue a,
-                                      JSValue *out)
+                                      int d, int ra, JSValue *out)
 {
     JSValue cst;
 
@@ -62711,6 +62711,16 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
         cst = f->b->cpool[idx];
         if (regvm_num_fast(sub, a, cst, out))
             return 1;
+        if (sub == REG_BIN_ADD) {
+            /* `s += 'x'`: append in place when the register holds the only reference,
+               as the interpreter's handler does. */
+            int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc,
+                                        d, ra, cst);
+            if (ar > 0)
+                return 2;
+            if (ar < 0)
+                return -1;
+        }
         if (js_regvm_binary(ctx, sub, a, cst, out))
             return -1;
         return 1;
@@ -62718,6 +62728,18 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
     cst = JS_AtomToValue(ctx, (JSAtom)idx);
     if (JS_IsException(cst))
         return -1;
+    if (sub == REG_BIN_ADD) {
+        int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc,
+                                    d, ra, cst);
+        if (ar > 0) {
+            JS_FreeValue(ctx, cst);
+            return 2;
+        }
+        if (ar < 0) {
+            JS_FreeValue(ctx, cst);
+            return -1;
+        }
+    }
     if (js_regvm_binary(ctx, sub, a, cst, out) < 0) {
         JS_FreeValue(ctx, cst);
         return -1;

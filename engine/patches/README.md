@@ -414,3 +414,4 @@ bump while `9999` is missing.
 | `0326` | Gives the object-literal helpers a bytecode form for functions with no frame | A frameless function could not build an object literal, so a tree builder stayed framed and shallow | `qjs_aot_object_template_b`, `qjs_aot_object_fill_b`; the frame forms call them | No. |
 | `0327` | Gives compiled code typed-array element access | A loop over a typed array ran every access through the step handler, slower than the interpreter | layout class ids for the typed arrays; `qjs_aot_typed_put` | No. |
 | `0328` | Throws the `to_propkey2` error in the step's own context | The handler read `rf->caller_ctx` from the record-only tail, which a light or compiled frame lacks | `to_propkey2` throws in `ctx` | No. |
+| `0329` | Appends a string in place from compiled code | The compiled `s += 'x'` built a new string every time | `qjs_aot_binary_cpool` takes the register indexes and runs `regvm_accum_append` | No. |

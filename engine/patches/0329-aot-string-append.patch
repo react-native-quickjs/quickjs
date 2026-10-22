@@ -1,0 +1,76 @@
+Subject: Append a string in place from compiled code
+
+What this does
+  - `qjs_aot_binary_cpool` takes the destination and left-operand register indexes. For
+    `s += 'x'` with the two the same register it runs the interpreter's in-place string
+    accumulator (`regvm_accum_append`) and returns 2, with the result left in the register.
+    Every other case is as before.
+
+Why we need it
+  The compiled `s += 'x'` built a new string each time (quadratic in the string length),
+  2.0 times slower than the interpreter's in-place append on a loop of 1,024 appends.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62703,7 +62703,7 @@
+    exception. */
+ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
+                                       uint32_t idx, int kind, JSValue a,
+-                                      JSValue *out)
++                                      int d, int ra, JSValue *out)
+ {
+     JSValue cst;
+ 
+@@ -62711,6 +62711,16 @@
+         cst = f->b->cpool[idx];
+         if (regvm_num_fast(sub, a, cst, out))
+             return 1;
++        if (sub == REG_BIN_ADD) {
++            /* `s += 'x'`: append in place when the register holds the only reference,
++               as the interpreter's handler does. */
++            int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc,
++                                        d, ra, cst);
++            if (ar > 0)
++                return 2;
++            if (ar < 0)
++                return -1;
++        }
+         if (js_regvm_binary(ctx, sub, a, cst, out))
+             return -1;
+         return 1;
+@@ -62718,6 +62728,18 @@
+     cst = JS_AtomToValue(ctx, (JSAtom)idx);
+     if (JS_IsException(cst))
+         return -1;
++    if (sub == REG_BIN_ADD) {
++        int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc,
++                                    d, ra, cst);
++        if (ar > 0) {
++            JS_FreeValue(ctx, cst);
++            return 2;
++        }
++        if (ar < 0) {
++            JS_FreeValue(ctx, cst);
++            return -1;
++        }
++    }
+     if (js_regvm_binary(ctx, sub, a, cst, out) < 0) {
+         JS_FreeValue(ctx, cst);
+         return -1;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -409,10 +409,12 @@
+ int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out);
+ /* `a <sub> const` for the forms whose right operand is not a register: a
+    constant-pool entry (`kind` REG_CONST_CPOOL) or an atom. 0 with an owned
+-   *out, -1 on exception. */
++   *out, -1 on exception. `d` and `ra` are the destination and the left operand's register
++   indexes: `s += 'x'` appends in place, like the interpreter's handler, and returns 2 with
++   the result left in register `d` (`*out` unset). */
+ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
+                                       uint32_t idx, int kind, JSValue a,
+-                                      JSValue *out);
++                                      int d, int ra, JSValue *out);
+ 
+ /* The frame's argument window: AOT_ARG(ab, slot). */
+ JSValue *qjs_aot_arg_buf(JSRegRun *f);
