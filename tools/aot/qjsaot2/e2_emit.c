@@ -261,6 +261,14 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
   const JSAotGenFunc *g = fn->g;
   int nregs = g->reg_count;
   int slots = (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
+  /* A function the engine does not call light has no frame size of its own; the
+     exit builds the same frame (prefix, then the registers; no variable area, which
+     frameless entry rules out). */
+  char slotsx[64];
+  if (g->light_ok)
+    snprintf(slotsx, sizeof(slotsx), "%d", slots);
+  else
+    snprintf(slotsx, sizeof(slotsx), "QJS_AOT_LIGHT_PREFIX_SLOTS + %d", nregs > 0 ? nregs : 1);
 
   fprintf(
       f,
@@ -270,7 +278,7 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "    JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue this_obj,\n"
       "    JSValue *argv, const E2Nx *x)\n"
       "{\n"
-      "    JSValue mem[%d] __attribute__((aligned(16)));\n"
+      "    JSValue mem[%s] __attribute__((aligned(16)));\n"
       "    uint8_t *nf = (uint8_t *)mem;\n"
       "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
       "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
@@ -327,7 +335,7 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
       "    return ret;\n"
       "}\n\n",
-      e2_linkage(), hex, slots, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
+      e2_linkage(), hex, slotsx, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
 }
 
 /* `aot_f_HEX` for a frameless function: the engine still enters through it with a
@@ -409,7 +417,7 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   }
   /* The unit builder must know a native entry exists, because a call site
      elsewhere in the unit may only name an `aot_n_` that some body defines. */
-  if (rc == 0 && g->light_ok && e2_fl_was_chosen()) {
+  if (rc == 0 && e2_fl_was_chosen()) {
     /* The body IS the native entry: it was emitted as `aot_n_`, with its exit
        function and the forwarding `aot_f_`. */
     e2_report_entry(g, hex, 1, 0, 0);
@@ -437,7 +445,8 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   ninsns = fn.ninsns;
   q2_free(&fn);
   if (rc != 0) return rc;
-  if (g->light_ok) qjs_aot_note_native_entry(qjs_aot_cur_func_idx());
+  if (g->light_ok || e2_fl_was_chosen())
+    qjs_aot_note_native_entry(qjs_aot_cur_func_idx());
   return ninsns;
 }
 

@@ -3477,6 +3477,26 @@ int qjs_aot_light_need(const char hex[33]) {
   return 0;
 }
 
+/* Whether a compiled caller may call this unit function on the C stack: a light
+   function, or one the engine does not call light (it reads closure variables) but
+   that a frameless body can serve: a plain function with no control records and no
+   variable area. The final answer is the `Q2_NATIVE_` macro, defined only when a
+   native entry was emitted. */
+int qjs_aot_native_capable(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) {
+      const JSAotGenFunc *g = &g_unit_funcs[i];
+      if (g->eligible != AOT_GEN_ELIGIBLE) return 0;
+      if (g->light_ok) return g->light_need > 0;
+      return g->func_kind == 0 && g->ctl_count == 0 && g->light_var_count == 0;
+    }
+  return 0;
+}
+
 /* The declared argument count of the unit function with this digest, or -1 when
    it is not in the unit. A direct call must supply at least this many: the
    callee's frame publishes `argc` and its body reads its parameters from the

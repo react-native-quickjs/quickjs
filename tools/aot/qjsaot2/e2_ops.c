@@ -107,6 +107,7 @@ int qjs_aot_prof_callees(
 int qjs_aot_inline_has(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
+int qjs_aot_native_capable(const char hex[33]);
 int qjs_aot_unit_argc(const char hex[33]);
 int qjs_aot_sweep_on(void);
 int qjs_aot_site_alloc(void);
@@ -1803,7 +1804,7 @@ static int emit_native_call(
        every declared argument, because the callee reads its parameters from
        the window and publishes `argc`; a short window would read a register
        the caller never wrote. */
-    if (qjs_aot_light_need(hex[k]) <= 0) continue;
+    if (!qjs_aot_native_capable(hex[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(hex[k])) continue;
     nb++;
   }
@@ -1825,7 +1826,7 @@ static int emit_native_call(
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1) continue;
     if (!qjs_aot_unit_has(hex[k])) continue;
-    if (qjs_aot_light_need(hex[k]) <= 0) continue;
+    if (!qjs_aot_native_capable(hex[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(hex[k])) continue;
     emit_one_direct_call(f, fn, in, hex[k], in->next);
   }
@@ -4435,7 +4436,7 @@ static int emit_inl_nested_call(
   }
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
-    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (!qjs_aot_native_capable(callee[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     nb++;
   }
@@ -4523,7 +4524,7 @@ static int emit_inl_nested_call(
   e2_sweep_guard(f, "vx", in->pc);
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
-    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (!qjs_aot_native_capable(callee[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
     if (getenv("QJS_AOT_E2_INL_CONTROL") != NULL &&
@@ -4607,7 +4608,7 @@ static int emit_typed_call(
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1) continue;
     if (!qjs_aot_unit_has(callee[k])) continue;
-    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (!qjs_aot_native_capable(callee[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     nb++;
   }
@@ -4689,7 +4690,7 @@ static int emit_typed_call(
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1) continue;
     if (!qjs_aot_unit_has(callee[k])) continue;
-    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (!qjs_aot_native_capable(callee[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
     /* Negative control: "noident" tests only that the callee is an object, so a
@@ -7857,7 +7858,9 @@ static int e2_fl_loops(void) {
 static const char *e2_fl_prefilter(const Q2Func *fn) {
   const JSAotGenFunc *g = fn->g;
   int i;
-  if (!g->light_ok) return "not light";
+  if (!g->light_ok &&
+      !(g->func_kind == E2_FUNC_NORMAL && g->ctl_count == 0))
+    return "not light";
   if (g->light_need > 16 * 1024) return "frame over 16 KB";
   if (g->light_var_count > 0) return "variable area";
   if (g->func_kind != E2_FUNC_NORMAL) return "not a plain function";
@@ -8026,6 +8029,7 @@ int e2_emit_inline_body(
   size_t ml = 0;
   FILE *m;
   int i, b, si, rc, ncalls = 0;
+  (void)0;
 
   /* QJS_AOT_E2_NOINLINE=1 emits no inline body: the baseline of a comparison. */
   if (getenv("QJS_AOT_E2_NOINLINE") != NULL &&
@@ -8033,8 +8037,23 @@ int e2_emit_inline_body(
     snprintf(why, whyn, "disabled");
     return 0;
   }
-  if (!g->light_ok) {
-    snprintf(why, whyn, "not light");
+  if (!g->light_ok && !(g->func_kind == E2_FUNC_NORMAL && g->ctl_count == 0)) {
+    /* The engine's light rule: a plain function, no closure variables, no control
+       records (try), no captured arguments, a light-safe opcode set. */
+    int vr = 0, ap = 0;
+    for (i = 0; i < fn->ninsns; i++) {
+      char nm2[64];
+      e2_rop_name(fn->insns[i].rop, nm2, sizeof(nm2));
+      if (strstr(nm2, "var_ref") != NULL || strcmp(nm2, "make_closure") == 0) vr = 1;
+      if (strcmp(nm2, "apply_arguments") == 0) ap = 1;
+    }
+    snprintf(
+        why, whyn, "not light: %s",
+        g->func_kind != E2_FUNC_NORMAL ? "generator or async"
+        : g->ctl_count > 0             ? "try/catch"
+        : vr                           ? "closure variables"
+        : ap                           ? "apply_arguments"
+                                       : "other (captured arguments or an op that is not light-safe)");
     return 0;
   }
   if (g->light_need > 16 * 1024) {
