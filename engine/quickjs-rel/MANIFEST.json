@@ -1239,12 +1239,16 @@
       "sha256": "d3ba1b734a8421250d8457c9d4a2968000dc06cfe8e16e2748ba6562fe289972"
     },
     {
+      "name": "0315-aot-poly-replace-release.patch",
+      "sha256": "0804c2c0659336c9ef1832f35bf3136b0c60a99dcb805437f8fda42e641265cf"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "320efa1dda174cae993ef7e6e5e56e83dbe9fdfe483c24f0640a00c5f483a516",
+    "quickjs.c": "629002f33bad8bd8acb9b57f878b9690ee2eb092455eade0f39077e49325cca0",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -62035,8 +62035,9 @@ int qjs_aot_poly_fill(
     }
     e = b->aot_poly + (size_t)site * AOT_POLY_WAYS;
     sh = JS_VALUE_GET_OBJ(obj)->shape;
-    /* The entries hold weak shape pointers, so every hit is revalidated by the
-       caller's shape compare against a live object; nothing is released. */
+    /* The entries hold a reference to their shape; every hit is revalidated by the
+       caller's shape compare against a live object. The reference is released when
+       a way is replaced and at teardown. */
     for (k = 0; k < AOT_POLY_WAYS; k++) {
         if (e[k].shape == sh) {
             e[k].off = off2;
@@ -62064,6 +62065,10 @@ int qjs_aot_poly_fill(
        by the engine's own paths before the next attempt. */
     if (!sh->is_hashed)
         return 0;
+    /* Replacing a full way releases the shape the way held, or it leaks (and keeps
+       its whole object graph alive until teardown). */
+    if (e[slot].shape != NULL)
+        js_free_shape(ctx->rt, e[slot].shape);
     e[slot].shape = js_dup_shape(sh);
     e[slot].off = off2;
     e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);

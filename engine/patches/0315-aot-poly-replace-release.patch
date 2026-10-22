@@ -1,0 +1,41 @@
+Subject: Release the shape a polymorphic cache way held when the way is replaced
+
+What this does
+  When all four ways of a site's polymorphic cache are full and a fifth shape is
+  filled, the replaced way's shape reference is released before the new shape is
+  stored.
+
+Why we need it
+  The fill duplicated the new shape and overwrote the way without releasing the old
+  one, so every replacement leaked a shape reference (and with it the shape's whole
+  object graph until runtime teardown, which then failed its "no objects left"
+  check). Nothing used a fifth shape until compiled bodies started serving
+  polymorphic sites. The release is a plain reference drop: the finalizers it can reach
+  take only the runtime (no context), so none can run JS; the same drop already runs
+  inline in compiled stores.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62035,8 +62035,9 @@
+     }
+     e = b->aot_poly + (size_t)site * AOT_POLY_WAYS;
+     sh = JS_VALUE_GET_OBJ(obj)->shape;
+-    /* The entries hold weak shape pointers, so every hit is revalidated by the
+-       caller's shape compare against a live object; nothing is released. */
++    /* The entries hold a reference to their shape; every hit is revalidated by the
++       caller's shape compare against a live object. The reference is released when
++       a way is replaced and at teardown. */
+     for (k = 0; k < AOT_POLY_WAYS; k++) {
+         if (e[k].shape == sh) {
+             e[k].off = off2;
+@@ -62064,6 +62065,10 @@
+        by the engine's own paths before the next attempt. */
+     if (!sh->is_hashed)
+         return 0;
++    /* Replacing a full way releases the shape the way held, or it leaks (and keeps
++       its whole object graph alive until teardown). */
++    if (e[slot].shape != NULL)
++        js_free_shape(ctx->rt, e[slot].shape);
+     e[slot].shape = js_dup_shape(sh);
+     e[slot].off = off2;
+     e[slot].kind = (uint16_t)(write ? AOT_POLY_WRITE : AOT_POLY_READ);
