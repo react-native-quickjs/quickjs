@@ -1856,6 +1856,15 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES %uu\n"
           "#define QJS_AOT_CLASS_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_UINT8C_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_INT8_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_UINT8_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_INT16_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_UINT16_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_INT32_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_UINT32_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_FLOAT32_ARRAY %uu\n"
+          "#define QJS_AOT_CLASS_FLOAT64_ARRAY %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_POLY %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_POLY_SITES %uu\n"
           "#define QJS_AOT_AOT_POLY_WAYS %uu\n"
@@ -1916,7 +1925,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_object_func_bytecode, lay.class_bytecode_function,
           lay.off_fnbc_aot_fn, lay.off_fnbc_regvm_pic,
           lay.off_object_array_count, lay.off_object_array_values,
-          lay.class_array, lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
+          lay.class_array, lay.class_uint8c_array, lay.class_int8_array,
+          lay.class_uint8_array, lay.class_int16_array, lay.class_uint16_array,
+          lay.class_int32_array, lay.class_uint32_array, lay.class_float32_array,
+          lay.class_float64_array, lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
@@ -2648,6 +2660,41 @@ int qjsaot_driver_main(int argc, char **argv) {
            checks, then the element itself, borrowed. No reference is taken,
            so the caller must consume it before the next safepoint, exactly
            like the cache-hit field read. */
+        /* An element of a typed array, in range: the engine keeps the element
+           pointer and the count where a dense array keeps its values and count, and
+           a detached or shrunken buffer has its count at zero. */
+        "#define E_TA_F64(d_) ({ double e_ = (d_); qjs_aot_box_num(e_, qjs_aot_fitsi(e_)); })\n"
+        "static inline __attribute__((always_inline)) int q2_ta_get(const "
+        "unsigned char *p, unsigned cid, uint32_t i, JSValue *out)\n"
+        "{\n"
+        "  const void *base;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
+        "return 0;\n"
+        "  base = *(const void *const *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES);\n"
+        "  switch (cid) {\n"
+        "  case QJS_AOT_CLASS_UINT8C_ARRAY:\n"
+        "  case QJS_AOT_CLASS_UINT8_ARRAY:\n"
+        "    *out = JS_MKVAL(JS_TAG_INT, ((const uint8_t *)base)[i]); return 1;\n"
+        "  case QJS_AOT_CLASS_INT8_ARRAY:\n"
+        "    *out = JS_MKVAL(JS_TAG_INT, ((const int8_t *)base)[i]); return 1;\n"
+        "  case QJS_AOT_CLASS_INT16_ARRAY:\n"
+        "    *out = JS_MKVAL(JS_TAG_INT, ((const int16_t *)base)[i]); return 1;\n"
+        "  case QJS_AOT_CLASS_UINT16_ARRAY:\n"
+        "    *out = JS_MKVAL(JS_TAG_INT, ((const uint16_t *)base)[i]); return 1;\n"
+        "  case QJS_AOT_CLASS_INT32_ARRAY:\n"
+        "    *out = JS_MKVAL(JS_TAG_INT, ((const int32_t *)base)[i]); return 1;\n"
+        "  case QJS_AOT_CLASS_UINT32_ARRAY: {\n"
+        "    uint32_t x = ((const uint32_t *)base)[i];\n"
+        "    *out = x <= 2147483647u ? JS_MKVAL(JS_TAG_INT, (int32_t)x) : "
+        "qjs_aot_box_num((double)x, 0);\n"
+        "    return 1; }\n"
+        "  case QJS_AOT_CLASS_FLOAT32_ARRAY:\n"
+        "    *out = E_TA_F64((double)((const float *)base)[i]); return 1;\n"
+        "  case QJS_AOT_CLASS_FLOAT64_ARRAY:\n"
+        "    *out = E_TA_F64(((const double *)base)[i]); return 1;\n"
+        "  default: return 0;\n"
+        "  }\n"
+        "}\n\n"
         "static inline __attribute__((always_inline)) int q2_elem_hit(JSValue "
         "arr, JSValue k, JSValue *out)\n"
         "{\n"
@@ -2660,7 +2707,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
-        "    return 0;\n"
+        "    return q2_ta_get(p, *(const uint16_t *)(p + "
+        "QJS_AOT_OFF_JSOBJECT_CLASS_ID), i, out);\n"
         "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
         "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
         "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
@@ -2756,7 +2804,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
-        "    return 0;\n"
+        "    return qjs_aot_typed_put(arr, i, v);\n"
         "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
         "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
         "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
@@ -2820,8 +2868,12 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;\n"
         "  p = (const unsigned char *)JS_VALUE_GET_PTR(v);\n"
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
-        "      QJS_AOT_CLASS_ARRAY)\n"
-        "    return 0;\n"
+        "      QJS_AOT_CLASS_ARRAY) {\n"
+        "    unsigned cid = *(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID);\n"
+        "    if (cid < QJS_AOT_CLASS_UINT8C_ARRAY || cid > QJS_AOT_CLASS_FLOAT64_ARRAY) return 0;\n"
+        "    *out = (double)*(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n"
+        "    return 1;\n"
+        "  }\n"
         "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
         "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
         "  prop = *(const unsigned char *const *)(p + "
