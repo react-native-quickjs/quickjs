@@ -5469,7 +5469,7 @@ static int emit_alloc_op(
   Q2ValueId dv;
   int off, dreg, r, na = 0, handler_ok = 0;
   const char *okc = "1";
-  int redef_mode = 0, nodest = in->rop == ROP_object_fill, src_off = -1;
+  int redef_mode = 0, nodest = in->rop == ROP_object_fill, src_off = -1, src_off2 = -1;
   char call[256];
 
   if (g_e_fl && !g_e_inl && have_types &&
@@ -5558,6 +5558,25 @@ static int emit_alloc_op(
       else
         return 0;
       break;
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul:
+    case ROP_div:
+    case ROP_mod: {
+      /* "rrr": the arithmetic the typed forms did not take (a string, an object, a mixed
+         pair) runs in the engine's own routine, not through the step handler. */
+      int ao, bo;
+      if (e_roles[in->rop]->nuse != 2 || in->sub < 0) return 0;
+      ao = operand_off(in, e_roles[in->rop]->use[0]);
+      bo = operand_off(in, e_roles[in->rop]->use[1]);
+      if (ao < 0 || bo < 0 || ao / 16 >= fn->nregs || bo / 16 >= fn->nregs) return 0;
+      src_off = ao;
+      src_off2 = bo;
+      snprintf(call, sizeof(call),
+               "qjs_aot_binary_rr(ctx, f, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), %d, %d, &_o)",
+               (int)in->sub, ao, bo, dreg, ao / 16);
+      break;
+    }
     case ROP_load_const:
       if (in->narg < 3 || in->arg[2].kind != 'c') return 0;
       /* An atom operand is the code's own word: atoms are renumbered at load. */
@@ -5608,7 +5627,8 @@ static int emit_alloc_op(
      frame (the registers a fallback-shaped op redefines) are boxed into the frame. */
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v;
-    int need = (r >= in->win_reg && r < in->win_reg + na) || r * 16 == src_off;
+    int need = (r >= in->win_reg && r < in->win_reg + na) || r * 16 == src_off ||
+               r * 16 == src_off2;
     int k2;
     for (k2 = 0; k2 < in->nredef; k2++)
       if (in->redef_reg != NULL && in->redef_reg[k2] == r) need = 1;
@@ -8414,11 +8434,13 @@ static int e_dispatch_rop(
     /* -- arithmetic -- */
     case ROP_div:
     case ROP_mod:
-      return emit_typed_divmod(f, fn, in, t, cur, have_types, hex, fi, b, NULL);
+      return emit_typed_divmod(f, fn, in, t, cur, have_types, hex, fi, b, NULL) ||
+             emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_add:
     case ROP_sub:
     case ROP_mul:
-      return have_types && emit_typed_arith(f, fn, in, t, cur);
+      return (have_types && emit_typed_arith(f, fn, in, t, cur)) ||
+             emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_binary_cpool:
       return emit_typed_arith_cpool(f, fn, in, t, cur, have_types) ||
              emit_tag_numeric(f, fn, in, t, cur, have_types, hex, fi, b) ||
