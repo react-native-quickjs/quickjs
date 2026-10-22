@@ -62443,11 +62443,28 @@ __attribute__((always_inline)) void qjs_aot_set_reg_b(JSContext *ctx, JSValue *f
 }
 #endif
 
+#if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING)
+#include <emmintrin.h>
+static inline void JSValue_store16(JSValue *d, JSValue v)
+{
+    __m128i x;
+    memcpy(&x, &v, sizeof x);
+    _mm_storeu_si128((__m128i *)d, x);
+}
+#else
+static inline void JSValue_store16(JSValue *d, JSValue v)
+{
+    *d = v;
+}
+#endif
+
 __attribute__((always_inline)) void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v)
 {
     JSValue *slot = (JSValue *)((uint8_t *)fr + off);
 #if QJS_DRC
-    *slot = v;
+    /* One 16-byte store: the next copy of this slot loads all 16 bytes at once,
+       which two 8-byte stores cannot forward to. */
+    JSValue_store16(slot, v);
     REG_ADOPT(ctx->rt, v);
 #else
     {
