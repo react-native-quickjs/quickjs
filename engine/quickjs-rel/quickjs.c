@@ -62568,6 +62568,9 @@ int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
 
     if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
         return 0;
+    /* a string's own `length` and its index properties come before the prototype's */
+    if (atom == JS_ATOM_length || __JS_AtomIsTaggedInt((JSAtom)atom))
+        return 0;
     p = JS_VALUE_GET_OBJ(pv);
     prs = find_own_property(&pr, p, (JSAtom)atom);
     if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)

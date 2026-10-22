@@ -1296,7 +1296,7 @@
     },
     {
       "name": "0330-aot-string-reads.patch",
-      "sha256": "9f3b4d0c0318ecb0bceeefab615f1f79b520be6c5796799f4f5e4e3279abe85e"
+      "sha256": "7c0d6001570ccf90c0cd2cdfbe06e1b521d221a8a1a239a781dc56bdbd65233f"
     },
     {
       "name": "0331-aot-binary-rr.patch",
@@ -1312,7 +1312,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "3301288e9714438946df1927f56c85c49ec2825c8d0c634378f733f6a00704b0",
+    "quickjs.c": "416038cfe7c4ba7cf8fb559adbc23f8e721279b659af1a45e084796bd47880fb",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

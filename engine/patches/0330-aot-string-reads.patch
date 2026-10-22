@@ -52,7 +52,7 @@ Why we need it
      out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
  #endif
      out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
-@@ -62514,6 +62541,26 @@
+@@ -62514,6 +62541,29 @@
      return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
  }
  
@@ -65,6 +65,9 @@ Why we need it
 +    JSProperty *pr;
 +
 +    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
++        return 0;
++    /* a string's own `length` and its index properties come before the prototype's */
++    if (atom == JS_ATOM_length || __JS_AtomIsTaggedInt((JSAtom)atom))
 +        return 0;
 +    p = JS_VALUE_GET_OBJ(pv);
 +    prs = find_own_property(&pr, p, (JSAtom)atom);
@@ -79,7 +82,7 @@ Why we need it
  /* A store of a number into an element of a typed array that is in range: 1 when done.
     An integer goes to any element type (converted as the engine's own fast path does),
     a double only to the float types; anything else is the caller's slow path. */
-@@ -89035,6 +89082,9 @@
+@@ -89035,6 +89085,9 @@
      case QJS_AOT_INTR_MIN:
      case QJS_AOT_INTR_MAX: return (void *)js_math_min_max;
      case QJS_AOT_INTR_PARSEINT: return (void *)js_parseInt;
