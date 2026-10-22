@@ -4121,6 +4121,7 @@ static int emit_typed_elem_read(
 static int emit_typed_elem_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
+  char elemcall[384];
   const E2Role *role = e2_roles[in->rop];
   Q2ValueId av, kv, vv;
   int areg, kreg, vreg;
@@ -4140,10 +4141,6 @@ static int emit_typed_elem_write(
      an old one that carry no reference, and does no counting. A frameless body
      leaves on the other cases, so only a number or a bool is stored there: an
      object stored over a slot would leave on every execution. */
-  if (g_e2_fl && t->lb[vv] == E2_LB_TAG) {
-    e2_fl_block("an element store of a TAG value", in);
-    return 0;
-  }
   if (t->lb[av] != E2_LB_TAG) return 0;
   if (t->lb[kv] == E2_LB_I32)
     snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
@@ -4167,8 +4164,13 @@ static int emit_typed_elem_write(
   fprintf(f, "    {\n");
   fprintf(
       f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_elem_put(v%u, %s, %s), 1)) {\n",
-      (unsigned)av, kb, vb);
+      "      if (__builtin_expect(!Q2_FORCE_MISS && %s, 1)) {\n",
+      g_e2_fl ? (snprintf(elemcall, sizeof(elemcall),
+                          "q2_elem_put_rc(ctx, v%u, %s, %s)", (unsigned)av, kb, vb),
+                 elemcall)
+              : (snprintf(elemcall, sizeof(elemcall), "q2_elem_put(v%u, %s, %s)",
+                          (unsigned)av, kb, vb),
+                 elemcall));
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", areg * 16, (unsigned)av);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", kreg * 16, kb);
@@ -5216,10 +5218,6 @@ static int emit_typed_field_write(
       int g = e2_exit_group(fn, in, site);
       /* No reference counting inline: a store of a TAG value (an object, null)
          over what is usually a reference leaves on nearly every execution. */
-      if (g_e2_fl && t->lb[vv] == E2_LB_TAG) {
-        e2_fl_block("a store of a TAG value", in);
-        return 0;
-      }
       if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
       if (e2_must_exit(fn, in)) return 0;
       /* The inline store counts references. */
@@ -5433,23 +5431,24 @@ static int emit_group_write(
   fprintf(
       f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
       test, recv, in->pc);
-  if (g_e2_fl) {
-    /* No reference counting inline: the store goes ahead only when neither the
-       old nor the new value is counted (so it is a plain store), otherwise the
-       generic body does it. A local first: the boxed value may be a compound
-       literal, whose commas would split a macro argument. */
+  /* The counted store the framed body makes: the new value duplicated before the
+     old one is released. The release is an effect, which a frameless or inline
+     body's exits account for. A local first: the boxed value may be a compound
+     literal, whose commas would split a macro argument. */
+  fprintf(f, "      JSValue _nv = %s;\n", boxed);
+  if (boxed[0] != 'v') {
+    /* A number or a bool: nothing to duplicate, only the old value to release. */
     fprintf(
         f,
-        "      JSValue _nv = %s;\n"
         "      JSValue *_sp = q2_slotp(%s, q2_cell_off(pic, %d));\n"
-        "      if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_nv) || "
-        "JS_VALUE_HAS_REF_COUNT(*_sp), 0)) goto vx_%d;\n"
-        "      *_sp = _nv;\n",
-        boxed, recv, site, in->pc);
+        "      JSValue _old = *_sp;\n"
+        "      *_sp = _nv;\n"
+        "      if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_old), 0)) "
+        "JS_FreeValue(ctx, _old);\n",
+        recv, site);
   } else {
     fprintf(
-        f, "      q2_put_slot(ctx, %s, q2_cell_off(pic, %d), %s);\n", recv, site,
-        boxed);
+        f, "      q2_put_slot(ctx, %s, q2_cell_off(pic, %d), _nv);\n", recv, site);
   }
   fprintf(f, "    }\n");
   e2_inl_store_mark(f);
@@ -5651,26 +5650,6 @@ static int emit_typed_var_ref_store(
     default:
       return 0;
   }
-  if (g_e2_fl && t->lb[a] == E2_LB_TAG) {
-    e2_fl_block("a cell store of a TAG value", in);
-    return 0;
-  }
-  if (g_e2_fl) {
-    /* No reference counting inline: the store goes ahead only when neither the
-       old nor the new value is counted, otherwise the generic body does it. */
-    e2_note_stub(
-        g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
-    fprintf(
-        f,
-        "    { JSValue *_p = qjs_aot_var_ref_ptr(f, %d);\n"
-        "      JSValue _nv = %s;\n"
-        "      if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_nv) || "
-        "JS_VALUE_HAS_REF_COUNT(*_p), 0)) goto vx_%d;\n"
-        "      *_p = _nv; }\n",
-        slot, box, in->pc);
-  e2_inl_store_mark(f);
-    return 1;
-  }
   /* The cell's OLD value is not forwarded: a later read of the cell is a fresh load
      with its own value id, so the IR already says the old value is gone. */
   fprintf(
@@ -5680,6 +5659,7 @@ static int emit_typed_var_ref_store(
       "      *_p = JS_DupValue(ctx, %s);\n"
       "      JS_FreeValue(ctx, _old); }\n",
       slot, box);
+  e2_inl_store_mark(f);
   (void)cur;
   return 1;
 }

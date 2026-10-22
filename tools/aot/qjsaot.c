@@ -5435,6 +5435,33 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *slot = v;\n"
         "  if (JS_VALUE_HAS_REF_COUNT(old)) JS_FreeValue(ctx, old);\n"
         "}\n\n");
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) int q2_elem_put_rc("
+        "JSContext *ctx, JSValue arr, JSValue k, JSValue v)\n"
+        "{\n"
+        "  unsigned char *p;\n"
+        "  uint32_t i;\n"
+        "  JSValue *slot, old;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(k) != JS_TAG_INT) return 0;\n"
+        "  p = (unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_ARRAY)\n"
+        "    return 0;\n"
+        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
+        "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
+        "return 0;\n"
+        "  slot = &(*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
+        "  if (JS_VALUE_GET_TAG(*slot) == JS_TAG_UNINITIALIZED) return 0;\n"
+        "  old = *slot;\n"
+        "  q2_dup(v);\n"
+        "  *slot = v;\n"
+        "  if (JS_VALUE_HAS_REF_COUNT(old)) JS_FreeValue(ctx, old);\n"
+        "  return 1;\n"
+        "}\n\n");
     /* The inline own-slot store hit: the interpreter's REG_PIC_OWN_W test on
        an object that is not a prototype, and the store the engine's own fast
        path makes (`*slot = js_dup(v); JS_FreeValue(ctx, old)`). The new value
