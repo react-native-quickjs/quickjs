@@ -57,6 +57,12 @@ static const EIntrinsic e_intr[QJS_AOT_INTR_COUNT] = {
     {QJS_AOT_INTR_MIN, "Math.min", "js_math_min_max", 0, 2, 2, E_RES_MINMAX, 0, 0, 0},
     {QJS_AOT_INTR_MAX, "Math.max", "js_math_min_max", 1, 2, 2, E_RES_MINMAX, 0, 0, 0},
     {QJS_AOT_INTR_PARSEINT, "parseInt", "js_parseInt", 0, 1, 2, E_RES_PARSEINT, 0, 0, 0},
+    {QJS_AOT_INTR_STR_CHARCODEAT, "String.prototype.charCodeAt", "js_string_charCodeAt", 0, 1, 1,
+     E_RES_F64, 0, 0, 0},
+    {QJS_AOT_INTR_STR_CODEPOINTAT, "String.prototype.codePointAt", "js_string_codePointAt", 0, 1,
+     1, E_RES_F64, 0, 0, 0},
+    {QJS_AOT_INTR_STR_CHARAT, "String.prototype.charAt", "js_string_charAt", 0, 1, 1, E_RES_F64,
+     0, 0, 0},
 };
 
 const char *e_intrinsic_name(int id) {

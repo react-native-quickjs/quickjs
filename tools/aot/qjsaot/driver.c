@@ -1865,6 +1865,13 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_CLASS_UINT32_ARRAY %uu\n"
           "#define QJS_AOT_CLASS_FLOAT32_ARRAY %uu\n"
           "#define QJS_AOT_CLASS_FLOAT64_ARRAY %uu\n"
+          "#define QJS_AOT_STRING_LEN_MASK %uu\n"
+          "#define QJS_AOT_OFF_CTX_CLASS_PROTO %uu\n"
+          "#define QJS_AOT_CLASS_STRING %uu\n"
+          "#define QJS_AOT_STRING_WIDE_MASK %uu\n"
+          "#define QJS_AOT_STRING_KIND_MASK %uu\n"
+          "#define QJS_AOT_SHAPE_PROP_TMASK %uu\n"
+          "#define QJS_AOT_OFF_RT_ONECHAR %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_POLY %uu\n"
           "#define QJS_AOT_OFF_FNBC_AOT_POLY_SITES %uu\n"
           "#define QJS_AOT_AOT_POLY_WAYS %uu\n"
@@ -1928,7 +1935,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.class_array, lay.class_uint8c_array, lay.class_int8_array,
           lay.class_uint8_array, lay.class_int16_array, lay.class_uint16_array,
           lay.class_int32_array, lay.class_uint32_array, lay.class_float32_array,
-          lay.class_float64_array, lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
+          lay.class_float64_array, lay.string_len_mask, lay.off_ctx_class_proto,
+          lay.class_string, lay.string_wide_mask, lay.string_kind_mask, lay.shape_prop_tmask, lay.off_rt_onechar,
+          lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
@@ -2520,6 +2529,42 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The inline arm of an intrinsic: 1 and a boxed result for numeric
            arguments of the shapes the engine handles the same way, 0 for
            anything else (the caller exits before the call). */
+        /* A character of a flat string, read in place: `charCodeAt` (NaN past the end) and
+           `codePointAt` (undefined past the end; a surrogate in a wide string is the
+           builtin's). A rope, a slice or an indirect string, a non-integer index: 0. */
+        "static inline __attribute__((always_inline)) int q2_intr_str(JSContext *ctx, int id, "
+        "JSValue s, Q2Num a, JSValue *out)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  uint32_t w0, w1, c;\n"
+        "  if (JS_VALUE_GET_TAG(s) != JS_TAG_STRING || a.k != 1) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(s);\n"
+        "  w0 = *(const uint32_t *)p;\n"
+        "  w1 = *(const uint32_t *)(p + 4);\n"
+        "  if (w1 & QJS_AOT_STRING_KIND_MASK) return 0;\n"
+        "  if ((uint32_t)a.i >= (w0 & QJS_AOT_STRING_LEN_MASK)) {\n"
+        "    if (id == QJS_AOT_INTR_STR_CHARAT) return 0;\n"
+        "    *out = id == QJS_AOT_INTR_STR_CHARCODEAT ? JS_NAN : JS_UNDEFINED;\n"
+        "    return 1;\n"
+        "  }\n"
+        "  if (w0 & QJS_AOT_STRING_WIDE_MASK) {\n"
+        "    c = ((const uint16_t *)(p + QJS_AOT_SIZEOF_JSSTRING))[a.i];\n"
+        "    if (id == QJS_AOT_INTR_STR_CODEPOINTAT && c >= 0xD800u && c <= 0xDFFFu)\n"
+        "      return 0;\n"
+        "  } else {\n"
+        "    c = ((const uint8_t *)(p + QJS_AOT_SIZEOF_JSSTRING))[a.i];\n"
+        "  }\n"
+        "  if (id == QJS_AOT_INTR_STR_CHARAT) {\n"
+        "    /* The runtime's one-character string, borrowed (the table holds it). */\n"
+        "    void *const *tab = (void *const *)(*(const unsigned char *const *)((const unsigned char *)ctx +\n"
+        "                                       QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_ONECHAR);\n"
+        "    if (c >= 256u || tab[c] == NULL) return 0;\n"
+        "    *out = JS_MKPTR(JS_TAG_STRING, tab[c]);\n"
+        "    return 1;\n"
+        "  }\n"
+        "  *out = JS_MKVAL(JS_TAG_INT, (int32_t)c);\n"
+        "  return 1;\n"
+        "}\n"
         "static inline __attribute__((always_inline)) int q2_intr(int id, "
         "Q2Num a, Q2Num b, JSValue *out)\n"
         "{\n"
@@ -2663,6 +2708,30 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* An element of a typed array, in range: the engine keeps the element
            pointer and the count where a dense array keeps its values and count, and
            a detached or shrunken buffer has its count at zero. */
+        /* A method on String.prototype read through a string receiver: the prototype's
+           shape and the property's offset are kept per site, and the current value
+           is read while the shape is unchanged. */
+        "typedef struct Q2StrCell { const void *shape; const void *prs; uint32_t off; uint32_t tried; } Q2StrCell;\n"
+        "static inline __attribute__((always_inline)) int q2_strproto_hit(JSContext *ctx, "
+        "JSValue recv, Q2StrCell *c, uint32_t atom, JSValue *out)\n"
+        "{\n"
+        "  JSValue pv;\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_STRING) return 0;\n"
+        "  pv = (*(JSValue *const *)((const unsigned char *)ctx + "
+        "QJS_AOT_OFF_CTX_CLASS_PROTO))[QJS_AOT_CLASS_STRING];\n"
+        "  if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT) return 0;\n"
+        "  if (__builtin_expect(q2_shape_of(pv) != c->shape || c->prs == NULL ||\n"
+        "      ((const uint32_t *)c->prs)[1] != atom ||\n"
+        "      (((const uint32_t *)c->prs)[0] & QJS_AOT_SHAPE_PROP_TMASK) != 0, 0)) {\n"
+        "    if (c->tried > 8 || !qjs_aot_strproto_slot(ctx, atom, &c->shape, &c->prs, &c->off)) {\n"
+        "      c->prs = NULL;\n"
+        "      c->tried++;\n"
+        "      return 0;\n"
+        "    }\n"
+        "  }\n"
+        "  *out = *q2_slotp(pv, c->off);\n"
+        "  return 1;\n"
+        "}\n"
         "#define E_TA_F64(d_) ({ double e_ = (d_); qjs_aot_box_num(e_, qjs_aot_fitsi(e_)); })\n"
         "static inline __attribute__((always_inline)) int q2_ta_get(const "
         "unsigned char *p, unsigned cid, uint32_t i, JSValue *out)\n"
@@ -2865,6 +2934,11 @@ int qjsaot_driver_main(int argc, char **argv) {
         "{\n"
         "  const unsigned char *p, *prop;\n"
         "  JSValue len;\n"
+        "  if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING) {\n"
+        "    *out = (double)(*(const uint32_t *)JS_VALUE_GET_PTR(v) &\n"
+        "                    QJS_AOT_STRING_LEN_MASK);\n"
+        "    return 1;\n"
+        "  }\n"
         "  if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;\n"
         "  p = (const unsigned char *)JS_VALUE_GET_PTR(v);\n"
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"

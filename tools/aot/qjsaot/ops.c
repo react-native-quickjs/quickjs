@@ -2195,6 +2195,8 @@ static int g_e_fl_chosen;
    keeps an activation record (JSAotFlRec) for the backtrace, and polls and checks
    the C stack at its entry. Kept from the trial emission into the real one. */
 static int g_e_fl_calls;
+/* The next site number of a direct call to a builtin (see emit_typed_call). */
+static int g_e_ccall_next;
 /* The published root array of a frameless body that calls (see JSAotFlRec): the slots
    of unrooted TAG values that live across a call or an allocation come first, then
    the argument window of the call in progress. A value gets its slot at its first
@@ -4604,7 +4606,8 @@ static int emit_intrinsic_call(
   Q2ValueId dv = in->def[0];
   Q2ValueId cv =
       cur != NULL && cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
-  char cexp[64], a0[128], a1[128];
+  char cexp[64], a0[128], a1[128], rexp[64], intcall[160];
+  int is_str;
 
   /* ---- every check, before any output ---- */
   if (dv >= (Q2ValueId)t->nvalues) return 0;
@@ -4626,6 +4629,22 @@ static int emit_intrinsic_call(
     intr_num(a1, sizeof(a1), fn, t, cur, in->win_reg + 1);
   else
     snprintf(a1, sizeof(a1), "(Q2Num){3, 0, 0}");
+  /* A string method takes its receiver from the call's `this` register. */
+  is_str = id == QJS_AOT_INTR_STR_CHARCODEAT || id == QJS_AOT_INTR_STR_CODEPOINTAT ||
+           id == QJS_AOT_INTR_STR_CHARAT;
+  if (is_str) {
+    int th = call_this_off(in);
+    Q2ValueId tv = th >= 0 && cur != NULL && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
+    if (th < 0) return 0;
+    if (tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME && tv < (Q2ValueId)t->nvalues &&
+        t->lb[tv] == E_LB_TAG)
+      snprintf(rexp, sizeof(rexp), "v%u", (unsigned)tv);
+    else if (tv == E_UNDEF || (tv != Q2_NO_VALUE && tv != E_INFRAME))
+      snprintf(rexp, sizeof(rexp), "JS_UNDEFINED");
+    else
+      snprintf(rexp, sizeof(rexp), "AOT_REG(fr, %d)", th);
+    snprintf(a1, sizeof(a1), "(Q2Num){3, 0, 0}");
+  }
 
   /* ---- output ---- */
   e_note_stub(
@@ -4640,8 +4659,12 @@ static int emit_intrinsic_call(
     /* control: a miss falls through to the real call below */
     fprintf(
         f,
-        "      if (q2_is_intr(%s, %d, %d) && q2_intr(%d, %s, %s, &_o)) {\n",
-        cexp, id, magic, id, a0, a1);
+        "      if (q2_is_intr(%s, %d, %d) && %s) {\n",
+        cexp, id, magic,
+        is_str ? (snprintf(intcall, sizeof(intcall), "q2_intr_str(ctx, %d, %s, %s, &_o)", id, rexp, a0),
+                  intcall)
+               : (snprintf(intcall, sizeof(intcall), "q2_intr(%d, %s, %s, &_o)", id, a0, a1),
+                  intcall));
     if (t->lb[dv] == E_LB_BOT)
       fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
     else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o"))
@@ -4660,10 +4683,16 @@ static int emit_intrinsic_call(
         f,
         "      if (__builtin_expect(!q2_is_intr(%s, %d, %d), 0)) goto vx_%d;\n",
         cexp, id, magic, in->pc);
-  fprintf(
-      f,
-      "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o), 0)) goto vx_%d;\n",
-      id, a0, a1, in->pc);
+  if (is_str)
+    fprintf(
+        f,
+        "      if (__builtin_expect(!q2_intr_str(ctx, %d, %s, %s, &_o), 0)) goto vx_%d;\n",
+        id, rexp, a0, in->pc);
+  else
+    fprintf(
+        f,
+        "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o), 0)) goto vx_%d;\n",
+        id, a0, a1, in->pc);
   if (t->lb[dv] == E_LB_BOT) {
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
   } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
@@ -5769,6 +5798,60 @@ static int emit_typed_call(
     fprintf(f, "    }\n");
     fprintf(f, "#endif\n");
   }
+  /* A builtin (C function) the profile saw at this site: called directly, not through
+     the step handler. The engine's call helper checks the callee against the one it
+     bound, so a replaced builtin takes the wrapper below; the call runs arbitrary C
+     (a callback, a getter), so it is a safepoint like any other call. */
+  if (!g_e_quiet && n > 0 && n <= 3) {
+    int all_c = 1;
+    for (k = 0; k < n; k++)
+      if (kind[k] != 2) all_c = 0;
+    if (all_c) {
+      int site = g_e_ccall_next++;
+      fprintf(
+          f,
+          "    { JSValue _o;\n"
+          "      int _rc = qjs_aot_call_c(ctx, %d, -1, %d, %s, %s, &AOT_REG(fr, %d), &_o);\n"
+          "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n"
+          "      if (_rc > 0) {\n"
+          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+          "        else AOT_SET_B(ctx, fr, %d, _o);\n",
+          site, na, cexp, recv, w, off, off);
+      e_emit_group_recheck(f, fn, in, cur);
+      if (t->lb[dv] == E_LB_TAG) {
+        fprintf(f, "        v%u = _o;\n", (unsigned)dv);
+      } else if (e_def_dead(in, dv)) {
+        /* nothing reads the result */
+      } else if (t->lb[dv] == E_LB_I32) {
+        e_sweep_guard(f, "dx", in->next);
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) "
+            "goto dx_%d;\n"
+            "        i%u = JS_VALUE_GET_INT(_o);\n",
+            in->next, (unsigned)dv);
+      } else if (t->lb[dv] == E_LB_BOOL) {
+        e_sweep_guard(f, "dx", in->next);
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) "
+            "goto dx_%d;\n"
+            "        b%u = JS_VALUE_GET_BOOL(_o);\n",
+            in->next, (unsigned)dv);
+      } else {
+        e_sweep_guard(f, "dx", in->next);
+        fprintf(
+            f,
+            "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = "
+            "(double)JS_VALUE_GET_INT(_o);\n"
+            "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = "
+            "JS_VALUE_GET_FLOAT64(_o);\n"
+            "        else goto dx_%d;\n",
+            (unsigned)dv, (unsigned)dv, in->next);
+      }
+      fprintf(f, "        goto cd_%d;\n      }\n    }\n", in->pc);
+    }
+  }
   /* No candidate matched (or none was offered): the call has NOT run, so the
      engine's own call handler does it, through the op-call wrapper. The live
      values and the window are already in the frame. Any callee takes this path,
@@ -6716,9 +6799,23 @@ static int emit_typed_field_read(
       (unsigned)rv, site);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
   /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
-     inlined duplicate (the reviewer's ruling). */
+     inlined duplicate (the reviewer's ruling). A string receiver's method comes
+     from String.prototype, which the PIC does not cache: a per-site cell keeps its
+     shape and the property's offset, and the value is read from the slot. */
   fprintf(f, "      } else {\n");
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  if (!g_e_fl && !g_e_quiet && in->arg[2].kind == 'a' && in->arg[2].off >= 0) {
+    fprintf(
+        f,
+        "        static Q2StrCell sc_%d;\n"
+        "        if (q2_strproto_hit(ctx, v%u, &sc_%d, qjs_aot_ld_u32(q2_code(f) + %d), &_f)) {\n",
+        in->pc, (unsigned)rv, in->pc, in->arg[2].off);
+    if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
+    fprintf(f, "        } else {\n");
+    if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+    fprintf(f, "        }\n");
+  } else if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    return 0;
+  }
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
