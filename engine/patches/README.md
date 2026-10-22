@@ -425,3 +425,4 @@ bump while `9999` is missing.
 | `0337` | Calls the built-in push on a dense array without the native frame | `c.push(x)` paid a native frame, stack check and argument padding per call | `qjs_aot_call_c` special case | No. |
 | `0338` | Stores to a cached global without the two lookups and gives compiled stores their function's strictness | A frameless strict store to an undeclared name created a global; global stores were 6 percent of script-style programs | `qjs_aot_put_global(ctx, b, ...)`, `JS_SetGlobalVarS` | No. |
 | `0339` | Runs a compiled function that needs a record frame on a record | Calls to compiled functions that read arguments, super or the new target paid a full activation each | `aot_call_record`, `REGVM_FLAG_AOT_REC` | No. |
+| `0340` | Runs a derived or base class constructor call on the record path too | `new D()` for a derived class took the full activation | `aot_call_record` takes new_target and flags | No. |

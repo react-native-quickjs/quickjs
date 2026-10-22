@@ -26372,7 +26372,7 @@ static void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
         return;
     b = rec->b;
     sf->is_strict_mode = b->is_strict_mode;
-    sf->is_constructor = false;
+    sf->is_constructor = (rec->flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->var_buf = rec->var_buf;
     sf->arg_buf = rec->arg_buf;
     sf->arg_count = rec->arg_owned
@@ -37971,7 +37971,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
 
 #if QJS_AOT && QJS_REGVM && QJS_DRC
 static int aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
-                           JSValueConst this_obj, int argc, JSValueConst *argv, JSValue *out);
+                           JSValueConst this_obj, JSValueConst new_target, int flags, int argc,
+                           JSValueConst *argv, JSValue *out);
 #endif
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -38119,14 +38120,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        own record frame, here on the C stack, runs the compiled body without the
        activation JS_CallInternal and js_regvm_execute would build. */
     if (b->aot_fn != NULL && b->aot_nfn == NULL && b->aot_call_ready &&
-        (flags & ~JS_CALL_FLAG_COPY_ARGV) == 0 && b->func_kind == JS_FUNC_NORMAL && !b->is_lazy &&
-        b->regvm_ctl_count == 0 && JS_IsUndefined(new_target)) {
+        (flags & ~(JS_CALL_FLAG_COPY_ARGV | JS_CALL_FLAG_CONSTRUCTOR)) == 0 &&
+        b->func_kind == JS_FUNC_NORMAL && !b->is_lazy && b->regvm_ctl_count == 0 &&
+        ((flags & JS_CALL_FLAG_CONSTRUCTOR) != 0) != JS_IsUndefined(new_target)) {
         JSAotRun *ar = rt->aot_run;
 
         if (likely(ar == NULL || ar->disabled == NULL ||
                    !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1))) {
             JSValue out;
-            int r = aot_call_record(caller_ctx, p, b, this_obj, argc, argv, &out);
+            int r = aot_call_record(caller_ctx, p, b, this_obj, new_target, flags, argc, argv, &out);
 
             if (r != 0)
                 return r < 0 ? JS_EXCEPTION : out;
@@ -63639,7 +63641,8 @@ aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
    there is no arena room (the caller takes the full activation). */
 static __attribute__((noinline)) int
 aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
-                JSValueConst this_obj, int argc, JSValueConst *argv, JSValue *out)
+                JSValueConst this_obj, JSValueConst new_target, int flags, int argc,
+                JSValueConst *argv, JSValue *out)
 {
     JSRuntime *rt = caller_ctx->rt;
     JSRegRecordLayout lay;
@@ -63669,7 +63672,8 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
     sf = lay.sf;
     rec->caller_ctx = caller_ctx;
     rec->ctx = cb->realm;
-    rec->flags |= REGVM_FLAG_AOT_REC;
+    rec->flags |= REGVM_FLAG_AOT_REC | (flags & JS_CALL_FLAG_CONSTRUCTOR);
+    rec->new_target = new_target;
     rec->aot_anchor = (uintptr_t)__builtin_frame_address(0);
     rec->deopt_pc = QJS_AOT_NO_DEOPT;
     rec->resume_marker = NULL;
