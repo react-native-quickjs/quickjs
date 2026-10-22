@@ -212,6 +212,17 @@ def cmd_run(args):
                 ref = outp
             elif outp != ref:
                 r["status"] = "WRONG:" + mode
+        # The exit sites the compiled run took: a site that fires thousands of times is a
+        # speculation the data does not match, which shows up as a slow program, not a wrong one.
+        if r.get("status", "ok") == "ok":
+            rc, so, se = sh([run, path], {"QJS_AOT_UNIT_STATS": "1"})
+            sites = []
+            for ln in se.splitlines():
+                if ln.startswith("unit-exit-site"):
+                    kv = dict(p.split("=", 1) for p in ln.split()[1:])
+                    if int(kv["count"]) >= 100:
+                        sites.append([kv["fn"], kv["kind"], int(kv["pc"]), int(kv["count"])])
+            r["exit_sites"] = sites
         r.setdefault("status", "ok")
         return r
 
@@ -263,6 +274,16 @@ def summarise(rows, out):
         lines.append("  %-44s %6.2fx  interp %7.1f ms  on %7.1f  off %7.1f  miss %7.1f  bytes/fn %6.0f" % (
             r["name"], x, r["interp"], r["spec_on"], r["spec_off"], r["force_miss"],
             r["bytes"] / r["funcs"] if r["funcs"] else 0))
+    hot = []
+    for r in ok:
+        for fn, kind, pc, cnt in r.get("exit_sites", []):
+            if cnt >= 1000:
+                hot.append((cnt, r["name"], fn[:8], kind, pc))
+    hot.sort(reverse=True)
+    lines.append("")
+    lines.append("exit sites taken 1000 times or more in a run (count, program, function, guard, pc): %d" % len(hot))
+    for cnt, n, fn, kind, pc in hot[:60]:
+        lines.append("  %9d  %-40s %s %s@%d" % (cnt, n, fn, kind, pc))
     text = "\n".join(lines) + "\n"
     os.makedirs(out, exist_ok=True)
     open(os.path.join(out, "report.txt"), "w").write(text)

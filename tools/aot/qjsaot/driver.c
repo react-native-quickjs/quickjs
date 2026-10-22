@@ -2090,6 +2090,9 @@ int qjsaot_driver_main(int argc, char **argv) {
            (in reg.c) rather than being `static` -- otherwise each part gets its
            own copy and its own counters. */
 
+        /* One node per exit stub, linked the first time the stub is taken, with the
+           number of times it was: the unit's statistics list the stubs that fire. */
+        "typedef struct E_XNode { const char *hex, *kind; int pc; uint32_t cnt; struct E_XNode *next; } E_XNode;\n"
         "#ifdef QJS_AOT_SPLIT_UNIT\n"
         "extern uint64_t e_ent[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
@@ -2100,7 +2103,9 @@ int qjsaot_driver_main(int argc, char **argv) {
         "extern uint64_t e_inl[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_inx[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
+        "extern E_XNode *e_xhead;\n"
         "#else\n"
+        "static E_XNode *e_xhead;\n"
         "static uint64_t e_ent[QJS_AOT_NFUNCS];\n"
         "static uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_off[QJS_AOT_NFUNCS];\n"
@@ -2152,6 +2157,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "            (unsigned long long)e_han[i], (unsigned long long)e_ref[i],\n"
         "            (unsigned)e_off[i], i, e_nfl[i] ? (unsigned long long)e_ent[i] : 0ull,\n            (unsigned long long)e_inl[i]);\n"
         "  }\n"
+        "  { const E_XNode *n_; for (n_ = e_xhead; n_ != NULL; n_ = n_->next)\n"
+        "      fprintf(stderr, \"unit-exit-site fn=%%s kind=%%s pc=%%d count=%%u\\n\", n_->hex, n_->kind, n_->pc, n_->cnt); }\n"
         "}\n"
         "#endif\n"
         "#endif\n"
@@ -2221,8 +2228,11 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  fprintf(stderr, \"unit-exit fn=%%s kind=%%s pc=%%d tag=%%d\\n\", hex, kind,\n"
         "          pc, tag);\n"
         "}\n"
-        "#define E_EXIT_LOG(hex, kind, pc, tag) do { static int e_xl_; \\\n"
-        "    if (__builtin_expect(e_exit_log_v != 0, 0) && !e_xl_) \\\n"
+        "static inline void e_xnode_reg(E_XNode *n) { n->next = e_xhead; e_xhead = n; }\n"
+        "#define E_EXIT_LOG(hex, kind, pc, tag) do { static E_XNode e_xn_ = {(hex), (kind), (pc), 0, NULL}; \\\n"
+        "    int e_xl_ = 0; \\\n"
+        "    if (__builtin_expect(++e_xn_.cnt == 1, 0)) e_xnode_reg(&e_xn_); \\\n"
+        "    if (__builtin_expect(e_exit_log_v != 0, 0) && (e_exit_log_v == 2 || e_xn_.cnt == 1)) \\\n"
         "      e_exit_log((hex), (kind), (pc), (int)(tag), &e_xl_); } while (0)\n"
         "#define E_EXIT_NOTE(fi) do { if (++e_exi[fi] > 256 && \\\n"
         "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
@@ -3814,6 +3824,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "uint32_t e_han[QJS_AOT_NFUNCS];\n"
           "uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
           "uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
+          "E_XNode *e_xhead;\n"
           "uint64_t e_inl[QJS_AOT_NFUNCS];\n"
           "uint32_t e_inx[QJS_AOT_NFUNCS];\n"
           "uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
@@ -3854,6 +3865,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "            (unsigned long long)e_han[i], (unsigned long long)e_ref[i],\n"
           "            (unsigned)e_off[i], i, e_nfl[i] ? (unsigned long long)e_ent[i] : 0ull,\n            (unsigned long long)e_inl[i]);\n"
           "  }\n"
+          "  { const E_XNode *n_; for (n_ = e_xhead; n_ != NULL; n_ = n_->next)\n"
+        "      fprintf(stderr, \"unit-exit-site fn=%%s kind=%%s pc=%%d count=%%u\\n\", n_->hex, n_->kind, n_->pc, n_->cnt); }\n"
           "}\n"
           );
     }
