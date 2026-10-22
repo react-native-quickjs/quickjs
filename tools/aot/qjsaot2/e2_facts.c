@@ -699,6 +699,15 @@ static int is_safepoint(const Q2Func *fn, E2Facts *f, const Q2Insn *in, int grou
 static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
                     int grouped_exit) {
   const Q2Insn *in = &fn->insns[insn];
+  /* The fused local read-modify-write ops update a local slot in memory. */
+  if ((in->rop == ROP_local_rmw_branch || in->rop == ROP_local_rmw_imm) && in->narg > 1) {
+    Access lk;
+    memset(&lk, 0, sizeof(lk));
+    lk.kind = E2_K_LOCAL;
+    lk.key.kind = E2_K_LOCAL;
+    lk.key.a = (int64_t)in->arg[1].val;
+    apply_store_kills(s, &lk);
+  }
   Access ld, st;
   int kind = insn_kind(in);
   int have_ld = insn_load(in, &ld);

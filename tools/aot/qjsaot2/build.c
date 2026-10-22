@@ -653,8 +653,34 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_CONTROL;
       return &info;
+    /* The compare-and-branch forms that read a local slot: a branch that defines
+       nothing and writes no register (the slot is memory), so the step wrapper and
+       the typed forms can take it with the registers left as they are. */
+    case ROP_branch_cmp_loc_loc: /* "buut": sub, slot, slot, target */
+      info.op = Q2_OP_BRANCH;
+      info.reads = Q2_E_SLOT;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_branch_cmp_loc_reg: /* "burt": sub, slot, register, target */
+      info.op = Q2_OP_BRANCH;
+      info.nuse = 1;
+      info.use[0] = 2;
+      info.reads = Q2_E_SLOT;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_branch_cmp_reg_loc: /* "brut": sub, register, slot, target */
+      info.op = Q2_OP_BRANCH;
+      info.nuse = 1;
+      info.use[0] = 1;
+      info.reads = Q2_E_SLOT;
+      info.writes = Q2_E_CONTROL;
+      return &info;
+    case ROP_local_rmw_branch: /* "buIt": sub, slot, imm, target: updates the slot */
+      info.op = Q2_OP_BRANCH;
+      info.reads = Q2_E_SLOT;
+      info.writes = Q2_E_SLOT | Q2_E_CONTROL;
+      return &info;
     case ROP_local_rmw_imm: /* "buI": bool, slot, imm: no register operand */
-    case ROP_local_rmw_branch:
       info.op = Q2_OP_FALLBACK;
       info.ndef = 0;
       info.nuse = 0;

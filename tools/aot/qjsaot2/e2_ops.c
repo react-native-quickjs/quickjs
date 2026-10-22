@@ -3842,6 +3842,139 @@ static int emit_term_wrapper(
   return 1;
 }
 
+/* ---- fused compare-and-branch on a local slot, and the local read-modify-write
+   branch (card E11) -------------------------------------------------------------
+   `branch_cmp_loc_reg` / `reg_loc` / `loc_loc` compare a variable slot (frame memory)
+   with a register or another slot; `local_rmw_branch` updates a slot in place and
+   branches (a loop's `i++`/`i--` and back edge). The int and double cases are inline;
+   anything else runs the instruction through the step and takes the edge it chose. */
+static void e2_loc_operand(
+    char *out, size_t n, const Q2Func *fn, const E2Types *t, const Q2Insn *in,
+    int arg_idx, int use_idx) {
+  if (in->arg[arg_idx].kind == 'u') {
+    snprintf(out, n, "q2_var_buf(f)[%d]", (int)in->arg[arg_idx].val);
+  } else {
+    Q2ValueId v = in->use[use_idx];
+    if (v < (Q2ValueId)t->nvalues && t->lb[v] == E2_LB_I32)
+      snprintf(out, n, "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)v);
+    else if (v < (Q2ValueId)t->nvalues && t->lb[v] == E2_LB_F64)
+      snprintf(out, n, "E2_BOX_F64(d%u)", (unsigned)v);
+    else if (v < (Q2ValueId)t->nvalues && t->lb[v] == E2_LB_BOOL)
+      snprintf(out, n, "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)v);
+    else
+      snprintf(out, n, "v%u", (unsigned)v);
+  }
+  (void)fn;
+}
+
+static int emit_typed_branch_loc(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33], int fi) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  int sub, inv, base, ai, bi, ua = 0;
+  char ea[96], eb[96];
+  const char *cop;
+
+  if (in->rop != ROP_branch_cmp_loc_reg && in->rop != ROP_branch_cmp_reg_loc &&
+      in->rop != ROP_branch_cmp_loc_loc)
+    return 0;
+  if (!have_types || t == NULL || g_e2_fl) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH || in->narg < 4) return 0;
+  if (in->arg[0].kind != 'b' || blk->nsucc < 2 || in->ndef != 0 || in->nredef != 0) return 0;
+  if (blk->succ_block[0] < 0 || blk->succ_block[0] >= fn->nblocks ||
+      blk->succ_block[1] < 0 || blk->succ_block[1] >= fn->nblocks)
+    return 0;
+  sub = (int)in->arg[0].val;
+  inv = (sub & REG_CMP_INVERT) != 0;
+  base = sub & ~REG_CMP_INVERT;
+  if (!(base >= REG_BIN_LT && base <= REG_BIN_GTE) && base != REG_BIN_EQ &&
+      base != REG_BIN_NEQ && base != REG_BIN_STRICT_EQ && base != REG_BIN_STRICT_NEQ)
+    return 0;
+  ai = 1;
+  bi = 2;
+  if (in->rop == ROP_branch_cmp_loc_reg || in->rop == ROP_branch_cmp_reg_loc) {
+    if (in->nuse < 1) return 0;
+  }
+  e2_loc_operand(ea, sizeof(ea), fn, t, in, ai, 0);
+  e2_loc_operand(eb, sizeof(eb), fn, t, in, bi, 0);
+  (void)ua;
+  cop = base == REG_BIN_LT    ? "<"
+        : base == REG_BIN_LTE ? "<="
+        : base == REG_BIN_GT  ? ">"
+        : base == REG_BIN_GTE ? ">="
+        : (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ) ? "!="
+                                                               : "==";
+  fprintf(f, "    { int c_; JSValue _a = %s, _b = %s;\n", ea, eb);
+  fprintf(
+      f,
+      "    if (__builtin_expect(JS_VALUE_IS_BOTH_INT(_a, _b), 1))\n"
+      "        c_ = (JS_VALUE_GET_INT(_a) %s JS_VALUE_GET_INT(_b)) ^ %d;\n"
+      "    else if ((JS_VALUE_GET_TAG(_a) == JS_TAG_INT || JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64) &&\n"
+      "             (JS_VALUE_GET_TAG(_b) == JS_TAG_INT || JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64))\n"
+      "        c_ = ((JS_VALUE_GET_TAG(_a) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(_a) : JS_VALUE_GET_FLOAT64(_a)) %s\n"
+      "              (JS_VALUE_GET_TAG(_b) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(_b) : JS_VALUE_GET_FLOAT64(_b))) ^ %d;\n"
+      "    else {\n",
+      cop, inv, cop, inv);
+  e2_emit_term_step(f, fn, in, t, blk, cur, hex, fi, 0);
+  fprintf(f, "    }\n    if (c_) {\n");
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+  fprintf(f, "    }\n    }\n");
+  g_e2_opcalls += 0;
+  return 1;
+}
+
+static int emit_typed_local_rmw_branch(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, int b,
+    Q2ValueId *cur, int have_types, char hex[33], int fi) {
+  const E2Role *role = e2_roles[in->rop];
+  const Q2Block *blk = &fn->blocks[b];
+  int sub, slot, imm;
+  const char *expr;
+
+  if (in->rop != ROP_local_rmw_branch || !have_types || t == NULL || g_e2_fl) return 0;
+  if (role == NULL || role->control != E2_CF_BRANCH || in->narg < 4) return 0;
+  if (in->arg[0].kind != 'b' || in->arg[1].kind != 'u' || blk->nsucc < 2) return 0;
+  if (in->ndef != 0 || in->nredef != 0) return 0;
+  if (blk->succ_block[0] < 0 || blk->succ_block[0] >= fn->nblocks ||
+      blk->succ_block[1] < 0 || blk->succ_block[1] >= fn->nblocks)
+    return 0;
+  sub = (int)in->arg[0].val;
+  slot = (int)in->arg[1].val;
+  imm = (int)in->arg[2].val;
+  if (sub & REG_RMW_UNARY) {
+    int u = sub & ~REG_RMW_UNARY;
+    if (u == REG_UN_INC) expr = "__builtin_add_overflow(_iv, 1, &_nv)";
+    else if (u == REG_UN_DEC) expr = "__builtin_sub_overflow(_iv, 1, &_nv)";
+    else return 0;
+  } else if (sub == REG_BIN_ADD) {
+    expr = "__builtin_add_overflow(_iv, _imm, &_nv)";
+  } else if (sub == REG_BIN_SUB) {
+    expr = "__builtin_sub_overflow(_iv, _imm, &_nv)";
+  } else {
+    return 0;
+  }
+  fprintf(
+      f,
+      "    { int c_; int32_t _imm = %d, _iv, _nv; JSValue *_vb = q2_var_buf(f);\n"
+      "    (void)_imm;\n"
+      "    if (__builtin_expect(JS_VALUE_GET_TAG(_vb[%d]) == JS_TAG_INT, 1) &&\n"
+      "        (_iv = JS_VALUE_GET_INT(_vb[%d]), !%s)) {\n"
+      "        _vb[%d] = JS_MKVAL(JS_TAG_INT, _nv);\n"
+      "        c_ = 1;\n"
+      "    } else {\n",
+      imm, slot, slot, expr, slot);
+  e2_emit_term_step(f, fn, in, t, blk, cur, hex, fi, 0);
+  fprintf(f, "    }\n    if (c_) {\n");
+  e2_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+  fprintf(f, "    } else {\n");
+  e2_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+  fprintf(f, "    }\n    }\n");
+  return 1;
+}
+
 /* `div` / `mod` ("rrr": dest, a, b) as typed arithmetic. The f64 form needs no
    exit: a double division cannot trap, and `1/0` is Infinity exactly as JS says.
    `mod` on doubles is `fmod`, which IS JavaScript's `%` for doubles (the sign
@@ -7960,6 +8093,10 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
             emit_typed_inc_branch(
                 f, fn, in, &types, b, cur, have_types, hex, fi) ||
             emit_typed_branch(
+                f, fn, in, &types, b, cur, have_types, hex, fi) ||
+            emit_typed_branch_loc(
+                f, fn, in, &types, b, cur, have_types, hex, fi) ||
+            emit_typed_local_rmw_branch(
                 f, fn, in, &types, b, cur, have_types, hex, fi) ||
             emit_tag_branch_truthy(
                 f, fn, in, &types, b, cur, have_types, hex) ||
