@@ -5224,6 +5224,20 @@ static int emit_fl_put_global(
       "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s, %d) < 0, 0)) return JS_EXCEPTION;\n",
       in->next - 1, in->arg[0].off, vb, (int)in->arg[2].val);
   g_e_inl_dirty = 1;
+  /* The decoder files the store as a fallback that redefines the live registers: they
+     keep their value, now under their new names. */
+  for (k = 0; k < in->nredef; k++) {
+    Q2ValueId rv = in->redef_val[k], src;
+    int rr = in->redef_reg[k];
+    char nm[32];
+    if (rv == Q2_NO_VALUE || rv >= (Q2ValueId)t->nvalues || rr < 0 || rr >= fn->nregs) continue;
+    src = cur[rr];
+    if (src == Q2_NO_VALUE || src == E_UNDEF || src == E_INFRAME || src >= (Q2ValueId)t->nvalues)
+      continue;
+    e_local_name(nm, sizeof(nm), rv);
+    fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
+    cur[rr] = rv;
+  }
   e_emit_group_recheck(f, fn, in, cur);
   return 1;
 }
