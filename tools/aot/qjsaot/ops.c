@@ -6418,6 +6418,75 @@ static int emit_typed_strict_eq(
   return 1;
 }
 
+/* A comparison as a VALUE (`lt`, `lte`, `gt`, `gte`, `eq`, `neq`, `strict_eq`, `strict_neq`)
+   of two tagged operands: two numbers compare inline, two flat strings by their
+   characters; anything else is the engine's (it can run a valueOf). */
+static int emit_tag_cmp_value(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  Q2ValueId dv, av, bv;
+  int dreg, rel, k;
+  const char *cop;
+  static const struct { int rop; const char *op; int rel; } tab[] = {
+      {ROP_lt, "<", 1}, {ROP_lte, "<=", 1}, {ROP_gt, ">", 1}, {ROP_gte, ">=", 1},
+      {ROP_eq, "==", 0}, {ROP_neq, "!=", 0}, {ROP_strict_eq, "==", 0},
+      {ROP_strict_neq, "!=", 0}};
+
+  if (!have_types || t == NULL || g_e_fl || cur == NULL) return 0;
+  cop = NULL;
+  rel = 0;
+  for (k = 0; k < (int)(sizeof(tab) / sizeof(tab[0])); k++)
+    if (tab[k].rop == in->rop) { cop = tab[k].op; rel = tab[k].rel; }
+  if (cop == NULL || in->ndef < 1 || in->nuse < 2) return 0;
+  if (e_must_exit(fn, in)) return 0;
+  dv = in->def[0];
+  av = in->use[0];
+  bv = in->use[1];
+  if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
+      bv >= (Q2ValueId)t->nvalues)
+    return 0;
+  if (t->lb[av] != E_LB_TAG || t->lb[bv] != E_LB_TAG) return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOOL) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  fprintf(f, "    { int c_;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(JS_VALUE_IS_BOTH_INT(v%u, v%u), 1))\n"
+      "        c_ = JS_VALUE_GET_INT(v%u) %s JS_VALUE_GET_INT(v%u);\n"
+      "      else if ((JS_VALUE_GET_TAG(v%u) == JS_TAG_INT || JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64) &&\n"
+      "               (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT || JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64))\n"
+      "        c_ = (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(v%u) : JS_VALUE_GET_FLOAT64(v%u)) %s\n"
+      "             (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(v%u) : JS_VALUE_GET_FLOAT64(v%u));\n",
+      (unsigned)av, (unsigned)bv, (unsigned)av, cop, (unsigned)bv, (unsigned)av, (unsigned)av,
+      (unsigned)bv, (unsigned)bv, (unsigned)av, (unsigned)av, (unsigned)av, cop, (unsigned)bv,
+      (unsigned)bv, (unsigned)bv);
+  if (rel)
+    fprintf(
+        f,
+        "      else if (q2_str_cmp(v%u, v%u, &c_))\n        c_ = c_ %s 0;\n",
+        (unsigned)av, (unsigned)bv, cop);
+  else
+    fprintf(
+        f,
+        "      else if (q2_str_eq(v%u, v%u, &c_))\n        c_ = %sc_;\n",
+        (unsigned)av, (unsigned)bv, strcmp(cop, "!=") == 0 ? "!" : "");
+  fprintf(f, "      else c_ = -1;\n");
+  fprintf(f, "      if (__builtin_expect(c_ >= 0, 1)) {\n");
+  if (t->lb[dv] == E_LB_TAG)
+    fprintf(f, "        v%u = JS_MKVAL(JS_TAG_BOOL, c_);\n", (unsigned)dv);
+  else
+    fprintf(f, "        b%u = c_;\n", (unsigned)dv);
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    fprintf(stderr, "qjsaot: compare at pc %d: the wrapper declined after output\n", in->pc);
+    abort();
+  }
+  fprintf(f, "      }\n    }\n");
+  cur[dreg] = dv;
+  return 1;
+}
+
 /* A speculative-body `this` FIELD READ: `get_this_field` / `get_this_field2`
    ("rras", but BOTH register operands are destinations -- def[0] is the read and
    def[1] the receiver -- so there is no use to take a receiver from). `this` comes
@@ -8804,7 +8873,15 @@ static int e_dispatch_rop(
       return emit_typed_load_this(f, fn, in, t, cur, have_types);
     case ROP_strict_eq:
     case ROP_strict_neq:
-      return emit_typed_strict_eq(f, fn, in, t, cur, have_types, hex, fi, b);
+      return emit_typed_strict_eq(f, fn, in, t, cur, have_types, hex, fi, b) ||
+             emit_tag_cmp_value(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_lt:
+    case ROP_lte:
+    case ROP_gt:
+    case ROP_gte:
+    case ROP_eq:
+    case ROP_neq:
+      return emit_tag_cmp_value(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- globals and closure cells -- */
     case ROP_get_global:
