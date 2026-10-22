@@ -5585,6 +5585,10 @@ static int emit_fl_alloc_op(
   return 1;
 }
 
+/* The code offset of the atom operand of the `load_const` a `get_element` has absorbed
+   (see e_try_fuse_atom_get), or -1. */
+static int g_e_fuse_atom_off = -1;
+
 static int emit_alloc_op(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -5655,6 +5659,24 @@ static int emit_alloc_op(
     case ROP_array_const:
       if (in->narg < 2) return 0;
       snprintf(call, sizeof(call), "qjs_aot_array_const(ctx, f, %d, &_o)", (int)in->arg[1].val);
+      break;
+    case ROP_get_super:
+      /* "rr": destination, object: the object's prototype. */
+      if (in->narg < 2 || in->arg[1].kind != 'r' || E_ROFF(in->arg[1]) / 16 >= fn->nregs)
+        return 0;
+      src_off = E_ROFF(in->arg[1]);
+      snprintf(call, sizeof(call), "qjs_aot_get_proto(ctx, AOT_REG(fr, %d), &_o)", src_off);
+      break;
+    case ROP_get_element:
+      /* Only the fused form (a constant string key, see e_try_fuse_atom_get): the read by
+         atom with the object as the receiver. */
+      if (g_e_fuse_atom_off < 0 || in->narg < 3 || in->arg[1].kind != 'r' ||
+          E_ROFF(in->arg[1]) / 16 >= fn->nregs)
+        return 0;
+      src_off = E_ROFF(in->arg[1]);
+      snprintf(call, sizeof(call),
+               "qjs_aot_get_prop_atom(ctx, AOT_REG(fr, %d), qjs_aot_ld_u32(q2_code(f) + %d), &_o)",
+               src_off, g_e_fuse_atom_off);
       break;
     case ROP_unary:
       /* "rbr": destination, sub-op, source. The engine's general unary op; the typed
@@ -8732,6 +8754,52 @@ static int emit_typed_return(
    report prints it; it should stay 0 for structured bytecode. */
 int e_irreducible = 0;
 
+/* `load_const` of an atom followed by the `get_element` that reads with it and nothing
+   else: `super.m`, `obj['name']`. The string is never built and the property is found by
+   the atom, with the object as the receiver, as the element read does. The key's register
+   must be dead after the read. Returns 1 when both instructions were emitted. */
+static uint8_t *g_e_pre_done;
+static int e_try_fuse_atom_get(
+    FILE *f, const Q2Func *fn, int i2, int b, int blk_end, const ETypes *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi) {
+  const Q2Insn *l = &fn->insns[i2], *e;
+  int ok, ei, same;
+
+  if (!have_types || t == NULL || g_e_fl || cur == NULL || g_e_pre_done == NULL) return 0;
+  if (l->rop != ROP_load_const || l->narg < 3 || l->arg[1].val == 0 || l->arg[2].off < 0 ||
+      l->ndef < 1)
+    return 0;
+  if (i2 + 1 < blk_end) {
+    ei = i2 + 1;
+    same = 1;
+  } else {
+    /* The block ends after the load and falls through to a block of its own that starts
+       with the read (the IR cuts blocks after instructions it does not lower). */
+    const Q2Block *blk = &fn->blocks[b], *nb;
+
+    if (blk->nsucc != 1 || blk->succ_block[0] < 0 || blk->succ_block[0] >= fn->nblocks ||
+        blk->nedge_args[0] != 0)
+      return 0;
+    nb = &fn->blocks[blk->succ_block[0]];
+    if (nb->npreds != 1 || nb->nparams != 0 || nb->ninsns < 1) return 0;
+    ei = nb->first_insn;
+    same = 0;
+  }
+  e = &fn->insns[ei];
+  if (e->rop != ROP_get_element || e->nuse < 2 || e->use[1] != l->def[0] || e->ndef < 1)
+    return 0;
+  if (e_def_dead(e, l->def[0]) == 0) return 0;
+  if (g_e_facts != NULL && (g_e_facts->fwd[i2] != Q2_NO_VALUE || g_e_facts->fwd[ei] != Q2_NO_VALUE))
+    return 0;
+  if (e_must_exit(fn, e)) return 0;
+  g_e_fuse_atom_off = l->arg[2].off;
+  ok = emit_alloc_op(f, fn, e, t, cur, have_types, hex, fi, b);
+  g_e_fuse_atom_off = -1;
+  if (!ok) return 0;
+  if (!same) g_e_pre_done[ei] = 1;
+  return same ? 1 : 2;
+}
+
 /* ============================ the rop -> emitter table ====================
    ONE emitter per rop. A long `else if` chain's ORDER was the bug several times
    (add_imm_self_s, the wrapper's tier gate, the fused ops, load_const): with a chain, an op silently stops lowering when an earlier,
@@ -8881,6 +8949,7 @@ static int e_dispatch_rop(
     case ROP_object_fill:
     case ROP_special_object:
     case ROP_apply_arguments:
+    case ROP_get_super:
       return emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- this, and strict equality as a value -- */
@@ -8930,6 +8999,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e_facts = NULL;
   g_e_inl_dirty = 0;
   g_e_dx_own_n = 0;
+  free(g_e_pre_done);
+  g_e_pre_done = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   free(g_e_spill_slot);
   g_e_spill_nv = fn->nvalues > 0 ? fn->nvalues : 1;
   g_e_spill_slot = malloc(sizeof(int) * (size_t)g_e_spill_nv);
@@ -9375,6 +9446,28 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
           term_lowered = 1;
         }
         break;
+      }
+      if (g_e_pre_done != NULL && g_e_pre_done[i2]) {
+        /* emitted at the end of the block before it, with the load it absorbed */
+        e_note_defs(cur, fn, in);
+        lowered_to = i2 + 1;
+        continue;
+      }
+      {
+        int fz = e_try_fuse_atom_get(f, fn, i2, b, blk->first_insn + blk->ninsns, &types, cur,
+                                     have_types, hex, fi);
+        if (fz == 1) {
+          e_note_defs(cur, fn, &fn->insns[i2 + 1]);
+          g_e_n_opcall++;
+          i2++;
+          lowered_to = i2 + 1;
+          continue;
+        }
+        if (fz == 2) {
+          g_e_n_opcall++;
+          lowered_to = i2 + 1;
+          continue;
+        }
       }
       /* A load the facts forward is a copy of the value the location already
          holds: no access, no shape test, no tag guard. The result is current in
