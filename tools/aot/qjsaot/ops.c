@@ -7706,9 +7706,11 @@ static int emit_typed_arith_imm(
       "goto ox_%d;\n",
       in->pc);
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
-  if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+  /* The exit hands over the state BEFORE the instruction: the destination register
+     may be the operand's, and the generic body redoes the operation from it. */
   e_note_stub(
       g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+  if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
   return 1;
 }
 
