@@ -62215,6 +62215,25 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                : 0;
 }
 
+int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
+{
+    JSFunctionBytecode *cb;
+    JSValue obj;
+
+    if (ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
+        return 0;
+    cb = ctor->u.func.function_bytecode;
+    if (cb->is_derived_class_constructor ||
+        !(cb->aot_fn != NULL ? cb->aot_light : cb->regvm_light))
+        return 0;
+    obj = js_create_from_ctor_cap(ctx, JS_MKPTR(JS_TAG_OBJECT, ctor),
+                                  JS_CLASS_OBJECT, cb->inst_inline_cap);
+    if (JS_IsException(obj))
+        return -1;
+    *out = obj;
+    return 1;
+}
+
 __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take)
 {
     int r;

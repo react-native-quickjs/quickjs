@@ -1,0 +1,61 @@
+Subject: Allocate the `this` object of `new C(...)` for compiled callers
+
+What this does
+  Adds `qjs_aot_construct_this(ctx, ctor, &out)`: for a plain, non-derived, light
+  bytecode constructor it allocates the object the interpreter's light construct would
+  (prototype from `C.prototype`, the constructor's inline slot capacity) and returns it
+  owned; for anything else it returns 0 and the caller takes the generic path.
+
+Why we need it
+  A `new C(...)` site in a compiled body went through the engine's construct handler
+  (a step, then the interpreter's call machinery) even when C is a compiled function the
+  site could call directly. With the allocation as a call, the site checks the
+  constructor's identity, allocates, calls the compiled body with the object as `this`,
+  and applies the result rule itself. The helper runs no JavaScript (the prototype of a
+  bytecode function is a plain data property).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62215,6 +62215,25 @@
+                : 0;
+ }
+ 
++int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
++{
++    JSFunctionBytecode *cb;
++    JSValue obj;
++
++    if (ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
++        return 0;
++    cb = ctor->u.func.function_bytecode;
++    if (cb->is_derived_class_constructor ||
++        !(cb->aot_fn != NULL ? cb->aot_light : cb->regvm_light))
++        return 0;
++    obj = js_create_from_ctor_cap(ctx, JS_MKPTR(JS_TAG_OBJECT, ctor),
++                                  JS_CLASS_OBJECT, cb->inst_inline_cap);
++    if (JS_IsException(obj))
++        return -1;
++    *out = obj;
++    return 1;
++}
++
+ __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take)
+ {
+     int r;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -333,6 +333,14 @@
+                                         JSValue recv, int atom, int site,
+                                         JSValue v);
+ 
++/* The `this` object of `new C(...)` for a plain constructor: allocated the way the
++   interpreter's light construct does (the prototype from `C.prototype`, the profiled
++   inline slot capacity), so the caller can run the constructor's compiled body with it
++   and apply the result rule. 1 with an owned object in *out; 0 when C is not a plain
++   non-derived light bytecode constructor (the caller takes the generic path); -1 on an
++   exception. Runs no JavaScript. */
++int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
++
+ /* Mirror the int/float fast path of REGVM_CMP_BRANCH. Return 1 when the
+    comparison is decided (*take), 0 when it needs the generic slow path. */
+ int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take);
