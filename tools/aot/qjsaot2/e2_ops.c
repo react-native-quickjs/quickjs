@@ -2213,10 +2213,12 @@ static void e2_fl_block(const char *what, const Q2Insn *in) {
    every time and the 257-exit rule would switch it off. Such a read keeps the
    function framed, where the miss continues. */
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
+int qjs_aot_prof_site_read_hits(const uint8_t dg[16], int site);
 static int e2_fl_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
   if (!g_e2_fl) return 1;
   if (qjs_aot_prof_site_own(fn->g->digest, site)) return 1;
-  e2_fl_block("a read that is not an own hit", in);
+  if (qjs_aot_prof_site_read_hits(fn->g->digest, site)) return 1;
+  e2_fl_block("a read that is not an own or prototype hit", in);
   return 0;
 }
 

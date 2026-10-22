@@ -3385,6 +3385,22 @@ int qjs_aot_prof_site_own(const uint8_t dg[16], int site) {
   return 0;
 }
 
+/* Whether every fill of a read site installed an own slot or a prototype slot, the
+   two kinds the inline read hit (q2_own_read_hit) serves: a prototype method read
+   hits through the cell's holder and shape check. */
+int qjs_aot_prof_site_read_hits(const uint8_t dg[16], int site) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i;
+  if (!e || !g_prof_sitekinds) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    unsigned k;
+    if (e->sites[i].site != site) continue;
+    k = e->sites[i].kinds;
+    return k != 0 && (k & ~((1u << 1) | (1u << 2))) == 0;
+  }
+  return 0;
+}
+
 /* Whether the profiler never executed the instruction at `pc` (a `U` record).
    Such a block is emitted as an exit in a specialised body. */
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc) {
