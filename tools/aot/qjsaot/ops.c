@@ -5215,9 +5215,11 @@ static int emit_typed_construct(
         "                if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n"
         "                _r = _t;\n"
         "            }\n"
+        "            if (JS_VALUE_GET_PTR(_r) == JS_VALUE_GET_PTR(_t))\n"
+        "                qjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(%s), _r);\n"
         "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
         cexp, callee[k], ntexp, ntexp, cexp, cexp, in->next - 1, callee[k], cexp, w, na,
-        getenv("QJS_AOT_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", off);
+        getenv("QJS_AOT_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", cexp, off);
     e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
     fprintf(f, "            goto cd_%d;\n        }\n    }\n#endif\n", in->pc);
@@ -6647,6 +6649,11 @@ static int emit_typed_field_write(
       if (g_e_fl) return 0;
     }
   fprintf(f, "    {\n");
+  /* A typed value is boxed once for the hit test, the replay and the engine's store. */
+  if (boxed[0] != 'v') {
+    fprintf(f, "      JSValue _bx = %s;\n", boxed);
+    snprintf(boxed, sizeof(boxed), "_bx");
+  }
   fprintf(
       f,
       "      if (__builtin_expect(!Q2_FORCE_MISS && q2_put_field_hit(ctx, pic, "
