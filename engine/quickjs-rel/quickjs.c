@@ -60919,6 +60919,8 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->class_c_function = JS_CLASS_C_FUNCTION;
     out->off_cfunc_c_function = (uint32_t)offsetof(JSObject, u.cfunc.c_function);
     out->off_cfunc_magic = (uint32_t)offsetof(JSObject, u.cfunc.magic);
+    out->off_rope_left = (uint32_t)offsetof(JSStringRope, left);
+    out->off_rope_right = (uint32_t)offsetof(JSStringRope, right);
     out->off_regpic_misses = (uint32_t)offsetof(JSRegPIC, misses);
     out->reg_pic_add_w = REG_PIC_ADD_W;
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);

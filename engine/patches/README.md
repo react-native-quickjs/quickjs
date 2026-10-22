@@ -427,3 +427,4 @@ bump while `9999` is missing.
 | `0339` | Runs a compiled function that needs a record frame on a record | Calls to compiled functions that read arguments, super or the new target paid a full activation each | `aot_call_record`, `REGVM_FLAG_AOT_REC` | No. |
 | `0340` | Runs a derived or base class constructor call on the record path too | `new D()` for a derived class took the full activation | `aot_call_record` takes new_target and flags | No. |
 | `0341` | Concatenates a short flat string with an int or another short flat string in one allocation | `'k' + (i & 15)` took 800 instructions through ToString and the general concatenation | `qjs_aot_binary_rr` fast case | No. |
+| `0342` | Exposes where a linearised rope keeps its flat string | Compiled character reads declined a rope and left the speculative body on every iteration | layout: rope left/right | Yes (layout hash). |
