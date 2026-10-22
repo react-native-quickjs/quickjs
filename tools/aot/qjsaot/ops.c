@@ -5323,7 +5323,7 @@ static int emit_fl_put_global(
   fprintf(
       f,
       "    rec_->pc = %d;\n"
-      "    if (__builtin_expect(qjs_aot_put_global(ctx, (int)qjs_aot_ld_u32(*(const uint8_t *const *)(cb + "
+      "    if (__builtin_expect(qjs_aot_put_global(ctx, (void *)cb, (int)qjs_aot_ld_u32(*(const uint8_t *const *)(cb + "
       "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s, %d) < 0, 0)) return JS_EXCEPTION;\n",
       in->next - 1, in->arg[0].off, vb, (int)in->arg[2].val);
   g_e_inl_dirty = 1;
@@ -5362,7 +5362,7 @@ static int emit_store_call(
       if (in->narg < 3 || in->arg[0].kind != 'a' || in->arg[1].kind != 'r') return 0;
       if (E_ROFF(in->arg[1]) / 16 >= fn->nregs || in->arg[0].off < 0) return 0;
       snprintf(call, sizeof(call),
-               "qjs_aot_put_global(ctx, (int)qjs_aot_ld_u32(q2_code(f) + %d), AOT_REG(fr, %d), %d) < 0",
+               "qjs_aot_put_global(ctx, *(void **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_B), (int)qjs_aot_ld_u32(q2_code(f) + %d), AOT_REG(fr, %d), %d) < 0",
                in->arg[0].off, E_ROFF(in->arg[1]), (int)in->arg[2].val);
       break;
     case ROP_put_local_s0:
@@ -5738,9 +5738,9 @@ static int emit_alloc_op(
   }
 
   /* ---- output ---- */
-  /* Two tagged numbers add, subtract or multiply inline; the engine's routine takes
-     what is left. */
-  if ((in->rop == ROP_add || in->rop == ROP_sub || in->rop == ROP_mul) && !nodest &&
+  /* Two tagged numbers combine inline; the engine's routine takes what is left. */
+  if ((in->rop == ROP_add || in->rop == ROP_sub || in->rop == ROP_mul ||
+       in->rop == ROP_div || in->rop == ROP_mod) && !nodest &&
       !redef_mode && in->nuse == 2 && t->lb[dv] == E_LB_TAG &&
       in->use[0] < (Q2ValueId)t->nvalues && in->use[1] < (Q2ValueId)t->nvalues &&
       t->lb[in->use[0]] == E_LB_TAG && t->lb[in->use[1]] == E_LB_TAG)
