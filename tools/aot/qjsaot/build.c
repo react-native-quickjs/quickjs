@@ -682,6 +682,28 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = Q2_E_SLOT;
       info.writes = Q2_E_SLOT | Q2_E_CONTROL;
       return &info;
+    case ROP_binary_loc_reg: /* "rbur": d, sub, slot, b */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 3;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_binary_reg_loc: /* "rbru": d, sub, a, slot */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 2;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
+    case ROP_binary_loc_loc: /* "rbuu": d, sub, slot, slot */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
     case ROP_local_rmw_imm: /* "buI": bool, slot, imm: no register operand */
       info.op = Q2_OP_FALLBACK;
       info.ndef = 0;
@@ -753,6 +775,10 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
     case ROP_put_local_s1:
     case ROP_put_local_s2:
     case ROP_put_local_s3:
+    case ROP_put_local_xfer_s0:
+    case ROP_put_local_xfer_s1:
+    case ROP_put_local_xfer_s2:
+    case ROP_put_local_xfer_s3:
       info.nuse = 1;
       info.use[0] = 0;
       info.reads = 0;

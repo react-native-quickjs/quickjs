@@ -5363,6 +5363,25 @@ static int emit_store_call(
       snprintf(call, sizeof(call), "(qjs_aot_put_local(ctx, q2_var_buf(f), %d, AOT_REG(fr, %d)), 0)",
                slot, E_ROFF(in->arg[0]));
       break;
+    case ROP_put_local_xfer_s0:
+    case ROP_put_local_xfer_s1:
+    case ROP_put_local_xfer_s2:
+    case ROP_put_local_xfer_s3:
+      /* The register keeps its value (it only borrows), so this is `put_local`. */
+      slot = in->rop - ROP_put_local_xfer_s0;
+      if (in->narg < 1 || in->arg[0].kind != 'r' || E_ROFF(in->arg[0]) / 16 >= fn->nregs)
+        return 0;
+      snprintf(call, sizeof(call), "(qjs_aot_put_local(ctx, q2_var_buf(f), %d, AOT_REG(fr, %d)), 0)",
+               slot, E_ROFF(in->arg[0]));
+      break;
+    case ROP_put_local:
+    case ROP_put_local_xfer:
+      if (in->narg < 2 || in->arg[0].kind != 'u' || in->arg[1].kind != 'r' ||
+          E_ROFF(in->arg[1]) / 16 >= fn->nregs)
+        return 0;
+      snprintf(call, sizeof(call), "(qjs_aot_put_local(ctx, q2_var_buf(f), %d, AOT_REG(fr, %d)), 0)",
+               (int)in->arg[0].val, E_ROFF(in->arg[1]));
+      break;
     case ROP_local_uninit:
       if (in->narg < 1) return 0;
       snprintf(call, sizeof(call),
@@ -6082,6 +6101,98 @@ static int emit_typed_call(
   g_e_presynced = 0;
   fprintf(f, "    cd_%d: ;\n", in->pc);
   if (cur != NULL) cur[dreg] = dv;
+  return 1;
+}
+
+/* A read of a variable slot. A function with an `arguments` binding, a handler or a
+   `with` keeps its variables in frame memory rather than registers; the read is the
+   slot's value, borrowed. */
+static int emit_typed_local_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId dv;
+  int slot, dreg;
+
+  if (!have_types || t == NULL || g_e_fl || cur == NULL) return 0;
+  if (in->rop == ROP_get_local) {
+    if (in->narg < 2 || in->arg[1].kind != 'u') return 0;
+    slot = (int)in->arg[1].val;
+  } else if (in->rop >= ROP_get_local_s0 && in->rop <= ROP_get_local_s3) {
+    slot = in->rop - ROP_get_local_s0;
+  } else {
+    return 0;
+  }
+  if (in->ndef < 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
+      t->lb[dv] != E_LB_BOOL)
+    return 0;
+  if (t->lb[dv] != E_LB_TAG)
+    e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
+  fprintf(f, "    { JSValue _lv = q2_var_buf(f)[%d];\n", slot);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_lv")) {
+    fprintf(stderr, "qjsaot: local read at pc %d: no guard for the def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "    }\n");
+  cur[dreg] = dv;
+  return 1;
+}
+
+/* `binary_loc_reg`, `binary_reg_loc`, `binary_loc_loc`: arithmetic with a variable
+   slot as an operand. Two numbers combine inline; anything else steps. */
+static int emit_typed_binary_loc(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  Q2ValueId dv;
+  int dreg, sub;
+  char ea[96], eb[96];
+
+  if (!have_types || t == NULL || g_e_fl || cur == NULL) return 0;
+  if (in->rop != ROP_binary_loc_reg && in->rop != ROP_binary_reg_loc &&
+      in->rop != ROP_binary_loc_loc)
+    return 0;
+  if (in->narg < 4 || in->arg[1].kind != 'b' || in->ndef < 1) return 0;
+  if (e_must_exit(fn, in)) return 0;
+  sub = (int)in->arg[1].val;
+  if (in->rop == ROP_binary_loc_reg) {
+    if (in->arg[2].kind != 'u' || in->arg[3].kind != 'r' || in->nuse < 1) return 0;
+    e_loc_operand(ea, sizeof(ea), fn, t, in, 2, 0);
+    e_loc_operand(eb, sizeof(eb), fn, t, in, 3, 0);
+  } else if (in->rop == ROP_binary_reg_loc) {
+    if (in->arg[2].kind != 'r' || in->arg[3].kind != 'u' || in->nuse < 1) return 0;
+    e_loc_operand(ea, sizeof(ea), fn, t, in, 2, 0);
+    e_loc_operand(eb, sizeof(eb), fn, t, in, 3, 0);
+  } else {
+    if (in->arg[2].kind != 'u' || in->arg[3].kind != 'u') return 0;
+    e_loc_operand(ea, sizeof(ea), fn, t, in, 2, 0);
+    e_loc_operand(eb, sizeof(eb), fn, t, in, 3, 0);
+  }
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
+      t->lb[dv] != E_LB_BOOL)
+    return 0;
+  if (t->lb[dv] != E_LB_TAG)
+    e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
+  fprintf(f, "    { JSValue _r;\n");
+  fprintf(f, "      if (__builtin_expect(q2_arith(%d, %s, %s, &_r), 1)) {\n", sub, ea, eb);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_r")) {
+    fprintf(stderr, "qjsaot: local arithmetic at pc %d: no guard for the def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    fprintf(stderr, "qjsaot: local arithmetic at pc %d: the wrapper declined after output\n", in->pc);
+    abort();
+  }
+  fprintf(f, "      }\n    }\n");
+  cur[dreg] = dv;
   return 1;
 }
 
@@ -8533,8 +8644,26 @@ static int e_dispatch_rop(
     case ROP_put_local_s1:
     case ROP_put_local_s2:
     case ROP_put_local_s3:
+    case ROP_put_local_xfer_s0:
+    case ROP_put_local_xfer_s1:
+    case ROP_put_local_xfer_s2:
+    case ROP_put_local_xfer_s3:
+    case ROP_put_local:
+    case ROP_put_local_xfer:
     case ROP_local_uninit:
       return emit_store_call(f, fn, in, t, cur, have_types);
+
+    /* -- variable slots in frame memory -- */
+    case ROP_get_local:
+    case ROP_get_local_s0:
+    case ROP_get_local_s1:
+    case ROP_get_local_s2:
+    case ROP_get_local_s3:
+      return emit_typed_local_read(f, fn, in, t, cur, have_types);
+    case ROP_binary_loc_reg:
+    case ROP_binary_reg_loc:
+    case ROP_binary_loc_loc:
+      return emit_typed_binary_loc(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- fused arithmetic (Q2_OP_BINARY, but a five-operand shape) -- */
     case ROP_add_mul:

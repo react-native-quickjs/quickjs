@@ -227,6 +227,17 @@ int q2_infer(Q2Func *fn) {
     w[fn->blocks[0].param_val[b]] = LB_TAG;
     fixed[fn->blocks[0].param_val[b]] = 1;
   }
+  /* A block nothing branches to (a generator's resume point) is entered with whatever
+     the frame holds: its parameters are tagged, and what joins them must see that. */
+  for (b = 1; b < fn->nblocks; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    int k;
+    if (blk->npreds != 0) continue;
+    for (k = 0; k < blk->nparams; k++) {
+      w[blk->param_val[k]] = LB_TAG;
+      fixed[blk->param_val[k]] = 1;
+    }
+  }
   /* A loop counter: a block parameter whose only incoming argument is the
      result of the in-place increment, which itself is int when the parameter
      is. The cycle has no least fixpoint, so it is broken here, by the same
