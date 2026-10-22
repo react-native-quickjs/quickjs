@@ -60659,6 +60659,9 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rc_back = (uint32_t)(offsetof(JSMallocBlockHeader, user_data) -
                                   offsetof(JSMallocBlockHeader, ref_count));
     out->off_varref_pvalue = (uint32_t)offsetof(JSVarRef, pvalue);
+    out->class_c_function = JS_CLASS_C_FUNCTION;
+    out->off_cfunc_c_function = (uint32_t)offsetof(JSObject, u.cfunc.c_function);
+    out->off_cfunc_magic = (uint32_t)offsetof(JSObject, u.cfunc.magic);
     out->hash = qjs_aot_layout_hash(out);
 }
 
@@ -88652,6 +88655,24 @@ static double js_math_exp(double d) { return exp(d); }
 static double js_math_log(double d) { return log(d); }
 static double js_math_sin(double d) { return sin(d); }
 static double js_math_tan(double d) { return tan(d); }
+#if QJS_AOT || QJS_AOT_GEN
+void *qjs_aot_intrinsic_fn(int id)
+{
+    switch (id) {
+    case QJS_AOT_INTR_SQRT: return (void *)js_math_sqrt;
+    case QJS_AOT_INTR_ABS: return (void *)js_math_fabs;
+    case QJS_AOT_INTR_FLOOR: return (void *)js_math_floor;
+    case QJS_AOT_INTR_CEIL: return (void *)js_math_ceil;
+    case QJS_AOT_INTR_ROUND: return (void *)js_math_round;
+    case QJS_AOT_INTR_SIN: return (void *)js_math_sin;
+    case QJS_AOT_INTR_COS: return (void *)js_math_cos;
+    case QJS_AOT_INTR_MIN:
+    case QJS_AOT_INTR_MAX: return (void *)js_math_min_max;
+    case QJS_AOT_INTR_PARSEINT: return (void *)js_parseInt;
+    }
+    return NULL;
+}
+#endif
 static double js_math_trunc(double d) { return trunc(d); }
 static double js_math_cosh(double d) { return cosh(d); }
 static double js_math_sinh(double d) { return sinh(d); }

@@ -1235,12 +1235,16 @@
       "sha256": "0b0eacaa1f1b395ce61e4b148798b2e027c6e5ad3587202356b9692c05e9a5a2"
     },
     {
+      "name": "0314-aot-intrinsic-fns.patch",
+      "sha256": "d3ba1b734a8421250d8457c9d4a2968000dc06cfe8e16e2748ba6562fe289972"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "a5428d9a724634c3fab0f76401d8a05db3fa34195f85cdf502a0b6767dae362a",
+    "quickjs.c": "320efa1dda174cae993ef7e6e5e56e83dbe9fdfe483c24f0640a00c5f483a516",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
