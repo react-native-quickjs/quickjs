@@ -30,7 +30,7 @@
  * `access[insn]` says it is a guarded access of a group's shape, `skip[insn]`
  * says that test is already implied by a SHAPE fact, and `miss_exits[insn]` says
  * its miss must leave the speculative body. Nothing is emitted here; the
- * emitter reads these and `--emit2-types` prints them.
+ * emitter reads these and `--types` prints them.
  *
  * ---- what counts as a safepoint, and why ----
  *
@@ -1072,7 +1072,7 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
       }
     }
 
-    /* Keep the in-set: `--emit2-types` prints it per block. */
+    /* Keep the in-set: `--types` prints it per block. */
     if (cur.nshape > 0) {
       out->blocks[b].nshape = cur.nshape;
       out->blocks[b].shape_val = malloc(sizeof(int) * (size_t)cur.nshape);

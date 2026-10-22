@@ -60,11 +60,10 @@ void e2_report_func(const JSAotGenFunc *g, const char *hex, double weight,
     snprintf(pos, sizeof(pos), "%s:%d:%d", g->file, g->line, g->col);
   else
     snprintf(pos, sizeof(pos), "%s", g->file[0] ? g->file : "?");
-  /* name file:line ops=N weight=W% delegated|native [scope] hex=... */
-  fprintf(e2_rep, "E2 %s %s ops=%d weight=%.1f%% %s%s hex=%s\n",
+  /* name file:line ops=N weight=W% delegated|native hex=... */
+  fprintf(e2_rep, "E2 %s %s ops=%d weight=%.1f%% %s hex=%s\n",
           g->name[0] ? g->name : "<anon>", pos, g->len / 4, weight,
-          delegated ? "delegated" : "native",
-          e2_only_hex[0] ? " scope" : "", hex);
+          delegated ? "delegated" : "native", hex);
 }
 
 void e2_report_opcall(uint16_t rop, double weight, int missarm) {
@@ -86,15 +85,13 @@ void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
      entry carries and can check the rule's assumption (only functions that
      call, plus frames over 16 KB, poll and check). */
   if (frameless)
-    fprintf(e2_rep, "E2 entry %s frameless%s\n",
-            g->name[0] ? g->name : "<anon>",
-            e2_only_hex[0] ? " scope" : "");
+    fprintf(e2_rep, "E2 entry %s frameless\n",
+            g->name[0] ? g->name : "<anon>");
   else
-    fprintf(e2_rep, "E2 entry %s framed (P%s)(K%s) blocked-by=%s%s\n",
+    fprintf(e2_rep, "E2 entry %s framed (P%s)(K%s) blocked-by=%s\n",
             g->name[0] ? g->name : "<anon>",
             poll ? "" : "-", stack_check ? "" : "-",
-            e2_fl_why_not()[0] ? e2_fl_why_not() : "-",
-            e2_only_hex[0] ? " scope" : "");
+            e2_fl_why_not()[0] ? e2_fl_why_not() : "-");
 }
 
 /* A call site the profile marks as an intrinsic site (e2_intrinsics.c). */

@@ -32,10 +32,6 @@
    and the selection are shared rather than copied. Emission mode therefore
    hands over to it; --verify-ir and --dump-ir stay here, where the IR lives. */
 int qjsaot_driver_main(int argc, char **argv);
-int qjsaot2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
-extern int (*qjs_aot_emit_body)(FILE *f, const JSAotGenFunc *g, char hex[33]);
-int qjsaot2_emit_pure(FILE *f, const JSAotGenFunc *g, char hex[33]);
-extern int (*qjs_aot_emit_pure)(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
 static char *read_file(const char *path, long *len_out) {
   FILE *f = fopen(path, "rb");
@@ -95,9 +91,9 @@ int main(int argc, char **argv) {
       dump = 1;
     else if (strcmp(argv[i], "--stats") == 0)
       stats = 1;
-    else if (strcmp(argv[i], "--emit2-types") == 0)
+    else if (strcmp(argv[i], "--types") == 0)
       types = 1;
-    else if (strcmp(argv[i], "--emit2-types-out") == 0 && i + 1 < argc) {
+    else if (strcmp(argv[i], "--types-out") == 0 && i + 1 < argc) {
       types = 1;
       types_out = argv[++i];
     }
@@ -108,8 +104,7 @@ int main(int argc, char **argv) {
   {
     int gen = 0, j;
     for (j = 1; j < argc; j++)
-      if (strcmp(argv[j], "--emit2") == 0 ||
-          strcmp(argv[j], "--emit2-split") == 0 ||
+      if (strcmp(argv[j], "--split") == 0 ||
           strcmp(argv[j], "--out") == 0)
         gen = 1;
     if (gen) types = 0;
@@ -117,17 +112,15 @@ int main(int argc, char **argv) {
   if (!verify && !dump && !stats && !types) {
     /* The unit-builder mode: the same CLI as qjsaot, with the SSA body
        emitter. Options are the driver's, so nothing is validated here. */
-    qjs_aot_emit_body = qjsaot2_emit_body;
-    qjs_aot_emit_pure = qjsaot2_emit_pure;
     return qjsaot_driver_main(argc, argv);
   }
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--verify-ir") == 0 ||
         strcmp(argv[i], "--dump-ir") == 0 ||
         strcmp(argv[i], "--stats") == 0 ||
-        strcmp(argv[i], "--emit2-types") == 0)
+        strcmp(argv[i], "--types") == 0)
       continue;
-    if (strcmp(argv[i], "--emit2-types-out") == 0 && i + 1 < argc) {
+    if (strcmp(argv[i], "--types-out") == 0 && i + 1 < argc) {
       i++;
       continue;
     }
@@ -144,7 +137,7 @@ int main(int argc, char **argv) {
   if (ninputs == 0) {
     fprintf(
         stderr,
-        "usage: qjsaot2 --verify-ir|--dump-ir|--stats|--emit2-types "
+        "usage: qjsaot2 --verify-ir|--dump-ir|--stats|--types "
         "bundle.js ...\n");
     return 2;
   }
@@ -179,7 +172,7 @@ int main(int argc, char **argv) {
          option: `keep[]` is sized by `ninputs`, so a value counted as an
          input here writes past the array. */
       if (strcmp(argv[i], "--profile") == 0 ||
-          strcmp(argv[i], "--emit2-types-out") == 0)
+          strcmp(argv[i], "--types-out") == 0)
         i++;
       continue;
     }

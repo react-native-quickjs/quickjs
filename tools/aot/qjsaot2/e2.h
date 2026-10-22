@@ -23,12 +23,6 @@
    success, -1 on a generation error. */
 int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
-/* The old emitter, unchanged. */
-int q2_old_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
-
-/* Called once per function by the unit builder: routes the function to the E2
-   emitter when `--emit2` selects it, else to the old one. */
-int e2_emit_body_if_on(FILE *f, const JSAotGenFunc *g, char hex[33]);
 /* The inline form `e2i_HEX` of a small leaf (card E15), or 0 with `why`. */
 int e2_emit_inline_func(
     FILE *f, const JSAotGenFunc *g, char hex[33], char *why, size_t whyn);
@@ -92,15 +86,6 @@ int e2_pic_sites(const struct Q2Func *fn);
    defined once in the unit prelude. */
 
 /* --- options, set by the unit builder's command line ------------------- */
-
-/* --emit2: route every function through `e2_emit_body`. */
-extern int e2_on;
-/* --emit2-only HEX: restrict `--emit2` to this function, so one function can
-   be switched to the new emitter while the rest stay on the old one. Empty
-   means every function. */
-extern char e2_only_hex[33];
-
-int qjs_aot_emit2_on(void);
 
 /* --- the role table (D12) --------------------------------------------- */
 

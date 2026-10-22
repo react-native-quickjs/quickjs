@@ -2182,3 +2182,97 @@ void q2_free(Q2Func *f) {
   free(f->reg_def);
   memset(f, 0, sizeof(*f));
 }
+
+/* The ROPs the IR models as more than an opaque instruction. The verifier checks the
+   classifier against this, so a modelled op the IR calls a fallback is a build
+   failure. */
+int q2_lowered(uint16_t rop) {
+  switch (rop) {
+    case ROP_load_undefined:
+    case ROP_load_null:
+    case ROP_load_true:
+    case ROP_load_false:
+    case ROP_load_i8:
+    case ROP_load_i8_s:
+    case ROP_load_i32:
+    case ROP_move:
+    case ROP_move_s:
+    case ROP_move_xfer:
+    case ROP_get_local:
+    case ROP_put_local:
+    case ROP_put_local_xfer:
+    case ROP_get_arg:
+    case ROP_get_arg2:
+    case ROP_get_var_ref:
+    case ROP_load_this:
+    case ROP_add:
+    case ROP_sub:
+    case ROP_mul:
+    case ROP_add_imm_s:
+    case ROP_sub_imm_s:
+    case ROP_binary_imm:
+    case ROP_binary_imm_s:
+    case ROP_mul_add:
+    case ROP_mul_sub:
+    case ROP_add_mul:
+    case ROP_sub_mul:
+    case ROP_get_field:
+    case ROP_get_field_own:
+    case ROP_get_field_chain:
+    case ROP_get_field_chain_own:
+    case ROP_get_field2:
+    case ROP_get_field2_own:
+    case ROP_get_element:
+    case ROP_branch_null:
+    case ROP_branch_not_null:
+    case ROP_branch_nullish:
+    case ROP_branch_not_nullish:
+    case ROP_branch:
+    case ROP_branch_s:
+    case ROP_branch_if:
+    case ROP_branch_if_not:
+    case ROP_branch_cmp_reg_reg:
+    case ROP_branch_cmp_reg_reg_s:
+    case ROP_put_field:
+    case ROP_get_global:
+    case ROP_neg:
+    case ROP_inc:
+    case ROP_inc_branch_lt:
+    case ROP_inc_branch_lt_s:
+    case ROP_add_imm_self_branch:
+    case ROP_add_imm_self_branch_s:
+    case ROP_return:
+    case ROP_return_undefined:
+    case ROP_get_this_field:
+    case ROP_get_this_field2:
+    case ROP_binary_cpool:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* The live set immediately after an instruction: what build.c computed and
+   stored. Equal to the successor's live-in for a fall-through edge. */
+const uint64_t *q2_live_out(const Q2Func *fn, int insn) {
+  return fn->insn_live + (size_t)insn * (size_t)fn->lwords;
+}
+
+void q2_live_before(const Q2Func *fn, int insn, uint64_t *out) {
+  int words = fn->lwords, k;
+  const Q2Insn *in = &fn->insns[insn];
+  memcpy(out, fn->insn_live + (size_t)insn * words, (size_t)words * 8);
+  for (k = 0; k < in->ndef; k++) {
+    int r = fn->values[in->def[k]].reg;
+    out[r >> 6] &= ~(1ull << (r & 63));
+  }
+  for (k = 0; k < in->nuse; k++) {
+    int r = fn->values[in->use[k]].reg;
+    out[r >> 6] |= 1ull << (r & 63);
+  }
+  for (k = 0; k < in->win_n; k++) {
+    int r = in->win_reg + k;
+    out[r >> 6] |= 1ull << (r & 63);
+  }
+}
+

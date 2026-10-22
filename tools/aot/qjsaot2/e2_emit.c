@@ -6,12 +6,8 @@
  */
 
 /*
- * The choice of emitter for one function, and the native entry a compiled
- * caller enters it through.
- *
- * With `--emit2` off nothing changes: the unit builder calls the old emitter
- * directly through `qjs_aot_emit_body`. With it on, every function (or the one
- * named by `--emit2-only`) comes here first, and this file decides.
+ * The per-function driver of the emitter and the native entry a compiled caller
+ * enters a function through.
  */
 #include <stdio.h>
 #include <string.h>
@@ -19,12 +15,9 @@
 #include "e2.h"
 #include "ir.h"
 
-int e2_on;
-char e2_only_hex[33];
-
 /* When set, compiled functions get external (hidden) linkage instead of
    `static`, so a unit split across files can call between them. Set by the
-   unit builder for `--emit2-split`. */
+   unit builder for `--split`. */
 static int e2_split;
 void e2_set_split(int on) {
   e2_split = on ? 1 : 0;
@@ -36,25 +29,13 @@ const char *e2_linkage(void) {
   return e2_split ? "__attribute__((visibility(\"hidden\"))) " : "static ";
 }
 
-/* The call-site A/B switch (--emit2-nocall). */
+/* The call-site A/B switch (--nocall). */
 static int e2_nocall;
 void e2_set_nocall(int on) {
   e2_nocall = on ? 1 : 0;
 }
 int e2_nocall_on(void) {
   return e2_nocall;
-}
-
-int qjs_aot_emit2_on(void) {
-  return e2_on;
-}
-
-/* Whether this function is one the new emitter should handle. A function is in
-   scope when `--emit2-only` names it, or when no name was given. */
-static int e2_in_scope(const char *hex) {
-  if (!e2_on) return 0;
-  if (e2_only_hex[0] == 0) return 1;
-  return strcmp(hex, e2_only_hex) == 0;
 }
 
 int qjs_aot_inline_uses_nx(const char hex[33]);
@@ -448,10 +429,6 @@ int e2_emit_inline_func(
   Q2Func fn;
   char msg[256];
   int rc;
-  if (!e2_in_scope(hex)) {
-    snprintf(why, whyn, "not in scope");
-    return 0;
-  }
   if (q2_build(g, &fn) < 0) {
     q2_free(&fn);
     snprintf(why, whyn, "the IR could not be built");
@@ -465,11 +442,4 @@ int e2_emit_inline_func(
   rc = e2_emit_inline_body(f, &fn, hex, why, whyn);
   q2_free(&fn);
   return rc;
-}
-
-/* The unit builder's hook: called once per function, with the option state
-   already parsed. */
-int e2_emit_body_if_on(FILE *f, const JSAotGenFunc *g, char hex[33]) {
-  if (!e2_in_scope(hex)) return q2_old_emit_body(f, g, hex);
-  return e2_emit_body(f, g, hex);
 }

@@ -1069,7 +1069,7 @@ const char *e2_types_rep_name(const E2Types *t, Q2ValueId v) {
   }
 }
 
-/* ---- the dump (`--emit2-types`) ----------------------------------------- */
+/* ---- the dump (`--types`) ----------------------------------------- */
 
 static const char *why_name(int why) {
   switch (why) {
