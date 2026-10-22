@@ -6471,6 +6471,12 @@ static int emit_tag_cmp_value(
         f,
         "      else if (q2_str_eq(v%u, v%u, &c_))\n        c_ = %sc_;\n",
         (unsigned)av, (unsigned)bv, strcmp(cop, "!=") == 0 ? "!" : "");
+  {
+    int mk = in->rop == ROP_lt ? 0 : in->rop == ROP_lte ? 1 : in->rop == ROP_gt ? 2
+           : in->rop == ROP_gte ? 3 : in->rop == ROP_eq ? 4 : in->rop == ROP_neq ? 5
+           : in->rop == ROP_strict_eq ? 6 : 7;
+    fprintf(f, "      else if (q2_mixed_cmp(v%u, v%u, %d, &c_)) { }\n", (unsigned)av, (unsigned)bv, mk);
+  }
   fprintf(f, "      else c_ = -1;\n");
   fprintf(f, "      if (__builtin_expect(c_ >= 0, 1)) {\n");
   if (t->lb[dv] == E_LB_TAG)
@@ -8418,6 +8424,15 @@ static int emit_typed_branch(
               "    else if (q2_str_cmp(v%u, v%u, &c_))\n"
               "        c_ = c_ %s 0;\n",
               (unsigned)av, (unsigned)bv, cop);
+        {
+          int mk = base == REG_BIN_LT ? 0 : base == REG_BIN_LTE ? 1 : base == REG_BIN_GT ? 2
+                 : base == REG_BIN_GTE ? 3 : base == REG_BIN_EQ ? 4 : base == REG_BIN_NEQ ? 5
+                 : base == REG_BIN_STRICT_EQ ? 6 : 7;
+          fprintf(
+              f,
+              "    else if (q2_mixed_cmp(v%u, v%u, %d, &c_)) { }\n",
+              (unsigned)av, (unsigned)bv, mk);
+        }
         if (e_term_wrappable(fn, in, role, blk)) {
           fprintf(f, "    else {\n");
           e_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
