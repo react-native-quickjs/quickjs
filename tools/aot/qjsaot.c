@@ -4851,6 +4851,9 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return (qjs_aot_load_this)(ctx, f, out);\n"
         "}\n"
         "#define qjs_aot_load_this(ctx, f, out) q2_load_this(ctx, f, out)\n"
+        /* The caller's position at a native call, for a backtrace: the callee's frame
+           carries no return address. */
+        "#define E2_CAP(f, pc) (*(const uint8_t **)((uint8_t *)(f) + QJS_AOT_OFF_REGRUN_CAP_IP) = e2cb + (pc))\n"
         "#define E2_NO_SHAPE ((const void *)1)\n"
         "#define E2_BOX_F64(d) ({ double d_ = (d); "
         "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"

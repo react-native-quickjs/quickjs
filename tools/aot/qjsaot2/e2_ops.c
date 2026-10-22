@@ -1765,10 +1765,11 @@ static void emit_one_direct_call(
      from the bytecode; `ctx` here is only the caller's. */
   fprintf(
       f,
+      "        E2_CAP(f, %d);\n"
       "        JSValue _o = aot_n_%s(ctx, f,\n"
       "            (JSObject *)JS_VALUE_GET_PTR(AOT_REG(fr, %d)), %s,\n"
       "            &AOT_REG(fr, %d), %d);\n",
-      hex, cc, recv, w, na);
+      in->next - 1, hex, cc, recv, w, na);
   fprintf(
       f,
       "        if (__builtin_expect(JS_IsException(_o), 0)) { pc = %d; "
@@ -1853,7 +1854,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    uint8_t *ip;\n");
   fprintf(f, "    uint32_t pc = 0;\n");
   fprintf(f, "    uint32_t e2_from_pc = entry_pc;\n");
-  fprintf(f, "    const void *pic = q2_pic(f);\n");
+  fprintf(f, "    const void *pic = q2_pic(f);\n    const uint8_t *e2cb = q2_code(f); (void)e2cb;\n");
   /* The PIC way stride, read once per activation. Every compiled store into the
      frame goes through a pointer, so the compiler cannot prove those stores
      leave the bytecode alone and would reload it at each probe. */
@@ -2044,7 +2045,7 @@ int e2_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
      which reads the JSStackFrame a light frame does not have. */
   fprintf(f, "exception:\n");
   if (!has_ctl) {
-    fprintf(f, "    return JS_EXCEPTION;\n");
+    fprintf(f, "    return qjs_aot_throw_here(ctx, f, pc);\n");
   } else {
     fprintf(f, "    {\n");
     fprintf(f, "        uint32_t rp = 0;\n");
@@ -4865,8 +4866,9 @@ static int emit_typed_construct(
         "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
         "        JSValue _t, _o, _r;\n"
         "        int _rc = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t);\n"
-        "        if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n"
+        "        if (__builtin_expect(_rc < 0, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n"
         "        if (_rc > 0) {\n"
+        "            E2_CAP(f, %d);\n"
         "            _o = aot_n_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), _t,\n"
         "                          &AOT_REG(fr, %d), %d);\n"
         "            if (__builtin_expect(JS_IsException(_o), 0)) {\n"
@@ -4881,7 +4883,7 @@ static int emit_typed_construct(
         "                _r = _t;\n"
         "            }\n"
         "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
-        cexp, callee[k], ntexp, ntexp, cexp, cexp, callee[k], cexp, w, na,
+        cexp, callee[k], ntexp, ntexp, cexp, cexp, in->next - 1, callee[k], cexp, w, na,
         getenv("QJS_AOT_E2_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", off);
     e2_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E2_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
@@ -4947,7 +4949,7 @@ static int emit_store_call(
       return 0;
   }
   e2_emit_presync(f, fn, in, t, cur);
-  fprintf(f, "    if (__builtin_expect(%s, 0)) return JS_EXCEPTION;\n", call);
+  fprintf(f, "    if (__builtin_expect(%s, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", call, in->pc);
   /* The decoder files some of these as a fallback that redefines the live registers:
      each becomes a TAG local again from the frame, which the sync above filled. */
   for (k = 0; k < in->nredef; k++) {
@@ -5118,7 +5120,7 @@ static int emit_alloc_op(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", r * 16, (unsigned)v);
   }
   fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
-  fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n");
+  fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", in->pc);
   fprintf(f, "      if (%s) {\n", okc);
   if (!nodest)
     fprintf(
@@ -5325,6 +5327,7 @@ static int emit_typed_call(
     /* The callee's inline body first: it runs the callee in place when every
        check passes and has changed nothing when one does not, so the native call
        below is then correct. */
+    fprintf(f, "        E2_CAP(f, %d);\n", in->next - 1);
     if (qjs_aot_inline_has(callee[k]))
       fprintf(
           f,
@@ -5867,8 +5870,8 @@ static int emit_typed_field_write(
         "        { JSValue _pv = %s;\n"
         "          if (qjs_aot_put_field_slow(ctx, f, q2_code(f) + %d, v%u,\n"
         "                  (int)qjs_aot_ld_u32(q2_code(f) + %d), %d, _pv) < 0)\n"
-        "              return JS_EXCEPTION; }\n",
-        boxed, in->pc, (unsigned)rv, in->arg[1].off, site);
+        "              return qjs_aot_throw_here(ctx, f, %d); }\n",
+        boxed, in->pc, (unsigned)rv, in->arg[1].off, site, in->pc);
     e2_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "      }\n");
     fprintf(f, "    }\n");
@@ -8121,7 +8124,7 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         "    const uint32_t q2_ns = (uint32_t)*(const uint16_t *)(cb +\n"
         "                               QJS_AOT_OFF_FNBC_PIC_COUNT);\n");
   } else {
-    fprintf(f, "    const void *pic = q2_pic(f);\n");
+    fprintf(f, "    const void *pic = q2_pic(f);\n    const uint8_t *e2cb = q2_code(f); (void)e2cb;\n");
     fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
     fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
   }
