@@ -1841,7 +1841,91 @@ static int emit_native_call(
   return 1;
 }
 
+/* The loop headers of a function: the blocks a back edge enters, with their start pcs.
+   Both bodies use the same list, so a loop the speculative body left can be re-entered
+   at exactly the headers the generic body offers. */
+static int e_loop_headers(const Q2Func *fn, int *blks, int *pcs, int max) {
+  int b, k, n = 0, j;
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    for (k = 0; k < blk->nsucc && k < 2; k++) {
+      int sb = blk->succ_block[k], dup = 0;
+      if (sb < 0 || sb >= fn->nblocks || !q2_is_back_edge(fn, b, sb)) continue;
+      for (j = 0; j < n; j++)
+        if (blks[j] == sb) dup = 1;
+      if (dup || n >= max) continue;
+      blks[n] = sb;
+      pcs[n++] = fn->blocks[sb].start_pc;
+    }
+  }
+  return n;
+}
+
+static int e_emit_generic_body_raw(FILE *f, const Q2Func *fn, char hex[33]);
+static int e_nosr_on(void);
+/* The generic body, with the loop re-entry hook after each loop header's label: a call
+   that left the speculative body inside a loop returns to it at the header. */
 int e_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
+  char *mb = NULL;
+  size_t ml = 0;
+  FILE *m;
+  int blks[16], pcs[16], nh, h, rc, fi = qjs_aot_cur_func_idx();
+  char *txt, *outp = NULL;
+  size_t outn = 0;
+  FILE *o2;
+
+  m = open_memstream(&mb, &ml);
+  if (m == NULL) return e_emit_generic_body_raw(f, fn, hex);
+  rc = e_emit_generic_body_raw(m, fn, hex);
+  fclose(m);
+  if (rc != 0 || fn->g->ctl_count > 0 || e_nosr_on()) {
+    fwrite(mb, 1, ml, f);
+    free(mb);
+    return rc;
+  }
+  nh = e_loop_headers(fn, blks, pcs, 16);
+  txt = mb;
+  o2 = open_memstream(&outp, &outn);
+  if (o2 == NULL) {
+    fwrite(mb, 1, ml, f);
+    free(mb);
+    return rc;
+  }
+  {
+    /* Insert the hook after the first "g_<pc>:" of each header. */
+    char *cursor = txt;
+    size_t len = ml;
+    size_t pos = 0;
+    while (pos < len) {
+      int matched = -1;
+      if ((pos == 0 || txt[pos - 1] == '\n') && txt[pos] == 'g' && pos + 2 < len && txt[pos + 1] == '_') {
+        char *endp;
+        long v = strtol(txt + pos + 2, &endp, 10);
+        if (endp != txt + pos + 2 && *endp == ':') {
+          for (h = 0; h < nh; h++)
+            if (pcs[h] == v) matched = h;
+          if (matched >= 0) {
+            fwrite(txt + pos, 1, (size_t)(endp - (txt + pos)) + 1, o2);
+            fprintf(o2, "\n    E_OSR_HOOK(%d, %d, aot_f_%s);", fi, pcs[matched], hex);
+            pos = (size_t)(endp - txt) + 1;
+            pcs[matched] = -1;
+            continue;
+          }
+        }
+      }
+      fputc(txt[pos], o2);
+      pos++;
+    }
+    (void)cursor;
+  }
+  fclose(o2);
+  fwrite(outp, 1, outn, f);
+  free(outp);
+  free(mb);
+  return rc;
+}
+
+static int e_emit_generic_body_raw(FILE *f, const Q2Func *fn, char hex[33]) {
   int i, has_ctl;
   g_cur_hex = hex;
   if (!fn->ok) return -1;
@@ -1856,6 +1940,7 @@ int e_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    uint8_t *ip;\n");
   fprintf(f, "    uint32_t pc = 0;\n");
   fprintf(f, "    uint32_t e_from_pc = entry_pc;\n");
+  fprintf(f, "    uint32_t osr_from = entry_pc; (void)osr_from;\n");
   fprintf(f, "    const void *pic = q2_pic(f);\n    const uint8_t *ecb = q2_code(f); (void)ecb;\n");
   /* The PIC way stride, read once per activation. Every compiled store into the
      frame goes through a pointer, so the compiler cannot prove those stores
@@ -2755,6 +2840,12 @@ static int emit_typed_arith(
 }
 
 /* Generation-time switch: omit the spec back-edge poll (see the call site). */
+static int e_nosr_on(void) {
+  static int cached = -1;
+  if (cached < 0) cached = getenv("QJS_AOT_NOOSR") != NULL;
+  return cached;
+}
+
 static int e_nopoll(void) {
   static int cached = -1;
   if (cached < 0) {
@@ -8579,6 +8670,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e_n_shape = g_e_n_skip = g_e_n_fwd = g_e_n_hoist = 0;
   int n_left = 0;
   char gen0[400], gene[160];
+  int osr_blk[16], osr_pc[16], osr_n = 0;
   FILE *out = NULL;
   char *mbuf = NULL;
   size_t mlen = 0;
@@ -8654,6 +8746,12 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   else
     snprintf(gen0, sizeof(gen0), "aot_g_%s(ctx, f, fr, 0)", hex);
   snprintf(gene, sizeof(gene), "aot_g_%s(ctx, f, fr, entry_pc)", hex);
+  /* Loop re-entry: a framed body can be entered at a loop header after the generic body
+     ran the loop's first iterations. */
+  osr_n = 0;
+  if (!g_e_fl && !g_e_inl && fn->g->ctl_count == 0 && !e_nosr_on())
+    osr_n = e_loop_headers(fn, osr_blk, osr_pc, 16);
+  if (!g_e_fl && !g_e_inl) snprintf(gen0, sizeof(gen0), "aot_g_%s(ctx, f, fr, entry_pc)", hex);
   if (g_e_fl) {
     /* The exit function comes first: the body names it. */
     if (!g_e_inl) e_emit_frameless_exit_fn(out != NULL ? out : f, fn, hex);
@@ -8743,7 +8841,13 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         "    if (__builtin_expect(e_off[%d] | e_dis[%d], 0))\n"
         "        return %s;\n",
         fi, fi, gen0);
-  else
+  else if (osr_n > 0) {
+    int h;
+    fprintf(f, "    if (__builtin_expect((e_off[%d] | e_dis[%d]) != 0", fi, fi);
+    fprintf(f, " || (entry_pc != 0");
+    for (h = 0; h < osr_n; h++) fprintf(f, " && entry_pc != %d", osr_pc[h]);
+    fprintf(f, "), 0))\n        return %s;\n", gene);
+  } else
     fprintf(
         f,
         "    if (__builtin_expect(entry_pc != 0 || (e_off[%d] | e_dis[%d]), 0))\n"
@@ -8884,6 +8988,12 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     fprintf(f, "    (void)fr; (void)ctx; (void)caller_f; (void)this_obj;\n");
   else
     fprintf(f, "    (void)fr; (void)ctx; (void)f;\n");
+  if (osr_n > 0) {
+    int h;
+    fprintf(f, "    if (entry_pc != 0) {\n        switch (entry_pc) {\n");
+    for (h = 0; h < osr_n; h++) fprintf(f, "        case %d: goto osr_%d;\n", osr_pc[h], osr_pc[h]);
+    fprintf(f, "        default: return %s;\n        }\n    }\n", gene);
+  }
 
   /* The blocks in reverse postorder. `fn->blocks` is in pc order, which is a
      reverse postorder here: a block starts at every branch target and after
@@ -9294,9 +9404,76 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     for (o = 0; o < g_e_hx_n; o++) free(g_e_hx_cur[o]);
     g_e_hx_n = 0;
   }
+  /* The loop entries: the live registers come from the frame (the generic body keeps
+     the true state there), each checked for the representation the loop assumes, and
+     the shape checks hoisted out of the loop run again. Any failure goes back to the
+     generic body at the same pc. */
+  if (osr_n > 0) {
+    int h, q, o2;
+    for (h = 0; h < osr_n; h++) {
+      const Q2Block *hb = &fn->blocks[osr_blk[h]];
+      fprintf(f, "    osr_%d:;\n    {\n", osr_pc[h]);
+      for (q = 0; q < hb->nlive_in; q++) {
+        int rr = hb->in_reg[q];
+        Q2ValueId vv = hb->in_val[q];
+        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE || vv >= (Q2ValueId)types.nvalues)
+          continue;
+        switch (types.lb[vv]) {
+          case E_LB_I32:
+            fprintf(
+                f,
+                "      if (JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_INT) goto osr_fail;\n"
+                "      i%u = JS_VALUE_GET_INT(AOT_REG(fr, %d));\n",
+                rr * 16, (unsigned)vv, rr * 16);
+            break;
+          case E_LB_F64:
+            fprintf(
+                f,
+                "      { JSValue _x = AOT_REG(fr, %d);\n"
+                "        if (JS_VALUE_GET_TAG(_x) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_x);\n"
+                "        else if (JS_VALUE_GET_TAG(_x) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_x);\n"
+                "        else goto osr_fail; }\n",
+                rr * 16, (unsigned)vv, (unsigned)vv);
+            break;
+          case E_LB_BOOL:
+            fprintf(
+                f,
+                "      if (JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_BOOL) goto osr_fail;\n"
+                "      b%u = JS_VALUE_GET_BOOL(AOT_REG(fr, %d));\n",
+                rr * 16, (unsigned)vv, rr * 16);
+            break;
+          case E_LB_TAG:
+            fprintf(f, "      v%u = AOT_REG(fr, %d);\n", (unsigned)vv, rr * 16);
+            break;
+          default:
+            break;
+        }
+      }
+      if (g_e_facts != NULL)
+        for (o2 = 0; o2 < g_e_facts->nhoist; o2++) {
+          Q2ValueId rv;
+          if (g_e_facts->hoist_hdr[o2] != osr_blk[h]) continue;
+          rv = (Q2ValueId)g_e_facts->hoist_val[o2];
+          if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG)
+            fprintf(
+                f, "      if (__builtin_expect(q2_shape_of(v%u) != gsh%d, 0)) goto osr_fail;\n",
+                (unsigned)rv, g_e_facts->hoist_grp[o2]);
+          else
+            fprintf(f, "      goto osr_fail;\n");
+        }
+      fprintf(f, "      goto s_%d;\n    }\n", osr_pc[h]);
+    }
+    fprintf(f, "    osr_fail:;\n    {\n      e_osr_n[%d] += 8;\n      return %s;\n    }\n", fi, gene);
+  }
 
   fprintf(f, "    }\n");
   fprintf(f, "}\n");
+  if (osr_n > 0)
+    fprintf(
+        f,
+        "static void __attribute__((constructor)) e_osr_reg_%s(void)\n"
+        "{ e_osr_ok[%d] = 1; }\n",
+        hex, fi);
   if (g_e_fl && !g_e_inl && g_e_fl_calls)
     fprintf(
         f,

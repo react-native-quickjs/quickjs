@@ -2078,6 +2078,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "extern uint8_t e_off[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_han[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
+        "extern uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
         "extern uint64_t e_inl[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_inx[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
@@ -2087,6 +2088,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static uint8_t e_off[QJS_AOT_NFUNCS];\n"
         "static uint32_t e_han[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
+        "static uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
         "static uint64_t e_inl[QJS_AOT_NFUNCS];\n"
         "static uint32_t e_inx[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
@@ -2159,6 +2161,15 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#endif\n"
         "#define E_ENTER_NOTE(fi) (e_ent[fi]++)\n"
         "#define E_INL_NOTE(fi) (e_inl[fi]++)\n"
+        /* Loop re-entry: the generic body, running a loop the speculative body left,
+           hands the call back to it at the loop header. Skipped once when the generic
+           body was entered at that very header (an exit there), and limited in count so
+           a loop the speculative body keeps leaving does not nest without end. */
+        "#define E_OSR_HOOK(fi_, h_, fn_) do { \\\n"
+        "    if (osr_from == (h_)) osr_from = ~0u; \\\n"
+        "    else if (__builtin_expect(e_osr_ok[fi_] && e_osr_n[fi_] < 64 && \\\n"
+        "             !(e_off[fi_] | e_dis[fi_]), 0)) { \\\n"
+        "      e_osr_n[fi_]++; return fn_(ctx, f, fr, (h_)); } } while (0)\n"
         /* An inline body that cannot run (its nested callee is another function than
            the profiled one, say) leaves with nothing done and the native call takes
            over; that is not a failed speculation, so it does not count toward
@@ -3591,6 +3602,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "uint8_t e_off[QJS_AOT_NFUNCS];\n"
           "uint32_t e_han[QJS_AOT_NFUNCS];\n"
           "uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
+          "uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
           "uint64_t e_inl[QJS_AOT_NFUNCS];\n"
           "uint32_t e_inx[QJS_AOT_NFUNCS];\n"
           "uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
