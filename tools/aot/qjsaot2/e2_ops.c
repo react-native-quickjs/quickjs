@@ -5235,6 +5235,30 @@ static int emit_typed_field_write(
       "v%u, %d, %s), 1)) {\n",
       (unsigned)rv, site, boxed);
   fprintf(f, "      } else {\n");
+  /* A miss (an add-property store, a prototype receiver, a polymorphic site) runs
+     the engine's cache-filling store directly, as the generic body does, instead of
+     stepping the handler: the same safepoint, without the step. */
+  if (!g_e2_fl && in->narg > 1 && in->arg[1].kind == 'a') {
+    int r2;
+    for (r2 = 0; r2 < fn->nregs; r2++) {
+      Q2ValueId lv2 = cur != NULL ? cur[r2] : Q2_NO_VALUE;
+      if (lv2 == Q2_NO_VALUE || lv2 == E2_UNDEF || lv2 >= (Q2ValueId)t->nvalues)
+        continue;
+      if (t->lb[lv2] == E2_LB_TAG)
+        fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", r2 * 16, (unsigned)lv2);
+    }
+    fprintf(
+        f,
+        "        { JSValue _pv = %s;\n"
+        "          if (qjs_aot_put_field_slow(ctx, f, q2_code(f) + %d, v%u,\n"
+        "                  (int)qjs_aot_ld_u32(q2_code(f) + %d), %d, _pv) < 0)\n"
+        "              return JS_EXCEPTION; }\n",
+        boxed, in->pc, (unsigned)rv, in->arg[1].off, site);
+    e2_emit_group_recheck(f, fn, in, cur);
+    fprintf(f, "      }\n");
+    fprintf(f, "    }\n");
+    return 1;
+  }
   /* The frame must hold the operands before the wrapper syncs and steps. */
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", rreg * 16, (unsigned)rv);
   if (t->lb[vv] == E2_LB_I32)
