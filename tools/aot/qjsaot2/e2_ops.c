@@ -4584,6 +4584,125 @@ static int emit_inl_nested_call(
   return 1;
 }
 
+/* ---- `new C(...)` with a known constructor (card E16) ----------------------
+   The site checks the constructor's identity (bound entry), allocates `this` with the
+   engine's own allocation for a plain light constructor (`qjs_aot_construct_this`),
+   runs the compiled body with it, and applies the result rule: an object the
+   constructor returns wins, otherwise `this`. new.target must be the constructor
+   itself. Anything else (a derived class, another new.target, a miss) takes the
+   op-call wrapper, which constructs through the engine. Allocation is a safepoint, so
+   the live TAG values are in the frame first and the groups are re-checked after. */
+static int emit_typed_construct(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k, nb = 0, cc, nt, off, na, w, r, dreg;
+  char cexp[64], ntexp[64];
+  Q2ValueId dv, cv, nv;
+
+  if (!have_types || t == NULL || g_e2_fl || cur == NULL) return 0;
+  if (in->rop != ROP_construct || in->ndef < 1 || in->narg < 5) return 0;
+  if (e2_roles[in->rop] == NULL || e2_roles[in->rop]->control != E2_CF_NONE) return 0;
+  if (e2_must_exit(fn, in)) return 0;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits)) return 0;
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    nb++;
+  }
+  if (nb == 0) return 0;
+  cc = (int)in->arg[1].val;
+  nt = (int)in->arg[2].val;
+  off = dest_off(fn, in);
+  na = in->win_n;
+  w = in->win_reg * 16;
+  if (off < 0 || cc < 0 || nt < 0 || (unsigned)(in->win_reg + na) > (unsigned)fn->nregs) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[dv] != E2_LB_TAG && !e2_def_dead(in, dv)) return 0;
+  dreg = off / 16;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+  nv = nt / 16 < fn->nregs ? cur[nt / 16] : Q2_NO_VALUE;
+  if (cv != Q2_NO_VALUE && cv != E2_UNDEF && cv != E2_INFRAME &&
+      cv < (Q2ValueId)t->nvalues && t->lb[cv] == E2_LB_TAG)
+    snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+  else
+    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+  if (nv != Q2_NO_VALUE && nv != E2_UNDEF && nv != E2_INFRAME &&
+      nv < (Q2ValueId)t->nvalues && t->lb[nv] == E2_LB_TAG)
+    snprintf(ntexp, sizeof(ntexp), "v%u", (unsigned)nv);
+  else
+    snprintf(ntexp, sizeof(ntexp), "AOT_REG(fr, %d)", nt);
+
+  /* ---- output ---- */
+  fprintf(f, "    /* R6: sync live TAG values before the construct */\n");
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] != E2_LB_TAG) continue;
+    fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", r * 16, (unsigned)v);
+  }
+  for (r = 0; r < na; r++) {
+    Q2ValueId v;
+    int wr = in->win_reg + r;
+    if (wr >= fn->nregs) continue;
+    v = cur[wr];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", wr * 16, (unsigned)v);
+  }
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1) &&\n"
+        "        JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT &&\n"
+        "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
+        "        JSValue _t, _o, _r;\n"
+        "        int _rc = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t);\n"
+        "        if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n"
+        "        if (_rc > 0) {\n"
+        "            _o = aot_n_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), _t,\n"
+        "                          &AOT_REG(fr, %d), %d);\n"
+        "            if (__builtin_expect(JS_IsException(_o), 0)) {\n"
+        "                JS_FreeValue(ctx, _t);\n"
+        "                return JS_EXCEPTION;\n"
+        "            }\n"
+        "            if (%s JS_VALUE_GET_TAG(_o) == JS_TAG_OBJECT) {\n"
+        "                JS_FreeValue(ctx, _t);\n"
+        "                _r = _o;\n"
+        "            } else {\n"
+        "                if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n"
+        "                _r = _t;\n"
+        "            }\n"
+        "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
+        cexp, callee[k], ntexp, ntexp, cexp, cexp, callee[k], cexp, w, na,
+        getenv("QJS_AOT_E2_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", off);
+    e2_emit_group_recheck(f, fn, in, cur);
+    if (t->lb[dv] == E2_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
+    fprintf(f, "            goto cd_%d;\n        }\n    }\n#endif\n", in->pc);
+  }
+  g_e2_presynced = 1;
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    fprintf(stderr, "e2: construct at pc %d: the wrapper declined after output\n", in->pc);
+    abort();
+  }
+  g_e2_presynced = 0;
+  fprintf(f, "    cd_%d: ;\n", in->pc);
+  cur[dreg] = dv;
+  return 1;
+}
+
 /* A SPECULATIVE-BODY CALL, mirroring `emit_native_call` + `emit_one_direct_call`:
    same eligibility, same call sequence, and the result taken with
    `qjs_aot_set_reg_p` because `aot_n_` hands back an OWNED reference.
@@ -7189,6 +7308,8 @@ static int e2_dispatch_rop(
     case ROP_call:
     case ROP_call_method:
       return emit_typed_call(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_construct:
+      return emit_typed_construct(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- this, and strict equality as a value -- */
     case ROP_load_this:
