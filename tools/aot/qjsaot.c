@@ -4824,6 +4824,33 @@ int qjsaot_driver_main(int argc, char **argv) {
            from the profile does not see FLOAT64 for the same number. */
         /* The shape of a monomorphic group whose cells were all empty at entry:
            no object has it, so every access of the group exits. */
+        /* A boxed int or bool is built in one vector register and stored as one 16-byte
+           word. JS_MKVAL's own 4-byte payload store, and two 8-byte stores, are both
+           followed in a frame slot by a copy that loads all 16 bytes at once, and such a
+           load cannot be forwarded from the smaller stores. */
+        "#if !defined(JS_NAN_BOXING) && defined(__SSE2__)\n"
+        "#include <emmintrin.h>\n"
+        "static inline JSValue q2_mkval(int32_t tag, int32_t val)\n"
+        "{\n"
+        "  __m128i x = _mm_set_epi64x((long long)tag, (long long)(uint32_t)val);\n"
+        "  JSValue r;\n"
+        "  __builtin_memcpy(&r, &x, sizeof r);\n"
+        "  return r;\n"
+        "}\n"
+        "#undef JS_MKVAL\n"
+        "#define JS_MKVAL(tag, val) q2_mkval((tag), (val))\n"
+        "#endif\n"
+        /* `this` is an object in nearly every call. The out-of-line helper writes the
+           result as two words, which the caller then copies as one 16-byte load: that
+           load cannot be forwarded from them and stalls. Reading the slot here avoids
+           the round trip; any other `this` takes the helper. */
+        "static inline int q2_load_this(JSContext *ctx, JSRegRun *f, JSValue *out)\n"
+        "{\n"
+        "  JSValue t = *(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ);\n"
+        "  if (__builtin_expect(JS_VALUE_GET_TAG(t) == JS_TAG_OBJECT, 1)) { *out = t; return 0; }\n"
+        "  return (qjs_aot_load_this)(ctx, f, out);\n"
+        "}\n"
+        "#define qjs_aot_load_this(ctx, f, out) q2_load_this(ctx, f, out)\n"
         "#define E2_NO_SHAPE ((const void *)1)\n"
         "#define E2_BOX_F64(d) ({ double d_ = (d); "
         "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
