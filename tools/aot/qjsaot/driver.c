@@ -2190,11 +2190,11 @@ int qjsaot_driver_main(int argc, char **argv) {
            hands the call back to it at the loop header. Skipped once when the generic
            body was entered at that very header (an exit there), and limited in count so
            a loop the speculative body keeps leaving does not nest without end. */
-        "#define E_OSR_HOOK(fi_, h_, fn_) do { \\\n"
+        "#define E_OSR_HOOK(fi_, h_, fn_) do { static uint8_t e_oc_; \\\n"
         "    if (osr_from == (h_)) osr_from = ~0u; \\\n"
-        "    else if (__builtin_expect(e_osr_ok[fi_] && e_osr_n[fi_] < 64 && \\\n"
+        "    else if (__builtin_expect(e_osr_ok[fi_] && e_oc_ < 64 && e_osr_n[fi_] < 200 && \\\n"
         "             !(e_off[fi_] | e_dis[fi_]), 0)) { \\\n"
-        "      e_osr_n[fi_]++; return fn_(ctx, f, fr, (h_)); } } while (0)\n"
+        "      e_oc_++; return fn_(ctx, f, fr, (h_)); } } while (0)\n"
         /* An inline body that cannot run (its nested callee is another function than
            the profiled one, say) leaves with nothing done and the native call takes
            over; that is not a failed speculation, so it does not count toward
