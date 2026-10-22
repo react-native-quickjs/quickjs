@@ -8099,6 +8099,16 @@ static int emit_typed_unary(
          (RD_OFF8). `i = i +/- k` with the int32 overflow deopt -- the inc path with
          a constant instead of 1. This is add_imm_self_branch without the jump. */
       int32_t k = (int32_t)(int8_t)(in->narg > 1 ? (in->arg[1].val & 0xff) : 1);
+      if (t->lb[d] == E_LB_F64 && (t->lb[a] == E_LB_F64 || t->lb[a] == E_LB_I32)) {
+        /* A double result needs no exit: the sum of a number and a small constant. */
+        e_local_name(dn, sizeof(dn), d);
+        e_local_name(an, sizeof(an), a);
+        fprintf(
+            f, "    %s = %s%s + (double)%d;\n", dn, t->lb[a] == E_LB_I32 ? "(double)" : "", an,
+            in->rop == ROP_add_imm_self_s ? k : -k);
+        if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+        return 1;
+      }
       if (t->lb[d] != E_LB_I32) return 0;
       e_local_name(dn, sizeof(dn), d);
       e_local_name(an, sizeof(an), a);
