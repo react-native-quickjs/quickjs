@@ -4703,6 +4703,181 @@ static int emit_typed_construct(
   return 1;
 }
 
+/* ---- allocating ops without the step handler (card E16 batch B) -----------
+   `new_object`, `object_template`, `array_from`, `special_object` (`arguments` and the
+   family) and `apply_arguments` call the engine's own bodies for the op (patch 0317)
+   and take the owned result, instead of stepping the handler. Allocation is a
+   safepoint: the live TAG values and the window are in the frame first, the groups
+   are re-checked after, an exception leaves like a call's. A case the helper leaves to
+   the handler (import.meta, a reified `arguments`, a non-builtin `apply`) takes the
+   op-call wrapper. Framed bodies only. */
+static int emit_alloc_op(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  Q2ValueId dv;
+  int off, dreg, r, na = 0, handler_ok = 0;
+  const char *okc = "1";
+  int redef_mode = 0;
+  char call[256];
+
+  if (!have_types || t == NULL || g_e2_fl || cur == NULL) return 0;
+  if (e2_roles[in->rop] == NULL || e2_roles[in->rop]->control != E2_CF_NONE) return 0;
+  if (e2_must_exit(fn, in)) return 0;
+  if (in->ndef >= 1) {
+    dv = in->def[0];
+    off = dest_off(fn, in);
+  } else if (in->nredef >= 1 && in->redef_reg != NULL && in->redef_val != NULL) {
+    /* The decoder files some ops as a fallback that redefines the destination. */
+    /* The destination is the first operand's register; the redef list holds every
+       register the fallback may rewrite. */
+    int k2, dr;
+    if (in->narg < 1 || in->arg[0].kind != 'r') return 0;
+    dr = (int)in->arg[0].val / 16;
+    dv = Q2_NO_VALUE;
+    for (k2 = 0; k2 < in->nredef; k2++)
+      if (in->redef_reg[k2] == dr) dv = in->redef_val[k2];
+    if (dv == Q2_NO_VALUE) return 0;
+    off = dr * 16;
+    redef_mode = 1;
+  } else {
+    return 0;
+  }
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (off < 0) return 0;
+  dreg = off / 16;
+  if (dreg >= fn->nregs) return 0;
+  if (!redef_mode && t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64 && t->lb[dv] != E2_LB_BOOL && !e2_def_dead(in, dv))
+    return 0;
+  if (in->win_n > 0 || in->rop == ROP_apply_arguments) {
+    if ((unsigned)(in->win_reg + in->win_n) > (unsigned)fn->nregs) return 0;
+    na = in->win_n;
+  }
+  switch (in->rop) {
+    case ROP_new_object:
+      snprintf(call, sizeof(call), "(_o = JS_NewObject(ctx), JS_IsException(_o) ? -1 : 0)");
+      break;
+    case ROP_object_template:
+      if (in->narg < 2) return 0;
+      snprintf(call, sizeof(call), "qjs_aot_object_template(ctx, f, %d, &_o)", (int)in->arg[1].val);
+      break;
+    case ROP_array_from:
+      if (in->win_n < 0) return 0;
+      snprintf(call, sizeof(call), "qjs_aot_array_from(ctx, &AOT_REG(fr, %d), %d, &_o)",
+               in->win_reg * 16, in->win_n);
+      break;
+    case ROP_special_object:
+      if (in->narg < 2) return 0;
+      /* Negative control: "unmapped" builds the unmapped form for mapped arguments,
+         so a store through `arguments` no longer reaches the parameter. */
+      snprintf(call, sizeof(call), "qjs_aot_special_object(ctx, f, %d, &_o)",
+               (getenv("QJS_AOT_E2_ALLOC_CONTROL") != NULL && (int)in->arg[1].val == 1)
+                   ? 0 : (int)in->arg[1].val);
+      handler_ok = 1;
+      okc = "_rc == 0"; /* 1: a kind the handler keeps */
+      break;
+    case ROP_apply_arguments:
+      if (in->win_n < 3) return 0;
+      snprintf(call, sizeof(call), "qjs_aot_apply_arguments(ctx, f, &AOT_REG(fr, %d), &_o)",
+               in->win_reg * 16);
+      handler_ok = 1;
+      okc = "_rc > 0"; /* 0: not the builtin apply, or a reified arguments object */
+      break;
+    default:
+      return 0;
+  }
+
+  /* ---- output ---- */
+  fprintf(f, "    /* R6: sync live TAG values before the allocation */\n");
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] != E2_LB_TAG) continue;
+    fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", r * 16, (unsigned)v);
+  }
+  /* Typed values the op may read (its window) or that the reload below takes from the
+     frame (the registers a fallback-shaped op redefines) are boxed into the frame. */
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v;
+    int need = r >= in->win_reg && r < in->win_reg + na;
+    int k2;
+    for (k2 = 0; k2 < in->nredef; k2++)
+      if (in->redef_reg != NULL && in->redef_reg[k2] == r) need = 1;
+    if (!need) continue;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", r * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", r * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", r * 16, (unsigned)v);
+  }
+  fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
+  fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n");
+  fprintf(f, "      if (%s) {\n", okc);
+  fprintf(
+      f,
+      "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+      "        else AOT_SET_B(ctx, fr, %d, _o);\n",
+      off, off);
+  e2_emit_group_recheck(f, fn, in, cur);
+  if (redef_mode) {
+    /* every register the op redefines becomes a TAG local again from the frame */
+    int k2;
+    for (k2 = 0; k2 < in->nredef; k2++) {
+      Q2ValueId rv2 = in->redef_val[k2];
+      int rr = in->redef_reg[k2];
+      if (rv2 == Q2_NO_VALUE || rv2 >= (Q2ValueId)t->nvalues || rr < 0 || rr >= fn->nregs ||
+          t->lb[rv2] != E2_LB_TAG)
+        continue;
+      fprintf(f, "        v%u = AOT_REG(fr, %d);\n", (unsigned)rv2, rr * 16);
+    }
+  } else if (t->lb[dv] == E2_LB_TAG) {
+    fprintf(f, "        v%u = _o;\n", (unsigned)dv);
+  } else if (e2_def_dead(in, dv)) {
+    /* nothing reads it */
+  } else if (t->lb[dv] == E2_LB_I32) {
+    e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    e2_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) goto dx_%d;\n"
+        "        i%u = JS_VALUE_GET_INT(_o);\n",
+        in->next, (unsigned)dv);
+  } else if (t->lb[dv] == E2_LB_BOOL) {
+    e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    e2_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) goto dx_%d;\n"
+        "        b%u = JS_VALUE_GET_BOOL(_o);\n",
+        in->next, (unsigned)dv);
+  } else {
+    e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+    e2_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_o);\n"
+        "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_o);\n"
+        "        else goto dx_%d;\n",
+        (unsigned)dv, (unsigned)dv, in->next);
+  }
+  fprintf(f, "        goto cd_%d;\n      }\n    }\n", in->pc);
+  if (handler_ok) {
+    /* the handler takes the case the helper declined */
+    g_e2_presynced = 1;
+    if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+      fprintf(stderr, "e2: alloc op at pc %d: the wrapper declined after output\n", in->pc);
+      abort();
+    }
+    g_e2_presynced = 0;
+  }
+  fprintf(f, "    cd_%d: ;\n", in->pc);
+  cur[dreg] = dv;
+  return 1;
+}
+
 /* A SPECULATIVE-BODY CALL, mirroring `emit_native_call` + `emit_one_direct_call`:
    same eligibility, same call sequence, and the result taken with
    `qjs_aot_set_reg_p` because `aot_n_` hands back an OWNED reference.
@@ -7310,6 +7485,14 @@ static int e2_dispatch_rop(
       return emit_typed_call(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_construct:
       return emit_typed_construct(f, fn, in, t, cur, have_types, hex, fi, b);
+
+    /* -- allocation without the step handler -- */
+    case ROP_new_object:
+    case ROP_object_template:
+    case ROP_array_from:
+    case ROP_special_object:
+    case ROP_apply_arguments:
+      return emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- this, and strict equality as a value -- */
     case ROP_load_this:
