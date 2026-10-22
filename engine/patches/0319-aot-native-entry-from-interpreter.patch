@@ -1,0 +1,192 @@
+Subject: An interpreted caller enters a compiled callee through its native entry
+
+What this does
+  The unit's table gains a native-entry pointer per function (`nfn`, NULL when the
+  function has none), bound into the bytecode as `aot_nfn`. The interpreter's
+  `call` and `call_method` handlers send a compiled callee to `qjs_aot_call_light`
+  when it is light OR has a native entry; there, a callee with a native entry is called
+  through it after the caller's frame is sealed, instead of building a light frame
+  and entering the unit's frame-taking entry. The helper is inlined into the two
+  handlers so its 16-byte result is not read back through memory it was just written
+  to as two words (a store-forwarding stall that was half of the handler's time).
+  QJS_AOT_ABI is bumped (the table entry changed size).
+
+Why we need it
+  An interpreted caller of a compiled function paid for a frame the compiled body
+  never needed (frameless callees forward straight to their native entry), and a
+  closure-reading function, which the engine does not call light, took the
+  generic call path.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1547,7 +1547,7 @@
+ /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
+    engine refuses a generated unit built against another version. */
+ #ifndef QJS_AOT_ABI
+-#define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
++#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
+ #endif
+ 
+ /* The layout facts the generated unit is compiled against. The struct and its
+@@ -1818,6 +1818,8 @@
+        once by js_aot_bind() when the bytecode is final. A bound function is not
+        regvm_record_eligible. */
+     void *aot_fn;
++    /* The unit's native entry for this function (JSAotNFn), or NULL. */
++    void *aot_nfn;
+     uint32_t aot_index;
+     /* The per-site polymorphic property cache a specialised body fills: four
+        entries of (shape, offset, kind) per site, allocated on demand and freed
+@@ -27660,6 +27662,11 @@
+    this one, as a compiled caller's call does, and returns its value here. A
+    callee that cannot be entered that way, or a nearly exhausted C stack, takes
+    the slow call, which raises the proper error. */
++static __attribute__((always_inline)) inline int
++aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
++                    JSValue callee, JSValue this_obj, JSValue *argv,
++                    JSValue *out);
++
+ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_aot(REGVM_ARGS)
+ {
+     int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
+@@ -27669,7 +27676,7 @@
+     REGVM_CAPTURE_IP();
+     if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
+         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+-    r = qjs_aot_call_light(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
++    r = aot_call_light_impl(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
+     if (r == 0)
+         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+     if (r < 0)
+@@ -27687,7 +27694,7 @@
+     REGVM_CAPTURE_IP();
+     if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
+         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+-    r = qjs_aot_call_light(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
++    r = aot_call_light_impl(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
+     if (r == 0)
+         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+     if (r < 0)
+@@ -27735,7 +27742,7 @@
+                 }
+             }
+ #if QJS_AOT
+-            if (cb->aot_fn != NULL && cb->aot_light)
++            if (cb->aot_fn != NULL && (cb->aot_light || cb->aot_nfn != NULL))
+                 __attribute__((musttail)) return regvm_t_call_aot(REGVM_PASS);
+ #endif
+             /* A light callee's header carries `ret_ip`, which locates the
+@@ -27790,7 +27797,7 @@
+                 }
+             }
+ #if QJS_AOT
+-            if (cb->aot_fn != NULL && cb->aot_light)
++            if (cb->aot_fn != NULL && (cb->aot_light || cb->aot_nfn != NULL))
+                 __attribute__((musttail))
+                     return regvm_t_call_method_aot(REGVM_PASS);
+ #endif
+@@ -61966,6 +61973,7 @@
+     if (b->aot_index == UINT32_MAX)
+         return;
+     b->aot_fn = NULL;
++    b->aot_nfn = NULL;
+     b->regvm_call_ready = b->aot_call_ready;
+     b->regvm_light = b->aot_light;
+     /* A light frame carries the PIC pointer, so the light path is only open
+@@ -62084,6 +62092,7 @@
+     uint32_t lo, hi;
+ 
+     b->aot_fn = NULL;
++    b->aot_nfn = NULL;
+     b->aot_index = UINT32_MAX;
+     b->aot_state = 2;           /* known-absent until a match is found */
+     if (!aot_unit_present())
+@@ -62105,6 +62114,7 @@
+             }
+ #endif
+             b->aot_fn = (void *)qjs_aot_table[mid].fn;
++            b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
+             b->aot_index = mid;
+             b->aot_state = 1;   /* bound */
+             /* Allocate the polymorphic cache now, so filling a site from
+@@ -62979,9 +62989,10 @@
+ 
+    Returns 1 with an owned *out, 0 when the callee is not one this can enter
+    (the caller then takes the generic path), -1 on exception. */
+-int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
+-                        JSValue callee, JSValue this_obj, JSValue *argv,
+-                        JSValue *out)
++static __attribute__((always_inline)) inline int
++aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
++                    JSValue callee, JSValue this_obj, JSValue *argv,
++                    JSValue *out)
+ {
+     JSRuntime *rt = ctx->rt;
+     JSObject *co;
+@@ -62999,12 +63010,27 @@
+     /* The bind block clears `regvm_light`/`regvm_light_fast` on a bound
+        function, so the saved eligibility is the test. The frame shape and size
+        it implies are kept either way. */
+-    if (cb->aot_fn == NULL || !cb->aot_light)
++    if (cb->aot_fn == NULL || !(cb->aot_light || cb->aot_nfn != NULL))
+         return 0;
+     if (cb->func_kind != JS_FUNC_NORMAL || na < cb->arg_count)
+         return 0;
+     if (unlikely(js_poll_interrupts(ctx)))
+         return -1;
++    if (cb->aot_nfn != NULL) {
++        /* The unit's native entry builds whatever frame it needs itself; the
++           caller's frame is sealed first so anything the callee takes from the
++           arena lands above it. */
++        if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
++            && regvm_pic_ensure(rt, cb) == NULL) {
++            JS_ThrowOutOfMemory(ctx);
++            return -1;
++        }
++        if (caller_f != NULL)
++            regvm_light_seal(rt, caller_f);
++        ret = ((JSAotNFn)cb->aot_nfn)(ctx, caller_f, co, this_obj, argv, na);
++        *out = ret;
++        return JS_IsException(ret) ? -1 : 1;
++    }
+     /* The callee's inline-cached handlers read their PIC base with no NULL
+        test, so the table must exist before the frame is published. */
+     if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+@@ -63044,6 +63070,13 @@
+     return JS_IsException(ret) ? -1 : 1;
+ }
+ 
++int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
++                        JSValue callee, JSValue this_obj, JSValue *argv,
++                        JSValue *out)
++{
++    return aot_call_light_impl(ctx, caller_f, na, callee, this_obj, argv, out);
++}
++
+ /* Allocate the callee's property-cache table if it has none, so a generated
+    native entry can publish a frame whose inline handlers read the table with no
+    NULL test. The engine's own light call checks this before it fills the frame;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -29,7 +29,7 @@
+ #endif
+ 
+ #ifndef QJS_AOT_ABI
+-#define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
++#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
+ #endif
+ 
+ /* The engine's object layouts the generated code reads at constant offsets.
+@@ -197,9 +197,12 @@
+    by `digest`. */
+ typedef JSValue (*JSAotFn)(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                            uint32_t entry_pc);
++typedef JSValue (*JSAotNFn)(JSContext *ctx, JSRegRun *caller_f, JSObject *co,
++                            JSValue this_obj, JSValue *argv, int argc);
+ typedef struct JSAotEntry {
+     uint8_t digest[16];
+     JSAotFn fn;
++    JSAotNFn nfn;        /* the native entry, or NULL: a caller enters here without a frame */
+     uint32_t flags;
+     uint32_t code_crc;   /* IRVERIFY: hash of the register program */
+ } JSAotEntry;
