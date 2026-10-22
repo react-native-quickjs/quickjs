@@ -1268,7 +1268,11 @@
     },
     {
       "name": "0322-aot-error-stack.patch",
-      "sha256": "7263d4aec4e3031b7b01b5841429dde319d1d0d210b3259c382eaab39d73bf6f"
+      "sha256": "249643506f6e2367aedd34a8f1877d171678410f6e04b4ad5ddefc36a25dfe27"
+    },
+    {
+      "name": "0324-aot-frameless-records.patch",
+      "sha256": "8cee5b0575704ff0028c6b9dac1fa8526e263da6338ea0776711eb5f1ea323ee"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1276,7 +1280,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "884f3b6712478126325024023a99cc7a102e04610aac364b2c07fcab25ddb76c",
+    "quickjs.c": "7857bffb4ed1c078905387330741a3e82c256dca6a3ecf3bb548bebd3f9127df",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

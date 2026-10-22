@@ -4,6 +4,8 @@ What this does
   - `qjs_aot_throw_here(ctx, f, pc)` builds an error's stack in a compiled frame that has
     no handler, where the exception otherwise leaves with no stack (the interpreter builds
     it at the throw, in the innermost frame).
+  - `qjs_aot_step` records the instruction it steps as the frame's position, so a frame
+    whose call is stepped (a function with a handler) names the call in a backtrace.
   - The compiled-code build keys a function's line table by register offset, as the plain
     build does; before, a register offset was looked up in the stack program's table and
     named another statement.
@@ -66,7 +68,17 @@ Why we need it
                      atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                      dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
                      JS_FreeCString(ctx, atom_str);
-@@ -62880,6 +62896,24 @@
+@@ -62143,6 +62159,9 @@
+ /* ABI entry points for the generated unit. */
+ QJS_AOT_STUB uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx)
+ {
++    /* The instruction being stepped names this frame's position in a backtrace of
++       whatever it calls. */
++    f->cap_ip = ip;
+     return regvm_step(ip, fr, f, ctx);
+ }
+ 
+@@ -62880,6 +62899,24 @@
      return JS_EXCEPTION;
  }
  
@@ -91,7 +103,7 @@ Why we need it
  /* Forward: the C-entered finish path, defined with the direct-call helpers. */
  static JSValue regvm_aot_run_to_end(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                      uint32_t pc);
-@@ -74296,10 +74330,10 @@
+@@ -74181,10 +74218,10 @@
      if (!b->pc2line_buf)
          b->pc2line_buf = fd->pc2line.buf;
      b->pc2line_len = fd->pc2line.size;
@@ -108,7 +120,7 @@ Why we need it
  #endif
 --- a/quickjs-aot-rt.h
 +++ b/quickjs-aot-rt.h
-@@ -354,6 +354,10 @@
+@@ -349,6 +349,10 @@
  int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
  int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
  int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);

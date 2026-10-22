@@ -1,0 +1,200 @@
+Subject: Keep an activation record for frameless functions that call, and merge it into backtraces
+
+What this does
+  - `JSAotFlRec` (prev, func, pc) is the record a compiled function with no frame leaves
+    on `rt->aot_fl_top` while it runs. Records live on the C stack and link innermost-first.
+  - A backtrace merges the records with the interpreter's frames by C-stack address, so an
+    error created below a frameless function names it, with the line of the call in progress.
+    The merge assumes one downward-growing C stack per runtime (a runtime is used on one
+    thread at a time); a debug build asserts that every record is on the C stack.
+  - The unit layout carries the offset of `aot_fl_top`.
+
+Why we need it
+  A frameless function that calls another compiled function (a recursive one, say) has no
+  JSRegRun, so its frame was missing from the stack text of an error the callee throws.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -739,6 +739,8 @@
+        the whole unit runs interpreted. Everything the unit reads an offset of
+        must therefore precede every `#if` in this struct. */
+     struct JSRegRun *regvm_cur;
++    /* The innermost frameless activation record (see JSAotFlRec). */
++    struct JSAotFlRec *aot_fl_top;
+ 
+ #if QJS_AOT
+     /* AOT call-site bindings, indexed by the unit's site id. Lazily grown. */
+@@ -991,6 +993,9 @@
+ #if QJS_REGVM
+ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque);
+ #endif
++#if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
++static void regvm_fl_roots(JSRuntime *rt, JSRegRootFn fn, void *opaque);
++#endif
+ 
+ static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
+                                       void *opaque)
+@@ -1000,6 +1005,9 @@
+ #if QJS_REGVM
+     regvm_light_walk(regvm_light_head(rt->regvm_cur), fn, opaque);
+ #endif
++#if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
++    regvm_fl_roots(rt, fn, opaque);
++#endif
+     for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+         if (sf->rv_regs && sf->rv_nregs)
+             fn(opaque, sf->rv_regs, sf->rv_nregs);
+@@ -11927,6 +11935,11 @@
+ 
+ #if !QJS_REGVM
+ /* The stack-only build has no light frames: just the JSStackFrame chain. */
++/* The logical stack for a backtrace, innermost first. The chain at
++   `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
++   light chain saved below it in `rv_light`. Only the innermost frame uses its
++   captured `cap_ip`; every outer frame is located by its callee's `ret_ip`,
++   its call site. */
+ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
+ {
+     int nb = 0;
+@@ -26076,16 +26089,73 @@
+ }
+ #endif
+ 
+-/* The logical stack for a backtrace, innermost first. The chain at
+-   `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
+-   light chain saved below it in `rv_light`. Only the innermost frame uses its
+-   captured `cap_ip`; every outer frame is located by its callee's `ret_ip`,
+-   its call site. */
++#if (QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE) && (QJS_DRC || QJS_DRC_VALIDATE)
++/* The argument windows frameless functions publish through their activation records. */
++static void regvm_fl_roots(JSRuntime *rt, JSRegRootFn fn, void *opaque)
++{
++    JSAotFlRec *r;
++
++    for (r = rt->aot_fl_top; r != NULL; r = r->prev)
++        if (r->nroots)
++            fn(opaque, r->roots, r->nroots);
++}
++#endif
++
++/* Whether `a` lies in the C stack the runtime is running on (the stack top was
++   recorded at the runtime's creation; the arena and the heap are elsewhere). */
++static inline int regvm_on_c_stack(JSRuntime *rt, uintptr_t a)
++{
++    return a < rt->stack_top && rt->stack_top - a < ((uintptr_t)1 << 28);
++}
++
++#if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
++/* Put the activation records of frameless functions (JSAotFlRec) into a backtrace.
++   Light frames, entry frames and the records all sit on the C stack, so their
++   addresses order them; a frame in the arena takes the address of the next outer
++   frame on the C stack, which is its run's entry frame. The order assumes one C
++   stack, growing down, per runtime: a runtime is used on one thread at a time. */
++static int regvm_merge_fl_records(JSRuntime *rt, JSRegBtFrame *bt, uintptr_t *anc,
++                                  int nb, int max)
++{
++    JSRegBtFrame tmp[130];
++    JSAotFlRec *r = rt->aot_fl_top;
++    uintptr_t next = UINTPTR_MAX;
++    int i, n = 0;
++
++    for (i = nb - 1; i >= 0; i--) {
++        if (anc[i])
++            next = anc[i];
++        else
++            anc[i] = next;
++    }
++    i = 0;
++    while (n < max && n < 128) {
++        if (r != NULL && (i >= nb || (uintptr_t)r < anc[i])) {
++            tmp[n].func = JS_MKPTR(JS_TAG_OBJECT, r->func);
++            tmp[n].cur_pc = NULL;
++            tmp[n].rpc = (int)r->pc;
++            tmp[n].sf = NULL;
++            n++;
++            assert(regvm_on_c_stack(rt, (uintptr_t)r));
++            r = r->prev;
++        } else if (i < nb) {
++            tmp[n++] = bt[i++];
++        } else {
++            break;
++        }
++    }
++    memcpy(bt, tmp, sizeof(*bt) * (size_t)n);
++    return n;
++}
++#endif
++
+ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
+ {
+     JSRegDebugIter it;
+     JSRegDebugFrame fr;
+     int nb = 0;
++    /* The C-stack address of each frame, 0 for one that lives in the arena. */
++    uintptr_t anc[128];
+ 
+     regvm_debug_iter_init(rt, &it);
+     while (nb < max && regvm_debug_iter_next(&it, &fr)) {
+@@ -26099,6 +26169,7 @@
+             if (bt[nb].rpc < 0)
+                 bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+             bt[nb].sf = NULL;
++            anc[nb] = (uintptr_t)lf;
+         } else {
+             JSStackFrame *sf = fr.sf;
+             JSFunctionBytecode *fb = NULL;
+@@ -26115,9 +26186,14 @@
+             if (bt[nb].rpc < 0 && fb)
+                 bt[nb].rpc = regvm_frame_pc(rt, sf, fb);
+             bt[nb].sf = sf;
++            anc[nb] = regvm_on_c_stack(rt, (uintptr_t)sf) ? (uintptr_t)sf : 0;
+         }
+         nb++;
+     }
++#if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
++    if (rt->aot_fl_top != NULL)
++        nb = regvm_merge_fl_records(rt, bt, anc, nb, max);
++#endif
+     return nb;
+ }
+ 
+@@ -60667,6 +60743,7 @@
+     out->off_fnbc_realm = (uint32_t)offsetof(JSFunctionBytecode, realm);
+     out->off_rt_regvm_cur = (uint32_t)offsetof(JSRuntime, regvm_cur);
+     out->off_rt_stack_limit = (uint32_t)offsetof(JSRuntime, stack_limit);
++    out->off_rt_fl_top = (uint32_t)offsetof(JSRuntime, aot_fl_top);
+     out->off_object_func_var_refs = (uint32_t)offsetof(JSObject, u.func.var_refs);
+     out->light_prefix_slots = REGVM_LIGHT_PREFIX_SLOTS;
+     out->regvm_flag_light = REGVM_FLAG_LIGHT;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -38,6 +38,20 @@
+    runtime re-derives the hash at bind. A layout change therefore invalidates an
+    old unit instead of corrupting it. All fields are uint32 so the hash is a
+    well-defined word fold, and it covers every field after `hash` itself. */
++/* The activation record a frameless function that makes calls leaves on `rt->aot_fl_top`
++   while it runs. Such a function has no JSRegRun, so without this its frame would be
++   missing from the backtrace of an error a callee creates. `pc` is the bytecode offset
++   of the call in progress. `roots` and `nroots` publish the argument window of the call in
++   progress as a root range, because the function has no register file the collector
++   scans. Records live on the C stack and are linked innermost-first. */
++typedef struct JSAotFlRec {
++    struct JSAotFlRec *prev;
++    JSObject *func;
++    uint32_t pc;
++    uint32_t nroots;
++    JSValue *roots;
++} JSAotFlRec;
++
+ typedef struct JSAotGenLayout {
+     uint32_t hash;
+     uint32_t sizeof_JSObject, sizeof_JSShape, sizeof_JSProperty, sizeof_JSString;
+@@ -119,7 +133,7 @@
+     uint32_t off_regrun_ret_ip, off_regrun_fr, off_regrun_var_refs;
+     uint32_t off_regrun_hdr_pack, off_regrun_cap_ip;
+     uint32_t off_fnbc_realm;
+-    uint32_t off_rt_regvm_cur, off_rt_stack_limit;
++    uint32_t off_rt_regvm_cur, off_rt_stack_limit, off_rt_fl_top;
+     uint32_t off_object_func_var_refs;
+     uint32_t light_prefix_slots;
+     /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
