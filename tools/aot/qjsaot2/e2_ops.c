@@ -6507,7 +6507,13 @@ static int emit_typed_bitwise(
     if (t->lb[b] == E2_LB_F64) snprintf(bn, sizeof(bn), "q2_toi32(d%u)", (unsigned)b);
     else snprintf(bn, sizeof(bn), "i%u", (unsigned)b);
     ld = fn->values[d].reg;
-    if (op != NULL)
+    if (in->rop == ROP_shl)
+      fprintf(
+          f, "    i%u = (int32_t)((uint32_t)%s << ((uint32_t)%s & 31));\n",
+          (unsigned)d, an, bn);
+    else if (in->rop == ROP_sar)
+      fprintf(f, "    i%u = %s >> ((uint32_t)%s & 31);\n", (unsigned)d, an, bn);
+    else if (op != NULL)
       fprintf(f, "    i%u = %s %s %s;\n", (unsigned)d, an, op, bn);
     else
       fprintf(
