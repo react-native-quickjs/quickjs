@@ -2029,12 +2029,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(uint8_t **)((unsigned char *)q2_b(f) +\n"
         "                       QJS_AOT_OFF_FNBC_REGVM_CODE);\n"
         "}\n\n"
-        /* The A/B switch: with a specialised body in place, setting this
-           environment variable runs every function through the generic one. */
-        /* An exit burst this long means the specialised body is mispredicting
-           more than it wins, so it hands the function back to the generic
-           body. */
-        "#define Q2_SPEC_FAIL_MAX 64\n"
         /* The A/B switch, and the enable switch for the specialised body. The
            specialised body is the default; QJS_AOT_SPEC=0 runs every function
            through the generic one for comparison. Its polymorphic compare
@@ -2550,32 +2544,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *out = E2_BOX_F64(r);\n"
         "  return 1;\n"
         "}\n\n"
-        /* A numeric element read: the profile saw only ints (or only doubles)
-           at this pc, so a class check, a bounds check and the load are enough;
-           a hole cannot be there or the profile would say so. */
-        "static inline __attribute__((always_inline)) int q2_elem_num(JSValue "
-        "arr, JSValue k, JSValue *out)\n"
-        "{\n"
-        "  const unsigned char *p;\n"
-        "  uint32_t i;\n"
-        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) return 0;\n"
-        "  if (JS_VALUE_GET_TAG(k) != JS_TAG_INT) return 0;\n"
-        "  p = (const unsigned char *)JS_VALUE_GET_PTR(arr);\n"
-        "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
-        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
-        "      QJS_AOT_CLASS_ARRAY)\n"
-        "    return 0;\n"
-        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
-        "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
-        "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
-        "return 0;\n"
-        "  *out = (*(JSValue *const *)(p + "
-        "QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
-        "  if (JS_VALUE_GET_TAG(*out) != JS_TAG_INT &&\n"
-        "      JS_VALUE_GET_TAG(*out) != JS_TAG_FLOAT64)\n"
-        "    return 0;\n"
-        "  return 1;\n"
-        "}\n\n"
         /* A site's polymorphic cache: four (shape, offset, kind) entries the
            compiled body fills on demand; NULL until the function has used the
            site. */
@@ -2624,12 +2592,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W) "
         "return NULL;\n"
         "  return *(const void *const *)e;\n"
-        "}\n\n"
-        "static inline int q2_cell_kind(const void *pic, int k)\n"
-        "{\n"
-        "  if (pic == NULL || (unsigned)k == QJS_AOT_REG_IC_NONE) return -1;\n"
-        "  return *(const uint16_t *)((const unsigned char *)pic + (size_t)k "
-        "* QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_KIND);\n"
         "}\n\n"
         "static inline const void *q2_cell_wshape(const void *pic, int k)\n"
         "{\n"
@@ -2895,11 +2857,6 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(
         f,
         "static int q2_force_miss_cache = -1;\n"
-        "static inline __attribute__((always_inline)) int q2_env1(const char *n)\n"
-        "{\n"
-        "  const char *v = getenv(n);\n"
-        "  return v != NULL && v[0] == '1';\n"
-        "}\n"
         "#define q2_force_miss q2_force_miss_cache\n"
         "#define Q2_FORCE_MISS (q2_force_miss > 0)\n"
         /* QJS_AOT_E2_SPEC_FNS="<lo>-<hi>" allows the spec body only for function
@@ -3178,37 +3135,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == "
         "entry;\n"
         "}\n\n");
-    /* A direct call to a leaf compiled into this unit: the callee must be the
-       bytecode function whose bound entry is `entry`, which only a function
-       with that digest can be. Its caches are the leaf's. */
-    fprintf(
-        f,
-        "static inline __attribute__((always_inline)) int "
-        "q2_leaf_callee(JSValue fnv, const void *entry,\n"
-        "                                 const void **pic, void *const "
-        "**holders)\n"
-        "{\n"
-        "  const unsigned char *o, *b;\n"
-        "\n"
-        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) {\n"
-        "    return 0;\n"
-        "  }\n"
-        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
-        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
-        "      QJS_AOT_CLASS_BYTECODE_FUNCTION) {\n"
-        "    return 0;\n"
-        "  }\n"
-        "  b = *(const unsigned char *const *)(o + "
-        "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
-        "  if (*(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) != entry) "
-        "{\n"
-        "    return 0;\n"
-        "  }\n"
-        "  *pic = *(const void *const *)(b + QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
-        "  *holders = *(void *const *const *)(b + "
-        "QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER);\n"
-        "  return 1;\n"
-        "}\n\n");
     /* The inline unary fast path for neg and inc: an int whose result stays an
        int, or a float64. Anything else (-0, an overflow, a coercion) returns 0
        and the caller takes the engine's unary. */
@@ -3408,33 +3334,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "!= b;\n"
         "  default: return -1;\n"
         "  }\n"
-        "}\n\n"
-        "static inline __attribute__((always_inline)) int q2_branch_cmp(int "
-        "sub, JSValue a, JSValue b, int *take)\n"
-        "{\n"
-        "  int r;\n"
-        "  if (__builtin_expect((unsigned)(sub - QJS_AOT_REG_BIN_IS_UNDEF) < "
-        "2, 0)) {\n"
-        "    *take = (JS_VALUE_GET_TAG(a) == JS_TAG_UNDEFINED) ==\n"
-        "            (sub == QJS_AOT_REG_BIN_IS_UNDEF);\n"
-        "    return 1;\n"
-        "  }\n"
-        "  if (JS_VALUE_IS_BOTH_INT(a, b) &&\n"
-        "      (r = q2_cmp_int(sub & ~QJS_AOT_REG_CMP_INVERT,\n"
-        "                      JS_VALUE_GET_INT(a), JS_VALUE_GET_INT(b))) >= "
-        "0) {\n"
-        "    *take = r ^ ((sub & QJS_AOT_REG_CMP_INVERT) != 0);\n"
-        "    return 1;\n"
-        "  }\n"
-        "  if (JS_VALUE_GET_TAG(a) == JS_TAG_FLOAT64 &&\n"
-        "      JS_VALUE_GET_TAG(b) == JS_TAG_FLOAT64 &&\n"
-        "      (r = q2_cmp_double(sub & ~QJS_AOT_REG_CMP_INVERT,\n"
-        "                         JS_VALUE_GET_FLOAT64(a),\n"
-        "                         JS_VALUE_GET_FLOAT64(b))) >= 0) {\n"
-        "    *take = r ^ ((sub & QJS_AOT_REG_CMP_INVERT) != 0);\n"
-        "    return 1;\n"
-        "  }\n"
-        "  return 0;\n"
         "}\n\n");
 
     /* Forward declarations, so a compiled body can name a callee that is
