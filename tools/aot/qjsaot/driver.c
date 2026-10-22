@@ -2874,6 +2874,11 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static int q2_force_miss_cache = -1;\n"
         "#define q2_force_miss q2_force_miss_cache\n"
         "#define Q2_FORCE_MISS (q2_force_miss > 0)\n"
+        "static void __attribute__((constructor, unused)) q2_force_miss_init(void)\n"
+        "{\n"
+        "  const char *v = getenv(\"QJS_AOT_FORCE_MISS\");\n"
+        "  q2_force_miss_cache = v != NULL && v[0] != 0 && v[0] != '0';\n"
+        "}\n"
         /* QJS_AOT_SPEC_FNS="<lo>-<hi>" allows the spec body only for function
            indices in that range, so a miscompile can be pinned to ONE function by
            halving the range. A run-time test, so a stale unit cannot fake it. */
