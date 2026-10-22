@@ -83,15 +83,15 @@ static int q2_is_load(int op) {
 
 int q2_def_from_record(const Q2Insn *in) {
   return q2_is_load(in->op) || (in->op == Q2_OP_FALLBACK && in->ndef > 0) ||
-         in->rop == ROP_neg || in->rop == ROP_inc;
+         in->rop == ROP_neg || in->rop == ROP_inc || in->rop == ROP_dec;
 }
 
-/* The profiler writes no record for `inc`, so its representation follows its
+/* The profiler writes no record for `inc` or `dec`, so its representation follows its
    operand instead: an int stays an int (the lowering exits on overflow) and a
    double stays a double. Only when there is no record; a record still
    speculates. */
 int q2_inc_by_operand(const Q2Func *fn, const Q2Insn *in) {
-  return in->rop == ROP_inc && in->ndef == 1 && in->nuse >= 1 &&
+  return (in->rop == ROP_inc || in->rop == ROP_dec) && in->ndef == 1 && in->nuse >= 1 &&
          !fn->values[in->def[0]].has_prof;
 }
 

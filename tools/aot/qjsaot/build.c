@@ -83,6 +83,8 @@ static int q2_rop_sub(uint16_t rop, const Q2Insn *in) {
       return REG_UN_NEG;
     case ROP_inc:
       return REG_UN_INC;
+    case ROP_dec:
+      return REG_UN_DEC;
     case ROP_add:
       return REG_BIN_ADD;
     case ROP_sub:
@@ -2263,6 +2265,7 @@ int q2_lowered(uint16_t rop) {
     case ROP_get_global:
     case ROP_neg:
     case ROP_inc:
+    case ROP_dec:
     case ROP_inc_branch_lt:
     case ROP_inc_branch_lt_s:
     case ROP_add_imm_self_branch:
