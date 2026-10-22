@@ -38065,6 +38065,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
     b = p->u.func.function_bytecode;
 
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+    /* A compiled function called from C (a builtin's callback, JS_Call): its unit's native
+       entry builds the light frame on the C stack, so the call needs neither a stack frame
+       nor the interpreter's activation. The arguments are used in place, which the
+       callee only does when it never writes them. */
+    if (b->aot_nfn != NULL && flags == JS_CALL_FLAG_COPY_ARGV && b->argv_safe &&
+        !b->args_captured && argc >= b->arg_count && b->func_kind == JS_FUNC_NORMAL &&
+        !b->is_lazy && JS_IsUndefined(new_target)) {
+        JSAotRun *ar = rt->aot_run;
+
+        if (likely(ar == NULL || ar->disabled == NULL ||
+                   !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))
+            return ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
+                                          (JSValue *)argv, argc);
+    }
+#endif
+
     /* First call of a function whose body was left in the blob. Everything
        below reads byte_code_buf, cpool and vardefs, so this is the point where
        the deferral has to end. */

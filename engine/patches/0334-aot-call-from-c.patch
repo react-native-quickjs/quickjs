@@ -1,0 +1,46 @@
+Subject: Enter a compiled function called from C through its native entry
+
+What this does
+  - `JS_CallInternal` takes a function whose unit gave it a native entry (`aot_nfn`) straight
+    into that entry, before it builds a stack frame and the interpreter's activation. The
+    entry builds the callee's light frame on the C stack, as it does for a compiled caller.
+  - Only the cases the entry already serves from a compiled caller: a plain call (no
+    construct, no generator flags), `new.target` undefined, an ordinary function, fewer
+    declared parameters than arguments, no captured arguments, and a callee that never
+    writes its arguments (`argv_safe`), since a C caller's argv is used in place. A function
+    the unit has switched off takes the interpreter as before.
+
+Why we need it
+  A builtin calling back into compiled code (forEach, map, filter, reduce, sort comparators,
+  JS_Call) paid the full interpreter activation per call: JS_CallInternal plus
+  js_regvm_execute were 29 percent of a map loop, so compiled callbacks ran at 1.0x of the
+  interpreter. The caller frame passed is the innermost light frame (NULL under a C
+  function, whose stack frame holds the saved chain), the same record a light call from the
+  interpreter leaves.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38065,6 +38065,23 @@
+     }
+     b = p->u.func.function_bytecode;
+ 
++#if QJS_AOT && QJS_REGVM && QJS_DRC
++    /* A compiled function called from C (a builtin's callback, JS_Call): its unit's native
++       entry builds the light frame on the C stack, so the call needs neither a stack frame
++       nor the interpreter's activation. The arguments are used in place, which the
++       callee only does when it never writes them. */
++    if (b->aot_nfn != NULL && flags == JS_CALL_FLAG_COPY_ARGV && b->argv_safe &&
++        !b->args_captured && argc >= b->arg_count && b->func_kind == JS_FUNC_NORMAL &&
++        !b->is_lazy && JS_IsUndefined(new_target)) {
++        JSAotRun *ar = rt->aot_run;
++
++        if (likely(ar == NULL || ar->disabled == NULL ||
++                   !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))
++            return ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
++                                          (JSValue *)argv, argc);
++    }
++#endif
++
+     /* First call of a function whose body was left in the blob. Everything
+        below reads byte_code_buf, cpool and vardefs, so this is the point where
+        the deferral has to end. */

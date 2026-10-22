@@ -419,3 +419,4 @@ bump while `9999` is missing.
 | `0331` | Runs register arithmetic outside the typed forms without the step handler | A compiled string or mixed add went through the step handler to reach the same routine | `qjs_aot_binary_rr` | No. |
 | `0332` | Replays a cached add-transition store from compiled code before the frame is published | A constructor setting its fields published every live register on each property before reaching the same replay | `qjs_aot_put_add` | No. |
 | `0333` | Reads the next element of a built-in array iterator in place for compiled for-of | A compiled for-of republished every live register and went four calls deep per element | `qjs_aot_iter_next` | No. |
+| `0334` | Enters a compiled function called from C through its native entry | A builtin calling a compiled callback paid the interpreter activation per call | `JS_CallInternal` fast head | No. |
