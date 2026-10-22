@@ -62795,6 +62795,25 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
     return 1;
 }
 
+/* `a <sub> b` on two registers, for the cases the inline arithmetic does not take (a string,
+   an object, a mixed pair). 1 with an owned *out, 2 when `s += x` was appended in place
+   (the result is left in register `d`), -1 on exception. */
+QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue a,
+                                   JSValue b, int d, int ra, JSValue *out)
+{
+    if (regvm_num_fast(sub, a, b, out))
+        return 1;
+    if (sub == REG_BIN_ADD) {
+        int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b);
+
+        if (ar > 0)
+            return 2;
+        if (ar < 0)
+            return -1;
+    }
+    return js_regvm_binary(ctx, sub, a, b, out) ? -1 : 1;
+}
+
 JSValue *qjs_aot_arg_buf(JSRegRun *f)
 {
     return f->arg_buf;

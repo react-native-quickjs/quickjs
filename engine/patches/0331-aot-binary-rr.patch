@@ -1,0 +1,56 @@
+Subject: Run register arithmetic the typed forms did not take without the step handler
+
+What this does
+  - `qjs_aot_binary_rr` is `a <sub> b` on two registers for the cases the inline arithmetic
+    does not take (a string, an object, a mixed pair). It tries the number fast path, then the
+    in-place string append for `s += x`, then the engine's binary routine, as the interpreter's
+    handler does. It returns 2 when the append happened in place (the result is left in the
+    destination register).
+
+Why we need it
+  A compiled `'x' + n` or `a + b` on tagged operands went through the step handler, 9 percent
+  of the time in the string loops, to reach the same routine.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62795,6 +62795,25 @@
+     return 1;
+ }
+ 
++/* `a <sub> b` on two registers, for the cases the inline arithmetic does not take (a string,
++   an object, a mixed pair). 1 with an owned *out, 2 when `s += x` was appended in place
++   (the result is left in register `d`), -1 on exception. */
++QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue a,
++                                   JSValue b, int d, int ra, JSValue *out)
++{
++    if (regvm_num_fast(sub, a, b, out))
++        return 1;
++    if (sub == REG_BIN_ADD) {
++        int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b);
++
++        if (ar > 0)
++            return 2;
++        if (ar < 0)
++            return -1;
++    }
++    return js_regvm_binary(ctx, sub, a, b, out) ? -1 : 1;
++}
++
+ JSValue *qjs_aot_arg_buf(JSRegRun *f)
+ {
+     return f->arg_buf;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -434,6 +434,12 @@
+                                       uint32_t idx, int kind, JSValue a,
+                                       int d, int ra, JSValue *out);
+ 
++/* `a <sub> b` on two registers (`d` the destination, `ra` the left operand's register
++   index). 1 with an owned *out, 2 when `s += x` appended in place (the result is left in
++   register `d`), -1 on exception. */
++QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue a,
++                                   JSValue b, int d, int ra, JSValue *out);
++
+ /* The frame's argument window: AOT_ARG(ab, slot). */
+ JSValue *qjs_aot_arg_buf(JSRegRun *f);
+ 
