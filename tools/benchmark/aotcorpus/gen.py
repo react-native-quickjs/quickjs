@@ -14,6 +14,7 @@ written from the list of language features and op shapes the compiler lowers.
 """
 import json
 import os
+import re as _re
 import sys
 
 PRE = """var N = %(n)d;
@@ -292,7 +293,7 @@ def fam_elems():
         "push": "a.push(i); if (a.length > 64) a.length = 0; s += a.length;",
         "pushpop": "a.push(i); s += a.pop();",
         "unshift": "a.unshift(i); if (a.length > 16) a.length = 4; s += a[0];",
-        "shift": "a.push(i, i + 1); s += a.shift();",
+        "shift": "a.push(i, i + 1); s += a.shift() + a.shift();",
         "splice": "a.splice(1, 0, i); if (a.length > 32) a.splice(0, 16); s += a.length;",
         "slice": "s += a.slice(2, 6).length + a.length;",
         "concat": "s += a.concat([i]).length;",
@@ -457,7 +458,7 @@ def fam_alloc():
                 code = ("function mk(d, v) { return d === 0 ? { v: v, l: null, r: null } : { v: v, l: mk(d - 1, v + 1), r: mk(d - 1, v + 2) }; }\n"
                         "function sum(t) { return t === null ? 0 : t.v + sum(t.l) + sum(t.r); }\n"
                         "function work(n) { var s = 0, i;\n  for (i = 0; i < n; i++) { s += sum(mk(%d, i)); mix(s); }\n  return s; }\nwork(N);\n") % (depth + 2)
-            add("alloc_%s_%d" % (form, depth), 40000 if form == "tree" else 60000, code)
+            add("alloc_%s_%d" % (form, depth), max(1000, 40000 >> max(0, depth - 3)) if form == "tree" else 60000, code)
 
 
 # ---- family 10: strings -----------------------------------------------------------
@@ -616,8 +617,8 @@ def fam_dispatch():
             classes = ""
             for c in range(nclass):
                 base = "A" if c else ""
-                classes += "class A%d%s { constructor(v) { this.v = v + %d; %s } m(x) { return x + this.v + %d; } t() { return 'c%d'; } valueOf() { return this.v + %d; } }\n" % (
-                    c, (" extends A%d" % (c - 1)) if c else "", c, "this.w%d = 1;" % c, c, c, c)
+                classes += "class A%d%s { constructor(v) { %sthis.v = v + %d; %s } m(x) { return x + this.v + %d; } t() { return 'c%d'; } valueOf() { return this.v + %d; } }\n" % (
+                    c, (" extends A%d" % (c - 1)) if c else "", "super(v); " if c else "", c, "this.w%d = 1;" % c, c, c, c)
             use = {"method": "s += o.m(i & 15);", "field": "s += o.v + (o.w0 | 0);",
                    "super": "s += o.m(i & 7) + o.t().length;", "tostring": "s += o.t().length;", "valueof": "s += +o;"}[form]
             body = classes + ("var os = []; for (var j = 0; j < 16; j++) os.push(new A%d(j));\n".replace("A%d", "A%d")) % 0
@@ -716,10 +717,10 @@ def fam_flip():
     for op in ["+", "-", "*", "&", "<", "===", "/"]:
         for fk, (a, b) in flips.items():
             body = ("function f(x, y) { return x %s y; }\nfunction work(n) { var s = 0, i;\n"
-                    "  for (i = 0; i < n; i++) { var x = i < n / 2 ? %s : %s; var r = f(x, 3); "
+                    "  for (i = 0; i < n; i++) { var x = i < T ? %s : %s; var r = f(x, 3); "
                     "if (typeof r === 'number') mixd(r); else if (typeof r === 'boolean') mix(r ? 1 : 0); else mixs(String(r)); }\n  return s; }\nwork(N);\n") % (
                         op, a, b)
-            add("flip_%s_%s" % (OPNAME[op], fk), 1000000, body)
+            add("flip_%s_%s" % (OPNAME[op], fk), 1000000, "var T = N / 2;\n" + body)
     for fk, (decl, early, late) in {
         "shape": ("function P(v) { this.a = v; }\nfunction Q(v) { this.b = 0; this.a = v; }\n", "new P(i)", "new Q(i)"),
         "proto": ("function P(v) { this.a = v; }\nP.prototype.m = function () { return this.a; };\nfunction Q(v) { this.a = v; }\nQ.prototype.m = function () { return this.a + 1; };\n", "new P(i)", "new Q(i)"),
@@ -727,7 +728,7 @@ def fam_flip():
         "callee": ("function g1(x) { return x + 1; }\nfunction g2(x) { return x * 2; }\n", "g1", "g2"),
     }.items():
         use = {"shape": "s += o.a;", "proto": "s += o.m();", "array": "s += typeof o[1] === 'string' ? 7 : o[1] | 0;", "callee": "s += o(i & 15);"}[fk]
-        body = decl + ("function work(n) { var s = 0, i;\n  for (i = 0; i < n; i++) { var o = i < n / 2 ? %s : %s; %s mix(s); }\n  return s; }\nwork(N);\n") % (early, late, use)
+        body = "var T = N / 2;\n" + decl + ("function work(n) { var s = 0, i;\n  for (i = 0; i < n; i++) { var o = i < T ? %s : %s; %s mix(s); }\n  return s; }\nwork(N);\n") % (early, late, use)
         add("flip_site_%s" % fk, 1000000, body)
 
 
@@ -833,7 +834,7 @@ def fam_algos():
     for key, tpl in algos.items():
         for rng in [4, 64, 1024, 100000]:
             code = tpl % rng
-            add("algo_%s_%d" % (key, rng), 150000, code + "\nfunction work(n) { var s = 0, i;\n  for (i = 0; i < n; i++) { s += run(i); mix(s); }\n  return s; }\nwork(N);\n")
+            add("algo_%s_%d" % (key, rng), 2000 if (key == "fibiter" and rng >= 100000) else 15000 if key in ("lcs", "editdist") else 150000, code + "\nfunction work(n) { var s = 0, i;\n  for (i = 0; i < n; i++) { s += run(i); mix(s); }\n  return s; }\nwork(N);\n")
 
 
 # ---- family 21: objects with typed fields ----------------------------------------------
@@ -866,7 +867,7 @@ def fam_more():
         for vk, ve in vals.items():
             for op in ["read", "write", "rmw"]:
                 names = ["f%d" % k for k in range(nf)]
-                lit = ", ".join("%s: %s" % (nm, ve.replace("i &", "(j &")) for nm in names)
+                lit = ", ".join("%s: %s" % (nm, _re.sub(r"\bi\b", "j", ve)) for nm in names)
                 stmt = {"read": "var t = o.f0; s += typeof t === 'number' ? t | 0 : typeof t === 'string' ? t.length : 1;",
                         "write": "o.f%d = %s; s += 1;" % (nf - 1, ve),
                         "rmw": "var t = o.f0; o.f0 = typeof t === 'number' ? t + 1 : t; s += 1;"}[op]
@@ -999,6 +1000,12 @@ def main():
             f.write(PRE % {"n": n})
             f.write(body)
             f.write(POST % {"name": name})
+        if "var T = N / 2;" in body:
+            # The profiled run sees only the early phase; the checked run flips.
+            with open(os.path.join(out, name + ".prof.js"), "w") as f:
+                f.write("// generated: do not edit; tools/benchmark/aotcorpus/gen.py\n")
+                f.write((PRE % {"n": n}) + body.replace("var T = N / 2;", "var T = Infinity;"))
+                f.write(POST % {"name": name})
     print("generated %d programs" % len(PROGRAMS))
     return 0
 
