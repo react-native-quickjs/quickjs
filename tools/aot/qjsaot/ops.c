@@ -3765,7 +3765,7 @@ static int emit_typed_opcall(
       in->rop == ROP_iter_next ? "qjs_aot_iter_next" : "qjs_aot_step", in->pc);
   fprintf(
       f,
-      "    if (__builtin_expect(ip_ == NULL, 0)) return JS_EXCEPTION;\n");
+      "    if (__builtin_expect(ip_ == NULL, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n");
   fprintf(
       f,
       "    if (__builtin_expect(ip_ == QJS_AOT_COLD_RET || "
@@ -3931,7 +3931,7 @@ static void e_emit_term_step(
       f,
       "    { uint8_t *code_ = q2_code(f), *ip_;\n"
       "    ip_ = qjs_aot_step(code_ + %d, fr, f, ctx);\n"
-      "    if (__builtin_expect(ip_ == NULL, 0)) return JS_EXCEPTION;\n"
+      "    if (__builtin_expect(ip_ == NULL, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n"
       "    if (__builtin_expect(ip_ == QJS_AOT_COLD_RET || "
       "ip_ == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n"
       "    if (ip_ == code_ + %d) c_ = %d;\n"
