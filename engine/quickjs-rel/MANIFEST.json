@@ -1267,12 +1267,16 @@
       "sha256": "73bde0be23855c2aade6b09556b326c6d8020ac864c38fd8b86877960e6fa3f3"
     },
     {
+      "name": "0322-aot-error-stack.patch",
+      "sha256": "7263d4aec4e3031b7b01b5841429dde319d1d0d210b3259c382eaab39d73bf6f"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "30b8fd9a27f45d8dc19c5f2d8dfc694df916d230984005d203bf37f667d9df6a",
+    "quickjs.c": "d5cd82e67527dbcdb5967d97a7a1467315897f956fadbd43823b5fca8fb9b921",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -4504,6 +4504,22 @@ static int regvm_light_var_bound(JSFunctionBytecode *b)
 #define regvm_light_var_bound(b) ((int)(b)->var_count)
 #endif
 
+/* The pc to look a register offset up by. A build whose pc2line stays keyed by the
+   stack program (the compiled-code builds keep it, with `regvm_src_pc`) names the
+   instruction by its stack pc; the offset may point inside an instruction. */
+static uint32_t regvm_line_key(JSFunctionBytecode *b, uint32_t rpc)
+{
+    int32_t j = (int32_t)rpc;
+
+    if (!b->regvm_src_pc || b->regvm_len <= 0)
+        return rpc;
+    if (j >= b->regvm_len)
+        j = b->regvm_len - 1;
+    while (j >= 0 && b->regvm_src_pc[j] < 0)
+        j--;
+    return j < 0 ? 0 : (uint32_t)b->regvm_src_pc[j];
+}
+
 #if JS_ENABLE_DEBUGGER
 
 void JS_SetDebugTraceHandler(JSContext *ctx, JSDebugTraceFunc *cb, void *opaque)
@@ -4928,7 +4944,7 @@ int JS_GetFrameInfoAtLevel(JSContext *ctx, int level, JSDebugFrameInfo *info)
         int rpc = regvm_debug_frame_pc(ctx->rt, sf, b, fr.callee_ret);
 
         if (rpc >= 0)
-            info->line = find_line_num(ctx, b, (uint32_t)rpc, &info->col);
+            info->line = find_line_num(ctx, b, regvm_line_key(b, (uint32_t)rpc), &info->col);
     }
     return 0;
 }
@@ -12073,7 +12089,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                         : (uint32_t)rpc;
 
                     lzf->kind = 0;
-                    lzf->line_num = find_line_num(ctx, b, pc, &lzf->col_num);
+                    lzf->line_num = find_line_num(ctx, b, bt[bi].cur_pc ? pc : regvm_line_key(b, pc), &lzf->col_num);
                     lzf->filename = JS_DupAtom(ctx, b->filename);
                 } else {
                     lzf->kind = b ? 1 : 2;
@@ -12117,7 +12133,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                     const char *atom_str;
                     int line_num1, col_num1;
 
-                    line_num1 = find_line_num(ctx, b, (uint32_t)rpc, &col_num1);
+                    line_num1 = find_line_num(ctx, b, regvm_line_key(b, (uint32_t)rpc), &col_num1);
                     atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                     dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
                     JS_FreeCString(ctx, atom_str);
@@ -62880,6 +62896,24 @@ QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
     return JS_EXCEPTION;
 }
 
+/* An exception leaves compiled code from a frame that has no handler. The throw built
+   no stack yet (the interpreter builds it at the throw, in the innermost frame), so
+   build it here, in this frame, at register pc `pc` (all ones: the pc a helper
+   already captured). */
+QJS_AOT_STUB JSValue qjs_aot_throw_here(JSContext *ctx, JSRegRun *f, uint32_t pc)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (needs_backtrace(rt->current_exception)) {
+        if (pc != UINT32_MAX)
+            f->cap_ip = f->b->regvm_code + pc;
+        if (f->sf)
+            f->sf->cur_pc = NULL;
+        build_backtrace(ctx, rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+    }
+    return JS_EXCEPTION;
+}
+
 /* Forward: the C-entered finish path, defined with the direct-call helpers. */
 static JSValue regvm_aot_run_to_end(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                     uint32_t pc);
@@ -74296,10 +74330,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (!b->pc2line_buf)
         b->pc2line_buf = fd->pc2line.buf;
     b->pc2line_len = fd->pc2line.size;
-#if QJS_REGVM && !QJS_AOT && !QJS_AOT_PROFILE
-    /* A register-compiled function's pc2line must be keyed by register offset.
-       AOT builds keep the stack table (and src_pc): their frames may be stack
-       frames. */
+#if QJS_REGVM && !QJS_AOT_PROFILE
+    /* A register-compiled function's pc2line must be keyed by register offset. The
+       profiling build keeps the stack table and src_pc, which maps a register offset
+       to its stack pc (regvm_line_key). */
     if (b->regvm_compiled && b->regvm_src_pc)
         regvm_build_pc2line(ctx, b, b->regvm_src_pc);
 #endif
