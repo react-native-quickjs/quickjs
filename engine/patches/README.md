@@ -423,3 +423,4 @@ bump while `9999` is missing.
 | `0335` | Exposes what compiled code needs to replay a cached add-transition store inline | A constructor setting its fields called into the engine per property | layout: epoch stamp, flag word, runtime epoch | Yes (layout hash). |
 | `0336` | Lets a compiled `new` teach the constructor its instance capacity | Constructors reached only through compiled `new` grew their property array on every construction | `qjs_aot_construct_done` | No. |
 | `0337` | Calls the built-in push on a dense array without the native frame | `c.push(x)` paid a native frame, stack check and argument padding per call | `qjs_aot_call_c` special case | No. |
+| `0338` | Stores to a cached global without the two lookups and gives compiled stores their function's strictness | A frameless strict store to an undeclared name created a global; global stores were 6 percent of script-style programs | `qjs_aot_put_global(ctx, b, ...)`, `JS_SetGlobalVarS` | No. |

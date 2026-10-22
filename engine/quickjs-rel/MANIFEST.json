@@ -1327,12 +1327,16 @@
       "sha256": "57cfb23d223399967195a0575c635b1f1c9c032f91363f3e4ed2bb00f417c65d"
     },
     {
+      "name": "0338-aot-global-store.patch",
+      "sha256": "6253e63cf92c2baf06bbf4d65f7a26e9fa1a67f7864115bb30cdd1a1af9fb4f4"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "6b1121b1a0586fdbf076b34013af6b7c0798c7b30464b504846d3ef5672f428b",
+    "quickjs.c": "16009b8cbfd356d37c69d00d4015dab6863c86069d27d09fe2773b2e2d53a83f",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

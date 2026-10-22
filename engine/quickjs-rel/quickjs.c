@@ -16158,8 +16158,18 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
 /* flag = 0: normal variable write
    flag = 1: initialize lexical variable
 */
+static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
+                                   int flag, int strict);
 static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
                                   int flag)
+{
+    return JS_SetGlobalVarS(ctx, prop, val, flag, is_strict_mode(ctx));
+}
+
+/* The store with the caller's strictness given, for a compiled body whose own frame the
+   engine cannot see. */
+static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
+                                   int flag, int strict)
 {
     JSObject *p;
     JSShapeProperty *prs;
@@ -16185,6 +16195,9 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
                     return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
                 }
             }
+            if (flag != 1 && likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
+                                    JS_PROP_WRITABLE))
+                js_gv_cell_fill(ctx, prop, p, pr);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -16196,6 +16209,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
+            js_gv_cell_fill(ctx, prop, p, pr);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -16206,13 +16220,13 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
         JS_FreeValue(ctx, val);
         return -1;
     }
-    if (ret == 0 && is_strict_mode(ctx)) {
+    if (ret == 0 && strict) {
         JS_FreeValue(ctx, val);
         JS_ThrowReferenceErrorNotDefined(ctx, prop);
         return -1;
     }
     return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val,
-                                  JS_PROP_THROW_STRICT);
+                                  strict ? JS_PROP_THROW : 0);
 }
 
 /* return -1, false or true */
@@ -62587,9 +62601,39 @@ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
     return 0;
 }
 
-int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init)
+int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init)
 {
-    return JS_SetGlobalVar(ctx, (JSAtom)atom, js_dup(v), init) < 0 ? -1 : 0;
+    if (likely(init == 0)) {
+        /* A store to a global the read cache holds: the cell's slot is a data property of
+           the global object or of the lexical object whose flags are checked here (a
+           flag change or a new property bumps the generation, which the probe checks). */
+        JSGVCell *gvc = ctx->gv_cells[atom & (JS_GV_CELL_SETS - 1)];
+        uint32_t gen = ctx->rt->gv_cell_gen;
+        JSProperty *slot = NULL;
+
+        if (likely(gvc[0].atom == (uint32_t)atom && gvc[0].gen == gen))
+            slot = gvc[0].slot;
+        else if (gvc[1].atom == (uint32_t)atom && gvc[1].gen == gen)
+            slot = gvc[1].slot;
+        if (likely(slot != NULL)) {
+            JSObject *go = JS_VALUE_GET_OBJ(ctx->global_obj);
+            JSObject *lo = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+            JSObject *po = NULL;
+
+            if (slot >= go->prop && slot < go->prop + go->shape->prop_size)
+                po = go;
+            else if (slot >= lo->prop && slot < lo->prop + lo->shape->prop_size)
+                po = lo;
+            if (likely(po != NULL) &&
+                (get_shape_prop(po->shape)[slot - po->prop].flags &
+                 (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
+                set_value(ctx, &slot->u.value, js_dup(v));
+                return 0;
+            }
+        }
+    }
+    return JS_SetGlobalVarS(ctx, (JSAtom)atom, js_dup(v), init,
+                            ((JSFunctionBytecode *)b)->is_strict_mode) < 0 ? -1 : 0;
 }
 
 int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
@@ -63750,6 +63794,39 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
     p = JS_VALUE_GET_OBJ(callee);
     if (p->class_id != JS_CLASS_C_FUNCTION)
         return 0;
+    if (p->u.cfunc.cproto == JS_CFUNC_generic || p->u.cfunc.cproto == JS_CFUNC_generic_magic) {
+        /* A generic builtin needs no bound pointer: the call is the engine's own, so the
+           per-site table is for the direct-pointer forms below only. */
+        JSValue rv;
+
+        if (p->u.cfunc.c_function.generic_magic == (void *)js_array_push &&
+            p->u.cfunc.magic == 0 && na == 1 && JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
+            /* Identity-bound by the pointer: a replaced Array.prototype.push, a JS
+               function or an own `push` never has this pointer and magic. `array.push(x)`
+               on a dense array with the standard prototype is the builtin's own fast path,
+               which runs no JS, so it needs neither the native frame nor the padded
+               argument list. */
+            JSObject *ap = JS_VALUE_GET_OBJ(this_obj);
+
+            if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array && ap->extensible &&
+                       ap->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
+                       ctx->std_array_prototype && p->u.cfunc.realm == ctx &&
+                       JS_VALUE_GET_TAG(ap->prop[0].u.value) == JS_TAG_INT &&
+                       (get_shape_prop(ap->shape)->flags & JS_PROP_WRITABLE) &&
+                       (uint32_t)JS_VALUE_GET_INT(ap->prop[0].u.value) == ap->u.array.count)) {
+                rv = js_array_push(ctx, this_obj, 1, argv, 0);
+                if (JS_IsException(rv))
+                    return -1;
+                *out = rv;
+                return 1;
+            }
+        }
+        rv = js_call_c_function(ctx, callee, this_obj, na, argv, 0);
+        if (JS_IsException(rv))
+            return -1;
+        *out = rv;
+        return 1;
+    }
     if (!aot_site_ensure(rt, (uint32_t)site))
         return 0;
     e = &rt->aot_sites[site];
@@ -63792,30 +63869,6 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
             return -1;
         *out = js_number(((double (*)(double, double))e->cfn)(d1, d2));
         return 1;
-    }
-    if (e->cproto == JS_CFUNC_generic_magic && e->cfn == (void *)js_array_push &&
-        e->magic == 0 && na == 1 && JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
-        /* The callee is identity-bound to the builtin: `p` is a C function whose pointer is
-           js_array_push (a replaced Array.prototype.push, a JS function or an own `push`
-           never reaches here with this pointer and magic).
-           `array.push(x)` on a dense array with the standard prototype: the builtin's
-           own fast path, which runs no JS, so it needs neither the native frame nor the
-           padded argument list. Any other receiver takes the full call below. */
-        JSObject *ap = JS_VALUE_GET_OBJ(this_obj);
-
-        if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array && ap->extensible &&
-                   ap->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
-                   ctx->std_array_prototype && p->u.cfunc.realm == ctx &&
-                   JS_VALUE_GET_TAG(ap->prop[0].u.value) == JS_TAG_INT &&
-                   (get_shape_prop(ap->shape)->flags & JS_PROP_WRITABLE) &&
-                   (uint32_t)JS_VALUE_GET_INT(ap->prop[0].u.value) == ap->u.array.count)) {
-            JSValue rv = js_array_push(ctx, this_obj, 1, argv, 0);
-
-            if (JS_IsException(rv))
-                return -1;
-            *out = rv;
-            return 1;
-        }
     }
     if (e->cproto == JS_CFUNC_generic || e->cproto == JS_CFUNC_generic_magic) {
         JSValue rv;
