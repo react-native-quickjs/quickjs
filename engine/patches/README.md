@@ -429,3 +429,4 @@ bump while `9999` is missing.
 | `0341` | Concatenates a short flat string with an int or another short flat string in one allocation | `'k' + (i & 15)` took 800 instructions through ToString and the general concatenation | `qjs_aot_binary_rr` fast case | No. |
 | `0342` | Exposes where a linearised rope keeps its flat string | Compiled character reads declined a rope and left the speculative body on every iteration | layout: rope left/right | Yes (layout hash). |
 | `0343` | Reads a prototype and a constant-keyed property from compiled code without the step handler | `super.m()` was three step handlers and an atom-table lookup per execution | `qjs_aot_get_proto`, `qjs_aot_get_prop_atom` | No. |
+| `0344` | Runs compiled functions that contain monolith-only instructions on a record too | Private methods, derived constructors and class bodies kept the full activation | `JS_CallInternal` record head without the threaded-eligibility test | No. |

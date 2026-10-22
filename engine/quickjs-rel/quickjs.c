@@ -38119,7 +38119,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        tail (it reads `arguments`, the new target, the home object): the interpreter's
        own record frame, here on the C stack, runs the compiled body without the
        activation JS_CallInternal and js_regvm_execute would build. */
-    if (b->aot_fn != NULL && b->aot_nfn == NULL && b->aot_call_ready &&
+    if (b->aot_fn != NULL && b->aot_nfn == NULL && b->regvm_compiled && b->regvm_code != NULL &&
         (flags & ~(JS_CALL_FLAG_COPY_ARGV | JS_CALL_FLAG_CONSTRUCTOR)) == 0 &&
         b->func_kind == JS_FUNC_NORMAL && !b->is_lazy && b->regvm_ctl_count == 0 &&
         ((flags & JS_CALL_FLAG_CONSTRUCTOR) != 0) != JS_IsUndefined(new_target)) {
@@ -63711,7 +63711,8 @@ aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
    handler and cold arm sees the frame it expects (and `regvm_rec_of_sf` finds it). The
    record is an entry record (no caller), so a return or a throw leaves to here, and a
    deopt resumes the threaded interpreter on it. The function has no control records (a
-   try keeps the full activation). Returns 1 with an owned *out, -1 on exception, 0 when
+   try keeps the full activation). It need not be record-eligible for the interpreter (an
+   instruction only the monolith runs is executed by the compiled body or its step). Returns 1 with an owned *out, -1 on exception, 0 when
    there is no arena room (the caller takes the full activation). */
 static __attribute__((noinline)) int
 aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
@@ -63757,8 +63758,15 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
         uint32_t pc = rec->deopt_pc;
 
         rec->deopt_pc = QJS_AOT_NO_DEOPT;
-        regvm_t_dispatch(cb->regvm_code + pc, rec->fr, rec, cb->realm);
-        ret = rec->ret;
+        if (unlikely(!cb->regvm_all_threaded)) {
+            /* the threaded interpreter cannot run every instruction of this function; the
+               generated code never asks (its only deopt is an impossible entry pc) */
+            JS_ThrowInternalError(cb->realm, "compiled function cannot be resumed");
+            ret = JS_EXCEPTION;
+        } else {
+            regvm_t_dispatch(cb->regvm_code + pc, rec->fr, rec, cb->realm);
+            ret = rec->ret;
+        }
     }
     if (JS_IsException(ret) && needs_backtrace(rt->current_exception)) {
         sf->cur_pc = NULL;
