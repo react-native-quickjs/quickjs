@@ -6,7 +6,7 @@
  */
 
 /*
- * Representation inference (step 3.3).
+ * Representation inference.
  *
  * The profile says which kinds a definition's register ever carried. Where that
  * is exactly one numeric kind, or `int|float`, the value can live in a C

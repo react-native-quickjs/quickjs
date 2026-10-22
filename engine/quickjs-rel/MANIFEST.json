@@ -60,7 +60,7 @@
     },
     {
       "name": "0015-inline-caches.patch",
-      "sha256": "24decd2b7639b67644a078289c5b8d3bb207e0d4e00d65b2d0d1b3d908ab56cb"
+      "sha256": "a3c4ad0c0ab18b50c4d2c0173387a2840765ec88c3deab761cfcff5cd1014cb5"
     },
     {
       "name": "0016-composed-ic-4wide-depth2-mega.patch",
@@ -272,7 +272,7 @@
     },
     {
       "name": "0069-arg-field-borrow-fusion.patch",
-      "sha256": "57b2bcffe6788e1cfa07b00d3cda7ab81503662b986e1999c24fd8f296e8e359"
+      "sha256": "8e3e523ed3fa89e74b0df8a9d972e1b57bf717aff0f0003fdf07a095e3427d7b"
     },
     {
       "name": "0070-element-store-template-removal.patch",
@@ -408,7 +408,7 @@
     },
     {
       "name": "0107-register-vm-backend.patch",
-      "sha256": "f16cbdab7bf7bdd49301766dd494e066cb9c1f4213848fc825cf409a5f41e05f"
+      "sha256": "26fba8c80130be502fc82144aba34c865cb1cede1b21fada4e77be28ad2eb9c5"
     },
     {
       "name": "0108-register-vm-homes.patch",
@@ -768,7 +768,7 @@
     },
     {
       "name": "0197-regvm-debug-arena-skew.patch",
-      "sha256": "834f33a4853bbd8e6780169dbdc80f7436c531651f2327ab18eeaa63c933cbdf"
+      "sha256": "d8f3bf30be04c797e4af665e1ce886f086750ef7f275a49b5d402d5a155cfb55"
     },
     {
       "name": "0198-regvm-light-entry-values.patch",
@@ -996,7 +996,7 @@
     },
     {
       "name": "0254-remove-ablation-knobs.patch",
-      "sha256": "348132efd6e63d03137b6827542754bd9b6a5c687093989fc22b757858e84395"
+      "sha256": "64de82d75b89d55fb1c7dd0e9a8647b9685e1ebd40400770d0d4b1f6356e57d6"
     },
     {
       "name": "0255-remove-post0073-unused.patch",
@@ -1196,7 +1196,7 @@
     },
     {
       "name": "0304-aot-function-sampler.patch",
-      "sha256": "d67b8861a98d70c8cc1e810bc8e6785d9471dd3dfc29d1abe8a9dfeaeb52d6b6"
+      "sha256": "8d8436b2ad60494e57c068b7c0d78f0f51c3f2f1880c60ffb190e29a4f251eda"
     },
     {
       "name": "0305-regvm-one-wire-format.patch",
@@ -1208,7 +1208,7 @@
     },
     {
       "name": "0307-aot-native-call-entry.patch",
-      "sha256": "02ba493abd0625287f0cf3e95323141dc838a9177ae2672a5e8fe9fef1aa3fa1"
+      "sha256": "c60d4f9b84dc2f66d59feefddae805058ea49d255221edd16ebb900c1b177767"
     },
     {
       "name": "0308-regvm-step-frame-func.patch",
@@ -1271,16 +1271,12 @@
       "sha256": "7263d4aec4e3031b7b01b5841429dde319d1d0d210b3259c382eaab39d73bf6f"
     },
     {
-      "name": "0323-aot-remove-frame-check.patch",
-      "sha256": "21b7b90979900388f68ee1707e0132e44a2b2d2516ee4b88dfb28daf4fde7e5a"
-    },
-    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "46053a61b587e8c120696635a23b51aaee744976845c97ffc2eeb516c67b7e01",
+    "quickjs.c": "884f3b6712478126325024023a99cc7a102e04610aac364b2c07fcab25ddb76c",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -6,12 +6,12 @@
  */
 
 /*
- * The generator's E2 report: one line per function, and a summary.
+ * The generator's report: one line per function, and a summary.
  *
- * It exists so a run says which functions the new emitter handled, which it
- * left to the old one, and how much of the program's executed ops they carry.
- * Without the weight a reader cannot tell "all functions delegated" from "all
- * functions delegated except the 60 % that matter".
+ * It exists so a run says which functions were compiled, which were left to the
+ * interpreter, and how much of the program's executed ops they carry. Without
+ * the weight a reader cannot tell "all functions delegated" from "all functions
+ * delegated except the 60 % that matter".
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,9 +134,9 @@ void e_report_spec(
 void e_report_close(void) {
   int r, n = 0;
   if (e_rep == NULL) return;
-  /* The summary answers "how much of this unit is the new emitter actually
-     responsible for", by dynamic weight rather than by function count: a unit
-     can be 90 % new functions by count and 5 % by executed ops. */
+  /* The summary answers "how much of this unit is compiled", by dynamic weight
+     rather than by function count: a unit can be 90 % compiled functions by count
+     and 5 % by executed ops. */
   fprintf(e_rep, "summary functions=%d delegated=%d weight=%.1f%% "
                   "weight_delegated=%.1f%% entries=%d poll=%d stackcheck=%d\n",
           e_rep_nfuncs, e_rep_delegated, e_rep_weight,

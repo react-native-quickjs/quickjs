@@ -135,7 +135,7 @@ Needs a bytecode version bump
          js_free_shape(rt, sh);
 +}
 +
-+/* ---- Inline caches (Phase 2). See doc/ic-design.md. -------------------- */
++/* ---- Inline caches. See doc/ic-design.md. -------------------- */
 +
 +/* Release the refs held by a (possibly empty) unified IC entry. */
 +static void ic_entry_reset(JSRuntime *rt, JSICEntry *e)
@@ -507,7 +507,7 @@ Needs a bytecode version bump
 -            *sp++ = js_dup(var_buf[0]);
 -            *sp++ = js_dup(var_buf[1]);
 +        CASE(OP_get_loc_field_nr):
-+            /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
++            /* Borrow-fusion: get_loc(n) get_field(atom).
 +               The receiver is the local var_buf[loc] and is NEVER pushed to the
 +               stack, so nothing else can free it — we borrow it (no dup) and never
 +               free it. Then the same IC read as OP_get_field_ic. */
@@ -978,7 +978,7 @@ Needs a bytecode version bump
 
      DynBuf byte_code;
      int last_opcode_pos; /* -1 if no last opcode */
-+    int ic_count; /* number of IC sites assigned in resolve_labels (Phase 2) */
++    int ic_count; /* number of IC sites assigned in resolve_labels */
 
      LabelSlot *label_slots;
      int label_size; /* allocated size for label_slots[] */
@@ -1090,7 +1090,7 @@ Needs a bytecode version bump
 -                /* transformation: get_loc(0) get_loc(1) -> get_loc0_loc1 */
 -                if (idx == 0 && code_match(&cc, pos_next, OP_get_loc, 1, -1)) {
 +#if JS_ENABLE_IC
-+                /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom) ->
++                /* Borrow-fusion: get_loc(n) get_field(atom) ->
 +                   get_loc_field_nr(atom, n, ic). Only when the field read consumes
 +                   the receiver (plain OP_get_field, not get_field2 which keeps the
 +                   receiver for a call), the atom isn't 'length' (that becomes

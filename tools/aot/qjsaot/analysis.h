@@ -17,7 +17,7 @@
  *               boxed, and which guard its definition needs.
  *
  * Neither pass emits anything. They produce a result the emitter reads (and
- * `--emit2-types` prints), so a representation or forwarding decision can be
+ * `--types` prints), so a representation or forwarding decision can be
  * inspected and gated before a single line of C is generated.
  *
  * The passes keep their results in their own structs rather than writing
@@ -26,8 +26,8 @@
  * the speculative body, wrong) answers. An instruction's forwarding source is
  * therefore `facts->fwd[insn]`, not `insn->fwd`.
  */
-#ifndef QJSAOT2_E_ANALYSIS_H
-#define QJSAOT2_E_ANALYSIS_H
+#ifndef QJSAOT_ANALYSIS_H
+#define QJSAOT_ANALYSIS_H
 
 #include <stdio.h>
 
@@ -58,7 +58,7 @@ typedef struct EGroup {
   int *sites;
 } EGroup;
 
-/* ---- memory locations (the design's D6 table) ---------------------------- */
+/* ---- memory locations (the location table) ---------------------------- */
 
 #define E_K_ARG 1    /* (ARG, slot) */
 #define E_K_LOCAL 2  /* (LOC, slot) */
@@ -108,7 +108,7 @@ typedef struct EFacts {
   uint8_t *access; /* a guarded access of a group site (tag + shape test) */
   uint8_t *skip;   /* ... whose test is redundant: SHAPE(receiver, group) holds */
   /* A grouped field access whose miss must leave the speculative body (an
-     exit, D9 steps 3-4), never continue. The pass treats it as no safepoint
+     exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter
      and invalidate every fact this pass carried past it. */
   uint8_t *miss_exits;
@@ -118,7 +118,7 @@ typedef struct EFacts {
   ESiteInfo *sites;
   int nblocks;
   EBlockFacts *blocks; /* the in-set of each block, for the dump */
-  /* Shape checks hoisted to a loop preheader (card E13): the loop header, its
+  /* Shape checks hoisted to a loop preheader: the loop header, its
      preheader, the receiver value and the group. */
   int nloops, loop_cap, *loop_hdr, *loop_pre;
   uint8_t **loop_mem;
@@ -128,14 +128,14 @@ typedef struct EFacts {
   int nskip;            /* shape checks skipped, for the report */
 } EFacts;
 
-/* Run the facts pass (D7) and build the site groups (D9 step 1). Returns 0, or
+/* Run the facts pass and build the site groups. Returns 0, or
    -1 on allocation failure. */
 /* `grouped_exit` selects the mode. 0: a grouped field access is an ordinary
    safepoint and `miss_exits` stays 0 -- in the speculative body its miss
    continues into the generic lowering, so whatever the access ran may have
    broken every fact. 1: a grouped access's miss exits, so the access is a
-   safepoint-free fast path. E8's body passes 0; `--emit2-types` passes 1 so its
-   numbers describe the E9 mode.
+   safepoint-free fast path. The speculative body passes 0; `--types` passes 1 so
+   its numbers describe the exiting mode.
 
    A parameter rather than a global on purpose: a run that both dumps types and
    emits would otherwise leave the flag set for the functions emitted after the
@@ -154,7 +154,7 @@ int e_facts_site_group(const EFacts *f, int site);
 
 /* ---- representations ---------------------------------------------------- */
 
-/* D8's lattice: BOT is "not computed yet", never "tagged". */
+/* The lattice: BOT is "not computed yet", never "tagged". */
 #define E_LB_BOT 0
 #define E_LB_BOOL 1
 #define E_LB_I32 2
@@ -180,7 +180,7 @@ enum {
                             a string or a bigint */
 };
 
-/* The exits an i32 result needs (D8's "exits" column), so the emitter does not
+/* The exits an i32 result needs (the "exits" column), so the emitter does not
    have to re-derive them from the operation. */
 #define E_EX_OVF (1u << 0)      /* add/sub/mul/inc/dec overflow */
 #define E_EX_ZERODIV (1u << 1)  /* b == 0 */
@@ -225,7 +225,7 @@ typedef struct ETypes {
   int nlive;     /* live values, i.e. what the counters above sum to */
 } ETypes;
 
-/* Run representation inference (D8) over a built IR, reading the facts pass's
+/* Run representation inference over a built IR, reading the facts pass's
    forwarding decisions. Returns 0, or -1 on allocation failure. */
 int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out);
 void e_types_free(ETypes *t);
@@ -241,9 +241,9 @@ const char *e_types_rep_name(const ETypes *t, Q2ValueId v);
 
 /* ---- the dump ----------------------------------------------------------- */
 
-/* `--emit2-types`: one block per function with the groups, the facts on entry
+/* `--types`: one block per function with the groups, the facts on entry
    to each block, one line per value, the loop counters and the tagged roots.
    Returns 0, or -1 on allocation failure. */
 int e_analysis_dump(FILE *f, const Q2Func *fn, const char *hex, double weight);
 
-#endif /* QJSAOT2_E_ANALYSIS_H */
+#endif /* QJSAOT_ANALYSIS_H */

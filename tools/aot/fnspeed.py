@@ -21,12 +21,12 @@ for box2d.
 Why the program counters are kept as well as the function: "outside the
 generated text" is not one thing. It is the AOT helper functions in the engine
 (which a better emitter removes), the interpreter (which runs a function the
-emitter refused or switched off, which E2 fixes), and genuine engine work such
+emitter refused or switched off, which more lowering fixes), and genuine engine work such
 as GC or allocation (which no emitter reaches). Only the last is
 "runtime-bound", so each sample's PC is resolved to a symbol and bucketed.
 
 Samples inside the unit are charged to a function by address rather than by the
-frame that `regvm_cur` points at, because a frameless function (D10) has no
+frame that `regvm_cur` points at, because a frameless function has no
 frame of its own and its time would otherwise be charged to its caller.
 """
 import argparse
@@ -83,7 +83,7 @@ OBJECT_BUCKET = {'__libc_internal': 'alloc', '__libm_internal': 'builtin'}
 
 
 def bucket_for(sym, in_unit):
-    """The bucket a symbol belongs to, per D14's table."""
+    """The bucket a symbol belongs to, by symbol name."""
     if in_unit:
         return 'unit'
     if sym is None:
@@ -300,9 +300,9 @@ def unit_functions(unit_c):
         return out
     # The emitter writes each function's position above its definition:
     #   /* with_call callnil.js:5:1 */
-    #   E2_TEXT static JSValue aot_f_<hex>(...)
+    #   E_TEXT static JSValue aot_f_<hex>(...)
     pat = (r'/\*\s*\S+\s+(\S+:\d+:\d+)\s*\*/'
-           r'(?:[^\n]*\n)*?\s*(?:E2_TEXT\s+)?static\s+JSValue'
+           r'(?:[^\n]*\n)*?\s*(?:E_TEXT\s+)?static\s+JSValue'
            r'\s+aot_[fgn]_([0-9a-f]{32})\(')
     for m in re.finditer(pat, text):
         out.setdefault(m.group(2), m.group(1))
@@ -503,7 +503,7 @@ def main():
         if lab == 'runtime-bound':
             rb += 1
         elif lab == 'not-compiled':
-            # Still in the target: E2 has to make this one fast, so its
+            # Still in the target: the emitter has to make this one fast, so its
             # current speedup counts toward the median as it stands.
             nc += 1
             if speed != float('inf'):
@@ -626,8 +626,8 @@ def main():
               % (1e6 * mi['wall'] / mi['total'], 1e6 * ma['wall'] / ma['total'],
                  mi['total'], mi['wall'], ma['wall']))
     print('median speedup %.2fx over %d hot functions excluding the %d '
-          'runtime-bound ones (not-compiled functions are included: E2 must '
-          'fix them)' % (med, len(speeds), rb))
+          'runtime-bound ones (not-compiled functions are included: the emitter '
+          'must fix them)' % (med, len(speeds), rb))
 
     # The helper and interpreter symbols, by sample count: the input for
     # deciding which to replace with compiled code first.

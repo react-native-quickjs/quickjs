@@ -426,8 +426,8 @@ diff --git a/quickjs.c b/quickjs.c
 +
 +                     bound     the unit's entry is in use;
 +                     disabled  it was bound and then switched off, because its
-+                               guards kept failing (the exit policy D4
-+                               replaces);
++                               guards kept failing, so the function is
++                               now run by the interpreter;
 +                     absent    it is not in the unit at all;
 +                     unbound   it was never offered for binding.
 +

@@ -56,7 +56,7 @@ Needs a bytecode version bump
          CASE(OP_get_loc_field_nr):
 +            nr_buf = var_buf;
 +        field_nr_common:
-             /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
+             /* Borrow-fusion: get_loc(n) get_field(atom).
                 The receiver is the local var_buf[loc] and is NEVER pushed to the
                 stack, so nothing else can free it — we borrow it (no dup) and never
 @@ -21166,7 +21174,7 @@

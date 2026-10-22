@@ -32,7 +32,7 @@ index 58e733d..7cc552e 100644
  } JSRegArenaChunk;
  
 -#ifdef QJS_REGVM_KNOBS
--/* Plan step 0.1: shift the frame arena by REGVM_SKEW bytes (rounded down to 16)
+-/* Shift the frame arena by REGVM_SKEW bytes (rounded down to 16)
 -   so a measurement can pick an alias-free layout. `getenv` is read once; without
 -   QJS_REGVM_KNOBS the offset folds to zero and the macro is unchanged. */
 -static size_t regvm_skew(void)

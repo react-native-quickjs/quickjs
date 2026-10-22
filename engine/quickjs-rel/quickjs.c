@@ -8066,7 +8066,7 @@ static void js_free_shape_null(JSRuntime *rt, JSShape *sh)
         js_free_shape(rt, sh);
 }
 
-/* ---- Inline caches (Phase 2). See doc/ic-design.md. -------------------- */
+/* ---- Inline caches. See doc/ic-design.md. -------------------- */
 
 /* Release the refs held by a (possibly empty) unified IC entry. */
 static void ic_entry_reset(JSRuntime *rt, JSICEntry *e)
@@ -25898,8 +25898,8 @@ static void fn_sample_stop(JSRuntime *rt)
 
                      bound     the unit's entry is in use;
                      disabled  it was bound and then switched off, because its
-                               guards kept failing (the exit policy D4
-                               replaces);
+                               guards kept failing, so the function is
+                               now run by the interpreter;
                      absent    it is not in the unit at all;
                      unbound   it was never offered for binding.
 
@@ -38927,7 +38927,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_loc_field_nr):
             nr_buf = var_buf;
         field_nr_common:
-            /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
+            /* Borrow-fusion: get_loc(n) get_field(atom).
                The receiver is the local var_buf[loc] and is NEVER pushed to the
                stack, so nothing else can free it — we borrow it (no dup) and never
                free it. Then the same IC read as OP_get_field_ic. */
@@ -43081,7 +43081,7 @@ typedef struct JSFunctionDef {
 
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
-    int ic_count; /* number of IC sites assigned in resolve_labels (Phase 2) */
+    int ic_count; /* number of IC sites assigned in resolve_labels */
 
     LabelSlot *label_slots;
     int label_size; /* allocated size for label_slots[] */
@@ -58596,7 +58596,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
 #if JS_ENABLE_IC
-                /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom) ->
+                /* Borrow-fusion: get_loc(n) get_field(atom) ->
                    get_loc_field_nr(atom, n, ic). Only when the field read consumes
                    the receiver (plain OP_get_field, not get_field2 which keeps the
                    receiver for a call), the atom isn't 'length' (that becomes

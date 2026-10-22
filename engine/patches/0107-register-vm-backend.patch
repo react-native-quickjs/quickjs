@@ -3950,7 +3950,7 @@ index 728daf5..31b6a40 100644
 -        CASE(OP_get_loc_field_nr):
 -            nr_buf = var_buf;
 -        field_nr_common:
--            /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
+-            /* Borrow-fusion: get_loc(n) get_field(atom).
 -               The receiver is the local var_buf[loc] and is NEVER pushed to the
 -               stack, so nothing else can free it — we borrow it (no dup) and never
 -               free it. Then the same IC read as OP_get_field_ic. */
@@ -15827,7 +15827,7 @@ index 728daf5..31b6a40 100644
 +        CASE(OP_get_loc_field_nr):
 +            nr_buf = var_buf;
 +        field_nr_common:
-+            /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom).
++            /* Borrow-fusion: get_loc(n) get_field(atom).
 +               The receiver is the local var_buf[loc] and is NEVER pushed to the
 +               stack, so nothing else can free it — we borrow it (no dup) and never
 +               free it. Then the same IC read as OP_get_field_ic. */
@@ -39016,7 +39016,7 @@ index 728daf5..31b6a40 100644
 +                    break;
 +                }
 +#if JS_ENABLE_IC
-+                /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom) ->
++                /* Borrow-fusion: get_loc(n) get_field(atom) ->
 +                   get_loc_field_nr(atom, n, ic). Only when the field read consumes
 +                   the receiver (plain OP_get_field, not get_field2 which keeps the
 +                   receiver for a call), the atom isn't 'length' (that becomes
@@ -46891,7 +46891,7 @@ index 728daf5..31b6a40 100644
 +                    continue;
                  }
 -#if JS_ENABLE_IC
--                /* Borrow-fusion (Phase 3.3): get_loc(n) get_field(atom) ->
+-                /* Borrow-fusion: get_loc(n) get_field(atom) ->
 -                   get_loc_field_nr(atom, n, ic). Only when the field read consumes
 -                   the receiver (plain OP_get_field, not get_field2 which keeps the
 -                   receiver for a call), the atom isn't 'length' (that becomes

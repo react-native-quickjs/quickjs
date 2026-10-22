@@ -34,10 +34,9 @@
  *
  * ---- what counts as a safepoint, and why ----
  *
- * D7 step 5 drops every SHAPE fact and applies D6's runs_js kills at a
- * safepoint. Applied literally to `runs_js` in the role table that would make a
+ * A safepoint drops every SHAPE fact and applies the runs_js kills. Applied literally to `runs_js` in the role table that would make a
  * property read kill the load fact it just established, so no field read could
- * ever be forwarded and D7's whole point (one load per location) would be lost.
+ * ever be forwarded and the point of the pass (one load per location) would be lost.
  * The role table's `runs_js` describes what the *interpreter handler* may do,
  * including its slow path; the pass has to model the code the speculative body
  * will actually contain:
@@ -45,18 +44,18 @@
  *   - A load or store of a local, an argument, a closure variable or `this`, a
  *     constant and a move cannot run JS (a TDZ read throws and leaves), so it
  *     is no safepoint.
- *   - A grouped field access (every site in a group, D9 step 1) has an inline
+ *   - A grouped field access (every site in a group) has an inline
  *     fast path that runs no JS: a tag and shape test and a slot load or store.
- *     Its miss is an exit to the generic body (D9 steps 3-4), which does not
+ *     Its miss is an exit to the generic body, which does not
  *     come back, so on the path that continues no JS ran and the facts hold.
  *     The pass marks it `miss_exits`, and the emitter must emit its miss as an
  *     exit. A miss that continued instead would rejoin with facts a getter or
  *     setter may have broken, and a forwarded value cannot be repaired on the
  *     cold arm alone, because the code after the join is shared.
  *   - Everything else that is not pure -- an ungrouped field access, a global
- *     or element access (whose misses continue, D9), calls, op calls,
- *     fallbacks, allocation -- is a safepoint (S4) and kills everything except
- *     `this`, which is fixed for the activation (D6).
+ *     or element access (whose misses continue), calls, op calls,
+ *     fallbacks, allocation -- is a safepoint and kills everything except
+ *     `this`, which is fixed for the activation.
  *
  * The `access`/`skip`/`miss_exits` marks are what makes this checkable: the gate
  * counts `skip` and `fwd` (the design's "shape checks skipped" and "loads
@@ -221,7 +220,7 @@ static int kp_global_atom(void *arg, const EKey *k) {
 }
 
 /* Two different atoms never alias, so a store kills only its own atom -- on any
-   receiver, because two receivers may be the same object (D6). */
+   receiver, because two receivers may be the same object. */
 static int kp_field_atom(void *arg, const EKey *k) {
   return k->kind == E_K_FIELD && k->b == *(const int64_t *)arg;
 }
@@ -233,7 +232,7 @@ static int kp_elem(void *arg, const EKey *k) {
 
 /* A safepoint: everything reachable from the heap may have changed, and a
    refill may have freed a shape and handed its address to another one. `this`
-   is fixed for the activation and survives (D6). */
+   is fixed for the activation and survives. */
 static int kp_safepoint(void *arg, const EKey *k) {
   (void)arg;
   return k->kind != E_K_THIS;
@@ -259,7 +258,7 @@ static int arg_nearest(const Q2Insn *in, int idx, char kind) {
   return -1;
 }
 
-/* One property access: the PIC site it uses and the D6 location it reads or
+/* One property access: the PIC site it uses and the location it reads or
    writes. */
 typedef struct SiteRef {
   int site;     /* the PIC index, or REG_IC_NONE */
@@ -268,7 +267,7 @@ typedef struct SiteRef {
   int is_store;
 } SiteRef;
 
-/* The D6 receiver key of a field access whose site is operand `si`.
+/* The receiver key of a field access whose site is operand `si`.
    `def_recv` is the value a chain's second link reads from. */
 static int64_t site_recv(const Q2Insn *in, int si, Q2ValueId def_recv) {
   int ai, ri;
@@ -530,7 +529,7 @@ static int insn_store(const Q2Insn *in, Access *a) {
   return 1;
 }
 
-/* ---- site groups (D9 step 1) -------------------------------------------- */
+/* ---- site groups -------------------------------------------- */
 
 static int build_groups(const Q2Func *fn, EFacts *f) {
   int i, k, n = 0, cap = 0, ng = 0;
@@ -659,7 +658,7 @@ static void apply_store_kills(FactSet *s, const Access *stp) {
     }
     case E_K_FIELD: {
       /* Different atoms never alias; the same atom on another receiver may be
-         the same object, so it kills them all (D6). */
+         the same object, so it kills them all. */
       int64_t atom = st.key.b;
       fs_kill(s, kp_field_atom, &atom);
       break;
@@ -737,7 +736,7 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     int nr = site_refs(in, ref), r, grouped = nr > 0;
     /* Without `grouped_exit` a grouped access is a safepoint: its miss
        continues into the generic lowering instead of exiting, so whatever it
-       ran may have broken every fact. E8's body runs in that mode. */
+       ran may have broken every fact. The continuing-miss mode of the speculative body is this one. */
     if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
       if (ref[r].site < 0 || ref[r].recv < 0 ||
@@ -795,7 +794,7 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     if (fs_set_avail(s, &st.key, st.val) < 0) return -1;
   }
 
-  /* 5. A safepoint loses every shape and every location (D7 step 5), except
+  /* 5. A safepoint loses every shape and every location, except
      `this`. It applies after the instruction's own load or store, so an
      ungrouped read does not leave a fact behind either: its miss may have run
      a getter. */
@@ -807,14 +806,14 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
   return 0;
 }
 
-/* ---- loop hoisting of shape checks (card E13) ------------------------------
+/* ---- loop hoisting of shape checks ------------------------------
    A natural loop with one back edge target (its header), a unique outside
    predecessor P that has no other successor, and no safepoint in its body can have
    the shape checks of its grouped accesses done once, at the end of P: nothing in
    the body can change a shape, so the fact holds throughout. A hoisted check that
    fails exits at the header's pc with the header's live-in set (the loop has not
    run, so nothing needs undoing). The accesses in the loop then skip their receiver
-   test. Only receivers defined outside the loop qualify. Loads (D6) are not
+   test. Only receivers defined outside the loop qualify. Loads are not
    hoisted: a hoisted load needs a new value in the IR (deferred). */
 static int in_loop(const uint8_t *loop, int b) { return b >= 0 && loop[b]; }
 

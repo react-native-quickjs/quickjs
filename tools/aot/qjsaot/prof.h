@@ -11,8 +11,8 @@
  * register the instruction at `pc` writes, so the two destinations of a fused
  * operation share one.
  */
-#ifndef QJSAOT2_PROF_H
-#define QJSAOT2_PROF_H
+#ifndef QJSAOT_PROF_H
+#define QJSAOT_PROF_H
 
 #include <stdint.h>
 
@@ -71,4 +71,4 @@ typedef struct ProfCount {
   unsigned long long count;
 } ProfCount;
 
-#endif /* QJSAOT2_PROF_H */
+#endif /* QJSAOT_PROF_H */

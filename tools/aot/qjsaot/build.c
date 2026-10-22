@@ -1831,7 +1831,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     (void)pk;
   }
 
-  /* 5b. drop the block parameters that are the same value on every edge */
+  /* Drop the block parameters that are the same value on every edge */
   if (q2_prune_params(f) < 0) {
     f->why = "out of memory";
     goto fail;

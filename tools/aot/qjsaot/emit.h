@@ -6,24 +6,22 @@
  */
 
 /*
- * The E2 emitter's interface. `e_emit_body` is the entry the unit builder
- * calls for each function; while the new emitter is being built it delegates
- * every function to the old one, so the harness, the report and the gates can
- * be exercised before a single instruction is emitted differently.
+ * The emitter's interface. `e_emit_body` is the entry the unit builder calls for
+ * each function.
  */
-#ifndef QJSAOT2_E_H
-#define QJSAOT2_E_H
+#ifndef QJSAOT_EMIT_H
+#define QJSAOT_EMIT_H
 
 #include <stdio.h>
 
 #include "quickjs-aot-gen.h"
 #include "quickjs-regvm.h"
 
-/* Emit one function's body in place of the old emitter's. Returns 0 on
+/* Emit one function's body. Returns 0 on
    success, -1 on a generation error. */
 int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
-/* The inline form `ei_HEX` of a small leaf (card E15), or 0 with `why`. */
+/* The inline form `ei_HEX` of a small leaf, or 0 with `why`. */
 int e_emit_inline_func(
     FILE *f, const JSAotGenFunc *g, char hex[33], char *why, size_t whyn);
 struct Q2Func;
@@ -33,7 +31,7 @@ int e_inline_used_nx(void);
 void e_report_hoist(const char *hex, int n);
 void e_report_inline(const char *hex, int ok, const char *why);
 
-/* The generic body (D2), the speculative body (D3) and the native entry. The
+/* The generic body, the speculative body and the native entry. The
    generic body is emitted first, and the speculative one forwards to it until
    it has a body of its own. */
 struct Q2Func;
@@ -42,8 +40,8 @@ int e_emit_spec_body(FILE *f, const struct Q2Func *fn, char hex[33]);
 /* The framed native entry, for a function a compiled caller may enter on the C
    stack: it builds the light frame and runs the speculative body on it. */
 void e_emit_native_entry(FILE *f, const struct Q2Func *fn, char hex[33]);
-/* Whether the function contains a call site, so its entry polls (rule P) and
-   checks the stack (rule K). */
+/* Whether the function contains a call site, so its entry polls (the poll rule) and
+   checks the stack (the stack-check rule). */
 int e_has_call_site(const struct Q2Func *fn);
 void e_emit_frameless_exit_fn(FILE *f, const struct Q2Func *fn, char hex[33]);
 void e_emit_frameless_forward(FILE *f, const struct Q2Func *fn, char hex[33]);
@@ -87,7 +85,7 @@ int e_pic_sites(const struct Q2Func *fn);
 
 /* --- options, set by the unit builder's command line ------------------- */
 
-/* --- the role table (D12) --------------------------------------------- */
+/* --- the role table --------------------------------------------- */
 
 /* How an op is lowered. Every op starts as an op call; later cards promote
    them by measured weight. */
@@ -103,7 +101,7 @@ int e_pic_sites(const struct Q2Func *fn);
 #define E_CF_SUSPEND 4
 #define E_CF_TRY 5
 
-/* The D6 location an op reads or writes, or 0. The generator uses this to
+/* The location an op reads or writes, or 0. The generator uses this to
    decide what kills a cached value, so an op that touches memory must not say
    0: a wrong 0 makes the cache stale, which is a miscompile. */
 #define E_MEM_NONE 0
@@ -119,7 +117,7 @@ typedef struct ERole {
   uint16_t rop;
   const char *fmt;      /* the engine's operand format */
   int8_t ndef, def[2];  /* destination operand indices */
-  /* D12 says use[4]. `iterator_next` has seven register operands
+  /* The role table says use[4]. `iterator_next` has seven register operands
      ("rrrrrrrr"), so four is too small; the table is generated and the struct
      is internal, so it holds the widest op the engine actually has. */
   int8_t nuse, use[8];  /* source operand indices */
@@ -129,7 +127,7 @@ typedef struct ERole {
   uint8_t mem;
   uint8_t control;
   uint8_t writes_regs;  /* writes registers beyond def[] */
-  uint8_t pure;         /* on D12's allow-list */
+  uint8_t pure;         /* on the op-call allow-list */
 } ERole;
 
 /* One entry per ROP_*, indexed by the opcode. NULL means the table has no
@@ -147,11 +145,11 @@ void e_rop_name(uint16_t rop, char *out, size_t n);
    by the profile) to the generator report. */
 void e_handoff_report(FILE *f);
 
-/* --emit2-poison: generate the units with D12's dynamic register check. The
-   unit must also be compiled with -DE2_POISON, which the poison run does. */
+/* --poison: generate the units with the dynamic register check. The
+   unit must also be compiled with -DE_POISON, which the poison run does. */
 void e_set_poison(int on);
 
-/* --emit2-nocall: omit the native call sites, so the call-cost benchmark can
+/* --nocall: omit the native call sites, so the call-cost benchmark can
    measure the entry without them. A/B switch, not a shipping mode. */
 void e_set_nocall(int on);
 
@@ -164,11 +162,11 @@ int e_nocall_on(void);
 
 /* --- the report ------------------------------------------------------- */
 
-/* --emit2-report FILE: open it once, write one line per function. */
+/* --report FILE: open it once, write one line per function. */
 void e_report_open(const char *path);
 void e_report_close(void);
 /* `weight` is the function's share of the profile's executed ops, in percent;
-   `delegated` says the old emitter produced the body in the end. */
+   `delegated` says the function was left to the interpreter. */
 void e_report_func(const JSAotGenFunc *g, const char *hex, double weight,
                     int delegated);
 
@@ -184,7 +182,7 @@ void e_report_opcall(uint16_t rop, double weight, int missarm);
 void e_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
                      int poll, int stack_check);
 
-/* The spec body's four report lines (step 8), keyed by digest: `values` by
+/* The spec body's four report lines, keyed by digest: `values` by
    representation (i32, f64, bool, tag); `tiers`, instructions lowered typed,
    through an op-call wrapper, left to a hand-off, and other (fused into a
    neighbour, or in a block the body never reaches); `checks`, guard sites by kind
@@ -197,11 +195,10 @@ void e_report_spec(
 /* --- the unit builder's native-entry registry --------------------------- */
 
 /* Tell the unit builder that the function at unit index `i` got a native entry,
-   so a call site elsewhere may name its `aot_n_`. A unit built with
-   `--emit2-only` emits the other functions with the old emitter, which emits
-   no native entry, and a call site that named one would not link. */
+   so a call site elsewhere may name its `aot_n_`: a call site that named a
+   function without one would not link. */
 void qjs_aot_note_native_entry(int index);
 /* The unit index of the function being emitted. */
 int qjs_aot_cur_func_idx(void);
 
-#endif /* QJSAOT2_E_H */
+#endif /* QJSAOT_EMIT_H */

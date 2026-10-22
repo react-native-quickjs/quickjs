@@ -6,7 +6,7 @@
  */
 
 /*
- * The builtins a unit lowers inline (card E15, D15) and what each one may do.
+ * The builtins a unit lowers inline and what each one may do.
  *
  * One row per intrinsic id, in the engine's numbering (`QJS_AOT_INTR_*`, the ids
  * of `qjs_aot_intrinsic_fn`). The table is the contract an inline lowering

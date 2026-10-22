@@ -42,7 +42,7 @@ int qjs_aot_inline_uses_nx(const char hex[33]);
 /* The driver's profile, for the function's dynamic weight. */
 double qjs_aot_prof_weight(const uint8_t dg[16]);
 
-/* --- the entry rules (D10 rules P and K) -------------------------------- */
+/* --- the entry rules: the poll and the stack check ---------------------- */
 
 /* Whether the function contains a call site: an op that can reach a call. The
    role table marks one with an argument window (the format's trailing `b`),
@@ -121,7 +121,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
       slots, has_var ? g->var_count : 0);
 
   /* Rule K: the stack check. The margin leaves room for the throw itself; a
-     4 KB margin crashed before, and 64 KB is what the E0 experiments used. */
+     4 KB margin crashed before; 64 KB has held. */
   if (check) {
     fprintf(
         f,
@@ -222,7 +222,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    return ret;\n}\n\n");
 }
 
-/* --- the frameless entry (card E9) -------------------------------------- */
+/* --- the frameless entry -------------------------------------- */
 
 /* `aot_nx_HEX`: the exit of a frameless body. It builds the frame the framed
    native entry builds, field for field, puts the live registers the body hands
@@ -367,8 +367,8 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     return -1;
   }
 
-  /* The generic body first: the speculative body forwards to it, and until E8
-     the speculative body is that forward. */
+  /* The generic body first: the speculative body forwards to it for everything
+     it does not lower. */
   rc = e_emit_generic_body(f, &fn, hex);
   if (rc != 0) {
     fprintf(
@@ -399,7 +399,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   } else if (rc == 0) {
     e_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
   }
-  /* The intrinsic sites, for the report: Batch 1 lowers them. */
+  /* The intrinsic sites, for the report. */
   if (rc == 0) {
     int ii;
     for (ii = 0; ii < fn.ninsns; ii++) {
@@ -421,7 +421,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   return ninsns;
 }
 
-/* The inline form of a function (card E15): `ei_HEX` written to `f` when the function
+/* The inline form of a function: `ei_HEX` written to `f` when the function
    is a candidate, else 0 with `why` set. Called once per function before any body
    is emitted, so a caller's emission can ask whether its callee has one. */
 int e_emit_inline_func(

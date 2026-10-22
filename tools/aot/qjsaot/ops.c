@@ -6,7 +6,7 @@
  */
 
 /*
- * The generic body (E2 design D2): frame-resident, every instruction pc an
+ * The generic body: frame-resident, every instruction pc an
  * entry, no exits.
  *
  * The frame is the home of every value, so there is no value map, no
@@ -28,7 +28,7 @@
 #include "ir.h"
 #include "analysis.h"
 
-/* Inline mode (card E15 part 1): the frameless body of a small leaf, emitted as
+/* Inline mode: the frameless body of a small leaf, emitted as
    `static inline int ei_HEX(...)` for a compiled caller to run in place. It is the
    frameless emission with three changes: every exit is `return 0` (nothing has
    happened, so the caller's native call is correct), the return stores the result
@@ -159,8 +159,8 @@ static int role_reads_reg(const ERole *role, const Q2Insn *in, int r) {
   return 0;
 }
 
-/* Whether the unit being generated will be compiled with -DE2_POISON. The
-   emitter sets it from the environment so `m1.sh e2` can build both units. */
+/* Whether the unit being generated will be compiled with -DE_POISON. The
+   emitter sets it from the command line (`--poison`). */
 static int g_poison;
 int e_poison_on(void) {
   return g_poison;
@@ -179,7 +179,7 @@ static int poison_applies(const Q2Insn *in, const ERole *role) {
   return 1;
 }
 
-/* D12's dynamic check around one op call. The work is done by two helpers in
+/* The dynamic register check around one op call. The work is done by two helpers in
    the unit prelude (`e_poison_pre`, `e_poison_post`); each call site passes
    two per-register mask strings, so the check costs one line per op rather
    than one per register, and a large function still compiles quickly.
@@ -267,7 +267,7 @@ static void emit_opcall(
    directly, never multiplied again. */
 #define E_ROFF(arg) ((int)(arg).val)
 
-/* --- native lowerings (E5) ----------------------------------------------
+/* --- native lowerings ----------------------------------------------
  *
  * A native lowering is frame-to-frame: it reads the operand registers, runs
  * the op's fast path inline, and stores the result. A miss falls through to
@@ -302,7 +302,7 @@ static int operand_off(const Q2Insn *in, int idx) {
 static const char *g_cur_hex = "";
 
 /* The tail every native lowering shares: the site counters (when the unit is
-   built with -DE2_COUNT), then the fall-through comment. A lowering's fast path
+   built with -DE_COUNT), then the fall-through comment. A lowering's fast path
    counts a hit before its `goto`; the op call below the block is the miss, so
    one `E_CTR(..., 0)` at the top of that block records it. `hex` names the
    function the site belongs to. */
@@ -1691,7 +1691,7 @@ static void emit_trivial(FILE *f, const Q2Insn *in, const ERole *role) {
   (void)role;
 }
 
-/* --- native call sites (E6) -----------------------------------------------
+/* --- native call sites -----------------------------------------------
  *
  * A call the profile shows as one known bytecode callee that is compiled into
  * this unit and can be entered on the C stack becomes a plain C call to the
@@ -1735,7 +1735,7 @@ static int call_site_shaped(const Q2Func *fn, const Q2Insn *in) {
    guard is the callee's bound entry against the entry this unit's body for that
    digest has. It does not see the engine's per-function disable bit, which
    leaves the entry bound: a direct call still enters a callee the engine
-   disabled. E2 bodies do not use that switch (D4), so the callee is always a
+   disabled. Bodies do not use that switch, so the callee is always a
    body that may run. A miss falls through to the next link of the chain. */
 static void emit_one_direct_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const char *hex, int next) {
@@ -1751,10 +1751,8 @@ static void emit_one_direct_call(
     snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
   else
     snprintf(recv, sizeof(recv), "JS_UNDEFINED");
-  /* Guarded by `Q2_SEL_`: a unit built with `--emit2-only` emits one function
-     and still contains call sites in the *other* functions, which the unit does
-     not define. The macro exists for exactly this and is set for every emitted
-     function. */
+  /* Guarded by `Q2_NATIVE_`: a call site names the callee's native entry only when
+     the unit defines one; the macro is set for every function that has one. */
   fprintf(f, "#ifdef Q2_NATIVE_%s\n", hex);
   fprintf(
       f,
@@ -1875,14 +1873,14 @@ int e_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    E_SEAL(ctx, f);\n");
   /* The first dispatch is an entry, not a back edge, so it does not poll: a
      loop polls on its back edge, a native entry with a call site polls
-     (rule P), and a call through the engine polls there. Polling here too cost
+     (the poll rule), and a call through the engine polls there. Polling here too cost
      a counter update on every call. Entry at pc 0 is the common case and skips
      the switch as well. */
   if (fn->ninsns > 0 && fn->insns[0].pc == 0)
     fprintf(f, "    if (__builtin_expect(entry_pc == 0, 1)) goto g_0;\n");
   fprintf(f, "    goto dispatch_switch;\n");
   fprintf(f, "dispatch:\n");
-  /* G7. A jump to a pc at or below the one that produced it is a back edge, so
+  /* A jump to a pc at or below the one that produced it is a back edge, so
      it polls: an inline decrement of the interrupt counter, and the engine only
      when the counter runs out. Without this a compiled loop never yields. */
   fprintf(f, "    if (__builtin_expect(entry_pc <= e_from_pc, 0)) {\n");
@@ -1909,7 +1907,7 @@ int e_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    switch (entry_pc) {\n");
   for (i = 0; i < fn->ninsns; i++)
     fprintf(f, "    case %d: goto g_%d;\n", fn->insns[i].pc, fn->insns[i].pc);
-  /* G8: a pc that is not an instruction start must never be dispatched. The
+  /* A pc that is not an instruction start must never be dispatched. The
      counters count it so the gate can require zero. */
   fprintf(f, "    default:\n");
   fprintf(f, "        e_g8_hits++;\n");
@@ -2040,7 +2038,7 @@ int e_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
   }
   }
 
-  /* G5: with no control records nothing can catch and there is nothing to
+  /* With no control records nothing can catch and there is nothing to
      close, so the exception leaves directly; that also avoids the unwind path,
      which reads the JSStackFrame a light frame does not have. */
   fprintf(f, "exception:\n");
@@ -2102,7 +2100,7 @@ static void e_handoff_note(const Q2Func *fn, const Q2Insn *in) {
   }
 }
 
-/* The report: `e2 handoff rop=<n> name=<..> weight=<..> blocks=<..>`, heaviest
+/* The report: `handoff rop=<n> name=<..> weight=<..> blocks=<..>`, heaviest
    first. */
 void e_handoff_report(FILE *f) {
   int i, j;
@@ -2166,7 +2164,7 @@ static const Q2Func *g_e_fn = NULL;
 static int g_e_blk = -1;
 /* The function index of the body being emitted; every exit's note must name it,
    or its exits are counted against another function's switch-off. */
-/* The per-function report counts (step 8), reset at each spec body: op-call
+/* The per-function report counts, reset at each spec body: op-call
    wrappers emitted, instructions lowered typed or through a wrapper, guard sites
    by kind (ax, vx, dx, ox), and exits by kind (deopt, hand-off). */
 static unsigned g_e_opcalls;
@@ -2174,7 +2172,7 @@ static int g_e_n_typed, g_e_n_opcall;
 static int g_e_n_guard[4];
 static int g_e_n_exit, g_e_n_handoff;
 
-/* The frameless body (card E9, D10): the speculative body written for a function
+/* The frameless body: the speculative body written for a function
    that has no frame. `g_e_fl` is set while one is being emitted; the first reason
    it cannot be one (an op that needs the engine's handler, an unlowered
    instruction) is `g_e_fl_block`, and the caller falls back to the framed body.
@@ -2449,7 +2447,7 @@ static void e_note_stub(
   (*n)++;
 }
 
-/* ---- monomorphic groups in the speculative body (D9) ------------------- */
+/* ---- monomorphic groups in the speculative body ------------------- */
 
 /* The facts of the body being emitted, run in the grouped-exit mode: an access
    the pass marks `miss_exits` is emitted with its miss as an EXIT before the
@@ -2936,7 +2934,7 @@ static void emit_trivial_own(
   }
 }
 
-/* ---- the spec body's exit primitive (E8 step 2a-1) ---------------------- */
+/* ---- the spec body's exit primitive ---------------------- */
 
 
 
@@ -3151,10 +3149,10 @@ static void e_emit_exit(
   }
   free(loff);
   free(lex);
-  /* A hand-off is the planned exit at an instruction the spec body does not lower
-     yet, not a failed speculation. Counting it as a deopt switched nearly every
-     spec body off after 257 calls while E8 is incomplete, which would have made
-     every measurement in this step time the generic body. */
+  /* A hand-off is the planned exit at an instruction the spec body does not lower,
+     not a failed speculation. Counting it as a deopt would switch nearly every
+     spec body off after 257 calls, and every measurement would time the generic
+     body. */
   fprintf(
       f, "    %s(%d);\n", handoff ? "E_HANDOFF_NOTE" : "E_EXIT_NOTE", fi);
   e_emit_generic_call(f, hex, pc, nlv, "    ");
@@ -3295,7 +3293,7 @@ static void e_emit_arm(
     return;
   }
   e_emit_edge_moves(f, fn, b, k, cur);
-  /* Shape checks hoisted out of the loop this edge enters (card E13). */
+  /* Shape checks hoisted out of the loop this edge enters. */
   if (g_e_facts != NULL && g_e_facts->nhoist > 0 && !q2_is_back_edge(fn, b, sb)) {
     int q, any = 0;
     for (q = 0; q < g_e_facts->nhoist; q++)
@@ -3587,9 +3585,8 @@ static void e_emit_presync(
 
 }
 
-/* THE SPEC-BODY OP CALL (step 5). The D12 contract in generated code.
-   Unused at the moment: the first user is 5b's field miss path. It is committed
-   ahead of its user so that path is a thin wrapper, as the plan said.
+/* THE SPEC-BODY OP CALL. The op-call contract in generated code.
+   The native emitters call it on their miss path, so that path is a thin wrapper.
 
    An op call is a SAFEPOINT, so the order is fixed:
      1. R6 sync: every live TAG value in cur[] is written to the frame FIRST. The call
@@ -3601,7 +3598,7 @@ static void e_emit_presync(
         which already decodes every instruction and handles every type.
      4. The three sentinels, and the control-transfer test: an ip that is NOT
         `code + next` means a handler took an exception or the op jumped, which is the
-        D11 try rule. The frame is already synced, so that is an ordinary exit.
+        try rule. The frame is already synced, so that is an ordinary exit.
      5. Reload ONLY what the role may have written, BY VALUE ID, each with the tag
         guard at its definition: the handler returned a JSValue, so a def the analysis
         typed i32/f64/bool is not safe to read blindly. A mismatch is a deopt exit at
@@ -3617,7 +3614,7 @@ static int emit_typed_opcall(
   int r, any;
 
   /* The CALLER decides when to use this: a native spec emitter calls it on its
-     miss path, and Batch 4's general rule calls it for any non-lowered instruction.
+     miss path, and the dispatcher calls it for any instruction no emitter lowers.
      So the tier test lives there, not here -- one copy of the op-call sequence. */
   if (role == NULL) return 0;
   if (role->control != E_CF_NONE) return 0;
@@ -3664,7 +3661,7 @@ static int emit_typed_opcall(
       f,
       "    if (__builtin_expect(ip_ == QJS_AOT_COLD_RET || "
       "ip_ == QJS_AOT_SUSPEND, 0)) return qjs_aot_ret(f);\n");
-  /* D11: a handler that caught the exception (or an op that jumped) returns an ip
+  /* A handler that caught the exception (or an op that jumped) returns an ip
      that is not the next instruction. In the SPEC body this must be an ordinary exit
      (rule R1): there is no `dispatch` label in aot_f_<hex> -- that is the generic
      body's -- so the earlier version compiled only because nothing emitted this yet.
@@ -3871,7 +3868,7 @@ static int emit_term_wrapper(
 }
 
 /* ---- fused compare-and-branch on a local slot, and the local read-modify-write
-   branch (card E11) -------------------------------------------------------------
+   branch -------------------------------------------------------------
    `branch_cmp_loc_reg` / `reg_loc` / `loc_loc` compare a variable slot (frame memory)
    with a register or another slot; `local_rmw_branch` updates a slot in place and
    branches (a loop's `i++`/`i--` and back edge). The int and double cases are inline;
@@ -4412,7 +4409,7 @@ static const char *e_intr_control(void) {
   return v;
 }
 
-/* ---- intrinsic calls (card E15) ------------------------------------------
+/* ---- intrinsic calls ------------------------------------------
 
    A call whose profiled callee is one engine builtin (Math.floor, parseInt, ...)
    with numeric arguments cannot run JS, allocate or write memory, so in the
@@ -4615,7 +4612,7 @@ static int emit_intrinsic_call(
   return 1;
 }
 
-/* ---- a call inside an inline body (card E15 part 2) -------------------------
+/* ---- a call inside an inline body -------------------------
 
    The nested call is the ordinary compiled-to-compiled call -- the callee's bound
    entry checked against this unit's body, then `aot_n_` -- with no op-call wrapper
@@ -4780,7 +4777,7 @@ static int emit_inl_nested_call(
   return 1;
 }
 
-/* ---- `new C(...)` with a known constructor (card E16) ----------------------
+/* ---- `new C(...)` with a known constructor ----------------------
    The site checks the constructor's identity (bound entry), allocates `this` with the
    engine's own allocation for a plain light constructor (`qjs_aot_construct_this`),
    runs the compiled body with it, and applies the result rule: an object the
@@ -4900,7 +4897,7 @@ static int emit_typed_construct(
   return 1;
 }
 
-/* ---- allocating ops without the step handler (card E16 batch B) -----------
+/* ---- allocating ops without the step handler -----------
    `new_object`, `object_template`, `array_from`, `special_object` (`arguments` and the
    family) and `apply_arguments` call the engine's own bodies for the op (patch 0317)
    and take the owned result, instead of stepping the handler. Allocation is a
@@ -5189,7 +5186,7 @@ static int emit_alloc_op(
    same eligibility, same call sequence, and the result taken with
    `qjs_aot_set_reg_p` because `aot_n_` hands back an OWNED reference.
 
-   RULE (E8): an emitter decides EVERYTHING before it writes a byte. This one used to
+   RULE: an emitter decides EVERYTHING before it writes a byte. This one used to
    emit the call and then return 0 for an unrepresentable def, so the dispatcher ALSO
    handed off -- and the callee ran twice. (Measured: smoke.js's `lc4` was one extra
    `lf1` call, i.e. exactly 2.5 too high per iteration.) So every check runs first.
@@ -6103,7 +6100,7 @@ static int emit_group_write(
   return 1;
 }
 
-/* ---- polymorphic property sites (card E12) -------------------------------
+/* ---- polymorphic property sites -------------------------------
    A site the profile saw with 2-4 shapes, all own slots, is served by the per-site
    polymorphic cache: a compare chain over its four (shape, offset) entries, and on a
    miss `qjs_aot_poly_fill`, which runs no JS and only caches an own data slot, so
@@ -6905,7 +6902,7 @@ static int emit_typed_branch_bool(
   return 1;
 }
 
-/* ---- TAG-operand fast paths (card E9) ------------------------------------
+/* ---- TAG-operand fast paths ------------------------------------
 
    An arithmetic, bitwise, compare or unary op whose operand the analysis left
    TAG (the profile has no record for it, or saw only numbers through a path the
@@ -7421,7 +7418,7 @@ static int emit_typed_branch(
   av = in->use[0];
   bv = in->use[1];
   if (av >= (Q2ValueId)t->nvalues || bv >= (Q2ValueId)t->nvalues) return 0;
-  /* TAG is admitted: the dispatch below handles it (E8 slice 2d). */
+  /* TAG is admitted: the dispatch below handles it. */
   if ((t->lb[av] != E_LB_I32 && t->lb[av] != E_LB_F64 &&
        t->lb[av] != E_LB_TAG) ||
       (t->lb[bv] != E_LB_I32 && t->lb[bv] != E_LB_F64 &&
@@ -7438,11 +7435,11 @@ static int emit_typed_branch(
      ONCE through e_emit_arm -- so edge moves, back-edge polls and R6 syncs are
      exactly as before and only the way `c_` is computed changes.
 
-     A TAG operand is dispatched on its tag (E8 slice 2d): INT compares as i32 (or
+     A TAG operand is dispatched on its tag: INT compares as i32 (or
      as a double when the other side is f64), FLOAT64 compares as a double, and
      anything else jumps to the function's COLD ARM `hx_<pc>`, a hand-off at the
      branch's own pc. It is a hand-off, not a deopt: a string compare is not a
-     failed speculation and must not count toward D4's switch-off. */
+     failed speculation and must not count toward the switch-off. */
   {
     int tag_side = -1, ntags = 0;
     char ex[128];
@@ -7558,7 +7555,7 @@ static int emit_typed_branch(
   return 1;
 }
 
-/* The D8 unary operations the spec body lowers.
+/* The unary operations the spec body lowers.
 
    `inc`/`dec` on an i32 local: the machine's `+ 1` / `- 1`, with the one value
    that overflows (`INT32_MAX` / `INT32_MIN`) taking the deopt exit at this
@@ -7768,29 +7765,24 @@ static int emit_typed_return(
   return 1;
 }
 
-/* The speculative body (E8).
+/* The speculative body.
 
-   Step 1 is the skeleton: the D4 switch-off counters, the S7 entry (which
-   refuses anything but a fresh entry at pc 0, and refuses once speculation has
-   been switched off for this function), the S1 locals, and the blocks in
-   reverse postorder with their edges -- a parameter move per successor
-   parameter, through a temporary so parameters may swap, exactly as
-   `q2_emit_edge` does it in the generic body.
-
-   Step 2 replaces each block's body with the typed lowerings. Until then a
-   reached block forwards to the generic body at its own start pc, so the
-   skeleton is exercised (entry, counters, classification, edges) without
-   claiming a single typed value: a mismatch between the two bodies cannot hide
-   behind unfinished lowerings, because the fallback is the correct body. */
+   The switch-off counters, the entry (which refuses anything but a fresh entry at
+   pc 0, and refuses once speculation has been switched off for this function), the
+   locals, and the blocks in reverse postorder with their edges -- a parameter move
+   per successor parameter, through a temporary so parameters may swap, exactly as
+   `q2_emit_edge` does it in the generic body. Each block's body is the typed
+   lowerings; an instruction none of them takes hands off to the generic body at its
+   own pc, which is the correct body, so a mismatch between the two bodies cannot
+   hide behind a missing lowering. */
 /* How many functions were refused for the speculative body because they are
    irreducible (a back edge to a block that does not dominate its source). The
    report prints it; it should stay 0 for structured bytecode. */
 int e_irreducible = 0;
 
 /* ============================ the rop -> emitter table ====================
-   ONE emitter per rop. This replaces the long `else if` chain whose ORDER was the
-   bug five times in E8 (add_imm_self_s, the wrapper's tier gate, the fused ops, and
-   load_const twice): with a chain, an op silently stops lowering when an earlier,
+   ONE emitter per rop. A long `else if` chain's ORDER was the bug several times
+   (add_imm_self_s, the wrapper's tier gate, the fused ops, load_const): with a chain, an op silently stops lowering when an earlier,
    wider test claims it, and a restructure can resurrect one of these without any
    test noticing. Here an op appears exactly once and the compiler checks the cases.
 
@@ -7937,8 +7929,8 @@ static int e_dispatch_rop(
   /* NO CATCH-ALL YET. This is a REFACTOR: the histogram must be identical before
      and after, and adding the general op-call fallback here would lower ops
      (object_fill, object_template, make_closure, ...) that the chain handed off --
-     which is Batch 4's (c) decision to make explicitly, not a side effect of
-     making the dispatch table-driven. */
+     which is a decision to make explicitly, not a side effect of making the
+     dispatch table-driven. */
   return 0;
 }
 
@@ -8090,9 +8082,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
 
      THE SPEC SWITCHES MUST BE HONOURED HERE TOO. `q2_spec_on`/`q2_no_spec` are set
      from QJS_AOT_SPEC/QJS_AOT_NO_SPEC, but the OLD emitter's spec entry was the only
-     reader -- so the E8 spec body ran even with QJS_AOT_SPEC=0, and the harness's
-     "nospec" pass was never a generic-only run. Every nospec result on this card
-     before this line was measuring the spec bodies. */
+     reader -- so the spec body ran even with QJS_AOT_SPEC=0, and the harness's
+     "nospec" pass was never a generic-only run. */
   if (g_e_inl)
     fprintf(
         f,
@@ -8111,15 +8102,15 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         "    if (__builtin_expect(entry_pc != 0 || (e_off[%d] | e_dis[%d]), 0))\n"
         "        return %s;\n",
         fi, fi, gene);
-  /* The index must be inside the D4 arrays; the generator sized them from the
+  /* The index must be inside the switch-off arrays; the generator sized them from the
      function count, so this can only fail if the two disagree. */
   fprintf(
       f, "    _Static_assert(%d < QJS_AOT_NFUNCS, \"function index\");\n",
       fi);
   if (!g_e_fl) fprintf(f, "    E_SEAL(ctx, f);\n");
 
-  /* D9's group cells arrive in E9; until then a NULL pic means there is no
-     profile to speculate on and the generic body is the only body. */
+  /* A NULL pic means there is no profile to speculate on and the generic body is
+     the only body. */
   fprintf(f, "    {\n");
   if (g_e_fl) {
     fprintf(
@@ -8149,7 +8140,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         "        return %s;\n"
         "    }\n",
         fi, gen0);
-  /* D9 step 2. Entry: each group some access uses takes the shape its first
+  /* Entry: each group some access uses takes the shape its first
      site's cell holds, and every other site's cell must agree. A NULL first cell
      means the profile's shape is not in the cache yet (the generic body will
      fill it); a filled cell that names ANOTHER shape means this run does not
@@ -8303,8 +8294,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       unsigned oc0 = g_e_opcalls;
       if (g_e_dirty_ins != NULL) g_e_dirty_ins[i2] = (uint8_t)g_e_inl_dirty;
       const ERole *role = e_roles[in->rop];
-      /* A terminator ends the block; branches are 2b's, so for now the block
-         exits at the terminator's pc. */
+      /* A terminator ends the block: a return, branch or switch lowers here, any
+         other exits at the terminator's pc. */
       if (role != NULL && role->control != E_CF_NONE) {
         if (emit_typed_return(f, fn, in, &types, cur, have_types)) {
           lowered_to = i2 + 1;
@@ -8451,7 +8442,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       e_handoff_note(fn, &fn->insns[lowered_to]);
       e_fl_block("unlowered", &fn->insns[lowered_to]);
       /* NAME THE REASON. The reps come from ETypes.lb -- never Q2Value.rep,
-         which holds the old emitter's inference and reads BOT as TAG. A decline is
+         which reads BOT as TAG. A decline is
          almost always a representation some emitter will not accept. */
       if (!g_e_quiet || getenv("QJS_AOT_FL_VERBOSE")) {
         const Q2Insn *hi = &fn->insns[lowered_to];
@@ -8499,7 +8490,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       if (is_term) {
         e_handoff_note(fn, &fn->insns[last]);
         e_fl_block("terminator", &fn->insns[last]);
-        fprintf(f, "    /* the terminator is 2b's: exit at its own pc */\n");
+        fprintf(f, "    /* the terminator: exit at its own pc */\n");
         e_emit_exit(f, fn, fn->insns[last].pc, hex, fi, cur, set, 1, b);
       } else if (blk->nsucc == 1 && blk->succ_block[0] >= 0 &&
                  blk->succ_block[0] < fn->nblocks) {
@@ -8628,7 +8619,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
      here. A hand-off at the branch's own pc -- the arithmetic has not run and the
      branch has not been taken, so the generic body redoes the compare -- and NOT a
      deopt: a string compare is not a failed speculation and must not count toward
-     D4's switch-off. */
+     the switch-off. */
   {
     int o;
     for (o = 0; o < g_e_hx_n; o++) {
@@ -8870,10 +8861,10 @@ int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
 int e_fl_was_chosen(void) { return g_e_fl_chosen; }
 const char *e_fl_why_not(void) { return g_e_fl_why; }
 
-/* ---- inline bodies (card E15 part 1) ---------------------------------------
+/* ---- inline bodies ---------------------------------------
 
    A small leaf, emitted as `ei_HEX` for a compiled caller to run in place of the
-   call. See g_e_inl. The candidate rule is D15's: `light_ok`, no loop, at most 40
+   call. See g_e_inl. The candidate rule is the rule: `light_ok`, no loop, at most 40
    instructions, no call but an intrinsic, no op that needs the engine's handler (the
    frameless emission blocks on any), every value typed by its own speculative body.
    The checks of every block come before any store, which the text is checked for. */

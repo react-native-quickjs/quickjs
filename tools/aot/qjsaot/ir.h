@@ -16,8 +16,8 @@
  * The IR is built from the *register program* (the encoded bytecode the engine
  * runs), never from JSFunctionDef: the generator only ever sees that program.
  */
-#ifndef QJSAOT2_IR_H
-#define QJSAOT2_IR_H
+#ifndef QJSAOT_IR_H
+#define QJSAOT_IR_H
 
 #include <stdint.h>
 #include <stdio.h>
@@ -93,8 +93,7 @@ enum {
   Q2_OP_LOAD_THIS,
   Q2_OP_PUT_FIELD,
   Q2_OP_CALL,
-  /* Ops the E2 projection named as unmodelled (`.local/E2-PROJECTION.md`
-     recommendation 1). Before these existed, q2_rop_info returned FALLBACK
+  /* Ops the IR names so they have operands. Before these existed, q2_rop_info returned FALLBACK
      with no operands, so the IR treated the instruction as redefining every
      live register and the arithmetic after it was boxed. */
   Q2_OP_POST_INC,    /* t, s, h: h = ++s, t = the value before -- 2 dests */
@@ -147,7 +146,7 @@ typedef struct Q2Value {
   uint32_t ptypes;
   uint8_t has_prof, frac, negzero;
   /* Which profile record `has_prof` came from: 0 for the per-pc `P` record,
-     1 for the per-register `R` record. Reported by `--emit2-types` so a test
+     1 for the per-register `R` record. Reported by `--types` so a test
      can assert which one a destination used. */
   uint8_t prof_src;
   double nmin, nmax;
@@ -293,4 +292,4 @@ int q2_is_reducible(const Q2Func *f);
    definition: nothing else compares pcs or block indices to decide this. */
 int q2_is_back_edge(const Q2Func *f, int u, int v);
 
-#endif /* QJSAOT2_IR_H */
+#endif /* QJSAOT_IR_H */

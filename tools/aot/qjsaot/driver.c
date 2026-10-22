@@ -260,11 +260,8 @@ static long long count_insns(const uint8_t *code, int len);
 static int g_dump_ir = 0;
 static const char *g_ir_path = NULL;
 
-/* --emit2: build the unit with the E2 emitter. --emit2-only HEX restricts it to
-   one function so the two emitters can be compared function by function, and
-   --report FILE writes one line per function saying which emitter
-   produced its body. */
-static const char *g_emit2_report = NULL;
+/* --report FILE writes one line per function, and a summary. */
+static const char *g_report_path = NULL;
 
 static void dump_ir_func(FILE *f, const JSAotGenFunc *g) {
   char hex[33];
@@ -1279,17 +1276,16 @@ typedef struct {
   size_t len;
 } EmitBuf;
 
-/* The inline forms (`ei_HEX`) of the unit's small leaves, by unit index (card E15). */
+/* The inline forms (`ei_HEX`) of the unit's small leaves, by unit index. */
 static EmitBuf *g_inl_eb;
 static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
 
-/* Which functions this run's E2 emitter gave a native entry. A call site may
-   only name an `aot_n_` that some body in this unit defines, and a unit built
-   with `--emit2-only` emits the *other* functions with the old emitter, which
-   emits no native entry. Keyed by unit index. */
+/* Which functions this run's emitter gave a native entry. A call site may
+   only name an `aot_n_` that some body in this unit defines, and only a
+   light-eligible function gets one. Keyed by unit index. */
 static uint8_t *g_e_native;
 
-/* The E2 emitter's hook, so the unit builder knows which bodies it produced. */
+/* The emitter's hook, so the unit builder knows which bodies it produced. */
 void qjs_aot_note_native_entry(int index) {
   if (g_e_native && index >= 0) g_e_native[index] = 1;
 }
@@ -1435,7 +1431,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--split") == 0 && i + 1 < argc) {
       split_dir = argv[++i];
     } else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
-      g_emit2_report = argv[++i];
+      g_report_path = argv[++i];
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       g_dump_ir = 1;
     } else if (strcmp(argv[i], "--dump-ir-out") == 0 && i + 1 < argc) {
@@ -1578,7 +1574,7 @@ int qjsaot_driver_main(int argc, char **argv) {
      call each other. */
   if (split_dir != NULL) e_set_split(1);
   e_roles_check();
-    e_report_open(g_emit2_report);
+    e_report_open(g_report_path);
     /* The inline forms first: a caller asks whether its callee has one while its own
        body is emitted. */
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
@@ -1985,12 +1981,12 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(f, "#include <stdlib.h>\n");
     if (g_check_locals) fprintf(f, "#include <string.h>\n#include <stdio.h>\n");
     fprintf(f, "\n");
-    /* The unit's function count, so the D4 counter arrays are sized exactly
+    /* The unit's function count, so the switch-off counter arrays are sized exactly
        rather than to a guessed bound. In a split unit this text is the shared
        header, and the arrays are declared there and defined once in reg.c. */
     fprintf(f, "#define QJS_AOT_NFUNCS %uu\n",
             nfuncs > 0 ? (unsigned)nfuncs : 1u);
-    /* The function names, indexed the same way as the D4 counter arrays, so the
+    /* The function names, indexed the same way as the switch-off counter arrays, so the
        teardown line can print one row per function and a test can assert on one
        by name. */
     {
@@ -2035,10 +2031,10 @@ int qjsaot_driver_main(int argc, char **argv) {
            chain is disabled (see q2_poly_site): with it, DeltaBlue's compiled
            body reported a constraint cycle the interpreter does not. */
         "static int q2_no_spec, q2_spec_on;\n"
-        /* E2 unit counters (D14 part 2). `e_g8_hits` counts a dispatch to a
+        /* Unit counters. `e_g8_hits` counts a dispatch to a
            pc that is not an instruction start; it must stay 0. */
         "static unsigned long e_g8_hits;\n"
-        /* The D4 switch-off counters, exactly one entry per function in the
+        /* The switch-off counters, exactly one entry per function in the
            table. A function whose speculative body keeps exiting, or keeps
            refusing at entry, is switched off for good and its calls go straight
            to the generic body.
@@ -2077,7 +2073,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  for (i = 0; i < QJS_AOT_NFUNCS; i++) t += e_ent[i];\n"
         "  return t;\n"
         "}\n"
-        "/* With QJS_AOT_UNIT_STATS=1 in the environment, print the E2 counters at\n"
+        "/* With QJS_AOT_UNIT_STATS=1 in the environment, print the unit counters at\n"
         "   teardown so a test can prove the speculative body actually ran. Without\n"
         "   it a case that means to exercise a spec path passes even when the body\n"
         "   is never entered -- which is exactly how the entry-refusal bug survived\n"
@@ -2163,15 +2159,14 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_EXIT_NOTE(fi) do { if (++e_exi[fi] > 256 && \\\n"
         "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
-        "   body does not lower yet (or at a terminator 2b has not reached). While\n"
-        "   E8 is incomplete almost every function has one, so feeding those to\n"
-        "   D4 switched every spec body off after 257 calls and every measurement\n"
-        "   timed the generic body. They are counted, never acted on. */\n"
+        "   body does not lower. Counting them toward the switch-off would turn off\n"
+        "   every spec body after 257 calls and every measurement would time the\n"
+        "   generic body. They are counted, never acted on. */\n"
         "#define E_HANDOFF_NOTE(fi) (e_han[fi]++)\n"
         "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
         "#define E_REFUSE_NOTE(fi) do { if (++e_ref[fi] > 256 && \\\n"
         "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
-        /* The D12 dynamic check, compiled into the unit only with -DE2_POISON.
+        /* The dynamic register check, compiled into the unit only with -DE_POISON.
            It compares every register an op call was not allowed to write
            against a copy taken before the call, by tag and then by kind, so a
            handler that writes a register it did not declare is caught at the
@@ -2266,7 +2261,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "          e_poison_calls, e_poison_regs);\n"
         "}\n"
         "#endif\n"
-        /* Per-site hit/miss counters (compiled with -DE2_COUNT=1). One pair per
+        /* Per-site hit/miss counters (compiled with -DE_COUNT=1). One pair per
            inline fast path, so a lowering that never hits is visible as data
            rather than inferred from a benchmark. A site is named by its
            function's digest, the instruction's pc and the op, which is what the
@@ -2350,7 +2345,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_CTR(hex, pc, rop, hit) ((void)0)\n"
         "#define E_PUTWHY(w) ((void)0)\n"
         "#endif\n"
-        /* D10's frame seal. The engine's frame area has a top marker, and a
+        /* The frame seal. The engine's frame area has a top marker, and a
            compiled function may be running on a frame above it; a native call
            made from there lets the callee's own calls into the engine allocate
            a frame at that marker, writing over the caller's registers. Sealing
@@ -2424,7 +2419,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  for (i = 0; i < QJS_AOT_NFUNCS; i++)\n"
         "    e_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
         "}\n\n"
-        /* The builtins a unit lowers inline (card E15): the engine's own
+        /* The builtins a unit lowers inline: the engine's own
            function pointers, filled once, and the number view the inline C
            works on (k: 0 not a number, 1 int, 2 double, 3 undefined). */
         "typedef struct { int k; int i; double d; } Q2Num;\n"
@@ -3357,11 +3352,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
           hex, hex);
       /* `Q2_SEL_` says the function's *body* is in this unit. A call site needs
-         more: the native *entry*, which exists only for a body the E2 emitter
-         produced for a light-eligible function. A unit built with
-         `--emit2-only` emits every other function with the old emitter, which
-         emits no entry, so the two must be distinguished or a call site names
-         an `aot_n_` nothing defines. */
+         more: the native *entry*, which exists only for a light-eligible
+         function, so the two must be distinguished or a call site names an
+         `aot_n_` nothing defines. */
       if (qjs_aot_has_native_entry(i))
         fprintf(
             f,
@@ -3438,7 +3431,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         return 2;
       }
       fprintf(f, "#include \"quickjs-aot-rt.h\"\n#include \"u.h\"\n");
-      /* The D4 counters are declared in the shared header, so they are defined
+      /* The switch-off counters are declared in the shared header, so they are defined
          exactly once, here. */
       fprintf(
           f,

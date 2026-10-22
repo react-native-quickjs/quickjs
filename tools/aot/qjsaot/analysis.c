@@ -33,7 +33,7 @@
  * emitter does not re-derive them from the operation and cannot disagree with
  * the analysis about them.
  *
- * Three profile-lookup rules are bugs the old emitter had and this pass fixes:
+ * Three profile-lookup rules, each a bug an earlier lookup had that this pass avoids:
  *
  *   1. a call's result is its own call-result record (the `K` line), keyed by
  *      the pc after the call; the `P` record at that pc is the next
@@ -815,7 +815,7 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     int d;
-    /* A forwarded instruction is a move of the value it copies (D7), so its
+    /* A forwarded instruction is a move of the value it copies, so its
        record says nothing about it: the transfer decides. */
     if (facts != NULL && facts->fwd[i] != Q2_NO_VALUE) continue;
     if (in->op == Q2_OP_CONST) {
@@ -1234,7 +1234,7 @@ int e_analysis_dump(
   if (e_analyze(fn, &facts, &types) < 0) return -1;
 
   {
-    /* The header names the function the way the E2 report does: `name
+    /* The header names the function the way the report does: `name
        file:line:col`, so a dump and a report line can be matched by eye. */
     char pos[320];
     if (fn->g->line > 0)
