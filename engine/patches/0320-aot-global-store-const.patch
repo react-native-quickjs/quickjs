@@ -1,0 +1,49 @@
+Subject: Run put_global and load_const without stepping the handler
+
+What this does
+  Adds `qjs_aot_put_global(ctx, atom, v, init)` (the handler's global store of a borrowed
+  value) and `qjs_aot_load_const(ctx, f, kind, idx, &out)` (a constant-pool entry or an
+  atom's string, as an owned value).
+
+Why we need it
+  Both were a step in a compiled body: a global store is a hot op in code that keeps its
+  state in globals, and a non-numeric constant is loaded on every use of a string or
+  object literal.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62283,6 +62283,18 @@
+     return 0;
+ }
+ 
++int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init)
++{
++    return JS_SetGlobalVar(ctx, (JSAtom)atom, js_dup(v), init) < 0 ? -1 : 0;
++}
++
++int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
++                       JSValue *out)
++{
++    *out = kind == REG_CONST_CPOOL ? js_dup(f->b->cpool[idx]) : JS_AtomToValue(ctx, idx);
++    return JS_IsException(*out) ? -1 : 0;
++}
++
+ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
+                         int n, int ti)
+ {
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -354,6 +354,13 @@
+ int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
+ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
+ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
++/* `put_global`: the engine's global store of a borrowed value (it duplicates).
++   0, or -1 on an exception. */
++int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init);
++/* `load_const` of the constant pool (kind 0) or an atom (kind 1): 0 with an OWNED *out,
++   -1 on an exception. */
++int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSValue *out);
++
+ /* Fills an object literal's properties from `n` registers (`object_fill`): the
+    template's shape when the object still has it, else property definitions. The
+    registers are left undefined, as the handler leaves them. 0, or -1 on an exception. */

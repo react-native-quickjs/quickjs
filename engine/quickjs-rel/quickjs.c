@@ -62283,6 +62283,18 @@ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
     return 0;
 }
 
+int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init)
+{
+    return JS_SetGlobalVar(ctx, (JSAtom)atom, js_dup(v), init) < 0 ? -1 : 0;
+}
+
+int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
+                       JSValue *out)
+{
+    *out = kind == REG_CONST_CPOOL ? js_dup(f->b->cpool[idx]) : JS_AtomToValue(ctx, idx);
+    return JS_IsException(*out) ? -1 : 0;
+}
+
 int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
                         int n, int ti)
 {
