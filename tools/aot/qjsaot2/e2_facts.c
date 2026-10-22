@@ -563,6 +563,7 @@ static int build_groups(const Q2Func *fn, E2Facts *f) {
       sites[n].insn = i;
       sites[n].group = E2_GROUP_NONE;
       sites[n].recv = ref[r].recv < 0 ? Q2_NO_VALUE : (Q2ValueId)ref[r].recv;
+      sites[n].poly = 0;
       n++;
     }
   }
@@ -571,7 +572,12 @@ static int build_groups(const Q2Func *fn, E2Facts *f) {
     uint64_t shapes[4];
     const Q2Insn *in = &fn->insns[sites[k].insn];
     if (!qjs_aot_prof_site(fn->g->digest, sites[k].site, &ns, shapes)) continue;
-    if (ns != 1) continue; /* polymorphic or never filled: no group */
+    if (ns >= 2 && ns <= 4 && qjs_aot_prof_site_own(fn->g->digest, sites[k].site) &&
+        !qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) {
+      sites[k].poly = 1; /* served by the polymorphic cache, not grouped */
+      continue;
+    }
+    if (ns != 1) continue; /* never filled, or too many shapes: no group */
     /* Only an own readable or writable slot has a fixed offset to group on. */
     if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) continue;
     if (qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) continue;
@@ -663,7 +669,9 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
     if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
       if (ref[r].site < 0 || ref[r].recv < 0 ||
-          e2_facts_site_group(f, ref[r].site) < 0)
+          (e2_facts_site_group(f, ref[r].site) < 0 &&
+           !(e2_facts_poly_on && nr == 1 && e2_facts_poly_op(in) &&
+             e2_facts_site_poly(f, ref[r].site))))
         grouped = 0;
     kind = grouped ? E2_SK_NOJS : E2_SK_SAFE;
     f->miss_exits[insn] = (uint8_t)grouped;
@@ -913,6 +921,22 @@ void e2_facts_free(E2Facts *f) {
     free(f->blocks);
   }
   memset(f, 0, sizeof(*f));
+}
+
+int e2_facts_poly_on;
+
+int e2_facts_site_poly(const E2Facts *f, int site) {
+  int i;
+  if (f == NULL || f->sites == NULL) return 0;
+  for (i = 0; i < f->nsites; i++)
+    if (f->sites[i].site == site) return f->sites[i].poly;
+  return 0;
+}
+
+int e2_facts_poly_op(const Q2Insn *in) {
+  return in->rop == ROP_get_field || in->rop == ROP_get_field_own ||
+         in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own ||
+         in->rop == ROP_put_field;
 }
 
 int e2_facts_site_group(const E2Facts *f, int site) {

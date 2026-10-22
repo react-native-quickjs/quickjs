@@ -4301,6 +4301,7 @@ int e2_analyze(const Q2Func *fn, E2Facts *facts, E2Types *types) {
     g_e2_intr_mask = NULL;
     if (in->op == Q2_OP_CALL && e2_intrinsic_lowerable(fn, in)) mask[i] = 1;
   }
+  e2_facts_poly_on = !g_e2_fl && getenv("QJS_AOT_E2_NOPOLY") == NULL;
   for (rounds = 0; rounds < 8; rounds++) {
     int changed = 0;
     g_e2_intr_mask = mask;
@@ -5187,6 +5188,10 @@ static int emit_typed_field_chain(
    A miss goes to the op-call wrapper: the store may be a setter, which runs JS.
    Operand registers are read from their LOCALS (R4/R5): a TAG operand is synced to
    its frame slot first because the helper takes JSValues from the frame. */
+static int e2_poly_site_ok(const Q2Func *fn, const Q2Insn *in, int site);
+static int emit_poly_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int site,
+    Q2ValueId rv, const char *boxed);
 static int emit_typed_field_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -5224,6 +5229,8 @@ static int emit_typed_field_write(
       /* No reference counting inline: a store of a TAG value (an object, null)
          over what is usually a reference leaves on nearly every execution. */
       if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
+      if (e2_poly_site_ok(fn, in, site))
+        return emit_poly_write(f, fn, in, cur, site, rv, boxed);
       if (e2_must_exit(fn, in)) return 0;
       /* The inline store counts references. */
       if (g_e2_fl) return 0;
@@ -5485,6 +5492,114 @@ static int emit_group_write(
   return 1;
 }
 
+/* ---- polymorphic property sites (card E12) -------------------------------
+   A site the profile saw with 2-4 shapes, all own slots, is served by the per-site
+   polymorphic cache: a compare chain over its four (shape, offset) entries, and on a
+   miss `qjs_aot_poly_fill`, which runs no JS and only caches an own data slot, so
+   the fill arm continues and the access is no safepoint. A property that is not own
+   data (or an unhashed shape) is an EXIT before the instruction. Framed bodies
+   only: the fill needs the frame. */
+static int e2_poly_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
+  (void)fn;
+  return e2_facts_poly_on && g_e2_facts != NULL && e2_facts_poly_op(in) &&
+         e2_facts_site_poly(g_e2_facts, site) && e2_must_exit(fn, in);
+}
+
+/* The chain: leaves `_po` set or jumps to the exit. `write` selects the entry kind
+   (a read accepts either kind, a write only a writable one). */
+static void e2_poly_chain(FILE *f, const char *recv, int site, int atom_off, int write, int pc) {
+  const char *ctl = getenv("QJS_AOT_E2_POLY_CONTROL");
+  int k;
+  fprintf(
+      f,
+      "      const void *_pe = q2_poly(f, %d), *_psh = q2_shape_of(%s);\n"
+      "      uint32_t _po = 0;\n"
+      "      if (__builtin_expect(_psh == NULL, 0)) goto vx_%d;\n"
+      "      if (_pe != NULL && (\n",
+      site, recv, pc);
+  for (k = 0; k < 4; k++) {
+    /* Negative control: "nocmp" drops the last compare, so any shape that misses
+       the first three uses the fourth entry's offset. */
+    if (ctl != NULL && strcmp(ctl, "nocmp") == 0 && k == 3)
+      fprintf(f, "          (_po = q2_poly_off(_pe, 3), 1)");
+    else if (write)
+      fprintf(
+          f,
+          "          (q2_poly_shape(_pe, %d) == _psh && q2_poly_kind(_pe, %d) == 2 &&\n"
+          "           (_po = q2_poly_off(_pe, %d), 1))",
+          k, k, k);
+    else
+      fprintf(
+          f, "          (q2_poly_shape(_pe, %d) == _psh && (_po = q2_poly_off(_pe, %d), 1))",
+          k, k);
+    fprintf(f, k < 3 ? " ||\n" : "\n");
+  }
+  fprintf(
+      f,
+      "          )) { }\n"
+      "      else if (__builtin_expect(!qjs_aot_poly_fill(ctx, f, %d, %s,\n"
+      "                   (int)qjs_aot_ld_u32(q2_code(f) + %d), %d, &_po), 0))\n"
+      "          goto vx_%d;\n",
+      site, recv, atom_off, write, pc);
+}
+
+static int emit_poly_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int site, Q2ValueId dv, Q2ValueId rv, int dreg) {
+  char recv[32];
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+      t->lb[dv] != E2_LB_F64 && t->lb[dv] != E2_LB_BOOL)
+    return 0;
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  e2_group_exit_stub(f, in, cur, rv);
+  fprintf(f, "    { JSValue _f;\n");
+  e2_poly_chain(f, recv, site, in->arg[2].off, 0, in->pc);
+  fprintf(f, "      _f = *q2_slotp(%s, _po);\n", recv);
+  fprintf(
+      f,
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) "
+      "goto vx_%d;\n",
+      in->pc);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
+    fprintf(stderr, "e2: polymorphic read at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  g_e2_miss_exit_seen = 1;
+  return 1;
+}
+
+static int emit_poly_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int site,
+    Q2ValueId rv, const char *boxed) {
+  char recv[32];
+  (void)fn;
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  e2_group_exit_stub(f, in, cur, rv);
+  fprintf(f, "    {\n");
+  e2_poly_chain(f, recv, site, in->arg[1].off, 1, in->pc);
+  fprintf(
+      f, "      if (__builtin_expect(q2_is_proto(%s), 0)) goto vx_%d;\n", recv,
+      in->pc);
+  fprintf(f, "      { JSValue _nv = %s;\n", boxed);
+  if (boxed[0] != 'v') {
+    fprintf(
+        f,
+        "        JSValue *_sp = q2_slotp(%s, _po);\n"
+        "        JSValue _old = *_sp;\n"
+        "        *_sp = _nv;\n"
+        "        if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_old), 0)) "
+        "JS_FreeValue(ctx, _old); }\n",
+        recv);
+  } else {
+    fprintf(f, "        q2_put_slot(ctx, %s, _po, _nv); }\n", recv);
+  }
+  fprintf(f, "    }\n");
+  g_e2_miss_exit_seen = 1;
+  return 1;
+}
+
 /* A speculative-body FIELD READ: `get_field` / `get_field2` ("rras": dest,
    receiver, atom, site). This is a SEPARATE emitter from the generic body's, on
    purpose: the shared part is the runtime helper (q2_own_read_hit), not the emitted
@@ -5535,6 +5650,11 @@ static int emit_typed_field_read(
       e2_note_stub(
           g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
       return emit_group_read(f, fn, in, t, cur, g, site, dv, rv, dreg);
+    }
+    if (e2_poly_site_ok(fn, in, site)) {
+      e2_note_stub(
+          g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+      return emit_poly_read(f, fn, in, t, cur, site, dv, rv, dreg);
     }
     if (e2_must_exit(fn, in)) return 0;
   }

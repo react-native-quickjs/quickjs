@@ -45,6 +45,7 @@ typedef struct E2SiteInfo {
   int insn;
   int group;      /* index into E2Facts.groups, or E2_GROUP_NONE */
   Q2ValueId recv; /* the receiver value, or Q2_NO_VALUE */
+  int poly;       /* the profile saw 2-4 shapes, all own slots: polymorphic cache */
 } E2SiteInfo;
 
 /* A group: every site whose profile saw exactly one shape, sharing it, so the
@@ -134,7 +135,13 @@ typedef struct E2Facts {
    emits would otherwise leave the flag set for the functions emitted after the
    first dump, and the body would be emitted with facts that assume misses exit
    while its code continues on a miss. */
-int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit);void e2_facts_free(E2Facts *f);
+int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit);
+/* Whether polymorphic sites are served by the polymorphic cache in this body (a
+   framed speculative body; set by the caller around e2_facts_run). */
+extern int e2_facts_poly_on;
+int e2_facts_site_poly(const E2Facts *f, int site);
+/* The instructions a polymorphic site may be served by: a plain read or store. */
+int e2_facts_poly_op(const Q2Insn *in);void e2_facts_free(E2Facts *f);
 
 /* The group a site index belongs to, or E2_GROUP_NONE. */
 int e2_facts_site_group(const E2Facts *f, int site);
