@@ -1997,8 +1997,9 @@ int e_emit_generic_body(FILE *f, const Q2Func *fn, char hex[33]) {
            interpreter several frames away. */
         fprintf(
             f,
-            "    if (__builtin_expect(q2_elem_open(AOT_REG(fr, %d), &_reg), "
-            "1)) {\n",
+            "    if (__builtin_expect(!q2_elem_open(AOT_REG(fr, %d), &_reg), "
+            "0)) _reg.count = 0;\n"
+            "    {\n",
             run_arr);
         emit_site_hit(f, in);
         run_open = 1;
