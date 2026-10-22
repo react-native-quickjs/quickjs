@@ -1,0 +1,88 @@
+Subject: Run object_fill without stepping the handler
+
+What this does
+  Adds `qjs_aot_object_fill(ctx, f, obj, vals, n, ti)`: the handler's body for the op
+  that stores an object literal's values into the object `object_template` made (the
+  template's shape when the object still has it, else property definitions), leaving
+  the value registers undefined.
+
+Why we need it
+  `object_template` allocates the literal and `object_fill` fills it; after patch 0317
+  the allocation was a direct call and the fill still a step (splay's two hottest
+  allocation ops).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62273,6 +62273,59 @@
+     return 0;
+ }
+ 
++int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
++                        int n, int ti)
++{
++    JSObjLitTemplate *tpl;
++    int i2;
++
++    if (unlikely(ti >= f->b->objlit_count)) {
++        JS_ThrowInternalError(ctx, "invalid object literal template");
++        return -1;
++    }
++    tpl = &f->b->objlit_tab[ti];
++    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
++        JSObject *po = JS_VALUE_GET_OBJ(obj);
++
++        if (likely(!po->is_exotic && po->shape == tpl->shape &&
++                   (int)tpl->prop_count == n)) {
++            for (i2 = 0; i2 < n; i2++) {
++#if QJS_DRC
++                set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
++#else
++                set_value(ctx, &po->prop[i2].u.value, vals[i2]);
++#endif
++                vals[i2] = JS_UNDEFINED;
++            }
++            return 0;
++        }
++    }
++    for (i2 = 0; i2 < n; i2++) {
++        JSValue v2 = vals[i2];
++
++        vals[i2] = JS_UNDEFINED;
++#if QJS_DRC
++        if (JS_DefinePropertyValue(ctx, obj, js_objlit_template_atom(tpl, i2),
++                                   js_dup(v2),
++                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
++            for (i2 = i2 + 1; i2 < n; i2++)
++                vals[i2] = JS_UNDEFINED;
++            return -1;
++        }
++#else
++        if (JS_DefinePropertyValue(ctx, obj, js_objlit_template_atom(tpl, i2),
++                                   v2, JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
++            for (i2 = i2 + 1; i2 < n; i2++) {
++                JS_FreeValue(ctx, vals[i2]);
++                vals[i2] = JS_UNDEFINED;
++            }
++            return -1;
++        }
++#endif
++    }
++    return 0;
++}
++
+ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
+ {
+     JSValue val = regvm_array_from_regs(ctx, argv, na);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -351,6 +351,10 @@
+ int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
+ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
+ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
++/* Fills an object literal's properties from `n` registers (`object_fill`): the
++   template's shape when the object still has it, else property definitions. The
++   registers are left undefined, as the handler leaves them. 0, or -1 on an exception. */
++int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
+ /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
+    reified, calls the callee with the frame's own arguments. 1 with an owned *out when
+    it did; 0 when the case needs the handler (not the builtin, or the arguments

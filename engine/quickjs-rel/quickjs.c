@@ -62273,6 +62273,59 @@ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
     return 0;
 }
 
+int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
+                        int n, int ti)
+{
+    JSObjLitTemplate *tpl;
+    int i2;
+
+    if (unlikely(ti >= f->b->objlit_count)) {
+        JS_ThrowInternalError(ctx, "invalid object literal template");
+        return -1;
+    }
+    tpl = &f->b->objlit_tab[ti];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        JSObject *po = JS_VALUE_GET_OBJ(obj);
+
+        if (likely(!po->is_exotic && po->shape == tpl->shape &&
+                   (int)tpl->prop_count == n)) {
+            for (i2 = 0; i2 < n; i2++) {
+#if QJS_DRC
+                set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
+#else
+                set_value(ctx, &po->prop[i2].u.value, vals[i2]);
+#endif
+                vals[i2] = JS_UNDEFINED;
+            }
+            return 0;
+        }
+    }
+    for (i2 = 0; i2 < n; i2++) {
+        JSValue v2 = vals[i2];
+
+        vals[i2] = JS_UNDEFINED;
+#if QJS_DRC
+        if (JS_DefinePropertyValue(ctx, obj, js_objlit_template_atom(tpl, i2),
+                                   js_dup(v2),
+                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            for (i2 = i2 + 1; i2 < n; i2++)
+                vals[i2] = JS_UNDEFINED;
+            return -1;
+        }
+#else
+        if (JS_DefinePropertyValue(ctx, obj, js_objlit_template_atom(tpl, i2),
+                                   v2, JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            for (i2 = i2 + 1; i2 < n; i2++) {
+                JS_FreeValue(ctx, vals[i2]);
+                vals[i2] = JS_UNDEFINED;
+            }
+            return -1;
+        }
+#endif
+    }
+    return 0;
+}
+
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
 {
     JSValue val = regvm_array_from_regs(ctx, argv, na);
