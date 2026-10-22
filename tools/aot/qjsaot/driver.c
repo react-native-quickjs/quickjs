@@ -3449,6 +3449,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static inline __attribute__((always_inline)) int32_t q2_toi32(double d)\n"
         "{\n"
         "  if (d > -2147483649.0 && d < 2147483648.0) return (int32_t)d;\n"
+        "  if (d > -9.0e18 && d < 9.0e18) return (int32_t)(uint32_t)(int64_t)d;\n"
         "  {\n"
         "    double m;\n"
         "    if (isnan(d) || isinf(d)) return 0;\n"
