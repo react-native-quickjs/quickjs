@@ -6597,6 +6597,46 @@ static int emit_typed_inc_branch(
   bv = in->use[1];
   /* The bound may be TAG (a field or a length read the profile saw as mixed): its
      tag is tested below, and a non-number goes to the cold arm. */
+  if (t->lb[dv] == E2_LB_TAG && t->lb[av] == E2_LB_TAG &&
+      (t->lb[bv] == E2_LB_I32 || t->lb[bv] == E2_LB_TAG)) {
+    /* A counter that is a TAG value (an allocation or call earlier in the loop
+       reloaded it from the frame): an int below INT32_MAX against an int bound is the
+       whole fast path; anything else is a hand-off at this pc with the old counter. */
+    int si_t = 0, si_e = 1;
+    e2_local_name(cn, sizeof(cn), dv);
+    e2_local_name(cn2, sizeof(cn2), av);
+    e2_local_name(bn, sizeof(bn), bv);
+    fprintf(f, "    { int c_;\n");
+    if (t->lb[bv] == E2_LB_I32)
+      fprintf(
+          f,
+          "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) == JS_TAG_INT && "
+          "JS_VALUE_GET_INT(%s) != INT32_MAX, 1)) {\n"
+          "      int32_t n_ = JS_VALUE_GET_INT(%s) + 1;\n"
+          "      %s = JS_MKVAL(JS_TAG_INT, n_);\n"
+          "      c_ = n_ < %s;\n"
+          "    } else goto hx_%d;\n",
+          cn2, cn2, cn2, cn, bn, in->pc);
+    else
+      fprintf(
+          f,
+          "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) == JS_TAG_INT && "
+          "JS_VALUE_GET_INT(%s) != INT32_MAX && JS_VALUE_GET_TAG(%s) == JS_TAG_INT, 1)) {\n"
+          "      int32_t n_ = JS_VALUE_GET_INT(%s) + 1;\n"
+          "      %s = JS_MKVAL(JS_TAG_INT, n_);\n"
+          "      c_ = n_ < JS_VALUE_GET_INT(%s);\n"
+          "    } else goto hx_%d;\n",
+          cn2, cn2, bn, cn2, cn, bn, in->pc);
+    e2_note_stub(
+        g_e2_hx, g_e2_hx_cur, g_e2_hx_blk, &g_e2_hx_n, in->pc, cur, NULL);
+    fprintf(f, "    if (c_) {\n");
+    e2_emit_arm(f, fn, b, si_t, cur, hex, blk->succ_block[si_t]);
+    fprintf(f, "    } else {\n");
+    e2_emit_arm(f, fn, b, si_e, cur, hex, blk->succ_block[si_e]);
+    fprintf(f, "    }\n    }\n");
+    (void)fi;
+    return 1;
+  }
   if (t->lb[dv] != E2_LB_I32 || t->lb[av] != E2_LB_I32 ||
       (t->lb[bv] != E2_LB_I32 && t->lb[bv] != E2_LB_TAG))
     return 0;
