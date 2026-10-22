@@ -1303,12 +1303,16 @@
       "sha256": "a0e47606084c6d46419da11e40a13cc6d54eaff205d5c559402b935197d7f85e"
     },
     {
+      "name": "0332-aot-put-add.patch",
+      "sha256": "f967adfd307bcb5772d92b3a3e101769e383b4a848c749f5eae3294aaa650561"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "206704137d2ec340693fe8d7549bdda050b8f7f54859556396cf43a022680182",
+    "quickjs.c": "3301288e9714438946df1927f56c85c49ec2825c8d0c634378f733f6a00704b0",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

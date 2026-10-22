@@ -1,0 +1,58 @@
+Subject: Replay a cached add-transition store from compiled code before the frame is published
+
+What this does
+  - `qjs_aot_put_add` tries the site's cached add transition for a compiled named store: the
+    same replay the interpreter's store handler does first. It returns 1 when the store landed,
+    0 when the site holds no transition for the receiver's shape, and -1 when growing the
+    property array failed.
+
+Why we need it
+  A constructor that sets its fields (`this.p = v`) takes the miss path of the inline store on
+  every property, which published every live register to the frame before reaching the same
+  replay. The replay only grows the property array, so nothing reads the registers.
+  The replay needs no published registers: it neither starts a collection nor runs a finalizer
+  (the realloc does not trigger one, and the pre-add shape it drops never holds the prototype's
+  last reference because the cached new shape holds it too), so a value only in a C local
+  stays valid.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62407,6 +62407,23 @@
+                : 0;
+ }
+ 
++/* The cached add-transition store of a compiled named store, tried before the
++   frame is published: it only grows the property array, so nothing observes
++   the registers. 1 when the store landed, 0 when the site holds no transition
++   for the receiver's shape, -1 on exception. The value is borrowed.
++   Nothing here can start a collection or run a finalizer, so a value held only
++   in a C local stays valid: the realloc does not trigger one (only a new object
++   does), and the pre-add shape it drops is never the last holder of the
++   prototype, because the cached new shape holds the same one. */
++QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
++                                 JSValue v, int site)
++{
++    if (f->pic == NULL || JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
++        return 0;
++    return regvm_put_field_add_hit(ctx, f->b, f->pic, JS_VALUE_GET_OBJ(recv),
++                                   v, site);
++}
++
+ int qjs_aot_object_template_b(JSContext *ctx, JSFunctionBytecode *b, int index,
+                              JSValue *out)
+ {
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -360,6 +360,12 @@
+                                         JSValue recv, int atom, int site,
+                                         JSValue v);
+ 
++/* The cached add-transition store of a compiled named store, before the frame
++   is published. 1 when the store landed, 0 when the site has no transition for
++   the receiver's shape, -1 on exception. The value is borrowed. */
++QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
++                                 JSValue v, int site);
++
+ /* The `this` object of `new C(...)` for a plain constructor: allocated the way the
+    interpreter's light construct does (the prototype from `C.prototype`, the profiled
+    inline slot capacity), so the caller can run the constructor's compiled body with it

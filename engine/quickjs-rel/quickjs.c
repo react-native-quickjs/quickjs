@@ -62407,6 +62407,23 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                : 0;
 }
 
+/* The cached add-transition store of a compiled named store, tried before the
+   frame is published: it only grows the property array, so nothing observes
+   the registers. 1 when the store landed, 0 when the site holds no transition
+   for the receiver's shape, -1 on exception. The value is borrowed.
+   Nothing here can start a collection or run a finalizer, so a value held only
+   in a C local stays valid: the realloc does not trigger one (only a new object
+   does), and the pre-add shape it drops is never the last holder of the
+   prototype, because the cached new shape holds the same one. */
+QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
+                                 JSValue v, int site)
+{
+    if (f->pic == NULL || JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
+        return 0;
+    return regvm_put_field_add_hit(ctx, f->b, f->pic, JS_VALUE_GET_OBJ(recv),
+                                   v, site);
+}
+
 int qjs_aot_object_template_b(JSContext *ctx, JSFunctionBytecode *b, int index,
                              JSValue *out)
 {
