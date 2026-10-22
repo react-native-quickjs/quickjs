@@ -4941,7 +4941,7 @@ static int emit_alloc_op(
   Q2ValueId dv;
   int off, dreg, r, na = 0, handler_ok = 0;
   const char *okc = "1";
-  int redef_mode = 0, nodest = in->rop == ROP_object_fill;
+  int redef_mode = 0, nodest = in->rop == ROP_object_fill, src_off = -1;
   char call[256];
 
   if (!have_types || t == NULL || g_e2_fl || cur == NULL) return 0;
@@ -5002,6 +5002,30 @@ static int emit_alloc_op(
       if (in->narg < 2) return 0;
       snprintf(call, sizeof(call), "qjs_aot_array_const(ctx, f, %d, &_o)", (int)in->arg[1].val);
       break;
+    case ROP_unary:
+      /* "rbr": destination, sub-op, source. The engine's general unary op; the typed
+         forms were tried first. */
+      if (in->narg < 3 || in->arg[2].kind != 'r' || E2_ROFF(in->arg[2]) / 16 >= fn->nregs)
+        return 0;
+      src_off = E2_ROFF(in->arg[2]);
+      snprintf(call, sizeof(call), "qjs_aot_unary(ctx, %d, AOT_REG(fr, %d), &_o)",
+               (int)in->arg[1].val, src_off);
+      break;
+    case ROP_binary_cpool:
+      /* "rbrbc": destination, sub-op, left operand, kind, pool index or atom. */
+      if (in->narg < 5 || in->arg[2].kind != 'r' || E2_ROFF(in->arg[2]) / 16 >= fn->nregs)
+        return 0;
+      src_off = E2_ROFF(in->arg[2]);
+      if (in->arg[3].val == 0)
+        snprintf(call, sizeof(call), "qjs_aot_binary_cpool(ctx, f, %d, %uu, 0, AOT_REG(fr, %d), &_o)",
+                 (int)in->arg[1].val, (unsigned)in->arg[4].val, src_off);
+      else if (in->arg[4].off >= 0)
+        snprintf(call, sizeof(call),
+                 "qjs_aot_binary_cpool(ctx, f, %d, qjs_aot_ld_u32(q2_code(f) + %d), 1, AOT_REG(fr, %d), &_o)",
+                 (int)in->arg[1].val, in->arg[4].off, src_off);
+      else
+        return 0;
+      break;
     case ROP_load_const:
       if (in->narg < 3 || in->arg[2].kind != 'c') return 0;
       /* An atom operand is the code's own word: atoms are renumbered at load. */
@@ -5052,7 +5076,7 @@ static int emit_alloc_op(
      frame (the registers a fallback-shaped op redefines) are boxed into the frame. */
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v;
-    int need = r >= in->win_reg && r < in->win_reg + na;
+    int need = (r >= in->win_reg && r < in->win_reg + na) || r * 16 == src_off;
     int k2;
     for (k2 = 0; k2 < in->nredef; k2++)
       if (in->redef_reg != NULL && in->redef_reg[k2] == r) need = 1;
@@ -7711,6 +7735,9 @@ static int e2_dispatch_rop(
     case ROP_load_const:
       return emit_typed_load_const(f, fn, in, t, cur, have_types) ||
              emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_unary:
+      return emit_tag_numeric(f, fn, in, t, cur, have_types, hex, fi, b) ||
+             emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_put_global:
     case ROP_put_local_s0:
     case ROP_put_local_s1:
@@ -7735,7 +7762,9 @@ static int e2_dispatch_rop(
     case ROP_mul:
       return have_types && emit_typed_arith(f, fn, in, t, cur);
     case ROP_binary_cpool:
-      return emit_typed_arith_cpool(f, fn, in, t, cur, have_types);
+      return emit_typed_arith_cpool(f, fn, in, t, cur, have_types) ||
+             emit_tag_numeric(f, fn, in, t, cur, have_types, hex, fi, b) ||
+             emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_binary_imm:
     case ROP_binary_imm_s:
     case ROP_add_imm_s:
