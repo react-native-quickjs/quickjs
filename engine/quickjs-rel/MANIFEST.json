@@ -1347,12 +1347,16 @@
       "sha256": "14bc57f52cde229130cca153c9b17efc142e728b5428a037dcbf6da73c10b89d"
     },
     {
+      "name": "0343-aot-get-super.patch",
+      "sha256": "ce742e74d87e8c0ec739642e074f70a1e38b78bca655cd8a2c4a6789e3a37b94"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "401d33d729d404aab570cfe1ed5a54ec0be067e5e5e9118f81a52249f4af42ca",
+    "quickjs.c": "6fe0e899ab1ead06586e342441be19ddb9be1937acfe6e507999f1c2190a03db",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

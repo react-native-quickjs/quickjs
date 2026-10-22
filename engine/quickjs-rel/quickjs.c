@@ -62864,6 +62864,31 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     return 1;
 }
 
+/* `super` and a string-keyed element read of a compiled body, without the step handler:
+   the prototype of an object (what `get_super` does), and a property read by atom with the
+   object itself as the receiver (what `get_element` does for a constant string key, minus
+   the trip from atom to string and back). Both return an owned value, 0 / -1 on
+   exception. */
+int qjs_aot_get_proto(JSContext *ctx, JSValue obj, JSValue *out)
+{
+    JSValue proto = JS_GetPrototype(ctx, obj);
+
+    if (JS_IsException(proto))
+        return -1;
+    *out = proto;
+    return 0;
+}
+
+int qjs_aot_get_prop_atom(JSContext *ctx, JSValue obj, uint32_t atom, JSValue *out)
+{
+    JSValue v = JS_GetProperty(ctx, obj, (JSAtom)atom);
+
+    if (JS_IsException(v))
+        return -1;
+    *out = v;
+    return 0;
+}
+
 /* A compiled `new` finished: feed the constructed object's property count back to the
    constructor's learned instance capacity, as the interpreter's construct paths do, so the
    next `this` is allocated with room for all its fields. */

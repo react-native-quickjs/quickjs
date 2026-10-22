@@ -1,0 +1,63 @@
+Subject: Read a prototype and a constant-keyed property from compiled code without the step handler
+
+What this does
+  - `qjs_aot_get_proto` is `get_super`: the prototype of an object, owned, with the
+    exception as -1.
+  - `qjs_aot_get_prop_atom` reads a property by atom with the object as the receiver, which
+    is what `get_element` does for a constant string key once the key is turned back into an
+    atom.
+
+Why we need it
+  `super.m()` is `get_super`, a load of the name as a string, and `get_element`: three step
+  handlers, and the element read converted the string back to an atom (a hash lookup in the
+  atom table) on every execution. A compiled body now calls these two directly, and does not
+  build the key string at all when the load feeds only the read. The class programs that call
+  through `super` were 1.07x to 1.18x of the interpreter.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62864,6 +62864,31 @@
+     return 1;
+ }
+ 
++/* `super` and a string-keyed element read of a compiled body, without the step handler:
++   the prototype of an object (what `get_super` does), and a property read by atom with the
++   object itself as the receiver (what `get_element` does for a constant string key, minus
++   the trip from atom to string and back). Both return an owned value, 0 / -1 on
++   exception. */
++int qjs_aot_get_proto(JSContext *ctx, JSValue obj, JSValue *out)
++{
++    JSValue proto = JS_GetPrototype(ctx, obj);
++
++    if (JS_IsException(proto))
++        return -1;
++    *out = proto;
++    return 0;
++}
++
++int qjs_aot_get_prop_atom(JSContext *ctx, JSValue obj, uint32_t atom, JSValue *out)
++{
++    JSValue v = JS_GetProperty(ctx, obj, (JSAtom)atom);
++
++    if (JS_IsException(v))
++        return -1;
++    *out = v;
++    return 0;
++}
++
+ /* A compiled `new` finished: feed the constructed object's property count back to the
+    constructor's learned instance capacity, as the interpreter's construct paths do, so the
+    next `this` is allocated with room for all its fields. */
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -381,6 +381,10 @@
+ QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
+                                  JSValue v, int site);
+ 
++/* `get_super` and a constant-key `get_element`, each with an owned result. */
++int qjs_aot_get_proto(JSContext *ctx, JSValue obj, JSValue *out);
++int qjs_aot_get_prop_atom(JSContext *ctx, JSValue obj, uint32_t atom, JSValue *out);
++
+ /* A compiled `new` finished with `inst`: the constructor learns its instance capacity. */
+ void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
+ 
