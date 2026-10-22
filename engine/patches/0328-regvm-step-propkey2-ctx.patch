@@ -1,0 +1,24 @@
+Subject: Throw the `to_propkey2` error in the step's own context
+
+What this does
+  - The step handler for `to_propkey2` threw its null-or-undefined TypeError in
+    `rf->caller_ctx`. That field is in the frame's record-only tail, which a light frame
+    (and every frame a compiled unit builds) does not have: the read took whatever lay past
+    the frame, and the throw crashed.
+  - It throws in `ctx`, the context the step runs in.
+
+Why we need it
+  `h[k]++` with `h` null or undefined, run from a compiled function, crashed instead of
+  throwing the TypeError.
+
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -5776,7 +5776,7 @@
+                 if (op == ROP_to_propkey2) {
+                     int chk = RD_REG();
+                     if (unlikely(JS_IsUndefined(regs[chk]) || JS_IsNull(regs[chk]))) {
+-                        JS_ThrowTypeError(rf->caller_ctx, "value has no property");
++                        JS_ThrowTypeError(ctx, "value has no property");
+                         goto exception;
+                     }
+                 }

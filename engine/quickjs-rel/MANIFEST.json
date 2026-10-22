@@ -1287,6 +1287,10 @@
       "sha256": "ebb3f8268242e38079fe7e2377cb35ce88006ae47e7f12a4f13803ab6479dc0c"
     },
     {
+      "name": "0328-regvm-step-propkey2-ctx.patch",
+      "sha256": "b81aaae059b0f31c27519d7678eb72bb0959566fe44be1fa5a0d9fc825e74ea2"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
