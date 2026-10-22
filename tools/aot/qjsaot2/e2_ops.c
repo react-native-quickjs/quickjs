@@ -4717,13 +4717,21 @@ static int emit_alloc_op(
   Q2ValueId dv;
   int off, dreg, r, na = 0, handler_ok = 0;
   const char *okc = "1";
-  int redef_mode = 0;
+  int redef_mode = 0, nodest = in->rop == ROP_object_fill;
   char call[256];
 
   if (!have_types || t == NULL || g_e2_fl || cur == NULL) return 0;
   if (e2_roles[in->rop] == NULL || e2_roles[in->rop]->control != E2_CF_NONE) return 0;
   if (e2_must_exit(fn, in)) return 0;
-  if (in->ndef >= 1) {
+  if (nodest) {
+    /* object_fill stores into an existing object: no destination. */
+    if (in->narg < 4 || in->arg[0].kind != 'r' || in->win_n < 0) return 0;
+    if ((unsigned)(in->win_reg + in->win_n) > (unsigned)fn->nregs) return 0;
+    dv = Q2_NO_VALUE;
+    off = (int)in->arg[0].val;
+    dreg = off / 16;
+    redef_mode = 1;
+  } else if (in->ndef >= 1) {
     dv = in->def[0];
     off = dest_off(fn, in);
   } else if (in->nredef >= 1 && in->redef_reg != NULL && in->redef_val != NULL) {
@@ -4742,11 +4750,11 @@ static int emit_alloc_op(
   } else {
     return 0;
   }
-  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (!nodest && dv >= (Q2ValueId)t->nvalues) return 0;
   if (off < 0) return 0;
   dreg = off / 16;
   if (dreg >= fn->nregs) return 0;
-  if (!redef_mode && t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
+  if (!nodest && !redef_mode && t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 &&
       t->lb[dv] != E2_LB_F64 && t->lb[dv] != E2_LB_BOOL && !e2_def_dead(in, dv))
     return 0;
   if (in->win_n > 0 || in->rop == ROP_apply_arguments) {
@@ -4765,6 +4773,11 @@ static int emit_alloc_op(
       if (in->win_n < 0) return 0;
       snprintf(call, sizeof(call), "qjs_aot_array_from(ctx, &AOT_REG(fr, %d), %d, &_o)",
                in->win_reg * 16, in->win_n);
+      break;
+    case ROP_object_fill:
+      snprintf(call, sizeof(call),
+               "(_o = JS_UNDEFINED, qjs_aot_object_fill(ctx, f, AOT_REG(fr, %d), &AOT_REG(fr, %d), %d, %d))",
+               off, in->win_reg * 16, in->win_n, (int)in->arg[3].val);
       break;
     case ROP_special_object:
       if (in->narg < 2) return 0;
@@ -4816,11 +4829,12 @@ static int emit_alloc_op(
   fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
   fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n");
   fprintf(f, "      if (%s) {\n", okc);
-  fprintf(
-      f,
-      "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
-      "        else AOT_SET_B(ctx, fr, %d, _o);\n",
-      off, off);
+  if (!nodest)
+    fprintf(
+        f,
+        "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+        "        else AOT_SET_B(ctx, fr, %d, _o);\n",
+        off, off);
   e2_emit_group_recheck(f, fn, in, cur);
   if (redef_mode) {
     /* every register the op redefines becomes a TAG local again from the frame */
@@ -4874,7 +4888,7 @@ static int emit_alloc_op(
     g_e2_presynced = 0;
   }
   fprintf(f, "    cd_%d: ;\n", in->pc);
-  cur[dreg] = dv;
+  if (!nodest) cur[dreg] = dv;
   return 1;
 }
 
@@ -7490,6 +7504,7 @@ static int e2_dispatch_rop(
     case ROP_new_object:
     case ROP_object_template:
     case ROP_array_from:
+    case ROP_object_fill:
     case ROP_special_object:
     case ROP_apply_arguments:
       return emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
