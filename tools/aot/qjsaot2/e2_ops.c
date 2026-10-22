@@ -34,6 +34,7 @@
    happened, so the caller's native call is correct), the return stores the result
    through `*out`, and no exit may follow a store on any path (checked on the
    text). Implies g_e2_fl. */
+static int g_e2_fi = -1;
 static int g_e2_inl;
 /* Set when a body emitted in inline mode needs more than inline mode can give. */
 static char g_e2_inl_why[160];
@@ -1175,8 +1176,8 @@ static void e2_emit_return(FILE *f, int off) {
         "#if QJS_DRC\n"
         "      q2_dup(_rv);\n"
         "#endif\n"
-        "      *out = _rv; return 1; }\n",
-        off);
+        "      E2_INL_NOTE(%d); *out = _rv; return 1; }\n",
+        off, g_e2_fi);
     return;
   }
   fprintf(
@@ -2145,7 +2146,6 @@ static const Q2Func *g_e2_fn = NULL;
 static int g_e2_blk = -1;
 /* The function index of the body being emitted; every exit's note must name it,
    or its exits are counted against another function's switch-off. */
-static int g_e2_fi = -1;
 /* The per-function report counts (step 8), reset at each spec body: op-call
    wrappers emitted, instructions lowered typed or through a wrapper, guard sites
    by kind (ax, vx, dx, ox), and exits by kind (deopt, hand-off). */
@@ -4305,7 +4305,12 @@ static int emit_intrinsic_call(
     snprintf(cexp, sizeof(cexp), "JS_UNDEFINED"); /* not an object: always exits */
   else
     snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
-  if (g_e2_fl && !g_e2_inl) e2_fl_block("an intrinsic call", in);
+  /* In a frameless body the miss is an exit. A replaced builtin is rare and the
+     profile saw the callee; parseInt can also miss on its argument's value, so in a
+     loop that may run long it keeps the function framed. */
+  if (g_e2_fl && !g_e2_inl && id == QJS_AOT_INTR_PARSEINT && g_e2_fl_longloop &&
+      g_e2_loop_blk != NULL && g_e2_blk >= 0 && g_e2_loop_blk[g_e2_blk])
+    e2_fl_block("a parseInt in a loop", in);
   intr_num(a0, sizeof(a0), fn, t, cur, in->win_reg);
   if (na >= 2)
     intr_num(a1, sizeof(a1), fn, t, cur, in->win_reg + 1);
@@ -4388,8 +4393,8 @@ static int emit_typed_call(
   /* The facts classed this site as an intrinsic with an exit for a miss. */
   if (e2_must_exit(fn, in) && !g_e2_intr_cont)
     return emit_intrinsic_call(f, fn, in, t, cur, hex, fi, b);
-  /* An inline body makes no call but an intrinsic. */
-  if (g_e2_inl) {
+  /* An inline or frameless body makes no call but a lowered intrinsic. */
+  if (g_e2_fl) {
     e2_fl_block("a call", in);
     return 0;
   }
@@ -6707,7 +6712,7 @@ static int emit_typed_return(
   if (in->rop == ROP_return_undefined) {
     if (role == NULL || role->control != E2_CF_RETURN) return 0;
     if (g_e2_inl)
-      fprintf(f, "    { *out = JS_UNDEFINED; return 1; }\n");
+      fprintf(f, "    { E2_INL_NOTE(%d); *out = JS_UNDEFINED; return 1; }\n", g_e2_fi);
     else
       fprintf(f, "    return JS_UNDEFINED;\n");
     return 1;
@@ -7649,7 +7654,16 @@ static const char *e2_fl_prefilter(const Q2Func *fn) {
   if (g->light_need > 16 * 1024) return "frame over 16 KB";
   if (g->light_var_count > 0) return "variable area";
   if (g->func_kind != E2_FUNC_NORMAL) return "not a plain function";
-  if (e2_has_call_site(fn)) return "call site";
+  /* A call site keeps the function framed, unless every one is an intrinsic the
+     analysis may lower: its fallback is an exit, so the body needs no frame. A
+     site the analysis then keeps as a call blocks the emission below. */
+  for (i = 0; i < fn->ninsns; i++) {
+    const E2Role *r = e2_roles[fn->insns[i].rop];
+    if (r == NULL || r->window < 0) continue;
+    if (fn->insns[i].op == Q2_OP_CALL && e2_intrinsic_lowerable(fn, &fn->insns[i]))
+      continue;
+    return "call site";
+  }
   /* A frameless body cannot go back: an exit hands the REST of the call to the
      generic body, so one miss inside a long loop costs every remaining iteration.
      So the body keeps out any access that can miss for a reason the profile cannot
