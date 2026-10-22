@@ -393,7 +393,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
        function and the forwarding `aot_f_`. */
     e_report_entry(g, hex, 1, 0, 0);
     e_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
-  } else if (rc == 0 && g->light_ok) {
+  } else if (rc == 0 && g->light_ok && g->light_need <= E_NATIVE_FRAME_MAX) {
     e_emit_native_entry(f, &fn, hex);
     e_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
   } else if (rc == 0) {
@@ -416,7 +416,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   ninsns = fn.ninsns;
   q2_free(&fn);
   if (rc != 0) return rc;
-  if (g->light_ok || e_fl_was_chosen())
+  if ((g->light_ok && g->light_need <= E_NATIVE_FRAME_MAX) || e_fl_was_chosen())
     qjs_aot_note_native_entry(qjs_aot_cur_func_idx());
   return ninsns;
 }

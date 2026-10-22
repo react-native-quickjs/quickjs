@@ -37,6 +37,10 @@ void e_report_inline(const char *hex, int ok, const char *why);
 struct Q2Func;
 int e_emit_generic_body(FILE *f, const struct Q2Func *fn, char hex[33]);
 int e_emit_spec_body(FILE *f, const struct Q2Func *fn, char hex[33]);
+/* The largest light frame a native entry builds on the C stack. A bigger one (a
+   function with thousands of registers) stays on the engine's arena frames: on the
+   C stack it would overflow where the interpreter does not. */
+#define E_NATIVE_FRAME_MAX (32 * 1024)
 /* The framed native entry, for a function a compiled caller may enter on the C
    stack: it builds the light frame and runs the speculative body on it. */
 void e_emit_native_entry(FILE *f, const struct Q2Func *fn, char hex[33]);

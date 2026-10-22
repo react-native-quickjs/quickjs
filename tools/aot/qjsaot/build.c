@@ -1351,14 +1351,31 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
       if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
         in->win_n = g->reg_count - in->win_reg;
       if (in->win_n < 0) in->win_n = 0;
-    } else if (
-        in->rop == ROP_apply_arguments && in->narg >= 1 &&
-        in->arg[0].kind == 'r') {
-      in->win_reg = q2_ri((int)in->arg[0].val);
-      in->win_n = 3;
-      if (in->win_reg + in->win_n > g->reg_count)
-        in->win_n = g->reg_count - in->win_reg;
-      if (in->win_n < 0) in->win_n = 0;
+    }
+    {
+      /* Ops that read a staged run of registers the format does not count: the
+         run's first register is operand `wop` and its length is fixed. `apply` and
+         `apply_arguments` read the function, `apply` and the receiver; `append`
+         reads the array, the next index and the iterable and writes the index
+         back; `iterator_call` reads four; the class definitions read their staged
+         key, parent and constructor. */
+      int wop = -1, wn = 0;
+      switch (in->rop) {
+        case ROP_apply_arguments:
+        case ROP_append: wop = 0; wn = 3; break;
+        case ROP_apply: wop = 1; wn = 3; break;
+        case ROP_iterator_call: wop = 0; wn = 4; break;
+        case ROP_define_class: wop = 0; wn = 2; break;
+        case ROP_define_class_computed: wop = 0; wn = 3; break;
+        default: break;
+      }
+      if (wop >= 0 && wop < in->narg && in->arg[wop].kind == 'r') {
+        in->win_reg = q2_ri((int)in->arg[wop].val);
+        in->win_n = wn;
+        if (in->win_reg + in->win_n > g->reg_count)
+          in->win_n = g->reg_count - in->win_reg;
+        if (in->win_n < 0) in->win_n = 0;
+      }
     }
     f->ninsns++;
     i += cur.size;

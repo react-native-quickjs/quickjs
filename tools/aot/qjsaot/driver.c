@@ -1229,7 +1229,7 @@ int qjs_aot_native_capable(const char hex[33]) {
     if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) {
       const JSAotGenFunc *g = &g_unit_funcs[i];
       if (g->eligible != AOT_GEN_ELIGIBLE) return 0;
-      if (g->light_ok) return g->light_need > 0;
+      if (g->light_ok) return g->light_need > 0 && g->light_need <= E_NATIVE_FRAME_MAX;
       return g->func_kind == 0 && g->ctl_count == 0 && g->light_var_count == 0;
     }
   return 0;

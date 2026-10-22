@@ -127,6 +127,10 @@ static int role_writes_reg(
         (int)(in->arg[role->def[i]].val >> 4) == r)
       return 1;
   if (role->writes_regs) return 1;
+  /* A window a callee takes as its argument slots is the callee's to write: a
+     parameter assigned in the callee is a store into the caller's register. The
+     window ops that stage values (append, the class definitions) write theirs too. */
+  if (in->win_n > 0 && r >= in->win_reg && r < in->win_reg + in->win_n) return 1;
   /* The IR's own destinations are authoritative: a value the instruction
      defines lives in a register (`Q2Value.reg`), and that register is written
      even when the table's operand index and the allocator's coalescing do not
@@ -3792,6 +3796,7 @@ static int e_xfer_src_off(const Q2Insn *in) {
 static int e_wrappable(const Q2Func *fn, const Q2Insn *in, const ERole *role) {
   if (g_e_fl) return 0; /* a frameless body has no handler to step */
   if (role == NULL || role->control != E_CF_NONE) return 0;
+
   /* The call family has its own site emitter for call/call_method; construct and
      apply_arguments run synchronously through the step (the callee's frame is
      the engine's), so the wrapper does them; tail calls, eval and the rest of
@@ -5565,6 +5570,15 @@ static int emit_typed_strict_eq(
   if (ld < 0 || ld >= fn->nregs) return 0;
   f64 = t->lb[av] == E_LB_F64 || t->lb[bv] == E_LB_F64;
 
+  /* A BOOL operand is equal only to a BOOL: `true === 1` is false. Two BOOLs
+     compare as their flags; any other mix is left to the generic body. */
+  if (t->lb[av] == E_LB_BOOL || t->lb[bv] == E_LB_BOOL) {
+    if (t->lb[av] != E_LB_BOOL || t->lb[bv] != E_LB_BOOL) return 0;
+    fprintf(f, "    b%u = %s(b%u == b%u);\n", (unsigned)dv, neg ? "!" : "",
+            (unsigned)av, (unsigned)bv);
+    if (cur != NULL) cur[ld] = dv;
+    return 1;
+  }
   e_cmp_expr(ex, sizeof(ex), REG_BIN_STRICT_EQ, t, av, bv, f64, 2);
 
   if (t->lb[av] == E_LB_TAG || t->lb[bv] == E_LB_TAG) {
@@ -8819,11 +8833,27 @@ static int e_fl_enabled(void) {
 /* The speculative body. A function that qualifies is emitted frameless: tried
    first into a buffer whose output is discarded, and kept only if nothing in it
    needed the engine's handler. Otherwise the framed body is emitted as before. */
+/* A function over this many instructions keeps the generic body only. The speculative
+   body keeps a C local per value, so a function with thousands of straight-line
+   values would take a C frame of hundreds of kilobytes (the interpreter's frame for
+   it lives on the heap), and a second body doubles its code. box2d's largest
+   function is about 5,000 instructions. */
+#define E_SPEC_BODY_MAX_INSNS 6000
+
 int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   const char *why;
   int rc;
   g_e_fl_chosen = 0;
   g_e_fl_why[0] = 0;
+  if (fn->ninsns > E_SPEC_BODY_MAX_INSNS) {
+    snprintf(g_e_fl_why, sizeof(g_e_fl_why), "over the size budget");
+    fprintf(
+        f,
+        "%sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, uint32_t entry_pc)\n"
+        "{\n    return aot_g_%s(ctx, f, fr, entry_pc);\n}\n\n",
+        e_linkage(), hex, hex);
+    return 0;
+  }
   if (!e_fl_enabled()) {
     snprintf(g_e_fl_why, sizeof(g_e_fl_why), "disabled");
     return e_emit_spec_body_pass(f, fn, hex);
