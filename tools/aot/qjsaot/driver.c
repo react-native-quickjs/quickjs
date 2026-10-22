@@ -1869,6 +1869,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_FNBC_REALM %uu\n"
           "#define QJS_AOT_OFF_RT_REGVM_CUR %uu\n"
           "#define QJS_AOT_OFF_RT_STACK_LIMIT %uu\n"
+          "#define QJS_AOT_OFF_RT_FL_TOP %uu\n"
           "#define QJS_AOT_OFF_OBJECT_FUNC_VAR_REFS %uu\n"
           "#define QJS_AOT_LIGHT_PREFIX_SLOTS %uu\n"
           "#define QJS_AOT_REGVM_FLAG_LIGHT %uu\n"
@@ -1919,7 +1920,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
-          lay.off_rt_regvm_cur, lay.off_rt_stack_limit,
+          lay.off_rt_regvm_cur, lay.off_rt_stack_limit, lay.off_rt_fl_top,
           lay.off_object_func_var_refs, lay.light_prefix_slots,
           lay.regvm_flag_light, lay.regvm_flag_c_entry, lay.regvm_flag_stack,
           lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm,
@@ -1986,6 +1987,12 @@ int qjsaot_driver_main(int argc, char **argv) {
        header, and the arrays are declared there and defined once in reg.c. */
     fprintf(f, "#define QJS_AOT_NFUNCS %uu\n",
             nfuncs > 0 ? (unsigned)nfuncs : 1u);
+    {
+      int mi, mr = 1;
+      for (mi = 0; mi < nfuncs; mi++)
+        if (funcs[mi].reg_count > mr) mr = funcs[mi].reg_count;
+      fprintf(f, "#define QJS_AOT_MAXREGS %du\n", mr);
+    }
     /* The function names, indexed the same way as the switch-off counter arrays, so the
        teardown line can print one row per function and a test can assert on one
        by name. */
@@ -2117,7 +2124,18 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  const JSValue *lv;\n"
         "  const uint16_t *offs;\n"
         "  int n, argc;\n"
+        "  const JSAotFlRec *rec;\n"
         "} ENx;\n"
+        /* The exit record of the stub that is leaving. A stub writes it here and
+           passes the address, so the hot body keeps no ENx of its own; the exit
+           function reads it before running anything else. */
+        "#ifdef QJS_AOT_SPLIT_UNIT\n"
+        "extern _Thread_local ENx e_xs;\n"
+        "extern _Thread_local JSValue e_xl[QJS_AOT_MAXREGS];\n"
+        "#else\n"
+        "static _Thread_local ENx e_xs;\n"
+        "static _Thread_local JSValue e_xl[QJS_AOT_MAXREGS];\n"
+        "#endif\n"
         "#define E_ENTER_NOTE(fi) (e_ent[fi]++)\n"
         "#define E_INL_NOTE(fi) (e_inl[fi]++)\n"
         /* An inline body that cannot run (its nested callee is another function than
@@ -2399,6 +2417,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The caller's position at a native call, for a backtrace: the callee's frame
            carries no return address. */
         "#define E_CAP(f, pc) (*(const uint8_t **)((uint8_t *)(f) + QJS_AOT_OFF_REGRUN_CAP_IP) = ecb + (pc))\n"
+        "#define E_FL_TOP(ctx_) (*(JSAotFlRec **)(*(uint8_t **)((uint8_t *)(ctx_) + "
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_FL_TOP))\n"
         "#define E_NO_SHAPE ((const void *)1)\n"
         "#define E_BOX_F64(d) ({ double d_ = (d); "
         "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
@@ -3443,6 +3463,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "uint64_t e_inl[QJS_AOT_NFUNCS];\n"
           "uint32_t e_inx[QJS_AOT_NFUNCS];\n"
           "uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
+          "_Thread_local ENx e_xs;\n"
+          "_Thread_local JSValue e_xl[QJS_AOT_MAXREGS];\n"
           "const char *const qjs_aot_e_names[] = {\n"
           );
       {

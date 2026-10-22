@@ -2190,6 +2190,10 @@ static char g_e_fl_why[160];
 /* Set by the spec body when it emitted a frameless function, read by the driver
    that decides which entry to emit. */
 static int g_e_fl_chosen;
+/* Set when the frameless body being emitted calls a compiled function: it then
+   keeps an activation record (JSAotFlRec) for the backtrace, and polls and checks
+   the C stack at its entry. Kept from the trial emission into the real one. */
+static int g_e_fl_calls;
 
 /* Which blocks sit in a loop, and whether some loop of the function may run long
    (set by the prefilter). A miss exit emitted in such a block, for an access the
@@ -3021,28 +3025,23 @@ static void e_emit_exit_log(
    registers travel as (offset, value) pairs and `aot_nx_` builds the frame. */
 static void e_emit_generic_call(
     FILE *f, char hex[33], int pc, int nlv, const char *indent) {
-  if (g_e_inl && g_e_exit_dirty) {
-    fprintf(
-        f,
-        "%sENx x_ = { %d, %s, %s, %s, %s, %d, argc };\n"
-        "%s*out = aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &x_);\n"
-        "%sreturn 1;\n",
-        indent, pc, g_e_xt[0] ? g_e_xt : "-100", g_e_xk[0] ? g_e_xk : "NULL",
-        nlv > 0 ? "lv" : "NULL", nlv > 0 ? "offs" : "NULL", nlv, indent, hex,
-        indent);
-    g_e_xk[0] = g_e_xt[0] = 0;
-    return;
-  }
-  if (!g_e_fl) {
+  if (!g_e_fl && !g_e_inl) {
     fprintf(f, "%sreturn aot_g_%s(ctx, f, fr, %d);\n", indent, hex, pc);
     return;
   }
+  if (g_e_inl && !g_e_exit_dirty) {
+    g_e_xk[0] = g_e_xt[0] = 0;
+    return;
+  }
+  /* The live registers are in `fr` by now; the record says where they are. */
   fprintf(
       f,
-      "%sENx x_ = { %d, %s, %s, %s, %s, %d, argc };\n"
-      "%sreturn aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &x_);\n",
+      "%se_xs = (ENx){ %d, %s, %s, %s, %s, %d, argc, rec_ };\n"
+      "%s%saot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &e_xs);\n",
       indent, pc, g_e_xt[0] ? g_e_xt : "-100", g_e_xk[0] ? g_e_xk : "NULL",
-      nlv > 0 ? "lv" : "NULL", nlv > 0 ? "offs" : "NULL", nlv, indent, hex);
+      nlv > 0 ? "e_xl" : "NULL", nlv > 0 ? "offs" : "NULL", nlv, indent,
+      g_e_inl ? "*out = " : "return ", hex);
+  if (g_e_inl) fprintf(f, "%sreturn 1;\n", indent);
   g_e_xk[0] = g_e_xt[0] = 0;
 }
 
@@ -3144,10 +3143,8 @@ static void e_emit_exit(
   }
   if (nlv > 0) {
     int q;
-    fprintf(f, "    JSValue lv[%d] = {\n", nlv);
-    for (q = 0; q < nlv; q++)
-      fprintf(f, "        %s%s\n", lex[q], q + 1 < nlv ? "," : "");
-    fprintf(f, "    };\n    static const uint16_t offs[%d] = {", nlv);
+    for (q = 0; q < nlv; q++) fprintf(f, "    e_xl[%d] = %s;\n", q, lex[q]);
+    fprintf(f, "    static const uint16_t offs[%d] = {", nlv);
     for (q = 0; q < nlv; q++) fprintf(f, "%s%d", q ? ", " : " ", loff[q]);
     fprintf(f, " };\n");
   }
@@ -3376,19 +3373,17 @@ static void e_emit_arm(
       /* A borrowed value only this body holds: leave at the loop header, where
          the generic body has a frame, and let it poll at its own next back edge
          (this body is not re-entered, so the rest of the call runs there). */
-      int nlv = 0;
       char ex[160];
-      fprintf(f, "          {\n          JSValue lv[%d] = {\n", t->nlive_in + 1);
+      int nlv = 0;
+      fprintf(f, "          {\n");
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
         Q2ValueId vv = t->in_val[q];
         if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
         e_exit_expr(
             ex, sizeof(ex), cur != NULL && cur[rr] != Q2_NO_VALUE ? cur[rr] : vv);
-        fprintf(f, "              %s,\n", ex);
-        nlv++;
+        fprintf(f, "              e_xl[%d] = %s;\n", nlv++, ex);
       }
-      fprintf(f, "              JS_UNDEFINED };\n");
       fprintf(f, "          static const uint16_t offs[%d] = {", nlv + 1);
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
@@ -3401,9 +3396,9 @@ static void e_emit_arm(
       if (g_e_inl) g_e_inl_nx_used = 1;
       fprintf(
           f,
-          "          ENx x_ = { %d, -100, \"poll\", lv, offs, %d, argc };\n"
-          "          %saot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
-          "&x_);\n%s          }\n",
+          "          e_xs = (ENx){ %d, -100, \"poll\", e_xl, offs, %d, argc, rec_ };\n"
+          "          %saot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &e_xs);\n"
+          "%s          }\n",
           t->start_pc, nlv, g_e_inl ? "*out = " : "return ",
           hex, g_e_inl ? "          return 1;\n" : "");
     } else {
@@ -4397,6 +4392,9 @@ static int emit_typed_elem_write(
 static int emit_hit_result(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId dv,
     int dreg, const char *raw);
+/* The exit stubs (dx) that take the owned result of a call to compiled code, by pc, with
+   the register offset it was written to. */
+static int g_e_dx_own_pc[1024], g_e_dx_own_off[1024], g_e_dx_own_n;
 
 /* Negative controls (never set in a real build): "off" lowers no intrinsic (the
    as-built baseline of a diff); "noident" drops the identity
@@ -4639,6 +4637,9 @@ static int emit_inl_nested_call(
   Q2ValueId dv;
   int dreg, dead;
   uint64_t *lb;
+  const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
+  char winp[48], ib[512], pushr[160];
+  const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
 
   if (t == NULL || cur == NULL) return 0;
   if (!call_site_shaped(fn, in)) {
@@ -4664,6 +4665,10 @@ static int emit_inl_nested_call(
   off = dest_off(fn, in);
   na = in->win_n;
   w = in->win_reg * 16;
+  if (g_e_inl)
+    snprintf(winp, sizeof(winp), "&AOT_REG(fr, %d)", w);
+  else
+    snprintf(winp, sizeof(winp), "&win_[0]");
   if (off < 0 || cc < 0 || in->ndef < 1) return 0;
   dv = in->def[0];
   if (dv >= (Q2ValueId)t->nvalues) return 0;
@@ -4679,6 +4684,19 @@ static int emit_inl_nested_call(
   lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (lb == NULL) return 0;
   q2_live_before(fn, (int)(in - fn->insns), lb);
+  /* The window is published as a root range while the call runs, so an argument
+     nothing reads after the call needs no other root. */
+  if (!g_e_inl && (int)(in - fn->insns) + 1 < fn->ninsns) {
+    uint64_t *la = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+    if (la == NULL) {
+      free(lb);
+      return 0;
+    }
+    q2_live_before(fn, (int)(in - fn->insns) + 1, la);
+    for (r = in->win_reg; r < in->win_reg + in->win_n && r < fn->nregs; r++)
+      if (!((la[r / 64] >> (r % 64)) & 1)) lb[r / 64] &= ~((uint64_t)1 << (r % 64));
+    free(la);
+  }
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v;
     if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
@@ -4717,10 +4735,41 @@ static int emit_inl_nested_call(
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOT)
     e_note_stub(
         g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-  /* the window, current in the body's own register array */
+  if (!g_e_inl && t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOT) {
+    if (g_e_dx_own_n >= 1024) {
+      e_fl_block("too many call exits", in);
+      return 0;
+    }
+    g_e_dx_own_pc[g_e_dx_own_n] = in->next;
+    g_e_dx_own_off[g_e_dx_own_n++] = off;
+  }
+  /* the window, current in the body's own register array; a frameless body that is
+     not inlined keeps it in an array of its own, so the rest of its register array
+     is plain locals */
   for (r = 0; r < na; r++) {
     Q2ValueId v;
     int wr = in->win_reg + r;
+    if (!g_e_inl) {
+      if (wr >= fn->nregs || (v = cur[wr]) == Q2_NO_VALUE || v == E_UNDEF) {
+        fprintf(f, "    win_[%d] = JS_UNDEFINED;\n", r);
+        continue;
+      }
+      if (v == E_INFRAME || v >= (Q2ValueId)t->nvalues) {
+        fprintf(f, "    win_[%d] = AOT_REG(fr, %d);\n", r, wr * 16);
+        continue;
+      }
+      if (t->lb[v] == E_LB_TAG)
+        fprintf(f, "    win_[%d] = v%u;\n", r, (unsigned)v);
+      else if (t->lb[v] == E_LB_I32)
+        fprintf(f, "    win_[%d] = JS_MKVAL(JS_TAG_INT, i%u);\n", r, (unsigned)v);
+      else if (t->lb[v] == E_LB_F64)
+        fprintf(f, "    win_[%d] = E_BOX_F64(d%u);\n", r, (unsigned)v);
+      else if (t->lb[v] == E_LB_BOOL)
+        fprintf(f, "    win_[%d] = JS_MKVAL(JS_TAG_BOOL, b%u);\n", r, (unsigned)v);
+      else
+        fprintf(f, "    win_[%d] = AOT_REG(fr, %d);\n", r, wr * 16);
+      continue;
+    }
     if (wr >= fn->nregs) continue;
     v = cur[wr];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
@@ -4737,31 +4786,58 @@ static int emit_inl_nested_call(
               wr * 16, (unsigned)v);
   }
   e_sweep_guard(f, "vx", in->pc);
+  if (!g_e_inl) {
+    g_e_fl_calls = 1;
+    /* QJS_AOT_NOWINROOT=1 leaves the window unpublished: the negative control. */
+    fprintf(
+        f, "    rec_->pc = %d;\n    rec_->nroots = %d;\n", in->next - 1,
+        getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
+  }
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
     if (!qjs_aot_native_capable(callee[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
+    ib[0] = 0;
+    /* An inlined body has no frame; its record puts it in the backtrace. */
+    if (g_e_inl)
+      snprintf(
+          pushr, sizeof(pushr),
+          "        JSAotFlRec ir_ = { E_FL_TOP(ctx_in), co, %d, 0, NULL };\n"
+          "        E_FL_TOP(ctx_in) = &ir_;\n",
+          in->next - 1);
+    else
+      pushr[0] = 0;
+    if (!g_e_inl && qjs_aot_inline_has(callee[k]))
+      snprintf(
+          ib, sizeof(ib),
+          "#ifdef Q2_INLINE_%s\n"
+          "        if (!ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "                    %s, %d, &_o))\n"
+          "#endif\n",
+          callee[k], callee[k], cexp, recv, winp, na);
     if (getenv("QJS_AOT_INL_CONTROL") != NULL &&
         strcmp(getenv("QJS_AOT_INL_CONTROL"), "noident") == 0)
       fprintf(f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n"
-                 "        JSValue _o = aot_n_%s(ctx, caller_f,\n"
+                 "        JSValue _o;\n%s"
+                 "%s        _o = aot_n_%s(ctx, caller_f,\n"
                  "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-                 "            &AOT_REG(fr, %d), %d);\n"
-                 "        if (__builtin_expect(JS_IsException(_o), 0)) "
-                 "{ *out = _o; return 1; }\n",
-              cexp, callee[k], cexp, recv, w, na);
+                 "            %s, %d);\n"
+                 "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
+                 "%s\n",
+              cexp, ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     else
     fprintf(
         f,
         "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1)) "
         "{\n"
-        "        JSValue _o = aot_n_%s(ctx, caller_f,\n"
+        "        JSValue _o;\n%s"
+        "%s        _o = aot_n_%s(ctx, caller_f,\n"
         "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "            &AOT_REG(fr, %d), %d);\n"
-        "        if (__builtin_expect(JS_IsException(_o), 0)) "
-        "{ *out = _o; return 1; }\n",
-        cexp, callee[k], callee[k], cexp, recv, w, na);
+        "            %s, %d);\n"
+        "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
+        "%s\n",
+        cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
     e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
@@ -4772,8 +4848,29 @@ static int emit_inl_nested_call(
     }
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
-  /* No candidate matched: the call has not run, leave before it. */
+  /* No candidate matched. A frameless body that is not inlined calls any other
+     function through the engine, so a changed callee costs the call and not the
+     function; a value that is no function leaves before the call, and the generic
+     body raises the error. */
+  if (!g_e_inl) {
+    fprintf(
+        f,
+        "    if (JS_IsFunction(ctx, %s)) {\n"
+        "        JSValue _o = JS_Call(ctx, %s, %s, %d, %s);\n"
+        "        if (__builtin_expect(JS_IsException(_o), 0)) return _o;\n",
+        cexp, cexp, recv, na, winp);
+    e_emit_group_recheck(f, fn, in, cur);
+    if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
+      fprintf(f, "        if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
+    } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
+      fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
+      abort();
+    }
+    fprintf(f, "        goto cd_%d;\n    }\n", in->pc);
+  }
+  /* The call has not run: leave before it. */
   fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
+  if (!g_e_inl) fprintf(f, "    rec_->nroots = 0;\n");
   g_e_inl_dirty = 1;
   cur[dreg] = dv;
   g_e_miss_exit_seen = 0;
@@ -5216,11 +5313,7 @@ static int emit_typed_call(
     return emit_intrinsic_call(f, fn, in, t, cur, hex, fi, b);
   /* An inline body may call a compiled callee; a frameless one makes no call but a
      lowered intrinsic. */
-  if (g_e_inl) return emit_inl_nested_call(f, fn, in, t, cur, hex);
-  if (g_e_fl) {
-    e_fl_block("a call", in);
-    return 0;
-  }
+  if (g_e_inl || g_e_fl) return emit_inl_nested_call(f, fn, in, t, cur, hex);
   if (e_nocall_on()) return 0;
   if (!call_site_shaped(fn, in)) return 0;
   if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits))
@@ -7959,6 +8052,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e_xtag_n = 0;
   g_e_facts = NULL;
   g_e_inl_dirty = 0;
+  g_e_dx_own_n = 0;
   g_e_inl_nx_used = 0;
   free(g_e_dirty_ins);
   g_e_dirty_ins = g_e_inl ? calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1) : NULL;
@@ -8036,8 +8130,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   else if (g_e_fl)
     snprintf(
         gen0, sizeof(gen0),
-        "aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
-        "&(ENx){ 0, -100, NULL, NULL, NULL, 0, argc })",
+        "(e_xs = (ENx){ 0, -100, NULL, NULL, NULL, 0, argc, rec_ }, "
+        "aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &e_xs))",
         hex);
   else
     snprintf(gen0, sizeof(gen0), "aot_g_%s(ctx, f, fr, 0)", hex);
@@ -8062,6 +8156,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
           "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
           "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
           "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+          "    JSAotFlRec *const rec_ = NULL;\n"
           "    JSValue fr[%d];\n"
           "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
           hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1,
@@ -8069,18 +8164,31 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     else
     fprintf(
         f,
-        "E_TEXT %sJSValue aot_n_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
+        "%s%sJSValue aot_%s_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
         "                               JSObject *co, JSValue this_obj,\n"
-        "                               JSValue *argv, int argc)\n"
+        "                               JSValue *argv, int argc%s)\n"
         "{\n"
+        "%s"
         "    _Static_assert(QJS_DRC, \"a frameless body needs deferred counting\");\n"
         "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
         "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
         "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
         "    JSValue fr[%d];\n"
         "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
-        e_linkage(), hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1,
+        g_e_fl_calls ? "static inline __attribute__((always_inline)) " : "E_TEXT ",
+        g_e_fl_calls ? "" : e_linkage(), g_e_fl_calls ? "nb" : "n", hex,
+        g_e_fl_calls ? ", JSAotFlRec *rec_" : "",
+        g_e_fl_calls ? "" : "    JSAotFlRec *const rec_ = NULL; (void)rec_;\n",
+        fn->g->reg_count > 0 ? fn->g->reg_count : 1,
         fn->g->reg_count > 0 ? fn->g->reg_count : 1);
+    if (g_e_fl_calls && !g_e_inl) {
+      int wi, mw = 1;
+      for (wi = 0; wi < fn->ninsns; wi++)
+        if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method) &&
+            fn->insns[wi].win_n > mw)
+          mw = fn->insns[wi].win_n;
+      fprintf(f, "    JSValue win_[%d];\n    rec_->roots = win_;\n", mw);
+    }
   } else {
     fprintf(
         f, "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
@@ -8583,13 +8691,25 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
      representation does not accept. The op has run, so the exit is at the NEXT pc,
      and the op's result is already in the frame (E_INFRAME in the snapshot). */
   {
-    int o;
+    int o, q2;
     for (o = 0; o < g_e_dx_n; o++) {
       int pc2 = g_e_dx[o], ii, ins = -1;
       for (ii = 0; ii < fn->ninsns; ii++)
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    dx_%d:;\n", pc2);
+      /* The result of a call to compiled code is owned. A frameless body has no
+         register to adopt it into, so it is parked in the published window and only
+         then released (the release can run a collection). */
+      for (q2 = 0; q2 < g_e_dx_own_n; q2++)
+        if (g_e_dx_own_pc[q2] == pc2)
+          fprintf(
+              f,
+              "    if (JS_VALUE_HAS_REF_COUNT(AOT_REG(fr, %d))) {\n"
+              "        rec_->nroots = 1;\n"
+              "        qjs_aot_set_reg_p(ctx, rec_->roots, 0, AOT_REG(fr, %d));\n"
+              "    }\n",
+              g_e_dx_own_off[q2], g_e_dx_own_off[q2]);
       {
         const char *tx = e_tag_expr('d', pc2);
         char te[200];
@@ -8603,6 +8723,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     for (o = 0; o < g_e_dx_n; o++) free(g_e_dx_cur[o]);
     g_e_dx_n = 0;
+    g_e_dx_own_n = 0;
   }
   /* The overflow exits: the arithmetic check jumps here, and the exit does the
      sync and the hand-over. Nothing was written to the frame by the arithmetic
@@ -8651,6 +8772,36 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
 
   fprintf(f, "    }\n");
   fprintf(f, "}\n");
+  if (g_e_fl && !g_e_inl && g_e_fl_calls)
+    fprintf(
+        f,
+        "E_TEXT %sJSValue aot_n_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
+        "                               JSObject *co, JSValue this_obj,\n"
+        "                               JSValue *argv, int argc)\n"
+        "{\n"
+        "    uint8_t *rt = *(uint8_t **)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_RT);\n"
+        "    JSAotFlRec rec;\n"
+        "    JSValue r;\n"
+        "    if (__builtin_expect((uintptr_t)__builtin_frame_address(0) <\n"
+        "            *(uintptr_t *)(rt + QJS_AOT_OFF_RT_STACK_LIMIT) + "
+        "E_STACK_MARGIN, 0))\n"
+        "        return qjs_aot_throw_stack_overflow(ctx_in);\n"
+        "    if (__builtin_expect(--*(int *)((uint8_t *)ctx_in + "
+        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n"
+        "        ++*(int *)((uint8_t *)ctx_in + "
+        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
+        "        if (qjs_aot_poll(ctx_in) < 0) return JS_EXCEPTION;\n"
+        "    }\n"
+        "    rec.prev = *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP);\n"
+        "    rec.func = co;\n"
+        "    rec.pc = 0;\n"
+        "    rec.nroots = 0;\n"
+        "    *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = &rec;\n"
+        "    r = aot_nb_%s(ctx_in, caller_f, co, this_obj, argv, argc, &rec);\n"
+        "    *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = rec.prev;\n"
+        "    return r;\n"
+        "}\n",
+        e_linkage(), hex, hex);
   if (g_e_fl)
     fprintf(
         f,
@@ -8775,9 +8926,25 @@ static void e_fl_loop_setup(const Q2Func *fn) {
   }
 }
 
+/* Whether the profile saw the call reach a callee this unit compiled and enters natively:
+   the call then becomes a direct call in a frameless body. */
+static int e_call_has_compiled_callee(const Q2Func *fn, const Q2Insn *in) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits))
+    return 0;
+  for (k = 0; k < n && k < 4; k++)
+    if (kind[k] == 1 && qjs_aot_unit_has(callee[k]) &&
+        qjs_aot_native_capable(callee[k]) &&
+        in->win_n >= qjs_aot_unit_argc(callee[k]))
+      return 1;
+  return 0;
+}
+
 static const char *e_fl_prefilter(const Q2Func *fn) {
   const JSAotGenFunc *g = fn->g;
-  int i;
+  int i, has_calls;
   if (!g->light_ok &&
       !(g->func_kind == E_FUNC_NORMAL && g->ctl_count == 0))
     return "not light";
@@ -8787,11 +8954,18 @@ static const char *e_fl_prefilter(const Q2Func *fn) {
   /* A call site keeps the function framed, unless every one is an intrinsic the
      analysis may lower: its fallback is an exit, so the body needs no frame. A
      site the analysis then keeps as a call blocks the emission below. */
+  has_calls = 0;
   for (i = 0; i < fn->ninsns; i++) {
     const ERole *r = e_roles[fn->insns[i].rop];
     if (r == NULL || r->window < 0) continue;
     if (fn->insns[i].op == Q2_OP_CALL && e_intrinsic_lowerable(fn, &fn->insns[i]))
       continue;
+    if ((fn->insns[i].rop == ROP_call || fn->insns[i].rop == ROP_call_method) &&
+        getenv("QJS_AOT_NOFLCALLS") == NULL &&
+        e_call_has_compiled_callee(fn, &fn->insns[i])) {
+      has_calls = 1;
+      continue;
+    }
     return "call site";
   }
   /* A frameless body cannot go back: an exit hands the REST of the call to the
@@ -8803,6 +8977,13 @@ static const char *e_fl_prefilter(const Q2Func *fn) {
      block, both samples at one rate). The loop blocks and the verdict are set up
      here and consulted where the miss exit is emitted. */
   e_fl_loop_setup(fn);
+  /* A function that calls does a call's worth of work between its accesses, and an
+     exit repeats all of it in the generic body: every block counts as inside a long
+     loop, so an access the profile cannot vouch for keeps the function framed. */
+  if (has_calls) {
+    memset(g_e_loop_blk, 1, (size_t)(fn->nblocks > 0 ? fn->nblocks : 1));
+    g_e_fl_longloop = 1;
+  }
   for (i = 0; i < fn->ninsns; i++) {
     static const char *const names[] = {
         "new_object",   "object_template", "array_const",  "array_from",
@@ -8870,11 +9051,13 @@ int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     if (m == NULL) return e_emit_spec_body_pass(f, fn, hex);
     g_e_fl = 1;
     g_e_quiet = 1;
+    g_e_fl_calls = 0;
     g_e_fl_block[0] = 0;
     rc = e_emit_spec_body_pass(m, fn, hex);
     fclose(m);
     free(mb);
     g_e_quiet = 0;
+
     if (rc == 0 && g_e_fl_block[0] == 0) {
       g_e_fl_chosen = 1;
       rc = e_emit_spec_body_pass(f, fn, hex);
