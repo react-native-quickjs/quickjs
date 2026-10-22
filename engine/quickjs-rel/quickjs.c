@@ -63023,6 +63023,53 @@ QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue
         if (ar < 0)
             return -1;
     }
+    if (sub == REG_BIN_ADD &&
+        (JS_VALUE_GET_TAG(a) == JS_TAG_STRING || JS_VALUE_GET_TAG(b) == JS_TAG_STRING)) {
+        /* A short flat 8-bit string with an int or another short flat 8-bit string: the
+           result is built in one allocation, with no ToString of the int and no trip
+           through the general concatenation. A long or wide operand, a rope and a number
+           that is not an int keep the general routine. */
+        uint8_t tmp[16];
+        const uint8_t *s1 = NULL, *s2 = NULL;
+        size_t n1 = 0, n2 = 0;
+
+        if (JS_VALUE_GET_TAG(a) == JS_TAG_STRING) {
+            JSString *pa = JS_VALUE_GET_STRING(a);
+
+            if (!pa->is_wide_char && pa->len <= 255) {
+                s1 = str8(pa);
+                n1 = pa->len;
+            }
+        } else if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {
+            n1 = i32toa((char *)tmp, JS_VALUE_GET_INT(a));
+            s1 = tmp;
+        }
+        if (s1 != NULL) {
+            if (JS_VALUE_GET_TAG(b) == JS_TAG_STRING) {
+                JSString *pb = JS_VALUE_GET_STRING(b);
+
+                if (!pb->is_wide_char && pb->len <= 255) {
+                    s2 = str8(pb);
+                    n2 = pb->len;
+                }
+            } else if (JS_VALUE_GET_TAG(b) == JS_TAG_INT && s1 != tmp) {
+                n2 = i32toa((char *)tmp, JS_VALUE_GET_INT(b));
+                s2 = tmp;
+            }
+        }
+        if (s1 != NULL && s2 != NULL) {
+            JSString *p = js_alloc_string(ctx, (int)(n1 + n2), 0);
+
+            if (p == NULL)
+                return -1;
+            p->len = (uint32_t)(n1 + n2);
+            memcpy(str8(p), s1, n1);
+            memcpy(str8(p) + n1, s2, n2);
+            str8(p)[n1 + n2] = '\0';
+            *out = JS_MKPTR(JS_TAG_STRING, p);
+            return 1;
+        }
+    }
     return js_regvm_binary(ctx, sub, a, b, out) ? -1 : 1;
 }
 
