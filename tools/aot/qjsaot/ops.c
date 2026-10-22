@@ -5429,12 +5429,12 @@ static int emit_alloc_op(
         return 0;
       src_off = E_ROFF(in->arg[2]);
       if (in->arg[3].val == 0)
-        snprintf(call, sizeof(call), "qjs_aot_binary_cpool(ctx, f, %d, %uu, 0, AOT_REG(fr, %d), &_o)",
-                 (int)in->arg[1].val, (unsigned)in->arg[4].val, src_off);
+        snprintf(call, sizeof(call), "qjs_aot_binary_cpool(ctx, f, %d, %uu, 0, AOT_REG(fr, %d), %d, %d, &_o)",
+                 (int)in->arg[1].val, (unsigned)in->arg[4].val, src_off, dreg, src_off / 16);
       else if (in->arg[4].off >= 0)
         snprintf(call, sizeof(call),
-                 "qjs_aot_binary_cpool(ctx, f, %d, qjs_aot_ld_u32(q2_code(f) + %d), 1, AOT_REG(fr, %d), &_o)",
-                 (int)in->arg[1].val, in->arg[4].off, src_off);
+                 "qjs_aot_binary_cpool(ctx, f, %d, qjs_aot_ld_u32(q2_code(f) + %d), 1, AOT_REG(fr, %d), %d, %d, &_o)",
+                 (int)in->arg[1].val, in->arg[4].off, src_off, dreg, src_off / 16);
       else
         return 0;
       break;
@@ -5508,9 +5508,10 @@ static int emit_alloc_op(
   if (!nodest)
     fprintf(
         f,
-        "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+        "        if (_rc == 2) _o = AOT_REG(fr, %d);\n"
+        "        else if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
         "        else AOT_SET_B(ctx, fr, %d, _o);\n",
-        off, off);
+        off, off, off);
   e_emit_group_recheck(f, fn, in, cur);
   if (redef_mode) {
     /* every register the op redefines becomes a TAG local again from the frame */
