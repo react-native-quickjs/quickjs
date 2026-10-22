@@ -6024,7 +6024,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           for (k = 0; k < 16; k++)
             fprintf(f, "%s0x%02x", k ? ", " : "", funcs[i].digest[k]);
         }
-        fprintf(f, "}, aot_f_%s, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
+        if (qjs_aot_has_native_entry(i) && getenv("QJS_AOT_E2_NONFN") == NULL)
+          fprintf(f, "}, aot_f_%s, aot_n_%s, 0u, 0x%08xu },\n", hex, hex, funcs[i].code_crc);
+        else
+          fprintf(f, "}, aot_f_%s, NULL, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
       }
       fprintf(f, "};\n");
       /* Deopt site -> its function's index in the emitted table. A site whose
