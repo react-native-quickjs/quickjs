@@ -8343,6 +8343,12 @@ static int emit_typed_branch(
               "        c_ = %sc_;\n",
               (unsigned)av, (unsigned)bv,
               (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ) ? "!" : "");
+        else if (base >= REG_BIN_LT && base <= REG_BIN_GTE)
+          fprintf(
+              f,
+              "    else if (q2_str_cmp(v%u, v%u, &c_))\n"
+              "        c_ = c_ %s 0;\n",
+              (unsigned)av, (unsigned)bv, cop);
         if (e_term_wrappable(fn, in, role, blk)) {
           fprintf(f, "    else {\n");
           e_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
