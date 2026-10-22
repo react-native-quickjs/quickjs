@@ -3296,7 +3296,8 @@ static void e2_emit_arm(
          receiver): the poll may run an interrupt handler and the collector
          without a frame to scan. */
       fprintf(
-          f, "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
+          f, g_e2_inl ? "          if (qjs_aot_poll(ctx) < 0) { *out = JS_EXCEPTION; return 1; }\n"
+                      : "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
     } else if (g_e2_fl) {
       /* A borrowed value only this body holds: leave at the loop header, where
          the generic body has a frame, and let it poll at its own next back edge
@@ -3323,12 +3324,14 @@ static void e2_emit_arm(
       }
       fprintf(f, " 0 };\n");
       /* Not noted: an interrupt is neither a hand-off nor a failed speculation. */
+      if (g_e2_inl) g_e2_inl_nx_used = 1;
       fprintf(
           f,
           "          E2Nx x_ = { %d, -100, \"poll\", lv, offs, %d, argc };\n"
-          "          return aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
-          "&x_);\n          }\n",
-          t->start_pc, nlv, hex);
+          "          %saot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
+          "&x_);\n%s          }\n",
+          t->start_pc, nlv, g_e2_inl ? "*out = " : "return ",
+          hex, g_e2_inl ? "          return 1;\n" : "");
     } else {
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
@@ -7837,33 +7840,9 @@ static int e2_fl_loops(void) {
   return cached;
 }
 
-static const char *e2_fl_prefilter(const Q2Func *fn) {
+/* The loop blocks of the function and whether any loop may run long (see below). */
+static void e2_fl_loop_setup(const Q2Func *fn) {
   const JSAotGenFunc *g = fn->g;
-  int i;
-  if (!g->light_ok &&
-      !(g->func_kind == E2_FUNC_NORMAL && g->ctl_count == 0))
-    return "not light";
-  if (g->light_need > 16 * 1024) return "frame over 16 KB";
-  if (g->light_var_count > 0) return "variable area";
-  if (g->func_kind != E2_FUNC_NORMAL) return "not a plain function";
-  /* A call site keeps the function framed, unless every one is an intrinsic the
-     analysis may lower: its fallback is an exit, so the body needs no frame. A
-     site the analysis then keeps as a call blocks the emission below. */
-  for (i = 0; i < fn->ninsns; i++) {
-    const E2Role *r = e2_roles[fn->insns[i].rop];
-    if (r == NULL || r->window < 0) continue;
-    if (fn->insns[i].op == Q2_OP_CALL && e2_intrinsic_lowerable(fn, &fn->insns[i]))
-      continue;
-    return "call site";
-  }
-  /* A frameless body cannot go back: an exit hands the REST of the call to the
-     generic body, so one miss inside a long loop costs every remaining iteration.
-     So the body keeps out any access that can miss for a reason the profile cannot
-     see (an element, an ungrouped field, a length) when it sits in a loop that is
-     not known to be short: the profile's tick samples give the trips per call (the
-     busiest sampled instruction of the loop against the busiest one of the entry
-     block, both samples at one rate). The loop blocks and the verdict are set up
-     here and consulted where the miss exit is emitted. */
   {
     unsigned long long entries = 0;
     int b, si, q;
@@ -7897,6 +7876,36 @@ static const char *e2_fl_prefilter(const Q2Func *fn) {
     }
     if (e2_fl_loops()) g_e2_fl_longloop = 0;
   }
+}
+
+static const char *e2_fl_prefilter(const Q2Func *fn) {
+  const JSAotGenFunc *g = fn->g;
+  int i;
+  if (!g->light_ok &&
+      !(g->func_kind == E2_FUNC_NORMAL && g->ctl_count == 0))
+    return "not light";
+  if (g->light_need > 16 * 1024) return "frame over 16 KB";
+  if (g->light_var_count > 0) return "variable area";
+  if (g->func_kind != E2_FUNC_NORMAL) return "not a plain function";
+  /* A call site keeps the function framed, unless every one is an intrinsic the
+     analysis may lower: its fallback is an exit, so the body needs no frame. A
+     site the analysis then keeps as a call blocks the emission below. */
+  for (i = 0; i < fn->ninsns; i++) {
+    const E2Role *r = e2_roles[fn->insns[i].rop];
+    if (r == NULL || r->window < 0) continue;
+    if (fn->insns[i].op == Q2_OP_CALL && e2_intrinsic_lowerable(fn, &fn->insns[i]))
+      continue;
+    return "call site";
+  }
+  /* A frameless body cannot go back: an exit hands the REST of the call to the
+     generic body, so one miss inside a long loop costs every remaining iteration.
+     So the body keeps out any access that can miss for a reason the profile cannot
+     see (an element, an ungrouped field, a length) when it sits in a loop that is
+     not known to be short: the profile's tick samples give the trips per call (the
+     busiest sampled instruction of the loop against the busiest one of the entry
+     block, both samples at one rate). The loop blocks and the verdict are set up
+     here and consulted where the miss exit is emitted. */
+  e2_fl_loop_setup(fn);
   for (i = 0; i < fn->ninsns; i++) {
     static const char *const names[] = {
         "new_object",   "object_template", "array_const",  "array_from",
@@ -8010,7 +8019,7 @@ int e2_emit_inline_body(
   char *mb = NULL;
   size_t ml = 0;
   FILE *m;
-  int i, b, si, rc, ncalls = 0;
+  int i, rc, ncalls = 0;
   (void)0;
 
   /* QJS_AOT_E2_NOINLINE=1 emits no inline body: the baseline of a comparison. */
@@ -8054,14 +8063,6 @@ int e2_emit_inline_body(
     snprintf(why, whyn, "%d instructions", fn->ninsns);
     return 0;
   }
-  for (b = 0; b < fn->nblocks; b++)
-    for (si = 0; si < fn->blocks[b].nsucc && si < 2; si++) {
-      int sb = fn->blocks[b].succ_block[si];
-      if (sb >= 0 && sb < fn->nblocks && q2_is_back_edge(fn, b, sb)) {
-        snprintf(why, whyn, "loop");
-        return 0;
-      }
-    }
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     char nm[64];
@@ -8090,9 +8091,7 @@ int e2_emit_inline_body(
     free(mb);
     return 0;
   }
-  free(g_e2_loop_blk);
-  g_e2_loop_blk = NULL;
-  g_e2_fl_longloop = 0;
+  e2_fl_loop_setup(fn);
   g_e2_fl = 1;
   g_e2_inl = 1;
   g_e2_quiet = 1;
