@@ -1307,12 +1307,16 @@
       "sha256": "f967adfd307bcb5772d92b3a3e101769e383b4a848c749f5eae3294aaa650561"
     },
     {
+      "name": "0333-aot-iter-next.patch",
+      "sha256": "7f06cbf180e9bd79a4e0c27f0d9820ce089e1046b17bedc20edc23c74768a47c"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "416038cfe7c4ba7cf8fb559adbc23f8e721279b659af1a45e084796bd47880fb",
+    "quickjs.c": "51a955982297ebe562716af53701b73b5d340c3ff04dd6870d7ee1498b75f20d",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

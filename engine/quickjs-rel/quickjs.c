@@ -62407,6 +62407,52 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                : 0;
 }
 
+/* `iter_next` for the built-in array iterator, which is what `for (x of array)` runs:
+   the next element is read in place, with no call through the iterator protocol. Any
+   other iterator, a holey or changed array, the end of the iteration, and a build without
+   deferred counts take the instruction's handler. The instruction is `op, reg w`: it reads
+   the iterator at w and its `next` at w+1, and writes the value at w+2 and `done` at
+   w+3. The element stays owned by the array, so the register borrows it, as the
+   handler's duplicate-then-adopt leaves it. Returns the next instruction. */
+QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                        JSContext *ctx)
+{
+#if QJS_DRC
+    int w = (int)regvm_ld_u16(ip + 1) >> 4;
+    JSValue it = fr[w], nx = fr[w + 1];
+
+    if (likely(JS_VALUE_GET_TAG(it) == JS_TAG_OBJECT &&
+               JS_VALUE_GET_TAG(nx) == JS_TAG_OBJECT)) {
+        JSObject *pi = JS_VALUE_GET_OBJ(it), *pn = JS_VALUE_GET_OBJ(nx);
+
+        if (likely(pi->class_id == JS_CLASS_ARRAY_ITERATOR &&
+                   pn->class_id == JS_CLASS_C_FUNCTION &&
+                   pn->u.cfunc.cproto == JS_CFUNC_iterator_next &&
+                   pn->u.cfunc.c_function.iterator_next == js_array_iterator_next)) {
+            JSArrayIteratorData *d = &pi->u.array_iterator_data;
+
+            if (likely(d->kind == JS_ITERATOR_KIND_VALUE &&
+                       JS_VALUE_GET_TAG(d->obj) == JS_TAG_OBJECT)) {
+                JSObject *ap = JS_VALUE_GET_OBJ(d->obj);
+
+                if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array &&
+                           !ap->holey && d->idx < ap->u.array.count)) {
+                    JSValue v = ap->u.array.u.values[d->idx];
+
+                    if (likely(!js_lazy_marker_is(v))) {
+                        d->idx++;
+                        fr[w + 2] = v;
+                        fr[w + 3] = JS_FALSE;
+                        return ip + 3;
+                    }
+                }
+            }
+        }
+    }
+#endif
+    return qjs_aot_step(ip, fr, f, ctx);
+}
+
 /* The cached add-transition store of a compiled named store, tried before the
    frame is published: it only grows the property array, so nothing observes
    the registers. 1 when the store landed, 0 when the site holds no transition
