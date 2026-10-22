@@ -6046,12 +6046,13 @@ static int emit_typed_call(
       fprintf(
           f,
           "    { JSValue _o;\n"
+          "      E_CAP(f, %d);\n"
           "      int _rc = qjs_aot_call_c(ctx, %d, -1, %d, %s, %s, &AOT_REG(fr, %d), &_o);\n"
           "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n"
           "      if (_rc > 0) {\n"
           "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
           "        else AOT_SET_B(ctx, fr, %d, _o);\n",
-          site, na, cexp, recv, w, off, off);
+          in->next - 1, site, na, cexp, recv, w, off, off);
       e_emit_group_recheck(f, fn, in, cur);
       if (t->lb[dv] == E_LB_TAG) {
         fprintf(f, "        v%u = _o;\n", (unsigned)dv);
