@@ -421,3 +421,4 @@ bump while `9999` is missing.
 | `0333` | Reads the next element of a built-in array iterator in place for compiled for-of | A compiled for-of republished every live register and went four calls deep per element | `qjs_aot_iter_next` | No. |
 | `0334` | Enters a compiled function called from C through its native entry | A builtin calling a compiled callback paid the interpreter activation per call | `JS_CallInternal` fast head | No. |
 | `0335` | Exposes what compiled code needs to replay a cached add-transition store inline | A constructor setting its fields called into the engine per property | layout: epoch stamp, flag word, runtime epoch | Yes (layout hash). |
+| `0336` | Lets a compiled `new` teach the constructor its instance capacity | Constructors reached only through compiled `new` grew their property array on every construction | `qjs_aot_construct_done` | No. |

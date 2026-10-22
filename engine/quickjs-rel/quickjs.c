@@ -62778,6 +62778,14 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     return 1;
 }
 
+/* A compiled `new` finished: feed the constructed object's property count back to the
+   constructor's learned instance capacity, as the interpreter's construct paths do, so the
+   next `this` is allocated with room for all its fields. */
+void qjs_aot_construct_done(JSObject *ctor, JSValue inst)
+{
+    js_learn_instance_cap(ctor->u.func.function_bytecode, inst);
+}
+
 __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take)
 {
     int r;

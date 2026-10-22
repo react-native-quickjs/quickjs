@@ -1,0 +1,42 @@
+Subject: Let a compiled `new` teach the constructor its instance capacity
+
+What this does
+  - `qjs_aot_construct_done(ctor, inst)` feeds the constructed object's property count to the
+    constructor's learned inline slot capacity (`js_learn_instance_cap`), exactly as the
+    interpreter's construct paths do when a constructor returns.
+
+Why we need it
+  A constructor reached only through compiled `new` never learned its capacity, so every
+  instance with more fields than the default grew its property array once per construction:
+  the 12-field constructors paid a realloc and the engine's slow add for each of the last
+  four fields. The interpreter had learned the capacity long before.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62778,6 +62778,14 @@
+     return 1;
+ }
+ 
++/* A compiled `new` finished: feed the constructed object's property count back to the
++   constructor's learned instance capacity, as the interpreter's construct paths do, so the
++   next `this` is allocated with room for all its fields. */
++void qjs_aot_construct_done(JSObject *ctor, JSValue inst)
++{
++    js_learn_instance_cap(ctor->u.func.function_bytecode, inst);
++}
++
+ __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take)
+ {
+     int r;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -378,6 +378,9 @@
+ QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
+                                  JSValue v, int site);
+ 
++/* A compiled `new` finished with `inst`: the constructor learns its instance capacity. */
++void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
++
+ /* The `this` object of `new C(...)` for a plain constructor: allocated the way the
+    interpreter's light construct does (the prototype from `C.prototype`, the profiled
+    inline slot capacity), so the caller can run the constructor's compiled body with it

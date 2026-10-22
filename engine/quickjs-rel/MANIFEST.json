@@ -1319,12 +1319,16 @@
       "sha256": "b197a900acec99ce01e6d397c2f18a3df832949396fd6b5357802bd5a21010ce"
     },
     {
+      "name": "0336-aot-construct-done.patch",
+      "sha256": "a48e52b85579eb91d3a00c9e9aa96af867335243db7c8bcc477e4ff0ecf62043"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "12600e4a997b94cf659da34d0b2cfdcf516a9feedf819b69b9a50ac09d84d265",
+    "quickjs.c": "54816afef9115b2635e1db218488f1580f68c4e36ab0c785d8a66020021d1135",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
