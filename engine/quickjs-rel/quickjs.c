@@ -60865,6 +60865,43 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->class_c_function = JS_CLASS_C_FUNCTION;
     out->off_cfunc_c_function = (uint32_t)offsetof(JSObject, u.cfunc.c_function);
     out->off_cfunc_magic = (uint32_t)offsetof(JSObject, u.cfunc.magic);
+    out->off_regpic_misses = (uint32_t)offsetof(JSRegPIC, misses);
+    out->reg_pic_add_w = REG_PIC_ADD_W;
+    out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
+    {
+        /* The object's flag bits and its inline slot capacity share one 16-bit word:
+           find where it is and which bits each field takes by setting them in a
+           zeroed object. */
+        JSObject o;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+        uint16_t w;
+
+        memset(&o, 0, sizeof(o));
+        o.extensible = 1;
+        o.is_exotic = 1;
+        o.gv_watched = 1;
+        o.prop_inline_cap = 31;
+        for (i = 0; i < sizeof(o) && q[i] == 0; i++)
+            ;
+        out->off_object_flags16 = (uint32_t)(i & ~(size_t)1);
+        memcpy(&w, q + out->off_object_flags16, 2);
+        out->object_inline_cap_mask = w;
+        memset(&o, 0, sizeof(o));
+        o.extensible = 1;
+        memcpy(&w, q + out->off_object_flags16, 2);
+        out->object_extensible_mask = w;
+        memset(&o, 0, sizeof(o));
+        o.is_exotic = 1;
+        o.gv_watched = 1;
+        memcpy(&w, q + out->off_object_flags16, 2);
+        out->object_noadd_mask = w;
+        memset(&o, 0, sizeof(o));
+        o.prop_inline_cap = 31;
+        memcpy(&w, q + out->off_object_flags16, 2);
+        out->object_inline_cap_mask = w;
+        out->object_inline_cap_shift = (uint32_t)__builtin_ctz(w);
+    }
     out->hash = qjs_aot_layout_hash(out);
 }
 
