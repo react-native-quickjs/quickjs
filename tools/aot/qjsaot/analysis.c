@@ -412,6 +412,16 @@ static int transfer_def(
           *whyp = E_WHY_UNKNOWN_RESULT;
           return E_LB_TAG;
       }
+    case Q2_OP_TO_PROPKEY:
+      /* An integer is already a property key; the object operand of the two-operand
+         form is only tested for null and undefined. */
+      if (in->nuse < 1) return E_LB_TAG;
+      a = w[in->use[0]];
+      if (a == E_LB_BOT) return E_LB_BOT;
+      if (a == E_LB_I32) return E_LB_I32;
+      *whyp = E_WHY_OPERAND_TAGGED;
+      *whyvp = in->use[0];
+      return E_LB_TAG;
     case Q2_OP_COMPARE:
       if (!binary_operands(in, w, &a, &b)) return E_LB_TAG;
       return rep_cmp(sub, a, b);

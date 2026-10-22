@@ -4218,6 +4218,50 @@ static int emit_typed_fused(
   return 1;
 }
 
+/* `to_propkey` ("rr": d, key) and `to_propkey2` ("rrr": d, key, object): an integer key is
+   already a property key, so the result is the key itself. The two-operand form first
+   tests the object for null and undefined, which is an exit before the instruction (the
+   generic body raises the error). A key that is not an integer stays with the wrapper. */
+static int emit_typed_propkey(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    int have_types) {
+  Q2ValueId dv, kv;
+  int dreg;
+  char dn[32], kn[32];
+
+  if (!have_types || t == NULL || cur == NULL) return 0;
+  if (in->rop != ROP_to_propkey && in->rop != ROP_to_propkey2) return 0;
+  if (in->ndef < 1 || in->nuse < 1) return 0;
+  dv = in->def[0];
+  kv = in->use[0];
+  if (dv >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[dv] != E_LB_I32 || t->lb[kv] != E_LB_I32) return 0;
+  if (in->rop == ROP_to_propkey2 && in->nuse < 2) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (in->rop == ROP_to_propkey2) {
+    Q2ValueId ov = in->use[1];
+    if (ov >= (Q2ValueId)t->nvalues) return 0;
+    if (t->lb[ov] == E_LB_TAG) {
+      char ex[48];
+      snprintf(ex, sizeof(ex), "v%u", (unsigned)ov);
+      e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+      e_note_tag('v', in->pc, ex);
+      e_sweep_guard(f, "vx", in->pc);
+      fprintf(
+          f,
+          "    if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_NULL || "
+          "JS_VALUE_GET_TAG(v%u) == JS_TAG_UNDEFINED, 0)) goto vx_%d;\n",
+          (unsigned)ov, (unsigned)ov, in->pc);
+    }
+  }
+  e_local_name(dn, sizeof(dn), dv);
+  e_local_name(kn, sizeof(kn), kv);
+  fprintf(f, "    %s = %s;\n", dn, kn);
+  cur[dreg] = dv;
+  return 1;
+}
+
 /* A speculative-body ARRAY LENGTH: `get_length` ("rr": dest, receiver). The hit
    helper is `q2_array_length`, which returns a double in an int range; the result is
    an i32 local (that is the only shape the analysis uses for it). A miss goes to the
@@ -8221,6 +8265,10 @@ static int e_dispatch_rop(
     case ROP_get_this_field:
     case ROP_get_this_field2:
       return emit_typed_this_field(f, fn, in, t, cur, have_types, hex, fi, b);
+
+    case ROP_to_propkey:
+    case ROP_to_propkey2:
+      return emit_typed_propkey(f, fn, in, t, cur, have_types);
 
     /* -- elements and length -- */
     case ROP_get_element:
