@@ -698,6 +698,15 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = Q2_E_HEAP;
       info.writes = Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
+    /* Allocation: the new object is the destination and nothing else is written. */
+    case ROP_new_object:      /* "r": d */
+    case ROP_object_template: /* "rb": d, template */
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
     case ROP_load_const: /* "rbc": d, kind, cpool */
       info.op = Q2_OP_FALLBACK;
       info.ndef = 1;

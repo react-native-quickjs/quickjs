@@ -2194,6 +2194,22 @@ static int g_e_fl_chosen;
    keeps an activation record (JSAotFlRec) for the backtrace, and polls and checks
    the C stack at its entry. Kept from the trial emission into the real one. */
 static int g_e_fl_calls;
+/* The published root array of a frameless body that calls (see JSAotFlRec): the slots
+   of unrooted TAG values that live across a call or an allocation come first, then
+   the argument window of the call in progress. A value gets its slot at its first
+   safepoint; the count of slots found by the trial emission sizes the array for the
+   real one. */
+static int *g_e_spill_slot;
+static int g_e_spill_n, g_e_spill_total, g_e_spill_nv;
+#define E_SPILL_MAX 16
+static int e_spill_slot(Q2ValueId v) {
+  if (g_e_spill_slot == NULL || (int)v >= g_e_spill_nv) return -1;
+  if (g_e_spill_slot[v] < 0) {
+    if (g_e_spill_n >= E_SPILL_MAX) return -1;
+    g_e_spill_slot[v] = g_e_spill_n++;
+  }
+  return g_e_spill_slot[v];
+}
 
 /* Which blocks sit in a loop, and whether some loop of the function may run long
    (set by the prefilter). A miss exit emitted in such a block, for an access the
@@ -4627,6 +4643,30 @@ static int emit_intrinsic_call(
    - the result must be typed, or dead (a dead owned result is released here);
    - from here on the body has an effect, so its exits build the callee's frame
      (aot_nx_) and finish in the generic body (g_e_inl_dirty). */
+/* Slot `idx` of the published window array, from register `wr`'s current value. */
+static void e_emit_fl_window_store(
+    FILE *f, const Q2Func *fn, const ETypes *t, const Q2ValueId *cur, int wr, int idx) {
+  Q2ValueId v;
+  if (wr >= fn->nregs || (v = cur[wr]) == Q2_NO_VALUE || v == E_UNDEF) {
+    fprintf(f, "    ra_[SB_ + %d] = JS_UNDEFINED;\n", idx);
+    return;
+  }
+  if (v == E_INFRAME || v >= (Q2ValueId)t->nvalues) {
+    fprintf(f, "    ra_[SB_ + %d] = AOT_REG(fr, %d);\n", idx, wr * 16);
+    return;
+  }
+  if (t->lb[v] == E_LB_TAG)
+    fprintf(f, "    ra_[SB_ + %d] = v%u;\n", idx, (unsigned)v);
+  else if (t->lb[v] == E_LB_I32)
+    fprintf(f, "    ra_[SB_ + %d] = JS_MKVAL(JS_TAG_INT, i%u);\n", idx, (unsigned)v);
+  else if (t->lb[v] == E_LB_F64)
+    fprintf(f, "    ra_[SB_ + %d] = E_BOX_F64(d%u);\n", idx, (unsigned)v);
+  else if (t->lb[v] == E_LB_BOOL)
+    fprintf(f, "    ra_[SB_ + %d] = JS_MKVAL(JS_TAG_BOOL, b%u);\n", idx, (unsigned)v);
+  else
+    fprintf(f, "    ra_[SB_ + %d] = AOT_REG(fr, %d);\n", idx, wr * 16);
+}
+
 static int emit_inl_nested_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     char hex[33]) {
@@ -4637,6 +4677,8 @@ static int emit_inl_nested_call(
   Q2ValueId dv;
   int dreg, dead;
   uint64_t *lb;
+  Q2ValueId spv[E_SPILL_MAX + 1];
+  int nsp, resslot;
   const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
   char winp[48], ib[512], pushr[160];
   const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
@@ -4668,18 +4710,26 @@ static int emit_inl_nested_call(
   if (g_e_inl)
     snprintf(winp, sizeof(winp), "&AOT_REG(fr, %d)", w);
   else
-    snprintf(winp, sizeof(winp), "&win_[0]");
+    snprintf(winp, sizeof(winp), "&ra_[SB_]");
   if (off < 0 || cc < 0 || in->ndef < 1) return 0;
   dv = in->def[0];
   if (dv >= (Q2ValueId)t->nvalues) return 0;
   dreg = off / 16;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   dead = e_def_dead(in, dv);
-  if (t->lb[dv] == E_LB_TAG && !dead) {
+  if (t->lb[dv] == E_LB_TAG && !dead && g_e_inl) {
     e_fl_block("a call whose result is a TAG value", in);
     return 0;
   }
   if (t->lb[dv] == E_LB_BOT && !dead) return 0;
+  resslot = -1;
+  if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
+    resslot = e_spill_slot(dv);
+    if (resslot < 0) {
+      e_fl_block("too many values live across a call", in);
+      return 0;
+    }
+  }
   /* Rooted: every TAG value live at the call, but the callee and the receiver. */
   lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (lb == NULL) return 0;
@@ -4697,19 +4747,29 @@ static int emit_inl_nested_call(
       if (!((la[r / 64] >> (r % 64)) & 1)) lb[r / 64] &= ~((uint64_t)1 << (r % 64));
     free(la);
   }
+  nsp = 0;
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v;
     if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
-    if (r * 16 == cc || (th >= 0 && r * 16 == th)) continue;
     v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME ||
         v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
       continue;
-    if (g_e_rooted == NULL || !g_e_rooted[v]) {
+    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if (g_e_inl) {
+      if (r * 16 == cc || (th >= 0 && r * 16 == th)) continue;
       free(lb);
       e_fl_block("a value live across a call is not rooted", in);
       return 0;
     }
+    /* Unrooted: the published array holds it for the call (the callee and the
+       receiver too, which only this body refers to). */
+    if (e_spill_slot(v) < 0) {
+      free(lb);
+      e_fl_block("too many values live across a call", in);
+      return 0;
+    }
+    spv[nsp++] = v;
   }
   free(lb);
   {
@@ -4750,24 +4810,7 @@ static int emit_inl_nested_call(
     Q2ValueId v;
     int wr = in->win_reg + r;
     if (!g_e_inl) {
-      if (wr >= fn->nregs || (v = cur[wr]) == Q2_NO_VALUE || v == E_UNDEF) {
-        fprintf(f, "    win_[%d] = JS_UNDEFINED;\n", r);
-        continue;
-      }
-      if (v == E_INFRAME || v >= (Q2ValueId)t->nvalues) {
-        fprintf(f, "    win_[%d] = AOT_REG(fr, %d);\n", r, wr * 16);
-        continue;
-      }
-      if (t->lb[v] == E_LB_TAG)
-        fprintf(f, "    win_[%d] = v%u;\n", r, (unsigned)v);
-      else if (t->lb[v] == E_LB_I32)
-        fprintf(f, "    win_[%d] = JS_MKVAL(JS_TAG_INT, i%u);\n", r, (unsigned)v);
-      else if (t->lb[v] == E_LB_F64)
-        fprintf(f, "    win_[%d] = E_BOX_F64(d%u);\n", r, (unsigned)v);
-      else if (t->lb[v] == E_LB_BOOL)
-        fprintf(f, "    win_[%d] = JS_MKVAL(JS_TAG_BOOL, b%u);\n", r, (unsigned)v);
-      else
-        fprintf(f, "    win_[%d] = AOT_REG(fr, %d);\n", r, wr * 16);
+      e_emit_fl_window_store(f, fn, t, cur, wr, r);
       continue;
     }
     if (wr >= fn->nregs) continue;
@@ -4789,8 +4832,10 @@ static int emit_inl_nested_call(
   if (!g_e_inl) {
     g_e_fl_calls = 1;
     /* QJS_AOT_NOWINROOT=1 leaves the window unpublished: the negative control. */
+    for (k = 0; k < nsp; k++)
+      fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
     fprintf(
-        f, "    rec_->pc = %d;\n    rec_->nroots = %d;\n", in->next - 1,
+        f, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n", in->next - 1,
         getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
   }
   for (k = 0; k < n && k < 4; k++) {
@@ -4839,13 +4884,27 @@ static int emit_inl_nested_call(
         "%s\n",
         cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
-    e_emit_group_recheck(f, fn, in, cur);
-    if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
+    if (g_e_inl) e_emit_group_recheck(f, fn, in, cur);
+    if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
+      /* The owned result parks in the published window, then its count is dropped (the
+         drop can run a collection); the next safepoint gives the value a slot. */
+      fprintf(
+          f,
+          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
+          "        else ra_[%d] = _o;\n"
+          "        v%u = _o;\n"
+          "        AOT_SET_B(ctx, fr, %d, _o);\n",
+          resslot, resslot, (unsigned)dv, dreg * 16);
+    } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
       fprintf(f, "        if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
     } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
       fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
       abort();
     }
+    /* The result is in place (a TAG value in its local, a typed one in the frame
+       slot the exit stub reads): the facts the call may have changed are checked now,
+       so an exit here carries the result. */
+    if (!g_e_inl) e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
   /* No candidate matched. A frameless body that is not inlined calls any other
@@ -4859,18 +4918,28 @@ static int emit_inl_nested_call(
         "        JSValue _o = JS_Call(ctx, %s, %s, %d, %s);\n"
         "        if (__builtin_expect(JS_IsException(_o), 0)) return _o;\n",
         cexp, cexp, recv, na, winp);
-    e_emit_group_recheck(f, fn, in, cur);
-    if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
+    if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
+      /* The owned result parks in the published window, then its count is dropped (the
+         drop can run a collection); the next safepoint gives the value a slot. */
+      fprintf(
+          f,
+          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
+          "        else ra_[%d] = _o;\n"
+          "        v%u = _o;\n"
+          "        AOT_SET_B(ctx, fr, %d, _o);\n",
+          resslot, resslot, (unsigned)dv, dreg * 16);
+    } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
       fprintf(f, "        if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
     } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
       fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
       abort();
     }
+    e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n", in->pc);
   }
   /* The call has not run: leave before it. */
   fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
-  if (!g_e_inl) fprintf(f, "    rec_->nroots = 0;\n");
+  if (!g_e_inl) fprintf(f, "    rec_->nroots = SB_;\n");
   g_e_inl_dirty = 1;
   cur[dreg] = dv;
   g_e_miss_exit_seen = 0;
@@ -5063,6 +5132,172 @@ static int emit_store_call(
   return 1;
 }
 
+/* Allocation in a frameless body: a new object (plain, from a template, or an array of
+   registers) and the fill of a template object. The engine helpers take the function's
+   bytecode, not a frame. The allocation is a safepoint, so the live TAG values nothing
+   else roots go into their slots of the published array first, and the new object
+   parks in the window before its count is dropped. */
+static int emit_fl_alloc_op(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur) {
+  Q2ValueId dv = Q2_NO_VALUE, spv[E_SPILL_MAX + 1], ov = Q2_NO_VALUE;
+  int dreg = -1, na = 0, r, nsp = 0, k, resslot, fill = in->rop == ROP_object_fill;
+  char call[256];
+  uint64_t *lb, *la;
+
+  if (t == NULL || cur == NULL) {
+    e_fl_block("an allocation with no analysis", in);
+    return 0;
+  }
+  if (e_must_exit(fn, in) || (fill && in->nredef > 0)) {
+    e_fl_block("an allocation the facts keep for the handler", in);
+    return 0;
+  }
+  if (in->win_n > 0) {
+    if ((unsigned)(in->win_reg + in->win_n) > (unsigned)fn->nregs) return 0;
+    na = in->win_n;
+  }
+  switch (in->rop) {
+    case ROP_new_object:
+      snprintf(call, sizeof(call), "(_o = JS_NewObject(ctx), JS_IsException(_o) ? -1 : 0)");
+      break;
+    case ROP_object_template:
+      if (in->narg < 2) return 0;
+      snprintf(
+          call, sizeof(call),
+          "qjs_aot_object_template_b(ctx, (struct JSFunctionBytecode *)cb, %d, &_o)",
+          (int)in->arg[1].val);
+      break;
+    case ROP_array_from:
+      if (in->win_n < 0) return 0;
+      snprintf(call, sizeof(call), "qjs_aot_array_from(ctx, &ra_[SB_], %d, &_o)", na);
+      break;
+    case ROP_object_fill: {
+      int oreg;
+      if (in->narg < 4 || in->arg[0].kind != 'r' || in->win_n < 0) return 0;
+      oreg = (int)in->arg[0].val / 16;
+      if (oreg < 0 || oreg >= fn->nregs) return 0;
+      ov = cur[oreg];
+      if (ov == Q2_NO_VALUE || ov == E_UNDEF || ov == E_INFRAME ||
+          ov >= (Q2ValueId)t->nvalues || t->lb[ov] != E_LB_TAG) {
+        e_fl_block("a fill of an object that is not a TAG value", in);
+        return 0;
+      }
+      snprintf(
+          call, sizeof(call),
+          "(_o = JS_UNDEFINED, qjs_aot_object_fill_b(ctx, (struct JSFunctionBytecode *)cb, "
+          "v%u, &ra_[SB_], %d, %d))",
+          (unsigned)ov, na, (int)in->arg[3].val);
+      break;
+    }
+    default:
+      e_fl_block("an allocation this body cannot make", in);
+      return 0;
+  }
+  if (!fill) {
+    if (in->ndef >= 1) {
+      int off = dest_off(fn, in);
+      if (off < 0) return 0;
+      dv = in->def[0];
+      dreg = off / 16;
+    } else if (in->nredef >= 1 && in->redef_reg != NULL && in->redef_val != NULL &&
+               in->narg >= 1 && in->arg[0].kind == 'r') {
+      /* The decoder files the op as a fallback that redefines the registers it may
+         rewrite: the destination is its first operand, the others keep their value. */
+      int k2;
+      dreg = (int)in->arg[0].val / 16;
+      for (k2 = 0; k2 < in->nredef; k2++)
+        if (in->redef_reg[k2] == dreg) dv = in->redef_val[k2];
+      if (dv == Q2_NO_VALUE) return 0;
+    } else {
+      return 0;
+    }
+    if (dv >= (Q2ValueId)t->nvalues || dreg < 0 || dreg >= fn->nregs) return 0;
+    if (t->lb[dv] != E_LB_TAG && !e_def_dead(in, dv)) {
+      e_fl_block("an allocation whose result is typed", in);
+      return 0;
+    }
+  }
+  resslot = -1;
+  if (!fill && t->lb[dv] == E_LB_TAG && !e_def_dead(in, dv)) {
+    resslot = e_spill_slot(dv);
+    if (resslot < 0) {
+      e_fl_block("too many values live across an allocation", in);
+      return 0;
+    }
+  }
+  /* Spill: the TAG values live across the op that nothing roots. The window values are
+     consumed by it (a fill clears them), so they are not live after unless read again. */
+  lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  la = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  if (lb == NULL || la == NULL) abort();
+  q2_live_before(fn, (int)(in - fn->insns), lb);
+  if ((int)(in - fn->insns) + 1 < fn->ninsns)
+    q2_live_before(fn, (int)(in - fn->insns) + 1, la);
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v;
+    int is_win = r >= in->win_reg && r < in->win_reg + na;
+    if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
+    if (is_win && !((la[r / 64] >> (r % 64)) & 1)) continue;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME ||
+        v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
+      continue;
+    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if (e_spill_slot(v) < 0) {
+      free(lb);
+      free(la);
+      e_fl_block("too many values live across an allocation", in);
+      return 0;
+    }
+    spv[nsp++] = v;
+  }
+  free(lb);
+  free(la);
+
+  /* ---- output ---- */
+  g_e_fl_calls = 1;
+  for (k = 0; k < nsp; k++)
+    fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
+  for (r = 0; r < na; r++) e_emit_fl_window_store(f, fn, t, cur, in->win_reg + r, r);
+  fprintf(f, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n", in->next - 1, na);
+  fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
+  fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n");
+  if (!fill) {
+    if (t->lb[dv] == E_LB_TAG && !e_def_dead(in, dv))
+      fprintf(
+          f,
+          "      if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
+          "      else ra_[%d] = _o;\n"
+          "      v%u = _o;\n"
+          "      AOT_SET_B(ctx, fr, %d, _o);\n",
+          resslot, resslot, (unsigned)dv, dreg * 16);
+    else
+      fprintf(f, "      if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
+  }
+  fprintf(f, "    }\n");
+  if (fill || na > 0) fprintf(f, "    rec_->nroots = SB_;\n");
+  /* The other registers the fallback form lists keep their value. */
+  for (k = 0; k < in->nredef; k++) {
+    Q2ValueId rv = in->redef_val[k], src;
+    int rr = in->redef_reg[k];
+    char nm[32];
+    if (rr == dreg || rv == Q2_NO_VALUE || rv >= (Q2ValueId)t->nvalues || rr < 0 ||
+        rr >= fn->nregs)
+      continue;
+    src = cur[rr];
+    if (src == Q2_NO_VALUE || src == E_UNDEF || src == E_INFRAME ||
+        src >= (Q2ValueId)t->nvalues)
+      continue;
+    e_local_name(nm, sizeof(nm), rv);
+    fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
+    cur[rr] = rv;
+  }
+  e_emit_group_recheck(f, fn, in, cur);
+  g_e_inl_dirty = 1;
+  if (!fill) cur[dreg] = dv;
+  return 1;
+}
+
 static int emit_alloc_op(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -5072,6 +5307,10 @@ static int emit_alloc_op(
   int redef_mode = 0, nodest = in->rop == ROP_object_fill, src_off = -1;
   char call[256];
 
+  if (g_e_fl && !g_e_inl && have_types &&
+      (in->rop == ROP_new_object || in->rop == ROP_object_template ||
+       in->rop == ROP_array_from || in->rop == ROP_object_fill))
+    return emit_fl_alloc_op(f, fn, in, t, cur);
   if (!have_types || t == NULL || g_e_fl || cur == NULL) return 0;
   if (e_roles[in->rop] == NULL || e_roles[in->rop]->control != E_CF_NONE) return 0;
   if (e_must_exit(fn, in)) return 0;
@@ -8053,6 +8292,15 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e_facts = NULL;
   g_e_inl_dirty = 0;
   g_e_dx_own_n = 0;
+  free(g_e_spill_slot);
+  g_e_spill_nv = fn->nvalues > 0 ? fn->nvalues : 1;
+  g_e_spill_slot = malloc(sizeof(int) * (size_t)g_e_spill_nv);
+  if (g_e_spill_slot == NULL) abort();
+  {
+    int q_;
+    for (q_ = 0; q_ < g_e_spill_nv; q_++) g_e_spill_slot[q_] = -1;
+  }
+  g_e_spill_n = 0;
   g_e_inl_nx_used = 0;
   free(g_e_dirty_ins);
   g_e_dirty_ins = g_e_inl ? calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1) : NULL;
@@ -8184,10 +8432,17 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     if (g_e_fl_calls && !g_e_inl) {
       int wi, mw = 1;
       for (wi = 0; wi < fn->ninsns; wi++)
-        if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method) &&
+        if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method ||
+             fn->insns[wi].rop == ROP_array_from || fn->insns[wi].rop == ROP_object_fill) &&
             fn->insns[wi].win_n > mw)
           mw = fn->insns[wi].win_n;
-      fprintf(f, "    JSValue win_[%d];\n    rec_->roots = win_;\n", mw);
+      fprintf(
+          f,
+          "    enum { SB_ = %d };\n"
+          "    JSValue ra_[SB_ + %d];\n"
+          "    { int k_; for (k_ = 0; k_ < SB_; k_++) ra_[k_] = JS_UNDEFINED; }\n"
+          "    rec_->roots = ra_;\n    rec_->nroots = SB_;\n",
+          g_e_spill_total, mw);
     }
   } else {
     fprintf(
@@ -8706,8 +8961,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
           fprintf(
               f,
               "    if (JS_VALUE_HAS_REF_COUNT(AOT_REG(fr, %d))) {\n"
-              "        rec_->nroots = 1;\n"
-              "        qjs_aot_set_reg_p(ctx, rec_->roots, 0, AOT_REG(fr, %d));\n"
+              "        rec_->nroots = SB_ + 1;\n"
+              "        qjs_aot_set_reg_p(ctx, &ra_[SB_], 0, AOT_REG(fr, %d));\n"
               "    }\n",
               g_e_dx_own_off[q2], g_e_dx_own_off[q2]);
       {
@@ -8960,6 +9215,8 @@ static const char *e_fl_prefilter(const Q2Func *fn) {
     if (r == NULL || r->window < 0) continue;
     if (fn->insns[i].op == Q2_OP_CALL && e_intrinsic_lowerable(fn, &fn->insns[i]))
       continue;
+    if (fn->insns[i].rop == ROP_array_from || fn->insns[i].rop == ROP_object_fill)
+      continue;
     if ((fn->insns[i].rop == ROP_call || fn->insns[i].rop == ROP_call_method) &&
         getenv("QJS_AOT_NOFLCALLS") == NULL &&
         e_call_has_compiled_callee(fn, &fn->insns[i])) {
@@ -8980,15 +9237,20 @@ static const char *e_fl_prefilter(const Q2Func *fn) {
   /* A function that calls does a call's worth of work between its accesses, and an
      exit repeats all of it in the generic body: every block counts as inside a long
      loop, so an access the profile cannot vouch for keeps the function framed. */
+  for (i = 0; i < fn->ninsns && !has_calls; i++) {
+    uint16_t rp = fn->insns[i].rop;
+    if (rp == ROP_new_object || rp == ROP_object_template || rp == ROP_array_from ||
+        rp == ROP_object_fill)
+      has_calls = 1;
+  }
   if (has_calls) {
     memset(g_e_loop_blk, 1, (size_t)(fn->nblocks > 0 ? fn->nblocks : 1));
     g_e_fl_longloop = 1;
   }
   for (i = 0; i < fn->ninsns; i++) {
     static const char *const names[] = {
-        "new_object",   "object_template", "array_const",  "array_from",
-        "make_closure", "define_class",    "define_class_computed",
-        "regexp",       "special_object",  "to_object",    "object_fill"};
+        "array_const",  "make_closure", "define_class", "define_class_computed",
+        "regexp",       "special_object", "to_object"};
     char nm[64];
     size_t k;
     e_rop_name(fn->insns[i].rop, nm, sizeof(nm));
@@ -9052,11 +9314,13 @@ int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     g_e_fl = 1;
     g_e_quiet = 1;
     g_e_fl_calls = 0;
+    g_e_spill_total = 0;
     g_e_fl_block[0] = 0;
     rc = e_emit_spec_body_pass(m, fn, hex);
     fclose(m);
     free(mb);
     g_e_quiet = 0;
+    g_e_spill_total = g_e_spill_n;
 
     if (rc == 0 && g_e_fl_block[0] == 0) {
       g_e_fl_chosen = 1;
