@@ -1910,6 +1910,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_JSOBJECT_NOADD_MASK %uu\n"
           "#define QJS_AOT_JSOBJECT_INLINE_CAP_MASK %uu\n"
           "#define QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT %uu\n"
+          "#define QJS_AOT_OFF_ROPE_LEFT %uu\n"
+          "#define QJS_AOT_OFF_ROPE_RIGHT %uu\n"
           "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
           "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
@@ -1961,7 +1963,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_cfunc_c_function, lay.off_cfunc_magic, lay.off_regpic_misses,
           lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_object_flags16,
           lay.object_extensible_mask, lay.object_noadd_mask,
-          lay.object_inline_cap_mask, lay.object_inline_cap_shift);
+          lay.object_inline_cap_mask, lay.object_inline_cap_shift, lay.off_rope_left,
+          lay.off_rope_right);
       fclose(lf);
     }
 
@@ -2558,12 +2561,29 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* A character of a flat string, read in place: `charCodeAt` (NaN past the end) and
            `codePointAt` (undefined past the end; a surrogate in a wide string is the
            builtin's). A rope, a slice or an indirect string, a non-integer index: 0. */
+        /* A string for character access: a flat string as is, a rope whose linearised
+           form the engine has memoised (flat on the left, empty on the right) as that flat
+           string. A rope not yet linearised is the engine's, which memoises it. */
+        "static inline __attribute__((always_inline)) int q2_flat_str(JSValue *v)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  JSValue l, r;\n"
+        "  if (__builtin_expect(JS_VALUE_GET_TAG(*v) == JS_TAG_STRING, 1)) return 1;\n"
+        "  if (JS_VALUE_GET_TAG(*v) != JS_TAG_STRING_ROPE) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(*v);\n"
+        "  l = *(const JSValue *)(p + QJS_AOT_OFF_ROPE_LEFT);\n"
+        "  r = *(const JSValue *)(p + QJS_AOT_OFF_ROPE_RIGHT);\n"
+        "  if (JS_VALUE_GET_TAG(l) != JS_TAG_STRING || JS_VALUE_GET_TAG(r) != JS_TAG_STRING) return 0;\n"
+        "  if ((*(const uint32_t *)JS_VALUE_GET_PTR(r) & QJS_AOT_STRING_LEN_MASK) != 0) return 0;\n"
+        "  *v = l;\n"
+        "  return 1;\n"
+        "}\n"
         "static inline __attribute__((always_inline)) int q2_intr_str(JSContext *ctx, int id, "
         "JSValue s, Q2Num a, JSValue *out)\n"
         "{\n"
         "  const unsigned char *p;\n"
         "  uint32_t w0, w1, c;\n"
-        "  if (JS_VALUE_GET_TAG(s) != JS_TAG_STRING || a.k != 1) return 0;\n"
+        "  if (!q2_flat_str(&s) || a.k != 1) return 0;\n"
         "  p = (const unsigned char *)JS_VALUE_GET_PTR(s);\n"
         "  w0 = *(const uint32_t *)p;\n"
         "  w1 = *(const uint32_t *)(p + 4);\n"
@@ -2885,7 +2905,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  const unsigned char *p;\n"
         "  uint32_t w0, w1, c;\n"
         "  void *const *tab;\n"
-        "  if (JS_VALUE_GET_TAG(s) != JS_TAG_STRING || JS_VALUE_GET_TAG(k) != JS_TAG_INT) return 0;\n"
+        "  if (!q2_flat_str(&s) || JS_VALUE_GET_TAG(k) != JS_TAG_INT) return 0;\n"
         "  p = (const unsigned char *)JS_VALUE_GET_PTR(s);\n"
         "  w0 = *(const uint32_t *)p;\n"
         "  w1 = *(const uint32_t *)(p + 4);\n"
@@ -3071,6 +3091,10 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING) {\n"
         "    *out = (double)(*(const uint32_t *)JS_VALUE_GET_PTR(v) &\n"
         "                    QJS_AOT_STRING_LEN_MASK);\n"
+        "    return 1;\n"
+        "  }\n"
+        "  if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE) {\n"
+        "    *out = (double)*(const uint32_t *)JS_VALUE_GET_PTR(v);\n"
         "    return 1;\n"
         "  }\n"
         "  if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;\n"
