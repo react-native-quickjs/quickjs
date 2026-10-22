@@ -38,6 +38,23 @@ static int g_e2_fi = -1;
 static int g_e2_inl;
 /* Set when a body emitted in inline mode needs more than inline mode can give. */
 static char g_e2_inl_why[160];
+/* Inline mode, effects so far. Once the body has stored or called, an exit can no
+   longer be `return 0` (the caller's native call would repeat the effect); it builds
+   the callee's frame (aot_nx_) and finishes in the generic body instead. The state is
+   captured per instruction before it is emitted, and each exit stub reads the state
+   of the instruction it belongs to. */
+static int g_e2_inl_dirty;
+static uint8_t *g_e2_dirty_ins;
+static int g_e2_exit_ins = -1;
+static int g_e2_exit_dirty;
+static int g_e2_inl_nx_used;
+static int g_e2_last_inl_nx;
+static const char *nm_of_rop(uint16_t rop);
+static void e2_inl_store_mark(FILE *f) {
+  if (!g_e2_inl) return;
+  g_e2_inl_dirty = 1;
+  fprintf(f, "    /*E2_STORE*/\n");
+}
 
 
 /* The number of PIC sites the function uses: one more than the largest site
@@ -2962,8 +2979,16 @@ static void e2_emit_exit_log(
    registers travel as (offset, value) pairs and `aot_nx_` builds the frame. */
 static void e2_emit_generic_call(
     FILE *f, char hex[33], int pc, int nlv, const char *indent) {
-  if (g_e2_inl) {
-    fprintf(f, "%sreturn 0;\n", indent);
+  if (g_e2_inl && g_e2_exit_dirty) {
+    fprintf(
+        f,
+        "%sE2Nx x_ = { %d, %s, %s, %s, %s, %d, argc };\n"
+        "%s*out = aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, &x_);\n"
+        "%sreturn 1;\n",
+        indent, pc, g_e2_xt[0] ? g_e2_xt : "-100", g_e2_xk[0] ? g_e2_xk : "NULL",
+        nlv > 0 ? "lv" : "NULL", nlv > 0 ? "offs" : "NULL", nlv, indent, hex,
+        indent);
+    g_e2_xk[0] = g_e2_xt[0] = 0;
     return;
   }
   if (!g_e2_fl) {
@@ -3003,14 +3028,22 @@ static void e2_emit_exit(
         g_e2_fi);
     abort();
   }
+  g_e2_exit_dirty = 0;
   if (g_e2_inl) {
-    /* Inline: nothing to sync, the call has not run. */
-    fprintf(
-        f, "    { %s(%d); return 0; }\n",
-        handoff ? "E2_HANDOFF_NOTE" : "E2_EXIT_NOTE", fi);
-    free(loff);
-    free(lex);
-    return;
+    const char *ctl = getenv("QJS_AOT_E2_INL_CONTROL");
+    g_e2_exit_dirty = g_e2_dirty_ins != NULL && g_e2_exit_ins >= 0 &&
+                      g_e2_dirty_ins[g_e2_exit_ins] &&
+                      !(ctl != NULL && strcmp(ctl, "clean") == 0);
+    if (!g_e2_exit_dirty) {
+      /* Nothing has happened: the caller's native call does the whole call. */
+      fprintf(
+          f, "    { %s(%d); return 0; }\n",
+          handoff ? "E2_HANDOFF_NOTE" : "E2_EXIT_NOTE", fi);
+      free(loff);
+      free(lex);
+      return;
+    }
+    g_e2_inl_nx_used = 1;
   }
   fprintf(f, "    {\n");
   if (live_set != NULL) {
@@ -3100,7 +3133,9 @@ static void e2_emit_exit_at(
     abort();
   }
   if (lb != NULL) q2_live_before(fn, ins, lb);
+  g_e2_exit_ins = ins;
   e2_emit_exit(f, fn, pc, hex, fi, cur, lb, handoff, blkidx);
+  g_e2_exit_ins = -1;
   free(lb);
 }
 
@@ -4140,7 +4175,7 @@ static int emit_typed_elem_write(
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
-  if (g_e2_inl) fprintf(f, "    /*E2_STORE*/\n");
+  e2_inl_store_mark(f);
   return 1;
 }
 
@@ -4366,6 +4401,171 @@ static int emit_intrinsic_call(
   return 1;
 }
 
+/* ---- a call inside an inline body (card E15 part 2) -------------------------
+
+   The nested call is the ordinary compiled-to-compiled call -- the callee's bound
+   entry checked against this unit's body, then `aot_n_` -- with no op-call wrapper
+   behind it (an inline body has no frame to step): a miss is an EXIT before the call.
+   The call is a safepoint, so:
+   - every TAG value live across it must be rooted by someone else (the caller's
+     argument window or receiver), because the body's locals are invisible to the
+     collector; otherwise the function is not an inline candidate;
+   - the result must be typed, or dead (a dead owned result is released here);
+   - from here on the body has an effect, so its exits build the callee's frame
+     (aot_nx_) and finish in the generic body (g_e2_inl_dirty). */
+static int emit_inl_nested_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    char hex[33]) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k, cc, th, off, na, w, r, nb = 0;
+  char recv[64], cexp[64];
+  Q2ValueId dv;
+  int dreg, dead;
+  uint64_t *lb;
+
+  if (t == NULL || cur == NULL) return 0;
+  if (!call_site_shaped(fn, in)) {
+    e2_fl_block("an unshaped call", in);
+    return 0;
+  }
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits)) {
+    e2_fl_block("a call with no profile", in);
+    return 0;
+  }
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    nb++;
+  }
+  if (nb == 0) {
+    e2_fl_block("a call to no compiled callee", in);
+    return 0;
+  }
+  cc = call_callee_off(in);
+  th = call_this_off(in);
+  off = dest_off(fn, in);
+  na = in->win_n;
+  w = in->win_reg * 16;
+  if (off < 0 || cc < 0 || in->ndef < 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = off / 16;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  dead = e2_def_dead(in, dv);
+  if (t->lb[dv] == E2_LB_TAG && !dead) {
+    e2_fl_block("a call whose result is a TAG value", in);
+    return 0;
+  }
+  if (t->lb[dv] == E2_LB_BOT && !dead) return 0;
+  /* Rooted: every TAG value live at the call, but the callee and the receiver. */
+  lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  if (lb == NULL) return 0;
+  q2_live_before(fn, (int)(in - fn->insns), lb);
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v;
+    if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
+    if (r * 16 == cc || (th >= 0 && r * 16 == th)) continue;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v == E2_INFRAME ||
+        v >= (Q2ValueId)t->nvalues || t->lb[v] != E2_LB_TAG)
+      continue;
+    if (g_e2_rooted == NULL || !g_e2_rooted[v]) {
+      free(lb);
+      e2_fl_block("a value live across a call is not rooted", in);
+      return 0;
+    }
+  }
+  free(lb);
+  {
+    Q2ValueId cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+    Q2ValueId tv = th >= 0 && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
+    if (cv != Q2_NO_VALUE && cv != E2_UNDEF && cv != E2_INFRAME &&
+        cv < (Q2ValueId)t->nvalues && t->lb[cv] == E2_LB_TAG)
+      snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+    else
+      snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    if (th < 0)
+      snprintf(recv, sizeof(recv), "JS_UNDEFINED");
+    else if (tv != Q2_NO_VALUE && tv != E2_UNDEF && tv != E2_INFRAME &&
+             tv < (Q2ValueId)t->nvalues && t->lb[tv] == E2_LB_TAG)
+      snprintf(recv, sizeof(recv), "v%u", (unsigned)tv);
+    else
+      snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
+  }
+
+  /* ---- output ---- */
+  e2_note_stub(g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+  e2_note_tag('v', in->pc, cexp);
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_BOT)
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  /* the window, current in the body's own register array */
+  for (r = 0; r < na; r++) {
+    Q2ValueId v;
+    int wr = in->win_reg + r;
+    if (wr >= fn->nregs) continue;
+    v = cur[wr];
+    if (v == Q2_NO_VALUE || v == E2_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E2_LB_TAG)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n",
+              wr * 16, (unsigned)v);
+    else if (t->lb[v] == E2_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E2_BOX_F64(d%u));\n", wr * 16,
+              (unsigned)v);
+    else if (t->lb[v] == E2_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n",
+              wr * 16, (unsigned)v);
+  }
+  e2_sweep_guard(f, "vx", in->pc);
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
+    if (getenv("QJS_AOT_E2_INL_CONTROL") != NULL &&
+        strcmp(getenv("QJS_AOT_E2_INL_CONTROL"), "noident") == 0)
+      fprintf(f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n"
+                 "        JSValue _o = aot_n_%s(ctx, caller_f,\n"
+                 "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+                 "            &AOT_REG(fr, %d), %d);\n"
+                 "        if (__builtin_expect(JS_IsException(_o), 0)) "
+                 "{ *out = _o; return 1; }\n",
+              cexp, callee[k], cexp, recv, w, na);
+    else
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1)) "
+        "{\n"
+        "        JSValue _o = aot_n_%s(ctx, caller_f,\n"
+        "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+        "            &AOT_REG(fr, %d), %d);\n"
+        "        if (__builtin_expect(JS_IsException(_o), 0)) "
+        "{ *out = _o; return 1; }\n",
+        cexp, callee[k], callee[k], cexp, recv, w, na);
+    g_e2_inl_dirty = 1;
+    e2_emit_group_recheck(f, fn, in, cur);
+    if (t->lb[dv] == E2_LB_TAG || t->lb[dv] == E2_LB_BOT) {
+      fprintf(f, "        if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
+    } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
+      fprintf(stderr, "e2: nested call at pc %d: no guard for its def\n", in->pc);
+      abort();
+    }
+    fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
+  }
+  /* No candidate matched: the call has not run, leave before it. */
+  fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
+  g_e2_inl_dirty = 1;
+  cur[dreg] = dv;
+  g_e2_miss_exit_seen = 0;
+  (void)hex;
+  (void)recv;
+  return 1;
+}
+
 /* A SPECULATIVE-BODY CALL, mirroring `emit_native_call` + `emit_one_direct_call`:
    same eligibility, same call sequence, and the result taken with
    `qjs_aot_set_reg_p` because `aot_n_` hands back an OWNED reference.
@@ -4393,7 +4593,9 @@ static int emit_typed_call(
   /* The facts classed this site as an intrinsic with an exit for a miss. */
   if (e2_must_exit(fn, in) && !g_e2_intr_cont)
     return emit_intrinsic_call(f, fn, in, t, cur, hex, fi, b);
-  /* An inline or frameless body makes no call but a lowered intrinsic. */
+  /* An inline body may call a compiled callee; a frameless one makes no call but a
+     lowered intrinsic. */
+  if (g_e2_inl) return emit_inl_nested_call(f, fn, in, t, cur, hex);
   if (g_e2_fl) {
     e2_fl_block("a call", in);
     return 0;
@@ -5249,7 +5451,7 @@ static int emit_group_write(
         boxed);
   }
   fprintf(f, "    }\n");
-  if (g_e2_inl) fprintf(f, "    /*E2_STORE*/\n");
+  e2_inl_store_mark(f);
   g_e2_miss_exit_seen = 1;
   return 1;
 }
@@ -5465,7 +5667,7 @@ static int emit_typed_var_ref_store(
         "JS_VALUE_HAS_REF_COUNT(*_p), 0)) goto vx_%d;\n"
         "      *_p = _nv; }\n",
         slot, box, in->pc);
-  if (g_e2_inl) fprintf(f, "    /*E2_STORE*/\n");
+  e2_inl_store_mark(f);
     return 1;
   }
   /* The cell's OLD value is not forwarded: a later read of the cell is a fresh load
@@ -6886,6 +7088,10 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e2_n_exit = g_e2_n_handoff = 0;
   g_e2_xtag_n = 0;
   g_e2_facts = NULL;
+  g_e2_inl_dirty = 0;
+  g_e2_inl_nx_used = 0;
+  free(g_e2_dirty_ins);
+  g_e2_dirty_ins = g_e2_inl ? calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1) : NULL;
   free(g_e2_group_used);
   g_e2_group_used = NULL;
   g_e2_n_shape = g_e2_n_skip = g_e2_n_fwd = 0;
@@ -7225,6 +7431,7 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     for (i2 = blk->first_insn; i2 < blk->first_insn + blk->ninsns; i2++) {
       const Q2Insn *in = &fn->insns[i2];
       unsigned oc0 = g_e2_opcalls;
+      if (g_e2_dirty_ins != NULL) g_e2_dirty_ins[i2] = (uint8_t)g_e2_inl_dirty;
       const E2Role *role = e2_roles[in->rop];
       /* A terminator ends the block; branches are 2b's, so for now the block
          exits at the terminator's pc. */
@@ -7785,32 +7992,14 @@ const char *e2_fl_why_not(void) { return g_e2_fl_why; }
    frameless emission blocks on any), every value typed by its own speculative body.
    The checks of every block come before any store, which the text is checked for. */
 
-/* The first heap store in the emitted text, then any exit after it. An exit is a
-   `goto` to an exit stub; after a store the callee has changed the world and the
-   caller's native call would repeat the store. Returns 1 when the text is fine. */
+/* Every `return` in the emitted text is the exit (`return 0;`) or the result
+   (`return 1;`). Returns 1 when the text is fine. */
 static int e2_inl_text_ok(const char *txt, size_t n, char *why, size_t whyn) {
-  static const char *const ex[] = {"goto vx_", "goto dx_", "goto ax_",
-                                   "goto ox_", "goto hx_"};
-  const char *st = NULL, *p;
-  size_t i, k;
+  const char *p;
   char *copy = malloc(n + 1);
   if (copy == NULL) return 0;
   memcpy(copy, txt, n);
   copy[n] = 0;
-  st = strstr(copy, "/*E2_STORE*/");
-  /* Negative control: "nostore" skips this check, so a callee that stores and then
-     exits is inlined, and the native call repeats the store. */
-  if (getenv("QJS_AOT_E2_INL_CONTROL") != NULL &&
-      strcmp(getenv("QJS_AOT_E2_INL_CONTROL"), "nostore") == 0)
-    st = NULL;
-  if (st != NULL)
-    for (k = 0; k < sizeof(ex) / sizeof(ex[0]); k++)
-      if (strstr(st, ex[k]) != NULL) {
-        snprintf(why, whyn, "an exit follows a store");
-        free(copy);
-        return 0;
-      }
-  /* Every `return` is the exit (`return 0;`) or the result (`return 1;`). */
   for (p = copy; (p = strstr(p, "return")) != NULL; p += 6) {
     const char *q = p + 6;
     if (p > copy && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
@@ -7822,7 +8011,6 @@ static int e2_inl_text_ok(const char *txt, size_t n, char *why, size_t whyn) {
       return 0;
     }
   }
-  (void)i;
   free(copy);
   return 1;
 }
@@ -7837,7 +8025,7 @@ int e2_emit_inline_body(
   char *mb = NULL;
   size_t ml = 0;
   FILE *m;
-  int i, b, si, rc;
+  int i, b, si, rc, ncalls = 0;
 
   /* QJS_AOT_E2_NOINLINE=1 emits no inline body: the baseline of a comparison. */
   if (getenv("QJS_AOT_E2_NOINLINE") != NULL &&
@@ -7877,11 +8065,12 @@ int e2_emit_inline_body(
     const Q2Insn *in = &fn->insns[i];
     char nm[64];
     size_t k;
-    if (e2_is_call_family(in->rop) &&
-        !(in->op == Q2_OP_CALL && e2_intrinsic_site(g->digest, in->next) >= 0)) {
-      snprintf(why, whyn, "a call at pc %d", in->pc);
+    if (e2_is_call_family(in->rop) && in->rop != ROP_call &&
+        in->rop != ROP_call_method) {
+      snprintf(why, whyn, "%s at pc %d", nm_of_rop(in->rop), in->pc);
       return 0;
     }
+    if (in->rop == ROP_call || in->rop == ROP_call_method) ncalls++;
     e2_rop_name(in->rop, nm, sizeof(nm));
     for (k = 0; k < sizeof(alloc_ops) / sizeof(alloc_ops[0]); k++)
       if (strcmp(nm, alloc_ops[k]) == 0) {
@@ -7892,6 +8081,12 @@ int e2_emit_inline_body(
   m = open_memstream(&mb, &ml);
   if (m == NULL) {
     snprintf(why, whyn, "out of memory");
+    return 0;
+  }
+  if (ncalls > 3) {
+    snprintf(why, whyn, "%d calls", ncalls);
+    fclose(m);
+    free(mb);
     return 0;
   }
   free(g_e2_loop_blk);
@@ -7915,7 +8110,17 @@ int e2_emit_inline_body(
     free(mb);
     return 0;
   }
+  g_e2_last_inl_nx = g_e2_inl_nx_used;
   fwrite(mb, 1, ml, f);
   free(mb);
   return 1;
+}
+
+/* Whether the inline body just emitted exits through aot_nx_. */
+int e2_inline_used_nx(void) { return g_e2_last_inl_nx; }
+
+static const char *nm_of_rop(uint16_t rop) {
+  static char buf[64];
+  e2_rop_name(rop, buf, sizeof(buf));
+  return buf;
 }

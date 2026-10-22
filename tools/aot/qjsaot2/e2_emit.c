@@ -57,6 +57,7 @@ static int e2_in_scope(const char *hex) {
   return strcmp(hex, e2_only_hex) == 0;
 }
 
+int qjs_aot_inline_uses_nx(const char hex[33]);
 /* The driver's profile, for the function's dynamic weight. */
 double qjs_aot_prof_weight(const uint8_t dg[16]);
 
@@ -265,7 +266,7 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       f,
       "/* The exit of the frameless body: builds the frame and runs the generic\n"
       "   body from x->pc with the registers' values handed over in x->lv. */\n"
-      "E2_TEXT static __attribute__((noinline, cold)) JSValue aot_nx_%s(\n"
+      "E2_TEXT %s__attribute__((noinline, cold)) JSValue aot_nx_%s(\n"
       "    JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue this_obj,\n"
       "    JSValue *argv, const E2Nx *x)\n"
       "{\n"
@@ -326,7 +327,7 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
       "    return ret;\n"
       "}\n\n",
-      hex, slots, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
+      e2_linkage(), hex, slots, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
 }
 
 /* `aot_f_HEX` for a frameless function: the engine still enters through it with a
@@ -396,6 +397,10 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
         g->name[0] ? g->name : "?", rc);
   } else {
     rc = e2_emit_spec_body(f, &fn, hex);
+    /* An inline body of this function that exits through aot_nx_ needs its
+       definition; a frameless body has emitted it already. */
+    if (rc == 0 && !e2_fl_was_chosen() && qjs_aot_inline_uses_nx(hex))
+      e2_emit_frameless_exit_fn(f, &fn, hex);
     if (rc != 0) {
       fprintf(
           stderr, "e2: %s: the speculative body emitter returned %d\n",

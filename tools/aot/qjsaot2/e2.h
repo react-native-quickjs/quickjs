@@ -35,6 +35,7 @@ int e2_emit_inline_func(
 struct Q2Func;
 int e2_emit_inline_body(
     FILE *f, const struct Q2Func *fn, char hex[33], char *why, size_t whyn);
+int e2_inline_used_nx(void);
 void e2_report_inline(const char *hex, int ok, const char *why);
 
 /* The generic body (D2), the speculative body (D3) and the native entry. The

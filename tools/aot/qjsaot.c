@@ -3635,6 +3635,7 @@ typedef struct {
 static EmitBuf *g_pure_eb;
 /* The inline forms (`e2i_HEX`) of the unit's small leaves, by unit index (card E15). */
 static EmitBuf *g_inl_eb;
+static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
 
 /* Which functions this run's E2 emitter gave a native entry. A call site may
    only name an `aot_n_` that some body in this unit defines, and a unit built
@@ -3681,6 +3682,16 @@ int qjs_aot_inline_has(const char hex[33]) {
   for (i = 0; i < g_unit_nfuncs; i++)
     if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
       return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE && g_inl_eb[i].buf;
+  return 0;
+}
+
+int qjs_aot_inline_uses_nx(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || !g_inl_nx || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) return g_inl_nx[i];
   return 0;
 }
 
@@ -3978,6 +3989,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     /* The inline forms first: a caller asks whether its callee has one while its own
        body is emitted. */
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
+    g_inl_nx = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     for (i = 0; g_inl_eb && qjs_aot_emit2_on() && i < nfuncs; i++) {
       char hex[33], why[160] = "";
       FILE *mf;
@@ -3993,6 +4005,7 @@ int qjsaot_driver_main(int argc, char **argv) {
       ok = e2_emit_inline_func(mf, &funcs[i], hex, why, sizeof(why));
       fclose(mf);
       e2_report_inline(hex, ok, why);
+      if (ok && g_inl_nx) g_inl_nx[i] = (uint8_t)e2_inline_used_nx();
       if (!ok) {
         free(g_inl_eb[i].buf);
         g_inl_eb[i].buf = NULL;
@@ -5805,6 +5818,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         continue;
       hex16(funcs[i].digest, hex);
       fprintf(f, "#define Q2_INLINE_%s 1\n", hex);
+      if (g_inl_nx && g_inl_nx[i])
+        fprintf(
+            f,
+            "%sJSValue aot_nx_%s(JSContext *, JSRegRun *, JSObject *, JSValue, "
+            "JSValue *, const E2Nx *);\n",
+            e2_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
+            hex);
       fwrite(g_inl_eb[i].buf, 1, g_inl_eb[i].len, f);
     }
     /* The leaves of the selected functions, before any caller. */
