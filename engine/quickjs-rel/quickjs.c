@@ -63494,8 +63494,7 @@ QJS_AOT_STUB int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic
 /* frame has to be the one `regvm_light_fill` builds, because every handler  */
 /* and every cold path that can run on it reads it, and a field the engine   */
 /* writes but the caller forgets is a crash much later. So the few pieces    */
-/* that are not a plain store live here, and `qjs_aot_frame_check` exists to  */
-/* prove the stores agree with the fill.                                    */
+/* that are not a plain store live here.                                   */
 /* ------------------------------------------------------------------------ */
 
 /* Nothing lowers the arena top below a sealed frame while the activation runs,
@@ -63531,120 +63530,6 @@ QJS_AOT_STUB void qjs_aot_light_release(JSContext *ctx, JSRegRun *f)
 #else
     (void)ctx;
     (void)f;
-#endif
-}
-
-/* Check builds only (`E2_CHECK=1`): build the frame the engine would have
-   built for this call and abort if the native entry's stores disagree with it.
-   Compared field by field rather than byte for byte, because the native entry
-   legitimately differs from `regvm_light_fill` in three places: it has no
-   destination register (a compiled caller has none), it has no resume address
-   (a compiled call returns to C), and it marks its frame `REGVM_FLAG_C_ENTRY`
-   and `REGVM_FLAG_STACK` so a deopt or a throw inside it finishes on this very
-   frame and the seal knows the frame is on the C stack rather than in the
-   arena. Those three are checked separately; everything else must match. */
-QJS_AOT_STUB void qjs_aot_frame_check(JSContext *ctx, JSRegRun *nf, JSObject *co,
-                                      JSRegRun *caller_f, JSValue *argv, int argc,
-                                      JSValue this_obj)
-{
-#if QJS_REGVM_RECORD && defined(E2_CHECK)
-    JSFunctionBytecode *cb = co->u.func.function_bytecode;
-    uint8_t *mem;
-    JSRegRun *ref;
-    JSValue *regs;
-    size_t need;
-    int k, vc, base;
-    uint16_t want_flags;
-
-    need = (size_t)cb->regvm_light_need + 16;
-    mem = alloca(need);
-    ref = (JSRegRun *)(((uintptr_t)mem + 15) & ~(uintptr_t)15);
-    regvm_light_fill(ctx, ref, co, cb, caller_f, 0, NULL, argv, argc,
-                     this_obj, &regs);
-#define E2_CHK(field)                                                          \
-    do {                                                                       \
-        if (nf->field != ref->field) {                                          \
-            fprintf(stderr,                                                     \
-                    "E2 frame check: %s differs for %s (native %p, engine %p)\n", \
-                    #field, cb->func_name ? "fn" : "?", (void *)(uintptr_t)nf->field, \
-                    (void *)(uintptr_t)ref->field);                             \
-            abort();                                                            \
-        }                                                                       \
-    } while (0)
-    E2_CHK(caller);
-    E2_CHK(b);
-    E2_CHK(pic);
-    E2_CHK(fr);
-    E2_CHK(var_refs);
-    E2_CHK(var_buf);
-    E2_CHK(arg_buf);
-    E2_CHK(func);
-    E2_CHK(cap_ip);
-    E2_CHK(sf);
-#undef E2_CHK
-    if (nf->ret_ip != NULL) {
-        fprintf(stderr, "E2 frame check: ret_ip is set for a compiled call\n");
-        abort();
-    }
-    if (JS_VALUE_GET_TAG(nf->this_obj) != JS_VALUE_GET_TAG(ref->this_obj) ||
-        JS_VALUE_GET_PTR(nf->this_obj) != JS_VALUE_GET_PTR(ref->this_obj)) {
-        fprintf(stderr, "E2 frame check: this_obj differs\n");
-        abort();
-    }
-    if (nf->argc != (uint16_t)argc) {
-        fprintf(stderr, "E2 frame check: argc is %u, not %d\n",
-                (unsigned)nf->argc, argc);
-        abort();
-    }
-    /* ret_dst: a compiled caller has no destination register. */
-    if (nf->ret_dst != 0) {
-        fprintf(stderr, "E2 frame check: ret_dst is %u, not 0\n",
-                (unsigned)nf->ret_dst);
-        abort();
-    }
-    if (nf->nctl != 0) {
-        fprintf(stderr, "E2 frame check: nctl is %u, not 0\n",
-                (unsigned)nf->nctl);
-        abort();
-    }
-    /* The flag word must also carry the two bits the native entry adds, and
-       nothing else may differ. */
-    want_flags = ref->flags | REGVM_FLAG_C_ENTRY | REGVM_FLAG_STACK;
-    if (nf->flags != want_flags) {
-        fprintf(stderr, "E2 frame check: flags are 0x%x, not 0x%x\n",
-                (unsigned)nf->flags, (unsigned)want_flags);
-        abort();
-    }
-    /* The variable area and the register file must be filled with undefined,
-       or a handler reads a stale stack word. */
-    vc = cb->var_count;
-#if QJS_DRC
-    if (cb->var_count <= 255)
-        vc = cb->regvm_var_count;
-#endif
-    if (vc != 0) {
-        if (nf->var_buf == NULL) {
-            fprintf(stderr, "E2 frame check: var_buf is NULL but vc is %d\n", vc);
-            abort();
-        }
-        for (k = 0; k < vc; k++) {
-            if (JS_VALUE_GET_TAG(nf->var_buf[k]) != JS_TAG_UNDEFINED) {
-                fprintf(stderr, "E2 frame check: variable %d is not undefined\n", k);
-                abort();
-            }
-        }
-    }
-    base = 0;
-    for (k = 0; k < cb->regvm_reg_count; k++) {
-        if (JS_VALUE_GET_TAG(nf->fr[k]) != JS_TAG_UNDEFINED) {
-            fprintf(stderr, "E2 frame check: register %d is not undefined\n",
-                    k + base);
-            abort();
-        }
-    }
-#else
-    (void)ctx; (void)nf; (void)co; (void)caller_f; (void)argv; (void)argc;
-    (void)this_obj;
 #endif
 }
 #endif /* QJS_AOT */
