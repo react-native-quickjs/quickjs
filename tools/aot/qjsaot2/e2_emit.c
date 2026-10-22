@@ -224,12 +224,6 @@ void e2_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
       "sizeof(JSValue));\n",
       nregs);
   fprintf(f, "    (void)k; (void)vb; (void)cb;\n");
-  fprintf(
-      f,
-      "#if E2_CHECK\n"
-      "    qjs_aot_frame_check(ctx, (JSRegRun *)nf, co, caller_f, argv, argc,\n"
-      "                        this_obj);\n"
-      "#endif\n");
   /* `regvm_cur` names the innermost light frame, so the collector finds its
      register window and a deopt or an uncaught throw inside the callee finds
      the chain. Restored on the way out. */
@@ -325,10 +319,6 @@ void e2_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "        __builtin_memcpy(&regs[k], &e2_undefined_value, "
       "sizeof(JSValue));\n"
       "    for (k = 0; k < x->n; k++) AOT_REG(regs, x->offs[k]) = x->lv[k];\n"
-      "#if E2_CHECK\n"
-      "    qjs_aot_frame_check(ctx, (JSRegRun *)nf, co, caller_f, argv, argc,\n"
-      "                        this_obj);\n"
-      "#endif\n"
       "    prev = *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR);\n"
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = (JSRegRun *)nf;\n"
       "    ret = aot_g_%s(realm, (JSRegRun *)nf, regs, (uint32_t)x->pc);\n"
