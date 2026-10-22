@@ -3040,8 +3040,8 @@ static void e2_emit_exit(
     if (!g_e2_exit_dirty) {
       /* Nothing has happened: the caller's native call does the whole call. */
       fprintf(
-          f, "    { %s(%d); return 0; }\n",
-          handoff ? "E2_HANDOFF_NOTE" : "E2_EXIT_NOTE", fi);
+          f, "    { E2_EXIT_LOG(\"%s\", \"ix\", %d, -100); %s(%d); return 0; }\n", hex, pc,
+          handoff ? "E2_HANDOFF_NOTE" : "E2_INL_EXIT_NOTE", fi);
       free(loff);
       free(lex);
       return;
@@ -7239,7 +7239,13 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
      reader -- so the E8 spec body ran even with QJS_AOT_SPEC=0, and the harness's
      "nospec" pass was never a generic-only run. Every nospec result on this card
      before this line was measuring the spec bodies. */
-  if (g_e2_fl)
+  if (g_e2_inl)
+    fprintf(
+        f,
+        "    if (__builtin_expect(e2_off[%d] | e2_dis[%d] | e2_ioff[%d], 0))\n"
+        "        return 0;\n",
+        fi, fi, fi);
+  else if (g_e2_fl)
     fprintf(
         f,
         "    if (__builtin_expect(e2_off[%d] | e2_dis[%d], 0))\n"
@@ -8096,7 +8102,14 @@ int e2_emit_inline_body(
       snprintf(why, whyn, "%s at pc %d", nm_of_rop(in->rop), in->pc);
       return 0;
     }
-    if (in->rop == ROP_call || in->rop == ROP_call_method) ncalls++;
+    if (in->rop == ROP_call || in->rop == ROP_call_method) {
+      ncalls++;
+      if (getenv("QJS_AOT_E2_NONEST") != NULL &&
+          e2_intrinsic_site(g->digest, in->next) < 0) {
+        snprintf(why, whyn, "nested calls disabled");
+        return 0;
+      }
+    }
     e2_rop_name(in->rop, nm, sizeof(nm));
     for (k = 0; k < sizeof(alloc_ops) / sizeof(alloc_ops[0]); k++)
       if (strcmp(nm, alloc_ops[k]) == 0) {

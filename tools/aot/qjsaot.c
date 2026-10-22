@@ -4505,6 +4505,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "extern uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
         "extern uint8_t e2_nfl[QJS_AOT_E2_NFUNCS], e2_dis[QJS_AOT_E2_NFUNCS];\n"
         "extern uint64_t e2_inl[QJS_AOT_E2_NFUNCS];\n"
+        "extern uint32_t e2_inx[QJS_AOT_E2_NFUNCS];\n"
+        "extern uint8_t e2_ioff[QJS_AOT_E2_NFUNCS];\n"
         "#else\n"
         "static uint64_t e2_ent[QJS_AOT_E2_NFUNCS];\n"
         "static uint32_t e2_exi[QJS_AOT_E2_NFUNCS], e2_ref[QJS_AOT_E2_NFUNCS];\n"
@@ -4512,6 +4514,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
         "static uint8_t e2_nfl[QJS_AOT_E2_NFUNCS], e2_dis[QJS_AOT_E2_NFUNCS];\n"
         "static uint64_t e2_inl[QJS_AOT_E2_NFUNCS];\n"
+        "static uint32_t e2_inx[QJS_AOT_E2_NFUNCS];\n"
+        "static uint8_t e2_ioff[QJS_AOT_E2_NFUNCS];\n"
         "/* How many times the speculative bodies have been entered. A case that\n"
         "   means to exercise a spec path asserts this is non-zero: a body that is\n"
         "   never entered passes every check for the wrong reason, which is how\n"
@@ -4570,6 +4574,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         "} E2Nx;\n"
         "#define E2_ENTER_NOTE(fi) (e2_ent[fi]++)\n"
         "#define E2_INL_NOTE(fi) (e2_inl[fi]++)\n"
+        /* An inline body that cannot run (its nested callee is another function than
+           the profiled one, say) leaves with nothing done and the native call takes
+           over; that is not a failed speculation, so it does not count toward
+           switching the function off, but a body that does it on more than 1/16 of
+           its attempts stops being tried. */
+        "#define E2_INL_EXIT_NOTE(fi) do { if (++e2_inx[fi] > 256 && \\\n"
+        "    (uint64_t)e2_inx[fi] * 16 > e2_inl[fi] + e2_inx[fi]) e2_ioff[fi] = 1; } while (0)\n"
         /* A frameless function marks itself at load (e2_nfl), so its entries
            are counted by the one counter every spec body bumps. */
         "/* More than 256 exits and in more than 1/16 of the calls: the guards do\n"
@@ -5952,6 +5963,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "uint32_t e2_han[QJS_AOT_E2_NFUNCS];\n"
           "uint8_t e2_nfl[QJS_AOT_E2_NFUNCS], e2_dis[QJS_AOT_E2_NFUNCS];\n"
           "uint64_t e2_inl[QJS_AOT_E2_NFUNCS];\n"
+          "uint32_t e2_inx[QJS_AOT_E2_NFUNCS];\n"
+          "uint8_t e2_ioff[QJS_AOT_E2_NFUNCS];\n"
           "const char *const qjs_aot_e2_names[] = {\n"
           );
       {
