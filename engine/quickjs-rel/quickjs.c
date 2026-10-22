@@ -62371,9 +62371,9 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                : 0;
 }
 
-int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out)
+int qjs_aot_object_template_b(JSContext *ctx, JSFunctionBytecode *b, int index,
+                             JSValue *out)
 {
-    JSFunctionBytecode *b = f->b;
     JSValue val;
 
     if (unlikely(index < 0 || index >= b->objlit_count)) {
@@ -62385,6 +62385,11 @@ int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out
         return -1;
     *out = val;
     return 0;
+}
+
+int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out)
+{
+    return qjs_aot_object_template_b(ctx, f->b, index, out);
 }
 
 int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
@@ -62441,17 +62446,17 @@ int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
     return JS_IsException(*out) ? -1 : 0;
 }
 
-int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
-                        int n, int ti)
+int qjs_aot_object_fill_b(JSContext *ctx, JSFunctionBytecode *b, JSValue obj,
+                          JSValue *vals, int n, int ti)
 {
     JSObjLitTemplate *tpl;
     int i2;
 
-    if (unlikely(ti >= f->b->objlit_count)) {
+    if (unlikely(ti >= b->objlit_count)) {
         JS_ThrowInternalError(ctx, "invalid object literal template");
         return -1;
     }
-    tpl = &f->b->objlit_tab[ti];
+    tpl = &b->objlit_tab[ti];
     if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
         JSObject *po = JS_VALUE_GET_OBJ(obj);
 
@@ -62492,6 +62497,12 @@ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
 #endif
     }
     return 0;
+}
+
+int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
+                        int n, int ti)
+{
+    return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
 }
 
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)

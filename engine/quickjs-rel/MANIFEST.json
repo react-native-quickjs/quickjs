@@ -1279,12 +1279,16 @@
       "sha256": "419c84780148d2bbfa37c5331135e6e6a89590dc5d18e2938266948839f52de3"
     },
     {
+      "name": "0326-aot-alloc-helpers-bytecode.patch",
+      "sha256": "e10ea0ab43d87c8af33e844e0ceb974238edacc85414a3f54729dd92776f9ca7"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "9c3afdf5c6490e04a95e7f714395ded1b857c2414b05e78bdc94421fc7e5a30c",
+    "quickjs.c": "36df0e89f1abb095894073509197cea11c74b0587e54afbae582169a13d8b4ad",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

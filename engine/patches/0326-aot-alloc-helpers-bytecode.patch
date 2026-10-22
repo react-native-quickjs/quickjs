@@ -1,0 +1,96 @@
+Subject: Object allocation helpers that take the function's bytecode instead of its frame
+
+What this does
+  - `qjs_aot_object_template_b` and `qjs_aot_object_fill_b` are `qjs_aot_object_template`
+    and `qjs_aot_object_fill` with the function's bytecode in place of its frame; the
+    frame forms call them.
+  - A compiled function with no frame (one that calls or allocates) can then build and
+    fill an object literal. Nothing else changes.
+
+Why we need it
+  An object literal in a recursive builder (a tree constructor) kept the function
+  framed, and a framed recursion needs the interpreter's frame size per level plus the
+  C frame, so it could not reach the interpreter's depth.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62371,9 +62371,9 @@
+                : 0;
+ }
+ 
+-int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out)
++int qjs_aot_object_template_b(JSContext *ctx, JSFunctionBytecode *b, int index,
++                             JSValue *out)
+ {
+-    JSFunctionBytecode *b = f->b;
+     JSValue val;
+ 
+     if (unlikely(index < 0 || index >= b->objlit_count)) {
+@@ -62387,6 +62387,11 @@
+     return 0;
+ }
+ 
++int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out)
++{
++    return qjs_aot_object_template_b(ctx, f->b, index, out);
++}
++
+ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(f->sf->cur_func);
+@@ -62441,17 +62446,17 @@
+     return JS_IsException(*out) ? -1 : 0;
+ }
+ 
+-int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
+-                        int n, int ti)
++int qjs_aot_object_fill_b(JSContext *ctx, JSFunctionBytecode *b, JSValue obj,
++                          JSValue *vals, int n, int ti)
+ {
+     JSObjLitTemplate *tpl;
+     int i2;
+ 
+-    if (unlikely(ti >= f->b->objlit_count)) {
++    if (unlikely(ti >= b->objlit_count)) {
+         JS_ThrowInternalError(ctx, "invalid object literal template");
+         return -1;
+     }
+-    tpl = &f->b->objlit_tab[ti];
++    tpl = &b->objlit_tab[ti];
+     if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+         JSObject *po = JS_VALUE_GET_OBJ(obj);
+ 
+@@ -62494,6 +62499,12 @@
+     return 0;
+ }
+ 
++int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
++                        int n, int ti)
++{
++    return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
++}
++
+ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
+ {
+     JSValue val = regvm_array_from_regs(ctx, argv, na);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -361,6 +361,9 @@
+    the frame is `f`), the function itself, new.target and most of the family;
+    `array_from` is an array literal of `na` registers. */
+ int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
++struct JSFunctionBytecode;
++/* The same with the function's bytecode instead of its frame, for a body that has none. */
++int qjs_aot_object_template_b(JSContext *ctx, struct JSFunctionBytecode *b, int index, JSValue *out);
+ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
+ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
+ /* An exception leaves a compiled frame that has no handler: builds the error's stack
+@@ -378,6 +381,8 @@
+    template's shape when the object still has it, else property definitions. The
+    registers are left undefined, as the handler leaves them. 0, or -1 on an exception. */
+ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
++int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue obj, JSValue *vals,
++                          int n, int ti);
+ /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
+    reified, calls the callee with the frame's own arguments. 1 with an owned *out when
+    it did; 0 when the case needs the handler (not the builtin, or the arguments
