@@ -62215,6 +62215,94 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                : 0;
 }
 
+int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out)
+{
+    JSFunctionBytecode *b = f->b;
+    JSValue val;
+
+    if (unlikely(index < 0 || index >= b->objlit_count)) {
+        JS_ThrowInternalError(ctx, "invalid object literal template");
+        return -1;
+    }
+    val = js_new_object_from_template(ctx, &b->objlit_tab[index]);
+    if (JS_IsException(val))
+        return -1;
+    *out = val;
+    return 0;
+}
+
+int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(f->sf->cur_func);
+    JSValue val;
+
+    switch (kind) {
+    case OP_SPECIAL_OBJECT_ARGUMENTS:
+        val = js_build_arguments(ctx, f->argc, f->argv);
+        break;
+    case OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS:
+        val = js_build_mapped_arguments(ctx, f->argc, f->argv, f->sf,
+                                        min_int(f->argc, f->b->arg_count));
+        break;
+    case OP_SPECIAL_OBJECT_THIS_FUNC:
+        val = js_dup(f->sf->cur_func);
+        break;
+    case OP_SPECIAL_OBJECT_NEW_TARGET:
+        val = js_dup(f->new_target);
+        break;
+    case OP_SPECIAL_OBJECT_HOME_OBJECT:
+        val = p->u.func.home_object
+            ? js_dup(JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object))
+            : JS_UNDEFINED;
+        break;
+    case OP_SPECIAL_OBJECT_VAR_OBJECT:
+        val = JS_NewObjectProto(ctx, JS_NULL);
+        break;
+    case OP_SPECIAL_OBJECT_NULL_PROTO:
+        val = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_OBJECT);
+        break;
+    case OP_SPECIAL_OBJECT_ARG_COUNT:
+        val = js_int32(f->argc);
+        break;
+    default:
+        return 1;               /* import.meta and the rest: the handler's */
+    }
+    if (JS_IsException(val))
+        return -1;
+    *out = val;
+    return 0;
+}
+
+int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
+{
+    JSValue val = regvm_array_from_regs(ctx, argv, na);
+
+    if (JS_IsException(val))
+        return -1;
+    *out = val;
+    return 0;
+}
+
+int qjs_aot_apply_arguments(JSContext *ctx, JSRegRun *f, JSValue *window,
+                            JSValue *out)
+{
+    JSObject *pa = js_args_apply_is_builtin(window[1]);
+    JSValue ret;
+
+    if (pa == NULL)
+        return 0;
+    if (!((f->flags & REGVM_FLAG_LIGHT) ||
+          f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))
+        return 0;
+    if (check_function(pa->u.cfunc.realm, window[0]))
+        return -1;
+    ret = JS_Call(ctx, window[0], window[2], f->argc, vc(f->arg_buf));
+    if (JS_IsException(ret))
+        return -1;
+    *out = ret;
+    return 1;
+}
+
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
 {
     JSFunctionBytecode *cb;

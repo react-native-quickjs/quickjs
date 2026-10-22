@@ -1,0 +1,140 @@
+Subject: Run the allocating ops of a compiled body without stepping the handler
+
+What this does
+  Adds `qjs_aot_object_template`, `qjs_aot_special_object` (`arguments`, mapped
+  `arguments`, the function itself, new.target and the other kinds but import.meta),
+  `qjs_aot_array_from` and `qjs_aot_apply_arguments`: each does what the interpreter's
+  handler for the op does and hands back the owned result, so a compiled body calls it
+  directly. `qjs_aot_apply_arguments` is the `f.apply(this, arguments)` call when the
+  builtin `apply` is the method and the frame's arguments are not reified; otherwise it
+  returns 0 and the body takes the handler.
+
+Why we need it
+  These ops went through the step handler (a table dispatch and a decode for every
+  object literal, `arguments` and `apply`), which was a fifth of raytrace's time with
+  the other steps. The helpers are the handlers' bodies, so the semantics (mapped
+  `arguments` aliasing, the result owned) are the interpreter's.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62215,6 +62215,94 @@
+                : 0;
+ }
+ 
++int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out)
++{
++    JSFunctionBytecode *b = f->b;
++    JSValue val;
++
++    if (unlikely(index < 0 || index >= b->objlit_count)) {
++        JS_ThrowInternalError(ctx, "invalid object literal template");
++        return -1;
++    }
++    val = js_new_object_from_template(ctx, &b->objlit_tab[index]);
++    if (JS_IsException(val))
++        return -1;
++    *out = val;
++    return 0;
++}
++
++int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(f->sf->cur_func);
++    JSValue val;
++
++    switch (kind) {
++    case OP_SPECIAL_OBJECT_ARGUMENTS:
++        val = js_build_arguments(ctx, f->argc, f->argv);
++        break;
++    case OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS:
++        val = js_build_mapped_arguments(ctx, f->argc, f->argv, f->sf,
++                                        min_int(f->argc, f->b->arg_count));
++        break;
++    case OP_SPECIAL_OBJECT_THIS_FUNC:
++        val = js_dup(f->sf->cur_func);
++        break;
++    case OP_SPECIAL_OBJECT_NEW_TARGET:
++        val = js_dup(f->new_target);
++        break;
++    case OP_SPECIAL_OBJECT_HOME_OBJECT:
++        val = p->u.func.home_object
++            ? js_dup(JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object))
++            : JS_UNDEFINED;
++        break;
++    case OP_SPECIAL_OBJECT_VAR_OBJECT:
++        val = JS_NewObjectProto(ctx, JS_NULL);
++        break;
++    case OP_SPECIAL_OBJECT_NULL_PROTO:
++        val = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_OBJECT);
++        break;
++    case OP_SPECIAL_OBJECT_ARG_COUNT:
++        val = js_int32(f->argc);
++        break;
++    default:
++        return 1;               /* import.meta and the rest: the handler's */
++    }
++    if (JS_IsException(val))
++        return -1;
++    *out = val;
++    return 0;
++}
++
++int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
++{
++    JSValue val = regvm_array_from_regs(ctx, argv, na);
++
++    if (JS_IsException(val))
++        return -1;
++    *out = val;
++    return 0;
++}
++
++int qjs_aot_apply_arguments(JSContext *ctx, JSRegRun *f, JSValue *window,
++                            JSValue *out)
++{
++    JSObject *pa = js_args_apply_is_builtin(window[1]);
++    JSValue ret;
++
++    if (pa == NULL)
++        return 0;
++    if (!((f->flags & REGVM_FLAG_LIGHT) ||
++          f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))
++        return 0;
++    if (check_function(pa->u.cfunc.realm, window[0]))
++        return -1;
++    ret = JS_Call(ctx, window[0], window[2], f->argc, vc(f->arg_buf));
++    if (JS_IsException(ret))
++        return -1;
++    *out = ret;
++    return 1;
++}
++
+ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
+ {
+     JSFunctionBytecode *cb;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -341,6 +341,23 @@
+    exception. Runs no JavaScript. */
+ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
+ 
++/* The allocating ops a compiled body runs without stepping the handler. Each does
++   what the interpreter's handler does and returns 0 with an OWNED *out, or -1 on an
++   exception (`special_object` returns 1 for a kind it leaves to the handler).
++   `object_template` is an object literal (the template's shape is the
++   profiled final shape); `special_object` covers `arguments` (unmapped and mapped:
++   the frame is `f`), the function itself, new.target and most of the family;
++   `array_from` is an array literal of `na` registers. */
++int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
++int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
++int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
++/* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
++   reified, calls the callee with the frame's own arguments. 1 with an owned *out when
++   it did; 0 when the case needs the handler (not the builtin, or the arguments
++   object exists); -1 on an exception. `window` is the three registers (callee, apply,
++   this). */
++int qjs_aot_apply_arguments(JSContext *ctx, JSRegRun *f, JSValue *window, JSValue *out);
++
+ /* Mirror the int/float fast path of REGVM_CMP_BRANCH. Return 1 when the
+    comparison is decided (*take), 0 when it needs the generic slow path. */
+ int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take);
