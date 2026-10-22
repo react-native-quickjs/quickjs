@@ -4879,6 +4879,62 @@ static int emit_typed_construct(
    are re-checked after, an exception leaves like a call's. A case the helper leaves to
    the handler (import.meta, a reified `arguments`, a non-builtin `apply`) takes the
    op-call wrapper. Framed bodies only. */
+/* Stores through an engine helper, with no result: `put_global` (the engine's global
+   store, which can run a setter on the global object), `put_local_s0..3` and
+   `put_local` (a variable slot, whose old value is released) and `local_uninit`.
+   Each is a safepoint, so the live TAG values and the typed source are in the frame
+   first, and the shape groups are rechecked after. */
+static int emit_store_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types) {
+  int k, slot = -1;
+  char call[300];
+  if (!have_types || t == NULL || g_e2_fl || cur == NULL) return 0;
+  if (e2_roles[in->rop] == NULL || e2_roles[in->rop]->control != E2_CF_NONE) return 0;
+  if (e2_must_exit(fn, in)) return 0;
+  switch (in->rop) {
+    case ROP_put_global:
+      if (in->narg < 3 || in->arg[0].kind != 'a' || in->arg[1].kind != 'r') return 0;
+      if (E2_ROFF(in->arg[1]) / 16 >= fn->nregs || in->arg[0].off < 0) return 0;
+      snprintf(call, sizeof(call),
+               "qjs_aot_put_global(ctx, (int)qjs_aot_ld_u32(q2_code(f) + %d), AOT_REG(fr, %d), %d) < 0",
+               in->arg[0].off, E2_ROFF(in->arg[1]), (int)in->arg[2].val);
+      break;
+    case ROP_put_local_s0:
+    case ROP_put_local_s1:
+    case ROP_put_local_s2:
+    case ROP_put_local_s3:
+      slot = in->rop - ROP_put_local_s0;
+      if (in->narg < 1 || in->arg[0].kind != 'r' || E2_ROFF(in->arg[0]) / 16 >= fn->nregs)
+        return 0;
+      snprintf(call, sizeof(call), "(qjs_aot_put_local(ctx, q2_var_buf(f), %d, AOT_REG(fr, %d)), 0)",
+               slot, E2_ROFF(in->arg[0]));
+      break;
+    case ROP_local_uninit:
+      if (in->narg < 1) return 0;
+      snprintf(call, sizeof(call),
+               "(qjs_aot_put_local(ctx, q2_var_buf(f), %d, JS_UNINITIALIZED), 0)",
+               (int)in->arg[0].val);
+      break;
+    default:
+      return 0;
+  }
+  e2_emit_presync(f, fn, in, t, cur);
+  fprintf(f, "    if (__builtin_expect(%s, 0)) return JS_EXCEPTION;\n", call);
+  /* The decoder files some of these as a fallback that redefines the live registers:
+     each becomes a TAG local again from the frame, which the sync above filled. */
+  for (k = 0; k < in->nredef; k++) {
+    Q2ValueId rv = in->redef_val[k];
+    int rr = in->redef_reg[k];
+    if (rv == Q2_NO_VALUE || rv >= (Q2ValueId)t->nvalues || rr < 0 || rr >= fn->nregs ||
+        t->lb[rv] != E2_LB_TAG)
+      continue;
+    fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)rv, rr * 16);
+  }
+  e2_emit_group_recheck(f, fn, in, cur);
+  return 1;
+}
+
 static int emit_alloc_op(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -4941,6 +4997,22 @@ static int emit_alloc_op(
       if (in->win_n < 0) return 0;
       snprintf(call, sizeof(call), "qjs_aot_array_from(ctx, &AOT_REG(fr, %d), %d, &_o)",
                in->win_reg * 16, in->win_n);
+      break;
+    case ROP_array_const:
+      if (in->narg < 2) return 0;
+      snprintf(call, sizeof(call), "qjs_aot_array_const(ctx, f, %d, &_o)", (int)in->arg[1].val);
+      break;
+    case ROP_load_const:
+      if (in->narg < 3 || in->arg[2].kind != 'c') return 0;
+      /* An atom operand is the code's own word: atoms are renumbered at load. */
+      if (in->arg[1].val != 0 && in->arg[2].off < 0) return 0;
+      if (in->arg[1].val == 0)
+        snprintf(call, sizeof(call), "qjs_aot_load_const(ctx, f, 0, %uu, &_o)",
+                 (unsigned)in->arg[2].val);
+      else
+        snprintf(call, sizeof(call),
+                 "qjs_aot_load_const(ctx, f, 1, qjs_aot_ld_u32(q2_code(f) + %d), &_o)",
+                 in->arg[2].off);
       break;
     case ROP_object_fill:
       snprintf(call, sizeof(call),
@@ -6082,6 +6154,52 @@ static int emit_poly_write(
   }
   fprintf(f, "    }\n");
   g_e2_miss_exit_seen = 1;
+  return 1;
+}
+
+/* `get_local_field_0..3` ("ras": d, atom, site) and `get_local_field` ("ruas": d, slot,
+   atom, site): a named read whose receiver is a variable slot in the frame. The inline
+   cache hit is the same one a register receiver gets; a miss is the step. Framed
+   bodies (a frameless body has no variable area). */
+static int emit_typed_local_field(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  Q2ValueId dv;
+  int site, slot, dreg;
+
+  if (!have_types || t == NULL || g_e2_fl) return 0;
+  if (in->ndef < 1 || in->narg < 3 || e2_must_exit(fn, in)) return 0;
+  if (in->rop >= ROP_get_local_field_0 && in->rop <= ROP_get_local_field_3) {
+    slot = in->rop - ROP_get_local_field_0;
+    if (in->arg[2].kind != 's') return 0;
+    site = (int)in->arg[2].val;
+  } else if (in->rop == ROP_get_local_field) {
+    if (in->narg < 4 || in->arg[1].kind != 'u' || in->arg[3].kind != 's') return 0;
+    slot = (int)in->arg[1].val;
+    site = (int)in->arg[3].val;
+  } else {
+    return 0;
+  }
+  if ((unsigned)site == REG_IC_NONE) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_I32 && t->lb[dv] != E2_LB_F64 &&
+      t->lb[dv] != E2_LB_BOOL)
+    return 0;
+  e2_note_stub(g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  fprintf(f, "    { JSValue _f;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+      "q2_var_buf(f)[%d], %d, (int)q2_ns, &_f), 1)) {\n",
+      slot, site);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n    }\n");
+  if (cur != NULL) cur[dreg] = dv;
   return 1;
 }
 
@@ -7591,7 +7709,15 @@ static int e2_dispatch_rop(
     /* -- the spec body's own trivial forms, separate because they are shared with
           the generic emitter and must not be added there -- */
     case ROP_load_const:
-      return emit_typed_load_const(f, fn, in, t, cur, have_types);
+      return emit_typed_load_const(f, fn, in, t, cur, have_types) ||
+             emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_put_global:
+    case ROP_put_local_s0:
+    case ROP_put_local_s1:
+    case ROP_put_local_s2:
+    case ROP_put_local_s3:
+    case ROP_local_uninit:
+      return emit_store_call(f, fn, in, t, cur, have_types);
 
     /* -- fused arithmetic (Q2_OP_BINARY, but a five-operand shape) -- */
     case ROP_add_mul:
@@ -7667,11 +7793,18 @@ static int e2_dispatch_rop(
       return emit_typed_call(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_construct:
       return emit_typed_construct(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_get_local_field_0:
+    case ROP_get_local_field_1:
+    case ROP_get_local_field_2:
+    case ROP_get_local_field_3:
+    case ROP_get_local_field:
+      return emit_typed_local_field(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- allocation without the step handler -- */
     case ROP_new_object:
     case ROP_object_template:
     case ROP_array_from:
+    case ROP_array_const:
     case ROP_object_fill:
     case ROP_special_object:
     case ROP_apply_arguments:
