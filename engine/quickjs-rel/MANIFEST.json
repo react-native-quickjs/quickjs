@@ -1275,12 +1275,16 @@
       "sha256": "8cee5b0575704ff0028c6b9dac1fa8526e263da6338ea0776711eb5f1ea323ee"
     },
     {
+      "name": "0325-default-stack-from-thread.patch",
+      "sha256": "419c84780148d2bbfa37c5331135e6e6a89590dc5d18e2938266948839f52de3"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "7857bffb4ed1c078905387330741a3e82c256dca6a3ecf3bb548bebd3f9127df",
+    "quickjs.c": "9c3afdf5c6490e04a95e7f714395ded1b857c2414b05e78bdc94421fc7e5a30c",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
@@ -1302,7 +1306,7 @@
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
     "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
-    "quickjs.h": "fd585b9de76f67f56a26abb5782790c2b2f3626f9f17cb77293c4ea173fa98ad",
+    "quickjs.h": "73e5008e8288aee7d2ba2de41a21862c0c627e032d7d9cc9864cfe29799b72ac",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
 }

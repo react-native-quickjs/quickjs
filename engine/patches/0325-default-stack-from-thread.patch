@@ -1,0 +1,125 @@
+Subject: Take the default stack limit from the thread's real stack
+
+What this does
+  - Unless the embedder called `JS_SetMaxStackSize`, the runtime's stack limit is what
+    the thread has below the stack pointer when the runtime is created (or when
+    `JS_UpdateStackTop` is called), less a margin of 256 KB, up to 64 MB. The thread's
+    lowest stack address is read once per thread (`pthread_getattr_np`); a platform or a
+    thread whose stack cannot be read keeps the 1 MB default. An unset limit is a derived one; the header says so
+    beside `JS_SetMaxStackSize`.
+  - The margin covers the C code that runs between two stack checks: the throw itself,
+    the regexp matcher, a native callee.
+  - The interpreter's frame arena takes its byte budget from the same value, so both
+    engines gain the same depth.
+
+Why we need it
+  The 1 MB default left seven eighths of a normal 8 MB stack unused, and a compiled
+  recursion that needs more C stack per level than the interpreter's heap frames ran
+  out of it first.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67,6 +67,10 @@
+ #include <time.h>
+ #include <math.h>
+ 
++#if defined(__linux__) && !defined(__wasi__)
++#include <pthread.h> /* pthread_getattr_np, for the default stack limit */
++#endif
++
+ #include "cutils.h"
+ #include "list.h"
+ #include "quickjs.h"
+@@ -631,6 +635,7 @@
+ #endif
+     /* stack limitation */
+     uintptr_t stack_size; /* in bytes, 0 if no limit */
++    bool stack_size_set; /* the embedder chose it (JS_SetMaxStackSize) */
+     uintptr_t stack_top;
+     uintptr_t stack_limit; /* lower stack limit */
+ 
+@@ -3729,8 +3734,10 @@
+     rt->js_class_id_alloc = JS_CLASS_INIT_COUNT;
+ 
+     rt->stack_size = JS_DEFAULT_STACK_SIZE;
++    rt->stack_size_set = false;
+ #ifdef __wasi__
+     rt->stack_size = 0;
++    rt->stack_size_set = true;
+ #endif
+ 
+     JS_UpdateStackTop(rt);
+@@ -5194,6 +5201,46 @@
+     return ctx->rt;
+ }
+ 
++/* The stack the runtime uses when the embedder does not choose one: what the thread
++   really has below the stack pointer, less a margin for the C code that runs between
++   two checks (the throw itself, the regexp matcher, a native callee), up to a cap that
++   bounds the heap a runaway recursion can take. A thread whose stack cannot be read
++   keeps JS_DEFAULT_STACK_SIZE. */
++#define JS_STACK_MARGIN ((size_t)256 * 1024)
++#define JS_AUTO_STACK_MAX ((size_t)64 * 1024 * 1024)
++
++static size_t js_auto_stack_size(uintptr_t sp)
++{
++#if defined(__linux__) && !defined(__wasi__)
++    /* The lowest address of the thread's stack never changes; reading it costs a
++       look at /proc on the main thread, so it is read once per thread. */
++    static _Thread_local uintptr_t low;
++    static _Thread_local bool low_known;
++
++    if (!low_known) {
++        pthread_attr_t attr;
++        void *addr;
++        size_t size;
++
++        low_known = true;
++        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
++            if (pthread_attr_getstack(&attr, &addr, &size) == 0)
++                low = (uintptr_t)addr;
++            pthread_attr_destroy(&attr);
++        }
++    }
++    if (low != 0 && sp > low) {
++        size_t avail = sp - low, n;
++
++        n = avail > 2 * JS_STACK_MARGIN ? avail - JS_STACK_MARGIN : avail / 2;
++        return n < JS_AUTO_STACK_MAX ? n : JS_AUTO_STACK_MAX;
++    }
++#else
++    (void)sp;
++#endif
++    return JS_DEFAULT_STACK_SIZE;
++}
++
+ static void update_stack_limit(JSRuntime *rt)
+ {
+ #if defined(__wasi__)
+@@ -5210,12 +5257,15 @@
+ void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size)
+ {
+     rt->stack_size = stack_size;
++    rt->stack_size_set = true;
+     update_stack_limit(rt);
+ }
+ 
+ void JS_UpdateStackTop(JSRuntime *rt)
+ {
+     rt->stack_top = js_get_stack_pointer();
++    if (!rt->stack_size_set)
++        rt->stack_size = js_auto_stack_size(rt->stack_top);
+     update_stack_limit(rt);
+ }
+ 
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -527,6 +527,8 @@
+ JS_EXTERN int JS_GetGCPacingCap(JSRuntime *rt);
+ JS_EXTERN void JS_SetGCPacingCap(JSRuntime *rt, int cap);
+ /* use 0 to disable maximum stack size check */
++/* Without a call to this, the limit is derived from the thread's real stack (up to
++   64 MB, less a margin) each time the stack top is recorded. */
+ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
+ /* should be called when changing thread to update the stack top value
+    used to check stack overflow. */

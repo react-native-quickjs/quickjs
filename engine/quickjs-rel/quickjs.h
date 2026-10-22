@@ -527,6 +527,8 @@ JS_EXTERN void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
 JS_EXTERN int JS_GetGCPacingCap(JSRuntime *rt);
 JS_EXTERN void JS_SetGCPacingCap(JSRuntime *rt, int cap);
 /* use 0 to disable maximum stack size check */
+/* Without a call to this, the limit is derived from the thread's real stack (up to
+   64 MB, less a margin) each time the stack top is recorded. */
 JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
