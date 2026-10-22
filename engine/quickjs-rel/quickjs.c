@@ -60746,6 +60746,15 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.count);
     out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
     out->class_array = JS_CLASS_ARRAY;
+    out->class_uint8c_array = JS_CLASS_UINT8C_ARRAY;
+    out->class_int8_array = JS_CLASS_INT8_ARRAY;
+    out->class_uint8_array = JS_CLASS_UINT8_ARRAY;
+    out->class_int16_array = JS_CLASS_INT16_ARRAY;
+    out->class_uint16_array = JS_CLASS_UINT16_ARRAY;
+    out->class_int32_array = JS_CLASS_INT32_ARRAY;
+    out->class_uint32_array = JS_CLASS_UINT32_ARRAY;
+    out->class_float32_array = JS_CLASS_FLOAT32_ARRAY;
+    out->class_float64_array = JS_CLASS_FLOAT64_ARRAY;
     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
 #endif
     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
@@ -62503,6 +62512,54 @@ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals,
                         int n, int ti)
 {
     return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
+}
+
+/* A store of a number into an element of a typed array that is in range: 1 when done.
+   An integer goes to any element type (converted as the engine's own fast path does),
+   a double only to the float types; anything else is the caller's slow path. */
+int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v)
+{
+    JSObject *p;
+    int cid;
+
+    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(recv);
+    cid = p->class_id;
+    if (cid < JS_CLASS_UINT8C_ARRAY || cid > JS_CLASS_FLOAT64_ARRAY)
+        return 0;
+    if (unlikely(idx >= (uint32_t)p->u.array.count) || typed_array_is_immutable(p))
+        return 0;
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        int32_t x = JS_VALUE_GET_INT(v);
+
+        switch (cid) {
+        case JS_CLASS_INT8_ARRAY:
+        case JS_CLASS_UINT8_ARRAY: p->u.array.u.uint8_ptr[idx] = x; return 1;
+        case JS_CLASS_UINT8C_ARRAY:
+            p->u.array.u.uint8_ptr[idx] = x < 0 ? 0 : x > 255 ? 255 : x; return 1;
+        case JS_CLASS_INT16_ARRAY:
+        case JS_CLASS_UINT16_ARRAY: p->u.array.u.uint16_ptr[idx] = x; return 1;
+        case JS_CLASS_INT32_ARRAY:
+        case JS_CLASS_UINT32_ARRAY: p->u.array.u.uint32_ptr[idx] = x; return 1;
+        case JS_CLASS_FLOAT32_ARRAY: p->u.array.u.float_ptr[idx] = (float)x; return 1;
+        case JS_CLASS_FLOAT64_ARRAY: p->u.array.u.double_ptr[idx] = (double)x; return 1;
+        default: return 0;
+        }
+    }
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
+        double d = JS_VALUE_GET_FLOAT64(v);
+
+        if (cid == JS_CLASS_FLOAT64_ARRAY) {
+            p->u.array.u.double_ptr[idx] = d;
+            return 1;
+        }
+        if (cid == JS_CLASS_FLOAT32_ARRAY) {
+            p->u.array.u.float_ptr[idx] = (float)d;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)

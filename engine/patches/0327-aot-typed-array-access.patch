@@ -1,0 +1,111 @@
+Subject: Typed-array element access for compiled code
+
+What this does
+  - The unit layout carries the class ids of the typed arrays a compiled body reads in
+    place (Uint8Clamped, Int8, Uint8, Int16, Uint16, Int32, Uint32, Float32, Float64).
+  - `qjs_aot_typed_put` stores a number into an in-range element of a typed array: an
+    integer into any element type (as the interpreter's own fast path converts it), a
+    double into the float types. It refuses an out-of-range index, an immutable buffer
+    and anything else, and the caller takes the slow path.
+  - Reads and the length need no engine code: a typed array keeps its element pointer
+    and count where a dense array keeps its values and count.
+
+Why we need it
+  A loop over a typed array ran every element read, write and length through the
+  engine's step handler, 1.5 to 2.9 times slower than the interpreter.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60746,6 +60746,15 @@
+     out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.count);
+     out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
+     out->class_array = JS_CLASS_ARRAY;
++    out->class_uint8c_array = JS_CLASS_UINT8C_ARRAY;
++    out->class_int8_array = JS_CLASS_INT8_ARRAY;
++    out->class_uint8_array = JS_CLASS_UINT8_ARRAY;
++    out->class_int16_array = JS_CLASS_INT16_ARRAY;
++    out->class_uint16_array = JS_CLASS_UINT16_ARRAY;
++    out->class_int32_array = JS_CLASS_INT32_ARRAY;
++    out->class_uint32_array = JS_CLASS_UINT32_ARRAY;
++    out->class_float32_array = JS_CLASS_FLOAT32_ARRAY;
++    out->class_float64_array = JS_CLASS_FLOAT64_ARRAY;
+     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
+ #endif
+     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
+@@ -62505,6 +62514,54 @@
+     return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
+ }
+ 
++/* A store of a number into an element of a typed array that is in range: 1 when done.
++   An integer goes to any element type (converted as the engine's own fast path does),
++   a double only to the float types; anything else is the caller's slow path. */
++int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v)
++{
++    JSObject *p;
++    int cid;
++
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(recv);
++    cid = p->class_id;
++    if (cid < JS_CLASS_UINT8C_ARRAY || cid > JS_CLASS_FLOAT64_ARRAY)
++        return 0;
++    if (unlikely(idx >= (uint32_t)p->u.array.count) || typed_array_is_immutable(p))
++        return 0;
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
++        int32_t x = JS_VALUE_GET_INT(v);
++
++        switch (cid) {
++        case JS_CLASS_INT8_ARRAY:
++        case JS_CLASS_UINT8_ARRAY: p->u.array.u.uint8_ptr[idx] = x; return 1;
++        case JS_CLASS_UINT8C_ARRAY:
++            p->u.array.u.uint8_ptr[idx] = x < 0 ? 0 : x > 255 ? 255 : x; return 1;
++        case JS_CLASS_INT16_ARRAY:
++        case JS_CLASS_UINT16_ARRAY: p->u.array.u.uint16_ptr[idx] = x; return 1;
++        case JS_CLASS_INT32_ARRAY:
++        case JS_CLASS_UINT32_ARRAY: p->u.array.u.uint32_ptr[idx] = x; return 1;
++        case JS_CLASS_FLOAT32_ARRAY: p->u.array.u.float_ptr[idx] = (float)x; return 1;
++        case JS_CLASS_FLOAT64_ARRAY: p->u.array.u.double_ptr[idx] = (double)x; return 1;
++        default: return 0;
++        }
++    }
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
++        double d = JS_VALUE_GET_FLOAT64(v);
++
++        if (cid == JS_CLASS_FLOAT64_ARRAY) {
++            p->u.array.u.double_ptr[idx] = d;
++            return 1;
++        }
++        if (cid == JS_CLASS_FLOAT32_ARRAY) {
++            p->u.array.u.float_ptr[idx] = (float)d;
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
+ {
+     JSValue val = regvm_array_from_regs(ctx, argv, na);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -117,6 +117,10 @@
+        the class id of an ordinary array. Read inline so a compiled `a[i]` is
+        a class check, a bounds check and a load. */
+     uint32_t off_object_array_count, off_object_array_values, class_array;
++    /* The classes of the typed arrays whose elements a body reads and writes in place. */
++    uint32_t class_uint8c_array, class_int8_array, class_uint8_array, class_int16_array;
++    uint32_t class_uint16_array, class_int32_array, class_uint32_array;
++    uint32_t class_float32_array, class_float64_array;
+     /* The per-site polymorphic property cache: where the bytecode's allocation
+        is, the stride between sites, and the ways per site. */
+     uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
+@@ -383,6 +387,8 @@
+ int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
+ int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue obj, JSValue *vals,
+                           int n, int ti);
++/* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
++int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
+ /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
+    reified, calls the callee with the frame's own arguments. 1 with an owned *out when
+    it did; 0 when the case needs the handler (not the builtin, or the arguments
