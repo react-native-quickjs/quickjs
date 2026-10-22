@@ -5155,11 +5155,88 @@ static int emit_typed_construct(
    `put_local` (a variable slot, whose old value is released) and `local_uninit`.
    Each is a safepoint, so the live TAG values and the typed source are in the frame
    first, and the shape groups are rechecked after. */
+/* `put_global` in a frameless body: the engine's global store of a borrowed value. The
+   store can run a setter on the global object, so it is a safepoint: the live TAG values
+   nothing else roots go into their slots of the published array first. The bytecode's
+   atom operand is read the way a framed body reads it, from the live code. */
+static int emit_fl_put_global(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur) {
+  Q2ValueId spv[E_SPILL_MAX + 1], vv;
+  int nsp = 0, r, k, vreg;
+  uint64_t *lb;
+  char vb[64];
+
+  if (t == NULL || cur == NULL) return 0;
+  if (in->narg < 3 || in->arg[0].kind != 'a' || in->arg[1].kind != 'r' || in->arg[0].off < 0)
+    return 0;
+  vreg = E_ROFF(in->arg[1]) / 16;
+  if (vreg < 0 || vreg >= fn->nregs) return 0;
+  vv = cur[vreg];
+  if (vv == Q2_NO_VALUE || vv == E_UNDEF || vv == E_INFRAME || vv >= (Q2ValueId)t->nvalues) {
+    if (vv == E_UNDEF) snprintf(vb, sizeof(vb), "JS_UNDEFINED");
+    else return 0;
+  } else if (t->lb[vv] == E_LB_TAG) {
+    snprintf(vb, sizeof(vb), "v%u", (unsigned)vv);
+  } else if (t->lb[vv] == E_LB_I32) {
+    snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)vv);
+  } else if (t->lb[vv] == E_LB_F64) {
+    snprintf(vb, sizeof(vb), "E_BOX_F64(d%u)", (unsigned)vv);
+  } else if (t->lb[vv] == E_LB_BOOL) {
+    snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
+  } else {
+    return 0;
+  }
+  lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+  if (lb == NULL) abort();
+  q2_live_before(fn, (int)(in - fn->insns) + 1 < fn->ninsns ? (int)(in - fn->insns) + 1 : (int)(in - fn->insns), lb);
+  for (r = 0; r < fn->nregs; r++) {
+    Q2ValueId v;
+    if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
+    v = cur[r];
+    if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues ||
+        t->lb[v] != E_LB_TAG)
+      continue;
+    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if (e_spill_slot(v) < 0) {
+      free(lb);
+      e_fl_block("too many values live across a global store", in);
+      return 0;
+    }
+    spv[nsp++] = v;
+  }
+  free(lb);
+  /* The value stored is read by the store itself: it is rooted by its own register or
+     local for the call. */
+  if (t->lb[vv] == E_LB_TAG && (g_e_rooted == NULL || !g_e_rooted[vv]) &&
+      e_spill_slot(vv) >= 0) {
+    int dup = 0;
+    for (k = 0; k < nsp; k++)
+      if (spv[k] == vv) dup = 1;
+    if (!dup) spv[nsp++] = vv;
+  }
+  g_e_fl_calls = 1;
+  for (k = 0; k < nsp; k++)
+    fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
+  fprintf(
+      f,
+      "    rec_->pc = %d;\n"
+      "    if (__builtin_expect(qjs_aot_put_global(ctx, (int)qjs_aot_ld_u32(*(const uint8_t *const *)(cb + "
+      "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s, %d) < 0, 0)) return JS_EXCEPTION;\n",
+      in->next - 1, in->arg[0].off, vb, (int)in->arg[2].val);
+  g_e_inl_dirty = 1;
+  e_emit_group_recheck(f, fn, in, cur);
+  return 1;
+}
+
 static int emit_store_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types) {
   int k, slot = -1;
   char call[300];
+  if (g_e_fl && !g_e_inl && have_types && in->rop == ROP_put_global &&
+      e_roles[in->rop] != NULL && e_roles[in->rop]->control == E_CF_NONE &&
+      !e_must_exit(fn, in))
+    return emit_fl_put_global(f, fn, in, t, cur);
   if (!have_types || t == NULL || g_e_fl || cur == NULL) return 0;
   if (e_roles[in->rop] == NULL || e_roles[in->rop]->control != E_CF_NONE) return 0;
   if (e_must_exit(fn, in)) return 0;
