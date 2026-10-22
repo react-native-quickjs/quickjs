@@ -5707,6 +5707,20 @@ static int emit_alloc_op(
   }
 
   /* ---- output ---- */
+  /* Two tagged numbers add, subtract or multiply inline; the engine's routine takes
+     what is left. */
+  if ((in->rop == ROP_add || in->rop == ROP_sub || in->rop == ROP_mul) && !nodest &&
+      !redef_mode && in->nuse == 2 && t->lb[dv] == E_LB_TAG &&
+      in->use[0] < (Q2ValueId)t->nvalues && in->use[1] < (Q2ValueId)t->nvalues &&
+      t->lb[in->use[0]] == E_LB_TAG && t->lb[in->use[1]] == E_LB_TAG)
+    fprintf(f,
+            "    { JSValue _r0;\n"
+            "      if (__builtin_expect(q2_arith(%d, v%u, v%u, &_r0), 1)) {\n"
+            "        v%u = _r0;\n"
+            "        goto cd_%d;\n"
+            "      }\n"
+            "    }\n",
+            (int)in->sub, (unsigned)in->use[0], (unsigned)in->use[1], (unsigned)dv, in->pc);
   fprintf(f, "    /* sync live TAG values to the frame before the allocation */\n");
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v = cur[r];
