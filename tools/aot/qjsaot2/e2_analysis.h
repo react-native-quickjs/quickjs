@@ -118,6 +118,12 @@ typedef struct E2Facts {
   E2SiteInfo *sites;
   int nblocks;
   E2BlockFacts *blocks; /* the in-set of each block, for the dump */
+  /* Shape checks hoisted to a loop preheader (card E13): the loop header, its
+     preheader, the receiver value and the group. */
+  int nloops, loop_cap, *loop_hdr, *loop_pre;
+  uint8_t **loop_mem;
+  int nhoist, hoist_cap;
+  int *hoist_hdr, *hoist_pre, *hoist_val, *hoist_grp;
   int nfwd;             /* loads forwarded, for the report */
   int nskip;            /* shape checks skipped, for the report */
 } E2Facts;

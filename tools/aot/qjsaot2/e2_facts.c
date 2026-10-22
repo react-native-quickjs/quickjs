@@ -633,6 +633,69 @@ oom:
 /* ---- the transfer ------------------------------------------------------- */
 
 /* Apply one instruction's transfer to `s`. */
+/* What a store may have changed: the facts it kills (not the location it defines). */
+static void apply_store_kills(FactSet *s, const Access *stp) {
+  const Access st = *stp;
+  switch (st.kind) {
+    case E2_K_ARG: {
+      int64_t slot = st.key.a;
+      fs_kill(s, kp_arg_slot, &slot);
+      break;
+    }
+    case E2_K_LOCAL: {
+      int64_t slot = st.key.a;
+      fs_kill(s, kp_local_slot, &slot);
+      break;
+    }
+    case E2_K_VARREF: {
+      int64_t slot = st.key.a;
+      fs_kill(s, kp_varref_slot, &slot);
+      break;
+    }
+    case E2_K_GLOBAL: {
+      int64_t atom = st.key.a;
+      fs_kill(s, kp_global_atom, &atom);
+      break;
+    }
+    case E2_K_FIELD: {
+      /* Different atoms never alias; the same atom on another receiver may be
+         the same object, so it kills them all (D6). */
+      int64_t atom = st.key.b;
+      fs_kill(s, kp_field_atom, &atom);
+      break;
+    }
+    case E2_K_ELEM: {
+      /* Any element store may move, extend or reshape the store. */
+      fs_kill(s, kp_elem, NULL);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/* Whether the instruction is a safepoint, ignoring forwarding (a forwarded load is
+   never one): the classification `transfer` applies, for the loop eligibility test. */
+static int is_safepoint(const Q2Func *fn, E2Facts *f, const Q2Insn *in, int grouped_exit) {
+  int kind = insn_kind(in);
+  if (kind == E2_SK_FIELD) {
+    SiteRef ref[2];
+    int nr = site_refs(in, ref), r, grouped = nr > 0;
+    if (!grouped_exit) grouped = 0;
+    for (r = 0; r < nr; r++)
+      if (ref[r].site < 0 || ref[r].recv < 0 ||
+          (e2_facts_site_group(f, ref[r].site) < 0 &&
+           !(e2_facts_poly_on && nr == 1 && e2_facts_poly_op(in) &&
+             e2_facts_site_poly(f, ref[r].site))))
+        grouped = 0;
+    kind = grouped ? E2_SK_NOJS : E2_SK_SAFE;
+  }
+  if (kind == E2_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
+      e2_intrinsic_lowerable(fn, in))
+    kind = E2_SK_NOJS;
+  return kind == E2_SK_SAFE;
+}
+
 static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
                     int grouped_exit) {
   const Q2Insn *in = &fn->insns[insn];
@@ -693,13 +756,19 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
     int nr = site_refs(in, ref), r;
     for (r = 0; r < nr; r++) {
       int g = ref[r].site >= 0 ? e2_facts_site_group(f, ref[r].site) : -1;
+      int rv;
       if (g < 0 || ref[r].recv < 0) continue;
       f->access[insn] = 1;
-      if (fs_has_shape(s, (int)ref[r].recv, g)) {
+      /* A receiver that is a forwarded copy of another value is that value. */
+      rv = (int)ref[r].recv;
+      while (rv >= 0 && rv < fn->nvalues && fn->values[rv].insn >= 0 &&
+             f->fwd[fn->values[rv].insn] != Q2_NO_VALUE)
+        rv = (int)f->fwd[fn->values[rv].insn];
+      if (fs_has_shape(s, rv, g)) {
         f->skip[insn] = 1;
         f->nskip++;
       }
-      if (fs_add_shape(s, (int)ref[r].recv, g) < 0) return -1;
+      if (fs_add_shape(s, rv, g) < 0) return -1;
     }
   }
 
@@ -713,42 +782,7 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
   if (insn_store(in, &st)) {
     /* The load and store helpers are disjoint by opcode, so a store is never
        also the load handled above. */
-    switch (st.kind) {
-      case E2_K_ARG: {
-        int64_t slot = st.key.a;
-        fs_kill(s, kp_arg_slot, &slot);
-        break;
-      }
-      case E2_K_LOCAL: {
-        int64_t slot = st.key.a;
-        fs_kill(s, kp_local_slot, &slot);
-        break;
-      }
-      case E2_K_VARREF: {
-        int64_t slot = st.key.a;
-        fs_kill(s, kp_varref_slot, &slot);
-        break;
-      }
-      case E2_K_GLOBAL: {
-        int64_t atom = st.key.a;
-        fs_kill(s, kp_global_atom, &atom);
-        break;
-      }
-      case E2_K_FIELD: {
-        /* Different atoms never alias; the same atom on another receiver may be
-           the same object, so it kills them all (D6). */
-        int64_t atom = st.key.b;
-        fs_kill(s, kp_field_atom, &atom);
-        break;
-      }
-      case E2_K_ELEM: {
-        /* Any element store may move, extend or reshape the store. */
-        fs_kill(s, kp_elem, NULL);
-        break;
-      }
-      default:
-        break;
-    }
+    apply_store_kills(s, &st);
     if (fs_set_avail(s, &st.key, st.val) < 0) return -1;
   }
 
@@ -761,6 +795,151 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
     s->nshape = 0;
   }
   (void)fn;
+  return 0;
+}
+
+/* ---- loop hoisting of shape checks (card E13) ------------------------------
+   A natural loop with one back edge target (its header), a unique outside
+   predecessor P that has no other successor, and no safepoint in its body can have
+   the shape checks of its grouped accesses done once, at the end of P: nothing in
+   the body can change a shape, so the fact holds throughout. A hoisted check that
+   fails exits at the header's pc with the header's live-in set (the loop has not
+   run, so nothing needs undoing). The accesses in the loop then skip their receiver
+   test. Only receivers defined outside the loop qualify. Loads (D6) are not
+   hoisted: a hoisted load needs a new value in the IR (deferred). */
+static int in_loop(const uint8_t *loop, int b) { return b >= 0 && loop[b]; }
+
+static int plan_hoists(const Q2Func *fn, E2Facts *out, int grouped_exit) {
+  int b, bi, k, q, p;
+  uint8_t *loop = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), 1);
+  int *stack = malloc(sizeof(int) * (size_t)(fn->nblocks > 0 ? fn->nblocks : 1));
+  if (loop == NULL || stack == NULL) {
+    free(loop);
+    free(stack);
+    return -1;
+  }
+  if (getenv("QJS_AOT_E2_NOHOIST") != NULL) goto done;
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *lt = &fn->blocks[b];
+    int si;
+    for (si = 0; si < lt->nsucc && si < 2; si++) {
+      int h = lt->succ_block[si], sp = 0, pre = -1, npre = 0, safe = 1;
+      if (h < 0 || h >= fn->nblocks || !q2_is_back_edge(fn, b, h)) continue;
+      /* the natural loop of the back edge b -> h */
+      memset(loop, 0, (size_t)fn->nblocks);
+      loop[h] = 1;
+      if (!loop[b]) {
+        loop[b] = 1;
+        stack[sp++] = b;
+      }
+      while (sp > 0) {
+        int x = stack[--sp];
+        for (p = 0; p < fn->blocks[x].npreds; p++) {
+          int pb = fn->blocks[x].preds[p];
+          if (pb < 0 || loop[pb] || fn->rpo_pos[pb] < 0) continue;
+          loop[pb] = 1;
+          stack[sp++] = pb;
+        }
+      }
+      /* the unique outside predecessor */
+      for (p = 0; p < fn->blocks[h].npreds; p++) {
+        int pb = fn->blocks[h].preds[p];
+        if (pb < 0 || fn->rpo_pos[pb] < 0 || loop[pb]) continue;
+        pre = pb;
+        npre++;
+      }
+      /* The check is emitted on the edge into the header, so the preheader may
+         have another successor (a rotated loop is entered by a branch). */
+      if (npre != 1) continue;
+      /* no safepoint in the body */
+      for (bi = 0; bi < fn->nblocks && safe; bi++) {
+        if (!loop[bi]) continue;
+        for (k = 0; k < fn->blocks[bi].ninsns; k++)
+          /* Negative control: "unsafe" hoists past a safepoint. */
+          if (is_safepoint(fn, out, &fn->insns[fn->blocks[bi].first_insn + k], grouped_exit) &&
+              getenv("QJS_AOT_E2_HOIST_CONTROL_SAFE") == NULL) {
+            safe = 0;
+            break;
+          }
+      }
+      if (!safe) continue;
+      /* record the loop for the facts that survive it */
+      if (out->nloops == out->loop_cap) {
+        int nc = out->loop_cap ? out->loop_cap * 2 : 8;
+        int *a1 = realloc(out->loop_hdr, sizeof(int) * (size_t)nc);
+        int *a2 = realloc(out->loop_pre, sizeof(int) * (size_t)nc);
+        uint8_t **a3 = realloc(out->loop_mem, sizeof(*a3) * (size_t)nc);
+        if (!a1 || !a2 || !a3) {
+          free(loop);
+          free(stack);
+          return -1;
+        }
+        out->loop_hdr = a1;
+        out->loop_pre = a2;
+        out->loop_mem = a3;
+        out->loop_cap = nc;
+      }
+      out->loop_hdr[out->nloops] = h;
+      out->loop_pre[out->nloops] = pre;
+      out->loop_mem[out->nloops] = malloc((size_t)fn->nblocks);
+      if (out->loop_mem[out->nloops] == NULL) {
+        free(loop);
+        free(stack);
+        return -1;
+      }
+      memcpy(out->loop_mem[out->nloops], loop, (size_t)fn->nblocks);
+      out->nloops++;
+      /* the receivers of grouped accesses that are defined outside the loop */
+      for (bi = 0; bi < fn->nblocks; bi++) {
+        if (!loop[bi]) continue;
+        for (k = 0; k < fn->blocks[bi].ninsns; k++) {
+          const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
+          SiteRef ref[2];
+          int nr = site_refs(in, ref), r;
+          if (insn_kind(in) != E2_SK_FIELD) continue;
+          for (r = 0; r < nr; r++) {
+            int g, dup = 0, db;
+            Q2ValueId v;
+            if (ref[r].site < 0 || ref[r].recv < 0) continue;
+            g = e2_facts_site_group(out, ref[r].site);
+            if (g < 0) continue;
+            v = (Q2ValueId)ref[r].recv;
+            if (v >= (Q2ValueId)fn->nvalues) continue;
+            db = fn->values[v].block;
+            if (db < 0 || in_loop(loop, db)) continue;
+            for (q = 0; q < out->nhoist; q++)
+              if (out->hoist_hdr[q] == h && out->hoist_val[q] == v && out->hoist_grp[q] == g) dup = 1;
+            if (dup) continue;
+            if (out->nhoist == out->hoist_cap) {
+              int nc = out->hoist_cap ? out->hoist_cap * 2 : 8;
+              int *a1 = realloc(out->hoist_hdr, sizeof(int) * (size_t)nc);
+              int *a2 = realloc(out->hoist_pre, sizeof(int) * (size_t)nc);
+              int *a3 = realloc(out->hoist_val, sizeof(int) * (size_t)nc);
+              int *a4 = realloc(out->hoist_grp, sizeof(int) * (size_t)nc);
+              if (!a1 || !a2 || !a3 || !a4) {
+                free(loop);
+                free(stack);
+                return -1;
+              }
+              out->hoist_hdr = a1;
+              out->hoist_pre = a2;
+              out->hoist_val = a3;
+              out->hoist_grp = a4;
+              out->hoist_cap = nc;
+            }
+            out->hoist_hdr[out->nhoist] = h;
+            out->hoist_pre[out->nhoist] = pre;
+            out->hoist_val[out->nhoist] = (int)v;
+            out->hoist_grp[out->nhoist] = g;
+            out->nhoist++;
+          }
+        }
+      }
+    }
+  }
+done:
+  free(loop);
+  free(stack);
   return 0;
 }
 
@@ -786,6 +965,7 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
   if (build_groups(fn, out) < 0) goto done;
+  if (plan_hoists(fn, out, grouped_exit) < 0) goto done;
 
   /* The blocks are visited in DFS reverse postorder, so every forward
      predecessor has been visited first and only a back edge can reach an
@@ -812,8 +992,38 @@ int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit) {
       }
       if (back_edge) {
         /* A loop header starts empty: the back edge carries no fact the first
-           time round, so none may be assumed. */
+           time round, so none may be assumed -- except the shape facts of a loop
+           that has hoisted checks: its body has no safepoint, so what held at the
+           end of the preheader (and the hoisted checks) holds throughout. */
         fs_clear(&cur);
+        /* An eligible loop (no safepoint) keeps what held at the end of its
+           preheader, except what a store in the loop may kill. */
+        for (k = 0; k < out->nloops; k++) {
+          int pre = out->loop_pre[k], j, bb, ii;
+          if (out->loop_hdr[k] != b) continue;
+          for (j = 0; j < outs[pre].navail; j++)
+            if (fs_set_avail(&cur, &outs[pre].avail[j].key, outs[pre].avail[j].val) < 0)
+              goto done;
+          for (bb = 0; bb < fn->nblocks; bb++) {
+            if (!out->loop_mem[k][bb]) continue;
+            for (ii = 0; ii < fn->blocks[bb].ninsns; ii++) {
+              Access st2;
+              /* Negative control: "nokill" carries facts past a store that kills them. */
+              if (insn_store(&fn->insns[fn->blocks[bb].first_insn + ii], &st2) &&
+                  getenv("QJS_AOT_E2_HOIST_CONTROL") == NULL)
+                apply_store_kills(&cur, &st2);
+            }
+          }
+          break;
+        }
+        for (k = 0; k < out->nhoist; k++) {
+          int pre = out->hoist_pre[k], j;
+          if (out->hoist_hdr[k] != b) continue;
+          for (j = 0; j < outs[pre].nshape; j++)
+            if (fs_add_shape(&cur, outs[pre].shape_val[j], outs[pre].shape_grp[j]) < 0)
+              goto done;
+          if (fs_add_shape(&cur, out->hoist_val[k], out->hoist_grp[k]) < 0) goto done;
+        }
       } else {
         /* `cur` still holds the previous block's out-set; the merge below
            starts from the first predecessor's, not from that. Without this a
@@ -903,6 +1113,14 @@ done:
 void e2_facts_free(E2Facts *f) {
   int i;
   if (f == NULL) return;
+  for (i = 0; i < f->nloops; i++) free(f->loop_mem[i]);
+  free(f->loop_mem);
+  free(f->loop_hdr);
+  free(f->loop_pre);
+  free(f->hoist_hdr);
+  free(f->hoist_pre);
+  free(f->hoist_val);
+  free(f->hoist_grp);
   free(f->fwd);
   free(f->access);
   free(f->skip);

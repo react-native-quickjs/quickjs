@@ -104,6 +104,11 @@ void e2_report_intrinsic(const char *hex, int pc, int id, int argc, int ok) {
           hex, pc, id, e2_intrinsic_name(id), argc, ok);
 }
 
+void e2_report_hoist(const char *hex, int n) {
+  if (e2_rep == NULL) return;
+  fprintf(e2_rep, "e2 hoist hex=%s n=%d\n", hex, n);
+}
+
 void e2_report_inline(const char *hex, int ok, const char *why) {
   if (e2_rep == NULL) return;
   fprintf(e2_rep, "e2 inline hex=%s %s reason=%s\n", hex, ok ? "yes" : "no",

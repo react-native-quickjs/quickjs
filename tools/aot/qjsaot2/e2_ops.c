@@ -2459,7 +2459,7 @@ static const E2Facts *g_e2_facts;
    re-checked after a safepoint. */
 static uint8_t *g_e2_group_used;
 /* The report counts: shape tests emitted and skipped, loads forwarded. */
-static int g_e2_n_shape, g_e2_n_skip, g_e2_n_fwd;
+static int g_e2_n_shape, g_e2_n_skip, g_e2_n_fwd, g_e2_n_hoist;
 /* Set around an op-call wrapper whose caller has already written the live TAG
    values and the operands to the frame (a call site does that once for all its
    arms), so the wrapper does not write them again. */
@@ -3267,6 +3267,41 @@ static void e2_emit_arm(
     return;
   }
   e2_emit_edge_moves(f, fn, b, k, cur);
+  /* Shape checks hoisted out of the loop this edge enters (card E13). */
+  if (g_e2_facts != NULL && g_e2_facts->nhoist > 0 && !q2_is_back_edge(fn, b, sb)) {
+    int q, any = 0;
+    for (q = 0; q < g_e2_facts->nhoist; q++)
+      if (g_e2_facts->hoist_hdr[q] == sb && g_e2_facts->hoist_pre[q] == b) any = 1;
+    if (any) {
+      const Q2Block *hb = &fn->blocks[sb];
+      Q2ValueId *seed = malloc(sizeof(*seed) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+      int r0;
+      if (seed == NULL) abort();
+      for (r0 = 0; r0 < fn->nregs; r0++) seed[r0] = Q2_NO_VALUE;
+      for (r0 = 0; r0 < hb->nlive_in; r0++) {
+        int rr = hb->in_reg[r0];
+        if (rr >= 0 && rr < fn->nregs) seed[rr] = hb->in_val[r0];
+      }
+      /* the exit is at the header's first instruction: nothing of the loop has run */
+      e2_note_stub(g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, hb->start_pc, seed, NULL);
+      free(seed);
+      for (q = 0; q < g_e2_facts->nhoist; q++) {
+        Q2ValueId rv;
+        if (g_e2_facts->hoist_hdr[q] != sb || g_e2_facts->hoist_pre[q] != b) continue;
+        rv = (Q2ValueId)g_e2_facts->hoist_val[q];
+        e2_sweep_guard(f, "vx", hb->start_pc);
+        if (g_e2_types != NULL && rv < (Q2ValueId)g_e2_types->nvalues &&
+            g_e2_types->lb[rv] == E2_LB_TAG) {
+          fprintf(
+              f, "      if (__builtin_expect(q2_shape_of(v%u) != gsh%d, 0)) goto vx_%d;\n",
+              (unsigned)rv, g_e2_facts->hoist_grp[q], hb->start_pc);
+        } else {
+          fprintf(f, "      goto vx_%d;\n", hb->start_pc);
+        }
+        g_e2_n_hoist++;
+      }
+    }
+  }
   /* RULE P / R6: every back edge polls, like the generic dispatch. Without it a
      loop in the spec body cannot be interrupted, and clang proves the loop to be
      side-effect free and replaces it with a closed form -- which is why an
@@ -7552,7 +7587,7 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e2_dirty_ins = g_e2_inl ? calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1) : NULL;
   free(g_e2_group_used);
   g_e2_group_used = NULL;
-  g_e2_n_shape = g_e2_n_skip = g_e2_n_fwd = 0;
+  g_e2_n_shape = g_e2_n_skip = g_e2_n_fwd = g_e2_n_hoist = 0;
   int n_left = 0;
   char gen0[400], gene[160];
   FILE *out = NULL;
@@ -8294,6 +8329,7 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     if (g_e2_fl && !g_e2_inl) e2_emit_frameless_forward(f, fn, hex);
     if (!g_e2_quiet && !g_e2_inl) e2_report_spec(hex, vals, tiers, checks, lines, bytes);
+    if (!g_e2_quiet && !g_e2_inl && g_e2_n_hoist > 0) e2_report_hoist(hex, g_e2_n_hoist);
   }
   e2_facts_free(&facts);
   g_e2_facts = NULL;
