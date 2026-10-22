@@ -531,6 +531,20 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           kind = 2;
           if (mg) magic = (int)strtol(mg + 7, NULL, 10);
           if (cp) cproto = (int)strtol(cp + 8, NULL, 10);
+          /* Name a C callee by its symbol and magic ("js_math_floor:0"): the
+             pointer differs from run to run, the symbol does not. It is held in
+             the digest slot, which a C callee has no other use for, so two
+             different builtins at one site stay two callees. */
+          {
+            const char *e = strstr(cl + 9, ":fn=");
+            size_t n = e ? (size_t)(e - (cl + 9)) : 0;
+            if (n > 0 && n < 24) {
+              char nm[32];
+              memcpy(nm, cl + 9, n);
+              nm[n] = 0;
+              snprintf(cd, sizeof(cd), "%s:%d", nm, magic);
+            }
+          }
         }
         for (k = 0; k < e->ncalls; k++)
           if (e->calls[k].pc == pc) break;
@@ -3619,6 +3633,8 @@ typedef struct {
 
 /* Per unit function: the leaf body, when it has one. */
 static EmitBuf *g_pure_eb;
+/* The inline forms (`e2i_HEX`) of the unit's small leaves, by unit index (card E15). */
+static EmitBuf *g_inl_eb;
 
 /* Which functions this run's E2 emitter gave a native entry. A call site may
    only name an `aot_n_` that some body in this unit defines, and a unit built
@@ -3653,6 +3669,19 @@ int qjs_aot_leaf_argc(const char hex[33]) {
                  ? g_unit_funcs[i].arg_count
                  : -1;
   return -1;
+}
+
+/* Whether the unit function with this digest has an inline form a caller can run
+   in place of a call. */
+int qjs_aot_inline_has(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || !g_inl_eb || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
+      return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE && g_inl_eb[i].buf;
+  return 0;
 }
 
 /* A function's share of the profile's executed ops, in percent: the report's
@@ -3946,6 +3975,30 @@ int qjsaot_driver_main(int argc, char **argv) {
   if (split_dir != NULL) e2_set_split(1);
   if (qjs_aot_emit2_on()) e2_roles_check();
     e2_report_open(g_emit2_report);
+    /* The inline forms first: a caller asks whether its callee has one while its own
+       body is emitted. */
+    g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
+    for (i = 0; g_inl_eb && qjs_aot_emit2_on() && i < nfuncs; i++) {
+      char hex[33], why[160] = "";
+      FILE *mf;
+      int ok;
+
+      if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
+      if (i + 1 < nfuncs && memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
+        continue;
+      hex16(funcs[i].digest, hex);
+      g_cur_func_idx = i;
+      mf = open_memstream(&g_inl_eb[i].buf, &g_inl_eb[i].len);
+      if (!mf) continue;
+      ok = e2_emit_inline_func(mf, &funcs[i], hex, why, sizeof(why));
+      fclose(mf);
+      e2_report_inline(hex, ok, why);
+      if (!ok) {
+        free(g_inl_eb[i].buf);
+        g_inl_eb[i].buf = NULL;
+        g_inl_eb[i].len = 0;
+      }
+    }
     for (i = 0; i < nfuncs; i++) {
       char hex[33];
       int ninsn;
@@ -4224,6 +4277,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_REGVM_FLAG_SAME_REALM %uu\n"
           "#define QJS_AOT_RC_BACK %uu\n"
           "#define QJS_AOT_OFF_VARREF_PVALUE %uu\n"
+          "#define QJS_AOT_CLASS_C_FUNCTION %uu\n"
+          "#define QJS_AOT_OFF_CFUNC_C_FUNCTION %uu\n"
+          "#define QJS_AOT_OFF_CFUNC_MAGIC %uu\n"
           "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
           "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
@@ -4266,7 +4322,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_object_func_var_refs, lay.light_prefix_slots,
           lay.regvm_flag_light, lay.regvm_flag_c_entry, lay.regvm_flag_stack,
           lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm,
-          lay.off_rc_back, lay.off_varref_pvalue);
+          lay.off_rc_back, lay.off_varref_pvalue, lay.class_c_function,
+          lay.off_cfunc_c_function, lay.off_cfunc_magic);
       fclose(lf);
     }
 
@@ -4723,6 +4780,126 @@ int qjsaot_driver_main(int argc, char **argv) {
            a call can afford (a frameless one) tests one byte, not four globals. */
         "  for (i = 0; i < QJS_AOT_E2_NFUNCS; i++)\n"
         "    e2_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
+        "}\n\n"
+        /* The builtins a unit lowers inline (card E15): the engine's own
+           function pointers, filled once, and the number view the inline C
+           works on (k: 0 not a number, 1 int, 2 double, 3 undefined). */
+        "typedef struct { int k; int i; double d; } Q2Num;\n"
+        "static void *e2_intr_fn[QJS_AOT_INTR_COUNT];\n"
+        "static void __attribute__((constructor)) q2_intr_init(void)\n"
+        "{\n"
+        "  int i;\n"
+        "  for (i = 0; i < QJS_AOT_INTR_COUNT; i++)\n"
+        "    e2_intr_fn[i] = qjs_aot_intrinsic_fn(i);\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) Q2Num q2_numv(JSValue v)\n"
+        "{\n"
+        "  Q2Num n;\n"
+        "  uint32_t t = JS_VALUE_GET_TAG(v);\n"
+        "  n.k = 0; n.i = 0; n.d = 0;\n"
+        "  if (t == JS_TAG_UNDEFINED) n.k = 3;\n"
+        "  if (t == JS_TAG_INT) {\n"
+        "    n.k = 1; n.i = JS_VALUE_GET_INT(v); n.d = (double)n.i;\n"
+        "  } else if (t == JS_TAG_FLOAT64) {\n"
+        "    n.k = 2; n.d = JS_VALUE_GET_FLOAT64(v);\n"
+        "  }\n"
+        "  return n;\n"
+        "}\n"
+        /* The value is the engine's builtin: a C function whose entry is the
+           one the engine registered (and, for min/max, whose magic selects
+           the operation). A replaced `Math.floor` fails this. */
+        "static inline __attribute__((always_inline)) int q2_is_intr(JSValue c, "
+        "int id, int magic)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  if (JS_VALUE_GET_TAG(c) != JS_TAG_OBJECT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(c);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_C_FUNCTION)\n"
+        "    return 0;\n"
+        "  if (*(void *const *)(p + QJS_AOT_OFF_CFUNC_C_FUNCTION) !=\n"
+        "      e2_intr_fn[id])\n"
+        "    return 0;\n"
+        "  return magic < 0 || *(const int16_t *)(p + QJS_AOT_OFF_CFUNC_MAGIC) == "
+        "magic;\n"
+        "}\n"
+        /* js_math_round, verbatim: not C round() (it differs at -0.5 and the
+           half-way cases the engine rounds up). */
+        "static inline double q2_math_round(double a)\n"
+        "{\n"
+        "  union { double d; uint64_t u64; } u;\n"
+        "  uint64_t frac_mask, one;\n"
+        "  unsigned int e, s;\n"
+        "  u.d = a;\n"
+        "  e = (u.u64 >> 52) & 0x7ff;\n"
+        "  if (e < 1023) {\n"
+        "    if (e == (1023 - 1) && u.u64 != 0xbfe0000000000000) {\n"
+        "      u.u64 = (u.u64 & ((uint64_t)1 << 63)) | ((uint64_t)1023 << 52);\n"
+        "    } else {\n"
+        "      u.u64 &= (uint64_t)1 << 63;\n"
+        "    }\n"
+        "  } else if (e < (1023 + 52)) {\n"
+        "    s = u.u64 >> 63;\n"
+        "    one = (uint64_t)1 << (52 - (e - 1023));\n"
+        "    frac_mask = one - 1;\n"
+        "    u.u64 += (one >> 1) - s;\n"
+        "    u.u64 &= ~frac_mask;\n"
+        "  }\n"
+        "  return u.d;\n"
+        "}\n"
+        /* The inline arm of an intrinsic: 1 and a boxed result for numeric
+           arguments of the shapes the engine handles the same way, 0 for
+           anything else (the caller exits before the call). */
+        "static inline __attribute__((always_inline)) int q2_intr(int id, "
+        "Q2Num a, Q2Num b, JSValue *out)\n"
+        "{\n"
+        "  double r;\n"
+        "  if (a.k != 1 && a.k != 2) return 0;\n"
+        "  switch (id) {\n"
+        "  case QJS_AOT_INTR_SQRT: r = sqrt(a.d); break;\n"
+        "  case QJS_AOT_INTR_SIN: r = sin(a.d); break;\n"
+        "  case QJS_AOT_INTR_COS: r = cos(a.d); break;\n"
+        "  case QJS_AOT_INTR_ABS: r = fabs(a.d); break;\n"
+        "  case QJS_AOT_INTR_FLOOR:\n"
+        "    if (a.k == 1) { *out = JS_MKVAL(JS_TAG_INT, a.i); return 1; }\n"
+        "    r = floor(a.d); break;\n"
+        "  case QJS_AOT_INTR_CEIL:\n"
+        "    if (a.k == 1) { *out = JS_MKVAL(JS_TAG_INT, a.i); return 1; }\n"
+        "    r = ceil(a.d); break;\n"
+        "  case QJS_AOT_INTR_ROUND:\n"
+        "    if (a.k == 1) { *out = JS_MKVAL(JS_TAG_INT, a.i); return 1; }\n"
+        "    r = q2_math_round(a.d); break;\n"
+        "  case QJS_AOT_INTR_MIN:\n"
+        "  case QJS_AOT_INTR_MAX: {\n"
+        "    int mx = id == QJS_AOT_INTR_MAX;\n"
+        "    if (b.k != 1 && b.k != 2) return 0;\n"
+        "    if (a.k == 1 && b.k == 1) {\n"
+        "      int x = mx ? (a.i > b.i ? a.i : b.i) : (a.i < b.i ? a.i : b.i);\n"
+        "      *out = JS_MKVAL(JS_TAG_INT, x);\n"
+        "      return 1;\n"
+        "    }\n"
+        "    if (a.d != a.d) r = a.d;\n"
+        "    else if (b.d != b.d) r = b.d;\n"
+        "    else if (a.d == 0 && b.d == 0) {\n"
+        "      union { double d; uint64_t u; } x, y;\n"
+        "      x.d = a.d; y.d = b.d;\n"
+        "      if (mx) x.u &= y.u; else x.u |= y.u;\n"
+        "      r = x.d;\n"
+        "    } else if (mx) r = a.d < b.d ? b.d : a.d;\n"
+        "    else r = a.d < b.d ? a.d : b.d;\n"
+        "    break;\n"
+        "  }\n"
+        "  case QJS_AOT_INTR_PARSEINT:\n"
+        /* radix absent, 0 or 10; an int is its own parse, an integral double
+           below 2^53 prints as that integer (and -0 prints as 0). */
+        "    if (b.k != 3 && !(b.k == 1 && (b.i == 0 || b.i == 10))) return 0;\n"
+        "    if (a.k == 1) { *out = JS_MKVAL(JS_TAG_INT, a.i); return 1; }\n"
+        "    if (!(fabs(a.d) < 9007199254740992.0) || a.d != floor(a.d)) return 0;\n"
+        "    r = a.d + 0.0; break;\n"
+        "  default: return 0;\n"
+        "  }\n"
+        "  *out = E2_BOX_F64(r);\n"
+        "  return 1;\n"
         "}\n\n"
         /* A numeric element read: the profile saw only ints (or only doubles)
            at this pc, so a class check, a bounds check and the load are enough;
@@ -5616,6 +5793,17 @@ int qjsaot_driver_main(int argc, char **argv) {
             hex);
     }
     fprintf(f, "\n");
+    /* The inline forms of the selected functions that have a native entry, before
+       any caller. */
+    for (i = 0; g_inl_eb && i < nfuncs; i++) {
+      char hex[33];
+      if (!sel[i] || !eb[i].buf || !g_inl_eb[i].buf ||
+          !qjs_aot_has_native_entry(i))
+        continue;
+      hex16(funcs[i].digest, hex);
+      fprintf(f, "#define Q2_INLINE_%s 1\n", hex);
+      fwrite(g_inl_eb[i].buf, 1, g_inl_eb[i].len, f);
+    }
     /* The leaves of the selected functions, before any caller. */
     for (i = 0; g_pure_eb && i < nfuncs; i++) {
       if (!sel[i] || !eb[i].buf || !g_pure_eb[i].buf) continue;

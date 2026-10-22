@@ -134,8 +134,7 @@ typedef struct E2Facts {
    emits would otherwise leave the flag set for the functions emitted after the
    first dump, and the body would be emitted with facts that assume misses exit
    while its code continues on a miss. */
-int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit);
-void e2_facts_free(E2Facts *f);
+int e2_facts_run(const Q2Func *fn, E2Facts *out, int grouped_exit);void e2_facts_free(E2Facts *f);
 
 /* The group a site index belongs to, or E2_GROUP_NONE. */
 int e2_facts_site_group(const E2Facts *f, int site);
@@ -217,6 +216,10 @@ typedef struct E2Types {
    forwarding decisions. Returns 0, or -1 on allocation failure. */
 int e2_types_run(const Q2Func *fn, const E2Facts *facts, E2Types *out);
 void e2_types_free(E2Types *t);
+/* Facts then types, with the intrinsic sites whose arguments are not numbers
+   dropped (e2_ops.c). 0 on success; on failure nothing is left allocated. */
+int e2_analyze(const Q2Func *fn, E2Facts *facts, E2Types *types);
+
 
 /* Whether the value is held unboxed (i32, f64 or bool). */
 int e2_types_typed(const E2Types *t, Q2ValueId v);

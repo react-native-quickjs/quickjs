@@ -1231,11 +1231,7 @@ int e2_analysis_dump(
   int nroots = 0, caproots = 0;
   int nfwd = 0, nskip = 0, naccess = 0;
 
-  if (e2_facts_run(fn, &facts, 1) < 0) return -1;
-  if (e2_types_run(fn, &facts, &types) < 0) {
-    e2_facts_free(&facts);
-    return -1;
-  }
+  if (e2_analyze(fn, &facts, &types) < 0) return -1;
 
   {
     /* The header names the function the way the E2 report does: `name

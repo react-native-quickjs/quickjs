@@ -669,6 +669,15 @@ static int transfer(const Q2Func *fn, E2Facts *f, int insn, FactSet *s,
     f->miss_exits[insn] = (uint8_t)grouped;
   }
 
+  /* An intrinsic call (a builtin on numbers) cannot run JS: with the exit
+     fallback it is no safepoint, so the facts survive it. Without
+     `grouped_exit` its miss would continue into the real call. */
+  if (kind == E2_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
+      e2_intrinsic_lowerable(fn, in)) {
+    kind = E2_SK_NOJS;
+    f->miss_exits[insn] = 1;
+  }
+
   /* 2. A guarded access of a receiver whose shape is known skips its tag and
      shape test; either way the shape is known afterwards. */
   if (kind != E2_SK_SAFE) {

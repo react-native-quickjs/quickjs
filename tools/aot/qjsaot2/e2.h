@@ -29,6 +29,13 @@ int q2_old_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 /* Called once per function by the unit builder: routes the function to the E2
    emitter when `--emit2` selects it, else to the old one. */
 int e2_emit_body_if_on(FILE *f, const JSAotGenFunc *g, char hex[33]);
+/* The inline form `e2i_HEX` of a small leaf (card E15), or 0 with `why`. */
+int e2_emit_inline_func(
+    FILE *f, const JSAotGenFunc *g, char hex[33], char *why, size_t whyn);
+struct Q2Func;
+int e2_emit_inline_body(
+    FILE *f, const struct Q2Func *fn, char hex[33], char *why, size_t whyn);
+void e2_report_inline(const char *hex, int ok, const char *why);
 
 /* The generic body (D2), the speculative body (D3) and the native entry. The
    generic body is emitted first, and the speculative one forwards to it until
@@ -45,6 +52,21 @@ int e2_has_call_site(const struct Q2Func *fn);
 void e2_emit_frameless_exit_fn(FILE *f, const struct Q2Func *fn, char hex[33]);
 void e2_emit_frameless_forward(FILE *f, const struct Q2Func *fn, char hex[33]);
 int e2_fl_was_chosen(void);
+
+/* The builtins a unit lowers inline (e2_intrinsics.c). */
+void e2_report_intrinsic(const char *hex, int pc, int id, int argc, int ok);
+const char *e2_intrinsic_name(int id);
+int e2_intrinsic_id_for_key(const char *key);
+int e2_intrinsic_site(const uint8_t digest[16], int pc);
+int e2_intrinsic_argc_ok(int id, int argc);
+int e2_intrinsic_pure(int id);
+int e2_intrinsic_magic(int id);
+struct Q2Func;
+struct Q2Insn;
+int e2_intrinsic_lowerable(const struct Q2Func *fn, const struct Q2Insn *in);
+int qjs_aot_prof_callees(
+    const uint8_t dg[16], int pc, int *n, char hex[4][33], int kind[4],
+    unsigned long long hits[4]);
 const char *e2_fl_why_not(void);
 
 /* The registers live immediately BEFORE an instruction: live-out minus the

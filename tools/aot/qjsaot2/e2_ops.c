@@ -19,6 +19,7 @@
  * at the pc the handler returned. That is what makes this body cover every op
  * without special cases, and it is why the body is small.
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,17 @@
 #include "e2.h"
 #include "ir.h"
 #include "e2_analysis.h"
+
+/* Inline mode (card E15 part 1): the frameless body of a small leaf, emitted as
+   `static inline int e2i_HEX(...)` for a compiled caller to run in place. It is the
+   frameless emission with three changes: every exit is `return 0` (nothing has
+   happened, so the caller's native call is correct), the return stores the result
+   through `*out`, and no exit may follow a store on any path (checked on the
+   text). Implies g_e2_fl. */
+static int g_e2_inl;
+/* Set when a body emitted in inline mode needs more than inline mode can give. */
+static char g_e2_inl_why[160];
+
 
 /* The number of PIC sites the function uses: one more than the largest site
    index. The per-site stride in the PIC table is this count, because site `k`'s
@@ -74,6 +86,7 @@ static void note_opcall(const Q2Func *fn, const Q2Insn *in, int missarm) {
 int qjs_aot_prof_callees(
     const uint8_t dg[16], int pc, int *n, char hex[4][33], int kind[4],
     unsigned long long hits[4]);
+int qjs_aot_inline_has(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
 int qjs_aot_unit_argc(const char hex[33]);
@@ -1155,6 +1168,17 @@ static int emit_native_post(
    register borrows under DRC, so the caller gets its own reference (q2_dup, the
    inline count), and the slot is cleared. */
 static void e2_emit_return(FILE *f, int off) {
+  if (g_e2_inl) {
+    fprintf(
+        f,
+        "    { JSValue _rv = AOT_REG(fr, %d);\n"
+        "#if QJS_DRC\n"
+        "      q2_dup(_rv);\n"
+        "#endif\n"
+        "      *out = _rv; return 1; }\n",
+        off);
+    return;
+  }
   fprintf(
       f,
       "    { JSValue _rv = AOT_REG(fr, %d);\n"
@@ -2137,6 +2161,7 @@ static int g_e2_n_exit, g_e2_n_handoff;
    `g_e2_quiet` marks the trial emission whose output is thrown away: it must not
    print, count or take a sweep site. */
 static int g_e2_fl;
+
 static char g_e2_fl_block[160];
 /* The reason the LAST function was not frameless, for the entry report line. */
 static char g_e2_fl_why[160];
@@ -2937,6 +2962,10 @@ static void e2_emit_exit_log(
    registers travel as (offset, value) pairs and `aot_nx_` builds the frame. */
 static void e2_emit_generic_call(
     FILE *f, char hex[33], int pc, int nlv, const char *indent) {
+  if (g_e2_inl) {
+    fprintf(f, "%sreturn 0;\n", indent);
+    return;
+  }
   if (!g_e2_fl) {
     fprintf(f, "%sreturn aot_g_%s(ctx, f, fr, %d);\n", indent, hex, pc);
     return;
@@ -2973,6 +3002,15 @@ static void e2_emit_exit(
         stderr, "e2: exit names function %d inside function %d's body\n", fi,
         g_e2_fi);
     abort();
+  }
+  if (g_e2_inl) {
+    /* Inline: nothing to sync, the call has not run. */
+    fprintf(
+        f, "    { %s(%d); return 0; }\n",
+        handoff ? "E2_HANDOFF_NOTE" : "E2_EXIT_NOTE", fi);
+    free(loff);
+    free(lex);
+    return;
   }
   fprintf(f, "    {\n");
   if (live_set != NULL) {
@@ -4102,6 +4140,224 @@ static int emit_typed_elem_write(
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
+  if (g_e2_inl) fprintf(f, "    /*E2_STORE*/\n");
+  return 1;
+}
+
+static int emit_hit_result(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId dv,
+    int dreg, const char *raw);
+
+/* Negative controls (never set in a real build): "off" lowers no intrinsic (the
+   as-built baseline of a diff); "noident" drops the identity
+   check, so a replaced builtin is called as if it were the original; "cont" makes
+   the miss CONTINUE into the real call while the facts still treat the site as
+   no safepoint, so a `valueOf` that changes the world leaves stale facts. Each
+   makes its test case FAIL, which is what proves the case tests the property. */
+static const char *e2_intr_control(void) {
+  static const char *v;
+  static int init;
+  if (!init) {
+    v = getenv("QJS_AOT_E2_INTR_CONTROL");
+    init = 1;
+  }
+  return v;
+}
+
+/* ---- intrinsic calls (card E15) ------------------------------------------
+
+   A call whose profiled callee is one engine builtin (Math.floor, parseInt, ...)
+   with numeric arguments cannot run JS, allocate or write memory, so in the
+   speculative body it is NOT a safepoint: the callee is checked against the
+   engine's own function pointer, the arguments are checked to be numbers, and the
+   result is computed inline. Anything else -- a replaced builtin, a non-number
+   argument (a `valueOf` could run) -- is an EXIT before the call (form (a) of the
+   safepoint split): the generic body redoes the call, which is the safepoint it
+   always was. The facts pass and the emitter share ONE predicate, so a site the
+   facts treat as no safepoint is never given the op-call wrapper. */
+static const uint8_t *g_e2_intr_mask;
+
+int e2_intrinsic_lowerable(const Q2Func *fn, const Q2Insn *in) {
+  int id;
+  const char *ctl = e2_intr_control();
+  if (ctl != NULL && strcmp(ctl, "off") == 0) return 0;
+  if (g_e2_intr_mask != NULL && !g_e2_intr_mask[in - fn->insns]) return 0;
+  if (!call_site_shaped(fn, in)) return 0;
+  if (call_callee_off(in) < 0) return 0;
+  id = e2_intrinsic_site(fn->g->digest, in->next);
+  if (id < 0 || !e2_intrinsic_pure(id) || !e2_intrinsic_argc_ok(id, in->win_n))
+    return 0;
+  if (dest_off(fn, in) / 16 >= fn->nregs) return 0;
+  return 1;
+}
+
+/* The number view of a window register, as a `Q2Num` expression. */
+static void intr_num(
+    char *out, size_t n, const Q2Func *fn, const E2Types *t,
+    const Q2ValueId *cur, int reg) {
+  Q2ValueId v = cur != NULL && reg < fn->nregs ? cur[reg] : Q2_NO_VALUE;
+  if (v == E2_UNDEF) {
+    snprintf(out, n, "(Q2Num){3, 0, 0}");
+  } else if (
+      v != Q2_NO_VALUE && v != E2_INFRAME && v < (Q2ValueId)t->nvalues &&
+      t->lb[v] == E2_LB_I32) {
+    snprintf(out, n, "(Q2Num){1, i%u, (double)i%u}", (unsigned)v, (unsigned)v);
+  } else if (
+      v != Q2_NO_VALUE && v != E2_INFRAME && v < (Q2ValueId)t->nvalues &&
+      t->lb[v] == E2_LB_F64) {
+    snprintf(out, n, "(Q2Num){2, 0, d%u}", (unsigned)v);
+  } else if (
+      v != Q2_NO_VALUE && v != E2_INFRAME && v < (Q2ValueId)t->nvalues &&
+      t->lb[v] == E2_LB_TAG) {
+    snprintf(out, n, "q2_numv(v%u)", (unsigned)v);
+  } else if (
+      v != Q2_NO_VALUE && v != E2_INFRAME && v < (Q2ValueId)t->nvalues) {
+    /* a bool or an unplaced value: never a number */
+    snprintf(out, n, "(Q2Num){0, 0, 0}");
+  } else {
+    snprintf(out, n, "q2_numv(AOT_REG(fr, %d))", reg * 16);
+  }
+}
+
+static int g_e2_intr_cont;
+static int emit_typed_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b);
+
+/* Whether every argument of the intrinsic site is a number by the analysis: an i32
+   or f64 value (parseInt's radix: absent or the constant 0 or 10). A site whose
+   argument is not would leave on every execution, so it keeps the call. */
+static int intr_args_numeric(const Q2Func *fn, const Q2Insn *in, const E2Types *t) {
+  int id = e2_intrinsic_site(fn->g->digest, in->next), k, na = in->win_n;
+  if (in->win_val == NULL) return 0;
+  for (k = 0; k < na; k++) {
+    Q2ValueId v = in->win_val[k];
+    if (v == Q2_NO_VALUE || v >= (Q2ValueId)t->nvalues) return 0;
+    if (id == QJS_AOT_INTR_PARSEINT && k == 1) {
+      const Q2Value *rv = &fn->values[v];
+      if (!rv->is_const || rv->con_kind != Q2_CON_INT ||
+          (rv->con != 0 && rv->con != 10))
+        return 0;
+      continue;
+    }
+    if (t->lb[v] != E2_LB_I32 && t->lb[v] != E2_LB_F64) return 0;
+  }
+  return 1;
+}
+
+/* The facts and the types of one function. An intrinsic site is no safepoint only
+   when its arguments are numbers, which the types decide and the facts feed; so the
+   sites start optimistic and the ones whose arguments turn out not to be numbers
+   are dropped until nothing changes (a site only ever leaves the set, so it ends). */
+int e2_analyze(const Q2Func *fn, E2Facts *facts, E2Types *types) {
+  uint8_t *mask = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  int i, rounds, rc = -1;
+  if (mask == NULL) return -1;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    g_e2_intr_mask = NULL;
+    if (in->op == Q2_OP_CALL && e2_intrinsic_lowerable(fn, in)) mask[i] = 1;
+  }
+  for (rounds = 0; rounds < 8; rounds++) {
+    int changed = 0;
+    g_e2_intr_mask = mask;
+    if (e2_facts_run(fn, facts, 1) < 0) goto done;
+    if (e2_types_run(fn, facts, types) < 0) {
+      e2_facts_free(facts);
+      goto done;
+    }
+    for (i = 0; i < fn->ninsns; i++) {
+      if (!mask[i] || intr_args_numeric(fn, &fn->insns[i], types)) continue;
+      mask[i] = 0;
+      changed = 1;
+    }
+    if (!changed) {
+      rc = 0;
+      goto done;
+    }
+    e2_facts_free(facts);
+    e2_types_free(types);
+  }
+done:
+  g_e2_intr_mask = NULL;
+  free(mask);
+  return rc;
+}
+
+static int emit_intrinsic_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const E2Types *t,
+    Q2ValueId *cur, char hex[33], int fi, int b) {
+  const char *ctl = e2_intr_control();
+  int id = e2_intrinsic_site(fn->g->digest, in->next);
+  int cc = call_callee_off(in), off = dest_off(fn, in), dreg = off / 16;
+  int na = in->win_n, magic = e2_intrinsic_magic(id);
+  Q2ValueId dv = in->def[0];
+  Q2ValueId cv =
+      cur != NULL && cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+  char cexp[64], a0[128], a1[128];
+
+  /* ---- every check, before any output ---- */
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (cv != Q2_NO_VALUE && cv != E2_UNDEF && cv != E2_INFRAME &&
+      cv < (Q2ValueId)t->nvalues && t->lb[cv] == E2_LB_TAG)
+    snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+  else if (cv == E2_UNDEF || (cv != Q2_NO_VALUE && cv != E2_INFRAME))
+    snprintf(cexp, sizeof(cexp), "JS_UNDEFINED"); /* not an object: always exits */
+  else
+    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+  if (g_e2_fl && !g_e2_inl) e2_fl_block("an intrinsic call", in);
+  intr_num(a0, sizeof(a0), fn, t, cur, in->win_reg);
+  if (na >= 2)
+    intr_num(a1, sizeof(a1), fn, t, cur, in->win_reg + 1);
+  else
+    snprintf(a1, sizeof(a1), "(Q2Num){3, 0, 0}");
+
+  /* ---- output ---- */
+  e2_note_stub(
+      g_e2_vx, g_e2_vx_cur, g_e2_vx_blk, &g_e2_vx_n, in->pc, cur, NULL);
+  e2_note_tag('v', in->pc, cexp);
+  e2_sweep_guard(f, "vx", in->pc);
+  if (t->lb[dv] != E2_LB_TAG && t->lb[dv] != E2_LB_BOT)
+    e2_note_stub(
+        g_e2_dx, g_e2_dx_cur, g_e2_dx_blk, &g_e2_dx_n, in->next, cur, in);
+  fprintf(f, "    { JSValue _o;\n");
+  if (ctl != NULL && strcmp(ctl, "cont") == 0) {
+    /* control: a miss falls through to the real call below */
+    fprintf(
+        f,
+        "      if (q2_is_intr(%s, %d, %d) && q2_intr(%d, %s, %s, &_o)) {\n",
+        cexp, id, magic, id, a0, a1);
+    if (t->lb[dv] == E2_LB_BOT)
+      fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
+    else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o"))
+      abort();
+    fprintf(f, "        goto cd_%d;\n      }\n    }\n", in->pc);
+    g_e2_intr_cont = 1;
+    emit_typed_call(f, fn, in, t, cur, 1, hex, fi, b);
+    g_e2_intr_cont = 0;
+    g_e2_miss_exit_seen = 1;
+    return 1;
+  }
+  if (ctl != NULL && strcmp(ctl, "noident") == 0)
+    fprintf(f, "      (void)q2_is_intr;\n");
+  else
+    fprintf(
+        f,
+        "      if (__builtin_expect(!q2_is_intr(%s, %d, %d), 0)) goto vx_%d;\n",
+        cexp, id, magic, in->pc);
+  fprintf(
+      f,
+      "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o), 0)) goto vx_%d;\n",
+      id, a0, a1, in->pc);
+  if (t->lb[dv] == E2_LB_BOT) {
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
+  } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
+    fprintf(stderr, "e2: intrinsic at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  g_e2_miss_exit_seen = 1;
   return 1;
 }
 
@@ -4129,6 +4385,14 @@ static int emit_typed_call(
 
   /* ---- every check, before any output ---- */
   if (!have_types || t == NULL) return 0;
+  /* The facts classed this site as an intrinsic with an exit for a miss. */
+  if (e2_must_exit(fn, in) && !g_e2_intr_cont)
+    return emit_intrinsic_call(f, fn, in, t, cur, hex, fi, b);
+  /* An inline body makes no call but an intrinsic. */
+  if (g_e2_inl) {
+    e2_fl_block("a call", in);
+    return 0;
+  }
   if (e2_nocall_on()) return 0;
   if (!call_site_shaped(fn, in)) return 0;
   if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits))
@@ -4221,14 +4485,33 @@ static int emit_typed_call(
     if (qjs_aot_light_need(callee[k]) <= 0) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
+    /* Negative control: "noident" tests only that the callee is an object, so a
+       replaced function runs the compiled callee's body. */
+    if (getenv("QJS_AOT_E2_INL_CONTROL") != NULL &&
+        strcmp(getenv("QJS_AOT_E2_INL_CONTROL"), "noident") == 0)
+      fprintf(
+          f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n", cexp);
+    else
     fprintf(
         f,
         "    if (__builtin_expect(q2_call_entry(%s, "
         "(const void *)aot_f_%s), 1)) {\n",
         cexp, callee[k]);
+    fprintf(f, "        JSValue _o;\n");
+    /* The callee's inline body first: it runs the callee in place when every
+       check passes and has changed nothing when one does not, so the native call
+       below is then correct. */
+    if (qjs_aot_inline_has(callee[k]))
+      fprintf(
+          f,
+          "#ifdef Q2_INLINE_%s\n"
+          "        if (!e2i_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "                    &AOT_REG(fr, %d), %d, &_o))\n"
+          "#endif\n",
+          callee[k], callee[k], cexp, recv, w, na);
     fprintf(
         f,
-        "        JSValue _o = aot_n_%s(ctx, f,\n"
+        "        _o = aot_n_%s(ctx, f,\n"
         "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "            &AOT_REG(fr, %d), %d);\n",
         callee[k], cexp, recv, w, na);
@@ -4961,6 +5244,7 @@ static int emit_group_write(
         boxed);
   }
   fprintf(f, "    }\n");
+  if (g_e2_inl) fprintf(f, "    /*E2_STORE*/\n");
   g_e2_miss_exit_seen = 1;
   return 1;
 }
@@ -5176,6 +5460,7 @@ static int emit_typed_var_ref_store(
         "JS_VALUE_HAS_REF_COUNT(*_p), 0)) goto vx_%d;\n"
         "      *_p = _nv; }\n",
         slot, box, in->pc);
+  if (g_e2_inl) fprintf(f, "    /*E2_STORE*/\n");
     return 1;
   }
   /* The cell's OLD value is not forwarded: a later read of the cell is a fresh load
@@ -6421,7 +6706,10 @@ static int emit_typed_return(
   (void)have_types;
   if (in->rop == ROP_return_undefined) {
     if (role == NULL || role->control != E2_CF_RETURN) return 0;
-    fprintf(f, "    return JS_UNDEFINED;\n");
+    if (g_e2_inl)
+      fprintf(f, "    { *out = JS_UNDEFINED; return 1; }\n");
+    else
+      fprintf(f, "    return JS_UNDEFINED;\n");
     return 1;
   }
   if (in->rop != ROP_return) return 0;
@@ -6625,19 +6913,16 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
        which treats BOT as TAG. The facts run in the grouped-exit mode: a grouped
        field access is no safepoint because its miss is an exit, and the field
        emitters emit it that way (a check in the dispatcher enforces it). */
-    if (e2_facts_run(fn, &facts, 1) == 0) {
-      if (e2_types_run(fn, &facts, &types) == 0) {
-        have_types = 1;
-        g_e2_types = &types;
-        g_e2_facts = &facts;
-      } else {
-        /* CLEAR the global when this function has no analysis. Leaving the previous
-           function's types in place made e2_rep_prefix name locals with ANOTHER
-           function's reps, so a `dec` wrote an int into what the emitter thought was
-           a TAG local and the unit failed to compile (measured: crypto.js). */
-        g_e2_types = NULL;
-        e2_facts_free(&facts);
-      }
+    if (e2_analyze(fn, &facts, &types) == 0) {
+      have_types = 1;
+      g_e2_types = &types;
+      g_e2_facts = &facts;
+    } else {
+      /* CLEAR the global when this function has no analysis. Leaving the previous
+         function's types in place made e2_rep_prefix name locals with ANOTHER
+         function's reps, so a `dec` wrote an int into what the emitter thought was
+         a TAG local and the unit failed to compile (measured: crypto.js). */
+      g_e2_types = NULL;
     }
   }
   if (!have_types) {
@@ -6665,7 +6950,9 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   }
   /* What the body returns through to enter the generic body at pc 0 (a refusal at
      entry, or speculation switched off). */
-  if (g_e2_fl)
+  if (g_e2_inl)
+    snprintf(gen0, sizeof(gen0), "0");
+  else if (g_e2_fl)
     snprintf(
         gen0, sizeof(gen0),
         "aot_nx_%s(ctx_in, caller_f, co, this_obj, argv, "
@@ -6676,12 +6963,31 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   snprintf(gene, sizeof(gene), "aot_g_%s(ctx, f, fr, entry_pc)", hex);
   if (g_e2_fl) {
     /* The exit function comes first: the body names it. */
-    e2_emit_frameless_exit_fn(out != NULL ? out : f, fn, hex);
+    if (!g_e2_inl) e2_emit_frameless_exit_fn(out != NULL ? out : f, fn, hex);
     fprintf(
         f,
         "#define q2_arg_buf(f_) (argv)\n"
         "#define qjs_aot_get_var_ref(f_, i_) q2_vref_get(co, (i_))\n"
-        "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(co, (i_))\n"
+        "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(co, (i_))\n");
+    if (g_e2_inl)
+      fprintf(
+          f,
+          "static inline __attribute__((always_inline)) int e2i_%s(JSContext "
+          "*ctx_in, JSRegRun *caller_f,\n"
+          "                               JSObject *co, JSValue this_obj,\n"
+          "                               JSValue *argv, int argc, JSValue *out)\n"
+          "{\n"
+          "    _Static_assert(QJS_DRC, \"an inline body needs deferred counting\");\n"
+          "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
+          "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+          "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+          "    JSValue fr[%d];\n"
+          "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
+          hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1,
+          fn->g->reg_count > 0 ? fn->g->reg_count : 1);
+    else
+    fprintf(
+        f,
         "E2_TEXT %sJSValue aot_n_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
         "                               JSObject *co, JSValue this_obj,\n"
         "                               JSValue *argv, int argc)\n"
@@ -7259,7 +7565,7 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         f,
         "#undef q2_arg_buf\n#undef qjs_aot_get_var_ref\n"
         "#undef qjs_aot_var_ref_ptr\n");
-  if (g_e2_fl)
+  if (g_e2_fl && !g_e2_inl)
     fprintf(
         f,
         "static void __attribute__((constructor)) e2_fl_reg_%s(void)\n"
@@ -7310,8 +7616,8 @@ static int e2_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       free(mbuf);
       f = out;
     }
-    if (g_e2_fl) e2_emit_frameless_forward(f, fn, hex);
-    if (!g_e2_quiet) e2_report_spec(hex, vals, tiers, checks, lines, bytes);
+    if (g_e2_fl && !g_e2_inl) e2_emit_frameless_forward(f, fn, hex);
+    if (!g_e2_quiet && !g_e2_inl) e2_report_spec(hex, vals, tiers, checks, lines, bytes);
   }
   e2_facts_free(&facts);
   g_e2_facts = NULL;
@@ -7456,3 +7762,146 @@ int e2_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
 /* Whether the body just emitted is a frameless one, and why not otherwise. */
 int e2_fl_was_chosen(void) { return g_e2_fl_chosen; }
 const char *e2_fl_why_not(void) { return g_e2_fl_why; }
+
+/* ---- inline bodies (card E15 part 1) ---------------------------------------
+
+   A small leaf, emitted as `e2i_HEX` for a compiled caller to run in place of the
+   call. See g_e2_inl. The candidate rule is D15's: `light_ok`, no loop, at most 40
+   instructions, no call but an intrinsic, no op that needs the engine's handler (the
+   frameless emission blocks on any), every value typed by its own speculative body.
+   The checks of every block come before any store, which the text is checked for. */
+
+/* The first heap store in the emitted text, then any exit after it. An exit is a
+   `goto` to an exit stub; after a store the callee has changed the world and the
+   caller's native call would repeat the store. Returns 1 when the text is fine. */
+static int e2_inl_text_ok(const char *txt, size_t n, char *why, size_t whyn) {
+  static const char *const ex[] = {"goto vx_", "goto dx_", "goto ax_",
+                                   "goto ox_", "goto hx_"};
+  const char *st = NULL, *p;
+  size_t i, k;
+  char *copy = malloc(n + 1);
+  if (copy == NULL) return 0;
+  memcpy(copy, txt, n);
+  copy[n] = 0;
+  st = strstr(copy, "/*E2_STORE*/");
+  /* Negative control: "nostore" skips this check, so a callee that stores and then
+     exits is inlined, and the native call repeats the store. */
+  if (getenv("QJS_AOT_E2_INL_CONTROL") != NULL &&
+      strcmp(getenv("QJS_AOT_E2_INL_CONTROL"), "nostore") == 0)
+    st = NULL;
+  if (st != NULL)
+    for (k = 0; k < sizeof(ex) / sizeof(ex[0]); k++)
+      if (strstr(st, ex[k]) != NULL) {
+        snprintf(why, whyn, "an exit follows a store");
+        free(copy);
+        return 0;
+      }
+  /* Every `return` is the exit (`return 0;`) or the result (`return 1;`). */
+  for (p = copy; (p = strstr(p, "return")) != NULL; p += 6) {
+    const char *q = p + 6;
+    if (p > copy && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
+    if (isalnum((unsigned char)*q) || *q == '_') continue;
+    while (*q == ' ') q++;
+    if (strncmp(q, "0;", 2) != 0 && strncmp(q, "1;", 2) != 0) {
+      snprintf(why, whyn, "a return that is not 0 or 1");
+      free(copy);
+      return 0;
+    }
+  }
+  (void)i;
+  free(copy);
+  return 1;
+}
+
+int e2_emit_inline_body(
+    FILE *f, const Q2Func *fn, char hex[33], char *why, size_t whyn) {
+  const JSAotGenFunc *g = fn->g;
+  static const char *const alloc_ops[] = {
+      "new_object",   "object_template", "array_const",  "array_from",
+      "make_closure", "define_class",    "define_class_computed",
+      "regexp",       "special_object",  "to_object",    "object_fill"};
+  char *mb = NULL;
+  size_t ml = 0;
+  FILE *m;
+  int i, b, si, rc;
+
+  /* QJS_AOT_E2_NOINLINE=1 emits no inline body: the baseline of a comparison. */
+  if (getenv("QJS_AOT_E2_NOINLINE") != NULL &&
+      getenv("QJS_AOT_E2_NOINLINE")[0] == '1') {
+    snprintf(why, whyn, "disabled");
+    return 0;
+  }
+  if (!g->light_ok) {
+    snprintf(why, whyn, "not light");
+    return 0;
+  }
+  if (g->light_need > 16 * 1024) {
+    snprintf(why, whyn, "frame over 16 KB");
+    return 0;
+  }
+  if (g->light_var_count > 0) {
+    snprintf(why, whyn, "variable area");
+    return 0;
+  }
+  if (g->func_kind != E2_FUNC_NORMAL) {
+    snprintf(why, whyn, "not a plain function");
+    return 0;
+  }
+  if (fn->ninsns > 40) {
+    snprintf(why, whyn, "%d instructions", fn->ninsns);
+    return 0;
+  }
+  for (b = 0; b < fn->nblocks; b++)
+    for (si = 0; si < fn->blocks[b].nsucc && si < 2; si++) {
+      int sb = fn->blocks[b].succ_block[si];
+      if (sb >= 0 && sb < fn->nblocks && q2_is_back_edge(fn, b, sb)) {
+        snprintf(why, whyn, "loop");
+        return 0;
+      }
+    }
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    char nm[64];
+    size_t k;
+    if (e2_is_call_family(in->rop) &&
+        !(in->op == Q2_OP_CALL && e2_intrinsic_site(g->digest, in->next) >= 0)) {
+      snprintf(why, whyn, "a call at pc %d", in->pc);
+      return 0;
+    }
+    e2_rop_name(in->rop, nm, sizeof(nm));
+    for (k = 0; k < sizeof(alloc_ops) / sizeof(alloc_ops[0]); k++)
+      if (strcmp(nm, alloc_ops[k]) == 0) {
+        snprintf(why, whyn, "allocates %s@%d", nm, in->pc);
+        return 0;
+      }
+  }
+  m = open_memstream(&mb, &ml);
+  if (m == NULL) {
+    snprintf(why, whyn, "out of memory");
+    return 0;
+  }
+  free(g_e2_loop_blk);
+  g_e2_loop_blk = NULL;
+  g_e2_fl_longloop = 0;
+  g_e2_fl = 1;
+  g_e2_inl = 1;
+  g_e2_quiet = 1;
+  g_e2_fl_block[0] = 0;
+  rc = e2_emit_spec_body_pass(m, fn, hex);
+  fclose(m);
+  g_e2_fl = 0;
+  g_e2_inl = 0;
+  g_e2_quiet = 0;
+  if (rc != 0 || g_e2_fl_block[0] != 0) {
+    snprintf(why, whyn, "%s", g_e2_fl_block[0] ? g_e2_fl_block : "no analysis");
+    free(mb);
+    return 0;
+  }
+  if (!e2_inl_text_ok(mb, ml, why, whyn)) {
+    free(mb);
+    return 0;
+  }
+  fwrite(mb, 1, ml, f);
+  free(mb);
+  return 1;
+}

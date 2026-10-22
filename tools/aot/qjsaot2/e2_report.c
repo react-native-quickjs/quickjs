@@ -97,6 +97,19 @@ void e2_report_entry(const JSAotGenFunc *g, const char *hex, int frameless,
             e2_only_hex[0] ? " scope" : "");
 }
 
+/* A call site the profile marks as an intrinsic site (e2_intrinsics.c). */
+void e2_report_intrinsic(const char *hex, int pc, int id, int argc, int ok) {
+  if (e2_rep == NULL) return;
+  fprintf(e2_rep, "e2 intrinsic hex=%s pc=%d id=%d name=%s argc=%d lowerable=%d\n",
+          hex, pc, id, e2_intrinsic_name(id), argc, ok);
+}
+
+void e2_report_inline(const char *hex, int ok, const char *why) {
+  if (e2_rep == NULL) return;
+  fprintf(e2_rep, "e2 inline hex=%s %s reason=%s\n", hex, ok ? "yes" : "no",
+          why != NULL && why[0] ? why : "-");
+}
+
 void e2_report_spec(
     const char *hex, const int vals[4], const int tiers[4], const int checks[9],
     long lines, long bytes) {

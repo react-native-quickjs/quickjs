@@ -415,11 +415,52 @@ int e2_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   } else if (rc == 0) {
     e2_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
   }
+  /* The intrinsic sites, for the report: Batch 1 lowers them. */
+  if (rc == 0) {
+    int ii;
+    for (ii = 0; ii < fn.ninsns; ii++) {
+      const Q2Insn *in = &fn.insns[ii];
+      int id;
+      if (in->rop != ROP_call && in->rop != ROP_call_method) continue;
+      id = e2_intrinsic_site(g->digest, in->next);
+      if (id >= 0)
+        e2_report_intrinsic(
+            hex, in->pc, id, in->win_n,
+            e2_intrinsic_argc_ok(id, in->win_n) && e2_intrinsic_pure(id));
+    }
+  }
   ninsns = fn.ninsns;
   q2_free(&fn);
   if (rc != 0) return rc;
   if (g->light_ok) qjs_aot_note_native_entry(qjs_aot_cur_func_idx());
   return ninsns;
+}
+
+/* The inline form of a function (card E15): `e2i_HEX` written to `f` when the function
+   is a candidate, else 0 with `why` set. Called once per function before any body
+   is emitted, so a caller's emission can ask whether its callee has one. */
+int e2_emit_inline_func(
+    FILE *f, const JSAotGenFunc *g, char hex[33], char *why, size_t whyn) {
+  Q2Func fn;
+  char msg[256];
+  int rc;
+  if (!e2_in_scope(hex)) {
+    snprintf(why, whyn, "not in scope");
+    return 0;
+  }
+  if (q2_build(g, &fn) < 0) {
+    q2_free(&fn);
+    snprintf(why, whyn, "the IR could not be built");
+    return 0;
+  }
+  if (q2_infer(&fn) < 0 || q2_verify(&fn, msg, sizeof(msg)) < 0) {
+    q2_free(&fn);
+    snprintf(why, whyn, "the IR did not verify");
+    return 0;
+  }
+  rc = e2_emit_inline_body(f, &fn, hex, why, whyn);
+  q2_free(&fn);
+  return rc;
 }
 
 /* The unit builder's hook: called once per function, with the option state
