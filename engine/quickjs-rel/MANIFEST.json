@@ -1363,12 +1363,16 @@
       "sha256": "bbba5eaf617a87887ad36197f41d39e4bc4a32ab0f24cf5d1d93319d62b47d22"
     },
     {
+      "name": "0347-forin-array-keys.patch",
+      "sha256": "3a3dd050504da7be132e00bd3db6ac271a4249d6448483a0e82a3462292d734b"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "371368492aaccbde3616357acc41855222aa111901ce5ed10d612acd48d232f5",
+    "quickjs.c": "f33b42c9c717086c18595b693817e0b3a9f7778dad6967f7c0c9a56faac343e7",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

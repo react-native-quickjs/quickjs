@@ -1217,6 +1217,9 @@ struct JSContext {
     */
     uint8_t std_array_prototype : 1;
     uint32_t regvm_ta_len_epoch;
+    /* the decimal strings of 0..255, made on first use: a for-in over a small array hands
+       out the same string for the same index instead of formatting one each time */
+    JSValue *small_int_str;
 
     JSShape *array_shape;   /* initial shape for Array objects */
     JSShape *arguments_shape;  /* shape for arguments objects */
@@ -5118,6 +5121,13 @@ void JS_FreeContext(JSContext *ctx)
     if (--JS_REF_COUNT(ctx) > 0)
         return;
     assert(JS_REF_COUNT(ctx) == 0);
+
+    if (ctx->small_int_str) {
+        for (i = 0; i < 256; i++)
+            JS_FreeValue(ctx, ctx->small_int_str[i]);
+        js_free(ctx, ctx->small_int_str);
+        ctx->small_int_str = NULL;
+    }
 
     if (rt->forin_shape) {
         js_free_shape(rt, rt->forin_shape);
@@ -21574,6 +21584,40 @@ static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
+/* The string of an array index (the key a for-in over an array yields). The strings for 0..255
+   are shared. */
+static JSValue js_index_to_string(JSContext *ctx, uint32_t idx)
+{
+    if (idx < 256) {
+        JSValue *tab = ctx->small_int_str;
+        if (unlikely(!tab)) {
+            int i;
+            tab = js_malloc(ctx, sizeof(JSValue) * 256);
+            if (!tab)
+                return JS_EXCEPTION;
+            for (i = 0; i < 256; i++)
+                tab[i] = JS_UNDEFINED;
+            ctx->small_int_str = tab;
+        }
+        if (unlikely(JS_IsUndefined(tab[idx]))) {
+            char buf[4];
+            int n = 0;
+            if (idx >= 100)
+                buf[n++] = '0' + idx / 100;
+            if (idx >= 10)
+                buf[n++] = '0' + idx / 10 % 10;
+            buf[n++] = '0' + idx % 10;
+            tab[idx] = js_new_string8_len(ctx, buf, n);
+            if (JS_IsException(tab[idx])) {
+                tab[idx] = JS_UNDEFINED;
+                return JS_EXCEPTION;
+            }
+        }
+        return js_dup(tab[idx]);
+    }
+    return JS_AtomToValue(ctx, __JS_AtomFromUInt32(idx));
+}
+
 /* enum_obj -> enum_obj value done */
 static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
 {
@@ -21635,6 +21679,14 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
                 goto done;
             prop = __JS_AtomFromUInt32(it->idx);
             it->idx++;
+            if (JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT) {
+                /* a present element of a fast array needs no property lookup */
+                JSObject *ao = JS_VALUE_GET_OBJ(it->obj);
+                if (ao->class_id == JS_CLASS_ARRAY && ao->fast_array &&
+                    it->idx <= (uint32_t)ao->u.array.count &&
+                    !js_array_slot_is_hole(ao->u.array.u.values[it->idx - 1]))
+                    break;
+            }
         } else {
             JSShape *sh = p->shape;
             JSShapeProperty *prs;
@@ -21660,7 +21712,10 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
             break;
     }
     /* return the property */
-    sp[0] = JS_AtomToValue(ctx, prop);
+    sp[0] = __JS_AtomIsTaggedInt(prop) ? js_index_to_string(ctx, __JS_AtomToUInt32(prop))
+                                       : JS_AtomToValue(ctx, prop);
+    if (unlikely(JS_IsException(sp[0])))
+        return -1;
     sp[1] = JS_FALSE;
     return 0;
  done:
