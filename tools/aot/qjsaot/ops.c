@@ -9365,9 +9365,12 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
           g_e_spill_total, mw);
     }
   } else {
+    /* With loop entries the body is `aot_s_`, and `aot_f_` calls it again whenever the generic
+       body hands a loop back (see E_RET_G), so a re-entry is a return and a call: not a jump
+       back into the body, and no frame that is not already there. */
     fprintf(
-        f, "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
-        e_linkage(), hex);
+        f, "E_TEXT %sJSValue aot_%c_%s(JSContext *ctx, JSRegRun *f,\n",
+        e_linkage(), osr_n > 0 ? 's' : 'f', hex);
     fprintf(
         f, "                                 JSValue *fr, uint32_t entry_pc)\n");
     fprintf(f, "{\n");
@@ -9453,7 +9456,6 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
      until the generic body fills it. */
   /* A loop entry handed back by the generic body starts here: the group shapes are read again
      from the cells it has filled. */
-  if (osr_n > 0) fprintf(f, "    osr_dispatch:;\n");
   {
     int g, q;
     int ng = g_e_facts != NULL ? g_e_facts->ngroups : 0;
@@ -10072,6 +10074,17 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
 
   fprintf(f, "    }\n");
   fprintf(f, "}\n");
+  if (osr_n > 0 && !g_e_fl && !g_e_inl)
+    fprintf(
+        f,
+        "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, uint32_t entry_pc)\n"
+        "{\n"
+        "    JSValue r_ = aot_s_%s(ctx, f, fr, entry_pc);\n"
+        "    while (__builtin_expect(JS_VALUE_GET_TAG(r_) == JS_TAG_UNINITIALIZED, 0))\n"
+        "        r_ = aot_s_%s(ctx, f, fr, (uint32_t)JS_VALUE_GET_INT(r_));\n"
+        "    return r_;\n"
+        "}\n",
+        e_linkage(), hex, hex, hex);
   if (osr_n > 0)
     fprintf(
         f,

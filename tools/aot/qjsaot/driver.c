@@ -2207,11 +2207,9 @@ int qjsaot_driver_main(int argc, char **argv) {
         "        if (from_spec_) return JS_MKVAL(JS_TAG_UNINITIALIZED, (h_)); \\\n"
         "        return fn_(ctx, f, fr, (h_)); } } } while (0)\n"
         /* A speculative body leaves for the generic body through this; a loop hook there
-           answers with the re-entry marker, and the body takes its own loop entry. */
-        "#define E_RET_G(h_, pc_) do { JSValue r_ = (e_gfs_##h_ = 1, aot_g_##h_(ctx, f, fr, (pc_))); \\\n"
-        "    if (__builtin_expect(JS_VALUE_GET_TAG(r_) == JS_TAG_UNINITIALIZED, 0)) { \\\n"
-        "      entry_pc = (uint32_t)JS_VALUE_GET_INT(r_); goto osr_dispatch; } \\\n"
-        "    return r_; } while (0)\n"
+           answers with the re-entry marker, which the entry function (aot_f_) turns into a call of
+           the body at the loop entry. */
+        "#define E_RET_G(h_, pc_) do { e_gfs_##h_ = 1; return aot_g_##h_(ctx, f, fr, (pc_)); } while (0)\n"
         /* An inline body that cannot run (its nested callee is another function than
            the profiled one, say) leaves with nothing done and the native call takes
            over; that is not a failed speculation, so it does not count toward
