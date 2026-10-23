@@ -2417,6 +2417,9 @@ int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes, uint64_t sha
 static int e_site_vouched(const Q2Func *fn, int site) {
   int ns = 0;
   uint64_t sh[4];
+  /* In a loop that may run long a frameless body gives up the entry-validated cache cells the
+     framed body hoists out of the loop, which costs more per iteration than the frame saves. */
+  if (g_e_fl_longloop && g_e_loop_blk != NULL && g_e_blk >= 0 && g_e_loop_blk[g_e_blk]) return 0;
   {
     int osite;
     const uint8_t *dg = e_site_dg(fn, site, &osite);
