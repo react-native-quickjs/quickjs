@@ -1314,9 +1314,16 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
         for (k = 0; k < out->nloops; k++) {
           int pre = out->loop_pre[k], j, bb, ii;
           if (out->loop_hdr[k] != b) continue;
-          for (j = 0; j < outs[pre].navail; j++)
-            if (fs_set_avail(&cur, &outs[pre].avail[j].key, outs[pre].avail[j].val) < 0)
+          /* The loop can also be entered at its header with the registers taken from the
+             frame (a re-entry after an exit), which skips the preheader: only a value that
+             is live in a register there is known on that path. */
+          for (j = 0; j < outs[pre].navail; j++) {
+            int li, live = 0;
+            for (li = 0; li < blk->nlive_in; li++)
+              if (blk->in_val[li] == outs[pre].avail[j].val) live = 1;
+            if (live && fs_set_avail(&cur, &outs[pre].avail[j].key, outs[pre].avail[j].val) < 0)
               goto done;
+          }
           for (bb = 0; bb < fn->nblocks; bb++) {
             if (!out->loop_mem[k][bb]) continue;
             for (ii = 0; ii < fn->blocks[bb].ninsns; ii++) {
