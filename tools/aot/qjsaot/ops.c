@@ -8550,11 +8550,13 @@ static int emit_typed_branch(
                 base == REG_BIN_STRICT_EQ || base == REG_BIN_STRICT_NEQ;
     int is_bit = base == REG_BIN_AND || base == REG_BIN_OR ||
                  base == REG_BIN_XOR;
-    if (!is_order && !is_eq && !is_bit) return 0;
+    if (!is_order && !is_eq && !is_bit && base != REG_BIN_INSTANCEOF) return 0;
   }
   av = in->use[0];
   bv = in->use[1];
   if (av >= (Q2ValueId)t->nvalues || bv >= (Q2ValueId)t->nvalues) return 0;
+  if (base == REG_BIN_INSTANCEOF && (t->lb[av] != E_LB_TAG || t->lb[bv] != E_LB_TAG))
+    return 0;
   /* An equality with a boolean operand: two booleans compare as booleans, and a TAG value
      against one is strictly equal only when it is a boolean too. The loose forms leave a
      non-boolean TAG to the engine (it converts). */
@@ -8644,6 +8646,20 @@ static int emit_typed_branch(
       if (ntags == 0) {
         e_cmp_expr(ex, sizeof(ex), base, t, av, bv, want_f64, 2);
         fprintf(f, "    if (%s%s) {\n", inv ? "!" : "", ex);
+      } else if (ntags == 2 && base == REG_BIN_INSTANCEOF) {
+        /* A plain constructor on the right is answered by the engine's lean routine; any
+           other right side is the operator itself. */
+        fprintf(f, "    { int c_ = qjs_aot_instanceof(ctx, v%u, v%u);\n", (unsigned)av, (unsigned)bv);
+        fprintf(f, "    if (__builtin_expect(c_ < 0, 0)) {\n");
+        if (e_term_wrappable(fn, in, role, blk)) {
+          e_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
+          fprintf(f, "    }\n");
+        } else {
+          fprintf(f, "    goto hx_%d;\n    }\n", in->pc);
+          e_note_stub(
+              g_e_hx, g_e_hx_cur, g_e_hx_blk, &g_e_hx_n, in->pc, cur, NULL);
+        }
+        fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
       } else if (ntags == 2) {
         /* Both operands are TAG: each tag is tested. Two ints compare as ints,
            any two numbers as doubles; everything else (strings, objects) is the
