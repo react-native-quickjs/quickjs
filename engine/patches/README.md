@@ -443,3 +443,4 @@ bump while `9999` is missing.
 | `0355` | The for-in keys are the runtime's small-integer strings | 0347 duplicated `rt->intstr`; `js_int_to_string` formatted before the table lookup | `js_index_to_string`, `qjs_aot_for_in_next` | No. |
 | `0356` | A new Map/Set iterator starts after the deleted records in front of it | An LRU cache walked every zombie record pinned by dead-but-uncollected iterators on each `keys().next()` | `JSMapState.scan_start` | No. |
 | `0357` | Compiled code calls Map/Set get/has/set/delete without the native frame | ~140 instructions of JSStackFrame setup per builtin call | `qjs_aot_call_c`, `cfunc.lean`, `aot_lean_kind` | No. |
+| `0358` | The short string concatenation is shared by the interpreter and compiled code | `js_add_slow` converted the int to a temporary string and concatenated twice | `js_concat_short` | No. |

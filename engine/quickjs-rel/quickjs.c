@@ -20208,6 +20208,58 @@ static no_inline int js_add_accum_fused(JSContext *ctx, const uint8_t *pc,
     return (adv << 2) | pop;
 }
 
+/* A short flat 8-bit string with an int or another short flat 8-bit string (at least one of the
+   two a string): the result is built in one allocation, with no ToString of the int and no trip
+   through the general concatenation. A long or wide operand, a rope and a number that is not
+   an int are not this case. The operands are borrowed. 1 with an owned *out, -1 on out of
+   memory, 0 when the case is not this one. */
+static int js_concat_short(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
+{
+    uint8_t tmp[16];
+    const uint8_t *s1 = NULL, *s2 = NULL;
+    size_t n1 = 0, n2 = 0;
+
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_STRING && JS_VALUE_GET_TAG(b) != JS_TAG_STRING)
+        return 0;
+    if (JS_VALUE_GET_TAG(a) == JS_TAG_STRING) {
+        JSString *pa = JS_VALUE_GET_STRING(a);
+
+        if (!pa->is_wide_char && pa->len <= 255) {
+            s1 = str8(pa);
+            n1 = pa->len;
+        }
+    } else if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {
+        n1 = i32toa((char *)tmp, JS_VALUE_GET_INT(a));
+        s1 = tmp;
+    }
+    if (s1 != NULL) {
+        if (JS_VALUE_GET_TAG(b) == JS_TAG_STRING) {
+            JSString *pb = JS_VALUE_GET_STRING(b);
+
+            if (!pb->is_wide_char && pb->len <= 255) {
+                s2 = str8(pb);
+                n2 = pb->len;
+            }
+        } else if (JS_VALUE_GET_TAG(b) == JS_TAG_INT && s1 != tmp) {
+            n2 = i32toa((char *)tmp, JS_VALUE_GET_INT(b));
+            s2 = tmp;
+        }
+    }
+    if (s1 != NULL && s2 != NULL) {
+        JSString *p = js_alloc_string(ctx, (int)(n1 + n2), 0);
+
+        if (p == NULL)
+            return -1;
+        p->len = (uint32_t)(n1 + n2);
+        memcpy(str8(p), s1, n1);
+        memcpy(str8(p) + n1, s2, n2);
+        str8(p)[n1 + n2] = '\0';
+        *out = JS_MKPTR(JS_TAG_STRING, p);
+        return 1;
+    }
+    return 0;
+}
+
 static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
@@ -20264,6 +20316,17 @@ sp[-1] = JS_UNDEFINED;
     }
 
     if (tag_is_string(tag1) || tag_is_string(tag2)) {
+        JSValue sc;
+        int cr = js_concat_short(ctx, op1, op2, &sc);
+
+        if (cr != 0) {
+            JS_FreeValue(ctx, op1);
+            JS_FreeValue(ctx, op2);
+            if (cr < 0)
+                goto exception;
+            sp[-2] = sc;
+            return 0;
+        }
         sp[-2] = JS_ConcatString(ctx, op1, op2);
         if (JS_IsException(sp[-2]))
             goto exception;
@@ -63473,52 +63536,11 @@ QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue
         if (ar < 0)
             return -1;
     }
-    if (sub == REG_BIN_ADD &&
-        (JS_VALUE_GET_TAG(a) == JS_TAG_STRING || JS_VALUE_GET_TAG(b) == JS_TAG_STRING)) {
-        /* A short flat 8-bit string with an int or another short flat 8-bit string: the
-           result is built in one allocation, with no ToString of the int and no trip
-           through the general concatenation. A long or wide operand, a rope and a number
-           that is not an int keep the general routine. */
-        uint8_t tmp[16];
-        const uint8_t *s1 = NULL, *s2 = NULL;
-        size_t n1 = 0, n2 = 0;
+    if (sub == REG_BIN_ADD) {
+        int cr = js_concat_short(ctx, a, b, out);
 
-        if (JS_VALUE_GET_TAG(a) == JS_TAG_STRING) {
-            JSString *pa = JS_VALUE_GET_STRING(a);
-
-            if (!pa->is_wide_char && pa->len <= 255) {
-                s1 = str8(pa);
-                n1 = pa->len;
-            }
-        } else if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {
-            n1 = i32toa((char *)tmp, JS_VALUE_GET_INT(a));
-            s1 = tmp;
-        }
-        if (s1 != NULL) {
-            if (JS_VALUE_GET_TAG(b) == JS_TAG_STRING) {
-                JSString *pb = JS_VALUE_GET_STRING(b);
-
-                if (!pb->is_wide_char && pb->len <= 255) {
-                    s2 = str8(pb);
-                    n2 = pb->len;
-                }
-            } else if (JS_VALUE_GET_TAG(b) == JS_TAG_INT && s1 != tmp) {
-                n2 = i32toa((char *)tmp, JS_VALUE_GET_INT(b));
-                s2 = tmp;
-            }
-        }
-        if (s1 != NULL && s2 != NULL) {
-            JSString *p = js_alloc_string(ctx, (int)(n1 + n2), 0);
-
-            if (p == NULL)
-                return -1;
-            p->len = (uint32_t)(n1 + n2);
-            memcpy(str8(p), s1, n1);
-            memcpy(str8(p) + n1, s2, n2);
-            str8(p)[n1 + n2] = '\0';
-            *out = JS_MKPTR(JS_TAG_STRING, p);
-            return 1;
-        }
+        if (cr != 0)
+            return cr;
     }
     return js_regvm_binary(ctx, sub, a, b, out) ? -1 : 1;
 }
