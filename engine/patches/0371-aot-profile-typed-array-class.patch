@@ -1,0 +1,65 @@
+Subject: The profile records which typed-array classes an element site accessed
+
+What this does
+  - A profile record of an element pc gains `ta_classes`, a bit per typed-array class (bit k = class
+    `JS_CLASS_UINT8C_ARRAY + k`) that was read or written there, and the profile file names it (`tacls=`)
+    next to `elem=`. The profiler only; no generated-code layout and no interpreter behaviour changes.
+
+Why we need it
+  A typed-array element access in compiled code needs the element type to be a compile-time fact (the
+  width, the signedness, the conversion a store applies, whether a read yields an int or a double). The
+  profile said only that "a typed array" was seen, so such sites were generic and every access was a call.
+  With the class the generator emits a checked region for the array (class tested once, base pointer and
+  length kept in locals) and unboxed accesses.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1634,6 +1634,7 @@
+     uint8_t negzero;       /* -0 was seen */
+     uint8_t elem_kinds;    /* AOT_ELEM_* stored/loaded at an element pc */
+     uint16_t alloc_props;  /* final property count at an allocation pc */
++    uint16_t ta_classes;   /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here */
+     double num_min;
+     double num_max;
+ } JSAotProfPc;
+@@ -29966,7 +29967,7 @@
+         {
+             JSValue tv;
+             if (regvm_get_elem_typed(p, idx, &tv)) {
+-                AOT_PROF_ELEM(f->b, tv, 2);
++                AOT_PROF_ELEM(f->b, tv, 2 + (int)(p->class_id - JS_CLASS_UINT8C_ARRAY));
+                 T_SET_NEXT_B(d, tv, T_SZ_RRR);
+             }
+         }
+@@ -61941,8 +61942,10 @@
+         kind = AOT_ELEM_BOOL;
+     else
+         kind = AOT_ELEM_MIXED;
+-    if (holey == 2)
++    if (holey >= 2) {
+         kind |= AOT_ELEM_TA;
++        pf->pcs[pc].ta_classes |= (uint16_t)(1u << (holey - 2));
++    }
+     pf->pcs[pc].elem_kinds |= kind;
+ }
+ 
+@@ -61968,6 +61971,7 @@
+             return;
+         if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
+             pf->pcs[pc].elem_kinds |= AOT_ELEM_TA;
++            pf->pcs[pc].ta_classes |= (uint16_t)(1u << (p->class_id - JS_CLASS_UINT8C_ARRAY));
+             return;
+         }
+     }
+@@ -62366,7 +62370,10 @@
+             continue;
+         aot_type_str(e->types, ts, sizeof(ts));
+         aot_src_str(b, i, src, sizeof(src));
+-        if (e->elem_kinds)
++        if (e->elem_kinds && e->ta_classes)
++            fprintf(f, "P %s pc=%d types=%s elem=%u tacls=%u src=%s\n",
++                    dgt, i, ts, e->elem_kinds, e->ta_classes, src);
++        else if (e->elem_kinds)
+             fprintf(f, "P %s pc=%d types=%s elem=%u src=%s\n",
+                     dgt, i, ts, e->elem_kinds, src);
+         else if (e->alloc_props)

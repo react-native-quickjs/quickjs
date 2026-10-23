@@ -1634,6 +1634,7 @@ typedef struct JSAotProfPc {
     uint8_t negzero;       /* -0 was seen */
     uint8_t elem_kinds;    /* AOT_ELEM_* stored/loaded at an element pc */
     uint16_t alloc_props;  /* final property count at an allocation pc */
+    uint16_t ta_classes;   /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here */
     double num_min;
     double num_max;
 } JSAotProfPc;
@@ -29966,7 +29967,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
         {
             JSValue tv;
             if (regvm_get_elem_typed(p, idx, &tv)) {
-                AOT_PROF_ELEM(f->b, tv, 2);
+                AOT_PROF_ELEM(f->b, tv, 2 + (int)(p->class_id - JS_CLASS_UINT8C_ARRAY));
                 T_SET_NEXT_B(d, tv, T_SZ_RRR);
             }
         }
@@ -61941,8 +61942,10 @@ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
         kind = AOT_ELEM_BOOL;
     else
         kind = AOT_ELEM_MIXED;
-    if (holey == 2)
+    if (holey >= 2) {
         kind |= AOT_ELEM_TA;
+        pf->pcs[pc].ta_classes |= (uint16_t)(1u << (holey - 2));
+    }
     pf->pcs[pc].elem_kinds |= kind;
 }
 
@@ -61968,6 +61971,7 @@ static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k)
             return;
         if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
             pf->pcs[pc].elem_kinds |= AOT_ELEM_TA;
+            pf->pcs[pc].ta_classes |= (uint16_t)(1u << (p->class_id - JS_CLASS_UINT8C_ARRAY));
             return;
         }
     }
@@ -62366,7 +62370,10 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
             continue;
         aot_type_str(e->types, ts, sizeof(ts));
         aot_src_str(b, i, src, sizeof(src));
-        if (e->elem_kinds)
+        if (e->elem_kinds && e->ta_classes)
+            fprintf(f, "P %s pc=%d types=%s elem=%u tacls=%u src=%s\n",
+                    dgt, i, ts, e->elem_kinds, e->ta_classes, src);
+        else if (e->elem_kinds)
             fprintf(f, "P %s pc=%d types=%s elem=%u src=%s\n",
                     dgt, i, ts, e->elem_kinds, src);
         else if (e->alloc_props)

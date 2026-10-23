@@ -1459,12 +1459,16 @@
       "sha256": "db9c766069d76a3f34f6f79a8af538072c28ac6e3bf37fc81c495a0f3ea40351"
     },
     {
+      "name": "0371-aot-profile-typed-array-class.patch",
+      "sha256": "7ffe672891342200b04f22a2cca7c282819abaf98f30c36f06e7620a6ab5abc5"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "f03f24517ff7f84c7354673bc0824e054e65a35b33129ff11f005e4053c961cb",
+    "quickjs.c": "e9a82f5e60bb210b6ebd1e21ecf9db84a53d20cb10d360b64127a59dcc47ce3f",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
