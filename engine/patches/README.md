@@ -457,3 +457,4 @@ bump while `9999` is missing.
 | `0369` | The runtime counts changes of its register property cache entries | A compiled call re-validated its cache cells every time | `JSRuntime.aot_pic_epoch` | No. |
 | `0370` | A compiled function can ask whether a constructor's fields are replayable from the engine's caches | A `new` of a plain constructor whose object never escapes allocated it and stored its fields | `qjs_aot_ctor_replayable` | No. |
 | `0371` | The profile records which typed-array classes an element site accessed | Typed-array element sites were generic: the element type was not a compile-time fact | `JSAotProfPc.ta_classes` | No. |
+| `0372` | The layout export carries what an inline append to a dense array tests | A store at index `count` of a dense array was a call into the engine | `JSAotGenLayout` | No. |

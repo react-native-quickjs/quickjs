@@ -61347,6 +61347,47 @@ void js_aot_gen_layout(JSAotGenLayout *out)
             }
         }
     }
+    {
+        /* `extensible` and `fast_array` likewise, and the context's `std_array_prototype`. */
+        JSObject o;
+        static JSContext c0; /* all zero: only the bit under test is set while it is searched for */
+        JSContext *c = &c0;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+
+        memset(&o, 0, sizeof(o));
+        o.extensible = 1;
+        for (i = 0; i < sizeof(o); i++) {
+            if (q[i] != 0) {
+                out->off_object_ext_byte = (uint32_t)i;
+                out->object_ext_mask = q[i];
+                break;
+            }
+        }
+        memset(&o, 0, sizeof(o));
+        o.fast_array = 1;
+        for (i = 0; i < sizeof(o); i++) {
+            if (q[i] != 0) {
+                out->off_object_fast_array_byte = (uint32_t)i;
+                out->object_fast_array_mask = q[i];
+                break;
+            }
+        }
+        out->off_array_size = (uint32_t)offsetof(JSObject, u.array.u1.size);
+        out->off_ctx_array_shape = (uint32_t)offsetof(JSContext, array_shape);
+        {
+            const uint8_t *cq = (const uint8_t *)c;
+            c->std_array_prototype = 1;
+            for (i = 0; i < sizeof(JSContext); i++) {
+                if (cq[i] != 0) {
+                    out->off_ctx_std_array_proto_byte = (uint32_t)i;
+                    out->ctx_std_array_proto_mask = cq[i];
+                    break;
+                }
+            }
+            c->std_array_prototype = 0;
+        }
+    }
     /* The light-frame header a generated native entry writes itself. It builds
        the same frame `regvm_light_fill` builds, field for field, so the
        offsets are the frame's own and the flag values are the engine's. */

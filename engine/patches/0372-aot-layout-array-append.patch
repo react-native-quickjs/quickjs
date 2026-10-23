@@ -1,0 +1,80 @@
+Subject: The layout export carries what an inline append to a dense array tests
+
+What this does
+  - `JSAotGenLayout` gains the byte and mask of `JSObject.extensible` and `JSObject.fast_array` (found the
+    way the `holey` bit is), the offset of `u.array.u1.size` (the capacity of the element storage), the
+    offset of `JSContext.array_shape` and the byte and mask of `JSContext.std_array_prototype`.
+
+Why we need it
+  A store at index `count` of a dense array (the fill of `new Array(n)`, an append loop, `push`) was a
+  call into the engine: the interpreter handler plus `JS_SetPropertyValue` plus `add_fast_array_element`,
+  about 200 instructions for a store that is five tests and two stores. The engine's own fast path
+  applies when the object is a fast, extensible array of the initial array shape (so its prototype is
+  Array.prototype and `length` is its first property), the array prototype chain is standard, the index is
+  the count, the length property is an int that already covers the new element, and the storage has room.
+  The generated store tests exactly those and takes the engine's path otherwise.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61347,6 +61347,47 @@
+             }
+         }
+     }
++    {
++        /* `extensible` and `fast_array` likewise, and the context's `std_array_prototype`. */
++        JSObject o;
++        static JSContext c0; /* all zero: only the bit under test is set while it is searched for */
++        JSContext *c = &c0;
++        const uint8_t *q = (const uint8_t *)&o;
++        size_t i;
++
++        memset(&o, 0, sizeof(o));
++        o.extensible = 1;
++        for (i = 0; i < sizeof(o); i++) {
++            if (q[i] != 0) {
++                out->off_object_ext_byte = (uint32_t)i;
++                out->object_ext_mask = q[i];
++                break;
++            }
++        }
++        memset(&o, 0, sizeof(o));
++        o.fast_array = 1;
++        for (i = 0; i < sizeof(o); i++) {
++            if (q[i] != 0) {
++                out->off_object_fast_array_byte = (uint32_t)i;
++                out->object_fast_array_mask = q[i];
++                break;
++            }
++        }
++        out->off_array_size = (uint32_t)offsetof(JSObject, u.array.u1.size);
++        out->off_ctx_array_shape = (uint32_t)offsetof(JSContext, array_shape);
++        {
++            const uint8_t *cq = (const uint8_t *)c;
++            c->std_array_prototype = 1;
++            for (i = 0; i < sizeof(JSContext); i++) {
++                if (cq[i] != 0) {
++                    out->off_ctx_std_array_proto_byte = (uint32_t)i;
++                    out->ctx_std_array_proto_mask = cq[i];
++                    break;
++                }
++            }
++            c->std_array_prototype = 0;
++        }
++    }
+     /* The light-frame header a generated native entry writes itself. It builds
+        the same frame `regvm_light_fill` builds, field for field, so the
+        offsets are the frame's own and the flag values are the engine's. */
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -141,6 +141,12 @@
+     /* The cache entry kind of a holder two prototypes up, and the byte and mask of
+        `is_HTMLDDA`: an inline null test of an object has to ask it. */
+     uint32_t reg_pic_proto2, off_object_htmldda_byte, object_htmldda_mask;
++    /* What an inline append to a dense array tests: the object's `extensible` and `fast_array`
++       bits, the capacity of its element storage, and in the context the initial array shape
++       (an array of that shape has Array.prototype and `length` as its first property) and the
++       "standard array prototype" bit (no indexed accessor on the prototype chain). */
++    uint32_t off_object_ext_byte, object_ext_mask, off_object_fast_array_byte, object_fast_array_mask;
++    uint32_t off_array_size, off_ctx_array_shape, off_ctx_std_array_proto_byte, ctx_std_array_proto_mask;
+     /* The global variable cell sets: a store to a global the read cache holds is a lookup of
+        the atom's set, a generation test and a store into the slot when the cell says the
+        property is plainly writable. */
