@@ -2430,6 +2430,8 @@ static int e_site_vouched(const Q2Func *fn, int site) {
    sits where the guard's own exit would be taken -- for dx_, after the op's raw
    result is in the frame. A normal build emits nothing. hx_ is a hand-off, not a
    deopt, and is not swept. */
+static const char *g_e_sweep_store;
+
 static void e_sweep_guard(FILE *f, const char *kind, int pc) {
   int sid;
   g_e_n_guard
@@ -2449,9 +2451,34 @@ static void e_sweep_guard(FILE *f, const char *kind, int pc) {
      name an unreached site by function, kind and pc. */
   fprintf(
       f,
-      "    if (__builtin_expect(e_sweep_hit(ctx, %d), 0)) goto %s_%d;"
+      "    if (__builtin_expect(e_sweep_hit(ctx, %d), 0)) { %s goto %s_%d; }"
       " /* sweep-site %d %s %d %d %s */\n",
-      sid, kind, pc, sid, kind, pc, g_e_fi, g_cur_hex);
+      sid, g_e_sweep_store ? g_e_sweep_store : "", kind, pc, sid, kind, pc,
+      g_e_fi, g_cur_hex);
+}
+
+/* The sweep at a guard whose raw result is stored to the frame only when the guard
+   really misses: the forced exit stores it too. */
+static void e_sweep_guard_set(
+    FILE *f, const char *kind, int pc, int off, const char *raw) {
+  char st[96];
+  snprintf(st, sizeof(st), "AOT_SET_B(ctx, fr, %d, %s);", off, raw);
+  g_e_sweep_store = st;
+  e_sweep_guard(f, kind, pc);
+  g_e_sweep_store = NULL;
+}
+
+/* The same for an owned result, which the register adopts. */
+static void e_sweep_guard_owned(FILE *f, int pc, int off) {
+  char st[160];
+  snprintf(
+      st, sizeof(st),
+      "if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o); "
+      "else AOT_SET_B(ctx, fr, %d, _o);",
+      off, off);
+  g_e_sweep_store = st;
+  e_sweep_guard(f, "dx", pc);
+  g_e_sweep_store = NULL;
 }
 
 /* A register an op has already written to the frame: its raw result, before the
@@ -4948,7 +4975,7 @@ static int emit_typed_elem_read(
     if (e_def_dead(in, dv)) {
       fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
     } else {
-      e_sweep_guard(f, "dx", in->next);
+      e_sweep_guard_set(f, "dx", in->next, dreg * 16, "_e");
       if (t->lb[dv] == E_LB_I32)
         fprintf(
             f,
@@ -6878,7 +6905,7 @@ static int emit_pure_call(
           "else AOT_SET_B(ctx, fr, %d, _o); goto dx_%d; }";
       char miss[200];
       snprintf(miss, sizeof(miss), fl, off, off, in->next);
-      e_sweep_guard(f, "dx", in->next);
+      e_sweep_guard_owned(f, in->next, off);
       if (t->lb[dv] == E_LB_I32)
         fprintf(
             f,
@@ -7379,7 +7406,7 @@ static int emit_typed_global_read(
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", dreg * 16);
   } else {
     /* The raw result reaches the frame only when the guard misses. */
-    e_sweep_guard(f, "dx", in->next);
+    e_sweep_guard_set(f, "dx", in->next, dreg * 16, "_g");
     if (t->lb[dv] == E_LB_I32)
       fprintf(
           f,
@@ -8016,7 +8043,7 @@ static int emit_hit_result(
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", dreg * 16, raw);
     return 1;
   }
-  e_sweep_guard(f, "dx", in->next);
+  e_sweep_guard_set(f, "dx", in->next, dreg * 16, raw);
   if (t->lb[dv] == E_LB_I32)
     fprintf(
         f,
