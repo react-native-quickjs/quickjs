@@ -45,6 +45,13 @@ static JSValue js_print(
   return JS_UNDEFINED;
 }
 
+/* Runs the cycle collector: the cases that need to know an object graph is freed or kept. */
+static JSValue js_force_gc(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  JS_RunGC(JS_GetRuntime(ctx));
+  return JS_UNDEFINED;
+}
+
 /* A trivial host (C) function for the aot_bench.js "host function in loop"
    kernel; the AOT compiler must handle a native callee like any other. */
 static JSValue js_host_add(
@@ -188,6 +195,8 @@ int main(int argc, char **argv) {
   JS_SetPropertyStr(
       ctx, global, "host_add",
       JS_NewCFunction(ctx, js_host_add, "host_add", 2));
+  JS_SetPropertyStr(
+      ctx, global, "gc", JS_NewCFunction(ctx, js_force_gc, "gc", 0));
   JS_SetPropertyStr(
       ctx, global, "host_opt",
       JS_NewCFunction(ctx, js_host_opt, "host_opt", 2));

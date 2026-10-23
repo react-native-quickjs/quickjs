@@ -11856,10 +11856,13 @@ static bool can_store_error_stack(JSValueConst obj)
 typedef struct JSErrorStackFrame {
     JSValue func_name;   /* JS_TAG_STRING, or JS_NULL => "<anonymous>" */
     JSAtom filename;     /* JS_ATOM_NULL => "<null>" */
-    int line_num;        /* -1 => omit ":line:col" */
+    int line_num;        /* -1 => omit ":line:col"; LINE_UNRESOLVED => from `bc` and `key` when read */
     int col_num;
     uint8_t kind;        /* 0 = located, 1 = "(missing)", 2 = "(native)" */
+    JSFunctionBytecode *bc; /* counted; the code whose line table resolves `key` */
+    uint32_t key;
 } JSErrorStackFrame;
+#define LINE_UNRESOLVED (-2)
 
 typedef struct JSErrorStackData {
     uint32_t count;
@@ -11875,13 +11878,31 @@ static void js_error_stack_finalizer(JSRuntime *rt, JSValueConst val)
         for (i = 0; i < esd->count; i++) {
             JS_FreeValueRT(rt, esd->frames[i].func_name);
             JS_FreeAtomRT(rt, esd->frames[i].filename);
+            if (esd->frames[i].bc)
+                JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, esd->frames[i].bc));
         }
         js_free_rt(rt, esd);
     }
 }
 
+/* The frames' code is counted, so the cycle collector has to see those edges. */
+static void js_error_stack_mark(JSRuntime *rt, JSValueConst val,
+                                JS_MarkFunc *mark_func)
+{
+    JSErrorStackData *esd = JS_GetOpaque(val, JS_CLASS_ERROR_STACK);
+    uint32_t i;
+
+    if (!esd)
+        return;
+    for (i = 0; i < esd->count; i++) {
+        if (esd->frames[i].bc)
+            JS_MarkValue(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, esd->frames[i].bc),
+                         mark_func);
+    }
+}
+
 static const JSClassShortDef js_error_stack_class_def[] = {
-    { JS_ATOM_Error, js_error_stack_finalizer, NULL }, /* JS_CLASS_ERROR_STACK */
+    { JS_ATOM_Error, js_error_stack_finalizer, js_error_stack_mark }, /* JS_CLASS_ERROR_STACK */
 };
 
 /* Like get_func_name(), but returns a strong reference to the name JSString
@@ -11933,6 +11954,12 @@ static JSValue js_error_stack_format(JSContext *ctx, JSErrorStackData *esd)
         if (f->kind == 0) {
             const char *atom_str;
 
+            if (f->line_num == LINE_UNRESOLVED) {
+                /* the position is looked up now, once, not when the error was made */
+                f->line_num = find_line_num(ctx, f->bc, f->key, &f->col_num);
+                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, f->bc));
+                f->bc = NULL;
+            }
             atom_str = f->filename != JS_ATOM_NULL
                      ? JS_AtomToCString(ctx, f->filename) : NULL;
             dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
@@ -12162,12 +12189,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                         : (uint32_t)rpc;
 
                     lzf->kind = 0;
-                    lzf->line_num = find_line_num(ctx, b, bt[bi].cur_pc ? pc : regvm_line_key(b, pc), &lzf->col_num);
+                    lzf->line_num = LINE_UNRESOLVED;
+                    lzf->col_num = -1;
+                    lzf->key = bt[bi].cur_pc ? pc : regvm_line_key(b, pc);
+                    lzf->bc = (JSFunctionBytecode *)JS_VALUE_GET_PTR(
+                        js_dup(JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b)));
                     lzf->filename = JS_DupAtom(ctx, b->filename);
                 } else {
                     lzf->kind = b ? 1 : 2;
                     lzf->line_num = -1;
                     lzf->col_num = -1;
+                    lzf->bc = NULL;
+                    lzf->key = 0;
                     lzf->filename = JS_ATOM_NULL;
                 }
             } else if (has_prepare) {
@@ -12244,6 +12277,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             for (k = 0; k < i; k++) {
                 JS_FreeValue(ctx, lazy_frames[k].func_name);
                 JS_FreeAtom(ctx, lazy_frames[k].filename);
+                if (lazy_frames[k].bc)
+                    JS_FreeValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, lazy_frames[k].bc));
             }
             JS_FreeValue(ctx, lazy_obj);
             JS_FreeValue(ctx, JS_GetException(ctx));

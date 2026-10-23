@@ -1375,12 +1375,16 @@
       "sha256": "061cb00e21ba86a08e4a775869f12582332bf4a5095e897160ce54f90b771ff9"
     },
     {
+      "name": "0350-lazy-error-lines.patch",
+      "sha256": "ecf990f3c51647d3238003f43dcf1ab2e938a553f74b346b16f4e23b80f614af"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "3610ca45ec0b423de4a3059edad6a44caef7c0cbba39d266f4fe32e6daedcf56",
+    "quickjs.c": "49b371663c84062a3d52b0f791acd7742d5952c908985c0330499ec94c7d0193",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
