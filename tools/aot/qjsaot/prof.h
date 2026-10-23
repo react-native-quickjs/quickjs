@@ -41,6 +41,7 @@ typedef struct ProfPc {
 #define Q2_ELEM_MIXED  (1u << 3)
 #define Q2_ELEM_HOLEY  (1u << 4)
 #define Q2_ELEM_TA     (1u << 5)
+#define Q2_ELEM_BOOL   (1u << 6)
   /* AOT_ELEM_*: what an element pc stored or loaded. INT or FLOAT alone means
      every element there was a number, so a compiled read needs no hole or lazy
      test. */

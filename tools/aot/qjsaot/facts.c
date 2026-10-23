@@ -66,6 +66,7 @@
  * us enough: a fact dropped needlessly costs a reload, a fact kept wrongly is a
  * miscompile.
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -312,6 +313,9 @@ static int64_t site_recv(const Q2Insn *in, int si, Q2ValueId def_recv) {
 
 /* Collect the property accesses of one instruction (a chain has two). Returns
    the count, 0 to 2. */
+/* A receiver the access emitters can test: an SSA value, or `this` of a get_this_field. */
+static int recv_groupable(int64_t recv) { return recv >= 0 || recv == E_RECV_THIS; }
+
 static int site_refs(const Q2Insn *in, SiteRef out[2]) {
   const ERole *role = e_roles[in->rop];
   int n = 0, i;
@@ -707,10 +711,26 @@ static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
   if (fn->prof == NULL) return 0;
   for (i = 0; i < fn->nprof; i++) {
     if (fn->prof[i].pc != in->pc) continue;
-    return (fn->prof[i].elem & (Q2_ELEM_INT | Q2_ELEM_FLOAT)) != 0 &&
-           (fn->prof[i].elem & (Q2_ELEM_OBJECT | Q2_ELEM_MIXED | Q2_ELEM_HOLEY | Q2_ELEM_TA)) == 0;
+    /* No miss and no typed array was seen. A read may yield any element (a number or an
+       object); a store is a region access only for numbers, since the inline store replaces
+       an element without releasing a reference. */
+    if (fn->prof[i].elem == 0 ||
+        (fn->prof[i].elem & (Q2_ELEM_HOLEY | Q2_ELEM_TA)) != 0)
+      return 0;
+    if (in->rop == ROP_get_element) return 1;
+    return (fn->prof[i].elem & (Q2_ELEM_INT | Q2_ELEM_FLOAT | Q2_ELEM_BOOL)) != 0 &&
+           (fn->prof[i].elem & (Q2_ELEM_OBJECT | Q2_ELEM_MIXED)) == 0;
   }
   return 0;
+}
+
+/* A global read the profile executed: the cache cell either hits or the body leaves at the
+   read (the generic body does the lookup, which can throw or run a getter), so it is no
+   safepoint. */
+static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
+  return in->rop == ROP_get_global && in->narg >= 4 && in->arg[3].kind == 's' &&
+         (unsigned)in->arg[3].val != REG_IC_NONE &&
+         qjs_aot_prof_pc_count(fn->g->digest, in->pc) > 0 && getenv("QJS_AOT_NOGLOBALEXIT") == NULL;
 }
 
 /* The receiver of a region access, through the forwarded copies recorded so far. */
@@ -820,9 +840,9 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
        ran may have broken every fact. The continuing-miss mode of the speculative body is this one. */
     if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
-      if (ref[r].site < 0 || ref[r].recv < 0 ||
+      if (ref[r].site < 0 || !recv_groupable(ref[r].recv) ||
           (e_facts_site_group(f, ref[r].site) < 0 &&
-           !(e_facts_poly_on && nr == 1 && e_facts_poly_op(in) &&
+           !(e_facts_poly_on && nr == 1 && ref[r].recv >= 0 && e_facts_poly_op(in) &&
              e_facts_site_poly(f, ref[r].site))))
         grouped = 0;
     kind = grouped ? E_SK_NOJS : E_SK_SAFE;
@@ -846,11 +866,11 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     for (r = 0; r < nr; r++) {
       int g = ref[r].site >= 0 ? e_facts_site_group(f, ref[r].site) : -1;
       int rv;
-      if (g < 0 || ref[r].recv < 0) continue;
+      if (g < 0 || !recv_groupable(ref[r].recv)) continue;
       f->access[insn] = 1;
       /* A receiver that is a forwarded copy of another value is that value. */
-      rv = (int)ref[r].recv;
-      while (rv >= 0 && rv < fn->nvalues && fn->values[rv].insn >= 0 &&
+      rv = ref[r].recv == E_RECV_THIS ? E_THISV : (int)ref[r].recv;
+      while (rv >= 0 && rv < E_THISV && rv < fn->nvalues && fn->values[rv].insn >= 0 &&
              f->fwd[fn->values[rv].insn] != Q2_NO_VALUE)
         rv = (int)f->fwd[fn->values[rv].insn];
       if (fs_has_shape(s, rv, g)) {
@@ -884,6 +904,11 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
      ungrouped read does not leave a fact behind either: its miss may have run
      a getter. */
   if (kind == E_SK_SAFE) {
+    if (getenv("QJS_AOT_DEBUG_SAFEPOINTS")) {
+      char nm[64];
+      e_rop_name(in->rop, nm, sizeof(nm));
+      fprintf(stderr, "safepoint %s %s@%d\n", fn->g->name, nm, in->pc);
+    }
     fs_kill(s, kp_safepoint, NULL);
     s->nshape = 0;
   }
@@ -1083,13 +1108,17 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
           for (r = 0; r < nr; r++) {
             int g, dup = 0, db;
             Q2ValueId v;
-            if (ref[r].site < 0 || ref[r].recv < 0) continue;
+            if (ref[r].site < 0 || !recv_groupable(ref[r].recv)) continue;
             g = e_facts_site_group(out, ref[r].site);
             if (g < 0) continue;
-            v = (Q2ValueId)ref[r].recv;
-            if (v >= (Q2ValueId)fn->nvalues) continue;
-            db = fn->values[v].block;
-            if (db < 0 || in_loop(loop, db)) continue;
+            if (ref[r].recv == E_RECV_THIS) {
+              v = E_THISV; /* `this` is fixed for the activation, so always outside the loop */
+            } else {
+              v = (Q2ValueId)ref[r].recv;
+              if (v >= (Q2ValueId)fn->nvalues) continue;
+              db = fn->values[v].block;
+              if (db < 0 || in_loop(loop, db)) continue;
+            }
             for (q = 0; q < out->nhoist; q++)
               if (out->hoist_hdr[q] == h && out->hoist_val[q] == v && out->hoist_grp[q] == g) dup = 1;
             if (dup) continue;

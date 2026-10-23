@@ -6691,6 +6691,8 @@ static int emit_typed_global_read(
       t->lb[dv] != E_LB_F64)
     return 0;
 
+  if (t->lb[dv] != E_LB_TAG && !e_def_dead(in, dv))
+    e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
   fprintf(f, "    { JSValue _g;\n");
   fprintf(
       f,
@@ -6699,38 +6701,44 @@ static int emit_typed_global_read(
       site);
   if (t->lb[dv] == E_LB_TAG) {
     fprintf(f, "        v%u = _g;\n", (unsigned)dv);
-  } else {
+  } else if (e_def_dead(in, dv)) {
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", dreg * 16);
-    /* Nothing reads the result: the frame write above is all it needs. */
-    if (!e_def_dead(in, dv)) {
-      e_sweep_guard(f, "dx", in->next);
-      if (t->lb[dv] == E_LB_I32)
-        fprintf(
-            f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, "
-            "0)) "
-            "goto dx_%d;\n"
-            "        i%u = JS_VALUE_GET_INT(_g);\n",
-            in->next, (unsigned)dv);
-      else if (t->lb[dv] == E_LB_F64)
-        fprintf(
-            f,
-            "        if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = "
-            "(double)JS_VALUE_GET_INT(_g);\n"
-            "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = "
-            "JS_VALUE_GET_FLOAT64(_g);\n"
-            "        else goto dx_%d;\n",
-            (unsigned)dv, (unsigned)dv, in->next);
-    }
+  } else {
+    /* The raw result reaches the frame only when the guard misses. */
+    e_sweep_guard(f, "dx", in->next);
+    if (t->lb[dv] == E_LB_I32)
+      fprintf(
+          f,
+          "        if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, 0)) "
+          "{ AOT_SET_B(ctx, fr, %d, _g); goto dx_%d; }\n"
+          "        i%u = JS_VALUE_GET_INT(_g);\n",
+          dreg * 16, in->next, (unsigned)dv);
+    else if (t->lb[dv] == E_LB_F64)
+      fprintf(
+          f,
+          "        if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = "
+          "(double)JS_VALUE_GET_INT(_g);\n"
+          "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = "
+          "JS_VALUE_GET_FLOAT64(_g);\n"
+          "        else { AOT_SET_B(ctx, fr, %d, _g); goto dx_%d; }\n",
+          (unsigned)dv, (unsigned)dv, dreg * 16, in->next);
   }
   fprintf(f, "      } else {\n");
-  /* A global's cache hit holds until a global changes: not a systematic miss. */
-  g_e_fl_miss_ok = 1;
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+  if (e_must_exit(fn, in)) {
+    /* The cache cell does not hold: the generic body does the lookup. */
+    e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+    e_sweep_guard(f, "vx", in->pc);
+    fprintf(f, "        goto vx_%d;\n", in->pc);
+    g_e_miss_exit_seen = 1;
+  } else {
+    /* A global's cache hit holds until a global changes: not a systematic miss. */
+    g_e_fl_miss_ok = 1;
+    if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+      g_e_fl_miss_ok = 0;
+      return 0;
+    }
     g_e_fl_miss_ok = 0;
-    return 0;
   }
-  g_e_fl_miss_ok = 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
@@ -6954,6 +6962,57 @@ static int emit_tag_cmp_value(
    def[1] the receiver -- so there is no use to take a receiver from). `this` comes
    from the function's own this-slot via `qjs_aot_load_this`, exactly as the generic
    emitter does; the value is owned when `_own` is set, otherwise borrowed. */
+static int emit_group_this_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int g,
+    int site, Q2ValueId fv, Q2ValueId rv, int freg, int rreg) {
+  char test[320];
+  int skip = g_e_facts->skip[e_insn_idx(fn, in)];
+  Q2ValueId *c2 = NULL;
+  (void)g;
+  if (cur == NULL) return 0;
+  if (t->lb[rv] != E_LB_TAG) return 0;
+  if (t->lb[fv] != E_LB_TAG && t->lb[fv] != E_LB_I32 && t->lb[fv] != E_LB_F64 &&
+      t->lb[fv] != E_LB_BOOL)
+    return 0;
+  e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+  e_note_tag(
+      'v', in->pc,
+      g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)");
+  e_sweep_guard(f, "vx", in->pc);
+  if (t->lb[fv] != E_LB_TAG && !e_def_dead(in, fv)) {
+    /* A guard that misses exits at the next instruction with `this` current: the stub syncs
+       it from its local. */
+    c2 = malloc(sizeof(*c2) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
+    if (c2 == NULL) abort();
+    memcpy(c2, cur, sizeof(*c2) * (size_t)fn->nregs);
+    c2[rreg] = rv;
+    e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, c2, in);
+    free(c2);
+  }
+  e_group_test(
+      test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, "_t", g, site, 0);
+  fprintf(
+      f,
+      "    { JSValue _t = %s, _f;\n"
+      "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
+      "      if (__builtin_expect(%s, 0)) goto vx_%d;\n"
+      "      _f = *q2_slotp(_t, q2_cell_off(pic, %d));\n",
+      g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)", in->pc,
+      test, in->pc, site);
+  if (!g_e_nolazy)
+    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+  fprintf(f, "      v%u = _t;\n", (unsigned)rv);
+  if (!emit_hit_result(f, fn, in, t, fv, freg, "_f")) {
+    fprintf(stderr, "qjsaot: grouped this read at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "    }\n");
+  cur[freg] = fv;
+  cur[rreg] = rv;
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
 static int emit_typed_this_field(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -6971,10 +7030,16 @@ static int emit_typed_this_field(
   fv = in->def[0];
   rv = in->def[1];
   if (fv >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues) return 0;
-  if (t->lb[fv] != E_LB_TAG) return 0;
   freg = fn->values[fv].reg;
   rreg = fn->values[rv].reg;
   if (freg < 0 || freg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
+  /* A grouped access (the facts say its miss exits) takes the group path. */
+  {
+    int g = e_exit_group(fn, in, site);
+    if (g >= 0) return emit_group_this_read(f, fn, in, t, cur, g, site, fv, rv, freg, rreg);
+    if (e_must_exit(fn, in)) return 0;
+  }
+  if (t->lb[fv] != E_LB_TAG) return 0;
 
   if (!e_fl_site_ok(fn, in, site)) return 0;
   if (g_e_fl) {
@@ -7396,7 +7461,9 @@ static int emit_elem_region_read(
   if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
       kv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
     return 0;
-  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64) return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
+      t->lb[dv] != E_LB_BOOL)
+    return 0;
   if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
@@ -7425,13 +7492,21 @@ static int emit_elem_region_read(
         "      else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_e);\n"
         "      else goto vx_%d;\n",
         (unsigned)dv, (unsigned)dv, in->pc);
-  else
+  else if (t->lb[dv] == E_LB_BOOL)
     fprintf(
         f,
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT &&\n"
-        "          JS_VALUE_GET_TAG(_e) != JS_TAG_FLOAT64, 0)) goto vx_%d;\n"
-        "      v%u = _e;\n",
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_BOOL, 0)) goto vx_%d;\n"
+        "      b%u = JS_VALUE_GET_BOOL(_e);\n",
         in->pc, (unsigned)dv);
+  else {
+    /* Any element but a hole (and a lazy marker while one can exist). */
+    fprintf(
+        f,
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) == JS_TAG_UNINITIALIZED%s, 0)) goto vx_%d;\n"
+        "      v%u = _e;\n",
+        g_e_nolazy ? "" : " || JS_VALUE_GET_TAG(_e) == QJS_AOT_TAG_LAZY_JSON", in->pc,
+        (unsigned)dv);
+  }
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
   g_e_miss_exit_seen = 1;
@@ -7469,7 +7544,7 @@ static int emit_elem_region_write(
       f,
       "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n"
       "      JSValue *_s = &ap%u[_i];\n"
-      "      if (__builtin_expect((JS_VALUE_GET_TAG(*_s) & ~(int)JS_TAG_FLOAT64) != 0, 0)) goto vx_%d;\n"
+      "      if (__builtin_expect((JS_VALUE_GET_TAG(*_s) & ~(int)(JS_TAG_FLOAT64 | JS_TAG_BOOL)) != 0, 0)) goto vx_%d;\n"
       "      { JSValue _nv = %s;\n",
       (unsigned)root, in->pc, (unsigned)root, in->pc, vb);
   if (t->lb[vv] == E_LB_TAG)
