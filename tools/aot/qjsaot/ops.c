@@ -3779,7 +3779,10 @@ static int emit_typed_opcall(
       f,
       "    { uint8_t *code_ = q2_code(f), *ip_;\n"
       "    ip_ = %s(code_ + %d, fr, f, ctx);\n",
-      in->rop == ROP_iter_next ? "qjs_aot_iter_next" : "qjs_aot_step", in->pc);
+      in->rop == ROP_iter_next ? "qjs_aot_iter_next"
+      : in->rop == ROP_for_in_next ? "qjs_aot_for_in_next"
+                                   : "qjs_aot_step",
+      in->pc);
   fprintf(
       f,
       "    if (__builtin_expect(ip_ == NULL, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n");
