@@ -7623,7 +7623,8 @@ static void e_group_test(
   int proto = !write && g_e_facts != NULL ? e_facts_site_proto(g_e_facts, site) : 0;
   snprintf(
       cell, sizeof(cell), "%s(pic, %s) != gsh%d",
-      write ? "q2_cell_wshape" : "q2_cell_shape", e_cellidx(ci, sizeof(ci), site), g);
+      write ? "q2_cell_wshape" : proto == 2 ? "q2_cell_shape" : "q2_cell_raw",
+      e_cellidx(ci, sizeof(ci), site), g);
   /* A prototype read also needs the holder's shape to be the one the cell was filled with. */
   if (proto == 1)
     snprintf(

@@ -2768,6 +2768,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         "return NULL;\n"
         "  return *(const void *const *)e;\n"
         "}\n\n"
+        /* The shape word of a cell the entry validated: a group's accesses compare it with the
+           group's shape, and a shape names the property's place, so the kind needs no re-test. */
+        "static inline const void *q2_cell_raw(const void *pic, int k)\n"
+        "{\n"
+        "  return *(const void *const *)((const unsigned char *)pic + (size_t)(unsigned)k * "
+        "QJS_AOT_SIZEOF_JSREGPIC);\n"
+        "}\n\n"
         "static inline const void *q2_cell_wshape(const void *pic, int k)\n"
         "{\n"
         "  const unsigned char *e;\n"
