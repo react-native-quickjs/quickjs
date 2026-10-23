@@ -1134,11 +1134,6 @@ static int q2_prune_params(Q2Func *f) {
   int changed = 1, b, i, guard = 0;
   if (!repl) return -1;
   for (i = 0; i < f->nvalues; i++) repl[i] = (Q2ValueId)i;
-  /* the copy that stands in for a hoisted load is its source */
-  for (i = 0; i < f->ninsns; i++) {
-    const Q2Insn *in = &f->insns[i];
-    if (in->licm_mov && in->ndef == 1 && in->nuse == 1) repl[in->def[0]] = in->use[0];
-  }
   for (b = 0; b < f->nblocks; b++) {
     Q2Block *blk = &f->blocks[b];
     int n = blk->nparams > 0 ? blk->nparams : 1;
