@@ -1,0 +1,30 @@
+Subject: The profiler records boolean elements apart from other kinds
+
+What this does
+  - `AOT_ELEM_BOOL` marks an element site that loaded or stored a boolean (it was folded into
+    `AOT_ELEM_MIXED` before). Profile builds only.
+
+Why we need it
+  An array of booleans (a sieve's flags) is a numeric-class array for the inline element access:
+  an element is one of int, boolean or double. MIXED also covers strings, undefined and null,
+  which are not, so the generator could not tell the two apart.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1673,6 +1673,7 @@
+ #define AOT_ELEM_MIXED  (1u << 3)
+ #define AOT_ELEM_HOLEY  (1u << 4)
+ #define AOT_ELEM_TA     (1u << 5)  /* a typed array's element */
++#define AOT_ELEM_BOOL   (1u << 6)
+ #endif /* QJS_AOT_PROFILE */
+ 
+ /* One polymorphic property cache entry: the receiver shape, the property's
+@@ -61890,6 +61891,8 @@
+         kind = AOT_ELEM_FLOAT;
+     else if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
+         kind = AOT_ELEM_OBJECT;
++    else if (JS_VALUE_GET_TAG(v) == JS_TAG_BOOL)
++        kind = AOT_ELEM_BOOL;
+     else
+         kind = AOT_ELEM_MIXED;
+     if (holey == 2)

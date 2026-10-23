@@ -1673,6 +1673,7 @@ typedef struct JSAotProfFunc {
 #define AOT_ELEM_MIXED  (1u << 3)
 #define AOT_ELEM_HOLEY  (1u << 4)
 #define AOT_ELEM_TA     (1u << 5)  /* a typed array's element */
+#define AOT_ELEM_BOOL   (1u << 6)
 #endif /* QJS_AOT_PROFILE */
 
 /* One polymorphic property cache entry: the receiver shape, the property's
@@ -61890,6 +61891,8 @@ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
         kind = AOT_ELEM_FLOAT;
     else if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
         kind = AOT_ELEM_OBJECT;
+    else if (JS_VALUE_GET_TAG(v) == JS_TAG_BOOL)
+        kind = AOT_ELEM_BOOL;
     else
         kind = AOT_ELEM_MIXED;
     if (holey == 2)
