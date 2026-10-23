@@ -1315,12 +1315,13 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
           int pre = out->loop_pre[k], j, bb, ii;
           if (out->loop_hdr[k] != b) continue;
           /* The loop can also be entered at its header with the registers taken from the
-             frame (a re-entry after an exit), which skips the preheader: only a value that
-             is live in a register there is known on that path. */
+             frame (a re-entry after an exit), which skips the preheader: a global read is known on
+             that path only if its value is live in a register there. */
           for (j = 0; j < outs[pre].navail; j++) {
             int li, live = 0;
             for (li = 0; li < blk->nlive_in; li++)
               if (blk->in_val[li] == outs[pre].avail[j].val) live = 1;
+            if (outs[pre].avail[j].key.kind != E_K_GLOBAL) live = 1;
             if (live && fs_set_avail(&cur, &outs[pre].avail[j].key, outs[pre].avail[j].val) < 0)
               goto done;
           }
