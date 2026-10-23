@@ -22033,6 +22033,9 @@ static __exception int regvm_for_of_start(JSContext *ctx, JSValue *regs_sp,
 #endif
 }
 
+static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val, int argc,
+                                 JSValueConst *argv, int *pdone, int magic);
+
 static __exception int regvm_for_of_next(JSContext *ctx, JSValue *regs_sp,
                                          int offset)
 {
@@ -22041,8 +22044,43 @@ static __exception int regvm_for_of_next(JSContext *ctx, JSValue *regs_sp,
     int done = 1;
 
     if (likely(!JS_IsUndefined(regs_sp[offset]))) {
-        value = JS_IteratorNext(ctx, regs_sp[offset], regs_sp[offset + 1],
-                                0, NULL, &done);
+        JSValue nx = regs_sp[offset + 1];
+
+        /* a plain generator's own `next`: resume it directly. A finished or delegating
+           (`yield*`) generator, and any other iterator, take the general protocol. */
+        if (likely(JS_VALUE_GET_TAG(nx) == JS_TAG_OBJECT &&
+                   JS_VALUE_GET_OBJ(nx)->class_id == JS_CLASS_C_FUNCTION &&
+                   JS_VALUE_GET_OBJ(nx)->u.cfunc.cproto == JS_CFUNC_iterator_next &&
+                   JS_VALUE_GET_OBJ(nx)->u.cfunc.c_function.iterator_next ==
+                       js_generator_next)) {
+            JSValueConst a0 = JS_UNDEFINED;
+
+            value = js_generator_next(ctx, regs_sp[offset], 1, &a0, &done,
+                                      JS_VALUE_GET_OBJ(nx)->u.cfunc.magic);
+            if (unlikely(done == 2)) {
+                /* a `yield*` result object: unpack it as JS_IteratorNext does */
+                JSValue obj = value, done_val;
+
+                done_val = JS_GetProperty(ctx, obj, JS_ATOM_done);
+                if (JS_IsException(done_val)) {
+                    JS_FreeValue(ctx, obj);
+                    value = JS_EXCEPTION;
+                    done = false;
+                } else {
+                    done = JS_ToBoolFree(ctx, done_val);
+                    value = JS_UNDEFINED;
+                    if (!done)
+                        value = JS_GetProperty(ctx, obj, JS_ATOM_value);
+                    JS_FreeValue(ctx, obj);
+                }
+            } else if (done) {
+                JS_FreeValue(ctx, value);
+                value = JS_UNDEFINED;
+            }
+        } else {
+            value = JS_IteratorNext(ctx, regs_sp[offset], regs_sp[offset + 1],
+                                    0, NULL, &done);
+        }
         if (JS_IsException(value))
             done = -1;
         if (done) {
@@ -62801,8 +62839,20 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
             }
         }
     }
-#endif
+    /* any other iterator: the handler's own steps, without the step table */
+    f->cap_ip = ip;
+    if (regvm_for_of_next(ctx, &fr[w + 2], -2)) {
+        regvm_ctl_iter_forget(ctx, f->ctl, f->nctl);
+        f->ret = JS_EXCEPTION;
+        return NULL;
+    }
+    /* the helper clears the iterator slot when the step reported done (also when it threw) */
+    if (JS_IsUndefined(fr[w]))
+        regvm_ctl_iter_forget(ctx, f->ctl, f->nctl);
+    return ip + 3;
+#else
     return qjs_aot_step(ip, fr, f, ctx);
+#endif
 }
 
 /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
