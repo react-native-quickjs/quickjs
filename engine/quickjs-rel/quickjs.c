@@ -2588,6 +2588,8 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
                         const JSClassDef *class_def, JSAtom name);
 static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int unshift);
+static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv, int shift);
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv);
 static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
@@ -61428,6 +61430,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->array_iter_kind_value = JS_ITERATOR_KIND_VALUE;
     out->off_cfunc_cproto = (uint32_t)offsetof(JSObject, u.cfunc.cproto);
     out->cfunc_cproto_iterator_next = JS_CFUNC_iterator_next;
+    out->cfunc_cproto_generic_magic = JS_CFUNC_generic_magic;
     out->off_rope_left = (uint32_t)offsetof(JSStringRope, left);
     out->off_rope_right = (uint32_t)offsetof(JSStringRope, right);
     out->off_ctx_ta_len_epoch = (uint32_t)offsetof(JSContext, regvm_ta_len_epoch);
@@ -63127,6 +63130,11 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
 QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void)
 {
     return (const void *)js_array_iterator_next;
+}
+
+QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
+{
+    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
 }
 
 /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is

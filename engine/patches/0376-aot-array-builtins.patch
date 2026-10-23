@@ -1,0 +1,66 @@
+Subject: Compiled code can identify Array.prototype.push and pop
+
+What this does
+  - `JSAotGenLayout` gains the prototype tag of a builtin that takes a magic number.
+  - `qjs_aot_array_builtin_fn` returns the function pointer of `js_array_push` or `js_array_pop`, which a
+    C function object holds, with magic 0, when it is Array.prototype.push or pop.
+
+Why we need it
+  `a.push(x)` and `a.pop()` on a dense array were a call into the engine each: the call helper, the
+  builtin's own checks and the length update, about 100 and 200 cycles. A generated site now tests that
+  the callee is the builtin (class, prototype tag, magic and function pointer), that the receiver is a
+  plain dense array (the initial array shape, extensible, standard array prototype, `length` an int equal
+  to the count) and, for push, that the storage has room, and for pop, that the last element is not a
+  hole: then the element is stored or taken and the count and `length` updated in place. Every other
+  case, a full array included, is the call as before.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2588,6 +2588,8 @@
+                         const JSClassDef *class_def, JSAtom name);
+ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv, int unshift);
++static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
++                            int argc, JSValueConst *argv, int shift);
+ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
+                                     int argc, JSValueConst *argv);
+ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
+@@ -61428,6 +61430,7 @@
+     out->array_iter_kind_value = JS_ITERATOR_KIND_VALUE;
+     out->off_cfunc_cproto = (uint32_t)offsetof(JSObject, u.cfunc.cproto);
+     out->cfunc_cproto_iterator_next = JS_CFUNC_iterator_next;
++    out->cfunc_cproto_generic_magic = JS_CFUNC_generic_magic;
+     out->off_rope_left = (uint32_t)offsetof(JSStringRope, left);
+     out->off_rope_right = (uint32_t)offsetof(JSStringRope, right);
+     out->off_ctx_ta_len_epoch = (uint32_t)offsetof(JSContext, regvm_ta_len_epoch);
+@@ -63129,6 +63132,11 @@
+     return (const void *)js_array_iterator_next;
+ }
+ 
++QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
++{
++    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
++}
++
+ /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
+    read from the table and the register borrows it (the table owns it for the context's life);
+    the element must still be present in a fast array, as in js_for_in_next. Everything else,
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -196,11 +196,16 @@
+        prototype tag and the tag of an iterator `next`. */
+     uint32_t class_array_iterator, off_array_iter_obj, off_array_iter_kind, off_array_iter_idx;
+     uint32_t array_iter_kind_value, off_cfunc_cproto, cfunc_cproto_iterator_next;
++    /* The prototype tag of a builtin that takes a magic number (Array's push and pop are such). */
++    uint32_t cfunc_cproto_generic_magic;
+ } JSAotGenLayout;
+ 
+ /* The function pointer of Array Iterator's `next`, which a C function object holds when it is
+    that builtin. */
+ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
++/* The function pointer of Array.prototype.push (0) or pop (1), which a C function object holds,
++   with magic 0, when it is that builtin. */
++QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+    the generator and the runtime. */

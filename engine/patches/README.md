@@ -461,3 +461,4 @@ bump while `9999` is missing.
 | `0373` | A stack overflow in compiled code builds its backtrace where it is thrown | A deep frameless recursion that overflowed printed one frame where the interpreter prints ten | `qjs_aot_throw_stack_overflow` | No. |
 | `0374` | The poll of a frameless body builds the backtrace of the exception it raises | An interrupt in a deep compiled recursion reported only the frame that caught it | `qjs_aot_poll_fl` | No. |
 | `0375` | The layout export carries what an inline step of an array iterator tests | A for-of over an array was an op call per element | `JSAotGenLayout`, `qjs_aot_array_iterator_next_fn` | No. |
+| `0376` | Compiled code can identify Array.prototype.push and pop | `a.push(x)` and `a.pop()` on a dense array were a call into the engine each | `qjs_aot_array_builtin_fn`, `JSAotGenLayout` | No. |
