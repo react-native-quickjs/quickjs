@@ -1,0 +1,112 @@
+Subject: The runtime counts changes of its register property cache entries
+
+What this does
+  - `JSRuntime.aot_pic_epoch` is incremented whenever a register property cache entry
+    (`JSRegPIC`) changes, and the layout export names its offset.
+
+Why we need it
+  A compiled function validated every cache cell it speculates on at each call (a load and a compare
+  per site: 8-14% of the instructions of a call-heavy kernel). It now remembers the epoch and the
+  cache table at which its cells last passed, and skips the validation while both are unchanged.
+
+Why the epoch is sound (every writer of a cell's shape, kind, slot offset, holder shape)
+  The fields of a `JSRegPIC` entry and of the holder arrays beside it are written in exactly these
+  places, and each one now bumps the epoch:
+    - `regvm_pic_entry_reset`: clears the entry and drops the references to its shapes. Every other
+      release of a cached shape (a refill, the miss limit, `js_free_regvm_pic` at teardown and when the
+      bytecode is freed, which calls it for every entry) goes through it.
+    - `regvm_pic_install`: stores a new shape/kind/slot and takes the references (it calls the reset
+      first, and bumps again after the fields are set).
+    - the two way swaps in `regvm_get_field_ic_x` and `regvm_get_field_ic`, which exchange the primary
+      entry and a way (shape, kind, slot and holder together) with no reset.
+    - `regvm_global_site_fill` (a global read site's entry) and the generation flush of the global
+      cells (`js_gv_site_flush`'s caller), which rewrite `slot_off` of entries of that kind.
+  The table itself is allocated once, zeroed (`regvm_pic_ensure`), so a function that validated while
+  the table did not exist sees a different table pointer afterwards; the compiled function keys its
+  cache on the table pointer as well. A shape that is freed and reallocated at the same address
+  cannot pass a stale validation: the entry holds a counted reference to its shape, so the shape is
+  freed only when the entry is reset, which bumps the epoch. The only other field written is `misses`
+  (an add-transition entry's watchpoint snapshot), which no validation reads.
+  A prototype's own shape can change without any entry changing, so a prototype read still tests its
+  holder's shape on every call.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -146,6 +146,8 @@
+        property is plainly writable. */
+     uint32_t off_ctx_gv_cells, sizeof_gv_cell, gv_cell_sets, gv_cell_ways;
+     uint32_t off_gvc_atom, off_gvc_gen, off_gvc_slot, off_gvc_wr;
++    /* Where the runtime counts changes of its property cache entries. */
++    uint32_t off_rt_pic_epoch;
+     /* The rest of the light-frame header a generated native entry writes, so
+        it can build the frame the engine's own light call builds. The header is
+        the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -718,6 +718,10 @@
+     /* Set once a lazily parsed JSON document has been created in this runtime: values it
+        holds can be lazy markers, which compiled code tests for only while this is set. */
+     uint8_t lazy_json_seen;
++    /* Bumped whenever a register property cache entry is cleared or refilled. A compiled
++       function that validated its cache cells at some epoch may trust them while it is
++       unchanged. */
++    uint32_t aot_pic_epoch;
+     /* Prototype/global watchpoint bumps, counted because the AOT
+        prototype-epoch guard assumes prototypes settle after startup. */
+     uint64_t aot_epoch_bumps;
+@@ -8281,6 +8285,7 @@
+     e->slot_off = 0;
+     e->misses = 0;
+     e->kind = REG_PIC_EMPTY;
++    rt->aot_pic_epoch++;
+ }
+ 
+ /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
+@@ -8892,6 +8897,7 @@
+             if (b->regvm_pic[j].kind == REG_PIC_GLOBAL)
+                 b->regvm_pic[j].slot_off = 0;
+         }
++        rt->aot_pic_epoch++;
+     }
+ }
+ #endif
+@@ -16119,6 +16125,7 @@
+     e->gslot = slot;
+     e->slot_off = gen;
+     e->kind = REG_PIC_GLOBAL;
++    ctx->rt->aot_pic_epoch++;
+     /* The profile counts the distinct generations a site was filled at: a site filled
+        twice saw the global object change. */
+     AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL);
+@@ -24531,6 +24538,7 @@
+     *pholder = hsh ? js_dup_shape(hsh) : NULL;
+     e->slot_off = slot * (uint32_t)sizeof(JSValue);
+     e->kind = kind;
++    rt->aot_pic_epoch++;
+ }
+ 
+ /* Hash an unhashed shape in place so the per-function PIC can hold it. A
+@@ -24915,6 +24923,7 @@
+                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
+                 *p2 = t; b->regvm_pic_holder[s2] = th;
+                 p2->misses = p1->misses; p1->misses = 0;
++                ctx->rt->aot_pic_epoch++;
+             }
+             return js_dup(v);
+         }
+@@ -24968,6 +24977,7 @@
+                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
+                 *p2 = t; b->regvm_pic_holder[s2] = th;
+                 p2->misses = p1->misses; p1->misses = 0;
++                ctx->rt->aot_pic_epoch++;
+             }
+ #if QJS_DRC
+             return js_dup(v2);
+@@ -61231,6 +61241,7 @@
+     out->off_gvc_gen = (uint32_t)offsetof(JSGVCell, gen);
+     out->off_gvc_slot = (uint32_t)offsetof(JSGVCell, slot);
+     out->off_gvc_wr = (uint32_t)offsetof(JSGVCell, wr);
++    out->off_rt_pic_epoch = (uint32_t)offsetof(JSRuntime, aot_pic_epoch);
+     out->off_ctx_interrupt_counter =
+         (uint32_t)offsetof(JSContext, interrupt_counter);
+     out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);

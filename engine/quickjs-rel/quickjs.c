@@ -718,6 +718,10 @@ struct JSRuntime {
     /* Set once a lazily parsed JSON document has been created in this runtime: values it
        holds can be lazy markers, which compiled code tests for only while this is set. */
     uint8_t lazy_json_seen;
+    /* Bumped whenever a register property cache entry is cleared or refilled. A compiled
+       function that validated its cache cells at some epoch may trust them while it is
+       unchanged. */
+    uint32_t aot_pic_epoch;
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
@@ -8281,6 +8285,7 @@ static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
     e->slot_off = 0;
     e->misses = 0;
     e->kind = REG_PIC_EMPTY;
+    rt->aot_pic_epoch++;
 }
 
 /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
@@ -8892,6 +8897,7 @@ static void js_gv_site_flush(JSRuntime *rt, struct list_head *head)
             if (b->regvm_pic[j].kind == REG_PIC_GLOBAL)
                 b->regvm_pic[j].slot_off = 0;
         }
+        rt->aot_pic_epoch++;
     }
 }
 #endif
@@ -16119,6 +16125,7 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
     e->gslot = slot;
     e->slot_off = gen;
     e->kind = REG_PIC_GLOBAL;
+    ctx->rt->aot_pic_epoch++;
     /* The profile counts the distinct generations a site was filled at: a site filled
        twice saw the global object change. */
     AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL);
@@ -24531,6 +24538,7 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
     *pholder = hsh ? js_dup_shape(hsh) : NULL;
     e->slot_off = slot * (uint32_t)sizeof(JSValue);
     e->kind = kind;
+    rt->aot_pic_epoch++;
 }
 
 /* Hash an unhashed shape in place so the per-function PIC can hold it. A
@@ -24915,6 +24923,7 @@ static inline __attribute__((always_inline)) JSValue regvm_get_field_ic_x(
                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
                 *p2 = t; b->regvm_pic_holder[s2] = th;
                 p2->misses = p1->misses; p1->misses = 0;
+                ctx->rt->aot_pic_epoch++;
             }
             return js_dup(v);
         }
@@ -24968,6 +24977,7 @@ static __attribute__((noinline)) JSValue regvm_get_field_ic_slow(JSContext *ctx,
                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
                 *p2 = t; b->regvm_pic_holder[s2] = th;
                 p2->misses = p1->misses; p1->misses = 0;
+                ctx->rt->aot_pic_epoch++;
             }
 #if QJS_DRC
             return js_dup(v2);
@@ -61231,6 +61241,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_gvc_gen = (uint32_t)offsetof(JSGVCell, gen);
     out->off_gvc_slot = (uint32_t)offsetof(JSGVCell, slot);
     out->off_gvc_wr = (uint32_t)offsetof(JSGVCell, wr);
+    out->off_rt_pic_epoch = (uint32_t)offsetof(JSRuntime, aot_pic_epoch);
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);
     out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);
