@@ -1,0 +1,25 @@
+Subject: The profiler names a read two prototypes up apart from a direct prototype read
+
+What this does
+  - `regvm_pic_fill` passes `REG_PIC_PROTO2` to the profile for a holder two prototypes up, and
+    `REG_PIC_PROTO` only for a direct prototype (profile builds only).
+
+Why we need it
+  A direct prototype read is served by the function's own cache entry and a compiled body can read it
+  inline; a read two prototypes up is only in the global stub cache, so it never hits there. The profile
+  recorded both as the same kind, so the generator could not tell which sites a body may group.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24619,7 +24619,10 @@
+         return;
+ 
+     rsh = p->shape;
+-    AOT_PROF_PIC(b, site, rsh, depth == 0 ? REG_PIC_OWN : REG_PIC_PROTO);
++    /* A read two prototypes up is cached only by the global stub cache, never by the
++       function's own cache entry, so the profile names it apart from a direct prototype. */
++    AOT_PROF_PIC(b, site, rsh,
++                 depth == 0 ? REG_PIC_OWN : depth == 1 ? REG_PIC_PROTO : REG_PIC_PROTO2);
+     slot = (uint32_t)(pr - holder->prop);
+ 
+     /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);

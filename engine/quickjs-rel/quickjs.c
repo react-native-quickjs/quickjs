@@ -24619,7 +24619,10 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
         return;
 
     rsh = p->shape;
-    AOT_PROF_PIC(b, site, rsh, depth == 0 ? REG_PIC_OWN : REG_PIC_PROTO);
+    /* A read two prototypes up is cached only by the global stub cache, never by the
+       function's own cache entry, so the profile names it apart from a direct prototype. */
+    AOT_PROF_PIC(b, site, rsh,
+                 depth == 0 ? REG_PIC_OWN : depth == 1 ? REG_PIC_PROTO : REG_PIC_PROTO2);
     slot = (uint32_t)(pr - holder->prop);
 
     /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);

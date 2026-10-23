@@ -451,3 +451,4 @@ bump while `9999` is missing.
 | `0363` | The profiler records element misses and typed-array receivers | A read past the end or a typed-array access looked like a numeric dense-array hit | `AOT_ELEM_HOLEY` on reads, `AOT_ELEM_TA` | No. |
 | `0364` | The profiler records boolean elements apart from other kinds | An array of booleans looked like a mixed array | `AOT_ELEM_BOOL` | No. |
 | `0365` | The profiler counts how often a global read cache cell was filled | An exit-on-miss global read must be cheap | `regvm_global_site_fill` | No. |
+| `0366` | The profiler names a read two prototypes up apart from a direct prototype read | A body could not tell which method-read sites its own cache serves inline | `regvm_pic_fill` | No. |
