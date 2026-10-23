@@ -437,3 +437,4 @@ bump while `9999` is missing.
 | `0349` | A generator or async frame is resumed without JS_CallInternal | Every next()/await step paid the call prologue to reach the generator branch | `js_regvm_resume_coroutine` | No. |
 | `0350` | An error's stack frames resolve line and column when the stack is read | Every `new Error` scanned the line table of each frame | `JSErrorStackFrame` keeps code + key | No. |
 | `0351` | A compiled `s += constant` appends in place without the frame scan | The in-place append scanned every register for another holder (75 of ~200 instructions) | `regvm_accum_append_u`, `qjs_aot_append_const` | No. |
+| `0352` | A parked coroutine with compiled code resumes straight into the unit | Each resume entered js_regvm_execute for ~200 instructions of setup | `js_aot_run_coroutine`, `JS_CALL_FLAG_AOT_DEOPT` | No. |

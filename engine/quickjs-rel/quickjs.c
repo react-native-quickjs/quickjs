@@ -22957,6 +22957,9 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 
 #define JS_ARGV_SAFE(b) ((b)->argv_safe)
 #define JS_CALL_FLAG_GENERATOR   (1 << 2)
+/* A compiled coroutine left a guard: the register interpreter continues the parked frame at the
+   pc in sf->cur_pc (not as a resumption of a yield), without entering compiled code again. */
+#define JS_CALL_FLAG_AOT_DEOPT   (1 << 3)
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -32646,6 +32649,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             /* the marker is ours now; sf->cur_pc must never hold a register pc
                while the frame is running */
             sf->cur_pc = NULL;
+            /* a deopt continues at an instruction, it does not resume a yield */
+            if (unlikely(flags & JS_CALL_FLAG_AOT_DEOPT))
+                regvm_resume_marker = NULL;
             regvm_nctl = JS_VALUE_GET_INT(regs[b->regvm_reg_count]);
         }
         sp = regs + b->regvm_reg_count + REGVM_HS - 1;
@@ -32675,7 +32681,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
            resume re-enters here: the marker is an instruction start, so the
            unit jumps to it. A function whose guards have failed too many times
            is disabled: its calls fall through to the interpreter below. */
-        if (unlikely(b->aot_fn != NULL)) {
+        if (unlikely(b->aot_fn != NULL) && !(flags & JS_CALL_FLAG_AOT_DEOPT)) {
             JSAotRun *ar = rt->aot_run;
 
             if (likely(ar == NULL || ar->disabled == NULL ||
@@ -42272,6 +42278,78 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     JS_FreeValueRT(rt, s->this_val);
 }
 
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+/* Resume a parked coroutine whose function has compiled code, without js_regvm_execute's
+   activation: the same hand-over (the window returns to borrowing, the control depth is read
+   back, the activation record is filled) and a direct call of the unit at the resume point.
+   Everything js_regvm_execute does after the unit returns for a coroutine is done here too.
+   A deopt (the unit left a guard to this frame) continues the frame in the full interpreter
+   at the recorded pc. `pc`, `sp` are the saved resting state; the frame links are already
+   made. */
+static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
+                                    JSStackFrame *sf, JSFunctionBytecode *b,
+                                    JSValue *sp, uint8_t *pc)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSValue *regs = sf->var_buf + b->var_count;
+    JSRegRun run;
+    JSValue ret_val;
+    uint32_t entry_pc;
+
+    if (sf->rv_owns_regs)
+        js_regvm_drc_resume(rt, regs, (uint32_t)(b->regvm_reg_count + 1));
+    sf->rv_owns_regs = 0;
+    sf->cur_pc = NULL;
+    run.caller_ctx = ctx;
+    run.b = b;
+    run.pic = b->regvm_pic;
+    run.sf = sf;
+    sf->rv_rec = &run;
+    run.func = p;
+    run.cap_ip = NULL;
+    run.var_refs = p->u.func.var_refs;
+    run.this_obj = s->this_val;
+    run.new_target = JS_UNDEFINED;
+    run.argc = s->argc;
+    run.argv = sf->arg_buf;
+    run.ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
+    run.nctl = JS_VALUE_GET_INT(regs[b->regvm_reg_count]);
+    run.arg_buf = sf->arg_buf;
+    run.var_buf = sf->var_buf;
+    run.ret = JS_UNDEFINED;
+    run.flags = JS_CALL_FLAG_GENERATOR;
+    run.caller = NULL;
+    run.ret_ip = NULL;
+    run.ret_dst = 0;
+    run.fr = regs;
+    run.local_buf = sf->arg_buf;
+    run.local_count = 0;
+    run.arg_owned = 1;
+    run.resume_marker = pc;
+    run.deopt_pc = QJS_AOT_NO_DEOPT;
+    entry_pc = (uint32_t)(pc - b->regvm_code);
+    js_aot_enter_count++;
+    ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, entry_pc);
+    if (unlikely(run.deopt_pc != QJS_AOT_NO_DEOPT)) {
+        /* Hand the frame to the interpreter: the control depth goes back to its slot and the
+           continuation is the recorded pc. */
+        regs[b->regvm_reg_count] = js_int32(run.nctl);
+        sf->cur_pc = b->regvm_code + run.deopt_pc;
+        return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
+                                s->argc, vc(sf->arg_buf), sf, b, sf->arg_buf, sf->arg_buf,
+                                sf->var_buf, regs, sp, pc,
+                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT, 0);
+    }
+    sf->cur_pc = run.sf->cur_pc;
+    sf->cur_sp = run.sf->cur_sp;
+    regs[b->regvm_reg_count] = js_int32(run.nctl);
+    rt->regvm_cur = sf->rv_light;
+    rt->current_stack_frame = sf->prev_frame;
+    return ret_val;
+}
+#endif
+
 #if QJS_REGVM
 /* Resume a parked generator or async frame directly in the register interpreter: the same
    frame hand-over JS_CallInternal does for JS_CALL_FLAG_GENERATOR, without that function's
@@ -42301,6 +42379,15 @@ static JSValue js_regvm_resume_coroutine(JSContext *ctx, JSAsyncFunctionState *s
     rt->regvm_cur = NULL;
     rt->current_stack_frame = sf;
     throw_pending = s->throw_flag != 0;
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled) {
+        JSAotRun *ar = rt->aot_run;
+
+        if (likely(ar == NULL || ar->disabled == NULL ||
+                   !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))
+            return js_aot_run_coroutine(ctx, s, sf, b, sp, pc);
+    }
+#endif
     return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
                             s->argc, vc(arg_buf), sf, b, local_buf, arg_buf, var_buf,
                             stack_buf, sp, pc, JS_CALL_FLAG_GENERATOR, throw_pending);
