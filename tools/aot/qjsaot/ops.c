@@ -4359,33 +4359,40 @@ static int emit_typed_fused(
                t->lb[cv] == E_LB_I32 && t->lb[dv] == E_LB_I32 &&
                t->lb[rv] == E_LB_I32) {
       /* Step 1: the product, with the -0 exit the multiply already has. */
-      e_sweep_guard(f, "ox", in->pc);
-      fprintf(
-          f,
-          "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n"
-          "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-          "goto ox_%d;\n"
-          "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) "
-          "goto ox_%d;\n"
-          "      i%u = (int32_t)_t; }\n",
-          (unsigned)xv, (unsigned)yv, in->pc, (unsigned)xv, (unsigned)yv,
-          in->pc, (unsigned)dv);
-      /* Step 2: the sum or difference. */
-      fprintf(
-          f,
-          "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n"
-          "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-          "goto ox_%d;\n"
-          "      i%u = (int32_t)_t; }\n",
-          (unsigned)(c_first ? cv : dv), is_add ? "+" : "-",
-          (unsigned)(c_first ? dv : cv), in->pc, (unsigned)rv);
+      {
+        int ovf1 = t->exits == NULL || (t->exits[dv] & E_EX_OVF);
+        int nz1 = t->exits == NULL || (t->exits[dv] & E_EX_NEGZERO);
+        int ovf2 = t->exits == NULL || (t->exits[rv] & E_EX_OVF);
+        if (ovf1 || nz1 || ovf2) e_sweep_guard(f, "ox", in->pc);
+        fprintf(f, "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n", (unsigned)xv, (unsigned)yv);
+        if (ovf1)
+          fprintf(
+              f,
+              "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) goto ox_%d;\n",
+              in->pc);
+        if (nz1)
+          fprintf(
+              f,
+              "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) goto ox_%d;\n",
+              (unsigned)xv, (unsigned)yv, in->pc);
+        fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)dv);
+        /* Step 2: the sum or difference. */
+        fprintf(f, "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n",
+            (unsigned)(c_first ? cv : dv), is_add ? "+" : "-", (unsigned)(c_first ? dv : cv));
+        if (ovf2)
+          fprintf(
+              f,
+              "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) goto ox_%d;\n",
+              in->pc);
+        fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)rv);
+        if (ovf1 || nz1 || ovf2)
+          e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+      }
     } else {
       return 0;
     }
     (void)is_add;
     (void)op;
-    e_note_stub(
-        g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
     if (cur != NULL) {
       cur[ldm] = dv;
       cur[ld] = rv;

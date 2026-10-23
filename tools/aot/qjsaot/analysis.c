@@ -996,6 +996,10 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
       Q2ValueId v = in->def[d];
       if (out->lb[v] != E_LB_I32) continue;
       out->exits[v] = exits_for(in->rop, in->sub, in->op == Q2_OP_FALLBACK);
+      /* a fused multiply-add pair: the product has mul's exits, the sum add's */
+      if ((in->rop == ROP_mul_add || in->rop == ROP_mul_sub || in->rop == ROP_add_mul ||
+           in->rop == ROP_sub_mul) && in->op != Q2_OP_FALLBACK)
+        out->exits[v] = d == 0 ? (E_EX_OVF | E_EX_NEGZERO) : E_EX_OVF;
     }
   }
 
