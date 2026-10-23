@@ -8950,7 +8950,7 @@ static int emit_tag_branch_null(
         f,
         "    { uint32_t tg_ = (uint32_t)JS_VALUE_GET_TAG(v%u);\n"
         "      c_ = tg_ == JS_TAG_NULL || tg_ == JS_TAG_UNDEFINED ||\n"
-        "           (tg_ == (uint32_t)JS_TAG_OBJECT && qjs_aot_nullish(v%u)); }\n",
+        "           (tg_ == (uint32_t)JS_TAG_OBJECT && q2_nullish_obj(v%u)); }\n",
         (unsigned)a, (unsigned)a);
   else
     fprintf(f, "    c_ = JS_VALUE_GET_TAG(v%u) == JS_TAG_NULL;\n", (unsigned)a);
