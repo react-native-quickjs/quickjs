@@ -3196,19 +3196,23 @@ int qjsaot_driver_main(int argc, char **argv) {
        of loads rather than a call across the unit boundary. A miss returns 0 and
        the caller takes the cache-filling slow path and continues. */
     /* QJS_AOT_FORCE_MISS: forces every spec-body inline cache hit to fail, so
-       the miss path (the op-call wrapper) runs on the EXISTING tests. The test is
-       a static load, so it costs nothing when unset, and the environment is read
-       once per process on the first spec-body entry. */
+       the miss path (the op-call wrapper) runs on the EXISTING tests. A unit
+       built with -DQJS_AOT_FORCE_MISS_ENV reads the variable once at load; any
+       other unit has no test at all, because a load and a branch at every
+       cache site cost instructions on every hot path. */
     fprintf(
         f,
+        "#ifdef QJS_AOT_FORCE_MISS_ENV\n"
         "static int q2_force_miss_cache = -1;\n"
-        "#define q2_force_miss q2_force_miss_cache\n"
-        "#define Q2_FORCE_MISS (q2_force_miss > 0)\n"
+        "#define Q2_FORCE_MISS (q2_force_miss_cache > 0)\n"
         "static void __attribute__((constructor, unused)) q2_force_miss_init(void)\n"
         "{\n"
         "  const char *v = getenv(\"QJS_AOT_FORCE_MISS\");\n"
         "  q2_force_miss_cache = v != NULL && v[0] != 0 && v[0] != '0';\n"
         "}\n"
+        "#else\n"
+        "#define Q2_FORCE_MISS 0\n"
+        "#endif\n"
         /* QJS_AOT_SPEC_FNS="<lo>-<hi>" allows the spec body only for function
            indices in that range, so a miscompile can be pinned to ONE function by
            halving the range. A run-time test, so a stale unit cannot fake it. */

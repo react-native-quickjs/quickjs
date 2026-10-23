@@ -197,8 +197,11 @@ def cmd_run(args):
             "interp": ([plain, path], {}),
             "spec_on": ([run, path], {}),
             "spec_off": ([run, path], {"QJS_AOT_SPEC": "0"}),
-            "force_miss": ([run, path], {"QJS_AOT_FORCE_MISS": "1"}),
         }
+        # A unit has the forced-miss test only when it is built with
+        # E_DEFS=-DQJS_AOT_FORCE_MISS_ENV; every other unit has no such test.
+        if os.environ.get("E_DEFS", "").find("QJS_AOT_FORCE_MISS_ENV") >= 0:
+            modes["force_miss"] = ([run, path], {"QJS_AOT_FORCE_MISS": "1"})
         ref = None
         for mode, (cmd, env) in modes.items():
             best, outp = None, None
@@ -240,7 +243,7 @@ def summarise(rows, out):
     gm = math.exp(sum(math.log(x) for x, _ in ratios) / len(ratios)) if ratios else 0.0
     ratios_off = [r["spec_off"] / r["interp"] for r in ok if r["interp"] > 0 and r["spec_off"] > 0]
     gm_off = math.exp(sum(math.log(x) for x in ratios_off) / len(ratios_off)) if ratios_off else 0.0
-    ratios_fm = [r["force_miss"] / r["interp"] for r in ok if r["interp"] > 0 and r["force_miss"] > 0]
+    ratios_fm = [r.get("force_miss", 0) / r["interp"] for r in ok if r["interp"] > 0 and r.get("force_miss", 0) > 0]
     gm_fm = math.exp(sum(math.log(x) for x in ratios_fm) / len(ratios_fm)) if ratios_fm else 0.0
     per = [r["bytes"] / r["funcs"] for r in ok if r["funcs"]]
     lines = []
@@ -272,7 +275,7 @@ def summarise(rows, out):
     lines.append("worst 50 by spec-on / interpreted:")
     for x, r in sorted(ratios, key=lambda p: -p[0])[:50]:
         lines.append("  %-44s %6.2fx  interp %7.1f ms  on %7.1f  off %7.1f  miss %7.1f  bytes/fn %6.0f" % (
-            r["name"], x, r["interp"], r["spec_on"], r["spec_off"], r["force_miss"],
+            r["name"], x, r["interp"], r["spec_on"], r["spec_off"], r.get("force_miss", 0),
             r["bytes"] / r["funcs"] if r["funcs"] else 0))
     hot = []
     for r in ok:
