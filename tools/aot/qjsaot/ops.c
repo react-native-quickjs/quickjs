@@ -1607,7 +1607,7 @@ static int emit_native_length(
   fprintf(
       f,
       "    if (__builtin_expect(q2_array_length(ctx, AOT_REG(fr, %d), "
-      "&_len), 1)) {\n",
+      "&_len, NULL, NULL), 1)) {\n",
       recv);
   emit_site_hit(f, in);
   fprintf(
@@ -3720,6 +3720,13 @@ static void e_emit_presync(
         typed i32/f64/bool is not safe to read blindly. A mismatch is a deopt exit at
         the NEXT pc, because the op has run and its result is in the frame.
    Nothing is forwarded across the call. */
+/* The speculative body keeps `ta_ok`/`ta_sh`: the shape of a typed array whose `length` read
+   was checked in full, valid while nothing has run that could reshape an object or redefine
+   `length`. It is cleared after every instruction that might (e_ta_keeps decides) and in
+   the miss arm of every op call. Set by an emitter whose inline path runs no JS and whose
+   miss goes through emit_typed_opcall. */
+static int g_e_ta_used, g_e_ta_keep;
+
 static int emit_typed_opcall(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     const uint64_t *live, char hex[33], int fi, int b);
@@ -3761,6 +3768,7 @@ static int emit_typed_opcall(
 
   e_emit_presync(f, fn, in, t, cur);
   (void)live;
+  if (g_e_ta_used) fprintf(f, "    ta_ok = 0;\n");
 
   /* 3. The call, and 4. the sentinels plus the control-transfer test. */
   /* The spec body has no `code`/`ip` locals -- those names belong to the generic
@@ -4388,7 +4396,7 @@ static int emit_typed_length(
   fprintf(f, "    { double _len;\n");
   fprintf(
       f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_array_length(ctx, v%u, &_len), 1)) {\n",
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_array_length(ctx, v%u, &_len, &ta_sh, &ta_ok), 1)) {\n",
       (unsigned)rv);
   fprintf(f, "        i%u = (int32_t)_len;\n", (unsigned)dv);
   fprintf(f, "      } else {\n");
@@ -4397,6 +4405,7 @@ static int emit_typed_length(
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
+  g_e_ta_keep = 1;
   return 1;
 }
 
@@ -4482,6 +4491,7 @@ static int emit_typed_elem_read(
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
+  g_e_ta_keep = 1;
   return 1;
 }
 
@@ -4548,6 +4558,7 @@ static int emit_typed_elem_write(
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   e_inl_store_mark(f);
+  g_e_ta_keep = 1;
   return 1;
 }
 
@@ -6309,6 +6320,7 @@ static int emit_typed_global_read(
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
+  g_e_ta_keep = 1;
   return 1;
 }
 
@@ -8777,6 +8789,31 @@ int e_irreducible = 0;
    the atom, with the object as the receiver, as the element read does. The key's register
    must be dead after the read. Returns 1 when both instructions were emitted. */
 static uint8_t *g_e_pre_done;
+/* Whether the typed-array shape check survives this instruction: nothing it runs can execute
+   JS or reshape an object. The role table says what the interpreter's handler may do; a
+   numeric instruction whose operands and results are all typed runs only machine code. */
+static int e_ta_keeps(const Q2Func *fn, const Q2Insn *in, const ETypes *t) {
+  const ERole *role = e_roles[in->rop];
+  int u, d;
+
+  if (role == NULL) return 0;
+  if (!role->runs_js && !role->allocates) return 1;
+  if (t == NULL) return 0;
+  if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
+      in->op != Q2_OP_BRANCH && in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_POST_INC)
+    return 0;
+  for (u = 0; u < in->nuse; u++)
+    if (in->use[u] >= (Q2ValueId)t->nvalues || t->lb[in->use[u]] == E_LB_TAG ||
+        t->lb[in->use[u]] == E_LB_BOT)
+      return 0;
+  for (d = 0; d < in->ndef; d++)
+    if (in->def[d] >= (Q2ValueId)t->nvalues || t->lb[in->def[d]] == E_LB_TAG ||
+        t->lb[in->def[d]] == E_LB_BOT)
+      return 0;
+  (void)fn;
+  return 1;
+}
+
 static int e_try_fuse_atom_get(
     FILE *f, const Q2Func *fn, int i2, int b, int blk_end, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi) {
@@ -9349,6 +9386,11 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     }
     (void)any;
   }
+  g_e_ta_used = 0;
+  for (k = 0; k < fn->ninsns; k++)
+    if (fn->insns[k].rop == ROP_get_length) g_e_ta_used = 1;
+  if (g_e_ta_used)
+    fprintf(f, "    const void *ta_sh = NULL; int ta_ok = 0; (void)ta_sh; (void)ta_ok;\n");
   if (g_e_fl) e_compute_rooted(fn);
   if (g_e_fl)
     fprintf(f, "    (void)fr; (void)ctx; (void)caller_f; (void)this_obj;\n");
@@ -9419,7 +9461,9 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       const ERole *role = e_roles[in->rop];
       /* A terminator ends the block: a return, branch or switch lowers here, any
          other exits at the terminator's pc. */
+      g_e_ta_keep = 0;
       if (role != NULL && role->control != E_CF_NONE) {
+        if (g_e_ta_used && !e_ta_keeps(fn, in, &types)) fprintf(f, "    ta_ok = 0;\n");
         if (emit_typed_return(f, fn, in, &types, cur, have_types)) {
           lowered_to = i2 + 1;
           if (g_e_opcalls != oc0)
@@ -9474,6 +9518,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       {
         int fz = e_try_fuse_atom_get(f, fn, i2, b, blk->first_insn + blk->ninsns, &types, cur,
                                      have_types, hex, fi);
+        if (fz && g_e_ta_used) fprintf(f, "    ta_ok = 0;\n");
         if (fz == 1) {
           e_note_defs(cur, fn, &fn->insns[i2 + 1]);
           g_e_n_opcall++;
@@ -9567,6 +9612,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
           break;
         }
         e_note_defs(cur, fn, in);
+        if (g_e_ta_used && !g_e_ta_keep && !e_ta_keeps(fn, in, &types))
+          fprintf(f, "    ta_ok = 0;\n");
       }
       lowered_to = i2 + 1;
       if (g_e_opcalls != oc0)
