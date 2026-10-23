@@ -1217,9 +1217,6 @@ struct JSContext {
     */
     uint8_t std_array_prototype : 1;
     uint32_t regvm_ta_len_epoch;
-    /* the decimal strings of 0..255, made on first use: a for-in over a small array hands
-       out the same string for the same index instead of formatting one each time */
-    JSValue *small_int_str;
 
     JSShape *array_shape;   /* initial shape for Array objects */
     JSShape *arguments_shape;  /* shape for arguments objects */
@@ -5122,13 +5119,6 @@ void JS_FreeContext(JSContext *ctx)
         return;
     assert(JS_REF_COUNT(ctx) == 0);
 
-    if (ctx->small_int_str) {
-        for (i = 0; i < 256; i++)
-            JS_FreeValue(ctx, ctx->small_int_str[i]);
-        js_free(ctx, ctx->small_int_str);
-        ctx->small_int_str = NULL;
-    }
-
     if (rt->forin_shape) {
         js_free_shape(rt, rt->forin_shape);
         rt->forin_shape = NULL;
@@ -6440,7 +6430,7 @@ static inline JSValue js_empty_string(JSRuntime *rt)
 static JSValue js_int_to_string(JSContext *ctx, int32_t v)
 {
     char buf[16];
-    size_t len = i32toa(buf, v);
+    size_t len;
 
     if ((uint32_t)v < JS_INTSTR_MAX) {
         JSRuntime *rt = ctx->rt;
@@ -6450,6 +6440,7 @@ static JSValue js_int_to_string(JSContext *ctx, int32_t v)
             JS_REF_COUNT(p)++;
             return JS_MKPTR(JS_TAG_STRING, p);
         }
+        len = i32toa(buf, v);
         {
             JSValue s = js_new_string8_len(ctx, buf, len);
 
@@ -6461,6 +6452,7 @@ static JSValue js_int_to_string(JSContext *ctx, int32_t v)
             return s;
         }
     }
+    len = i32toa(buf, v);
     return js_new_string8_len(ctx, buf, len);
 }
 
@@ -21704,37 +21696,12 @@ static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
-/* The string of an array index (the key a for-in over an array yields). The strings for 0..255
-   are shared. */
+/* The string of an array index (the key a for-in over an array yields): the runtime's shared
+   strings for 0..255, else a new one. */
 static JSValue js_index_to_string(JSContext *ctx, uint32_t idx)
 {
-    if (idx < 256) {
-        JSValue *tab = ctx->small_int_str;
-        if (unlikely(!tab)) {
-            int i;
-            tab = js_malloc(ctx, sizeof(JSValue) * 256);
-            if (!tab)
-                return JS_EXCEPTION;
-            for (i = 0; i < 256; i++)
-                tab[i] = JS_UNDEFINED;
-            ctx->small_int_str = tab;
-        }
-        if (unlikely(JS_IsUndefined(tab[idx]))) {
-            char buf[4];
-            int n = 0;
-            if (idx >= 100)
-                buf[n++] = '0' + idx / 100;
-            if (idx >= 10)
-                buf[n++] = '0' + idx / 10 % 10;
-            buf[n++] = '0' + idx % 10;
-            tab[idx] = js_new_string8_len(ctx, buf, n);
-            if (JS_IsException(tab[idx])) {
-                tab[idx] = JS_UNDEFINED;
-                return JS_EXCEPTION;
-            }
-        }
-        return js_dup(tab[idx]);
-    }
+    if (idx < JS_INTSTR_MAX)
+        return js_int_to_string(ctx, (int32_t)idx);
     return JS_AtomToValue(ctx, __JS_AtomFromUInt32(idx));
 }
 
@@ -62953,18 +62920,18 @@ QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
         if (likely(p->class_id == JS_CLASS_FOR_IN_ITERATOR)) {
             JSForInIterator *it = p->u.for_in_iterator;
 
-            if (likely(it->is_array && it->idx < it->array_length && it->idx < 256 &&
-                       ctx->small_int_str != NULL &&
+            if (likely(it->is_array && it->idx < it->array_length && it->idx < JS_INTSTR_MAX &&
                        JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT)) {
                 JSObject *ao = JS_VALUE_GET_OBJ(it->obj);
-                JSValue key = ctx->small_int_str[it->idx];
+                JSString *ks = ctx->rt->intstr[it->idx];
 
                 if (likely(ao->class_id == JS_CLASS_ARRAY && ao->fast_array &&
                            it->idx < (uint32_t)ao->u.array.count &&
                            !js_array_slot_is_hole(ao->u.array.u.values[it->idx]) &&
-                           !JS_IsUndefined(key))) {
+                           ks != NULL)) {
+                    /* the runtime's table owns the string for the runtime's life */
                     it->idx++;
-                    fr[w + 1] = key;
+                    fr[w + 1] = JS_MKPTR(JS_TAG_STRING, ks);
                     fr[w + 2] = JS_FALSE;
                     return ip + 3;
                 }
