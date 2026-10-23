@@ -2768,11 +2768,7 @@ static void e_load_arg_to_local(
     case 'i':
       e_sweep_guard(f, "ax", pc);
       fprintf(
-          f,
-          "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
-          "JS_TAG_INT, 0)) goto ax_%d;\n",
-          slot, pc);
-      fprintf(f, "    %s = JS_VALUE_GET_INT(q2_arg_buf(f)[%d]);\n", dn, slot);
+          f, "    if (__builtin_expect(!Q2_I32_OK(q2_arg_buf(f)[%d], %s), 0)) goto ax_%d;\n", slot, dn, pc);
       break;
     case 'd':
       e_sweep_guard(f, "ax", pc);
@@ -3867,10 +3863,9 @@ static int emit_typed_var_ref_load(
     fprintf(
         f,
         "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(_c) != JS_TAG_INT, 0)) "
-        "goto vx_%d;\n"
-        "      i%u = JS_VALUE_GET_INT(_c); }\n",
-        slot, in->pc, (unsigned)d);
+        "      if (__builtin_expect(!Q2_I32_OK(_c, i%u), 0)) "
+        "goto vx_%d; }\n",
+        slot, (unsigned)d, in->pc);
   } else if (t->lb[d] == E_LB_F64) {
     e_sweep_guard(f, "vx", in->pc);
     fprintf(
@@ -4123,10 +4118,9 @@ static int emit_typed_opcall(
         fprintf(
             f,
             "    { JSValue _r = AOT_REG(fr, %d);\n"
-            "      if (__builtin_expect(JS_VALUE_GET_TAG(_r) != JS_TAG_INT, 0)) "
-            "goto dx_%d;\n"
-            "      i%u = JS_VALUE_GET_INT(_r); }\n",
-            reg * 16, in->next, (unsigned)v);
+            "      if (__builtin_expect(!Q2_I32_OK(_r, i%u), 0)) "
+            "goto dx_%d; }\n",
+            reg * 16, (unsigned)v, in->next);
         any = 1;
         break;
       case E_LB_F64:
@@ -4847,10 +4841,9 @@ static int emit_typed_elem_read(
       if (t->lb[dv] == E_LB_I32)
         fprintf(
             f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT, "
-            "0)) { AOT_SET_B(ctx, fr, %d, _e); goto dx_%d; }\n"
-            "        i%u = JS_VALUE_GET_INT(_e);\n",
-            dreg * 16, in->next, (unsigned)dv);
+            "        if (__builtin_expect(!Q2_I32_OK(_e, i%u), "
+            "0)) { AOT_SET_B(ctx, fr, %d, _e); goto dx_%d; }\n",
+            (unsigned)dv, dreg * 16, in->next);
       else if (t->lb[dv] == E_LB_F64)
         fprintf(
             f,
@@ -6407,9 +6400,8 @@ static int emit_alloc_op(
     e_sweep_guard(f, "dx", in->next);
     fprintf(
         f,
-        "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) goto dx_%d;\n"
-        "        i%u = JS_VALUE_GET_INT(_o);\n",
-        in->next, (unsigned)dv);
+        "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) goto dx_%d;\n",
+        (unsigned)dv, in->next);
   } else if (t->lb[dv] == E_LB_BOOL) {
     e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
     e_sweep_guard(f, "dx", in->next);
@@ -6777,9 +6769,8 @@ static int emit_pure_call(
       if (t->lb[dv] == E_LB_I32)
         fprintf(
             f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) %s\n"
-            "        i%u = JS_VALUE_GET_INT(_o);\n",
-            miss, (unsigned)dv);
+            "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) %s\n",
+            (unsigned)dv, miss);
       else if (t->lb[dv] == E_LB_BOOL)
         fprintf(
             f,
@@ -6965,10 +6956,9 @@ static int emit_typed_call(
       e_sweep_guard(f, "dx", in->next);
       fprintf(
           f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) "
-          "goto dx_%d;\n"
-          "        i%u = JS_VALUE_GET_INT(_o);\n",
-          in->next, (unsigned)dv);
+          "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) "
+          "goto dx_%d;\n",
+          (unsigned)dv, in->next);
     } else if (t->lb[dv] == E_LB_BOOL) {
       e_sweep_guard(f, "dx", in->next);
       fprintf(
@@ -7022,10 +7012,9 @@ static int emit_typed_call(
         e_sweep_guard(f, "dx", in->next);
         fprintf(
             f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) "
-            "goto dx_%d;\n"
-            "        i%u = JS_VALUE_GET_INT(_o);\n",
-            in->next, (unsigned)dv);
+            "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) "
+            "goto dx_%d;\n",
+            (unsigned)dv, in->next);
       } else if (t->lb[dv] == E_LB_BOOL) {
         e_sweep_guard(f, "dx", in->next);
         fprintf(
@@ -7871,10 +7860,9 @@ static int emit_hit_result(
   if (t->lb[dv] == E_LB_I32)
     fprintf(
         f,
-        "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) "
-        "{ AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n"
-        "        i%u = JS_VALUE_GET_INT(%s);\n",
-        raw, dreg * 16, raw, in->next, (unsigned)dv, raw);
+        "        if (__builtin_expect(!Q2_I32_OK(%s, i%u), 0)) "
+        "{ AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n",
+        raw, (unsigned)dv, dreg * 16, raw, in->next);
   else if (t->lb[dv] == E_LB_F64)
     fprintf(
         f,
@@ -8189,9 +8177,8 @@ static int emit_elem_region_read(
   if (t->lb[dv] == E_LB_I32)
     fprintf(
         f,
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT, 0)) goto vx_%d;\n"
-        "      i%u = JS_VALUE_GET_INT(_e);\n",
-        in->pc, (unsigned)dv);
+        "      if (__builtin_expect(!Q2_I32_OK(_e, i%u), 0)) goto vx_%d;\n",
+        (unsigned)dv, in->pc);
   else if (t->lb[dv] == E_LB_F64)
     fprintf(
         f,
@@ -9482,10 +9469,9 @@ static int emit_tag_post(
     if (t->lb[dv] == E_LB_I32)
       fprintf(
           f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) "
-          "goto dx_%d;\n"
-          "        i%u = JS_VALUE_GET_INT(%s);\n",
-          raw, in->next, (unsigned)dv, raw);
+          "        if (__builtin_expect(!Q2_I32_OK(%s, i%u), 0)) "
+          "goto dx_%d;\n",
+          raw, (unsigned)dv, in->next);
     else if (t->lb[dv] == E_LB_F64)
       fprintf(
           f,
@@ -11636,8 +11622,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           else if (types.lb[vv] == E_LB_I32)
             fprintf(
                 f,
-                "        if (JS_VALUE_GET_TAG(_g) != JS_TAG_INT) goto osr_fail;\n"
-                "        i%u = JS_VALUE_GET_INT(_g); }\n",
+                "        if (!Q2_I32_OK(_g, i%u)) goto osr_fail; }\n",
                 (unsigned)vv);
           else
             fprintf(
@@ -11652,9 +11637,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           case E_LB_I32:
             fprintf(
                 f,
-                "      if (JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_INT) goto osr_fail;\n"
-                "      i%u = JS_VALUE_GET_INT(AOT_REG(fr, %d));\n",
-                rr * 16, (unsigned)vv, rr * 16);
+                "      if (!Q2_I32_OK(AOT_REG(fr, %d), i%u)) goto osr_fail;\n",
+                rr * 16, (unsigned)vv);
             break;
           case E_LB_F64:
             fprintf(

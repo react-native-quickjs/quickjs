@@ -2563,18 +2563,26 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_FL_TOP(ctx_) (*(JSAotFlRec **)(*(uint8_t **)((uint8_t *)(ctx_) + "
         "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_FL_TOP))\n"
         "#define E_NO_SHAPE ((const void *)1)\n"
-        /* An integral double boxes as an int, as the engine does. The conversion is the
-           hardware's (out of range gives INT_MIN, which never compares equal to a double that
-           does not fit), so the test is a convert, a convert back and a compare. */
-        "#if defined(__SSE2__)\n"
+        /* A double boxes as a float64, whatever its value: the engine's own double arithmetic does
+           the same (an integral float64 is an ordinary value everywhere), and a consumer that wants
+           an int takes an integral float64 through Q2_I32_OK. */
+        "#define E_BOX_F64(d) __JS_NewFloat64(d)\n"
+        /* An int32 from a boxed value: an int is the one-compare fast arm; an integral float64
+           (not -0, in range) converts; anything else is the caller's exit. */
         "#include <emmintrin.h>\n"
-        "#define E_BOX_F64(d) ({ double d_ = (d); int32_t i_ = _mm_cvttsd_si32(_mm_set_sd(d_)); "
-        "__builtin_expect((double)i_ == d_ && (i_ != 0 || !signbit(d_)), 0) ? "
-        "JS_MKVAL(JS_TAG_INT, i_) : __JS_NewFloat64(d_); })\n"
-        "#else\n"
-        "#define E_BOX_F64(d) ({ double d_ = (d); "
-        "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
-        "#endif\n"
+        "static inline __attribute__((always_inline)) int q2_to_i32_float(JSValue v, int32_t *out)\n"
+        "{\n"
+        "  double d;\n"
+        "  int32_t i;\n"
+        "  if (JS_VALUE_GET_TAG(v) != JS_TAG_FLOAT64) return 0;\n"
+        "  d = JS_VALUE_GET_FLOAT64(v);\n"
+        "  i = _mm_cvttsd_si32(_mm_set_sd(d));\n"
+        "  if (!((double)i == d && (i != 0 || !signbit(d)))) return 0;\n"
+        "  *out = i;\n"
+        "  return 1;\n"
+        "}\n"
+        "#define Q2_I32_OK(v_, out_) (__builtin_expect(JS_VALUE_GET_TAG(v_) == JS_TAG_INT, 1) ? "
+        "((out_) = JS_VALUE_GET_INT(v_), 1) : q2_to_i32_float((v_), &(out_)))\n"
         /* The `undefined` word a native entry fills its frame with, as one
            static constant so the fill is a copy of a known word. */
         "static const JSValue e_undefined_value = { { .int32 = 0 }, "
