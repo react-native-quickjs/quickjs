@@ -57,6 +57,7 @@
 
 /* Whether constant-pool entry `idx` is a number (qjsaot.c). */
 int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
+int qjs_aot_pool_tag(const struct JSAotGenFunc *g, uint32_t idx);
 
 /* ---- the lattice -------------------------------------------------------- */
 
@@ -871,6 +872,27 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
         out->spec[v] = 0;
       }
       continue;
+    }
+    /* A load of a number from the constant pool is a constant of its own kind. */
+    if (in->op == Q2_OP_FALLBACK && in->rop == ROP_load_const && in->ndef == 1 && in->own == 0 && in->narg >= 3 &&
+        in->arg[2].kind == 'c' && in->arg[1].val == 0) {
+      double c;
+      uint32_t idx = (uint32_t)in->arg[2].val;
+      if (qjs_aot_pool_num(fn->g, idx, &c)) {
+        int tag = qjs_aot_pool_tag(fn->g, idx);
+        if (tag == 1) { /* QJS_AOT_POOL_INT */
+          w[in->def[0]] = E_LB_I32;
+          fixed[in->def[0]] = 1;
+          out->spec[in->def[0]] = 0;
+          continue;
+        }
+        if (tag == 2 && __builtin_isfinite(c)) { /* QJS_AOT_POOL_DOUBLE */
+          w[in->def[0]] = E_LB_F64;
+          fixed[in->def[0]] = 1;
+          out->spec[in->def[0]] = 0;
+          continue;
+        }
+      }
     }
     if (def_from_record(in) && !inc_by_operand(in)) {
       for (d = 0; d < in->ndef; d++) {
