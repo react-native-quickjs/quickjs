@@ -7189,9 +7189,8 @@ static int emit_typed_global_read(
     else if (t->lb[dv] == E_LB_I32)
       fprintf(
           f,
-          "      if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, 0)) goto vx_%d;\n"
-          "      i%u = JS_VALUE_GET_INT(_g);\n",
-          in->pc, (unsigned)dv);
+          "      if (__builtin_expect(!Q2_I32_OK(_g, i%u), 0)) goto vx_%d;\n",
+          (unsigned)dv, in->pc);
     else
       fprintf(
           f,
@@ -7222,10 +7221,9 @@ static int emit_typed_global_read(
     if (t->lb[dv] == E_LB_I32)
       fprintf(
           f,
-          "        if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, 0)) "
-          "{ AOT_SET_B(ctx, fr, %d, _g); goto dx_%d; }\n"
-          "        i%u = JS_VALUE_GET_INT(_g);\n",
-          dreg * 16, in->next, (unsigned)dv);
+          "        if (__builtin_expect(!Q2_I32_OK(_g, i%u), 0)) "
+          "{ AOT_SET_B(ctx, fr, %d, _g); goto dx_%d; }\n",
+          (unsigned)dv, dreg * 16, in->next);
     else if (t->lb[dv] == E_LB_F64)
       fprintf(
           f,
