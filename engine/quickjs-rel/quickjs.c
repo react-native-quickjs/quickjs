@@ -64217,6 +64217,18 @@ QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx)
     return 0;
 }
 
+/* The poll of a frameless body, whose frame is only its activation record: an exception the
+   poll raises gets its backtrace here, while the records are in place (see
+   qjs_aot_throw_stack_overflow). */
+QJS_AOT_STUB int qjs_aot_poll_fl(JSContext *ctx)
+{
+    int rc = qjs_aot_poll(ctx);
+
+    if (unlikely(rc < 0) && needs_backtrace(ctx->rt->current_exception))
+        build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+    return rc;
+}
+
 QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx)
 {
     return ctx->rt->ic_watchpoint_epoch;

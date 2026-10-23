@@ -1,0 +1,44 @@
+Subject: The poll of a frameless body builds the backtrace of the exception it raises
+
+What this does
+  - `qjs_aot_poll_fl` is `qjs_aot_poll` plus the backtrace of an exception the poll raised, built at
+    the poll. Frameless bodies (the entry of a function with calls, the poll in a frameless loop, the
+    pure recursive form) call it in place of `qjs_aot_poll`.
+
+Why we need it
+  The interrupt handler's "interrupted" error is thrown with its backtrace deferred to the unwinder of
+  the catching frame, after the frameless activation records are popped (see 0373), so a function
+  interrupted deep in a compiled recursion reported only the frame that caught it. The poll of a
+  frameless body is always the innermost activation, so the backtrace can be built there.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64217,6 +64217,18 @@
+     return 0;
+ }
+ 
++/* The poll of a frameless body, whose frame is only its activation record: an exception the
++   poll raises gets its backtrace here, while the records are in place (see
++   qjs_aot_throw_stack_overflow). */
++QJS_AOT_STUB int qjs_aot_poll_fl(JSContext *ctx)
++{
++    int rc = qjs_aot_poll(ctx);
++
++    if (unlikely(rc < 0) && needs_backtrace(ctx->rt->current_exception))
++        build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
++    return rc;
++}
++
+ QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx)
+ {
+     return ctx->rt->ic_watchpoint_epoch;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -234,6 +234,7 @@
+    an interpreted one share the same budget. Returns 0 to continue, -1 after
+    throwing. */
+ QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx);
++QJS_AOT_STUB int qjs_aot_poll_fl(JSContext *ctx);
+ 
+ /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
+    REGVM_STEP_SUSPEND in quickjs.c. */

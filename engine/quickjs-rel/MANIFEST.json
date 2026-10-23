@@ -1471,12 +1471,16 @@
       "sha256": "9f98f2b5292d2a9b2ab067e70915c3be3d729112985d75c5545071d98cf599a1"
     },
     {
+      "name": "0374-aot-poll-backtrace.patch",
+      "sha256": "87d5b1c24ce70a143430d2bcdd01e2408b106a20dfacea2d9b54a715b8452d11"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "8b9a05292fca068cf51f7cd8c729d5a9575a9082691e71da3453d9a000727fe2",
+    "quickjs.c": "89c14a56db5f4d9c5c5bd5f5258b08846886cdd6344bc02163b908372c056e97",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
