@@ -1,0 +1,50 @@
+Subject: The layout export carries the two-prototype cache kind and the IsHTMLDDA bit
+
+What this does
+  - `JSAotGenLayout` gains `reg_pic_proto2` (the cache entry kind of a holder two prototypes up),
+    `off_object_htmldda_byte` and `object_htmldda_mask` (where `JSObject.is_HTMLDDA` lives), found the
+    same way the `holey` bit is.
+
+Why we need it
+  A compiled body reads a method inherited through two prototypes (a class that extends a class) from
+  the function's own cache entry, and tests an object for null without a call into the engine; both
+  need these constants from the engine's own layout so a change to either breaks the unit's hash.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -138,6 +138,9 @@
+        array, as the engine's own fast store does, since filling a hole has
+        bookkeeping the inline path does not do. */
+     uint32_t off_object_holey_byte, object_holey_mask;
++    /* The cache entry kind of a holder two prototypes up, and the byte and mask of
++       `is_HTMLDDA`: an inline null test of an object has to ask it. */
++    uint32_t reg_pic_proto2, off_object_htmldda_byte, object_htmldda_mask;
+     /* The rest of the light-frame header a generated native entry writes, so
+        it can build the frame the engine's own light call builds. The header is
+        the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61306,6 +61306,23 @@
+             }
+         }
+     }
++    out->reg_pic_proto2 = REG_PIC_PROTO2;
++    {
++        /* `is_HTMLDDA` likewise. */
++        JSObject o;
++        const uint8_t *q = (const uint8_t *)&o;
++        size_t i;
++
++        memset(&o, 0, sizeof(o));
++        o.is_HTMLDDA = 1;
++        for (i = 0; i < sizeof(o); i++) {
++            if (q[i] != 0) {
++                out->off_object_htmldda_byte = (uint32_t)i;
++                out->object_htmldda_mask = q[i];
++                break;
++            }
++        }
++    }
+     /* The light-frame header a generated native entry writes itself. It builds
+        the same frame `regvm_light_fill` builds, field for field, so the
+        offsets are the frame's own and the flag values are the engine's. */

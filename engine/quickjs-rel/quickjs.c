@@ -61306,6 +61306,23 @@ void js_aot_gen_layout(JSAotGenLayout *out)
             }
         }
     }
+    out->reg_pic_proto2 = REG_PIC_PROTO2;
+    {
+        /* `is_HTMLDDA` likewise. */
+        JSObject o;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+
+        memset(&o, 0, sizeof(o));
+        o.is_HTMLDDA = 1;
+        for (i = 0; i < sizeof(o); i++) {
+            if (q[i] != 0) {
+                out->off_object_htmldda_byte = (uint32_t)i;
+                out->object_htmldda_mask = q[i];
+                break;
+            }
+        }
+    }
     /* The light-frame header a generated native entry writes itself. It builds
        the same frame `regvm_light_fill` builds, field for field, so the
        offsets are the frame's own and the flag values are the engine's. */
