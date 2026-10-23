@@ -3727,6 +3727,8 @@ static void e_emit_presync(
    miss goes through emit_typed_opcall. */
 static int g_e_ta_used, g_e_ta_keep;
 
+static void e_boxed_operand(char *buf, size_t n, const ETypes *t, Q2ValueId v);
+
 static int emit_typed_opcall(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     const uint64_t *live, char hex[33], int fi, int b);
@@ -5783,15 +5785,22 @@ static int emit_alloc_op(
        in->rop == ROP_div || in->rop == ROP_mod) && !nodest &&
       !redef_mode && in->nuse == 2 && t->lb[dv] == E_LB_TAG &&
       in->use[0] < (Q2ValueId)t->nvalues && in->use[1] < (Q2ValueId)t->nvalues &&
-      t->lb[in->use[0]] == E_LB_TAG && t->lb[in->use[1]] == E_LB_TAG)
+      (t->lb[in->use[0]] == E_LB_TAG || t->lb[in->use[0]] == E_LB_I32 ||
+       t->lb[in->use[0]] == E_LB_F64) &&
+      (t->lb[in->use[1]] == E_LB_TAG || t->lb[in->use[1]] == E_LB_I32 ||
+       t->lb[in->use[1]] == E_LB_F64)) {
+    char xa[64], xb[64];
+    e_boxed_operand(xa, sizeof(xa), t, in->use[0]);
+    e_boxed_operand(xb, sizeof(xb), t, in->use[1]);
     fprintf(f,
             "    { JSValue _r0;\n"
-            "      if (__builtin_expect(q2_arith(%d, v%u, v%u, &_r0), 1)) {\n"
+            "      if (__builtin_expect(q2_arith(%d, %s, %s, &_r0), 1)) {\n"
             "        v%u = _r0;\n"
             "        goto cd_%d;\n"
             "      }\n"
             "    }\n",
-            (int)in->sub, (unsigned)in->use[0], (unsigned)in->use[1], (unsigned)dv, in->pc);
+            (int)in->sub, xa, xb, (unsigned)dv, in->pc);
+  }
   fprintf(f, "    /* sync live TAG values to the frame before the allocation */\n");
   for (r = 0; r < fn->nregs; r++) {
     Q2ValueId v = cur[r];
