@@ -10941,8 +10941,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "    JSAotFlRec *const rec_ = NULL;\n"
           "    JSValue fr[%d];\n"
           "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
-          hex, fn->g->reg_count > 0 ? fn->g->reg_count : 1,
-          fn->g->reg_count > 0 ? fn->g->reg_count : 1);
+          hex, fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
     else
     fprintf(
         f,
@@ -10961,8 +10960,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         g_e_fl_calls ? "" : e_linkage(), g_e_fl_calls ? "nb" : "n", hex,
         g_e_fl_calls ? ", JSAotFlRec *rec_" : "",
         g_e_fl_calls ? "" : "    JSAotFlRec *const rec_ = NULL; (void)rec_;\n",
-        fn->g->reg_count > 0 ? fn->g->reg_count : 1,
-        fn->g->reg_count > 0 ? fn->g->reg_count : 1);
+        fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
     if (g_e_fl_calls && !g_e_inl) {
       int wi, mw = 1;
       for (wi = 0; wi < fn->ninsns; wi++)
