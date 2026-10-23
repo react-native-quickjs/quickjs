@@ -1487,12 +1487,16 @@
       "sha256": "f2969b92b3301c9c4e91828ba57166e2dcb32c7cb70d850d845a6a91cc746136"
     },
     {
+      "name": "0378-map-int-key-lookup.patch",
+      "sha256": "195eea43c757344e80edc0eecf18c9a962a50a57b1b2142744b46a136a3a7222"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "c90f0fa4d7169317cc99a972f98ed47d86b27c03f9afeb903b856fff6a0eca69",
+    "quickjs.c": "6436ef5eebacc9a878450cb75a7016b2c6295747cbc70991b97024165b723d0c",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

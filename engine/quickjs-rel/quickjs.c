@@ -97117,8 +97117,11 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         h = (uint32_t)map_hash_mix64((uint64_t)(uintptr_t)JS_VALUE_GET_PTR(key));
         break;
     case JS_TAG_INT:
-        d = JS_VALUE_GET_INT(key);
-        goto hash_float64;
+        /* the hash of the number's double, which a float64 key with the same value takes below */
+        u.d = (double)JS_VALUE_GET_INT(key);
+        h = (uint32_t)map_hash_mix64(u.u64);
+        tag = JS_TAG_FLOAT64;
+        break;
     case JS_TAG_SHORT_BIG_INT:
         d = JS_VALUE_GET_SHORT_BIG_INT(key);
         goto hash_float64;
@@ -97153,6 +97156,19 @@ static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
     JSMapRecord *mr;
     uint32_t h;
     h = map_hash_key(ctx, key) & (s->hash_size - 1);
+    if (JS_VALUE_GET_TAG(key) == JS_TAG_INT) {
+        /* two ints are equal when their values are; any other pairing takes the general test */
+        list_for_each(el, &s->hash_table[h]) {
+            mr = list_entry(el, JSMapRecord, hash_link);
+            if (JS_VALUE_GET_TAG(mr->key) == JS_TAG_INT) {
+                if (JS_VALUE_GET_INT(mr->key) == JS_VALUE_GET_INT(key))
+                    return mr;
+            } else if (js_same_value_zero(ctx, mr->key, key)) {
+                return mr;
+            }
+        }
+        return NULL;
+    }
     list_for_each(el, &s->hash_table[h]) {
         mr = list_entry(el, JSMapRecord, hash_link);
         if (js_same_value_zero(ctx, mr->key, key))

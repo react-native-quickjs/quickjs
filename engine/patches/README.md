@@ -463,3 +463,4 @@ bump while `9999` is missing.
 | `0375` | The layout export carries what an inline step of an array iterator tests | A for-of over an array was an op call per element | `JSAotGenLayout`, `qjs_aot_array_iterator_next_fn` | No. |
 | `0376` | Compiled code can identify Array.prototype.push and pop | `a.push(x)` and `a.pop()` on a dense array were a call into the engine each | `qjs_aot_array_builtin_fn`, `JSAotGenLayout` | No. |
 | `0377` | A compiled callback is entered from JS_Call, and a sort calls its compiled comparator directly | A builtin's callback went through the whole interpreter frame before the compiled function's own entry started | `JS_Call`, `js_array_sort` | No. |
+| `0378` | A Map or Set lookup of an int key compares ints directly and hashes without the general switch | A Map/Set lookup of an int key called the general equality test for every chain element | `map_find_record`, `map_hash_key` | No. |
