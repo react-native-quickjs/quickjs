@@ -200,6 +200,8 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);
 int e_plan_licm(const Q2Func *fn, Q2Extra **out);
 /* The calls worth replacing by a copy of their callee (see facts.c). */
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out);
+/* The objects that never escape (see facts.c). */
+int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs, int *nwebs, Q2Rewrite **rw, int *nrw);
 /* Whether polymorphic sites are served by the polymorphic cache in this body (a
    framed speculative body; set by the caller around e_facts_run). */
 extern int e_facts_poly_on;

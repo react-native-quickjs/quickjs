@@ -448,6 +448,26 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
         q2_free(&fn2);
       }
     }
+    if (!have2 && nex == 0 && nir == 0) {
+      Q2VWeb *webs = NULL;
+      Q2Rewrite *rws = NULL;
+      int nwebs = 0, nrws = 0;
+      if (e_plan_virtual(&fn, &webs, &nwebs, &rws, &nrws) > 0 && nwebs > 0) {
+        int st = 0;
+        if (q2_build_ea(g, NULL, 0, NULL, 0, webs, nwebs, rws, nrws, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 &&
+            (st = 2) && q2_verify(&fn2, msg, sizeof(msg)) == 0 && (st = 3) && e_inline_typed_ok(&fn2))
+          have2 = 1;
+        if (!have2) {
+          if (getenv("QJS_AOT_DEBUG_VIRT") != NULL)
+            fprintf(stderr, "virt %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
+          q2_free(&fn2);
+        } else if (getenv("QJS_AOT_DEBUG_VIRT") != NULL) {
+          fprintf(stderr, "virt %s: %d webs\n", g->name, nwebs);
+        }
+      }
+      free(webs);
+      free(rws);
+    }
     free(ex);
     free(ir);
     rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);

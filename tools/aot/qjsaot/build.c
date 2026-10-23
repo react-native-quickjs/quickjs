@@ -1715,17 +1715,177 @@ fail:
   return -1;
 }
 
+
+/* ---- virtual objects ----------------------------------------------------
+   The objects of a web are never made. Each construct of the web becomes a copy of its arguments
+   into the web's argument registers (and of the constructor value into its register), and an
+   instruction that stands for the object itself; a read of one of its fields becomes a copy of the
+   argument that holds it. The registers are set to undefined on entry so every path defines them, and
+   a return reads them, which keeps them live from their first definition to the end. */
+static int q2_apply_rewrites(
+    Q2Func *f, const JSAotGenFunc *g, const Q2VWeb *webs, int nwebs, const Q2Rewrite *rw, int nrw,
+    int32_t vreg_base) {
+  int i, k, w, nout = 0;
+  Q2Insn *out;
+  int32_t synpc = f->exit_pc + 64;
+  size_t cap = (size_t)f->ninsns + (size_t)nrw * 12 + (size_t)nwebs * 10 + 8;
+  f->vweb = calloc((size_t)nwebs, sizeof(*f->vweb));
+  out = calloc(cap, sizeof(*out));
+  if (f->vweb == NULL || out == NULL) {
+    free(out);
+    f->why = "out of memory";
+    return -1;
+  }
+  f->nvweb = nwebs;
+  for (w = 0; w < nwebs; w++) {
+    f->vweb[w] = webs[w];
+    for (k = 0; k < webs[w].nargs; k++) f->vweb[w].areg[k] = vreg_base++;
+    f->vweb[w].creg = vreg_base++;
+  }
+#define Q2_SYN(m_, rop_, pc_, bpc_, nxt_)                                                   \
+  do {                                                                                     \
+    memset((m_), 0, sizeof(*(m_)));                                                        \
+    (m_)->rop = (rop_);                                                                    \
+    (m_)->pc = (pc_);                                                                      \
+    (m_)->next = (nxt_);                                                                   \
+    (m_)->bpc = (bpc_);                                                                    \
+    (m_)->ppc = (pc_);                                                                     \
+    (m_)->opc = (pc_);                                                                     \
+    (m_)->onext = (nxt_);                                                                  \
+    (m_)->xpc = -1;                                                                        \
+  } while (0)
+  /* every web register starts as undefined, at the top of the function */
+  for (w = 0; w < nwebs; w++) {
+    for (k = 0; k <= f->vweb[w].nargs; k++) {
+      Q2Insn *m = &out[nout++];
+      int32_t reg = k < f->vweb[w].nargs ? f->vweb[w].areg[k] : f->vweb[w].creg;
+      Q2_SYN(m, ROP_load_undefined, synpc, 0, 1);
+      synpc++;
+      m->narg = 1;
+      m->arg[0].kind = 'r';
+      m->arg[0].val = (int64_t)reg * 16;
+      m->arg[0].off = -1;
+      q2_decode_roles(g, m);
+    }
+  }
+  for (i = 0; i < f->ninsns; i++) {
+    Q2Insn *in = &f->insns[i];
+    int hit = -1;
+    for (k = 0; k < nrw; k++)
+      if (rw[k].pc == in->pc) hit = k;
+    if (hit < 0) {
+      out[nout++] = *in;
+      continue;
+    }
+    {
+      const Q2Rewrite *r = &rw[hit];
+      const Q2VWeb *vw = &f->vweb[r->web];
+      if (r->kind == Q2_RW_CONSTRUCT) {
+        int j;
+        for (j = 0; j < vw->nargs; j++) {
+          Q2Insn *m = &out[nout++];
+          Q2_SYN(m, ROP_move, synpc, in->pc, in->next);
+          synpc++;
+          m->own = in->own;
+          m->arg[0].kind = 'r';
+          m->arg[0].val = (int64_t)vw->areg[j] * 16;
+          m->arg[0].off = -1;
+          if (j < in->win_n) {
+            m->rop = ROP_move;
+            m->narg = 2;
+            m->arg[1].kind = 'r';
+            m->arg[1].val = (int64_t)(in->win_reg + j) * 16;
+            m->arg[1].off = -1;
+          } else {
+            m->rop = ROP_load_undefined;
+            m->narg = 1;
+          }
+          q2_decode_roles(g, m);
+        }
+        {
+          Q2Insn *m = &out[nout++];
+          Q2_SYN(m, ROP_move, synpc, in->pc, in->next);
+          synpc++;
+          m->own = in->own;
+          m->narg = 2;
+          m->arg[0].kind = 'r';
+          m->arg[0].val = (int64_t)vw->creg * 16;
+          m->arg[0].off = -1;
+          m->arg[1].kind = 'r';
+          m->arg[1].val = in->arg[1].val;
+          m->arg[1].off = -1;
+          q2_decode_roles(g, m);
+        }
+        {
+          /* the object itself: nothing to run, a name for the web. It keeps the construct's
+             operands: it checks the constructor and leaves to the construct if that fails. */
+          Q2Insn *m = &out[nout++];
+          *m = *in;
+          m->vk = Q2_VK_DEF;
+          m->vweb = (uint8_t)(r->web + 1);
+        }
+      } else if (r->kind == Q2_RW_GET) {
+        Q2Insn *m = &out[nout++];
+        int recv_reg = (int)(in->arg[1].val >> 4);
+        *m = *in;
+        m->rop = ROP_move;
+        m->narg = 2;
+        m->ndef = 0;
+        m->nuse = 0;
+        m->nredef = 0;
+        m->win_n = 0;
+        m->win_reg = 0;
+        m->arg[1].kind = 'r';
+        m->arg[1].val = (int64_t)vw->areg[r->arg] * 16;
+        m->arg[1].off = -1;
+        q2_decode_roles(g, m);
+        m->use[m->nuse++] = (Q2ValueId)recv_reg; /* the object stays live while it is read */
+        m->vk = Q2_VK_GET;
+        m->vweb = (uint8_t)(r->web + 1);
+        m->varg = (int8_t)r->arg;
+      } else {
+        out[nout++] = *in;
+      }
+    }
+  }
+  /* a return reads the web registers */
+  for (i = 0; i < nout; i++) {
+    Q2Insn *in = &out[i];
+    if (in->op != Q2_OP_RETURN && in->op != Q2_OP_RETURN_UNDEF) continue;
+    for (w = 0; w < nwebs; w++) {
+      for (k = 0; k <= f->vweb[w].nargs && in->nuse < 8; k++)
+        in->use[in->nuse++] = (Q2ValueId)(k < f->vweb[w].nargs ? f->vweb[w].areg[k] : f->vweb[w].creg);
+    }
+  }
+#undef Q2_SYN
+  free(f->insns);
+  f->insns = out;
+  f->ninsns = nout;
+  return 0;
+}
+
 int q2_build(const JSAotGenFunc *g, Q2Func *f) { return q2_build_ex(g, NULL, 0, f); }
 
 int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
-  return q2_build_inl(g, ex, nex, NULL, 0, f);
+  return q2_build_ea(g, ex, nex, NULL, 0, NULL, 0, NULL, 0, f);
 }
-
-static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *req, int nreq);
 
 int q2_build_inl(
     const JSAotGenFunc *g, const Q2Extra *ex, int nex, const Q2InlReq *inl, int ninl, Q2Func *f) {
+  return q2_build_ea(g, ex, nex, inl, ninl, NULL, 0, NULL, 0, f);
+}
+
+static int q2_apply_rewrites(
+    Q2Func *f, const JSAotGenFunc *g, const Q2VWeb *webs, int nwebs, const Q2Rewrite *rw, int nrw,
+    int32_t vreg_base);
+
+static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *req, int nreq);
+
+int q2_build_ea(
+    const JSAotGenFunc *g, const Q2Extra *ex, int nex, const Q2InlReq *inl, int ninl,
+    const Q2VWeb *webs, int nwebs, const Q2Rewrite *rw, int nrw, Q2Func *f) {
   int i, n, words;
+  int32_t vreg_base = 0;
   int32_t *starts = NULL;
   int nstarts = 0, cap = 0;
   int32_t *pc_to_block = NULL;
@@ -1738,6 +1898,8 @@ int q2_build_inl(
     if (ex[i].newreg + 1 > f->nregs) f->nregs = ex[i].newreg + 1;
   /* each copied callee gets its own registers and one per parameter */
   for (i = 0; i < ninl; i++) f->nregs += inl[i].g->reg_count + inl[i].g->arg_count;
+  vreg_base = f->nregs;
+  for (i = 0; i < nwebs; i++) f->nregs += webs[i].nargs + 1;
   words = (f->nregs + 63) / 64;
   f->lwords = words;
   f->exit_pc = g->len;
@@ -1850,6 +2012,7 @@ int q2_build_inl(
   }
 
   if (ninl > 0 && q2_apply_inlines(f, g, inl, ninl) < 0) return -1;
+  if (nwebs > 0 && q2_apply_rewrites(f, g, webs, nwebs, rw, nrw, vreg_base) < 0) return -1;
 
   /* 2. block starts: pc 0, every branch target, and after a terminator */
   {
@@ -2744,6 +2907,7 @@ void q2_free(Q2Func *f) {
   free(f->reg_def);
   free(f->prof_owned);
   free(f->inl);
+  free(f->vweb);
   memset(f, 0, sizeof(*f));
 }
 

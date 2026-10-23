@@ -3085,12 +3085,110 @@ static void emit_trivial_own(
 /* Write one value's local back to its frame register, in the frame's
    representation. A TAG value is already a JSValue, so it is a plain store; an
    i32 or f64 is boxed the way the interpreter would have it. */
+/* The virtual objects: the web (1-based) each value belongs to, computed for the function being
+   emitted, and the register snapshot of the exit stub being written (its argument registers hold
+   what the object is made from). */
+static const Q2Func *g_e_virt_fn;
+static uint8_t *g_e_virt;
+static const Q2ValueId *g_e_stub_cur;
+static int g_e_stub_pc;
+
+static void e_virt_compute(const Q2Func *fn) {
+  int i, sp = 0, *stack;
+  if (g_e_virt_fn == fn) return;
+  free(g_e_virt);
+  g_e_virt = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
+  g_e_virt_fn = fn;
+  if (g_e_virt == NULL || fn->nvweb == 0) return;
+  stack = malloc(sizeof(int) * (size_t)(fn->nvalues > 0 ? fn->nvalues : 1));
+  if (stack == NULL) return;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    if (in->vk == Q2_VK_DEF && in->ndef == 1) {
+      g_e_virt[in->def[0]] = in->vweb;
+      stack[sp++] = (int)in->def[0];
+    }
+  }
+  while (sp > 0) {
+    int x = stack[--sp], j, n, k;
+    for (j = 0; j < fn->ninsns; j++) {
+      const Q2Insn *in = &fn->insns[j];
+      if (in->op == Q2_OP_MOVE && in->vk == 0 && in->nuse >= 1 && in->use[0] == (Q2ValueId)x && in->ndef == 1 &&
+          !g_e_virt[in->def[0]]) {
+        g_e_virt[in->def[0]] = g_e_virt[x];
+        stack[sp++] = (int)in->def[0];
+      }
+    }
+    for (j = 0; j < fn->nblocks; j++) {
+      const Q2Block *b = &fn->blocks[j];
+      for (n = 0; n < b->nsucc; n++) {
+        const Q2Block *sb = b->succ_block[n] >= 0 && b->succ_block[n] < fn->nblocks ? &fn->blocks[b->succ_block[n]] : NULL;
+        for (k = 0; sb != NULL && k < b->nedge_args[n] && k < sb->nparams; k++)
+          if (b->edge_arg[n][k] == (Q2ValueId)x && !g_e_virt[sb->param_val[k]]) {
+            g_e_virt[sb->param_val[k]] = g_e_virt[x];
+            stack[sp++] = (int)sb->param_val[k];
+          }
+      }
+    }
+  }
+  free(stack);
+}
+
+static void e_exit_expr(char *buf, size_t n, Q2ValueId v);
+/* The object a virtual value stands for, made where the generic body takes over: the constructor
+   is called with the arguments it was going to get. */
+static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
+  const Q2VWeb *vw;
+  char body[2400], one[240], cexp[120];
+  int j, len = 0;
+  Q2ValueId cv;
+  if (g_e_virt_fn == NULL || g_e_virt == NULL || v >= (Q2ValueId)g_e_virt_fn->nvalues || !g_e_virt[v] ||
+      g_e_stub_cur == NULL)
+    return 0;
+  vw = &g_e_virt_fn->vweb[g_e_virt[v] - 1];
+  cv = g_e_stub_cur[vw->creg];
+  if (cv == Q2_NO_VALUE || cv == E_UNDEF || cv == E_INFRAME || cv >= (Q2ValueId)g_e_types->nvalues)
+    snprintf(cexp, sizeof(cexp), "JS_UNDEFINED");
+  else
+    e_exit_expr(cexp, sizeof(cexp), cv);
+  body[0] = 0;
+  for (j = 0; j < vw->nfields; j++) {
+    Q2ValueId av = g_e_stub_cur[vw->areg[vw->argidx[j]]];
+    char one2[260];
+    if (av == Q2_NO_VALUE || av == E_UNDEF || av == E_INFRAME || av >= (Q2ValueId)g_e_types->nvalues)
+      snprintf(one, sizeof(one), "JS_UNDEFINED");
+    else
+      e_exit_expr(one, sizeof(one), av);
+    snprintf(
+        one2, sizeof(one2),
+        "if (JS_DefinePropertyValue(ctx, t_, (JSAtom)%d, JS_DupValue(ctx, %s), JS_PROP_C_W_E) < 0) { "
+        "JS_FreeValue(ctx, t_); return JS_EXCEPTION; } ",
+        vw->atom[j], one);
+    len += snprintf(body + len, sizeof(body) - (size_t)len, "%s", one2);
+  }
+  snprintf(
+      buf, n,
+      "({ JSValue c_ = %s, t_; int rc_ = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(c_), &t_); "
+      "if (rc_ < 0) return JS_EXCEPTION; "
+      "if (rc_ == 0) { JS_ThrowTypeError(ctx, \"not a constructor\"); return JS_EXCEPTION; } "
+      "%sqjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(c_), t_); t_; })",
+      cexp, body);
+  return 1;
+}
+
 static void e_exit_store(FILE *f, Q2ValueId v, int reg) {
   /* The register to write is the one being synced, NOT the one the value was
      defined in: an edge can move a value into another register's param, and
      those are different slots. Writing val->reg here silently left the slot the
      generic body actually reads holding its previous contents. */
   int off = reg * 16;
+  {
+    char vx[1600];
+    if (e_virt_expr(vx, sizeof(vx), v)) {
+      fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, %s);\n", off, vx);
+      return;
+    }
+  }
   switch (e_rep_prefix(v)[0]) {
     case 'i':
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", off,
@@ -3124,6 +3222,7 @@ static void e_exit_store(FILE *f, Q2ValueId v, int reg) {
 /* The expression that boxes value `v` for an exit, in the frame's representation:
    what e_exit_store would store. */
 static void e_exit_expr(char *buf, size_t n, Q2ValueId v) {
+  if (e_virt_expr(buf, n, v)) return;
   switch (e_rep_prefix(v)[0]) {
     case 'i':
       snprintf(buf, n, "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)v);
@@ -3198,9 +3297,9 @@ static void e_emit_exit(
     const Q2ValueId *cur, const uint64_t *live_set, int handoff, int blkidx) {
   int words = fn->lwords, w, r;
   /* Frameless: the values are collected, not stored. */
-  int nlv = 0;
+  int nlv = 0, ndefer = 0, defer[64];
   int *loff = NULL;
-  char (*lex)[160] = NULL;
+  char (*lex)[1600] = NULL;
 
   if (g_e_fl) {
     loff = malloc(sizeof(int) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
@@ -3218,6 +3317,9 @@ static void e_emit_exit(
     abort();
   }
   g_e_exit_dirty = 0;
+  e_virt_compute(fn);
+  g_e_stub_cur = cur;
+  g_e_stub_pc = pc;
   if (g_e_inl) {
     const char *ctl = getenv("QJS_AOT_INL_CONTROL");
     g_e_exit_dirty = g_e_dirty_ins != NULL && g_e_exit_ins >= 0 &&
@@ -3283,11 +3385,17 @@ static void e_emit_exit(
           loff[nlv] = r * 16;
           e_exit_expr(lex[nlv], sizeof(lex[0]), cur[r]);
           nlv++;
+        } else if (cur[r] < (Q2ValueId)fn->nvalues && g_e_virt != NULL && g_e_virt[cur[r]]) {
+          /* An object that is not made yet is built last: making it allocates, and the
+             collector must find every other register in the frame by then. */
+          if (ndefer >= 64) abort();
+          defer[ndefer++] = r;
         } else {
           e_exit_store(f, cur[r], r);
         }
       }
     }
+    for (w = 0; w < ndefer; w++) e_exit_store(f, cur[defer[w]], defer[w]);
   }
   if (nlv > 0) {
     int q;
@@ -3472,6 +3580,8 @@ static void e_emit_arm(
     const char *hex, int want_succ) {
   const Q2Block *blk = &fn->blocks[b];
   int sb = blk->succ_block[k];
+  e_virt_compute(fn);
+  g_e_stub_cur = cur;
   if (want_succ >= 0 && sb != want_succ) {
     fprintf(
         stderr,
@@ -3612,8 +3722,10 @@ static void e_emit_arm(
       /* A borrowed value only this body holds: leave at the loop header, where
          the generic body has a frame, and let it poll at its own next back edge
          (this body is not re-entered, so the rest of the call runs there). */
-      char ex[160];
+      char ex[1600];
       int nlv = 0;
+      e_virt_compute(fn);
+      g_e_stub_cur = cur;
       fprintf(f, "          {\n");
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
@@ -5157,7 +5269,7 @@ static int emit_inl_nested_call(
     free(la);
   }
   nsp = 0;
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v;
     if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
     v = cur[r];
@@ -5412,7 +5524,7 @@ static int emit_typed_construct(
 
   /* ---- output ---- */
   fprintf(f, "    /* sync live TAG values to the frame before the construct */\n");
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
     if (t->lb[v] != E_LB_TAG) continue;
@@ -5526,7 +5638,7 @@ static int emit_fl_put_global(
   lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (lb == NULL) abort();
   q2_live_before(fn, (int)(in - fn->insns) + 1 < fn->ninsns ? (int)(in - fn->insns) + 1 : (int)(in - fn->insns), lb);
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v;
     if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
     v = cur[r];
@@ -5811,7 +5923,7 @@ static int emit_fl_alloc_op(
   q2_live_before(fn, (int)(in - fn->insns), lb);
   if ((int)(in - fn->insns) + 1 < fn->ninsns)
     q2_live_before(fn, (int)(in - fn->insns) + 1, la);
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v;
     int is_win = r >= in->win_reg && r < in->win_reg + na;
     if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
@@ -6176,7 +6288,7 @@ static int emit_alloc_op(
             (unsigned)dv, off, in->pc, in->pc);
   }
   fprintf(f, "    /* sync live TAG values to the frame before the allocation */\n");
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
     if (t->lb[v] != E_LB_TAG) continue;
@@ -6184,7 +6296,7 @@ static int emit_alloc_op(
   }
   /* Typed values the op may read (its window) or that the reload below takes from the
      frame (the registers a fallback-shaped op redefines) are boxed into the frame. */
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v;
     int need = (r >= in->win_reg && r < in->win_reg + na) || r * 16 == src_off ||
                r * 16 == src_off2;
@@ -6390,6 +6502,64 @@ static int emit_inl_guard(
           fprintf(f, "    pci%d = q2_cell2_index(ipic_%d, %d, (int)ins_%d, gsh%d);\n", gr->sites[qq], ik, gr->sites[qq], ik, gi);
     }
   }
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
+/* The construct of an object that is never made (see Q2VWeb): the constructor must be the one the
+   web was planned for, and the engine's own caches must say that constructing it stores each
+   field with no side effect. A miss leaves to the construct itself. The object is a name only. */
+static int emit_virt_def(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types) {
+  const Q2VWeb *vw = &fn->vweb[in->vweb - 1];
+  char callee[33], cexp[64];
+  int cc, q, dreg;
+  Q2ValueId cv, dv;
+  static const char *const hx = "0123456789abcdef";
+  if (!have_types || t == NULL || cur == NULL || in->ndef < 1 || in->narg < 2) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues || t->lb[dv] != E_LB_TAG) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  for (q = 0; q < 16; q++) {
+    callee[2 * q] = hx[vw->ctor->digest[q] >> 4];
+    callee[2 * q + 1] = hx[vw->ctor->digest[q] & 15];
+  }
+  callee[32] = 0;
+  cc = (int)in->arg[1].val;
+  cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+  if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME && cv < (Q2ValueId)t->nvalues &&
+      t->lb[cv] == E_LB_TAG)
+    snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+  else
+    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+  e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+  e_note_tag('v', in->pc, cexp);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(
+      f,
+      "#ifdef Q2_SEL_%s\n"
+      "    if (__builtin_expect(!q2_call_entry(%s, (const void *)aot_f_%s), 0)) goto vx_%d;\n"
+      "    { static const uint16_t sites_[%d] = {",
+      callee, cexp, callee, in->pc, vw->nfields);
+  for (q = 0; q < vw->nfields; q++) fprintf(f, "%s%d", q ? ", " : "", vw->site[q]);
+  fprintf(
+      f,
+      "};\n"
+      "      static JSAotCtorCache cc_;\n"
+      "      const unsigned char *co_ = (const unsigned char *)JS_VALUE_GET_PTR(%s);\n"
+      "      if (__builtin_expect(*(const void *const *)(co_ + QJS_AOT_OFF_JSOBJECT_SHAPE) != cc_.shape ||\n"
+      "          *(const uint32_t *)(*(const unsigned char *const *)((const unsigned char *)ctx + QJS_AOT_OFF_CTX_RT) +\n"
+      "                              QJS_AOT_OFF_RT_PIC_EPOCH) != cc_.pic_epoch ||\n"
+      "          JS_VALUE_GET_PTR(*(const JSValue *)(*(const unsigned char *const *)(co_ + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
+      "                                              (size_t)cc_.slot * QJS_AOT_SIZEOF_JSPROPERTY)) != cc_.proto, 0))\n"
+      "        if (!qjs_aot_ctor_replayable(ctx, (JSObject *)co_, sites_, %d, &cc_)) goto vx_%d; }\n"
+      "#else\n"
+      "    goto vx_%d;\n"
+      "#endif\n"
+      "    v%u = JS_UNDEFINED;\n",
+      cexp, vw->nfields, in->pc, in->pc, (unsigned)dv);
+  cur[dreg] = dv;
   g_e_miss_exit_seen = 1;
   return 1;
 }
@@ -6603,7 +6773,7 @@ static int emit_typed_call(
 
   /* ---- output starts here; it must not be abandoned ---- */
   fprintf(f, "    /* sync live TAG values to the frame before the call */\n");
-  for (r = 0; r < fn->nregs; r++) {
+  for (r = 0; r < fn->norig; r++) {
     Q2ValueId v;
     if (cur == NULL) break;
     v = cur[r];
@@ -7529,7 +7699,7 @@ static int emit_typed_field_write(
      stepping the handler: the same safepoint, without the step. */
   if (!g_e_fl && in->narg > 1 && in->arg[1].kind == 'a') {
     int r2;
-    for (r2 = 0; r2 < fn->nregs; r2++) {
+    for (r2 = 0; r2 < fn->norig; r2++) {
       Q2ValueId lv2 = cur != NULL ? cur[r2] : Q2_NO_VALUE;
       if (lv2 == Q2_NO_VALUE || lv2 == E_UNDEF || lv2 >= (Q2ValueId)t->nvalues)
         continue;
@@ -9793,8 +9963,9 @@ static int emit_typed_return(
   const ERole *role = e_roles[in->rop];
   (void)fn;
   (void)t;
-  (void)cur;
   (void)have_types;
+  e_virt_compute(fn);
+  g_e_stub_cur = cur;
   if (in->rop == ROP_return_undefined) {
     if (role == NULL || role->control != E_CF_RETURN) return 0;
     if (g_e_inl)
@@ -9925,6 +10096,7 @@ static int e_dispatch_rop(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b, const ERole *role) {
   if (in->inlg) return emit_inl_guard(f, fn, in, t, cur, have_types);
+  if (in->vk == Q2_VK_DEF) return emit_virt_def(f, fn, in, t, cur, have_types);
   switch (in->rop) {
     /* -- the spec body's own trivial forms, separate because they are shared with
           the generic emitter and must not be added there -- */
@@ -10113,6 +10285,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
 static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e_fn = fn;
+  g_e_virt_fn = NULL;
+  g_e_stub_cur = NULL;
   g_e_fi = fi;
   g_e_opcalls = 0;
   g_e_n_typed = g_e_n_opcall = 0;

@@ -193,6 +193,10 @@ typedef struct Q2Insn {
   /* 0 for an instruction of the program; k+1 for one copied from inlined callee k, whose
      guard is the instruction with `inlg` == k+1. */
   uint8_t own, inlg;
+  /* A virtual-object instruction (see Q2VWeb): VK_DEF stands for the construct that made the
+     object, VK_GET for a read of one of its fields, VK_PROTO for a method lookup on it. */
+  uint8_t vk, vweb;
+  int8_t varg; /* VK_GET: which constructor argument the field holds */
   int32_t narg;
   Q2Arg arg[8];
   /* The SSA value each operand holds at this instruction: for an 'r' operand
@@ -253,6 +257,17 @@ typedef struct Q2Inl {
   int32_t thispc[32], nthis; /* callee pcs of fused reads of `this`, whose profile record also covers `this` */
 } Q2Inl;
 
+enum { Q2_VK_DEF = 1, Q2_VK_GET, Q2_VK_PROTO };
+
+/* A set of objects made by one constructor that never escape: each is represented by the arguments
+   it was constructed with, kept in registers `areg[0..nargs)` (all the sites of the web write
+   the same ones), and made a real object only where the generic body takes over. */
+typedef struct Q2VWeb {
+  const struct JSAotGenFunc *ctor; /* the constructor's program */
+  int32_t nargs, areg[8], creg;    /* the constructor value is kept in `creg` */
+  int32_t atom[8], argidx[8], site[8], nfields;
+} Q2VWeb;
+
 /* ---- functions ----------------------------------------------------------- */
 typedef struct Q2Func {
   /* The blocks in DFS reverse postorder, as block indices, then the blocks only a
@@ -270,6 +285,8 @@ typedef struct Q2Func {
   int32_t norig; /* the program's own registers: those from here up exist only in this IR */
   Q2Inl *inl;    /* the callees copied in */
   int32_t ninl;
+  Q2VWeb *vweb; /* the virtual-object webs */
+  int32_t nvweb;
   ProfPc *prof_owned; /* the profile records of the inserted instructions, if any */
   Q2Block *blocks;
   int32_t nblocks;
@@ -307,6 +324,12 @@ int q2_build(const struct JSAotGenFunc *g, Q2Func *out);
    defined into the new register `newreg` just before the instruction at `anchor_pc` (or, with
    `fallthrough`, at the end of the block that falls into `anchor_pc`), and the original becomes a
    copy of it. */
+/* A rewrite of one instruction of the combined program, found by its pc. */
+enum { Q2_RW_CONSTRUCT = 1, Q2_RW_GET, Q2_RW_PROTO };
+typedef struct Q2Rewrite {
+  int kind, pc, web, arg;
+} Q2Rewrite;
+
 typedef struct Q2Extra {
   int32_t anchor_pc, src_pc, newreg;
   int fallthrough;
@@ -315,6 +338,10 @@ int q2_build_ex(const struct JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func
 /* ... and with callees copied in at their calls. */
 int q2_build_inl(
     const struct JSAotGenFunc *g, const Q2Extra *ex, int nex, const Q2InlReq *inl, int ninl, Q2Func *out);
+/* ... and with virtual-object rewrites applied to the combined program. */
+int q2_build_ea(
+    const struct JSAotGenFunc *g, const Q2Extra *ex, int nex, const Q2InlReq *inl, int ninl,
+    const Q2VWeb *webs, int nwebs, const Q2Rewrite *rw, int nrw, Q2Func *out);
 void q2_free(Q2Func *f);
 void q2_dump(FILE *f, const Q2Func *fn);
 
