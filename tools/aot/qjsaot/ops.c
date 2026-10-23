@@ -1261,9 +1261,8 @@ static int emit_native_return(
    is not a number pair; a miss falls into the op call, which repeats both halves
    (safe: neither has a side effect beyond its results).
 
-   `dm` is stored even when the second half misses, because the handler stores it
-   too and a fallback that re-runs the whole instruction reads it back from the
-   frame. */
+   `dm` is stored with the result, after both halves have hit: a miss re-runs the whole
+   instruction from the frame, and `dm` may share a register with `x`, `y` or `c`. */
 static int emit_native_fused(
     FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last) {
   const ERole *role = e_roles[in->rop];
@@ -1311,20 +1310,22 @@ static int emit_native_fused(
       "    if (__builtin_expect(q2_arith(QJS_AOT_REG_BIN_MUL, "
       "AOT_REG(fr, %d), AOT_REG(fr, %d), &_t), 1)) {\n",
       x, y);
-  fprintf(f, "        AOT_SET_B(ctx, fr, %d, _t);\n", dm);
+  /* The product stays in a local until both halves have hit: a miss re-runs the whole
+     instruction from the frame, and the product's register may be one of its operands. */
   if (c_first)
     fprintf(
         f,
         "        if (__builtin_expect(q2_arith(%s, AOT_REG(fr, %d), "
-        "AOT_REG(fr, %d), &_r), 1)) {\n",
-        second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", c, dm);
+        "_t, &_r), 1)) {\n",
+        second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", c);
   else
     fprintf(
         f,
-        "        if (__builtin_expect(q2_arith(%s, AOT_REG(fr, %d), "
+        "        if (__builtin_expect(q2_arith(%s, _t, "
         "AOT_REG(fr, %d), &_r), 1)) {\n",
-        second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", dm, c);
+        second == 1 ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", c);
   emit_site_hit(f, in);
+  fprintf(f, "            AOT_SET_B(ctx, fr, %d, _t);\n", dm);
   fprintf(f, "            AOT_SET_B(ctx, fr, %d, _r);\n", da);
   fprintf(f, "            goto g_%d;\n", in->next);
   fprintf(f, "        }\n");
@@ -4331,6 +4332,64 @@ static int emit_typed_fused(
   return 1;
 }
 
+/* The fused multiply-add forms on tagged operands (a global, a field, a parameter): both halves are
+   the engine's number fast path, and a pair it declines runs the instruction through the op call,
+   which repeats both halves (neither has a side effect beyond its results). */
+static int emit_tag_fused(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    int have_types, char hex[33], int fi, int b) {
+  const ERole *role = e_roles[in->rop];
+  Q2ValueId dv, rv, xv, yv, cv;
+  int c_first = in->rop == ROP_add_mul || in->rop == ROP_sub_mul;
+  int is_add = in->rop == ROP_add_mul || in->rop == ROP_mul_add;
+  int ldm, ld, k;
+  char xa[64], ya[64], ca[64];
+
+  if (!have_types || t == NULL || cur == NULL) return 0;
+  if (in->rop != ROP_add_mul && in->rop != ROP_mul_add && in->rop != ROP_sub_mul &&
+      in->rop != ROP_mul_sub)
+    return 0;
+  if (role == NULL || role->control != E_CF_NONE) return 0;
+  if (in->ndef < 2 || in->nuse < 3) return 0;
+  dv = in->def[0];
+  rv = in->def[1];
+  xv = in->use[0];
+  yv = in->use[1];
+  cv = in->use[2];
+  if (dv >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues ||
+      xv >= (Q2ValueId)t->nvalues || yv >= (Q2ValueId)t->nvalues ||
+      cv >= (Q2ValueId)t->nvalues)
+    return 0;
+  if (t->lb[dv] != E_LB_TAG || t->lb[rv] != E_LB_TAG) return 0;
+  {
+    Q2ValueId us[3];
+    us[0] = xv; us[1] = yv; us[2] = cv;
+    for (k = 0; k < 3; k++)
+      if (t->lb[us[k]] != E_LB_TAG && t->lb[us[k]] != E_LB_I32 && t->lb[us[k]] != E_LB_F64)
+        return 0;
+  }
+  ldm = fn->values[dv].reg;
+  ld = fn->values[rv].reg;
+  if (ld < 0 || ld >= fn->nregs || ldm < 0 || ldm >= fn->nregs) return 0;
+  if (e_must_exit(fn, in)) return 0;
+  e_boxed_operand(xa, sizeof(xa), t, xv);
+  e_boxed_operand(ya, sizeof(ya), t, yv);
+  e_boxed_operand(ca, sizeof(ca), t, cv);
+  fprintf(f, "    { JSValue _m, _r;\n");
+  fprintf(f, "      if (__builtin_expect(q2_arith(QJS_AOT_REG_BIN_MUL, %s, %s, &_m), 1) &&\n", xa, ya);
+  fprintf(
+      f, "          __builtin_expect(q2_arith(%s, %s, %s, &_r), 1)) {\n",
+      is_add ? "QJS_AOT_REG_BIN_ADD" : "QJS_AOT_REG_BIN_SUB", c_first ? ca : "_m",
+      c_first ? "_m" : ca);
+  fprintf(f, "        v%u = _m;\n        v%u = _r;\n", (unsigned)dv, (unsigned)rv);
+  fprintf(f, "      } else {\n");
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  fprintf(f, "      }\n    }\n");
+  cur[ldm] = dv;
+  cur[ld] = rv;
+  return 1;
+}
+
 /* `to_propkey` ("rr": d, key) and `to_propkey2` ("rrr": d, key, object): an integer key is
    already a property key, so the result is the key itself. The two-operand form first
    tests the object for null and undefined, which is an exit before the instruction (the
@@ -4441,8 +4500,10 @@ static int emit_typed_elem_read(
   if (t->lb[av] != E_LB_TAG) return 0;
   if (t->lb[kv] == E_LB_I32)
     snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
+  else if (t->lb[kv] == E_LB_TAG)
+    snprintf(kb, sizeof(kb), "v%u", (unsigned)kv); /* an int is a hit; any other key is the wrapper's */
   else
-    return 0;  /* a TAG key needs ToPropertyKey: the wrapper's job */
+    return 0;
   dreg = fn->values[dv].reg;
   areg = fn->values[av].reg;
   kreg = fn->values[kv].reg;
@@ -4528,6 +4589,8 @@ static int emit_typed_elem_write(
   if (t->lb[av] != E_LB_TAG) return 0;
   if (t->lb[kv] == E_LB_I32)
     snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
+  else if (t->lb[kv] == E_LB_TAG)
+    snprintf(kb, sizeof(kb), "v%u", (unsigned)kv);
   else
     return 0;
   if (t->lb[vv] == E_LB_I32)
@@ -8924,7 +8987,8 @@ static int e_dispatch_rop(
     case ROP_mul_add:
     case ROP_mul_sub:
     case ROP_sub_mul:
-      return emit_typed_fused(f, fn, in, t, cur, have_types);
+      return emit_typed_fused(f, fn, in, t, cur, have_types) ||
+             emit_tag_fused(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- arithmetic -- */
     case ROP_div:
