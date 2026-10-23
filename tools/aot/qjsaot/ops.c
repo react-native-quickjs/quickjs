@@ -9834,7 +9834,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]);
    take the choice from Q2_LZ. Frameless and inline bodies keep the tests. */
 static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   int rc;
-  g_e_nolazy = !g_e_fl && !g_e_inl;
+  g_e_nolazy = !g_e_inl;
   if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 0\n");
   rc = e_emit_spec_body_pass_inner(f, fn, hex);
   if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 1\n");
