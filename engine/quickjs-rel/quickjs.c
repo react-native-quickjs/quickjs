@@ -21420,8 +21420,13 @@ js_proto_has_enum_string_prop(JSContext *ctx, JSObject *p1)
     JSShapeProperty *pprs;
     int pi;
 
-    if (p1->is_exotic)
-        return -1;
+    if (p1->is_exotic) {
+        /* a fast array's own keys are its elements and its shape; Array.prototype is one */
+        if (p1->class_id != JS_CLASS_ARRAY || !p1->fast_array)
+            return -1;
+        if (p1->u.array.count > 0)
+            return 1;
+    }
     psh = p1->shape;
     JSRuntime *rt = ctx->rt;
 
@@ -62624,6 +62629,53 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
     }
 #endif
     return qjs_aot_step(ip, fr, f, ctx);
+}
+
+/* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
+   read from the table and the register borrows it (the table owns it for the context's life);
+   the element must still be present in a fast array, as in js_for_in_next. Everything else,
+   including the first use of an index, runs the instruction's handler. The instruction is
+   `op, reg w`: the iterator at w, the key written at w+1 and `done` at w+2. */
+QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                          JSContext *ctx)
+{
+#if QJS_DRC
+    int w = (int)regvm_ld_u16(ip + 1) >> 4;
+    JSValue eo = fr[w];
+
+    if (likely(JS_VALUE_GET_TAG(eo) == JS_TAG_OBJECT)) {
+        JSObject *p = JS_VALUE_GET_OBJ(eo);
+
+        if (likely(p->class_id == JS_CLASS_FOR_IN_ITERATOR)) {
+            JSForInIterator *it = p->u.for_in_iterator;
+
+            if (likely(it->is_array && it->idx < it->array_length && it->idx < 256 &&
+                       ctx->small_int_str != NULL &&
+                       JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT)) {
+                JSObject *ao = JS_VALUE_GET_OBJ(it->obj);
+                JSValue key = ctx->small_int_str[it->idx];
+
+                if (likely(ao->class_id == JS_CLASS_ARRAY && ao->fast_array &&
+                           it->idx < (uint32_t)ao->u.array.count &&
+                           !js_array_slot_is_hole(ao->u.array.u.values[it->idx]) &&
+                           !JS_IsUndefined(key))) {
+                    it->idx++;
+                    fr[w + 1] = key;
+                    fr[w + 2] = JS_FALSE;
+                    return ip + 3;
+                }
+            }
+        }
+    }
+    f->cap_ip = ip;
+    if (regvm_for_in_next(ctx, &fr[w + 1])) {
+        f->ret = JS_EXCEPTION;
+        return NULL;
+    }
+    return ip + 3;
+#else
+    return qjs_aot_step(ip, fr, f, ctx);
+#endif
 }
 
 /* The cached add-transition store of a compiled named store, tried before the

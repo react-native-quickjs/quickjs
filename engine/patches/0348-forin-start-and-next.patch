@@ -1,0 +1,103 @@
+Subject: A for-in start does not enumerate Array.prototype, and a compiled for-in step reads array keys in place
+
+What this does
+  - `js_proto_has_enum_string_prop` answers for a fast array (Array.prototype is one) from its
+    element count and its shape instead of reporting "unknown", which sent every `for (k in x)`
+    through `JS_GetOwnPropertyNamesInternal` of Array.prototype to learn that it has no
+    enumerable keys.
+  - `qjs_aot_for_in_next(ip, fr, f, ctx)`, the `for_in_next` twin of `qjs_aot_iter_next`: over a
+    fast array whose next key is one of the shared small-index strings the key is read from the
+    table (the register borrows it) with no handler call; every other case runs the same code the
+    handler runs.
+
+Why we need it
+  `for (k in arr)` cost about 2300 instructions per start in the proto-chain scan and about 70
+  instructions per step in the step wrapper and the handler. trips_forin_2 ran 171 ms and runs
+  93 ms in the interpreter.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -377,6 +377,11 @@
+ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                         JSContext *ctx);
+ 
++/* `for_in_next` over an array, the next key read from the shared small-index strings; any
++   other case runs the instruction's handler. Same contract as qjs_aot_step. */
++QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
++                                          JSContext *ctx);
++
+ /* The cached add-transition store of a compiled named store, before the frame
+    is published. 1 when the store landed, 0 when the site has no transition for
+    the receiver's shape, -1 on exception. The value is borrowed. */
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21420,8 +21420,13 @@
+     JSShapeProperty *pprs;
+     int pi;
+ 
+-    if (p1->is_exotic)
+-        return -1;
++    if (p1->is_exotic) {
++        /* a fast array's own keys are its elements and its shape; Array.prototype is one */
++        if (p1->class_id != JS_CLASS_ARRAY || !p1->fast_array)
++            return -1;
++        if (p1->u.array.count > 0)
++            return 1;
++    }
+     psh = p1->shape;
+     JSRuntime *rt = ctx->rt;
+ 
+@@ -62626,6 +62631,53 @@
+     return qjs_aot_step(ip, fr, f, ctx);
+ }
+ 
++/* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
++   read from the table and the register borrows it (the table owns it for the context's life);
++   the element must still be present in a fast array, as in js_for_in_next. Everything else,
++   including the first use of an index, runs the instruction's handler. The instruction is
++   `op, reg w`: the iterator at w, the key written at w+1 and `done` at w+2. */
++QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
++                                          JSContext *ctx)
++{
++#if QJS_DRC
++    int w = (int)regvm_ld_u16(ip + 1) >> 4;
++    JSValue eo = fr[w];
++
++    if (likely(JS_VALUE_GET_TAG(eo) == JS_TAG_OBJECT)) {
++        JSObject *p = JS_VALUE_GET_OBJ(eo);
++
++        if (likely(p->class_id == JS_CLASS_FOR_IN_ITERATOR)) {
++            JSForInIterator *it = p->u.for_in_iterator;
++
++            if (likely(it->is_array && it->idx < it->array_length && it->idx < 256 &&
++                       ctx->small_int_str != NULL &&
++                       JS_VALUE_GET_TAG(it->obj) == JS_TAG_OBJECT)) {
++                JSObject *ao = JS_VALUE_GET_OBJ(it->obj);
++                JSValue key = ctx->small_int_str[it->idx];
++
++                if (likely(ao->class_id == JS_CLASS_ARRAY && ao->fast_array &&
++                           it->idx < (uint32_t)ao->u.array.count &&
++                           !js_array_slot_is_hole(ao->u.array.u.values[it->idx]) &&
++                           !JS_IsUndefined(key))) {
++                    it->idx++;
++                    fr[w + 1] = key;
++                    fr[w + 2] = JS_FALSE;
++                    return ip + 3;
++                }
++            }
++        }
++    }
++    f->cap_ip = ip;
++    if (regvm_for_in_next(ctx, &fr[w + 1])) {
++        f->ret = JS_EXCEPTION;
++        return NULL;
++    }
++    return ip + 3;
++#else
++    return qjs_aot_step(ip, fr, f, ctx);
++#endif
++}
++
+ /* The cached add-transition store of a compiled named store, tried before the
+    frame is published: it only grows the property array, so nothing observes
+    the registers. 1 when the store landed, 0 when the site holds no transition
