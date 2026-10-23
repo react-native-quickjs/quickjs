@@ -4021,11 +4021,64 @@ static void e_boxed_operand(char *buf, size_t n, const ETypes *t, Q2ValueId v);
 static int emit_typed_opcall(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     const uint64_t *live, char hex[33], int fi, int b);
+
+/* The step of a for-of over a dense array, before the instruction's op call: when the iterator is an
+   Array Iterator over a dense array whose `next` is the builtin, the element is read in place and the
+   index advanced (q2_iter_next_fast), and the window registers the step writes take their new values
+   in their locals without the frame or the step. Returns 1 when the test was written; the caller
+   writes the op call after it and the label `it_<pc>` after that. */
+static int e_emit_iter_fast(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, const Q2ValueId *cur) {
+  int w, wr, r;
+  char ie[48], ne[48], old[16][48];
+  if (in->rop != ROP_iter_next) return 0;
+  if (in->narg < 1 || in->nredef < 1 || in->nredef > 16 || cur == NULL) return 0;
+  w = E_ROFF(in->arg[0]);
+  wr = w / 16;
+  if (w % 16 != 0 || wr < 0 || wr + 3 >= fn->nregs) return 0;
+  /* The step writes the value and `done` registers (and clears the iterator slot at the end, which
+     this path never reaches); the IR also lists the other live registers as redefined, and they keep
+     the value they have. */
+  for (r = 0; r < in->nredef; r++) {
+    int rr = in->redef_reg[r];
+    Q2ValueId nv = in->redef_val[r], cv;
+    if (nv == Q2_NO_VALUE || nv >= (Q2ValueId)t->nvalues || t->lb[nv] != E_LB_TAG) return 0;
+    if (rr == wr + 2 || rr == wr + 3) continue;
+    if (rr < 0 || rr >= fn->nregs) return 0;
+    cv = cur[rr];
+    if (cv == E_INFRAME)
+      snprintf(old[r], sizeof(old[r]), "AOT_REG(fr, %d)", rr * 16);
+    else if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
+      snprintf(old[r], sizeof(old[r]), "v%u", (unsigned)cv);
+    else
+      return 0;
+  }
+  for (r = 0; r < 2; r++) {
+    Q2ValueId cv = cur[wr + r];
+    char *dst = r == 0 ? ie : ne;
+    if (cv == E_INFRAME)
+      snprintf(dst, 48, "AOT_REG(fr, %d)", (wr + r) * 16);
+    else if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
+      snprintf(dst, 48, "v%u", (unsigned)cv);
+    else
+      return 0;
+  }
+  fprintf(f, "    { JSValue _ev;\n      if (q2_iter_next_fast(%s, %s, &_ev)) {\n", ie, ne);
+  for (r = 0; r < in->nredef; r++) {
+    int rr = in->redef_reg[r];
+    fprintf(
+        f, "        v%u = %s;\n", (unsigned)in->redef_val[r],
+        rr == wr + 2 ? "_ev" : rr == wr + 3 ? "JS_FALSE" : old[r]);
+  }
+  fprintf(f, "        goto it_%d;\n      } }\n", in->pc);
+  return 1;
+}
+
 static int emit_typed_opcall(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     const uint64_t *live, char hex[33], int fi, int b) {
   const ERole *role = e_roles[in->rop];
-  int r, any;
+  int r, any, iter_fast = 0;
 
   /* A copied callee has no step engine behind it. */
   if (in->own > 0) {
@@ -4065,6 +4118,7 @@ static int emit_typed_opcall(
     return 1;
   }
 
+  iter_fast = e_emit_iter_fast(f, fn, in, t, cur);
   e_emit_presync(f, fn, in, t, cur);
   (void)live;
   if (g_e_ta_used) fprintf(f, "    ta_ok = 0;\n");
@@ -4168,6 +4222,7 @@ static int emit_typed_opcall(
      with two miss paths gives the second one the pre-instruction state. */
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
   e_emit_group_recheck(f, fn, in, cur);
+  if (iter_fast) fprintf(f, "    it_%d: ;\n", in->pc);
   g_e_opcalls++;
   return 1;
 }

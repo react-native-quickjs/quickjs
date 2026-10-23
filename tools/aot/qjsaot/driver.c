@@ -1975,6 +1975,13 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_ROPE_LEFT %uu\n"
           "#define QJS_AOT_OFF_ROPE_RIGHT %uu\n"
           "#define QJS_AOT_OFF_CTX_TA_LEN_EPOCH %uu\n"
+          "#define QJS_AOT_CLASS_ARRAY_ITERATOR %uu\n"
+          "#define QJS_AOT_OFF_ARRAY_ITER_OBJ %uu\n"
+          "#define QJS_AOT_OFF_ARRAY_ITER_KIND %uu\n"
+          "#define QJS_AOT_OFF_ARRAY_ITER_IDX %uu\n"
+          "#define QJS_AOT_ARRAY_ITER_KIND_VALUE %uu\n"
+          "#define QJS_AOT_OFF_CFUNC_CPROTO %uu\n"
+          "#define QJS_AOT_CFUNC_CPROTO_ITERATOR_NEXT %uu\n"
           "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
           "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
@@ -2033,7 +2040,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_rt_lazy_json, lay.off_object_flags16,
           lay.object_extensible_mask, lay.object_noadd_mask,
           lay.object_inline_cap_mask, lay.object_inline_cap_shift, lay.off_rope_left,
-          lay.off_rope_right, lay.off_ctx_ta_len_epoch);
+          lay.off_rope_right, lay.off_ctx_ta_len_epoch, lay.class_array_iterator,
+          lay.off_array_iter_obj, lay.off_array_iter_kind, lay.off_array_iter_idx,
+          lay.array_iter_kind_value, lay.off_cfunc_cproto, lay.cfunc_cproto_iterator_next);
       fclose(lf);
     }
 
@@ -3303,6 +3312,41 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (count + 1 > *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE)) return 0;\n"
         "  (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] = v;\n"
         "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count + 1;\n"
+        "  return 1;\n"
+        "}\n\n"
+        /* The step of a for-of over a dense array that reads its elements from an Array Iterator
+           whose `next` is the builtin: the element in place (the register borrows it, the array
+           owns it) and the iterator's index advanced, as the engine's own step does. Every other
+           case, the end of the iteration included, is the engine's. */
+        "static const void *e_arrnext_fn;\n"
+        "static inline __attribute__((always_inline)) int q2_iter_next_fast(JSValue it, JSValue nx, JSValue *out)\n"
+        "{\n"
+        "  const unsigned char *pi, *pn, *ap;\n"
+        "  JSValue ao, v;\n"
+        "  uint32_t idx;\n"
+        "  if (JS_VALUE_GET_TAG(it) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(nx) != JS_TAG_OBJECT) return 0;\n"
+        "  pi = (const unsigned char *)JS_VALUE_GET_PTR(it);\n"
+        "  pn = (const unsigned char *)JS_VALUE_GET_PTR(nx);\n"
+        "  if (*(const uint16_t *)(pi + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_ARRAY_ITERATOR) return 0;\n"
+        "  if (*(const uint16_t *)(pn + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_C_FUNCTION ||\n"
+        "      pn[QJS_AOT_OFF_CFUNC_CPROTO] != QJS_AOT_CFUNC_CPROTO_ITERATOR_NEXT)\n"
+        "    return 0;\n"
+        "  if (__builtin_expect(e_arrnext_fn == NULL, 0)) e_arrnext_fn = qjs_aot_array_iterator_next_fn();\n"
+        "  if (*(const void *const *)(pn + QJS_AOT_OFF_CFUNC_C_FUNCTION) != e_arrnext_fn) return 0;\n"
+        "  if (*(const uint32_t *)(pi + QJS_AOT_OFF_ARRAY_ITER_KIND) != QJS_AOT_ARRAY_ITER_KIND_VALUE) return 0;\n"
+        "  ao = *(const JSValue *)(pi + QJS_AOT_OFF_ARRAY_ITER_OBJ);\n"
+        "  if (JS_VALUE_GET_TAG(ao) != JS_TAG_OBJECT) return 0;\n"
+        "  ap = (const unsigned char *)JS_VALUE_GET_PTR(ao);\n"
+        "  if (*(const uint16_t *)(ap + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_ARRAY ||\n"
+        "      !(ap[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK) ||\n"
+        "      (ap[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK))\n"
+        "    return 0;\n"
+        "  idx = *(const uint32_t *)(pi + QJS_AOT_OFF_ARRAY_ITER_IDX);\n"
+        "  if (idx >= *(const uint32_t *)(ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) return 0;\n"
+        "  v = (*(const JSValue *const *)(ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[idx];\n"
+        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  *(uint32_t *)(pi + QJS_AOT_OFF_ARRAY_ITER_IDX) = idx + 1;\n"
+        "  *out = v;\n"
         "  return 1;\n"
         "}\n\n"
         "static inline const void *q2_pic(JSRegRun *f)\n"
