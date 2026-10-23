@@ -3823,6 +3823,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  fl = *(const uint16_t *)(obj + QJS_AOT_OFF_JSOBJECT_FLAGS16);\n"
         "  if ((fl & (QJS_AOT_JSOBJECT_EXTENSIBLE_MASK | QJS_AOT_JSOBJECT_NOADD_MASK)) !=\n"
         "      QJS_AOT_JSOBJECT_EXTENSIBLE_MASK) return 0;\n"
+        /* an addition to a prototype is the engine's to make: it moves the cache epoch */
+        "  if (obj[QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE] & QJS_AOT_JSOBJECT_IS_PROTOTYPE_MASK) return 0;\n"
         "  if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_MISSES) !=\n"
         "      (uint16_t)*(const uint32_t *)(*(const unsigned char *const *)((const unsigned char *)ctx +\n"
         "          QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_IC_EPOCH)) return 0;\n"

@@ -8457,9 +8457,10 @@ static void e_group_test(
     snprintf(
         cell + strlen(cell), sizeof(cell) - strlen(cell),
         " || q2_holder2_bad(%s, holders, (int)q2_ns, %s)", recv, ci);
-  /* A cell the entry validated and no change of the epoch has followed needs no test; a prototype
-     read still tests its holder. */
-  if (!proto && e_cell_entry_valid(g, site)) cellskip = 1;
+  /* A cell the entry validated and no change of the epoch has followed needs no test, and neither does
+     the holder of a prototype read: everything that changes a prototype in a way a cached read cares
+     about (an addition, a deletion, an accessor, a read-only property, a new prototype) moves the epoch. */
+  if (e_cell_entry_valid(g, site)) cellskip = 1;
   if (skip && cellskip) {
     snprintf(out, n, "0");
   } else if (skip) {
