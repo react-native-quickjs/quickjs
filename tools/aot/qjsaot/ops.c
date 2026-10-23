@@ -2604,55 +2604,6 @@ static int e_must_exit(const Q2Func *fn, const Q2Insn *in) {
   return g_e_facts != NULL && g_e_facts->miss_exits[e_insn_idx(fn, in)];
 }
 
-/* Whether an access that SKIPS its shape test (so relies on the entry check of group
-   `g` still holding) can run after `in`: one later in the code, or any at all when `in`
-   sits in a loop. An access that tests the cell itself needs no recheck before it, so
-   a call whose group is never relied on afterwards can change the cell freely. */
-static int e_group_relied_on_after(const Q2Func *fn, const Q2Insn *in, int g) {
-  int k, here = (int)(in - fn->insns);
-  int in_loop = 0, b, si;
-  /* Loop membership comes from the function itself, not from the frameless trial's
-     tables, which are only set up when that trial runs. */
-  for (b = 0; b < fn->nblocks && !in_loop; b++)
-    for (si = 0; si < fn->blocks[b].nsucc && si < 2; si++) {
-      int sb = fn->blocks[b].succ_block[si];
-      if (sb >= 0 && sb < fn->nblocks && q2_is_back_edge(fn, b, sb) && g_e_blk >= sb &&
-          g_e_blk <= b)
-        in_loop = 1;
-    }
-  if (g_e_facts->skip == NULL) return 1;
-  for (k = 0; k < g_e_facts->nsites; k++) {
-    const ESiteInfo *si = &g_e_facts->sites[k];
-    if (si->group != g || si->insn < 0 || si->insn >= g_e_facts->ninsns) continue;
-    if (!g_e_facts->skip[si->insn]) continue;
-    if (in_loop || si->insn > here) return 1;
-  }
-  return 0;
-}
-
-/* After a safepoint (an op call, a call): a group whose cell no longer holds
-   the shape taken at entry has been refilled, so the speculation about it is
-   over. Exit at the next instruction, with the op's results already in the
-   frame (the dx_ stub). One helper for every safepoint emitter. */
-static void e_emit_group_recheck(
-    FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur) {
-  int g;
-  (void)fn;
-  if (g_e_facts == NULL) return;
-  for (g = 0; g < g_e_facts->ngroups; g++) {
-    if (g_e_group_used == NULL || !g_e_group_used[g]) continue;
-    if (!e_group_relied_on_after(fn, in, g)) continue;
-    e_note_stub(
-        g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-    e_sweep_guard(f, "dx", in->next);
-    fprintf(
-        f,
-        "    if (__builtin_expect(gsh%d != E_NO_SHAPE && "
-        "q2_cell_shape(pic, %d) != gsh%d, 0)) goto dx_%d;\n",
-        g, g_e_facts->groups[g].first_site, g, in->next);
-  }
-}
-
 /* Defined with the other field emitters below; the chain and write emitters
    above them call these. */
 static int emit_group_chain(
@@ -3922,7 +3873,6 @@ static int emit_typed_opcall(
      e_note_defs does that once the whole instruction is lowered, so an emitter
      with two miss paths gives the second one the pre-instruction state. */
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
-  e_emit_group_recheck(f, fn, in, cur);
   g_e_opcalls++;
   return 1;
 }
@@ -5193,7 +5143,6 @@ static int emit_inl_nested_call(
         "%s\n",
         cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
-    if (g_e_inl) e_emit_group_recheck(f, fn, in, cur);
     if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
       /* The owned result parks in the published window, then its count is dropped (the
          drop can run a collection); the next safepoint gives the value a slot. */
@@ -5213,7 +5162,6 @@ static int emit_inl_nested_call(
     /* The result is in place (a TAG value in its local, a typed one in the frame
        slot the exit stub reads): the facts the call may have changed are checked now,
        so an exit here carries the result. */
-    if (!g_e_inl) e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
   /* No candidate matched. A frameless body that is not inlined calls any other
@@ -5243,7 +5191,6 @@ static int emit_inl_nested_call(
       fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
       abort();
     }
-    e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n", in->pc);
   }
   /* The call has not run: leave before it. */
@@ -5364,7 +5311,6 @@ static int emit_typed_construct(
         "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
         cexp, callee[k], ntexp, ntexp, cexp, cexp, in->next - 1, callee[k], cexp, w, na,
         getenv("QJS_AOT_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", cexp, off);
-    e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
     fprintf(f, "            goto cd_%d;\n        }\n    }\n#endif\n", in->pc);
   }
@@ -5475,7 +5421,6 @@ static int emit_fl_put_global(
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
     cur[rr] = rv;
   }
-  e_emit_group_recheck(f, fn, in, cur);
   return 1;
 }
 
@@ -5549,7 +5494,6 @@ static int emit_store_call(
       continue;
     fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)rv, rr * 16);
   }
-  e_emit_group_recheck(f, fn, in, cur);
   return 1;
 }
 
@@ -5713,7 +5657,6 @@ static int emit_fl_alloc_op(
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
     cur[rr] = rv;
   }
-  e_emit_group_recheck(f, fn, in, cur);
   g_e_inl_dirty = 1;
   if (!fill) cur[dreg] = dv;
   return 1;
@@ -6054,7 +5997,6 @@ static int emit_alloc_op(
         "        else if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
         "        else AOT_SET_B(ctx, fr, %d, _o);\n",
         off, off, off);
-  e_emit_group_recheck(f, fn, in, cur);
   if (redef_mode) {
     /* every register the op redefines becomes a TAG local again from the frame */
     int k2;
@@ -6273,7 +6215,6 @@ static int emit_typed_call(
         "        else AOT_SET_B(ctx, fr, %d, _o);\n",
         off, off);
     /* The call ran JS: re-read the groups before anything reads a field. */
-    e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(f, "        v%u = _o;\n", (unsigned)dv);
     } else if (e_def_dead(in, dv)) {
@@ -6331,7 +6272,6 @@ static int emit_typed_call(
           "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
           "        else AOT_SET_B(ctx, fr, %d, _o);\n",
           in->next - 1, site, na, cexp, recv, w, off, off);
-      e_emit_group_recheck(f, fn, in, cur);
       if (t->lb[dv] == E_LB_TAG) {
         fprintf(f, "        v%u = _o;\n", (unsigned)dv);
       } else if (e_def_dead(in, dv)) {
@@ -7039,7 +6979,6 @@ static int emit_typed_field_write(
         "              return qjs_aot_throw_here(ctx, f, %d); }\n",
         boxed, in->pc, (unsigned)rv, in->arg[1].off, site, in->pc);
     fprintf(f, "        }\n");
-    e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "      }\n");
     fprintf(f, "    }\n");
     return 1;
