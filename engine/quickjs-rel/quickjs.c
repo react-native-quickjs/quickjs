@@ -61418,6 +61418,16 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->class_c_function = JS_CLASS_C_FUNCTION;
     out->off_cfunc_c_function = (uint32_t)offsetof(JSObject, u.cfunc.c_function);
     out->off_cfunc_magic = (uint32_t)offsetof(JSObject, u.cfunc.magic);
+    out->class_array_iterator = JS_CLASS_ARRAY_ITERATOR;
+    out->off_array_iter_obj = (uint32_t)(offsetof(JSObject, u.array_iterator_data) +
+                                         offsetof(JSArrayIteratorData, obj));
+    out->off_array_iter_kind = (uint32_t)(offsetof(JSObject, u.array_iterator_data) +
+                                          offsetof(JSArrayIteratorData, kind));
+    out->off_array_iter_idx = (uint32_t)(offsetof(JSObject, u.array_iterator_data) +
+                                         offsetof(JSArrayIteratorData, idx));
+    out->array_iter_kind_value = JS_ITERATOR_KIND_VALUE;
+    out->off_cfunc_cproto = (uint32_t)offsetof(JSObject, u.cfunc.cproto);
+    out->cfunc_cproto_iterator_next = JS_CFUNC_iterator_next;
     out->off_rope_left = (uint32_t)offsetof(JSStringRope, left);
     out->off_rope_right = (uint32_t)offsetof(JSStringRope, right);
     out->off_ctx_ta_len_epoch = (uint32_t)offsetof(JSContext, regvm_ta_len_epoch);
@@ -63112,6 +63122,11 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
 #else
     return qjs_aot_step(ip, fr, f, ctx);
 #endif
+}
+
+QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void)
+{
+    return (const void *)js_array_iterator_next;
 }
 
 /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is

@@ -460,3 +460,4 @@ bump while `9999` is missing.
 | `0372` | The layout export carries what an inline append to a dense array tests | A store at index `count` of a dense array was a call into the engine | `JSAotGenLayout` | No. |
 | `0373` | A stack overflow in compiled code builds its backtrace where it is thrown | A deep frameless recursion that overflowed printed one frame where the interpreter prints ten | `qjs_aot_throw_stack_overflow` | No. |
 | `0374` | The poll of a frameless body builds the backtrace of the exception it raises | An interrupt in a deep compiled recursion reported only the frame that caught it | `qjs_aot_poll_fl` | No. |
+| `0375` | The layout export carries what an inline step of an array iterator tests | A for-of over an array was an op call per element | `JSAotGenLayout`, `qjs_aot_array_iterator_next_fn` | No. |
