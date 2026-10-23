@@ -48971,7 +48971,14 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     }
                     break;
                 case OP_get_super_value:
-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el;
+                    /* on stack: this proto key. The method is read with `this` as the
+                       receiver (an accessor runs with it), and `this` stays below it. */
+                    fd->byte_code.size = fd->last_opcode_pos;
+                    fd->last_opcode_pos = -1;
+                    emit_op(s, OP_dup3);
+                    emit_op(s, OP_get_super_value);
+                    emit_op(s, OP_nip);
+                    emit_op(s, OP_nip);
                     /* on stack: this func_obj */
                     opcode = OP_get_array_el;
                     drop_count = 2;

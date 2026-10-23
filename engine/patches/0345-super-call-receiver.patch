@@ -1,0 +1,30 @@
+Subject: A method called through super gets its property with this as the receiver
+
+What this does
+  - `super.m(...)` and `super[k](...)` read the method with `OP_get_super_value` (home
+    object's prototype as the lookup start, `this` as the receiver) and keep `this` below it
+    for the call, instead of rewriting the read to `OP_get_array_el` on the prototype.
+
+Why we need it
+  When `m` is an accessor the getter ran with the prototype as `this`, so
+  `super.f()` with `get f() { return function () { return this.tag; }; }` returned the
+  prototype's `tag`; the specification runs the getter with the instance.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -48971,7 +48971,14 @@
+                     }
+                     break;
+                 case OP_get_super_value:
+-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el;
++                    /* on stack: this proto key. The method is read with `this` as the
++                       receiver (an accessor runs with it), and `this` stays below it. */
++                    fd->byte_code.size = fd->last_opcode_pos;
++                    fd->last_opcode_pos = -1;
++                    emit_op(s, OP_dup3);
++                    emit_op(s, OP_get_super_value);
++                    emit_op(s, OP_nip);
++                    emit_op(s, OP_nip);
+                     /* on stack: this func_obj */
+                     opcode = OP_get_array_el;
+                     drop_count = 2;
