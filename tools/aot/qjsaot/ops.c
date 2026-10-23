@@ -55,6 +55,7 @@ static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char
 static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc);
 static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in);
 static const char *e_slotfn(int site);
+static const char *e_cellidx(char *buf, size_t n, int site);
 static void e_group_test(
     char *out, size_t n, int skip, int cellskip, const char *recv, int g, int site, int write);
 static int emit_hit_result(
@@ -6998,7 +6999,7 @@ static int emit_tag_cmp_value(
 static int emit_group_this_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int g,
     int site, Q2ValueId fv, Q2ValueId rv, int freg, int rreg) {
-  char test[320];
+  char test[320], cib[24];
   int skip = g_e_facts->skip[e_insn_idx(fn, in)];
   Q2ValueId *c2 = NULL;
   (void)g;
@@ -7029,9 +7030,9 @@ static int emit_group_this_read(
       "    { JSValue _t = %s, _f;\n"
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
       "      if (__builtin_expect(%s, 0)) goto vx_%d;\n"
-      "      _f = *%s(_t, q2_cell_off(pic, %d));\n",
+      "      _f = *%s(_t, q2_cell_off(pic, %s));\n",
       g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)", in->pc,
-      test, in->pc, e_slotfn(site), site);
+      test, in->pc, e_slotfn(site), e_cellidx(cib, sizeof(cib), site));
   if (!g_e_nolazy)
     fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
@@ -7591,7 +7592,17 @@ static int emit_elem_region_write(
 /* The slot accessor of a grouped read: the receiver's own slots, or the holder's for a
    prototype read. */
 static const char *e_slotfn(int site) {
-  return g_e_facts != NULL && e_facts_site_proto(g_e_facts, site) ? "q2_hslotp" : "q2_slotp";
+  int pr = g_e_facts != NULL ? e_facts_site_proto(g_e_facts, site) : 0;
+  return pr == 2 ? "q2_hslot2p" : pr == 1 ? "q2_hslotp" : "q2_slotp";
+}
+/* The cache entry index of a site's cell: the site itself, or for a holder two prototypes up
+   the way the entry was found in at entry. */
+static const char *e_cellidx(char *buf, size_t n, int site) {
+  if (g_e_facts != NULL && e_facts_site_proto(g_e_facts, site) == 2)
+    snprintf(buf, n, "pci%d", site);
+  else
+    snprintf(buf, n, "%d", site);
+  return buf;
 }
 
 /* The test that sends a grouped access to its exit: the receiver must be an
@@ -7608,16 +7619,20 @@ static const char *e_slotfn(int site) {
 static void e_group_test(
     char *out, size_t n, int skip, int cellskip, const char *recv, int g, int site,
     int write) {
-  char cell[160];
-  int proto = !write && g_e_facts != NULL && e_facts_site_proto(g_e_facts, site);
+  char cell[200], ci[24];
+  int proto = !write && g_e_facts != NULL ? e_facts_site_proto(g_e_facts, site) : 0;
   snprintf(
-      cell, sizeof(cell), "%s(pic, %d) != gsh%d",
-      write ? "q2_cell_wshape" : "q2_cell_shape", site, g);
+      cell, sizeof(cell), "%s(pic, %s) != gsh%d",
+      write ? "q2_cell_wshape" : "q2_cell_shape", e_cellidx(ci, sizeof(ci), site), g);
   /* A prototype read also needs the holder's shape to be the one the cell was filled with. */
-  if (proto)
+  if (proto == 1)
     snprintf(
         cell + strlen(cell), sizeof(cell) - strlen(cell), " || q2_holder_bad(%s, holders, %d)",
         recv, site);
+  else if (proto == 2)
+    snprintf(
+        cell + strlen(cell), sizeof(cell) - strlen(cell),
+        " || q2_holder2_bad(%s, holders, (int)q2_ns, %s)", recv, ci);
   if (skip && cellskip) {
     snprintf(out, n, "0");
   } else if (skip) {
@@ -7639,7 +7654,7 @@ static void e_group_test(
 static int emit_group_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t,
     Q2ValueId *cur, int g, int site, Q2ValueId dv, Q2ValueId rv, int dreg) {
-  char test[320], recv[32];
+  char test[320], recv[32], cib[24];
   int skip = g_e_facts->skip[e_insn_idx(fn, in)];
   /* Decide everything before writing a byte. */
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 &&
@@ -7650,7 +7665,7 @@ static int emit_group_read(
   e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 0);
   fprintf(f, "    { JSValue _f;\n");
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
-  fprintf(f, "      _f = *%s(%s, q2_cell_off(pic, %d));\n", e_slotfn(site), recv, site);
+  fprintf(f, "      _f = *%s(%s, q2_cell_off(pic, %s));\n", e_slotfn(site), recv, e_cellidx(cib, sizeof(cib), site));
   if (!g_e_nolazy)
     fprintf(
       f,
@@ -7676,14 +7691,14 @@ static int emit_group_chain(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t,
     Q2ValueId *cur, int g1, int s1, int g2, int s2, Q2ValueId rv, Q2ValueId d0v,
     Q2ValueId d1v, int d0reg, int d1reg) {
-  char test[320], recv[32];
+  char test[320], recv[32], cib[24];
   (void)fn;
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_group_exit_stub(f, in, cur, rv);
   fprintf(f, "    { JSValue _c0, _c1;\n");
   e_group_test(test, sizeof(test), 0, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
-  fprintf(f, "      _c0 = *%s(%s, q2_cell_off(pic, %d));\n", e_slotfn(s1), recv, s1);
+  fprintf(f, "      _c0 = *%s(%s, q2_cell_off(pic, %s));\n", e_slotfn(s1), recv, e_cellidx(cib, sizeof(cib), s1));
   if (!g_e_nolazy)
     fprintf(
       f,
@@ -7692,7 +7707,7 @@ static int emit_group_chain(
       in->pc);
   e_group_test(test, sizeof(test), 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
-  fprintf(f, "      _c1 = *%s(_c0, q2_cell_off(pic, %d));\n", e_slotfn(s2), s2);
+  fprintf(f, "      _c1 = *%s(_c0, q2_cell_off(pic, %s));\n", e_slotfn(s2), e_cellidx(cib, sizeof(cib), s2));
   if (!g_e_nolazy)
     fprintf(
       f,
@@ -10161,9 +10176,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       /* The shape is the first filled cell among the group's sites. */
       fprintf(f, "    const void *gsh%d = NULL;\n", g);
       for (q = 0; q < gr->nsites; q++)
-        fprintf(
-            f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(pic, %d);\n", g, g,
-            gr->sites[q]);
+        if (e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
+          fprintf(
+              f, "    if (gsh%d == NULL) gsh%d = q2_cell2_shape(pic, %d, (int)q2_ns);\n", g, g,
+              gr->sites[q]);
+        else
+          fprintf(
+              f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(pic, %d);\n", g, g,
+              gr->sites[q]);
       /* A site the profile sampled (hot) must have a cell holding the group's shape, in the
          kind it needs (a store needs the writable kind): its accesses and the facts assume
          it until a safepoint. A cell that is empty or of another shape refuses the entry;
@@ -10196,17 +10216,33 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             wr = g_e_facts->sites[z].write;
             hot = g_e_facts->sites[z].hot;
           }
-        fprintf(
-            f,
-            "    { const void *_s = %s(pic, %d);\n"
-            "      if (__builtin_expect(%s_s != gsh%d, 0)) {\n"
-            "        E_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
-            "        E_REFUSE_NOTE(%d);\n"
-            "        return %s;\n"
-            "      } }\n",
-            wr && hot ? "q2_cell_wshape" : "q2_cell_shape", gr->sites[q],
-            hot ? "" : "_s != NULL && ", g, hex, gr->sites[q], fi, gen0);
-        if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]))
+        if (e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
+          fprintf(
+              f, "    const int pci%d = q2_cell2_index(pic, %d, (int)q2_ns, gsh%d);\n",
+              gr->sites[q], gr->sites[q], g);
+        {
+          char cib[24];
+          fprintf(
+              f,
+              "    { const void *_s = %s(pic, %s);\n"
+              "      if (__builtin_expect(%s_s != gsh%d, 0)) {\n"
+              "        E_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "      } }\n",
+              wr && hot ? "q2_cell_wshape" : "q2_cell_shape",
+              e_cellidx(cib, sizeof(cib), gr->sites[q]), hot ? "" : "_s != NULL && ", g, hex,
+              gr->sites[q], fi, gen0);
+        }
+        if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
+          fprintf(
+              f,
+              "    if (__builtin_expect(q2_holder2_bad_sh(gsh%d, holders, (int)q2_ns, pci%d), 0)) {\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "    }\n",
+              g, gr->sites[q], fi, gen0);
+        else if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]))
           fprintf(
               f,
               "    if (__builtin_expect(q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"

@@ -1107,6 +1107,18 @@ int qjs_aot_prof_site_own(const uint8_t dg[16], int site) {
   return 0;
 }
 
+/* Whether every fill of a read site was a read from a holder two prototypes up. */
+int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i;
+  if (!e || !g_prof_sitekinds) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    if (e->sites[i].site != site) continue;
+    return e->sites[i].kinds == (1u << 5);
+  }
+  return 0;
+}
+
 /* Whether every fill of a read site was a read from the direct prototype. */
 int qjs_aot_prof_site_proto(const uint8_t dg[16], int site) {
   const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
@@ -1894,7 +1906,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_FNBC_AOT_POLY_SITES %uu\n"
           "#define QJS_AOT_AOT_POLY_WAYS %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE %uu\n"
-          "#define QJS_AOT_JSOBJECT_HOLEY_MASK %uu\n\n"
+          "#define QJS_AOT_JSOBJECT_HOLEY_MASK %uu\n"
+          "#define QJS_AOT_REG_PIC_PROTO2 %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_HTMLDDA_BYTE %uu\n"
+          "#define QJS_AOT_JSOBJECT_HTMLDDA_MASK %uu\n\n"
           "#define QJS_AOT_OFF_REGRUN_RET_IP %uu\n"
           "#define QJS_AOT_OFF_REGRUN_FR %uu\n"
           "#define QJS_AOT_OFF_REGRUN_VAR_REFS %uu\n"
@@ -1969,6 +1984,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.class_string, lay.string_wide_mask, lay.string_kind_mask, lay.shape_prop_tmask, lay.off_rt_onechar,
           lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
+          lay.reg_pic_proto2, lay.off_object_htmldda_byte, lay.object_htmldda_mask,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
           lay.off_rt_regvm_cur, lay.off_rt_stack_limit, lay.off_rt_fl_top,
@@ -2748,7 +2764,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "QJS_AOT_SIZEOF_JSREGPIC;\n"
         "  kind = *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND);\n"
         "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W &&\n"
-        "      kind != QJS_AOT_REG_PIC_PROTO) "
+        "      kind != QJS_AOT_REG_PIC_PROTO && kind != QJS_AOT_REG_PIC_PROTO2) "
         "return NULL;\n"
         "  return *(const void *const *)e;\n"
         "}\n\n"
@@ -2797,6 +2813,64 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  const unsigned char *prop =\n"
         "      *(const unsigned char *const *)(h + QJS_AOT_OFF_JSOBJECT_PROP);\n"
         "  return (JSValue *)(prop + off);\n"
+        "}\n"
+        /* A holder two prototypes up: the cache entry sits in way 1 or above at index `ci`, its
+           holder shape in holders[ci] and the middle object's shape in the second half. */
+        "static inline const void *q2_cell2_shape(const void *pic, int site, int nsites)\n"
+        "{\n"
+        "  unsigned k;\n"
+        "  if (pic == NULL) return NULL;\n"
+        "  for (k = 1; k < QJS_AOT_REG_PIC_WAYS; k++) {\n"
+        "    const unsigned char *e = (const unsigned char *)pic +\n"
+        "        ((size_t)k * (size_t)nsites + (size_t)site) * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "    if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) == QJS_AOT_REG_PIC_PROTO2)\n"
+        "      return *(const void *const *)e;\n"
+        "  }\n"
+        "  return NULL;\n"
+        "}\n"
+        "static inline int q2_cell2_index(const void *pic, int site, int nsites, const void *sh)\n"
+        "{\n"
+        "  unsigned k;\n"
+        "  if (pic == NULL) return (int)QJS_AOT_REG_IC_NONE;\n"
+        "  for (k = 1; k < QJS_AOT_REG_PIC_WAYS; k++) {\n"
+        "    const unsigned char *e = (const unsigned char *)pic +\n"
+        "        ((size_t)k * (size_t)nsites + (size_t)site) * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "    if (*(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) == QJS_AOT_REG_PIC_PROTO2 &&\n"
+        "        *(const void *const *)e == sh)\n"
+        "      return (int)(k * (unsigned)nsites + (unsigned)site);\n"
+        "  }\n"
+        "  return (int)QJS_AOT_REG_IC_NONE;\n"
+        "}\n"
+        "static inline int q2_holder2_bad_sh(const void *sh, void *const *holders, int nsites, int ci)\n"
+        "{\n"
+        "  const unsigned char *p1, *p2;\n"
+        "  if ((unsigned)ci == QJS_AOT_REG_IC_NONE) return 1;\n"
+        "  p1 = *(const unsigned char *const *)((const unsigned char *)sh + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  if (p1 == NULL ||\n"
+        "      *(const void *const *)(p1 + QJS_AOT_OFF_JSOBJECT_SHAPE) !=\n"
+        "          holders[(size_t)QJS_AOT_REG_PIC_WAYS * (size_t)nsites + (size_t)ci])\n"
+        "    return 1;\n"
+        "  p2 = *(const unsigned char *const *)(*(const unsigned char *const *)(p1 +\n"
+        "           QJS_AOT_OFF_JSOBJECT_SHAPE) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  return p2 == NULL || *(const void *const *)(p2 + QJS_AOT_OFF_JSOBJECT_SHAPE) != holders[ci];\n"
+        "}\n"
+        "static inline int q2_holder2_bad(JSValue v, void *const *holders, int nsites, int ci)\n"
+        "{\n"
+        "  return q2_holder2_bad_sh(q2_shape_of(v), holders, nsites, ci);\n"
+        "}\n"
+        "static inline JSValue *q2_hslot2p(JSValue v, uint32_t off)\n"
+        "{\n"
+        "  const unsigned char *p1 = *(const unsigned char *const *)(\n"
+        "      (const unsigned char *)q2_shape_of(v) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  const unsigned char *p2 = *(const unsigned char *const *)(*(const unsigned char *const *)(p1 +\n"
+        "           QJS_AOT_OFF_JSOBJECT_SHAPE) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  const unsigned char *prop = *(const unsigned char *const *)(p2 + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+        "  return (JSValue *)(prop + off);\n"
+        "}\n"
+        "static inline int q2_nullish_obj(JSValue v)\n"
+        "{\n"
+        "  return (((const unsigned char *)JS_VALUE_GET_PTR(v))[QJS_AOT_OFF_JSOBJECT_HTMLDDA_BYTE] &\n"
+        "          QJS_AOT_JSOBJECT_HTMLDDA_MASK) != 0;\n"
         "}\n"
         "static inline int q2_holder_bad_sh(const void *sh, void *const *holders, int site)\n"
         "{\n"

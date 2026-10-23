@@ -79,6 +79,7 @@ int qjs_aot_prof_site(
     const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_proto(const uint8_t dg[16], int site);
+int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
 
@@ -601,6 +602,9 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
     if (qjs_aot_prof_site_proto(fn->g->digest, sites[k].site) && !sites[k].write &&
         getenv("QJS_AOT_NOPROTOGROUP") == NULL) {
       sites[k].proto = 1;
+    } else if (qjs_aot_prof_site_proto2(fn->g->digest, sites[k].site) && !sites[k].write &&
+               getenv("QJS_AOT_NOPROTOGROUP") == NULL) {
+      sites[k].proto = 2;
     } else if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) {
       continue;
     }
