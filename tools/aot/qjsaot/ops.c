@@ -2831,6 +2831,13 @@ static int emit_typed_arith(
         "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
         "goto ox_%d;\n",
         in->pc);
+    /* a zero product with a negative operand is -0, which no int32 holds */
+    if (in->rop == ROP_mul)
+      fprintf(
+          f,
+          "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) "
+          "goto ox_%d;\n",
+          (unsigned)in->use[0], (unsigned)in->use[1], in->pc);
     e_note_stub(
         g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
   }
@@ -7328,14 +7335,21 @@ static int emit_typed_arith_cpool(
   if (t->lb[d] == E_LB_I32 && tag == E_POOL_INT &&
       t->lb[a] == E_LB_I32) {
     int32_t ic = (int32_t)c;
+    char nz[96] = "";
+    /* a zero product with a negative operand is -0, which no int32 holds */
+    if (sub == REG_BIN_MUL)
+      snprintf(nz, sizeof(nz),
+               "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) goto ox_%d;\n",
+               (unsigned)a, ic, in->pc);
     e_sweep_guard(f, "ox", in->pc);
     fprintf(
         f,
         "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n"
         "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
         "goto ox_%d;\n"
+        "%s"
         "      i%u = (int32_t)_t; }\n",
-        (unsigned)a, op, ic, in->pc, (unsigned)d);
+        (unsigned)a, op, ic, in->pc, nz, (unsigned)d);
     e_note_stub(
         g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -7802,6 +7816,10 @@ static int emit_typed_arith_imm(
       "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
       "goto ox_%d;\n",
       in->pc);
+  if (sub == REG_BIN_MUL)
+    fprintf(
+        f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) goto ox_%d;\n",
+        (unsigned)a, imm, in->pc);
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   /* The exit hands over the state BEFORE the instruction: the destination register
      may be the operand's, and the generic body redoes the operation from it. */
