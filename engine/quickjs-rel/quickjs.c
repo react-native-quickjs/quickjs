@@ -1319,6 +1319,9 @@ typedef struct JSMapState {
     uint32_t hash_size; /* must be a power of two */
     uint32_t record_count_threshold; /* count at which a hash table
                                         resize is needed */
+    /* Every record before this list node is a deleted one, so a new iterator starts here
+       instead of walking the zombies a live iterator still pins. NULL: the first record. */
+    struct list_head *scan_start;
 } JSMapState;
 
 enum
@@ -96762,6 +96765,16 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
     js_free_rt(rt, wr);
 }
 
+/* Takes the record off the list of its map; the scan-start hint moves on if it named it. */
+static void map_unlink_record(JSMapRecord *mr)
+{
+    JSMapState *s = mr->map;
+
+    if (s->scan_start == &mr->link)
+        s->scan_start = mr->link.next == &s->records ? NULL : mr->link.next;
+    list_del(&mr->link);
+}
+
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
 {
     if (mr->empty)
@@ -96774,7 +96787,7 @@ static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
     }
     JS_FreeValueRT(rt, mr->value);
     if (--mr->ref_count == 0) {
-        list_del(&mr->link);
+        map_unlink_record(mr);
         js_free_rt(rt, mr);
     } else {
         /* keep a zombie record for iterators */
@@ -96790,7 +96803,7 @@ static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
     if (--mr->ref_count == 0) {
         /* the record can be safely removed */
         assert(mr->empty);
-        list_del(&mr->link);
+        map_unlink_record(mr);
         js_free_rt(rt, mr);
     }
 }
@@ -97193,6 +97206,7 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     JSMapState *s;
     JSMapRecord *mr;
     struct list_head *el;
+    bool fresh;
 
     it = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP_ITERATOR + magic);
     if (!it) {
@@ -97203,8 +97217,9 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
         goto done;
     s = JS_GetOpaque(it->obj, JS_CLASS_MAP + magic);
     assert(s != NULL);
-    if (!it->cur_record) {
-        el = s->records.next;
+    fresh = !it->cur_record;
+    if (fresh) {
+        el = s->scan_start ? s->scan_start : s->records.next;
     } else {
         mr = it->cur_record;
         el = mr->link.next;
@@ -97228,6 +97243,9 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
         el = mr->link.next;
     }
 
+    /* a new iterator has walked over every deleted record before this one: later ones start here */
+    if (fresh)
+        s->scan_start = &mr->link;
     /* lock the record so that it won't be freed */
     mr->ref_count++;
     it->cur_record = mr;
