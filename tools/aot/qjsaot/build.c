@@ -1316,6 +1316,16 @@ static int def_from_record_insn(const Q2Insn *in) {
   }
 }
 
+/* Whether register `m` is one a fallback with unknown roles may write: all of them, except for the
+   two for-of steps, whose window is known. `iter_next` clears the iterator (when the loop ends) and
+   writes the value and `done`; `iter_start` leaves the iterator and its `next`. */
+static int q2_fallback_writes(const Q2Insn *in, int m) {
+  if (in->rop == ROP_iter_next && in->win_n >= 2)
+    return m == in->win_reg || m == in->win_reg + 2 || m == in->win_reg + 3;
+  if (in->rop == ROP_iter_start && in->win_n >= 1) return m == in->win_reg || m == in->win_reg + 1;
+  return 1;
+}
+
 /* The roles of a decoded instruction: its canonical form, its definitions, uses and window. */
 static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
   const Q2RopInfo *ri;
@@ -1359,6 +1369,16 @@ static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
     if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
       in->win_n = g->reg_count - in->win_reg;
     if (in->win_n < 0) in->win_n = 0;
+  }
+  if (in->rop == ROP_iter_next || in->rop == ROP_iter_start) {
+    /* A for-of's window: the step reads the iterator and its `next` (the start reads the iterable),
+       and writes only its own registers (see q2_fallback_writes). */
+    if (in->narg >= 1 && in->arg[0].kind == 'r') {
+      in->win_reg = q2_ri((int)in->arg[0].val);
+      in->win_n = in->rop == ROP_iter_next ? 2 : 1;
+      if (in->win_reg + in->win_n > g->reg_count) in->win_n = g->reg_count - in->win_reg;
+      if (in->win_n < 0) in->win_n = 0;
+    }
   }
   {
     /* Ops that read a staged run of registers the format does not count: the
@@ -2415,7 +2435,7 @@ int q2_build_ea(
           uint64_t *lo = f->insn_live + (size_t)(blk->first_insn + k) * words;
           int nlive = 0;
           for (m = 0; m < f->nregs; m++)
-            if (bits_test(lo, m)) nlive++;
+            if (bits_test(lo, m) && q2_fallback_writes(in2, m)) nlive++;
           if (nlive > 0) {
             in2->redef_reg = malloc(sizeof(int32_t) * (size_t)nlive);
             in2->redef_val = malloc(sizeof(Q2ValueId) * (size_t)nlive);
@@ -2426,7 +2446,7 @@ int q2_build_ea(
           }
           for (m = 0; m < f->nregs; m++) {
             Q2ValueId v;
-            if (!bits_test(lo, m)) continue;
+            if (!bits_test(lo, m) || !q2_fallback_writes(in2, m)) continue;
             v = q2_new_value(f);
             if (v == Q2_NO_VALUE) {
               f->why = "out of memory";
