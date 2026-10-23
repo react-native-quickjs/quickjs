@@ -5087,6 +5087,7 @@ static int emit_typed_elem_write(
 static int emit_hit_result(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId dv,
     int dreg, const char *raw);
+static void e_toi32_expr(char *buf, size_t n, const ETypes *t, Q2ValueId a);
 /* The exit stubs (dx) that take the owned result of a call to compiled code, by pc, with
    the register offset it was written to. */
 static int g_e_dx_own_pc[1024], g_e_dx_own_off[1024], g_e_dx_own_n;
@@ -9083,10 +9084,8 @@ static int emit_typed_bitwise(
   if (t->lb[b] != E_LB_I32 && t->lb[b] != E_LB_F64) return 0;
   {
     char an[48], bn[48];
-    if (t->lb[a] == E_LB_F64) snprintf(an, sizeof(an), "q2_toi32(d%u)", (unsigned)a);
-    else snprintf(an, sizeof(an), "i%u", (unsigned)a);
-    if (t->lb[b] == E_LB_F64) snprintf(bn, sizeof(bn), "q2_toi32(d%u)", (unsigned)b);
-    else snprintf(bn, sizeof(bn), "i%u", (unsigned)b);
+    e_toi32_expr(an, sizeof(an), t, a);
+    e_toi32_expr(bn, sizeof(bn), t, b);
     ld = fn->values[d].reg;
     if (in->rop == ROP_shl)
       fprintf(
@@ -9304,6 +9303,28 @@ static int emit_typed_inc_branch(
   return 1;
 }
 
+/* The C expression for ToInt32 of value `a` (an I32 or F64 local). A double that is the sum or
+   difference of two int32 values is exact, so its ToInt32 is the wrapped machine add. */
+static void e_toi32_expr(char *buf, size_t n, const ETypes *t, Q2ValueId a) {
+  if (t->lb[a] == E_LB_I32) {
+    snprintf(buf, n, "i%u", (unsigned)a);
+    return;
+  }
+  if (g_e_fn != NULL && a < (Q2ValueId)g_e_fn->nvalues && g_e_fn->values[a].insn >= 0) {
+    const Q2Insn *di = &g_e_fn->insns[g_e_fn->values[a].insn];
+    if (di->op == Q2_OP_BINARY && di->own == 0 && di->ndef == 1 && di->def[0] == a && di->nuse == 2 &&
+        (di->sub == REG_BIN_ADD || di->sub == REG_BIN_SUB) &&
+        di->use[0] < (Q2ValueId)t->nvalues && di->use[1] < (Q2ValueId)t->nvalues &&
+        t->lb[di->use[0]] == E_LB_I32 && t->lb[di->use[1]] == E_LB_I32) {
+      snprintf(
+          buf, n, "(int32_t)((uint32_t)i%u %c (uint32_t)i%u)", (unsigned)di->use[0],
+          di->sub == REG_BIN_ADD ? '+' : '-', (unsigned)di->use[1]);
+      return;
+    }
+  }
+  snprintf(buf, n, "q2_toi32(d%u)", (unsigned)a);
+}
+
 /* A typed binary with an IMMEDIATE operand: `binary_imm_s`, `add_imm_s`,
    `sub_imm_s` and `binary_cpool` whose pool entry is a foldable number. One
    operand is a local, the other a C literal, so the operation is the machine's
@@ -9371,7 +9392,7 @@ static int emit_typed_arith_imm(
         snprintf(xn, sizeof(xn), "i%u", (unsigned)a);
         xrep = 'i';
       } else if (t->lb[a] == E_LB_F64) {
-        snprintf(xn, sizeof(xn), "q2_toi32(d%u)", (unsigned)a);
+        e_toi32_expr(xn, sizeof(xn), t, a);
         xrep = 'd';
       } else {
         return 0;
