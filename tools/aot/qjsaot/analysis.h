@@ -37,6 +37,32 @@
 
 #define E_GROUP_NONE (-1)
 
+/* The program an instruction came from: the function itself, or a callee copied into it. */
+static inline const uint8_t *e_dg(const Q2Func *fn, const Q2Insn *in) {
+  return in->own ? fn->inl[in->own - 1].g->digest : fn->g->digest;
+}
+/* The program a property cache site number belongs to, and its number there. The copy's sites sit
+   above the function's own. */
+static inline const uint8_t *e_site_dg(const Q2Func *fn, int site, int *osite) {
+  int k;
+  for (k = 0; k < fn->ninl; k++) {
+    const Q2Inl *iv = &fn->inl[k];
+    if (site >= iv->sbase && site < iv->sbase + iv->g->pic_count) {
+      *osite = site - iv->sbase;
+      return iv->g->digest;
+    }
+  }
+  *osite = site;
+  return fn->g->digest;
+}
+/* The copy a site belongs to (1-based), or 0. */
+static inline int e_site_own(const Q2Func *fn, int site) {
+  int k;
+  for (k = 0; k < fn->ninl; k++)
+    if (site >= fn->inl[k].sbase && site < fn->inl[k].sbase + fn->inl[k].g->pic_count) return k + 1;
+  return 0;
+}
+
 /* One property site the speculator knows a PIC cell for. `site` is the PIC
    index the encoder assigned; `insn` is the defining instruction so diagnostics
    can name a pc. */
@@ -47,6 +73,7 @@ typedef struct ESiteInfo {
   Q2ValueId recv; /* the receiver value, or Q2_NO_VALUE */
   int poly;       /* the profile saw 2-4 shapes, all own slots: polymorphic cache */
   int proto;      /* a read served from the direct prototype: the holder is the shape's proto */
+  int own;        /* 0, or the copied callee (1-based) the site belongs to */
   int write;      /* the site is a field store (its cell is checked for the writable kind) */
   int hot;        /* the profile sampled the site (1024+ executions): its cell is checked strictly at entry */
 } ESiteInfo;
@@ -55,6 +82,7 @@ typedef struct ESiteInfo {
    speculative body validates the shape once at entry and then checks only the
    per-site slot offset. */
 typedef struct EGroup {
+  int own;        /* 0, or the copied callee (1-based) whose sites these are */
   int64_t shape;  /* the profile's shape id (an address in the profiled process) */
   int first_site; /* the site whose cell is read first at entry */
   int nsites;

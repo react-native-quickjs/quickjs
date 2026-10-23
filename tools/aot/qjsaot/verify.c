@@ -243,7 +243,7 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
          register operand of a classified operation is named (a def, a use or
          the call window base). A hand-written table that drifts here used to
          hide as a silent frame read in the lowering. */
-      if (in->op != Q2_OP_FALLBACK) {
+      if (in->op != Q2_OP_FALLBACK && !in->inlg) {
         int m;
         for (m = 0; m < in->narg; m++) {
           int named = 0, r;

@@ -1391,7 +1391,7 @@ static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
    the call. The copy's pcs are twice the callee's, offset, so a return can be two instructions. */
 static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *req, int nreq) {
   int k, i;
-  int32_t rnext = f->nregs, pnext = g->len + 16;
+  int32_t rnext = f->nregs, pnext = g->len + 16, sb_next = g->pic_count;
   Q2Insn *out = NULL;
   int nout = 0, capout;
   size_t total = (size_t)f->ninsns;
@@ -1413,6 +1413,8 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
     iv->rbase = rnext;
     rnext += cg->reg_count + np;
     iv->nparam = np;
+    iv->sbase = sb_next;
+    sb_next += cg->pic_count;
     iv->pcbase = pnext;
     iv->pcend = pnext + 2 * (np + 1) + 2 * cg->len + 2;
     pnext = iv->pcend + 16;
@@ -1537,9 +1539,12 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
       d.ppc = d.pc;
       d.xpc = iv->call_pc;
       d.own = (uint8_t)(k + 1);
+      d.opc = s.pc;
+      d.onext = s.next;
       for (a = 0; a < d.narg; a++) {
         if (d.arg[a].kind == 'r') d.arg[a].val += (int64_t)iv->rbase * 16;
         else if (d.arg[a].kind == 't') d.arg[a].val *= 2;
+        else if (d.arg[a].kind == 's' && d.arg[a].val != 0xffff) d.arg[a].val += iv->sbase;
       }
       for (a = 0; a < d.ndef; a++) d.def[a] += (Q2ValueId)iv->rbase;
       for (a = 0; a < d.nuse; a++) d.use[a] += (Q2ValueId)iv->rbase;
@@ -1572,6 +1577,54 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
           }
           q2_decode_roles(g, m);
         }
+        continue;
+      }
+      if (s.rop == ROP_get_this_field || s.rop == ROP_get_this_field2) {
+        /* "rras": the field value, a copy of `this`, the atom, the site: a copy of the receiver
+           and an ordinary read from it */
+        Q2Insn *m = &out[nout++], *r2;
+        iv->uses_this = 1;
+        if (iv->nthis < 32) iv->thispc[iv->nthis++] = s.pc;
+        memset(m, 0, sizeof(*m));
+        m->pc = d.pc;
+        m->next = d.pc + 1;
+        m->bpc = m->pc;
+        m->ppc = m->pc;
+        m->opc = s.pc;
+        m->onext = s.next;
+        m->xpc = iv->call_pc;
+        m->own = (uint8_t)(k + 1);
+        m->narg = 2;
+        m->arg[0].kind = 'r';
+        m->arg[0].val = s.arg[1].val + (int64_t)iv->rbase * 16;
+        m->arg[0].off = -1;
+        m->arg[1].kind = 'r';
+        m->arg[1].val = recv_off;
+        m->arg[1].off = -1;
+        m->rop = ROP_move;
+        q2_decode_roles(g, m);
+        r2 = &out[nout++];
+        *r2 = s;
+        r2->rop = s.rop == ROP_get_this_field ? ROP_get_field : ROP_get_field2;
+        r2->ndef = 0;
+        r2->nuse = 0;
+        r2->win_n = 0;
+        r2->win_reg = 0;
+        r2->pc = d.pc + 1;
+        r2->next = d.next;
+        r2->bpc = r2->pc;
+        r2->ppc = d.pc; /* the callee's record for the fused read is at the fused read's pc */
+        r2->opc = s.pc;
+        r2->onext = s.next;
+        r2->xpc = iv->call_pc;
+        r2->own = (uint8_t)(k + 1);
+        /* "rras": d, obj, atom, site -- the object is the copy of `this` */
+        r2->arg[0].val = s.arg[0].val + (int64_t)iv->rbase * 16;
+        r2->arg[1].kind = 'r';
+        r2->arg[1].val = s.arg[1].val + (int64_t)iv->rbase * 16;
+        r2->arg[1].off = -1;
+        if (r2->arg[3].kind == 's' && r2->arg[3].val != 0xffff) r2->arg[3].val += iv->sbase;
+        q2_decode_roles(g, r2);
         continue;
       }
       if (s.rop == ROP_load_this) {
@@ -1719,6 +1772,8 @@ int q2_build_inl(
     in->xpc = -1;
     in->bpc = i;
     in->ppc = i;
+    in->opc = i;
+    in->onext = i + cur.size;
     in->narg = cur.nargs;
     for (n = 0; n < cur.nargs && n < 8; n++) {
       in->arg[n].kind = cur.arg[n].kind;
@@ -1763,6 +1818,8 @@ int q2_build_inl(
         ni[nn].xpc = ex[k].anchor_pc;
         ni[nn].bpc = ex[k].fallthrough ? prev_pc : ex[k].anchor_pc;
         ni[nn].ppc = src->pc;
+        ni[nn].opc = src->pc;
+        ni[nn].onext = src->onext;
         ni[nn].arg[0].val = (int64_t)ex[k].newreg * 16;
         q2_decode_roles(g, &ni[nn]);
         nn++;
@@ -2341,8 +2398,14 @@ int q2_build_inl(
         const ProfPc *cp = qjs_aot_prof_pcs(f->inl[kk].g->digest, &nc);
         int32_t cbk = f->inl[kk].pcbase + 2 * (f->inl[kk].nparam + 1);
         for (rr = 0; rr < nc; rr++) {
+          int tq;
           mp[tot] = cp[rr];
           mp[tot].pc = cbk + 2 * cp[rr].pc;
+          /* a fused read of `this` shares one record between the field and `this` (an object):
+             the field's own kinds are what is left when it has others */
+          for (tq = 0; tq < f->inl[kk].nthis; tq++)
+            if (f->inl[kk].thispc[tq] == cp[rr].pc && (mp[tot].types & ~PT_OBJECT) != 0)
+              mp[tot].types &= ~PT_OBJECT;
           tot++;
         }
       }

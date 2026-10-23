@@ -105,7 +105,7 @@ int qjs_aot_pool_tag(const struct JSAotGenFunc *g, uint32_t idx);
    weight as `missarm`: only its misses reach the op call, so counting it in the
    op's own row would make a lowered family look unlowered. */
 static void note_opcall(const Q2Func *fn, const Q2Insn *in, int missarm) {
-  unsigned long long w = qjs_aot_prof_pc_count(fn->g->digest, in->ppc);
+  unsigned long long w = qjs_aot_prof_pc_count(e_dg(fn, in), in->opc);
   if (w) e_report_opcall(in->rop, (double)w, missarm);
 }
 
@@ -2202,14 +2202,14 @@ static void e_handoff_note(const Q2Func *fn, const Q2Insn *in) {
   if (in == NULL || g_e_quiet) return;
   for (i = 0; i < g_e_ho_n; i++) {
     if (g_e_ho[i].rop == in->rop) {
-      g_e_ho[i].weight += qjs_aot_prof_pc_count(fn->g->digest, in->ppc);
+      g_e_ho[i].weight += qjs_aot_prof_pc_count(e_dg(fn, in), in->opc);
       g_e_ho[i].blocks++;
       return;
     }
   }
   if (g_e_ho_n < E_HANDOFF_MAX) {
     g_e_ho[g_e_ho_n].rop = in->rop;
-    g_e_ho[g_e_ho_n].weight = qjs_aot_prof_pc_count(fn->g->digest, in->ppc);
+    g_e_ho[g_e_ho_n].weight = qjs_aot_prof_pc_count(e_dg(fn, in), in->opc);
     g_e_ho[g_e_ho_n].blocks = 1;
     g_e_ho_n++;
   }
@@ -2355,8 +2355,12 @@ int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_read_hits(const uint8_t dg[16], int site);
 static int e_fl_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
   if (!g_e_fl) return 1;
-  if (qjs_aot_prof_site_own(fn->g->digest, site)) return 1;
-  if (qjs_aot_prof_site_read_hits(fn->g->digest, site)) return 1;
+  {
+    int osite;
+    const uint8_t *dg = e_site_dg(fn, site, &osite);
+    if (qjs_aot_prof_site_own(dg, osite)) return 1;
+    if (qjs_aot_prof_site_read_hits(dg, osite)) return 1;
+  }
   e_fl_block("a read that is not an own or prototype hit", in);
   return 0;
 }
@@ -2368,8 +2372,12 @@ int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes, uint64_t sha
 static int e_site_vouched(const Q2Func *fn, int site) {
   int ns = 0;
   uint64_t sh[4];
-  return qjs_aot_prof_site(fn->g->digest, site, &ns, sh) && ns >= 1 && ns <= 4 &&
-         qjs_aot_prof_site_read_hits(fn->g->digest, site);
+  {
+    int osite;
+    const uint8_t *dg = e_site_dg(fn, site, &osite);
+    return qjs_aot_prof_site(dg, osite, &ns, sh) && ns >= 1 && ns <= 4 &&
+           qjs_aot_prof_site_read_hits(dg, osite);
+  }
 }
 
 /* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
@@ -6352,6 +6360,36 @@ static int emit_inl_guard(
     fprintf(
         f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto vx_%d;\n", rexp,
         in->pc);
+  if (iv->g->pic_count > 0) {
+    /* the callee's cache tables, shifted so its site numbers (above ours) index them */
+    int ik = in->inlg - 1, gi, qq;
+    fprintf(
+        f,
+        "    { const uint8_t *cbk_ = *(const uint8_t *const *)((const uint8_t *)JS_VALUE_GET_PTR(%s) + "
+        "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "      const uint8_t *pr_ = *(const uint8_t *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
+        "      if (__builtin_expect(pr_ == NULL, 0)) goto vx_%d;\n"
+        "      ipic_%d = pr_ - (size_t)%d * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "      iholders_%d = *(void *const *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER) - %d;\n"
+        "      ins_%d = (uint32_t)*(const uint16_t *)(cbk_ + QJS_AOT_OFF_FNBC_PIC_COUNT); }\n",
+        cexp, in->pc, ik, iv->sbase, ik, iv->sbase, ik);
+    /* each group of the copy takes the shape of its first filled cell; an access tests its own
+       cell against it, and a group nothing filled never matches */
+    for (gi = 0; g_e_facts != NULL && gi < g_e_facts->ngroups; gi++) {
+      const EGroup *gr = &g_e_facts->groups[gi];
+      if (gr->own != in->inlg || !g_e_group_used[gi]) continue;
+      fprintf(f, "    gsh%d = NULL;\n", gi);
+      for (qq = 0; qq < gr->nsites; qq++)
+        if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
+          fprintf(f, "    if (gsh%d == NULL) gsh%d = q2_cell2_shape(ipic_%d, %d, (int)ins_%d);\n", gi, gi, ik, gr->sites[qq], ik);
+        else
+          fprintf(f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(ipic_%d, %d);\n", gi, gi, ik, gr->sites[qq]);
+      fprintf(f, "    if (gsh%d == NULL) gsh%d = E_NO_SHAPE;\n", gi, gi);
+      for (qq = 0; qq < gr->nsites; qq++)
+        if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
+          fprintf(f, "    pci%d = q2_cell2_index(ipic_%d, %d, (int)ins_%d, gsh%d);\n", gr->sites[qq], ik, gr->sites[qq], ik, gi);
+    }
+  }
   g_e_miss_exit_seen = 1;
   return 1;
 }
@@ -8713,6 +8751,22 @@ static int emit_typed_arith_imm(
       return 1;
     }
   }
+  {
+    int base = sub & ~REG_CMP_INVERT, inv = (sub & REG_CMP_INVERT) != 0;
+    if ((base >= REG_BIN_LT && base <= REG_BIN_GTE) || base == REG_BIN_EQ || base == REG_BIN_NEQ ||
+        base == REG_BIN_STRICT_EQ || base == REG_BIN_STRICT_NEQ) {
+      /* a comparison of a number with a constant */
+      const char *cop = base == REG_BIN_LT ? "<" : base == REG_BIN_LTE ? "<=" : base == REG_BIN_GT ? ">"
+                        : base == REG_BIN_GTE ? ">=" : (base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ) ? "!=" : "==";
+      if (t->lb[d] != E_LB_BOOL || (t->lb[a] != E_LB_I32 && t->lb[a] != E_LB_F64)) return 0;
+      ld = fn->values[d].reg;
+      fprintf(
+          f, "    b%u = (%s%u %s %s%d)%s;\n", (unsigned)d, t->lb[a] == E_LB_I32 ? "i" : "d", (unsigned)a, cop,
+          t->lb[a] == E_LB_I32 ? "" : "(double)", imm, inv ? " ^ 1" : "");
+      if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+      return 1;
+    }
+  }
   if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL) return 0;
   if (d >= (Q2ValueId)t->nvalues) return 0;
   if (in->nuse < 1) return 0;
@@ -10323,6 +10377,18 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     fprintf(f, "    const uint32_t q2_ns = (uint32_t)q2_pic_sites(f);\n");
   }
   fprintf(f, "    (void)q2_ns; (void)holders;\n");
+  /* The environment of each copied callee: its cache tables (set where its guard passes) and a scratch
+     frame for the writes its instructions make to registers the real frame does not have. */
+  {
+    int ik;
+    for (ik = 0; ik < fn->ninl; ik++)
+      fprintf(
+          f,
+          "    const uint8_t *ipic_%d = NULL; void *const *iholders_%d = NULL; uint32_t ins_%d = 0;\n"
+          "    JSValue ifr_%d[%d];\n"
+          "    (void)ipic_%d; (void)iholders_%d; (void)ins_%d; (void)ifr_%d;\n",
+          ik, ik, ik, ik, fn->nregs, ik, ik, ik, ik);
+  }
   /* A function with no PIC sites -- a leaf arithmetic function, say -- has no
      PIC table at all, so `pic` is NULL on EVERY call. Refusing on that refused
      every such function for good (E_REFUSE_NOTE switches a function off after
@@ -10371,14 +10437,24 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           break;
         }
     {
+      /* The groups of copied callees are set up where their guard runs. */
+      for (g = 0; g < ng; g++) {
+        const EGroup *gr0 = &g_e_facts->groups[g];
+        int q0;
+        if (!g_e_group_used[g] || !gr0->own) continue;
+        fprintf(f, "    const void *gsh%d = E_NO_SHAPE;\n", g);
+        for (q0 = 0; q0 < gr0->nsites; q0++)
+          if (e_facts_site_proto(g_e_facts, gr0->sites[q0]) == 2)
+            fprintf(f, "    int pci%d = (int)QJS_AOT_REG_IC_NONE;\n", gr0->sites[q0]);
+      }
       /* The validation of the cells is done again only when a cache entry has changed since it
          last passed for this bytecode. */
       int ngu = 0, npci = 0, gi, qq;
       for (g = 0; g < ng; g++)
-        if (g_e_group_used[g]) ngu++;
+        if (g_e_group_used[g] && !g_e_facts->groups[g].own) ngu++;
       for (g = 0; g < ng; g++) {
         const EGroup *gr = &g_e_facts->groups[g];
-        if (!g_e_group_used[g]) continue;
+        if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
         for (qq = 0; qq < gr->nsites; qq++)
           if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2) npci++;
       }
@@ -10391,10 +10467,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
             ngu, npci > 0 ? npci : 1);
         for (g = 0; g < ng; g++)
-          if (g_e_group_used[g]) fprintf(f, "    const void *gsh%d;\n", g);
+          if (g_e_group_used[g] && !g_e_facts->groups[g].own) fprintf(f, "    const void *gsh%d;\n", g);
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
-          if (!g_e_group_used[g]) continue;
+          if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
           for (qq = 0; qq < gr->nsites; qq++)
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
               fprintf(f, "    int pci%d;\n", gr->sites[qq]);
@@ -10402,7 +10478,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
         for (g = 0, gk = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
-          if (!g_e_group_used[g]) continue;
+          if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
           fprintf(f, "      gsh%d = e_vg[%d];\n", g, gk++);
           for (qq = 0; qq < gr->nsites; qq++)
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
@@ -10413,7 +10489,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       }
       for (g = 0; g < ng; g++) {
       const EGroup *gr = &g_e_facts->groups[g];
-      if (!g_e_group_used[g]) continue;
+      if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
       /* The shape is the first filled cell among the group's sites. */
       fprintf(f, "    gsh%d = NULL;\n", g);
       for (q = 0; q < gr->nsites; q++)
@@ -10481,7 +10557,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         int gk = 0, pk = 0;
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
-          if (!g_e_group_used[g]) continue;
+          if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
           fprintf(f, "      e_vg[%d] = gsh%d;\n", gk++, g);
           for (qq = 0; qq < gr->nsites; qq++)
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
@@ -10493,7 +10569,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
          every entry. */
       for (g = 0; g < ng; g++) {
         const EGroup *gr = &g_e_facts->groups[g];
-        if (!g_e_group_used[g]) continue;
+        if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
         for (q = 0; q < gr->nsites; q++) {
           int hot = 0, z;
           for (z = 0; z < g_e_facts->nsites; z++)
@@ -10749,6 +10825,11 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         long before = ftell(f);
         int must_exit = e_must_exit(fn, in), emitted;
         g_e_miss_exit_seen = 0;
+        if (in->own > 0)
+          fprintf(
+              f,
+              "#define pic ipic_%d\n#define holders iholders_%d\n#define q2_ns ins_%d\n#define fr ifr_%d\n",
+              in->own - 1, in->own - 1, in->own - 1, in->own - 1);
         emitted = e_dispatch_rop(
             f, fn, in, &types, cur, have_types, hex, fi, b, role);
         if (!emitted)
@@ -10767,6 +10848,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             if (sr >= 0 && sr < fn->nregs) cur[sr] = E_UNDEF;
           }
         }
+        if (in->own > 0) fprintf(f, "#undef pic\n#undef holders\n#undef q2_ns\n#undef fr\n");
         /* The facts treated this access as no safepoint only because its miss
            exits; an emitter that gave it a continuing miss would leave facts the
            miss may have broken. */

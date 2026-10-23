@@ -576,6 +576,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
         cap = nc;
       }
       sites[n].site = ref[r].site;
+      sites[n].own = e_site_own(fn, ref[r].site);
       sites[n].insn = i;
       sites[n].group = E_GROUP_NONE;
       sites[n].recv = ref[r].recv < 0 ? Q2_NO_VALUE : (Q2ValueId)ref[r].recv;
@@ -584,35 +585,36 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
       {
         Access stw;
         sites[n].write = insn_store(in, &stw) && stw.kind == E_K_FIELD;
-        sites[n].hot = qjs_aot_prof_pc_count(fn->g->digest, in->ppc) > 0;
+        sites[n].hot = !in->own && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) > 0;
       }
       n++;
     }
   }
   for (k = 0; k < n; k++) {
-    int ns = 0, g = E_GROUP_NONE, j;
+    int ns = 0, g = E_GROUP_NONE, j, osite;
     uint64_t shapes[4];
     const Q2Insn *in = &fn->insns[sites[k].insn];
-    if (!qjs_aot_prof_site(fn->g->digest, sites[k].site, &ns, shapes)) continue;
-    if (ns >= 2 && ns <= 4 && qjs_aot_prof_site_own(fn->g->digest, sites[k].site) &&
-        !qjs_aot_prof_unexecuted(fn->g->digest, in->ppc)) {
+    const uint8_t *dg = e_site_dg(fn, sites[k].site, &osite);
+    if (!qjs_aot_prof_site(dg, osite, &ns, shapes)) continue;
+    if (ns >= 2 && ns <= 4 && qjs_aot_prof_site_own(dg, osite) &&
+        !qjs_aot_prof_unexecuted(dg, in->opc)) {
       sites[k].poly = 1; /* served by the polymorphic cache, not grouped */
       continue;
     }
     if (ns != 1) continue; /* never filled, or too many shapes: no group */
     /* Only an own readable or writable slot has a fixed offset to group on. */
-    if (qjs_aot_prof_site_proto(fn->g->digest, sites[k].site) && !sites[k].write &&
+    if (qjs_aot_prof_site_proto(dg, osite) && !sites[k].write &&
         getenv("QJS_AOT_NOPROTOGROUP") == NULL) {
       sites[k].proto = 1;
-    } else if (qjs_aot_prof_site_proto2(fn->g->digest, sites[k].site) && !sites[k].write &&
+    } else if (qjs_aot_prof_site_proto2(dg, osite) && !sites[k].write &&
                getenv("QJS_AOT_NOPROTOGROUP") == NULL) {
       sites[k].proto = 2;
-    } else if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) {
+    } else if (!qjs_aot_prof_site_own(dg, osite)) {
       continue;
     }
-    if (qjs_aot_prof_unexecuted(fn->g->digest, in->ppc)) continue;
+    if (qjs_aot_prof_unexecuted(dg, in->opc)) continue;
     for (j = 0; j < ng; j++) {
-      if (gshape[j] == (int64_t)shapes[0]) {
+      if (gshape[j] == (int64_t)shapes[0] && groups[j].own == sites[k].own) {
         g = j;
         break;
       }
@@ -627,6 +629,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
       gshape = s2;
       gshape[ng] = (int64_t)shapes[0];
       groups[ng].shape = (int64_t)shapes[0];
+      groups[ng].own = sites[k].own;
       groups[ng].first_site = sites[k].site;
       groups[ng].nsites = 0;
       groups[ng].sites = NULL;
@@ -745,14 +748,18 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   uint64_t shapes[4];
   if (in->rop != ROP_get_global || in->narg < 4 || in->arg[3].kind != 's' ||
       (unsigned)in->arg[3].val == REG_IC_NONE ||
-      qjs_aot_prof_pc_count(fn->g->digest, in->ppc) == 0 || getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
+      qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) == 0 || getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
     return 0;
   /* Filled at exactly one generation of the global object in the profiled run: the cell holds
      unless the global object changes, which that run did not see. */
-  if (!qjs_aot_prof_site(fn->g->digest, (int)in->arg[3].val, &ns, shapes)) return 0;
+  {
+    int osite;
+    const uint8_t *dg = e_site_dg(fn, (int)in->arg[3].val, &osite);
+    if (!qjs_aot_prof_site(dg, osite, &ns, shapes)) return 0;
+  }
   /* A site that ran many times and was filled only a couple of times saw the global object
      change at startup, not in its steady state. */
-  return ns == 1 || (ns <= 3 && qjs_aot_prof_pc_count(fn->g->digest, in->ppc) >= 16384);
+  return ns == 1 || (ns <= 3 && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) >= 16384);
 }
 
 /* The receiver of a region access, through the forwarded copies recorded so far. */
@@ -1626,6 +1633,15 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
         break;
       case Q2_OP_LOAD_THIS:
         if (!has_recv) ok = 0;
+        break;
+      case Q2_OP_GET_FIELD:
+        /* a read of a field of a register, or of `this` when the call has a receiver */
+        if (in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2) {
+          if (!has_recv) ok = 0;
+        } else if (in->rop != ROP_get_field && in->rop != ROP_get_field2 &&
+                   in->rop != ROP_get_field_own && in->rop != ROP_get_field2_own) {
+          ok = 0;
+        }
         break;
       default:
         ok = 0;

@@ -301,6 +301,7 @@ static uint8_t exits_for(int rop, int sub, int from_opcall) {
 
 /* A binary's operand representations, with an immediate operand counting as an
    i32. Returns 0 when the instruction has no operand pair. */
+static int is_cmp_sub(int sub);
 static int binary_operands(const Q2Insn *in, const uint8_t *w, int *a, int *b) {
   switch (in->rop) {
     case ROP_add_imm_s:
@@ -419,6 +420,9 @@ static int transfer_def(
         case REG_BIN_SHR:
           return rep_exact(a, b, record_int_only(dv));
         default:
+          /* a comparison of numbers written as an operation with a comparison sub */
+          if (is_cmp_sub(sub) && sub != REG_BIN_INSTANCEOF && sub != REG_BIN_IN && sub != REG_BIN_PRIVATE_IN)
+            return rep_cmp(sub, a, b);
           *whyp = E_WHY_UNKNOWN_RESULT;
           return E_LB_TAG;
       }

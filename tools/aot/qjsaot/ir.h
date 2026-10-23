@@ -188,6 +188,7 @@ typedef struct Q2Insn {
      whose profile it uses. -1 / pc / pc for an instruction of the program. `licm_mov` marks the
      copy that replaces the original in the loop. */
   int32_t xpc, bpc, ppc;
+  int32_t opc, onext; /* pc and next within the program the instruction came from */
   uint8_t licm_mov;
   /* 0 for an instruction of the program; k+1 for one copied from inlined callee k, whose
      guard is the instruction with `inlg` == k+1. */
@@ -246,9 +247,10 @@ typedef struct Q2InlReq {
 
 typedef struct Q2Inl {
   const struct JSAotGenFunc *g;
-  int32_t call_pc, rbase, pcbase, pcend, nparam;
+  int32_t call_pc, rbase, pcbase, pcend, nparam, sbase;
   int32_t keep[10], nkeep; /* the registers the call reads: live throughout the copy */
   int uses_this;           /* the copy reads the receiver */
+  int32_t thispc[32], nthis; /* callee pcs of fused reads of `this`, whose profile record also covers `this` */
 } Q2Inl;
 
 /* ---- functions ----------------------------------------------------------- */

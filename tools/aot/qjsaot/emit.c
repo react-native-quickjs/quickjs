@@ -348,22 +348,42 @@ static int e_inline_typed_ok(const Q2Func *fn) {
   if (fn->ninl == 0) return 1;
   memset(&facts, 0, sizeof(facts));
   memset(&types, 0, sizeof(types));
-  if (e_analyze(fn, &facts, &types) < 0) return 0;
+  if (e_analyze(fn, &facts, &types) < 0) {
+    if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: analysis failed\n");
+    return 0;
+  }
   for (i = 0; ok && i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     if (in->own == 0) continue;
+    /* a field read of a copy has to be a grouped access whose miss exits */
+    if (in->op == Q2_OP_GET_FIELD && !facts.miss_exits[i]) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: field read at clone pc %d (orig %d) is not a grouped exit\n", in->pc, in->opc);
+      ok = 0;
+      continue;
+    }
     if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
         in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH)
       continue;
     for (k = 0; k < in->nuse; k++)
       if (in->use[k] >= (Q2ValueId)types.nvalues || types.lb[in->use[k]] == E_LB_TAG ||
-          types.lb[in->use[k]] == E_LB_BOT)
+          types.lb[in->use[k]] == E_LB_BOT) {
+        if (getenv("QJS_AOT_DEBUG_INL")) {
+          const Q2Value *uv = &fn->values[in->use[k]];
+          fprintf(stderr, "  copy: operand v%d of clone pc %d rop %u (orig %d) is not typed (lb=%d); defined at insn %d rop %u pc %d (has_prof=%d ptypes=0x%x ppc=%d)\n",
+                  (int)in->use[k], in->pc, in->rop, in->opc, types.lb[in->use[k]], uv->insn, uv->insn >= 0 ? fn->insns[uv->insn].rop : 0, uv->insn >= 0 ? fn->insns[uv->insn].pc : -1, uv->has_prof, uv->ptypes, uv->insn >= 0 ? fn->insns[uv->insn].ppc : -1);
+        }
         ok = 0;
+      }
     for (k = 0; k < in->ndef; k++)
       if (in->def[k] >= (Q2ValueId)types.nvalues || types.lb[in->def[k]] == E_LB_TAG ||
-          types.lb[in->def[k]] == E_LB_BOT)
+          types.lb[in->def[k]] == E_LB_BOT) {
+        if (getenv("QJS_AOT_DEBUG_INL"))
+          fprintf(stderr, "  copy: result v%d of clone pc %d rop %u (orig %d) is not typed (lb=%d) op=%d sub=%d nuse=%d use0lb=%d\n", (int)in->def[k], in->pc, in->rop, in->opc, in->def[k] < (Q2ValueId)types.nvalues ? types.lb[in->def[k]] : -1, in->op, in->sub, in->nuse, in->nuse ? types.lb[in->use[0]] : -1);
         ok = 0;
+      }
   }
+  if (!ok && getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: not typed\n");
+  if (!ok && getenv("QJS_AOT_DUMP_INL")) e_analysis_dump(stderr, fn, "inl", 0.0);
   e_facts_free(&facts);
   e_types_free(&types);
   return ok;
@@ -418,11 +438,13 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     int nex = nir > 0 ? 0 : e_plan_licm(&fn, &ex), have2 = 0;
     if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: %d hoists\n", g->name, nex);
     if (nex > 0 || nir > 0) {
-      if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && q2_infer(&fn2) == 0 &&
-          q2_verify(&fn2, msg, sizeof(msg)) == 0 && e_inline_typed_ok(&fn2))
+      int st = 0;
+      if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 && (st = 2) &&
+          q2_verify(&fn2, msg, sizeof(msg)) == 0 && (st = 3) && e_inline_typed_ok(&fn2))
         have2 = 1;
-      else {
-        if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: rebuild failed: %s %s\n", g->name, fn2.why ? fn2.why : "-", msg);
+      if (!have2) {
+        if (getenv("QJS_AOT_DEBUG_LICM") != NULL)
+          fprintf(stderr, "licm %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
         q2_free(&fn2);
       }
     }
