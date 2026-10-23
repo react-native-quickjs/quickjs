@@ -434,3 +434,4 @@ bump while `9999` is missing.
 | `0346` | Exposes whether the typed-array length accessor is intact | Compiled typed-array `.length` went through the step handler on every read | `qjs_aot_ta_len_valid`, layout: ctx ta-length epoch | Yes (layout hash). |
 | `0347` | A for-in over an array skips the lookup of present elements and shares small index strings | `for (k in arr)` was dominated by `JS_HasProperty` and a string format per element | `js_for_in_next`, `js_index_to_string` | No. |
 | `0348` | A for-in start skips the Array.prototype key scan; a compiled for-in step reads array keys in place | Every `for (k in arr)` enumerated Array.prototype; each step went through the step wrapper | `js_proto_has_enum_string_prop`, `qjs_aot_for_in_next` | No. |
+| `0349` | A generator or async frame is resumed without JS_CallInternal | Every next()/await step paid the call prologue to reach the generator branch | `js_regvm_resume_coroutine` | No. |

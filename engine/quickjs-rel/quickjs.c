@@ -42223,12 +42223,50 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     JS_FreeValueRT(rt, s->this_val);
 }
 
+#if QJS_REGVM
+/* Resume a parked generator or async frame directly in the register interpreter: the same
+   frame hand-over JS_CallInternal does for JS_CALL_FLAG_GENERATOR, without that function's
+   prologue. */
+static JSValue js_regvm_resume_coroutine(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = &s->frame;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSValue *local_buf, *arg_buf, *var_buf, *stack_buf, *sp;
+    uint8_t *pc;
+    int throw_pending;
+
+    if (js_poll_interrupts(ctx))
+        return JS_EXCEPTION;
+    local_buf = arg_buf = sf->arg_buf;
+    var_buf = sf->var_buf;
+    stack_buf = sf->var_buf + b->var_count;
+    sp = sf->cur_sp;
+    sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
+    pc = sf->cur_pc;
+    sf->prev_frame = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
+    sf->rv_light = rt->regvm_cur;
+    sf->rv_rec = NULL;
+    rt->regvm_cur = NULL;
+    rt->current_stack_frame = sf;
+    throw_pending = s->throw_flag != 0;
+    return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
+                            s->argc, vc(arg_buf), sf, b, local_buf, arg_buf, var_buf,
+                            stack_buf, sp, pc, JS_CALL_FLAG_GENERATOR, throw_pending);
+}
+#endif
+
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
     JSValue func_obj;
 
     if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
+#if QJS_REGVM
+    return js_regvm_resume_coroutine(ctx, s);
+#endif
 
     /* the tag does not matter provided it is not an object */
     func_obj = JS_MKPTR(JS_TAG_INT, s);
