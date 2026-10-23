@@ -113,6 +113,15 @@ typedef struct EFacts {
      (validated at entry or by an earlier access, with no safepoint since), so the access
      does not test it again. */
   uint8_t *cellskip;
+  /* A numeric element access (get_element / put_element) whose miss exits the speculative
+     body, so it is no safepoint; and, for the ones among them whose receiver is a dense
+     array already checked in this region, `arrskip`: the receiver's class, holey flag, base
+     pointer and count are in the C locals ap<v> / an<v>. `arr_used[v]` marks the receivers
+     that have locals. */
+  uint8_t *elemreg;
+  uint8_t *arrskip;
+  uint8_t *arr_used;
+  int narr_vals;
   /* A grouped field access whose miss must leave the speculative body (an
      exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter

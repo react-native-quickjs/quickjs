@@ -82,6 +82,9 @@ unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
 
 /* A cell fact's value in the shape-fact list: no receiver value is this large. */
 #define E_CELLV(site) (0x40000000 + (site))
+/* An array fact's value in the same list: `rv` is a dense array whose base pointer and count
+   are in locals. Group 0. */
+#define E_ARRV(rv) (0x20000000 + (rv))
 
 /* ---- the fact set -------------------------------------------------------- */
 
@@ -682,10 +685,38 @@ static void apply_store_kills(FactSet *s, const Access *stp) {
   }
 }
 
+/* A numeric element access that runs on a checked dense-array region: the profile saw only
+   numbers at the pc (no hole, no out-of-range read, no growing store, no typed array), so its
+   miss is an exit and it is no safepoint. */
+static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
+  int i;
+  if (in->rop != ROP_get_element && in->rop != ROP_put_element &&
+      in->rop != ROP_put_element_xfer)
+    return 0;
+  if (in->nuse < (in->rop == ROP_get_element ? 2 : 3)) return 0;
+  if (fn->prof == NULL) return 0;
+  for (i = 0; i < fn->nprof; i++) {
+    if (fn->prof[i].pc != in->pc) continue;
+    return (fn->prof[i].elem & (Q2_ELEM_INT | Q2_ELEM_FLOAT)) != 0 &&
+           (fn->prof[i].elem & (Q2_ELEM_OBJECT | Q2_ELEM_MIXED | Q2_ELEM_HOLEY | Q2_ELEM_TA)) == 0;
+  }
+  return 0;
+}
+
+/* The receiver of a region access, through the forwarded copies recorded so far. */
+static int region_recv(const Q2Func *fn, const EFacts *f, const Q2Insn *in) {
+  int rv = (int)in->use[0];
+  while (rv >= 0 && rv < fn->nvalues && fn->values[rv].insn >= 0 &&
+         f->fwd[fn->values[rv].insn] != Q2_NO_VALUE)
+    rv = (int)f->fwd[fn->values[rv].insn];
+  return rv;
+}
+
 /* Whether the instruction is a safepoint, ignoring forwarding (a forwarded load is
    never one): the classification `transfer` applies, for the loop eligibility test. */
 static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int grouped_exit) {
   int kind = insn_kind(in);
+  if (grouped_exit && elem_region_ok(fn, in)) return 0;
   if (kind == E_SK_FIELD) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r, grouped = nr > 0;
@@ -736,6 +767,20 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
        tagged value there. Nothing ran, so the instruction is no safepoint
        and no fact changes. */
     return 0;
+  }
+
+  /* A numeric element access on a dense array: its miss exits, so it is no safepoint; the
+     receiver is a checked array afterwards. */
+  if (grouped_exit && elem_region_ok(fn, in)) {
+    int rv = region_recv(fn, f, in);
+    kind = E_SK_NOJS;
+    f->elemreg[insn] = 1;
+    f->miss_exits[insn] = 1;
+    if (rv >= 0 && rv < fn->nvalues) {
+      if (fs_has_shape(s, E_ARRV(rv), 0)) f->arrskip[insn] = 1;
+      if (fs_add_shape(s, E_ARRV(rv), 0) < 0) return -1;
+      f->arr_used[rv] = 1;
+    }
   }
 
   /* A field access is no safepoint only when every site it uses is grouped:
@@ -912,6 +957,47 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
       }
       memcpy(out->loop_mem[out->nloops], loop, (size_t)fn->nblocks);
       out->nloops++;
+      /* the receivers of numeric element accesses that are defined outside the loop: the array
+         check and the loads of its base pointer and count are hoisted (group -2) */
+      for (bi = 0; bi < fn->nblocks; bi++) {
+        if (!loop[bi]) continue;
+        for (k = 0; k < fn->blocks[bi].ninsns; k++) {
+          const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
+          Q2ValueId v;
+          int db, dup = 0;
+          if (!grouped_exit || !elem_region_ok(fn, in)) continue;
+          v = in->use[0];
+          if (v >= (Q2ValueId)fn->nvalues) continue;
+          db = fn->values[v].block;
+          if (db < 0 || in_loop(loop, db)) continue;
+          for (q = 0; q < out->nhoist; q++)
+            if (out->hoist_hdr[q] == h && out->hoist_val[q] == (int)v && out->hoist_grp[q] == -2) dup = 1;
+          if (dup) continue;
+          if (out->nhoist == out->hoist_cap) {
+            int nc = out->hoist_cap ? out->hoist_cap * 2 : 8;
+            int *a1 = realloc(out->hoist_hdr, sizeof(int) * (size_t)nc);
+            int *a2 = realloc(out->hoist_pre, sizeof(int) * (size_t)nc);
+            int *a3 = realloc(out->hoist_val, sizeof(int) * (size_t)nc);
+            int *a4 = realloc(out->hoist_grp, sizeof(int) * (size_t)nc);
+            if (!a1 || !a2 || !a3 || !a4) {
+              free(loop);
+              free(stack);
+              return -1;
+            }
+            out->hoist_hdr = a1;
+            out->hoist_pre = a2;
+            out->hoist_val = a3;
+            out->hoist_grp = a4;
+            out->hoist_cap = nc;
+          }
+          out->hoist_hdr[out->nhoist] = h;
+          out->hoist_pre[out->nhoist] = pre;
+          out->hoist_val[out->nhoist] = (int)v;
+          out->hoist_grp[out->nhoist] = -2;
+          out->nhoist++;
+          out->arr_used[v] = 1;
+        }
+      }
       /* the receivers of grouped accesses that are defined outside the loop */
       for (bi = 0; bi < fn->nblocks; bi++) {
         if (!loop[bi]) continue;
@@ -980,11 +1066,16 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->access = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->skip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->cellskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->elemreg = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->arrskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->narr_vals = fn->nvalues;
+  out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->miss_exits = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->blocks = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1),
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
-  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL ||
+  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->elemreg == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1052,7 +1143,11 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
           for (j = 0; j < outs[pre].nshape; j++)
             if (fs_add_shape(&cur, outs[pre].shape_val[j], outs[pre].shape_grp[j]) < 0)
               goto done;
-          if (fs_add_shape(&cur, out->hoist_val[k], out->hoist_grp[k]) < 0) goto done;
+          if (out->hoist_grp[k] == -2) {
+            if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]), 0) < 0) goto done;
+          } else if (fs_add_shape(&cur, out->hoist_val[k], out->hoist_grp[k]) < 0) {
+            goto done;
+          }
         }
       } else {
         /* `cur` still holds the previous block's out-set; the merge below
@@ -1155,6 +1250,9 @@ void e_facts_free(EFacts *f) {
   free(f->access);
   free(f->skip);
   free(f->cellskip);
+  free(f->elemreg);
+  free(f->arrskip);
+  free(f->arr_used);
   free(f->miss_exits);
   if (f->groups != NULL) {
     for (i = 0; i < f->ngroups; i++) free(f->groups[i].sites);
