@@ -3931,7 +3931,9 @@ static int emit_typed_var_ref_load(
     snprintf(ex, sizeof(ex), "qjs_aot_get_var_ref(f, %d)", slot);
     e_note_tag('v', in->pc, ex);
   }
-  if (t->lb[d] == E_LB_I32) {
+  if (t->lb[d] != E_LB_TAG && e_def_dead(in, d)) {
+    /* nothing reads it, and a closure-cell read cannot throw: no load, no guard */
+  } else if (t->lb[d] == E_LB_I32) {
     e_sweep_guard(f, "vx", in->pc);
     fprintf(
         f,
@@ -4971,9 +4973,9 @@ static int emit_typed_elem_read(
     fprintf(f, "        v%u = _e;\n", (unsigned)dv);
   } else {
     /* The raw result reaches the frame only when the guard misses, so a miss leaves the
-       op's result where the generic body will look for it; a dead result is stored. */
+       op's result where the generic body will look for it; a dead result is neither. */
     if (e_def_dead(in, dv)) {
-      fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
+      /* nothing reads it: no guard, no store */
     } else {
       e_sweep_guard_set(f, "dx", in->next, dreg * 16, "_e");
       if (t->lb[dv] == E_LB_I32)
@@ -7403,7 +7405,7 @@ static int emit_typed_global_read(
   if (t->lb[dv] == E_LB_TAG) {
     fprintf(f, "        v%u = _g;\n", (unsigned)dv);
   } else if (e_def_dead(in, dv)) {
-    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _g);\n", dreg * 16);
+    /* nothing reads it: no guard, no store */
   } else {
     /* The raw result reaches the frame only when the guard misses. */
     e_sweep_guard_set(f, "dx", in->next, dreg * 16, "_g");
@@ -8038,11 +8040,8 @@ static int emit_hit_result(
     return 1;
   }
   /* The raw result reaches the frame only when the guard misses (the generic body finds
-     the op's result there); a result nothing reads is stored. */
-  if (e_def_dead(in, dv)) {
-    fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", dreg * 16, raw);
-    return 1;
-  }
+     the op's result there); a result nothing reads is neither guarded nor stored. */
+  if (e_def_dead(in, dv)) return 1; /* nothing reads it: no guard, no store */
   e_sweep_guard_set(f, "dx", in->next, dreg * 16, raw);
   if (t->lb[dv] == E_LB_I32)
     fprintf(
