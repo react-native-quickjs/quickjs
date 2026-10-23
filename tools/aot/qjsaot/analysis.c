@@ -955,6 +955,9 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   }
 
   /* ---- the join fixpoint over the blocks in reverse postorder ---- */
+  {
+  int round;
+  for (round = 0; round < 4; round++) {
   for (pass = 0; pass < fn->nblocks + 8; pass++) {
     changed = 0;
     for (b = 0; b < fn->nblocks; b++) {
@@ -1011,6 +1014,37 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
       }
     }
     if (!changed) break;
+  }
+  /* A copy of a boxed value whose profile record is purely one kind of number (or a boolean) is held
+     unboxed behind a guard at the copy: the dx exit of a typed load, with the raw value in the
+     register. This is decided after the fixpoint, because it needs the source to be boxed for good,
+     and the fixpoint is then run again from nothing with these values fixed. */
+  {
+    int added = 0;
+    for (i = 0; i < fn->ninsns && getenv("QJS_AOT_NOMOVENARROW") == NULL; i++) {
+      const Q2Insn *in = &fn->insns[i];
+      Q2ValueId v;
+      int lbn;
+      if ((in->rop != ROP_move && in->rop != ROP_move_s) || in->op != Q2_OP_MOVE) continue;
+      if (in->ndef != 1 || in->nuse != 1 || in->own != 0 || in->vk != 0) continue;
+      if (facts != NULL && facts->fwd[i] != Q2_NO_VALUE) continue;
+      v = in->def[0];
+      if (fixed[v] || in->use[0] >= (Q2ValueId)nv || w[in->use[0]] != E_LB_TAG) continue;
+      if (!fn->values[v].has_prof) continue;
+      lbn = lb_from_q2_types(fn->values[v].ptypes, 1);
+      if (lbn != E_LB_I32 && lbn != E_LB_F64 && lbn != E_LB_BOOL) continue;
+      w[v] = (uint8_t)lbn;
+      fixed[v] = 1;
+      out->spec[v] = 1;
+      added++;
+      if (getenv("QJS_AOT_DEBUG_NARROW") != NULL)
+        fprintf(stderr, "narrow %s: move at pc %d (rop %d) v%u r%d to %d\n", fn->g->name, in->pc, in->rop, (unsigned)v, fn->values[v].reg, lbn);
+    }
+    if (!added) break;
+    for (i = 0; i < nv; i++)
+      if (!fixed[i]) w[i] = E_LB_BOT;
+  }
+  }
   }
 
   /* ---- the final walk: representations, reasons, exits, counters ---- */

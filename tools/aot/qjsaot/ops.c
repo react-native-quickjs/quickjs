@@ -3036,7 +3036,20 @@ static void emit_trivial_own(
          lowerable here and the block must exit at it instead. Each side is
          named by ITS OWN representation: a value held as i32 is `i<v>`, not
          `v<v>`. */
-      if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE)
+      if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE && e_rep_prefix(sv)[0] == 'v' && e_rep_prefix(d)[0] != 'v') {
+        /* A copy the profile saw hold one kind of number: held unboxed behind the guard of a typed
+           load. A miss leaves the value in the register and the generic body resumes after the copy. */
+        char raw[24];
+        int dreg = g_e_fn->values[d].reg;
+        snprintf(raw, sizeof(raw), "v%u", (unsigned)sv);
+        e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
+        fprintf(f, "    {\n");
+        if (!emit_hit_result(f, g_e_fn, in, g_e_types, d, dreg, raw)) {
+          fprintf(stderr, "qjsaot: a guarded copy at pc %d has no guard for its def\n", in->pc);
+          abort();
+        }
+        fprintf(f, "    }\n");
+      } else if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE)
         e_copy_local(f, d, sv);
       if (in->rop == ROP_move_xfer && sv != Q2_NO_VALUE) {
         int sr = g_e_fn->values[sv].reg;
