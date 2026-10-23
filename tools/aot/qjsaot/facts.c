@@ -728,9 +728,16 @@ static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
    read (the generic body does the lookup, which can throw or run a getter), so it is no
    safepoint. */
 static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
-  return in->rop == ROP_get_global && in->narg >= 4 && in->arg[3].kind == 's' &&
-         (unsigned)in->arg[3].val != REG_IC_NONE &&
-         qjs_aot_prof_pc_count(fn->g->digest, in->pc) > 0 && getenv("QJS_AOT_NOGLOBALEXIT") == NULL;
+  int ns = 0;
+  uint64_t shapes[4];
+  if (in->rop != ROP_get_global || in->narg < 4 || in->arg[3].kind != 's' ||
+      (unsigned)in->arg[3].val == REG_IC_NONE ||
+      qjs_aot_prof_pc_count(fn->g->digest, in->pc) == 0 || getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
+    return 0;
+  /* Filled at exactly one generation of the global object in the profiled run: the cell holds
+     unless the global object changes, which that run did not see. */
+  if (!qjs_aot_prof_site(fn->g->digest, (int)in->arg[3].val, &ns, shapes)) return 0;
+  return ns == 1;
 }
 
 /* The receiver of a region access, through the forwarded copies recorded so far. */

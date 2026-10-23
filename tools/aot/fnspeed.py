@@ -127,7 +127,7 @@ CALL_PREFIXES = ('regvm_call', 'qjs_aot_call', 'js_call_internal')
 
 # A unit symbol names the function it belongs to: aot_f_HEX, aot_g_HEX,
 # aot_n_HEX (the native entry) and aot_nx_HEX (a frameless cold exit).
-UNIT_SYM = re.compile(r'^aot_(?:f|g|n|nx)_([0-9a-f]{32})$')
+UNIT_SYM = re.compile(r'^aot_(?:f|g|s|n|nx)_([0-9a-f]{32})$')
 
 
 def load(path):
@@ -303,7 +303,7 @@ def unit_functions(unit_c):
     #   E_TEXT static JSValue aot_f_<hex>(...)
     pat = (r'/\*\s*\S+\s+(\S+:\d+:\d+)\s*\*/'
            r'(?:[^\n]*\n)*?\s*(?:E_TEXT\s+)?static\s+JSValue'
-           r'\s+aot_[fgn]_([0-9a-f]{32})\(')
+           r'\s+aot_[fgns]_([0-9a-f]{32})\(')
     for m in re.finditer(pat, text):
         out.setdefault(m.group(2), m.group(1))
     return out
@@ -452,7 +452,8 @@ def main():
 
     rows = []
     for key, (s, _u) in ti.items():
-        sa, ua = ta.get(key, (0, 0))
+        sa, _ua = ta.get(key, (0, 0))
+        ua = per_key.get(key, {}).get('unit', 0)  # by the sampled PC's symbol
         sh = s / mi['total']
         sh_a = sa / ma['total'] if ma['total'] else 0.0
         rows.append((key, s, sa, sh, sh_a, sh * wi, sh_a * wa, ua))
@@ -518,7 +519,7 @@ def main():
             st = state_of(key)
             labtxt = '  [not compiled%s]' % ('' if st is None else ' %s' % st)
         lab_f = label(key, names)
-        where = '' if lab_f == key[1] else ' ' + key[1]
+        where = ' ' + key[1]
         print('%5.1f%% %8.3f %8.3f %8s %7s  %-30s%s%s' % (
             100.0 * sh, ti_f, ta_f,
             ('%.2fx' % speed) if speed != float('inf') else 'n/a',
