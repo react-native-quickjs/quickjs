@@ -450,6 +450,13 @@ static int transfer_def(
         *whyvp = in->use[0];
         return E_LB_TAG;
       }
+      /* ToNumeric of a number is the number. */
+      if (in->rop == ROP_to_numeric) {
+        if (a == E_LB_BOT || a == E_LB_I32 || a == E_LB_F64) return a;
+        *whyp = E_WHY_OPERAND_TAGGED;
+        *whyvp = in->use[0];
+        return E_LB_TAG;
+      }
       if (sub == REG_UN_NEG) {
         if (a == E_LB_BOT) return E_LB_BOT;
         if (a == E_LB_I32) return record_int_only(dv) ? E_LB_I32 : E_LB_F64;

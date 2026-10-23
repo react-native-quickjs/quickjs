@@ -9434,13 +9434,24 @@ static int emit_typed_unary(
   is_bitnot = 0;  /* bitwise not is a binary op (REG_BIN_NOT), not a unary rop */
   /* `add_imm_self_s`/`sub_imm_self_s` are Q2_OP_UNARY with their own rops, so they
      must be admitted here or the branch below is unreachable. */
-  if (!is_inc && !is_dec && !is_neg && !is_not &&
+  if (!is_inc && !is_dec && !is_neg && !is_not && in->rop != ROP_to_numeric &&
       in->rop != ROP_add_imm_self_s && in->rop != ROP_sub_imm_self_s)
     return 0;
   if (in->ndef < 1 || in->nuse < 1) return 0;
   d = in->def[0];
   a = in->use[0];
   if (d >= (Q2ValueId)t->nvalues || a >= (Q2ValueId)t->nvalues) return 0;
+  if (in->rop == ROP_to_numeric) {
+    /* a number is its own ToNumeric */
+    char dn[32], an[32];
+    int ld = fn->values[d].reg;
+    if (t->lb[a] != t->lb[d] || (t->lb[a] != E_LB_I32 && t->lb[a] != E_LB_F64)) return 0;
+    e_local_name(dn, sizeof(dn), d);
+    e_local_name(an, sizeof(an), a);
+    fprintf(f, "    %s = %s;\n", dn, an);
+    if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
+    return 1;
+  }
   {
     char dn[32], an[32];
     int ld = fn->values[d].reg;
@@ -9806,6 +9817,7 @@ static int e_dispatch_rop(
     case ROP_dec:
     case ROP_neg:
     case ROP_not:
+    case ROP_to_numeric:
       return emit_typed_unary(f, fn, in, t, cur, have_types, hex, fi);
     case ROP_post_inc:
     case ROP_post_dec:
