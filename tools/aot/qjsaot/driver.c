@@ -1925,6 +1925,14 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_REG_PIC_PROTO2 %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_HTMLDDA_BYTE %uu\n"
           "#define QJS_AOT_JSOBJECT_HTMLDDA_MASK %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_EXT_BYTE %uu\n"
+          "#define QJS_AOT_JSOBJECT_EXT_MASK %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE %uu\n"
+          "#define QJS_AOT_JSOBJECT_FAST_ARRAY_MASK %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE %uu\n"
+          "#define QJS_AOT_OFF_CTX_ARRAY_SHAPE %uu\n"
+          "#define QJS_AOT_OFF_CTX_STD_ARRAY_PROTO_BYTE %uu\n"
+          "#define QJS_AOT_CTX_STD_ARRAY_PROTO_MASK %uu\n"
           "#define QJS_AOT_OFF_CTX_GV_CELLS %uu\n"
           "#define QJS_AOT_SIZEOF_GV_CELL %uu\n"
           "#define QJS_AOT_GV_CELL_SETS %uu\n"
@@ -2009,6 +2017,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
           lay.reg_pic_proto2, lay.off_object_htmldda_byte, lay.object_htmldda_mask,
+          lay.off_object_ext_byte, lay.object_ext_mask, lay.off_object_fast_array_byte,
+          lay.object_fast_array_mask, lay.off_array_size, lay.off_ctx_array_shape,
+          lay.off_ctx_std_array_proto_byte, lay.ctx_std_array_proto_mask,
           lay.off_ctx_gv_cells, lay.sizeof_gv_cell, lay.gv_cell_sets, lay.gv_cell_ways,
           lay.off_gvc_atom, lay.off_gvc_gen, lay.off_gvc_slot, lay.off_gvc_wr, lay.off_rt_pic_epoch,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
@@ -3251,6 +3262,39 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      JS_VALUE_GET_TAG(*slot) == JS_TAG_UNINITIALIZED)\n"
         "    return 0;\n"
         "  *slot = v;\n"
+        "  return 1;\n"
+        "}\n\n"
+        /* A store at index == count into a fast, extensible array of the context's initial array
+           shape, with a standard array prototype, when `length` already covers the new element and
+           the storage has room: the engine's own fast case of an append, without the length update
+           or the growth (those, and every other case, take the engine's path). The value carries no
+           reference. */
+        "static inline __attribute__((always_inline)) int q2_elem_append(JSContext *ctx, JSValue arr, JSValue k, "
+        "JSValue v)\n"
+        "{\n"
+        "  unsigned char *p;\n"
+        "  const unsigned char *c = (const unsigned char *)ctx;\n"
+        "  uint32_t i, count;\n"
+        "  const JSValue *lenp;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(k) != JS_TAG_INT || JS_VALUE_GET_TAG(v) < 0) return 0;\n"
+        "  p = (unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
+        "  count = *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n"
+        "  if (i != count) return 0;\n"
+        "  if (!(p[QJS_AOT_OFF_JSOBJECT_EXT_BYTE] & QJS_AOT_JSOBJECT_EXT_MASK) ||\n"
+        "      !(p[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK))\n"
+        "    return 0;\n"
+        "  if (*(const void *const *)(p + QJS_AOT_OFF_JSOBJECT_SHAPE) !=\n"
+        "      *(const void *const *)(c + QJS_AOT_OFF_CTX_ARRAY_SHAPE))\n"
+        "    return 0;\n"
+        "  if (!(c[QJS_AOT_OFF_CTX_STD_ARRAY_PROTO_BYTE] & QJS_AOT_CTX_STD_ARRAY_PROTO_MASK)) return 0;\n"
+        "  lenp = (const JSValue *)(*(const unsigned char *const *)(p + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
+        "                           QJS_AOT_OFF_JSPROPERTY_U_VALUE);\n"
+        "  if (JS_VALUE_GET_TAG(*lenp) != JS_TAG_INT || (uint32_t)JS_VALUE_GET_INT(*lenp) <= count) return 0;\n"
+        "  if (count + 1 > *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE)) return 0;\n"
+        "  (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] = v;\n"
+        "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count + 1;\n"
         "  return 1;\n"
         "}\n\n"
         "static inline const void *q2_pic(JSRegRun *f)\n"

@@ -4935,8 +4935,9 @@ static int emit_typed_elem_write(
       g_e_fl ? (snprintf(elemcall, sizeof(elemcall),
                           "q2_elem_put_rc(ctx, v%u, %s, %s)", (unsigned)av, kb, vb),
                  elemcall)
-              : (snprintf(elemcall, sizeof(elemcall), "q2_elem_put(v%u, %s, %s)",
-                          (unsigned)av, kb, vb),
+              : (snprintf(elemcall, sizeof(elemcall),
+                          "(q2_elem_put(v%u, %s, %s) || q2_elem_append(ctx, v%u, %s, %s))",
+                          (unsigned)av, kb, vb, (unsigned)av, kb, vb),
                  elemcall));
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", areg * 16, (unsigned)av);
