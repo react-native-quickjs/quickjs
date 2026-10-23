@@ -6683,6 +6683,7 @@ static int emit_tag_cmp_value(
            : in->rop == ROP_gte ? 3 : in->rop == ROP_eq ? 4 : in->rop == ROP_neq ? 5
            : in->rop == ROP_strict_eq ? 6 : 7;
     fprintf(f, "      else if (q2_mixed_cmp(v%u, v%u, %d, &c_)) { }\n", (unsigned)av, (unsigned)bv, mk);
+    fprintf(f, "      else if (q2_ident_cmp(v%u, v%u, %d, &c_)) { }\n", (unsigned)av, (unsigned)bv, mk);
   }
   fprintf(f, "      else c_ = -1;\n");
   fprintf(f, "      if (__builtin_expect(c_ >= 0, 1)) {\n");
@@ -8554,6 +8555,50 @@ static int emit_typed_branch(
   av = in->use[0];
   bv = in->use[1];
   if (av >= (Q2ValueId)t->nvalues || bv >= (Q2ValueId)t->nvalues) return 0;
+  /* An equality with a boolean operand: two booleans compare as booleans, and a TAG value
+     against one is strictly equal only when it is a boolean too. The loose forms leave a
+     non-boolean TAG to the engine (it converts). */
+  if ((base == REG_BIN_EQ || base == REG_BIN_NEQ || base == REG_BIN_STRICT_EQ ||
+       base == REG_BIN_STRICT_NEQ) &&
+      ((t->lb[av] == E_LB_BOOL && (t->lb[bv] == E_LB_BOOL || t->lb[bv] == E_LB_TAG)) ||
+       (t->lb[bv] == E_LB_BOOL && t->lb[av] == E_LB_TAG)) &&
+      blk->nsucc >= 2 && blk->succ_block[0] >= 0 && blk->succ_block[0] < fn->nblocks &&
+      !g_e_fl) {
+    int neg = base == REG_BIN_NEQ || base == REG_BIN_STRICT_NEQ;
+    int strict = base == REG_BIN_STRICT_EQ || base == REG_BIN_STRICT_NEQ;
+    int sb2 = blk->succ_block[0];
+    (void)sb2;
+    if (t->lb[av] == E_LB_BOOL && t->lb[bv] == E_LB_BOOL) {
+      fprintf(f, "    { int c_ = (b%u == b%u)%s;\n", (unsigned)av, (unsigned)bv, neg ? " ^ 1" : "");
+    } else {
+      Q2ValueId tv = t->lb[av] == E_LB_TAG ? av : bv;
+      Q2ValueId bo = t->lb[av] == E_LB_TAG ? bv : av;
+      if (strict) {
+        fprintf(
+            f, "    { int c_ = (JS_VALUE_GET_TAG(v%u) == JS_TAG_BOOL && JS_VALUE_GET_BOOL(v%u) == b%u)%s;\n",
+            (unsigned)tv, (unsigned)tv, (unsigned)bo, neg ? " ^ 1" : "");
+      } else {
+        fprintf(f, "    { int c_;\n");
+        fprintf(
+            f, "    if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_BOOL, 1)) c_ = (JS_VALUE_GET_BOOL(v%u) == b%u)%s;\n",
+            (unsigned)tv, (unsigned)tv, (unsigned)bo, neg ? " ^ 1" : "");
+        if (e_term_wrappable(fn, in, role, blk)) {
+          fprintf(f, "    else {\n");
+          e_emit_term_step(f, fn, in, t, blk, cur, hex, fi, inv);
+          fprintf(f, "    }\n");
+        } else {
+          fprintf(f, "    else goto hx_%d;\n", in->pc);
+          e_note_stub(g_e_hx, g_e_hx_cur, g_e_hx_blk, &g_e_hx_n, in->pc, cur, NULL);
+        }
+      }
+    }
+    fprintf(f, "    if (%sc_) {\n", inv ? "!" : "");
+    e_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
+    fprintf(f, "    } else {\n");
+    e_emit_arm(f, fn, b, 1, cur, hex, blk->succ_block[1]);
+    fprintf(f, "    }\n    }\n");
+    return 1;
+  }
   /* TAG is admitted: the dispatch below handles it. */
   if ((t->lb[av] != E_LB_I32 && t->lb[av] != E_LB_F64 &&
        t->lb[av] != E_LB_TAG) ||
@@ -8647,8 +8692,9 @@ static int emit_typed_branch(
                  : base == REG_BIN_STRICT_EQ ? 6 : 7;
           fprintf(
               f,
-              "    else if (q2_mixed_cmp(v%u, v%u, %d, &c_)) { }\n",
-              (unsigned)av, (unsigned)bv, mk);
+              "    else if (q2_mixed_cmp(v%u, v%u, %d, &c_)) { }\n"
+              "    else if (q2_ident_cmp(v%u, v%u, %d, &c_)) { }\n",
+              (unsigned)av, (unsigned)bv, mk, (unsigned)av, (unsigned)bv, mk);
         }
         if (e_term_wrappable(fn, in, role, blk)) {
           fprintf(f, "    else {\n");
