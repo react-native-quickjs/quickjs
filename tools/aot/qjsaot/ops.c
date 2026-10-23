@@ -2362,6 +2362,16 @@ static int e_fl_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
 }
 
 
+/* A read site the function's cache holds every shape of: the profile saw at most four, all own or
+   direct-prototype hits, so the inline walk of the ways misses only on a shape it never saw. */
+int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
+static int e_site_vouched(const Q2Func *fn, int site) {
+  int ns = 0;
+  uint64_t sh[4];
+  return qjs_aot_prof_site(fn->g->digest, site, &ns, sh) && ns >= 1 && ns <= 4 &&
+         qjs_aot_prof_site_read_hits(fn->g->digest, site);
+}
+
 /* The deopt-everywhere sweep at a spec guard: in a sweep build the guard can be
    forced to fail, so its stub runs even where the speculation always holds. It
    sits where the guard's own exit would be taken -- for dx_, after the op's raw
@@ -7215,7 +7225,11 @@ static int emit_typed_field_chain(
   fprintf(f, "        } else {\n");
   /* Link 2 missed: restore the receiver and hand the whole instruction over. */
   fprintf(f, "          AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  g_e_fl_miss_ok = e_site_vouched(fn, s1) && e_site_vouched(fn, s2);
+  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
+    g_e_fl_miss_ok = 0;
+    return 0;
+  }
   fprintf(f, "        }\n");
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
@@ -7226,6 +7240,7 @@ static int emit_typed_field_chain(
         stderr, "qjsaot: field chain at pc %d: second wrapper declined\n", in->pc);
     abort();
   }
+  g_e_fl_miss_ok = 0;
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) {
@@ -8017,8 +8032,12 @@ static int emit_typed_field_read(
     fprintf(f, "        } else {\n");
     if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
     fprintf(f, "        }\n");
-  } else if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
-    return 0;
+  } else {
+    int ok;
+    g_e_fl_miss_ok = e_site_vouched(fn, site);
+    ok = emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b);
+    g_e_fl_miss_ok = 0;
+    if (!ok) return 0;
   }
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
