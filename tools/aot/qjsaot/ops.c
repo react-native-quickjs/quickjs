@@ -3544,6 +3544,32 @@ static void e_emit_arm(
               g_e_rooted[vv] == 1))
           unsafe_tag = 1;
       }
+    if (g_e_fl && unsafe_tag && !g_e_inl && getenv("QJS_AOT_NOPOLLSPILL") == NULL) {
+      /* A borrowed value only this body holds: publish it in a root slot for the poll, so the
+         body keeps running here instead of finishing the whole call in the generic body. */
+      int ok = 1;
+      for (q = 0; q < t->nlive_in; q++) {
+        int rr = t->in_reg[q];
+        Q2ValueId vv = t->in_val[q];
+        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        if (e_rep_prefix(vv)[0] == 'v' &&
+            !(g_e_rooted != NULL && vv < (Q2ValueId)fn->nvalues && g_e_rooted[vv] == 1) &&
+            e_spill_slot(vv) < 0)
+          ok = 0;
+      }
+      if (ok) {
+        for (q = 0; q < t->nlive_in; q++) {
+          int rr = t->in_reg[q];
+          Q2ValueId vv = t->in_val[q];
+          if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+          if (e_rep_prefix(vv)[0] == 'v' &&
+              !(g_e_rooted != NULL && vv < (Q2ValueId)fn->nvalues && g_e_rooted[vv] == 1))
+            fprintf(f, "          ra_[%d] = v%u;\n", e_spill_slot(vv), (unsigned)vv);
+        }
+        g_e_fl_calls = 1;
+        unsafe_tag = 0;
+      }
+    }
     if (g_e_fl && !unsafe_tag) {
       /* Every live TAG value is kept alive by the caller (an argument, the
          receiver): the poll may run an interrupt handler and the collector
