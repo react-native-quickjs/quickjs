@@ -10723,6 +10723,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   if (g_e_fl) {
     /* The exit function comes first: the body names it. */
     if (!g_e_inl) e_emit_frameless_exit_fn(out != NULL ? out : f, fn, hex);
+    if (!g_e_inl && g_e_fl_calls) e_pure_emit_fn(out != NULL ? out : f);
     fprintf(
         f,
         "#define q2_arg_buf(f_) (argv)\n"
@@ -11075,6 +11076,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "        return %s;\n"
         "    }\n",
         fi, gen0);
+  if (g_e_fl && g_e_fl_calls && !g_e_inl) e_pure_emit_entry(f);
   /* Counted only now: everything that could refuse the entry has been passed, so
      this measures speculative bodies that ACTUALLY RAN. */
   fprintf(f, "    E_ENTER_NOTE(%d);\n", fi);

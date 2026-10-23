@@ -53,6 +53,12 @@ void e_emit_frameless_exit_fn(FILE *f, const struct Q2Func *fn, char hex[33]);
 void e_emit_frameless_forward(FILE *f, const struct Q2Func *fn, char hex[33]);
 int e_fl_was_chosen(void);
 
+/* The pure recursive form of a function (pure.c). */
+void e_pure_plan(const struct Q2Func *fn, const char hex[33]);
+void e_pure_clear(void);
+void e_pure_emit_fn(FILE *f);
+void e_pure_emit_entry(FILE *f);
+
 /* The builtins a unit lowers inline (e_intrinsics.c). */
 void e_report_intrinsic(const char *hex, int pc, int id, int argc, int ok);
 const char *e_intrinsic_name(int id);

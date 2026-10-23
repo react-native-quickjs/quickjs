@@ -538,7 +538,9 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
        unmade; the generic body keeps the program as it is. */
     Q2Func fn2;
     int have2 = e_build_spec_fn(g, &fn, 1, &fn2, msg, sizeof(msg));
+    e_pure_plan(&fn, hex);
     rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
+    e_pure_clear();
     /* An inline body of this function that exits through aot_nx_ needs its
        definition; a frameless body has emitted it already. */
     if (rc == 0 && !e_fl_was_chosen() && qjs_aot_inline_uses_nx(hex))
