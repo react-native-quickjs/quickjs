@@ -1868,6 +1868,7 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
                             int kind);
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
 static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey);
+static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k);
 static void js_aot_prof_alloc(JSFunctionBytecode *b, uint32_t props);
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
@@ -1901,6 +1902,8 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
 #define AOT_PROF_ELEM(b_, v_, h_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_elem((b_), (v_), (h_)); } while (0)
+#define AOT_PROF_PUT(b_, o_, k_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_put((b_), (o_), (k_)); } while (0)
 #define AOT_PROF_ALLOC(b_, n_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_alloc((b_), (n_)); } while (0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
@@ -1939,6 +1942,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
 #define AOT_PROF_TAKEN(f_, ip_)     ((void)0)
 #define AOT_PROF_ELEM(b_, v_, h_)   ((void)0)
+#define AOT_PROF_PUT(b_, o_, k_)    ((void)0)
 #define AOT_PROF_ALLOC(b_, n_)      ((void)0)
 #endif
 #endif
@@ -29349,6 +29353,7 @@ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
     int key = T_REG(3);
     int v = T_REG(5);
     AOT_PROF_ELEM(f->b, FR(v), 0);
+    AOT_PROF_PUT(f->b, FR(o), FR(key));
 #if QJS_DRC
     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
         T_NEXT(T_SZ_RRR);
@@ -31360,6 +31365,7 @@ static uint8_t *REGVM_CC regvm_t_put_element(REGVM_ARGS)
     int key = T_REG(3);
     int v = T_REG(5);
     AOT_PROF_ELEM(f->b, FR(v), 0);
+    AOT_PROF_PUT(f->b, FR(o), FR(key));
 #if QJS_DRC
     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
         T_NEXT(T_SZ_RRR);
@@ -61878,6 +61884,32 @@ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
     else
         kind = AOT_ELEM_MIXED;
     pf->pcs[pc].elem_kinds |= kind;
+}
+
+/* An element store the compiled inline store would not take: not an existing, non-hole
+   element of an array or typed array. Such a store grows the array or fills a hole, and may
+   reach a setter on the prototype chain. */
+static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k)
+{
+    JSAotProfFunc *pf = b->aot_prof;
+    int pc;
+
+    if (!pf)
+        return;
+    pc = pf->last_pc;
+    if (pc < 0 || pc >= pf->pc_n)
+        return;
+    if (JS_VALUE_GET_TAG(o) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(k) == JS_TAG_INT) {
+        JSObject *p = JS_VALUE_GET_OBJ(o);
+        uint32_t idx = (uint32_t)JS_VALUE_GET_INT(k);
+
+        if (p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count &&
+            !js_array_slot_is_hole(p->u.array.u.values[idx]))
+            return;
+        if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY)
+            return;
+    }
+    pf->pcs[pc].elem_kinds |= AOT_ELEM_HOLEY;
 }
 
 /* The final property count an allocation site reaches, so compiled code can
