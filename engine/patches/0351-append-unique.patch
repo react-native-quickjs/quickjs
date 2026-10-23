@@ -1,0 +1,138 @@
+Subject: A compiled `s += 'constant'` appends in place without the frame scan, and the append reads its destination directly
+
+What this does
+  - `regvm_accum_append_u` is the in-place append with a `unique` flag: when the caller has
+    shown that no other register can hold the string, the scan of the frame for another holder
+    is skipped. `regvm_accum_append` is the old entry with `unique` 0.
+  - The append writes into the destination string through its header (a normal string's
+    characters follow it) instead of through `str8()`, which switches on the string kind and was
+    out of line in the hot loop.
+  - `qjs_aot_append_const(ctx, f, kind, idx, ra, unique)`: the compiled-code entry for
+    `s += <pool or atom string>`, 1 appended / 0 not this case / -1 exception.
+
+Why we need it
+  string_concatloop spent 47% in the append, 75 instructions of every ~200 in the frame scan.
+  Compiled code proves uniqueness from the function's data flow (the string comes from a
+  constant or from this append, and is never copied to another register); the interpreter
+  keeps the scan. Compiled concatloop 1.03 -> 0.79 (961M -> 728M instructions); the interpreter
+  also gains from the direct write (1126M -> 1070M).
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -377,6 +377,11 @@
+ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                         JSContext *ctx);
+ 
++/* `s += <constant string>` (pool or atom) in place when the register holds the only reference:
++   1 appended (result in register `ra`), 0 not this case, -1 exception. `unique` skips the
++   register scan: the caller proved no other register can hold the string. */
++QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
++                                      int ra, int unique);
+ /* `for_in_next` over an array, the next key read from the shared small-index strings; any
+    other case runs the instruction's handler. Same contract as qjs_aot_step. */
+ QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25147,9 +25147,11 @@
+  * -1 with an exception set. The right operand is borrowed. d and a are
+  * register indices, not the byte offsets the threaded decoder produces.
+  */
+-static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
+-                              JSValue *fr, JSValue *arg_buf, int argc,
+-                              int d, int a, JSValue op2)
++/* `unique`: the caller has shown that no other register of the frame can hold this string
++   (compiled code proves it from the function's data flow), so the register scan is skipped. */
++static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
++                                JSValue *fr, JSValue *arg_buf, int argc,
++                                int d, int a, JSValue op2, int unique)
+ {
+ #if QJS_DRC
+     JSString *p1, *p2;
+@@ -25177,12 +25179,14 @@
+         return 0;
+     p1ptr = p1;
+     nregs = b->regvm_reg_count;
+-    for (i = 0; i < nregs; i++) {
+-        if (i == (uint32_t)a)
+-            continue;
+-        if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
+-            JS_VALUE_GET_PTR(fr[i]) == p1ptr)
+-            return 0;
++    if (!unique) {
++        for (i = 0; i < nregs; i++) {
++            if (i == (uint32_t)a)
++                continue;
++            if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
++                JS_VALUE_GET_PTR(fr[i]) == p1ptr)
++                return 0;
++        }
+     }
+     if (arg_buf != NULL) {
+         for (i = 0; i < (uint32_t)argc; i++) {
+@@ -25195,11 +25199,14 @@
+     need = sizeof(*p1) + ((size_t)nlen << p1->is_wide_char) + 1 -
+            p1->is_wide_char;
+     if (js_malloc_usable_size(ctx, p1) >= need) {
++        /* p1 is a normal string: its characters follow the header */
+         if (p1->is_wide_char) {
+-            memcpy(str16(p1) + p1->len, str16(p2), (size_t)p2->len << 1);
++            memcpy((uint16_t *)&p1[1] + p1->len, str16(p2), (size_t)p2->len << 1);
+         } else {
+-            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
+-            str8(p1)[nlen] = '\0';
++            uint8_t *d1 = (uint8_t *)&p1[1];
++
++            memcpy(d1 + p1->len, str8(p2), p2->len);
++            d1[nlen] = '\0';
+         }
+         p1->len = nlen;
+         return 1;
+@@ -25236,11 +25243,18 @@
+     }
+ #else
+     (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
+-    (void)d; (void)a; (void)op2;
++    (void)d; (void)a; (void)op2; (void)unique;
+     return 0;
+ #endif
+ }
+ 
++static inline int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
++                                     JSValue *fr, JSValue *arg_buf, int argc,
++                                     int d, int a, JSValue op2)
++{
++    return regvm_accum_append_u(ctx, b, fr, arg_buf, argc, d, a, op2, 0);
++}
++
+ static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
+                                       JSValue *out)
+ {
+@@ -63230,6 +63244,28 @@
+     return 1;
+ }
+ 
++/* `s += <constant string>` (from the function's pool, or an atom) appended in place when the
++   register holds the only reference: 1 when it was (the result is in register `ra`, adopted),
++   0 when the case is not that (the caller takes the general route), -1 on exception. `unique`:
++   the caller has shown that no other register can hold the string, so the register scan is
++   skipped. */
++QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
++                                      int ra, int unique)
++{
++    JSValue cst;
++    int r;
++
++    if (kind == REG_CONST_CPOOL)
++        return regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra,
++                                    f->b->cpool[idx], unique);
++    cst = JS_AtomToValue(ctx, (JSAtom)idx);
++    if (JS_IsException(cst))
++        return -1;
++    r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique);
++    JS_FreeValue(ctx, cst);
++    return r;
++}
++
+ /* `a <sub> b` on two registers, for the cases the inline arithmetic does not take (a string,
+    an object, a mixed pair). 1 with an owned *out, 2 when `s += x` was appended in place
+    (the result is left in register `d`), -1 on exception. */

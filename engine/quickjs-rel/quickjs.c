@@ -25147,9 +25147,11 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
  * -1 with an exception set. The right operand is borrowed. d and a are
  * register indices, not the byte offsets the threaded decoder produces.
  */
-static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
-                              JSValue *fr, JSValue *arg_buf, int argc,
-                              int d, int a, JSValue op2)
+/* `unique`: the caller has shown that no other register of the frame can hold this string
+   (compiled code proves it from the function's data flow), so the register scan is skipped. */
+static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
+                                JSValue *fr, JSValue *arg_buf, int argc,
+                                int d, int a, JSValue op2, int unique)
 {
 #if QJS_DRC
     JSString *p1, *p2;
@@ -25177,12 +25179,14 @@ static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
         return 0;
     p1ptr = p1;
     nregs = b->regvm_reg_count;
-    for (i = 0; i < nregs; i++) {
-        if (i == (uint32_t)a)
-            continue;
-        if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
-            JS_VALUE_GET_PTR(fr[i]) == p1ptr)
-            return 0;
+    if (!unique) {
+        for (i = 0; i < nregs; i++) {
+            if (i == (uint32_t)a)
+                continue;
+            if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
+                JS_VALUE_GET_PTR(fr[i]) == p1ptr)
+                return 0;
+        }
     }
     if (arg_buf != NULL) {
         for (i = 0; i < (uint32_t)argc; i++) {
@@ -25195,11 +25199,14 @@ static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
     need = sizeof(*p1) + ((size_t)nlen << p1->is_wide_char) + 1 -
            p1->is_wide_char;
     if (js_malloc_usable_size(ctx, p1) >= need) {
+        /* p1 is a normal string: its characters follow the header */
         if (p1->is_wide_char) {
-            memcpy(str16(p1) + p1->len, str16(p2), (size_t)p2->len << 1);
+            memcpy((uint16_t *)&p1[1] + p1->len, str16(p2), (size_t)p2->len << 1);
         } else {
-            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
-            str8(p1)[nlen] = '\0';
+            uint8_t *d1 = (uint8_t *)&p1[1];
+
+            memcpy(d1 + p1->len, str8(p2), p2->len);
+            d1[nlen] = '\0';
         }
         p1->len = nlen;
         return 1;
@@ -25236,9 +25243,16 @@ static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
     }
 #else
     (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
-    (void)d; (void)a; (void)op2;
+    (void)d; (void)a; (void)op2; (void)unique;
     return 0;
 #endif
+}
+
+static inline int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
+                                     JSValue *fr, JSValue *arg_buf, int argc,
+                                     int d, int a, JSValue op2)
+{
+    return regvm_accum_append_u(ctx, b, fr, arg_buf, argc, d, a, op2, 0);
 }
 
 static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
@@ -63228,6 +63242,28 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
     }
     JS_FreeValue(ctx, cst);
     return 1;
+}
+
+/* `s += <constant string>` (from the function's pool, or an atom) appended in place when the
+   register holds the only reference: 1 when it was (the result is in register `ra`, adopted),
+   0 when the case is not that (the caller takes the general route), -1 on exception. `unique`:
+   the caller has shown that no other register can hold the string, so the register scan is
+   skipped. */
+QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
+                                      int ra, int unique)
+{
+    JSValue cst;
+    int r;
+
+    if (kind == REG_CONST_CPOOL)
+        return regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra,
+                                    f->b->cpool[idx], unique);
+    cst = JS_AtomToValue(ctx, (JSAtom)idx);
+    if (JS_IsException(cst))
+        return -1;
+    r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique);
+    JS_FreeValue(ctx, cst);
+    return r;
 }
 
 /* `a <sub> b` on two registers, for the cases the inline arithmetic does not take (a string,

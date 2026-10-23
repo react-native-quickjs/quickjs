@@ -436,3 +436,4 @@ bump while `9999` is missing.
 | `0348` | A for-in start skips the Array.prototype key scan; a compiled for-in step reads array keys in place | Every `for (k in arr)` enumerated Array.prototype; each step went through the step wrapper | `js_proto_has_enum_string_prop`, `qjs_aot_for_in_next` | No. |
 | `0349` | A generator or async frame is resumed without JS_CallInternal | Every next()/await step paid the call prologue to reach the generator branch | `js_regvm_resume_coroutine` | No. |
 | `0350` | An error's stack frames resolve line and column when the stack is read | Every `new Error` scanned the line table of each frame | `JSErrorStackFrame` keeps code + key | No. |
+| `0351` | A compiled `s += constant` appends in place without the frame scan | The in-place append scanned every register for another holder (75 of ~200 instructions) | `regvm_accum_append_u`, `qjs_aot_append_const` | No. |
