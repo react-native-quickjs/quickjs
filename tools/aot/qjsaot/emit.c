@@ -382,6 +382,13 @@ static int e_inline_typed_ok(const Q2Func *fn) {
     if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
         in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH)
       continue;
+    /* a remainder has no typed form: it is lowered only on tagged operands, with the step
+       engine behind it */
+    if (in->op == Q2_OP_BINARY && in->sub == REG_BIN_MOD) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: remainder at clone pc %d\n", in->pc);
+      ok = 0;
+      continue;
+    }
     for (k = 0; k < in->nuse; k++)
       if (in->use[k] >= (Q2ValueId)types.nvalues || types.lb[in->use[k]] == E_LB_TAG ||
           types.lb[in->use[k]] == E_LB_BOT) {
