@@ -1852,6 +1852,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_FNBC_VAR_REF_COUNT %uu\n"
           "#define QJS_AOT_OFF_RT_GV_CELL_GEN %uu\n"
           "#define QJS_AOT_OFF_CTX_INTERRUPT_COUNTER %uu\n"
+          "/* The poll's decrement as one read-modify-write with the flags kept: `sub $1, mem; jle`. */\n"
+          "#define Q2_POLL_HIT(c) ({ int hit_; __asm__ volatile(\"subl $1, %%0\" : \"+m\"(*(int *)((unsigned char *)(c) + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER)), \"=@ccle\"(hit_)); hit_; })\n"
           "#define QJS_AOT_OFF_CTX_RT %uu\n"
           "#define QJS_AOT_OFF_OBJECT_FUNC_BYTECODE %uu\n"
           "#define QJS_AOT_CLASS_BYTECODE_FUNCTION %uu\n"

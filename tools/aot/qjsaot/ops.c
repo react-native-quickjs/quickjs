@@ -3527,8 +3527,7 @@ static void e_emit_arm(
     int q;
     fprintf(
         f,
-        "      if (__builtin_expect(--*(int *)((unsigned char *)ctx +\n"
-        "              QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n");
+        "      if (__builtin_expect(Q2_POLL_HIT(ctx), 0)) {\n");
     fprintf(
         f,
         "          ++*(int *)((unsigned char *)ctx +\n"
