@@ -1,0 +1,70 @@
+Subject: The profiler records receiver class and misses at element reads
+
+What this does
+  - `AOT_ELEM_TA` marks an element site whose receiver was a typed array, at reads
+    (`regvm_get_elem_typed` hits) and stores; `regvm_t_get_element` records a read that
+    missed the dense-array and typed-array fast paths (a hole, an index out of range, a
+    string, a getter) as `AOT_ELEM_HOLEY`. Profile builds only.
+
+Why we need it
+  Compiled code runs a numeric element access on a checked dense-array region whose miss
+  leaves the body. That is only sound and cheap where the profile saw no miss and no typed
+  array at the site; before, a read that missed was not recorded at all, so a site that read
+  past the end looked numeric.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1672,6 +1672,7 @@
+ #define AOT_ELEM_OBJECT (1u << 2)
+ #define AOT_ELEM_MIXED  (1u << 3)
+ #define AOT_ELEM_HOLEY  (1u << 4)
++#define AOT_ELEM_TA     (1u << 5)  /* a typed array's element */
+ #endif /* QJS_AOT_PROFILE */
+ 
+ /* One polymorphic property cache entry: the receiver shape, the property's
+@@ -29943,10 +29944,14 @@
+         }
+         {
+             JSValue tv;
+-            if (regvm_get_elem_typed(p, idx, &tv))
++            if (regvm_get_elem_typed(p, idx, &tv)) {
++                AOT_PROF_ELEM(f->b, tv, 2);
+                 T_SET_NEXT_B(d, tv, T_SZ_RRR);
++            }
+         }
+     }
++    /* Not a dense array element and not a typed array's: the profile records the miss. */
++    AOT_PROF_ELEM(f->b, JS_UNDEFINED, 1);
+     __attribute__((musttail)) return regvm_t_get_element_slow(REGVM_PASS);
+ }
+ 
+@@ -61877,7 +61882,7 @@
+     pc = pf->last_pc;
+     if (pc < 0 || pc >= pf->pc_n)
+         return;
+-    if (holey)
++    if (holey == 1)
+         kind = AOT_ELEM_HOLEY;
+     else if (JS_VALUE_GET_TAG(v) == JS_TAG_INT)
+         kind = AOT_ELEM_INT;
+@@ -61887,6 +61892,8 @@
+         kind = AOT_ELEM_OBJECT;
+     else
+         kind = AOT_ELEM_MIXED;
++    if (holey == 2)
++        kind |= AOT_ELEM_TA;
+     pf->pcs[pc].elem_kinds |= kind;
+ }
+ 
+@@ -61910,8 +61917,10 @@
+         if (p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count &&
+             !js_array_slot_is_hole(p->u.array.u.values[idx]))
+             return;
+-        if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY)
++        if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
++            pf->pcs[pc].elem_kinds |= AOT_ELEM_TA;
+             return;
++        }
+     }
+     pf->pcs[pc].elem_kinds |= AOT_ELEM_HOLEY;
+ }

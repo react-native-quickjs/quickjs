@@ -448,3 +448,4 @@ bump while `9999` is missing.
 | `0360` | Compiled code answers `x instanceof C` for a plain constructor without the operator handler | The fused instanceof branch went through `regvm_cmp_take` and the generic `prototype` lookup (16% of earleyboyer) | `qjs_aot_instanceof` | No. |
 | `0361` | The profiler records an element store the compiled inline store would not take | A frameless leaf filling `new Array(n)` missed on every call and was switched off | `AOT_PROF_PUT`, `AOT_ELEM_HOLEY` | No. |
 | `0362` | The runtime records that a lazy JSON document exists | Every compiled field/element load tested for the lazy marker (5-17% of cycles in OO code) | `JSRuntime.lazy_json_seen`, `off_rt_lazy_json` | No. |
+| `0363` | The profiler records element misses and typed-array receivers | A read past the end or a typed-array access looked like a numeric dense-array hit | `AOT_ELEM_HOLEY` on reads, `AOT_ELEM_TA` | No. |
