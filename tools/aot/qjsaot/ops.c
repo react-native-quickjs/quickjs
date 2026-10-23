@@ -2219,6 +2219,8 @@ static Q2ValueId *g_e_ax_cur[E_MAX_STUBS];
 static int g_e_ax_blk[E_MAX_STUBS];
 /* The compare COLD ARM: a TAG operand whose tag is neither INT nor FLOAT64. It is a
    hand-off at the branch's own pc, not a deopt. */
+/* the pcs after a suspension that the body can be entered at (they have an `osr_` label) */
+static int g_e_osr_res[16], g_e_osr_res_n;
 static int g_e_hx[E_MAX_STUBS];
 static Q2ValueId *g_e_hx_cur[E_MAX_STUBS];
 static int g_e_hx_blk[E_MAX_STUBS];
@@ -3272,6 +3274,38 @@ static void e_emit_exit(
      not a failed speculation. Counting it as a deopt would switch nearly every
      spec body off after 257 calls, and every measurement would time the generic
      body. */
+  /* A suspension (yield, await) the speculative body reached: the live registers are in
+     the frame, so the instruction runs through its handler right here and the function
+     returns, instead of entering the generic body to do the same. */
+  if (handoff && !g_e_fl && !g_e_inl) {
+    int ii, sus = 0;
+    for (ii = 0; ii < fn->ninsns; ii++)
+      if (fn->insns[ii].pc == pc) {
+        const ERole *rl = e_roles[fn->insns[ii].rop];
+        sus = rl != NULL && rl->control == E_CF_SUSPEND;
+        break;
+      }
+    if (sus) {
+      fprintf(
+          f,
+          "    { uint8_t *code_ = q2_code(f), *ip_ = qjs_aot_step(code_ + %d, fr, f, ctx);\n"
+          "      if (__builtin_expect(ip_ == NULL, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n"
+          "      if (__builtin_expect(ip_ == QJS_AOT_COLD_RET || ip_ == QJS_AOT_SUSPEND, 1))\n"
+          "          return qjs_aot_ret(f);\n",
+          pc);
+      {
+        int q, nx = -1;
+        for (q = 0; q < fn->ninsns; q++)
+          if (fn->insns[q].pc == pc) nx = fn->insns[q].next;
+        for (q = 0; q < g_e_osr_res_n; q++)
+          if (g_e_osr_res[q] == nx)
+            fprintf(f, "      if (ip_ == code_ + %d) goto osr_%d;\n", nx, nx);
+      }
+      fprintf(
+          f, "      return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_)); }\n    }\n", hex);
+      return;
+    }
+  }
   fprintf(
       f, "    %s(%d);\n", handoff ? "E_HANDOFF_NOTE" : "E_EXIT_NOTE", fi);
   e_emit_generic_call(f, hex, pc, nlv, "    ");
@@ -9149,7 +9183,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e_n_shape = g_e_n_skip = g_e_n_fwd = g_e_n_hoist = 0;
   int n_left = 0;
   char gen0[400], gene[160];
-  int osr_blk[16], osr_pc[16], osr_n = 0;
+  int osr_blk[16], osr_pc[16], osr_ypc[16], osr_n = 0;
   FILE *out = NULL;
   char *mbuf = NULL;
   size_t mlen = 0;
@@ -9228,8 +9262,31 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   /* Loop re-entry: a framed body can be entered at a loop header after the generic body
      ran the loop's first iterations. */
   osr_n = 0;
-  if (!g_e_fl && !g_e_inl && fn->g->ctl_count == 0 && !e_nosr_on())
+  g_e_osr_res_n = 0;
+  if (!g_e_fl && !g_e_inl && fn->g->ctl_count == 0 && !e_nosr_on()) {
+    int ib;
     osr_n = e_loop_headers(fn, osr_blk, osr_pc, 16);
+    for (ib = 0; ib < osr_n; ib++) osr_ypc[ib] = -1;
+    g_e_osr_res_n = 0;
+    /* A generator or async function is resumed at the instruction after each suspension,
+       with every live register in the frame: those blocks are entries too. */
+    for (ib = 0; ib < fn->ninsns && osr_n < 16; ib++) {
+      const Q2Insn *si = &fn->insns[ib];
+      const ERole *sr = e_roles[si->rop];
+      int sb, dup = 0, j;
+      if (sr == NULL || sr->control != E_CF_SUSPEND) continue;
+      for (sb = 0; sb < fn->nblocks; sb++)
+        if (fn->blocks[sb].start_pc == si->next && fn->blocks[sb].npreds == 0) break;
+      if (sb >= fn->nblocks) continue;
+      for (j = 0; j < osr_n; j++)
+        if (osr_blk[j] == sb) dup = 1;
+      if (dup) continue;
+      osr_blk[osr_n] = sb;
+      osr_ypc[osr_n] = si->pc;
+      g_e_osr_res[g_e_osr_res_n++] = fn->blocks[sb].start_pc;
+      osr_pc[osr_n++] = fn->blocks[sb].start_pc;
+    }
+  }
   if (!g_e_fl && !g_e_inl) snprintf(gen0, sizeof(gen0), "aot_g_%s(ctx, f, fr, entry_pc)", hex);
   if (g_e_fl) {
     /* The exit function comes first: the body names it. */
@@ -9324,7 +9381,8 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     int h;
     fprintf(f, "    if (__builtin_expect((e_off[%d] | e_dis[%d]) != 0", fi, fi);
     fprintf(f, " || (entry_pc != 0");
-    for (h = 0; h < osr_n; h++) fprintf(f, " && entry_pc != %d", osr_pc[h]);
+    for (h = 0; h < osr_n; h++)
+      if (osr_ypc[h] != 0) fprintf(f, " && entry_pc != %d", osr_ypc[h] >= 0 ? osr_ypc[h] : osr_pc[h]);
     fprintf(f, "), 0))\n        return %s;\n", gene);
   } else
     fprintf(
@@ -9475,7 +9533,13 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   if (osr_n > 0) {
     int h;
     fprintf(f, "    if (entry_pc != 0) {\n        switch (entry_pc) {\n");
-    for (h = 0; h < osr_n; h++) fprintf(f, "        case %d: goto osr_%d;\n", osr_pc[h], osr_pc[h]);
+    for (h = 0; h < osr_n; h++) {
+      if (osr_ypc[h] == 0) continue; /* the first entry is the normal one */
+      if (osr_ypc[h] > 0)
+        fprintf(f, "        case %d: goto osrs_%d;\n", osr_ypc[h], osr_ypc[h]);
+      else
+        fprintf(f, "        case %d: goto osr_%d;\n", osr_pc[h], osr_pc[h]);
+    }
     fprintf(f, "        default: return %s;\n        }\n    }\n", gene);
   }
 
@@ -9923,6 +9987,16 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
     int h, q, o2;
     for (h = 0; h < osr_n; h++) {
       const Q2Block *hb = &fn->blocks[osr_blk[h]];
+      if (osr_ypc[h] > 0)
+        fprintf(
+            f,
+            "    osrs_%d:;\n"
+            "    { uint8_t *code_ = q2_code(f), *ip_ = qjs_aot_step(code_ + %d, fr, f, ctx);\n"
+            "      if (__builtin_expect(ip_ == NULL, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n"
+            "      if (__builtin_expect(ip_ != code_ + %d, 0)) {\n"
+            "          if (ip_ == QJS_AOT_COLD_RET || ip_ == QJS_AOT_SUSPEND) return qjs_aot_ret(f);\n"
+            "          return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_)); } }\n",
+            osr_ypc[h], osr_ypc[h], osr_pc[h], hex);
       fprintf(f, "    osr_%d:;\n    {\n", osr_pc[h]);
       for (q = 0; q < hb->nlive_in; q++) {
         int rr = hb->in_reg[q];

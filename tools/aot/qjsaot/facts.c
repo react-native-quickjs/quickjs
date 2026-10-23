@@ -833,6 +833,8 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
     for (si = 0; si < lt->nsucc && si < 2; si++) {
       int h = lt->succ_block[si], sp = 0, pre = -1, npre = 0, safe = 1;
       if (h < 0 || h >= fn->nblocks || !q2_is_back_edge(fn, b, h)) continue;
+      /* a loop whose back edge starts in a resumed part has no preheader on the path that enters it */
+      if (lt->resume) continue;
       /* the natural loop of the back edge b -> h */
       memset(loop, 0, (size_t)fn->nblocks);
       loop[h] = 1;

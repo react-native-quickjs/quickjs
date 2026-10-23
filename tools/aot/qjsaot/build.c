@@ -2173,28 +2173,65 @@ static void q2_build_rpo(Q2Func *f) {
   if (!iter || !stack || !seen || !f->rpo || !f->rpo_pos) goto done;
 
   /* Iterative DFS: a block is appended after all its successors, so the array
-     built in visit order, reversed, is a reverse postorder. */
-  stack[sp++] = 0;
-  seen[0] = 1;
-  while (sp > 0) {
-    int b = stack[sp - 1];
-    const Q2Block *blk = &f->blocks[b];
-    if (iter[b] < blk->nsucc) {
-      int s = blk->succ_block[iter[b]++];
-      if (s >= 0 && s < nb && !seen[s]) {
-        seen[s] = 1;
-        stack[sp++] = s;
+     built in visit order, reversed, is a reverse postorder. The entry's part comes
+     first; then the part reached from each resumption point (the block after a
+     suspending instruction, which only a resumption enters), in block order. */
+  {
+    int root = 0, first = 0, pass;
+    for (pass = 0; pass < 1 + nb; pass++) {
+      int base = f->nrpo, lo, hi;
+      if (pass > 0) {
+        /* the next resumption root not reached yet */
+        for (root = (pass == 1 ? 1 : root + 1); root < nb; root++) {
+          const Q2Block *rb = &f->blocks[root];
+          int p;
+          if (seen[root] || rb->npreds != 0) continue;
+          for (p = 0; p < nb; p++) {
+            const Q2Block *pb = &f->blocks[p];
+            const Q2Insn *last;
+            const ERole *rl;
+            if (pb->ninsns <= 0 || pb->end_pc != rb->start_pc) continue;
+            last = &f->insns[pb->first_insn + pb->ninsns - 1];
+            rl = e_roles[last->rop];
+            if (rl != NULL && rl->control == E_CF_SUSPEND) break;
+          }
+          if (p < nb) break;
+        }
+        if (root >= nb) break;
+        seen[root] = 1;
+        f->blocks[root].resume = 1;
+      } else {
+        root = 0;
+        seen[0] = 1;
       }
-    } else {
-      sp--;
-      f->rpo[f->nrpo++] = b; /* postorder */
+      sp = 0;
+      stack[sp++] = root;
+      iter[root] = 0;
+      while (sp > 0) {
+        int b = stack[sp - 1];
+        const Q2Block *blk = &f->blocks[b];
+        if (iter[b] < blk->nsucc) {
+          int s = blk->succ_block[iter[b]++];
+          if (s >= 0 && s < nb && !seen[s]) {
+            seen[s] = 1;
+            if (pass > 0) f->blocks[s].resume = 1;
+            stack[sp++] = s;
+          }
+        } else {
+          sp--;
+          f->rpo[f->nrpo++] = b; /* postorder */
+        }
+      }
+      /* this part, reversed in place */
+      lo = base;
+      hi = f->nrpo - 1;
+      while (lo < hi) {
+        int32_t t = f->rpo[lo];
+        f->rpo[lo++] = f->rpo[hi];
+        f->rpo[hi--] = t;
+      }
+      (void)first;
     }
-  }
-  /* Reverse into postorder -> reverse postorder. */
-  for (i = 0; i < f->nrpo / 2; i++) {
-    int32_t t = f->rpo[i];
-    f->rpo[i] = f->rpo[f->nrpo - 1 - i];
-    f->rpo[f->nrpo - 1 - i] = t;
   }
   for (i = 0; i < f->nrpo; i++) f->rpo_pos[f->rpo[i]] = i;
 

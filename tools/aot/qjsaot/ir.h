@@ -222,11 +222,14 @@ typedef struct Q2Block {
   int32_t *preds;       /* the block's predecessors, sized by a counting pass */
   int32_t npreds;
   int32_t ctl_in; /* control-stack depth on entry */
+  uint8_t resume; /* in the part of the order that follows a suspension (see q2_build_rpo) */
 } Q2Block;
 
 /* ---- functions ----------------------------------------------------------- */
 typedef struct Q2Func {
-  /* The blocks in DFS reverse postorder, as block indices. Unreachable blocks
+  /* The blocks in DFS reverse postorder, as block indices, then the blocks only a
+     resumption reaches (the instruction after a yield or await), each root's part in
+     its own reverse postorder, marked `resume`. Other unreachable blocks
      are absent: they are never emitted. `rpo_pos[b]` is b's position in this
      order, or -1 when b is unreachable. */
   int32_t *rpo;

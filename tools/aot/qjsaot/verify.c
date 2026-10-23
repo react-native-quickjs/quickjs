@@ -178,6 +178,7 @@ int q2_is_reducible(const Q2Func *f) {
   for (i = 0; i < f->nrpo && rc == 1; i++) {
     int b = f->rpo[i], s;
     const Q2Block *blk = &f->blocks[b];
+    if (blk->resume) continue; /* entered by a resumption: no edge into it from the entry's part */
     for (s = 0; s < blk->nsucc; s++) {
       int t = blk->succ_block[s];
       if (t < 0 || t >= f->nblocks) continue;
