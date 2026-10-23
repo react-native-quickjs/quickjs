@@ -1,0 +1,24 @@
+Subject: The profiler counts how often a global read's cache cell was filled
+
+What this does
+  - `regvm_global_site_fill` records the generation of the global-cell cache it filled the site at
+    as a distinct "shape" of that site (profile builds only), so a site filled at two generations
+    shows two entries.
+
+Why we need it
+  A compiled global read whose cache cell misses leaves the body (so it is no safepoint for the
+  facts about objects). That is cheap only if misses are rare; a site that was refilled after the
+  global object changed during the profiled run keeps the continuing form.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -16117,6 +16117,9 @@
+     e->gslot = slot;
+     e->slot_off = gen;
+     e->kind = REG_PIC_GLOBAL;
++    /* The profile counts the distinct generations a site was filled at: a site filled
++       twice saw the global object change. */
++    AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL);
+ }
+ #endif
+ 

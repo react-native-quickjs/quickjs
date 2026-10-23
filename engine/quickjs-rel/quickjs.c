@@ -16117,6 +16117,9 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
     e->gslot = slot;
     e->slot_off = gen;
     e->kind = REG_PIC_GLOBAL;
+    /* The profile counts the distinct generations a site was filled at: a site filled
+       twice saw the global object change. */
+    AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL);
 }
 #endif
 
