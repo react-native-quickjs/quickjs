@@ -1483,12 +1483,16 @@
       "sha256": "d5dc2f9cffc51b02c0fe538596985d7a324664fb61e8cdb0be631e1e8bfb0790"
     },
     {
+      "name": "0377-aot-callback-entry.patch",
+      "sha256": "f2969b92b3301c9c4e91828ba57166e2dcb32c7cb70d850d845a6a91cc746136"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "36720ef9f87642ae329576fd934d3c1046cedb644179d5d60a96f352f547517c",
+    "quickjs.c": "c90f0fa4d7169317cc99a972f98ed47d86b27c03f9afeb903b856fff6a0eca69",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

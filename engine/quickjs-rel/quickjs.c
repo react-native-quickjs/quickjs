@@ -41996,8 +41996,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 int argc, JSValueConst *argv)
 {
-    JSValue res = JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
-                                  argc, argv, JS_CALL_FLAG_COPY_ARGV);
+    JSValue res;
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+    /* A compiled function with a native entry (a builtin's callback: a sort comparator, forEach)
+       is entered here, under the conditions JS_CallInternal enters it under, without the large
+       frame JS_CallInternal sets up first. The entry runs in the function's own realm (it takes
+       its context from the bytecode, as it does when JS_CallInternal calls it), and it checks its
+       own stack margin whenever the function has a call site, which any recursion through a
+       callback has. */
+    if (likely(JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT) &&
+        JS_VALUE_GET_OBJ(func_obj)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+        JSObject *p = JS_VALUE_GET_OBJ(func_obj);
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+
+        if (b->aot_nfn != NULL && b->argv_safe && !b->args_captured && argc >= b->arg_count &&
+            b->func_kind == JS_FUNC_NORMAL && !b->is_lazy) {
+            JSRuntime *rt = ctx->rt;
+            JSAotRun *ar = rt->aot_run;
+
+            if (likely(ar == NULL || ar->disabled == NULL ||
+                       !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1))) {
+                if (js_poll_interrupts(ctx))
+                    return JS_EXCEPTION;
+                res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, p, this_obj, (JSValue *)argv, argc);
+                if (rt->current_stack_frame == NULL && regvm_light_head(rt->regvm_cur) == NULL)
+                    js_drc_safepoint(rt);
+                return res;
+            }
+        }
+    }
+#endif
+    res = JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
+                          argc, argv, JS_CALL_FLAG_COPY_ARGV);
 #if QJS_DRC
     if (ctx->rt->current_stack_frame == NULL
         && regvm_light_head(ctx->rt->regvm_cur) == NULL)
@@ -85869,6 +85899,12 @@ struct array_sort_context {
     int exception;
     int has_method;
     JSValueConst method;
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+    /* A comparator that is a compiled function with a native entry is called through that
+       entry, as JS_Call would call it, with the checks that do not change during the sort
+       made once. */
+    JSFunctionBytecode *nb;
+#endif
 };
 
 static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
@@ -85886,6 +85922,24 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
     if (psc->has_method) {
         argv[0] = ap->val;
         argv[1] = bp->val;
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+        if (psc->nb != NULL) {
+            JSRuntime *rt = ctx->rt;
+            JSFunctionBytecode *b = psc->nb;
+            JSAotRun *ar = rt->aot_run;
+
+            if (likely(b->aot_nfn != NULL &&
+                       (ar == NULL || ar->disabled == NULL ||
+                        !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))) {
+                if (js_poll_interrupts(ctx))
+                    goto exception;
+                res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, JS_VALUE_GET_OBJ(psc->method),
+                                             JS_UNDEFINED, (JSValue *)argv, 2);
+            } else {
+                res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
+            }
+        } else
+#endif
         res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
         if (JS_IsException(res))
             goto exception;
@@ -85929,7 +85983,7 @@ exception:
 static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
-    struct array_sort_context asc = { ctx, 0, 0, argv[0] };
+    struct array_sort_context asc = { .ctx = ctx, .method = argv[0] };
     JSValue obj = JS_UNDEFINED;
     ValueSlot *array = NULL;
     size_t array_size = 0, pos = 0, n = 0;
@@ -85940,6 +85994,18 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
         if (check_function(ctx, asc.method))
             goto exception;
         asc.has_method = 1;
+#if QJS_AOT && QJS_REGVM && QJS_DRC
+        if (JS_VALUE_GET_TAG(asc.method) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_OBJ(asc.method)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSFunctionBytecode *b = JS_VALUE_GET_OBJ(asc.method)->u.func.function_bytecode;
+
+            /* the conditions under which JS_Call makes the same call (the entry's realm and stack
+               check are as described there) */
+            if (b->aot_nfn != NULL && b->argv_safe && !b->args_captured && 2 >= b->arg_count &&
+                b->func_kind == JS_FUNC_NORMAL && !b->is_lazy)
+                asc.nb = b;
+        }
+#endif
     }
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &len, obj))
