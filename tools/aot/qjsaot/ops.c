@@ -9070,7 +9070,7 @@ static int emit_typed_bitwise(
   a = in->use[0];
   b = in->use[1];
   if (d >= (Q2ValueId)t->nvalues) return 0;
-  if (t->lb[d] != E_LB_I32) return 0;
+  if (t->lb[d] != E_LB_I32 && !(in->rop == ROP_shr && t->lb[d] == E_LB_F64)) return 0;
   switch (in->rop) {
     case ROP_bitand: op = "&"; break;
     case ROP_bitor: op = "|"; break;
@@ -9097,10 +9097,21 @@ static int emit_typed_bitwise(
       fprintf(f, "    i%u = %s >> ((uint32_t)%s & 31);\n", (unsigned)d, an, bn);
     else if (op != NULL)
       fprintf(f, "    i%u = %s %s %s;\n", (unsigned)d, an, op, bn);
-    else
+    else if (t->lb[d] == E_LB_F64)
       fprintf(
-          f, "    i%u = (int32_t)((uint32_t)%s >> ((uint32_t)%s & 31));\n",
+          f, "    d%u = (double)((uint32_t)%s >> ((uint32_t)%s & 31));\n",
           (unsigned)d, an, bn);
+    else {
+      /* the result is an int only below 2^31: above it the generic body redoes the shift */
+      e_sweep_guard(f, "ox", in->pc);
+      fprintf(
+          f,
+          "    { uint32_t _u = (uint32_t)%s >> ((uint32_t)%s & 31);\n"
+          "      if (__builtin_expect(_u > (uint32_t)INT32_MAX, 0)) goto ox_%d;\n"
+          "      i%u = (int32_t)_u; }\n",
+          an, bn, in->pc, (unsigned)d);
+      e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+    }
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
   }
   return 1;
