@@ -5719,6 +5719,85 @@ static int emit_fl_alloc_op(
   return 1;
 }
 
+/* Whether the string that `s += <constant>` extends can be held by no other register. Compiled
+   code then tells the engine to skip its scan of the frame for another holder. The proof is
+   about the data flow of the function:
+   - where the string comes from: either a constant (never a register-only string, so the first
+     append makes a fresh one) or the result of this very append (a loop-carried accumulator);
+   - where it goes: the append, a length read, a compare or a branch, and the loop-carried
+     register itself. Any other use of the old or the new value (a move, a call argument or
+     receiver, an edge into a different register) may leave a second register holding it. */
+static int e_append_unique(const Q2Func *fn, const Q2Insn *in) {
+  Q2ValueId vo, vn;
+  int b, k, si, x, u, reg;
+
+  if (in->nuse < 1 || in->ndef < 1) return 0;
+  vo = in->use[0];
+  vn = in->def[0];
+  if (vo >= (Q2ValueId)fn->nvalues || vn >= (Q2ValueId)fn->nvalues) return 0;
+  reg = fn->values[vo].reg;
+  if (reg < 0 || reg != fn->values[vn].reg) return 0;
+  /* the sources of the old value */
+  {
+    int is_param = 0;
+    for (b = 0; b < fn->nblocks && !is_param; b++)
+      for (k = 0; k < fn->blocks[b].nparams; k++)
+        if (fn->blocks[b].param_val[k] == vo) {
+          int pb;
+          is_param = 1;
+          for (pb = 0; pb < fn->nblocks; pb++) {
+            const Q2Block *p = &fn->blocks[pb];
+            for (si = 0; si < p->nsucc && si < 2; si++) {
+              Q2ValueId av;
+              const Q2Insn *ai;
+              if (p->succ_block[si] != b || k >= p->nedge_args[si]) continue;
+              av = p->edge_arg[si][k];
+              if (av == vn || av == vo) continue;
+              if (av == Q2_NO_VALUE || av >= (Q2ValueId)fn->nvalues ||
+                  fn->values[av].insn < 0)
+                return 0;
+              ai = &fn->insns[fn->values[av].insn];
+              if (ai->op != Q2_OP_CONST && ai->rop != ROP_load_const) return 0;
+            }
+          }
+          break;
+        }
+    if (!is_param) {
+      const Q2Insn *di;
+      if (fn->values[vo].insn < 0) return 0;
+      di = &fn->insns[fn->values[vo].insn];
+      if (di->op != Q2_OP_CONST && di->rop != ROP_load_const) return 0;
+    }
+  }
+  /* the uses of the old and the new value */
+  for (x = 0; x < fn->ninsns; x++) {
+    const Q2Insn *xi = &fn->insns[x];
+    if (xi == in) continue;
+    for (u = 0; u < xi->nuse; u++) {
+      if (xi->use[u] != vo && xi->use[u] != vn) continue;
+      if (xi->rop == ROP_get_length || xi->op == Q2_OP_BRANCH ||
+          xi->op == Q2_OP_BRANCH_CMP || xi->op == Q2_OP_COMPARE)
+        continue;
+      return 0;
+    }
+    for (u = 0; u < xi->win_n && xi->win_val != NULL; u++)
+      if (xi->win_val[u] == vo || xi->win_val[u] == vn) return 0;
+  }
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *p = &fn->blocks[b];
+    for (si = 0; si < p->nsucc && si < 2; si++) {
+      const Q2Block *sb;
+      if (p->succ_block[si] < 0 || p->succ_block[si] >= fn->nblocks) continue;
+      sb = &fn->blocks[p->succ_block[si]];
+      for (k = 0; k < p->nedge_args[si] && k < sb->nparams; k++) {
+        Q2ValueId av = p->edge_arg[si][k];
+        if ((av == vo || av == vn) && sb->param_reg[k] != reg) return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 /* The code offset of the atom operand of the `load_const` a `get_element` has absorbed
    (see e_try_fuse_atom_get), or -1. */
 static int g_e_fuse_atom_off = -1;
@@ -5914,6 +5993,30 @@ static int emit_alloc_op(
             "      }\n"
             "    }\n",
             (int)in->sub, xa, xb, (unsigned)dv, in->pc);
+  }
+  /* `s += 'constant'` with the result in the operand's register: try the in-place append
+     before the general sequence. Only the operand needs to be in the frame for it. */
+  /* `s += 'constant'` with the result in the operand's register: try the in-place append
+     before the general sequence. Only the operand needs to be in the frame for it. */
+  if (in->rop == ROP_binary_cpool && !nodest && !redef_mode && in->nuse == 1 && in->narg >= 5 &&
+      in->arg[1].val == REG_BIN_ADD && in->arg[2].kind == 'r' && E_ROFF(in->arg[2]) == off &&
+      t->lb[dv] == E_LB_TAG && in->use[0] < (Q2ValueId)t->nvalues &&
+      t->lb[in->use[0]] == E_LB_TAG &&
+      (in->arg[3].val == REG_CONST_CPOOL || in->arg[4].off >= 0) && e_append_unique(fn, in)) {
+    char idx[96];
+    if (in->arg[3].val == REG_CONST_CPOOL)
+      snprintf(idx, sizeof(idx), "%uu", (unsigned)in->arg[4].val);
+    else
+      snprintf(idx, sizeof(idx), "qjs_aot_ld_u32(q2_code(f) + %d)", in->arg[4].off);
+    fprintf(f,
+            "    { int _ap;\n"
+            "      AOT_SET_B(ctx, fr, %d, v%u);\n"
+            "      _ap = qjs_aot_append_const(ctx, f, %d, %s, %d, %d);\n"
+            "      if (_ap > 0) { v%u = AOT_REG(fr, %d); goto cd_%d; }\n"
+            "      if (__builtin_expect(_ap < 0, 0)) return qjs_aot_throw_here(ctx, f, %d);\n"
+            "    }\n",
+            off, (unsigned)in->use[0], (int)in->arg[3].val, idx, dreg, 1,
+            (unsigned)dv, off, in->pc, in->pc);
   }
   fprintf(f, "    /* sync live TAG values to the frame before the allocation */\n");
   for (r = 0; r < fn->nregs; r++) {
