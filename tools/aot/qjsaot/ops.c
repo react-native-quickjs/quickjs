@@ -4533,20 +4533,19 @@ static int emit_typed_elem_read(
   if (t->lb[dv] == E_LB_TAG) {
     fprintf(f, "        v%u = _e;\n", (unsigned)dv);
   } else {
-    /* Raw result to the frame first, so a guard miss leaves the op's result where
-       the generic body will look for it. */
-    fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
-    /* Nothing reads the result: the frame write above is all it needs. */
-    if (!e_def_dead(in, dv)) {
+    /* The raw result reaches the frame only when the guard misses, so a miss leaves the
+       op's result where the generic body will look for it; a dead result is stored. */
+    if (e_def_dead(in, dv)) {
+      fprintf(f, "        AOT_SET_B(ctx, fr, %d, _e);\n", dreg * 16);
+    } else {
       e_sweep_guard(f, "dx", in->next);
       if (t->lb[dv] == E_LB_I32)
         fprintf(
             f,
             "        if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_INT, "
-            "0)) "
-            "goto dx_%d;\n"
+            "0)) { AOT_SET_B(ctx, fr, %d, _e); goto dx_%d; }\n"
             "        i%u = JS_VALUE_GET_INT(_e);\n",
-            in->next, (unsigned)dv);
+            dreg * 16, in->next, (unsigned)dv);
       else if (t->lb[dv] == E_LB_F64)
         fprintf(
             f,
@@ -4554,8 +4553,8 @@ static int emit_typed_elem_read(
             "(double)JS_VALUE_GET_INT(_e);\n"
             "        else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = "
             "JS_VALUE_GET_FLOAT64(_e);\n"
-            "        else goto dx_%d;\n",
-            (unsigned)dv, (unsigned)dv, in->next);
+            "        else { AOT_SET_B(ctx, fr, %d, _e); goto dx_%d; }\n",
+            (unsigned)dv, (unsigned)dv, dreg * 16, in->next);
     }
   }
   fprintf(f, "      } else {\n");
@@ -7034,17 +7033,20 @@ static int emit_hit_result(
     fprintf(f, "        v%u = %s;\n", (unsigned)dv, raw);
     return 1;
   }
-  fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", dreg * 16, raw);
-  /* Nothing reads the result: the frame write above is all it needs. */
-  if (e_def_dead(in, dv)) return 1;
+  /* The raw result reaches the frame only when the guard misses (the generic body finds
+     the op's result there); a result nothing reads is stored. */
+  if (e_def_dead(in, dv)) {
+    fprintf(f, "        AOT_SET_B(ctx, fr, %d, %s);\n", dreg * 16, raw);
+    return 1;
+  }
   e_sweep_guard(f, "dx", in->next);
   if (t->lb[dv] == E_LB_I32)
     fprintf(
         f,
         "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) "
-        "goto dx_%d;\n"
+        "{ AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n"
         "        i%u = JS_VALUE_GET_INT(%s);\n",
-        raw, in->next, (unsigned)dv, raw);
+        raw, dreg * 16, raw, in->next, (unsigned)dv, raw);
   else if (t->lb[dv] == E_LB_F64)
     fprintf(
         f,
@@ -7052,15 +7054,15 @@ static int emit_hit_result(
         "(double)JS_VALUE_GET_INT(%s);\n"
         "        else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) d%u = "
         "JS_VALUE_GET_FLOAT64(%s);\n"
-        "        else goto dx_%d;\n",
-        raw, (unsigned)dv, raw, raw, (unsigned)dv, raw, in->next);
+        "        else { AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n",
+        raw, (unsigned)dv, raw, raw, (unsigned)dv, raw, dreg * 16, raw, in->next);
   else if (t->lb[dv] == E_LB_BOOL)
     fprintf(
         f,
         "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_BOOL, 0)) "
-        "goto dx_%d;\n"
+        "{ AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n"
         "        b%u = JS_VALUE_GET_BOOL(%s);\n",
-        raw, in->next, (unsigned)dv, raw);
+        raw, dreg * 16, raw, in->next, (unsigned)dv, raw);
   else
     return 0;
   return 1;
