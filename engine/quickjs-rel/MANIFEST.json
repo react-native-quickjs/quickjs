@@ -1456,7 +1456,7 @@
     },
     {
       "name": "0370-aot-ctor-replayable.patch",
-      "sha256": "e7c6d0bccbda8b913bf1357a39b25690f8bb1c0dddd38f6458f6c1238ec5ee1f"
+      "sha256": "db9c766069d76a3f34f6f79a8af538072c28ac6e3bf37fc81c495a0f3ea40351"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1464,7 +1464,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "ca04058896ac5fa8978783b0ac12f50d02df87261f024de6dfb8094db943ac47",
+    "quickjs.c": "f03f24517ff7f84c7354673bc0824e054e65a35b33129ff11f005e4053c961cb",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

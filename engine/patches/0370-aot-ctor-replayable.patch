@@ -6,7 +6,8 @@ What this does
     the cell of `sites[k]` leads to the shape the next one starts from, and the cells were filled at
     the current prototype-interceptor epoch (`misses == rt->ic_watchpoint_epoch`). It reads only. A caller-owned
     `JSAotCtorCache` remembers the last positive answer, keyed on the function object's shape, the object in
-    its `prototype` slot, and `aot_pic_epoch`, so a repeated question is a few loads.
+    its `prototype` slot, and `aot_pic_epoch`, so a repeated question is a few loads; it also holds the shape a constructed object ends
+    with (the last cell's target), which is what a compiled function knows an unmade object's shape to be.
 
 Why we need it
   A compiled function that proves an object made by a plain constructor never escapes does not make it:
@@ -28,7 +29,7 @@ Why we need it
  }
  
  /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
-@@ -63454,6 +63455,70 @@
+@@ -63454,6 +63455,71 @@
      return 1;
  }
  
@@ -89,6 +90,7 @@ Why we need it
 +        if (sh == NULL)
 +            return 0;
 +    }
++    cc->final_shape = sh;
 +    cc->shape = ctor->shape;
 +    cc->proto = JS_VALUE_GET_PTR(pv);
 +    cc->slot = (uint32_t)(ppr - ctor->prop);
@@ -101,13 +103,14 @@ Why we need it
     object itself as the receiver (what `get_element` does for a constant string key, minus
 --- a/quickjs-aot-rt.h
 +++ b/quickjs-aot-rt.h
-@@ -417,6 +417,19 @@
+@@ -417,6 +417,20 @@
     non-derived light bytecode constructor (the caller takes the generic path); -1 on an
     exception. Runs no JavaScript. */
  int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
 +/* What `qjs_aot_ctor_replayable` remembers between calls (zero-initialised, one per use). */
 +typedef struct JSAotCtorCache {
 +    const void *shape, *proto;
++    const void *final_shape; /* the shape of the constructed object, all fields added */
 +    uint32_t slot, pic_epoch;
 +} JSAotCtorCache;
 +

@@ -63512,6 +63512,7 @@ int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *site
         if (sh == NULL)
             return 0;
     }
+    cc->final_shape = sh;
     cc->shape = ctor->shape;
     cc->proto = JS_VALUE_GET_PTR(pv);
     cc->slot = (uint32_t)(ppr - ctor->prop);
