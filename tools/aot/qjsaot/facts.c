@@ -1609,7 +1609,7 @@ int qjs_aot_unit_has(const char hex[33]);
 
 int e_inline_allow_construct = 1;
 typedef struct CtorSum {
-  int nfields, atom[8], argidx[8], site[8], nparams;
+  int nfields, atom[8], aoff[8], argidx[8], site[8], nparams;
 } CtorSum;
 static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc **cg_out, CtorSum *sum);
 
@@ -1778,7 +1778,12 @@ static int ctor_summary(const JSAotGenFunc *cg, CtorSum *out) {
           }
           out->site[out->nfields] = st;
         }
+        if (in->arg[1].kind != 'a' || in->arg[1].off < 0) {
+          ok = 0;
+          break;
+        }
         out->atom[out->nfields] = (int)in->arg[1].val;
+        out->aoff[out->nfields] = in->arg[1].off;
         out->argidx[out->nfields] = kind[val] - 2;
         out->nfields++;
         break;
@@ -2082,7 +2087,11 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
         }
       }
     }
-    if (ok && nweb >= 8) ok = 0;
+    if (ok) {
+      int regs = 0, w;
+      for (w = 0; w < nweb; w++) regs += webs[w].nargs + 1;
+      if (nweb >= 8 || regs + sums[cc0].nparams + 1 > 20) ok = 0;
+    }
     if (!ok) {
       nrw = first_rw;
       for (m = 0; m < nv; m++)
@@ -2102,6 +2111,7 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
       webs[nweb].nargs = sm->nparams;
       for (j = 0; j < sm->nfields; j++) {
         webs[nweb].atom[j] = sm->atom[j];
+        webs[nweb].aoff[j] = sm->aoff[j];
         webs[nweb].argidx[j] = sm->argidx[j];
         webs[nweb].site[j] = sm->site[j];
       }

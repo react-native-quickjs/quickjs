@@ -3163,22 +3163,27 @@ static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
   for (j = 0; j < vw->nfields; j++) {
     Q2ValueId av = g_e_stub_cur[vw->areg[vw->argidx[j]]];
     char one2[260];
-    if (av == Q2_NO_VALUE || av == E_UNDEF || av == E_INFRAME || av >= (Q2ValueId)g_e_types->nvalues)
+    if (av == Q2_NO_VALUE || av == E_UNDEF || av == E_INFRAME || av >= (Q2ValueId)g_e_types->nvalues) {
+      if (getenv("QJS_AOT_DEBUG_VIRT"))
+        fprintf(stderr, "virt: object %u of web %d: argument register %d holds %d at stub pc %d\n", (unsigned)v, (int)g_e_virt[v],
+                vw->areg[vw->argidx[j]], (int)av, g_e_stub_pc);
       snprintf(one, sizeof(one), "JS_UNDEFINED");
-    else
+    } else
       e_exit_expr(one, sizeof(one), av);
     snprintf(
         one2, sizeof(one2),
-        "if (JS_DefinePropertyValue(ctx, t_, (JSAtom)%d, JS_DupValue(ctx, %s), JS_PROP_C_W_E) < 0) { "
+        "if (JS_DefinePropertyValue(ctx, t_, (JSAtom)qjs_aot_ld_u32(code_ + %d), JS_DupValue(ctx, %s), JS_PROP_C_W_E) < 0) { "
         "JS_FreeValue(ctx, t_); return JS_EXCEPTION; } ",
-        vw->atom[j], one);
+        vw->aoff[j], one);
     len += snprintf(body + len, sizeof(body) - (size_t)len, "%s", one2);
   }
   snprintf(
       buf, n,
-      "({ JSValue c_ = %s, t_; int rc_ = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(c_), &t_); "
+      "({ JSValue c_ = %s, t_; const uint8_t *code_ = NULL; int rc_ = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(c_), &t_); "
       "if (rc_ < 0) return JS_EXCEPTION; "
       "if (rc_ == 0) { JS_ThrowTypeError(ctx, \"not a constructor\"); return JS_EXCEPTION; } "
+      "code_ = *(const uint8_t *const *)(*(const uint8_t *const *)((const uint8_t *)JS_VALUE_GET_PTR(c_) + "
+      "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE) + QJS_AOT_OFF_FNBC_REGVM_CODE); "
       "%sqjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(c_), t_); t_; })",
       cexp, body);
   return 1;

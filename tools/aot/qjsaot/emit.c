@@ -433,6 +433,24 @@ static int e_build_spec_fn(
         q2_free(&fn3);
       } else {
         if (dbg) fprintf(stderr, "virt %s: %d webs\n", g->name, nwebs);
+        if (getenv("QJS_AOT_DUMP_VIRT") != NULL) {
+          int di, dk;
+          for (di = 0; di < fn3.ninsns; di++) {
+            const Q2Insn *x = &fn3.insns[di];
+            fprintf(stderr, "  [%d] pc %d bpc %d rop %u vk %d own %d xpc %d def", di, x->pc, x->bpc, x->rop, x->vk, x->own, x->xpc);
+            for (dk = 0; dk < x->ndef; dk++) fprintf(stderr, " v%d(r%d)", (int)x->def[dk], fn3.values[x->def[dk]].reg);
+            fprintf(stderr, " use");
+            for (dk = 0; dk < x->nuse; dk++) fprintf(stderr, " v%d(r%d)", (int)x->use[dk], fn3.values[x->use[dk]].reg);
+            fprintf(stderr, "\n");
+          }
+          for (di = 0; di < fn3.nblocks; di++) {
+            fprintf(stderr, "  block %d pc %d..%d live-in:", di, fn3.blocks[di].start_pc, fn3.blocks[di].end_pc);
+            for (dk = 0; dk < fn3.blocks[di].nlive_in; dk++) fprintf(stderr, " r%d=v%d", fn3.blocks[di].in_reg[dk], (int)fn3.blocks[di].in_val[dk]);
+            fprintf(stderr, " succ:");
+            for (dk = 0; dk < fn3.blocks[di].nsucc; dk++) fprintf(stderr, " %d", fn3.blocks[di].succ_block[dk]);
+            fprintf(stderr, "\n");
+          }
+        }
         if (have2) q2_free(&fn2);
         fn2 = fn3;
         have2 = 1;

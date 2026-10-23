@@ -203,7 +203,7 @@ typedef struct Q2Insn {
      the value currently defined for that register, else Q2_NO_VALUE. */
   Q2ValueId argval[8];
   int8_t nuse;
-  Q2ValueId use[8];
+  Q2ValueId use[24];
   /* A call's argument window, if any: the registers the callee reads. Kept
      beside `use` because the count is dynamic (up to 255). */
   int32_t win_reg, win_n;
@@ -265,7 +265,7 @@ enum { Q2_VK_DEF = 1, Q2_VK_GET, Q2_VK_PROTO };
 typedef struct Q2VWeb {
   const struct JSAotGenFunc *ctor; /* the constructor's program */
   int32_t nargs, areg[8], creg;    /* the constructor value is kept in `creg` */
-  int32_t atom[8], argidx[8], site[8], nfields;
+  int32_t atom[8], aoff[8], argidx[8], site[8], nfields; /* atom: its id here; aoff: where the constructor's code holds it */
 } Q2VWeb;
 
 /* ---- functions ----------------------------------------------------------- */

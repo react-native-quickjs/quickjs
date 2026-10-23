@@ -1854,6 +1854,21 @@ static int q2_apply_rewrites(
       }
     }
   }
+  /* a return reads the registers of the objects that are not made, so their values are kept for
+     the exits (an exit builds an object from them) */
+  for (i = 0; i < nout; i++) {
+    Q2Insn *in = &out[i];
+    if (in->op != Q2_OP_RETURN && in->op != Q2_OP_RETURN_UNDEF) continue;
+    for (w = 0; w < nwebs; w++)
+      for (k = 0; k <= f->vweb[w].nargs; k++) {
+        if (in->nuse >= 24) {
+          f->why = "too many registers of unmade objects";
+          free(out);
+          return -1;
+        }
+        in->use[in->nuse++] = (Q2ValueId)(k < f->vweb[w].nargs ? f->vweb[w].areg[k] : f->vweb[w].creg);
+      }
+  }
 #undef Q2_SYN
   free(f->insns);
   f->insns = out;
@@ -2269,13 +2284,16 @@ int q2_build_ea(
             int r = in2->win_reg + m;
             cur[r >> 6] |= 1ull << (r & 63);
           }
-          /* the registers of the objects that are not made are read by every way out: they are
-             defined on entry, and an exit builds an object from them */
-          if ((in2->op == Q2_OP_RETURN || in2->op == Q2_OP_RETURN_UNDEF) && f->vweb != NULL) {
+          /* the registers of the objects that are not made are live everywhere after their first
+             definition: an exit anywhere builds an object from them */
+          if (f->vweb != NULL) {
             int w2, k2;
             for (w2 = 0; w2 < f->nvweb; w2++)
               for (k2 = 0; k2 <= f->vweb[w2].nargs; k2++) {
                 int r = k2 < f->vweb[w2].nargs ? f->vweb[w2].areg[k2] : f->vweb[w2].creg;
+                if (in2->rop == ROP_load_undefined && in2->ndef == 1 && (int)in2->def[0] == r && in2->nuse == 0 &&
+                    in2->own == 0 && in2->pc >= f->exit_pc)
+                  continue;
                 cur[r >> 6] |= 1ull << (r & 63);
               }
           }
