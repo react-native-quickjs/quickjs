@@ -361,6 +361,16 @@ static int e_inline_typed_ok(const Q2Func *fn) {
       ok = 0;
       continue;
     }
+    /* a polymorphic site is served by a cache that fills from the frame, which a copy has none of */
+    if (in->op == Q2_OP_GET_FIELD || in->op == Q2_OP_PUT_FIELD) {
+      int sa;
+      for (sa = 0; sa < in->narg; sa++)
+        if (in->arg[sa].kind == 's' && (unsigned)in->arg[sa].val != 0xffff && e_facts_site_poly(&facts, (int)in->arg[sa].val)) {
+          if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: polymorphic field access at clone pc %d\n", in->pc);
+          ok = 0;
+        }
+      if (!ok) continue;
+    }
     if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
         in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH)
       continue;

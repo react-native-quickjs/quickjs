@@ -8416,7 +8416,10 @@ static int emit_typed_field_read(
   if (dv >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues) return 0;
   /* The receiver is a JSValue; a typed receiver would be a number, which misses
      the PIC, so decline and let the op-call path take it. */
-  if (t->lb[rv] != E_LB_TAG) return 0;
+  if (t->lb[rv] != E_LB_TAG) {
+    if (getenv("E_DBG5")) fprintf(stderr, "pc%d get_field: receiver v%u is not a TAG value (lb %d)\n", in->pc, (unsigned)rv, t->lb[rv]);
+    return 0;
+  }
   dreg = fn->values[dv].reg;
   rreg = fn->values[rv].reg;
   if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;

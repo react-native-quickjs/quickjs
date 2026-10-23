@@ -942,6 +942,12 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = 0;
       info.writes = Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
+    case ROP_array_const: /* "rb": d, index of the constant array */
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.reads = 0;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
     case ROP_object_fill: /* "rrbu": object (filled in place), window, count, template */
       info.nuse = 1;
       info.use[0] = 0;

@@ -1615,7 +1615,7 @@ static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc
 
 static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
   Q2Func cf;
-  int i, ok = 1, has_ctor = 0;
+  int i, ok = 1;
   if (cg->func_kind != 0 || cg->ctl_count != 0 || cg->light_var_count != 0 || cg->arg_count > 6 ||
       cg->len > 400)
     return 0;
@@ -1624,8 +1624,6 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
     return 0;
   }
   if (cf.ninsns > 70) ok = 0;
-  for (i = 0; ok && i < cf.ninsns; i++)
-    if (cf.insns[i].rop == ROP_construct) has_ctor = 1;
   for (i = 0; ok && i < cf.ninsns; i++) {
     const Q2Insn *in = &cf.insns[i];
     /* A copy may build an object of a plain constructor: the copy is kept only if that object is
@@ -1635,7 +1633,7 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
       e_facts_virtual_planning = 1;
       gok = global_exit_ok(&cf, in);
       e_facts_virtual_planning = saved;
-      if (!e_inline_allow_construct || !has_ctor || !gok) ok = 0;
+      if (!e_inline_allow_construct || !gok) ok = 0;
       continue;
     }
     if (in->rop == ROP_construct) {
