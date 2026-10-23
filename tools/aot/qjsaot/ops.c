@@ -11173,31 +11173,16 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           fprintf(
               f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(pic, %d);\n", g, g,
               gr->sites[q]);
-      /* A site the profile sampled (hot) must have a cell holding the group's shape, in the
-         kind it needs (a store needs the writable kind): its accesses and the facts assume
-         it until a safepoint. A cell that is empty or of another shape refuses the entry;
-         the generic body that runs instead fills the cell, so the next call can enter. A
-         cold site's cell may be empty (its accesses test it themselves); only a cell of
-         another shape refuses. */
-      {
-        int any_hot = 0;
-        for (q = 0; q < gr->nsites; q++) {
-          int z;
-          for (z = 0; z < g_e_facts->nsites; z++)
-            if (g_e_facts->sites[z].site == gr->sites[q] && g_e_facts->sites[z].hot) any_hot = 1;
-        }
-        if (any_hot)
-          fprintf(
-              f,
-              "    if (__builtin_expect(gsh%d == NULL, 0)) {\n"
-              "        E_REFUSE_NOTE(%d);\n"
-              "        return %s;\n"
-              "    }\n",
-              g, fi, gen0);
-        else
-          fprintf(
-              f, "    if (__builtin_expect(gsh%d == NULL, 0)) gsh%d = E_NO_SHAPE;\n", g, g);
-      }
+      /* A group none of whose cells has been filled has not run yet, which is no reason to
+         refuse the entry. The shape becomes one no object has, so each access of the group
+         takes its miss exit if it is ever reached (and the 257-exit rule switches the
+         function off if that turns out to be common), and the generic body fills the cells
+         for the next entry. Once any cell holds a shape, a site the profile sampled (hot)
+         must have a cell holding it, in the kind it needs (a store needs the writable
+         kind): its accesses and the facts assume it until a safepoint. An empty cell or one
+         of another shape refuses the entry. A cold site's cell may be empty (its accesses
+         test it themselves); only a cell of another shape refuses. */
+      fprintf(f, "    if (__builtin_expect(gsh%d == NULL, 0)) gsh%d = E_NO_SHAPE;\n", g, g);
       for (q = 0; q < gr->nsites; q++) {
         int wr = 0, hot = 0, z;
         for (z = 0; z < g_e_facts->nsites; z++)
@@ -11214,13 +11199,13 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           fprintf(
               f,
               "    { const void *_s = %s(pic, %s);\n"
-              "      if (__builtin_expect(%s_s != gsh%d, 0)) {\n"
+              "      if (__builtin_expect(gsh%d != E_NO_SHAPE && %s_s != gsh%d, 0)) {\n"
               "        E_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
               "        E_REFUSE_NOTE(%d);\n"
               "        return %s;\n"
               "      } }\n",
               wr && hot ? "q2_cell_wshape" : "q2_cell_shape",
-              e_cellidx(cib, sizeof(cib), gr->sites[q]), hot ? "" : "_s != NULL && ", g, hex,
+              e_cellidx(cib, sizeof(cib), gr->sites[q]), g, hot ? "" : "_s != NULL && ", g, hex,
               gr->sites[q], fi, gen0);
         }
       }
@@ -11249,19 +11234,21 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
             fprintf(
                 f,
-                "    if (__builtin_expect(q2_holder2_bad_sh(gsh%d, holders, (int)q2_ns, pci%d), 0)) {\n"
+                "    if (__builtin_expect(gsh%d != E_NO_SHAPE &&\n"
+                "            q2_holder2_bad_sh(gsh%d, holders, (int)q2_ns, pci%d), 0)) {\n"
                 "        E_REFUSE_NOTE(%d);\n"
                 "        return %s;\n"
                 "    }\n",
-                g, gr->sites[q], fi, gen0);
+                g, g, gr->sites[q], fi, gen0);
           else if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]))
             fprintf(
                 f,
-                "    if (__builtin_expect(q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"
+                "    if (__builtin_expect(gsh%d != E_NO_SHAPE &&\n"
+                "            q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"
                 "        E_REFUSE_NOTE(%d);\n"
                 "        return %s;\n"
                 "    }\n",
-                g, gr->sites[q], fi, gen0);
+                g, g, gr->sites[q], fi, gen0);
         }
       }
     }
