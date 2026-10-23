@@ -748,7 +748,9 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   /* Filled at exactly one generation of the global object in the profiled run: the cell holds
      unless the global object changes, which that run did not see. */
   if (!qjs_aot_prof_site(fn->g->digest, (int)in->arg[3].val, &ns, shapes)) return 0;
-  return ns == 1;
+  /* A site that ran many times and was filled only a couple of times saw the global object
+     change at startup, not in its steady state. */
+  return ns == 1 || (ns <= 3 && qjs_aot_prof_pc_count(fn->g->digest, in->ppc) >= 16384);
 }
 
 /* The receiver of a region access, through the forwarded copies recorded so far. */
@@ -1515,6 +1517,12 @@ int e_plan_licm(const Q2Func *fn, Q2Extra **out) {
         for (k = 0; k < fn->blocks[bi].ninsns; k++)
           if (is_safepoint(fn, &facts, &fn->insns[fn->blocks[bi].first_insn + k], 1)) {
             safe = 0;
+            if (getenv("QJS_AOT_DEBUG_LICM") != NULL) {
+              char nm[64];
+              e_rop_name(fn->insns[fn->blocks[bi].first_insn + k].rop, nm, sizeof(nm));
+              fprintf(stderr, "licm %s: loop at block %d has a safepoint %s@%d\n", fn->g->name, h, nm,
+                      fn->insns[fn->blocks[bi].first_insn + k].pc);
+            }
             break;
           }
       }

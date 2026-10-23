@@ -2526,8 +2526,18 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_FL_TOP(ctx_) (*(JSAotFlRec **)(*(uint8_t **)((uint8_t *)(ctx_) + "
         "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_FL_TOP))\n"
         "#define E_NO_SHAPE ((const void *)1)\n"
+        /* An integral double boxes as an int, as the engine does. The conversion is the
+           hardware's (out of range gives INT_MIN, which never compares equal to a double that
+           does not fit), so the test is a convert, a convert back and a compare. */
+        "#if defined(__SSE2__)\n"
+        "#include <emmintrin.h>\n"
+        "#define E_BOX_F64(d) ({ double d_ = (d); int32_t i_ = _mm_cvttsd_si32(_mm_set_sd(d_)); "
+        "__builtin_expect((double)i_ == d_ && (i_ != 0 || !signbit(d_)), 0) ? "
+        "JS_MKVAL(JS_TAG_INT, i_) : __JS_NewFloat64(d_); })\n"
+        "#else\n"
         "#define E_BOX_F64(d) ({ double d_ = (d); "
         "qjs_aot_box_num(d_, qjs_aot_fitsi(d_)); })\n"
+        "#endif\n"
         /* The `undefined` word a native entry fills its frame with, as one
            static constant so the fill is a copy of a known word. */
         "static const JSValue e_undefined_value = { { .int32 = 0 }, "
