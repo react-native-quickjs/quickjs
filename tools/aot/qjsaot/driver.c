@@ -2336,7 +2336,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "   generic body. They are counted, never acted on. */\n"
         "#define E_HANDOFF_NOTE(fi) (e_han[fi]++)\n"
         "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
-        "#define E_REFUSE_NOTE(fi) do { if (++e_ref[fi] > 256 && \\\n"
+        "#define E_REFUSE_NOTE(fi) do { if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_ref[fi] > 256 && \\\n"
         "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
         /* The dynamic register check, compiled into the unit only with -DE_POISON.
            It compares every register an op call was not allowed to write
