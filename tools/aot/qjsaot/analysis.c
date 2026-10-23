@@ -1054,6 +1054,7 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   }
   free(w);
   free(fixed);
+  e_ranges_run(fn, out);
   return 0;
 }
 

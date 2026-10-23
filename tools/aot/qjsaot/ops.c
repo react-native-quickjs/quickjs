@@ -2810,22 +2810,27 @@ static int emit_typed_arith(
       f,
       "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n",
       (unsigned)in->use[0], op, (unsigned)in->use[1]);
-  if (t->exits != NULL && (t->exits[d] & E_EX_OVF)) {
-    e_sweep_guard(f, "ox", in->pc);
-    fprintf(
-        f,
-        "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-        "goto ox_%d;\n",
-        in->pc);
-    /* a zero product with a negative operand is -0, which no int32 holds */
-    if (in->rop == ROP_mul)
-      fprintf(
-          f,
-          "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) "
-          "goto ox_%d;\n",
-          (unsigned)in->use[0], (unsigned)in->use[1], in->pc);
-    e_note_stub(
-        g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+  {
+    int ovf = t->exits != NULL && (t->exits[d] & E_EX_OVF);
+    int nz = t->exits != NULL && in->rop == ROP_mul && (t->exits[d] & E_EX_NEGZERO);
+    if (ovf || nz) {
+      e_sweep_guard(f, "ox", in->pc);
+      if (ovf)
+        fprintf(
+            f,
+            "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+            "goto ox_%d;\n",
+            in->pc);
+      /* a zero product with a negative operand is -0, which no int32 holds */
+      if (nz)
+        fprintf(
+            f,
+            "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) "
+            "goto ox_%d;\n",
+            (unsigned)in->use[0], (unsigned)in->use[1], in->pc);
+      e_note_stub(
+          g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+    }
   }
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -8052,16 +8057,21 @@ static int emit_typed_arith_imm(
   fprintf(
       f, "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n", (unsigned)a, op,
       imm);
-  e_sweep_guard(f, "ox", in->pc);
-  fprintf(
-      f,
-      "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-      "goto ox_%d;\n",
-      in->pc);
-  if (sub == REG_BIN_MUL)
-    fprintf(
-        f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) goto ox_%d;\n",
-        (unsigned)a, imm, in->pc);
+  {
+    int ovf = t->exits == NULL || (t->exits[d] & E_EX_OVF);
+    int nz = sub == REG_BIN_MUL && (t->exits == NULL || (t->exits[d] & E_EX_NEGZERO));
+    if (ovf || nz) e_sweep_guard(f, "ox", in->pc);
+    if (ovf)
+      fprintf(
+          f,
+          "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
+          "goto ox_%d;\n",
+          in->pc);
+    if (nz)
+      fprintf(
+          f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) goto ox_%d;\n",
+          (unsigned)a, imm, in->pc);
+  }
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
   /* The exit hands over the state BEFORE the instruction: the destination register
      may be the operand's, and the generic body redoes the operation from it. */

@@ -234,6 +234,8 @@ typedef struct ETypes {
 /* Run representation inference over a built IR, reading the facts pass's
    forwarding decisions. Returns 0, or -1 on allocation failure. */
 int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out);
+/* Drop the overflow exits an interval proof makes unnecessary. */
+void e_ranges_run(const Q2Func *fn, ETypes *t);
 void e_types_free(ETypes *t);
 /* Facts then types, with the intrinsic sites whose arguments are not numbers
    dropped (e_ops.c). 0 on success; on failure nothing is left allocated. */
