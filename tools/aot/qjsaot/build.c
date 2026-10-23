@@ -1134,6 +1134,11 @@ static int q2_prune_params(Q2Func *f) {
   int changed = 1, b, i, guard = 0;
   if (!repl) return -1;
   for (i = 0; i < f->nvalues; i++) repl[i] = (Q2ValueId)i;
+  /* the copy that stands in for a hoisted load is its source */
+  for (i = 0; i < f->ninsns; i++) {
+    const Q2Insn *in = &f->insns[i];
+    if (in->licm_mov && in->ndef == 1 && in->nuse == 1) repl[in->def[0]] = in->use[0];
+  }
   for (b = 0; b < f->nblocks; b++) {
     Q2Block *blk = &f->blocks[b];
     int n = blk->nparams > 0 ? blk->nparams : 1;
@@ -3053,6 +3058,17 @@ void q2_live_before(const Q2Func *fn, int insn, uint64_t *out) {
   for (k = 0; k < in->nuse; k++) {
     int r = fn->values[in->use[k]].reg;
     out[r >> 6] |= 1ull << (r & 63);
+  }
+  /* A use that stands for another value (the copy of a hoisted load is its source) still
+     reads the register the program names: the generic body resumes at this instruction. */
+  if (in->own == 0 && in->xpc < 0 && in->op != Q2_OP_FALLBACK) {
+    const Q2RopInfo *ri = q2_rop_info(in->rop);
+    for (k = 0; k < ri->nuse && k < 3; k++) {
+      int idx = ri->use[k], r;
+      if (idx < 0 || idx >= in->narg || in->arg[idx].kind != 'r') continue;
+      r = q2_ri((int)in->arg[idx].val);
+      if (r >= 0 && r < fn->nregs) out[r >> 6] |= 1ull << (r & 63);
+    }
   }
   for (k = 0; k < in->win_n; k++) {
     int r = in->win_reg + k;
