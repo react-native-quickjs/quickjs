@@ -1606,7 +1606,7 @@ static int emit_native_length(
   fprintf(f, "    double _len;\n");
   fprintf(
       f,
-      "    if (__builtin_expect(q2_array_length(AOT_REG(fr, %d), "
+      "    if (__builtin_expect(q2_array_length(ctx, AOT_REG(fr, %d), "
       "&_len), 1)) {\n",
       recv);
   emit_site_hit(f, in);
@@ -4388,7 +4388,7 @@ static int emit_typed_length(
   fprintf(f, "    { double _len;\n");
   fprintf(
       f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_array_length(v%u, &_len), 1)) {\n",
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_array_length(ctx, v%u, &_len), 1)) {\n",
       (unsigned)rv);
   fprintf(f, "        i%u = (int32_t)_len;\n", (unsigned)dv);
   fprintf(f, "      } else {\n");

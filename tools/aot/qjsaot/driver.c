@@ -1912,6 +1912,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT %uu\n"
           "#define QJS_AOT_OFF_ROPE_LEFT %uu\n"
           "#define QJS_AOT_OFF_ROPE_RIGHT %uu\n"
+          "#define QJS_AOT_OFF_CTX_TA_LEN_EPOCH %uu\n"
           "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
           "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
@@ -1964,7 +1965,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_object_flags16,
           lay.object_extensible_mask, lay.object_noadd_mask,
           lay.object_inline_cap_mask, lay.object_inline_cap_shift, lay.off_rope_left,
-          lay.off_rope_right);
+          lay.off_rope_right, lay.off_ctx_ta_len_epoch);
       fclose(lf);
     }
 
@@ -3094,7 +3095,7 @@ int qjsaot_driver_main(int argc, char **argv) {
            structural -- class, fast array, not holey -- and the value comes from
            the length property itself, which is prop[0] for every array. */
         "static inline __attribute__((always_inline)) int "
-        "q2_array_length(JSValue v, double *out)\n"
+        "q2_array_length(JSContext *ctx, JSValue v, double *out)\n"
         "{\n"
         "  const unsigned char *p, *prop;\n"
         "  JSValue len;\n"
@@ -3109,10 +3110,27 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0;\n"
         "  p = (const unsigned char *)JS_VALUE_GET_PTR(v);\n"
-        "  /* a typed array's length is an accessor the engine validates (own and\n"
-        "     inherited shadows, the getter's identity): the step answers it */\n"
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
-        "      QJS_AOT_CLASS_ARRAY) return 0;\n"
+        "      QJS_AOT_CLASS_ARRAY) {\n"
+        "    /* a typed array's length is the standard accessor: the instance has no own\n"
+        "       property, its prototype is the realm's class prototype, and the engine has\n"
+        "       validated the accessor at the current watchpoint epoch */\n"
+        "    unsigned cid = *(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID);\n"
+        "    const unsigned char *sh;\n"
+        "    JSValue pv;\n"
+        "    if (cid < QJS_AOT_CLASS_UINT8C_ARRAY || cid > QJS_AOT_CLASS_FLOAT64_ARRAY) return 0;\n"
+        "    sh = *(const unsigned char *const *)(p + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+        "    if (*(const int *)(sh + QJS_AOT_OFF_JSSHAPE_PROP_COUNT) != 0) return 0;\n"
+        "    pv = (*(JSValue *const *)((const unsigned char *)ctx + QJS_AOT_OFF_CTX_CLASS_PROTO))[cid];\n"
+        "    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT ||\n"
+        "        *(const void *const *)(sh + QJS_AOT_OFF_JSSHAPE_PROTO) != JS_VALUE_GET_PTR(pv)) return 0;\n"
+        "    if (__builtin_expect(*(const uint32_t *)((const unsigned char *)ctx + QJS_AOT_OFF_CTX_TA_LEN_EPOCH) !=\n"
+        "        *(const uint32_t *)(*(const unsigned char *const *)((const unsigned char *)ctx +\n"
+        "            QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_IC_EPOCH), 0) &&\n"
+        "        !qjs_aot_ta_len_valid(ctx)) return 0;\n"
+        "    *out = (double)*(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n"
+        "    return 1;\n"
+        "  }\n"
         "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
         "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
         "  prop = *(const unsigned char *const *)(p + "
