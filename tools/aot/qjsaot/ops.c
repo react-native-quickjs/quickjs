@@ -7066,7 +7066,14 @@ static void e_group_exit_stub(
 /* The test that sends a grouped access to its exit: the receiver must be an
    object of the group's shape (skipped when the facts already hold that), and
    this site's own cell must still say the same (a refill after entry would move
-   the offset). `write` selects the own-writable cell kind. */
+   the offset). `write` selects the own-writable cell kind.
+
+   Nothing is rechecked after a call or an op call. A safepoint drops every shape
+   fact, so no access after it skips its shape test, and every access compares its
+   OWN cell against the group's shape and reads its offset from that same cell, never
+   from an entry-time local: a cell that was refilled or emptied meanwhile makes the
+   access miss, it cannot make it use another shape's slot. Keep it that way: an
+   access that read its offset early but tested the current cell would be unsound. */
 static void e_group_test(
     char *out, size_t n, int skip, const char *recv, int g, int site,
     int write) {
