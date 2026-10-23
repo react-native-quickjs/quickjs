@@ -803,6 +803,7 @@ static int why_tagged(
 int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   uint8_t *w = NULL;
   uint8_t *fixed = NULL;
+  uint8_t *narrowed = NULL, *banned = NULL;
   int nv, i, b, k, pass, changed;
 
   memset(out, 0, sizeof(*out));
@@ -819,11 +820,23 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   out->live = calloc((size_t)nv, 1);
   w = calloc((size_t)nv, 1);
   fixed = calloc((size_t)nv, 1);
+  narrowed = calloc((size_t)nv, 1);
+  banned = calloc((size_t)nv, 1);
+  if (narrowed == NULL || banned == NULL) {
+    free(w);
+    free(fixed);
+    free(narrowed);
+    free(banned);
+    e_types_free(out);
+    return -1;
+  }
   if (out->lb == NULL || out->spec == NULL || out->exits == NULL ||
       out->why == NULL || out->whyv == NULL || out->arith == NULL ||
       w == NULL || fixed == NULL) {
     free(w);
     free(fixed);
+    free(narrowed);
+    free(banned);
     e_types_free(out);
     return -1;
   }
@@ -957,7 +970,7 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   /* ---- the join fixpoint over the blocks in reverse postorder ---- */
   {
   int round;
-  for (round = 0; round < 4; round++) {
+  for (round = 0; round < 8; round++) {
   for (pass = 0; pass < fn->nblocks + 8; pass++) {
     changed = 0;
     for (b = 0; b < fn->nblocks; b++) {
@@ -1021,6 +1034,21 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
      and the fixpoint is then run again from nothing with these values fixed. */
   {
     int added = 0;
+    /* A narrowed copy whose source has meanwhile become a number is not a copy of a boxed value
+       any more: it is given up, and the fixpoint runs again without it. */
+    for (i = 0; i < fn->ninsns; i++) {
+      const Q2Insn *in = &fn->insns[i];
+      Q2ValueId v;
+      if ((in->rop != ROP_move && in->rop != ROP_move_s) || in->op != Q2_OP_MOVE) continue;
+      if (in->ndef != 1 || in->nuse != 1) continue;
+      v = in->def[0];
+      if (!narrowed[v] || w[in->use[0]] == E_LB_TAG) continue;
+      narrowed[v] = 0;
+      banned[v] = 1;
+      fixed[v] = 0;
+      out->spec[v] = 0;
+      added++;
+    }
     for (i = 0; i < fn->ninsns && getenv("QJS_AOT_NOMOVENARROW") == NULL; i++) {
       const Q2Insn *in = &fn->insns[i];
       Q2ValueId v;
@@ -1029,12 +1057,13 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
       if (in->ndef != 1 || in->nuse != 1 || in->own != 0 || in->vk != 0) continue;
       if (facts != NULL && facts->fwd[i] != Q2_NO_VALUE) continue;
       v = in->def[0];
-      if (fixed[v] || in->use[0] >= (Q2ValueId)nv || w[in->use[0]] != E_LB_TAG) continue;
+      if (fixed[v] || banned[v] || in->use[0] >= (Q2ValueId)nv || w[in->use[0]] != E_LB_TAG) continue;
       if (!fn->values[v].has_prof) continue;
       lbn = lb_from_q2_types(fn->values[v].ptypes, 1);
       if (lbn != E_LB_I32 && lbn != E_LB_F64 && lbn != E_LB_BOOL) continue;
       w[v] = (uint8_t)lbn;
       fixed[v] = 1;
+      narrowed[v] = 1;
       out->spec[v] = 1;
       added++;
       if (getenv("QJS_AOT_DEBUG_NARROW") != NULL)
@@ -1132,6 +1161,8 @@ int e_types_run(const Q2Func *fn, const EFacts *facts, ETypes *out) {
   }
   free(w);
   free(fixed);
+  free(narrowed);
+  free(banned);
   e_ranges_run(fn, out);
   return 0;
 }
