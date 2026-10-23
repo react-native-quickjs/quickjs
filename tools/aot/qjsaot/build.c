@@ -1843,18 +1843,15 @@ static int q2_apply_rewrites(
         m->vk = Q2_VK_GET;
         m->vweb = (uint8_t)(r->web + 1);
         m->varg = (int8_t)r->arg;
+      } else if (r->kind == Q2_RW_PROTO) {
+        /* a method read from the object's prototype: the read stays, on an object that is not made */
+        Q2Insn *m = &out[nout++];
+        *m = *in;
+        m->vk = Q2_VK_PROTO;
+        m->vweb = (uint8_t)(r->web + 1);
       } else {
         out[nout++] = *in;
       }
-    }
-  }
-  /* a return reads the web registers */
-  for (i = 0; i < nout; i++) {
-    Q2Insn *in = &out[i];
-    if (in->op != Q2_OP_RETURN && in->op != Q2_OP_RETURN_UNDEF) continue;
-    for (w = 0; w < nwebs; w++) {
-      for (k = 0; k <= f->vweb[w].nargs && in->nuse < 8; k++)
-        in->use[in->nuse++] = (Q2ValueId)(k < f->vweb[w].nargs ? f->vweb[w].areg[k] : f->vweb[w].creg);
     }
   }
 #undef Q2_SYN
@@ -2011,7 +2008,15 @@ int q2_build_ea(
     f->ninsns = nn;
   }
 
-  if (ninl > 0 && q2_apply_inlines(f, g, inl, ninl) < 0) return -1;
+  if (ninl > 0) {
+    /* the copies' registers end where the objects' registers begin */
+    int32_t full = f->nregs;
+    int rc2;
+    f->nregs = vreg_base;
+    rc2 = q2_apply_inlines(f, g, inl, ninl);
+    f->nregs = full;
+    if (rc2 < 0) return -1;
+  }
   if (nwebs > 0 && q2_apply_rewrites(f, g, webs, nwebs, rw, nrw, vreg_base) < 0) return -1;
 
   /* 2. block starts: pc 0, every branch target, and after a terminator */
@@ -2263,6 +2268,16 @@ int q2_build_ea(
           for (m = 0; m < in2->win_n; m++) {
             int r = in2->win_reg + m;
             cur[r >> 6] |= 1ull << (r & 63);
+          }
+          /* the registers of the objects that are not made are read by every way out: they are
+             defined on entry, and an exit builds an object from them */
+          if ((in2->op == Q2_OP_RETURN || in2->op == Q2_OP_RETURN_UNDEF) && f->vweb != NULL) {
+            int w2, k2;
+            for (w2 = 0; w2 < f->nvweb; w2++)
+              for (k2 = 0; k2 <= f->vweb[w2].nargs; k2++) {
+                int r = k2 < f->vweb[w2].nargs ? f->vweb[w2].areg[k2] : f->vweb[w2].creg;
+                cur[r >> 6] |= 1ull << (r & 63);
+              }
           }
           /* the registers a copied callee's call reads: the copy can leave for the call */
           if (in2->own > 0 && f->inl != NULL)

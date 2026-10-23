@@ -743,12 +743,13 @@ static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
 /* A global read the profile executed: the cache cell either hits or the body leaves at the
    read (the generic body does the lookup, which can throw or run a getter), so it is no
    safepoint. */
+static int e_facts_virtual_planning;
 static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   int ns = 0;
   uint64_t shapes[4];
   if (in->rop != ROP_get_global || in->narg < 4 || in->arg[3].kind != 's' ||
       (unsigned)in->arg[3].val == REG_IC_NONE ||
-      qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) == 0 || getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
+      getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
     return 0;
   /* Filled at exactly one generation of the global object in the profiled run: the cell holds
      unless the global object changes, which that run did not see. */
@@ -759,6 +760,8 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   }
   /* A site that ran many times and was filled only a couple of times saw the global object
      change at startup, not in its steady state. */
+  if (ns == 1 && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) == 0 && fn->nvweb == 0 && !e_facts_virtual_planning)
+    return 0; /* (the profile has no sample here; with unmade objects a cold read leaves the same way) */
   return ns == 1 || (ns <= 3 && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) >= 16384);
 }
 
@@ -1604,9 +1607,15 @@ done:
 const JSAotGenFunc *qjs_aot_unit_func(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
 
+int e_inline_allow_construct = 1;
+typedef struct CtorSum {
+  int nfields, atom[8], argidx[8], site[8], nparams;
+} CtorSum;
+static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc **cg_out, CtorSum *sum);
+
 static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
   Q2Func cf;
-  int i, ok = 1;
+  int i, ok = 1, has_ctor = 0;
   if (cg->func_kind != 0 || cg->ctl_count != 0 || cg->light_var_count != 0 || cg->arg_count > 6 ||
       cg->len > 400)
     return 0;
@@ -1615,8 +1624,26 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
     return 0;
   }
   if (cf.ninsns > 70) ok = 0;
+  for (i = 0; ok && i < cf.ninsns; i++)
+    if (cf.insns[i].rop == ROP_construct) has_ctor = 1;
   for (i = 0; ok && i < cf.ninsns; i++) {
     const Q2Insn *in = &cf.insns[i];
+    /* A copy may build an object of a plain constructor: the copy is kept only if that object is
+       never made (see e_plan_virtual), so its constructor must be one that can be. */
+    if (in->rop == ROP_get_global) {
+      int saved = e_facts_virtual_planning, gok;
+      e_facts_virtual_planning = 1;
+      gok = global_exit_ok(&cf, in);
+      e_facts_virtual_planning = saved;
+      if (!e_inline_allow_construct || !has_ctor || !gok) ok = 0;
+      continue;
+    }
+    if (in->rop == ROP_construct) {
+      const JSAotGenFunc *cg2;
+      CtorSum sm;
+      if (!e_inline_allow_construct || !ctor_candidate(&cf, in, &cg2, &sm)) ok = 0;
+      continue;
+    }
     switch (in->op) {
       case Q2_OP_CONST:
       case Q2_OP_MOVE:
@@ -1675,9 +1702,11 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
     if (!qjs_aot_unit_has(hex[0])) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  not in unit\n"); continue; }
     cg = qjs_aot_unit_func(hex[0]);
     if (cg == NULL || cg == fn->g || memcmp(cg->digest, fn->g->digest, 16) == 0) continue;
-    for (k = 0; k < n; k++)
-      if ((*out)[k].g == cg) break;
-    if (k < n) continue;
+    if (getenv("QJS_AOT_INLDEDUP") != NULL) {
+      for (k = 0; k < n; k++)
+        if ((*out)[k].g == cg) break;
+      if (k < n) continue;
+    }
     if (!inl_callee_ok(cg, in->rop == ROP_call_method)) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok\n", cg->name); continue; }
     q = realloc(*out, sizeof(**out) * (size_t)(n + 1));
     if (q == NULL) return n;
@@ -1693,10 +1722,6 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
    `new C(a, b)` where C only stores its parameters into fields of `this` makes an object that is its
    arguments: when every use of it is a read of one of those fields, a copy, or a join with another such
    object, the object is never made. See q2_apply_rewrites. */
-typedef struct CtorSum {
-  int nfields, atom[8], argidx[8], site[8], nparams;
-} CtorSum;
-
 static int ctor_summary(const JSAotGenFunc *cg, CtorSum *out) {
   Q2Func cf;
   int i, ok = 1, kind[512], nreg;
@@ -1768,33 +1793,77 @@ static int ctor_summary(const JSAotGenFunc *cg, CtorSum *out) {
   return ok && out->nfields > 0;
 }
 
+/* A construct of a plain constructor the profile saw with one target: the target and what it does. */
+static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc **cg_out, CtorSum *sum) {
+  char hex[4][33];
+  int kind[4], cnt = 0;
+  unsigned long long hits[4];
+  const JSAotGenFunc *cg;
+  if (ci->rop != ROP_construct || ci->ndef != 1 || ci->nuse < 2 || ci->win_n > 8) return 0;
+  if (ci->use[0] != ci->use[1]) return 0; /* new.target is the constructor */
+  if (!qjs_aot_prof_callees(e_dg(fn, ci), ci->onext, &cnt, hex, kind, hits) || cnt != 1 || kind[0] != 1) return 0;
+  if (!qjs_aot_unit_has(hex[0])) return 0;
+  cg = qjs_aot_unit_func(hex[0]);
+  if (cg == NULL || !ctor_summary(cg, sum) || sum->nparams > 8) return 0;
+  *cg_out = cg;
+  return 1;
+}
+
 typedef struct UseRef {
   int insn;  /* the instruction, or -1 for a block-edge use */
   int slot;  /* operand slot / edge index */
   int param; /* for an edge use, the receiving parameter's value */
 } UseRef;
 
+static int uf_find(int *p, int x) {
+  while (p[x] != x) {
+    p[x] = p[p[x]];
+    x = p[x];
+  }
+  return x;
+}
+
+static int rw_push(Q2Rewrite **rw, int *nrw, int *caprw, int kind, int pc, int web, int arg) {
+  if (*nrw == *caprw) {
+    int nc = *caprw ? *caprw * 2 : 16;
+    Q2Rewrite *q = realloc(*rw, sizeof(**rw) * (size_t)nc);
+    if (q == NULL) return -1;
+    *rw = q;
+    *caprw = nc;
+  }
+  (*rw)[*nrw].kind = kind;
+  (*rw)[*nrw].pc = pc;
+  (*rw)[*nrw].web = web;
+  (*rw)[*nrw].arg = arg;
+  (*nrw)++;
+  return 0;
+}
+
 int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrite **rw_out, int *nrw_out) {
   EFacts facts;
-  int nv = fn->nvalues, i, k, c, nweb = 0, nrw = 0, caprw = 0, ret = 0;
+  int nv = fn->nvalues, i, k, c, j, nweb = 0, nrw = 0, caprw = 0, ret = 0, dbg, pass, changed;
+  uint8_t *isreal = NULL;
   UseRef **uses = NULL;
-  int *nuses = NULL, *capuses = NULL;
-  uint8_t *inweb = NULL, *claimed = NULL;
+  int *nuses = NULL, *capuses = NULL, *uf = NULL, *candof = NULL, *memlist = NULL, *claimed_root = NULL;
   Q2VWeb *webs = NULL;
   Q2Rewrite *rw = NULL;
+  CtorSum *sums = NULL;
+  const JSAotGenFunc **cgs = NULL;
+  int ncand = 0;
   *webs_out = NULL;
   *nwebs_out = 0;
   *rw_out = NULL;
   *nrw_out = 0;
   if (getenv("QJS_AOT_NOVIRT") != NULL || nv <= 0) return 0;
-  if (getenv("QJS_AOT_DEBUG_VIRT") != NULL) fprintf(stderr, "virt: planning %s\n", fn->g->name);
+  dbg = getenv("QJS_AOT_DEBUG_VIRT") != NULL;
   memset(&facts, 0, sizeof(facts));
   {
     int saved = e_facts_pure_ok;
     e_facts_pure_ok = 0;
+    e_facts_virtual_planning = 1;
     if (e_facts_run(fn, &facts, 1) < 0) {
-      if (getenv("QJS_AOT_DEBUG_VIRT") != NULL) fprintf(stderr, "virt: facts failed\n");
       e_facts_pure_ok = saved;
+      e_facts_virtual_planning = 0;
       return 0;
     }
     e_facts_pure_ok = saved;
@@ -1802,9 +1871,18 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
   uses = calloc((size_t)nv, sizeof(*uses));
   nuses = calloc((size_t)nv, sizeof(int));
   capuses = calloc((size_t)nv, sizeof(int));
-  inweb = calloc((size_t)nv, 1);
-  claimed = calloc((size_t)nv, 1);
-  if (!uses || !nuses || !capuses || !inweb || !claimed) goto done;
+  uf = malloc(sizeof(int) * (size_t)nv);
+  candof = malloc(sizeof(int) * (size_t)nv);
+  memlist = malloc(sizeof(int) * (size_t)nv);
+  claimed_root = calloc((size_t)nv, sizeof(int));
+  sums = calloc((size_t)fn->ninsns + 1, sizeof(*sums));
+  cgs = calloc((size_t)fn->ninsns + 1, sizeof(*cgs));
+  isreal = calloc((size_t)fn->ninsns + 1, 1);
+  if (!uses || !nuses || !capuses || !uf || !candof || !memlist || !claimed_root || !sums || !cgs || !isreal) goto done;
+  for (i = 0; i < nv; i++) {
+    uf[i] = i;
+    candof[i] = -1;
+  }
 #define ADD_USE(val_, ins_, slot_, par_)                                                       \
   do {                                                                                          \
     Q2ValueId vv_ = (val_);                                                                     \
@@ -1827,6 +1905,11 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
     for (k = 0; k < in->nuse; k++) ADD_USE(in->use[k], i, k, -1);
     for (k = 0; k < in->win_n; k++) ADD_USE(in->win_val[k], i, 100 + k, -1);
     for (k = 0; k < in->nredef; k++) ADD_USE(in->redef_val[k], i, 200 + k, -1);
+    if ((in->rop == ROP_move || in->rop == ROP_move_s || in->rop == ROP_move_xfer) && in->ndef == 1 && in->nuse >= 1 &&
+        in->vk == 0) {
+      int a = uf_find(uf, (int)in->use[0]), b = uf_find(uf, (int)in->def[0]);
+      if (a != b) uf[a] = b;
+    }
   }
   for (i = 0; i < fn->nblocks; i++) {
     const Q2Block *b = &fn->blocks[i];
@@ -1837,163 +1920,198 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
         Q2ValueId av = b->edge_arg[n][k];
         if (av == Q2_NO_VALUE) continue;
         ADD_USE(av, -1, n, sb != NULL && k < sb->nparams ? (int)sb->param_val[k] : -1);
+        if (sb != NULL && k < sb->nparams) {
+          int a = uf_find(uf, (int)av), bb = uf_find(uf, (int)sb->param_val[k]);
+          if (a != bb) uf[a] = bb;
+        }
       }
     }
   }
-  for (c = 0; c < fn->ninsns && nweb < 4; c++) {
+  /* the constructs that could be virtual */
+  for (c = 0; c < fn->ninsns; c++) {
     const Q2Insn *ci = &fn->insns[c];
-    char hex[4][33];
-    int kind[4], cnt = 0;
-    unsigned long long hits[4];
     const JSAotGenFunc *cg;
-    CtorSum sum;
-    int stack[256], sp = 0, ok = 1, nmem = 0, mem[256], j;
-    int first_rw = nrw;
-    int dbg = getenv("QJS_AOT_DEBUG_VIRT") != NULL;
-    if (ci->rop != ROP_construct || ci->ndef != 1 || ci->nuse < 2 || ci->win_n > 8) continue;
-    if (dbg) fprintf(stderr, "virt: construct at pc %d\n", (int)ci->pc);
-    if (claimed[ci->def[0]]) { if (dbg) fprintf(stderr, "virt: claimed\n"); continue; }
-    if (ci->use[0] != ci->use[1]) { if (dbg) fprintf(stderr, "virt: new.target differs\n"); continue; } /* new.target is the constructor */
-    if (!qjs_aot_prof_callees(e_dg(fn, ci), ci->onext, &cnt, hex, kind, hits) || cnt != 1 || kind[0] != 1) {
-      if (dbg) fprintf(stderr, "virt: callees cnt=%d\n", cnt);
+    if (ci->rop != ROP_construct || ci->ndef != 1) continue;
+    if (!ctor_candidate(fn, ci, &cg, &sums[ncand])) {
+      if (dbg) fprintf(stderr, "virt: construct at pc %d own %d is not a candidate\n", (int)ci->pc, (int)ci->own);
       continue;
     }
-    if (!qjs_aot_unit_has(hex[0])) { if (dbg) fprintf(stderr, "virt: callee not in unit\n"); continue; }
-    cg = qjs_aot_unit_func(hex[0]);
-    if (cg == NULL || !ctor_summary(cg, &sum)) { if (dbg) fprintf(stderr, "virt: ctor summary failed\n"); continue; }
-    if (dbg) fprintf(stderr, "virt: summary nparams=%d nfields=%d\n", sum.nparams, sum.nfields);
-    if (sum.nparams > 8) continue;
-    /* the web: the object and everything it is copied or joined into */
-    stack[sp++] = (int)ci->def[0];
-    inweb[ci->def[0]] = 1;
-    mem[nmem++] = (int)ci->def[0];
-    while (sp > 0 && ok) {
-      int x = stack[--sp];
+    if (dbg) fprintf(stderr, "virt: candidate construct at pc %d own %d\n", (int)ci->pc, (int)ci->own);
+    cgs[ncand] = cg;
+    candof[ci->def[0]] = ncand;
+    ncand++;
+  }
+  /* A web is judged with the constructs of the other candidate webs taken as not allocating; a
+     candidate whose web fails is real from then on, and the webs are judged again until none changes. */
+  for (pass = 0; pass < 8; pass++) {
+  changed = 0;
+  nweb = 0;
+  nrw = 0;
+  free(webs);
+  webs = NULL;
+  memset(claimed_root, 0, sizeof(int) * (size_t)nv);
+  for (c = 0; c < fn->ninsns; c++) {
+    const Q2Insn *ci = &fn->insns[c];
+    int root, nmem = 0, ok = 1, first_rw = nrw, nc2 = 0, cands[16], cc0 = -1, m;
+    if (ci->rop != ROP_construct || ci->ndef != 1 || candof[ci->def[0]] < 0) continue;
+    root = uf_find(uf, (int)ci->def[0]);
+    if (claimed_root[root]) continue;
+    claimed_root[root] = 1;
+    if (isreal[candof[ci->def[0]]]) continue;
+    for (m = 0; m < nv; m++)
+      if (uf_find(uf, m) == root) memlist[nmem++] = m;
+    /* what makes each member: a candidate construct of the one constructor, a copy, or a join */
+    for (j = 0; ok && j < nmem; j++) {
+      const Q2Value *mv = &fn->values[memlist[j]];
+      if (mv->insn < 0) continue; /* a block parameter */
+      {
+        const Q2Insn *di = &fn->insns[mv->insn];
+        if ((di->rop == ROP_move || di->rop == ROP_move_s || di->rop == ROP_move_xfer) && di->vk == 0) continue;
+        if (di->rop == ROP_construct && candof[memlist[j]] >= 0) {
+          if (cc0 < 0) cc0 = candof[memlist[j]];
+          if (cgs[candof[memlist[j]]] != cgs[cc0] || nc2 >= 16) ok = 0;
+          else cands[nc2++] = mv->insn;
+        } else {
+          ok = 0;
+          if (dbg) {
+            char nm[64];
+            e_rop_name(di->rop, nm, sizeof(nm));
+            fprintf(stderr, "virt:   member %d defined by %s at pc %d\n", memlist[j], nm, (int)di->pc);
+          }
+        }
+      }
+    }
+    if (dbg) fprintf(stderr, "virt: web at pc %d: members=%d constructs=%d ok=%d\n", (int)ci->pc, nmem, nc2, ok);
+    /* what each member is used for */
+    for (j = 0; ok && j < nmem; j++) {
+      int x = memlist[j];
       for (k = 0; k < nuses[x] && ok; k++) {
         const UseRef *u = &uses[x][k];
-        int add = -1;
-        if (u->insn < 0) {
-          add = u->param;
-          if (add < 0) ok = 0;
+        const Q2Insn *ui;
+        if (u->insn < 0) continue; /* an edge into a member join: in the web */
+        ui = &fn->insns[u->insn];
+        if (ui->rop == ROP_move_xfer) continue; /* (a copy that empties its source) */
+        if (ui->vk != 0) {
+          ok = 0;
+        } else if ((ui->rop == ROP_move || ui->rop == ROP_move_s) && ui->ndef == 1 && u->slot == 0) {
+          continue;
+        } else if (ui->inlg) {
+          continue; /* the guard of a copied callee: the copy reads the object as the receiver or an argument */
+        } else if ((ui->rop == ROP_get_field || ui->rop == ROP_get_field_own || ui->rop == ROP_get_field2 ||
+                    ui->rop == ROP_get_field2_own) &&
+                   ui->nuse >= 1 && u->slot == 0 && ui->ndef == 1 && ui->narg >= 3) {
+          int found = -1, site = -1, sa;
+          const CtorSum *sm = &sums[cc0];
+          for (sa = 0; sa < sm->nfields; sa++)
+            if (sm->atom[sa] == (int)ui->arg[2].val) found = sa;
+          for (sa = 0; sa < ui->narg; sa++)
+            if (ui->arg[sa].kind == 's') site = (int)ui->arg[sa].val;
+          if (found >= 0) {
+            if (rw_push(&rw, &nrw, &caprw, Q2_RW_GET, ui->pc, nweb, sm->argidx[found]) < 0) goto done;
+          } else if (site >= 0 && e_facts_site_group(&facts, site) >= 0 && e_facts_site_proto(&facts, site) == 1) {
+            if (rw_push(&rw, &nrw, &caprw, Q2_RW_PROTO, ui->pc, nweb, 0) < 0) goto done;
+          } else {
+            ok = 0;
+          }
         } else {
-          const Q2Insn *ui = &fn->insns[u->insn];
-          if (ui->op == Q2_OP_MOVE && (ui->rop == ROP_move || ui->rop == ROP_move_s) && ui->ndef == 1 && u->slot == 0)
-            add = (int)ui->def[0];
-          else if ((ui->rop == ROP_get_field || ui->rop == ROP_get_field_own) && ui->nuse >= 1 && u->slot == 0 &&
-                   ui->ndef == 1 && ui->narg >= 3) {
-            int found = -1;
-            for (j = 0; j < sum.nfields; j++)
-              if (sum.atom[j] == (int)ui->arg[2].val) found = j;
-            if (found < 0) {
-              ok = 0;
-            } else {
-              if (nrw == caprw) {
-                int nc = caprw ? caprw * 2 : 16;
-                Q2Rewrite *q = realloc(rw, sizeof(*q) * (size_t)nc);
-                if (q == NULL) goto done;
-                rw = q;
-                caprw = nc;
-              }
-              rw[nrw].kind = Q2_RW_GET;
-              rw[nrw].pc = ui->pc;
-              rw[nrw].web = nweb;
-              rw[nrw].arg = sum.argidx[found];
-              nrw++;
-            }
-          } else {
-            ok = 0;
-          }
+          ok = 0;
         }
-        if (ok && add >= 0 && !inweb[add]) {
-          if (sp >= 256 || nmem >= 256) {
-            ok = 0;
-          } else {
-            inweb[add] = 1;
-            stack[sp++] = add;
-            mem[nmem++] = add;
-          }
+        if (!ok && dbg) {
+          char nm[64];
+          e_rop_name(ui->rop, nm, sizeof(nm));
+          fprintf(stderr, "virt:   use of value %d (reg %d) by %s at pc %d own %d slot %d\n", x, fn->values[x].reg, nm, (int)ui->pc, (int)ui->own, u->slot);
         }
       }
     }
-    /* a join must be fed only by members */
-    for (i = 0; ok && i < fn->nblocks; i++) {
-      const Q2Block *b = &fn->blocks[i];
-      for (k = 0; k < b->nparams && ok; k++) {
-        int pv = (int)b->param_val[k], n, e;
-        if (!inweb[pv]) continue;
-        for (e = 0; e < b->npreds && ok; e++) {
-          const Q2Block *pb = &fn->blocks[b->preds[e]];
-          for (n = 0; n < pb->nsucc; n++)
-            if (pb->succ_block[n] == i && k < pb->nedge_args[n] && pb->edge_arg[n][k] != Q2_NO_VALUE &&
-                !inweb[pb->edge_arg[n][k]])
-              ok = 0;
-        }
-      }
-    }
-    /* a member's register must not hold an earlier object of the web where the construct runs:
-       the exit would build it from the arguments of this one */
+    if (dbg) fprintf(stderr, "virt: web at pc %d: uses ok=%d\n", (int)ci->pc, ok);
+    /* no safepoint while a member is live: a register of a member is not live across one */
     for (j = 0; ok && j < nmem; j++) {
-      int r = fn->values[mem[j]].reg;
-      const uint64_t *lb;
-      uint64_t tmp[64];
-      if (r < 0 || r >= fn->nregs || fn->lwords > 64) continue;
-      memset(tmp, 0, sizeof(tmp));
-      q2_live_before(fn, c, tmp);
-      lb = tmp;
-      if ((lb[r >> 6] >> (r & 63)) & 1) ok = 0;
-    }
-    /* constructs in the web: only the one this web was started from (one object at a time) */
-    for (j = 0; ok && j < nmem; j++) {
-      const Q2Value *mv = &fn->values[mem[j]];
-      if (mv->insn >= 0 && fn->insns[mv->insn].rop == ROP_construct && mem[j] != (int)ci->def[0]) ok = 0;
-    }
-    /* no safepoint while a member is live: registers of members are not live across one */
-    for (j = 0; ok && j < nmem; j++) {
-      int r = fn->values[mem[j]].reg;
+      int r = fn->values[memlist[j]].reg;
       if (r < 0 || r >= fn->nregs) continue;
       for (i = 0; ok && i < fn->ninsns; i++) {
         const uint64_t *lo = q2_live_out(fn, i);
-        if (((lo[r >> 6] >> (r & 63)) & 1) && fn->insns[i].inlg == 0 && i != c) {
-          const Q2Insn *si = &fn->insns[i];
-          if (si->rop != ROP_return && si->rop != ROP_return_undefined && is_safepoint(fn, &facts, si, 1)) ok = 0;
+        const Q2Insn *si = &fn->insns[i];
+        if (!((lo[r >> 6] >> (r & 63)) & 1) || si->inlg || si->rop == ROP_return || si->rop == ROP_return_undefined)
+          continue;
+        if (si->rop == ROP_construct && candof[si->def[0]] >= 0 && !isreal[candof[si->def[0]]]) continue;
+        if (is_safepoint(fn, &facts, si, 1)) {
+          if (dbg) {
+            char nm[64];
+            e_rop_name(si->rop, nm, sizeof(nm));
+            fprintf(stderr, "virt: web at pc %d: safepoint %s at pc %d own %d with reg %d live\n", (int)ci->pc, nm, (int)si->pc, (int)si->own, r);
+          }
+          ok = 0;
         }
       }
     }
-    if (dbg) fprintf(stderr, "virt: web ok=%d nfields=%d nmem=%d\n", ok, sum.nfields, nmem);
-    if (!ok || sum.nfields <= 0) {
-      for (j = 0; j < nmem; j++) inweb[mem[j]] = 0;
+    /* the objects of the web share its argument registers: at a construct no other object of the
+       web may still be needed */
+    for (j = 0; ok && j < nc2; j++) {
+      const Q2Insn *cj = &fn->insns[cands[j]];
+      int defreg = fn->values[cj->def[0]].reg;
+      int endi = cands[j];
+      const uint64_t *lo;
+      uint8_t over[512];
+      memset(over, 0, sizeof(over));
+      if (cj->own) {
+        /* In a copied callee the registers the call reads stay live to the end of the copy (an exit
+           inside it leaves for the call), so the object is judged where the copy ends; nothing after
+           the construct in the copy may then leave. */
+        int q3;
+        for (q3 = cands[j] + 1; q3 < fn->ninsns && fn->insns[q3].own == cj->own; q3++) {
+          const Q2Insn *ti = &fn->insns[q3];
+          if (ti->rop != ROP_move && ti->rop != ROP_move_s && ti->rop != ROP_load_undefined && ti->rop != ROP_branch) {
+            if (dbg) fprintf(stderr, "virt: web at pc %d: the copy leaves after the construct at pc %d\n", (int)ci->pc, (int)cj->pc);
+            ok = 0;
+          }
+          for (m = 0; m < ti->ndef; m++) {
+            int dr = fn->values[ti->def[m]].reg;
+            if (dr >= 0 && dr < 512) over[dr] = 1;
+          }
+          endi = q3;
+        }
+      }
+      lo = q2_live_out(fn, endi);
+      for (m = 0; ok && m < nmem; m++) {
+        int r = fn->values[memlist[m]].reg;
+        if (memlist[m] == (int)cj->def[0] || r < 0 || r >= fn->nregs || r == defreg) continue;
+        if (r < 512 && over[r]) continue;
+        if ((lo[r >> 6] >> (r & 63)) & 1) {
+          if (dbg) fprintf(stderr, "virt: web at pc %d: another object (value %d reg %d, defreg %d) is live after the construct at pc %d (end insn pc %d)\n", (int)ci->pc, memlist[m], r, defreg, (int)cj->pc, (int)fn->insns[endi].pc);
+          ok = 0;
+        }
+      }
+    }
+    if (ok && nweb >= 8) ok = 0;
+    if (!ok) {
       nrw = first_rw;
+      for (m = 0; m < nv; m++)
+        if (candof[m] >= 0 && uf_find(uf, m) == root && !isreal[candof[m]]) {
+          isreal[candof[m]] = 1;
+          changed = 1;
+        }
       continue;
     }
-    for (j = 0; j < nmem; j++) claimed[mem[j]] = 1;
     {
       Q2VWeb *q = realloc(webs, sizeof(*q) * (size_t)(nweb + 1));
+      const CtorSum *sm = &sums[cc0];
       if (q == NULL) goto done;
       webs = q;
       memset(&webs[nweb], 0, sizeof(webs[nweb]));
-      webs[nweb].ctor = cg;
-      webs[nweb].nargs = ci->win_n < sum.nparams ? sum.nparams : ci->win_n;
-      if (webs[nweb].nargs > 8) webs[nweb].nargs = 8;
-      for (j = 0; j < sum.nfields; j++) {
-        webs[nweb].atom[j] = sum.atom[j];
-        webs[nweb].argidx[j] = sum.argidx[j];
-        webs[nweb].site[j] = sum.site[j];
+      webs[nweb].ctor = cgs[cc0];
+      webs[nweb].nargs = sm->nparams;
+      for (j = 0; j < sm->nfields; j++) {
+        webs[nweb].atom[j] = sm->atom[j];
+        webs[nweb].argidx[j] = sm->argidx[j];
+        webs[nweb].site[j] = sm->site[j];
       }
-      webs[nweb].nfields = sum.nfields;
-      if (nrw == caprw) {
-        int nc = caprw ? caprw * 2 : 16;
-        Q2Rewrite *q2 = realloc(rw, sizeof(*q2) * (size_t)nc);
-        if (q2 == NULL) goto done;
-        rw = q2;
-        caprw = nc;
-      }
-      rw[nrw].kind = Q2_RW_CONSTRUCT;
-      rw[nrw].pc = ci->pc;
-      rw[nrw].web = nweb;
-      rw[nrw].arg = 0;
-      nrw++;
+      webs[nweb].nfields = sm->nfields;
+      for (j = 0; j < nc2; j++)
+        if (rw_push(&rw, &nrw, &caprw, Q2_RW_CONSTRUCT, fn->insns[cands[j]].pc, nweb, 0) < 0) goto done;
       nweb++;
     }
+  }
+  if (!changed) break;
   }
   *webs_out = webs;
   *nwebs_out = nweb;
@@ -2010,8 +2128,14 @@ done:
   free(uses);
   free(nuses);
   free(capuses);
-  free(inweb);
-  free(claimed);
+  free(uf);
+  free(candof);
+  free(memlist);
+  free(claimed_root);
+  free(sums);
+  free(cgs);
+  free(isreal);
+  e_facts_virtual_planning = 0;
   e_facts_free(&facts);
   return ret;
 }

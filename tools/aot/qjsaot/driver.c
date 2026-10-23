@@ -2854,6 +2854,14 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      *(const unsigned char *const *)(h + QJS_AOT_OFF_JSOBJECT_PROP);\n"
         "  return (JSValue *)(prop + off);\n"
         "}\n"
+        "static inline JSValue *q2_hslotp_sh(const void *sh, uint32_t off)\n"
+        "{\n"
+        "  const unsigned char *h = *(const unsigned char *const *)(\n"
+        "      (const unsigned char *)sh + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  const unsigned char *prop =\n"
+        "      *(const unsigned char *const *)(h + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+        "  return (JSValue *)(prop + off);\n"
+        "}\n"
         /* A holder two prototypes up: the cache entry sits in way 1 or above at index `ci`, its
            holder shape in holders[ci] and the middle object's shape in the second half. */
         "static inline const void *q2_cell2_shape(const void *pic, int site, int nsites)\n"

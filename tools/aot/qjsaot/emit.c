@@ -389,6 +389,74 @@ static int e_inline_typed_ok(const Q2Func *fn) {
   return ok;
 }
 
+/* The function the speculative body is emitted from, when it is not the program itself: its
+   loop-invariant global reads hoisted, hot calls to small callees replaced by copies of their
+   instructions, and objects of plain constructors that never escape left unmade. A copy that
+   builds an object is kept only if every such object is left unmade; otherwise the callees that
+   build objects are not copied. Returns 1 with *out built, 0 when the program is used as it is. */
+static int e_build_spec_fn(
+    const JSAotGenFunc *g, Q2Func *fn, int allow_ctor, Q2Func *out, char *msg, size_t msglen) {
+  Q2Extra *ex = NULL;
+  Q2InlReq *ir = NULL;
+  int nir, nex, have2 = 0, dbg = getenv("QJS_AOT_DEBUG_VIRT") != NULL;
+  Q2Func fn2;
+  e_inline_allow_construct = allow_ctor;
+  nir = e_plan_inline(fn, &ir);
+  nex = nir > 0 ? 0 : e_plan_licm(fn, &ex);
+  if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: %d hoists\n", g->name, nex);
+  if (nex > 0 || nir > 0) {
+    int st = 0;
+    if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 && (st = 2) &&
+        q2_verify(&fn2, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn2))
+      have2 = 1;
+    if (!have2) {
+      if (getenv("QJS_AOT_DEBUG_LICM") != NULL)
+        fprintf(stderr, "licm %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
+      q2_free(&fn2);
+    }
+  }
+  {
+    /* Objects of a plain constructor that never escape are not made. The plan reads the function
+       the speculative body would be built from, and the body is built again with the objects
+       rewritten. */
+    Q2VWeb *webs = NULL;
+    Q2Rewrite *rws = NULL;
+    int nwebs = 0, nrws = 0;
+    if (e_plan_virtual(have2 ? &fn2 : fn, &webs, &nwebs, &rws, &nrws) > 0 && nwebs > 0) {
+      Q2Func fn3;
+      int st = 0, ok3 = 0;
+      if (q2_build_ea(g, ex, nex, ir, nir, webs, nwebs, rws, nrws, &fn3) == 0 && (st = 1) && q2_infer(&fn3) == 0 &&
+          (st = 2) && q2_verify(&fn3, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn3))
+        ok3 = 1;
+      if (!ok3) {
+        if (dbg) fprintf(stderr, "virt %s: stage %d failed: %s %s\n", g->name, st, fn3.why ? fn3.why : "-", msg);
+        q2_free(&fn3);
+      } else {
+        if (dbg) fprintf(stderr, "virt %s: %d webs\n", g->name, nwebs);
+        if (have2) q2_free(&fn2);
+        fn2 = fn3;
+        have2 = 1;
+      }
+    }
+    free(webs);
+    free(rws);
+  }
+  free(ex);
+  free(ir);
+  if (have2 && allow_ctor) {
+    /* a copy that builds an object nobody removed would run an allocation without a frame behind it */
+    int i;
+    for (i = 0; i < fn2.ninsns; i++)
+      if (fn2.insns[i].own > 0 && fn2.insns[i].rop == ROP_construct && fn2.insns[i].vk != Q2_VK_DEF) {
+        if (dbg) fprintf(stderr, "virt %s: a copied constructor call stays; copying without constructors\n", g->name);
+        q2_free(&fn2);
+        return e_build_spec_fn(g, fn, 0, out, msg, msglen);
+      }
+  }
+  if (have2) *out = fn2;
+  return have2;
+}
+
 int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   Q2Func fn;
   char msg[256];
@@ -430,46 +498,10 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
         g->name[0] ? g->name : "?", rc);
   } else {
     /* The speculative body is built from the program with its loop-invariant global reads
-       moved before their loops; the generic body keeps the program as it is. */
+       moved before their loops, copies of small callees, and objects that never escape left
+       unmade; the generic body keeps the program as it is. */
     Q2Func fn2;
-    Q2Extra *ex = NULL;
-    Q2InlReq *ir = NULL;
-    int nir = e_plan_inline(&fn, &ir);
-    int nex = nir > 0 ? 0 : e_plan_licm(&fn, &ex), have2 = 0;
-    if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: %d hoists\n", g->name, nex);
-    if (nex > 0 || nir > 0) {
-      int st = 0;
-      if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 && (st = 2) &&
-          q2_verify(&fn2, msg, sizeof(msg)) == 0 && (st = 3) && e_inline_typed_ok(&fn2))
-        have2 = 1;
-      if (!have2) {
-        if (getenv("QJS_AOT_DEBUG_LICM") != NULL)
-          fprintf(stderr, "licm %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
-        q2_free(&fn2);
-      }
-    }
-    if (!have2 && nex == 0 && nir == 0) {
-      Q2VWeb *webs = NULL;
-      Q2Rewrite *rws = NULL;
-      int nwebs = 0, nrws = 0;
-      if (e_plan_virtual(&fn, &webs, &nwebs, &rws, &nrws) > 0 && nwebs > 0) {
-        int st = 0;
-        if (q2_build_ea(g, NULL, 0, NULL, 0, webs, nwebs, rws, nrws, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 &&
-            (st = 2) && q2_verify(&fn2, msg, sizeof(msg)) == 0 && (st = 3) && e_inline_typed_ok(&fn2))
-          have2 = 1;
-        if (!have2) {
-          if (getenv("QJS_AOT_DEBUG_VIRT") != NULL)
-            fprintf(stderr, "virt %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
-          q2_free(&fn2);
-        } else if (getenv("QJS_AOT_DEBUG_VIRT") != NULL) {
-          fprintf(stderr, "virt %s: %d webs\n", g->name, nwebs);
-        }
-      }
-      free(webs);
-      free(rws);
-    }
-    free(ex);
-    free(ir);
+    int have2 = e_build_spec_fn(g, &fn, 1, &fn2, msg, sizeof(msg));
     rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
     /* An inline body of this function that exits through aot_nx_ needs its
        definition; a frameless body has emitted it already. */

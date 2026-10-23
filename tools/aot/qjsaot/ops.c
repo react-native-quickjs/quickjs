@@ -3106,6 +3106,7 @@ static void e_virt_compute(const Q2Func *fn) {
     const Q2Insn *in = &fn->insns[i];
     if (in->vk == Q2_VK_DEF && in->ndef == 1) {
       g_e_virt[in->def[0]] = in->vweb;
+      if (getenv("QJS_AOT_DEBUG_VIRT")) fprintf(stderr, "virt: value %d is the object of web %d (construct pc %d)\n", (int)in->def[0], in->vweb, in->pc);
       stack[sp++] = (int)in->def[0];
     }
   }
@@ -3116,6 +3117,7 @@ static void e_virt_compute(const Q2Func *fn) {
       if (in->op == Q2_OP_MOVE && in->vk == 0 && in->nuse >= 1 && in->use[0] == (Q2ValueId)x && in->ndef == 1 &&
           !g_e_virt[in->def[0]]) {
         g_e_virt[in->def[0]] = g_e_virt[x];
+        if (getenv("QJS_AOT_DEBUG_VIRT")) fprintf(stderr, "virt: value %d member of web %d via move %d (rop %d pc %d) of %d\n", (int)in->def[0], g_e_virt[x], j, in->rop, in->pc, x);
         stack[sp++] = (int)in->def[0];
       }
     }
@@ -3126,6 +3128,7 @@ static void e_virt_compute(const Q2Func *fn) {
         for (k = 0; sb != NULL && k < b->nedge_args[n] && k < sb->nparams; k++)
           if (b->edge_arg[n][k] == (Q2ValueId)x && !g_e_virt[sb->param_val[k]]) {
             g_e_virt[sb->param_val[k]] = g_e_virt[x];
+            if (getenv("QJS_AOT_DEBUG_VIRT")) fprintf(stderr, "virt: value %d member of web %d via edge of block %d from %d\n", (int)sb->param_val[k], g_e_virt[x], j, x);
             stack[sp++] = (int)sb->param_val[k];
           }
       }
@@ -3147,9 +3150,14 @@ static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
     return 0;
   vw = &g_e_virt_fn->vweb[g_e_virt[v] - 1];
   cv = g_e_stub_cur[vw->creg];
-  if (cv == Q2_NO_VALUE || cv == E_UNDEF || cv == E_INFRAME || cv >= (Q2ValueId)g_e_types->nvalues)
+  if (cv == Q2_NO_VALUE || cv == E_UNDEF || cv == E_INFRAME || cv >= (Q2ValueId)g_e_types->nvalues) {
+    if (getenv("QJS_AOT_DEBUG_VIRT"))
+      fprintf(stderr, "virt: object %u of web %d: constructor register %d holds %d at stub pc %d\n", (unsigned)v, (int)g_e_virt[v], vw->creg, (int)cv, g_e_stub_pc);
     snprintf(cexp, sizeof(cexp), "JS_UNDEFINED");
-  else
+  } else if (g_e_virt[cv]) {
+    fprintf(stderr, "qjsaot: virtual object %u: its constructor value %u is itself virtual\n", (unsigned)v, (unsigned)cv);
+    abort();
+  } else
     e_exit_expr(cexp, sizeof(cexp), cv);
   body[0] = 0;
   for (j = 0; j < vw->nfields; j++) {
@@ -3730,7 +3738,7 @@ static void e_emit_arm(
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
         Q2ValueId vv = t->in_val[q];
-        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        if (rr < 0 || rr >= fn->norig || vv == Q2_NO_VALUE) continue;
         e_exit_expr(
             ex, sizeof(ex), cur != NULL && cur[rr] != Q2_NO_VALUE ? cur[rr] : vv);
         fprintf(f, "              e_xl[%d] = %s;\n", nlv++, ex);
@@ -3739,7 +3747,7 @@ static void e_emit_arm(
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
         Q2ValueId vv = t->in_val[q];
-        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        if (rr < 0 || rr >= fn->norig || vv == Q2_NO_VALUE) continue;
         fprintf(f, " %d,", rr * 16);
       }
       fprintf(f, " 0 };\n");
@@ -3756,7 +3764,7 @@ static void e_emit_arm(
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
         Q2ValueId vv = t->in_val[q];
-        if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
+        if (rr < 0 || rr >= fn->norig || vv == Q2_NO_VALUE) continue;
         if (cur != NULL && cur[rr] != Q2_NO_VALUE) e_exit_store(f, cur[rr], rr);
         else e_exit_store(f, vv, rr);
       }
@@ -3974,8 +3982,10 @@ static int emit_typed_opcall(
 
   /* A copied callee has no step engine behind it. */
   if (in->own > 0) {
-    fprintf(stderr, "qjsaot: copied callee instruction at pc %d (rop %u) needs the step engine\n",
-            in->pc, (unsigned)in->rop);
+    char nm[64];
+    e_rop_name(in->rop, nm, sizeof(nm));
+    fprintf(stderr, "qjsaot: copied callee instruction %s at pc %d (rop %u, orig pc %d) needs the step engine (in %s, copy %d)\n",
+            nm, in->pc, (unsigned)in->rop, (int)in->opc, fn->g->name, (int)in->own);
     abort();
   }
   /* The CALLER decides when to use this: a native spec emitter calls it on its
@@ -6468,7 +6478,9 @@ static int emit_inl_guard(
       "    goto vx_%d;\n"
       "#endif\n",
       callee, cexp, callee, in->pc, in->pc);
-  if (iv->uses_this)
+  e_virt_compute(fn);
+  if (iv->uses_this && !(tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME && tv < (Q2ValueId)fn->nvalues &&
+                         g_e_virt != NULL && g_e_virt[tv]))
     fprintf(
         f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto vx_%d;\n", rexp,
         in->pc);
@@ -6553,12 +6565,54 @@ static int emit_virt_def(
       "                              QJS_AOT_OFF_RT_PIC_EPOCH) != cc_.pic_epoch ||\n"
       "          JS_VALUE_GET_PTR(*(const JSValue *)(*(const unsigned char *const *)(co_ + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
       "                                              (size_t)cc_.slot * QJS_AOT_SIZEOF_JSPROPERTY)) != cc_.proto, 0))\n"
-      "        if (!qjs_aot_ctor_replayable(ctx, (JSObject *)co_, sites_, %d, &cc_)) goto vx_%d; }\n"
+      "        if (!qjs_aot_ctor_replayable(ctx, (JSObject *)co_, sites_, %d, &cc_)) goto vx_%d;\n"
+      "      if (__builtin_expect(vsh%d != NULL && vsh%d != cc_.final_shape, 0)) goto vx_%d;\n"
+      "      vsh%d = cc_.final_shape; }\n"
       "#else\n"
       "    goto vx_%d;\n"
       "#endif\n"
       "    v%u = JS_UNDEFINED;\n",
-      cexp, vw->nfields, in->pc, in->pc, (unsigned)dv);
+      cexp, vw->nfields, in->pc, in->vweb, in->vweb, in->pc, in->vweb, in->pc, (unsigned)dv);
+  cur[dreg] = dv;
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
+static void e_group_exit_stub(FILE *f, const Q2Insn *in, const Q2ValueId *cur, Q2ValueId rv);
+/* A method read from the prototype of an object that is not made: the object's shape is the one
+   its construct recorded (`vsh`), which must be the shape the site's group was filled with; the
+   prototype is that shape's, tested and read like any prototype read. */
+static int emit_virt_proto(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types) {
+  int site = -1, g, a, dreg;
+  Q2ValueId dv;
+  char cib[24];
+  if (!have_types || t == NULL || cur == NULL || g_e_facts == NULL || in->ndef < 1 || in->nuse < 1) return 0;
+  for (a = 0; a < in->narg; a++)
+    if (in->arg[a].kind == 's') site = (int)in->arg[a].val;
+  if (site < 0) return 0;
+  g = e_facts_site_group(g_e_facts, site);
+  if (g < 0 || e_facts_site_proto(g_e_facts, site) != 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 && t->lb[dv] != E_LB_BOOL) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  e_group_exit_stub(f, in, cur, in->use[0]);
+  fprintf(f, "    { JSValue _f;\n");
+  fprintf(
+      f,
+      "      if (__builtin_expect(vsh%d != gsh%d || q2_cell_raw(pic, %s) != gsh%d || "
+      "q2_holder_bad_sh(vsh%d, holders, %d), 0)) goto vx_%d;\n",
+      in->vweb, g, e_cellidx(cib, sizeof(cib), site), g, in->vweb, site, in->pc);
+  fprintf(f, "      _f = *q2_hslotp_sh(vsh%d, q2_cell_off(pic, %s));\n", in->vweb, cib);
+  if (!g_e_nolazy)
+    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+  if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
+    fprintf(stderr, "qjsaot: virtual prototype read at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
+  fprintf(f, "    }\n");
   cur[dreg] = dv;
   g_e_miss_exit_seen = 1;
   return 1;
@@ -10097,6 +10151,7 @@ static int e_dispatch_rop(
     int have_types, char hex[33], int fi, int b, const ERole *role) {
   if (in->inlg) return emit_inl_guard(f, fn, in, t, cur, have_types);
   if (in->vk == Q2_VK_DEF) return emit_virt_def(f, fn, in, t, cur, have_types);
+  if (in->vk == Q2_VK_PROTO) return emit_virt_proto(f, fn, in, t, cur, have_types);
   switch (in->rop) {
     /* -- the spec body's own trivial forms, separate because they are shared with
           the generic emitter and must not be added there -- */
@@ -10610,6 +10665,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               fi, gen0);
           break;
         }
+    for (g = 0; g < fn->nvweb; g++) fprintf(f, "    const void *vsh%d = NULL;\n", g + 1);
     {
       /* The groups of copied callees are set up where their guard runs. */
       for (g = 0; g < ng; g++) {
