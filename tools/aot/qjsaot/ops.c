@@ -6861,6 +6861,51 @@ static int emit_pure_call(
   return 1;
 }
 
+/* The result `_o` of a builtin called directly, taken as the call's definition: an owned result
+   is adopted by the register, the groups are re-read, a typed definition is guarded, and the body
+   continues after the call. */
+static void e_builtin_call_tail(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, const Q2ValueId *cur, Q2ValueId dv,
+    int off) {
+  fprintf(
+      f,
+      "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+      "        else AOT_SET_B(ctx, fr, %d, _o);\n",
+      off, off);
+  e_emit_group_recheck(f, fn, in, cur);
+  if (t->lb[dv] == E_LB_TAG) {
+    fprintf(f, "        v%u = _o;\n", (unsigned)dv);
+  } else if (e_def_dead(in, dv)) {
+    /* nothing reads the result */
+  } else if (t->lb[dv] == E_LB_I32) {
+    e_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) "
+        "goto dx_%d;\n",
+        (unsigned)dv, in->next);
+  } else if (t->lb[dv] == E_LB_BOOL) {
+    e_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) "
+        "goto dx_%d;\n"
+        "        b%u = JS_VALUE_GET_BOOL(_o);\n",
+        in->next, (unsigned)dv);
+  } else {
+    e_sweep_guard(f, "dx", in->next);
+    fprintf(
+        f,
+        "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = "
+        "(double)JS_VALUE_GET_INT(_o);\n"
+        "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = "
+        "JS_VALUE_GET_FLOAT64(_o);\n"
+        "        else goto dx_%d;\n",
+        (unsigned)dv, (unsigned)dv, in->next);
+  }
+  fprintf(f, "        goto cd_%d;\n", in->pc);
+}
+
 static int emit_typed_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -6935,6 +6980,42 @@ static int emit_typed_call(
       snprintf(recv, sizeof(recv), "v%u", (unsigned)tv);
     else
       snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
+  }
+
+  /* Array.prototype.push and pop on a dense array, done in place: the callee is checked to be the
+     builtin, the receiver to be a plain dense array with room, and nothing else runs. Anything
+     else takes the call below. */
+  if (!g_e_inl && !g_e_fl && n == 1 && kind[0] == 2 && th >= 0 && cur != NULL && getenv("QJS_AOT_NOINLINEARR") == NULL) {
+    int which = -1;
+    if (strcmp(callee[0], "js_array_push:0") == 0 && na == 1) which = 0;
+    else if (strcmp(callee[0], "js_array_pop:0") == 0 && na == 0) which = 1;
+    if (which >= 0) {
+      char ae[80] = "";
+      int ok = 1;
+      if (which == 0) {
+        Q2ValueId av = in->win_reg < fn->nregs ? cur[in->win_reg] : Q2_NO_VALUE;
+        if (av == E_UNDEF)
+          snprintf(ae, sizeof(ae), ", JS_UNDEFINED");
+        else if (av == E_INFRAME)
+          snprintf(ae, sizeof(ae), ", AOT_REG(fr, %d)", in->win_reg * 16);
+        else if (av != Q2_NO_VALUE && av < (Q2ValueId)t->nvalues) {
+          switch (t->lb[av]) {
+            case E_LB_I32: snprintf(ae, sizeof(ae), ", JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)av); break;
+            case E_LB_F64: snprintf(ae, sizeof(ae), ", E_BOX_F64(d%u)", (unsigned)av); break;
+            case E_LB_BOOL: snprintf(ae, sizeof(ae), ", JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)av); break;
+            default: snprintf(ae, sizeof(ae), ", v%u", (unsigned)av); break;
+          }
+        } else
+          ok = 0;
+      }
+      if (ok) {
+        fprintf(
+            f, "    { JSValue _o;\n      if (q2_array_%s(ctx, %s, %s%s, &_o)) {\n", which ? "pop0" : "push1", cexp,
+            recv, ae);
+        e_builtin_call_tail(f, fn, in, t, cur, dv, off);
+        fprintf(f, "      }\n    }\n");
+      }
+    }
   }
 
   /* ---- output starts here; it must not be abandoned ---- */
@@ -7067,42 +7148,10 @@ static int emit_typed_call(
           "      E_CAP(f, %d);\n"
           "      int _rc = qjs_aot_call_c(ctx, %d, -1, %d, %s, %s, &AOT_REG(fr, %d), &_o);\n"
           "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n"
-          "      if (_rc > 0) {\n"
-          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
-          "        else AOT_SET_B(ctx, fr, %d, _o);\n",
-          in->next - 1, site, na, cexp, recv, w, off, off);
-      e_emit_group_recheck(f, fn, in, cur);
-      if (t->lb[dv] == E_LB_TAG) {
-        fprintf(f, "        v%u = _o;\n", (unsigned)dv);
-      } else if (e_def_dead(in, dv)) {
-        /* nothing reads the result */
-      } else if (t->lb[dv] == E_LB_I32) {
-        e_sweep_guard(f, "dx", in->next);
-        fprintf(
-            f,
-            "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) "
-            "goto dx_%d;\n",
-            (unsigned)dv, in->next);
-      } else if (t->lb[dv] == E_LB_BOOL) {
-        e_sweep_guard(f, "dx", in->next);
-        fprintf(
-            f,
-            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) "
-            "goto dx_%d;\n"
-            "        b%u = JS_VALUE_GET_BOOL(_o);\n",
-            in->next, (unsigned)dv);
-      } else {
-        e_sweep_guard(f, "dx", in->next);
-        fprintf(
-            f,
-            "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = "
-            "(double)JS_VALUE_GET_INT(_o);\n"
-            "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = "
-            "JS_VALUE_GET_FLOAT64(_o);\n"
-            "        else goto dx_%d;\n",
-            (unsigned)dv, (unsigned)dv, in->next);
-      }
-      fprintf(f, "        goto cd_%d;\n      }\n    }\n", in->pc);
+          "      if (_rc > 0) {\n",
+          in->next - 1, site, na, cexp, recv, w);
+      e_builtin_call_tail(f, fn, in, t, cur, dv, off);
+      fprintf(f, "      }\n    }\n");
     }
   }
   /* No candidate matched (or none was offered): the call has NOT run, so the

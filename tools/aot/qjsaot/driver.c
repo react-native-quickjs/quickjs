@@ -1982,6 +1982,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_ARRAY_ITER_KIND_VALUE %uu\n"
           "#define QJS_AOT_OFF_CFUNC_CPROTO %uu\n"
           "#define QJS_AOT_CFUNC_CPROTO_ITERATOR_NEXT %uu\n"
+          "#define QJS_AOT_CFUNC_CPROTO_GENERIC_MAGIC %uu\n"
           "_Static_assert(QJS_AOT_RC_BACK >= 4 && QJS_AOT_RC_BACK <= 64, "
           "\"rc offset\");\n\n"
           "#endif /* QUICKJS_AOT_LAYOUT_H */\n",
@@ -2042,7 +2043,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.object_inline_cap_mask, lay.object_inline_cap_shift, lay.off_rope_left,
           lay.off_rope_right, lay.off_ctx_ta_len_epoch, lay.class_array_iterator,
           lay.off_array_iter_obj, lay.off_array_iter_kind, lay.off_array_iter_idx,
-          lay.array_iter_kind_value, lay.off_cfunc_cproto, lay.cfunc_cproto_iterator_next);
+          lay.array_iter_kind_value, lay.off_cfunc_cproto, lay.cfunc_cproto_iterator_next,
+          lay.cfunc_cproto_generic_magic);
       fclose(lf);
     }
 
@@ -3346,6 +3348,69 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  v = (*(const JSValue *const *)(ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[idx];\n"
         "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
         "  *(uint32_t *)(pi + QJS_AOT_OFF_ARRAY_ITER_IDX) = idx + 1;\n"
+        "  *out = v;\n"
+        "  return 1;\n"
+        "}\n\n"
+        /* Array.prototype.push (one argument) and pop on a plain dense array: done in place when the
+           callee is the builtin, the array has the initial array shape (Array.prototype, `length` writable
+           as its first property) and `length` equals the count. push needs room; pop needs an element
+           that is not a hole. Anything else returns 0 and the call is made. */
+        "static const void *e_arrpush_fn, *e_arrpop_fn;\n"
+        "static inline __attribute__((always_inline)) int q2_builtin_is(JSValue callee, const void **cache, int which)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(callee);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_C_FUNCTION ||\n"
+        "      p[QJS_AOT_OFF_CFUNC_CPROTO] != QJS_AOT_CFUNC_CPROTO_GENERIC_MAGIC ||\n"
+        "      *(const int16_t *)(p + QJS_AOT_OFF_CFUNC_MAGIC) != 0)\n"
+        "    return 0;\n"
+        "  if (__builtin_expect(*cache == NULL, 0)) *cache = qjs_aot_array_builtin_fn(which);\n"
+        "  return *(const void *const *)(p + QJS_AOT_OFF_CFUNC_C_FUNCTION) == *cache;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_array_plain(JSContext *ctx, const unsigned char *p, uint32_t *count, JSValue **lenp)\n"
+        "{\n"
+        "  const unsigned char *c = (const unsigned char *)ctx;\n"
+        "  if (!(p[QJS_AOT_OFF_JSOBJECT_EXT_BYTE] & QJS_AOT_JSOBJECT_EXT_MASK) ||\n"
+        "      !(p[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK))\n"
+        "    return 0;\n"
+        "  if (*(const void *const *)(p + QJS_AOT_OFF_JSOBJECT_SHAPE) != *(const void *const *)(c + QJS_AOT_OFF_CTX_ARRAY_SHAPE))\n"
+        "    return 0;\n"
+        "  if (!(c[QJS_AOT_OFF_CTX_STD_ARRAY_PROTO_BYTE] & QJS_AOT_CTX_STD_ARRAY_PROTO_MASK)) return 0;\n"
+        "  *count = *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n"
+        "  *lenp = (JSValue *)(*(const unsigned char *const *)(p + QJS_AOT_OFF_JSOBJECT_PROP) + QJS_AOT_OFF_JSPROPERTY_U_VALUE);\n"
+        "  return JS_VALUE_GET_TAG(**lenp) == JS_TAG_INT && (uint32_t)JS_VALUE_GET_INT(**lenp) == *count;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_array_push1(JSContext *ctx, JSValue callee, JSValue arr, JSValue v, JSValue *out)\n"
+        "{\n"
+        "  unsigned char *p;\n"
+        "  uint32_t count;\n"
+        "  JSValue *lenp;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT || !q2_builtin_is(callee, &e_arrpush_fn, 0)) return 0;\n"
+        "  p = (unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  if (!q2_array_plain(ctx, p, &count, &lenp)) return 0;\n"
+        "  if (count + 1 > *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE) || count >= 0x7fffffffu) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  if (JS_VALUE_HAS_REF_COUNT(v)) ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
+        "  (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] = v;\n"
+        "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count + 1;\n"
+        "  *lenp = JS_MKVAL(JS_TAG_INT, (int32_t)(count + 1));\n"
+        "  *out = *lenp;\n"
+        "  return 1;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_array_pop0(JSContext *ctx, JSValue callee, JSValue arr, JSValue *out)\n"
+        "{\n"
+        "  unsigned char *p;\n"
+        "  uint32_t count;\n"
+        "  JSValue *lenp, v;\n"
+        "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT || !q2_builtin_is(callee, &e_arrpop_fn, 1)) return 0;\n"
+        "  p = (unsigned char *)JS_VALUE_GET_PTR(arr);\n"
+        "  if (!q2_array_plain(ctx, p, &count, &lenp) || count == 0) return 0;\n"
+        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  v = (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count - 1];\n"
+        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON || JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
+        "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count - 1;\n"
+        "  *lenp = JS_MKVAL(JS_TAG_INT, (int32_t)(count - 1));\n"
         "  *out = v;\n"
         "  return 1;\n"
         "}\n\n"
