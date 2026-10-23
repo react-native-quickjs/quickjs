@@ -52,6 +52,13 @@ static int g_e_inl_nx_used;
 static int g_e_last_inl_nx;
 static const char *nm_of_rop(uint16_t rop);
 static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail);
+static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc);
+static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in);
+static void e_group_test(
+    char *out, size_t n, int skip, int cellskip, const char *recv, int g, int site, int write);
+static int emit_hit_result(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId dv, int dreg,
+    const char *raw);
 static void e_inl_store_mark(FILE *f) {
   if (!g_e_inl) return;
   g_e_inl_dirty = 1;
@@ -3468,8 +3475,25 @@ static void e_emit_arm(
       for (q = 0; q < g_e_facts->nhoist; q++) {
         Q2ValueId rv;
         if (g_e_facts->hoist_hdr[q] != sb || g_e_facts->hoist_pre[q] != b) continue;
+        if (g_e_facts->hoist_grp[q] <= -1000) {
+          e_sweep_guard(f, "vx", hb->start_pc);
+          e_cell_hoist_check(f, g_e_facts->hoist_val[q], -1000 - g_e_facts->hoist_grp[q], "vx", hb->start_pc);
+          g_e_n_hoist++;
+          continue;
+        }
         rv = (Q2ValueId)g_e_facts->hoist_val[q];
         e_sweep_guard(f, "vx", hb->start_pc);
+        if (g_e_facts->hoist_val[q] == 0x10000000 && g_e_facts->hoist_grp[q] >= 0) {
+          fprintf(
+              f,
+              "      { JSValue _th = %s;\n"
+              "        if (__builtin_expect(JS_VALUE_GET_TAG(_th) != JS_TAG_OBJECT ||\n"
+              "            q2_shape_of(_th) != gsh%d, 0)) goto vx_%d; }\n",
+              g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
+              g_e_facts->hoist_grp[q], hb->start_pc);
+          g_e_n_hoist++;
+          continue;
+        }
         if (g_e_types != NULL && rv < (Q2ValueId)g_e_types->nvalues &&
             g_e_types->lb[rv] == E_LB_TAG && g_e_facts->hoist_grp[q] == -2) {
           char fl[32];
@@ -4800,6 +4824,8 @@ int e_analyze(const Q2Func *fn, EFacts *facts, ETypes *types) {
     if (in->op == Q2_OP_CALL && e_intrinsic_lowerable(fn, in)) mask[i] = 1;
   }
   e_facts_poly_on = !g_e_fl && getenv("QJS_AOT_NOPOLY") == NULL;
+  e_facts_pure_ok = !g_e_fl && !g_e_inl && getenv("QJS_AOT_NOPURE") == NULL;
+  e_facts_pure_call = e_pure_call_site;
   for (rounds = 0; rounds < 8; rounds++) {
     int changed = 0;
     g_e_intr_mask = mask;
@@ -6127,6 +6153,161 @@ static int emit_alloc_op(
    CONTROL FLOW: each candidate's success path ends at `cd_<pc>:`; the slow path -- no
    candidate matched, so the call has NOT run -- hands off at this pc, and `cd_<pc>:`
    follows. A failed `q2_call_entry` must never fall through with no call at all. */
+/* ---- pure inline calls --------------------------------------------------
+   A call whose profiled callees all have an inline body with no safepoint (no call, no
+   allocation, no store that could add a property or grow an array) runs that body in place
+   and otherwise leaves the speculative body at the call: no JS runs and no object changes
+   shape, so the shape, cache-cell and array facts survive it. */
+static char g_pure_inl[512][33];
+static int g_pure_inl_n = 0;
+
+void e_note_pure_inline(const char hex[33]) {
+  if (g_pure_inl_n < 512) memcpy(g_pure_inl[g_pure_inl_n++], hex, 33);
+}
+
+static int pure_inline_is(const char *hex) {
+  int i;
+  for (i = 0; i < g_pure_inl_n; i++)
+    if (strcmp(g_pure_inl[i], hex) == 0) return 1;
+  return 0;
+}
+
+static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k;
+  if (!call_site_shaped(fn, in)) return 0;
+  if (e_nocall_on()) return 0;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits)) return 0;
+  if (n <= 0 || n > 4) return 0;
+  for (k = 0; k < n; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k]) || !qjs_aot_inline_has(callee[k]) ||
+        !pure_inline_is(callee[k]) || in->win_n < qjs_aot_unit_argc(callee[k]))
+      return 0;
+  }
+  return 1;
+}
+
+static int emit_pure_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    int have_types) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k, cc, th, off, na, w, r, dreg;
+  char recv[64], cexp[64];
+  Q2ValueId dv;
+  if (!have_types || t == NULL || cur == NULL || g_e_fl || g_e_inl) return 0;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits)) return 0;
+  cc = call_callee_off(in);
+  th = call_this_off(in);
+  off = dest_off(fn, in);
+  na = in->win_n;
+  w = in->win_reg * 16;
+  if (off < 0 || cc < 0 || in->ndef < 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
+      t->lb[dv] != E_LB_BOOL)
+    return 0;
+  dreg = off / 16;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  {
+    Q2ValueId cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+    Q2ValueId tv = th >= 0 && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
+    if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME &&
+        cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
+      snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+    else
+      snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    if (th < 0)
+      snprintf(recv, sizeof(recv), "JS_UNDEFINED");
+    else if (tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME &&
+             tv < (Q2ValueId)t->nvalues && t->lb[tv] == E_LB_TAG)
+      snprintf(recv, sizeof(recv), "v%u", (unsigned)tv);
+    else
+      snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", th);
+  }
+  e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+  e_note_tag('v', in->pc, cexp);
+  if (t->lb[dv] != E_LB_TAG)
+    e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
+  /* The argument window, and the receiver and callee when they live only in locals: the inline
+     body reads them from the frame. No other value is synced: nothing here can collect. */
+  for (r = 0; r < na + 2; r++) {
+    Q2ValueId v;
+    int wr = r < na ? in->win_reg + r : (r == na ? cc / 16 : (th >= 0 ? th / 16 : -1));
+    if (wr < 0 || wr >= fn->nregs) continue;
+    v = cur[wr];
+    if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E_LB_TAG)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E_BOX_F64(d%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", wr * 16, (unsigned)v);
+  }
+  e_sweep_guard(f, "vx", in->pc);
+  for (k = 0; k < n && k < 4; k++) {
+    fprintf(f, "#ifdef Q2_INLINE_%s\n", callee[k]);
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1)) {\n"
+        "        JSValue _o;\n"
+        "        E_CAP(f, %d);\n"
+        "        if (!ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+        "                    &AOT_REG(fr, %d), %d, &_o)) goto vx_%d;\n",
+        cexp, callee[k], in->next - 1, callee[k], cexp, recv, w, na, in->pc);
+    /* A result that needs a guard reaches the frame only when the guard misses. */
+    if (t->lb[dv] == E_LB_TAG) {
+      fprintf(
+          f,
+          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+          "        else AOT_SET_B(ctx, fr, %d, _o);\n"
+          "        v%u = _o;\n",
+          off, off, (unsigned)dv);
+    } else if (e_def_dead(in, dv)) {
+      fprintf(
+          f,
+          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+          "        else AOT_SET_B(ctx, fr, %d, _o);\n",
+          off, off);
+    } else {
+      const char *fl =
+          "{ if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o); "
+          "else AOT_SET_B(ctx, fr, %d, _o); goto dx_%d; }";
+      char miss[200];
+      snprintf(miss, sizeof(miss), fl, off, off, in->next);
+      e_sweep_guard(f, "dx", in->next);
+      if (t->lb[dv] == E_LB_I32)
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_INT, 0)) %s\n"
+            "        i%u = JS_VALUE_GET_INT(_o);\n",
+            miss, (unsigned)dv);
+      else if (t->lb[dv] == E_LB_BOOL)
+        fprintf(
+            f,
+            "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) %s\n"
+            "        b%u = JS_VALUE_GET_BOOL(_o);\n",
+            miss, (unsigned)dv);
+      else
+        fprintf(
+            f,
+            "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_o);\n"
+            "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_o);\n"
+            "        else %s\n",
+            (unsigned)dv, (unsigned)dv, miss);
+    }
+    fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
+  }
+  fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
+  cur[dreg] = dv;
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
 static int emit_typed_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -6139,6 +6320,9 @@ static int emit_typed_call(
 
   /* ---- every check, before any output ---- */
   if (!have_types || t == NULL) return 0;
+  /* The facts classed this site as a pure inline call. */
+  if (g_e_facts != NULL && g_e_facts->purecall[e_insn_idx(fn, in)])
+    return emit_pure_call(f, fn, in, t, cur, have_types);
   /* The facts classed this site as an intrinsic with an exit for a miss. */
   if (e_must_exit(fn, in) && !g_e_intr_cont)
     return emit_intrinsic_call(f, fn, in, t, cur, hex, fi, b);
@@ -7167,6 +7351,23 @@ static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char
       "        ap%u = *(JSValue *const *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES);\n"
       "        an%u = *(const uint32_t *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); }\n",
       (unsigned)av, fail, (unsigned)av, fail, (unsigned)root, (unsigned)root);
+}
+
+/* A cache cell checked on the edge into a loop (or at its OSR entry): it must still hold the group's
+   shape, in the kind its site needs. `kind` "vx" leaves at the loop header, "osr" returns to the
+   generic body. */
+static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc) {
+  int z, wr = 0;
+  for (z = 0; z < g_e_facts->nsites; z++)
+    if (g_e_facts->sites[z].site == site) wr = g_e_facts->sites[z].write;
+  if (strcmp(kind, "osr") == 0)
+    fprintf(
+        f, "      if (__builtin_expect(%s(pic, %d) != gsh%d, 0)) goto osr_fail;\n",
+        wr ? "q2_cell_wshape" : "q2_cell_shape", site, group);
+  else
+    fprintf(
+        f, "      if (__builtin_expect(%s(pic, %d) != gsh%d, 0)) goto vx_%d;\n",
+        wr ? "q2_cell_wshape" : "q2_cell_shape", site, group, pc);
 }
 
 /* The index as `_i`, from an i32 local or a TAG local (which must hold an int). */
@@ -10448,7 +10649,21 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         for (o2 = 0; o2 < g_e_facts->nhoist; o2++) {
           Q2ValueId rv;
           if (g_e_facts->hoist_hdr[o2] != osr_blk[h]) continue;
+          if (g_e_facts->hoist_grp[o2] <= -1000) {
+            e_cell_hoist_check(f, g_e_facts->hoist_val[o2], -1000 - g_e_facts->hoist_grp[o2], "osr", 0);
+            continue;
+          }
           rv = (Q2ValueId)g_e_facts->hoist_val[o2];
+          if (g_e_facts->hoist_val[o2] == 0x10000000 && g_e_facts->hoist_grp[o2] >= 0) {
+            fprintf(
+                f,
+                "      { JSValue _th = %s;\n"
+                "        if (__builtin_expect(JS_VALUE_GET_TAG(_th) != JS_TAG_OBJECT ||\n"
+                "            q2_shape_of(_th) != gsh%d, 0)) goto osr_fail; }\n",
+                g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
+                g_e_facts->hoist_grp[o2]);
+            continue;
+          }
           if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG &&
               g_e_facts->hoist_grp[o2] == -2)
             e_arr_region_start(f, rv, rv, "goto osr_fail");

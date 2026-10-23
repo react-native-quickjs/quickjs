@@ -82,6 +82,8 @@ unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
 
 /* A cell fact's value in the shape-fact list: no receiver value is this large. */
 #define E_CELLV(site) (0x40000000 + (site))
+/* The shape fact of `this` of the activation. */
+#define E_THISV 0x10000000
 /* An array fact's value in the same list: `rv` is a dense array whose base pointer and count
    are in locals. Group 0. */
 #define E_ARRV(rv) (0x20000000 + (rv))
@@ -688,6 +690,14 @@ static void apply_store_kills(FactSet *s, const Access *stp) {
 /* A numeric element access that runs on a checked dense-array region: the profile saw only
    numbers at the pc (no hole, no out-of-range read, no growing store, no typed array), so its
    miss is an exit and it is no safepoint. */
+int e_facts_pure_ok = 0;
+int (*e_facts_pure_call)(const Q2Func *fn, const Q2Insn *in) = NULL;
+
+static int pure_call_ok(const Q2Func *fn, const Q2Insn *in) {
+  return e_facts_pure_ok && e_facts_pure_call != NULL &&
+         (in->rop == ROP_call || in->rop == ROP_call_method) && e_facts_pure_call(fn, in);
+}
+
 static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
   int i;
   if (in->rop != ROP_get_element && in->rop != ROP_put_element &&
@@ -717,14 +727,16 @@ static int region_recv(const Q2Func *fn, const EFacts *f, const Q2Insn *in) {
 static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int grouped_exit) {
   int kind = insn_kind(in);
   if (grouped_exit && elem_region_ok(fn, in)) return 0;
+  if (grouped_exit && global_exit_ok(fn, in)) return 0;
+  if (grouped_exit && pure_call_ok(fn, in)) return 0;
   if (kind == E_SK_FIELD) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r, grouped = nr > 0;
     if (!grouped_exit) grouped = 0;
     for (r = 0; r < nr; r++)
-      if (ref[r].site < 0 || ref[r].recv < 0 ||
+      if (ref[r].site < 0 || !recv_groupable(ref[r].recv) ||
           (e_facts_site_group(f, ref[r].site) < 0 &&
-           !(e_facts_poly_on && nr == 1 && e_facts_poly_op(in) &&
+           !(e_facts_poly_on && nr == 1 && ref[r].recv >= 0 && e_facts_poly_op(in) &&
              e_facts_site_poly(f, ref[r].site))))
         grouped = 0;
     kind = grouped ? E_SK_NOJS : E_SK_SAFE;
@@ -781,6 +793,21 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       if (fs_add_shape(s, E_ARRV(rv), 0) < 0) return -1;
       f->arr_used[rv] = 1;
     }
+  }
+
+  if (grouped_exit && global_exit_ok(fn, in)) {
+    kind = E_SK_NOJS;
+    f->miss_exits[insn] = 1;
+  }
+
+  /* A call whose callees all have safepoint-free inline bodies: the body runs in place or
+     the call exits, so no JS ran. What the callee may have stored dies with the loaded
+     values; the shape, cache-cell and array facts stay. */
+  if (grouped_exit && pure_call_ok(fn, in)) {
+    kind = E_SK_NOJS;
+    f->purecall[insn] = 1;
+    f->miss_exits[insn] = 1;
+    fs_kill(s, kp_safepoint, NULL);
   }
 
   /* A field access is no safepoint only when every site it uses is grouped:
@@ -957,6 +984,53 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
       }
       memcpy(out->loop_mem[out->nloops], loop, (size_t)fn->nblocks);
       out->nloops++;
+      /* the cache cells of the grouped sites in the loop: checked once on the edge into the
+         loop (and at an OSR entry), so no access in it tests its cell (group code
+         -1000 - group, value = site) */
+      for (bi = 0; bi < fn->nblocks; bi++) {
+        if (!loop[bi]) continue;
+        for (k = 0; k < fn->blocks[bi].ninsns; k++) {
+          const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
+          SiteRef ref[2];
+          int nr = site_refs(in, ref), r;
+          for (r = 0; r < nr; r++) {
+            int g, dup = 0, z, hot = 0;
+            if (ref[r].site < 0 || ref[r].recv < 0) continue;
+            g = e_facts_site_group(out, ref[r].site);
+            if (g < 0) continue;
+            for (z = 0; z < out->nsites; z++)
+              if (out->sites[z].site == ref[r].site) hot = out->sites[z].hot;
+            if (!hot) continue;
+            for (q = 0; q < out->nhoist; q++)
+              if (out->hoist_hdr[q] == h && out->hoist_val[q] == ref[r].site &&
+                  out->hoist_grp[q] == -1000 - g)
+                dup = 1;
+            if (dup) continue;
+            if (out->nhoist == out->hoist_cap) {
+              int nc = out->hoist_cap ? out->hoist_cap * 2 : 8;
+              int *a1 = realloc(out->hoist_hdr, sizeof(int) * (size_t)nc);
+              int *a2 = realloc(out->hoist_pre, sizeof(int) * (size_t)nc);
+              int *a3 = realloc(out->hoist_val, sizeof(int) * (size_t)nc);
+              int *a4 = realloc(out->hoist_grp, sizeof(int) * (size_t)nc);
+              if (!a1 || !a2 || !a3 || !a4) {
+                free(loop);
+                free(stack);
+                return -1;
+              }
+              out->hoist_hdr = a1;
+              out->hoist_pre = a2;
+              out->hoist_val = a3;
+              out->hoist_grp = a4;
+              out->hoist_cap = nc;
+            }
+            out->hoist_hdr[out->nhoist] = h;
+            out->hoist_pre[out->nhoist] = pre;
+            out->hoist_val[out->nhoist] = ref[r].site;
+            out->hoist_grp[out->nhoist] = -1000 - g;
+            out->nhoist++;
+          }
+        }
+      }
       /* the receivers of numeric element accesses that are defined outside the loop: the array
          check and the loads of its base pointer and count are hoisted (group -2) */
       for (bi = 0; bi < fn->nblocks; bi++) {
@@ -1068,6 +1142,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->cellskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->elemreg = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->arrskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->narr_vals = fn->nvalues;
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->miss_exits = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
@@ -1075,7 +1150,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL || out->purecall == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1143,7 +1218,10 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
           for (j = 0; j < outs[pre].nshape; j++)
             if (fs_add_shape(&cur, outs[pre].shape_val[j], outs[pre].shape_grp[j]) < 0)
               goto done;
-          if (out->hoist_grp[k] == -2) {
+          if (out->hoist_grp[k] <= -1000) {
+            if (fs_add_shape(&cur, E_CELLV(out->hoist_val[k]), -1000 - out->hoist_grp[k]) < 0)
+              goto done;
+          } else if (out->hoist_grp[k] == -2) {
             if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]), 0) < 0) goto done;
           } else if (fs_add_shape(&cur, out->hoist_val[k], out->hoist_grp[k]) < 0) {
             goto done;
@@ -1252,6 +1330,7 @@ void e_facts_free(EFacts *f) {
   free(f->cellskip);
   free(f->elemreg);
   free(f->arrskip);
+  free(f->purecall);
   free(f->arr_used);
   free(f->miss_exits);
   if (f->groups != NULL) {
@@ -1293,4 +1372,27 @@ int e_facts_site_group(const EFacts *f, int site) {
     if (f->sites[i].site == site) return f->sites[i].group;
   }
   return E_GROUP_NONE;
+}
+
+int e_facts_safepoint_free(const Q2Func *fn) {
+  EFacts f;
+  int i, free_ = 1, saved = e_facts_pure_ok;
+  e_facts_pure_ok = 0; /* a call inside the body is a safepoint */
+  if (e_facts_run(fn, &f, 1) < 0) {
+    e_facts_pure_ok = saved;
+    return 0;
+  }
+  for (i = 0; i < fn->ninsns && free_; i++)
+    if (fn->insns[i].rop != ROP_return && fn->insns[i].rop != ROP_return_undefined &&
+        is_safepoint(fn, &f, &fn->insns[i], 1)) {
+      if (getenv("QJS_AOT_DEBUG_PURE")) {
+        char nm[64];
+        e_rop_name(fn->insns[i].rop, nm, sizeof(nm));
+        fprintf(stderr, "pure: safepoint %s@%d\n", nm, fn->insns[i].pc);
+      }
+      free_ = 0;
+    }
+  e_facts_free(&f);
+  e_facts_pure_ok = saved;
+  return free_;
 }

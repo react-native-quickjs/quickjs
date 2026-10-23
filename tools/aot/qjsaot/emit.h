@@ -22,6 +22,8 @@
 int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
 /* The inline form `ei_HEX` of a small leaf, or 0 with `why`. */
+/* Record that the inline body of `hex` has no safepoint (see EFacts.purecall). */
+void e_note_pure_inline(const char hex[33]);
 int e_emit_inline_func(
     FILE *f, const JSAotGenFunc *g, char hex[33], char *why, size_t whyn);
 struct Q2Func;

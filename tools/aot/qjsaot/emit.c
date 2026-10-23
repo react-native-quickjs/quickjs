@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "analysis.h"
 #include "emit.h"
 #include "ir.h"
 
@@ -442,6 +443,7 @@ int e_emit_inline_func(
     return 0;
   }
   rc = e_emit_inline_body(f, &fn, hex, why, whyn);
+  if (rc && e_facts_safepoint_free(&fn)) e_note_pure_inline(hex);
   q2_free(&fn);
   return rc;
 }

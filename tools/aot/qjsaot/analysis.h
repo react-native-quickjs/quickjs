@@ -122,6 +122,10 @@ typedef struct EFacts {
   uint8_t *arrskip;
   uint8_t *arr_used;
   int narr_vals;
+  /* A call to compiled callees that all have a safepoint-free inline body: it runs the body
+     in place or exits at the call, so it is no safepoint for the shape, cache-cell and array
+     facts (the callee may store, so the loaded-value facts still die). */
+  uint8_t *purecall;
   /* A grouped field access whose miss must leave the speculative body (an
      exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter
@@ -156,6 +160,12 @@ typedef struct EFacts {
    emits would otherwise leave the flag set for the functions emitted after the
    first dump, and the body would be emitted with facts that assume misses exit
    while its code continues on a miss. */
+/* Set by the emitter: whether a call at `in` is a pure inline call (see EFacts.purecall), and
+   whether this pass may use that (a framed speculative body). */
+extern int e_facts_pure_ok;
+extern int (*e_facts_pure_call)(const Q2Func *fn, const Q2Insn *in);
+/* Whether a function has no safepoint at all in its speculative form. */
+int e_facts_safepoint_free(const Q2Func *fn);
 int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);
 /* Whether polymorphic sites are served by the polymorphic cache in this body (a
    framed speculative body; set by the caller around e_facts_run). */
