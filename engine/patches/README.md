@@ -455,3 +455,4 @@ bump while `9999` is missing.
 | `0367` | The layout export carries the two-prototype cache kind and the IsHTMLDDA bit | Inherited-method reads and null tests of objects cost a call into the engine | `JSAotGenLayout` | No. |
 | `0368` | A global variable cell says whether its slot is plainly writable | A top-level loop's global counter store was a call into the engine | `JSGVCell`, `JSAotGenLayout` | No. |
 | `0369` | The runtime counts changes of its register property cache entries | A compiled call re-validated its cache cells every time | `JSRuntime.aot_pic_epoch` | No. |
+| `0370` | A compiled function can ask whether a constructor's fields are replayable from the engine's caches | A `new` of a plain constructor whose object never escapes allocated it and stored its fields | `qjs_aot_ctor_replayable` | No. |

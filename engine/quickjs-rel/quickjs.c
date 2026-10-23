@@ -8628,6 +8628,7 @@ static inline void ic_watchpoint_bump(JSRuntime *rt)
     if (rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX)
         rt->ic_watchpoint_epoch++;
     rt->aot_epoch_bumps++;
+    rt->aot_pic_epoch++;    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
 }
 
 /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
@@ -63451,6 +63452,70 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     if (JS_IsException(obj))
         return -1;
     *out = obj;
+    return 1;
+}
+
+/* Whether constructing `ctor` now is fully described by the engine's own add-transition cells:
+   a fresh `this` has the shape the first cell starts from, each cell leads to the shape the next
+   one starts from, and no prototype interceptor has appeared since they were filled. Then `new
+   ctor(...)` for a constructor that only stores its parameters into fields of `this`
+   (`sites[0..n)`, in order) makes an object that is its arguments, and building it later with
+   the same stores is unobservable. Pure: reads only, allocates nothing. `cc` remembers the last
+   positive answer: it stays valid while the function object keeps its shape, its `prototype`
+   slot keeps its object, and no register cache entry has changed and no prototype watchpoint has
+   fired (both bump `aot_pic_epoch`). */
+int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *sites, int n,
+                            JSAotCtorCache *cc)
+{
+    JSRuntime *rt = ctx->rt;
+    JSFunctionBytecode *cb;
+    JSRegPIC *pic;
+    JSShape *sh = NULL;
+    JSProperty *ppr;
+    JSShapeProperty *prs;
+    JSValue pv;
+    int k;
+
+    if (cc->shape == (const void *)ctor->shape &&
+        cc->proto == JS_VALUE_GET_PTR(ctor->prop[cc->slot].u.value) &&
+        cc->pic_epoch == rt->aot_pic_epoch)
+        return 1;
+    if (n <= 0 || ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
+        return 0;
+    cb = ctor->u.func.function_bytecode;
+    if (cb->is_derived_class_constructor ||
+        !(cb->aot_fn != NULL ? cb->aot_light : cb->regvm_light))
+        return 0;
+    pic = cb->regvm_pic;
+    if (pic == NULL || cb->regvm_pic_count == 0)
+        return 0;
+    prs = find_own_property(&ppr, ctor, JS_ATOM_prototype);
+    if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    pv = ppr->u.value;
+    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
+        return 0;
+    for (k = 0; k < 4; k++) {
+        JSShape *ish = cb->ctor_inst_shape[k];
+        if (ish && ish->proto == JS_VALUE_GET_OBJ(pv))
+            sh = ish;
+    }
+    if (sh == NULL)
+        return 0;
+    for (k = 0; k < n; k++) {
+        int s2 = cb->regvm_pic_count + sites[k];
+        JSRegPIC *e = &pic[s2];
+        if (e->kind != REG_PIC_ADD_W || e->shape != sh ||
+            e->misses != (uint16_t)rt->ic_watchpoint_epoch)
+            return 0;
+        sh = cb->regvm_pic_holder[s2];
+        if (sh == NULL)
+            return 0;
+    }
+    cc->shape = ctor->shape;
+    cc->proto = JS_VALUE_GET_PTR(pv);
+    cc->slot = (uint32_t)(ppr - ctor->prop);
+    cc->pic_epoch = rt->aot_pic_epoch;
     return 1;
 }
 

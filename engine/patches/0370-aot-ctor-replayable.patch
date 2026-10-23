@@ -1,0 +1,123 @@
+Subject: A compiled function can ask whether a constructor's fields are replayable from the engine's caches
+
+What this does
+  - `qjs_aot_ctor_replayable(ctx, ctor, sites, n, cache)` answers 1 when `new ctor(...)` is described by the
+    engine's own add-transition cells: a fresh `this` has the shape the cell of `sites[0]` starts from,
+    the cell of `sites[k]` leads to the shape the next one starts from, and the cells were filled at
+    the current prototype-interceptor epoch (`misses == rt->ic_watchpoint_epoch`). It reads only. A caller-owned
+    `JSAotCtorCache` remembers the last positive answer, keyed on the function object's shape, the object in
+    its `prototype` slot, and `aot_pic_epoch`, so a repeated question is a few loads.
+
+Why we need it
+  A compiled function that proves an object made by a plain constructor never escapes does not make it:
+  its fields are the constructor's arguments, and an exit builds the object then. That is unobservable
+  only if running the constructor would have taken the cached add path for every field (no setter,
+  read-only slot, proxy or non-extensible target on the prototype chain), which is the condition
+  `regvm_put_field_add_hit` replays under. `ctor.prototype` is read as `js_create_from_ctor_cap` reads it, and the instance shape it selects is
+  the one cached for that prototype, so a changed prototype with no cached instance shape answers 0.
+  `ic_watchpoint_bump` (a prototype interceptor appearing) now also bumps `JSRuntime.aot_pic_epoch`, which is what a
+  cached verdict about add-transition entries depends on.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8628,6 +8628,7 @@
+     if (rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX)
+         rt->ic_watchpoint_epoch++;
+     rt->aot_epoch_bumps++;
++    rt->aot_pic_epoch++;    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
+ }
+ 
+ /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
+@@ -63454,6 +63455,70 @@
+     return 1;
+ }
+ 
++/* Whether constructing `ctor` now is fully described by the engine's own add-transition cells:
++   a fresh `this` has the shape the first cell starts from, each cell leads to the shape the next
++   one starts from, and no prototype interceptor has appeared since they were filled. Then `new
++   ctor(...)` for a constructor that only stores its parameters into fields of `this`
++   (`sites[0..n)`, in order) makes an object that is its arguments, and building it later with
++   the same stores is unobservable. Pure: reads only, allocates nothing. `cc` remembers the last
++   positive answer: it stays valid while the function object keeps its shape, its `prototype`
++   slot keeps its object, and no register cache entry has changed and no prototype watchpoint has
++   fired (both bump `aot_pic_epoch`). */
++int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *sites, int n,
++                            JSAotCtorCache *cc)
++{
++    JSRuntime *rt = ctx->rt;
++    JSFunctionBytecode *cb;
++    JSRegPIC *pic;
++    JSShape *sh = NULL;
++    JSProperty *ppr;
++    JSShapeProperty *prs;
++    JSValue pv;
++    int k;
++
++    if (cc->shape == (const void *)ctor->shape &&
++        cc->proto == JS_VALUE_GET_PTR(ctor->prop[cc->slot].u.value) &&
++        cc->pic_epoch == rt->aot_pic_epoch)
++        return 1;
++    if (n <= 0 || ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
++        return 0;
++    cb = ctor->u.func.function_bytecode;
++    if (cb->is_derived_class_constructor ||
++        !(cb->aot_fn != NULL ? cb->aot_light : cb->regvm_light))
++        return 0;
++    pic = cb->regvm_pic;
++    if (pic == NULL || cb->regvm_pic_count == 0)
++        return 0;
++    prs = find_own_property(&ppr, ctor, JS_ATOM_prototype);
++    if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return 0;
++    pv = ppr->u.value;
++    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
++        return 0;
++    for (k = 0; k < 4; k++) {
++        JSShape *ish = cb->ctor_inst_shape[k];
++        if (ish && ish->proto == JS_VALUE_GET_OBJ(pv))
++            sh = ish;
++    }
++    if (sh == NULL)
++        return 0;
++    for (k = 0; k < n; k++) {
++        int s2 = cb->regvm_pic_count + sites[k];
++        JSRegPIC *e = &pic[s2];
++        if (e->kind != REG_PIC_ADD_W || e->shape != sh ||
++            e->misses != (uint16_t)rt->ic_watchpoint_epoch)
++            return 0;
++        sh = cb->regvm_pic_holder[s2];
++        if (sh == NULL)
++            return 0;
++    }
++    cc->shape = ctor->shape;
++    cc->proto = JS_VALUE_GET_PTR(pv);
++    cc->slot = (uint32_t)(ppr - ctor->prop);
++    cc->pic_epoch = rt->aot_pic_epoch;
++    return 1;
++}
++
+ /* `super` and a string-keyed element read of a compiled body, without the step handler:
+    the prototype of an object (what `get_super` does), and a property read by atom with the
+    object itself as the receiver (what `get_element` does for a constant string key, minus
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -417,6 +417,19 @@
+    non-derived light bytecode constructor (the caller takes the generic path); -1 on an
+    exception. Runs no JavaScript. */
+ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
++/* What `qjs_aot_ctor_replayable` remembers between calls (zero-initialised, one per use). */
++typedef struct JSAotCtorCache {
++    const void *shape, *proto;
++    uint32_t slot, pic_epoch;
++} JSAotCtorCache;
++
++/* 1 when `new C(...)` now is described by the engine's own add-transition cells: a fresh
++   `this` has the shape the cell of `sites[0]` starts from, each cell of `sites[k]` leads to the
++   shape the next starts from, and no prototype interceptor appeared since they were filled.
++   A constructor that only stores its parameters into those fields in that order then makes an
++   object that is its arguments. Reads only; `cc` makes a repeated positive answer a few loads. */
++int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *sites, int n,
++                            JSAotCtorCache *cc);
+ 
+ /* The allocating ops a compiled body runs without stepping the handler. Each does
+    what the interpreter's handler does and returns 0 with an OWNED *out, or -1 on an
