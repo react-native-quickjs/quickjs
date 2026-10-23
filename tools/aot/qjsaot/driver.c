@@ -2328,13 +2328,17 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    if (__builtin_expect(++e_xn_.cnt == 1, 0)) e_xnode_reg(&e_xn_); \\\n"
         "    if (__builtin_expect(e_exit_log_v != 0, 0) && (e_exit_log_v == 2 || e_xn_.cnt == 1)) \\\n"
         "      e_exit_log((hex), (kind), (pc), (int)(tag), &e_xl_); } while (0)\n"
-        "#define E_EXIT_NOTE(fi) do { if (++e_exi[fi] > 256 && \\\n"
+        /* An exit taken because some cache entry changed since the body validated its cells is not a
+           failed speculation: the generic body fills what changed and the next entry passes. It does
+           not count toward the switch-off. */
+        "static int e_ep_exit;\n"
+        "#define E_EXIT_NOTE(fi) do { if (e_ep_exit) { e_ep_exit = 0; break; } if (++e_exi[fi] > 256 && \\\n"
         "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
         "   body does not lower. Counting them toward the switch-off would turn off\n"
         "   every spec body after 257 calls and every measurement would time the\n"
         "   generic body. They are counted, never acted on. */\n"
-        "#define E_HANDOFF_NOTE(fi) (e_han[fi]++)\n"
+        "#define E_HANDOFF_NOTE(fi) (e_ep_exit = 0, e_han[fi]++)\n"
         "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
         "#define E_REFUSE_NOTE(fi) do { if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_ref[fi] > 256 && \\\n"
         "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
@@ -3697,7 +3701,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define Q2_EPOCH_MOVED(ctx_) ((void)q2_ep, 1)\n"
         "#else\n"
         "#define Q2_EPOCH_MOVED(ctx_) (*(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)(ctx_) + "
-        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH) != q2_ep)\n"
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH) != q2_ep ? (e_ep_exit = 1, 1) : 0)\n"
         "#endif\n\n");
     /* A reference taken inline: the count is an int QJS_AOT_RC_BACK bytes before
        the object (the layout publishes the offset), and this is js_dup()'s body,
