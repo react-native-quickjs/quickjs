@@ -355,9 +355,17 @@ static int e_inline_typed_ok(const Q2Func *fn) {
   for (i = 0; ok && i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     if (in->own == 0) continue;
+    /* a forwarded load is a copy of a value already held: no access, nothing to miss */
+    if (facts.fwd != NULL && facts.fwd[i] != Q2_NO_VALUE) continue;
     /* a field read of a copy has to be a grouped access whose miss exits */
     if (in->op == Q2_OP_GET_FIELD && !facts.miss_exits[i]) {
       if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: field read at clone pc %d (orig %d) is not a grouped exit\n", in->pc, in->opc);
+      ok = 0;
+      continue;
+    }
+    /* a store of a copy is a grouped write whose miss leaves before it */
+    if (in->op == Q2_OP_PUT_FIELD && !facts.miss_exits[i]) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: field write at clone pc %d (orig %d) is not a grouped exit\n", in->pc, in->opc);
       ok = 0;
       continue;
     }

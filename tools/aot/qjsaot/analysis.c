@@ -392,7 +392,7 @@ static int transfer_def(
         double c;
         int ki = in->narg > 3 ? 3 : -1, ui = in->narg > 4 ? 4 : -1;
         if (ki < 0 || in->arg[ki].val != REG_CONST_CPOOL || ui < 0 ||
-            !qjs_aot_pool_num(fn->g, (uint32_t)in->arg[ui].val, &c)) {
+            !qjs_aot_pool_num(q2_insn_g(fn, in), (uint32_t)in->arg[ui].val, &c)) {
           *whyp = E_WHY_UNKNOWN_RESULT;
           return E_LB_TAG;
         }

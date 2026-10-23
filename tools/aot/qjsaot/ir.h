@@ -193,6 +193,7 @@ typedef struct Q2Insn {
   /* 0 for an instruction of the program; k+1 for one copied from inlined callee k, whose
      guard is the instruction with `inlg` == k+1. */
   uint8_t own, inlg;
+  uint8_t inlret; /* the branch that ends a copied callee's return: its stores are final here */
   /* A virtual-object instruction (see Q2VWeb): VK_DEF stands for the construct that made the
      object, VK_GET for a read of one of its fields, VK_PROTO for a method lookup on it. */
   uint8_t vk, vweb;
@@ -316,6 +317,12 @@ typedef struct Q2Func {
   const Q2ProfReg *prof_regs;
   int32_t nprof_regs;
 } Q2Func;
+
+/* The program an instruction belongs to: the function itself, or the callee a copied instruction was taken from. */
+static inline const struct JSAotGenFunc *q2_insn_g(const Q2Func *fn, const Q2Insn *in) {
+  return in->own > 0 && fn->inl != NULL ? fn->inl[in->own - 1].g : fn->g;
+}
+
 
 /* Build the IR for one function. Returns 0 on success, -1 with why set. */
 int q2_build(const struct JSAotGenFunc *g, Q2Func *out);

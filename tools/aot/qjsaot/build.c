@@ -1690,6 +1690,7 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
         b2->bpc = b2->pc;
         b2->ppc = b2->pc;
         b2->xpc = iv->call_pc;
+        b2->inlret = 1;
         b2->own = (uint8_t)(k + 1);
         b2->narg = 1;
         b2->arg[0].kind = 't';

@@ -61,6 +61,50 @@ static void e_group_test(
 static int emit_hit_result(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId dv, int dreg,
     const char *raw);
+/* The stores of copied callees. A copy that has stored and then has to leave cannot be replayed from the
+   call, so each store keeps the slot it wrote, the value it replaced and the value it put there, in locals
+   of the body (us/uo/un<n>): the replaced value stays alive until the copy ends, and a way out puts every
+   slot back first, most recent store first. `g_e_undo_id` numbers the stores by instruction; the order the
+   emitter reached them in is the order they run in, since a copy has no loops. */
+static int *g_e_undo_id;
+static int g_e_undo_total;
+static int g_e_undo_seq[256], g_e_undo_seq_own[256], g_e_undo_seq_n;
+static void e_undo_prepare(const Q2Func *fn) {
+  int i;
+  free(g_e_undo_id);
+  g_e_undo_id = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int));
+  g_e_undo_total = 0;
+  g_e_undo_seq_n = 0;
+  for (i = 0; i < fn->ninsns; i++) {
+    g_e_undo_id[i] = -1;
+    if (fn->insns[i].own > 0 && fn->insns[i].rop == ROP_put_field) g_e_undo_id[i] = g_e_undo_total++;
+  }
+}
+/* the copy's instance ends: its stores are final, and the values they replaced are released */
+static void e_undo_release(FILE *f, int own) {
+  int q;
+  for (q = 0; q < g_e_undo_seq_n; q++) {
+    int id = g_e_undo_seq[q];
+    if (g_e_undo_seq_own[q] != own) continue;
+    fprintf(
+        f,
+        "    if (us%d != NULL) { if (JS_VALUE_HAS_REF_COUNT(uo%d)) JS_FreeValue(ctx, uo%d); us%d = NULL; }\n", id, id,
+        id, id);
+  }
+}
+/* a way out of the copy before its end: every store it made is put back */
+static void e_undo_restore(FILE *f, int own) {
+  int q;
+  for (q = g_e_undo_seq_n - 1; q >= 0; q--) {
+    int id = g_e_undo_seq[q];
+    if (g_e_undo_seq_own[q] != own) continue;
+    fprintf(
+        f,
+        "    if (us%d != NULL) { *us%d = uo%d; if (JS_VALUE_HAS_REF_COUNT(un%d)) JS_FreeValue(ctx, un%d); us%d = NULL; }\n",
+        id, id, id, id, id, id);
+  }
+}
+
 static void e_inl_store_mark(FILE *f) {
   if (!g_e_inl) return;
   g_e_inl_dirty = 1;
@@ -439,8 +483,8 @@ static int emit_native_binary_imm(
       kind = (uint32_t)in->arg[3].val;
       idx = (uint32_t)in->arg[4].val;
       if (kind != REG_CONST_CPOOL) return 0;
-      if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
-      tag = qjs_aot_pool_tag(fn->g, idx);
+      if (!qjs_aot_pool_num(q2_insn_g(fn, in), idx, &c)) return 0;
+      tag = qjs_aot_pool_tag(q2_insn_g(fn, in), idx);
       if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL &&
           sub != REG_BIN_DIV)
         return 0;
@@ -3485,6 +3529,7 @@ static void e_emit_exit_at(
   } else if (lb != NULL) {
     q2_live_before(fn, ins, lb);
   }
+  if (fn->insns[ins].own > 0) e_undo_restore(f, fn->insns[ins].own);
   g_e_exit_ins = ins;
   e_emit_exit(f, fn, pc, hex, fi, cur, lb, handoff, blkidx);
   g_e_exit_ins = -1;
@@ -8200,6 +8245,30 @@ static int emit_group_write(
   fprintf(
       f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
       test, recv, in->pc);
+  if (in->own > 0 && g_e_undo_id != NULL && g_e_undo_id[e_insn_idx(fn, in)] >= 0) {
+    /* a store of a copied callee: kept so that a way out of the copy can put it back */
+    int id = g_e_undo_id[e_insn_idx(fn, in)];
+    fprintf(f, "      JSValue _nv = %s;\n", boxed);
+    fprintf(
+        f,
+        "      JSValue *_sp = q2_slotp(%s, q2_cell_off(pic, %d));\n"
+        "      uo%d = *_sp;\n"
+        "      us%d = _sp;\n"
+        "      q2_dup(_nv);\n"
+        "      *_sp = _nv;\n"
+        "      un%d = _nv;\n",
+        recv, site, id, id, id);
+    fprintf(f, "    }\n");
+    if (g_e_undo_seq_n < 256) {
+      g_e_undo_seq[g_e_undo_seq_n] = id;
+      g_e_undo_seq_own[g_e_undo_seq_n++] = in->own;
+    } else {
+      fprintf(stderr, "qjsaot: too many stores in copied callees\n");
+      abort();
+    }
+    g_e_miss_exit_seen = 1;
+    return 1;
+  }
   /* The counted store the framed body makes: the new value duplicated before the
      old one is released. The release is an effect, which a frameless or inline
      body's exits account for. A local first: the boxed value may be a compound
@@ -8506,8 +8575,8 @@ static int emit_typed_arith_cpool(
   if (sub != REG_BIN_ADD && sub != REG_BIN_SUB && sub != REG_BIN_MUL &&
       sub != REG_BIN_DIV)
     return 0;
-  if (!qjs_aot_pool_num(fn->g, idx, &c)) return 0;
-  tag = qjs_aot_pool_tag(fn->g, idx);
+  if (!qjs_aot_pool_num(q2_insn_g(fn, in), idx, &c)) return 0;
+  tag = qjs_aot_pool_tag(q2_insn_g(fn, in), idx);
   if (tag != E_POOL_INT && tag != E_POOL_DOUBLE) return 0;
   d = in->def[0];
   a = in->use[0];
@@ -10874,6 +10943,9 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     }
     (void)any;
   }
+  e_undo_prepare(fn);
+  for (k = 0; k < g_e_undo_total; k++)
+    fprintf(f, "    JSValue *us%d = NULL; JSValue uo%d, un%d; (void)uo%d; (void)un%d;\n", k, k, k, k, k);
   g_e_ta_used = 0;
   for (k = 0; k < fn->ninsns; k++)
     if (fn->insns[k].rop == ROP_get_length) g_e_ta_used = 1;
@@ -10956,6 +11028,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       /* A terminator ends the block: a return, branch or switch lowers here, any
          other exits at the terminator's pc. */
       g_e_ta_keep = 0;
+      if (in->inlret) e_undo_release(f, in->own);
       if (role != NULL && role->control != E_CF_NONE) {
         if (g_e_ta_used && !e_ta_keeps(fn, in, &types)) fprintf(f, "    ta_ok = 0;\n");
         if (emit_typed_return(f, fn, in, &types, cur, have_types)) {

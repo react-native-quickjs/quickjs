@@ -1613,17 +1613,54 @@ typedef struct CtorSum {
 } CtorSum;
 static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc **cg_out, CtorSum *sum);
 
+static const char *e_inl_why;
+/* the operations the copies lower beyond what q2_lowered lists: the bitwise group, value comparisons, a chained read and a constant-pool operand */
+static int inl_extra_rop(uint16_t rop) {
+  switch (rop) {
+    case ROP_bitand:
+    case ROP_bitor:
+    case ROP_bitxor:
+    case ROP_shl:
+    case ROP_sar:
+    case ROP_shr:
+    case ROP_lt:
+    case ROP_lte:
+    case ROP_gt:
+    case ROP_gte:
+    case ROP_binary_cpool:
+    case ROP_add_imm_self_s:
+    case ROP_sub_imm_self_s:
+    case ROP_div:
+    case ROP_mod:
+    case ROP_not:
+    case ROP_to_numeric:
+    case ROP_post_inc:
+    case ROP_post_dec:
+      return 1;
+    default:
+      return 0;
+  }
+}
 static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
   Q2Func cf;
-  int i, ok = 1;
+  int i, ok = 1, has_back_edge = 0;
+  e_inl_why = "ok";
   if (cg->func_kind != 0 || cg->ctl_count != 0 || cg->light_var_count != 0 || cg->arg_count > 6 ||
-      cg->len > 400)
+      cg->len > 400) {
+    e_inl_why = "kind/ctl/vars/args/len";
     return 0;
+  }
   if (q2_build(cg, &cf) < 0) {
     q2_free(&cf);
     return 0;
   }
-  if (cf.ninsns > 70) ok = 0;
+  if (cf.ninsns > 70) { ok = 0; e_inl_why = "more than 70 instructions"; }
+  for (i = 0; ok && i < cf.ninsns; i++) {
+    const Q2Insn *bi = &cf.insns[i];
+    int bt;
+    for (bt = 0; bt < bi->narg; bt++)
+      if (bi->arg[bt].kind == 't' && bi->next + (int32_t)bi->arg[bt].val <= bi->pc) has_back_edge = 1;
+  }
   for (i = 0; ok && i < cf.ninsns; i++) {
     const Q2Insn *in = &cf.insns[i];
     /* A copy may build an object of a plain constructor: the copy is kept only if that object is
@@ -1668,11 +1705,22 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
           ok = 0;
         }
         break;
+      case Q2_OP_PUT_FIELD:
+        /* A store into a field a copy may make: undone if the copy has to leave after it, so the
+           callee must not loop (a store would then be undone twice over). */
+        if (in->rop != ROP_put_field || has_back_edge) ok = 0;
+        break;
       default:
         ok = 0;
     }
-    if (in->rop == ROP_binary_cpool) ok = 0;
-    if (!q2_lowered(in->rop)) ok = 0;
+    if (!q2_lowered(in->rop) && !inl_extra_rop(in->rop)) ok = 0;
+    if (!ok && strcmp(e_inl_why, "ok") == 0) {
+      static char why[80];
+      char nm[48];
+      e_rop_name(in->rop, nm, sizeof(nm));
+      snprintf(why, sizeof(why), "instruction %s", nm);
+      e_inl_why = why;
+    }
   }
   q2_free(&cf);
   return ok;
@@ -1705,7 +1753,7 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
         if ((*out)[k].g == cg) break;
       if (k < n) continue;
     }
-    if (!inl_callee_ok(cg, in->rop == ROP_call_method)) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok\n", cg->name); continue; }
+    if (!inl_callee_ok(cg, in->rop == ROP_call_method)) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok: %s\n", cg->name, e_inl_why); continue; }
     q = realloc(*out, sizeof(**out) * (size_t)(n + 1));
     if (q == NULL) return n;
     *out = q;
