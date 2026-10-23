@@ -1447,12 +1447,16 @@
       "sha256": "e565bdd53827d0acbc7a5d0c329f1ef3272dad1b6e9eae9d99dfcd8b67bac7e5"
     },
     {
+      "name": "0368-aot-global-cell-writable.patch",
+      "sha256": "14bd044990d583fefcabe10615f710e45383c924522525550baad6a66d7be912"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "beeef150765620dff6ba9d78af512696c4e70a870d6be617c1a5c4c73188e0f3",
+    "quickjs.c": "c70633f246fb56e8f39020e15f19c08fe80c7bd9cc7464cbd507ea62e9109697",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

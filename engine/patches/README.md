@@ -453,3 +453,4 @@ bump while `9999` is missing.
 | `0365` | The profiler counts how often a global read cache cell was filled | An exit-on-miss global read must be cheap | `regvm_global_site_fill` | No. |
 | `0366` | The profiler names a read two prototypes up apart from a direct prototype read | A body could not tell which method-read sites its own cache serves inline | `regvm_pic_fill` | No. |
 | `0367` | The layout export carries the two-prototype cache kind and the IsHTMLDDA bit | Inherited-method reads and null tests of objects cost a call into the engine | `JSAotGenLayout` | No. |
+| `0368` | A global variable cell says whether its slot is plainly writable | A top-level loop's global counter store was a call into the engine | `JSGVCell`, `JSAotGenLayout` | No. |

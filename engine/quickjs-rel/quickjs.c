@@ -1202,6 +1202,8 @@ typedef struct JSGVCell {
     uint32_t atom;              /* JS_ATOM_NULL (0) when empty */
     uint32_t gen;               /* rt->gv_cell_gen snapshot; 0 never matches */
     struct JSProperty *slot;    /* valid while `gen` matches */
+    uint32_t wr;                /* the slot is a plain writable data property (a flag change
+                                   bumps the generation, like every other change) */
 } JSGVCell;
 
 struct JSContext {
@@ -16124,7 +16126,7 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
 #endif
 
 static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
-                                   JSObject *p, JSProperty *pr)
+                                   JSObject *p, JSProperty *pr, int flags)
 {
     JSGVCell *set = ctx->gv_cells[prop & (JS_GV_CELL_SETS - 1)];
     if (set[0].atom != prop)
@@ -16132,6 +16134,7 @@ static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
     set[0].atom = prop;
     set[0].gen = ctx->rt->gv_cell_gen;
     set[0].slot = pr;
+    set[0].wr = (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE;
 }
 
 static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
@@ -16155,7 +16158,7 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
                JS_UNINITIALIZED into global_var_obj bumps the generation, so a
                hit needs no TDZ test. */
             if (likely((prs->flags & JS_PROP_TMASK) == 0))
-                js_gv_cell_fill(ctx, prop, p, pr);
+                js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
             return js_dup(pr->u.value);
         }
     }
@@ -16166,7 +16169,7 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
     if (prs) {
         if (likely((prs->flags & JS_PROP_TMASK) == 0)) {
             /* Reached only after the global_var_obj probe missed. */
-            js_gv_cell_fill(ctx, prop, p, pr);
+            js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
             return js_dup(pr->u.value);
         }
     }
@@ -16253,7 +16256,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
             }
             if (flag != 1 && likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
                                     JS_PROP_WRITABLE))
-                js_gv_cell_fill(ctx, prop, p, pr);
+                js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -16265,7 +16268,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
-            js_gv_cell_fill(ctx, prop, p, pr);
+            js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -61220,6 +61223,14 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_fnbc_var_ref_count =
         (uint32_t)offsetof(JSFunctionBytecode, var_ref_count);
     out->off_rt_gv_cell_gen = (uint32_t)offsetof(JSRuntime, gv_cell_gen);
+    out->off_ctx_gv_cells = (uint32_t)offsetof(JSContext, gv_cells);
+    out->sizeof_gv_cell = (uint32_t)sizeof(JSGVCell);
+    out->gv_cell_sets = JS_GV_CELL_SETS;
+    out->gv_cell_ways = JS_GV_CELL_WAYS;
+    out->off_gvc_atom = (uint32_t)offsetof(JSGVCell, atom);
+    out->off_gvc_gen = (uint32_t)offsetof(JSGVCell, gen);
+    out->off_gvc_slot = (uint32_t)offsetof(JSGVCell, slot);
+    out->off_gvc_wr = (uint32_t)offsetof(JSGVCell, wr);
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);
     out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);

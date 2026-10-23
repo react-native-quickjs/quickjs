@@ -1,0 +1,105 @@
+Subject: A global variable cell says whether its slot is plainly writable, and the layout export names the cells
+
+What this does
+  - `JSGVCell` gains `wr`, set when the cell is filled from the property's own flags: the slot is a
+    plain writable data property (valid for as long as `gen` matches, since a flag change bumps it).
+  - `JSAotGenLayout` exports where a context keeps its cell sets and the cell's fields.
+
+Why we need it
+  A compiled store to a global variable (a loop counter of a script, `i++` at top level) called into
+  the engine, which looked the cell up and re-read the property's flags from the shape on every store.
+  With the flag in the cell, a unit does the lookup, the generation test and the store itself.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -141,6 +141,11 @@
+     /* The cache entry kind of a holder two prototypes up, and the byte and mask of
+        `is_HTMLDDA`: an inline null test of an object has to ask it. */
+     uint32_t reg_pic_proto2, off_object_htmldda_byte, object_htmldda_mask;
++    /* The global variable cell sets: a store to a global the read cache holds is a lookup of
++       the atom's set, a generation test and a store into the slot when the cell says the
++       property is plainly writable. */
++    uint32_t off_ctx_gv_cells, sizeof_gv_cell, gv_cell_sets, gv_cell_ways;
++    uint32_t off_gvc_atom, off_gvc_gen, off_gvc_slot, off_gvc_wr;
+     /* The rest of the light-frame header a generated native entry writes, so
+        it can build the frame the engine's own light call builds. The header is
+        the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1202,6 +1202,8 @@
+     uint32_t atom;              /* JS_ATOM_NULL (0) when empty */
+     uint32_t gen;               /* rt->gv_cell_gen snapshot; 0 never matches */
+     struct JSProperty *slot;    /* valid while `gen` matches */
++    uint32_t wr;                /* the slot is a plain writable data property (a flag change
++                                   bumps the generation, like every other change) */
+ } JSGVCell;
+ 
+ struct JSContext {
+@@ -16124,7 +16126,7 @@
+ #endif
+ 
+ static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
+-                                   JSObject *p, JSProperty *pr)
++                                   JSObject *p, JSProperty *pr, int flags)
+ {
+     JSGVCell *set = ctx->gv_cells[prop & (JS_GV_CELL_SETS - 1)];
+     if (set[0].atom != prop)
+@@ -16132,6 +16134,7 @@
+     set[0].atom = prop;
+     set[0].gen = ctx->rt->gv_cell_gen;
+     set[0].slot = pr;
++    set[0].wr = (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE;
+ }
+ 
+ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
+@@ -16155,7 +16158,7 @@
+                JS_UNINITIALIZED into global_var_obj bumps the generation, so a
+                hit needs no TDZ test. */
+             if (likely((prs->flags & JS_PROP_TMASK) == 0))
+-                js_gv_cell_fill(ctx, prop, p, pr);
++                js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
+             return js_dup(pr->u.value);
+         }
+     }
+@@ -16166,7 +16169,7 @@
+     if (prs) {
+         if (likely((prs->flags & JS_PROP_TMASK) == 0)) {
+             /* Reached only after the global_var_obj probe missed. */
+-            js_gv_cell_fill(ctx, prop, p, pr);
++            js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
+             return js_dup(pr->u.value);
+         }
+     }
+@@ -16253,7 +16256,7 @@
+             }
+             if (flag != 1 && likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
+                                     JS_PROP_WRITABLE))
+-                js_gv_cell_fill(ctx, prop, p, pr);
++                js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
+             set_value(ctx, &pr->u.value, val);
+             return 0;
+         }
+@@ -16265,7 +16268,7 @@
+         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+             /* fast path */
+-            js_gv_cell_fill(ctx, prop, p, pr);
++            js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
+             set_value(ctx, &pr->u.value, val);
+             return 0;
+         }
+@@ -61220,6 +61223,14 @@
+     out->off_fnbc_var_ref_count =
+         (uint32_t)offsetof(JSFunctionBytecode, var_ref_count);
+     out->off_rt_gv_cell_gen = (uint32_t)offsetof(JSRuntime, gv_cell_gen);
++    out->off_ctx_gv_cells = (uint32_t)offsetof(JSContext, gv_cells);
++    out->sizeof_gv_cell = (uint32_t)sizeof(JSGVCell);
++    out->gv_cell_sets = JS_GV_CELL_SETS;
++    out->gv_cell_ways = JS_GV_CELL_WAYS;
++    out->off_gvc_atom = (uint32_t)offsetof(JSGVCell, atom);
++    out->off_gvc_gen = (uint32_t)offsetof(JSGVCell, gen);
++    out->off_gvc_slot = (uint32_t)offsetof(JSGVCell, slot);
++    out->off_gvc_wr = (uint32_t)offsetof(JSGVCell, wr);
+     out->off_ctx_interrupt_counter =
+         (uint32_t)offsetof(JSContext, interrupt_counter);
+     out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);
