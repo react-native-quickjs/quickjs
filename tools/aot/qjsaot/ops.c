@@ -1932,6 +1932,9 @@ static int e_emit_generic_body_raw(FILE *f, const Q2Func *fn, char hex[33]) {
   if (!fn->ok) return -1;
   has_ctl = fn->g->ctl_count > 0;
 
+  /* Set by a speculative body just before it calls this one, so a loop hook below can hand
+     back to it by returning instead of by a nested call. */
+  fprintf(f, "static uint8_t e_gfs_%s;\n", hex);
   fprintf(
       f, "E_TEXT %sJSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n", e_linkage(), hex);
   fprintf(
@@ -1942,6 +1945,7 @@ static int e_emit_generic_body_raw(FILE *f, const Q2Func *fn, char hex[33]) {
   fprintf(f, "    uint32_t pc = 0;\n");
   fprintf(f, "    uint32_t e_from_pc = entry_pc;\n");
   fprintf(f, "    uint32_t osr_from = entry_pc; (void)osr_from;\n");
+  fprintf(f, "    const int from_spec_ = e_gfs_%s; e_gfs_%s = 0; (void)from_spec_;\n", hex, hex);
   fprintf(f, "    const void *pic = q2_pic(f);\n    const uint8_t *ecb = q2_code(f); (void)ecb;\n");
   /* The PIC way stride, read once per activation. Every compiled store into the
      frame goes through a pointer, so the compiler cannot prove those stores
@@ -3143,10 +3147,22 @@ static void e_emit_exit_log(
 /* The generic body entered at `pc` from the speculative body. In a framed body
    that is a tail call on the live frame. A frameless body has none: the live
    registers travel as (offset, value) pairs and `aot_nx_` builds the frame. */
+/* the speculative body has loop entries, so a generic body it calls can hand back to it by returning rather than by a nested call */
+static int g_e_osr_loop;
+
+static void e_emit_ret_g(FILE *f, const char *indent, const char *hex, const char *pcexpr) {
+  if (g_e_osr_loop)
+    fprintf(f, "%sE_RET_G(%s, %s);\n", indent, hex, pcexpr);
+  else
+    fprintf(f, "%sreturn aot_g_%s(ctx, f, fr, %s);\n", indent, hex, pcexpr);
+}
+
 static void e_emit_generic_call(
     FILE *f, char hex[33], int pc, int nlv, const char *indent) {
   if (!g_e_fl && !g_e_inl) {
-    fprintf(f, "%sreturn aot_g_%s(ctx, f, fr, %d);\n", indent, hex, pc);
+    char pe[24];
+    snprintf(pe, sizeof(pe), "%d", pc);
+    e_emit_ret_g(f, indent, hex, pe);
     return;
   }
   if (g_e_inl && !g_e_exit_dirty) {
@@ -3301,8 +3317,8 @@ static void e_emit_exit(
           if (g_e_osr_res[q] == nx)
             fprintf(f, "      if (ip_ == code_ + %d) goto osr_%d;\n", nx, nx);
       }
-      fprintf(
-          f, "      return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_)); }\n    }\n", hex);
+      e_emit_ret_g(f, "      ", hex, "(uint32_t)(ip_ - code_)");
+      fprintf(f, "    } }\n");
       return;
     }
   }
@@ -3833,8 +3849,7 @@ static int emit_typed_opcall(
      results to the frame. */
   fprintf(f, "    if (__builtin_expect(ip_ != code_ + %d, 0)) {\n", in->next);
   fprintf(f, "        E_HANDOFF_NOTE(%d);\n", fi);
-  fprintf(
-      f, "        return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_));\n", hex);
+  e_emit_ret_g(f, "        ", hex, "(uint32_t)(ip_ - code_)");
   fprintf(f, "    } }\n");
 
   /* 5. Reload the defs the role says it wrote, by value id, with the tag guard. */
@@ -3992,11 +4007,10 @@ static void e_emit_term_step(
       "    if (ip_ == code_ + %d) c_ = %d;\n"
       "    else if (ip_ == code_ + %d) c_ = %d;\n"
       "    else {\n"
-      "        E_HANDOFF_NOTE(%d);\n"
-      "        return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_));\n"
-      "    } }\n",
-      in->pc, blk->succ_pc[0], inv ? 0 : 1, blk->succ_pc[1], inv ? 1 : 0, fi,
-      hex);
+      "        E_HANDOFF_NOTE(%d);\n",
+      in->pc, blk->succ_pc[0], inv ? 0 : 1, blk->succ_pc[1], inv ? 1 : 0, fi);
+  e_emit_ret_g(f, "        ", hex, "(uint32_t)(ip_ - code_)");
+  fprintf(f, "    } }\n");
 }
 
 /* Whether a terminator can run through the wrapper: a two-way branch that defines
@@ -9262,6 +9276,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   /* Loop re-entry: a framed body can be entered at a loop header after the generic body
      ran the loop's first iterations. */
   osr_n = 0;
+  g_e_osr_loop = 0;
   g_e_osr_res_n = 0;
   if (!g_e_fl && !g_e_inl && fn->g->ctl_count == 0 && !e_nosr_on()) {
     int ib;
@@ -9287,6 +9302,7 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       osr_pc[osr_n++] = fn->blocks[sb].start_pc;
     }
   }
+  if (osr_n > 0) g_e_osr_loop = 1;
   if (!g_e_fl && !g_e_inl) snprintf(gen0, sizeof(gen0), "aot_g_%s(ctx, f, fr, entry_pc)", hex);
   if (g_e_fl) {
     /* The exit function comes first: the body names it. */
@@ -9435,6 +9451,9 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
      see the profiled one. Either refuses, and the generic body serves the call.
      An unfilled cell on a later site is tolerated: that access misses and exits
      until the generic body fills it. */
+  /* A loop entry handed back by the generic body starts here: the group shapes are read again
+     from the cells it has filled. */
+  if (osr_n > 0) fprintf(f, "    osr_dispatch:;\n");
   {
     int g, q;
     int ng = g_e_facts != NULL ? g_e_facts->ngroups : 0;
