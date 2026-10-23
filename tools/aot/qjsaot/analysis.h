@@ -46,6 +46,8 @@ typedef struct ESiteInfo {
   int group;      /* index into EFacts.groups, or E_GROUP_NONE */
   Q2ValueId recv; /* the receiver value, or Q2_NO_VALUE */
   int poly;       /* the profile saw 2-4 shapes, all own slots: polymorphic cache */
+  int write;      /* the site is a field store (its cell is checked for the writable kind) */
+  int hot;        /* the profile sampled the site (1024+ executions): its cell is checked strictly at entry */
 } ESiteInfo;
 
 /* A group: every site whose profile saw exactly one shape, sharing it, so the
@@ -107,6 +109,10 @@ typedef struct EFacts {
   Q2ValueId *fwd;
   uint8_t *access; /* a guarded access of a group site (tag + shape test) */
   uint8_t *skip;   /* ... whose test is redundant: SHAPE(receiver, group) holds */
+  /* Per instruction, bit r: the cell of its r-th site is known to hold the group's shape
+     (validated at entry or by an earlier access, with no safepoint since), so the access
+     does not test it again. */
+  uint8_t *cellskip;
   /* A grouped field access whose miss must leave the speculative body (an
      exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter

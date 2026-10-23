@@ -78,6 +78,10 @@ int qjs_aot_prof_site(
     const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
+unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
+
+/* A cell fact's value in the shape-fact list: no receiver value is this large. */
+#define E_CELLV(site) (0x40000000 + (site))
 
 /* ---- the fact set -------------------------------------------------------- */
 
@@ -563,6 +567,11 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
       sites[n].group = E_GROUP_NONE;
       sites[n].recv = ref[r].recv < 0 ? Q2_NO_VALUE : (Q2ValueId)ref[r].recv;
       sites[n].poly = 0;
+      {
+        Access stw;
+        sites[n].write = insn_store(in, &stw) && stw.kind == E_K_FIELD;
+        sites[n].hot = qjs_aot_prof_pc_count(fn->g->digest, in->pc) > 0;
+      }
       n++;
     }
   }
@@ -777,6 +786,10 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
         f->nskip++;
       }
       if (fs_add_shape(s, rv, g) < 0) return -1;
+      /* The site's own cell: a cell fact is held with the shape facts under a value no
+         receiver has, and dies with them at a safepoint. */
+      if (fs_has_shape(s, E_CELLV(ref[r].site), g)) f->cellskip[insn] |= (uint8_t)(1u << r);
+      if (fs_add_shape(s, E_CELLV(ref[r].site), g) < 0) return -1;
     }
   }
 
@@ -966,11 +979,12 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
       malloc(sizeof(*out->fwd) * (size_t)(fn->ninsns > 0 ? fn->ninsns : 1));
   out->access = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->skip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->cellskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->miss_exits = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->blocks = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1),
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
-  if (out->fwd == NULL || out->access == NULL || out->skip == NULL ||
+  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -991,6 +1005,12 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
 
     if (b == 0 || blk->npreds <= 0) {
       fs_clear(&cur);
+      /* The prelude validated every group site's cell (strictly) before the first
+         instruction, and before every resume entry. */
+      for (k = 0; k < out->nsites; k++)
+        if (out->sites[k].group >= 0 && out->sites[k].hot &&
+            fs_add_shape(&cur, E_CELLV(out->sites[k].site), out->sites[k].group) < 0)
+          goto done;
     } else {
       for (p = 0; p < blk->npreds; p++) {
         if (blk->preds[p] < 0) continue;
@@ -1134,6 +1154,7 @@ void e_facts_free(EFacts *f) {
   free(f->fwd);
   free(f->access);
   free(f->skip);
+  free(f->cellskip);
   free(f->miss_exits);
   if (f->groups != NULL) {
     for (i = 0; i < f->ngroups; i++) free(f->groups[i].sites);

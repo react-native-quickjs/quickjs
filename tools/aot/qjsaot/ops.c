@@ -7093,15 +7093,20 @@ static void e_group_exit_stub(
    access miss, it cannot make it use another shape's slot. Keep it that way: an
    access that read its offset early but tested the current cell would be unsound. */
 static void e_group_test(
-    char *out, size_t n, int skip, const char *recv, int g, int site,
+    char *out, size_t n, int skip, int cellskip, const char *recv, int g, int site,
     int write) {
+  char cell[96];
   snprintf(
-      out, n, "%s(pic, %d) != gsh%d",
+      cell, sizeof(cell), "%s(pic, %d) != gsh%d",
       write ? "q2_cell_wshape" : "q2_cell_shape", site, g);
-  if (!skip) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "q2_shape_of(%s) != gsh%d || %s", recv, g, out);
-    snprintf(out, n, "%s", tmp);
+  if (skip && cellskip) {
+    snprintf(out, n, "0");
+  } else if (skip) {
+    snprintf(out, n, "%s", cell);
+  } else if (cellskip) {
+    snprintf(out, n, "q2_shape_of(%s) != gsh%d", recv, g);
+  } else {
+    snprintf(out, n, "q2_shape_of(%s) != gsh%d || %s", recv, g, cell);
   }
   if (skip)
     g_e_n_skip++;
@@ -7123,7 +7128,7 @@ static int emit_group_read(
     return 0;
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_group_exit_stub(f, in, cur, rv);
-  e_group_test(test, sizeof(test), skip, recv, g, site, 0);
+  e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 0);
   fprintf(f, "    { JSValue _f;\n");
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   fprintf(f, "      _f = *q2_slotp(%s, q2_cell_off(pic, %d));\n", recv, site);
@@ -7156,7 +7161,7 @@ static int emit_group_chain(
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_group_exit_stub(f, in, cur, rv);
   fprintf(f, "    { JSValue _c0, _c1;\n");
-  e_group_test(test, sizeof(test), 0, recv, g1, s1, 0);
+  e_group_test(test, sizeof(test), 0, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   fprintf(f, "      _c0 = *q2_slotp(%s, q2_cell_off(pic, %d));\n", recv, s1);
   fprintf(
@@ -7164,7 +7169,7 @@ static int emit_group_chain(
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
       in->pc);
-  e_group_test(test, sizeof(test), 0, "_c0", g2, s2, 0);
+  e_group_test(test, sizeof(test), 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   fprintf(f, "      _c1 = *q2_slotp(_c0, q2_cell_off(pic, %d));\n", s2);
   fprintf(
@@ -7205,7 +7210,7 @@ static int emit_group_write(
   int skip = g_e_facts->skip[e_insn_idx(fn, in)];
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_group_exit_stub(f, in, cur, rv);
-  e_group_test(test, sizeof(test), skip, recv, g, site, 1);
+  e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 1);
   fprintf(f, "    {\n");
   fprintf(
       f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
@@ -9618,24 +9623,49 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
         fprintf(
             f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(pic, %d);\n", g, g,
             gr->sites[q]);
-      /* Every cell empty: no site of the group has run yet, which is no reason
-         to refuse the entry. The shape becomes one no object has, so each access
-         of the group takes its miss exit if it is ever reached (and the 257-exit
-         rule switches the function off if that turns out to be common). */
-      fprintf(
-          f,
-          "    if (__builtin_expect(gsh%d == NULL, 0)) gsh%d = E_NO_SHAPE;\n", g,
-          g);
-      for (q = 0; q < gr->nsites; q++)
+      /* A site the profile sampled (hot) must have a cell holding the group's shape, in the
+         kind it needs (a store needs the writable kind): its accesses and the facts assume
+         it until a safepoint. A cell that is empty or of another shape refuses the entry;
+         the generic body that runs instead fills the cell, so the next call can enter. A
+         cold site's cell may be empty (its accesses test it themselves); only a cell of
+         another shape refuses. */
+      {
+        int any_hot = 0;
+        for (q = 0; q < gr->nsites; q++) {
+          int z;
+          for (z = 0; z < g_e_facts->nsites; z++)
+            if (g_e_facts->sites[z].site == gr->sites[q] && g_e_facts->sites[z].hot) any_hot = 1;
+        }
+        if (any_hot)
+          fprintf(
+              f,
+              "    if (__builtin_expect(gsh%d == NULL, 0)) {\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "    }\n",
+              g, fi, gen0);
+        else
+          fprintf(
+              f, "    if (__builtin_expect(gsh%d == NULL, 0)) gsh%d = E_NO_SHAPE;\n", g, g);
+      }
+      for (q = 0; q < gr->nsites; q++) {
+        int wr = 0, hot = 0, z;
+        for (z = 0; z < g_e_facts->nsites; z++)
+          if (g_e_facts->sites[z].site == gr->sites[q]) {
+            wr = g_e_facts->sites[z].write;
+            hot = g_e_facts->sites[z].hot;
+          }
         fprintf(
             f,
-            "    { const void *_s = q2_cell_shape(pic, %d);\n"
-            "      if (__builtin_expect(_s != NULL && _s != gsh%d, 0)) {\n"
+            "    { const void *_s = %s(pic, %d);\n"
+            "      if (__builtin_expect(%s_s != gsh%d, 0)) {\n"
             "        E_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
             "        E_REFUSE_NOTE(%d);\n"
             "        return %s;\n"
             "      } }\n",
-            gr->sites[q], g, hex, gr->sites[q], fi, gen0);
+            wr && hot ? "q2_cell_wshape" : "q2_cell_shape", gr->sites[q],
+            hot ? "" : "_s != NULL && ", g, hex, gr->sites[q], fi, gen0);
+      }
     }
   }
   /* Counted only now: everything that could refuse the entry has been passed, so
