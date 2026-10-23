@@ -419,6 +419,13 @@ static int transfer_def(
         case REG_BIN_SAR:
           return rep_bit(a, b);
         case REG_BIN_SHR:
+          /* A logical shift right by a constant of 1 to 31 gives a value below 2^31 whatever the
+             operand: an exact i32, with no record. */
+          if ((in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s) && in->narg >= 4 &&
+              (in->arg[3].kind == 'I' || in->arg[3].kind == 'i') && (in->arg[3].val & 31) != 0) {
+            if (a == E_LB_BOT) return E_LB_BOT;
+            if (lb_num(a)) return E_LB_I32;
+          }
           return rep_exact(a, b, record_int_only(dv));
         default:
           /* a comparison of numbers written as an operation with a comparison sub */
