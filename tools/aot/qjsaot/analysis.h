@@ -46,6 +46,7 @@ typedef struct ESiteInfo {
   int group;      /* index into EFacts.groups, or E_GROUP_NONE */
   Q2ValueId recv; /* the receiver value, or Q2_NO_VALUE */
   int poly;       /* the profile saw 2-4 shapes, all own slots: polymorphic cache */
+  int proto;      /* a read served from the direct prototype: the holder is the shape's proto */
   int write;      /* the site is a field store (its cell is checked for the writable kind) */
   int hot;        /* the profile sampled the site (1024+ executions): its cell is checked strictly at entry */
 } ESiteInfo;
@@ -176,6 +177,8 @@ int e_facts_poly_op(const Q2Insn *in);void e_facts_free(EFacts *f);
 
 /* The group a site index belongs to, or E_GROUP_NONE. */
 int e_facts_site_group(const EFacts *f, int site);
+/* Whether a site is a prototype-read site of its group. */
+int e_facts_site_proto(const EFacts *f, int site);
 
 /* ---- representations ---------------------------------------------------- */
 

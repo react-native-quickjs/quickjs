@@ -78,6 +78,7 @@
 int qjs_aot_prof_site(
     const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
+int qjs_aot_prof_site_proto(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
 
@@ -576,6 +577,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
       sites[n].group = E_GROUP_NONE;
       sites[n].recv = ref[r].recv < 0 ? Q2_NO_VALUE : (Q2ValueId)ref[r].recv;
       sites[n].poly = 0;
+      sites[n].proto = 0;
       {
         Access stw;
         sites[n].write = insn_store(in, &stw) && stw.kind == E_K_FIELD;
@@ -596,7 +598,12 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
     }
     if (ns != 1) continue; /* never filled, or too many shapes: no group */
     /* Only an own readable or writable slot has a fixed offset to group on. */
-    if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) continue;
+    if (qjs_aot_prof_site_proto(fn->g->digest, sites[k].site) && !sites[k].write &&
+        getenv("QJS_AOT_NOPROTOGROUP") == NULL) {
+      sites[k].proto = 1;
+    } else if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) {
+      continue;
+    }
     if (qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) continue;
     for (j = 0; j < ng; j++) {
       if (gshape[j] == (int64_t)shapes[0]) {
@@ -1029,7 +1036,7 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
             int g, dup = 0, z, hot = 0;
             if (ref[r].site < 0 || ref[r].recv < 0) continue;
             g = e_facts_site_group(out, ref[r].site);
-            if (g < 0) continue;
+            if (g < 0 || e_facts_site_proto(out, ref[r].site)) continue;
             for (z = 0; z < out->nsites; z++)
               if (out->sites[z].site == ref[r].site) hot = out->sites[z].hot;
             if (!hot) continue;
@@ -1431,4 +1438,12 @@ int e_facts_safepoint_free(const Q2Func *fn) {
   e_facts_free(&f);
   e_facts_pure_ok = saved;
   return free_;
+}
+
+int e_facts_site_proto(const EFacts *f, int site) {
+  int i;
+  if (f == NULL || f->sites == NULL) return 0;
+  for (i = 0; i < f->nsites; i++)
+    if (f->sites[i].site == site) return f->sites[i].proto;
+  return 0;
 }

@@ -1107,6 +1107,18 @@ int qjs_aot_prof_site_own(const uint8_t dg[16], int site) {
   return 0;
 }
 
+/* Whether every fill of a read site was a read from the direct prototype. */
+int qjs_aot_prof_site_proto(const uint8_t dg[16], int site) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i;
+  if (!e || !g_prof_sitekinds) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    if (e->sites[i].site != site) continue;
+    return e->sites[i].kinds == (1u << 2);
+  }
+  return 0;
+}
+
 /* Whether every fill of a read site installed an own slot or a prototype slot, the
    two kinds the inline read hit (q2_own_read_hit) serves: a prototype method read
    hits through the cell's holder and shape check. */
@@ -2735,7 +2747,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  e = (const unsigned char *)pic + (size_t)k * "
         "QJS_AOT_SIZEOF_JSREGPIC;\n"
         "  kind = *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND);\n"
-        "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W) "
+        "  if (kind != QJS_AOT_REG_PIC_OWN && kind != QJS_AOT_REG_PIC_OWN_W &&\n"
+        "      kind != QJS_AOT_REG_PIC_PROTO) "
         "return NULL;\n"
         "  return *(const void *const *)e;\n"
         "}\n\n"
@@ -2774,6 +2787,28 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      *(const unsigned char *const *)(p + "
         "QJS_AOT_OFF_JSOBJECT_PROP);\n"
         "  return (JSValue *)(prop + off);\n"
+        "}\n\n"
+        /* A prototype read: the holder is the receiver's shape's prototype. The test is that
+           the holder's own shape is still the one the cell was filled with. */
+        "static inline JSValue *q2_hslotp(JSValue v, uint32_t off)\n"
+        "{\n"
+        "  const unsigned char *h = *(const unsigned char *const *)(\n"
+        "      (const unsigned char *)q2_shape_of(v) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  const unsigned char *prop =\n"
+        "      *(const unsigned char *const *)(h + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+        "  return (JSValue *)(prop + off);\n"
+        "}\n"
+        "static inline int q2_holder_bad_sh(const void *sh, void *const *holders, int site)\n"
+        "{\n"
+        "  const unsigned char *h = *(const unsigned char *const *)(\n"
+        "      (const unsigned char *)sh + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  return h == NULL || *(const void *const *)(h + QJS_AOT_OFF_JSOBJECT_SHAPE) != holders[site];\n"
+        "}\n"
+        "static inline int q2_holder_bad(JSValue v, void *const *holders, int site)\n"
+        "{\n"
+        "  const unsigned char *h = *(const unsigned char *const *)(\n"
+        "      (const unsigned char *)q2_shape_of(v) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "  return h == NULL || *(const void *const *)(h + QJS_AOT_OFF_JSOBJECT_SHAPE) != holders[site];\n"
         "}\n\n"
         /* A fast array's element read: class, bounds, hole and lazy-JSON
            checks, then the element itself, borrowed. No reference is taken,
