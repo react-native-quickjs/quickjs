@@ -1,0 +1,52 @@
+Subject: The runtime records that a lazy JSON document exists, so compiled code tests for lazy markers only then
+
+What this does
+  - `JSRuntime.lazy_json_seen` is set when `json_lazy_parse` starts building a document, and
+    never cleared. Its offset is published in the AOT layout (`off_rt_lazy_json`).
+
+Why we need it
+  Every field and element load in compiled code compared the loaded value's tag against the
+  lazy-JSON marker tag (5-17% of the cycles of the richards, deltablue and box2d solver
+  functions; 9.5% of richards' score when the tests are removed). A lazy marker can only be
+  reached once a lazy document has been created, so a speculative body now checks the flag at
+  entry and after each safepoint and carries no per-load test.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -715,6 +715,9 @@
+        an is_prototype object. Add-transition IC entries snapshot it and only hit while
+        it is unchanged. Saturates at JS_IC_EPOCH_MAX (then transition filling stops). */
+     uint32_t ic_watchpoint_epoch;
++    /* Set once a lazily parsed JSON document has been created in this runtime: values it
++       holds can be lazy markers, which compiled code tests for only while this is set. */
++    uint8_t lazy_json_seen;
+     /* Prototype/global watchpoint bumps, counted because the AOT
+        prototype-epoch guard assumes prototypes settle after startup. */
+     uint64_t aot_epoch_bumps;
+@@ -61327,6 +61330,7 @@
+     out->off_regpic_misses = (uint32_t)offsetof(JSRegPIC, misses);
+     out->reg_pic_add_w = REG_PIC_ADD_W;
+     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
++    out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
+     {
+         /* The object's flag bits and its inline slot capacity share one 16-bit word:
+            find where it is and which bits each field takes by setting them in a
+@@ -94606,6 +94610,7 @@
+         JS_FreeValue(ctx, document);
+         return is_exception ? JS_EXCEPTION : JS_UNDEFINED;
+     }
++    ctx->rt->lazy_json_seen = 1;
+     v = js_lazy_parse_tape_node(ctx, doc, document, 0, NULL);
+     if (JS_IsUndefined(v)) {
+         JS_FreeValue(ctx, document);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -167,7 +167,7 @@
+        kind, the runtime's epoch, and the object's flag word (where it is, the
+        extensible bit, the bits that forbid the replay, and the inline slot
+        capacity's mask and shift). */
+-    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch;
++    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json;
+     uint32_t off_object_flags16, object_extensible_mask, object_noadd_mask;
+     uint32_t object_inline_cap_mask, object_inline_cap_shift;
+     /* A rope whose linearised form is memoised holds the flat string on the left and the

@@ -1423,12 +1423,20 @@
       "sha256": "27072d23ca056c01d74528e5ef74ac01860f2dfbefc04ce3d1bf5ff35903407c"
     },
     {
+      "name": "0362-aot-lazy-json-flag.patch",
+      "sha256": "2e9d97e5a17a2eb8148a4102db7e01a47132e9fe95059fd09e8de3bf4b2176f0"
+    },
+    {
+      "name": "0363-aot-prof-elem-class.patch",
+      "sha256": "d1c446d3b906e922e911db3df5737dac9c7d248675b9f9e16dcf3bce1789b201"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "dc80b3a21312fa8693cdc98b3300b1478f82e27343e23a3fff76c284916c29dc",
+    "quickjs.c": "a063dd340076fa43f4bcfc2a0bf669c552ba47d6df66ee2d2a571bad814e8b8b",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

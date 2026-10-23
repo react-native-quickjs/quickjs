@@ -715,6 +715,9 @@ struct JSRuntime {
        an is_prototype object. Add-transition IC entries snapshot it and only hit while
        it is unchanged. Saturates at JS_IC_EPOCH_MAX (then transition filling stops). */
     uint32_t ic_watchpoint_epoch;
+    /* Set once a lazily parsed JSON document has been created in this runtime: values it
+       holds can be lazy markers, which compiled code tests for only while this is set. */
+    uint8_t lazy_json_seen;
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
@@ -61327,6 +61330,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_regpic_misses = (uint32_t)offsetof(JSRegPIC, misses);
     out->reg_pic_add_w = REG_PIC_ADD_W;
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
+    out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
     {
         /* The object's flag bits and its inline slot capacity share one 16-bit word:
            find where it is and which bits each field takes by setting them in a
@@ -94606,6 +94610,7 @@ static JSValue json_lazy_parse(JSContext *ctx, const char *buf, size_t buf_len)
         JS_FreeValue(ctx, document);
         return is_exception ? JS_EXCEPTION : JS_UNDEFINED;
     }
+    ctx->rt->lazy_json_seen = 1;
     v = js_lazy_parse_tape_node(ctx, doc, document, 0, NULL);
     if (JS_IsUndefined(v)) {
         JS_FreeValue(ctx, document);
