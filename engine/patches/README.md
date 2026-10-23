@@ -444,3 +444,4 @@ bump while `9999` is missing.
 | `0356` | A new Map/Set iterator starts after the deleted records in front of it | An LRU cache walked every zombie record pinned by dead-but-uncollected iterators on each `keys().next()` | `JSMapState.scan_start` | No. |
 | `0357` | Compiled code calls Map/Set get/has/set/delete without the native frame | ~140 instructions of JSStackFrame setup per builtin call | `qjs_aot_call_c`, `cfunc.lean`, `aot_lean_kind` | No. |
 | `0358` | The short string concatenation is shared by the interpreter and compiled code | `js_add_slow` converted the int to a temporary string and concatenated twice | `js_concat_short` | No. |
+| `0359` | Compiled code calls the plain String.prototype methods without the native frame | The frame setup and stack check on every string method call | `aot_lean_kind`, `aot_lean_args` | No. |

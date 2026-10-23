@@ -64420,8 +64420,20 @@ static JSValue js_map_has(JSContext *ctx, JSValueConst this_val, int argc,
 static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val, int argc,
                              JSValueConst *argv, int magic);
 
+static JSValue js_string_at(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_charAt(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_codePointAt(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_substring(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_substr(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_slice(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_string_trim(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+
 #define AOT_LEAN_NONE 1
 #define AOT_LEAN_MAP  2
+#define AOT_LEAN_STR  3
 
 /* Which builtins compiled code may call straight, without the JSStackFrame js_call_c_function
    builds: Map and Set get/has/set(add)/delete on a Map or Set (not a weak one) with the
@@ -64435,13 +64447,49 @@ static uint8_t aot_lean_kind(JSObject *p)
 {
     void *f;
 
-    if (p->u.cfunc.cproto != JS_CFUNC_generic_magic || (p->u.cfunc.magic & ~1) != 0)
+    f = (void *)p->u.cfunc.c_function.generic;
+    if (p->u.cfunc.cproto == JS_CFUNC_generic) {
+        if (f == (void *)js_string_at || f == (void *)js_string_charCodeAt ||
+            f == (void *)js_string_charAt || f == (void *)js_string_codePointAt ||
+            f == (void *)js_string_substring || f == (void *)js_string_substr ||
+            f == (void *)js_string_slice)
+            return AOT_LEAN_STR;
         return AOT_LEAN_NONE;
-    f = (void *)p->u.cfunc.c_function.generic_magic;
+    }
+    if (p->u.cfunc.cproto != JS_CFUNC_generic_magic)
+        return AOT_LEAN_NONE;
+    if (f == (void *)js_string_indexOf || f == (void *)js_string_includes ||
+        f == (void *)js_string_trim || f == (void *)js_string_toLowerCase)
+        return AOT_LEAN_STR;
+    if ((p->u.cfunc.magic & ~1) != 0)
+        return AOT_LEAN_NONE;
     if (f == (void *)js_map_get || f == (void *)js_map_set || f == (void *)js_map_has ||
         f == (void *)js_map_delete)
         return AOT_LEAN_MAP;
     return AOT_LEAN_NONE;
+}
+
+/* Whether every argument is a value ToString/ToInteger converts without running JS and
+   without throwing: a number, a boolean, null, undefined or a flat string (not a symbol, a
+   BigInt, an object or a rope). */
+static inline bool aot_lean_args(const JSValue *argv, int na)
+{
+    int i;
+
+    for (i = 0; i < na; i++) {
+        switch (JS_VALUE_GET_TAG(argv[i])) {
+        case JS_TAG_INT:
+        case JS_TAG_BOOL:
+        case JS_TAG_NULL:
+        case JS_TAG_UNDEFINED:
+        case JS_TAG_STRING:
+        case JS_TAG_FLOAT64:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
 }
 
 /* The specialised C-call path for `callee(this, argv[0..na-1])`. `cproto` is
@@ -64495,13 +64543,33 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
 
             if (unlikely(lk == 0))
                 lk = p->u.cfunc.lean = aot_lean_kind(p);
-            if (lk > AOT_LEAN_NONE && na >= (int)p->u.cfunc.length &&
-                JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
-                JS_VALUE_GET_OBJ(this_obj)->class_id ==
-                    JS_CLASS_MAP + (p->u.cfunc.magic & 1) &&
-                p->u.cfunc.realm == ctx) {
-                rv = p->u.cfunc.c_function.generic_magic(ctx, this_obj, na, argv,
-                                                         p->u.cfunc.magic);
+            if (lk > AOT_LEAN_NONE && p->u.cfunc.length <= 3 &&
+                (na >= (int)p->u.cfunc.length || lk == AOT_LEAN_STR) &&
+                p->u.cfunc.realm == ctx &&
+                (lk == AOT_LEAN_MAP
+                     ? (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
+                        JS_VALUE_GET_OBJ(this_obj)->class_id ==
+                            JS_CLASS_MAP + (p->u.cfunc.magic & 1))
+                     : (JS_VALUE_GET_TAG(this_obj) == JS_TAG_STRING &&
+                        aot_lean_args(argv, na)))) {
+                JSValueConst *av = argv;
+                JSValueConst padded[3];
+
+                if (unlikely(na < (int)p->u.cfunc.length)) {
+                    /* the callee may read as many arguments as it declares */
+                    int k;
+
+                    for (k = 0; k < na; k++)
+                        padded[k] = argv[k];
+                    for (; k < (int)p->u.cfunc.length; k++)
+                        padded[k] = JS_UNDEFINED;
+                    av = padded;
+                }
+                if (p->u.cfunc.cproto == JS_CFUNC_generic)
+                    rv = p->u.cfunc.c_function.generic(ctx, this_obj, na, av);
+                else
+                    rv = p->u.cfunc.c_function.generic_magic(ctx, this_obj, na, av,
+                                                             p->u.cfunc.magic);
                 if (JS_IsException(rv))
                     return -1;
                 *out = rv;

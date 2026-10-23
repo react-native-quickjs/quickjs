@@ -1411,12 +1411,16 @@
       "sha256": "388c51200f73a7e93ef4cbc4c46fec3c6c908f2a31f3024caafdc7c81ddd5d33"
     },
     {
+      "name": "0359-lean-string-call.patch",
+      "sha256": "762bed2d33ee8a3c22758572563c0db4f01091f903a5bba9fa7759d1705877af"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "0e0f2eb827c602b887ff45a4a1de0b0afce210dd8ec3f6b8f4a9dd3ad7ee0206",
+    "quickjs.c": "58794987c329d5203735f08fef4d27906475e98971823e519e3e6b9453887e24",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
