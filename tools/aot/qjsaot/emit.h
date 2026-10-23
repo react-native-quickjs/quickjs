@@ -32,6 +32,7 @@ int e_emit_inline_body(
 int e_inline_used_nx(void);
 void e_report_hoist(const char *hex, int n);
 void e_report_inline(const char *hex, int ok, const char *why);
+void e_report_copycap(const char *hex, const char *callee, int copied, int len, int cap);
 
 /* The generic body, the speculative body and the native entry. The
    generic body is emitted first, and the speculative one forwards to it until

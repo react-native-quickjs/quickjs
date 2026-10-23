@@ -106,6 +106,12 @@ void e_report_hoist(const char *hex, int n) {
   fprintf(e_rep, "hoist hex=%s n=%d\n", hex, n);
 }
 
+/* A call that stayed a call because the copies in `hex` reached their budget. */
+void e_report_copycap(const char *hex, const char *callee, int copied, int len, int cap) {
+  if (e_rep == NULL) return;
+  fprintf(e_rep, "copycap hex=%s callee=%s copied=%d len=%d cap=%d\n", hex, callee, copied, len, cap);
+}
+
 void e_report_inline(const char *hex, int ok, const char *why) {
   if (e_rep == NULL) return;
   fprintf(e_rep, "inline hex=%s %s reason=%s\n", hex, ok ? "yes" : "no",

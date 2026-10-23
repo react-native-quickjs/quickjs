@@ -1790,8 +1790,12 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
   return ok;
 }
 
+/* The most program bytes (about five per instruction) of callees copied into one function: 3000
+   is about 600 instructions. A call over the budget stays a call. */
+#define E_INLINE_COPY_BYTES 3000
+
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
-  int i, n = 0;
+  int i, n = 0, copied = 0;
   *out = NULL;
   if (getenv("QJS_AOT_NOIRINLINE") != NULL) return 0;
   for (i = 0; i < fn->ninsns && n < 6; i++) {
@@ -1818,6 +1822,14 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
       if (k < n) continue;
     }
     if (!inl_callee_ok(cg, in->rop == ROP_call_method)) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok: %s\n", cg->name, e_inl_why); continue; }
+    if (copied + cg->len > E_INLINE_COPY_BYTES) {
+      char fh[33];
+      int di;
+      for (di = 0; di < 16; di++) snprintf(fh + 2 * di, 3, "%02x", fn->g->digest[di]);
+      e_report_copycap(fh, hex[0], copied, cg->len, E_INLINE_COPY_BYTES);
+      continue;
+    }
+    copied += cg->len;
     q = realloc(*out, sizeof(**out) * (size_t)(n + 1));
     if (q == NULL) return n;
     *out = q;
