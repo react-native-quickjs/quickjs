@@ -2151,7 +2151,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#ifdef QJS_AOT_SPLIT_UNIT\n"
         "extern uint64_t e_ent[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
-        "extern uint8_t e_off[QJS_AOT_NFUNCS];\n"
+        "extern uint8_t e_off[QJS_AOT_NFUNCS], e_gate[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_han[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
@@ -2163,7 +2163,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static E_XNode *e_xhead;\n"
         "static uint64_t e_ent[QJS_AOT_NFUNCS];\n"
         "static uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
-        "static uint8_t e_off[QJS_AOT_NFUNCS];\n"
+        "static uint8_t e_off[QJS_AOT_NFUNCS], e_gate[QJS_AOT_NFUNCS];\n"
         "static uint32_t e_han[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
@@ -2248,7 +2248,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_OSR_HOOK(fi_, h_, fn_) do { static uint8_t e_oc_; static int e_ic_; \\\n"
         "    if (osr_from == (h_)) osr_from = ~0u; \\\n"
         "    else if (__builtin_expect(e_osr_ok[fi_] && e_osr_n[fi_] < 200 && \\\n"
-        "             !(e_off[fi_] | e_dis[fi_]), 0)) { \\\n"
+        "             !e_gate[fi_], 0)) { \\\n"
         /* The back-edge poll counter counts down once per loop iteration in either body, so
            its fall since the last re-entry is how long that stay lasted. When the speculative
            body called this one it takes the call back by returning to it (no nesting), and a
@@ -2304,7 +2304,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    if (__builtin_expect(e_exit_log_v != 0, 0) && (e_exit_log_v == 2 || e_xn_.cnt == 1)) \\\n"
         "      e_exit_log((hex), (kind), (pc), (int)(tag), &e_xl_); } while (0)\n"
         "#define E_EXIT_NOTE(fi) do { if (++e_exi[fi] > 256 && \\\n"
-        "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
+        "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
         "   body does not lower. Counting them toward the switch-off would turn off\n"
         "   every spec body after 257 calls and every measurement would time the\n"
@@ -2312,7 +2312,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_HANDOFF_NOTE(fi) (e_han[fi]++)\n"
         "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
         "#define E_REFUSE_NOTE(fi) do { if (++e_ref[fi] > 256 && \\\n"
-        "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = 1; } while (0)\n"
+        "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
         /* The dynamic register check, compiled into the unit only with -DE_POISON.
            It compares every register an op call was not allowed to write
            against a copy taken before the call, by tag and then by kind, so a
@@ -2576,7 +2576,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The switches folded per function, so a body that must be as short as
            a call can afford (a frameless one) tests one byte, not four globals. */
         "  for (i = 0; i < QJS_AOT_NFUNCS; i++)\n"
-        "    e_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
+        "    e_gate[i] = e_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
         "}\n\n"
         /* The builtins a unit lowers inline: the engine's own
            function pointers, filled once, and the number view the inline C
@@ -4077,7 +4077,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           f,
           "uint64_t e_ent[QJS_AOT_NFUNCS];\n"
           "uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
-          "uint8_t e_off[QJS_AOT_NFUNCS];\n"
+          "uint8_t e_off[QJS_AOT_NFUNCS], e_gate[QJS_AOT_NFUNCS];\n"
           "uint32_t e_han[QJS_AOT_NFUNCS];\n"
           "uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
           "uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"

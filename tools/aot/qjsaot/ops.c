@@ -10637,18 +10637,18 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   if (g_e_inl)
     fprintf(
         f,
-        "    if (__builtin_expect(e_off[%d] | e_dis[%d] | e_ioff[%d], 0))\n"
+        "    if (__builtin_expect(e_gate[%d] | e_ioff[%d], 0))\n"
         "        return 0;\n",
-        fi, fi, fi);
+        fi, fi);
   else if (g_e_fl)
     fprintf(
         f,
-        "    if (__builtin_expect(e_off[%d] | e_dis[%d], 0))\n"
+        "    if (__builtin_expect(e_gate[%d], 0))\n"
         "        return %s;\n",
-        fi, fi, gen0);
+        fi, gen0);
   else if (osr_n > 0) {
     int h;
-    fprintf(f, "    if (__builtin_expect((e_off[%d] | e_dis[%d]) != 0", fi, fi);
+    fprintf(f, "    if (__builtin_expect(e_gate[%d] != 0", fi);
     fprintf(f, " || (entry_pc != 0");
     for (h = 0; h < osr_n; h++)
       if (osr_ypc[h] != 0) fprintf(f, " && entry_pc != %d", osr_ypc[h] >= 0 ? osr_ypc[h] : osr_pc[h]);
@@ -10656,9 +10656,9 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   } else
     fprintf(
         f,
-        "    if (__builtin_expect(entry_pc != 0 || (e_off[%d] | e_dis[%d]), 0))\n"
+        "    if (__builtin_expect(entry_pc != 0 || e_gate[%d], 0))\n"
         "        return %s;\n",
-        fi, fi, gene);
+        fi, gene);
   /* The index must be inside the switch-off arrays; the generator sized them from the
      function count, so this can only fail if the two disagree. */
   fprintf(

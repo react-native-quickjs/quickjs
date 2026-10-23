@@ -1636,6 +1636,11 @@ static int inl_extra_rop(uint16_t rop) {
     case ROP_to_numeric:
     case ROP_post_inc:
     case ROP_post_dec:
+    case ROP_eq:
+    case ROP_neq:
+    case ROP_strict_eq:
+    case ROP_strict_neq:
+    case ROP_unary:
       return 1;
     default:
       return 0;
@@ -1701,7 +1706,8 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
         if (in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2) {
           if (!has_recv) ok = 0;
         } else if (in->rop != ROP_get_field && in->rop != ROP_get_field2 &&
-                   in->rop != ROP_get_field_own && in->rop != ROP_get_field2_own) {
+                   in->rop != ROP_get_field_own && in->rop != ROP_get_field2_own &&
+                   in->rop != ROP_get_field_chain && in->rop != ROP_get_field_chain_own) {
           ok = 0;
         }
         break;
