@@ -1126,6 +1126,11 @@ static int q2_prune_params(Q2Func *f) {
   int changed = 1, b, i, guard = 0;
   if (!repl) return -1;
   for (i = 0; i < f->nvalues; i++) repl[i] = (Q2ValueId)i;
+  /* the copy that stands in for a hoisted load is its source */
+  for (i = 0; i < f->ninsns; i++) {
+    const Q2Insn *in = &f->insns[i];
+    if (in->licm_mov && in->ndef == 1 && in->nuse == 1) repl[in->def[0]] = in->use[0];
+  }
   for (b = 0; b < f->nblocks; b++) {
     Q2Block *blk = &f->blocks[b];
     int n = blk->nparams > 0 ? blk->nparams : 1;
@@ -1303,7 +1308,80 @@ static int def_from_record_insn(const Q2Insn *in) {
   }
 }
 
-int q2_build(const JSAotGenFunc *g, Q2Func *f) {
+/* The roles of a decoded instruction: its canonical form, its definitions, uses and window. */
+static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
+  const Q2RopInfo *ri;
+  int n;
+  q2_canon_cmp_branch(in);
+  ri = q2_rop_info(in->rop);
+  in->op = (int8_t)ri->op;
+  in->sub = q2_rop_sub(in->rop, in);
+  in->sub2 = q2_rop_sub2(in->rop);
+  for (n = 0; n < ri->ndef && n < 2; n++) {
+    int idx = ri->def[n];
+    if (idx < in->narg && in->arg[idx].kind == 'r')
+      in->def[in->ndef++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
+    else
+      in->ndef = 0; /* a role that does not match the decoding: fall back */
+  }
+  for (n = 0; n < ri->nuse && n < 3; n++) {
+    int idx = ri->use[n];
+    if (idx < in->narg && in->arg[idx].kind == 'r')
+      in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
+  }
+  if (in->ndef == 0 && ri->ndef != 0) in->op = Q2_OP_FALLBACK;
+  if (in->op == Q2_OP_FALLBACK && ri->ndef == 0 && ri->nuse == 0) {
+    /* Unknown roles: the step engine reads every register operand of the
+       instruction, so every one of them is a use, and which is the
+       destination is unknown, so the instruction redefines the whole live
+       set instead. A fallback that declares roles keeps them. */
+    in->ndef = 0;
+    in->nuse = 0;
+    for (n = 0; n < in->narg && in->nuse < 8; n++)
+      if (in->arg[n].kind == 'r')
+        in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[n].val);
+  } else if (ri->window >= 0 && ri->window < in->narg) {
+    /* A call: the callee reads the whole argument window, so every register
+       in it is live at the call and must be current in the frame. */
+    int na = (int)in->arg[ri->window].val;
+    int ab = (int)in->arg[ri->window - 1].val;
+    if (na < 0 || na > 255) na = 0;
+    in->win_reg = q2_ri(ab);
+    in->win_n = na;
+    if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
+      in->win_n = g->reg_count - in->win_reg;
+    if (in->win_n < 0) in->win_n = 0;
+  }
+  {
+    /* Ops that read a staged run of registers the format does not count: the
+       run's first register is operand `wop` and its length is fixed. `apply` and
+       `apply_arguments` read the function, `apply` and the receiver; `append`
+       reads the array, the next index and the iterable and writes the index
+       back; `iterator_call` reads four; the class definitions read their staged
+       key, parent and constructor. */
+    int wop = -1, wn = 0;
+    switch (in->rop) {
+      case ROP_apply_arguments:
+      case ROP_append: wop = 0; wn = 3; break;
+      case ROP_apply: wop = 1; wn = 3; break;
+      case ROP_iterator_call: wop = 0; wn = 4; break;
+      case ROP_define_class: wop = 0; wn = 2; break;
+      case ROP_define_class_computed: wop = 0; wn = 3; break;
+      default: break;
+    }
+    if (wop >= 0 && wop < in->narg && in->arg[wop].kind == 'r') {
+      in->win_reg = q2_ri((int)in->arg[wop].val);
+      in->win_n = wn;
+      if (in->win_reg + in->win_n > g->reg_count)
+        in->win_n = g->reg_count - in->win_reg;
+      if (in->win_n < 0) in->win_n = 0;
+    }
+  }
+}
+
+int q2_build(const JSAotGenFunc *g, Q2Func *f) { return q2_build_ex(g, NULL, 0, f); }
+
+int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
   int i, n, words;
   int32_t *starts = NULL;
   int nstarts = 0, cap = 0;
@@ -1312,6 +1390,9 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
   memset(f, 0, sizeof(*f));
   f->g = g;
   f->nregs = g->reg_count;
+  f->norig = g->reg_count;
+  for (i = 0; i < nex; i++)
+    if (ex[i].newreg + 1 > f->nregs) f->nregs = ex[i].newreg + 1;
   words = (f->nregs + 63) / 64;
   f->lwords = words;
   f->exit_pc = g->len;
@@ -1319,13 +1400,13 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     f->why = "empty program";
     return -1;
   }
-  if (g->reg_count > 4096 || g->len > (1 << 18)) {
+  if (g->reg_count > 4096 || g->len > (1 << 18) || f->nregs > 4096) {
     f->why = "program too large for the IR";
     return -1;
   }
 
   /* 1. decode every instruction */
-  f->insns = calloc((size_t)g->len + 1, sizeof(*f->insns));
+  f->insns = calloc((size_t)g->len + 1 + (size_t)nex, sizeof(*f->insns));
   if (!f->insns) {
     f->why = "out of memory";
     return -1;
@@ -1343,83 +1424,80 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
     in->rop = (uint16_t)cur.op;
     in->pc = i;
     in->next = i + cur.size;
+    in->xpc = -1;
+    in->bpc = i;
+    in->ppc = i;
     in->narg = cur.nargs;
     for (n = 0; n < cur.nargs && n < 8; n++) {
       in->arg[n].kind = cur.arg[n].kind;
       in->arg[n].val = cur.arg[n].val;
       in->arg[n].off = cur.arg[n].off;
     }
-    q2_canon_cmp_branch(in);
-    ri = q2_rop_info(in->rop);
-    in->op = (int8_t)ri->op;
-    in->sub = q2_rop_sub(in->rop, in);
-    in->sub2 = q2_rop_sub2(in->rop);
-    for (n = 0; n < ri->ndef && n < 2; n++) {
-      int idx = ri->def[n];
-      if (idx < in->narg && in->arg[idx].kind == 'r')
-        in->def[in->ndef++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
-      else
-        in->ndef = 0; /* a role that does not match the decoding: fall back */
-    }
-    for (n = 0; n < ri->nuse && n < 3; n++) {
-      int idx = ri->use[n];
-      if (idx < in->narg && in->arg[idx].kind == 'r')
-        in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
-    }
-    if (in->ndef == 0 && ri->ndef != 0) in->op = Q2_OP_FALLBACK;
-    if (in->op == Q2_OP_FALLBACK && ri->ndef == 0 && ri->nuse == 0) {
-      /* Unknown roles: the step engine reads every register operand of the
-         instruction, so every one of them is a use, and which is the
-         destination is unknown, so the instruction redefines the whole live
-         set instead. A fallback that declares roles keeps them. */
-      in->ndef = 0;
-      in->nuse = 0;
-      for (n = 0; n < in->narg && in->nuse < 8; n++)
-        if (in->arg[n].kind == 'r')
-          in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[n].val);
-    } else if (ri->window >= 0 && ri->window < in->narg) {
-      /* A call: the callee reads the whole argument window, so every register
-         in it is live at the call and must be current in the frame. */
-      int na = (int)in->arg[ri->window].val;
-      int ab = (int)in->arg[ri->window - 1].val;
-      if (na < 0 || na > 255) na = 0;
-      in->win_reg = q2_ri(ab);
-      in->win_n = na;
-      if (in->win_n > 0 && in->win_reg + in->win_n > g->reg_count)
-        in->win_n = g->reg_count - in->win_reg;
-      if (in->win_n < 0) in->win_n = 0;
-    }
-    {
-      /* Ops that read a staged run of registers the format does not count: the
-         run's first register is operand `wop` and its length is fixed. `apply` and
-         `apply_arguments` read the function, `apply` and the receiver; `append`
-         reads the array, the next index and the iterable and writes the index
-         back; `iterator_call` reads four; the class definitions read their staged
-         key, parent and constructor. */
-      int wop = -1, wn = 0;
-      switch (in->rop) {
-        case ROP_apply_arguments:
-        case ROP_append: wop = 0; wn = 3; break;
-        case ROP_apply: wop = 1; wn = 3; break;
-        case ROP_iterator_call: wop = 0; wn = 4; break;
-        case ROP_define_class: wop = 0; wn = 2; break;
-        case ROP_define_class_computed: wop = 0; wn = 3; break;
-        default: break;
-      }
-      if (wop >= 0 && wop < in->narg && in->arg[wop].kind == 'r') {
-        in->win_reg = q2_ri((int)in->arg[wop].val);
-        in->win_n = wn;
-        if (in->win_reg + in->win_n > g->reg_count)
-          in->win_n = g->reg_count - in->win_reg;
-        if (in->win_n < 0) in->win_n = 0;
-      }
-    }
+    q2_decode_roles(g, in);
     f->ninsns++;
     i += cur.size;
   }
   if (f->ninsns == 0) {
     f->why = "no instructions";
     return -1;
+  }
+  if (nex > 0) {
+    /* Hoisted loads: a copy of each source instruction defines its new register next to its
+       anchor, and the original becomes a copy of that register. The copies sit at pcs past the
+       program, so no real pc moves. */
+    Q2Insn *ni = calloc((size_t)f->ninsns + (size_t)nex + 1, sizeof(*ni));
+    int k, nn = 0, prev_pc = 0;
+    if (ni == NULL) {
+      f->why = "out of memory";
+      return -1;
+    }
+    for (i = 0; i < f->ninsns; i++) {
+      Q2Insn *in = &f->insns[i];
+      for (k = 0; k < nex; k++) {
+        const Q2Insn *src = NULL;
+        int j;
+        if (ex[k].anchor_pc != in->pc) continue;
+        for (j = 0; j < f->ninsns; j++)
+          if (f->insns[j].pc == ex[k].src_pc) src = &f->insns[j];
+        if (src == NULL || src->narg < 1 || src->arg[0].kind != 'r') continue;
+        ni[nn] = *src;
+        memset(&ni[nn].def, 0, sizeof(ni[nn].def));
+        ni[nn].ndef = 0;
+        ni[nn].nuse = 0;
+        ni[nn].win_n = 0;
+        ni[nn].win_reg = 0;
+        ni[nn].pc = f->exit_pc + 1 + k;
+        ni[nn].next = ex[k].fallthrough ? ex[k].anchor_pc : ni[nn].pc + 1;
+        ni[nn].xpc = ex[k].anchor_pc;
+        ni[nn].bpc = ex[k].fallthrough ? prev_pc : ex[k].anchor_pc;
+        ni[nn].ppc = src->pc;
+        ni[nn].arg[0].val = (int64_t)ex[k].newreg * 16;
+        q2_decode_roles(g, &ni[nn]);
+        nn++;
+      }
+      ni[nn++] = *in;
+      prev_pc = in->pc;
+    }
+    for (k = 0; k < nex; k++) {
+      for (i = 0; i < nn; i++) {
+        Q2Insn *in = &ni[i];
+        if (in->pc != ex[k].src_pc || in->xpc >= 0) continue;
+        in->rop = ROP_move;
+        in->narg = 2;
+        in->arg[1].kind = 'r';
+        in->arg[1].val = (int64_t)ex[k].newreg * 16;
+        in->arg[1].off = -1;
+        in->ndef = 0;
+        in->nuse = 0;
+        in->win_n = 0;
+        in->win_reg = 0;
+        in->licm_mov = 1;
+        q2_decode_roles(g, in);
+      }
+    }
+    free(f->insns);
+    f->insns = ni;
+    f->ninsns = nn;
   }
 
   /* 2. block starts: pc 0, every branch target, and after a terminator */
@@ -1509,11 +1587,11 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
 
   /* instruction -> block, and block extents */
   for (i = 0, n = 0; i < f->ninsns; i++) {
-    while (n + 1 < f->nblocks && f->blocks[n + 1].start_pc <= f->insns[i].pc)
+    while (n + 1 < f->nblocks && f->blocks[n + 1].start_pc <= f->insns[i].bpc)
       n++;
     if (f->blocks[n].first_insn < 0) f->blocks[n].first_insn = i;
     f->blocks[n].ninsns++;
-    if (f->insns[i].next > f->blocks[n].end_pc) {
+    if (f->insns[i].xpc < 0 && f->insns[i].next > f->blocks[n].end_pc) {
       f->why = "instruction crosses a block boundary";
       goto fail;
     }
@@ -1959,7 +2037,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
         int lo, hi, found = -1;
         int32_t dpc;
         if (v->insn < 0) continue;
-        dpc = f->insns[v->insn].pc;
+        dpc = f->insns[v->insn].ppc;
         lo = 0;
         hi = f->nprof - 1;
         while (lo <= hi) {
@@ -2096,7 +2174,7 @@ int q2_build(const JSAotGenFunc *g, Q2Func *f) {
          value was in that register, and the compiled code must box. */
       {
         int pc_found = 0;
-        int32_t dpc = in->pc;
+        int32_t dpc = in->ppc;
         lo = 0;
         hi = f->nprof - 1;
         while (lo <= hi) {
@@ -2271,6 +2349,7 @@ void q2_free(Q2Func *f) {
   free(f->live_out);
   free(f->insn_live);
   free(f->reg_def);
+  free(f->prof_owned);
   memset(f, 0, sizeof(*f));
 }
 

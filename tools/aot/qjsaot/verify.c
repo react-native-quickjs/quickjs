@@ -264,7 +264,8 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
             Q2ValueId val = in->use[k];
             if (val >= (Q2ValueId)f->nvalues)
               Q2_VERIFY_FAIL("block %d pc %d: use out of range", b, in->pc);
-            if (f->values[val].reg == r) named = 1;
+            /* a value hoisted out of a loop stands in for the copy that held it */
+            if (f->values[val].reg == r || f->values[val].reg >= f->norig) named = 1;
           }
           if (!named)
             Q2_VERIFY_FAIL(

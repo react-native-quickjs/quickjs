@@ -180,6 +180,13 @@ typedef struct Q2Insn {
   int8_t sub2;  /* REG_BIN_* of a fused op's second half, else -1 */
   int32_t pc;   /* instruction start in the register program */
   int32_t next; /* pc + size */
+  /* An instruction the build inserted (a load hoisted out of a loop): `xpc` is the pc where
+     the generic body takes over when it exits (every exit of it leaves before anything ran),
+     `bpc` the pc of the instruction it sits next to (which block it belongs to), `ppc` the pc
+     whose profile it uses. -1 / pc / pc for an instruction of the program. `licm_mov` marks the
+     copy that replaces the original in the loop. */
+  int32_t xpc, bpc, ppc;
+  uint8_t licm_mov;
   int32_t narg;
   Q2Arg arg[8];
   /* The SSA value each operand holds at this instruction: for an 'r' operand
@@ -239,6 +246,8 @@ typedef struct Q2Func {
   int ok;          /* the build succeeded */
   const char *why; /* when it did not */
   int32_t nregs;
+  int32_t norig; /* the program's own registers: those from here up exist only in this IR */
+  ProfPc *prof_owned; /* the profile records of the inserted instructions, if any */
   Q2Block *blocks;
   int32_t nblocks;
   Q2Insn *insns;
@@ -270,6 +279,16 @@ typedef struct Q2Func {
 
 /* Build the IR for one function. Returns 0 on success, -1 with why set. */
 int q2_build(const struct JSAotGenFunc *g, Q2Func *out);
+
+/* A load copied to a point before a loop: the instruction at `src_pc` (a get_global) is
+   defined into the new register `newreg` just before the instruction at `anchor_pc` (or, with
+   `fallthrough`, at the end of the block that falls into `anchor_pc`), and the original becomes a
+   copy of it. */
+typedef struct Q2Extra {
+  int32_t anchor_pc, src_pc, newreg;
+  int fallthrough;
+} Q2Extra;
+int q2_build_ex(const struct JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *out);
 void q2_free(Q2Func *f);
 void q2_dump(FILE *f, const Q2Func *fn);
 

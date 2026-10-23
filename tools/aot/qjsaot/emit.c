@@ -9,6 +9,7 @@
  * The per-function driver of the emitter and the native entry a compiled caller
  * enters a function through.
  */
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -378,11 +379,28 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
         stderr, "qjsaot: %s: the generic body emitter returned %d\n",
         g->name[0] ? g->name : "?", rc);
   } else {
-    rc = e_emit_spec_body(f, &fn, hex);
+    /* The speculative body is built from the program with its loop-invariant global reads
+       moved before their loops; the generic body keeps the program as it is. */
+    Q2Func fn2;
+    Q2Extra *ex = NULL;
+    int nex = e_plan_licm(&fn, &ex), have2 = 0;
+    if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: %d hoists\n", g->name, nex);
+    if (nex > 0) {
+      if (q2_build_ex(g, ex, nex, &fn2) == 0 && q2_infer(&fn2) == 0 &&
+          q2_verify(&fn2, msg, sizeof(msg)) == 0)
+        have2 = 1;
+      else {
+        if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: rebuild failed: %s %s\n", g->name, fn2.why ? fn2.why : "-", msg);
+        q2_free(&fn2);
+      }
+    }
+    free(ex);
+    rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
     /* An inline body of this function that exits through aot_nx_ needs its
        definition; a frameless body has emitted it already. */
     if (rc == 0 && !e_fl_was_chosen() && qjs_aot_inline_uses_nx(hex))
-      e_emit_frameless_exit_fn(f, &fn, hex);
+      e_emit_frameless_exit_fn(f, have2 ? &fn2 : &fn, hex);
+    if (have2) q2_free(&fn2);
     if (rc != 0) {
       fprintf(
           stderr, "qjsaot: %s: the speculative body emitter returned %d\n",

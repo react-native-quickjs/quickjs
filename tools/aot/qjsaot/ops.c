@@ -105,7 +105,7 @@ int qjs_aot_pool_tag(const struct JSAotGenFunc *g, uint32_t idx);
    weight as `missarm`: only its misses reach the op call, so counting it in the
    op's own row would make a lowered family look unlowered. */
 static void note_opcall(const Q2Func *fn, const Q2Insn *in, int missarm) {
-  unsigned long long w = qjs_aot_prof_pc_count(fn->g->digest, in->pc);
+  unsigned long long w = qjs_aot_prof_pc_count(fn->g->digest, in->ppc);
   if (w) e_report_opcall(in->rop, (double)w, missarm);
 }
 
@@ -2202,14 +2202,14 @@ static void e_handoff_note(const Q2Func *fn, const Q2Insn *in) {
   if (in == NULL || g_e_quiet) return;
   for (i = 0; i < g_e_ho_n; i++) {
     if (g_e_ho[i].rop == in->rop) {
-      g_e_ho[i].weight += qjs_aot_prof_pc_count(fn->g->digest, in->pc);
+      g_e_ho[i].weight += qjs_aot_prof_pc_count(fn->g->digest, in->ppc);
       g_e_ho[i].blocks++;
       return;
     }
   }
   if (g_e_ho_n < E_HANDOFF_MAX) {
     g_e_ho[g_e_ho_n].rop = in->rop;
-    g_e_ho[g_e_ho_n].weight = qjs_aot_prof_pc_count(fn->g->digest, in->pc);
+    g_e_ho[g_e_ho_n].weight = qjs_aot_prof_pc_count(fn->g->digest, in->ppc);
     g_e_ho[g_e_ho_n].blocks = 1;
     g_e_ho_n++;
   }
@@ -3233,7 +3233,7 @@ static void e_emit_exit(
       while (bits != 0) {
         r = w * 64 + __builtin_ctzll(bits);
         bits &= bits - 1;
-        if (r >= fn->nregs) continue;
+        if (r >= fn->norig) continue;
         /* A register the spec body holds in a local is written from it; one it
            never touched already has the right contents in the frame, so it is
            left alone. Writing a stale definition would corrupt exactly that. */
@@ -3343,7 +3343,19 @@ static void e_emit_exit_at(
         stderr, "qjsaot: exit stub at pc %d has no sync set (fn %s)\n", pc, hex);
     abort();
   }
-  if (lb != NULL) q2_live_before(fn, ins, lb);
+  if (fn->insns[ins].xpc >= 0) {
+    /* An inserted instruction: it leaves before anything ran, to the pc it was placed
+       before, with the state that instruction starts with. */
+    int j;
+    for (j = 0; j < fn->ninsns; j++)
+      if (fn->insns[j].xpc < 0 && fn->insns[j].pc == fn->insns[ins].xpc) {
+        if (lb != NULL) q2_live_before(fn, j, lb);
+        break;
+      }
+    pc = fn->insns[ins].xpc;
+  } else if (lb != NULL) {
+    q2_live_before(fn, ins, lb);
+  }
   g_e_exit_ins = ins;
   e_emit_exit(f, fn, pc, hex, fi, cur, lb, handoff, blkidx);
   g_e_exit_ins = -1;
@@ -3720,7 +3732,7 @@ static void e_emit_presync(
         f,
         "    /* sync live TAG values to the frame before the op call (a safepoint) "
         "*/\n");
-  for (r = 0; !g_e_presynced && r < fn->nregs; r++) {
+  for (r = 0; !g_e_presynced && r < fn->norig; r++) {
     Q2ValueId v;
     if (cur == NULL) break;
     v = cur[r];
@@ -6735,6 +6747,36 @@ static int emit_typed_global_read(
       t->lb[dv] != E_LB_F64)
     return 0;
 
+  if (in->xpc >= 0) {
+    /* Moved before a loop: every way out leaves to the pc it was placed before. */
+    e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+    e_sweep_guard(f, "vx", in->pc);
+    fprintf(f, "    { JSValue _g;\n");
+    fprintf(
+        f,
+        "      if (__builtin_expect(Q2_FORCE_MISS || !q2_global_hit(ctx, pic, %d, &_g), 0)) "
+        "goto vx_%d;\n",
+        site, in->pc);
+    if (t->lb[dv] == E_LB_TAG)
+      fprintf(f, "      v%u = _g;\n", (unsigned)dv);
+    else if (t->lb[dv] == E_LB_I32)
+      fprintf(
+          f,
+          "      if (__builtin_expect(JS_VALUE_GET_TAG(_g) != JS_TAG_INT, 0)) goto vx_%d;\n"
+          "      i%u = JS_VALUE_GET_INT(_g);\n",
+          in->pc, (unsigned)dv);
+    else
+      fprintf(
+          f,
+          "      if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_g);\n"
+          "      else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_g);\n"
+          "      else goto vx_%d;\n",
+          (unsigned)dv, (unsigned)dv, in->pc);
+    fprintf(f, "    }\n");
+    if (cur != NULL) cur[dreg] = dv;
+    g_e_miss_exit_seen = 1;
+    return 1;
+  }
   if (t->lb[dv] != E_LB_TAG && !e_def_dead(in, dv))
     e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
   fprintf(f, "    { JSValue _g;\n");
@@ -10798,6 +10840,36 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         Q2ValueId vv = hb->in_val[q];
         if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE || vv >= (Q2ValueId)types.nvalues)
           continue;
+        if (rr >= fn->norig) {
+          /* A register only this IR has: the load that was moved before the loop runs again
+             here, and a miss returns to the generic body. */
+          const Q2Value *dvv = &fn->values[vv];
+          const Q2Insn *sin = dvv->insn >= 0 ? &fn->insns[dvv->insn] : NULL;
+          if (sin == NULL || sin->rop != ROP_get_global || sin->narg < 4) {
+            fprintf(f, "      goto osr_fail;\n");
+            continue;
+          }
+          fprintf(
+              f,
+              "      { JSValue _g; if (!q2_global_hit(ctx, pic, %d, &_g)) goto osr_fail;\n",
+              (int)sin->arg[3].val);
+          if (types.lb[vv] == E_LB_TAG)
+            fprintf(f, "        v%u = _g; }\n", (unsigned)vv);
+          else if (types.lb[vv] == E_LB_I32)
+            fprintf(
+                f,
+                "        if (JS_VALUE_GET_TAG(_g) != JS_TAG_INT) goto osr_fail;\n"
+                "        i%u = JS_VALUE_GET_INT(_g); }\n",
+                (unsigned)vv);
+          else
+            fprintf(
+                f,
+                "        if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_g);\n"
+                "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_g);\n"
+                "        else goto osr_fail; }\n",
+                (unsigned)vv, (unsigned)vv);
+          continue;
+        }
         switch (types.lb[vv]) {
           case E_LB_I32:
             fprintf(

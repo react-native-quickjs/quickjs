@@ -582,7 +582,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
       {
         Access stw;
         sites[n].write = insn_store(in, &stw) && stw.kind == E_K_FIELD;
-        sites[n].hot = qjs_aot_prof_pc_count(fn->g->digest, in->pc) > 0;
+        sites[n].hot = qjs_aot_prof_pc_count(fn->g->digest, in->ppc) > 0;
       }
       n++;
     }
@@ -593,7 +593,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
     const Q2Insn *in = &fn->insns[sites[k].insn];
     if (!qjs_aot_prof_site(fn->g->digest, sites[k].site, &ns, shapes)) continue;
     if (ns >= 2 && ns <= 4 && qjs_aot_prof_site_own(fn->g->digest, sites[k].site) &&
-        !qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) {
+        !qjs_aot_prof_unexecuted(fn->g->digest, in->ppc)) {
       sites[k].poly = 1; /* served by the polymorphic cache, not grouped */
       continue;
     }
@@ -608,7 +608,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
     } else if (!qjs_aot_prof_site_own(fn->g->digest, sites[k].site)) {
       continue;
     }
-    if (qjs_aot_prof_unexecuted(fn->g->digest, in->pc)) continue;
+    if (qjs_aot_prof_unexecuted(fn->g->digest, in->ppc)) continue;
     for (j = 0; j < ng; j++) {
       if (gshape[j] == (int64_t)shapes[0]) {
         g = j;
@@ -743,7 +743,7 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   uint64_t shapes[4];
   if (in->rop != ROP_get_global || in->narg < 4 || in->arg[3].kind != 's' ||
       (unsigned)in->arg[3].val == REG_IC_NONE ||
-      qjs_aot_prof_pc_count(fn->g->digest, in->pc) == 0 || getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
+      qjs_aot_prof_pc_count(fn->g->digest, in->ppc) == 0 || getenv("QJS_AOT_NOGLOBALEXIT") != NULL)
     return 0;
   /* Filled at exactly one generation of the global object in the profiled run: the cell holds
      unless the global object changes, which that run did not see. */
@@ -1450,4 +1450,132 @@ int e_facts_site_proto(const EFacts *f, int site) {
   for (i = 0; i < f->nsites; i++)
     if (f->sites[i].site == site) return f->sites[i].proto;
   return 0;
+}
+
+/* ---- loop-invariant global reads ----------------------------------------
+   A loop with no safepoint cannot change a global binding, so a read of it inside the loop
+   returns what a read before the loop does. The read is copied to the block that enters the
+   outermost such loop and the original becomes a copy of it; the copy's misses leave before
+   the loop starts. The facts then see a receiver defined outside the loop, and the array and
+   shape checks of its accesses can be done once. Returns the number of reads to hoist, filling
+   `*out` (malloc'd). */
+int e_plan_licm(const Q2Func *fn, Q2Extra **out) {
+  EFacts facts;
+  int nl = 0, capl = 0, nex = 0, i, b, p, k;
+  struct Lp {
+    uint8_t *mem;
+    int pre, hdr, size;
+  } *loops = NULL;
+  uint8_t *loop = NULL;
+  int *stack = NULL;
+  int saved_pure = e_facts_pure_ok;
+  *out = NULL;
+  if (getenv("QJS_AOT_NOLICM") != NULL || fn->nblocks <= 0) return 0;
+  e_facts_pure_ok = 0;
+  memset(&facts, 0, sizeof(facts));
+  if (e_facts_run(fn, &facts, 1) < 0) {
+    e_facts_pure_ok = saved_pure;
+    return 0;
+  }
+  e_facts_pure_ok = saved_pure;
+  loop = calloc((size_t)fn->nblocks, 1);
+  stack = malloc(sizeof(int) * (size_t)fn->nblocks);
+  if (loop == NULL || stack == NULL) goto done;
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *lt = &fn->blocks[b];
+    int si;
+    for (si = 0; si < lt->nsucc && si < 2; si++) {
+      int h = lt->succ_block[si], sp = 0, pre = -1, npre = 0, safe = 1, bi, sz = 0;
+      if (h < 0 || h >= fn->nblocks || !q2_is_back_edge(fn, b, h) || lt->resume) continue;
+      memset(loop, 0, (size_t)fn->nblocks);
+      loop[h] = 1;
+      if (!loop[b]) {
+        loop[b] = 1;
+        stack[sp++] = b;
+      }
+      while (sp > 0) {
+        int x = stack[--sp];
+        for (p = 0; p < fn->blocks[x].npreds; p++) {
+          int pb = fn->blocks[x].preds[p];
+          if (pb < 0 || loop[pb] || fn->rpo_pos[pb] < 0) continue;
+          loop[pb] = 1;
+          stack[sp++] = pb;
+        }
+      }
+      for (p = 0; p < fn->blocks[h].npreds; p++) {
+        int pb = fn->blocks[h].preds[p];
+        if (pb < 0 || fn->rpo_pos[pb] < 0 || loop[pb]) continue;
+        pre = pb;
+        npre++;
+      }
+      if (npre != 1 || fn->blocks[pre].resume) continue;
+      for (bi = 0; bi < fn->nblocks && safe; bi++) {
+        if (!loop[bi]) continue;
+        sz++;
+        for (k = 0; k < fn->blocks[bi].ninsns; k++)
+          if (is_safepoint(fn, &facts, &fn->insns[fn->blocks[bi].first_insn + k], 1)) {
+            safe = 0;
+            break;
+          }
+      }
+      if (!safe) continue;
+      if (nl == capl) {
+        int nc = capl ? capl * 2 : 8;
+        struct Lp *q = realloc(loops, sizeof(*q) * (size_t)nc);
+        if (q == NULL) goto done;
+        loops = q;
+        capl = nc;
+      }
+      loops[nl].mem = malloc((size_t)fn->nblocks);
+      if (loops[nl].mem == NULL) goto done;
+      memcpy(loops[nl].mem, loop, (size_t)fn->nblocks);
+      loops[nl].pre = pre;
+      loops[nl].hdr = h;
+      loops[nl].size = sz;
+      nl++;
+    }
+  }
+  for (i = 0; i < fn->ninsns && nex < 8; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    int best = -1, blk = -1, j;
+    if (in->rop != ROP_get_global || in->xpc >= 0 || in->ndef != 1) continue;
+    for (b = 0; b < fn->nblocks; b++)
+      if (i >= fn->blocks[b].first_insn && i < fn->blocks[b].first_insn + fn->blocks[b].ninsns) blk = b;
+    if (blk < 0) continue;
+    for (j = 0; j < nl; j++)
+      if (loops[j].mem[blk] && (best < 0 || loops[j].size > loops[best].size)) best = j;
+    if (best < 0) continue;
+    {
+      const Q2Block *pb = &fn->blocks[loops[best].pre];
+      const Q2Block *hb = &fn->blocks[loops[best].hdr];
+      const Q2Insn *t;
+      Q2Extra *q;
+      if (pb->ninsns <= 0) continue;
+      t = &fn->insns[pb->first_insn + pb->ninsns - 1];
+      q = realloc(*out, sizeof(**out) * (size_t)(nex + 1));
+      if (q == NULL) goto done;
+      *out = q;
+      q[nex].src_pc = in->pc;
+      q[nex].newreg = fn->nregs + nex;
+      if (t->op == Q2_OP_BRANCH || t->op == Q2_OP_BRANCH_CMP) {
+        q[nex].anchor_pc = t->pc;
+        q[nex].fallthrough = 0;
+      } else if (pb->nsucc == 1 && pb->succ_block[0] == loops[best].hdr && hb->start_pc == pb->end_pc &&
+                 t->next == pb->end_pc && t->op != Q2_OP_RETURN && t->op != Q2_OP_RETURN_UNDEF) {
+        q[nex].anchor_pc = hb->start_pc;
+        q[nex].fallthrough = 1;
+      } else {
+        continue;
+      }
+      nex++;
+    }
+  }
+done:
+  if (loops != NULL)
+    for (i = 0; i < nl; i++) free(loops[i].mem);
+  free(loops);
+  free(loop);
+  free(stack);
+  e_facts_free(&facts);
+  return nex;
 }
