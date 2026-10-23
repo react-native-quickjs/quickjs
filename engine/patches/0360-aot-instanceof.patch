@@ -1,0 +1,68 @@
+Subject: Compiled code answers `x instanceof C` for a plain constructor without the operator handler
+
+What this does
+  - `qjs_aot_instanceof(ctx, a, b)` returns 1 or 0, or -1 when the engine's own operator has to
+    decide. It answers only a right side that is a bytecode or C function whose [[Prototype]] is
+    Function.prototype and that has no own @@hasInstance (the case `JS_IsInstanceOf` already
+    treats as the builtin, which is non-writable and non-configurable), a left side that is not
+    an object (false) or whose prototype chain has no proxy, and a `prototype` that is an
+    ordinary data property holding an object. It runs no JS and throws nothing.
+
+Why we need it
+  earleyboyer's `sc_isPair`/`sc_isVector` are `o instanceof C`: the fused compare-and-branch went
+  through the interpreter handler (`regvm_cmp_take`, `js_operator_instanceof`, a generic
+  `prototype` lookup), about 16% of its instructions. Octane earleyboyer 0.88x -> 1.12x of the
+  interpreter together with the inline equality of objects and booleans.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63208,6 +63208,39 @@
+            regvm_ta_len_validate(ctx);
+ }
+ 
++/* `a instanceof b` for a plain constructor: 1 or 0, or -1 when the engine's own operator has to
++   decide (a right side that is not a function whose @@hasInstance is the builtin, a `prototype`
++   that is not a plain object property, a proxy in the chain). It runs no JS and throws nothing. */
++int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b)
++{
++    JSObject *p, *proto;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++
++    if (JS_VALUE_GET_TAG(b) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(b);
++    if ((p->class_id != JS_CLASS_BYTECODE_FUNCTION && p->class_id != JS_CLASS_C_FUNCTION) ||
++        p->shape->proto != JS_VALUE_GET_OBJ(ctx->function_proto) ||
++        find_own_property1(p, JS_ATOM_Symbol_hasInstance))
++        return -1;
++    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
++        return 0;
++    prs = find_own_property(&pr, p, JS_ATOM_prototype);
++    if (!prs || (prs->flags & JS_PROP_TMASK) != 0 || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
++        return -1;
++    proto = JS_VALUE_GET_OBJ(pr->u.value);
++    p = JS_VALUE_GET_OBJ(a);
++    for (;;) {
++        JSObject *p1 = p->shape->proto;
++        if (!p1)
++            return p->class_id == JS_CLASS_PROXY ? -1 : 0;
++        p = p1;
++        if (p == proto)
++            return 1;
++    }
++}
++
+ int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
+                           const void **prs_out, uint32_t *off)
+ {
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -450,6 +450,7 @@
+ /* 1 when every typed-array class reads `length` from the builtin accessor (no class
+    prototype shadows it); revalidates after a watched change. */
+ int qjs_aot_ta_len_valid(JSContext *ctx);
++int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b);
+ /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
+ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
+ /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not

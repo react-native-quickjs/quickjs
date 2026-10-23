@@ -63208,6 +63208,39 @@ int qjs_aot_ta_len_valid(JSContext *ctx)
            regvm_ta_len_validate(ctx);
 }
 
+/* `a instanceof b` for a plain constructor: 1 or 0, or -1 when the engine's own operator has to
+   decide (a right side that is not a function whose @@hasInstance is the builtin, a `prototype`
+   that is not a plain object property, a proxy in the chain). It runs no JS and throws nothing. */
+int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b)
+{
+    JSObject *p, *proto;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    if (JS_VALUE_GET_TAG(b) != JS_TAG_OBJECT)
+        return -1;
+    p = JS_VALUE_GET_OBJ(b);
+    if ((p->class_id != JS_CLASS_BYTECODE_FUNCTION && p->class_id != JS_CLASS_C_FUNCTION) ||
+        p->shape->proto != JS_VALUE_GET_OBJ(ctx->function_proto) ||
+        find_own_property1(p, JS_ATOM_Symbol_hasInstance))
+        return -1;
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+        return 0;
+    prs = find_own_property(&pr, p, JS_ATOM_prototype);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != 0 || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+        return -1;
+    proto = JS_VALUE_GET_OBJ(pr->u.value);
+    p = JS_VALUE_GET_OBJ(a);
+    for (;;) {
+        JSObject *p1 = p->shape->proto;
+        if (!p1)
+            return p->class_id == JS_CLASS_PROXY ? -1 : 0;
+        p = p1;
+        if (p == proto)
+            return 1;
+    }
+}
+
 int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
                           const void **prs_out, uint32_t *off)
 {
