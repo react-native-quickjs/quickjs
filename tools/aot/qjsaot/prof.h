@@ -46,6 +46,8 @@ typedef struct ProfPc {
      every element there was a number, so a compiled read needs no hole or lazy
      test. */
   uint8_t elem;
+  /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here (the profiler's `tacls=`) */
+  uint16_t ta;
   double num_min, num_max;
   /* A call-result (`K`) record only: the calls that entered the site and the
      returns recorded for it. Zero in a `P` record. */

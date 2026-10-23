@@ -202,6 +202,7 @@ int e_plan_licm(const Q2Func *fn, Q2Extra **out);
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out);
 /* The objects that never escape (see facts.c). */
 extern int e_inline_allow_construct;
+int e_ta_class(const Q2Func *fn, const Q2Insn *in);
 int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs, int *nwebs, Q2Rewrite **rw, int *nrw);
 /* Whether polymorphic sites are served by the polymorphic cache in this body (a
    framed speculative body; set by the caller around e_facts_run). */

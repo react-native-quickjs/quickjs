@@ -124,6 +124,18 @@ static int fs_has_shape(const FactSet *s, int val, int grp) {
   return 0;
 }
 
+/* every fact about one value is dropped (the region's locals now describe another kind of array) */
+static void fs_drop_val(FactSet *s, int val) {
+  int i, w = 0;
+  for (i = 0; i < s->nshape; i++) {
+    if (s->shape_val[i] == val) continue;
+    s->shape_val[w] = s->shape_val[i];
+    s->shape_grp[w] = s->shape_grp[i];
+    w++;
+  }
+  s->nshape = w;
+}
+
 static int fs_add_shape(FactSet *s, int val, int grp) {
   if (val < 0 || grp < 0) return 0;
   if (fs_has_shape(s, val, grp)) return 0;
@@ -718,6 +730,27 @@ static int pure_call_ok(const Q2Func *fn, const Q2Insn *in) {
          (in->rop == ROP_call || in->rop == ROP_call_method) && e_facts_pure_call(fn, in);
 }
 
+/* The typed-array class an element site was seen with: 1 + the class's index among the typed arrays
+   (Uint8Clamped first), or 0 for a dense array or a site no region can serve (two classes, a half-float
+   or a BigInt array). The element sites of the same array must agree: the region keeps one class. */
+int e_ta_class(const Q2Func *fn, const Q2Insn *in) {
+  int i;
+  if (in->rop != ROP_get_element && in->rop != ROP_put_element && in->rop != ROP_put_element_xfer) return 0;
+  if (fn->prof == NULL) return 0;
+  for (i = 0; i < fn->nprof; i++) {
+    unsigned m, k;
+    if (fn->prof[i].pc != in->pc) continue;
+    if (!(fn->prof[i].elem & Q2_ELEM_TA)) return 0;
+    m = fn->prof[i].ta;
+    if (m == 0 || (m & (m - 1)) != 0) return 0;
+    k = (unsigned)__builtin_ctz(m);
+    /* Uint8Clamped, Int8, Uint8, Int16, Uint16, Int32, Uint32, Float32, Float64 */
+    if (k <= 6 || k == 10 || k == 11) return (int)k + 1;
+    return 0;
+  }
+  return 0;
+}
+
 static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
   int i;
   if (in->rop != ROP_get_element && in->rop != ROP_put_element &&
@@ -727,6 +760,9 @@ static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
   if (fn->prof == NULL) return 0;
   for (i = 0; i < fn->nprof; i++) {
     if (fn->prof[i].pc != in->pc) continue;
+    /* A typed array of one class: reads and stores are numbers by construction. */
+    if ((fn->prof[i].elem & Q2_ELEM_TA) != 0)
+      return e_ta_class(fn, in) != 0 && (fn->prof[i].elem & (Q2_ELEM_HOLEY | Q2_ELEM_OBJECT | Q2_ELEM_MIXED)) == 0;
     /* No miss and no typed array was seen. A read may yield any element (a number or an
        object); a store is a region access only for numbers, since the inline store replaces
        an element without releasing a reference. */
@@ -841,8 +877,14 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     f->elemreg[insn] = 1;
     f->miss_exits[insn] = 1;
     if (rv >= 0 && rv < fn->nvalues) {
-      if (fs_has_shape(s, E_ARRV(rv), 0)) f->arrskip[insn] = 1;
-      if (fs_add_shape(s, E_ARRV(rv), 0) < 0) return -1;
+      /* the fact names the region's class (0: a dense array): the locals hold one array kind at a time */
+      int cls = e_ta_class(fn, in);
+      if (fs_has_shape(s, E_ARRV(rv), cls)) {
+        f->arrskip[insn] = 1;
+      } else {
+        fs_drop_val(s, E_ARRV(rv));
+        if (fs_add_shape(s, E_ARRV(rv), cls) < 0) return -1;
+      }
       f->arr_used[rv] = 1;
     }
   }
@@ -928,7 +970,9 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     /* The load and store helpers are disjoint by opcode, so a store is never
        also the load handled above. */
     apply_store_kills(s, &st);
-    if (fs_set_avail(s, &st.key, st.val) < 0) return -1;
+    /* A store into a typed array converts the value (wraps, clamps, rounds to a float): the element
+       does not hold the stored value, so the location is not made current by it. */
+    if (!(st.kind == E_K_ELEM && e_ta_class(fn, in)) && fs_set_avail(s, &st.key, st.val) < 0) return -1;
   }
 
   /* 5. A safepoint loses every shape and every location, except
@@ -1096,13 +1140,16 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
           const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
           Q2ValueId v;
           int db, dup = 0;
+          int agrp;
           if (!grouped_exit || !elem_region_ok(fn, in)) continue;
           v = in->use[0];
           if (v >= (Q2ValueId)fn->nvalues) continue;
           db = fn->values[v].block;
           if (db < 0 || in_loop(loop, db)) continue;
+          /* -2: a dense array; -100 - c: a typed array of class c (1..12) */
+          agrp = e_ta_class(fn, in) ? -100 - e_ta_class(fn, in) : -2;
           for (q = 0; q < out->nhoist; q++)
-            if (out->hoist_hdr[q] == h && out->hoist_val[q] == (int)v && out->hoist_grp[q] == -2) dup = 1;
+            if (out->hoist_hdr[q] == h && out->hoist_val[q] == (int)v && out->hoist_grp[q] == agrp) dup = 1;
           if (dup) continue;
           if (out->nhoist == out->hoist_cap) {
             int nc = out->hoist_cap ? out->hoist_cap * 2 : 8;
@@ -1124,7 +1171,7 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
           out->hoist_hdr[out->nhoist] = h;
           out->hoist_pre[out->nhoist] = pre;
           out->hoist_val[out->nhoist] = (int)v;
-          out->hoist_grp[out->nhoist] = -2;
+          out->hoist_grp[out->nhoist] = agrp;
           out->nhoist++;
           out->arr_used[v] = 1;
         }
@@ -1284,6 +1331,8 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
               goto done;
           } else if (out->hoist_grp[k] == -2) {
             if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]), 0) < 0) goto done;
+          } else if (out->hoist_grp[k] <= -101 && out->hoist_grp[k] >= -112) {
+            if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]), -100 - out->hoist_grp[k]) < 0) goto done;
           } else if (fs_add_shape(&cur, out->hoist_val[k], out->hoist_grp[k]) < 0) {
             goto done;
           }

@@ -599,9 +599,10 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         const char *fm = strstr(line + 2, "frac=");
         const char *nz = strstr(line + 2, "negzero=");
         const char *el = strstr(line + 2, "elem=");
+        const char *tc = strstr(line + 2, "tacls=");
         int k;
         double nmin = 0, nmax = 0;
-        int has_num = 0, frac = 0, negzero = 0, elem = 0;
+        int has_num = 0, frac = 0, negzero = 0, elem = 0, tacls = 0;
         if (nm) {
           has_num = 1;
           sscanf(nm + 4, "%lf..%lf", &nmin, &nmax);
@@ -609,6 +610,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         if (fm) frac = (int)strtol(fm + 5, NULL, 10) != 0;
         if (nz) negzero = (int)strtol(nz + 8, NULL, 10) != 0;
         if (el) elem = (uint8_t)strtoul(el + 5, NULL, 10);
+        if (tc) tacls = (int)strtoul(tc + 6, NULL, 10);
         for (k = 0; k < e->npcs; k++)
           if (e->pcs[k].pc == pc) break;
         if (k == e->npcs) {
@@ -627,6 +629,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         e->pcs[k].frac |= (uint8_t)frac;
         e->pcs[k].negzero |= (uint8_t)negzero;
         e->pcs[k].elem |= (uint8_t)elem;
+        e->pcs[k].ta |= (uint16_t)tacls;
         if (has_num) {
           if (!e->pcs[k].has_num) {
             e->pcs[k].num_min = nmin;

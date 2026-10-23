@@ -52,6 +52,7 @@ static int g_e_inl_nx_used;
 static int g_e_last_inl_nx;
 static const char *nm_of_rop(uint16_t rop);
 static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail);
+static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int grp);
 static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc);
 static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in);
 static const char *e_slotfn(int site);
@@ -3695,10 +3696,11 @@ static void e_emit_arm(
           continue;
         }
         if (g_e_types != NULL && rv < (Q2ValueId)g_e_types->nvalues &&
-            g_e_types->lb[rv] == E_LB_TAG && g_e_facts->hoist_grp[q] == -2) {
+            g_e_types->lb[rv] == E_LB_TAG &&
+            (g_e_facts->hoist_grp[q] == -2 || (g_e_facts->hoist_grp[q] <= -101 && g_e_facts->hoist_grp[q] >= -112))) {
           char fl[32];
           snprintf(fl, sizeof(fl), "goto vx_%d", hb->start_pc);
-          e_arr_region_start(f, rv, rv, fl);
+          e_arr_region_start_grp(f, rv, rv, fl, g_e_facts->hoist_grp[q]);
         } else if (g_e_types != NULL && rv < (Q2ValueId)g_e_types->nvalues &&
             g_e_types->lb[rv] == E_LB_TAG) {
           fprintf(
@@ -7944,6 +7946,50 @@ static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char
       (unsigned)av, fail, (unsigned)av, fail, (unsigned)root, (unsigned)root);
 }
 
+/* The element type of a typed-array class (1 + index among the typed arrays; see e_ta_class). */
+typedef struct ETaInfo {
+  const char *cname, *ctype;
+  int is_float, is_u32, clamped;
+} ETaInfo;
+static int e_ta_info(int cls, ETaInfo *o) {
+  memset(o, 0, sizeof(*o));
+  switch (cls) {
+    case 1: o->cname = "QJS_AOT_CLASS_UINT8C_ARRAY"; o->ctype = "uint8_t"; o->clamped = 1; return 1;
+    case 2: o->cname = "QJS_AOT_CLASS_INT8_ARRAY"; o->ctype = "int8_t"; return 1;
+    case 3: o->cname = "QJS_AOT_CLASS_UINT8_ARRAY"; o->ctype = "uint8_t"; return 1;
+    case 4: o->cname = "QJS_AOT_CLASS_INT16_ARRAY"; o->ctype = "int16_t"; return 1;
+    case 5: o->cname = "QJS_AOT_CLASS_UINT16_ARRAY"; o->ctype = "uint16_t"; return 1;
+    case 6: o->cname = "QJS_AOT_CLASS_INT32_ARRAY"; o->ctype = "int32_t"; return 1;
+    case 7: o->cname = "QJS_AOT_CLASS_UINT32_ARRAY"; o->ctype = "uint32_t"; o->is_u32 = 1; return 1;
+    case 11: o->cname = "QJS_AOT_CLASS_FLOAT32_ARRAY"; o->ctype = "float"; o->is_float = 1; return 1;
+    case 12: o->cname = "QJS_AOT_CLASS_FLOAT64_ARRAY"; o->ctype = "double"; o->is_float = 1; return 1;
+    default: return 0;
+  }
+}
+
+/* The typed array's check and the loads of its base pointer and length, from the TAG local v<av>: the
+   class is the one the site was profiled with, and a detached or shrunken view has length 0 or less
+   than the index, so the bounds test is the whole story. The element storage is `ap<root>` (as a
+   byte pointer), the length `an<root>`. */
+static void e_arr_region_start_cls(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int cls) {
+  ETaInfo ti;
+  if (!e_ta_info(cls, &ti)) abort();
+  fprintf(
+      f,
+      "      if (__builtin_expect(Q2_FORCE_MISS || JS_VALUE_GET_TAG(v%u) != JS_TAG_OBJECT, 0)) %s;\n"
+      "      { const unsigned char *_ap = (const unsigned char *)JS_VALUE_GET_PTR(v%u);\n"
+      "        if (__builtin_expect(*(const uint16_t *)(_ap + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != %s, 0)) %s;\n"
+      "        ap%u = *(JSValue *const *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES);\n"
+      "        an%u = *(const uint32_t *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); }\n",
+      (unsigned)av, fail, (unsigned)av, ti.cname, fail, (unsigned)root, (unsigned)root);
+}
+static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int grp) {
+  if (grp <= -101 && grp >= -112)
+    e_arr_region_start_cls(f, av, root, fail, -100 - grp);
+  else
+    e_arr_region_start(f, av, root, fail);
+}
+
 /* A cache cell checked on the edge into a loop (or at its OSR entry): it must still hold the group's
    shape, in the kind its site needs. `kind` "vx" leaves at the loop header, "osr" returns to the
    generic body. */
@@ -7979,11 +8025,145 @@ static int e_region_index(
   return 0;
 }
 
+/* The statement that stores the number `expr` (an int32 when `isd` is 0, a double otherwise) into element
+   `_i` of the typed array whose storage is ap<root>: the conversion each class makes on a store. */
+static void e_ta_store_stmt(FILE *f, const ETaInfo *ti, unsigned root, int isd, const char *expr) {
+  if (ti->is_float) {
+    fprintf(f, "      ((%s *)ap%u)[_i] = (%s)(%s);\n", ti->ctype, root, ti->ctype, expr);
+  } else if (ti->clamped) {
+    if (isd)
+      fprintf(
+          f,
+          "      { double _c = %s; ((uint8_t *)ap%u)[_i] = (_c != _c || _c <= 0) ? 0 : _c >= 255 ? 255 : "
+          "(uint8_t)__builtin_rint(_c); }\n",
+          expr, root);
+    else
+      fprintf(
+          f, "      { int32_t _c = %s; ((uint8_t *)ap%u)[_i] = _c < 0 ? 0 : _c > 255 ? 255 : (uint8_t)_c; }\n", expr,
+          root);
+  } else if (isd) {
+    fprintf(f, "      ((%s *)ap%u)[_i] = (%s)q2_toi32(%s);\n", ti->ctype, root, ti->ctype, expr);
+  } else {
+    fprintf(f, "      ((%s *)ap%u)[_i] = (%s)(%s);\n", ti->ctype, root, ti->ctype, expr);
+  }
+}
+
+/* A numeric element read on a checked typed array: the class is a compile-time fact, the length and the
+   storage pointer are the region's locals, and the element goes to the result in the result's own
+   representation (an exit where it does not fit). */
+static int emit_ta_region_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int cls) {
+  Q2ValueId dv = in->def[0], av = in->use[0], kv = in->use[1], root;
+  int dreg, idx = e_insn_idx(fn, in);
+  ETaInfo ti;
+  char fail[32];
+  if (!e_ta_info(cls, &ti)) return 0;
+  if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues ||
+      t->lb[av] != E_LB_TAG)
+    return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 && t->lb[dv] != E_LB_BOOL)
+    return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  root = e_region_root(fn, in);
+  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  e_group_exit_stub(f, in, cur, av);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(f, "    {\n");
+  if (!g_e_facts->arrskip[idx]) e_arr_region_start_cls(f, av, root, fail, cls);
+  e_region_index(f, t, kv, in->pc);
+  fprintf(
+      f,
+      "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n"
+      "      %s _x = ((const %s *)ap%u)[_i];\n",
+      (unsigned)root, in->pc, ti.ctype, ti.ctype, (unsigned)root);
+  if (t->lb[dv] == E_LB_I32) {
+    if (ti.is_float)
+      fprintf(
+          f,
+          "      { double _d = (double)_x; int32_t _y = (int32_t)_d;\n"
+          "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) goto vx_%d;\n"
+          "        i%u = _y; }\n",
+          in->pc, (unsigned)dv);
+    else if (ti.is_u32)
+      fprintf(
+          f, "      if (__builtin_expect(_x > 2147483647u, 0)) goto vx_%d;\n      i%u = (int32_t)_x;\n", in->pc,
+          (unsigned)dv);
+    else
+      fprintf(f, "      i%u = (int32_t)_x;\n", (unsigned)dv);
+  } else if (t->lb[dv] == E_LB_F64) {
+    fprintf(f, "      d%u = (double)_x;\n", (unsigned)dv);
+  } else if (t->lb[dv] == E_LB_BOOL) {
+    fprintf(f, "      goto vx_%d;\n", in->pc);
+  } else if (ti.is_float) {
+    fprintf(f, "      v%u = E_TA_F64((double)_x);\n", (unsigned)dv);
+  } else if (ti.is_u32) {
+    fprintf(
+        f, "      v%u = _x <= 2147483647u ? JS_MKVAL(JS_TAG_INT, (int32_t)_x) : qjs_aot_box_num((double)_x, 0);\n",
+        (unsigned)dv);
+  } else {
+    fprintf(f, "      v%u = JS_MKVAL(JS_TAG_INT, (int32_t)_x);\n", (unsigned)dv);
+  }
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
+/* A numeric element store on a checked typed array. */
+static int emit_ta_region_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int cls) {
+  Q2ValueId av = in->use[0], kv = in->use[1], vv = in->use[2], root;
+  int idx = e_insn_idx(fn, in);
+  ETaInfo ti;
+  char fail[32], ex[48];
+  (void)cur;
+  if (!e_ta_info(cls, &ti)) return 0;
+  if (av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues || vv >= (Q2ValueId)t->nvalues ||
+      t->lb[av] != E_LB_TAG)
+    return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  root = e_region_root(fn, in);
+  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  e_group_exit_stub(f, in, cur, av);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(f, "    {\n");
+  if (!g_e_facts->arrskip[idx]) e_arr_region_start_cls(f, av, root, fail, cls);
+  e_region_index(f, t, kv, in->pc);
+  fprintf(f, "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n", (unsigned)root, in->pc);
+  if (t->lb[vv] == E_LB_I32) {
+    snprintf(ex, sizeof(ex), "i%u", (unsigned)vv);
+    e_ta_store_stmt(f, &ti, (unsigned)root, 0, ex);
+  } else if (t->lb[vv] == E_LB_BOOL) {
+    snprintf(ex, sizeof(ex), "(int32_t)b%u", (unsigned)vv);
+    e_ta_store_stmt(f, &ti, (unsigned)root, 0, ex);
+  } else if (t->lb[vv] == E_LB_F64) {
+    snprintf(ex, sizeof(ex), "d%u", (unsigned)vv);
+    e_ta_store_stmt(f, &ti, (unsigned)root, 1, ex);
+  } else if (t->lb[vv] == E_LB_TAG) {
+    fprintf(f, "      if (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT) {\n", (unsigned)vv);
+    fprintf(f, "        int32_t _xi = JS_VALUE_GET_INT(v%u);\n", (unsigned)vv);
+    e_ta_store_stmt(f, &ti, (unsigned)root, 0, "_xi");
+    fprintf(f, "      } else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64) {\n", (unsigned)vv);
+    fprintf(f, "        double _xd = JS_VALUE_GET_FLOAT64(v%u);\n", (unsigned)vv);
+    e_ta_store_stmt(f, &ti, (unsigned)root, 1, "_xd");
+    fprintf(f, "      } else goto vx_%d;\n", in->pc);
+  } else {
+    return 0;
+  }
+  fprintf(f, "    }\n");
+  e_inl_store_mark(f);
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
 static int emit_elem_region_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur) {
   Q2ValueId dv = in->def[0], av = in->use[0], kv = in->use[1], root;
   int dreg, idx = e_insn_idx(fn, in);
   char fail[32];
+  if (e_ta_class(fn, in)) return emit_ta_region_read(f, fn, in, t, cur, e_ta_class(fn, in));
   if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
       kv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
     return 0;
@@ -8044,6 +8224,7 @@ static int emit_elem_region_write(
   Q2ValueId av = in->use[0], kv = in->use[1], vv = in->use[2], root;
   int idx = e_insn_idx(fn, in);
   char fail[32], vb[48];
+  if (e_ta_class(fn, in)) return emit_ta_region_write(f, fn, in, t, cur, e_ta_class(fn, in));
   (void)cur;
   if (av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues ||
       vv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
@@ -11517,8 +11698,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             continue;
           }
           if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG &&
-              g_e_facts->hoist_grp[o2] == -2)
-            e_arr_region_start(f, rv, rv, "goto osr_fail");
+              (g_e_facts->hoist_grp[o2] == -2 || (g_e_facts->hoist_grp[o2] <= -101 && g_e_facts->hoist_grp[o2] >= -112)))
+            e_arr_region_start_grp(f, rv, rv, "goto osr_fail", g_e_facts->hoist_grp[o2]);
           else if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG)
             fprintf(
                 f, "      if (__builtin_expect(q2_shape_of(v%u) != gsh%d, 0)) goto osr_fail;\n",
