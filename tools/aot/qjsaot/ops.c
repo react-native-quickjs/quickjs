@@ -792,6 +792,16 @@ static int elem_pc_is_numeric(const Q2Func *fn, const Q2Insn *in) {
   return 0;
 }
 
+/* Whether the profile saw a store at this pc that the inline store would not take: it grew
+   the array or filled a hole. */
+static int elem_pc_store_misses(const Q2Func *fn, const Q2Insn *in) {
+  int i;
+  if (fn->prof == NULL) return 0;
+  for (i = 0; i < fn->nprof; i++)
+    if (fn->prof[i].pc == in->pc) return (fn->prof[i].elem & Q2_ELEM_HOLEY) != 0;
+  return 0;
+}
+
 /* ---- guarded element regions ---------------------------------------------
    A block that accesses one array several times re-validates the receiver and
    reloads the array's `count` and `values` pointers on every access, because the
@@ -4585,6 +4595,12 @@ static int emit_typed_elem_write(
      leaves on the other cases, so only a number or a bool is stored there: an
      object stored over a slot would leave on every execution. */
   if (t->lb[av] != E_LB_TAG) return 0;
+  /* A frameless body leaves at a miss and cannot run the store's slow path: a store that
+     grows the array or fills a hole would leave on every call. */
+  if (g_e_fl && elem_pc_store_misses(fn, in)) {
+    e_fl_block("a store that grows an array or fills a hole", in);
+    return 0;
+  }
   if (t->lb[kv] == E_LB_I32)
     snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
   else if (t->lb[kv] == E_LB_TAG)
