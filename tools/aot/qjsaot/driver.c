@@ -2599,6 +2599,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static const JSValue e_undefined_value = { { .int32 = 0 }, "
         "JS_TAG_UNDEFINED };\n"
         "static inline int q2_spec_fns_out(int fi);\n"
+        "static inline int q2_spec_set_out(int fi);\n"
         "static void __attribute__((constructor)) q2_no_spec_init(void)\n"
         "{\n"
         "  const char *e = getenv(\"QJS_AOT_NO_SPEC\");\n"
@@ -2609,7 +2610,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The switches folded per function, so a body that must be as short as
            a call can afford (a frameless one) tests one byte, not four globals. */
         "  for (i = 0; i < QJS_AOT_NFUNCS; i++)\n"
-        "    e_gate[i] = e_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i));\n"
+        "    e_gate[i] = e_dis[i] = (!q2_spec_on || q2_no_spec || q2_spec_fns_out(i) || q2_spec_set_out(i));\n"
         "}\n\n"
         /* The builtins a unit lowers inline: the engine's own
            function pointers, filled once, and the number view the inline C
@@ -3575,6 +3576,18 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  if (q2_spec_fns_lo < 0) return 0;\n"
         "  return fi < q2_spec_fns_lo || fi > q2_spec_fns_hi;\n"
+        "}\n\n"
+        /* QJS_AOT_SPEC_SET="3,17,40": the spec body only for those function indices (a set, for
+           pinning down a failure that needs more than one function) */
+        "static inline __attribute__((always_inline)) int q2_spec_set_out(int fi)\n"
+        "{\n"
+        "  static const char *v; static int init;\n"
+        "  char tok[16];\n"
+        "  const char *p;\n"
+        "  if (!init) { v = getenv(\"QJS_AOT_SPEC_SET\"); init = 1; }\n"
+        "  if (v == NULL) return 0;\n"
+        "  snprintf(tok, sizeof(tok), \",%%d,\", fi);\n"
+        "  { char buf[512]; snprintf(buf, sizeof(buf), \",%%s,\", v); p = strstr(buf, tok); return p == NULL; }\n"
         "}\n\n");
     /* The sweep's coverage record: which guard sites a run reached. Only a sweep
        unit calls it. Each translation unit keeps its own bitmap and appends the
@@ -3678,7 +3691,14 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define q2_elem_hit(a, k, o) q2_elem_hit_lz(a, k, o, Q2_LZ)\n"
         "#define q2_own_read_hit(...) q2_own_read_hit_lz(__VA_ARGS__, Q2_LZ)\n"
         "#define E_LAZY_SEEN(ctx_) (*((uint8_t *)*(uint8_t **)((uint8_t *)(ctx_) + "
-        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_LAZY_JSON))\n\n");
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_LAZY_JSON))\n"
+        /* some cache entry has changed since this body's entry validated its cache cells */
+        "#ifdef Q2_FORCE_EPOCH\n"
+        "#define Q2_EPOCH_MOVED(ctx_) ((void)q2_ep, 1)\n"
+        "#else\n"
+        "#define Q2_EPOCH_MOVED(ctx_) (*(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)(ctx_) + "
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH) != q2_ep)\n"
+        "#endif\n\n");
     /* A reference taken inline: the count is an int QJS_AOT_RC_BACK bytes before
        the object (the layout publishes the offset), and this is js_dup()'s body,
        so a counted store or a return costs no call into the engine. Release

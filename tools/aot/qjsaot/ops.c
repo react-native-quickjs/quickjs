@@ -2695,14 +2695,47 @@ static int g_e_nolazy = 0;
    safepoint may create one (JSON.parse of a large text), so the flag is read again and a
    set flag exits at the next instruction, with the op's results already in the frame (the
    dx_ stub). One helper for every safepoint emitter. */
+/* Set while a body is emitted whose entry validates the cache cells of its groups (and so defines
+   `q2_ep`, the epoch it validated them at): an access to a hot site of such a group tests no cell, and
+   every safepoint is followed by a comparison of the runtime's epoch with `q2_ep` that leaves the body
+   when any cache entry has changed meanwhile. */
+static int g_e_epoch_skip;
+static const ETypes *g_e_types;
+
 static void e_emit_group_recheck(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur) {
-  (void)fn;
-  if (!g_e_nolazy) return;
+  if (!g_e_nolazy && !g_e_epoch_skip) return;
   e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
   e_sweep_guard(f, "dx", in->next);
   fprintf(
-      f, "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) goto dx_%d;\n", in->next);
+      f, "    if (__builtin_expect(%s%s%s, 0)) goto dx_%d;\n", g_e_nolazy ? "E_LAZY_SEEN(ctx)" : "",
+      g_e_nolazy && g_e_epoch_skip ? " || " : "", g_e_epoch_skip ? "Q2_EPOCH_MOVED(ctx)" : "", in->next);
+}
+
+/* A typed definition held only in its local, put in its frame register for the exit stub that reads it
+   from there. */
+static void e_store_typed_def(FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId dv) {
+  int reg;
+  if (dv == Q2_NO_VALUE || dv >= (Q2ValueId)t->nvalues || e_def_dead(in, dv)) return;
+  reg = fn->values[dv].reg;
+  if (reg < 0 || reg >= fn->nregs) return;
+  switch (t->lb[dv]) {
+    case E_LB_I32: fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", reg * 16, (unsigned)dv); break;
+    case E_LB_F64: fprintf(f, "        AOT_SET_B(ctx, fr, %d, E_BOX_F64(d%u));\n", reg * 16, (unsigned)dv); break;
+    case E_LB_BOOL: fprintf(f, "        AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", reg * 16, (unsigned)dv); break;
+    default: break;
+  }
+}
+
+/* Whether the entry validated the cell of `site` in group `g`, which no safepoint has since been
+   followed by a change of the epoch. */
+static int e_cell_entry_valid(int g, int site) {
+  int z;
+  if (!g_e_epoch_skip || g_e_facts == NULL || g < 0 || g >= g_e_facts->ngroups || g_e_group_used == NULL) return 0;
+  if (!g_e_group_used[g] || g_e_facts->groups[g].own) return 0;
+  for (z = 0; z < g_e_facts->nsites; z++)
+    if (g_e_facts->sites[z].site == site) return g_e_facts->sites[z].hot;
+  return 0;
 }
 
 /* Defined with the other field emitters below; the chain and write emitters
@@ -4324,6 +4357,16 @@ static void e_emit_term_step(
       in->pc, blk->succ_pc[0], inv ? 0 : 1, blk->succ_pc[1], inv ? 1 : 0, fi);
   e_emit_ret_g(f, "        ", hex, "(uint32_t)(ip_ - code_)");
   fprintf(f, "    } }\n");
+  /* the step may have run code: the cache cells the body assumes are valid only while the epoch holds */
+  if (g_e_epoch_skip) {
+    fprintf(f, "    if (__builtin_expect(Q2_EPOCH_MOVED(ctx), 0)) {\n        E_HANDOFF_NOTE(%d);\n", fi);
+    {
+      char tgt[96];
+      snprintf(tgt, sizeof(tgt), "(uint32_t)((c_ ^ %d) ? %d : %d)", inv ? 1 : 0, blk->succ_pc[0], blk->succ_pc[1]);
+      e_emit_ret_g(f, "        ", hex, tgt);
+    }
+    fprintf(f, "    }\n");
+  }
 }
 
 /* Whether a terminator can run through the wrapper: a two-way branch that defines
@@ -5529,7 +5572,6 @@ static int emit_inl_nested_call(
         "%s\n",
         cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
-    if (g_e_inl) e_emit_group_recheck(f, fn, in, cur);
     if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
       /* The owned result parks in the published window, then its count is dropped (the
          drop can run a collection); the next safepoint gives the value a slot. */
@@ -5549,7 +5591,8 @@ static int emit_inl_nested_call(
     /* The result is in place (a TAG value in its local, a typed one in the frame
        slot the exit stub reads): the facts the call may have changed are checked now,
        so an exit here carries the result. */
-    if (!g_e_inl) e_emit_group_recheck(f, fn, in, cur);
+    if (g_e_epoch_skip || g_e_nolazy) e_store_typed_def(f, fn, in, t, dv);
+    e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
   /* No candidate matched. A frameless body that is not inlined calls any other
@@ -5579,6 +5622,7 @@ static int emit_inl_nested_call(
       fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
       abort();
     }
+    if (g_e_epoch_skip || g_e_nolazy) e_store_typed_def(f, fn, in, t, dv);
     e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n", in->pc);
   }
@@ -5911,6 +5955,8 @@ static int emit_store_call(
           continue;
         fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)rv, rr * 16);
       }
+      /* only the engine's store is a safepoint: the cache hit runs no code, and keeps its values in locals */
+      e_emit_group_recheck(f, fn, in, cur);
       fprintf(f, "    } else {\n");
       for (k = 0; k < in->nredef; k++) {
         Q2ValueId rv = in->redef_val[k], src;
@@ -5926,7 +5972,6 @@ static int emit_store_call(
         fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
       }
       fprintf(f, "    }\n");
-      e_emit_group_recheck(f, fn, in, cur);
       return 1;
     }
   }
@@ -8099,6 +8144,8 @@ static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const 
    generic body. */
 static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc) {
   int z, wr = 0;
+  /* a cell the entry validated is valid while the epoch has not moved, which every safepoint tests */
+  if (e_cell_entry_valid(group, site)) return;
   for (z = 0; z < g_e_facts->nsites; z++)
     if (g_e_facts->sites[z].site == site) wr = g_e_facts->sites[z].write;
   if (strcmp(kind, "osr") == 0)
@@ -8410,6 +8457,9 @@ static void e_group_test(
     snprintf(
         cell + strlen(cell), sizeof(cell) - strlen(cell),
         " || q2_holder2_bad(%s, holders, (int)q2_ns, %s)", recv, ci);
+  /* A cell the entry validated and no change of the epoch has followed needs no test; a prototype
+     read still tests its holder. */
+  if (!proto && e_cell_entry_valid(g, site)) cellskip = 1;
   if (skip && cellskip) {
     snprintf(out, n, "0");
   } else if (skip) {
@@ -10691,10 +10741,12 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]);
 static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   int rc;
   g_e_nolazy = !g_e_inl;
+  g_e_epoch_skip = 0;
   if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 0\n");
   rc = e_emit_spec_body_pass_inner(f, fn, hex);
   if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 1\n");
   g_e_nolazy = 0;
+  g_e_epoch_skip = 0;
   return rc;
 }
 static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) {
@@ -11049,6 +11101,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         for (qq = 0; qq < gr->nsites; qq++)
           if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2) npci++;
       }
+      g_e_epoch_skip = ngu > 0 && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
       if (ngu > 0) {
         int gk = 0, pk = 0;
         fprintf(
