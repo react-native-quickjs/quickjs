@@ -64996,13 +64996,27 @@ QJS_AOT_STUB void qjs_aot_seal(JSContext *ctx, JSRegRun *f)
 #endif
 }
 
+static JSValue JS_PRINTF_FORMAT_ATTR(2, 3)
+qjs_aot_throw_range_error_bt(JSContext *ctx, JS_PRINTF_FORMAT const char *fmt, ...)
+{
+    va_list ap;
+    JSValue ret;
+
+    va_start(ap, fmt);
+    ret = JS_ThrowError2(ctx, JS_RANGE_ERROR, true, fmt, ap);
+    va_end(ap);
+    return ret;
+}
+
 /* A native entry checks the C stack itself, so a deep recursion of compiled
    functions raises the interpreter's own RangeError instead of running into
    the guard page. The message and the constructor must match the
    interpreter's exactly: a test compares them. */
 QJS_AOT_STUB JSValue qjs_aot_throw_stack_overflow(JSContext *ctx)
 {
-    return JS_ThrowStackOverflow(ctx);
+    /* The backtrace is built here, not when the exception is caught: the frameless
+       activation records that stand for the calling functions are gone by then. */
+    return qjs_aot_throw_range_error_bt(ctx, "Maximum call stack size exceeded");
 }
 
 /* The callee's frame is the caller's stack buffer, so returning is just the
