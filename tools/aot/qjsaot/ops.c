@@ -6344,22 +6344,33 @@ static int emit_pure_call(
   e_note_tag('v', in->pc, cexp);
   if (t->lb[dv] != E_LB_TAG)
     e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-  /* The argument window, and the receiver and callee when they live only in locals: the inline
-     body reads them from the frame. No other value is synced: nothing here can collect. */
-  for (r = 0; r < na + 2; r++) {
-    Q2ValueId v;
-    int wr = r < na ? in->win_reg + r : (r == na ? cc / 16 : (th >= 0 ? th / 16 : -1));
-    if (wr < 0 || wr >= fn->nregs) continue;
-    v = cur[wr];
-    if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues) continue;
-    if (t->lb[v] == E_LB_TAG)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", wr * 16, (unsigned)v);
-    else if (t->lb[v] == E_LB_I32)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", wr * 16, (unsigned)v);
-    else if (t->lb[v] == E_LB_F64)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E_BOX_F64(d%u));\n", wr * 16, (unsigned)v);
-    else if (t->lb[v] == E_LB_BOOL)
-      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", wr * 16, (unsigned)v);
+  /* The argument window is built from the locals into an array of this scope, and the receiver
+     and callee are passed as values: the inline body reads them in place, nothing is stored to
+     the frame, and nothing here can collect. */
+  {
+    char wexp[64];
+    fprintf(f, "    {\n    JSValue args_[%d];\n", na > 0 ? na : 1);
+    for (r = 0; r < na; r++) {
+      Q2ValueId v;
+      int wr = in->win_reg + r;
+      if (wr < 0 || wr >= fn->nregs || (v = cur[wr]) == Q2_NO_VALUE || v == E_UNDEF) {
+        snprintf(wexp, sizeof(wexp), "JS_UNDEFINED");
+      } else if (v == E_INFRAME || v >= (Q2ValueId)t->nvalues) {
+        snprintf(wexp, sizeof(wexp), "AOT_REG(fr, %d)", wr * 16);
+      } else if (t->lb[v] == E_LB_TAG) {
+        snprintf(wexp, sizeof(wexp), "v%u", (unsigned)v);
+      } else if (t->lb[v] == E_LB_I32) {
+        snprintf(wexp, sizeof(wexp), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)v);
+      } else if (t->lb[v] == E_LB_F64) {
+        snprintf(wexp, sizeof(wexp), "E_BOX_F64(d%u)", (unsigned)v);
+      } else if (t->lb[v] == E_LB_BOOL) {
+        snprintf(wexp, sizeof(wexp), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)v);
+      } else {
+        snprintf(wexp, sizeof(wexp), "AOT_REG(fr, %d)", wr * 16);
+      }
+      fprintf(f, "    args_[%d] = %s;\n", r, wexp);
+    }
+    (void)w;
   }
   e_sweep_guard(f, "vx", in->pc);
   for (k = 0; k < n && k < 4; k++) {
@@ -6370,8 +6381,8 @@ static int emit_pure_call(
         "        JSValue _o;\n"
         "        E_CAP(f, %d);\n"
         "        if (!ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "                    &AOT_REG(fr, %d), %d, &_o)) goto vx_%d;\n",
-        cexp, callee[k], in->next - 1, callee[k], cexp, recv, w, na, in->pc);
+        "                    args_, %d, &_o)) goto vx_%d;\n",
+        cexp, callee[k], in->next - 1, callee[k], cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(
@@ -6415,7 +6426,7 @@ static int emit_pure_call(
     }
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
-  fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
+  fprintf(f, "    goto vx_%d;\n    }\n    cd_%d: ;\n", in->pc, in->pc);
   cur[dreg] = dv;
   g_e_miss_exit_seen = 1;
   return 1;
