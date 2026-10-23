@@ -1,0 +1,60 @@
+Subject: Exposes whether the typed-array length accessor is intact
+
+What this does
+  - `qjs_aot_ta_len_valid(ctx)` answers whether every typed-array class reads `length` from the
+    builtin %TypedArray%.prototype accessor (no class prototype shadows it, the getter is the
+    builtin), revalidating after a watched change; the interpreter's `get_length` already
+    caches this per context. The layout header gains the offset of that cached epoch.
+
+Why we need it
+  A compiled typed-array `.length` has to honour an own or inherited `length`, so it was
+  answered by the step handler on every read. With the epoch readable in place, a unit
+  checks the instance shape (no own property), the realm's class prototype and the epoch
+  inline, and calls `qjs_aot_ta_len_valid` only after the epoch moved.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -173,6 +173,8 @@
+     /* A rope whose linearised form is memoised holds the flat string on the left and the
+        empty string on the right: where those two values sit. */
+     uint32_t off_rope_left, off_rope_right;
++    /* The epoch at which the typed-array `length` accessor was last validated. */
++    uint32_t off_ctx_ta_len_epoch;
+ } JSAotGenLayout;
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+@@ -435,6 +437,9 @@
+    unchanged. */
+ int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
+                           const void **prs, uint32_t *off);
++/* 1 when every typed-array class reads `length` from the builtin accessor (no class
++   prototype shadows it); revalidates after a watched change. */
++int qjs_aot_ta_len_valid(JSContext *ctx);
+ /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
+ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
+ /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60928,6 +60928,7 @@
+     out->off_cfunc_magic = (uint32_t)offsetof(JSObject, u.cfunc.magic);
+     out->off_rope_left = (uint32_t)offsetof(JSStringRope, left);
+     out->off_rope_right = (uint32_t)offsetof(JSStringRope, right);
++    out->off_ctx_ta_len_epoch = (uint32_t)offsetof(JSContext, regvm_ta_len_epoch);
+     out->off_regpic_misses = (uint32_t)offsetof(JSRegPIC, misses);
+     out->reg_pic_add_w = REG_PIC_ADD_W;
+     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
+@@ -62751,6 +62752,14 @@
+     return qjs_aot_object_fill_b(ctx, f->b, obj, vals, n, ti);
+ }
+ 
++/* A typed array's `length` is the standard accessor in every realm class: no class prototype
++   shadows it and the getter is the builtin. The inline read checks the epoch first. */
++int qjs_aot_ta_len_valid(JSContext *ctx)
++{
++    return ctx->regvm_ta_len_epoch == ctx->rt->ic_watchpoint_epoch ||
++           regvm_ta_len_validate(ctx);
++}
++
+ int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
+                           const void **prs_out, uint32_t *off)
+ {
