@@ -439,3 +439,4 @@ bump while `9999` is missing.
 | `0351` | A compiled `s += constant` appends in place without the frame scan | The in-place append scanned every register for another holder (75 of ~200 instructions) | `regvm_accum_append_u`, `qjs_aot_append_const` | No. |
 | `0352` | A parked coroutine with compiled code resumes straight into the unit | Each resume entered js_regvm_execute for ~200 instructions of setup | `js_aot_run_coroutine`, `JS_CALL_FLAG_AOT_DEOPT` | No. |
 | `0353` | A for-of over a plain generator resumes it directly; the compiled for-of step skips the step table | Each element went through three protocol layers and a table dispatch | `regvm_for_of_next`, `qjs_aot_iter_next` | No. |
+| `0354` | A plain decimal literal of <= 15 digits is converted without the big-number routine | Every Number()/parseInt/parseFloat/unary plus ran js_atod's multi-limb path (27% of string_parseint) | `js_dec_fast` in `js_atof` | No. |

@@ -18141,6 +18141,76 @@ static JSValue JS_CompactBigInt(JSContext *ctx, JSBigInt *p)
 /* accept -0x1 */
 #define ATOD_ACCEPT_PREFIX_AFTER_SIGN (1 << 10)
 
+/* The value of a plain decimal literal "digits[.digits][e[+-]digits]" of at most 15 significant
+   digits and a power of ten within 10^-22..10^22: one correctly rounded multiplication or
+   division of two exactly representable doubles (Clinger's fast path), identical to what
+   js_atod produces. Returns false for anything else, which takes the general conversion. */
+static bool js_dec_fast(const char *p, const char *e, double *out)
+{
+    static const double p10[23] = {
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    };
+    uint64_t m = 0;
+    int nd = 0, frac = 0, digits = 0, exp10 = 0;
+    bool seen_dot = false;
+    double d;
+
+    for (; p < e; p++) {
+        unsigned c = (unsigned char)*p - '0';
+
+        if (c <= 9) {
+            if (nd > 0 || c != 0) {
+                if (++nd > 15)
+                    return false;
+            }
+            m = m * 10 + c;
+            digits++;
+            if (seen_dot)
+                frac++;
+        } else if (*p == '.' && !seen_dot) {
+            seen_dot = true;
+        } else {
+            break;
+        }
+    }
+    if (digits == 0)
+        return false;
+    if (p < e) {
+        int es = 1, ev = 0;
+
+        if (*p != 'e' && *p != 'E')
+            return false;
+        p++;
+        if (p < e && (*p == '+' || *p == '-')) {
+            es = *p == '-' ? -1 : 1;
+            p++;
+        }
+        if (p >= e)
+            return false;
+        for (; p < e; p++) {
+            unsigned c = (unsigned char)*p - '0';
+
+            if (c > 9)
+                return false;
+            ev = ev * 10 + (int)c;
+            if (ev > 400)
+                return false;
+        }
+        exp10 = es * ev;
+    }
+    exp10 -= frac;
+    if (m == 0) {
+        *out = 0.0;
+        return true;
+    }
+    if (exp10 < -22 || exp10 > 22)
+        return false;
+    d = (double)m;
+    *out = exp10 < 0 ? d / p10[-exp10] : d * p10[exp10];
+    return true;
+}
+
 /* return an exception in case of memory error. Return JS_NAN if
    invalid syntax */
 /* XXX: directly use js_atod() */
@@ -18256,6 +18326,16 @@ static JSValue js_atof(JSContext *ctx, const char *str, const char **pp,
     }
     if (p == p_start)
         goto fail;
+
+    if (radix == 10 && atod_type == ATOD_TYPE_FLOAT64 &&
+        !((flags & ATOD_ACCEPT_SUFFIX) && *p == 'n')) {
+        double d;
+
+        if (js_dec_fast(p_start, p, &d)) {
+            val = js_number(is_neg ? -d : d);
+            goto done;
+        }
+    }
 
     buf = buf1;
     buf_allocated = false;
