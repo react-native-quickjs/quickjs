@@ -1403,12 +1403,16 @@
       "sha256": "1560194dfc4b6af76a0ab4c778377314f34b9af6c24f898f14ac91c1f23c8b57"
     },
     {
+      "name": "0357-lean-map-call.patch",
+      "sha256": "6f8923d6c1a8350c12bcc4d515e6f8beb126af21528370045cd91f356d96291a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "324c8d38dc945759bbc1ae6786c32e814dbd44e7f4b8d5a3219390f1e6563724",
+    "quickjs.c": "2daf3358c8b2cd7dead60f8f91118e333e8c884a42133976e1516fd90e6c76f0",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

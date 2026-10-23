@@ -442,3 +442,4 @@ bump while `9999` is missing.
 | `0354` | A plain decimal literal of <= 15 digits is converted without the big-number routine | Every Number()/parseInt/parseFloat/unary plus ran js_atod's multi-limb path (27% of string_parseint) | `js_dec_fast` in `js_atof` | No. |
 | `0355` | The for-in keys are the runtime's small-integer strings | 0347 duplicated `rt->intstr`; `js_int_to_string` formatted before the table lookup | `js_index_to_string`, `qjs_aot_for_in_next` | No. |
 | `0356` | A new Map/Set iterator starts after the deleted records in front of it | An LRU cache walked every zombie record pinned by dead-but-uncollected iterators on each `keys().next()` | `JSMapState.scan_start` | No. |
+| `0357` | Compiled code calls Map/Set get/has/set/delete without the native frame | ~140 instructions of JSStackFrame setup per builtin call | `qjs_aot_call_c`, `cfunc.lean`, `aot_lean_kind` | No. |

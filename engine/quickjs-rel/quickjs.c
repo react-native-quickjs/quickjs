@@ -2346,6 +2346,9 @@ struct JSObject {
             uint8_t length;
             uint8_t cproto;
             int16_t magic;
+            /* what compiled code may do with the function without building the native frame
+               (see aot_lean_kind): 0 not decided yet */
+            uint8_t lean;
         } cfunc;
         /* array part for fast arrays and typed arrays */
         struct { /* JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS, JS_CLASS_MAPPED_ARGUMENTS, JS_CLASS_UINT8C_ARRAY..JS_CLASS_FLOAT64_ARRAY */
@@ -9651,6 +9654,7 @@ JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
     p->u.cfunc.length = length;
     p->u.cfunc.cproto = cproto;
     p->u.cfunc.magic = magic;
+    p->u.cfunc.lean = 0;
     p->is_constructor = (cproto == JS_CFUNC_constructor ||
                          cproto == JS_CFUNC_constructor_magic ||
                          cproto == JS_CFUNC_constructor_or_func ||
@@ -64385,6 +64389,39 @@ QJS_AOT_STUB int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
     return JS_IsException(ret_val) ? -1 : 1;
 }
 
+static JSValue js_map_get(JSContext *ctx, JSValueConst this_val, int argc,
+                          JSValueConst *argv, int magic);
+static JSValue js_map_set(JSContext *ctx, JSValueConst this_val, int argc,
+                          JSValueConst *argv, int magic);
+static JSValue js_map_has(JSContext *ctx, JSValueConst this_val, int argc,
+                          JSValueConst *argv, int magic);
+static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val, int argc,
+                             JSValueConst *argv, int magic);
+
+#define AOT_LEAN_NONE 1
+#define AOT_LEAN_MAP  2
+
+/* Which builtins compiled code may call straight, without the JSStackFrame js_call_c_function
+   builds: Map and Set get/has/set(add)/delete on a Map or Set (not a weak one) with the
+   declared number of arguments. They run no JS, and for a receiver of the right class they
+   throw nothing but out-of-memory, so there is no frame to describe in a backtrace and no
+   callback to link it to. (An out-of-memory error raised inside such a call lacks the
+   "at set (native)" line the full call would give it; the allocation does not start a
+   collection, so nothing else needs the frame.) The caller checks the receiver and the
+   argument count. */
+static uint8_t aot_lean_kind(JSObject *p)
+{
+    void *f;
+
+    if (p->u.cfunc.cproto != JS_CFUNC_generic_magic || (p->u.cfunc.magic & ~1) != 0)
+        return AOT_LEAN_NONE;
+    f = (void *)p->u.cfunc.c_function.generic_magic;
+    if (f == (void *)js_map_get || f == (void *)js_map_set || f == (void *)js_map_has ||
+        f == (void *)js_map_delete)
+        return AOT_LEAN_MAP;
+    return AOT_LEAN_NONE;
+}
+
 /* The specialised C-call path for `callee(this, argv[0..na-1])`. `cproto` is
    the C prototype the profile saw (-1 = any). Returns 1 with *out, 0 to fall
    back, -1 on exception. The f_f / f_f_f paths call the bound pointer, so the
@@ -64423,6 +64460,26 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
                        (get_shape_prop(ap->shape)->flags & JS_PROP_WRITABLE) &&
                        (uint32_t)JS_VALUE_GET_INT(ap->prop[0].u.value) == ap->u.array.count)) {
                 rv = js_array_push(ctx, this_obj, 1, argv, 0);
+                if (JS_IsException(rv))
+                    return -1;
+                *out = rv;
+                return 1;
+            }
+        }
+        {
+            /* a builtin that runs no JS and cannot throw for these operands needs neither
+               the native frame nor the stack check (see aot_lean_kind) */
+            uint8_t lk = p->u.cfunc.lean;
+
+            if (unlikely(lk == 0))
+                lk = p->u.cfunc.lean = aot_lean_kind(p);
+            if (lk > AOT_LEAN_NONE && na >= (int)p->u.cfunc.length &&
+                JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_OBJ(this_obj)->class_id ==
+                    JS_CLASS_MAP + (p->u.cfunc.magic & 1) &&
+                p->u.cfunc.realm == ctx) {
+                rv = p->u.cfunc.c_function.generic_magic(ctx, this_obj, na, argv,
+                                                         p->u.cfunc.magic);
                 if (JS_IsException(rv))
                     return -1;
                 *out = rv;
