@@ -1905,6 +1905,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_JSREGPIC_MISSES %uu\n"
           "#define QJS_AOT_REG_PIC_ADD_W %uu\n"
           "#define QJS_AOT_OFF_RT_IC_EPOCH %uu\n"
+          "#define QJS_AOT_OFF_RT_LAZY_JSON %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_FLAGS16 %uu\n"
           "#define QJS_AOT_JSOBJECT_EXTENSIBLE_MASK %uu\n"
           "#define QJS_AOT_JSOBJECT_NOADD_MASK %uu\n"
@@ -1962,7 +1963,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm,
           lay.off_rc_back, lay.off_varref_pvalue, lay.class_c_function,
           lay.off_cfunc_c_function, lay.off_cfunc_magic, lay.off_regpic_misses,
-          lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_object_flags16,
+          lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_rt_lazy_json, lay.off_object_flags16,
           lay.object_extensible_mask, lay.object_noadd_mask,
           lay.object_inline_cap_mask, lay.object_inline_cap_shift, lay.off_rope_left,
           lay.off_rope_right, lay.off_ctx_ta_len_epoch);
@@ -2969,8 +2970,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *out = JS_MKPTR(JS_TAG_STRING, tab[c]);\n"
         "  return 1;\n"
         "}\n"
-        "static inline __attribute__((always_inline)) int q2_elem_hit(JSValue "
-        "arr, JSValue k, JSValue *out)\n"
+        "static inline __attribute__((always_inline)) int q2_elem_hit_lz(JSValue "
+        "arr, JSValue k, JSValue *out, int lz)\n"
         "{\n"
         "  const unsigned char *p;\n"
         "  uint32_t i;\n"
@@ -2990,7 +2991,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  v = (*(JSValue *const *)(p + "
         "QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
         "  if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
-        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  if (lz && JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
         "  *out = v;\n"
         "  return 1;\n"
         "}\n\n"
@@ -3284,9 +3285,9 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int "
-        "q2_own_read_hit(const void *pic, void *const *holders,\n"
+        "q2_own_read_hit_lz(const void *pic, void *const *holders,\n"
         "                       JSValue recv, int site, int nsites,\n"
-        "                       JSValue *out)\n"
+        "                       JSValue *out, int lz)\n"
         "{\n"
         "  const unsigned char *obj, *e, *holder, *prop;\n"
         "  uint32_t slot_off;\n"
@@ -3334,7 +3335,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "QJS_AOT_OFF_JSOBJECT_PROP);\n"
         "  slot_off = *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF);\n"
         "  v = *(const JSValue *)(prop + slot_off);\n"
-        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) {\n"
+        "  if (lz && JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) {\n"
         "    return 0;\n"
         "  }\n"
         "#if !QJS_DRC\n"
@@ -3344,7 +3345,14 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#endif\n"
         "  *out = v;\n"
         "  return 1;\n"
-        "}\n\n");
+        "}\n"
+        /* The lazy-JSON marker test is on unless the body in progress assumes no lazy
+           document exists (Q2_LZ is redefined around such a body). */
+        "#define Q2_LZ 1\n"
+        "#define q2_elem_hit(a, k, o) q2_elem_hit_lz(a, k, o, Q2_LZ)\n"
+        "#define q2_own_read_hit(...) q2_own_read_hit_lz(__VA_ARGS__, Q2_LZ)\n"
+        "#define E_LAZY_SEEN(ctx_) (*((uint8_t *)*(uint8_t **)((uint8_t *)(ctx_) + "
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_LAZY_JSON))\n\n");
     /* A reference taken inline: the count is an int QJS_AOT_RC_BACK bytes before
        the object (the layout publishes the offset), and this is js_dup()'s body,
        so a counted store or a return costs no call into the engine. Release

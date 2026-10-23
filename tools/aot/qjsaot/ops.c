@@ -2614,6 +2614,24 @@ static int e_must_exit(const Q2Func *fn, const Q2Insn *in) {
   return g_e_facts != NULL && g_e_facts->miss_exits[e_insn_idx(fn, in)];
 }
 
+/* Set while a speculative body that assumes no lazy JSON value exists is emitted. */
+static int g_e_nolazy = 0;
+
+/* After a safepoint (an op call, a call): code in this body skips the lazy-JSON marker
+   test on loaded values, which holds while no lazy JSON document has been created. A
+   safepoint may create one (JSON.parse of a large text), so the flag is read again and a
+   set flag exits at the next instruction, with the op's results already in the frame (the
+   dx_ stub). One helper for every safepoint emitter. */
+static void e_emit_group_recheck(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur) {
+  (void)fn;
+  if (!g_e_nolazy) return;
+  e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
+  e_sweep_guard(f, "dx", in->next);
+  fprintf(
+      f, "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) goto dx_%d;\n", in->next);
+}
+
 /* Defined with the other field emitters below; the chain and write emitters
    above them call these. */
 static int emit_group_chain(
@@ -3883,6 +3901,7 @@ static int emit_typed_opcall(
      e_note_defs does that once the whole instruction is lowered, so an emitter
      with two miss paths gives the second one the pre-instruction state. */
   if (any) fprintf(f, "    /* op call done, defs reloaded with their guards */\n");
+  e_emit_group_recheck(f, fn, in, cur);
   g_e_opcalls++;
   return 1;
 }
@@ -5158,6 +5177,7 @@ static int emit_inl_nested_call(
         "%s\n",
         cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
+    if (g_e_inl) e_emit_group_recheck(f, fn, in, cur);
     if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
       /* The owned result parks in the published window, then its count is dropped (the
          drop can run a collection); the next safepoint gives the value a slot. */
@@ -5177,6 +5197,7 @@ static int emit_inl_nested_call(
     /* The result is in place (a TAG value in its local, a typed one in the frame
        slot the exit stub reads): the facts the call may have changed are checked now,
        so an exit here carries the result. */
+    if (!g_e_inl) e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
   /* No candidate matched. A frameless body that is not inlined calls any other
@@ -5206,6 +5227,7 @@ static int emit_inl_nested_call(
       fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
       abort();
     }
+    e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "        goto cd_%d;\n    }\n", in->pc);
   }
   /* The call has not run: leave before it. */
@@ -5326,6 +5348,7 @@ static int emit_typed_construct(
         "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
         cexp, callee[k], ntexp, ntexp, cexp, cexp, in->next - 1, callee[k], cexp, w, na,
         getenv("QJS_AOT_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", cexp, off);
+    e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
     fprintf(f, "            goto cd_%d;\n        }\n    }\n#endif\n", in->pc);
   }
@@ -5436,6 +5459,7 @@ static int emit_fl_put_global(
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
     cur[rr] = rv;
   }
+  e_emit_group_recheck(f, fn, in, cur);
   return 1;
 }
 
@@ -5509,6 +5533,7 @@ static int emit_store_call(
       continue;
     fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)rv, rr * 16);
   }
+  e_emit_group_recheck(f, fn, in, cur);
   return 1;
 }
 
@@ -5672,6 +5697,7 @@ static int emit_fl_alloc_op(
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
     cur[rr] = rv;
   }
+  e_emit_group_recheck(f, fn, in, cur);
   g_e_inl_dirty = 1;
   if (!fill) cur[dreg] = dv;
   return 1;
@@ -6012,6 +6038,7 @@ static int emit_alloc_op(
         "        else if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
         "        else AOT_SET_B(ctx, fr, %d, _o);\n",
         off, off, off);
+  e_emit_group_recheck(f, fn, in, cur);
   if (redef_mode) {
     /* every register the op redefines becomes a TAG local again from the frame */
     int k2;
@@ -6230,6 +6257,7 @@ static int emit_typed_call(
         "        else AOT_SET_B(ctx, fr, %d, _o);\n",
         off, off);
     /* The call ran JS: re-read the groups before anything reads a field. */
+    e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(f, "        v%u = _o;\n", (unsigned)dv);
     } else if (e_def_dead(in, dv)) {
@@ -6287,6 +6315,7 @@ static int emit_typed_call(
           "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
           "        else AOT_SET_B(ctx, fr, %d, _o);\n",
           in->next - 1, site, na, cexp, recv, w, off, off);
+      e_emit_group_recheck(f, fn, in, cur);
       if (t->lb[dv] == E_LB_TAG) {
         fprintf(f, "        v%u = _o;\n", (unsigned)dv);
       } else if (e_def_dead(in, dv)) {
@@ -6995,6 +7024,7 @@ static int emit_typed_field_write(
         "              return qjs_aot_throw_here(ctx, f, %d); }\n",
         boxed, in->pc, (unsigned)rv, in->arg[1].off, site, in->pc);
     fprintf(f, "        }\n");
+    e_emit_group_recheck(f, fn, in, cur);
     fprintf(f, "      }\n");
     fprintf(f, "    }\n");
     return 1;
@@ -7132,7 +7162,8 @@ static int emit_group_read(
   fprintf(f, "    { JSValue _f;\n");
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   fprintf(f, "      _f = *q2_slotp(%s, q2_cell_off(pic, %d));\n", recv, site);
-  fprintf(
+  if (!g_e_nolazy)
+    fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
@@ -7164,7 +7195,8 @@ static int emit_group_chain(
   e_group_test(test, sizeof(test), 0, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   fprintf(f, "      _c0 = *q2_slotp(%s, q2_cell_off(pic, %d));\n", recv, s1);
-  fprintf(
+  if (!g_e_nolazy)
+    fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
@@ -7172,7 +7204,8 @@ static int emit_group_chain(
   e_group_test(test, sizeof(test), 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   fprintf(f, "      _c1 = *q2_slotp(_c0, q2_cell_off(pic, %d));\n", s2);
-  fprintf(
+  if (!g_e_nolazy)
+    fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c1) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
@@ -7303,11 +7336,12 @@ static int emit_poly_read(
   fprintf(f, "    { JSValue _f;\n");
   e_poly_chain(f, recv, site, in->arg[2].off, 0, in->pc);
   fprintf(f, "      _f = *q2_slotp(%s, _po);\n", recv);
+  if (!g_e_nolazy)
   fprintf(
-      f,
-      "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) "
-      "goto vx_%d;\n",
-      in->pc);
+        f,
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) "
+        "goto vx_%d;\n",
+        in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: polymorphic read at pc %d: no guard for its def\n", in->pc);
     abort();
@@ -9300,7 +9334,20 @@ static int e_dispatch_rop(
   return 0;
 }
 
+static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]);
+/* A framed speculative body assumes no lazy JSON document exists (it is re-checked at entry
+   and after every safepoint), so its loads carry no lazy-marker test; the cache-hit helpers
+   take the choice from Q2_LZ. Frameless and inline bodies keep the tests. */
 static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
+  int rc;
+  g_e_nolazy = !g_e_fl && !g_e_inl;
+  if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 0\n");
+  rc = e_emit_spec_body_pass_inner(f, fn, hex);
+  if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 1\n");
+  g_e_nolazy = 0;
+  return rc;
+}
+static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e_fn = fn;
   g_e_fi = fi;
@@ -9668,6 +9715,14 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
       }
     }
   }
+  if (g_e_nolazy)
+    fprintf(
+        f,
+        "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) {\n"
+        "        E_REFUSE_NOTE(%d);\n"
+        "        return %s;\n"
+        "    }\n",
+        fi, gen0);
   /* Counted only now: everything that could refuse the entry has been passed, so
      this measures speculative bodies that ACTUALLY RAN. */
   fprintf(f, "    E_ENTER_NOTE(%d);\n", fi);
