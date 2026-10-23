@@ -1491,12 +1491,16 @@
       "sha256": "195eea43c757344e80edc0eecf18c9a962a50a57b1b2142744b46a136a3a7222"
     },
     {
+      "name": "0379-pic-add-replay-not-prototype.patch",
+      "sha256": "f8ab5249a3bec4e74cac31b74b4ec0028a8766ea56a884cba198e36c66480d46"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "6436ef5eebacc9a878450cb75a7016b2c6295747cbc70991b97024165b723d0c",
+    "quickjs.c": "8baca4ef44aee878a45b8196608611ac684218f4d909904969e8a06d85213053",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

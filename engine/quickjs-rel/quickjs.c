@@ -25115,6 +25115,9 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
         return 0;
     if (!p->extensible || p->is_exotic)
         return 0;
+    /* a property added to a prototype is the generic add's to make: it moves the watchpoint epoch */
+    if (unlikely(p->is_prototype))
+        return 0;
     if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
         return 0;                   /* a prototype interceptor appeared */
     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];

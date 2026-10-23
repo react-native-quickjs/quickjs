@@ -1,0 +1,27 @@
+Subject: The cached add-transition replay does not add to a prototype
+
+What this does
+  - `regvm_put_field_add_hit` returns a miss for a receiver that is a prototype, so the generic add
+    makes the store.
+
+Why we need it
+  The generic add of a property to a prototype moves the prototype watchpoint epoch (`add_property`), and
+  so `aot_pic_epoch`: cached lookups that went through the prototype are no longer trusted. The replay of
+  a cached add transition changes the receiver's shape without going through `add_property`, so it did
+  not move the epoch when the receiver was a prototype. Compiled code that tests its prototype holders
+  once per epoch rather than per access needs every addition to a prototype to move it. The replay is for
+  the common case of adding to an ordinary object; an addition to a prototype is rare and takes the
+  generic path.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25115,6 +25115,9 @@
+         return 0;
+     if (!p->extensible || p->is_exotic)
+         return 0;
++    /* a property added to a prototype is the generic add's to make: it moves the watchpoint epoch */
++    if (unlikely(p->is_prototype))
++        return 0;
+     if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
+         return 0;                   /* a prototype interceptor appeared */
+     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
