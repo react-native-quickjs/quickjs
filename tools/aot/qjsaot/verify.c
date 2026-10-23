@@ -358,7 +358,9 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
         Q2ValueId val = blk->edge_arg[i][k];
         if (val >= (Q2ValueId)f->nvalues)
           Q2_VERIFY_FAIL("edge %d->%d: argument out of range", b, sb);
-        if (f->values[val].reg != s->param_reg[k])
+        /* a hoisted load lives in a register only the IR has; the edge copies it to the
+           parameter's own */
+        if (f->values[val].reg != s->param_reg[k] && f->values[val].reg < f->norig)
           Q2_VERIFY_FAIL(
               "edge %d->%d: argument %d is register %d, parameter wants %d", b,
               sb, k, f->values[val].reg, s->param_reg[k]);
