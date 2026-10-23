@@ -233,6 +233,16 @@ static int rep_inc(int a) {
   return a;
 }
 
+/* An increment-like result follows its operand, except where the profile saw the result
+   leave the int range at this instruction: that case failed in the profiled run, so the
+   result is a double rather than an int whose overflow exit would be taken again. */
+static int rep_inc_rec(int a, const Q2Value *dv) {
+  if (a == E_LB_I32 && dv != NULL && dv->has_prof && dv->ptypes != Q2_T_INT32 &&
+      (dv->ptypes & ~(Q2_T_INT32 | Q2_T_NUM)) == 0)
+    return E_LB_F64;
+  return rep_inc(a);
+}
+
 /* The exits an exact integer result needs. A result that came out of an op call
    (a fallback, a fused second half) is already exact and needs none. */
 static uint8_t exits_for(int rop, int sub, int from_opcall) {
@@ -434,7 +444,7 @@ static int transfer_def(
          overflow exit covers the rest). */
       if (in->rop == ROP_add_imm_self_s || in->rop == ROP_sub_imm_self_s) {
         if (a == E_LB_BOT) return E_LB_BOT;
-        if (a == E_LB_I32) return rep_inc(a);
+        if (a == E_LB_I32) return rep_inc_rec(a, dv);
         if (a == E_LB_F64) return E_LB_F64;
         *whyp = E_WHY_OPERAND_TAGGED;
         *whyvp = in->use[0];
@@ -448,7 +458,7 @@ static int transfer_def(
         *whyvp = in->use[0];
         return E_LB_TAG;
       }
-      if (sub == REG_UN_INC || sub == REG_UN_DEC) return rep_inc(a);
+      if (sub == REG_UN_INC || sub == REG_UN_DEC) return rep_inc_rec(a, dv);
       if (sub == REG_UN_NOT || sub == REG_UN_LNOT) {
         if (a == E_LB_BOT) return E_LB_BOT;
         if (a == E_LB_BOOL || lb_num(a)) return E_LB_BOOL;
@@ -464,7 +474,7 @@ static int transfer_def(
          `rep_inc`; the integer case keeps i32 because the lowering guards the
          overflow. */
       if (in->nuse < 1) return E_LB_TAG;
-      return rep_inc(w[in->use[0]]);
+      return rep_inc_rec(w[in->use[0]], dv);
     case Q2_OP_BRANCH_CMP:
       /* `inc_branch_lt`: `d = d + 1` in place, then compare. An int stays an
          int (the lowering guards the overflow). */
