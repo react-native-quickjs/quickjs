@@ -396,7 +396,7 @@ void e_pure_plan(const Q2Func *fn, const char hex[33]) {
       "{\n"
       "    int *cnt = (int *)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
       "    *cnt = b + 1;\n"
-      "    if (qjs_aot_poll(ctx_in) < 0) return 0;\n"
+      "    if (qjs_aot_poll_fl(ctx_in) < 0) return 0;\n"
       "    return *cnt > 0 ? *cnt : 1;\n"
       "}\n#endif\n");
   fprintf(o, "static uint8_t e_pdis_%s, e_pfail_%s;\n", hex, hex);

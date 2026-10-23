@@ -3772,8 +3772,8 @@ static void e_emit_arm(
          receiver): the poll may run an interrupt handler and the collector
          without a frame to scan. */
       fprintf(
-          f, g_e_inl ? "          if (qjs_aot_poll(ctx) < 0) { *out = JS_EXCEPTION; return 1; }\n"
-                      : "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
+          f, g_e_inl ? "          if (qjs_aot_poll_fl(ctx) < 0) { *out = JS_EXCEPTION; return 1; }\n"
+                      : "          if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n");
     } else if (g_e_fl) {
       /* A borrowed value only this body holds: leave at the loop header, where
          the generic body has a frame, and let it poll at its own next back edge
@@ -3816,7 +3816,7 @@ static void e_emit_arm(
         if (cur != NULL && cur[rr] != Q2_NO_VALUE) e_exit_store(f, cur[rr], rr);
         else e_exit_store(f, vv, rr);
       }
-      fprintf(f, "          if (qjs_aot_poll(ctx) < 0) return JS_EXCEPTION;\n");
+      fprintf(f, "          if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n");
     }
     fprintf(f, "      }\n");
   }
@@ -11734,7 +11734,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n"
         "        ++*(int *)((uint8_t *)ctx_in + "
         "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
-        "        if (qjs_aot_poll(ctx_in) < 0) return JS_EXCEPTION;\n"
+        "        if (qjs_aot_poll_fl(ctx_in) < 0) return JS_EXCEPTION;\n"
         "    }\n"
         "    rec.prev = *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP);\n"
         "    rec.func = co;\n"
