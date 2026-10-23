@@ -135,6 +135,28 @@ static int bench_interrupt_cb(JSRuntime *rt, void *opaque) {
   return 0;
 }
 
+/* newRealm(): a new context on the same runtime; returns its global object, so a script can take
+   arrays, functions and prototypes from a second realm (`newRealm().eval("[]")`). The contexts live
+   until the end of the run. */
+static JSContext *bench_realms[16];
+static int bench_nrealms;
+
+static JSValue js_new_realm(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  JSContext *nc;
+  JSValue g;
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  if (bench_nrealms >= 16) return JS_ThrowRangeError(ctx, "too many realms");
+  nc = JS_NewContext(JS_GetRuntime(ctx));
+  if (!nc) return JS_ThrowInternalError(ctx, "cannot create a realm");
+  bench_realms[bench_nrealms++] = nc;
+  g = JS_GetGlobalObject(nc);
+  JS_SetPropertyStr(nc, g, "print", JS_NewCFunction(nc, js_print, "print", 1));
+  return g;
+}
+
 int main(int argc, char **argv) {
   int mem = 0;
   int stats = 0;
@@ -197,6 +219,8 @@ int main(int argc, char **argv) {
       JS_NewCFunction(ctx, js_host_add, "host_add", 2));
   JS_SetPropertyStr(
       ctx, global, "gc", JS_NewCFunction(ctx, js_force_gc, "gc", 0));
+  JS_SetPropertyStr(
+      ctx, global, "newRealm", JS_NewCFunction(ctx, js_new_realm, "newRealm", 0));
   JS_SetPropertyStr(
       ctx, global, "host_opt",
       JS_NewCFunction(ctx, js_host_opt, "host_opt", 2));
@@ -267,6 +291,7 @@ int main(int argc, char **argv) {
         (long long)u.fast_array_elements);
   }
 
+  while (bench_nrealms > 0) JS_FreeContext(bench_realms[--bench_nrealms]);
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
   free(buf);
