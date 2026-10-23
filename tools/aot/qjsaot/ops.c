@@ -10312,11 +10312,52 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               fi, gen0);
           break;
         }
-    for (g = 0; g < ng; g++) {
+    {
+      /* The validation of the cells is done again only when a cache entry has changed since it
+         last passed for this bytecode. */
+      int ngu = 0, npci = 0, gi, qq;
+      for (g = 0; g < ng; g++)
+        if (g_e_group_used[g]) ngu++;
+      for (g = 0; g < ng; g++) {
+        const EGroup *gr = &g_e_facts->groups[g];
+        if (!g_e_group_used[g]) continue;
+        for (qq = 0; qq < gr->nsites; qq++)
+          if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2) npci++;
+      }
+      if (ngu > 0) {
+        int gk = 0, pk = 0;
+        fprintf(
+            f,
+            "    static const void *e_vg[%d]; static int e_vp[%d]; static uint32_t e_vep; static const void *e_vcb;\n"
+            "    const uint32_t q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
+            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
+            ngu, npci > 0 ? npci : 1);
+        for (g = 0; g < ng; g++)
+          if (g_e_group_used[g]) fprintf(f, "    const void *gsh%d;\n", g);
+        for (g = 0; g < ng; g++) {
+          const EGroup *gr = &g_e_facts->groups[g];
+          if (!g_e_group_used[g]) continue;
+          for (qq = 0; qq < gr->nsites; qq++)
+            if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
+              fprintf(f, "    int pci%d;\n", gr->sites[qq]);
+        }
+        fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
+        for (g = 0, gk = 0; g < ng; g++) {
+          const EGroup *gr = &g_e_facts->groups[g];
+          if (!g_e_group_used[g]) continue;
+          fprintf(f, "      gsh%d = e_vg[%d];\n", g, gk++);
+          for (qq = 0; qq < gr->nsites; qq++)
+            if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
+              fprintf(f, "      pci%d = e_vp[%d];\n", gr->sites[qq], pk++);
+        }
+        fprintf(f, "    } else {\n");
+        (void)gi;
+      }
+      for (g = 0; g < ng; g++) {
       const EGroup *gr = &g_e_facts->groups[g];
       if (!g_e_group_used[g]) continue;
       /* The shape is the first filled cell among the group's sites. */
-      fprintf(f, "    const void *gsh%d = NULL;\n", g);
+      fprintf(f, "    gsh%d = NULL;\n", g);
       for (q = 0; q < gr->nsites; q++)
         if (e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
           fprintf(
@@ -10360,7 +10401,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           }
         if (e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
           fprintf(
-              f, "    const int pci%d = q2_cell2_index(pic, %d, (int)q2_ns, gsh%d);\n",
+              f, "    pci%d = q2_cell2_index(pic, %d, (int)q2_ns, gsh%d);\n",
               gr->sites[q], gr->sites[q], g);
         {
           char cib[24];
@@ -10376,22 +10417,46 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               e_cellidx(cib, sizeof(cib), gr->sites[q]), hot ? "" : "_s != NULL && ", g, hex,
               gr->sites[q], fi, gen0);
         }
-        if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
-          fprintf(
-              f,
-              "    if (__builtin_expect(q2_holder2_bad_sh(gsh%d, holders, (int)q2_ns, pci%d), 0)) {\n"
-              "        E_REFUSE_NOTE(%d);\n"
-              "        return %s;\n"
-              "    }\n",
-              g, gr->sites[q], fi, gen0);
-        else if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]))
-          fprintf(
-              f,
-              "    if (__builtin_expect(q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"
-              "        E_REFUSE_NOTE(%d);\n"
-              "        return %s;\n"
-              "    }\n",
-              g, gr->sites[q], fi, gen0);
+      }
+      }
+      if (ngu > 0) {
+        int gk = 0, pk = 0;
+        for (g = 0; g < ng; g++) {
+          const EGroup *gr = &g_e_facts->groups[g];
+          if (!g_e_group_used[g]) continue;
+          fprintf(f, "      e_vg[%d] = gsh%d;\n", gk++, g);
+          for (qq = 0; qq < gr->nsites; qq++)
+            if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
+              fprintf(f, "      e_vp[%d] = pci%d;\n", pk++, gr->sites[qq]);
+        }
+        fprintf(f, "      e_vcb = pic; e_vep = q2_ep;\n    }\n");
+      }
+      /* The holder of a prototype read can change without a cache entry changing: tested on
+         every entry. */
+      for (g = 0; g < ng; g++) {
+        const EGroup *gr = &g_e_facts->groups[g];
+        if (!g_e_group_used[g]) continue;
+        for (q = 0; q < gr->nsites; q++) {
+          int hot = 0, z;
+          for (z = 0; z < g_e_facts->nsites; z++)
+            if (g_e_facts->sites[z].site == gr->sites[q]) hot = g_e_facts->sites[z].hot;
+          if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
+            fprintf(
+                f,
+                "    if (__builtin_expect(q2_holder2_bad_sh(gsh%d, holders, (int)q2_ns, pci%d), 0)) {\n"
+                "        E_REFUSE_NOTE(%d);\n"
+                "        return %s;\n"
+                "    }\n",
+                g, gr->sites[q], fi, gen0);
+          else if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]))
+            fprintf(
+                f,
+                "    if (__builtin_expect(q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"
+                "        E_REFUSE_NOTE(%d);\n"
+                "        return %s;\n"
+                "    }\n",
+                g, gr->sites[q], fi, gen0);
+        }
       }
     }
   }

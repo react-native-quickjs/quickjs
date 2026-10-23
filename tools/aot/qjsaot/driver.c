@@ -1917,7 +1917,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_GVC_ATOM %uu\n"
           "#define QJS_AOT_OFF_GVC_GEN %uu\n"
           "#define QJS_AOT_OFF_GVC_SLOT %uu\n"
-          "#define QJS_AOT_OFF_GVC_WR %uu\n\n"
+          "#define QJS_AOT_OFF_GVC_WR %uu\n"
+          "#define QJS_AOT_OFF_RT_PIC_EPOCH %uu\n\n"
           "#define QJS_AOT_OFF_REGRUN_RET_IP %uu\n"
           "#define QJS_AOT_OFF_REGRUN_FR %uu\n"
           "#define QJS_AOT_OFF_REGRUN_VAR_REFS %uu\n"
@@ -1994,7 +1995,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
           lay.reg_pic_proto2, lay.off_object_htmldda_byte, lay.object_htmldda_mask,
           lay.off_ctx_gv_cells, lay.sizeof_gv_cell, lay.gv_cell_sets, lay.gv_cell_ways,
-          lay.off_gvc_atom, lay.off_gvc_gen, lay.off_gvc_slot, lay.off_gvc_wr,
+          lay.off_gvc_atom, lay.off_gvc_gen, lay.off_gvc_slot, lay.off_gvc_wr, lay.off_rt_pic_epoch,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
           lay.off_rt_regvm_cur, lay.off_rt_stack_limit, lay.off_rt_fl_top,
