@@ -371,8 +371,16 @@ static int site_refs(const Q2Insn *in, SiteRef out[2]) {
 #define E_SK_FIELD 2
 #define E_SK_SAFE 3
 
+static const Q2Func *g_facts_fn;
+int qjs_aot_pool_num(const struct JSAotGenFunc *g, uint32_t idx, double *out);
 static int insn_kind(const Q2Insn *in) {
   const ERole *role = e_roles[in->rop];
+  /* A constant-pool operand that is a number: the speculative body lowers the op for numbers
+     and leaves for anything else, like the other arithmetic with an immediate. */
+  if (in->rop == ROP_binary_cpool && g_facts_fn != NULL && in->narg > 4 && in->arg[3].val == REG_CONST_CPOOL) {
+    double c;
+    if (qjs_aot_pool_num(q2_insn_g(g_facts_fn, in), (uint32_t)in->arg[4].val, &c)) return E_SK_PURE;
+  }
   /* the guard of a copied callee leaves for the call or falls into the copy */
   if (in->inlg || in->vk == Q2_VK_DEF) return E_SK_PURE;
   if (role == NULL) return E_SK_SAFE;
@@ -1236,6 +1244,7 @@ done:
 
 int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   FactSet cur;
+  g_facts_fn = fn;
   FactSet *outs = NULL;
   int b, bi, i, k, rc = -1;
 
