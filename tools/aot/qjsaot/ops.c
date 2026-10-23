@@ -5538,17 +5538,27 @@ static int emit_fl_put_global(
     if (!dup) spv[nsp++] = vv;
   }
   g_e_fl_calls = 1;
+  /* A store the global cache serves is a lookup and a store; anything else takes the
+     engine's. The registers the decoder files as redefined keep their value, now under
+     their new names. */
+  if ((int)in->arg[2].val == 0)
+    fprintf(
+        f,
+        "    if (__builtin_expect(!q2_put_global_hit(ctx, qjs_aot_ld_u32(*(const uint8_t *const *)(cb + "
+        "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s), 0)) {\n",
+        in->arg[0].off, vb);
+  else
+    fprintf(f, "    {\n");
   for (k = 0; k < nsp; k++)
     fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
   fprintf(
       f,
       "    rec_->pc = %d;\n"
       "    if (__builtin_expect(qjs_aot_put_global(ctx, (void *)cb, (int)qjs_aot_ld_u32(*(const uint8_t *const *)(cb + "
-      "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s, %d) < 0, 0)) return JS_EXCEPTION;\n",
+      "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s, %d) < 0, 0)) return JS_EXCEPTION;\n"
+      "    }\n",
       in->next - 1, in->arg[0].off, vb, (int)in->arg[2].val);
   g_e_inl_dirty = 1;
-  /* The decoder files the store as a fallback that redefines the live registers: they
-     keep their value, now under their new names. */
   for (k = 0; k < in->nredef; k++) {
     Q2ValueId rv = in->redef_val[k], src;
     int rr = in->redef_reg[k];
@@ -5622,6 +5632,53 @@ static int emit_store_call(
       break;
     default:
       return 0;
+  }
+  /* A store the global cache serves is a lookup and a store, with no frame write. */
+  if (in->rop == ROP_put_global && (int)in->arg[2].val == 0 && cur[E_ROFF(in->arg[1]) / 16] != Q2_NO_VALUE &&
+      cur[E_ROFF(in->arg[1]) / 16] != E_INFRAME) {
+    Q2ValueId vv = cur[E_ROFF(in->arg[1]) / 16];
+    char vb[64];
+    int ok = 1;
+    if (vv == E_UNDEF) snprintf(vb, sizeof(vb), "JS_UNDEFINED");
+    else if (vv >= (Q2ValueId)t->nvalues) ok = 0;
+    else if (t->lb[vv] == E_LB_TAG) snprintf(vb, sizeof(vb), "v%u", (unsigned)vv);
+    else if (t->lb[vv] == E_LB_I32) snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)vv);
+    else if (t->lb[vv] == E_LB_F64) snprintf(vb, sizeof(vb), "E_BOX_F64(d%u)", (unsigned)vv);
+    else if (t->lb[vv] == E_LB_BOOL) snprintf(vb, sizeof(vb), "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)vv);
+    else ok = 0;
+    if (ok) {
+      fprintf(
+          f, "    if (__builtin_expect(!q2_put_global_hit(ctx, qjs_aot_ld_u32(q2_code(f) + %d), %s), 0)) {\n",
+          in->arg[0].off, vb);
+      e_emit_presync(f, fn, in, t, cur);
+      fprintf(f, "    if (__builtin_expect(%s, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", call, in->pc);
+      /* the registers the decoder files as redefined keep their value under their new names */
+      for (k = 0; k < in->nredef; k++) {
+        Q2ValueId rv = in->redef_val[k];
+        int rr = in->redef_reg[k];
+        if (rv == Q2_NO_VALUE || rv >= (Q2ValueId)t->nvalues || rr < 0 || rr >= fn->nregs ||
+            t->lb[rv] != E_LB_TAG)
+          continue;
+        fprintf(f, "    v%u = AOT_REG(fr, %d);\n", (unsigned)rv, rr * 16);
+      }
+      fprintf(f, "    } else {\n");
+      for (k = 0; k < in->nredef; k++) {
+        Q2ValueId rv = in->redef_val[k], src;
+        int rr = in->redef_reg[k];
+        char nm[32];
+        if (rv == Q2_NO_VALUE || rv >= (Q2ValueId)t->nvalues || rr < 0 || rr >= fn->nregs ||
+            t->lb[rv] != E_LB_TAG)
+          continue;
+        src = cur[rr];
+        if (src == Q2_NO_VALUE || src == E_UNDEF || src == E_INFRAME || src >= (Q2ValueId)t->nvalues)
+          continue;
+        e_local_name(nm, sizeof(nm), rv);
+        fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
+      }
+      fprintf(f, "    }\n");
+      e_emit_group_recheck(f, fn, in, cur);
+      return 1;
+    }
   }
   e_emit_presync(f, fn, in, t, cur);
   fprintf(f, "    if (__builtin_expect(%s, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", call, in->pc);

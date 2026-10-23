@@ -1909,7 +1909,15 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_JSOBJECT_HOLEY_MASK %uu\n"
           "#define QJS_AOT_REG_PIC_PROTO2 %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_HTMLDDA_BYTE %uu\n"
-          "#define QJS_AOT_JSOBJECT_HTMLDDA_MASK %uu\n\n"
+          "#define QJS_AOT_JSOBJECT_HTMLDDA_MASK %uu\n"
+          "#define QJS_AOT_OFF_CTX_GV_CELLS %uu\n"
+          "#define QJS_AOT_SIZEOF_GV_CELL %uu\n"
+          "#define QJS_AOT_GV_CELL_SETS %uu\n"
+          "#define QJS_AOT_GV_CELL_WAYS %uu\n"
+          "#define QJS_AOT_OFF_GVC_ATOM %uu\n"
+          "#define QJS_AOT_OFF_GVC_GEN %uu\n"
+          "#define QJS_AOT_OFF_GVC_SLOT %uu\n"
+          "#define QJS_AOT_OFF_GVC_WR %uu\n\n"
           "#define QJS_AOT_OFF_REGRUN_RET_IP %uu\n"
           "#define QJS_AOT_OFF_REGRUN_FR %uu\n"
           "#define QJS_AOT_OFF_REGRUN_VAR_REFS %uu\n"
@@ -1985,6 +1993,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_fnbc_aot_poly, lay.off_fnbc_aot_poly_sites,
           lay.aot_poly_ways, lay.off_object_holey_byte, lay.object_holey_mask,
           lay.reg_pic_proto2, lay.off_object_htmldda_byte, lay.object_htmldda_mask,
+          lay.off_ctx_gv_cells, lay.sizeof_gv_cell, lay.gv_cell_sets, lay.gv_cell_ways,
+          lay.off_gvc_atom, lay.off_gvc_gen, lay.off_gvc_slot, lay.off_gvc_wr,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
           lay.off_rt_regvm_cur, lay.off_rt_stack_limit, lay.off_rt_fl_top,
@@ -3520,7 +3530,36 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  q2_dup(v);\n"
         "  *slot = v;\n"
         "  if (JS_VALUE_HAS_REF_COUNT(old)) JS_FreeValue(ctx, old);\n"
-        "}\n\n");
+        "}\n\n"
+        /* A store to a global the read cache holds and the cell says is plainly writable. A miss
+           (no cell, another generation, a read-only or accessor property) takes the engine's
+           own store. */
+        "static inline int q2_put_global_hit(JSContext *ctx, uint32_t atom, JSValue v)\n"
+        "{\n"
+        "  const unsigned char *rt = *(const unsigned char *const *)((const unsigned char *)ctx +\n"
+        "                                                            QJS_AOT_OFF_CTX_RT);\n"
+        "  uint32_t gen = *(const uint32_t *)(rt + QJS_AOT_OFF_RT_GV_CELL_GEN);\n"
+        "  const unsigned char *set = (const unsigned char *)ctx + QJS_AOT_OFF_CTX_GV_CELLS +\n"
+        "      (size_t)(atom & (QJS_AOT_GV_CELL_SETS - 1)) * QJS_AOT_GV_CELL_WAYS * QJS_AOT_SIZEOF_GV_CELL;\n"
+        "  unsigned w;\n"
+        "  for (w = 0; w < QJS_AOT_GV_CELL_WAYS; w++) {\n"
+        "    const unsigned char *c = set + (size_t)w * QJS_AOT_SIZEOF_GV_CELL;\n"
+        "    if (*(const uint32_t *)(c + QJS_AOT_OFF_GVC_ATOM) == atom &&\n"
+        "        *(const uint32_t *)(c + QJS_AOT_OFF_GVC_GEN) == gen) {\n"
+        "      JSValue *p, old;\n"
+        "      if (!*(const uint32_t *)(c + QJS_AOT_OFF_GVC_WR)) return 0;\n"
+        "      p = (JSValue *)(*(const unsigned char *const *)(c + QJS_AOT_OFF_GVC_SLOT) +\n"
+        "                      QJS_AOT_OFF_JSPROPERTY_U_VALUE);\n"
+        "      old = *p;\n"
+        "      q2_dup(v);\n"
+        "      *p = v;\n"
+        "      if (JS_VALUE_HAS_REF_COUNT(old)) JS_FreeValue(ctx, old);\n"
+        "      return 1;\n"
+        "    }\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n"
+);
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int q2_elem_put_rc("
