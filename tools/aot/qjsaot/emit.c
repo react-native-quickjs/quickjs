@@ -339,6 +339,36 @@ void e_emit_frameless_forward(FILE *f, const Q2Func *fn, char hex[33]) {
 
 /* --- the driver --------------------------------------------------------- */
 
+/* Whether every arithmetic instruction of a copied callee is typed: a copy has no step engine
+   behind it, so an operation on a value of unknown type could not fall back. */
+static int e_inline_typed_ok(const Q2Func *fn) {
+  EFacts facts;
+  ETypes types;
+  int i, k, ok = 1;
+  if (fn->ninl == 0) return 1;
+  memset(&facts, 0, sizeof(facts));
+  memset(&types, 0, sizeof(types));
+  if (e_analyze(fn, &facts, &types) < 0) return 0;
+  for (i = 0; ok && i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    if (in->own == 0) continue;
+    if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
+        in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH)
+      continue;
+    for (k = 0; k < in->nuse; k++)
+      if (in->use[k] >= (Q2ValueId)types.nvalues || types.lb[in->use[k]] == E_LB_TAG ||
+          types.lb[in->use[k]] == E_LB_BOT)
+        ok = 0;
+    for (k = 0; k < in->ndef; k++)
+      if (in->def[k] >= (Q2ValueId)types.nvalues || types.lb[in->def[k]] == E_LB_TAG ||
+          types.lb[in->def[k]] == E_LB_BOT)
+        ok = 0;
+  }
+  e_facts_free(&facts);
+  e_types_free(&types);
+  return ok;
+}
+
 int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
   Q2Func fn;
   char msg[256];
@@ -383,11 +413,13 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
        moved before their loops; the generic body keeps the program as it is. */
     Q2Func fn2;
     Q2Extra *ex = NULL;
-    int nex = e_plan_licm(&fn, &ex), have2 = 0;
+    Q2InlReq *ir = NULL;
+    int nir = e_plan_inline(&fn, &ir);
+    int nex = nir > 0 ? 0 : e_plan_licm(&fn, &ex), have2 = 0;
     if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: %d hoists\n", g->name, nex);
-    if (nex > 0) {
-      if (q2_build_ex(g, ex, nex, &fn2) == 0 && q2_infer(&fn2) == 0 &&
-          q2_verify(&fn2, msg, sizeof(msg)) == 0)
+    if (nex > 0 || nir > 0) {
+      if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && q2_infer(&fn2) == 0 &&
+          q2_verify(&fn2, msg, sizeof(msg)) == 0 && e_inline_typed_ok(&fn2))
         have2 = 1;
       else {
         if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: rebuild failed: %s %s\n", g->name, fn2.why ? fn2.why : "-", msg);
@@ -395,6 +427,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
       }
     }
     free(ex);
+    free(ir);
     rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
     /* An inline body of this function that exits through aot_nx_ needs its
        definition; a frameless body has emitted it already. */

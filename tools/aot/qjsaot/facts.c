@@ -361,6 +361,8 @@ static int site_refs(const Q2Insn *in, SiteRef out[2]) {
 
 static int insn_kind(const Q2Insn *in) {
   const ERole *role = e_roles[in->rop];
+  /* the guard of a copied callee leaves for the call or falls into the copy */
+  if (in->inlg) return E_SK_PURE;
   if (role == NULL) return E_SK_SAFE;
   if (role->pure) return E_SK_PURE;
   switch (in->op) {
@@ -1586,4 +1588,87 @@ done:
   free(stack);
   e_facts_free(&facts);
   return nex;
+}
+
+/* ---- copied callees ------------------------------------------------------
+   A call the profile saw reach one compiled function, at a pc that ran, whose callee is a small
+   function of plain arithmetic (no field, no call, no allocation): its instructions are copied
+   into the caller after a guard on the callee value (see q2_build_inl). */
+const JSAotGenFunc *qjs_aot_unit_func(const char hex[33]);
+int qjs_aot_unit_has(const char hex[33]);
+
+static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
+  Q2Func cf;
+  int i, ok = 1;
+  if (cg->func_kind != 0 || cg->ctl_count != 0 || cg->light_var_count != 0 || cg->arg_count > 6 ||
+      cg->len > 400)
+    return 0;
+  if (q2_build(cg, &cf) < 0) {
+    q2_free(&cf);
+    return 0;
+  }
+  if (cf.ninsns > 70) ok = 0;
+  for (i = 0; ok && i < cf.ninsns; i++) {
+    const Q2Insn *in = &cf.insns[i];
+    switch (in->op) {
+      case Q2_OP_CONST:
+      case Q2_OP_MOVE:
+      case Q2_OP_BINARY:
+      case Q2_OP_COMPARE:
+      case Q2_OP_UNARY:
+      case Q2_OP_BRANCH:
+      case Q2_OP_BRANCH_CMP:
+      case Q2_OP_RETURN:
+      case Q2_OP_RETURN_UNDEF:
+      case Q2_OP_GET_ARG:
+      case Q2_OP_GET_ARG2:
+      case Q2_OP_PUT_ARG:
+        break;
+      case Q2_OP_LOAD_THIS:
+        if (!has_recv) ok = 0;
+        break;
+      default:
+        ok = 0;
+    }
+    if (in->rop == ROP_binary_cpool) ok = 0;
+    if (!q2_lowered(in->rop)) ok = 0;
+  }
+  q2_free(&cf);
+  return ok;
+}
+
+int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
+  int i, n = 0;
+  *out = NULL;
+  if (getenv("QJS_AOT_NOIRINLINE") != NULL) return 0;
+  for (i = 0; i < fn->ninsns && n < 6; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    char hex[4][33];
+    int kind[4], cnt = 0, k;
+    unsigned long long hits[4];
+    const JSAotGenFunc *cg;
+    Q2InlReq *q;
+    if ((in->rop != ROP_call && in->rop != ROP_call_method) || in->xpc >= 0 || in->own || in->inlg) continue;
+    if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "inl %s@%d: win_n=%d nredef=%d ndef=%d count=%llu\n", fn->g->name, in->pc, in->win_n, in->nredef, in->ndef, qjs_aot_prof_pc_count(fn->g->digest, in->ppc));
+    if (in->win_n > 6 || in->nredef != 0 || in->ndef != 1) continue;
+    if (qjs_aot_prof_pc_count(fn->g->digest, in->ppc) == 0) continue;
+    if (!qjs_aot_prof_callees(fn->g->digest, in->next, &cnt, hex, kind, hits) || cnt != 1 || kind[0] != 1) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callees cnt=%d\n", cnt);
+      continue;
+    }
+    if (!qjs_aot_unit_has(hex[0])) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  not in unit\n"); continue; }
+    cg = qjs_aot_unit_func(hex[0]);
+    if (cg == NULL || cg == fn->g || memcmp(cg->digest, fn->g->digest, 16) == 0) continue;
+    for (k = 0; k < n; k++)
+      if ((*out)[k].g == cg) break;
+    if (k < n) continue;
+    if (!inl_callee_ok(cg, in->rop == ROP_call_method)) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok\n", cg->name); continue; }
+    q = realloc(*out, sizeof(**out) * (size_t)(n + 1));
+    if (q == NULL) return n;
+    *out = q;
+    q[n].g = cg;
+    q[n].call_pc = in->pc;
+    n++;
+  }
+  return n;
 }

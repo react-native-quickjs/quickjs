@@ -3852,6 +3852,12 @@ static int emit_typed_opcall(
   const ERole *role = e_roles[in->rop];
   int r, any;
 
+  /* A copied callee has no step engine behind it. */
+  if (in->own > 0) {
+    fprintf(stderr, "qjsaot: copied callee instruction at pc %d (rop %u) needs the step engine\n",
+            in->pc, (unsigned)in->rop);
+    abort();
+  }
   /* The CALLER decides when to use this: a native spec emitter calls it on its
      miss path, and the dispatcher calls it for any instruction no emitter lowers.
      So the tier test lives there, not here -- one copy of the op-call sequence. */
@@ -6298,6 +6304,55 @@ static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in) {
         !pure_inline_is(callee[k]) || in->win_n < qjs_aot_unit_argc(callee[k]))
       return 0;
   }
+  return 1;
+}
+
+/* The guard of a copied callee: the callee value must be the compiled function the copy was made from
+   (and, for a copy that reads `this`, the receiver an object, so the engine's boxing of a primitive
+   receiver does not apply); anything else leaves for the call itself. */
+static int emit_inl_guard(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types) {
+  const Q2Inl *iv = &fn->inl[in->inlg - 1];
+  char callee[33], cexp[64], rexp[64];
+  int cc = call_callee_off(in), th = call_this_off(in), q;
+  Q2ValueId cv, tv;
+  static const char *const hx = "0123456789abcdef";
+  if (!have_types || t == NULL || cur == NULL) return 0;
+  for (q = 0; q < 16; q++) {
+    callee[2 * q] = hx[iv->g->digest[q] >> 4];
+    callee[2 * q + 1] = hx[iv->g->digest[q] & 15];
+  }
+  callee[32] = 0;
+  cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+  if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME && cv < (Q2ValueId)t->nvalues &&
+      t->lb[cv] == E_LB_TAG)
+    snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+  else
+    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+  tv = th >= 0 && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
+  if (th < 0)
+    snprintf(rexp, sizeof(rexp), "JS_UNDEFINED");
+  else if (tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME && tv < (Q2ValueId)t->nvalues &&
+           t->lb[tv] == E_LB_TAG)
+    snprintf(rexp, sizeof(rexp), "v%u", (unsigned)tv);
+  else
+    snprintf(rexp, sizeof(rexp), "AOT_REG(fr, %d)", th);
+  e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+  e_note_tag('v', in->pc, cexp);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(
+      f,
+      "#ifdef Q2_SEL_%s\n"
+      "    if (__builtin_expect(!q2_call_entry(%s, (const void *)aot_f_%s), 0)) goto vx_%d;\n"
+      "#else\n"
+      "    goto vx_%d;\n"
+      "#endif\n",
+      callee, cexp, callee, in->pc, in->pc);
+  if (iv->uses_this)
+    fprintf(
+        f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto vx_%d;\n", rexp,
+        in->pc);
+  g_e_miss_exit_seen = 1;
   return 1;
 }
 
@@ -9810,9 +9865,12 @@ static int e_try_fuse_atom_get(
 
 /* Emitters whose rop test is now redundant with the table still keep it: the same
    function is called from more than one place (the generic body, tests). */
+static int emit_inl_guard(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types);
 static int e_dispatch_rop(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b, const ERole *role) {
+  if (in->inlg) return emit_inl_guard(f, fn, in, t, cur, have_types);
   switch (in->rop) {
     /* -- the spec body's own trivial forms, separate because they are shared with
           the generic emitter and must not be added there -- */

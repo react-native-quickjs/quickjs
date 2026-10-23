@@ -170,6 +170,8 @@ int e_facts_safepoint_free(const Q2Func *fn);
 int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);
 /* The loop-invariant global reads worth moving before their loop (see facts.c). */
 int e_plan_licm(const Q2Func *fn, Q2Extra **out);
+/* The calls worth replacing by a copy of their callee (see facts.c). */
+int e_plan_inline(const Q2Func *fn, Q2InlReq **out);
 /* Whether polymorphic sites are served by the polymorphic cache in this body (a
    framed speculative body; set by the caller around e_facts_run). */
 extern int e_facts_poly_on;

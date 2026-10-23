@@ -101,6 +101,8 @@ enum {
   Q2_OP_TO_PROPKEY,  /* d = ToPropertyKey(src); the 2-operand form adds a
                          null/undefined check on a third register */
   Q2_OP_SET_NAME,    /* sets the function name; writes nothing to a register */
+  Q2_OP_INL_GUARD,   /* the call of an inlined callee: leaves for the call unless the callee
+                        value is the compiled function the inlined body is a copy of */
   Q2_OP_COUNT
 };
 
@@ -187,6 +189,9 @@ typedef struct Q2Insn {
      copy that replaces the original in the loop. */
   int32_t xpc, bpc, ppc;
   uint8_t licm_mov;
+  /* 0 for an instruction of the program; k+1 for one copied from inlined callee k, whose
+     guard is the instruction with `inlg` == k+1. */
+  uint8_t own, inlg;
   int32_t narg;
   Q2Arg arg[8];
   /* The SSA value each operand holds at this instruction: for an 'r' operand
@@ -232,6 +237,20 @@ typedef struct Q2Block {
   uint8_t resume; /* in the part of the order that follows a suspension (see q2_build_rpo) */
 } Q2Block;
 
+/* An inlined callee: its program, where its registers start in the combined function, where its
+   instructions start in pc, and the call it replaces. */
+typedef struct Q2InlReq {
+  const struct JSAotGenFunc *g;
+  int32_t call_pc;
+} Q2InlReq;
+
+typedef struct Q2Inl {
+  const struct JSAotGenFunc *g;
+  int32_t call_pc, rbase, pcbase, pcend, nparam;
+  int32_t keep[10], nkeep; /* the registers the call reads: live throughout the copy */
+  int uses_this;           /* the copy reads the receiver */
+} Q2Inl;
+
 /* ---- functions ----------------------------------------------------------- */
 typedef struct Q2Func {
   /* The blocks in DFS reverse postorder, as block indices, then the blocks only a
@@ -247,6 +266,8 @@ typedef struct Q2Func {
   const char *why; /* when it did not */
   int32_t nregs;
   int32_t norig; /* the program's own registers: those from here up exist only in this IR */
+  Q2Inl *inl;    /* the callees copied in */
+  int32_t ninl;
   ProfPc *prof_owned; /* the profile records of the inserted instructions, if any */
   Q2Block *blocks;
   int32_t nblocks;
@@ -289,6 +310,9 @@ typedef struct Q2Extra {
   int fallthrough;
 } Q2Extra;
 int q2_build_ex(const struct JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *out);
+/* ... and with callees copied in at their calls. */
+int q2_build_inl(
+    const struct JSAotGenFunc *g, const Q2Extra *ex, int nex, const Q2InlReq *inl, int ninl, Q2Func *out);
 void q2_free(Q2Func *f);
 void q2_dump(FILE *f, const Q2Func *fn);
 

@@ -1340,6 +1340,18 @@ int qjs_aot_inline_has(const char hex[33]) {
   return 0;
 }
 
+/* The program of the unit function with this digest, or NULL. */
+const JSAotGenFunc *qjs_aot_unit_func(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return NULL;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0 && g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE)
+      return &g_unit_funcs[i];
+  return NULL;
+}
+
 int qjs_aot_inline_uses_nx(const char hex[33]) {
   uint8_t dg[16];
   int i;

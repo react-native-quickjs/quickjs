@@ -232,7 +232,7 @@ int q2_verify(const Q2Func *f, char *msg, size_t msg_len) {
         if (ri->ndef == 0 && ri->nuse == 0 && ri->reads == 0 && ri->writes == 0)
           Q2_VERIFY_FAIL(
               "block %d pc %d: a fallback declares no effects", b, in->pc);
-      } else if (in->op != ri->op) {
+      } else if (in->op != ri->op && !in->inlg) {
         Q2_VERIFY_FAIL(
             "block %d pc %d: operation %s does not match the table's %s", b,
             in->pc, q2_op_name(in->op), q2_op_name(ri->op));

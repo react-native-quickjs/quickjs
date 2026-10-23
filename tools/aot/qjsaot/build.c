@@ -271,6 +271,8 @@ const char *q2_op_name(int op) {
       return "to_propkey";
     case Q2_OP_SET_NAME:
       return "set_name";
+    case Q2_OP_INL_GUARD:
+      return "inline_guard";
     default:
       return "?";
   }
@@ -1379,9 +1381,297 @@ static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
   }
 }
 
+
+/* ---- copied callees ------------------------------------------------------
+   The call of an inlined callee stays in place as a guard that leaves for the call unless the callee
+   is the compiled function the copy was made from. After it, a branch goes to a copy of the callee's
+   instructions placed past the program: its registers are renumbered above the caller's, a read of
+   argument i reads a register the prologue filled from the call's window, `this` is the call's
+   receiver, and a return writes the call's destination and branches back to the instruction after
+   the call. The copy's pcs are twice the callee's, offset, so a return can be two instructions. */
+static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *req, int nreq) {
+  int k, i;
+  int32_t rnext = f->nregs, pnext = g->len + 16;
+  Q2Insn *out = NULL;
+  int nout = 0, capout;
+  size_t total = (size_t)f->ninsns;
+  Q2Insn **cins = calloc((size_t)nreq, sizeof(*cins));
+  int *ncins = calloc((size_t)nreq, sizeof(int));
+  if (cins == NULL || ncins == NULL) goto oom;
+  f->inl = calloc((size_t)nreq, sizeof(*f->inl));
+  if (f->inl == NULL) goto oom;
+  f->ninl = nreq;
+  /* the registers were counted before the build; assign them from the top down */
+  rnext = f->nregs;
+  for (k = 0; k < nreq; k++) rnext -= req[k].g->reg_count + req[k].g->arg_count;
+  for (k = 0; k < nreq; k++) {
+    const JSAotGenFunc *cg = req[k].g;
+    Q2Inl *iv = &f->inl[k];
+    int np = cg->arg_count, pos = 0;
+    iv->g = cg;
+    iv->call_pc = req[k].call_pc;
+    iv->rbase = rnext;
+    rnext += cg->reg_count + np;
+    iv->nparam = np;
+    iv->pcbase = pnext;
+    iv->pcend = pnext + 2 * (np + 1) + 2 * cg->len + 2;
+    pnext = iv->pcend + 16;
+    cins[k] = calloc((size_t)cg->len + 1, sizeof(Q2Insn));
+    if (cins[k] == NULL) goto oom;
+    for (pos = 0; pos < cg->len;) {
+      JSAotGenInsn cur;
+      Q2Insn *in = &cins[k][ncins[k]];
+      int n;
+      if (js_aot_gen_decode_insn(cg->code, cg->len, pos, &cur) < 0) {
+        f->why = "malformed callee";
+        goto fail;
+      }
+      in->rop = (uint16_t)cur.op;
+      in->pc = pos;
+      in->next = pos + cur.size;
+      in->narg = cur.nargs;
+      for (n = 0; n < cur.nargs && n < 8; n++) {
+        in->arg[n].kind = cur.arg[n].kind;
+        in->arg[n].val = cur.arg[n].val;
+        in->arg[n].off = cur.arg[n].off;
+      }
+      in->xpc = -1;
+      q2_decode_roles(cg, in);
+      ncins[k]++;
+      pos += cur.size;
+    }
+    total += (size_t)ncins[k] * 2 + (size_t)np + 4;
+  }
+  out = calloc(total + (size_t)nreq * 2 + 8, sizeof(*out));
+  capout = (int)total + nreq * 2 + 8;
+  if (out == NULL) goto oom;
+  (void)capout;
+  /* the host instructions, with each call turned into its guard and a branch to the copy */
+  for (i = 0; i < f->ninsns; i++) {
+    Q2Insn *in = &f->insns[i];
+    int idx = -1;
+    for (k = 0; k < nreq; k++)
+      if (in->pc == req[k].call_pc && in->xpc < 0 && (in->rop == ROP_call || in->rop == ROP_call_method)) idx = k;
+    out[nout++] = *in;
+    if (idx >= 0) {
+      Q2Insn *gd = &out[nout - 1], *br = &out[nout];
+      Q2Inl *iv = &f->inl[idx];
+      int w;
+      /* the registers the call reads stay live through the copy */
+      iv->nkeep = 0;
+      for (w = 0; w < gd->nuse && iv->nkeep < 10; w++) iv->keep[iv->nkeep++] = (int32_t)gd->use[w];
+      for (w = 0; w < gd->win_n && iv->nkeep < 10; w++) iv->keep[iv->nkeep++] = gd->win_reg + w;
+      gd->op = Q2_OP_INL_GUARD;
+      gd->inlg = (uint8_t)(idx + 1);
+      gd->ndef = 0;
+      gd->nredef = 0;
+      /* the window is read by the copy's prologue, not by the guard */
+      iv->nparam = iv->nparam; /* (kept) */
+      memset(br, 0, sizeof(*br));
+      br->rop = ROP_branch;
+      br->pc = iv->pcbase - 1;
+      br->next = gd->next;
+      br->bpc = gd->pc;
+      br->ppc = gd->pc;
+      br->xpc = -1;
+      br->narg = 1;
+      br->arg[0].kind = 't';
+      br->arg[0].val = (int64_t)iv->pcbase - (int64_t)br->next;
+      br->arg[0].off = -1;
+      q2_decode_roles(g, br);
+      nout++;
+    }
+  }
+  /* the copies */
+  for (k = 0; k < nreq; k++) {
+    Q2Inl *iv = &f->inl[k];
+    const JSAotGenFunc *cg = iv->g;
+    const Q2Insn *call = NULL;
+    int32_t cb = iv->pcbase + 2 * (iv->nparam + 1), argb = iv->rbase + cg->reg_count, p;
+    int32_t dst_off = 0, recv_off = -1, cont_pc = 0, win_reg = 0, win_n = 0;
+    for (i = 0; i < nout; i++)
+      if (out[i].pc == iv->call_pc && out[i].inlg == k + 1) call = &out[i];
+    if (call == NULL) {
+      f->why = "inlined call not found";
+      goto fail;
+    }
+    dst_off = (int32_t)call->arg[0].val;
+    recv_off = call->rop == ROP_call_method ? (int32_t)call->arg[2].val : -1;
+    cont_pc = call->next;
+    win_reg = call->win_reg;
+    win_n = call->win_n;
+    /* the prologue: parameter registers from the window */
+    for (p = 0; p < iv->nparam; p++) {
+      Q2Insn *m = &out[nout++];
+      memset(m, 0, sizeof(*m));
+      m->pc = iv->pcbase + 2 * p;
+      m->next = p + 1 == iv->nparam ? cb : m->pc + 2;
+      m->bpc = m->pc;
+      m->ppc = m->pc;
+      m->xpc = iv->call_pc;
+      m->own = (uint8_t)(k + 1);
+      m->narg = 2;
+      m->arg[0].kind = 'r';
+      m->arg[0].val = (int64_t)(argb + p) * 16;
+      m->arg[0].off = -1;
+      if (p < win_n) {
+        m->rop = ROP_move;
+        m->arg[1].kind = 'r';
+        m->arg[1].val = (int64_t)(win_reg + p) * 16;
+        m->arg[1].off = -1;
+      } else {
+        m->rop = ROP_load_undefined;
+        m->narg = 1;
+      }
+      q2_decode_roles(g, m);
+    }
+    for (i = 0; i < ncins[k]; i++) {
+      Q2Insn s = cins[k][i];
+      Q2Insn d;
+      int a;
+      memset(&d, 0, sizeof(d));
+      d = s;
+      d.pc = cb + 2 * s.pc;
+      d.next = cb + 2 * s.next;
+      d.bpc = d.pc;
+      d.ppc = d.pc;
+      d.xpc = iv->call_pc;
+      d.own = (uint8_t)(k + 1);
+      for (a = 0; a < d.narg; a++) {
+        if (d.arg[a].kind == 'r') d.arg[a].val += (int64_t)iv->rbase * 16;
+        else if (d.arg[a].kind == 't') d.arg[a].val *= 2;
+      }
+      for (a = 0; a < d.ndef; a++) d.def[a] += (Q2ValueId)iv->rbase;
+      for (a = 0; a < d.nuse; a++) d.use[a] += (Q2ValueId)iv->rbase;
+      if (d.win_n > 0) d.win_reg += iv->rbase;
+      if (s.rop == ROP_get_arg || s.rop == ROP_get_arg2 || s.rop == ROP_put_arg) {
+        /* argument slots are the parameter registers */
+        int pairs = s.rop == ROP_get_arg2 ? 2 : 1, q;
+        for (q = 0; q < pairs; q++) {
+          Q2Insn *m = &out[nout++];
+          memset(m, 0, sizeof(*m));
+          m->rop = ROP_move;
+          m->pc = d.pc + q;
+          m->next = q + 1 == pairs ? d.next : d.pc + q + 1;
+          m->bpc = m->pc;
+          m->ppc = m->pc;
+          m->xpc = iv->call_pc;
+          m->own = (uint8_t)(k + 1);
+          m->narg = 2;
+          m->arg[0].kind = 'r';
+          m->arg[1].kind = 'r';
+          m->arg[0].off = m->arg[1].off = -1;
+          if (s.rop == ROP_put_arg) {
+            m->arg[0].val = (int64_t)(argb + (int)s.arg[0].val) * 16;
+            m->arg[1].val = (int64_t)(s.arg[1].val + (int64_t)iv->rbase * 16);
+          } else {
+            int ia = q * 2 + 1; /* get_arg: "ru" (d, idx); get_arg2: "ruru" */
+            int da = q * 2;
+            m->arg[0].val = s.arg[da].val + (int64_t)iv->rbase * 16;
+            m->arg[1].val = (int64_t)(argb + (int)s.arg[ia].val) * 16;
+          }
+          q2_decode_roles(g, m);
+        }
+        continue;
+      }
+      if (s.rop == ROP_load_this) {
+        Q2Insn *m = &out[nout++];
+        iv->uses_this = 1;
+        memset(m, 0, sizeof(*m));
+        m->pc = d.pc;
+        m->next = d.next;
+        m->bpc = m->pc;
+        m->ppc = m->pc;
+        m->xpc = iv->call_pc;
+        m->own = (uint8_t)(k + 1);
+        m->arg[0].kind = 'r';
+        m->arg[0].val = s.arg[0].val + (int64_t)iv->rbase * 16;
+        m->arg[0].off = -1;
+        if (recv_off >= 0) {
+          m->rop = ROP_move;
+          m->narg = 2;
+          m->arg[1].kind = 'r';
+          m->arg[1].val = recv_off;
+          m->arg[1].off = -1;
+        } else {
+          m->rop = ROP_load_undefined;
+          m->narg = 1;
+        }
+        q2_decode_roles(g, m);
+        continue;
+      }
+      if (s.rop == ROP_return || s.rop == ROP_return_undefined) {
+        Q2Insn *m = &out[nout++], *b2;
+        memset(m, 0, sizeof(*m));
+        m->pc = d.pc;
+        m->next = d.pc + 1;
+        m->bpc = m->pc;
+        m->ppc = m->pc;
+        m->xpc = iv->call_pc;
+        m->own = (uint8_t)(k + 1);
+        m->arg[0].kind = 'r';
+        m->arg[0].val = dst_off;
+        m->arg[0].off = -1;
+        if (s.rop == ROP_return) {
+          m->rop = ROP_move;
+          m->narg = 2;
+          m->arg[1].kind = 'r';
+          m->arg[1].val = s.arg[0].val + (int64_t)iv->rbase * 16;
+          m->arg[1].off = -1;
+        } else {
+          m->rop = ROP_load_undefined;
+          m->narg = 1;
+        }
+        q2_decode_roles(g, m);
+        b2 = &out[nout++];
+        memset(b2, 0, sizeof(*b2));
+        b2->rop = ROP_branch;
+        b2->pc = d.pc + 1;
+        b2->next = d.next;
+        b2->bpc = b2->pc;
+        b2->ppc = b2->pc;
+        b2->xpc = iv->call_pc;
+        b2->own = (uint8_t)(k + 1);
+        b2->narg = 1;
+        b2->arg[0].kind = 't';
+        b2->arg[0].val = (int64_t)cont_pc - (int64_t)b2->next;
+        b2->arg[0].off = -1;
+        q2_decode_roles(g, b2);
+        continue;
+      }
+      out[nout++] = d;
+    }
+    (void)win_reg;
+  }
+  free(f->insns);
+  f->insns = out;
+  f->ninsns = nout;
+  f->exit_pc = pnext;
+  for (k = 0; k < nreq; k++) free(cins[k]);
+  free(cins);
+  free(ncins);
+  return 0;
+oom:
+  f->why = "out of memory";
+fail:
+  if (cins != NULL)
+    for (k = 0; k < nreq; k++) free(cins[k]);
+  free(cins);
+  free(ncins);
+  free(out);
+  return -1;
+}
+
 int q2_build(const JSAotGenFunc *g, Q2Func *f) { return q2_build_ex(g, NULL, 0, f); }
 
 int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
+  return q2_build_inl(g, ex, nex, NULL, 0, f);
+}
+
+static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *req, int nreq);
+
+int q2_build_inl(
+    const JSAotGenFunc *g, const Q2Extra *ex, int nex, const Q2InlReq *inl, int ninl, Q2Func *f) {
   int i, n, words;
   int32_t *starts = NULL;
   int nstarts = 0, cap = 0;
@@ -1393,6 +1683,8 @@ int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
   f->norig = g->reg_count;
   for (i = 0; i < nex; i++)
     if (ex[i].newreg + 1 > f->nregs) f->nregs = ex[i].newreg + 1;
+  /* each copied callee gets its own registers and one per parameter */
+  for (i = 0; i < ninl; i++) f->nregs += inl[i].g->reg_count + inl[i].g->arg_count;
   words = (f->nregs + 63) / 64;
   f->lwords = words;
   f->exit_pc = g->len;
@@ -1406,7 +1698,7 @@ int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
   }
 
   /* 1. decode every instruction */
-  f->insns = calloc((size_t)g->len + 1 + (size_t)nex, sizeof(*f->insns));
+  f->insns = calloc((size_t)g->len + 1 + (size_t)nex + 1, sizeof(*f->insns));
   if (!f->insns) {
     f->why = "out of memory";
     return -1;
@@ -1499,6 +1791,8 @@ int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
     f->insns = ni;
     f->ninsns = nn;
   }
+
+  if (ninl > 0 && q2_apply_inlines(f, g, inl, ninl) < 0) return -1;
 
   /* 2. block starts: pc 0, every branch target, and after a terminator */
   {
@@ -1750,6 +2044,12 @@ int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
             int r = in2->win_reg + m;
             cur[r >> 6] |= 1ull << (r & 63);
           }
+          /* the registers a copied callee's call reads: the copy can leave for the call */
+          if (in2->own > 0 && f->inl != NULL)
+            for (m = 0; m < f->inl[in2->own - 1].nkeep; m++) {
+              int r = f->inl[in2->own - 1].keep[m];
+              cur[r >> 6] |= 1ull << (r & 63);
+            }
         }
         memcpy(in, cur, (size_t)words * 8);
         if (!bits_equal(in, f->live_in + (size_t)i * words, words)) {
@@ -2020,6 +2320,36 @@ int q2_build_ex(const JSAotGenFunc *g, const Q2Extra *ex, int nex, Q2Func *f) {
     int n = 0;
     f->prof = qjs_aot_prof_pcs(g->digest, &n);
     f->nprof = n;
+    if (f->ninl > 0) {
+      /* the copies keep their callee's records, under the pcs of the copy */
+      int tot = n, kk, rr;
+      ProfPc *mp;
+      for (kk = 0; kk < f->ninl; kk++) {
+        int nc = 0;
+        qjs_aot_prof_pcs(f->inl[kk].g->digest, &nc);
+        tot += nc;
+      }
+      mp = calloc((size_t)(tot > 0 ? tot : 1), sizeof(*mp));
+      if (mp == NULL) {
+        f->why = "out of memory";
+        goto fail;
+      }
+      if (n > 0) memcpy(mp, f->prof, sizeof(*mp) * (size_t)n);
+      tot = n;
+      for (kk = 0; kk < f->ninl; kk++) {
+        int nc = 0;
+        const ProfPc *cp = qjs_aot_prof_pcs(f->inl[kk].g->digest, &nc);
+        int32_t cbk = f->inl[kk].pcbase + 2 * (f->inl[kk].nparam + 1);
+        for (rr = 0; rr < nc; rr++) {
+          mp[tot] = cp[rr];
+          mp[tot].pc = cbk + 2 * cp[rr].pc;
+          tot++;
+        }
+      }
+      f->prof_owned = mp;
+      f->prof = mp;
+      f->nprof = tot;
+    }
     f->cres = qjs_aot_prof_cres(g->digest, &n);
     f->ncres = n;
     /* The per-register `R` records, kept for the per-destination lookup. A
@@ -2350,6 +2680,7 @@ void q2_free(Q2Func *f) {
   free(f->insn_live);
   free(f->reg_def);
   free(f->prof_owned);
+  free(f->inl);
   memset(f, 0, sizeof(*f));
 }
 
