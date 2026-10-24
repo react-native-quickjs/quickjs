@@ -145,8 +145,18 @@ if(QJS_AOT)
     # set only when a unit is actually configured, because an unresolved `-u`
     # is a hard link error -- which is the right way for the no-unit case to
     # stay correct rather than to become a warning nobody reads.
+    # The flag differs per toolchain, and the Apple and MSVC forms are not
+    # optional: iOS and Android are product targets. `-u` takes the symbol name
+    # as the linker sees it, which carries a leading underscore on Mach-O.
+    if(MSVC)
+      set(_qjs_aot_force_unit "/INCLUDE:qjs_aot_table")
+    elseif(APPLE)
+      set(_qjs_aot_force_unit "-Wl,-u,_qjs_aot_table")
+    else()
+      set(_qjs_aot_force_unit "-Wl,-u,qjs_aot_table")
+    endif()
     set_property(TARGET quickjs APPEND PROPERTY
-      INTERFACE_LINK_OPTIONS "-Wl,-u,qjs_aot_table")
+      INTERFACE_LINK_OPTIONS "${_qjs_aot_force_unit}")
   endif()
 endif()
 
