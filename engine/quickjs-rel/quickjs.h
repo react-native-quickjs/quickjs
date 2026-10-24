@@ -677,6 +677,19 @@ JS_EXTERN JSRuntime *JS_NewRuntime(void);
 JS_EXTERN void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
 /* QJS_JSON_LAZY=0/1 remains available as a process-level test override. */
 JS_EXTERN void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled);
+/* Closed-world mode: off by default, and set before the first context exists.
+   While it is on, a context created from this runtime has the existing own
+   properties of its builtin prototypes and namespaces made non-writable and
+   non-configurable (non-configurable only, for an accessor): Array, Object,
+   String, Number, Boolean, Function, Map, Set, Promise and Symbol.prototype,
+   the typed-array prototypes, Math, JSON and Reflect. A script that assigns to,
+   deletes or redefines one of them throws a TypeError, in sloppy mode too, and
+   a script that asks for code from a string -- eval, the Function
+   constructors, indirect eval -- throws an EvalError. Adding a new member
+   stays allowed, and the embedder's own JS_Eval and JS_EvalFunction still
+   work: this limits what JavaScript can do, not what the host can do. */
+JS_EXTERN int JS_SetClosedWorld(JSRuntime *rt, int on);
+JS_EXTERN int JS_GetClosedWorld(JSRuntime *rt);
 /* use 0 to disable memory limit */
 JS_EXTERN void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
 JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);

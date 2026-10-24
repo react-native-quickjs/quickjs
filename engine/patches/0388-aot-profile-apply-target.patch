@@ -1,0 +1,29 @@
+Subject: The profile records the call a `f.apply(this, arguments)` site makes
+
+What this does
+  - At the `apply_arguments` opcode, in both the threaded and the monolith interpreter, the
+    profiler records a call site at the opcode: the value the site calls (`f`, the register the
+    `apply` is taken from) and the argument count, so the callee is the forwarded-to function and
+    not the `apply` function itself. The profiler only; no generated-code layout and no
+    interpreter behaviour changes.
+
+Why we need it
+  `apply_arguments` is how a `Class.create`-style forwarder passes its arguments on, and the
+  profile is the only thing the generator has to learn what such a site calls. It named no callee
+  there, so the generator could not see which functions such a site forwards to, and the site stayed a
+  call into the engine even when every call went to one compiled function. The call the site makes is
+  the one worth recording.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -30363,0 +30364,4 @@
++        /* The call this site forwards to, recorded like any other call site's:
++           the target is the value the site calls, not the `apply` function. */
++        AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 7, sp[-3],
++                      f->argc);
+@@ -36155,0 +36160,5 @@
++                    /* The call this site forwards to, recorded like any other
++                       call site's: the target is the value the site calls, not
++                       the `apply` function. */
++                    AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), sp[-3],
++                                  argc);
