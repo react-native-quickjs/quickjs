@@ -1512,7 +1512,7 @@
     },
     {
       "name": "0384-aot-profile-array-storage-kind.patch",
-      "sha256": "78864fd8987ea940e54f090d2a80f1d806e2a5d2bd06ca7785dfb6d1d54af174"
+      "sha256": "efb40c460b82d460f8ac5bf5bcb0eba3d174b365783c6eb7f5d18dd5bd9f72f0"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1520,7 +1520,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "4b4cd49be4453f1627427ef2fd2ec965047356c7cda9d371ec97201cda404dcb",
+    "quickjs.c": "c9e2e0986092f0fca8d1ba37cd25b29b8fac997d06deecdc71caf67db9d599ad",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

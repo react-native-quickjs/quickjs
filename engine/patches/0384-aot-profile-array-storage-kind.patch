@@ -115,7 +115,16 @@ packed2.js, matmul, sieve equal).
              T_SET_NEXT_B(d, pv, T_SZ_RRR);
          }
  #endif
-@@ -62842,6 +62867,37 @@
+@@ -32203,6 +32228,8 @@
+     int v = T_REG(5);
+     AOT_PROF_ELEM(f->b, FR(v), 0);
+     AOT_PROF_PUT(f->b, FR(o), FR(key));
++    if (JS_VALUE_GET_TAG(FR(o)) == JS_TAG_OBJECT)
++        js_aot_prof_store_packed(f->b, JS_VALUE_GET_OBJ(FR(o)));
+ #if QJS_DRC
+     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
+         T_NEXT(T_SZ_RRR);
+@@ -62842,6 +62869,37 @@
      pf->pcs[pc].elem_kinds |= kind;
  }
  
@@ -153,7 +162,7 @@ packed2.js, matmul, sieve equal).
  /* An element store the compiled inline store would not take: not an existing, non-hole
     element of an array or typed array. Such a store grows the array or fills a hole, and may
     reach a setter on the prototype chain. */
-@@ -62859,9 +62915,14 @@
+@@ -62859,9 +62917,14 @@
          JSObject *p = JS_VALUE_GET_OBJ(o);
          uint32_t idx = (uint32_t)JS_VALUE_GET_INT(k);
  
@@ -171,7 +180,7 @@ packed2.js, matmul, sieve equal).
          if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
              pf->pcs[pc].elem_kinds |= AOT_ELEM_TA;
              pf->pcs[pc].ta_classes |= (uint16_t)(1u << (p->class_id - JS_CLASS_UINT8C_ARRAY));
-@@ -63259,24 +63320,24 @@
+@@ -63259,24 +63322,24 @@
          JSAotProfPc *e = &pf->pcs[i];
          char ts[128];
  

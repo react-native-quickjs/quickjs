@@ -32228,6 +32228,8 @@ static uint8_t *REGVM_CC regvm_t_put_element(REGVM_ARGS)
     int v = T_REG(5);
     AOT_PROF_ELEM(f->b, FR(v), 0);
     AOT_PROF_PUT(f->b, FR(o), FR(key));
+    if (JS_VALUE_GET_TAG(FR(o)) == JS_TAG_OBJECT)
+        js_aot_prof_store_packed(f->b, JS_VALUE_GET_OBJ(FR(o)));
 #if QJS_DRC
     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
         T_NEXT(T_SZ_RRR);
