@@ -1539,12 +1539,16 @@
       "sha256": "9f575e7e5592fd0f812571481182160309e57218591612f61d978b0e48f88a96"
     },
     {
+      "name": "0391-aot-function-apply-identity.patch",
+      "sha256": "dbcbce856df91e1754d784be1b2160b00634ab4d871cb91bdc273266818cffae"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "575b1a45629ed0fda7442537faa475a906041069932656c26ebf7b2a5121f44a",
+    "quickjs.c": "b0d76a1313427cac6c0ce525fd64f16ee5ffafb0a9f51a846aa3cba41490a995",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

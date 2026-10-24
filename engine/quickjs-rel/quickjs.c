@@ -64173,6 +64173,11 @@ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
     return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
 }
 
+QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
+{
+    return (const void *)js_function_apply;
+}
+
 /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
    read from the table and the register borrows it (the table owns it for the context's life);
    the element must still be present in a fast array, as in js_for_in_next. Everything else,

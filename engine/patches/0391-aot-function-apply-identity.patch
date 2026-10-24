@@ -1,0 +1,50 @@
+Subject: The layout export names the builtin `Function.prototype.apply`
+
+What this does
+  - `qjs_aot_function_apply_fn` returns the function pointer of the builtin
+    `Function.prototype.apply`, which a C function object holds in
+    `c_function.generic_magic` when it is that builtin.
+
+Why we need it
+  A program that writes `f.apply(this, arguments)` pays the builtin's own argument-list
+  build for a call whose arguments are already a contiguous window. Bypassing the call
+  is only sound while the `apply` being bypassed is the builtin, so the code that
+  bypasses it must compare the value it would skip against this pointer, together with
+  the class, cproto and magic a C function object carries. The engine already has that
+  predicate (`js_args_apply_is_builtin`), but its function is static, so the pointer is
+  not nameable from a unit; this returns it, the same way the array iterator's `next`
+  pointer is returned.
+
+Functions touched
+  `qjs_aot_function_apply_fn` (new, AOT builds only); `quickjs-aot-rt.h` declares it.
+
+No (read-only; nothing changes behaviour).
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -209,6 +209,11 @@
+ /* The function pointer of Array.prototype.push (0) or pop (1), which a C function object holds,
+    with magic 0, when it is that builtin. */
+ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
++/* The function pointer of the builtin `Function.prototype.apply`, which a C function object holds,
++   with cproto generic_magic and magic 0, when it is that builtin. A unit that bypasses a
++   `f.apply(this, arguments)` compares the `apply` it would bypass against this, so a program that
++   replaced `apply` keeps its own. */
++QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void);
+ 
+ /* Fold every field after `hash` (the hash field itself is excluded). Shared by
+    the generator and the runtime. */
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64437,6 +64437,11 @@
+     return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
+ }
+ 
++QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
++{
++    return (const void *)js_function_apply;
++}
++
+ /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
+    read from the table and the register borrows it (the table owns it for the context's life);
+    the element must still be present in a fast array, as in js_for_in_next. Everything else,
