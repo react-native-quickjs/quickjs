@@ -8,10 +8,10 @@ What this does
 Why we need it
   A unit that is linked but refused is not an error the program can see. The
   engine falls back to the interpreter, which is correct and several times
-  slower, with no diagnostic anywhere: the only symptom of a Release engine
-  refusing a Debug build's unit was an instruction count six times too high, and
-  finding the cause took a day of disassembly. The condition is always a
-  misbuilt binary, and the hashes are the whole diagnosis.
+  slower, with no diagnostic anywhere, so the only symptom of a misbuilt binary
+  is a program that runs at the wrong speed. The condition is always a mismatch
+  between the layout the unit was generated against and the engine's own, and
+  the two hashes are the whole diagnosis.
 
 Hazards
   The message goes to stderr at the first binding attempt, which is the first
@@ -25,17 +25,13 @@ and raytrace are unchanged, and no line is printed when the unit binds.
 
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -63597,12 +63597,38 @@
+@@ -63597,12 +63597,34 @@
      return l.hash;
  }
  
-+/* A unit that is linked but refused leaves the program running in the
-+   interpreter, which is correct but several times slower, and nothing about the
-+   run says so. That silence cost a day: a Release engine and a Debug engine
-+   disagree on sizeof(JSString), so every unit was refused and the only symptom
-+   was an instruction count six times too high. One line, once, on stderr is
-+   worth the branch -- and it names both hashes, so the reason is visible
-+   without a debugger. */
++/* A unit that is linked but refused runs the program in the interpreter
++   with no other sign; one line on stderr, once per process, names
++   the cause and both hashes. */
 +static int aot_unit_refused_reported;
 +
  static int aot_unit_present(void)

@@ -1532,11 +1532,11 @@
     },
     {
       "name": "0389-dumps-opt-in.patch",
-      "sha256": "8680fb57f17defffc2bac2cc0219e34a2352f404df0034f3a12195251266d1a5"
+      "sha256": "c70a016001d3225b953e4080391a0ac9a82e1872b158808c43f1cfd3de4982f1"
     },
     {
       "name": "0390-aot-refusal-line.patch",
-      "sha256": "83fb3351d30bfe06e5cccf83b8b661fa455f1132c87c09a3fda9028d1272ac45"
+      "sha256": "9f575e7e5592fd0f812571481182160309e57218591612f61d978b0e48f88a96"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1544,7 +1544,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "ba7534e9936020928f2be10364d0fb1e3a1d263a1a42df54ea773247a304006f",
+    "quickjs.c": "575b1a45629ed0fda7442537faa475a906041069932656c26ebf7b2a5121f44a",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

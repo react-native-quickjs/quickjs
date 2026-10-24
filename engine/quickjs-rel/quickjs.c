@@ -198,11 +198,10 @@ static void js_closcyc_resolve(JSRuntime *rt);
 #endif
 
 /* The leak and GC dumps are a debugging facility, so they are opt-in rather
-   than a consequence of the build type.  ENABLE_DUMPS reaches beyond the dump
+   than a consequence of the build type. ENABLE_DUMPS reaches beyond the dump
    code: it adds a `link` field to JSString, and JSString's size is part of the
-   AOT layout hash, so deriving it from NDEBUG made a Release build's engine
-   refuse every unit built with a Debug engine -- silently, because the refusal
-   path is a null table.  A debugging facility must not change the ABI. */
+   AOT layout hash, so deriving it from NDEBUG made the two build types refuse
+   each other's units. A debugging facility must not change the ABI. */
 #if defined(QJS_ENABLE_DUMPS) && !defined(ENABLE_DUMPS)
 #define ENABLE_DUMPS
 #endif
@@ -63606,13 +63605,9 @@ static uint32_t js_aot_unit_layout_hash(void)
     return l.hash;
 }
 
-/* A unit that is linked but refused leaves the program running in the
-   interpreter, which is correct but several times slower, and nothing about the
-   run says so. That silence cost a day: a Release engine and a Debug engine
-   disagree on sizeof(JSString), so every unit was refused and the only symptom
-   was an instruction count six times too high. One line, once, on stderr is
-   worth the branch -- and it names both hashes, so the reason is visible
-   without a debugger. */
+/* A unit that is linked but refused runs the program in the interpreter
+   with no other sign; one line on stderr, once per process, names
+   the cause and both hashes. */
 static int aot_unit_refused_reported;
 
 static int aot_unit_present(void)
