@@ -1639,6 +1639,7 @@ typedef struct JSAotProfPc {
     uint8_t frac;          /* a non-integral number was seen */
     uint8_t negzero;       /* -0 was seen */
     uint8_t elem_kinds;    /* AOT_ELEM_* stored/loaded at an element pc */
+    uint8_t packed_kinds;  /* AOT_PK_*: the storage kinds of the arrays seen at this element pc */
     uint16_t alloc_props;  /* final property count at an allocation pc */
     uint16_t ta_classes;   /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here */
     double num_min;
@@ -1687,6 +1688,13 @@ typedef struct JSAotProfFunc {
 #define AOT_ELEM_HOLEY  (1u << 4)
 #define AOT_ELEM_TA     (1u << 5)  /* a typed array's element */
 #define AOT_ELEM_BOOL   (1u << 6)
+
+/* Storage kinds of the JS_CLASS_ARRAY receivers seen at an element access site. 0 means the site
+   recorded no array storage kind (an engine built without the flag, or a profile that predates the
+   field), so compiled code forms no packed region from it. */
+#define AOT_PK_I32      (1u << 0)
+#define AOT_PK_F64      (1u << 1)
+#define AOT_PK_GENERIC  (1u << 2)
 #endif /* QJS_AOT_PROFILE */
 
 /* One polymorphic property cache entry: the receiver shape, the property's
@@ -1887,7 +1895,15 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
 static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey);
 static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k);
+static void js_aot_prof_packed(JSFunctionBytecode *b, JSObject *o);
 static void js_aot_prof_alloc(JSFunctionBytecode *b, uint32_t props);
+/* The element-store site's storage-kind record: inline, so a build without the profiler pays
+   nothing and a profiling build pays one test when profiling is switched off. */
+static inline void js_aot_prof_store_packed(JSFunctionBytecode *b, JSObject *o)
+{
+    if (b->aot_prof != NULL && b->realm->rt->aot_prof_on)
+        js_aot_prof_packed(b, o);
+}
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
 static void js_aot_prof_call_result(JSFunctionBytecode *b, uint8_t *rip,
@@ -1920,6 +1936,8 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
 #define AOT_PROF_ELEM(b_, v_, h_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_elem((b_), (v_), (h_)); } while (0)
+#define AOT_PROF_PACKED(b_, o_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_packed((b_), (o_)); } while (0)
 #define AOT_PROF_PUT(b_, o_, k_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_put((b_), (o_), (k_)); } while (0)
 #define AOT_PROF_ALLOC(b_, n_) \
@@ -1960,6 +1978,9 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
 #define AOT_PROF_TAKEN(f_, ip_)     ((void)0)
 #define AOT_PROF_ELEM(b_, v_, h_)   ((void)0)
+#define AOT_PROF_PACKED(b_, o_)     ((void)0)
+/* No profiler in this build: the element store's storage-kind record is not compiled at all. */
+#define js_aot_prof_store_packed(b_, o_) ((void)0)
 #define AOT_PROF_PUT(b_, o_, k_)    ((void)0)
 #define AOT_PROF_ALLOC(b_, n_)      ((void)0)
 #endif
@@ -30180,6 +30201,8 @@ static uint8_t *REGVM_CC regvm_t_put_element_xfer(REGVM_ARGS)
     int v = T_REG(5);
     AOT_PROF_ELEM(f->b, FR(v), 0);
     AOT_PROF_PUT(f->b, FR(o), FR(key));
+    if (JS_VALUE_GET_TAG(FR(o)) == JS_TAG_OBJECT)
+        js_aot_prof_store_packed(f->b, JS_VALUE_GET_OBJ(FR(o)));
 #if QJS_DRC
     if (likely(regvm_put_elem_fast(ctx, FR(o), FR(key), FR(v))))
         T_NEXT(T_SZ_RRR);
@@ -30762,12 +30785,14 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
                 __attribute__((musttail))
                     return regvm_t_get_element_lazy_slow(REGVM_PASS);
             AOT_PROF_ELEM(f->b, JS_ARR_VALS(p)[idx], 0);
+            AOT_PROF_PACKED(f->b, p);
             T_SET_NEXT_B(d,JS_ARR_VALS(p)[idx], T_SZ_RRR);
         }
 #if QJS_PACKED_ARRAYS
         if (p->class_id == JS_CLASS_ARRAY && !JS_ARR_GENERIC(p) && idx < p->u.array.count) {
             JSValue pv = js_arr_packed_get(p, idx);
             AOT_PROF_ELEM(f->b, pv, 0);
+            AOT_PROF_PACKED(f->b, p);
             T_SET_NEXT_B(d, pv, T_SZ_RRR);
         }
 #endif
@@ -62842,6 +62867,37 @@ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
     pf->pcs[pc].elem_kinds |= kind;
 }
 
+/* The storage kind of an array an element site just accessed (JS_CLASS_ARRAY only). A site that
+   sees only one packed kind is where compiled code can read and write the elements directly. */
+static void js_aot_prof_packed(JSFunctionBytecode *b, JSObject *o)
+{
+    JSAotProfFunc *pf = b->aot_prof;
+    int pc;
+
+    if (!pf)
+        return;
+    if (o == NULL || o->class_id != JS_CLASS_ARRAY)
+        return;
+    pc = pf->last_pc;
+    if (pc < 0 || pc >= pf->pc_n)
+        return;
+#if QJS_PACKED_ARRAYS
+    switch (o->arr_kind) {
+    case JS_ARR_KIND_INT32:
+        pf->pcs[pc].packed_kinds |= AOT_PK_I32;
+        break;
+    case JS_ARR_KIND_FLOAT64:
+        pf->pcs[pc].packed_kinds |= AOT_PK_F64;
+        break;
+    default:
+        pf->pcs[pc].packed_kinds |= AOT_PK_GENERIC;
+        break;
+    }
+#else
+    pf->pcs[pc].packed_kinds |= AOT_PK_GENERIC;
+#endif
+}
+
 /* An element store the compiled inline store would not take: not an existing, non-hole
    element of an array or typed array. Such a store grows the array or fills a hole, and may
    reach a setter on the prototype chain. */
@@ -62859,9 +62915,14 @@ static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k)
         JSObject *p = JS_VALUE_GET_OBJ(o);
         uint32_t idx = (uint32_t)JS_VALUE_GET_INT(k);
 
-        if (p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count && JS_ARR_GENERIC(p) &&
-            !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))
-            return;
+        if (p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count) {
+#if QJS_PACKED_ARRAYS
+            if (!JS_ARR_GENERIC(p))
+                return;     /* a packed element at an index inside the count: the store is taken */
+#endif
+            if (JS_ARR_GENERIC(p) && !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))
+                return;
+        }
         if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
             pf->pcs[pc].elem_kinds |= AOT_ELEM_TA;
             pf->pcs[pc].ta_classes |= (uint16_t)(1u << (p->class_id - JS_CLASS_UINT8C_ARRAY));
@@ -63259,24 +63320,24 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
         JSAotProfPc *e = &pf->pcs[i];
         char ts[128];
 
-        if (!e->types && !e->elem_kinds && !e->alloc_props)
+        if (!e->types && !e->elem_kinds && !e->alloc_props && !e->packed_kinds)
             continue;
         aot_type_str(e->types, ts, sizeof(ts));
         aot_src_str(b, i, src, sizeof(src));
         if (e->elem_kinds && e->ta_classes)
-            fprintf(f, "P %s pc=%d types=%s elem=%u tacls=%u src=%s\n",
-                    dgt, i, ts, e->elem_kinds, e->ta_classes, src);
+            fprintf(f, "P %s pc=%d types=%s elem=%u tacls=%u pk=%u src=%s\n",
+                    dgt, i, ts, e->elem_kinds, e->ta_classes, e->packed_kinds, src);
         else if (e->elem_kinds)
-            fprintf(f, "P %s pc=%d types=%s elem=%u src=%s\n",
-                    dgt, i, ts, e->elem_kinds, src);
+            fprintf(f, "P %s pc=%d types=%s elem=%u pk=%u src=%s\n",
+                    dgt, i, ts, e->elem_kinds, e->packed_kinds, src);
         else if (e->alloc_props)
-            fprintf(f, "P %s pc=%d types=%s props=%u src=%s\n",
-                    dgt, i, ts, e->alloc_props, src);
+            fprintf(f, "P %s pc=%d types=%s props=%u pk=%u src=%s\n",
+                    dgt, i, ts, e->alloc_props, e->packed_kinds, src);
         else if (e->has_num)
-            fprintf(f, "P %s pc=%d types=%s num=%g..%g frac=%u negzero=%u src=%s\n",
-                    dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, src);
+            fprintf(f, "P %s pc=%d types=%s num=%g..%g frac=%u negzero=%u pk=%u src=%s\n",
+                    dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, e->packed_kinds, src);
         else
-            fprintf(f, "P %s pc=%d types=%s src=%s\n", dgt, i, ts, src);
+            fprintf(f, "P %s pc=%d types=%s pk=%u src=%s\n", dgt, i, ts, e->packed_kinds, src);
     }
     if (pf->br_total) {
         for (i = 0; i < pf->pc_n; i++) {

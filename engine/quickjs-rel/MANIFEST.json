@@ -1511,12 +1511,16 @@
       "sha256": "21f9e4145c171834e95908ea8b45f0e6c431b23c03015ac38aff88c313464e7c"
     },
     {
+      "name": "0384-aot-profile-array-storage-kind.patch",
+      "sha256": "78864fd8987ea940e54f090d2a80f1d806e2a5d2bd06ca7785dfb6d1d54af174"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "6f120c27710f84a378d034d831b9501b48d1aa3eb8823ae3c8c7ff23893e3eb8",
+    "quickjs.c": "4b4cd49be4453f1627427ef2fd2ec965047356c7cda9d371ec97201cda404dcb",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
