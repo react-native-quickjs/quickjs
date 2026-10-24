@@ -1528,7 +1528,7 @@
     },
     {
       "name": "0388-aot-profile-apply-target.patch",
-      "sha256": "8326c1dcecdda98fed81773cc08e24f9f0a12cd26ef24ef6ef2a1b857efe92c5"
+      "sha256": "e02ab7816c2a9a387d7a5c6de2659b2efa1c69b608def760aed9b232371e8b17"
     },
     {
       "name": "0389-closed-world-realm-freeze.patch",

@@ -10,9 +10,7 @@ What this does
 Why we need it
   `apply_arguments` is how a `Class.create`-style forwarder passes its arguments on, and the
   profile is the only thing the generator has to learn what such a site calls. It named no callee
-  there, so the generator could not see which functions such a site forwards to, and the site stayed a
-  call into the engine even when every call went to one compiled function. The call the site makes is
-  the one worth recording.
+  there, so the generator could not see which functions such a site forwards to.
 
 --- a/quickjs.c
 +++ b/quickjs.c
