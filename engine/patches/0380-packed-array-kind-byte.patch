@@ -33,7 +33,7 @@ Why we need it
   list every place that assumed a JSValue array, so none is missed; the unpack at the mutators keeps
   the invariant that only code written for packed arrays ever sees one.
 
-Pointer hazard (reviewer's condition 1)
+Pointer hazard
   `u.array.u.values` used to move only when an array grew; with the flag on it also moves when a packed
   array is unpacked. No site holds the pointer across a call that can run JS or unpack: the sites that
   keep `values` in a local (js_array_toSpliced/toSorted/toReversed/slice/with, js_regexp_result_prealloc,
@@ -44,7 +44,7 @@ Pointer hazard (reviewer's condition 1)
   The kit case packed1.js unpacks arrays from inside forEach/map/sort/reduce/indexOf/join callbacks over
   the same array under asan with QJS_PACKED_TEST=1.
 
-Sites without an error path (condition 2): the finalizer, the mark function, JS_ComputeMemoryUsage,
+Sites without an error path: the finalizer, the mark function, JS_ComputeMemoryUsage,
   JS_DumpObject (kind-aware, no unpack), js_get_fast_array / qjs_aot_dense / the concat appends / the
   push fast path / regvm_put_elem_fast / the iterators (refuse a packed array, the generic path serves
   it). Every js_array_unpack call has an error path.

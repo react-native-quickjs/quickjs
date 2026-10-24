@@ -18,10 +18,10 @@ What this does
 
 Why we need it
   The interpreter and the AOT runtime then read and write number arrays without a JSValue per element, and
-  the stage-5 generator can emit typed loads and stores on them. Everything else sees a packed array only
-  through the stage-1 paths (kind-aware reads, or unpack at a mutator with an error path).
+  the generator can emit typed loads and stores on them. Everything else sees a packed array only
+  through the kind-aware paths (a kind-aware read, or unpack at a mutator with an error path).
 
-Pointer hazard (reviewer's condition B1)
+Pointer hazard
   Widening moves `values` exactly as unpacking does. The sites that can widen are the packed store
   (`js_arr_packed_store`, from `JS_SetPropertyValue`) and the packed append (`js_arr_packed_append`, from
   `add_fast_array_element`, the `push` fast path); none of them is reached while a caller holds a pointer
@@ -32,7 +32,7 @@ Pointer hazard (reviewer's condition B1)
   Creators: `JS_NewArray` is unchanged (generic), so the builtin results and the arguments of rest
   parameters, Object.keys/entries and the other engine-made arrays are generic; only `[]` and `Array()`
   produce kind 1. Any creator that wrote `values` of such an array directly would fail the assertion in
-  JS_ARR_VALS (the stage-1 rename routes every use through it); none does (pktest: 230 files, 0 differ,
+  JS_ARR_VALS (the renamed storage member routes every use through it); none does (pktest: 230 files, 0 differ,
   asan, both test modes).
 --- a/quickjs.c
 +++ b/quickjs.c
