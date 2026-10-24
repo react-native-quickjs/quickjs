@@ -1392,6 +1392,11 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
             if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]), 0) < 0) goto done;
           } else if (out->hoist_grp[k] <= -101 && out->hoist_grp[k] >= -112) {
             if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]), -100 - out->hoist_grp[k]) < 0) goto done;
+          } else if (out->hoist_grp[k] == E_GRP_PK_I32 || out->hoist_grp[k] == E_GRP_PK_F64) {
+            /* a packed region: the same fact the dense entry seeds, with the kind's class code
+               (100 + kind), so a later access in the loop finds the region and skips its entry */
+            if (fs_add_shape(&cur, E_ARRV(out->hoist_val[k]),
+                             100 + (out->hoist_grp[k] == E_GRP_PK_I32 ? 1 : 2)) < 0) goto done;
           } else if (fs_add_shape(&cur, out->hoist_val[k], out->hoist_grp[k]) < 0) {
             goto done;
           }
