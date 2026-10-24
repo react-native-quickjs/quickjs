@@ -90,6 +90,16 @@ if(QJS_REGVM)
       "Production builds are stack-only for now; host builds may set "
       "QJS_REGVM=ON freely.")
   endif()
+  # The register VM's executor is written for clang: it relies on
+  # `__attribute__((always_inline))` being honoured across translation-unit
+  # boundaries and on statement expressions. GCC rejects the AOT build outright
+  # (implicit declarations inside the interpreter), so the failure would appear
+  # as a wall of errors in the engine rather than as a configure refusal.
+  if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR
+      "QJS_REGVM=ON requires clang (found GNU ${CMAKE_C_COMPILER_VERSION}). "
+      "Configure with -DCMAKE_C_COMPILER=clang.")
+  endif()
   target_compile_definitions(quickjs PUBLIC QJS_REGVM=1)
 
   # The register VM's default executor is the threaded dispatch plus the record
@@ -121,8 +131,16 @@ if(QJS_AOT)
   if(NOT QJS_REGVM)
     message(FATAL_ERROR "QJS_AOT=ON requires QJS_REGVM=ON")
   endif()
-  if(QUICKJS_ENABLE_DEBUGGER)
-    message(FATAL_ERROR "QJS_AOT=ON cannot be combined with QUICKJS_ENABLE_DEBUGGER=ON: the parser emits a debugger trap per statement when a debugger is attached, which changes the register bytecode and its digest, so a unit built with the debugger on binds against a different program than the one that runs. AOT is release-only.")
+  # The debugger option is declared further down this file, so at this point it
+  # may not exist yet and `if(QUICKJS_ENABLE_DEBUGGER)` is false even when it is
+  # on. Reading it from the cache (defaulting to its declared default of ON)
+  # makes the refusal fire on the configuration that actually breaks.
+  set(_qjs_dbg "${QUICKJS_ENABLE_DEBUGGER}")
+  if(NOT DEFINED _qjs_dbg OR _qjs_dbg STREQUAL "")
+    set(_qjs_dbg ON)
+  endif()
+  if(_qjs_dbg)
+    message(FATAL_ERROR "QJS_AOT=ON cannot be combined with QUICKJS_ENABLE_DEBUGGER=ON: the parser emits a debugger trap per statement when a debugger is attached, which changes the register bytecode and its digest, so a unit built with the debugger on binds against a different program than the one that runs. AOT is release-only. Configure with -DQUICKJS_ENABLE_DEBUGGER=OFF.")
   endif()
   target_compile_definitions(quickjs PUBLIC QJS_AOT=1)
   if(QJS_AOT_UNIT)
