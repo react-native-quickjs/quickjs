@@ -2454,6 +2454,10 @@ static inline JSValue js_arr_packed_get(const JSObject *p, uint32_t idx)
 }
 #define JS_ARR_GENERIC(p) ((p)->arr_kind == JS_ARR_KIND_GENERIC)
 static bool js_array_pack(JSContext *ctx, JSObject *p);
+static bool js_arr_packed_store_nomem(JSObject *p, uint32_t idx, JSValueConst val);
+static bool js_arr_packed_append_nomem(JSObject *p, JSValueConst val);
+static int js_arr_packed_store(JSContext *ctx, JSObject *p, uint32_t idx, JSValueConst val);
+static int js_arr_packed_append(JSContext *ctx, JSObject *p, JSValueConst val);
 /* QJS_PACKED_TEST=1 (testing only): arrays are packed whenever they are built or appended to, so the
    whole test corpus runs through the packed paths and the conversions back. */
 static unsigned long js_packed_n_pack, js_packed_n_unpack;
@@ -9593,8 +9597,16 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
                                             JS_CLASS_ARRAY, NULL, 0, count);
     else
         obj = JS_NewArray(ctx);
-    if (JS_IsException(obj) || count == 0)
+    if (JS_IsException(obj))
         return obj;
+    if (count == 0) {
+#if QJS_PACKED_ARRAYS
+        /* `[]` starts as an int32 array without storage: the first number appended keeps it packed,
+           the first other value unpacks it for free */
+        JS_VALUE_GET_OBJ(obj)->arr_kind = JS_ARR_KIND_INT32;
+#endif
+        return obj;
+    }
     p = JS_VALUE_GET_OBJ(obj);
     if (!p->values_inline && expand_fast_array(ctx, p, count)) {
         JS_FreeValue(ctx, obj);
@@ -14600,9 +14612,9 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
 
     if (likely(p->fast_array)) {
         uint32_t old_len = p->u.array.count;
-        if (len < old_len) {
-            if (js_array_ensure_generic(ctx, p) < 0)
-                return -1;
+        if (len < old_len && !JS_ARR_GENERIC(p)) {
+            p->u.array.count = len;     /* a packed array holds nothing to release */
+        } else if (len < old_len) {
             for(i = len; i < old_len; i++) {
                 if (unlikely(p->holey) &&
                     js_array_slot_is_hole(JS_ARR_VALS(p)[i])) {
@@ -14725,10 +14737,6 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
                                   JSValue val, int flags)
 {
     uint32_t new_len, array_len;
-    if (js_array_ensure_generic(ctx, p) < 0) {
-        JS_FreeValue(ctx, val);
-        return -1;
-    }
     /* extend the array by one */
     /* XXX: convert to slow array if new_len > 2^31-1 elements */
     new_len = p->u.array.count + 1;
@@ -14744,6 +14752,21 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
             p->prop[0].u.value = js_int32(new_len);
         }
     }
+#if QJS_PACKED_ARRAYS
+    if (unlikely(!JS_ARR_GENERIC(p))) {
+        int r = js_arr_packed_append(ctx, p, val);
+        if (r < 0)
+            return -1;
+        if (r > 0) {
+            JS_ARR_PACK_TEST(ctx, p);
+            return true;
+        }
+        if (js_array_ensure_generic(ctx, p) < 0) {
+            JS_FreeValue(ctx, val);
+            return -1;
+        }
+    }
+#endif
     if (unlikely(new_len > p->u.array.u1.size)) {
         if (expand_fast_array(ctx, p, new_len)) {
             JS_FreeValue(ctx, val);
@@ -14839,6 +14862,150 @@ static bool js_array_pack(JSContext *ctx, JSObject *p)
     return true;
 }
 
+#endif
+
+#if QJS_PACKED_ARRAYS
+/* A number that a packed array can hold in its current kind: an int32 for kind 1; any number for kind 2.
+   An integral float64 in int32 range (not -0) counts as an int, so a result boxed as float64 does not
+   widen the array. *out receives the element: an int32 for kind 1, the double's bits via *dbl for kind 2. */
+static inline bool js_arr_packed_num_int(JSValueConst v, int32_t *i)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+    if (likely(tag == JS_TAG_INT)) {
+        *i = JS_VALUE_GET_INT(v);
+        return true;
+    }
+    if (tag == JS_TAG_FLOAT64) {
+        double d = JS_VALUE_GET_FLOAT64(v);
+        int32_t k = (int32_t)d;
+        if ((double)k == d && !(k == 0 && signbit(d))) {
+            *i = k;
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool js_arr_packed_num_double(JSValueConst v, double *d)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+    if (tag == JS_TAG_INT) {
+        *d = (double)JS_VALUE_GET_INT(v);
+        return true;
+    }
+    if (tag == JS_TAG_FLOAT64) {
+        *d = JS_VALUE_GET_FLOAT64(v);
+        return true;
+    }
+    return false;
+}
+
+/* The stores that need no allocation: they return false when the array has to widen, grow or unpack. */
+static bool js_arr_packed_store_nomem(JSObject *p, uint32_t idx, JSValueConst val)
+{
+    int32_t i;
+    double d;
+    if (p->arr_kind == JS_ARR_KIND_INT32) {
+        if (!js_arr_packed_num_int(val, &i))
+            return false;
+        ((int32_t *)p->u.array.u.values_raw)[idx] = i;
+        return true;
+    }
+    if (!js_arr_packed_num_double(val, &d))
+        return false;
+    ((double *)p->u.array.u.values_raw)[idx] = d;
+    return true;
+}
+
+static bool js_arr_packed_append_nomem(JSObject *p, JSValueConst val)
+{
+    uint32_t n = p->u.array.count;
+    if (n >= p->u.array.u1.size || !js_arr_packed_store_nomem(p, n, val))
+        return false;
+    p->u.array.count = n + 1;
+    return true;
+}
+
+/* Widens an int32 array to float64 (the storage moves). */
+static int js_arr_packed_widen(JSContext *ctx, JSObject *p)
+{
+    uint32_t i, count = p->u.array.count, size = p->u.array.u1.size;
+    double *nb;
+    int32_t *ob = (int32_t *)p->u.array.u.values_raw;
+
+    assert(p->arr_kind == JS_ARR_KIND_INT32);
+    if (size != 0) {
+        nb = js_malloc(ctx, sizeof(double) * size);
+        if (!nb)
+            return -1;
+        for (i = 0; i < count; i++)
+            nb[i] = (double)ob[i];
+        js_free(ctx, ob);
+        p->u.array.u.values_raw = nb;
+    }
+    p->arr_kind = JS_ARR_KIND_FLOAT64;
+    return 0;
+}
+
+/* Capacity for at least new_len elements, in the array's kind (the storage moves). */
+static int js_arr_packed_reserve(JSContext *ctx, JSObject *p, uint32_t new_len)
+{
+    uint32_t old_size = p->u.array.u1.size, new_size;
+    size_t esz = js_arr_elem_size(p);
+    void *nb;
+
+    if (unlikely(new_len > (uint32_t)INT32_MAX)) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    new_size = old_size + old_size / 2;
+    if (new_size < old_size) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    new_size = max_uint32(new_len, max_uint32(new_size, 4));
+    nb = js_realloc(ctx, p->u.array.u.values_raw, esz * new_size);
+    if (!nb)
+        return -1;
+    p->u.array.u.values_raw = nb;
+    p->u.array.u1.size = new_size;
+    return 0;
+}
+
+/* Stores a number at idx < count of a packed array, widening if needed. Returns 1 stored, 0 when the
+   value is not a number (the array is untouched; the caller unpacks), -1 out of memory. */
+static int js_arr_packed_store(JSContext *ctx, JSObject *p, uint32_t idx, JSValueConst val)
+{
+    double d;
+    if (js_arr_packed_store_nomem(p, idx, val))
+        return 1;
+    if (!js_arr_packed_num_double(val, &d))
+        return 0;
+    /* a number that is not an int32 into an int32 array */
+    if (js_arr_packed_widen(ctx, p) < 0)
+        return -1;
+    ((double *)p->u.array.u.values_raw)[idx] = d;
+    return 1;
+}
+
+/* Appends a number to a packed array. Returns 1 appended, 0 when the value is not a number, -1 out
+   of memory. */
+static int js_arr_packed_append(JSContext *ctx, JSObject *p, JSValueConst val)
+{
+    uint32_t n = p->u.array.count;
+    double d;
+    if (!js_arr_packed_num_double(val, &d))
+        return 0;
+    if (p->arr_kind == JS_ARR_KIND_INT32 && !js_arr_packed_num_int(val, &(int32_t){0}) &&
+        js_arr_packed_widen(ctx, p) < 0)
+        return -1;
+    if (n >= p->u.array.u1.size && js_arr_packed_reserve(ctx, p, n + 1) < 0)
+        return -1;
+    if (!js_arr_packed_store_nomem(p, n, val))
+        abort();
+    p->u.array.count = n + 1;
+    return 1;
+}
 #endif
 
 static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
@@ -15271,10 +15438,19 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 js_array_fill_hole(p, idx, val);
                 break;
             }
-            if (unlikely(!JS_ARR_GENERIC(p)) && js_array_ensure_generic(ctx, p) < 0) {
-                JS_FreeValue(ctx, val);
-                return -1;
+#if QJS_PACKED_ARRAYS
+            if (unlikely(!JS_ARR_GENERIC(p))) {
+                int r = js_arr_packed_store(ctx, p, idx, val);
+                if (r < 0)
+                    return -1;
+                if (r > 0)
+                    break;
+                if (js_array_ensure_generic(ctx, p) < 0) {
+                    JS_FreeValue(ctx, val);
+                    return -1;
+                }
             }
+#endif
             set_value(ctx, &JS_ARR_VALS(p)[idx], val);
             JS_ARR_PACK_TEST(ctx, p);
             break;
@@ -29568,9 +29744,16 @@ regvm_put_elem_fast(JSContext *ctx, JSValue recv, JSValue k, JSValue v)
     idx = JS_VALUE_GET_INT(k);
     if (p->class_id == JS_CLASS_ARRAY) {
         JSValue old;
-        if (unlikely(idx >= (uint32_t)p->u.array.count || p->holey ||
-                     !JS_ARR_GENERIC(p)))
+        if (unlikely(idx >= (uint32_t)p->u.array.count || p->holey))
             return 0;
+#if QJS_PACKED_ARRAYS
+        if (unlikely(!JS_ARR_GENERIC(p))) {
+            if (!js_arr_packed_store_nomem(p, idx, v))
+                return 0;
+            JS_ARR_PACK_TEST(ctx, p);
+            return 1;
+        }
+#endif
         old = JS_ARR_VALS(p)[idx];
         JS_ARR_VALS(p)[idx] = js_dup(v);
         JS_FreeValue(ctx, old);
@@ -30194,6 +30377,13 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
             AOT_PROF_ELEM(f->b, JS_ARR_VALS(p)[idx], 0);
             T_SET_NEXT_B(d,JS_ARR_VALS(p)[idx], T_SZ_RRR);
         }
+#if QJS_PACKED_ARRAYS
+        if (p->class_id == JS_CLASS_ARRAY && !JS_ARR_GENERIC(p) && idx < p->u.array.count) {
+            JSValue pv = js_arr_packed_get(p, idx);
+            AOT_PROF_ELEM(f->b, pv, 0);
+            T_SET_NEXT_B(d, pv, T_SZ_RRR);
+        }
+#endif
         {
             JSValue tv;
             if (regvm_get_elem_typed(p, idx, &tv)) {
@@ -64182,6 +64372,12 @@ __attribute__((always_inline)) int qjs_aot_get_element(JSValue recv, JSValue k, 
             *out = js_dup(JS_ARR_VALS(p)[idx]);
             return 1;
         }
+#if QJS_PACKED_ARRAYS
+        if (p->class_id == JS_CLASS_ARRAY && !JS_ARR_GENERIC(p) && idx < p->u.array.count) {
+            *out = js_arr_packed_get(p, idx);
+            return 1;
+        }
+#endif
     }
     return 0;
 }
@@ -84344,6 +84540,11 @@ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
     obj = js_create_from_ctor(ctx, new_target, JS_CLASS_ARRAY);
     if (JS_IsException(obj))
         return obj;
+#if QJS_PACKED_ARRAYS
+    if (argc == 0 && JS_VALUE_GET_OBJ(obj)->fast_array && JS_VALUE_GET_OBJ(obj)->u.array.count == 0 &&
+        JS_VALUE_GET_OBJ(obj)->u.array.u1.size == 0)
+        JS_VALUE_GET_OBJ(obj)->arr_kind = JS_ARR_KIND_INT32;
+#endif
     if (argc == 1 && JS_IsNumber(argv[0])) {
         uint32_t len;
         if (JS_ToArrayLengthFree(ctx, &len, js_dup(argv[0]), true))
@@ -85605,23 +85806,48 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
     if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT && !unshift)) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (likely(p->class_id == JS_CLASS_ARRAY &&
-                   p->fast_array && JS_ARR_GENERIC(p) &&
+                   p->fast_array &&
                    p->extensible &&
                    p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
                    ctx->std_array_prototype)) {
             uint32_t array_len, new_len;
+            int i0 = 0;
             if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
                        (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE))) {
                 array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
                 new_len = array_len + argc;
                 if (likely(array_len == p->u.array.count &&
                            new_len >= array_len && new_len <= (uint32_t)INT32_MAX)) { /* no overflow and within fast-array bounds */
+#if QJS_PACKED_ARRAYS
+                    if (unlikely(!JS_ARR_GENERIC(p))) {
+                        /* numbers stay in the packed kind; the first other value unpacks, and the
+                           rest is appended generically */
+                        int r = 1;
+                        for (i = 0; i < argc; i++) {
+                            r = js_arr_packed_append(ctx, p, argv[i]);
+                            if (r <= 0)
+                                break;
+                        }
+                        p->prop[0].u.value = js_uint32(p->u.array.count);
+                        if (r < 0)
+                            return JS_EXCEPTION;
+                        if (i == argc) {
+                            JS_ARR_PACK_TEST(ctx, p);
+                            return js_int32(p->u.array.count);
+                        }
+                        if (js_array_ensure_generic(ctx, p) < 0)
+                            return JS_EXCEPTION;
+                        array_len = p->u.array.count;
+                        new_len = array_len + (argc - i);
+                        i0 = i;
+                    }
+#endif
                     if (unlikely(new_len > p->u.array.u1.size)) {
                         if (expand_fast_array(ctx, p, new_len))
                             return JS_EXCEPTION;
                     }
-                    for(i = 0; i < argc; i++) {
-                        JS_ARR_VALS(p)[array_len + i] = js_dup(argv[i]);
+                    for(i = i0; i < argc; i++) {
+                        JS_ARR_VALS(p)[array_len + (i - i0)] = js_dup(argv[i]);
                     }
                     p->u.array.count = new_len;
                     JS_ARR_PACK_TEST(ctx, p);
