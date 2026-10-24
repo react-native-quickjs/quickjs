@@ -8119,7 +8119,7 @@ static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char
       "      { const unsigned char *_ap = (const unsigned char *)JS_VALUE_GET_PTR(v%u);\n"
       "        if (__builtin_expect(*(const uint16_t *)(_ap + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
       "                QJS_AOT_CLASS_ARRAY ||\n"
-      "            (_ap[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK), 0)) %s;\n"
+      "            QJS_AOT_ARR_ODD(_ap), 0)) %s;\n"
       "        ap%u = *(JSValue *const *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES);\n"
       "        an%u = *(const uint32_t *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); }\n",
       (unsigned)av, fail, (unsigned)av, fail, (unsigned)root, (unsigned)root);

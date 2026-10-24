@@ -2045,6 +2045,17 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_array_iter_obj, lay.off_array_iter_kind, lay.off_array_iter_idx,
           lay.array_iter_kind_value, lay.off_cfunc_cproto, lay.cfunc_cproto_iterator_next,
           lay.cfunc_cproto_generic_magic);
+      /* Arrays that may hold int32 or double elements: every inline access of an array's elements
+         refuses one whose kind byte is not zero, with the test it already has for a holey array. */
+      fprintf(lf,
+          "#define QJS_AOT_PACKED_ARRAYS %uu\n"
+          "#define QJS_AOT_OFF_JSOBJECT_ARR_KIND %uu\n"
+          "#if QJS_AOT_PACKED_ARRAYS\n"
+          "#define QJS_AOT_ARR_ODD(p_) (((p_)[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) | (p_)[QJS_AOT_OFF_JSOBJECT_ARR_KIND])\n"
+          "#else\n"
+          "#define QJS_AOT_ARR_ODD(p_) ((p_)[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK)\n"
+          "#endif\n",
+          lay.packed_arrays, lay.off_object_arr_kind);
       fclose(lf);
     }
 
@@ -3181,8 +3192,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      QJS_AOT_CLASS_ARRAY)\n"
         "    return q2_ta_get(p, *(const uint16_t *)(p + "
         "QJS_AOT_OFF_JSOBJECT_CLASS_ID), i, out);\n"
-        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
-        "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (QJS_AOT_ARR_ODD(p)) return 0;\n"
         "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
         "return 0;\n"
         "  v = (*(JSValue *const *)(p + "
@@ -3219,8 +3229,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
         "    return 0;\n"
-        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
-        "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (QJS_AOT_ARR_ODD(p)) return 0;\n"
         "  r->vals = *(const unsigned char *const *)(p + "
         "QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES);\n"
         "  r->count = *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n"
@@ -3277,8 +3286,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
         "    return qjs_aot_typed_put(arr, i, v);\n"
-        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
-        "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (QJS_AOT_ARR_ODD(p)) return 0;\n"
         "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
         "return 0;\n"
         "  slot = &(*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
@@ -3306,6 +3314,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  i = (uint32_t)JS_VALUE_GET_INT(k);\n"
         "  count = *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n"
         "  if (i != count) return 0;\n"
+        "  if (QJS_AOT_PACKED_ARRAYS && p[QJS_AOT_OFF_JSOBJECT_ARR_KIND]) return 0;\n"
         "  if (!(p[QJS_AOT_OFF_JSOBJECT_EXT_BYTE] & QJS_AOT_JSOBJECT_EXT_MASK) ||\n"
         "      !(p[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK))\n"
         "    return 0;\n"
@@ -3346,7 +3355,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  ap = (const unsigned char *)JS_VALUE_GET_PTR(ao);\n"
         "  if (*(const uint16_t *)(ap + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_ARRAY ||\n"
         "      !(ap[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK) ||\n"
-        "      (ap[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK))\n"
+        "      QJS_AOT_ARR_ODD(ap))\n"
         "    return 0;\n"
         "  idx = *(const uint32_t *)(pi + QJS_AOT_OFF_ARRAY_ITER_IDX);\n"
         "  if (idx >= *(const uint32_t *)(ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) return 0;\n"
@@ -3376,6 +3385,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "static inline __attribute__((always_inline)) int q2_array_plain(JSContext *ctx, const unsigned char *p, uint32_t *count, JSValue **lenp)\n"
         "{\n"
         "  const unsigned char *c = (const unsigned char *)ctx;\n"
+        "  if (QJS_AOT_PACKED_ARRAYS && p[QJS_AOT_OFF_JSOBJECT_ARR_KIND]) return 0;\n"
         "  if (!(p[QJS_AOT_OFF_JSOBJECT_EXT_BYTE] & QJS_AOT_JSOBJECT_EXT_MASK) ||\n"
         "      !(p[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK))\n"
         "    return 0;\n"
@@ -3411,7 +3421,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT || !q2_builtin_is(callee, &e_arrpop_fn, 1)) return 0;\n"
         "  p = (unsigned char *)JS_VALUE_GET_PTR(arr);\n"
         "  if (!q2_array_plain(ctx, p, &count, &lenp) || count == 0) return 0;\n"
-        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (QJS_AOT_ARR_ODD(p)) return 0;\n"
         "  v = (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count - 1];\n"
         "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON || JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
         "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count - 1;\n"
@@ -3784,8 +3794,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
         "      QJS_AOT_CLASS_ARRAY)\n"
         "    return 0;\n"
-        "  if (p[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & "
-        "QJS_AOT_JSOBJECT_HOLEY_MASK) return 0;\n"
+        "  if (QJS_AOT_ARR_ODD(p)) return 0;\n"
         "  if (i >= *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT)) "
         "return 0;\n"
         "  slot = &(*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
