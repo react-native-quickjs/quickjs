@@ -1,0 +1,198 @@
+Subject: Array.prototype.sort with a subtraction comparator sorts the numbers directly
+
+What this does
+  - `js_array_cmp_numeric_shape` recognises a comparator whose register program is exactly
+    `get_arg2`, one `sub` of the two argument registers and `return` of its result, with two
+    arguments and no captures. It returns +1 for `a - b` and -1 for `b - a`.
+  - `js_array_sort_numeric` takes that comparator when the receiver is a generic fast array
+    with no holes, at least as long as the length, and every element is an int or a float64
+    that is not NaN. It copies the elements to a `double` array, sorts that with a stable
+    merge sort (ascending or descending), and writes the values back to the elements.
+  - An int element stays an int when the value still fits and is not -0; every other value
+    becomes a float64. A -0 element keeps its sign, which is why the int test excludes it.
+  - Every other case takes the existing route unchanged: a comparator that is not that
+    shape, a hole, a non-number element, any NaN, a packed array, an array-like receiver, a
+    length the element storage does not cover, or `sort` replaced on the prototype.
+
+Why we need it
+  `a.sort((x, y) => x - y)` on a number array called the comparator through the whole
+  function entry for every comparison and then wrote every element back through
+  `JS_SetPropertyInt64`. Of sortcmp's instructions, 39.5% went to
+  `js_array_cmp_generic`, 24.3% to the compiled comparator, and 14.4% to the sort's own
+  element shuffling. sortcmp (400 numbers, 1200 sorts, `x - y`) went from 675.7 M
+  instructions to 144.8 M.
+
+Hazards
+  - A NaN in the array takes the generic route: `a - b` is inconsistent with NaN, so a
+    total order over doubles would not reproduce the engine's answer.
+  - `-0` and `+0` compare equal under `a - b`; the merge sort is stable, so their relative
+    order is the one the generic sort produces, and the test pins the exact sequence.
+  - The fast path is taken only when `Array.prototype.sort` is the builtin, which the
+    dispatch of the builtin itself already establishes, and only for a value the engine
+    holds as a bytecode function; a callable proxy or a bound function is refused by the
+    class test.
+
+Test files: `.local/kit/sortcmp2.js`, `.local/kit/sortcmp.js`.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -87120,0 +87121,137 @@
++/* A comparator written as exactly `(a, b) => a - b` or `(a, b) => b - a` compiles to a
++   register program of one `get_arg` pair, one `sub` and one `return`, and captures
++   nothing. `1` is ascending, `-1` descending, `0` for any other program. */
++static int js_array_cmp_numeric_shape(JSFunctionBytecode *b)
++{
++    const uint8_t *c;
++    int len, p, sz, op;
++    int ra0, ra1, sub_d, sub_l, sub_r;
++
++    if (b->regvm_code == NULL || b->regvm_len <= 0 || b->arg_count != 2 ||
++        b->args_captured)
++        return 0;
++    c = b->regvm_code;
++    len = b->regvm_len;
++    /* get_arg2: the two argument slots, in the order the source named them */
++    p = 0;
++    op = c[p];
++    sz = (op < ROP_COUNT && regvm_rop_fmt[op]) ?
++         regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op) : -1;
++    if (op != ROP_get_arg2 || sz != 8 || p + 1 + sz >= len)
++        return 0;
++    ra0 = regvm_ld_u16(c + p + 1);
++    ra1 = regvm_ld_u16(c + p + 5);
++    if (regvm_ld_u16(c + p + 3) != 0 || regvm_ld_u16(c + p + 7) != 1)
++        return 0; /* the arguments, in order */
++    p += 1 + sz;
++    /* sub: one source is each argument's register and nothing else happens */
++    op = c[p];
++    sz = (op < ROP_COUNT && regvm_rop_fmt[op]) ?
++         regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op) : -1;
++    if (op != ROP_sub || sz != 6 || p + 1 + sz + 3 != len)
++        return 0;
++    sub_d = regvm_ld_u16(c + p + 1);
++    sub_l = regvm_ld_u16(c + p + 3);
++    sub_r = regvm_ld_u16(c + p + 5);
++    if (!((sub_l == ra0 && sub_r == ra1) || (sub_l == ra1 && sub_r == ra0)))
++        return 0;
++    p += 1 + sz;
++    /* return: of the subtraction's register */
++    if (c[p] != ROP_return || regvm_ld_u16(c + p + 1) != sub_d)
++        return 0;
++    /* `sub` subtracts its second source from its first: a - b ascends, b - a descends */
++    return (sub_l == ra0) ? 1 : -1;
++}
++
++/* Sorts `n` doubles, keeping equal values in their order: `tmp` is scratch of `n`
++   elements. A NaN is never present, so every comparison is a total order. */
++static void js_array_merge_sort_num(double *a, double *tmp, uint32_t n, int sign)
++{
++    uint32_t width, i, lo, mid, hi, l, r, k;
++
++    for (width = 1; width < n; width *= 2) {
++        for (lo = 0; lo < n; lo += 2 * width) {
++            mid = lo + width < n ? lo + width : n;
++            hi = lo + 2 * width < n ? lo + 2 * width : n;
++            if (mid >= hi)
++                continue;
++            l = lo;
++            r = mid;
++            k = lo;
++            while (l < mid && r < hi) {
++                /* stability: the left run wins a tie */
++                if ((sign > 0 ? a[l] <= a[r] : a[l] >= a[r]))
++                    tmp[k++] = a[l++];
++                else
++                    tmp[k++] = a[r++];
++            }
++            while (l < mid)
++                tmp[k++] = a[l++];
++            while (r < hi)
++                tmp[k++] = a[r++];
++            memcpy(a + lo, tmp + lo, (size_t)(hi - lo) * sizeof(a[0]));
++        }
++    }
++}
++/* The numeric fast path: every element of `obj` is a number, there is no hole and no
++   NaN, and the comparator is the subtraction one. The doubles are sorted directly and
++   written back, so the comparator never runs. Returns 1 when it sorted, 0 when the
++   caller must take the generic route, -1 on an exception. */
++static int js_array_sort_numeric(JSContext *ctx, JSValueConst obj, int64_t len,
++                                 int sign)
++{
++    JSValue *arrp;
++    uint32_t count, i;
++    double *vals, *tmp;
++    JSObject *p;
++
++    if (len <= 0)
++        return 1;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || !JS_ARR_GENERIC(p))
++        return 0;
++    if (p->holey || !js_get_fast_array(ctx, obj, &arrp, &count) || count != (uint32_t)len)
++        return 0;
++    for (i = 0; i < count; i++) {
++        if (JS_VALUE_GET_TAG(arrp[i]) == JS_TAG_INT)
++            continue;
++        if (JS_VALUE_GET_TAG(arrp[i]) != JS_TAG_FLOAT64)
++            return 0;
++        if (isnan(JS_VALUE_GET_FLOAT64(arrp[i])))
++            return 0;
++    }
++    vals = js_malloc(ctx, sizeof(vals[0]) * (size_t)count);
++    if (!vals)
++        return -1;
++    tmp = js_malloc(ctx, sizeof(tmp[0]) * (size_t)count);
++    if (!tmp) {
++        js_free(ctx, vals);
++        return -1;
++    }
++    for (i = 0; i < count; i++) {
++        if (JS_VALUE_GET_TAG(arrp[i]) == JS_TAG_INT)
++            vals[i] = (double)JS_VALUE_GET_INT(arrp[i]);
++        else
++            vals[i] = JS_VALUE_GET_FLOAT64(arrp[i]);
++    }
++    js_array_merge_sort_num(vals, tmp, count, sign);
++    /* write back in the element kind the array already has */
++    for (i = 0; i < count; i++) {
++        JSValue nv;
++
++        /* an int stays an int, but -0 has to stay a double: an int 0 has no sign */
++        if (JS_VALUE_GET_TAG(arrp[i]) == JS_TAG_INT && !signbit(vals[i]) &&
++            vals[i] >= INT32_MIN && vals[i] <= INT32_MAX &&
++            (double)(int32_t)vals[i] == vals[i])
++            nv = JS_MKVAL(JS_TAG_INT, (int32_t)vals[i]);
++        else
++            nv = JS_NewFloat64(ctx, vals[i]);
++        JS_FreeValue(ctx, arrp[i]);
++        arrp[i] = nv;
++    }
++    js_free(ctx, vals);
++    js_free(ctx, tmp);
++    return 1;
++}
+@@ -87289,0 +87427,21 @@
++    if (asc.has_method) {
++        /* Array.prototype.sort unmodified, so the fast path cannot change what the
++           property means, and a comparator that is exactly a subtraction */
++        int shape = 0;
++
++        if (JS_VALUE_GET_TAG(asc.method) == JS_TAG_OBJECT &&
++            JS_VALUE_GET_OBJ(asc.method)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++            JSFunctionBytecode *b = JS_VALUE_GET_OBJ(asc.method)->u.func.function_bytecode;
++
++            if (b->func_kind == JS_FUNC_NORMAL && !b->is_lazy)
++                shape = js_array_cmp_numeric_shape(b);
++        }
++        if (shape != 0) {
++            int nr = js_array_sort_numeric(ctx, obj, len, shape);
++
++            if (nr < 0)
++                goto exception;
++            if (nr > 0)
++                return obj;
++        }
++    }
