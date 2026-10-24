@@ -7868,14 +7868,44 @@ static int emit_group_this_read(
   }
   e_group_test(
       test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, "_t", g, site, 0);
-  fprintf(
-      f,
-      "    { JSValue _t = %s, _f;\n"
-      "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
-      "      if (__builtin_expect(%s, 0)) goto vx_%d;\n"
-      "      _f = *%s(_t, q2_cell_off(pic, %s));\n",
-      g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)", in->pc,
-      test, in->pc, e_slotfn(site), e_cellidx(cib, sizeof(cib), site));
+  {
+    /* An own data-property read keeps the shape and offset it last accepted, captured
+       TOGETHER by an access that passed the full check: a hit is one shape compare and the
+       slot load from the receiver. The pair starts NULL -- a shape no object has -- so an
+       empty one always misses and refills.
+       ONLY for an own read. A prototype read takes its value from the HOLDER's property
+       array (`q2_hslotp`/`q2_hslot2p`), so its offset belongs to a different object than the
+       shape the compare names; caching that pair would read the receiver's array at the
+       holder's offset, which is a wrong answer rather than a slow one. Those sites keep the
+       cell path exactly as it was. */
+    int protoc = e_facts_site_proto(g_e_facts, site);
+    if (protoc == 0) {
+      fprintf(
+          f,
+          "    { JSValue _t = %s, _f;\n"
+          "      static const void *q2_s1_%d; static uint32_t q2_o1_%d;\n"
+          "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
+          "      if (__builtin_expect(q2_shape_of(_t) == q2_s1_%d, 1)) {\n"
+          "        _f = *q2_slotp(_t, q2_o1_%d);\n"
+          "      } else {\n"
+          "      if (__builtin_expect(%s, 0)) goto vx_%d;\n"
+          "      { uint32_t _o = q2_cell_off(pic, %s);\n"
+          "        _f = *q2_slotp(_t, _o);\n"
+          "        q2_s1_%d = q2_shape_of(_t); q2_o1_%d = _o; }\n"
+          "      }\n",
+          g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)", site, site, in->pc, site, site, test, in->pc,
+          e_cellidx(cib, sizeof(cib), site), site, site);
+    } else {
+      fprintf(
+          f,
+          "    { JSValue _t = %s, _f;\n"
+          "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
+          "      if (__builtin_expect(%s, 0)) goto vx_%d;\n"
+          "      _f = *%s(_t, q2_cell_off(pic, %s));\n",
+          g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)", in->pc, test, in->pc, e_slotfn(site),
+          e_cellidx(cib, sizeof(cib), site));
+    }
+  }
   if (!g_e_nolazy)
     fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
