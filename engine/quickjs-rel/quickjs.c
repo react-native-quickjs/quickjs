@@ -63606,12 +63606,38 @@ static uint32_t js_aot_unit_layout_hash(void)
     return l.hash;
 }
 
+/* A unit that is linked but refused leaves the program running in the
+   interpreter, which is correct but several times slower, and nothing about the
+   run says so. That silence cost a day: a Release engine and a Debug engine
+   disagree on sizeof(JSString), so every unit was refused and the only symptom
+   was an instruction count six times too high. One line, once, on stderr is
+   worth the branch -- and it names both hashes, so the reason is visible
+   without a debugger. */
+static int aot_unit_refused_reported;
+
 static int aot_unit_present(void)
 {
 #if defined(__GNUC__)
-    return (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL) &&
-           qjs_aot_abi == QJS_AOT_ABI &&
-           qjs_aot_layout == js_aot_unit_layout_hash();
+    int has_unit = (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL);
+
+    if (!has_unit)
+        return 0;
+    if (qjs_aot_abi == QJS_AOT_ABI && qjs_aot_layout == js_aot_unit_layout_hash())
+        return 1;
+    if (!aot_unit_refused_reported) {
+        aot_unit_refused_reported = 1;
+        if (qjs_aot_abi != QJS_AOT_ABI)
+            fprintf(stderr,
+                    "quickjs: AOT unit refused: ABI mismatch (unit %u, engine %u)\n",
+                    (unsigned)qjs_aot_abi, (unsigned)QJS_AOT_ABI);
+        else
+            fprintf(stderr,
+                    "quickjs: AOT unit refused: engine layout mismatch "
+                    "(unit %u, engine %u)\n",
+                    (unsigned)qjs_aot_layout,
+                    (unsigned)js_aot_unit_layout_hash());
+    }
+    return 0;
 #else
     return 0;
 #endif

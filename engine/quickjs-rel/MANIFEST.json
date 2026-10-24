@@ -1535,12 +1535,16 @@
       "sha256": "8680fb57f17defffc2bac2cc0219e34a2352f404df0034f3a12195251266d1a5"
     },
     {
+      "name": "0390-aot-refusal-line.patch",
+      "sha256": "83fb3351d30bfe06e5cccf83b8b661fa455f1132c87c09a3fda9028d1272ac45"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "ec75e7bae7e271fb74e91853261108280563c8f3717c258a8aee61eb6e79e611",
+    "quickjs.c": "ba7534e9936020928f2be10364d0fb1e3a1d263a1a42df54ea773247a304006f",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

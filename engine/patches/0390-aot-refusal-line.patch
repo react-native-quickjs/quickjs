@@ -1,0 +1,69 @@
+Subject: engine: a refused AOT unit says why, once
+
+What this does
+  aot_unit_present reports the reason before it returns zero: one line on stderr
+  naming the cause and both hashes, for an ABI mismatch or a layout mismatch.
+  The flag that guards it keeps it to one line per process.
+
+Why we need it
+  A unit that is linked but refused is not an error the program can see. The
+  engine falls back to the interpreter, which is correct and several times
+  slower, with no diagnostic anywhere: the only symptom of a Release engine
+  refusing a Debug build's unit was an instruction count six times too high, and
+  finding the cause took a day of disassembly. The condition is always a
+  misbuilt binary, and the hashes are the whole diagnosis.
+
+Hazards
+  The message goes to stderr at the first binding attempt, which is the first
+  compiled call, not at init: a run that never reaches a compiled function never
+  prints it. Nothing else changes -- the return value, the binding table and the
+  fallback path are as they were.
+
+Tests: a refusal is forced by linking a unit whose layout hash is wrong and the
+line is checked, once per process; the kit outputs for richards, deltablue, nbody
+and raytrace are unchanged, and no line is printed when the unit binds.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63597,12 +63597,38 @@
+     return l.hash;
+ }
+ 
++/* A unit that is linked but refused leaves the program running in the
++   interpreter, which is correct but several times slower, and nothing about the
++   run says so. That silence cost a day: a Release engine and a Debug engine
++   disagree on sizeof(JSString), so every unit was refused and the only symptom
++   was an instruction count six times too high. One line, once, on stderr is
++   worth the branch -- and it names both hashes, so the reason is visible
++   without a debugger. */
++static int aot_unit_refused_reported;
++
+ static int aot_unit_present(void)
+ {
+ #if defined(__GNUC__)
+-    return (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL) &&
+-           qjs_aot_abi == QJS_AOT_ABI &&
+-           qjs_aot_layout == js_aot_unit_layout_hash();
++    int has_unit = (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL);
++
++    if (!has_unit)
++        return 0;
++    if (qjs_aot_abi == QJS_AOT_ABI && qjs_aot_layout == js_aot_unit_layout_hash())
++        return 1;
++    if (!aot_unit_refused_reported) {
++        aot_unit_refused_reported = 1;
++        if (qjs_aot_abi != QJS_AOT_ABI)
++            fprintf(stderr,
++                    "quickjs: AOT unit refused: ABI mismatch (unit %u, engine %u)\n",
++                    (unsigned)qjs_aot_abi, (unsigned)QJS_AOT_ABI);
++        else
++            fprintf(stderr,
++                    "quickjs: AOT unit refused: engine layout mismatch "
++                    "(unit %u, engine %u)\n",
++                    (unsigned)qjs_aot_layout,
++                    (unsigned)js_aot_unit_layout_hash());
++    }
++    return 0;
+ #else
+     return 0;
+ #endif
