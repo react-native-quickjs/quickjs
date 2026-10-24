@@ -1,13 +1,22 @@
-# Runs the linked binary on a kernel that must reach compiled code, with the
-# unit statistics on, and requires the unit to be bound and entered. A refused
-# or dropped unit leaves unit=0 / enter=0 and the program still succeeds, which
-# is exactly why this asserts on the statistics rather than on the exit code.
+# The AOT product path must BIND the unit.
+#
+# The engine refers to `qjs_aot_table` weakly, so that a build with no unit
+# still links. A weak undefined reference does not pull its member out of a
+# static archive, so the unit is compiled, archived, and then dropped: the
+# binary links, exits 0, and silently runs the interpreter. Naming the symbol
+# on the link line is what forces the member in.
+#
+# The test runs the linked binary on a kernel that reaches compiled code with
+# the unit statistics on, and requires the unit to be bound AND entered: a
+# dropped unit leaves unit=0 / enter=0 while still exiting 0, which is exactly
+# why this asserts on the statistics and not on the exit code.
 if(NOT EXISTS "${BIN}")
   message(FATAL_ERROR "aot_unit_binds: no binary at ${BIN}")
 endif()
 
 execute_process(
-  COMMAND "${CMAKE_COMMAND}" -E env QJS_AOT_STATS=1 "${BIN}" "${ROOT}/tools/aot/kernels2/02-loops.js"
+  COMMAND "${CMAKE_COMMAND}" -E env QJS_AOT_STATS=1 "${BIN}"
+          "${ROOT}/tools/aot/kernels2/02-loops.js"
   OUTPUT_VARIABLE out
   ERROR_VARIABLE err
   RESULT_VARIABLE rc)
