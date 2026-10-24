@@ -2049,14 +2049,18 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.array_iter_kind_value, lay.off_cfunc_cproto, lay.cfunc_cproto_iterator_next,
           lay.cfunc_cproto_generic_magic);
       /* Arrays that may hold int32 or double elements: every inline access of an array's elements
-         refuses one whose kind byte is not zero, with the test it already has for a holey array. */
+         refuses one whose kind byte is not zero. A holey array is the case the element path meets
+         most often, so its byte is tested first and the kind byte only when that byte is clear:
+         ORing the two loads together costs a third instruction on every element and decides no
+         test the two tests do not already decide. */
       fprintf(lf,
           "#define QJS_AOT_PACKED_ARRAYS %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_ARR_KIND %uu\n"
+          "#define QJS_AOT_ARR_HOLES(p_) ((p_)[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK)\n"
           "#if QJS_AOT_PACKED_ARRAYS\n"
-          "#define QJS_AOT_ARR_ODD(p_) (((p_)[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK) | (p_)[QJS_AOT_OFF_JSOBJECT_ARR_KIND])\n"
+          "#define QJS_AOT_ARR_ODD(p_) (QJS_AOT_ARR_HOLES(p_) || (p_)[QJS_AOT_OFF_JSOBJECT_ARR_KIND] != 0)\n"
           "#else\n"
-          "#define QJS_AOT_ARR_ODD(p_) ((p_)[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK)\n"
+          "#define QJS_AOT_ARR_ODD(p_) QJS_AOT_ARR_HOLES(p_)\n"
           "#endif\n",
           lay.packed_arrays, lay.off_object_arr_kind);
       fclose(lf);
