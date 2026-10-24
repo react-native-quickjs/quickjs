@@ -72,6 +72,42 @@ CMake:
 cmake -DQJS_REGVM=ON -DQJS_AOT=ON -DQJS_AOT_UNIT=$PWD/aot_unit.c ...
 ```
 
+### ThinLTO: recommended for release builds and CI
+
+Add `-DQJS_AOT_LTO=ON` to put the engine and the unit in one module at link
+time:
+
+```
+cmake -DQJS_REGVM=ON -DQJS_AOT=ON -DQJS_AOT_LTO=ON \
+      -DQJS_AOT_UNIT=$PWD/aot_unit.c ...
+```
+
+The unit calls an engine runtime stub on every slow path, inline-cache miss and
+generic operation. Compiled as separate objects those calls are opaque, so no
+stub is ever inlined or specialised for the site that reaches it. With ThinLTO
+the engine's stubs inline into generated code: `qjs_aot_step` and
+`qjs_aot_set_reg_p` disappear entirely, and the unit's calls into the engine
+drop by about two thirds. Measured on four benchmark kernels that is 6.1% fewer
+instructions and 5.3% fewer cycles in geomean, with no kernel slower.
+
+It needs clang and lld; the option refuses any other compiler rather than
+silently ignoring LTO. Compile time is roughly unchanged -- the unit lowers to
+bitcode faster and the link does the rest -- and the peak memory of a single
+compile drops, which matters when several units build in parallel.
+
+Two flags are added to the **link** command by the option, not just the compile
+command:
+
+- `-mbranches-within-32B-boundaries`, the JCC erratum workaround. LTO generates
+  code at link time, so a flag given only at compile time never reaches the
+  backend. A link without it executes 4.4% *fewer* instructions and runs 2.2%
+  *slower*.
+- `-ffp-contract=off`, so floating-point results are identical to the
+  non-LTO build.
+
+The measurement harness audits a built binary for the first of these and fails
+rather than report a number taken from a link that lost it.
+
 ## 3. Selection and budget
 
 `qjsaot --profile` ranks functions by profiled ops, takes the prefix covering

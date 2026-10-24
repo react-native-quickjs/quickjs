@@ -133,6 +133,20 @@ if(QJS_AOT)
     # The unit includes quickjs-aot-layout.h, which qjsaot writes next to it.
     get_filename_component(QJS_AOT_UNIT_DIR "${QJS_AOT_UNIT}" DIRECTORY)
     target_include_directories(quickjs PRIVATE "${QJS_AOT_UNIT_DIR}")
+
+    # The engine refers to the unit's `qjs_aot_table` WEAKLY, so that a build
+    # with no unit still links. A weak undefined reference does not pull its
+    # archive member out of a static library, and the unit is one member of
+    # libquickjs.a: the linker leaves it out, the weak reference stays null, and
+    # the binary silently runs the interpreter with the unit compiled but never
+    # bound. Nothing warns and the exit status is 0.
+    #
+    # Naming the symbol undefined on the link line forces the member in. It is
+    # set only when a unit is actually configured, because an unresolved `-u`
+    # is a hard link error -- which is the right way for the no-unit case to
+    # stay correct rather than to become a warning nobody reads.
+    set_property(TARGET quickjs APPEND PROPERTY
+      INTERFACE_LINK_OPTIONS "-Wl,-u,qjs_aot_table")
   endif()
 endif()
 
@@ -148,6 +162,76 @@ if(QJS_AOT_PROFILE)
     message(FATAL_ERROR "QJS_AOT_PROFILE=ON requires QJS_REGVM=ON")
   endif()
   target_compile_definitions(quickjs PUBLIC QJS_AOT_PROFILE=1)
+endif()
+
+# ThinLTO across the engine and the AOT unit (`QJS_AOT_LTO=ON`), off by default.
+#
+# The generated unit calls the engine's runtime stubs on every slow path, IC
+# miss and generic operation. Compiled as separate objects those calls are
+# opaque, so a stub is never inlined and never specialised for the call site
+# that reaches it. ThinLTO puts the engine and the unit in one module at link
+# time: `qjs_aot_step` and `qjs_aot_set_reg_p` disappear into their callers
+# entirely, and the unit's calls to engine helpers drop by about two thirds.
+# Measured on the four kit kernels, that is 6.1% fewer instructions and 5.3%
+# fewer cycles in geomean, with no kernel slower (see .local/specs/PGO-LTO.md).
+#
+# RECOMMENDED for release builds and CI. It needs clang and lld; GCC's LTO is
+# a different beast and is refused rather than silently ignored.
+#
+# The two flags this tree depends on for correct measurements are added to the
+# LINK command as well as the compile command. LTO defers code generation to
+# the link, so a flag given only at compile time never reaches the backend --
+# a link without -mbranches-within-32B-boundaries produces a binary that runs
+# 2.2% slower on the same instruction count, which is exactly the JCC erratum
+# this tree pins that flag to prevent.
+option(QJS_AOT_LTO "Build the engine and the AOT unit with ThinLTO" OFF)
+if(QJS_AOT_LTO)
+  # check_c_compiler_flag() is also used further down for the non-LTO case; the
+  # module has to be included before the first use, and this option comes first.
+  include(CheckCCompilerFlag)
+  if(NOT QJS_AOT)
+    message(FATAL_ERROR
+      "QJS_AOT_LTO=ON requires QJS_AOT=ON: ThinLTO is here to let the generated "
+      "unit and the engine see each other, which needs a unit to link.")
+  endif()
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR
+      "QJS_AOT_LTO=ON requires clang (found ${CMAKE_C_COMPILER_ID}).")
+  endif()
+  if(NOT CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+    message(FATAL_ERROR
+      "QJS_AOT_LTO=ON requires clang 13 or newer (found "
+      "${CMAKE_C_COMPILER_VERSION}).")
+  endif()
+
+  # The engine and the unit are both bitcode until the link.
+  set_target_properties(quickjs PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+  target_compile_options(quickjs PRIVATE -flto=thin)
+
+  # An archive of bitcode needs the plugin at link time and, for a static
+  # library, "thin" archives so the linker can see the members.
+  set_property(TARGET quickjs APPEND PROPERTY
+    INTERFACE_LINK_OPTIONS -flto=thin -fuse-ld=lld)
+
+  # The measurement flags, repeated where LTO's code generation actually runs.
+  # -ffp-contract=off is not decoration: it is what keeps floating-point
+  # results identical between the LTO and non-LTO builds.
+  set_property(TARGET quickjs APPEND PROPERTY
+    INTERFACE_LINK_OPTIONS -ffp-contract=off)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$"
+     AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    check_c_compiler_flag(-mbranches-within-32B-boundaries QJS_HAVE_JCC_ALIGN)
+    if(QJS_HAVE_JCC_ALIGN)
+      set_property(TARGET quickjs APPEND PROPERTY
+        INTERFACE_LINK_OPTIONS -mbranches-within-32B-boundaries)
+    else()
+      message(FATAL_ERROR
+        "QJS_AOT_LTO=ON needs -mbranches-within-32B-boundaries on x86: without "
+        "it on the link command the JCC erratum costs up to 2% cycles at an "
+        "identical instruction count, and the measurements this option exists "
+        "to serve are meaningless.")
+    endif()
+  endif()
 endif()
 
 # Lazy JSON is opt-in for applications. Android and CocoaPods derive this
