@@ -5611,7 +5611,9 @@ static int emit_inl_nested_call(
     else
     fprintf(
         f,
-        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1)) "
+        "    { static const void *q2_cc_%d;\n"
+        "    if (__builtin_expect(q2_call_entry_c(%s, (const void *)aot_f_%s, "
+        "&q2_cc_%d), 1)) "
         "{\n"
         "        JSValue _o;\n%s"
         "%s        _o = aot_n_%s(ctx, caller_f,\n"
@@ -5619,7 +5621,8 @@ static int emit_inl_nested_call(
         "            %s, %d);\n"
         "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
         "%s\n",
-        cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
+        in->pc, cexp, callee[k], in->pc, ib, pushr, callee[k], cexp, recv, winp, na, popr,
+        excret);
     g_e_inl_dirty = 1;
     if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
       /* The owned result parks in the published window, then its count is dropped (the
@@ -5642,7 +5645,7 @@ static int emit_inl_nested_call(
        so an exit here carries the result. */
     if (g_e_epoch_skip || g_e_nolazy) e_store_typed_def(f, fn, in, t, dv);
     e_emit_group_recheck(f, fn, in, cur);
-    fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
+    fprintf(f, "        goto cd_%d;\n    }\n    }\n#endif\n", in->pc);
   }
   /* No candidate matched. A frameless body that is not inlined calls any other
      function through the engine, so a changed callee costs the call and not the
