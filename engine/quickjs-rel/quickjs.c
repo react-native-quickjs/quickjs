@@ -123,6 +123,12 @@ typedef struct JSRegRCC JSRegRCC;
    stay a plain expression. */
 #define REGVM_FAST_HANDLER(name) regvm_t_##name
 
+/* Packed array element kinds (int32 and float64 arrays without a JSValue per element). Off by
+   default: the build is then the one without the feature. */
+#ifndef QJS_PACKED_ARRAYS
+#define QJS_PACKED_ARRAYS 0
+#endif
+
 /* Deferred reference counting. QJS_DRC enables the machinery (ZCT, reconcile,
    register-root scanning); QJS_DRC_VALIDATE adds the debug root validator. */
 #ifndef QJS_DRC
@@ -2322,6 +2328,7 @@ struct JSObject {
                                     before class_id, which does not move. */
     uint16_t class_id; /* see JS_CLASS_x */
     uint8_t values_inline;
+    uint8_t arr_kind; /* JS_CLASS_ARRAY only: JS_ARR_KIND_* (see QJS_PACKED_ARRAYS); always 0 unless the flag is on */
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
     JSProperty *prop; /* array of properties */
@@ -2373,7 +2380,11 @@ struct JSObject {
                 struct JSTypedArray *typed_array; /* JS_CLASS_UINT8C_ARRAY..JS_CLASS_FLOAT64_ARRAY */
             } u1;
             union {
+#if QJS_PACKED_ARRAYS
+                void *values_raw;       /* JS_CLASS_ARRAY (any arr_kind), JS_CLASS_ARGUMENTS: use JS_ARR_VALS / JS_ARR_RAW */
+#else
                 JSValue *values;        /* JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS */
+#endif
                 JSVarRef **var_refs;    /* JS_CLASS_MAPPED_ARGUMENTS */
                 void *ptr;              /* JS_CLASS_UINT8C_ARRAY..JS_CLASS_FLOAT64_ARRAY */
                 int8_t *int8_ptr;       /* JS_CLASS_INT8_ARRAY */
@@ -2399,6 +2410,81 @@ struct JSObject {
 
 _Static_assert(sizeof(((JSObject *)0)->u.array) <= sizeof(((JSObject *)0)->u.func),
                "u.array outgrew u.func");
+
+/* Array storage kinds. With QJS_PACKED_ARRAYS off every array is generic (a JSValue array) and
+   nothing below costs anything. With it on, a JS_CLASS_ARRAY object may hold int32_t or double
+   elements instead (arr_kind), without holes, lazy markers or references; every code path that
+   wants JSValue elements first calls js_array_ensure_generic(), which converts in place. */
+enum { JS_ARR_KIND_GENERIC = 0, JS_ARR_KIND_INT32 = 1, JS_ARR_KIND_FLOAT64 = 2 };
+#if QJS_PACKED_ARRAYS
+static inline JSValue **js_arr_valsp(JSObject *p)
+{
+    assert(p->arr_kind == JS_ARR_KIND_GENERIC);
+    return (JSValue **)&p->u.array.u.values_raw;
+}
+#define JS_ARR_VALS(p) (*js_arr_valsp(p))
+#define JS_ARR_RAW(p) ((p)->u.array.u.values_raw)
+#define JS_ARR_RAW_MEMBER u.array.u.values_raw
+#else
+#define JS_ARR_VALS(p) ((p)->u.array.u.values)
+#define JS_ARR_RAW(p) ((void *)(p)->u.array.u.values)
+#define JS_ARR_RAW_MEMBER u.array.u.values
+#endif
+
+#if QJS_PACKED_ARRAYS
+static int js_array_unpack(JSContext *ctx, JSObject *p);
+/* Makes the array's storage a JSValue array (see above). Returns 0, or -1 with an exception pending
+   when the new storage cannot be allocated. A packed array holds no references, so nothing is
+   released or retained by the conversion. */
+static inline int js_array_ensure_generic(JSContext *ctx, JSObject *p)
+{
+    return likely(p->arr_kind == JS_ARR_KIND_GENERIC) ? 0 : js_array_unpack(ctx, p);
+}
+static inline size_t js_arr_elem_size(const JSObject *p)
+{
+    return p->arr_kind == JS_ARR_KIND_INT32 ? sizeof(int32_t) :
+           p->arr_kind == JS_ARR_KIND_FLOAT64 ? sizeof(double) : sizeof(JSValue);
+}
+/* The element `idx` (< count) of a packed array as a value (no reference to release). */
+static inline JSValue js_arr_packed_get(const JSObject *p, uint32_t idx)
+{
+    if (p->arr_kind == JS_ARR_KIND_INT32)
+        return JS_MKVAL(JS_TAG_INT, ((const int32_t *)p->u.array.u.values_raw)[idx]);
+    return __JS_NewFloat64(((const double *)p->u.array.u.values_raw)[idx]);
+}
+#define JS_ARR_GENERIC(p) ((p)->arr_kind == JS_ARR_KIND_GENERIC)
+static bool js_array_pack(JSContext *ctx, JSObject *p);
+/* QJS_PACKED_TEST=1 (testing only): arrays are packed whenever they are built or appended to, so the
+   whole test corpus runs through the packed paths and the conversions back. */
+static unsigned long js_packed_n_pack, js_packed_n_unpack;
+static void js_packed_report(void)
+{
+    fprintf(stderr, "packed-test: %lu packed, %lu unpacked\n", js_packed_n_pack, js_packed_n_unpack);
+}
+static bool js_packed_test_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("QJS_PACKED_TEST");
+        mode = e != NULL && e[0] != '\0' && e[0] != '0';
+        if (mode && e[0] == '2')
+            atexit(js_packed_report);   /* QJS_PACKED_TEST=2 also prints the counts at exit */
+    }
+    return mode;
+}
+static void js_array_pack_test(JSContext *ctx, JSObject *p)
+{
+    static unsigned n;
+    /* every small array, and one in a thousand of the large ones (packing is linear) */
+    if (p->u.array.count <= 128 || (++n & 1023) == 0)
+        (void)js_array_pack(ctx, p);
+}
+#define JS_ARR_PACK_TEST(ctx, p) do { if (unlikely(js_packed_test_mode())) js_array_pack_test(ctx, p); } while (0)
+#else
+#define js_array_ensure_generic(ctx, p) 0
+#define JS_ARR_GENERIC(p) 1
+#define JS_ARR_PACK_TEST(ctx, p) ((void)0)
+#endif
 
 typedef struct JSCallSiteData {
     JSValue filename;
@@ -9148,6 +9234,7 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
     }
     p->class_id = class_id;
     p->values_inline = 0;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
     p->extensible = true;
     p->free_mark = 0;
     p->is_exotic = 0;
@@ -9189,12 +9276,12 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
             JSProperty *pr;
             p->is_exotic = 1;
             p->fast_array = 1;
-            p->u.array.u.values = NULL;
+            JS_ARR_VALS(p) = NULL;
             p->u.array.count = 0;
             p->u.array.hole_count = 0;
             p->u.array.u1.size = 0;
             if (extra_values != 0) {
-                p->u.array.u.values = (JSValue *)((JSProperty *)(p + 1) +
+                JS_ARR_VALS(p) = (JSValue *)((JSProperty *)(p + 1) +
                                                   p->prop_inline_cap);
                 p->u.array.u1.size = extra_values;
                 p->values_inline = 1;
@@ -9481,7 +9568,8 @@ JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values)
         }
         p->u.array.count = count;
         p->prop[0].u.value = js_int32(count);
-        memcpy(p->u.array.u.values, values, count * sizeof(*values));
+        memcpy(JS_ARR_VALS(p), values, count * sizeof(*values));
+        JS_ARR_PACK_TEST(ctx, p);
     }
     return obj;
 exception:
@@ -9513,9 +9601,10 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
         return JS_EXCEPTION;
     }
     for (i = 0; i < count; i++)
-        p->u.array.u.values[i] = js_dup(src[i]);
+        JS_ARR_VALS(p)[i] = js_dup(src[i]);
     p->u.array.count = count;
     p->prop[0].u.value = js_int32(count);
+    JS_ARR_PACK_TEST(ctx, p);
     return obj;
 }
 
@@ -9525,9 +9614,12 @@ static JSValue regvm_array_from_const(JSContext *ctx, JSValueConst tv)
 
     if (likely(JS_VALUE_GET_TAG(tv) == JS_TAG_OBJECT)) {
         tp = JS_VALUE_GET_OBJ(tv);
-        if (likely(tp->class_id == JS_CLASS_ARRAY && tp->fast_array))
-            return regvm_array_from_regs(ctx, tp->u.array.u.values,
+        if (likely(tp->class_id == JS_CLASS_ARRAY && tp->fast_array)) {
+            if (js_array_ensure_generic(ctx, tp) < 0)
+                return JS_EXCEPTION;
+            return regvm_array_from_regs(ctx, JS_ARR_VALS(tp),
                                          tp->u.array.count);
+        }
     }
     return JS_ThrowInternalError(ctx, "regvm: bad array template");
 }
@@ -9547,7 +9639,7 @@ static JSValue js_new_array_from_owned(JSContext *ctx, int count, JSValue *value
     }
     p = JS_VALUE_GET_OBJ(obj);
     if (count > 0) {
-        p->u.array.u.values = values;
+        JS_ARR_VALS(p) = values;
         p->u.array.u1.size = count;
         p->u.array.count = count;
         p->prop[0].u.value = js_int32(count);
@@ -10059,14 +10151,21 @@ static void js_array_finalizer(JSRuntime *rt, JSValueConst val)
     JSObject *p = JS_VALUE_GET_OBJ(val);
     uint32_t i;
 
+#if QJS_PACKED_ARRAYS
+    if (p->arr_kind != JS_ARR_KIND_GENERIC) {   /* holds no references */
+        if (!p->values_inline)
+            js_free_rt(rt, JS_ARR_RAW(p));
+        return;
+    }
+#endif
     for(i = 0; i < p->u.array.count; i++) {
-        JSValue v = p->u.array.u.values[i];
+        JSValue v = JS_ARR_VALS(p)[i];
         if (JS_VALUE_HAS_REF_COUNT(v) &&
             --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
             js_free_value_rt(rt, v);
     }
     if (!p->values_inline)
-        js_free_rt(rt, p->u.array.u.values);
+        js_free_rt(rt, JS_ARR_VALS(p));
 }
 
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
@@ -10075,8 +10174,10 @@ static void js_array_mark(JSRuntime *rt, JSValueConst val,
     JSObject *p = JS_VALUE_GET_OBJ(val);
     uint32_t i;
 
+    if (!JS_ARR_GENERIC(p))
+        return;
     for(i = 0; i < p->u.array.count; i++) {
-        JS_MarkValue(rt, p->u.array.u.values[i], mark_func);
+        JS_MarkValue(rt, JS_ARR_VALS(p)[i], mark_func);
     }
 }
 
@@ -11360,13 +11461,19 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
             s->array_count++;
             if (p->fast_array) {
                 s->fast_array_count++;
-                if (p->u.array.u.values) {
+                if (JS_ARR_RAW(p)) {
                     s->memory_used_count++;
+#if QJS_PACKED_ARRAYS
+                    s->memory_used_size += p->u.array.count * js_arr_elem_size(p);
+#else
                     s->memory_used_size += p->u.array.count *
-                        sizeof(*p->u.array.u.values);
+                        sizeof(*JS_ARR_VALS(p));
+#endif
                     s->fast_array_elements += p->u.array.count;
-                    for (i = 0; i < p->u.array.count; i++) {
-                        compute_value_size(p->u.array.u.values[i], hp);
+                    if (JS_ARR_GENERIC(p)) {
+                        for (i = 0; i < p->u.array.count; i++) {
+                            compute_value_size(JS_ARR_VALS(p)[i], hp);
+                        }
                     }
                 }
             }
@@ -13207,7 +13314,7 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     uint32_t idx = __JS_AtomToUInt32(prop);
                     if (idx < p->u.array.count &&
                         !(p->holey &&
-                          js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                          js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
                         /* we avoid duplicating the code */
                         return JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
                     } else if (is_typed_array(p->class_id)) {
@@ -13664,7 +13771,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 len = p->u.array.count;
                 if (unlikely(p->holey)) {
                     for(i = 0; i < len; i++) {
-                        if (js_array_slot_is_hole(p->u.array.u.values[i]))
+                        if (js_array_slot_is_hole(JS_ARR_VALS(p)[i]))
                             continue;
                         tab_atom[num_index].atom = __JS_AtomFromUInt32(i);
                         if (tab_atom[num_index].atom == JS_ATOM_NULL) {
@@ -13808,7 +13915,7 @@ retry:
                 idx = __JS_AtomToUInt32(prop);
                 if (idx < p->u.array.count &&
                     !(p->holey &&
-                      js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                      js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
                     if (desc) {
                         desc->flags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
                             JS_PROP_CONFIGURABLE;
@@ -13996,21 +14103,27 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
         {
             JSValue v;
             if (unlikely(idx >= p->u.array.count)) return false;
-            v = p->u.array.u.values[idx];
+#if QJS_PACKED_ARRAYS
+            if (unlikely(!JS_ARR_GENERIC(p))) {
+                *pval = js_arr_packed_get(p, idx);
+                return true;
+            }
+#endif
+            v = JS_ARR_VALS(p)[idx];
             if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED))
                 return false;
             if (js_lazy_marker_is(v))
-                *pval = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+                *pval = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
             else
                 *pval = js_dup(v);
             return true;
         }
     case JS_CLASS_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
-        if (js_lazy_marker_is(p->u.array.u.values[idx]))
-            *pval = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+        if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
+            *pval = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
         else
-            *pval = js_dup(p->u.array.u.values[idx]);
+            *pval = js_dup(JS_ARR_VALS(p)[idx]);
         return true;
     case JS_CLASS_MAPPED_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
@@ -14296,6 +14409,8 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     JSShape *sh;
     uint32_t i, len, new_count;
 
+    if (js_array_ensure_generic(ctx, p) < 0)
+        return -1;
     /* track modification of Array.prototype */
     if (unlikely(p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]))) {
         ctx->std_array_prototype = false;
@@ -14320,7 +14435,7 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
             pr->u.var_ref = *tab++;
         }
     } else {
-        JSValue *tab = p->u.array.u.values;
+        JSValue *tab = JS_ARR_VALS(p);
         for(i = 0; i < len; i++) {
             JSValue v = *tab++;
             if (unlikely(js_array_slot_is_hole(v)))
@@ -14332,11 +14447,11 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
         }
     }
     if (!p->values_inline)
-        js_free(ctx, p->u.array.u.values);
+        js_free(ctx, JS_ARR_VALS(p));
     p->values_inline = 0;
     p->u.array.count = 0;
     p->u.array.hole_count = 0;
-    p->u.array.u.values = NULL; /* fail safe */
+    JS_ARR_VALS(p) = NULL; /* fail safe */
     p->u.array.u1.size = 0;
     p->fast_array = 0;
     p->holey = 0;
@@ -14408,10 +14523,13 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
             if (JS_AtomIsArrayIndex(ctx, &idx, atom) &&
                 idx < p->u.array.count) {
                 if (p->class_id == JS_CLASS_ARRAY) {
-                    JSValue v = p->u.array.u.values[idx];
+                    JSValue v;
+                    if (js_array_ensure_generic(ctx, p) < 0)
+                        return -1;
+                    v = JS_ARR_VALS(p)[idx];
                     if (js_array_slot_is_hole(v))
                         return true;              /* already absent */
-                    p->u.array.u.values[idx] = JS_UNINITIALIZED;
+                    JS_ARR_VALS(p)[idx] = JS_UNINITIALIZED;
                     if (!p->holey) {
                         p->holey = 1;
                         p->u.array.hole_count = 0;
@@ -14483,14 +14601,16 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
     if (likely(p->fast_array)) {
         uint32_t old_len = p->u.array.count;
         if (len < old_len) {
+            if (js_array_ensure_generic(ctx, p) < 0)
+                return -1;
             for(i = len; i < old_len; i++) {
                 if (unlikely(p->holey) &&
-                    js_array_slot_is_hole(p->u.array.u.values[i])) {
+                    js_array_slot_is_hole(JS_ARR_VALS(p)[i])) {
                     if (--p->u.array.hole_count == 0)
                         p->holey = 0;
                 }
-                JS_FreeValue(ctx, p->u.array.u.values[i]);
-                p->u.array.u.values[i] = JS_UNDEFINED;
+                JS_FreeValue(ctx, JS_ARR_VALS(p)[i]);
+                JS_ARR_VALS(p)[i] = JS_UNDEFINED;
             }
             p->u.array.count = len;
         }
@@ -14568,6 +14688,8 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     uint32_t old_size, new_size;
     JSValue *new_array_prop;
 
+    if (js_array_ensure_generic(ctx, p) < 0)
+        return -1;
     if (unlikely(new_len > (uint32_t)INT32_MAX)) {
         JS_ThrowOutOfMemory(ctx);
         return -1;
@@ -14584,15 +14706,15 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
         new_array_prop = js_malloc(ctx, sizeof(JSValue) * new_size);
         if (!new_array_prop)
             return -1;
-        memcpy(new_array_prop, p->u.array.u.values,
+        memcpy(new_array_prop, JS_ARR_VALS(p),
                sizeof(JSValue) * p->u.array.count);
         p->values_inline = 0;
     } else {
-        new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
+        new_array_prop = js_realloc(ctx, JS_ARR_VALS(p), sizeof(JSValue) * new_size);
         if (!new_array_prop)
             return -1;
     }
-    p->u.array.u.values = new_array_prop;
+    JS_ARR_VALS(p) = new_array_prop;
     p->u.array.u1.size = new_size;
     return 0;
 }
@@ -14603,6 +14725,10 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
                                   JSValue val, int flags)
 {
     uint32_t new_len, array_len;
+    if (js_array_ensure_generic(ctx, p) < 0) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
     /* extend the array by one */
     /* XXX: convert to slow array if new_len > 2^31-1 elements */
     new_len = p->u.array.count + 1;
@@ -14624,8 +14750,9 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
             return -1;
         }
     }
-    p->u.array.u.values[new_len - 1] = val;
+    JS_ARR_VALS(p)[new_len - 1] = val;
     p->u.array.count = new_len;
+    JS_ARR_PACK_TEST(ctx, p);
     return true;
 }
 
@@ -14641,11 +14768,88 @@ static inline bool js_array_can_fill_hole_fast(JSContext *ctx, JSObject *p)
         ctx->std_array_prototype;
 }
 
+#if QJS_PACKED_ARRAYS
+/* Converts a packed array to the generic representation in place (see JS_ARR_KIND_*). Capacity is
+   kept. The storage moves even when the count does not change, so a caller holding a pointer into
+   the elements across anything that can reach here must fetch it again. */
+static int js_array_unpack(JSContext *ctx, JSObject *p)
+{
+    uint32_t i, count = p->u.array.count, size = p->u.array.u1.size;
+    JSValue *tab;
+    void *old = JS_ARR_RAW(p);
+
+    assert(p->class_id == JS_CLASS_ARRAY && p->arr_kind != JS_ARR_KIND_GENERIC && !p->holey);
+    if (size != 0) {
+        tab = js_malloc(ctx, sizeof(JSValue) * size);
+        if (!tab)
+            return -1;
+        for (i = 0; i < count; i++)
+            tab[i] = js_arr_packed_get(p, i);
+        if (!p->values_inline)
+            js_free(ctx, old);
+        p->values_inline = 0;
+        p->u.array.u.values_raw = tab;
+    }
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    js_packed_n_unpack++;
+    return 0;
+}
+
+/* Packs a generic array whose elements are all numbers: INT32 when every one is an int, FLOAT64
+   otherwise. Returns whether the array is packed afterwards. A failed allocation leaves the array
+   as it was. */
+static bool js_array_pack(JSContext *ctx, JSObject *p)
+{
+    uint32_t i, count = p->u.array.count, size = p->u.array.u1.size;
+    const JSValue *src;
+    bool all_int = true;
+    void *buf;
+
+    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || p->holey || p->arr_kind != JS_ARR_KIND_GENERIC)
+        return p->arr_kind != JS_ARR_KIND_GENERIC;
+    if (count == 0 || size < count || !p->extensible)
+        return false;
+    src = JS_ARR_VALS(p);
+    for (i = 0; i < count; i++) {
+        int tag = JS_VALUE_GET_TAG(src[i]);
+        if (tag == JS_TAG_INT)
+            continue;
+        if (tag == JS_TAG_FLOAT64) {
+            all_int = false;
+            continue;
+        }
+        return false;
+    }
+    buf = js_malloc(ctx, (all_int ? sizeof(int32_t) : sizeof(double)) * size);
+    if (!buf)
+        return false;
+    for (i = 0; i < count; i++) {
+        if (all_int)
+            ((int32_t *)buf)[i] = JS_VALUE_GET_INT(src[i]);
+        else
+            ((double *)buf)[i] = JS_VALUE_GET_TAG(src[i]) == JS_TAG_INT ?
+                (double)JS_VALUE_GET_INT(src[i]) : JS_VALUE_GET_FLOAT64(src[i]);
+    }
+    if (!p->values_inline)
+        js_free(ctx, JS_ARR_VALS(p));
+    p->values_inline = 0;
+    p->u.array.u.values_raw = buf;
+    p->arr_kind = all_int ? JS_ARR_KIND_INT32 : JS_ARR_KIND_FLOAT64;
+    js_packed_n_pack++;
+    return true;
+}
+
+#endif
+
 static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
                                    JSValue val)
 {
     uint32_t count, gap, new_count, elems, array_len, i;
 
+    if (js_array_ensure_generic(ctx, p) < 0) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
     count = p->u.array.count;
     gap = idx - count;
     if (gap > JS_ARRAY_HOLE_MAX_GAP)
@@ -14670,8 +14874,8 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
         }
     }
     for (i = count; i < idx; i++)
-        p->u.array.u.values[i] = JS_UNINITIALIZED;
-    p->u.array.u.values[idx] = val;
+        JS_ARR_VALS(p)[i] = JS_UNINITIALIZED;
+    JS_ARR_VALS(p)[idx] = val;
     p->u.array.count = new_count;
     if (new_count > array_len)
         p->prop[0].u.value = js_int32(new_count);
@@ -14685,8 +14889,8 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
 
 static void js_array_fill_hole(JSObject *p, uint32_t idx, JSValue val)
 {
-    assert(p->holey && js_array_slot_is_hole(p->u.array.u.values[idx]));
-    p->u.array.u.values[idx] = val;
+    assert(p->holey && js_array_slot_is_hole(JS_ARR_VALS(p)[idx]));
+    JS_ARR_VALS(p)[idx] = val;
     if (--p->u.array.hole_count == 0)
         p->holey = 0;
 }
@@ -14702,7 +14906,7 @@ static bool js_array_try_repack(JSObject *p)
     count = p->u.array.count;
     holes = 0;
     for (i = 0; i < count; i++)
-        holes += js_array_slot_is_hole(p->u.array.u.values[i]);
+        holes += js_array_slot_is_hole(JS_ARR_VALS(p)[i]);
     p->u.array.hole_count = holes;
     if (holes == 0) {
         p->holey = 0;
@@ -14733,7 +14937,7 @@ static JSValue js_allocate_fast_array(JSContext *ctx, int64_t len)
         }
         p->u.array.count = len;
         for(i = 0; i < len; i++)
-            p->u.array.u.values[i] = JS_UNDEFINED;
+            JS_ARR_VALS(p)[i] = JS_UNDEFINED;
         /* update the 'length' field */
         set_value(ctx, &p->prop[0].u.value, js_int32(len));
     }
@@ -14830,7 +15034,7 @@ retry:
                     uint32_t idx = __JS_AtomToUInt32(prop);
                     if (idx < p1->u.array.count &&
                         !(p1->holey &&
-                          js_array_slot_is_hole(p1->u.array.u.values[idx]))) {
+                          js_array_slot_is_hole(JS_ARR_VALS(p1)[idx]))) {
                         if (unlikely(p == p1))
                             return JS_SetPropertyValue(ctx, this_obj, js_int32(idx), val, flags);
                         else
@@ -15061,18 +15265,23 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 return add_fast_array_element(ctx, p, val, flags);
             }
             if (unlikely(p->holey) &&
-                js_array_slot_is_hole(p->u.array.u.values[idx])) {
+                js_array_slot_is_hole(JS_ARR_VALS(p)[idx])) {
                 if (unlikely(!js_array_can_fill_hole_fast(ctx, p)))
                     goto slow_path;
                 js_array_fill_hole(p, idx, val);
                 break;
             }
-            set_value(ctx, &p->u.array.u.values[idx], val);
+            if (unlikely(!JS_ARR_GENERIC(p)) && js_array_ensure_generic(ctx, p) < 0) {
+                JS_FreeValue(ctx, val);
+                return -1;
+            }
+            set_value(ctx, &JS_ARR_VALS(p)[idx], val);
+            JS_ARR_PACK_TEST(ctx, p);
             break;
         case JS_CLASS_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
                 goto slow_path;
-            set_value(ctx, &p->u.array.u.values[idx], val);
+            set_value(ctx, &JS_ARR_VALS(p)[idx], val);
             break;
         case JS_CLASS_MAPPED_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
@@ -15284,7 +15493,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                             goto convert_to_array;
                         if (idx < p->u.array.count) {
                             assert(p->holey &&
-                                   js_array_slot_is_hole(p->u.array.u.values[idx]));
+                                   js_array_slot_is_hole(JS_ARR_VALS(p)[idx]));
                             js_array_fill_hole(p, idx, js_dup(val));
                             return true;
                         }
@@ -15675,7 +15884,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                 idx = __JS_AtomToUInt32(prop);
                 if (idx < p->u.array.count &&
                     !(p->holey &&
-                      js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                      js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
                     prop_flags = get_prop_flags(flags, JS_PROP_C_W_E);
                     if (prop_flags != JS_PROP_C_W_E)
                         goto convert_to_slow_array;
@@ -15687,7 +15896,9 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                             goto redo_prop_update;
                     }
                     if (flags & JS_PROP_HAS_VALUE) {
-                        set_value(ctx, &p->u.array.u.values[idx], js_dup(val));
+                        if (js_array_ensure_generic(ctx, p) < 0)
+                            return -1;
+                        set_value(ctx, &JS_ARR_VALS(p)[idx], js_dup(val));
                     }
                     return true;
                 }
@@ -19329,7 +19540,13 @@ static __maybe_unused void JS_DumpObject(JSRuntime *rt, JSObject *p)
             switch (p->class_id) {
             case JS_CLASS_ARRAY:
             case JS_CLASS_ARGUMENTS:
-                JS_DumpValue(rt, p->u.array.u.values[i]);
+#if QJS_PACKED_ARRAYS
+                if (!JS_ARR_GENERIC(p)) {
+                    JS_DumpValue(rt, js_arr_packed_get(p, i));
+                    break;
+                }
+#endif
+                JS_DumpValue(rt, JS_ARR_VALS(p)[i]);
                 break;
             case JS_CLASS_UINT8C_ARRAY:
             case JS_CLASS_INT8_ARRAY:
@@ -21409,7 +21626,7 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
             tab[i] = js_dup(argv[i]);
         }
     }
-    p->u.array.u.values = tab;
+    JS_ARR_VALS(p) = tab;
     p->u.array.count = argc;
 
     return val;
@@ -21866,8 +22083,8 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
                 /* a present element of a fast array needs no property lookup */
                 JSObject *ao = JS_VALUE_GET_OBJ(it->obj);
                 if (ao->class_id == JS_CLASS_ARRAY && ao->fast_array &&
-                    it->idx <= (uint32_t)ao->u.array.count &&
-                    !js_array_slot_is_hole(ao->u.array.u.values[it->idx - 1]))
+                    it->idx <= (uint32_t)ao->u.array.count && JS_ARR_GENERIC(ao) &&
+                    !js_array_slot_is_hole(JS_ARR_VALS(ao)[it->idx - 1]))
                     break;
             }
         } else {
@@ -22400,10 +22617,12 @@ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(obj);
         if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
+            if (!JS_ARR_GENERIC(p))     /* callers read JSValues: the generic path serves a packed array */
+                return false;
             if (unlikely(p->holey) && !js_array_try_repack(p))
                 return false;
             *countp = p->u.array.count;
-            *arrpp = p->u.array.u.values;
+            *arrpp = JS_ARR_VALS(p);
             return true;
         }
     }
@@ -22467,13 +22686,17 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
                         (get_shape_prop(dst->shape)->flags & JS_PROP_WRITABLE)) {
                         uint32_t k, new_count = pos + src_count;
                         if (new_count >= pos) {
+                            if (js_array_ensure_generic(ctx, dst) < 0) {
+                                js_free_desc(ctx, &desc);
+                                return -1;
+                            }
                             if (new_count > dst->u.array.u1.size &&
                                 expand_fast_array(ctx, dst, new_count)) {
                                 js_free_desc(ctx, &desc);
                                 return -1;
                             }
                             for (k = 0; k < src_count; k++)
-                                dst->u.array.u.values[pos + k] = js_dup(src_arr[k]);
+                                JS_ARR_VALS(dst)[pos + k] = js_dup(src_arr[k]);
                             dst->u.array.count = new_count;
                             dst->prop[0].u.value = js_int32(new_count);
                             sp[-2] = js_int32(new_count);
@@ -23436,12 +23659,12 @@ static JSValue js_u3_el_recv(JSContext *ctx, JSStackFrame *sf,
         uint32_t idx = JS_VALUE_GET_INT(key);
 
         if (likely(p->class_id == JS_CLASS_ARRAY &&
-                   idx < p->u.array.count &&
-                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
-            if (js_lazy_marker_is(p->u.array.u.values[idx]))
-                val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+                   idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
+            if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
+                val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
             else
-                val = js_dup(p->u.array.u.values[idx]);
+                val = js_dup(JS_ARR_VALS(p)[idx]);
             JS_FreeValue(ctx, key);
             return val;
         }
@@ -29345,11 +29568,13 @@ regvm_put_elem_fast(JSContext *ctx, JSValue recv, JSValue k, JSValue v)
     idx = JS_VALUE_GET_INT(k);
     if (p->class_id == JS_CLASS_ARRAY) {
         JSValue old;
-        if (unlikely(idx >= (uint32_t)p->u.array.count || p->holey))
+        if (unlikely(idx >= (uint32_t)p->u.array.count || p->holey ||
+                     !JS_ARR_GENERIC(p)))
             return 0;
-        old = p->u.array.u.values[idx];
-        p->u.array.u.values[idx] = js_dup(v);
+        old = JS_ARR_VALS(p)[idx];
+        JS_ARR_VALS(p)[idx] = js_dup(v);
         JS_FreeValue(ctx, old);
+        JS_ARR_PACK_TEST(ctx, p);
         return 1;
     }
     if (JS_VALUE_GET_TAG(v) != JS_TAG_INT)
@@ -29941,7 +30166,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_lazy_slow
     int d = T_REG(1);
     JSObject *p = JS_VALUE_GET_OBJ(FR(T_REG(3)));
     uint32_t idx = JS_VALUE_GET_INT(FR(T_REG(5)));
-    JSValue val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+    JSValue val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
     T_SET_NEXT_P(d, val, T_SZ_RRR);
 }
 
@@ -29958,16 +30183,16 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
         uint32_t idx = JS_VALUE_GET_INT(k);
 
         if (likely(p->class_id == JS_CLASS_ARRAY &&
-                   idx < p->u.array.count &&
-                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                   idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
 #ifdef QJS_REGVM_COUNT
             js_regvm_elem[0]++;
 #endif
-            if (unlikely(js_lazy_marker_is(p->u.array.u.values[idx])))
+            if (unlikely(js_lazy_marker_is(JS_ARR_VALS(p)[idx])))
                 __attribute__((musttail))
                     return regvm_t_get_element_lazy_slow(REGVM_PASS);
-            AOT_PROF_ELEM(f->b, p->u.array.u.values[idx], 0);
-            T_SET_NEXT_B(d,p->u.array.u.values[idx], T_SZ_RRR);
+            AOT_PROF_ELEM(f->b, JS_ARR_VALS(p)[idx], 0);
+            T_SET_NEXT_B(d,JS_ARR_VALS(p)[idx], T_SZ_RRR);
         }
         {
             JSValue tv;
@@ -34263,16 +34488,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     uint32_t idx = JS_VALUE_GET_INT(k);
 
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
-                               idx < p->u.array.count &&
-                               !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
+                               idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+                               !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
 #ifdef QJS_REGVM_COUNT
                         js_regvm_elem[0]++;
 #endif
-                        if (unlikely(js_lazy_marker_is(p->u.array.u.values[idx])))
+                        if (unlikely(js_lazy_marker_is(JS_ARR_VALS(p)[idx])))
                             val = js_lazy_materialize_slot(ctx,
-                                    &p->u.array.u.values[idx], p);
+                                    &JS_ARR_VALS(p)[idx], p);
                         else
-                            val = js_dup(p->u.array.u.values[idx]);
+                            val = js_dup(JS_ARR_VALS(p)[idx]);
                     } else if (js_get_fast_array_element(ctx, p, idx, &val)) {
                         /* the remaining fast classes: arguments, mapped
                            arguments and the typed arrays */
@@ -40761,12 +40986,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
-                               idx < p->u.array.count &&
-                               !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
-                        if (js_lazy_marker_is(p->u.array.u.values[idx]))
-                            val = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+                               idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+                               !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
+                        if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
+                            val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
                         else
-                            val = js_dup(p->u.array.u.values[idx]);
+                            val = js_dup(JS_ARR_VALS(p)[idx]);
                         JS_FreeValue(ctx, sp[-2]);
                         sp[-2] = val;
                         sp--;
@@ -40820,19 +41045,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
                            JS_VALUE_GET_TAG(var_buf[idx]) == JS_TAG_INT &&
                            JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_ARRAY &&
+                           JS_ARR_GENERIC(JS_VALUE_GET_OBJ(sp[-1])) &&
                            (uint32_t)JS_VALUE_GET_INT(var_buf[idx]) <
                                JS_VALUE_GET_OBJ(sp[-1])->u.array.count &&
                            !js_array_slot_is_hole(
-                               JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                               JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                    JS_VALUE_GET_INT(var_buf[idx])]))) {
-                    if (js_lazy_marker_is(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                    if (js_lazy_marker_is(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                               JS_VALUE_GET_INT(var_buf[idx])]))
                         val = js_lazy_materialize_slot(ctx,
-                                  &JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                  &JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                        JS_VALUE_GET_INT(var_buf[idx])],
                                   JS_VALUE_GET_OBJ(sp[-1]));
                     else
-                        val = js_dup(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                        val = js_dup(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                          JS_VALUE_GET_INT(var_buf[idx])]);
                 } else {
                     sf->cur_pc = pc;
@@ -40861,19 +41087,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
                            JS_VALUE_GET_TAG(arg_buf[idx]) == JS_TAG_INT &&
                            JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_ARRAY &&
+                           JS_ARR_GENERIC(JS_VALUE_GET_OBJ(sp[-1])) &&
                            (uint32_t)JS_VALUE_GET_INT(arg_buf[idx]) <
                                JS_VALUE_GET_OBJ(sp[-1])->u.array.count &&
                            !js_array_slot_is_hole(
-                               JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                               JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                    JS_VALUE_GET_INT(arg_buf[idx])]))) {
-                    if (js_lazy_marker_is(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                    if (js_lazy_marker_is(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                               JS_VALUE_GET_INT(arg_buf[idx])]))
                         val = js_lazy_materialize_slot(ctx,
-                                  &JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                  &JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                        JS_VALUE_GET_INT(arg_buf[idx])],
                                   JS_VALUE_GET_OBJ(sp[-1]));
                     else
-                        val = js_dup(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                        val = js_dup(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                          JS_VALUE_GET_INT(arg_buf[idx])]);
                 } else {
                     sf->cur_pc = pc;
@@ -40896,12 +41123,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
-                               idx < p->u.array.count &&
-                               !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
-                        if (js_lazy_marker_is(p->u.array.u.values[idx]))
-                            sp[-1] = js_lazy_materialize_slot(ctx, &p->u.array.u.values[idx], p);
+                               idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+                               !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
+                        if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
+                            sp[-1] = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
                         else
-                            sp[-1] = js_dup(p->u.array.u.values[idx]);
+                            sp[-1] = js_dup(JS_ARR_VALS(p)[idx]);
                         BREAK;
                     }
                     if (js_get_fast_array_element(ctx, p, idx, &val)) {
@@ -40959,16 +41186,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
                         p = JS_VALUE_GET_OBJ(sp[-3]);
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
-                                   idx < (uint32_t)p->u.array.count &&
-                                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
-                            set_value(ctx, &p->u.array.u.values[idx], val);
+                                   idx < (uint32_t)p->u.array.count && JS_ARR_GENERIC(p) &&
+                                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
+                            set_value(ctx, &JS_ARR_VALS(p)[idx], val);
                             JS_FreeValue(ctx, sp[-3]);
                             sp -= 3;
                             BREAK;
                         }
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
                                    idx == (uint32_t)p->u.array.count &&
-                                   p->fast_array &&
+                                   p->fast_array && JS_ARR_GENERIC(p) &&
                                    p->extensible &&
                                    p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
                                    ctx->std_array_prototype)) {
@@ -40978,7 +41205,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 uint32_t new_len = idx + 1;
                                 array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
                                 if (likely(new_len <= p->u.array.u1.size)) {
-                                    p->u.array.u.values[idx] = val;
+                                    JS_ARR_VALS(p)[idx] = val;
                                     p->u.array.count = new_len;
                                     if (new_len > array_len)
                                         p->prop[0].u.value = js_int32(new_len);
@@ -41021,15 +41248,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                         p = JS_VALUE_GET_OBJ(obj);
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
-                                   idx < (uint32_t)p->u.array.count &&
-                                   !js_array_slot_is_hole(p->u.array.u.values[idx]))) {
-                            set_value(ctx, &p->u.array.u.values[idx], val);
+                                   idx < (uint32_t)p->u.array.count && JS_ARR_GENERIC(p) &&
+                                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
+                            set_value(ctx, &JS_ARR_VALS(p)[idx], val);
                             sp -= 2;
                             BREAK;
                         }
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
                                    idx == (uint32_t)p->u.array.count &&
-                                   p->fast_array && p->extensible &&
+                                   p->fast_array && JS_ARR_GENERIC(p) && p->extensible &&
                                    p->shape->proto == JS_VALUE_GET_OBJ(
                                        ctx->class_proto[JS_CLASS_ARRAY]) &&
                                    ctx->std_array_prototype)) {
@@ -41040,7 +41267,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 uint32_t new_len = idx + 1;
                                 array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
                                 if (likely(new_len <= p->u.array.u1.size)) {
-                                    p->u.array.u.values[idx] = val;
+                                    JS_ARR_VALS(p)[idx] = val;
                                     p->u.array.count = new_len;
                                     if (new_len > array_len)
                                         p->prop[0].u.value = js_int32(new_len);
@@ -61291,7 +61518,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
         (uint32_t)offsetof(JSFunctionBytecode, aot_poly_sites);
     out->aot_poly_ways = AOT_POLY_WAYS;
     out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.count);
-    out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
+    out->off_object_array_values = (uint32_t)offsetof(JSObject, JS_ARR_RAW_MEMBER);
     out->class_array = JS_CLASS_ARRAY;
     out->class_uint8c_array = JS_CLASS_UINT8C_ARRAY;
     out->class_int8_array = JS_CLASS_INT8_ARRAY;
@@ -61464,6 +61691,8 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_cfunc_cproto = (uint32_t)offsetof(JSObject, u.cfunc.cproto);
     out->cfunc_cproto_iterator_next = JS_CFUNC_iterator_next;
     out->cfunc_cproto_generic_magic = JS_CFUNC_generic_magic;
+    out->packed_arrays = QJS_PACKED_ARRAYS;
+    out->off_object_arr_kind = (uint32_t)offsetof(JSObject, arr_kind);
     out->off_rope_left = (uint32_t)offsetof(JSStringRope, left);
     out->off_rope_right = (uint32_t)offsetof(JSStringRope, right);
     out->off_ctx_ta_len_epoch = (uint32_t)offsetof(JSContext, regvm_ta_len_epoch);
@@ -62053,8 +62282,8 @@ static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k)
         JSObject *p = JS_VALUE_GET_OBJ(o);
         uint32_t idx = (uint32_t)JS_VALUE_GET_INT(k);
 
-        if (p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count &&
-            !js_array_slot_is_hole(p->u.array.u.values[idx]))
+        if (p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+            !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))
             return;
         if (p->class_id >= JS_CLASS_UINT8C_ARRAY && p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
             pf->pcs[pc].elem_kinds |= AOT_ELEM_TA;
@@ -63131,8 +63360,8 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                 JSObject *ap = JS_VALUE_GET_OBJ(d->obj);
 
                 if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array &&
-                           !ap->holey && d->idx < ap->u.array.count)) {
-                    JSValue v = ap->u.array.u.values[d->idx];
+                           !ap->holey && JS_ARR_GENERIC(ap) && d->idx < ap->u.array.count)) {
+                    JSValue v = JS_ARR_VALS(ap)[d->idx];
 
                     if (likely(!js_lazy_marker_is(v))) {
                         d->idx++;
@@ -63194,8 +63423,8 @@ QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                 JSString *ks = ctx->rt->intstr[it->idx];
 
                 if (likely(ao->class_id == JS_CLASS_ARRAY && ao->fast_array &&
-                           it->idx < (uint32_t)ao->u.array.count &&
-                           !js_array_slot_is_hole(ao->u.array.u.values[it->idx]) &&
+                           it->idx < (uint32_t)ao->u.array.count && JS_ARR_GENERIC(ao) &&
+                           !js_array_slot_is_hole(JS_ARR_VALS(ao)[it->idx]) &&
                            ks != NULL)) {
                     /* the runtime's table owns the string for the runtime's life */
                     it->idx++;
@@ -63947,10 +64176,10 @@ __attribute__((always_inline)) int qjs_aot_get_element(JSValue recv, JSValue k, 
         JSObject *p = JS_VALUE_GET_OBJ(recv);
         uint32_t idx = JS_VALUE_GET_INT(k);
 
-        if (likely(p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count &&
-                   !js_array_slot_is_hole(p->u.array.u.values[idx]) &&
-                   !js_lazy_marker_is(p->u.array.u.values[idx]))) {
-            *out = js_dup(p->u.array.u.values[idx]);
+        if (likely(p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]) &&
+                   !js_lazy_marker_is(JS_ARR_VALS(p)[idx]))) {
+            *out = js_dup(JS_ARR_VALS(p)[idx]);
             return 1;
         }
     }
@@ -64057,9 +64286,9 @@ QJS_AOT_STUB int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len)
     if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
         return 0;
     p = JS_VALUE_GET_OBJ(v);
-    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array)
+    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || !JS_ARR_GENERIC(p))
         return 0;
-    *data = p->u.array.u.values;
+    *data = JS_ARR_VALS(p);
     *len = p->u.array.count;
     return 1;
 }
@@ -83503,10 +83732,10 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
     p = JS_VALUE_GET_OBJ(array_arg);
     if ((p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) &&
         p->fast_array &&
-        !p->holey &&
+        !p->holey && JS_ARR_GENERIC(p) &&
         len == p->u.array.count) {
         for(i = 0; i < len; i++) {
-            tab[i] = js_dup(p->u.array.u.values[i]);
+            tab[i] = js_dup(JS_ARR_VALS(p)[i]);
         }
     } else if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS &&
                p->fast_array &&
@@ -84061,7 +84290,7 @@ static int JS_CopySubArray(JSContext *ctx,
             from = from_pos + i;
             to = to_pos + i;
         }
-        if (p && p->fast_array && !p->holey &&
+        if (p && p->fast_array && !p->holey && JS_ARR_GENERIC(p) &&
             from >= 0 && from < (len = p->u.array.count)  &&
             to >= 0 && to < len) {
             int64_t l, j;
@@ -84073,15 +84302,15 @@ static int JS_CopySubArray(JSContext *ctx,
                 l = min_int64(l, from + 1);
                 l = min_int64(l, to + 1);
                 for(j = 0; j < l; j++) {
-                    set_value(ctx, &p->u.array.u.values[to - j],
-                              js_dup(p->u.array.u.values[from - j]));
+                    set_value(ctx, &JS_ARR_VALS(p)[to - j],
+                              js_dup(JS_ARR_VALS(p)[from - j]));
                 }
             } else {
                 l = min_int64(l, len - from);
                 l = min_int64(l, len - to);
                 for(j = 0; j < l; j++) {
-                    set_value(ctx, &p->u.array.u.values[to + j],
-                              js_dup(p->u.array.u.values[from + j]));
+                    set_value(ctx, &JS_ARR_VALS(p)[to + j],
+                              js_dup(JS_ARR_VALS(p)[from + j]));
                 }
             }
             i += l;
@@ -84478,7 +84707,7 @@ static JSValue js_array_with(JSContext *ctx, JSValueConst this_val,
 
     p = JS_VALUE_GET_OBJ(arr);
     i = 0;
-    pval = p->u.array.u.values;
+    pval = JS_ARR_VALS(p);
     if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
         for (; i < idx; i++, pval++)
             *pval = js_dup(arrp[i]);
@@ -84527,12 +84756,12 @@ static JSObject *js_concat_direct_target(JSValueConst arr)
 static int js_concat_direct_append(JSContext *ctx, JSObject *p, int64_t n,
                                    JSValueConst e)
 {
-    if (p->holey || p->u.array.count != (uint32_t)n || n >= INT32_MAX)
+    if (p->holey || !JS_ARR_GENERIC(p) || p->u.array.count != (uint32_t)n || n >= INT32_MAX)
         return 0;
     if (p->u.array.u1.size <= (uint32_t)n &&
         expand_fast_array(ctx, p, (uint32_t)n + 1) < 0)
         return -1;
-    p->u.array.u.values[n] = js_dup(e);
+    JS_ARR_VALS(p)[n] = js_dup(e);
     p->u.array.count = (uint32_t)n + 1;
     set_value(ctx, &p->prop[0].u.value, js_int32(n + 1));
     return 1;
@@ -84546,7 +84775,7 @@ static int js_concat_direct_spread(JSContext *ctx, JSObject *p, int64_t n,
 
     if (len <= 0)
         return 0;
-    if (p->holey || p->u.array.count != (uint32_t)n || n + len > INT32_MAX)
+    if (p->holey || !JS_ARR_GENERIC(p) || p->u.array.count != (uint32_t)n || n + len > INT32_MAX)
         return 0;
     if (JS_VALUE_GET_TAG(e) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(e) == p)
         return 0;
@@ -84556,7 +84785,7 @@ static int js_concat_direct_spread(JSContext *ctx, JSObject *p, int64_t n,
         expand_fast_array(ctx, p, (uint32_t)(n + len)) < 0)
         return -1;
     for (i = 0; i < (uint32_t)len; i++)
-        p->u.array.u.values[n + i] = js_dup(arrp[i]);
+        JS_ARR_VALS(p)[n + i] = js_dup(arrp[i]);
     p->u.array.count = (uint32_t)(n + len);
     set_value(ctx, &p->prop[0].u.value, js_int32(n + len));
     return 1;
@@ -85376,7 +85605,7 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
     if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT && !unshift)) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (likely(p->class_id == JS_CLASS_ARRAY &&
-                   p->fast_array &&
+                   p->fast_array && JS_ARR_GENERIC(p) &&
                    p->extensible &&
                    p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
                    ctx->std_array_prototype)) {
@@ -85392,9 +85621,10 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                             return JS_EXCEPTION;
                     }
                     for(i = 0; i < argc; i++) {
-                        p->u.array.u.values[array_len + i] = js_dup(argv[i]);
+                        JS_ARR_VALS(p)[array_len + i] = js_dup(argv[i]);
                     }
                     p->u.array.count = new_len;
+                    JS_ARR_PACK_TEST(ctx, p);
                     p->prop[0].u.value = js_uint32(new_len);
                     return js_int32(new_len);
                 }
@@ -85526,7 +85756,7 @@ static JSValue js_array_toReversed(JSContext *ctx, JSValueConst this_val,
         p = JS_VALUE_GET_OBJ(arr);
 
         i = len - 1;
-        pval = p->u.array.u.values;
+        pval = JS_ARR_VALS(p);
         if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
             for (; i >= 0; i--, pval++)
                 *pval = js_dup(arrp[i]);
@@ -85615,7 +85845,7 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
             (ap->u.array.u1.size >= (uint32_t)count ||
              expand_fast_array(ctx, ap, count) == 0)) {
             for (i = 0; i < (uint32_t)count; i++)
-                ap->u.array.u.values[i] = js_dup(arrp[start + i]);
+                JS_ARR_VALS(ap)[i] = js_dup(arrp[start + i]);
             ap->u.array.count = count;
             n = count;
             k = final;
@@ -85713,8 +85943,8 @@ static JSValue js_array_toSpliced(JSContext *ctx, JSValueConst this_val,
         goto done;
 
     p = JS_VALUE_GET_OBJ(arr);
-    pval = &p->u.array.u.values[0];
-    last = &p->u.array.u.values[newlen];
+    pval = &JS_ARR_VALS(p)[0];
+    last = &JS_ARR_VALS(p)[newlen];
 
     if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
         for (i = 0; i < start; i++, pval++)
@@ -86109,7 +86339,7 @@ static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(arr);
         i = 0;
-        pval = p->u.array.u.values;
+        pval = JS_ARR_VALS(p);
         if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
             for (; i < len; i++, pval++)
                 *pval = js_dup(arrp[i]);
@@ -86168,7 +86398,7 @@ static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab)
         }
         p->u.array.count = len;
         for(i = 0; i < len; i++)
-            p->u.array.u.values[i] = js_dup(tab[i]);
+            JS_ARR_VALS(p)[i] = js_dup(tab[i]);
         /* update the 'length' field */
         set_value(ctx, &p->prop[0].u.value, js_int32(len));
     }
@@ -86229,16 +86459,16 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
     {
         JSObject *ap = JS_VALUE_GET_OBJ(it->obj);
         if (likely(ap->class_id == JS_CLASS_ARRAY && ap->fast_array &&
-                   !ap->holey && it->idx < ap->u.array.count)) {
+                   !ap->holey && JS_ARR_GENERIC(ap) && it->idx < ap->u.array.count)) {
             uint32_t i2 = it->idx;
             it->idx = i2 + 1;
             *pdone = false;
             if (it->kind == JS_ITERATOR_KIND_KEY)
                 return js_uint32(i2);
-            if (js_lazy_marker_is(ap->u.array.u.values[i2]))
-                val = js_lazy_materialize_slot(ctx, &ap->u.array.u.values[i2], ap);
+            if (js_lazy_marker_is(JS_ARR_VALS(ap)[i2]))
+                val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(ap)[i2], ap);
             else
-                val = js_dup(ap->u.array.u.values[i2]);
+                val = js_dup(JS_ARR_VALS(ap)[i2]);
             if (it->kind == JS_ITERATOR_KIND_VALUE)
                 return val;
             {
@@ -91684,14 +91914,10 @@ js_regexp_exec_prepare(JSContext *ctx, JSRegExp *re, uint8_t **capture_stack,
 static JSValue *js_regexp_result_prealloc(JSContext *ctx, JSValue obj, int n)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
-    /* obj is empty (count/size 0); it starts life as packed INT32 but we store
-       JSValues, so settle it to BOXED before allocating the buffer. */
-#if QJS_PACKED_ARRAYS
-    p->array_kind = JS_ARRAY_KIND_BOXED;
-#endif
+    /* obj is empty (count/size 0) and generic */
     if (expand_fast_array(ctx, p, n) < 0)
         return NULL;
-    return p->u.array.u.values;
+    return JS_ARR_VALS(p);
 }
 
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
@@ -93930,8 +94156,10 @@ static int js_lazy_container_has_markers(JSObject *holder)
 {
     uint32_t i;
     if (holder->class_id == JS_CLASS_ARRAY && holder->fast_array) {
+        if (!JS_ARR_GENERIC(holder))
+            return 0;
         for (i = 0; i < holder->u.array.count; i++) {
-            if (js_lazy_marker_is(holder->u.array.u.values[i]))
+            if (js_lazy_marker_is(JS_ARR_VALS(holder)[i]))
                 return 1;
         }
         return 0;
