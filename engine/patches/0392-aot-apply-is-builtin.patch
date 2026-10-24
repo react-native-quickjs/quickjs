@@ -1,0 +1,78 @@
+Subject: The layout export answers whether a function's apply is the builtin
+
+What this does
+  - `qjs_aot_apply_is_builtin(fn)` answers whether reading `fn.apply` would return the builtin
+    `Function.prototype.apply`, without running JavaScript, allocating or taking a reference:
+    the function's own properties first, then each prototype in turn, every object on the way
+    must be a plain ordinary object, and the property must be a plain data property whose value
+    is the builtin. It answers 0 for an own `apply` on the function, a replaced
+    `Function.prototype.apply`, a getter, a Proxy, a bound function's exotic handler, a non-object
+    value, and for the chain ending without `apply` (a depth bound of 16 is answered 0 too).
+
+Why we need it
+  A program that writes `f.apply(this, arguments)` pays the builtin's argument-list build for a
+  call whose arguments are already a contiguous window. Bypassing that call is only sound while
+  the `apply` the body would read is the builtin, and an own `apply` installed on one class's
+  method, or a replaced `Function.prototype.apply`, must keep making its own call.
+  `js_args_apply_is_builtin` tests a value the caller has already loaded, but a guard cannot load
+  the property with `JS_GetProperty`: that can run a getter and can allocate, neither of which a
+  guard may do.
+
+Functions touched
+  `qjs_aot_apply_is_builtin` (new, AOT builds only); `quickjs-aot-rt.h` declares it.
+
+No (read-only; nothing changes behaviour).
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -216,0 +217,6 @@
++/* Whether reading `fn.apply` would return the builtin `Function.prototype.apply`: the property
++   is found by walking the function's own properties and then its prototypes, every object on the
++   way must be a plain ordinary object, and the property must be a plain data property whose value
++   is the builtin. A getter is never run, nothing is allocated, and no reference is taken. A unit
++   that bypasses `f.apply(this, arguments)` asks this first and keeps the program's own call on 0. */
++QJS_AOT_STUB int qjs_aot_apply_is_builtin(JSValue fn);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64180,0 +64181,41 @@
++/* Whether reading `fn.apply` would hand back exactly the builtin `Function.prototype.apply`,
++   decided without running JavaScript, allocating or taking a reference. The property is looked
++   up the way an ordinary read would find it -- the function's own properties first, then each
++   prototype in turn -- and the walk stops with 0 as soon as an object on the way is not a plain
++   ordinary object, or holds `apply` as anything but a plain data property. A getter, a Proxy, a
++   bound function's exotic handler, an own `apply` and a replaced `Function.prototype.apply` all
++   answer 0, and the caller then makes the call the program wrote. */
++QJS_AOT_STUB int qjs_aot_apply_is_builtin(JSValue fn)
++{
++    JSObject *p;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    int depth;
++
++    if (JS_VALUE_GET_TAG(fn) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(fn);
++    for (depth = 0; depth < 16 && p != NULL; depth++) {
++        if (p->is_exotic)
++            return 0;
++        prs = find_own_property(&pr, p, JS_ATOM_apply);
++        if (prs != NULL) {
++            JSValue v;
++            JSObject *f;
++
++            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++                return 0;
++            v = pr->u.value;
++            if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++                return 0;
++            f = JS_VALUE_GET_OBJ(v);
++            return f->class_id == JS_CLASS_C_FUNCTION &&
++                   f->u.cfunc.cproto == JS_CFUNC_generic_magic &&
++                   f->u.cfunc.c_function.generic_magic == js_function_apply &&
++                   f->u.cfunc.magic == 0;
++        }
++        p = p->shape->proto;
++    }
++    return 0;
++}
++

@@ -64178,6 +64178,47 @@ QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
     return (const void *)js_function_apply;
 }
 
+/* Whether reading `fn.apply` would hand back exactly the builtin `Function.prototype.apply`,
+   decided without running JavaScript, allocating or taking a reference. The property is looked
+   up the way an ordinary read would find it -- the function's own properties first, then each
+   prototype in turn -- and the walk stops with 0 as soon as an object on the way is not a plain
+   ordinary object, or holds `apply` as anything but a plain data property. A getter, a Proxy, a
+   bound function's exotic handler, an own `apply` and a replaced `Function.prototype.apply` all
+   answer 0, and the caller then makes the call the program wrote. */
+QJS_AOT_STUB int qjs_aot_apply_is_builtin(JSValue fn)
+{
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int depth;
+
+    if (JS_VALUE_GET_TAG(fn) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(fn);
+    for (depth = 0; depth < 16 && p != NULL; depth++) {
+        if (p->is_exotic)
+            return 0;
+        prs = find_own_property(&pr, p, JS_ATOM_apply);
+        if (prs != NULL) {
+            JSValue v;
+            JSObject *f;
+
+            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                return 0;
+            v = pr->u.value;
+            if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+                return 0;
+            f = JS_VALUE_GET_OBJ(v);
+            return f->class_id == JS_CLASS_C_FUNCTION &&
+                   f->u.cfunc.cproto == JS_CFUNC_generic_magic &&
+                   f->u.cfunc.c_function.generic_magic == js_function_apply &&
+                   f->u.cfunc.magic == 0;
+        }
+        p = p->shape->proto;
+    }
+    return 0;
+}
+
 /* `for_in_next` over an array whose next key is one of the shared small-index strings: the key is
    read from the table and the register borrows it (the table owns it for the context's life);
    the element must still be present in a fast array, as in js_for_in_next. Everything else,
