@@ -1531,16 +1531,12 @@
       "sha256": "e02ab7816c2a9a387d7a5c6de2659b2efa1c69b608def760aed9b232371e8b17"
     },
     {
-      "name": "0389-closed-world-realm-freeze.patch",
-      "sha256": "614a38d7c8696efcf6a1e3d88a734ba5db17ea572235a4d6b0c113bd2d40220b"
-    },
-    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "b272971635814bd136cfa5663ddfded95c4348dabc5e73f3e3b7882fd1f9e686",
+    "quickjs.c": "d06c43c090044a1d0eaa634a32effc5f76f81deef00a272bd93d8dc2f45677cb",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
@@ -1562,7 +1558,7 @@
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
     "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
-    "quickjs.h": "d8251953e7b693bd07442cca528ad782405dba3e4e6efa3cee923febd74984b9",
+    "quickjs.h": "9c8d3ab694430b11f765ac3bd055e6dfb27e0db2acb48ed5a61c81c01814e5a8",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
 }

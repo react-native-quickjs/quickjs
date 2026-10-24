@@ -809,11 +809,6 @@ struct JSRuntime {
        hang where the nested path raises RangeError. Runtime-scoped and appended
        last to keep the hot fields' offsets. */
     uint32_t regvm_tail_chain;
-    /* Closed-world mode (JS_SetClosedWorld): each realm freezes the existing
-       members of its builtin prototypes and refuses code from strings. Appended
-       after every field the generated unit reads an offset of, so no offset in
-       the layout hash moves whether or not the mode is used. */
-    uint8_t closed_world;
 };
 
 #if QJS_REGVM_RECORD
@@ -1285,19 +1280,6 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
-
-    /* Closed-world mode: the objects whose members this realm's freeze pass
-       closed, by address, so a sloppy-mode assignment or a deletion can tell a
-       member the contract froze from an ordinary read-only property. Per realm,
-       because every realm freezes its own builtins, and empty when the mode is
-       off. */
-    JSObject **closed_world_targets;
-    uint32_t closed_world_ntargets;
-    uint32_t closed_world_targets_cap;
-    /* The three namespaces the realm froze, as own data properties of the
-       global object, so replacing the global binding cannot hide the frozen
-       object behind a writable one. */
-    JSValue closed_world_globals[3];
 
 #if JS_ENABLE_DEBUGGER
     JSDebugTraceFunc *debug_trace;
@@ -2853,16 +2835,6 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc);
 static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
                             JS_MarkFunc *mark_func);
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
-static int js_closed_world_freeze_realm(JSContext *ctx);
-static int JS_GetOwnPropertyNamesInternal(JSContext *ctx, JSPropertyEnum **ptab,
-                                          uint32_t *plen, JSObject *p,
-                                          int flags);
-static void js_free_prop_enum(JSContext *ctx, JSPropertyEnum *tab,
-                              uint32_t len);
-static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
-                               JSProperty *pr, JSShapeProperty *prs);
-static int js_update_property_flags(JSContext *ctx, JSObject *p,
-                                    JSShapeProperty **pprs, int flags);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
 static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
@@ -4258,29 +4230,6 @@ void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled)
         rt->json_lazy_enabled = enabled;
 }
 
-/* The mode is decided for the whole runtime, before any realm exists: a realm
-   that was built with writable builtins cannot be frozen afterwards without
-   walking objects the embedder may already hold, and the compiled code that
-   relies on the contract is bound per runtime. A second call with the value it
-   already has is accepted, so an embedder's setup routine is idempotent. */
-int JS_SetClosedWorld(JSRuntime *rt, int on)
-{
-    if (!rt)
-        return -1;
-    on = on != 0;
-    if (on == rt->closed_world)
-        return 0;
-    if (!list_empty(&rt->context_list))
-        return -1;
-    rt->closed_world = on;
-    return 0;
-}
-
-int JS_GetClosedWorld(JSRuntime *rt)
-{
-    return rt ? rt->closed_world : 0;
-}
-
 static void js_gc_promote_all_code(JSRuntime *rt);
 #ifdef QJS_REGVM_COUNT
 int js_regvm_count_dump(void);
@@ -4653,8 +4602,6 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_back_trace = JS_UNDEFINED;
     ctx->error_prepare_stack = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
-    for (i = 0; i < (int)countof(ctx->closed_world_globals); i++)
-        ctx->closed_world_globals[i] = JS_UNDEFINED;
     init_list_head(&ctx->loaded_modules);
     // TODO(bnoordhuis) use getrandom() etc.
     ctx->random_state = js__gettimeofday_us();
@@ -4692,231 +4639,8 @@ JSContext *JS_NewContext(JSRuntime *rt)
         JS_FreeContext(ctx);
         return NULL;
     }
-    if (unlikely(rt->closed_world) && js_closed_world_freeze_realm(ctx)) {
-        JS_FreeContext(ctx);
-        return NULL;
-    }
 
     return ctx;
-}
-
-/* Closed-world realm freeze: the builtin prototypes and namespaces
-   ----------------------------------------------------------------
-   The contract names objects, and every one of them is reachable from the
-   realm's own fields or from the global object by the name it has there, so the
-   pass collects them by exactly those names. A name that is not an object is
-   skipped rather than assumed: the typed-array prototypes depend on which
-   intrinsic installers ran, and an embedder can build a realm without them.
-
-   The properties frozen are the ones the object OWNS at this moment, which is
-   after the intrinsic installers finished and before any script has run. A
-   property added later -- by a later intrinsic installer, or by a script -- is
-   not affected: the contract freezes the existing members and leaves adding
-   open.
-
-   A data property loses its writable bit and its configurable bit; an accessor
-   loses only its configurable bit, so a getter and its setter keep working, and
-   the four properties the spec makes non-writable stay that way. A property
-   that is still an auto-init entry holds no getter, setter or value yet, so it
-   is instantiated first: freezing it as it stands would freeze a placeholder
-   and let the real value arrive writable afterwards.
-
-   The walk uses the engine's own own-property enumeration, so every ordinary
-   property and both string and symbol keys are covered. A proxy or another
-   exotic object among the targets is not walked here: none of these names can
-   resolve to one, the global object is still extensible, and its properties are
-   not redefined by this pass.
-
-   Every object the pass freezes is remembered on the realm by its address and a
-   tag, because two of the contract's promises need to know whether an object is
-   one of them: assigning to a frozen member throws in sloppy mode too, and
-   deleting one throws, and both tests are otherwise the language's silent
-   failures on a non-writable or non-configurable property. */
-
-/* Whether this object is one whose members the closed-world contract froze.
-   Every realm freezes its own builtins and keeps its own registry, and a
-   script can hold one realm's prototype and write to it from another, so the
-   question is asked of every realm the runtime still holds. The registry is
-   freed with its realm, so an address a freed realm once held cannot match. */
-static bool js_closed_world_target(JSRuntime *rt, const JSObject *p)
-{
-    struct list_head *el;
-    uint32_t i;
-
-    if (!rt->closed_world)
-        return false;
-    list_for_each(el, &rt->context_list) {
-        JSContext *ctx = list_entry(el, JSContext, link);
-
-        for (i = 0; i < ctx->closed_world_ntargets; i++)
-            if (ctx->closed_world_targets[i] == p)
-                return true;
-    }
-    return false;
-}
-
-/* Records one frozen object, growing the realm's registry. */
-static int js_closed_world_record_target(JSContext *ctx, JSObject *p)
-{
-    uint32_t n = ctx->closed_world_ntargets;
-
-    if (n == ctx->closed_world_targets_cap) {
-        uint32_t cap = n == 0 ? 32 : n * 2;
-        JSObject **tab;
-
-        tab = js_realloc(ctx, ctx->closed_world_targets,
-                         sizeof(tab[0]) * (size_t)cap);
-        if (!tab)
-            return -1;
-        ctx->closed_world_targets = tab;
-        ctx->closed_world_targets_cap = cap;
-    }
-    ctx->closed_world_targets[n] = p;
-    ctx->closed_world_ntargets = n + 1;
-    return 0;
-}
-
-static int js_closed_world_freeze_object(JSContext *ctx, JSObject *p)
-{
-    JSPropertyEnum *props;
-    uint32_t len, i;
-    int ret = 0;
-
-    if (JS_GetOwnPropertyNamesInternal(ctx, &props, &len, p,
-                                      JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK))
-        return -1;
-    for (i = 0; i < len; i++) {
-        JSAtom prop = props[i].atom;
-        JSProperty *pr;
-        JSShapeProperty *prs;
-        int flags;
-
-        prs = find_own_property(&pr, p, prop);
-        if (!prs)
-            continue;
-        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
-            if (JS_AutoInitProperty(ctx, p, prop, pr, prs)) {
-                ret = -1;
-                break;
-            }
-            prs = find_own_property(&pr, p, prop);
-            if (!prs) {
-                ret = -1;
-                break;
-            }
-        }
-        flags = prs->flags & ~JS_PROP_CONFIGURABLE;
-        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET)
-            flags &= ~JS_PROP_WRITABLE; /* an accessor has no writable bit */
-        if (js_update_property_flags(ctx, p, &prs, flags)) {
-            ret = -1;
-            break;
-        }
-    }
-    js_free_prop_enum(ctx, props, len);
-    if (ret == 0 && js_closed_world_record_target(ctx, p))
-        ret = -1;
-    return ret;
-}
-
-/* Reads a name from an object and freezes what it resolves to when that is an
-   object. A missing or non-object name is not an error: the realm may have been
-   built with a subset of the intrinsic installers. */
-static int js_closed_world_freeze_named(JSContext *ctx, JSValueConst holder,
-                                        JSAtom name)
-{
-    JSValue v;
-    int ret = 0;
-
-    v = JS_GetProperty(ctx, holder, name);
-    if (JS_IsException(v))
-        return -1;
-    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
-        ret = js_closed_world_freeze_object(ctx, JS_VALUE_GET_OBJ(v));
-    JS_FreeValue(ctx, v);
-    return ret;
-}
-
-/* The prototypes the realm keeps in class_proto, in the contract's order. The
-   typed-array prototypes are contiguous in the class table, so one loop covers
-   every element type. */
-static const uint16_t js_closed_world_class_protos[] = {
-    JS_CLASS_OBJECT, JS_CLASS_ARRAY, JS_CLASS_STRING, JS_CLASS_NUMBER,
-    JS_CLASS_BOOLEAN, JS_CLASS_SYMBOL, JS_CLASS_MAP, JS_CLASS_SET,
-    JS_CLASS_PROMISE,
-};
-
-/* The namespaces, which are own properties of the global object. */
-static const char * const js_closed_world_globals[] = {
-    "Math", "JSON", "Reflect",
-};
-
-static int js_closed_world_freeze_realm(JSContext *ctx)
-{
-    JSValue global;
-    size_t i;
-
-    for (i = 0; i < countof(js_closed_world_class_protos); i++) {
-        JSValue proto = ctx->class_proto[js_closed_world_class_protos[i]];
-
-        if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT)
-            continue;
-        if (js_closed_world_freeze_object(ctx, JS_VALUE_GET_OBJ(proto)))
-            return -1;
-    }
-    /* The typed-array prototypes, element types and then %TypedArray%.prototype,
-       which is the prototype of each of them and the only place some of the
-       shared methods live. */
-    for (i = 0; i < JS_TYPED_ARRAY_COUNT; i++) {
-        JSValue proto = ctx->class_proto[JS_CLASS_UINT8C_ARRAY + i];
-        JSShape *sh;
-
-        if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT)
-            continue;
-        if (js_closed_world_freeze_object(ctx, JS_VALUE_GET_OBJ(proto)))
-            return -1;
-        sh = JS_VALUE_GET_OBJ(proto)->shape;
-        if (sh->proto && js_closed_world_freeze_object(ctx, sh->proto))
-            return -1;
-    }
-    /* Function.prototype is the prototype of every function, and the class
-       table's slot for a bytecode function names the same object. */
-    if (JS_VALUE_GET_TAG(ctx->function_proto) == JS_TAG_OBJECT &&
-        js_closed_world_freeze_object(ctx, JS_VALUE_GET_OBJ(ctx->function_proto)))
-        return -1;
-
-    global = ctx->global_obj;
-    for (i = 0; i < countof(js_closed_world_globals); i++) {
-        JSAtom atom = JS_NewAtom(ctx, js_closed_world_globals[i]);
-        JSValue v;
-        int ret;
-
-        if (atom == JS_ATOM_NULL)
-            return -1;
-        ret = js_closed_world_freeze_named(ctx, global, atom);
-        if (ret == 0) {
-            v = JS_GetProperty(ctx, global, atom);
-            if (JS_IsException(v)) {
-                ret = -1;
-            } else {
-                ctx->closed_world_globals[i] = v;
-                /* the global binding is a route to a frozen namespace: a script
-                   assigns to it, and a sloppy assignment to it is refused like
-                   one to a frozen member */
-                ret = JS_DefineProperty(ctx, global, atom, JS_UNDEFINED,
-                                        JS_UNDEFINED, JS_UNDEFINED,
-                                        JS_PROP_HAS_CONFIGURABLE |
-                                        JS_PROP_HAS_WRITABLE) < 0 ? -1 : 0;
-            }
-        }
-        JS_FreeAtom(ctx, atom);
-        if (ret)
-            return -1;
-    }
-    /* The global object joins the registry last: an assignment to a namespace
-       name is a refusal like an assignment to a frozen member, and the check
-       that makes it one has to be able to recognize this object. */
-    return js_closed_world_record_target(ctx, JS_VALUE_GET_OBJ(global));
 }
 
 void *JS_GetContextOpaque(JSContext *ctx)
@@ -5567,8 +5291,6 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     for (i = 0; i < (int)countof(ctx->closure_shape); i++)
         if (ctx->closure_shape[i])
             mark_func(rt, &ctx->closure_shape[i]->header);
-    for (i = 0; i < (int)countof(ctx->closed_world_globals); i++)
-        JS_MarkValue(rt, ctx->closed_world_globals[i], mark_func);
 }
 
 void JS_FreeContext(JSContext *ctx)
@@ -5631,10 +5353,6 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
-    for(i = 0; i < (int)countof(ctx->closed_world_globals); i++) {
-        JS_FreeValue(ctx, ctx->closed_world_globals[i]);
-    }
-    js_free_rt(rt, ctx->closed_world_targets);
     for(i = 0; i < rt->class_count; i++) {
         JS_FreeValue(ctx, ctx->class_proto[i]);
     }
@@ -16114,16 +15832,7 @@ retry:
         } else if (!(desc_flags & JS_PROP_WRITABLE) ||
                    p->class_id == JS_CLASS_MODULE_NS) {
         read_only_prop:
-            /* In closed-world mode the read-only member is one the contract
-               froze, and the contract says assigning to it throws in sloppy
-               mode too: the assignment is refused rather than silently
-               dropped. A read-only property of any other object keeps the
-               language's behaviour: a throw in strict mode, a no-op
-               otherwise. */
-            if (unlikely(ctx->rt->closed_world && js_closed_world_target(ctx->rt, p1)))
-                ret = JS_ThrowTypeErrorReadOnly(ctx, flags | JS_PROP_THROW, prop);
-            else
-                ret = JS_ThrowTypeErrorReadOnly(ctx, flags, prop);
+            ret = JS_ThrowTypeErrorReadOnly(ctx, flags, prop);
             goto done;
         }
         ret = JS_DefineProperty(ctx, this_obj, prop, val,
@@ -17483,15 +17192,6 @@ int JS_DeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int flags)
         return -1;
     p = JS_VALUE_GET_OBJ(obj1);
     res = delete_property(ctx, p, prop);
-    if (res == false && unlikely(ctx->rt->closed_world) &&
-        js_closed_world_target(ctx->rt, p)) {
-        /* a frozen member of the contract: deleting it is refused, and the
-           refusal is a throw whether or not the caller asked for one, because
-           the contract says so in sloppy mode too */
-        JS_FreeValue(ctx, obj1);
-        JS_ThrowTypeError(ctx, "could not delete property");
-        return -1;
-    }
     JS_FreeValue(ctx, obj1);
     if (res != false)
         return res;
@@ -30661,6 +30361,10 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
     if (likely(pa != NULL &&
                ((f->flags & REGVM_FLAG_LIGHT) ||
                 f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
+        /* The call this site forwards to, recorded like any other call site's:
+           the target is the value the site calls, not the `apply` function. */
+        AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 7, sp[-3],
+                      f->argc);
         if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
             T_FAIL();
 #if QJS_REGVM_RECORD
@@ -36453,6 +36157,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(pa != NULL &&
                            (arg_buf == (JSValue *)argv ||
                             argc <= b->arg_count))) {
+                    /* The call this site forwards to, recorded like any other
+                       call site's: the target is the value the site calls, not
+                       the `apply` function. */
+                    AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), sp[-3],
+                                  argc);
                     if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
                         goto exception;
                     ret_val = JS_Call(ctx, sp[-3], sp[-1], argc, vc(arg_buf));
@@ -78366,24 +78075,6 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                               flags, scope_idx);
 }
 
-/* The closed-world refusal: JavaScript may not compile a string, so every path
-   a script can reach with source text ends here. The string itself is the
-   argument of eval or of a Function constructor; a value that is not a string
-   is not source, and eval returns it as it is. The error is an EvalError, with
-   a backtrace added on the same terms as the other engine errors. */
-static JSValue JS_ThrowClosedWorldEval(JSContext *ctx)
-{
-    JSRuntime *rt = ctx->rt;
-    JSStackFrame *sf = rt->current_stack_frame;
-    bool add_backtrace = !rt->in_out_of_memory &&
-        (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
-    JSValue obj;
-
-    obj = JS_MakeError2(ctx, JS_EVAL_ERROR, add_backtrace,
-                        "code generation from strings is disabled");
-    return JS_Throw(ctx, obj);
-}
-
 static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
                              JSValueConst val, int flags, int scope_idx)
 {
@@ -78393,8 +78084,6 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
 
     if (!JS_IsString(val))
         return js_dup(val);
-    if (unlikely(ctx->rt->closed_world))
-        return JS_ThrowClosedWorldEval(ctx);
     str = JS_ToCStringLen(ctx, &len, val);
     if (!str)
         return JS_EXCEPTION;
