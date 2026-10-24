@@ -100,3 +100,21 @@ target_compile_definitions(quickjs_jsi_bench PRIVATE
   QJS_BENCH_OPTIMIZED=$<IF:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>,1,0>)
 
 add_test(NAME jsi_bench COMMAND quickjs_jsi_bench)
+
+# The AOT product path: a Release configure with a unit must BIND that unit.
+#
+# Two bugs made a shipped build run the interpreter with no diagnostic. The
+# engine refers to `qjs_aot_table` weakly, so a static archive drops the unit's
+# member unless the link names the symbol; and a layout field that exists only
+# under -DNDEBUG made a Release engine refuse every unit. Both are silent: the
+# program is correct, just several times slower. This test fails if either
+# comes back -- it asserts the unit is bound (unit=1) and entered (enter>0),
+# and it compares the layout hash of a Debug and a Release configure.
+if(QJS_AOT AND QJS_AOT_UNIT AND NOT MSVC)
+  add_test(NAME aot_unit_binds
+    COMMAND ${CMAKE_COMMAND}
+      -DROOT=${PROJECT_SOURCE_DIR}
+      -DUNIT=${QJS_AOT_UNIT}
+      -DBIN=$<TARGET_FILE:qjs-bench>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/aot-unit-binds.cmake)
+endif()
