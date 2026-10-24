@@ -1,0 +1,49 @@
+Subject: engine: the leak and GC dumps are opt-in, not a consequence of NDEBUG
+
+What this does
+  ENABLE_DUMPS is defined only when QJS_ENABLE_DUMPS is defined. It used to be
+  defined whenever NDEBUG was not, so a Debug build and a Release build disagreed
+  about every struct ENABLE_DUMPS touches.
+
+Why we need it
+  ENABLE_DUMPS reaches beyond the dump code: it adds `struct list_head link` to
+  JSString, which takes sizeof(JSString) from 24 to 40 bytes. JSString's size is
+  one of the fields in the AOT layout hash that js_aot_gen_layout computes, and
+  the engine refuses a unit whose hash it did not produce. A Release build
+  therefore threw away every unit a Debug build had generated, and Debug threw
+  away every unit Release had generated. The refusal is a null table, so nothing
+  reported it: the program simply ran in the interpreter at six times the
+  instruction count.
+
+  A debugging facility must not change the ABI. Deriving one from the build type
+  makes the build type part of a layout, which is the whole defect; an explicit
+  option keeps the dump code available to whoever wants it without letting it
+  perturb a shipped layout.
+
+Hazards
+  A build that relied on a Debug build having the leak dumps now has to pass
+  -DQJS_ENABLE_DUMPS to get them. Nothing in the test suites depends on the macro
+  being set: the dump entry points are debugger conveniences called by hand, and
+  the automated tests reach the engine through the JS_* API. tools/aot/check.sh
+  gains a permanent check that computes the layout under -DNDEBUG and without it
+  and fails if any field differs.
+
+Tests: tools/aot/check.sh (the new layout-independence check), and the kit
+outputs for richards, deltablue, nbody and raytrace equal to the interpreter in
+both build types.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -198,5 +198,11 @@
+ #endif
+ 
+-#ifndef NDEBUG
++/* The leak and GC dumps are a debugging facility, so they are opt-in rather
++   than a consequence of the build type.  ENABLE_DUMPS reaches beyond the dump
++   code: it adds a `link` field to JSString, and JSString's size is part of the
++   AOT layout hash, so deriving it from NDEBUG made a Release build's engine
++   refuse every unit built with a Debug engine -- silently, because the refusal
++   path is a null table.  A debugging facility must not change the ABI. */
++#if defined(QJS_ENABLE_DUMPS) && !defined(ENABLE_DUMPS)
+ #define ENABLE_DUMPS
+ #endif

@@ -197,7 +197,13 @@ static void js_closcyc_resolve(JSRuntime *rt);
 #define __extension__
 #endif
 
-#ifndef NDEBUG
+/* The leak and GC dumps are a debugging facility, so they are opt-in rather
+   than a consequence of the build type.  ENABLE_DUMPS reaches beyond the dump
+   code: it adds a `link` field to JSString, and JSString's size is part of the
+   AOT layout hash, so deriving it from NDEBUG made a Release build's engine
+   refuse every unit built with a Debug engine -- silently, because the refusal
+   path is a null table.  A debugging facility must not change the ABI. */
+#if defined(QJS_ENABLE_DUMPS) && !defined(ENABLE_DUMPS)
 #define ENABLE_DUMPS
 #endif
 
