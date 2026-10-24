@@ -2460,6 +2460,9 @@ static int js_arr_packed_store(JSContext *ctx, JSObject *p, uint32_t idx, JSValu
 static int js_arr_packed_append(JSContext *ctx, JSObject *p, JSValueConst val);
 static bool js_array_species_is_default(JSContext *ctx, JSValueConst obj);
 static bool js_concat_spread_is_default(JSContext *ctx, JSObject *p);
+static bool js_arr_packed_num_int(JSValueConst v, int32_t *i);
+static bool js_arr_packed_num_double(JSValueConst v, double *d);
+static int js_arr_packed_kind_of(const JSValue *src, int count);
 /* QJS_PACKED_TEST=1 (testing only): arrays are packed whenever they are built or appended to, so the
    whole test corpus runs through the packed paths and the conversions back. */
 static unsigned long js_packed_n_pack, js_packed_n_unpack;
@@ -9610,6 +9613,42 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
         return obj;
     }
     p = JS_VALUE_GET_OBJ(obj);
+#if QJS_PACKED_ARRAYS
+    {
+        /* A literal of numbers is built packed: no reference is retained and the elements cost
+           their own width. */
+        int kind = js_arr_packed_kind_of(src, count);
+        if (kind != 0) {
+            int32_t i32;
+            size_t esz = kind == JS_ARR_KIND_INT32 ? sizeof(int32_t) : sizeof(double);
+            void *buf;
+            if (!p->values_inline) {
+                buf = js_malloc(ctx, esz * count);
+                if (!buf) {
+                    JS_FreeValue(ctx, obj);
+                    return JS_EXCEPTION;
+                }
+                p->u.array.u.values_raw = buf;
+                p->u.array.u1.size = count;
+            }
+            p->arr_kind = kind;
+            for (i = 0; i < count; i++) {
+                if (kind == JS_ARR_KIND_INT32) {
+                    assert(js_arr_packed_num_int(src[i], &i32));
+                    ((int32_t *)p->u.array.u.values_raw)[i] = i32;
+                } else {
+                    double d;
+                    assert(js_arr_packed_num_double(src[i], &d));
+                    ((double *)p->u.array.u.values_raw)[i] = d;
+                }
+            }
+            p->u.array.count = count;
+            p->prop[0].u.value = js_int32(count);
+            JS_ARR_PACK_TEST(ctx, p);
+            return obj;
+        }
+    }
+#endif
     if (!p->values_inline && expand_fast_array(ctx, p, count)) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
@@ -9629,6 +9668,37 @@ static JSValue regvm_array_from_const(JSContext *ctx, JSValueConst tv)
     if (likely(JS_VALUE_GET_TAG(tv) == JS_TAG_OBJECT)) {
         tp = JS_VALUE_GET_OBJ(tv);
         if (likely(tp->class_id == JS_CLASS_ARRAY && tp->fast_array)) {
+#if QJS_PACKED_ARRAYS
+            if (unlikely(!JS_ARR_GENERIC(tp))) {
+                /* A packed template is a byte pattern: one allocation and one memcpy, and the
+                   constant itself is never modified. */
+                JSValue obj;
+                JSObject *p;
+                uint32_t n = tp->u.array.count;
+                size_t esz = js_arr_elem_size(tp);
+                obj = JS_NewArray(ctx);
+                if (JS_IsException(obj))
+                    return obj;
+                p = JS_VALUE_GET_OBJ(obj);
+                if (n > 0) {
+                    void *buf = js_malloc(ctx, esz * n);
+                    if (!buf) {
+                        JS_FreeValue(ctx, obj);
+                        return JS_EXCEPTION;
+                    }
+                    memcpy(buf, tp->u.array.u.values_raw, esz * n);
+                    p->u.array.u.values_raw = buf;
+                    p->u.array.u1.size = n;
+                    p->u.array.count = n;
+                    p->prop[0].u.value = js_int32(n);
+                    p->arr_kind = tp->arr_kind;
+                }
+                /* an empty template copies nothing: the result stays generic (0 elements either
+                   way, no storage to keep in a kind) */
+                JS_ARR_PACK_TEST(ctx, p);
+                return obj;
+            }
+#endif
             if (js_array_ensure_generic(ctx, tp) < 0)
                 return JS_EXCEPTION;
             return regvm_array_from_regs(ctx, JS_ARR_VALS(tp),
@@ -14818,6 +14888,24 @@ static int js_array_unpack(JSContext *ctx, JSObject *p)
     p->arr_kind = JS_ARR_KIND_GENERIC;
     js_packed_n_unpack++;
     return 0;
+}
+
+/* The packed kind a run of values would have: 0 when a value is not a number, JS_ARR_KIND_INT32 when
+   they are all int32, JS_ARR_KIND_FLOAT64 otherwise. */
+static int js_arr_packed_kind_of(const JSValue *src, int count)
+{
+    int32_t i32;
+    int kind, i;
+
+    kind = JS_ARR_KIND_INT32;
+    for (i = 0; i < count; i++) {
+        if (js_arr_packed_num_int(src[i], &i32))
+            continue;
+        if (JS_VALUE_GET_TAG(src[i]) != JS_TAG_FLOAT64)
+            return 0;
+        kind = JS_ARR_KIND_FLOAT64;
+    }
+    return kind;
 }
 
 /* Packs a generic array whose elements are all numbers: INT32 when every one is an int, FLOAT64
@@ -84906,12 +84994,17 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
         goto exception;
     if (!JS_IsUndefined(iter)) {
         JS_FreeValue(ctx, iter);
-        if (JS_IsConstructor(ctx, this_val))
+        if (JS_IsConstructor(ctx, this_val)) {
             r = JS_CallConstructor(ctx, this_val, 0, NULL);
-        else
+        } else {
             r = JS_NewArray(ctx);
+        }
         if (JS_IsException(r))
             goto exception;
+#if QJS_PACKED_ARRAYS
+        if (!JS_IsConstructor(ctx, this_val) && JS_VALUE_GET_OBJ(r)->fast_array)
+            JS_VALUE_GET_OBJ(r)->arr_kind = JS_ARR_KIND_INT32;
+#endif
         stack[0] = js_dup(items);
         if (js_for_of_start(ctx, &stack[1], false))
             goto exception;
@@ -84999,6 +85092,12 @@ static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
     }
     if (JS_IsException(obj))
         return JS_EXCEPTION;
+#if QJS_PACKED_ARRAYS
+    /* The result starts as the int32 kind, so the appends below keep a run of numbers packed and
+       the first other value unpacks it. A constructor's own result is left as it is. */
+    if (!JS_IsConstructor(ctx, this_val) && JS_VALUE_GET_OBJ(obj)->fast_array)
+        JS_VALUE_GET_OBJ(obj)->arr_kind = JS_ARR_KIND_INT32;
+#endif
     for(i = 0; i < argc; i++) {
         if (JS_CreateDataPropertyUint32Const(ctx, obj, i, argv[i],
                                              JS_PROP_THROW) < 0) {
