@@ -1786,9 +1786,9 @@ int qjsaot_driver_main(int argc, char **argv) {
        the unit's own `qjs_aot_layout` value. A unit compiled against a
        different engine's layouts has a different hash, which the engine
        refuses at bind (aot_unit_present). The static asserts that pin each
-       offset against a mirror struct land with the first generated code that
-       reads a field (stage 2.8); the hash already makes a drift unsound-free,
-       because an old unit stops binding. */
+       offset against a mirror struct are generated alongside the code that
+       reads a field; the hash already makes a drift unsound-free, because an
+       old unit stops binding. */
     {
       JSAotGenLayout lay;
       FILE *lf;

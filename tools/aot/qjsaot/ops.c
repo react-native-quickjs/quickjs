@@ -8887,7 +8887,7 @@ static int emit_typed_field_read(
       (unsigned)rv, site);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
   /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
-     inlined duplicate (the reviewer's ruling). A string receiver's method comes
+     inlined duplicate. A string receiver's method comes
      from String.prototype, which the PIC does not cache: a per-site cell keeps its
      shape and the property's offset, and the value is read from the slot. */
   fprintf(f, "      } else {\n");
