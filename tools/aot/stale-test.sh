@@ -19,7 +19,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 CLANG=${CLANG:-clang}
 S=engine/quickjs-ng
-O=${AOT_OUT:-${TMPDIR:-/tmp}/qjs-aot-stale}
+O=${AOT_OUT:-${TMPDIR:-$(dirname "$0")/../../.local/scratch}/qjs-aot-stale}
 BASE="-g -std=gnu11 -D_GNU_SOURCE -DJS_ENABLE_DEBUGGER=1 -I$S"
 mkdir -p "$O/obj"
 fail=0

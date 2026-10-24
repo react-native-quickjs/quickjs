@@ -18,7 +18,7 @@
 #
 # ENV
 #   CC             clang
-#   WORK           build and cache directory (default /tmp/qjs-check)
+#   WORK           build and cache directory (default .local/scratch/qjs-check)
 #   JOBS           parallel compiles (default: nproc)
 #   BOX2D          box2d checksum script for t1+ (default .local/box2d-gap/check.js)
 #   OCTANE=1       run the Octane rows in t3
@@ -32,7 +32,7 @@ S=engine/quickjs-ng
 K2=tools/aot/kernels2
 GOLDEN=$K2/golden
 CC=${CC:-clang}
-WORK=${WORK:-/tmp/qjs-check}
+WORK=${WORK:-$(dirname "$0")/../../.local/scratch/qjs-check}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 GEN=qjsaot
 BOX2D=${BOX2D:-.local/box2d-gap/check.js}

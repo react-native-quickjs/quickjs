@@ -25,7 +25,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 CLANG=${CLANG:-clang}
 S=engine/quickjs-ng
-O=${AOT_OUT:-${TMPDIR:-/tmp}/qjs-aot-accept}
+O=${AOT_OUT:-${TMPDIR:-$(dirname "$0")/../../.local/scratch}/qjs-aot-accept}
 MD=${AOT_REPORT:-$O/acceptance.md}
 BOX2D=${BOX2D:-}
 [ -n "$BOX2D" ] || { echo "acceptance.sh: set BOX2D to the box2d checksum script" >&2; exit 2; }

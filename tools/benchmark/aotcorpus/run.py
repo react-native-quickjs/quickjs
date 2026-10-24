@@ -168,6 +168,9 @@ def cmd_run(args):
         names = [n for n in names if filt.search(n)]
     plain = os.path.join(m1, "run-plain")
     scratch = os.path.join(out, "scratch")
+    free = shutil.disk_usage(out if os.path.isdir(out) else os.path.dirname(os.path.abspath(out)) or ".").free
+    if free < 50 * 2**30:
+        sys.exit("aotcorpus: only %.0f GB free; a corpus run needs at least 50 GB" % (free / 2**30))
     os.makedirs(scratch, exist_ok=True)
     results = {}
     t0 = time.time()
@@ -227,6 +230,8 @@ def cmd_run(args):
                         sites.append([kv["fn"], kv["kind"], int(kv["pc"]), int(kv["count"])])
             r["exit_sites"] = sites
         r.setdefault("status", "ok")
+        if not os.environ.get("KEEP_SCRATCH"):
+            shutil.rmtree(d, ignore_errors=True)  # a program's build products are not kept past its measurement
         return r
 
     with ThreadPoolExecutor(time_jobs) as ex:
