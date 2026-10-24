@@ -150,6 +150,7 @@ typedef struct EFacts {
   uint8_t *elemreg;
   uint8_t *arrskip;
   uint8_t *arr_used;
+  uint8_t *arr_pk;   /* the receiver's region is a packed one: keys the pkp/pkn locals */
   int narr_vals;
   /* A call to compiled callees that all have a safepoint-free inline body: it runs the body
      in place or exits at the call, so it is no safepoint for the shape, cache-cell and array
@@ -203,6 +204,11 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out);
 /* The objects that never escape (see facts.c). */
 extern int e_inline_allow_construct;
 int e_ta_class(const Q2Func *fn, const Q2Insn *in);
+/* The packed storage kind of an element site (1 int32, 2 float64) and the group code a packed
+   region uses for it, or 0 when the site is not a packed one. */
+#define E_GRP_PK_I32 (-121)
+#define E_GRP_PK_F64 (-122)
+int e_pk_grp(const Q2Func *fn, const Q2Insn *in, int *kindp);
 int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs, int *nwebs, Q2Rewrite **rw, int *nrw);
 /* Whether polymorphic sites are served by the polymorphic cache in this body (a
    framed speculative body; set by the caller around e_facts_run). */

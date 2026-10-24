@@ -3769,7 +3769,8 @@ static void e_emit_arm(
         }
         if (g_e_types != NULL && rv < (Q2ValueId)g_e_types->nvalues &&
             g_e_types->lb[rv] == E_LB_TAG &&
-            (g_e_facts->hoist_grp[q] == -2 || (g_e_facts->hoist_grp[q] <= -101 && g_e_facts->hoist_grp[q] >= -112))) {
+            (g_e_facts->hoist_grp[q] == -2 || (g_e_facts->hoist_grp[q] <= -101 && g_e_facts->hoist_grp[q] >= -112) ||
+             g_e_facts->hoist_grp[q] == E_GRP_PK_I32 || g_e_facts->hoist_grp[q] == E_GRP_PK_F64)) {
           char fl[32];
           snprintf(fl, sizeof(fl), "goto vx_%d", hb->start_pc);
           e_arr_region_start_grp(f, rv, rv, fl, g_e_facts->hoist_grp[q]);
@@ -4920,6 +4921,10 @@ static int emit_elem_region_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur);
 static int emit_elem_region_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur);
+static int emit_pk_region_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int kind);
+static int emit_pk_region_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int kind);
 
 /* A speculative-body ELEMENT READ: `get_element` ("rrr": dest, array, key). The
    SPEC body does NOT open the generic body's element region -- a region caches the
@@ -4941,6 +4946,12 @@ static int emit_typed_elem_read(
   if (in->ndef < 1 || in->nuse < 2) return 0;
   if (g_e_facts != NULL && g_e_facts->elemreg[e_insn_idx(fn, in)])
     return emit_elem_region_read(f, fn, in, t, cur);
+  /* A packed site: the region's own entry checks the kind and its miss exits the body, so it is
+     the same kind of access as a dense region's, with the element in its own type. */
+  {
+    int pk = 0;
+    if (e_pk_grp(fn, in, &pk) != 0) return emit_pk_region_read(f, fn, in, t, cur, pk);
+  }
   dv = in->def[0];
   av = in->use[0];
   kv = in->use[1];
@@ -5026,6 +5037,10 @@ static int emit_typed_elem_write(
   if (in->nuse < 3) return 0;
   if (g_e_facts != NULL && g_e_facts->elemreg[e_insn_idx(fn, in)])
     return emit_elem_region_write(f, fn, in, t, cur);
+  {
+    int pk = 0;
+    if (e_pk_grp(fn, in, &pk) != 0) return emit_pk_region_write(f, fn, in, t, cur, pk);
+  }
   av = in->use[0];
   kv = in->use[1];
   vv = in->use[2];
@@ -8162,9 +8177,31 @@ static void e_arr_region_start_cls(FILE *f, Q2ValueId av, Q2ValueId root, const 
       "        an%u = *(const uint32_t *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); }\n",
       (unsigned)av, fail, (unsigned)av, ti.cname, fail, (unsigned)root, (unsigned)root);
 }
+/* The entry of a region over a packed array of kind `kind` (1 int32, 2 float64): the receiver is
+   an object of class Array whose holey byte is clear and whose storage kind is exactly this one.
+   The element storage becomes `pkp<root>` and the count `pkn<root>`, function-level locals, so a
+   later access in the same region reuses them. */
+static void e_arr_region_start_pk(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int kind) {
+  fprintf(
+      f,
+      "      if (__builtin_expect(Q2_FORCE_MISS || JS_VALUE_GET_TAG(v%u) != JS_TAG_OBJECT, 0)) %s;\n"
+      "      { const unsigned char *_ap = (const unsigned char *)JS_VALUE_GET_PTR(v%u);\n"
+      "        if (__builtin_expect(*(const uint16_t *)(_ap + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+      "                QJS_AOT_CLASS_ARRAY ||\n"
+      "            (*(_ap + QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE) & QJS_AOT_JSOBJECT_HOLEY_MASK) != 0 ||\n"
+      "            *(_ap + QJS_AOT_OFF_JSOBJECT_ARR_KIND) != %d, 0)) %s;\n"
+      "        pkp%u = *(void *const *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES);\n"
+      "        pkn%u = *(const uint32_t *)(_ap + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); }\n",
+      (unsigned)av, fail, (unsigned)av, kind, fail, (unsigned)root, (unsigned)root);
+}
+
 static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int grp) {
   if (grp <= -101 && grp >= -112)
     e_arr_region_start_cls(f, av, root, fail, -100 - grp);
+  else if (grp == E_GRP_PK_I32)
+    e_arr_region_start_pk(f, av, root, fail, 1);
+  else if (grp == E_GRP_PK_F64)
+    e_arr_region_start_pk(f, av, root, fail, 2);
   else
     e_arr_region_start(f, av, root, fail);
 }
@@ -8339,12 +8376,78 @@ static int emit_ta_region_write(
   return 1;
 }
 
+/* A read inside a packed region: a bounds test and a load of the element in its own type, with no
+   tag test (the kind's element type is a compile-time fact). An index at or past the count is a
+   hole (or past the length): it leaves the region, and the generic code does the prototype
+   lookup. */
+static int emit_pk_region_read(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int kind) {
+  Q2ValueId dv = in->def[0], av = in->use[0], kv = in->use[1], root;
+  int dreg, idx = e_insn_idx(fn, in);
+  char fail[32];
+  if (kind != 1 && kind != 2) return 0;
+  if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
+      kv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
+    return 0;
+  if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
+      t->lb[dv] != E_LB_BOOL)
+    return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  root = e_region_root(fn, in);
+  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  e_group_exit_stub(f, in, cur, av);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(f, "    {\n");
+  if (!g_e_facts->arrskip[idx]) e_arr_region_start_pk(f, av, root, fail, kind);
+  e_region_index(f, t, kv, in->pc);
+  fprintf(f, "      if (__builtin_expect(_i >= pkn%u, 0)) goto vx_%d;\n", (unsigned)root, in->pc);
+  if (kind == 1) {
+    /* the element is an int32: every result representation can hold it */
+    fprintf(f, "      { int32_t _x = ((const int32_t *)pkp%u)[_i];\n", (unsigned)root);
+    if (t->lb[dv] == E_LB_I32)
+      fprintf(f, "        i%u = _x; }\n", (unsigned)dv);
+    else if (t->lb[dv] == E_LB_F64)
+      fprintf(f, "        d%u = (double)_x; }\n", (unsigned)dv);
+    else if (t->lb[dv] == E_LB_BOOL)
+      fprintf(f, "        goto vx_%d; }\n", in->pc);
+    else
+      fprintf(f, "        v%u = JS_MKVAL(JS_TAG_INT, _x); }\n", (unsigned)dv);
+  } else {
+    /* the element is a double: boxing canonicalises NaN, and an int32 result needs the integral
+       in-range test (with -0 excluded) that the packed store uses */
+    fprintf(f, "      { double _x = ((const double *)pkp%u)[_i];\n", (unsigned)root);
+    if (t->lb[dv] == E_LB_I32)
+      fprintf(
+          f,
+          "        int32_t _y = (int32_t)_x;\n"
+          "        if (__builtin_expect(!(_y == _x && !(_y == 0 && signbit(_x))), 0)) goto vx_%d;\n"
+          "        i%u = _y; }\n",
+          in->pc, (unsigned)dv);
+    else if (t->lb[dv] == E_LB_F64)
+      fprintf(f, "        d%u = _x; }\n", (unsigned)dv);
+    else if (t->lb[dv] == E_LB_BOOL)
+      fprintf(f, "        goto vx_%d; }\n", in->pc);
+    else
+      fprintf(f, "        v%u = E_BOX_F64(_x); }\n", (unsigned)dv);
+  }
+  fprintf(f, "    }\n");
+  if (cur != NULL) cur[dreg] = dv;
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
 static int emit_elem_region_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur) {
   Q2ValueId dv = in->def[0], av = in->use[0], kv = in->use[1], root;
   int dreg, idx = e_insn_idx(fn, in);
   char fail[32];
   if (e_ta_class(fn, in)) return emit_ta_region_read(f, fn, in, t, cur, e_ta_class(fn, in));
+  {
+    int pk = 0;
+    if (e_pk_grp(fn, in, &pk) != 0) return emit_pk_region_read(f, fn, in, t, cur, pk);
+  }
   if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues ||
       kv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
     return 0;
@@ -8399,12 +8502,82 @@ static int emit_elem_region_read(
   return 1;
 }
 
+/* A store inside a packed region. A value of the kind stores in place and the region continues; a
+   value that does not fit (a double into int32, a string, an out-of-bounds index) leaves the
+   region, and the op call widens, unpacks or grows the array as the engine decides. */
+static int emit_pk_region_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int kind) {
+  Q2ValueId av = in->use[0], kv = in->use[1], vv = in->use[2], root;
+  int idx = e_insn_idx(fn, in);
+  char fail[32];
+  if (kind != 1 && kind != 2) return 0;
+  if (av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues ||
+      vv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
+    return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  root = e_region_root(fn, in);
+  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  e_group_exit_stub(f, in, cur, av);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(f, "    {\n");
+  if (!g_e_facts->arrskip[idx]) e_arr_region_start_pk(f, av, root, fail, kind);
+  e_region_index(f, t, kv, in->pc);
+  fprintf(f, "      if (__builtin_expect(_i >= pkn%u, 0)) goto vx_%d;\n", (unsigned)root, in->pc);
+  if (kind == 1) {
+    if (t->lb[vv] == E_LB_I32)
+      fprintf(f, "      ((int32_t *)pkp%u)[_i] = i%u;\n", (unsigned)root, (unsigned)vv);
+    else if (t->lb[vv] == E_LB_BOOL)
+      fprintf(f, "      ((int32_t *)pkp%u)[_i] = (int32_t)b%u;\n", (unsigned)root, (unsigned)vv);
+    else if (t->lb[vv] == E_LB_F64)
+      /* a double that is not an int32 widens the array: only the integral, in-range, non -0 case
+         stays in this region, and it stores the int32 the widening would have produced */
+      fprintf(
+          f,
+          "      { double _d = d%u; int32_t _y = (int32_t)_d;\n"
+          "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) goto vx_%d;\n"
+          "        ((int32_t *)pkp%u)[_i] = _y; }\n",
+          (unsigned)vv, in->pc, (unsigned)root);
+    else if (t->lb[vv] == E_LB_TAG)
+      fprintf(
+          f,
+          "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) != JS_TAG_INT, 0)) goto vx_%d;\n"
+          "      ((int32_t *)pkp%u)[_i] = JS_VALUE_GET_INT(v%u);\n",
+          (unsigned)vv, in->pc, (unsigned)root, (unsigned)vv);
+    else
+      return 0;
+  } else {
+    if (t->lb[vv] == E_LB_I32)
+      fprintf(f, "      ((double *)pkp%u)[_i] = (double)i%u;\n", (unsigned)root, (unsigned)vv);
+    else if (t->lb[vv] == E_LB_BOOL)
+      fprintf(f, "      ((double *)pkp%u)[_i] = (double)b%u;\n", (unsigned)root, (unsigned)vv);
+    else if (t->lb[vv] == E_LB_F64)
+      fprintf(f, "      ((double *)pkp%u)[_i] = d%u;\n", (unsigned)root, (unsigned)vv);
+    else if (t->lb[vv] == E_LB_TAG)
+      fprintf(
+          f,
+          "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_INT, 0)) ((double *)pkp%u)[_i] = (double)JS_VALUE_GET_INT(v%u);\n"
+          "      else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64) ((double *)pkp%u)[_i] = JS_VALUE_GET_FLOAT64(v%u);\n"
+          "      else goto vx_%d;\n",
+          (unsigned)vv, (unsigned)root, (unsigned)vv, (unsigned)vv, (unsigned)root, (unsigned)vv, in->pc);
+    else
+      return 0;
+  }
+  fprintf(f, "    }\n");
+  e_inl_store_mark(f);
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
 static int emit_elem_region_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur) {
   Q2ValueId av = in->use[0], kv = in->use[1], vv = in->use[2], root;
   int idx = e_insn_idx(fn, in);
   char fail[32], vb[48];
   if (e_ta_class(fn, in)) return emit_ta_region_write(f, fn, in, t, cur, e_ta_class(fn, in));
+  {
+    int pk = 0;
+    if (e_pk_grp(fn, in, &pk) != 0) return emit_pk_region_write(f, fn, in, t, cur, pk);
+  }
   (void)cur;
   if (av >= (Q2ValueId)t->nvalues || kv >= (Q2ValueId)t->nvalues ||
       vv >= (Q2ValueId)t->nvalues || t->lb[av] != E_LB_TAG)
@@ -11310,6 +11483,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
          the `b79`/`v79` class of bug. */
       if (g_e_facts != NULL && k < g_e_facts->narr_vals && g_e_facts->arr_used[k])
         fprintf(f, "    JSValue *ap%u = NULL; uint32_t an%u = 0;\n", (unsigned)k, (unsigned)k);
+      if (g_e_facts != NULL && k < g_e_facts->narr_vals && g_e_facts->arr_pk[k])
+        fprintf(f, "    void *pkp%u = NULL; uint32_t pkn%u = 0;\n", (unsigned)k, (unsigned)k);
       switch (e_rep_prefix((Q2ValueId)k)[0]) {
         case 'i':
           fprintf(f, "    int32_t i%u = 0;\n", (unsigned)k);
@@ -11900,7 +12075,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             continue;
           }
           if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG &&
-              (g_e_facts->hoist_grp[o2] == -2 || (g_e_facts->hoist_grp[o2] <= -101 && g_e_facts->hoist_grp[o2] >= -112)))
+              (g_e_facts->hoist_grp[o2] == -2 || (g_e_facts->hoist_grp[o2] <= -101 && g_e_facts->hoist_grp[o2] >= -112) ||
+               g_e_facts->hoist_grp[o2] == E_GRP_PK_I32 || g_e_facts->hoist_grp[o2] == E_GRP_PK_F64))
             e_arr_region_start_grp(f, rv, rv, "goto osr_fail", g_e_facts->hoist_grp[o2]);
           else if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG)
             fprintf(

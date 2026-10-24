@@ -48,6 +48,13 @@ typedef struct ProfPc {
   uint8_t elem;
   /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here (the profiler's `tacls=`) */
   uint16_t ta;
+  /* The storage kinds of the JS_CLASS_ARRAY receivers seen at this element pc (the profiler's
+     `pk=`). A profile written before the field existed has no `pk=`, so the site records none and
+     no packed region forms from it. */
+#define Q2_PK_I32     (1u << 0)
+#define Q2_PK_F64     (1u << 1)
+#define Q2_PK_GENERIC (1u << 2)
+  uint8_t pk;
   double num_min, num_max;
   /* A call-result (`K`) record only: the calls that entered the site and the
      returns recorded for it. Zero in a `P` record. */

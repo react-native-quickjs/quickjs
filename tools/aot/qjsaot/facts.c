@@ -759,6 +759,26 @@ int e_ta_class(const Q2Func *fn, const Q2Insn *in) {
   return 0;
 }
 
+/* The packed storage kind an element site was seen with, as a group code: E_GRP_PK_I32 or
+   E_GRP_PK_F64 when the site saw exactly one packed kind and no hole, object, mixed or typed-array
+   element, else 0 (today's code). The profile's `pk=` records the kind of the array the site
+   accessed, so a site that saw a generic array too is not packed. */
+int e_pk_grp(const Q2Func *fn, const Q2Insn *in, int *kindp) {
+  int i;
+  if (in->rop != ROP_get_element && in->rop != ROP_put_element && in->rop != ROP_put_element_xfer) return 0;
+  if (fn->prof == NULL) return 0;
+  for (i = 0; i < fn->nprof; i++) {
+    unsigned p;
+    if (fn->prof[i].pc != in->pc) continue;
+    if (fn->prof[i].elem & (Q2_ELEM_HOLEY | Q2_ELEM_TA | Q2_ELEM_OBJECT | Q2_ELEM_MIXED)) return 0;
+    p = fn->prof[i].pk;
+    if (p == Q2_PK_I32) { if (kindp) *kindp = 1; return E_GRP_PK_I32; }
+    if (p == Q2_PK_F64) { if (kindp) *kindp = 2; return E_GRP_PK_F64; }
+    return 0;
+  }
+  return 0;
+}
+
 static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
   int i;
   if (in->rop != ROP_get_element && in->rop != ROP_put_element &&
@@ -768,6 +788,15 @@ static int elem_region_ok(const Q2Func *fn, const Q2Insn *in) {
   if (fn->prof == NULL) return 0;
   for (i = 0; i < fn->nprof; i++) {
     if (fn->prof[i].pc != in->pc) continue;
+    /* An array whose storage kind was recorded: it is a dense region only when the site never saw
+       packed storage (the dense entry check refuses a non-zero kind byte). A site that saw both
+       packed kinds saw the storage change, so no single entry check holds for the whole loop and
+       it is no region either; a site that saw a packed kind and the generic one keeps the dense
+       route, which refuses a packed array at run time and takes the single-access helper's path. */
+    if ((fn->prof[i].pk & (Q2_PK_I32 | Q2_PK_F64)) != 0 && e_pk_grp(fn, in, NULL) == 0) {
+      unsigned packed = fn->prof[i].pk & (Q2_PK_I32 | Q2_PK_F64);
+      if (packed == (Q2_PK_I32 | Q2_PK_F64)) return 0;
+    }
     /* A typed array of one class: reads and stores are numbers by construction. */
     if ((fn->prof[i].elem & Q2_ELEM_TA) != 0)
       return e_ta_class(fn, in) != 0 && (fn->prof[i].elem & (Q2_ELEM_HOLEY | Q2_ELEM_OBJECT | Q2_ELEM_MIXED)) == 0;
@@ -885,8 +914,14 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     f->elemreg[insn] = 1;
     f->miss_exits[insn] = 1;
     if (rv >= 0 && rv < fn->nvalues) {
-      /* the fact names the region's class (0: a dense array): the locals hold one array kind at a time */
+      /* the fact names the region's class (0: a dense array, 1..12: a typed array's class,
+         101/102: a packed array of int32/float64 elements): the locals hold one array kind at a
+         time, so a second access to the same receiver in the same kind needs no entry */
       int cls = e_ta_class(fn, in);
+      if (cls == 0) {
+        int pk = 0;
+        if (e_pk_grp(fn, in, &pk) != 0) cls = 100 + pk;
+      }
       if (fs_has_shape(s, E_ARRV(rv), cls)) {
         f->arrskip[insn] = 1;
       } else {
@@ -894,6 +929,7 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
         if (fs_add_shape(s, E_ARRV(rv), cls) < 0) return -1;
       }
       f->arr_used[rv] = 1;
+      if (cls >= 101) f->arr_pk[rv] = 1;   /* a packed region: it has its own storage locals */
     }
   }
 
@@ -1154,8 +1190,13 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
           if (v >= (Q2ValueId)fn->nvalues) continue;
           db = fn->values[v].block;
           if (db < 0 || in_loop(loop, db)) continue;
-          /* -2: a dense array; -100 - c: a typed array of class c (1..12) */
+          /* -2: a dense array; -100 - c: a typed array of class c (1..12); -121/-122: a packed
+             array of int32/float64 elements. A site whose profile saw packed storage never gets -2:
+             the dense entry check refuses any array with a non-zero kind byte, so the loop would
+             leave on its first iteration. elem_region_ok already refused a site that saw both
+             kinds, so reaching here with a packed site means exactly one kind. */
           agrp = e_ta_class(fn, in) ? -100 - e_ta_class(fn, in) : -2;
+          if (e_pk_grp(fn, in, NULL) != 0) agrp = e_pk_grp(fn, in, NULL);
           for (q = 0; q < out->nhoist; q++)
             if (out->hoist_hdr[q] == h && out->hoist_val[q] == (int)v && out->hoist_grp[q] == agrp) dup = 1;
           if (dup) continue;
@@ -1262,12 +1303,13 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->narr_vals = fn->nvalues;
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
+  out->arr_pk = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->miss_exits = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->blocks = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1),
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL || out->purecall == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1459,6 +1501,7 @@ void e_facts_free(EFacts *f) {
   free(f->arrskip);
   free(f->purecall);
   free(f->arr_used);
+  free(f->arr_pk);
   free(f->miss_exits);
   if (f->groups != NULL) {
     for (i = 0; i < f->ngroups; i++) free(f->groups[i].sites);
