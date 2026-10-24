@@ -163,6 +163,7 @@ int qjs_aot_prof_callees(
 int qjs_aot_inline_has(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
+int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci);
 int qjs_aot_native_capable(const char hex[33]);
 int qjs_aot_unit_argc(const char hex[33]);
 int qjs_aot_sweep_on(void);
@@ -5693,6 +5694,158 @@ static int emit_inl_nested_call(
    itself. Anything else (a derived class, another new.target, a miss) takes the
    op-call wrapper, which constructs through the engine. Allocation is a safepoint, so
    the live TAG values are in the frame first and the groups are re-checked after. */
+/* A CONSTRUCT inside a copied body. The body has no frame of its own to hand the
+   construct path (`f` in the emitted code), so the object is made and the constructor
+   run with the same engine helpers the non-inlined path uses and the same result
+   rule, on `this_obj` as the receiver: `qjs_aot_construct_this` allocates it from
+   the constructor's prototype and learned capacity, the constructor's own entry runs
+   it, and a non-object return leaves the object as the value. The guards are the
+   construct path's own (the callee's entry identity and the constructor being the
+   new.target), and a miss leaves the whole copied body for the call the body was
+   copied from, which does the construct.
+   The constructor runs arbitrary JavaScript, so this is a safepoint like any other
+   call: every TAG value the body has live across it must already be rooted by
+   someone else, exactly the rule an inlined call is held to. A body that would have
+   to root one itself is not a candidate for this path. */
+static int emit_inl_construct(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
+    char hex[33]) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k, r, nb = 0, cc, nt, off, na, w, dreg;
+  Q2ValueId dv, cv, nv;
+  char cexp[64], ntexp[64];
+
+  (void)hex;
+  if (t == NULL || cur == NULL) return 0;
+  if (in->rop != ROP_construct || in->ndef < 1 || in->narg < 5) return 0;
+  if (e_roles[in->rop] == NULL || e_roles[in->rop]->control != E_CF_NONE) return 0;
+  if (e_must_exit(fn, in)) return 0;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits)) return 0;
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    nb++;
+  }
+  if (nb == 0) return 0;
+  cc = (int)in->arg[1].val;
+  nt = (int)in->arg[2].val;
+  off = dest_off(fn, in);
+  na = in->win_n;
+  w = in->win_reg * 16;
+  if (off < 0 || cc < 0 || nt < 0 || (unsigned)(in->win_reg + na) > (unsigned)fn->nregs) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  /* The object is the result. A TAG value is fine here (it is the object), and a
+     typed or dead one is not this path's business. */
+  if (t->lb[dv] != E_LB_TAG && !e_def_dead(in, dv)) return 0;
+  dreg = off / 16;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
+  nv = nt / 16 < fn->nregs ? cur[nt / 16] : Q2_NO_VALUE;
+  if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME &&
+      cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
+    snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
+  else
+    return 0; /* the callee is not a value this body holds in a register */
+  if (nv != Q2_NO_VALUE && nv != E_UNDEF && nv != E_INFRAME &&
+      nv < (Q2ValueId)t->nvalues && t->lb[nv] == E_LB_TAG)
+    snprintf(ntexp, sizeof(ntexp), "v%u", (unsigned)nv);
+  else
+    return 0;
+
+  /* The constructor's call is a safepoint: the body cannot root a value across it
+     (it has no frame to publish), so every TAG value live across it must be rooted
+     by someone else. The callee and the receiver are the exception, as in a call. */
+  {
+    uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
+    int r;
+    if (lb == NULL) return 0;
+    q2_live_before(fn, (int)(in - fn->insns), lb);
+    for (r = 0; r < fn->norig; r++) {
+      Q2ValueId v;
+      if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
+      v = cur[r];
+      if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME ||
+          v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
+        continue;
+      if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+      if (r * 16 == cc || r * 16 == nt) continue;
+      free(lb);
+      e_fl_block("a value live across a construct is not rooted", in);
+      return 0;
+    }
+    free(lb);
+  }
+  /* The constructor reads its arguments from the window it is given, which is the
+     construct's own register window in the frame. This body holds those values in
+     locals, so they are written to their slots first -- the same sync the
+     non-inlined construct path does before it calls. */
+  for (r = 0; r < na; r++) {
+    Q2ValueId v;
+    int wr = in->win_reg + r;
+    if (wr >= fn->nregs) continue;
+    v = cur[wr];
+    if (v == Q2_NO_VALUE || v == E_UNDEF || v >= (Q2ValueId)t->nvalues) continue;
+    if (t->lb[v] == E_LB_I32)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_INT, i%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E_LB_F64)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, E_BOX_F64(d%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E_LB_BOOL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", wr * 16, (unsigned)v);
+  }
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+    if (qjs_aot_light_need(callee[k]) <= 0) continue;
+    if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+    fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
+    e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+    e_sweep_guard(f, "vx", in->pc);
+    fprintf(
+        f,
+        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1) &&\n"
+        "        JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT &&\n"
+        "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
+        "        JSValue _t, _o, _r;\n"
+        "        int _rc = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t);\n"
+        "        if (__builtin_expect(_rc < 0, 0)) { *out = JS_EXCEPTION; return 1; }\n"
+        "        if (_rc > 0) {\n"
+        "            _o = aot_n_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), _t,\n"
+        "                          &AOT_REG(fr, %d), %d);\n"
+        "            if (__builtin_expect(JS_IsException(_o), 0)) {\n"
+        "                JS_FreeValue(ctx, _t);\n"
+        "                *out = _o; return 1;\n"
+        "            }\n"
+        "            if (JS_VALUE_GET_TAG(_o) == JS_TAG_OBJECT) {\n"
+        "                JS_FreeValue(ctx, _t);\n"
+        "                _r = _o;\n"
+        "            } else {\n"
+        "                if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n"
+        "                _r = _t;\n"
+        "            }\n"
+        "            if (JS_VALUE_GET_PTR(_r) == JS_VALUE_GET_PTR(_t))\n"
+        "                qjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(%s), _r);\n"
+        "            /* The object goes into the frame slot, which AOT_SET_B below\n"
+        "               writes with a duplicate: the construct path's own reference\n"
+        "               is released here, or the object is never freed. */\n"
+        "            if (JS_VALUE_HAS_REF_COUNT(_r)) JS_FreeValue(ctx, _r);\n",
+        cexp, callee[k], ntexp, ntexp, cexp, cexp, callee[k], cexp, w, na, cexp);
+    if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
+    /* Neither guard held, or the object could not be made: the construct has not
+       happened, so the whole copied body leaves for the call it was copied from,
+       which does it. Falling through here would run the next instruction of the
+       callee with the construct's result undefined. */
+    fprintf(f, "            goto cd_%d;\n        }\n    }\n    goto vx_%d;\n#endif\n",
+            in->pc, in->pc);
+  }
+  fprintf(f, "    cd_%d: ;\n", in->pc);
+  e_inl_store_mark(f);
+  g_e_miss_exit_seen = 1;
+  cur[dreg] = dv;
+  return 1;
+}
+
 static int emit_typed_construct(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -10961,6 +11114,7 @@ static int e_dispatch_rop(
     case ROP_call_method:
       return emit_typed_call(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_construct:
+      if (g_e_inl) return emit_inl_construct(f, fn, in, t, cur, hex);
       return emit_typed_construct(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_get_local_field_0:
     case ROP_get_local_field_1:
@@ -12555,6 +12709,14 @@ int e_emit_inline_body(
     const Q2Insn *in = &fn->insns[i];
     char nm[64];
     size_t k;
+    /* A construct is a call family op, and the allowance is consulted first: a
+       construct the caller could lower itself (the engine helper, the constructor's
+       entry, the result rule) is a call this body can make, not a refusal. Anything
+       the allowance declines keeps the refusal the call-family test would give it. */
+    if (in->rop == ROP_construct && e_inl_construct_allowed(fn, in)) {
+      ncalls++; /* it runs the constructor's compiled entry, so it is a call */
+      continue;
+    }
     if (e_is_call_family(in->rop) && in->rop != ROP_call &&
         in->rop != ROP_call_method) {
       snprintf(why, whyn, "%s at pc %d", nm_of_rop(in->rop), in->pc);

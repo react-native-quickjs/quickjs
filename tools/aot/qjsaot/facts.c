@@ -1720,6 +1720,8 @@ done:
    into the caller after a guard on the callee value (see q2_build_inl). */
 const JSAotGenFunc *qjs_aot_unit_func(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
+int qjs_aot_unit_argc(const char hex[33]);
+int qjs_aot_light_need(const char hex[33]);
 
 int e_inline_allow_construct = 1;
 typedef struct CtorSum {
@@ -1844,6 +1846,33 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
   }
   q2_free(&cf);
   return ok;
+}
+
+/* Whether a construct in a function could be lowered in a non-inlined body too: the
+   same test the virtual-object plan uses (`ctor_candidate`: a profiled constructor that
+   is compiled into this unit, with a summary the plan understands), and only when the
+   copy is allowed to build an object at all. A copied body then emits the construct
+   itself, so accepting it here does not widen what qualifies -- it is the same
+   condition, consulted earlier. */
+int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci) {
+  char hex[4][33];
+  int kind[4], cnt = 0, k, nb = 0;
+  unsigned long long hits[4];
+
+  if (!e_inline_allow_construct) return 0;
+  if (ci->rop != ROP_construct || ci->ndef < 1 || ci->narg < 5) return 0;
+  /* The test the non-inlined construct path itself applies: a profiled callee that
+     is compiled into this unit, has a native entry, and is given every argument it
+     declares. A copy that lowers a construct therefore lowers exactly what that path
+     would have lowered -- the condition is the same one, consulted earlier. */
+  if (!qjs_aot_prof_callees(e_dg(fn, ci), ci->onext, &cnt, hex, kind, hits)) return 0;
+  for (k = 0; k < cnt && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(hex[k])) continue;
+    if (qjs_aot_light_need(hex[k]) <= 0) continue;
+    if (ci->win_n < qjs_aot_unit_argc(hex[k])) continue;
+    nb++;
+  }
+  return nb > 0;
 }
 
 /* The most program bytes (about five per instruction) of callees copied into one function: 3000
