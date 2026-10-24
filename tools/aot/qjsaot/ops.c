@@ -7937,6 +7937,9 @@ static int e_poly_site_ok(const Q2Func *fn, const Q2Insn *in, int site);
 static int emit_poly_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int site,
     Q2ValueId rv, const char *boxed);
+static int emit_inl_field_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int site,
+    Q2ValueId rv, const char *boxed);
 static int emit_typed_field_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -7976,6 +7979,9 @@ static int emit_typed_field_write(
       if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
       if (e_poly_site_ok(fn, in, site))
         return emit_poly_write(f, fn, in, cur, site, rv, boxed);
+      /* An inline body takes the same two cache forms a plain store does, with a
+         miss that leaves for the call the body was copied from. */
+      if (g_e_inl) return emit_inl_field_write(f, fn, in, cur, site, rv, boxed);
       if (e_must_exit(fn, in)) return 0;
       /* The inline store counts references. */
       if (g_e_fl) return 0;
@@ -8937,6 +8943,46 @@ static int emit_poly_write(
     fprintf(f, "        q2_put_slot(ctx, %s, _po, _nv); }\n", recv);
   }
   fprintf(f, "    }\n");
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
+/* A FIELD WRITE inside an inline body: the two forms the engine's store cache keeps,
+   tested and taken without the frame. The own-slot hit is `q2_put_field_hit`; the add
+   of a new field replays the site's cached transition with `q2_put_add`, which only
+   grows the property array, so nothing has left the body when it succeeds. A miss is
+   an exit before the store, which is the call the callee was copied from: the store
+   may run a setter, may grow the property array, or may not land at all on a frozen
+   object, and with nothing done the caller's native call does all of that.
+
+   The store that lands is a real effect, and the release it makes can free an object
+   whose finalizer runs or park one, so the body is marked as having stored: its
+   exits build the callee's frame instead of returning to the call. */
+static int emit_inl_field_write(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int site,
+    Q2ValueId rv, const char *boxed) {
+  char recv[32];
+  (void)fn;
+  (void)cur;
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+  e_note_tag('v', in->pc, recv);
+  e_sweep_guard(f, "vx", in->pc);
+  fprintf(f, "    {\n");
+  fprintf(f, "      JSValue _nv = %s;\n", boxed);
+  fprintf(
+      f,
+      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_put_field_hit(ctx, pic, %s, "
+      "%d, _nv), 1)) {\n",
+      recv, site);
+  fprintf(f, "      } else if (__builtin_expect(!Q2_FORCE_MISS && q2_put_add(ctx, pic, "
+             "holders, q2_ns, %s, %d, _nv), 0)) {\n",
+          recv, site);
+  fprintf(f, "      } else {\n");
+  fprintf(f, "        goto vx_%d;\n", in->pc);
+  fprintf(f, "      }\n");
+  fprintf(f, "    }\n");
+  e_inl_store_mark(f);
   g_e_miss_exit_seen = 1;
   return 1;
 }
