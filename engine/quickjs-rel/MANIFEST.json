@@ -1496,11 +1496,15 @@
     },
     {
       "name": "0380-packed-array-kind-byte.patch",
-      "sha256": "982e901b8bebc95c510806b5038824eea5fb2a5b7bf7f0a0e511c515eb5ea2b8"
+      "sha256": "f846eb4268a2d16c6cfd1c2e349bc1d59e40f4b127bad47eadcbeff5a0f18c18"
     },
     {
       "name": "0381-packed-array-number-paths.patch",
-      "sha256": "70b7264cb1a7e43722ddb6bff73c6563b1c80f6601a5806a31d7efdb49ec0330"
+      "sha256": "afeea22fbc8344544c37aedb69afe6ed22dc45b76f6b72131d19297ced1899ce"
+    },
+    {
+      "name": "0382-packed-array-builtins.patch",
+      "sha256": "b17aeb4b4792cf800720a7777f9a0175abc0a2ed6904f1cd55fd2cc130f3bbcc"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1508,7 +1512,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "9b0663bd387e835e92bd19ebd6657ff81cd0eafb334df9ca69173fbf8fcb80b9",
+    "quickjs.c": "1d493fc36a48abb53787c9b14703360a6c82789632ec1b8048db1aaed12d1f35",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
