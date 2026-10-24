@@ -1,0 +1,714 @@
+Subject: engine: values are one 64-bit word, so a double's bits and a tag share it (QJS_NAN_BOXING64, off by default)
+
+What this does
+  With `QJS_NAN_BOXING64` on, `JSValue` is a `uint64_t`. The top 19 bits are the tag offset T and
+  the low 45 are the payload P: a non-double with tag `t` is `(t - JS_TAG_FIRST) << 45 | payload`, a
+  double is its IEEE bits plus `17 << 45`, and a pointer is the address shifted right by three. A
+  double's T is therefore always at least `JS_TAG_FLOAT64`, so `JS_TAG_IS_FLOAT64` and
+  `JS_VALUE_GET_NORM_TAG` keep the meaning they have in the 32-bit encoding. Every special value and
+  every constructor is a compile-time constant expression.
+
+  `JS_VALUE_IS_BOTH_INT` tests each operand's upper 32 bits against the int tag's T, because the
+  16-byte form's `(tag1 | tag2) == 0` relies on `JS_TAG_INT` being zero. `JS_VALUE_HAS_REF_COUNT` is
+  `T <= 8 && T != 5`, the second term being the lazy-JSON marker. `JS_MKPTR` asserts an 8-aligned
+  pointer below `1 << 48` in a debug build.
+
+  Every register-file stride, register-operand decode and light-frame offset now derives from
+  `sizeof(JSValue)` or `offsetof` instead of a 16-byte assumption: the encoder's operand scale, the
+  wire encode and decode, the monolith's `RD_REG`/`RD_REG8`, the profiler's register index, the
+  accumulator-append call sites, the AOT iterator helpers, and the light prefix, which is now "the
+  bytes before the record-only tail" rather than nine 16-byte slots.
+
+  The register bytecode's narrow operand is written as a register index in wire units
+  (`REGVM_WIRE_REG_SCALE`) rather than as a byte offset into the writer's register file, so the
+  serialized stream does not depend on the writer's value size. The same source therefore writes the
+  same bytes in either encoding, and the checked-in builtin bundles load and run in both without
+  being rebuilt.
+
+  A profile header carries `vmode=` and `QJS_AOT_ABI` carries the encoding in bit 9, because a
+  profile and a compiled unit describe the build's layouts; the layout's `off_jsvalue_*` fields are
+  zeroed under the flag, so the layout hash differs too.
+
+  `JS_NewRuntime` checks that a heap block and a stack address fit the 48-bit encoding and refuses to
+  start otherwise, printing the offending heap address. `JS_DupValueRT` and `JS_FreeValueRT` assert in
+  a debug build that a counted tag never carries a NULL pointer.
+
+  The 16-byte build is unchanged: same structure, same macro values, same bytecode header, same
+  serialized bytes, same generated code.
+
+Why we need it
+  A 16-byte value doubles the register file, every property slot and every argument window, and the
+  tag sits in a separate word from the payload, so a tag test and a payload load are two cache
+  accesses. One word per value halves all of those and makes the tag a shift of the same word the
+  payload comes from. The encoding is a flag so the 16-byte build stays the reference the AOT
+  generator's output is checked against.
+
+Hazards
+  The encoding is not a macro rename: the compiler catches the `.u`/`.tag` accesses, and six classes
+  of site that compile either way are silently wrong. Each is fixed here and each was observed, not
+  reasoned about:
+
+  1. An exact double-tag test. `JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64` is false for every double,
+     because a double's tag is `57` before normalisation. Fifty-one sites compared tags exactly, in
+     the relational and equality slow paths, the register VM's fused arithmetic, fused compare and
+     deopt fast paths, the packed-array kind helpers, the AOT runtime's helpers and the generator's
+     constant-pool scan; all now use `JS_TAG_IS_FLOAT64`. Before the fix `-0 === 0` was false inside
+     a function, `0 * -5` lost its sign, and four corpus cases differed.
+
+  2. `sizeof(JSValue)` used as another struct's stride. `JSRegPIC.slot_off` was
+     `slot * sizeof(JSValue)`, which coincided with `JSProperty`'s size only while a value was 16
+     bytes; every cached property read then returned a slot at the wrong offset. It is now
+     `slot * sizeof(JSProperty)`, and the reverse division in the add-transition replay matches.
+
+  3. A hard-coded 16. `REGVM_LIGHT_PREFIX_BYTES` was nine 16-byte slots. The nine is a count of
+     fields, which pack two-to-a-slot only while a value is 16 bytes; the prefix must end where the
+     record-only tail begins, so it is `offsetof(struct JSRegRun, ctx)` and the slot count is derived.
+
+  4. All-bits-zero used as a value. Zero is `T = 0`, the big-int tag, with a NULL pointer: a register
+     filled that way faults on its first release or mark. The register-file fills, including the
+     never-written-register fill and the AOT gate mutant, now use `regvm_fill_unwritten`, which
+     writes integer 0 in both encodings; the debug assertion in the value free and dup paths catches
+     any remaining one at the point it is first touched.
+
+  5. A two-word copy or compare, and a file whose bytes depend on the writer's layouts. No `memcmp`
+     or `memcpy` treats a value as 16 bytes: the copies are `sizeof(JSValue)`-sized and the 16-byte SSE
+     store is compiled out. The one place a layout did leak into a file was the narrow register
+     operand, which stored a byte offset into the writer's register file; it now stores a register
+     index, so the same source writes the same bytecode in either encoding. Everything else a file
+     holds is a tag, a payload or a register index, all of which are size-independent.
+
+  6. The generated code's prelude. What this patch owes that class is only the engine's half: the
+     layout export prints no tag or union offset for a one-word value, and the ABI and the layout
+     hash carry the encoding so a unit built against the other one refuses to bind.
+
+  NaN payloads do not survive a value: `__JS_NewFloat64` canonicalises every NaN to one quiet NaN and
+  asserts it, so a payload written through a DataView into a Float64Array reads back as a NaN that
+  neither compares, hashes nor serialises by its payload.
+
+  Pointer range: the encoding keeps 45 bits of an address, which covers the 48-bit user space. A
+  build on a target that tags heap pointers in their top byte (Android 11 and later) must set
+  `android:allowNativeHeapPointerTagging="false"`; iOS on arm64 needs nothing, since user addresses
+  fit and pointer authentication covers code pointers rather than data. The runtime check makes a
+  target that does not fit fail at startup instead of corrupting addresses.
+
+  A profile and a compiled unit from the other encoding are refused, through the ABI bit and the
+  layout hash, because those do encode the build's layouts; a bytecode file is not refused, because
+  it does not. Compiling and linking two translation units with different flags is undefined; the ABI
+  is not compatible and this is documented beside the flag.
+
+Tests: .local/m1/nb64-values.js (tags, the encoding's edges, NaN payloads through a DataView, the
+arithmetic fast paths, a value in a slot, a closure, an array and the exception path, the packed and
+typed-array element kinds, negative zero through `===`, and Array.fromAsync with Iterator.zip and
+Iterator.zipKeyed, which are the precompiled builtins), .local/m1/eops-cases, .local/m1/*.js,
+tools/aot/kernels2, tests/differential/corpus and tests/ all equal in both encodings; the three
+builtin bundles are byte-identical to what either build serializes, and matmul's and sieve's
+generated units and every kit unit are byte-identical to the parent tree's flag-off output.
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -179,0 +180,28 @@
++/* Eight-byte values on a 64-bit target: one word holds every value, a double
++   included, instead of a 16-byte union and tag pair. Off by default, so the
++   build is then the one without the feature.
++
++   With it on, `JSValue` is a `uint64_t` and the `.u` / `.tag` struct fields do
++   not exist: every user of a value goes through the JS_VALUE_* macros below.
++   ABI-incompatible: code compiled with the flag and code compiled without it
++   cannot be linked together, and a bytecode file, a profile or a compiled unit
++   from one mode is refused by the other.
++
++   Android: a build with this flag must pass
++   `android:allowNativeHeapPointerTagging="false"` in the manifest, because
++   Android 11 and later tag heap pointers in their top byte, which the encoding
++   below does not expect. iOS on arm64 needs nothing: user addresses fit in the
++   encoded range and pointer authentication applies to code pointers, not to the
++   data pointers a value holds. */
++#ifndef QJS_NAN_BOXING64
++#define QJS_NAN_BOXING64 0
++#endif
++
++#if QJS_NAN_BOXING64 && JS_NAN_BOXING
++#error "JS_NAN_BOXING and QJS_NAN_BOXING64 are mutually exclusive"
++#endif
++
++#if QJS_NAN_BOXING64 && UINTPTR_MAX != 0xffffffffffffffff
++#error "QJS_NAN_BOXING64 needs a 64-bit target"
++#endif
++
+@@ -318,0 +347,115 @@
++#if QJS_NAN_BOXING64
++
++/* The debug-only pointer check below, and the bytecode and profile readers,
++   need assert. */
++#include <assert.h>
++
++/*
++ * One 64-bit word per value. The top 19 bits are T, the rest is the payload P:
++ *
++ *   T = v >> 45              P = v & ((1 << 45) - 1)
++ *
++ * A non-double with tag `t` has T = t - JS_TAG_FIRST, so T is 0..16 and P holds
++ * that tag's payload. A double is stored as its bit pattern plus
++ * JS_NB64_ADDEND, which puts every double at T >= 17 -- +0.0 is the lowest one,
++ * at exactly JS_TAG_FLOAT64 -- so a double can never be read as a tagged value
++ * and JS_TAG_IS_FLOAT64 means what it means in the 32-bit encoding. A pointer
++ * is stored shifted right by three: that keeps 45 bits of a 48-bit address
++ * space, room for the tag above it, and the low three bits free for the tags
++ * that are mostly-immediate.
++ */
++typedef uint64_t JSValue;
++
++#define JS_NB64_TAG_BITS 45
++#define JS_NB64_P_MASK   ((1ull << JS_NB64_TAG_BITS) - 1)
++#define JS_NB64_ADDEND   (17ull << JS_NB64_TAG_BITS)
++
++#define JS_VALUE_GET_TAG(v) ((int)((v) >> JS_NB64_TAG_BITS) + JS_TAG_FIRST)
++#define JS_VALUE_GET_INT(v) ((int32_t)(uint32_t)(v))
++#define JS_VALUE_GET_BOOL(v) ((int)(v))
++#define JS_VALUE_GET_SHORT_BIG_INT(v) ((int32_t)(uint32_t)(v))
++#define JS_VALUE_GET_PTR(v) ((void *)((uintptr_t)((v) & JS_NB64_P_MASK) << 3))
++
++/* `tag - JS_TAG_FIRST` is an integer constant expression, so every special
++   value below is too, and can initialise a static or a const table. */
++#define JS_MKVAL(tag, val) \
++    ((((uint64_t)((tag) - JS_TAG_FIRST)) << JS_NB64_TAG_BITS) | (uint32_t)(val))
++
++/* A pointer must be 8-aligned, or its three low bits cannot be dropped, and it
++   must fit the 45 bits the payload has, which is the 48-bit address range the
++   encoding supports. */
++#ifdef NDEBUG
++#define JS_NB64_CHECK_PTR(p) ((void)0)
++#else
++#define JS_NB64_CHECK_PTR(p) \
++    assert(((uintptr_t)(p) & 7) == 0 && (uintptr_t)(p) < (1ull << 48))
++#endif
++#define JS_MKPTR(tag, p) \
++    (JS_NB64_CHECK_PTR(p), \
++     (((uint64_t)((tag) - JS_TAG_FIRST)) << JS_NB64_TAG_BITS) | \
++         ((uintptr_t)(p) >> 3))
++
++static inline double JS_VALUE_GET_FLOAT64(JSValue v)
++{
++    union {
++        uint64_t u64;
++        double d;
++    } u;
++    u.u64 = v - JS_NB64_ADDEND;
++    return u.d;
++}
++
++/* The canonical quiet NaN, encoded. */
++#define JS_NAN (0x7ff8000000000000ull + JS_NB64_ADDEND)
++
++static inline JSValue __JS_NewFloat64(double d)
++{
++    union {
++        uint64_t u64;
++        double d;
++    } u;
++    JSValue v;
++
++    u.d = d;
++    /* Every NaN is stored as the same canonical one, so no NaN payload ever
++       reaches a comparison, a typed array or a hash. */
++    if ((u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000)
++        v = JS_NAN;
++    else
++        v = u.u64 + JS_NB64_ADDEND;
++#ifndef NDEBUG
++    /* A NaN that kept a payload would be a value two NaN-producing paths
++       disagree on, which is the reason to canonicalise here at all. */
++    assert(((u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000)
++               ? v == JS_NAN
++               : JS_VALUE_GET_FLOAT64(v) == d);
++#endif
++    return v;
++}
++
++#define JS_TAG_IS_FLOAT64(tag) \
++    ((unsigned)((tag) - JS_TAG_FIRST) >= (JS_TAG_FLOAT64 - JS_TAG_FIRST))
++
++/* same as JS_VALUE_GET_TAG, but return JS_TAG_FLOAT64 with NaN boxing */
++static inline int JS_VALUE_GET_NORM_TAG(JSValue v)
++{
++    int tag = JS_VALUE_GET_TAG(v);
++
++    return JS_TAG_IS_FLOAT64(tag) ? JS_TAG_FLOAT64 : tag;
++}
++
++static inline bool JS_VALUE_IS_NAN(JSValue v)
++{
++    union {
++        uint64_t u64;
++        double d;
++    } u;
++
++    if (!JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)))
++        return 0;
++    u.u64 = v - JS_NB64_ADDEND;
++    return (u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000;
++}
++
++#else /* !QJS_NAN_BOXING64 */
++
+@@ -394,0 +538,2 @@
++#endif /* !QJS_NAN_BOXING64 */
++
+@@ -396,0 +542,17 @@
++#if QJS_NAN_BOXING64
++/* A value is an int when its upper 32 bits are the int tag's T, shifted down to
++   where those bits sit. The 16-byte encoding ORs the two tags and compares the
++   result with 0, which works only because JS_TAG_INT is 0 there. */
++#define JS_NB64_INT_HI \
++    ((uint64_t)(JS_TAG_INT - JS_TAG_FIRST) << (JS_NB64_TAG_BITS - 32))
++#define JS_VALUE_IS_BOTH_INT(v1, v2) \
++    ((((v1) >> 32) == JS_NB64_INT_HI) & (((v2) >> 32) == JS_NB64_INT_HI))
++#define JS_VALUE_IS_BOTH_FLOAT(v1, v2) \
++    (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v1)) && \
++     JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v2)))
++/* T <= 8 holds the tags that name a counted object, and T 5 is the lazy-JSON
++   marker, which a reader materialises before the value reaches any code that
++   could count it. */
++#define JS_VALUE_HAS_REF_COUNT(v) \
++    (((v) >> JS_NB64_TAG_BITS) <= 8 && ((v) >> JS_NB64_TAG_BITS) != 5)
++#else
+@@ -402,0 +565 @@
++#endif
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1579 +1579,3 @@
+-   engine refuses a generated unit built against another version. */
++   engine refuses a generated unit built against another version. The value
++   encoding is part of the ABI: a unit compiled against one encoding reads a
++   different JSValue and must not bind against the other. */
+@@ -1581 +1583 @@
+-#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
++#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8) | ((uint32_t)QJS_NAN_BOXING64 << 9))
+@@ -1953 +1955,2 @@
+-/* The threaded chain. `d_` is a register operand, encoded as index * 16. */
++/* The threaded chain. `d_` is a register operand: a byte offset into the
++   register file, so its index is the offset divided by the value size. */
+@@ -1960 +1963 @@
+-/* `d_` is a register operand, encoded as index * 16. */
++/* `d_` is a register operand, a byte offset. */
+@@ -1963 +1966,2 @@
+-                 js_aot_prof_reg((f_)->b, (d_) >> 4, (v_)); } while (0)
++                 js_aot_prof_reg((f_)->b, (int)((d_) / (int)sizeof(JSValue)), \
++                                 (v_)); } while (0)
+@@ -3001,0 +3006,7 @@
++#if QJS_NAN_BOXING64 && !defined(NDEBUG)
++    /* A counted tag with a NULL pointer is an all-bits-zero word that was read
++       as a value: T 0 is the big-int tag, whose payload is the pointer. Count
++       it here, where the value is still in hand, rather than faulting on the
++       increment below. */
++    assert(!JS_VALUE_HAS_REF_COUNT(v) || JS_VALUE_GET_PTR(v) != NULL);
++#endif
+@@ -3795,0 +3807,27 @@
++#if QJS_NAN_BOXING64
++/* The value encoding keeps 45 bits of a pointer, so every heap or stack address
++   a value can name has to fit the 48-bit address space it covers. A tagged
++   heap (Android 11 and later) or a wider user address space moves addresses
++   outside that range, and the encoding would silently truncate them, so the
++   runtime refuses to start instead. */
++static int js_nb64_addresses_fit(const JSMallocFunctions *mf, void *opaque)
++{
++    void *block;
++    uintptr_t stack_addr = (uintptr_t)&block;
++    int ok;
++
++    block = mf->js_malloc(opaque, 64);
++    if (!block)
++        return 0;
++    ok = ((uintptr_t)block & 7) == 0 && (uintptr_t)block < (1ull << 48) &&
++         stack_addr < (1ull << 48);
++    if (!ok)
++        fprintf(stderr,
++                "QJS_NAN_BOXING64: heap address 0x%" PRIxPTR
++                " does not fit the 48-bit value encoding\n",
++                (uintptr_t)block);
++    mf->js_free(opaque, block);
++    return ok;
++}
++#endif
++
+@@ -3800,0 +3839,5 @@
++#if QJS_NAN_BOXING64
++    if (!js_nb64_addresses_fit(mf, opaque))
++        return NULL;
++#endif
++
+@@ -10930,0 +10974,5 @@
++#if QJS_NAN_BOXING64 && !defined(NDEBUG)
++    /* See JS_DupValueRT: a counted tag with a NULL pointer is not a value the
++       engine can have produced. */
++    assert(!JS_VALUE_HAS_REF_COUNT(v) || JS_VALUE_GET_PTR(v) != NULL);
++#endif
+@@ -14925 +14973 @@
+-        if (JS_VALUE_GET_TAG(src[i]) != JS_TAG_FLOAT64)
++        if (!JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(src[i])))
+@@ -14951 +14999 @@
+-        if (tag == JS_TAG_FLOAT64) {
++        if (JS_TAG_IS_FLOAT64(tag)) {
+@@ -14989 +15037 @@
+-    if (tag == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag)) {
+@@ -15007 +15055 @@
+-    if (tag == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag)) {
+@@ -20726 +20774 @@
+-    if (tag1 == JS_TAG_FLOAT64 && tag2 == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag1) && JS_TAG_IS_FLOAT64(tag2)) {
+@@ -21101 +21149 @@
+-    if (tag1 == JS_TAG_FLOAT64 && tag2 == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag1) && JS_TAG_IS_FLOAT64(tag2)) {
+@@ -21440 +21488 @@
+-        if (tag1 == JS_TAG_FLOAT64) {
++        if (JS_TAG_IS_FLOAT64(tag1)) {
+@@ -21446 +21494 @@
+-        } else if (tag2 == JS_TAG_FLOAT64) {
++        } else if (JS_TAG_IS_FLOAT64(tag2)) {
+@@ -21539,2 +21587,2 @@
+-    } else if ((tag1 <= JS_TAG_NULL || tag1 == JS_TAG_FLOAT64) &&
+-               (tag2 <= JS_TAG_NULL || tag2 == JS_TAG_FLOAT64)) {
++    } else if ((tag1 <= JS_TAG_NULL || JS_TAG_IS_FLOAT64(tag1)) &&
++               (tag2 <= JS_TAG_NULL || JS_TAG_IS_FLOAT64(tag2))) {
+@@ -21593 +21641 @@
+-            if (tag1 == JS_TAG_FLOAT64) {
++            if (JS_TAG_IS_FLOAT64(tag1)) {
+@@ -21598 +21646 @@
+-            if (tag2 == JS_TAG_FLOAT64) {
++            if (JS_TAG_IS_FLOAT64(tag2)) {
+@@ -21632 +21680 @@
+-            tag == JS_TAG_FLOAT64 ||
++            JS_TAG_IS_FLOAT64(tag) ||
+@@ -21651,4 +21699,4 @@
+-        } else if ((tag1 == JS_TAG_FLOAT64 &&
+-                    (tag2 == JS_TAG_INT || tag2 == JS_TAG_FLOAT64)) ||
+-                   (tag2 == JS_TAG_FLOAT64 &&
+-                    (tag1 == JS_TAG_INT || tag1 == JS_TAG_FLOAT64))) {
++        } else if ((JS_TAG_IS_FLOAT64(tag1) &&
++                    (tag2 == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag2))) ||
++                   (JS_TAG_IS_FLOAT64(tag2) &&
++                    (tag1 == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag1)))) {
+@@ -21656 +21704 @@
+-            if (tag1 == JS_TAG_FLOAT64) {
++            if (JS_TAG_IS_FLOAT64(tag1)) {
+@@ -21661 +21709 @@
+-            if (tag2 == JS_TAG_FLOAT64) {
++            if (JS_TAG_IS_FLOAT64(tag2)) {
+@@ -21864 +21912 @@
+-        } else if (tag2 == JS_TAG_FLOAT64) {
++        } else if (JS_TAG_IS_FLOAT64(tag2)) {
+@@ -21873 +21921 @@
+-        if (tag2 == JS_TAG_FLOAT64) {
++        if (JS_TAG_IS_FLOAT64(tag2)) {
+@@ -25052 +25100 @@
+-    if (tag == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag)) {
+@@ -25350 +25398,3 @@
+-    e->slot_off = slot * (uint32_t)sizeof(JSValue);
++    /* The property slot's own offset in the property array, not the value's
++       size: JSProperty is at least 8 bytes in every encoding. */
++    e->slot_off = slot * (uint32_t)sizeof(JSProperty);
+@@ -25931 +25981 @@
+-    off = e->slot_off / (uint32_t)sizeof(JSValue);
++    off = e->slot_off / (uint32_t)sizeof(JSProperty);
+@@ -26375 +26425 @@
+-        if (ta == JS_TAG_INT && tb == JS_TAG_FLOAT64)
++        if (ta == JS_TAG_INT && JS_TAG_IS_FLOAT64(tb))
+@@ -26377 +26427 @@
+-        else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
++        else if (JS_TAG_IS_FLOAT64(ta) && tb == JS_TAG_INT)
+@@ -26423 +26473 @@
+-        if (ta == JS_TAG_INT && tb == JS_TAG_FLOAT64)
++        if (ta == JS_TAG_INT && JS_TAG_IS_FLOAT64(tb))
+@@ -26425 +26475 @@
+-        else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
++        else if (JS_TAG_IS_FLOAT64(ta) && tb == JS_TAG_INT)
+@@ -26527,2 +26577,2 @@
+-        else if ((_ta == JS_TAG_INT || _ta == JS_TAG_FLOAT64) &&
+-                 (_tb == JS_TAG_INT || _tb == JS_TAG_FLOAT64)) _k = 2;
++        else if ((_ta == JS_TAG_INT || JS_TAG_IS_FLOAT64(_ta)) &&
++                 (_tb == JS_TAG_INT || JS_TAG_IS_FLOAT64(_tb))) _k = 2;
+@@ -26675,3 +26725,3 @@
+- * The encoder and the light handlers depend on `REGVM_LIGHT_PREFIX_SLOTS`.
+- * Light eligibility guarantees a light function never runs a handler that
+- * reads the tail.
++ * The encoder and the light handlers depend on `REGVM_LIGHT_PREFIX_BYTES`,
++ * which is where the record-only tail begins. Light eligibility guarantees a
++ * light function never runs a handler that reads the tail.
+@@ -26679,2 +26728,0 @@
+-#define REGVM_LIGHT_PREFIX_SLOTS 9
+-#define REGVM_LIGHT_PREFIX_BYTES (REGVM_LIGHT_PREFIX_SLOTS * 16)
+@@ -26763,0 +26812,12 @@
++/* The light prefix ends where the record-only tail begins. It is a byte range,
++   not a fixed word count: the 16-byte value packs two of the struct's fields
++   into one register slot and the 8-byte one does not, while the fields a light
++   handler reads are the same set either way. */
++#define REGVM_LIGHT_PREFIX_BYTES ((int)offsetof(struct JSRegRun, ctx))
++#define REGVM_LIGHT_PREFIX_SLOTS \
++    (REGVM_LIGHT_PREFIX_BYTES / (int)sizeof(JSValue))
++_Static_assert(offsetof(struct JSRegRun, ctx) % sizeof(JSValue) == 0,
++               "the light prefix is a whole number of registers");
++_Static_assert(REGVM_LIGHT_PREFIX_BYTES >= 9 * 8,
++               "the light prefix holds every field a light handler reads");
++
+@@ -27751,2 +27811 @@
+-        FR(d).u.float64 = (r); \
+-        FR(d).tag = JS_TAG_FLOAT64; \
++        FR(d) = __JS_NewFloat64(r); \
+@@ -27785,7 +27844,5 @@
+-        int64_t _ot = FR(d).tag; \
+-        JSValue _o; \
+-        if (unlikely(_ot < 0)) \
+-            _o = FR(d); \
+-        FR(d).u.float64 = (r); \
+-        FR(d).tag = JS_TAG_FLOAT64; \
+-        if (unlikely(_ot < 0) && \
++        JSValue _ot = FR(d), _o; \
++        if (unlikely(REGVM_HAS_COUNT(_ot))) \
++            _o = _ot; \
++        FR(d) = __JS_NewFloat64(r); \
++        if (unlikely(REGVM_HAS_COUNT(_ot)) && \
+@@ -27840 +27897,2 @@
+-                                         _d >> 4, _a >> 4, _o2); \
++                                         (int)(_d / (int)sizeof(JSValue)), \
++                                         (int)(_a / (int)sizeof(JSValue)), _o2); \
+@@ -27972,3 +28030,4 @@
+-        if (likely(JS_VALUE_GET_TAG(FR(_a)) == JS_TAG_FLOAT64 && \
+-                   JS_VALUE_GET_TAG(FR(_b)) == JS_TAG_FLOAT64)) { \
+-            double _r = REGVM_F64_OP(SUB_, FR(_a).u.float64, FR(_b).u.float64); \
++        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(_a))) && \
++                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(_b))))) { \
++            double _r = REGVM_F64_OP(SUB_, JS_VALUE_GET_FLOAT64(FR(_a)), \
++                                      JS_VALUE_GET_FLOAT64(FR(_b))); \
+@@ -28926 +28985 @@
+-static const JSValue regvm_undefined_value = { { .int32 = 0 }, JS_TAG_UNDEFINED };
++static const JSValue regvm_undefined_value = JS_UNDEFINED;
+@@ -30402 +30461,3 @@
+-                                            d >> 4, a >> 4, f->b->cpool[idx]);
++                                            (int)(d / (int)sizeof(JSValue)),
++                                            (int)(a / (int)sizeof(JSValue)),
++                                            f->b->cpool[idx]);
+@@ -30415 +30476,2 @@
+-                                        d >> 4, a >> 4, cst);
++                                        (int)(d / (int)sizeof(JSValue)),
++                                        (int)(a / (int)sizeof(JSValue)), cst);
+@@ -31195,2 +31257 @@
+-    slot->u.float64 = r;
+-    slot->tag = JS_TAG_FLOAT64;
++    *slot = __JS_NewFloat64(r);
+@@ -31199,2 +31260 @@
+-    int64_t ot = slot->tag;
+-    JSValue old;
++    JSValue old = *slot;
+@@ -31202,5 +31262,2 @@
+-    if (unlikely(ot < 0))
+-        old = *slot;
+-    slot->u.float64 = r;
+-    slot->tag = JS_TAG_FLOAT64;
+-    if (unlikely(ot < 0) &&
++    *slot = __JS_NewFloat64(r);
++    if (unlikely(REGVM_HAS_COUNT(old)) &&
+@@ -31257,4 +31314,4 @@
+-        if (likely(JS_VALUE_GET_TAG(FR(x)) == JS_TAG_FLOAT64 && \
+-                   JS_VALUE_GET_TAG(FR(y)) == JS_TAG_FLOAT64 && \
+-                   JS_VALUE_GET_TAG(FR(c)) == JS_TAG_FLOAT64)) { \
+-            double p = FR(x).u.float64 * FR(y).u.float64; \
++        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(x))) && \
++                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(y))) && \
++                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(c))))) { \
++            double p = JS_VALUE_GET_FLOAT64(FR(x)) * JS_VALUE_GET_FLOAT64(FR(y)); \
+@@ -31262,2 +31319,3 @@
+-            T_SET_NEXT_F64(da, rev ? FOP(FR(c).u.float64, p) \
+-                                   : FOP(p, FR(c).u.float64), T_SZ_RRRRR); \
++            T_SET_NEXT_F64(da, rev ? FOP(JS_VALUE_GET_FLOAT64(FR(c)), p) \
++                                   : FOP(p, JS_VALUE_GET_FLOAT64(FR(c))), \
++                           T_SZ_RRRRR); \
+@@ -31308,2 +31366,2 @@
+-        if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64)) { \
+-            double d_ = v.u.float64; \
++        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)))) { \
++            double d_ = JS_VALUE_GET_FLOAT64(v); \
+@@ -31600,2 +31658,2 @@
+-        if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
+-                   JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64)) { \
++        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) && \
++                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)))) { \
+@@ -31615,3 +31673,3 @@
+-            if (likely((_ta == JS_TAG_INT || _ta == JS_TAG_FLOAT64) && \
+-                       (_tb == JS_TAG_INT || _tb == JS_TAG_FLOAT64))) { \
+-                double _da = (_ta == JS_TAG_FLOAT64) ? \
++            if (likely((_ta == JS_TAG_INT || JS_TAG_IS_FLOAT64(_ta)) && \
++                       (_tb == JS_TAG_INT || JS_TAG_IS_FLOAT64(_tb)))) { \
++                double _da = JS_TAG_IS_FLOAT64(_ta) ? \
+@@ -31619 +31677 @@
+-                double _db = (_tb == JS_TAG_FLOAT64) ? \
++                double _db = JS_TAG_IS_FLOAT64(_tb) ? \
+@@ -33162,0 +33221,16 @@
++/* Fill the registers no analysis named. Such a register is only ever released,
++   never read as a value, so any valid uncounted word will do -- but it must be
++   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
++   8-byte one it is a double's bits pattern. */
++static inline void regvm_fill_unwritten(JSValue *regs, int n)
++{
++#if QJS_NAN_BOXING64
++    int k;
++
++    for (k = 0; k < n; k++)
++        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
++#else
++    memset(regs, 0, (size_t)n * sizeof(JSValue));
++#endif
++}
++
+@@ -33168 +33242 @@
+-    [0 ... REGVM_UNDEF_TMPL_N - 1] = { { .int32 = 0 }, JS_TAG_UNDEFINED },
++    [0 ... REGVM_UNDEF_TMPL_N - 1] = JS_UNDEFINED,
+@@ -33324 +33398 @@
+-        memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
++        regvm_fill_unwritten(lay->regs, nregs);
+@@ -33334 +33408 @@
+-            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
++            regvm_fill_unwritten(lay->regs, nregs);
+@@ -33442 +33516 @@
+-            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
++            regvm_fill_unwritten(lay->regs, nregs);
+@@ -33561 +33635 @@
+-#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) >> 4)
++#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) / (int)sizeof(JSValue))
+@@ -33564 +33638 @@
+-#define RD_REG8() ((int)(uint8_t)*rpc++ >> 4)
++#define RD_REG8() ((int)(uint8_t)*rpc++ / (int)sizeof(JSValue))
+@@ -33651 +33725 @@
+-                memset(regs, 0, (size_t)ninit * sizeof(JSValue));
++                regvm_fill_unwritten(regs, ninit);
+@@ -34375,2 +34449,2 @@
+-                  } else if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
+-                                    JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64 && \
++                  } else if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) && \
++                                    JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)) && \
+@@ -37382,2 +37456,2 @@
+-                  } else if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
+-                                    JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64 && \
++                  } else if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) && \
++                                    JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)) && \
+@@ -62053,0 +62128,6 @@
++#if QJS_NAN_BOXING64
++    /* The value is one word: no separate tag or union member to name, and a
++       unit built against the other encoding must not bind. */
++    out->off_jsvalue_tag = 0;
++    out->off_jsvalue_u = 0;
++#else
+@@ -62055,0 +62136 @@
++#endif
+@@ -62857 +62938 @@
+-    else if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64)
++    else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)))
+@@ -63454 +63535 @@
+-    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1\n",
++    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 vmode=%u\n",
+@@ -63456 +63537 @@
+-            QJS_REGVM_THREAD, QJS_REGVM_RECORD);
++            QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
+@@ -63985 +64066 @@
+-    int w = (int)regvm_ld_u16(ip + 1) >> 4;
++    int w = (int)regvm_ld_u16(ip + 1) / (int)sizeof(JSValue);
+@@ -64055 +64136 @@
+-    int w = (int)regvm_ld_u16(ip + 1) >> 4;
++    int w = (int)regvm_ld_u16(ip + 1) / (int)sizeof(JSValue);
+@@ -64371 +64452 @@
+-    if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v))) {
+@@ -64548,2 +64629,2 @@
+-    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_FLOAT64 &&
+-               JS_VALUE_GET_TAG(b) == JS_TAG_FLOAT64) &&
++    if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(a)) &&
++               JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(b))) &&
+@@ -64579 +64660 @@
+-#if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING)
++#if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING) && !QJS_NAN_BOXING64
+@@ -64598,2 +64679,2 @@
+-    /* One 16-byte store: the next copy of this slot loads all 16 bytes at once,
+-       which two 8-byte stores cannot forward to. */
++    /* One store of the whole value: the next copy of this slot loads all of it
++       at once, which its two halves written separately cannot forward to. */
+@@ -64923 +65004 @@
+-    if (tag == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag)) {
+@@ -66083 +66164 @@
+-                            } else if (JS_VALUE_GET_TAG(cv) == JS_TAG_FLOAT64) {
++                            } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(cv))) {
+@@ -67919,2 +68000,4 @@
+-/* Register operands are byte offsets: one byte reaches register 15, two bytes
+-   reach register 4095. */
++/* Register operands are byte offsets: one wire byte reaches register 15, two
++   reach register 4095. The narrow form's byte is a register index in wire
++   units (REGVM_WIRE_REG_SCALE), so 16 registers is its bound in either value
++   encoding. */
+@@ -67921,0 +68005,5 @@
++/* A narrow register operand is written as the register index times this, a
++   constant of the wire format rather than of the writer's value size: the byte
++   is the narrow form's whole point, and a stream written by one encoding has to
++   read in the other, which the builtin bundles require. */
++#define REGVM_WIRE_REG_SCALE 16
+@@ -69567 +69655 @@
+-            JS_VALUE_GET_TAG(fd->cpool[in->ops[2]]) != JS_TAG_FLOAT64)
++            !JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(fd->cpool[in->ops[2]])))
+@@ -78213,0 +78302,10 @@
++/* The bytecode header is the version, the checksum and then the payload, in
++   both value encodings. What a file stores is tags, payloads and register
++   offsets, not a value's memory, so a file from one encoding is read by the
++   other wherever those are independent of the value's size; the one place they
++   are not is a register bytecode operand, which is a byte offset into the
++   writer's register file. The reader therefore takes the writer's value size
++   (this build's own, or 16 for a file from the 16-byte build, which is the only
++   other one) and scales narrow and wide register operands by it. */
++#define BC_HDR_SIZE 5 /* version, 4 checksum bytes */
++
+@@ -79030 +79128,4 @@
+-                    dbuf_putc(&wire, (uint8_t)v); /* narrow: stored byte as is */
++                    /* narrow: the register index, in wire units */
++                    dbuf_putc(&wire,
++                              (uint8_t)(v / (uint32_t)sizeof(JSValue) *
++                                        REGVM_WIRE_REG_SCALE));
+@@ -79714 +79815,2 @@
+-    // don't include version and checksum fields in checksum
++    /* Don't include the version, the value-encoding byte or the checksum field
++       itself in the checksum. */
+@@ -79716,2 +79818,2 @@
+-    h = bc_csum(&d->buf[5], d->size - 5);
+-    put_u32(&d->buf[1], h);
++    h = bc_csum(&d->buf[BC_HDR_SIZE], d->size - BC_HDR_SIZE);
++    put_u32(&d->buf[BC_HDR_SIZE - 4], h);
+@@ -79772,0 +79875 @@
++
+@@ -80380,2 +80483,2 @@
+-                    /* The narrow form stores the byte offset as a raw byte, not
+-                       a LEB. */
++                    /* The narrow form stores the register index times
++                       REGVM_WIRE_REG_SCALE as a raw byte, not a LEB. */
+@@ -80387 +80490,7 @@
+-                    if (v >= (uint32_t)(REGVM_NARROW_REG_MAX * sizeof(JSValue))) {
++                    if (v % REGVM_WIRE_REG_SCALE) {
++                        JS_ThrowSyntaxError(ctx, "register %u misaligned",
++                                            (unsigned)v);
++                        goto fail_ins;
++                    }
++                    v /= REGVM_WIRE_REG_SCALE;
++                    if (v >= (uint32_t)REGVM_NARROW_REG_MAX) {
+@@ -80392 +80501 @@
+-                    sv = (int32_t)v;
++                    sv = (int32_t)(v * (uint32_t)sizeof(JSValue));
+@@ -82161,0 +82271 @@
++
+@@ -82167 +82277,6 @@
+-        JS_ThrowSyntaxError(s->ctx, "checksum error");
++        /* A file from the 8-byte-value build carries a mode byte where this
++           reader expects the first payload byte, so it fails here before it
++           can fail anywhere that matters. Name the likelier cause. */
++        JS_ThrowSyntaxError(s->ctx,
++                            "checksum error (a file written with the other "
++                            "value encoding has an extra header byte)");
+@@ -105658 +105773 @@
+-    if (tag == JS_TAG_FLOAT64) {
++    if (JS_TAG_IS_FLOAT64(tag)) {

@@ -177,6 +177,34 @@ typedef uint32_t JSAtom;
 #endif
 #endif
 
+/* Eight-byte values on a 64-bit target: one word holds every value, a double
+   included, instead of a 16-byte union and tag pair. Off by default, so the
+   build is then the one without the feature.
+
+   With it on, `JSValue` is a `uint64_t` and the `.u` / `.tag` struct fields do
+   not exist: every user of a value goes through the JS_VALUE_* macros below.
+   ABI-incompatible: code compiled with the flag and code compiled without it
+   cannot be linked together, and a bytecode file, a profile or a compiled unit
+   from one mode is refused by the other.
+
+   Android: a build with this flag must pass
+   `android:allowNativeHeapPointerTagging="false"` in the manifest, because
+   Android 11 and later tag heap pointers in their top byte, which the encoding
+   below does not expect. iOS on arm64 needs nothing: user addresses fit in the
+   encoded range and pointer authentication applies to code pointers, not to the
+   data pointers a value holds. */
+#ifndef QJS_NAN_BOXING64
+#define QJS_NAN_BOXING64 0
+#endif
+
+#if QJS_NAN_BOXING64 && JS_NAN_BOXING
+#error "JS_NAN_BOXING and QJS_NAN_BOXING64 are mutually exclusive"
+#endif
+
+#if QJS_NAN_BOXING64 && UINTPTR_MAX != 0xffffffffffffffff
+#error "QJS_NAN_BOXING64 needs a 64-bit target"
+#endif
+
 enum {
     /* all tags with a reference count are negative */
     JS_TAG_FIRST       = -9, /* first negative tag */
@@ -316,6 +344,121 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 
 #else /* !JS_NAN_BOXING */
 
+#if QJS_NAN_BOXING64
+
+/* The debug-only pointer check below, and the bytecode and profile readers,
+   need assert. */
+#include <assert.h>
+
+/*
+ * One 64-bit word per value. The top 19 bits are T, the rest is the payload P:
+ *
+ *   T = v >> 45              P = v & ((1 << 45) - 1)
+ *
+ * A non-double with tag `t` has T = t - JS_TAG_FIRST, so T is 0..16 and P holds
+ * that tag's payload. A double is stored as its bit pattern plus
+ * JS_NB64_ADDEND, which puts every double at T >= 17 -- +0.0 is the lowest one,
+ * at exactly JS_TAG_FLOAT64 -- so a double can never be read as a tagged value
+ * and JS_TAG_IS_FLOAT64 means what it means in the 32-bit encoding. A pointer
+ * is stored shifted right by three: that keeps 45 bits of a 48-bit address
+ * space, room for the tag above it, and the low three bits free for the tags
+ * that are mostly-immediate.
+ */
+typedef uint64_t JSValue;
+
+#define JS_NB64_TAG_BITS 45
+#define JS_NB64_P_MASK   ((1ull << JS_NB64_TAG_BITS) - 1)
+#define JS_NB64_ADDEND   (17ull << JS_NB64_TAG_BITS)
+
+#define JS_VALUE_GET_TAG(v) ((int)((v) >> JS_NB64_TAG_BITS) + JS_TAG_FIRST)
+#define JS_VALUE_GET_INT(v) ((int32_t)(uint32_t)(v))
+#define JS_VALUE_GET_BOOL(v) ((int)(v))
+#define JS_VALUE_GET_SHORT_BIG_INT(v) ((int32_t)(uint32_t)(v))
+#define JS_VALUE_GET_PTR(v) ((void *)((uintptr_t)((v) & JS_NB64_P_MASK) << 3))
+
+/* `tag - JS_TAG_FIRST` is an integer constant expression, so every special
+   value below is too, and can initialise a static or a const table. */
+#define JS_MKVAL(tag, val) \
+    ((((uint64_t)((tag) - JS_TAG_FIRST)) << JS_NB64_TAG_BITS) | (uint32_t)(val))
+
+/* A pointer must be 8-aligned, or its three low bits cannot be dropped, and it
+   must fit the 45 bits the payload has, which is the 48-bit address range the
+   encoding supports. */
+#ifdef NDEBUG
+#define JS_NB64_CHECK_PTR(p) ((void)0)
+#else
+#define JS_NB64_CHECK_PTR(p) \
+    assert(((uintptr_t)(p) & 7) == 0 && (uintptr_t)(p) < (1ull << 48))
+#endif
+#define JS_MKPTR(tag, p) \
+    (JS_NB64_CHECK_PTR(p), \
+     (((uint64_t)((tag) - JS_TAG_FIRST)) << JS_NB64_TAG_BITS) | \
+         ((uintptr_t)(p) >> 3))
+
+static inline double JS_VALUE_GET_FLOAT64(JSValue v)
+{
+    union {
+        uint64_t u64;
+        double d;
+    } u;
+    u.u64 = v - JS_NB64_ADDEND;
+    return u.d;
+}
+
+/* The canonical quiet NaN, encoded. */
+#define JS_NAN (0x7ff8000000000000ull + JS_NB64_ADDEND)
+
+static inline JSValue __JS_NewFloat64(double d)
+{
+    union {
+        uint64_t u64;
+        double d;
+    } u;
+    JSValue v;
+
+    u.d = d;
+    /* Every NaN is stored as the same canonical one, so no NaN payload ever
+       reaches a comparison, a typed array or a hash. */
+    if ((u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000)
+        v = JS_NAN;
+    else
+        v = u.u64 + JS_NB64_ADDEND;
+#ifndef NDEBUG
+    /* A NaN that kept a payload would be a value two NaN-producing paths
+       disagree on, which is the reason to canonicalise here at all. */
+    assert(((u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000)
+               ? v == JS_NAN
+               : JS_VALUE_GET_FLOAT64(v) == d);
+#endif
+    return v;
+}
+
+#define JS_TAG_IS_FLOAT64(tag) \
+    ((unsigned)((tag) - JS_TAG_FIRST) >= (JS_TAG_FLOAT64 - JS_TAG_FIRST))
+
+/* same as JS_VALUE_GET_TAG, but return JS_TAG_FLOAT64 with NaN boxing */
+static inline int JS_VALUE_GET_NORM_TAG(JSValue v)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+
+    return JS_TAG_IS_FLOAT64(tag) ? JS_TAG_FLOAT64 : tag;
+}
+
+static inline bool JS_VALUE_IS_NAN(JSValue v)
+{
+    union {
+        uint64_t u64;
+        double d;
+    } u;
+
+    if (!JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)))
+        return 0;
+    u.u64 = v - JS_NB64_ADDEND;
+    return (u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000;
+}
+
+#else /* !QJS_NAN_BOXING64 */
+
 typedef union JSValueUnion {
     int32_t int32;
     double float64;
@@ -392,14 +535,34 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
     return (u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000;
 }
 
+#endif /* !QJS_NAN_BOXING64 */
+
 #endif /* !JS_NAN_BOXING */
 
+#if QJS_NAN_BOXING64
+/* A value is an int when its upper 32 bits are the int tag's T, shifted down to
+   where those bits sit. The 16-byte encoding ORs the two tags and compares the
+   result with 0, which works only because JS_TAG_INT is 0 there. */
+#define JS_NB64_INT_HI \
+    ((uint64_t)(JS_TAG_INT - JS_TAG_FIRST) << (JS_NB64_TAG_BITS - 32))
+#define JS_VALUE_IS_BOTH_INT(v1, v2) \
+    ((((v1) >> 32) == JS_NB64_INT_HI) & (((v2) >> 32) == JS_NB64_INT_HI))
+#define JS_VALUE_IS_BOTH_FLOAT(v1, v2) \
+    (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v1)) && \
+     JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v2)))
+/* T <= 8 holds the tags that name a counted object, and T 5 is the lazy-JSON
+   marker, which a reader materialises before the value reaches any code that
+   could count it. */
+#define JS_VALUE_HAS_REF_COUNT(v) \
+    (((v) >> JS_NB64_TAG_BITS) <= 8 && ((v) >> JS_NB64_TAG_BITS) != 5)
+#else
 #define JS_VALUE_IS_BOTH_INT(v1, v2) ((JS_VALUE_GET_TAG(v1) | JS_VALUE_GET_TAG(v2)) == 0)
 #define JS_VALUE_IS_BOTH_FLOAT(v1, v2) (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v1)) && JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v2)))
 
 #define JS_VALUE_HAS_REF_COUNT(v) \
     (JS_VALUE_GET_TAG(v) != JS_TAG_LAZY_JSON && \
      (unsigned)JS_VALUE_GET_TAG(v) >= (unsigned)JS_TAG_FIRST)
+#endif
 
 /* special values */
 #define JS_NULL      JS_MKVAL(JS_TAG_NULL, 0)

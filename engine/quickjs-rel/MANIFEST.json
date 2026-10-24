@@ -1515,6 +1515,10 @@
       "sha256": "efb40c460b82d460f8ac5bf5bcb0eba3d174b365783c6eb7f5d18dd5bd9f72f0"
     },
     {
+      "name": "0385-nan-boxing-64.patch",
+      "sha256": "f24d5e547c1683f546d7049a2280075062b2f5d1608d5d3bc693cc2d691a9f5f"
+    },
+    {
       "name": "0386-aot-plain-object-park.patch",
       "sha256": "0f44536505c1a97b0f39e35568d8a1c11d9687475464e1a4691491b963fd9ec9"
     },
@@ -1524,7 +1528,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "c9e2e0986092f0fca8d1ba37cd25b29b8fac997d06deecdc71caf67db9d599ad",
+    "quickjs.c": "a1dbe17e39d20232d4a31ab01d6510316d3ce9e9b9733f9c5f7842ae6d331a2d",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
@@ -1546,7 +1550,7 @@
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
     "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
-    "quickjs.h": "73e5008e8288aee7d2ba2de41a21862c0c627e032d7d9cc9864cfe29799b72ac",
+    "quickjs.h": "9c8d3ab694430b11f765ac3bd055e6dfb27e0db2acb48ed5a61c81c01814e5a8",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
 }

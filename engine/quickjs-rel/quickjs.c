@@ -1576,9 +1576,11 @@ struct JSMegaEntry {
 };
 
 /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
-   engine refuses a generated unit built against another version. */
+   engine refuses a generated unit built against another version. The value
+   encoding is part of the ABI: a unit compiled against one encoding reads a
+   different JSValue and must not bind against the other. */
 #ifndef QJS_AOT_ABI
-#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
+#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8) | ((uint32_t)QJS_NAN_BOXING64 << 9))
 #endif
 
 /* The layout facts the generated unit is compiled against. The struct and its
@@ -1950,17 +1952,19 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_CALL_RESULT(c_, rip_, v_) \
         do { if (unlikely(AOT_PROF_ON((c_)->b))) \
                  js_aot_prof_call_result((c_)->b, (rip_), (v_)); } while (0)
-/* The threaded chain. `d_` is a register operand, encoded as index * 16. */
+/* The threaded chain. `d_` is a register operand: a byte offset into the
+   register file, so its index is the offset divided by the value size. */
 #define AOT_PROF_TICK(f_, ip_) \
         do { if (unlikely(AOT_PROF_ON((f_)->b))) \
                  js_aot_prof_tick((f_)->b, (ip_)); } while (0)
 #define AOT_PROF_EDGE(f_, ip_, off_) \
         do { if ((off_) < 0 && unlikely(AOT_PROF_ON((f_)->b))) \
                  js_aot_prof_edge((f_)->b, (ip_) + (off_)); } while (0)
-/* `d_` is a register operand, encoded as index * 16. */
+/* `d_` is a register operand, a byte offset. */
 #define AOT_PROF_REG_T(f_, d_, v_) \
         do { if (unlikely(AOT_PROF_ON((f_)->b))) \
-                 js_aot_prof_reg((f_)->b, (d_) >> 4, (v_)); } while (0)
+                 js_aot_prof_reg((f_)->b, (int)((d_) / (int)sizeof(JSValue)), \
+                                 (v_)); } while (0)
 #define AOT_PROF_TAKEN(f_, ip_) \
         do { if (unlikely(AOT_PROF_ON((f_)->b))) \
                  js_aot_prof_taken((f_)->b, (ip_)); } while (0)
@@ -2999,6 +3003,13 @@ JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 
 JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 {
+#if QJS_NAN_BOXING64 && !defined(NDEBUG)
+    /* A counted tag with a NULL pointer is an all-bits-zero word that was read
+       as a value: T 0 is the big-int tag, whose payload is the pointer. Count
+       it here, where the value is still in hand, rather than faulting on the
+       increment below. */
+    assert(!JS_VALUE_HAS_REF_COUNT(v) || JS_VALUE_GET_PTR(v) != NULL);
+#endif
     return js_dup(v);
 }
 
@@ -3793,10 +3804,42 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
     return unlikely(sp < rt->stack_limit);
 }
 
+#if QJS_NAN_BOXING64
+/* The value encoding keeps 45 bits of a pointer, so every heap or stack address
+   a value can name has to fit the 48-bit address space it covers. A tagged
+   heap (Android 11 and later) or a wider user address space moves addresses
+   outside that range, and the encoding would silently truncate them, so the
+   runtime refuses to start instead. */
+static int js_nb64_addresses_fit(const JSMallocFunctions *mf, void *opaque)
+{
+    void *block;
+    uintptr_t stack_addr = (uintptr_t)&block;
+    int ok;
+
+    block = mf->js_malloc(opaque, 64);
+    if (!block)
+        return 0;
+    ok = ((uintptr_t)block & 7) == 0 && (uintptr_t)block < (1ull << 48) &&
+         stack_addr < (1ull << 48);
+    if (!ok)
+        fprintf(stderr,
+                "QJS_NAN_BOXING64: heap address 0x%" PRIxPTR
+                " does not fit the 48-bit value encoding\n",
+                (uintptr_t)block);
+    mf->js_free(opaque, block);
+    return ok;
+}
+#endif
+
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
     JSRuntime *rt;
     JSMallocState ms;
+
+#if QJS_NAN_BOXING64
+    if (!js_nb64_addresses_fit(mf, opaque))
+        return NULL;
+#endif
 
     memset(&ms, 0, sizeof(ms));
     ms.opaque = opaque;
@@ -10603,6 +10646,19 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
         js_free_value_rt(rt, v);
         return;
     }
+    if (likely(tag == JS_TAG_OBJECT)) {
+        JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
+        if (likely(((JSObject *)p)->class_id == JS_CLASS_OBJECT)) {
+            /* A plain object is not a value js_drc_value_is_large() can call
+               large, so parking it takes neither the tag switch below nor the
+               large-value walk. */
+            list_del(&p->link);
+            list_add(&p->link, &rt->gc_zero_ref_count_list);
+            JS_GC_IN_ZCT(p) = 1;
+            rt->zct_nobj++;
+            return;
+        }
+    }
     if (js_drc_value_is_large(v)) {
         /* One large value can dominate the parked memory before allocation
            pressure is even felt; make the next safepoint reconcile. */
@@ -10928,6 +10984,11 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
 
 void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
+#if QJS_NAN_BOXING64 && !defined(NDEBUG)
+    /* See JS_DupValueRT: a counted tag with a NULL pointer is not a value the
+       engine can have produced. */
+    assert(!JS_VALUE_HAS_REF_COUNT(v) || JS_VALUE_GET_PTR(v) != NULL);
+#endif
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         void *p = JS_VALUE_GET_PTR(v);
         if (--JS_REF_COUNT(p) <= 0) {
@@ -14922,7 +14983,7 @@ static int js_arr_packed_kind_of(const JSValue *src, int count)
     for (i = 0; i < count; i++) {
         if (js_arr_packed_num_int(src[i], &i32))
             continue;
-        if (JS_VALUE_GET_TAG(src[i]) != JS_TAG_FLOAT64)
+        if (!JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(src[i])))
             return 0;
         kind = JS_ARR_KIND_FLOAT64;
     }
@@ -14948,7 +15009,7 @@ static bool js_array_pack(JSContext *ctx, JSObject *p)
         int tag = JS_VALUE_GET_TAG(src[i]);
         if (tag == JS_TAG_INT)
             continue;
-        if (tag == JS_TAG_FLOAT64) {
+        if (JS_TAG_IS_FLOAT64(tag)) {
             all_int = false;
             continue;
         }
@@ -14986,7 +15047,7 @@ static inline bool js_arr_packed_num_int(JSValueConst v, int32_t *i)
         *i = JS_VALUE_GET_INT(v);
         return true;
     }
-    if (tag == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag)) {
         double d = JS_VALUE_GET_FLOAT64(v);
         int32_t k = (int32_t)d;
         if ((double)k == d && !(k == 0 && signbit(d))) {
@@ -15004,7 +15065,7 @@ static inline bool js_arr_packed_num_double(JSValueConst v, double *d)
         *d = (double)JS_VALUE_GET_INT(v);
         return true;
     }
-    if (tag == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag)) {
         *d = JS_VALUE_GET_FLOAT64(v);
         return true;
     }
@@ -20723,7 +20784,7 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
     /* fast path for float operations */
-    if (tag1 == JS_TAG_FLOAT64 && tag2 == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag1) && JS_TAG_IS_FLOAT64(tag2)) {
         d1 = JS_VALUE_GET_FLOAT64(op1);
         d2 = JS_VALUE_GET_FLOAT64(op2);
         goto handle_float64;
@@ -21098,7 +21159,7 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
     /* fast path for float64 */
-    if (tag1 == JS_TAG_FLOAT64 && tag2 == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag1) && JS_TAG_IS_FLOAT64(tag2)) {
         double d1, d2;
         d1 = JS_VALUE_GET_FLOAT64(op1);
         d2 = JS_VALUE_GET_FLOAT64(op2);
@@ -21437,13 +21498,13 @@ static int js_compare_bigint(JSContext *ctx, OPCodeEnum op,
             v2 = JS_VALUE_GET_SHORT_BIG_INT(op2);
         val = (v1 > v2) - (v1 < v2);
     } else {
-        if (tag1 == JS_TAG_FLOAT64) {
+        if (JS_TAG_IS_FLOAT64(tag1)) {
             p2 = JS_ToBigIntBuf(ctx, &buf2, op2);
             val = js_bigint_float64_cmp(ctx, p2, JS_VALUE_GET_FLOAT64(op1));
             if (val == 2)
                 goto unordered;
             val = -val;
-        } else if (tag2 == JS_TAG_FLOAT64) {
+        } else if (JS_TAG_IS_FLOAT64(tag2)) {
             p1 = JS_ToBigIntBuf(ctx, &buf1, op1);
             val = js_bigint_float64_cmp(ctx, p1, JS_VALUE_GET_FLOAT64(op2));
             if (val == 2) {
@@ -21536,8 +21597,8 @@ sp[-1] = JS_UNDEFINED;
         }
         JS_FreeValue(ctx, op1);
         JS_FreeValue(ctx, op2);
-    } else if ((tag1 <= JS_TAG_NULL || tag1 == JS_TAG_FLOAT64) &&
-               (tag2 <= JS_TAG_NULL || tag2 == JS_TAG_FLOAT64)) {
+    } else if ((tag1 <= JS_TAG_NULL || JS_TAG_IS_FLOAT64(tag1)) &&
+               (tag2 <= JS_TAG_NULL || JS_TAG_IS_FLOAT64(tag2))) {
         /* fast path for float64/int */
         goto float64_compare;
     } else {
@@ -21590,12 +21651,12 @@ sp[-1] = JS_UNDEFINED;
 
         float64_compare:
             /* can use floating point comparison */
-            if (tag1 == JS_TAG_FLOAT64) {
+            if (JS_TAG_IS_FLOAT64(tag1)) {
                 d1 = JS_VALUE_GET_FLOAT64(op1);
             } else {
                 d1 = JS_VALUE_GET_INT(op1);
             }
-            if (tag2 == JS_TAG_FLOAT64) {
+            if (JS_TAG_IS_FLOAT64(tag2)) {
                 d2 = JS_VALUE_GET_FLOAT64(op2);
             } else {
                 d2 = JS_VALUE_GET_INT(op2);
@@ -21629,7 +21690,7 @@ sp[-1] = JS_UNDEFINED;
 static bool tag_is_number(uint32_t tag)
 {
     return (tag == JS_TAG_INT ||
-            tag == JS_TAG_FLOAT64 ||
+            JS_TAG_IS_FLOAT64(tag) ||
             tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT);
 }
 
@@ -21648,17 +21709,17 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
     if (tag_is_number(tag1) && tag_is_number(tag2)) {
         if (tag1 == JS_TAG_INT && tag2 == JS_TAG_INT) {
             res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2);
-        } else if ((tag1 == JS_TAG_FLOAT64 &&
-                    (tag2 == JS_TAG_INT || tag2 == JS_TAG_FLOAT64)) ||
-                   (tag2 == JS_TAG_FLOAT64 &&
-                    (tag1 == JS_TAG_INT || tag1 == JS_TAG_FLOAT64))) {
+        } else if ((JS_TAG_IS_FLOAT64(tag1) &&
+                    (tag2 == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag2))) ||
+                   (JS_TAG_IS_FLOAT64(tag2) &&
+                    (tag1 == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag1)))) {
             double d1, d2;
-            if (tag1 == JS_TAG_FLOAT64) {
+            if (JS_TAG_IS_FLOAT64(tag1)) {
                 d1 = JS_VALUE_GET_FLOAT64(op1);
             } else {
                 d1 = JS_VALUE_GET_INT(op1);
             }
-            if (tag2 == JS_TAG_FLOAT64) {
+            if (JS_TAG_IS_FLOAT64(tag2)) {
                 d2 = JS_VALUE_GET_FLOAT64(op2);
             } else {
                 d2 = JS_VALUE_GET_INT(op2);
@@ -21861,7 +21922,7 @@ static bool js_strict_eq2(JSContext *ctx, JSValueConst op1, JSValueConst op2,
         if (tag2 == JS_TAG_INT) {
             d2 = JS_VALUE_GET_INT(op2);
             goto number_test;
-        } else if (tag2 == JS_TAG_FLOAT64) {
+        } else if (JS_TAG_IS_FLOAT64(tag2)) {
             d2 = JS_VALUE_GET_FLOAT64(op2);
             goto number_test;
         } else {
@@ -21870,7 +21931,7 @@ static bool js_strict_eq2(JSContext *ctx, JSValueConst op1, JSValueConst op2,
         break;
     case JS_TAG_FLOAT64:
         d1 = JS_VALUE_GET_FLOAT64(op1);
-        if (tag2 == JS_TAG_FLOAT64) {
+        if (JS_TAG_IS_FLOAT64(tag2)) {
             d2 = JS_VALUE_GET_FLOAT64(op2);
         } else if (tag2 == JS_TAG_INT) {
             d2 = JS_VALUE_GET_INT(op2);
@@ -25049,7 +25110,7 @@ static inline __attribute__((always_inline)) int regvm_to_int32_fast(JSValue v, 
         *out = JS_VALUE_GET_INT(v);
         return 1;
     }
-    if (tag == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag)) {
         double d = JS_VALUE_GET_FLOAT64(v);
         if (likely(d >= -2147483648.0 && d < 2147483648.0)) {
             *out = (int32_t)d;
@@ -25347,7 +25408,9 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
     e->misses = misses;
     e->shape = js_dup_shape(rsh);
     *pholder = hsh ? js_dup_shape(hsh) : NULL;
-    e->slot_off = slot * (uint32_t)sizeof(JSValue);
+    /* The property slot's own offset in the property array, not the value's
+       size: JSProperty is at least 8 bytes in every encoding. */
+    e->slot_off = slot * (uint32_t)sizeof(JSProperty);
     e->kind = kind;
     rt->aot_pic_epoch++;
 }
@@ -25928,7 +25991,7 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
     if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
         return 0;                   /* a prototype interceptor appeared */
     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
-    off = e->slot_off / (uint32_t)sizeof(JSValue);
+    off = e->slot_off / (uint32_t)sizeof(JSProperty);
     osh = p->shape;
     /* a watched object (the global objects) gaining a property invalidates
        every cached cell, the same as the generic add paths do */
@@ -26372,9 +26435,9 @@ static inline int regvm_strict_eq(int sub, JSValue a, JSValue b)
     int eq;
 
     if (unlikely(ta != tb)) {
-        if (ta == JS_TAG_INT && tb == JS_TAG_FLOAT64)
+        if (ta == JS_TAG_INT && JS_TAG_IS_FLOAT64(tb))
             eq = (double)JS_VALUE_GET_INT(a) == JS_VALUE_GET_FLOAT64(b);
-        else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
+        else if (JS_TAG_IS_FLOAT64(ta) && tb == JS_TAG_INT)
             eq = JS_VALUE_GET_FLOAT64(a) == (double)JS_VALUE_GET_INT(b);
         else if ((ta == JS_TAG_STRING || ta == JS_TAG_STRING_ROPE) &&
                  (tb == JS_TAG_STRING || tb == JS_TAG_STRING_ROPE))
@@ -26420,9 +26483,9 @@ static inline int regvm_loose_eq(int sub, JSValue a, JSValue b)
     int eq;
 
     if (unlikely(ta != tb)) {
-        if (ta == JS_TAG_INT && tb == JS_TAG_FLOAT64)
+        if (ta == JS_TAG_INT && JS_TAG_IS_FLOAT64(tb))
             eq = (double)JS_VALUE_GET_INT(a) == JS_VALUE_GET_FLOAT64(b);
-        else if (ta == JS_TAG_FLOAT64 && tb == JS_TAG_INT)
+        else if (JS_TAG_IS_FLOAT64(ta) && tb == JS_TAG_INT)
             eq = JS_VALUE_GET_FLOAT64(a) == (double)JS_VALUE_GET_INT(b);
         else if ((ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED) &&
                  (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED))
@@ -26524,8 +26587,8 @@ static __exception int regvm_cmp_take(JSContext *ctx, int sub, JSValue a,
         int _k;
         if (JS_VALUE_IS_BOTH_INT(a, b)) _k = 0;
         else if (JS_VALUE_IS_BOTH_FLOAT(a, b)) _k = 1;
-        else if ((_ta == JS_TAG_INT || _ta == JS_TAG_FLOAT64) &&
-                 (_tb == JS_TAG_INT || _tb == JS_TAG_FLOAT64)) _k = 2;
+        else if ((_ta == JS_TAG_INT || JS_TAG_IS_FLOAT64(_ta)) &&
+                 (_tb == JS_TAG_INT || JS_TAG_IS_FLOAT64(_tb))) _k = 2;
         else _k = 3;
         js_regvm_cmptake[_k]++;
         js_regvm_cmptake_sub[(sub & ~REG_CMP_INVERT) & 63]++;
@@ -26672,12 +26735,10 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
  *   7     ret
  *   8     set_v
  *
- * The encoder and the light handlers depend on `REGVM_LIGHT_PREFIX_SLOTS`.
- * Light eligibility guarantees a light function never runs a handler that
- * reads the tail.
+ * The encoder and the light handlers depend on `REGVM_LIGHT_PREFIX_BYTES`,
+ * which is where the record-only tail begins. Light eligibility guarantees a
+ * light function never runs a handler that reads the tail.
  */
-#define REGVM_LIGHT_PREFIX_SLOTS 9
-#define REGVM_LIGHT_PREFIX_BYTES (REGVM_LIGHT_PREFIX_SLOTS * 16)
 
 /* A record in the arena that a compiled body runs on, entered from C: `aot_anchor` is the
    C stack address it was entered at, so a backtrace can order it among the compiled
@@ -26760,6 +26821,18 @@ typedef struct JSRegRun {
     /* The C stack address a record run by aot_call_record was entered at. */
     uintptr_t aot_anchor;
 } JSRegRun;
+
+/* The light prefix ends where the record-only tail begins. It is a byte range,
+   not a fixed word count: the 16-byte value packs two of the struct's fields
+   into one register slot and the 8-byte one does not, while the fields a light
+   handler reads are the same set either way. */
+#define REGVM_LIGHT_PREFIX_BYTES ((int)offsetof(struct JSRegRun, ctx))
+#define REGVM_LIGHT_PREFIX_SLOTS \
+    (REGVM_LIGHT_PREFIX_BYTES / (int)sizeof(JSValue))
+_Static_assert(offsetof(struct JSRegRun, ctx) % sizeof(JSValue) == 0,
+               "the light prefix is a whole number of registers");
+_Static_assert(REGVM_LIGHT_PREFIX_BYTES >= 9 * 8,
+               "the light prefix holds every field a light handler reads");
 
 /* `hdr_pack` is composed by explicit shifts, which assumes the four narrow
    fields sit in order at these offsets. */
@@ -27748,8 +27821,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 /* The float store tail. A float is uncounted and the old value was only
    borrowed, so the store is plain. */
 #define T_SET_NEXT_F64(d, r, off) do { \
-        FR(d).u.float64 = (r); \
-        FR(d).tag = JS_TAG_FLOAT64; \
+        FR(d) = __JS_NewFloat64(r); \
         AOT_PROF_REG_T(f, d, FR(d)); \
         T_NEXT(off); \
     } while (0)
@@ -27782,13 +27854,11 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
    old value is fetched, before the overwrite, only when it is counted. The
    tag is written as the whole int64_t so the upper bits stay defined. */
 #define T_SET_NEXT_F64(d, r, off) do { \
-        int64_t _ot = FR(d).tag; \
-        JSValue _o; \
-        if (unlikely(_ot < 0)) \
-            _o = FR(d); \
-        FR(d).u.float64 = (r); \
-        FR(d).tag = JS_TAG_FLOAT64; \
-        if (unlikely(_ot < 0) && \
+        JSValue _ot = FR(d), _o; \
+        if (unlikely(REGVM_HAS_COUNT(_ot))) \
+            _o = _ot; \
+        FR(d) = __JS_NewFloat64(r); \
+        if (unlikely(REGVM_HAS_COUNT(_ot)) && \
             unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(_o)) <= 0)) { \
             f->set_v = _o; \
             __attribute__((musttail)) \
@@ -27837,7 +27907,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
         JSValue _o1 = FR(_a), _o2 = FR(T_REG(5)), _out; \
         if ((SUB_) == REG_BIN_ADD) { \
             int _ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc, \
-                                         _d >> 4, _a >> 4, _o2); \
+                                         (int)(_d / (int)sizeof(JSValue)), \
+                                         (int)(_a / (int)sizeof(JSValue)), _o2); \
             if (_ar > 0) T_NEXT(SZ_); \
             if (_ar < 0) T_FAIL(); \
         } \
@@ -27969,9 +28040,10 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 #define T_FAST_RRR_F64(SUB_, SZ_, SLOW_) do { \
         int _d = T_REG(1); \
         int _a = T_REG(3), _b = T_REG(5); \
-        if (likely(JS_VALUE_GET_TAG(FR(_a)) == JS_TAG_FLOAT64 && \
-                   JS_VALUE_GET_TAG(FR(_b)) == JS_TAG_FLOAT64)) { \
-            double _r = REGVM_F64_OP(SUB_, FR(_a).u.float64, FR(_b).u.float64); \
+        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(_a))) && \
+                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(_b))))) { \
+            double _r = REGVM_F64_OP(SUB_, JS_VALUE_GET_FLOAT64(FR(_a)), \
+                                      JS_VALUE_GET_FLOAT64(FR(_b))); \
             T_SET_NEXT_F64(_d, _r, SZ_); \
         } \
         JSValue _out; \
@@ -28923,7 +28995,7 @@ regvm_t_return_trivial_chunk(REGVM_ARGS)
 #if QJS_REGVM_RECORD
 /* A plain call stores `this_obj = undefined`; copying from this constant
    keeps it a single 16-byte store. */
-static const JSValue regvm_undefined_value = { { .int32 = 0 }, JS_TAG_UNDEFINED };
+static const JSValue regvm_undefined_value = JS_UNDEFINED;
 /*
  * The call handler. The fast path builds the callee's record and dispatches
  * the callee's first opcode with it; the slow path (ineligible, native, or an
@@ -30399,7 +30471,9 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
         if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out)) {
             if (sub == REG_BIN_ADD) {
                 int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
-                                            d >> 4, a >> 4, f->b->cpool[idx]);
+                                            (int)(d / (int)sizeof(JSValue)),
+                                            (int)(a / (int)sizeof(JSValue)),
+                                            f->b->cpool[idx]);
                 if (ar > 0) T_NEXT(11);
                 if (ar < 0) T_FAIL();
             }
@@ -30412,7 +30486,8 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
             T_FAIL();
         if (sub == REG_BIN_ADD) {
             int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
-                                        d >> 4, a >> 4, cst);
+                                        (int)(d / (int)sizeof(JSValue)),
+                                        (int)(a / (int)sizeof(JSValue)), cst);
             if (ar > 0) {
                 JS_FreeValue(ctx, cst);
                 T_NEXT(11);
@@ -31192,18 +31267,13 @@ static inline void regvm_store_intermediate(JSRuntime *rt, JSValue *slot, JSValu
 static inline void regvm_store_intermediate_f64(JSRuntime *rt, JSValue *slot, double r)
 {
 #if QJS_DRC
-    slot->u.float64 = r;
-    slot->tag = JS_TAG_FLOAT64;
+    *slot = __JS_NewFloat64(r);
     (void)rt;
 #else
-    int64_t ot = slot->tag;
-    JSValue old;
+    JSValue old = *slot;
 
-    if (unlikely(ot < 0))
-        old = *slot;
-    slot->u.float64 = r;
-    slot->tag = JS_TAG_FLOAT64;
-    if (unlikely(ot < 0) &&
+    *slot = __JS_NewFloat64(r);
+    if (unlikely(REGVM_HAS_COUNT(old)) &&
         unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0))
         js_free_value_rt(rt, old);
 #endif
@@ -31254,13 +31324,14 @@ static inline void regvm_store_intermediate_f64(JSRuntime *rt, JSValue *slot, do
         int da = T_REG(7); \
         int c = T_REG(9); \
         JSValue t, r; \
-        if (likely(JS_VALUE_GET_TAG(FR(x)) == JS_TAG_FLOAT64 && \
-                   JS_VALUE_GET_TAG(FR(y)) == JS_TAG_FLOAT64 && \
-                   JS_VALUE_GET_TAG(FR(c)) == JS_TAG_FLOAT64)) { \
-            double p = FR(x).u.float64 * FR(y).u.float64; \
+        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(x))) && \
+                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(y))) && \
+                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(FR(c))))) { \
+            double p = JS_VALUE_GET_FLOAT64(FR(x)) * JS_VALUE_GET_FLOAT64(FR(y)); \
             regvm_store_intermediate_f64(ctx->rt, &FR(dm), p); \
-            T_SET_NEXT_F64(da, rev ? FOP(FR(c).u.float64, p) \
-                                   : FOP(p, FR(c).u.float64), T_SZ_RRRRR); \
+            T_SET_NEXT_F64(da, rev ? FOP(JS_VALUE_GET_FLOAT64(FR(c)), p) \
+                                   : FOP(p, JS_VALUE_GET_FLOAT64(FR(c))), \
+                           T_SZ_RRRRR); \
         } \
         if (likely(regvm_num_fast(REG_BIN_MUL, FR(x), FR(y), &t)) && \
             (rev ? likely(regvm_num_fast(sub2, FR(c), t, &r)) \
@@ -31305,8 +31376,8 @@ T_DEF_ARITH2(sub_mul, REG_BIN_SUB, REGVM_F_SUB, 1)
             regvm_store_intermediate(ctx->rt, &FR(dt), v); \
             T_SET_NEXT_B(dh, js_int32(i_ + (FD_)), T_SZ_RRR); \
         } \
-        if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64)) { \
-            double d_ = v.u.float64; \
+        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)))) { \
+            double d_ = JS_VALUE_GET_FLOAT64(v); \
             regvm_store_intermediate_f64(ctx->rt, &FR(dt), d_); \
             T_SET_NEXT_F64(dh, d_ + (FD_), T_SZ_RRR); \
         } \
@@ -31597,8 +31668,8 @@ static uint8_t *REGVM_CC regvm_t_branch_not_nullish(REGVM_ARGS)
             if (_take) { T_BR_NEXT((SZ_) + _off); } \
             T_NEXT((SZ_)); \
         } \
-        if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
-                   JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64)) { \
+        if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) && \
+                   JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)))) { \
             int _rd = regvm_double_cmp(_sub & ~REG_CMP_INVERT, \
                                        JS_VALUE_GET_FLOAT64(_a), \
                                        JS_VALUE_GET_FLOAT64(_b)); \
@@ -31612,11 +31683,11 @@ static uint8_t *REGVM_CC regvm_t_branch_not_nullish(REGVM_ARGS)
         if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) || \
                    JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)))) { \
             int _ta = JS_VALUE_GET_TAG(_a), _tb = JS_VALUE_GET_TAG(_b); \
-            if (likely((_ta == JS_TAG_INT || _ta == JS_TAG_FLOAT64) && \
-                       (_tb == JS_TAG_INT || _tb == JS_TAG_FLOAT64))) { \
-                double _da = (_ta == JS_TAG_FLOAT64) ? \
+            if (likely((_ta == JS_TAG_INT || JS_TAG_IS_FLOAT64(_ta)) && \
+                       (_tb == JS_TAG_INT || JS_TAG_IS_FLOAT64(_tb)))) { \
+                double _da = JS_TAG_IS_FLOAT64(_ta) ? \
                     JS_VALUE_GET_FLOAT64(_a) : (double)JS_VALUE_GET_INT(_a); \
-                double _db = (_tb == JS_TAG_FLOAT64) ? \
+                double _db = JS_TAG_IS_FLOAT64(_tb) ? \
                     JS_VALUE_GET_FLOAT64(_b) : (double)JS_VALUE_GET_INT(_b); \
                 int _rd = regvm_double_cmp(_sub & ~REG_CMP_INVERT, _da, _db); \
                 if (likely(_rd >= 0)) { \
@@ -33160,12 +33231,28 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
  */
 /* always_inline: both callers are already framed, and a twelve-argument call
    would pass some arguments on the stack. */
+/* Fill the registers no analysis named. Such a register is only ever released,
+   never read as a value, so any valid uncounted word will do -- but it must be
+   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
+   8-byte one it is a double's bits pattern. */
+static inline void regvm_fill_unwritten(JSValue *regs, int n)
+{
+#if QJS_NAN_BOXING64
+    int k;
+
+    for (k = 0; k < n; k++)
+        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
+#else
+    memset(regs, 0, (size_t)n * sizeof(JSValue));
+#endif
+}
+
 /* A static block of `undefined` words. Every register must hold a valid,
    uncounted word before the frame runs; filling the frame from this template
    is one memcpy. */
 #define REGVM_UNDEF_TMPL_N 256
 static const JSValue regvm_undef_tmpl[REGVM_UNDEF_TMPL_N] = {
-    [0 ... REGVM_UNDEF_TMPL_N - 1] = { { .int32 = 0 }, JS_TAG_UNDEFINED },
+    [0 ... REGVM_UNDEF_TMPL_N - 1] = JS_UNDEFINED,
 };
 static __attribute__((always_inline)) inline void regvm_record_fill(
     JSRuntime *rt, const JSRegRecordLayout *lay, JSValueConst cf, JSObject *co,
@@ -33321,7 +33408,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
 #ifdef AOT_MUT_FILL_DROP_ALL
         /* Gate mutant: no `undefined` fill; a never-written register reads as
            integer 0. */
-        memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
+        regvm_fill_unwritten(lay->regs, nregs);
 #else
         if (likely(nregs <= REGVM_UNDEF_TMPL_N)) {
             memcpy(lay->regs, regvm_undef_tmpl, (size_t)nregs * sizeof(JSValue));
@@ -33331,7 +33418,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
         } else {
             int nf = cb->regvm_fill_count;
 
-            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
+            regvm_fill_unwritten(lay->regs, nregs);
             for (k = 0; k < nf; k++)
                 lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
         }
@@ -33439,7 +33526,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
         } else {
             int nf = cb->regvm_fill_count;
 
-            memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
+            regvm_fill_unwritten(lay->regs, nregs);
             for (k = 0; k < nf; k++)
                 lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
         }
@@ -33558,10 +33645,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #endif
 /* Register operands are always two bytes: a register operand is one load and
    the advance is a constant. */
-#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) >> 4)
+#define RD_REG() (rpc += 2, (int)regvm_ld_u16(rpc - 2) / (int)sizeof(JSValue))
 /* The narrow encoding's operands: one unsigned byte, and a signed byte for a
    relative branch target. */
-#define RD_REG8() ((int)(uint8_t)*rpc++ >> 4)
+#define RD_REG8() ((int)(uint8_t)*rpc++ / (int)sizeof(JSValue))
 #define RD_OFF8() ((int)(int8_t)*rpc++)
 #define RD_U8()  ((int)*rpc++)
 #define RD_U16() (rpc += 2, (int)regvm_ld_u16(rpc - 2))
@@ -33648,7 +33735,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             if (likely(b->regvm_fill != NULL)) {
                 int nf = b->regvm_fill_count;
 
-                memset(regs, 0, (size_t)ninit * sizeof(JSValue));
+                regvm_fill_unwritten(regs, ninit);
                 for (i = 0; i < nf; i++)
                     regs[b->regvm_fill[i]] = JS_UNDEFINED;
             } else {
@@ -34372,8 +34459,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                                                    JS_VALUE_GET_INT(_a), \
                                                    JS_VALUE_GET_INT(_b))) < 0))) { \
                       take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
-                  } else if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
-                                    JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64 && \
+                  } else if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) && \
+                                    JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)) && \
                                     (_r = regvm_double_cmp(sub & ~REG_CMP_INVERT, \
                                                            JS_VALUE_GET_FLOAT64(_a), \
                                                            JS_VALUE_GET_FLOAT64(_b))) >= 0)) { \
@@ -37379,8 +37466,8 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                                    JS_VALUE_GET_INT(_a), \
                                                    JS_VALUE_GET_INT(_b))) < 0))) { \
                       take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
-                  } else if (likely(JS_VALUE_GET_TAG(_a) == JS_TAG_FLOAT64 && \
-                                    JS_VALUE_GET_TAG(_b) == JS_TAG_FLOAT64 && \
+                  } else if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_a)) && \
+                                    JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(_b)) && \
                                     (_r = regvm_double_cmp(sub & ~REG_CMP_INVERT, \
                                                            JS_VALUE_GET_FLOAT64(_a), \
                                                            JS_VALUE_GET_FLOAT64(_b))) >= 0)) { \
@@ -62051,8 +62138,15 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_shape_property_flags_atom = (uint32_t)sizeof(uint32_t);
     out->off_string_len_bits = 0;
     out->off_string_strv = (uint32_t)sizeof(JSString);
+#if QJS_NAN_BOXING64
+    /* The value is one word: no separate tag or union member to name, and a
+       unit built against the other encoding must not bind. */
+    out->off_jsvalue_tag = 0;
+    out->off_jsvalue_u = 0;
+#else
     out->off_jsvalue_tag = (uint32_t)offsetof(JSValue, tag);
     out->off_jsvalue_u = (uint32_t)offsetof(JSValue, u);
+#endif
     out->sizeof_JSRegPIC = (uint32_t)sizeof(JSRegPIC);
     out->reg_pic_ways = (uint32_t)REGVM_PIC_WAYS;
     out->off_fnbc_pic_count = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic_count);
@@ -62854,7 +62948,7 @@ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey)
         kind = AOT_ELEM_HOLEY;
     else if (JS_VALUE_GET_TAG(v) == JS_TAG_INT)
         kind = AOT_ELEM_INT;
-    else if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64)
+    else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)))
         kind = AOT_ELEM_FLOAT;
     else if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
         kind = AOT_ELEM_OBJECT;
@@ -63451,9 +63545,9 @@ void js_aot_prof_dump(JSRuntime *rt)
         if (!f)
             f = stderr;
     }
-    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1\n",
+    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 vmode=%u\n",
             QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
-            QJS_REGVM_THREAD, QJS_REGVM_RECORD);
+            QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
@@ -63982,7 +64076,7 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                                         JSContext *ctx)
 {
 #if QJS_DRC
-    int w = (int)regvm_ld_u16(ip + 1) >> 4;
+    int w = (int)regvm_ld_u16(ip + 1) / (int)sizeof(JSValue);
     JSValue it = fr[w], nx = fr[w + 1];
 
     if (likely(JS_VALUE_GET_TAG(it) == JS_TAG_OBJECT &&
@@ -64052,7 +64146,7 @@ QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                                           JSContext *ctx)
 {
 #if QJS_DRC
-    int w = (int)regvm_ld_u16(ip + 1) >> 4;
+    int w = (int)regvm_ld_u16(ip + 1) / (int)sizeof(JSValue);
     JSValue eo = fr[w];
 
     if (likely(JS_VALUE_GET_TAG(eo) == JS_TAG_OBJECT)) {
@@ -64368,7 +64462,7 @@ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v)
         default: return 0;
         }
     }
-    if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v))) {
         double d = JS_VALUE_GET_FLOAT64(v);
 
         if (cid == JS_CLASS_FLOAT64_ARRAY) {
@@ -64545,8 +64639,8 @@ __attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValu
         *take = r ^ ((sub & REG_CMP_INVERT) != 0);
         return 1;
     }
-    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_FLOAT64 &&
-               JS_VALUE_GET_TAG(b) == JS_TAG_FLOAT64) &&
+    if (likely(JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(a)) &&
+               JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(b))) &&
         (r = regvm_double_cmp(sub & ~REG_CMP_INVERT,
                               JS_VALUE_GET_FLOAT64(a),
                               JS_VALUE_GET_FLOAT64(b))) >= 0) {
@@ -64576,7 +64670,7 @@ __attribute__((always_inline)) void qjs_aot_set_reg_b(JSContext *ctx, JSValue *f
 }
 #endif
 
-#if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING)
+#if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING) && !QJS_NAN_BOXING64
 #include <emmintrin.h>
 static inline void JSValue_store16(JSValue *d, JSValue v)
 {
@@ -64595,8 +64689,8 @@ __attribute__((always_inline)) void qjs_aot_set_reg_p(JSContext *ctx, JSValue *f
 {
     JSValue *slot = (JSValue *)((uint8_t *)fr + off);
 #if QJS_DRC
-    /* One 16-byte store: the next copy of this slot loads all 16 bytes at once,
-       which two 8-byte stores cannot forward to. */
+    /* One store of the whole value: the next copy of this slot loads all of it
+       at once, which its two halves written separately cannot forward to. */
     JSValue_store16(slot, v);
     REG_ADOPT(ctx->rt, v);
 #else
@@ -64920,7 +65014,7 @@ int qjs_aot_to_num(JSValue v, double *out, int *isint)
         *isint = 1;
         return 1;
     }
-    if (tag == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag)) {
         *out = JS_VALUE_GET_FLOAT64(v);
         *isint = 0;
         return 1;
@@ -66080,7 +66174,7 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                             if (JS_VALUE_GET_TAG(cv) == JS_TAG_INT) {
                                 nums[ci] = (double)JS_VALUE_GET_INT(cv);
                                 mark[ci] = (uint8_t)JS_TAG_INT;
-                            } else if (JS_VALUE_GET_TAG(cv) == JS_TAG_FLOAT64) {
+                            } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(cv))) {
                                 nums[ci] = JS_VALUE_GET_FLOAT64(cv);
                                 mark[ci] = (uint8_t)JS_TAG_FLOAT64;
                             }
@@ -67916,9 +68010,16 @@ static void regvm_fuse_inc_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     js_free(ctx, is_target);
 }
 
-/* Register operands are byte offsets: one byte reaches register 15, two bytes
-   reach register 4095. */
+/* Register operands are byte offsets: one wire byte reaches register 15, two
+   reach register 4095. The narrow form's byte is a register index in wire
+   units (REGVM_WIRE_REG_SCALE), so 16 registers is its bound in either value
+   encoding. */
 #define REGVM_NARROW_REG_MAX 16
+/* A narrow register operand is written as the register index times this, a
+   constant of the wire format rather than of the writer's value size: the byte
+   is the narrow form's whole point, and a stream written by one encoding has to
+   read in the other, which the builtin bundles require. */
+#define REGVM_WIRE_REG_SCALE 16
 #define REGVM_WIDE_REG_MAX 4095
 
 static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
@@ -69564,7 +69665,7 @@ static int regvm_const_load_value(JSFunctionDef *fd, const JSRegInsn *in,
     case ROP_load_const:
         if (in->n_ops != 3 || in->ops[1] != REG_CONST_CPOOL ||
             in->ops[2] < 0 || in->ops[2] >= fd->cpool_count ||
-            JS_VALUE_GET_TAG(fd->cpool[in->ops[2]]) != JS_TAG_FLOAT64)
+            !JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(fd->cpool[in->ops[2]])))
             return 0;
         *pv = fd->cpool[in->ops[2]];
         return 1;
@@ -78211,6 +78312,16 @@ typedef struct BCWriterState {
     JSObjectList object_list;
 } BCWriterState;
 
+/* The bytecode header is the version, the checksum and then the payload, in
+   both value encodings. What a file stores is tags, payloads and register
+   offsets, not a value's memory, so a file from one encoding is read by the
+   other wherever those are independent of the value's size; the one place they
+   are not is a register bytecode operand, which is a byte offset into the
+   writer's register file. The reader therefore takes the writer's value size
+   (this build's own, or 16 for a file from the 16-byte build, which is the only
+   other one) and scales narrow and wide register operands by it. */
+#define BC_HDR_SIZE 5 /* version, 4 checksum bytes */
+
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
 static const char * const bc_tag_str[] = {
     "invalid",
@@ -79027,7 +79138,10 @@ static int regvm_wire_encode(BCWriterState *s, const JSFunctionBytecode *b)
             switch (fmt[m]) {
             case 'r':
                 if (nar)
-                    dbuf_putc(&wire, (uint8_t)v); /* narrow: stored byte as is */
+                    /* narrow: the register index, in wire units */
+                    dbuf_putc(&wire,
+                              (uint8_t)(v / (uint32_t)sizeof(JSValue) *
+                                        REGVM_WIRE_REG_SCALE));
                 else
                     dbuf_put_leb128(&wire, v / (uint32_t)sizeof(JSValue));
                 break;
@@ -79711,10 +79825,11 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     } else {
         js_free(ctx, s->sab_tab);
     }
-    // don't include version and checksum fields in checksum
+    /* Don't include the version, the value-encoding byte or the checksum field
+       itself in the checksum. */
     d = &s->dbuf;
-    h = bc_csum(&d->buf[5], d->size - 5);
-    put_u32(&d->buf[1], h);
+    h = bc_csum(&d->buf[BC_HDR_SIZE], d->size - BC_HDR_SIZE);
+    put_u32(&d->buf[BC_HDR_SIZE - 4], h);
     return d->buf;
  fail:
     js_object_list_end(ctx, &s->object_list);
@@ -79770,6 +79885,7 @@ typedef struct BCReaderState {
     int *wire_targets;
     int wire_scratch_len;
 #endif
+
 } BCReaderState;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
@@ -80377,19 +80493,25 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
 
             if (fmt[m] == 'r') {
                 if (nar) {
-                    /* The narrow form stores the byte offset as a raw byte, not
-                       a LEB. */
+                    /* The narrow form stores the register index times
+                       REGVM_WIRE_REG_SCALE as a raw byte, not a LEB. */
                     if (w >= w_end) {
                         JS_ThrowSyntaxError(ctx, "truncated register program");
                         goto fail_ins;
                     }
                     v = *w++;
-                    if (v >= (uint32_t)(REGVM_NARROW_REG_MAX * sizeof(JSValue))) {
+                    if (v % REGVM_WIRE_REG_SCALE) {
+                        JS_ThrowSyntaxError(ctx, "register %u misaligned",
+                                            (unsigned)v);
+                        goto fail_ins;
+                    }
+                    v /= REGVM_WIRE_REG_SCALE;
+                    if (v >= (uint32_t)REGVM_NARROW_REG_MAX) {
                         JS_ThrowSyntaxError(ctx, "register %u out of range",
                                             (unsigned)v);
                         goto fail_ins;
                     }
-                    sv = (int32_t)v;
+                    sv = (int32_t)(v * (uint32_t)sizeof(JSValue));
                 } else {
                     if (regvm_wire_get_leb(&w, w_end, &v))
                         goto fail_leb;
@@ -82159,12 +82281,18 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
                             v8, BC_VERSION);
         return -1;
     }
+
     if (bc_get_u32(s, &h))
         return -1;
     // allow UINT32_MAX as an escape hatch, otherwise updating
     // the test corpus in tests/test_bjson.js gets too tedious
     if (h != UINT32_MAX && h != bc_csum(s->ptr, s->buf_end - s->ptr)) {
-        JS_ThrowSyntaxError(s->ctx, "checksum error");
+        /* A file from the 8-byte-value build carries a mode byte where this
+           reader expects the first payload byte, so it fails here before it
+           can fail anywhere that matters. Name the likelier cause. */
+        JS_ThrowSyntaxError(s->ctx,
+                            "checksum error (a file written with the other "
+                            "value encoding has an extra header byte)");
         return -1;
     }
     if (bc_get_leb128(s, &s->idx_to_atom_count))
@@ -105655,7 +105783,7 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
         v64 = JS_VALUE_GET_INT(argv[0]);
         d = v64;
     } else
-    if (tag == JS_TAG_FLOAT64) {
+    if (JS_TAG_IS_FLOAT64(tag)) {
         d = JS_VALUE_GET_FLOAT64(argv[0]);
         if (d >= INT64_MIN && d < 0x1p63) {
             v64 = d;
