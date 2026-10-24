@@ -180,11 +180,23 @@ run_ir_verify() {
   log "ok   ir $res"
 }
 
+# The AOT layout must not depend on the optimisation/debug configuration. A
+# field that only exists under -DNDEBUG changes sizeof() of a struct the
+# generated unit reads an offset of, and the unit is then refused by a release
+# engine with no other sign. This compiles the layout probe both ways and
+# fails if the hash differs -- the regression guard for exactly that bug.
+layout_hash_probe() {
+  local out
+  out=$(cd "$ROOT" && tools/aot/layout-audit.sh 2>&1) || { fail=$((fail + 1)); log "FAIL layout audit"; echo "$out" | sed -n '1,6p'; return; }
+  log "ok   $out"
+}
+
 t0() {
   local start end
   start=$(date +%s)
   build_gen || die "cannot build $GEN"
   build_rt  || die "cannot build the runtime engine"
+  layout_hash_probe
   GEN_IRBIN=""
   if "$BIN" --verify-ir /dev/null > /dev/null 2>&1; then
     GEN_IRBIN="$BIN"
