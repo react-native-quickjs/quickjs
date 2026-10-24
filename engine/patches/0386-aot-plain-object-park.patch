@@ -1,0 +1,49 @@
+Subject: engine: parking a plain object takes the direct route to the deferred list
+
+What this does
+  js_drc_zero parks a value whose reference count reached zero. For an object of class
+  JS_CLASS_OBJECT it now links the object onto the deferred list directly, without the tag switch
+  and without the large-value walk. Both are still there for every other value, and a plain object
+  can never be one the large-value walk names: it has no string, rope, BigInt, array buffer, typed
+  array or data view of its own.
+
+Why we need it
+  A plain object is the common counted value: tree reaches js_drc_zero 2,948,676 times for
+  1,474,039 frees, and the tag switch plus the large-value switch is paid on every one of those
+  parks. The two tests the shortcut skips are a class-id compare and a tag compare on the fast
+  path, and the switch table's code is what the profile attributes to the site.
+
+Hazards
+  The parked object is marked in_zct and counted in zct_nobj exactly as before, so a borrowing
+  register that still names it is validated the same way, and reconcile's keep-or-free decision is
+  unchanged. Weak references, finalizers and FinalizationRegistry never see this path: a plain
+  object of class JS_CLASS_OBJECT has no class finalizer, and a weak reference or a
+  FinalizationRegistry entry is not a class of its own, so the object still goes through
+  free_object and reset_weak_ref as before when reconcile frees it.
+
+Tests: .local/tests/alloc-free-plain.js and tests/differential/corpus/alloc-free-plain.js (asan,
+AOT and interpreter arms equal to node); tree, raytrace, deltablue, closure and richards outputs
+equal to the interpreter.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -10603,6 +10603,19 @@
+         js_free_value_rt(rt, v);
+         return;
+     }
++    if (likely(tag == JS_TAG_OBJECT)) {
++        JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
++        if (likely(((JSObject *)p)->class_id == JS_CLASS_OBJECT)) {
++            /* A plain object is not a value js_drc_value_is_large() can call
++               large, so parking it takes neither the tag switch below nor the
++               large-value walk. */
++            list_del(&p->link);
++            list_add(&p->link, &rt->gc_zero_ref_count_list);
++            JS_GC_IN_ZCT(p) = 1;
++            rt->zct_nobj++;
++            return;
++        }
++    }
+     if (js_drc_value_is_large(v)) {
+         /* One large value can dominate the parked memory before allocation
+            pressure is even felt; make the next safepoint reconcile. */

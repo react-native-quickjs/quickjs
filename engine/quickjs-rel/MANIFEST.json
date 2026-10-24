@@ -1515,6 +1515,10 @@
       "sha256": "efb40c460b82d460f8ac5bf5bcb0eba3d174b365783c6eb7f5d18dd5bd9f72f0"
     },
     {
+      "name": "0386-aot-plain-object-park.patch",
+      "sha256": "0f44536505c1a97b0f39e35568d8a1c11d9687475464e1a4691491b963fd9ec9"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
