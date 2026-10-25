@@ -4234,6 +4234,29 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (JS_VALUE_HAS_REF_COUNT(v))\n"
         "    ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
         "}\n\n");
+    /* Adopting an owned value into a frame slot: its count drops by the one the slot's
+       register does not hold. Only a count that would reach zero (the zero-count table
+       takes the value) needs the engine. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) void q2_set_reg_p(JSContext *ctx, "
+        "JSValue *fr, int off, JSValue v)\n"
+        "{\n"
+        "  if (!JS_VALUE_HAS_REF_COUNT(v)) {\n"
+        "    *(JSValue *)((uint8_t *)fr + off) = v;\n"
+        "    return;\n"
+        "  }\n"
+        "  {\n"
+        "    int *rc = (int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
+        "    if (__builtin_expect(*rc > 1, 1)) {\n"
+        "      *rc -= 1;\n"
+        "      *(JSValue *)((uint8_t *)fr + off) = v;\n"
+        "      return;\n"
+        "    }\n"
+        "  }\n"
+        "  (qjs_aot_set_reg_p)(ctx, fr, off, v);\n"
+        "}\n"
+        "#define qjs_aot_set_reg_p(c_, f_, o_, v_) q2_set_reg_p(c_, f_, o_, v_)\n\n");
     /* A grouped field store, after the caller has checked the shape: the same
        store the engine's fast path makes, minus the cache lookup (the offset
        comes from the group's cell). The new value is duplicated before the old

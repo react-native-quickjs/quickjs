@@ -11779,7 +11779,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_epoch_skip = ngu > 0 && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
       g_e_mc_n = 0;
       memset(g_e_mc_of, -1, sizeof(g_e_mc_of));
-      if (g_e_epoch_skip && !g_e_nolazy && getenv("QJS_AOT_NOMETHCACHE") == NULL)
+      if (g_e_epoch_skip && getenv("QJS_AOT_NOMETHCACHE") == NULL)
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
           if (!g_e_group_used[g] || e_entry_skip(g)) continue;
