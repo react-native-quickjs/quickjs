@@ -367,6 +367,10 @@ typedef enum JSErrorEnum {
 #define __exception __attribute__((warn_unused_result))
 
 typedef struct JSShape JSShape;
+
+/* The unit's teardown: drops the references its site and layout caches hold and
+   forgets the runtime that owned them. Weak, so a build with no unit links. */
+extern void qjs_aot_release(JSRuntime *rt) __attribute__((weak));
 typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 typedef struct JSStringRope JSStringRope;
@@ -733,6 +737,11 @@ struct JSRuntime {
        function that validated its cache cells at some epoch may trust them while it is
        unchanged. */
     uint32_t aot_pic_epoch;
+    /* The contracted layouts: the shape each one ends, their count, and a bit per
+       layout set once an object is seen to leave it. Empty without a unit. */
+    JSShape **aot_layout_shape;
+    uint32_t aot_layout_count;
+    uint64_t aot_layout_broken;
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
@@ -2317,6 +2326,14 @@ struct JSShape {
     /* true if the shape is inserted in the shape hash table. If not,
        JSShape.hash is not valid */
     uint8_t is_hashed;
+    /* The contracted layout this shape ends, 1..N, or 0 for a shape no layout
+       owns. A shape with an id is also held by the AOT unit, so its reference
+       count stays above one and every in-place mutation path clones instead of
+       writing to it: js_shape_prepare_update clones above one, and
+       add_shape_property's only hot caller asserts a count of exactly one after
+       cloning. An object that adopts another shape leaves the layout, and that
+       adoption sets the contract's broken bit. */
+    uint16_t layout_id;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -2846,6 +2863,7 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
                                                  JSAtom atom);
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
+static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
 static int init_shape_hash(JSRuntime *rt);
 static __exception int js_get_length32(JSContext *ctx, uint32_t *pres,
                                        JSValueConst obj);
@@ -4291,6 +4309,11 @@ void JS_FreeRuntime(JSRuntime *rt)
     init_list_head(&rt->job_list);
 
 #if QJS_AOT
+    /* The unit's own caches hold counted references: its site callees and the
+       contracted layout shapes. Release them first, so nothing it holds outlives
+       this runtime. A build with no unit has no such function. */
+    if (&qjs_aot_release != NULL)
+        qjs_aot_release(rt);
     /* Release the per-site callee references before the final collection. A
        bound C callee (kind 2) holds a counted reference, which would keep its
        whole realm reachable; a folded prototype value (kind 3) owns nothing. */
@@ -8170,6 +8193,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->deleted_prop_count = 0;
     sh->is_hashed = false;
     sh->parent = NULL;
+    sh->layout_id = 0;
     return sh;
 }
 
@@ -9034,6 +9058,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     sh->deleted_prop_count = 0;
     sh->prop_count = j;
 
+    js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = sh;
     js_free(ctx, get_alloc_from_shape(old_sh));
     /* see resize_properties above */
@@ -14548,6 +14573,7 @@ static JSProperty *add_property(JSContext *ctx,
                     return NULL;
                 p->prop = new_prop;
             }
+            js_aot_layout_leave(ctx->rt, p->shape);
             p->shape = js_dup_shape(new_sh);
             js_free_shape(ctx->rt, sh);
             return &p->prop[new_sh->prop_count - 1];
@@ -14560,6 +14586,7 @@ static JSProperty *add_property(JSContext *ctx,
             /* hash the cloned shape */
             new_sh->is_hashed = true;
             js_shape_hash_link(ctx->rt, new_sh);
+            js_aot_layout_leave(ctx->rt, p->shape);
             js_free_shape(ctx->rt, p->shape);
             p->shape = new_sh;
         }
@@ -16276,6 +16303,20 @@ static bool check_define_prop_flags(int prop_flags, int flags)
 }
 
 /* ensure that the shape can be safely modified */
+/* An object is about to stop being the shape `old_sh`: adopting any other shape
+   leaves the layout `old_sh` ends, so that layout's contract is broken for the
+   rest of the run. Entering a contracted shape is never a break, so only the
+   shape being LEFT is tested: one load of a field already in cache. The bit is
+   permanent, like a map deprecation, and a body that relied on the layout goes
+   to its generic body from then on. */
+static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
+{
+    /* At most 63 layouts are ever emitted, which the bind path asserts, so an id
+       that reaches here is 1..63 and the shift is defined. */
+    if (unlikely(old_sh != NULL && old_sh->layout_id != 0))
+        rt->aot_layout_broken |= 1ULL << (old_sh->layout_id - 1);
+}
+
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs)
 {
@@ -16295,6 +16336,7 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
             sh = js_clone_shape(ctx, sh);
             if (!sh)
                 return -1;
+            js_aot_layout_leave(ctx->rt, p->shape);
             js_free_shape(ctx->rt, p->shape);
             p->shape = sh;
             if (pprs)
@@ -26010,6 +26052,7 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
             return -1;              /* js_prop_grow threw */
         p->prop = np;
     }
+    js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = js_dup_shape(nsh);
     js_free_shape(ctx->rt, osh);
     p->prop[off].u.value = js_dup(v);
@@ -41459,6 +41502,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                         goto exception;
                                     p->prop = np;
                                 }
+                                js_aot_layout_leave(ctx->rt, p->shape);
                                 p->shape = js_dup_shape(nsh);
                                 js_free_shape(ctx->rt, osh);
                                 p->prop[off].u.value = sp[-1]; /* fresh slot: transfer */
@@ -62218,6 +62262,10 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_gvc_slot = (uint32_t)offsetof(JSGVCell, slot);
     out->off_gvc_wr = (uint32_t)offsetof(JSGVCell, wr);
     out->off_rt_pic_epoch = (uint32_t)offsetof(JSRuntime, aot_pic_epoch);
+    out->off_rt_layout_broken = (uint32_t)offsetof(JSRuntime, aot_layout_broken);
+    out->off_rt_layout_shape = (uint32_t)offsetof(JSRuntime, aot_layout_shape);
+    out->off_rt_layout_count = (uint32_t)offsetof(JSRuntime, aot_layout_count);
+    out->off_shape_layout_id = (uint32_t)offsetof(JSShape, layout_id);
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);
     out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);
@@ -64176,6 +64224,27 @@ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
 {
     return (const void *)js_function_apply;
+}
+
+/* A contracted layout's shape, from the unit's side: the unit cannot name JSShape
+   or js_free_shape, so these are its whole view. A layout takes one reference per
+   shape in its chain, so no in-place mutation path can reach a contracted shape,
+   and drops them at release. */
+QJS_AOT_STUB void *qjs_aot_layout_dup(void *sh)
+{
+    return sh != NULL ? (void *)js_dup_shape((JSShape *)sh) : NULL;
+}
+
+QJS_AOT_STUB void qjs_aot_layout_free(JSRuntime *rt, void *sh)
+{
+    if (sh != NULL)
+        js_free_shape(rt, (JSShape *)sh);
+}
+
+/* The layout a shape ends, or 0. */
+QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh)
+{
+    return sh != NULL ? (uint32_t)((const JSShape *)sh)->layout_id : 0u;
 }
 
 /* Whether reading `fn.apply` would hand back exactly the builtin `Function.prototype.apply`,
@@ -94894,6 +94963,7 @@ static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
         p->prop = new_prop;
     }
     p->prop[new_sh->prop_count - 1].u.value = v;
+    js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = js_dup_shape(new_sh);
     js_free_shape(ctx->rt, sh);
     return 0;

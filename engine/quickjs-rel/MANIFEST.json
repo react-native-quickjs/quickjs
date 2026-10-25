@@ -1547,12 +1547,16 @@
       "sha256": "c8b0c655ec1ae243ab7efd4b5c8f12832689e6950d08160bf101bfd6bc7713d4"
     },
     {
+      "name": "0393-contracted-layouts.patch",
+      "sha256": "dec5e7f53f47e82108f7e2910844ae8be032424e89c8f8e29f5a5131f9308416"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "72f54605753dc121598d51ee4af952546393707d7e050c4a42795077b52c1438",
+    "quickjs.c": "388ad18740f03b61c432546d770022b27f98c1ee267463d99b4978ac70e69901",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

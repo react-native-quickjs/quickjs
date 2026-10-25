@@ -1,0 +1,154 @@
+Subject: The unit owns its contracted layouts, so a field has a constant slot
+
+What this does
+  - `JSShape` gains `layout_id`, a uint16 that names the contracted layout a shape
+    ends, or 0 for a shape no layout owns.
+  - The runtime gains the layouts' shapes, their count, and a word of bits recording
+    which layouts have been broken by an object leaving them.
+  - An object adopting any other shape leaves the layout it was in, so
+    `js_aot_layout_leave` sets that layout's bit. It tests only the shape being left,
+    because entering a contracted shape is never a break. It is called wherever an
+    object's shape is replaced: both clone branches of the in-place update paths, the
+    property-add path, compaction, the two compiled add-transition paths and the JSON
+    adoption path. Object construction and the free path have no previous shape and
+    are not hooked, and neither is `resize_properties`, which only runs on a shape
+    whose reference count is one -- a contracted shape never is.
+  - At most 63 layouts are emitted (the hottest by site count; the rest stay
+    uncontracted), and the bind path asserts the table holds no more, so the bit word
+    cannot silently drop a break past id 63.
+  - `qjs_aot_release(JSRuntime *)` is the unit's teardown, called once at the start of
+    `JS_FreeRuntime` before the final collection. It drops the references the unit's
+    caches hold: its site callees and the shapes of its contracted layouts. The unit
+    records the runtime that filled those caches and releases only for that runtime,
+    so a value of one runtime is never freed with another.
+  - Two accessors let the unit take and drop a reference on a shape without naming
+    `JSShape` or `js_free_shape`, and one reports a shape's layout id.
+  - The layout export gains the five new offsets.
+
+Why we need it
+  The compiled code cannot read a field at a constant slot while a shape may change
+  underneath it: QuickJS mutates a shape in place when its reference count is one, so
+  the property cache cell is the only authority on a field's offset, and every access
+  reloads it. A shape the unit holds a reference to is never mutated in place, since
+  both in-place paths clone above a count of one. Contracting a layout therefore turns
+  its field offsets into facts: the compiled body reads a constant slot, and the
+  contract is broken -- once, permanently, like a map deprecation -- if any object is
+  seen to leave the layout. The bit is checked at function entry, not per access.
+
+Functions touched
+  `js_aot_layout_leave` (new), `js_shape_prepare_update`, `add_property`,
+  `compact_properties`, `regvm_put_field_add_hit`, the put_field path in
+  `JS_CallInternal`, `json_obj_adopt_shape`, `JS_FreeRuntime`, and the new
+  `qjs_aot_release`, `qjs_aot_layout_dup`, `qjs_aot_layout_free` and
+  `qjs_aot_shape_layout`.
+
+No (the bit is 0 and no layout is contracted without a unit that declares one; with
+no unit every hook tests a zero field and the release is not linked).
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -64,0 +65,4 @@
++    /* The contracted layouts: the id in a JSShape, the runtime's shape array and
++       count, and the bit word that records a broken contract. */
++    uint32_t off_shape_layout_id;
++    uint32_t off_rt_layout_broken, off_rt_layout_shape, off_rt_layout_count;
+@@ -306,0 +311,11 @@
++
++/* The unit's teardown, called once at the start of JS_FreeRuntime: it drops the
++   counted references its site and layout caches hold and forgets the runtime that
++   owned them. A build with no unit defines nothing here; the engine's reference
++   is weak. */
++void qjs_aot_release(JSRuntime *rt);
++
++/* A contracted layout's shape, from the unit's side. */
++QJS_AOT_STUB void *qjs_aot_layout_dup(void *sh);
++QJS_AOT_STUB void qjs_aot_layout_free(JSRuntime *rt, void *sh);
++QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -369,0 +370,4 @@
++
++/* The unit's teardown: drops the references its site and layout caches hold and
++   forgets the runtime that owned them. Weak, so a build with no unit links. */
++extern void qjs_aot_release(JSRuntime *rt) __attribute__((weak));
+@@ -735,0 +740,5 @@
++    /* The contracted layouts: the shape each one ends, their count, and a bit per
++       layout set once an object is seen to leave it. Empty without a unit. */
++    JSShape **aot_layout_shape;
++    uint32_t aot_layout_count;
++    uint64_t aot_layout_broken;
+@@ -2319,0 +2329,8 @@
++    /* The contracted layout this shape ends, 1..N, or 0 for a shape no layout
++       owns. A shape with an id is also held by the AOT unit, so its reference
++       count stays above one and every in-place mutation path clones instead of
++       writing to it: js_shape_prepare_update clones above one, and
++       add_shape_property's only hot caller asserts a count of exactly one after
++       cloning. An object that adopts another shape leaves the layout, and that
++       adoption sets the contract's broken bit. */
++    uint16_t layout_id;
+@@ -2848,0 +2866 @@
++static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
+@@ -4293,0 +4312,5 @@
++    /* The unit's own caches hold counted references: its site callees and the
++       contracted layout shapes. Release them first, so nothing it holds outlives
++       this runtime. A build with no unit has no such function. */
++    if (&qjs_aot_release != NULL)
++        qjs_aot_release(rt);
+@@ -8172,0 +8196 @@
++    sh->layout_id = 0;
+@@ -9036,0 +9061 @@
++    js_aot_layout_leave(ctx->rt, p->shape);
+@@ -14550,0 +14576 @@
++            js_aot_layout_leave(ctx->rt, p->shape);
+@@ -14562,0 +14589 @@
++            js_aot_layout_leave(ctx->rt, p->shape);
+@@ -16278,0 +16306,14 @@
++/* An object is about to stop being the shape `old_sh`: adopting any other shape
++   leaves the layout `old_sh` ends, so that layout's contract is broken for the
++   rest of the run. Entering a contracted shape is never a break, so only the
++   shape being LEFT is tested: one load of a field already in cache. The bit is
++   permanent, like a map deprecation, and a body that relied on the layout goes
++   to its generic body from then on. */
++static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
++{
++    /* At most 63 layouts are ever emitted, which the bind path asserts, so an id
++       that reaches here is 1..63 and the shift is defined. */
++    if (unlikely(old_sh != NULL && old_sh->layout_id != 0))
++        rt->aot_layout_broken |= 1ULL << (old_sh->layout_id - 1);
++}
++
+@@ -16297,0 +16339 @@
++            js_aot_layout_leave(ctx->rt, p->shape);
+@@ -26012,0 +26055 @@
++    js_aot_layout_leave(ctx->rt, p->shape);
+@@ -41461,0 +41505 @@
++                                js_aot_layout_leave(ctx->rt, p->shape);
+@@ -62220,0 +62265,4 @@
++    out->off_rt_layout_broken = (uint32_t)offsetof(JSRuntime, aot_layout_broken);
++    out->off_rt_layout_shape = (uint32_t)offsetof(JSRuntime, aot_layout_shape);
++    out->off_rt_layout_count = (uint32_t)offsetof(JSRuntime, aot_layout_count);
++    out->off_shape_layout_id = (uint32_t)offsetof(JSShape, layout_id);
+@@ -64180,0 +64229,21 @@
++/* A contracted layout's shape, from the unit's side: the unit cannot name JSShape
++   or js_free_shape, so these are its whole view. A layout takes one reference per
++   shape in its chain, so no in-place mutation path can reach a contracted shape,
++   and drops them at release. */
++QJS_AOT_STUB void *qjs_aot_layout_dup(void *sh)
++{
++    return sh != NULL ? (void *)js_dup_shape((JSShape *)sh) : NULL;
++}
++
++QJS_AOT_STUB void qjs_aot_layout_free(JSRuntime *rt, void *sh)
++{
++    if (sh != NULL)
++        js_free_shape(rt, (JSShape *)sh);
++}
++
++/* The layout a shape ends, or 0. */
++QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh)
++{
++    return sh != NULL ? (uint32_t)((const JSShape *)sh)->layout_id : 0u;
++}
++
+@@ -94896,0 +94966 @@
++    js_aot_layout_leave(ctx->rt, p->shape);
