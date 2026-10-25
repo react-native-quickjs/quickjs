@@ -580,6 +580,7 @@ typedef struct JSAotRun {
 #define JS_CHAR2_K 1024
 
 #define JS_AOT_CLAIM_MAXF 32
+#define JS_AOT_GWATCH_MAX 16
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -750,6 +751,10 @@ struct JSRuntime {
        function that validated its cache cells at some epoch may trust them while it is
        unchanged. */
     uint32_t aot_pic_epoch;
+    /* Atoms of global-object properties a compiled body holds as literals. A write to one moves
+       `aot_pic_epoch`; the cells of such a property never take the direct store. */
+    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
+    uint32_t aot_gwatch_n;
     /* The contracted layouts: the shape each one ends, their count, and a bit per
        layout set once an object is seen to leave it. Empty without a unit. */
     JSShape **aot_layout_shape;
@@ -4324,6 +4329,8 @@ void JS_FreeRuntime(JSRuntime *rt)
         rt->forin_shape = NULL;
         rt->forin_atom = JS_ATOM_NULL;
     }
+    while (rt->aot_gwatch_n != 0)
+        JS_FreeAtomRT(rt, rt->aot_gwatch[--rt->aot_gwatch_n]);
     for (int i = 0; i < JS_PIN_MEMO_SIZE; i++) {
         if (rt->pin_memo_shape[i]) {
             js_free_shape(rt, rt->pin_memo_shape[i]);
@@ -16386,10 +16393,35 @@ static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot,
         rt->aot_layout_broken |= 1ULL << (id - 1);
 }
 
+static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
+{
+    uint32_t i;
+    for (i = 0; i < rt->aot_gwatch_n; i++)
+        if (rt->aot_gwatch[i] == atom)
+            return true;
+    return false;
+}
+
+/* A value is about to be written to the global property `atom`: a compiled body that holds
+   it as a literal must leave at its next epoch test. */
+static inline void js_aot_gwrite(JSRuntime *rt, JSAtom atom)
+{
+    if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
+        rt->aot_pic_epoch++;
+}
+
+static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
+{
+    if (rt->aot_gwatch_n != 0 && slot < (uint32_t)p->shape->prop_count)
+        js_aot_gwrite(rt, get_shape_prop(p->shape)[slot].atom);
+}
+
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
 {
     if (unlikely(p->shape->layout_id != 0))
         js_aot_content_store_slow(rt, p, slot, v);
+    if (unlikely(p->gv_watched))
+        js_aot_gwrite_slot(rt, p, slot);
 }
 
 /* An object has just adopted a contracted shape, or a template filled one. Every slot but the
@@ -17152,7 +17184,8 @@ static inline void js_gv_cell_fill(JSContext *ctx, JSAtom prop,
     set[0].atom = prop;
     set[0].gen = ctx->rt->gv_cell_gen;
     set[0].slot = pr;
-    set[0].wr = (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE;
+    set[0].wr = (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE &&
+                !js_aot_gwatched(ctx->rt, prop);
 }
 
 static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
@@ -17275,6 +17308,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
             if (flag != 1 && likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
                                     JS_PROP_WRITABLE))
                 js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
+            js_aot_gwrite(ctx->rt, prop);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -17287,6 +17321,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
             js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
+            js_aot_gwrite(ctx->rt, prop);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -64907,6 +64942,35 @@ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
     return 0;
 }
 
+/* A compiled body holds the global `atom` as the int32 literal `v`: true if the property is a
+   plain data property of the global object, shadowed by no lexical binding, that holds exactly
+   `v` now. From then on every write to it moves `aot_pic_epoch`. The body takes the check at
+   the entry that follows an epoch change. */
+int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
+{
+    JSRuntime *rt = ctx->rt;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSValue cur;
+
+    if (find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_var_obj), (JSAtom)atom) != NULL)
+        return 0;
+    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_obj), (JSAtom)atom);
+    if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    cur = pr->u.value;
+    if (JS_VALUE_GET_TAG(cur) != JS_TAG_INT || JS_VALUE_GET_INT(cur) != v)
+        return 0;
+    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
+        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
+            return 0;
+        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+        /* the cells filled so far may take the direct store */
+        js_gv_cell_invalidate(rt);
+    }
+    return 1;
+}
+
 int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init)
 {
     if (likely(init == 0)) {
@@ -64933,6 +64997,7 @@ int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init)
             if (likely(po != NULL) &&
                 (get_shape_prop(po->shape)[slot - po->prop].flags &
                  (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
+                js_aot_gwrite(ctx->rt, (JSAtom)atom);
                 set_value(ctx, &slot->u.value, js_dup(v));
                 return 0;
             }

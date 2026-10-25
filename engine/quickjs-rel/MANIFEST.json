@@ -1583,12 +1583,16 @@
       "sha256": "eacb57b37a85cad1d286f403786a3851e4b65f143c74d5d35c1c90f609a4024c"
     },
     {
+      "name": "0402-aot-global-fold.patch",
+      "sha256": "49dbed6e842b07b17ad1c093d1f5754e3cc698e1d2aaef04960e1f5f562aea74"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "e234ee62ad4e52891618660f9328eca4d3454abe8a773ed9c51e550529e62aeb",
+    "quickjs.c": "71a703b14dfe121bc285e84d1b77145c2d414ba3d306b6433abd2672b1ea0fcb",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
