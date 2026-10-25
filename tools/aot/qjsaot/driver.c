@@ -242,6 +242,10 @@ typedef struct {
    entry, set by emit_func; `g_site_next` hands out one AOT site id per emitted
    call site (the engine's per-runtime binding array is indexed by it). */
 static const ProfEntry *g_prof = NULL;
+
+/* How many contracted layouts the generator decided on. Set once, before the
+   unit's helpers are emitted, so the entry check and the layout table agree. */
+static int g_nlayouts;
 static int g_nprof = 0;
 /* Whether the profile's header said `thr=1`, i.e. it came from the threaded
    build whose `R` records are complete. See parse_profile. */
@@ -1842,6 +1846,13 @@ int qjsaot_driver_main(int argc, char **argv) {
     }
     g_prof = prof;
     g_nprof = nprof;
+    /* Decide the contracted layouts here, before any helper or body is emitted,
+       so the entry check and the layout table come from one decision. */
+    {
+      ELayoutInfo *pre = calloc(E_LAYOUT_MAX, sizeof(*pre));
+      g_nlayouts = pre != NULL ? e_layouts_collect(pre, E_LAYOUT_MAX) : 0;
+      free(pre);
+    }
     if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL) {
       ELayoutInfo *cand = calloc(E_LAYOUT_MAX, sizeof(*cand));
       int nc = cand != NULL ? e_layouts_collect(cand, E_LAYOUT_MAX) : 0;
@@ -4378,6 +4389,34 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == "
         "entry;\n"
         "}\n\n");
+    /* ---- the contracted-layout check ---------------------------------------
+       A value entering compiled code is checked ONCE, here, never at each field
+       access. `q2_layout_of` answers which contracted layout a value's shape is,
+       or 0 when it is not one: one load of the shape's id, one test of that
+       layout's bit in the broken word. A body that needs a layout calls this at
+       entry and hands over to its generic body when the answer is wrong, so a
+       violation costs the check and can never give a wrong result. */
+    fprintf(f, "#define Q2_LAYOUT_COUNT %du\n", g_nlayouts);
+    if (g_nlayouts > 0)
+      fprintf(
+          f,
+          "/* The contracted layout a value's shape ends, or 0 for anything else:\n"
+          "   not an object, not a contracted shape, or a layout already broken. */\n"
+          "static inline __attribute__((always_inline)) uint32_t q2_layout_of(\n"
+          "    JSRuntime *rt, JSValue v)\n"
+          "{\n"
+          "  const unsigned char *o, *sh;\n"
+          "  uint32_t id;\n"
+          "  if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) return 0u;\n"
+          "  o = (const unsigned char *)JS_VALUE_GET_PTR(v);\n"
+          "  sh = *(const unsigned char *const *)(o + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+          "  id = (uint32_t)*(const uint16_t *)(sh + QJS_AOT_OFF_SHAPE_LAYOUT_ID);\n"
+          "  if (id == 0u || id > (uint32_t)Q2_LAYOUT_COUNT) return 0u;\n"
+          "  if ((*(const uint64_t *)((const unsigned char *)rt +\n"
+          "                           QJS_AOT_OFF_RT_LAYOUT_BROKEN) >> (id - 1u)) & 1u)\n"
+          "    return 0u;\n"
+          "  return id;\n"
+          "}\n\n");
     /* The inline unary fast path for neg and inc: an int whose result stays an
        int, or a float64. Anything else (-0, an overflow, a coercion) returns 0
        and the caller takes the engine's unary. */
@@ -4817,12 +4856,11 @@ int qjsaot_driver_main(int argc, char **argv) {
                                             unsigned **flags);
       ELayoutInfo *cand = calloc(E_LAYOUT_MAX, sizeof(*cand));
       int nc = cand != NULL ? qjs_aot_layout_export(cand, E_LAYOUT_MAX) : 0;
+      g_nlayouts = nc;
       int li;
       fprintf(f,
-              "#define Q2_LAYOUT_COUNT %du\n"
               "static void *q2_layout_shape[Q2_LAYOUT_COUNT + 1u];\n"
-              "static const uint32_t q2_layout_count = Q2_LAYOUT_COUNT;\n",
-              nc);
+              "static const uint32_t q2_layout_count = Q2_LAYOUT_COUNT;\n");
       if (nc > 0) {
         fprintf(f, "static const char *const q2_layout_fields[Q2_LAYOUT_COUNT][%d] = {\n",
                 PROF_MAX_FIELDS);
