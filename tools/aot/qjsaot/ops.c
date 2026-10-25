@@ -2560,6 +2560,17 @@ static void e_note_tag(char kind, int pc, const char *expr) {
    window slot no longer holds what was read). Filled before the blocks are
    emitted; NULL in a framed body. */
 static uint8_t *g_e_rooted;
+static int g_e_child_max, g_e_child_decl, g_e_last_inl_rz;
+/* Values whose property array pointer is held in a local `pp<N>`: a value of a contracted
+   layout read at the function's entry block. While the value stays in its layout (the facts
+   and the broken-bit rechecks guarantee it at every access) its property array is not moved,
+   so every slot access loads nothing but the slot. */
+static uint8_t *g_e_pp;
+static int e_pp_of(const char *recv) {
+  unsigned n;
+  if (recv[0] != 'v' || sscanf(recv + 1, "%u", &n) != 1) return -1;
+  return g_e_pp != NULL && (int)n < g_e_spill_nv && g_e_pp[n] ? (int)n : -1;
+}
 
 static void e_compute_rooted(const Q2Func *fn) {
   int nv = fn->nvalues, i, b, k, si, changed;
@@ -8029,6 +8040,10 @@ static int emit_group_this_read(
   if (!g_e_nolazy)
     fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
+  if (g_e_fl && e_group_layout(g) != 0 && fn->nrpo > 0 && g_e_blk == fn->rpo[0] && (int)rv < g_e_spill_nv) {
+    fprintf(f, "      pp%u = q2_propp(_t);\n", (unsigned)rv);
+    g_e_pp[rv] = 1;
+  }
   if (!emit_hit_result(f, fn, in, t, fv, freg, "_f")) {
     fprintf(stderr, "qjsaot: grouped this read at pc %d: no guard for its def\n", in->pc);
     abort();
@@ -9119,7 +9134,10 @@ static int emit_group_read(
     if (e_mc_index(site) >= 0)
       fprintf(f, "      _f = mcv%d;\n", e_mc_index(site));
     else
-      fprintf(f, "      _f = *%s(%s, %s);\n", e_slotfn(site), recv, off);
+      if (e_pp_of(recv) >= 0)
+        fprintf(f, "      _f = *q2_slotpp(pp%d, %s);\n", e_pp_of(recv), off);
+      else
+        fprintf(f, "      _f = *%s(%s, %s);\n", e_slotfn(site), recv, off);
   }
   if (!g_e_nolazy)
     fprintf(
@@ -9260,8 +9278,11 @@ static int emit_group_write(
         "JS_FreeValue(ctx, _old);\n",
         recv, woff);
   } else {
-    fprintf(
-        f, "      q2_put_slot(ctx, %s, %s, _nv);\n", recv, woff);
+    if (e_pp_of(recv) >= 0)
+      fprintf(f, "      q2_put_slotpp(ctx, pp%d, %s, _nv);\n", e_pp_of(recv), woff);
+    else
+      fprintf(
+          f, "      q2_put_slot(ctx, %s, %s, _nv);\n", recv, woff);
   }
   fprintf(f, "    }\n");
   e_inl_store_mark(f);
@@ -11500,6 +11521,9 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     int q_;
     for (q_ = 0; q_ < g_e_spill_nv; q_++) g_e_spill_slot[q_] = -1;
   }
+  free(g_e_pp);
+  g_e_pp = calloc((size_t)g_e_spill_nv, 1);
+  if (g_e_pp == NULL) abort();
   g_e_spill_n = 0;
   g_e_inl_nx_used = 0;
   free(g_e_dirty_ins);
@@ -12050,6 +12074,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           break;
         default:
           fprintf(f, "    JSValue v%u = JS_UNDEFINED;\n", (unsigned)k);
+          fprintf(f, "    const unsigned char *pp%u = NULL; (void)pp%u;\n", (unsigned)k, (unsigned)k);
           break;
       }
       any = 1;
