@@ -2755,6 +2755,24 @@ static int g_e_nolazy = 0;
    every safepoint is followed by a comparison of the runtime's epoch with `q2_ep` that leaves the body
    when any cache entry has changed meanwhile. */
 static int g_e_epoch_skip;
+/* The prototype data properties a body reads through a non-contracted group: the entry reads
+   each once, at the epoch its group shapes were validated at, so an access takes the value
+   from a local. */
+#define E_MC_MAX 32
+static int g_e_mc_site[E_MC_MAX], g_e_mc_grp[E_MC_MAX], g_e_mc_n;
+/* The value each cached read defines, so a call on it knows the callee's bound entry. */
+#define E_MC_VALS 8192
+static signed char g_e_mc_of[E_MC_VALS];
+static int e_mc_of(Q2ValueId v) { return (unsigned)v < E_MC_VALS ? g_e_mc_of[v] : -1; }
+static void e_mc_def(Q2ValueId v, int idx) {
+  if ((unsigned)v < E_MC_VALS) g_e_mc_of[v] = (signed char)idx;
+}
+static int e_mc_index(int site) {
+  int i;
+  for (i = 0; i < g_e_mc_n; i++)
+    if (g_e_mc_site[i] == site) return i;
+  return -1;
+}
 static const ETypes *g_e_types;
 
 static void e_emit_group_recheck(
@@ -5466,8 +5484,8 @@ static int emit_inl_nested_call(
   Q2ValueId spv[E_SPILL_MAX + 1];
   int nsp, resslot;
   const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
-  char winp[48], ib[512], pushr[200], spl[1024];
-  int allleaf;
+  char winp[48], ib[512], pushr[200], spl[1024], idt[256];
+  int allleaf, cmc = -1;
   const int pub = !g_e_inl || g_e_inl_r;
   char nrx[32];
   const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
@@ -5567,6 +5585,8 @@ static int emit_inl_nested_call(
   {
     Q2ValueId cv = cc / 16 < fn->nregs ? cur[cc / 16] : Q2_NO_VALUE;
     Q2ValueId tv = th >= 0 && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
+    if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME && cv < (Q2ValueId)t->nvalues)
+      cmc = e_mc_of(cv);
     if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME &&
         cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
       snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
@@ -5656,6 +5676,12 @@ static int emit_inl_nested_call(
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
     ib[0] = 0;
+    if (cmc >= 0)
+      snprintf(idt, sizeof(idt), "mce%d == (const void *)aot_f_%s", cmc, callee[k]);
+    else
+      snprintf(
+          idt, sizeof(idt), "%s%s, (const void *)aot_f_%s, %du)", e_cc_fn(fn, in), cexp,
+          callee[k], e_cc_ix(fn, in));
     /* An inlined body has no frame; its record puts it in the backtrace. */
     if (g_e_inl)
       snprintf(
@@ -5686,14 +5712,13 @@ static int emit_inl_nested_call(
     else if (allleaf) {
       fprintf(
           f,
-          "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) {\n"
+          "    if (__builtin_expect(%s, 1)) {\n"
           "        JSValue _o;\n"
           "#ifdef Q2_INLINE_%s\n"
           "        if (ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "                    %s, %d, &_o)) {\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
-          e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), callee[k], callee[k], cexp, recv, winp,
-          na, excret);
+          idt, callee[k], callee[k], cexp, recv, winp, na, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
       fprintf(
@@ -5709,7 +5734,7 @@ static int emit_inl_nested_call(
     else
     fprintf(
         f,
-        "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) "
+        "    if (__builtin_expect(%s, 1)) "
         "{\n"
         "        JSValue _o;\n%s"
         "%s        _o = aot_n_%s(ctx, caller_f,\n"
@@ -5717,7 +5742,7 @@ static int emit_inl_nested_call(
         "            %s, %d);\n"
         "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
         "%s\n",
-        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
+        idt, ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
     e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "        ");
     /* The result is in place (a TAG value in its local, a typed one in the frame
@@ -9027,7 +9052,10 @@ static int emit_group_read(
   {
     char off[96];
     e_slot_off(off, sizeof(off), g, site);
-    fprintf(f, "      _f = *%s(%s, %s);\n", e_slotfn(site), recv, off);
+    if (e_mc_index(site) >= 0)
+      fprintf(f, "      _f = mcv%d;\n", e_mc_index(site));
+    else
+      fprintf(f, "      _f = *%s(%s, %s);\n", e_slotfn(site), recv, off);
   }
   if (!g_e_nolazy)
     fprintf(
@@ -9077,7 +9105,10 @@ static int emit_group_chain(
   {
     char off[96];
     e_slot_off(off, sizeof(off), g2, s2);
-    fprintf(f, "      _c1 = *%s(_c0, %s);\n", e_slotfn(s2), off);
+    if (e_mc_index(s2) >= 0)
+      fprintf(f, "      _c1 = mcv%d;\n", e_mc_index(s2));
+    else
+      fprintf(f, "      _c1 = *%s(_c0, %s);\n", e_slotfn(s2), off);
   }
   if (!g_e_nolazy)
     fprintf(
@@ -9086,6 +9117,7 @@ static int emit_group_chain(
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
       in->pc);
   fprintf(f, "      v%u = _c0;\n", (unsigned)d0v);
+  if (e_mc_index(s2) >= 0 && t->lb[d1v] == E_LB_TAG) e_mc_def(d1v, e_mc_index(s2));
   if (t->lb[d1v] == E_LB_TAG) {
     fprintf(f, "      v%u = _c1;\n    }\n", (unsigned)d1v);
   } else {
@@ -11745,14 +11777,32 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         if (g_e_group_used[g] && !g_e_facts->groups[g].own && e_group_layout(g) != 0)
           fprintf(f, "    const void *gsh%d;\n", g);
       g_e_epoch_skip = ngu > 0 && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
+      g_e_mc_n = 0;
+      memset(g_e_mc_of, -1, sizeof(g_e_mc_of));
+      if (g_e_epoch_skip && !g_e_nolazy && getenv("QJS_AOT_NOMETHCACHE") == NULL)
+        for (g = 0; g < ng; g++) {
+          const EGroup *gr = &g_e_facts->groups[g];
+          if (!g_e_group_used[g] || e_entry_skip(g)) continue;
+          for (qq = 0; qq < gr->nsites; qq++) {
+            int hot = 0, z;
+            for (z = 0; z < g_e_facts->nsites; z++)
+              if (g_e_facts->sites[z].site == gr->sites[qq]) hot = g_e_facts->sites[z].hot;
+            if (hot && e_facts_site_proto(g_e_facts, gr->sites[qq]) == 1 && g_e_mc_n < E_MC_MAX) {
+              g_e_mc_site[g_e_mc_n] = gr->sites[qq];
+              g_e_mc_grp[g_e_mc_n++] = g;
+            }
+          }
+        }
       if (ngu > 0) {
         int gk = 0, pk = 0;
         fprintf(
             f,
             "    static const void *e_vg[%d]; static int e_vp[%d]; static uint32_t e_vep; static const void *e_vcb;\n"
+            "    static JSValue e_vm[%d]; static const void *e_vme[%d];\n"
             "    const uint32_t q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
             "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
-            ngu, npci > 0 ? npci : 1);
+            ngu, npci > 0 ? npci : 1, g_e_mc_n > 0 ? g_e_mc_n : 1, g_e_mc_n > 0 ? g_e_mc_n : 1);
+        for (g = 0; g < g_e_mc_n; g++) fprintf(f, "    JSValue mcv%d; const void *mce%d;\n", g, g);
         for (g = 0; g < ng; g++)
           if (g_e_group_used[g] && !e_entry_skip(g)) fprintf(f, "    const void *gsh%d;\n", g);
         for (g = 0; g < ng; g++) {
@@ -11771,6 +11821,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
               fprintf(f, "      pci%d = e_vp[%d];\n", gr->sites[qq], pk++);
         }
+        for (g = 0; g < g_e_mc_n; g++) fprintf(f, "      mcv%d = e_vm[%d]; mce%d = e_vme[%d];\n", g, g, g, g);
         fprintf(f, "    } else {\n");
         (void)gi;
       }
@@ -11835,6 +11886,15 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
               fprintf(f, "      e_vp[%d] = pci%d;\n", pk++, gr->sites[qq]);
         }
+        for (g = 0; g < g_e_mc_n; g++)
+          fprintf(
+              f,
+              "      mcv%d = JS_MKVAL(QJS_AOT_TAG_LAZY_JSON, 0);\n"
+              "      if (gsh%d != E_NO_SHAPE && !q2_holder_bad_sh(gsh%d, holders, %d))\n"
+              "        mcv%d = *q2_hslotp_sh(gsh%d, q2_cell_off(pic, %d));\n"
+              "      mce%d = q2_entry_of(mcv%d);\n"
+              "      e_vm[%d] = mcv%d; e_vme[%d] = mce%d;\n",
+              g, g_e_mc_grp[g], g_e_mc_grp[g], g_e_mc_site[g], g, g_e_mc_grp[g], g_e_mc_site[g], g, g, g, g, g, g);
         fprintf(f, "      e_vcb = pic; e_vep = q2_ep;\n    }\n");
       }
       /* A contracted group's shape is its layout's, read on every entry: the layout may

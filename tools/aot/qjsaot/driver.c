@@ -4437,6 +4437,23 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == "
         "entry;\n"
         "}\n\n");
+    /* The bound entry of a bytecode function, or NULL for any other value. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) const void *q2_entry_of("
+        "JSValue fnv)\n"
+        "{\n"
+        "  const unsigned char *o, *b;\n"
+        "\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return NULL;\n"
+        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
+        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) !=\n"
+        "      QJS_AOT_CLASS_BYTECODE_FUNCTION)\n"
+        "    return NULL;\n"
+        "  b = *(const unsigned char *const *)(o + "
+        "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN);\n"
+        "}\n\n");
     /* The same test with the function object a call site first accepted held in
        `q2_cc[ix]`: the unit holds a counted reference on it, so its address cannot be
        reused by another object while the site compares against it, and a match is one
