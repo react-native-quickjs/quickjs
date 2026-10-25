@@ -36,6 +36,9 @@
    text). Implies g_e_fl. */
 static int g_e_fi = -1;
 static int g_e_inl;
+/* An inline body that makes calls roots what it holds in an array of its own, published for the
+   length of each call, like a frameless body that calls. */
+static int g_e_inl_r;
 static const EFacts *g_e_facts;
 /* Set when a body emitted in inline mode needs more than inline mode can give. */
 static char g_e_inl_why[160];
@@ -5434,7 +5437,9 @@ static int emit_inl_nested_call(
   Q2ValueId spv[E_SPILL_MAX + 1];
   int nsp, resslot;
   const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
-  char winp[48], ib[512], pushr[160];
+  char winp[48], ib[512], pushr[200];
+  const int pub = !g_e_inl || g_e_inl_r;
+  char nrx[32];
   const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
 
   if (t == NULL || cur == NULL) return 0;
@@ -5460,8 +5465,11 @@ static int emit_inl_nested_call(
   th = call_this_off(in);
   off = dest_off(fn, in);
   na = in->win_n;
+  if (g_e_inl_r)
+    snprintf(nrx, sizeof(nrx), "%s", getenv("QJS_AOT_NOWINROOT") != NULL ? "0" : "SB_ + 0");
+  if (g_e_inl_r && getenv("QJS_AOT_NOWINROOT") == NULL) snprintf(nrx, sizeof(nrx), "SB_ + %d", na);
   w = in->win_reg * 16;
-  if (g_e_inl)
+  if (!pub)
     snprintf(winp, sizeof(winp), "&AOT_REG(fr, %d)", w);
   else
     snprintf(winp, sizeof(winp), "&ra_[SB_]");
@@ -5471,13 +5479,13 @@ static int emit_inl_nested_call(
   dreg = off / 16;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   dead = e_def_dead(in, dv);
-  if (t->lb[dv] == E_LB_TAG && !dead && g_e_inl) {
+  if (t->lb[dv] == E_LB_TAG && !dead && !pub) {
     e_fl_block("a call whose result is a TAG value", in);
     return 0;
   }
   if (t->lb[dv] == E_LB_BOT && !dead) return 0;
   resslot = -1;
-  if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
+  if (pub && t->lb[dv] == E_LB_TAG && !dead) {
     resslot = e_spill_slot(dv);
     if (resslot < 0) {
       e_fl_block("too many values live across a call", in);
@@ -5490,7 +5498,7 @@ static int emit_inl_nested_call(
   q2_live_before(fn, (int)(in - fn->insns), lb);
   /* The window is published as a root range while the call runs, so an argument
      nothing reads after the call needs no other root. */
-  if (!g_e_inl && (int)(in - fn->insns) + 1 < fn->ninsns) {
+  if (pub && (int)(in - fn->insns) + 1 < fn->ninsns) {
     uint64_t *la = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
     if (la == NULL) {
       free(lb);
@@ -5510,7 +5518,7 @@ static int emit_inl_nested_call(
         v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
       continue;
     if (g_e_rooted != NULL && g_e_rooted[v]) continue;
-    if (g_e_inl) {
+    if (!pub) {
       if (r * 16 == cc || (th >= 0 && r * 16 == th)) continue;
       free(lb);
       e_fl_block("a value live across a call is not rooted", in);
@@ -5563,7 +5571,7 @@ static int emit_inl_nested_call(
   for (r = 0; r < na; r++) {
     Q2ValueId v;
     int wr = in->win_reg + r;
-    if (!g_e_inl) {
+    if (pub) {
       e_emit_fl_window_store(f, fn, t, cur, wr, r);
       continue;
     }
@@ -5583,14 +5591,16 @@ static int emit_inl_nested_call(
               wr * 16, (unsigned)v);
   }
   e_sweep_guard(f, "vx", in->pc);
-  if (!g_e_inl) {
-    g_e_fl_calls = 1;
+  if (pub) {
     /* QJS_AOT_NOWINROOT=1 leaves the window unpublished: the negative control. */
     for (k = 0; k < nsp; k++)
       fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
-    fprintf(
-        f, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n", in->next - 1,
-        getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
+    if (!g_e_inl) {
+      g_e_fl_calls = 1;
+      fprintf(
+          f, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n", in->next - 1,
+          getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
+    }
   }
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
@@ -5602,9 +5612,9 @@ static int emit_inl_nested_call(
     if (g_e_inl)
       snprintf(
           pushr, sizeof(pushr),
-          "        JSAotFlRec ir_ = { E_FL_TOP(ctx_in), co, %d, 0, NULL };\n"
+          "        JSAotFlRec ir_ = { E_FL_TOP(ctx_in), co, %d, %s, %s };\n"
           "        E_FL_TOP(ctx_in) = &ir_;\n",
-          in->next - 1);
+          in->next - 1, nrx, g_e_inl_r ? "ra_" : "NULL");
     else
       pushr[0] = 0;
     if (!g_e_inl && qjs_aot_inline_has(callee[k]))
@@ -5638,7 +5648,7 @@ static int emit_inl_nested_call(
         "%s\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
-    if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
+    if (pub && t->lb[dv] == E_LB_TAG && !dead) {
       /* The owned result parks in the published window, then its count is dropped (the
          drop can run a collection); the next safepoint gives the value a slot. */
       fprintf(
@@ -11461,7 +11471,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "#define q2_arg_buf(f_) (argv)\n"
         "#define qjs_aot_get_var_ref(f_, i_) q2_vref_get(co, (i_))\n"
         "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(co, (i_))\n");
-    if (g_e_inl)
+    if (g_e_inl) {
       fprintf(
           f,
           "static inline __attribute__((always_inline)) int ei_%s(JSContext "
@@ -11477,7 +11487,20 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "    JSValue fr[%d];\n"
           "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
           hex, fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
-    else
+    if (g_e_inl && g_e_inl_r) {
+      int wi, mw = 1;
+      for (wi = 0; wi < fn->ninsns; wi++)
+        if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method) &&
+            fn->insns[wi].win_n > mw)
+          mw = fn->insns[wi].win_n;
+      fprintf(
+          f,
+          "    enum { SB_ = %d };\n"
+          "    JSValue ra_[SB_ + %d];\n"
+          "    { int k_; for (k_ = 0; k_ < SB_ + %d; k_++) ra_[k_] = JS_UNDEFINED; }\n",
+          g_e_spill_total, mw, mw);
+    }
+    } else
     fprintf(
         f,
         "%s%sJSValue aot_%s_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
@@ -12889,8 +12912,23 @@ int e_emit_inline_body(
   g_e_fl = 1;
   g_e_inl = 1;
   g_e_quiet = 1;
+  g_e_inl_r = ncalls > 0;
+  g_e_spill_total = 0;
   g_e_fl_block[0] = 0;
+  if (g_e_inl_r) {
+    char *tb = NULL;
+    size_t tl = 0;
+    FILE *tm = open_memstream(&tb, &tl);
+    if (tm != NULL) {
+      rc = e_emit_spec_body_pass(tm, fn, hex);
+      fclose(tm);
+      free(tb);
+      g_e_spill_total = g_e_spill_n;
+      g_e_fl_block[0] = 0;
+    }
+  }
   rc = e_emit_spec_body_pass(m, fn, hex);
+  g_e_inl_r = 0;
   fclose(m);
   g_e_fl = 0;
   g_e_inl = 0;
