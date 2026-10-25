@@ -1552,7 +1552,7 @@
     },
     {
       "name": "0394-aot-shape-table.patch",
-      "sha256": "063c8850fffd983e1e88769c2b807c2c93794e45fb0b95606447d95205e97899"
+      "sha256": "e9cff780fd8633a3f6fd26cc95f6e3633acaeec13745dfea3111e5b471e4b288"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1560,7 +1560,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "d58f6244bf0b0afda3482a6049ad5c65f064228068c10bbc175234815068e7c5",
+    "quickjs.c": "fadde33ba853860af38a30048d9a5b89daa4a2f1ef86d3fabca511aa968a32e8",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

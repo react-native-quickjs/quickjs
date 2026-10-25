@@ -64,17 +64,20 @@ until a unit declares one).
 +           which an address join would otherwise attach to the wrong layout. The
 +           dump drops these after printing. */
 +        s->shapes[s->nshapes] = js_dup_shape(shape);
-@@ -62941,0 +62956 @@
-+    shape->aot_prof_seen = 1;
-@@ -63555 +63570,5 @@
+@@ -62940,0 +62955,4 @@
++        /* Only a shape a site actually STORES enters the table: a fifth shape at
++           one site is recorded by neither, and a table entry no site references
++           would be a layout the generator could never cover. */
++        shape->aot_prof_seen = 1;
+@@ -63555 +63573,5 @@
 -            fprintf(f, " shape%d=%p hits=%u", j, (void *)s->shapes[j],
 +            /* The table index: safe to read because the site holds a reference
 +               on the shape, so it is alive and its id was assigned by the walk
 +               that printed the `P` lines. */
 +            fprintf(f, " shape%d=%u hits=%u", j,
 +                    s->shapes[j] != NULL ? (unsigned)s->shapes[j]->aot_prof_id : 0u,
-@@ -63598,0 +63618,82 @@
-+/* The shape table the generator reads: one `Q` line per distinct shape a field
+@@ -63598,0 +63621,82 @@
++/* The shape table the generator reads: one `P` line per distinct shape a field
 +   site observed, printed once, with the prototype it belongs to and its ordered
 +   property list. A site's `shape%d=` entry carries the table index instead of a
 +   runtime address, so the generator derives the ordered field list, each atom's
@@ -98,7 +101,7 @@ until a unit declares one).
 +        if (!sh->aot_prof_seen)
 +            continue;
 +        sh->aot_prof_id = (uint16_t)id;
-+        fprintf(f, "Q %d proto=", id);
++        fprintf(f, "P %d proto=", id);
 +        if (sh->proto == NULL) {
 +            fprintf(f, "null");
 +        } else {
@@ -156,7 +159,7 @@ until a unit declares one).
 +    }
 +}
 +
-@@ -63612,0 +63714,8 @@
+@@ -63612,0 +63717,8 @@
 +    {
 +        /* A context is needed only to name atoms; the dump runs at teardown, when
 +           the runtime's contexts are still alive. */
@@ -165,7 +168,7 @@ until a unit declares one).
 +                              : list_entry(rt->context_list.next, JSContext, link);
 +        aot_dump_shapes(f, rt, ctx0);
 +    }
-@@ -63622,0 +63732,21 @@
+@@ -63622,0 +63735,21 @@
 +    /* The site records took a reference on every shape they named (see
 +       js_aot_prof_pic): drop them now that both the table and the site lines are
 +       written, so a recorded shape's address can never have been reused. */
@@ -187,7 +190,7 @@ until a unit declares one).
 +                    }
 +        }
 +    }
-@@ -64248,0 +64379,48 @@
+@@ -64248,0 +64382,48 @@
 +
 +/* Build a contracted layout's shape chain. A temporary object of the prototype
 +   gets the fields in order through `add_property`, the same hashed transitions an

@@ -62952,8 +62952,11 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
         s->shapes[s->nshapes] = js_dup_shape(shape);
         s->shape_hits[s->nshapes] = 1;
         s->nshapes++;
+        /* Only a shape a site actually STORES enters the table: a fifth shape at
+           one site is recorded by neither, and a table entry no site references
+           would be a layout the generator could never cover. */
+        shape->aot_prof_seen = 1;
     }
-    shape->aot_prof_seen = 1;
 }
 
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
@@ -63615,7 +63618,7 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     }
 }
 
-/* The shape table the generator reads: one `Q` line per distinct shape a field
+/* The shape table the generator reads: one `P` line per distinct shape a field
    site observed, printed once, with the prototype it belongs to and its ordered
    property list. A site's `shape%d=` entry carries the table index instead of a
    runtime address, so the generator derives the ordered field list, each atom's
@@ -63639,7 +63642,7 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
         if (!sh->aot_prof_seen)
             continue;
         sh->aot_prof_id = (uint16_t)id;
-        fprintf(f, "Q %d proto=", id);
+        fprintf(f, "P %d proto=", id);
         if (sh->proto == NULL) {
             fprintf(f, "null");
         } else {
