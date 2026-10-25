@@ -1,0 +1,64 @@
+Subject: The profile records the slot each property site read or wrote
+
+What this does
+  - A property site's record keeps, for each shape it saw, the slot that shape put
+    the site's property in (the property's index in the shape's property list), or
+    -1 when the fill was not an own data slot (a prototype read, an add, a global).
+  - The profile's `S` line prints it as `slotN=` beside `shapeN=`.
+
+Why we need it
+  A compiled body can read a contracted layout's field at a constant slot only if
+  the generator knows which field a site names. The generator cannot resolve a
+  site's atom (the atom is read from the bytecode at run time), but the slot the
+  profiled run used, together with the shape table's ordered property list, names
+  the field exactly.
+
+Functions touched
+  `js_aot_prof_pic` (new `slot` argument and the `AOT_PROF_PIC` macro), the
+  property-read and property-store fills that call it, `js_aot_prof_dump`;
+  `JSAotProfSite` gains `shape_slots`.
+
+No (written only by a profiling build).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1639,0 +1640,3 @@
++    /* The slot each recorded shape put the site's property in, or -1 when the
++       fill was not an own data slot. */
++    int16_t shape_slots[4];
+@@ -1928 +1931 @@
+-                            int kind);
++                            int kind, int slot);
+@@ -1966 +1969 @@
+-#define AOT_PROF_PIC(b_, s_, sh_, k_) \
++#define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) \
+@@ -1968 +1971 @@
+-                 js_aot_prof_pic((b_), (s_), (sh_), (k_)); } while (0)
++                 js_aot_prof_pic((b_), (s_), (sh_), (k_), (sl_)); } while (0)
+@@ -2008 +2011 @@
+-#define AOT_PROF_PIC(b_, s_, sh_, k_) ((void)0)
++#define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) ((void)0)
+@@ -17060 +17063 @@
+-    AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL);
++    AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL, -1);
+@@ -25601 +25604,2 @@
+-                 depth == 0 ? REG_PIC_OWN : depth == 1 ? REG_PIC_PROTO : REG_PIC_PROTO2);
++                 depth == 0 ? REG_PIC_OWN : depth == 1 ? REG_PIC_PROTO : REG_PIC_PROTO2,
++                 depth == 0 ? (int)(pr - holder->prop) : -1);
+@@ -26022 +26026 @@
+-        AOT_PROF_PIC(b, site, NULL, REG_PIC_ADD_W);
++        AOT_PROF_PIC(b, site, NULL, REG_PIC_ADD_W, -1);
+@@ -26031 +26035 @@
+-        AOT_PROF_PIC(b, site, p->shape, REG_PIC_OWN_W);
++        AOT_PROF_PIC(b, site, p->shape, REG_PIC_OWN_W, (int)(pr - p->prop));
+@@ -62960 +62964 @@
+-                            int kind)
++                            int kind, int slot)
+@@ -62997,0 +63002 @@
++        s->shape_slots[s->nshapes] = (int16_t)slot;
+@@ -63617 +63622 @@
+-            fprintf(f, " shape%d=%u hits=%u", j,
++            fprintf(f, " shape%d=%u hits=%u slot%d=%d", j,
+@@ -63619 +63624 @@
+-                    s->shape_hits[j]);
++                    s->shape_hits[j], j, (int)s->shape_slots[j]);

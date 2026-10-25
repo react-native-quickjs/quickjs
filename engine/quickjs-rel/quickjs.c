@@ -1637,6 +1637,9 @@ typedef struct JSAotProfSite {
     uint8_t kinds;
     JSShape *shapes[4];
     uint32_t shape_hits[4];
+    /* The slot each recorded shape put the site's property in, or -1 when the
+       fill was not an own data slot. */
+    int16_t shape_slots[4];
 } JSAotProfSite;
 
 typedef struct JSAotProfCallee {
@@ -1925,7 +1928,7 @@ static int js_aot_prof_enter(JSFunctionBytecode *b);
 static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev);
 #endif
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
-                            int kind);
+                            int kind, int slot);
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
 static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey);
 static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k);
@@ -1963,9 +1966,9 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #endif
 #define AOT_PROF_ENTER(b_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_enter(b_); } while (0)
-#define AOT_PROF_PIC(b_, s_, sh_, k_) \
+#define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) \
         do { if (unlikely(AOT_PROF_ON(b_))) \
-                 js_aot_prof_pic((b_), (s_), (sh_), (k_)); } while (0)
+                 js_aot_prof_pic((b_), (s_), (sh_), (k_), (sl_)); } while (0)
 #define AOT_PROF_REG(b_, d_, v_) \
         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
 #define AOT_PROF_ELEM(b_, v_, h_) \
@@ -2005,7 +2008,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #if QJS_REGVM
 #define AOT_PROF_OP(b_, rpc_)       ((void)0)
 #define AOT_PROF_ENTER(b_)          ((void)0)
-#define AOT_PROF_PIC(b_, s_, sh_, k_) ((void)0)
+#define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) ((void)0)
 #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
 #define AOT_PROF_CALL_RESULT(c_, rip_, v_) ((void)0)
@@ -17057,7 +17060,7 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
     ctx->rt->aot_pic_epoch++;
     /* The profile counts the distinct generations a site was filled at: a site filled
        twice saw the global object change. */
-    AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL);
+    AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL, -1);
 }
 #endif
 
@@ -25598,7 +25601,8 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     /* A read two prototypes up is cached only by the global stub cache, never by the
        function's own cache entry, so the profile names it apart from a direct prototype. */
     AOT_PROF_PIC(b, site, rsh,
-                 depth == 0 ? REG_PIC_OWN : depth == 1 ? REG_PIC_PROTO : REG_PIC_PROTO2);
+                 depth == 0 ? REG_PIC_OWN : depth == 1 ? REG_PIC_PROTO : REG_PIC_PROTO2,
+                 depth == 0 ? (int)(pr - holder->prop) : -1);
     slot = (uint32_t)(pr - holder->prop);
 
     /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);
@@ -26019,7 +26023,7 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     /* The profile wants to know the store ADDED the property, whatever else
        declines to cache it below: a site that adds never hits an own slot. */
     if (!prof_was_own)
-        AOT_PROF_PIC(b, site, NULL, REG_PIC_ADD_W);
+        AOT_PROF_PIC(b, site, NULL, REG_PIC_ADD_W, -1);
     if (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))
         return;                     /* accessor, var-ref, autoinit or length */
     if (!(prs->flags & JS_PROP_WRITABLE))
@@ -26028,7 +26032,7 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
         return;                     /* see regvm_pic_fill: only hashed is immutable */
 
     if (prof_was_own)
-        AOT_PROF_PIC(b, site, p->shape, REG_PIC_OWN_W);
+        AOT_PROF_PIC(b, site, p->shape, REG_PIC_OWN_W, (int)(pr - p->prop));
     pic = *ppic;
     if (!pic) {
         pic = regvm_pic_ensure(rt, b);
@@ -62957,7 +62961,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc)
 }
 
 static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
-                            int kind)
+                            int kind, int slot)
 {
     JSAotProfFunc *pf = b->aot_prof;
     JSAotProfSite *s;
@@ -62995,6 +62999,7 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
            dump drops these after printing. */
         s->shapes[s->nshapes] = js_dup_shape(shape);
         s->shape_hits[s->nshapes] = 1;
+        s->shape_slots[s->nshapes] = (int16_t)slot;
         s->nshapes++;
         shape->aot_prof_seen = 1;
     }
@@ -63614,9 +63619,9 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
             /* The table index: safe to read because the site holds a reference
                on the shape, so it is alive and its id was assigned by the walk
                that printed the `P` lines. */
-            fprintf(f, " shape%d=%u hits=%u", j,
+            fprintf(f, " shape%d=%u hits=%u slot%d=%d", j,
                     s->shapes[j] != NULL ? (unsigned)s->shapes[j]->aot_prof_id : 0u,
-                    s->shape_hits[j]);
+                    s->shape_hits[j], j, (int)s->shape_slots[j]);
         fputc('\n', f);
     }
     for (i = 0; i < pf->ncalls; i++) {
