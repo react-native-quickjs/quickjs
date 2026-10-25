@@ -11891,11 +11891,17 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           fprintf(
               f,
               "      mcv%d = JS_MKVAL(QJS_AOT_TAG_LAZY_JSON, 0);\n"
-              "      if (gsh%d != E_NO_SHAPE && !q2_holder_bad_sh(gsh%d, holders, %d))\n"
+              "      if (gsh%d != E_NO_SHAPE) {\n"
+              "        if (__builtin_expect(q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"
+              "          E_REFUSE_NOTE(%d);\n"
+              "          return %s;\n"
+              "        }\n"
               "        mcv%d = *q2_hslotp_sh(gsh%d, q2_cell_off(pic, %d));\n"
+              "      }\n"
               "      mce%d = q2_entry_of(mcv%d);\n"
               "      e_vm[%d] = mcv%d; e_vme[%d] = mce%d;\n",
-              g, g_e_mc_grp[g], g_e_mc_grp[g], g_e_mc_site[g], g, g_e_mc_grp[g], g_e_mc_site[g], g, g, g, g, g, g);
+              g, g_e_mc_grp[g], g_e_mc_grp[g], g_e_mc_site[g], fi, gen0, g, g_e_mc_grp[g],
+              g_e_mc_site[g], g, g, g, g, g, g);
         fprintf(f, "      e_vcb = pic; e_vep = q2_ep;\n    }\n");
       }
       /* A contracted group's shape is its layout's, read on every entry: the layout may
@@ -11924,7 +11930,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
                 "        return %s;\n"
                 "    }\n",
                 g, g, gr->sites[q], fi, gen0);
-          else if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]))
+          else if (hot && e_facts_site_proto(g_e_facts, gr->sites[q]) && e_mc_index(gr->sites[q]) < 0)
             fprintf(
                 f,
                 "    if (__builtin_expect(gsh%d != E_NO_SHAPE &&\n"
