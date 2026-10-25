@@ -1289,8 +1289,8 @@ static void e_emit_return(FILE *f, int off) {
         "#if QJS_DRC\n"
         "      q2_dup(_rv);\n"
         "#endif\n"
-        "      E_INL_NOTE(%d); *out = _rv; return 1; }\n",
-        off, g_e_fi);
+        "      *out = _rv; return 1; }\n",
+        off);
     return;
   }
   fprintf(
@@ -11063,7 +11063,7 @@ static int emit_typed_return(
   if (in->rop == ROP_return_undefined) {
     if (role == NULL || role->control != E_CF_RETURN) return 0;
     if (g_e_inl)
-      fprintf(f, "    { E_INL_NOTE(%d); *out = JS_UNDEFINED; return 1; }\n", g_e_fi);
+      fprintf(f, "    { *out = JS_UNDEFINED; return 1; }\n");
     else
       fprintf(f, "    return JS_UNDEFINED;\n");
     return 1;
@@ -11887,7 +11887,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   if (g_e_fl && g_e_fl_calls && !g_e_inl) e_pure_emit_entry(f);
   /* Counted only now: everything that could refuse the entry has been passed, so
      this measures speculative bodies that ACTUALLY RAN. */
-  fprintf(f, "    E_ENTER_NOTE(%d);\n", fi);
+  if (!g_e_inl) fprintf(f, "    E_ENTER_NOTE(%d);\n", fi);
 
 
   /* One C local per value, by representation. A value that is not live is
