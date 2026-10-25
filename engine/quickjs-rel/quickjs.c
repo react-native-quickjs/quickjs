@@ -371,6 +371,18 @@ typedef struct JSShape JSShape;
 /* The unit's teardown: drops the references its site and layout caches hold and
    forgets the runtime that owned them. Weak, so a build with no unit links. */
 extern void qjs_aot_release(JSRuntime *rt) __attribute__((weak));
+
+/* The unit's bind-time chain builder. Weak, so a build with no unit links; called
+   once at the first bind, with a context on the interpreter's stack, because
+   laying out a chain allocates and that must not happen inside a compiled body. */
+extern int qjs_aot_layouts_build(JSContext *ctx) __attribute__((weak));
+/* Whether a digest names the constructor of a contracted layout whose chain is
+   still to be built, and the call that builds it once the constructor's function
+   object (with its final `.prototype`) exists. Both weak. */
+extern int qjs_aot_layout_ctor(const uint8_t digest[16]) __attribute__((weak));
+extern void qjs_aot_layout_fn_created(JSContext *ctx, JSValue fn,
+                                      const uint8_t digest[16])
+    __attribute__((weak));
 typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 typedef struct JSStringRope JSStringRope;
@@ -742,6 +754,9 @@ struct JSRuntime {
     JSShape **aot_layout_shape;
     uint32_t aot_layout_count;
     uint64_t aot_layout_broken;
+    /* Set once the unit's chains are laid out. A chain allocates, which must
+       never happen inside a compiled body, so the build runs at the first bind. */
+    uint8_t aot_layouts_built;
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
@@ -1893,6 +1908,9 @@ typedef struct JSFunctionBytecode {
        recomputes it from the table it finds. */
     uint8_t aot_call_ready, aot_light;
     uint8_t aot_state;
+    /* The function is the constructor of a contracted layout (the unit says so at
+       bind): creating its function object builds that layout's chain. */
+    uint8_t aot_layout_ctor;
 #endif
 } JSFunctionBytecode;
 
@@ -23786,9 +23804,17 @@ static const uint16_t func_kind_to_class_id[] = {
     [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
 };
 
-static JSValue js_closure(JSContext *ctx, JSValue bfunc,
-                          JSVarRef **cur_var_refs,
-                          JSStackFrame *sf)
+#if QJS_AOT
+static void js_aot_layout_fn_hook(JSContext *ctx, JSValueConst fn);
+#define JS_AOT_LAYOUT_CTOR(b_) ((b_)->aot_layout_ctor)
+#else
+#define js_aot_layout_fn_hook(ctx_, fn_) ((void)0)
+#define JS_AOT_LAYOUT_CTOR(b_) 0
+#endif
+
+static JSValue js_closure_impl(JSContext *ctx, JSValue bfunc,
+                               JSVarRef **cur_var_refs,
+                               JSStackFrame *sf)
 {
     JSFunctionBytecode *b;
     JSValue func_obj;
@@ -23898,6 +23924,18 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     return JS_EXCEPTION;
 }
 
+static JSValue js_closure(JSContext *ctx, JSValue bfunc,
+                          JSVarRef **cur_var_refs,
+                          JSStackFrame *sf)
+{
+    bool ctor = JS_AOT_LAYOUT_CTOR((JSFunctionBytecode *)JS_VALUE_GET_PTR(bfunc));
+    JSValue fn = js_closure_impl(ctx, bfunc, cur_var_refs, sf);
+
+    if (unlikely(ctor) && !JS_IsException(fn))
+        js_aot_layout_fn_hook(ctx, fn);
+    return fn;
+}
+
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
 
 static int js_op_define_class(JSContext *ctx, JSValue *sp,
@@ -23988,6 +24026,8 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
     JS_FreeValue(ctx, parent_proto);
     JS_FreeValue(ctx, parent_class);
 
+    if (unlikely(JS_AOT_LAYOUT_CTOR(b)))
+        js_aot_layout_fn_hook(ctx, ctor);
     sp[-2] = ctor;
     sp[-1] = proto;
     return 0;
@@ -64150,11 +64190,16 @@ static void js_aot_bind(JSFunctionBytecode *b)
     b->aot_nfn = NULL;
     b->aot_index = UINT32_MAX;
     b->aot_state = 2;           /* known-absent until a match is found */
+    b->aot_layout_ctor = 0;
     if (!aot_unit_present())
         return;
     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
         return;
     js_aot_digest(b, digest);
+    /* A constructor of a contracted layout is marked whether or not the unit
+       compiled it: its function object is what the layout's chain is built from. */
+    if (&qjs_aot_layout_ctor != NULL && qjs_aot_layout_ctor(digest))
+        b->aot_layout_ctor = 1;
     lo = 0;
     hi = qjs_aot_count;
     while (lo < hi) {
@@ -64184,6 +64229,21 @@ static void js_aot_bind(JSFunctionBytecode *b)
                     b->realm->rt, sizeof(JSAotPolyEntry) * n * AOT_POLY_WAYS);
                 if (b->aot_poly != NULL)
                     b->aot_poly_sites = n;
+            }
+            /* The unit's contracted layouts are built HERE, on the first bind,
+               before any compiled body runs: laying out a chain allocates, and
+               an allocation inside a compiled frame is a safepoint the frame is
+               not prepared for. Bind runs on the interpreter's stack with the
+               bytecode final and no instance of any contracted class created by
+               this unit yet. */
+            if (!b->realm->rt->aot_layouts_built && &qjs_aot_layouts_build != NULL) {
+                struct list_head *el;
+                b->realm->rt->aot_layouts_built = 1;
+                list_for_each(el, &b->realm->rt->context_list) {
+                    JSContext *cx0 = list_entry(el, JSContext, link);
+                    qjs_aot_layouts_build(cx0);
+                    break;
+                }
             }
             js_aot_bound_count++;
             return;
@@ -64381,6 +64441,69 @@ QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh)
     return sh != NULL ? (uint32_t)((const JSShape *)sh)->layout_id : 0u;
 }
 
+/* A constructor of a contracted layout now has its function object: hand it to the
+   unit, which builds the layout's chain against the constructor's final
+   `.prototype`. Runs on the interpreter's stack after the closure (or, for a
+   class, its prototype) is complete. */
+static void js_aot_layout_fn_hook(JSContext *ctx, JSValueConst fn)
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+    uint8_t dg[16];
+
+    if (&qjs_aot_layout_fn_created == NULL || !JS_IsObject(fn))
+        return;
+    p = JS_VALUE_GET_OBJ(fn);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return;
+    b = p->u.func.function_bytecode;
+    js_aot_digest(b, dg);
+    qjs_aot_layout_fn_created(ctx, fn, dg);
+    /* The closure itself succeeded, so nothing may be left pending by the build: an
+       allocation failure there refuses the layout and is dropped here. */
+    if (unlikely(JS_HasException(ctx)))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    /* Once the unit has nothing left to build for this digest the mark is
+       dropped, so later closures of the same function skip the hash. */
+    if (&qjs_aot_layout_ctor != NULL && !qjs_aot_layout_ctor(dg))
+        b->aot_layout_ctor = 0;
+}
+
+/* Object.prototype, for a layout whose instances are plain object literals. The
+   unit cannot read a context's class_proto table. A borrowed reference. */
+QJS_AOT_STUB JSValue qjs_aot_object_prototype(JSContext *ctx)
+{
+    return ctx->class_proto[JS_CLASS_OBJECT];
+}
+
+/* The `.prototype` of a constructor, as an owned reference, or undefined when it
+   is not an own plain data property holding an object: a getter is never run, so
+   a layout whose constructor has anything else there is refused. Reading an
+   unforced automatic prototype instantiates it, which is what the first `new` of
+   the constructor does anyway. */
+QJS_AOT_STUB JSValue qjs_aot_function_prototype(JSContext *ctx, JSValueConst fn)
+{
+    JSPropertyDescriptor desc;
+    int r = JS_GetOwnProperty(ctx, &desc, fn, JS_ATOM_prototype);
+
+    if (r < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_UNDEFINED;
+    }
+    if (r == 0)
+        return JS_UNDEFINED;
+    if (desc.flags & (JS_PROP_GETSET)) {
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+        return JS_UNDEFINED;
+    }
+    if (!JS_IsObject(desc.value)) {
+        JS_FreeValue(ctx, desc.value);
+        return JS_UNDEFINED;
+    }
+    return desc.value;
+}
+
 /* Build a contracted layout's shape chain. A temporary object of the prototype
    gets the fields in order through `add_property`, the same hashed transitions an
    interpreter `this.x = v` follows, so the final shape is the exact pointer any
@@ -64396,7 +64519,9 @@ QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
 {
     JSValue obj;
     JSObject *p;
+    JSShape *final_sh;
     uint32_t i, stored = 0;
+    void **shapes = (void **)out;
 
     if (atoms == NULL || n == 0 || out == NULL || out_cap < n + 1)
         return 0;
@@ -64406,28 +64531,40 @@ QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
     if (JS_IsException(obj))
         return 0;
     p = JS_VALUE_GET_OBJ(obj);
-    ((void **)out)[stored++] = (void *)js_dup_shape(p->shape);
+    shapes[stored++] = (void *)js_dup_shape(p->shape);
     for (i = 0; i < n; i++) {
         JSProperty *pr;
         pr = add_property(ctx, p, atoms[i], JS_PROP_C_W_E);
         if (pr == NULL)
             goto fail;
-        /* A shape that already ends another layout would be shared between two
-           contracts, so its id could only lie about one of them. */
+        /* add_property leaves the slot for the caller to fill, and the object's
+           teardown frees every slot. */
+        pr->u.value = JS_UNDEFINED;
+        /* A shape that already ends a DIFFERENT layout cannot also end this one;
+           sharing with a shape of the SAME layout is what lets an interpreter
+           instance and a compiled one agree, so it is allowed. */
         if (p->shape->layout_id != 0 && p->shape->layout_id != (uint16_t)layout_id)
             goto fail;
-        ((void **)out)[stored++] = (void *)js_dup_shape(p->shape);
+        shapes[stored++] = (void *)js_dup_shape(p->shape);
     }
-    p->shape->layout_id = (uint16_t)layout_id;
+    /* The chain must have ended on a shape carrying every field: that is what
+       proves the adds diverged instead of collapsing back onto a shorter or the
+       prototype's empty shape. */
+    if ((uint32_t)p->shape->prop_count != n)
+        goto fail;
+    /* Stamp the layout id while the object still names the shape, then drop the
+       object. Our own references keep every shape in the chain alive. */
+    final_sh = p->shape;
+    final_sh->layout_id = (uint16_t)layout_id;
     JS_FreeValue(ctx, obj);
     return stored;
 fail:
-    for (i = 0; i < stored; i++)
-        js_free_shape(ctx->rt, (JSShape *)((void **)out)[i]);
     JS_FreeValue(ctx, obj);
+    for (i = 0; i < stored; i++)
+        if (shapes[i] != NULL)
+            js_free_shape(ctx->rt, (JSShape *)shapes[i]);
     return 0;
 }
-
 
 /* Whether reading `fn.apply` would hand back exactly the builtin `Function.prototype.apply`,
    decided without running JavaScript, allocating or taking a reference. The property is looked

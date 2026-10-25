@@ -1555,12 +1555,16 @@
       "sha256": "8fdb6b0094d95608a51bd0f812cea8870f35c4d3454e01d2955e3a9ad1c42b1f"
     },
     {
+      "name": "0395-aot-layout-build.patch",
+      "sha256": "b5fd0338cc71b40b139943217faffac237ec4fc43e88d731969b3ed56ef29050"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "b49f2fe6b68a8f2e4d47568886bc225f725f5ea9caac13da2dc7d3e4212b962e",
+    "quickjs.c": "1e1572139b6117ef902841b6fd877a26429b010addb7997ab8e5c80595a8a5d3",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
