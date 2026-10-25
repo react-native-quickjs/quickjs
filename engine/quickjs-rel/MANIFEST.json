@@ -1551,12 +1551,16 @@
       "sha256": "dec5e7f53f47e82108f7e2910844ae8be032424e89c8f8e29f5a5131f9308416"
     },
     {
+      "name": "0394-aot-shape-table.patch",
+      "sha256": "3d1037c497fa25f2c194bf631e36b1d7bb6eb278e1d77d9992640f516d518d81"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "388ad18740f03b61c432546d770022b27f98c1ee267463d99b4978ac70e69901",
+    "quickjs.c": "d0282d95c9c911747d10c952521bb9ecaa92c5913be92091f9bb30d6ac46a935",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

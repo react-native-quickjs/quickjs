@@ -2334,6 +2334,10 @@ struct JSShape {
        cloning. An object that adopts another shape leaves the layout, and that
        adoption sets the contract's broken bit. */
     uint16_t layout_id;
+    /* The profiler's shape table: set when a field site observes this shape, and
+       the index the dumped table gives it. Only in a build that can profile. */
+    uint8_t aot_prof_seen;
+    uint16_t aot_prof_id;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -62934,11 +62938,22 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
             return;
         }
     }
+    /* A global slot's fill passes its cell GENERATION cast to a shape pointer, to
+       record the fill's kind only (see regvm_global_site_fill), so it names no
+       shape: it must not be recorded, referenced or marked, or the table would
+       hold a pointer that is not a shape at all. */
+    if (kind == REG_PIC_GLOBAL)
+        return;
     if (s->nshapes < 4) {
-        s->shapes[s->nshapes] = shape;
+        /* A recorded shape is REFERENCED: at most four per site, and it keeps the
+           address from being reused by a different shape before the dump reads it,
+           which an address join would otherwise attach to the wrong layout. The
+           dump drops these after printing. */
+        s->shapes[s->nshapes] = js_dup_shape(shape);
         s->shape_hits[s->nshapes] = 1;
         s->nshapes++;
     }
+    shape->aot_prof_seen = 1;
 }
 
 static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
@@ -63552,7 +63567,11 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
         fprintf(f, "S %s site=%d count=%u src=%s kinds=%u shapes=%u", dgt, i,
                 s->count, src, s->kinds, s->nshapes);
         for (j = 0; j < s->nshapes; j++)
-            fprintf(f, " shape%d=%p hits=%u", j, (void *)s->shapes[j],
+            /* The table index: safe to read because the site holds a reference
+               on the shape, so it is alive and its id was assigned by the walk
+               that printed the `P` lines. */
+            fprintf(f, " shape%d=%u hits=%u", j,
+                    s->shapes[j] != NULL ? (unsigned)s->shapes[j]->aot_prof_id : 0u,
                     s->shape_hits[j]);
         fputc('\n', f);
     }
@@ -63596,6 +63615,88 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     }
 }
 
+/* The shape table the generator reads: one `P` line per distinct shape a field
+   site observed, printed once, with the prototype it belongs to and its ordered
+   property list. A site's `shape%d=` entry carries the table index instead of a
+   runtime address, so the generator derives the ordered field list, each atom's
+   slot and the prefix relations from the table. Prototype identity is the
+   prototype object's address, which is enough within one profile -- the same
+   assumption the shape addresses themselves already rest on. */
+static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
+{
+    struct list_head *el;
+    int id = 0;
+
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSShape *sh;
+        uint32_t k;
+        int first = 1;
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_SHAPE)
+            continue;
+        sh = (JSShape *)gp;
+        if (!sh->aot_prof_seen)
+            continue;
+        sh->aot_prof_id = (uint16_t)id;
+        fprintf(f, "P %d proto=", id);
+        if (sh->proto == NULL) {
+            fprintf(f, "null");
+        } else {
+            JSObject *po = sh->proto;
+            JSProperty *cpr = NULL;
+            JSShapeProperty *cprs = find_own_property(&cpr, po, JS_ATOM_constructor);
+            int named = 0;
+            /* Only an own plain data property, so no getter is ever run. A bytecode
+               function there is the constructor the unit binds by digest; its
+               prototype is what a chain is built from at that construct's first
+               compiled execution. */
+            if (cprs != NULL && (cprs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
+                JS_VALUE_GET_TAG(cpr->u.value) == JS_TAG_OBJECT) {
+                JSObject *cf = JS_VALUE_GET_OBJ(cpr->u.value);
+                if (cf->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                    uint8_t dg[16];
+                    char hx[33];
+                    uint32_t b;
+                    js_aot_digest(cf->u.func.function_bytecode, dg);
+                    for (b = 0; b < 16; b++)
+                        snprintf(hx + b * 2, 3, "%02x", dg[b]);
+                    fprintf(f, "fn:%s", hx);
+                    named = 1;
+                }
+            }
+            if (!named) {
+                if (po->class_id == JS_CLASS_ARRAY)
+                    fprintf(f, "array");
+                else if (po->class_id == JS_CLASS_OBJECT && ctx != NULL &&
+                         po == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]))
+                    fprintf(f, "object");
+                else
+                    fprintf(f, "other:%p", (void *)po);
+            }
+        }
+        fprintf(f, " n=%d props=", (int)sh->prop_count);
+        for (k = 0; k < (uint32_t)sh->prop_count; k++) {
+            JSShapeProperty *pr = &get_shape_prop(sh)[k];
+            if (pr->atom == JS_ATOM_NULL)
+                continue;
+            {
+                const char *nm = ctx != NULL ? JS_AtomToCString(ctx, pr->atom) : NULL;
+                if (!first)
+                    fputc(',', f);
+                first = 0;
+                fprintf(f, "%s:%u", nm != NULL ? nm : "?",
+                        (unsigned)(pr->flags & (JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
+                                                JS_PROP_CONFIGURABLE)));
+                if (nm != NULL)
+                    JS_FreeCString(ctx, nm);
+            }
+        }
+        fputc('\n', f);
+        id++;
+    }
+}
+
 void js_aot_prof_dump(JSRuntime *rt)
 {
     const char *out = getenv("QJS_AOT_PROFILE_OUT");
@@ -63610,6 +63711,14 @@ void js_aot_prof_dump(JSRuntime *rt)
     fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 vmode=%u\n",
             QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
             QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
+    {
+        /* A context is needed only to name atoms; the dump runs at teardown, when
+           the runtime's contexts are still alive. */
+        JSContext *ctx0 = list_empty(&rt->context_list)
+                              ? NULL
+                              : list_entry(rt->context_list.next, JSContext, link);
+        aot_dump_shapes(f, rt, ctx0);
+    }
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
@@ -63619,6 +63728,27 @@ void js_aot_prof_dump(JSRuntime *rt)
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
             aot_dump_one(f, rt, (JSFunctionBytecode *)gp);
+    }
+    /* The site records took a reference on every shape they named (see
+       js_aot_prof_pic): drop them now that both the table and the site lines are
+       written, so a recorded shape's address can never have been reused. */
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+            continue;
+        {
+            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+            JSAotProfFunc *pf = b->aot_prof;
+            int si, sj;
+            if (pf == NULL)
+                continue;
+            for (si = 0; si < pf->nsites; si++)
+                for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+                    if (pf->sites[si].shapes[sj] != NULL) {
+                        js_free_shape(rt, pf->sites[si].shapes[sj]);
+                        pf->sites[si].shapes[sj] = NULL;
+                    }
+        }
     }
     if (f != stderr)
         fclose(f);
@@ -64246,6 +64376,54 @@ QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh)
 {
     return sh != NULL ? (uint32_t)((const JSShape *)sh)->layout_id : 0u;
 }
+
+/* Build a contracted layout's shape chain. A temporary object of the prototype
+   gets the fields in order through `add_property`, the same hashed transitions an
+   interpreter `this.x = v` follows, so the final shape is the exact pointer any
+   path arrives at -- which is what lets a compiled read test it. One reference is
+   taken on every shape in the chain and stored in `out`, so no in-place mutation
+   can ever reach one; the final shape also gets the layout id. The temporary
+   object is freed, leaving only the chain's references. Returns the number of
+   shapes stored, or 0 on failure. */
+QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
+                                           const JSAtom *atoms, uint32_t n,
+                                           void *out, uint32_t out_cap,
+                                           uint32_t layout_id)
+{
+    JSValue obj;
+    JSObject *p;
+    uint32_t i, stored = 0;
+
+    if (atoms == NULL || n == 0 || out == NULL || out_cap < n + 1)
+        return 0;
+    if (layout_id == 0 || layout_id > 63)
+        return 0;
+    obj = JS_NewObjectProtoClass(ctx, proto_val, JS_CLASS_OBJECT);
+    if (JS_IsException(obj))
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    ((void **)out)[stored++] = (void *)js_dup_shape(p->shape);
+    for (i = 0; i < n; i++) {
+        JSProperty *pr;
+        pr = add_property(ctx, p, atoms[i], JS_PROP_C_W_E);
+        if (pr == NULL)
+            goto fail;
+        /* A shape that already ends another layout would be shared between two
+           contracts, so its id could only lie about one of them. */
+        if (p->shape->layout_id != 0 && p->shape->layout_id != (uint16_t)layout_id)
+            goto fail;
+        ((void **)out)[stored++] = (void *)js_dup_shape(p->shape);
+    }
+    p->shape->layout_id = (uint16_t)layout_id;
+    JS_FreeValue(ctx, obj);
+    return stored;
+fail:
+    for (i = 0; i < stored; i++)
+        js_free_shape(ctx->rt, (JSShape *)((void **)out)[i]);
+    JS_FreeValue(ctx, obj);
+    return 0;
+}
+
 
 /* Whether reading `fn.apply` would hand back exactly the builtin `Function.prototype.apply`,
    decided without running JavaScript, allocating or taking a reference. The property is looked
