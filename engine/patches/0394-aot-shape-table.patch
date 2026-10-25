@@ -1,7 +1,7 @@
 Subject: The profile records a shape table, so a contracted layout has a field list
 
 What this does
-  - The profiler writes a shape table: one `P` line per distinct shape any field
+  - The profiler writes a shape table: one `Q` line per distinct shape any field
     site observed, with the prototype that shape belongs to and the ordered
     property list. A site's `shapeN=` entry carries the table index.
   - A shape's prototype is named by the prototype's own `constructor` data
@@ -74,7 +74,7 @@ until a unit declares one).
 +            fprintf(f, " shape%d=%u hits=%u", j,
 +                    s->shapes[j] != NULL ? (unsigned)s->shapes[j]->aot_prof_id : 0u,
 @@ -63598,0 +63618,82 @@
-+/* The shape table the generator reads: one `P` line per distinct shape a field
++/* The shape table the generator reads: one `Q` line per distinct shape a field
 +   site observed, printed once, with the prototype it belongs to and its ordered
 +   property list. A site's `shape%d=` entry carries the table index instead of a
 +   runtime address, so the generator derives the ordered field list, each atom's
@@ -98,7 +98,7 @@ until a unit declares one).
 +        if (!sh->aot_prof_seen)
 +            continue;
 +        sh->aot_prof_id = (uint16_t)id;
-+        fprintf(f, "P %d proto=", id);
++        fprintf(f, "Q %d proto=", id);
 +        if (sh->proto == NULL) {
 +            fprintf(f, "null");
 +        } else {
