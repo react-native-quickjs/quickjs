@@ -11497,8 +11497,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           f,
           "    enum { SB_ = %d };\n"
           "    JSValue ra_[SB_ + %d];\n"
-          "    { int k_; for (k_ = 0; k_ < SB_ + %d; k_++) ra_[k_] = JS_UNDEFINED; }\n",
-          g_e_spill_total, mw, mw);
+          "    { int k_; for (k_ = 0; k_ < SB_; k_++) ra_[k_] = JS_UNDEFINED; }\n",
+          g_e_spill_total, mw);
     }
     } else
     fprintf(
