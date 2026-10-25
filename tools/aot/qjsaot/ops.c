@@ -8020,6 +8020,7 @@ static int emit_group_this_read(
 /* The hit test of a plain (ungrouped) field read: a contracted site compares its
    layout's shape and loads a constant slot; any other reads through the PIC. */
 int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
+int qjs_aot_prof_site_proto(const uint8_t dg[16], int site);
 static void e_fprint_hit(FILE *f, const Q2Func *fn, const char *ind, const char *recv,
                          int site, const char *out) {
   int osite = 0, lay = 0, slot = 0;
@@ -8029,6 +8030,13 @@ static void e_fprint_hit(FILE *f, const Q2Func *fn, const char *ind, const char 
             "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_cslot_hit_lz(%s, %du, %du, "
             "%s, Q2_LZ), 1)) {\n",
             ind, recv, lay, slot, out);
+  else if (dg != NULL && qjs_aot_prof_site_proto(dg, osite))
+    fprintf(f,
+            "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_poly_read_lz(pic, holders, "
+            "%s, %d, (int)q2_ns, %s, Q2_LZ, ({ static Q2PolyC c_; &c_; }), "
+            "(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
+            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH)), 1)) {\n",
+            ind, recv, site, out);
   else
     fprintf(f,
             "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
