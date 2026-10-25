@@ -995,6 +995,13 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       while (rv >= 0 && rv < E_THISV && rv < fn->nvalues && fn->values[rv].insn >= 0 &&
              f->fwd[fn->values[rv].insn] != Q2_NO_VALUE)
         rv = (int)f->fwd[fn->values[rv].insn];
+      /* The receiver copy a fused `this.f` read defines is `this`. */
+      if (rv >= 0 && rv < E_THISV && rv < fn->nvalues && fn->values[rv].insn >= 0) {
+        const Q2Insn *di = &fn->insns[fn->values[rv].insn];
+        if ((di->rop == ROP_get_this_field || di->rop == ROP_get_this_field2) && di->ndef == 2 &&
+            di->def[1] == (Q2ValueId)rv)
+          rv = E_THISV;
+      }
       if (fs_has_shape(s, rv, g)) {
         f->skip[insn] = 1;
         f->nskip++;

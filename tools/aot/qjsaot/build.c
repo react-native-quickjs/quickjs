@@ -2671,6 +2671,17 @@ int q2_build_ea(
         p = &f->prof[found];
         v->has_prof = 1;
         v->ptypes = prof_to_q2(p->types);
+        /* A fused `this.f` read has one record for the field and the receiver copy it
+           also defines: the copy is an object, the field is what the record says besides. */
+        {
+          const Q2Insn *vi = &f->insns[v->insn];
+          if ((vi->rop == ROP_get_this_field || vi->rop == ROP_get_this_field2) && vi->ndef == 2) {
+            if (vi->def[1] == (Q2ValueId)i)
+              v->ptypes = Q2_T_OBJ;
+            else if ((v->ptypes & ~Q2_T_OBJ) != 0)
+              v->ptypes &= ~Q2_T_OBJ;
+          }
+        }
         v->frac = p->frac;
         v->negzero = p->negzero;
         v->nmin = p->num_min;
