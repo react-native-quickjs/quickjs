@@ -1,0 +1,69 @@
+Subject: The prototype epoch is the watch for a prototype's data-property value overwrites
+
+What this does
+  - Closes the three stores into an existing data property of a prototype that did not move the
+    prototype epoch: the interpreter's direct-slot put_field hit (both register-VM entry points)
+    and `defineProperty` / `JS_DefinePropertyValue` updating the value of an existing data property.
+  - Adds `qjs_aot_proto_method`, which a unit asks for the bytecode function a receiver shape's
+    prototype holds under an atom. It refuses a holder without the prototype flag.
+
+Why we need it
+  A compiled call site that the profile saw reach one prototype method can treat the method as a
+  constant for as long as the prototype epoch has not moved. THE EPOCH IS NOW THE WATCH for every
+  overwrite of a prototype's data property: no bump below is redundant, and none may be dropped.
+  The set-property slow path, the unit's own direct store, and the accessor / read-only / delete /
+  add / prototype-swap paths already moved it; these three did not.
+
+Functions touched
+  `JS_DefineProperty` (the epoch condition), `regvm_t_put_field`, the `ROP_put_field` arm of
+  `js_regvm_execute`, new `qjs_aot_proto_method`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -16588 +16588 @@
+-            ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
++            ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET | JS_PROP_HAS_VALUE)) ||
+@@ -31557,0 +31558,6 @@
++                /* A direct slot store bypasses JS_SetPropertyInternal2, so it
++                   moves the prototype epoch itself. */
++#if JS_ENABLE_IC
++                if (unlikely(p->is_prototype))
++                    ic_watchpoint_bump(ctx->rt);
++#endif
+@@ -35206,0 +35213,4 @@
++#if JS_ENABLE_IC
++                            if (unlikely(p->is_prototype))
++                                ic_watchpoint_bump(ctx->rt);
++#endif
+@@ -64481,0 +64492,25 @@
++}
++
++/* The bytecode function object that the prototype of a receiver shape holds under
++   `atom` as a plain data property, or NULL (an accessor, an exotic prototype, one without the
++   prototype flag, a value that is not a bytecode function). Borrowed, and it runs no JS and allocates nothing.
++   The unit takes its own reference before it keeps the pointer, and asks again whenever
++   the prototype epoch moves. */
++QJS_AOT_STUB void *qjs_aot_proto_method(const void *recv_shape, uint32_t atom)
++{
++    const JSObject *h = ((const JSShape *)recv_shape)->proto;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    JSValue v;
++
++    /* The epoch guarantee rests on the holder carrying the prototype flag. */
++    if (h == NULL || h->is_exotic || !h->is_prototype)
++        return NULL;
++    prs = find_own_property(&pr, (JSObject *)h, (JSAtom)atom);
++    if (prs == NULL || (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH)))
++        return NULL;
++    v = pr->u.value;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT ||
++        JS_VALUE_GET_OBJ(v)->class_id != JS_CLASS_BYTECODE_FUNCTION)
++        return NULL;
++    return JS_VALUE_GET_OBJ(v);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -322,0 +323 @@
++QJS_AOT_STUB void *qjs_aot_proto_method(const void *recv_shape, uint32_t atom);

@@ -16585,7 +16585,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
             return -1;
 #if JS_ENABLE_IC
         if (unlikely(p->is_prototype) &&
-            ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
+            ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET | JS_PROP_HAS_VALUE)) ||
              ((flags & JS_PROP_HAS_WRITABLE) && !(flags & JS_PROP_WRITABLE))))
             ic_watchpoint_bump(ctx->rt);
 #endif
@@ -31555,6 +31555,12 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
 #ifdef QJS_REGVM_COUNT
                 js_regvm_put_hit++;
 #endif
+                /* A direct slot store bypasses JS_SetPropertyInternal2, so it
+                   moves the prototype epoch itself. */
+#if JS_ENABLE_IC
+                if (unlikely(p->is_prototype))
+                    ic_watchpoint_bump(ctx->rt);
+#endif
                 *slot = js_dup(FR(v));
                 if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
                     unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
@@ -35204,6 +35210,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             JSValue *slot = (JSValue *)((char *)p->prop + e->slot_off);
                             JSValue old = *slot;
 
+#if JS_ENABLE_IC
+                            if (unlikely(p->is_prototype))
+                                ic_watchpoint_bump(ctx->rt);
+#endif
                             *slot = js_dup(regs[v]);
                             JS_FreeValue(ctx, old);
                             REGVM_NEXT();
@@ -64479,6 +64489,31 @@ static void js_aot_layout_fn_hook(JSContext *ctx, JSValueConst fn)
 QJS_AOT_STUB JSValue qjs_aot_object_prototype(JSContext *ctx)
 {
     return ctx->class_proto[JS_CLASS_OBJECT];
+}
+
+/* The bytecode function object that the prototype of a receiver shape holds under
+   `atom` as a plain data property, or NULL (an accessor, an exotic prototype, one without the
+   prototype flag, a value that is not a bytecode function). Borrowed, and it runs no JS and allocates nothing.
+   The unit takes its own reference before it keeps the pointer, and asks again whenever
+   the prototype epoch moves. */
+QJS_AOT_STUB void *qjs_aot_proto_method(const void *recv_shape, uint32_t atom)
+{
+    const JSObject *h = ((const JSShape *)recv_shape)->proto;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSValue v;
+
+    /* The epoch guarantee rests on the holder carrying the prototype flag. */
+    if (h == NULL || h->is_exotic || !h->is_prototype)
+        return NULL;
+    prs = find_own_property(&pr, (JSObject *)h, (JSAtom)atom);
+    if (prs == NULL || (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH)))
+        return NULL;
+    v = pr->u.value;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(v)->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return NULL;
+    return JS_VALUE_GET_OBJ(v);
 }
 
 /* The `.prototype` of a constructor, as an owned reference, or undefined when it
