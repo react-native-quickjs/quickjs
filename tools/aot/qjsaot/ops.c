@@ -6878,6 +6878,12 @@ static int emit_inl_guard(
     for (gi = 0; g_e_facts != NULL && gi < g_e_facts->ngroups; gi++) {
       const EGroup *gr = &g_e_facts->groups[gi];
       if (gr->own != in->inlg || !g_e_group_used[gi]) continue;
+      if (e_group_layout(gi) != 0) {
+        fprintf(
+            f, "    gsh%d = q2_layout_shape[%d] != NULL ? (const void *)q2_layout_shape[%d] : E_NO_SHAPE;\n",
+            gi, e_group_layout(gi) - 1, e_group_layout(gi) - 1);
+        continue;
+      }
       fprintf(f, "    gsh%d = NULL;\n", gi);
       for (qq = 0; qq < gr->nsites; qq++)
         if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
@@ -6885,10 +6891,6 @@ static int emit_inl_guard(
         else
           fprintf(f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(ipic_%d, %d);\n", gi, gi, ik, gr->sites[qq]);
       fprintf(f, "    if (gsh%d == NULL) gsh%d = E_NO_SHAPE;\n", gi, gi);
-      if (e_group_layout(gi) != 0)
-        fprintf(
-            f, "    gsh%d = q2_layout_shape[%d] != NULL ? (const void *)q2_layout_shape[%d] : E_NO_SHAPE;\n",
-            gi, e_group_layout(gi) - 1, e_group_layout(gi) - 1);
       for (qq = 0; qq < gr->nsites; qq++)
         if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
           fprintf(f, "    pci%d = q2_cell2_index(ipic_%d, %d, (int)ins_%d, gsh%d);\n", gr->sites[qq], ik, gr->sites[qq], ik, gi);
@@ -11530,11 +11532,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
      reader -- so the spec body ran even with QJS_AOT_SPEC=0, and the harness's
      "nospec" pass was never a generic-only run. */
   if (g_e_inl)
-    fprintf(
-        f,
-        "    if (__builtin_expect(e_gate[%d] | e_ioff[%d], 0))\n"
-        "        return 0;\n",
-        fi, fi);
+    (void)0;
   else if (g_e_fl)
     fprintf(
         f,
