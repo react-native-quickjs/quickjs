@@ -4299,7 +4299,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      *rc -= 1;\n"
         "      return;\n"
         "    }\n"
-        "    (JS_FreeValue)(ctx, v);\n"
+        "    (qjs_aot_drc_zero)(ctx, v);\n"
         "  }\n"
         "}\n"
         "#define JS_FreeValue(c_, v_) q2_free(c_, v_)\n\n");

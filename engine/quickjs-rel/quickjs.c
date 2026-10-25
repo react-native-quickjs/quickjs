@@ -65219,6 +65219,24 @@ __attribute__((always_inline)) void qjs_aot_set_reg_p(JSContext *ctx, JSValue *f
 #endif
 }
 
+/* Compiled code dropped a reference to a counted value whose count is 1: what JS_FreeValue does
+   for it, with the zero case going straight to the parking of the value. */
+void qjs_aot_drc_zero(JSContext *ctx, JSValue v)
+{
+    JSRuntime *rt = ctx->rt;
+    void *p = JS_VALUE_GET_PTR(v);
+
+    if (--JS_REF_COUNT(p) > 0)
+        return;
+#if QJS_DRC
+    if (likely(!rt->drc_in_reconcile && rt->gc_phase == JS_GC_PHASE_NONE)) {
+        js_drc_zero(rt, v);
+        return;
+    }
+#endif
+    js_free_value_rt(rt, v);
+}
+
 __attribute__((always_inline)) int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out)
 {
     return js_regvm_binary(ctx, sub, a, b, out);

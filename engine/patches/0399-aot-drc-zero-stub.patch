@@ -1,0 +1,46 @@
+Subject: Compiled code parks a value whose last reference goes without three calls
+
+What this does
+  - `qjs_aot_drc_zero(ctx, v)` is JS_FreeValue for a counted value whose count is 1: it drops the
+    count and, at zero, parks the value with `js_drc_zero` directly when no reconcile or collection
+    is running, and through `js_free_value_rt` otherwise.
+
+Why we need it
+  The inline free of a compiled field store ends in JS_FreeValue -> JS_FreeValueRT ->
+  js_free_value_rt -> js_drc_zero whenever the old value's count is 1, which on a call-heavy program
+  is several times per loop iteration and about 57 instructions each. The decision those three calls
+  make is the one `qjs_aot_drc_zero` makes in one.
+
+Functions touched
+  `qjs_aot_drc_zero` (new).
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65221,0 +65222,18 @@
++/* Compiled code dropped a reference to a counted value whose count is 1: what JS_FreeValue does
++   for it, with the zero case going straight to the parking of the value. */
++void qjs_aot_drc_zero(JSContext *ctx, JSValue v)
++{
++    JSRuntime *rt = ctx->rt;
++    void *p = JS_VALUE_GET_PTR(v);
++
++    if (--JS_REF_COUNT(p) > 0)
++        return;
++#if QJS_DRC
++    if (likely(!rt->drc_in_reconcile && rt->gc_phase == JS_GC_PHASE_NONE)) {
++        js_drc_zero(rt, v);
++        return;
++    }
++#endif
++    js_free_value_rt(rt, v);
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -386,0 +387,4 @@
++/* The last reference of a counted value whose count is 1 goes: JS_FreeValue without its
++   intermediate calls. */
++void qjs_aot_drc_zero(JSContext *ctx, JSValue v);
++
