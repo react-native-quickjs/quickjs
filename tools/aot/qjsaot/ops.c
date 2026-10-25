@@ -2781,14 +2781,22 @@ static int e_mc_index(int site) {
 }
 static const ETypes *g_e_types;
 
+static int g_e_recheck_done = -1;
 static void e_emit_group_recheck(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur) {
-  if (!g_e_nolazy && !g_e_epoch_skip) return;
+  unsigned long long lm = g_e_facts != NULL ? (unsigned long long)g_e_facts->laymask[e_insn_idx(fn, in)] : 0;
+  char lt[96] = "";
+  if (!g_e_nolazy && !g_e_epoch_skip && lm == 0) return;
+  /* The shape facts of these layouts were kept across the instruction: an object leaves a layout
+     only by setting its bit. */
+  if (lm != 0) snprintf(lt, sizeof(lt), "Q2_LAYOUT_BROKEN(ctx) & 0x%llxull", lm);
   e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
   e_sweep_guard(f, "dx", in->next);
   fprintf(
-      f, "    if (__builtin_expect(%s%s%s, 0)) goto dx_%d;\n", g_e_nolazy ? "E_LAZY_SEEN(ctx)" : "",
-      g_e_nolazy && g_e_epoch_skip ? " || " : "", g_e_epoch_skip ? "Q2_EPOCH_MOVED(ctx)" : "", in->next);
+      f, "    if (__builtin_expect(%s%s%s%s%s, 0)) goto dx_%d;\n", g_e_nolazy ? "E_LAZY_SEEN(ctx)" : "",
+      g_e_nolazy && (g_e_epoch_skip || lm) ? " || " : "", g_e_epoch_skip ? "Q2_EPOCH_MOVED(ctx)" : "",
+      g_e_epoch_skip && lm ? " || " : "", lt, in->next);
+  g_e_recheck_done = in->pc;
 }
 
 /* A typed definition held only in its local, put in its frame register for the exit stub that reads it

@@ -4262,6 +4262,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "}\n"
         /* The lazy-JSON marker test is on unless the body in progress assumes no lazy
            document exists (Q2_LZ is redefined around such a body). */
+        "#define Q2_LAYOUT_BROKEN(ctx_) (*(const uint64_t *)(*(const uint8_t *const *)((const uint8_t *)(ctx_) + "
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_LAYOUT_BROKEN))\n"
         "#define Q2_LZ 1\n"
         "#define q2_elem_hit(a, k, o) q2_elem_hit_lz(a, k, o, Q2_LZ)\n"
         "#define q2_own_read_hit(...) q2_own_read_hit_lz(__VA_ARGS__, Q2_LZ)\n"

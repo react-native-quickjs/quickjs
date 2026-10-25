@@ -156,6 +156,10 @@ typedef struct EFacts {
      in place or exits at the call, so it is no safepoint for the shape, cache-cell and array
      facts (the callee may store, so the loaded-value facts still die). */
   uint8_t *purecall;
+  /* Per instruction: the contracted layouts (bit k-1 for layout k) whose shape facts survive this
+     call. An object leaves a layout only by setting the layout's broken bit, so the call is
+     followed by a test of those bits and no shape fact of such a layout is dropped. */
+  uint64_t *laymask;
   /* A grouped field access whose miss must leave the speculative body (an
      exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter

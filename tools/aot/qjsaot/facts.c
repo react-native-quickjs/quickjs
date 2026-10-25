@@ -876,6 +876,26 @@ static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int group
   return kind == E_SK_SAFE;
 }
 
+int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
+/* The contracted layout every site of a group reads as an own data property, or 0. The emitter
+   decides the same way (see e_compute_group_layouts). */
+static int group_layout(const Q2Func *fn, const EFacts *f, int g) {
+  const EGroup *gr;
+  int q, lay = 0;
+  if (g < 0 || g >= f->ngroups) return 0;
+  gr = &f->groups[g];
+  if (gr->own || gr->nsites <= 0 || getenv("QJS_AOT_NOCONTRACT") != NULL) return 0;
+  for (q = 0; q < gr->nsites; q++) {
+    int osite, l = 0, sl = 0;
+    const uint8_t *dg = e_site_dg(fn, gr->sites[q], &osite);
+    if (e_facts_site_proto(f, gr->sites[q]) != 0 || !qjs_aot_layout_site(dg, osite, &l, &sl) ||
+        (lay != 0 && lay != l))
+      return 0;
+    lay = l;
+  }
+  return lay;
+}
+
 static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
                     int grouped_exit) {
   const Q2Insn *in = &fn->insns[insn];
@@ -1041,9 +1061,21 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       fprintf(stderr, "safepoint %s %s@%d\n", fn->g->name, nm, in->pc);
     }
     fs_kill(s, kp_safepoint, NULL);
-    s->nshape = 0;
+    f->laymask[insn] = 0;
+    if (in->rop == ROP_call || in->rop == ROP_call_method) {
+      int i, n = 0;
+      for (i = 0; i < s->nshape; i++) {
+        int lay = s->shape_val[i] < E_ARRV(0) ? group_layout(fn, f, s->shape_grp[i]) : 0;
+        if (lay == 0) continue;
+        s->shape_val[n] = s->shape_val[i];
+        s->shape_grp[n++] = s->shape_grp[i];
+        f->laymask[insn] |= 1ULL << (lay - 1);
+      }
+      s->nshape = n;
+    } else {
+      s->nshape = 0;
+    }
   }
-  (void)fn;
   return 0;
 }
 
@@ -1312,6 +1344,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->elemreg = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->arrskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->laymask = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(uint64_t));
   out->narr_vals = fn->nvalues;
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->arr_pk = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
@@ -1320,7 +1353,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1516,6 +1549,7 @@ void e_facts_free(EFacts *f) {
   free(f->elemreg);
   free(f->arrskip);
   free(f->purecall);
+  free(f->laymask);
   free(f->arr_used);
   free(f->arr_pk);
   free(f->miss_exits);
