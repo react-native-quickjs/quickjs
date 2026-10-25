@@ -2384,6 +2384,24 @@ static int g_e_ccall_next;
    real one. */
 static int *g_e_spill_slot;
 static int g_e_spill_n, g_e_spill_total, g_e_spill_nv;
+/* The inline chain shares one published root array, owned by the outermost frameless body:
+   it is filled with undefined once at the outer entry, its record covers every slot for the
+   whole activation, and an inlined body writes its roots into a slice at the end of its
+   caller's own slots. A slot that is not overwritten pins its object until the outer frame
+   exits: the release is delayed, an object is never freed under a pointer the scan reads.
+   `g_e_child_max` is the largest slice a callee inlined so far needs; `g_e_child_decl` is the
+   value the trial emission found, which sizes the array of the real one. */
+static int g_e_child_max, g_e_child_decl, g_e_last_inl_rz;
+static int e_win_max(const Q2Func *fn) {
+  int wi, mw = 1;
+  for (wi = 0; wi < fn->ninsns; wi++)
+    if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method ||
+         fn->insns[wi].rop == ROP_array_from || fn->insns[wi].rop == ROP_object_fill) &&
+        fn->insns[wi].win_n > mw)
+      mw = fn->insns[wi].win_n;
+  return mw;
+}
+int qjs_aot_inline_rz(const char hex[33]);
 #define E_SPILL_MAX 16
 static int e_spill_slot(Q2ValueId v) {
   if (g_e_spill_slot == NULL || (int)v >= g_e_spill_nv) return -1;
@@ -5497,7 +5515,7 @@ static int emit_inl_nested_call(
   char winp[48], ib[512], pushr[200], spl[1024], idt[256];
   int allleaf, cmc = -1;
   const int pub = !g_e_inl || g_e_inl_r;
-  char nrx[32];
+  char nrx[32], nrxe[64], rax[48];
   const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
 
   if (t == NULL || cur == NULL) return 0;
@@ -5528,6 +5546,12 @@ static int emit_inl_nested_call(
   if (g_e_inl_r)
     snprintf(nrx, sizeof(nrx), "%s", getenv("QJS_AOT_NOWINROOT") != NULL ? "0" : "SB_ + 0");
   if (g_e_inl_r && getenv("QJS_AOT_NOWINROOT") == NULL) snprintf(nrx, sizeof(nrx), "SB_ + %d", na);
+  if (g_e_inl_r)
+    snprintf(nrxe, sizeof(nrxe), "ra_x_ ? 0 : (%s)", nrx);
+  else
+    snprintf(nrxe, sizeof(nrxe), "0");
+  snprintf(rax, sizeof(rax), "%s",
+           !pub ? "NULL" : g_e_inl ? "(ra_x_ ? ra_ + RB_ : NULL)" : "ra_ + RB_");
   w = in->win_reg * 16;
   if (!pub)
     snprintf(winp, sizeof(winp), "&AOT_REG(fr, %d)", w);
@@ -5677,8 +5701,7 @@ static int emit_inl_nested_call(
     if (!g_e_inl) {
       g_e_fl_calls = 1;
       snprintf(
-          spl + sl, sizeof(spl) - sl, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n",
-          in->next - 1, getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
+          spl + sl, sizeof(spl) - sl, "    rec_->pc = %d;\n", in->next - 1);
     }
     if (!allleaf) fputs(spl, f);
   }
@@ -5700,17 +5723,19 @@ static int emit_inl_nested_call(
           pushr, sizeof(pushr),
           "        JSAotFlRec ir_ = { E_FL_TOP(ctx_in), co, %d, %s, %s };\n"
           "        E_FL_TOP(ctx_in) = &ir_;\n",
-          in->next - 1, nrx, g_e_inl_r ? "ra_" : "NULL");
+          in->next - 1, nrxe, g_e_inl_r ? "ra_x_ ? NULL : ra_" : "NULL");
     else
       pushr[0] = 0;
+    if (qjs_aot_inline_has(callee[k]) && qjs_aot_inline_rz(callee[k]) > g_e_child_max)
+      g_e_child_max = qjs_aot_inline_rz(callee[k]);
     if (qjs_aot_inline_has(callee[k]))
       snprintf(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
           "        if (!(_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o)))\n"
+          "                    %s, %d, &_o, %s)))\n"
           "#endif\n",
-          callee[k], callee[k], cexp, recv, winp, na);
+          callee[k], callee[k], cexp, recv, winp, na, rax);
     if (getenv("QJS_AOT_INL_CONTROL") != NULL &&
         strcmp(getenv("QJS_AOT_INL_CONTROL"), "noident") == 0)
       fprintf(f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n"
@@ -5728,9 +5753,9 @@ static int emit_inl_nested_call(
           "        JSValue _o; int _r = 1;\n"
           "#ifdef Q2_INLINE_%s\n"
           "        if ((_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o))) {\n"
+          "                    %s, %d, &_o, %s))) {\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
-          idt, callee[k], callee[k], cexp, recv, winp, na, excret);
+          idt, callee[k], callee[k], cexp, recv, winp, na, rax, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
       fprintf(
@@ -5743,7 +5768,7 @@ static int emit_inl_nested_call(
           "%s%s"
           "        if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
           spl, pushr, callee[k], cexp, recv, winp, na, popr,
-          g_e_inl ? "" : "        rec_->nroots = SB_;\n", excret);
+          "", excret);
     }
     else
     fprintf(
@@ -5800,7 +5825,6 @@ static int emit_inl_nested_call(
   }
   /* The call has not run: leave before it. */
   fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
-  if (!g_e_inl && !allleaf) fprintf(f, "    rec_->nroots = SB_;\n");
   g_e_inl_dirty = 1;
   cur[dreg] = dv;
   g_e_miss_exit_seen = 0;
@@ -6443,7 +6467,7 @@ static int emit_fl_alloc_op(
   for (k = 0; k < nsp; k++)
     fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
   for (r = 0; r < na; r++) e_emit_fl_window_store(f, fn, t, cur, in->win_reg + r, r);
-  fprintf(f, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n", in->next - 1, na);
+  fprintf(f, "    rec_->pc = %d;\n", in->next - 1);
   fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
   fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n");
   if (!fill) {
@@ -6459,7 +6483,6 @@ static int emit_fl_alloc_op(
       fprintf(f, "      if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
   }
   fprintf(f, "    }\n");
-  if (fill || na > 0) fprintf(f, "    rec_->nroots = SB_;\n");
   /* The other registers the fallback form lists keep their value. */
   for (k = 0; k < in->nredef; k++) {
     Q2ValueId rv = in->redef_val[k], src;
@@ -7187,7 +7210,7 @@ static int emit_pure_call(
         "        JSValue _o; int _r;\n"
         "        E_CAP(f, %d);\n"
         "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "                    args_, %d, &_o))) goto vx_%d;\n",
+        "                    args_, %d, &_o, NULL))) goto vx_%d;\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
@@ -7453,7 +7476,7 @@ static int emit_typed_call(
           f,
           "#ifdef Q2_INLINE_%s\n"
           "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    &AOT_REG(fr, %d), %d, &_o)))\n"
+          "                    &AOT_REG(fr, %d), %d, &_o, NULL)))\n"
           "#endif\n",
           callee[k], callee[k], cexp, recv, w, na);
     fprintf(
@@ -11608,7 +11631,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "static inline __attribute__((always_inline)) int ei_%s(JSContext "
           "*ctx_in, JSRegRun *caller_f,\n"
           "                               JSObject *co, JSValue this_obj,\n"
-          "                               JSValue *argv, int argc, JSValue *out)\n"
+          "                               JSValue *argv, int argc, JSValue *out, JSValue *ra_x_)\n"
           "{\n"
           "    _Static_assert(QJS_DRC, \"an inline body needs deferred counting\");\n"
           "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
@@ -11619,17 +11642,18 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "    Q2_FILL_UNDEF(fr, %d);\n",
           hex, fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
     if (g_e_inl && g_e_inl_r) {
-      int wi, mw = 1;
-      for (wi = 0; wi < fn->ninsns; wi++)
-        if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method) &&
-            fn->insns[wi].win_n > mw)
-          mw = fn->insns[wi].win_n;
+      int mw = e_win_max(fn);
       fprintf(
           f,
-          "    enum { SB_ = %d };\n"
-          "    JSValue ra_[SB_ + %d];\n"
-          "    Q2_FILL_UNDEF(ra_, SB_);\n",
+          "    enum { SB_ = %d, RB_ = SB_ + %d };\n"
+          "    JSValue ra_own_[RB_];\n"
+          "    JSValue *ra_ = ra_x_;\n"
+          "    if (ra_x_ == NULL) { Q2_FILL_UNDEF(ra_own_, SB_); ra_ = ra_own_; }\n",
           g_e_spill_total, mw);
+      g_e_last_inl_rz = g_e_spill_total + mw + g_e_child_decl;
+    } else if (g_e_inl) {
+      g_e_last_inl_rz = 0;
+      fprintf(f, "    (void)ra_x_;\n");
     }
     } else
     fprintf(
@@ -11651,19 +11675,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         g_e_fl_calls ? "" : "    JSAotFlRec *const rec_ = NULL; (void)rec_;\n",
         fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
     if (g_e_fl_calls && !g_e_inl) {
-      int wi, mw = 1;
-      for (wi = 0; wi < fn->ninsns; wi++)
-        if ((fn->insns[wi].rop == ROP_call || fn->insns[wi].rop == ROP_call_method ||
-             fn->insns[wi].rop == ROP_array_from || fn->insns[wi].rop == ROP_object_fill) &&
-            fn->insns[wi].win_n > mw)
-          mw = fn->insns[wi].win_n;
+      int mw = e_win_max(fn);
       fprintf(
           f,
-          "    enum { SB_ = %d };\n"
-          "    JSValue ra_[SB_ + %d];\n"
-          "    Q2_FILL_UNDEF(ra_, SB_);\n"
-          "    rec_->roots = ra_;\n    rec_->nroots = SB_;\n",
-          g_e_spill_total, mw);
+          "    enum { SB_ = %d, RB_ = SB_ + %d, RT_ = RB_ + %d };\n"
+          "    JSValue ra_[RT_];\n"
+          "    Q2_FILL_UNDEF(ra_, RT_);\n"
+          "    rec_->roots = ra_;\n    rec_->nroots = RT_;\n",
+          g_e_spill_total, mw, g_e_child_decl);
     }
   } else {
     /* With loop entries the body is `aot_s_`, and `aot_f_` calls it again whenever the generic
@@ -12443,7 +12462,6 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           fprintf(
               f,
               "    if (JS_VALUE_HAS_REF_COUNT(AOT_REG(fr, %d))) {\n"
-              "        rec_->nroots = SB_ + 1;\n"
               "        qjs_aot_set_reg_p(ctx, &ra_[SB_], 0, AOT_REG(fr, %d));\n"
               "    }\n",
               g_e_dx_own_off[q2], g_e_dx_own_off[q2]);
@@ -12931,12 +12949,15 @@ int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     g_e_quiet = 1;
     g_e_fl_calls = 0;
     g_e_spill_total = 0;
+    g_e_child_max = 0;
     g_e_fl_block[0] = 0;
     rc = e_emit_spec_body_pass(m, fn, hex);
     fclose(m);
     free(mb);
     g_e_quiet = 0;
     g_e_spill_total = g_e_spill_n;
+    g_e_child_decl = g_e_child_max;
+    g_e_child_max = 0;
 
     if (rc == 0 && g_e_fl_block[0] == 0) {
       g_e_fl_chosen = 1;
@@ -13090,6 +13111,8 @@ int e_emit_inline_body(
   g_e_inl_safepoint = 0;
   g_e_inl_pending = 0;
   g_e_spill_total = 0;
+  g_e_child_max = 0;
+  g_e_child_decl = 0;
   g_e_fl_block[0] = 0;
   if (g_e_inl_r) {
     char *tb = NULL;
@@ -13100,6 +13123,8 @@ int e_emit_inline_body(
       fclose(tm);
       free(tb);
       g_e_spill_total = g_e_spill_n;
+      g_e_child_decl = g_e_child_max;
+      g_e_child_max = 0;
       g_e_fl_block[0] = 0;
     }
   }
@@ -13130,6 +13155,10 @@ int e_inline_used_nx(void) { return g_e_last_inl_nx; }
 
 /* Whether the inline body just emitted makes no call and no construct. */
 int e_inline_leaf(void) { return g_e_last_inl_leaf; }
+
+/* The slots the inline body just emitted needs in the shared root array: its own, its window
+   and the largest slice of a body it inlines; 0 for a body that makes no call. */
+int e_inline_rz(void) { return g_e_last_inl_rz; }
 
 /* Whether the inline body just emitted calls a function whose inline form is not decided. */
 int e_inline_pending(void) { return g_e_inl_pending; }
