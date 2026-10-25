@@ -6890,7 +6890,7 @@ static int emit_inl_guard(
       if (gr->own != in->inlg || !g_e_group_used[gi]) continue;
       if (e_group_layout(gi) != 0) {
         fprintf(
-            f, "    gsh%d = q2_layout_shape[%d] != NULL ? (const void *)q2_layout_shape[%d] : E_NO_SHAPE;\n",
+            f, "    gsh%d = (const void *)q2_layout_shape[%d]; (void)%d;\n",
             gi, e_group_layout(gi) - 1, e_group_layout(gi) - 1);
         continue;
       }
@@ -11785,7 +11785,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       for (g = 0; g < ng; g++)
         if (e_group_layout(g) != 0)
           fprintf(
-              f, "    gsh%d = q2_layout_shape[%d] != NULL ? (const void *)q2_layout_shape[%d] : E_NO_SHAPE;\n",
+              f, "    gsh%d = (const void *)q2_layout_shape[%d]; (void)%d;\n",
               g, e_group_layout(g) - 1, e_group_layout(g) - 1);
       /* The holder of a prototype read can change without a cache entry changing: tested on
          every entry. */
