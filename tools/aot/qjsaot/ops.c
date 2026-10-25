@@ -9102,8 +9102,8 @@ static int emit_group_read(
 
 /* A grouped CHAINED read (`get_field_chain`: o.a.b): two grouped reads, the
    second on the first's result. Any failure exits before the instruction, so
-   neither result is written until both loads have passed. The facts' skip flag
-   is per instruction, not per link, so both receivers are always tested. */
+   neither result is written until both loads have passed. Bit k of the facts' skip
+   flag says link k's receiver test is implied. */
 static int emit_group_chain(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t,
     Q2ValueId *cur, int g1, int s1, int g2, int s2, Q2ValueId rv, Q2ValueId d0v,
@@ -9113,7 +9113,7 @@ static int emit_group_chain(
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_group_exit_stub(f, in, cur, rv);
   fprintf(f, "    { JSValue _c0, _c1;\n");
-  e_group_test(test, sizeof(test), 0, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
+  e_group_test(test, sizeof(test), g_e_facts->skip[e_insn_idx(fn, in)] & 1, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   {
     char off[96];
@@ -9126,7 +9126,7 @@ static int emit_group_chain(
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
       in->pc);
-  e_group_test(test, sizeof(test), 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
+  e_group_test(test, sizeof(test), (g_e_facts->skip[e_insn_idx(fn, in)] >> 1) & 1, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   {
     char off[96];

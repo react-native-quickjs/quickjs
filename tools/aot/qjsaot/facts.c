@@ -1023,7 +1023,7 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
           rv = E_THISV;
       }
       if (fs_has_shape(s, rv, g)) {
-        f->skip[insn] = 1;
+        f->skip[insn] |= (uint8_t)(1u << r);
         f->nskip++;
       }
       if (fs_add_shape(s, rv, g) < 0) return -1;
@@ -1327,15 +1327,22 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
             if (ref[r].site < 0 || !recv_groupable(ref[r].recv)) continue;
             g = e_facts_site_group(out, ref[r].site);
             if (g < 0) continue;
-            if (callsonly && group_layout(fn, out, g) == 0) continue;
+            if (callsonly && group_layout(fn, out, g) == 0) {
+              if (getenv("QJS_AOT_DEBUG_LOOPS")) fprintf(stderr, "  hoist skip: group %d not contracted\n", g);
+              continue;
+            }
             if (ref[r].recv == E_RECV_THIS) {
               v = E_THISV; /* `this` is fixed for the activation, so always outside the loop */
             } else {
               v = (Q2ValueId)ref[r].recv;
               if (v >= (Q2ValueId)fn->nvalues) continue;
               db = fn->values[v].block;
-              if (db < 0 || in_loop(loop, db)) continue;
+              if (db < 0 || in_loop(loop, db)) {
+                if (getenv("QJS_AOT_DEBUG_LOOPS") && callsonly) fprintf(stderr, "  hoist skip: v%d defined in loop block %d\n", (int)v, db);
+                continue;
+              }
             }
+            if (getenv("QJS_AOT_DEBUG_LOOPS") && callsonly) fprintf(stderr, "  hoist v%d group %d\n", (int)v, g);
             for (q = 0; q < out->nhoist; q++)
               if (out->hoist_hdr[q] == h && out->hoist_val[q] == v && out->hoist_grp[q] == g) dup = 1;
             if (dup) continue;
@@ -1537,6 +1544,12 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
       }
     }
 
+    if (getenv("QJS_AOT_DEBUG_LOOPS") && out->nloops > 0) {
+      int z;
+      fprintf(stderr, "  inset b%d:", b);
+      for (z = 0; z < cur.nshape; z++) fprintf(stderr, " (%d,%d)", cur.shape_val[z], cur.shape_grp[z]);
+      fprintf(stderr, "\n");
+    }
     /* Keep the in-set: `--types` prints it per block. */
     if (cur.nshape > 0) {
       out->blocks[b].nshape = cur.nshape;
