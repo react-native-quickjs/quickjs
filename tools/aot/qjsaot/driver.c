@@ -4234,6 +4234,22 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (JS_VALUE_HAS_REF_COUNT(v))\n"
         "    ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
         "}\n\n");
+    /* Releasing a reference: a count that stays above zero is a decrement. Only the
+       last reference needs the engine. */
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) void q2_free(JSContext *ctx, JSValue v)\n"
+        "{\n"
+        "  if (JS_VALUE_HAS_REF_COUNT(v)) {\n"
+        "    int *rc = (int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
+        "    if (__builtin_expect(*rc > 1, 1)) {\n"
+        "      *rc -= 1;\n"
+        "      return;\n"
+        "    }\n"
+        "    (JS_FreeValue)(ctx, v);\n"
+        "  }\n"
+        "}\n"
+        "#define JS_FreeValue(c_, v_) q2_free(c_, v_)\n\n");
     /* Adopting an owned value into a frame slot: its count drops by the one the slot's
        register does not hold. Only a count that would reach zero (the zero-count table
        takes the value) needs the engine. */
