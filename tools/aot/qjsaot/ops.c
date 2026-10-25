@@ -5645,7 +5645,7 @@ static int emit_inl_nested_call(
   /* Every candidate is an inlined body that makes no call: while it runs nothing can
      collect, so the roots and the record are written only for the call it falls back to. */
   allleaf = 0;
-  if (!g_e_inl && pub) {
+  if (pub) {
     allleaf = 1;
     for (k = 0; k < n && k < 4; k++) {
       if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
@@ -5691,7 +5691,7 @@ static int emit_inl_nested_call(
           in->next - 1, nrx, g_e_inl_r ? "ra_" : "NULL");
     else
       pushr[0] = 0;
-    if (!g_e_inl && qjs_aot_inline_has(callee[k]))
+    if ((!g_e_inl || qjs_aot_inline_leaf(callee[k])) && qjs_aot_inline_has(callee[k]))
       snprintf(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
@@ -5723,13 +5723,14 @@ static int emit_inl_nested_call(
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
       fprintf(
           f,
-          "        {\n%s"
+          "        {\n%s%s"
           "        _o = aot_n_%s(ctx, caller_f,\n"
           "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "            %s, %d);\n"
-          "        rec_->nroots = SB_;\n"
+          "%s%s"
           "        if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
-          spl, callee[k], cexp, recv, winp, na, excret);
+          spl, pushr, callee[k], cexp, recv, winp, na, popr,
+          g_e_inl ? "" : "        rec_->nroots = SB_;\n", excret);
     }
     else
     fprintf(

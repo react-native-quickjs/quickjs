@@ -1967,7 +1967,10 @@ int qjsaot_driver_main(int argc, char **argv) {
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
     g_inl_nx = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     g_inl_leaf = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
-    for (i = 0; g_inl_eb && i < nfuncs; i++) {
+    /* Two sweeps: the bodies that call nothing first, then the others, which may take
+       the first kind inline in turn. */
+    for (int sweep = 0; g_inl_eb && sweep < 2; sweep++)
+    for (i = 0; i < nfuncs; i++) {
       char hex[33], why[160] = "";
       FILE *mf;
       int ok;
@@ -1975,16 +1978,18 @@ int qjsaot_driver_main(int argc, char **argv) {
       if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
       if (i + 1 < nfuncs && memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
         continue;
+      if (g_inl_eb[i].buf) continue;
       hex16(funcs[i].digest, hex);
       g_cur_func_idx = i;
       mf = open_memstream(&g_inl_eb[i].buf, &g_inl_eb[i].len);
       if (!mf) continue;
       ok = e_emit_inline_func(mf, &funcs[i], hex, why, sizeof(why));
       fclose(mf);
-      e_report_inline(hex, ok, why);
-      if (ok && g_inl_nx) g_inl_nx[i] = (uint8_t)e_inline_used_nx();
-      if (ok && g_inl_leaf) g_inl_leaf[i] = (uint8_t)e_inline_leaf();
-      if (!ok) {
+      if (sweep == 0 && !(ok && e_inline_leaf())) ok = -1;
+      if (ok >= 0) e_report_inline(hex, ok, why);
+      if (ok > 0 && g_inl_nx) g_inl_nx[i] = (uint8_t)e_inline_used_nx();
+      if (ok > 0 && g_inl_leaf) g_inl_leaf[i] = (uint8_t)e_inline_leaf();
+      if (ok <= 0) {
         free(g_inl_eb[i].buf);
         g_inl_eb[i].buf = NULL;
         g_inl_eb[i].len = 0;
@@ -4851,10 +4856,11 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(f, "\n");
     /* The inline forms of the selected functions that have a native entry, before
        any caller. */
+    for (int sweep = 0; g_inl_eb && sweep < 2; sweep++)
     for (i = 0; g_inl_eb && i < nfuncs; i++) {
       char hex[33];
       if (!sel[i] || !eb[i].buf || !g_inl_eb[i].buf ||
-          !qjs_aot_has_native_entry(i))
+          !qjs_aot_has_native_entry(i) || (sweep == 0) != (g_inl_leaf[i] != 0))
         continue;
       hex16(funcs[i].digest, hex);
       fprintf(f, "#define Q2_INLINE_%s 1\n", hex);
