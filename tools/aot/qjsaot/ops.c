@@ -1285,14 +1285,10 @@ static int emit_native_post(
    inline count), and the slot is cleared. */
 static void e_emit_return(FILE *f, int off) {
   if (g_e_inl) {
-    fprintf(
-        f,
-        "    { JSValue _rv = AOT_REG(fr, %d);\n"
-        "#if QJS_DRC\n"
-        "      q2_dup(_rv);\n"
-        "#endif\n"
-        "      *out = _rv; return 1; }\n",
-        off);
+    /* An inlined body hands its value back borrowed (status 2): its frame is part of the
+       caller's, so there is no teardown for the reference to survive, and the caller stores
+       the value without adopting. */
+    fprintf(f, "    { JSValue _rv = AOT_REG(fr, %d);\n      *out = _rv; return 2; }\n", off);
     return;
   }
   fprintf(
@@ -5471,13 +5467,13 @@ static int e_emit_nested_result(
        drop can run a collection); the next safepoint gives the value a slot. */
     fprintf(
         f,
-        "%sif (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
+        "%sif (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
         "%selse ra_[%d] = _o;\n"
         "%sv%u = _o;\n"
         "%sAOT_SET_B(ctx, fr, %d, _o);\n",
         ind, resslot, ind, resslot, ind, (unsigned)dv, ind, dreg * 16);
   } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
-    fprintf(f, "%sif (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n", ind);
+    fprintf(f, "%sif (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n", ind);
   } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
     fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
     abort();
@@ -5711,14 +5707,14 @@ static int emit_inl_nested_call(
       snprintf(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
-          "        if (!ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o))\n"
+          "        if (!(_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "                    %s, %d, &_o)))\n"
           "#endif\n",
           callee[k], callee[k], cexp, recv, winp, na);
     if (getenv("QJS_AOT_INL_CONTROL") != NULL &&
         strcmp(getenv("QJS_AOT_INL_CONTROL"), "noident") == 0)
       fprintf(f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n"
-                 "        JSValue _o;\n%s"
+                 "        JSValue _o; int _r = 1;\n%s"
                  "%s        _o = aot_n_%s(ctx, caller_f,\n"
                  "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
                  "            %s, %d);\n"
@@ -5729,10 +5725,10 @@ static int emit_inl_nested_call(
       fprintf(
           f,
           "    if (__builtin_expect(%s, 1)) {\n"
-          "        JSValue _o;\n"
+          "        JSValue _o; int _r = 1;\n"
           "#ifdef Q2_INLINE_%s\n"
-          "        if (ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o)) {\n"
+          "        if ((_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "                    %s, %d, &_o))) {\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
           idt, callee[k], callee[k], cexp, recv, winp, na, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
@@ -5740,6 +5736,7 @@ static int emit_inl_nested_call(
       fprintf(
           f,
           "        {\n%s%s"
+          "        _r = 1;\n"
           "        _o = aot_n_%s(ctx, caller_f,\n"
           "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "            %s, %d);\n"
@@ -5753,10 +5750,10 @@ static int emit_inl_nested_call(
         f,
         "    if (__builtin_expect(%s, 1)) "
         "{\n"
-        "        JSValue _o;\n%s%s"
-        "        _o = aot_n_%s(ctx, caller_f,\n"
+        "        JSValue _o; int _r = 1;\n%s%s"
+        "        { _r = 1; _o = aot_n_%s(ctx, caller_f,\n"
         "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "            %s, %d);\n"
+        "            %s, %d); }\n"
         "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
         "%s\n",
         idt, pushr, ib, callee[k], cexp, recv, winp, na, popr, excret);
@@ -7187,28 +7184,28 @@ static int emit_pure_call(
     fprintf(
         f,
         "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) {\n"
-        "        JSValue _o;\n"
+        "        JSValue _o; int _r;\n"
         "        E_CAP(f, %d);\n"
-        "        if (!ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "                    args_, %d, &_o)) goto vx_%d;\n",
+        "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+        "                    args_, %d, &_o))) goto vx_%d;\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(
           f,
-          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+          "        if (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
           "        else AOT_SET_B(ctx, fr, %d, _o);\n"
           "        v%u = _o;\n",
           off, off, (unsigned)dv);
     } else if (e_def_dead(in, dv)) {
       fprintf(
           f,
-          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+          "        if (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
           "        else AOT_SET_B(ctx, fr, %d, _o);\n",
           off, off);
     } else {
       const char *fl =
-          "{ if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o); "
+          "{ if (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o); "
           "else AOT_SET_B(ctx, fr, %d, _o); goto dx_%d; }";
       char miss[200];
       snprintf(miss, sizeof(miss), fl, off, off, in->next);
@@ -7446,7 +7443,7 @@ static int emit_typed_call(
         "    if (__builtin_expect(%s%s, "
         "(const void *)aot_f_%s, %du), 1)) {\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in));
-    fprintf(f, "        JSValue _o;\n");
+    fprintf(f, "        JSValue _o; int _r = 1;\n");
     /* The callee's inline body first: it runs the callee in place when every
        check passes and has changed nothing when one does not, so the native call
        below is then correct. */
@@ -7455,22 +7452,22 @@ static int emit_typed_call(
       fprintf(
           f,
           "#ifdef Q2_INLINE_%s\n"
-          "        if (!ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    &AOT_REG(fr, %d), %d, &_o))\n"
+          "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "                    &AOT_REG(fr, %d), %d, &_o)))\n"
           "#endif\n",
           callee[k], callee[k], cexp, recv, w, na);
     fprintf(
         f,
-        "        _o = aot_n_%s(ctx, f,\n"
+        "        { _r = 1; _o = aot_n_%s(ctx, f,\n"
         "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "            &AOT_REG(fr, %d), %d);\n",
+        "            &AOT_REG(fr, %d), %d); }\n",
         callee[k], cexp, recv, w, na);
     fprintf(
         f,
         "        if (__builtin_expect(JS_IsException(_o), 0)) return JS_EXCEPTION;\n"
         "        /* Adopting an owned result drops its reference; a value that has\n"
         "           none (an int, a double, a bool) is a plain store. */\n"
-        "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
+        "        if (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o);\n"
         "        else AOT_SET_B(ctx, fr, %d, _o);\n",
         off, off);
     /* The call ran JS: re-read the groups before anything reads a field. */
@@ -12938,8 +12935,8 @@ const char *e_fl_why_not(void) { return g_e_fl_why; }
    frameless emission blocks on any), every value typed by its own speculative body.
    The checks of every block come before any store, which the text is checked for. */
 
-/* Every `return` in the emitted text is the exit (`return 0;`) or the result
-   (`return 1;`). Returns 1 when the text is fine. */
+/* Every `return` in the emitted text is the exit (`return 0;`), the result (`return 1;`) or the
+   borrowed result (`return 2;`). Returns 1 when the text is fine. */
 static int e_inl_text_ok(const char *txt, size_t n, char *why, size_t whyn) {
   const char *p;
   char *copy = malloc(n + 1);
@@ -12951,8 +12948,8 @@ static int e_inl_text_ok(const char *txt, size_t n, char *why, size_t whyn) {
     if (p > copy && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
     if (isalnum((unsigned char)*q) || *q == '_') continue;
     while (*q == ' ') q++;
-    if (strncmp(q, "0;", 2) != 0 && strncmp(q, "1;", 2) != 0) {
-      snprintf(why, whyn, "a return that is not 0 or 1");
+    if (strncmp(q, "0;", 2) != 0 && strncmp(q, "1;", 2) != 0 && strncmp(q, "2;", 2) != 0) {
+      snprintf(why, whyn, "a return that is not 0, 1 or 2");
       free(copy);
       return 0;
     }
