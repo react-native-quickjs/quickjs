@@ -63615,7 +63615,7 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     }
 }
 
-/* The shape table the generator reads: one `P` line per distinct shape a field
+/* The shape table the generator reads: one `Q` line per distinct shape a field
    site observed, printed once, with the prototype it belongs to and its ordered
    property list. A site's `shape%d=` entry carries the table index instead of a
    runtime address, so the generator derives the ordered field list, each atom's
@@ -63639,7 +63639,7 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
         if (!sh->aot_prof_seen)
             continue;
         sh->aot_prof_id = (uint16_t)id;
-        fprintf(f, "P %d proto=", id);
+        fprintf(f, "Q %d proto=", id);
         if (sh->proto == NULL) {
             fprintf(f, "null");
         } else {
