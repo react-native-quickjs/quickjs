@@ -1423,6 +1423,17 @@ int qjs_aot_prof_site_own(const uint8_t dg[16], int site) {
   return 0;
 }
 
+/* Whether the profile has no record of the site at all: the code around it never ran, so a read
+   there cannot be a hit and the body leaves at it. */
+int qjs_aot_prof_site_cold(const uint8_t dg[16], int site) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i;
+  if (!e || !g_prof_sitekinds) return 0;
+  for (i = 0; i < e->nsites; i++)
+    if (e->sites[i].site == site) return 0;
+  return 1;
+}
+
 /* Whether every fill of a read site was a read from a holder two prototypes up. */
 int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site) {
   const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
