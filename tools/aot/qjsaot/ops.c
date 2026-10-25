@@ -9291,7 +9291,12 @@ static int emit_group_write(
         "JS_FreeValue(ctx, _old);\n",
         recv, woff);
   } else {
-    if (e_pp_of(recv) >= 0)
+    int ov = g_e_facts->oldval[e_insn_idx(fn, in)] - 1;
+    if (e_pp_of(recv) >= 0 && ov >= 0 && g_e_types != NULL && (unsigned)ov < (unsigned)g_e_types->nvalues &&
+        g_e_types->lb[ov] == E_LB_TAG)
+      fprintf(f, "      q2_put_slotpp_k%s(ctx, pp%d, %s, _nv, v%d);\n",
+              g_e_facts->oldobj[e_insn_idx(fn, in)] ? "o" : "", e_pp_of(recv), woff, ov);
+    else if (e_pp_of(recv) >= 0)
       fprintf(f, "      q2_put_slotpp(ctx, pp%d, %s, _nv);\n", e_pp_of(recv), woff);
     else
       fprintf(

@@ -1047,11 +1047,36 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
   /* 3. A load makes its result current for the location. */
   if (have_ld) {
     if (fs_set_avail(s, &ld.key, ld.val) < 0) return -1;
+  } else if (kind != E_SK_SAFE) {
+    /* A chained read leaves its first link's value current for that link's location. */
+    SiteRef ref[2];
+    int nr = site_refs(in, ref);
+    if (nr == 2 && in->ndef >= 2 && !ref[0].is_store && ref[0].site >= 0 &&
+        (unsigned)ref[0].site != REG_IC_NONE && ref[0].recv >= 0 && ref[0].atom != 0) {
+      EKey k;
+      memset(&k, 0, sizeof(k));
+      k.kind = E_K_FIELD;
+      k.a = ref[0].recv;
+      k.b = ref[0].atom;
+      if (fs_set_avail(s, &k, in->def[0]) < 0) return -1;
+    }
   }
 
   /* 4. A store kills what it may have changed, then defines its own
      location. */
   if (insn_store(in, &st)) {
+    if (st.kind == E_K_FIELD) {
+      Q2ValueId ov = fs_get_avail(s, &st.key);
+      if (ov != Q2_NO_VALUE && ov >= 0 && ov < fn->nvalues) {
+        int z;
+        f->oldval[insn] = (int32_t)ov + 1;
+        for (z = 0; z < s->nshape; z++)
+          if (s->shape_val[z] == ov && s->shape_grp[z] >= 0) {
+            f->oldobj[insn] = 1;
+            break;
+          }
+      }
+    }
     /* The load and store helpers are disjoint by opcode, so a store is never
        also the load handled above. */
     apply_store_kills(s, &st);
@@ -1414,6 +1439,8 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->access = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->skip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->cellskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->oldval = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int32_t));
+  out->oldobj = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->elemreg = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->arrskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
@@ -1426,7 +1453,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->blocks = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1),
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
-  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->elemreg == NULL ||
+  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
       out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
@@ -1634,6 +1661,8 @@ void e_facts_free(EFacts *f) {
   free(f->access);
   free(f->skip);
   free(f->cellskip);
+  free(f->oldval);
+  free(f->oldobj);
   free(f->elemreg);
   free(f->arrskip);
   free(f->purecall);

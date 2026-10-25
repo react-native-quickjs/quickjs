@@ -142,6 +142,11 @@ typedef struct EFacts {
      (validated at entry or by an earlier access, with no safepoint since), so the access
      does not test it again. */
   uint8_t *cellskip;
+  /* Per field store: 1 + the value the location held, when an earlier load of it in this region is
+     still current (the store releases that value without reading the slot again), and whether
+     that value is known to be an object. */
+  int32_t *oldval;
+  uint8_t *oldobj;
   /* A numeric element access (get_element / put_element) whose miss exits the speculative
      body, so it is no safepoint; and, for the ones among them whose receiver is a dense
      array already checked in this region, `arrskip`: the receiver's class, holey flag, base
