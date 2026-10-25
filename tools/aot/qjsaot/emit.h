@@ -31,6 +31,7 @@ int e_emit_inline_body(
     FILE *f, const struct Q2Func *fn, char hex[33], char *why, size_t whyn);
 int e_inline_used_nx(void);
 int e_inline_leaf(void);
+int e_inline_pending(void);
 void e_report_hoist(const char *hex, int n);
 void e_report_inline(const char *hex, int ok, const char *why);
 void e_report_copycap(const char *hex, const char *callee, int copied, int len, int cap);

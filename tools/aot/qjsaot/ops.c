@@ -42,6 +42,7 @@ static int g_e_inl_r;
 /* Set when the inline body being emitted makes a call or a construct (a safepoint). */
 static int g_e_inl_safepoint;
 static int g_e_last_inl_leaf;
+static int g_e_inl_pending;
 static const EFacts *g_e_facts;
 /* Set when a body emitted in inline mode needs more than inline mode can give. */
 static char g_e_inl_why[160];
@@ -185,6 +186,7 @@ int qjs_aot_prof_callees(
     unsigned long long hits[4]);
 int qjs_aot_inline_has(const char hex[33]);
 int qjs_aot_inline_leaf(const char hex[33]);
+int qjs_aot_inline_pending(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
 int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci);
@@ -5504,6 +5506,8 @@ static int emit_inl_nested_call(
     if (!qjs_aot_native_capable(callee[k])) continue;
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     nb++;
+    if (g_e_inl && !qjs_aot_inline_has(callee[k]) && qjs_aot_inline_pending(callee[k]))
+      g_e_inl_pending = 1;
   }
   if (nb == 0) {
     e_fl_block("a call to no compiled callee", in);
@@ -5691,7 +5695,7 @@ static int emit_inl_nested_call(
           in->next - 1, nrx, g_e_inl_r ? "ra_" : "NULL");
     else
       pushr[0] = 0;
-    if ((!g_e_inl || qjs_aot_inline_leaf(callee[k])) && qjs_aot_inline_has(callee[k]))
+    if (qjs_aot_inline_has(callee[k]))
       snprintf(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
@@ -5737,13 +5741,13 @@ static int emit_inl_nested_call(
         f,
         "    if (__builtin_expect(%s, 1)) "
         "{\n"
-        "        JSValue _o;\n%s"
-        "%s        _o = aot_n_%s(ctx, caller_f,\n"
+        "        JSValue _o;\n%s%s"
+        "        _o = aot_n_%s(ctx, caller_f,\n"
         "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "            %s, %d);\n"
         "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
         "%s\n",
-        idt, ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
+        idt, pushr, ib, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
     e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "        ");
     /* The result is in place (a TAG value in its local, a typed one in the frame
@@ -13039,6 +13043,7 @@ int e_emit_inline_body(
   g_e_quiet = 1;
   g_e_inl_r = ncalls > 0;
   g_e_inl_safepoint = 0;
+  g_e_inl_pending = 0;
   g_e_spill_total = 0;
   g_e_fl_block[0] = 0;
   if (g_e_inl_r) {
@@ -13080,6 +13085,9 @@ int e_inline_used_nx(void) { return g_e_last_inl_nx; }
 
 /* Whether the inline body just emitted makes no call and no construct. */
 int e_inline_leaf(void) { return g_e_last_inl_leaf; }
+
+/* Whether the inline body just emitted calls a function whose inline form is not decided. */
+int e_inline_pending(void) { return g_e_inl_pending; }
 
 static const char *nm_of_rop(uint16_t rop) {
   static char buf[64];

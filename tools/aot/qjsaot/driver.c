@@ -1624,6 +1624,8 @@ typedef struct {
 static EmitBuf *g_inl_eb;
 static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
 static uint8_t *g_inl_leaf; /* the inline body makes no call and no construct */
+static uint8_t *g_inl_try;  /* 1: the inline form was emitted in some sweep, 2: it was refused */
+static uint8_t *g_inl_lvl;  /* the sweep that committed the inline form */
 
 /* Which functions this run's emitter gave a native entry. A call site may
    only name an `aot_n_` that some body in this unit defines, and only a
@@ -1677,6 +1679,20 @@ int qjs_aot_inline_leaf(const char hex[33]) {
   if (!g_unit_funcs || !g_inl_leaf || hex_to_bytes16(hex, dg) < 0) return 0;
   for (i = 0; i < g_unit_nfuncs; i++)
     if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) return g_inl_leaf[i];
+  return 0;
+}
+
+/* Whether the unit function with this digest may still get an inline form: not committed
+   yet and not refused. A body that calls such a function waits for it. */
+int qjs_aot_inline_pending(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || !g_inl_eb || !g_inl_try || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0)
+      return g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE && !g_inl_eb[i].buf &&
+             g_inl_try[i] != 2;
   return 0;
 }
 
@@ -1967,33 +1983,52 @@ int qjsaot_driver_main(int argc, char **argv) {
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
     g_inl_nx = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     g_inl_leaf = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
-    /* Two sweeps: the bodies that call nothing first, then the others, which may take
-       the first kind inline in turn. */
-    for (int sweep = 0; g_inl_eb && sweep < 2; sweep++)
-    for (i = 0; i < nfuncs; i++) {
-      char hex[33], why[160] = "";
-      FILE *mf;
-      int ok;
+    /* The inline forms in sweeps. A body is committed once every callee it could take inline
+       has been (or cannot be), so a committed body only names callees committed before it:
+       there are no cycles, and the depth is the number of sweeps. The last sweep commits what
+       is left. */
+    g_inl_try = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
+    g_inl_lvl = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
+    {
+      char (*whys)[160] = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 160);
+      enum { E_INL_SWEEPS = 5 };
+      for (int sweep = 0; g_inl_eb && whys && g_inl_try && sweep < E_INL_SWEEPS; sweep++)
+        for (i = 0; i < nfuncs; i++) {
+          char hex[33];
+          char *tb = NULL;
+          size_t tl = 0;
+          FILE *mf;
+          int ok;
 
-      if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
-      if (i + 1 < nfuncs && memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0)
-        continue;
-      if (g_inl_eb[i].buf) continue;
-      hex16(funcs[i].digest, hex);
-      g_cur_func_idx = i;
-      mf = open_memstream(&g_inl_eb[i].buf, &g_inl_eb[i].len);
-      if (!mf) continue;
-      ok = e_emit_inline_func(mf, &funcs[i], hex, why, sizeof(why));
-      fclose(mf);
-      if (sweep == 0 && !(ok && e_inline_leaf())) ok = -1;
-      if (ok >= 0) e_report_inline(hex, ok, why);
-      if (ok > 0 && g_inl_nx) g_inl_nx[i] = (uint8_t)e_inline_used_nx();
-      if (ok > 0 && g_inl_leaf) g_inl_leaf[i] = (uint8_t)e_inline_leaf();
-      if (ok <= 0) {
-        free(g_inl_eb[i].buf);
-        g_inl_eb[i].buf = NULL;
-        g_inl_eb[i].len = 0;
+          if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
+          if (i + 1 < nfuncs && memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0) continue;
+          if (g_inl_eb[i].buf) continue;
+          hex16(funcs[i].digest, hex);
+          g_cur_func_idx = i;
+          mf = open_memstream(&tb, &tl);
+          if (!mf) continue;
+          whys[i][0] = 0;
+          ok = e_emit_inline_func(mf, &funcs[i], hex, whys[i], 160);
+          fclose(mf);
+          g_inl_try[i] = ok ? 1 : 2;
+          if (ok && (sweep == E_INL_SWEEPS - 1 || !e_inline_pending())) {
+            g_inl_eb[i].buf = tb;
+            g_inl_eb[i].len = tl;
+            g_inl_lvl[i] = (uint8_t)sweep;
+            g_inl_nx[i] = (uint8_t)e_inline_used_nx();
+            g_inl_leaf[i] = (uint8_t)e_inline_leaf();
+          } else {
+            free(tb);
+          }
+        }
+      for (i = 0; whys && i < nfuncs; i++) {
+        char hex[33];
+        if (funcs[i].eligible != AOT_GEN_ELIGIBLE) continue;
+        if (i + 1 < nfuncs && memcmp(funcs[i].digest, funcs[i + 1].digest, 16) == 0) continue;
+        hex16(funcs[i].digest, hex);
+        e_report_inline(hex, g_inl_eb[i].buf != NULL, whys[i]);
       }
+      free(whys);
     }
     for (i = 0; i < nfuncs; i++) {
       char hex[33];
@@ -4856,11 +4891,11 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(f, "\n");
     /* The inline forms of the selected functions that have a native entry, before
        any caller. */
-    for (int sweep = 0; g_inl_eb && sweep < 2; sweep++)
+    for (int sweep = 0; g_inl_eb && sweep < 5; sweep++)
     for (i = 0; g_inl_eb && i < nfuncs; i++) {
       char hex[33];
       if (!sel[i] || !eb[i].buf || !g_inl_eb[i].buf ||
-          !qjs_aot_has_native_entry(i) || (sweep == 0) != (g_inl_leaf[i] != 0))
+          !qjs_aot_has_native_entry(i) || g_inl_lvl[i] != sweep)
         continue;
       hex16(funcs[i].digest, hex);
       fprintf(f, "#define Q2_INLINE_%s 1\n", hex);
