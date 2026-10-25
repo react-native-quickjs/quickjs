@@ -12990,7 +12990,7 @@ int e_emit_inline_body(
     snprintf(why, whyn, "not a plain function");
     return 0;
   }
-  if (fn->ninsns > 40) {
+  if (fn->ninsns > 64) {
     snprintf(why, whyn, "%d instructions", fn->ninsns);
     return 0;
   }
@@ -13031,7 +13031,7 @@ int e_emit_inline_body(
     snprintf(why, whyn, "out of memory");
     return 0;
   }
-  if (ncalls > 3) {
+  if (ncalls > 6) {
     snprintf(why, whyn, "%d calls", ncalls);
     fclose(m);
     free(mb);
