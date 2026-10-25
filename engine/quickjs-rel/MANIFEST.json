@@ -1575,12 +1575,16 @@
       "sha256": "e9049e41e29501dcebd4179410ac3fb566b3d689f3bccf37cb63de1020d6c979"
     },
     {
+      "name": "0400-aot-content-claims.patch",
+      "sha256": "408cb3fed1d444ff295c3a265246cef38bf901cef18b4666a9a1773acafb96fe"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "506348992c920e4f5407c219eeca605223266982a2c3528d1fb38e93eafb6922",
+    "quickjs.c": "6ab4dc07cc1d08a47180bcc9612595e0d095ad2672e2c008ab89ffec55472a70",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

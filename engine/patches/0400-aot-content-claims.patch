@@ -1,0 +1,162 @@
+Subject: A contracted layout can promise what a slot holds, and the engine enforces it at the stores
+
+What this does
+  - `rt->aot_slot_claim[layout][slot]` holds one promise per slot: 0 none, 1..63 "an object of that
+    layout or null/undefined", 0x80 "not reference counted". `qjs_aot_layout_claim` sets one.
+  - `js_aot_content_store(rt, p, slot, v)` runs before a value is written into an existing slot of an
+    object whose shape is a layout: a value that breaks the slot's promise sets the layout's broken
+    bit, the one a shape change sets.
+  - `js_aot_content_enter(rt, p)` runs right after an object adopts a layout shape (an add
+    transition, a JSON adoption, a template fill) and checks every slot but the last. The last slot
+    never carries a promise: the caller of an add writes it afterwards.
+
+Why we need it
+  A compiled body that loads a field of a contracted object can use the value without testing its
+  tag or its shape only if every way a value reaches that slot is known to keep the promise. The
+  bit makes the promise safe: a break turns every dependent body to its generic form. The hooks sit
+  next to the existing prototype-epoch and layout-leave hooks and cost one load of the shape's
+  layout id on a store.
+
+Functions touched
+  `js_aot_content_store`, `js_aot_content_enter` (new); `add_property`, `regvm_put_field_add_hit`,
+  `JS_CallInternal` (put_field add), `json_obj_adopt_shape`, the five object-literal template fills,
+  `JS_SetPropertyInternal2`, `JS_DefineProperty`, `JS_SetPrivateField`, `JS_AutoInitProperty`, the
+  cold put_field handler and the three own-slot hit paths; `qjs_aot_layout_claim` (new).
+  The audit that every property-value store is hooked or listed with its reason is
+  `.local/specs/audit-slot-stores.sh` with `.local/specs/slot-store-allowlist.txt`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -581,0 +582 @@
++#define JS_AOT_CLAIM_MAXF 32
+@@ -756,0 +758,6 @@
++    /* What a contracted layout promises about the value in one of its slots: 0 nothing,
++       1..63 an object of that layout or null/undefined, 0x80 a value that is not reference
++       counted. A store that breaks the promise sets the layout's broken bit like a shape
++       change does. Slot indexes past JS_AOT_CLAIM_MAXF carry no promise. */
++    uint8_t aot_slot_claim[63][JS_AOT_CLAIM_MAXF];
++    uint64_t aot_claimed;       /* bit k-1: layout k has at least one promise */
+@@ -2891,0 +2899,2 @@
++static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v);
++static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p);
+@@ -13438,0 +13448 @@
++    js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
+@@ -13708,0 +13719 @@
++    js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
+@@ -14608,0 +14620 @@
++            js_aot_content_enter(ctx->rt, p);
+@@ -15701,0 +15714 @@
++            js_aot_content_store(ctx->rt, p1, (uint32_t)(pr - p1->prop), val);
+@@ -16349,0 +16363,57 @@
++/* Whether `v` keeps the promise `claim` makes about a slot. */
++static inline bool js_aot_claim_ok(JSValue v, uint8_t claim)
++{
++    if (claim & 0x80)
++        return !JS_VALUE_HAS_REF_COUNT(v);
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_NULL || JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED)
++        return true;
++    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
++           JS_VALUE_GET_OBJ(v)->shape->layout_id == claim;
++}
++
++/* A value is stored into slot `slot` of `p`, which is in a contracted layout: a promise it
++   breaks breaks the layout. Called before or after the store, with the new value. */
++static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
++{
++    uint32_t id = p->shape->layout_id;
++    uint8_t claim;
++    if (slot >= JS_AOT_CLAIM_MAXF)
++        return;
++    claim = rt->aot_slot_claim[id - 1][slot];
++    if (claim != 0 && !js_aot_claim_ok(v, claim))
++        rt->aot_layout_broken |= 1ULL << (id - 1);
++}
++
++static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
++{
++    if (unlikely(p->shape->layout_id != 0))
++        js_aot_content_store_slow(rt, p, slot, v);
++}
++
++/* An object has just adopted a contracted shape, or a template filled one. Every slot but the
++   last is already written (the caller of an add writes the last one afterwards, and a layout
++   never promises it), so the promises are checked once here. The check runs before the object
++   can reach JS: no safepoint lies between the shape set or the fill and this call. */
++static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p)
++{
++    uint32_t id = p->shape->layout_id, f, n;
++    if (!((rt->aot_claimed >> (id - 1)) & 1))
++        return;
++    n = p->shape->prop_count;
++    if (n > JS_AOT_CLAIM_MAXF)
++        n = JS_AOT_CLAIM_MAXF;
++    for (f = 0; f + 1 < n; f++) {
++        uint8_t claim = rt->aot_slot_claim[id - 1][f];
++        if (claim != 0 && !js_aot_claim_ok(p->prop[f].u.value, claim)) {
++            rt->aot_layout_broken |= 1ULL << (id - 1);
++            return;
++        }
++    }
++}
++
++static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p)
++{
++    if (unlikely(p->shape->layout_id != 0))
++        js_aot_content_enter_slow(rt, p);
++}
++
+@@ -16545,0 +16616 @@
++                        js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val1);
+@@ -16570,0 +16642 @@
++                        js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
+@@ -24735,0 +24808 @@
++            js_aot_content_enter(ctx->rt, p);
+@@ -24785,0 +24859 @@
++            js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), sp[-1]);
+@@ -26110,0 +26185 @@
++    js_aot_content_enter(ctx->rt, p);
+@@ -31568,0 +31644 @@
++                js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), FR(v));
+@@ -32459,0 +32536 @@
++            js_aot_content_enter(ctx->rt, po);
+@@ -35221,0 +35299 @@
++                            js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), regs[v]);
+@@ -35421,0 +35500 @@
++                        js_aot_content_enter(ctx->rt, po);
+@@ -38024,0 +38104 @@
++                            js_aot_content_enter(ctx->rt, po);
+@@ -41570,0 +41651 @@
++                                js_aot_content_enter(ctx->rt, p);
+@@ -64559,0 +64641,18 @@
++/* The unit's promise about slot `slot` of layout `layout_id`: 0 clears it, 1..63 an object of
++   that layout or null/undefined, 0x80 a value that is not reference counted. The last slot of
++   a layout never carries one (its value is written after the shape is adopted). Returns 0 when
++   the promise is refused. */
++QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32_t slot,
++                                      uint32_t claim)
++{
++    JSRuntime *rt = ctx->rt;
++    if (layout_id == 0 || layout_id > 63 || slot >= JS_AOT_CLAIM_MAXF)
++        return 0;
++    if (claim != 0 && claim != 0x80 && (claim > 63))
++        return 0;
++    rt->aot_slot_claim[layout_id - 1][slot] = (uint8_t)claim;
++    if (claim != 0)
++        rt->aot_claimed |= 1ULL << (layout_id - 1);
++    return 1;
++}
++
+@@ -64847,0 +64947 @@
++            js_aot_content_enter(ctx->rt, po);
+@@ -65434,0 +65535 @@
++            js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), v);
+@@ -95350,0 +95452 @@
++    js_aot_content_enter(ctx->rt, p);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -328,0 +329,3 @@
++/* What the unit promises about one slot of a layout (see JSRuntime.aot_slot_claim). */
++QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32_t slot,
++                                      uint32_t claim);

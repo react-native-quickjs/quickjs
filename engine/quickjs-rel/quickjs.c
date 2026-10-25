@@ -579,6 +579,7 @@ typedef struct JSAotRun {
 
 #define JS_CHAR2_K 1024
 
+#define JS_AOT_CLAIM_MAXF 32
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -754,6 +755,12 @@ struct JSRuntime {
     JSShape **aot_layout_shape;
     uint32_t aot_layout_count;
     uint64_t aot_layout_broken;
+    /* What a contracted layout promises about the value in one of its slots: 0 nothing,
+       1..63 an object of that layout or null/undefined, 0x80 a value that is not reference
+       counted. A store that breaks the promise sets the layout's broken bit like a shape
+       change does. Slot indexes past JS_AOT_CLAIM_MAXF carry no promise. */
+    uint8_t aot_slot_claim[63][JS_AOT_CLAIM_MAXF];
+    uint64_t aot_claimed;       /* bit k-1: layout k has at least one promise */
     /* Set once the unit's chains are laid out. A chain allocates, which must
        never happen inside a compiled body, so the build runs at the first bind. */
     uint8_t aot_layouts_built;
@@ -2889,6 +2896,8 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
+static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v);
+static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p);
 static int init_shape_hash(JSRuntime *rt);
 static __exception int js_get_length32(JSContext *ctx, uint32_t *pres,
                                        JSValueConst obj);
@@ -13436,6 +13445,7 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     pr->u.value = JS_UNDEFINED;
     if (JS_IsException(val))
         return -1;
+    js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
     pr->u.value = val;
     return 0;
 }
@@ -13706,6 +13716,7 @@ static int JS_SetPrivateField(JSContext *ctx, JSValueConst obj,
         JS_FreeValue(ctx, val);
         return -1;
     }
+    js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
     set_value(ctx, &pr->u.value, val);
     return 0;
 }
@@ -14606,6 +14617,7 @@ static JSProperty *add_property(JSContext *ctx,
             js_aot_layout_leave(ctx->rt, p->shape);
             p->shape = js_dup_shape(new_sh);
             js_free_shape(ctx->rt, sh);
+            js_aot_content_enter(ctx->rt, p);
             return &p->prop[new_sh->prop_count - 1];
         } else if (JS_REF_COUNT(sh) != 1) {
             /* if the shape is shared, clone it */
@@ -15699,6 +15711,7 @@ retry:
             if (unlikely(p1->is_prototype))
                 ic_watchpoint_bump(ctx->rt);
 #endif
+            js_aot_content_store(ctx->rt, p1, (uint32_t)(pr - p1->prop), val);
             set_value(ctx, &pr->u.value, val);
             return true;
         } else if (prs->flags & JS_PROP_LENGTH) {
@@ -16347,6 +16360,63 @@ static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
         rt->aot_layout_broken |= 1ULL << (old_sh->layout_id - 1);
 }
 
+/* Whether `v` keeps the promise `claim` makes about a slot. */
+static inline bool js_aot_claim_ok(JSValue v, uint8_t claim)
+{
+    if (claim & 0x80)
+        return !JS_VALUE_HAS_REF_COUNT(v);
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_NULL || JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED)
+        return true;
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
+           JS_VALUE_GET_OBJ(v)->shape->layout_id == claim;
+}
+
+/* A value is stored into slot `slot` of `p`, which is in a contracted layout: a promise it
+   breaks breaks the layout. Called before or after the store, with the new value. */
+static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
+{
+    uint32_t id = p->shape->layout_id;
+    uint8_t claim;
+    if (slot >= JS_AOT_CLAIM_MAXF)
+        return;
+    claim = rt->aot_slot_claim[id - 1][slot];
+    if (claim != 0 && !js_aot_claim_ok(v, claim))
+        rt->aot_layout_broken |= 1ULL << (id - 1);
+}
+
+static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
+{
+    if (unlikely(p->shape->layout_id != 0))
+        js_aot_content_store_slow(rt, p, slot, v);
+}
+
+/* An object has just adopted a contracted shape, or a template filled one. Every slot but the
+   last is already written (the caller of an add writes the last one afterwards, and a layout
+   never promises it), so the promises are checked once here. The check runs before the object
+   can reach JS: no safepoint lies between the shape set or the fill and this call. */
+static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p)
+{
+    uint32_t id = p->shape->layout_id, f, n;
+    if (!((rt->aot_claimed >> (id - 1)) & 1))
+        return;
+    n = p->shape->prop_count;
+    if (n > JS_AOT_CLAIM_MAXF)
+        n = JS_AOT_CLAIM_MAXF;
+    for (f = 0; f + 1 < n; f++) {
+        uint8_t claim = rt->aot_slot_claim[id - 1][f];
+        if (claim != 0 && !js_aot_claim_ok(p->prop[f].u.value, claim)) {
+            rt->aot_layout_broken |= 1ULL << (id - 1);
+            return;
+        }
+    }
+}
+
+static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p)
+{
+    if (unlikely(p->shape->layout_id != 0))
+        js_aot_content_enter_slow(rt, p);
+}
+
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs)
 {
@@ -16543,6 +16613,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                             return -1;
                         val1 = js_dup(*pr->u.var_ref->pvalue);
                         free_var_ref(ctx->rt, pr->u.var_ref);
+                        js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val1);
                         pr->u.value = val1;
                         prs->flags &= ~(JS_PROP_TMASK | JS_PROP_WRITABLE);
                     }
@@ -16568,6 +16639,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                     return res;
                 } else {
                     if (flags & JS_PROP_HAS_VALUE) {
+                        js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
                         JS_FreeValue(ctx, pr->u.value);
                         pr->u.value = js_dup(val);
                     }
@@ -24733,6 +24805,7 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_object_fill(JSFunctionBytecode *b
                    (int)tpl->prop_count == n)) {
             for (i = 0; i < n; i++)
                 set_value(ctx, &p->prop[i].u.value, vals[i]);
+            js_aot_content_enter(ctx->rt, p);
             sp = vals;
             return JS_COLD_HANDLER_OK(sp);
         }
@@ -24783,6 +24856,7 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_put_field(JSContext *ctx, uint8_t
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
+            js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), sp[-1]);
             set_value(ctx, &pr->u.value, sp[-1]);
         } else {
             goto put_field_slow_path;
@@ -26108,6 +26182,7 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
     js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = js_dup_shape(nsh);
     js_free_shape(ctx->rt, osh);
+    js_aot_content_enter(ctx->rt, p);
     p->prop[off].u.value = js_dup(v);
     return 1;
 }
@@ -31566,6 +31641,7 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
                 if (unlikely(p->is_prototype))
                     ic_watchpoint_bump(ctx->rt);
 #endif
+                js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), FR(v));
                 *slot = js_dup(FR(v));
                 if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
                     unlikely(--JS_REF_COUNT(JS_VALUE_GET_PTR(old)) <= 0)) {
@@ -32457,6 +32533,7 @@ static uint8_t *REGVM_CC regvm_t_object_fill(REGVM_ARGS)
                 vals[i2] = JS_UNDEFINED;
 #endif
             }
+            js_aot_content_enter(ctx->rt, po);
             T_NEXT(T_SZ_RBUU);
         }
     }
@@ -35219,6 +35296,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             if (unlikely(p->is_prototype))
                                 ic_watchpoint_bump(ctx->rt);
 #endif
+                            js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), regs[v]);
                             *slot = js_dup(regs[v]);
                             JS_FreeValue(ctx, old);
                             REGVM_NEXT();
@@ -35419,6 +35497,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             vals[i2] = JS_UNDEFINED;
 #endif
                         }
+                        js_aot_content_enter(ctx->rt, po);
                         REGVM_NEXT();
                     }
                 }
@@ -38022,6 +38101,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                 vals[i2] = JS_UNDEFINED;
 #endif
                             }
+                            js_aot_content_enter(ctx->rt, po);
                             REGVM_NEXT();
                         }
                     }
@@ -41568,6 +41648,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 js_aot_layout_leave(ctx->rt, p->shape);
                                 p->shape = js_dup_shape(nsh);
                                 js_free_shape(ctx->rt, osh);
+                                js_aot_content_enter(ctx->rt, p);
                                 p->prop[off].u.value = sp[-1]; /* fresh slot: transfer */
                                 JS_FreeValue(ctx, obj);
                                 sp -= 2;
@@ -64557,6 +64638,24 @@ QJS_AOT_STUB JSValue qjs_aot_function_prototype(JSContext *ctx, JSValueConst fn)
    can ever reach one; the final shape also gets the layout id. The temporary
    object is freed, leaving only the chain's references. Returns the number of
    shapes stored, or 0 on failure. */
+/* The unit's promise about slot `slot` of layout `layout_id`: 0 clears it, 1..63 an object of
+   that layout or null/undefined, 0x80 a value that is not reference counted. The last slot of
+   a layout never carries one (its value is written after the shape is adopted). Returns 0 when
+   the promise is refused. */
+QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32_t slot,
+                                      uint32_t claim)
+{
+    JSRuntime *rt = ctx->rt;
+    if (layout_id == 0 || layout_id > 63 || slot >= JS_AOT_CLAIM_MAXF)
+        return 0;
+    if (claim != 0 && claim != 0x80 && (claim > 63))
+        return 0;
+    rt->aot_slot_claim[layout_id - 1][slot] = (uint8_t)claim;
+    if (claim != 0)
+        rt->aot_claimed |= 1ULL << (layout_id - 1);
+    return 1;
+}
+
 QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
                                            const JSAtom *atoms, uint32_t n,
                                            void *out, uint32_t out_cap,
@@ -64845,6 +64944,7 @@ int qjs_aot_object_fill_b(JSContext *ctx, JSFunctionBytecode *b, JSValue obj,
 #endif
                 vals[i2] = JS_UNDEFINED;
             }
+            js_aot_content_enter(ctx->rt, po);
             return 0;
         }
     }
@@ -65432,6 +65532,7 @@ __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRu
             if (unlikely(p->is_prototype))
                 ic_watchpoint_bump(ctx->rt);
 #endif
+            js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), v);
             *slot = js_dup(v);
             JS_FreeValue(ctx, old);
             return 1;
@@ -95348,6 +95449,7 @@ static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
     js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = js_dup_shape(new_sh);
     js_free_shape(ctx->rt, sh);
+    js_aot_content_enter(ctx->rt, p);
     return 0;
 }
 
