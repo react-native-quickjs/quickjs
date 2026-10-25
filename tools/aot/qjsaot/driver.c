@@ -1225,7 +1225,7 @@ typedef struct ELayoutInfo {
    the unit could not rebuild and the ones a longer layout shadows. Returns the
    number kept, in `out` (at most E_LAYOUT_MAX), and reports the refusals. */
 int e_layouts_collect(ELayoutInfo *out, int cap) {
-  int i, j, n = 0, nproto = 0, nprefix = 0;
+  int i, j, n = 0, nproto = 0, nprefix = 0, nempty = 0;
   if (g_prof == NULL || g_shapes == NULL) return 0;
   for (i = 0; i < g_nshapes && n < cap; i++) {
     const ProfShape *sh = &g_shapes[i];
@@ -1249,7 +1249,11 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
       nproto++;
       continue;
     }
-    if (sh->nfields <= 0 || sh->nfields > PROF_MAX_FIELDS) continue;
+    if (sh->nfields <= 0) {
+      nempty++;
+      continue;
+    }
+    if (sh->nfields > PROF_MAX_FIELDS) continue;
     out[n].shape_id = sh->id;
     out[n].proto = sh->proto;
     memcpy(out[n].digest, sh->digest, sizeof(out[n].digest));
@@ -1299,8 +1303,8 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
     free(drop);
   }
   if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
-    fprintf(stderr, "layout census: kept=%d proto-refused=%d prefix-refused=%d\n",
-            n, nproto, nprefix);
+    fprintf(stderr, "layout census: kept=%d proto-refused=%d prefix-refused=%d empty=%d\n",
+            n, nproto, nprefix, nempty);
   return n;
 }
 
@@ -4740,7 +4744,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         fprintf(stderr, "qjsaot: cannot write %s\n", rpath);
         return 2;
       }
-      fprintf(f, "#include \"quickjs-aot-rt.h\"\n#include \"u.h\"\n");
+      fprintf(f, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+                 "#include \"quickjs-aot-rt.h\"\n#include \"u.h\"\n");
       /* The switch-off counters are declared in the shared header, so they are defined
          exactly once, here. */
       fprintf(
@@ -4845,25 +4850,28 @@ int qjsaot_driver_main(int argc, char **argv) {
        shape still held here would keep its whole object graph reachable. The
        runtime that filled the caches is recorded on the first fill, so a second
        runtime only ever runs the full checks and never frees against the first. */
-    /* The contracted-layout table: one row per layout, carrying the prototype to
-       build the chain against, the ordered field names, and (once built) the
-       shape the chain ends. The release hook walks the shape array. */
+    /* The contracted layouts. This file owns them: the table of rows (prototype
+       kind, constructor digest, ordered field names), the shapes the built chains
+       end, the runtime that holds those references, and both runtime-wide entry
+       points. `u.h` carries only what a body needs at compile time. A layout is
+       built once, outside any compiled frame, and released once at teardown. */
     {
-      extern int qjs_aot_layout_census(void);
       extern int qjs_aot_layout_export(ELayoutInfo *out, int cap);
       extern const void *qjs_aot_prof_shape(int id, int *proto, char *digest,
                                             int *nfields, const char ***fields,
                                             unsigned **flags);
       ELayoutInfo *cand = calloc(E_LAYOUT_MAX, sizeof(*cand));
       int nc = cand != NULL ? qjs_aot_layout_export(cand, E_LAYOUT_MAX) : 0;
-      g_nlayouts = nc;
       int li;
-      fprintf(f,
-              "static void *q2_layout_shape[Q2_LAYOUT_COUNT + 1u];\n"
-              "static const uint32_t q2_layout_count = Q2_LAYOUT_COUNT;\n");
+      g_nlayouts = nc;
       if (nc > 0) {
-        fprintf(f, "static const char *const q2_layout_fields[Q2_LAYOUT_COUNT][%d] = {\n",
-                PROF_MAX_FIELDS);
+        fprintf(f, "#define Q2_MAXF %d\n", PROF_MAX_FIELDS);
+        fprintf(f,
+                "static void *q2_layout_shape[Q2_LAYOUT_COUNT + 1u];\n"
+                "static void *q2_layout_chain[Q2_LAYOUT_COUNT][Q2_MAXF + 1];\n"
+                "static uint8_t q2_layout_state[Q2_LAYOUT_COUNT];\n"
+                "static JSRuntime *q2_owner_rt;\n");
+        fprintf(f, "static const char *const q2_layout_fields[Q2_LAYOUT_COUNT][Q2_MAXF] = {\n");
         for (li = 0; li < nc; li++) {
           const char **fld = NULL;
           unsigned *flg = NULL;
@@ -4883,23 +4891,124 @@ int qjsaot_driver_main(int argc, char **argv) {
         for (li = 0; li < nc; li++)
           fprintf(f, "%s%d", li ? "," : "", cand[li].proto);
         fprintf(f, "};\n");
+        fprintf(f, "static const uint8_t q2_layout_digest[Q2_LAYOUT_COUNT][16] = {\n");
+        for (li = 0; li < nc; li++) {
+          int bi;
+          fprintf(f, "  {");
+          for (bi = 0; bi < 16; bi++) {
+            unsigned v = 0;
+            if (cand[li].proto == 1) sscanf(cand[li].digest + bi * 2, "%2x", &v);
+            fprintf(f, "%s0x%02x", bi ? "," : "", v);
+          }
+          fprintf(f, "},\n");
+        }
+        fprintf(f, "};\n");
+        fprintf(
+            f,
+            "/* The first runtime to build claims the layouts, and records itself before the\n"
+            "   first reference is taken; another runtime only ever runs the full checks. */\n"
+            "static int q2_claim(JSRuntime *rt)\n"
+            "{\n"
+            "  if (q2_owner_rt == NULL) {\n"
+            "    q2_owner_rt = rt;\n"
+            "    *(void ***)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_SHAPE) =\n"
+            "        q2_layout_shape;\n"
+            "    *(uint32_t *)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_COUNT) =\n"
+            "        Q2_LAYOUT_COUNT;\n"
+            "  }\n"
+            "  return q2_owner_rt == rt;\n"
+            "}\n"
+            "/* Lay out layout `i` against `proto` (borrowed). A failure is final: nothing is\n"
+            "   stamped, so the entry check hands every such value to the generic body. */\n"
+            "static void q2_build_one(JSContext *ctx, uint32_t i, JSValueConst proto)\n"
+            "{\n"
+            "  JSAtom atoms[Q2_MAXF];\n"
+            "  uint32_t k, nf = q2_layout_nfields[i], made = 0, n = 0;\n"
+            "  for (k = 0; k < nf; k++) {\n"
+            "    atoms[k] = JS_NewAtom(ctx, q2_layout_fields[i][k]);\n"
+            "    if (atoms[k] == 0) break;\n"
+            "    made++;\n"
+            "  }\n"
+            "  if (made == nf)\n"
+            "    n = qjs_aot_layout_build(ctx, proto, atoms, nf, q2_layout_chain[i],\n"
+            "                             Q2_MAXF + 1, i + 1u);\n"
+            "  for (k = 0; k < made; k++) JS_FreeAtom(ctx, atoms[k]);\n"
+            "  if (n == nf + 1u) {\n"
+            "    q2_layout_shape[i] = q2_layout_chain[i][nf];\n"
+            "    q2_layout_state[i] = 1;\n"
+            "  } else {\n"
+            "    q2_layout_state[i] = 2;\n"
+            "  }\n"
+            "}\n"
+            "/* Object-literal layouts, built at the first bind. */\n"
+            "int qjs_aot_layouts_build(JSContext *ctx)\n"
+            "{\n"
+            "  uint32_t i;\n"
+            "  if (!q2_claim(JS_GetRuntime(ctx))) return 0;\n"
+            "  for (i = 0; i < Q2_LAYOUT_COUNT; i++)\n"
+            "    if (q2_layout_proto[i] == 2 && q2_layout_state[i] == 0)\n"
+            "      q2_build_one(ctx, i, qjs_aot_object_prototype(ctx));\n"
+            "  return 0;\n"
+            "}\n"
+            "/* Whether a constructor digest still has a layout to build. */\n"
+            "int qjs_aot_layout_ctor(const uint8_t digest[16])\n"
+            "{\n"
+            "  uint32_t i;\n"
+            "  for (i = 0; i < Q2_LAYOUT_COUNT; i++)\n"
+            "    if (q2_layout_proto[i] == 1 && q2_layout_state[i] == 0 &&\n"
+            "        memcmp(q2_layout_digest[i], digest, 16) == 0)\n"
+            "      return 1;\n"
+            "  return 0;\n"
+            "}\n"
+            "/* A constructor's function object now exists with its final `.prototype`. A\n"
+            "   second function object of the same digest finds the layout built and keeps\n"
+            "   the first chain. */\n"
+            "void qjs_aot_layout_fn_created(JSContext *ctx, JSValue fn, const uint8_t digest[16])\n"
+            "{\n"
+            "  uint32_t i;\n"
+            "  if (!q2_claim(JS_GetRuntime(ctx))) return;\n"
+            "  for (i = 0; i < Q2_LAYOUT_COUNT; i++) {\n"
+            "    JSValue proto;\n"
+            "    if (q2_layout_proto[i] != 1 || q2_layout_state[i] != 0 ||\n"
+            "        memcmp(q2_layout_digest[i], digest, 16) != 0)\n"
+            "      continue;\n"
+            "    proto = qjs_aot_function_prototype(ctx, fn);\n"
+            "    if (JS_IsUndefined(proto)) {\n"
+            "      q2_layout_state[i] = 2;\n"
+            "      continue;\n"
+            "    }\n"
+            "    q2_build_one(ctx, i, proto);\n"
+            "    JS_FreeValue(ctx, proto);\n"
+            "  }\n"
+            "}\n"
+            "void qjs_aot_release(JSRuntime *rt)\n"
+            "{\n"
+            "  uint32_t i, k, built = 0, refused = 0, pending = 0;\n"
+            "  if (q2_owner_rt != rt) return;\n"
+            "  for (i = 0; i < Q2_LAYOUT_COUNT; i++) {\n"
+            "    built += q2_layout_state[i] == 1;\n"
+            "    refused += q2_layout_state[i] == 2;\n"
+            "    pending += q2_layout_state[i] == 0;\n"
+            "    if (q2_layout_state[i] == 1)\n"
+            "      for (k = 0; k <= q2_layout_nfields[i]; k++) {\n"
+            "        qjs_aot_layout_free(rt, q2_layout_chain[i][k]);\n"
+            "        q2_layout_chain[i][k] = NULL;\n"
+            "      }\n"
+            "    q2_layout_shape[i] = NULL;\n"
+            "    q2_layout_state[i] = 0;\n"
+            "  }\n"
+            "  if (getenv(\"QJS_AOT_STATS\"))\n"
+            "    fprintf(stderr, \"aot layouts: built=%%u refused=%%u unbuilt=%%u\\n\", built,\n"
+            "            refused, pending);\n"
+            "  *(void ***)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_SHAPE) = NULL;\n"
+            "  *(uint32_t *)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_COUNT) = 0;\n"
+            "  q2_owner_rt = NULL;\n"
+            "}\n");
+      } else {
+        fprintf(f, "void qjs_aot_release(JSRuntime *rt) { (void)rt; }\n");
       }
       free(cand);
     }
-    fprintf(
-        f,
-        "static JSRuntime *q2_owner_rt;\n"
-        "void qjs_aot_release(JSRuntime *rt)\n"
-        "{\n"
-        "  uint32_t i;\n"
-        "  if (q2_owner_rt != rt) return;\n"
-        "  for (i = 0; i < q2_layout_count; i++)\n"
-        "    if (q2_layout_shape[i] != NULL) {\n"
-        "      qjs_aot_layout_free(rt, q2_layout_shape[i]);\n"
-        "      q2_layout_shape[i] = NULL;\n"
-        "    }\n"
-        "  q2_owner_rt = NULL;\n"
-        "}\n");
     fprintf(f, "const uint32_t qjs_aot_abi = QJS_AOT_ABI;\n");
     fprintf(f, "const uint32_t qjs_aot_layout = QJS_AOT_LAYOUT_HASH;\n");
     fprintf(f, "const uint32_t qjs_aot_cell_count = 0u;\n");
