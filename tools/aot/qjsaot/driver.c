@@ -4529,6 +4529,33 @@ int qjsaot_driver_main(int argc, char **argv) {
         f,
         "const uint32_t qjs_aot_count = "
         "sizeof(qjs_aot_table) / sizeof(qjs_aot_table[0]);\n");
+    /* The unit's teardown, called once at the start of JS_FreeRuntime. The site
+       caches and the contracted layout shapes hold counted references that must be
+       dropped while the runtime is still alive; the final collection follows, so a
+       shape still held here would keep its whole object graph reachable. The
+       runtime that filled the caches is recorded on the first fill, so a second
+       runtime only ever runs the full checks and never frees against the first. */
+    /* The contracted-layout table. Empty until K2 emits layouts; the array and
+       the count exist so the release path and the exported offsets are the same
+       in every unit. */
+    fprintf(
+        f,
+        "static void *q2_layout_shape[1];\n"
+        "static const uint32_t q2_layout_count = 0;\n");
+    fprintf(
+        f,
+        "static JSRuntime *q2_owner_rt;\n"
+        "void qjs_aot_release(JSRuntime *rt)\n"
+        "{\n"
+        "  uint32_t i;\n"
+        "  if (q2_owner_rt != rt) return;\n"
+        "  for (i = 0; i < q2_layout_count; i++)\n"
+        "    if (q2_layout_shape[i] != NULL) {\n"
+        "      qjs_aot_layout_free(rt, q2_layout_shape[i]);\n"
+        "      q2_layout_shape[i] = NULL;\n"
+        "    }\n"
+        "  q2_owner_rt = NULL;\n"
+        "}\n");
     fprintf(f, "const uint32_t qjs_aot_abi = QJS_AOT_ABI;\n");
     fprintf(f, "const uint32_t qjs_aot_layout = QJS_AOT_LAYOUT_HASH;\n");
     fprintf(f, "const uint32_t qjs_aot_cell_count = 0u;\n");
