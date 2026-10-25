@@ -1,0 +1,27 @@
+Subject: Invalidating the global-variable cells moves the prototype epoch
+
+What this does
+  - `js_gv_cell_invalidate`, which every change to the global object's property structure (an add, a
+    delete, a flag change) runs, now also moves `aot_pic_epoch`.
+
+Why we need it
+  A compiled function that reads a global through a register-VM global site keeps the property slot
+  that site's cell names, taken once at the epoch its other cache cells were validated at. The slot
+  is valid only for the generation the cell was filled at; the generation moved without the epoch
+  moving, so the function would have kept a slot that a structure change had left behind. With this
+  bump the function's existing epoch check after every call, and at the next entry, covers it. The
+  value is still read from the slot on each use, so a plain value store to a global needs no watch.
+
+Functions touched
+  `js_gv_cell_invalidate`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -9125,0 +9126,5 @@
++#if QJS_REGVM
++    /* A compiled function holds the property slots of the global sites it read at some epoch;
++       they are valid only for the generation they were read at. */
++    rt->aot_pic_epoch++;
++#endif

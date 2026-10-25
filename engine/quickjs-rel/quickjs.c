@@ -9123,6 +9123,11 @@ static void js_gv_site_flush(JSRuntime *rt, struct list_head *head)
 /* Invalidate every OP_get_var cell in the runtime. */
 static void js_gv_cell_invalidate(JSRuntime *rt)
 {
+#if QJS_REGVM
+    /* A compiled function holds the property slots of the global sites it read at some epoch;
+       they are valid only for the generation they were read at. */
+    rt->aot_pic_epoch++;
+#endif
     if (unlikely(++rt->gv_cell_gen == 0)) {
         struct list_head *el;
         rt->gv_cell_gen = 1;
