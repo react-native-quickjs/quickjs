@@ -4087,22 +4087,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
         "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == "
         "entry;\n"
-        "}\n\n"
-        /* The same test with the object it last accepted kept in `*cached`: a matching
-           object is one compare, where the full test is a tag test, a class test and two
-           dependent loads. A function object's bytecode never changes, so the same object
-           implies the same entry. A miss runs the full test and refills, so a site that
-           alternates callees still behaves, it just stops paying off. */
-        "static inline __attribute__((always_inline)) int q2_call_entry_c(\n"
-        "JSValue fnv, const void *entry, const void **cached)\n"
-        "{\n"
-        "  const void *o;\n"
-        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return 0;\n"
-        "  o = JS_VALUE_GET_PTR(fnv);\n"
-        "  if (__builtin_expect(o == *cached, 1)) return 1;\n"
-        "  if (!q2_call_entry(fnv, entry)) return 0;\n"
-        "  *cached = o;\n"
-        "  return 1;\n"
         "}\n\n");
     /* Whether the callee is the function whose bound entry is `entry`. Only
        that function's digest produces that entry, so this is an exact identity
