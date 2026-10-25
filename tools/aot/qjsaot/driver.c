@@ -196,6 +196,7 @@ typedef struct {
   int proto;              /* see above */
   char digest[33];        /* proto == 1 */
   int nfields;
+  int nprops;             /* the shape's property count, deleted slots included */
   char *field[PROF_MAX_FIELDS];  /* the atom, by name */
   unsigned flags[PROF_MAX_FIELDS];
 } ProfShape;
@@ -495,6 +496,10 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         sh = &g_shapes[g_nshapes++];
         memset(sh, 0, sizeof(*sh));
         sh->id = id;
+        {
+          const char *np = strstr(line + 2, " n=");
+          sh->nprops = np != NULL ? (int)strtol(np + 3, NULL, 10) : -1;
+        }
         if (strncmp(pr, "fn:", 3) == 0) {
           sh->proto = 1;
           for (k = 0; k < 32 && pr[3 + k] != '\0' && pr[3 + k] != ' '; k++)
@@ -1306,6 +1311,48 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
     fprintf(stderr, "layout census: kept=%d proto-refused=%d prefix-refused=%d empty=%d\n",
             n, nproto, nprefix, nempty);
   return n;
+}
+
+/* The contracted layout a property site reads, and the constant slot its field
+   sits at in that layout. Only a site that saw exactly one shape and filled it as
+   an own data read or write qualifies, and only when the shape's property list has no
+   deleted slot, so the profiled slot is also the field's index in the layout the
+   unit builds. The layout number is the id the unit stamps (the position in the
+   candidate list plus one). */
+static int g_slot_refused;
+int qjs_aot_layout_slot_refusals(void) { return g_slot_refused; }
+int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot) {
+  static ELayoutInfo tab[E_LAYOUT_MAX];
+  static int ntab = -1;
+  const ProfEntry *e;
+  int i, l;
+  if (ntab < 0) ntab = e_layouts_collect(tab, E_LAYOUT_MAX);
+  e = g_prof != NULL ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  if (e == NULL || !g_prof_sitekinds) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    const ProfSite *ps = &e->sites[i];
+    if (ps->site != site) continue;
+    if (ps->nshapes != 1 || ps->slot[0] < 0 ||
+        (ps->kinds != (1u << 1) && ps->kinds != (1u << 3)))
+      return 0;
+    for (l = 0; l < ntab; l++) {
+      const ProfShape *sh;
+      if (tab[l].shape_id != (int)ps->shape[0]) continue;
+      sh = prof_shape_by_id(tab[l].shape_id);
+      /* Two sources must agree: the slot the site's fill recorded and the property
+         list of the shape table. A shape with a deleted slot, or a slot past the
+         list, refuses the site. */
+      if (sh == NULL || sh->nprops != sh->nfields || ps->slot[0] >= sh->nfields) {
+        g_slot_refused++;
+        return 0;
+      }
+      *layout = l + 1;
+      *slot = ps->slot[0];
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
 }
 
 /* The layout census, for the report: the candidates the profile supports. */
@@ -4420,6 +4467,32 @@ int qjsaot_driver_main(int argc, char **argv) {
           "                           QJS_AOT_OFF_RT_LAYOUT_BROKEN) >> (id - 1u)) & 1u)\n"
           "    return 0u;\n"
           "  return id;\n"
+          "}\n"
+          "/* The shapes the unit's built layouts end, defined where the layouts are\n"
+          "   owned. A value whose shape IS one of them is in that layout: the unit\n"
+          "   holds a reference, so the shape is never changed in place, and leaving\n"
+          "   the layout changes the value\'s shape pointer. */\n"
+          "extern void *q2_layout_shape[];\n"
+          "/* A field of a value in layout `k` (1-based) at constant slot `slot`: one\n"
+          "   compare against the layout\'s shape and one load. Anything else is a miss. */\n"
+          "static inline __attribute__((always_inline)) int q2_cslot_hit_lz(\n"
+          "    JSValue recv, uint32_t k, uint32_t slot, JSValue *out, int lz)\n"
+          "{\n"
+          "  const unsigned char *obj, *prop;\n"
+          "  JSValue v;\n"
+          "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
+          "  obj = (const unsigned char *)JS_VALUE_GET_PTR(recv);\n"
+          "  if (*(void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE) !=\n"
+          "      q2_layout_shape[k - 1u])\n"
+          "    return 0;\n"
+          "  prop = *(const unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+          "  v = *(const JSValue *)(prop + (size_t)slot * QJS_AOT_SIZEOF_JSPROPERTY);\n"
+          "  if (lz && JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+          "#if !QJS_DRC\n"
+          "  if (JS_VALUE_GET_TAG(v) < 0) return 0;\n"
+          "#endif\n"
+          "  *out = v;\n"
+          "  return 1;\n"
           "}\n\n");
     /* The inline unary fast path for neg and inc: an int whose result stays an
        int, or a float64. Anything else (-0, an overflow, a coercion) returns 0
@@ -4867,7 +4940,7 @@ int qjsaot_driver_main(int argc, char **argv) {
       if (nc > 0) {
         fprintf(f, "#define Q2_MAXF %d\n", PROF_MAX_FIELDS);
         fprintf(f,
-                "static void *q2_layout_shape[Q2_LAYOUT_COUNT + 1u];\n"
+                "void *q2_layout_shape[Q2_LAYOUT_COUNT + 1u];\n"
                 "static void *q2_layout_chain[Q2_LAYOUT_COUNT][Q2_MAXF + 1];\n"
                 "static uint8_t q2_layout_state[Q2_LAYOUT_COUNT];\n"
                 "static JSRuntime *q2_owner_rt;\n");
@@ -5015,6 +5088,8 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(f, "const uint32_t qjs_aot_site_count = %du;\n", g_deopt_site_next);
     fclose(f);
 
+    if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
+      fprintf(stderr, "layout census: site-slot-refused=%d\n", g_slot_refused);
     fprintf(
         stderr,
         "qjsaot: %d functions seen, %d emitted, %lld instructions, "
