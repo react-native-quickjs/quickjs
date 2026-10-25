@@ -4262,6 +4262,10 @@ int qjsaot_driver_main(int argc, char **argv) {
         "}\n"
         /* The lazy-JSON marker test is on unless the body in progress assumes no lazy
            document exists (Q2_LZ is redefined around such a body). */
+        "/* undefined into n slots, one 16-byte store each */\n"
+        "typedef long long q2_v2_t __attribute__((vector_size(16), aligned(8), may_alias));\n"
+        "#define Q2_FILL_UNDEF(p_, n_) do { const q2_v2_t u_ = { 0, (long long)JS_TAG_UNDEFINED }; int k_; \\\n"
+        "    for (k_ = 0; k_ < (n_); k_++) *(q2_v2_t *)&(p_)[k_] = u_; } while (0)\n"
         "#define Q2_LAYOUT_BROKEN(ctx_) (*(const uint64_t *)(*(const uint8_t *const *)((const uint8_t *)(ctx_) + "
         "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_LAYOUT_BROKEN))\n"
         "#define Q2_LZ 1\n"

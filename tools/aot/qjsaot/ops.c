@@ -11598,7 +11598,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
           "    JSAotFlRec *const rec_ = NULL;\n"
           "    JSValue fr[%d];\n"
-          "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
+          "    Q2_FILL_UNDEF(fr, %d);\n",
           hex, fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
     if (g_e_inl && g_e_inl_r) {
       int wi, mw = 1;
@@ -11610,7 +11610,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           f,
           "    enum { SB_ = %d };\n"
           "    JSValue ra_[SB_ + %d];\n"
-          "    { int k_; for (k_ = 0; k_ < SB_; k_++) ra_[k_] = JS_UNDEFINED; }\n",
+          "    Q2_FILL_UNDEF(ra_, SB_);\n",
           g_e_spill_total, mw);
     }
     } else
@@ -11626,7 +11626,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
         "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
         "    JSValue fr[%d];\n"
-        "    { int k_; for (k_ = 0; k_ < %d; k_++) fr[k_] = JS_UNDEFINED; }\n",
+        "    Q2_FILL_UNDEF(fr, %d);\n",
         g_e_fl_calls ? "static inline __attribute__((always_inline)) " : "E_TEXT ",
         g_e_fl_calls ? "" : e_linkage(), g_e_fl_calls ? "nb" : "n", hex,
         g_e_fl_calls ? ", JSAotFlRec *rec_" : "",
@@ -11643,7 +11643,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           f,
           "    enum { SB_ = %d };\n"
           "    JSValue ra_[SB_ + %d];\n"
-          "    { int k_; for (k_ = 0; k_ < SB_; k_++) ra_[k_] = JS_UNDEFINED; }\n"
+          "    Q2_FILL_UNDEF(ra_, SB_);\n"
           "    rec_->roots = ra_;\n    rec_->nroots = SB_;\n",
           g_e_spill_total, mw);
     }
