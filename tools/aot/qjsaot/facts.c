@@ -1070,6 +1070,16 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       e_rop_name(in->rop, nm, sizeof(nm));
       fprintf(stderr, "safepoint %s %s@%d\n", fn->g->name, nm, in->pc);
     }
+    f->thislay[insn] = 0;
+    if (in->rop == ROP_call_method && in->narg > 2) {
+      int i;
+      for (i = 0; i < s->nshape; i++) {
+        int lay;
+        if (s->shape_val[i] != in->argval[2] || s->shape_val[i] >= E_ARRV(0)) continue;
+        lay = group_layout(fn, f, s->shape_grp[i]);
+        if (lay != 0) { f->thislay[insn] = (uint8_t)lay; break; }
+      }
+    }
     fs_kill(s, kp_safepoint, NULL);
     f->laymask[insn] = 0;
     if (in->rop == ROP_call || in->rop == ROP_call_method) {
@@ -1408,6 +1418,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->arrskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->laymask = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(uint64_t));
+  out->thislay = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->narr_vals = fn->nvalues;
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->arr_pk = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
@@ -1416,7 +1427,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1627,6 +1638,7 @@ void e_facts_free(EFacts *f) {
   free(f->arrskip);
   free(f->purecall);
   free(f->laymask);
+  free(f->thislay);
   free(f->arr_used);
   free(f->arr_pk);
   free(f->miss_exits);

@@ -2392,6 +2392,10 @@ static int g_e_spill_n, g_e_spill_total, g_e_spill_nv;
    `g_e_child_max` is the largest slice a callee inlined so far needs; `g_e_child_decl` is the
    value the trial emission found, which sizes the array of the real one. */
 static int g_e_child_max, g_e_child_decl, g_e_last_inl_rz;
+/* The layout the inline body just emitted tests its `this` for at entry (0: none). A caller
+   that knows its receiver is in that layout passes `this_ok_` and the test is not run. */
+static int g_e_last_inl_tl;
+int qjs_aot_inline_thislay(const char hex[33]);
 static int e_win_max(const Q2Func *fn) {
   int wi, mw = 1;
   for (wi = 0; wi < fn->ninsns; wi++)
@@ -2560,7 +2564,6 @@ static void e_note_tag(char kind, int pc, const char *expr) {
    window slot no longer holds what was read). Filled before the blocks are
    emitted; NULL in a framed body. */
 static uint8_t *g_e_rooted;
-static int g_e_child_max, g_e_child_decl, g_e_last_inl_rz;
 /* Values whose property array pointer is held in a local `pp<N>`: a value of a contracted
    layout read at the function's entry block. While the value stays in its layout (the facts
    and the broken-bit rechecks guarantee it at every access) its property array is not moved,
@@ -5527,6 +5530,7 @@ static int emit_inl_nested_call(
   int allleaf, cmc = -1;
   const int pub = !g_e_inl || g_e_inl_r;
   char nrx[32], nrxe[64], rax[48];
+  int tlay = g_e_facts != NULL ? g_e_facts->thislay[e_insn_idx(fn, in)] : 0;
   const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
 
   if (t == NULL || cur == NULL) return 0;
@@ -5744,9 +5748,10 @@ static int emit_inl_nested_call(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
           "        if (!(_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o, %s)))\n"
+          "                    %s, %d, &_o, %s, %d)))\n"
           "#endif\n",
-          callee[k], callee[k], cexp, recv, winp, na, rax);
+          callee[k], callee[k], cexp, recv, winp, na, rax,
+          tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay);
     if (getenv("QJS_AOT_INL_CONTROL") != NULL &&
         strcmp(getenv("QJS_AOT_INL_CONTROL"), "noident") == 0)
       fprintf(f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n"
@@ -5764,9 +5769,10 @@ static int emit_inl_nested_call(
           "        JSValue _o; int _r = 1;\n"
           "#ifdef Q2_INLINE_%s\n"
           "        if ((_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o, %s))) {\n"
+          "                    %s, %d, &_o, %s, %d))) {\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
-          idt, callee[k], callee[k], cexp, recv, winp, na, rax, excret);
+          idt, callee[k], callee[k], cexp, recv, winp, na, rax,
+          tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
       fprintf(
@@ -7221,7 +7227,7 @@ static int emit_pure_call(
         "        JSValue _o; int _r;\n"
         "        E_CAP(f, %d);\n"
         "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "                    args_, %d, &_o, NULL))) goto vx_%d;\n",
+        "                    args_, %d, &_o, NULL, 0))) goto vx_%d;\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
@@ -7487,7 +7493,7 @@ static int emit_typed_call(
           f,
           "#ifdef Q2_INLINE_%s\n"
           "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    &AOT_REG(fr, %d), %d, &_o, NULL)))\n"
+          "                    &AOT_REG(fr, %d), %d, &_o, NULL, 0)))\n"
           "#endif\n",
           callee[k], callee[k], cexp, recv, w, na);
     fprintf(
@@ -8029,14 +8035,21 @@ static int emit_group_this_read(
   e_group_test(
       test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, "_t", g, site, 0);
   e_slot_off(off, sizeof(off), g, site);
-  fprintf(
-      f,
-      "    { JSValue _t = %s, _f;\n"
-      "      if (__builtin_expect(JS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
-      "      if (__builtin_expect(%s, 0)) goto vx_%d;\n"
-      "      _f = *%s(_t, %s);\n",
-      g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)", in->pc,
-      test, in->pc, e_slotfn(site), off);
+  {
+    /* An inlined body's first test of `this`: its caller may already know the answer. */
+    const int okt = g_e_inl && g_e_fl && e_group_layout(g) != 0 && fn->nrpo > 0 &&
+                    g_e_blk == fn->rpo[0] && g_e_last_inl_tl == 0;
+    if (okt) g_e_last_inl_tl = e_group_layout(g);
+    fprintf(
+        f,
+        "    { JSValue _t = %s, _f;\n"
+        "      if (__builtin_expect(%sJS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
+        "      if (__builtin_expect(%s%s, 0)) goto vx_%d;\n"
+        "      _f = *%s(_t, %s);\n",
+        g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
+        okt ? "!this_ok_ && " : "", in->pc, okt ? "!this_ok_ && " : "", test, in->pc,
+        e_slotfn(site), off);
+  }
   if (!g_e_nolazy)
     fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
@@ -11655,7 +11668,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "static inline __attribute__((always_inline)) int ei_%s(JSContext "
           "*ctx_in, JSRegRun *caller_f,\n"
           "                               JSObject *co, JSValue this_obj,\n"
-          "                               JSValue *argv, int argc, JSValue *out, JSValue *ra_x_)\n"
+          "                               JSValue *argv, int argc, JSValue *out, JSValue *ra_x_, int this_ok_)\n"
           "{\n"
           "    _Static_assert(QJS_DRC, \"an inline body needs deferred counting\");\n"
           "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
@@ -11679,6 +11692,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_last_inl_rz = 0;
       fprintf(f, "    (void)ra_x_;\n");
     }
+    if (g_e_inl) fprintf(f, "    (void)this_ok_;\n");
     } else
     fprintf(
         f,
@@ -13133,6 +13147,7 @@ int e_emit_inline_body(
   g_e_inl = 1;
   g_e_quiet = 1;
   g_e_inl_r = ncalls > 0;
+  g_e_last_inl_tl = 0;
   g_e_inl_safepoint = 0;
   g_e_inl_pending = 0;
   g_e_spill_total = 0;
@@ -13184,6 +13199,7 @@ int e_inline_leaf(void) { return g_e_last_inl_leaf; }
 /* The slots the inline body just emitted needs in the shared root array: its own, its window
    and the largest slice of a body it inlines; 0 for a body that makes no call. */
 int e_inline_rz(void) { return g_e_last_inl_rz; }
+int e_inline_thislay(void) { return g_e_last_inl_tl; }
 
 /* Whether the inline body just emitted calls a function whose inline form is not decided. */
 int e_inline_pending(void) { return g_e_inl_pending; }

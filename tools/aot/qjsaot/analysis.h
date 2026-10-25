@@ -160,6 +160,9 @@ typedef struct EFacts {
      call. An object leaves a layout only by setting the layout's broken bit, so the call is
      followed by a test of those bits and no shape fact of such a layout is dropped. */
   uint64_t *laymask;
+  /* Per call instruction: the contracted layout (1-based, 0 for none) its receiver is known to
+     be in when the call starts, so an inlined callee whose entry tests that layout need not. */
+  uint8_t *thislay;
   /* A grouped field access whose miss must leave the speculative body (an
      exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter

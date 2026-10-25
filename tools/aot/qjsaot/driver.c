@@ -1635,6 +1635,8 @@ typedef struct {
 static EmitBuf *g_inl_eb;
 static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
 static uint8_t *g_inl_leaf; /* the inline body makes no call and no construct */
+static uint8_t *g_inl_tl;  /* the layout its inline form tests `this` for at entry */
+int e_inline_thislay(void);
 static int *g_inl_rz;       /* the slots its inline form takes in the shared root array */
 int e_inline_rz(void);
 static uint8_t *g_inl_try;  /* 1: the inline form was emitted in some sweep, 2: it was refused */
@@ -1693,6 +1695,18 @@ int qjs_aot_inline_rz(const char hex[33]) {
   if (!g_unit_funcs || !g_inl_rz || hex_to_bytes16(hex, dg) < 0) return 0;
   for (i = 0; i < g_unit_nfuncs; i++)
     if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) return g_inl_rz[i];
+  return 0;
+}
+
+/* The layout the inline form of the unit function with this digest tests `this` for at its
+   entry, or 0. */
+int qjs_aot_inline_thislay(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || !g_inl_tl || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) return g_inl_tl[i];
   return 0;
 }
 
@@ -2009,6 +2023,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     g_inl_nx = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     g_inl_leaf = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     g_inl_rz = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(int));
+    g_inl_tl = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     /* The inline forms in sweeps. A body is committed once every callee it could take inline
        has been (or cannot be), so a committed body only names callees committed before it:
        there are no cycles, and the depth is the number of sweeps. The last sweep commits what
@@ -2044,6 +2059,7 @@ int qjsaot_driver_main(int argc, char **argv) {
             g_inl_nx[i] = (uint8_t)e_inline_used_nx();
             g_inl_leaf[i] = (uint8_t)e_inline_leaf();
             g_inl_rz[i] = e_inline_rz();
+            g_inl_tl[i] = (uint8_t)e_inline_thislay();
           } else {
             free(tb);
           }
