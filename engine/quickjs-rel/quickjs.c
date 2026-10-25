@@ -62934,7 +62934,11 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
     s->count++;
     for (i = 0; i < s->nshapes; i++) {
         if (s->shapes[i] == shape) {
+            /* Already stored at this site, so it is in the table: mark it here
+               too, since this path returns before the store below. */
             s->shape_hits[i]++;
+            if (kind != REG_PIC_GLOBAL)
+                shape->aot_prof_seen = 1;
             return;
         }
     }
@@ -62952,9 +62956,6 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
         s->shapes[s->nshapes] = js_dup_shape(shape);
         s->shape_hits[s->nshapes] = 1;
         s->nshapes++;
-        /* Only a shape a site actually STORES enters the table: a fifth shape at
-           one site is recorded by neither, and a table entry no site references
-           would be a layout the generator could never cover. */
         shape->aot_prof_seen = 1;
     }
 }
@@ -63642,7 +63643,7 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
         if (!sh->aot_prof_seen)
             continue;
         sh->aot_prof_id = (uint16_t)id;
-        fprintf(f, "P %d proto=", id);
+        fprintf(f, "Q %d proto=", id);
         if (sh->proto == NULL) {
             fprintf(f, "null");
         } else {

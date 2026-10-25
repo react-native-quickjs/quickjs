@@ -50,33 +50,36 @@ until a unit declares one).
 +       the index the dumped table gives it. Only in a build that can profile. */
 +    uint8_t aot_prof_seen;
 +    uint16_t aot_prof_id;
-@@ -62936,0 +62941,6 @@
+@@ -62932,0 +62937,2 @@
++            /* Already stored at this site, so it is in the table: mark it here
++               too, since this path returns before the store below. */
+@@ -62933,0 +62940,2 @@
++            if (kind != REG_PIC_GLOBAL)
++                shape->aot_prof_seen = 1;
+@@ -62936,0 +62945,6 @@
 +    /* A global slot's fill passes its cell GENERATION cast to a shape pointer, to
 +       record the fill's kind only (see regvm_global_site_fill), so it names no
 +       shape: it must not be recorded, referenced or marked, or the table would
 +       hold a pointer that is not a shape at all. */
 +    if (kind == REG_PIC_GLOBAL)
 +        return;
-@@ -62938 +62948,5 @@
+@@ -62938 +62952,5 @@
 -        s->shapes[s->nshapes] = shape;
 +        /* A recorded shape is REFERENCED: at most four per site, and it keeps the
 +           address from being reused by a different shape before the dump reads it,
 +           which an address join would otherwise attach to the wrong layout. The
 +           dump drops these after printing. */
 +        s->shapes[s->nshapes] = js_dup_shape(shape);
-@@ -62940,0 +62955,4 @@
-+        /* Only a shape a site actually STORES enters the table: a fifth shape at
-+           one site is recorded by neither, and a table entry no site references
-+           would be a layout the generator could never cover. */
+@@ -62940,0 +62959 @@
 +        shape->aot_prof_seen = 1;
-@@ -63555 +63573,5 @@
+@@ -63555 +63574,5 @@
 -            fprintf(f, " shape%d=%p hits=%u", j, (void *)s->shapes[j],
 +            /* The table index: safe to read because the site holds a reference
 +               on the shape, so it is alive and its id was assigned by the walk
 +               that printed the `P` lines. */
 +            fprintf(f, " shape%d=%u hits=%u", j,
 +                    s->shapes[j] != NULL ? (unsigned)s->shapes[j]->aot_prof_id : 0u,
-@@ -63598,0 +63621,82 @@
+@@ -63598,0 +63622,82 @@
 +/* The shape table the generator reads: one `P` line per distinct shape a field
 +   site observed, printed once, with the prototype it belongs to and its ordered
 +   property list. A site's `shape%d=` entry carries the table index instead of a
@@ -101,7 +104,7 @@ until a unit declares one).
 +        if (!sh->aot_prof_seen)
 +            continue;
 +        sh->aot_prof_id = (uint16_t)id;
-+        fprintf(f, "P %d proto=", id);
++        fprintf(f, "Q %d proto=", id);
 +        if (sh->proto == NULL) {
 +            fprintf(f, "null");
 +        } else {
@@ -159,7 +162,7 @@ until a unit declares one).
 +    }
 +}
 +
-@@ -63612,0 +63717,8 @@
+@@ -63612,0 +63718,8 @@
 +    {
 +        /* A context is needed only to name atoms; the dump runs at teardown, when
 +           the runtime's contexts are still alive. */
@@ -168,7 +171,7 @@ until a unit declares one).
 +                              : list_entry(rt->context_list.next, JSContext, link);
 +        aot_dump_shapes(f, rt, ctx0);
 +    }
-@@ -63622,0 +63735,21 @@
+@@ -63622,0 +63736,21 @@
 +    /* The site records took a reference on every shape they named (see
 +       js_aot_prof_pic): drop them now that both the table and the site lines are
 +       written, so a recorded shape's address can never have been reused. */
@@ -190,7 +193,7 @@ until a unit declares one).
 +                    }
 +        }
 +    }
-@@ -64248,0 +64382,48 @@
+@@ -64248,0 +64383,48 @@
 +
 +/* Build a contracted layout's shape chain. A temporary object of the prototype
 +   gets the fields in order through `add_property`, the same hashed transitions an
