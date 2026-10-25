@@ -8852,6 +8852,12 @@ static int e_group_layout(int g) {
   return g >= 0 && g < g_e_glay_n ? g_e_glay[g] : 0;
 }
 
+/* A group whose shape the entry does not read from the cache cells: a copied callee's
+   (set where its guard runs) and a contracted one (its layout's shape). */
+static int e_entry_skip(int g) {
+  return g_e_facts->groups[g].own || e_group_layout(g) != 0;
+}
+
 /* The byte offset of `site`'s field in a receiver of group `g`'s shape: a constant
    for a contracted group, otherwise the offset the site's cache cell holds. */
 static const Q2Func *g_e_glay_fn;
@@ -11649,13 +11655,16 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
          last passed for this bytecode. */
       int ngu = 0, npci = 0, gi, qq;
       for (g = 0; g < ng; g++)
-        if (g_e_group_used[g] && !g_e_facts->groups[g].own) ngu++;
+        if (g_e_group_used[g] && !e_entry_skip(g)) ngu++;
       for (g = 0; g < ng; g++) {
         const EGroup *gr = &g_e_facts->groups[g];
-        if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
+        if (!g_e_group_used[g] || e_entry_skip(g)) continue;
         for (qq = 0; qq < gr->nsites; qq++)
           if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2) npci++;
       }
+      for (g = 0; g < ng; g++)
+        if (g_e_group_used[g] && !g_e_facts->groups[g].own && e_group_layout(g) != 0)
+          fprintf(f, "    const void *gsh%d;\n", g);
       g_e_epoch_skip = ngu > 0 && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
       if (ngu > 0) {
         int gk = 0, pk = 0;
@@ -11666,10 +11675,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
             ngu, npci > 0 ? npci : 1);
         for (g = 0; g < ng; g++)
-          if (g_e_group_used[g] && !g_e_facts->groups[g].own) fprintf(f, "    const void *gsh%d;\n", g);
+          if (g_e_group_used[g] && !e_entry_skip(g)) fprintf(f, "    const void *gsh%d;\n", g);
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
-          if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
+          if (!g_e_group_used[g] || e_entry_skip(g)) continue;
           for (qq = 0; qq < gr->nsites; qq++)
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
               fprintf(f, "    int pci%d;\n", gr->sites[qq]);
@@ -11677,7 +11686,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
         for (g = 0, gk = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
-          if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
+          if (!g_e_group_used[g] || e_entry_skip(g)) continue;
           fprintf(f, "      gsh%d = e_vg[%d];\n", g, gk++);
           for (qq = 0; qq < gr->nsites; qq++)
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
@@ -11688,7 +11697,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       }
       for (g = 0; g < ng; g++) {
       const EGroup *gr = &g_e_facts->groups[g];
-      if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
+      if (!g_e_group_used[g] || e_entry_skip(g)) continue;
       /* The shape is the first filled cell among the group's sites. */
       fprintf(f, "    gsh%d = NULL;\n", g);
       for (q = 0; q < gr->nsites; q++)
@@ -11741,7 +11750,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         int gk = 0, pk = 0;
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
-          if (!g_e_group_used[g] || g_e_facts->groups[g].own) continue;
+          if (!g_e_group_used[g] || e_entry_skip(g)) continue;
           fprintf(f, "      e_vg[%d] = gsh%d;\n", gk++, g);
           for (qq = 0; qq < gr->nsites; qq++)
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
