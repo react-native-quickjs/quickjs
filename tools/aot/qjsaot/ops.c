@@ -8008,6 +8008,25 @@ static int emit_group_this_read(
   return 1;
 }
 
+/* The hit test of a plain (ungrouped) field read: a contracted site compares its
+   layout's shape and loads a constant slot; any other reads through the PIC. */
+int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
+static void e_fprint_hit(FILE *f, const Q2Func *fn, const char *ind, const char *recv,
+                         int site, const char *out) {
+  int osite = 0, lay = 0, slot = 0;
+  const uint8_t *dg = e_site_dg(fn, site, &osite);
+  if (dg != NULL && qjs_aot_layout_site(dg, osite, &lay, &slot))
+    fprintf(f,
+            "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_cslot_hit_lz(%s, %du, %du, "
+            "%s, Q2_LZ), 1)) {\n",
+            ind, recv, lay, slot, out);
+  else
+    fprintf(f,
+            "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+            "%s, %d, (int)q2_ns, %s), 1)) {\n",
+            ind, recv, site, out);
+}
+
 static int emit_typed_this_field(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -8046,12 +8065,14 @@ static int emit_typed_this_field(
         "0)) goto vx_%d;\n"
         "    { JSValue _t = this_obj, _v;\n"
         "      v%u = _t;\n"
-        "      AOT_SET_B(ctx, fr, %d, _t);\n"
-        "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, "
-        "holders, _t, %d, (int)q2_ns, &_v), 1)) {\n"
+        "      AOT_SET_B(ctx, fr, %d, _t);\n",
+        in->pc, (unsigned)rv, rreg * 16);
+    e_fprint_hit(f, fn, "      ", "_t", site, "&_v");
+    fprintf(
+        f,
         "        v%u = _v;\n"
         "      } else {\n",
-        in->pc, (unsigned)rv, rreg * 16, site, (unsigned)fv);
+        (unsigned)fv);
     if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
     fprintf(f, "      }\n    }\n");
     if (cur != NULL) {
@@ -8073,11 +8094,7 @@ static int emit_typed_this_field(
      wrapper reads if the hit below misses. */
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
   fprintf(f, "      AOT_SET_B(ctx, fr, %d, _t);\n", rreg * 16);
-  fprintf(
-      f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
-      "_t, %d, (int)q2_ns, &_v), 1)) {\n",
-      site);
+  e_fprint_hit(f, fn, "      ", "_t", site, "&_v");
   fprintf(f, "        v%u = _v;\n", (unsigned)fv);
   /* The hit keeps `this`: an owned one is adopted by its frame slot, as the
      generic body's load_this does (the slot already holds it borrowed). The miss
@@ -8158,20 +8175,12 @@ static int emit_typed_field_chain(
   if (!e_fl_site_ok(fn, in, s1) || !e_fl_site_ok(fn, in, s2)) return 0;
   fprintf(f, "    { JSValue _c0, _c1;\n");
   fprintf(f, "      JSValue _rcv = v%u;\n", (unsigned)rv);
-  fprintf(
-      f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
-      "_rcv, %d, (int)q2_ns, &_c0), 1)) {\n",
-      s1);
+  e_fprint_hit(f, fn, "      ", "_rcv", s1, "&_c0");
   /* Link 1's result goes to its local; the frame slot is written too, because a
      link-2 miss hands the WHOLE instruction to the wrapper. */
   fprintf(f, "        v%u = _c0;\n", (unsigned)d0v);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _c0);\n", d0reg * 16);
-  fprintf(
-      f,
-      "        if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
-      "_c0, %d, (int)q2_ns, &_c1), 1)) {\n",
-      s2);
+  e_fprint_hit(f, fn, "        ", "_c0", s2, "&_c1");
   fprintf(f, "          v%u = _c1;\n", (unsigned)d1v);
   fprintf(f, "        } else {\n");
   /* Link 2 missed: restore the receiver and hand the whole instruction over. */
