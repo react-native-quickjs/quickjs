@@ -79,6 +79,10 @@ int qjs_aot_prof_site(
     const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_proto(const uint8_t dg[16], int site);
+int qjs_aot_prof_site_slots(const uint8_t dg[16], int site, int nshapes, int *slots,
+                            int cap);
+const void *qjs_aot_prof_shape(int id, int *proto, char *digest, int *nfields,
+                               const char ***fields, unsigned **flags);
 int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);

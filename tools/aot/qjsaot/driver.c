@@ -175,10 +175,36 @@ typedef struct {
   int site;
   int nshapes;
   uint64_t shape[PROF_MAX_SHAPES];
+  /* The slot each shape put this site's atom in, or -1 when the profile did not
+     say. Two shapes with the same slot share the field's offset, which is what
+     lets a contracted site read one constant slot; different slots need a switch
+     on the layout. */
+  int slot[PROF_MAX_SHAPES];
   /* Which cache kinds the site's fills installed, one bit per REG_PIC_* value
      (only meaningful when the header said `sitekinds=1`). */
   unsigned kinds;
 } ProfSite;
+
+/* A `Q` record: the shape table. One entry per distinct shape any field site
+   observed, with the prototype it belongs to and its ordered property list.
+   `proto` is 1 for fn:<digest> (the constructor the unit binds by), 2 for
+   Object.prototype, 3 for Array.prototype, 4 for a null prototype, and 0 for
+   anything else, which cannot be contracted. */
+#define PROF_MAX_FIELDS 32
+typedef struct {
+  int id;
+  int proto;              /* see above */
+  char digest[33];        /* proto == 1 */
+  int nfields;
+  char *field[PROF_MAX_FIELDS];  /* the atom, by name */
+  unsigned flags[PROF_MAX_FIELDS];
+} ProfShape;
+
+/* The shape table: the `Q` records describe shapes, which belong to no one
+   function, so they are collected once for the whole profile rather than per
+   function entry. */
+static ProfShape *g_shapes;
+static int g_nshapes, g_capshapes;
 
 /* A `U` record: a pc range the profiler never saw executed, inclusive. */
 typedef struct {
@@ -444,6 +470,57 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   while (fgets(line, sizeof(line), f)) {
     uint8_t dg[16];
     ProfEntry *e;
+    /* The `Q` records are the shape table: they name a shape by a decimal table
+       index, not by a function digest, so they are read before the
+       per-function filter below -- which needs a hex digest and would drop
+       them. The table belongs to no one function, so it is collected globally. */
+    if (line[0] == 'Q' && line[1] == ' ') {
+      char *pp = strstr(line + 2, "proto=");
+      if (pp != NULL) {
+        ProfShape *sh;
+        int id = (int)strtol(line + 2, NULL, 10);
+        const char *pr = pp + 6;
+        int k;
+        if (g_nshapes == g_capshapes) {
+          ProfShape *ns;
+          g_capshapes = g_capshapes ? g_capshapes * 2 : 64;
+          ns = realloc(g_shapes, sizeof(*ns) * (size_t)g_capshapes);
+          if (!ns) return NULL;
+          g_shapes = ns;
+        }
+        sh = &g_shapes[g_nshapes++];
+        memset(sh, 0, sizeof(*sh));
+        sh->id = id;
+        if (strncmp(pr, "fn:", 3) == 0) {
+          sh->proto = 1;
+          for (k = 0; k < 32 && pr[3 + k] != '\0' && pr[3 + k] != ' '; k++)
+            sh->digest[k] = pr[3 + k];
+          sh->digest[k] = '\0';
+        } else if (strncmp(pr, "object", 6) == 0) sh->proto = 2;
+        else if (strncmp(pr, "array", 5) == 0) sh->proto = 3;
+        else if (strncmp(pr, "null", 4) == 0) sh->proto = 4;
+        else sh->proto = 0;
+        {
+          char *pf = strstr(line + 2, " props=");
+          if (pf != NULL) {
+            char *q = pf + 7;
+            while (*q != '\0' && *q != '\n' && sh->nfields < PROF_MAX_FIELDS) {
+              char *colon = strchr(q, ':');
+              char *comma;
+              if (colon == NULL) break;
+              comma = strchr(colon, ',');
+              *colon = '\0';
+              sh->field[sh->nfields] = strdup(q);
+              sh->flags[sh->nfields] = (unsigned)strtoul(colon + 1, NULL, 10);
+              sh->nfields++;
+              if (comma == NULL) break;
+              q = comma + 1;
+            }
+          }
+        }
+      }
+      continue;
+    }
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
          line[0] != 'P' && line[0] != 'S' && line[0] != 'U' && line[0] != 'T' &&
          line[0] != 'K') ||
@@ -730,11 +807,22 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           snprintf(key, sizeof(key), "shape%d=", k);
           s = strstr(line + 2, key);
           if (!s) continue;
-          sh = strtoull(s + strlen(key), NULL, 16);
+          /* Decimal: the dump prints a TABLE INDEX, not an address. It was base
+             16 while the record held an address, and reading an index as hex
+             silently mapped every site to the wrong shape. */
+          sh = strtoull(s + strlen(key), NULL, 10);
           for (j = 0; j < ps->nshapes; j++)
             if (ps->shape[j] == sh) break;
           if (j < ps->nshapes) continue;
-          if (ps->nshapes < PROF_MAX_SHAPES) ps->shape[ps->nshapes++] = sh;
+          if (ps->nshapes < PROF_MAX_SHAPES) {
+            char skey[24];
+            char *ss;
+            ps->slot[ps->nshapes] = -1;
+            snprintf(skey, sizeof(skey), "slot%d=", k);
+            ss = strstr(line + 2, skey);
+            if (ss) ps->slot[ps->nshapes] = (int)strtol(ss + strlen(skey), NULL, 10);
+            ps->shape[ps->nshapes++] = sh;
+          }
         }
       }
     } else if (line[0] == 'T') {
@@ -1089,6 +1177,171 @@ int qjs_aot_prof_site(
     if (e->sites[i].site != site) continue;
     *nshapes = e->sites[i].nshapes;
     for (k = 0; k < PROF_MAX_SHAPES; k++) shapes[k] = e->sites[i].shape[k];
+    return 1;
+  }
+  return 0;
+}
+
+/* The slot each observed shape put this site's atom in, -1 when the profile did
+   not record one. Two shapes with the same slot give a contracted site one
+   constant offset, which is what lets a polymorphic site read a single slot. */
+/* The shape table entry for a table index, or NULL. The fields are the shape's
+   ordered property names and flags; `proto` says whether the unit can find the
+   prototype at run time (1 = a constructor digest, 2 = Object.prototype). */
+/* The table entry for a shape id, or NULL. */
+static const ProfShape *prof_shape_by_id(int id) {
+  int i;
+  if (g_shapes == NULL) return NULL;
+  for (i = 0; i < g_nshapes; i++)
+    if (g_shapes[i].id == id) return &g_shapes[i];
+  return NULL;
+}
+
+/* ---- contracted layouts ------------------------------------------------
+   A candidate layout is one shape of the shape table that a monomorphic own-slot
+   site saw, provided the unit can find its prototype at run time: a constructor
+   digest (`fn:<digest>`) or Object.prototype. `array`, `null` and `other:` are
+   refused with a reason, because the chain could not be rebuilt against the same
+   prototype.
+
+   A layout whose field list is a strict PREFIX of another candidate with the same
+   prototype is refused too: an instance of the longer layout passes through the
+   shorter one's final shape while it is being constructed, so it would break the
+   shorter contract on arrival and never use it. Literals `{x,y}` and `{x,y,z}`
+   are the common case. */
+#define E_LAYOUT_MAX 63
+typedef struct ELayoutInfo {
+  int shape_id;
+  int proto;              /* 1 = fn:<digest>, 2 = Object.prototype */
+  char digest[33];
+  int nfields;
+} ELayoutInfo;
+
+/* Gather the candidate layouts from the profile's shape table, dropping the ones
+   the unit could not rebuild and the ones a longer layout shadows. Returns the
+   number kept, in `out` (at most E_LAYOUT_MAX), and reports the refusals. */
+int e_layouts_collect(ELayoutInfo *out, int cap) {
+  int i, j, n = 0, nproto = 0, nprefix = 0;
+  if (g_prof == NULL || g_shapes == NULL) return 0;
+  for (i = 0; i < g_nshapes && n < cap; i++) {
+    const ProfShape *sh = &g_shapes[i];
+    int used = 0, f, k;
+    /* Only a shape some monomorphic own-slot site actually reads. The sites are
+       per function, so every entry of the profile is searched, not just the
+       first. */
+    for (f = 0; f < g_nprof && !used; f++) {
+      const ProfEntry *pe = &g_prof[f];
+      if (pe->sites == NULL) continue;
+      for (k = 0; k < pe->nsites; k++) {
+        const ProfSite *ps = &pe->sites[k];
+        if (ps->nshapes == 1 && ps->shape[0] == (uint64_t)sh->id) {
+          used = 1;
+          break;
+        }
+      }
+    }
+    if (!used) continue;
+    if (sh->proto != 1 && sh->proto != 2) {
+      nproto++;
+      continue;
+    }
+    if (sh->nfields <= 0 || sh->nfields > PROF_MAX_FIELDS) continue;
+    out[n].shape_id = sh->id;
+    out[n].proto = sh->proto;
+    memcpy(out[n].digest, sh->digest, sizeof(out[n].digest));
+    out[n].nfields = sh->nfields;
+    n++;
+  }
+  /* The prefix refusal: a candidate whose field list is a strict prefix of
+     another candidate's, with the same prototype, cannot be contracted -- an
+     instance of the longer layout passes through the shorter one's final shape
+     while it is constructed, so it would break the shorter contract at once.
+     Marked first, then compacted, so one candidate's removal cannot shift
+     another out from under the scan. */
+  {
+    int *drop = calloc((size_t)(n > 0 ? n : 1), sizeof(*drop));
+    int kept = 0;
+    if (drop == NULL) return n;
+    for (i = 0; i < n; i++) {
+      for (j = 0; j < n; j++) {
+        const ProfShape *a, *b;
+        int f, same = 1;
+        if (i == j) continue;
+        a = prof_shape_by_id(out[i].shape_id);
+        b = prof_shape_by_id(out[j].shape_id);
+        if (a == NULL || b == NULL) continue;
+        if (a->proto != b->proto) continue;
+        if (b->nfields <= a->nfields) continue;
+        for (f = 0; f < a->nfields; f++)
+          if (a->field[f] == NULL || b->field[f] == NULL ||
+              strcmp(a->field[f], b->field[f]) != 0) {
+            same = 0;
+            break;
+          }
+        if (same) {
+          drop[i] = 1;
+          break;
+        }
+      }
+    }
+    for (i = 0; i < n; i++) {
+      if (drop[i]) {
+        nprefix++;
+        continue;
+      }
+      out[kept++] = out[i];
+    }
+    n = kept;
+    free(drop);
+  }
+  if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
+    fprintf(stderr, "layout census: kept=%d proto-refused=%d prefix-refused=%d\n",
+            n, nproto, nprefix);
+  return n;
+}
+
+/* The layout census, for the report: the candidates the profile supports. */
+int qjs_aot_layout_census(void) {
+  ELayoutInfo tmp[E_LAYOUT_MAX];
+  return e_layouts_collect(tmp, E_LAYOUT_MAX);
+}
+
+/* The same candidates, handed to the emitter. Two entry points rather than one so
+   the census can report without the emitter having to run. */
+int qjs_aot_layout_export(ELayoutInfo *out, int cap) {
+  return e_layouts_collect(out, cap);
+}
+
+const void *qjs_aot_prof_shape(int id, int *proto, char *digest, int *nfields,
+                               const char ***fields, unsigned **flags) {
+  int i;
+  if (g_shapes == NULL) return NULL;
+  for (i = 0; i < g_nshapes; i++) {
+    const ProfShape *sh = &g_shapes[i];
+    if (sh->id != id) continue;
+    if (proto) *proto = sh->proto;
+    if (digest) {
+      int k;
+      for (k = 0; k < 32 && sh->digest[k]; k++) digest[k] = sh->digest[k];
+      digest[k] = 0;
+    }
+    if (nfields) *nfields = sh->nfields;
+    if (fields) *fields = (const char **)sh->field;
+    if (flags) *flags = (unsigned *)sh->flags;
+    return sh;
+  }
+  return NULL;
+}
+
+int qjs_aot_prof_site_slots(const uint8_t dg[16], int site, int nshapes, int *slots,
+                            int cap) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k;
+  if (!e) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    if (e->sites[i].site != site) continue;
+    if (e->sites[i].nshapes != nshapes) return 0;
+    for (k = 0; k < nshapes && k < cap; k++) slots[k] = e->sites[i].slot[k];
     return 1;
   }
   return 0;
@@ -1589,6 +1842,18 @@ int qjsaot_driver_main(int argc, char **argv) {
     }
     g_prof = prof;
     g_nprof = nprof;
+    if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL) {
+      ELayoutInfo *cand = calloc(E_LAYOUT_MAX, sizeof(*cand));
+      int nc = cand != NULL ? e_layouts_collect(cand, E_LAYOUT_MAX) : 0;
+      int ci;
+      fprintf(stderr, "qjsaot: layout candidates=%d\n", nc);
+      for (ci = 0; ci < nc; ci++)
+        fprintf(stderr, "qjsaot:   layout shape=%d proto=%s%s fields=%d\n",
+                cand[ci].shape_id, cand[ci].proto == 1 ? "fn:" : "",
+                cand[ci].proto == 1 ? cand[ci].digest : "object",
+                cand[ci].nfields);
+      free(cand);
+    }
     print_census(funcs, nfuncs, prof, nprof);
   }
 
@@ -4535,13 +4800,48 @@ int qjsaot_driver_main(int argc, char **argv) {
        shape still held here would keep its whole object graph reachable. The
        runtime that filled the caches is recorded on the first fill, so a second
        runtime only ever runs the full checks and never frees against the first. */
-    /* The contracted-layout table. Empty until K2 emits layouts; the array and
-       the count exist so the release path and the exported offsets are the same
-       in every unit. */
-    fprintf(
-        f,
-        "static void *q2_layout_shape[1];\n"
-        "static const uint32_t q2_layout_count = 0;\n");
+    /* The contracted-layout table: one row per layout, carrying the prototype to
+       build the chain against, the ordered field names, and (once built) the
+       shape the chain ends. The release hook walks the shape array. */
+    {
+      extern int qjs_aot_layout_census(void);
+      extern int qjs_aot_layout_export(ELayoutInfo *out, int cap);
+      extern const void *qjs_aot_prof_shape(int id, int *proto, char *digest,
+                                            int *nfields, const char ***fields,
+                                            unsigned **flags);
+      ELayoutInfo *cand = calloc(E_LAYOUT_MAX, sizeof(*cand));
+      int nc = cand != NULL ? qjs_aot_layout_export(cand, E_LAYOUT_MAX) : 0;
+      int li;
+      fprintf(f,
+              "#define Q2_LAYOUT_COUNT %du\n"
+              "static void *q2_layout_shape[Q2_LAYOUT_COUNT + 1u];\n"
+              "static const uint32_t q2_layout_count = Q2_LAYOUT_COUNT;\n",
+              nc);
+      if (nc > 0) {
+        fprintf(f, "static const char *const q2_layout_fields[Q2_LAYOUT_COUNT][%d] = {\n",
+                PROF_MAX_FIELDS);
+        for (li = 0; li < nc; li++) {
+          const char **fld = NULL;
+          unsigned *flg = NULL;
+          int nf = 0, fi;
+          qjs_aot_prof_shape(cand[li].shape_id, NULL, NULL, &nf, &fld, &flg);
+          fprintf(f, "  {");
+          for (fi = 0; fi < nf; fi++)
+            fprintf(f, "%s\"%s\"", fi ? "," : "", fld[fi] != NULL ? fld[fi] : "");
+          fprintf(f, "},\n");
+        }
+        fprintf(f, "};\n");
+        fprintf(f, "static const uint32_t q2_layout_nfields[Q2_LAYOUT_COUNT] = {");
+        for (li = 0; li < nc; li++)
+          fprintf(f, "%s%du", li ? "," : "", (unsigned)cand[li].nfields);
+        fprintf(f, "};\n");
+        fprintf(f, "static const int q2_layout_proto[Q2_LAYOUT_COUNT] = {");
+        for (li = 0; li < nc; li++)
+          fprintf(f, "%s%d", li ? "," : "", cand[li].proto);
+        fprintf(f, "};\n");
+      }
+      free(cand);
+    }
     fprintf(
         f,
         "static JSRuntime *q2_owner_rt;\n"
