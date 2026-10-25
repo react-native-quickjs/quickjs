@@ -1683,6 +1683,8 @@ typedef struct JSAotProfPc {
     uint8_t packed_kinds;  /* AOT_PK_*: the storage kinds of the arrays seen at this element pc */
     uint16_t alloc_props;  /* final property count at an allocation pc */
     uint16_t ta_classes;   /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here */
+    uint8_t rmulti;        /* objects of more than one shape were defined here */
+    JSShape *rshape;       /* the shape of the objects defined here (referenced until the dump) */
     double num_min;
     double num_max;
 } JSAotProfPc;
@@ -63121,6 +63123,15 @@ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
         JSAotProfPc *e = &pf->pcs[pc];
 
         e->types |= bit;
+        if (bit == AOT_TYPE_OBJECT) {
+            JSShape *rsh = JS_VALUE_GET_OBJ(v)->shape;
+            if (e->rshape == NULL && !e->rmulti) {
+                e->rshape = js_dup_shape(rsh);
+                rsh->aot_prof_seen = 1;
+            } else if (e->rshape != rsh) {
+                e->rmulti = 1;
+            }
+        }
         if (bit == AOT_TYPE_INT) {
             double d = (double)JS_VALUE_GET_INT(v);
 
@@ -63413,6 +63424,12 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
     if (!pf)
         return;
     js_free_rt(rt, pf->loop_iters);
+    if (pf->pcs != NULL) {
+        int pi;
+        for (pi = 0; pi < pf->pc_n; pi++)
+            if (pf->pcs[pi].rshape != NULL)
+                js_free_shape(rt, pf->pcs[pi].rshape);
+    }
     js_free_rt(rt, pf->pcs);
     js_free_rt(rt, pf->cov);
     js_free_rt(rt, pf->br_taken);
@@ -63709,8 +63726,8 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
         if (!s->count)
             continue;
         aot_src_str(b, s->pc, src, sizeof(src));
-        fprintf(f, "S %s site=%d count=%u src=%s kinds=%u shapes=%u", dgt, i,
-                s->count, src, s->kinds, s->nshapes);
+        fprintf(f, "S %s site=%d count=%u src=%s kinds=%u pc=%d shapes=%u", dgt, i,
+                s->count, src, s->kinds, (int)s->pc, s->nshapes);
         for (j = 0; j < s->nshapes; j++)
             /* The table index: safe to read because the site holds a reference
                on the shape, so it is alive and its id was assigned by the walk
@@ -63719,6 +63736,13 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
                     s->shapes[j] != NULL ? (unsigned)s->shapes[j]->aot_prof_id : 0u,
                     s->shape_hits[j], j, (int)s->shape_slots[j]);
         fputc('\n', f);
+    }
+    for (i = 0; i < pf->pc_n; i++) {
+        JSAotProfPc *e = &pf->pcs[i];
+        if (e->rshape == NULL && !e->rmulti)
+            continue;
+        fprintf(f, "W %s pc=%d rshape=%d rmulti=%u\n", dgt, i,
+                e->rshape != NULL ? (int)e->rshape->aot_prof_id : -1, (unsigned)e->rmulti);
     }
     for (i = 0; i < pf->ncalls; i++) {
         JSAotProfCall *c = &pf->calls[i];
@@ -63893,6 +63917,11 @@ void js_aot_prof_dump(JSRuntime *rt)
                         js_free_shape(rt, pf->sites[si].shapes[sj]);
                         pf->sites[si].shapes[sj] = NULL;
                     }
+            for (si = 0; si < pf->pc_n; si++)
+                if (pf->pcs[si].rshape != NULL) {
+                    js_free_shape(rt, pf->pcs[si].rshape);
+                    pf->pcs[si].rshape = NULL;
+                }
         }
     }
     if (f != stderr)

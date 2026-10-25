@@ -183,7 +183,18 @@ typedef struct {
   /* Which cache kinds the site's fills installed, one bit per REG_PIC_* value
      (only meaningful when the header said `sitekinds=1`). */
   unsigned kinds;
+  /* The regvm offset of the op that first filled the site, or -1. */
+  int pc;
 } ProfSite;
+
+/* A `W` record: the shape of the objects the instruction at `pc` defined, as a
+   shape table index, or -1 when it never defined an object; `multi` when it
+   defined objects of more than one shape. */
+typedef struct {
+  int pc;
+  int shape;
+  int multi;
+} ProfRes;
 
 /* A `Q` record: the shape table. One entry per distinct shape any field site
    observed, with the prototype it belongs to and its ordered property list.
@@ -231,6 +242,8 @@ typedef struct {
   int ncres, capcres;
   ProfSite *sites;
   int nsites, capsites;
+  ProfRes *res;
+  int nres, capres;
   ProfUnused *unused;
   int nunused, capunused;
   /* The `T` records: sampler hits by pc, kept as the per-instruction execution
@@ -534,7 +547,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
     }
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
          line[0] != 'P' && line[0] != 'S' && line[0] != 'U' && line[0] != 'T' &&
-         line[0] != 'K') ||
+         line[0] != 'K' && line[0] != 'W') ||
         line[1] != ' ')
       continue;
     if (hex_to_bytes16(line + 2, dg) < 0) continue;
@@ -806,6 +819,11 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           ps = &e->sites[e->nsites++];
           memset(ps, 0, sizeof(*ps));
           ps->site = site;
+          ps->pc = -1;
+        }
+        {
+          const char *pp = strstr(line + 2, " pc=");
+          if (pp) ps->pc = (int)strtol(pp + 4, NULL, 10);
         }
         {
           const char *kd = strstr(line + 2, "kinds=");
@@ -834,6 +852,39 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
             if (ss) ps->slot[ps->nshapes] = (int)strtol(ss + strlen(skey), NULL, 10);
             ps->shape[ps->nshapes++] = sh;
           }
+        }
+      }
+    } else if (line[0] == 'W') {
+      /* W <hex> pc=<n> rshape=<id> rmulti=<0|1>: merged by pc; two records
+         that disagree on the shape count as several shapes. */
+      char *p = strstr(line + 2, "pc=");
+      char *q = strstr(line + 2, "rshape=");
+      char *m = strstr(line + 2, "rmulti=");
+      if (p && q && m) {
+        int pc = (int)strtol(p + 3, NULL, 10);
+        int sh = (int)strtol(q + 7, NULL, 10);
+        int multi = (int)strtol(m + 7, NULL, 10) != 0;
+        int k;
+        for (k = 0; k < e->nres; k++)
+          if (e->res[k].pc == pc) break;
+        if (k == e->nres) {
+          if (e->nres == e->capres) {
+            ProfRes *nr;
+            e->capres = e->capres ? e->capres * 2 : 16;
+            nr = realloc(e->res, sizeof(*nr) * (size_t)e->capres);
+            if (!nr) return NULL;
+            e->res = nr;
+          }
+          e->nres++;
+          e->res[k].pc = pc;
+          e->res[k].shape = sh;
+          e->res[k].multi = multi;
+        } else {
+          if (e->res[k].shape != sh) {
+            if (e->res[k].shape < 0) e->res[k].shape = sh;
+            else if (sh >= 0) e->res[k].multi = 1;
+          }
+          if (multi) e->res[k].multi = 1;
         }
       }
     } else if (line[0] == 'T') {

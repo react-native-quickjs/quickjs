@@ -1,0 +1,60 @@
+Subject: The profile records the shape of the objects each instruction defined
+
+What this does
+  - Each profiled instruction remembers the shape of the objects it defined (one reference, until
+    the dump) and whether it defined objects of more than one shape.
+  - The dump prints a `W <digest> pc=<n> rshape=<id> rmulti=<0|1>` line per such instruction, and
+    the `S` lines now carry the pc of the op that first filled the site.
+
+Why we need it
+  The generator promises what a field of a contracted layout holds only if every read of that field
+  agreed on one layout. A read's site names the field; the shape of what the read produced says what
+  the field held.
+
+Functions touched
+  `js_aot_prof_reg` (records the shape), `aot_dump_one` (writes `W` lines, drops the
+  references), `js_aot_prof_free`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1685,0 +1686,2 @@
++    uint8_t rmulti;        /* objects of more than one shape were defined here */
++    JSShape *rshape;       /* the shape of the objects defined here (referenced until the dump) */
+@@ -63123,0 +63126,9 @@
++        if (bit == AOT_TYPE_OBJECT) {
++            JSShape *rsh = JS_VALUE_GET_OBJ(v)->shape;
++            if (e->rshape == NULL && !e->rmulti) {
++                e->rshape = js_dup_shape(rsh);
++                rsh->aot_prof_seen = 1;
++            } else if (e->rshape != rsh) {
++                e->rmulti = 1;
++            }
++        }
+@@ -63415,0 +63427,6 @@
++    if (pf->pcs != NULL) {
++        int pi;
++        for (pi = 0; pi < pf->pc_n; pi++)
++            if (pf->pcs[pi].rshape != NULL)
++                js_free_shape(rt, pf->pcs[pi].rshape);
++    }
+@@ -63712,2 +63729,2 @@
+-        fprintf(f, "S %s site=%d count=%u src=%s kinds=%u shapes=%u", dgt, i,
+-                s->count, src, s->kinds, s->nshapes);
++        fprintf(f, "S %s site=%d count=%u src=%s kinds=%u pc=%d shapes=%u", dgt, i,
++                s->count, src, s->kinds, (int)s->pc, s->nshapes);
+@@ -63722,0 +63740,7 @@
++    for (i = 0; i < pf->pc_n; i++) {
++        JSAotProfPc *e = &pf->pcs[i];
++        if (e->rshape == NULL && !e->rmulti)
++            continue;
++        fprintf(f, "W %s pc=%d rshape=%d rmulti=%u\n", dgt, i,
++                e->rshape != NULL ? (int)e->rshape->aot_prof_id : -1, (unsigned)e->rmulti);
++    }
+@@ -63895,0 +63920,5 @@
++            for (si = 0; si < pf->pc_n; si++)
++                if (pf->pcs[si].rshape != NULL) {
++                    js_free_shape(rt, pf->pcs[si].rshape);
++                    pf->pcs[si].rshape = NULL;
++                }
