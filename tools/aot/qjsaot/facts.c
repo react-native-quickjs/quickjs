@@ -877,23 +877,33 @@ static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int group
 }
 
 int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
-/* The contracted layout every site of a group reads as an own data property, or 0. The emitter
-   decides the same way (see e_compute_group_layouts). */
-static int group_layout(const Q2Func *fn, const EFacts *f, int g) {
+/* The contracted layout a group's shape is, or 0. Every own site of the group must be an own data
+   access of the one layout (the group's sites all saw one shape, so a prototype read in it is a
+   read of an object in that layout too). `*pure` is set when no site is a prototype read: the
+   group is then contracted outright and consults no cache cell. The emitter decides the same way
+   (see e_compute_group_layouts). */
+int e_facts_group_layout(const Q2Func *fn, const EFacts *f, int g, int *pure) {
   const EGroup *gr;
-  int q, lay = 0;
+  int q, lay = 0, nproto = 0;
+  if (pure != NULL) *pure = 0;
   if (g < 0 || g >= f->ngroups) return 0;
   gr = &f->groups[g];
   if (gr->own || gr->nsites <= 0 || getenv("QJS_AOT_NOCONTRACT") != NULL) return 0;
   for (q = 0; q < gr->nsites; q++) {
     int osite, l = 0, sl = 0;
     const uint8_t *dg = e_site_dg(fn, gr->sites[q], &osite);
-    if (e_facts_site_proto(f, gr->sites[q]) != 0 || !qjs_aot_layout_site(dg, osite, &l, &sl) ||
-        (lay != 0 && lay != l))
-      return 0;
+    if (e_facts_site_proto(f, gr->sites[q]) != 0) {
+      nproto++;
+      continue;
+    }
+    if (!qjs_aot_layout_site(dg, osite, &l, &sl) || (lay != 0 && lay != l)) return 0;
     lay = l;
   }
+  if (pure != NULL) *pure = lay != 0 && nproto == 0;
   return lay;
+}
+static int group_layout(const Q2Func *fn, const EFacts *f, int g) {
+  return e_facts_group_layout(fn, f, g, NULL);
 }
 
 static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,

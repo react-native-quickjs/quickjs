@@ -226,6 +226,7 @@ int e_facts_poly_op(const Q2Insn *in);void e_facts_free(EFacts *f);
 int e_facts_site_group(const EFacts *f, int site);
 /* Whether a site is a prototype-read site of its group. */
 int e_facts_site_proto(const EFacts *f, int site);
+int e_facts_group_layout(const Q2Func *fn, const EFacts *f, int g, int *pure);
 
 /* ---- representations ---------------------------------------------------- */
 

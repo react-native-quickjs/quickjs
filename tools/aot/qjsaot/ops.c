@@ -8938,14 +8938,17 @@ static const char *e_cellidx(char *buf, size_t n, int site) {
    body, before any access is emitted. */
 int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
 static int *g_e_glay;
+static int *g_e_gret; /* per group: the layout its shape equals, though it reads prototype sites too */
 static int g_e_glay_n;
 
 static void e_compute_group_layouts(const Q2Func *fn, int ng) {
   int g, q;
   free(g_e_glay);
+  free(g_e_gret);
   g_e_glay = calloc((size_t)(ng > 0 ? ng : 1), sizeof(*g_e_glay));
-  g_e_glay_n = g_e_glay != NULL ? ng : 0;
-  if (g_e_glay == NULL || g_e_facts == NULL || getenv("QJS_AOT_NOCONTRACT") != NULL) return;
+  g_e_gret = calloc((size_t)(ng > 0 ? ng : 1), sizeof(*g_e_gret));
+  g_e_glay_n = g_e_glay != NULL && g_e_gret != NULL ? ng : 0;
+  if (g_e_glay == NULL || g_e_gret == NULL || g_e_facts == NULL || getenv("QJS_AOT_NOCONTRACT") != NULL) return;
   for (g = 0; g < ng; g++) {
     const EGroup *gr = &g_e_facts->groups[g];
     int lay = 0;
@@ -8961,6 +8964,10 @@ static void e_compute_group_layouts(const Q2Func *fn, int ng) {
       lay = l;
     }
     g_e_glay[g] = lay;
+    if (lay == 0) {
+      int pure = 0, rl = e_facts_group_layout(fn, g_e_facts, g, &pure);
+      if (rl != 0 && !pure) g_e_gret[g] = rl;
+    }
     if (lay != 0 && getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
       fprintf(stderr, "qjsaot: group %d contracted to layout %d (%d sites)\n", g, lay, gr->nsites);
   }
@@ -8968,6 +8975,9 @@ static void e_compute_group_layouts(const Q2Func *fn, int ng) {
 
 static int e_group_layout(int g) {
   return g >= 0 && g < g_e_glay_n ? g_e_glay[g] : 0;
+}
+static int e_group_ret(int g) {
+  return g >= 0 && g < g_e_glay_n ? g_e_gret[g] : 0;
 }
 
 /* A group whose shape the entry does not read from the cache cells: a copied callee's
@@ -11898,6 +11908,15 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               gr->sites[q], fi, gen0);
         }
       }
+      /* A shape kept across calls on the strength of its layout must be that layout's. */
+      if (e_group_ret(g) != 0)
+        fprintf(
+            f,
+            "    if (__builtin_expect(gsh%d != E_NO_SHAPE && gsh%d != (const void *)q2_layout_shape[%d], 0)) {\n"
+            "        E_REFUSE_NOTE(%d);\n"
+            "        return %s;\n"
+            "    }\n",
+            g, g, e_group_ret(g) - 1, fi, gen0);
       }
       if (ngu > 0) {
         int gk = 0, pk = 0;
