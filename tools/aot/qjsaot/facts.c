@@ -1104,13 +1104,20 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
     const Q2Block *lt = &fn->blocks[b];
     int si;
     for (si = 0; si < lt->nsucc && si < 2; si++) {
-      int h = lt->succ_block[si], sp = 0, pre = -1, npre = 0, safe = 1;
+      int h = lt->succ_block[si], sp = 0, pre = -1, npre = 0, safe = 1, callsonly = 0;
       if (h < 0 || h >= fn->nblocks || !q2_is_back_edge(fn, b, h)) continue;
       /* a loop whose back edge starts in a resumed part has no preheader on the path that enters it */
       if (lt->resume) continue;
       /* the natural loop of the back edge b -> h */
       memset(loop, 0, (size_t)fn->nblocks);
       loop[h] = 1;
+      /* every back edge to this header belongs to the one loop */
+      for (p = 0; p < fn->blocks[h].npreds; p++) {
+        int pb = fn->blocks[h].preds[p];
+        if (pb < 0 || fn->rpo_pos[pb] < 0 || loop[pb] || !q2_is_back_edge(fn, pb, h)) continue;
+        loop[pb] = 1;
+        stack[sp++] = pb;
+      }
       if (!loop[b]) {
         loop[b] = 1;
         stack[sp++] = b;
@@ -1124,6 +1131,12 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
           stack[sp++] = pb;
         }
       }
+      {
+        int z, seen = 0;
+        for (z = 0; z < out->nloops; z++)
+          if (out->loop_hdr[z] == h) seen = 1;
+        if (seen) continue;
+      }
       /* the unique outside predecessor */
       for (p = 0; p < fn->blocks[h].npreds; p++) {
         int pb = fn->blocks[h].preds[p];
@@ -1133,26 +1146,55 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
       }
       /* The check is emitted on the edge into the header, so the preheader may
          have another successor (a rotated loop is entered by a branch). */
-      if (npre != 1) continue;
-      /* no safepoint in the body */
+      if (npre != 1) {
+        if (getenv("QJS_AOT_DEBUG_LOOPS")) {
+          int z;
+          fprintf(stderr, "loop %s hdr %d npre %d preds:", fn->g->name, h, npre);
+          for (z = 0; z < fn->blocks[h].npreds; z++)
+            fprintf(stderr, " %d%s", fn->blocks[h].preds[z], loop[fn->blocks[h].preds[z]] ? "(in)" : "");
+          fprintf(stderr, " nblocks=%d resume=%d\n", fn->nblocks, fn->blocks[h].resume);
+        }
+        continue;
+      }
+      /* no safepoint in the body, or only calls: the shape facts of a contracted layout survive
+         those (see `laymask`) and nothing else does */
       for (bi = 0; bi < fn->nblocks && safe; bi++) {
         if (!loop[bi]) continue;
-        for (k = 0; k < fn->blocks[bi].ninsns; k++)
+        for (k = 0; k < fn->blocks[bi].ninsns; k++) {
+          const Q2Insn *si = &fn->insns[fn->blocks[bi].first_insn + k];
           /* Negative control: "unsafe" hoists past a safepoint. */
-          if (is_safepoint(fn, out, &fn->insns[fn->blocks[bi].first_insn + k], grouped_exit) &&
-              getenv("QJS_AOT_HOIST_CONTROL_SAFE") == NULL) {
+          if (is_safepoint(fn, out, si, grouped_exit) && getenv("QJS_AOT_HOIST_CONTROL_SAFE") == NULL) {
+            if (si->rop == ROP_call || si->rop == ROP_call_method) {
+              callsonly = 1;
+              continue;
+            }
+            if (getenv("QJS_AOT_DEBUG_LOOPS")) {
+              char nm[64];
+              e_rop_name(si->rop, nm, sizeof(nm));
+              fprintf(stderr, "loop %s hdr %d blocked by %s@%d\n", fn->g->name, h, nm, si->pc);
+            }
             safe = 0;
             break;
           }
+        }
       }
       if (!safe) continue;
+      /* a header with several back edges keeps one record, the strictest */
+      {
+        int z, dup_hdr = 0;
+        for (z = 0; z < out->nloops; z++)
+          if (out->loop_hdr[z] == h) dup_hdr = 1;
+        if (dup_hdr && callsonly) continue;
+        if (!dup_hdr && callsonly && getenv("QJS_AOT_NOCONTRACT") != NULL) continue;
+      }
       /* record the loop for the facts that survive it */
       if (out->nloops == out->loop_cap) {
         int nc = out->loop_cap ? out->loop_cap * 2 : 8;
         int *a1 = realloc(out->loop_hdr, sizeof(int) * (size_t)nc);
         int *a2 = realloc(out->loop_pre, sizeof(int) * (size_t)nc);
         uint8_t **a3 = realloc(out->loop_mem, sizeof(*a3) * (size_t)nc);
-        if (!a1 || !a2 || !a3) {
+        uint8_t *a4 = realloc(out->loop_calls, (size_t)nc);
+        if (!a1 || !a2 || !a3 || !a4) {
           free(loop);
           free(stack);
           return -1;
@@ -1160,8 +1202,11 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
         out->loop_hdr = a1;
         out->loop_pre = a2;
         out->loop_mem = a3;
+        out->loop_calls = a4;
         out->loop_cap = nc;
       }
+      out->loop_calls[out->nloops] = (uint8_t)callsonly;
+      if (getenv("QJS_AOT_DEBUG_LOOPS")) fprintf(stderr, "loop %s hdr %d accepted calls=%d\n", fn->g->name, h, callsonly);
       out->loop_hdr[out->nloops] = h;
       out->loop_pre[out->nloops] = pre;
       out->loop_mem[out->nloops] = malloc((size_t)fn->nblocks);
@@ -1175,7 +1220,7 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
       /* the cache cells of the grouped sites in the loop: checked once on the edge into the
          loop (and at an OSR entry), so no access in it tests its cell (group code
          -1000 - group, value = site) */
-      for (bi = 0; bi < fn->nblocks; bi++) {
+      for (bi = 0; bi < fn->nblocks && !callsonly; bi++) {
         if (!loop[bi]) continue;
         for (k = 0; k < fn->blocks[bi].ninsns; k++) {
           const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
@@ -1221,7 +1266,7 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
       }
       /* the receivers of numeric element accesses that are defined outside the loop: the array
          check and the loads of its base pointer and count are hoisted (group -2) */
-      for (bi = 0; bi < fn->nblocks; bi++) {
+      for (bi = 0; bi < fn->nblocks && !callsonly; bi++) {
         if (!loop[bi]) continue;
         for (k = 0; k < fn->blocks[bi].ninsns; k++) {
           const Q2Insn *in = &fn->insns[fn->blocks[bi].first_insn + k];
@@ -1282,6 +1327,7 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
             if (ref[r].site < 0 || !recv_groupable(ref[r].recv)) continue;
             g = e_facts_site_group(out, ref[r].site);
             if (g < 0) continue;
+            if (callsonly && group_layout(fn, out, g) == 0) continue;
             if (ref[r].recv == E_RECV_THIS) {
               v = E_THISV; /* `this` is fixed for the activation, so always outside the loop */
             } else {
@@ -1370,7 +1416,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   for (bi = 0; bi < fn->nrpo; bi++) {
     int b = fn->rpo[bi];
     const Q2Block *blk = &fn->blocks[b];
-    int p, first = 1, back_edge = 0;
+    int p, first = 1, back_edge = 0, callsloop = 0;
 
     if (b == 0 || blk->npreds <= 0) {
       fs_clear(&cur);
@@ -1395,11 +1441,14 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
            that has hoisted checks: its body has no safepoint, so what held at the
            end of the preheader (and the hoisted checks) holds throughout. */
         fs_clear(&cur);
+        callsloop = 0;
         /* An eligible loop (no safepoint) keeps what held at the end of its
            preheader, except what a store in the loop may kill. */
         for (k = 0; k < out->nloops; k++) {
           int pre = out->loop_pre[k], j, bb, ii;
           if (out->loop_hdr[k] != b) continue;
+          callsloop = out->loop_calls[k];
+          if (callsloop) break; /* a call kills every loaded value */
           /* The loop can also be entered at its header with the registers taken from the
              frame (a re-entry after an exit), which skips the preheader: a global read is known on
              that path only if its value is live in a register there. */
@@ -1426,9 +1475,13 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
         for (k = 0; k < out->nhoist; k++) {
           int pre = out->hoist_pre[k], j;
           if (out->hoist_hdr[k] != b) continue;
-          for (j = 0; j < outs[pre].nshape; j++)
-            if (fs_add_shape(&cur, outs[pre].shape_val[j], outs[pre].shape_grp[j]) < 0)
+          for (j = 0; j < outs[pre].nshape; j++) {
+            int lay_ok = !callsloop;
+            if (callsloop && outs[pre].shape_val[j] < E_ARRV(0) && group_layout(fn, out, outs[pre].shape_grp[j]) != 0)
+              lay_ok = 1;
+            if (lay_ok && fs_add_shape(&cur, outs[pre].shape_val[j], outs[pre].shape_grp[j]) < 0)
               goto done;
+          }
           if (out->hoist_grp[k] <= -1000) {
             if (fs_add_shape(&cur, E_CELLV(out->hoist_val[k]), -1000 - out->hoist_grp[k]) < 0)
               goto done;
@@ -1537,6 +1590,7 @@ void e_facts_free(EFacts *f) {
   for (i = 0; i < f->nloops; i++) free(f->loop_mem[i]);
   free(f->loop_mem);
   free(f->loop_hdr);
+  free(f->loop_calls);
   free(f->loop_pre);
   free(f->hoist_hdr);
   free(f->hoist_pre);

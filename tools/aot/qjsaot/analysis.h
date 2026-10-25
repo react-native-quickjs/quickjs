@@ -175,6 +175,7 @@ typedef struct EFacts {
      preheader, the receiver value and the group. */
   int nloops, loop_cap, *loop_hdr, *loop_pre;
   uint8_t **loop_mem;
+  uint8_t *loop_calls; /* the loop's only safepoints are calls: only contracted-layout shape facts hold in it */
   int nhoist, hoist_cap;
   int *hoist_hdr, *hoist_pre, *hoist_val, *hoist_grp;
   int nfwd;             /* loads forwarded, for the report */
