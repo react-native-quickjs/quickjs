@@ -39,6 +39,9 @@ static int g_e_inl;
 /* An inline body that makes calls roots what it holds in an array of its own, published for the
    length of each call, like a frameless body that calls. */
 static int g_e_inl_r;
+/* Set when the inline body being emitted makes a call or a construct (a safepoint). */
+static int g_e_inl_safepoint;
+static int g_e_last_inl_leaf;
 static const EFacts *g_e_facts;
 /* Set when a body emitted in inline mode needs more than inline mode can give. */
 static char g_e_inl_why[160];
@@ -181,6 +184,7 @@ int qjs_aot_prof_callees(
     const uint8_t dg[16], int pc, int *n, char hex[4][33], int kind[4],
     unsigned long long hits[4]);
 int qjs_aot_inline_has(const char hex[33]);
+int qjs_aot_inline_leaf(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
 int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci);
@@ -5424,6 +5428,31 @@ static void e_emit_fl_window_store(
     fprintf(f, "    ra_[SB_ + %d] = AOT_REG(fr, %d);\n", idx, wr * 16);
 }
 
+/* The owned result of a nested call, put where the rest of the body reads it. */
+static int e_emit_nested_result(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId dv, int dreg,
+    int dead, int resslot, const char *ind) {
+  const int pub = !g_e_inl || g_e_inl_r;
+
+  if (pub && t->lb[dv] == E_LB_TAG && !dead) {
+    /* The owned result parks in the published window, then its count is dropped (the
+       drop can run a collection); the next safepoint gives the value a slot. */
+    fprintf(
+        f,
+        "%sif (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
+        "%selse ra_[%d] = _o;\n"
+        "%sv%u = _o;\n"
+        "%sAOT_SET_B(ctx, fr, %d, _o);\n",
+        ind, resslot, ind, resslot, ind, (unsigned)dv, ind, dreg * 16);
+  } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
+    fprintf(f, "%sif (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n", ind);
+  } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
+    fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
+  return 1;
+}
+
 static int emit_inl_nested_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     char hex[33]) {
@@ -5437,7 +5466,8 @@ static int emit_inl_nested_call(
   Q2ValueId spv[E_SPILL_MAX + 1];
   int nsp, resslot;
   const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
-  char winp[48], ib[512], pushr[200];
+  char winp[48], ib[512], pushr[200], spl[1024];
+  int allleaf;
   const int pub = !g_e_inl || g_e_inl_r;
   char nrx[32];
   const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
@@ -5552,6 +5582,7 @@ static int emit_inl_nested_call(
   }
 
   /* ---- output ---- */
+  if (g_e_inl) g_e_inl_safepoint = 1;
   e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
   e_note_tag('v', in->pc, cexp);
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOT)
@@ -5591,16 +5622,33 @@ static int emit_inl_nested_call(
               wr * 16, (unsigned)v);
   }
   e_sweep_guard(f, "vx", in->pc);
+  /* Every candidate is an inlined body that makes no call: while it runs nothing can
+     collect, so the roots and the record are written only for the call it falls back to. */
+  allleaf = 0;
+  if (!g_e_inl && pub) {
+    allleaf = 1;
+    for (k = 0; k < n && k < 4; k++) {
+      if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
+      if (!qjs_aot_native_capable(callee[k])) continue;
+      if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
+      if (!qjs_aot_inline_has(callee[k]) || !qjs_aot_inline_leaf(callee[k])) allleaf = 0;
+    }
+  }
+  spl[0] = 0;
   if (pub) {
     /* QJS_AOT_NOWINROOT=1 leaves the window unpublished: the negative control. */
+    size_t sl = 0;
     for (k = 0; k < nsp; k++)
-      fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
+      sl += (size_t)snprintf(
+          spl + sl, sizeof(spl) - sl, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]),
+          (unsigned)spv[k]);
     if (!g_e_inl) {
       g_e_fl_calls = 1;
-      fprintf(
-          f, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n", in->next - 1,
-          getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
+      snprintf(
+          spl + sl, sizeof(spl) - sl, "    rec_->pc = %d;\n    rec_->nroots = SB_ + %d;\n",
+          in->next - 1, getenv("QJS_AOT_NOWINROOT") != NULL ? 0 : na);
     }
+    if (!allleaf) fputs(spl, f);
   }
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
@@ -5635,6 +5683,29 @@ static int emit_inl_nested_call(
                  "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
                  "%s\n",
               cexp, ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
+    else if (allleaf) {
+      fprintf(
+          f,
+          "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) {\n"
+          "        JSValue _o;\n"
+          "#ifdef Q2_INLINE_%s\n"
+          "        if (ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "                    %s, %d, &_o)) {\n"
+          "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
+          e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), callee[k], callee[k], cexp, recv, winp,
+          na, excret);
+      e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
+      fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
+      fprintf(
+          f,
+          "        {\n%s"
+          "        _o = aot_n_%s(ctx, caller_f,\n"
+          "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "            %s, %d);\n"
+          "        rec_->nroots = SB_;\n"
+          "        if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
+          spl, callee[k], cexp, recv, winp, na, excret);
+    }
     else
     fprintf(
         f,
@@ -5648,27 +5719,13 @@ static int emit_inl_nested_call(
         "%s\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
-    if (pub && t->lb[dv] == E_LB_TAG && !dead) {
-      /* The owned result parks in the published window, then its count is dropped (the
-         drop can run a collection); the next safepoint gives the value a slot. */
-      fprintf(
-          f,
-          "        if (JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, &ra_[%d], 0, _o);\n"
-          "        else ra_[%d] = _o;\n"
-          "        v%u = _o;\n"
-          "        AOT_SET_B(ctx, fr, %d, _o);\n",
-          resslot, resslot, (unsigned)dv, dreg * 16);
-    } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
-      fprintf(f, "        if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
-    } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
-      fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
-      abort();
-    }
+    e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "        ");
     /* The result is in place (a TAG value in its local, a typed one in the frame
        slot the exit stub reads): the facts the call may have changed are checked now,
        so an exit here carries the result. */
     if (g_e_epoch_skip || g_e_nolazy) e_store_typed_def(f, fn, in, t, dv);
     e_emit_group_recheck(f, fn, in, cur);
+    if (allleaf) fprintf(f, "        }\n");
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
   /* No candidate matched. A frameless body that is not inlined calls any other
@@ -5704,7 +5761,7 @@ static int emit_inl_nested_call(
   }
   /* The call has not run: leave before it. */
   fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
-  if (!g_e_inl) fprintf(f, "    rec_->nroots = SB_;\n");
+  if (!g_e_inl && !allleaf) fprintf(f, "    rec_->nroots = SB_;\n");
   g_e_inl_dirty = 1;
   cur[dreg] = dv;
   g_e_miss_exit_seen = 0;
@@ -5756,6 +5813,7 @@ static int emit_inl_construct(
     nb++;
   }
   if (nb == 0) return 0;
+  g_e_inl_safepoint = 1;
   cc = (int)in->arg[1].val;
   nt = (int)in->arg[2].val;
   off = dest_off(fn, in);
@@ -12913,6 +12971,7 @@ int e_emit_inline_body(
   g_e_inl = 1;
   g_e_quiet = 1;
   g_e_inl_r = ncalls > 0;
+  g_e_inl_safepoint = 0;
   g_e_spill_total = 0;
   g_e_fl_block[0] = 0;
   if (g_e_inl_r) {
@@ -12943,6 +13002,7 @@ int e_emit_inline_body(
     return 0;
   }
   g_e_last_inl_nx = g_e_inl_nx_used;
+  g_e_last_inl_leaf = !g_e_inl_safepoint;
   fwrite(mb, 1, ml, f);
   free(mb);
   return 1;
@@ -12950,6 +13010,9 @@ int e_emit_inline_body(
 
 /* Whether the inline body just emitted exits through aot_nx_. */
 int e_inline_used_nx(void) { return g_e_last_inl_nx; }
+
+/* Whether the inline body just emitted makes no call and no construct. */
+int e_inline_leaf(void) { return g_e_last_inl_leaf; }
 
 static const char *nm_of_rop(uint16_t rop) {
   static char buf[64];

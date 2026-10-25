@@ -1623,6 +1623,7 @@ typedef struct {
 /* The inline forms (`ei_HEX`) of the unit's small leaves, by unit index. */
 static EmitBuf *g_inl_eb;
 static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
+static uint8_t *g_inl_leaf; /* the inline body makes no call and no construct */
 
 /* Which functions this run's emitter gave a native entry. A call site may
    only name an `aot_n_` that some body in this unit defines, and only a
@@ -1666,6 +1667,17 @@ const JSAotGenFunc *qjs_aot_unit_func(const char hex[33]) {
     if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0 && g_unit_funcs[i].eligible == AOT_GEN_ELIGIBLE)
       return &g_unit_funcs[i];
   return NULL;
+}
+
+/* Whether the inline form of the unit function with this digest has no safepoint. */
+int qjs_aot_inline_leaf(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || !g_inl_leaf || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) return g_inl_leaf[i];
+  return 0;
 }
 
 int qjs_aot_inline_uses_nx(const char hex[33]) {
@@ -1954,6 +1966,7 @@ int qjsaot_driver_main(int argc, char **argv) {
        body is emitted. */
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
     g_inl_nx = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
+    g_inl_leaf = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     for (i = 0; g_inl_eb && i < nfuncs; i++) {
       char hex[33], why[160] = "";
       FILE *mf;
@@ -1970,6 +1983,7 @@ int qjsaot_driver_main(int argc, char **argv) {
       fclose(mf);
       e_report_inline(hex, ok, why);
       if (ok && g_inl_nx) g_inl_nx[i] = (uint8_t)e_inline_used_nx();
+      if (ok && g_inl_leaf) g_inl_leaf[i] = (uint8_t)e_inline_leaf();
       if (!ok) {
         free(g_inl_eb[i].buf);
         g_inl_eb[i].buf = NULL;
