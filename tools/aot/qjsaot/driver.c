@@ -247,6 +247,8 @@ static const ProfEntry *g_prof = NULL;
 /* How many contracted layouts the generator decided on. Set once, before the
    unit's helpers are emitted, so the entry check and the layout table agree. */
 static int g_nlayouts;
+/* Defined in ops.c: how many call sites hold a callee in the unit's table. */
+extern int g_cc_count;
 static int g_nprof = 0;
 /* Whether the profile's header said `thr=1`, i.e. it came from the threaded
    build whose `R` records are complete. See parse_profile. */
@@ -4421,6 +4423,30 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN) == "
         "entry;\n"
         "}\n\n");
+    /* The same test with the function object a call site first accepted held in
+       `q2_cc[ix]`: the unit holds a counted reference on it, so its address cannot be
+       reused by another object while the site compares against it, and a match is one
+       compare where the full test is a tag test, a class test and two dependent loads.
+       A function object's bytecode never changes. Any other object runs the full test. */
+    fprintf(
+        f,
+        "extern void *q2_cc[];\n"
+        "void q2_cc_fill(JSContext *ctx, uint32_t ix, JSValue fnv);\n"
+        "static inline __attribute__((always_inline)) int q2_call_entry_u(\n"
+        "JSContext *ctx, JSValue fnv, const void *entry, uint32_t ix)\n"
+        "{\n"
+        "  (void)ctx; (void)ix;\n"
+        "  return q2_call_entry(fnv, entry);\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_call_entry_c(\n"
+        "JSContext *ctx, JSValue fnv, const void *entry, uint32_t ix)\n"
+        "{\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return 0;\n"
+        "  if (__builtin_expect(JS_VALUE_GET_PTR(fnv) == q2_cc[ix], 1)) return 1;\n"
+        "  if (!q2_call_entry(fnv, entry)) return 0;\n"
+        "  if (q2_cc[ix] == NULL) q2_cc_fill(ctx, ix, fnv);\n"
+        "  return 1;\n"
+        "}\n\n");
     /* Whether the callee is the function whose bound entry is `entry`. Only
        that function's digest produces that entry, so this is an exact identity
        test, cheap enough for a dispatch chain. */
@@ -4923,6 +4949,31 @@ int qjsaot_driver_main(int argc, char **argv) {
        shape still held here would keep its whole object graph reachable. The
        runtime that filled the caches is recorded on the first fill, so a second
        runtime only ever runs the full checks and never frees against the first. */
+    /* The function objects the call sites hold (see q2_call_entry_c): the first runtime
+       to fill one owns them all, and its teardown drops each reference. */
+    fprintf(
+        f,
+        "void *q2_cc[%d];\n"
+        "static JSRuntime *q2_cc_rt;\n"
+        "void q2_cc_fill(JSContext *ctx, uint32_t ix, JSValue fnv)\n"
+        "{\n"
+        "  JSRuntime *rt = JS_GetRuntime(ctx);\n"
+        "  if (q2_cc_rt == NULL) q2_cc_rt = rt;\n"
+        "  if (q2_cc_rt != rt || q2_cc[ix] != NULL) return;\n"
+        "  q2_cc[ix] = JS_VALUE_GET_PTR(JS_DupValue(ctx, fnv));\n"
+        "}\n"
+        "static void q2_cc_release(JSRuntime *rt)\n"
+        "{\n"
+        "  uint32_t i;\n"
+        "  if (q2_cc_rt != rt) return;\n"
+        "  for (i = 0; i < %du; i++)\n"
+        "    if (q2_cc[i] != NULL) {\n"
+        "      JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, q2_cc[i]));\n"
+        "      q2_cc[i] = NULL;\n"
+        "    }\n"
+        "  q2_cc_rt = NULL;\n"
+        "}\n",
+        g_cc_count + 1, g_cc_count + 1);
     /* The contracted layouts. This file owns them: the table of rows (prototype
        kind, constructor digest, ordered field names), the shapes the built chains
        end, the runtime that holds those references, and both runtime-wide entry
@@ -5057,6 +5108,7 @@ int qjsaot_driver_main(int argc, char **argv) {
             "void qjs_aot_release(JSRuntime *rt)\n"
             "{\n"
             "  uint32_t i, k, built = 0, refused = 0, pending = 0;\n"
+            "  q2_cc_release(rt);\n"
             "  if (q2_owner_rt != rt) return;\n"
             "  for (i = 0; i < Q2_LAYOUT_COUNT; i++) {\n"
             "    built += q2_layout_state[i] == 1;\n"
@@ -5078,7 +5130,7 @@ int qjsaot_driver_main(int argc, char **argv) {
             "  q2_owner_rt = NULL;\n"
             "}\n");
       } else {
-        fprintf(f, "void qjs_aot_release(JSRuntime *rt) { (void)rt; }\n");
+        fprintf(f, "void qjs_aot_release(JSRuntime *rt) { q2_cc_release(rt); }\n");
       }
       free(cand);
     }

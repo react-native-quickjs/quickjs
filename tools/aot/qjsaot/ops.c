@@ -57,6 +57,21 @@ static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, i
 static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in);
 static const char *e_slotfn(int site);
 static const char *e_cellidx(char *buf, size_t n, int site);
+/* The next index into the unit's table of held callees (see q2_call_entry_c). */
+int g_cc_count;
+/* A call site the profile saw with one callee tests the object it first accepted (see
+   q2_call_entry_c); a site with several keeps the full test, which a cached object would
+   only make slower. */
+static int e_cc_mono(const Q2Func *fn, const Q2Insn *in) {
+  int n = 0, kind[4];
+  char hex[4][33];
+  unsigned long long hits[4];
+  return qjs_aot_prof_callees(fn->g->digest, in->next, &n, hex, kind, hits) && n == 1;
+}
+static const char *e_cc_fn(const Q2Func *fn, const Q2Insn *in) {
+  return e_cc_mono(fn, in) ? "q2_call_entry_c(ctx, " : "q2_call_entry_u(ctx, ";
+}
+static int e_cc_ix(const Q2Func *fn, const Q2Insn *in) { return e_cc_mono(fn, in) ? g_cc_count++ : 0; }
 static void e_slot_off(char *out, size_t n, int g, int site);
 static int e_group_layout(int g);
 static void e_group_test(
@@ -1829,9 +1844,9 @@ static void emit_one_direct_call(
   fprintf(f, "#ifdef Q2_NATIVE_%s\n", hex);
   fprintf(
       f,
-      "    if (__builtin_expect(q2_call_entry(AOT_REG(fr, %d), "
-      "(const void *)aot_f_%s), 1)) {\n",
-      cc, hex);
+      "    if (__builtin_expect(%sAOT_REG(fr, %d), "
+      "(const void *)aot_f_%s, %du), 1)) {\n",
+      e_cc_fn(fn, in), cc, hex, e_cc_ix(fn, in));
   /* The callee's realm is the context its body runs in, which the entry takes
      from the bytecode; `ctx` here is only the caller's. */
   fprintf(
@@ -5613,7 +5628,7 @@ static int emit_inl_nested_call(
     else
     fprintf(
         f,
-        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1)) "
+        "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) "
         "{\n"
         "        JSValue _o;\n%s"
         "%s        _o = aot_n_%s(ctx, caller_f,\n"
@@ -5621,7 +5636,7 @@ static int emit_inl_nested_call(
         "            %s, %d);\n"
         "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
         "%s\n",
-        cexp, callee[k], ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
+        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), ib, pushr, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
     if (!g_e_inl && t->lb[dv] == E_LB_TAG && !dead) {
       /* The owned result parks in the published window, then its count is dropped (the
@@ -6834,11 +6849,11 @@ static int emit_inl_guard(
   fprintf(
       f,
       "#ifdef Q2_SEL_%s\n"
-      "    if (__builtin_expect(!q2_call_entry(%s, (const void *)aot_f_%s), 0)) goto vx_%d;\n"
+      "    if (__builtin_expect(!%s%s, (const void *)aot_f_%s, %du), 0)) goto vx_%d;\n"
       "#else\n"
       "    goto vx_%d;\n"
       "#endif\n",
-      callee, cexp, callee, in->pc, in->pc);
+      callee, e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), in->pc, in->pc);
   e_virt_compute(fn);
   if (iv->uses_this && !(tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME && tv < (Q2ValueId)fn->nvalues &&
                          g_e_virt != NULL && g_e_virt[tv]))
@@ -6916,9 +6931,9 @@ static int emit_virt_def(
   fprintf(
       f,
       "#ifdef Q2_SEL_%s\n"
-      "    if (__builtin_expect(!q2_call_entry(%s, (const void *)aot_f_%s), 0)) goto vx_%d;\n"
+      "    if (__builtin_expect(!%s%s, (const void *)aot_f_%s, %du), 0)) goto vx_%d;\n"
       "    { static const uint16_t sites_[%d] = {",
-      callee, cexp, callee, in->pc, vw->nfields);
+      callee, e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), in->pc, vw->nfields);
   for (q = 0; q < vw->nfields; q++) fprintf(f, "%s%d", q ? ", " : "", vw->site[q]);
   fprintf(
       f,
@@ -7059,12 +7074,12 @@ static int emit_pure_call(
     fprintf(f, "#ifdef Q2_INLINE_%s\n", callee[k]);
     fprintf(
         f,
-        "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1)) {\n"
+        "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) {\n"
         "        JSValue _o;\n"
         "        E_CAP(f, %d);\n"
         "        if (!ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "                    args_, %d, &_o)) goto vx_%d;\n",
-        cexp, callee[k], in->next - 1, callee[k], cexp, recv, na, in->pc);
+        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(
@@ -7316,9 +7331,9 @@ static int emit_typed_call(
     else
     fprintf(
         f,
-        "    if (__builtin_expect(q2_call_entry(%s, "
-        "(const void *)aot_f_%s), 1)) {\n",
-        cexp, callee[k]);
+        "    if (__builtin_expect(%s%s, "
+        "(const void *)aot_f_%s, %du), 1)) {\n",
+        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in));
     fprintf(f, "        JSValue _o;\n");
     /* The callee's inline body first: it runs the callee in place when every
        check passes and has changed nothing when one does not, so the native call
