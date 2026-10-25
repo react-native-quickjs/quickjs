@@ -7679,6 +7679,25 @@ static int emit_typed_binary_loc(
   return 1;
 }
 
+/* A global read the profile saw hold one int32 value throughout: the program's own instruction
+   (an inlined callee's atom is not in this function's code), its destination typed by the
+   instruction's own record. The body that folds it holds the value as a literal; its entry
+   confirms the live property (`qjs_aot_global_fold`) and every write to the property moves the
+   epoch the body tests after each safepoint. */
+static int e_gfold_val(const Q2Func *fn, const Q2Insn *in, int32_t *val) {
+  const Q2Value *v;
+  if (in->rop != ROP_get_global) return 0;
+  if (in->own != 0 || in->ndef < 1 || in->narg < 4) return 0;
+  if (in->arg[1].kind != 'a' || in->arg[3].kind != 's') return 0;
+  if ((unsigned)in->arg[3].val == REG_IC_NONE) return 0;
+  if (in->def[0] >= (Q2ValueId)fn->nvalues) return 0;
+  v = &fn->values[in->def[0]];
+  if (!v->has_prof || v->prof_src != 0 || v->ptypes != Q2_T_INT32 || v->frac) return 0;
+  if (v->nmin != v->nmax || v->nmin < -2147483648.0 || v->nmin > 2147483647.0) return 0;
+  *val = (int32_t)v->nmin;
+  return 1;
+}
+
 /* A speculative-body GLOBAL READ: `get_global` ("rabs": dest, atom offset, throw
    flag, site). `q2_global_hit` is the same inline test the generic body uses; a
    miss goes to the wrapper, which performs the real lookup (that path can run a
@@ -7706,6 +7725,16 @@ static int emit_typed_global_read(
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 &&
       t->lb[dv] != E_LB_F64)
     return 0;
+
+  {
+    int32_t gv;
+    if (t->lb[dv] == E_LB_I32 && g_e_epoch_skip && e_gfold_val(fn, in, &gv)) {
+      fprintf(f, "    i%u = %d;\n", (unsigned)dv, (int)gv);
+      if (cur != NULL) cur[dreg] = dv;
+      g_e_miss_exit_seen = 1; /* nothing here can miss */
+      return 1;
+    }
+  }
 
   if (in->xpc >= 0) {
     /* Moved before a loop: every way out leaves to the pc it was placed before. */
@@ -11785,7 +11814,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "    void *const *holders = *(void *const **)(cb +\n"
         "                               QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER);\n"
         "    const uint32_t q2_ns = (uint32_t)*(const uint16_t *)(cb +\n"
-        "                               QJS_AOT_OFF_FNBC_PIC_COUNT);\n");
+        "                               QJS_AOT_OFF_FNBC_PIC_COUNT);\n"
+        "    const uint8_t *ecb = *(const uint8_t *const *)(cb + QJS_AOT_OFF_FNBC_REGVM_CODE); (void)ecb;\n");
   } else {
     fprintf(f, "    const void *pic = q2_pic(f);\n    const uint8_t *ecb = q2_code(f); (void)ecb;\n");
     fprintf(f, "    void *const *holders = q2_pic_holder(f);\n");
@@ -11867,7 +11897,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       }
       /* The validation of the cells is done again only when a cache entry has changed since it
          last passed for this bytecode. */
-      int ngu = 0, npci = 0, gi, qq;
+      int ngu = 0, ngf = 0, npci = 0, gi, qq;
       for (g = 0; g < ng; g++)
         if (g_e_group_used[g] && !e_entry_skip(g)) ngu++;
       for (g = 0; g < ng; g++) {
@@ -11879,7 +11909,13 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       for (g = 0; g < ng; g++)
         if (g_e_group_used[g] && !g_e_facts->groups[g].own && e_group_layout(g) != 0)
           fprintf(f, "    const void *gsh%d;\n", g);
-      g_e_epoch_skip = ngu > 0 && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
+      /* A body that holds a global as a literal tests the epoch after each safepoint like one
+         that holds cache cells. */
+      for (g = 0; g < fn->ninsns; g++) {
+        int32_t gv_;
+        if (e_gfold_val(fn, &fn->insns[g], &gv_)) ngf++;
+      }
+      g_e_epoch_skip = (ngu > 0 || ngf > 0) && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
       g_e_mc_n = 0;
       memset(g_e_mc_of, -1, sizeof(g_e_mc_of));
       if (g_e_epoch_skip && getenv("QJS_AOT_NOMETHCACHE") == NULL)
@@ -11896,15 +11932,15 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             }
           }
         }
-      if (ngu > 0) {
+      if (ngu > 0 || ngf > 0) {
         int gk = 0, pk = 0;
         fprintf(
             f,
             "    static const void *e_vg[%d]; static int e_vp[%d]; static uint32_t e_vep; static const void *e_vcb;\n"
             "    static JSValue e_vm[%d]; static const void *e_vme[%d];\n"
-            "    const uint32_t q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
+            "    uint32_t q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
             "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
-            ngu, npci > 0 ? npci : 1, g_e_mc_n > 0 ? g_e_mc_n : 1, g_e_mc_n > 0 ? g_e_mc_n : 1);
+            ngu > 0 ? ngu : 1, npci > 0 ? npci : 1, g_e_mc_n > 0 ? g_e_mc_n : 1, g_e_mc_n > 0 ? g_e_mc_n : 1);
         for (g = 0; g < g_e_mc_n; g++) fprintf(f, "    JSValue mcv%d; const void *mce%d;\n", g, g);
         for (g = 0; g < ng; g++)
           if (g_e_group_used[g] && !e_entry_skip(g)) fprintf(f, "    const void *gsh%d;\n", g);
@@ -11926,6 +11962,29 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         }
         for (g = 0; g < g_e_mc_n; g++) fprintf(f, "      mcv%d = e_vm[%d]; mce%d = e_vme[%d];\n", g, g, g, g);
         fprintf(f, "    } else {\n");
+        /* The globals the body holds as literals are confirmed first: the first confirmation
+           of one moves the epoch, so the epoch this entry validates at is read after it. */
+        {
+          int ik, nfold = 0;
+          for (ik = 0; ik < fn->ninsns; ik++) {
+            int32_t gv;
+            const Q2Insn *gi_ = &fn->insns[ik];
+            if (!e_gfold_val(fn, gi_, &gv)) continue;
+            fprintf(
+                f,
+                "      if (__builtin_expect(!qjs_aot_global_fold(ctx, (int)qjs_aot_ld_u32(ecb + %d), %d), 0)) {\n"
+                "        E_REFUSE_NOTE(%d);\n"
+                "        return %s;\n"
+                "      }\n",
+                gi_->arg[1].off, (int)gv, fi, gen0);
+            nfold++;
+          }
+          if (nfold > 0)
+            fprintf(
+                f,
+                "      q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
+                "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n");
+        }
         (void)gi;
       }
       for (g = 0; g < ng; g++) {
@@ -11988,7 +12047,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             "    }\n",
             g, g, e_group_ret(g) - 1, fi, gen0);
       }
-      if (ngu > 0) {
+      if (ngu > 0 || ngf > 0) {
         int gk = 0, pk = 0;
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];

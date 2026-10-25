@@ -376,6 +376,14 @@ static unsigned prof_type_bit(const char *name) {
   return PT_OTHER;
 }
 
+/* `<min>..<max>` as the profile writes it. A scanf of the two numbers reads `2.` and stops at `..2`
+   when the bounds are integers, so the separator is found first. */
+static void prof_parse_range(const char *p, double *lo, double *hi) {
+  const char *dd = strstr(p, "..");
+  *lo = strtod(p, NULL);
+  if (dd != NULL) *hi = strtod(dd + 2, NULL);
+}
+
 static unsigned prof_parse_types(const char *s) {
   unsigned t = 0;
   char buf[64];
@@ -707,7 +715,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         int has_num = 0, frac = 0, negzero = 0, elem = 0, tacls = 0, pkinds = 0;
         if (nm) {
           has_num = 1;
-          sscanf(nm + 4, "%lf..%lf", &nmin, &nmax);
+          prof_parse_range(nm + 4, &nmin, &nmax);
         }
         if (fm) frac = (int)strtol(fm + 5, NULL, 10) != 0;
         if (nz) negzero = (int)strtol(nz + 8, NULL, 10) != 0;
@@ -759,7 +767,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         const char *nz = strstr(line + 2, "negzero=");
         double nmin = 0, nmax = 0;
         int k;
-        if (nm) sscanf(nm + 4, "%lf..%lf", &nmin, &nmax);
+        if (nm) prof_parse_range(nm + 4, &nmin, &nmax);
         for (k = 0; k < e->ncres; k++)
           if (e->cres[k].pc == pc) break;
         if (k == e->ncres) {
