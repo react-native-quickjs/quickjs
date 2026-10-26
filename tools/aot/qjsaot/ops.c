@@ -5840,7 +5840,7 @@ static int emit_inl_nested_call(
           "#ifdef Q2_INLINE_%s\n"
           "        if ((_r = ei_%s%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "                    %s, %d, &_o, %s, %d, %s))) {\n"
-          "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
+          "            if (__builtin_expect(_r != 2 && JS_IsException(_o), 0)) %s\n",
           idt, callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, winp, na, rax,
           tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, rrx, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
@@ -5866,7 +5866,7 @@ static int emit_inl_nested_call(
         "        { _r = 1; _o = aot_n_%s(ctx, caller_f,\n"
         "            (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "            %s, %d); }\n"
-        "%s        if (__builtin_expect(JS_IsException(_o), 0)) "
+        "%s        if (__builtin_expect(_r != 2 && JS_IsException(_o), 0)) "
         "%s\n",
         idt, pushr, ib, callee[k], cexp, recv, winp, na, popr, excret);
     g_e_inl_dirty = 1;
@@ -11441,7 +11441,7 @@ static int emit_typed_return(
   if (in->rop == ROP_return_undefined) {
     if (role == NULL || role->control != E_CF_RETURN) return 0;
     if (g_e_inl)
-      fprintf(f, "    { *out = JS_UNDEFINED; return 1; }\n");
+      fprintf(f, "    { *out = JS_UNDEFINED; return 2; }\n");
     else
       fprintf(f, "    return JS_UNDEFINED;\n");
     return 1;
