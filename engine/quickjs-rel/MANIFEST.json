@@ -1619,12 +1619,16 @@
       "sha256": "0dceea7827b25e3155ffef89ce5833298408c9508a30430374d339d82fa9e9ea"
     },
     {
+      "name": "0411-aot-claim-refusal-breaks-layout.patch",
+      "sha256": "b082eff20a9c701397f51cae1b4dac016164f7f68ea743d004ad0453a6e8be7a"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "4e1190368a2e02c4b2cc880a03098d23ff096bdb7e47ce620383d76c6c2442f9",
+    "quickjs.c": "7e74197fe5acc1d9972c252c02db06e1203842c62c1ac67e31c187764dac3f84",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

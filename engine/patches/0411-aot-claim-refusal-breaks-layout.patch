@@ -1,0 +1,106 @@
+Subject: A refused or violated promise breaks its layout, and the claim table accepts every kind of promise
+
+What this does
+  - `qjs_aot_layout_claim` accepts 0, NOREF, INT and the object kinds 1..0x3f / 0x41..0x7f (0409 refused every code above 63, so INT and
+    never-null object promises were never installed). A refused promise sets the layout's broken bit and returns 0, so a unit that
+    relied on it runs that layout generic.
+  - Kit builds only (`QJS_KIT_TEST_KNOBS`): `QJS_AOT_CLAIMTRACE` prints which store or add broke a promise, and `QJS_AOT_BADCLAIM` forces
+    every installed promise to an invalid code, to prove the refusal path.
+
+Why we need it
+  A promise the engine cannot enforce must never be trusted by compiled code. Promises are installed when a unit binds a layout, which
+  for a constructor layout happens in `qjs_aot_layout_fn_created`, before the constructor can have produced an instance.
+
+Functions touched
+  `qjs_aot_layout_claim`, `js_aot_content_store_slow`, `js_aot_content_enter_slow`, `js_aot_content_last`, `js_aot_claim_trace`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -16438,6 +16438,17 @@
+ #define js_aot_claim_hooks_off() false
+ #endif
+ 
++#ifdef QJS_KIT_TEST_KNOBS
++static void js_aot_claim_trace(const char *what, uint32_t id, uint32_t slot, JSValue v, uint8_t claim)
++{
++    if (getenv("QJS_AOT_CLAIMTRACE"))
++        fprintf(stderr, "claim broken by %s: layout %u slot %u claim 0x%x tag %d\n", what, id, slot, claim,
++                (int)JS_VALUE_GET_TAG(v));
++}
++#else
++#define js_aot_claim_trace(what, id, slot, v, claim) ((void)0)
++#endif
++
+ static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
+ {
+     uint32_t id = p->shape->layout_id;
+@@ -16447,8 +16458,10 @@
+     if (slot >= JS_AOT_CLAIM_MAXF)
+         return;
+     claim = rt->aot_slot_claim[id - 1][slot];
+-    if (claim != 0 && !js_aot_claim_ok(v, claim))
++    if (claim != 0 && !js_aot_claim_ok(v, claim)) {
++        js_aot_claim_trace("store", id, slot, v, claim);
+         rt->aot_layout_broken |= 1ULL << (id - 1);
++    }
+ }
+ 
+ static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
+@@ -16505,6 +16518,7 @@
+     for (f = 0; f + (filled ? 0 : 1) < n; f++) {
+         uint8_t claim = rt->aot_slot_claim[id - 1][f];
+         if (claim != 0 && !js_aot_claim_ok(p->prop[f].u.value, claim)) {
++            js_aot_claim_trace("enter", id, f, p->prop[f].u.value, claim);
+             rt->aot_layout_broken |= 1ULL << (id - 1);
+             return;
+         }
+@@ -16532,8 +16546,10 @@
+         uint32_t id = p->shape->layout_id, n = p->shape->prop_count;
+         if (n != 0 && n <= JS_AOT_CLAIM_MAXF) {
+             uint8_t claim = rt->aot_slot_claim[id - 1][n - 1];
+-            if (claim != 0 && !js_aot_claim_ok(p->prop[n - 1].u.value, claim))
++            if (claim != 0 && !js_aot_claim_ok(p->prop[n - 1].u.value, claim)) {
++                js_aot_claim_trace("last-slot add", id, n - 1, p->prop[n - 1].u.value, claim);
+                 rt->aot_layout_broken |= 1ULL << (id - 1);
++            }
+         }
+     }
+ }
+@@ -64920,18 +64936,28 @@
+    can ever reach one; the final shape also gets the layout id. The temporary
+    object is freed, leaving only the chain's references. Returns the number of
+    shapes stored, or 0 on failure. */
+-/* The unit's promise about slot `slot` of layout `layout_id`: 0 clears it, 1..63 an object of
+-   that layout or null/undefined, 0x80 a value that is not reference counted. The last slot of
+-   a layout never carries one (its value is written after the shape is adopted). Returns 0 when
+-   the promise is refused. */
++/* The unit's promise about slot `slot` of layout `layout_id`: 0 clears it, QJS_AOT_CLAIM_OBJ(l)
++   an object of layout l or null/undefined, QJS_AOT_CLAIM_OBJ_NN(l) one that is never null,
++   QJS_AOT_CLAIM_INT an int, QJS_AOT_CLAIM_NOREF a value that is not reference counted. Returns
++   0 when the promise is refused. */
+ QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32_t slot,
+                                       uint32_t claim)
+ {
+     JSRuntime *rt = ctx->rt;
+-    if (layout_id == 0 || layout_id > 63 || slot >= JS_AOT_CLAIM_MAXF)
+-        return 0;
+-    if (claim != 0 && claim != 0x80 && (claim > 63))
++#ifdef QJS_KIT_TEST_KNOBS
++    if (getenv("QJS_AOT_BADCLAIM"))
++        claim = 0xff;
++#endif
++    int ok = layout_id != 0 && layout_id <= 63 && slot < JS_AOT_CLAIM_MAXF;
++    if (ok && claim != 0 && claim != QJS_AOT_CLAIM_NOREF && claim != QJS_AOT_CLAIM_INT &&
++        ((claim & 0x3f) == 0 || claim > 0x7f))
++        ok = 0;
++    if (!ok) {
++        /* a promise the unit relies on and the engine cannot enforce: the layout runs generic */
++        if (layout_id != 0 && layout_id <= 63)
++            rt->aot_layout_broken |= 1ULL << (layout_id - 1);
+         return 0;
++    }
+     rt->aot_slot_claim[layout_id - 1][slot] = (uint8_t)claim;
+     if (claim != 0)
+         rt->aot_claimed |= 1ULL << (layout_id - 1);
