@@ -11729,6 +11729,41 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   g_e_epoch_skip = 0;
   return rc;
 }
+/* The values the entry reads once per activation and the body reads from their per-body statics:
+   a group's shape (a contracted group's from its layout), and a cached method with its entry. They are
+   names for the static reads rather than locals, so they hold no register or stack slot across the
+   body. The statics hold for the whole activation: another activation refills them only at a later
+   cache epoch, and every read follows a test of the epoch. */
+static int g_e_sm_stat, g_e_sm_on;
+static void e_sm_macros(FILE *f, int define) {
+  int g, gk = 0, ng = g_e_facts != NULL ? g_e_facts->ngroups : 0;
+  for (g = 0; g < ng; g++) {
+    if (!g_e_group_used[g]) continue;
+    if (e_entry_skip(g)) {
+      if (g_e_facts->groups[g].own || e_group_layout(g) == 0) continue;
+      if (define)
+        fprintf(f, "#define gsh%d ((const void *)q2_layout_shape[%d])\n", g, e_group_layout(g) - 1);
+      else
+        fprintf(f, "#undef gsh%d\n", g);
+    } else {
+      if (g_e_sm_stat) {
+        if (define)
+          fprintf(f, "#define gsh%d (e_vg[%d])\n", g, gk);
+        else
+          fprintf(f, "#undef gsh%d\n", g);
+      }
+      gk++;
+    }
+  }
+  if (g_e_sm_stat)
+    for (g = 0; g < g_e_mc_n; g++) {
+      if (define)
+        fprintf(f, "#define mcv%d (e_vm[%d])\n#define mce%d (e_vme[%d])\n", g, g, g, g);
+      else
+        fprintf(f, "#undef mcv%d\n#undef mce%d\n", g, g);
+    }
+}
+
 static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) {
   int fi = qjs_aot_cur_func_idx();
   g_e_fn = fn;
@@ -12126,6 +12161,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             }
           }
         }
+      g_e_sm_stat = ngu > 0 || ngf > 0;
       if (ngu > 0 || ngf > 0) {
         int gk = 0, pk = 0;
         fprintf(
@@ -12158,6 +12194,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         }
         for (g = 0; g < g_e_mc_n; g++) fprintf(f, "      mcv%d = e_vm[%d]; mce%d = e_vme[%d];\n", g, g, g, g);
         fprintf(f, "    } else {\n");
+        if (getenv("QJS_AOT_NOSTATICSH") == NULL)
+          fprintf(
+              f,
+              "      if (__builtin_expect(q2_ep == e_vep && e_vcb != NULL, 0)) {\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "      }\n",
+              fi, gen0);
         for (g = 0; g < fn->ninl; g++)
           if (e_copy_nfold(fn, g) > 0) fprintf(f, "      e_gfc%d = 0;\n", g);
         /* The globals the body holds as literals are confirmed first: the first confirmation
@@ -12311,6 +12355,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       }
     }
   }
+  g_e_sm_on = getenv("QJS_AOT_NOSTATICSH") == NULL && g_e_facts != NULL && g_e_group_used != NULL;
+  if (g_e_sm_on) e_sm_macros(f, 1);
   if (g_e_nolazy)
     fprintf(
         f,
@@ -12950,6 +12996,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
 
   fprintf(f, "    }\n");
   fprintf(f, "}\n");
+  if (g_e_sm_on) e_sm_macros(f, 0);
+  g_e_sm_on = 0;
   if (osr_n > 0 && !g_e_fl && !g_e_inl)
     fprintf(
         f,
