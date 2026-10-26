@@ -8466,7 +8466,17 @@ static int emit_typed_this_field(
     if (g >= 0) return emit_group_this_read(f, fn, in, t, cur, g, site, fv, rv, freg, rreg);
     if (e_must_exit(fn, in)) return 0;
   }
-  if (t->lb[fv] != E_LB_TAG) return 0;
+  /* A typed hit result is allowed here, not only a TAG one. The ungrouped arm used
+     to hardcode `v<fv> = _v`, so a read the IR typed (an enum field read by a
+     four-instruction accessor, say) had to be declined: storing the raw JSValue
+     into an int local is a miscompile, and the only result-guarding helper was
+     reachable through an exit group this site does not have. emit_hit_result() is
+     that helper and needs nothing of the group but the stub it registers itself,
+     so use it for both arms. Measured on deltablue: the two BinaryConstraint
+     accessors this unblocks were 61% of all qjs_aot_step calls. */
+  if (t->lb[fv] != E_LB_TAG && t->lb[fv] != E_LB_I32 && t->lb[fv] != E_LB_F64 &&
+      t->lb[fv] != E_LB_BOOL)
+    return 0;
 
   if (!e_fl_site_ok(fn, in, site)) return 0;
   if (g_e_fl) {
@@ -8481,11 +8491,11 @@ static int emit_typed_this_field(
         "      AOT_SET_B(ctx, fr, %d, _t);\n",
         in->pc, (unsigned)rv, rreg * 16);
     e_fprint_hit(f, fn, "      ", "_t", site, "&_v", NULL);
-    fprintf(
-        f,
-        "        v%u = _v;\n"
-        "      } else {\n",
-        (unsigned)fv);
+    if (!emit_hit_result(f, fn, in, t, fv, freg, "_v")) {
+      fprintf(stderr, "qjsaot: this read at pc %d: no guard for its def\n", in->pc);
+      abort();
+    }
+    fprintf(f, "      } else {\n");
     if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
     fprintf(f, "      }\n    }\n");
     if (cur != NULL) {
@@ -8508,7 +8518,10 @@ static int emit_typed_this_field(
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
   fprintf(f, "      AOT_SET_B(ctx, fr, %d, _t);\n", rreg * 16);
   e_fprint_hit(f, fn, "      ", "_t", site, "&_v", NULL);
-  fprintf(f, "        v%u = _v;\n", (unsigned)fv);
+  if (!emit_hit_result(f, fn, in, t, fv, freg, "_v")) {
+    fprintf(stderr, "qjsaot: this read at pc %d: no guard for its def\n", in->pc);
+    abort();
+  }
   /* The hit keeps `this`: an owned one is adopted by its frame slot, as the
      generic body's load_this does (the slot already holds it borrowed). The miss
      releases it instead, because the wrapper loads `this` again itself. */
