@@ -2810,6 +2810,9 @@ static int e_must_exit(const Q2Func *fn, const Q2Insn *in) {
 
 /* Set while a speculative body that assumes no lazy JSON value exists is emitted. */
 static int g_e_nolazy = 0;
+/* An inline body emitted for a caller that has tested for lazy documents (its own entry and each safepoint),
+   so its loads carry no lazy-marker test. */
+static int g_e_inl_nl;
 
 /* After a safepoint (an op call, a call): code in this body skips the lazy-JSON marker
    test on loaded values, which holds while no lazy JSON document has been created. A
@@ -2842,21 +2845,39 @@ static int e_mc_index(int site) {
 static const ETypes *g_e_types;
 
 static int g_e_recheck_done = -1;
+static void e_emit_group_recheck_at(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur, int exit_pc);
 static void e_emit_group_recheck(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur) {
+  e_emit_group_recheck_at(f, fn, in, cur, in->next);
+}
+static void e_emit_group_recheck_at(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur, int exit_pc) {
   unsigned long long lm = g_e_facts != NULL ? (unsigned long long)g_e_facts->laymask[e_insn_idx(fn, in)] : 0;
   char lt[96] = "";
   if (!g_e_nolazy && !g_e_epoch_skip && lm == 0) return;
   /* The shape facts of these layouts were kept across the instruction: an object leaves a layout
      only by setting its bit. */
   if (lm != 0) snprintf(lt, sizeof(lt), "Q2_LAYOUT_BROKEN(ctx) & 0x%llxull", lm);
-  e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-  e_sweep_guard(f, "dx", in->next);
+  e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, exit_pc, cur, in);
+  e_sweep_guard(f, "dx", exit_pc);
   fprintf(
       f, "    if (__builtin_expect(%s%s%s%s%s, 0)) goto dx_%d;\n", g_e_nolazy ? "E_LAZY_SEEN(ctx)" : "",
       g_e_nolazy && (g_e_epoch_skip || lm) ? " || " : "", g_e_epoch_skip ? "Q2_EPOCH_MOVED(ctx)" : "",
-      g_e_epoch_skip && lm ? " || " : "", lt, in->next);
+      g_e_epoch_skip && lm ? " || " : "", lt, exit_pc);
   g_e_recheck_done = in->pc;
+}
+
+/* Whether a call that stays a call is inside the copy `k` or a copy nested in it. */
+static int e_copy_has_ext(const Q2Func *fn, int k) {
+  int i;
+  for (i = 0; i < fn->ninsns; i++) {
+    int c;
+    if (fn->insns[i].extcall != 1 || fn->insns[i].own == 0) continue;
+    for (c = fn->insns[i].own - 1; c >= 0; c = fn->inl[c].parent)
+      if (c == k) return 1;
+  }
+  return 0;
 }
 
 /* A typed definition held only in its local, put in its frame register for the exit stub that reads it
@@ -5779,10 +5800,10 @@ static int emit_inl_nested_call(
       snprintf(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
-          "        if (!(_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "        if (!(_r = ei_%s%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "                    %s, %d, &_o, %s, %d)))\n"
           "#endif\n",
-          callee[k], callee[k], cexp, recv, winp, na, rax,
+          callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, winp, na, rax,
           tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay);
     if (getenv("QJS_AOT_INL_CONTROL") != NULL &&
         strcmp(getenv("QJS_AOT_INL_CONTROL"), "noident") == 0)
@@ -5800,10 +5821,10 @@ static int emit_inl_nested_call(
           "    if (__builtin_expect(%s, 1)) {\n"
           "        JSValue _o; int _r = 1;\n"
           "#ifdef Q2_INLINE_%s\n"
-          "        if ((_r = ei_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "        if ((_r = ei_%s%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "                    %s, %d, &_o, %s, %d))) {\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
-          idt, callee[k], callee[k], cexp, recv, winp, na, rax,
+          idt, callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, winp, na, rax,
           tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
@@ -7281,9 +7302,9 @@ static int emit_pure_call(
         "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du), 1)) {\n"
         "        JSValue _o; int _r;\n"
         "        E_CAP(f, %d);\n"
-        "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+        "        if (!(_r = ei_%s%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "                    args_, %d, &_o, NULL, 0))) goto vx_%d;\n",
-        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], cexp, recv, na, in->pc);
+        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], g_e_nolazy ? "_n" : "", cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(
@@ -7649,10 +7670,10 @@ static int emit_typed_call(
       fprintf(
           f,
           "#ifdef Q2_INLINE_%s\n"
-          "        if (!(_r = ei_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
+          "        if (!(_r = ei_%s%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
           "                    &AOT_REG(fr, %d), %d, &_o, NULL, 0)))\n"
           "#endif\n",
-          callee[k], callee[k], cexp, recv, w, na);
+          callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, w, na);
     fprintf(
         f,
         "        { _r = 1; _o = aot_n_%s(ctx, f,\n"
@@ -11720,7 +11741,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]);
    take the choice from Q2_LZ. Frameless and inline bodies keep the tests. */
 static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   int rc;
-  g_e_nolazy = !g_e_inl;
+  g_e_nolazy = !g_e_inl || g_e_inl_nl;
   g_e_epoch_skip = 0;
   if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 0\n");
   rc = e_emit_spec_body_pass_inner(f, fn, hex);
@@ -11927,7 +11948,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     if (g_e_inl) {
       fprintf(
           f,
-          "static inline __attribute__((always_inline)) int ei_%s(JSContext "
+          "static inline __attribute__((always_inline)) int ei_%s%s(JSContext "
           "*ctx_in, JSRegRun *caller_f,\n"
           "                               JSObject *co, JSValue this_obj,\n"
           "                               JSValue *argv, int argc, JSValue *out, JSValue *ra_x_, int this_ok_)\n"
@@ -11939,7 +11960,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "    JSAotFlRec *const rec_ = NULL;\n"
           "    JSValue fr[%d];\n"
           "    Q2_FILL_UNDEF(fr, %d);\n",
-          hex, fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
+          hex, g_e_nolazy ? "_n" : "", fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
     if (g_e_inl && g_e_inl_r) {
       int mw = e_win_max(fn);
       fprintf(
@@ -12357,7 +12378,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   }
   g_e_sm_on = getenv("QJS_AOT_NOSTATICSH") == NULL && g_e_facts != NULL && g_e_group_used != NULL;
   if (g_e_sm_on) e_sm_macros(f, 1);
-  if (g_e_nolazy)
+  if (g_e_nolazy && !g_e_inl)
     fprintf(
         f,
         "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) {\n"
@@ -12494,6 +12515,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
          other exits at the terminator's pc. */
       g_e_ta_keep = 0;
       if (in->inlret && fn->inl[in->own - 1].parent < 0) e_undo_release(f, e_dom(in->own));
+      /* A copy that ran a call that stays a call has run code: the facts are tested before the body goes on,
+         with the result where the exit puts it. */
+      if (in->inlret && fn->inl[in->own - 1].parent < 0 && have_types && i2 > blk->first_insn &&
+          e_copy_has_ext(fn, in->own - 1)) {
+        const Q2Insn *mv = &fn->insns[i2 - 1];
+        if (mv->ndef > 0) e_store_typed_def(f, fn, mv, &types, mv->def[0]);
+        e_emit_group_recheck_at(f, fn, in, cur, (int)((int64_t)in->next + in->arg[0].val));
+      }
       if (role != NULL && role->control != E_CF_NONE) {
         if (g_e_ta_used && !e_ta_keeps(fn, in, &types)) fprintf(f, "    ta_ok = 0;\n");
         if (emit_typed_return(f, fn, in, &types, cur, have_types)) {
@@ -13367,7 +13396,7 @@ static int e_inl_text_ok(const char *txt, size_t n, char *why, size_t whyn) {
   return 1;
 }
 
-int e_emit_inline_body(
+static int e_emit_inline_body_v(
     FILE *f, const Q2Func *fn, char hex[33], char *why, size_t whyn) {
   const JSAotGenFunc *g = fn->g;
   static const char *const alloc_ops[] = {
@@ -13509,6 +13538,33 @@ int e_emit_inline_body(
   g_e_last_inl_leaf = !g_e_inl_safepoint;
   fwrite(mb, 1, ml, f);
   free(mb);
+  return 1;
+}
+
+/* An inline body is emitted twice: for a caller that may meet a lazy document (every load tests for the
+   marker) and for a caller that has tested for one at its entry and after each safepoint (the loads
+   carry no test, and the body's own safepoints test again). */
+int e_emit_inline_body(
+    FILE *f, const Q2Func *fn, char hex[33], char *why, size_t whyn) {
+  int nx0, leaf0, rz0, tl0, rc;
+  g_e_inl_nl = 0;
+  rc = e_emit_inline_body_v(f, fn, hex, why, whyn);
+  if (!rc || getenv("QJS_AOT_NOINLNL") != NULL) return rc;
+  nx0 = g_e_last_inl_nx;
+  leaf0 = g_e_last_inl_leaf;
+  rz0 = g_e_last_inl_rz;
+  tl0 = g_e_last_inl_tl;
+  g_e_inl_nl = 1;
+  rc = e_emit_inline_body_v(f, fn, hex, why, whyn);
+  g_e_inl_nl = 0;
+  if (!rc) return 0;
+  g_e_last_inl_nx = g_e_last_inl_nx || nx0;
+  g_e_last_inl_leaf = g_e_last_inl_leaf && leaf0;
+  if (rz0 > g_e_last_inl_rz) g_e_last_inl_rz = rz0;
+  if (tl0 != g_e_last_inl_tl) {
+    snprintf(why, whyn, "the two forms disagree on the receiver layout");
+    return 0;
+  }
   return 1;
 }
 
