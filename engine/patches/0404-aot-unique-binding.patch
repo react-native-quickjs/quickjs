@@ -1,0 +1,46 @@
+Subject: A bytecode binds to a compiled function only if no other live bytecode holds it
+
+What this does
+  - `JSRuntime` gains `aot_bound`, a byte per unit index, set while a live bytecode is bound to that compiled function.
+  - `js_aot_bind` leaves a second live bytecode of the same unit index unbound (it runs in the interpreter); a rebind of
+    a bound bytecode clears its own slot first, and an allocation failure of the table leaves it unbound.
+  - The bytecode finalizer clears the slot after the register PIC is freed, and `JS_FreeRuntime` frees the table.
+
+Why we need it
+  The compiled bodies keep one set of cached property facts per function, validated at entry against the bytecode's cache
+  table. Two live bytecodes with the same code (the same source compiled twice) would share that set. With one live
+  instance per unit index, an inline body entered through a callee guard (`aot_fn` equals the function's entry) is
+  always the instance whose facts are cached, and the entry no longer compares the bytecode's identity. Freeing a
+  bytecode resets every entry of its register PIC, each of which moves `aot_pic_epoch`, before the slot is cleared, so a
+  bytecode bound to the index afterwards sees the epoch already moved.
+
+Functions touched
+  `js_aot_bind`, `js_free_function_bytecode`, `JS_FreeRuntime`; the `JSRuntime` type.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -771,0 +772,4 @@
++    /* One byte per unit index: set while a live bytecode is bound to that compiled function. The
++       compiled bodies keep one set of cached facts per function, so a second live instance of the
++       same code is left unbound and runs in the interpreter. */
++    uint8_t *aot_bound;
+@@ -4459,0 +4464,3 @@
++#if QJS_AOT || QJS_AOT_GEN
++    js_free_rt(rt, rt->aot_bound);
++#endif
+@@ -64362,0 +64370,2 @@
++    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL)
++        b->realm->rt->aot_bound[b->aot_index] = 0;
+@@ -64389,0 +64399,5 @@
++            if (b->realm->rt->aot_bound == NULL)
++                b->realm->rt->aot_bound = js_mallocz_rt(b->realm->rt, qjs_aot_count);
++            if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
++                return;         /* another live bytecode holds this function */
++            b->realm->rt->aot_bound[mid] = 1;
+@@ -77632,0 +77647,4 @@
++    /* After the register PIC went (every entry reset moves aot_pic_epoch), the unit index is free for
++       another bytecode to bind. */
++    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL)
++        rt->aot_bound[b->aot_index] = 0;

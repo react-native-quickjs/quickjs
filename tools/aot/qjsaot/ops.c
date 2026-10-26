@@ -12239,7 +12239,12 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         }
         for (g = 0; g < fn->ninl; g++)
           if (e_copy_nfold(fn, g) > 0) fprintf(f, "    static uint8_t e_gfc%d;\n", g);
-        fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
+        /* An inline body is entered through its function's entry guard, and the engine binds that entry
+           to one live bytecode, so the epoch alone says the statics are the ones for `pic`. */
+        if (g_e_inl)
+          fprintf(f, "    if (__builtin_expect(q2_ep == e_vep, 1)) {\n");
+        else
+          fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
         if (g_e_pic_defer) fprintf(f, "      __builtin_assume(pic != NULL);\n");
         for (g = 0, gk = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];

@@ -769,6 +769,10 @@ struct JSRuntime {
     /* Set once the unit's chains are laid out. A chain allocates, which must
        never happen inside a compiled body, so the build runs at the first bind. */
     uint8_t aot_layouts_built;
+    /* One byte per unit index: set while a live bytecode is bound to that compiled function. The
+       compiled bodies keep one set of cached facts per function, so a second live instance of the
+       same code is left unbound and runs in the interpreter. */
+    uint8_t *aot_bound;
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
@@ -4457,6 +4461,9 @@ void JS_FreeRuntime(JSRuntime *rt)
             JS_FreeAtomRT(rt, cl->class_name);
         }
     }
+#if QJS_AOT || QJS_AOT_GEN
+    js_free_rt(rt, rt->aot_bound);
+#endif
     js_free_rt(rt, rt->class_array);
 
     /* Drop the interned RegExp flag-name atoms before the atom leak scan. */
@@ -64360,6 +64367,8 @@ static void js_aot_bind(JSFunctionBytecode *b)
     uint8_t digest[16];
     uint32_t lo, hi;
 
+    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL)
+        b->realm->rt->aot_bound[b->aot_index] = 0;
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
     b->aot_index = UINT32_MAX;
@@ -64387,6 +64396,11 @@ static void js_aot_bind(JSFunctionBytecode *b)
                 return;
             }
 #endif
+            if (b->realm->rt->aot_bound == NULL)
+                b->realm->rt->aot_bound = js_mallocz_rt(b->realm->rt, qjs_aot_count);
+            if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
+                return;         /* another live bytecode holds this function */
+            b->realm->rt->aot_bound[mid] = 1;
             b->aot_fn = (void *)qjs_aot_table[mid].fn;
             b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
             b->aot_index = mid;
@@ -77630,6 +77644,10 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     /* release register-PIC-held shape refs and free the table */
     js_free_regvm_pic(rt, b);
 #if QJS_AOT || QJS_AOT_GEN
+    /* After the register PIC went (every entry reset moves aot_pic_epoch), the unit index is free for
+       another bytecode to bind. */
+    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL)
+        rt->aot_bound[b->aot_index] = 0;
     /* The polymorphic property cache is independent of the register PIC, so it
        is released here rather than in js_free_regvm_pic, which returns early
        when a function has no PIC at all. */
