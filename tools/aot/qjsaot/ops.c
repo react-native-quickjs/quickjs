@@ -13491,7 +13491,7 @@ static int e_emit_inline_body_v(
     snprintf(why, whyn, "not a plain function");
     return 0;
   }
-  if (fn->ninsns > 64) {
+  if (fn->ninsns > 96) {
     snprintf(why, whyn, "%d instructions", fn->ninsns);
     return 0;
   }
