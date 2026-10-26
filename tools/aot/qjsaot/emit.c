@@ -618,7 +618,7 @@ int e_emit_inline_func(
     snprintf(why, whyn, "the IR did not verify");
     return 0;
   }
-  if (getenv("QJS_AOT_NOEICOPY") == NULL) {
+  if (getenv("QJS_AOT_EICOPY") != NULL) {
     Q2Func fn2;
     int have2;
     e_inline_allow_ext = 0;
