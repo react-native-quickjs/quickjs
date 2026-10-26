@@ -5589,12 +5589,12 @@ static int emit_inl_nested_call(
   Q2ValueId spv[E_SPILL_MAX + 1];
   int nsp, resslot;
   const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
-  char winp[48], ib[512], pushr[200], spl[1024], idt[256];
+  char winp[48], ib[512], pushr[512], spl[1024], idt[256];
   int allleaf, cmc = -1;
   const int pub = !g_e_inl || g_e_inl_r;
-  char nrx[32], nrxe[64], rax[48];
+  char nrx[32], nrxe[64], rax[48], rrx[48];
   int tlay = g_e_facts != NULL ? g_e_facts->thislay[e_insn_idx(fn, in)] : 0;
-  const char *popr = g_e_inl ? "        E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
+  const char *popr = g_e_inl ? "        if (rr_) rr_->ifunc = NULL; else E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
 
   if (t == NULL || cur == NULL) return 0;
   if (!call_site_shaped(fn, in)) {
@@ -5630,6 +5630,9 @@ static int emit_inl_nested_call(
     snprintf(nrxe, sizeof(nrxe), "0");
   snprintf(rax, sizeof(rax), "%s",
            !pub ? "NULL" : g_e_inl ? "(ra_x_ ? ra_ + RB_ : NULL)" : "ra_ + RB_");
+  /* The record the callee's inline body shares: the outermost body's own, when the window is
+     published through it. */
+  snprintf(rrx, sizeof(rrx), "%s", !pub ? "NULL" : g_e_inl ? "(ra_x_ ? rr_ : NULL)" : "rec_");
   w = in->win_reg * 16;
   if (!pub)
     snprintf(winp, sizeof(winp), "&AOT_REG(fr, %d)", w);
@@ -5799,9 +5802,13 @@ static int emit_inl_nested_call(
     if (g_e_inl)
       snprintf(
           pushr, sizeof(pushr),
-          "        JSAotFlRec ir_ = { E_FL_TOP(ctx_in), co, %d, %s, %s };\n"
-          "        E_FL_TOP(ctx_in) = &ir_;\n",
-          in->next - 1, nrxe, g_e_inl_r ? "ra_x_ ? NULL : ra_" : "NULL");
+          "        JSAotFlRec ir_;\n"
+          "        if (rr_) { rr_->ifunc = co; rr_->ipc = %d; }\n"
+          "        else {\n"
+          "            ir_ = (JSAotFlRec){ E_FL_TOP(ctx_in), co, %d, %s, %s };\n"
+          "            E_FL_TOP(ctx_in) = &ir_;\n"
+          "        }\n",
+          in->next - 1, in->next - 1, nrxe, g_e_inl_r ? "ra_x_ ? NULL : ra_" : "NULL");
     else
       pushr[0] = 0;
     if (qjs_aot_inline_has(callee[k]) && qjs_aot_inline_rz(callee[k]) > g_e_child_max)
@@ -5811,10 +5818,10 @@ static int emit_inl_nested_call(
           ib, sizeof(ib),
           "#ifdef Q2_INLINE_%s\n"
           "        if (!(_r = ei_%s%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o, %s, %d)))\n"
+          "                    %s, %d, &_o, %s, %d, %s)))\n"
           "#endif\n",
           callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, winp, na, rax,
-          tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay);
+          tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, rrx);
     if (getenv("QJS_AOT_INL_CONTROL") != NULL &&
         strcmp(getenv("QJS_AOT_INL_CONTROL"), "noident") == 0)
       fprintf(f, "    if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) {\n"
@@ -5832,10 +5839,10 @@ static int emit_inl_nested_call(
           "        JSValue _o; int _r = 1;\n"
           "#ifdef Q2_INLINE_%s\n"
           "        if ((_r = ei_%s%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    %s, %d, &_o, %s, %d))) {\n"
+          "                    %s, %d, &_o, %s, %d, %s))) {\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) %s\n",
           idt, callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, winp, na, rax,
-          tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, excret);
+          tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, rrx, excret);
       e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
       fprintf(
@@ -7313,7 +7320,7 @@ static int emit_pure_call(
         "        JSValue _o; int _r;\n"
         "        E_CAP(f, %d);\n"
         "        if (!(_r = ei_%s%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "                    args_, %d, &_o, NULL, 0))) goto vx_%d;\n",
+        "                    args_, %d, &_o, NULL, 0, NULL))) goto vx_%d;\n",
         e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], g_e_nolazy ? "_n" : "", cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
@@ -7681,7 +7688,7 @@ static int emit_typed_call(
           f,
           "#ifdef Q2_INLINE_%s\n"
           "        if (!(_r = ei_%s%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-          "                    &AOT_REG(fr, %d), %d, &_o, NULL, 0)))\n"
+          "                    &AOT_REG(fr, %d), %d, &_o, NULL, 0, NULL)))\n"
           "#endif\n",
           callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, w, na);
     fprintf(
@@ -11961,7 +11968,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "static inline __attribute__((always_inline)) int ei_%s%s(JSContext "
           "*ctx_in, JSRegRun *caller_f,\n"
           "                               JSObject *co, JSValue this_obj,\n"
-          "                               JSValue *argv, int argc, JSValue *out, JSValue *ra_x_, int this_ok_)\n"
+          "                               JSValue *argv, int argc, JSValue *out, JSValue *ra_x_, int this_ok_,\n"
+          "                               JSAotFlRec *rr_)\n"
           "{\n"
           "    _Static_assert(QJS_DRC, \"an inline body needs deferred counting\");\n"
           "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
@@ -11985,7 +11993,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_last_inl_rz = 0;
       fprintf(f, "    (void)ra_x_;\n");
     }
-    if (g_e_inl) fprintf(f, "    (void)this_ok_;\n");
+    if (g_e_inl) fprintf(f, "    (void)this_ok_; (void)rr_;\n");
     } else
     fprintf(
         f,
@@ -13104,6 +13112,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "    rec.func = co;\n"
         "    rec.pc = 0;\n"
         "    rec.nroots = 0;\n"
+        "    rec.ifunc = NULL;\n"
         "    *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = &rec;\n"
         "    r = aot_nb_%s(ctx_in, caller_f, co, this_obj, argv, argc, &rec);\n"
         "    *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = rec.prev;\n"
