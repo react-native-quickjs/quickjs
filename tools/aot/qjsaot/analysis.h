@@ -168,6 +168,10 @@ typedef struct EFacts {
   /* Per call instruction: the contracted layout (1-based, 0 for none) its receiver is known to
      be in when the call starts, so an inlined callee whose entry tests that layout need not. */
   uint8_t *thislay;
+  /* Per grouped store into a contracted layout: 1 when the store itself tests that the layout has no
+     prototype object (its bit of the runtime's broken word), 2 when an earlier store on every path
+     has tested it and no call that could set it has run since (the call's recheck covers that). */
+  uint8_t *noproto;
   /* Per get_field_chain: 1 + the earlier chain result that already holds this chain's first link
      (same receiver and atom, no store of that atom, no safepoint between). The chain reuses it
      instead of loading the first link, and the second link's receiver is that value. */

@@ -91,6 +91,9 @@ unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
 #define E_CELLV(site) (0x40000000 + (site))
 /* The shape fact of `this` of the activation. */
 #define E_THISV 0x10000000
+/* "No object of layout `lay` is a prototype": held with the shape facts, under a value no receiver has,
+   so it is kept across a call exactly as a contracted layout's shape facts are. */
+#define E_NOPROTOV(lay) (E_THISV + 1 + (lay))
 /* An array fact's value in the same list: `rv` is a dense array whose base pointer and count
    are in locals. Group 0. */
 #define E_ARRV(rv) (0x20000000 + (rv))
@@ -1089,6 +1092,13 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
         f->nskip++;
       }
       if (fs_add_shape(s, rv, g) < 0) return -1;
+      if (ref[r].is_store && in->rop == ROP_put_field && in->extcall == 0 && nr == 1) {
+        int pure = 0, lay = e_facts_group_layout(fn, f, g, &pure);
+        if (lay != 0 && pure) {
+          f->noproto[insn] = fs_has_shape(s, E_NOPROTOV(lay), g) ? 2 : 1;
+          if (fs_add_shape(s, E_NOPROTOV(lay), g) < 0) return -1;
+        }
+      }
       /* The site's own cell: a cell fact is held with the shape facts under a value no
          receiver has, and dies with them at a safepoint. */
       if (fs_has_shape(s, E_CELLV(ref[r].site), g)) f->cellskip[insn] |= (uint8_t)(1u << r);
@@ -1498,6 +1508,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->laymask = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(uint64_t));
   out->thislay = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->noproto = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->cfwd = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int32_t));
   out->narr_vals = fn->nvalues;
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
@@ -1507,7 +1518,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->cfwd == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->noproto == NULL || out->cfwd == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1721,6 +1732,7 @@ void e_facts_free(EFacts *f) {
   free(f->purecall);
   free(f->laymask);
   free(f->thislay);
+  free(f->noproto);
   free(f->cfwd);
   free(f->arr_used);
   free(f->arr_pk);

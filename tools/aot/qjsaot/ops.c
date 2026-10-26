@@ -8539,6 +8539,15 @@ static int emit_poly_write(
 static int emit_inl_field_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int site,
     Q2ValueId rv, const char *boxed);
+/* A store whose no-prototype fact was derived must be emitted by the grouped write that tests the
+   bit: any other form would leave a later store without the test the fact stands for. */
+static int e_np_bail(const Q2Func *fn, const Q2Insn *in) {
+  if (g_e_facts != NULL && g_e_facts->noproto[e_insn_idx(fn, in)] != 0) {
+    fprintf(stderr, "qjsaot: store at pc %d carries a no-prototype fact but is not a grouped write\n", in->pc);
+    abort();
+  }
+  return 0;
+}
 static int emit_typed_field_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -8546,25 +8555,25 @@ static int emit_typed_field_write(
   Q2ValueId rv, vv;
   int site, rreg, vreg, r;
 
-  if (!have_types || t == NULL) return 0;
-  if (in->rop != ROP_put_field) return 0;
+  if (!have_types || t == NULL) return e_np_bail(fn, in);
+  if (in->rop != ROP_put_field) return e_np_bail(fn, in);
   /* the store of a call's result: the call made it */
   if (in->extcall == 2) {
     g_e_miss_exit_seen = 1;
     return 1;
   }
-  if (role == NULL || role->control != E_CF_NONE) return 0;
-  if (in->nuse < 2 || in->narg < 4 || in->arg[2].kind != 's') return 0;
+  if (role == NULL || role->control != E_CF_NONE) return e_np_bail(fn, in);
+  if (in->nuse < 2 || in->narg < 4 || in->arg[2].kind != 's') return e_np_bail(fn, in);
   site = (int)in->arg[2].val;
   rv = in->use[0];
   vv = in->use[1];
-  if (rv >= (Q2ValueId)t->nvalues || vv >= (Q2ValueId)t->nvalues) return 0;
+  if (rv >= (Q2ValueId)t->nvalues || vv >= (Q2ValueId)t->nvalues) return e_np_bail(fn, in);
   /* The RECEIVER must be a TAG local (a number receiver misses the PIC anyway), but
      the VALUE may be typed: it is boxed for the frame slot the helper reads. */
-  if (t->lb[rv] != E_LB_TAG) return 0;
+  if (t->lb[rv] != E_LB_TAG) return e_np_bail(fn, in);
   rreg = fn->values[rv].reg;
   vreg = fn->values[vv].reg;
-  if (rreg < 0 || rreg >= fn->nregs || vreg < 0 || vreg >= fn->nregs) return 0;
+  if (rreg < 0 || rreg >= fn->nregs || vreg < 0 || vreg >= fn->nregs) return e_np_bail(fn, in);
 
   {
     char boxed[64];
@@ -9500,14 +9509,28 @@ static int emit_group_write(
     int site, Q2ValueId rv, const char *boxed) {
   char test[320], recv[32], woff[96];
   int skip = g_e_facts->skip[e_insn_idx(fn, in)];
+  int np = g_e_facts->noproto[e_insn_idx(fn, in)];
+  if (np != 0 && e_group_layout(g) == 0) {
+    fprintf(stderr, "qjsaot: store at pc %d: a no-prototype fact for a group that is not contracted\n", in->pc);
+    abort();
+  }
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_slot_off(woff, sizeof(woff), g, site);
   e_group_exit_stub(f, in, cur, rv);
   e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 1);
   fprintf(f, "    {\n");
-  fprintf(
-      f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
-      test, recv, in->pc);
+  /* A store into a contracted layout tests that the layout has no prototype object once on a path,
+     by its bit; the test the engine's prototype flag would give is then redundant. */
+  if (np == 1)
+    fprintf(
+        f, "      if (__builtin_expect(%s || (Q2_LAYOUT_BROKEN(ctx) & 0x%llxull), 0)) goto vx_%d;\n",
+        test, 1ULL << (e_group_layout(g) - 1), in->pc);
+  else if (np == 2)
+    fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  else
+    fprintf(
+        f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
+        test, recv, in->pc);
   if (in->own > 0 && g_e_undo_id != NULL && g_e_undo_id[e_insn_idx(fn, in)] >= 0) {
     /* a store of a copied callee: kept so that a way out of the copy can put it back */
     int id = g_e_undo_id[e_insn_idx(fn, in)];
