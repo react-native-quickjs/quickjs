@@ -1587,12 +1587,16 @@
       "sha256": "49dbed6e842b07b17ad1c093d1f5754e3cc698e1d2aaef04960e1f5f562aea74"
     },
     {
+      "name": "0403-aot-fl-record-inline-frame.patch",
+      "sha256": "620a3d7c3e3e2a46e9bfb2cd7fe8d6ab2bc3f07858f0ceee80c80800e4fac8de"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "71a703b14dfe121bc285e84d1b77145c2d414ba3d306b6433abd2672b1ea0fcb",
+    "quickjs.c": "0b7fd353177ce759bd4abb99fd9aa615253efccbf45e34c5355d57676f055a06",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -1,0 +1,42 @@
+Subject: A frameless function's record carries the inlined body that is calling a compiled function
+
+What this does
+  - `JSAotFlRec` gains `ifunc` and `ipc`: the function and bytecode offset of the inlined body
+    that is in the middle of a call to a compiled function with its own record. NULL when none.
+  - `regvm_merge_fl_records` reports that frame between the callee's frames and the record's own.
+
+Why we need it
+  An inlined body used to push a record of its own around such a call, five words linked into
+  the runtime's list and unlinked after. At most one inlined body per frameless function is in
+  that state at a time, so the shared record holds it in two stores, and one to clear it.
+
+Functions touched
+  `regvm_merge_fl_records`; the `JSAotFlRec` type in `quickjs-aot-rt.h`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27599,0 +27600,9 @@
++            if (r->ifunc != NULL) {
++                tmp[n].func = JS_MKPTR(JS_TAG_OBJECT, r->ifunc);
++                tmp[n].cur_pc = NULL;
++                tmp[n].rpc = (int)r->ipc;
++                tmp[n].sf = NULL;
++                n++;
++                if (n >= max || n >= 128)
++                    break;
++            }
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -46 +46,6 @@
+-   scans. Records live on the C stack and are linked innermost-first. */
++   scans. Records live on the C stack and are linked innermost-first.
++
++   Bodies inlined into such a function share its record. One of them at a time is in the middle
++   of a call to a compiled function that has its own record: `ifunc`, when set, is that body's
++   function (borrowed: the caller's window keeps it alive for the call) and `ipc` the bytecode
++   offset of the call. It is reported as a frame between the callee's and the record's own. */
+@@ -52,0 +58,2 @@
++    JSObject *ifunc;
++    uint32_t ipc;

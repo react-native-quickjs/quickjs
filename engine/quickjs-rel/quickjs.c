@@ -27597,6 +27597,15 @@ static int regvm_merge_fl_records(JSRuntime *rt, JSRegBtFrame *bt, uintptr_t *an
     i = 0;
     while (n < max && n < 128) {
         if (r != NULL && (i >= nb || (uintptr_t)r < anc[i])) {
+            if (r->ifunc != NULL) {
+                tmp[n].func = JS_MKPTR(JS_TAG_OBJECT, r->ifunc);
+                tmp[n].cur_pc = NULL;
+                tmp[n].rpc = (int)r->ipc;
+                tmp[n].sf = NULL;
+                n++;
+                if (n >= max || n >= 128)
+                    break;
+            }
             tmp[n].func = JS_MKPTR(JS_TAG_OBJECT, r->func);
             tmp[n].cur_pc = NULL;
             tmp[n].rpc = (int)r->pc;
