@@ -1631,12 +1631,16 @@
       "sha256": "addd6eb59e8b98d0602d3b46efc30b86aaff3c2245ad73b2a4853bb626e2ed51"
     },
     {
+      "name": "0414-aot-layout-break-moves-epoch.patch",
+      "sha256": "2485bacbc52fa8ae008f5924a2980bfe135c80d06622c3a0f66726e075cc52cf"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "3d6b6ff6110080c1998ecc63e907f9c2fbf6dbe2f4f85057aa1a8566a0c301e9",
+    "quickjs.c": "ab18d2cb280ede6fa8dc7700753d80ae561ac6b572093f5b05353af676201e08",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -16388,12 +16388,31 @@ static bool check_define_prop_flags(int prop_flags, int flags)
    shape being LEFT is tested: one load of a field already in cache. The bit is
    permanent, like a map deprecation, and a body that relied on the layout goes
    to its generic body from then on. */
+
+/* A layout's promises are broken for good. The cache epoch moves with the first break of each
+   layout (one-way: at most once per layout), so a compiled body that compares the epoch after a
+   safepoint also learns of the break. The interpreter's `ic_watchpoint_epoch` does not move: a
+   layout break says nothing about interpreter IC entries. */
+static void js_aot_layout_break(JSRuntime *rt, uint32_t layout_id)
+{
+    uint64_t bit = 1ULL << (layout_id - 1);
+    if (rt->aot_layout_broken & bit)
+        return;
+    rt->aot_layout_broken |= bit;
+#ifdef QJS_KIT_TEST_KNOBS
+    if (getenv("QJS_AOT_NOEPOCHBUMP"))
+        return;
+#endif
+    rt->aot_epoch_bumps++;
+    rt->aot_pic_epoch++;
+}
+
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
 {
     /* At most 63 layouts are ever emitted, which the bind path asserts, so an id
        that reaches here is 1..63 and the shift is defined. */
     if (unlikely(old_sh != NULL && old_sh->layout_id != 0))
-        rt->aot_layout_broken |= 1ULL << (old_sh->layout_id - 1);
+        js_aot_layout_break(rt, old_sh->layout_id);
 }
 
 /* An object becomes a prototype. A compiled store into a slot of a contracted layout's object
@@ -16405,7 +16424,7 @@ static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p)
     if (unlikely(!p->is_prototype)) {
         p->is_prototype = true;
         if (unlikely(p->shape->layout_id != 0))
-            rt->aot_layout_broken |= 1ULL << (p->shape->layout_id - 1);
+            js_aot_layout_break(rt, p->shape->layout_id);
     }
 }
 
@@ -16526,7 +16545,7 @@ static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot,
     claim = rt->aot_slot_claim[id - 1][slot];
     if (claim != 0 && !js_aot_claim_ok(v, claim)) {
         js_aot_claim_trace("store", id, slot, v, claim);
-        rt->aot_layout_broken |= 1ULL << (id - 1);
+        js_aot_layout_break(rt, id);
     }
 }
 
@@ -16576,7 +16595,7 @@ static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p, bool filled)
     /* A prototype object entering a contracted shape breaks it: the layout promises that none
        of its objects is one. This runs whether or not the layout makes any slot promise. */
     if (unlikely(p->is_prototype)) {
-        rt->aot_layout_broken |= 1ULL << (id - 1);
+        js_aot_layout_break(rt, id);
         return;
     }
     if (!((rt->aot_claimed >> (id - 1)) & 1))
@@ -16588,7 +16607,7 @@ static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p, bool filled)
         uint8_t claim = rt->aot_slot_claim[id - 1][f];
         if (claim != 0 && !js_aot_claim_ok(p->prop[f].u.value, claim)) {
             js_aot_claim_trace("enter", id, f, p->prop[f].u.value, claim);
-            rt->aot_layout_broken |= 1ULL << (id - 1);
+            js_aot_layout_break(rt, id);
             return;
         }
     }
@@ -16623,7 +16642,7 @@ static inline void js_aot_content_last(JSRuntime *rt, JSObject *p)
             uint8_t claim = rt->aot_slot_claim[id - 1][n - 1];
             if (claim != 0 && !js_aot_claim_ok(p->prop[n - 1].u.value, claim)) {
                 js_aot_claim_trace("last-slot add", id, n - 1, p->prop[n - 1].u.value, claim);
-                rt->aot_layout_broken |= 1ULL << (id - 1);
+                js_aot_layout_break(rt, id);
             }
         }
     }
@@ -65061,7 +65080,7 @@ QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32
     if (!ok) {
         /* a promise the unit relies on and the engine cannot enforce: the layout runs generic */
         if (layout_id != 0 && layout_id <= 63)
-            rt->aot_layout_broken |= 1ULL << (layout_id - 1);
+            js_aot_layout_break(rt, layout_id);
         return 0;
     }
     rt->aot_slot_claim[layout_id - 1][slot] = (uint8_t)claim;
@@ -65140,7 +65159,7 @@ QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
     final_sh = p->shape;
     final_sh->layout_id = (uint16_t)layout_id;
     if (js_aot_layout_held_by_prototype(ctx->rt, final_sh))
-        ctx->rt->aot_layout_broken |= 1ULL << (layout_id - 1);
+        js_aot_layout_break(ctx->rt, layout_id);
     JS_FreeValue(ctx, obj);
     return stored;
 fail:
