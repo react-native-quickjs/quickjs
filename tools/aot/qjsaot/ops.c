@@ -2856,6 +2856,14 @@ static void e_emit_group_recheck_at(
   unsigned long long lm = g_e_facts != NULL ? (unsigned long long)g_e_facts->laymask[e_insn_idx(fn, in)] : 0;
   char lt[96] = "";
   if (!g_e_nolazy && !g_e_epoch_skip && lm == 0) return;
+  /* An inline body's call whose result is the body's return value is followed by nothing that reads
+     the facts; the caller tests them where the body returns. */
+  if (g_e_inl && (in->rop == ROP_call || in->rop == ROP_call_method) && e_insn_idx(fn, in) + 1 < fn->ninsns) {
+    const Q2Insn *nx = &fn->insns[e_insn_idx(fn, in) + 1];
+    if (nx->rop == ROP_return && nx->narg >= 1 && nx->arg[0].kind == 'r' && in->narg >= 1 && in->arg[0].kind == 'r' &&
+        (nx->arg[0].val >> 4) == (in->arg[0].val >> 4))
+      return;
+  }
   /* The shape facts of these layouts were kept across the instruction: an object leaves a layout
      only by setting its bit. */
   if (lm != 0) snprintf(lt, sizeof(lt), "Q2_LAYOUT_BROKEN(ctx) & 0x%llxull", lm);
