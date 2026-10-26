@@ -1615,12 +1615,16 @@
       "sha256": "7dd65100804ce990dec0e174a6c9a02ff8dcbecbf517369e4560f9506956d21a"
     },
     {
+      "name": "0410-aot-profile-slot-contents.patch",
+      "sha256": "0dceea7827b25e3155ffef89ce5833298408c9508a30430374d339d82fa9e9ea"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "bd1dd0ddb372a3afa56d628096b30987a67976706434ff66ba2845c9b24e9c0c",
+    "quickjs.c": "4e1190368a2e02c4b2cc880a03098d23ff096bdb7e47ce620383d76c6c2442f9",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -63769,6 +63769,86 @@ static int aot_code_has_debug(const JSFunctionBytecode *b)
     return 0;
 }
 
+/* What the live objects hold in the slots of every shape of the table: one `V <shape> <slot>
+   types=<set> vs=<shapes> vm=<0|1>` line per slot that held a value. `vs` lists up to four
+   shapes of table index the object values had; `vm` is set when there were more, or when an
+   object value's shape is not in the table. */
+#define AOT_CONT_SHAPES 4
+#define AOT_PROF_MAX_SLOTS 32
+typedef struct AotCont {
+    uint16_t types;
+    uint8_t nvs, vm;
+    int16_t vs[AOT_CONT_SHAPES];
+} AotCont;
+
+static void aot_dump_contents(FILE *f, JSRuntime *rt, int nshapes)
+{
+    struct list_head *el;
+    AotCont *tab;
+    int i, k;
+
+    if (nshapes <= 0)
+        return;
+    tab = js_mallocz_rt(rt, sizeof(*tab) * (size_t)nshapes * AOT_PROF_MAX_SLOTS);
+    if (tab == NULL)
+        return;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSObject *p;
+        JSShape *sh;
+        JSShapeProperty *prs;
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        p = (JSObject *)gp;
+        sh = p->shape;
+        if (!sh->aot_prof_seen || p->is_exotic || sh->prop_count > AOT_PROF_MAX_SLOTS)
+            continue;
+        prs = get_shape_prop(sh);
+        for (i = 0; i < sh->prop_count; i++) {
+            AotCont *c = &tab[(size_t)sh->aot_prof_id * AOT_PROF_MAX_SLOTS + (size_t)i];
+            JSValue v;
+            uint16_t bit;
+            if (prs[i].atom == JS_ATOM_NULL || (prs[i].flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                continue;
+            v = p->prop[i].u.value;
+            if (js_lazy_marker_is(v))
+                continue;
+            bit = aot_tag_class(v);
+            c->types |= bit;
+            if (bit == AOT_TYPE_OBJECT) {
+                JSShape *vsh = JS_VALUE_GET_OBJ(v)->shape;
+                if (!vsh->aot_prof_seen) {
+                    c->vm = 1;
+                } else {
+                    for (k = 0; k < c->nvs; k++)
+                        if (c->vs[k] == (int16_t)vsh->aot_prof_id)
+                            break;
+                    if (k == c->nvs) {
+                        if (c->nvs < AOT_CONT_SHAPES)
+                            c->vs[c->nvs++] = (int16_t)vsh->aot_prof_id;
+                        else
+                            c->vm = 1;
+                    }
+                }
+            }
+        }
+    }
+    for (i = 0; i < nshapes; i++)
+        for (k = 0; k < AOT_PROF_MAX_SLOTS; k++) {
+            AotCont *c = &tab[(size_t)i * AOT_PROF_MAX_SLOTS + (size_t)k];
+            int j;
+            if (c->types == 0)
+                continue;
+            fprintf(f, "V %d %d types=%u vs=", i, k, (unsigned)c->types);
+            if (c->nvs == 0)
+                fprintf(f, "-1");
+            for (j = 0; j < c->nvs; j++)
+                fprintf(f, "%s%d", j ? "," : "", (int)c->vs[j]);
+            fprintf(f, " vm=%u\n", (unsigned)c->vm);
+        }
+    js_free_rt(rt, tab);
+}
+
 static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
 {
     JSAotProfFunc *pf = b->aot_prof;
@@ -64041,6 +64121,15 @@ void js_aot_prof_dump(JSRuntime *rt)
                               ? NULL
                               : list_entry(rt->context_list.next, JSContext, link);
         aot_dump_shapes(f, rt, ctx0);
+        {
+            int nseen = 0;
+            list_for_each(el, &rt->gc_obj_list) {
+                JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+                if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_SHAPE && ((JSShape *)gp)->aot_prof_seen)
+                    nseen++;
+            }
+            aot_dump_contents(f, rt, nseen);
+        }
     }
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
