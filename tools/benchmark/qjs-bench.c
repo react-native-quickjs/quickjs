@@ -46,6 +46,15 @@ static JSValue js_print(
 }
 
 /* Runs the cycle collector: the cases that need to know an object graph is freed or kept. */
+#ifdef QJS_KIT_HTMLDDA
+/* Kit only: an object that compares equal to null, the host's way of making one. */
+static JSValue js_make_htmldda(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  JSValue f = JS_NewCFunction(ctx, js_print, "htmldda", 0);
+  JS_SetIsHTMLDDA(ctx, f);
+  return f;
+}
+#endif
 static JSValue js_force_gc(
     JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JS_RunGC(JS_GetRuntime(ctx));
@@ -219,6 +228,10 @@ int main(int argc, char **argv) {
       JS_NewCFunction(ctx, js_host_add, "host_add", 2));
   JS_SetPropertyStr(
       ctx, global, "gc", JS_NewCFunction(ctx, js_force_gc, "gc", 0));
+#ifdef QJS_KIT_HTMLDDA
+  JS_SetPropertyStr(
+      ctx, global, "makeHTMLDDA", JS_NewCFunction(ctx, js_make_htmldda, "makeHTMLDDA", 0));
+#endif
   JS_SetPropertyStr(
       ctx, global, "newRealm", JS_NewCFunction(ctx, js_new_realm, "newRealm", 0));
   JS_SetPropertyStr(

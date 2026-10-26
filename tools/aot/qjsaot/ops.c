@@ -2838,6 +2838,7 @@ static int g_e_mc_site[E_MC_MAX], g_e_mc_grp[E_MC_MAX], g_e_mc_n;
 static signed char g_e_mono_st[E_MC_MAX];
 static char g_e_mono_callee[E_MC_MAX][33];
 static int g_e_mono_seq, g_e_mono_id;
+static int g_e_sm_stat;
 /* The value each cached read defines, so a call on it knows the callee's bound entry. */
 #define E_MC_VALS 8192
 static signed char g_e_mc_of[E_MC_VALS];
@@ -10882,6 +10883,12 @@ static int emit_tag_branch_null(
   fprintf(f, "    { int c_;\n");
   if (t->lb[a] != E_LB_TAG)
     fprintf(f, "    c_ = 0;\n");
+  else if (nullish && g_e_sm_stat)
+    fprintf(
+        f,
+        "    { uint32_t tg_ = (uint32_t)JS_VALUE_GET_TAG(v%u);\n"
+        "      c_ = tg_ == JS_TAG_NULL || tg_ == JS_TAG_UNDEFINED; }\n",
+        (unsigned)a);
   else if (nullish)
     fprintf(
         f,
@@ -12453,6 +12460,17 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               "      }\n",
               g, g_e_mc_grp[g], g_e_mc_grp[g], g_e_mc_site[g], fi, gen0, g, g_e_mc_grp[g],
               g_e_mc_site[g], g, g, g_e_mono_id, g, g, g_e_mono_id, g, fi, gen0);
+        /* The nullish tests of this body look at the tag alone, which holds while no object with the
+           exotic `== null` behaviour exists. The flag moves the cache epoch when it is set, so a body
+           that is running leaves at its next epoch test and the next entry comes here. */
+        if (getenv("QJS_AOT_NOHTMLDDA_CHECK") == NULL)
+          fprintf(
+              f,
+              "      if (__builtin_expect(Q2_HTMLDDA(ctx), 0)) {\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "      }\n",
+              fi, gen0);
         for (g = 0; g < g_e_mc_n; g++)
           fprintf(f, "      e_vm[%d] = mcv%d; e_vme[%d] = mce%d;\n", g, g, g, g);
         fprintf(f, "      e_vcb = pic; e_vep = q2_ep;\n    }\n");

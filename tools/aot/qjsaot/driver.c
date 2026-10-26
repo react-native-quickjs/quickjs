@@ -2452,7 +2452,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_SHAPE_LAYOUT_ID %uu\n"
           "#define QJS_AOT_OFF_RT_LAYOUT_BROKEN %uu\n"
           "#define QJS_AOT_OFF_RT_LAYOUT_SHAPE %uu\n"
-          "#define QJS_AOT_OFF_RT_LAYOUT_COUNT %uu\n\n"
+          "#define QJS_AOT_OFF_RT_LAYOUT_COUNT %uu\n"
+          "#define QJS_AOT_OFF_RT_HTMLDDA %uu\n\n"
           "#define QJS_AOT_OFF_REGRUN_RET_IP %uu\n"
           "#define QJS_AOT_OFF_REGRUN_FR %uu\n"
           "#define QJS_AOT_OFF_REGRUN_VAR_REFS %uu\n"
@@ -2542,7 +2543,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_ctx_gv_cells, lay.sizeof_gv_cell, lay.gv_cell_sets, lay.gv_cell_ways,
           lay.off_gvc_atom, lay.off_gvc_gen, lay.off_gvc_slot, lay.off_gvc_wr,
           lay.off_rt_pic_epoch, lay.off_shape_layout_id, lay.off_rt_layout_broken,
-          lay.off_rt_layout_shape, lay.off_rt_layout_count,
+          lay.off_rt_layout_shape, lay.off_rt_layout_count, lay.off_rt_htmldda,
           lay.off_regrun_ret_ip, lay.off_regrun_fr, lay.off_regrun_var_refs,
           lay.off_regrun_hdr_pack, lay.off_regrun_cap_ip, lay.off_fnbc_realm,
           lay.off_rt_regvm_cur, lay.off_rt_stack_limit, lay.off_rt_fl_top,
@@ -4429,6 +4430,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    for (k_ = 0; k_ < (n_); k_++) *(q2_v2_t *)&(p_)[k_] = u_; } while (0)\n"
         "#define Q2_LAYOUT_BROKEN(ctx_) (*(const uint64_t *)(*(const uint8_t *const *)((const uint8_t *)(ctx_) + "
         "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_LAYOUT_BROKEN))\n"
+        "#define Q2_HTMLDDA(ctx_) (*(const uint8_t *)(*(const uint8_t *const *)((const uint8_t *)(ctx_) + "
+        "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_HTMLDDA))\n"
         "#define Q2_LZ 1\n"
         "#define q2_elem_hit(a, k, o) q2_elem_hit_lz(a, k, o, Q2_LZ)\n"
         "#define q2_own_read_hit(...) q2_own_read_hit_lz(__VA_ARGS__, Q2_LZ)\n"
