@@ -94,6 +94,8 @@ static int emit_hit_result(
 static int *g_e_undo_id;
 static const Q2Func *g_e_undo_fn;
 static int g_e_undo_total;
+static int *g_e_own_id;
+static int g_e_own_total;
 /* The stores of a nest of copies are one set: they are put back together, and released when the
    outermost copy returns. A copy is named by the copy that is the outermost of its nest. */
 static int e_dom(int own) {
@@ -9522,6 +9524,45 @@ static int emit_group_chain(
   return 1;
 }
 
+/* A store whose old value is a register the body reads again keeps that reference in a local that
+   the C scope releases at every way out of the body (the release is q2_free_obj: the inline
+   decrement, and on zero the engine's parking of the value, where a register that still names it
+   is seen by the reconcile). The old value is then not released and parked here and taken again
+   by the call that follows. Only a body without a loop qualifies, so the local is set at most
+   once per activation, and only a store that no copied callee can put back. Until the local is
+   released the object's count has one reference the cycle collector cannot find inside the heap,
+   so it treats the object as held from outside, which keeps it and what it reaches alive. The
+   release is the one the store made before: when it takes the count to zero the object is parked
+   on the zero list, where the reconcile finds a register of a body that left for the generic code
+   and does not free it; a way out of the body reads the old value through that register after the
+   handoff, and the local is released only when the handoff has returned. */
+static void e_own_prepare(const Q2Func *fn) {
+  int i, call_after = -1, loops = 0, blks[16], pcs[16];
+  free(g_e_own_id);
+  g_e_own_id = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int));
+  g_e_own_total = 0;
+  for (i = 0; i < fn->ninsns; i++) g_e_own_id[i] = -1;
+  if (fn->g->ctl_count > 0 || g_e_facts == NULL || g_e_types == NULL) return;
+  loops = e_loop_headers(fn, blks, pcs, 16);
+  if (loops != 0) return;
+  for (i = fn->ninsns - 1; i >= 0; i--) {
+    const Q2Insn *in = &fn->insns[i];
+    int ov;
+    if (e_is_call_family(in->rop)) call_after = i;
+    if (in->rop != ROP_put_field || call_after <= i || in->extcall != 0) continue;
+    if (in->own > 0) continue;
+    ov = g_e_facts->oldval[i] - 1;
+    if (ov < 0 || (unsigned)ov >= (unsigned)g_e_types->nvalues || g_e_types->lb[ov] != E_LB_TAG ||
+        !g_e_facts->oldobj[i])
+      continue;
+    {
+      int r = fn->values[ov].reg;
+      const uint64_t *lo = q2_live_out(fn, i);
+      if (!(lo[r >> 6] >> (r & 63) & 1)) continue;
+    }
+    g_e_own_id[i] = g_e_own_total++;
+  }
+}
 /* A grouped field WRITE: the same tests, plus the prototype flag, then the
    engine's own store order (duplicate the new value, store, free the old one). */
 static int emit_group_write(
@@ -9592,8 +9633,14 @@ static int emit_group_write(
         recv, woff);
   } else {
     int ov = g_e_facts->oldval[e_insn_idx(fn, in)] - 1;
-    if (e_pp_of(recv) >= 0 && ov >= 0 && g_e_types != NULL && (unsigned)ov < (unsigned)g_e_types->nvalues &&
-        g_e_types->lb[ov] == E_LB_TAG)
+    int oid = g_e_own_id != NULL ? g_e_own_id[e_insn_idx(fn, in)] : -1;
+    if (oid >= 0 && ov >= 0 && g_e_facts->oldobj[e_insn_idx(fn, in)]) {
+      if (e_pp_of(recv) >= 0)
+        fprintf(f, "      q2_put_slotpp_own(pp%d, %s, _nv, &own%d, v%d);\n", e_pp_of(recv), woff, oid, ov);
+      else
+        fprintf(f, "      q2_put_slot_own(%s, %s, _nv, &own%d, v%d);\n", recv, woff, oid, ov);
+    } else if (e_pp_of(recv) >= 0 && ov >= 0 && g_e_types != NULL && (unsigned)ov < (unsigned)g_e_types->nvalues &&
+               g_e_types->lb[ov] == E_LB_TAG)
       fprintf(f, "      q2_put_slotpp_k%s(ctx, pp%d, %s, _nv, v%d);\n",
               g_e_facts->oldobj[e_insn_idx(fn, in)] ? "o" : "", e_pp_of(recv), woff, ov);
     else if (e_pp_of(recv) >= 0)
@@ -12563,6 +12610,9 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     (void)any;
   }
   e_undo_prepare(fn);
+  e_own_prepare(fn);
+  for (k = 0; k < g_e_own_total; k++)
+    fprintf(f, "    Q2Own own%d __attribute__((cleanup(q2_own_drop))) = { ctx, JS_UNDEFINED };\n", k);
   for (k = 0; k < g_e_undo_total; k++)
     fprintf(f, "    JSValue *us%d = NULL; JSValue uo%d, un%d; (void)uo%d; (void)un%d;\n", k, k, k, k, k);
   g_e_ta_used = 0;
