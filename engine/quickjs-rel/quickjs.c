@@ -67292,6 +67292,22 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                         js_free_rt(rt, mark);
                     }
                 }
+                /* The digest of every function in the pool, whether or not it has numbers. */
+                if (b->cpool_count > 0 && b->cpool != NULL) {
+                    uint8_t (*fns)[16] = js_mallocz_rt(rt, 16 * (size_t)b->cpool_count);
+                    if (fns) {
+                        int ci;
+                        for (ci = 0; ci < b->cpool_count; ci++) {
+                            JSValue cv = b->cpool[ci];
+                            if (JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE) {
+                                JSFunctionBytecode *cb = JS_VALUE_GET_PTR(cv);
+                                if (!cb->is_lazy && cb->regvm_compiled)
+                                    js_aot_digest(cb, fns[ci]);
+                            }
+                        }
+                        g->cpool_fn = (const uint8_t (*)[16])fns;
+                    }
+                }
             }
             n++;
         }
@@ -67308,6 +67324,7 @@ void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr, int n)
         for (i = 0; i < n; i++) {
             js_free_rt(rt, (void *)arr[i].cpool_num);
             js_free_rt(rt, (void *)arr[i].cpool_numeric);
+            js_free_rt(rt, (void *)arr[i].cpool_fn);
         }
     }
     js_free_rt(rt, arr);

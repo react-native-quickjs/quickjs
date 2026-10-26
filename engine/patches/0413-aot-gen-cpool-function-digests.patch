@@ -1,0 +1,60 @@
+Subject: The generator export carries the digest of every function in a function's constant pool
+
+What this does
+  - `JSAotGenFunc` gets `cpool_fn`: one 16-byte digest per constant-pool entry, all zero when the entry is not a materialized
+    register-compiled function. It is filled for every function with a pool, whether or not the pool has numbers, and freed with the rest.
+
+Why we need it
+  The generator can then follow a `make_closure` to the function it creates, to attribute methods to classes and resolve callees. A zero
+  digest is an unresolved function, which the scan treats as an unknown callee.
+
+Functions touched
+  `js_aot_gen_collect`, `js_aot_gen_free`, `JSAotGenFunc`. Generator build only; nothing in a running engine reads it.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67292,6 +67292,22 @@
+                         js_free_rt(rt, mark);
+                     }
+                 }
++                /* The digest of every function in the pool, whether or not it has numbers. */
++                if (b->cpool_count > 0 && b->cpool != NULL) {
++                    uint8_t (*fns)[16] = js_mallocz_rt(rt, 16 * (size_t)b->cpool_count);
++                    if (fns) {
++                        int ci;
++                        for (ci = 0; ci < b->cpool_count; ci++) {
++                            JSValue cv = b->cpool[ci];
++                            if (JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE) {
++                                JSFunctionBytecode *cb = JS_VALUE_GET_PTR(cv);
++                                if (!cb->is_lazy && cb->regvm_compiled)
++                                    js_aot_digest(cb, fns[ci]);
++                            }
++                        }
++                        g->cpool_fn = (const uint8_t (*)[16])fns;
++                    }
++                }
+             }
+             n++;
+         }
+@@ -67308,6 +67324,7 @@
+         for (i = 0; i < n; i++) {
+             js_free_rt(rt, (void *)arr[i].cpool_num);
+             js_free_rt(rt, (void *)arr[i].cpool_numeric);
++            js_free_rt(rt, (void *)arr[i].cpool_fn);
+         }
+     }
+     js_free_rt(rt, arr);
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -50,6 +50,9 @@
+     int cpool_count;
+     const double *cpool_num;
+     const uint8_t *cpool_numeric;
++    /* For every constant-pool entry that is a function, that function's digest (all zero for any
++       other entry), so the generator can follow a `make_closure` to the function it creates. */
++    const uint8_t (*cpool_fn)[16];
+     /* The light-frame size a direct call needs, when this function is one a
+        compiled caller may enter on the C stack (`light_ok`), i.e. it is light
+        eligible. */

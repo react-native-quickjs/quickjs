@@ -1627,12 +1627,16 @@
       "sha256": "c3c50598a318e318d9caf6068b1a5b27d593b8ddbb0b99539f3e33d0450625c0"
     },
     {
+      "name": "0413-aot-gen-cpool-function-digests.patch",
+      "sha256": "addd6eb59e8b98d0602d3b46efc30b86aaff3c2245ad73b2a4853bb626e2ed51"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "eddc157599ae7144f3e52a9f2fb830d742770c592ab932a99a4600a9502283e2",
+    "quickjs.c": "3d6b6ff6110080c1998ecc63e907f9c2fbf6dbe2f4f85057aa1a8566a0c301e9",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
