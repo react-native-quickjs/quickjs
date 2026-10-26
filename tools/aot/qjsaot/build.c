@@ -1435,7 +1435,11 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
     Q2Inl *iv = &f->inl[k];
     int np = cg->arg_count, pos = 0;
     iv->g = cg;
-    iv->call_pc = req[k].call_pc;
+    iv->parent = req[k].parent;
+    iv->root = req[k].parent < 0 ? k : f->inl[req[k].parent].root;
+    /* exits of a nest leave to the call of its outermost copy */
+    iv->call_pc = req[k].parent < 0 ? req[k].call_pc : f->inl[iv->root].call_pc;
+    iv->gpc = iv->call_pc;
     iv->rbase = rnext;
     rnext += cg->reg_count + np;
     iv->nparam = np;
@@ -1479,7 +1483,9 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
     Q2Insn *in = &f->insns[i];
     int idx = -1;
     for (k = 0; k < nreq; k++)
-      if (in->pc == req[k].call_pc && in->xpc < 0 && (in->rop == ROP_call || in->rop == ROP_call_method)) idx = k;
+      if (req[k].parent < 0 && in->pc == req[k].call_pc && in->xpc < 0 &&
+          (in->rop == ROP_call || in->rop == ROP_call_method))
+        idx = k;
     out[nout++] = *in;
     if (idx >= 0) {
       Q2Insn *gd = &out[nout - 1], *br = &out[nout];
@@ -1518,7 +1524,7 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
     int32_t cb = iv->pcbase + 2 * (iv->nparam + 1), argb = iv->rbase + cg->reg_count, p;
     int32_t dst_off = 0, recv_off = -1, cont_pc = 0, win_reg = 0, win_n = 0;
     for (i = 0; i < nout; i++)
-      if (out[i].pc == iv->call_pc && out[i].inlg == k + 1) call = &out[i];
+      if (out[i].pc == iv->gpc && out[i].inlg == k + 1) call = &out[i];
     if (call == NULL) {
       f->why = "inlined call not found";
       goto fail;
@@ -1575,6 +1581,39 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
       for (a = 0; a < d.ndef; a++) d.def[a] += (Q2ValueId)iv->rbase;
       for (a = 0; a < d.nuse; a++) d.use[a] += (Q2ValueId)iv->rbase;
       if (d.win_n > 0) d.win_reg += iv->rbase;
+      if (s.rop == ROP_call || s.rop == ROP_call_method) {
+        /* the call of a nested copy: a guard and a branch to the copy, as for a call of the function */
+        int ch = -1, w;
+        for (w = k + 1; w < nreq; w++)
+          if (req[w].parent == k && req[w].call_pc == s.pc) ch = w;
+        if (ch >= 0) {
+          Q2Insn *gd = &out[nout++], *br = &out[nout++];
+          Q2Inl *cv = &f->inl[ch];
+          *gd = d;
+          gd->op = Q2_OP_INL_GUARD;
+          gd->inlg = (uint8_t)(ch + 1);
+          gd->ndef = 0;
+          gd->nredef = 0;
+          cv->gpc = d.pc;
+          cv->nkeep = 0;
+          for (w = 0; w < gd->nuse && cv->nkeep < 10; w++) cv->keep[cv->nkeep++] = (int32_t)gd->use[w];
+          for (w = 0; w < gd->win_n && cv->nkeep < 10; w++) cv->keep[cv->nkeep++] = gd->win_reg + w;
+          memset(br, 0, sizeof(*br));
+          br->rop = ROP_branch;
+          br->pc = cv->pcbase - 1;
+          br->next = d.next;
+          br->bpc = d.pc;
+          br->ppc = d.pc;
+          br->xpc = iv->call_pc;
+          br->own = (uint8_t)(k + 1);
+          br->narg = 1;
+          br->arg[0].kind = 't';
+          br->arg[0].val = (int64_t)cv->pcbase - (int64_t)br->next;
+          br->arg[0].off = -1;
+          q2_decode_roles(g, br);
+          continue;
+        }
+      }
       if (s.rop == ROP_get_arg || s.rop == ROP_get_arg2 || s.rop == ROP_put_arg) {
         /* argument slots are the parameter registers */
         int pairs = s.rop == ROP_get_arg2 ? 2 : 1, q;

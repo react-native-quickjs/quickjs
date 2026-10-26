@@ -247,12 +247,14 @@ typedef struct Q2Block {
    instructions start in pc, and the call it replaces. */
 typedef struct Q2InlReq {
   const struct JSAotGenFunc *g;
-  int32_t call_pc;
+  int32_t call_pc; /* a pc of the function, or of the parent's program when `parent` >= 0 */
+  int32_t parent;  /* -1: the call is in the function; else the request whose copy holds it */
 } Q2InlReq;
 
 typedef struct Q2Inl {
   const struct JSAotGenFunc *g;
   int32_t call_pc, rbase, pcbase, pcend, nparam, sbase;
+  int32_t parent, root, gpc; /* the copy holding the call (-1: the function), the outermost copy of the nest, the pc of the guard */
   int32_t keep[10], nkeep; /* the registers the call reads: live throughout the copy */
   int uses_this;           /* the copy reads the receiver */
   int32_t thispc[32], nthis; /* callee pcs of fused reads of `this`, whose profile record also covers `this` */

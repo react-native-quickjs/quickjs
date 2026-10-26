@@ -1931,10 +1931,18 @@ static int inl_extra_rop(uint16_t rop) {
       return 0;
   }
 }
-static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
+/* The calls of the callee last examined that a copy may hold as nested copies. */
+typedef struct InlCall {
+  int pc, rop, win_n;
+} InlCall;
+static InlCall inl_calls[8];
+static int inl_ncalls;
+
+static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) {
   Q2Func cf;
-  int i, ok = 1, has_back_edge = 0;
+  int i, ok = 1, has_back_edge = 0, first_call = -1;
   e_inl_why = "ok";
+  inl_ncalls = 0;
   if (cg->func_kind != 0 || cg->ctl_count != 0 || cg->light_var_count != 0 || cg->arg_count > 6 ||
       cg->len > 400) {
     e_inl_why = "kind/ctl/vars/args/len";
@@ -2002,16 +2010,41 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
            callee must not loop (a store would then be undone twice over). */
         if (in->rop != ROP_put_field || has_back_edge) ok = 0;
         break;
+      case Q2_OP_CALL:
+        /* a call a nested copy stands for (checked by the planner) */
+        if (!allow_calls || inl_ncalls >= 8 || (in->rop != ROP_call && in->rop != ROP_call_method)) {
+          ok = 0;
+          break;
+        }
+        inl_calls[inl_ncalls].pc = in->pc;
+        inl_calls[inl_ncalls].rop = in->rop;
+        inl_calls[inl_ncalls].win_n = in->win_n;
+        inl_ncalls++;
+        if (first_call < 0) first_call = in->pc;
+        break;
       case Q2_OP_FALLBACK:
         /* the loose and strict comparisons, which a copy lowers when both operands are typed
            (checked once the types are known, see e_inline_typed_ok) */
+        if (in->rop == ROP_call || in->rop == ROP_call_method) {
+          /* a call a nested copy stands for (checked by the planner) */
+          if (!allow_calls || inl_ncalls >= 8) {
+            ok = 0;
+            break;
+          }
+          inl_calls[inl_ncalls].pc = in->pc;
+          inl_calls[inl_ncalls].rop = in->rop;
+          inl_calls[inl_ncalls].win_n = in->win_n;
+          inl_ncalls++;
+          if (first_call < 0) first_call = in->pc;
+          break;
+        }
         if (in->rop != ROP_eq && in->rop != ROP_neq && in->rop != ROP_strict_eq && in->rop != ROP_strict_neq)
           ok = 0;
         break;
       default:
         ok = 0;
     }
-    if (!q2_lowered(in->rop) && !inl_extra_rop(in->rop)) ok = 0;
+    if (!q2_lowered(in->rop) && !inl_extra_rop(in->rop) && !(allow_calls && (in->rop == ROP_call || in->rop == ROP_call_method))) ok = 0;
     if (!ok && strcmp(e_inl_why, "ok") == 0) {
       static char why[80];
       char nm[48];
@@ -2020,6 +2053,12 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
       e_inl_why = why;
     }
   }
+  /* a store after a nested call would be undone out of order with the nested copy's own */
+  for (i = 0; ok && first_call >= 0 && i < cf.ninsns; i++)
+    if (cf.insns[i].rop == ROP_put_field && cf.insns[i].pc > first_call) {
+      ok = 0;
+      e_inl_why = "a store after a nested call";
+    }
   q2_free(&cf);
   return ok;
 }
@@ -2055,6 +2094,66 @@ int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci) {
    is about 600 instructions. A call over the budget stays a call. */
 #define E_INLINE_COPY_BYTES 3000
 
+/* Plan callee `cg` as a copy, and the copies of the calls inside it (a call the profile saw with one
+   compiled callee that is itself a copy), in the order a parent precedes its children. Returns 0
+   and leaves the plan as it was if any of them cannot be. */
+static int plan_copy(
+    const JSAotGenFunc *cg, int has_recv, int call_pc, int parent, int depth, Q2InlReq **out, int *n,
+    int *copied, const JSAotGenFunc **chain, int nchain) {
+  InlCall calls[8];
+  int ncalls, idx, k, c, saved_n = *n, saved_copied = *copied;
+  Q2InlReq *q;
+  if (*n >= 6 || *copied + cg->len > E_INLINE_COPY_BYTES) return 0;
+  for (k = 0; k < nchain; k++)
+    if (chain[k] == cg || memcmp(chain[k]->digest, cg->digest, 16) == 0) return 0;
+  if (!inl_callee_ok(cg, has_recv, depth < 2)) {
+    if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok: %s\n", cg->name, e_inl_why);
+    return 0;
+  }
+  ncalls = inl_ncalls;
+  memcpy(calls, inl_calls, sizeof(calls));
+  q = realloc(*out, sizeof(**out) * (size_t)(*n + 1));
+  if (q == NULL) return 0;
+  *out = q;
+  idx = *n;
+  q[idx].g = cg;
+  q[idx].call_pc = call_pc;
+  q[idx].parent = parent;
+  (*n)++;
+  *copied += cg->len;
+  chain[nchain] = cg;
+  for (c = 0; c < ncalls; c++) {
+    char hex[4][33];
+    int kind[4], cnt = 0;
+    unsigned long long hits[4];
+    const JSAotGenFunc *cg2;
+    Q2Func cf;
+    const Q2Insn *ci = NULL;
+    int ci_ok = 0, j;
+    if (q2_build(cg, &cf) == 0) {
+      for (j = 0; j < cf.ninsns; j++)
+        if (cf.insns[j].pc == calls[c].pc) ci = &cf.insns[j];
+      if (ci != NULL && ci->win_n <= 6 && ci->nredef == 0 && ci->ndef == 1 &&
+          (qjs_aot_prof_pc_count(cg->digest, ci->ppc) > 0 || qjs_aot_prof_pc_count(cg->digest, ci->onext) > 0) &&
+          qjs_aot_prof_callees(cg->digest, ci->next, &cnt, hex, kind, hits) && cnt == 1 && kind[0] == 1 &&
+          qjs_aot_unit_has(hex[0]))
+        ci_ok = 1;
+    }
+    q2_free(&cf);
+    cg2 = ci_ok ? qjs_aot_unit_func(hex[0]) : NULL;
+    if (cg2 == NULL || !plan_copy(cg2, calls[c].rop == ROP_call_method, calls[c].pc, idx, depth + 1, out, n,
+                                  copied, chain, nchain + 1)) {
+      if (getenv("QJS_AOT_DEBUG_INL"))
+        fprintf(stderr, "  nested call at pc %d of %s: %s\n", calls[c].pc, cg->name,
+                cg2 == NULL ? "no single compiled callee" : "callee refused");
+      *n = saved_n;
+      *copied = saved_copied;
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
   int i, n = 0, copied = 0;
   *out = NULL;
@@ -2065,7 +2164,8 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
     int kind[4], cnt = 0, k;
     unsigned long long hits[4];
     const JSAotGenFunc *cg;
-    Q2InlReq *q;
+    const JSAotGenFunc *chain[8];
+    Q2InlReq *q = NULL;
     if ((in->rop != ROP_call && in->rop != ROP_call_method) || in->xpc >= 0 || in->own || in->inlg) continue;
     if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "inl %s@%d: win_n=%d nredef=%d ndef=%d count=%llu\n", fn->g->name, in->pc, in->win_n, in->nredef, in->ndef, qjs_aot_prof_pc_count(fn->g->digest, in->ppc));
     if (in->win_n > 6 || in->nredef != 0 || in->ndef != 1) continue;
@@ -2082,7 +2182,6 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
         if ((*out)[k].g == cg) break;
       if (k < n) continue;
     }
-    if (!inl_callee_ok(cg, in->rop == ROP_call_method)) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok: %s\n", cg->name, e_inl_why); continue; }
     if (copied + cg->len > E_INLINE_COPY_BYTES) {
       char fh[33];
       int di;
@@ -2090,13 +2189,9 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
       e_report_copycap(fh, hex[0], copied, cg->len, E_INLINE_COPY_BYTES);
       continue;
     }
-    copied += cg->len;
-    q = realloc(*out, sizeof(**out) * (size_t)(n + 1));
-    if (q == NULL) return n;
-    *out = q;
-    q[n].g = cg;
-    q[n].call_pc = in->pc;
-    n++;
+    chain[0] = fn->g;
+    (void)q;
+    plan_copy(cg, in->rop == ROP_call_method, in->pc, -1, 0, out, &n, &copied, chain, 1);
   }
   return n;
 }

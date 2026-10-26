@@ -92,7 +92,14 @@ static int emit_hit_result(
    slot back first, most recent store first. `g_e_undo_id` numbers the stores by instruction; the order the
    emitter reached them in is the order they run in, since a copy has no loops. */
 static int *g_e_undo_id;
+static const Q2Func *g_e_undo_fn;
 static int g_e_undo_total;
+/* The stores of a nest of copies are one set: they are put back together, and released when the
+   outermost copy returns. A copy is named by the copy that is the outermost of its nest. */
+static int e_dom(int own) {
+  if (own <= 0 || g_e_undo_fn == NULL || g_e_undo_fn->inl == NULL) return own;
+  return g_e_undo_fn->inl[own - 1].root + 1;
+}
 static int g_e_undo_seq[256], g_e_undo_seq_own[256], g_e_undo_seq_n;
 /* An instruction that cannot take a way out of the body (no guard, no type test, no cache test). */
 static int e_never_exits(const Q2Insn *in) {
@@ -108,13 +115,17 @@ static int e_never_exits(const Q2Insn *in) {
 }
 /* A store is logged only if some instruction after it in its copy can still take a way out. */
 static int e_exit_follows(const Q2Func *fn, int i) {
-  int j;
-  for (j = i + 1; j < fn->ninsns && fn->insns[j].own == fn->insns[i].own; j++)
+  int j, dom = e_dom(fn->insns[i].own);
+  for (j = 0; j < fn->ninsns; j++) {
+    if (j == i || e_dom(fn->insns[j].own) != dom) continue;
+    if (fn->insns[j].own == fn->insns[i].own && j < i) continue;
     if (!e_never_exits(&fn->insns[j])) return 1;
+  }
   return 0;
 }
 static void e_undo_prepare(const Q2Func *fn) {
   int i;
+  g_e_undo_fn = fn;
   free(g_e_undo_id);
   g_e_undo_id = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int));
   g_e_undo_total = 0;
@@ -3707,7 +3718,7 @@ static void e_emit_exit_at(
   } else if (lb != NULL) {
     q2_live_before(fn, ins, lb);
   }
-  if (fn->insns[ins].own > 0) e_undo_restore(f, fn->insns[ins].own);
+  if (fn->insns[ins].own > 0) e_undo_restore(f, e_dom(fn->insns[ins].own));
   g_e_exit_ins = ins;
   e_emit_exit(f, fn, pc, hex, fi, cur, lb, handoff, blkidx);
   g_e_exit_ins = -1;
@@ -9352,7 +9363,7 @@ static int emit_group_write(
     fprintf(f, "    }\n");
     if (g_e_undo_seq_n < 256) {
       g_e_undo_seq[g_e_undo_seq_n] = id;
-      g_e_undo_seq_own[g_e_undo_seq_n++] = in->own;
+      g_e_undo_seq_own[g_e_undo_seq_n++] = e_dom(in->own);
     } else {
       fprintf(stderr, "qjsaot: too many stores in copied callees\n");
       abort();
@@ -12326,7 +12337,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       /* A terminator ends the block: a return, branch or switch lowers here, any
          other exits at the terminator's pc. */
       g_e_ta_keep = 0;
-      if (in->inlret) e_undo_release(f, in->own);
+      if (in->inlret && fn->inl[in->own - 1].parent < 0) e_undo_release(f, e_dom(in->own));
       if (role != NULL && role->control != E_CF_NONE) {
         if (g_e_ta_used && !e_ta_keeps(fn, in, &types)) fprintf(f, "    ta_ok = 0;\n");
         if (emit_typed_return(f, fn, in, &types, cur, have_types)) {
