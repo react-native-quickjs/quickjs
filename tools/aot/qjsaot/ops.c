@@ -2845,6 +2845,8 @@ static int e_mc_index(int site) {
 static const ETypes *g_e_types;
 
 static int g_e_recheck_done = -1;
+/* The test of the cache table for NULL waits until the entry validated last time fails to match. */
+static int g_e_pic_defer;
 static void e_emit_group_recheck_at(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur, int exit_pc);
 static void e_emit_group_recheck(
@@ -12098,7 +12100,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
      enough entries), and the speculative body never ran once. The table is only
      needed by accesses, so the check is emitted only when the function has
      sites; and the count is known here, at generation time. */
-  if (e_pic_sites(fn) > 0)
+  g_e_pic_defer = 0;
+  if (e_pic_sites(fn) > 0 && getenv("QJS_AOT_NOPICDEFER") == NULL && getenv("QJS_AOT_NOSTATICSH") == NULL)
+    g_e_pic_defer = 1;
+  if (e_pic_sites(fn) > 0 && !g_e_pic_defer)
     fprintf(
         f,
         "    if (__builtin_expect(pic == NULL, 0)) {\n"
@@ -12130,6 +12135,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     if (e_pic_sites(fn) == 0)
       for (g = 0; g < ng; g++)
         if (g_e_group_used[g]) {
+          if (getenv("QJS_AOT_NOPICDEFER") == NULL && getenv("QJS_AOT_NOSTATICSH") == NULL) {
+            g_e_pic_defer = 1;
+            break;
+          }
           fprintf(
               f,
               "    if (__builtin_expect(pic == NULL, 0)) {\n"
@@ -12191,11 +12200,21 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           }
         }
       g_e_sm_stat = ngu > 0 || ngf > 0;
+      if (g_e_pic_defer && !g_e_sm_stat) {
+        g_e_pic_defer = 0;
+        fprintf(
+            f,
+            "    if (__builtin_expect(pic == NULL, 0)) {\n"
+            "        E_REFUSE_NOTE(%d);\n"
+            "        return %s;\n"
+            "    }\n",
+            fi, gen0);
+      }
       if (ngu > 0 || ngf > 0) {
         int gk = 0, pk = 0;
         fprintf(
             f,
-            "    static const void *e_vg[%d]; static int e_vp[%d]; static uint32_t e_vep; static const void *e_vcb;\n"
+            "    static const void *e_vg[%d]; static int e_vp[%d]; static uint32_t e_vep = ~0u; static const void *e_vcb;\n"
             "    static JSValue e_vm[%d]; static const void *e_vme[%d];\n"
             "    uint32_t q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
             "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
@@ -12213,6 +12232,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         for (g = 0; g < fn->ninl; g++)
           if (e_copy_nfold(fn, g) > 0) fprintf(f, "    static uint8_t e_gfc%d;\n", g);
         fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
+        if (g_e_pic_defer) fprintf(f, "      __builtin_assume(pic != NULL);\n");
         for (g = 0, gk = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
           if (!g_e_group_used[g] || e_entry_skip(g)) continue;
@@ -12223,6 +12243,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         }
         for (g = 0; g < g_e_mc_n; g++) fprintf(f, "      mcv%d = e_vm[%d]; mce%d = e_vme[%d];\n", g, g, g, g);
         fprintf(f, "    } else {\n");
+        if (g_e_pic_defer)
+          fprintf(
+              f,
+              "      if (__builtin_expect(pic == NULL, 0)) {\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "      }\n",
+              fi, gen0);
         if (getenv("QJS_AOT_NOSTATICSH") == NULL)
           fprintf(
               f,
