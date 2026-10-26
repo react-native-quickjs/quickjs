@@ -760,6 +760,9 @@ struct JSRuntime {
     JSShape **aot_layout_shape;
     uint32_t aot_layout_count;
     uint64_t aot_layout_broken;
+    /* Set once an object with the exotic `== null` behaviour exists. A compiled body tests nullish by
+       tag alone only while it is clear; setting it moves the cache epoch. */
+    uint8_t aot_htmldda;
     /* What a contracted layout promises about the value in one of its slots: 0 nothing,
        1..63 an object of that layout or null/undefined, 0x80 a value that is not reference
        counted. A store that breaks the promise sets the layout's broken bit like a shape
@@ -17707,6 +17710,10 @@ void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj)
         return;
     p = JS_VALUE_GET_OBJ(obj);
     p->is_HTMLDDA = true;
+    ctx->rt->aot_htmldda = 1;
+#if JS_ENABLE_IC
+    ic_watchpoint_bump(ctx->rt);
+#endif
 }
 
 static inline bool JS_IsHTMLDDA(JSContext *ctx, JSValueConst obj)
@@ -62482,6 +62489,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_layout_broken = (uint32_t)offsetof(JSRuntime, aot_layout_broken);
     out->off_rt_layout_shape = (uint32_t)offsetof(JSRuntime, aot_layout_shape);
     out->off_rt_layout_count = (uint32_t)offsetof(JSRuntime, aot_layout_count);
+    out->off_rt_htmldda = (uint32_t)offsetof(JSRuntime, aot_htmldda);
     out->off_shape_layout_id = (uint32_t)offsetof(JSShape, layout_id);
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);

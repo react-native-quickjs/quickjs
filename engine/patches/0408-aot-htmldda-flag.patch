@@ -1,0 +1,41 @@
+Subject: The runtime records that an object with the exotic `== null` behaviour exists
+
+What this does
+  - `JSRuntime` gets `aot_htmldda`, set by `JS_SetIsHTMLDDA`, the only place the object bit is set, which also moves the
+    prototype cache epoch.
+  - The layout export carries the field's offset, so the unit's layout hash changes with it.
+
+Why we need it
+  A compiled nullish test looks at the tag alone while no such object exists. The flag is what the unit's entry tests; the
+  epoch move makes a body that is running leave at its next epoch test, and the next entry refuses while the flag is set.
+
+  Soundness: the bit is set only by a host call on an object that already exists. No body runs while that call runs
+  (one thread); every body suspended below it resumes through a call return, where the epoch test follows, and a body
+  entered later reads the flag at its entry. A body that makes no call cannot hold the object before the flag is set
+  and still see it afterwards, since the call that sets the flag is not inside it. A getter, a setter, a proxy trap, a
+  toString or valueOf is a call; an array element, a property slot or a closed variable read is not a way for a new
+  value to arrive: the value was in the heap before, and the flag is set before the next epoch test of any body
+  holding it.
+
+Functions touched
+  `JS_SetIsHTMLDDA`, `js_aot_gen_layout`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -762,0 +763,3 @@
++    /* Set once an object with the exotic `== null` behaviour exists. A compiled body tests nullish by
++       tag alone only while it is clear; setting it moves the cache epoch. */
++    uint8_t aot_htmldda;
+@@ -17709,0 +17713,4 @@
++    ctx->rt->aot_htmldda = 1;
++#if JS_ENABLE_IC
++    ic_watchpoint_bump(ctx->rt);
++#endif
+@@ -62484,0 +62492 @@
++    out->off_rt_htmldda = (uint32_t)offsetof(JSRuntime, aot_htmldda);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -75,0 +76 @@
++    uint32_t off_rt_htmldda;
