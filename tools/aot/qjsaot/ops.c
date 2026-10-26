@@ -6920,8 +6920,12 @@ static int emit_alloc_op(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", r * 16, (unsigned)v);
   }
   fprintf(f, "    { JSValue _o; int _rc;\n");
-  /* The forwarded call runs user code, whose backtrace names this frame at this instruction. */
-  if (in->rop == ROP_apply_arguments) fprintf(f, "      E_CAP(f, %d);\n", in->pc);
+  /* A helper that can run user code (a forwarded call, valueOf or toString) publishes this frame's
+     position on this edge, so a backtrace from inside names the instruction. */
+  if ((e_roles[in->rop] != NULL && e_roles[in->rop]->runs_js) || in->rop == ROP_apply_arguments ||
+      in->rop == ROP_add || in->rop == ROP_sub || in->rop == ROP_mul || in->rop == ROP_div ||
+      in->rop == ROP_mod)
+    fprintf(f, "      E_CAP(f, %d);\n", in->pc);
   fprintf(f, "      _rc = %s;\n", call);
   fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", in->pc);
   fprintf(f, "      if (%s) {\n", okc);
