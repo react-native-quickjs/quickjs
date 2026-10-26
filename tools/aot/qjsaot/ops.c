@@ -9684,7 +9684,17 @@ static int emit_group_write(
      literal, whose commas would split a macro argument. */
   fprintf(f, "      JSValue _nv = %s;\n", boxed);
   if (boxed[0] != 'v') {
-    /* A number or a bool: nothing to duplicate, only the old value to release. */
+    /* A number or a bool: nothing to duplicate, only the old value to release; and nothing to
+       release when the body read this slot's value before as an unboxed number or bool. */
+    const int ov = g_e_facts->oldval[e_insn_idx(fn, in)] - 1;
+    if (ov >= 0 && g_e_types != NULL && (unsigned)ov < (unsigned)g_e_types->nvalues &&
+        (g_e_types->lb[ov] == E_LB_I32 || g_e_types->lb[ov] == E_LB_F64 || g_e_types->lb[ov] == E_LB_BOOL)) {
+      fprintf(f, "      *q2_slotp(%s, %s) = _nv;\n", recv, woff);
+      fprintf(f, "    }\n");
+      e_inl_store_mark(f);
+      g_e_miss_exit_seen = 1;
+      return 1;
+    }
     fprintf(
         f,
         "      JSValue *_sp = q2_slotp(%s, %s);\n"
