@@ -6332,7 +6332,15 @@ static int emit_fl_put_global(
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
     cur[rr] = rv;
   }
-  e_emit_group_recheck(f, fn, in, cur);
+  /* The redefined registers are in their locals, not in the frame, so an exit here names the
+     locals: the recheck sees the store as writing no register. */
+  {
+    Q2Insn *wr = (Q2Insn *)in;
+    const int nre = wr->nredef;
+    wr->nredef = 0;
+    e_emit_group_recheck(f, fn, in, cur);
+    wr->nredef = nre;
+  }
   return 1;
 }
 
