@@ -1187,11 +1187,13 @@ static int emit_native_branch(
             ? "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_NULL"
         : in->rop == ROP_branch_nullish
             ? "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_NULL || "
-              "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_UNDEFINED)"
+              "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_UNDEFINED || "
+              "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_OBJECT && q2_nullish_obj(AOT_REG(fr, %d))))"
             : "(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_NULL && "
-              "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_UNDEFINED)";
-    char buf[256];
-    snprintf(buf, sizeof(buf), test, a, a);
+              "JS_VALUE_GET_TAG(AOT_REG(fr, %d)) != JS_TAG_UNDEFINED && "
+              "!(JS_VALUE_GET_TAG(AOT_REG(fr, %d)) == JS_TAG_OBJECT && q2_nullish_obj(AOT_REG(fr, %d))))";
+    char buf[384];
+    snprintf(buf, sizeof(buf), test, a, a, a, a);
     fprintf(f, "    if (%s) goto g_%d;\n", buf, tgt);
     fprintf(f, "    goto g_%d;\n", in->next);
   }
