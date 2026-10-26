@@ -11529,6 +11529,13 @@ static int e_dispatch_rop(
   return 0;
 }
 
+/* Analysis aid: with QJS_AOT_OPMARK=<file> each emitted body is written there with the byte offset
+   of every instruction in it, so a later pass can map generated lines to the operations that
+   produced them without changing the unit. */
+static FILE *g_opm;
+static FILE *g_opm_ops;
+static char *g_opm_buf;
+static size_t g_opm_len;
 static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]);
 /* A framed speculative body assumes no lazy JSON document exists (it is re-checked at entry
    and after every safepoint), so its loads carry no lazy-marker test; the cache-hit helpers
@@ -11642,6 +11649,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   if (f == NULL) {
     f = out;
     out = NULL;
+  }
+  if (getenv("QJS_AOT_OPMARK") != NULL && out != NULL) {
+    if (g_opm == NULL) g_opm = fopen(getenv("QJS_AOT_OPMARK"), "w");
+    if (g_opm_ops != NULL) fclose(g_opm_ops);
+    free(g_opm_buf);
+    g_opm_buf = NULL;
+    g_opm_ops = open_memstream(&g_opm_buf, &g_opm_len);
+    if (g_opm_ops == NULL) g_opm = NULL;
   }
   /* What the body returns through to enter the generic body at pc 0 (a refusal at
      entry, or speculation switched off). */
@@ -12241,6 +12256,11 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       unsigned oc0 = g_e_opcalls;
       if (g_e_dirty_ins != NULL) g_e_dirty_ins[i2] = (uint8_t)g_e_inl_dirty;
       const ERole *role = e_roles[in->rop];
+      if (g_opm != NULL) {
+        char rn_[48];
+        e_rop_name(in->rop, rn_, sizeof(rn_));
+        fprintf(g_opm_ops, "%ld %s %d %d %d\n", ftell(f), rn_, in->pc, in->own, in->opc);
+      }
       /* A terminator ends the block: a return, branch or switch lowers here, any
          other exits at the terminator's pc. */
       g_e_ta_keep = 0;
@@ -12847,6 +12867,13 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         if (mbuf[i] == '\n') lines++;
       bytes = (long)mlen;
       fwrite(mbuf, 1, mlen, out);
+      if (g_opm != NULL && g_opm_ops != NULL) {
+        fclose(g_opm_ops);
+        g_opm_ops = NULL;
+        fprintf(g_opm, "BODY %.8s %zu %zu\n", hex, mlen, g_opm_len);
+        fwrite(mbuf, 1, mlen, g_opm);
+        fwrite(g_opm_buf, 1, g_opm_len, g_opm);
+      }
       free(mbuf);
       f = out;
     }
