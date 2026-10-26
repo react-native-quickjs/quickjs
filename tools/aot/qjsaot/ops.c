@@ -7098,14 +7098,41 @@ static int emit_inl_guard(
   e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
   e_note_tag('v', in->pc, cexp);
   e_sweep_guard(f, "vx", in->pc);
-  fprintf(
-      f,
-      "#ifdef Q2_SEL_%s\n"
-      "    if (__builtin_expect(!%s%s, (const void *)aot_f_%s, %du), 0)) goto vx_%d;\n"
-      "#else\n"
-      "    goto vx_%d;\n"
-      "#endif\n",
-      callee, e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), in->pc, in->pc);
+  {
+    /* A callee read from a method cell the body validated at entry: the cell's callee is what the entry
+       accepted, so a cell that every user takes to hold this one callee needs no test here (the entry
+       refuses the body when the cell holds another), and any other cell is compared by its entry. */
+    int cmc = cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME && cv < (Q2ValueId)t->nvalues ? e_mc_of(cv) : -1;
+    if (cmc >= 0 && cmc < E_MC_MAX && g_e_mono_id != 0) {
+      int n1 = 0, kind1[4];
+      char hex1[4][33];
+      unsigned long long hits1[4];
+      int single = qjs_aot_prof_callees(fn->g->digest, in->next, &n1, hex1, kind1, hits1) && n1 == 1;
+      if (single && g_e_mono_st[cmc] == 0) {
+        g_e_mono_st[cmc] = 1;
+        snprintf(g_e_mono_callee[cmc], sizeof(g_e_mono_callee[cmc]), "%s", callee);
+      } else if (!single || strcmp(g_e_mono_callee[cmc], callee) != 0) {
+        g_e_mono_st[cmc] = 2;
+      }
+      fprintf(
+          f,
+          "#ifdef Q2_SEL_%s\n"
+          "    if (__builtin_expect(!(e_mono_%d[%d] == (const void *)aot_f_%s || mce%d == (const void *)aot_f_%s), 0)) "
+          "goto vx_%d;\n"
+          "#else\n"
+          "    goto vx_%d;\n"
+          "#endif\n",
+          callee, g_e_mono_id, cmc, callee, cmc, callee, in->pc, in->pc);
+    } else
+      fprintf(
+          f,
+          "#ifdef Q2_SEL_%s\n"
+          "    if (__builtin_expect(!%s%s, (const void *)aot_f_%s, %du), 0)) goto vx_%d;\n"
+          "#else\n"
+          "    goto vx_%d;\n"
+          "#endif\n",
+          callee, e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), in->pc, in->pc);
+  }
   e_virt_compute(fn);
   if (iv->uses_this && !(tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME && tv < (Q2ValueId)fn->nvalues &&
                          g_e_virt != NULL && g_e_virt[tv]))
