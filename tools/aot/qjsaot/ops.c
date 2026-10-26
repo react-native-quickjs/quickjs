@@ -7567,7 +7567,7 @@ static int emit_copy_ext_call(
         "          JSValue *_sp = q2_slotp(%s, %s);\n"
         "          JSValue _old = *_sp;\n"
         "          *_sp = _o;\n"
-        "          if (JS_VALUE_HAS_REF_COUNT(_old)) JS_FreeValue(ctx, _old);\n"
+        "          if (Q2_HRC(_old)) JS_FreeValue(ctx, _old);\n"
         "        } else\n",
         test, recv, recv, woff);
   }
@@ -9682,7 +9682,7 @@ static int emit_group_write(
         "      JSValue *_sp = q2_slotp(%s, %s);\n"
         "      JSValue _old = *_sp;\n"
         "      *_sp = _nv;\n"
-        "      if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_old), 0)) "
+        "      if (__builtin_expect(Q2_HRC(_old), 0)) "
         "JS_FreeValue(ctx, _old);\n",
         recv, woff);
   } else {
@@ -9807,7 +9807,7 @@ static int emit_poly_write(
         "        JSValue *_sp = q2_slotp(%s, _po);\n"
         "        JSValue _old = *_sp;\n"
         "        *_sp = _nv;\n"
-        "        if (__builtin_expect(JS_VALUE_HAS_REF_COUNT(_old), 0)) "
+        "        if (__builtin_expect(Q2_HRC(_old), 0)) "
         "JS_FreeValue(ctx, _old); }\n",
         recv);
   } else {
@@ -11924,9 +11924,23 @@ static int e_emit_spec_body_pass(FILE *f, const Q2Func *fn, char hex[33]) {
   int rc;
   g_e_nolazy = !g_e_inl || g_e_inl_nl;
   g_e_epoch_skip = 0;
-  if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 0\n");
+  if (g_e_nolazy)
+    fprintf(
+        f,
+        "#undef Q2_LZ\n#define Q2_LZ 0\n"
+        "#undef JS_FreeValue\n#define JS_FreeValue(c_, v_) q2_free_nl(c_, v_)\n"
+        "#define q2_dup q2_dup_nl\n#define q2_put_slotpp q2_put_slotpp_nl\n"
+        "#define q2_put_slotpp_k q2_put_slotpp_k_nl\n#define q2_put_slotpp_ko q2_put_slotpp_ko_nl\n"
+        "#define q2_put_slot_own q2_put_slot_own_nl\n#define q2_put_slotpp_own q2_put_slotpp_own_nl\n"
+        "#define q2_put_slot q2_put_slot_nl\n");
   rc = e_emit_spec_body_pass_inner(f, fn, hex);
-  if (g_e_nolazy) fprintf(f, "#undef Q2_LZ\n#define Q2_LZ 1\n");
+  if (g_e_nolazy)
+    fprintf(
+        f,
+        "#undef q2_dup\n#undef q2_put_slotpp\n#undef q2_put_slotpp_k\n#undef q2_put_slotpp_ko\n"
+        "#undef q2_put_slot_own\n#undef q2_put_slotpp_own\n#undef q2_put_slot\n"
+        "#undef JS_FreeValue\n#define JS_FreeValue(c_, v_) q2_free(c_, v_)\n"
+        "#undef Q2_LZ\n#define Q2_LZ 1\n");
   g_e_nolazy = 0;
   g_e_epoch_skip = 0;
   return rc;
