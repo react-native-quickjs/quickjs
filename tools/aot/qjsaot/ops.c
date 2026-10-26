@@ -2708,7 +2708,7 @@ static int e_def_dead(const Q2Insn *in, Q2ValueId v) {
   if (g_e_facts != NULL && g_e_facts->fwd != NULL) {
     int k;
     for (k = 0; k < g_e_fn->ninsns; k++)
-      if (g_e_facts->fwd[k] == v) return 0;
+      if (g_e_facts->fwd[k] == v || g_e_facts->cfwd[k] == (int32_t)v + 1) return 0;
   }
   return 1;
 }
@@ -9423,16 +9423,20 @@ static int emit_group_chain(
   char test[320], recv[32], cib[24];
   (void)fn;
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  int cf = g_e_facts->cfwd[e_insn_idx(fn, in)];
   e_group_exit_stub(f, in, cur, rv);
   fprintf(f, "    { JSValue _c0, _c1;\n");
-  e_group_test(test, sizeof(test), g_e_facts->skip[e_insn_idx(fn, in)] & 1, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
-  fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
-  {
+  if (cf != 0) {
+    /* the first link is the value an earlier chain loaded from the same field */
+    fprintf(f, "      _c0 = v%u;\n", (unsigned)(cf - 1));
+  } else {
     char off[96];
+    e_group_test(test, sizeof(test), g_e_facts->skip[e_insn_idx(fn, in)] & 1, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
+    fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
     e_slot_off(off, sizeof(off), g1, s1);
     fprintf(f, "      _c0 = *%s(%s, %s);\n", e_slotfn(s1), recv, off);
   }
-  if (!g_e_nolazy)
+  if (!g_e_nolazy && cf == 0)
     fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "

@@ -912,6 +912,32 @@ static int group_layout(const Q2Func *fn, const EFacts *f, int g) {
   return e_facts_group_layout(fn, f, g, NULL);
 }
 
+/* The earlier chain result that still holds `in`'s first link, or Q2_NO_VALUE: `in` is a grouped
+   get_field_chain whose first link (receiver, atom) is current in the avail set as the first
+   result of another chain. Only such a result is taken: it is a TAG local in every body. */
+static Q2ValueId chain_fwd_value(
+    const Q2Func *fn, const EFacts *f, const Q2Insn *in, const FactSet *s, const SiteRef *ref, int nr) {
+  EKey k;
+  Q2ValueId w;
+  const Q2Insn *di;
+  if ((in->rop != ROP_get_field_chain && in->rop != ROP_get_field_chain_own) || nr != 2 || in->ndef < 2)
+    return Q2_NO_VALUE;
+  if (ref[0].site < 0 || (unsigned)ref[0].site == REG_IC_NONE || ref[0].recv < 0 || ref[0].atom == 0 ||
+      !recv_groupable(ref[1].recv) || e_facts_site_group(f, ref[0].site) < 0 ||
+      e_facts_site_group(f, ref[1].site) < 0)
+    return Q2_NO_VALUE;
+  memset(&k, 0, sizeof(k));
+  k.kind = E_K_FIELD;
+  k.a = ref[0].recv;
+  k.b = ref[0].atom;
+  w = fs_get_avail(s, &k);
+  if (w == Q2_NO_VALUE || w < 0 || w >= fn->nvalues || w == in->def[0] || fn->values[w].insn < 0) return Q2_NO_VALUE;
+  di = &fn->insns[fn->values[w].insn];
+  if ((di->rop != ROP_get_field_chain && di->rop != ROP_get_field_chain_own) || di->ndef < 2 || di->def[0] != w)
+    return Q2_NO_VALUE;
+  return w;
+}
+
 static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
                     int grouped_exit) {
   const Q2Insn *in = &fn->insns[insn];
@@ -1021,11 +1047,31 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
   if (kind != E_SK_SAFE) {
     SiteRef ref[2];
     int nr = site_refs(in, ref), r;
+    Q2ValueId cw = chain_fwd_value(fn, f, in, s, ref, nr);
+    if (cw != Q2_NO_VALUE) f->cfwd[insn] = (int32_t)cw + 1;
     for (r = 0; r < nr; r++) {
       int g = ref[r].site >= 0 ? e_facts_site_group(f, ref[r].site) : -1;
       int rv;
       if (g < 0 || !recv_groupable(ref[r].recv)) continue;
       f->access[insn] = 1;
+      if (cw != Q2_NO_VALUE) {
+        /* The first link is not executed: nothing is learned of its receiver. The second link's
+           receiver is the earlier result, whose shape fact (if it still holds) skips the test. */
+        if (r == 0) {
+          f->skip[insn] |= 1;
+          f->cellskip[insn] |= 1;
+          continue;
+        }
+        if (fs_has_shape(s, cw, g)) {
+          f->skip[insn] |= 2;
+          f->nskip++;
+        }
+        if (fs_add_shape(s, cw, g) < 0) return -1;
+        if (fs_add_shape(s, in->def[0], g) < 0) return -1;
+        if (fs_has_shape(s, E_CELLV(ref[r].site), g)) f->cellskip[insn] |= 2;
+        if (fs_add_shape(s, E_CELLV(ref[r].site), g) < 0) return -1;
+        continue;
+      }
       /* A receiver that is a forwarded copy of another value is that value. */
       rv = ref[r].recv == E_RECV_THIS ? E_THISV : (int)ref[r].recv;
       while (rv >= 0 && rv < E_THISV && rv < fn->nvalues && fn->values[rv].insn >= 0 &&
@@ -1452,6 +1498,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->laymask = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(uint64_t));
   out->thislay = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->cfwd = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int32_t));
   out->narr_vals = fn->nvalues;
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->arr_pk = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
@@ -1460,7 +1507,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL ||
+      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->cfwd == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
@@ -1674,6 +1721,7 @@ void e_facts_free(EFacts *f) {
   free(f->purecall);
   free(f->laymask);
   free(f->thislay);
+  free(f->cfwd);
   free(f->arr_used);
   free(f->arr_pk);
   free(f->miss_exits);

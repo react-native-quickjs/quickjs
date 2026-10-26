@@ -168,6 +168,10 @@ typedef struct EFacts {
   /* Per call instruction: the contracted layout (1-based, 0 for none) its receiver is known to
      be in when the call starts, so an inlined callee whose entry tests that layout need not. */
   uint8_t *thislay;
+  /* Per get_field_chain: 1 + the earlier chain result that already holds this chain's first link
+     (same receiver and atom, no store of that atom, no safepoint between). The chain reuses it
+     instead of loading the first link, and the second link's receiver is that value. */
+  int32_t *cfwd;
   /* A grouped field access whose miss must leave the speculative body (an
      exit), never continue. The pass treats it as no safepoint
      only because of that: a miss that rejoins could run a getter or setter
