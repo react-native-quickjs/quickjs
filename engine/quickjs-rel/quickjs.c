@@ -2907,6 +2907,7 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
+static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p);
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v);
 static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p);
 static int init_shape_hash(JSRuntime *rt);
@@ -8230,7 +8231,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
            IC prototype watchpoint (doc/ic-design.md Task 2.4) fires when it gains an
            interceptor — `new`/literals/Object.create reach protos only through here,
            not through JS_SetPrototypeInternal. Idempotent, one-way. */
-        proto->is_prototype = true;
+        js_aot_mark_prototype(rt, proto);
     }
     sh->proto = proto;
     /* prop_hash_mask must be set before prop_hash_end(sh) is used, as the hash
@@ -13083,7 +13084,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
     sh->proto = proto;
     if (proto)
-        proto->is_prototype = true;
+        js_aot_mark_prototype(ctx->rt, proto);
     if (p->is_prototype) {
         /* track modification of Array.prototype */
         if (unlikely(p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]))) {
@@ -16376,6 +16377,19 @@ static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
         rt->aot_layout_broken |= 1ULL << (old_sh->layout_id - 1);
 }
 
+/* An object becomes a prototype. A compiled store into a slot of a contracted layout's object
+   skips the prototype test, so the promise is that no object of the layout is a prototype: an
+   object in a layout that turns into one breaks the layout, as leaving it does. The flag is
+   one-way, so the bit is set when it first turns on. */
+static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p)
+{
+    if (unlikely(!p->is_prototype)) {
+        p->is_prototype = true;
+        if (unlikely(p->shape->layout_id != 0))
+            rt->aot_layout_broken |= 1ULL << (p->shape->layout_id - 1);
+    }
+}
+
 /* Whether `v` keeps the promise `claim` makes about a slot. */
 static inline bool js_aot_claim_ok(JSValue v, uint8_t claim)
 {
@@ -16438,6 +16452,12 @@ static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slo
 static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p)
 {
     uint32_t id = p->shape->layout_id, f, n;
+    /* A prototype object entering a contracted shape breaks it: the layout promises that none
+       of its objects is one. This runs whether or not the layout makes any slot promise. */
+    if (unlikely(p->is_prototype)) {
+        rt->aot_layout_broken |= 1ULL << (id - 1);
+        return;
+    }
     if (!((rt->aot_claimed >> (id - 1)) & 1))
         return;
     n = p->shape->prop_count;
@@ -64756,6 +64776,31 @@ QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32
     return 1;
 }
 
+/* Whether an object that is already a prototype holds the shape `sh`. A layout's shape may
+   already be the shape of a live object when the layout is stamped (the chains are built when a
+   class is defined, with user objects on the heap), and such a prototype never passes through
+   js_aot_mark_prototype or js_aot_content_enter afterwards. An object waiting on the zero
+   reference list can still be resurrected, so that list is scanned as well. */
+static bool js_aot_layout_held_by_prototype(JSRuntime *rt, JSShape *sh)
+{
+    struct list_head *lists[3], *el;
+    int i;
+    lists[0] = &rt->gc_obj_list;
+    lists[1] = &rt->gc_zero_ref_count_list;
+    lists[2] = &rt->gc_notrace_list;
+    for (i = 0; i < 3; i++) {
+        list_for_each(el, lists[i]) {
+            JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+            if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_JS_OBJECT) {
+                JSObject *o = (JSObject *)gp;
+                if (o->is_prototype && o->shape == sh)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
                                            const JSAtom *atoms, uint32_t n,
                                            void *out, uint32_t out_cap,
@@ -64800,6 +64845,8 @@ QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
        object. Our own references keep every shape in the chain alive. */
     final_sh = p->shape;
     final_sh->layout_id = (uint16_t)layout_id;
+    if (js_aot_layout_held_by_prototype(ctx->rt, final_sh))
+        ctx->rt->aot_layout_broken |= 1ULL << (layout_id - 1);
     JS_FreeValue(ctx, obj);
     return stored;
 fail:
