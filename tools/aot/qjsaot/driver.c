@@ -4422,6 +4422,25 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  return 1;\n"
         "}\n"
+        /* The same read in an inline body that validated its caches at entry: its epoch alone says the
+           table was filled under the epoch the body runs at, as for the statics it reads elsewhere. */
+        "static inline __attribute__((always_inline)) int "
+        "q2_poly_read_lze(const void *pic, void *const *holders,\n"
+        "                       JSValue recv, int site, int nsites,\n"
+        "                       JSValue *out, int lz, Q2PolyC *c, const uint32_t *epp, uint32_t qep)\n"
+        "{\n"
+        "  const void *s;\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
+        "  s = *(const void *const *)((const unsigned char *)JS_VALUE_GET_PTR(recv) +\n"
+        "                             QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+        "  if (__builtin_expect(c->ep == qep, 1)) {\n"
+        "    if (s == c->sh[0]) { *out = c->v[0]; return 1; }\n"
+        "    if (s == c->sh[1]) { *out = c->v[1]; return 1; }\n"
+        "    if (s == c->sh[2]) { *out = c->v[2]; return 1; }\n"
+        "    if (s == c->sh[3]) { *out = c->v[3]; return 1; }\n"
+        "  }\n"
+        "  return q2_poly_read_lz(pic, holders, recv, site, nsites, out, lz, c, epp);\n"
+        "}\n"
         /* The lazy-JSON marker test is on unless the body in progress assumes no lazy
            document exists (Q2_LZ is redefined around such a body). */
         "/* undefined into n slots, one 16-byte store each */\n"

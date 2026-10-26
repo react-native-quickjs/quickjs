@@ -8380,11 +8380,11 @@ static void e_fprint_hit(FILE *f, const Q2Func *fn, const char *ind, const char 
             ind, recv, lay, slot, out);
   else if (dg != NULL && qjs_aot_prof_site_proto(dg, osite))
     fprintf(f,
-            "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_poly_read_lz(pic, holders, "
+            "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_poly_read_lz%s(pic, holders, "
             "%s, %d, (int)q2_ns, %s, Q2_LZ, ({ static Q2PolyC c_; &c_; }), "
             "(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
-            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH)), 1)) {\n",
-            ind, recv, site, out);
+            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH)%s), 1)) {\n",
+            ind, g_e_inl && g_e_sm_stat ? "e" : "", recv, site, out, g_e_inl && g_e_sm_stat ? ", q2_ep" : "");
   else
     fprintf(f,
             "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
