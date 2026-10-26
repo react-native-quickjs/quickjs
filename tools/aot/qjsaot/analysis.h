@@ -214,8 +214,10 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);
 int e_plan_licm(const Q2Func *fn, Q2Extra **out);
 /* The calls worth replacing by a copy of their callee (see facts.c). */
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out);
+int e_never_exits(const Q2Insn *in);
 /* The objects that never escape (see facts.c). */
 extern int e_inline_allow_construct;
+extern int e_inline_allow_ext;
 int e_ta_class(const Q2Func *fn, const Q2Insn *in);
 /* The packed storage kind of an element site (1 int32, 2 float64) and the group code a packed
    region uses for it, or 0 when the site is not a packed one. */

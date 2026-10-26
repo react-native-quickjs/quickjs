@@ -355,6 +355,8 @@ static int e_inline_typed_ok(const Q2Func *fn) {
   for (i = 0; ok && i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
     if (in->own == 0) continue;
+    /* a call that stays a call, and the store of its result, are made by the call's own emission */
+    if (in->extcall) continue;
     /* a forwarded load is a copy of a value already held: no access, nothing to miss */
     if (facts.fwd != NULL && facts.fwd[i] != Q2_NO_VALUE) continue;
     /* a field read of a copy has to be a grouped access whose miss exits */
@@ -379,6 +381,8 @@ static int e_inline_typed_ok(const Q2Func *fn) {
         }
       if (!ok) continue;
     }
+    /* a nullish test reads the tag of any value */
+    if (in->rop == ROP_branch_nullish || in->rop == ROP_branch_not_nullish) continue;
     if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
         in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH &&
         !(in->op == Q2_OP_FALLBACK && (in->rop == ROP_eq || in->rop == ROP_neq ||
@@ -613,6 +617,18 @@ int e_emit_inline_func(
     q2_free(&fn);
     snprintf(why, whyn, "the IR did not verify");
     return 0;
+  }
+  if (getenv("QJS_AOT_NOEICOPY") == NULL) {
+    Q2Func fn2;
+    int have2;
+    e_inline_allow_ext = 0;
+    have2 = e_build_spec_fn(g, &fn, 1, &fn2, msg, sizeof(msg));
+    e_inline_allow_ext = 1;
+    rc = e_emit_inline_body(f, have2 ? &fn2 : &fn, hex, why, whyn);
+    if (rc && e_facts_safepoint_free(&fn)) e_note_pure_inline(hex);
+    if (have2) q2_free(&fn2);
+    q2_free(&fn);
+    return rc;
   }
   rc = e_emit_inline_body(f, &fn, hex, why, whyn);
   if (rc && e_facts_safepoint_free(&fn)) e_note_pure_inline(hex);

@@ -194,6 +194,9 @@ typedef struct Q2Insn {
      guard is the instruction with `inlg` == k+1. */
   uint8_t own, inlg;
   uint8_t inlret; /* the branch that ends a copied callee's return: its stores are final here */
+  /* In a copy: 1 for a call to a function that is not copied (the stores of the nest are final at it),
+     2 for the store of its result, which the call makes itself. Nothing after the call can leave. */
+  uint8_t extcall;
   /* A virtual-object instruction (see Q2VWeb): VK_DEF stands for the construct that made the
      object, VK_GET for a read of one of its fields, VK_PROTO for a method lookup on it. */
   uint8_t vk, vweb;

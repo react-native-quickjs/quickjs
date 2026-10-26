@@ -1559,6 +1559,7 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
       }
       q2_decode_roles(g, m);
     }
+    int ext_pending = 0;
     for (i = 0; i < ncins[k]; i++) {
       Q2Insn s = cins[k][i];
       Q2Insn d;
@@ -1613,6 +1614,18 @@ static int q2_apply_inlines(Q2Func *f, const JSAotGenFunc *g, const Q2InlReq *re
           q2_decode_roles(g, br);
           continue;
         }
+      }
+      if (ext_pending) {
+        /* the store of the result of a call that stays a call */
+        if (s.rop != ROP_put_field) {
+          f->why = "a call that stays a call is not followed by the store of its result";
+          goto fail;
+        }
+        d.extcall = 2;
+        ext_pending = 0;
+      } else if (s.rop == ROP_call || s.rop == ROP_call_method) {
+        d.extcall = 1;
+        ext_pending = 1;
       }
       if (s.rop == ROP_get_arg || s.rop == ROP_get_arg2 || s.rop == ROP_put_arg) {
         /* argument slots are the parameter registers */

@@ -102,8 +102,9 @@ static int e_dom(int own) {
 }
 static int g_e_undo_seq[256], g_e_undo_seq_own[256], g_e_undo_seq_n;
 /* An instruction that cannot take a way out of the body (no guard, no type test, no cache test). */
-static int e_never_exits(const Q2Insn *in) {
+int e_never_exits(const Q2Insn *in) {
   switch (in->rop) {
+    case ROP_get_arg: case ROP_get_arg2:
     case ROP_move: case ROP_move_s: case ROP_move_xfer:
     case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
     case ROP_load_undefined: case ROP_load_null: case ROP_load_true: case ROP_load_false:
@@ -132,7 +133,7 @@ static void e_undo_prepare(const Q2Func *fn) {
   g_e_undo_seq_n = 0;
   for (i = 0; i < fn->ninsns; i++) {
     g_e_undo_id[i] = -1;
-    if (fn->insns[i].own > 0 && fn->insns[i].rop == ROP_put_field && e_exit_follows(fn, i))
+    if (fn->insns[i].own > 0 && fn->insns[i].rop == ROP_put_field && fn->insns[i].extcall != 2 && e_exit_follows(fn, i))
       g_e_undo_id[i] = g_e_undo_total++;
   }
 }
@@ -7052,8 +7053,9 @@ static int emit_inl_guard(
         "      if (__builtin_expect(pr_ == NULL, 0)) goto vx_%d;\n"
         "      ipic_%d = pr_ - (size_t)%d * QJS_AOT_SIZEOF_JSREGPIC;\n"
         "      iholders_%d = *(void *const *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER) - %d;\n"
-        "      ins_%d = (uint32_t)*(const uint16_t *)(cbk_ + QJS_AOT_OFF_FNBC_PIC_COUNT); }\n",
-        cexp, in->pc, ik, iv->sbase, ik, iv->sbase, ik);
+        "      ins_%d = (uint32_t)*(const uint16_t *)(cbk_ + QJS_AOT_OFF_FNBC_PIC_COUNT);\n"
+        "      icode_%d = *(const uint8_t *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_CODE); }\n",
+        cexp, in->pc, ik, iv->sbase, ik, iv->sbase, ik, ik);
     if (e_copy_nfold(fn, ik) > 0) {
       int zi;
       int32_t gv;
@@ -7375,6 +7377,107 @@ static void e_builtin_call_tail(
   fprintf(f, "        goto cd_%d;\n", in->pc);
 }
 
+/* The expression of the value register `reg` holds, boxed. */
+static void e_reg_box(char *buf, size_t n, const Q2Func *fn, const ETypes *t, const Q2ValueId *cur, int reg) {
+  Q2ValueId v = reg >= 0 && reg < fn->nregs ? cur[reg] : Q2_NO_VALUE;
+  if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues) {
+    snprintf(buf, n, "AOT_REG(fr, %d)", reg * 16);
+    return;
+  }
+  switch (t->lb[v]) {
+    case E_LB_I32: snprintf(buf, n, "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)v); break;
+    case E_LB_F64: snprintf(buf, n, "E_BOX_F64(d%u)", (unsigned)v); break;
+    case E_LB_BOOL: snprintf(buf, n, "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)v); break;
+    case E_LB_TAG: snprintf(buf, n, "v%u", (unsigned)v); break;
+    default: snprintf(buf, n, "AOT_REG(fr, %d)", reg * 16); break;
+  }
+}
+
+/* A call in a copy that stays a call, with the store of its result into a field of an object the copy
+   holds. The stores the nest has made are final here (their old values are released); nothing after the
+   call can leave, so the store tests its group in full and a miss makes the store through the engine.
+   The window is owned for the length of the call, and the result moves into the field. */
+static int emit_copy_ext_call(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types) {
+  const Q2Insn *pf = &fn->insns[e_insn_idx(fn, in) + 1];
+  char callee[4][33], cexp[96], rexp[96], wbox[8][96], woff[96], test[320], recv[32];
+  unsigned long long hits[4];
+  int kind[4], n = 0, k, cc, th, na = in->win_n, i, site, g, rootpc;
+  Q2ValueId rv;
+  if (!have_types || t == NULL || cur == NULL || g_e_fl || g_e_inl || in->own == 0 || pf->rop != ROP_put_field ||
+      pf->extcall != 2 || pf->nuse < 1 || na > 6) {
+    fprintf(stderr, "qjsaot: a call in a copy at pc %d cannot be emitted\n", in->pc);
+    abort();
+  }
+  cc = call_callee_off(in);
+  th = call_this_off(in);
+  if (cc < 0 || th < 0) {
+    fprintf(stderr, "qjsaot: a call in a copy at pc %d has no receiver\n", in->pc);
+    abort();
+  }
+  rootpc = fn->inl[in->own - 1].call_pc;
+  e_reg_box(cexp, sizeof(cexp), fn, t, cur, cc / 16);
+  e_reg_box(rexp, sizeof(rexp), fn, t, cur, th / 16);
+  for (i = 0; i < na; i++) e_reg_box(wbox[i], sizeof(wbox[i]), fn, t, cur, in->win_reg + i);
+  if (!qjs_aot_prof_callees(e_dg(fn, in), in->onext, &n, callee, kind, hits)) n = 0;
+  /* the stores made so far are final */
+  e_undo_release(f, e_dom(in->own));
+  fprintf(f, "    {\n      JSValue cw_[%d];\n      JSValue _o;\n", na + 2);
+  fprintf(f, "      cw_[0] = %s; cw_[1] = %s;\n", cexp, rexp);
+  for (i = 0; i < na; i++) fprintf(f, "      cw_[%d] = %s;\n", i + 2, wbox[i]);
+  for (i = 0; i < na + 2; i++) fprintf(f, "      q2_dup(cw_[%d]);\n", i);
+  fprintf(f, "      E_CAP(f, %d);\n", rootpc);
+  for (k = 0; k < n && k < 4; k++) {
+    if (kind[k] != 1 || !qjs_aot_unit_has(callee[k]) || !qjs_aot_native_capable(callee[k]) ||
+        in->win_n < qjs_aot_unit_argc(callee[k]))
+      continue;
+    fprintf(
+        f,
+        "#ifdef Q2_NATIVE_%s\n"
+        "      if (q2_call_entry_u(ctx, cw_[0], (const void *)aot_f_%s, 0u))\n"
+        "        _o = aot_n_%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(cw_[0]), cw_[1], &cw_[2], %d);\n"
+        "      else\n"
+        "#endif\n",
+        callee[k], callee[k], callee[k], na);
+  }
+  fprintf(f, "      _o = JS_Call(ctx, cw_[0], cw_[1], %d, &cw_[2]);\n", na);
+  for (i = 0; i < na + 2; i++) fprintf(f, "      JS_FreeValue(ctx, cw_[%d]);\n", i);
+  fprintf(f, "      if (__builtin_expect(JS_IsException(_o), 0)) return JS_EXCEPTION;\n");
+  /* the store of the result */
+  rv = pf->use[0];
+  site = -1;
+  for (i = 0; i < pf->narg; i++)
+    if (pf->arg[i].kind == 's') site = (int)pf->arg[i].val;
+  if (rv >= (Q2ValueId)t->nvalues || t->lb[rv] != E_LB_TAG || site < 0 || pf->arg[1].kind != 'a' || pf->arg[1].off < 0) {
+    fprintf(stderr, "qjsaot: the store of a call in a copy at pc %d cannot be emitted\n", in->pc);
+    abort();
+  }
+  snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
+  g = g_e_facts != NULL ? e_exit_group(fn, pf, site) : -1;
+  fprintf(f, "      {\n        JSAtom _a = (JSAtom)qjs_aot_ld_u32(icode_%d + %d);\n", in->own - 1, pf->arg[1].off);
+  if (g >= 0) {
+    e_slot_off(woff, sizeof(woff), g, site);
+    e_group_test(test, sizeof(test), 0, 0, recv, g, site, 1);
+    fprintf(
+        f,
+        "        if (__builtin_expect(!(%s || q2_is_proto(%s)), 1)) {\n"
+        "          JSValue *_sp = q2_slotp(%s, %s);\n"
+        "          JSValue _old = *_sp;\n"
+        "          *_sp = _o;\n"
+        "          if (JS_VALUE_HAS_REF_COUNT(_old)) JS_FreeValue(ctx, _old);\n"
+        "        } else\n",
+        test, recv, recv, woff);
+  }
+  fprintf(
+      f,
+      "        if (__builtin_expect(JS_SetProperty(ctx, %s, _a, _o) < 0, 0)) return JS_EXCEPTION;\n"
+      "      }\n    }\n",
+      recv);
+  g_e_inl_dirty = 1;
+  g_e_miss_exit_seen = 1;
+  return 1;
+}
+
 static int emit_typed_call(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types, char hex[33], int fi, int b) {
@@ -7387,6 +7490,7 @@ static int emit_typed_call(
 
   /* ---- every check, before any output ---- */
   if (!have_types || t == NULL) return 0;
+  if (in->extcall == 1) return emit_copy_ext_call(f, fn, in, t, cur, have_types);
   /* The facts classed this site as a pure inline call. */
   if (g_e_facts != NULL && g_e_facts->purecall[e_insn_idx(fn, in)])
     return emit_pure_call(f, fn, in, t, cur, have_types);
@@ -8396,6 +8500,11 @@ static int emit_typed_field_write(
 
   if (!have_types || t == NULL) return 0;
   if (in->rop != ROP_put_field) return 0;
+  /* the store of a call's result: the call made it */
+  if (in->extcall == 2) {
+    g_e_miss_exit_seen = 1;
+    return 1;
+  }
   if (role == NULL || role->control != E_CF_NONE) return 0;
   if (in->nuse < 2 || in->narg < 4 || in->arg[2].kind != 's') return 0;
   site = (int)in->arg[2].val;
@@ -11914,9 +12023,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       fprintf(
           f,
           "    const uint8_t *ipic_%d = NULL; void *const *iholders_%d = NULL; uint32_t ins_%d = 0;\n"
+          "    const uint8_t *icode_%d = NULL;\n"
           "    JSValue ifr_%d[%d];\n"
-          "    (void)ipic_%d; (void)iholders_%d; (void)ins_%d; (void)ifr_%d;\n",
-          ik, ik, ik, ik, fn->nregs, ik, ik, ik, ik);
+          "    (void)ipic_%d; (void)iholders_%d; (void)ins_%d; (void)ifr_%d; (void)icode_%d;\n",
+          ik, ik, ik, ik, ik, fn->nregs, ik, ik, ik, ik, ik);
   }
   /* A function with no PIC sites -- a leaf arithmetic function, say -- has no
      PIC table at all, so `pic` is NULL on EVERY call. Refusing on that refused
