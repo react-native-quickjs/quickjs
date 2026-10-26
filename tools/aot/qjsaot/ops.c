@@ -5567,7 +5567,7 @@ static int e_emit_nested_result(
         "%sv%u = _o;\n"
         "%sAOT_SET_B(ctx, fr, %d, _o);\n",
         ind, resslot, ind, resslot, ind, (unsigned)dv, ind, dreg * 16);
-  } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT) {
+  } else if (t->lb[dv] == E_LB_TAG || t->lb[dv] == E_LB_BOT || e_def_dead(in, dv)) {
     fprintf(f, "%sif (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n", ind);
   } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
     fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
@@ -5725,7 +5725,9 @@ static int emit_inl_nested_call(
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOT)
     e_note_stub(
         g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-  if (!g_e_inl && t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOT) {
+  /* A result nothing reads is released where it is returned and never reaches the frame, so no
+     exit stub has an owned result to adopt. */
+  if (!g_e_inl && t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_BOT && !dead) {
     if (g_e_dx_own_n >= 1024) {
       e_fl_block("too many call exits", in);
       return 0;
