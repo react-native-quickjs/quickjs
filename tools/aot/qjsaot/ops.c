@@ -3878,7 +3878,7 @@ static void e_emit_arm(
               f,
               "      { JSValue _th = %s;\n"
               "        if (__builtin_expect(JS_VALUE_GET_TAG(_th) != JS_TAG_OBJECT ||\n"
-              "            q2_shape_of(_th) != gsh%d, 0)) goto vx_%d; }\n",
+              "            q2_shape_ne(_th, gsh%d), 0)) goto vx_%d; }\n",
               g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
               g_e_facts->hoist_grp[q], hb->start_pc);
           g_e_n_hoist++;
@@ -3894,7 +3894,7 @@ static void e_emit_arm(
         } else if (g_e_types != NULL && rv < (Q2ValueId)g_e_types->nvalues &&
             g_e_types->lb[rv] == E_LB_TAG) {
           fprintf(
-              f, "      if (__builtin_expect(q2_shape_of(v%u) != gsh%d, 0)) goto vx_%d;\n",
+              f, "      if (__builtin_expect(q2_shape_ne(v%u, gsh%d), 0)) goto vx_%d;\n",
               (unsigned)rv, g_e_facts->hoist_grp[q], hb->start_pc);
         } else {
           fprintf(f, "      goto vx_%d;\n", hb->start_pc);
@@ -9290,7 +9290,7 @@ static void e_group_test(
     if (skip)
       snprintf(out, n, "0");
     else
-      snprintf(out, n, "q2_shape_of(%s) != gsh%d", recv, g);
+      snprintf(out, n, "q2_shape_ne(%s, gsh%d)", recv, g);
     if (skip)
       g_e_n_skip++;
     else
@@ -9319,9 +9319,9 @@ static void e_group_test(
   } else if (skip) {
     snprintf(out, n, "%s", cell);
   } else if (cellskip) {
-    snprintf(out, n, "q2_shape_of(%s) != gsh%d", recv, g);
+    snprintf(out, n, "q2_shape_ne(%s, gsh%d)", recv, g);
   } else {
-    snprintf(out, n, "q2_shape_of(%s) != gsh%d || %s", recv, g, cell);
+    snprintf(out, n, "q2_shape_ne(%s, gsh%d) || %s", recv, g, cell);
   }
   if (skip)
     g_e_n_skip++;
@@ -12973,7 +12973,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
                 f,
                 "      { JSValue _th = %s;\n"
                 "        if (__builtin_expect(JS_VALUE_GET_TAG(_th) != JS_TAG_OBJECT ||\n"
-                "            q2_shape_of(_th) != gsh%d, 0)) goto osr_fail; }\n",
+                "            q2_shape_ne(_th, gsh%d), 0)) goto osr_fail; }\n",
                 g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
                 g_e_facts->hoist_grp[o2]);
             continue;
@@ -12984,7 +12984,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             e_arr_region_start_grp(f, rv, rv, "goto osr_fail", g_e_facts->hoist_grp[o2]);
           else if (rv < (Q2ValueId)types.nvalues && types.lb[rv] == E_LB_TAG)
             fprintf(
-                f, "      if (__builtin_expect(q2_shape_of(v%u) != gsh%d, 0)) goto osr_fail;\n",
+                f, "      if (__builtin_expect(q2_shape_ne(v%u, gsh%d), 0)) goto osr_fail;\n",
                 (unsigned)rv, g_e_facts->hoist_grp[o2]);
           else
             fprintf(f, "      goto osr_fail;\n");
