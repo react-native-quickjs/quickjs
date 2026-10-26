@@ -63,6 +63,8 @@ static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const 
 static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc);
 static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in);
 static const char *e_slotfn(int site);
+static int e_group_copy_claim_refused(int g);
+static int e_group_copy_layout(const Q2Func *fn, int g);
 static const char *e_cellidx(char *buf, size_t n, int site);
 /* The next index into the unit's table of held callees (see q2_call_entry_c). */
 int g_cc_count;
@@ -2871,6 +2873,7 @@ static void e_emit_group_recheck_at(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur, int exit_pc) {
   unsigned long long lm = g_e_facts != NULL ? (unsigned long long)g_e_facts->laymask[e_insn_idx(fn, in)] : 0;
   char lt[96] = "";
+  if (g_e_facts != NULL) lm |= (unsigned long long)g_e_facts->claimdeps;
   if (!g_e_nolazy && !g_e_epoch_skip && lm == 0) return;
   /* An inline body's call whose result is the body's return value is followed by nothing that reads
      the facts; the caller tests them where the body returns. */
@@ -7204,6 +7207,13 @@ static int emit_inl_guard(
         else
           fprintf(f, "    if (gsh%d == NULL) gsh%d = q2_cell_shape(ipic_%d, %d);\n", gi, gi, ik, gr->sites[qq]);
       fprintf(f, "    if (gsh%d == NULL) gsh%d = E_NO_SHAPE;\n", gi, gi);
+      if (e_group_copy_claim_refused(gi)) {
+        const int cl_ = e_group_copy_layout(fn, gi);
+        fprintf(
+            f, "    if (__builtin_expect(gsh%d != E_NO_SHAPE && Q2_ENTERS_LAYOUT((const unsigned char *)gsh%d)", gi, gi);
+        if (cl_ != 0) fprintf(f, " && gsh%d != (const void *)q2_layout_shape[%d]", gi, cl_ - 1);
+        fprintf(f, ", 0)) goto vx_%d;\n", in->pc);
+      }
       for (qq = 0; qq < gr->nsites; qq++)
         if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
           fprintf(f, "    pci%d = q2_cell2_index(ipic_%d, %d, (int)ins_%d, gsh%d);\n", gr->sites[qq], ik, gr->sites[qq], ik, gi);
@@ -8764,6 +8774,12 @@ static int emit_hit_result(
   /* The raw result reaches the frame only when the guard misses (the generic body finds
      the op's result there); a result nothing reads is neither guarded nor stored. */
   if (e_def_dead(in, dv)) return 1; /* nothing reads it: no guard, no store */
+  if (t->lb[dv] == E_LB_I32 && g_e_facts != NULL && (int)dv < fn->nvalues &&
+      g_e_facts->vclaim[dv] == QJS_AOT_CLAIM_INT) {
+    /* the slot's layout promises an int */
+    fprintf(f, "        i%u = JS_VALUE_GET_INT(%s);\n", (unsigned)dv, raw);
+    return 1;
+  }
   e_sweep_guard_set(f, "dx", in->next, dreg * 16, raw);
   if (t->lb[dv] == E_LB_I32)
     fprintf(
@@ -9451,9 +9467,17 @@ static void e_group_test(
     int write) {
   char cell[200], ci[24];
   int proto = !write && g_e_facts != NULL ? e_facts_site_proto(g_e_facts, site) : 0;
+  /* `skip` 2: the receiver was loaded from a slot that promises an object of this layout or
+     null, so only its tag is tested. */
+  if (skip == 2 && e_group_layout(g) == 0 && e_group_ret(g) == 0) skip = 0;
   /* A contracted group's shape is the layout's, held by the unit: the receiver's
      shape alone decides, and no cell is consulted. */
   if (e_group_layout(g) != 0) {
+    if (skip == 2) {
+      snprintf(out, n, "JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT", recv);
+      g_e_n_skip++;
+      return;
+    }
     if (skip)
       snprintf(out, n, "0");
     else
@@ -9481,7 +9505,14 @@ static void e_group_test(
      the holder of a prototype read: everything that changes a prototype in a way a cached read cares
      about (an addition, a deletion, an accessor, a read-only property, a new prototype) moves the epoch. */
   if (e_cell_entry_valid(g, site)) cellskip = 1;
-  if (skip && cellskip) {
+  if (skip == 2) {
+    /* The group's shape is its layout's (checked at entry), so the promise gives the shape and
+       the tag is all that is left of the receiver test. */
+    if (cellskip)
+      snprintf(out, n, "JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT", recv);
+    else
+      snprintf(out, n, "JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || %s", recv, cell);
+  } else if (skip && cellskip) {
     snprintf(out, n, "0");
   } else if (skip) {
     snprintf(out, n, "%s", cell);
@@ -9510,6 +9541,7 @@ static int emit_group_read(
     return 0;
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_group_exit_stub(f, in, cur, rv);
+  if (!skip && (g_e_facts->claimskip[e_insn_idx(fn, in)] & 1)) skip = 2;
   e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 0);
   fprintf(f, "    { JSValue _f;\n");
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
@@ -9560,7 +9592,7 @@ static int emit_group_chain(
     fprintf(f, "      _c0 = v%u;\n", (unsigned)(cf - 1));
   } else {
     char off[96];
-    e_group_test(test, sizeof(test), g_e_facts->skip[e_insn_idx(fn, in)] & 1, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
+    e_group_test(test, sizeof(test), (g_e_facts->skip[e_insn_idx(fn, in)] & 1) ? 1 : (g_e_facts->claimskip[e_insn_idx(fn, in)] & 1) ? 2 : 0, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
     fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
     e_slot_off(off, sizeof(off), g1, s1);
     fprintf(f, "      _c0 = *%s(%s, %s);\n", e_slotfn(s1), recv, off);
@@ -9571,7 +9603,7 @@ static int emit_group_chain(
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
       "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
       in->pc);
-  e_group_test(test, sizeof(test), (g_e_facts->skip[e_insn_idx(fn, in)] >> 1) & 1, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
+  e_group_test(test, sizeof(test), ((g_e_facts->skip[e_insn_idx(fn, in)] >> 1) & 1) ? 1 : ((g_e_facts->claimskip[e_insn_idx(fn, in)] >> 1) & 1) ? 2 : 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   {
     char off[96];
@@ -9651,13 +9683,106 @@ static void e_own_prepare(const Q2Func *fn) {
     g_e_own_id[i] = g_e_own_total++;
   }
 }
+int qjs_aot_layout_claims_any(void);
+int qjs_aot_layout_claim_of(int layout, int slot);
+
+static int e_group_claim_refused(int g) {
+  const EGroup *gr;
+  int q, z;
+  if (!qjs_aot_layout_claims_any() || g < 0 || g >= g_e_facts->ngroups) return 0;
+  gr = &g_e_facts->groups[g];
+  if (gr->own != 0 || !g_e_group_used[g] || e_entry_skip(g) || e_group_layout(g) != 0 || e_group_ret(g) != 0)
+    return 0;
+  for (q = 0; q < gr->nsites; q++)
+    for (z = 0; z < g_e_facts->nsites; z++)
+      if (g_e_facts->sites[z].site == gr->sites[q] && g_e_facts->sites[z].write) return 1;
+  return 0;
+}
+
+/* A copied callee's group (its shape is read where the copy starts) with a write site, whose shape is
+   no layout's at the start: the copy leaves when the shape turns out to end one, so its stores need no
+   test of the promises. */
+static int e_group_copy_claim_refused(int g) {
+  const EGroup *gr;
+  int q, z;
+  if (!qjs_aot_layout_claims_any() || g < 0 || g >= g_e_facts->ngroups) return 0;
+  gr = &g_e_facts->groups[g];
+  if (gr->own == 0 || !g_e_group_used[g] || e_group_layout(g) != 0 || e_group_ret(g) != 0) return 0;
+  for (q = 0; q < gr->nsites; q++)
+    for (z = 0; z < g_e_facts->nsites; z++)
+      if (g_e_facts->sites[z].site == gr->sites[q] && g_e_facts->sites[z].write) return 1;
+  return 0;
+}
+
+/* The layout whose shape a copied callee's group is expected to hold, from the profile of its sites (0 when
+   none of them is a layout's). */
+static int e_group_copy_layout(const Q2Func *fn, int g) {
+  const EGroup *gr = &g_e_facts->groups[g];
+  int q, l = 0, sl, osite, l1;
+  for (q = 0; q < gr->nsites; q++) {
+    const uint8_t *dg = e_site_dg(fn, gr->sites[q], &osite);
+    if (dg != NULL && qjs_aot_layout_site(dg, osite, &l1, &sl)) {
+      if (l != 0 && l != l1) return 0;
+      l = l1;
+    }
+  }
+  return l;
+}
+
+static int e_claim_store_check(
+    FILE *f, const Q2Func *fn, int g, int site, const char *recv, const char *off, int pc) {
+  int l = 0, sl = 0, osite;
+  if (!qjs_aot_layout_claims_any()) return 0;
+  if (g >= 0 && e_group_layout(g) != 0 && g_e_glay_fn != NULL) {
+    const uint8_t *dg = e_site_dg(fn, site, &osite);
+    if (qjs_aot_layout_site(dg, osite, &l, &sl)) {
+      int c = qjs_aot_layout_claim_of(l, sl);
+      if (c != 0)
+        fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, pc);
+      return c;
+    }
+  }
+  if (g >= 0 && e_group_ret(g) != 0) {
+    /* The entry refuses unless the group's shape is the layout's, so the slot's promise is known. */
+    int ks = e_site_const_slot(g, site), osite2, l2 = 0, sl2 = 0;
+    if (ks < 0 && g_e_glay_fn != NULL) {
+      const uint8_t *dg2 = e_site_dg(fn, site, &osite2);
+      if (qjs_aot_layout_site(dg2, osite2, &l2, &sl2) && l2 == e_group_ret(g)) ks = sl2;
+    }
+    if (ks >= 0) {
+      int c = qjs_aot_layout_claim_of(e_group_ret(g), ks);
+      if (c != 0)
+        fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, pc);
+      return c;
+    }
+  }
+  if (g >= 0 && e_group_copy_claim_refused(g)) {
+    int l3 = e_group_copy_layout(fn, g);
+    if (l3 != 0) {
+      const uint8_t *dg3 = e_site_dg(fn, site, &osite);
+      if (qjs_aot_layout_site(dg3, osite, &l, &sl) && l == l3) {
+        int c = qjs_aot_layout_claim_of(l, sl);
+        if (c != 0)
+          fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, pc);
+        return c;
+      }
+    } else {
+      return 0;
+    }
+  } else if (e_group_claim_refused(g)) {
+    return 0;
+  }
+  fprintf(f, "      if (__builtin_expect(Q2_CLAIM_BAD(%s, %s, _nv), 0)) goto vx_%d;\n", recv, off, pc);
+  return 0;
+}
+
 /* A grouped field WRITE: the same tests, plus the prototype flag, then the
    engine's own store order (duplicate the new value, store, free the old one). */
 static int emit_group_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g,
     int site, Q2ValueId rv, const char *boxed) {
   char test[320], recv[32], woff[96];
-  int skip = g_e_facts->skip[e_insn_idx(fn, in)];
+  int skip = g_e_facts->skip[e_insn_idx(fn, in)], claim;
   int np = g_e_facts->noproto[e_insn_idx(fn, in)];
   if (np != 0 && e_group_layout(g) == 0) {
     fprintf(stderr, "qjsaot: store at pc %d: a no-prototype fact for a group that is not contracted\n", in->pc);
@@ -9666,6 +9791,7 @@ static int emit_group_write(
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_slot_off(woff, sizeof(woff), g, site);
   e_group_exit_stub(f, in, cur, rv);
+  if (!skip && (g_e_facts->claimskip[e_insn_idx(fn, in)] & 1)) skip = 2;
   e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 1);
   fprintf(f, "    {\n");
   /* A store into a contracted layout tests that the layout has no prototype object once on a path,
@@ -9684,6 +9810,7 @@ static int emit_group_write(
     /* a store of a copied callee: kept so that a way out of the copy can put it back */
     int id = g_e_undo_id[e_insn_idx(fn, in)];
     fprintf(f, "      JSValue _nv = %s;\n", boxed);
+    (void)e_claim_store_check(f, fn, g, site, recv, woff, in->pc);
     fprintf(
         f,
         "      JSValue *_sp = q2_slotp(%s, %s);\n"
@@ -9709,6 +9836,17 @@ static int emit_group_write(
      body's exits account for. A local first: the boxed value may be a compound
      literal, whose commas would split a macro argument. */
   fprintf(f, "      JSValue _nv = %s;\n", boxed);
+  claim = e_claim_store_check(f, fn, g, site, recv, woff, in->pc);
+  if (claim == 0x80) {
+    if (e_pp_of(recv) >= 0)
+      fprintf(f, "      *q2_slotpp(pp%d, %s) = _nv;\n", e_pp_of(recv), woff);
+    else
+      fprintf(f, "      *q2_slotp(%s, %s) = _nv;\n", recv, woff);
+    fprintf(f, "    }\n");
+    e_inl_store_mark(f);
+    g_e_miss_exit_seen = 1;
+    return 1;
+  }
   if (boxed[0] != 'v') {
     /* A number or a bool: nothing to duplicate, only the old value to release; and nothing to
        release when the body read this slot's value before as an unboxed number or bool. */
@@ -9845,6 +9983,8 @@ static int emit_poly_write(
       f, "      if (__builtin_expect(q2_is_proto(%s), 0)) goto vx_%d;\n", recv,
       in->pc);
   fprintf(f, "      { JSValue _nv = %s;\n", boxed);
+  if (qjs_aot_layout_claims_any())
+    fprintf(f, "        if (__builtin_expect(Q2_CLAIM_BAD(%s, _po, _nv), 0)) goto vx_%d;\n", recv, in->pc);
   if (boxed[0] != 'v') {
     fprintf(
         f,
@@ -9885,9 +10025,29 @@ static int emit_inl_field_write(
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   fprintf(f, "      JSValue _nv = %s;\n", boxed);
+  {
+    /* A site the profile saw on one contracted layout stores at the layout's constant slot under
+       the slot's promise; a receiver of any other shape takes the cached store. */
+    int l = 0, sl = 0, osite;
+    const uint8_t *dg = e_site_dg(fn, site, &osite);
+    if (qjs_aot_layout_claims_any() && qjs_aot_layout_site(dg, osite, &l, &sl)) {
+      int c = qjs_aot_layout_claim_of(l, sl);
+      fprintf(f, "      if (!Q2_FORCE_MISS && q2_shape_of(%s) == q2_layout_shape[%d]) {\n", recv, l - 1);
+      fprintf(f, "        if (__builtin_expect(q2_is_proto(%s), 0)) goto vx_%d;\n", recv, in->pc);
+      if (c != 0)
+        fprintf(f, "        if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, in->pc);
+      if (c == 0x80)
+        fprintf(f, "        *q2_slotp(%s, %uu * QJS_AOT_SIZEOF_JSPROPERTY) = _nv;\n", recv, (unsigned)sl);
+      else
+        fprintf(f, "        q2_put_slot(ctx, %s, %uu * QJS_AOT_SIZEOF_JSPROPERTY, _nv);\n", recv, (unsigned)sl);
+      fprintf(f, "      } else ");
+    } else {
+      fprintf(f, "      ");
+    }
+  }
   fprintf(
       f,
-      "      if (__builtin_expect(!Q2_FORCE_MISS && q2_put_field_hit(ctx, pic, %s, "
+      "if (__builtin_expect(!Q2_FORCE_MISS && q2_put_field_hit(ctx, pic, %s, "
       "%d, _nv), 1)) {\n",
       recv, site);
   fprintf(f, "      } else if (__builtin_expect(!Q2_FORCE_MISS && q2_put_add(ctx, pic, "
@@ -12524,6 +12684,15 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         }
         (void)gi;
       }
+      /* The loads that drop their tag or shape test trust the promises of these layouts. */
+      if (g_e_facts->claimdeps != 0)
+        fprintf(
+            f,
+            "    if (__builtin_expect(Q2_LAYOUT_BROKEN(ctx) & 0x%llxull, 0)) {\n"
+            "        E_REFUSE_NOTE(%d);\n"
+            "        return %s;\n"
+            "    }\n",
+            (unsigned long long)g_e_facts->claimdeps, fi, gen0);
       for (g = 0; g < ng; g++) {
       const EGroup *gr = &g_e_facts->groups[g];
       if (!g_e_group_used[g] || e_entry_skip(g)) continue;
@@ -12584,6 +12753,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               gr->sites[q], fi, gen0);
         }
       }
+      if (e_group_claim_refused(g))
+        fprintf(
+            f,
+            "    if (__builtin_expect(gsh%d != E_NO_SHAPE && Q2_ENTERS_LAYOUT((const unsigned char *)gsh%d), 0)) {\n"
+            "        E_REFUSE_NOTE(%d);\n"
+            "        return %s;\n"
+            "    }\n",
+            g, g, fi, gen0);
       /* A shape kept across calls on the strength of its layout must be that layout's. */
       if (e_group_ret(g) != 0)
         fprintf(

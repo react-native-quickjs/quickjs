@@ -142,6 +142,11 @@ typedef struct EFacts {
      (validated at entry or by an earlier access, with no safepoint since), so the access
      does not test it again. */
   uint8_t *cellskip;
+  uint8_t *claimskip;
+  /* per value: what the layout promises about the slot the value was loaded from (a claim byte), and
+     the layouts whose bits the body's loads trust */
+  uint8_t *vclaim;
+  uint64_t claimdeps;
   /* Per field store: 1 + the value the location held, when an earlier load of it in this region is
      still current (the store releases that value without reading the slot again), and whether
      that value is known to be an object. */

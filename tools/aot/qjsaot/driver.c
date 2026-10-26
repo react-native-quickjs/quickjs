@@ -192,8 +192,10 @@ typedef struct {
    defined objects of more than one shape. */
 typedef struct {
   int pc;
+  int ord; /* which register of the op, in the order it first wrote them */
   int shape;
   int multi;
+  unsigned types; /* the PT_* set of the register, 0 when the record carries none */
 } ProfRes;
 
 /* A `Q` record: the shape table. One entry per distinct shape any field site
@@ -217,6 +219,20 @@ typedef struct {
    function entry. */
 static ProfShape *g_shapes;
 static int g_nshapes, g_capshapes;
+
+/* A `V` record: what the live objects of a shape held in one slot when the profile was written
+   (the PT_* set, the table indexes of up to four shapes of the object values, and whether
+   there were others). */
+#define PROF_CONT_SHAPES 4
+typedef struct {
+  int shape, slot;
+  unsigned types;
+  int nvs;
+  int vs[PROF_CONT_SHAPES];
+  int vm;
+} ProfCont;
+static ProfCont *g_cont;
+static int g_ncont, g_capcont;
 
 /* A `U` record: a pc range the profiler never saw executed, inclusive. */
 typedef struct {
@@ -502,6 +518,39 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
        index, not by a function digest, so they are read before the
        per-function filter below -- which needs a hex digest and would drop
        them. The table belongs to no one function, so it is collected globally. */
+    if (line[0] == 'V' && line[1] == ' ') {
+      /* V <shape> <slot> types=<n> vs=<a,b,..|-1> vm=<0|1> */
+      ProfCont c;
+      const char *ty = strstr(line + 2, "types="), *vs = strstr(line + 2, "vs="),
+                 *vm = strstr(line + 2, "vm=");
+      int k;
+      memset(&c, 0, sizeof(c));
+      if (sscanf(line + 2, "%d %d", &c.shape, &c.slot) == 2 && ty && vs && vm) {
+        c.types = (unsigned)strtoul(ty + 6, NULL, 10);
+        c.vm = (int)strtol(vm + 3, NULL, 10) != 0;
+        for (vs += 3; c.nvs < PROF_CONT_SHAPES;) {
+          char *end;
+          long v = strtol(vs, &end, 10);
+          if (end == vs) break;
+          if (v >= 0) c.vs[c.nvs++] = (int)v;
+          if (*end != ',') break;
+          vs = end + 1;
+        }
+        for (k = 0; k < g_ncont; k++)
+          if (g_cont[k].shape == c.shape && g_cont[k].slot == c.slot) break;
+        if (k == g_ncont) {
+          if (g_ncont == g_capcont) {
+            ProfCont *nc;
+            g_capcont = g_capcont ? g_capcont * 2 : 64;
+            nc = realloc(g_cont, sizeof(*nc) * (size_t)g_capcont);
+            if (!nc) return NULL;
+            g_cont = nc;
+          }
+          g_cont[g_ncont++] = c;
+        }
+      }
+      continue;
+    }
     if (line[0] == 'Q' && line[1] == ' ') {
       char *pp = strstr(line + 2, "proto=");
       if (pp != NULL) {
@@ -872,9 +921,13 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         int pc = (int)strtol(p + 3, NULL, 10);
         int sh = (int)strtol(q + 7, NULL, 10);
         int multi = (int)strtol(m + 7, NULL, 10) != 0;
+        const char *ty = strstr(line + 2, "types=");
+        unsigned types = ty != NULL ? (unsigned)strtoul(ty + 6, NULL, 10) : 0;
         int k;
+        const char *od = strstr(line + 2, "ord=");
+        int ord = od != NULL ? (int)strtol(od + 4, NULL, 10) : 0;
         for (k = 0; k < e->nres; k++)
-          if (e->res[k].pc == pc) break;
+          if (e->res[k].pc == pc && e->res[k].ord == ord) break;
         if (k == e->nres) {
           if (e->nres == e->capres) {
             ProfRes *nr;
@@ -885,9 +938,12 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           }
           e->nres++;
           e->res[k].pc = pc;
+          e->res[k].ord = ord;
           e->res[k].shape = sh;
           e->res[k].multi = multi;
+          e->res[k].types = types;
         } else {
+          e->res[k].types |= types;
           if (e->res[k].shape != sh) {
             if (e->res[k].shape < 0) e->res[k].shape = sh;
             else if (sh >= 0) e->res[k].multi = 1;
@@ -1280,6 +1336,8 @@ static const ProfShape *prof_shape_by_id(int id) {
    shorter contract on arrival and never use it. Literals `{x,y}` and `{x,y,z}`
    are the common case. */
 #define E_LAYOUT_MAX 63
+int qjs_aot_layout_claims_any(void);
+int qjs_aot_layout_claim_of(int layout, int slot);
 typedef struct ELayoutInfo {
   int shape_id;
   int proto;              /* 1 = fn:<digest>, 2 = Object.prototype */
@@ -1414,6 +1472,96 @@ int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot) 
     return 0;
   }
   return 0;
+}
+
+/* ---- slot claims -------------------------------------------------------
+   What a contracted layout promises about the value in one of its slots, the last
+   one included: 0 nothing, QJS_AOT_CLAIM_INT "an int", QJS_AOT_CLAIM_NOREF "a
+   value that is not reference counted", QJS_AOT_CLAIM_OBJ(l) "an object of layout
+   l, or null or undefined", QJS_AOT_CLAIM_OBJ_NN(l) "an object of layout l". The
+   promise is derived from the heap walk and the recorded stores of the slot and
+   from every read site of it: they must agree, and a read the profile saw
+   produce anything else leaves the slot without one. The engine enforces it at
+   every store and add (a store that breaks it sets the layout's broken bit), so
+   a store the profile never saw only turns the dependent bodies to their
+   generic form.
+
+   The promises are emitted only while every property-value store in the engine
+   is either hooked or listed with its reason (the audit run by
+   `.local/specs/audit-slot-stores.sh`). */
+#define QJS_AOT_SLOT_STORES_AUDITED 1
+static unsigned char g_claim_tab[E_LAYOUT_MAX][PROF_MAX_FIELDS];
+static int g_claim_done, g_claim_any;
+
+static void claims_derive(void) {
+  static ELayoutInfo tab[E_LAYOUT_MAX];
+  int ntab, l, f;
+  if (g_claim_done) return;
+  g_claim_done = 1;
+  memset(g_claim_tab, 0, sizeof(g_claim_tab));
+  if (!QJS_AOT_SLOT_STORES_AUDITED || getenv("QJS_AOT_NOCLAIMS") != NULL) return;
+  if (g_prof == NULL || !g_prof_sitekinds) return;
+  ntab = e_layouts_collect(tab, E_LAYOUT_MAX);
+  for (l = 0; l < ntab; l++) {
+    const ProfShape *sh = prof_shape_by_id(tab[l].shape_id);
+    /* Only a constructor's layout: it is installed when the function object and its fresh prototype
+       exist, so no instance can exist yet. An object-literal layout is built at the first bind. */
+    if (sh == NULL || sh->nprops != sh->nfields || tab[l].proto != 1) continue;
+    for (f = 0; f < sh->nfields; f++) {
+      int claim = 0, k, j;
+      unsigned ldty = 0;
+      const ProfCont *ct = NULL;
+      for (k = 0; k < g_ncont; k++)
+        if (g_cont[k].shape == sh->id && g_cont[k].slot == f) { ct = &g_cont[k]; break; }
+      /* What the loads of this slot saw, by pc: the union of the types the profile recorded at
+         the defining instruction of every read site of the slot. */
+      for (j = 0; j < g_nprof; j++) {
+        const ProfEntry *e = &g_prof[j];
+        for (k = 0; k < e->nsites; k++) {
+          const ProfSite *ps = &e->sites[k];
+          int m;
+          if (ps->nshapes < 1 || ps->kinds != (1u << 1)) continue;
+          for (m = 0; m < ps->nshapes; m++)
+            if ((int)ps->shape[m] == sh->id && ps->slot[m] == f) {
+              int q;
+              for (q = 0; q < e->npcs; q++)
+                if (e->pcs[q].pc == ps->pc) ldty |= e->pcs[q].types;
+            }
+        }
+      }
+      if (ct != NULL) {
+        unsigned ty = ct->types;
+        /* The heap walk and every load's record must agree. A fused load (a field read together with
+           its receiver) shares one record between its two destinations, so an object in a record
+           of a read of a number slot may be the receiver: that bit is not held against a number. */
+        unsigned lnum = ldty & ~PT_OBJECT;
+        if (ty == PT_INT && (lnum & ~PT_INT) == 0) {
+          claim = QJS_AOT_CLAIM_INT;
+        } else if ((ty & ~(PT_INT | PT_FLOAT | PT_BOOL | PT_UNDEF)) == 0 && (ty & (PT_INT | PT_FLOAT | PT_BOOL)) &&
+                   (lnum & ~(PT_INT | PT_FLOAT | PT_BOOL | PT_UNDEF)) == 0) {
+          claim = QJS_AOT_CLAIM_NOREF;
+        }
+        /* An object promise (QJS_AOT_CLAIM_OBJ / OBJ_NN) is not derived: measured on richards, the shape
+           test it removes costs less than the store-side check it adds (+2.1M). */
+      }
+      if (claim > 0) {
+        g_claim_tab[l][f] = (unsigned char)claim;
+        g_claim_any = 1;
+      }
+    }
+  }
+}
+
+/* The promise for slot `slot` of contracted layout `layout` (1-based). */
+int qjs_aot_layout_claim_of(int layout, int slot) {
+  claims_derive();
+  if (layout < 1 || layout > E_LAYOUT_MAX || slot < 0 || slot >= PROF_MAX_FIELDS) return 0;
+  return g_claim_tab[layout - 1][slot];
+}
+
+int qjs_aot_layout_claims_any(void) {
+  claims_derive();
+  return g_claim_any;
 }
 
 /* The layout census, for the report: the candidates the profile supports. */
@@ -4538,6 +4686,20 @@ int qjsaot_driver_main(int argc, char **argv) {
        one is released, so storing a slot's own value cannot free it. A
        prototype receiver goes to the engine, which invalidates the prototype
        epoch, so the caller exits on it first. */
+    if (qjs_aot_layout_claims_any())
+      fprintf(
+          f,
+          "static inline __attribute__((always_inline)) int q2_claim_bad(JSValue recv, uint32_t off,\n"
+          "                                                             JSValue v);\n"
+          "#define Q2_CLAIM_BAD(recv_, off_, v_) q2_claim_bad(recv_, off_, v_)\n"
+          "#define Q2_ENTERS_LAYOUT(shape_) (*(const uint16_t *)((shape_) + QJS_AOT_OFF_SHAPE_LAYOUT_ID) != 0)\n"
+          "#define Q2_OBJ_IN_LAYOUT(obj_) Q2_ENTERS_LAYOUT(*(const unsigned char *const *)((obj_) + QJS_AOT_OFF_JSOBJECT_SHAPE))\n");
+    else
+      fprintf(
+          f,
+          "#define Q2_CLAIM_BAD(recv_, off_, v_) 0\n"
+          "#define Q2_ENTERS_LAYOUT(shape_) 0\n"
+          "#define Q2_OBJ_IN_LAYOUT(obj_) 0\n");
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int q2_is_proto(JSValue "
@@ -4772,6 +4934,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      (uint16_t)*(const uint32_t *)(*(const unsigned char *const *)((const unsigned char *)ctx +\n"
         "          QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_IC_EPOCH)) return 0;\n"
         "  nsh = (unsigned char *)holders[ns + (uint32_t)site];\n"
+        "  if (Q2_ENTERS_LAYOUT(nsh)) return 0;\n"
         "  npsz = *(const int *)(nsh + QJS_AOT_OFF_JSSHAPE_PROP_SIZE);\n"
         "  if (npsz != *(const int *)(osh + QJS_AOT_OFF_JSSHAPE_PROP_SIZE) &&\n"
         "      (unsigned)npsz > ((fl & QJS_AOT_JSOBJECT_INLINE_CAP_MASK) >> QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT)) return 0;\n"
@@ -4820,6 +4983,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    E_PUTWHY(E_PUT_PROTO);\n"
         "    return 0;\n"
         "  }\n"
+        "  if (Q2_OBJ_IN_LAYOUT(obj)) return 0;\n"
         "  slot = (JSValue *)(*(unsigned char *const *)(obj + "
         "QJS_AOT_OFF_JSOBJECT_PROP) +\n"
         "                     *(const uint32_t *)(e + "
@@ -4970,6 +5134,39 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#endif\n"
           "  *out = v;\n"
           "  return 1;\n"
+          "}\n\n");
+    if (qjs_aot_layout_claims_any())
+      fprintf(
+          f,
+          "/* What each built layout promises about its slots (0 nothing, 1..63 an object of\n"
+          "   that layout or null or undefined, 0x80 not reference counted). The engine\n"
+          "   enforces them at its stores; a store made here checks its own. */\n"
+          "#define Q2_CLAIMS 1\n"
+          "extern const uint8_t q2_layout_claim[][32];\n"
+          "static inline __attribute__((always_inline)) int q2_claim_val_ok(unsigned c, JSValue v)\n"
+          "{\n"
+          "  int t;\n"
+          "  if (c == QJS_AOT_CLAIM_INT) return JS_VALUE_GET_TAG(v) == JS_TAG_INT;\n"
+          "  if (c & QJS_AOT_CLAIM_NOREF) return !JS_VALUE_HAS_REF_COUNT(v);\n"
+          "  t = JS_VALUE_GET_TAG(v);\n"
+          "  if (!(c & 0x40u) && (t == JS_TAG_NULL || t == JS_TAG_UNDEFINED)) return 1;\n"
+          "  return t == JS_TAG_OBJECT &&\n"
+          "         *(void *const *)((const unsigned char *)JS_VALUE_GET_PTR(v) +\n"
+          "                          QJS_AOT_OFF_JSOBJECT_SHAPE) == q2_layout_shape[(c & 0x3fu) - 1u];\n"
+          "}\n"
+          "/* Whether storing `v` at byte offset `off` of the property array of `recv` (an object)\n"
+          "   would break a promise of the layout its shape ends. */\n"
+          "static inline __attribute__((always_inline)) int q2_claim_bad(JSValue recv, uint32_t off,\n"
+          "                                                             JSValue v)\n"
+          "{\n"
+          "  const unsigned char *sh = *(const unsigned char *const *)((const unsigned char *)\n"
+          "      JS_VALUE_GET_PTR(recv) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+          "  uint32_t id = (uint32_t)*(const uint16_t *)(sh + QJS_AOT_OFF_SHAPE_LAYOUT_ID), slot, c;\n"
+          "  if (id == 0u || id > (uint32_t)Q2_LAYOUT_COUNT) return 0;\n"
+          "  slot = off / QJS_AOT_SIZEOF_JSPROPERTY;\n"
+          "  if (slot >= 32u) return 0;\n"
+          "  c = q2_layout_claim[id - 1u][slot];\n"
+          "  return c != 0u && !q2_claim_val_ok(c, v);\n"
           "}\n\n");
     /* The inline unary fast path for neg and inc: an int whose result stays an
        int, or a float64. Anything else (-0, an overflow, a coercion) returns 0
@@ -5459,6 +5656,28 @@ int qjsaot_driver_main(int argc, char **argv) {
           fprintf(f, "},\n");
         }
         fprintf(f, "};\n");
+        if (qjs_aot_layout_claims_any()) {
+          fprintf(f, "const uint8_t q2_layout_claim[Q2_LAYOUT_COUNT][32] = {\n");
+          for (li = 0; li < nc; li++) {
+            int fi;
+            fprintf(f, "  {");
+            for (fi = 0; fi < PROF_MAX_FIELDS; fi++)
+              fprintf(f, "%s%d", fi ? "," : "", qjs_aot_layout_claim_of(li + 1, fi));
+            fprintf(f, "},\n");
+          }
+          fprintf(f, "};\n");
+        }
+        if (qjs_aot_layout_claims_any())
+          fprintf(f,
+                  "static void q2_install_claims(JSContext *ctx, uint32_t i)\n"
+                  "{\n"
+                  "  uint32_t k;\n"
+                  "  for (k = 0; k < Q2_MAXF; k++)\n"
+                  "    if (q2_layout_claim[i][k] != 0)\n"
+                  "      qjs_aot_layout_claim(ctx, i + 1u, k, q2_layout_claim[i][k]);\n"
+                  "}\n");
+        else
+          fprintf(f, "static void q2_install_claims(JSContext *ctx, uint32_t i) { (void)ctx; (void)i; }\n");
         fprintf(f, "static const uint32_t q2_layout_nfields[Q2_LAYOUT_COUNT] = {");
         for (li = 0; li < nc; li++)
           fprintf(f, "%s%du", li ? "," : "", (unsigned)cand[li].nfields);
@@ -5512,6 +5731,7 @@ int qjsaot_driver_main(int argc, char **argv) {
             "  if (n == nf + 1u) {\n"
             "    q2_layout_shape[i] = q2_layout_chain[i][nf];\n"
             "    q2_layout_state[i] = 1;\n"
+            "    q2_install_claims(ctx, i);\n"
             "  } else {\n"
             "    q2_layout_state[i] = 2;\n"
             "  }\n"
@@ -5575,8 +5795,8 @@ int qjsaot_driver_main(int argc, char **argv) {
             "    q2_layout_state[i] = 0;\n"
             "  }\n"
             "  if (getenv(\"QJS_AOT_STATS\"))\n"
-            "    fprintf(stderr, \"aot layouts: built=%%u refused=%%u unbuilt=%%u\\n\", built,\n"
-            "            refused, pending);\n"
+            "    fprintf(stderr, \"aot layouts: built=%%u refused=%%u unbuilt=%%u broken=0x%%llx\\n\", built,\n"
+            "            refused, pending, (unsigned long long)*(const uint64_t *)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_BROKEN));\n"
             "  *(void ***)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_SHAPE) = NULL;\n"
             "  *(uint32_t *)((unsigned char *)rt + QJS_AOT_OFF_RT_LAYOUT_COUNT) = 0;\n"
             "  q2_owner_rt = NULL;\n"

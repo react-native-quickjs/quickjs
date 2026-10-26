@@ -886,6 +886,7 @@ static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int group
 }
 
 int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
+int qjs_aot_layout_claim_of(int layout, int slot);
 /* The contracted layout a group's shape is, or 0. Every own site of the group must be an own data
    access of the one layout (the group's sites all saw one shape, so a prototype read in it is a
    read of an object in that layout too). `*pure` is set when no site is a prototype read: the
@@ -911,8 +912,9 @@ int e_facts_group_layout(const Q2Func *fn, const EFacts *f, int g, int *pure) {
   if (pure != NULL) *pure = lay != 0 && nproto == 0;
   return lay;
 }
+#define E_CLAIMG 4096
 static int group_layout(const Q2Func *fn, const EFacts *f, int g) {
-  return e_facts_group_layout(fn, f, g, NULL);
+  return e_facts_group_layout(fn, f, g >= E_CLAIMG ? g - E_CLAIMG : g, NULL);
 }
 
 /* The earlier chain result that still holds `in`'s first link, or Q2_NO_VALUE: `in` is a grouped
@@ -1090,8 +1092,32 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       if (fs_has_shape(s, rv, g)) {
         f->skip[insn] |= (uint8_t)(1u << r);
         f->nskip++;
+      } else if (fs_has_shape(s, rv, E_CLAIMG + g)) {
+        f->claimskip[insn] |= (uint8_t)(1u << r);
       }
       if (fs_add_shape(s, rv, g) < 0) return -1;
+      if (!ref[r].is_store && in->ndef == nr && r < in->ndef && in->def[r] != Q2_NO_VALUE &&
+          in->def[r] < E_ARRV(0)) {
+        int l = 0, sl = 0, osite, own = group_layout(fn, f, g), cl = 0, gg;
+        const uint8_t *dg = e_site_dg(fn, ref[r].site, &osite);
+        if (own != 0 && e_facts_site_proto(f, ref[r].site) == 0 && qjs_aot_layout_site(dg, osite, &l, &sl) &&
+            l == own)
+          cl = qjs_aot_layout_claim_of(l, sl);
+        if (cl != 0 && (unsigned)in->def[r] < (unsigned)fn->nvalues) {
+          /* the body trusts this load: it depends on the holder's bit, and on the loaded object's
+             layout too when the promise names one */
+          f->vclaim[in->def[r]] = (uint8_t)cl;
+          f->claimdeps |= 1ULL << (l - 1);
+          if ((cl & 0x80) == 0 && (cl & 0x3f) != 0) f->claimdeps |= 1ULL << ((cl & 0x3f) - 1);
+        }
+        if (cl >= 1 && cl <= 63)
+          for (gg = 0; gg < f->ngroups; gg++)
+            if (group_layout(fn, f, gg) == cl && fs_add_shape(s, in->def[r], E_CLAIMG + gg) < 0) return -1;
+        /* never null: the value is an object of that layout, whatever the test was */
+        if ((cl & 0xC0) == 0x40)
+          for (gg = 0; gg < f->ngroups; gg++)
+            if (group_layout(fn, f, gg) == (cl & 0x3f) && fs_add_shape(s, in->def[r], gg) < 0) return -1;
+      }
       if (ref[r].is_store && in->rop == ROP_put_field && in->extcall == 0 && nr == 1) {
         int pure = 0, lay = e_facts_group_layout(fn, f, g, &pure);
         if (lay != 0 && pure) {
@@ -1162,7 +1188,7 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       int i;
       for (i = 0; i < s->nshape; i++) {
         int lay;
-        if (s->shape_val[i] != in->argval[2] || s->shape_val[i] >= E_ARRV(0)) continue;
+        if (s->shape_val[i] != in->argval[2] || s->shape_val[i] >= E_ARRV(0) || s->shape_grp[i] >= E_CLAIMG) continue;
         lay = group_layout(fn, f, s->shape_grp[i]);
         if (lay != 0) { f->thislay[insn] = (uint8_t)lay; break; }
       }
@@ -1501,6 +1527,9 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->access = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->skip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->cellskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->claimskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->vclaim = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
+  out->claimdeps = 0;
   out->oldval = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int32_t));
   out->oldobj = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->elemreg = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
@@ -1517,7 +1546,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->blocks = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1),
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
-  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
+  if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->claimskip == NULL || out->vclaim == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
       out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->noproto == NULL || out->cfwd == NULL ||
       out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
     goto done;
@@ -1699,6 +1728,14 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
         goto done;
   }
   rc = 0;
+  /* A load that drops the shape test on a never-null promise is correct only while the loaded object's
+     layout is intact: that layout's bit must be among those the body tests. */
+  for (k = 0; k < fn->nvalues; k++)
+    if ((out->vclaim[k] & 0xC0) == 0x40 && !((out->claimdeps >> ((out->vclaim[k] & 0x3f) - 1)) & 1)) {
+      fprintf(stderr, "qjsaot: a never-null promise on layout %d is used without that layout's bit in the body's dependencies\n",
+              out->vclaim[k] & 0x3f);
+      abort();
+    }
 done:
   if (outs != NULL) {
     for (b = 0; b < fn->nblocks; b++) fs_free(&outs[b]);
@@ -1725,6 +1762,8 @@ void e_facts_free(EFacts *f) {
   free(f->access);
   free(f->skip);
   free(f->cellskip);
+  free(f->claimskip);
+  free(f->vclaim);
   free(f->oldval);
   free(f->oldobj);
   free(f->elemreg);
