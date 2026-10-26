@@ -8350,7 +8350,13 @@ static int emit_group_this_read(
     if (c2 == NULL) abort();
     memcpy(c2, cur, sizeof(*c2) * (size_t)fn->nregs);
     c2[rreg] = rv;
-    e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, c2, in);
+    {
+      const int n0 = g_e_dx_n;
+      e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, c2, in);
+      /* The stub marks every def of the op as written to the frame; only the read is. The
+         receiver lives in its local, which the exit must still sync. */
+      if (g_e_dx_n > n0) g_e_dx_cur[n0][rreg] = rv;
+    }
     free(c2);
   }
   e_group_test(
