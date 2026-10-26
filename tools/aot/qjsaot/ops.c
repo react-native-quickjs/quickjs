@@ -2830,6 +2830,12 @@ static int g_e_epoch_skip;
    from a local. */
 #define E_MC_MAX 32
 static int g_e_mc_site[E_MC_MAX], g_e_mc_grp[E_MC_MAX], g_e_mc_n;
+/* What the calls through each method cache cell expect of the cell's value: state 1 is one callee
+   every call through the cell names, 2 is anything else. The entry compares the cell once, so a
+   call site of state 1 does not compare the callee. */
+static signed char g_e_mono_st[E_MC_MAX];
+static char g_e_mono_callee[E_MC_MAX][33];
+static int g_e_mono_seq, g_e_mono_id;
 /* The value each cached read defines, so a call on it knows the callee's bound entry. */
 #define E_MC_VALS 8192
 static signed char g_e_mc_of[E_MC_VALS];
@@ -5795,7 +5801,18 @@ static int emit_inl_nested_call(
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
     ib[0] = 0;
-    if (cmc >= 0)
+    if (cmc >= 0 && cmc < E_MC_MAX && g_e_mono_id != 0) {
+      if (nb == 1 && g_e_mono_st[cmc] == 0) {
+        g_e_mono_st[cmc] = 1;
+        snprintf(g_e_mono_callee[cmc], sizeof(g_e_mono_callee[cmc]), "%s", callee[k]);
+      } else if (nb != 1 || strcmp(g_e_mono_callee[cmc], callee[k]) != 0) {
+        g_e_mono_st[cmc] = 2;
+      }
+      snprintf(
+          idt, sizeof(idt),
+          "e_mono_%d[%d] == (const void *)aot_f_%s || mce%d == (const void *)aot_f_%s",
+          g_e_mono_id, cmc, callee[k], cmc, callee[k]);
+    } else if (cmc >= 0)
       snprintf(idt, sizeof(idt), "mce%d == (const void *)aot_f_%s", cmc, callee[k]);
     else
       snprintf(
@@ -12230,6 +12247,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_epoch_skip = (ngu > 0 || ngf > 0) && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
       g_e_mc_n = 0;
       memset(g_e_mc_of, -1, sizeof(g_e_mc_of));
+      memset(g_e_mono_st, 0, sizeof(g_e_mono_st));
+      g_e_mono_id = ++g_e_mono_seq;
       if (g_e_epoch_skip && getenv("QJS_AOT_NOMETHCACHE") == NULL)
         for (g = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
@@ -12406,6 +12425,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
               fprintf(f, "      e_vp[%d] = pci%d;\n", pk++, gr->sites[qq]);
         }
+        /* The entry names what the method cells hold, and the body trusts it until the cache epoch moves. A call
+           site whose cell has one callee in every call through it takes the callee as given: the entry refuses
+           the body when the cell's value is not that callee. What moves a cell's value is a write into a
+           prototype's slot, and every such write moves the epoch: the engine's own-slot, add, delete and define
+           paths bump it for a prototype, a compiled store skips the test only for an object of a contracted
+           layout that the layout's bit says is no prototype, and a store the compiled code refuses runs in the
+           step executor with the same bump. The entry reads the epoch before it fills the statics, and the
+           statics are written only after every cell passed, so a refused entry leaves the last good set. */
         for (g = 0; g < g_e_mc_n; g++)
           fprintf(
               f,
@@ -12418,9 +12445,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               "        mcv%d = *q2_hslotp_sh(gsh%d, q2_cell_off(pic, %d));\n"
               "      }\n"
               "      mce%d = q2_entry_of(mcv%d);\n"
-              "      e_vm[%d] = mcv%d; e_vme[%d] = mce%d;\n",
+              "      if (__builtin_expect(e_mono_%d[%d] != NULL && mce%d != e_mono_%d[%d], 0)) {\n"
+              "        E_REFUSE_NOTE(%d);\n"
+              "        return %s;\n"
+              "      }\n",
               g, g_e_mc_grp[g], g_e_mc_grp[g], g_e_mc_site[g], fi, gen0, g, g_e_mc_grp[g],
-              g_e_mc_site[g], g, g, g, g, g, g);
+              g_e_mc_site[g], g, g, g_e_mono_id, g, g, g_e_mono_id, g, fi, gen0);
+        for (g = 0; g < g_e_mc_n; g++)
+          fprintf(f, "      e_vm[%d] = mcv%d; e_vme[%d] = mce%d;\n", g, g, g, g);
         fprintf(f, "      e_vcb = pic; e_vep = q2_ep;\n    }\n");
       }
       /* A contracted group's shape is its layout's, read on every entry: the layout may
@@ -13213,6 +13245,19 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       for (i = 0; i < mlen; i++)
         if (mbuf[i] == '\n') lines++;
       bytes = (long)mlen;
+      if (g_e_mc_n > 0 && g_e_mono_id != 0) {
+        int mg;
+        fprintf(out, "static const void *const e_mono_%d[%d] = {\n", g_e_mono_id, g_e_mc_n);
+        for (mg = 0; mg < g_e_mc_n; mg++) {
+          if (g_e_mono_st[mg] == 1)
+            fprintf(
+                out, "#ifdef Q2_NATIVE_%s\n  (const void *)aot_f_%s,\n#else\n  NULL,\n#endif\n",
+                g_e_mono_callee[mg], g_e_mono_callee[mg]);
+          else
+            fprintf(out, "  NULL,\n");
+        }
+        fprintf(out, "};\n");
+      }
       fwrite(mbuf, 1, mlen, out);
       if (g_opm != NULL && g_opm_ops != NULL) {
         fclose(g_opm_ops);
