@@ -9394,6 +9394,26 @@ static int e_entry_skip(int g) {
 /* The byte offset of `site`'s field in a receiver of group `g`'s shape: a constant
    for a contracted group, otherwise the offset the site's cache cell holds. */
 static const Q2Func *g_e_glay_fn;
+/* The slot of a site of an uncontracted group, as the profile saw it, when the entry checks that the
+   site's cell still says so: an own slot of a hot site in a group whose shape the entry reads from the
+   cells. A slot of a shape is fixed by the shape and the property, and the entry refuses when the cell
+   holding the group's shape holds another offset, so every access that tests the shape uses it. */
+int qjs_aot_prof_site_slots(const uint8_t dg[16], int site, int nshapes, int *slots, int cap);
+static int e_site_const_slot_at(int g, int site, int need_flag) {
+  int osite, slot = -1, z, hot = 0;
+  const uint8_t *dg;
+  if (g_e_glay_fn == NULL || g_e_facts == NULL || g_e_group_used == NULL || e_group_layout(g) != 0) return -1;
+  if (g < 0 || g >= g_e_facts->ngroups || !g_e_group_used[g] || g_e_facts->groups[g].own) return -1;
+  if (need_flag && !e_cell_entry_valid(g, site)) return -1;
+  for (z = 0; z < g_e_facts->nsites; z++)
+    if (g_e_facts->sites[z].site == site) hot = g_e_facts->sites[z].hot;
+  if (!hot) return -1;
+  if (e_facts_site_proto(g_e_facts, site) != 0 || e_mc_index(site) >= 0) return -1;
+  dg = e_site_dg(g_e_glay_fn, site, &osite);
+  if (dg == NULL || !qjs_aot_prof_site_slots(dg, osite, 1, &slot, 1) || slot < 0) return -1;
+  return slot;
+}
+static int e_site_const_slot(int g, int site) { return e_site_const_slot_at(g, site, 1); }
 static void e_slot_off(char *out, size_t n, int g, int site) {
   int l = 0, sl = 0, osite;
   if (e_group_layout(g) != 0 && g_e_glay_fn != NULL) {
@@ -9402,6 +9422,12 @@ static void e_slot_off(char *out, size_t n, int g, int site) {
       snprintf(out, n, "%uu * QJS_AOT_SIZEOF_JSPROPERTY", (unsigned)sl);
       return;
     }
+  }
+  if ((sl = e_site_const_slot(g, site)) >= 0) {
+    /* QJS_AOT_OFFSKEW_ACC=n moves every such access by n slots: the negative control for the entry check. */
+    if (getenv("QJS_AOT_OFFSKEW_ACC") != NULL) sl += atoi(getenv("QJS_AOT_OFFSKEW_ACC"));
+    snprintf(out, n, "%uu * QJS_AOT_SIZEOF_JSPROPERTY", (unsigned)sl);
+    return;
   }
   {
     char ci[24];
@@ -12534,17 +12560,27 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               f, "    pci%d = q2_cell2_index(pic, %d, (int)q2_ns, gsh%d);\n",
               gr->sites[q], gr->sites[q], g);
         {
-          char cib[24];
+          char cib[24], offchk[96] = "";
+          const int ks = e_site_const_slot_at(g, gr->sites[q], 0);
+          int ks2 = ks;
+          /* A slot the body takes from the profile is the one the cell holds for the group's shape. */
+          if (ks >= 0) {
+            char ci2[24];
+            if (getenv("QJS_AOT_OFFSKEW_CHK") != NULL) ks2 = ks + atoi(getenv("QJS_AOT_OFFSKEW_CHK"));
+            snprintf(
+                offchk, sizeof(offchk), " || q2_cell_off(pic, %s) != %uu * QJS_AOT_SIZEOF_JSPROPERTY",
+                e_cellidx(ci2, sizeof(ci2), gr->sites[q]), (unsigned)ks2);
+          }
           fprintf(
               f,
               "    { const void *_s = %s(pic, %s);\n"
-              "      if (__builtin_expect(gsh%d != E_NO_SHAPE && %s_s != gsh%d, 0)) {\n"
+              "      if (__builtin_expect(gsh%d != E_NO_SHAPE && (%s_s != gsh%d%s), 0)) {\n"
               "        E_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
               "        E_REFUSE_NOTE(%d);\n"
               "        return %s;\n"
               "      } }\n",
               wr && hot ? "q2_cell_wshape" : "q2_cell_shape",
-              e_cellidx(cib, sizeof(cib), gr->sites[q]), g, hot ? "" : "_s != NULL && ", g, hex,
+              e_cellidx(cib, sizeof(cib), gr->sites[q]), g, hot ? "" : "_s != NULL && ", g, offchk, hex,
               gr->sites[q], fi, gen0);
         }
       }
