@@ -1492,6 +1492,7 @@ int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot) 
 #define QJS_AOT_SLOT_STORES_AUDITED 1
 void qjs_aot_scan_init(JSContext *ctx, const JSAotGenFunc *funcs, int n);
 int qjs_aot_scan_verdict(const char *name, int claim, const uint8_t own[16], const uint8_t (*ctors)[16], int nctors);
+void qjs_aot_layterm_counts(int *dropped, int *kept);
 static unsigned char g_claim_tab[E_LAYOUT_MAX][PROF_MAX_FIELDS];
 static int g_claim_done, g_claim_any;
 
@@ -5839,6 +5840,11 @@ int qjsaot_driver_main(int argc, char **argv) {
 
     if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
       fprintf(stderr, "layout census: site-slot-refused=%d\n", g_slot_refused);
+    {
+      int dropped, kept;
+      qjs_aot_layterm_counts(&dropped, &kept);
+      fprintf(stderr, "qjsaot: layout-bit tests: %d dropped (an epoch test covers them), %d kept\n", dropped, kept);
+    }
     fprintf(
         stderr,
         "qjsaot: %d functions seen, %d emitted, %lld instructions, "

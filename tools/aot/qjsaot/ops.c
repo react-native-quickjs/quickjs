@@ -2831,6 +2831,12 @@ static int g_e_inl_nl;
    every safepoint is followed by a comparison of the runtime's epoch with `q2_ep` that leaves the body
    when any cache entry has changed meanwhile. */
 static int g_e_epoch_skip;
+static int g_e_layterm_dropped, g_e_layterm_kept;
+static int e_layterm_epoch(void) { return g_e_epoch_skip && getenv("QJS_AOT_KEEPLAYTERMS") == NULL; }
+void qjs_aot_layterm_counts(int *dropped, int *kept) {
+  *dropped = g_e_layterm_dropped;
+  *kept = g_e_layterm_kept;
+}
 /* The prototype data properties a body reads through a non-contracted group: the entry reads
    each once, at the epoch its group shapes were validated at, so an access takes the value
    from a local. */
@@ -2885,13 +2891,16 @@ static void e_emit_group_recheck_at(
   }
   /* The shape facts of these layouts were kept across the instruction: an object leaves a layout
      only by setting its bit. */
-  if (lm != 0) snprintf(lt, sizeof(lt), "Q2_LAYOUT_BROKEN(ctx) & 0x%llxull", lm);
+  /* A layout break moves the cache epoch, so where the epoch is compared at this point the layout bits
+     need no test of their own. */
+  if (lm != 0 && !e_layterm_epoch()) snprintf(lt, sizeof(lt), "Q2_LAYOUT_BROKEN(ctx) & 0x%llxull", lm);
+  if (lm != 0 && e_layterm_epoch()) g_e_layterm_dropped++; else if (lm != 0) g_e_layterm_kept++;
   e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, exit_pc, cur, in);
   e_sweep_guard(f, "dx", exit_pc);
   fprintf(
       f, "    if (__builtin_expect(%s%s%s%s%s, 0)) goto dx_%d;\n", g_e_nolazy ? "E_LAZY_SEEN(ctx)" : "",
-      g_e_nolazy && (g_e_epoch_skip || lm) ? " || " : "", g_e_epoch_skip ? "Q2_EPOCH_MOVED(ctx)" : "",
-      g_e_epoch_skip && lm ? " || " : "", lt, exit_pc);
+      g_e_nolazy && (g_e_epoch_skip || lt[0]) ? " || " : "", g_e_epoch_skip ? "Q2_EPOCH_MOVED(ctx)" : "",
+      g_e_epoch_skip && lt[0] ? " || " : "", lt, exit_pc);
   g_e_recheck_done = in->pc;
 }
 
@@ -9802,10 +9811,16 @@ static int emit_group_write(
   fprintf(f, "    {\n");
   /* A store into a contracted layout tests that the layout has no prototype object once on a path,
      by its bit; the test the engine's prototype flag would give is then redundant. */
-  if (np == 1)
+  if (np == 1 && e_layterm_epoch()) {
+    /* every safepoint of the body is followed by an epoch comparison, which a layout break moves */
+    g_e_layterm_dropped++;
+    fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  } else if (np == 1) {
+    g_e_layterm_kept++;
     fprintf(
         f, "      if (__builtin_expect(%s || (Q2_LAYOUT_BROKEN(ctx) & 0x%llxull), 0)) goto vx_%d;\n",
         test, 1ULL << (e_group_layout(g) - 1), in->pc);
+  }
   else if (np == 2)
     fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
   else
