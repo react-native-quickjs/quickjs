@@ -2452,6 +2452,7 @@ static int e_spill_slot(Q2ValueId v) {
    (set by the prefilter). A miss exit emitted in such a block, for an access the
    profile cannot vouch for, keeps the function framed. */
 static uint8_t *g_e_loop_blk;
+static int g_e_loop_blk_n;
 static int g_e_fl_longloop;
 /* Set around a miss exit whose cause the profile CAN vouch for (a number test on an
    operand it saw as a number, a global's cache). */
@@ -2484,7 +2485,7 @@ static int e_fl_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
     if (qjs_aot_prof_site_own(dg, osite)) return 1;
     if (qjs_aot_prof_site_read_hits(dg, osite)) return 1;
     if (qjs_aot_prof_site_cold(dg, osite) &&
-        !(g_e_loop_blk != NULL && g_e_blk >= 0 && g_e_loop_blk[g_e_blk]))
+        !(g_e_loop_blk != NULL && g_e_blk >= 0 && (g_e_blk < g_e_loop_blk_n && g_e_loop_blk[g_e_blk])))
       return 1;
   }
   e_fl_block("a read that is not an own or prototype hit", in);
@@ -2500,7 +2501,7 @@ static int e_site_vouched(const Q2Func *fn, int site) {
   uint64_t sh[4];
   /* In a loop that may run long a frameless body gives up the entry-validated cache cells the
      framed body hoists out of the loop, which costs more per iteration than the frame saves. */
-  if (g_e_fl_longloop && g_e_loop_blk != NULL && g_e_blk >= 0 && g_e_loop_blk[g_e_blk]) return 0;
+  if (g_e_fl_longloop && g_e_loop_blk != NULL && g_e_blk >= 0 && (g_e_blk < g_e_loop_blk_n && g_e_loop_blk[g_e_blk])) return 0;
   {
     int osite;
     const uint8_t *dg = e_site_dg(fn, site, &osite);
@@ -4333,7 +4334,7 @@ static int emit_typed_opcall(
      frameless. */
   if (g_e_fl) {
     if (g_e_fl_longloop && !g_e_fl_miss_ok && g_e_loop_blk != NULL &&
-        g_e_blk >= 0 && g_e_loop_blk[g_e_blk])
+        g_e_blk >= 0 && (g_e_blk < g_e_loop_blk_n && g_e_loop_blk[g_e_blk]))
       e_fl_block("a miss-exit access in a loop", in);
     e_note_stub(
         g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
@@ -5423,7 +5424,7 @@ static int emit_intrinsic_call(
      profile saw the callee; parseInt can also miss on its argument's value, so in a
      loop that may run long it keeps the function framed. */
   if (g_e_fl && !g_e_inl && id == QJS_AOT_INTR_PARSEINT && g_e_fl_longloop &&
-      g_e_loop_blk != NULL && g_e_blk >= 0 && g_e_loop_blk[g_e_blk])
+      g_e_loop_blk != NULL && g_e_blk >= 0 && (g_e_blk < g_e_loop_blk_n && g_e_loop_blk[g_e_blk]))
     e_fl_block("a parseInt in a loop", in);
   intr_num(a0, sizeof(a0), fn, t, cur, in->win_reg);
   if (na >= 2)
@@ -13236,6 +13237,7 @@ static void e_fl_loop_setup(const Q2Func *fn) {
     free(g_e_loop_blk);
     g_e_loop_blk = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), 1);
     if (g_e_loop_blk == NULL) abort();
+    g_e_loop_blk_n = fn->nblocks > 0 ? fn->nblocks : 1;
     g_e_fl_longloop = 0;
     for (q = 0; q < fn->ninsns; q++) {
       const Q2Insn *ii = &fn->insns[q];
