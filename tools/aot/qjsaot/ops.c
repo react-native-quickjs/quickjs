@@ -6919,7 +6919,10 @@ static int emit_alloc_op(
     else if (t->lb[v] == E_LB_BOOL)
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", r * 16, (unsigned)v);
   }
-  fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
+  fprintf(f, "    { JSValue _o; int _rc;\n");
+  /* The forwarded call runs user code, whose backtrace names this frame at this instruction. */
+  if (in->rop == ROP_apply_arguments) fprintf(f, "      E_CAP(f, %d);\n", in->pc);
+  fprintf(f, "      _rc = %s;\n", call);
   fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", in->pc);
   fprintf(f, "      if (%s) {\n", okc);
   if (!nodest)
