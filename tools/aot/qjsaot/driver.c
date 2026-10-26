@@ -1566,6 +1566,25 @@ int qjs_aot_prof_callees(
         hex[k][32] = 0;
       }
     }
+    /* Hottest first: a site tests its candidates in this order. */
+    for (k = 1; k < *n && k < PROF_MAX_CALLEES; k++) {
+      int j = k;
+      while (j > 0 && hits[j] > hits[j - 1]) {
+        unsigned long long th = hits[j];
+        int tk = kind[j];
+        char tx[33];
+        hits[j] = hits[j - 1];
+        hits[j - 1] = th;
+        kind[j] = kind[j - 1];
+        kind[j - 1] = tk;
+        if (hex) {
+          memcpy(tx, hex[j], 33);
+          memcpy(hex[j], hex[j - 1], 33);
+          memcpy(hex[j - 1], tx, 33);
+        }
+        j--;
+      }
+    }
     return *n;
   }
   return 0;
