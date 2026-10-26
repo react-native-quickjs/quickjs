@@ -1,0 +1,159 @@
+Subject: The profile build notes every store into a profiled shape's slots, so the slot types it reports are complete
+
+What this does
+  - Profile build only: the store and add hooks record, per shape and slot, the value kinds written and the shape of an object value.
+    The profile dump merges these notes into the `V` lines, which the heap walk alone got wrong (it sees only objects on the
+    collector's list and misses values that were overwritten, such as a constructor's `this.x = null`).
+
+Why we need it
+  A promise about a slot is derived from every type the slot ever held; a partial view would promise what a later store breaks.
+
+Functions touched
+  `aot_note_of`, `aot_note_slot`, `aot_note_object`, `js_aot_content_store`, `js_aot_content_filled`, `js_aot_content_last`,
+  `aot_dump_contents`. All under `QJS_AOT_PROFILE`; the preprocessed non-profile source holds none of it.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -16409,6 +16409,72 @@
+     }
+ }
+ 
++#if QJS_AOT_PROFILE
++/* What the program stored into the slots of each shape, noted at the hooks every store passes: the
++   types, and the shape of an object value (one, or "several"). The profile dump merges it with the
++   heap walk, which cannot see objects that are not on the collector's list or values that were
++   overwritten. */
++#define AOT_NOTE_SLOTS 32
++typedef struct AotNote {
++    JSShape *sh;
++    uint16_t types[AOT_NOTE_SLOTS];
++    JSShape *vs[AOT_NOTE_SLOTS];
++    uint8_t multi[AOT_NOTE_SLOTS];
++} AotNote;
++static AotNote *aot_notes;
++static int aot_nnotes, aot_capnotes;
++static uint16_t aot_tag_class(JSValue v);
++
++static AotNote *aot_note_of(JSShape *sh)
++{
++    static int last = -1;
++    int i;
++    if (last >= 0 && aot_notes[last].sh == sh)
++        return &aot_notes[last];
++    for (i = 0; i < aot_nnotes; i++)
++        if (aot_notes[i].sh == sh)
++            goto found;
++    if (aot_nnotes == aot_capnotes) {
++        int nc = aot_capnotes ? aot_capnotes * 2 : 64;
++        AotNote *nn = (realloc)(aot_notes, sizeof(*nn) * (size_t)nc);
++        if (nn == NULL)
++            return NULL;
++        aot_notes = nn;
++        aot_capnotes = nc;
++    }
++    memset(&aot_notes[aot_nnotes], 0, sizeof(aot_notes[0]));
++    aot_notes[aot_nnotes].sh = sh;
++    i = aot_nnotes++;
++found:
++    last = i;
++    return &aot_notes[i];
++}
++
++static void aot_note_slot(JSShape *sh, uint32_t slot, JSValue v)
++{
++    AotNote *n;
++    uint16_t bit;
++    if (slot >= AOT_NOTE_SLOTS || (n = aot_note_of(sh)) == NULL)
++        return;
++    bit = aot_tag_class(v);
++    n->types[slot] |= bit;
++    if (bit == AOT_TYPE_OBJECT) {
++        JSShape *vsh = JS_VALUE_GET_OBJ(v)->shape;
++        if (n->vs[slot] == NULL)
++            n->vs[slot] = vsh;
++        else if (n->vs[slot] != vsh)
++            n->multi[slot] = 1;
++    }
++}
++
++static void aot_note_object(JSObject *p, uint32_t from)
++{
++    uint32_t i, n = p->shape->prop_count;
++    for (i = from; i < n && i < AOT_NOTE_SLOTS; i++)
++        aot_note_slot(p->shape, i, p->prop[i].u.value);
++}
++#endif
++
+ /* Whether `v` keeps the promise `claim` makes about a slot. */
+ static inline bool js_aot_claim_ok(JSValue v, uint8_t claim)
+ {
+@@ -16489,6 +16555,9 @@
+ 
+ static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
+ {
++#if QJS_AOT_PROFILE
++    aot_note_slot(p->shape, slot, v);
++#endif
+     if (unlikely(p->shape->layout_id != 0))
+         js_aot_content_store_slow(rt, p, slot, v);
+     if (unlikely(p->gv_watched))
+@@ -16535,6 +16604,9 @@
+ /* Every slot, the last one included, holds its value. */
+ static inline void js_aot_content_filled(JSRuntime *rt, JSObject *p)
+ {
++#if QJS_AOT_PROFILE
++    aot_note_object(p, 0);
++#endif
+     if (unlikely(p->shape->layout_id != 0))
+         js_aot_content_enter_slow(rt, p, true);
+ }
+@@ -16542,6 +16614,9 @@
+ /* The last slot of an object that has just adopted a shape has been written. */
+ static inline void js_aot_content_last(JSRuntime *rt, JSObject *p)
+ {
++#if QJS_AOT_PROFILE
++    aot_note_object(p, 0);
++#endif
+     if (unlikely(p->shape->layout_id != 0) && !js_aot_claim_hooks_off()) {
+         uint32_t id = p->shape->layout_id, n = p->shape->prop_count;
+         if (n != 0 && n <= JS_AOT_CLAIM_MAXF) {
+@@ -63843,6 +63918,37 @@
+                         if (c->nvs < AOT_CONT_SHAPES)
+                             c->vs[c->nvs++] = (int16_t)vsh->aot_prof_id;
+                         else
++                            c->vm = 1;
++                    }
++                }
++            }
++        }
++    }
++    for (k = 0; k < aot_nnotes; k++) {
++        AotNote *nt = &aot_notes[k];
++        int sl;
++        if (!nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
++            continue;
++        for (sl = 0; sl < AOT_NOTE_SLOTS && sl < AOT_PROF_MAX_SLOTS; sl++) {
++            AotCont *c = &tab[(size_t)nt->sh->aot_prof_id * AOT_PROF_MAX_SLOTS + (size_t)sl];
++            if (nt->types[sl] == 0)
++                continue;
++            c->types |= nt->types[sl];
++            if (nt->multi[sl])
++                c->vm = 1;
++            if (nt->vs[sl] != NULL) {
++                JSShape *vsh = nt->vs[sl];
++                if (!vsh->aot_prof_seen) {
++                    c->vm = 1;
++                } else {
++                    int q;
++                    for (q = 0; q < c->nvs; q++)
++                        if (c->vs[q] == (int16_t)vsh->aot_prof_id)
++                            break;
++                    if (q == c->nvs) {
++                        if (c->nvs < AOT_CONT_SHAPES)
++                            c->vs[c->nvs++] = (int16_t)vsh->aot_prof_id;
++                        else
+                             c->vm = 1;
+                     }
+                 }
