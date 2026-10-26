@@ -837,9 +837,15 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   }
   /* A site that ran many times and was filled only a couple of times saw the global object
      change at startup, not in its steady state. */
-  if (ns == 1 && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) == 0 && fn->nvweb == 0 && !e_facts_virtual_planning)
-    return 0; /* (the profile has no sample here; with unmade objects a cold read leaves the same way) */
-  return ns == 1 || (ns <= 3 && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) >= 16384);
+  {
+    /* The sampler lands on the op after the one it charges, so the next op's count stands in for a read that
+       has none of its own. */
+    unsigned long long cnt = qjs_aot_prof_pc_count(e_dg(fn, in), in->opc);
+    if (cnt == 0) cnt = qjs_aot_prof_pc_count(e_dg(fn, in), in->onext);
+    if (ns == 1 && cnt == 0 && fn->nvweb == 0 && !e_facts_virtual_planning)
+      return 0; /* (the profile has no sample here; with unmade objects a cold read leaves the same way) */
+    return ns == 1 || (ns <= 3 && cnt >= 16384);
+  }
 }
 
 /* The receiver of a region access, through the forwarded copies recorded so far. */
@@ -1954,6 +1960,7 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
       e_facts_virtual_planning = 1;
       gok = global_exit_ok(&cf, in);
       e_facts_virtual_planning = saved;
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee get_global pc %d: allow=%d exit_ok=%d\n", in->pc, e_inline_allow_construct, gok);
       if (!e_inline_allow_construct || !gok) ok = 0;
       continue;
     }
@@ -1994,6 +2001,12 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv) {
         /* A store into a field a copy may make: undone if the copy has to leave after it, so the
            callee must not loop (a store would then be undone twice over). */
         if (in->rop != ROP_put_field || has_back_edge) ok = 0;
+        break;
+      case Q2_OP_FALLBACK:
+        /* the loose and strict comparisons, which a copy lowers when both operands are typed
+           (checked once the types are known, see e_inline_typed_ok) */
+        if (in->rop != ROP_eq && in->rop != ROP_neq && in->rop != ROP_strict_eq && in->rop != ROP_strict_neq)
+          ok = 0;
         break;
       default:
         ok = 0;

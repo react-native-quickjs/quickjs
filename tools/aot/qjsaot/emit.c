@@ -380,7 +380,9 @@ static int e_inline_typed_ok(const Q2Func *fn) {
       if (!ok) continue;
     }
     if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
-        in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH)
+        in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH &&
+        !(in->op == Q2_OP_FALLBACK && (in->rop == ROP_eq || in->rop == ROP_neq ||
+                                       in->rop == ROP_strict_eq || in->rop == ROP_strict_neq)))
       continue;
     /* a remainder has no typed form: it is lowered only on tagged operands, with the step
        engine behind it */

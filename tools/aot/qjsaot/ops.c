@@ -6963,6 +6963,9 @@ static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in) {
 /* The guard of a copied callee: the callee value must be the compiled function the copy was made from
    (and, for a copy that reads `this`, the receiver an object, so the engine's boxing of a primitive
    receiver does not apply); anything else leaves for the call itself. */
+static int e_gfold_val(const Q2Func *fn, const Q2Insn *in, int32_t *val);
+static int e_copy_nfold(const Q2Func *fn, int ik);
+
 static int emit_inl_guard(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types) {
   const Q2Inl *iv = &fn->inl[in->inlg - 1];
@@ -7020,6 +7023,25 @@ static int emit_inl_guard(
         "      iholders_%d = *(void *const *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER) - %d;\n"
         "      ins_%d = (uint32_t)*(const uint16_t *)(cbk_ + QJS_AOT_OFF_FNBC_PIC_COUNT); }\n",
         cexp, in->pc, ik, iv->sbase, ik, iv->sbase, ik);
+    if (e_copy_nfold(fn, ik) > 0) {
+      int zi;
+      int32_t gv;
+      fprintf(
+          f,
+          "    if (__builtin_expect(!e_gfc%d, 0)) {\n"
+          "      const uint8_t *cbk_ = *(const uint8_t *const *)((const uint8_t *)JS_VALUE_GET_PTR(%s) + "
+          "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+          "      const uint8_t *icd_ = *(const uint8_t *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_CODE);\n",
+          ik, cexp);
+      for (zi = 0; zi < fn->ninsns; zi++) {
+        const Q2Insn *gz = &fn->insns[zi];
+        if (gz->own != ik + 1 || !e_gfold_val(fn, gz, &gv)) continue;
+        fprintf(
+            f, "      if (__builtin_expect(!qjs_aot_global_fold(ctx, (int)qjs_aot_ld_u32(icd_ + %d), %d), 0)) goto vx_%d;\n",
+            gz->arg[1].off, (int)gv, in->pc);
+      }
+      fprintf(f, "      if (__builtin_expect(Q2_EPOCH_MOVED(ctx), 0)) goto vx_%d;\n      e_gfc%d = 1;\n    }\n", in->pc, ik);
+    }
     /* each group of the copy takes the shape of its first filled cell; an access tests its own
        cell against it, and a group nothing filled never matches */
     for (gi = 0; g_e_facts != NULL && gi < g_e_facts->ngroups; gi++) {
@@ -7679,15 +7701,15 @@ static int emit_typed_binary_loc(
   return 1;
 }
 
-/* A global read the profile saw hold one int32 value throughout: the program's own instruction
-   (an inlined callee's atom is not in this function's code), its destination typed by the
-   instruction's own record. The body that folds it holds the value as a literal; its entry
+/* A global read the profile saw hold one int32 value throughout, its destination typed by the
+   instruction's own record. A copied callee's atom is read from the callee's code, so its
+   confirmation is made where the copy's guard passes. The body that folds it holds the value as a literal; its entry
    confirms the live property (`qjs_aot_global_fold`) and every write to the property moves the
    epoch the body tests after each safepoint. */
 static int e_gfold_val(const Q2Func *fn, const Q2Insn *in, int32_t *val) {
   const Q2Value *v;
   if (in->rop != ROP_get_global) return 0;
-  if (in->own != 0 || in->ndef < 1 || in->narg < 4) return 0;
+  if (in->ndef < 1 || in->narg < 4) return 0;
   if (in->arg[1].kind != 'a' || in->arg[3].kind != 's') return 0;
   if ((unsigned)in->arg[3].val == REG_IC_NONE) return 0;
   if (in->def[0] >= (Q2ValueId)fn->nvalues) return 0;
@@ -7696,6 +7718,15 @@ static int e_gfold_val(const Q2Func *fn, const Q2Insn *in, int32_t *val) {
   if (v->nmin != v->nmax || v->nmin < -2147483648.0 || v->nmin > 2147483647.0) return 0;
   *val = (int32_t)v->nmin;
   return 1;
+}
+
+/* How many globals copied callee `ik` (0-based) holds as literals. */
+static int e_copy_nfold(const Q2Func *fn, int ik) {
+  int i, n = 0;
+  int32_t gv;
+  for (i = 0; i < fn->ninsns; i++)
+    if (fn->insns[i].own == ik + 1 && e_gfold_val(fn, &fn->insns[i], &gv)) n++;
+  return n;
 }
 
 /* A speculative-body GLOBAL READ: `get_global` ("rabs": dest, atom offset, throw
@@ -7893,7 +7924,8 @@ static int emit_typed_strict_eq(
   char xa[48], xb[48], ex[128];
 
   if (!have_types || t == NULL) return 0;
-  if (in->rop != ROP_strict_eq && in->rop != ROP_strict_neq) return 0;
+  if (in->rop != ROP_strict_eq && in->rop != ROP_strict_neq && in->rop != ROP_eq && in->rop != ROP_neq)
+    return 0;
   if (in->ndef < 1 || in->nuse < 2) return 0;
   dv = in->def[0];
   av = in->use[0];
@@ -7902,7 +7934,11 @@ static int emit_typed_strict_eq(
       bv >= (Q2ValueId)t->nvalues)
     return 0;
   if (t->lb[dv] != E_LB_BOOL) return 0;
-  neg = in->rop == ROP_strict_neq;
+  /* `==` agrees with `===` on two numbers; anything else may coerce and is not decided here */
+  if ((in->rop == ROP_eq || in->rop == ROP_neq) &&
+      ((t->lb[av] != E_LB_I32 && t->lb[av] != E_LB_F64) || (t->lb[bv] != E_LB_I32 && t->lb[bv] != E_LB_F64)))
+    return 0;
+  neg = in->rop == ROP_strict_neq || in->rop == ROP_neq;
   ld = fn->values[dv].reg;
   if (ld < 0 || ld >= fn->nregs) return 0;
   f64 = t->lb[av] == E_LB_F64 || t->lb[bv] == E_LB_F64;
@@ -11505,9 +11541,11 @@ static int e_dispatch_rop(
     case ROP_lte:
     case ROP_gt:
     case ROP_gte:
+      return emit_tag_cmp_value(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_eq:
     case ROP_neq:
-      return emit_tag_cmp_value(f, fn, in, t, cur, have_types, hex, fi, b);
+      return emit_typed_strict_eq(f, fn, in, t, cur, have_types, hex, fi, b) ||
+             emit_tag_cmp_value(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- globals and closure cells -- */
     case ROP_get_global:
@@ -11966,6 +12004,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
               fprintf(f, "    int pci%d;\n", gr->sites[qq]);
         }
+        for (g = 0; g < fn->ninl; g++)
+          if (e_copy_nfold(fn, g) > 0) fprintf(f, "    static uint8_t e_gfc%d;\n", g);
         fprintf(f, "    if (__builtin_expect(q2_ep == e_vep && (const void *)pic == e_vcb, 1)) {\n");
         for (g = 0, gk = 0; g < ng; g++) {
           const EGroup *gr = &g_e_facts->groups[g];
@@ -11977,6 +12017,8 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         }
         for (g = 0; g < g_e_mc_n; g++) fprintf(f, "      mcv%d = e_vm[%d]; mce%d = e_vme[%d];\n", g, g, g, g);
         fprintf(f, "    } else {\n");
+        for (g = 0; g < fn->ninl; g++)
+          if (e_copy_nfold(fn, g) > 0) fprintf(f, "      e_gfc%d = 0;\n", g);
         /* The globals the body holds as literals are confirmed first: the first confirmation
            of one moves the epoch, so the epoch this entry validates at is read after it. */
         {
@@ -11984,7 +12026,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           for (ik = 0; ik < fn->ninsns; ik++) {
             int32_t gv;
             const Q2Insn *gi_ = &fn->insns[ik];
-            if (!e_gfold_val(fn, gi_, &gv)) continue;
+            if (gi_->own != 0 || !e_gfold_val(fn, gi_, &gv)) continue;
             fprintf(
                 f,
                 "      if (__builtin_expect(!qjs_aot_global_fold(ctx, (int)qjs_aot_ld_u32(ecb + %d), %d), 0)) {\n"
