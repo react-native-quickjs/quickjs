@@ -1490,11 +1490,14 @@ int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot) 
    is either hooked or listed with its reason (the audit run by
    `.local/specs/audit-slot-stores.sh`). */
 #define QJS_AOT_SLOT_STORES_AUDITED 1
+void qjs_aot_scan_init(JSContext *ctx, const JSAotGenFunc *funcs, int n);
+int qjs_aot_scan_verdict(const char *name, int claim, const uint8_t own[16], const uint8_t (*ctors)[16], int nctors);
 static unsigned char g_claim_tab[E_LAYOUT_MAX][PROF_MAX_FIELDS];
 static int g_claim_done, g_claim_any;
 
 static void claims_derive(void) {
   static ELayoutInfo tab[E_LAYOUT_MAX];
+  static uint8_t ctors[E_LAYOUT_MAX][16];
   int ntab, l, f;
   if (g_claim_done) return;
   g_claim_done = 1;
@@ -1502,7 +1505,10 @@ static void claims_derive(void) {
   if (!QJS_AOT_SLOT_STORES_AUDITED || getenv("QJS_AOT_NOCLAIMS") != NULL) return;
   if (g_prof == NULL || !g_prof_sitekinds) return;
   ntab = e_layouts_collect(tab, E_LAYOUT_MAX);
+  for (l = 0; l < ntab; l++)
+    if (tab[l].proto == 1) hex_to_bytes16(tab[l].digest, ctors[l]); else memset(ctors[l], 0, 16);
   for (l = 0; l < ntab; l++) {
+    const uint8_t *own = ctors[l];
     const ProfShape *sh = prof_shape_by_id(tab[l].shape_id);
     /* Only a constructor's layout: it is installed when the function object and its fresh prototype
        exist, so no instance can exist yet. An object-literal layout is built at the first bind. */
@@ -1543,6 +1549,24 @@ static void claims_derive(void) {
         }
         /* An object promise (QJS_AOT_CLAIM_OBJ / OBJ_NN) is not derived: measured on richards, the shape
            test it removes costs less than the store-side check it adds (+2.1M). */
+      }
+      {
+        const char *nm = sh->field[f];
+        int pclaim = claim, vd = 0;
+        if (nm != NULL) {
+          if (claim != 0) {
+            vd = qjs_aot_scan_verdict(nm, claim, own, ctors, ntab);
+            if (vd < 0) claim = 0;
+          } else if (ct == NULL) {
+            vd = qjs_aot_scan_verdict(nm, QJS_AOT_CLAIM_INT, own, ctors, ntab);
+            if (vd == 1) claim = QJS_AOT_CLAIM_INT;
+            else if ((vd = qjs_aot_scan_verdict(nm, QJS_AOT_CLAIM_NOREF, own, ctors, ntab)) == 1) claim = QJS_AOT_CLAIM_NOREF;
+            else vd = 0;
+          }
+          if (getenv("QJS_AOT_SCANREPORT"))
+            fprintf(stderr, "scan layout=%d slot=%d name=%s profile=%d verdict=%d final=%d%s\n", l + 1, f, nm, pclaim, vd,
+                    claim, pclaim != 0 && claim == 0 ? " CONTRADICTED-profile-promise" : "");
+        }
       }
       if (claim > 0) {
         g_claim_tab[l][f] = (unsigned char)claim;
@@ -2234,6 +2258,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     }
 
     g_unit_funcs = funcs;
+    qjs_aot_scan_init(ctx, funcs, nfuncs);
     g_unit_nfuncs = nfuncs;
     g_e_native = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     /* The bodies are emitted into memory buffers before the output file is
