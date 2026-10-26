@@ -29,7 +29,8 @@
    `eval`, `delete`, prototype changes, functions without a register program and closures the
    scan cannot follow to a function are escapes: the source cannot account for every store, so
    a promise rests on the profile and the engine hook (the verdict is consistent, not proven). */
-enum { SC_INT = 1, SC_DBL = 2, SC_NUM = 4, SC_BOOL = 8, SC_NULL = 16, SC_UNDEF = 32, SC_UNK = 64 };
+enum { SC_INT = 1, SC_DBL = 2, SC_NUM = 4, SC_BOOL = 8, SC_NULL = 16, SC_UNDEF = 32, SC_UNK = 64, SC_INTOV = 128 };
+#define SC_NUMERIC (SC_INT | SC_DBL | SC_NUM | SC_INTOV)
 #define SCAN_NAMES 512
 #define SCAN_GLOBALS 512
 #define SCAN_THIS 8192
@@ -159,9 +160,19 @@ static unsigned scan_class(int fi, Q2ValueId v) {
       x = scan_class(fi, d->use[0]);
       y = scan_class(fi, d->use[1]);
       g_scan_depth--;
-      if (x != 0 && y != 0 && (x & ~(SC_INT | SC_DBL | SC_NUM)) == 0 && (y & ~(SC_INT | SC_DBL | SC_NUM)) == 0 &&
-          d->sub != REG_BIN_POW)
-        return SC_NUM;
+      if (x != 0 && y != 0 && (x & ~SC_NUMERIC) == 0 && (y & ~SC_NUMERIC) == 0 && d->sub != REG_BIN_POW) {
+        /* int arithmetic that may leave the int range gives a double: a store of it into an int slot
+           takes the typed store's exit and the engine's hook breaks the layout, so it is an int-or-overflow */
+        int ints = (x & ~(SC_INT | SC_INTOV)) == 0 && (y & ~(SC_INT | SC_INTOV)) == 0;
+        switch (d->sub) {
+          case REG_BIN_ADD: case REG_BIN_SUB: case REG_BIN_MUL: case REG_BIN_MOD:
+            return ints ? SC_INTOV : SC_NUM;
+          case REG_BIN_AND: case REG_BIN_OR: case REG_BIN_XOR: case REG_BIN_SHL: case REG_BIN_SAR:
+            return SC_INTOV;
+          default:
+            return SC_NUM;
+        }
+      }
       if (x == 0 || y == 0) return g_scan_fixing ? 0 : SC_UNK;
       return SC_UNK;
     }
@@ -604,9 +615,9 @@ int qjs_aot_scan_verdict(const char *name, int claim, const uint8_t own[16], con
   }
   if (getenv("QJS_AOT_SCANDEBUG")) fprintf(stderr, "scan name=%s ownfn=%d seen=%x nonthis=%x esc=%d\n", name, ownfn, seen, sn->mask, g_scan_escapes);
   if (claim == QJS_AOT_CLAIM_INT) {
-    allowed = SC_INT; definite = SC_DBL | SC_BOOL | SC_NULL | SC_UNDEF;
+    allowed = SC_INT | SC_INTOV; definite = SC_DBL | SC_BOOL | SC_NULL | SC_UNDEF;
   } else {
-    allowed = SC_INT | SC_DBL | SC_NUM | SC_BOOL | SC_NULL | SC_UNDEF; definite = 0;
+    allowed = SC_INT | SC_INTOV | SC_DBL | SC_NUM | SC_BOOL | SC_NULL | SC_UNDEF; definite = 0;
   }
   if (seen & definite) return -1;
   if ((seen & ~allowed) == 0)
