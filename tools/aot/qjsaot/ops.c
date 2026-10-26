@@ -94,6 +94,25 @@ static int emit_hit_result(
 static int *g_e_undo_id;
 static int g_e_undo_total;
 static int g_e_undo_seq[256], g_e_undo_seq_own[256], g_e_undo_seq_n;
+/* An instruction that cannot take a way out of the body (no guard, no type test, no cache test). */
+static int e_never_exits(const Q2Insn *in) {
+  switch (in->rop) {
+    case ROP_move: case ROP_move_s: case ROP_move_xfer:
+    case ROP_load_i8: case ROP_load_i8_s: case ROP_load_i32:
+    case ROP_load_undefined: case ROP_load_null: case ROP_load_true: case ROP_load_false:
+    case ROP_branch: case ROP_return: case ROP_return_undefined:
+      return 1;
+    default:
+      return 0;
+  }
+}
+/* A store is logged only if some instruction after it in its copy can still take a way out. */
+static int e_exit_follows(const Q2Func *fn, int i) {
+  int j;
+  for (j = i + 1; j < fn->ninsns && fn->insns[j].own == fn->insns[i].own; j++)
+    if (!e_never_exits(&fn->insns[j])) return 1;
+  return 0;
+}
 static void e_undo_prepare(const Q2Func *fn) {
   int i;
   free(g_e_undo_id);
@@ -102,7 +121,8 @@ static void e_undo_prepare(const Q2Func *fn) {
   g_e_undo_seq_n = 0;
   for (i = 0; i < fn->ninsns; i++) {
     g_e_undo_id[i] = -1;
-    if (fn->insns[i].own > 0 && fn->insns[i].rop == ROP_put_field) g_e_undo_id[i] = g_e_undo_total++;
+    if (fn->insns[i].own > 0 && fn->insns[i].rop == ROP_put_field && e_exit_follows(fn, i))
+      g_e_undo_id[i] = g_e_undo_total++;
   }
 }
 /* the copy's instance ends: its stores are final, and the values they replaced are released */
