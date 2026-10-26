@@ -1608,7 +1608,11 @@
     },
     {
       "name": "0408-aot-htmldda-flag.patch",
-      "sha256": "727f353d7c2959ca1be90a8ff9ef98ea19581a4cd20655155c5aacd9a2ff801f"
+      "sha256": "74810b592b3ece4d06670c5176ee0bb38ddaef8c5a2d9390bf401946c36c5e6a"
+    },
+    {
+      "name": "0409-aot-last-slot-claims.patch",
+      "sha256": "7dd65100804ce990dec0e174a6c9a02ff8dcbecbf517369e4560f9506956d21a"
     },
     {
       "name": "9999-bc-version-bump.patch",
@@ -1616,7 +1620,7 @@
     }
   ],
   "files": {
-    "quickjs.c": "191d6493ffd21a25a60ec0611668f1156b1f77431af618216574683acbd064dc",
+    "quickjs.c": "bd1dd0ddb372a3afa56d628096b30987a67976706434ff66ba2845c9b24e9c0c",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

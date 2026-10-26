@@ -580,6 +580,17 @@ typedef struct JSAotRun {
 #define JS_CHAR2_K 1024
 
 #define JS_AOT_CLAIM_MAXF 32
+#ifndef QJS_AOT_CLAIM_NOREF
+/* One byte per (layout, slot) in JSRuntime.aot_slot_claim. A layout id has 6 bits (at most 63
+   layouts), so an object claim is the id itself (the object's shape ends that layout, or the
+   value is null/undefined) and CLAIM_OBJ_NN adds 0x40 (never null/undefined). */
+#define QJS_AOT_CLAIM_NOREF 0x80
+#define QJS_AOT_CLAIM_INT 0x81
+#define QJS_AOT_CLAIM_OBJ(l) ((l))
+#define QJS_AOT_CLAIM_OBJ_NN(l) (0x40 | (l))
+#define QJS_AOT_CLAIM_MAX_LAYOUTS 63
+_Static_assert(QJS_AOT_CLAIM_MAX_LAYOUTS == (QJS_AOT_CLAIM_OBJ_NN(63) & 0x3f), "a layout id fits in 6 bits");
+#endif
 #define JS_AOT_GWATCH_MAX 16
 struct JSRuntime {
     JSMallocFunctions mf;
@@ -2913,6 +2924,8 @@ static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
 static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p);
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v);
 static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p);
+static inline void js_aot_content_filled(JSRuntime *rt, JSObject *p);
+static inline void js_aot_content_last(JSRuntime *rt, JSObject *p);
 static int init_shape_hash(JSRuntime *rt);
 static __exception int js_get_length32(JSContext *ctx, uint32_t *pres,
                                        JSValueConst obj);
@@ -13684,6 +13697,7 @@ static int JS_DefinePrivateField(JSContext *ctx, JSValueConst obj,
         return -1;
     }
     pr->u.value = val;
+    js_aot_content_last(ctx->rt, p);
     return 0;
 }
 
@@ -15909,6 +15923,7 @@ retry:
             if (!pr)
                 goto fail;
             pr->u.value = val;
+            js_aot_content_last(ctx->rt, p);
             return true;
         }
     }
@@ -16323,6 +16338,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
         } else {
             pr->u.value = JS_UNDEFINED;
         }
+        js_aot_content_last(ctx->rt, p);
     }
 #if JS_ENABLE_IC
     if (unlikely(p->is_prototype) &&
@@ -16396,20 +16412,38 @@ static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p)
 /* Whether `v` keeps the promise `claim` makes about a slot. */
 static inline bool js_aot_claim_ok(JSValue v, uint8_t claim)
 {
-    if (claim & 0x80)
+    if (claim == QJS_AOT_CLAIM_INT)
+        return JS_VALUE_GET_TAG(v) == JS_TAG_INT;
+    if (claim & QJS_AOT_CLAIM_NOREF)
         return !JS_VALUE_HAS_REF_COUNT(v);
-    if (JS_VALUE_GET_TAG(v) == JS_TAG_NULL || JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED)
+    if (!(claim & 0x40) &&
+        (JS_VALUE_GET_TAG(v) == JS_TAG_NULL || JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED))
         return true;
     return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
-           JS_VALUE_GET_OBJ(v)->shape->layout_id == claim;
+           JS_VALUE_GET_OBJ(v)->shape->layout_id == (claim & 0x3f);
 }
 
 /* A value is stored into slot `slot` of `p`, which is in a contracted layout: a promise it
    breaks breaks the layout. Called before or after the store, with the new value. */
+#ifdef QJS_KIT_TEST_KNOBS
+/* The kit's negative controls turn the claim hooks off to show what they catch. */
+static bool js_aot_claim_hooks_off(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("QJS_AOT_NOCLAIMHOOK") != NULL;
+    return off;
+}
+#else
+#define js_aot_claim_hooks_off() false
+#endif
+
 static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
 {
     uint32_t id = p->shape->layout_id;
     uint8_t claim;
+    if (js_aot_claim_hooks_off())
+        return;
     if (slot >= JS_AOT_CLAIM_MAXF)
         return;
     claim = rt->aot_slot_claim[id - 1][slot];
@@ -16452,9 +16486,11 @@ static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slo
    last is already written (the caller of an add writes the last one afterwards, and a layout
    never promises it), so the promises are checked once here. The check runs before the object
    can reach JS: no safepoint lies between the shape set or the fill and this call. */
-static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p)
+static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p, bool filled)
 {
     uint32_t id = p->shape->layout_id, f, n;
+    if (js_aot_claim_hooks_off() && !p->is_prototype)
+        return;
     /* A prototype object entering a contracted shape breaks it: the layout promises that none
        of its objects is one. This runs whether or not the layout makes any slot promise. */
     if (unlikely(p->is_prototype)) {
@@ -16466,7 +16502,7 @@ static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p)
     n = p->shape->prop_count;
     if (n > JS_AOT_CLAIM_MAXF)
         n = JS_AOT_CLAIM_MAXF;
-    for (f = 0; f + 1 < n; f++) {
+    for (f = 0; f + (filled ? 0 : 1) < n; f++) {
         uint8_t claim = rt->aot_slot_claim[id - 1][f];
         if (claim != 0 && !js_aot_claim_ok(p->prop[f].u.value, claim)) {
             rt->aot_layout_broken |= 1ULL << (id - 1);
@@ -16475,10 +16511,31 @@ static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p)
     }
 }
 
+/* The shape was adopted and the last slot is written by the caller afterwards. */
 static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p)
 {
     if (unlikely(p->shape->layout_id != 0))
-        js_aot_content_enter_slow(rt, p);
+        js_aot_content_enter_slow(rt, p, false);
+}
+
+/* Every slot, the last one included, holds its value. */
+static inline void js_aot_content_filled(JSRuntime *rt, JSObject *p)
+{
+    if (unlikely(p->shape->layout_id != 0))
+        js_aot_content_enter_slow(rt, p, true);
+}
+
+/* The last slot of an object that has just adopted a shape has been written. */
+static inline void js_aot_content_last(JSRuntime *rt, JSObject *p)
+{
+    if (unlikely(p->shape->layout_id != 0) && !js_aot_claim_hooks_off()) {
+        uint32_t id = p->shape->layout_id, n = p->shape->prop_count;
+        if (n != 0 && n <= JS_AOT_CLAIM_MAXF) {
+            uint8_t claim = rt->aot_slot_claim[id - 1][n - 1];
+            if (claim != 0 && !js_aot_claim_ok(p->prop[n - 1].u.value, claim))
+                rt->aot_layout_broken |= 1ULL << (id - 1);
+        }
+    }
 }
 
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
@@ -17113,6 +17170,7 @@ static int JS_DefineGlobalVar(JSContext *ctx, JSAtom prop, int def_flags)
     if (unlikely(!pr))
         return -1;
     pr->u.value = val;
+    js_aot_content_last(ctx->rt, p);
     return 0;
 }
 
@@ -24876,7 +24934,7 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_object_fill(JSFunctionBytecode *b
                    (int)tpl->prop_count == n)) {
             for (i = 0; i < n; i++)
                 set_value(ctx, &p->prop[i].u.value, vals[i]);
-            js_aot_content_enter(ctx->rt, p);
+            js_aot_content_filled(ctx->rt, p);
             sp = vals;
             return JS_COLD_HANDLER_OK(sp);
         }
@@ -26255,6 +26313,7 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
     js_free_shape(ctx->rt, osh);
     js_aot_content_enter(ctx->rt, p);
     p->prop[off].u.value = js_dup(v);
+    js_aot_content_last(ctx->rt, p);
     return 1;
 }
 
@@ -32613,7 +32672,7 @@ static uint8_t *REGVM_CC regvm_t_object_fill(REGVM_ARGS)
                 vals[i2] = JS_UNDEFINED;
 #endif
             }
-            js_aot_content_enter(ctx->rt, po);
+            js_aot_content_filled(ctx->rt, po);
             T_NEXT(T_SZ_RBUU);
         }
     }
@@ -35538,6 +35597,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                         if (likely(prs != NULL &&
                                    (prs->flags & (JS_PROP_TMASK | JS_PROP_C_W_E |
                                                   JS_PROP_LENGTH)) == JS_PROP_C_W_E)) {
+                            js_aot_content_store(ctx->rt, po, (uint32_t)(pr - po->prop), val);
                             set_value(ctx, &pr->u.value, val);
                             REGVM_NEXT();
                         }
@@ -35577,7 +35637,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             vals[i2] = JS_UNDEFINED;
 #endif
                         }
-                        js_aot_content_enter(ctx->rt, po);
+                        js_aot_content_filled(ctx->rt, po);
                         REGVM_NEXT();
                     }
                 }
@@ -38142,6 +38202,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                             if (likely(prs != NULL &&
                                        (prs->flags & (JS_PROP_TMASK | JS_PROP_C_W_E |
                                                       JS_PROP_LENGTH)) == JS_PROP_C_W_E)) {
+                                js_aot_content_store(ctx->rt, po, (uint32_t)(pr - po->prop), val);
                                 set_value(ctx, &pr->u.value, val);
                                 REGVM_NEXT();
                             }
@@ -38181,7 +38242,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                 vals[i2] = JS_UNDEFINED;
 #endif
                             }
-                            js_aot_content_enter(ctx->rt, po);
+                            js_aot_content_filled(ctx->rt, po);
                             REGVM_NEXT();
                         }
                     }
@@ -41730,6 +41791,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 js_free_shape(ctx->rt, osh);
                                 js_aot_content_enter(ctx->rt, p);
                                 p->prop[off].u.value = sp[-1]; /* fresh slot: transfer */
+                                js_aot_content_last(ctx->rt, p);
                                 JS_FreeValue(ctx, obj);
                                 sp -= 2;
                                 BREAK;
@@ -41737,6 +41799,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto put_field_ic_slow; /* guard failed: generic + re-fill */
                         }
                         /* Overwrite hit: cached shape -> writable data slot. */
+                        js_aot_content_store(ctx->rt, p, ic[k].offset, sp[-1]);
                         set_value(ctx, &p->prop[ic[k].offset].u.value, sp[-1]);
                         JS_FreeValue(ctx, obj);
                         sp -= 2;
@@ -41748,6 +41811,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto put_field_ic_slow;
                     if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                               JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+                        js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), sp[-1]);
                         set_value(ctx, &pr->u.value, sp[-1]);
 #if JS_ENABLE_IC
                         /* cache the overwrite site (shape -> writable slot) */
@@ -41865,6 +41929,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (likely(prs != NULL &&
                                    (prs->flags & (JS_PROP_TMASK | JS_PROP_C_W_E |
                                                   JS_PROP_LENGTH)) == JS_PROP_C_W_E)) {
+                            js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), sp[-1]);
                             set_value(ctx, &pr->u.value, sp[-1]);
                             sp--;
                             BREAK;
@@ -65129,7 +65194,7 @@ int qjs_aot_object_fill_b(JSContext *ctx, JSFunctionBytecode *b, JSValue obj,
 #endif
                 vals[i2] = JS_UNDEFINED;
             }
-            js_aot_content_enter(ctx->rt, po);
+            js_aot_content_filled(ctx->rt, po);
             return 0;
         }
     }
@@ -95638,7 +95703,7 @@ static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
     js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = js_dup_shape(new_sh);
     js_free_shape(ctx->rt, sh);
-    js_aot_content_enter(ctx->rt, p);
+    js_aot_content_filled(ctx->rt, p);
     return 0;
 }
 
