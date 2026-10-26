@@ -4392,8 +4392,17 @@ int qjsaot_driver_main(int argc, char **argv) {
            cache epoch stays what it was when they were read, so the next read of a known
            shape is a short compare chain, not a walk of the site's ways. A shape not in the
            table reads through the ways and is added. */
+        "static inline __attribute__((always_inline)) const void *q2_pe_of(JSValue fnv)\n"
+        "{\n"
+        "  const unsigned char *o, *b;\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return NULL;\n"
+        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
+        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_BYTECODE_FUNCTION) return NULL;\n"
+        "  b = *(const unsigned char *const *)(o + QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "  return *(const void *const *)(b + QJS_AOT_OFF_FNBC_AOT_FN);\n"
+        "}\n"
         "typedef struct Q2PolyC { const void *pic; uint32_t ep; uint32_t n;\n"
-        "                          const void *sh[4]; JSValue v[4]; } Q2PolyC;\n"
+        "                          const void *sh[4]; JSValue v[4]; const void *e[4]; } Q2PolyC;\n"
         "static inline __attribute__((always_inline)) int "
         "q2_poly_read_lz(const void *pic, void *const *holders,\n"
         "                       JSValue recv, int site, int nsites,\n"
@@ -4418,28 +4427,32 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      c->pic = pic; c->ep = ep; c->n = 0;\n"
         "      c->sh[0] = c->sh[1] = c->sh[2] = c->sh[3] = NULL;\n"
         "    }\n"
-        "    if (c->n < 4) { c->sh[c->n] = s; c->v[c->n] = *out; c->n++; }\n"
+        "    if (c->n < 4) { c->sh[c->n] = s; c->v[c->n] = *out; c->e[c->n] = q2_pe_of(*out); c->n++; }\n"
         "  }\n"
         "  return 1;\n"
         "}\n"
         /* The same read in an inline body that validated its caches at entry: its epoch alone says the
-           table was filled under the epoch the body runs at, as for the statics it reads elsewhere. */
+           table was filled under the epoch the body runs at, as for the statics it reads elsewhere. The
+           entry the function's bytecode is bound to is final once the bytecode is, so the table keeps it
+           per way and a call site tests it by comparison alone. */
         "static inline __attribute__((always_inline)) int "
         "q2_poly_read_lze(const void *pic, void *const *holders,\n"
         "                       JSValue recv, int site, int nsites,\n"
-        "                       JSValue *out, int lz, Q2PolyC *c, const uint32_t *epp, uint32_t qep)\n"
+        "                       JSValue *out, int lz, Q2PolyC *c, const uint32_t *epp, uint32_t qep, const void **ent)\n"
         "{\n"
         "  const void *s;\n"
         "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
         "  s = *(const void *const *)((const unsigned char *)JS_VALUE_GET_PTR(recv) +\n"
         "                             QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
         "  if (__builtin_expect(c->ep == qep, 1)) {\n"
-        "    if (s == c->sh[0]) { *out = c->v[0]; return 1; }\n"
-        "    if (s == c->sh[1]) { *out = c->v[1]; return 1; }\n"
-        "    if (s == c->sh[2]) { *out = c->v[2]; return 1; }\n"
-        "    if (s == c->sh[3]) { *out = c->v[3]; return 1; }\n"
+        "    if (s == c->sh[0]) { *out = c->v[0]; *ent = c->e[0]; return 1; }\n"
+        "    if (s == c->sh[1]) { *out = c->v[1]; *ent = c->e[1]; return 1; }\n"
+        "    if (s == c->sh[2]) { *out = c->v[2]; *ent = c->e[2]; return 1; }\n"
+        "    if (s == c->sh[3]) { *out = c->v[3]; *ent = c->e[3]; return 1; }\n"
         "  }\n"
-        "  return q2_poly_read_lz(pic, holders, recv, site, nsites, out, lz, c, epp);\n"
+        "  if (!q2_poly_read_lz(pic, holders, recv, site, nsites, out, lz, c, epp)) return 0;\n"
+        "  *ent = q2_pe_of(*out);\n"
+        "  return 1;\n"
         "}\n"
         /* The lazy-JSON marker test is on unless the body in progress assumes no lazy
            document exists (Q2_LZ is redefined around such a body). */

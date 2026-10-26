@@ -2844,6 +2844,8 @@ static int g_e_sm_stat;
 /* The value each cached read defines, so a call on it knows the callee's bound entry. */
 #define E_MC_VALS 8192
 static signed char g_e_mc_of[E_MC_VALS];
+/* A value read through the per-site (shape, method) table, whose entry a local `pe<v>` holds. */
+static uint8_t g_e_pe_flag[E_MC_VALS];
 static int e_mc_of(Q2ValueId v) { return (unsigned)v < E_MC_VALS ? g_e_mc_of[v] : -1; }
 static void e_mc_def(Q2ValueId v, int idx) {
   if ((unsigned)v < E_MC_VALS) g_e_mc_of[v] = (signed char)idx;
@@ -5603,6 +5605,7 @@ static int emit_inl_nested_call(
   const char *excret = g_e_inl ? "{ *out = _o; return 1; }" : "return _o;";
   char winp[48], ib[512], pushr[512], spl[1024], idt[256];
   int allleaf, cmc = -1;
+  Q2ValueId cvv = Q2_NO_VALUE;
   const int pub = !g_e_inl || g_e_inl_r;
   char nrx[32], nrxe[64], rax[48], rrx[48];
   int tlay = g_e_facts != NULL ? g_e_facts->thislay[e_insn_idx(fn, in)] : 0;
@@ -5716,6 +5719,7 @@ static int emit_inl_nested_call(
     Q2ValueId tv = th >= 0 && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
     if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME && cv < (Q2ValueId)t->nvalues)
       cmc = e_mc_of(cv);
+    cvv = cv;
     if (cv != Q2_NO_VALUE && cv != E_UNDEF && cv != E_INFRAME &&
         cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
       snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
@@ -5819,6 +5823,8 @@ static int emit_inl_nested_call(
           g_e_mono_id, cmc, callee[k], cmc, callee[k]);
     } else if (cmc >= 0)
       snprintf(idt, sizeof(idt), "mce%d == (const void *)aot_f_%s", cmc, callee[k]);
+    else if (cvv != Q2_NO_VALUE && cvv != E_UNDEF && cvv != E_INFRAME && (unsigned)cvv < E_MC_VALS && g_e_pe_flag[cvv])
+      snprintf(idt, sizeof(idt), "pe%u == (const void *)aot_f_%s", (unsigned)cvv, callee[k]);
     else
       snprintf(
           idt, sizeof(idt), "%s%s, (const void *)aot_f_%s, %du)", e_cc_fn(fn, in), cexp,
@@ -8369,8 +8375,15 @@ static int emit_group_this_read(
    layout's shape and loads a constant slot; any other reads through the PIC. */
 int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
 int qjs_aot_prof_site_proto(const uint8_t dg[16], int site);
+/* Whether a plain read at `site` is served by the per-site table of (shape, method) pairs. */
+static int e_site_polyread(const Q2Func *fn, int site) {
+  int osite = 0, lay = 0, slot = 0;
+  const uint8_t *dg = e_site_dg(fn, site, &osite);
+  return dg != NULL && !qjs_aot_layout_site(dg, osite, &lay, &slot) && qjs_aot_prof_site_proto(dg, osite);
+}
+/* `ent` names the local that takes the entry the method is bound to, where the caller wants it. */
 static void e_fprint_hit(FILE *f, const Q2Func *fn, const char *ind, const char *recv,
-                         int site, const char *out) {
+                         int site, const char *out, const char *ent) {
   int osite = 0, lay = 0, slot = 0;
   const uint8_t *dg = e_site_dg(fn, site, &osite);
   if (dg != NULL && qjs_aot_layout_site(dg, osite, &lay, &slot))
@@ -8378,14 +8391,16 @@ static void e_fprint_hit(FILE *f, const Q2Func *fn, const char *ind, const char 
             "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_cslot_hit_lz(%s, %du, %du, "
             "%s, Q2_LZ), 1)) {\n",
             ind, recv, lay, slot, out);
-  else if (dg != NULL && qjs_aot_prof_site_proto(dg, osite))
+  else if (dg != NULL && qjs_aot_prof_site_proto(dg, osite)) {
+    const int ee = g_e_inl && g_e_sm_stat;
     fprintf(f,
             "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_poly_read_lz%s(pic, holders, "
             "%s, %d, (int)q2_ns, %s, Q2_LZ, ({ static Q2PolyC c_; &c_; }), "
             "(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
-            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH)%s), 1)) {\n",
-            ind, g_e_inl && g_e_sm_stat ? "e" : "", recv, site, out, g_e_inl && g_e_sm_stat ? ", q2_ep" : "");
-  else
+            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH)%s%s), 1)) {\n",
+            ind, ee ? "e" : "", recv, site, out, ee ? ", q2_ep, " : "",
+            ee ? (ent != NULL ? ent : "&(const void *){NULL}") : "");
+  } else
     fprintf(f,
             "%sif (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
             "%s, %d, (int)q2_ns, %s), 1)) {\n",
@@ -8432,7 +8447,7 @@ static int emit_typed_this_field(
         "      v%u = _t;\n"
         "      AOT_SET_B(ctx, fr, %d, _t);\n",
         in->pc, (unsigned)rv, rreg * 16);
-    e_fprint_hit(f, fn, "      ", "_t", site, "&_v");
+    e_fprint_hit(f, fn, "      ", "_t", site, "&_v", NULL);
     fprintf(
         f,
         "        v%u = _v;\n"
@@ -8459,7 +8474,7 @@ static int emit_typed_this_field(
      wrapper reads if the hit below misses. */
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
   fprintf(f, "      AOT_SET_B(ctx, fr, %d, _t);\n", rreg * 16);
-  e_fprint_hit(f, fn, "      ", "_t", site, "&_v");
+  e_fprint_hit(f, fn, "      ", "_t", site, "&_v", NULL);
   fprintf(f, "        v%u = _v;\n", (unsigned)fv);
   /* The hit keeps `this`: an owned one is adopted by its frame slot, as the
      generic body's load_this does (the slot already holds it borrowed). The miss
@@ -8491,6 +8506,8 @@ static int emit_typed_field_chain(
   const ERole *role = e_roles[in->rop];
   Q2ValueId rv, d0v, d1v;
   int s1, s2, rreg, d0reg, d1reg;
+  char pent[24];
+  const char *pent_p = NULL;
 
   if (!have_types || t == NULL) return 0;
   if (in->rop != ROP_get_field_chain && in->rop != ROP_get_field_chain_own)
@@ -8538,14 +8555,24 @@ static int emit_typed_field_chain(
     if (e_must_exit(fn, in)) return 0;
   }
   if (!e_fl_site_ok(fn, in, s1) || !e_fl_site_ok(fn, in, s2)) return 0;
+  {
+    /* The callee of a call that follows is tested by the entry the table kept for its way. */
+    const int pe = g_e_inl && g_e_sm_stat && e_site_polyread(fn, s2) && (unsigned)d1v < E_MC_VALS;
+    if (pe) {
+      if (!g_e_pe_flag[d1v]) fprintf(f, "    const void *pe%u = NULL; (void)pe%u;\n", (unsigned)d1v, (unsigned)d1v);
+      g_e_pe_flag[d1v] = 1;
+    }
+    snprintf(pent, sizeof(pent), "&pe%u", (unsigned)d1v);
+    pent_p = pe ? pent : NULL;
+  }
   fprintf(f, "    { JSValue _c0, _c1;\n");
   fprintf(f, "      JSValue _rcv = v%u;\n", (unsigned)rv);
-  e_fprint_hit(f, fn, "      ", "_rcv", s1, "&_c0");
+  e_fprint_hit(f, fn, "      ", "_rcv", s1, "&_c0", NULL);
   /* Link 1's result goes to its local; the frame slot is written too, because a
      link-2 miss hands the WHOLE instruction to the wrapper. */
   fprintf(f, "        v%u = _c0;\n", (unsigned)d0v);
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _c0);\n", d0reg * 16);
-  e_fprint_hit(f, fn, "        ", "_c0", s2, "&_c1");
+  e_fprint_hit(f, fn, "        ", "_c0", s2, "&_c1", pent_p);
   fprintf(f, "          v%u = _c1;\n", (unsigned)d1v);
   fprintf(f, "        } else {\n");
   /* Link 2 missed: restore the receiver and hand the whole instruction over. */
@@ -12330,6 +12357,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_epoch_skip = (ngu > 0 || ngf > 0) && getenv("QJS_AOT_NOEPOCHSKIP") == NULL;
       g_e_mc_n = 0;
       memset(g_e_mc_of, -1, sizeof(g_e_mc_of));
+      memset(g_e_pe_flag, 0, sizeof(g_e_pe_flag));
       memset(g_e_mono_st, 0, sizeof(g_e_mono_st));
       g_e_mono_id = ++g_e_mono_seq;
       if (g_e_epoch_skip && getenv("QJS_AOT_NOMETHCACHE") == NULL)
