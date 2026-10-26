@@ -1,0 +1,31 @@
+Subject: The step executor's property stores carry the main interpreter's prototype and content hooks
+
+What this does
+  - `regvm_s_ROP_put_field`, own-slot hit: bumps the prototype epoch when the receiver is a prototype and records the
+    store in the layout's content claims, as the main interpreter's copy of the same hit does.
+  - `regvm_s_ROP_object_fill`, template hit: enters the filled object into its layout's content claims, as the main
+    interpreter's copy does.
+
+Why we need it
+  A compiled body that leaves through an exit runs the instruction in the step executor. A store the compiled code
+  refused because the receiver is a prototype ran in the step executor's own-slot hit, which neither moved the cache
+  epoch nor told the layout about the store, so a method cache keyed on the epoch kept the replaced method. The audit
+  compared every op of the step copy that writes a slot or changes a shape with the main interpreter's block: define_field,
+  put_element, put_field_xfer, put_global, put_var_ref, set_proto, the private, super, home-object and with stores and the
+  define ops are the same text or go through the shared helpers; put_field and object_fill were the two that differed.
+
+Functions touched
+  `regvm_s_ROP_put_field`, `regvm_s_ROP_object_fill`.
+
+No.
+
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -4405,0 +4406 @@
++                        js_aot_content_enter(ctx->rt, po);
+@@ -4671,0 +4673,5 @@
++#if JS_ENABLE_IC
++                            if (unlikely(p->is_prototype))
++                                ic_watchpoint_bump(ctx->rt);
++#endif
++                            js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), regs[v]);

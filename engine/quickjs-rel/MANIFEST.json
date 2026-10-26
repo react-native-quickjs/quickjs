@@ -1603,6 +1603,10 @@
       "sha256": "64512a451d0d5c16cbe9716f5dfb9bb04a262b1ed5a3abbd46602d8b178a846b"
     },
     {
+      "name": "0407-regvm-step-prototype-store-hooks.patch",
+      "sha256": "791c72023437377f09bd00e5aa68da57012e51816de95c7c0afb7be81cb1b33f"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
