@@ -63141,6 +63141,13 @@ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
        hold a pointer that is not a shape at all. */
     if (kind == REG_PIC_GLOBAL)
         return;
+    /* An unhashed shape is owned by its one object and is mutated in place when a property is
+       added; a hashed shape is copy-on-write (js_shape_prepare_update and add_property clone it
+       while it has a second reference). A reference held here on an unhashed shape would make
+       that add assert, or, without asserts, change the shape the record names. So only a hashed
+       shape is recorded; the fill is still counted, as for a fifth shape. */
+    if (!shape->is_hashed)
+        return;
     if (s->nshapes < 4) {
         /* A recorded shape is REFERENCED: at most four per site, and it keeps the
            address from being reused by a different shape before the dump reads it,
@@ -63176,7 +63183,9 @@ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
         e->types |= bit;
         if (bit == AOT_TYPE_OBJECT) {
             JSShape *rsh = JS_VALUE_GET_OBJ(v)->shape;
-            if (e->rshape == NULL && !e->rmulti) {
+            if (!rsh->is_hashed) {
+                e->rmulti = 1;
+            } else if (e->rshape == NULL && !e->rmulti) {
                 e->rshape = js_dup_shape(rsh);
                 rsh->aot_prof_seen = 1;
             } else if (e->rshape != rsh) {
@@ -63919,6 +63928,7 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
 
 void js_aot_prof_dump(JSRuntime *rt)
 {
+    int pass;
     const char *out = getenv("QJS_AOT_PROFILE_OUT");
     FILE *f = stderr;
     struct list_head *el;
@@ -63952,27 +63962,30 @@ void js_aot_prof_dump(JSRuntime *rt)
     /* The site records took a reference on every shape they named (see
        js_aot_prof_pic): drop them now that both the table and the site lines are
        written, so a recorded shape's address can never have been reused. */
-    list_for_each(el, &rt->gc_obj_list) {
-        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
-        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
-            continue;
-        {
-            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
-            JSAotProfFunc *pf = b->aot_prof;
-            int si, sj;
-            if (pf == NULL)
+    /* Bytecode on the no-trace list holds its records too. */
+    for (pass = 0; pass < 2; pass++) {
+        list_for_each(el, pass ? &rt->gc_notrace_list : &rt->gc_obj_list) {
+            JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+            if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
                 continue;
-            for (si = 0; si < pf->nsites; si++)
-                for (sj = 0; sj < pf->sites[si].nshapes; sj++)
-                    if (pf->sites[si].shapes[sj] != NULL) {
-                        js_free_shape(rt, pf->sites[si].shapes[sj]);
-                        pf->sites[si].shapes[sj] = NULL;
+            {
+                JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+                JSAotProfFunc *pf = b->aot_prof;
+                int si, sj;
+                if (pf == NULL)
+                    continue;
+                for (si = 0; si < pf->nsites; si++)
+                    for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+                        if (pf->sites[si].shapes[sj] != NULL) {
+                            js_free_shape(rt, pf->sites[si].shapes[sj]);
+                            pf->sites[si].shapes[sj] = NULL;
+                        }
+                for (si = 0; si < pf->pc_n; si++)
+                    if (pf->pcs[si].rshape != NULL) {
+                        js_free_shape(rt, pf->pcs[si].rshape);
+                        pf->pcs[si].rshape = NULL;
                     }
-            for (si = 0; si < pf->pc_n; si++)
-                if (pf->pcs[si].rshape != NULL) {
-                    js_free_shape(rt, pf->pcs[si].rshape);
-                    pf->pcs[si].rshape = NULL;
-                }
+            }
         }
     }
     if (f != stderr)

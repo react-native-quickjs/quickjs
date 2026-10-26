@@ -1,0 +1,83 @@
+Subject: The profile holds no reference on an unhashed shape, and drops the records of bytecode on the no-trace list
+
+What this does
+  - `js_aot_prof_pic` and `js_aot_prof_reg` record a receiver shape (with a reference) only if it is hashed. An unhashed
+    shape is counted as a fill and not recorded, as for a fifth shape; a pc whose receiver shape is unhashed becomes
+    polymorphic.
+  - `js_aot_prof_dump` drops the shape references of the site and pc records of the bytecode on `gc_notrace_list` as
+    well as `gc_obj_list`.
+
+Why we need it
+  An unhashed shape is owned by one object and `add_property` appends to it in place. A reference held by the profile made
+  that add assert (`JS_REF_COUNT(p->shape) == 1`), and in a build without asserts it changed the shape the record names.
+  A hashed shape is copy-on-write, so a held reference cannot be mutated under the record. Bytecode on the no-trace list
+  kept its recorded shapes after the dump; a shape holds its prototype, which holds the function and so the bytecode, a
+  cycle through an edge the collector does not trace, so the final collection could not free the realm and
+  `JS_FreeRuntime` asserted on a non-empty object list.
+
+Functions touched
+  `js_aot_prof_pic`, `js_aot_prof_reg`, `js_aot_prof_dump`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63143,0 +63144,7 @@
++    /* An unhashed shape is owned by its one object and is mutated in place when a property is
++       added; a hashed shape is copy-on-write (js_shape_prepare_update and add_property clone it
++       while it has a second reference). A reference held here on an unhashed shape would make
++       that add assert, or, without asserts, change the shape the record names. So only a hashed
++       shape is recorded; the fill is still counted, as for a fifth shape. */
++    if (!shape->is_hashed)
++        return;
+@@ -63179 +63186,3 @@
+-            if (e->rshape == NULL && !e->rmulti) {
++            if (!rsh->is_hashed) {
++                e->rmulti = 1;
++            } else if (e->rshape == NULL && !e->rmulti) {
+@@ -63921,0 +63931 @@
++    int pass;
+@@ -63955,9 +63965,5 @@
+-    list_for_each(el, &rt->gc_obj_list) {
+-        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+-        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+-            continue;
+-        {
+-            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+-            JSAotProfFunc *pf = b->aot_prof;
+-            int si, sj;
+-            if (pf == NULL)
++    /* Bytecode on the no-trace list holds its records too. */
++    for (pass = 0; pass < 2; pass++) {
++        list_for_each(el, pass ? &rt->gc_notrace_list : &rt->gc_obj_list) {
++            JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++            if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+@@ -63965,5 +63971,16 @@
+-            for (si = 0; si < pf->nsites; si++)
+-                for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+-                    if (pf->sites[si].shapes[sj] != NULL) {
+-                        js_free_shape(rt, pf->sites[si].shapes[sj]);
+-                        pf->sites[si].shapes[sj] = NULL;
++            {
++                JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
++                JSAotProfFunc *pf = b->aot_prof;
++                int si, sj;
++                if (pf == NULL)
++                    continue;
++                for (si = 0; si < pf->nsites; si++)
++                    for (sj = 0; sj < pf->sites[si].nshapes; sj++)
++                        if (pf->sites[si].shapes[sj] != NULL) {
++                            js_free_shape(rt, pf->sites[si].shapes[sj]);
++                            pf->sites[si].shapes[sj] = NULL;
++                        }
++                for (si = 0; si < pf->pc_n; si++)
++                    if (pf->pcs[si].rshape != NULL) {
++                        js_free_shape(rt, pf->pcs[si].rshape);
++                        pf->pcs[si].rshape = NULL;
+@@ -63971,5 +63988 @@
+-            for (si = 0; si < pf->pc_n; si++)
+-                if (pf->pcs[si].rshape != NULL) {
+-                    js_free_shape(rt, pf->pcs[si].rshape);
+-                    pf->pcs[si].rshape = NULL;
+-                }
++            }
