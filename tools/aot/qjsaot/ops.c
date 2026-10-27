@@ -7438,6 +7438,11 @@ static int emit_pure_call(
   }
   e_sweep_guard(f, "vx", in->pc);
   for (k = 0; k < n && k < 4; k++) {
+    /* Each branch of the chain holds its OWN accepted function object, so the
+       common case is a pointer compare rather than the full tag/class/bytecode
+       walk. A branch that has not been taken yet has a null slot and runs the
+       full test exactly as before. */
+    int ccx = g_cc_count++;
     fprintf(f, "#ifdef Q2_INLINE_%s\n", callee[k]);
     fprintf(
         f,
@@ -7446,7 +7451,7 @@ static int emit_pure_call(
         "        E_CAP(f, %d);\n"
         "        if (!(_r = ei_%s%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
         "                    args_, %d, &_o, NULL, 0, NULL))) goto vx_%d;\n",
-        e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in), in->next - 1, callee[k], g_e_nolazy ? "_n" : "", cexp, recv, na, in->pc);
+        "q2_call_entry_c(ctx, ", cexp, callee[k], ccx, in->next - 1, callee[k], g_e_nolazy ? "_n" : "", cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
       fprintf(
