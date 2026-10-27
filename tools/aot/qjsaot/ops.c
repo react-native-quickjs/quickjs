@@ -4161,13 +4161,15 @@ static void e_emit_presync(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t,
     Q2ValueId *cur) {
   int r;
-  /* 1. Sync every live TAG value to the frame before the call. */
-  if (!g_e_presynced)
-    fprintf(
-        f,
-        "    /* sync live TAG values to the frame before the op call (a safepoint) "
-        "*/\n");
-  for (r = 0; !g_e_presynced && r < fn->norig; r++) {
+  /* 1. Sync every live TAG value to the frame before the call.
+     The range is `fn->nregs`, not `fn->norig`: this generator allocates
+     registers ABOVE the program's own for a virtual object's argument window and
+     its constructor slot, and a copied callee's registers and a hoisted load land
+     there too. A counted value in one of them that the frame does not hold is
+     invisible to the collector while the safepoint runs, and the object that owns
+     it can be recycled under the register. The frame is `fn->nregs` wide
+     (`JSValue fr[fn->nregs]`), so the store is in bounds. */
+  for (r = 0; !g_e_presynced && r < fn->nregs; r++) {
     Q2ValueId v;
     if (cur == NULL) break;
     v = cur[r];
