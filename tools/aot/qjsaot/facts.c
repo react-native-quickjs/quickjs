@@ -2144,6 +2144,9 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
           inl_ncalls++;
           break;
         }
+        /* A numeric constant-pool load is emitted from the pool: no frame, no
+           handler, and nothing that can run JS (see emit_typed_load_const). */
+        if (in->rop == ROP_load_const) break;
         if (in->rop != ROP_eq && in->rop != ROP_neq && in->rop != ROP_strict_eq && in->rop != ROP_strict_neq)
           ok = 0;
         break;
