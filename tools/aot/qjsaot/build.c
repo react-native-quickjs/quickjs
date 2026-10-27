@@ -3055,6 +3055,7 @@ int q2_lowered(uint16_t rop) {
     case ROP_get_arg:
     case ROP_get_arg2:
     case ROP_get_var_ref:
+    case ROP_put_var_ref:
     case ROP_load_this:
     case ROP_add:
     case ROP_sub:
