@@ -2092,6 +2092,10 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
       case Q2_OP_GET_ARG:
       case Q2_OP_GET_ARG2:
       case Q2_OP_PUT_ARG:
+      /* a closure-cell read: the copy's own activation holds the same cell */
+      case Q2_OP_GET_VAR_REF:
+      /* a closure-cell write: a local effect like a field store, undone on the way out */
+      case Q2_OP_PUT_VAR_REF:
         break;
       case Q2_OP_LOAD_THIS:
         if (!has_recv) ok = 0;

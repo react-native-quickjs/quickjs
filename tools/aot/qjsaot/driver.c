@@ -4296,8 +4296,19 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(JSValue **)((unsigned char *)f +\n"
         "                       QJS_AOT_OFF_REGRUN_ARG_BUF);\n"
         "}\n\n"
-        /* A captured variable, read through the function object's cell vector:
-           what qjs_aot_get_var_ref does from a frame, for a body that has none. */
+        /* A captured variable, read through THE FUNCTION that owns the cell
+           vector: what qjs_aot_get_var_ref does from a frame, for a body that has
+           none.
+
+           THE CELLS BELONG TO THE FUNCTION, NOT TO THE ACTIVATION. `co` is right
+           for a frameless body's own entry, where it names the function being
+           entered. A COPY is not: its instructions run inside its CALLER's body,
+           where `co` (frameless) and `f` (framed) both name the CALLER. A caller
+           that captures nothing has a NULL `var_refs` -- the NULL dereference that
+           segfaulted -- and one that does capture has ITS OWN slots, so a copied
+           cell read would read or write another function's variable. A copy
+           therefore names the function object its guard has already proved
+           identity on, `nco_<n>`, and keeps the CALLEE's slot number. */
         "static inline __attribute__((always_inline)) JSValue *"
         "q2_vref_ptr(JSObject *co, int slot)\n"
         "{\n"

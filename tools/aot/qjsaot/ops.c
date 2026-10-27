@@ -137,7 +137,14 @@ static void e_undo_prepare(const Q2Func *fn) {
   g_e_undo_seq_n = 0;
   for (i = 0; i < fn->ninsns; i++) {
     g_e_undo_id[i] = -1;
-    if (fn->insns[i].own > 0 && fn->insns[i].rop == ROP_put_field && fn->insns[i].extcall != 2 && e_exit_follows(fn, i))
+    /* A CLOSURE-CELL STORE OF A COPY IS A STORE LIKE ANY OTHER. A copy's way out
+       exits at the CALL's pc, so the generic body replays the whole call -- the
+       store included -- and without a record the cell is written twice (for
+       `c += d`, twice the increment). put_var_ref writes through a heap VARREF
+       rather than a property slot, but the shape is the same: the cell's address
+       and the value it held are kept, and e_undo_restore puts them back. */
+    if (fn->insns[i].own > 0 && fn->insns[i].extcall != 2 && e_exit_follows(fn, i) &&
+        (fn->insns[i].rop == ROP_put_field || fn->insns[i].rop == ROP_put_var_ref))
       g_e_undo_id[i] = g_e_undo_total++;
   }
 }
@@ -7124,6 +7131,21 @@ static int emit_inl_guard(
   e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
   e_note_tag('v', in->pc, cexp);
   e_sweep_guard(f, "vx", in->pc);
+  /* THE COPY'S FUNCTION OBJECT. Recorded HERE, where the guard has just proved
+     `cexp` is the callee whose bound entry it compared, because a copied
+     get_var_ref/put_var_ref must read the CALLEE's cell vector and every other
+     function object in scope names the CALLER:
+       - a frameless body has `co` = the caller, whose `var_refs` is NULL when it
+         captures nothing (the NULL dereference that segfaulted) and holds the
+         caller's own slots when it does;
+       - a framed body has `f` = the caller's frame, same problem (this is the
+         crash `adv2` shows: an inline body's own `f` is right, but a copy spliced
+         INTO a framed body still ran against `f`).
+     Every guard form below proves exactly this identity, so the assignment is
+     unconditional and a store, not a test: it cannot refuse an entry and cannot
+     cost a branch. `nco_<n>` is declared once per copy in the body prologue of
+     BOTH body kinds, so a second guard for the same copy writes the same object. */
+  fprintf(f, "    nco_%d = (JSObject *)JS_VALUE_GET_PTR(%s);\n", in->inlg - 1, cexp);
   {
     /* A callee read from a method cell the body validated at entry: the cell's callee is what the entry
        accepted, so a cell that every user takes to hold this one callee needs no test here (the entry
@@ -10385,6 +10407,33 @@ static int emit_typed_var_ref_store(
   }
   /* The cell's OLD value is not forwarded: a later read of the cell is a fresh load
      with its own value id, so the IR already says the old value is gone. */
+  if (in->own > 0 && g_e_undo_id != NULL && g_e_undo_id[e_insn_idx(fn, in)] >= 0) {
+    /* A COPY's cell store: the copy's exit is at the CALL's pc, so a later miss
+       replays the whole call and would write the cell a second time. Keep the
+       cell's address and the value it held exactly as a copied field store does,
+       and e_undo_restore puts them back on the way out. The old value is NOT
+       released here: the undo record may have to restore it, and the record's
+       release at the copy's end frees it then. */
+    int id = g_e_undo_id[e_insn_idx(fn, in)];
+    fprintf(
+        f,
+        "    { JSValue *_p = qjs_aot_var_ref_ptr(f, %d);\n"
+        "      uo%d = *_p;\n"
+        "      us%d = _p;\n"
+        "      *_p = JS_DupValue(ctx, %s);\n"
+        "      un%d = *_p; }\n",
+        slot, id, id, box, id);
+    if (g_e_undo_seq_n < 256) {
+      g_e_undo_seq[g_e_undo_seq_n] = id;
+      g_e_undo_seq_own[g_e_undo_seq_n++] = e_dom(in->own);
+    } else {
+      fprintf(stderr, "qjsaot: too many stores in copied callees\n");
+      abort();
+    }
+    e_inl_store_mark(f);
+    (void)cur;
+    return 1;
+  }
   fprintf(
       f,
       "    { JSValue *_p = qjs_aot_var_ref_ptr(f, %d);\n"
@@ -12514,9 +12563,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           f,
           "    const uint8_t *ipic_%d = NULL; void *const *iholders_%d = NULL; uint32_t ins_%d = 0;\n"
           "    const uint8_t *icode_%d = NULL;\n"
+          "    JSObject *nco_%d = NULL;\n"
           "    JSValue ifr_%d[%d];\n"
-          "    (void)ipic_%d; (void)iholders_%d; (void)ins_%d; (void)ifr_%d; (void)icode_%d;\n",
-          ik, ik, ik, ik, ik, fn->nregs, ik, ik, ik, ik, ik);
+          "    (void)ipic_%d; (void)iholders_%d; (void)ins_%d; (void)ifr_%d; (void)icode_%d; (void)nco_%d;\n",
+          ik, ik, ik, ik, ik, ik, fn->nregs, ik, ik, ik, ik, ik, ik);
   }
   /* A function with no PIC sites -- a leaf arithmetic function, say -- has no
      PIC table at all, so `pic` is NULL on EVERY call. Refusing on that refused
@@ -13157,6 +13207,21 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               f,
               "#define pic ipic_%d\n#define holders iholders_%d\n#define q2_ns ins_%d\n#define fr ifr_%d\n",
               in->own - 1, in->own - 1, in->own - 1, in->own - 1);
+        /* A copy's closure cells are the CALLEE's, reachable only through the
+           callee's own function object. Inside a frameless body `co` names the
+           CALLER (NULL `var_refs` when it captures nothing -- the segfault), and
+           inside a framed body `f` names the CALLER's frame (the same fault).
+           `nco_<n>` is set where the copy's guard proved identity on the callee,
+           and this rebinding is what routes the cell access through it. It is
+           defined for every body kind, because a copy exists in either; the
+           restore below is what differs (a frameless body defines the pair
+           itself, a framed one must not leave it defined). */
+        if (in->own > 0)
+          fprintf(
+              f,
+              "#define qjs_aot_get_var_ref(f_, i_) q2_vref_get(nco_%d, (i_))\n"
+              "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(nco_%d, (i_))\n",
+              in->own - 1, in->own - 1);
         emitted = e_dispatch_rop(
             f, fn, in, &types, cur, have_types, hex, fi, b, role);
         if (!emitted)
@@ -13175,7 +13240,18 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             if (sr >= 0 && sr < fn->nregs) cur[sr] = E_UNDEF;
           }
         }
-        if (in->own > 0) fprintf(f, "#undef pic\n#undef holders\n#undef q2_ns\n#undef fr\n");
+        if (in->own > 0) {
+          fprintf(f, "#undef pic\n#undef holders\n#undef q2_ns\n#undef fr\n"
+                     "#undef qjs_aot_get_var_ref\n#undef qjs_aot_var_ref_ptr\n");
+          /* A frameless body defines the pair for its own text (see above), so put
+             it back; a framed body never had it, and leaving `nco_<n>` in the
+             accessor would make the CALLER's own cells read the wrong object. */
+          if (g_e_fl)
+            fprintf(
+                f,
+                "#define qjs_aot_get_var_ref(f_, i_) q2_vref_get(co, (i_))\n"
+                "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(co, (i_))\n");
+        }
         /* The facts treated this access as no safepoint only because its miss
            exits; an emitter that gave it a continuing miss would leave facts the
            miss may have broken. */
