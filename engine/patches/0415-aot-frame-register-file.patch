@@ -1,0 +1,672 @@
+Subject: A compiled frame's register file is published to the collector
+
+What this does
+  - A light frame is sized and scanned by `regvm_frame_regs(cb)`, which is the
+    program's own `regvm_reg_count` widened to the count the unit compiled the
+    body for. The generator publishes that count per body in
+    `qjs_aot_table[].reg_count` (new field in `quickjs-aot-rt.h`), and a body
+    that cannot publish one keeps the program's own count, so nothing widens.
+  - `regvm_light_scan` is that count, kept separate from `regvm_reg_count`
+    because the latter also POSITIONS `var_refs` and the handshake slots in the
+    interpreter's flat frame (`out->var_refs = out->regs + b->regvm_reg_count +
+    REGVM_HS`); raising it would move them.
+  - `regvm_set_frame_shape` recomputes the light-frame size, `regvm_end_off` and
+    `regvm_frame_need` at bind, so a frame is allocated for the widened count.
+  - `regvm_light_fill` initialises the whole widened file.
+  - Also: `js_aot_enter_count` is incremented on both fast AOT entries (the
+    `aot_nfn` path and the light entry), so `enter` in the unit stats counts code
+    that is really running instead of reporting 0.
+
+Why we need it
+  A virtual object's argument registers and a hoisted global read are allocated
+  ABOVE the program's own register count, and a compiled body writes counted
+  values into them. The collector scanned only `regvm_reg_count` and the
+  pre-safepoint sync stopped at the program's registers, so a collection between
+  a construct and the last read of a member could recycle an object those
+  registers still held. Publishing the count is what lets the sync and the scan
+  cover them, and it is what makes the virtual-object safepoint relaxation
+  sound: without it, vec3 is a heap-use-after-free under GC-at-every-malloc.
+
+Functions touched
+  `regvm_frame_regs` (new), `regvm_set_frame_shape`, `regvm_light_fill`,
+  `regvm_light_walk`, `regvm_end_off`, `regvm_frame_need`, `js_aot_bind`,
+  `qjs_aot_note_frame_regs` / `qjs_aot_frame_regs`, the two fast AOT entries.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1637,10 +1637,11 @@
+ /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
+    engine refuses a generated unit built against another version. The value
+    encoding is part of the ABI: a unit compiled against one encoding reads a
+-   different JSValue and must not bind against the other. */
+-#ifndef QJS_AOT_ABI
+-#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8) | ((uint32_t)QJS_NAN_BOXING64 << 9))
+-#endif
++   different JSValue and must not bind against the other.
++   The ONE definition lives in quickjs-aot-rt.h, which this file includes
++   below and the generated unit includes too; a second copy here would be the
++   one the ENGINE compiles against while the unit used the other, which is
++   exactly the mismatch the version is meant to catch. */
+ 
+ /* The layout facts the generated unit is compiled against. The struct and its
+    hash live in quickjs-aot-rt.h so the engine and the unit share one definition;
+@@ -1904,6 +1905,20 @@
+     uint8_t regvm_light;
+     uint8_t regvm_light_fast; /* light, and its PIC needs no lazy allocation */
+     uint32_t regvm_light_need;
++    /* How many JSValues of a light frame the collector must scan: the whole
++       register file the compiled unit may use, which is `regvm_reg_count` plus
++       the registers the generator allocates above the program's own (a
++       virtual object's argument window, a hoisted load). It is separate from
++       `regvm_reg_count` because that field also POSITIONS `var_refs` and the
++       handshake slots in the interpreter's flat frame layout
++       (`out->var_refs = out->regs + b->regvm_reg_count + REGVM_HS`), so
++       raising it would move them. It is published by the unit at bind
++       (`qjs_aot_table[].reg_count`), and a frame whose count the unit could
++       not publish keeps `regvm_light_scan` equal to `regvm_reg_count`. Only a
++       light frame is scanned this wide: its register array is the unit's own
++       `JSValue fr[N]`, sized to the same count, so there is nothing past the
++       end. */
++    uint32_t regvm_light_scan;
+     /* Bytes from a frame's `fr` to its end (the larger of the record and light
+        shapes, rounded to 16), so a light callee is placed directly above its
+        caller without reading the arena top. */
+@@ -2057,6 +2072,19 @@
+ #endif
+ #endif
+ 
++/* The register file a frame of `b` holds: the program's own count, widened to
++   the count the unit compiled the body for when a unit is bound (see
++   `regvm_light_scan`). Everything that sizes or scans a frame goes through this,
++   so the unit's own array and the engine's arena frame cannot disagree. */
++static inline uint32_t regvm_frame_regs(const JSFunctionBytecode *b)
++{
++    uint32_t n = b->regvm_reg_count > 0 ? (uint32_t)b->regvm_reg_count : 0;
++
++    if (b->regvm_light_scan > n)
++        n = b->regvm_light_scan;
++    return n;
++}
++
+ #if QJS_AOT
+ /* AOT runtime. `js_aot_digest` is the profiler digest, reused as the binding
+    key; `js_aot_bind` is called from regvm_set_call_desc. The ABI header
+@@ -2067,6 +2095,9 @@
+ static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
+ #endif
+ static void js_aot_bind(JSFunctionBytecode *b);
++/* Recompute the parts of the call descriptor that depend on the frame's register
++   count; `js_aot_bind` calls it after the unit publishes a wider count. */
++static void regvm_set_frame_shape(JSFunctionBytecode *b);
+ void js_aot_stats_dump(JSRuntime *rt);
+ static void aot_run_free(JSRuntime *rt);
+ extern uint64_t js_aot_bound_count;
+@@ -27715,7 +27746,7 @@
+     target->prev_frame = saved;
+     target->rv_light = regvm_light_head(lf->caller);
+     target->rv_rec = NULL;
+-    REGVM_SET_ROOT(target, lf->fr, b->regvm_reg_count);
++    REGVM_SET_ROOT(target, lf->fr, regvm_frame_regs(b));
+     if (vc < var_count) {
+         JSValue *vars = js_malloc(ctx, sizeof(JSValue) * var_count);
+         if (!vars)
+@@ -27746,14 +27777,28 @@
+ #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
+ /* Walk one light chain, innermost first, publishing each frame's register
+    window as a root range (registers borrow under DRC). The chain ends at the
+-   first frame whose caller is real or NULL. */
++   first frame whose caller is real or NULL.
++
++   A light frame is scanned over `regvm_light_scan` JSValues, not
++   `regvm_reg_count`: a compiled body allocates its own registers ABOVE the
++   program's (a virtual object's argument window, a hoisted global read), and
++   those hold references too. They are inside the unit's own `JSValue fr[N]`
++   register array, which the unit sizes from the same count, so nothing past the
++   end is read. `regvm_reg_count` itself must not be raised: it positions
++   `var_refs` and the handshake slots in the INTERPRETER's flat frame layout.
++   Record frames keep the program's count, which is what the interpreter
++   layout actually has. */
+ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
+ {
+     for (; lf != NULL;
+          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
+         JSFunctionBytecode *b = lf->b;
+-        if (lf->fr && b->regvm_reg_count)
+-            fn(opaque, lf->fr, b->regvm_reg_count);
++        uint32_t n = b->regvm_light_scan;
++
++        if (n < (uint32_t)b->regvm_reg_count)
++            n = (uint32_t)b->regvm_reg_count;
++        if (lf->fr && n)
++            fn(opaque, lf->fr, n);
+     }
+ }
+ #endif
+@@ -29878,7 +29923,12 @@
+     for (k = 0; k < vc; k++)
+         __builtin_memcpy(&vb[k], &regvm_undefined_value, sizeof(JSValue));
+     /* a light frame never suspends, so it has no handshake slots */
+-    nregs = cb->regvm_reg_count;
++    /* Fill the WHOLE register file, not just the program's registers: the
++       collector scans the frame over `regvm_light_scan`, and a compiled body's
++       owns registers above `regvm_reg_count`. An uninitialised slot there would
++       be scanned as a JSValue -- a stale stack or arena word, freed or traced as
++       if it were a real value. */
++    nregs = (int)regvm_frame_regs(cb);
+     /* One 16-byte `undefined` store per register. `__builtin_memcpy` from the
+        constant is alignment- and aliasing-safe; the barrier keeps the loop from
+        becoming a `memset` call. */
+@@ -30059,7 +30109,7 @@
+ #if QJS_DRC
+     f->local_count = slots + 2 + cb->var_count;
+ #else
+-    f->local_count = slots + 2 + cb->var_count + cb->regvm_reg_count
++    f->local_count = slots + 2 + cb->var_count + regvm_frame_regs(cb)
+         + REGVM_HS - 1;
+ #endif
+ #if !QJS_REGVM_RECORD
+@@ -33388,7 +33438,7 @@
+     out->arg_buf = (JSValue *)q;
+     out->var_buf = out->arg_buf + arg_slots;
+     out->regs = out->var_buf + b->var_count;
+-    out->var_refs = (JSVarRef **)(out->regs + b->regvm_reg_count + REGVM_HS);
++    out->var_refs = (JSVarRef **)(out->regs + regvm_frame_regs(b) + REGVM_HS);
+     out->ctl = (JSRegCtl *)(out->var_refs + b->var_ref_count);
+     out->sf = &out->rec->sf_embed;
+     return 0;
+@@ -33595,20 +33645,65 @@
+    metadata are final: end of js_create_function, non-lazy deserialize, lazy
+    materialization. `regvm_all_threaded` is never serialized, so a blob
+    function stays ineligible. */
+-static void regvm_set_call_desc(JSFunctionBytecode *b)
++/* The parts of the call descriptor that depend on `regvm_frame_regs`: the light
++   frame's size and the distance from `fr` to a frame's end. `regvm_set_call_desc`
++   runs it after eligibility is decided, and `js_aot_bind` runs it again when the
++   unit publishes a wider register count -- a frame sized before the bind would
++   put the unit's own registers past its end. */
++static void regvm_set_frame_shape(JSFunctionBytecode *b)
+ {
+-    b->regvm_call_ready = (b->func_kind == JS_FUNC_NORMAL && b->regvm_compiled
+-                           && !b->is_lazy && b->regvm_all_threaded) ? 1 : 0;
++#if QJS_REGVM_RECORD
++    if (b->regvm_light) {
++        int lvc = b->var_count;
++#if QJS_DRC
++        if (b->var_count <= 255)
++            lvc = b->regvm_var_count;
++#endif
++        /* No variable area when the promotion map leaves no slot in it;
++           `regvm_light_enter` sizes `fr` the same way. The register file is the
++           wider compiled count: a web argument register or a hoisted load lands
++           above the program's own registers, and both the unit's `JSValue fr[N]`
++           and this arena frame must have room for it. */
++        b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
++            + sizeof(JSValue) * (size_t)((lvc ? b->var_count : 0)
++                                        + regvm_frame_regs(b));
++    }
++    /* The arena slot a record needs; `regvm_record_alloc` adds the reserved
++       argument copy. It covers the WIDER register file, because a bound
++       function's record runs the unit's compiled body. */
+     b->regvm_frame_need = sizeof(JSRegRun)
+-        + sizeof(JSValue) * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS)
++        + sizeof(JSValue) * (size_t)(b->var_count + regvm_frame_regs(b)
++                                     + REGVM_HS)
+         + sizeof(JSVarRef *) * (size_t)b->var_ref_count
+         + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
++    /* the distance from `fr` to the frame's end, for both shapes */
++    {
++        size_t rec = (size_t)(regvm_frame_regs(b) + REGVM_HS) * sizeof(JSValue)
++                   + (size_t)b->var_ref_count * sizeof(JSVarRef *)
++                   + (size_t)b->regvm_ctl_count * sizeof(JSRegCtl);
++        size_t lite = (size_t)regvm_frame_regs(b) * sizeof(JSValue);
++        size_t off = rec > lite ? rec : lite;
++
++        b->regvm_end_off = (uint32_t)((off + 15) & ~(size_t)15);
++    }
++#else
++    (void)b;
++#endif
++}
++
++static void regvm_set_call_desc(JSFunctionBytecode *b)
++{
++    b->regvm_call_ready = (b->func_kind == JS_FUNC_NORMAL && b->regvm_compiled
++                           && !b->is_lazy && b->regvm_all_threaded) ? 1 : 0;
+     /* Light eligibility: the record test, plus nothing to close, no owned
+        argument copy, no control records, and no opcode that reads a record-only
+        field or the JSStackFrame. */
+     b->regvm_light = 0;
+     b->regvm_light_fast = 0;
+     b->regvm_light_need = 0;
++    /* The collector scans the program's own registers until a unit publishes the
++       wider count it compiled the body with (see `regvm_light_scan`). */
++    b->regvm_light_scan = (uint32_t)(b->regvm_reg_count > 0 ? b->regvm_reg_count : 0);
+ #if QJS_REGVM_RECORD
+ #if QJS_DRC
+     if (b->regvm_call_ready && b->func_kind == JS_FUNC_NORMAL
+@@ -33618,34 +33713,12 @@
+         && !(b->arg_count != 0 &&
+              regvm_code_has_op(b->regvm_code, b->regvm_len, ROP_apply_arguments))) {
+         b->regvm_light = 1;
+-        {
+-            int lvc = b->var_count;
+-#if QJS_DRC
+-            if (b->var_count <= 255)
+-                lvc = b->regvm_var_count;
+-#endif
+-            /* No variable area when the promotion map leaves no slot in it;
+-               `regvm_light_enter` sizes `fr` the same way. */
+-            b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
+-                + sizeof(JSValue)
+-                    * (size_t)((lvc ? b->var_count : 0)
+-                               + b->regvm_reg_count);
+-            b->regvm_light_fast = (b->regvm_pic != NULL
+-                                   || b->regvm_pic_count == 0);
+-        }
++        b->regvm_light_fast = (b->regvm_pic != NULL
++                               || b->regvm_pic_count == 0);
+     }
+ #endif
+-    /* the distance from `fr` to the frame's end, for both shapes */
+-    {
+-        size_t rec = (size_t)(b->regvm_reg_count + REGVM_HS) * sizeof(JSValue)
+-                   + (size_t)b->var_ref_count * sizeof(JSVarRef *)
+-                   + (size_t)b->regvm_ctl_count * sizeof(JSRegCtl);
+-        size_t lite = (size_t)b->regvm_reg_count * sizeof(JSValue);
+-        size_t off = rec > lite ? rec : lite;
+-
+-        b->regvm_end_off = (uint32_t)((off + 15) & ~(size_t)15);
+-    }
+ #endif
++    regvm_set_frame_shape(b);
+ #if QJS_AOT
+     /* Bind the generated entry, if any. A bound function is kept off the record
+        and light paths so its calls reach js_regvm_execute's AOT entry; the
+@@ -33761,7 +33834,7 @@
+            area (and owned argument copies). */
+         rec->local_count = vcount;
+ #else
+-        rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
++        rec->local_count = cb->var_count + regvm_frame_regs(cb) + REGVM_HS - 1;
+ #endif
+ #if !QJS_REGVM_RECORD
+         sf->arg_count = na;
+@@ -33778,7 +33851,7 @@
+ #if QJS_DRC
+         rec->local_count = slots + vcount;
+ #else
+-        rec->local_count = slots + cb->var_count + cb->regvm_reg_count
++        rec->local_count = slots + cb->var_count + regvm_frame_regs(cb)
+             + REGVM_HS - 1;
+ #endif
+         for (k = 0; k < slots; k++)
+@@ -33809,7 +33882,7 @@
+     regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = rec;
+-    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
++    REGVM_SET_ROOT(sf, lay->regs, regvm_frame_regs(cb) + REGVM_HS - 1);
+ 
+ #if !QJS_REGVM_RECORD
+     sf->arg_buf = rec->arg_buf;
+@@ -33819,7 +33892,7 @@
+     {
+         int var_count = cb->var_count; /* the fill stays full */
+         int var_ref_count = cb->var_ref_count;
+-        int nregs = cb->regvm_reg_count + REGVM_HS;
++        int nregs = regvm_frame_regs(cb) + REGVM_HS;
+ 
+         for (k = 0; k < var_count; k++)
+             lay->var_buf[k] = JS_UNDEFINED;
+@@ -33912,7 +33985,7 @@
+ #if QJS_DRC
+     rec->local_count = slots + vcount;
+ #else
+-    rec->local_count = slots + cb->var_count + cb->regvm_reg_count
++    rec->local_count = slots + cb->var_count + regvm_frame_regs(cb)
+         + REGVM_HS - 1;
+ #endif
+     for (k = 0; k < slots; k++)
+@@ -33941,7 +34014,7 @@
+     regvm_light_seal(rt, rt->regvm_cur);
+     sf->rv_light = rt->regvm_cur;
+     sf->rv_rec = rec;
+-    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
++    REGVM_SET_ROOT(sf, lay->regs, regvm_frame_regs(cb) + REGVM_HS - 1);
+ 
+ #if !QJS_REGVM_RECORD
+     sf->arg_buf = rec->arg_buf;
+@@ -33949,7 +34022,7 @@
+     {
+         int var_count = cb->var_count; /* the fill stays full */
+         int var_ref_count = cb->var_ref_count;
+-        int nregs = cb->regvm_reg_count + REGVM_HS;
++        int nregs = regvm_frame_regs(cb) + REGVM_HS;
+ 
+         for (k = 0; k < var_count; k++)
+             lay->var_buf[k] = JS_UNDEFINED;
+@@ -34105,7 +34178,7 @@
+ #define SET_REG_P(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); AOT_PROF_REG(b, (d), regs[d]); } while (0)
+ #endif
+ 
+-#define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
++#define REGVM_SLOT(k) (regs[regvm_frame_regs(b) + (k)])        /*
+          * Leave the frame for the engine. The continuation is the register pc
+          * in sf->cur_pc, the control stack rides in slot 0, and the value being
+          * handed over is already in slot 1, which is cur_sp[-1] because the
+@@ -34119,9 +34192,9 @@
+         sf->rv_owns_regs = (JS_VALUE_GET_TAG(_sus_code) == JS_TAG_INT); \
+         if (sf->rv_owns_regs) \
+             js_regvm_drc_suspend(ctx->rt, regs, \
+-                                 (uint32_t)(b->regvm_reg_count + REGVM_HS - 1)); \
++                                 (uint32_t)(regvm_frame_regs(b) + REGVM_HS - 1)); \
+         REGVM_SLOT(0) = js_int32(regvm_nctl); \
+-        sp = regs + b->regvm_reg_count + REGVM_HS - 1; \
++        sp = regs + regvm_frame_regs(b) + REGVM_HS - 1; \
+         ret_val = _sus_code; \
+         goto done_generator; \
+     } while (0)
+@@ -34132,9 +34205,9 @@
+         JSValue _sus_code = (code_); \
+         sf->rv_owns_regs = 1; \
+         js_regvm_drc_suspend(ctx->rt, regs, \
+-                             (uint32_t)(b->regvm_reg_count + REGVM_HS - 1)); \
++                             (uint32_t)(regvm_frame_regs(b) + REGVM_HS - 1)); \
+         REGVM_SLOT(0) = js_int32(regvm_nctl); \
+-        sp = regs + b->regvm_reg_count + REGVM_HS - 1; \
++        sp = regs + regvm_frame_regs(b) + REGVM_HS - 1; \
+         ret_val = _sus_code; \
+         goto done_generator; \
+     } while (0)
+@@ -34157,7 +34230,7 @@
+         if (sp == stack_buf) {
+             /* Bound hoisted: the 16-byte stores through `regs` would otherwise
+                force a reload of `b->regvm_reg_count` on every slot. */
+-            int ninit = b->regvm_reg_count + REGVM_HS;
++            int ninit = regvm_frame_regs(b) + REGVM_HS;
+ 
+ #ifdef AOT_MUT_FILL_DROP_ALL
+             /* Gate mutant: no fill at all, so the pin and release walks see
+@@ -34191,7 +34264,7 @@
+                argument, which the yield arm adopts itself. */
+             if (sf->rv_owns_regs)
+                 js_regvm_drc_resume(ctx->rt, regs,
+-                                    (uint32_t)(b->regvm_reg_count + 1));
++                                    (uint32_t)(regvm_frame_regs(b) + 1));
+             sf->rv_owns_regs = 0;
+             regvm_resume_marker = sf->cur_pc;
+             rpc = regvm_resume_marker;
+@@ -34201,9 +34274,9 @@
+             /* a deopt continues at an instruction, it does not resume a yield */
+             if (unlikely(flags & JS_CALL_FLAG_AOT_DEOPT))
+                 regvm_resume_marker = NULL;
+-            regvm_nctl = JS_VALUE_GET_INT(regs[b->regvm_reg_count]);
++            regvm_nctl = JS_VALUE_GET_INT(regs[regvm_frame_regs(b)]);
+         }
+-        sp = regs + b->regvm_reg_count + REGVM_HS - 1;
++        sp = regs + regvm_frame_regs(b) + REGVM_HS - 1;
+         regvm_ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
+ #if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
+         /* From here the monolith's control stack is the entry record's: cold
+@@ -37663,7 +37736,7 @@
+      done_generator:
+         sf->cur_pc = pc;
+         sf->cur_sp = sp;
+-        regs[b->regvm_reg_count] = js_int32(regvm_nctl);
++        regs[regvm_frame_regs(b)] = js_int32(regvm_nctl);
+         rt->regvm_cur = sf->rv_light;
+         rt->current_stack_frame = sf->prev_frame;
+         return ret_val;
+@@ -37689,7 +37762,7 @@
+             /* Registers do not own, so the walk stops at the register file. */
+             JSValue *end = regs;
+ #else
+-            JSValue *end = regs + b->regvm_reg_count + REGVM_HS - 1;
++            JSValue *end = regs + regvm_frame_regs(b) + REGVM_HS - 1;
+ #endif
+ 
+             for (pval = local_buf; pval < end; pval++)
+@@ -39790,8 +39863,13 @@
+ 
+         if (likely(ar == NULL || ar->disabled == NULL ||
+                    !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))
+-            return ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
+-                                          (JSValue *)argv, argc);
++        {
++            JSValue aot_ret;
++            js_aot_enter_count++;
++            aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
++                                             (JSValue *)argv, argc);
++            return aot_ret;
++        }
+     }
+     /* A compiled function with no native entry because its frame needs the record's
+        tail (it reads `arguments`, the new target, the home object): the interpreter's
+@@ -39852,7 +39930,7 @@
+     /* The register frame's temporary area is the allocator's register count,
+        not the stack VM's maximum depth. */
+     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
+-                                     b->regvm_reg_count + REGVM_HS) +
++                                     regvm_frame_regs(b) + REGVM_HS) +
+         sizeof(JSVarRef *) * b->var_ref_count +
+         sizeof(JSRegCtl) * b->regvm_ctl_count;
+ #else
+@@ -39889,7 +39967,7 @@
+ 
+     stack_buf = var_buf + b->var_count;
+ #if QJS_REGVM
+-    sf->var_refs = (JSVarRef **)(stack_buf + b->regvm_reg_count + REGVM_HS);
++    sf->var_refs = (JSVarRef **)(stack_buf + regvm_frame_regs(b) + REGVM_HS);
+ #else
+     sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
+ #endif
+@@ -39899,7 +39977,7 @@
+     /* ordinary C-stack frame: not owned by a coroutine GC object */
+     sf->cur_gc_obj = NULL;
+ #if QJS_REGVM
+-    REGVM_SET_ROOT(sf, stack_buf, b->regvm_reg_count + REGVM_HS - 1);
++    REGVM_SET_ROOT(sf, stack_buf, regvm_frame_regs(b) + REGVM_HS - 1);
+ #else
+     REGVM_SET_ROOT(sf, NULL, 0);
+ #endif
+@@ -43732,7 +43810,7 @@
+     arg_buf_len = max_int(b->arg_count, argc);
+ #if QJS_REGVM
+     /* the register file and its handshake slots, not the stack VM's depth */
+-    local_count = arg_buf_len + b->var_count + b->regvm_reg_count + REGVM_HS;
++    local_count = arg_buf_len + b->var_count + regvm_frame_regs(b) + REGVM_HS;
+     alloc_size = sizeof(JSValue) * max_int(local_count, 1) +
+         sizeof(JSVarRef *) * b->var_ref_count +
+         sizeof(JSRegCtl) * b->regvm_ctl_count;
+@@ -43753,9 +43831,9 @@
+     /* set by the caller once the owning coroutine GC object exists */
+     sf->cur_gc_obj = NULL;
+ #if QJS_REGVM
+-    REGVM_SET_ROOT(sf, sf->cur_sp, b->regvm_reg_count + REGVM_HS - 1);
++    REGVM_SET_ROOT(sf, sf->cur_sp, regvm_frame_regs(b) + REGVM_HS - 1);
+     sf->rv_owns_regs = 0;
+-    sf->var_refs = (JSVarRef **)(sf->cur_sp + b->regvm_reg_count + REGVM_HS);
++    sf->var_refs = (JSVarRef **)(sf->cur_sp + regvm_frame_regs(b) + REGVM_HS);
+ #else
+     REGVM_SET_ROOT(sf, NULL, 0);
+     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
+@@ -43766,7 +43844,7 @@
+ #if QJS_REGVM
+     /* where the interpreter publishes the control-stack depth, and how deep
+        that stack can go: see async_func_free and async_func_mark */
+-    s->regvm_depth_slot = sf->var_buf + b->var_count + b->regvm_reg_count;
++    s->regvm_depth_slot = sf->var_buf + b->var_count + regvm_frame_regs(b);
+     s->regvm_ctl_cap = b->regvm_ctl_count;
+ #endif
+     for(i = 0; i < argc; i++)
+@@ -43899,7 +43977,7 @@
+     uint32_t entry_pc;
+ 
+     if (sf->rv_owns_regs)
+-        js_regvm_drc_resume(rt, regs, (uint32_t)(b->regvm_reg_count + 1));
++        js_regvm_drc_resume(rt, regs, (uint32_t)(regvm_frame_regs(b) + 1));
+     sf->rv_owns_regs = 0;
+     sf->cur_pc = NULL;
+     run.caller_ctx = ctx;
+@@ -43915,7 +43993,7 @@
+     run.argc = s->argc;
+     run.argv = sf->arg_buf;
+     run.ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
+-    run.nctl = JS_VALUE_GET_INT(regs[b->regvm_reg_count]);
++    run.nctl = JS_VALUE_GET_INT(regs[regvm_frame_regs(b)]);
+     run.arg_buf = sf->arg_buf;
+     run.var_buf = sf->var_buf;
+     run.ret = JS_UNDEFINED;
+@@ -43935,7 +44013,7 @@
+     if (unlikely(run.deopt_pc != QJS_AOT_NO_DEOPT)) {
+         /* Hand the frame to the interpreter: the control depth goes back to its slot and the
+            continuation is the recorded pc. */
+-        regs[b->regvm_reg_count] = js_int32(run.nctl);
++        regs[regvm_frame_regs(b)] = js_int32(run.nctl);
+         sf->cur_pc = b->regvm_code + run.deopt_pc;
+         return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
+                                 s->argc, vc(sf->arg_buf), sf, b, sf->arg_buf, sf->arg_buf,
+@@ -43944,7 +44022,7 @@
+     }
+     sf->cur_pc = run.sf->cur_pc;
+     sf->cur_sp = run.sf->cur_sp;
+-    regs[b->regvm_reg_count] = js_int32(run.nctl);
++    regs[regvm_frame_regs(b)] = js_int32(run.nctl);
+     rt->regvm_cur = sf->rv_light;
+     rt->current_stack_frame = sf->prev_frame;
+     return ret_val;
+@@ -64588,12 +64666,21 @@
+     b->aot_nfn = NULL;
+     b->regvm_call_ready = b->aot_call_ready;
+     b->regvm_light = b->aot_light;
++    /* No compiled body runs this function any more, so its frames are the
++       interpreter's own: the register file ends at `regvm_reg_count`, and the
++       wider compiled count must not be scanned or reserved past it. A STACK light
++       frame is the unit's own array (only the unit can run on it), but an
++       unbound function is not entered through the unit, so the count goes back
++       for both shapes. */
++    b->regvm_light_scan = (uint32_t)(b->regvm_reg_count > 0 ? b->regvm_reg_count : 0);
+     /* A light frame carries the PIC pointer, so the light path is only open
+        once the table exists. The flag is the one eligibility bit that can
+        change while the function is bound (the table is allocated on its first
+        fill), so recompute it instead of restoring the bind-time byte. */
+     b->regvm_light_fast = b->regvm_light != 0 &&
+                           (b->regvm_pic != NULL || b->regvm_pic_count == 0);
++    /* The frame shrank back to the interpreter's own register count. */
++    regvm_set_frame_shape(b);
+ }
+ 
+ /* Bind a function to its generated entry. The table is sorted by digest;
+@@ -64741,6 +64828,20 @@
+             b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
+             b->aot_index = mid;
+             b->aot_state = 1;   /* bound */
++            /* The register file the unit compiled this body for. It may be wider
++               than `regvm_reg_count`: the generator allocates registers above the
++               program's own for a virtual object's argument window and for a
++               hoisted global read, and the unit's own `JSValue fr[N]` is sized to
++               match. Publishing it here is what makes the collector scan those
++               slots (see `regvm_light_scan`) and what makes the engine's arena
++               frame for this function wide enough to hold them. A unit generated
++               before the field existed reports 0, which keeps the program's own
++               count. */
++            if (qjs_aot_table[mid].reg_count > b->regvm_light_scan)
++                b->regvm_light_scan = qjs_aot_table[mid].reg_count;
++            /* The frame is sized from `regvm_light_scan`, so redo the shape. The
++               bind runs from regvm_set_call_desc, before the first call. */
++            regvm_set_frame_shape(b);
+             /* Allocate the polymorphic cache now, so filling a site from
+                compiled code never allocates: an allocation there would be a
+                safepoint, and the compiled body's frame is not prepared for
+@@ -66541,6 +66642,7 @@
+     nf->flags |= REGVM_FLAG_C_ENTRY;
+     prev = rt->regvm_cur;
+     rt->regvm_cur = nf;
++    js_aot_enter_count++;
+     ret = ((JSAotFn)cb->aot_fn)(cb->realm, nf, regs, 0);
+     rt->regvm_cur = prev;
+     {
+@@ -66579,7 +66681,7 @@
+ 
+     /* the C stack the compiled body and its callees will use, as JS_CallInternal checks */
+     if (js_check_stack_overflow(rt, sizeof(JSValue) * (size_t)(cb->var_count +
+-                                    cb->regvm_reg_count + REGVM_HS) + 1024)) {
++                                    regvm_frame_regs(cb) + REGVM_HS) + 1024)) {
+         JS_ThrowStackOverflow(caller_ctx);
+         return -1;
+     }
+@@ -66735,6 +66837,7 @@
+         JSRegRun *prev = rt->regvm_cur;
+ 
+         rt->regvm_cur = nf;
++        js_aot_enter_count++;
+         ret = ((JSAotFn)cb->aot_fn)(cb->realm, nf, regs, 0);
+         rt->regvm_cur = prev;
+     }
+@@ -66775,7 +66878,7 @@
+         return 0;
+     if (js_poll_interrupts(caller_ctx))
+         return -1;
+-    alloca_size = sizeof(JSValue) * (b->var_count + b->regvm_reg_count + REGVM_HS) +
++    alloca_size = sizeof(JSValue) * (b->var_count + regvm_frame_regs(b) + REGVM_HS) +
+         sizeof(JSVarRef *) * b->var_ref_count +
+         sizeof(JSRegCtl) * b->regvm_ctl_count;
+     if (js_check_stack_overflow(rt, alloca_size)) {
+@@ -66794,12 +66897,12 @@
+     for (i = 0; i < b->var_count; i++)
+         var_buf[i] = JS_UNDEFINED;
+     stack_buf = var_buf + b->var_count;
+-    sf->var_refs = (JSVarRef **)(stack_buf + b->regvm_reg_count + REGVM_HS);
++    sf->var_refs = (JSVarRef **)(stack_buf + regvm_frame_regs(b) + REGVM_HS);
+     sf->var_ref_count = b->var_ref_count;
+     for (i = 0; i < b->var_ref_count; i++)
+         sf->var_refs[i] = NULL;
+     sf->cur_gc_obj = NULL;
+-    REGVM_SET_ROOT(sf, stack_buf, b->regvm_reg_count + REGVM_HS - 1);
++    REGVM_SET_ROOT(sf, stack_buf, regvm_frame_regs(b) + REGVM_HS - 1);
+     sp = stack_buf;
+     pc = b->byte_code_buf;
+     sf->cur_pc = NULL;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -22,14 +22,18 @@
+ #define QJS_AOT_STUB
+ #endif
+ 
+-/* QJS_DRC changes the ownership rule for a register store, so it is part of
+-   the ABI: a unit built with a different -DQJS_DRC is refused at bind. */
++/* QJS_DRC changes the ownership rule for a register store, and the NaN-boxing
++   choice changes the width and encoding of a JSValue, so both are part of the
++   ABI: a unit built with a different one is refused at bind. */
+ #ifndef QJS_DRC
+ #define QJS_DRC 1
+ #endif
++#ifndef QJS_NAN_BOXING64
++#define QJS_NAN_BOXING64 0
++#endif
+ 
+ #ifndef QJS_AOT_ABI
+-#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
++#define QJS_AOT_ABI (5u | ((uint32_t)QJS_DRC << 8) | ((uint32_t)QJS_NAN_BOXING64 << 9))
+ #endif
+ 
+ /* The engine's object layouts the generated code reads at constant offsets.
+@@ -302,6 +306,16 @@
+     JSAotNFn nfn;        /* the native entry, or NULL: a caller enters here without a frame */
+     uint32_t flags;
+     uint32_t code_crc;   /* IRVERIFY: hash of the register program */
++    /* The register file the unit compiled this body for: at least the program's
++       `regvm_reg_count`, and WIDER when the generator allocated registers above
++       the program's own (a virtual object's argument window, a hoisted global
++       read). Those registers hold counted values too, so a collector scanning
++       only `regvm_reg_count` would miss them. The count is published here rather
++       than by raising `regvm_reg_count`, because that field also POSITIONS
++       `var_refs` and the handshake slots in the interpreter's flat frame layout.
++       0 for a function emitted before this field existed: the engine then falls
++       back to the program's own count. */
++    uint32_t reg_count;
+ } JSAotEntry;
+ 
+ /* The unit's table and size, referenced weakly by the engine; qjs_aot_count
