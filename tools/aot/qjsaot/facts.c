@@ -2092,16 +2092,6 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
       case Q2_OP_GET_ARG:
       case Q2_OP_GET_ARG2:
       case Q2_OP_PUT_ARG:
-      /* A read of a closure cell: the copy's own activation has the same cell, and a
-         TDZ throw leaves the activation, which a copy handles like any other exit.
-         Without this a closure's method could never be copied into its caller --
-         deltablue and closure both call one per iteration through exactly this op. */
-      case Q2_OP_GET_VAR_REF:
-      /* A WRITE to a closure cell: it cannot run JS (a cell store has no setter and
-         the cell belongs to this activation's own closure), so it is a copy's local
-         effect like a field store. A copy that leaves after it is undone the same
-         way (see the put_field case above). */
-      case Q2_OP_PUT_VAR_REF:
         break;
       case Q2_OP_LOAD_THIS:
         if (!has_recv) ok = 0;
