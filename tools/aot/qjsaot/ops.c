@@ -5092,7 +5092,16 @@ static int emit_typed_length(
   fprintf(f, "        i%u = (int32_t)_len;\n", (unsigned)dv);
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, v%u);\n", rreg * 16, (unsigned)rv);
-  if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  /* A copied callee has no step engine behind it, so the miss cannot go through
+     the op-call wrapper. The hit path above needs only ctx, and `.length` on a
+     non-array is the only thing the wrapper would add: exit at this pc instead,
+     which the copy's own stub handles like any other miss. */
+  if (in->own > 0) {
+    e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+    fprintf(f, "        goto vx_%d;\n", in->pc);
+  } else {
+    if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
+  }
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;

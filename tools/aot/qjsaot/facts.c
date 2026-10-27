@@ -2027,6 +2027,7 @@ static int inl_extra_rop(uint16_t rop) {
     case ROP_strict_eq:
     case ROP_strict_neq:
     case ROP_unary:
+    case ROP_get_length:
       return 1;
     default:
       return 0;
@@ -2116,7 +2117,9 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
         if (in->rop != ROP_put_field || has_back_edge) ok = 0;
         break;
       case Q2_OP_GET_ELEMENT:
-        if (in->rop != ROP_get_element) ok = 0;
+        /* `length` off the receiver: the same shape of access as an element read,
+           and emit_typed_length gives a copy its own miss exit. */
+        if (in->rop != ROP_get_element && in->rop != ROP_get_length) ok = 0;
         break;
       case Q2_OP_CALL:
         /* a call a nested copy stands for (checked by the planner) */
