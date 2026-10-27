@@ -2665,7 +2665,17 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
       }
     }
     if (dbg) fprintf(stderr, "virt: web at pc %d: uses ok=%d\n", (int)ci->pc, ok);
-    /* no safepoint while a member is live: a register of a member is not live across one */
+    /* A safepoint while a member is live is allowed: the member's register is a
+       live TAG value, so `e_emit_presync` writes it into the frame before the
+       safepoint and the collector scans the frame over the generator's full
+       register count (the unit publishes that count, and the engine sizes and
+       scans the frame for it). The register would otherwise hold the only
+       reference to the object the member was read from, and a collection between
+       the construct and the last read would recycle it -- which is exactly the
+       case the sync and the wider scan exist for.
+       Not allowed in a copied callee: its registers live in the caller's frame
+       at a different base (`iv->rbase`), and the caller's pre-safepoint sync
+       walks the caller's own map, so it would not publish them. */
     for (j = 0; ok && j < nmem; j++) {
       int r = fn->values[memlist[j]].reg;
       if (r < 0 || r >= fn->nregs) continue;
@@ -2679,9 +2689,8 @@ int e_plan_virtual(const Q2Func *fn, Q2VWeb **webs_out, int *nwebs_out, Q2Rewrit
           if (dbg) {
             char nm[64];
             e_rop_name(si->rop, nm, sizeof(nm));
-            fprintf(stderr, "virt: web at pc %d: safepoint %s at pc %d own %d with reg %d live\n", (int)ci->pc, nm, (int)si->pc, (int)si->own, r);
+            fprintf(stderr, "virt: web at pc %d: ok: safepoint %s at pc %d own %d with reg %d live (synced)\n", (int)ci->pc, nm, (int)si->pc, (int)si->own, r);
           }
-          ok = 0;
         }
       }
     }

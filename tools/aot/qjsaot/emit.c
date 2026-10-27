@@ -81,11 +81,24 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
   int vc = g->light_var_count;
   int call_site = e_has_call_site(fn);
   int check = call_site || g->light_need > 16 * 1024;
-  int nregs = g->reg_count;
+  /* The register file this body was compiled for. It is `fn->nregs`, not
+     `g->reg_count`: the generator allocates registers ABOVE the program's own
+     (a virtual object's argument window and constructor slot, a copied callee's,
+     a hoisted load), and the body writes them. The engine sizes its own frame for
+     this function from the same published count, so the two agree. */
+  int nregs = qjs_aot_frame_regs(qjs_aot_cur_func_idx());
+  if (nregs < fn->nregs) nregs = fn->nregs;
   /* The variable area exists only when the promotion map leaves a slot in it,
      and the frame's layout follows: the engine sizes `fr` the same way. */
   int has_var = vc > 0;
-  int slots = (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
+  /* The frame covers the WIDER register file: `g->light_need` counts the
+     program's registers only, and the engine's frame for a bound function is
+     sized from the published count, so a smaller array here would be a store out
+     of bounds the moment a web or a hoist touches a high register. */
+  int need = g->light_need
+             + (int)sizeof(JSValue)
+                   * (nregs > g->reg_count ? nregs - g->reg_count : 0);
+  int slots = (need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
 
   e_report_entry(g, hex, 0, call_site, check);
 
@@ -93,7 +106,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
       f,
       "/* The native entry: the whole call is this C call. NEED = %d bytes,\n"
       "   %d slots, variable area %s (%d of %d slots), %d registers. */\n",
-      g->light_need, slots, has_var ? "present" : "absent", has_var ? vc : 0,
+      need, slots, has_var ? "present" : "absent", has_var ? vc : 0,
       g->var_count, nregs);
 
   fprintf(
@@ -235,8 +248,16 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
    body no more arguments than entering did. */
 void e_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
   const JSAotGenFunc *g = fn->g;
-  int nregs = g->reg_count;
-  int slots = (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
+  /* The wider register file, as the native entry uses: the generic body the exit
+     continues into reads and writes every register this body was compiled with. */
+  int nregs = qjs_aot_frame_regs(qjs_aot_cur_func_idx());
+  if (nregs < fn->nregs) nregs = fn->nregs;
+  int slots = g->light_need > 0 ? (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue) : 0;
+  int need = g->light_need
+             + (int)sizeof(JSValue)
+                   * (nregs > g->reg_count ? nregs - g->reg_count : 0);
+  if (need > slots * (int)sizeof(JSValue))
+    slots = (need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
   /* A function the engine does not call light has no frame size of its own; the
      exit builds the same frame (prefix, then the registers; no variable area, which
      frameless entry rules out). */
@@ -438,8 +459,12 @@ static int e_build_spec_fn(
   if (nex > 0 || nir > 0) {
     int st = 0;
     if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 && (st = 2) &&
-        q2_verify(&fn2, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn2))
+        q2_verify(&fn2, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn2)) {
       have2 = 1;
+      /* This IR is what the body is emitted from, and it has registers the
+         program does not: a copied callee's, a hoisted load's. */
+      qjs_aot_note_frame_regs(qjs_aot_cur_func_idx(), fn2.nregs);
+    }
     if (!have2) {
       if (getenv("QJS_AOT_DEBUG_LICM") != NULL)
         fprintf(stderr, "licm %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
@@ -457,8 +482,12 @@ static int e_build_spec_fn(
       Q2Func fn3;
       int st = 0, ok3 = 0;
       if (q2_build_ea(g, ex, nex, ir, nir, webs, nwebs, rws, nrws, &fn3) == 0 && (st = 1) && q2_infer(&fn3) == 0 &&
-          (st = 2) && q2_verify(&fn3, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn3))
+          (st = 2) && q2_verify(&fn3, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn3)) {
         ok3 = 1;
+        /* The web rewrite allocates the argument window and the constructor slot
+           ABOVE the program's registers, and this is the body that runs. */
+        qjs_aot_note_frame_regs(qjs_aot_cur_func_idx(), fn3.nregs);
+      }
       if (!ok3) {
         if (dbg) fprintf(stderr, "virt %s: stage %d failed: %s %s\n", g->name, st, fn3.why ? fn3.why : "-", msg);
         q2_free(&fn3);
@@ -537,6 +566,15 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     q2_free(&fn);
     return -1;
   }
+  /* The register file the EMITTED code can touch. The body that runs is the
+     speculative one (or the web-rewritten form of it), not `fn`: `fn` is the
+     program, and copied callees, hoisted loads and a virtual object's argument
+     window all allocate registers ABOVE the program's own. Every one of those can
+     hold a counted value that no exit writes into the frame, so the collector has
+     to scan them and the frame has to be that wide. `qjs_aot_note_frame_regs`
+     keeps the widest count it is told, and `e_build_spec_fn` reports the IR it
+     produces, so the published count covers whichever body ends up emitted. */
+  qjs_aot_note_frame_regs(qjs_aot_cur_func_idx(), fn.nregs);
 
   /* The generic body first: the speculative body forwards to it for everything
      it does not lower. */
