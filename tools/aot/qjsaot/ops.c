@@ -1525,6 +1525,18 @@ static int emit_native_branch_cmp(
       "        _c = q2_cmp_double(%d, JS_VALUE_GET_FLOAT64(_a), "
       "JS_VALUE_GET_FLOAT64(_b));\n",
       base);
+  /* Abstract equality of two OBJECTS is reference identity: the spec's
+     SameValueNonNumeric-style rule for a matching pair of Objects calls no user
+     code, so it can decide here like a numeric compare. Without this an
+     identity test such as `a != b` on two objects takes an op call forever,
+     which is what regvm_loose_eq_fast already avoids in the interpreter. */
+  if (base == REG_BIN_EQ || base == REG_BIN_NEQ) {
+    fprintf(f, "    } else if (JS_VALUE_GET_TAG(_a) == JS_TAG_OBJECT &&\n");
+    fprintf(f, "               JS_VALUE_GET_TAG(_b) == JS_TAG_OBJECT) {\n");
+    fprintf(f, "        _c = (JS_VALUE_GET_PTR(_a) == JS_VALUE_GET_PTR(_b))"
+               " == (%d == %d);\n",
+            base, (int)REG_BIN_EQ);
+  }
   fprintf(f, "    }\n");
   fprintf(f, "    if (__builtin_expect(_c >= 0, 1)) {\n");
   emit_site_hit(f, in);
