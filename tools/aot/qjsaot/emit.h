@@ -215,15 +215,5 @@ void e_report_spec(
 void qjs_aot_note_native_entry(int index);
 /* The unit index of the function being emitted. */
 int qjs_aot_cur_func_idx(void);
-/* Publish the register file a body was compiled for at unit index `i`. The
-   engine scans a light frame over this many JSValues and sizes the frame for it,
-   so it must cover every register the emitted code can write -- including the
-   ones this generator allocates ABOVE the program's own (a virtual object's
-   argument window, a hoisted global read). The wider count wins, so a body may
-   report more than once. */
-void qjs_aot_note_frame_regs(int index, int nregs);
-/* How many registers the unit compiled the function at unit index `i` for: the
-   program's own count until a body publishes a wider one. */
-int qjs_aot_frame_regs(int index);
 
 #endif /* QJSAOT_EMIT_H */

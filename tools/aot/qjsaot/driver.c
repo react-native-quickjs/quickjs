@@ -1898,27 +1898,9 @@ static uint8_t *g_inl_lvl;  /* the sweep that committed the inline form */
    light-eligible function gets one. Keyed by unit index. */
 static uint8_t *g_e_native;
 
-/* The register file each body was compiled for, keyed by unit index: the
-   widest register the emitted code can touch. It is published in the unit's
-   `qjs_aot_table`, because the engine scans and sizes a light frame from it --
-   the program's own `regvm_reg_count` does not cover the registers allocated
-   above it (a web's argument window, a hoisted load). */
-static int *g_e_frameregs;
-
 /* The emitter's hook, so the unit builder knows which bodies it produced. */
 void qjs_aot_note_native_entry(int index) {
   if (g_e_native && index >= 0) g_e_native[index] = 1;
-}
-
-void qjs_aot_note_frame_regs(int index, int nregs) {
-  if (g_e_frameregs == NULL || index < 0 || nregs <= 0) return;
-  if (nregs > g_e_frameregs[index]) g_e_frameregs[index] = nregs;
-}
-
-int qjs_aot_frame_regs(int index) {
-  if (index < 0) return 0;
-  if (g_e_frameregs != NULL && g_e_frameregs[index] > 0) return g_e_frameregs[index];
-  return index < g_unit_nfuncs ? g_unit_funcs[index].reg_count : 0;
 }
 
 /* The unit index of the function being emitted, for the hook above. */
@@ -2280,7 +2262,6 @@ int qjsaot_driver_main(int argc, char **argv) {
     qjs_aot_scan_init(ctx, funcs, nfuncs);
     g_unit_nfuncs = nfuncs;
     g_e_native = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
-    g_e_frameregs = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(int));
     /* The bodies are emitted into memory buffers before the output file is
      opened, so the linkage decision has to be made before that: a split unit
      gives every compiled function hidden external linkage so the parts can
@@ -5622,22 +5603,10 @@ int qjsaot_driver_main(int argc, char **argv) {
           for (k = 0; k < 16; k++)
             fprintf(f, "%s0x%02x", k ? ", " : "", funcs[i].digest[k]);
         }
-        /* The register file the body was compiled for. The engine scans a light
-           frame over this many JSValues and sizes the frame for it, because the
-           program's own `regvm_reg_count` does not cover the registers the
-           generator allocates above it. Clamped to at least the program's count,
-           so an unbound or never-widened function reports its own. */
-        {
-          int fr = qjs_aot_frame_regs(i);
-          if (fr < funcs[i].reg_count) fr = funcs[i].reg_count;
-          if (fr < 0) fr = 0;
-          if (qjs_aot_has_native_entry(i) && getenv("QJS_AOT_NONFN") == NULL)
-            fprintf(f, "}, aot_f_%s, aot_n_%s, 0u, 0x%08xu, %du },\n", hex, hex,
-                    funcs[i].code_crc, (unsigned)fr);
-          else
-            fprintf(f, "}, aot_f_%s, NULL, 0u, 0x%08xu, %du },\n", hex,
-                    funcs[i].code_crc, (unsigned)fr);
-        }
+        if (qjs_aot_has_native_entry(i) && getenv("QJS_AOT_NONFN") == NULL)
+          fprintf(f, "}, aot_f_%s, aot_n_%s, 0u, 0x%08xu },\n", hex, hex, funcs[i].code_crc);
+        else
+          fprintf(f, "}, aot_f_%s, NULL, 0u, 0x%08xu },\n", hex, funcs[i].code_crc);
       }
       fprintf(f, "};\n");
       /* Deopt site -> its function's index in the emitted table. A site whose
