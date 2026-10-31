@@ -1,0 +1,17 @@
+Subject: An object made in a class shape keeps all its slots inline: one allocation, not two
+
+What this does
+  - `qjs_aot_new_from_shape` asks for an inline capacity of the shape's property count (up to the learned maximum, 16). Before, an object of more than four fields got a second allocation for its slot array.
+
+Why we need it
+  The region compiler makes a class's objects itself (`qjs_aot_new_from_shape`); deltablue's constraint and variable objects have five to nine fields.
+
+Soundness
+  The same capacity path the engine's learned constructors use (`JS_NewObjectFromShapeCap` with a request); the free path already handles an inline block of any capacity.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66450 +66450,2 @@
+-    obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
++    /* the slots live in the object's own block whatever their number (up to the learned maximum): one allocation, not two */
++    obj = JS_NewObjectFromShapeCap(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL, sh->prop_count);

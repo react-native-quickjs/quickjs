@@ -1,0 +1,44 @@
+Subject: A compiled push that does not fit the array's capacity runs the builtin instead of leaving
+
+What this does
+  - `qjs_aot_array_push_slow(ctx, arr, v, out)` (exported to the units, declared in quickjs-aot-rt.h) pushes one value through `js_array_push`, the engine's own builtin, and returns the new length. If the builtin throws (out of memory)
+    it clears the exception and returns 0.
+  - The inline push of a compiled body (`q2_array_push1`, generated) calls it when the array has no spare capacity or its packed element kind has none, instead of leaving for the generic call.
+
+Why we need it
+  `new Array()` starts with capacity 0, so every first push (and every growth step) left the compiled body: in deltablue `OrderedCollection.add` left 56,730 times per unit and each exit repeated the call (about 250 instructions).
+  With the helper those pushes stay in compiled code: deltablue 782.0 -> 758.7 C.Minstr.
+
+Soundness
+  The helper is called only after the body checked what the inline push checks before it writes (`q2_array_plain`: standard array shape and prototype, extensible, length equals the count and is writable, the callee is the builtin `push`), so no JS runs. It allocates but cannot run
+  a collection (js_malloc does not). An out-of-memory exception is cleared and the body leaves before any effect, so the generic body repeats the call and throws it properly. The value pushed is counted by the builtin.
+
+Functions touched
+  `qjs_aot_array_push_slow` (new).
+
+No.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -227,0 +228,2 @@
++/* push of one value through the builtin on a plain array the body checked (the capacity miss of the inline push); 0 = it threw and nothing happened */
++QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65239,0 +65240,16 @@
++}
++
++/* The push of a compiled body that does not fit the array's capacity (or its packed element kind): the builtin itself, on a receiver the
++   body has already checked is a plain extensible array whose length is the count and whose prototype is the standard one, so no JS can
++   run. Returns 1 with the new length in *out; 0 when the push threw (an out-of-memory), after clearing the exception, so the body leaves
++   before any effect and its generic body repeats the call and throws it properly. */
++QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out)
++{
++    JSValue r = js_array_push(ctx, arr, 1, (JSValueConst *)&v, 0);
++
++    if (JS_IsException(r)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return 0;
++    }
++    *out = r;
++    return 1;

@@ -1,0 +1,23 @@
+Subject: The unit can tell the builtin Function.prototype.apply from a replaced one
+
+What this does
+  - `qjs_aot_intrinsic_fn(QJS_AOT_INTR_X_FUNC_APPLY)` returns the C function pointer of the builtin `Function.prototype.apply` (`js_function_apply`). The id sits at `QJS_AOT_INTR_COUNT`, outside the table a unit fills and outside the generator's inline-lowering table: it is not a builtin the unit lowers.
+
+Why we need it
+  A region that forwards `this.initialize.apply(this, arguments)` straight to `initialize` (the interpreter's OP_apply_arguments does the same when the callee's `apply` is the builtin, with no arguments object) has to prove that the `apply` it read is the builtin. The proof is a fact on the property plus this pointer comparison on the function object it holds.
+
+Soundness
+  Nothing on the run-time paths changes: the new case is only reached by a caller that asks for this id.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -95272,0 +95273 @@
++    case QJS_AOT_INTR_X_FUNC_APPLY: return (void *)js_function_apply;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -467 +467,4 @@
+-    QJS_AOT_INTR_STR_CODEPOINTAT, QJS_AOT_INTR_STR_CHARAT, QJS_AOT_INTR_COUNT
++    QJS_AOT_INTR_STR_CODEPOINTAT, QJS_AOT_INTR_STR_CHARAT, QJS_AOT_INTR_COUNT,
++    /* Not an inline-lowered builtin (no row in the generator's table, outside the unit's pointer table): `Function.prototype.apply`, whose pointer a region compares with to tell the
++       builtin from a replaced `apply`. */
++    QJS_AOT_INTR_X_FUNC_APPLY = QJS_AOT_INTR_COUNT

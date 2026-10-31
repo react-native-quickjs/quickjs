@@ -1,0 +1,52 @@
+Subject: The compiled constructor cache is keyed on shape_free_epoch too, and refuses an answer once the prototype watchpoint has saturated
+
+What this does
+  - `JSAotCtorCache` gains `sfe`, the value of `rt->shape_free_epoch` when the answer was filled. `qjs_aot_ctor_replayable`'s fast path and the generated twin of it (the vweb construct arm in ops.c) both compare it.
+  - `shape_free_epoch` moves from the tail of `JSRuntime` to next to `aot_pic_epoch`, and its offset is exported (`off_rt_shape_free_epoch`, `QJS_AOT_OFF_RT_SHAPE_FREE_EPOCH`) so a unit can read it. Where it was, its offset followed a block of optional fields and differed between the generator's engine build and the runtime's.
+  - `qjs_aot_ctor_replayable` returns 0 once `ic_watchpoint_epoch` has reached `JS_IC_EPOCH_MAX`.
+
+Why we need it
+  The cache remembers `ctor->shape` as a raw address and, on a hit, reads `ctor->prop[cc->slot]` against it. A shape that is freed and reallocated at the same address with different contents (the constructor
+  function object's own shape changing, its old shape freed, a new one allocated there) matched, and `slot` then indexed a shape it was not computed for. Nothing compared `shape_free_epoch`, which exists for exactly this.
+  Past saturation `ic_watchpoint_epoch` stops moving, so the cells' equality test against it can no longer detect a prototype interceptor; no cell is filled then (0421), but the answer is also refused here.
+
+Cost
+  One load and one branch on a hit. Measured with the compare in place: raytrace 1282.8 -> 1282.8 C.Minstr, deltablue 790.5 -> 790.5, so the frees that move the epoch do not reach the cache's steady state.
+  (If a kernel ever loses more than 1% here, compare against the counted `cb->ctor_fn_shape` in the slow path instead: a shape the bytecode holds a reference to cannot be recycled.)
+
+Soundness
+  Fill and hit see the same `shape_free_epoch` only if no shape was freed or edited in place in between (0420 moves it for in-place edits), so a recycled address is never taken for the shape recorded.
+  `.local/kit/cases/stub_sat.js` forces saturation (9000 interceptor events on prototypes) and checks that constructors and stores, cached before and first run after saturation, still honour a setter added afterwards.
+
+Functions touched
+  `qjs_aot_ctor_replayable`, `js_aot_gen_layout`, `JSRuntime` (field moved), `JSAotCtorCache`, `JSAotGenLayout`.
+
+No.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -202 +202 @@
+-    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json;
++    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json, off_rt_shape_free_epoch;
+@@ -523 +523 @@
+-    uint32_t slot, pic_epoch;
++    uint32_t slot, pic_epoch, sfe; /* aot_pic_epoch and shape_free_epoch when the answer was filled */
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -764,0 +765,3 @@
++    /* Bumped whenever a shape is freed or edited in place: an address-keyed cache validates against it. Kept here, with the
++       other epochs a compiled unit reads by offset, where its offset does not depend on the build's optional fields. */
++    uint32_t shape_free_epoch;
+@@ -857 +859,0 @@
+-    uint32_t shape_free_epoch;
+@@ -63096,0 +63099 @@
++    out->off_rt_shape_free_epoch = (uint32_t)offsetof(JSRuntime, shape_free_epoch);
+@@ -66077 +66080 @@
+-        cc->pic_epoch == rt->aot_pic_epoch)
++        cc->pic_epoch == rt->aot_pic_epoch && cc->sfe == rt->shape_free_epoch)
+@@ -66078,0 +66082,3 @@
++    /* Past saturation the watchpoint epoch can no longer say that an interceptor appeared (and no cell is filled then). */
++    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
++        return 0;
+@@ -66115,0 +66122 @@
++    cc->sfe = rt->shape_free_epoch;

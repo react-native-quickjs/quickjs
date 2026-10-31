@@ -1,0 +1,272 @@
+Subject: One facts_valid word per compiled region: 64-bit dependents on fact groups and layouts, METHOD / PROTO-IDENTITY / ABSENT helpers, one funnel for layout breaks
+
+What this does
+  - `qjs_aot_fact_depend64(g, word, mask)`: a bit of a uint64_t the caller owns depends on a fact group. `qjs_aot_layout_depend(ctx, layout, word, mask)`: a bit depends on a contracted layout (1..63). Neither arms the bit. `qjs_aot_facts_commit(ctx, word, mask)` sets the bits only when every dependent registered on them is VALID / unbroken, so a bit is the AND of its dependents (the 32-bit `qjs_aot_fact_depend` set its bit as soon as ONE group was valid, which is wrong for two groups sharing a bit; it is kept as it was). Any break clears the bits of its dependents; `qjs_aot_facts_undepend(ctx, word)` forgets a word; `JS_FreeRuntime` clears every bit it ever armed, since the words live in the unit's statics and outlive the runtime.
+  - Generated code tests `QJS_AOT_FACTS_OK(word, MASK)` (quickjs.h): one volatile 64-bit load and a compare.
+  - Layouts are folded in: every layout break already passes `js_aot_layout_break` (leaving the layout's shape, an instance becoming a prototype, a refused slot claim, a refused claim at bind); that function now also clears the layout's dependents, next to the old `aot_layout_broken` bit, which stays as the mirror that generated code and the claim tables read. There is no second place that decides a layout is broken.
+  - Group kinds the region compiler needs: METHOD `qjs_aot_fact_method(ctx, holder, atom, fn, digest)` (own data property `atom` of `holder` is `fn`, optionally with the bytecode digest of `fn` checked), PROTO-IDENTITY `qjs_aot_fact_proto_is(ctx, obj, proto)`, and ABSENT `qjs_aot_fact_absent(ctx, g, atom)` (no own property `atom`; adding it breaks the group; CLOSED counts present properties only). A method found two prototypes up is `absent(P, atom) + proto_is(P, Q) + method(Q, atom, fn)`.
+  - `qjs_aot_layouts_broken(rt)` reports the broken layout bits. `QJS_AOT_FACTS_OFF=layout` (kit knob builds) stops layout breaks from clearing facts_valid bits, for a negative control.
+
+Why we need it
+  The region compiler guards a whole fast body with one `facts_valid` word instead of a test per fact (AOT-REDESIGN.md section 4/5). Today a layout is tested through the runtime-wide `aot_layout_broken` word and a per-function `claimdeps` mask; groups are tested not at all. One word per region instance, fed by both, is the single thing generated code reads.
+
+Soundness
+  Breaks only clear bits, synchronously, at or before the mutation they report; nothing here blocks, allocates, frees or calls JS. A region must test the word at entry, after an interrupt-poll slow path that ran a handler, and after any call with unknown effects (a call, a getter/setter/Proxy trap, a native method, a release that can run a host finalizer, a host callback), because a break can clear a bit inside any of them; it must not cache the word across such a point. A bit that a group makes invalid before `qjs_aot_facts_commit` is never armed. `qjs_aot_fact_depend64` of a group that is not VALID clears the bit. The eval scan still breaks more groups than the mutators do (any code that stores a listed atom, even to another object).
+
+Functions touched
+  `js_aot_layout_break`, `js_aot_fact_matches`, `js_aot_fact_set_deps`, `js_aot_facts_free`, `js_aot_facts_off_mask`, `struct JSAotFactDep` / `JSAotFacts`, and new: `qjs_aot_fact_depend64`, `qjs_aot_layout_depend`, `qjs_aot_facts_commit`, `qjs_aot_facts_undepend`, `qjs_aot_layouts_broken`, `qjs_aot_fact_absent`, `qjs_aot_fact_method`, `qjs_aot_fact_proto_is`, `js_aot_layout_facts_break`.
+
+No.
+
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1802,0 +1803,30 @@ JS_EXTERN uint32_t qjs_aot_facts_breaks(JSRuntime *rt);
++/* ---- the facts_valid word (AOT-FACTS-WORD.md) ------------------------------------------------------------------------------
++   A compiled region owns ONE uint64_t `word` (a static of the unit, one per region instance). Each bit of it stands for "these facts
++   hold": a bit is made a dependent of any number of groups (`qjs_aot_fact_depend64`) and of layouts (`qjs_aot_layout_depend`), is armed
++   only by `qjs_aot_facts_commit` (which refuses unless every dependent is VALID / unbroken, so a bit is the AND of its dependents),
++   and is CLEARED, never set, by any break of any dependent. Generated code tests `QJS_AOT_FACTS_OK(word, MASK)` (one load, one compare)
++   at region entry, after the interrupt-poll slow path that ran a handler, and after every call with unknown effects, and leaves the
++   fast body when it is false. A break only clears bits, synchronously, on the mutating thread; it never blocks, allocates or calls JS.
++   The word must outlive its dependents: `qjs_aot_facts_undepend` before the storage goes away (the runtime clears every word it knows
++   when it is freed). The word is plain memory: read it volatile, never cache it across a call. */
++#define QJS_AOT_FACTS_OK(word_, mask_) ((*(volatile const uint64_t *)(word_) & (uint64_t)(mask_)) == (uint64_t)(mask_))
++JS_EXTERN void qjs_aot_fact_depend64(JSAotFact *g, uint64_t *word, uint64_t mask);
++/* layout kind: bit `mask` of `word` depends on contracted layout `layout_id` (1..63) staying unbroken: no add, delete, attribute change
++   or prototype change on an instance, no instance turning into a prototype, no slot claim refused. 1: dependent registered; 0: the layout
++   is already broken (the bits are cleared); -1: bad id or out of memory. */
++JS_EXTERN int qjs_aot_layout_depend(JSContext *ctx, uint32_t layout_id, uint64_t *word, uint64_t mask);
++/* Arm the bits of `mask`: 1 and the bits are set when every dependent registered on them (groups and layouts) is VALID / unbroken, else
++   0 and no bit of `mask` is set. Call it again after a rebuild; it is cheap but not free (it scans the dependents). */
++JS_EXTERN int qjs_aot_facts_commit(JSContext *ctx, uint64_t *word, uint64_t mask);
++/* Forget every dependent registered on `word` (all its bits); the word is left as it is. */
++JS_EXTERN void qjs_aot_facts_undepend(JSContext *ctx, uint64_t *word);
++/* The broken layouts (bit k-1: layout k), the same data generated code reads through the runtime. */
++JS_EXTERN uint64_t qjs_aot_layouts_broken(JSRuntime *rt);
++/* METHOD kind: a group on `holder` whose own data property `atom` is the function `fn`, created VALID, or NULL when the property is
++   absent, an accessor, another value, `fn` is not callable, or `digest` (16 bytes, may be NULL) is not the digest of the bytecode of `fn`. */
++JS_EXTERN JSAotFact *qjs_aot_fact_method(JSContext *ctx, JSValueConst holder, JSAtom atom, JSValueConst fn, const uint8_t *digest);
++/* PROTO-IDENTITY kind: a group on `obj` whose [[prototype]] stays `proto` (an object, or null), created VALID, or NULL if it is not now. */
++JS_EXTERN JSAotFact *qjs_aot_fact_proto_is(JSContext *ctx, JSValueConst obj, JSValueConst proto);
++/* ABSENT: while PENDING, the object must have no own property `atom` (adding it breaks the group). With the lookup of a method found
++   further up the chain this is how a read through P to a method on Q is stated: absent(P, atom) + proto_is(P, Q) + method(Q, atom, fn). */
++JS_EXTERN int qjs_aot_fact_absent(JSContext *ctx, JSAotFact *g, JSAtom atom);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2981,0 +2982 @@ static void js_aot_facts_free(JSRuntime *rt);
++static void js_aot_layout_facts_break(JSRuntime *rt, uint32_t layout_id);
+@@ -16609,0 +16611 @@ static void js_aot_layout_break(JSRuntime *rt, uint32_t layout_id)
++    js_aot_layout_facts_break(rt, layout_id);
+@@ -16794 +16796,3 @@ static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
+-struct JSAotFactDep { uint32_t *word; uint32_t mask; };
++/* A dependent: a word and a mask in the caller's statics, 32 bits wide (`wide` 0, the first API) or 64 (`wide` 1, the facts_valid word). */
++struct JSAotFactDep { void *word; uint64_t mask; uint8_t wide; };
++struct JSAotLayoutDep { uint32_t layout; uint64_t *word; uint64_t mask; };
+@@ -16811,0 +16816,2 @@ typedef struct JSAotFacts {
++    struct JSAotLayoutDep *ld;      /* the facts_valid bits that depend on a layout */
++    int nld, ldcap;
+@@ -16830,0 +16837 @@ static uint32_t js_aot_facts_off_mask(void)
++            if (strstr(s, "layout")) m |= 1u << 6;
+@@ -16869 +16876 @@ static bool js_aot_fact_matches(const JSAotFact *g)
+-    int i;
++    int i, nabs = 0;
+@@ -16879,0 +16887,6 @@ static bool js_aot_fact_matches(const JSAotFact *g)
++        if (JS_VALUE_GET_TAG(g->props[i].val) == JS_TAG_UNINITIALIZED) {   /* ABSENT */
++            if (prs != NULL)
++                return false;
++            nabs++;
++            continue;
++        }
+@@ -16884 +16897 @@ static bool js_aot_fact_matches(const JSAotFact *g)
+-        p->shape->prop_count - p->shape->deleted_prop_count != g->nprops)
++        p->shape->prop_count - p->shape->deleted_prop_count != g->nprops - nabs)
+@@ -16893,4 +16906,9 @@ static void js_aot_fact_set_deps(JSAotFact *g, int on)
+-        if (on)
+-            *g->dep[i].word |= g->dep[i].mask;
+-        else
+-            *g->dep[i].word &= ~g->dep[i].mask;
++        /* The 64-bit dependents are armed by qjs_aot_facts_commit (a bit is the AND of its dependents), never here; a break clears them. */
++        if (g->dep[i].wide) {
++            if (!on)
++                *(uint64_t *)g->dep[i].word &= ~g->dep[i].mask;
++        } else if (on) {
++            *(uint32_t *)g->dep[i].word |= (uint32_t)g->dep[i].mask;
++        } else {
++            *(uint32_t *)g->dep[i].word &= ~(uint32_t)g->dep[i].mask;
++        }
+@@ -16983 +17001,10 @@ static void js_aot_facts_free(JSRuntime *rt)
+-    for (i = 0; i < F->n; i++)
++    /* The words belong to the unit and outlive the runtime: no bit may stay set for the next runtime that binds it. */
++    for (i = 0; i < F->nld; i++)
++        *F->ld[i].word &= ~F->ld[i].mask;
++    for (i = 0; i < F->n; i++) {
++        int j;
++        for (j = 0; j < F->g[i]->ndep; j++)
++            if (F->g[i]->dep[j].wide)
++                *(uint64_t *)F->g[i]->dep[j].word &= ~F->g[i]->dep[j].mask;
++            else
++                *(uint32_t *)F->g[i]->dep[j].word &= ~(uint32_t)F->g[i]->dep[j].mask;
+@@ -16984,0 +17012,2 @@ static void js_aot_facts_free(JSRuntime *rt)
++    }
++    js_free_rt(rt, F->ld);
+@@ -17131,0 +17161 @@ void qjs_aot_fact_depend(JSAotFact *g, uint32_t *word, uint32_t mask)
++    g->dep[g->ndep].wide = 0;
+@@ -17136,0 +17167,158 @@ void qjs_aot_fact_depend(JSAotFact *g, uint32_t *word, uint32_t mask)
++/* The facts_valid word: register, never arm. A bit already armed by another group stays honest: it is cleared if this group is not VALID. */
++void qjs_aot_fact_depend64(JSAotFact *g, uint64_t *word, uint64_t mask)
++{
++    if (g->ndep == g->depcap) {
++        int ncap = g->depcap ? g->depcap * 2 : 4;
++        struct JSAotFactDep *nd = js_realloc_rt(g->rt, g->dep, sizeof(g->dep[0]) * (size_t)ncap);
++        if (nd == NULL) {
++            *word &= ~mask;     /* cannot register: the bit must never read as valid */
++            return;
++        }
++        g->dep = nd;
++        g->depcap = ncap;
++    }
++    g->dep[g->ndep].word = word;
++    g->dep[g->ndep].mask = mask;
++    g->dep[g->ndep].wide = 1;
++    g->ndep++;
++    if (g->state != QJS_AOT_FACT_VALID)
++        *word &= ~mask;
++}
++
++int qjs_aot_layout_depend(JSContext *ctx, uint32_t layout_id, uint64_t *word, uint64_t mask)
++{
++    JSRuntime *rt = ctx->rt;
++    JSAotFacts *F;
++    if (layout_id == 0 || layout_id > 63)
++        return -1;
++    if (rt->aot_facts == NULL) {
++        rt->aot_facts = js_mallocz_rt(rt, sizeof(JSAotFacts));
++        if (rt->aot_facts == NULL) {
++            *word &= ~mask;
++            return -1;
++        }
++    }
++    F = rt->aot_facts;
++    if (F->nld == F->ldcap) {
++        int ncap = F->ldcap ? F->ldcap * 2 : 16;
++        struct JSAotLayoutDep *nl = js_realloc_rt(rt, F->ld, sizeof(F->ld[0]) * (size_t)ncap);
++        if (nl == NULL) {
++            *word &= ~mask;
++            return -1;
++        }
++        F->ld = nl;
++        F->ldcap = ncap;
++    }
++    F->ld[F->nld].layout = layout_id;
++    F->ld[F->nld].word = word;
++    F->ld[F->nld].mask = mask;
++    F->nld++;
++    if ((rt->aot_layout_broken >> (layout_id - 1)) & 1) {
++        *word &= ~mask;
++        return 0;
++    }
++    return 1;
++}
++
++/* The single funnel of layout breaks (js_aot_layout_break) lands here: the bits that depend on the layout are cleared. */
++static void js_aot_layout_facts_break(JSRuntime *rt, uint32_t layout_id)
++{
++    JSAotFacts *F = rt->aot_facts;
++    int i;
++    if (F == NULL || (js_aot_facts_off_mask() & (1u << 6)))
++        return;
++    for (i = 0; i < F->nld; i++)
++        if (F->ld[i].layout == layout_id)
++            *F->ld[i].word &= ~F->ld[i].mask;
++}
++
++int qjs_aot_facts_commit(JSContext *ctx, uint64_t *word, uint64_t mask)
++{
++    JSRuntime *rt = ctx->rt;
++    JSAotFacts *F = rt->aot_facts;
++    int i, j;
++    if (F != NULL) {
++        for (i = 0; i < F->nld; i++)
++            if (F->ld[i].word == word && (F->ld[i].mask & mask) && ((rt->aot_layout_broken >> (F->ld[i].layout - 1)) & 1))
++                return 0;
++        for (i = 0; i < F->n; i++) {
++            JSAotFact *g = F->g[i];
++            for (j = 0; j < g->ndep; j++)
++                if (g->dep[j].wide && g->dep[j].word == word && (g->dep[j].mask & mask) && g->state != QJS_AOT_FACT_VALID)
++                    return 0;
++        }
++    }
++    *word |= mask;
++    return 1;
++}
++
++void qjs_aot_facts_undepend(JSContext *ctx, uint64_t *word)
++{
++    JSAotFacts *F = ctx->rt->aot_facts;
++    int i, j, k;
++    if (F == NULL)
++        return;
++    for (i = 0, k = 0; i < F->nld; i++)
++        if (F->ld[i].word != word)
++            F->ld[k++] = F->ld[i];
++    F->nld = k;
++    for (i = 0; i < F->n; i++) {
++        JSAotFact *g = F->g[i];
++        for (j = 0, k = 0; j < g->ndep; j++)
++            if (!(g->dep[j].wide && g->dep[j].word == word))
++                g->dep[k++] = g->dep[j];
++        g->ndep = k;
++    }
++}
++
++uint64_t qjs_aot_layouts_broken(JSRuntime *rt)
++{
++    return rt->aot_layout_broken;
++}
++
++int qjs_aot_fact_absent(JSContext *ctx, JSAotFact *g, JSAtom atom)
++{
++    return qjs_aot_fact_expect(ctx, g, atom, JS_UNINITIALIZED);
++}
++
++JSAotFact *qjs_aot_fact_method(JSContext *ctx, JSValueConst holder, JSAtom atom, JSValueConst fn, const uint8_t *digest)
++{
++    JSAotFact *g;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    if (JS_VALUE_GET_TAG(holder) != JS_TAG_OBJECT || !JS_IsFunction(ctx, fn))
++        return NULL;
++    if (digest != NULL) {
++#if QJS_AOT
++        uint8_t d[16];
++        if (!qjs_aot_function_digest((JSValue)fn, d) || memcmp(d, digest, 16) != 0)
++            return NULL;
++#else
++        return NULL;
++#endif
++    }
++    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(holder), atom);
++    if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !js_aot_fact_same(pr->u.value, fn))
++        return NULL;
++    g = qjs_aot_fact_new(ctx, holder, JS_UNDEFINED, 0, &atom, 1);
++    if (g == NULL)
++        return NULL;
++    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
++        qjs_aot_fact_break(ctx, g);
++        return NULL;
++    }
++    return g;
++}
++
++JSAotFact *qjs_aot_fact_proto_is(JSContext *ctx, JSValueConst obj, JSValueConst proto)
++{
++    JSAotFact *g = qjs_aot_fact_new(ctx, obj, proto, QJS_AOT_FACT_PROTO, NULL, 0);
++    if (g == NULL)
++        return NULL;
++    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
++        qjs_aot_fact_break(ctx, g);
++        return NULL;
++    }
++    return g;
++}
++

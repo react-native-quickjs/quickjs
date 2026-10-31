@@ -1,0 +1,38 @@
+Subject: Extending or editing a hashed shape in place retires what the address-keyed caches recorded about it
+
+What this does
+  - `js_shape_prepare_update`'s in-place branch (a hashed shape with a single referrer is unhashed and then edited: a delete, a flag change, a conversion to an accessor) and
+    `add_property`'s in-place append (a hashed single-referrer shape that has no matching transition gets one more property appended) move `rt->shape_free_epoch` before they edit.
+
+Why we need it
+  The global stub cache (the megamorphic read cache) records (receiver shape pointer, atom, holder, offset) and validates an entry by the shape pointer and `shape_free_epoch`. An in-place edit
+  changes what the shape says without changing its address and without moving the epoch, so the entry stayed valid for a shape it no longer described:
+      var P = {p: 'proto'}; var T = Object.create(P); /* a read site made megamorphic and warmed on T */  T.p = 'own';  /* appends in place */   rd(T) -> 'proto'   (spec: 'own')
+      delete T.p with a deeper prototype that has p                                                         rd(T) -> undefined (spec: the deeper value)
+      delete P.p, T reading through P                                                                       rd(T) -> undefined (spec: the deeper value)
+  Reproduced on the interpreter alone (no AOT) with and without patch 0419: .local/kit/cases/stub_append.js, stub_delete.js, stub_protodel.js print `BAD ...` lines; node prints none.
+  After this patch all five stub_*.js tests (those three, stub_define.js and stub_addw.js) print no BAD line.
+  The same move retires the raw-pointer caches of the compiled code that already compare `shape_free_epoch` (the wrapper cache of 0418).
+
+Soundness
+  A hashed shape is edited in place only when its reference count is 1 and the edit is one of the two paths above; every other mutation clones (js_shape_prepare_update with a count above 1, add_property's clone branch)
+  or allocates a new shape. In steady state the two paths are rare (0 per unit in raytrace and deltablue; creating the first object of a new shape shape once), so the extra moves cost nothing measurable.
+  Unhashed shapes are not cached by address: every fill of a cache that names a shape by address hashes the shape first (`regvm_shape_hashify`).
+
+Functions touched
+  `js_shape_prepare_update`, `add_property`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -14807,0 +14808,4 @@
++    /* A hashed shape that no other object or cache references and for which no transition exists is extended in place: the
++       same address now names a shape with one more property. See js_shape_prepare_update. */
++    if (p->shape->is_hashed)
++        ctx->rt->shape_free_epoch++;
+@@ -16816,0 +16821,4 @@
++            /* The shape is about to be edited where it stands, at the same address. Every cache that names a shape by its
++               address (the global stub cache, the compiled code's statics) validates with shape_free_epoch, so this move
++               retires what they recorded about it. */
++            ctx->rt->shape_free_epoch++;

@@ -1,0 +1,147 @@
+Subject: The unit binds a class once: its shape from the prototype and the field list, objects made in it, globals read without code
+
+What this does
+  - `qjs_aot_class_shape(ctx, proto, atoms, n)`: the hashed shape an object with prototype `proto` reaches by adding the fields in order (a counted reference). Every transition looks a hashed shape up first and the reference keeps it in the table, so the engine's own constructs of the class end on the same address. The walk's private object is exempt from slot-claim checks (`js_aot_shape_scratch`): its undefined placeholders are no evidence against a claim.
+  - `qjs_aot_new_from_shape(ctx, shape)`: a new ordinary object of that shape, fields undefined; `qjs_aot_object_filled(ctx, obj)` runs the slot-claim check of a contracted layout once the caller has written the fields.
+  - `qjs_aot_ctor_prepare(ctx, fn)`: the engine's once-per-constructor work before a first construct (the unit's layout chain), for a region that makes the class's objects itself.
+  - `qjs_aot_global_get(ctx, atom, &v)`: a global binding's value without running code (a lexical binding first, then an own data property of the global object), borrowed; 0 for an accessor, a missing binding or one in its dead zone.
+
+Why we need it
+  The region compiler (TRUST) binds every proven class at its init instead of learning shapes from receivers at run time: dispatch is a compare with the class shapes, a construct makes the object in its final shape and fills fixed slots, a receiver that is a global (`planner`) is loaded from its binding.
+
+Soundness
+  No JS runs in any of them. The class shape is an ordinary hashed shape; an object made in it is indistinguishable from one the engine built field by field (the region checks the claims at the end). A global read leaves the compiled code for anything but a plain data binding.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -17384,0 +17385,4 @@
++/* The private object qjs_aot_class_shape walks a class's shape chain with: its fields are undefined
++   placeholders, not values of the class, so its adds are no evidence against a slot claim. */
++static JSObject *js_aot_shape_scratch;
++
+@@ -17389,0 +17394,2 @@
++    if (unlikely(p == js_aot_shape_scratch))
++        return;
+@@ -66384,0 +66391,62 @@
++}
++
++/* A class's instance shape, from the bundle's field list: the hashed shape an object whose prototype is `proto` reaches by adding
++   `atoms[0..n)` in that order as ordinary data properties (what `this.x = v` adds in a constructor). A counted reference
++   (qjs_aot_shape_release), or NULL. Every transition looks a hashed shape up before it makes one, and this reference keeps the final
++   shape in the table, so the engine's own constructs of the class end on this same address. Runs no JS. */
++QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint32_t *atoms, int n)
++{
++    JSValue obj;
++    JSObject *p;
++    JSShape *sh;
++    int i;
++
++    if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT || n < 0)
++        return NULL;
++    obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);
++    if (JS_IsException(obj)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return NULL;
++    }
++    p = JS_VALUE_GET_OBJ(obj);
++    js_aot_shape_scratch = p;
++    for (i = 0; i < n; i++) {
++        JSProperty *pr;
++        if (find_own_property1(p, (JSAtom)atoms[i]) != NULL)
++            goto fail;
++        pr = add_property(ctx, p, (JSAtom)atoms[i], JS_PROP_C_W_E);
++        if (pr == NULL) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++            goto fail;
++        }
++        pr->u.value = JS_UNDEFINED;
++    }
++    js_aot_shape_scratch = NULL;
++    sh = p->shape;
++    if (!sh->is_hashed)
++        goto fail;
++    sh = js_dup_shape(sh);
++    JS_FreeValue(ctx, obj);
++    return sh;
++ fail:
++    js_aot_shape_scratch = NULL;
++    JS_FreeValue(ctx, obj);
++    return NULL;
++}
++
++/* A new ordinary object of a class shape (qjs_aot_class_shape), every field undefined. The caller writes the fields and then calls
++   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would. */
++QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
++{
++    JSShape *sh = (JSShape *)shape;
++    JSValue obj;
++    JSObject *p;
++    int i;
++
++    obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
++    if (JS_IsException(obj))
++        return obj;
++    p = JS_VALUE_GET_OBJ(obj);
++    for (i = 0; i < sh->prop_count; i++)
++        p->prop[i].u.value = JS_UNDEFINED;
++    return obj;
+@@ -66386,0 +66455,48 @@
++/* What the engine's construct path does once per constructor before its first construct (the unit's layout chain for it, built against
++   its `prototype` as it is now): a compiled region that makes the class's objects itself runs it at its init instead. */
++QJS_AOT_STUB void qjs_aot_ctor_prepare(JSContext *ctx, JSValue fn)
++{
++    JSObject *p;
++    JSFunctionBytecode *fb;
++
++    if (JS_VALUE_GET_TAG(fn) != JS_TAG_OBJECT)
++        return;
++    p = JS_VALUE_GET_OBJ(fn);
++    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
++        return;
++    fb = p->u.func.function_bytecode;
++    if (unlikely(JS_AOT_LAYOUT_CTOR(fb)))
++        js_aot_layout_fn_hook(ctx, fn);
++}
++
++QJS_AOT_STUB void qjs_aot_object_filled(JSContext *ctx, JSValue obj)
++{
++    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
++        js_aot_content_filled(ctx->rt, JS_VALUE_GET_OBJ(obj));
++}
++
++/* The value of the global binding `atom` without running code: a lexical binding (let/const/class at the top level) first, then an
++   own data property of the global object (var, function). 1 with a BORROWED value (the binding owns it), 0 when the binding is not
++   there, is an accessor, or is still in its temporal dead zone (the caller leaves its compiled code). */
++QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out)
++{
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    JSObject *p;
++
++    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
++    prs = find_own_property(&pr, p, (JSAtom)atom);
++    if (prs == NULL) {
++        p = JS_VALUE_GET_OBJ(ctx->global_obj);
++        prs = find_own_property(&pr, p, (JSAtom)atom);
++        if (prs == NULL)
++            return 0;
++    }
++    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return 0;
++    if (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
++        return 0;
++    *out = pr->u.value;
++    return 1;
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -237,0 +238,8 @@
++/* A class's instance shape from its prototype and field list (held), a new object of it (fields undefined), the slot-claim check once the
++   fields are written, and a global binding's value without running code (borrowed). */
++QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint32_t *atoms, int n);
++QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape);
++QJS_AOT_STUB void qjs_aot_object_filled(JSContext *ctx, JSValue obj);
++/* the engine's once-per-constructor work before a first construct (the unit's layout chain), for a region that constructs the class itself */
++QJS_AOT_STUB void qjs_aot_ctor_prepare(JSContext *ctx, JSValue fn);
++QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out);

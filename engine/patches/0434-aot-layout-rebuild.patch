@@ -1,0 +1,98 @@
+Subject: A constructor's layout chain is built at its first construct, and the layout breaks when `prototype` changes
+
+What this does
+  - The chain of a contracted constructor layout was built when the function object was created. For `function F(){}; F.prototype = new Base();` the assignment follows, so the chain stood on the default prototype and no instance ever reached it. It is now built from `js_create_from_ctor_cap`, the engine's single construct entry (interpreter, register VM, light constructs, `qjs_aot_construct_this`), on the first construct of a function whose bytecode still has `aot_layout_ctor` set: `F.prototype` is read after any ES5 assignment and before the construct reads it. `js_closure` no longer calls the hook; a class (`js_op_define_class`, `prototype` is not writable) still builds at definition.
+  - The mark `aot_layout_ctor` is dropped after that one attempt (built or refused), so a later construct costs nothing; every function without a layout pays only the byte it never loaded before inside a branch the construct already takes.
+  - New `qjs_aot_layout_watch_proto(ctx, fn, layout_id)`, called by the unit after a successful build: a fact group on `fn` listing its own `prototype` data property (the value the chain was built on). A store of a different value, a delete, a redefinition, `defineProperty`, freeze etc. reach the group through the existing lowest-level mutator events, and the group's break now calls `js_aot_layout_break` for its layout (new `JSAotFact.layout`), which clears the facts word and moves the epoch. Storing the same object again is not a change.
+  - `JSAotFacts.fresh_pending` counts FRESH groups still PENDING; the construct event of `js_create_from_ctor_cap` is only raised while it is non-zero, so a watched constructor does not scan every group on each construct.
+
+Why we need it
+  Deltablue-style classes (`Scale.prototype = new Inheriter()`) kept 11 layouts in the generator but every instance shape had layout id 0: the chain was built for the replaced prototype.
+
+Soundness
+  - A layout is built only when the first instance is about to be made, so no instance of the old chain exists. After the build the identity of `F.prototype` is part of the layout's fact: any change breaks it for good (no re-pointing). Instances already made keep their shape; the broken layout sends compiled code to the generic body.
+  - Shapes come from `qjs_aot_layout_build` (hash-consed `add_property` transitions of an object whose prototype is the built-on object), so they are the shapes the engine itself reaches for an instance of that prototype.
+  - Only the final shape of the chain carries the layout id (leaving a layout shape breaks the layout, so intermediate shapes cannot).
+  - The watched function becomes a prototype in the engine's cache sense (interpreter add/store caches stay off it), as every fact-group object does.
+
+Functions touched
+  `js_create_from_ctor_cap`, `js_closure`, `js_aot_layout_fn_hook`, `js_aot_fact_break_now`, `qjs_aot_fact_new`, `qjs_aot_fact_validate`, new `qjs_aot_layout_watch_proto`; `JSAotFact`, `JSAotFacts`; `quickjs-aot-rt.h` (declaration).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -16806,0 +16807 @@
++    uint32_t layout;        /* a constructor-layout watch: the layout this group's break breaks (0: none) */
+@@ -16815,0 +16817 @@
++    uint32_t fresh_pending; /* FRESH groups still PENDING: only they care about a construct */
+@@ -16922,0 +16925,2 @@
++    if (g->state == QJS_AOT_FACT_PENDING && (g->flags & QJS_AOT_FACT_FRESH))
++        F->fresh_pending--;
+@@ -16925,0 +16930,3 @@
++    /* a constructor-layout watch: the layout was built on this `prototype` value */
++    if (g->layout != 0)
++        js_aot_layout_break(g->rt, g->layout);
+@@ -17058,0 +17066,2 @@
++    if (flags & QJS_AOT_FACT_FRESH)
++        F->fresh_pending++;
+@@ -17137,0 +17147,2 @@
++        if (g->flags & QJS_AOT_FACT_FRESH)
++            g->rt->aot_facts->fresh_pending--;
+@@ -25040,6 +25051,3 @@
+-    bool ctor = JS_AOT_LAYOUT_CTOR((JSFunctionBytecode *)JS_VALUE_GET_PTR(bfunc));
+-    JSValue fn = js_closure_impl(ctx, bfunc, cur_var_refs, sf);
+-
+-    if (unlikely(ctor) && !JS_IsException(fn))
+-        js_aot_layout_fn_hook(ctx, fn);
+-    return fn;
++    /* A layout's chain is no longer built here: `F.prototype = X` usually follows the
++       closure. See js_create_from_ctor_cap. */
++    return js_closure_impl(ctx, bfunc, cur_var_refs, sf);
+@@ -44341 +44349 @@
+-    if (unlikely(ctx->rt->aot_facts != NULL) && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(ctor)->gv_watched)
++    if (unlikely(ctx->rt->aot_facts != NULL) && ctx->rt->aot_facts->fresh_pending != 0 && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(ctor)->gv_watched)
+@@ -44358,0 +44367,6 @@
++                /* The first construct of a function whose bytecode has a layout still to build: the
++                   chain is built against `ctor.prototype` as it is NOW, after any ES5-style
++                   `F.prototype = X`, and before this construct reads it. One byte of fb, already
++                   loaded; clear for every other function and, once tried, for this one. */
++                if (unlikely(JS_AOT_LAYOUT_CTOR(fb)))
++                    js_aot_layout_fn_hook(ctx, ctor);
+@@ -66411,4 +66425,30 @@
+-    /* Once the unit has nothing left to build for this digest the mark is
+-       dropped, so later closures of the same function skip the hash. */
+-    if (&qjs_aot_layout_ctor != NULL && !qjs_aot_layout_ctor(dg))
+-        b->aot_layout_ctor = 0;
++    /* One attempt per bytecode: the layout is built (or refused) from the first
++       constructor object that constructs, so the mark is dropped whatever the
++       answer and every later construct skips the hash. */
++    b->aot_layout_ctor = 0;
++}
++
++/* The unit built layout `layout_id` on `proto`, which is `fn`'s own `prototype` right now.
++   Watch that property: a store, a redefinition or a delete of it, by any path, breaks the
++   layout (a fact group on `fn` listing `prototype`, whose break calls js_aot_layout_break).
++   Costs nothing on the construct path of any other function, and for a watched one the
++   construct event is only looked at while a FRESH group is pending. Returns 0, with the
++   layout already broken, when the watch cannot be made. */
++QJS_AOT_STUB int qjs_aot_layout_watch_proto(JSContext *ctx, JSValueConst fn, uint32_t layout_id)
++{
++    JSAtom atoms[1];
++    JSAotFact *g;
++
++    atoms[0] = JS_ATOM_prototype;
++    g = qjs_aot_fact_new(ctx, fn, JS_UNDEFINED, 0, atoms, 1);
++    if (g == NULL) {
++        if (layout_id != 0 && layout_id <= 63)
++            js_aot_layout_break(ctx->rt, layout_id);
++        return 0;
++    }
++    g->layout = layout_id;
++    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
++        js_aot_fact_break_now(ctx->rt->aot_facts, g);
++        return 0;
++    }
++    return 1;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -362,0 +363 @@
++QJS_AOT_STUB int qjs_aot_layout_watch_proto(JSContext *ctx, JSValueConst fn, uint32_t layout_id);

@@ -1,0 +1,60 @@
+Subject: An add-transition store is cached only when it was a plain add, and not once the prototype watchpoint has saturated
+
+What this does
+  - `ic_store_is_plain_add(pre_sh, atom)` (fill time only) answers whether a store of `atom` into an object of shape `pre_sh` can only have been a plain add: no object on the
+    prototype chain is exotic or has a property of that name. Both add-transition fills use it: the register store cache (`regvm_put_pic_fill`) and the stack interpreter's
+    (`OP_put_field` ... `ic_add_transition_update`).
+  - The register store cache also refuses to fill an add-transition once `ic_watchpoint_epoch` has saturated (`JS_IC_EPOCH_MAX`), as the stack interpreter's fill already did: past
+    that point the epoch can no longer tell that an interceptor appeared on a prototype, and a cell filled then would be valid forever.
+
+Why we need it
+  A store `o.x = v` whose prototype has a setter for `x` that itself defines the own property `x` ends with the property added; the fill saw "one more property" and cached
+  "pre shape + add x -> shape", and every later store replayed the append and skipped the setter. Reproduced on the interpreter alone: .local/kit/cases/stub_addw2.js
+  (a setter that counts its calls and defines the property) printed `BAD setter ran 1 times, expected 5000`; node and this patch run it 5000 times.
+  Read-only and setter properties of that name on the chain that do NOT end with an own property never filled (the fill requires the property to exist afterwards); stub_addw.js
+  keeps that pinned.
+
+Soundness
+  The check runs at fill time and walks the prototype chain of the pre-add shape (a handful of objects). A chain that is plain at fill time stays plain while the epoch is unchanged: any
+  property added to a prototype, any define, any delete and any prototype change moves `ic_watchpoint_epoch`, which the replay compares. So the cached add is exactly what the engine's store did.
+  The saturation gate only removes fills.
+
+Functions touched
+  `ic_store_is_plain_add` (new), `regvm_put_pic_fill`, `OP_put_field` slow path in the stack interpreter.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8989,0 +8990,21 @@
++/* Whether a store of `atom` into an object of shape `pre_sh` can only have been a plain add: no object on its prototype chain
++   is exotic or has a property of that name that changes what the store does (a setter or a read-only property; a writable data
++   property is shadowed by the store's own add and does not count). A store that ends with the property added by other means (a setter that defines it itself) must not be cached
++   as "append this property", because the replay would skip the setter. Used at fill time only. */
++static bool ic_store_is_plain_add(JSShape *pre_sh, JSAtom atom)
++{
++    JSObject *po;
++    JSProperty *ppr;
++    JSShapeProperty *prs;
++
++    for (po = pre_sh->proto; po != NULL; po = po->shape->proto) {
++        if (po->is_exotic)
++            return false;
++        prs = find_own_property(&ppr, po, atom);
++        /* A writable data property on a prototype is shadowed by the store, which adds an own property: the plain add. */
++        if (prs != NULL && ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE)))
++            return false;
++    }
++    return true;
++}
++
+@@ -26532 +26553,4 @@
+-        if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
++        /* Saturated: the epoch can no longer say that a prototype changed. The store is replayed as "append this property"
++           only when it was a plain add (see ic_store_is_plain_add). */
++        int plain_add = rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX && ic_store_is_plain_add(pre_sh, atom);
++        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+@@ -42180 +42204,2 @@
+-                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
++                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE &&
++                                ic_store_is_plain_add(pre_sh, atom))

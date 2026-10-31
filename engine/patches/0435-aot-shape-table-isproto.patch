@@ -1,0 +1,30 @@
+Subject: The shape table marks a shape some of whose objects are prototypes
+
+What this does
+  - `aot_dump_shapes` first walks the collector's objects once and marks every observed shape that has a live object with `is_prototype` set; the `Q` line of such a shape carries `isproto=1`.
+  - The generator drops such a shape from the layout candidates.
+
+Why we need it
+  A class's own prototype object (`Sub.prototype`, which gains its methods by assignment) was taken as an instance layout of its parent class: the unit stamped it with a layout id, every method assignment then walked the layout's chain, and an object that is a prototype breaks the layout anyway. On deltablue the two such layouts cost 5 Minstr in the per-site backend (581.2 -> 586.2).
+
+Soundness
+  Profiling build only. It reads the object list at the dump, runs no JS and allocates nothing. A shape wrongly marked loses only a layout.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65313,0 +65314,12 @@
++    /* A shape some live object of which is a prototype (a class's own prototype object, which gains its methods by
++       assignment) is never a layout: bit 1 of aot_prof_seen, printed as `isproto=1`. */
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *po;
++
++        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        po = (JSObject *)gp;
++        if (po->is_prototype && po->shape->aot_prof_seen)
++            po->shape->aot_prof_seen |= 2;
++    }
+@@ -65374,0 +65387,2 @@
++        if (sh->aot_prof_seen & 2)
++            fprintf(f, " isproto=1");

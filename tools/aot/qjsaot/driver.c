@@ -124,7 +124,9 @@ static int hex_to_bytes16(const char *s, uint8_t out[16]) {
 #define PT_ARITH (PT_FLOAT | PT_INT)
 
 #include "emit.h"
+#include "fast.h"
 #include "prof.h"
+#include "select.h"
 
 typedef struct {
   int pc;
@@ -208,6 +210,9 @@ typedef struct {
   int id;
   int proto;              /* see above */
   char digest[33];        /* proto == 1 */
+  int isproto;            /* some object of this shape is a prototype (patch 0435): never a layout */
+  unsigned long long pk;  /* the prototype's stable key (patch 0449): equal across processes for the same prototype by construction; 0 = none recorded */
+  int via_scan;           /* the constructor was found by scanning for the function whose prototype this is (patch 0433): a class with no own `constructor` */
   int nfields;
   int nprops;             /* the shape's property count, deleted slots included */
   char *field[PROF_MAX_FIELDS];  /* the atom, by name */
@@ -242,6 +247,7 @@ typedef struct {
 typedef struct {
   uint8_t digest[16];
   unsigned long long ops;
+  unsigned long long entries; /* calls of the function in the profile run (exact) */
   ProfLoop *loops;
   int nloops, caploops;
   ProfReg *regs;
@@ -304,6 +310,10 @@ static int g_cur_func_idx = 0;
    profiled callee is emitted in this same translation unit. */
 static const JSAotGenFunc *g_unit_funcs = NULL;
 static int g_unit_nfuncs = 0;
+/* region roots and the functions they expanded (region.c reports each when its region compiles) */
+static struct { uint8_t root[16], callee[16]; } *g_rgdep;
+static int g_rgdep_n, g_rgdep_cap;
+void qjs_aot_region_dep(const char root_hex[33], const char callee_hex[33]);
 /* Deopt-everywhere: every operation the unit does not lower leaves compiled
    code at its own instruction. Sweeping every entry exercises every frame state
    against the interpreter. */
@@ -324,6 +334,7 @@ static const char *g_ir_path = NULL;
 
 /* --report FILE writes one line per function, and a summary. */
 static const char *g_report_path = NULL;
+static const char *g_facts_path = NULL;
 
 static void dump_ir_func(FILE *f, const JSAotGenFunc *g) {
   char hex[33];
@@ -569,6 +580,11 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         memset(sh, 0, sizeof(*sh));
         sh->id = id;
         {
+          const char *kp = strstr(line + 2, " pk=");
+          const char *pp3 = strstr(line + 2, " props=");
+          if (kp != NULL && (pp3 == NULL || kp < pp3)) sh->pk = strtoull(kp + 4, NULL, 16);
+        }
+        {
           const char *np = strstr(line + 2, " n=");
           sh->nprops = np != NULL ? (int)strtol(np + 3, NULL, 10) : -1;
         }
@@ -577,10 +593,16 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           for (k = 0; k < 32 && pr[3 + k] != '\0' && pr[3 + k] != ' '; k++)
             sh->digest[k] = pr[3 + k];
           sh->digest[k] = '\0';
+          sh->via_scan = strncmp(pr + 3 + k, " via=scan", 9) == 0;
         } else if (strncmp(pr, "object", 6) == 0) sh->proto = 2;
         else if (strncmp(pr, "array", 5) == 0) sh->proto = 3;
         else if (strncmp(pr, "null", 4) == 0) sh->proto = 4;
         else sh->proto = 0;
+        {
+          const char *ip = strstr(line + 2, " isproto=1");
+          const char *pp2 = strstr(line + 2, " props=");
+          sh->isproto = ip != NULL && (pp2 == NULL || ip < pp2);
+        }
         {
           char *pf = strstr(line + 2, " props=");
           if (pf != NULL) {
@@ -612,7 +634,9 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
     if (!e) return NULL;
     if (line[0] == 'F') {
       char *p = strstr(line + 2, "ops=");
+      char *pe = strstr(line + 2, "entries=");
       if (p) e->ops += strtoull(p + 4, NULL, 10);
+      if (pe) e->entries += strtoull(pe + 8, NULL, 10);
     } else if (line[0] == 'L') {
       char *p = strstr(line + 2, "pc=");
       if (p) {
@@ -646,6 +670,14 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         if (!strncmp(cl + 7, "bc:", 3)) {
           kind = 1;
           if (hex_to_bytes16(cl + 10, dg) == 0) {
+            int z;
+            for (z = 0; z < 16; z++) sprintf(cd + z * 2, "%02x", dg[z]);
+            cd[32] = 0;
+          }
+        } else if (!strncmp(cl + 7, "thru:", 5)) {
+          /* `X.call(...)`: X is the callee of kind 4 (see the profile writer) */
+          kind = 4;
+          if (hex_to_bytes16(cl + 12, dg) == 0) {
             int z;
             for (z = 0; z < 16; z++) sprintf(cd + z * 2, "%02x", dg[z]);
             cd[32] = 0;
@@ -685,7 +717,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           memset(&e->calls[k], 0, sizeof(e->calls[k]));
           e->calls[k].pc = pc;
         }
-        if (hits >= e->calls[k].hits) {
+        if (hits >= e->calls[k].hits && kind != 4) {
           e->calls[k].hits = hits;
           e->calls[k].kind = kind;
           e->calls[k].cproto = cproto;
@@ -1251,6 +1283,24 @@ const ProfReg *qjs_aot_prof_regs(const uint8_t dg[16], int *n) {
    execution count, or 0 when the profile has no sample there. The profiler
    charges one tick per 1024 dispatches, so the count is the sample count
    scaled back up; it is an estimate and is reported as one. */
+unsigned long long qjs_aot_prof_entries(const uint8_t dg[16]) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  return e ? e->entries : 0;
+}
+
+/* The calls a call site made in the profile run (exact: the sum over its callees), 0 for a site that never ran. */
+unsigned long long qjs_aot_prof_site_calls(const uint8_t dg[16], int next_pc) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  unsigned long long t = 0;
+  int i, k;
+  if (!e) return 0;
+  for (i = 0; i < e->ncallsites; i++) {
+    if (e->callsites[i].pc != next_pc) continue;
+    for (k = 0; k < e->callsites[i].n && k < PROF_MAX_CALLEES; k++) t += e->callsites[i].c[k].hits;
+  }
+  return t;
+}
+
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc) {
   const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
   int lo, hi;
@@ -1308,6 +1358,26 @@ int qjs_aot_prof_site(
   return 0;
 }
 
+/* E0 (QJS_AOT_REGION_MEASURE): print the property sites of one function whose profile saw shapes: the count (4 = the profile's per-site cap, so "4 or more") and each shape's ordered fields. */
+static const ProfShape *prof_shape_by_id(int id);
+void qjs_aot_prof_site_dump(const uint8_t dg[16], const char *tag) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k, f;
+  if (!e) return;
+  for (i = 0; i < e->nsites; i++) {
+    const ProfSite *ps = &e->sites[i];
+    if (ps->nshapes < 2) continue;
+    fprintf(stderr, "measure: %s site %d saw %d shapes:", tag, ps->site, ps->nshapes);
+    for (k = 0; k < ps->nshapes; k++) {
+      const ProfShape *sh = prof_shape_by_id((int)ps->shape[k]);
+      fprintf(stderr, " [");
+      if (sh) for (f = 0; f < sh->nfields; f++) fprintf(stderr, "%s%s", f ? "," : "", sh->field[f] ? sh->field[f] : "?");
+      fprintf(stderr, "]");
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
 /* The slot each observed shape put this site's atom in, -1 when the profile did
    not record one. Two shapes with the same slot give a contracted site one
    constant offset, which is what lets a polymorphic site read a single slot. */
@@ -1348,6 +1418,29 @@ typedef struct ELayoutInfo {
 /* Gather the candidate layouts from the profile's shape table, dropping the ones
    the unit could not rebuild and the ones a longer layout shadows. Returns the
    number kept, in `out` (at most E_LAYOUT_MAX), and reports the refusals. */
+void region_dry_collect(const Q2Func *root, const char hex[33], int fi);
+int region_needs_ctor(const char *name);
+int region_needs_digest(const char *hex);
+int region_class_path(char (*names)[40], int nn, char *out, size_t cap);
+static int g_rg_dry_done;
+/* Region mode's extra layouts (classes seen at polymorphic sites, constructors found by a scan): with the dry pass done, only for a class a region
+   binds (its constructor's digest is that of a function named as a region's class constructor). */
+static int e_region_wants_layout(const ProfShape *sh) {
+  int i, h;
+  char hx[33];
+  if (qjsaot_region_mode() == 0 || getenv("QJS_AOT_REGION_NOLAYOUTX") != NULL) return 0;
+  if (!g_rg_dry_done) return 1;
+  if (sh->proto != 1 || g_unit_funcs == NULL) return 0;
+  if (region_needs_digest(sh->digest)) return 1;
+  for (i = 0; i < g_unit_nfuncs; i++) {
+    const JSAotGenFunc *g = &g_unit_funcs[i];
+    if (!g->name[0] || !region_needs_ctor(g->name)) continue;
+    for (h = 0; h < 16; h++) snprintf(hx + 2 * h, 3, "%02x", g->digest[h]);
+    if (strcmp(hx, sh->digest) == 0) return 1;
+  }
+  return 0;
+}
+
 int e_layouts_collect(ELayoutInfo *out, int cap) {
   int i, j, n = 0, nproto = 0, nprefix = 0, nempty = 0;
   if (g_prof == NULL || g_shapes == NULL) return 0;
@@ -1366,10 +1459,27 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
           used = 1;
           break;
         }
+        /* a class the region compiler dispatches on is seen by polymorphic sites too: its layout is what the facts word depends on */
+        if (getenv("QJS_AOT_LAYOUT_ALL") != NULL || e_region_wants_layout(sh)) {
+          int q;
+          for (q = 0; q < ps->nshapes && q < PROF_MAX_SHAPES; q++)
+            if (ps->shape[q] == (uint64_t)sh->id) used = 1;
+          if (used) break;
+        }
       }
     }
     if (!used) continue;
     if (sh->proto != 1 && sh->proto != 2) {
+      nproto++;
+      continue;
+    }
+    /* Such a layout serves the region compiler (the facts word depends on it); the per-site backend pays for a contracted layout in claim and store
+       checks, so without the region compiler these classes keep the shape-guarded code they had (AOT-REDESIGN.md, MSG 80) */
+    if (sh->isproto) {
+      nproto++;
+      continue;
+    }
+    if (sh->via_scan && !e_region_wants_layout(sh) && getenv("QJS_AOT_PLAIN_VIA_SCAN") == NULL) {
       nproto++;
       continue;
     }
@@ -1403,6 +1513,8 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
         b = prof_shape_by_id(out[j].shape_id);
         if (a == NULL || b == NULL) continue;
         if (a->proto != b->proto) continue;
+        /* the same prototype: for a constructor-named one, the same constructor */
+        if (a->proto == 1 && strcmp(a->digest, b->digest) != 0) continue;
         if (b->nfields <= a->nfields) continue;
         for (f = 0; f < a->nfields; f++)
           if (a->field[f] == NULL || b->field[f] == NULL ||
@@ -1426,6 +1538,26 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
     n = kept;
     free(drop);
   }
+  if (getenv("QJS_AOT_LAYOUT_SKIP") != NULL) {
+    /* a bisecting knob: drop the layouts whose profile shape ids are listed (comma separated) */
+    const char *sk = getenv("QJS_AOT_LAYOUT_SKIP");
+    int kept2 = 0;
+    for (i = 0; i < n; i++) {
+      char key[16];
+      const char *q;
+      snprintf(key, sizeof(key), ",%d,", out[i].shape_id);
+      {
+        char hay[512];
+        snprintf(hay, sizeof(hay), ",%s,", sk);
+        q = strstr(hay, key);
+      }
+      if (q == NULL) out[kept2++] = out[i];
+    }
+    n = kept2;
+  }
+  if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL) {
+    for (i = 0; i < n; i++) fprintf(stderr, "layout kept: shape %d nfields %d\n", out[i].shape_id, out[i].nfields);
+  }
   if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
     fprintf(stderr, "layout census: kept=%d proto-refused=%d prefix-refused=%d empty=%d\n",
             n, nproto, nprefix, nempty);
@@ -1440,6 +1572,133 @@ int e_layouts_collect(ELayoutInfo *out, int cap) {
    candidate list plus one). */
 static int g_slot_refused;
 int qjs_aot_layout_slot_refusals(void) { return g_slot_refused; }
+/* Whether the unit will carry a contracted layout for a class with these ordered fields (the region's init fails at run time for a class it has no layout for, and the whole run then pays the
+   generic body): checked at generation. Any kept layout with a function prototype and exactly this field list. */
+/* Whether the profiled shapes with exactly this ordered field list belong to a digest shared by another class (see region_layout_for): independent of which layouts the unit ends up carrying, so the dry
+   pass can use it to avoid asking for layouts a region would never be allowed to use. */
+int region_class_ambiguous(char (*names)[40], int nn) {
+  int i, m, f;
+  if (getenv("QJS_AOT_REGION_NOAMBIG") != NULL) return 0;
+  /* Rows of one digest are built per class, against the closure the class's constant path names; what a row cannot tell apart is two profiled shapes of the same digest with the SAME ordered fields
+     (two prototypes, one field list). Without a path (the region compiler knows no single ctor for the list) the digest's classes are ambiguous too. */
+  {
+    char p_[64];
+    int has_path = region_class_path(names, nn, p_, sizeof(p_));
+    int shared = 0;
+    for (i = 0; i < g_nshapes; i++) {
+      const ProfShape *sh = &g_shapes[i];
+      if (sh->proto != 1 || sh->nfields != nn) continue;
+      for (f = 0; f < nn && sh->field[f] != NULL && strcmp(sh->field[f], names[f]) == 0; f++) {}
+      if (f != nn) continue;
+      for (m = 0; m < g_nshapes; m++) {
+        const ProfShape *o = &g_shapes[m];
+        int k, same = 1;
+        if (o->proto != 1 || o->nfields <= 0 || strcmp(o->digest, sh->digest) != 0 || o->id == sh->id) continue;
+        {
+          int n2 = o->nfields < nn ? o->nfields : nn;
+          for (k = 0; k < n2; k++) if (o->field[k] == NULL || strcmp(o->field[k], names[k]) != 0) same = 0;
+          if (!same) shared = 1;   /* a prefix or extension is the same class at another stage */
+        }
+      }
+    }
+    if (shared && !has_path) return 1;
+  }
+  return 0;
+}
+
+/* The profile's shapes of one class (see QjsAotClassShapes in fast.h). Candidates: shapes of the constructor's digest that no object uses as a prototype, with no deleted slot,
+   whose first `nbase` fields are the base list and whose further fields are all among the names added late. Keyed by (prototype key, ordered field list). Shapes of more than one
+   prototype key are ambiguous (the init cannot tell which prototype F.prototype will be): the table keeps only the base and says so. */
+static int ms_cmp(const void *a, const void *b) {
+  const ProfShape *x = *(const ProfShape *const *)a, *y = *(const ProfShape *const *)b;
+  int k;
+  if (x->nfields != y->nfields) return x->nfields < y->nfields ? -1 : 1;
+  for (k = 0; k < x->nfields; k++) {
+    int c = strcmp(x->field[k], y->field[k]);
+    if (c != 0) return c;
+  }
+  return 0;
+}
+int qjs_aot_mshape_on(void) {
+  const char *e = getenv("QJS_AOT_REGION_MSHAPE");
+  return e != NULL && e[0] != '\0' && strcmp(e, "0") != 0;
+}
+int qjs_aot_prof_class_shapes(const char *hex, char (*base)[40], int nbase, char (*late)[40], int nlate, QjsAotClassShapes *out) {
+  const ProfShape *cand[64];
+  int nc = 0, i, k, j, nuniq = 0, seen_digest = 0;
+  unsigned long long pk = 0;
+  memset(out, 0, sizeof(*out));
+  out->n = 1;
+  out->nn[0] = nbase;
+  for (k = 0; k < nbase; k++) snprintf(out->names[0][k], 40, "%s", base[k]);
+  out->parent[0] = -1;
+  if (g_shapes == NULL || hex == NULL) { out->status = QJS_AOT_MS_NOPROF; return 0; }
+  for (i = 0; i < g_nshapes; i++) {
+    const ProfShape *sh = &g_shapes[i];
+    int ok = 1, dup = 0;
+    if (sh->proto != 1 || strcmp(sh->digest, hex) != 0 || sh->isproto) continue;
+    seen_digest = 1;
+    if (sh->nfields < nbase || sh->nprops != sh->nfields) continue;
+    for (k = 0; k < sh->nfields && ok; k++) {
+      if (sh->field[k] == NULL) { ok = 0; break; }
+      if (k < nbase) { if (strcmp(sh->field[k], base[k]) != 0) ok = 0; }
+      else {
+        for (j = 0; j < nlate && strcmp(late[j], sh->field[k]) != 0; j++) {}
+        if (j == nlate) ok = 0;
+      }
+    }
+    if (!ok) continue;
+    /* the base-length shape carries no class information (every class of the digest with this first field passes through it): only a shape that EXTENDS the base, by names this
+       class is known to add late, says which prototype is meant */
+    if (sh->nfields == nbase) continue;
+    if (nuniq == 0) pk = sh->pk;
+    else if (sh->pk != pk && getenv("QJS_AOT_REGION_MSHAPE_NOPK") == NULL) { out->status = QJS_AOT_MS_AMBIG; out->pk = pk; return 0; }
+    nuniq++;
+    for (j = 0; j < nc && !dup; j++) if (ms_cmp(&cand[j], &sh) == 0) dup = 1;
+    if (dup) continue;
+    if (nc >= 64) { out->status = QJS_AOT_MS_CAP; return 0; }
+    cand[nc++] = sh;
+  }
+  out->pk = pk;
+  if (!seen_digest) { out->status = QJS_AOT_MS_NOPROF; return 0; }
+  qsort(cand, (size_t)nc, sizeof(cand[0]), ms_cmp);
+  {
+    const char *ce = getenv("QJS_AOT_REGION_MSHAPE_CAP");
+    int cap = ce != NULL ? atoi(ce) : 4;
+    if (cap < 2) cap = 4;
+    if (cap > QJS_AOT_MAXSHAPES) cap = QJS_AOT_MAXSHAPES;
+    if (nc > cap - 1) { out->status = QJS_AOT_MS_CAP; out->n = 1; return 0; }
+  }
+  for (i = 0; i < nc; i++) {
+    const ProfShape *sh = cand[i];
+    int t = out->n++;
+    out->nn[t] = sh->nfields;
+    for (k = 0; k < sh->nfields; k++) snprintf(out->names[t][k], 40, "%s", sh->field[k]);
+    out->parent[t] = -1;
+    for (j = 0; j < t; j++) {
+      if (out->nn[j] != sh->nfields - 1) continue;
+      for (k = 0; k < out->nn[j] && strcmp(out->names[j][k], sh->field[k]) == 0; k++) {}
+      if (k == out->nn[j]) { out->parent[t] = j; snprintf(out->add[t], 40, "%s", sh->field[sh->nfields - 1]); break; }
+    }
+  }
+  return out->n;
+}
+int region_layout_for(char (*names)[40], int nn) {
+  static ELayoutInfo tab[E_LAYOUT_MAX];
+  static int ntab = -1;
+  int l, f;
+  if (ntab < 0) ntab = e_layouts_collect(tab, E_LAYOUT_MAX);
+  if (region_class_ambiguous(names, nn)) return 0;
+  for (l = 0; l < ntab; l++) {
+    const ProfShape *sh;
+    if (tab[l].proto != 1 || tab[l].nfields != nn) continue;
+    sh = prof_shape_by_id(tab[l].shape_id);
+    if (sh == NULL) continue;
+    for (f = 0; f < nn && sh->field[f] != NULL && strcmp(sh->field[f], names[f]) == 0; f++) {}
+    if (f == nn) return 1;
+  }
+  return 0;
+}
 int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot) {
   static ELayoutInfo tab[E_LAYOUT_MAX];
   static int ntab = -1;
@@ -1708,6 +1967,13 @@ int qjs_aot_prof_site_read_hits(const uint8_t dg[16], int site) {
 
 /* Whether the profiler never executed the instruction at `pc` (a `U` record).
    Such a block is emitted as an exit in a specialised body. */
+/* Copies of a callee's never-run branches (cold copies) are OFF by default: their resume exits lose registers the generic continuation reads (an open old-backend defect, see
+   vcases/o-cc-1level.js and o-coldcopy.js), which runs wrong or aborts the generator. QJS_AOT_COLDCOPY=1 turns them back on, for the investigation. */
+int qjs_aot_coldcopy_off(void) {
+  static int off = -1;
+  if (off < 0) off = !(getenv("QJS_AOT_COLDCOPY") != NULL && getenv("QJS_AOT_NOCOLDCOPY") == NULL);
+  return off;
+}
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc) {
   const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
   int i;
@@ -1859,6 +2125,66 @@ int qjs_aot_unit_argc(const char hex[33]) {
   return -1;
 }
 
+/* Whether the unit function with this digest is a constructor wrapper: `function () { this.X.apply(this, arguments); }`,
+   recognised by its register program, not by names. The program is compared instruction by instruction with the one
+   the compiler makes for it, operands included except the atoms and the cache sites. On a match `*init_off` and
+   `*apply_off` are the byte offsets, in that function's own program, of the atom operands of the two reads (`this.X` and
+   `.apply`): atoms are runtime values, so the generated code hands the offsets to the engine, which loads the atoms
+   from the callee's live code, requires the second to be `apply` and reads the first. */
+_Static_assert(ROP_local_uninit == 22 && ROP_load_this == 9 && ROP_get_local_field_0 == 145 && ROP_get_field2 == 39 &&
+                   ROP_move_s == 217 && ROP_move_xfer == 141 && ROP_apply_arguments == 79 && ROP_return_undefined == 68,
+               "the wrapper reference program names its opcodes by number");
+int qjs_aot_wrapper_shape(const char hex[33], int *init_off, int *apply_off) {
+  /* op, then the register operands in order (byte offsets) or -1 for an operand that is not compared */
+  static const struct { int op; int n; int64_t v[3]; } ref[10] = {
+      {22, 1, {1}},            /* local_uninit u:1 (the `this` slot) */
+      {9, 1, {0}},             /* load_this r0 */
+      {153, 1, {0}},           /* store r0 into the slot */
+      {145, 1, {16}},          /* r1 = slot0.X (atom, site not compared) */
+      {39, 2, {32, 16}},       /* r2 = r1.apply (atom, site not compared) */
+      {217, 2, {48, 16}},      /* r3 = r1 */
+      {141, 2, {64, 32}},      /* r4 = r2 */
+      {217, 2, {80, 0}},       /* r5 = this */
+      {79, 3, {48, 16, 1}},    /* apply_arguments window r3, dest r1, arguments slot 1 */
+      {68, 0, {0}},            /* return_undefined */
+  };
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return 0;
+  for (i = 0; i < g_unit_nfuncs; i++)
+    if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) {
+      const JSAotGenFunc *g = &g_unit_funcs[i];
+      int off = 0, n = 0, a, ia = -1, aa = -1;
+      JSAotGenInsn in;
+      if (g->eligible != AOT_GEN_ELIGIBLE || g->arg_count != 0 || g->len > 128) return 0;
+      while (off < g->len) {
+        if (n >= 10 || js_aot_gen_decode_insn(g->code, g->len, off, &in) < 0 || in.op != ref[n].op) return 0;
+        {
+          int ri = 0;
+          for (a = 0; a < in.nargs; a++) {
+            if (in.arg[a].kind == 'a') {
+              if (n == 3) ia = in.arg[a].off;
+              if (n == 4) aa = in.arg[a].off;
+              continue;
+            }
+            if (in.arg[a].kind == 's') continue;
+            if (ri >= ref[n].n || in.arg[a].val != ref[n].v[ri]) return 0;
+            ri++;
+          }
+          if (ri != ref[n].n) return 0;
+        }
+        off += in.size;
+        n++;
+      }
+      if (n != 10 || ia < 0 || aa < 0) return 0;
+      *init_off = ia;
+      *apply_off = aa;
+      return 1;
+    }
+  return 0;
+}
+
 int qjs_aot_unit_has(const char hex[33]) {
   uint8_t dg[16];
   int i;
@@ -1908,6 +2234,45 @@ static int *g_e_frameregs;
 /* The emitter's hook, so the unit builder knows which bodies it produced. */
 void qjs_aot_note_native_entry(int index) {
   if (g_e_native && index >= 0) g_e_native[index] = 1;
+}
+
+/* A compiled caller that leaves a copy of this function in the middle asks for the function's resume entry
+   (aot_rx_HEX, emitted with the function's body). Returns 0 when the function is not in the unit. */
+static uint8_t *g_rx_need;
+void qjs_aot_region_dep(const char root_hex[33], const char callee_hex[33]) {
+  uint8_t a[16], b[16];
+  int i;
+  if (hex_to_bytes16(root_hex, a) < 0 || hex_to_bytes16(callee_hex, b) < 0) return;
+  for (i = 0; i < g_rgdep_n; i++)
+    if (memcmp(g_rgdep[i].root, a, 16) == 0 && memcmp(g_rgdep[i].callee, b, 16) == 0) return;
+  if (g_rgdep_n >= g_rgdep_cap) {
+    g_rgdep_cap = g_rgdep_cap ? g_rgdep_cap * 2 : 64;
+    g_rgdep = realloc(g_rgdep, (size_t)g_rgdep_cap * sizeof(*g_rgdep));
+    if (g_rgdep == NULL) abort();
+  }
+  memcpy(g_rgdep[g_rgdep_n].root, a, 16);
+  memcpy(g_rgdep[g_rgdep_n].callee, b, 16);
+  g_rgdep_n++;
+}
+
+int qjs_aot_rx_request(const char hex[33]) {
+  uint8_t dg[16];
+  int i;
+
+  if (!g_unit_funcs || hex_to_bytes16(hex, dg) < 0) return 0;
+  if (g_rx_need == NULL) g_rx_need = calloc((size_t)(g_unit_nfuncs > 0 ? g_unit_nfuncs : 1), 1);
+  if (g_rx_need == NULL) return 0;
+  /* every function of this digest: byte-identical functions share one, and the one the unit emits need not be the first listed (QJS_AOT_DUPRX_BUG=1 restores the old first-only mark, for the vkit knock) */
+  {
+    int found = 0;
+    for (i = 0; i < g_unit_nfuncs; i++)
+      if (memcmp(g_unit_funcs[i].digest, dg, 16) == 0) {
+        g_rx_need[i] = 1;
+        found = 1;
+        if (getenv("QJS_AOT_DUPRX_BUG") != NULL) return 1;
+      }
+    return found;
+  }
 }
 
 void qjs_aot_note_frame_regs(int index, int nregs) {
@@ -2124,6 +2489,8 @@ int qjsaot_driver_main(int argc, char **argv) {
       split_dir = argv[++i];
     } else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
       g_report_path = argv[++i];
+    } else if (strcmp(argv[i], "--facts") == 0 && i + 1 < argc) {
+      g_facts_path = argv[++i];
     } else if (strcmp(argv[i], "--dump-ir") == 0) {
       g_dump_ir = 1;
     } else if (strcmp(argv[i], "--dump-ir-out") == 0 && i + 1 < argc) {
@@ -2237,6 +2604,26 @@ int qjsaot_driver_main(int argc, char **argv) {
     g_nprof = nprof;
     /* Decide the contracted layouts here, before any helper or body is emitted,
        so the entry check and the layout table come from one decision. */
+    if (qjsaot_region_mode() == 2 && getenv("QJS_AOT_REGION_NOLAYOUTDRY") == NULL) {
+      /* the classes the regions would bind, so that region mode makes layouts for those only (a dry first walk of every region) */
+      int di_;
+      g_unit_funcs = funcs;
+      g_unit_nfuncs = nfuncs;
+      qjs_aot_scan_init(ctx, funcs, nfuncs);
+      qjs_aot_bundle_init(ctx, funcs, nfuncs);
+      sel_prepare(funcs, nfuncs, NULL);
+      for (di_ = 0; di_ < nfuncs; di_++) {
+        Q2Func dfn_;
+        char dhex_[33];
+        int h_;
+        if (!funcs[di_].light_ok) continue;
+        if (q2_build(&funcs[di_], &dfn_) < 0 || q2_infer(&dfn_) < 0) { q2_free(&dfn_); continue; }
+        for (h_ = 0; h_ < 16; h_++) snprintf(dhex_ + 2 * h_, 3, "%02x", funcs[di_].digest[h_]);
+        region_dry_collect(&dfn_, dhex_, di_);
+        q2_free(&dfn_);
+      }
+      g_rg_dry_done = 1;
+    }
     {
       ELayoutInfo *pre = calloc(E_LAYOUT_MAX, sizeof(*pre));
       g_nlayouts = pre != NULL ? e_layouts_collect(pre, E_LAYOUT_MAX) : 0;
@@ -2278,6 +2665,10 @@ int qjsaot_driver_main(int argc, char **argv) {
 
     g_unit_funcs = funcs;
     qjs_aot_scan_init(ctx, funcs, nfuncs);
+    qjs_aot_bundle_init(ctx, funcs, nfuncs);
+    if (g_facts_path != NULL) {
+      if (qjs_aot_bundle_report(g_facts_path) != 0) fprintf(stderr, "qjsaot: cannot write the facts report %s\n", g_facts_path);
+    }
     g_unit_nfuncs = nfuncs;
     g_e_native = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), 1);
     g_e_frameregs = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(int));
@@ -2288,6 +2679,7 @@ int qjsaot_driver_main(int argc, char **argv) {
   if (split_dir != NULL) e_set_split(1);
   e_roles_check();
     e_report_open(g_report_path);
+    sel_prepare(funcs, nfuncs, e_report_file());
     /* The inline forms first: a caller asks whether its callee has one while its own
        body is emitted. */
     g_inl_eb = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*g_inl_eb));
@@ -2450,6 +2842,14 @@ int qjsaot_driver_main(int argc, char **argv) {
                 }
               }
             }
+            /* a region's exits continue in the generic bodies of the functions it expanded: they must be in the unit when the root is */
+            for (k = 0; k < g_rgdep_n; k++) {
+              int rj = find_unit(funcs, nfuncs, g_rgdep[k].root), cj = find_unit(funcs, nfuncs, g_rgdep[k].callee);
+              if (rj >= 0 && cj >= 0 && sel[rj] && !sel[cj] && eb[cj].buf) {
+                sel[cj] = 1;
+                changed = 1;
+              }
+            }
           }
         }
         /* budget: drop the lowest ops/byte until it fits */
@@ -2474,6 +2874,18 @@ int qjsaot_driver_main(int argc, char **argv) {
             if (best < 0) break;
             sel[best] = 0;
             est_bytes -= (long)eb[best].len;
+          }
+        }
+        /* a body whose exits name another function's resume or generic body (a region's expanded callees, a resumable copy's callee) cannot stay when that function is not in the unit
+           (not selected, no body, dropped by the budget): drop the body, which then runs through the engine */
+        {
+          int changed2 = 1;
+          while (changed2) {
+            changed2 = 0;
+            for (k = 0; k < g_rgdep_n && getenv("QJS_AOT_NORXDEP") == NULL; k++) {
+              int rj = find_unit(funcs, nfuncs, g_rgdep[k].root), cj = find_unit(funcs, nfuncs, g_rgdep[k].callee);
+              if (rj >= 0 && cj >= 0 && sel[rj] && (!sel[cj] || !eb[cj].buf)) { sel[rj] = 0; changed2 = 1; }
+            }
           }
         }
       }
@@ -2592,7 +3004,11 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_RT_GV_CELL_GEN %uu\n"
           "#define QJS_AOT_OFF_CTX_INTERRUPT_COUNTER %uu\n"
           "/* The poll's decrement as one read-modify-write with the flags kept: `sub $1, mem; jle`. */\n"
+          "#if defined(__x86_64__)\n"
           "#define Q2_POLL_HIT(c) ({ int hit_; __asm__ volatile(\"subl $1, %%0\" : \"+m\"(*(int *)((unsigned char *)(c) + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER)), \"=@ccle\"(hit_)); hit_; })\n"
+          "#else\n"
+          "#define Q2_POLL_HIT(c) (--*(int *)((unsigned char *)(c) + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0)\n"
+          "#endif\n"
           "#define QJS_AOT_OFF_CTX_RT %uu\n"
           "#define QJS_AOT_OFF_OBJECT_FUNC_BYTECODE %uu\n"
           "#define QJS_AOT_CLASS_BYTECODE_FUNCTION %uu\n"
@@ -2760,13 +3176,15 @@ int qjsaot_driver_main(int argc, char **argv) {
       fprintf(lf,
           "#define QJS_AOT_PACKED_ARRAYS %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_ARR_KIND %uu\n"
+          "#define QJS_AOT_OFF_RT_SHAPE_FREE_EPOCH %uu\n"
+          "#define QJS_AOT_OFF_FNBC_REGVM_LEN %uu\n"
           "#define QJS_AOT_ARR_HOLES(p_) ((p_)[QJS_AOT_OFF_JSOBJECT_HOLEY_BYTE] & QJS_AOT_JSOBJECT_HOLEY_MASK)\n"
           "#if QJS_AOT_PACKED_ARRAYS\n"
           "#define QJS_AOT_ARR_ODD(p_) (QJS_AOT_ARR_HOLES(p_) || (p_)[QJS_AOT_OFF_JSOBJECT_ARR_KIND] != 0)\n"
           "#else\n"
           "#define QJS_AOT_ARR_ODD(p_) QJS_AOT_ARR_HOLES(p_)\n"
           "#endif\n",
-          lay.packed_arrays, lay.off_object_arr_kind);
+          lay.packed_arrays, lay.off_object_arr_kind, lay.off_rt_shape_free_epoch, lay.off_fnbc_regvm_len);
       fclose(lf);
     }
 
@@ -2815,9 +3233,15 @@ int qjsaot_driver_main(int argc, char **argv) {
        weak, so a unit without the section still links. */
     fprintf(
         f,
+        "#if defined(__APPLE__)\n"
+        "#define E_TEXT __attribute__((section(\"__TEXT,aottext,regular,pure_instructions\")))\n"
+        "extern char __start_aottext[] __asm(\"section$start$__TEXT$aottext\");\n"
+        "extern char __stop_aottext[] __asm(\"section$end$__TEXT$aottext\");\n"
+        "#else\n"
         "#define E_TEXT __attribute__((section(\"aottext\")))\n"
         "extern char __start_aottext[] __attribute__((weak));\n"
-        "extern char __stop_aottext[] __attribute__((weak));\n");
+        "extern char __stop_aottext[] __attribute__((weak));\n"
+        "#endif\n");
     /* Unconditional: the A/B switch reads the environment, and a unit that is
        compiled without the debug checks still has to do that. */
     fprintf(f, "#include <stdlib.h>\n");
@@ -2895,9 +3319,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* One node per exit stub, linked the first time the stub is taken, with the
            number of times it was: the unit's statistics list the stubs that fire. */
         "typedef struct E_XNode { const char *hex, *kind; int pc; uint32_t cnt; struct E_XNode *next; } E_XNode;\n"
+        /* Exit tally for the profitability gate's report: how often each (function, source pc) exit was taken, kept for every exit
+           (not only under a stats flag) so that a function the gate switched off can name the exit that did it. */
+        "#define E_XT_N 512\n"
+        "typedef struct { const char *hex; int fi, pc; uint32_t cnt; } E_XT;\n"
         "#ifdef QJS_AOT_SPLIT_UNIT\n"
         "extern uint64_t e_ent[QJS_AOT_NFUNCS];\n"
-        "extern uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
+        "extern uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS], e_refs[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_off[QJS_AOT_NFUNCS], e_gate[QJS_AOT_NFUNCS];\n"
         "extern uint32_t e_han[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
@@ -2906,10 +3334,16 @@ int qjsaot_driver_main(int argc, char **argv) {
         "extern uint32_t e_inx[QJS_AOT_NFUNCS];\n"
         "extern uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
         "extern E_XNode *e_xhead;\n"
+        "extern E_XT e_xt[E_XT_N];\n"
+        "extern uint32_t e_ngated;\n"
+        "extern uint8_t e_gwhy[QJS_AOT_NFUNCS];\n"
         "#else\n"
         "static E_XNode *e_xhead;\n"
+        "static E_XT e_xt[E_XT_N];\n"
+        "static uint32_t e_ngated;\n"
+        "static uint8_t e_gwhy[QJS_AOT_NFUNCS];\n"
         "static uint64_t e_ent[QJS_AOT_NFUNCS];\n"
-        "static uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
+        "static uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS], e_refs[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_off[QJS_AOT_NFUNCS], e_gate[QJS_AOT_NFUNCS];\n"
         "static uint32_t e_han[QJS_AOT_NFUNCS];\n"
         "static uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
@@ -2961,6 +3395,19 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  { const E_XNode *n_; for (n_ = e_xhead; n_ != NULL; n_ = n_->next)\n"
         "      fprintf(stderr, \"unit-exit-site fn=%%s kind=%%s pc=%%d count=%%u\\n\", n_->hex, n_->kind, n_->pc, n_->cnt); }\n"
+        "}\n"
+        "static void __attribute__((destructor)) e_gate_report(void)\n"
+        "{\n"
+        "  int i, k;\n"
+        "  if (getenv(\"QJS_AOT_STATS\") == NULL) return;\n"
+        "  for (i = 0; i < QJS_AOT_NFUNCS; i++) {\n"
+        "    const E_XT *b_ = NULL;\n"
+        "    if (!e_gwhy[i]) continue;\n"
+        "    for (k = 0; k < E_XT_N; k++) if (e_xt[k].cnt && e_xt[k].fi == i && (b_ == NULL || e_xt[k].cnt > b_->cnt)) b_ = &e_xt[k];\n"
+        "    fprintf(stderr, \"aot gated fn=%%s idx=%%d enters=%%llu exits=%%u refuses=%%u dominant-exit pc=%%d%%s count=%%u hex=%%s\\n\", qjs_aot_e_names[i] ? qjs_aot_e_names[i] : \"?\", i,\n"
+        "            (unsigned long long)e_ent[i], e_exi[i], e_ref[i], b_ ? b_->pc : -1, b_ && b_->pc < 0 ? \"(negated line of the stub in the unit C)\" : \"\", b_ ? b_->cnt : 0u, b_ && b_->hex ? b_->hex : \"?\");\n"
+        "  }\n"
+        "  fprintf(stderr, \"aot gated=%%u\\n\", e_ngated);\n"
         "}\n"
         "#endif\n"
         "#endif\n"
@@ -3054,16 +3501,42 @@ int qjsaot_driver_main(int argc, char **argv) {
            failed speculation: the generic body fills what changed and the next entry passes. It does
            not count toward the switch-off. */
         "static int e_ep_exit;\n"
-        "#define E_EXIT_NOTE(fi) do { if (e_ep_exit) { e_ep_exit = 0; break; } if (++e_exi[fi] > 256 && \\\n"
-        "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
+        /* The profitability gate (a safety net, never a fix): a function that exits more than 256 times and in more than 1 of 16
+           of its entries is switched off (it runs its generic body from then on). A region's exit stubs name their pc and hex
+           (E_EXIT_NOTE_PC); the switch-off is counted (e_ngated, printed as gated=K with QJS_AOT_STATS=1) and reported with the
+           exit taken most, so a gated region is never silent. */
+        "static inline void e_xt_note(const char *hex, int fi, int pc)\n"
+        "{\n"
+        "  unsigned h_ = ((unsigned)fi * 31u + (unsigned)pc) %% E_XT_N, k_;\n"
+        "  for (k_ = 0; k_ < E_XT_N; k_++, h_ = (h_ + 1) %% E_XT_N) {\n"
+        "    E_XT *t_ = &e_xt[h_];\n"
+        "    if (t_->cnt == 0) { t_->hex = hex; t_->fi = fi; t_->pc = pc; t_->cnt = 1; return; }\n"
+        "    if (t_->fi == fi && t_->pc == pc) { t_->cnt++; return; }\n"
+        "  }\n"
+        "}\n"
+        "static inline void e_gate_note(int fi)\n"
+        "{\n"
+        "  if (!e_gate[fi]) { e_gwhy[fi] = 1; e_ngated++; }\n"
+        "  e_off[fi] = e_gate[fi] = 1;\n"
+        "}\n"
+        "#define E_EXIT_NOTE_PC(fi, pc_, hex_) do { if (e_ep_exit) { e_ep_exit = 0; break; } e_xt_note((hex_), (fi), (pc_)); \\\n"
+        "    if (++e_exi[fi] > 256 && (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_gate_note(fi); } while (0)\n"
+        "#define E_EXIT_NOTE(fi) do { if (e_ep_exit) { e_ep_exit = 0; break; } e_xt_note(NULL, (fi), -__LINE__); if (++e_exi[fi] > 256 && \\\n"
+        "    (uint64_t)e_exi[fi] * 16 > e_ent[fi]) e_gate_note(fi); } while (0)\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
         "   body does not lower. Counting them toward the switch-off would turn off\n"
         "   every spec body after 257 calls and every measurement would time the\n"
         "   generic body. They are counted, never acted on. */\n"
         "#define E_HANDOFF_NOTE(fi) (e_ep_exit = 0, e_han[fi]++)\n"
         "/* Entry refused in more than half the calls: nothing to speculate on. */\n"
+        /* A refusal because a hot site's cell is still EMPTY: the site has not run yet in this process (a rare branch), so the
+           generic body that runs instead fills it and the next entry passes. It does not count toward the switch-off at 256,
+           which was reached by such functions before the branch ever ran; a much larger limit still ends a cell that is never
+           filled. */
+        "#define E_REFUSE_SOFT(fi) do { if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_refs[fi] > 65536 && \\\n"
+        "    (uint64_t)e_refs[fi] * 2 > e_ent[fi]) e_gate_note(fi); } while (0)\n"
         "#define E_REFUSE_NOTE(fi) do { if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_ref[fi] > 256 && \\\n"
-        "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_off[fi] = e_gate[fi] = 1; } while (0)\n"
+        "    (uint64_t)e_ref[fi] * 2 > e_ent[fi]) e_gate_note(fi); } while (0)\n"
         /* The dynamic register check, compiled into the unit only with -DE_POISON.
            It compares every register an op call was not allowed to write
            against a copy taken before the call, by tag and then by kind, so a
@@ -3306,14 +3779,20 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_BOX_F64(d) __JS_NewFloat64(d)\n"
         /* An int32 from a boxed value: an int is the one-compare fast arm; an integral float64
            (not -0, in range) converts; anything else is the caller's exit. */
+        "#if defined(__SSE2__)\n"
         "#include <emmintrin.h>\n"
+        "#define Q2_CVTT_I32(d) _mm_cvttsd_si32(_mm_set_sd(d))\n"
+        "#else\n"
+        /* arm64 fcvtzs saturates; the range test keeps the C conversion defined. */
+        "#define Q2_CVTT_I32(d) ((d) > -2147483649.0 && (d) < 2147483648.0 ? (int32_t)(d) : INT32_MIN)\n"
+        "#endif\n"
         "static inline __attribute__((always_inline)) int q2_to_i32_float(JSValue v, int32_t *out)\n"
         "{\n"
         "  double d;\n"
         "  int32_t i;\n"
         "  if (JS_VALUE_GET_TAG(v) != JS_TAG_FLOAT64) return 0;\n"
         "  d = JS_VALUE_GET_FLOAT64(v);\n"
-        "  i = _mm_cvttsd_si32(_mm_set_sd(d));\n"
+        "  i = Q2_CVTT_I32(d);\n"
         "  if (!((double)i == d && (i != 0 || !signbit(d)))) return 0;\n"
         "  *out = i;\n"
         "  return 1;\n"
@@ -3854,6 +4333,9 @@ int qjsaot_driver_main(int argc, char **argv) {
         "         JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);\n"
         "  else if (k >= 6) eq = 0;\n"
         "  else if ((ta == JS_TAG_NULL && tb == JS_TAG_UNDEFINED) || (ta == JS_TAG_UNDEFINED && tb == JS_TAG_NULL)) eq = 1;\n"
+        /* an object is neither null nor undefined (no HTMLDDA object exists while a body runs: its entry refuses otherwise) */
+        "  else if ((ta == JS_TAG_OBJECT && (tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED)) ||\n"
+        "           (tb == JS_TAG_OBJECT && (ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED))) eq = 0;\n"
         "  else return 0;\n"
         "  *c = (k == 4 || k == 6) ? eq : !eq;\n"
         "  return 1;\n"
@@ -4212,6 +4694,30 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (__builtin_expect(*cache == NULL, 0)) *cache = qjs_aot_array_builtin_fn(which);\n"
         "  return *(const void *const *)(p + QJS_AOT_OFF_CFUNC_C_FUNCTION) == *cache;\n"
         "}\n"
+        /* Function.prototype.apply: the builtin's function object (class C function, generic-magic entry with magic 0, the engine's own pointer) */
+        "static const void *e_fnapply_fn;\n"
+        "static inline __attribute__((always_inline)) int q2_is_fn_apply(JSValue callee)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(callee);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_C_FUNCTION ||\n"
+        "      p[QJS_AOT_OFF_CFUNC_CPROTO] != QJS_AOT_CFUNC_CPROTO_GENERIC_MAGIC ||\n"
+        "      *(const int16_t *)(p + QJS_AOT_OFF_CFUNC_MAGIC) != 0)\n"
+        "    return 0;\n"
+        "  if (__builtin_expect(e_fnapply_fn == NULL, 0)) e_fnapply_fn = qjs_aot_intrinsic_fn(QJS_AOT_INTR_X_FUNC_APPLY);\n"
+        "  return *(const void *const *)(p + QJS_AOT_OFF_CFUNC_C_FUNCTION) == e_fnapply_fn;\n"
+        "}\n"
+        "static const void *e_fncall_fn;\n"
+        "static inline __attribute__((always_inline)) int q2_is_fn_call(JSValue callee)\n"
+        "{\n"
+        "  const unsigned char *p;\n"
+        "  if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT) return 0;\n"
+        "  p = (const unsigned char *)JS_VALUE_GET_PTR(callee);\n"
+        "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_C_FUNCTION) return 0;\n"
+        "  if (__builtin_expect(e_fncall_fn == NULL, 0)) e_fncall_fn = qjs_aot_function_call_fn();\n"
+        "  return *(const void *const *)(p + QJS_AOT_OFF_CFUNC_C_FUNCTION) == e_fncall_fn;\n"
+        "}\n"
         "static inline __attribute__((always_inline)) int q2_array_plain(JSContext *ctx, const unsigned char *p, uint32_t *count, JSValue **lenp)\n"
         "{\n"
         "  const unsigned char *c = (const unsigned char *)ctx;\n"
@@ -4244,7 +4750,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      return 0;\n"
         "    if ((size_t)(count + 1) * esz >\n"
         "        *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE) * esz)\n"
-        "      return 0;\n"
+        "      return qjs_aot_array_push_slow(ctx, arr, v, out);\n"
         "    if (kind == 1)\n"
         "      ((int32_t *)*(void *const *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] =\n"
         "          JS_VALUE_GET_INT(v);\n"
@@ -4260,8 +4766,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    return 1;\n"
         "  }\n"
         "#endif\n"
-        "  if (count + 1 > *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE) || count >= 0x7fffffffu) return 0;\n"
-        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  if (count >= 0x7fffffffu || JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  if (count + 1 > *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE)) return qjs_aot_array_push_slow(ctx, arr, v, out);\n"
         "  if (JS_VALUE_HAS_REF_COUNT(v)) ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK);\n"
         "  (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] = v;\n"
         "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count + 1;\n"
@@ -4498,6 +5004,14 @@ int qjsaot_driver_main(int argc, char **argv) {
           "{\n"
           "  if (sid < E_SWEEP_MAX) e_sw_seen[sid >> 3] |= (uint8_t)(1u << "
           "(sid & 7));\n"
+          /* QJS_AOT_SWEEP_SET="<n>:<id>,<id>,...": fail each listed site on its <n>-th execution (a debugging aid
+             for finding which combination of exits differs; the unit consults it before the engine's single-site sweep). */
+          "  { static int set_ = -1; static uint32_t n_, ids_[64], cnt_[64]; static int nid_;\n"
+          "    if (__builtin_expect(set_ < 0, 0)) {\n"
+          "      const char *e_ = getenv(\"QJS_AOT_SWEEP_SET\"); set_ = 0;\n"
+          "      if (e_ != NULL) { char *q_; n_ = (uint32_t)strtoul(e_, &q_, 10); while (*q_ == ':' || *q_ == ',') { ids_[nid_++] = (uint32_t)strtoul(q_ + 1, &q_, 10); if (nid_ >= 64) break; } set_ = 1; }\n"
+          "    }\n"
+          "    if (set_ == 1) { int k_; for (k_ = 0; k_ < nid_; k_++) if (ids_[k_] == sid) return ++cnt_[k_] == n_; return 0; } }\n"
           "  return qjs_aot_should_deopt(ctx, sid);\n"
           "}\n"
           "static void __attribute__((destructor, unused)) "
@@ -5088,6 +5602,20 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  return 1;\n"
         "}\n\n");
+    /* The fast bodies' (fast.c) shared pieces: the exit value, the reference duplicate, and the shapes the bodies hold. */
+    fprintf(
+        f,
+        "#define E_PEXIT JS_MKVAL(JS_TAG_UNINITIALIZED, 0)\n"
+        "#define Q2_PH_MAX 8192\n"
+        "static void *q2_ph[Q2_PH_MAX]; static int q2_phn;\n"
+        "static inline __attribute__((always_inline)) void q2_dup_p(JSValue v) { if (JS_VALUE_HAS_REF_COUNT(v)) ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK); }\n"
+        "#define Q2_FH_MAX 1024\n"
+        "static JSRuntime *q2_cc_rt;\n"
+        "static JSObject **q2_fh_slot[Q2_FH_MAX]; static int q2_fhn;\n"
+        "/* a counted reference to a function object a region dispatched to (an exit builds the callee's frame from it, possibly after the fact that kept it alive broke); *slot is cleared when it is dropped at teardown */\n"
+        "/* a slot holds at most one reference: a second hold (an init tried again) releases the first and keeps the slot's one registration */\n"
+        "static JSObject *q2_fh_hold(JSContext *ctx, JSValue fv, JSObject **slot) { if (JS_VALUE_GET_TAG(fv) != JS_TAG_OBJECT) return NULL; if (*slot != NULL) { JSObject *o_ = *slot; *slot = NULL; JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, o_)); } else { int i_; for (i_ = 0; i_ < q2_fhn && q2_fh_slot[i_] != slot; i_++) {} if (i_ == q2_fhn) { if (q2_fhn >= Q2_FH_MAX) return NULL; q2_fh_slot[q2_fhn++] = slot; } } if (q2_cc_rt == NULL) q2_cc_rt = JS_GetRuntime(ctx); return (JSObject *)JS_VALUE_GET_PTR(JS_DupValue(ctx, fv)); }\n"
+        "static void q2_ph_release(JSRuntime *rt) { while (q2_fhn > 0) { JSObject **s_ = q2_fh_slot[--q2_fhn]; if (*s_ != NULL) JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, *s_)); *s_ = NULL; } while (q2_phn > 0) qjs_aot_shape_release(rt, q2_ph[--q2_phn]); }\n\n");
     /* Whether an argument-window call can be a plain C call into a compiled
        callee: the value is a bytecode function whose bound entry is `entry`,
        which only that function's digest produces. The same test `q2_entry_is`
@@ -5137,6 +5665,19 @@ int qjsaot_driver_main(int argc, char **argv) {
         f,
         "extern void *q2_cc[];\n"
         "void q2_cc_fill(JSContext *ctx, uint32_t ix, JSValue fnv);\n"
+        /* Whether `fnv` is a bytecode function whose register program is exactly `code[0..n)`: a function that has the same body as a compiled one but
+           no bound entry of its own (the engine binds an entry to one bytecode; a twin such as an identical empty method stays interpreted). Only
+           for bodies that read nothing from their own cache or constants, which the generator checks. */
+        "static inline __attribute__((always_inline)) int q2_code_is(JSValue fnv, const unsigned char *code, int n)\n"
+        "{\n"
+        "  const unsigned char *o, *b;\n"
+        "  if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT) return 0;\n"
+        "  o = (const unsigned char *)JS_VALUE_GET_PTR(fnv);\n"
+        "  if (*(const uint16_t *)(o + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_BYTECODE_FUNCTION) return 0;\n"
+        "  b = *(const unsigned char *const *)(o + QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
+        "  return *(const int *)(b + QJS_AOT_OFF_FNBC_REGVM_LEN) == n &&\n"
+        "         __builtin_memcmp(*(const unsigned char *const *)(b + QJS_AOT_OFF_FNBC_REGVM_CODE), code, (size_t)n) == 0;\n"
+        "}\n"
         "static inline __attribute__((always_inline)) int q2_call_entry_u(\n"
         "JSContext *ctx, JSValue fnv, const void *entry, uint32_t ix)\n"
         "{\n"
@@ -5151,6 +5692,153 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (!q2_call_entry(fnv, entry)) return 0;\n"
         "  if (q2_cc[ix] == NULL) q2_cc_fill(ctx, ix, fnv);\n"
         "  return 1;\n"
+        "}\n\n");
+    /* Prototype-method tables (see e_pm_collect in ops.c). A table holds, for one read site, the
+       receiver shapes its cache cells name and the method value each of them reaches through the
+       prototype, resolved once per cache epoch at the body's entry.
+       INVARIANT: a key is a shape taken from a NON-EMPTY cache cell at fill time, never from a live
+       receiver. Cells hold counted references on their shapes, and clearing or refilling a cell
+       moves aot_pic_epoch, so a key stays a live shape while the epoch is unchanged. A value is
+       valid while the epoch is unchanged too: every write that can change what a prototype holds
+       moves it. A way that is not a plain one-level prototype data read whose holder still has the
+       shape the cell was filled with is left out (its key stays NULL, which no object's shape
+       equals), so a receiver of that shape takes the ordinary read. */
+    /* A learned method table: for a method read no cache cell serves (the function is more than one prototype up), the shapes receivers
+       of the site have had and the method each reaches, found by qjs_aot_shape_method. An entry is a function of the shape and of what the
+       prototypes hold, so it is kept while neither aot_pic_epoch (every write that can change a prototype) nor shape_free_epoch (a freed shape's
+       address can be reused) has moved; both are read on every lookup, and a lookup that finds either moved starts the table again. */
+    fprintf(
+        f,
+        "typedef struct { uint32_t ep, sfe, n; const void *k[4]; JSValue v[4]; const void *e[4]; } Q2Lmt;\n"
+        "static __attribute__((noinline)) int q2_lmt_fill(Q2Lmt *t, const void *sh, uint32_t atom, JSValue *out, const void **ent)\n"
+        "{\n"
+        "  JSValue v;\n"
+        "  uint32_t s;\n"
+        "  if (!qjs_aot_shape_method(sh, atom, &v)) {\n"
+        "#ifdef Q2_MXDEBUG\n"
+        "    static int n_; if (n_++ < 5) fprintf(stderr, \"lmt fill failed: atom=%%u shape=%%p\\n\", atom, sh);\n"
+        "#endif\n"
+        "    return 0;\n"
+        "  }\n"
+        "  s = t->n++ & 3;\n"
+        "  t->k[s] = sh; t->v[s] = v; t->e[s] = q2_entry_of(v);\n"
+        "  *out = v; *ent = t->e[s];\n"
+        "  return 1;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_lmt_hit(JSContext *ctx, Q2Lmt *t, JSValue recv, uint32_t atom, JSValue *out, const void **ent)\n"
+        "{\n"
+        "  const unsigned char *rt = *(const unsigned char *const *)((const unsigned char *)ctx + QJS_AOT_OFF_CTX_RT);\n"
+        "  uint32_t ep = *(const uint32_t *)(rt + QJS_AOT_OFF_RT_PIC_EPOCH), sfe = *(const uint32_t *)(rt + QJS_AOT_OFF_RT_SHAPE_FREE_EPOCH + 4), k; /* shape_obs_epoch */\n"
+        "  const void *sh;\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
+        "  sh = *(const void *const *)((const unsigned char *)JS_VALUE_GET_PTR(recv) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+        "  if (__builtin_expect(t->ep != ep || t->sfe != sfe, 0)) {\n"
+        "    t->ep = ep; t->sfe = sfe; t->n = 0;\n"
+        "    for (k = 0; k < 4; k++) t->k[k] = NULL;\n"
+        "  }\n"
+        "  for (k = 0; k < 4; k++)\n"
+        "    if (sh == t->k[k]) { *out = t->v[k]; *ent = t->e[k]; return 1; }\n"
+        "  return q2_lmt_fill(t, sh, atom, out, ent);\n"
+        "}\n");
+    /* The same for a field a copy reads off receivers of several shapes: shape -> slot offset of an own data property (a function of the shape
+       alone, so only a shape freed or edited retires an entry: shape_obs_epoch). */
+    fprintf(
+        f,
+        "typedef struct { uint32_t oe, n; const void *k[4]; uint32_t o[4]; } Q2Slt;\n"
+        "static __attribute__((noinline)) int q2_slt_fill(JSContext *ctx, Q2Slt *t, const void *sh, uint32_t atom, uint32_t *off)\n"
+        "{\n"
+        "  uint32_t s;\n"
+        "  if (!qjs_aot_shape_slot(sh, atom, off)) {\n"
+        "#ifdef Q2_MXDEBUG\n"
+        "    { static int n_; if (n_++ < 6) { const char *an_ = JS_AtomToCString(ctx, (JSAtom)atom); fprintf(stderr, \"slt miss atom=%%s shape=%%p\\n\", an_ ? an_ : \"?\", sh); } }\n"
+        "#endif\n"
+        "    (void)ctx;\n"
+        "    return 0;\n"
+        "  }\n"
+        "  s = t->n++ & 3;\n"
+        "  t->k[s] = sh; t->o[s] = *off;\n"
+        "  return 1;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_slt_off(JSContext *ctx, Q2Slt *t, JSValue recv, uint32_t atom, uint32_t *off)\n"
+        "{\n"
+        "  const unsigned char *rt = *(const unsigned char *const *)((const unsigned char *)ctx + QJS_AOT_OFF_CTX_RT);\n"
+        "  uint32_t oe = *(const uint32_t *)(rt + QJS_AOT_OFF_RT_SHAPE_FREE_EPOCH + 4), k;\n"
+        "  const void *sh;\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
+        "  sh = *(const void *const *)((const unsigned char *)JS_VALUE_GET_PTR(recv) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+        "  if (__builtin_expect(t->oe != oe, 0)) {\n"
+        "    t->oe = oe; t->n = 0;\n"
+        "    for (k = 0; k < 4; k++) t->k[k] = NULL;\n"
+        "  }\n"
+        "  for (k = 0; k < 4; k++)\n"
+        "    if (sh == t->k[k]) { *off = t->o[k]; return 1; }\n"
+        "  return q2_slt_fill(ctx, t, sh, atom, off);\n"
+        "}\n");
+    fprintf(
+        f,
+        "static inline __attribute__((always_inline)) void q2_pm_fill(const void *pic, "
+        "void *const *holders, uint32_t nsites, int site, const void **ks, JSValue *vs, const void **es)\n"
+        "{\n"
+        "  unsigned k;\n"
+        "  for (k = 0; k < QJS_AOT_REG_PIC_WAYS; k++) {\n"
+        "    const unsigned char *e = (const unsigned char *)pic +\n"
+        "        ((size_t)site + (size_t)k * nsites) * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "    const unsigned char *sh, *holder, *prop;\n"
+        "    JSValue v;\n"
+        "    ks[k] = NULL; es[k] = NULL; vs[k] = JS_UNDEFINED;\n"
+        "#if QJS_DRC\n"
+        "    sh = *(const unsigned char *const *)e;\n"
+        "    if (sh == NULL || *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) != QJS_AOT_REG_PIC_PROTO)\n"
+        "      continue;\n"
+        "    holder = *(const unsigned char *const *)(sh + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
+        "    if (holder == NULL || *(const void *const *)(holder + QJS_AOT_OFF_JSOBJECT_SHAPE) !=\n"
+        "        holders[(size_t)site + (size_t)k * nsites])\n"
+        "      continue;\n"
+        "    prop = *(const unsigned char *const *)(holder + QJS_AOT_OFF_JSOBJECT_PROP);\n"
+        "    v = *(const JSValue *)(prop + *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
+        "    if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) continue;\n"
+        "    ks[k] = sh; vs[k] = v; es[k] = q2_entry_of(v);\n"
+        "#else\n"
+        "    (void)e; (void)sh; (void)holder; (void)prop; (void)v; (void)holders;\n"
+        "#endif\n"
+        "  }\n"
+        "}\n"
+        /* Debug counters, compiled in only under -DQ2_PMSTATS=1 (aotcase.sh builds a second binary with it):
+           reads that reached a table and reads it served, per table, printed at exit when QJS_AOT_PMSTATS is set. */
+        "#if defined(Q2_PMSTATS) && Q2_PMSTATS\n"
+        "static unsigned long q2_pm_calls[16], q2_pm_hits[16];\n"
+        "__attribute__((destructor)) static void q2_pm_report(void)\n"
+        "{\n"
+        "  int i;\n"
+        "  if (getenv(\"QJS_AOT_PMSTATS\") == NULL) return;\n"
+        "  for (i = 0; i < 16; i++)\n"
+        "    if (q2_pm_calls[i] != 0) fprintf(stderr, \"pmstats table=%%d calls=%%lu hits=%%lu\\n\", i, q2_pm_calls[i], q2_pm_hits[i]);\n"
+        "}\n"
+        "#define Q2_PM_COUNT(c_, j_) (q2_pm_##c_[(j_) & 15]++)\n"
+        "static unsigned long q2_wc_calls[256], q2_wc_hits[256];\n"
+        "__attribute__((destructor)) static void q2_wc_report(void)\n"
+        "{\n"
+        "  int i;\n"
+        "  if (getenv(\"QJS_AOT_PMSTATS\") == NULL) return;\n"
+        "  for (i = 0; i < 256; i++)\n"
+        "    if (q2_wc_calls[i] != 0) fprintf(stderr, \"wcstats site=%%d calls=%%lu hits=%%lu\\n\", i, q2_wc_calls[i], q2_wc_hits[i]);\n"
+        "}\n"
+        "#define Q2_WC_COUNT(c_, j_) (q2_wc_##c_[(j_) & 255]++)\n"
+        "#else\n"
+        "#define Q2_PM_COUNT(c_, j_) ((void)(j_))\n"
+        "#define Q2_WC_COUNT(c_, j_) ((void)(j_))\n"
+        "#endif\n"
+        "static inline __attribute__((always_inline)) int q2_pm_hit(JSValue recv, const void *const *ks, "
+        "const JSValue *vs, const void *const *es, JSValue *out, const void **ent, int j)\n"
+        "{\n"
+        "  const void *sh;\n"
+        "  unsigned k;\n"
+        "  Q2_PM_COUNT(calls, j);\n"
+        "  if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return 0;\n"
+        "  sh = *(const void *const *)((const unsigned char *)JS_VALUE_GET_PTR(recv) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+        "  for (k = 0; k < QJS_AOT_REG_PIC_WAYS; k++)\n"
+        "    if (sh == ks[k]) { Q2_PM_COUNT(hits, j); *out = vs[k]; *ent = es[k]; return 1; }\n"
+        "  return 0;\n"
         "}\n\n");
     /* Whether the callee is the function whose bound entry is `entry`. Only
        that function's digest produces that entry, so this is an exact identity
@@ -5375,7 +6063,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      *out = JS_MKVAL(JS_TAG_INT, (int32_t)r); return 1;\n"
         "    case QJS_AOT_REG_BIN_DIV: *out = E_TA_F64((double)v1 / (double)v2); return 1;\n"
         "    case QJS_AOT_REG_BIN_MOD:\n"
-        "      if (__builtin_expect(v1 >= 0 && v2 > 0, 1)) { *out = JS_MKVAL(JS_TAG_INT, v1 % v2); return 1; }\n"
+        "      if (__builtin_expect(v1 >= 0 && v2 > 0, 1)) { *out = JS_MKVAL(JS_TAG_INT, v1 %% v2); return 1; }\n"
         "      return 0;\n"
         "    case QJS_AOT_REG_BIN_LT: *out = JS_MKVAL(JS_TAG_BOOL, v1 < v2); "
         "return 1;\n"
@@ -5502,10 +6190,17 @@ int qjsaot_driver_main(int argc, char **argv) {
           "uint32_t);\n#define Q2_SEL_%s 1\n",
           e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
           hex, hex);
+      /* the register file a frame of this function is built with (a region's exit builds inlined callees' frames; the engine scans them over this many) */
+      fprintf(f, "#define Q2_FR_%s %d\n", hex, qjs_aot_frame_regs(i) > funcs[i].reg_count ? qjs_aot_frame_regs(i) : funcs[i].reg_count);
       /* `Q2_SEL_` says the function's *body* is in this unit. A call site needs
          more: the native *entry*, which exists only for a light-eligible
          function, so the two must be distinguished or a call site names an
          `aot_n_` nothing defines. */
+      if (g_rx_need != NULL && g_rx_need[i])
+        fprintf(
+            f,
+            "%sJSValue aot_rx_%s(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, const ENx *);\n",
+            e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ", hex);
       if (qjs_aot_has_native_entry(i))
         fprintf(
             f,
@@ -5556,16 +6251,28 @@ int qjsaot_driver_main(int argc, char **argv) {
         fprintf(pf, "#include \"quickjs-aot-rt.h\"\n#include %s\n", inc);
         fprintf(
             pf,
+            "#if defined(__APPLE__)\n"
+            "#define E_TEXT __attribute__((section(\"__TEXT,aottext,regular,pure_instructions\")))\n"
+            "extern char __start_aottext[] __asm(\"section$start$__TEXT$aottext\");\n"
+            "extern char __stop_aottext[] __asm(\"section$end$__TEXT$aottext\");\n"
+            "#else\n"
             "#define E_TEXT __attribute__((section(\"aottext\")))\n"
             "extern char __start_aottext[] __attribute__((weak));\n"
-            "extern char __stop_aottext[] __attribute__((weak));\n");
+            "extern char __stop_aottext[] __attribute__((weak));\n"
+            "#endif\n");
         /* The pure leaf helpers are `static inline` and are written once, to
            the shared header above; repeating them in each part would be a
            redefinition. Only the function's own bodies go here. */
         fwrite(eb[i].buf, 1, eb[i].len, pf);
+        if (g_rx_need != NULL && g_rx_need[i]) e_emit_resume_fn(pf, &funcs[i], qjs_aot_frame_regs(i), hex);
         fclose(pf);
       } else {
         fwrite(eb[i].buf, 1, eb[i].len, f);
+        if (g_rx_need != NULL && g_rx_need[i]) {
+          char hexr[33];
+          hex16(funcs[i].digest, hexr);
+          e_emit_resume_fn(f, &funcs[i], qjs_aot_frame_regs(i), hexr);
+        }
       }
       actual_bytes += (long)eb[i].len;
       emitted++;
@@ -5589,12 +6296,15 @@ int qjsaot_driver_main(int argc, char **argv) {
       fprintf(
           f,
           "uint64_t e_ent[QJS_AOT_NFUNCS];\n"
-          "uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS];\n"
+          "uint32_t e_exi[QJS_AOT_NFUNCS], e_ref[QJS_AOT_NFUNCS], e_refs[QJS_AOT_NFUNCS];\n"
           "uint8_t e_off[QJS_AOT_NFUNCS], e_gate[QJS_AOT_NFUNCS];\n"
           "uint32_t e_han[QJS_AOT_NFUNCS];\n"
           "uint8_t e_nfl[QJS_AOT_NFUNCS], e_dis[QJS_AOT_NFUNCS];\n"
           "uint8_t e_osr_ok[QJS_AOT_NFUNCS], e_osr_n[QJS_AOT_NFUNCS];\n"
           "E_XNode *e_xhead;\n"
+          "E_XT e_xt[E_XT_N];\n"
+          "uint32_t e_ngated;\n"
+          "uint8_t e_gwhy[QJS_AOT_NFUNCS];\n"
           "uint64_t e_inl[QJS_AOT_NFUNCS];\n"
           "uint32_t e_inx[QJS_AOT_NFUNCS];\n"
           "uint8_t e_ioff[QJS_AOT_NFUNCS];\n"
@@ -5637,6 +6347,19 @@ int qjsaot_driver_main(int argc, char **argv) {
           "  }\n"
           "  { const E_XNode *n_; for (n_ = e_xhead; n_ != NULL; n_ = n_->next)\n"
         "      fprintf(stderr, \"unit-exit-site fn=%%s kind=%%s pc=%%d count=%%u\\n\", n_->hex, n_->kind, n_->pc, n_->cnt); }\n"
+          "}\n"
+          "void __attribute__((destructor)) e_gate_report(void)\n"
+          "{\n"
+          "  int i, k;\n"
+          "  if (getenv(\"QJS_AOT_STATS\") == NULL) return;\n"
+          "  for (i = 0; i < QJS_AOT_NFUNCS; i++) {\n"
+          "    const E_XT *b_ = NULL;\n"
+          "    if (!e_gwhy[i]) continue;\n"
+          "    for (k = 0; k < E_XT_N; k++) if (e_xt[k].cnt && e_xt[k].fi == i && (b_ == NULL || e_xt[k].cnt > b_->cnt)) b_ = &e_xt[k];\n"
+          "    fprintf(stderr, \"aot gated fn=%%s idx=%%d enters=%%llu exits=%%u refuses=%%u dominant-exit pc=%%d%%s count=%%u hex=%%s\\n\", qjs_aot_e_names[i] ? qjs_aot_e_names[i] : \"?\", i,\n"
+          "            (unsigned long long)e_ent[i], e_exi[i], e_ref[i], b_ ? b_->pc : -1, b_ && b_->pc < 0 ? \"(negated line of the stub in the unit C)\" : \"\", b_ ? b_->cnt : 0u, b_ && b_->hex ? b_->hex : \"?\");\n"
+          "  }\n"
+          "  fprintf(stderr, \"aot gated=%%u\\n\", e_ngated);\n"
           "}\n"
           );
     }
@@ -5694,6 +6417,18 @@ int qjsaot_driver_main(int argc, char **argv) {
         f,
         "const uint32_t qjs_aot_count = "
         "sizeof(qjs_aot_table) / sizeof(qjs_aot_table[0]);\n");
+    /* The bundle this unit was generated for: a hash of the digests of its functions. The engine records it in the runtime that binds the
+       unit, which owns it until it is freed (a unit serves one runtime at a time). */
+    {
+      uint64_t bh = 1469598103934665603ULL;
+      int bi, bb;
+      for (bi = 0; bi < nfuncs; bi++)
+        for (bb = 0; bb < 16; bb++) {
+          bh ^= funcs[bi].digest[bb];
+          bh *= 1099511628211ULL;
+        }
+      fprintf(f, "const uint64_t qjs_aot_bundle_tag = 0x%016llxULL;\n", (unsigned long long)bh);
+    }
     /* The unit's teardown, called once at the start of JS_FreeRuntime. The site
        caches and the contracted layout shapes hold counted references that must be
        dropped while the runtime is still alive; the final collection follows, so a
@@ -5722,9 +6457,10 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, q2_cc[i]));\n"
         "      q2_cc[i] = NULL;\n"
         "    }\n"
+        "%s"
         "  q2_cc_rt = NULL;\n"
         "}\n",
-        g_cc_count + 1, g_cc_count + 1);
+        g_cc_count + 1, g_cc_count + 1, "  q2_ph_release(rt);\n");
     /* The contracted layouts. This file owns them: the table of rows (prototype
        kind, constructor digest, ordered field names), the shapes the built chains
        end, the runtime that holds those references, and both runtime-wide entry
@@ -5800,6 +6536,27 @@ int qjsaot_driver_main(int argc, char **argv) {
           fprintf(f, "},\n");
         }
         fprintf(f, "};\n");
+        {
+          /* The constant path (`Flog.RayTracer.Camera`, or a global's name) of the class a layout row belongs to, when the region compiler knows exactly one class with that ordered field list: two
+             classes made by one function share a digest, and the row must be built against the prototype of THEIR closure, found by this path. "" = the legacy rule (the closure that constructs first). */
+          fprintf(f, "static const char *const q2_layout_path[Q2_LAYOUT_COUNT] = {\n");
+          for (li = 0; li < nc; li++) {
+            const char **fld = NULL;
+            unsigned *flg = NULL;
+            int nf = 0, fi2;
+            char names2[32][40], path2[64];
+            qjs_aot_prof_shape(cand[li].shape_id, NULL, NULL, &nf, &fld, &flg);
+            path2[0] = 0;
+            int shared_ = 0, lj;
+            for (lj = 0; lj < nc; lj++) if (lj != li && cand[lj].proto == 1 && strcmp(cand[lj].digest, cand[li].digest) == 0) shared_ = 1;
+            if (shared_ && cand[li].proto == 1 && nf > 0 && nf <= 32 && getenv("QJS_AOT_NOLAYOUTPATH") == NULL) {   /* a digest with one row keeps the legacy rule exactly */
+              for (fi2 = 0; fi2 < nf; fi2++) snprintf(names2[fi2], 40, "%s", fld[fi2] != NULL ? fld[fi2] : "");
+              region_class_path(names2, nf, path2, sizeof(path2));
+            }
+            fprintf(f, "  \"%s\",\n", path2);
+          }
+          fprintf(f, "};\n");
+        }
         fprintf(
             f,
             "/* The first runtime to build claims the layouts, and records itself before the\n"
@@ -5858,25 +6615,61 @@ int qjsaot_driver_main(int argc, char **argv) {
             "      return 1;\n"
             "  return 0;\n"
             "}\n"
-            "/* A constructor's function object now exists with its final `.prototype`. A\n"
-            "   second function object of the same digest finds the layout built and keeps\n"
-            "   the first chain. */\n"
+            "/* A constructor function object is about to make its first instance (the engine calls\n"
+            "   this from the construct path, after any `F.prototype = X`, and once per bytecode). The\n"
+            "   chain is built against the `.prototype` it has now, and that property is watched: any\n"
+            "   later change of it breaks the layout. A second function object of the same digest\n"
+            "   finds the layout built and keeps the first chain. */\n"
+            "/* The value of the dotted path from the global object through own data properties only (a getter, an accessor or a missing link: undefined). Owned. */\n"
+            "static JSValue q2_resolve_path(JSContext *ctx, const char *path)\n"
+            "{\n"
+            "  JSValue cur = JS_GetGlobalObject(ctx);\n"
+            "  char buf[64], *seg, *next;\n"
+            "  snprintf(buf, sizeof(buf), \"%%s\", path);\n"
+            "  for (seg = buf; seg != NULL && *seg; seg = next) {\n"
+            "    JSPropertyDescriptor d; JSAtom a; int r;\n"
+            "    next = strchr(seg, '.');\n"
+            "    if (next) *next++ = 0;\n"
+            "    if (!JS_IsObject(cur)) { JS_FreeValue(ctx, cur); return JS_UNDEFINED; }\n"
+            "    a = JS_NewAtom(ctx, seg);\n"
+            "    r = JS_GetOwnProperty(ctx, &d, cur, a);\n"
+            "    JS_FreeAtom(ctx, a);\n"
+            "    JS_FreeValue(ctx, cur);\n"
+            "    if (r <= 0) return JS_UNDEFINED;\n"
+            "    JS_FreeValue(ctx, d.getter); JS_FreeValue(ctx, d.setter);\n"
+            "    if (d.flags & JS_PROP_GETSET) { JS_FreeValue(ctx, d.value); return JS_UNDEFINED; }\n"
+            "    cur = d.value;\n"
+            "  }\n"
+            "  return cur;\n"
+            "}\n"
             "void qjs_aot_layout_fn_created(JSContext *ctx, JSValue fn, const uint8_t digest[16])\n"
             "{\n"
             "  uint32_t i;\n"
             "  if (!q2_claim(JS_GetRuntime(ctx))) return;\n"
             "  for (i = 0; i < Q2_LAYOUT_COUNT; i++) {\n"
-            "    JSValue proto;\n"
+            "    JSValue proto, rfn = JS_UNDEFINED;\n"
+            "    JSValue bfn = fn;\n"
             "    if (q2_layout_proto[i] != 1 || q2_layout_state[i] != 0 ||\n"
             "        memcmp(q2_layout_digest[i], digest, 16) != 0)\n"
             "      continue;\n"
-            "    proto = qjs_aot_function_prototype(ctx, fn);\n"
+            "    if (q2_layout_path[i][0]) {\n"
+            "      /* a class of a shared digest: its row is built against the closure its path names (own data properties only) */\n"
+            "      uint8_t dg2[16];\n"
+            "      rfn = q2_resolve_path(ctx, q2_layout_path[i]);\n"
+            "      if (!JS_IsObject(rfn) || !qjs_aot_function_digest(rfn, dg2) || memcmp(dg2, digest, 16) != 0) { JS_FreeValue(ctx, rfn); continue; }\n"
+            "      bfn = rfn;\n"
+            "    }\n"
+            "    if (getenv(\"QJS_AOT_STATS\")) fprintf(stderr, \"aot layout row %%u path '%%s' built against %%s\\n\", i, q2_layout_path[i], bfn.u.ptr == fn.u.ptr ? \"the constructing closure\" : \"the path's closure\");\n"
+            "    proto = qjs_aot_function_prototype(ctx, bfn);\n"
             "    if (JS_IsUndefined(proto)) {\n"
             "      q2_layout_state[i] = 2;\n"
+            "      JS_FreeValue(ctx, rfn);\n"
             "      continue;\n"
             "    }\n"
             "    q2_build_one(ctx, i, proto);\n"
             "    JS_FreeValue(ctx, proto);\n"
+            "    if (q2_layout_state[i] == 1) qjs_aot_layout_watch_proto(ctx, bfn, i + 1u);\n"
+            "    JS_FreeValue(ctx, rfn);\n"
             "  }\n"
             "}\n"
             "void qjs_aot_release(JSRuntime *rt)\n"

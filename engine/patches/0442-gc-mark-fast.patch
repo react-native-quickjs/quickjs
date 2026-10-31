@@ -1,0 +1,90 @@
+Subject: The cycle collector marks plain objects and fast Arrays in a loop specialised for each of its three passes
+
+What this does
+  - `mark_children_fast` (always inline) marks the shape, the data properties and, for a generic fast Array, the elements of a plain object or Array without weak references, with the mark function a compile-time constant: `gc_decref`, `gc_scan` (both loops) call it first and fall back to `mark_children` for anything else. A property that is not plain data goes through `mark_prop_special`, the code `mark_children` ran for it.
+
+Why we need it
+  Garbage cycles (Variable <-> Constraint in deltablue) make the collector run; its three passes were 6.7M instructions of indirect calls and the class dispatch of `mark_children`.
+
+Soundness
+  It marks the same references in the same order as `mark_children` for the objects it accepts (class OBJECT or ARRAY, no weak record); the Array element loop is `js_array_mark`. Pacing and the set of collected objects are unchanged.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11544,0 +11545,53 @@
++    }
++}
++
++/* mark_children for the commonest garbage and live data: a plain object or a fast Array without weak references. The shape, the data properties and (for an
++   Array) the elements are marked in a loop the compiler specialises for the mark function it is called with (gc_decref_child, gc_scan_incref_child,
++   gc_scan_incref_child2); a property that is not plain data (accessor, var_ref, autoinit) takes mark_children's own code. Marks the same set of references, in the same
++   order, as mark_children. Returns 0 (nothing done) for any other object. */
++static void mark_prop_special(JSRuntime *rt, JSProperty *pr, JSShapeProperty *prs, JS_MarkFunc *mark_func)
++{
++    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
++        if (pr->u.getset.getter)
++            mark_func(rt, &pr->u.getset.getter->header);
++        if (pr->u.getset.setter)
++            mark_func(rt, &pr->u.getset.setter->header);
++    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
++        if (pr->u.var_ref->is_detached ||
++            pr->u.var_ref->is_coro) {
++            mark_func(rt, &pr->u.var_ref->header);
++        }
++    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
++        js_autoinit_mark(rt, pr, mark_func);
++    }
++}
++
++static inline __attribute__((always_inline)) int
++mark_children_fast(JSRuntime *rt, JSGCObjectHeader *gp, JS_MarkFunc *mark_func)
++{
++    JSObject *p;
++    JSShape *sh;
++    JSShapeProperty *prs;
++    int i;
++
++    if (unlikely(JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT))
++        return 0;
++    p = (JSObject *)gp;
++    if (unlikely(p->first_weak_ref != NULL ||
++                 (p->class_id != JS_CLASS_OBJECT && p->class_id != JS_CLASS_ARRAY)))
++        return 0;
++    sh = p->shape;
++    mark_func(rt, &sh->header);
++    prs = get_shape_prop(sh);
++    for(i = 0; i < sh->prop_count; i++) {
++        if (prs->atom != JS_ATOM_NULL) {
++            if (unlikely(prs->flags & JS_PROP_TMASK)) {
++                mark_prop_special(rt, &p->prop[i], prs, mark_func);
++            } else {
++                JSValue v = p->prop[i].u.value;
++                if (JS_VALUE_HAS_REF_COUNT(v) &&
++                    (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE))
++                    mark_func(rt, JS_VALUE_GET_PTR(v));
++            }
++        }
++        prs++;
+@@ -11545,0 +11599,10 @@
++    if (p->class_id == JS_CLASS_ARRAY && JS_ARR_GENERIC(p)) {
++        uint32_t n = p->u.array.count, k;
++        for(k = 0; k < n; k++) {
++            JSValue v = JS_ARR_VALS(p)[k];
++            if (JS_VALUE_HAS_REF_COUNT(v) &&
++                (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE))
++                mark_func(rt, JS_VALUE_GET_PTR(v));
++        }
++    }
++    return 1;
+@@ -11571 +11634,2 @@
+-        mark_children(rt, p, gc_decref_child);
++        if (!mark_children_fast(rt, p, gc_decref_child))
++            mark_children(rt, p, gc_decref_child);
+@@ -11607 +11671,2 @@
+-        mark_children(rt, p, gc_scan_incref_child);
++        if (!mark_children_fast(rt, p, gc_scan_incref_child))
++            mark_children(rt, p, gc_scan_incref_child);
+@@ -11613 +11678,2 @@
+-        mark_children(rt, p, gc_scan_incref_child2);
++        if (!mark_children_fast(rt, p, gc_scan_incref_child2))
++            mark_children(rt, p, gc_scan_incref_child2);

@@ -1780,6 +1780,61 @@ JS_EXTERN const char* JS_GetVersion(void);
 /* Integration point for quickjs-libc.c, not for public use. */
 JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
 
+/* ---- fact groups (AOT-REDESIGN.md section 4) ----------------------------------------------------
+   One group per watched object: its [[prototype]] (PROTO), the values of the listed own data properties, and with CLOSED no other
+   own property. PENDING until `qjs_aot_fact_validate` finds the object matching; VALID until any mutator changes it; then BROKEN for good.
+   `qjs_aot_fact_depend` ties a bit of a word the caller owns to the group: set while VALID, cleared on break. FRESH: a construct of the
+   object (a constructor) while the group is still PENDING breaks it, because an instance made earlier has another prototype.
+   Per runtime: a group belongs to the runtime of the context that made it. */
+typedef struct JSAotFact JSAotFact;
+#define QJS_AOT_FACT_PROTO  1u
+#define QJS_AOT_FACT_CLOSED 2u
+#define QJS_AOT_FACT_FRESH  4u
+enum { QJS_AOT_FACT_PENDING = 0, QJS_AOT_FACT_VALID = 1, QJS_AOT_FACT_BROKEN = 2 };
+JS_EXTERN JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto, uint32_t flags,
+                            const JSAtom *atoms, int natoms);
+JS_EXTERN int qjs_aot_fact_expect(JSContext *ctx, JSAotFact *g, JSAtom atom, JSValueConst val);
+JS_EXTERN int qjs_aot_fact_expect_proto(JSContext *ctx, JSAotFact *g, JSValueConst proto);
+JS_EXTERN int qjs_aot_fact_validate(JSContext *ctx, JSAotFact *g);
+JS_EXTERN int qjs_aot_fact_state(const JSAotFact *g);
+JS_EXTERN void qjs_aot_fact_depend(JSAotFact *g, uint32_t *word, uint32_t mask);
+JS_EXTERN void qjs_aot_fact_break(JSContext *ctx, JSAotFact *g);
+JS_EXTERN uint32_t qjs_aot_facts_breaks(JSRuntime *rt);
+/* ---- the facts_valid word (AOT-FACTS-WORD.md) ------------------------------------------------------------------------------
+   A compiled region owns ONE uint64_t `word` (a static of the unit, one per region instance). Each bit of it stands for "these facts
+   hold": a bit is made a dependent of any number of groups (`qjs_aot_fact_depend64`) and of layouts (`qjs_aot_layout_depend`), is armed
+   only by `qjs_aot_facts_commit` (which refuses unless every dependent is VALID / unbroken, so a bit is the AND of its dependents),
+   and is CLEARED, never set, by any break of any dependent. Generated code tests `QJS_AOT_FACTS_OK(word, MASK)` (one load, one compare)
+   at region entry, after the interrupt-poll slow path that ran a handler, and after every call with unknown effects, and leaves the
+   fast body when it is false. A break only clears bits, synchronously, on the mutating thread; it never blocks, allocates or calls JS.
+   The word must outlive its dependents: `qjs_aot_facts_undepend` before the storage goes away (the runtime clears every word it knows
+   when it is freed). The word is plain memory: read it volatile, never cache it across a call. */
+#define QJS_AOT_FACTS_OK(word_, mask_) ((*(volatile const uint64_t *)(word_) & (uint64_t)(mask_)) == (uint64_t)(mask_))
+JS_EXTERN void qjs_aot_fact_depend64(JSAotFact *g, uint64_t *word, uint64_t mask);
+/* layout kind: bit `mask` of `word` depends on contracted layout `layout_id` (1..63) staying unbroken: no add, delete, attribute change
+   or prototype change on an instance, no instance turning into a prototype, no slot claim refused. 1: dependent registered; 0: the layout
+   is already broken (the bits are cleared); -1: bad id or out of memory. */
+JS_EXTERN int qjs_aot_layout_depend(JSContext *ctx, uint32_t layout_id, uint64_t *word, uint64_t mask);
+/* Arm the bits of `mask`: 1 and the bits are set when every dependent registered on them (groups and layouts) is VALID / unbroken, else
+   0 and no bit of `mask` is set. Call it again after a rebuild; it is cheap but not free (it scans the dependents). */
+JS_EXTERN int qjs_aot_facts_commit(JSContext *ctx, uint64_t *word, uint64_t mask);
+/* Forget every dependent registered on `word` (all its bits); the word is left as it is. */
+JS_EXTERN void qjs_aot_facts_undepend(JSContext *ctx, uint64_t *word);
+/* The broken layouts (bit k-1: layout k), the same data generated code reads through the runtime. */
+JS_EXTERN uint64_t qjs_aot_layouts_broken(JSRuntime *rt);
+/* METHOD kind: a group on `holder` whose own data property `atom` is the function `fn`, created VALID, or NULL when the property is
+   absent, an accessor, another value, `fn` is not callable, or `digest` (16 bytes, may be NULL) is not the digest of the bytecode of `fn`. */
+JS_EXTERN JSAotFact *qjs_aot_fact_method(JSContext *ctx, JSValueConst holder, JSAtom atom, JSValueConst fn, const uint8_t *digest);
+/* PROTO-IDENTITY kind: a group on `obj` whose [[prototype]] stays `proto` (an object, or null), created VALID, or NULL if it is not now. */
+JS_EXTERN JSAotFact *qjs_aot_fact_proto_is(JSContext *ctx, JSValueConst obj, JSValueConst proto);
+/* ABSENT: while PENDING, the object must have no own property `atom` (adding it breaks the group). With the lookup of a method found
+   further up the chain this is how a read through P to a method on Q is stated: absent(P, atom) + proto_is(P, Q) + method(Q, atom, fn). */
+JS_EXTERN int qjs_aot_fact_absent(JSContext *ctx, JSAotFact *g, JSAtom atom);
+/* A compiled unit serves one runtime at a time (the first to bind a function owns it; another binds nothing and interprets). These
+   report the number of functions bound in `rt`, and the bundle tag the unit was generated for (0: none). */
+JS_EXTERN uint32_t qjs_aot_runtime_bound(JSRuntime *rt);
+JS_EXTERN uint64_t qjs_aot_runtime_bundle(JSRuntime *rt);
+
 #ifdef __cplusplus
 } /* extern "C" { */
 #endif

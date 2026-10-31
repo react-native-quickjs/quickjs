@@ -1,0 +1,89 @@
+Subject: The profile records what `X.call(...)` is applied to, and the unit can recognise the builtin `call`
+
+What this does
+  - A `call_method` site whose callee is `Function.prototype.call` and whose receiver is a bytecode function X records X as a callee of kind 4 (profile text `callee=thru:<digest>`), beside the builtin's own record. Both interpreters' call_method ops pass the receiver (`AOT_PROF_CALLM`).
+  - `qjs_aot_function_call_fn()` (exported to the units, declared in quickjs-aot-rt.h) returns the builtin's function pointer, as `qjs_aot_function_apply_fn` does for `apply`.
+
+Why we need it
+  The constraint constructors chain through `Super.superConstructor.call(this, ...)`. The compiled caller saw only the builtin `call` as callee and so called it through the engine (call_method op, js_call_c_function, js_function_call, JS_Call, a frame): the compiled callee X was unknown to it. With X in the profile and the builtin recognisable, the caller can compare the two identities and call X's native entry directly.
+
+Soundness
+  Recording only: the profile file gains a callee kind. The helper returns an address.
+
+Functions touched
+  `js_aot_prof_call_this` (new), the two call_method ops, the profile writer, `qjs_aot_function_call_fn` (new).
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1997,0 +1998,2 @@
++static void js_aot_prof_call_this(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
++                                  JSValue fn, JSValue thisv, int argc);
+@@ -2036,0 +2039,4 @@
++/* A method call: also records what `f.call(...)` is applied to, see js_aot_prof_call_this. */
++#define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) \
++        do { if (unlikely(AOT_PROF_ON(b_))) \
++                 js_aot_prof_call_this((c_), (b_), (pc_), (fn_), (this_), (na_)); } while (0)
+@@ -2065,0 +2072 @@
++#define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) ((void)0)
+@@ -2833,0 +2841,2 @@
++static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
+@@ -29760 +29769 @@
+-    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, T_U8(9));
++    AOT_PROF_CALLM(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, FR(T_REG(5)), T_U8(9));
+@@ -37627 +37636 @@
+-                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
++                AOT_PROF_CALLM(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], regs[r], na);
+@@ -63883,0 +63893,32 @@
++}
++
++/* A call_method site whose callee is Function.prototype.call applied to a bytecode function X (`X.call(thisArg, ...)`): X is recorded as a
++   callee of kind 4, beside the builtin itself (kind 2), so the compiled caller can call X directly. */
++static void js_aot_prof_call_this(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
++                                  JSValue fn, JSValue thisv, int argc)
++{
++    js_aot_prof_call(ctx, b, pc, fn, argc);
++    if (JS_VALUE_GET_TAG(fn) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(thisv) == JS_TAG_OBJECT) {
++        JSObject *o = JS_VALUE_GET_OBJ(fn), *x = JS_VALUE_GET_OBJ(thisv);
++        if (o->class_id == JS_CLASS_C_FUNCTION && o->u.cfunc.c_function.generic == js_function_call &&
++            x->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++            JSAotProfFunc *pf = js_aot_prof_ensure(ctx->rt, b);
++            JSAotProfCall *c = pf ? aot_call_slot(ctx->rt, pf, pc) : NULL;
++            uint8_t digest[16];
++            int i;
++            if (!c)
++                return;
++            js_aot_digest(x->u.func.function_bytecode, digest);
++            for (i = 0; i < c->ncallee; i++)
++                if (c->callee[i].kind == 4 && memcmp(c->callee[i].digest, digest, 16) == 0)
++                    break;
++            if (i == c->ncallee && c->ncallee < 4) {
++                memset(&c->callee[i], 0, sizeof(c->callee[i]));
++                c->callee[i].kind = 4;
++                memcpy(c->callee[i].digest, digest, 16);
++                c->ncallee++;
++            }
++            if (i < c->ncallee)
++                c->callee[i].hits++;
++        }
++    }
+@@ -64392,0 +64434,4 @@
++            } else if (ce->kind == 4) {
++                char cd[33];
++                aot_digest_hex(ce->digest, cd);
++                fprintf(f, "callee=thru:%s", cd);
+@@ -65346,0 +65392,7 @@
++/* The function pointer of the builtin `Function.prototype.call`, which a C function object holds with cproto generic: a unit that
++   calls `X.call(thisArg, ...)` as a direct call of X compares the callee it would bypass against this. */
++QJS_AOT_STUB const void *qjs_aot_function_call_fn(void)
++{
++    return (const void *)js_function_call;
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -238,0 +239,2 @@
++/* the function pointer of the builtin `Function.prototype.call` (cproto generic), to recognise the callee of `X.call(thisArg, ...)` */
++QJS_AOT_STUB const void *qjs_aot_function_call_fn(void);

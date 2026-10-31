@@ -1,0 +1,43 @@
+Subject: The generator can read each function's closure-variable table
+
+What this does
+  - `JSAotGenFunc` gains `closure_count`, `closure_type[]` and `closure_idx[]`, copied from the function bytecode's `closure_var` table in `js_aot_gen_collect` and released in `js_aot_gen_free`. Entry i describes the variable behind `get_var_ref` / `put_var_ref` i: the engine's closure type (local or argument of the creating function, or one of its own closure variables) and its index.
+
+Why we need it
+  The offline analysis models every closure variable of a program as one shared node, so one unknown write (the Octane harness's `continuation = continuation()`) poisons every captured variable, leaves calls through captured objects unresolved, and keeps whole call trees from being analysed. To give each variable its own cell the generator has to follow a `get_var_ref` index to the function that declares the variable.
+
+Soundness
+  Generator-side data only: nothing on the run-time paths changes, the table is read once when the generator collects the program's functions.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -69539,0 +69540,17 @@
++                if (b->closure_var_count > 0 && b->closure_var != NULL) {
++                    uint8_t *cty = js_malloc_rt(rt, (size_t)b->closure_var_count);
++                    uint16_t *cix = js_malloc_rt(rt, sizeof(uint16_t) * (size_t)b->closure_var_count);
++                    if (cty && cix) {
++                        int ci;
++                        for (ci = 0; ci < b->closure_var_count; ci++) {
++                            cty[ci] = b->closure_var[ci].closure_type;
++                            cix[ci] = b->closure_var[ci].var_idx;
++                        }
++                        g->closure_count = b->closure_var_count;
++                        g->closure_type = cty;
++                        g->closure_idx = cix;
++                    } else {
++                        js_free_rt(rt, cty);
++                        js_free_rt(rt, cix);
++                    }
++                }
+@@ -69580,0 +69598,2 @@
++            js_free_rt(rt, (void *)arr[i].closure_type);
++            js_free_rt(rt, (void *)arr[i].closure_idx);
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -76,0 +77,6 @@
++    /* The closure-variable table: entry i is the variable behind get_var_ref / put_var_ref i. `closure_type[i]` is the engine's closure type (0 = a local of the
++       creating function, 1 = an argument of it, 2 = a closure variable of it, others = global / module forms) and `closure_idx[i]` the variable's index in that
++       function (locals and arguments are indexed apart). The generator follows a variable to its declaring function with these and the creators' `cpool_fn`. */
++    int closure_count;
++    const uint8_t *closure_type;
++    const uint16_t *closure_idx;

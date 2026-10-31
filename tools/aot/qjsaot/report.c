@@ -36,6 +36,8 @@ typedef struct {
 } EOpWeight;
 static EOpWeight e_opw[ROP_COUNT];
 
+FILE *e_report_file(void) { return e_rep; }
+
 void e_report_open(const char *path) {
   if (path == NULL || path[0] == 0) return;
   e_rep = fopen(path, "w");
@@ -168,4 +170,10 @@ void e_report_close(void) {
   fprintf(e_rep, "opcall-ops ops=%d\n", n);
   fclose(e_rep);
   e_rep = NULL;
+}
+
+void e_report_fast(const char *hex, const char *name, int ok, const char *why) {
+  if (e_rep == NULL) return;
+  if (ok) fprintf(e_rep, "fast %s hex=%s ok\n", name[0] ? name : "<anon>", hex);
+  else fprintf(e_rep, "fast %s hex=%s not: %s\n", name[0] ? name : "<anon>", hex, why);
 }

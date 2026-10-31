@@ -33,8 +33,14 @@
 
 #if QJS_AOT_PROFILE && !defined(_WIN32)
 #include <dlfcn.h> /* dladdr */
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>   /* the main image's header and slide */
+#include <mach-o/loader.h> /* LC_SYMTAB / __LINKEDIT walk, for naming static C callees */
+#include <mach-o/nlist.h>
+#else
 #include <elf.h>   /* symbol table walk, for naming static C callees */
 #include <link.h>  /* dl_iterate_phdr, for the image load base */
+#endif
 #endif
 
 #ifndef QJS_FNSAMPLE
@@ -591,7 +597,7 @@ typedef struct JSAotRun {
 #define QJS_AOT_CLAIM_MAX_LAYOUTS 63
 _Static_assert(QJS_AOT_CLAIM_MAX_LAYOUTS == (QJS_AOT_CLAIM_OBJ_NN(63) & 0x3f), "a layout id fits in 6 bits");
 #endif
-#define JS_AOT_GWATCH_MAX 16
+#define JS_AOT_GWATCH_MAX 256
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -762,9 +768,14 @@ struct JSRuntime {
        function that validated its cache cells at some epoch may trust them while it is
        unchanged. */
     uint32_t aot_pic_epoch;
+    /* Bumped whenever a shape is freed or edited in place: an address-keyed cache validates against it. Kept here, with the
+       other epochs a compiled unit reads by offset, where its offset does not depend on the build's optional fields. */
+    uint32_t shape_free_epoch;
+    /* Moved only when an OBSERVED shape (JSShape.aot_observed) is freed or edited in place. A unit reads it at the offset right after
+       shape_free_epoch (a static assertion below keeps them adjacent). */
+    uint32_t shape_obs_epoch;
     /* Atoms of global-object properties a compiled body holds as literals. A write to one moves
        `aot_pic_epoch`; the cells of such a property never take the direct store. */
-    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
     uint32_t aot_gwatch_n;
     /* The contracted layouts: the shape each one ends, their count, and a bit per
        layout set once an object is seen to leave it. Empty without a unit. */
@@ -790,6 +801,10 @@ struct JSRuntime {
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
+    /* Fact groups (see the block before js_aot_content_store); NULL until the first one is made. */
+    struct JSAotFacts *aot_facts;
+    /* The bundle tag of the unit this runtime is bound to (0: none). */
+    uint64_t aot_unit_tag;
 
 #if QJS_AOT_PROFILE
     /* Nonzero when QJS_AOT_PROFILE_OUT named a file: the profiler's switch. */
@@ -854,7 +869,6 @@ struct JSRuntime {
     size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
 #endif
     JSMegaEntry *mega_cache;
-    uint32_t shape_free_epoch;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -868,6 +882,10 @@ struct JSRuntime {
        hang where the nested path raises RangeError. Runtime-scoped and appended
        last to keep the hot fields' offsets. */
     uint32_t regvm_tail_chain;
+    /* kept at the end so that the offsets of the fields generated code reads do not move: the list itself and its filter (bit (atom & 255) per watched atom: most stores of a
+       watched object name an unwatched atom and skip the list) */
+    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
+    uint64_t aot_gwatch_bloom[4];
 };
 
 #if QJS_REGVM_RECORD
@@ -1637,10 +1655,11 @@ struct JSMegaEntry {
 /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
    engine refuses a generated unit built against another version. The value
    encoding is part of the ABI: a unit compiled against one encoding reads a
-   different JSValue and must not bind against the other. */
-#ifndef QJS_AOT_ABI
-#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8) | ((uint32_t)QJS_NAN_BOXING64 << 9))
-#endif
+   different JSValue and must not bind against the other.
+   The ONE definition lives in quickjs-aot-rt.h, which this file includes
+   below and the generated unit includes too; a second copy here would be the
+   one the ENGINE compiles against while the unit used the other, which is
+   exactly the mismatch the version is meant to catch. */
 
 /* The layout facts the generated unit is compiled against. The struct and its
    hash live in quickjs-aot-rt.h so the engine and the unit share one definition;
@@ -1904,6 +1923,20 @@ typedef struct JSFunctionBytecode {
     uint8_t regvm_light;
     uint8_t regvm_light_fast; /* light, and its PIC needs no lazy allocation */
     uint32_t regvm_light_need;
+    /* How many JSValues of a light frame the collector must scan: the whole
+       register file the compiled unit may use, which is `regvm_reg_count` plus
+       the registers the generator allocates above the program's own (a
+       virtual object's argument window, a hoisted load). It is separate from
+       `regvm_reg_count` because that field also POSITIONS `var_refs` and the
+       handshake slots in the interpreter's flat frame layout
+       (`out->var_refs = out->regs + b->regvm_reg_count + REGVM_HS`), so
+       raising it would move them. It is published by the unit at bind
+       (`qjs_aot_table[].reg_count`), and a frame whose count the unit could
+       not publish keeps `regvm_light_scan` equal to `regvm_reg_count`. Only a
+       light frame is scanned this wide: its register array is the unit's own
+       `JSValue fr[N]`, sized to the same count, so there is nothing past the
+       end. */
+    uint32_t regvm_light_scan;
     /* Bytes from a frame's `fr` to its end (the larger of the record and light
        shapes, rounded to 16), so a light callee is placed directly above its
        caller without reading the arena top. */
@@ -1946,6 +1979,7 @@ typedef struct JSFunctionBytecode {
     /* The function is the constructor of a contracted layout (the unit says so at
        bind): creating its function object builds that layout's chain. */
     uint8_t aot_layout_ctor;
+    uint8_t aot_layout_tries;   /* attempts the layout hook has made for this bytecode while rows of its digest were still unbuilt (see js_aot_layout_fn_hook) */
 #endif
 } JSFunctionBytecode;
 
@@ -1975,6 +2009,8 @@ static inline void js_aot_prof_store_packed(JSFunctionBytecode *b, JSObject *o)
 }
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
+static void js_aot_prof_call_this(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
+                                  JSValue fn, JSValue thisv, int argc);
 static void js_aot_prof_call_result(JSFunctionBytecode *b, uint8_t *rip,
                                     JSValue v);
 #if QJS_REGVM_THREAD
@@ -2014,6 +2050,10 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
         do { if (unlikely(AOT_PROF_ON(b_))) \
                  js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_)); } while (0)
+/* A method call: also records what `f.call(...)` is applied to, see js_aot_prof_call_this. */
+#define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) \
+                 js_aot_prof_call_this((c_), (b_), (pc_), (fn_), (this_), (na_)); } while (0)
 /* A bytecode callee returned `v_` into frame `c_` (a regvm frame) resuming at
    `rip_`: record it against the call site that ends there. */
 #define AOT_PROF_CALL_RESULT(c_, rip_, v_) \
@@ -2043,6 +2083,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) ((void)0)
 #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
+#define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) ((void)0)
 #define AOT_PROF_CALL_RESULT(c_, rip_, v_) ((void)0)
 #define AOT_PROF_TICK(f_, ip_)      ((void)0)
 #define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
@@ -2057,6 +2098,19 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #endif
 #endif
 
+/* The register file a frame of `b` holds: the program's own count, widened to
+   the count the unit compiled the body for when a unit is bound (see
+   `regvm_light_scan`). Everything that sizes or scans a frame goes through this,
+   so the unit's own array and the engine's arena frame cannot disagree. */
+static inline uint32_t regvm_frame_regs(const JSFunctionBytecode *b)
+{
+    uint32_t n = b->regvm_reg_count > 0 ? (uint32_t)b->regvm_reg_count : 0;
+
+    if (b->regvm_light_scan > n)
+        n = b->regvm_light_scan;
+    return n;
+}
+
 #if QJS_AOT
 /* AOT runtime. `js_aot_digest` is the profiler digest, reused as the binding
    key; `js_aot_bind` is called from regvm_set_call_desc. The ABI header
@@ -2067,6 +2121,9 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 static void js_aot_digest(JSFunctionBytecode *b, uint8_t out[16]);
 #endif
 static void js_aot_bind(JSFunctionBytecode *b);
+/* Recompute the parts of the call descriptor that depend on the frame's register
+   count; `js_aot_bind` calls it after the unit publishes a wider count. */
+static void regvm_set_frame_shape(JSFunctionBytecode *b);
 void js_aot_stats_dump(JSRuntime *rt);
 static void aot_run_free(JSRuntime *rt);
 extern uint64_t js_aot_bound_count;
@@ -2391,6 +2448,10 @@ struct JSShape {
        the index the dumped table gives it. Only in a build that can profile. */
     uint8_t aot_prof_seen;
     uint16_t aot_prof_id;
+    /* Some compiled-code table keyed by this shape's address holds it without a reference (a switch arm's slot table, a learned method
+       table): freeing or editing it in place moves shape_obs_epoch, which those tables validate instead of shape_free_epoch, so the
+       churn of unobserved shapes costs them nothing. Also set when a PIC cell holds the shape (the counters). */
+    uint8_t aot_observed;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -2791,6 +2852,8 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv, int shift);
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv);
+static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv);
 static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv, int magic);
 static JSValue js_object_defineProperty(JSContext *ctx, JSValueConst this_val,
@@ -2922,6 +2985,15 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
 static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p);
+/* What a watched object (JSObject.gv_watched) reports to the fact groups, from the engine's lowest-level mutators. */
+enum { JS_AOT_EV_ADD = 1, JS_AOT_EV_STORE, JS_AOT_EV_EDIT, JS_AOT_EV_PROTO, JS_AOT_EV_CONSTRUCT };
+static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
+static void js_aot_facts_free(JSRuntime *rt);
+static void js_aot_layout_facts_break(JSRuntime *rt, uint32_t layout_id);
+#if QJS_AOT
+static void js_aot_unit_release(JSRuntime *rt);
+#endif
+static void js_aot_facts_eval_scan(JSContext *ctx, JSFunctionBytecode *b);
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v);
 static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p);
 static inline void js_aot_content_filled(JSRuntime *rt, JSObject *p);
@@ -3129,7 +3201,7 @@ static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
     rt->malloc_gc_threshold = after + step;
 }
 
-static void js_trigger_gc(JSRuntime *rt, size_t size)
+static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t size)
 {
     bool force_gc;
 #ifdef FORCE_GC_AT_MALLOC
@@ -3183,6 +3255,17 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
             js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
         }
     }
+}
+
+/* The threshold test stays inline at every allocation site; the collection itself is out of line. */
+static inline __attribute__((always_inline)) void js_trigger_gc(JSRuntime *rt, size_t size)
+{
+#ifdef FORCE_GC_AT_MALLOC
+    js_trigger_gc_slow(rt, size);
+#else
+    if (unlikely((rt->malloc_state.malloc_size + size) > rt->malloc_gc_threshold))
+        js_trigger_gc_slow(rt, size);
+#endif
 }
 
 static size_t js_malloc_usable_size_unknown(const void *ptr)
@@ -3342,6 +3425,22 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
     }
 }
 
+/* An arena just lost its last used block.
+   Keep a bounded number of empty arenas: a batch of deferred frees
+   empties whole arenas and the allocations that follow need them
+   back. An empty arena stays on its class's free list;
+   js_arena_trim releases them after a full collection. */
+static no_inline void js_arena_empty(JSRuntime *rt, JSArena *ar)
+{
+    if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
+        rt->arena_state.n_empty++;
+    } else {
+        list_del(&ar->link);
+        list_del(&ar->free_link);
+        rt->mf.js_free(rt->malloc_state.opaque, ar);
+    }
+}
+
 static void js_arena_free(JSRuntime *rt, void *ptr)
 {
     JSMallocBlockHeader *b;
@@ -3369,19 +3468,8 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
             list_add(&ar->free_link,
                      &rt->arena_state.free_arena_list[block_size_idx]);
         ar->n_used_blocks--;
-        if (unlikely(ar->n_used_blocks == 0)) {
-            /* Keep a bounded number of empty arenas: a batch of deferred frees
-               empties whole arenas and the allocations that follow need them
-               back. An empty arena stays on its class's free list;
-               js_arena_trim releases them after a full collection. */
-            if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
-                rt->arena_state.n_empty++;
-            } else {
-                list_del(&ar->link);
-                list_del(&ar->free_link);
-                rt->mf.js_free(rt->malloc_state.opaque, ar);
-            }
-        }
+        if (unlikely(ar->n_used_blocks == 0))
+            js_arena_empty(rt, ar);
     }
 }
 
@@ -3605,6 +3693,36 @@ void js_free_rt(JSRuntime *rt, void *ptr)
         return;
 
     s = &rt->malloc_state;
+    if (likely(!JS_ARENA_LARGE_BLOCKS_ONLY)) {
+        /* An arena block: its size class is in the header, so the accounted
+           size, the arena and the free-list push come from one header read
+           (js_arena_usable_size and js_arena_free each re-derive them). */
+        JSMallocBlockHeader *b = container_of(ptr, JSMallocBlockHeader, user_data);
+        unsigned int block_idx = b->u.block_idx;
+        if (likely(block_idx != JS_ARENA_FREE_NIL)) {
+            unsigned int block_size_idx = b->block_size_idx;
+            unsigned int block_size = arena_block_sizes[block_size_idx];
+            size_t sz = block_size - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD;
+            JSArena *ar;
+            if (unlikely(sz > s->malloc_size)) {
+                printf("js_free_rt: malloc_size underflow: freeing %zu but only %zu tracked\n", sz, s->malloc_size);
+                abort();
+            }
+            s->malloc_count--;
+            s->malloc_size -= sz;
+            ar = (JSArena *)((uint8_t *)b - (size_t)block_size * block_idx -
+                             sizeof(JSArena));
+            b->u.free_next = ar->first_free_block;
+            ar->first_free_block = block_idx;
+            if (unlikely(ar->n_used_blocks == ar->n_blocks))
+                list_add(&ar->free_link,
+                         &rt->arena_state.free_arena_list[block_size_idx]);
+            ar->n_used_blocks--;
+            if (unlikely(ar->n_used_blocks == 0))
+                js_arena_empty(rt, ar);
+            return;
+        }
+    }
     size_t free_size = js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
     if (unlikely(free_size > s->malloc_size)) {
         printf("js_free_rt: malloc_size underflow: freeing %zu but only %zu tracked\n", free_size, s->malloc_size);
@@ -4352,6 +4470,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     while (rt->aot_gwatch_n != 0)
         JS_FreeAtomRT(rt, rt->aot_gwatch[--rt->aot_gwatch_n]);
+    js_aot_facts_free(rt);
     for (int i = 0; i < JS_PIN_MEMO_SIZE; i++) {
         if (rt->pin_memo_shape[i]) {
             js_free_shape(rt, rt->pin_memo_shape[i]);
@@ -4480,6 +4599,9 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #if QJS_AOT || QJS_AOT_GEN
     js_free_rt(rt, rt->aot_bound);
+#endif
+#if QJS_AOT
+    js_aot_unit_release(rt);
 #endif
     js_free_rt(rt, rt->class_array);
 
@@ -8261,6 +8383,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->is_hashed = false;
     sh->parent = NULL;
     sh->layout_id = 0;
+    sh->aot_observed = 0;
     return sh;
 }
 
@@ -8364,6 +8487,9 @@ static JSShape *js_dup_shape(JSShape *sh)
     return sh;
 }
 
+#ifdef QJS_AOT_BUMPSTATS
+static uint64_t js_aot_shape_stat[8]; /* 0 frees, 1 frees of observed, 2 in-place edits, 3 in-place edits of observed */
+#endif
 static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 {
     uint32_t i;
@@ -8371,6 +8497,12 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 
     assert(JS_REF_COUNT(sh) == 0);
     rt->shape_free_epoch++;
+    if (sh->aot_observed)
+        rt->shape_obs_epoch++;
+#ifdef QJS_AOT_BUMPSTATS
+    js_aot_shape_stat[0]++;
+    if (sh->aot_observed) js_aot_shape_stat[1]++;
+#endif
     if (sh->is_hashed)
         js_shape_hash_unlink(rt, sh);
     if (sh->proto != NULL) {
@@ -8532,6 +8664,26 @@ _Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
 
 /* Release one entry's shape references and clear it. Also used by a refill
    before storing the new shapes. */
+/* Counters for the sites that move aot_pic_epoch (a build with -DQJS_AOT_BUMPSTATS=1 prints them with QJS_AOT_STATS); free otherwise. */
+#ifdef QJS_AOT_BUMPSTATS
+static uint64_t js_aot_bump_n[16];
+typedef struct { void *b; int site; uint64_t n; } JSAotThrash;
+static JSAotThrash js_aot_thrash[512];
+static void js_aot_thrash_note(void *b, int site)
+{
+    uint32_t h = (uint32_t)(((uintptr_t)b >> 4) * 2654435761u + (uint32_t)site * 40503u) & 511, k;
+    for (k = 0; k < 512; k++) {
+        JSAotThrash *t = &js_aot_thrash[(h + k) & 511];
+        if (t->b == NULL) { t->b = b; t->site = site; t->n = 1; return; }
+        if (t->b == b && t->site == site) { t->n++; return; }
+    }
+}
+#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; js_aot_bump_n[id_]++; } while (0)
+#define AOT_THRASH(b_, s_) js_aot_thrash_note((b_), (s_))
+#else
+#define AOT_THRASH(b_, s_) ((void)0)
+#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; } while (0)
+#endif
 static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
 {
     if (e->shape && e->kind != REG_PIC_GLOBAL)
@@ -8543,7 +8695,7 @@ static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
     e->slot_off = 0;
     e->misses = 0;
     e->kind = REG_PIC_EMPTY;
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 0);
 }
 
 /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
@@ -8886,11 +9038,32 @@ static inline void ic_watchpoint_bump(JSRuntime *rt)
     if (rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX)
         rt->ic_watchpoint_epoch++;
     rt->aot_epoch_bumps++;
-    rt->aot_pic_epoch++;    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
+    AOT_EPOCH_BUMP(rt, 1);    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
 }
 
 /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
    `to_sh` with the new value at `offset`. Mirrors ic_read_update's slot/poly policy. */
+/* Whether a store of `atom` into an object of shape `pre_sh` can only have been a plain add: no object on its prototype chain
+   is exotic or has a property of that name that changes what the store does (a setter or a read-only property; a writable data
+   property is shadowed by the store's own add and does not count). A store that ends with the property added by other means (a setter that defines it itself) must not be cached
+   as "append this property", because the replay would skip the setter. Used at fill time only. */
+static bool ic_store_is_plain_add(JSShape *pre_sh, JSAtom atom)
+{
+    JSObject *po;
+    JSProperty *ppr;
+    JSShapeProperty *prs;
+
+    for (po = pre_sh->proto; po != NULL; po = po->shape->proto) {
+        if (po->is_exotic)
+            return false;
+        prs = find_own_property(&ppr, po, atom);
+        /* A writable data property on a prototype is shadowed by the store, which adds an own property: the plain add. */
+        if (prs != NULL && ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE)))
+            return false;
+    }
+    return true;
+}
+
 static void ic_add_transition_update(JSRuntime *rt, JSFunctionBytecode *b,
                                      uint32_t ic_idx, JSShape *from_sh,
                                      JSShape *to_sh, uint32_t offset)
@@ -9038,6 +9211,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
            shape_free_epoch too, or a stub cache entry keyed on this address
            could alias the next shape allocated here. */
         ctx->rt->shape_free_epoch++;
+        ctx->rt->shape_obs_epoch++;
     } else {
         /* only resize the properties */
         list_del(&sh->header.link);
@@ -9052,6 +9226,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
         /* js_realloc may have moved the shape allocation. */
         ctx->rt->shape_free_epoch++;
+        ctx->rt->shape_obs_epoch++;
     }
     *psh = sh;
     sh->prop_size = new_size;
@@ -9130,6 +9305,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     js_free(ctx, get_alloc_from_shape(old_sh));
     /* see resize_properties above */
     ctx->rt->shape_free_epoch++;
+    ctx->rt->shape_obs_epoch++;
 
     /* reduce the size of the object properties */
     new_prop = js_prop_grow(ctx, p, sizeof(new_prop[0]) * new_size);
@@ -9157,7 +9333,7 @@ static void js_gv_site_flush(JSRuntime *rt, struct list_head *head)
             if (b->regvm_pic[j].kind == REG_PIC_GLOBAL)
                 b->regvm_pic[j].slot_off = 0;
         }
-        rt->aot_pic_epoch++;
+        AOT_EPOCH_BUMP(rt, 2);
     }
 }
 #endif
@@ -9168,7 +9344,7 @@ static void js_gv_cell_invalidate(JSRuntime *rt)
 #if QJS_REGVM
     /* A compiled function holds the property slots of the global sites it read at some epoch;
        they are valid only for the generation they were read at. */
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 3);
 #endif
     if (unlikely(++rt->gv_cell_gen == 0)) {
         struct list_head *el;
@@ -9195,8 +9371,10 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
     intptr_t h;
 
     /* A watched object gaining a property can shadow a cached name. */
-    if (unlikely(p != NULL && p->gv_watched))
+    if (unlikely(p != NULL && p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, atom, JS_UNDEFINED);
+    }
 
     /* update the shape hash */
     if (sh->is_hashed) {
@@ -10622,6 +10800,75 @@ static void free_object(JSRuntime *rt, JSObject *p)
     }
 }
 
+/* free_object for the commonest garbage: a plain object (JS_CLASS_OBJECT, which
+   has no finalizer and no exotic behaviour) without weak references, freed from
+   free_zero_refcount, where gc_phase is DECREF. Nothing outside this call sees
+   the object once it returns, so the free_mark and fail-safe stores, the
+   finalizer lookup and the REMOVE_CYCLES test of free_object are skipped; every
+   other step runs in the same order. */
+static inline __attribute__((always_inline)) void
+free_plain_object(JSRuntime *rt, JSObject *p)
+{
+    int i;
+    JSShape *sh;
+    JSShapeProperty *pr;
+
+    assert(p->class_id == JS_CLASS_OBJECT && !p->first_weak_ref);
+    assert(rt->class_array[JS_CLASS_OBJECT].finalizer == NULL);
+    assert(rt->gc_phase == JS_GC_PHASE_DECREF);
+    sh = p->shape;
+    pr = get_shape_prop(sh);
+    for(i = 0; i < sh->prop_count; i++) {
+        if (likely(!(pr->flags & JS_PROP_TMASK))) {
+            JSValue v = p->prop[i].u.value;
+            if (JS_VALUE_HAS_REF_COUNT(v) &&
+                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
+                js_free_value_rt(rt, v);
+        } else {
+            free_property(rt, &p->prop[i], pr->flags);
+        }
+        pr++;
+    }
+    if (p->prop_inline_cap == 0)
+        js_free_rt(rt, p->prop);
+    js_free_shape(rt, sh);
+    remove_gc_object(&p->header);
+    js_free_rt(rt, p);
+}
+
+/* free_object for a fast Array (JS_CLASS_ARRAY) without weak references, freed from free_zero_refcount (gc_phase DECREF): the property loop of free_plain_object, then
+   the array finalizer's work (release the elements, free the element block unless it is inline), without the finalizer lookup, the fail-safe stores and the
+   REMOVE_CYCLES test. Every step runs in the order free_object runs it. */
+static inline __attribute__((always_inline)) void
+free_array_object(JSRuntime *rt, JSObject *p)
+{
+    int i;
+    JSShape *sh;
+    JSShapeProperty *pr;
+
+    assert(p->class_id == JS_CLASS_ARRAY && !p->first_weak_ref);
+    assert(rt->gc_phase == JS_GC_PHASE_DECREF);
+    sh = p->shape;
+    pr = get_shape_prop(sh);
+    for(i = 0; i < sh->prop_count; i++) {
+        if (likely(!(pr->flags & JS_PROP_TMASK))) {
+            JSValue v = p->prop[i].u.value;
+            if (JS_VALUE_HAS_REF_COUNT(v) &&
+                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
+                js_free_value_rt(rt, v);
+        } else {
+            free_property(rt, &p->prop[i], pr->flags);
+        }
+        pr++;
+    }
+    if (p->prop_inline_cap == 0)
+        js_free_rt(rt, p->prop);
+    js_free_shape(rt, sh);
+    js_array_finalizer(rt, JS_MKPTR(JS_TAG_OBJECT, p));
+    remove_gc_object(&p->header);
+    js_free_rt(rt, p);
+}
+
 static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
 {
     switch(JS_GC_TYPE(gp)) {
@@ -10648,7 +10895,16 @@ static void free_zero_refcount(JSRuntime *rt)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_REF_COUNT(p) == 0);
-        free_gc_object(rt, p);
+        if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
+                   ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
+                   ((JSObject *)p)->first_weak_ref == NULL))
+            free_plain_object(rt, (JSObject *)p);
+        else if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
+                        ((JSObject *)p)->class_id == JS_CLASS_ARRAY &&
+                        ((JSObject *)p)->first_weak_ref == NULL))
+            free_array_object(rt, (JSObject *)p);
+        else
+            free_gc_object(rt, p);
     }
     rt->gc_phase = JS_GC_PHASE_NONE;
 }
@@ -11304,6 +11560,69 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     }
 }
 
+/* mark_children for the commonest garbage and live data: a plain object or a fast Array without weak references. The shape, the data properties and (for an
+   Array) the elements are marked in a loop the compiler specialises for the mark function it is called with (gc_decref_child, gc_scan_incref_child,
+   gc_scan_incref_child2); a property that is not plain data (accessor, var_ref, autoinit) takes mark_children's own code. Marks the same set of references, in the same
+   order, as mark_children. Returns 0 (nothing done) for any other object. */
+static void mark_prop_special(JSRuntime *rt, JSProperty *pr, JSShapeProperty *prs, JS_MarkFunc *mark_func)
+{
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+        if (pr->u.getset.getter)
+            mark_func(rt, &pr->u.getset.getter->header);
+        if (pr->u.getset.setter)
+            mark_func(rt, &pr->u.getset.setter->header);
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+        if (pr->u.var_ref->is_detached ||
+            pr->u.var_ref->is_coro) {
+            mark_func(rt, &pr->u.var_ref->header);
+        }
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+        js_autoinit_mark(rt, pr, mark_func);
+    }
+}
+
+static inline __attribute__((always_inline)) int
+mark_children_fast(JSRuntime *rt, JSGCObjectHeader *gp, JS_MarkFunc *mark_func)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    int i;
+
+    if (unlikely(JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT))
+        return 0;
+    p = (JSObject *)gp;
+    if (unlikely(p->first_weak_ref != NULL ||
+                 (p->class_id != JS_CLASS_OBJECT && p->class_id != JS_CLASS_ARRAY)))
+        return 0;
+    sh = p->shape;
+    mark_func(rt, &sh->header);
+    prs = get_shape_prop(sh);
+    for(i = 0; i < sh->prop_count; i++) {
+        if (prs->atom != JS_ATOM_NULL) {
+            if (unlikely(prs->flags & JS_PROP_TMASK)) {
+                mark_prop_special(rt, &p->prop[i], prs, mark_func);
+            } else {
+                JSValue v = p->prop[i].u.value;
+                if (JS_VALUE_HAS_REF_COUNT(v) &&
+                    (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE))
+                    mark_func(rt, JS_VALUE_GET_PTR(v));
+            }
+        }
+        prs++;
+    }
+    if (p->class_id == JS_CLASS_ARRAY && JS_ARR_GENERIC(p)) {
+        uint32_t n = p->u.array.count, k;
+        for(k = 0; k < n; k++) {
+            JSValue v = JS_ARR_VALS(p)[k];
+            if (JS_VALUE_HAS_REF_COUNT(v) &&
+                (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE))
+                mark_func(rt, JS_VALUE_GET_PTR(v));
+        }
+    }
+    return 1;
+}
+
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
     assert(JS_REF_COUNT(p) > 0);
@@ -11327,7 +11646,8 @@ static void gc_decref(JSRuntime *rt)
     list_for_each_safe(el, el1, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_GC_MARK(p) == 0);
-        mark_children(rt, p, gc_decref_child);
+        if (!mark_children_fast(rt, p, gc_decref_child))
+            mark_children(rt, p, gc_decref_child);
         JS_GC_MARK(p) = 1;
         if (JS_REF_COUNT(p) == 0) {
             list_del(&p->link);
@@ -11363,13 +11683,15 @@ static void gc_scan(JSRuntime *rt)
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_REF_COUNT(p) > 0);
         JS_GC_MARK(p) = 0; /* reset the mark for the next GC call */
-        mark_children(rt, p, gc_scan_incref_child);
+        if (!mark_children_fast(rt, p, gc_scan_incref_child))
+            mark_children(rt, p, gc_scan_incref_child);
     }
 
     /* restore the refcount of the objects to be deleted. */
     list_for_each(el, &rt->tmp_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        mark_children(rt, p, gc_scan_incref_child2);
+        if (!mark_children_fast(rt, p, gc_scan_incref_child2))
+            mark_children(rt, p, gc_scan_incref_child2);
     }
 }
 
@@ -13093,6 +13415,8 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         js_dup(proto_val);
     }
 
+    if (unlikely(p->gv_watched))
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_PROTO, JS_ATOM_NULL, JS_UNDEFINED);
     if (js_shape_prepare_update(ctx, p, NULL))
         return -1;
     sh = p->shape;
@@ -13459,16 +13783,17 @@ static JSAutoInitFunc *const js_autoinit_func_table[] = {
 };
 
 /* warning: 'prs' is reallocated after it */
-static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
-                               JSProperty *pr, JSShapeProperty *prs)
+static int js_autoinit_one(JSContext *ctx, JSObject *p, JSProperty *pr, JSShapeProperty *prs)
 {
     JSValue val;
     JSContext *realm;
     JSAutoInitFunc *func;
+    JSAtom prop;
 
     if (js_shape_prepare_update(ctx, p, &prs))
         return -1;
 
+    prop = prs->atom;
     realm = js_autoinit_get_realm(pr);
     func = js_autoinit_func_table[js_autoinit_get_id(pr)];
     /* 'func' shall not modify the object properties 'pr' */
@@ -13481,6 +13806,46 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
     pr->u.value = val;
     return 0;
+}
+
+/* A plain builtin namespace object (Math, JSON, Reflect, Atomics, ...) carries
+   one lazy function property per member. Each materialisation edits the shape
+   (a clone while a cache holds it), so a cache filled between two of them is
+   stale by the next: Math's shape changed three times in rayTrace's first call.
+   The first touch of any lazy member settles all of them, in definition order,
+   so the shape is final before any cache can name it. The values and their
+   order equal the eager definition. */
+static int js_builtin_settle_off = -1;
+
+static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
+                               JSProperty *pr, JSShapeProperty *prs)
+{
+    (void)prop;
+    if (js_autoinit_get_id(pr) == JS_AUTOINIT_ID_PROP &&
+        p->class_id == JS_CLASS_OBJECT && !p->is_exotic &&
+        p != JS_VALUE_GET_OBJ(ctx->global_obj) &&
+        p != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) {
+#ifdef QJS_KIT_TEST_KNOBS
+        if (js_builtin_settle_off < 0)
+            js_builtin_settle_off = getenv("QJS_NO_BUILTIN_SETTLE") != NULL;
+#else
+        js_builtin_settle_off = 0;
+#endif
+        if (!js_builtin_settle_off) {
+            uint32_t i, n = p->shape->prop_count;
+            for (i = 0; i < n; i++) {
+                JSShapeProperty *q = &get_shape_prop(p->shape)[i];
+                JSProperty *qr = &p->prop[i];
+                if ((q->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
+                    js_autoinit_get_id(qr) == JS_AUTOINIT_ID_PROP) {
+                    if (js_autoinit_one(ctx, p, qr, q))
+                        return -1;
+                }
+            }
+            return 0;
+        }
+    }
+    return js_autoinit_one(ctx, p, pr, prs);
 }
 
 static int js_lazy_marker_is(JSValueConst v);
@@ -14616,8 +14981,10 @@ static JSProperty *add_property(JSContext *ctx,
     JSShape *sh, *new_sh;
 
     /* Covers add_property's find_hashed_shape_prop fast branch. */
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, prop, JS_UNDEFINED);
+    }
 
     if (unlikely(p->is_prototype)) {
         /* track addition of small integer properties to
@@ -14668,6 +15035,13 @@ static JSProperty *add_property(JSContext *ctx,
         }
     }
     assert(JS_REF_COUNT(p->shape) == 1);
+    /* A hashed shape that no other object or cache references and for which no transition exists is extended in place: the
+       same address now names a shape with one more property. See js_shape_prepare_update. */
+    if (p->shape->is_hashed) {
+        ctx->rt->shape_free_epoch++;
+        if (p->shape->aot_observed)
+            ctx->rt->shape_obs_epoch++;
+    }
     if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
         return NULL;
     return &p->prop[p->shape->prop_count - 1];
@@ -16399,12 +16773,13 @@ static void js_aot_layout_break(JSRuntime *rt, uint32_t layout_id)
     if (rt->aot_layout_broken & bit)
         return;
     rt->aot_layout_broken |= bit;
+    js_aot_layout_facts_break(rt, layout_id);
 #ifdef QJS_KIT_TEST_KNOBS
     if (getenv("QJS_AOT_NOEPOCHBUMP"))
         return;
 #endif
     rt->aot_epoch_bumps++;
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 4);
 }
 
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
@@ -16552,6 +16927,8 @@ static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot,
 static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
 {
     uint32_t i;
+    if (likely(rt->aot_gwatch_n == 0) || !(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
+        return false;
     for (i = 0; i < rt->aot_gwatch_n; i++)
         if (rt->aot_gwatch[i] == atom)
             return true;
@@ -16563,7 +16940,27 @@ static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
 static inline void js_aot_gwrite(JSRuntime *rt, JSAtom atom)
 {
     if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
-        rt->aot_pic_epoch++;
+        AOT_EPOCH_BUMP(rt, 5);
+}
+
+static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
+
+/* A global binding is being written directly (not through the content-store hooks): besides the epoch, a watched atom reports the store to the fact groups, so a
+   fact that expects the property's value breaks. Only atoms on the watch list pay for the scan. */
+static __attribute__((noinline)) void js_aot_gwrite_slow(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
+{
+    if (!js_aot_gwatched(rt, atom))
+        return;
+    AOT_EPOCH_BUMP(rt, 5);
+    if (rt->aot_facts != NULL)
+        js_aot_obj_event(rt, p, JS_AOT_EV_STORE, atom, v);
+}
+
+static inline void js_aot_gwrite_val(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
+{
+    /* the filter bit first: most stores name an unwatched atom and pay a load and a test */
+    if (unlikely(rt->aot_gwatch_n != 0) && unlikely(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
+        js_aot_gwrite_slow(rt, p, atom, v);
 }
 
 static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
@@ -16572,6 +16969,586 @@ static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
         js_aot_gwrite(rt, get_shape_prop(p->shape)[slot].atom);
 }
 
+/* ---- fact groups (AOT-REDESIGN.md section 4) -----------------------------------------------
+   A fact group states what compiled code was built on about ONE object: its [[prototype]], the values of some of its own data
+   properties (function identities, mostly) and, when CLOSED, that it has no other own property. It has three states:
+     PENDING   made, not yet checked against the heap (or checked and different);
+     VALID     the object matches and every lowest-level mutator reports a change to it;
+     BROKEN    some mutator changed it (permanent: there is no re-promotion).
+   A dependent is a word and a mask in the unit's statics: the bit is set while the group is VALID and cleared when it breaks.
+   The object is flagged `gv_watched`, which the engine's mutators (add_shape_property, add_property, js_shape_prepare_update,
+   js_aot_content_store, the IC add paths, JS_SetPrototypeInternal, js_create_from_ctor_cap) already test, so every way of changing it
+   (bytecode, builtins, Reflect, defineProperty, freeze, spread, the C API) reports here. It is also marked a prototype, which keeps
+   the interpreter's add and store caches off it. Everything is per runtime: nothing in this block is process-global. */
+/* A dependent: a word and a mask in the caller's statics, 32 bits wide (`wide` 0, the first API) or 64 (`wide` 1, the facts_valid word). */
+struct JSAotFactDep { void *word; uint64_t mask; uint8_t wide; };
+struct JSAotLayoutDep { uint32_t layout; uint64_t *word; uint64_t mask; };
+struct JSAotFactProp { JSAtom atom; JSValue val; };
+struct JSAotFact {
+    JSRuntime *rt;
+    JSObject *obj;
+    JSValue objv;           /* the counted reference that keeps obj alive */
+    JSValue proto;          /* the expected [[prototype]] when QJS_AOT_FACT_PROTO is set */
+    uint32_t flags;
+    uint8_t state;
+    uint32_t layout;        /* a constructor-layout watch: the layout this group's break breaks (0: none) */
+    int nprops;
+    struct JSAotFactProp *props;
+    int ndep, depcap;
+    struct JSAotFactDep *dep;
+};
+typedef struct JSAotFacts {
+    JSAotFact **g;
+    int n, cap;
+    uint32_t breaks;
+    uint32_t fresh_pending; /* FRESH groups still PENDING: only they care about a construct */
+    uint32_t sweep_pending; /* a group broke since the last sweep: it may still hold values (the sweep is a walk of every group) */
+    struct JSAotLayoutDep *ld;      /* the facts_valid bits that depend on a layout */
+    int nld, ldcap;
+} JSAotFacts;
+
+#ifdef QJS_KIT_TEST_KNOBS
+/* The vkit's negative controls: QJS_AOT_FACTS_OFF=add,store,edit,proto,construct,eval,all switches a mechanism off so its case can be
+   seen to fail. */
+static uint32_t js_aot_facts_off_mask(void)
+{
+    static int init;
+    static uint32_t m;
+    if (!init) {
+        const char *s = getenv("QJS_AOT_FACTS_OFF");
+        init = 1;
+        if (s != NULL) {
+            if (strstr(s, "all")) m = ~0u;
+            if (strstr(s, "add")) m |= 1u << JS_AOT_EV_ADD;
+            if (strstr(s, "store")) m |= 1u << JS_AOT_EV_STORE;
+            if (strstr(s, "edit")) m |= 1u << JS_AOT_EV_EDIT;
+            if (strstr(s, "proto")) m |= 1u << JS_AOT_EV_PROTO;
+            if (strstr(s, "construct")) m |= 1u << JS_AOT_EV_CONSTRUCT;
+            if (strstr(s, "layout")) m |= 1u << 6;
+            if (strstr(s, "eval")) m |= 1u << 31;
+        }
+    }
+    return m;
+}
+#else
+#define js_aot_facts_off_mask() 0u
+#endif
+
+static bool js_aot_fact_same(JSValueConst a, JSValueConst b)
+{
+    int tag = JS_VALUE_GET_TAG(a);
+    if (tag != JS_VALUE_GET_TAG(b))
+        return false;
+    if (JS_VALUE_HAS_REF_COUNT(a))
+        return JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
+    if (JS_TAG_IS_FLOAT64(tag)) {
+        double x = JS_VALUE_GET_FLOAT64(a), y = JS_VALUE_GET_FLOAT64(b);
+        return memcmp(&x, &y, sizeof(x)) == 0;
+    }
+    if (tag == JS_TAG_INT || tag == JS_TAG_BOOL)
+        return JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b);
+    return true;
+}
+
+static int js_aot_fact_listed(const JSAotFact *g, JSAtom atom)
+{
+    int i;
+    for (i = 0; i < g->nprops; i++)
+        if (g->props[i].atom == atom)
+            return i;
+    return -1;
+}
+
+/* Whether the object is, right now, what the group says. */
+static bool js_aot_fact_matches(const JSAotFact *g)
+{
+    JSObject *p = g->obj;
+    int i, nabs = 0;
+    if (p->class_id == JS_CLASS_PROXY || p->class_id == JS_CLASS_MODULE_NS)
+        return false;
+    if (g->flags & QJS_AOT_FACT_PROTO) {
+        JSObject *sp = p->shape->proto;
+        if (JS_IsNull(g->proto) ? sp != NULL : sp != JS_VALUE_GET_OBJ(g->proto))
+            return false;
+    }
+    for (i = 0; i < g->nprops; i++) {
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, g->props[i].atom);
+        if (JS_VALUE_GET_TAG(g->props[i].val) == JS_TAG_UNINITIALIZED) {   /* ABSENT */
+            if (prs != NULL)
+                return false;
+            nabs++;
+            continue;
+        }
+        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !js_aot_fact_same(pr->u.value, g->props[i].val))
+            return false;
+    }
+    if ((g->flags & QJS_AOT_FACT_CLOSED) &&
+        p->shape->prop_count - p->shape->deleted_prop_count != g->nprops - nabs)
+        return false;
+    return true;
+}
+
+static void js_aot_fact_set_deps(JSAotFact *g, int on)
+{
+    int i;
+    for (i = 0; i < g->ndep; i++) {
+        /* The 64-bit dependents are armed by qjs_aot_facts_commit (a bit is the AND of its dependents), never here; a break clears them. */
+        if (g->dep[i].wide) {
+            if (!on)
+                *(uint64_t *)g->dep[i].word &= ~g->dep[i].mask;
+        } else if (on) {
+            *(uint32_t *)g->dep[i].word |= (uint32_t)g->dep[i].mask;
+        } else {
+            *(uint32_t *)g->dep[i].word &= ~(uint32_t)g->dep[i].mask;
+        }
+    }
+}
+
+/* Break a group: from a mutator, so nothing here allocates, frees or calls out. Its references are released later (sweep). */
+static void js_aot_fact_break_now(JSAotFacts *F, JSAotFact *g)
+{
+    if (g->state == QJS_AOT_FACT_BROKEN)
+        return;
+    if (g->state == QJS_AOT_FACT_PENDING && (g->flags & QJS_AOT_FACT_FRESH))
+        F->fresh_pending--;
+    g->state = QJS_AOT_FACT_BROKEN;
+    F->breaks++;
+    F->sweep_pending = 1;
+    js_aot_fact_set_deps(g, 0);
+    /* a constructor-layout watch: the layout was built on this `prototype` value */
+    if (g->layout != 0)
+        js_aot_layout_break(g->rt, g->layout);
+}
+
+static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i;
+    if (F == NULL || (js_aot_facts_off_mask() & (1u << ev)))
+        return;
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        int k;
+        if (g->obj != p || g->state == QJS_AOT_FACT_BROKEN)
+            continue;
+        if (ev == JS_AOT_EV_CONSTRUCT) {
+            /* an instance made before the group was valid has a prototype the group does not know */
+            if (g->state == QJS_AOT_FACT_PENDING && (g->flags & QJS_AOT_FACT_FRESH))
+                js_aot_fact_break_now(F, g);
+            continue;
+        }
+        if (g->state != QJS_AOT_FACT_VALID)
+            continue;
+        k = atom != JS_ATOM_NULL ? js_aot_fact_listed(g, atom) : -1;
+        switch (ev) {
+        case JS_AOT_EV_ADD:
+            if (k >= 0 || (g->flags & QJS_AOT_FACT_CLOSED))
+                js_aot_fact_break_now(F, g);
+            break;
+        case JS_AOT_EV_STORE:
+            if (k >= 0 && !js_aot_fact_same(val, g->props[k].val))
+                js_aot_fact_break_now(F, g);
+            break;
+        case JS_AOT_EV_EDIT:
+            /* a delete, an attribute change or a redefinition of a listed property, or of any property of a closed object (an edit
+               that names no property is a prototype change or an array conversion, which the PROTO event covers) */
+            if (k >= 0 || (g->flags & QJS_AOT_FACT_CLOSED))
+                js_aot_fact_break_now(F, g);
+            break;
+        case JS_AOT_EV_PROTO:
+            if (g->flags & QJS_AOT_FACT_PROTO)
+                js_aot_fact_break_now(F, g);
+            break;
+        }
+    }
+}
+
+/* Release what broken groups hold. Not from a mutator: freeing a value can run a finalizer. */
+static void js_aot_facts_sweep(JSRuntime *rt)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i, j;
+    if (F == NULL || !F->sweep_pending)
+        return;
+    F->sweep_pending = 0;
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        if (g->state != QJS_AOT_FACT_BROKEN || JS_IsUndefined(g->objv))
+            continue;
+        for (j = 0; j < g->nprops; j++) {
+            JS_FreeValueRT(rt, g->props[j].val);
+            JS_FreeAtomRT(rt, g->props[j].atom);
+        }
+        g->nprops = 0;
+        JS_FreeValueRT(rt, g->proto);
+        g->proto = JS_UNDEFINED;
+        JS_FreeValueRT(rt, g->objv);
+        g->objv = JS_UNDEFINED;
+        g->obj = NULL;
+    }
+}
+
+static void js_aot_facts_free(JSRuntime *rt)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i;
+    if (F == NULL)
+        return;
+    /* The words belong to the unit and outlive the runtime: no bit may stay set for the next runtime that binds it. */
+    for (i = 0; i < F->nld; i++)
+        *F->ld[i].word &= ~F->ld[i].mask;
+    for (i = 0; i < F->n; i++) {
+        int j;
+        for (j = 0; j < F->g[i]->ndep; j++)
+            if (F->g[i]->dep[j].wide)
+                *(uint64_t *)F->g[i]->dep[j].word &= ~F->g[i]->dep[j].mask;
+            else
+                *(uint32_t *)F->g[i]->dep[j].word &= ~(uint32_t)F->g[i]->dep[j].mask;
+        F->g[i]->state = QJS_AOT_FACT_BROKEN;
+    }
+    F->sweep_pending = 1;
+    js_free_rt(rt, F->ld);
+    js_aot_facts_sweep(rt);
+    for (i = 0; i < F->n; i++) {
+        js_free_rt(rt, F->g[i]->props);
+        js_free_rt(rt, F->g[i]->dep);
+        js_free_rt(rt, F->g[i]);
+    }
+    js_free_rt(rt, F->g);
+    js_free_rt(rt, F);
+    rt->aot_facts = NULL;
+}
+
+JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto, uint32_t flags,
+                            const JSAtom *atoms, int natoms)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAotFacts *F;
+    JSAotFact *g;
+    JSObject *p;
+    int i;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id == JS_CLASS_PROXY || p->class_id == JS_CLASS_MODULE_NS)
+        return NULL;
+    if (rt->aot_facts == NULL) {
+        rt->aot_facts = js_mallocz_rt(rt, sizeof(JSAotFacts));
+        if (rt->aot_facts == NULL)
+            return NULL;
+    }
+    js_aot_facts_sweep(rt);
+    F = rt->aot_facts;
+    g = js_mallocz_rt(rt, sizeof(*g));
+    if (g == NULL)
+        return NULL;
+    g->props = natoms > 0 ? js_mallocz_rt(rt, sizeof(g->props[0]) * (size_t)natoms) : NULL;
+    if (natoms > 0 && g->props == NULL) {
+        js_free_rt(rt, g);
+        return NULL;
+    }
+    g->rt = rt;
+    g->objv = js_dup(obj);
+    g->obj = p;
+    g->flags = flags;
+    g->proto = JS_UNDEFINED;
+    if (flags & QJS_AOT_FACT_FRESH)
+        F->fresh_pending++;
+    if (flags & QJS_AOT_FACT_PROTO)
+        g->proto = js_dup(JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT ? proto : JS_NULL);
+    for (i = 0; i < natoms; i++) {
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, atoms[i]);
+        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            goto fail;
+        g->props[g->nprops].atom = JS_DupAtom(ctx, atoms[i]);
+        g->props[g->nprops].val = js_dup(pr->u.value);
+        g->nprops++;
+    }
+    if (F->n == F->cap) {
+        int ncap = F->cap ? F->cap * 2 : 16;
+        JSAotFact **ng = js_realloc_rt(rt, F->g, sizeof(F->g[0]) * (size_t)ncap);
+        if (ng == NULL)
+            goto fail;
+        F->g = ng;
+        F->cap = ncap;
+    }
+    F->g[F->n++] = g;
+    /* From now on every mutator of the object reports to the groups. The object is a prototype as far as the engine's caches are
+       concerned (they stay off it), and the flag is one-way, like gv_watched. */
+    p->gv_watched = 1;
+    js_aot_mark_prototype(rt, p);
+    return g;
+fail:
+    for (i = 0; i < g->nprops; i++) {
+        JS_FreeValueRT(rt, g->props[i].val);
+        JS_FreeAtomRT(rt, g->props[i].atom);
+    }
+    JS_FreeValueRT(rt, g->proto);
+    JS_FreeValueRT(rt, g->objv);
+    js_free_rt(rt, g->props);
+    js_free_rt(rt, g);
+    return NULL;
+}
+
+/* Say what a PENDING group should find: the value of one own data property (replacing an earlier expectation of it), and the [[prototype]].
+   A group is made when its object first exists, before the program has finished building it; the expectation is its final state. */
+int qjs_aot_fact_expect(JSContext *ctx, JSAotFact *g, JSAtom atom, JSValueConst val)
+{
+    int k;
+    if (g->state != QJS_AOT_FACT_PENDING)
+        return -1;
+    k = js_aot_fact_listed(g, atom);
+    if (k >= 0) {
+        JSValue old = g->props[k].val;
+        g->props[k].val = js_dup(val);
+        JS_FreeValue(ctx, old);
+        return 0;
+    }
+    {
+        struct JSAotFactProp *np = js_realloc_rt(g->rt, g->props, sizeof(g->props[0]) * (size_t)(g->nprops + 1));
+        if (np == NULL)
+            return -1;
+        g->props = np;
+        g->props[g->nprops].atom = JS_DupAtom(ctx, atom);
+        g->props[g->nprops].val = js_dup(val);
+        g->nprops++;
+    }
+    return 0;
+}
+
+int qjs_aot_fact_expect_proto(JSContext *ctx, JSAotFact *g, JSValueConst proto)
+{
+    JSValue old;
+    if (g->state != QJS_AOT_FACT_PENDING)
+        return -1;
+    old = g->proto;
+    g->proto = js_dup(JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT ? proto : JS_NULL);
+    g->flags |= QJS_AOT_FACT_PROTO;
+    JS_FreeValue(ctx, old);
+    return 0;
+}
+
+int qjs_aot_fact_validate(JSContext *ctx, JSAotFact *g)
+{
+    (void)ctx;
+    if (g->state == QJS_AOT_FACT_PENDING && js_aot_fact_matches(g)) {
+        if (g->flags & QJS_AOT_FACT_FRESH)
+            g->rt->aot_facts->fresh_pending--;
+        g->state = QJS_AOT_FACT_VALID;
+        js_aot_fact_set_deps(g, 1);
+    }
+    return g->state;
+}
+
+int qjs_aot_fact_state(const JSAotFact *g)
+{
+    return g->state;
+}
+
+void qjs_aot_fact_depend(JSAotFact *g, uint32_t *word, uint32_t mask)
+{
+    if (g->ndep == g->depcap) {
+        int ncap = g->depcap ? g->depcap * 2 : 4;
+        struct JSAotFactDep *nd = js_realloc_rt(g->rt, g->dep, sizeof(g->dep[0]) * (size_t)ncap);
+        if (nd == NULL)
+            return;
+        g->dep = nd;
+        g->depcap = ncap;
+    }
+    g->dep[g->ndep].word = word;
+    g->dep[g->ndep].mask = mask;
+    g->dep[g->ndep].wide = 0;
+    g->ndep++;
+    if (g->state == QJS_AOT_FACT_VALID)
+        *word |= mask;
+}
+
+/* The facts_valid word: register, never arm. A bit already armed by another group stays honest: it is cleared if this group is not VALID. */
+void qjs_aot_fact_depend64(JSAotFact *g, uint64_t *word, uint64_t mask)
+{
+    if (g->ndep == g->depcap) {
+        int ncap = g->depcap ? g->depcap * 2 : 4;
+        struct JSAotFactDep *nd = js_realloc_rt(g->rt, g->dep, sizeof(g->dep[0]) * (size_t)ncap);
+        if (nd == NULL) {
+            *word &= ~mask;     /* cannot register: the bit must never read as valid */
+            return;
+        }
+        g->dep = nd;
+        g->depcap = ncap;
+    }
+    g->dep[g->ndep].word = word;
+    g->dep[g->ndep].mask = mask;
+    g->dep[g->ndep].wide = 1;
+    g->ndep++;
+    if (g->state != QJS_AOT_FACT_VALID)
+        *word &= ~mask;
+}
+
+int qjs_aot_layout_depend(JSContext *ctx, uint32_t layout_id, uint64_t *word, uint64_t mask)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAotFacts *F;
+    if (layout_id == 0 || layout_id > 63)
+        return -1;
+    if (rt->aot_facts == NULL) {
+        rt->aot_facts = js_mallocz_rt(rt, sizeof(JSAotFacts));
+        if (rt->aot_facts == NULL) {
+            *word &= ~mask;
+            return -1;
+        }
+    }
+    F = rt->aot_facts;
+    if (F->nld == F->ldcap) {
+        int ncap = F->ldcap ? F->ldcap * 2 : 16;
+        struct JSAotLayoutDep *nl = js_realloc_rt(rt, F->ld, sizeof(F->ld[0]) * (size_t)ncap);
+        if (nl == NULL) {
+            *word &= ~mask;
+            return -1;
+        }
+        F->ld = nl;
+        F->ldcap = ncap;
+    }
+    F->ld[F->nld].layout = layout_id;
+    F->ld[F->nld].word = word;
+    F->ld[F->nld].mask = mask;
+    F->nld++;
+    if ((rt->aot_layout_broken >> (layout_id - 1)) & 1) {
+        *word &= ~mask;
+        return 0;
+    }
+    return 1;
+}
+
+/* The single funnel of layout breaks (js_aot_layout_break) lands here: the bits that depend on the layout are cleared. */
+static void js_aot_layout_facts_break(JSRuntime *rt, uint32_t layout_id)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i;
+    if (F == NULL || (js_aot_facts_off_mask() & (1u << 6)))
+        return;
+    for (i = 0; i < F->nld; i++)
+        if (F->ld[i].layout == layout_id)
+            *F->ld[i].word &= ~F->ld[i].mask;
+}
+
+int qjs_aot_facts_commit(JSContext *ctx, uint64_t *word, uint64_t mask)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAotFacts *F = rt->aot_facts;
+    int i, j;
+    if (F != NULL) {
+        for (i = 0; i < F->nld; i++)
+            if (F->ld[i].word == word && (F->ld[i].mask & mask) && ((rt->aot_layout_broken >> (F->ld[i].layout - 1)) & 1))
+                return 0;
+        for (i = 0; i < F->n; i++) {
+            JSAotFact *g = F->g[i];
+            for (j = 0; j < g->ndep; j++)
+                if (g->dep[j].wide && g->dep[j].word == word && (g->dep[j].mask & mask) && g->state != QJS_AOT_FACT_VALID)
+                    return 0;
+        }
+    }
+    *word |= mask;
+    return 1;
+}
+
+void qjs_aot_facts_undepend(JSContext *ctx, uint64_t *word)
+{
+    JSAotFacts *F = ctx->rt->aot_facts;
+    int i, j, k;
+    if (F == NULL)
+        return;
+    for (i = 0, k = 0; i < F->nld; i++)
+        if (F->ld[i].word != word)
+            F->ld[k++] = F->ld[i];
+    F->nld = k;
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        for (j = 0, k = 0; j < g->ndep; j++)
+            if (!(g->dep[j].wide && g->dep[j].word == word))
+                g->dep[k++] = g->dep[j];
+        g->ndep = k;
+    }
+}
+
+uint64_t qjs_aot_layouts_broken(JSRuntime *rt)
+{
+    return rt->aot_layout_broken;
+}
+
+int qjs_aot_fact_absent(JSContext *ctx, JSAotFact *g, JSAtom atom)
+{
+    return qjs_aot_fact_expect(ctx, g, atom, JS_UNINITIALIZED);
+}
+
+JSAotFact *qjs_aot_fact_method(JSContext *ctx, JSValueConst holder, JSAtom atom, JSValueConst fn, const uint8_t *digest)
+{
+    JSAotFact *g;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    if (JS_VALUE_GET_TAG(holder) != JS_TAG_OBJECT || !JS_IsFunction(ctx, fn))
+        return NULL;
+    if (digest != NULL) {
+#if QJS_AOT
+        uint8_t d[16];
+        if (!qjs_aot_function_digest((JSValue)fn, d) || memcmp(d, digest, 16) != 0)
+            return NULL;
+#else
+        return NULL;
+#endif
+    }
+    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(holder), atom);
+    if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !js_aot_fact_same(pr->u.value, fn))
+        return NULL;
+    g = qjs_aot_fact_new(ctx, holder, JS_UNDEFINED, 0, &atom, 1);
+    if (g == NULL)
+        return NULL;
+    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
+        qjs_aot_fact_break(ctx, g);
+        return NULL;
+    }
+    return g;
+}
+
+JSAotFact *qjs_aot_fact_proto_is(JSContext *ctx, JSValueConst obj, JSValueConst proto)
+{
+    JSAotFact *g = qjs_aot_fact_new(ctx, obj, proto, QJS_AOT_FACT_PROTO, NULL, 0);
+    if (g == NULL)
+        return NULL;
+    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
+        qjs_aot_fact_break(ctx, g);
+        return NULL;
+    }
+    return g;
+}
+
+void qjs_aot_fact_break(JSContext *ctx, JSAotFact *g)
+{
+    JSAotFacts *F = ctx->rt->aot_facts;
+    if (F != NULL)
+        js_aot_fact_break_now(F, g);
+}
+
+uint32_t qjs_aot_facts_breaks(JSRuntime *rt)
+{
+    return rt->aot_facts != NULL ? rt->aot_facts->breaks : 0;
+}
+
+#if !QJS_AOT
+uint32_t qjs_aot_runtime_bound(JSRuntime *rt)
+{
+    (void)rt;
+    return 0;
+}
+
+uint64_t qjs_aot_runtime_bundle(JSRuntime *rt)
+{
+    return rt->aot_unit_tag;
+}
+#endif
+
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
 {
 #if QJS_AOT_PROFILE
@@ -16579,18 +17556,27 @@ static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slo
 #endif
     if (unlikely(p->shape->layout_id != 0))
         js_aot_content_store_slow(rt, p, slot, v);
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_aot_gwrite_slot(rt, p, slot);
+        if (unlikely(rt->aot_facts != NULL) && slot < (uint32_t)p->shape->prop_count)
+            js_aot_obj_event(rt, p, JS_AOT_EV_STORE, get_shape_prop(p->shape)[slot].atom, v);
+    }
 }
 
 /* An object has just adopted a contracted shape, or a template filled one. Every slot but the
    last is already written (the caller of an add writes the last one afterwards, and a layout
    never promises it), so the promises are checked once here. The check runs before the object
    can reach JS: no safepoint lies between the shape set or the fill and this call. */
+/* The private object qjs_aot_class_shape walks a class's shape chain with: its fields are undefined
+   placeholders, not values of the class, so its adds are no evidence against a slot claim. */
+static JSObject *js_aot_shape_scratch;
+
 static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p, bool filled)
 {
     uint32_t id = p->shape->layout_id, f, n;
     if (js_aot_claim_hooks_off() && !p->is_prototype)
+        return;
+    if (unlikely(p == js_aot_shape_scratch))
         return;
     /* A prototype object entering a contracted shape breaks it: the layout promises that none
        of its objects is one. This runs whether or not the layout makes any slot promise. */
@@ -16655,8 +17641,10 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
     uint32_t idx = 0;    /* prevent warning */
 
     /* Every in-place shape-property mutation passes through here. */
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_EDIT, pprs != NULL && *pprs != NULL ? (*pprs)->atom : JS_ATOM_NULL, JS_UNDEFINED);
+    }
 
     sh = p->shape;
     if (sh->is_hashed) {
@@ -16673,6 +17661,16 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
             if (pprs)
                 *pprs = &get_shape_prop(sh)[idx];
         } else {
+#ifdef QJS_AOT_BUMPSTATS
+            js_aot_shape_stat[2]++;
+            if (sh->aot_observed) js_aot_shape_stat[3]++;
+#endif
+            /* The shape is about to be edited where it stands, at the same address. Every cache that names a shape by its
+               address (the global stub cache, the compiled code's statics) validates with shape_free_epoch, so this move
+               retires what they recorded about it. */
+            ctx->rt->shape_free_epoch++;
+            if (sh->aot_observed)
+                ctx->rt->shape_obs_epoch++;
             js_shape_hash_unlink(ctx->rt, sh);
             sh->is_hashed = false;
         }
@@ -17366,7 +18364,7 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
     e->gslot = slot;
     e->slot_off = gen;
     e->kind = REG_PIC_GLOBAL;
-    ctx->rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(ctx->rt, 6);
     /* The profile counts the distinct generations a site was filled at: a site filled
        twice saw the global object change. */
     AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL, -1);
@@ -17506,7 +18504,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
             if (flag != 1 && likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
                                     JS_PROP_WRITABLE))
                 js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
-            js_aot_gwrite(ctx->rt, prop);
+            js_aot_gwrite_val(ctx->rt, p, prop, val);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -17519,7 +18517,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
             js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
-            js_aot_gwrite(ctx->rt, prop);
+            js_aot_gwrite_val(ctx->rt, p, prop, val);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -24247,12 +25245,9 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
                           JSVarRef **cur_var_refs,
                           JSStackFrame *sf)
 {
-    bool ctor = JS_AOT_LAYOUT_CTOR((JSFunctionBytecode *)JS_VALUE_GET_PTR(bfunc));
-    JSValue fn = js_closure_impl(ctx, bfunc, cur_var_refs, sf);
-
-    if (unlikely(ctor) && !JS_IsException(fn))
-        js_aot_layout_fn_hook(ctx, fn);
-    return fn;
+    /* A layout's chain is no longer built here: `F.prototype = X` usually follows the
+       closure. See js_create_from_ctor_cap. */
+    return js_closure_impl(ctx, bfunc, cur_var_refs, sf);
 }
 
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
@@ -25809,6 +26804,10 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
         return;                     /* already cached */
 
     misses = e->misses;
+    /* A dead site stays dead (the contract above): without this, the next fill of a dead site installed again and the one
+       after that dropped it again, so a polymorphic site cycled between cached and empty and moved the epoch every time. */
+    if (e->kind == REG_PIC_EMPTY && misses >= REG_PIC_MISS_LIMIT)
+        return;
     if (e->kind != REG_PIC_EMPTY) {
         if (++misses >= REG_PIC_MISS_LIMIT) {
             regvm_pic_entry_reset(rt, e, pholder);  /* drops the shape refs */
@@ -25820,11 +26819,13 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
     e->misses = misses;
     e->shape = js_dup_shape(rsh);
     *pholder = hsh ? js_dup_shape(hsh) : NULL;
+    rsh->aot_observed = 1;
+    if (hsh) hsh->aot_observed = 1;
     /* The property slot's own offset in the property array, not the value's
        size: JSProperty is at least 8 bytes in every encoding. */
     e->slot_off = slot * (uint32_t)sizeof(JSProperty);
     e->kind = kind;
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 7);
 }
 
 /* Hash an unhashed shape in place so the per-function PIC can hold it. A
@@ -25988,14 +26989,16 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                 b->regvm_pic_holder[nw + s2] = NULL;
                 regvm_pic_entry_reset(rt, &pic[s2], &b->regvm_pic_holder[s2]);
             }
-            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+            AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                               kind, rsh, hsh, slot);
             if (!need_mega &&
                 pic[s2].kind == REG_PIC_EMPTY &&
                 pic[s2].misses >= REG_PIC_MISS_LIMIT)
                 need_mega = 1;
         } else {
-            regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+            AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
                               kind, rsh, hsh, slot);
             /* The install may have pushed a live site over the miss limit;
                cache it globally too. */
@@ -26042,7 +27045,8 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                 }
                 if (pic[s2].shape == rsh)
                     regvm_pic_entry_reset(rt, &pic[s2], &b->regvm_pic_holder[s2]);
-                regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+                AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                                   REG_PIC_PROTO2, rsh, holder->shape, slot);
                 if (pic[s2].kind == REG_PIC_PROTO2)
                     b->regvm_pic_holder[nw + s2] = js_dup_shape(mid);
@@ -26210,7 +27214,7 @@ static inline __attribute__((always_inline)) JSValue regvm_get_field_ic_x(
                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
                 *p2 = t; b->regvm_pic_holder[s2] = th;
                 p2->misses = p1->misses; p1->misses = 0;
-                ctx->rt->aot_pic_epoch++;
+                /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
             }
             return js_dup(v);
         }
@@ -26264,7 +27268,7 @@ static __attribute__((noinline)) JSValue regvm_get_field_ic_slow(JSContext *ctx,
                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
                 *p2 = t; b->regvm_pic_holder[s2] = th;
                 p2->misses = p1->misses; p1->misses = 0;
-                ctx->rt->aot_pic_epoch++;
+                /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
             }
 #if QJS_DRC
             return js_dup(v2);
@@ -26358,7 +27362,8 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
             return;
         *ppic = pic;
     }
-    regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+    AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
                       REG_PIC_OWN_W, p->shape, NULL,
                       (uint32_t)(pr - p->prop));
     /* Add-transition fill, in the secondary way. When the store created `atom`
@@ -26368,9 +27373,13 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
        only while no interceptor has appeared on a prototype since. */
     if (pre_sh != NULL) {
         JSShape *nsh = p->shape;
-        if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+        /* Saturated: the epoch can no longer say that a prototype changed. The store is replayed as "append this property"
+           only when it was a plain add (see ic_store_is_plain_add). */
+        int plain_add = rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX && ic_store_is_plain_add(pre_sh, atom);
+        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
             int s2 = b->regvm_pic_count + site;
-            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+            AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                               REG_PIC_ADD_W, pre_sh, nsh,
                               (uint32_t)(pr - p->prop));
             pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
@@ -26408,8 +27417,10 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
     osh = p->shape;
     /* a watched object (the global objects) gaining a property invalidates
        every cached cell, the same as the generic add paths do */
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, JS_ATOM_NULL, JS_UNDEFINED);
+    }
     if (nsh->prop_size != osh->prop_size &&
         (uint32_t)nsh->prop_size > p->prop_inline_cap) {
         JSProperty *np = js_prop_grow(ctx, p,
@@ -27715,7 +28726,7 @@ static int regvm_debug_eval_light(JSContext *ctx, JSRegRun *lf,
     target->prev_frame = saved;
     target->rv_light = regvm_light_head(lf->caller);
     target->rv_rec = NULL;
-    REGVM_SET_ROOT(target, lf->fr, b->regvm_reg_count);
+    REGVM_SET_ROOT(target, lf->fr, regvm_frame_regs(b));
     if (vc < var_count) {
         JSValue *vars = js_malloc(ctx, sizeof(JSValue) * var_count);
         if (!vars)
@@ -27746,14 +28757,28 @@ static int regvm_debug_eval_light(JSContext *ctx, JSRegRun *lf,
 #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
 /* Walk one light chain, innermost first, publishing each frame's register
    window as a root range (registers borrow under DRC). The chain ends at the
-   first frame whose caller is real or NULL. */
+   first frame whose caller is real or NULL.
+
+   A light frame is scanned over `regvm_light_scan` JSValues, not
+   `regvm_reg_count`: a compiled body allocates its own registers ABOVE the
+   program's (a virtual object's argument window, a hoisted global read), and
+   those hold references too. They are inside the unit's own `JSValue fr[N]`
+   register array, which the unit sizes from the same count, so nothing past the
+   end is read. `regvm_reg_count` itself must not be raised: it positions
+   `var_refs` and the handshake slots in the INTERPRETER's flat frame layout.
+   Record frames keep the program's count, which is what the interpreter
+   layout actually has. */
 static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
 {
     for (; lf != NULL;
          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
         JSFunctionBytecode *b = lf->b;
-        if (lf->fr && b->regvm_reg_count)
-            fn(opaque, lf->fr, b->regvm_reg_count);
+        uint32_t n = b->regvm_light_scan;
+
+        if (n < (uint32_t)b->regvm_reg_count)
+            n = (uint32_t)b->regvm_reg_count;
+        if (lf->fr && n)
+            fn(opaque, lf->fr, n);
     }
 }
 #endif
@@ -29542,7 +30567,7 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
-    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, T_U8(9));
+    AOT_PROF_CALLM(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, FR(T_REG(5)), T_U8(9));
     /* Pure classify-and-jump; the lazy materialize is in
        `regvm_t_call_method_lazy`. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -29878,7 +30903,12 @@ static __attribute__((always_inline)) inline void regvm_light_fill(
     for (k = 0; k < vc; k++)
         __builtin_memcpy(&vb[k], &regvm_undefined_value, sizeof(JSValue));
     /* a light frame never suspends, so it has no handshake slots */
-    nregs = cb->regvm_reg_count;
+    /* Fill the WHOLE register file, not just the program's registers: the
+       collector scans the frame over `regvm_light_scan`, and a compiled body's
+       owns registers above `regvm_reg_count`. An uninitialised slot there would
+       be scanned as a JSValue -- a stale stack or arena word, freed or traced as
+       if it were a real value. */
+    nregs = (int)regvm_frame_regs(cb);
     /* One 16-byte `undefined` store per register. `__builtin_memcpy` from the
        constant is alignment- and aliasing-safe; the barrier keeps the loop from
        becoming a `memset` call. */
@@ -30059,7 +31089,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGV
 #if QJS_DRC
     f->local_count = slots + 2 + cb->var_count;
 #else
-    f->local_count = slots + 2 + cb->var_count + cb->regvm_reg_count
+    f->local_count = slots + 2 + cb->var_count + regvm_frame_regs(cb)
         + REGVM_HS - 1;
 #endif
 #if !QJS_REGVM_RECORD
@@ -33388,7 +34418,7 @@ static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slot
     out->arg_buf = (JSValue *)q;
     out->var_buf = out->arg_buf + arg_slots;
     out->regs = out->var_buf + b->var_count;
-    out->var_refs = (JSVarRef **)(out->regs + b->regvm_reg_count + REGVM_HS);
+    out->var_refs = (JSVarRef **)(out->regs + regvm_frame_regs(b) + REGVM_HS);
     out->ctl = (JSRegCtl *)(out->var_refs + b->var_ref_count);
     out->sf = &out->rec->sf_embed;
     return 0;
@@ -33595,20 +34625,65 @@ static int regvm_record_eligible(JSFunctionBytecode *cb)
    metadata are final: end of js_create_function, non-lazy deserialize, lazy
    materialization. `regvm_all_threaded` is never serialized, so a blob
    function stays ineligible. */
+/* The parts of the call descriptor that depend on `regvm_frame_regs`: the light
+   frame's size and the distance from `fr` to a frame's end. `regvm_set_call_desc`
+   runs it after eligibility is decided, and `js_aot_bind` runs it again when the
+   unit publishes a wider register count -- a frame sized before the bind would
+   put the unit's own registers past its end. */
+static void regvm_set_frame_shape(JSFunctionBytecode *b)
+{
+#if QJS_REGVM_RECORD
+    if (b->regvm_light) {
+        int lvc = b->var_count;
+#if QJS_DRC
+        if (b->var_count <= 255)
+            lvc = b->regvm_var_count;
+#endif
+        /* No variable area when the promotion map leaves no slot in it;
+           `regvm_light_enter` sizes `fr` the same way. The register file is the
+           wider compiled count: a web argument register or a hoisted load lands
+           above the program's own registers, and both the unit's `JSValue fr[N]`
+           and this arena frame must have room for it. */
+        b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
+            + sizeof(JSValue) * (size_t)((lvc ? b->var_count : 0)
+                                        + regvm_frame_regs(b));
+    }
+    /* The arena slot a record needs; `regvm_record_alloc` adds the reserved
+       argument copy. It covers the WIDER register file, because a bound
+       function's record runs the unit's compiled body. */
+    b->regvm_frame_need = sizeof(JSRegRun)
+        + sizeof(JSValue) * (size_t)(b->var_count + regvm_frame_regs(b)
+                                     + REGVM_HS)
+        + sizeof(JSVarRef *) * (size_t)b->var_ref_count
+        + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
+    /* the distance from `fr` to the frame's end, for both shapes */
+    {
+        size_t rec = (size_t)(regvm_frame_regs(b) + REGVM_HS) * sizeof(JSValue)
+                   + (size_t)b->var_ref_count * sizeof(JSVarRef *)
+                   + (size_t)b->regvm_ctl_count * sizeof(JSRegCtl);
+        size_t lite = (size_t)regvm_frame_regs(b) * sizeof(JSValue);
+        size_t off = rec > lite ? rec : lite;
+
+        b->regvm_end_off = (uint32_t)((off + 15) & ~(size_t)15);
+    }
+#else
+    (void)b;
+#endif
+}
+
 static void regvm_set_call_desc(JSFunctionBytecode *b)
 {
     b->regvm_call_ready = (b->func_kind == JS_FUNC_NORMAL && b->regvm_compiled
                            && !b->is_lazy && b->regvm_all_threaded) ? 1 : 0;
-    b->regvm_frame_need = sizeof(JSRegRun)
-        + sizeof(JSValue) * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS)
-        + sizeof(JSVarRef *) * (size_t)b->var_ref_count
-        + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
     /* Light eligibility: the record test, plus nothing to close, no owned
        argument copy, no control records, and no opcode that reads a record-only
        field or the JSStackFrame. */
     b->regvm_light = 0;
     b->regvm_light_fast = 0;
     b->regvm_light_need = 0;
+    /* The collector scans the program's own registers until a unit publishes the
+       wider count it compiled the body with (see `regvm_light_scan`). */
+    b->regvm_light_scan = (uint32_t)(b->regvm_reg_count > 0 ? b->regvm_reg_count : 0);
 #if QJS_REGVM_RECORD
 #if QJS_DRC
     if (b->regvm_call_ready && b->func_kind == JS_FUNC_NORMAL
@@ -33618,34 +34693,12 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
         && !(b->arg_count != 0 &&
              regvm_code_has_op(b->regvm_code, b->regvm_len, ROP_apply_arguments))) {
         b->regvm_light = 1;
-        {
-            int lvc = b->var_count;
-#if QJS_DRC
-            if (b->var_count <= 255)
-                lvc = b->regvm_var_count;
-#endif
-            /* No variable area when the promotion map leaves no slot in it;
-               `regvm_light_enter` sizes `fr` the same way. */
-            b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
-                + sizeof(JSValue)
-                    * (size_t)((lvc ? b->var_count : 0)
-                               + b->regvm_reg_count);
-            b->regvm_light_fast = (b->regvm_pic != NULL
-                                   || b->regvm_pic_count == 0);
-        }
+        b->regvm_light_fast = (b->regvm_pic != NULL
+                               || b->regvm_pic_count == 0);
     }
 #endif
-    /* the distance from `fr` to the frame's end, for both shapes */
-    {
-        size_t rec = (size_t)(b->regvm_reg_count + REGVM_HS) * sizeof(JSValue)
-                   + (size_t)b->var_ref_count * sizeof(JSVarRef *)
-                   + (size_t)b->regvm_ctl_count * sizeof(JSRegCtl);
-        size_t lite = (size_t)b->regvm_reg_count * sizeof(JSValue);
-        size_t off = rec > lite ? rec : lite;
-
-        b->regvm_end_off = (uint32_t)((off + 15) & ~(size_t)15);
-    }
 #endif
+    regvm_set_frame_shape(b);
 #if QJS_AOT
     /* Bind the generated entry, if any. A bound function is kept off the record
        and light paths so its calls reach js_regvm_execute's AOT entry; the
@@ -33761,7 +34814,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
            area (and owned argument copies). */
         rec->local_count = vcount;
 #else
-        rec->local_count = cb->var_count + cb->regvm_reg_count + REGVM_HS - 1;
+        rec->local_count = cb->var_count + regvm_frame_regs(cb) + REGVM_HS - 1;
 #endif
 #if !QJS_REGVM_RECORD
         sf->arg_count = na;
@@ -33778,7 +34831,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
 #if QJS_DRC
         rec->local_count = slots + vcount;
 #else
-        rec->local_count = slots + cb->var_count + cb->regvm_reg_count
+        rec->local_count = slots + cb->var_count + regvm_frame_regs(cb)
             + REGVM_HS - 1;
 #endif
         for (k = 0; k < slots; k++)
@@ -33809,7 +34862,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
     regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = rec;
-    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+    REGVM_SET_ROOT(sf, lay->regs, regvm_frame_regs(cb) + REGVM_HS - 1);
 
 #if !QJS_REGVM_RECORD
     sf->arg_buf = rec->arg_buf;
@@ -33819,7 +34872,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
     {
         int var_count = cb->var_count; /* the fill stays full */
         int var_ref_count = cb->var_ref_count;
-        int nregs = cb->regvm_reg_count + REGVM_HS;
+        int nregs = regvm_frame_regs(cb) + REGVM_HS;
 
         for (k = 0; k < var_count; k++)
             lay->var_buf[k] = JS_UNDEFINED;
@@ -33912,7 +34965,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
 #if QJS_DRC
     rec->local_count = slots + vcount;
 #else
-    rec->local_count = slots + cb->var_count + cb->regvm_reg_count
+    rec->local_count = slots + cb->var_count + regvm_frame_regs(cb)
         + REGVM_HS - 1;
 #endif
     for (k = 0; k < slots; k++)
@@ -33941,7 +34994,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
     regvm_light_seal(rt, rt->regvm_cur);
     sf->rv_light = rt->regvm_cur;
     sf->rv_rec = rec;
-    REGVM_SET_ROOT(sf, lay->regs, cb->regvm_reg_count + REGVM_HS - 1);
+    REGVM_SET_ROOT(sf, lay->regs, regvm_frame_regs(cb) + REGVM_HS - 1);
 
 #if !QJS_REGVM_RECORD
     sf->arg_buf = rec->arg_buf;
@@ -33949,7 +35002,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
     {
         int var_count = cb->var_count; /* the fill stays full */
         int var_ref_count = cb->var_ref_count;
-        int nregs = cb->regvm_reg_count + REGVM_HS;
+        int nregs = regvm_frame_regs(cb) + REGVM_HS;
 
         for (k = 0; k < var_count; k++)
             lay->var_buf[k] = JS_UNDEFINED;
@@ -34105,7 +35158,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #define SET_REG_P(d, v) do { JSValue _old_rv = regs[d]; if (REGVM_HAS_COUNT(_old_rv)) JS_FreeValue(ctx, _old_rv); regs[d] = (v); AOT_PROF_REG(b, (d), regs[d]); } while (0)
 #endif
 
-#define REGVM_SLOT(k) (regs[b->regvm_reg_count + (k)])        /*
+#define REGVM_SLOT(k) (regs[regvm_frame_regs(b) + (k)])        /*
          * Leave the frame for the engine. The continuation is the register pc
          * in sf->cur_pc, the control stack rides in slot 0, and the value being
          * handed over is already in slot 1, which is cur_sp[-1] because the
@@ -34119,9 +35172,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         sf->rv_owns_regs = (JS_VALUE_GET_TAG(_sus_code) == JS_TAG_INT); \
         if (sf->rv_owns_regs) \
             js_regvm_drc_suspend(ctx->rt, regs, \
-                                 (uint32_t)(b->regvm_reg_count + REGVM_HS - 1)); \
+                                 (uint32_t)(regvm_frame_regs(b) + REGVM_HS - 1)); \
         REGVM_SLOT(0) = js_int32(regvm_nctl); \
-        sp = regs + b->regvm_reg_count + REGVM_HS - 1; \
+        sp = regs + regvm_frame_regs(b) + REGVM_HS - 1; \
         ret_val = _sus_code; \
         goto done_generator; \
     } while (0)
@@ -34132,9 +35185,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         JSValue _sus_code = (code_); \
         sf->rv_owns_regs = 1; \
         js_regvm_drc_suspend(ctx->rt, regs, \
-                             (uint32_t)(b->regvm_reg_count + REGVM_HS - 1)); \
+                             (uint32_t)(regvm_frame_regs(b) + REGVM_HS - 1)); \
         REGVM_SLOT(0) = js_int32(regvm_nctl); \
-        sp = regs + b->regvm_reg_count + REGVM_HS - 1; \
+        sp = regs + regvm_frame_regs(b) + REGVM_HS - 1; \
         ret_val = _sus_code; \
         goto done_generator; \
     } while (0)
@@ -34157,7 +35210,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         if (sp == stack_buf) {
             /* Bound hoisted: the 16-byte stores through `regs` would otherwise
                force a reload of `b->regvm_reg_count` on every slot. */
-            int ninit = b->regvm_reg_count + REGVM_HS;
+            int ninit = regvm_frame_regs(b) + REGVM_HS;
 
 #ifdef AOT_MUT_FILL_DROP_ALL
             /* Gate mutant: no fill at all, so the pin and release walks see
@@ -34191,7 +35244,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                argument, which the yield arm adopts itself. */
             if (sf->rv_owns_regs)
                 js_regvm_drc_resume(ctx->rt, regs,
-                                    (uint32_t)(b->regvm_reg_count + 1));
+                                    (uint32_t)(regvm_frame_regs(b) + 1));
             sf->rv_owns_regs = 0;
             regvm_resume_marker = sf->cur_pc;
             rpc = regvm_resume_marker;
@@ -34201,9 +35254,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             /* a deopt continues at an instruction, it does not resume a yield */
             if (unlikely(flags & JS_CALL_FLAG_AOT_DEOPT))
                 regvm_resume_marker = NULL;
-            regvm_nctl = JS_VALUE_GET_INT(regs[b->regvm_reg_count]);
+            regvm_nctl = JS_VALUE_GET_INT(regs[regvm_frame_regs(b)]);
         }
-        sp = regs + b->regvm_reg_count + REGVM_HS - 1;
+        sp = regs + regvm_frame_regs(b) + REGVM_HS - 1;
         regvm_ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
 #if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
         /* From here the monolith's control stack is the entry record's: cold
@@ -37381,7 +38434,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int na = RD_U8();
                 /* `oargv`: `argv` is the activation's own argument vector. */
                 JSValue *oargv = &regs[ab];
-                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+                AOT_PROF_CALLM(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], regs[r], na);
 #ifdef QJS_REGVM_COUNT
                 js_regvm_argmoves += (uint64_t)na;
 #endif
@@ -37663,7 +38716,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
      done_generator:
         sf->cur_pc = pc;
         sf->cur_sp = sp;
-        regs[b->regvm_reg_count] = js_int32(regvm_nctl);
+        regs[regvm_frame_regs(b)] = js_int32(regvm_nctl);
         rt->regvm_cur = sf->rv_light;
         rt->current_stack_frame = sf->prev_frame;
         return ret_val;
@@ -37689,7 +38742,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             /* Registers do not own, so the walk stops at the register file. */
             JSValue *end = regs;
 #else
-            JSValue *end = regs + b->regvm_reg_count + REGVM_HS - 1;
+            JSValue *end = regs + regvm_frame_regs(b) + REGVM_HS - 1;
 #endif
 
             for (pval = local_buf; pval < end; pval++)
@@ -39790,8 +40843,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         if (likely(ar == NULL || ar->disabled == NULL ||
                    !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))
-            return ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
-                                          (JSValue *)argv, argc);
+        {
+            JSValue aot_ret;
+            js_aot_enter_count++;
+            aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
+                                             (JSValue *)argv, argc);
+            return aot_ret;
+        }
     }
     /* A compiled function with no native entry because its frame needs the record's
        tail (it reads `arguments`, the new target, the home object): the interpreter's
@@ -39852,7 +40910,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* The register frame's temporary area is the allocator's register count,
        not the stack VM's maximum depth. */
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
-                                     b->regvm_reg_count + REGVM_HS) +
+                                     regvm_frame_regs(b) + REGVM_HS) +
         sizeof(JSVarRef *) * b->var_ref_count +
         sizeof(JSRegCtl) * b->regvm_ctl_count;
 #else
@@ -39889,7 +40947,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     stack_buf = var_buf + b->var_count;
 #if QJS_REGVM
-    sf->var_refs = (JSVarRef **)(stack_buf + b->regvm_reg_count + REGVM_HS);
+    sf->var_refs = (JSVarRef **)(stack_buf + regvm_frame_regs(b) + REGVM_HS);
 #else
     sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
 #endif
@@ -39899,7 +40957,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* ordinary C-stack frame: not owned by a coroutine GC object */
     sf->cur_gc_obj = NULL;
 #if QJS_REGVM
-    REGVM_SET_ROOT(sf, stack_buf, b->regvm_reg_count + REGVM_HS - 1);
+    REGVM_SET_ROOT(sf, stack_buf, regvm_frame_regs(b) + REGVM_HS - 1);
 #else
     REGVM_SET_ROOT(sf, NULL, 0);
 #endif
@@ -41887,8 +42945,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSShape *osh = p->shape;
                                 /* a watched object gaining a property invalidates
                                    every cached cell, as the generic add paths do */
-                                if (unlikely(p->gv_watched))
+                                if (unlikely(p->gv_watched)) {
                                     js_gv_cell_invalidate(ctx->rt);
+                                    js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, JS_ATOM_NULL, JS_UNDEFINED);
+                                }
                                 if (nsh->prop_size != osh->prop_size) {
                                     JSProperty *np = js_prop_grow(ctx, p,
                                             sizeof(p->prop[0]) * nsh->prop_size);
@@ -41968,7 +43028,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JSShapeProperty *prs1 = find_own_property(&pr1, po, atom);
                             if (prs1 &&
                                 (prs1->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
-                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
+                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE &&
+                                ic_store_is_plain_add(pre_sh, atom))
                                 ic_add_transition_update(ctx->rt, b, ic_idx, pre_sh, nsh,
                                                          (uint32_t)(pr1 - po->prop));
                         }
@@ -43482,6 +44543,8 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
     JSProperty *ppr = NULL;
     JSFunctionBytecode *fb = NULL;
 
+    if (unlikely(ctx->rt->aot_facts != NULL) && ctx->rt->aot_facts->fresh_pending != 0 && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(ctor)->gv_watched)
+        js_aot_obj_event(ctx->rt, JS_VALUE_GET_OBJ(ctor), JS_AOT_EV_CONSTRUCT, JS_ATOM_NULL, JS_UNDEFINED);
     if (JS_IsUndefined(ctor)) {
         proto = js_dup(ctx->class_proto[class_id]);
     } else {
@@ -43498,6 +44561,12 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
                 JSValue pv;
 
                 fb = cp->u.func.function_bytecode;
+                /* The first construct of a function whose bytecode has a layout still to build: the
+                   chain is built against `ctor.prototype` as it is NOW, after any ES5-style
+                   `F.prototype = X`, and before this construct reads it. One byte of fb, already
+                   loaded; clear for every other function and, once tried, for this one. */
+                if (unlikely(JS_AOT_LAYOUT_CTOR(fb)))
+                    js_aot_layout_fn_hook(ctx, ctor);
                 if (fb->ctor_fn_shape == cp->shape) {
                     ppr = &cp->prop[fb->ctor_proto_slot];
                 } else {
@@ -43732,7 +44801,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     arg_buf_len = max_int(b->arg_count, argc);
 #if QJS_REGVM
     /* the register file and its handshake slots, not the stack VM's depth */
-    local_count = arg_buf_len + b->var_count + b->regvm_reg_count + REGVM_HS;
+    local_count = arg_buf_len + b->var_count + regvm_frame_regs(b) + REGVM_HS;
     alloc_size = sizeof(JSValue) * max_int(local_count, 1) +
         sizeof(JSVarRef *) * b->var_ref_count +
         sizeof(JSRegCtl) * b->regvm_ctl_count;
@@ -43753,9 +44822,9 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     /* set by the caller once the owning coroutine GC object exists */
     sf->cur_gc_obj = NULL;
 #if QJS_REGVM
-    REGVM_SET_ROOT(sf, sf->cur_sp, b->regvm_reg_count + REGVM_HS - 1);
+    REGVM_SET_ROOT(sf, sf->cur_sp, regvm_frame_regs(b) + REGVM_HS - 1);
     sf->rv_owns_regs = 0;
-    sf->var_refs = (JSVarRef **)(sf->cur_sp + b->regvm_reg_count + REGVM_HS);
+    sf->var_refs = (JSVarRef **)(sf->cur_sp + regvm_frame_regs(b) + REGVM_HS);
 #else
     REGVM_SET_ROOT(sf, NULL, 0);
     sf->var_refs = (JSVarRef **)(sf->cur_sp + b->stack_size);
@@ -43766,7 +44835,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
 #if QJS_REGVM
     /* where the interpreter publishes the control-stack depth, and how deep
        that stack can go: see async_func_free and async_func_mark */
-    s->regvm_depth_slot = sf->var_buf + b->var_count + b->regvm_reg_count;
+    s->regvm_depth_slot = sf->var_buf + b->var_count + regvm_frame_regs(b);
     s->regvm_ctl_cap = b->regvm_ctl_count;
 #endif
     for(i = 0; i < argc; i++)
@@ -43899,7 +44968,7 @@ static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
     uint32_t entry_pc;
 
     if (sf->rv_owns_regs)
-        js_regvm_drc_resume(rt, regs, (uint32_t)(b->regvm_reg_count + 1));
+        js_regvm_drc_resume(rt, regs, (uint32_t)(regvm_frame_regs(b) + 1));
     sf->rv_owns_regs = 0;
     sf->cur_pc = NULL;
     run.caller_ctx = ctx;
@@ -43915,7 +44984,7 @@ static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
     run.argc = s->argc;
     run.argv = sf->arg_buf;
     run.ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
-    run.nctl = JS_VALUE_GET_INT(regs[b->regvm_reg_count]);
+    run.nctl = JS_VALUE_GET_INT(regs[regvm_frame_regs(b)]);
     run.arg_buf = sf->arg_buf;
     run.var_buf = sf->var_buf;
     run.ret = JS_UNDEFINED;
@@ -43935,7 +45004,7 @@ static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
     if (unlikely(run.deopt_pc != QJS_AOT_NO_DEOPT)) {
         /* Hand the frame to the interpreter: the control depth goes back to its slot and the
            continuation is the recorded pc. */
-        regs[b->regvm_reg_count] = js_int32(run.nctl);
+        regs[regvm_frame_regs(b)] = js_int32(run.nctl);
         sf->cur_pc = b->regvm_code + run.deopt_pc;
         return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
                                 s->argc, vc(sf->arg_buf), sf, b, sf->arg_buf, sf->arg_buf,
@@ -43944,7 +45013,7 @@ static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
     }
     sf->cur_pc = run.sf->cur_pc;
     sf->cur_sp = run.sf->cur_sp;
-    regs[b->regvm_reg_count] = js_int32(run.nctl);
+    regs[regvm_frame_regs(b)] = js_int32(run.nctl);
     rt->regvm_cur = sf->rv_light;
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
@@ -45288,6 +46357,116 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #define short_opcode_info(op)           \
     opcode_info[(op) >= OP_TEMP_START ? \
                 (op) + (OP_TEMP_END - OP_TEMP_START) : (op)]
+
+/* ---- the eval scan --------------------------------------------------------------------------
+   Code that arrives as text (eval, indirect eval, new Function, a module loaded at run time, JS_Eval from the host) is looked at before
+   it first runs: the atoms it writes by name, and whether it can write a name it does not spell (a computed key, a spread, `with`,
+   delete, a prototype change, a nested eval). A group that lists a written atom, and every group when the code writes by a computed
+   key, is broken before the code runs, so a compiled body that depends on it leaves at its next test even if the store the engine's
+   hooks would have caught is never reached. Code that only reads costs nothing. */
+typedef struct JSAotScan {
+    JSAtom atoms[64];
+    int n;
+    bool dyn;
+} JSAotScan;
+
+static void js_aot_scan_atom(JSAotScan *s, JSAtom a)
+{
+    int i;
+    for (i = 0; i < s->n; i++)
+        if (s->atoms[i] == a)
+            return;
+    if (s->n < 64)
+        s->atoms[s->n++] = a;
+    else
+        s->dyn = true;
+}
+
+static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth);
+#if !QJS_REGVM
+static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth)
+{
+    int pos = 0, len, op, i;
+    const uint8_t *bc = b->byte_code_buf;
+    int bc_len = b->byte_code_len;
+    if (bc == NULL) {
+        /* no stack bytecode to read: assume the worst */
+        s->dyn = true;
+        return;
+    }
+    while (pos < bc_len) {
+        const JSOpCode *oi;
+        op = bc[pos];
+        oi = &short_opcode_info(op);
+        len = oi->size;
+        if (len <= 0)
+            break;
+        switch (op) {
+        case OP_put_field:
+        case OP_put_field_ic:
+        case OP_define_field:
+        case OP_define_method:
+        case OP_put_var:
+        case OP_put_var_init:
+        case OP_define_func:
+            if (pos + 5 <= bc_len)
+                js_aot_scan_atom(s, get_u32(bc + pos + 1));
+            break;
+        case OP_put_array_el:
+        case OP_put_ref_value:
+        case OP_put_super_value:
+        case OP_define_array_el:
+        case OP_define_method_computed:
+        case OP_copy_data_properties:
+        case OP_set_proto:
+        case OP_delete:
+        case OP_delete_var:
+        case OP_with_put_var:
+        case OP_with_delete_var:
+        case OP_eval:
+        case OP_apply_eval:
+            s->dyn = true;
+            break;
+        default:
+            break;
+        }
+        pos += len;
+    }
+    if (depth < 8 && b->cpool != NULL)
+        for (i = 0; i < b->cpool_count; i++)
+            if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+                js_aot_scan_bytecode(JS_VALUE_GET_PTR(b->cpool[i]), s, depth + 1);
+}
+
+#endif
+
+static void js_aot_facts_eval_scan(JSContext *ctx, JSFunctionBytecode *b)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAotFacts *F = rt->aot_facts;
+    JSAotScan s;
+    int i, j;
+    if (F == NULL || F->n == 0 || (js_aot_facts_off_mask() & (1u << 31)))
+        return;
+    s.n = 0;
+    s.dyn = false;
+    js_aot_scan_bytecode(b, &s, 0);
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        if (g->state != QJS_AOT_FACT_VALID)
+            continue;
+        if (s.dyn) {
+            js_aot_fact_break_now(F, g);
+            continue;
+        }
+        for (j = 0; j < s.n; j++)
+            if (js_aot_fact_listed(g, s.atoms[j]) >= 0) {
+                js_aot_fact_break_now(F, g);
+                break;
+            }
+    }
+}
+
 
 #if QJS_REGVM
 #include "quickjs-regvm.h"
@@ -62342,6 +63521,86 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
     return n;
 }
 
+#if QJS_REGVM
+/* The eval scan over a register program (see js_aot_facts_eval_scan): the atoms its stores name, and whether it can write a name it does not
+   spell. A function that is not materialized yet (lazy) is read when it first runs; its stores reach the objects' hooks like any other. */
+static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth)
+{
+    const uint8_t *code = b->regvm_code;
+    int len = b->regvm_len, off = 0, i;
+
+    if (b->is_lazy)
+        return;
+    if (code == NULL) {
+        s->dyn = true;
+        return;
+    }
+    while (off < len) {
+        int op = code[off], sz;
+        const char *fmt;
+        if (op <= 0 || op >= ROP_COUNT || (fmt = regvm_rop_fmt[op]) == NULL ||
+            (sz = regvm_fmt_size(fmt, 1, (uint16_t)op)) < 0 || off + 1 + sz > len) {
+            s->dyn = true;
+            break;
+        }
+        switch (op) {
+        case ROP_put_field:
+        case ROP_put_field_xfer:
+        case ROP_define_field:
+        case ROP_define_method:
+        case ROP_define_class:
+        case ROP_put_global:
+        case ROP_define_global:
+        case ROP_define_global_func: {
+            const uint8_t *p = code + off + 1;
+            const char *f;
+            int nar = regvm_rop_narrow((uint16_t)op);
+            for (f = fmt; *f; f++) {
+                if (*f == 'a') {
+                    js_aot_scan_atom(s, regvm_ld_u32(p));
+                    break;
+                }
+                switch (*f) {
+                case 'r': p += nar ? 1 : 2; break;
+                case 'i': case 'b': p += 1; break;
+                case 'u': case 's': p += 2; break;
+                case 't': p += nar ? 1 : 4; break;
+                default: p += 4; break;
+                }
+            }
+            break;
+        }
+        case ROP_put_element:
+        case ROP_put_element_xfer:
+        case ROP_define_element:
+        case ROP_define_method_computed:
+        case ROP_define_class_computed:
+        case ROP_put_ref_value:
+        case ROP_put_ref:
+        case ROP_put_super_value:
+        case ROP_super_put:
+        case ROP_copy_props:
+        case ROP_set_proto:
+        case ROP_delete:
+        case ROP_delete_var:
+        case ROP_with_put:
+        case ROP_with_delete:
+        case ROP_eval:
+        case ROP_apply_eval:
+            s->dyn = true;
+            break;
+        default:
+            break;
+        }
+        off += 1 + sz;
+    }
+    if (depth < 8 && b->cpool != NULL)
+        for (i = 0; i < b->cpool_count; i++)
+            if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+                js_aot_scan_bytecode(JS_VALUE_GET_PTR(b->cpool[i]), s, depth + 1);
+}
+#endif
+
 /* Does every opcode in a register program have a threaded handler? Read from
    the encoded bytes, the final form. `regvm_all_threaded` is never serialized,
    so the bundle read path runs the same walk. */
@@ -62860,6 +64119,9 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->reg_pic_add_w = REG_PIC_ADD_W;
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
     out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
+    out->off_rt_shape_free_epoch = (uint32_t)offsetof(JSRuntime, shape_free_epoch);
+    _Static_assert(offsetof(JSRuntime, shape_obs_epoch) == offsetof(JSRuntime, shape_free_epoch) + sizeof(uint32_t), "units read shape_obs_epoch right after shape_free_epoch");
+    out->off_fnbc_regvm_len = (uint32_t)offsetof(JSFunctionBytecode, regvm_len);
     {
         /* The object's flag bits and its inline slot capacity share one 16-bit word:
            find where it is and which bits each field takes by setting them in a
@@ -63631,6 +64893,38 @@ static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
         ce->hits++;
 }
 
+/* A call_method site whose callee is Function.prototype.call applied to a bytecode function X (`X.call(thisArg, ...)`): X is recorded as a
+   callee of kind 4, beside the builtin itself (kind 2), so the compiled caller can call X directly. */
+static void js_aot_prof_call_this(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
+                                  JSValue fn, JSValue thisv, int argc)
+{
+    js_aot_prof_call(ctx, b, pc, fn, argc);
+    if (JS_VALUE_GET_TAG(fn) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(thisv) == JS_TAG_OBJECT) {
+        JSObject *o = JS_VALUE_GET_OBJ(fn), *x = JS_VALUE_GET_OBJ(thisv);
+        if (o->class_id == JS_CLASS_C_FUNCTION && o->u.cfunc.c_function.generic == js_function_call &&
+            x->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSAotProfFunc *pf = js_aot_prof_ensure(ctx->rt, b);
+            JSAotProfCall *c = pf ? aot_call_slot(ctx->rt, pf, pc) : NULL;
+            uint8_t digest[16];
+            int i;
+            if (!c)
+                return;
+            js_aot_digest(x->u.func.function_bytecode, digest);
+            for (i = 0; i < c->ncallee; i++)
+                if (c->callee[i].kind == 4 && memcmp(c->callee[i].digest, digest, 16) == 0)
+                    break;
+            if (i == c->ncallee && c->ncallee < 4) {
+                memset(&c->callee[i], 0, sizeof(c->callee[i]));
+                c->callee[i].kind = 4;
+                memcpy(c->callee[i].digest, digest, 16);
+                c->ncallee++;
+            }
+            if (i < c->ncallee)
+                c->callee[i].hits++;
+        }
+    }
+}
+
 /* Record a returned value against the call site that ends at `rip`. Find only:
    a return into a frame whose resume address is not a profiled call site
    (a getter, a callback) records nothing. */
@@ -63736,7 +65030,7 @@ static void aot_type_str(uint16_t bits, char *out, int n)
         snprintf(out, (size_t)n, "none");
 }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
 static int aot_phdr_base(struct dl_phdr_info *info, size_t size, void *data)
 {
     (void)size;
@@ -63750,7 +65044,63 @@ static int aot_phdr_base(struct dl_phdr_info *info, size_t size, void *data)
    builds are linked -no-pie. */
 static const char *aot_sym_name(JSRuntime *rt, void *p, char *buf, int n)
 {
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    /* dladdr sees exported symbols only; the main image's LC_SYMTAB (in
+       __LINKEDIT, mapped) also holds the static functions of an unstripped
+       binary: the nearest preceding defined section symbol names `p`. */
+    Dl_info di;
+    const struct mach_header_64 *mh;
+    const struct load_command *lc;
+    const struct symtab_command *st = NULL;
+    const struct segment_command_64 *le = NULL;
+    const struct nlist_64 *sym;
+    const char *str;
+    uintptr_t slide, lebase, off, bestv = 0;
+    uint32_t i, best = 0;
+    int have_best = 0;
+
+    (void)rt;
+    if (!p)
+        return NULL;
+    if (dladdr(p, &di) && di.dli_sname && di.dli_saddr == p) {
+        snprintf(buf, (size_t)n, "%s", di.dli_sname[0] == '_' ? di.dli_sname + 1 : di.dli_sname);
+        return buf;
+    }
+    mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    if (!mh || mh->magic != MH_MAGIC_64)
+        return NULL;
+    lc = (const struct load_command *)(mh + 1);
+    for (i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SYMTAB)
+            st = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 &&
+                 !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT"))
+            le = (const struct segment_command_64 *)lc;
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    if (!st || !le)
+        return NULL;
+    lebase = slide + le->vmaddr - le->fileoff;
+    sym = (const struct nlist_64 *)(lebase + st->symoff);
+    str = (const char *)(lebase + st->stroff);
+    off = (uintptr_t)p - slide;
+    for (i = 0; i < st->nsyms; i++) {
+        if ((sym[i].n_type & N_STAB) || (sym[i].n_type & N_TYPE) != N_SECT)
+            continue;
+        if (sym[i].n_value <= off && (!have_best || sym[i].n_value > bestv)) {
+            best = i;
+            bestv = sym[i].n_value;
+            have_best = 1;
+        }
+    }
+    if (have_best) {
+        const char *nm = str + sym[best].n_un.n_strx;
+        snprintf(buf, (size_t)n, "%s", nm[0] == '_' ? nm + 1 : nm);
+        return buf;
+    }
+    return NULL;
+#elif !defined(_WIN32)
     Dl_info di;
     unsigned char *img;
     Elf64_Ehdr *eh;
@@ -64138,6 +65488,10 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
                 const char *sn = aot_sym_name(rt, ce->cfn, sbuf, sizeof(sbuf));
                 fprintf(f, "callee=c:%s:fn=%p:magic=%d:cproto=%u",
                         sn ? sn : "?", ce->cfn, ce->magic, ce->cproto);
+            } else if (ce->kind == 4) {
+                char cd[33];
+                aot_digest_hex(ce->digest, cd);
+                fprintf(f, "callee=thru:%s", cd);
             } else {
                 fprintf(f, "callee=other");
             }
@@ -64158,6 +65512,115 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     }
 }
 
+/* The constructor of a prototype that has no own `constructor` (the
+   `Sub.prototype = new Base()` idiom): the one bytecode function digest among the
+   live functions whose own plain data `prototype` is exactly `po`. Found by
+   scanning the collector's object list, so no JS runs and nothing is allocated or
+   kept alive. Returns 1 and fills `dg` only when every such function has the same
+   digest (closures of one function agree); none, or two different functions
+   sharing a prototype, returns 0 and the shape stays unnamed. The unit later
+   checks the same claim when it builds the layout: `proto == F.prototype` at the
+   function's creation. */
+static int aot_proto_ctor_digest(JSRuntime *rt, JSObject *po, uint8_t dg[16])
+{
+    struct list_head *el;
+    int found = 0;
+
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSObject *fo;
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        uint8_t d[16];
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        fo = (JSObject *)gp;
+        if (fo->class_id != JS_CLASS_BYTECODE_FUNCTION)
+            continue;
+        prs = find_own_property(&pr, fo, JS_ATOM_prototype);
+        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+            JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT ||
+            JS_VALUE_GET_OBJ(pr->u.value) != po)
+            continue;
+        js_aot_digest(fo->u.func.function_bytecode, d);
+        if (found && memcmp(d, dg, 16) != 0)
+            return 0;
+        memcpy(dg, d, 16);
+        found = 1;
+    }
+    return found;
+}
+
+/* A STABLE key of a prototype object, identical across processes (the profile is written by one process and read by the generator, another, so a
+   pointer is useless): FNV-1a 64 over the prototype's identity-by-construction -- its own properties in shape order (name, attribute flags, and for
+   a data property the digest of a bytecode function it holds or a one-letter kind of any other value, never the value itself, which a program may
+   change), then the key of its own prototype, to a depth of 3. A class prototype is thus keyed by its methods' digests and names; a prototype
+   replaced by a literal (`C.prototype = {...}`) by the literal's property names and function digests; Object.prototype and Array.prototype by the
+   engine's own fixed property list. Two prototypes of one class made from the same code get one key (they are one class). No JS runs: only own
+   plain data properties are looked at. Printed as `pk=<16 hex>`; the reader compares keys, nothing else. */
+static uint64_t aot_pk_mix(uint64_t h, const void *p, size_t n)
+{
+    const unsigned char *b = p;
+    while (n--) { h ^= *b++; h *= 0x100000001b3ULL; }
+    return h;
+}
+
+static uint64_t aot_proto_key(JSContext *ctx, JSObject *po, int depth)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    JSShape *sh;
+    uint32_t k;
+
+    if (po == NULL)
+        return 0;
+    sh = po->shape;
+    for (k = 0; k < (uint32_t)sh->prop_count; k++) {
+        JSShapeProperty *pr = &get_shape_prop(sh)[k];
+        unsigned char fl;
+        char kind = 'o';
+        if (pr->atom == JS_ATOM_NULL)
+            continue;
+        if (ctx != NULL) {
+            const char *nm = JS_AtomToCString(ctx, pr->atom);
+            if (nm != NULL) {
+                h = aot_pk_mix(h, nm, strlen(nm));
+                JS_FreeCString(ctx, nm);
+            }
+        }
+        fl = (unsigned char)(pr->flags & (JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE | JS_PROP_TMASK));
+        h = aot_pk_mix(h, &fl, 1);
+        if ((pr->flags & JS_PROP_TMASK) == JS_PROP_NORMAL && !po->is_exotic) {
+            JSValue v = po->prop[k].u.value;
+            switch (JS_VALUE_GET_TAG(v)) {
+            case JS_TAG_OBJECT: {
+                JSObject *o = JS_VALUE_GET_OBJ(v);
+                if (o->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                    uint8_t d[16];
+                    js_aot_digest(o->u.func.function_bytecode, d);
+                    h = aot_pk_mix(h, d, 16);
+                    kind = 'f';
+                } else {
+                    kind = o->class_id == JS_CLASS_C_FUNCTION ? 'n' : 'O';
+                }
+                break;
+            }
+            case JS_TAG_INT: case JS_TAG_FLOAT64: kind = 'i'; break;
+            case JS_TAG_STRING: kind = 's'; break;
+            default: kind = 'p'; break;
+            }
+        } else {
+            kind = 'a';
+        }
+        h = aot_pk_mix(h, &kind, 1);
+    }
+    if (depth > 0 && po->shape->proto != NULL) {
+        uint64_t up = aot_proto_key(ctx, po->shape->proto, depth - 1);
+        h = aot_pk_mix(h, &up, sizeof(up));
+    }
+    return h;
+}
+
 /* The shape table the generator reads: one `P` line per distinct shape a field
    site observed, printed once, with the prototype it belongs to and its ordered
    property list. A site's `shape%d=` entry carries the table index instead of a
@@ -64170,6 +65633,18 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
     struct list_head *el;
     int id = 0;
 
+    /* A shape some live object of which is a prototype (a class's own prototype object, which gains its methods by
+       assignment) is never a layout: bit 1 of aot_prof_seen, printed as `isproto=1`. */
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSObject *po;
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        po = (JSObject *)gp;
+        if (po->is_prototype && po->shape->aot_prof_seen)
+            po->shape->aot_prof_seen |= 2;
+    }
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         JSShape *sh;
@@ -64208,6 +65683,19 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
                     named = 1;
                 }
             }
+            if (!named && po->class_id == JS_CLASS_OBJECT && !po->is_exotic) {
+                /* No own constructor: name it by the function whose `prototype`
+                   it is, if there is exactly one (see aot_proto_ctor_digest). */
+                uint8_t dg[16];
+                char hx[33];
+                uint32_t b;
+                if (aot_proto_ctor_digest(rt, po, dg)) {
+                    for (b = 0; b < 16; b++)
+                        snprintf(hx + b * 2, 3, "%02x", dg[b]);
+                    fprintf(f, "fn:%s via=scan", hx);
+                    named = 1;
+                }
+            }
             if (!named) {
                 if (po->class_id == JS_CLASS_ARRAY)
                     fprintf(f, "array");
@@ -64218,6 +65706,9 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
                     fprintf(f, "other:%p", (void *)po);
             }
         }
+        if (sh->aot_prof_seen & 2)
+            fprintf(f, " isproto=1");
+        fprintf(f, " pk=%016llx", (unsigned long long)(sh->proto != NULL ? aot_proto_key(ctx, sh->proto, 3) : 0));
         fprintf(f, " n=%d props=", (int)sh->prop_count);
         for (k = 0; k < (uint32_t)sh->prop_count; k++) {
             JSShapeProperty *pr = &get_shape_prop(sh)[k];
@@ -64331,6 +65822,8 @@ extern const uint32_t qjs_aot_abi __attribute__((weak));
 extern const uint32_t qjs_aot_layout __attribute__((weak));
 extern const uint32_t qjs_aot_cell_count __attribute__((weak));
 extern const uint32_t qjs_aot_site_count __attribute__((weak));
+/* The bundle the unit was generated from: a hash of its function digests. */
+extern const uint64_t qjs_aot_bundle_tag __attribute__((weak));
 extern const uint32_t qjs_aot_deopt_site_func[] __attribute__((weak));
 #endif
 
@@ -64563,6 +66056,36 @@ void js_aot_stats_dump(JSRuntime *rt)
     }
     for (i = 0; r && i < r->deopt_count; i++)
         sw += r->deopt_hits[i];
+#ifdef QJS_AOT_BUMPSTATS
+    {
+        static const char *const bn[] = {"pic_entry_reset","ic_watchpoint_bump","gv_site_flush","gv_cell_invalidate","layout_break","gwrite","global_site_fill","pic_install","ic_x_way_swap","ic_slow_way_swap","aot_unbind","aot_bind_rebind"};
+        int bi;
+        {
+            int ti, tj;
+            fprintf(stderr, "aot shapes: frees=%llu frees_observed=%llu inplace=%llu inplace_observed=%llu\n",
+                    (unsigned long long)js_aot_shape_stat[0], (unsigned long long)js_aot_shape_stat[1],
+                    (unsigned long long)js_aot_shape_stat[2], (unsigned long long)js_aot_shape_stat[3]);
+            for (ti = 0; ti < 12; ti++) {
+                int best = -1;
+                for (tj = 0; tj < 512; tj++)
+                    if (js_aot_thrash[tj].b != NULL && (best < 0 || js_aot_thrash[tj].n > js_aot_thrash[best].n)) best = tj;
+                if (best < 0 || js_aot_thrash[best].n == 0) break;
+                {
+                    JSFunctionBytecode *tb = js_aot_thrash[best].b;
+                    char nb[64];
+                    fprintf(stderr, "aot thrash: installs=%llu site=%d fn=%s idx=%u pic_count=%u\n",
+                            (unsigned long long)js_aot_thrash[best].n, js_aot_thrash[best].site,
+                            JS_AtomGetStrRT(rt, nb, 64, tb->func_name), (unsigned)tb->aot_index, (unsigned)tb->regvm_pic_count);
+                }
+                js_aot_thrash[best].n = 0;
+            }
+        }
+        fprintf(stderr, "aot bumps: pic_epoch=%u", rt->aot_pic_epoch);
+        for (bi = 0; bi < (int)(sizeof(bn) / sizeof(bn[0])); bi++)
+            fprintf(stderr, " %s=%llu", bn[bi], (unsigned long long)js_aot_bump_n[bi]);
+        fprintf(stderr, "\n");
+    }
+#endif
     fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu "
             "cells=%u/%u disabled=%u deopts=%llu%s\n",
             present, count,
@@ -64584,16 +66107,31 @@ static void js_aot_unbind(JSFunctionBytecode *b)
 {
     if (b->aot_index == UINT32_MAX)
         return;
+    /* A compiled body that identified a callee by its bound entry (a method table's entry pointer) trusts
+       it until the cache epoch moves, so dropping the binding moves it. */
+    if (b->aot_fn != NULL) {
+        b->realm->rt->aot_epoch_bumps++;
+        AOT_EPOCH_BUMP(b->realm->rt, 10);
+    }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
     b->regvm_call_ready = b->aot_call_ready;
     b->regvm_light = b->aot_light;
+    /* No compiled body runs this function any more, so its frames are the
+       interpreter's own: the register file ends at `regvm_reg_count`, and the
+       wider compiled count must not be scanned or reserved past it. A STACK light
+       frame is the unit's own array (only the unit can run on it), but an
+       unbound function is not entered through the unit, so the count goes back
+       for both shapes. */
+    b->regvm_light_scan = (uint32_t)(b->regvm_reg_count > 0 ? b->regvm_reg_count : 0);
     /* A light frame carries the PIC pointer, so the light path is only open
        once the table exists. The flag is the one eligibility bit that can
        change while the function is bound (the table is allocated on its first
        fill), so recompute it instead of restoring the bind-time byte. */
     b->regvm_light_fast = b->regvm_light != 0 &&
                           (b->regvm_pic != NULL || b->regvm_pic_count == 0);
+    /* The frame shrank back to the interpreter's own register count. */
+    regvm_set_frame_shape(b);
 }
 
 /* Bind a function to its generated entry. The table is sorted by digest;
@@ -64698,6 +66236,47 @@ int qjs_aot_poly_fill(
 }
 #endif /* QJS_AOT || QJS_AOT_GEN */
 
+/* A compiled unit keeps one set of cached facts per function in its statics, so it serves ONE runtime at a time (a worklet runs its own
+   bundle, which has its own unit). The first runtime to bind a function owns the unit; another runtime binds nothing and interprets,
+   until the owner is freed. */
+static JSRuntime *volatile js_aot_unit_owner;
+
+static bool js_aot_unit_claim(JSRuntime *rt)
+{
+    JSRuntime *expected = NULL;
+#ifdef QJS_KIT_TEST_KNOBS
+    if (getenv("QJS_AOT_UNIT_SHARED") != NULL)
+        return true;
+#endif
+    if (__atomic_compare_exchange_n(&js_aot_unit_owner, &expected, rt, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (&qjs_aot_bundle_tag != NULL)
+            rt->aot_unit_tag = qjs_aot_bundle_tag;
+        return true;
+    }
+    return expected == rt;
+}
+
+static void js_aot_unit_release(JSRuntime *rt)
+{
+    JSRuntime *expected = rt;
+    __atomic_compare_exchange_n(&js_aot_unit_owner, &expected, NULL, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+uint32_t qjs_aot_runtime_bound(JSRuntime *rt)
+{
+    uint32_t i, n = 0;
+    if (rt->aot_bound == NULL || &qjs_aot_count == NULL)
+        return 0;
+    for (i = 0; i < qjs_aot_count; i++)
+        n += rt->aot_bound[i] != 0;
+    return n;
+}
+
+uint64_t qjs_aot_runtime_bundle(JSRuntime *rt)
+{
+    return rt->aot_unit_tag;
+}
+
 static void js_aot_bind(JSFunctionBytecode *b)
 {
     uint8_t digest[16];
@@ -64705,11 +66284,16 @@ static void js_aot_bind(JSFunctionBytecode *b)
 
     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL)
         b->realm->rt->aot_bound[b->aot_index] = 0;
+    if (b->aot_fn != NULL) {
+        b->realm->rt->aot_epoch_bumps++;
+        AOT_EPOCH_BUMP(b->realm->rt, 11);
+    }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
     b->aot_index = UINT32_MAX;
     b->aot_state = 2;           /* known-absent until a match is found */
     b->aot_layout_ctor = 0;
+    b->aot_layout_tries = 0;
     if (!aot_unit_present())
         return;
     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
@@ -64734,6 +66318,8 @@ static void js_aot_bind(JSFunctionBytecode *b)
 #endif
             if (b->realm->rt->aot_bound == NULL)
                 b->realm->rt->aot_bound = js_mallocz_rt(b->realm->rt, qjs_aot_count);
+            if (!js_aot_unit_claim(b->realm->rt))
+                return;         /* the unit is bound in another runtime: this one interprets */
             if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
                 return;         /* another live bytecode holds this function */
             b->realm->rt->aot_bound[mid] = 1;
@@ -64741,6 +66327,20 @@ static void js_aot_bind(JSFunctionBytecode *b)
             b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
             b->aot_index = mid;
             b->aot_state = 1;   /* bound */
+            /* The register file the unit compiled this body for. It may be wider
+               than `regvm_reg_count`: the generator allocates registers above the
+               program's own for a virtual object's argument window and for a
+               hoisted global read, and the unit's own `JSValue fr[N]` is sized to
+               match. Publishing it here is what makes the collector scan those
+               slots (see `regvm_light_scan`) and what makes the engine's arena
+               frame for this function wide enough to hold them. A unit generated
+               before the field existed reports 0, which keeps the program's own
+               count. */
+            if (qjs_aot_table[mid].reg_count > b->regvm_light_scan)
+                b->regvm_light_scan = qjs_aot_table[mid].reg_count;
+            /* The frame is sized from `regvm_light_scan`, so redo the shape. The
+               bind runs from regvm_set_call_desc, before the first call. */
+            regvm_set_frame_shape(b);
             /* Allocate the polymorphic cache now, so filling a site from
                compiled code never allocates: an allocation there would be a
                safepoint, and the compiled body's frame is not prepared for
@@ -64939,9 +66539,556 @@ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
     return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
 }
 
+/* The push of a compiled body that does not fit the array's capacity (or its packed element kind): the builtin itself, on a receiver the
+   body has already checked is a plain extensible array whose length is the count and whose prototype is the standard one, so no JS can
+   run. Returns 1 with the new length in *out; 0 when the push threw (an out-of-memory), after clearing the exception, so the body leaves
+   before any effect and its generic body repeats the call and throws it properly. */
+QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out)
+{
+    JSValue r = js_array_push(ctx, arr, 1, (JSValueConst *)&v, 0);
+
+    if (JS_IsException(r)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 0;
+    }
+    *out = r;
+    return 1;
+}
+
+/* Where the property `atom` lives in objects of shape `shape`: 1 with the byte offset of its slot in the property array when it is an own
+   data property of the shape (an accessor, a variable reference or an auto-initialised slot is not), else 0. Reads nothing but the shape,
+   so it is only as good as the shape is: the caller keeps the answer while the shape cannot be freed or edited in place (shape_free_epoch)
+   and the properties of its prototypes cannot change (aot_pic_epoch). */
+QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *off)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr, *prop;
+    intptr_t h;
+
+    if (sh == NULL)
+        return 0;
+    sh->aot_observed = 1;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        pr = &prop[h - 1];
+        if (pr->atom == (JSAtom)atom) {
+            if ((pr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                return 0;
+            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
+            return 1;
+        }
+        h = pr->hash_next;
+    }
+    return 0;
+}
+
+/* The two forms below are for a table that HOLDS the shape (qjs_aot_shape_hold): they do not mark it observed, since a held shape can be neither
+   freed nor edited in place (an edit of a shape somebody else references clones it first), so no epoch has to guard the table.
+   Like qjs_aot_shape_slot: 1 with the byte offset of an own data property; `rslot` for a read, `wslot` for a store (also writable, not the array length). */
+QJS_AOT_STUB int qjs_aot_shape_rslot(const void *shape, uint32_t atom, uint32_t *off)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr, *prop;
+    intptr_t h;
+
+    if (sh == NULL)
+        return 0;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        pr = &prop[h - 1];
+        if (pr->atom == (JSAtom)atom) {
+            if ((pr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                return 0;
+            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
+            return 1;
+        }
+        h = pr->hash_next;
+    }
+    return 0;
+}
+
+QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t *off)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr, *prop;
+    intptr_t h;
+
+    if (sh == NULL)
+        return 0;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        pr = &prop[h - 1];
+        if (pr->atom == (JSAtom)atom) {
+            if ((pr->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE)
+                return 0;
+            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
+            return 1;
+        }
+        h = pr->hash_next;
+    }
+    return 0;
+}
+
+/* A counted reference to a shape for a compiled table keyed by its address, and its release (at the unit's teardown, while the runtime lives). */
+QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape)
+{
+    return js_dup_shape((JSShape *)shape);
+}
+
+QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape)
+{
+    js_free_shape(rt, (JSShape *)shape);
+}
+
+/* A class's instance shape, from the bundle's field list: the hashed shape an object whose prototype is `proto` reaches by adding
+   `atoms[0..n)` in that order as ordinary data properties (what `this.x = v` adds in a constructor). A counted reference
+   (qjs_aot_shape_release), or NULL. Every transition looks a hashed shape up before it makes one, and this reference keeps the final
+   shape in the table, so the engine's own constructs of the class end on this same address. Runs no JS. */
+QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint32_t *atoms, int n)
+{
+    JSValue obj;
+    JSObject *p;
+    JSShape *sh;
+    int i;
+
+    if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT || n < 0)
+        return NULL;
+    obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return NULL;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    js_aot_shape_scratch = p;
+    for (i = 0; i < n; i++) {
+        JSProperty *pr;
+        if (find_own_property1(p, (JSAtom)atoms[i]) != NULL)
+            goto fail;
+        pr = add_property(ctx, p, (JSAtom)atoms[i], JS_PROP_C_W_E);
+        if (pr == NULL) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            goto fail;
+        }
+        pr->u.value = JS_UNDEFINED;
+    }
+    js_aot_shape_scratch = NULL;
+    sh = p->shape;
+    if (!sh->is_hashed)
+        goto fail;
+    sh = js_dup_shape(sh);
+    JS_FreeValue(ctx, obj);
+    return sh;
+ fail:
+    js_aot_shape_scratch = NULL;
+    JS_FreeValue(ctx, obj);
+    return NULL;
+}
+
+/* A new ordinary object of a class shape (qjs_aot_class_shape), every field undefined. The caller writes the fields and then calls
+   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would. */
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    JSProperty *pr;
+    int i, n = sh->prop_count;
+
+    if (unlikely(n > JS_OBJ_LEARNED_INLINE_MAX)) {
+        JSValue obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
+        if (JS_IsException(obj))
+            return obj;
+        p = JS_VALUE_GET_OBJ(obj);
+        for (i = 0; i < n; i++)
+            p->prop[i].u.value = JS_UNDEFINED;
+        return obj;
+    }
+    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the n slots */
+    js_trigger_gc(rt, sizeof(JSObject));
+    p = js_malloc(ctx, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    if (unlikely(!p))
+        return JS_EXCEPTION;   /* the generic path also drops the shape reference it was given; here none was taken yet */
+    p->prop_inline_cap = n;
+    p->class_id = JS_CLASS_OBJECT;
+    p->values_inline = 0;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->free_mark = 0;
+    p->is_exotic = 0;
+    p->fast_array = 0;
+    p->holey = 0;
+    p->is_constructor = 0;
+    p->is_uncatchable_error = 0;
+    p->tmp_mark = 0;
+    p->is_HTMLDDA = 0;
+    p->gv_watched = 0;
+    p->is_prototype = 0;
+    p->first_weak_ref = NULL;
+    p->shape = js_dup_shape(sh);
+    pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+    p->prop = pr;
+    for (i = 0; i < n; i++)
+        pr[i].u.value = JS_UNDEFINED;
+    JS_REF_COUNT(p) = 1;
+    add_gc_object(rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* What the engine's construct path does once per constructor before its first construct (the unit's layout chain for it, built against
+   its `prototype` as it is now): a compiled region that makes the class's objects itself runs it at its init instead. */
+QJS_AOT_STUB void qjs_aot_ctor_prepare(JSContext *ctx, JSValue fn)
+{
+    JSObject *p;
+    JSFunctionBytecode *fb;
+
+    if (JS_VALUE_GET_TAG(fn) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(fn);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return;
+    fb = p->u.func.function_bytecode;
+    if (unlikely(JS_AOT_LAYOUT_CTOR(fb)))
+        js_aot_layout_fn_hook(ctx, fn);
+}
+
+QJS_AOT_STUB void qjs_aot_object_filled(JSContext *ctx, JSValue obj)
+{
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+        js_aot_content_filled(ctx->rt, JS_VALUE_GET_OBJ(obj));
+}
+
+/* The value of the global binding `atom` without running code: a lexical binding (let/const/class at the top level) first, then an
+   own data property of the global object (var, function). 1 with a BORROWED value (the binding owns it), 0 when the binding is not
+   there, is an accessor, or is still in its temporal dead zone (the caller leaves its compiled code). */
+QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSObject *p;
+
+    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    prs = find_own_property(&pr, p, (JSAtom)atom);
+    if (prs == NULL) {
+        p = JS_VALUE_GET_OBJ(ctx->global_obj);
+        prs = find_own_property(&pr, p, (JSAtom)atom);
+        if (prs == NULL)
+            return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    if (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
+        return 0;
+    *out = pr->u.value;
+    return 1;
+}
+
+/* A store to the global binding `atom`, as `put_var` (`init` = `put_var_init`), for a binding that is a writable data property: no code
+   runs. The engine's own store does it (the facts that watch the binding break there); the binding's previous value is handed back in
+   *old as a counted reference, so whatever the caller borrowed from it stays alive. `val` is borrowed. 1 when stored, 0 when the binding
+   is not such a property (nothing done), -1 with an exception pending. */
+QJS_AOT_STUB int qjs_aot_global_put(JSContext *ctx, uint32_t atom, JSValue val, int init, JSValue *old)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSObject *p;
+
+    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    prs = find_own_property(&pr, p, (JSAtom)atom);
+    if (prs == NULL) {
+        p = JS_VALUE_GET_OBJ(ctx->global_obj);
+        prs = find_own_property(&pr, p, (JSAtom)atom);
+        if (prs == NULL)
+            return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE))
+        return 0;
+    if (!init && JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
+        return 0;
+    *old = js_dup(pr->u.value);
+    if (JS_SetGlobalVar(ctx, (JSAtom)atom, js_dup(val), init) < 0) {
+        JS_FreeValue(ctx, *old);
+        *old = JS_UNDEFINED;
+        return -1;
+    }
+    return 1;
+}
+
+/* `new Array()` for code that knows the array will hold a few elements: an empty array of the realm's array shape whose first `n` elements
+   live in the object's own allocation (the first pushes allocate nothing; a growth past them moves the elements out as for any array). */
+QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n)
+{
+    return JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, n);
+}
+
+/* ---- stack objects (the region compiler) ------------------------------------------------------------------------------------------------------------
+   An object a compiled region makes and proves never leaves it (no store of it, no call that receives it, no return) lives in a block of the region's own C frame
+   instead of the heap: [JSMallocBlockHeader][JSObject body + inline slots (+ inline elements)]. It is NOT on gc_obj_list; its reference count starts at a bias no
+   stray release can reach zero from, so a block is never handed to the allocator. The values in its fields and elements are counted references held by native
+   code, like any other: the cycle collector's trial decrement leaves them positive, so they act as roots (sound, conservative). A push past the room in an array's
+   block is the engine's own growth (expand_fast_array): it allocates a heap element block and leaves the object where it is; release / migrate free that block. */
+#define JS_STACK_BIAS (1 << 30)
+
+static JSObject *js_stack_block(void *buf, size_t bytes, size_t body)
+{
+    JSMallocBlockHeader *h = (JSMallocBlockHeader *)buf;
+    JSObject *p;
+    if (((uintptr_t)buf & (JS_ARENA_ALIGN - 1)) != 0 || sizeof(JSMallocBlockHeader) + body > bytes)
+        return NULL;
+    memset(buf, 0, sizeof(JSMallocBlockHeader) + body);
+    h->u.block_idx = JS_ARENA_FREE_NIL;   /* "not an arena block": js_free_rt would treat it as a large one, and is never called on it */
+    h->ref_count = JS_STACK_BIAS;
+    h->gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
+    p = (JSObject *)h->user_data;
+    init_list_head(&p->header.link);
+    return p;
+}
+
+/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long). JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
+{
+    JSShape *sh = (JSShape *)shape;
+    int n = sh->prop_count, i;
+    JSObject *p;
+    if (n <= 0 || n > JS_OBJ_LEARNED_INLINE_MAX)
+        return JS_UNINITIALIZED;
+    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    if (p == NULL)
+        return JS_UNINITIALIZED;
+    p->prop_inline_cap = n;
+    p->class_id = JS_CLASS_OBJECT;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->shape = js_dup_shape(sh);
+    p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+    for (i = 0; i < n; i++)
+        p->prop[i].u.value = JS_UNDEFINED;
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* An empty Array of the realm's array shape in `buf`, with room for `n` elements in the block itself (a push past `n` moves the elements to a heap block, as for
+   any inline-valued array). JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_array_init(JSContext *ctx, void *buf, size_t bytes, uint32_t n)
+{
+    JSShape *sh = ctx->array_shape;
+    uint32_t inline_cap = sh->prop_size <= 4 ? sh->prop_size : 0;
+    JSObject *p;
+    if (inline_cap == 0)
+        return JS_UNINITIALIZED;
+    p = js_stack_block(buf, bytes, sizeof(JSObject) + inline_cap * sizeof(JSProperty) + n * sizeof(JSValue));
+    if (p == NULL)
+        return JS_UNINITIALIZED;
+    p->prop_inline_cap = inline_cap;
+    p->class_id = JS_CLASS_ARRAY;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->is_exotic = 1;
+    p->fast_array = 1;
+    p->shape = js_dup_shape(sh);
+    p->prop = (JSProperty *)((uint8_t *)p + sizeof(JSObject));
+    JS_ARR_VALS(p) = (JSValue *)((JSProperty *)(p + 1) + inline_cap);
+    p->u.array.count = 0;
+    p->u.array.hole_count = 0;
+    p->u.array.u1.size = n;
+    p->values_inline = 1;   /* growth (expand_fast_array) then allocates a heap element block and leaves this block alone */
+    assert(p->values_inline && JS_ARR_GENERIC(p));
+    p->prop[0].u.value = js_int32(0);
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* Release what a stack object (and, if given, its stack array) holds: the references in its fields (but the array, which is the other block) and in its
+   elements, and its shape reference. The blocks themselves are the region's frame. */
+QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr)
+{
+    JSRuntime *rt = ctx->rt;
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        JSShape *sh = p->shape;
+        int i;
+        assert(JS_REF_COUNT(p) >= JS_STACK_BIAS / 2);   /* nothing released the block's bias away */
+        for (i = 0; i < sh->prop_count; i++) {
+            JSValue v = p->prop[i].u.value;
+            if (JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) != (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT ? JS_VALUE_GET_PTR(arr) : NULL))
+                JS_FreeValueRT(rt, v);
+            p->prop[i].u.value = JS_UNDEFINED;
+        }
+        js_free_shape(rt, sh);
+        p->shape = NULL;   /* the block is dead until qjs_aot_stack_object_init makes it again */
+    }
+    if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
+        JSObject *a = JS_VALUE_GET_OBJ(arr);
+        uint32_t k;
+        assert(JS_REF_COUNT(a) >= JS_STACK_BIAS / 2);
+        for (k = 0; k < a->u.array.count; k++) {
+            JSValue v = JS_ARR_VALS(a)[k];
+            if (JS_VALUE_HAS_REF_COUNT(v))
+                JS_FreeValueRT(rt, v);
+        }
+        a->u.array.count = 0;
+        if (!a->values_inline && JS_ARR_VALS(a) != NULL) {   /* a push past the inline room moved the elements to a heap block (expand_fast_array); the object stayed where it is */
+            js_free_rt(rt, JS_ARR_VALS(a));
+            JS_ARR_VALS(a) = NULL;
+            a->values_inline = 1;
+            a->u.array.u1.size = 0;
+        }
+        js_free_shape(rt, a->shape);
+        a->shape = NULL;
+    }
+}
+
+/* Move a stack object and its stack array (either may be undefined) to the heap: the heap array takes the elements (their references move), the heap object takes
+   the fields (the field that held the stack array holds the heap array), and the stack blocks are emptied and released. *hobj and *harr each hold one reference for
+   the caller. 1, or 0 with nothing moved on an out-of-memory. */
+QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
+{
+    JSValue ha = JS_UNDEFINED, ho = JS_UNDEFINED;
+    JSObject *a = NULL, *p = NULL;
+    uint32_t k;
+    int i;
+    if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
+        a = JS_VALUE_GET_OBJ(arr);
+        ha = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, a->u.array.u1.size > a->u.array.count ? a->u.array.u1.size : a->u.array.count);
+        if (JS_IsException(ha))
+            return 0;
+    }
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(obj);
+        ho = qjs_aot_new_from_shape(ctx, p->shape);
+        if (JS_IsException(ho)) {
+            JS_FreeValue(ctx, ha);
+            return 0;
+        }
+    }
+    if (a != NULL) {
+        JSObject *h = JS_VALUE_GET_OBJ(ha);
+        for (k = 0; k < a->u.array.count; k++)
+            JS_ARR_VALS(h)[k] = JS_ARR_VALS(a)[k];
+        h->u.array.count = a->u.array.count;
+        h->prop[0].u.value = js_int32((int32_t)a->u.array.count);
+        a->u.array.count = 0;
+    }
+    if (p != NULL) {
+        JSObject *h = JS_VALUE_GET_OBJ(ho);
+        for (i = 0; i < p->shape->prop_count; i++) {
+            JSValue v = p->prop[i].u.value;
+            if (a != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)a)
+                v = JS_DupValue(ctx, ha);
+            h->prop[i].u.value = v;
+            p->prop[i].u.value = JS_UNDEFINED;
+        }
+    }
+    qjs_aot_stack_release(ctx, obj, arr);
+    if (p != NULL)
+        qjs_aot_object_filled(ctx, ho);   /* the slot-claim check the stack object skipped */
+    *hobj = ho;
+    *harr = ha;
+    return 1;
+}
+
+/* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
+   null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
+QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
+{
+    int ta = JS_VALUE_GET_NORM_TAG(a), tb = JS_VALUE_GET_NORM_TAG(b);
+#define AOT_STR_PRIM(t) ((t) == JS_TAG_STRING || (t) == JS_TAG_INT || (t) == JS_TAG_FLOAT64 || (t) == JS_TAG_BOOL || (t) == JS_TAG_NULL || (t) == JS_TAG_UNDEFINED)
+    JSValue sa, sb, r;
+    if (!((ta == JS_TAG_STRING || tb == JS_TAG_STRING) && AOT_STR_PRIM(ta) && AOT_STR_PRIM(tb)))
+        return 0;
+#undef AOT_STR_PRIM
+    {
+        int cr = js_concat_short(ctx, a, b, out);
+        if (cr != 0)
+            return cr;
+    }
+    sa = JS_ToString(ctx, a);
+    if (JS_IsException(sa))
+        return -1;
+    sb = JS_ToString(ctx, b);
+    if (JS_IsException(sb)) {
+        JS_FreeValue(ctx, sa);
+        return -1;
+    }
+    r = JS_ConcatString(ctx, sa, sb);
+    if (JS_IsException(r))
+        return -1;
+    *out = r;
+    return 1;
+}
+
+/* The digest of the bytecode function `fnv` (the key the unit binds functions by), without needing the function to have been called: 1 and 16 bytes in *out,
+   or 0 when it is not a function the unit can know (not a bytecode function, lazy, or without a register program). */
+QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16])
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(fnv);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (b->is_lazy || !b->regvm_compiled || b->regvm_len <= 0)
+        return 0;
+    js_aot_digest(b, out);
+    return 1;
+}
+
+/* The method a receiver of shape `shape` finds as `atom`: 1 with the value when the shape has no own property of that name and the first
+   object of its prototype chain that has one holds it as a plain data property (ordinary objects only, at most eight links), else 0.
+   Like qjs_aot_shape_slot it reads the shape and the prototype objects only, so the caller keeps the answer while shape_free_epoch
+   and aot_pic_epoch have not moved (every write that can change what a prototype holds, or a prototype link, moves the latter). */
+QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue *out)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *prop, *prs;
+    JSProperty *pr;
+    JSObject *holder;
+    intptr_t h;
+    int depth;
+
+    if (sh == NULL)
+        return 0;
+    sh->aot_observed = 1;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        if (prop[h - 1].atom == (JSAtom)atom)
+            return 0;
+        h = prop[h - 1].hash_next;
+    }
+    holder = sh->proto;
+    for (depth = 0; holder != NULL; depth++) {
+        if (depth >= 8 || holder->class_id != JS_CLASS_OBJECT || holder->is_exotic)
+            return 0;
+        prs = find_own_property(&pr, holder, (JSAtom)atom);
+        if (prs != NULL) {
+            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+                return 0;
+            *out = pr->u.value;
+            return 1;
+        }
+        holder = holder->shape->proto;
+    }
+    return 0;
+}
+
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
 {
     return (const void *)js_function_apply;
+}
+
+/* The function pointer of the builtin `Function.prototype.call`, which a C function object holds with cproto generic: a unit that
+   calls `X.call(thisArg, ...)` as a direct call of X compares the callee it would bypass against this. */
+QJS_AOT_STUB const void *qjs_aot_function_call_fn(void)
+{
+    return (const void *)js_function_call;
 }
 
 /* A contracted layout's shape, from the unit's side: the unit cannot name JSShape
@@ -64981,16 +67128,54 @@ static void js_aot_layout_fn_hook(JSContext *ctx, JSValueConst fn)
     if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
         return;
     b = p->u.func.function_bytecode;
+    /* between attempts the flag counts constructs down (cheap: no digest) */
+    if (b->aot_layout_ctor > 1) {
+        b->aot_layout_ctor--;
+        return;
+    }
     js_aot_digest(b, dg);
     qjs_aot_layout_fn_created(ctx, fn, dg);
     /* The closure itself succeeded, so nothing may be left pending by the build: an
        allocation failure there refuses the layout and is dropped here. */
     if (unlikely(JS_HasException(ctx)))
         JS_FreeValue(ctx, JS_GetException(ctx));
-    /* Once the unit has nothing left to build for this digest the mark is
-       dropped, so later closures of the same function skip the hash. */
-    if (&qjs_aot_layout_ctor != NULL && !qjs_aot_layout_ctor(dg))
+    /* One attempt per bytecode, unless rows of its digest are still unbuilt: the rows of classes
+       made by one function (every Class.create class) are built by each class's constant path, and
+       a class defined after the first construct is not there yet. Retry after 250 constructs, at
+       most 16 times; a digest with nothing pending drops the mark as before, so every later
+       construct skips the hash. */
+    if (&qjs_aot_layout_ctor != NULL && b->aot_layout_tries < 16 && qjs_aot_layout_ctor(dg)) {
+        b->aot_layout_tries++;
+        b->aot_layout_ctor = 250;
+    } else {
         b->aot_layout_ctor = 0;
+    }
+}
+
+/* The unit built layout `layout_id` on `proto`, which is `fn`'s own `prototype` right now.
+   Watch that property: a store, a redefinition or a delete of it, by any path, breaks the
+   layout (a fact group on `fn` listing `prototype`, whose break calls js_aot_layout_break).
+   Costs nothing on the construct path of any other function, and for a watched one the
+   construct event is only looked at while a FRESH group is pending. Returns 0, with the
+   layout already broken, when the watch cannot be made. */
+QJS_AOT_STUB int qjs_aot_layout_watch_proto(JSContext *ctx, JSValueConst fn, uint32_t layout_id)
+{
+    JSAtom atoms[1];
+    JSAotFact *g;
+
+    atoms[0] = JS_ATOM_prototype;
+    g = qjs_aot_fact_new(ctx, fn, JS_UNDEFINED, 0, atoms, 1);
+    if (g == NULL) {
+        if (layout_id != 0 && layout_id <= 63)
+            js_aot_layout_break(ctx->rt, layout_id);
+        return 0;
+    }
+    g->layout = layout_id;
+    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
+        js_aot_fact_break_now(ctx->rt->aot_facts, g);
+        return 0;
+    }
+    return 1;
 }
 
 /* Object.prototype, for a layout whose instances are plain object literals. The
@@ -65342,6 +67527,26 @@ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
    plain data property of the global object, shadowed by no lexical binding, that holds exactly
    `v` now. From then on every write to it moves `aot_pic_epoch`. The body takes the check at
    the entry that follows an epoch change. */
+/* A unit holds the value of the global data property `atom` of `obj` (the global object or the lexical object) behind a fact: put the atom on the watch list so
+   that every direct write of the binding reports to the fact groups. 1 when `obj` is not a global object (nothing to watch) or the atom is watched; 0 when the list is full. */
+int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
+        (JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_obj) && JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_var_obj)))
+        return 1;
+    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
+        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
+            return 0;
+        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
+        /* the cells filled so far may take the direct store */
+        js_gv_cell_invalidate(rt);
+    }
+    return 1;
+}
+
 int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
 {
     JSRuntime *rt = ctx->rt;
@@ -65361,6 +67566,7 @@ int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
         if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
             return 0;
         rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
         /* the cells filled so far may take the direct store */
         js_gv_cell_invalidate(rt);
     }
@@ -65393,7 +67599,7 @@ int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init)
             if (likely(po != NULL) &&
                 (get_shape_prop(po->shape)[slot - po->prop].flags &
                  (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
-                js_aot_gwrite(ctx->rt, (JSAtom)atom);
+                js_aot_gwrite_val(ctx->rt, po, (JSAtom)atom, v);
                 set_value(ctx, &slot->u.value, js_dup(v));
                 return 0;
             }
@@ -65631,6 +67837,129 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     return 1;
 }
 
+/* A constructor wrapper `function () { this.X.apply(this, arguments); }` (the generator recognises it by its register
+   program, see qjs_aot_wrapper_shape) called with a fresh `this`: the same effect as running the wrapper, without its frame,
+   its `arguments` object, the polymorphic read of `this.X` (one wrapper bytecode serves every class built by the same
+   factory) or the trip through the `apply` builtin. `wc` is the construct site's cache, eight words the generated code owns:
+   the receiver shape, the epoch, the function X resolved for it, X's shape, the wrapper bytecode and X's atom. The cache
+   says: for a `this` of this shape, `this.X` is that function while `aot_pic_epoch` has not moved (every write that can
+   change what a prototype holds, a prototype link, or a cache cell moves it, and so does unbinding a compiled function),
+   and X has no own `apply` while its shape is this one. Only a plain data property found on ordinary objects, holding an
+   ordinary bytecode function whose prototype is its realm's Function.prototype, whose `apply` is the builtin, is cached.
+   Returns JS_UNINITIALIZED, with nothing done, when any of that does not hold: the caller then runs the wrapper. Otherwise
+   returns undefined (what the wrapper returns) or the exception. */
+#define AOT_WC_SHAPE 0
+#define AOT_WC_EPOCH 1
+#define AOT_WC_INIT 2
+#define AOT_WC_ISHAPE 3
+#define AOT_WC_CB 4
+#define AOT_WC_ATOM 5
+#define AOT_WC_SFE 6
+JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
+                          int argc, void **wc, int init_off, int apply_off)
+{
+    JSRuntime *rt = ctx->rt;
+    JSFunctionBytecode *cb = co->u.func.function_bytecode, *cb2;
+    JSObject *p, *init;
+    JSValue ret;
+
+    if (JS_VALUE_GET_TAG(thisv) != JS_TAG_OBJECT)
+        return JS_UNINITIALIZED;
+    p = JS_VALUE_GET_OBJ(thisv);
+#ifdef QJS_KIT_TEST_KNOBS
+    /* Negative control: a cache that is never invalidated once filled, as if nothing moved the epoch or X's shape. */
+    static int wc_stale = -1;
+    if (wc_stale < 0)
+        wc_stale = getenv("QJS_AOT_WCSTALE") != NULL;
+#endif
+    /* The cache holds raw pointers: the receiver shape and X are compared or dereferenced only after the two epochs agree.
+       `shape_free_epoch` moves whenever any shape is freed, so a shape freed since the fill (and its address possibly reused
+       by another one, which a pointer compare cannot tell) fails the test before anything cached is dereferenced; and while
+       no shape has been freed the cached shape is alive, so are its prototype chain and X (which only a write or delete on
+       a prototype can drop, and those move aot_pic_epoch). */
+#ifdef QJS_KIT_TEST_KNOBS
+    if (wc[AOT_WC_SHAPE] == (void *)p->shape && wc[AOT_WC_EPOCH] == (void *)(uintptr_t)rt->aot_pic_epoch &&
+        wc[AOT_WC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch && getenv("QJS_AOT_WCABA") != NULL)
+        fprintf(stderr, "wc: a freed shape's address was reused (the cache would have hit)\n");
+#endif
+    if (unlikely(wc[AOT_WC_SHAPE] != (void *)p->shape || wc[AOT_WC_CB] != (void *)cb ||
+                 (
+#ifdef QJS_KIT_TEST_KNOBS
+                  !wc_stale &&
+#endif
+                  (wc[AOT_WC_EPOCH] != (void *)(uintptr_t)rt->aot_pic_epoch ||
+                   wc[AOT_WC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch ||
+                   ((JSObject *)wc[AOT_WC_INIT])->shape != (JSShape *)wc[AOT_WC_ISHAPE])))) {
+        JSAtom atom;
+        JSObject *holder;
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        JSValue v = JS_UNDEFINED;
+        int depth;
+
+        wc[AOT_WC_SHAPE] = NULL;
+        if (wc[AOT_WC_CB] != (void *)cb) {
+            uint32_t a_init, a_apply;
+            wc[AOT_WC_CB] = NULL;
+            memcpy(&a_init, cb->regvm_code + init_off, 4);
+            memcpy(&a_apply, cb->regvm_code + apply_off, 4);
+            if (a_apply != JS_ATOM_apply || a_init == JS_ATOM_NULL)
+                return JS_UNINITIALIZED;
+            wc[AOT_WC_ATOM] = (void *)(uintptr_t)a_init;
+            wc[AOT_WC_CB] = (void *)cb;
+        }
+        atom = (JSAtom)(uintptr_t)wc[AOT_WC_ATOM];
+        if (p->class_id != JS_CLASS_OBJECT || p->is_exotic || find_own_property(&pr, p, atom) != NULL)
+            return JS_UNINITIALIZED;
+        holder = p->shape->proto;
+        for (depth = 0; holder != NULL; depth++) {
+            if (depth >= 8 || holder->class_id != JS_CLASS_OBJECT || holder->is_exotic)
+                return JS_UNINITIALIZED;
+            prs = find_own_property(&pr, holder, atom);
+            if (prs != NULL) {
+                if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                    return JS_UNINITIALIZED;
+                v = pr->u.value;
+                break;
+            }
+            holder = holder->shape->proto;
+        }
+        if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+            return JS_UNINITIALIZED;
+        init = JS_VALUE_GET_OBJ(v);
+        if (init->class_id != JS_CLASS_BYTECODE_FUNCTION || init->is_exotic)
+            return JS_UNINITIALIZED;
+        cb2 = init->u.func.function_bytecode;
+        if (cb2->is_derived_class_constructor || cb2->func_kind != JS_FUNC_NORMAL)
+            return JS_UNINITIALIZED;
+        {
+            JSObject *fp = JS_VALUE_GET_OBJ(cb2->realm->function_proto);
+            if (init->shape->proto != fp || find_own_property(&pr, init, JS_ATOM_apply) != NULL)
+                return JS_UNINITIALIZED;
+            prs = find_own_property(&pr, fp, JS_ATOM_apply);
+            if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+                js_args_apply_is_builtin(pr->u.value) == NULL)
+                return JS_UNINITIALIZED;
+        }
+        wc[AOT_WC_EPOCH] = (void *)(uintptr_t)rt->aot_pic_epoch;
+        wc[AOT_WC_SFE] = (void *)(uintptr_t)rt->shape_free_epoch;
+        wc[AOT_WC_INIT] = init;
+        wc[AOT_WC_ISHAPE] = init->shape;
+        wc[AOT_WC_SHAPE] = p->shape;
+    }
+    init = (JSObject *)wc[AOT_WC_INIT];
+    cb2 = init->u.func.function_bytecode;
+    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count)
+        ret = ((JSValue (*)(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int))cb2->aot_nfn)(
+            ctx, caller_f, init, thisv, argv, argc);
+    else
+        ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, init), thisv, argc, vc(argv));
+    if (JS_IsException(ret))
+        return ret;
+    JS_FreeValue(ctx, ret);
+    return JS_UNDEFINED;
+}
+
 /* Whether constructing `ctor` now is fully described by the engine's own add-transition cells:
    a fresh `this` has the shape the first cell starts from, each cell leads to the shape the next
    one starts from, and no prototype interceptor has appeared since they were filled. Then `new
@@ -65654,8 +67983,11 @@ int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *site
 
     if (cc->shape == (const void *)ctor->shape &&
         cc->proto == JS_VALUE_GET_PTR(ctor->prop[cc->slot].u.value) &&
-        cc->pic_epoch == rt->aot_pic_epoch)
+        cc->pic_epoch == rt->aot_pic_epoch && cc->sfe == rt->shape_free_epoch)
         return 1;
+    /* Past saturation the watchpoint epoch can no longer say that an interceptor appeared (and no cell is filled then). */
+    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
+        return 0;
     if (n <= 0 || ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
         return 0;
     cb = ctor->u.func.function_bytecode;
@@ -65693,6 +68025,7 @@ int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *site
     cc->proto = JS_VALUE_GET_PTR(pv);
     cc->slot = (uint32_t)(ppr - ctor->prop);
     cc->pic_epoch = rt->aot_pic_epoch;
+    cc->sfe = rt->shape_free_epoch;
     return 1;
 }
 
@@ -66541,6 +68874,7 @@ aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
     nf->flags |= REGVM_FLAG_C_ENTRY;
     prev = rt->regvm_cur;
     rt->regvm_cur = nf;
+    js_aot_enter_count++;
     ret = ((JSAotFn)cb->aot_fn)(cb->realm, nf, regs, 0);
     rt->regvm_cur = prev;
     {
@@ -66579,7 +68913,7 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
 
     /* the C stack the compiled body and its callees will use, as JS_CallInternal checks */
     if (js_check_stack_overflow(rt, sizeof(JSValue) * (size_t)(cb->var_count +
-                                    cb->regvm_reg_count + REGVM_HS) + 1024)) {
+                                    regvm_frame_regs(cb) + REGVM_HS) + 1024)) {
         JS_ThrowStackOverflow(caller_ctx);
         return -1;
     }
@@ -66735,6 +69069,7 @@ int qjs_aot_call_leaf(JSContext *ctx, JSRegRun *caller_f, int na,
         JSRegRun *prev = rt->regvm_cur;
 
         rt->regvm_cur = nf;
+        js_aot_enter_count++;
         ret = ((JSAotFn)cb->aot_fn)(cb->realm, nf, regs, 0);
         rt->regvm_cur = prev;
     }
@@ -66775,7 +69110,7 @@ QJS_AOT_STUB int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
         return 0;
     if (js_poll_interrupts(caller_ctx))
         return -1;
-    alloca_size = sizeof(JSValue) * (b->var_count + b->regvm_reg_count + REGVM_HS) +
+    alloca_size = sizeof(JSValue) * (b->var_count + regvm_frame_regs(b) + REGVM_HS) +
         sizeof(JSVarRef *) * b->var_ref_count +
         sizeof(JSRegCtl) * b->regvm_ctl_count;
     if (js_check_stack_overflow(rt, alloca_size)) {
@@ -66794,12 +69129,12 @@ QJS_AOT_STUB int qjs_aot_call_b(JSContext *caller_ctx, int na, JSValue callee,
     for (i = 0; i < b->var_count; i++)
         var_buf[i] = JS_UNDEFINED;
     stack_buf = var_buf + b->var_count;
-    sf->var_refs = (JSVarRef **)(stack_buf + b->regvm_reg_count + REGVM_HS);
+    sf->var_refs = (JSVarRef **)(stack_buf + regvm_frame_regs(b) + REGVM_HS);
     sf->var_ref_count = b->var_ref_count;
     for (i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
     sf->cur_gc_obj = NULL;
-    REGVM_SET_ROOT(sf, stack_buf, b->regvm_reg_count + REGVM_HS - 1);
+    REGVM_SET_ROOT(sf, stack_buf, regvm_frame_regs(b) + REGVM_HS - 1);
     sp = stack_buf;
     pc = b->byte_code_buf;
     sf->cur_pc = NULL;
@@ -67327,6 +69662,47 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                         g->cpool_fn = (const uint8_t (*)[16])fns;
                     }
                 }
+                if (b->closure_var_count > 0 && b->closure_var != NULL) {
+                    uint8_t *cty = js_malloc_rt(rt, (size_t)b->closure_var_count);
+                    uint16_t *cix = js_malloc_rt(rt, sizeof(uint16_t) * (size_t)b->closure_var_count);
+                    if (cty && cix) {
+                        int ci;
+                        for (ci = 0; ci < b->closure_var_count; ci++) {
+                            cty[ci] = b->closure_var[ci].closure_type;
+                            cix[ci] = b->closure_var[ci].var_idx;
+                        }
+                        g->closure_count = b->closure_var_count;
+                        g->closure_type = cty;
+                        g->closure_idx = cix;
+                    } else {
+                        js_free_rt(rt, cty);
+                        js_free_rt(rt, cix);
+                    }
+                }
+                if (b->objlit_count > 0 && b->objlit_tab != NULL) {
+                    JSAtom **atoms = js_mallocz_rt(rt, sizeof(JSAtom *) * (size_t)b->objlit_count);
+                    uint16_t *np = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)b->objlit_count);
+                    if (atoms && np) {
+                        int oi, pi;
+                        for (oi = 0; oi < b->objlit_count; oi++) {
+                            JSObjLitTemplate *tp = &b->objlit_tab[oi];
+                            if (tp->prop_count == 0 || (tp->atoms == NULL && tp->shape == NULL))
+                                continue;
+                            atoms[oi] = js_malloc_rt(rt, sizeof(JSAtom) * tp->prop_count);
+                            if (atoms[oi] == NULL)
+                                continue;
+                            for (pi = 0; pi < tp->prop_count; pi++)
+                                atoms[oi][pi] = js_objlit_template_atom(tp, pi);
+                            np[oi] = tp->prop_count;
+                        }
+                        g->objlit_count = b->objlit_count;
+                        g->objlit_atoms = (const JSAtom *const *)atoms;
+                        g->objlit_nprops = np;
+                    } else {
+                        js_free_rt(rt, atoms);
+                        js_free_rt(rt, np);
+                    }
+                }
             }
             n++;
         }
@@ -67344,6 +69720,15 @@ void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr, int n)
             js_free_rt(rt, (void *)arr[i].cpool_num);
             js_free_rt(rt, (void *)arr[i].cpool_numeric);
             js_free_rt(rt, (void *)arr[i].cpool_fn);
+            js_free_rt(rt, (void *)arr[i].closure_type);
+            js_free_rt(rt, (void *)arr[i].closure_idx);
+            if (arr[i].objlit_atoms != NULL) {
+                int oi;
+                for (oi = 0; oi < arr[i].objlit_count; oi++)
+                    js_free_rt(rt, (void *)arr[i].objlit_atoms[oi]);
+            }
+            js_free_rt(rt, (void *)arr[i].objlit_atoms);
+            js_free_rt(rt, (void *)arr[i].objlit_nprops);
         }
     }
     js_free_rt(rt, arr);
@@ -79044,6 +81429,12 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
     uint32_t tag;
 
     tag = JS_VALUE_GET_TAG(fun_obj);
+    if (unlikely(ctx->rt->aot_facts != NULL)) {
+        if (tag == JS_TAG_FUNCTION_BYTECODE)
+            js_aot_facts_eval_scan(ctx, JS_VALUE_GET_PTR(fun_obj));
+        else if (tag == JS_TAG_MODULE && JS_VALUE_GET_TAG(((JSModuleDef *)JS_VALUE_GET_PTR(fun_obj))->func_obj) == JS_TAG_FUNCTION_BYTECODE)
+            js_aot_facts_eval_scan(ctx, JS_VALUE_GET_PTR(((JSModuleDef *)JS_VALUE_GET_PTR(fun_obj))->func_obj));
+    }
     if (tag == JS_TAG_FUNCTION_BYTECODE) {
         fun_obj = js_closure(ctx, fun_obj, var_refs, sf);
         ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
@@ -93004,6 +95395,7 @@ void *qjs_aot_intrinsic_fn(int id)
     case QJS_AOT_INTR_STR_CHARCODEAT: return (void *)js_string_charCodeAt;
     case QJS_AOT_INTR_STR_CODEPOINTAT: return (void *)js_string_codePointAt;
     case QJS_AOT_INTR_STR_CHARAT: return (void *)js_string_charAt;
+    case QJS_AOT_INTR_X_FUNC_APPLY: return (void *)js_function_apply;
     }
     return NULL;
 }

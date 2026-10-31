@@ -186,6 +186,9 @@ typedef struct EFacts {
      only because of that: a miss that rejoins could run a getter or setter
      and invalidate every fact this pass carried past it. */
   uint8_t *miss_exits;
+  /* A method read (get_field2 at a prototype site) in a function with polymorphic arms whose miss leaves the body: no safepoint. The emitter
+     serves it from the method table or the cache walk and leaves on a miss, where it would otherwise run the op call. */
+  uint8_t *pmexit;
   int ngroups;
   EGroup *groups;
   int nsites;
@@ -199,6 +202,12 @@ typedef struct EFacts {
   uint8_t *loop_calls; /* the loop's only safepoints are calls: only contracted-layout shape facts hold in it */
   int nhoist, hoist_cap;
   int *hoist_hdr, *hoist_pre, *hoist_val, *hoist_grp;
+  /* Runs of instructions that give one result at every iteration of their loop (see plan_invariants): `hvrun[i]` is 1 + the run
+     of instruction i, else 0; a run's instructions are adjacent in one block; `hv_loop[r]` is its loop (index into loop_hdr). */
+  int nhv, hv_cap;
+  int32_t *hvrun;
+  int32_t *hvarm; /* per instruction: 1 + the run whose flag says the arm's shape-cache validation (an invariant test) has been done */
+  int *hv_first, *hv_last, *hv_loop;
   int nfwd;             /* loads forwarded, for the report */
   int nskip;            /* shape checks skipped, for the report */
 } EFacts;
@@ -227,6 +236,9 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);
 int e_plan_licm(const Q2Func *fn, Q2Extra **out);
 /* The calls worth replacing by a copy of their callee (see facts.c). */
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out);
+extern int e_facts_pm_exit_on;
+extern int e_plan_nopoly;  /* plan no call with several callees as a set of arms (a retry after the copies were refused) */
+extern int e_plan_used_poly; /* the last plan kept such a call */
 int e_never_exits(const Q2Insn *in);
 /* The objects that never escape (see facts.c). */
 extern int e_inline_allow_construct;

@@ -1,0 +1,86 @@
+Subject: A direct write of a watched global binding reports to the fact groups
+
+What this does
+  - `js_aot_gwrite_val`: when the written global's atom is on the watch list, besides the epoch bump it fires the STORE event on the owning global object, so a fact that expects the property's value breaks. `JS_SetGlobalVarS` (both objects) and `qjs_aot_put_global`'s fast path call it.
+  - `qjs_aot_global_watch(ctx, obj, atom)`: puts the atom of a global data property on the watch list (for a unit that holds the binding's value behind a fact).
+  - `js_aot_gwatched` tests a 256-bit filter (`aot_gwatch_bloom`) before it scans the list: the content-store hook asks it for every store to a watched object, and a region registers every global it binds (about a hundred in richards), so the linear scan cost on every store.
+  - `JS_AOT_GWATCH_MAX` 16 -> 256: a region registers every global it binds; with 16 slots the regions filled the list and the old backend's own global folds (qjs_aot_global_fold) failed, which sent IdleTask.run, Scheduler.release and markAsNotHeld to their generic bodies (+50% on richbreak1).
+
+Why we need it
+  Compiled and interpreted global stores wrote the slot directly and bumped the epoch only for gwatched atoms; they never reported to fact groups. A region that binds a script global as a constant (`__arm`, a flag set by top-level code after the profile run) kept using the value it bound at init after `__arm = 1`, so richbreak1 diverged from the interpreter.
+
+Soundness
+  Only atoms on the watch list pay for the fact scan; every other global store is unchanged. The generic content-store path (globalThis.x = v, Reflect.set, defineProperty, delete) already reports through the gv_watched hooks.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -600 +600 @@
+-#define JS_AOT_GWATCH_MAX 16
++#define JS_AOT_GWATCH_MAX 256
+@@ -779 +778,0 @@
+-    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
+@@ -885,0 +885,4 @@
++    /* kept at the end so that the offsets of the fields generated code reads do not move: the list itself and its filter (bit (atom & 255) per watched atom: most stores of a
++       watched object name an unwatched atom and skip the list) */
++    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
++    uint64_t aot_gwatch_bloom[4];
+@@ -16884,0 +16888,2 @@
++    if (likely(rt->aot_gwatch_n == 0) || !(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
++        return false;
+@@ -16896,0 +16902,20 @@
++}
++
++static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
++
++/* A global binding is being written directly (not through the content-store hooks): besides the epoch, a watched atom reports the store to the fact groups, so a
++   fact that expects the property's value breaks. Only atoms on the watch list pay for the scan. */
++static __attribute__((noinline)) void js_aot_gwrite_slow(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
++{
++    if (!js_aot_gwatched(rt, atom))
++        return;
++    AOT_EPOCH_BUMP(rt, 5);
++    if (rt->aot_facts != NULL)
++        js_aot_obj_event(rt, p, JS_AOT_EV_STORE, atom, v);
++}
++
++static inline void js_aot_gwrite_val(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
++{
++    /* the filter bit first: most stores name an unwatched atom and pay a load and a test */
++    if (unlikely(rt->aot_gwatch_n != 0) && unlikely(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
++        js_aot_gwrite_slow(rt, p, atom, v);
+@@ -18440 +18465 @@
+-            js_aot_gwrite(ctx->rt, prop);
++            js_aot_gwrite_val(ctx->rt, p, prop, val);
+@@ -18453 +18478 @@
+-            js_aot_gwrite(ctx->rt, prop);
++            js_aot_gwrite_val(ctx->rt, p, prop, val);
+@@ -67379,0 +67405,20 @@
++/* A unit holds the value of the global data property `atom` of `obj` (the global object or the lexical object) behind a fact: put the atom on the watch list so
++   that every direct write of the binding reports to the fact groups. 1 when `obj` is not a global object (nothing to watch) or the atom is watched; 0 when the list is full. */
++int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom)
++{
++    JSRuntime *rt = ctx->rt;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
++        (JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_obj) && JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_var_obj)))
++        return 1;
++    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
++        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
++            return 0;
++        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
++        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
++        /* the cells filled so far may take the direct store */
++        js_gv_cell_invalidate(rt);
++    }
++    return 1;
++}
++
+@@ -67398,0 +67444 @@
++        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
+@@ -67431 +67477 @@
+-                js_aot_gwrite(ctx->rt, (JSAtom)atom);
++                js_aot_gwrite_val(ctx->rt, po, (JSAtom)atom, v);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -588,0 +589 @@
++int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom);

@@ -1,0 +1,53 @@
+Subject: The unit can ask where a property lives in a shape
+
+What this does
+  - `qjs_aot_shape_slot(shape, atom, &off)` (exported to the units, declared in quickjs-aot-rt.h) returns 1 and the byte offset of the property's slot in the object's property array when `atom` is an own data property of `shape`, else 0 (absent, accessor, variable reference, auto-initialised).
+
+Why we need it
+  A compiled copy of a callee inside a switch arm knows its receiver's shape (the arm's guard proved it), so its `this.f` reads can be a slot load at an offset computed from the shape, with no test, instead of a walk of the callee's own inline cache, which a copy never fills.
+  The offsets are resolved once per cache epoch when the arm is first entered.
+
+Soundness
+  It reads only the shape. The unit keeps the answer while the shape cannot be freed or edited in place (`shape_free_epoch`, 0420) and the properties of its prototypes cannot change (`aot_pic_epoch`); an own data property's slot index is fixed for a shape's lifetime.
+
+Functions touched
+  `qjs_aot_shape_slot` (new).
+
+No.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -229,0 +230,2 @@
++/* the byte offset of the own data property `atom` in objects of `shape`, or 0 when it is not one (a compiled copy resolves its receiver's slots from the shape) */
++QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *off);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65255,0 +65256,28 @@
++}
++
++/* Where the property `atom` lives in objects of shape `shape`: 1 with the byte offset of its slot in the property array when it is an own
++   data property of the shape (an accessor, a variable reference or an auto-initialised slot is not), else 0. Reads nothing but the shape,
++   so it is only as good as the shape is: the caller keeps the answer while the shape cannot be freed or edited in place (shape_free_epoch)
++   and the properties of its prototypes cannot change (aot_pic_epoch). */
++QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *off)
++{
++    JSShape *sh = (JSShape *)shape;
++    JSShapeProperty *pr, *prop;
++    intptr_t h;
++
++    if (sh == NULL)
++        return 0;
++    h = (uintptr_t)atom & sh->prop_hash_mask;
++    h = prop_hash_end(sh)[-h - 1];
++    prop = get_shape_prop(sh);
++    while (h) {
++        pr = &prop[h - 1];
++        if (pr->atom == (JSAtom)atom) {
++            if ((pr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++                return 0;
++            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
++            return 1;
++        }
++        h = pr->hash_next;
++    }
++    return 0;

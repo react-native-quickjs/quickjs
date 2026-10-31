@@ -1,0 +1,171 @@
+Subject: A dead cache site stays dead, a swap of two ways of a site moves no epoch, and the epoch's movers can be counted
+
+What this does
+  - `regvm_pic_install` returns at once for a site that is dead (empty with the miss limit reached). The contract stated above `REG_PIC_MISS_LIMIT` is that such a site "stays empty",
+    but the next fill installed into it again, and the fill after that dropped it again at the limit: a polymorphic site cycled between cached and empty and moved
+    `aot_pic_epoch` twice (install and entry reset) per fill, 3 times counting the install's own bump. A site that is dead is served by the global stub cache.
+  - The secondary-way promotion in `regvm_get_field_ic_x` and `regvm_get_field_ic_slow` (at 16 hits the primary and the secondary way swap) no longer moves the epoch. A swap
+    changes which of two shapes of one site sits in the first way; it changes no fact about a shape or about a prototype, and the entry statics, the group shapes and the method
+    tables trust shapes, not the order of the ways.
+  - `AOT_EPOCH_BUMP(rt, id)` replaces each of the 12 `aot_pic_epoch++` statements. In a build with `-DQJS_AOT_BUMPSTATS=1` it counts each mover, counts shape frees and in-place edits
+    (also of shapes a cell ever held, marked by `JSShape.aot_observed`), keeps a table of the sites that install most, and prints them with `QJS_AOT_STATS`. Otherwise it is the bare increment.
+
+Why we need it
+  Measured in steady state, per unit: the epoch moved about 17.5k times on both raytrace and deltablue, and only about 250 of those were anything about a prototype or a layout; the rest were
+  cell installs, entry resets and way swaps from sites that never settled. Every body that trusts the epoch left at the next safepoint after each move and refilled its statics. With this
+  patch the epoch does not move at all in steady state on either kernel, and raytrace C.Minstr falls 3.4% (1327.6 -> 1282.8), deltablue 1.9% (806.0 -> 790.5).
+
+Soundness
+  - A dead site that no longer installs is served by the same path it was served by between installs: the global stub cache, which validates by shape pointer and `shape_free_epoch`, and the
+    engine lookup. No consumer can rely on a dead site's cell: the entry checks refuse an empty hot cell (softly) and a cold site tests its own cell.
+  - The swap bump: every consumer of the epoch that reads a cell at fill time learns shapes and slots, which stay true after a swap (the shape is still in a way); the consumer that reads cells at run
+    time after validation (`qjs_aot_ctor_replayable`, add-transition cells) is unaffected, since a swap happens only on a read site's own/proto kinds. An entry check that wants way 0 to hold the group's shape
+    still sees the swapped order and refuses, as before.
+  - The counters change no behaviour.
+
+Behaviour changes
+  The interpreter no longer re-caches a site that died; such a site reads through the global stub cache or the engine lookup every time. Interpreter instructions on the kit: see the report (deltablue +1.1%).
+
+Functions touched
+  `regvm_pic_install`, `regvm_get_field_ic_x`, `regvm_get_field_ic_slow`, the 12 sites of `aot_pic_epoch++`, `js_free_shape0`, `js_shape_prepare_update`, `js_aot_stats` printing.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2424,0 +2425,3 @@
++#ifdef QJS_AOT_BUMPSTATS
++    uint8_t aot_observed;   /* measurement only: some PIC cell has held this shape */
++#endif
+@@ -8432,0 +8436,3 @@
++#ifdef QJS_AOT_BUMPSTATS
++static uint64_t js_aot_shape_stat[8]; /* 0 frees, 1 frees of observed, 2 in-place edits, 3 in-place edits of observed */
++#endif
+@@ -8439,0 +8446,4 @@
++#ifdef QJS_AOT_BUMPSTATS
++    js_aot_shape_stat[0]++;
++    if (sh->aot_observed) js_aot_shape_stat[1]++;
++#endif
+@@ -8600,0 +8611,20 @@
++/* Counters for the sites that move aot_pic_epoch (a build with -DQJS_AOT_BUMPSTATS=1 prints them with QJS_AOT_STATS); free otherwise. */
++#ifdef QJS_AOT_BUMPSTATS
++static uint64_t js_aot_bump_n[16];
++typedef struct { void *b; int site; uint64_t n; } JSAotThrash;
++static JSAotThrash js_aot_thrash[512];
++static void js_aot_thrash_note(void *b, int site)
++{
++    uint32_t h = (uint32_t)(((uintptr_t)b >> 4) * 2654435761u + (uint32_t)site * 40503u) & 511, k;
++    for (k = 0; k < 512; k++) {
++        JSAotThrash *t = &js_aot_thrash[(h + k) & 511];
++        if (t->b == NULL) { t->b = b; t->site = site; t->n = 1; return; }
++        if (t->b == b && t->site == site) { t->n++; return; }
++    }
++}
++#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; js_aot_bump_n[id_]++; } while (0)
++#define AOT_THRASH(b_, s_) js_aot_thrash_note((b_), (s_))
++#else
++#define AOT_THRASH(b_, s_) ((void)0)
++#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; } while (0)
++#endif
+@@ -8612 +8642 @@
+-    rt->aot_pic_epoch++;
++    AOT_EPOCH_BUMP(rt, 0);
+@@ -8955 +8985 @@
+-    rt->aot_pic_epoch++;    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
++    AOT_EPOCH_BUMP(rt, 1);    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
+@@ -9226 +9256 @@
+-        rt->aot_pic_epoch++;
++        AOT_EPOCH_BUMP(rt, 2);
+@@ -9237 +9267 @@
+-    rt->aot_pic_epoch++;
++    AOT_EPOCH_BUMP(rt, 3);
+@@ -16514 +16544 @@
+-    rt->aot_pic_epoch++;
++    AOT_EPOCH_BUMP(rt, 4);
+@@ -16673 +16703 @@
+-        rt->aot_pic_epoch++;
++        AOT_EPOCH_BUMP(rt, 5);
+@@ -16782,0 +16813,4 @@
++#ifdef QJS_AOT_BUMPSTATS
++            js_aot_shape_stat[2]++;
++            if (sh->aot_observed) js_aot_shape_stat[3]++;
++#endif
+@@ -17476 +17510 @@
+-    ctx->rt->aot_pic_epoch++;
++    AOT_EPOCH_BUMP(ctx->rt, 6);
+@@ -25918,0 +25953,4 @@
++    /* A dead site stays dead (the contract above): without this, the next fill of a dead site installed again and the one
++       after that dropped it again, so a polymorphic site cycled between cached and empty and moved the epoch every time. */
++    if (e->kind == REG_PIC_EMPTY && misses >= REG_PIC_MISS_LIMIT)
++        return;
+@@ -25929,0 +25968,4 @@
++#ifdef QJS_AOT_BUMPSTATS
++    rsh->aot_observed = 1;
++    if (hsh) hsh->aot_observed = 1;
++#endif
+@@ -25934 +25976 @@
+-    rt->aot_pic_epoch++;
++    AOT_EPOCH_BUMP(rt, 7);
+@@ -26098 +26140,2 @@
+-            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
++            AOT_THRASH(b, site);
++regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+@@ -26105 +26148,2 @@
+-            regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
++            AOT_THRASH(b, site);
++regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+@@ -26152 +26196,2 @@
+-                regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
++                AOT_THRASH(b, site);
++regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+@@ -26320 +26365 @@
+-                ctx->rt->aot_pic_epoch++;
++                /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
+@@ -26374 +26419 @@
+-                ctx->rt->aot_pic_epoch++;
++                /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
+@@ -26468 +26513,2 @@
+-    regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
++    AOT_THRASH(b, site);
++regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+@@ -26480 +26526,2 @@
+-            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
++            AOT_THRASH(b, site);
++regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+@@ -64719,0 +64767,30 @@
++#ifdef QJS_AOT_BUMPSTATS
++    {
++        static const char *const bn[] = {"pic_entry_reset","ic_watchpoint_bump","gv_site_flush","gv_cell_invalidate","layout_break","gwrite","global_site_fill","pic_install","ic_x_way_swap","ic_slow_way_swap","aot_unbind","aot_bind_rebind"};
++        int bi;
++        {
++            int ti, tj;
++            fprintf(stderr, "aot shapes: frees=%llu frees_observed=%llu inplace=%llu inplace_observed=%llu\n",
++                    (unsigned long long)js_aot_shape_stat[0], (unsigned long long)js_aot_shape_stat[1],
++                    (unsigned long long)js_aot_shape_stat[2], (unsigned long long)js_aot_shape_stat[3]);
++            for (ti = 0; ti < 12; ti++) {
++                int best = -1;
++                for (tj = 0; tj < 512; tj++)
++                    if (js_aot_thrash[tj].b != NULL && (best < 0 || js_aot_thrash[tj].n > js_aot_thrash[best].n)) best = tj;
++                if (best < 0 || js_aot_thrash[best].n == 0) break;
++                {
++                    JSFunctionBytecode *tb = js_aot_thrash[best].b;
++                    char nb[64];
++                    fprintf(stderr, "aot thrash: installs=%llu site=%d fn=%s idx=%u pic_count=%u\n",
++                            (unsigned long long)js_aot_thrash[best].n, js_aot_thrash[best].site,
++                            JS_AtomGetStrRT(rt, nb, 64, tb->func_name), (unsigned)tb->aot_index, (unsigned)tb->regvm_pic_count);
++                }
++                js_aot_thrash[best].n = 0;
++            }
++        }
++        fprintf(stderr, "aot bumps: pic_epoch=%u", rt->aot_pic_epoch);
++        for (bi = 0; bi < (int)(sizeof(bn) / sizeof(bn[0])); bi++)
++            fprintf(stderr, " %s=%llu", bn[bi], (unsigned long long)js_aot_bump_n[bi]);
++        fprintf(stderr, "\n");
++    }
++#endif
+@@ -64745 +64822 @@
+-        b->realm->rt->aot_pic_epoch++;
++        AOT_EPOCH_BUMP(b->realm->rt, 10);
+@@ -64879 +64956 @@
+-        b->realm->rt->aot_pic_epoch++;
++        AOT_EPOCH_BUMP(b->realm->rt, 11);

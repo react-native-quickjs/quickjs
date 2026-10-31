@@ -85,7 +85,10 @@ const void *qjs_aot_prof_shape(int id, int *proto, char *digest, int *nfields,
                                const char ***fields, unsigned **flags);
 int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
+int qjs_aot_coldcopy_off(void);
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
+unsigned long long qjs_aot_prof_entries(const uint8_t dg[16]);
+unsigned long long qjs_aot_prof_site_calls(const uint8_t dg[16], int next_pc);
 
 /* A cell fact's value in the shape-fact list: no receiver value is this large. */
 #define E_CELLV(site) (0x40000000 + (site))
@@ -836,7 +839,11 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
   {
     int osite;
     const uint8_t *dg = e_site_dg(fn, (int)in->arg[3].val, &osite);
-    if (!qjs_aot_prof_site(dg, osite, &ns, shapes)) return 0;
+    if (!qjs_aot_prof_site(dg, osite, &ns, shapes)) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "    global_exit_ok pc %d: no site profile (site %d)\n", in->pc, (int)in->arg[3].val);
+      return 0;
+    }
+    if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "    global_exit_ok pc %d: ns=%d\n", in->pc, ns);
   }
   /* A site that ran many times and was filled only a couple of times saw the global object
      change at startup, not in its steady state. */
@@ -847,7 +854,9 @@ static int global_exit_ok(const Q2Func *fn, const Q2Insn *in) {
     if (cnt == 0) cnt = qjs_aot_prof_pc_count(e_dg(fn, in), in->onext);
     if (ns == 1 && cnt == 0 && fn->nvweb == 0 && !e_facts_virtual_planning)
       return 0; /* (the profile has no sample here; with unmade objects a cold read leaves the same way) */
-    return ns == 1 || (ns <= 3 && cnt >= 16384);
+    /* (ns == 0: the cell was never filled with a shape in the profiled run, e.g. a global found through the global cells; the read
+       still hits its cell or leaves, so a site the run executed is as good as one filled once) */
+    return ns <= 1 || (ns <= 3 && cnt >= 16384);
   }
 }
 
@@ -862,6 +871,19 @@ static int region_recv(const Q2Func *fn, const EFacts *f, const Q2Insn *in) {
 
 /* Whether the instruction is a safepoint, ignoring forwarding (a forwarded load is
    never one): the classification `transfer` applies, for the loop eligibility test. */
+int qjs_aot_layout_site(const uint8_t dg[16], int site, int *layout, int *slot);
+/* A method read (get_field2 at a site that read from the direct prototype) in a function with polymorphic arms, outside every group: served from the
+   method table or the cache walk, and a miss leaves the body, so it is no safepoint (see EFacts.pmexit). */
+static int pm_exit_load(const Q2Func *fn, EFacts *f, const Q2Insn *in, const SiteRef *ref, int nr, int grouped_exit) {
+  int osite_p, lay_p = 0, slot_p = 0;
+  const uint8_t *dg_p;
+  if (!grouped_exit || !e_facts_pm_exit_on || nr != 1 || ref[0].site < 0 || !recv_groupable(ref[0].recv) || in->own != 0 || in->rop != ROP_get_field2)
+    return 0;
+  dg_p = e_site_dg(fn, ref[0].site, &osite_p);
+  return dg_p != NULL && qjs_aot_prof_site_proto(dg_p, osite_p) && !qjs_aot_layout_site(dg_p, osite_p, &lay_p, &slot_p) &&
+         e_facts_site_group(f, ref[0].site) < 0 && !e_facts_site_poly(f, ref[0].site);
+}
+
 static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int grouped_exit) {
   int kind = insn_kind(in);
   if (grouped_exit && elem_region_ok(fn, in)) return 0;
@@ -877,10 +899,13 @@ static int is_safepoint(const Q2Func *fn, EFacts *f, const Q2Insn *in, int group
            !(e_facts_poly_on && nr == 1 && ref[r].recv >= 0 && e_facts_poly_op(in) &&
              e_facts_site_poly(f, ref[r].site))))
         grouped = 0;
+    if (!grouped && pm_exit_load(fn, f, in, ref, nr, grouped_exit)) grouped = 1;
     kind = grouped ? E_SK_NOJS : E_SK_SAFE;
   }
+  /* A push or pop writes the array's count: a loop holding an array region in locals must not be
+     hoisted over it, so it stays a safepoint here (transfer drops the region facts at it). */
   if (kind == E_SK_SAFE && grouped_exit && in->op == Q2_OP_CALL &&
-      e_intrinsic_lowerable(fn, in))
+      e_intrinsic_lowerable(fn, in) && !e_arrayop_site(fn, in))
     kind = E_SK_NOJS;
   return kind == E_SK_SAFE;
 }
@@ -954,6 +979,21 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     lk.key.kind = E_K_LOCAL;
     lk.key.a = (int64_t)in->arg[1].val;
     apply_store_kills(s, &lk);
+  }
+  /* A copy's prologue move (and its return move) makes the destination the same object as the source: what is known of one
+     is known of the other. Only the facts are carried; the moves and their registers stay as they are. */
+  if (in->op == Q2_OP_MOVE && in->own != 0 && in->ndef == 1 && in->nuse == 1 && getenv("QJS_AOT_NOMOVEFACTS") == NULL) {
+    int n0 = s->nshape, n1 = s->navail, j;
+    int sv = (int)in->use[0], dv = (int)in->def[0];
+    for (j = 0; j < n0; j++)
+      if (s->shape_val[j] == sv && fs_add_shape(s, dv, s->shape_grp[j]) < 0) return -1;
+    for (j = 0; j < n1; j++) {
+      EAvail a = s->avail[j];
+      if ((a.key.kind == E_K_FIELD || a.key.kind == E_K_ELEM) && a.key.a == sv) {
+        a.key.a = dv;
+        if (fs_set_avail(s, &a.key, a.val) < 0) return -1;
+      }
+    }
   }
   Access ld, st;
   int kind = insn_kind(in);
@@ -1034,6 +1074,10 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
            !(e_facts_poly_on && nr == 1 && ref[r].recv >= 0 && e_facts_poly_op(in) &&
              e_facts_site_poly(f, ref[r].site))))
         grouped = 0;
+    if (!grouped && pm_exit_load(fn, f, in, ref, nr, grouped_exit)) {
+      grouped = 1;
+      f->pmexit[insn] = 1;
+    }
     kind = grouped ? E_SK_NOJS : E_SK_SAFE;
     f->miss_exits[insn] = (uint8_t)grouped;
   }
@@ -1045,6 +1089,21 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       e_intrinsic_lowerable(fn, in)) {
     kind = E_SK_NOJS;
     f->miss_exits[insn] = 1;
+    /* An array push or pop runs no JS and changes no shape, but it writes the array: its count and
+       `length` slot, and the element at the end. Every loaded value and element is stale, and the base
+       and count a region holds in locals no longer describe the array (a pop leaves the count too
+       large). The object shape facts stay. */
+    if (e_arrayop_site(fn, in)) {
+      int z, w = 0;
+      fs_kill(s, kp_safepoint, NULL);
+      for (z = 0; z < s->nshape; z++) {
+        if (s->shape_val[z] >= E_ARRV(0) && s->shape_val[z] < E_CELLV(0)) continue;
+        s->shape_val[w] = s->shape_val[z];
+        s->shape_grp[w] = s->shape_grp[z];
+        w++;
+      }
+      s->nshape = w;
+    }
   }
 
   /* 2. A guarded access of a receiver whose shape is known skips its tag and
@@ -1123,6 +1182,11 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
         if (lay != 0 && pure) {
           f->noproto[insn] = fs_has_shape(s, E_NOPROTOV(lay), g) ? 2 : 1;
           if (fs_add_shape(s, E_NOPROTOV(lay), g) < 0) return -1;
+          /* The store drops the prototype test on the promise that no object of the layout is a prototype (an object that becomes
+             one breaks the layout): the entry must refuse a body whose layout is already broken, as for a claimed load. Otherwise a
+             prototype made before the first entry (a fact group's watched object, Object.create(o)) takes the direct store and the
+             watchpoints never see it. */
+          if (lay >= 1 && lay <= 63) f->claimdeps |= 1ULL << (lay - 1);
         }
       }
       /* The site's own cell: a cell fact is held with the shape facts under a value no
@@ -1223,6 +1287,13 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
    hoisted: a hoisted load needs a new value in the IR (deferred). */
 static int in_loop(const uint8_t *loop, int b) { return b >= 0 && loop[b]; }
 
+static const char *e_dbg_hex(const Q2Func *fn) {
+  static char b[40][9];
+  static int n;
+  char *o = b[n++ % 40];
+  snprintf(o, 9, "%02x%02x%02x%02x", fn->g->digest[0], fn->g->digest[1], fn->g->digest[2], fn->g->digest[3]);
+  return o;
+}
 static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
   int b, bi, k, q, p;
   uint8_t *loop = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), 1);
@@ -1298,13 +1369,14 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
           /* Negative control: "unsafe" hoists past a safepoint. */
           if (is_safepoint(fn, out, si, grouped_exit) && getenv("QJS_AOT_HOIST_CONTROL_SAFE") == NULL) {
             if (si->rop == ROP_call || si->rop == ROP_call_method) {
+              if (getenv("QJS_AOT_DEBUG_LOOPS")) fprintf(stderr, "loop %s hdr %d has a call at pc %d (own %d, inlg %d, xpc %d)\n", e_dbg_hex(fn), h, si->pc, si->own, si->inlg, si->xpc);
               callsonly = 1;
               continue;
             }
             if (getenv("QJS_AOT_DEBUG_LOOPS")) {
               char nm[64];
               e_rop_name(si->rop, nm, sizeof(nm));
-              fprintf(stderr, "loop %s hdr %d blocked by %s@%d\n", fn->g->name, h, nm, si->pc);
+              fprintf(stderr, "loop %s hdr %d blocked by %s@%d\n", e_dbg_hex(fn), h, nm, si->pc);
             }
             safe = 0;
             break;
@@ -1339,7 +1411,7 @@ static int plan_hoists(const Q2Func *fn, EFacts *out, int grouped_exit) {
         out->loop_cap = nc;
       }
       out->loop_calls[out->nloops] = (uint8_t)callsonly;
-      if (getenv("QJS_AOT_DEBUG_LOOPS")) fprintf(stderr, "loop %s hdr %d accepted calls=%d\n", fn->g->name, h, callsonly);
+      if (getenv("QJS_AOT_DEBUG_LOOPS")) fprintf(stderr, "loop %s hdr %d accepted calls=%d\n", e_dbg_hex(fn), h, callsonly);
       out->loop_hdr[out->nloops] = h;
       out->loop_pre[out->nloops] = pre;
       out->loop_mem[out->nloops] = malloc((size_t)fn->nblocks);
@@ -1512,7 +1584,214 @@ done:
   return 0;
 }
 
+static int e_facts_pm_exit_scan(const Q2Func *fn) {
+  int i;
+  if (getenv("QJS_AOT_NOPMEXIT") != NULL) return 0;
+  for (i = 0; i < fn->ninsns; i++)
+    if (q2_is_sel(&fn->insns[i])) return 1;
+  return 0;
+}
+/* ---- loop-invariant runs -------------------------------------------------
+   A loop that holds no safepoint and stores no atom a load of it reads cannot change what that load returns. A field or
+   method read, a copy's callee guard and the moves between them whose operands are defined outside the loop (or are
+   themselves such instructions) therefore give the same result at every iteration. The emitter wraps each maximal run of
+   them in a test of a flag that is cleared on the edge into the loop and set at the end of the run: the run executes once
+   per entry to the loop, in the place and with the exits it has, and the iterations after skip it. A run reached for the
+   first time at a later iteration still sees the state of the loop's entry, because nothing in the loop writes it.
+   The loop's interrupt poll is assumed not to change them; a poll that fires clears the flags (see e_emit_arm), so a
+   handler that ran JS costs a recomputation, not a stale value. */
+static int hv_run_new(EFacts *out, int first, int last, int loop) {
+  if (out->nhv == out->hv_cap) {
+    int nc = out->hv_cap ? out->hv_cap * 2 : 8;
+    int *a1 = realloc(out->hv_first, sizeof(int) * (size_t)nc);
+    int *a2 = realloc(out->hv_last, sizeof(int) * (size_t)nc);
+    int *a3 = realloc(out->hv_loop, sizeof(int) * (size_t)nc);
+    if (a1) out->hv_first = a1;
+    if (a2) out->hv_last = a2;
+    if (a3) out->hv_loop = a3;
+    if (!a1 || !a2 || !a3) return -1;
+    out->hv_cap = nc;
+  }
+  out->hv_first[out->nhv] = first;
+  out->hv_last[out->nhv] = last;
+  out->hv_loop[out->nhv] = loop;
+  return out->nhv++;
+}
+
+static int plan_invariants(const Q2Func *fn, EFacts *out) {
+  int li, nl = out->nloops, b, k, i, rc = -1, dbg = getenv("QJS_AOT_DEBUG_HV") != NULL;
+  uint8_t *ivg = NULL, *mark = NULL;
+  int *order = NULL, *size = NULL;
+  if (getenv("QJS_AOT_NOHV") != NULL || nl == 0 || fn->ninsns <= 0) return 0;
+  out->hvrun = calloc((size_t)fn->ninsns, sizeof(int32_t));
+  out->hvarm = calloc((size_t)fn->ninsns, sizeof(int32_t));
+  ivg = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
+  mark = calloc((size_t)fn->ninsns, 1);
+  order = malloc(sizeof(int) * (size_t)nl);
+  size = calloc((size_t)nl, sizeof(int));
+  if (out->hvrun == NULL || out->hvarm == NULL || ivg == NULL || mark == NULL || order == NULL || size == NULL) goto done;
+  for (li = 0; li < nl; li++) {
+    order[li] = li;
+    for (b = 0; b < fn->nblocks; b++)
+      if (out->loop_mem[li][b]) size[li]++;
+  }
+  for (i = 1; i < nl; i++) { /* the larger loops first */
+    int x = order[i], j = i - 1;
+    while (j >= 0 && size[order[j]] < size[x]) {
+      order[j + 1] = order[j];
+      j--;
+    }
+    order[j + 1] = x;
+  }
+  for (k = 0; k < nl; k++) {
+    const uint8_t *mem;
+    int64_t katom[64];
+    int nk = 0, killall = 0, bi, q, gstore = 0;
+    uint8_t *inl_;
+    li = order[k];
+    if (out->loop_calls[li]) continue;
+    mem = out->loop_mem[li];
+    for (b = 0; b < fn->nblocks && !killall; b++) {
+      if (!mem[b]) continue;
+      for (q = 0; q < fn->blocks[b].ninsns && !killall; q++) {
+        const Q2Insn *in = &fn->insns[fn->blocks[b].first_insn + q];
+        const ERole *role = e_roles[in->rop];
+        if (role == NULL) {
+          killall = 1;
+        } else if (role->mem == E_MEM_GLOBAL && (in->rop == ROP_put_global || in->narg < 1)) {
+          gstore = 1;
+        } else if (role->mem == E_MEM_FIELD) {
+          SiteRef ref[2];
+          int nr = site_refs(in, ref), r;
+          for (r = 0; r < nr; r++) {
+            if (!ref[r].is_store) continue;
+            if (ref[r].atom == 0 || nk >= 64) killall = 1;
+            else katom[nk++] = ref[r].atom;
+          }
+        }
+      }
+    }
+    if (killall) continue;
+    inl_ = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1); /* values defined by an instruction marked in this loop */
+    if (inl_ == NULL) goto done;
+    for (bi = 0; bi < fn->nrpo; bi++) {
+      b = fn->rpo[bi];
+      if (!mem[b]) continue;
+      for (q = 0; q < fn->blocks[b].ninsns; q++) {
+        int ix = fn->blocks[b].first_insn + q, cls = 0, ok = 1, d;
+        const Q2Insn *in = &fn->insns[ix];
+#define HV_INV(v_) ((v_) < (Q2ValueId)fn->nvalues && ((fn->values[v_].block >= 0 && !mem[fn->values[v_].block]) || ivg[v_] || inl_[v_] || fn->values[v_].is_const))
+        if (out->hvrun[ix] != 0 || in->vk != 0 || (in->ndef < 1 && !in->inlg)) continue;
+        if (in->op == Q2_OP_MOVE && in->rop == ROP_move && in->nuse == 1 && in->ndef == 1) {
+          cls = 1;
+          ok = HV_INV(in->use[0]);
+        } else if (in->inlg && !q2_is_sel(in) && (in->rop == ROP_call || in->rop == ROP_call_method)) {
+          cls = 2;
+          ok = in->argval[1] != Q2_NO_VALUE && HV_INV(in->argval[1]);
+          if (ok && in->rop == ROP_call_method) ok = in->argval[2] != Q2_NO_VALUE && HV_INV(in->argval[2]);
+        } else if (in->rop == ROP_get_length && in->nuse == 1 && in->ndef == 1) {
+          cls = 2;
+          ok = HV_INV(in->use[0]);
+        } else if (in->rop == ROP_get_global && in->ndef == 1 && !gstore) {
+          cls = 2;
+        } else if (e_roles[in->rop] != NULL && e_roles[in->rop]->mem == E_MEM_FIELD && insn_kind(in) == E_SK_FIELD &&
+                   !is_safepoint(fn, out, in, 1)) {
+          SiteRef ref[2];
+          int nr = site_refs(in, ref), r, j;
+          cls = 2;
+          if (nr < 1) ok = 0;
+          for (r = 0; ok && r < nr; r++) {
+            if (ref[r].is_store || ref[r].atom == 0) ok = 0;
+            for (j = 0; ok && j < nk; j++)
+              if (katom[j] == ref[r].atom) ok = 0;
+            if (!ok) break;
+            if (r == 0 || nr == 1) {
+              /* the first link's receiver; a second link reads the first link's result */
+              if (ref[r].recv == E_RECV_THIS) continue;
+              if (ref[r].recv < 0 || ref[r].recv >= fn->nvalues || !HV_INV((Q2ValueId)ref[r].recv)) ok = 0;
+            }
+          }
+        }
+        if (dbg && in->inlg) {
+          char nm[64];
+          e_rop_name(in->rop, nm, sizeof(nm));
+          fprintf(stderr, "hv %s: guard %s@%d cls %d ok %d sel %d argval %d %d\n", e_dbg_hex(fn), nm, in->pc, cls, ok, q2_is_sel(in), (int)in->argval[1], (int)in->argval[2]);
+        }
+        if (dbg && (!cls || !ok) && in->op != Q2_OP_BRANCH && in->op != Q2_OP_CONST) {
+          char nm[64];
+          e_rop_name(in->rop, nm, sizeof(nm));
+          fprintf(stderr, "hv %s: keep %s@%d own %d cls %d ok %d kind %d use %d,%d ndef %d xpc %d gs %d rop %d\n", e_dbg_hex(fn), nm, in->pc, in->own, cls, ok, insn_kind(in), in->nuse > 0 ? (int)in->use[0] : -1, in->nuse > 1 ? (int)in->use[1] : -1, in->ndef, in->xpc, gstore, (int)in->rop);
+        }
+        if (!cls || !ok) continue;
+        mark[ix] = 1;
+        for (d = 0; d < in->ndef; d++)
+          if (in->def[d] < (Q2ValueId)fn->nvalues) inl_[in->def[d]] = 1;
+      }
+    }
+    /* the runs: adjacent marked instructions of one block, with at least one read or guard in them */
+    for (b = 0; b < fn->nblocks; b++) {
+      int q2, s = -1, has = 0;
+      if (!mem[b]) continue;
+      for (q2 = 0; q2 <= fn->blocks[b].ninsns; q2++) {
+        int ix = fn->blocks[b].first_insn + q2;
+        int m = q2 < fn->blocks[b].ninsns && mark[ix];
+        if (m) {
+          if (s < 0) {
+            s = ix;
+            has = 0;
+          }
+          if (fn->insns[ix].op != Q2_OP_MOVE) has = 1;
+        } else if (s >= 0) {
+          if (has) {
+            int r = hv_run_new(out, s, ix - 1, li), z;
+            if (r < 0) {
+              free(inl_);
+              goto done;
+            }
+            for (z = s; z < ix; z++) out->hvrun[z] = r + 1;
+            for (z = s; z < ix; z++) {
+              int d;
+              for (d = 0; d < fn->insns[z].ndef; d++)
+                if (fn->insns[z].def[d] < (Q2ValueId)fn->nvalues) ivg[fn->insns[z].def[d]] = 1;
+            }
+            if (dbg) fprintf(stderr, "hv %s: loop hdr %d run %d: insns %d..%d (pc %d..%d)\n", e_dbg_hex(fn), out->loop_hdr[li], r, s, ix - 1, fn->insns[s].pc, fn->insns[ix - 1].pc);
+          }
+          for (int z = s; z < ix; z++) mark[z] = 0;
+          s = -1;
+        }
+      }
+    }
+    /* the shape-cache validation of a switch arm's guard (epoch and shape-free epoch against the arm's record) cannot change in this loop */
+    for (b = 0; b < fn->nblocks; b++) {
+      int q2;
+      if (!mem[b] || getenv("QJS_AOT_NOHVARM") != NULL) continue;
+      for (q2 = 0; q2 < fn->blocks[b].ninsns; q2++) {
+        int ix = fn->blocks[b].first_insn + q2;
+        const Q2Insn *in = &fn->insns[ix];
+        int r;
+        if (!in->inlg || out->hvrun[ix] != 0 || out->hvarm[ix] != 0 || !(q2_is_sel(in) || in->xpc >= 0)) continue;
+        r = hv_run_new(out, ix, ix, li);
+        if (r < 0) {
+          free(inl_);
+          goto done;
+        }
+        out->hvarm[ix] = r + 1;
+        if (dbg) fprintf(stderr, "hv %s: loop hdr %d arm-validation flag %d at insn %d (pc %d)\n", e_dbg_hex(fn), out->loop_hdr[li], r, ix, in->pc);
+      }
+    }
+    free(inl_);
+  }
+  rc = 0;
+done:
+  free(ivg);
+  free(mark);
+  free(order);
+  free(size);
+  return rc;
+}
+
 int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
+  e_facts_pm_exit_on = e_facts_pm_exit_scan(fn);
   FactSet cur;
   g_facts_fn = fn;
   FactSet *outs = NULL;
@@ -1543,12 +1822,13 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->arr_used = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->arr_pk = calloc((size_t)(fn->nvalues > 0 ? fn->nvalues : 1), 1);
   out->miss_exits = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->pmexit = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->blocks = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1),
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->claimskip == NULL || out->vclaim == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
       out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->noproto == NULL || out->cfwd == NULL ||
-      out->miss_exits == NULL || out->blocks == NULL || outs == NULL)
+      out->miss_exits == NULL || out->pmexit == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
   if (build_groups(fn, out) < 0) goto done;
@@ -1727,6 +2007,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
       if (fs_set_avail(&outs[b], &cur.avail[k].key, cur.avail[k].val) < 0)
         goto done;
   }
+  if (plan_invariants(fn, out) < 0) goto done;
   rc = 0;
   /* A load that drops the shape test on a never-null promise is correct only while the loaded object's
      layout is intact: that layout's bit must be among those the body tests. */
@@ -1776,6 +2057,12 @@ void e_facts_free(EFacts *f) {
   free(f->arr_used);
   free(f->arr_pk);
   free(f->miss_exits);
+  free(f->pmexit);
+  free(f->hvrun);
+  free(f->hvarm);
+  free(f->hv_first);
+  free(f->hv_last);
+  free(f->hv_loop);
   if (f->groups != NULL) {
     for (i = 0; i < f->ngroups; i++) free(f->groups[i].sites);
     free(f->groups);
@@ -1793,6 +2080,7 @@ void e_facts_free(EFacts *f) {
 }
 
 int e_facts_poly_on;
+int e_facts_pm_exit_on;
 
 int e_facts_site_poly(const EFacts *f, int site) {
   int i;
@@ -2037,7 +2325,30 @@ static int inl_extra_rop(uint16_t rop) {
 typedef struct InlCall {
   int pc, rop, win_n;
 } InlCall;
-static InlCall inl_calls[8];
+static InlCall inl_calls[32];
+#define INL_MAXCALLS 32
+/* Inlining knobs (the hotness model, see e_plan_inline): the cumulative bytes of non-tiny callees copied into one root, the size under which a
+   callee is copied whatever the budget, the biggest single callee, the least path frequency (calls of the site per entry of the root) and the
+   least number of calls of a site per run (the profile counts are estimates). */
+static long inl_knob(const char *name, long dflt) {
+  const char *e = getenv(name);
+  return e != NULL && *e ? strtol(e, NULL, 10) : dflt;
+}
+static long inl_budget(void) { return inl_knob("QJS_AOT_INL_BUDGET", 3000); }
+static long inl_tiny(void) { return inl_knob("QJS_AOT_INL_TINY", 0); }
+static long inl_callee_cap(void) { return inl_knob("QJS_AOT_INL_CALLEE", 400); }
+static double inl_freq_min(void) { return (double)inl_knob("QJS_AOT_INL_FREQ_PCT", 0) / 100.0; }
+static long inl_count_floor(void) { return inl_knob("QJS_AOT_INL_FLOOR", 0); }
+/* the hotness model is the default; QJS_AOT_INL_OFF=1 restores the count limits (A/B) */
+static int inl_hot_on(void) { return getenv("QJS_AOT_INL_OFF") == NULL; }
+/* the entries of a function and the calls of a site as estimates from the profile (1024 per sample) */
+static double inl_site_freq(const uint8_t dg[16], int site_next_pc, int unused) {
+  unsigned long long c = qjs_aot_prof_site_calls(dg, site_next_pc), e = qjs_aot_prof_entries(dg);
+  (void)unused;
+  if (c == 0) return 0;
+  if (e == 0) return 1.0;
+  return (double)c / (double)e;
+}
 static int inl_ncalls;
 
 static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) {
@@ -2046,7 +2357,7 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
   e_inl_why = "ok";
   inl_ncalls = 0;
   if (cg->func_kind != 0 || cg->ctl_count != 0 || cg->light_var_count != 0 || cg->arg_count > 6 ||
-      cg->len > 400) {
+      cg->len > (inl_hot_on() ? inl_callee_cap() : 400)) {
     e_inl_why = "kind/ctl/vars/args/len";
     return 0;
   }
@@ -2054,7 +2365,7 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
     q2_free(&cf);
     return 0;
   }
-  if (cf.ninsns > 70) { ok = 0; e_inl_why = "more than 70 instructions"; }
+  if (cf.ninsns > (inl_hot_on() ? 1000 : 70)) { ok = 0; e_inl_why = "more than 70 instructions"; }
   for (i = 0; ok && i < cf.ninsns; i++) {
     const Q2Insn *bi = &cf.insns[i];
     int bt;
@@ -2063,6 +2374,8 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
   }
   for (i = 0; ok && i < cf.ninsns; i++) {
     const Q2Insn *in = &cf.insns[i];
+    /* an instruction the profile never ran is not copied (the copy leaves there): it cannot refuse the callee */
+    if (inl_hot_on() && !qjs_aot_coldcopy_off() && qjs_aot_prof_unexecuted(cg->digest, in->pc)) continue;
     /* A copy may build an object of a plain constructor: the copy is kept only if that object is
        never made (see e_plan_virtual), so its constructor must be one that can be. */
     if (in->rop == ROP_get_global) {
@@ -2123,7 +2436,7 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
         break;
       case Q2_OP_CALL:
         /* a call a nested copy stands for (checked by the planner) */
-        if (!allow_calls || inl_ncalls >= 8 || (in->rop != ROP_call && in->rop != ROP_call_method)) {
+        if (!(allow_calls || inl_hot_on()) || inl_ncalls >= (inl_hot_on() ? INL_MAXCALLS : 8) || (in->rop != ROP_call && in->rop != ROP_call_method)) {
           ok = 0;
           break;
         }
@@ -2137,7 +2450,7 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
            (checked once the types are known, see e_inline_typed_ok) */
         if (in->rop == ROP_call || in->rop == ROP_call_method) {
           /* a call a nested copy stands for (checked by the planner) */
-          if (!allow_calls || inl_ncalls >= 8) {
+          if (!(allow_calls || inl_hot_on()) || inl_ncalls >= (inl_hot_on() ? INL_MAXCALLS : 8)) {
             ok = 0;
             break;
           }
@@ -2150,13 +2463,13 @@ static int inl_callee_ok(const JSAotGenFunc *cg, int has_recv, int allow_calls) 
         /* A numeric constant-pool load is emitted from the pool: no frame, no
            handler, and nothing that can run JS (see emit_typed_load_const). */
         if (in->rop == ROP_load_const) break;
-        if (in->rop != ROP_eq && in->rop != ROP_neq && in->rop != ROP_strict_eq && in->rop != ROP_strict_neq)
+        if (in->rop != ROP_eq && in->rop != ROP_neq && in->rop != ROP_strict_eq && in->rop != ROP_strict_neq && in->rop != ROP_div)
           ok = 0;
         break;
       default:
         ok = 0;
     }
-    if (!q2_lowered(in->rop) && !inl_extra_rop(in->rop) && !(allow_calls && (in->rop == ROP_call || in->rop == ROP_call_method))) ok = 0;
+    if (!q2_lowered(in->rop) && !inl_extra_rop(in->rop) && !((allow_calls || inl_hot_on()) && (in->rop == ROP_call || in->rop == ROP_call_method))) ok = 0;
     if (!ok && strcmp(e_inl_why, "ok") == 0) {
       static char why[80];
       char nm[48];
@@ -2199,21 +2512,49 @@ int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci) {
 /* The most program bytes (about five per instruction) of callees copied into one function: 3000
    is about 600 instructions. A call over the budget stays a call. */
 #define E_INLINE_COPY_BYTES 3000
+/* set while a function with a polymorphic call (several arms) is planned: its copies get the larger budgets */
+static int g_plan_poly;
 
 /* Plan callee `cg` as a copy, and the copies of the calls inside it (a call the profile saw with one
    compiled callee that is itself a copy), in the order a parent precedes its children. Returns 0
    and leaves the plan as it was if any of them cannot be. */
+static int g_plan_thru; /* the call being planned is `X.call(...)` */
+static double g_plan_child_freq;
+static unsigned long long g_plan_root_entries;
+/* A call_method site whose profile is the builtin `Function.prototype.call` (a C callee) and X (kind 4): keep X alone, as a bytecode callee. */
+static int thru_filter(const Q2Insn *ci, char hex[4][33], int kind[4], unsigned long long hits[4], int *cnt) {
+  int k, k4 = 0, other = 0, w2 = 0;
+  if (ci->rop != ROP_call_method || ci->win_n < 1 || getenv("QJS_AOT_THRUCOPY") == NULL) return 0;
+  for (k = 0; k < *cnt; k++) {
+    if (kind[k] == 4) k4++;
+    else if (!(kind[k] == 2 && strncmp(hex[k], "js_function_call", 16) == 0)) other++;
+  }
+  if (k4 == 0 || other != 0) return 0;
+  for (k = 0; k < *cnt; k++)
+    if (kind[k] == 4) {
+      memcpy(hex[w2], hex[k], 33);
+      kind[w2] = 1;
+      hits[w2] = hits[k];
+      w2++;
+    }
+  *cnt = w2;
+  return 1;
+}
 static int plan_copy(
     const JSAotGenFunc *cg, int has_recv, int call_pc, int parent, int depth, Q2InlReq **out, int *n,
-    int *copied, const JSAotGenFunc **chain, int nchain) {
-  InlCall calls[8];
+    int *copied, const JSAotGenFunc **chain, int nchain, double pfreq) {
+  InlCall calls[INL_MAXCALLS];
   int ncalls, idx, k, c, saved_n = *n, saved_copied = *copied, next = 0;
   Q2InlReq *q;
   Q2Func cf;
-  if (*n >= 6 || *copied + cg->len > E_INLINE_COPY_BYTES) return 0;
+  if (inl_hot_on()) {
+    /* hotness model: a cap on the requests the IR can number, the cumulative bytes of non-tiny callees, and the path frequency */
+    if (*n >= 120) return 0;
+    if (cg->len > inl_tiny() && *copied + cg->len > inl_budget() * (g_plan_poly ? 4 : 1)) return 0;
+  } else if (*n >= (g_plan_poly ? 12 : 6) || *copied + cg->len > E_INLINE_COPY_BYTES * (g_plan_poly ? 4 : 1)) return 0;
   for (k = 0; k < nchain; k++)
     if (chain[k] == cg || memcmp(chain[k]->digest, cg->digest, 16) == 0) return 0;
-  if (!inl_callee_ok(cg, has_recv, depth < 2)) {
+  if (!inl_callee_ok(cg, has_recv, depth < 2 || inl_hot_on())) {
     if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok: %s\n", cg->name, e_inl_why);
     return 0;
   }
@@ -2226,18 +2567,35 @@ static int plan_copy(
   q[idx].g = cg;
   q[idx].call_pc = call_pc;
   q[idx].parent = parent;
+  q[idx].lifted = 0;
+  q[idx].fallback = 0;
+  q[idx].thru = g_plan_thru;
   (*n)++;
-  *copied += cg->len;
+  if (!inl_hot_on() || cg->len > inl_tiny()) *copied += cg->len;
   chain[nchain] = cg;
+  (void)pfreq;
   if (ncalls > 0 && q2_build(cg, &cf) != 0) {
     q2_free(&cf);
     *n = saved_n;
     *copied = saved_copied;
     return 0;
   }
-  for (c = 0; c < ncalls; c++) {
+  /* the hottest call first (the hotness model spends the budget on the hottest sites first) */
+  int corder[INL_MAXCALLS];
+  for (c = 0; c < ncalls; c++) corder[c] = c;
+  if (inl_hot_on())
+    for (c = 1; c < ncalls; c++) {
+      int x = corder[c], y = c - 1;
+      while (y >= 0 && qjs_aot_prof_pc_count(cg->digest, calls[corder[y]].pc) < qjs_aot_prof_pc_count(cg->digest, calls[x].pc)) {
+        corder[y + 1] = corder[y];
+        y--;
+      }
+      corder[y + 1] = x;
+    }
+  for (int co_ = 0; co_ < ncalls; co_++) {
+    c = corder[co_];
     char hex[4][33];
-    int kind[4], cnt = 0, j, ci_ix = -1, ext = 0, nested_ok = 0;
+    int kind[4], cnt = 0, j, ci_ix = -1, ext = 0, nested_ok = 0, nested_thru = 0;
     unsigned long long hits[4];
     const JSAotGenFunc *cg2 = NULL;
     const Q2Insn *ci = NULL;
@@ -2246,11 +2604,61 @@ static int plan_copy(
         ci = &cf.insns[j];
         ci_ix = j;
       }
+    if (inl_hot_on() && ci != NULL && qjs_aot_prof_site_calls(cg->digest, ci->next) == 0) {
+      /* a call that never ran in the profile: cold, so it is not copied and nothing below it is considered; it stays a call, which the
+         copy leaves at (the generic body makes it) */
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  nested call at pc %d of %s never ran: left as a call\n", calls[c].pc, cg->name);
+      continue;
+    }
+    if (ci != NULL && getenv("QJS_AOT_NOCOPYARR") == NULL && ci->rop == ROP_call_method && (ci->win_n == 1 || ci->win_n == 0) &&
+        qjs_aot_prof_callees(cg->digest, ci->next, &cnt, hex, kind, hits) && cnt == 1 && kind[0] == 2 &&
+        ((ci->win_n == 1 && strcmp(hex[0], "js_array_push:0") == 0) || (ci->win_n == 0 && strcmp(hex[0], "js_array_pop:0") == 0))) {
+      /* Array.prototype.push: the copy does it in place (see e_arrayop_site) */
+      continue;
+    }
+    if (ci != NULL && inl_hot_on() && getenv("QJS_AOT_NESTARMS") != NULL && ci->win_n <= 6 && ci->nredef == 0 && ci->ndef == 1 &&
+        qjs_aot_prof_callees(cg->digest, ci->next, &cnt, hex, kind, hits) && cnt >= 2 && cnt <= 4) {
+      /* a nested call with several compiled callees: one arm per callee inside the copy (a guard chain, the last guard leaves) */
+      int all = 1, k2, ord[4], a2, b2, n0 = *n, c0 = *copied, ok = 1, lift2 = 0, jj;
+      for (k2 = 0; k2 < cnt; k2++) {
+        ord[k2] = k2;
+        if (kind[k2] != 1 || !qjs_aot_unit_has(hex[k2])) all = 0;
+      }
+      for (a2 = 0; a2 < cnt; a2++)
+        for (b2 = a2 + 1; b2 < cnt; b2++)
+          if (hits[ord[b2]] > hits[ord[a2]]) { int tm = ord[a2]; ord[a2] = ord[b2]; ord[b2] = tm; }
+      if (all) {
+        for (jj = ci_ix + 1; jj < cf.ninsns; jj++)
+          if (cf.insns[jj].rop == ROP_put_field) lift2 = 1;
+        if (lift2 && getenv("QJS_AOT_NOMIDEXIT") != NULL) ok = 0;
+        for (k2 = 0; ok && k2 < cnt; k2++) {
+          const JSAotGenFunc *ca = qjs_aot_unit_func(hex[ord[k2]]);
+          int save_thru = g_plan_thru;
+          g_plan_thru = 0;
+          g_plan_poly = 1;
+          if (ca == NULL || !plan_copy(ca, calls[c].rop == ROP_call_method, calls[c].pc, idx, depth + 1, out, n, copied, chain, nchain + 1, pfreq)) ok = 0;
+          g_plan_thru = save_thru;
+        }
+        if (ok) {
+          if (lift2) (*out)[idx].lifted = 1;
+          if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  nested call at pc %d of %s: %d arms\n", calls[c].pc, cg->name, cnt);
+          continue;
+        }
+        *n = n0;
+        *copied = c0;
+      }
+      cnt = 0;
+    }
     if (ci != NULL && ci->win_n <= 6 && ci->nredef == 0 && ci->ndef == 1 &&
-        (qjs_aot_prof_pc_count(cg->digest, ci->ppc) > 0 || qjs_aot_prof_pc_count(cg->digest, ci->onext) > 0) &&
-        qjs_aot_prof_callees(cg->digest, ci->next, &cnt, hex, kind, hits) && cnt == 1 && kind[0] == 1 &&
-        qjs_aot_unit_has(hex[0]))
+        (inl_hot_on() || qjs_aot_prof_pc_count(cg->digest, ci->ppc) > 0 || qjs_aot_prof_pc_count(cg->digest, ci->onext) > 0) &&
+        qjs_aot_prof_callees(cg->digest, ci->next, &cnt, hex, kind, hits) && ((nested_thru = thru_filter(ci, hex, kind, hits, &cnt)), 1) &&
+        cnt == 1 && kind[0] == 1 && qjs_aot_unit_has(hex[0]))
       cg2 = qjs_aot_unit_func(hex[0]);
+    if (cg2 != NULL && inl_hot_on()) {
+      double sf = inl_site_freq(cg->digest, ci->next, 0), cf_ = pfreq * sf;
+      if (cf_ < inl_freq_min() || (double)inl_count_floor() > cf_ * (double)(g_plan_root_entries > 0 ? g_plan_root_entries : 1)) cg2 = NULL;
+      else g_plan_child_freq = cf_;
+    }
     if (cg2 != NULL) {
       /* a copy of the callee, with no store of this callee after the call */
       int stores = 0;
@@ -2263,10 +2671,21 @@ static int plan_copy(
                           (cf.insns[j].arg[3].val >> 4) == (pc_->arg[0].val >> 4);
           if (!own_fused) stores = 1;
         }
-      /* ... unless the call is not copied, below */
-      if (!stores)
+      /* ... unless the call is not copied, below. With resumable copies a store after the call is no obstacle: a way out of the
+         nest resumes the callee instead of replaying the call (the checker drops the copies if the nest cannot resume). */
+      int lift = 0;
+      if (stores && getenv("QJS_AOT_NOMIDEXIT") == NULL) {
+        lift = 1;
+        stores = 0;
+      }
+      if (!stores) {
+        int save_thru = g_plan_thru;
+        g_plan_thru = nested_thru;
         nested_ok = plan_copy(cg2, calls[c].rop == ROP_call_method, calls[c].pc, idx, depth + 1, out, n, copied,
-                              chain, nchain + 1);
+                              chain, nchain + 1, g_plan_child_freq);
+        g_plan_thru = save_thru;
+      }
+      if (nested_ok && lift) (*out)[idx].lifted = 1;
       if (!nested_ok && e_inline_allow_ext && getenv("QJS_AOT_NOEXTCALL") == NULL && next == 0 && ci->rop == ROP_call_method &&
           qjs_aot_native_capable(hex[0]) && ci->win_n >= qjs_aot_unit_argc(hex[0])) {
         /* A call that stays a call. Nothing after it may leave the copy: only the store of its result
@@ -2292,6 +2711,14 @@ static int plan_copy(
           next++;
         }
       }
+      if (!nested_ok && !ext && inl_hot_on() && getenv("QJS_AOT_REALCALL") != NULL && ci != NULL && ci->win_n <= 6 && ci->ndef == 1 && ci->nredef == 0) {
+        /* the call stays a real call inside the copy; stores after it need the nest to resume */
+        int jj, stores2 = 0;
+        for (jj = ci_ix + 1; jj < cf.ninsns; jj++)
+          if (cf.insns[jj].rop == ROP_put_field) stores2 = 1;
+        if (stores2) (*out)[idx].lifted = 1;
+        ext = 1;
+      }
       if (!nested_ok && !ext) {
         if (getenv("QJS_AOT_DEBUG_INL"))
           fprintf(stderr, "  nested call at pc %d of %s: callee refused\n", calls[c].pc, cg->name);
@@ -2302,7 +2729,26 @@ static int plan_copy(
       }
     } else {
       if (getenv("QJS_AOT_DEBUG_INL"))
-        fprintf(stderr, "  nested call at pc %d of %s: no single compiled callee\n", calls[c].pc, cg->name);
+        {
+          char hx2[4][33];
+          int kd2[4], c2 = 0;
+          unsigned long long ht2[4];
+          fprintf(stderr, "  nested call at pc %d of %s: no single compiled callee", calls[c].pc, cg->name);
+          if (ci != NULL && qjs_aot_prof_callees(cg->digest, ci->next, &c2, hx2, kd2, ht2)) {
+            int z;
+            for (z = 0; z < c2 && z < 4; z++) fprintf(stderr, " [kind %d %s hits %llu unit %d]", kd2[z], kd2[z] == 1 ? hx2[z] : (kd2[z] == 4 ? "thru" : hx2[z]), ht2[z], kd2[z] == 1 ? qjs_aot_unit_has(hx2[z]) : -1);
+          } else {
+            fprintf(stderr, " [no callee record%s]", ci == NULL ? ", no insn" : "");
+          }
+          fprintf(stderr, "\n");
+        }
+      if (inl_hot_on() && getenv("QJS_AOT_REALCALL") != NULL && ci != NULL && ci->win_n <= 6 && ci->ndef == 1 && ci->nredef == 0) {
+        /* the call cannot be copied: it stays a real call inside the copy (emit_copy_real_call); stores after it need the nest to resume */
+        int jj;
+        for (jj = ci_ix + 1; jj < cf.ninsns; jj++)
+          if (cf.insns[jj].rop == ROP_put_field) (*out)[idx].lifted = 1;
+        continue;
+      }
       q2_free(&cf);
       *n = saved_n;
       *copied = saved_copied;
@@ -2315,45 +2761,108 @@ static int plan_copy(
   return 1;
 }
 
+int e_plan_nopoly, e_plan_used_poly;
 int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
   int i, n = 0, copied = 0;
   *out = NULL;
+  e_plan_used_poly = 0;
   if (getenv("QJS_AOT_NOIRINLINE") != NULL) return 0;
-  for (i = 0; i < fn->ninsns && n < 6; i++) {
-    const Q2Insn *in = &fn->insns[i];
+  g_plan_poly = 0;
+  int *ord = malloc(sizeof(int) * (size_t)(fn->ninsns > 0 ? fn->ninsns : 1)), oi;
+  if (ord == NULL) return 0;
+  for (oi = 0; oi < fn->ninsns; oi++) ord[oi] = oi;
+  if (inl_hot_on())
+    for (oi = 1; oi < fn->ninsns; oi++) { /* the hottest sites first */
+      int x = ord[oi], y = oi - 1;
+      unsigned long long cx = qjs_aot_prof_pc_count(fn->g->digest, fn->insns[x].ppc);
+      while (y >= 0 && qjs_aot_prof_pc_count(fn->g->digest, fn->insns[ord[y]].ppc) < cx) {
+        ord[y + 1] = ord[y];
+        y--;
+      }
+      ord[y + 1] = x;
+    }
+  for (oi = 0; oi < fn->ninsns && n < (inl_hot_on() ? 120 : 12); oi++) {
+    const Q2Insn *in;
+    i = ord[oi];
+    in = &fn->insns[i];
     char hex[4][33];
     int kind[4], cnt = 0, k;
     unsigned long long hits[4];
     const JSAotGenFunc *cg;
-    const JSAotGenFunc *chain[8];
+    const JSAotGenFunc *chain[64];
     Q2InlReq *q = NULL;
     if ((in->rop != ROP_call && in->rop != ROP_call_method) || in->xpc >= 0 || in->own || in->inlg) continue;
     if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "inl %s@%d: win_n=%d nredef=%d ndef=%d count=%llu\n", fn->g->name, in->pc, in->win_n, in->nredef, in->ndef, qjs_aot_prof_pc_count(fn->g->digest, in->ppc));
     if (in->win_n > 6 || in->nredef != 0 || in->ndef != 1) continue;
     if (qjs_aot_prof_pc_count(fn->g->digest, in->ppc) == 0) continue;
-    if (!qjs_aot_prof_callees(fn->g->digest, in->next, &cnt, hex, kind, hits) || cnt != 1 || kind[0] != 1) {
+    if (!qjs_aot_prof_callees(fn->g->digest, in->next, &cnt, hex, kind, hits) || cnt < 1 || cnt > 4) {
       if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callees cnt=%d\n", cnt);
       continue;
     }
-    if (!qjs_aot_unit_has(hex[0])) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  not in unit\n"); continue; }
-    cg = qjs_aot_unit_func(hex[0]);
-    if (cg == NULL || cg == fn->g || memcmp(cg->digest, fn->g->digest, 16) == 0) continue;
-    if (getenv("QJS_AOT_INLDEDUP") != NULL) {
-      for (k = 0; k < n; k++)
-        if ((*out)[k].g == cg) break;
-      if (k < n) continue;
+    g_plan_thru = thru_filter(in, hex, kind, hits, &cnt);
+    /* A call the profile saw with several compiled callees gets one copy per callee, tried in turn (see q2_apply_inlines);
+       a callee that is not compiled in this unit, or a builtin, leaves the call as the fall-back of the last guard. */
+    {
+      int arm_max = getenv("QJS_AOT_NOSWITCH") != NULL || e_plan_nopoly ? 1 : 4, narm = 0, order[4], ai, aj;
+      int n0 = n, c0 = copied;
+      if (cnt > 1) g_plan_poly = 1;
+      for (ai = 0; ai < cnt; ai++) order[ai] = ai;
+      for (ai = 0; ai < cnt; ai++)
+        for (aj = ai + 1; aj < cnt; aj++)
+          if (hits[order[aj]] > hits[order[ai]]) { int tmp = order[ai]; order[ai] = order[aj]; order[aj] = tmp; }
+      if (cnt > 1 && (getenv("QJS_AOT_NOSWITCH") != NULL || e_plan_nopoly)) continue;
+      for (ai = 0; ai < cnt && narm < arm_max; ai++) {
+        int c1 = order[ai], n_before = n;
+        if (kind[c1] != 1) { if (cnt > 1) continue; else break; }
+        if (!qjs_aot_unit_has(hex[c1])) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  not in unit\n"); continue; }
+        cg = qjs_aot_unit_func(hex[c1]);
+        if (cg == NULL || cg == fn->g || memcmp(cg->digest, fn->g->digest, 16) == 0) continue;
+        if (getenv("QJS_AOT_INLDEDUP") != NULL) {
+          for (k = 0; k < n; k++)
+            if ((*out)[k].g == cg) break;
+          if (k < n) continue;
+        }
+        if (copied + cg->len > E_INLINE_COPY_BYTES * (g_plan_poly ? 4 : 1)) {
+          char fh[33];
+          int di;
+          for (di = 0; di < 16; di++) snprintf(fh + 2 * di, 3, "%02x", fn->g->digest[di]);
+          e_report_copycap(fh, hex[c1], copied, cg->len, E_INLINE_COPY_BYTES);
+          continue;
+        }
+        chain[0] = fn->g;
+        (void)q;
+        {
+          double pf = 1.0;
+          if (inl_hot_on()) {
+            pf = inl_site_freq(fn->g->digest, in->next, 0);
+            g_plan_root_entries = qjs_aot_prof_entries(fn->g->digest);
+            if (pf < inl_freq_min() || (double)inl_count_floor() > pf * (double)(g_plan_root_entries > 0 ? g_plan_root_entries : 1)) continue;
+          }
+          plan_copy(cg, in->rop == ROP_call_method, in->pc, -1, 0, out, &n, &copied, chain, 1, pf);
+        }
+        if (n > n_before) narm++;
+      }
+      /* The last arm's guard leaves when the callee is none of the arms'. That is only cheap if the arms cover the callees the
+         call really has: a call with a callee that gets no arm stays a call (the guarded native-call chain). */
+      if (cnt > 1 && narm > 0) e_plan_used_poly = 1;
+      if (cnt > 1 && getenv("QJS_AOT_DEBUG_INL"))
+        fprintf(stderr, "  polymorphic call %s@%d: %d callees, %d arms%s\n", fn->g->name, in->pc, cnt, narm, narm < cnt ? " (dropped)" : "");
+      /* The last guard leaves for the call when the callee is none of the arms'. That is only cheap if the arms cover every callee the
+         profile saw; a call with a callee that gets no arm stays a call (the guarded chain of native calls). Keeping the call as the
+         fall-back of the guards instead (QJS_AOT_POLYFALLBACK=1) makes every join after it a join with a call, and costs more than it saves. */
+      if (cnt > 1) {
+        if (narm < cnt && getenv("QJS_AOT_POLYFALLBACK") == NULL) {
+          n = n0;
+          copied = c0;
+        } else if (narm > 0 && narm < cnt || (narm == cnt && getenv("QJS_AOT_POLYFALLBACK") != NULL)) {
+          int rq;
+          for (rq = n0; rq < n; rq++)
+            if ((*out)[rq].parent < 0) (*out)[rq].fallback = 1;
+        }
+      }
     }
-    if (copied + cg->len > E_INLINE_COPY_BYTES) {
-      char fh[33];
-      int di;
-      for (di = 0; di < 16; di++) snprintf(fh + 2 * di, 3, "%02x", fn->g->digest[di]);
-      e_report_copycap(fh, hex[0], copied, cg->len, E_INLINE_COPY_BYTES);
-      continue;
-    }
-    chain[0] = fn->g;
-    (void)q;
-    plan_copy(cg, in->rop == ROP_call_method, in->pc, -1, 0, out, &n, &copied, chain, 1);
   }
+  free(ord);
   return n;
 }
 

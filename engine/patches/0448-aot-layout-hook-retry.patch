@@ -1,0 +1,39 @@
+Subject: A layout hook retries while rows of its digest are unbuilt
+
+What this does
+  - `JSFunctionBytecode` gains `aot_layout_tries`. The first-construct layout hook (`js_aot_layout_fn_hook`) used to drop its mark after one attempt per bytecode. When the unit still has an unbuilt row for the bytecode's digest it now re-arms the mark as a countdown of 250 constructs (the constructs in between only decrement it, no digest is computed), at most 16 times; with nothing pending it drops the mark as before.
+
+Why we need it
+  Classes made by one function (Prototype.js's Class.create) share a bytecode digest. The unit builds each class's layout row against the closure its constant path names, and a class defined after the first construct is not there when the first attempt runs. A digest with one row, or all rows built, behaves exactly as before.
+
+Soundness
+  The hook only builds layouts the unit already owns; the retry never changes what a built layout means. Cost is a decrement per construct while rows are pending, bounded by 16 x 250 constructs.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1981,0 +1982 @@
++    uint8_t aot_layout_tries;   /* attempts the layout hook has made for this bytecode while rows of its digest were still unbuilt (see js_aot_layout_fn_hook) */
+@@ -66183,0 +66185 @@
++    b->aot_layout_tries = 0;
+@@ -67017,0 +67020,5 @@
++    /* between attempts the flag counts constructs down (cheap: no digest) */
++    if (b->aot_layout_ctor > 1) {
++        b->aot_layout_ctor--;
++        return;
++    }
+@@ -67024,4 +67031,11 @@
+-    /* One attempt per bytecode: the layout is built (or refused) from the first
+-       constructor object that constructs, so the mark is dropped whatever the
+-       answer and every later construct skips the hash. */
+-    b->aot_layout_ctor = 0;
++    /* One attempt per bytecode, unless rows of its digest are still unbuilt: the rows of classes
++       made by one function (every Class.create class) are built by each class's constant path, and
++       a class defined after the first construct is not there yet. Retry after 250 constructs, at
++       most 16 times; a digest with nothing pending drops the mark as before, so every later
++       construct skips the hash. */
++    if (&qjs_aot_layout_ctor != NULL && b->aot_layout_tries < 16 && qjs_aot_layout_ctor(dg)) {
++        b->aot_layout_tries++;
++        b->aot_layout_ctor = 250;
++    } else {
++        b->aot_layout_ctor = 0;
++    }

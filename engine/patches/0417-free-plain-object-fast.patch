@@ -1,0 +1,144 @@
+Subject: A plain object freed from the zero-count list takes a direct path, and an arena block is freed with one header read
+
+What this does
+  - `free_zero_refcount` sends an object with `class_id == JS_CLASS_OBJECT` and no `first_weak_ref` to the new `free_plain_object` instead of
+    `free_gc_object` -> `free_object`. It runs the same field loop, prop-array free, shape release, `remove_gc_object` and block free, in the same
+    order, and omits the `free_mark` store, the finalizer-table lookup, the `shape`/`prop`/`class_id`/`u` fail-safe stores and the
+    REMOVE_CYCLES test.
+  - `js_free_rt` frees an arena block from a single read of its header (size class, accounted size, arena, free-list push), instead of
+    `js_arena_usable_size` followed by `js_arena_free` re-deriving the same things. Large and zero-size blocks, and the
+    `JS_ARENA_LARGE_BLOCKS_ONLY` builds, take the old path. The empty-arena handling moves into the shared `js_arena_empty`.
+
+Why we need it
+  The commonest garbage is a plain object. Its free ran through four layers (type switch, class-generic `free_object`, `js_free_rt`,
+  `js_arena_usable_size`, `js_arena_free`) that re-test things a plain object cannot have (a finalizer, exotic state, a cycle-collector phase).
+
+Soundness
+  free_plain_object is entered only from free_zero_refcount, which sets gc_phase = DECREF for the whole loop and is the only caller of
+  free_gc_object besides gc_free_cycles (which runs in REMOVE_CYCLES and is untouched). In DECREF, free_object's last branch is always
+  `js_free_rt(p)`, so the zombie re-queue is unreachable here. Dropped stores: free_mark is read only by JS_IsLiveObject and the cycle
+  walk of the finalizer-visible zombies, both reachable only for objects that outlive free_object (REMOVE_CYCLES); shape/prop/class_id/u are
+  dead stores into a block released at the end of the same call, and no code runs between them and the release for a class without a
+  finalizer (reset_weak_ref is excluded by the first_weak_ref test). rt->class_array[JS_CLASS_OBJECT].finalizer is NULL by construction
+  (the class table entry is {Object, NULL, NULL} and JS_NewClass refuses an id already registered); asserted. Child values released in the field
+  loop go through js_free_value_rt, which in DECREF only moves them onto the zero list (no nesting), exactly as before. js_free_rt's
+  fused path computes the same free_size (block_size - header + MALLOC_OVERHEAD), the same underflow check before any mutation, the same
+  counters and the same free-list/arena transitions as usable_size + js_arena_free; js_arena_empty is the old tail verbatim. Accounting
+  (malloc_count/malloc_size, JS_ComputeMemoryUsage) is unchanged: verified equal on the interpreter shell.
+
+Functions touched
+  `free_zero_refcount`, `free_plain_object` (new), `js_free_rt`, `js_arena_empty` (new, split out of `js_arena_free`), `js_arena_free`
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3372,0 +3373,16 @@
++    }
++}
++
++/* An arena just lost its last used block.
++   Keep a bounded number of empty arenas: a batch of deferred frees
++   empties whole arenas and the allocations that follow need them
++   back. An empty arena stays on its class's free list;
++   js_arena_trim releases them after a full collection. */
++static no_inline void js_arena_empty(JSRuntime *rt, JSArena *ar)
++{
++    if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
++        rt->arena_state.n_empty++;
++    } else {
++        list_del(&ar->link);
++        list_del(&ar->free_link);
++        rt->mf.js_free(rt->malloc_state.opaque, ar);
+@@ -3403,13 +3419,2 @@
+-        if (unlikely(ar->n_used_blocks == 0)) {
+-            /* Keep a bounded number of empty arenas: a batch of deferred frees
+-               empties whole arenas and the allocations that follow need them
+-               back. An empty arena stays on its class's free list;
+-               js_arena_trim releases them after a full collection. */
+-            if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
+-                rt->arena_state.n_empty++;
+-            } else {
+-                list_del(&ar->link);
+-                list_del(&ar->free_link);
+-                rt->mf.js_free(rt->malloc_state.opaque, ar);
+-            }
+-        }
++        if (unlikely(ar->n_used_blocks == 0))
++            js_arena_empty(rt, ar);
+@@ -3638,0 +3644,30 @@
++    if (likely(!JS_ARENA_LARGE_BLOCKS_ONLY)) {
++        /* An arena block: its size class is in the header, so the accounted
++           size, the arena and the free-list push come from one header read
++           (js_arena_usable_size and js_arena_free each re-derive them). */
++        JSMallocBlockHeader *b = container_of(ptr, JSMallocBlockHeader, user_data);
++        unsigned int block_idx = b->u.block_idx;
++        if (likely(block_idx != JS_ARENA_FREE_NIL)) {
++            unsigned int block_size_idx = b->block_size_idx;
++            unsigned int block_size = arena_block_sizes[block_size_idx];
++            size_t sz = block_size - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD;
++            JSArena *ar;
++            if (unlikely(sz > s->malloc_size)) {
++                printf("js_free_rt: malloc_size underflow: freeing %zu but only %zu tracked\n", sz, s->malloc_size);
++                abort();
++            }
++            s->malloc_count--;
++            s->malloc_size -= sz;
++            ar = (JSArena *)((uint8_t *)b - (size_t)block_size * block_idx -
++                             sizeof(JSArena));
++            b->u.free_next = ar->first_free_block;
++            ar->first_free_block = block_idx;
++            if (unlikely(ar->n_used_blocks == ar->n_blocks))
++                list_add(&ar->free_link,
++                         &rt->arena_state.free_arena_list[block_size_idx]);
++            ar->n_used_blocks--;
++            if (unlikely(ar->n_used_blocks == 0))
++                js_arena_empty(rt, ar);
++            return;
++        }
++    }
+@@ -10655,0 +10691,36 @@
++/* free_object for the commonest garbage: a plain object (JS_CLASS_OBJECT, which
++   has no finalizer and no exotic behaviour) without weak references, freed from
++   free_zero_refcount, where gc_phase is DECREF. Nothing outside this call sees
++   the object once it returns, so the free_mark and fail-safe stores, the
++   finalizer lookup and the REMOVE_CYCLES test of free_object are skipped; every
++   other step runs in the same order. */
++static inline __attribute__((always_inline)) void
++free_plain_object(JSRuntime *rt, JSObject *p)
++{
++    int i;
++    JSShape *sh;
++    JSShapeProperty *pr;
++
++    assert(p->class_id == JS_CLASS_OBJECT && !p->first_weak_ref);
++    assert(rt->class_array[JS_CLASS_OBJECT].finalizer == NULL);
++    assert(rt->gc_phase == JS_GC_PHASE_DECREF);
++    sh = p->shape;
++    pr = get_shape_prop(sh);
++    for(i = 0; i < sh->prop_count; i++) {
++        if (likely(!(pr->flags & JS_PROP_TMASK))) {
++            JSValue v = p->prop[i].u.value;
++            if (JS_VALUE_HAS_REF_COUNT(v) &&
++                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
++                js_free_value_rt(rt, v);
++        } else {
++            free_property(rt, &p->prop[i], pr->flags);
++        }
++        pr++;
++    }
++    if (p->prop_inline_cap == 0)
++        js_free_rt(rt, p->prop);
++    js_free_shape(rt, sh);
++    remove_gc_object(&p->header);
++    js_free_rt(rt, p);
++}
++
+@@ -10682 +10753,6 @@
+-        free_gc_object(rt, p);
++        if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
++                   ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
++                   ((JSObject *)p)->first_weak_ref == NULL))
++            free_plain_object(rt, (JSObject *)p);
++        else
++            free_gc_object(rt, p);

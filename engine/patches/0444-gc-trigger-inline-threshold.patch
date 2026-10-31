@@ -1,0 +1,28 @@
+Subject: The collection trigger's threshold test is always inlined; the collection itself is out of line
+
+What this does
+  - `js_trigger_gc` splits into an always-inline threshold test (`malloc_size + size > malloc_gc_threshold`) and `js_trigger_gc_slow`, which holds the previous body unchanged (deferral, reconcile, collection, pacing).
+
+Why we need it
+  `js_trigger_gc` had one caller, so the compiler inlined it into JS_NewObjectFromShapeCapExtra. The dedicated allocator of 0440 is a second caller; the compiler then emitted `js_trigger_gc` out of line and every object allocation paid a call and the setup of its large body (+195M on rootpin, +35M on virt5 in the default kit, interpreter unaffected). With the test inline, rootpin and virt5 are below their numbers before 0439.
+
+Soundness
+  The same condition decides, and the same code runs when it holds; GC pacing is untouched. With FORCE_GC_AT_MALLOC the slow path is called unconditionally, as before.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3200 +3200 @@
+-static void js_trigger_gc(JSRuntime *rt, size_t size)
++static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t size)
+@@ -3255,0 +3256,11 @@
++/* The threshold test stays inline at every allocation site; the collection itself is out of line. */
++static inline __attribute__((always_inline)) void js_trigger_gc(JSRuntime *rt, size_t size)
++{
++#ifdef FORCE_GC_AT_MALLOC
++    js_trigger_gc_slow(rt, size);
++#else
++    if (unlikely((rt->malloc_state.malloc_size + size) > rt->malloc_gc_threshold))
++        js_trigger_gc_slow(rt, size);
++#endif
++}
++

@@ -1,0 +1,25 @@
+Subject: The unit layout exports where a bytecode keeps the length of its register program
+
+What this does
+  - `JSAotGenLayout` gains `off_fnbc_regvm_len`, the offset of `JSFunctionBytecode.regvm_len`, filled by `js_aot_gen_layout` (so it is part of the layout hash a unit is checked against).
+
+Why we need it
+  A compiled switch arm whose callee body is tiny and uses nothing of its own (an empty method, a constant, an argument) accepts a callee by its register program, because the engine binds a compiled entry to one bytecode only and an identical twin (EditConstraint.execute next to StayConstraint.execute in deltablue) stays unbound and was never accepted. The unit compares the program's length first, then its bytes.
+
+Soundness
+  An offset only; the unit reads the length and the code pointer of a function object whose class it has tested to be a bytecode function.
+
+Functions touched
+  `js_aot_gen_layout`, `JSAotGenLayout`.
+
+No.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -202 +202 @@
+-    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json, off_rt_shape_free_epoch;
++    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json, off_rt_shape_free_epoch, off_fnbc_regvm_len;
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63099,0 +63100 @@
++    out->off_fnbc_regvm_len = (uint32_t)offsetof(JSFunctionBytecode, regvm_len);

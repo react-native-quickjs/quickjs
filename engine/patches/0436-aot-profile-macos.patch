@@ -1,0 +1,84 @@
+Subject: The AOT profiling build runs on macOS
+
+What this does
+  - `aot_sym_name` names a C function by address on Apple platforms from the main image's `LC_SYMTAB` (mapped in `__LINKEDIT`): the nearest preceding defined section symbol, which covers the static functions `dladdr` cannot see. The ELF walk and `dl_iterate_phdr` stay for the other platforms.
+  - The ELF and link headers are included only where they exist.
+
+Why we need it
+  The kit is measured on the development machine (Apple silicon) as well as the x86 box; the profiling engine (`QJS_AOT_PROFILE=1`) did not compile there (`elf.h`), so no profile, no unit.
+
+Soundness
+  Profiling build only. It reads the mapped symbol table and runs no JS.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -35,0 +36,5 @@
++#if defined(__APPLE__)
++#include <mach-o/dyld.h>   /* the main image's header and slide */
++#include <mach-o/loader.h> /* LC_SYMTAB / __LINKEDIT walk, for naming static C callees */
++#include <mach-o/nlist.h>
++#else
+@@ -38,0 +44 @@
++#endif
+@@ -64836 +64842 @@
+-#if !defined(_WIN32)
++#if !defined(_WIN32) && !defined(__APPLE__)
+@@ -64850 +64856,57 @@
+-#if !defined(_WIN32)
++#if defined(__APPLE__)
++    /* dladdr sees exported symbols only; the main image's LC_SYMTAB (in
++       __LINKEDIT, mapped) also holds the static functions of an unstripped
++       binary: the nearest preceding defined section symbol names `p`. */
++    Dl_info di;
++    const struct mach_header_64 *mh;
++    const struct load_command *lc;
++    const struct symtab_command *st = NULL;
++    const struct segment_command_64 *le = NULL;
++    const struct nlist_64 *sym;
++    const char *str;
++    uintptr_t slide, lebase, off, bestv = 0;
++    uint32_t i, best = 0;
++    int have_best = 0;
++
++    (void)rt;
++    if (!p)
++        return NULL;
++    if (dladdr(p, &di) && di.dli_sname && di.dli_saddr == p) {
++        snprintf(buf, (size_t)n, "%s", di.dli_sname[0] == '_' ? di.dli_sname + 1 : di.dli_sname);
++        return buf;
++    }
++    mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
++    slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
++    if (!mh || mh->magic != MH_MAGIC_64)
++        return NULL;
++    lc = (const struct load_command *)(mh + 1);
++    for (i = 0; i < mh->ncmds; i++) {
++        if (lc->cmd == LC_SYMTAB)
++            st = (const struct symtab_command *)lc;
++        else if (lc->cmd == LC_SEGMENT_64 &&
++                 !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT"))
++            le = (const struct segment_command_64 *)lc;
++        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
++    }
++    if (!st || !le)
++        return NULL;
++    lebase = slide + le->vmaddr - le->fileoff;
++    sym = (const struct nlist_64 *)(lebase + st->symoff);
++    str = (const char *)(lebase + st->stroff);
++    off = (uintptr_t)p - slide;
++    for (i = 0; i < st->nsyms; i++) {
++        if ((sym[i].n_type & N_STAB) || (sym[i].n_type & N_TYPE) != N_SECT)
++            continue;
++        if (sym[i].n_value <= off && (!have_best || sym[i].n_value > bestv)) {
++            best = i;
++            bestv = sym[i].n_value;
++            have_best = 1;
++        }
++    }
++    if (have_best) {
++        const char *nm = str + sym[best].n_un.n_strx;
++        snprintf(buf, (size_t)n, "%s", nm[0] == '_' ? nm + 1 : nm);
++        return buf;
++    }
++    return NULL;
++#elif !defined(_WIN32)

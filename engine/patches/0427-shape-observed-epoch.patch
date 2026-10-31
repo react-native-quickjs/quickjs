@@ -1,0 +1,61 @@
+Subject: Shapes that compiled tables key by address are marked observed, and only their frees move an epoch
+
+What this does
+  - `JSShape.aot_observed` is a real field (it was a counters-only field): set when a PIC cell holds the shape and when `qjs_aot_shape_slot` / `qjs_aot_shape_method` read it. `JSRuntime.shape_obs_epoch`, right after `shape_free_epoch`, moves when an observed shape is freed or edited in place (and at the three places that move a shape allocation).
+
+Why we need it
+  The switch arms' slot tables and the learned method tables keep shapes by address without a reference. They validated against `shape_free_epoch`, which moves whenever ANY shape is freed: 40,000 times per deltablue unit, almost all of them the throwaway shape every `new Array()` builds and frees. Each move made every arm and every method table refill (~18 Minsn per unit). A table now validates against `shape_obs_epoch`, which the churn of unobserved shapes does not touch.
+
+Soundness
+  A table only keeps shapes it passed to `qjs_aot_shape_slot` / `qjs_aot_shape_method`, and those set the bit before the table stores the address, so freeing or editing a kept shape always moves `shape_obs_epoch`. Other users of `shape_free_epoch` (constructor-wrapper cache, constructor caches, the global stub cache) are unchanged.
+
+Functions touched
+  `js_new_shape2`, `js_free_shape0`, `resize_properties`, `compact_properties`, `add_property`, `js_shape_prepare_update`, the PIC fill, `qjs_aot_shape_slot`, `qjs_aot_shape_method`, `js_aot_gen_layout` (static assertion).
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -767,0 +768,3 @@
++    /* Moved only when an OBSERVED shape (JSShape.aot_observed) is freed or edited in place. A unit reads it at the offset right after
++       shape_free_epoch (a static assertion below keeps them adjacent). */
++    uint32_t shape_obs_epoch;
+@@ -2427,3 +2430,4 @@
+-#ifdef QJS_AOT_BUMPSTATS
+-    uint8_t aot_observed;   /* measurement only: some PIC cell has held this shape */
+-#endif
++    /* Some compiled-code table keyed by this shape's address holds it without a reference (a switch arm's slot table, a learned method
++       table): freeing or editing it in place moves shape_obs_epoch, which those tables validate instead of shape_free_epoch, so the
++       churn of unobserved shapes costs them nothing. Also set when a PIC cell holds the shape (the counters). */
++    uint8_t aot_observed;
+@@ -8334,0 +8339 @@
++    sh->aot_observed = 0;
+@@ -8447,0 +8453,2 @@
++    if (sh->aot_observed)
++        rt->shape_obs_epoch++;
+@@ -9159,0 +9167 @@
++        ctx->rt->shape_obs_epoch++;
+@@ -9173,0 +9182 @@
++        ctx->rt->shape_obs_epoch++;
+@@ -9251,0 +9261 @@
++    ctx->rt->shape_obs_epoch++;
+@@ -14833 +14843 @@
+-    if (p->shape->is_hashed)
++    if (p->shape->is_hashed) {
+@@ -14834,0 +14845,3 @@
++        if (p->shape->aot_observed)
++            ctx->rt->shape_obs_epoch++;
++    }
+@@ -16847,0 +16861,2 @@
++            if (sh->aot_observed)
++                ctx->rt->shape_obs_epoch++;
+@@ -25999 +26013,0 @@
+-#ifdef QJS_AOT_BUMPSTATS
+@@ -26002 +26015,0 @@
+-#endif
+@@ -63099,0 +63113 @@
++    _Static_assert(offsetof(JSRuntime, shape_obs_epoch) == offsetof(JSRuntime, shape_free_epoch) + sizeof(uint32_t), "units read shape_obs_epoch right after shape_free_epoch");
+@@ -65270,0 +65285 @@
++    sh->aot_observed = 1;
+@@ -65301,0 +65317 @@
++    sh->aot_observed = 1;

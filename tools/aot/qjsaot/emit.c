@@ -15,11 +15,13 @@
 
 #include "analysis.h"
 #include "emit.h"
+#include "fast.h"
 #include "ir.h"
 
 /* When set, compiled functions get external (hidden) linkage instead of
    `static`, so a unit split across files can call between them. Set by the
    unit builder for `--split`. */
+extern int g_e_spec_fb;   /* ops.c */
 static int e_split;
 void e_set_split(int on) {
   e_split = on ? 1 : 0;
@@ -134,6 +136,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
       "\n",
       slots, has_var ? g->var_count : 0);
 
+  if (fast_has(hex)) fast_emit_entry_call(f, hex);
   /* The stack check. The margin leaves room for the throw itself; a
      4 KB margin crashed before; 64 KB has held. */
   if (check) {
@@ -246,12 +249,23 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
    so there is no stack check, no poll and no release; the frame is small (rule 1).
    It takes ONE pointer for everything about the exit, so that leaving costs the
    body no more arguments than entering did. */
+static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33], const char *prefix);
 void e_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
-  const JSAotGenFunc *g = fn->g;
   /* The wider register file, as the native entry uses: the generic body the exit
      continues into reads and writes every register this body was compiled with. */
   int nregs = qjs_aot_frame_regs(qjs_aot_cur_func_idx());
   if (nregs < fn->nregs) nregs = fn->nregs;
+  e_emit_exit_fn_named(f, fn->g, nregs, hex, "aot_nx_");
+}
+
+/* `aot_rx_HEX`: the same entry, for a copy of this function in a compiled caller that leaves the copy in the
+   middle: it runs the generic body from the callee pc the copy had reached, with the registers the copy holds. Emitted
+   for any unit function a caller asks for, whether or not it has a frameless body. */
+void e_emit_resume_fn(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33]) {
+  e_emit_exit_fn_named(f, g, nregs, hex, "aot_rx_");
+}
+
+static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33], const char *prefix) {
   int slots = g->light_need > 0 ? (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue) : 0;
   int need = g->light_need
              + (int)sizeof(JSValue)
@@ -271,7 +285,7 @@ void e_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       f,
       "/* The exit of the frameless body: builds the frame and runs the generic\n"
       "   body from x->pc with the registers' values handed over in x->lv. */\n"
-      "E_TEXT %s__attribute__((noinline, cold)) JSValue aot_nx_%s(\n"
+      "E_TEXT %s__attribute__((noinline, cold)) JSValue %s%s(\n"
       "    JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue this_obj,\n"
       "    JSValue *argv, const ENx *xp)\n"
       "{\n"
@@ -331,7 +345,7 @@ void e_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
       "    return ret;\n"
       "}\n\n",
-      e_linkage(), hex, slotsx, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
+      e_linkage(), prefix, hex, slotsx, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
 }
 
 /* `aot_f_HEX` for a frameless function: the engine still enters through it with a
@@ -367,6 +381,12 @@ static int e_inline_typed_ok(const Q2Func *fn) {
   ETypes types;
   int i, k, ok = 1;
   if (fn->ninl == 0) return 1;
+  /* A copy planned with a store after a nested copy's call is only sound if its nest leaves by resuming. */
+  for (k = 0; k < fn->ninl; k++)
+    if (fn->inl[k].lifted && !e_copy_resumable(fn, k)) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: nest of copy %d has a store after a nested call and cannot resume\n", k);
+      return 0;
+    }
   memset(&facts, 0, sizeof(facts));
   memset(&types, 0, sizeof(types));
   if (e_analyze(fn, &facts, &types) < 0) {
@@ -375,13 +395,18 @@ static int e_inline_typed_ok(const Q2Func *fn) {
   }
   for (i = 0; ok && i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];
-    if (in->own == 0) continue;
+    if (in->own == 0 || in->cold) continue;
+    if (in->extcall == 3 && !e_copy_resumable(fn, in->own - 1)) {
+      if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: a real call in a copy that cannot resume (clone pc %d)\n", in->pc);
+      ok = 0;
+      continue;
+    }
     /* a call that stays a call, and the store of its result, are made by the call's own emission */
     if (in->extcall) continue;
     /* a forwarded load is a copy of a value already held: no access, nothing to miss */
     if (facts.fwd != NULL && facts.fwd[i] != Q2_NO_VALUE) continue;
     /* a field read of a copy has to be a grouped access whose miss exits */
-    if (in->op == Q2_OP_GET_FIELD && !facts.miss_exits[i]) {
+    if (in->op == Q2_OP_GET_FIELD && !facts.miss_exits[i] && !e_copy_arm_this_read(fn, in) && !e_copy_tbl_read(fn, in)) {
       if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: field read at clone pc %d (orig %d) is not a grouped exit\n", in->pc, in->opc);
       ok = 0;
       continue;
@@ -396,7 +421,8 @@ static int e_inline_typed_ok(const Q2Func *fn) {
     if (in->op == Q2_OP_GET_FIELD || in->op == Q2_OP_PUT_FIELD) {
       int sa;
       for (sa = 0; sa < in->narg; sa++)
-        if (in->arg[sa].kind == 's' && (unsigned)in->arg[sa].val != 0xffff && e_facts_site_poly(&facts, (int)in->arg[sa].val)) {
+        if (in->arg[sa].kind == 's' && (unsigned)in->arg[sa].val != 0xffff && e_facts_site_poly(&facts, (int)in->arg[sa].val) &&
+            !e_copy_arm_this_read(fn, in) && !e_copy_tbl_read(fn, in) && getenv("QJS_AOT_POLYFIELD") == NULL) {
           if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: polymorphic field access at clone pc %d\n", in->pc);
           ok = 0;
         }
@@ -446,6 +472,50 @@ static int e_inline_typed_ok(const Q2Func *fn) {
    instructions, and objects of plain constructors that never escape left unmade. A copy that
    builds an object is kept only if every such object is left unmade; otherwise the callees that
    build objects are not copied. Returns 1 with *out built, 0 when the program is used as it is. */
+/* A copy's prologue moves (callee parameter <- caller argument, `this` included) and the move that carries its result back
+   define a value equal to their source. Reads of the copy are redirected to the source so that facts keyed by value (receiver
+   identity, shapes, available loads) see through the splice. The moves stay: registers and the frame write-back are unchanged. */
+static void e_alias_copy_moves(Q2Func *fn) {
+  Q2ValueId *sub;
+  int32_t i, k, b, n = fn->nvalues;
+  if (getenv("QJS_AOT_ALIAS") == NULL) return;
+  sub = (Q2ValueId *)malloc(sizeof(Q2ValueId) * (n > 0 ? n : 1));
+  if (sub == NULL) return;
+  for (i = 0; i < n; i++) sub[i] = (Q2ValueId)i;
+  for (i = 0; i < fn->ninsns; i++) {
+    Q2Insn *in = &fn->insns[i];
+    Q2ValueId d, u;
+    if (in->op != Q2_OP_MOVE || in->own == 0 || in->ndef != 1 || in->nuse != 1) continue;
+    d = in->def[0];
+    u = in->use[0];
+    if (d < 0 || u < 0 || d >= n || u >= n) continue;
+    if (fn->values[d].type != fn->values[u].type || fn->values[d].rep != fn->values[u].rep ||
+        fn->values[d].is_const != fn->values[u].is_const)
+      continue;
+    sub[d] = sub[u];
+  }
+  for (i = 0; i < fn->ninsns; i++) {
+    Q2Insn *in = &fn->insns[i];
+    int skip = (in->op == Q2_OP_MOVE && in->own != 0);
+    if (skip) continue; /* the moves keep reading their registers' values */
+    for (k = 0; k < in->nuse; k++)
+      if (in->use[k] >= 0 && in->use[k] < n) in->use[k] = sub[in->use[k]];
+    for (k = 0; k < 8; k++)
+      if (in->argval[k] >= 0 && in->argval[k] < n) in->argval[k] = sub[in->argval[k]];
+    if (in->win_val != NULL)
+      for (k = 0; k < in->win_n; k++)
+        if (in->win_val[k] >= 0 && in->win_val[k] < n) in->win_val[k] = sub[in->win_val[k]];
+  }
+  for (b = 0; b < fn->nblocks; b++) {
+    Q2Block *bl = &fn->blocks[b];
+    int si;
+    for (si = 0; si < bl->nsucc; si++)
+      for (k = 0; k < bl->nedge_args[si]; k++)
+        if (bl->edge_arg[si][k] >= 0 && bl->edge_arg[si][k] < n) bl->edge_arg[si][k] = sub[bl->edge_arg[si][k]];
+  }
+  free(sub);
+}
+
 static int e_build_spec_fn(
     const JSAotGenFunc *g, Q2Func *fn, int allow_ctor, Q2Func *out, char *msg, size_t msglen) {
   Q2Extra *ex = NULL;
@@ -454,11 +524,12 @@ static int e_build_spec_fn(
   Q2Func fn2;
   e_inline_allow_construct = allow_ctor;
   nir = e_plan_inline(fn, &ir);
-  nex = nir > 0 ? 0 : e_plan_licm(fn, &ex);
+  nex = (nir > 0 && getenv("QJS_AOT_LICMCOPY") == NULL) ? 0 : e_plan_licm(fn, &ex);
+retry_plan:
   if (getenv("QJS_AOT_DEBUG_LICM") != NULL) fprintf(stderr, "licm %s: %d hoists\n", g->name, nex);
   if (nex > 0 || nir > 0) {
     int st = 0;
-    if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 && (st = 2) &&
+    if (q2_build_inl(g, ex, nex, ir, nir, &fn2) == 0 && (st = 1) && q2_infer(&fn2) == 0 && (e_alias_copy_moves(&fn2), 1) && (st = 2) &&
         q2_verify(&fn2, msg, msglen) == 0 && (st = 3) && e_inline_typed_ok(&fn2)) {
       have2 = 1;
       /* This IR is what the body is emitted from, and it has registers the
@@ -469,6 +540,18 @@ static int e_build_spec_fn(
       if (getenv("QJS_AOT_DEBUG_LICM") != NULL)
         fprintf(stderr, "licm %s: stage %d failed: %s %s\n", g->name, st, fn2.why ? fn2.why : "-", msg);
       q2_free(&fn2);
+      /* The copies of a function with a polymorphic call are refused as a set (one copy that is not typed refuses all). Plan again
+         without the arms: the copies of its single-callee calls may still stand. */
+      if (e_plan_used_poly && !e_plan_nopoly) {
+        free(ir);
+        ir = NULL;
+        e_plan_nopoly = 1;
+        nir = e_plan_inline(fn, &ir);
+        e_plan_nopoly = 0;
+        nex = (nir > 0 && getenv("QJS_AOT_LICMCOPY") == NULL) ? 0 : e_plan_licm(fn, &ex);
+        e_plan_used_poly = 0;
+        goto retry_plan;
+      }
     }
   }
   {
@@ -590,7 +673,27 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     Q2Func fn2;
     int have2 = e_build_spec_fn(g, &fn, 1, &fn2, msg, sizeof(msg));
     e_pure_plan(&fn, hex);
-    rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
+    /* The fast body of a leaf (fast.c), ahead of the entries that call it. */
+    if (g->light_ok && g->light_need <= E_NATIVE_FRAME_MAX) {
+      char fwhy[200];
+      int fok = fast_emit(f, &fn, hex, fwhy, sizeof(fwhy));
+      e_report_fast(hex, g->name, fok, fwhy);
+    }
+    {
+      char rwhy[220];
+      int rok = 0, virt_ = 0, k_;
+      /* the speculative body leaves some object unmade (a virtual object): a region would allocate it, so the speculative body is kept */
+      if (have2 && qjsaot_region_mode() == 2 && getenv("QJS_AOT_REGION_VIRT") == NULL)
+        for (k_ = 0; k_ < fn2.ninsns && !virt_; k_++) if (fn2.insns[k_].vk != 0) virt_ = 1;
+      if (virt_) snprintf(rwhy, sizeof(rwhy), "the speculative body keeps an object virtual");
+      else rok = g->light_ok ? region_emit(f, &fn, hex, qjs_aot_cur_func_idx(), rwhy, sizeof(rwhy)) : 0;
+      if (g->light_ok) e_report_fast(hex, "region", rok, rwhy);
+      if (rok) e_fl_clear();
+      /* a region root keeps the speculative body as the native fallback of an entry the region cannot serve (its init failed, its facts word is down): aot_fs_, never the generic body */
+      g_e_spec_fb = rok;
+      rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
+      g_e_spec_fb = 0;
+    }
     e_pure_clear();
     /* An inline body of this function that exits through aot_nx_ needs its
        definition; a frameless body has emitted it already. */

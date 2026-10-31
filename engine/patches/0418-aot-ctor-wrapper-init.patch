@@ -1,0 +1,190 @@
+Subject: A constructor wrapper called with a fresh this runs the function it applies, without its own frame
+
+What this does
+  - `qjs_aot_wrap_init` takes a construct site that the generator recognised as calling a constructor wrapper
+    (`function () { this.X.apply(this, arguments); }`, by its register program) and runs `this.X` with the same arguments directly, in
+    place of the wrapper: no wrapper frame, no `arguments` object, no polymorphic read of `this.X`, no trip through the `apply` builtin.
+  - The site keeps a cache (eight words in the generated unit): the shape of the fresh `this`, the function `X` it resolves to, `X`'s
+    shape and the epoch. It hits while `aot_pic_epoch` is unchanged and `X` keeps its shape. It fills only for a plain data property
+    found on ordinary prototypes (no accessor, proxy or exotic object), holding an ordinary bytecode function whose prototype is its
+    realm's Function.prototype, has no own `apply`, and whose Function.prototype.apply is the builtin.
+  - Anything else returns JS_UNINITIALIZED with nothing done, and the generated code runs the wrapper as before.
+  - Kit builds only (`QJS_KIT_TEST_KNOBS`): `QJS_AOT_WCSTALE` makes a filled cache never invalidate, the negative control for the tests.
+  - Kit builds only: `QJS_AOT_WCABA` prints a line each time a call finds the cached shape pointer, the same pic epoch and a different shape-free epoch (the
+    state in which an address-only compare would have hit a freed and reused shape).
+
+Why we need it
+  Every class built by Prototype's `Class.create` shares one wrapper bytecode, so its `this.initialize` read is megamorphic and its
+  `apply(this, arguments)` materialises an `arguments` object, enters the builtin and calls through the generic call path. Measured on
+  raytrace, the wrapper and what it reaches are about a fifth of the instructions; a program whose classes are their own initialize
+  runs 25% fewer.
+
+Soundness
+  The result is what the wrapper returns (undefined) or the exception from the call. The observable differences are limited to the
+  wrapper's own frame: it no longer appears in a stack trace taken inside X. `arguments.length` inside X is the count passed, as through
+  apply. A `this.X` that could run code (getter, proxy) or find `X` through anything but ordinary prototype data properties is refused.
+  The cache is exactly as strong as the generator's other epoch-trusting caches: every write into a prototype slot, every addition to or
+  deletion from a prototype, every prototype link change and every cache cell reset moves `aot_pic_epoch`, and X's own shape is compared
+  on every hit, so an own `apply` added to X (which is not a prototype and moves no epoch) is seen. A call with fewer arguments than X
+  declares, or to an X without a native entry, goes through JS_Call, as apply would.
+
+Why the cache holds no references (and what keeps its raw pointers honest)
+  The cache stores raw pointers (the receiver shape, X, X's shape). A shape that is freed can have its address reused by another shape, which a pointer
+  compare cannot tell from the cached one, and X is then dangling. This is reachable without any prototype write: `C.prototype = Q` writes an ordinary
+  function's property and moves no epoch; the old instances die; the old prototype's shape is freed; the next shape lands at its address. It happens in
+  raytrace itself (136 times in one run, counted by the kit-only detector below). The test therefore also compares `rt->shape_free_epoch`, which moves
+  whenever any shape is freed, BEFORE it dereferences anything cached: while it is unchanged the cached shape is alive, so are its prototype chain and X (X
+  can only be dropped by a write or delete on a prototype, which moves `aot_pic_epoch`), and the compare of the shape pointer is a compare of live objects.
+  Chosen over holding a counted reference on the shape because it needs no teardown: the cache lives in the generated unit's static data, shared by every
+  runtime of the process, and a reference there would have to be released at each `JS_FreeRuntime` and at unit unload. The price is a refill whenever a shape
+  anywhere is freed, measured on raytrace at +0.5% C.Minstr (1448.7 -> 1456.0). The wrapper bytecode pointer is also raw; it cannot matter: the site reaches
+  this helper only after testing that the callee's bound entry is the one generated for this wrapper's digest, so a reused address holding another wrapper
+  fails that test, and one holding a function of the same digest has the same code and therefore the same atoms.
+
+Assumptions
+  The cache (`wc`) is static data of the generated unit, like the existing `e_vg`/`e_vm` statics: it is process-global. Two runtimes in one process share it
+  (a hit needs the cached shape pointer to equal a live shape of the running runtime, which another runtime's shape cannot be, and the epochs are read from
+  the running runtime, so the sharing only costs refills), and two runtimes running on different threads would race on its multi-word fill. The statics
+  design already assumes one runtime runs compiled code at a time.
+
+Behaviour changes
+  - The wrapper's own frame no longer appears in a stack trace (or in a debugger) taken inside X.
+  - Nothing else observable: the call, the arguments, `this`, the exceptions and the result are those of the wrapper.
+
+Functions touched
+  `qjs_aot_wrap_init` (new), declared in quickjs-aot-rt.h.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65819,0 +65820,26 @@
++
++/* A constructor wrapper `function () { this.X.apply(this, arguments); }` (the generator recognises it by its register
++   program, see qjs_aot_wrapper_shape) called with a fresh `this`: the same effect as running the wrapper, without its frame,
++   its `arguments` object, the polymorphic read of `this.X` (one wrapper bytecode serves every class built by the same
++   factory) or the trip through the `apply` builtin. `wc` is the construct site's cache, eight words the generated code owns:
++   the receiver shape, the epoch, the function X resolved for it, X's shape, the wrapper bytecode and X's atom. The cache
++   says: for a `this` of this shape, `this.X` is that function while `aot_pic_epoch` has not moved (every write that can
++   change what a prototype holds, a prototype link, or a cache cell moves it, and so does unbinding a compiled function),
++   and X has no own `apply` while its shape is this one. Only a plain data property found on ordinary objects, holding an
++   ordinary bytecode function whose prototype is its realm's Function.prototype, whose `apply` is the builtin, is cached.
++   Returns JS_UNINITIALIZED, with nothing done, when any of that does not hold: the caller then runs the wrapper. Otherwise
++   returns undefined (what the wrapper returns) or the exception. */
++#define AOT_WC_SHAPE 0
++#define AOT_WC_EPOCH 1
++#define AOT_WC_INIT 2
++#define AOT_WC_ISHAPE 3
++#define AOT_WC_CB 4
++#define AOT_WC_ATOM 5
++#define AOT_WC_SFE 6
++JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
++                          int argc, void **wc, int init_off, int apply_off)
++{
++    JSRuntime *rt = ctx->rt;
++    JSFunctionBytecode *cb = co->u.func.function_bytecode, *cb2;
++    JSObject *p, *init;
++    JSValue ret;
+@@ -65820,0 +65847,97 @@
++    if (JS_VALUE_GET_TAG(thisv) != JS_TAG_OBJECT)
++        return JS_UNINITIALIZED;
++    p = JS_VALUE_GET_OBJ(thisv);
++#ifdef QJS_KIT_TEST_KNOBS
++    /* Negative control: a cache that is never invalidated once filled, as if nothing moved the epoch or X's shape. */
++    static int wc_stale = -1;
++    if (wc_stale < 0)
++        wc_stale = getenv("QJS_AOT_WCSTALE") != NULL;
++#endif
++    /* The cache holds raw pointers: the receiver shape and X are compared or dereferenced only after the two epochs agree.
++       `shape_free_epoch` moves whenever any shape is freed, so a shape freed since the fill (and its address possibly reused
++       by another one, which a pointer compare cannot tell) fails the test before anything cached is dereferenced; and while
++       no shape has been freed the cached shape is alive, so are its prototype chain and X (which only a write or delete on
++       a prototype can drop, and those move aot_pic_epoch). */
++#ifdef QJS_KIT_TEST_KNOBS
++    if (wc[AOT_WC_SHAPE] == (void *)p->shape && wc[AOT_WC_EPOCH] == (void *)(uintptr_t)rt->aot_pic_epoch &&
++        wc[AOT_WC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch && getenv("QJS_AOT_WCABA") != NULL)
++        fprintf(stderr, "wc: a freed shape's address was reused (the cache would have hit)\n");
++#endif
++    if (unlikely(wc[AOT_WC_SHAPE] != (void *)p->shape || wc[AOT_WC_CB] != (void *)cb ||
++                 (
++#ifdef QJS_KIT_TEST_KNOBS
++                  !wc_stale &&
++#endif
++                  (wc[AOT_WC_EPOCH] != (void *)(uintptr_t)rt->aot_pic_epoch ||
++                   wc[AOT_WC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch ||
++                   ((JSObject *)wc[AOT_WC_INIT])->shape != (JSShape *)wc[AOT_WC_ISHAPE])))) {
++        JSAtom atom;
++        JSObject *holder;
++        JSProperty *pr;
++        JSShapeProperty *prs;
++        JSValue v = JS_UNDEFINED;
++        int depth;
++
++        wc[AOT_WC_SHAPE] = NULL;
++        if (wc[AOT_WC_CB] != (void *)cb) {
++            uint32_t a_init, a_apply;
++            wc[AOT_WC_CB] = NULL;
++            memcpy(&a_init, cb->regvm_code + init_off, 4);
++            memcpy(&a_apply, cb->regvm_code + apply_off, 4);
++            if (a_apply != JS_ATOM_apply || a_init == JS_ATOM_NULL)
++                return JS_UNINITIALIZED;
++            wc[AOT_WC_ATOM] = (void *)(uintptr_t)a_init;
++            wc[AOT_WC_CB] = (void *)cb;
++        }
++        atom = (JSAtom)(uintptr_t)wc[AOT_WC_ATOM];
++        if (p->class_id != JS_CLASS_OBJECT || p->is_exotic || find_own_property(&pr, p, atom) != NULL)
++            return JS_UNINITIALIZED;
++        holder = p->shape->proto;
++        for (depth = 0; holder != NULL; depth++) {
++            if (depth >= 8 || holder->class_id != JS_CLASS_OBJECT || holder->is_exotic)
++                return JS_UNINITIALIZED;
++            prs = find_own_property(&pr, holder, atom);
++            if (prs != NULL) {
++                if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++                    return JS_UNINITIALIZED;
++                v = pr->u.value;
++                break;
++            }
++            holder = holder->shape->proto;
++        }
++        if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++            return JS_UNINITIALIZED;
++        init = JS_VALUE_GET_OBJ(v);
++        if (init->class_id != JS_CLASS_BYTECODE_FUNCTION || init->is_exotic)
++            return JS_UNINITIALIZED;
++        cb2 = init->u.func.function_bytecode;
++        if (cb2->is_derived_class_constructor || cb2->func_kind != JS_FUNC_NORMAL)
++            return JS_UNINITIALIZED;
++        {
++            JSObject *fp = JS_VALUE_GET_OBJ(cb2->realm->function_proto);
++            if (init->shape->proto != fp || find_own_property(&pr, init, JS_ATOM_apply) != NULL)
++                return JS_UNINITIALIZED;
++            prs = find_own_property(&pr, fp, JS_ATOM_apply);
++            if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
++                js_args_apply_is_builtin(pr->u.value) == NULL)
++                return JS_UNINITIALIZED;
++        }
++        wc[AOT_WC_EPOCH] = (void *)(uintptr_t)rt->aot_pic_epoch;
++        wc[AOT_WC_SFE] = (void *)(uintptr_t)rt->shape_free_epoch;
++        wc[AOT_WC_INIT] = init;
++        wc[AOT_WC_ISHAPE] = init->shape;
++        wc[AOT_WC_SHAPE] = p->shape;
++    }
++    init = (JSObject *)wc[AOT_WC_INIT];
++    cb2 = init->u.func.function_bytecode;
++    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count)
++        ret = ((JSValue (*)(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int))cb2->aot_nfn)(
++            ctx, caller_f, init, thisv, argv, argc);
++    else
++        ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, init), thisv, argc, vc(argv));
++    if (JS_IsException(ret))
++        return ret;
++    JS_FreeValue(ctx, ret);
++    return JS_UNDEFINED;
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -516,0 +517,2 @@
++JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
++                          int argc, void **wc, int init_off, int apply_off);

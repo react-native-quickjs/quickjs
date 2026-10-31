@@ -53,8 +53,14 @@ void e_emit_native_entry(FILE *f, const struct Q2Func *fn, char hex[33]);
    checks the stack (the stack-check rule). */
 int e_has_call_site(const struct Q2Func *fn);
 void e_emit_frameless_exit_fn(FILE *f, const struct Q2Func *fn, char hex[33]);
+int e_copy_resumable(const struct Q2Func *fn, int k);
+struct Q2Insn;
+int e_copy_tbl_read(const struct Q2Func *fn, const struct Q2Insn *in);
+int e_copy_arm_this_read(const struct Q2Func *fn, const struct Q2Insn *in);
+void e_emit_resume_fn(FILE *f, const struct JSAotGenFunc *g, int nregs, char hex[33]);
 void e_emit_frameless_forward(FILE *f, const struct Q2Func *fn, char hex[33]);
 int e_fl_was_chosen(void);
+void e_fl_clear(void);
 
 /* The pure recursive form of a function (pure.c). */
 void e_pure_plan(const struct Q2Func *fn, const char hex[33]);
@@ -73,6 +79,7 @@ int e_intrinsic_magic(int id);
 struct Q2Func;
 struct Q2Insn;
 int e_intrinsic_lowerable(const struct Q2Func *fn, const struct Q2Insn *in);
+int e_arrayop_site(const struct Q2Func *fn, const struct Q2Insn *in);
 int qjs_aot_prof_callees(
     const uint8_t dg[16], int pc, int *n, char hex[4][33], int kind[4],
     unsigned long long hits[4]);
@@ -179,6 +186,7 @@ int e_nocall_on(void);
 
 /* --report FILE: open it once, write one line per function. */
 void e_report_open(const char *path);
+FILE *e_report_file(void);
 void e_report_close(void);
 /* `weight` is the function's share of the profile's executed ops, in percent;
    `delegated` says the function was left to the interpreter. */

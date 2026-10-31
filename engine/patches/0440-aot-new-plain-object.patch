@@ -1,0 +1,66 @@
+Subject: A class-shape object is made by a dedicated allocator, without the generic constructor's class switch
+
+What this does
+  - `qjs_aot_new_from_shape` allocates the object body and its slots in one block, stores the plain-object header directly, and links it into the GC list. It keeps `js_trigger_gc` and the malloc accounting. A shape with no properties, or more than the learned inline maximum (16), takes the generic path.
+
+Why we need it
+  The region compiler's direct construct calls it for every object it makes; the generic `JS_NewObjectFromShapeCapExtra` costs about 60 instructions of class dispatch and flag stores per object that a plain object does not need.
+
+Soundness
+  The block is the one the generic path makes for a plain object with an inline capacity (`prop_inline_cap` = n, `prop` into the block), so `free_plain_object` frees it as before. Objects of other classes never reach it (the region calls it only for shapes of plain objects).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66446 +66446 @@
+-    JSValue obj;
++    JSRuntime *rt = ctx->rt;
+@@ -66448 +66448,2 @@
+-    int i;
++    JSProperty *pr;
++    int i, n = sh->prop_count;
+@@ -66450,3 +66451,7 @@
+-    /* the slots live in the object's own block whatever their number (up to the learned maximum): one allocation, not two */
+-    obj = JS_NewObjectFromShapeCap(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL, sh->prop_count);
+-    if (JS_IsException(obj))
++    if (unlikely(n > JS_OBJ_LEARNED_INLINE_MAX)) {
++        JSValue obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
++        if (JS_IsException(obj))
++            return obj;
++        p = JS_VALUE_GET_OBJ(obj);
++        for (i = 0; i < n; i++)
++            p->prop[i].u.value = JS_UNDEFINED;
+@@ -66454,4 +66459,30 @@
+-    p = JS_VALUE_GET_OBJ(obj);
+-    for (i = 0; i < sh->prop_count; i++)
+-        p->prop[i].u.value = JS_UNDEFINED;
+-    return obj;
++    }
++    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the n slots */
++    js_trigger_gc(rt, sizeof(JSObject));
++    p = js_malloc(ctx, offsetof(JSObject, u) + n * sizeof(JSProperty));
++    if (unlikely(!p))
++        return JS_EXCEPTION;   /* the generic path also drops the shape reference it was given; here none was taken yet */
++    p->prop_inline_cap = n;
++    p->class_id = JS_CLASS_OBJECT;
++    p->values_inline = 0;
++    p->arr_kind = JS_ARR_KIND_GENERIC;
++    p->extensible = true;
++    p->free_mark = 0;
++    p->is_exotic = 0;
++    p->fast_array = 0;
++    p->holey = 0;
++    p->is_constructor = 0;
++    p->is_uncatchable_error = 0;
++    p->tmp_mark = 0;
++    p->is_HTMLDDA = 0;
++    p->gv_watched = 0;
++    p->is_prototype = 0;
++    p->first_weak_ref = NULL;
++    p->shape = js_dup_shape(sh);
++    pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
++    p->prop = pr;
++    for (i = 0; i < n; i++)
++        pr[i].u.value = JS_UNDEFINED;
++    JS_REF_COUNT(p) = 1;
++    add_gc_object(rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
++    return JS_MKPTR(JS_TAG_OBJECT, p);

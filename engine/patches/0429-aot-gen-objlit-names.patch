@@ -1,0 +1,60 @@
+Subject: The generator can read the property names of an object-literal template
+
+What this does
+  - `JSAotGenFunc` gains `objlit_count`, `objlit_atoms[i]` and `objlit_nprops[i]`: the property names of object-literal template i, in the order `object_fill` stores its window. The names are copied (from the template, or from its shape once the template has been used), so the generator owns them.
+  - `js_aot_gen_free` releases them.
+
+Why we need it
+  The bundle analysis follows which value an object literal puts under which name (the property descriptor `{value: f}` of `Object.defineProperty(Object.prototype, "inheritsFrom", ...)`, a configuration object, a literal with fields). The register program only carries the template index.
+
+Soundness
+  Generator-side data only; no unit code and no runtime path reads it.
+
+Functions touched
+  `js_aot_gen_collect`, `js_aot_gen_free`, `JSAotGenFunc`.
+
+No.
+
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -55,0 +56,5 @@
++    /* The object-literal templates: `objlit_atoms[i]` lists the `objlit_nprops[i]` property names of template i, in
++       the order `object_fill` stores its window, so the generator can follow which value a literal puts under which name. */
++    int objlit_count;
++    const JSAtom *const *objlit_atoms;
++    const uint16_t *objlit_nprops;
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67910,0 +67911,24 @@
++                if (b->objlit_count > 0 && b->objlit_tab != NULL) {
++                    JSAtom **atoms = js_mallocz_rt(rt, sizeof(JSAtom *) * (size_t)b->objlit_count);
++                    uint16_t *np = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)b->objlit_count);
++                    if (atoms && np) {
++                        int oi, pi;
++                        for (oi = 0; oi < b->objlit_count; oi++) {
++                            JSObjLitTemplate *tp = &b->objlit_tab[oi];
++                            if (tp->prop_count == 0 || (tp->atoms == NULL && tp->shape == NULL))
++                                continue;
++                            atoms[oi] = js_malloc_rt(rt, sizeof(JSAtom) * tp->prop_count);
++                            if (atoms[oi] == NULL)
++                                continue;
++                            for (pi = 0; pi < tp->prop_count; pi++)
++                                atoms[oi][pi] = js_objlit_template_atom(tp, pi);
++                            np[oi] = tp->prop_count;
++                        }
++                        g->objlit_count = b->objlit_count;
++                        g->objlit_atoms = (const JSAtom *const *)atoms;
++                        g->objlit_nprops = np;
++                    } else {
++                        js_free_rt(rt, atoms);
++                        js_free_rt(rt, np);
++                    }
++                }
+@@ -67927,0 +67952,7 @@
++            if (arr[i].objlit_atoms != NULL) {
++                int oi;
++                for (oi = 0; oi < arr[i].objlit_count; oi++)
++                    js_free_rt(rt, (void *)arr[i].objlit_atoms[oi]);
++            }
++            js_free_rt(rt, (void *)arr[i].objlit_atoms);
++            js_free_rt(rt, (void *)arr[i].objlit_nprops);

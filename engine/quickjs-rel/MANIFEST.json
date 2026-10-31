@@ -1635,12 +1635,156 @@
       "sha256": "2485bacbc52fa8ae008f5924a2980bfe135c80d06622c3a0f66726e075cc52cf"
     },
     {
+      "name": "0415-aot-frame-register-file.patch",
+      "sha256": "cb36707ff538cdcdf90ac10699ba9955049d5b6a3af4146c667c5a4495eca6fe"
+    },
+    {
+      "name": "0416-aot-unbind-moves-epoch.patch",
+      "sha256": "ab012250d094d7a476614765dcba3715a354077972fcb42bb342fc97343cf458"
+    },
+    {
+      "name": "0417-free-plain-object-fast.patch",
+      "sha256": "509974f6014fd1bc9ff131d664e6519223f9c4e644b56c6bc537499530a0b19d"
+    },
+    {
+      "name": "0418-aot-ctor-wrapper-init.patch",
+      "sha256": "96900dd72aa4e09f37b9b0258af8721e6ec9d3f0f9fa122dcef22a7942888565"
+    },
+    {
+      "name": "0419-aot-pic-epoch-thrash.patch",
+      "sha256": "c633a7988416da5086ac5a7ace80ab2aa022c8aa29fbb424cd0909f7c01c0e3c"
+    },
+    {
+      "name": "0420-shape-edit-in-place-moves-epoch.patch",
+      "sha256": "23bf789767032c2a67e5a1e823de395bba3589cbc3d2dbdc36b64677a82ba0be"
+    },
+    {
+      "name": "0421-add-transition-fill-plain-add.patch",
+      "sha256": "7765e19602340f2e00c0c644182e60717362345a5d06b09dffc9b92ac769c9a2"
+    },
+    {
+      "name": "0422-aot-ctor-cache-sfe-and-saturation.patch",
+      "sha256": "5b8947e32797d36f6162c6038ecfed3c19c652130818f98651193b284ab3d31f"
+    },
+    {
+      "name": "0423-aot-array-push-slow.patch",
+      "sha256": "e099321f32a6ff398c7692747e7db962d9f90f1d6cc1ea9a9c91ecf7a8085fcb"
+    },
+    {
+      "name": "0424-aot-shape-slot.patch",
+      "sha256": "839f292d9c07522ec84c41e45a40736fbba032c7f068acc580a107864a896309"
+    },
+    {
+      "name": "0425-aot-layout-regvm-len.patch",
+      "sha256": "15c4065d4e1e2613ffd29b978526bfbc64729408c7b9662c5ff3a29fc3b697fd"
+    },
+    {
+      "name": "0426-aot-shape-method.patch",
+      "sha256": "0acf2b4fcfc9863779e78cb30beede4e403eb3d185d4c864e365bbdcd9219814"
+    },
+    {
+      "name": "0427-shape-observed-epoch.patch",
+      "sha256": "02c0ca4058f4584c9e7159f96770deef8cd737ef929267f6bd65ae861f8b7509"
+    },
+    {
+      "name": "0428-aot-prof-call-through.patch",
+      "sha256": "587226e29fe0733546858ac17447719da36603f01b64f9890d806c9d2b558b8f"
+    },
+    {
+      "name": "0429-aot-gen-objlit-names.patch",
+      "sha256": "082c3235a2f03822d71d17051f78e5159cd41848215f6278c1c1130cefda322c"
+    },
+    {
+      "name": "0430-aot-fact-groups.patch",
+      "sha256": "267096f0a6ad465714db531785d814da3f4fb2fbe9d9e15ef6a3ec8335ce587a"
+    },
+    {
+      "name": "0431-aot-shape-hold.patch",
+      "sha256": "d9325dbe78dc1d2eb598f6400b85d252272e4fd04295c356ebc64206d16e01c7"
+    },
+    {
+      "name": "0432-aot-facts-word.patch",
+      "sha256": "4a0d378670e1e0d1943aea02374f6c7150d97357448f2c57ed880fd380d7dcb9"
+    },
+    {
+      "name": "0433-aot-shape-table-ctor.patch",
+      "sha256": "5e60f166986c3c088ddf92f2b8fb6de94797261c3f46299da7447ea41bcdb5cf"
+    },
+    {
+      "name": "0434-aot-layout-rebuild.patch",
+      "sha256": "20dae1bb2ac5846468f6910f7db36a27e936518660e32f4383511c0fdfc025a2"
+    },
+    {
+      "name": "0435-aot-shape-table-isproto.patch",
+      "sha256": "a583fc81e34271d5974cda35b3aae1292b4eb273d0ee6e7e88a5e5a7a233dfd9"
+    },
+    {
+      "name": "0436-aot-profile-macos.patch",
+      "sha256": "46081fb3aa3d21ab3bd53e2b531cb99b31e50a4476399dd79b6aee6e67c0ecca"
+    },
+    {
+      "name": "0437-aot-class-bind.patch",
+      "sha256": "345292da2d01695ff478343ae7f2dee2ef74342102090020da7f376f3e649993"
+    },
+    {
+      "name": "0438-aot-region-engine-support.patch",
+      "sha256": "46ea8d67ce62ac42dada875fc170fd9478e04cafc16cc83f289b41ee24862224"
+    },
+    {
+      "name": "0439-aot-new-from-shape-inline-slots.patch",
+      "sha256": "c87fb01565a3bf7e649dc70d37c4f8d5a2295cf24edef3eaadf07efb72e5b002"
+    },
+    {
+      "name": "0440-aot-new-plain-object.patch",
+      "sha256": "9a23f11d7cbd2d2fbe84432e0947a7f206474f35e565aeffe10762dd258bf9fc"
+    },
+    {
+      "name": "0441-free-array-fast.patch",
+      "sha256": "359597a845e089895c82ce61926df865a89e5dd7f8a4bff4091f8a9d665ecbb6"
+    },
+    {
+      "name": "0442-gc-mark-fast.patch",
+      "sha256": "94cb78f21a7d9a252b7e816f741a16efc46b675e6c89f15a64deefe9a24db5e5"
+    },
+    {
+      "name": "0443-aot-stack-objects.patch",
+      "sha256": "e00e8a2828636a834338d6fa7cce2d65b8f83ceac690714b97d67e6347fdca36"
+    },
+    {
+      "name": "0444-gc-trigger-inline-threshold.patch",
+      "sha256": "acd2d6a6f04815aa1a13c591783f8f4135493b0d2fdbee097a7129c86c4a963c"
+    },
+    {
+      "name": "0445-aot-global-store-reports-to-facts.patch",
+      "sha256": "8cdf2a4d753b3facc4c7eda83d5f0945bedb78a6b7ded654d215f71a6ef57053"
+    },
+    {
+      "name": "0446-aot-gen-closure-var-table.patch",
+      "sha256": "bf9795c7f43c64fdd4a799760b2db4564f99b265a424bd20eb3b664abbdd0921"
+    },
+    {
+      "name": "0447-aot-intrinsic-function-apply.patch",
+      "sha256": "113554cbec1be76c53486f8ae7c2d5cfacf46fc5811b16022843f41b8d23fce3"
+    },
+    {
+      "name": "0448-aot-layout-hook-retry.patch",
+      "sha256": "e6ac154b7599dca216e6e12f8b094d6a46848b66fe1b2895a5e73a7010a5abf9"
+    },
+    {
+      "name": "0449-aot-profile-proto-key.patch",
+      "sha256": "867b74ee74f7044e39a65678924bc4904bd4113ec43323c2c2bda26f0341ce16"
+    },
+    {
+      "name": "0450-builtin-namespace-settle.patch",
+      "sha256": "3d00400f7060496b3fe0d14cac97d66746957dccf12ad490dd11caa9eb228fa2"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "ab18d2cb280ede6fa8dc7700753d80ae561ac6b572093f5b05353af676201e08",
+    "quickjs.c": "c73cef0e81d9ea43949a90c4e442827259da1c93c3abfd4ce1c19eaa23183b06",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
@@ -1662,7 +1806,7 @@
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
     "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
-    "quickjs.h": "9c8d3ab694430b11f765ac3bd055e6dfb27e0db2acb48ed5a61c81c01814e5a8",
+    "quickjs.h": "04c62a4ca6cc11b258776596f5be54b05579f13160a5a22b23ac2f46b3af9377",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
 }

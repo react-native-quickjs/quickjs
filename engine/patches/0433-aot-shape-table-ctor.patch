@@ -1,0 +1,77 @@
+Subject: The shape table names a prototype's constructor when the prototype has no own `constructor`
+
+What this does
+  - `aot_dump_shapes` named a shape's prototype `fn:<digest>` only when the prototype had an own plain data `constructor` holding a bytecode function. With `Sub.prototype = new Base()` / `inheritsFrom` there is none, so such a shape printed `other:%p`, which the generator refuses as a layout.
+  - New `aot_proto_ctor_digest`: when no own `constructor` named the prototype, scan the collector's object list for bytecode function objects whose own plain data `prototype` property is exactly this prototype object. If every such function has the same digest, the shape prints `fn:<that digest>`; if there is none, or two different functions share the prototype, it stays `other:`.
+  - Shapes that were named before are named identically: the new lookup runs only when the old one found nothing, and only for a non-exotic plain-object prototype.
+
+Why we need it
+  The unit rebuilds a contracted layout from `fn:<digest>` as "the instance prototype is F.prototype, F the bytecode function with that digest" (`js_aot_layout_fn_hook` -> `qjs_aot_layout_fn_created`, which reads F's own `prototype` data property). The scan states exactly that claim, so classes built the pre-ES6 way get layouts too.
+
+Soundness
+  - Chosen over a construct-time (proto -> F) side table: it needs no hook in the construct paths and no per-runtime table whose entries could outlive objects or keep them alive. It runs only at the profile dump (start of `JS_FreeRuntime`), runs no JS, allocates nothing and takes no references.
+  - The claim checked is `proto == F.prototype` at dump time, not at construct time. If `F.prototype` is reassigned after instances were made, the old prototype matches no function (stays `other:`, refused), and the new one is named only if the instances of that shape really have it. A prototype shared by two distinct functions is refused (ambiguous). A function freed before the dump is not seen, which only loses a name. The unit still re-checks at bind: the chain is built from F's actual `.prototype`, and an instance shape whose proto differs is not that layout.
+
+Functions touched
+  `aot_dump_shapes`, and the new `aot_proto_ctor_digest`.
+
+No (profiling build only).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65246,0 +65247,14 @@
++
++/* The constructor of a prototype that has no own `constructor` (the
++   `Sub.prototype = new Base()` idiom): the one bytecode function digest among the
++   live functions whose own plain data `prototype` is exactly `po`. Found by
++   scanning the collector's object list, so no JS runs and nothing is allocated or
++   kept alive. Returns 1 and fills `dg` only when every such function has the same
++   digest (closures of one function agree); none, or two different functions
++   sharing a prototype, returns 0 and the shape stays unnamed. The unit later
++   checks the same claim when it builds the layout: `proto == F.prototype` at the
++   function's creation. */
++static int aot_proto_ctor_digest(JSRuntime *rt, JSObject *po, uint8_t dg[16])
++{
++    struct list_head *el;
++    int found = 0;
+@@ -65247,0 +65262,26 @@
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *fo;
++        JSProperty *pr;
++        JSShapeProperty *prs;
++        uint8_t d[16];
++
++        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        fo = (JSObject *)gp;
++        if (fo->class_id != JS_CLASS_BYTECODE_FUNCTION)
++            continue;
++        prs = find_own_property(&pr, fo, JS_ATOM_prototype);
++        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
++            JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT ||
++            JS_VALUE_GET_OBJ(pr->u.value) != po)
++            continue;
++        js_aot_digest(fo->u.func.function_bytecode, d);
++        if (found && memcmp(d, dg, 16) != 0)
++            return 0;
++        memcpy(dg, d, 16);
++        found = 1;
++    }
++    return found;
++}
++
+@@ -65297,0 +65338,13 @@
++            if (!named && po->class_id == JS_CLASS_OBJECT && !po->is_exotic) {
++                /* No own constructor: name it by the function whose `prototype`
++                   it is, if there is exactly one (see aot_proto_ctor_digest). */
++                uint8_t dg[16];
++                char hx[33];
++                uint32_t b;
++                if (aot_proto_ctor_digest(rt, po, dg)) {
++                    for (b = 0; b < 16; b++)
++                        snprintf(hx + b * 2, 3, "%02x", dg[b]);
++                    fprintf(f, "fn:%s via=scan", hx);
++                    named = 1;
++                }
++            }

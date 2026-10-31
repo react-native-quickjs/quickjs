@@ -189,10 +189,13 @@ typedef struct Q2Insn {
      copy that replaces the original in the loop. */
   int32_t xpc, bpc, ppc;
   int32_t opc, onext; /* pc and next within the program the instruction came from */
+  int32_t cont;       /* a guard of a copied call: the pc where the call continues (its own `next` may be a later guard's pc) */
   uint8_t licm_mov;
   /* 0 for an instruction of the program; k+1 for one copied from inlined callee k, whose
      guard is the instruction with `inlg` == k+1. */
   uint8_t own, inlg;
+  int16_t thru_cc; /* a guard of a `X.call(...)` copy: 1 + the register holding the builtin `call` (the guard's callee operand is X) */
+  uint8_t cold;   /* a run of a copied callee's instructions the profile never executed, standing as one throw: the copy leaves there */
   uint8_t inlret; /* the branch that ends a copied callee's return: its stores are final here */
   /* In a copy: 1 for a call to a function that is not copied (the stores of the nest are final at it),
      2 for the store of its result, which the call makes itself. Nothing after the call can leave. */
@@ -252,16 +255,31 @@ typedef struct Q2InlReq {
   const struct JSAotGenFunc *g;
   int32_t call_pc; /* a pc of the function, or of the parent's program when `parent` >= 0 */
   int32_t parent;  /* -1: the call is in the function; else the request whose copy holds it */
+  int lifted;      /* the copy has a store after a nested copy's call: only sound if its nest leaves by resuming */
+  int fallback;    /* one arm of a call with several callees: the call itself stays, as what no arm's guard accepts */
+  int thru;        /* the call is `X.call(thisArg, ...)`: the callee is X, its `this` the first window register, its arguments the rest */
 } Q2InlReq;
 
 typedef struct Q2Inl {
   const struct JSAotGenFunc *g;
+  int thru;
   int32_t call_pc, rbase, pcbase, pcend, nparam, sbase;
   int32_t parent, root, gpc; /* the copy holding the call (-1: the function), the outermost copy of the nest, the pc of the guard */
   int32_t keep[10], nkeep; /* the registers the call reads: live throughout the copy */
   int uses_this;           /* the copy reads the receiver */
+  int lifted;              /* see Q2InlReq */
   int32_t thispc[32], nthis; /* callee pcs of fused reads of `this`, whose profile record also covers `this` */
 } Q2Inl;
+
+/* The guard of one arm of a polymorphic call that is not the last arm: it carries a branch target ('t') to the copy of its callee and
+   falls through to the next arm's guard when the callee is not its own. */
+static inline int q2_is_sel(const Q2Insn *in) {
+  int a;
+  if (in->op != Q2_OP_INL_GUARD) return 0;
+  for (a = 0; a < in->narg; a++)
+    if (in->arg[a].kind == 't') return 1;
+  return 0;
+}
 
 enum { Q2_VK_DEF = 1, Q2_VK_GET, Q2_VK_PROTO };
 

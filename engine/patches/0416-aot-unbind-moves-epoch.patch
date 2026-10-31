@@ -1,0 +1,30 @@
+Subject: Dropping a function's compiled binding moves the compiled code's cache epoch
+
+What this does
+  - `js_aot_unbind` and the rebinding at the top of `js_aot_bind` move `aot_pic_epoch` (and count it in `aot_epoch_bumps`) when the bytecode
+    had a bound entry.
+
+Why we need it
+  A compiled method call that identifies its callee by the entry pointer a method table recorded at its entry, instead of testing the
+  function object, holds only while that function stays bound. The binding was the one thing about a function value that could change
+  without any cache epoch moving.
+
+Functions touched
+  `js_aot_unbind`, `js_aot_bind`.
+
+No.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64664,0 +64665,6 @@
++    /* A compiled body that identified a callee by its bound entry (a method table's entry pointer) trusts
++       it until the cache epoch moves, so dropping the binding moves it. */
++    if (b->aot_fn != NULL) {
++        b->realm->rt->aot_epoch_bumps++;
++        b->realm->rt->aot_pic_epoch++;
++    }
+@@ -64794,0 +64801,4 @@
++    if (b->aot_fn != NULL) {
++        b->realm->rt->aot_epoch_bumps++;
++        b->realm->rt->aot_pic_epoch++;
++    }

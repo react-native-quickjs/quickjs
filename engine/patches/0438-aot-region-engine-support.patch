@@ -1,0 +1,102 @@
+Subject: Region support in the engine: global stores without code, string concatenation, arrays with inline elements, and no fact sweep when nothing broke
+
+What this does
+  - `qjs_aot_global_put(ctx, atom, val, init, &old)`: a store to a global binding that is a writable data property, by the engine's own store (the facts watching the binding break there). The previous value comes back as a counted reference, so a region that borrowed from it keeps it alive to its end; 0 (nothing done) for an accessor, a read-only or missing binding.
+  - `qjs_aot_add_str(ctx, a, b, &out)`: `a + b` when one side is a string and the other a string, number, boolean, null or undefined (no code runs); 0 for anything else.
+  - `qjs_aot_new_array_inline(ctx, n)`: an empty array of the realm's array shape whose first n elements live in the object's own allocation (the engine's existing inline-values array); growth past them moves the elements out as for any array.
+  - `JSAotFacts.sweep_pending`: `js_aot_facts_sweep` walks the groups only when one broke since the last sweep. `qjs_aot_fact_new` sweeps on every call, which made binding a unit's facts quadratic in their number.
+
+Why we need it
+  The region compiler (TRUST) compiles the benchmark's drivers (`chainTest`, `projectionTest`, `change`): they write a global (`planner = new Planner()`) and build names (`"v" + i`). The regions make their collections' arrays with a few inline elements (most hold one to three, and each first push allocated a buffer). The sweep was 7.2M instructions at load.
+
+Soundness
+  No JS runs in the new helpers: `qjs_aot_global_put` refuses any binding that is not a plain writable data property (a setter, a read-only or uninitialised binding go back to the caller, which leaves its compiled code), and `qjs_aot_add_str` refuses an object operand (its valueOf/toString would run). An inline-values array is the engine's own representation (array literals use it). A sweep only releases what broken groups hold; skipping it when no group broke releases nothing less.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -16823,0 +16824 @@
++    uint32_t sweep_pending; /* a group broke since the last sweep: it may still hold values (the sweep is a walk of every group) */
+@@ -16934,0 +16936 @@
++    F->sweep_pending = 1;
+@@ -16989 +16991 @@
+-    if (F == NULL)
++    if (F == NULL || !F->sweep_pending)
+@@ -16990,0 +16993 @@
++    F->sweep_pending = 0;
+@@ -17025,0 +17029 @@
++    F->sweep_pending = 1;
+@@ -66499,0 +66504,68 @@
++    return 1;
++}
++
++/* A store to the global binding `atom`, as `put_var` (`init` = `put_var_init`), for a binding that is a writable data property: no code
++   runs. The engine's own store does it (the facts that watch the binding break there); the binding's previous value is handed back in
++   *old as a counted reference, so whatever the caller borrowed from it stays alive. `val` is borrowed. 1 when stored, 0 when the binding
++   is not such a property (nothing done), -1 with an exception pending. */
++QJS_AOT_STUB int qjs_aot_global_put(JSContext *ctx, uint32_t atom, JSValue val, int init, JSValue *old)
++{
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    JSObject *p;
++
++    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
++    prs = find_own_property(&pr, p, (JSAtom)atom);
++    if (prs == NULL) {
++        p = JS_VALUE_GET_OBJ(ctx->global_obj);
++        prs = find_own_property(&pr, p, (JSAtom)atom);
++        if (prs == NULL)
++            return 0;
++    }
++    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE))
++        return 0;
++    if (!init && JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
++        return 0;
++    *old = js_dup(pr->u.value);
++    if (JS_SetGlobalVar(ctx, (JSAtom)atom, js_dup(val), init) < 0) {
++        JS_FreeValue(ctx, *old);
++        *old = JS_UNDEFINED;
++        return -1;
++    }
++    return 1;
++}
++
++/* `new Array()` for code that knows the array will hold a few elements: an empty array of the realm's array shape whose first `n` elements
++   live in the object's own allocation (the first pushes allocate nothing; a growth past them moves the elements out as for any array). */
++QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n)
++{
++    return JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, n);
++}
++
++/* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
++   null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
++QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
++{
++    int ta = JS_VALUE_GET_NORM_TAG(a), tb = JS_VALUE_GET_NORM_TAG(b);
++#define AOT_STR_PRIM(t) ((t) == JS_TAG_STRING || (t) == JS_TAG_INT || (t) == JS_TAG_FLOAT64 || (t) == JS_TAG_BOOL || (t) == JS_TAG_NULL || (t) == JS_TAG_UNDEFINED)
++    JSValue sa, sb, r;
++    if (!((ta == JS_TAG_STRING || tb == JS_TAG_STRING) && AOT_STR_PRIM(ta) && AOT_STR_PRIM(tb)))
++        return 0;
++#undef AOT_STR_PRIM
++    {
++        int cr = js_concat_short(ctx, a, b, out);
++        if (cr != 0)
++            return cr;
++    }
++    sa = JS_ToString(ctx, a);
++    if (JS_IsException(sa))
++        return -1;
++    sb = JS_ToString(ctx, b);
++    if (JS_IsException(sb)) {
++        JS_FreeValue(ctx, sa);
++        return -1;
++    }
++    r = JS_ConcatString(ctx, sa, sb);
++    if (JS_IsException(r))
++        return -1;
++    *out = r;
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -245,0 +246,3 @@
++QJS_AOT_STUB int qjs_aot_global_put(JSContext *ctx, uint32_t atom, JSValue val, int init, JSValue *old);
++QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out);
++QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n);

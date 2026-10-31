@@ -1,0 +1,114 @@
+Subject: The unit can hold a shape and ask where a property is, without marking the shape observed
+
+What this does
+  - `qjs_aot_shape_rslot` / `qjs_aot_shape_wslot`: the byte offset of an own data property for a read / for a store (also writable, not the array length), without marking the shape observed.
+  - `qjs_aot_shape_hold` / `qjs_aot_shape_release`: a counted reference to a shape, and its release.
+  - `qjs_aot_function_digest`: the digest of a bytecode function (the unit's binding key) whether or not it has been called, so a dispatch can tell which compiled function a lookup found before it first runs.
+
+Why we need it
+  The new backend's fast bodies store at a constant slot after verifying a receiver shape once, and keep the verified shapes in a table keyed by address. Holding a counted reference means the shape can be neither freed (its address cannot be reused) nor edited in place (an edit of a shape somebody else references clones it first), so the table needs no epoch. The read form `qjs_aot_shape_slot` marks the shape observed, and then every free or in-place edit of it moves shape_obs_epoch, which the other compiled tables validate: observing the instance shapes of a program that creates and frees them constantly flushed them (deltablue: C.Minstr doubled).
+
+Soundness
+  Reads the shape only. A held shape stays valid and unchanged for the life of the reference; the unit releases its references at teardown, before the runtime is freed.
+
+Functions touched
+  `qjs_aot_shape_rslot`, `qjs_aot_shape_wslot`, `qjs_aot_shape_hold`, `qjs_aot_shape_release`, `qjs_aot_function_digest` (new).
+
+No.
+
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -231,0 +232,8 @@
++/* For a table that holds the shape (qjs_aot_shape_hold): the offset of an own data property for a read (rslot) or a store (wslot: also writable), without marking the shape observed. */
++QJS_AOT_STUB int qjs_aot_shape_rslot(const void *shape, uint32_t atom, uint32_t *off);
++QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t *off);
++/* A counted reference to a shape, and its release (at the unit's teardown). */
++QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape);
++QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape);
++/* The digest of a bytecode function (the unit's binding key), whether or not it has been called: 1 with 16 bytes, or 0. */
++QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16]);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65977,0 +65978,27 @@
++    h = (uintptr_t)atom & sh->prop_hash_mask;
++    h = prop_hash_end(sh)[-h - 1];
++    prop = get_shape_prop(sh);
++    while (h) {
++        pr = &prop[h - 1];
++        if (pr->atom == (JSAtom)atom) {
++            if ((pr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++                return 0;
++            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
++            return 1;
++        }
++        h = pr->hash_next;
++    }
++    return 0;
++}
++
++/* The two forms below are for a table that HOLDS the shape (qjs_aot_shape_hold): they do not mark it observed, since a held shape can be neither
++   freed nor edited in place (an edit of a shape somebody else references clones it first), so no epoch has to guard the table.
++   Like qjs_aot_shape_slot: 1 with the byte offset of an own data property; `rslot` for a read, `wslot` for a store (also writable, not the array length). */
++QJS_AOT_STUB int qjs_aot_shape_rslot(const void *shape, uint32_t atom, uint32_t *off)
++{
++    JSShape *sh = (JSShape *)shape;
++    JSShapeProperty *pr, *prop;
++    intptr_t h;
++
++    if (sh == NULL)
++        return 0;
+@@ -65993,0 +66021,54 @@
++QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t *off)
++{
++    JSShape *sh = (JSShape *)shape;
++    JSShapeProperty *pr, *prop;
++    intptr_t h;
++
++    if (sh == NULL)
++        return 0;
++    h = (uintptr_t)atom & sh->prop_hash_mask;
++    h = prop_hash_end(sh)[-h - 1];
++    prop = get_shape_prop(sh);
++    while (h) {
++        pr = &prop[h - 1];
++        if (pr->atom == (JSAtom)atom) {
++            if ((pr->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE)
++                return 0;
++            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
++            return 1;
++        }
++        h = pr->hash_next;
++    }
++    return 0;
++}
++
++/* A counted reference to a shape for a compiled table keyed by its address, and its release (at the unit's teardown, while the runtime lives). */
++QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape)
++{
++    return js_dup_shape((JSShape *)shape);
++}
++
++QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape)
++{
++    js_free_shape(rt, (JSShape *)shape);
++}
++
++/* The digest of the bytecode function `fnv` (the key the unit binds functions by), without needing the function to have been called: 1 and 16 bytes in *out,
++   or 0 when it is not a function the unit can know (not a bytecode function, lazy, or without a register program). */
++QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16])
++{
++    JSObject *p;
++    JSFunctionBytecode *b;
++
++    if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(fnv);
++    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
++        return 0;
++    b = p->u.func.function_bytecode;
++    if (b->is_lazy || !b->regvm_compiled || b->regvm_len <= 0)
++        return 0;
++    js_aot_digest(b, out);
++    return 1;
++}
++
