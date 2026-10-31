@@ -1783,12 +1783,20 @@
       "sha256": "84a55558ad34e1feaf383885fde572adc4d22a63b1bc76a1a251b977a4e95a9f"
     },
     {
+      "name": "0452-aot-new-wrap-recipe.patch",
+      "sha256": "1f99aa7ee62fc4e75d1783ce31f8752e6c95412a9f04fd322e165843713223ea"
+    },
+    {
+      "name": "0453-plain-object-fast-alloc.patch",
+      "sha256": "554acdaa8ebb4505d816b1e1254eb570326b1e833fe73f93dc9b0f733b6c60da"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "66ebb75c799f965c0e559adc248e40755047056b6b3c59d4d3ae1d4c791b9334",
+    "quickjs.c": "2c53f20d349dd5fd37536faaa6cac8edde27e1af2b9db0e24cf1f2fe50aa9253",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

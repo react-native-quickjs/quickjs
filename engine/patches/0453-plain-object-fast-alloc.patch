@@ -1,0 +1,117 @@
+Subject: A plain object is allocated without the generic allocator's work, and a constructor's common create has no slow path inlined
+
+What this does
+  - js_new_plain_object: what JS_NewObjectFromShapeCapExtra does for a JS_CLASS_OBJECT object with no properties handed in. It applies the same capacity rule, clears the flags as the two bytes before class_id in one go (checked by a static_assert), then fills the header and the GC list. There is no class switch. JS_NewObjectFromShapeCap takes it for that case.
+  - js_create_from_ctor_cap is split. Its common case (a bytecode constructor whose shape still has the cached `prototype` slot, holding an object it keeps an instance shape for) is a small function that allocates through js_new_plain_object. Everything else (a fact event to report, a layout to build, any other constructor or class) runs the unchanged body, now js_create_from_ctor_cap_slow and out of line, so its property read no longer weighs on the common path.
+
+Why we need it
+  Every `new C()` of a plain constructor paid about 160 instructions in these two functions. raytrace C.Minstr 1002.3 -> 966.1. The plain interpreter (I.Minstr) 1982.9 -> 1947.7: this is the engine's general construct path.
+
+Soundness
+  The same checks in the same order and the same object, field for field. Only the code layout changes.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -9548,10 +9548,51 @@
+                                              JSClassID class_id,
+                                              JSProperty *props, uint32_t req_cap,
+                                              uint32_t extra_values);
++
++/* A plain object (JS_CLASS_OBJECT, no properties handed in): the object JS_NewObjectFromShapeCapExtra makes, with only
++   the work that class needs. The flags are the two bytes before class_id, cleared together; the capacity rule is that
++   function's. Takes over the caller's reference to `sh`. */
++static_assert(offsetof(JSObject, class_id) == sizeof(JSGCObjectHeader) + 2,
++              "js_new_plain_object clears the object flags as the two bytes before class_id");
++static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSContext *ctx, JSShape *sh, uint32_t req_cap)
++{
++    JSRuntime *rt = ctx->rt;
++    JSObject *p;
++    uint32_t cap = sh->prop_size <= JS_OBJ_INLINE_PROPS ? sh->prop_size : 0;
++
++    if (req_cap > cap)
++        cap = req_cap > JS_OBJ_LEARNED_INLINE_MAX ? JS_OBJ_LEARNED_INLINE_MAX : req_cap;
++    if (unlikely(cap == 0))
++        return JS_NewObjectFromShapeCapExtra(ctx, sh, JS_CLASS_OBJECT, NULL, req_cap, 0);
++    js_trigger_gc(rt, sizeof(JSObject));
++    p = js_malloc_rt(rt, offsetof(JSObject, u) + cap * sizeof(JSProperty));
++    if (unlikely(!p)) {
++        JS_ThrowOutOfMemory(ctx);
++        js_free_shape(rt, sh);
++        return JS_EXCEPTION;
++    }
++    memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 2);
++    p->extensible = true;
++    p->prop_inline_cap = cap;
++    p->class_id = JS_CLASS_OBJECT;
++    p->values_inline = 0;
++    p->arr_kind = JS_ARR_KIND_GENERIC;
++    p->first_weak_ref = NULL;
++    p->shape = sh;
++    p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
++    JS_REF_COUNT(p) = 1;
++    JS_GC_MARK(&p->header) = 0;
++    JS_GC_TYPE(&p->header) = JS_GC_OBJ_TYPE_JS_OBJECT;
++    JS_GC_NOTRACE(&p->header) = 0;
++    list_add_tail(&p->header.link, &rt->gc_obj_list);
++    return JS_MKPTR(JS_TAG_OBJECT, p);
++}
+ 
+ static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                         JSProperty *props, uint32_t req_cap)
+ {
++    if (class_id == JS_CLASS_OBJECT && props == NULL)
++        return js_new_plain_object(ctx, sh, req_cap);
+     return JS_NewObjectFromShapeCapExtra(ctx, sh, class_id, props, req_cap, 0);
+ }
+ 
+@@ -44554,8 +44595,8 @@
+     return realm;
+ }
+ 
+-static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+-                                       int class_id, uint32_t req_cap)
++static __attribute__((noinline)) JSValue js_create_from_ctor_cap_slow(JSContext *ctx, JSValueConst ctor,
++                                                                    int class_id, uint32_t req_cap)
+ {
+     JSValue proto, obj;
+     JSContext *realm;
+@@ -44656,6 +44697,39 @@
+     return obj;
+ }
+ 
++/* The common case of the function above, with nothing to set up: a bytecode constructor whose shape still has the
++   `prototype` slot it cached, holding an object for which it keeps an instance shape. Anything else (a fact event to
++   report, a layout to build, any other constructor or class) takes the full path. */
++static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
++                                       int class_id, uint32_t req_cap)
++{
++    if (likely(class_id == JS_CLASS_OBJECT && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT)) {
++        JSObject *cp = JS_VALUE_GET_OBJ(ctor);
++        JSRuntime *rt = ctx->rt;
++
++        if (likely(cp->class_id == JS_CLASS_BYTECODE_FUNCTION) &&
++            !(unlikely(rt->aot_facts != NULL) && rt->aot_facts->fresh_pending != 0 && cp->gv_watched)) {
++            JSFunctionBytecode *fb = cp->u.func.function_bytecode;
++
++            if (likely(!JS_AOT_LAYOUT_CTOR(fb) && fb->ctor_fn_shape == cp->shape)) {
++                JSValue pv = cp->prop[fb->ctor_proto_slot].u.value;
++
++                if (likely(JS_VALUE_GET_TAG(pv) == JS_TAG_OBJECT)) {
++                    JSObject *po = JS_VALUE_GET_OBJ(pv);
++                    int k;
++
++                    for (k = 0; k < 4; k++) {
++                        JSShape *ish = fb->ctor_inst_shape[k];
++                        if (ish && ish->proto == po)
++                            return js_new_plain_object(ctx, js_dup_shape(ish), req_cap);
++                    }
++                }
++            }
++        }
++    }
++    return js_create_from_ctor_cap_slow(ctx, ctor, class_id, req_cap);
++}
++
+ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
+                                    int class_id)
+ {

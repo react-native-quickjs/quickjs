@@ -6735,6 +6735,26 @@ static void e_ctor_call_text(char *buf, size_t n, const char *callee, const char
   }
 }
 
+/* How a construct site makes `this` (`_t`), the initialiser of its `_rc`. For a constructor wrapper the engine first tries
+   `qjs_aot_new_wrap`: the allocation and the function the wrapper applies in one call through the site's own cache, which
+   leaves `_nw` set and `_t` the finished object; the site then skips its own body call (`_o` is undefined) and the
+   capacity feedback, which the helper did. When it answers 0 the site allocates and calls as before.
+   QJS_AOT_NONEWWRAP turns it off. */
+static int g_nw_count;
+static void e_ctor_alloc_text(char *buf, size_t n, const char *callee, const char *caller, const char *cexp, int w, int na) {
+  int io, ao;
+  if (getenv("QJS_AOT_NOWRAP") == NULL && getenv("QJS_AOT_NONEWWRAP") == NULL && qjs_aot_wrapper_shape(callee, &io, &ao)) {
+    int ix = g_nw_count++;
+    snprintf(
+        buf, n,
+        "({ static void *nc_%d[48]; (_nw = qjs_aot_new_wrap(ctx, %s, (JSObject *)JS_VALUE_GET_PTR(%s), &AOT_REG(fr, %d), %d, nc_%d, %d, %d, &_t)) != 0 ? _nw\n"
+        "            : qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t); })",
+        ix, caller, cexp, w, na, ix, io, ao, cexp);
+  } else {
+    snprintf(buf, n, "qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t)", cexp);
+  }
+}
+
 static int emit_inl_construct(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     char hex[33]) {
@@ -6742,7 +6762,7 @@ static int emit_inl_construct(
   unsigned long long hits[4];
   int kind[4], n = 0, k, r, nb = 0, cc, nt, off, na, w, dreg;
   Q2ValueId dv, cv, nv;
-  char cexp[64], ntexp[64], ctext[1024];
+  char cexp[64], ntexp[64], ctext[1024], atext[512];
 
   (void)hex;
   if (t == NULL || cur == NULL) return 0;
@@ -6832,16 +6852,19 @@ static int emit_inl_construct(
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
     e_sweep_guard(f, "vx", in->pc);
     e_ctor_call_text(ctext, sizeof(ctext), callee[k], "caller_f", cexp, w, na);
+    e_ctor_alloc_text(atext, sizeof(atext), callee[k], "caller_f", cexp, w, na);
     fprintf(
         f,
         "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1) &&\n"
         "        JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT &&\n"
         "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
         "        JSValue _t, _o, _r;\n"
-        "        int _rc = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t);\n"
+        "        int _nw = 0;\n"
+        "        int _rc = %s;\n"
         "        if (__builtin_expect(_rc < 0, 0)) { *out = JS_EXCEPTION; return 1; }\n"
         "        if (_rc > 0) {\n"
-        "            %s"
+        "            if (_nw) _o = JS_UNDEFINED;\n"
+        "            else %s"
         "            if (__builtin_expect(JS_IsException(_o), 0)) {\n"
         "                JS_FreeValue(ctx, _t);\n"
         "                *out = _o; return 1;\n"
@@ -6853,13 +6876,13 @@ static int emit_inl_construct(
         "                if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n"
         "                _r = _t;\n"
         "            }\n"
-        "            if (JS_VALUE_GET_PTR(_r) == JS_VALUE_GET_PTR(_t))\n"
+        "            if (!_nw && JS_VALUE_GET_PTR(_r) == JS_VALUE_GET_PTR(_t))\n"
         "                qjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(%s), _r);\n"
         "            /* The object goes into the frame slot, which AOT_SET_B below\n"
         "               writes with a duplicate: the construct path's own reference\n"
         "               is released here, or the object is never freed. */\n"
         "            if (JS_VALUE_HAS_REF_COUNT(_r)) JS_FreeValue(ctx, _r);\n",
-        cexp, callee[k], ntexp, ntexp, cexp, cexp, ctext, cexp);
+        cexp, callee[k], ntexp, ntexp, cexp, atext, ctext, cexp);
     if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
     /* Neither guard held, or the object could not be made: the construct has not
        happened, so the whole copied body leaves for the call it was copied from,
@@ -6881,7 +6904,7 @@ static int emit_typed_construct(
   char callee[4][33];
   unsigned long long hits[4];
   int kind[4], n = 0, k, nb = 0, cc, nt, off, na, w, r, dreg;
-  char cexp[64], ntexp[64], ctext[1024];
+  char cexp[64], ntexp[64], ctext[1024], atext[512];
   Q2ValueId dv, cv, nv;
 
   if (!have_types || t == NULL || g_e_fl || cur == NULL) return 0;
@@ -6947,17 +6970,20 @@ static int emit_typed_construct(
     if (in->win_n < qjs_aot_unit_argc(callee[k])) continue;
     fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee[k]);
     e_ctor_call_text(ctext, sizeof(ctext), callee[k], "f", cexp, w, na);
+    e_ctor_alloc_text(atext, sizeof(atext), callee[k], "f", cexp, w, na);
     fprintf(
         f,
         "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1) &&\n"
         "        JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT &&\n"
         "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
         "        JSValue _t, _o, _r;\n"
-        "        int _rc = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t);\n"
+        "        int _nw = 0;\n"
+        "        E_CAP(f, %d);\n"
+        "        int _rc = %s;\n"
         "        if (__builtin_expect(_rc < 0, 0)) return qjs_aot_throw_here(ctx, f, UINT32_MAX);\n"
         "        if (_rc > 0) {\n"
-        "            E_CAP(f, %d);\n"
-        "            %s"
+        "            if (_nw) _o = JS_UNDEFINED;\n"
+        "            else %s"
         "            if (__builtin_expect(JS_IsException(_o), 0)) {\n"
         "                JS_FreeValue(ctx, _t);\n"
         "                return JS_EXCEPTION;\n"
@@ -6969,10 +6995,10 @@ static int emit_typed_construct(
         "                if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n"
         "                _r = _t;\n"
         "            }\n"
-        "            if (JS_VALUE_GET_PTR(_r) == JS_VALUE_GET_PTR(_t))\n"
+        "            if (!_nw && JS_VALUE_GET_PTR(_r) == JS_VALUE_GET_PTR(_t))\n"
         "                qjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(%s), _r);\n"
         "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
-        cexp, callee[k], ntexp, ntexp, cexp, cexp, in->next - 1, ctext,
+        cexp, callee[k], ntexp, ntexp, cexp, in->next - 1, atext, ctext,
         getenv("QJS_AOT_CONSTRUCT_CONTROL") != NULL ? "0 &&" : "", cexp, off);
     e_emit_group_recheck(f, fn, in, cur);
     if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);

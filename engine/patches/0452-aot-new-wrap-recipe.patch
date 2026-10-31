@@ -1,0 +1,475 @@
+Subject: A constructor wrapper's `new` is one call, and a store-only initialiser runs as a recipe
+
+What this does
+  - qjs_aot_new_wrap: `new C(...)` for a constructor wrapper C (`function(){ this.initialize.apply(this, arguments) }`, which the generator recognises) in one call through a 32-word per-site cache. It allocates `this` from the instance shape the constructor bytecode keeps for its current `prototype`, valid while C keeps its shape, its `prototype` slot keeps the same object and shape_free_epoch has not moved. It then runs the applied function through qjs_aot_wrap_init's existing cache, and applies the construct result rule and the capacity feedback. Anything the general path does besides allocating (a pending fact event, a layout still to build) answers 0 with nothing done.
+  - A store-only initialiser (argument loads, small constants, moves, forward branches on an argument's truthiness, stores to `this`, return undefined: nothing that can call out, throw or read `this`) is compiled once per function, by enumerating its paths, into a recipe of up to 8 fields; only the prototype check and the shape lookup are redone when aot_pic_epoch moves. Each field is one source, or one of two sources chosen by one argument's truthiness. When the wrapper's cache proves the function, the object is allocated directly in the shape the stores lead to, the slots are written from the recipe, and js_aot_content_filled checks the layout claims. No frame is built and no add transitions run.
+
+Why we need it
+  raytrace builds about 800k Class.create objects per run. Each one cost about 850 instructions across js_create_from_ctor_cap, construct_this, wrap_init, initialize's frame and three add transitions, and construct_done. Vector, Color and Ray (about 655k of them) have store-only initialisers. raytrace C.Minstr 1136.8 -> 1045.4.
+
+Soundness
+  - The recipe is the initialiser's own semantics. Every path stores the same fields in the same order. Truthiness uses the branch handlers' own test, and anything that needs the slow test falls back before anything is allocated.
+  - The shape is the hashed shape a plain C_W_E add chain from the instance shape reaches. It is used only when no prototype on the chain holds a field name as an accessor or a read-only property, which is exactly when the stores would be plain adds.
+  - The recipe is valid under aot_pic_epoch (prototype writes and links move it) and is reset whenever shape_free_epoch moves.
+  - Test kernel zctor (setter added mid-run, read-only prototype field, replaced initialize, every truthiness kind, extra and missing arguments) matches the interpreter. With the prototype check knocked out it does not.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67978,6 +67978,444 @@
+         return ret;
+     JS_FreeValue(ctx, ret);
+     return JS_UNDEFINED;
++}
++
++/* `new C(...)` for a constructor wrapper C (see qjs_aot_wrap_init), allocation and body in one call. `nc` is the site's
++   cache, 48 words: 0..6 are qjs_aot_wrap_init's own (the function the wrapper applies, for a `this` of the instance
++   shape), 8..12 the allocation's. The allocation is the one js_create_from_ctor_cap's cached path makes (the instance
++   shape the constructor bytecode keeps for its current `prototype`, the learned capacity), and it is reused while C
++   keeps its shape, its `prototype` slot keeps the same object and no shape has been freed (`shape_free_epoch`, so a
++   cached shape pointer is still the shape it was). Anything that path does besides allocating (a pending fact event on
++   a watched constructor, a layout still to build) makes this answer 0 with nothing done, and the caller takes the
++   general path. Returns 1 with the constructed object in *out, 0 when not applicable, -1 on an exception. */
++#define AOT_NC_CSHAPE 8
++#define AOT_NC_PROTO 9
++#define AOT_NC_ISHAPE 10
++#define AOT_NC_SLOT 11
++#define AOT_NC_SFE 12
++#define AOT_NC_RCB 13 /* words 13..32: the store-only recipe (see aot_rv_build) */
++#define AOT_NC_RSHAPE 14
++#define AOT_NC_REPOCH 15
++/* The fill of qjs_aot_new_wrap's allocation words: 1 when C's `prototype` is an own data property holding an object
++   for which the constructor bytecode keeps an instance shape (the general path's first construct records it). */
++static __attribute__((noinline, cold)) int aot_new_wrap_fill(JSRuntime *rt, JSObject *ctor, JSFunctionBytecode *cb,
++                                                             void **nc)
++{
++    JSProperty *ppr;
++    JSShapeProperty *prs;
++    JSShape *ish = NULL;
++    JSValue pv;
++    int k;
++
++    nc[AOT_NC_CSHAPE] = NULL;
++    prs = find_own_property(&ppr, ctor, JS_ATOM_prototype);
++    if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return 0;
++    pv = ppr->u.value;
++    if (JS_VALUE_GET_TAG(pv) != JS_TAG_OBJECT)
++        return 0;
++    for (k = 0; k < 4; k++) {
++        JSShape *s = cb->ctor_inst_shape[k];
++        if (s && s->proto == JS_VALUE_GET_OBJ(pv))
++            ish = s;
++    }
++    if (ish == NULL)
++        return 0;
++    nc[AOT_NC_PROTO] = JS_VALUE_GET_PTR(pv);
++    nc[AOT_NC_ISHAPE] = ish;
++    nc[AOT_NC_REPOCH] = (void *)UINTPTR_MAX; /* the recipe's shape was found under the old shape epoch */
++    nc[AOT_NC_SLOT] = (void *)(uintptr_t)(ppr - ctor->prop);
++    nc[AOT_NC_SFE] = (void *)(uintptr_t)rt->shape_free_epoch;
++    nc[AOT_NC_CSHAPE] = ctor->shape;
++    return 1;
++}
++
++/* A store-only `initialize` (see qjs_aot_new_wrap), compiled once into a recipe. Such a function reads its arguments,
++   loads small constants, moves registers, branches forward on the truthiness of an argument or a constant, stores to
++   `this` and returns undefined: nothing else, so it cannot call out, throw, or see `this` before every store is done.
++   Its paths are enumerated symbolically; every path must store the same fields in the same order, and each field's
++   value must be one source on every path, or one of two sources chosen by the truthiness of one argument. Words
++   13..32 of the site cache hold the recipe. The part that depends only on the function (13: the function it was made
++   from, low bit set when it is not store-only; 16: the field count; 17..24: one word per field, source if true |
++   source if false << 16 | the argument tested << 32, 0xff when none; 25..32: the field names) is made once; the part
++   that depends on the prototypes (14: the shape the stores lead to, NULL when they are not plain adds; 15: the
++   aot_pic_epoch it was checked under) is redone when that epoch moves. A source is kind << 8 | value. */
++#define AOT_NC_RN 16
++#define AOT_NC_RF 17
++#define AOT_NC_RA 25 /* 25..32: the field names */
++#define AOT_RV_MAXF 8
++#define AOT_RV_MAXR 32
++enum { AOT_SV_NONE = 0, AOT_SV_ARG, AOT_SV_INT, AOT_SV_UNDEF, AOT_SV_NULL, AOT_SV_TRUE, AOT_SV_FALSE, AOT_SV_THIS };
++typedef struct AotRvPath {
++    uint16_t sv[AOT_RV_MAXF];
++    JSAtom atom[AOT_RV_MAXF];
++    uint8_t cond[16]; /* per argument: 0 untested, 1 falsy, 2 truthy on this path */
++    int n;
++} AotRvPath;
++typedef struct AotRvWalk {
++    const uint8_t *code;
++    int len, npaths;
++    AotRvPath paths[16];
++} AotRvWalk;
++
++/* the operands of the instruction at `ip`, as the encoder wrote them (regvm_map_atoms2's widths); -1 when malformed */
++static int aot_rv_operands(const uint8_t *ip, const uint8_t *end, int *opv, int *nop)
++{
++    int op = ip[0], nar = regvm_rop_narrow((uint16_t)op), m, q = 1, k = 0;
++    const char *fmt = regvm_rop_fmt[op];
++
++    for (m = 0; fmt[m] && k < 6; m++) {
++        int v;
++        switch (fmt[m]) {
++        case 'r': if (ip + q + (nar ? 1 : 2) > end) return -1;
++                  v = nar ? ip[q] : regvm_ld_u16(ip + q); q += nar ? 1 : 2; break;
++        case 'i': if (ip + q + 1 > end) return -1; v = (int8_t)ip[q]; q += 1; break;
++        case 'b': if (ip + q + 1 > end) return -1; v = ip[q]; q += 1; break;
++        case 'u': case 's': if (ip + q + 2 > end) return -1; v = regvm_ld_u16(ip + q); q += 2; break;
++        case 'I': case 'c': case 'a': if (ip + q + 4 > end) return -1; v = (int32_t)regvm_ld_u32(ip + q); q += 4; break;
++        case 't': if (nar) { if (ip + q + 1 > end) return -1; v = (int8_t)ip[q]; q += 1; }
++                  else { if (ip + q + 4 > end) return -1; v = (int32_t)regvm_ld_u32(ip + q); q += 4; }
++                  break;
++        default: return -1;
++        }
++        opv[k++] = v;
++    }
++    *nop = k;
++    return q;
++}
++
++static int aot_rv_reg(int off)
++{
++    return (off % (int)sizeof(JSValue)) == 0 && off / (int)sizeof(JSValue) < AOT_RV_MAXR ? off / (int)sizeof(JSValue) : -1;
++}
++
++/* one path from `pc`, registers `reg` and conditions `cond`; 0 when the function is not store-only */
++static int aot_rv_walk(AotRvWalk *w, int pc, uint16_t *reg, uint8_t *cond, AotRvPath *cur, int depth)
++{
++    while (pc < w->len) {
++        const uint8_t *ip = w->code + pc;
++        int op = ip[0], opv[6], nop, sz, d, s, k;
++
++        if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
++            return 0;
++        sz = aot_rv_operands(ip, w->code + w->len, opv, &nop);
++        if (sz < 0)
++            return 0;
++        switch (op) {
++        case ROP_load_this:
++            if ((d = aot_rv_reg(opv[0])) < 0) return 0;
++            reg[d] = AOT_SV_THIS << 8;
++            break;
++        case ROP_get_arg:
++            if ((d = aot_rv_reg(opv[0])) < 0 || opv[1] >= 16) return 0;
++            reg[d] = (AOT_SV_ARG << 8) | opv[1];
++            break;
++        case ROP_get_arg2:
++            if ((d = aot_rv_reg(opv[0])) < 0 || opv[1] >= 16) return 0;
++            reg[d] = (AOT_SV_ARG << 8) | opv[1];
++            if ((d = aot_rv_reg(opv[2])) < 0 || opv[3] >= 16) return 0;
++            reg[d] = (AOT_SV_ARG << 8) | opv[3];
++            break;
++        case ROP_load_i8:
++        case ROP_load_i8_s:
++            if ((d = aot_rv_reg(opv[0])) < 0) return 0;
++            reg[d] = (AOT_SV_INT << 8) | (uint8_t)opv[1];
++            break;
++        case ROP_load_undefined: case ROP_load_null: case ROP_load_true: case ROP_load_false:
++            if ((d = aot_rv_reg(opv[0])) < 0) return 0;
++            reg[d] = (op == ROP_load_undefined ? AOT_SV_UNDEF : op == ROP_load_null ? AOT_SV_NULL :
++                      op == ROP_load_true ? AOT_SV_TRUE : AOT_SV_FALSE) << 8;
++            break;
++        case ROP_move:
++        case ROP_move_s:
++            if ((d = aot_rv_reg(opv[0])) < 0 || (s = aot_rv_reg(opv[1])) < 0) return 0;
++            if ((reg[s] >> 8) == AOT_SV_THIS || (reg[s] >> 8) == AOT_SV_NONE) return 0;
++            reg[d] = reg[s];
++            break;
++        case ROP_branch:
++        case ROP_branch_s:
++            if (opv[0] < 0) return 0; /* forward only: no loops */
++            pc += sz + opv[0];
++            continue;
++        case ROP_branch_if:
++        case ROP_branch_if_not: {
++            int kind, t, taken;
++            if ((s = aot_rv_reg(opv[0])) < 0 || opv[1] < 0) return 0;
++            kind = reg[s] >> 8;
++            if (kind == AOT_SV_ARG) {
++                k = reg[s] & 0xff;
++                if (cond[k] == 0) {
++                    /* both ways: the argument falsy, then truthy */
++                    uint8_t c2[16];
++                    uint16_t r2[AOT_RV_MAXR];
++                    AotRvPath p2;
++                    if (depth >= 4) return 0;
++                    memcpy(c2, cond, sizeof(c2));
++                    memcpy(r2, reg, sizeof(r2));
++                    p2 = *cur;
++                    c2[k] = 1;
++                    if (!aot_rv_walk(w, pc, r2, c2, &p2, depth + 1)) return 0;
++                    cond[k] = 2;
++                    continue; /* this path: re-run the branch with the argument truthy */
++                }
++                t = cond[k] == 2;
++            } else if (kind == AOT_SV_INT) {
++                t = (reg[s] & 0xff) != 0;
++            } else if (kind == AOT_SV_UNDEF || kind == AOT_SV_NULL || kind == AOT_SV_FALSE) {
++                t = 0;
++            } else if (kind == AOT_SV_TRUE) {
++                t = 1;
++            } else {
++                return 0;
++            }
++            taken = op == ROP_branch_if ? t : !t;
++            pc += sz + (taken ? opv[1] : 0);
++            continue;
++        }
++        case ROP_put_field:
++            if ((d = aot_rv_reg(opv[0])) < 0 || (s = aot_rv_reg(opv[3])) < 0) return 0;
++            if ((reg[d] >> 8) != AOT_SV_THIS) return 0;
++            if ((reg[s] >> 8) == AOT_SV_THIS || (reg[s] >> 8) == AOT_SV_NONE) return 0;
++            if (cur->n >= AOT_RV_MAXF) return 0;
++            cur->atom[cur->n] = (JSAtom)opv[1];
++            cur->sv[cur->n] = reg[s];
++            cur->n++;
++            break;
++        case ROP_return_undefined:
++            if (w->npaths >= 16) return 0;
++            memcpy(cur->cond, cond, sizeof(cur->cond));
++            w->paths[w->npaths++] = *cur;
++            return 1;
++        default:
++            return 0;
++        }
++        pc += sz;
++    }
++    return 0;
++}
++
++/* The function part of the recipe of `ib` (see above). 1 when it is store-only. */
++static __attribute__((noinline, cold)) int aot_rv_build(JSRuntime *rt, JSFunctionBytecode *ib, void **nc)
++{
++    AotRvWalk *w;
++    uint16_t reg[AOT_RV_MAXR];
++    uint8_t cond[16];
++    AotRvPath cur;
++    int ok = 0, i, j, k, n;
++
++    nc[AOT_NC_RCB] = (void *)((uintptr_t)ib | 1);
++    nc[AOT_NC_REPOCH] = (void *)UINTPTR_MAX; /* no epoch is this: the prototype part is redone */
++    nc[AOT_NC_RSHAPE] = NULL;
++    if (ib->func_kind != JS_FUNC_NORMAL || ib->var_ref_count != 0 || ib->regvm_ctl_count != 0 ||
++        ib->regvm_code == NULL)
++        return 0;
++    w = js_malloc_rt(rt, sizeof(*w));
++    if (!w)
++        return 0;
++    memset(w, 0, sizeof(*w));
++    w->code = ib->regvm_code;
++    w->len = ib->regvm_len;
++    for (i = 0; i < AOT_RV_MAXR; i++)
++        reg[i] = AOT_SV_UNDEF << 8;
++    memset(cond, 0, sizeof(cond));
++    memset(&cur, 0, sizeof(cur));
++    if (!aot_rv_walk(w, 0, reg, cond, &cur, 0) || w->npaths == 0)
++        goto done;
++    n = w->paths[0].n;
++    if (n == 0)
++        goto done;
++    for (i = 0; i < w->npaths; i++) {
++        if (w->paths[i].n != n)
++            goto done;
++        for (k = 0; k < n; k++)
++            if (w->paths[i].atom[k] != w->paths[0].atom[k])
++                goto done;
++    }
++    for (k = 0; k < n; k++)
++        for (j = 0; j < k; j++)
++            if (w->paths[0].atom[j] == w->paths[0].atom[k])
++                goto done;
++    /* each field: one source, or two chosen by one argument's truthiness */
++    for (k = 0; k < n; k++) {
++        uint16_t s0 = w->paths[0].sv[k];
++        int same = 1, a;
++        uint64_t word = 0;
++        for (i = 1; i < w->npaths; i++)
++            if (w->paths[i].sv[k] != s0)
++                same = 0;
++        if (same) {
++            word = (uint64_t)s0 | ((uint64_t)s0 << 16) | ((uint64_t)0xff << 32);
++        } else {
++            for (a = 0; a < 16; a++) {
++                int st = -1, sf = -1, good = 1;
++                for (i = 0; good && i < w->npaths; i++) {
++                    int c = w->paths[i].cond[a], v = w->paths[i].sv[k];
++                    if (c == 0) good = 0;
++                    else if (c == 2) { if (st >= 0 && st != v) good = 0; st = v; }
++                    else { if (sf >= 0 && sf != v) good = 0; sf = v; }
++                }
++                if (good && st >= 0 && sf >= 0) {
++                    word = (uint64_t)st | ((uint64_t)sf << 16) | ((uint64_t)a << 32);
++                    break;
++                }
++            }
++            if (a == 16)
++                goto done;
++        }
++        nc[AOT_NC_RF + k] = (void *)(uintptr_t)word;
++        nc[AOT_NC_RA + k] = (void *)(uintptr_t)w->paths[0].atom[k];
++    }
++    nc[AOT_NC_RN] = (void *)(uintptr_t)n;
++    nc[AOT_NC_RCB] = ib;
++    ok = 1;
++done:
++    js_free_rt(rt, w);
++    return ok;
++}
++
++/* The prototype part: the shape the recipe's stores lead to from `ish`, each a plain add. No prototype on the way may
++   hold a field name as anything but a writable data property (an accessor or a read-only one would make the store
++   something else). NULL when they are not plain adds or the shape has not been made yet (the ordinary path makes it). */
++static __attribute__((noinline, cold)) void aot_rv_shape(JSRuntime *rt, JSShape *ish, void **nc)
++{
++    JSShape *sh = ish;
++    int n = (int)(uintptr_t)nc[AOT_NC_RN], k;
++
++    nc[AOT_NC_REPOCH] = (void *)(uintptr_t)rt->aot_pic_epoch;
++    nc[AOT_NC_RSHAPE] = NULL;
++    if (ish->prop_count != 0)
++        return;
++    for (k = 0; k < n; k++) {
++        JSAtom atom = (JSAtom)(uintptr_t)nc[AOT_NC_RA + k];
++        JSObject *o;
++        int depth = 0;
++        for (o = ish->proto; o != NULL; o = o->shape->proto) {
++            JSProperty *pr;
++            JSShapeProperty *prs;
++            if (++depth > 8 || o->is_exotic || o->class_id != JS_CLASS_OBJECT)
++                return;
++            prs = find_own_property(&pr, o, atom);
++            if (prs != NULL) {
++                if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE))
++                    return;
++                break;
++            }
++        }
++        sh = find_hashed_shape_prop(rt, sh, atom, JS_PROP_C_W_E);
++        if (sh == NULL)
++            return;
++    }
++    nc[AOT_NC_RSHAPE] = sh;
++}
++
++static inline JSValue aot_rv_value(int src, JSValue *argv, int argc)
++{
++    int v = src & 0xff;
++    switch (src >> 8) {
++    case AOT_SV_ARG: return v < argc ? js_dup(argv[v]) : JS_UNDEFINED;
++    case AOT_SV_INT: return js_int32((int8_t)v);
++    case AOT_SV_NULL: return JS_NULL;
++    case AOT_SV_TRUE: return JS_TRUE;
++    case AOT_SV_FALSE: return JS_FALSE;
++    default: return JS_UNDEFINED;
++    }
++}
++
++int qjs_aot_new_wrap(JSContext *ctx, JSRegRun *caller_f, JSObject *ctor, JSValue *argv, int argc,
++                     void **nc, int init_off, int apply_off, JSValue *out)
++{
++    JSRuntime *rt = ctx->rt;
++    JSFunctionBytecode *cb;
++    JSValue obj, ret;
++
++    if (ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
++        return 0;
++    cb = ctor->u.func.function_bytecode;
++    if (unlikely(JS_AOT_LAYOUT_CTOR(cb)) || cb->is_derived_class_constructor ||
++        (unlikely(rt->aot_facts != NULL) && rt->aot_facts->fresh_pending != 0 && ctor->gv_watched))
++        return 0;
++    /* the epoch first: only while no shape has been freed does an equal pointer mean the same shape, and only then is
++       the cached slot index inside C's property array */
++    if (unlikely(nc[AOT_NC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch ||
++                 nc[AOT_NC_CSHAPE] != (void *)ctor->shape ||
++                 JS_VALUE_GET_PTR(ctor->prop[(uintptr_t)nc[AOT_NC_SLOT]].u.value) != nc[AOT_NC_PROTO]) &&
++        !aot_new_wrap_fill(rt, ctor, cb, nc))
++        return 0;
++    /* A store-only initialiser whose function the wrapper's cache already proves (the same test qjs_aot_wrap_init
++       makes first): the object is made with every field, from the recipe, and no code runs. */
++    if (likely(nc[AOT_WC_SHAPE] == nc[AOT_NC_ISHAPE] && nc[AOT_WC_CB] == (void *)cb &&
++               nc[AOT_WC_EPOCH] == (void *)(uintptr_t)rt->aot_pic_epoch &&
++               nc[AOT_WC_SFE] == (void *)(uintptr_t)rt->shape_free_epoch &&
++               ((JSObject *)nc[AOT_WC_INIT])->shape == (JSShape *)nc[AOT_WC_ISHAPE])) {
++        JSFunctionBytecode *ib = ((JSObject *)nc[AOT_WC_INIT])->u.func.function_bytecode;
++        if (unlikely(nc[AOT_NC_RCB] != (void *)ib) && nc[AOT_NC_RCB] != (void *)((uintptr_t)ib | 1))
++            aot_rv_build(rt, ib, nc);
++        if (nc[AOT_NC_RCB] == (void *)ib &&
++            unlikely(nc[AOT_NC_REPOCH] != (void *)(uintptr_t)rt->aot_pic_epoch))
++            aot_rv_shape(rt, (JSShape *)nc[AOT_NC_ISHAPE], nc);
++        if (nc[AOT_NC_RCB] == (void *)ib && nc[AOT_NC_RSHAPE] != NULL) {
++            int n = (int)(uintptr_t)nc[AOT_NC_RN], k;
++            uint16_t src[AOT_RV_MAXF];
++            JSShape *fsh = (JSShape *)nc[AOT_NC_RSHAPE];
++            JSObject *p;
++            uint32_t cap = cb->inst_inline_cap;
++
++            for (k = 0; k < n; k++) {
++                uint64_t word = (uint64_t)(uintptr_t)nc[AOT_NC_RF + k];
++                int a = (int)((word >> 32) & 0xff);
++                if (a == 0xff) {
++                    src[k] = (uint16_t)word;
++                } else {
++                    JSValue av = a < argc ? argv[a] : JS_UNDEFINED;
++                    int t;
++                    /* the branch handlers' own test: int, bool, null and undefined carry their truth in the int */
++                    if ((uint32_t)JS_VALUE_GET_TAG(av) <= JS_TAG_UNDEFINED)
++                        t = JS_VALUE_GET_INT(av) != 0;
++                    else if (unlikely((t = regvm_truthy_fast(av)) < 0))
++                        goto general;
++                    src[k] = (uint16_t)(t ? word : word >> 16);
++                }
++            }
++            if (cap < fsh->prop_size)
++                cap = fsh->prop_size;
++            obj = JS_NewObjectFromShapeCap(ctx, js_dup_shape(fsh), JS_CLASS_OBJECT, NULL, cap);
++            if (unlikely(JS_IsException(obj)))
++                return -1;
++            p = JS_VALUE_GET_OBJ(obj);
++            for (k = 0; k < n; k++)
++                p->prop[k].u.value = aot_rv_value(src[k], argv, argc);
++            js_aot_content_filled(rt, p);
++            if (unlikely(cb->inst_cap_samples < JS_OBJ_LEARN_SAMPLES))
++                js_learn_instance_cap(cb, obj);
++            *out = obj;
++            return 1;
++        }
++    }
++general:
++    obj = JS_NewObjectFromShapeCap(ctx, js_dup_shape((JSShape *)nc[AOT_NC_ISHAPE]), JS_CLASS_OBJECT, NULL,
++                                   cb->inst_inline_cap);
++    if (unlikely(JS_IsException(obj)))
++        return -1;
++    ret = qjs_aot_wrap_init(ctx, caller_f, ctor, obj, argv, argc, nc, init_off, apply_off);
++    if (unlikely(JS_VALUE_GET_TAG(ret) != JS_TAG_UNDEFINED)) {
++        if (JS_VALUE_GET_TAG(ret) == JS_TAG_UNINITIALIZED)
++            /* the wrapper's own body, on this object: what the construct would run */
++            ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, ctor), obj, argc, vc(argv));
++        if (JS_IsException(ret)) {
++            JS_FreeValue(ctx, obj);
++            return -1;
++        }
++        if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
++            JS_FreeValue(ctx, obj);
++            *out = ret;
++            return 1;
++        }
++        JS_FreeValue(ctx, ret);
++    }
++    if (unlikely(cb->inst_cap_samples < JS_OBJ_LEARN_SAMPLES))
++        js_learn_instance_cap(cb, obj);
++    *out = obj;
++    return 1;
+ }
+ 
+ /* Whether constructing `ctor` now is fully described by the engine's own add-transition cells:
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -551,6 +551,10 @@
+ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
+ JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
+                           int argc, void **wc, int init_off, int apply_off);
++/* `new C(...)` for a constructor wrapper C: the allocation and qjs_aot_wrap_init in one call, both through the
++   site's 48-word cache. 1 with the object in *out, 0 when not applicable (nothing done), -1 on an exception. */
++int qjs_aot_new_wrap(JSContext *ctx, JSRegRun *caller_f, JSObject *ctor, JSValue *argv, int argc,
++                     void **nc, int init_off, int apply_off, JSValue *out);
+ /* What `qjs_aot_ctor_replayable` remembers between calls (zero-initialised, one per use). */
+ typedef struct JSAotCtorCache {
+     const void *shape, *proto;
