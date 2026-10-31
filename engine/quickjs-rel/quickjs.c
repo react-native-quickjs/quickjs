@@ -29536,6 +29536,7 @@ static uint8_t *REGVM_CC regvm_t_binary_imm_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_binary_imm_s(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_binary_imm_s_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_unary(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_throw(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_unary_slow(REGVM_ARGS);
 
 static uint8_t *REGVM_CC regvm_t_load_undefined(REGVM_ARGS);
@@ -29943,7 +29944,7 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(super_get, regvm_t_cold) \
     X(tail_call, regvm_t_tail_call) \
     X(tail_call_method, regvm_t_tail_call_method) \
-    X(throw, regvm_t_cold) \
+    X(throw, regvm_t_throw) \
     X(throw_error, regvm_t_cold) \
     X(to_object, regvm_t_cold) \
     X(to_propkey, regvm_t_cold) \
@@ -31368,6 +31369,25 @@ static uint8_t *REGVM_CC regvm_t_unary(REGVM_ARGS)
         T_SET_NEXT_B(d, out, T_SZ_RBR);
     }
     __attribute__((musttail)) return regvm_t_unary_slow(REGVM_PASS);
+}
+
+/* `throw`: the monolith's L_ROP_throw, threaded, so a function whose only cold
+   opcode is a throw (a guard such as `if (!v) throw ...`) stays light. The
+   position is captured first so the backtrace names this instruction. */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_throw(REGVM_ARGS)
+{
+    REGVM_CAPTURE_IP();
+    int s = T_REG(1);
+    JSValue v = FR(s);
+
+    FR(s) = JS_UNDEFINED;
+#if QJS_DRC
+    /* The register only borrows; JS_Throw takes ownership. */
+    JS_Throw(ctx, js_dup(v));
+#else
+    JS_Throw(ctx, v);
+#endif
+    T_FAIL();
 }
 
 

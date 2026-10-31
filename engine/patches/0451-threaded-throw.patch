@@ -1,0 +1,56 @@
+Subject: `throw` has a threaded handler, so a throwing guard no longer makes a function heavy
+
+What this does
+  - ROP_throw gets a threaded handler, regvm_t_throw: the monolith's L_ROP_throw (capture the position, clear the register, JS_Throw, unwind). The explicit list names it instead of regvm_t_cold.
+
+Why we need it
+  A cold opcode makes a function light-unsafe (regvm_op_light_unsafe), and throw was cold. So any function with a guard like `if (!w || !v) throw '...'` lost the light frame, and with it the AOT native entry: every call went through the step handler, JS_CallInternal and a full record frame. In raytrace, Vector.subtract (156,696 calls per run) was such a function: 1193 -> 1137 C.Minstr, and 2007 -> 1983 I.Minstr for the plain interpreter.
+
+Soundness
+  Same effect as the monolith's handler: the register is cleared, the exception owns its value (a dup under DRC, where registers borrow), and T_FAIL unwinds through regvm_t_unwind like every other threaded handler that throws. REGVM_CAPTURE_IP runs first, so the backtrace names the throw. Stack traces of a throwing light function are byte-identical to the previous engine's.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29536,6 +29536,7 @@
+ static uint8_t *REGVM_CC regvm_t_binary_imm_s(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_binary_imm_s_slow(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_unary(REGVM_ARGS);
++static uint8_t *REGVM_CC regvm_t_throw(REGVM_ARGS);
+ static uint8_t *REGVM_CC regvm_t_unary_slow(REGVM_ARGS);
+ 
+ static uint8_t *REGVM_CC regvm_t_load_undefined(REGVM_ARGS);
+@@ -29943,7 +29944,7 @@
+     X(super_get, regvm_t_cold) \
+     X(tail_call, regvm_t_tail_call) \
+     X(tail_call_method, regvm_t_tail_call_method) \
+-    X(throw, regvm_t_cold) \
++    X(throw, regvm_t_throw) \
+     X(throw_error, regvm_t_cold) \
+     X(to_object, regvm_t_cold) \
+     X(to_propkey, regvm_t_cold) \
+@@ -31368,6 +31369,25 @@
+         T_SET_NEXT_B(d, out, T_SZ_RBR);
+     }
+     __attribute__((musttail)) return regvm_t_unary_slow(REGVM_PASS);
++}
++
++/* `throw`: the monolith's L_ROP_throw, threaded, so a function whose only cold
++   opcode is a throw (a guard such as `if (!v) throw ...`) stays light. The
++   position is captured first so the backtrace names this instruction. */
++static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_throw(REGVM_ARGS)
++{
++    REGVM_CAPTURE_IP();
++    int s = T_REG(1);
++    JSValue v = FR(s);
++
++    FR(s) = JS_UNDEFINED;
++#if QJS_DRC
++    /* The register only borrows; JS_Throw takes ownership. */
++    JS_Throw(ctx, js_dup(v));
++#else
++    JS_Throw(ctx, v);
++#endif
++    T_FAIL();
+ }
+ 
+ 
