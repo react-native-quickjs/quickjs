@@ -100,7 +100,7 @@
             fprintf(o, "          rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, r_); %sv%d = r_; } }\n", I->pfx, dv);
             reg = fn->values[dv].reg;
             if (I->cur != NULL && reg >= 0 && reg < 256) snprintf(I->cur[reg], 40, "%sv%d", I->pfx, dv);
-            rg_xlabel(c, rg_xit(c, ii, in->next), in->pc, "call-facts", xo, sizeof(xo));
+            rg_xlabel(c, rg_xit_x(c, ii, in->next), in->pc, "call-facts", xo, sizeof(xo));
             fprintf(o, "        if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1) || rgon_ >= RG_OWNCAP, 0)) goto %s;\n", c->hex, xo);
           }
           break;

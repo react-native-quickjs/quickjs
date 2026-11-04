@@ -3181,6 +3181,7 @@ static void recv_ctor_global(int s, char *out, size_t cap) {
   }
 }
 
+static const char *g_recv_name;   /* T13: when set, only accesses of this field name count (the two reads of a chain share a pc and have different receivers) */
 static int g_recv_only = -1;   /* qjs_aot_bundle_receivers_for: only this allocation site's class is wanted */
 int qjs_aot_bundle_receivers(const JSAotGenFunc *g, int pc, int kind, QjsAotRecvClass *out, int max) {
   int fi, i, s, n = 0;
@@ -3196,7 +3197,7 @@ int qjs_aot_bundle_receivers(const JSAotGenFunc *g, int pc, int kind, QjsAotRecv
       if (P.rcv[i].fn == fi && P.rcv[i].pc == pc) { bs_or(&recv, &P.rcv[i].recv); cls |= P.rcv[i].cls; nodisp |= P.rcv[i].nodisp; found = 1; }
   } else {
     for (i = 0; i < P.nacc; i++)
-      if (P.acc[i].fn == fi && P.acc[i].pc == pc && P.acc[i].kind == kind) { bs_or(&recv, &P.acc[i].recv); cls |= P.acc[i].cls; found = 1; }
+      if (P.acc[i].fn == fi && P.acc[i].pc == pc && P.acc[i].kind == kind && (g_recv_name == NULL || strcmp(g_bn_names[P.acc[i].name], g_recv_name) == 0)) { bs_or(&recv, &P.acc[i].recv); cls |= P.acc[i].cls; found = 1; }
   }
   if (!found) return -1;
   if (g_recv_only < 0 && (cls & (K_UNK | K_BOOL | K_INT | K_INTOV | K_DBL | K_NUM | K_STR))) return -1;
@@ -3385,7 +3386,7 @@ int qjs_aot_bundle_const_int(const char *gname, const char *fname, int32_t *out)
 
 /* The allocation site of `new F(...)` at (g, pc): its id when every context of it adds the same fields in the same order, all of them
    unconditionally in the construction walk and none later anywhere in the bundle (the class has one shape); -1 otherwise. */
-int qjs_aot_bundle_alloc_site(const JSAotGenFunc *g, int pc) {
+static int alloc_site_impl(const JSAotGenFunc *g, int pc, int late_ok) {
   int fi, s, first = -1, nf0 = -1, j, ev;
   BAdd a0[64];
   if (bundle_prepare() != 0) return -1;
@@ -3399,7 +3400,7 @@ int qjs_aot_bundle_alloc_site(const JSAotGenFunc *g, int pc) {
     na = site_adds(s, adds);
     if (na < 0) return -1;
     for (j = 0; j < na; j++) if (!adds[j].uncond) return -1;
-    for (ev = 0; ev < P.nev; ev++) {
+    for (ev = 0; ev < P.nev && !late_ok; ev++) {
       if (P.ev[ev].callee >= 0 || P.ev[ev].site != s) continue;
       for (j = 0; j < na && adds[j].name != P.ev[ev].name; j++) {}
       if (j == na) return -1;
@@ -3411,6 +3412,24 @@ int qjs_aot_bundle_alloc_site(const JSAotGenFunc *g, int pc) {
   return first;
 }
 
+int qjs_aot_bundle_alloc_site(const JSAotGenFunc *g, int pc) { return alloc_site_impl(g, pc, 0); }
+
+/* The allocation site of a construct whose class gains fields after the construction walk (stores in the code that uses the object): the walk's own fields are all unconditional and the same
+   for every site made at (g, pc); the later fields are the class's late names, which size the object. -1 when the walk itself is not a single field list. */
+int qjs_aot_bundle_alloc_site_late(const JSAotGenFunc *g, int pc) { return alloc_site_impl(g, pc, 1); }
+
+
+/* The first instance site allocated at (g, pc), whatever shape its class has (a class whose objects gain fields after construction has no alloc_site): a forwarding constructor's
+   object is of the class of its construct site, and the dispatch of the forwarded call asks the analysis about that site only. 0 if there is none. */
+int qjs_aot_bundle_alloc_site_any(const JSAotGenFunc *g, int pc) {
+  int fi, s;
+  if (bundle_prepare() != 0) return 0;
+  fi = bundle_fn_index(g);
+  if (fi < 0) return 0;
+  for (s = 1; s < P.nst; s++)
+    if (P.st[s].kind == SK_INST && P.st[s].afn == fi && P.st[s].apc == pc) return s;
+  return 0;
+}
 
 /* The constructor's digest of an allocation site. */
 int qjs_aot_bundle_site_ctor_digest(int site, char hex[33]) {
@@ -3468,6 +3487,26 @@ int qjs_aot_bundle_class_late_names(int site, char (*names)[40], int max) {
     }
   }
   return n;
+}
+
+/* The late names of the class whose construction-walk fields are exactly `base` (a construct whose allocation site the analysis did not resolve): the longest list over the sites that
+   have those fields. The count is a size hint for the object, never a fact. */
+int qjs_aot_bundle_late_count_by_fields(char (*base)[40], int nbase) {
+  BAdd adds[64];
+  int s, j, best = 0;
+  if (bundle_prepare() != 0) return 0;
+  for (s = 1; s < P.nst; s++) {
+    char late[16][40];
+    int na, n;
+    if (P.st[s].kind != SK_INST) continue;
+    na = site_adds(s, adds);
+    if (na != nbase) continue;
+    for (j = 0; j < na && strcmp(g_bn_names[adds[j].name], base[j]) == 0; j++) {}
+    if (j != na) continue;
+    n = qjs_aot_bundle_class_late_names(s, late, 16);
+    if (n > best) best = n;
+  }
+  return best;
 }
 
 /* The audit section for classes that gain fields late: the shapes the profile observed for each (the class table's shape list). */
@@ -3579,4 +3618,43 @@ int qjs_aot_bundle_site_proto_field(int site, const char *name) {
     BS_FOR(i, &P.st[t].proto) if (sp < 64) stack[sp++] = i; else return 1;
   }
   return 0;
+}
+
+/* T13: the value classes of an access without a fixed position. The union, over every receiver allocation site the bundle knows at (g, pc, kind), of the K_* classes of what its field
+   `name` holds (as qjs_aot_bundle_field computes for a fixed position); 0 when no access is recorded there, a receiver is not a plain instance/object, or a receiver's field has no flow
+   entry or holds an unknown value (lost flow). The receivers themselves are checked at run time by the shape dispatch, not here. */
+int qjs_aot_bundle_access_cls(const JSAotGenFunc *g, int pc, int kind, const char *name, unsigned *cls) {
+  int fi, i, s, nm = -1, found = 0, nf = 0;
+  BSet recv;
+  unsigned c = 0, rc = 0;
+  if (bundle_prepare() != 0 || name == NULL) return 0;
+  fi = bundle_fn_index(g);
+  nm = bn_lookup(name);
+  if (fi < 0 || nm < 0) return 0;
+  memset(&recv, 0, sizeof(recv));
+  for (i = 0; i < P.nacc; i++)
+    if (P.acc[i].fn == fi && P.acc[i].pc == pc && P.acc[i].kind == kind && P.acc[i].name == nm) { bs_or(&recv, &P.acc[i].recv); rc |= P.acc[i].cls; found = 1; }
+  if (!found) return 0;
+  /* a stored value whose kind the model cannot tell is any value: the access still dispatches on the shape, and its stores are checked at run time */
+  if (rc & K_UNK) { *cls = K_UNK | K_DBL | K_NUM; return 1; }
+  BS_FOR(s, &recv) {
+    const BSite *S = &P.st[s];
+    int f;
+    if (S->kind != SK_INST && S->kind != SK_OBJ) return 0;
+    f = fl_find_in(&P, s, nm);
+    if (f < 0) continue;   /* this receiver site never holds the field in the model: a profile shape without it is not in the dispatch (the shapes decide at run time) */
+    nf++;
+    c |= P.nd[P.fl[f].node].cls;
+  }
+  if (nf == 0 || (c & K_UNK)) { *cls = K_UNK | K_DBL | K_NUM; return 1; }
+  *cls = c;
+  return 1;
+}
+
+int qjs_aot_bundle_receivers_named(const JSAotGenFunc *g, int pc, int kind, const char *name, QjsAotRecvClass *out, int max) {
+  int r;
+  g_recv_name = name;
+  r = qjs_aot_bundle_receivers(g, pc, kind, out, max);
+  g_recv_name = NULL;
+  return r;
 }

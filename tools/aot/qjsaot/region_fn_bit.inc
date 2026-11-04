@@ -18,12 +18,12 @@ static int rg_bitop(FILE *o, int sub, const char *dst, const char *a, const char
     case REG_BIN_OR: case REG_BIN_AND: case REG_BIN_XOR: case REG_BIN_SHL: case REG_BIN_SAR: case REG_BIN_SHR: case REG_BIN_MOD: break;
     default: return 0;
   }
-  fprintf(o, "        { int32_t x_, y_;\n");
   if (sub == REG_BIN_MOD) {
-    /* ints only: JS's remainder takes the sign of the dividend, so a zero remainder of a negative dividend is -0; a zero divisor is NaN */
-    fprintf(o, "          if (JS_VALUE_GET_TAG(%s) != JS_TAG_INT", a);
-    if (b != NULL) fprintf(o, " || JS_VALUE_GET_TAG(%s) != JS_TAG_INT", b);
-    fprintf(o, ") goto %s;\n          x_ = JS_VALUE_GET_INT(%s); y_ = ", xl, a);
+    /* JS's remainder takes the sign of the dividend, so a zero remainder of a negative dividend is -0, and a zero divisor is NaN. Two ints: the integer remainder. Any other
+       numbers (int or double): fmod, which is the remainder JS defines for doubles (NaN, infinities, -0 as the interpreter); an integral result in range is an int again. */
+    fprintf(o, "        { if (JS_VALUE_GET_TAG(%s) == JS_TAG_INT", a);
+    if (b != NULL) fprintf(o, " && JS_VALUE_GET_TAG(%s) == JS_TAG_INT", b);
+    fprintf(o, ") {\n          int32_t x_ = JS_VALUE_GET_INT(%s), y_ = ", a);
     if (b != NULL) fprintf(o, "JS_VALUE_GET_INT(%s);\n", b); else fprintf(o, "%d;\n", (int)imm);
     fprintf(o, "          if (y_ == 0) %s = __JS_NewFloat64(__builtin_nan(\"\"));\n", dst);
     fprintf(o, "          else { int32_t r_ = y_ == -1 ? 0 : x_ %% y_;\n");
@@ -31,8 +31,16 @@ static int rg_bitop(FILE *o, int sub, const char *dst, const char *a, const char
       fprintf(o, "            if (r_ == 0 && x_ < 0 && !getenv(\"%s\")) %s = __JS_NewFloat64(-0.0); else %s = JS_MKVAL(JS_TAG_INT, r_); } }\n", knob, dst, dst);
     else
       fprintf(o, "            if (r_ == 0 && x_ < 0) %s = __JS_NewFloat64(-0.0); else %s = JS_MKVAL(JS_TAG_INT, r_); } }\n", dst, dst);
+    fprintf(o, "          else { double x_, y_, r_; int32_t t_;\n");
+    fprintf(o, "          if (JS_VALUE_GET_TAG(%s) == JS_TAG_INT) x_ = JS_VALUE_GET_INT(%s); else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) x_ = JS_VALUE_GET_FLOAT64(%s); else goto %s;\n", a, a, a, a, xl);
+    if (b != NULL)
+      fprintf(o, "          if (JS_VALUE_GET_TAG(%s) == JS_TAG_INT) y_ = JS_VALUE_GET_INT(%s); else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) y_ = JS_VALUE_GET_FLOAT64(%s); else goto %s;\n", b, b, b, b, xl);
+    else fprintf(o, "          y_ = (double)%d;\n", (int)imm);
+    fprintf(o, "          r_ = fmod(x_, y_); t_ = r_ >= -2147483648.0 && r_ <= 2147483647.0 ? (int32_t)r_ : 0;\n");
+    fprintf(o, "          %s = (r_ == (double)t_ && !(t_ == 0 && __builtin_signbit(r_)) && r_ >= -2147483648.0 && r_ <= 2147483647.0) ? JS_MKVAL(JS_TAG_INT, t_) : __JS_NewFloat64(r_); } }\n", dst);
     return 1;
   }
+  fprintf(o, "        { int32_t x_, y_;\n");
   rg_toi32(o, "x_", a, xl, knob);
   if (b != NULL) rg_toi32(o, "y_", b, xl, knob); else fprintf(o, "          y_ = %d;\n", (int)imm);
   switch (sub) {

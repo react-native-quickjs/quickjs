@@ -22,7 +22,7 @@
             fprintf(o, "        { double x_, y_; int ia_ = JS_VALUE_GET_TAG(%sv%d) == JS_TAG_INT, ib_ = JS_VALUE_GET_TAG(%sv%d) == JS_TAG_INT;\n", I->pfx, u0, I->pfx, u1);
             fprintf(o, "          if (ia_ && ib_) {\n");
             if (in->rop == ROP_div) {
-              fprintf(o, "            double d_ = (double)JS_VALUE_GET_INT(%sv%d) / (double)JS_VALUE_GET_INT(%sv%d); int32_t t_ = (int32_t)d_;\n", I->pfx, u0, I->pfx, u1);
+              fprintf(o, "            double d_ = (double)JS_VALUE_GET_INT(%sv%d) / (double)JS_VALUE_GET_INT(%sv%d); int32_t t_ = d_ >= -2147483648.0 && d_ <= 2147483647.0 ? (int32_t)d_ : 0;\n", I->pfx, u0, I->pfx, u1);
               fprintf(o, "            %sv%d = (d_ == (double)t_ && !(t_ == 0 && __builtin_signbit(d_)) && d_ >= -2147483648.0 && d_ <= 2147483647.0) ? JS_MKVAL(JS_TAG_INT, t_) : __JS_NewFloat64(d_);\n", I->pfx, dv);
             } else {
               fprintf(o, "            int64_t r_ = (int64_t)JS_VALUE_GET_INT(%sv%d) %s (int64_t)JS_VALUE_GET_INT(%sv%d);\n", I->pfx, u0, opc, I->pfx, u1);
@@ -71,12 +71,15 @@
         case ROP_binary_imm_s: case ROP_binary_imm:
           /* the additive forms are add_imm_s / sub_imm_s (an int32 result or an exit); a product follows ROP_mul on two ints */
           if (in->narg >= 4 && in->arg[1].kind == 'b' && (int)in->arg[1].val == REG_BIN_MUL && dv >= 0 && u0 >= 0) {
-            int32_t km = (int32_t)in->arg[3].val;
-            if (c->emit)
-              fprintf(o, "        { int64_t r_; if (__builtin_expect(JS_VALUE_GET_TAG(%sv%d) != JS_TAG_INT, 0)) goto %s; r_ = (int64_t)JS_VALUE_GET_INT(%sv%d) * (int64_t)%d;\n"
-                         "          if (r_ == 0 && (JS_VALUE_GET_INT(%sv%d) < 0 || %d < 0)) %sv%d = __JS_NewFloat64(-0.0); else\n"
-                         "          %sv%d = (r_ >= INT32_MIN && r_ <= INT32_MAX) ? JS_MKVAL(JS_TAG_INT, (int32_t)r_) : __JS_NewFloat64((double)r_); }\n",
-                      I->pfx, u0, xl, I->pfx, u0, (int)km, I->pfx, u0, (int)km, I->pfx, dv, I->pfx, dv);
+            /* a product by an int immediate: as the binary op with an int constant (two ints: the int product, -0 and overflow as a double; a double operand: the double product) */
+            if (c->emit) {
+              char a_[24], d_[24];
+              snprintf(a_, sizeof(a_), "%sv%d", I->pfx, u0);
+              snprintf(d_, sizeof(d_), "%sv%d", I->pfx, dv);
+              fprintf(o, "        { JSValue kc_ = JS_MKVAL(JS_TAG_INT, %d);\n", (int)(int32_t)in->arg[3].val);
+              rg_arith(o, REG_BIN_MUL, d_, a_, "kc_", xl);
+              fprintf(o, "        }\n");
+            }
             break;
           }
           if (in->narg >= 4 && in->arg[1].kind == 'b' && (int)in->arg[1].val == REG_BIN_DIV && dv >= 0 && u0 >= 0) {

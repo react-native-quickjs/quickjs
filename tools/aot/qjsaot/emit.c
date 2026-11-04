@@ -78,7 +78,12 @@ int e_has_call_site(const Q2Func *fn) {
    Recursion needs a call site in every function on the cycle, so every cycle
    still polls once per round; loops poll on their back edges; an op call that
    runs JS polls inside the engine. */
-void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
+int region_retslot_real(const char *hex);
+static void e_emit_native_entry_x(FILE *f, const Q2Func *fn, char hex[33], int rs);
+void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) { e_emit_native_entry_x(f, fn, hex, 0); }
+/* `aot_nr_HEX`: the same entry with one more parameter, a block of the caller's frame the function may return its object in (q2_rs_pending, taken by the first statement of the body). */
+void e_emit_native_entry_rs(FILE *f, const Q2Func *fn, char hex[33]) { e_emit_native_entry_x(f, fn, hex, 1); }
+static void e_emit_native_entry_x(FILE *f, const Q2Func *fn, char hex[33], int rs) {
   const JSAotGenFunc *g = fn->g;
   int vc = g->light_var_count;
   int call_site = e_has_call_site(fn);
@@ -102,7 +107,7 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
                    * (nregs > g->reg_count ? nregs - g->reg_count : 0);
   int slots = (need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue);
 
-  e_report_entry(g, hex, 0, call_site, check);
+  if (!rs) e_report_entry(g, hex, 0, call_site, check);
 
   fprintf(
       f,
@@ -113,11 +118,11 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
 
   fprintf(
       f,
-      "E_TEXT %sJSValue aot_n_%s(JSContext *ctx, JSRegRun *caller_f,\n"
+      "E_TEXT %sJSValue aot_n%s_%s(JSContext *ctx, JSRegRun *caller_f,\n"
       "                               JSObject *co, JSValue this_obj,\n"
-      "                               JSValue *argv, int argc)\n"
+      "                               JSValue *argv, int argc%s)\n"
       "{\n",
-      e_linkage(), hex);
+      e_linkage(), rs ? "r" : "", hex, rs ? ", JSValue *rs" : "");
   /* The frame. Over-aligned because the register file inside it is read as
      JSValue and the engine's own frames are 16-byte aligned. */
   fprintf(
@@ -229,9 +234,9 @@ void e_emit_native_entry(FILE *f, const Q2Func *fn, char hex[33]) {
       f,
       "    prev = *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR);\n"
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = (JSRegRun *)nf;\n"
-      "    ret = aot_f_%s(realm, (JSRegRun *)nf, regs, 0);\n"
+      "    %sret = aot_f_%s(realm, (JSRegRun *)nf, regs, 0);\n"
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n",
-      hex);
+      rs ? "q2_rs_pending = rs; " : "", hex);
   /* The frame is the caller's buffer, so the teardown is the release of what
      the variable area owns and nothing else. */
   if (has_var)
@@ -715,6 +720,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
     e_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
   } else if (rc == 0 && g->light_ok && g->light_need <= E_NATIVE_FRAME_MAX) {
     e_emit_native_entry(f, &fn, hex);
+    if (region_retslot_real(hex)) e_emit_native_entry_rs(f, &fn, hex);
     e_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);
   } else if (rc == 0) {
     e_report_func(g, hex, qjs_aot_prof_weight(g->digest), 0);

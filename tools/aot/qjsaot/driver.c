@@ -187,6 +187,10 @@ typedef struct {
   unsigned kinds;
   /* The regvm offset of the op that first filled the site, or -1. */
   int pc;
+  /* the fills the engine counted at this site, and the hits of each recorded shape: count > sum(hits) means fills were NOT recorded (a fifth shape, or an unhashed one),
+     so the site's shape set is SATURATED and says nothing about the shapes it did not keep */
+  unsigned count;
+  unsigned hits[PROF_MAX_SHAPES];
 } ProfSite;
 
 /* A `W` record: the shape of the objects the instruction at `pc` defined, as a
@@ -918,10 +922,15 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           const char *kd = strstr(line + 2, "kinds=");
           if (kd) ps->kinds |= (unsigned)strtoul(kd + 6, NULL, 10);
         }
+        {
+          const char *cd = strstr(line + 2, " count=");
+          if (cd) ps->count += (unsigned)strtoul(cd + 7, NULL, 10);
+        }
         for (k = 0; k < nshapes; k++) {
           char key[24];
           char *s;
           uint64_t sh;
+          unsigned hv;
           snprintf(key, sizeof(key), "shape%d=", k);
           s = strstr(line + 2, key);
           if (!s) continue;
@@ -929,12 +938,17 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
              16 while the record held an address, and reading an index as hex
              silently mapped every site to the wrong shape. */
           sh = strtoull(s + strlen(key), NULL, 10);
+          {
+            const char *hp = strstr(s, " hits=");
+            hv = hp != NULL ? (unsigned)strtoul(hp + 6, NULL, 10) : 0;
+          }
           for (j = 0; j < ps->nshapes; j++)
             if (ps->shape[j] == sh) break;
-          if (j < ps->nshapes) continue;
+          if (j < ps->nshapes) { ps->hits[j] += hv; continue; }
           if (ps->nshapes < PROF_MAX_SHAPES) {
             char skey[24];
             char *ss;
+            ps->hits[ps->nshapes] = hv;
             ps->slot[ps->nshapes] = -1;
             snprintf(skey, sizeof(skey), "slot%d=", k);
             ss = strstr(line + 2, skey);
@@ -1378,6 +1392,62 @@ void qjs_aot_prof_site_dump(const uint8_t dg[16], const char *tag) {
   }
 }
 
+int qjs_aot_prof_access_shapes(const uint8_t dg[16], int pc, int which, const char *name, int write, QjsAotSiteShapes *out) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k, f, n = 0, sel[8], j;
+  unsigned sum = 0;
+  const ProfSite *ps;
+  int why = getenv("QJS_AOT_REGION_WHY") != NULL;
+  memset(out, 0, sizeof(*out));
+  if (!e || g_shapes == NULL) return 0;
+  /* the sites whose first fill was at this pc, in site order (the k-th property access in source order) */
+  for (i = 0; i < e->nsites && n < 8; i++) if (e->sites[i].pc == pc && e->sites[i].nshapes > 0) sel[n++] = i;
+  if (which < 0 || which >= n) { if (why) { fprintf(stderr, "why: site pc %d .%s: profile has %d record(s) there, wanted #%d; sites:", pc, name, n, which); for (i = 0; i < e->nsites; i++) fprintf(stderr, " %d(%d)", e->sites[i].pc, e->sites[i].nshapes); fprintf(stderr, "\n"); } return 0; }
+  ps = &e->sites[sel[which]];
+  for (k = 0; k < ps->nshapes; k++) sum += ps->hits[k];
+  out->saturated = ps->count != sum;
+  /* hottest first (stable on the profile's own order) */
+  for (k = 0; k < ps->nshapes; k++) {
+    const ProfShape *sh = prof_shape_by_id((int)ps->shape[k]);
+    int idx = -1, d = out->n, t;
+    if (sh == NULL || (sh->proto != 1 && sh->proto != 2) || sh->isproto || sh->nprops != sh->nfields || sh->nfields > 32 || sh->nfields < 1) { if (why) fprintf(stderr, "why: site pc %d .%s: shape %d unusable (proto %d isproto %d nprops %d nfields %d)\n", pc, name, (int)ps->shape[k], sh ? sh->proto : -1, sh ? sh->isproto : -1, sh ? sh->nprops : -1, sh ? sh->nfields : -1); return 0; }
+    for (f = 0; f < sh->nfields; f++) {
+      if (sh->field[f] == NULL || strlen(sh->field[f]) >= 40 || sh->flags[f] != 7) { if (why) fprintf(stderr, "why: site pc %d .%s: shape %d has a non-plain field\n", pc, name, (int)ps->shape[k]); return 0; }
+      if (idx < 0 && strcmp(sh->field[f], name) == 0) idx = f;
+    }
+    if (idx < 0 && (write || sh->proto != 1)) { if (why) fprintf(stderr, "why: site pc %d .%s: shape %d lacks the field\n", pc, name, (int)ps->shape[k]); return 0; }
+    /* a read the object's prototype answers (the field is a default there): slot -1 */
+    if (!write && ps->slot[k] >= 0 && ps->slot[k] != idx) { if (why) fprintf(stderr, "why: site pc %d .%s: profile slot %d != field index %d (site mapping)\n", pc, name, ps->slot[k], idx); return 0; }
+    for (t = 0; t < d; t++) {
+      if (out->nf[t] != sh->nfields) continue;
+      for (f = 0; f < sh->nfields && strcmp(out->f[t][f], sh->field[f]) == 0; f++) {}
+      if (f == sh->nfields && out->pk[t] == sh->pk && out->proto[t] == sh->proto) break;
+    }
+    if (t < d) { out->hits[t] += ps->hits[k]; continue; }
+    out->pk[d] = sh->pk;
+    out->proto[d] = sh->proto;
+    snprintf(out->digest[d], 33, "%s", sh->proto == 1 ? sh->digest : "");
+    out->nf[d] = sh->nfields;
+    for (f = 0; f < sh->nfields; f++) snprintf(out->f[d][f], 40, "%s", sh->field[f]);
+    out->slot[d] = idx;
+    out->hits[d] = ps->hits[k];
+    out->n++;
+  }
+  /* hottest first: a stable insertion sort on hits */
+  for (i = 1; i < out->n; i++) {
+    for (j = i; j > 0 && out->hits[j] > out->hits[j - 1]; j--) {
+      unsigned long long pk_ = out->pk[j]; unsigned h_ = out->hits[j]; int nf_ = out->nf[j], sl_ = out->slot[j], pr_ = out->proto[j];
+      char dg_[33], f_[32][40];
+      memcpy(dg_, out->digest[j], 33); memcpy(f_, out->f[j], sizeof(f_));
+      out->proto[j] = out->proto[j - 1]; out->proto[j - 1] = pr_; out->pk[j] = out->pk[j - 1]; out->hits[j] = out->hits[j - 1]; out->nf[j] = out->nf[j - 1]; out->slot[j] = out->slot[j - 1];
+      memcpy(out->digest[j], out->digest[j - 1], 33); memcpy(out->f[j], out->f[j - 1], sizeof(f_));
+      out->pk[j - 1] = pk_; out->hits[j - 1] = h_; out->nf[j - 1] = nf_; out->slot[j - 1] = sl_;
+      memcpy(out->digest[j - 1], dg_, 33); memcpy(out->f[j - 1], f_, sizeof(f_));
+    }
+  }
+  return out->n > 0;
+}
+
 /* The slot each observed shape put this site's atom in, -1 when the profile did
    not record one. Two shapes with the same slot give a contracted site one
    constant offset, which is what lets a polymorphic site read a single slot. */
@@ -1420,6 +1490,9 @@ typedef struct ELayoutInfo {
    number kept, in `out` (at most E_LAYOUT_MAX), and reports the refusals. */
 void region_dry_collect(const Q2Func *root, const char hex[33], int fi);
 int region_needs_ctor(const char *name);
+unsigned region_lent_real(const char *hex);
+int region_retslot_real(const char *hex);
+int region_lent_verify(void);
 int region_needs_digest(const char *hex);
 int region_class_path(char (*names)[40], int nn, char *out, size_t cap);
 static int g_rg_dry_done;
@@ -5514,6 +5587,12 @@ int qjsaot_driver_main(int argc, char **argv) {
        the new shape fits the slots the object has (no growth), the object is extensible
        and not exotic or watched; the old shape is dropped by count and only while another
        reference holds it, so nothing is freed here. */
+    /* An add that has just made an object take a contracted layout's shape: the engine's claim check over the filled object (a violated promise breaks the layout,
+       as in the engine's own add). QJS_AOT_ADDCLAIMKNOCK drops it, for the negative control only. */
+    if (getenv("QJS_AOT_ADDCLAIMKNOCK") != NULL)
+      fprintf(f, "#define Q2_ADD_FILLED(ctx_, obj_, nsh_) ((void)0)\n");
+    else
+      fprintf(f, "#define Q2_ADD_FILLED(ctx_, obj_, nsh_) do { if (__builtin_expect(Q2_ENTERS_LAYOUT((const unsigned char *)(nsh_)), 0)) qjs_aot_object_filled(ctx_, obj_); } while (0)\n");
     fprintf(
         f,
         "static inline __attribute__((always_inline)) int "
@@ -5538,7 +5617,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      (uint16_t)*(const uint32_t *)(*(const unsigned char *const *)((const unsigned char *)ctx +\n"
         "          QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_IC_EPOCH)) return 0;\n"
         "  nsh = (unsigned char *)holders[ns + (uint32_t)site];\n"
-        "  if (Q2_ENTERS_LAYOUT(nsh)) return 0;\n"
+        "  if (Q2_ENTERS_LAYOUT(osh)) return 0;\n"
         "  npsz = *(const int *)(nsh + QJS_AOT_OFF_JSSHAPE_PROP_SIZE);\n"
         "  if (npsz != *(const int *)(osh + QJS_AOT_OFF_JSSHAPE_PROP_SIZE) &&\n"
         "      (unsigned)npsz > ((fl & QJS_AOT_JSOBJECT_INLINE_CAP_MASK) >> QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT)) return 0;\n"
@@ -5550,6 +5629,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  --*(int *)(osh - QJS_AOT_RC_BACK);\n"
         "  q2_dup(v);\n"
         "  *slot = v;\n"
+        /* an add that lands in a contracted layout is checked against the slot claims, as the engine's add does */
+        "  Q2_ADD_FILLED(ctx, recv, nsh);\n"
         "  return 1;\n"
         "}\n");
     fprintf(
@@ -5608,6 +5689,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_PEXIT JS_MKVAL(JS_TAG_UNINITIALIZED, 0)\n"
         "#define Q2_PH_MAX 8192\n"
         "static void *q2_ph[Q2_PH_MAX]; static int q2_phn;\n"
+        "static JSValue *q2_rs_pending;   /* the block of the caller's frame an `aot_nr_` entry hands the region it enters; the region takes it as its first statement */\n"
         "static inline __attribute__((always_inline)) void q2_dup_p(JSValue v) { if (JS_VALUE_HAS_REF_COUNT(v)) ++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK); }\n"
         "#define Q2_FH_MAX 1024\n"
         "static JSRuntime *q2_cc_rt;\n"
@@ -6170,6 +6252,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "}\n\n");
 
+    /* Every body is out: a region that lent a stack object to a callee must find the callee's emitted region taking it (a mismatch is the generator's to report, never an unsound unit). */
+    if (region_lent_verify() > 0) abort();
     /* Forward declarations, so a compiled body can name a callee that is
        emitted later in this file. A call site names the callee's `aot_f_` for
        its identity check and its `aot_n_` for the call, and either may be
@@ -6210,6 +6294,13 @@ int qjsaot_driver_main(int argc, char **argv) {
             hex,
             e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ",
             hex);
+      {
+        /* the parameters this function's region takes as stack blocks lent by its callers */
+        unsigned lm_ = region_lent_real(hex);
+        if (lm_ != 0) fprintf(f, "#define RG_LENT_%s %uu\n", hex, lm_);
+        if (region_retslot_real(hex))
+          fprintf(f, "#define RG_RETSLOT_%s 1\n%sJSValue aot_nr_%s(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int, JSValue *);\n", hex, e_split_on() ? "__attribute__((visibility(\"hidden\"))) " : "static ", hex);
+      }
     }
     fprintf(f, "\n");
     /* The inline forms of the selected functions that have a native entry, before

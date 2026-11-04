@@ -28,6 +28,50 @@ static int rg_nat_effect(const Q2Insn *x) {
          strstr(nm, "iter") || strstr(nm, "gen") || strstr(nm, "class") || strstr(nm, "close") || strstr(nm, "private");
 }
 
+
+/* A function whose run changes nothing a re-run could see twice: it stores nothing, makes no construct, and calls only functions of the same kind (depth-limited). An exit in the middle of a
+   pending method read resumes at the read, so code that sits between the read and the call is re-executed: it may be this kind only. */
+static int rg_fn_pure(const JSAotGenFunc *g, int depth) {
+  Q2Func q;
+  int k, ok = 1;
+  if (g == NULL || depth <= 0) return 0;
+  if (q2_build(g, &q) < 0 || !q.ok) { q2_free(&q); return 0; }
+  for (k = 0; k < q.ninsns && ok; k++) {
+    char nm[64];
+    const Q2Insn *x = &q.insns[k];
+    if (!rg_nat_effect(x)) continue;
+    e_rop_name((uint16_t)x->rop, nm, sizeof(nm));
+    if (strstr(nm, "call_method") != NULL && strstr(nm, "apply") == NULL && x->ndef >= 1) {
+      const JSAotGenFunc *tg[RG_MAXT];
+      int nt = qjs_aot_bundle_targets(g, x->pc, tg, RG_MAXT), t;
+      if (nt <= 0) { ok = 0; break; }
+      for (t = 0; t < nt && ok; t++) ok = rg_fn_pure(tg[t], depth - 1);
+    } else ok = 0;
+  }
+  q2_free(&q);
+  return ok;
+}
+/* Whether instruction k of the caller is code that can run and be seen twice: a call to functions that are all pure is not. */
+static int rg_nat_between(RCtx *c, RInst *I, int k) {
+  const Q2Insn *x = &I->q.insns[k];
+  char nm[64];
+  if (!rg_nat_effect(x)) return 0;
+  e_rop_name((uint16_t)x->rop, nm, sizeof(nm));
+  if (getenv("QJS_AOT_REGION_NOPURE") == NULL && strstr(nm, "call_method") != NULL && x->nuse >= 2 && (int32_t)x->use[0] >= 0 && (int32_t)x->use[0] < I->q.nvalues && I->mname != NULL && I->mname[x->use[0]][0]) {
+    int id_, mg_;
+    if (rg_math_site(c, I, x, I->mname[x->use[0]], &id_, &mg_)) return 0;   /* an inline Math builtin on numbers runs nothing */
+  }
+  if (getenv("QJS_AOT_REGION_NOPURE") == NULL && strstr(nm, "call_method") != NULL && strstr(nm, "apply") == NULL && x->ndef >= 1 && I->g != NULL) {
+    const JSAotGenFunc *tg[RG_MAXT];
+    int nt = qjs_aot_bundle_targets(I->g, x->pc, tg, RG_MAXT), t;
+    if (nt <= 0) { if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: pure: call at pc %d has no targets\n", x->pc); return 1; }
+    for (t = 0; t < nt; t++) if (!rg_fn_pure(tg[t], 3)) { if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: pure: target %d of the call at pc %d (line %d) is not pure\n", t, x->pc, tg[t]->line); return 1; }
+    return 0;
+  }
+  if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: pure: pc %d op %s is an effect (ndef %d)\n", x->pc, nm, x->ndef);
+  return 1;
+}
+
 /* The text of a cached atom: one per site, valid for the runtime that made it (a unit can serve another runtime, which makes its own). */
 static void rg_nat_atom(FILE *o, int id, const char *name) {
   fprintf(o, "        static JSRuntime *nrt_%d; static JSAtom nat_%d;\n        if (__builtin_expect(nrt_%d != JS_GetRuntime(ctx), 0)) { nat_%d = JS_NewAtom(ctx, ", id, id, id, id);
@@ -50,12 +94,13 @@ static int rg_native_call(RCtx *c, int ii, const char *method, const Q2Insn *cal
   rd = rg_insn_at(&I->q, exit_pc);
   if (rd < 0 || rd >= at) return rg_fail(c, "pc %d: .%s: the method read is not before the call", call->pc, method);
   for (k = rd + 1; k < at; k++)
-    if (rg_nat_effect(&I->q.insns[k])) return rg_fail(c, "pc %d: .%s: code that can run sits between the method read and the call (pc %d)", call->pc, method, I->q.insns[k].pc);
+    if (rg_nat_between(c, I, k)) return rg_fail(c, "pc %d: .%s: code that can run sits between the method read and the call (pc %d)", call->pc, method, I->q.insns[k].pc);
   held_ = (I->ploop || I->curloop) && rg_carried_up(c, ii, (int)call->def[0]);
   ki = rg_cons(c, I->id, call->pc);
   if (ki < 0) return rg_fail(c, "pc %d: too many held values in one region", call->pc);
   c->cons[ki].kind = 2;
   if (!c->emit) { c->opaque = 1; c->nnative++; return 1; }   /* an out-of-line call runs code the region cannot see */
+  rg_mark_eff(c, ii);
   {
     char xr[32], xo[32], rel_[96], rv[48];
     snprintf(rv, sizeof(rv), "%sv%d", I->pfx, recv_val);
@@ -83,7 +128,7 @@ static int rg_native_call(RCtx *c, int ii, const char *method, const Q2Insn *cal
     else fprintf(o, "        { JSValue r_ = JS_Invoke(ctx, %s, nat_%d, %d, av_);\n", rv, call->pc, call->win_n);
     fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { %sRG_FREE_OWNED(); return JS_EXCEPTION; }\n", rg_nat_kn() ? "if (nk_ == 3) { JS_FreeValue(ctx, JS_GetException(ctx)); RG_FREE_OWNED(); return JS_UNDEFINED; } " : "");
     fprintf(o, "          %s; rn_%d = r_; %s = r_; }\n", rel_, ki, resvar);
-    rg_xlabel(c, rg_xit(c, ii, call->next), call->pc, "native-facts", xo, sizeof(xo));
+    rg_xlabel(c, rg_xit_x(c, ii, call->next), call->pc, "native-facts", xo, sizeof(xo));
     fprintf(o, "        if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1), 0)) goto %s;\n", c->hex, xo);
     fprintf(o, "        nd_%d_%d: (void)0;\n    }\n", ii, call->pc);
     reg = I->q.values[call->def[0]].reg;
@@ -124,7 +169,7 @@ static int rg_native_construct(RCtx *c, int ii, const Q2Insn *in, const char *gn
     fprintf(o, "        { JSValue r_ = JS_CallConstructor(ctx, cv_, %d, av_);\n          JS_FreeValue(ctx, cv_);\n", in->win_n);
     fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { %sRG_FREE_OWNED(); return JS_EXCEPTION; }\n", rg_nat_kn() ? "if (nk_ == 3) { JS_FreeValue(ctx, JS_GetException(ctx)); RG_FREE_OWNED(); return JS_UNDEFINED; } " : "");
     fprintf(o, "          %s; rn_%d = r_; %sv%d = r_; }\n", rel_, ki, I->pfx, dv);
-    rg_xlabel(c, rg_xit(c, ii, in->next), in->pc, "native-facts", xo, sizeof(xo));
+    rg_xlabel(c, rg_xit_x(c, ii, in->next), in->pc, "native-facts", xo, sizeof(xo));
     fprintf(o, "        if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1), 0)) goto %s;\n    }\n", c->hex, xo);
     if (I->cur != NULL) {
       int reg = I->q.values[dv].reg;
@@ -168,7 +213,7 @@ static int rg_math_call(RCtx *c, int ii, const char *method, const Q2Insn *call,
   rd = rg_insn_at(&I->q, exit_pc);
   if (rd < 0 || rd >= at) return rg_fail(c, "pc %d: .%s: the method read is not before the call", call->pc, method);
   for (k = rd + 1; k < at; k++)
-    if (rg_nat_effect(&I->q.insns[k])) return rg_fail(c, "pc %d: .%s: code that can run sits between the method read and the call (pc %d)", call->pc, method, I->q.insns[k].pc);
+    if (rg_nat_between(c, I, k)) return rg_fail(c, "pc %d: .%s: code that can run sits between the method read and the call (pc %d)", call->pc, method, I->q.insns[k].pc);
   snprintf(pn[0], 40, "Math");
   snprintf(pn[1], 40, "%s", method);
   q = rg_cp_add(c, pn, 2);

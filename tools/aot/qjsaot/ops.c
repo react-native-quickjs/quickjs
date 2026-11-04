@@ -5400,6 +5400,7 @@ static int emit_typed_fused(
         (t->lb[xv] == E_LB_F64 || t->lb[xv] == E_LB_I32) &&
         (t->lb[yv] == E_LB_F64 || t->lb[yv] == E_LB_I32) &&
         (t->lb[cv] == E_LB_F64 || t->lb[cv] == E_LB_I32) &&
+        (t->lb[dv] != E_LB_I32 || (t->lb[xv] == E_LB_I32 && t->lb[yv] == E_LB_I32)) &&
         (t->lb[xv] == E_LB_F64 || t->lb[yv] == E_LB_F64 ||
          t->lb[cv] == E_LB_F64 || t->lb[dv] == E_LB_F64)) {
       /* Two statements, in the engine's order. */
@@ -5413,6 +5414,18 @@ static int emit_typed_fused(
         else snprintf(cb, sizeof(cb), "(double)i%u", (unsigned)cv);
         if (t->lb[dv] == E_LB_F64) snprintf(mb, sizeof(mb), "d%u", (unsigned)dv);
         else snprintf(mb, sizeof(mb), "(double)i%u", (unsigned)dv);
+        if (t->lb[dv] == E_LB_I32) {
+          /* the product is an int local (an integer product consumed as a double): it is made as an integer, with the overflow and -0 exits of the integer form, and the sum reads it
+             converted (an lvalue cast is not C) */
+          int ovf1 = t->exits == NULL || (t->exits[dv] & E_EX_OVF);
+          int nz1 = t->exits == NULL || (t->exits[dv] & E_EX_NEGZERO);
+          if (ovf1 || nz1) e_sweep_guard(f, "ox", in->pc);
+          fprintf(f, "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n", (unsigned)xv, (unsigned)yv);
+          if (ovf1) fprintf(f, "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) goto ox_%d;\n", in->pc);
+          if (nz1) fprintf(f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) goto ox_%d;\n", (unsigned)xv, (unsigned)yv, in->pc);
+          fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)dv);
+          if (ovf1 || nz1) e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+        } else
         fprintf(f, "    %s = %s * %s;\n", mb, xb, yb);
         if (c_first)
           fprintf(f, "    d%u = %s %s %s;\n", (unsigned)rv, cb, op, mb);

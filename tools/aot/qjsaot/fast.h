@@ -42,6 +42,8 @@ int qjs_aot_bundle_site_field(int site, const char *name, int *slot, unsigned *c
 int qjs_aot_bundle_site_field_name(int site, int slot, char *out, size_t cap);
 /* the site of `new F()` at (g, pc) when the class has one shape (every context adds the same fields, unconditionally, none later); -1 otherwise */
 int qjs_aot_bundle_alloc_site(const JSAotGenFunc *g, int pc);
+int qjs_aot_bundle_alloc_site_late(const JSAotGenFunc *g, int pc);
+int qjs_aot_bundle_alloc_site_any(const JSAotGenFunc *g, int pc);
 /* the number of writes of global `name` in the bundle (a declaration is one); -1 when unknown */
 int qjs_aot_bundle_global_writes(const char *name);
 int qjs_aot_bundle_const_int(const char *gname, const char *fname, int32_t *out);
@@ -100,5 +102,28 @@ int qjs_aot_bundle_site_ctor_digest(int site, char hex[33]);
 int qjs_aot_bundle_site_late_names(int site, char (*names)[40], int max);
 /* the same, united over the allocation sites of the same constructor and construction-walk fields (the class) */
 int qjs_aot_bundle_class_late_names(int site, char (*names)[40], int max);
+int qjs_aot_bundle_late_count_by_fields(char (*base)[40], int nbase);
+
+/* ---- the shapes one property access saw (the per-site profile set of the dispatch; T13) ----------------------------------------------------------------
+   Unlike QjsAotClassShapes (every shape of a class), this is what the profile saw AT ONE READ/WRITE SITE of one function, hottest first. `saturated`: the engine counted
+   more fills than it recorded (it keeps four shapes per site), so the list is not the site's whole set. Each shape is a constructor-made, hashed, non-prototype shape with
+   plain data properties only (flags 7) and no deleted slot, so (pk, ordered field list) rebuilds it at run time; `slot[i]` is the index of the accessed name in shape i. */
+typedef struct QjsAotSiteShapes {
+  int n, saturated;
+  unsigned long long pk[4];
+  char digest[4][33];
+  int nf[4];
+  int proto[4];             /* 1: a constructor's prototype (digest), 2: Object.prototype (an object literal's shape) */
+  char f[4][32][40];
+  int slot[4];
+  unsigned hits[4];
+} QjsAotSiteShapes;
+/* driver.c: the shapes the profile saw at the `which`-th (0-based) property access of function `dg` at regvm pc `pc` (a chain read has two at one pc), for the field `name`. 1 and
+   the shapes; 0 when the profile has no record or the mapping/shapes cannot be used (the reason is printed under QJS_AOT_REGION_WHY). */
+int qjs_aot_prof_access_shapes(const uint8_t dg[16], int pc, int which, const char *name, int write, QjsAotSiteShapes *out);
+/* bundle.c: the union of the whole-program value classes (K_*) the access at (g, pc, kind) of field `name` reads/stores, and the number of receiver allocation sites; 0 when the access is unknown
+   or a receiver holds an unknown value. */
+int qjs_aot_bundle_receivers_named(const JSAotGenFunc *g, int pc, int kind, const char *name, QjsAotRecvClass *out, int max);   /* qjs_aot_bundle_receivers for the accesses of one field name */
+int qjs_aot_bundle_access_cls(const JSAotGenFunc *g, int pc, int kind, const char *name, unsigned *cls);
 
 #endif

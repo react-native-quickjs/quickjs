@@ -198,6 +198,15 @@ static int rg_ty_transfer(RCtx *c, RInst *I, const Q2Insn *in, int d) {
   RArith ar;
   int u0 = in->nuse >= 1 ? (int)in->use[0] : -1, u1 = in->nuse >= 2 ? (int)in->use[1] : -1, ld = rg_ty_loaddefs(I, in);
   if (ld & (1 << d)) {
+    if (d == 0 && (in->rop == ROP_get_field || in->rop == ROP_get_field_own || in->rop == ROP_get_this_field)) {
+      /* a read of a virtual field is the field's typed local */
+      char vnm_[40];
+      int vfi_ = -1, vki_;
+      if (rg_atom(in, vnm_, sizeof(vnm_))) {
+        vki_ = rg_virt_at(c, I, in->rop == ROP_get_this_field ? -1 : u0, in->rop == ROP_get_this_field, vnm_, &vfi_);
+        if (vki_ >= 0) return c->cons[vki_].vty[vfi_];
+      }
+    }
     if (in->rop == ROP_get_length) return RT_I32;
     return rg_rec_load_ty(&fn->values[in->def[d]]);
   }
@@ -660,6 +669,7 @@ static void rg_emit_load_conv(FILE *o, const RInst *I, int v, const char *src, c
 static int rg_ty_wrap_begin(RCtx *c, RInst *I, const Q2Insn *in, FILE *o) {
   int ld = rg_ty_loaddefs(I, in), d, mask = 0;
   (void)c;
+  g_vty_dv = -1;
   if (ld == 0 || I->ty == NULL) return 0;
   for (d = 0; d < 2 && d < in->ndef; d++) {
     if (!(ld & (1 << d)) || !rg_ty_num(I, (int)in->def[d])) continue;
@@ -676,7 +686,7 @@ static void rg_ty_wrap_end(RCtx *c, RInst *I, const Q2Insn *in, FILE *o, int mas
   int d;
   (void)c;
   if (!mask) return;
-  for (d = 0; d < 2; d++) if (mask & (1 << d)) { char sn[16]; snprintf(sn, sizeof(sn), "ldv%d_", d); rg_emit_load_conv(o, I, (int)in->def[d], sn, xl); }
+  for (d = 0; d < 2; d++) if ((mask & (1 << d)) && (int)in->def[d] != g_vty_dv) { char sn[16]; snprintf(sn, sizeof(sn), "ldv%d_", d); rg_emit_load_conv(o, I, (int)in->def[d], sn, xl); }
   fprintf(o, "        }\n");
   for (d = 0; d < 2; d++) {
     if (!(mask & (1 << d))) continue;
@@ -812,8 +822,23 @@ static int rg_ty_op(RCtx *c, RInst *I, const Q2Insn *in, int dv, int dv2, int u0
 }
 
 /* The expression of edge argument av converted to the type pt of the parameter that takes it. */
+static int g_edge_ovr_n, g_edge_ovr_v[4];   /* the arguments of the edge being written that are another text (an object moved to the heap on it) */
+static int g_edge_ovr_k[4], g_edge_ovr_s[4];   /* the construct whose block the argument may be, and its moved-copy slot */
 static void rg_edge_arg(const RInst *I, int av, int pt, char *buf, size_t cap) {
-  int at = rg_tyof(I, av);
+  int at = rg_tyof(I, av), q;
+  if (pt != RT_I32 && pt != RT_F64) {
+    char e[1024];
+    int any = 0;
+    snprintf(e, sizeof(e), "%sv%d", I->pfx, av);
+    /* the argument is the moved copy when it is the object's block (the migration just before the edge made the copy), else what it was */
+    for (q = 0; q < g_edge_ovr_n; q++) if (g_edge_ovr_v[q] == av) {
+      char t[1024];
+      snprintf(t, sizeof(t), "(JS_VALUE_GET_PTR(%sv%d) == JS_VALUE_GET_PTR(SKV_%d) ? sks_m[%d] : %s)", I->pfx, av, g_edge_ovr_k[q], g_edge_ovr_s[q], e);
+      snprintf(e, sizeof(e), "%s", t);
+      any = 1;
+    }
+    if (any) { snprintf(buf, cap, "%s", e); return; }
+  }
   if (pt == RT_I32) snprintf(buf, cap, "%si%d", I->pfx, av);
   else if (pt == RT_F64 && at == RT_I32) {
     if (rg_f64_knob("QJS_AOT_REGION_F64NOPHICONV")) snprintf(buf, cap, "(%s ? ({ int64_t b_ = %si%d; double d_; __builtin_memcpy(&d_, &b_, 8); d_; }) : (double)%si%d)", RG_KN("NOPHICONV"), I->pfx, av, I->pfx, av);

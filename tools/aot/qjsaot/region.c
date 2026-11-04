@@ -69,6 +69,9 @@ typedef struct RInst {
   int par_dv;             /* the value of the parent's call (or construct) result that this instance's result becomes */
   int cls1;               /* 1 + the allocation site of the receiver class this instance was made for, 0 when the instance serves several classes */
   int owner_g, owner_t;   /* the guard whose receiver is this instance's `this`, and the target it dispatched to */
+  int bsnap[128], bpe[128];   /* per block: the stretch's stub and whether its last op ended it, when the block was left */
+  int snap, prev_eff;     /* the exit stub of the current stretch (the state at its start), and whether the previous op ended it */
+  int eff, ieff;          /* census: the current effect point of this instance, and whether an effect op has run in it since its start */
   int par;                /* the instance whose call (or construct) expanded this one, -1 for the root */
   int par_call_pc, par_pc_after, par_read_pc, par_dst, par_kind, par_cons;  /* in the parent: the pc of the call, the pc after it, the register that receives its result, 1 for a construct (of region object rn_<par_cons>) */
   char co[112];           /* the C expression of this instance's function object (an exit builds its frame from it) */
@@ -98,21 +101,49 @@ typedef struct RGlob { char g[40], f[40]; int obj; } RGlob;   /* obj: the value 
 
 /* A construct (`new F(args)` of a global F) in the region: the object is owned by the region (`rn_K`) until it returns or leaves. */
 #define RG_MAXC 256
-typedef struct RCons { int inst, pc, kind; char gname[48]; char path[4][40]; int npath; const JSAotGenFunc *tg; int nn; char names[16][40]; int site, direct; unsigned seen; int esc; int stack, sk_pair, knock; unsigned pre; int nrbs; char rbs[8][40]; } RCons;   /* stack: lives in the region's C frame (kind 0 object, kind 1 array); sk_pair: the cons index of its array / its object, else -1 */
+typedef struct RCons { int inst, pc, kind; char gname[48]; char path[4][40]; int npath; const JSAotGenFunc *tg; int nn; char names[16][40]; int site, direct, fwd; unsigned seen; int esc; int stack, sk_pair, knock, ss, late, nmat, mat[4][5]; unsigned pre; int nrbs; char rbs[8][40]; int chi, par, nkvis, kvis[48][2]; char cfield[40]; int nst, stover; short st[64][4]; unsigned fref; int vok, vstore, nvthis, virt; unsigned vcov; short vthis[32][2]; unsigned char vcls[16], vty[16]; int nls, ls[4][4]; int accum, acn, acv[16], accroom, matacc[4], rslot; } RCons;   /* stack: lives in the region's C frame (kind 0 object, kind 1 array); sk_pair: the cons index of its array / its object, else -1; chi: the cons index + 1 of the stack object its field `cfield` holds (a container), par: the cons index + 1 of the container (a child);
+   kvis: the container's aliases (instance, value) the analysis followed, for the reads of `cfield` that would hand out the child */
 
 /* TRUST: a class of the region (AOT-REDESIGN.md, the class table): the allocation site, its constructor's global, and its fields in add order. At the region's first
    entry the init binds it once: the constructor (a fact on the global binding), its prototype (a fact on F.prototype), the class shape built from the prototype and
    the field list (qjs_aot_class_shape, held), and the shape's layout (a dependency of the word: an instance leaving the shape breaks it). Dispatch is a compare of
    the receiver's shape with these, field reads and writes are at the slots of the list; nothing is learned at run time. */
 #define RG_MAXCL 24
+#define RG_MAXSTK 40
+static const Q2Func *g_matdef_fn[16];   /* the results of the moves that make a heap object of a stack object (an origin the region made, for the owned list's compaction) */
+static int g_matdef_v[16], g_nmatdef;
 /* nsh > 1: a class whose instances gain fields late (QJS_AOT_REGION_MSHAPE=1, opt-in): `ms` is its table of up to QJS_AOT_MAXSHAPES profile-observed shapes (fast.h QjsAotClassShapes); shape 0
    is the construction walk's final shape (`nn`/`names` above, rk_s_), the others extend it. nsh is 0 for every other class, whose emission is unchanged. */
 typedef struct RCls { int site; char ctor[48]; int nn; char names[32][40]; int need_layout; int nsh; QjsAotClassShapes ms; } RCls;
+/* The inline slots a constructed object is given: its construction-walk fields and the fields its class gains after (the profile's late adds), 0 when there are none. A size hint for the allocation. */
+static unsigned rg_cons_cap(const RCons *K) {
+  char late[24][40];
+  int nl;
+  if (getenv("QJS_AOT_REGION_NOCAP") != NULL) return 0;
+  nl = K->site > 0 ? qjs_aot_bundle_class_late_names(K->site, late, 24) : qjs_aot_bundle_late_count_by_fields((char (*)[40])K->names, K->nn);
+  return nl > 0 ? (unsigned)(K->nn + nl) : 0u;
+}
 #define RG_MAXGV 8
 #define RG_MAXCP 64
+/* The inline slots a stack object's block is given: the property-array size the engine's shape reaches for the construction walk's fields and for the fields the class gains later (it doubles from 2, so the room is
+   the power of two that holds them; 0 when the engine's inline capacity cannot name it). */
+static unsigned rg_stack_room(const RCons *K) {
+  unsigned cap = K->late ? rg_cons_cap(K) : 0u, room = 2;
+  while (room < (unsigned)K->nn) room *= 2;
+  while (room < cap) room *= 2;
+  if (K->accroom > (int)room) room = (unsigned)K->accroom;   /* the accumulator holds any of the objects that are assigned into it */
+  return room <= 16 ? room : 0;
+}
+
+/* Whether the stack object of construct K is made by copying an image of the block (an object of one class shape with a known room) rather than by the engine's init call. */
+static int rg_img_ok(const RCons *K) {
+  static int v = -1;
+  if (v < 0) v = getenv("QJS_AOT_REGION_NOIMG") == NULL;
+  return v && K->stack && K->kind == 0 && K->direct && !K->rslot && rg_stack_room(K) > 0;
+}
 
 /* An exit stub: the root's frame state (`root`, AOT_SET_B lines), and for an exit inside inlined code the chain of inlined frames to materialise (`rest`). */
-typedef struct RXit { int pc, d, rpc; unsigned long long h; char *root, *rest; } RXit;
+typedef struct RXit { int pc, d, rpc, cep, cii; unsigned long long h; char *root, *rest; } RXit;
 typedef struct RStr { char *p; size_t n, cap; } RStr;
 
 typedef struct RCtx {
@@ -127,7 +158,9 @@ typedef struct RCtx {
   RGlob gl[RG_MAXK];
   int ngl;
   RXit *xit;
+  struct { int xi, ep, d, outerok; } *cen; int ncen, cencap, effn; int *effcnt, effcap;   /* census of exits against effect points */
   int nxit, xitcap, bad;
+  int xelig;              /* the walk is at an op whose guards may resume at the stretch start instead of the op */
   char pmn[64][40]; int npmn;   /* the method names the exit stubs re-read (RG_PM): a table, so the text in a cur[] slot is short whatever the name */
   int emit;
   int nsite;
@@ -148,7 +181,7 @@ typedef struct RCtx {
   int ncls;
   char gv[RG_MAXGV][40];  /* TRUST: globals read as values (their atoms are bound at init) */
   int ngv;
-  char cp[RG_MAXCP][4][40];  /* TRUST: constant paths G.f1.f2.f3 (a global and own data properties), bound at init with a fact on every link */
+  char cp[RG_MAXCP][6][40];  /* TRUST: constant paths G.f1.f2.f3 (a global and own data properties), bound at init with a fact on every link */
   int cpn[RG_MAXCP], ncp;
   int cpk[RG_MAXCP]; int32_t cpv[RG_MAXCP];
   int cpi[RG_MAXCP], cpm[RG_MAXCP];   /* a path that must be the engine's intrinsic (id + 1, magic): Math.sqrt and the like (inlined) */
@@ -162,9 +195,15 @@ typedef struct RCtx {
   RStr hoist;
   struct { int inst, v; } skal[64]; int nskal;   /* the values that are a stack array (instance, value id) */
   int nstack;                                   /* stack objects (pairs) in this region */
+  int nss, skstride;                            /* the stack slots (objects and their Arrays), and the bytes of one slot's block */
   int loopinl;            /* TRUST: a callee with a loop of its own is expanded in place when it is small and the call has one target (else it is called out of line); the retry without it is region_emit's */
   char hk[256][120]; int hkm[256], nhk;
   char (*invn)[24]; int ninv, invcap; int nmemo;   /* TRUST: a path whose value the bundle shows is one int constant (the code uses it, the init checks it) */
+  /* T13, the per-site profile-set dispatch: the shapes (class table index, ordered field list) the dispatches test against, built at init (rk_dx_); the shape-test CSE: the variable (rgd_N) that
+     holds the matched shape of a value, valid while dsx_ep is the epoch it was made in (an op that may add or delete a field, and every block start, moves the epoch on) */
+  struct RDsh { int k, nn; char names[32][40]; } dsh[48]; int ndsh;
+  unsigned dsx_ep; struct { int inst, base; unsigned ep; int var; } dsx[96]; int ndsx; int ndx;
+  unsigned lent;   /* the parameters of the root that it only reads, so a caller may lend its stack objects to them (rg_lent_mask) */
 } RCtx;
 
 static RCtx *g_rgc;       /* the region being compiled (the field-position query registers the classes it relies on) */
@@ -207,10 +246,26 @@ int region_class_path(char (*names)[40], int nn, char *out, size_t cap) {
   snprintf(out, cap, "%s", g_rg_clreg[found].ctor);
   return 1;
 }
+static int rg_cls_multi(RCls *K) {
+  /* a class that gains fields late: the profile's observed shapes (E1/E2); the base alone, or an ambiguous or over-full table, is not a multi-shape class */
+  char hex[33], late[16][40];
+  int nl, t;
+  if (!qjs_aot_mshape_on() || !qjs_aot_bundle_site_ctor_digest(K->site, hex) || (nl = qjs_aot_bundle_class_late_names(K->site, late, 16)) <= 0) return -1;
+  qjs_aot_prof_class_shapes(hex, K->names, K->nn, late, nl, &K->ms);
+  if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: class %s: profile shapes %d status %d\n", K->ctor, K->ms.n, K->ms.status);
+  if (K->ms.status != QJS_AOT_MS_OK || K->ms.n < 2) return -1;
+  K->nsh = K->ms.n;
+  for (t = 1; t < K->nsh; t++) rg_clreg_add(K->ctor, K->ms.names[t], K->ms.nn[t]);
+  return 0;
+}
 static int rg_cls_add(RCtx *c, int site, const char *ctor, int nfields, int multi) {
   int k = rg_cls_find(c, ctor), j;
   RCls *K;
-  if (k >= 0) return k;
+  if (k >= 0) {
+    /* a class first bound for the per-site dispatch only (multi 2) that a later use needs the shape table of (multi 1) */
+    if (multi == 1 && !c->emit && c->cls[k].nsh == 0 && c->cls[k].ms.n == 0 && c->cls[k].site > 0) { if (rg_cls_multi(&c->cls[k]) == 0) rg_clreg_add(c->cls[k].ctor, c->cls[k].names, c->cls[k].nn); }
+    return k;
+  }
   if (c->emit || ctor == NULL || !ctor[0] || strlen(ctor) >= sizeof(c->cls[0].ctor) || c->ncls >= RG_MAXCL || nfields < 0 || nfields > 32) return -1;
   K = &c->cls[c->ncls];
   memset(K, 0, sizeof(*K));
@@ -218,18 +273,8 @@ static int rg_cls_add(RCtx *c, int site, const char *ctor, int nfields, int mult
   snprintf(K->ctor, sizeof(K->ctor), "%s", ctor);
   for (j = 0; j < nfields; j++) if (!qjs_aot_bundle_site_field_name(site, j, K->names[j], sizeof(K->names[0]))) return -1;
   K->nn = nfields;
-  if (multi) {
-    /* a class that gains fields late: the profile's observed shapes (E1/E2); the base alone, or an ambiguous or over-full table, is not a multi-shape class */
-    char hex[33], late[16][40];
-    int nl, t;
-    if (!qjs_aot_mshape_on() || !qjs_aot_bundle_site_ctor_digest(site, hex) || (nl = qjs_aot_bundle_class_late_names(site, late, 16)) <= 0) return -1;
-    qjs_aot_prof_class_shapes(hex, K->names, K->nn, late, nl, &K->ms);
-    if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: class %s: profile shapes %d status %d\n", K->ctor, K->ms.n, K->ms.status);
-    if (K->ms.status != QJS_AOT_MS_OK || K->ms.n < 2) return -1;
-    K->nsh = K->ms.n;
-    for (t = 1; t < K->nsh; t++) rg_clreg_add(K->ctor, K->ms.names[t], K->ms.nn[t]);
-  }
-  rg_clreg_add(K->ctor, K->names, K->nn);
+  if (multi == 1 && rg_cls_multi(K) < 0) return -1;
+  if (multi != 2) rg_clreg_add(K->ctor, K->names, K->nn);   /* multi 2: a class bound for the per-site shape dispatch only; no layout row is asked for */
   return c->ncls++;
 }
 /* A receiver class qualifies for the table: one shape, a global constructor, all fields known. */
@@ -313,6 +358,7 @@ static void rg_inv_add(RCtx *c, const char *nm) {
 }
 
 static void rs_add(RStr *s, const char *fmt, ...);
+static void rg_lent_assume(const char *callee, const char *caller, unsigned m);
 /* a vkit knock-out: the hoisted reads skip the region-wide check that nothing in the region writes the field / the array */
 static int rg_hoist_nomut(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_REGION_HOISTNOMUT") != NULL; return v; }
 static int rg_hoist_on(RCtx *c) { static int off = -1; if (off < 0) off = getenv("QJS_AOT_REGION_NOHOIST") != NULL; return !off && rg_inv_on(c); }
@@ -684,7 +730,128 @@ static int rg_pend_push(RInst *I, const Q2Func *fn, int ridx, int callee, int ca
   return 1;
 }
 
-static int rg_xit(RCtx *c, int ii, int pc) {
+static int rg_insn_at(const Q2Func *fn, int pc);
+/* Whether value v of fn is used by instruction k or after it (the instruction a generic body resumes at runs first). */
+static int rg_blk_uses(const Q2Func *fn, const Q2Block *B, int from, Q2ValueId v) {
+  int j, u, si;
+  for (j = from; j < B->first_insn + B->ninsns; j++) {
+    const Q2Insn *in = &fn->insns[j];
+    for (u = 0; u < in->nuse; u++) if (in->use[u] == v) return 1;
+    for (u = 0; u < in->win_n && in->win_val != NULL; u++) if (in->win_val[u] == v) return 1;
+  }
+  for (si = 0; si < B->nsucc; si++)
+    for (j = 0; j < B->nedge_args[si]; j++) if (B->edge_arg[si][j] == v) return 1;
+  return 0;
+}
+/* Whether value v (held in register `reg`) is still needed when the code resumes at instruction index `from` of its block: it is read in the rest of the block, or on an edge out of
+   it, or in ANY block reachable from the block's successors (a value is defined once, so a read down any path is a read of this value; a block only lists the values it reads itself, so
+   a value passed through blocks that do not read it, a loop bound read by the loop header, is found by walking on). A block that defines v ends the walk on its path: v is made again
+   there before any read. A register live into a reached block (its in_reg) counts too, since the later blocks name a flowing value by their own parameter. A target that leaves the
+   function keeps everything. */
+static int g_lw_param_kill;   /* set: a block parameter is defined afresh at the entry of its block (the walk does not follow it round a loop to its own block) */
+static int rg_live_walk(const Q2Func *fn, int from, Q2ValueId v, int reg) {
+  int b, j, u, si, nst = 0, defblk = -1, found = 0;
+  const Q2Block *B = NULL;
+  int *stack;
+  unsigned char *seen;
+  for (b = 0; b < fn->nblocks; b++) if (from >= fn->blocks[b].first_insn && from < fn->blocks[b].first_insn + fn->blocks[b].ninsns + 1) { B = &fn->blocks[b]; break; }
+  if (B == NULL) return 1;
+  for (j = from; j < B->first_insn + B->ninsns; j++) {
+    const Q2Insn *in = &fn->insns[j];
+    for (u = 0; u < in->nuse; u++) if (in->use[u] == v) return 1;
+    for (u = 0; u < in->win_n && in->win_val != NULL; u++) if (in->win_val[u] == v) return 1;
+  }
+  if ((int32_t)v >= 0 && (int32_t)v < fn->nvalues && fn->values[v].insn >= 0) {
+    int di = fn->values[v].insn;
+    for (b = 0; b < fn->nblocks; b++) if (di >= fn->blocks[b].first_insn && di < fn->blocks[b].first_insn + fn->blocks[b].ninsns) { defblk = b; break; }
+  } else if (g_lw_param_kill && (int32_t)v >= 0 && (int32_t)v < fn->nvalues && fn->values[v].insn < 0 && fn->values[v].param_of >= 0) defblk = fn->values[v].block;
+  stack = malloc((size_t)(fn->nblocks + 1) * sizeof(int) * 2);
+  seen = calloc((size_t)fn->nblocks + 1, 1);
+  if (stack == NULL || seen == NULL) abort();
+  for (si = 0; si < B->nsucc; si++) {
+    for (j = 0; j < B->nedge_args[si]; j++) if (B->edge_arg[si][j] == v) { found = 1; goto done; }
+    if (B->succ_block[si] < 0 || B->succ_block[si] >= fn->nblocks) { found = 1; goto done; }
+    stack[nst++] = B->succ_block[si];
+  }
+  while (nst > 0) {
+    const Q2Block *T = &fn->blocks[stack[--nst]];
+    int tb = (int)(T - fn->blocks);
+    if (seen[tb]) continue;
+    seen[tb] = 1;
+    if (g_lw_param_kill && tb == defblk) continue;
+    for (j = 0; j < T->nlive_in; j++) if (T->in_val[j] == v || T->in_reg[j] == reg) { found = 1; goto done; }
+    if (tb == defblk) continue;
+    for (j = T->first_insn; j < T->first_insn + T->ninsns; j++) {
+      const Q2Insn *in = &fn->insns[j];
+      for (u = 0; u < in->nuse; u++) if (in->use[u] == v) { found = 1; goto done; }
+      for (u = 0; u < in->win_n && in->win_val != NULL; u++) if (in->win_val[u] == v) { found = 1; goto done; }
+    }
+    for (si = 0; si < T->nsucc; si++) {
+      for (j = 0; j < T->nedge_args[si]; j++) if (T->edge_arg[si][j] == v) { found = 1; goto done; }
+      if (T->succ_block[si] < 0 || T->succ_block[si] >= fn->nblocks) { found = 1; goto done; }
+      if (nst < fn->nblocks * 2) stack[nst++] = T->succ_block[si];
+    }
+  }
+done:
+  free(stack);
+  free(seen);
+  return found;
+}
+static int rg_live_from(const Q2Func *fn, int k, Q2ValueId v, int reg) { return rg_live_walk(fn, k, v, reg); }
+/* The registers of instance X an exit that resumes X's generic body at `pc` must write: those whose current value is still used from that instruction on. A register whose current value is
+   not a plain SSA name of X (a pending-pair text, a constant) is always written. QJS_AOT_REGION_NOLIVEEXIT=1 writes every register as before. */
+static void rg_exit_keep(const RInst *X, int pc, uint8_t keep[256]) {
+  int r, idx = -1;
+  size_t pl = strlen(X->pfx);
+  memset(keep, 1, 256);
+  if (getenv("QJS_AOT_REGION_NOLIVEEXIT") != NULL || X->g == NULL) return;
+  idx = rg_insn_at(&X->q, pc);
+  if (idx < 0) return;
+  for (r = 0; r < 256; r++) {
+    const char *t = X->cur[r];
+    char *e;
+    long v;
+    if (!t[0]) { keep[r] = 0; continue; }
+    if (strncmp(t, X->pfx, pl) != 0 || t[pl] != 'v') continue;
+    v = strtol(t + pl + 1, &e, 10);
+    if (*e != 0 || e == t + pl + 1 || v < 0 || v >= X->q.nvalues) continue;
+    keep[r] = (uint8_t)rg_live_from(&X->q, idx, (Q2ValueId)v, r);
+  }
+}
+
+static void rg_cen_rec(RCtx *c, int xi, int ep, int d, int ok) {
+  if (getenv("QJS_AOT_REGION_EPCENSUS") == NULL) return;
+  if (c->ncen >= c->cencap) { c->cencap = c->cencap ? c->cencap * 2 : 4096; c->cen = realloc(c->cen, (size_t)c->cencap * sizeof(c->cen[0])); if (c->cen == NULL) abort(); }
+  c->cen[c->ncen].xi = xi; c->cen[c->ncen].ep = ep; c->cen[c->ncen].d = d; c->cen[c->ncen].outerok = ok; c->ncen++;
+}
+
+/* census: a new effect point of instance I at pc, with the number of distinct values an exit resuming there would name */
+static void rg_cen_point(RCtx *c, RInst *I, int pc) {
+  uint8_t keep[256];
+  int r, q, n = 0;
+  if (getenv("QJS_AOT_REGION_EPCENSUS") == NULL || I->cur == NULL) return;
+  rg_exit_keep(I, pc, keep);
+  for (r = 0; r < 256; r++) {
+    if (!I->cur[r][0] || !keep[r]) continue;
+    for (q = 0; q < r; q++) if (keep[q] && strcmp(I->cur[q], I->cur[r]) == 0) break;
+    if (q == r) n++;
+  }
+  c->effn++;
+  if (c->effn >= c->effcap) { c->effcap = c->effcap ? c->effcap * 2 : 4096; c->effcnt = realloc(c->effcnt, (size_t)c->effcap * sizeof(int)); if (c->effcnt == NULL) abort(); }
+  c->effcnt[c->effn] = n;
+  I->eff = c->effn;
+}
+
+/* The accumulator the root returns, when the root may fill a shell its caller gives (QJS_AOT_REGION_RETSLOT=1): its construct, else -1. */
+static int rg_retslot_on(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_REGION_RETSLOT") != NULL && getenv("QJS_AOT_REGION_NORETSLOT") == NULL; return v; }
+static int rg_acc_cons(const RCtx *c) {
+  int k;
+  for (k = 0; k < c->ncons; k++) if (c->cons[k].stack && c->cons[k].accum) return k;
+  return -1;
+}
+static int rg_has_retslot(const RCtx *c) { return rg_retslot_on() && rg_acc_cons(c) >= 0; }
+static int rg_skf(const RCtx *c) { return c->nstack > 0 || c->lent != 0; }
+static int rg_xit_x(RCtx *c, int ii, int pc) {
   int chain[16], d = 0, k, i, j, r, rpc, total = 0, off, nlv;
   RInst *I0 = c->in[0], *C1 = NULL;
   RStr rt = {0}, rs = {0};
@@ -698,22 +865,24 @@ static int rg_xit(RCtx *c, int ii, int pc) {
   for (i = 0; i < d / 2; i++) { k = chain[i]; chain[i] = chain[d - 1 - i]; chain[d - 1 - i] = k; }
   if (d > 0) C1 = c->in[chain[0]];
   rpc = d ? C1->par_pc_after : pc;
+  if (c->lent != 0) rs_add(&rt, "    (void)RG_BORP();\n");   /* a block lent to this function moves to the heap before any name below is read */
   if (c->nstack > 0) {
     /* a stack object alive at this exit moves to the heap first (its references move: qjs_aot_stack_migrate); sk_ho / sk_ha are the heap object and Array, and every
        name below is read through SKFIX, which maps a stack block to them. The region then owns the heap objects in rnh_ (freed with the rest at the stub's end);
        AOT_SET_B takes the frame's own reference to each name, as for any other object. */
     int k0;
+    /* a virtual object's fields are written into its block before anything reads the block */
+    if (getenv("QJS_AOT_REGION_VIRTKNOCK") == NULL)
+      for (k0 = 0; k0 < c->ncons; k0++) if (c->cons[k0].virt) {
+        int j0;
+        if (getenv("QJS_AOT_REGION_VFCHECK") != NULL) rs_add(&rt, "    if (sk_%d) rg_vmat_%s_%d(ctx, skb_%d, vs_%d", k0, c->hex, k0, k0, k0);
+        else rs_add(&rt, "    if (vk_%d) { sk_%d = 1; vk_%d = 0; rg_vmat_%s_%d(ctx, skb_%d, vs_%d", k0, k0, k0, c->hex, k0, k0, k0);
+        for (j0 = 0; j0 < c->cons[k0].nn; j0++) rs_add(&rt, ", vf_%d_%d", k0, j0);
+        rs_add(&rt, getenv("QJS_AOT_REGION_VFCHECK") != NULL ? ");\n" : "); }\n");
+      }
     /* the vkit knock-out build (QJS_AOT_REGION_NOMIGRATE at generation): the stub migrates unless the run sets QJS_AOT_REGION_MIGKNOCK, which leaves the stack object un-migrated */
     if (getenv("QJS_AOT_REGION_NOMIGRATE") != NULL) rs_add(&rt, "    if (!getenv(\"QJS_AOT_REGION_MIGKNOCK\")) {\n");
-    for (k0 = 0; k0 < c->ncons; k0++)
-      if (c->cons[k0].stack && c->cons[k0].kind == 0) {
-        int k1 = c->cons[k0].sk_pair;
-        if (k1 >= 0)
-          rs_add(&rt, "    if (sk_%d || sk_%d) {\n      if (!qjs_aot_stack_migrate(ctx, sk_%d ? SKV_%d : JS_UNDEFINED, sk_%d ? SKV_%d : JS_UNDEFINED, &sk_ho, &sk_ha)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n      rnh_%d = sk_ho; rnh_%d = sk_ha; sk_%d = 0; sk_%d = 0;\n    }\n",
-                  k0, k1, k0, k0, k1, k1, k0, k1, k0, k1);
-        else
-          rs_add(&rt, "    if (sk_%d) {\n      if (!qjs_aot_stack_migrate(ctx, SKV_%d, JS_UNDEFINED, &sk_ho, &sk_ha)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n      rnh_%d = sk_ho; sk_%d = 0;\n    }\n", k0, k0, k0, k0);
-      }
+    rs_add(&rt, "    if (!rg_skm_%s(ctx, &sks_b[0][0], sks_on, sks_h)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n", c->hex);
     if (getenv("QJS_AOT_REGION_NOMIGRATE") != NULL) rs_add(&rt, "    }\n");
   }
   /* the pairs still pending in the arguments (`a.f(b.g(x))`): each one's callee and receiver registers get their values for this exit (the callee read again from the receiver, the
@@ -729,7 +898,7 @@ static int rg_xit(RCtx *c, int ii, int pc) {
       for (pj = 0; pj < X->npend; pj++) {
         struct RPend *e = &X->pend[pj];
         int innermost = (ci < 0 && d == 0) || (ci == d - 1 && d > 0);
-        if (e->end <= X->curidx + 1) continue;
+        if (e->end <= X->curidx + (getenv("QJS_AOT_REGION_NOCALLPAIR") != NULL ? 1 : 0)) continue;   /* an exit at the call itself resumes there: its callee and receiver are still needed */
         if (innermost && e->pc == pc) continue;
         if (npm + 2 > 24) { c->bad = 1; break; }
         if (e->creg >= 0) {
@@ -745,29 +914,33 @@ static int rg_xit(RCtx *c, int ii, int pc) {
       }
     }
   }
-  for (r = 0; r < 256; r++) if (I0->cur[r][0]) rs_add(&rt, c->nstack > 0 ? "    AOT_SET_B(ctx, fr, %d, SKFIX(%s));\n" : "    AOT_SET_B(ctx, fr, %d, %s);\n", r * 16, I0->cur[r]);
+  uint8_t keep0[256], keepj[16][256];
+  int cen_ok, cen_ep;
+  rg_exit_keep(I0, rpc, keep0);
+  for (j = 0; j < d; j++) rg_exit_keep(c->in[chain[j]], j + 1 < d ? c->in[chain[j + 1]]->par_pc_after : pc, keepj[j]);
+  for (r = 0; r < 256; r++) if (I0->cur[r][0] && keep0[r]) rs_add(&rt, rg_skf(c) ? "    AOT_SET_B(ctx, fr, %d, SKFIX(%s));\n" : "    AOT_SET_B(ctx, fr, %d, %s);\n", r * 16, I0->cur[r]);
   if (d > 0) {
     for (j = 0; j < d; j++) {
       RInst *J = c->in[chain[j]];
       nlv = 0;
-      for (r = 0; r < 256; r++) if (J->cur[r][0]) nlv++;
+      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) nlv++;
       total += 1 + J->nargs + nlv;
     }
     /* a vkit knob: leave at the root's call as the replaying design did (no frames), so the effects the callee had made are made twice */
     rs_add(&rs, "    if (__builtin_expect(rg_nof_%s(), 0)) { RG_FREE_OWNED(); E_RET_G(%s, %d); }\n", c->hex, c->hex, C1->par_read_pc);
     rs_add(&rs, "    {\n      JSValue rr_, dv_[%d]; JSObject *cos_[%d];\n", total, d);
-    if (C1->par_kind == 1) rs_add(&rs, c->nstack > 0 ? "      AOT_SET_B(ctx, fr, %d, SKFIX(rn_%d));\n" : "      AOT_SET_B(ctx, fr, %d, rn_%d);\n", C1->par_dst * 16, C1->par_cons);
+    if (C1->par_kind == 1) rs_add(&rs, rg_skf(c) ? "      AOT_SET_B(ctx, fr, %d, SKFIX(rn_%d));\n" : "      AOT_SET_B(ctx, fr, %d, rn_%d);\n", C1->par_dst * 16, C1->par_cons);
     rs_add(&rs, "      *(const uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_CAP_IP) = *(const uint8_t *const *)(*(uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_B) + QJS_AOT_OFF_FNBC_REGVM_CODE) + %d;\n", C1->par_call_pc);
     off = 0;
     for (j = 0; j < d; j++) {
       RInst *J = c->in[chain[j]];
       int n = 0;
-      rs_add(&rs, c->nstack > 0 && !(J->wrap && getenv("QJS_AOT_REGION_NOWRAPSKFIX") != NULL) ? "      cos_[%d] = %s;\n      dv_[%d] = SKFIX(%s);\n" : "      cos_[%d] = %s;\n      dv_[%d] = %s;\n", j, J->co, off, J->self);   /* NOWRAPSKFIX: a vkit knock-out (a wrapper's slot 0 would hold the stale stack pointer) */
-      for (i = 0; i < J->nargs; i++) rs_add(&rs, c->nstack > 0 ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + i, J->arg[i]);
+      rs_add(&rs, rg_skf(c) && !(J->wrap && getenv("QJS_AOT_REGION_NOWRAPSKFIX") != NULL) ? "      cos_[%d] = %s;\n      dv_[%d] = SKFIX(%s);\n" : "      cos_[%d] = %s;\n      dv_[%d] = %s;\n", j, J->co, off, J->self);   /* NOWRAPSKFIX: a vkit knock-out (a wrapper's slot 0 would hold the stale stack pointer) */
+      for (i = 0; i < J->nargs; i++) rs_add(&rs, rg_skf(c) ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + i, J->arg[i]);
       nlv = 0;
-      for (r = 0; r < 256; r++) if (J->cur[r][0]) { rs_add(&rs, c->nstack > 0 ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + J->nargs + nlv, J->cur[r]); nlv++; }
+      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) { rs_add(&rs, rg_skf(c) ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + J->nargs + nlv, J->cur[r]); nlv++; }
       rs_add(&rs, "      static const uint16_t of_%d[] = {", j);
-      for (r = 0; r < 256; r++) if (J->cur[r][0]) rs_add(&rs, "%s%d", n++ ? ", " : " ", r * 16);
+      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) rs_add(&rs, "%s%d", n++ ? ", " : " ", r * 16);
       if (n == 0) rs_add(&rs, " 0");
       rs_add(&rs, " };\n");
       off += 1 + J->nargs + nlv;
@@ -778,7 +951,7 @@ static int rg_xit(RCtx *c, int ii, int pc) {
       char hx[33];
       rg_hexof(J->g, hx);
       nlv = 0;
-      for (r = 0; r < 256; r++) if (J->cur[r][0]) nlv++;
+      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) nlv++;
       {
         /* a forwarding constructor's frame has its two-slot variable area: slot 0 holds `this` once the put_local_s0 has run, slot 1 is uninitialised once the local_uninit has: by the pc the generic body
            resumes at (static, not a run-time flag). QJS_AOT_REGION_NOWRAPVARS (a vkit knock-out build): the area is not built. */
@@ -790,7 +963,7 @@ static int rg_xit(RCtx *c, int ii, int pc) {
     }
     rs_add(&rs, "      };\n      rr_ = rg_chain_%s(ctx, f, fc_, cos_, dv_, %d);\n", c->hex, d);
     rs_add(&rs, "      if (__builtin_expect(JS_IsException(rr_), 0)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n");
-    if (C1->par_kind == 1) rs_add(&rs, c->nstack > 0 && getenv("QJS_AOT_REGION_NOSKFIXCTOR") == NULL ? "      JS_FreeValue(ctx, rr_); AOT_SET_B(ctx, fr, %d, SKFIX(rn_%d));\n" : "      JS_FreeValue(ctx, rr_); AOT_SET_B(ctx, fr, %d, rn_%d);\n", C1->par_dst * 16, C1->par_cons);   /* a stack object was migrated above: the frame gets the heap object, not the stale stack pointer */
+    if (C1->par_kind == 1) rs_add(&rs, rg_skf(c) && getenv("QJS_AOT_REGION_NOSKFIXCTOR") == NULL ? "      JS_FreeValue(ctx, rr_); AOT_SET_B(ctx, fr, %d, SKFIX(rn_%d));\n" : "      JS_FreeValue(ctx, rr_); AOT_SET_B(ctx, fr, %d, rn_%d);\n", C1->par_dst * 16, C1->par_cons);   /* a stack object was migrated above: the frame gets the heap object, not the stale stack pointer */
     else rs_add(&rs, "      if (JS_VALUE_HAS_REF_COUNT(rr_)) qjs_aot_set_reg_p(ctx, fr, %d, rr_); else AOT_SET_B(ctx, fr, %d, rr_);\n", C1->par_dst * 16, C1->par_dst * 16);
     rs_add(&rs, "    }\n");
   }
@@ -798,13 +971,23 @@ static int rg_xit(RCtx *c, int ii, int pc) {
   /* the stub of a pc is shared by the exits whose frame state is the same (several IR instructions can come from one bytecode op) */
   for (cp = rt.p ? rt.p : ""; *cp; cp++) h = (h ^ (unsigned char)*cp) * 1099511628211ull;
   for (cp = rs.p ? rs.p : ""; *cp; cp++) h = (h ^ (unsigned char)*cp) * 1099511628211ull;
+  cen_ok = 1;
+  if (d > 0) for (j = 0; j < d; j++) if (c->in[chain[j]]->ieff) cen_ok = 0;
+  cen_ep = d > 0 && cen_ok ? I0->eff : c->in[ii]->eff;
   h = (h ^ (unsigned)rpc) * 1099511628211ull;
   for (i = 0; i < c->nxit; i++) {
     x = &c->xit[i];
+    if (getenv("QJS_AOT_REGION_STRETCHBOUND") != NULL && x->cep == cen_ep && x->cii == ii && x->d == d && cen_ep != 0) {
+      /* a measurement of the generated unit's size only: the exits of a stretch share the first one's stub (not a runnable region) */
+      free(rt.p);
+      free(rs.p);
+      return i;
+    }
     if (x->h != h || x->rpc != rpc || x->d != d) continue;
     if (strcmp(x->root, rt.p ? rt.p : "") != 0 || strcmp(x->rest, rs.p ? rs.p : "") != 0) continue;
     free(rt.p);
     free(rs.p);
+    rg_cen_rec(c, i, cen_ep, d, cen_ok);
     return i;
   }
   if (c->nxit >= RG_MAXX) { c->bad = 1; free(rt.p); free(rs.p); return 0; }
@@ -817,10 +1000,37 @@ static int rg_xit(RCtx *c, int ii, int pc) {
   x->pc = pc;
   x->d = d;
   x->rpc = rpc;
+  x->cep = cen_ep;
+  x->cii = ii;
   x->h = h;
   x->root = rt.p ? rt.p : strdup("");
   x->rest = rs.p ? rs.p : strdup("");
+  rg_cen_rec(c, c->nxit, cen_ep, d, cen_ok);
   return c->nxit++;
+}
+
+/* The stretch rule: a guard that fails before the op it belongs to has taken any effect resumes at the start of its stretch, the state taken there, so the stretch's guards share one stub
+   and no value defined inside the stretch is named by an exit; the generic body re-executes the pure ops in between. A stretch starts at a block and after every op that is not
+   shape-neutral (a store, an allocation, a throw, a call made out of line, an inlined call whose body had one of these). QJS_AOT_REGION_NOSTRETCH=1 turns it off; a guard after an effect op
+   (the facts test after a call) names its own pc through rg_xit_x. QJS_AOT_REGION_STRETCHKNOCK=1 (a knock-out build for the test) takes calls made out of line for pure. */
+static int rg_stretch_on(void) {
+  static int off = -1;
+  if (off < 0) off = getenv("QJS_AOT_REGION_NOSTRETCH") != NULL;
+  return !off;
+}
+static int rg_stretch_knock(void) {
+  static int k = -1;
+  if (k < 0) k = getenv("QJS_AOT_REGION_STRETCHKNOCK") != NULL;
+  return k;
+}
+static void rg_mark_eff(RCtx *c, int ii) {
+  if (rg_stretch_knock()) return;
+  c->in[ii]->prev_eff = 1;
+  c->in[ii]->ieff = 1;
+}
+static int rg_xit(RCtx *c, int ii, int pc) {
+  if (c->xelig && rg_stretch_on() && c->in[ii]->snap >= 0) return c->in[ii]->snap;
+  return rg_xit_x(c, ii, pc);
 }
 
 /* In a stats build every exit source gets its own label, counted at the stub, so an exit can be traced to the instruction that took it. */
@@ -833,12 +1043,28 @@ static const char *rg_xlabel(RCtx *c, int xi, int pc, const char *what, char *bu
   return buf;
 }
 
+/* The C test "the shape SH is arm t's": the class's base shape, or (a class that gains fields late) any shape of its table. NULL arm shapes (unbound arms) match nothing. */
+static void rg_arm_eq(RCtx *c, int gi, int t, const char *sh, char *buf, size_t cap) {
+  const RGuard *G = &c->gd[gi];
+  int kk = G->kcls[t];
+  if (!G->crecv && kk >= 0 && kk < c->ncls && c->cls[kk].nsh > 1)
+    snprintf(buf, cap, "(%s == rk_sa_%s_%d[%d] || (rk_sa_%s_%d[%d] != NULL && rg_inx_%s(rk_sx_%s[%d], %d, %s)))", sh, c->hex, gi, t, c->hex, gi, t, c->hex, c->hex, kk, c->cls[kk].nsh, sh);
+  else
+    snprintf(buf, cap, "%s == rk_sa_%s_%d[%d]", sh, c->hex, gi, t);
+}
 typedef struct RWalk {
   char (*cur)[40];        /* the root's current value per register (as C text), NULL inside an inlined instance */
   int root_pc;            /* the root pc exits resume at (the call pair being expanded), -1 at root level */
 } RWalk;
 
-static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root);
+static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root);
+/* Walk an instance; the effects its body took end the caller's stretch (unless the body took none), and the caller's guard rule is back as it was. */
+static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root) {
+  int saved = c->xelig, ok = rg_walk_inst_(c, ii, rootcur, root);
+  c->xelig = saved;
+  if (ii > 0 && c->in[ii]->ieff && c->in[ii]->par >= 0 && c->emit && !rg_stretch_knock()) { c->in[c->in[ii]->par]->prev_eff = 1; c->in[c->in[ii]->par]->ieff = 1; }
+  return ok;
+}
 void qjs_aot_region_dep(const char root_hex[33], const char callee_hex[33]);
 int qjs_aot_pool_num(const JSAotGenFunc *g, uint32_t idx, double *out);
 int qjs_aot_pool_tag(const JSAotGenFunc *g, uint32_t idx);
@@ -918,6 +1144,7 @@ static int rg_trust_field_n(const RInst *I, const Q2Insn *in, int write, const c
       int k = rg_cls_ok(g_rgc, &cl[u]) ? rg_cls_add(g_rgc, cl[u].site, rg_clctor(g_rgc, &cl[u]), cl[u].nfields, 0)
             : (!cl[u].one_shape && rg_clctor(g_rgc, &cl[u])[0] && cl[u].nfields >= 0 && cl[u].nfields <= 32 && qjs_aot_mshape_on()) ? rg_cls_add(g_rgc, cl[u].site, rg_clctor(g_rgc, &cl[u]), cl[u].nfields, 1) : -1;
       if (k < 0) { if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: %s pc %d .%s: class %s not bindable (one_shape %d ctor '%s' nf %d)\n", I->g->name, in->pc, name ? name : "?", cl[u].label, cl[u].one_shape, rg_clctor(g_rgc, &cl[u]), cl[u].nfields); return 0; }
+      if (!rg_cls_ok(g_rgc, &cl[u]) && g_rgc->cls[k].nsh <= 1) return 0;   /* bound for the per-site dispatch only (T13): its fields have no fixed slot */
       if (g_rgc->cls[k].nsh > 1) {
         /* a fixed-slot access to an object of a class with several shapes needs a shape test (the class has no layout the word could depend on): the shape join is the integrator's (E3) */
         if (getenv("QJS_AOT_REGION_MSHAPE_INITONLY") == NULL) { if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: %s pc %d .%s: class %s has %d shapes; a fixed-slot access needs the shape join\n", I->g->name, in->pc, name ? name : "?", cl[u].label, g_rgc->cls[k].nsh); return 0; }
@@ -987,6 +1214,240 @@ static int rg_poly_field(RCtx *c, RInst *I, const Q2Insn *in, const char *name, 
   return 1;
 }
 
+/* ---- T13: the per-site profile-set dispatch -----------------------------------------------------------------------------------------------------------
+   A field access whose receivers are objects of one class that gains fields late (several shapes, so no fixed slot) is a compare of the receiver's shape with the shapes the PROFILE SAW
+   AT THAT SITE, hottest first, each arm reading at that shape's own slot; any other shape leaves (before any effect). The shapes are rebuilt at init from the class's prototype and the
+   ordered field lists (qjs_aot_class_shape, held), so soundness is the shape's: an object whose shape IS the held shape has exactly those plain data properties in that order. A site the
+   profile saturated (it keeps four shapes per site and counted more fills) or whose shapes do not all hold the field is refused (this access only). One test per object per straight-line
+   stretch: the matched shape index is kept in rgd_N, reused until an op that may add or delete a field (or a block start) ends the stretch.
+   QJS_AOT_REGION_NODISP=1 turns it off. */
+typedef struct RDisp { int n, sh[4], slot[4]; unsigned cls; int dcp; } RDisp;
+static int g_disp_quiet;
+static int rg_disp_on(void) { static int off = -1; if (off < 0) off = getenv("QJS_AOT_REGION_NODISP") != NULL; return !off; }
+static int rg_dsh_idx(RCtx *c, int k, const QjsAotSiteShapes *S, int j) {
+  int q, f;
+  for (q = 0; q < c->ndsh; q++) {
+    if (c->dsh[q].k != k || c->dsh[q].nn != S->nf[j]) continue;
+    for (f = 0; f < S->nf[j] && strcmp(c->dsh[q].names[f], S->f[j][f]) == 0; f++) {}
+    if (f == S->nf[j]) return q;
+  }
+  if (c->emit || c->ndsh >= 48) return -1;
+  c->dsh[c->ndsh].k = k;
+  c->dsh[c->ndsh].nn = S->nf[j];
+  for (f = 0; f < S->nf[j]; f++) snprintf(c->dsh[c->ndsh].names[f], 40, "%s", S->f[j][f]);
+  return c->ndsh++;
+}
+/* The constant path `Ctor.prototype.name` (the constructor's own path, then "prototype", then the field): bound and watched at init, so a class prototype's default value or
+   its plain data property is a fact of the region. -1: the path does not fit. */
+static int rg_proto_cp(RCtx *c, const char *ctor, const char *name) {
+  char pn[6][40];
+  const char *p = ctor;
+  int pnn = 0;
+  while (*p && pnn < 4) {
+    const char *e = strchr(p, '.');
+    size_t l = e ? (size_t)(e - p) : strlen(p);
+    if (l == 0 || l >= 40) return -1;
+    memcpy(pn[pnn], p, l); pn[pnn][l] = 0; pnn++;
+    p = e ? e + 1 : p + l;
+  }
+  if (*p || pnn > 3 || strlen(name) >= 40) return -1;
+  snprintf(pn[pnn++], 40, "prototype");
+  snprintf(pn[pnn++], 40, "%s", name);
+  return rg_cp_add(c, pn, pnn);
+}
+/* A store to a field the receiver's class gains late (QJS_AOT_REGION_MSHAPE): per shape of the class table, the slot of an existing field (kind 1) or the add of the field,
+   the constant transition to the table's child shape (kind 2). Any other shape leaves. */
+typedef struct RAdd { int k, n, cp, kind[16], sh[16], slot[16], to[16]; } RAdd;
+static int rg_add_plan(RCtx *c, RInst *I, const Q2Insn *in, const char *name, RAdd *a) {
+  QjsAotRecvClass cl[32];
+  int nr, r, k = -1, t, s, nadd = 0, why = getenv("QJS_AOT_REGION_WHY") != NULL && !g_disp_quiet;
+  const RCls *K;
+  if (!rg_trust_on() || !qjs_aot_mshape_on() || I->g == NULL || name == NULL || qjsaot_region_mode() != 2) return 0;
+  nr = qjs_aot_bundle_receivers_named(I->g, in->pc, 1, name, cl, 32);
+  if (nr < 1) return 0;
+  for (r = 0; r < nr; r++) {
+    const char *ctor = rg_clctor(c, &cl[r]);
+    int kk;
+    if (!ctor[0] || cl[r].nfields < 0 || cl[r].nfields > 32) return 0;
+    kk = rg_cls_add(c, cl[r].site, ctor, cl[r].nfields, 1);
+    if (kk < 0 || (k >= 0 && kk != k)) return 0;
+    k = kk;
+  }
+  K = &c->cls[k];
+  if (K->nsh < 2) return 0;
+  memset(a, 0, sizeof(*a));
+  a->k = k;
+  for (t = 0; t < K->nsh && a->n < 16; t++) {
+    int idx = -1, f;
+    for (f = 0; f < K->ms.nn[t]; f++) if (strcmp(K->ms.names[t][f], name) == 0) { idx = f; break; }
+    if (idx >= 0) { a->kind[a->n] = 1; a->sh[a->n] = t; a->slot[a->n] = idx; a->to[a->n] = -1; a->n++; continue; }
+    for (s = 1; s < K->nsh; s++) if (K->ms.parent[s] == t && strcmp(K->ms.add[s], name) == 0) break;
+    if (s == K->nsh) continue;
+    a->kind[a->n] = 2; a->sh[a->n] = t; a->slot[a->n] = K->ms.nn[t]; a->to[a->n] = s; a->n++; nadd++;
+  }
+  if (a->n == 0) return 0;
+  a->cp = -1;
+  if (nadd > 0) {
+    a->cp = rg_proto_cp(c, K->ctor, name);   /* the prototype holds the field as a plain data property: the add shadows it, no setter runs */
+    if (a->cp < 0) return 0;
+  }
+  if (why) fprintf(stderr, "why: %s pc %d .%s: store into class %s: %d shape arms, %d adds\n", I->g->name, in->pc, name, K->ctor, a->n, nadd);
+  return 1;
+}
+static int rg_disp_plan(RCtx *c, RInst *I, const Q2Insn *in, const char *name, int which, int write, RDisp *d) {
+  QjsAotRecvClass cl[32];
+  QjsAotSiteShapes S;
+  struct { int k; char hex[33]; } grp[8];
+  int ngrp = 0;
+  int nr, j, f, r, why = getenv("QJS_AOT_REGION_WHY") != NULL && !g_disp_quiet;
+  int any_multi = 0, has_lit = 0;
+  if (!rg_trust_on() || !rg_disp_on() || I->g == NULL || name == NULL || qjsaot_region_mode() != 2) return 0;
+  nr = qjs_aot_bundle_receivers_named(I->g, in->pc, write ? 1 : 0, name, cl, 32);
+  if (nr < 1) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: no receivers named (%d)\n", I->g->name, in->pc, name, nr); return 0; }
+  /* the receiver classes, one per constructor (several allocation sites of one constructor and one construction field list are one class) */
+  for (r = 0; r < nr; r++) {
+    const char *ctor = rg_clctor(c, &cl[r]);
+    int g, same = 0;
+    if (!cl[r].one_shape) any_multi = 1;
+    if (!ctor[0] && cl[r].label[0] == '{') { has_lit = 1; continue; }   /* an object literal: its shapes have Object.prototype (bound at init) */
+    if (!ctor[0] || cl[r].nfields < 0 || cl[r].nfields > 32) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: class %s has no bindable constructor\n", I->g->name, in->pc, name, cl[r].label); return 0; }
+    for (g = 0; g < ngrp; g++) {
+      if (strcmp(c->cls[grp[g].k].ctor, ctor) != 0) continue;
+      same = 1;
+      if (cl[r].nfields != c->cls[grp[g].k].nn) return 0;
+      for (f = 0; f < cl[r].nfields; f++) {
+        char a_[40];
+        if (!qjs_aot_bundle_site_field_name(cl[r].site, f, a_, sizeof(a_)) || strcmp(a_, c->cls[grp[g].k].names[f]) != 0) return 0;
+      }
+    }
+    if (same) continue;
+    if (ngrp >= 8) return 0;
+    if (!qjs_aot_bundle_site_ctor_digest(cl[r].site, grp[ngrp].hex)) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: class %s has no constructor digest\n", I->g->name, in->pc, name, ctor); return 0; }
+    grp[ngrp].k = rg_cls_add(c, cl[r].site, ctor, cl[r].nfields, cl[r].one_shape ? 0 : 2);
+    if (grp[ngrp].k < 0) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: class %s not bindable\n", I->g->name, in->pc, name, ctor); return 0; }
+    ngrp++;
+  }
+  /* a site whose receivers are single-shape classes only is the class table's (rg_poly_field) unless its profile saw more shapes: dispatch serves it too, with no layout to depend on */
+  (void)any_multi;
+  if (!qjs_aot_bundle_access_cls(I->g, in->pc, write ? 1 : 0, name, &d->cls)) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: no value class for the access (lost flow)\n", I->g->name, in->pc, name); return 0; }
+  if (!qjs_aot_prof_access_shapes(I->g->digest, in->pc, which, name, write, &S)) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: the profile has no shapes for the access\n", I->g->name, in->pc, name); return 0; }
+  if (S.saturated) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: the site's profile is saturated (%d shapes kept, more seen); this access is generic\n", I->g->name, in->pc, name, S.n); return 0; }
+  for (j = 0; j < S.n; j++) {
+    int g, k = -1;
+    if (S.proto[j] == 2) {
+      if (!has_lit) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: profile shape %d has Object.prototype but no receiver of the analysis is an object literal\n", I->g->name, in->pc, name, j); return 0; }
+      d->sh[j] = rg_dsh_idx(c, -1, &S, j);
+      if (d->sh[j] < 0) return 0;
+      d->slot[j] = S.slot[j];
+      continue;
+    }
+    for (g = 0; g < ngrp && k < 0; g++) {
+      const RCls *K = &c->cls[grp[g].k];
+      if (strcmp(S.digest[j], grp[g].hex) != 0 || S.nf[j] < K->nn) continue;
+      for (f = 0; f < K->nn && strcmp(S.f[j][f], K->names[f]) == 0; f++) {}
+      if (f == K->nn) k = grp[g].k;
+    }
+    if (k < 0) { if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch: profile shape %d is of no receiver class of the analysis\n", I->g->name, in->pc, name, j); return 0; }
+    d->sh[j] = rg_dsh_idx(c, k, &S, j);
+    if (d->sh[j] < 0) return 0;
+    d->slot[j] = S.slot[j];
+  }
+  d->n = S.n;
+  d->dcp = -1;
+  for (j = 0; j < S.n; j++) {
+    if (d->slot[j] >= 0) continue;
+    /* a shape the field is absent from: the read finds the class prototype's value, a constant path Ctor.prototype.name bound and watched at init */
+    if (write || ngrp != 1 || has_lit) return 0;
+    d->dcp = rg_proto_cp(c, c->cls[grp[0].k].ctor, name);
+    if (d->dcp < 0) return 0;
+    break;
+  }
+  if (why) fprintf(stderr, "why: %s pc %d .%s: dispatch on %d profile shape(s)\n", I->g->name, in->pc, name, d->n);
+  return 1;
+}
+/* Whether an op leaves every object's property set as it was (so a matched shape stays matched). */
+static int rg_shape_neutral(int rop) {
+  switch (rop) {
+    case ROP_load_const: case ROP_load_i8: case ROP_load_i32: case ROP_load_undefined: case ROP_load_null: case ROP_load_true: case ROP_load_false: case ROP_load_this:
+    case ROP_move: case ROP_move_xfer: case ROP_get_local: case ROP_put_local: case ROP_get_arg: case ROP_put_arg: case ROP_get_global:
+    case ROP_unary: case ROP_binary: case ROP_binary_imm: case ROP_to_number: case ROP_compare:
+    case ROP_get_field: case ROP_get_field2: case ROP_get_element: case ROP_get_length:
+    case ROP_branch: case ROP_branch_if: case ROP_branch_if_not: case ROP_return: case ROP_return_undefined:
+    case ROP_get_local_field: case ROP_get_arg_field: case ROP_get_local_s0: case ROP_get_local_s1: case ROP_get_local_s2: case ROP_get_local_s3:
+    case ROP_put_local_s0: case ROP_put_local_s1: case ROP_put_local_s2: case ROP_put_local_s3: case ROP_put_local_xfer: case ROP_put_arg_xfer:
+    case ROP_binary_loc_reg: case ROP_binary_reg_loc: case ROP_binary_loc_loc: case ROP_local_rmw_imm:
+    case ROP_branch_cmp_loc_loc: case ROP_branch_cmp_loc_reg: case ROP_branch_cmp_reg_loc: case ROP_branch_cmp_reg_reg: case ROP_branch_cmp_reg_reg_s: case ROP_binary_imm_s: case ROP_branch_s:
+    case ROP_add_imm_s: case ROP_sub_imm_s: case ROP_add_imm_self_s: case ROP_sub_imm_self_s: case ROP_binary_cpool:
+      return 1;
+    default:
+      break;
+  }
+  return rop == ROP_get_field_chain || rop == ROP_get_field_chain_own || rop == ROP_get_field_own || rop == ROP_get_field2_own || rop == ROP_get_this_field || rop == ROP_get_this_field2;
+}
+/* Emit statements (in a block of the caller's) that leave the slot offset of the accessed field in `off_` for the object `val`: from the matched shape of an earlier test of the same object
+   when the stretch is the same, else by comparing the shape with the site's shapes. Any other object leaves through `xl`. */
+static void rg_disp_off(RCtx *c, RInst *I, const char *val, int base, const RDisp *d, const char *xl) {
+  FILE *o = c->o;
+  int j, e = -1, var;
+  for (j = 0; j < c->ndsx; j++) if (c->dsx[j].inst == I->id && c->dsx[j].base == base) { e = j; break; }
+  fprintf(o, "        uint32_t off_;\n");
+  if (e >= 0 && c->dsx[e].ep == c->dsx_ep) {
+    var = c->dsx[e].var;
+    fprintf(o, "        ");
+    for (j = 0; j < d->n; j++) fprintf(o, d->slot[j] < 0 ? "if (rgd_%d == %d) off_ = 0xffffffffu; else " : "if (rgd_%d == %d) off_ = %du * QJS_AOT_SIZEOF_JSPROPERTY; else ", var, d->sh[j], d->slot[j] < 0 ? 0 : d->slot[j]);
+    fprintf(o, "goto %s;\n", xl);
+    return;
+  }
+  if (e >= 0) var = c->dsx[e].var;
+  else {
+    var = c->ndx++;
+    if (c->ndsx < 96) { e = c->ndsx++; c->dsx[e].inst = I->id; c->dsx[e].base = base; c->dsx[e].var = var; }
+  }
+  if (e >= 0) c->dsx[e].ep = c->dsx_ep;
+  fprintf(o, "        const void *sh_;\n        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto %s;\n", val, xl);
+  fprintf(o, "        sh_ = *(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n        ", val);
+  for (j = 0; j < d->n; j++) {
+    if (d->slot[j] < 0) fprintf(o, "if (sh_ == rk_dx_%s[%d]) { off_ = 0xffffffffu; rgd_%d = %d; } else ", c->hex, d->sh[j], var, d->sh[j]);
+    else fprintf(o, "if (sh_ == rk_dx_%s[%d]) { off_ = %du * QJS_AOT_SIZEOF_JSPROPERTY; rgd_%d = %d; } else ", c->hex, d->sh[j], d->slot[j], var, d->sh[j]);
+  }
+  fprintf(o, "goto %s;\n", xl);
+}
+/* a read of the field at the dispatched slot */
+static void rg_disp_read(RCtx *c, RInst *I, const Q2Insn *in, int ii, int xpc, const char *val, int base, const char *dst, const RDisp *d) {
+  char xd[32];
+  int xi;
+  if (!c->emit) return;
+  xi = rg_xit(c, ii, xpc);
+  rg_xlabel(c, xi, in->pc, "disp-miss", xd, sizeof(xd));
+  fprintf(c->o, "        {\n");
+  rg_disp_off(c, I, val, base, d, xd);
+  if (d->dcp >= 0) { char cpt[64]; fprintf(c->o, "        %s = off_ == 0xffffffffu ? %s : *q2_slotp(%s, off_);\n        }\n", dst, rg_cp_text(c, d->dcp, cpt, sizeof(cpt)), val); return; }
+  fprintf(c->o, "        %s = *q2_slotp(%s, off_);\n        }\n", dst, val);
+}
+
+/* Emit statements that leave `off_` (the property's slot offset) and `nsh_` (the held shape an add turns the object into, else NULL) for a store into the object `val`. */
+static void rg_add_off(RCtx *c, const char *val, const RAdd *a, const char *xl) {
+  FILE *o = c->o;
+  int j;
+  fprintf(o, "        uint32_t off_; const void *nsh_ = NULL, *sh_;\n        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto %s;\n", val, xl);
+  fprintf(o, "        sh_ = *(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n        ", val);
+  for (j = 0; j < a->n; j++) {
+    if (a->kind[j] == 1) fprintf(o, "if (sh_ == rk_sx_%s[%d][%d]) off_ = %du * QJS_AOT_SIZEOF_JSPROPERTY; else ", c->hex, a->k, a->sh[j], a->slot[j]);
+    else fprintf(o, "if (sh_ == rk_sx_%s[%d][%d]) { off_ = %du * QJS_AOT_SIZEOF_JSPROPERTY; nsh_ = rk_sx_%s[%d][%d]; } else ", c->hex, a->k, a->sh[j], a->slot[j], c->hex, a->k, a->to[j]);
+  }
+  fprintf(o, "goto %s;\n", xl);
+}
+/* The shape change of an add, before the slot is written: the object takes the new shape (a reference to it, the old one dropped) when it may be extended in place. */
+static void rg_add_swap(RCtx *c, const char *val, const char *xl) {
+  FILE *o = c->o;
+  fprintf(o, "        if (nsh_ != NULL) {\n");
+  fprintf(o, "          unsigned char *ob_ = (unsigned char *)JS_VALUE_GET_PTR(%s); uint16_t fl_ = *(const uint16_t *)(ob_ + QJS_AOT_OFF_JSOBJECT_FLAGS16); int np_ = *(const int *)((const unsigned char *)nsh_ + QJS_AOT_OFF_JSSHAPE_PROP_SIZE);\n", val);
+  fprintf(o, "          if (__builtin_expect((fl_ & (QJS_AOT_JSOBJECT_EXTENSIBLE_MASK | QJS_AOT_JSOBJECT_NOADD_MASK)) != QJS_AOT_JSOBJECT_EXTENSIBLE_MASK, 0)) goto %s;\n", xl);
+  fprintf(o, "          if (__builtin_expect(np_ != *(const int *)((const unsigned char *)sh_ + QJS_AOT_OFF_JSSHAPE_PROP_SIZE) && (unsigned)np_ > ((fl_ & QJS_AOT_JSOBJECT_INLINE_CAP_MASK) >> QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT), 0)) goto %s;\n", xl);
+  /* an object whose inline room is below its shape's property-array size (made without room for the fields it gains) has no slot for the add even when the size does not change */
+  fprintf(o, "          { unsigned ic_ = (fl_ & QJS_AOT_JSOBJECT_INLINE_CAP_MASK) >> QJS_AOT_JSOBJECT_INLINE_CAP_SHIFT; if (__builtin_expect(ic_ != 0 && off_ >= ic_ * QJS_AOT_SIZEOF_JSPROPERTY, 0)) goto %s; }\n", xl);
+  fprintf(o, "          ++*(int *)((unsigned char *)nsh_ - QJS_AOT_RC_BACK); *(const void **)(ob_ + QJS_AOT_OFF_JSOBJECT_SHAPE) = nsh_; --*(int *)((unsigned char *)sh_ - QJS_AOT_RC_BACK);\n        }\n");
+}
 /* The n-th atom operand of an instruction (a chain read has two). */
 static int rg_atom_n(const Q2Insn *in, int which, char *out, size_t cap) {
   int a, seen = 0;
@@ -1051,27 +1512,8 @@ static int rg_find_call(const Q2Func *fn, const Q2Block *B, int k, int v) {
   return -1;
 }
 
-/* Whether block b can run again after it ran (it is in a cycle of the function's own CFG). */
-/* Whether value v of fn is used after instruction k (an index): later in its block, on an edge out of it, or live into a successor. */
-static int rg_live_after(const Q2Func *fn, int k, Q2ValueId v) {
-  int b, j, u, si;
-  const Q2Block *B = NULL;
-  for (b = 0; b < fn->nblocks; b++) if (k >= fn->blocks[b].first_insn && k < fn->blocks[b].first_insn + fn->blocks[b].ninsns) { B = &fn->blocks[b]; break; }
-  if (B == NULL) return 1;
-  for (j = k + 1; j < B->first_insn + B->ninsns; j++) {
-    const Q2Insn *in = &fn->insns[j];
-    for (u = 0; u < in->nuse; u++) if (in->use[u] == v) return 1;
-    for (u = 0; u < in->win_n && in->win_val != NULL; u++) if (in->win_val[u] == v) return 1;
-  }
-  for (si = 0; si < B->nsucc; si++) {
-    const Q2Block *T;
-    for (j = 0; j < B->nedge_args[si]; j++) if (B->edge_arg[si][j] == v) return 1;
-    if (B->succ_block[si] < 0 || B->succ_block[si] >= fn->nblocks) return 1;
-    T = &fn->blocks[B->succ_block[si]];
-    for (j = 0; j < T->nlive_in; j++) if (T->in_val[j] == v) return 1;
-  }
-  return 0;
-}
+/* Whether value v of fn is used after instruction k (an index): later in its block, on an edge out of it, or in any block reachable from it (rg_live_walk). */
+static int rg_live_after(const Q2Func *fn, int k, Q2ValueId v, int reg) { return rg_live_walk(fn, k + 1, v, reg); }
 static int rg_insn_at(const Q2Func *fn, int pc) {
   int i;
   for (i = 0; i < fn->ninsns; i++) if (fn->insns[i].pc == pc) return i;
@@ -1273,6 +1715,7 @@ static int rg_srcok(const Q2Func *fn, int T, Q2ValueId a, uint8_t *seen, int dep
   if (v->insn < 0 || v->insn >= fn->ninsns) return 0;
   {
     const Q2Insn *d = &fn->insns[v->insn];
+    { int q_; for (q_ = 0; q_ < g_nmatdef; q_++) if (g_matdef_fn[q_] == fn && g_matdef_v[q_] == (int)a) return 1; }   /* a heap object made of a stack object of the region */
     if ((d->rop == ROP_move || d->rop == ROP_move_s || d->rop == ROP_move_xfer) && d->nuse >= 1) return rg_srcok(fn, T, d->use[0], seen, depth + 1);
     /* arithmetic and bit operations (the fused increments and branches included) give primitives (a number, a string, a bigint), never an object */
     {
@@ -1340,6 +1783,7 @@ static int rg_cons(RCtx *c, int inst, int pc) {
    its growth path runs no JavaScript, so a miss leaves before any effect. */
 static void rg_amut_note(RCtx *c, const RInst *I, int base);
 static int rg_push(RCtx *c, int ii, const Q2Insn *call, char (*rootcur)[40], const Q2Func *root, int exit_pc) {
+  if (c->emit) rg_mark_eff(c, ii);
   if (!c->emit) { c->arr_mut = 1; rg_amut_note(c, c->in[ii], (int)call->use[1]); }
   RInst *I = c->in[ii];
   int gi = rg_guard(c, I->id, (int)call->use[1], call->pc, 1, "push");
@@ -1348,7 +1792,7 @@ static int rg_push(RCtx *c, int ii, const Q2Insn *call, char (*rootcur)[40], con
   c->gd[gi].intr = 1;
   if (c->emit) {
     char xl2[32];
-    rg_xlabel(c, rg_xit(c, ii, exit_pc), call->pc, "push", xl2, sizeof(xl2));
+    rg_xlabel(c, rg_xit_x(c, ii, exit_pc), call->pc, "push", xl2, sizeof(xl2));
     fprintf(o, "    { /* %s.push() at pc %d */\n", I->pfx, call->pc);
     /* (TRUST: the builtin and the facts that it stays the one found were bound at the region's init) */
     if (!rg_trust_on()) fprintf(o, "      if (__builtin_expect(!rg_sk_%s_%d, 0)) { if (rg_learn_%s_%d(ctx, %sv%u) < 0) goto %s; rg_sk_%s_%d = 1; }\n", c->hex, gi, c->hex, gi, I->pfx, (unsigned)call->use[1], xl2, c->hex, gi);
@@ -1362,6 +1806,8 @@ static int rg_push(RCtx *c, int ii, const Q2Insn *call, char (*rootcur)[40], con
 }
 
 /* Whether the value v of fn, a copy of it or a block parameter it is passed to can be carried over a back edge (so it may be live when the code that made it runs again). */
+static const Q2Func *g_mskip_fn[4];   /* where an object is moved to the heap, left out of a carried test: (kind, a, b, value) = (0, block, successor, argument) of an edge or (1, insn, -, result) of a move */
+static int g_mskip[4][4], g_nmskip;
 static int rg_carried(const Q2Func *fn, Q2ValueId v0) {
   uint8_t *in;
   int changed = 1, i, b, s, j, carried = 0;
@@ -1373,7 +1819,12 @@ static int rg_carried(const Q2Func *fn, Q2ValueId v0) {
     changed = 0;
     for (i = 0; i < fn->ninsns; i++) {
       const Q2Insn *d = &fn->insns[i];
-      if ((d->rop == ROP_move || d->rop == ROP_move_s || d->rop == ROP_move_xfer) && d->nuse >= 1 && d->ndef >= 1 && in[d->use[0]] && !in[d->def[0]]) { in[d->def[0]] = 1; changed = 1; }
+      if ((d->rop == ROP_move || d->rop == ROP_move_s || d->rop == ROP_move_xfer) && d->nuse >= 1 && d->ndef >= 1 && in[d->use[0]] && !in[d->def[0]]) {
+        int q_;
+        for (q_ = 0; q_ < g_nmskip && !(g_mskip_fn[q_] == fn && g_mskip[q_][0] == 1 && g_mskip[q_][1] == i); q_++) {}
+        if (q_ < g_nmskip) continue;
+        in[d->def[0]] = 1; changed = 1;
+      }
     }
     for (b = 0; b < fn->nblocks; b++) {
       const Q2Block *B = &fn->blocks[b];
@@ -1382,6 +1833,11 @@ static int rg_carried(const Q2Func *fn, Q2ValueId v0) {
         const Q2Block *T = &fn->blocks[B->succ_block[s]];
         for (j = 0; j < B->nedge_args[s] && j < T->nparams; j++) {
           if (!in[B->edge_arg[s][j]]) continue;
+          {
+            int q_;
+            for (q_ = 0; q_ < g_nmskip && !(g_mskip_fn[q_] == fn && g_mskip[q_][0] == 0 && g_mskip[q_][1] == b && g_mskip[q_][2] == s && g_mskip[q_][3] == (int)B->edge_arg[s][j]); q_++) {}
+            if (q_ < g_nmskip) continue;
+          }
           if (fn->rpo_pos != NULL && fn->rpo_pos[B->succ_block[s]] <= fn->rpo_pos[b]) carried = 1;
           if (!in[T->param_val[j]]) { in[T->param_val[j]] = 1; changed = 1; }
         }
@@ -1395,6 +1851,7 @@ static int rg_carried(const Q2Func *fn, Q2ValueId v0) {
 /* `arr.pop()`: the element moves out of the array and the region owns it (`rn_K`) until the site runs again or the region ends. That is safe only when the value
    cannot be live when the site runs again: the caller checks, at the root, that it is not carried over a back edge. */
 static int rg_pop(RCtx *c, int ii, const Q2Insn *call, char (*rootcur)[40], const Q2Func *root, int exit_pc) {
+  if (c->emit) rg_mark_eff(c, ii);
   if (!c->emit) { c->arr_mut = 1; rg_amut_note(c, c->in[ii], (int)call->use[1]); }
   RInst *I = c->in[ii];
   /* an element still live when the site runs again (carried over a loop edge) is parked in the owned list, as a construct's object is, instead of released */
@@ -1411,7 +1868,7 @@ static int rg_pop(RCtx *c, int ii, const Q2Insn *call, char (*rootcur)[40], cons
   if (c->emit) {
     char xl2[32], rel_[96];
     snprintf(rel_, sizeof(rel_), held_ ? "rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, rn_%d)" : "JS_FreeValue(ctx, rn_%d)", ki);
-    rg_xlabel(c, rg_xit(c, ii, exit_pc), call->pc, "pop", xl2, sizeof(xl2));
+    rg_xlabel(c, rg_xit_x(c, ii, exit_pc), call->pc, "pop", xl2, sizeof(xl2));
     fprintf(o, "    { /* %s.pop() at pc %d */\n", I->pfx, call->pc);
     if (held_) fprintf(o, "      if (__builtin_expect(rgon_ >= RG_OWNCAP, 0)) goto %s;\n", xl2);
     if (!rg_trust_on()) fprintf(o, "      if (__builtin_expect(!rg_sk_%s_%d, 0)) { if (rg_learn_%s_%d(ctx, %sv%u) < 0) goto %s; rg_sk_%s_%d = 1; }\n", c->hex, gi, c->hex, gi, I->pfx, (unsigned)call->use[1], xl2, c->hex, gi);
@@ -1421,22 +1878,35 @@ static int rg_pop(RCtx *c, int ii, const Q2Insn *call, char (*rootcur)[40], cons
   return 1;
 }
 
+/* The C statement that moves the stack object of construct kq to the heap (its heap object lands in sks_m[ss]) and parks the heap objects in the owned list: with the stack child its
+   field holds when that is alive (qjs_aot_stack_migrate_child), else alone. A failure leaves with the exception. */
+static void rg_mig_stmt(const RCtx *c, int kq, char *buf, size_t cap) {
+  const RCons *Kq = &c->cons[kq];
+  if (Kq->chi > 0) {
+    int cq = Kq->chi - 1;
+    snprintf(buf, cap, "{ JSValue ha_; if (sk_%d) { JSValue hc_; if (!qjs_aot_stack_migrate_child(ctx, SKV_%d, SKV_%d, &sks_m[%d], &hc_)) { RG_FREE_OWNED(); return JS_EXCEPTION; } sk_%d = 0; rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, hc_); } "
+                   "else if (!qjs_aot_stack_migrate(ctx, SKV_%d, JS_UNDEFINED, &sks_m[%d], &ha_)) { RG_FREE_OWNED(); return JS_EXCEPTION; } sk_%d = 0; rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, sks_m[%d]);",
+            cq, kq, cq, Kq->ss, cq, kq, Kq->ss, kq, Kq->ss);
+  } else
+    snprintf(buf, cap, "{ JSValue ha_; if (!qjs_aot_stack_migrate(ctx, SKV_%d, JS_UNDEFINED, &sks_m[%d], &ha_)) { RG_FREE_OWNED(); return JS_EXCEPTION; } sk_%d = 0; rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, sks_m[%d]);", kq, Kq->ss, kq, Kq->ss);
+}
 /* The text that releases the stack object of construct k0 and its Array (a no-op when neither is alive). */
 static void rg_sk_release_text(RCtx *c, int k0, RStr *out) {
   int k1 = c->cons[k0].sk_pair;
   if (k1 >= 0) rs_add(out, "if (sk_%d || sk_%d) { qjs_aot_stack_release(ctx, sk_%d ? SKV_%d : JS_UNDEFINED, sk_%d ? SKV_%d : JS_UNDEFINED); sk_%d = 0; sk_%d = 0; } ", k0, k1, k0, k0, k1, k1, k0, k1);
+  else if (c->cons[k0].fref == 0 && getenv("QJS_AOT_REGION_MASKCHECK") == NULL && getenv("QJS_AOT_REGION_NOINLREL") == NULL) rs_add(out, "if (sk_%d) { rg_skrel0(ctx, SKV_%d); sk_%d = 0; } ", k0, k0, k0);
+  else if (c->cons[k0].fref != ~0u && (c->cons[k0].fref >> 8) == 0 && getenv("QJS_AOT_REGION_MASKCHECK") == NULL && getenv("QJS_AOT_REGION_NOINLREL") == NULL) rs_add(out, "if (sk_%d) { rg_skrelm(ctx, SKV_%d, %uu); sk_%d = 0; } ", k0, k0, c->cons[k0].fref, k0);
+  else if (c->cons[k0].fref != ~0u) rs_add(out, "if (sk_%d) { qjs_aot_stack_release_m(ctx, SKV_%d, %uu); sk_%d = 0; } ", k0, k0, c->cons[k0].fref, k0);
   else rs_add(out, "if (sk_%d) { qjs_aot_stack_release(ctx, SKV_%d, JS_UNDEFINED); sk_%d = 0; } ", k0, k0, k0);
 }
 /* The objects the region's constructs made (`rn_K`) belong to the region until it returns or leaves: whoever kept one took a reference of its own. */
 static void rg_free_owned(RCtx *c, FILE *o, const char *ind) {
   int k;
   for (k = 0; k < c->ncons; k++) {
-    if (c->cons[k].stack) {
-      /* a stack object is released as a pair (its block is the region's frame); once migrated, rnh_K holds the heap object */
-      if (c->cons[k].kind == 0) { RStr t = {0}; rg_sk_release_text(c, k, &t); fprintf(o, "%s%s\n", ind, t.p ? t.p : ""); free(t.p); }
-      fprintf(o, "%sJS_FreeValue(ctx, rnh_%d);\n", ind, k);
-    } else fprintf(o, "%sJS_FreeValue(ctx, rn_%d);\n", ind, k);
+    if (!c->cons[k].stack) fprintf(o, "%sJS_FreeValue(ctx, rn_%d);\n", ind, k);
   }
+  /* the stack blocks are released as pairs (they are the region's frame); once migrated, the heap objects are the region's */
+  if (c->nss > 0) fprintf(o, "%srg_skr_%s(ctx, &sks_b[0][0], sks_on, sks_h);\n", ind, c->hex);
   if (rg_trust_on()) fprintf(o, "%sif (rgon_) rg_own_free(ctx, rgo_, rgon_, rgoc_ > 0);\n", ind);
 }
 
@@ -1534,6 +2004,44 @@ static void rg_emit_cap(RCtx *c, int ii, int pc, FILE *o) {
 
 /* Before an out-of-line call (TRUST): every value a frame on the path still uses after the call (the call itself in instance ii, the call that
    expanded each frame above) is a borrow the callee could free, so each gets a reference held to the region's end. */
+/* The text that makes a virtual stack object's block real (its fields are written from the registers that hold them), as an exit does before it moves anything. */
+static void rg_vmat_text(RCtx *c, int k0, RStr *out) {
+  int j0;
+  if (getenv("QJS_AOT_REGION_VFCHECK") != NULL) rs_add(out, "    if (sk_%d) rg_vmat_%s_%d(ctx, skb_%d, vs_%d", k0, c->hex, k0, k0, k0);
+  else rs_add(out, "    if (vk_%d) { sk_%d = 1; vk_%d = 0; rg_vmat_%s_%d(ctx, skb_%d, vs_%d", k0, k0, k0, c->hex, k0, k0, k0);
+  for (j0 = 0; j0 < c->cons[k0].nn; j0++) rs_add(out, ", vf_%d_%d", k0, j0);
+  rs_add(out, getenv("QJS_AOT_REGION_VFCHECK") != NULL ? ");\n" : "); }\n");
+}
+/* The stack objects lent at the call (instruction `at` of instance ii): their container constructs, and for each the stack child it holds. Before the call a virtual one is made real, the callee
+   reads the blocks; after it a block whose shape is NULL was moved to the heap by the callee (the forward word holds the heap object): the region takes the reference into its owned list and
+   forgets the block. Returns how many were lent; `pre` and `post` get the text, `need` the lent parameters of the callee the call assumes. */
+static int rg_lend_text(RCtx *c, int ii, int at, RStr *pre, RStr *post, unsigned *need) {
+  int ki, m, n = 0;
+  *need = 0;
+  for (ki = 0; ki < c->ncons; ki++) {
+    const RCons *K = &c->cons[ki];
+    if (!K->stack || K->kind != 0) continue;
+    for (m = 0; m < K->nls; m++) {
+      int ch = K->chi > 0 ? K->chi - 1 : -1;
+      if (K->ls[m][0] != ii || K->ls[m][1] != at) continue;
+      if (K->virt || K->sk_pair >= 0) return -1;
+      *need |= 1u << K->ls[m][3];
+      if (ch >= 0 && c->cons[ch].virt) rg_vmat_text(c, ch, pre);
+      if (getenv("QJS_AOT_REGION_BORROWRT") != NULL) {
+        /* the run-time BORROWCHECK: a lent block that is still a block after the call (the callee did not move it) holds exactly the owner's reference: nothing kept it, and the child's either */
+        rs_add(post, "        if (sk_%d && *(const void *const *)((const char *)JS_VALUE_GET_PTR(SKV_%d) + QJS_AOT_OFF_JSOBJECT_SHAPE) != NULL && *(const int *)((const char *)JS_VALUE_GET_PTR(SKV_%d) - 4) != (1 << 30)) { fprintf(stderr, \"BORROWCHECK: a lent block was kept (refcount %%d)\\n\", *(const int *)((const char *)JS_VALUE_GET_PTR(SKV_%d) - 4) - (1 << 30)); abort(); }\n", ki, ki, ki, ki);
+        if (ch >= 0) rs_add(post, "        if (sk_%d && sk_%d && *(const void *const *)((const char *)JS_VALUE_GET_PTR(SKV_%d) + QJS_AOT_OFF_JSOBJECT_SHAPE) != NULL && *(const int *)((const char *)JS_VALUE_GET_PTR(SKV_%d) - 4) != (1 << 30)) { fprintf(stderr, \"BORROWCHECK: a lent child was kept (refcount %%d)\\n\", *(const int *)((const char *)JS_VALUE_GET_PTR(SKV_%d) - 4) - (1 << 30)); abort(); }\n", ki, ch, ch, ch, ch);
+      }
+      rs_add(post, "        if (__builtin_expect(sk_%d && *(const void *const *)((const char *)JS_VALUE_GET_PTR(SKV_%d) + QJS_AOT_OFF_JSOBJECT_SHAPE) == NULL, 0)) { JSValue lw_ = qjs_aot_stack_forward(SKV_%d);%s rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, lw_); sk_%d = 0;", ki, ki, ki, getenv("QJS_AOT_REGION_BORROWDBG") != NULL ? " fprintf(stderr, \"adopt rc=%d\\n\", *(const int *)((const char *)JS_VALUE_GET_PTR(lw_) - 4));" : "", ki);
+      if (ch >= 0) rs_add(post, " if (sk_%d && *(const void *const *)((const char *)JS_VALUE_GET_PTR(SKV_%d) + QJS_AOT_OFF_JSOBJECT_SHAPE) == NULL) { rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, qjs_aot_stack_forward(SKV_%d)); sk_%d = 0; }", ch, ch, ch, ch);   /* (a child block the callee did not move, such as one the container no longer holds, stays a block: the owner releases it) */
+      /* what names the block after the call (a copy made later, another call it is lent to, an exit's frame state) names the heap object now */
+      { int w_; for (w_ = 0; w_ < K->nkvis; w_++) rs_add(post, " %sv%d = lw_;", c->in[K->kvis[w_][0]]->pfx, K->kvis[w_][1]); }
+      rs_add(post, " }\n");
+      n++;
+    }
+  }
+  return n;
+}
 static void rg_ool_live(RCtx *c, int ii, const Q2Insn *call, FILE *o) {
   RStr live = {0};
   RInst *I = c->in[ii];
@@ -1546,7 +2054,7 @@ static void rg_ool_live(RCtx *c, int ii, const Q2Insn *call, FILE *o) {
       char px_[12];
       unsigned vn_;
       if (!A->cur[reg][0]) continue;
-      if (sscanf(A->cur[reg], "%11[^v]v%u", px_, &vn_) == 2 && strcmp(px_, A->pfx) == 0 && kidx >= 0 && !rg_live_after(&A->q, kidx, (Q2ValueId)vn_)) continue;
+      if (sscanf(A->cur[reg], "%11[^v]v%u", px_, &vn_) == 2 && strcmp(px_, A->pfx) == 0 && kidx >= 0 && !rg_live_after(&A->q, kidx, (Q2ValueId)vn_, reg)) continue;
       if (rg_held_name(c, A->cur[reg], 0)) continue;   /* a reference the call cannot drop: the root's frame, the region's own construct or owned call result, an inlined result of those */
       if (getenv("QJS_AOT_REGION_OWNSTAT") != NULL && c->emit) {
         /* a temporary per-site counter: the generator names the site, the unit counts its executions and prints them at exit */
@@ -1580,7 +2088,7 @@ static int rg_borrow_live(RCtx *c, int ii, const Q2Insn *in) {
       char px_[12];
       unsigned vn_;
       if (!A->cur[reg][0]) continue;
-      if (sscanf(A->cur[reg], "%11[^v]v%u", px_, &vn_) == 2 && strcmp(px_, A->pfx) == 0 && kidx >= 0 && !rg_live_after(&A->q, kidx, (Q2ValueId)vn_)) continue;
+      if (sscanf(A->cur[reg], "%11[^v]v%u", px_, &vn_) == 2 && strcmp(px_, A->pfx) == 0 && kidx >= 0 && !rg_live_after(&A->q, kidx, (Q2ValueId)vn_, reg)) continue;
       if (rg_held_name(c, A->cur[reg], 0)) continue;
       return 1;
     }
@@ -1595,7 +2103,7 @@ static void rg_store_release(RCtx *c, int ii, const Q2Insn *in) {
   rg_note_park(c, ii);
   if (c->emit) {
     char xo[32];
-    rg_xlabel(c, rg_xit(c, ii, in->next), in->pc, "store-cap", xo, sizeof(xo));
+    rg_xlabel(c, rg_xit_x(c, ii, in->next), in->pc, "store-cap", xo, sizeof(xo));
     fprintf(o, "          if (JS_VALUE_HAS_REF_COUNT(old_)) { rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, old_); if (__builtin_expect(rgon_ >= RG_OWNCAP, 0)) goto %s; }\n", xo);
   }
 }
@@ -1629,12 +2137,33 @@ static int rg_wrapper(const Q2Func *q, const JSAotGenFunc *g, RWrap *w) {
 }
 static int g_rg_fwd;   /* rg_call is expanding a wrapper's apply_arguments as a call of `this.m` (set around the call) */
 static int rg_native_call(RCtx *c, int ii, const char *method, const Q2Insn *call, const char *resvar, int exit_pc);
-static int rg_rty_typed(const RInst *I);   /* region_fn_var.inc: an instance whose result is a typed local */
+static int rg_rty_typed(const RInst *I);
+static int rg_virt_at(RCtx *c, const RInst *I, int u0, int thisop, const char *nm, int *fio);
+static void rg_virt_put(RCtx *c, FILE *o, const RInst *I, int ki, int j, int u1, const char *recv);
+static void rg_virt_get(RCtx *c, FILE *o, int ki, int j, const char *dst, const char *recv, int dty);
+int g_vty_dv = -1;   /* the value whose typed local a virtual read just wrote: its load wrapper has nothing left to convert */
+static void rg_virt_dst(const RInst *I, int dv, char *buf, size_t cap);   /* region_fn_var.inc: an instance whose result is a typed local */
 static void rg_res_decl(FILE *o, const RInst *I);
 static void rg_res_set(FILE *o, const RInst *I, int u0);
 static void rg_res_get(FILE *o, const RInst *P, int dv, const char *resvar, const RInst *J);
 static int rg_math_site(RCtx *c, RInst *I, const Q2Insn *call, const char *method, int *id, int *magic);   /* region_fn_native.inc */
 static int rg_math_call(RCtx *c, int ii, const char *method, const Q2Insn *call, const char *resvar, int exit_pc, int id, int magic);   /* region_fn_native.inc */
+/* QJS_AOT_REGION_NOINL=a-b,c-d (generator, a measurement knob): a callee whose source line lies in a listed range is not expanded; its call is made out of line like any call
+   the bundle resolves to nothing. */
+static int rg_noinl(const JSAotGenFunc *g) {
+  const char *e = getenv("QJS_AOT_REGION_NOINL");
+  if (e == NULL || g == NULL) return 0;
+  while (*e) {
+    char *end;
+    long a = strtol(e, &end, 10), b = a;
+    if (end == e) break;
+    if (*end == '-') { e = end + 1; b = strtol(e, &end, 10); }
+    if ((long)g->line >= a && (long)g->line <= b) return 1;
+    e = *end == ',' ? end + 1 : end;
+    if (*end != ',') break;
+  }
+  return 0;
+}
 static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, char (*rootcur)[40], const Q2Func *root, int exit_pc, const char *resvar) {
   RInst *I = c->in[ii];
   const JSAotGenFunc *tg[RG_MAXT];
@@ -1654,6 +2183,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
     return 1;
   }
   nt = g_rg_fwd && I->cls1 > 0 ? qjs_aot_bundle_class_targets(I->g, call->pc, I->cls1 - 1, tg, RG_MAXT) : qjs_aot_bundle_targets(I->g, call->pc, tg, RG_MAXT);   /* a forwarding constructor is shared by every class Class.create made: the targets are the building object's class's */
+  for (t = 0; t < nt; t++) if (rg_noinl(tg[t])) { nt = 0; break; }
   if (nt <= 0 && strcmp(method, "push") == 0 && rg_trust_on() && call->win_n == 1 && call->nuse >= 2 && call->ndef >= 1 && call->win_val != NULL)
     return rg_push(c, ii, call, rootcur, root, exit_pc);
   if (nt <= 0 && strcmp(method, "pop") == 0 && rg_trust_on() && call->win_n == 0 && call->nuse >= 2 && call->ndef >= 1) {
@@ -1710,7 +2240,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
       const JSAotGenFunc *cand[RG_MAXT];
       int k, w, nc, ci_;
       if (g_rg_fwd && I->cls1 > 0 && cl[u].site != I->cls1 - 1) continue;   /* the object being built is of one class */
-      if (!rg_cls_ok(c, &cl[u]) && !(g_meas_on > 0 && !c->emit && !cl[u].one_shape && rg_clctor(c, &cl[u])[0] && cl[u].nfields >= 0 && cl[u].nfields <= 32 && qjs_aot_mshape_on()))
+      if (!rg_cls_ok(c, &cl[u]) && !(!cl[u].one_shape && rg_clctor(c, &cl[u])[0] && cl[u].nfields >= 0 && cl[u].nfields <= 32 && qjs_aot_mshape_on()))
         return rg_fail(c, "pc %d: .%s: receiver class %s is not bound once (%s)", call->pc, method, cl[u].label,
                        !cl[u].one_shape ? "more than one shape" : "no global constructor");
       /* the method's candidates for this class: one, or an override and what it overrides when the analysis cannot order them; the init binds the one the
@@ -1732,7 +2262,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
       /* the root's `this`, when every arm of its first dispatch is one class: its shape is compared once at entry, and its own dispatches need no
          compare. The class's layout is a dependency of the word (an object leaving the shape breaks it, tested after every out-of-line call) */
       for (u = 1; u < n && kc[u] == kc[0]; u++) {}
-      if (u == n) { I->kcls = kc[0] + 1; c->cls[kc[0]].need_layout = 1; }
+      if (u == n && c->cls[kc[0]].nsh <= 1) { I->kcls = kc[0] + 1; c->cls[kc[0]].need_layout = 1; }
     }
     if (I->kcls > 0 && rg_is_this(&I->q, (Q2ValueId)recv_val)) {
       int m = 0;
@@ -1847,7 +2377,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
     J->kcls = rg_trust_on() && !thru && !crecv ? kc[t] + 1 : 0;
     J->ctp = rg_trust_on() && crecv ? tcp + 1 : 0;
     J->ool = rg_trust_on() && getenv("QJS_AOT_REGION_NOOOL") == NULL && rg_has_loop(&J->q);
-    if (J->ool && c->loopinl && nt == 1 && J->q.nvalues <= 400) {
+    if (J->ool && c->loopinl && nt == 1 && J->q.nvalues <= (getenv("QJS_AOT_REGION_LOOPINL_FN") != NULL && strcmp(J->g->name, getenv("QJS_AOT_REGION_LOOPINL_FN")) == 0 ? 800 : getenv("QJS_AOT_REGION_LOOPINL_MAX") ? atoi(getenv("QJS_AOT_REGION_LOOPINL_MAX")) : 400)) {
       /* a small loop callee with one target, not on the call chain already (a recursion): expanded in place, its loop a loop of the region */
       int a_, rec_ = 0;
       for (a_ = ii; a_ >= 0 && !rec_; a_ = c->in[a_]->par) { if (c->in[a_]->g == J->g) rec_ = 1; if (a_ == 0) break; }
@@ -1893,19 +2423,34 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
         int k_;
         snprintf(key, sizeof(key), "S|%s|%d", ov, gi);
         if (rg_hk(c, key, &k_) == 0)
-          rs_add(&c->hoist, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || *(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE) != rk_sa_%s_%d[0], 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n    rgmv_%d = 1;\n", ov, ov, c->hex, gi, c->hex, k_);
+          {
+            char eq_[900], sx_[160];
+            snprintf(sx_, sizeof(sx_), "*(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE)", ov);
+            rg_arm_eq(c, gi, 0, sx_, eq_, sizeof(eq_));
+            rs_add(&c->hoist, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || !(%s), 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n    rgmv_%d = 1;\n", ov, eq_, c->hex, k_);
+          }
         c->in[base]->hver = 1;
         fprintf(o, "      switch (0) {\n");
       } else
       if (nt == 1 && !G->known && !thru && rg_inv_on(c) && (I->curloop || I->ploop) && rg_inv_has(c, val)) {
         /* one arm on a receiver that is the same object on every pass (its shape cannot change: the region adds no field to an object it did not make) */
         int k_ = c->nmemo++;
-        fprintf(o, "      if (__builtin_expect(!rgmv_%d, 0)) { if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || *(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE) != rk_sa_%s_%d[0], 0)) goto %s; rgmv_%d = 1; }\n", k_, val, val, c->hex, gi, xl2, k_);
+        {
+          char eq_[900], sx_[160];
+          snprintf(sx_, sizeof(sx_), "*(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE)", val);
+          rg_arm_eq(c, gi, 0, sx_, eq_, sizeof(eq_));
+          fprintf(o, "      if (__builtin_expect(!rgmv_%d, 0)) { if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || !(%s), 0)) goto %s; rgmv_%d = 1; }\n", k_, val, eq_, xl2, k_);
+        }
         fprintf(o, "      switch (0) {\n");
       } else if (nt == 1 && !G->known) {
         /* one arm: a compare and an exit (no arm index to select) */
         if (thru) fprintf(o, "      if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || JS_VALUE_GET_PTR(%s) != (const void *)rg_tf_%s_%d[0], 0)) goto %s;\n", val, val, c->hex, gi, xl2);
-        else fprintf(o, "      if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || *(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE) != rk_sa_%s_%d[0], 0)) goto %s;\n", val, val, c->hex, gi, xl2);
+        else {
+          char eq_[900], sx_[160];
+          snprintf(sx_, sizeof(sx_), "*(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE)", val);
+          rg_arm_eq(c, gi, 0, sx_, eq_, sizeof(eq_));
+          fprintf(o, "      if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT || !(%s), 0)) goto %s;\n", val, eq_, xl2);
+        }
         fprintf(o, "      switch (0) {\n");
       } else if (thru) {
         fprintf(o, "      int gix_%d = -1;\n      if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto %s;\n      { const void *xp_ = JS_VALUE_GET_PTR(%s);\n", gi, val, xl2, val);
@@ -1919,7 +2464,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
         fprintf(o, "      int gix_%d = -1;\n      if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto %s;\n", gi, val, xl2);
         fprintf(o, "      { const void *sh_ = *(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n", val);
         /* an arm's shape is its class's, or NULL when the init found another candidate's method on that class */
-        for (tt = 0; tt < nt; tt++) fprintf(o, "        %sif (sh_ == rk_sa_%s_%d[%d]) gix_%d = %d;\n", tt ? "else " : "", c->hex, gi, tt, gi, tt);
+        for (tt = 0; tt < nt; tt++) { char eq_[900]; rg_arm_eq(c, gi, tt, "sh_", eq_, sizeof(eq_)); fprintf(o, "        %sif (%s) gix_%d = %d;\n", tt ? "else " : "", eq_, gi, tt); }
         fprintf(o, "      }\n      switch (gix_%d) {\n", gi);
       }
     } else {
@@ -1947,10 +2492,11 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
       RInst *J = c->in[base + t];
       fprintf(o, "      case %d: {\n", t);
       if (J->ool) {
+        if (c->emit) rg_mark_eff(c, ii);
         /* an out-of-line call (TRUST): the callee runs its own compiled body. Every value the region's frames hold is a borrow the callee could free, so
            each is kept alive (a reference held to the region's end); the result is owned and held the same way; after the call the word is tested
            (the callee may have broken a fact) and a broken word leaves after the call with the result in place */
-        int ka, reg;
+        int ka, reg, rk_ = -1;
         char xo[32];
         rg_note_park(c, ii);   /* the result is owned to the region's end (or until a back edge frees it) */
         {
@@ -1962,17 +2508,47 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
           fprintf(o, "        JSValue av_[%d];\n", nb_ > 0 ? nb_ : 1);
           for (ka = 0; ka < J->nargs; ka++) fprintf(o, "        av_[%d] = %s;\n", ka, J->arg[ka]);
           for (; ka < nb_; ka++) fprintf(o, "        av_[%d] = JS_UNDEFINED;\n", ka);
-          rg_ool_live(c, ii, call, o);
-          rg_emit_cap(c, ii, call->pc, o);
-          fprintf(o, "#ifdef Q2_NATIVE_%s\n        { JSValue r_ = %s ? aot_n_%s(ctx, f, (JSObject *)(%s), %s, av_, %d) : JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, %s), %s, %d, av_);\n#else\n",
-                  hx_, getenv("QJS_AOT_REGION_NODIRECTCALL") ? "0" : "1", hx_, J->co, J->self, J->nargs, J->co, J->self, J->nargs);
-          fprintf(o, "        { JSValue r_ = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, %s), %s, %d, av_);\n#endif\n", J->co, J->self, J->nargs);
+          {
+            /* stack objects lent to the callee: made real before the call, adopted back after it (the callee may have moved them to the heap) */
+            RStr lpre = {0}, lpost = {0};
+            unsigned lneed = 0;
+            int nl = c->emit ? rg_lend_text(c, ii, (int)(call - I->q.insns), &lpre, &lpost, &lneed) : 0;
+            if (nl < 0) { free(lpre.p); free(lpost.p); return rg_fail(c, "pc %d: a lent object is virtual or paired with an Array", call->pc); }
+            if (nl > 0) {
+              if (getenv("QJS_AOT_REGION_NODIRECTCALL") != NULL) return rg_fail(c, "pc %d: a lent object needs the direct call", call->pc);
+              rg_lent_assume(hx_, c->hex, lneed);
+              fprintf(o, "#if !defined(Q2_NATIVE_%s) || !defined(RG_LENT_%s) || (RG_LENT_%s & %uu) != %uu\n#error \"a stack object is lent to a function that does not take it\"\n#endif\n", hx_, hx_, hx_, lneed, lneed);
+              if (lpre.p) fputs(lpre.p, o);
+            }
+            rg_ool_live(c, ii, call, o);
+            rg_emit_cap(c, ii, call->pc, o);
+            {
+              int q_;
+              rk_ = -1;
+              for (q_ = 0; q_ < c->ncons; q_++) if (c->cons[q_].rslot && c->cons[q_].stack && c->cons[q_].inst == ii && c->cons[q_].pc == call->pc) rk_ = q_;
+            }
+            if (rk_ >= 0 && getenv("QJS_AOT_REGION_NODIRECTCALL") == NULL) {
+              /* the result may come back in a block of this frame: an empty shell goes to the callee's aot_nr_ entry (when it has one); the previous incarnation of the block is released first */
+              RStr rt_ = {0};
+              rg_sk_release_text(c, rk_, &rt_);
+              fprintf(o, "#ifdef Q2_NATIVE_%s\n#ifdef RG_RETSLOT_%s\n        { %s JSValue rsv_ = qjs_aot_stack_shell(skb_%d, sizeof skb_%d, 8u);\n          JSValue r_ = %s ? aot_nr_%s(ctx, f, (JSObject *)(%s), %s, av_, %d, &rsv_) : JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, %s), %s, %d, av_);\n#else\n",
+                      hx_, hx_, rt_.p ? rt_.p : "", rk_, rk_, "1", hx_, J->co, J->self, J->nargs, J->co, J->self, J->nargs);
+              fprintf(o, "        { JSValue r_ = aot_n_%s(ctx, f, (JSObject *)(%s), %s, av_, %d);\n#endif\n#else\n", hx_, J->co, J->self, J->nargs);
+              free(rt_.p);
+            } else
+            fprintf(o, "#ifdef Q2_NATIVE_%s\n        { JSValue r_ = %s ? aot_n_%s(ctx, f, (JSObject *)(%s), %s, av_, %d) : JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, %s), %s, %d, av_);\n#else\n",
+                    hx_, getenv("QJS_AOT_REGION_NODIRECTCALL") ? "0" : "1", hx_, J->co, J->self, J->nargs, J->co, J->self, J->nargs);
+            fprintf(o, "        { JSValue r_ = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, %s), %s, %d, av_);\n#endif\n", J->co, J->self, J->nargs);
+            if (nl > 0 && lpost.p) fputs(lpost.p, o);
+            free(lpre.p); free(lpost.p);
+          }
         }
         fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n");
+        if (rk_ >= 0) { char hy_[33]; rg_hexof(J->g, hy_); fprintf(o, "#ifdef RG_RETSLOT_%s\n          if (JS_VALUE_GET_TAG(r_) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(r_) == JS_VALUE_GET_PTR(SKV_%d)) sk_%d = 1; else\n#endif\n", hy_, rk_, rk_); }
         fprintf(o, "          rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, r_); %s = r_; }\n", resvar);
         reg = (int32_t)call->def[0] >= 0 && (int32_t)call->def[0] < I->q.nvalues ? I->q.values[call->def[0]].reg : -1;
         if (I->cur != NULL && reg >= 0 && reg < 256) snprintf(I->cur[reg], 40, "%s", resvar);
-        rg_xlabel(c, rg_xit(c, ii, call->next), call->pc, "ool-facts", xo, sizeof(xo));
+        rg_xlabel(c, rg_xit_x(c, ii, call->next), call->pc, "ool-facts", xo, sizeof(xo));
         fprintf(o, "        if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1) || rgon_ >= RG_OWNCAP, 0)) goto %s;\n        break; }\n", c->hex, xo);
         continue;
       }
@@ -1997,6 +2573,15 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
     int base = c->nin - nt;
     for (t = 0; t < nt; t++)
       if (!c->in[base + t]->ool && !rg_walk_inst(c, base + t, rootcur, root)) return 0;
+    if (nt == 1 && c->in[base]->ool && rg_retslot_on() && (int32_t)call->def[0] >= 0 && (int32_t)call->def[0] < I->q.nvalues) {
+      /* the result of an out-of-line call: a block of this frame the callee may return its object in (decided like any stack object; the call passes a shell for it) */
+      int kr = rg_cons(c, ii, call->pc);
+      if (kr >= 0) {
+        RCons *R = &c->cons[kr];
+        R->kind = 0; R->direct = 1; R->esc = 0; R->rslot = 1; R->nn = 0; R->accroom = 8; R->site = -1;
+        snprintf(R->gname, sizeof(R->gname), "<result>");
+      }
+    }
   }
   return 1;
 }
@@ -2034,7 +2619,7 @@ static void rg_arith(FILE *o, int sub, const char *dst, const char *a, const cha
   if (opc != NULL) {
     fprintf(o, "          if (ia_ && ib_) {\n");
     if (sub == REG_BIN_DIV) {
-      fprintf(o, "            double d_ = (double)JS_VALUE_GET_INT(%s) / (double)JS_VALUE_GET_INT(%s); int32_t t_ = (int32_t)d_;\n", a, b);
+      fprintf(o, "            double d_ = (double)JS_VALUE_GET_INT(%s) / (double)JS_VALUE_GET_INT(%s); int32_t t_ = d_ >= -2147483648.0 && d_ <= 2147483647.0 ? (int32_t)d_ : 0;\n", a, b);
       fprintf(o, "            %s = (d_ == (double)t_ && !(t_ == 0 && __builtin_signbit(d_)) && d_ >= -2147483648.0 && d_ <= 2147483647.0) ? JS_MKVAL(JS_TAG_INT, t_) : __JS_NewFloat64(d_);\n", dst);
     } else {
       fprintf(o, "            int64_t r_ = (int64_t)JS_VALUE_GET_INT(%s) %s (int64_t)JS_VALUE_GET_INT(%s);\n", a, opc, b);
@@ -2059,7 +2644,7 @@ static void rg_arith(FILE *o, int sub, const char *dst, const char *a, const cha
 #include "region_fn_bit.inc"
 #include "region_fn_native.inc"
 #include "region_fn_var.inc"
-static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root) {
+static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root) {
   RInst *I = c->in[ii];
   const Q2Func *fn = &I->q;
   FILE *o = c->o;
@@ -2067,6 +2652,8 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
   char xl[32];
   I->pend_end = 0;
   I->npend = 0; I->lastcall = I->nextcall = -1;
+  I->eff = 0; I->ieff = 0; I->snap = -1; I->prev_eff = 0;
+  { int q_; for (q_ = 0; q_ < 128; q_++) { I->bsnap[q_] = -1; I->bpe[q_] = 0; } }
   if (c->emit) {
     /* the frame state of this walk: the value each register holds now (the root's table is the caller's) */
     if (is_root) I->cur = rootcur;
@@ -2088,6 +2675,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
     /* a loop inside an inlined function is a loop of the region like the root's: the blocks are labelled per instance, the values are locals of the function, and
        its back edges poll (below) with the instance's frame state, the chain of frames materialised at the poll exit */
     if (c->emit) fprintf(o, "        %sB%d: (void)0;\n", I->pfx, b);
+    c->dsx_ep++;   /* a block start ends the stretch of a shape test (T13) */
     if (b >= 128) return rg_fail(c, "too many blocks");
     I->curloop = rg_in_loop(fn, b);
     if (I->cur != NULL) {
@@ -2098,13 +2686,31 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
       for (j = 0; j < B->nparams; j++)
         if (B->param_reg[j] >= 0 && B->param_reg[j] < 256) snprintf(I->cur[B->param_reg[j]], 40, "%sv%u", I->pfx, (unsigned)B->param_val[j]);
     }
+    if (c->emit) rg_cen_point(c, I, B->start_pc);
     for (k = 0; k < B->ninsns; k++) {
       int idx = B->first_insn + k;
       const Q2Insn *in = &fn->insns[idx];
       int dv = in->ndef >= 1 ? (int)in->def[0] : -1, dv2 = in->ndef >= 2 ? (int)in->def[1] : -1;
       int u0 = in->nuse >= 1 ? (int)in->use[0] : -1, u1 = in->nuse >= 2 ? (int)in->use[1] : -1;
       int xpc, np_ = 0, pj_;
+      char fsmv_[64]; char migs_[1400];
       I->curidx = idx;
+      /* T13: an op that may add or delete a field ends the stretch of the shape tests; a store of a field the profile shapes of its site all hold is a slot store and keeps it */
+      if (in->rop == ROP_put_field || in->rop == ROP_put_field_xfer) {
+        RDisp wd_; char wn_[40]; int keep_ = 0;
+        if (!I->fresh && rg_atom(in, wn_, sizeof(wn_))) { g_disp_quiet = 1; keep_ = rg_disp_plan(c, I, in, wn_, 0, 1, &wd_); g_disp_quiet = 0; }
+        if (!keep_) c->dsx_ep++;
+      } else if (!rg_shape_neutral(in->rop)) c->dsx_ep++;
+      if (c->emit && !rg_shape_neutral(in->rop)) {
+        const char *ce_ = getenv("QJS_AOT_REGION_EPCENSUS");
+        int eff_ = 1;
+        if (ce_ != NULL && ce_[0] == '2') {
+          /* refined: an inlined call is not itself an effect (its callee's ops are), a store to the object under construction is not */
+          if (in->rop == ROP_call || in->rop == ROP_call_method || in->rop == ROP_construct || in->rop == ROP_apply_arguments) eff_ = 0;
+          if ((in->rop == ROP_put_field || in->rop == ROP_put_field_xfer) && I->fresh && in->nuse >= 1 && rg_is_this(fn, in->use[0])) eff_ = 0;
+        }
+        if (eff_) { rg_cen_point(c, I, in->pc); I->ieff = 1; }
+      }
       I->lastcall = I->nextcall;
       if (in->rop == ROP_call_method || in->rop == ROP_call || in->rop == ROP_construct || in->rop == ROP_apply_arguments) I->nextcall = idx;
       for (pj_ = 0; pj_ < I->npend; ) { if (I->pend[pj_].end <= idx) { memmove(&I->pend[pj_], &I->pend[pj_ + 1], (size_t)(I->npend - pj_ - 1) * sizeof(I->pend[0])); I->npend--; } else pj_++; }
@@ -2114,6 +2720,24 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
       else if (np_ == 1) {
         /* one pair pending and the arguments so far made no call: the exit resumes at its read (the interpreter makes the callee again) */
         for (pj_ = 0; pj_ < I->npend; pj_++) if (I->pend[pj_].end > idx + 1 && I->lastcall < I->pend[pj_].ridx) xpc = I->pend[pj_].pc;
+      }
+      if (c->emit && rg_stretch_on() && I->cur != NULL) {
+        /* the stretch rule (rg_xit): a snapshot at a block's start and after every op that took an effect; this op's pre-effect guards resume there */
+        int eff_ = !rg_shape_neutral(in->rop);
+        if (in->rop == ROP_call || in->rop == ROP_call_method) eff_ = 0;   /* an inlined call has the effects of its body (marked when the body is walked); one made out of line marks itself */
+        if ((in->rop == ROP_put_field || in->rop == ROP_put_field_xfer) && I->fresh && in->nuse >= 1 && rg_is_this(fn, in->use[0])) eff_ = 0;   /* a store to the object being constructed */
+        int newsnap_ = 0;
+        if (k == 0) {
+          /* a block entered from one earlier block only continues that block's stretch (its guards may resume where the stretch began); a join or a loop head starts one */
+          int p_ = B->npreds == 1 && B->preds != NULL ? B->preds[0] : -1;
+          if (p_ >= 0 && p_ < 128 && p_ != b && fn->rpo_pos != NULL && fn->rpo_pos[p_] >= 0 && fn->rpo_pos[p_] < fn->rpo_pos[b] && I->bsnap[p_] >= 0) { I->snap = I->bsnap[p_]; I->prev_eff = I->bpe[p_]; }
+          else newsnap_ = 1;
+        }
+        if (I->prev_eff) newsnap_ = 1;
+        if (newsnap_) { I->snap = rg_xit_x(c, ii, xpc); }
+        I->prev_eff = 0;
+        if (eff_) { I->prev_eff = 1; I->ieff = 1; }
+        c->xelig = !eff_;
       }
       int pair_read = 0, ov_active = 0;
       char (*ovsave)[40] = NULL;
@@ -2250,6 +2874,10 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
           char nm[40];
           int fs = -1; (void)fs;
           if (dv < 0 || dv2 < 0 || !rg_atom(in, nm, sizeof(nm))) return rg_fail(c, "pc %d: get_this_field", in->pc);
+          if (c->emit) {
+            int vf_ = -1, vk_ = rg_virt_at(c, I, -1, 1, nm, &vf_);
+            if (vk_ >= 0) { char dd_[40]; rg_virt_dst(I, dv, dd_, sizeof(dd_)); rg_virt_get(c, o, vk_, vf_, dd_, I->self, rg_tyof(I, dv)); fprintf(o, "        %sv%d = %s;\n", I->pfx, dv2, I->self); break; }
+          }
           /* after a store a read may not exit (the exit would redo the store); a read of `this` in an instance a dispatch made has its position from the shape the
              dispatch chose (no lookup, nothing that can fail), and a trusted read is a constant offset */
           {
@@ -2291,7 +2919,8 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
         case ROP_get_field_chain: case ROP_get_field_chain_own: {
           /* d0 = recv.a1 (a field), d1 = d0.a2 (a method read that the call right after uses) */
           char n1[40], n2[40];
-          int call_idx = -1, j, glob_ = 0;
+          int call_idx = -1, j, glob_ = 0, disp1_ = 0;
+          RDisp d1_, d2_;
           if (dv < 0 || dv2 < 0 || u0 < 0 || !rg_atom(in, n1, sizeof(n1))) return rg_fail(c, "pc %d: get_field_chain", in->pc);
           {
             int a, seen = 0;
@@ -2328,7 +2957,13 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
               glob_ = 1;
             }
           }
+          if (!glob_ && rg_trust_on() && !rg_trust_field_n(I, in, 0, n1, tmp_, sizeof(tmp_))) disp1_ = rg_disp_plan(c, I, in, n1, 0, 0, &d1_);   /* T13 */
           if (glob_) {
+          } else if (disp1_) {
+            char val_[40], dst_[40];
+            snprintf(val_, sizeof(val_), "%sv%d", I->pfx, u0);
+            snprintf(dst_, sizeof(dst_), "%sv%d", I->pfx, dv);
+            rg_disp_read(c, I, in, ii, xpc, val_, rg_base(fn, (Q2ValueId)u0), dst_, &d1_);
           } else if (!c->emit) {
             if (!rg_trust_field_n(I, in, 0, n1, tmp_, sizeof(tmp_)) && !rg_note_field(c, I, u0, n1, 0, 0, rg_is_this(fn, u0))) return rg_fail(c, "pc %d: .%s requirements", in->pc, n1);
           } else {
@@ -2362,6 +2997,11 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
               int q2_ = rg_cp_add(c, pc2_, pcn2_);
               if (q2_ < 0) return rg_fail(c, "pc %d: too many constant paths", in->pc);
               if (c->emit) { char cpt_[64]; fprintf(o, "        %sv%d = %s;\n", I->pfx, dv2, rg_cp_text(c, q2_, cpt_, sizeof(cpt_)));  snprintf(tmp_, sizeof(tmp_), "%sv%d", I->pfx, dv2); rg_inv_add(c, tmp_); }
+            } else if (rg_trust_on() && !rg_trust_field_n(I, in, 0, n2, tmp_, sizeof(tmp_)) && rg_disp_plan(c, I, in, n2, 1, 0, &d2_)) {   /* T13 */
+              char val_[40], dst_[40];
+              snprintf(val_, sizeof(val_), "%sv%d", I->pfx, dv);
+              snprintf(dst_, sizeof(dst_), "%sv%d", I->pfx, dv2);
+              rg_disp_read(c, I, in, ii, xpc, val_, rg_base(fn, (Q2ValueId)dv), dst_, &d2_);
             } else if (!c->emit) {
               if (!rg_trust_field_n(I, in, 0, n2, tmp_, sizeof(tmp_)) && !rg_note_field(c, I, dv, n2, 0, 0, 0)) return rg_fail(c, "pc %d: .%s requirements", in->pc, n2);
             } else {
@@ -2396,6 +3036,10 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
           int call_idx = -1, j;
           if (dv < 0 || u0 < 0 || !rg_atom(in, nm, sizeof(nm))) return rg_fail(c, "pc %d: get_field", in->pc);
           if (I->wrap && in->rop == ROP_get_field2) { if (c->emit) fprintf(o, "        %sv%d = JS_UNDEFINED;   /* the wrapper's `.apply` read: the forward proves it is the builtin */\n", I->pfx, dv); break; }
+          if (c->emit && (in->rop == ROP_get_field || in->rop == ROP_get_field_own)) {
+            int vf_ = -1, vk_ = rg_virt_at(c, I, u0, 0, nm, &vf_);
+            if (vk_ >= 0) { char rv_[40], dd_[40]; snprintf(rv_, sizeof(rv_), "%sv%d", I->pfx, u0); rg_virt_dst(I, dv, dd_, sizeof(dd_)); rg_virt_get(c, o, vk_, vf_, dd_, rv_, rg_tyof(I, dv)); break; }
+          }
           /* a method read followed, in this block, by the call that is its only use: the pair is a dispatch */
           call_idx = rg_find_call(fn, B, k, dv);
           (void)j;
@@ -2444,6 +3088,17 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
             snprintf(dst_, sizeof(dst_), "%sv%d", I->pfx, dv);
             if (rg_poly_field(c, I, in, nm, val_, dst_, xl)) break;
           }
+          if (rg_trust_on() && !rg_trust_field(I, in, 0, tmp_, sizeof(tmp_))) {
+            /* T13: one class that gains fields late: a compare with the shapes the profile saw at this site */
+            RDisp dd_;
+            if (rg_disp_plan(c, I, in, nm, 0, 0, &dd_)) {
+              char val_[40], dst_[40];
+              snprintf(val_, sizeof(val_), "%sv%d", I->pfx, u0);
+              snprintf(dst_, sizeof(dst_), "%sv%d", I->pfx, dv);
+              rg_disp_read(c, I, in, ii, xpc, val_, rg_base(fn, (Q2ValueId)u0), dst_, &dd_);
+              break;
+            }
+          }
           if (!c->emit) {
             if (!rg_trust_field(I, in, 0, tmp_, sizeof(tmp_)) && !rg_note_field(c, I, u0, nm, 0, 0, rg_is_this(fn, u0))) return rg_fail(c, "pc %d: .%s requirements", in->pc, nm);
           } else {
@@ -2466,6 +3121,9 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
         }
         case ROP_put_field: case ROP_put_field_xfer: {
           char nm[40];
+          RDisp wd_;
+          RAdd ad_;
+          int wdisp_ = 0;
           if (u0 < 0 || u1 < 0 || !rg_atom(in, nm, sizeof(nm))) return rg_fail(c, "pc %d: put_field", in->pc);
           if (I->fresh && I->cons > 0 && rg_is_this(fn, u0)) {
             /* a field of the object this region is constructing: nothing else can see it, so the store is no effect (an exit discards the object), and it is made
@@ -2473,6 +3131,12 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
             RCons *K = &c->cons[I->cons - 1];
             int ni;
             for (ni = 0; ni < K->nn && strcmp(K->names[ni], nm) != 0; ni++) {}
+            if (c->emit && K->virt && ni < K->nn) {
+              char rv_[40];
+              snprintf(rv_, sizeof(rv_), "%sv%d", I->pfx, u0);
+              rg_virt_put(c, o, I, I->cons - 1, ni, u1, rv_);
+              break;
+            }
             if (ni == K->nn) {
               if (c->emit) return rg_fail(c, "pc %d: .%s was not seen by the first pass", in->pc, nm);
               if (K->nn >= 16 || strlen(nm) >= sizeof(K->names[0])) return rg_fail(c, "pc %d: too many fields in a constructed object", in->pc);
@@ -2489,23 +3153,36 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
             break;
           }
           if (!rg_cold(I, in)) rg_mut_add(c, nm);
+          if (c->emit) {
+            int vf_ = -1, vk_ = rg_virt_at(c, I, u0, 0, nm, &vf_);
+            if (vk_ >= 0) { char rv_[40]; snprintf(rv_, sizeof(rv_), "%sv%d", I->pfx, u0); rg_virt_put(c, o, I, vk_, vf_, u1, rv_); break; }
+          }
+          if (rg_trust_on() && !rg_trust_field(I, in, 1, tmp_, sizeof(tmp_))) wdisp_ = rg_disp_plan(c, I, in, nm, 0, 1, &wd_);
+          if (!wdisp_ && rg_trust_on() && !rg_trust_field(I, in, 1, tmp_, sizeof(tmp_)) && rg_add_plan(c, I, in, nm, &ad_)) wdisp_ = 2;
+          if (wdisp_) g_rg_cls = wdisp_ == 2 ? (512u | 32u | 64u) : wd_.cls;   /* the kinds the field may hold, for the narrowing of a double store */
           if (!c->emit) {
             if (rg_borrow_live(c, ii, in)) rg_note_park(c, ii);
-            if (!rg_trust_field(I, in, 1, tmp_, sizeof(tmp_)) && !rg_note_field(c, I, u0, nm, 0, 1, rg_is_this(fn, u0))) return rg_fail(c, "pc %d: .%s requirements", in->pc, nm);
+            if (!wdisp_ && !rg_trust_field(I, in, 1, tmp_, sizeof(tmp_)) && !rg_note_field(c, I, u0, nm, 0, 1, rg_is_this(fn, u0))) return rg_fail(c, "pc %d: .%s requirements", in->pc, nm);
           } else {
             int is_this = rg_is_this(fn, u0);
-            int gq = is_this && I->owner_g >= 0 ? I->owner_g : rg_guard(c, I->id, u0, -1, 0, NULL);
+            int gq = wdisp_ ? -1 : is_this && I->owner_g >= 0 ? I->owner_g : rg_guard(c, I->id, u0, -1, 0, NULL);
             int qq = gq >= 0 ? rg_qidx(&c->gd[gq], is_this && I->owner_g >= 0 ? I->owner_t : 0, nm) : -1;
             char val[40], off[96];
-            if (qq < 0 && !rg_trust_field(I, in, 1, tmp_, sizeof(tmp_))) return rg_fail(c, "pc %d: .%s has no verified position", in->pc, nm);
+            if (!wdisp_ && qq < 0 && !rg_trust_field(I, in, 1, tmp_, sizeof(tmp_))) return rg_fail(c, "pc %d: .%s has no verified position", in->pc, nm);
             snprintf(val, sizeof(val), "%sv%d", I->pfx, u0);
             fprintf(o, "        {\n");
-            if (rg_trust_field(I, in, 1, off, sizeof(off))) rg_verify(c, I, in, 1, val, nm, off);
+            if (wdisp_) {
+              char xd_[32];
+              rg_xlabel(c, rg_xit(c, ii, xpc), in->pc, "disp-miss", xd_, sizeof(xd_));
+              if (wdisp_ == 2) rg_add_off(c, val, &ad_, xd_);
+              else rg_disp_off(c, I, val, rg_base(fn, (Q2ValueId)u0), &wd_, xd_);
+              snprintf(off, sizeof(off), "off_");
+            } else if (rg_trust_field(I, in, 1, off, sizeof(off))) rg_verify(c, I, in, 1, val, nm, off);
             else {
               if (!(is_this && I->owner_g >= 0)) rg_lookup(c, gq, val, xl, "        ");
               snprintf(off, sizeof(off), "rg_off_%s_%d[gix_%d][%d]", c->hex, gq, gq, qq);
             }
-            if (rg_trust_field(I, in, 1, tmp_, sizeof(tmp_)) && g_rg_plain && (rg_trust_on() || getenv("QJS_AOT_REGION_LEAN") != NULL) && (!rg_store_narrow(I, u1, g_rg_cls) || rg_f64_knob("QJS_AOT_REGION_F64NOCLAIM") || getenv("QJS_AOT_REGION_F64NARROWEXIT") != NULL)) {
+            if (!wdisp_ && rg_trust_field(I, in, 1, tmp_, sizeof(tmp_)) && g_rg_plain && (rg_trust_on() || getenv("QJS_AOT_REGION_LEAN") != NULL) && (!rg_store_narrow(I, u1, g_rg_cls) || rg_f64_knob("QJS_AOT_REGION_F64NOCLAIM") || getenv("QJS_AOT_REGION_F64NARROWEXIT") != NULL)) {
               /* a slot that holds only numbers/booleans/undefined of an instance of a proven class: a plain store */
               if (c->emit && getenv("QJS_AOT_REGION_F64DBG")) { char an_[48] = "?"; rg_atom(in, an_, sizeof(an_)); fprintf(o, "        /* store pc %d in %s line %d .%s cls %x ty %d */\n", in->pc, I->g->name, I->g->line, an_, g_rg_cls, rg_tyof(I, u1)); }
               if (rg_store_narrow(I, u1, g_rg_cls)) {
@@ -2540,6 +3217,15 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
                 fprintf(o, "        if (Q2_CLAIM_BAD(%s, %s, %sv%d)) { static int once_; if (!once_++) { const unsigned char *sh_ = *(const unsigned char *const *)((const unsigned char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE); unsigned id_ = *(const uint16_t *)(sh_ + QJS_AOT_OFF_SHAPE_LAYOUT_ID); fprintf(stderr, \"region claim: layout %%u slot %%u claim %%u tag %%d broken %%llx\\n\", id_, (unsigned)(%s / QJS_AOT_SIZEOF_JSPROPERTY), id_ && id_ <= (unsigned)Q2_LAYOUT_COUNT ? (unsigned)q2_layout_claim[id_ - 1u][(%s / QJS_AOT_SIZEOF_JSPROPERTY) & 31u] : 0u, (int)JS_VALUE_GET_TAG(%sv%d), (unsigned long long)Q2_LAYOUT_BROKEN(ctx)); } }\n", val, off, I->pfx, u1, val, off, off, I->pfx, u1);
               fprintf(o, "        if (__builtin_expect(Q2_CLAIM_BAD(%s, %s, %s) && !(Q2_LAYOUT_BROKEN(ctx) & (1ull << (*(const uint16_t *)(*(const unsigned char *const *)((const unsigned char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE) + QJS_AOT_OFF_SHAPE_LAYOUT_ID) - 1u))), 0)) goto %s;\n", val, off, vs_, val, xc);
             }
+            if (wdisp_ == 2) {
+              char xc2[32], xg2[32];
+              rg_xlabel(c, rg_xit(c, ii, xpc), in->pc, "store-oldlay", xc2, sizeof(xc2));
+              rg_xlabel(c, rg_xit(c, ii, xpc), in->pc, "store-grow", xg2, sizeof(xg2));
+              fprintf(o, "        if (nsh_ != NULL && __builtin_expect(Q2_ENTERS_LAYOUT((const unsigned char *)sh_), 0)) goto %s;\n", xc2);
+              rg_add_swap(c, val, xg2);
+              fprintf(o, "        { JSValue *sp_ = q2_slotp(%s, %s); JSValue old_ = nsh_ != NULL ? JS_UNDEFINED : *sp_; q2_dup_p(%s); *sp_ = %s;\n", val, off, vs_, vs_);
+              fprintf(o, "        if (nsh_ != NULL) Q2_ADD_FILLED(ctx, %s, nsh_);\n", val);
+            } else
             fprintf(o, "        { JSValue *sp_ = q2_slotp(%s, %s); JSValue old_ = *sp_; q2_dup_p(%s); *sp_ = %s;\n", val, off, vs_, vs_);
             rg_store_release(c, ii, in);
             fprintf(o, "        } }\n");
@@ -2730,6 +3416,19 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
             }
             return rg_fail(c, "pc %d: a global's value is used as a value by %s at pc %d (the region reads globals only as `G.F` or as a constructor; the profile executed this load)", in->pc, usern, usepc);
           }
+          /* a construct the profile never ran, reading this global, is an exit that spills the callee register: a value the region never made would be handed to the generic body as
+             the callee. The load is then the cold point itself (the exit resumes at the load). */
+          if (dv >= 0 && rg_cold(I, in) && getenv("QJS_AOT_REGION_NOCOLDGLOBAL") == NULL) {   /* (the env var brings the old behaviour back, for the knock-out of this case) */
+            int ncold_ = 0, nhot_ = 0;
+            for (j2 = 0; j2 < fn->ninsns; j2++) {
+              const Q2Insn *cj = &fn->insns[j2];
+              if (cj->rop == ROP_construct && cj->nuse >= 1 && rg_base(fn, cj->use[0]) == dv) { if (rg_cold(I, cj)) ncold_++; else nhot_++; }
+            }
+            if (ncold_ > 0 && nhot_ == 0) {
+              if (c->emit) fprintf(o, "        goto %s; /* get_global: its construct was never executed in the profile */\n", xl);
+              break;
+            }
+          }
           for (j2 = 0; dv >= 0 && j2 < fn->ninsns; j2++) {
             const Q2Insn *cj = &fn->insns[j2];
             if (cj->rop == ROP_construct && cj->nuse >= 1 && rg_base(fn, cj->use[0]) == dv && !rg_cold(I, cj)) {
@@ -2822,6 +3521,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
           }
           nt1 = qjs_aot_bundle_targets(I->g, in->pc, tg1, 2);
           if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: construct pc %d path %d targets %d\n", in->pc, K->npath, nt1);
+          if (nt1 == 1 && rg_noinl(tg1[0])) nt1 = 0;
           if (nt1 != 1) { if (!rg_native_construct(c, ii, in, gn, dv, xl)) return 0; break; }   /* M5: a generic construct out of line (region_fn_native.inc) */
           K->kind = 0;
           K->tg = tg1[0];
@@ -2865,30 +3565,64 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
             J->cons = ki + 1;
             J->ploop = 0;
             if (J->depth > 14) return rg_fail(c, "inlining deeper than 14 (the exit chain holds 16 frames)");
-            if (!c->emit) K->site = rg_trust_on() ? qjs_aot_bundle_alloc_site(I->g, in->pc) : -1;
+            if (!c->emit) K->site = rg_trust_on() ? (qjs_aot_bundle_alloc_site(I->g, in->pc) > 0 || getenv("QJS_AOT_REGION_NOLATESITE") != NULL || getenv("QJS_AOT_REGION_NOCAP") != NULL ? qjs_aot_bundle_alloc_site(I->g, in->pc) : qjs_aot_bundle_alloc_site_late(I->g, in->pc)) : -1;
             if (J->wrap) {
               /* the forwarded call dispatches on the class of the object being built: the construct's own allocation site */
-              if (K->site <= 0) return rg_fail(c, "pc %d: the forwarding constructor's object has no single allocation site", in->pc);
-              J->cls1 = K->site + 1;
+              int ws_ = K->site > 0 ? K->site : (rg_trust_on() ? qjs_aot_bundle_alloc_site_any(I->g, in->pc) : 0);   /* a class that gains fields later has no single shape but its construct site still has its class */
+              if (ws_ <= 0) return rg_fail(c, "pc %d: the forwarding constructor's object has no allocation site", in->pc);
+              J->cls1 = ws_ + 1;
+              if (getenv("QJS_AOT_REGION_FWDONESITE") != NULL) {
+                /* vkit knock: the old rule, one forwarded construct site per region (the constructor digest is shared by every class) */
+                int k_;
+                for (k_ = 0; k_ < c->ncons; k_++) if (k_ != ki && c->cons[k_].fwd) return rg_fail(c, "pc %d: the forwarding constructor already builds an object at another construct site (FWDONESITE)", in->pc);
+              }
+              K->fwd = 1;
             }
             if (c->emit && held_) fprintf(o, "        if (__builtin_expect(rgon_ >= RG_OWNCAP, 0)) goto %s;   /* the owned list is full: leave before the site, the generic body goes on */\n", xl);
+            if (c->emit && getenv("QJS_AOT_FASTSTATS") != NULL) fprintf(o, "        rgn_%s[%d]++;\n", c->hex, ki);
+            if (c->emit && K->stack && K->virt && getenv("QJS_AOT_REGION_VFCHECK") == NULL) {
+              /* a virtual object has no block until something observes it: its shape word is the one thing the region reads (the guards of the methods it is the receiver of); the fields are locals,
+                 and the exits make the block (rg_vmat_) before they migrate it */
+              fprintf(o, "        *(void **)((uint8_t *)skb_%d + 8 + QJS_AOT_OFF_JSOBJECT_SHAPE) = rgc_s_%s_%d;\n        vk_%d = 1; vs_%d = 0; rn_%d = SKV_%d;\n", ki, c->hex, ki, ki, ki, ki, ki);
+            } else
             if (c->emit && K->stack) {
               /* the object of a stack pair: the previous incarnation (dead: nothing carries it) is released, the block is made again in the class's final shape */
               RStr rt_ = {0};
               rg_sk_release_text(c, ki, &rt_);
               if (K->knock) fprintf(o, "        if (!getenv(\"QJS_AOT_REGION_SRKNOCK\")) goto %s;   /* the knock-out build: only the knocked run makes it a stack object */\n", xl);
-              fprintf(o, "        { JSValue t_; %s\n          t_ = qjs_aot_stack_object_init(skb_%d, sizeof skb_%d, rgc_s_%s_%d);\n          if (__builtin_expect(JS_VALUE_GET_TAG(t_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n          sk_%d = 1; rn_%d = t_; }\n",
-                      rt_.p ? rt_.p : "", ki, ki, c->hex, ki, xl, ki, ki);
+              if (rg_img_ok(K)) {
+                /* the block is a copy of the image of the class's block (rg_img_build): the shape gains the reference the engine's init would give it */
+                fprintf(o, "        { JSValue t_; %s\n          if (__builtin_expect(rg_imgok_%s_%d, 1)) {\n            _Static_assert(RGIMGW_%s_%d * 8 <= sizeof(sks_b[0]), \"the image fits the slot\");\n"
+                           "            rg_img_copy(skb_%d, rg_img_%s_%d, RGIMGW_%s_%d);\n            ++*(int *)((uint8_t *)rgc_s_%s_%d - QJS_AOT_RC_BACK);\n            t_ = SKV_%d;\n",
+                        rt_.p ? rt_.p : "", c->hex, ki, c->hex, ki, ki, c->hex, ki, c->hex, ki, c->hex, ki, ki);
+                if (getenv("QJS_AOT_REGION_IMGCHECK") != NULL)
+                  fprintf(o, "            { _Alignas(64) uint64_t chk_[RGIMGW_%s_%d] = {0}; JSValue u_ = qjs_aot_stack_object_init_cap(chk_, sizeof chk_, rgc_s_%s_%d, %uu); unsigned w_;\n"
+                             "              for (w_ = 0; w_ < RGIMGW_%s_%d; w_++) {\n                uint64_t a_ = skb_%d[w_], b_ = chk_[w_];\n"
+                             "                if (w_ == 1 || w_ == 2) { a_ -= (uintptr_t)skb_%d; b_ -= (uintptr_t)chk_; } else if (w_ == RG_IMGPW) { a_ -= (uintptr_t)skb_%d; b_ -= (uintptr_t)chk_; }\n"
+                             "                if (a_ != b_) { fprintf(stderr, \"IMGCHECK cons %d word %%u: image %%llx init %%llx\\n\", w_, (unsigned long long)a_, (unsigned long long)b_); abort(); }\n              }\n"
+                             "              qjs_aot_stack_release(ctx, u_, JS_UNDEFINED); }\n",
+                          c->hex, ki, c->hex, ki, K->late ? rg_cons_cap(K) : 0u, c->hex, ki, ki, ki, ki, ki);
+                fprintf(o, "          } else {\n            t_ = qjs_aot_stack_object_init_cap(skb_%d, sizeof skb_%d, rgc_s_%s_%d, %uu);\n            if (__builtin_expect(JS_VALUE_GET_TAG(t_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n          }\n          sk_%d = 1; rn_%d = t_; }\n",
+                        ki, ki, c->hex, ki, K->late ? rg_cons_cap(K) : 0u, xl, ki, ki);
+              } else
+              fprintf(o, "        { JSValue t_; %s\n          t_ = qjs_aot_stack_object_init_cap(skb_%d, sizeof skb_%d, rgc_s_%s_%d, %uu);\n          if (__builtin_expect(JS_VALUE_GET_TAG(t_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n          sk_%d = 1; rn_%d = t_; }\n",
+                      rt_.p ? rt_.p : "", ki, ki, c->hex, ki, K->late ? rg_cons_cap(K) : 0u, xl, ki, ki);
               free(rt_.p);
+              if (K->virt) fprintf(o, "        vs_%d = 0; vk_%d = 1;\n", ki, ki);
             } else
             if (c->emit && K->direct)
               /* TRUST, one class shape: the object is made in its final shape (every field undefined) and the constructor's stores fill the slots */
-              fprintf(o, "        { JSValue t_ = qjs_aot_new_from_shape(ctx, rgc_s_%s_%d);\n"
-                         "          if (__builtin_expect(JS_IsException(t_), 0)) { JS_FreeValue(ctx, JS_GetException(ctx)); goto %s; }\n          %s; rn_%d = t_; }\n", c->hex, ki, xl, rel_, ki);
-            else if (c->emit)
-              fprintf(o, "        { JSValue t_; int rc_ = qjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(rgc_f_%s_%d), &t_);\n"
-                         "          if (__builtin_expect(rc_ <= 0, 0)) { if (rc_ < 0) JS_FreeValue(ctx, JS_GetException(ctx)); goto %s; }\n          %s; rn_%d = t_; }\n", c->hex, ki, xl, rel_, ki);
-            if (c->emit && K->direct && K->pre && getenv("QJS_AOT_REGION_PDNOPREFILL") == NULL)
+            {
+              /* the fields the class's objects gain after the construction walk (stores in the code that fills them) get room in the object, so that their adds are made in place:
+                 a property array that has to grow is the engine's to grow, and the add leaves the region */
+              fprintf(o, "        { JSValue t_ = qjs_aot_new_from_shape_cap(ctx, rgc_s_%s_%d, %du);\n"
+                         "          if (__builtin_expect(JS_IsException(t_), 0)) { JS_FreeValue(ctx, JS_GetException(ctx)); goto %s; }\n          %s; rn_%d = t_; }\n", c->hex, ki, rg_cons_cap(K), xl, rel_, ki);
+            }
+            else if (c->emit) {
+              fprintf(o, "        { JSValue t_; int rc_ = qjs_aot_construct_this_cap(ctx, (JSObject *)JS_VALUE_GET_PTR(rgc_f_%s_%d), &t_, %du);\n"
+                         "          if (__builtin_expect(rc_ <= 0, 0)) { if (rc_ < 0) JS_FreeValue(ctx, JS_GetException(ctx)); goto %s; }\n          %s; rn_%d = t_; }\n", c->hex, ki, rg_cons_cap(K), xl, rel_, ki);
+            }
+            if (c->emit && K->direct && K->pre && getenv("QJS_AOT_REGION_PDNOPREFILL") == NULL && !(K->stack && K->virt && getenv("QJS_AOT_REGION_VFCHECK") == NULL))   /* a virtual object has no block yet: its materialise writes the defaults */
               for (int jp_ = 0; jp_ < K->nn; jp_++)
                 if (K->pre & (1u << jp_)) fprintf(o, "        *q2_slotp(rn_%d, %du * QJS_AOT_SIZEOF_JSPROPERTY) = rgc_dv_%s_%d[%d];   /* the prototype's default, until the constructor's store */\n", ki, jp_, c->hex, ki, jp_);
             if (!rg_walk_inst(c, ci, rootcur, root)) return 0;
@@ -2933,7 +3667,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
           if (q_ < 0) return rg_fail(c, "pc %d: too many globals", in->pc);
           rg_note_park(c, ii);
           if (c->emit) {
-            rg_xlabel(c, rg_xit(c, ii, in->next), in->pc, "put-global-facts", xo, sizeof(xo));
+            rg_xlabel(c, rg_xit_x(c, ii, in->next), in->pc, "put-global-facts", xo, sizeof(xo));
             fprintf(o, "        { JSValue o_; int r_ = qjs_aot_global_put(ctx, rgga_%s[%d], %sv%d, %d, &o_);\n", c->hex, q_, I->pfx, u0, in->narg >= 3 ? (int)in->arg[2].val : 0);
             fprintf(o, "          if (__builtin_expect(r_ < 0, 0)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n");
             fprintf(o, "          if (__builtin_expect(r_ == 0, 0)) goto %s;\n", xl);
@@ -2957,6 +3691,23 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
         case ROP_return:
           if (u0 < 0) return rg_fail(c, "pc %d: return", in->pc);
           if (c->emit) {
+            if (is_root) {
+              int ka;
+              for (ka = 0; ka < c->ncons; ka++) if (c->cons[ka].stack && c->cons[ka].accum) {
+                /* the accumulator the root returns moves to the heap here */
+                char mg_[1400];
+                rg_mig_stmt(c, ka, mg_, sizeof(mg_));
+                if (rg_retslot_on()) {
+                  /* a caller that gave a shell (aot_nr_) gets the object in it: the shell takes the fields, the stack child goes to the heap alone; any refusal moves the object to the heap */
+                  const RCons *Ka = &c->cons[ka];
+                  fprintf(o, "        if (sk_%d && JS_VALUE_GET_PTR(%sv%d) == JS_VALUE_GET_PTR(SKV_%d)) {\n          if (rs_ != NULL && qjs_aot_slot_fill(ctx, *rs_, SKV_%d, ", ka, I->pfx, u0, ka, ka);
+                  if (Ka->chi > 0) fprintf(o, "SKV_%d) > 0) { sk_%d = 0; JSValue rv_ = *rs_;\n", Ka->chi - 1, Ka->chi - 1); else fprintf(o, "JS_UNDEFINED) > 0) { JSValue rv_ = *rs_;\n");
+                  rg_free_owned(c, o, "            ");
+                  fprintf(o, "            return rv_; }   /* the shell is the caller's block: its reference is not counted */\n          %s\n          %sv%d = sks_m[%d]; } }\n", mg_, I->pfx, u0, c->cons[ka].ss);
+                } else
+                  fprintf(o, "        if (sk_%d && JS_VALUE_GET_PTR(%sv%d) == JS_VALUE_GET_PTR(SKV_%d)) %s\n          %sv%d = sks_m[%d]; }\n", ka, I->pfx, u0, ka, mg_, I->pfx, u0, c->cons[ka].ss);
+              }
+            }
             if (is_root) { fprintf(o, "        { JSValue rv_ = %sv%d; q2_dup_p(rv_);\n", I->pfx, u0); rg_free_owned(c, o, "          "); fprintf(o, "          return rv_; } /* every value the region holds is borrowed: the caller gets its own reference */\n"); }
             else if (rg_rty_typed(I)) rg_res_set(o, I, u0);
             else fprintf(o, "        %sres = %sv%d; goto %sdone;\n", I->pfx, I->pfx, u0, I->pfx);
@@ -3002,18 +3753,75 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
             snprintf(I->cur[reg], 40, "%sv%u", I->pfx, (unsigned)in->def[d]);
         }
       }
+      if (c->emit) {
+        /* a move that makes the heap object of a stack object: it is migrated here and parked in the owned list (which holds the region's reference), and the result is the heap object */
+        int kq, mq;
+        for (kq = 0; kq < c->ncons; kq++) {
+          const RCons *Kq = &c->cons[kq];
+          if (!Kq->stack) continue;
+          for (mq = 0; mq < Kq->nmat; mq++) {
+            if (Kq->mat[mq][0] != ii || Kq->mat[mq][1] != 1 || Kq->mat[mq][2] != idx) continue;
+            /* the moved value is this object only when it is the block itself: several objects can reach one move (a value that is one of two constructs) */
+            rg_mig_stmt(c, kq, migs_, sizeof(migs_));
+            if (Kq->matacc[mq] > 0) {
+              /* the accumulator takes the object's fields (its stack child with them): the result is the accumulator; when it can not (it was moved, or the object does not fit) the object goes to the heap as it would otherwise */
+              const RCons *K0 = &c->cons[Kq->matacc[mq] - 1];
+              char c0_[24], cq_[24];
+              int knock_ = getenv("QJS_AOT_REGION_ACCUMKNOCK") != NULL;   /* a knock-out: a refused assignment is taken as done */
+              if (K0->chi > 0) snprintf(c0_, sizeof(c0_), "SKV_%d", K0->chi - 1); else snprintf(c0_, sizeof(c0_), "JS_UNDEFINED");
+              if (Kq->chi > 0) snprintf(cq_, sizeof(cq_), "SKV_%d", Kq->chi - 1); else snprintf(cq_, sizeof(cq_), "JS_UNDEFINED");
+              fprintf(o, "        if (sk_%d && JS_VALUE_GET_PTR(%sv%d) == JS_VALUE_GET_PTR(SKV_%d)) { if (sk_%d && %sqjs_aot_slot_assign(ctx, SKV_%d, %s, SKV_%d, %s)%s) %sv%d = SKV_%d; else %s%s\n          %sv%d = sks_m[%d]; } }\n",
+                      kq, I->pfx, u0, kq, (int)(K0 - c->cons), knock_ ? "(" : "", (int)(K0 - c->cons), c0_, kq, cq_, knock_ ? ", 1)" : "", I->pfx, dv, (int)(K0 - c->cons), migs_, getenv("QJS_AOT_FASTSTATS") != NULL ? (snprintf(fsmv_, sizeof(fsmv_), " rgm_%s[%d]++;", c->hex, kq), fsmv_) : "", I->pfx, dv, Kq->ss);
+              continue;
+            }
+            rg_mig_stmt(c, kq, migs_, sizeof(migs_));
+            fprintf(o, "        if (sk_%d && JS_VALUE_GET_PTR(%sv%d) == JS_VALUE_GET_PTR(SKV_%d)) %s%s\n          %sv%d = sks_m[%d]; }\n",
+                    kq, I->pfx, u0, kq, migs_, getenv("QJS_AOT_FASTSTATS") != NULL ? (snprintf(fsmv_, sizeof(fsmv_), " rgm_%s[%d]++;", c->hex, kq), fsmv_) : "", I->pfx, dv, Kq->ss);
+          }
+        }
+      }
     }
+    if (c->emit && b < 128) { I->bsnap[b] = I->snap; I->bpe[b] = I->prev_eff; }
     /* the block's terminator */
     if (B->nsucc == 0) continue;
     {
       const Q2Insn *last = B->ninsns > 0 ? &fn->insns[B->first_insn + B->ninsns - 1] : NULL;
       int s, j;
-      char edge[2][1536];
+      char edge[2][3072];
       for (s = 0; s < B->nsucc; s++) {
         size_t eo = 0;
         const Q2Block *T = &fn->blocks[B->succ_block[s]];
         edge[s][0] = 0;
-        rg_edge_text(I, B, s, T, edge[s], sizeof(edge[s]));   /* the parameter takes the argument in its own type (region_fn_var.inc) */
+        {
+          /* an object that moves to the heap on this edge: migrated here (parked in the owned list, which holds the region's reference), and the parameter takes the heap object */
+          char mpre[2600], fsm_[64], migs2_[1400];
+          int kq, mq;
+          mpre[0] = 0;
+          g_edge_ovr_n = 0;
+          for (kq = 0; kq < c->ncons && c->emit; kq++) {
+            const RCons *Kq = &c->cons[kq];
+            if (!Kq->stack) continue;
+            for (mq = 0; mq < Kq->nmat; mq++) {
+              if (Kq->mat[mq][0] != ii || Kq->mat[mq][1] != 0 || Kq->mat[mq][2] != b || Kq->mat[mq][3] != s || g_edge_ovr_n >= 4) continue;
+              if (getenv("QJS_AOT_FASTSTATS") != NULL) snprintf(fsm_, sizeof(fsm_), " rgm_%s[%d]++;", c->hex, kq); else fsm_[0] = 0;
+              rg_mig_stmt(c, kq, migs2_, sizeof(migs2_));
+              snprintf(mpre + strlen(mpre), sizeof(mpre) - strlen(mpre),
+                       "if (sk_%d && JS_VALUE_GET_PTR(%sv%d) == JS_VALUE_GET_PTR(SKV_%d)) %s%s } ",
+                       kq, I->pfx, Kq->mat[mq][4], kq, migs2_, fsm_);
+              g_edge_ovr_v[g_edge_ovr_n] = Kq->mat[mq][4];
+              g_edge_ovr_k[g_edge_ovr_n] = kq;
+              g_edge_ovr_s[g_edge_ovr_n] = Kq->ss;
+              g_edge_ovr_n++;
+            }
+          }
+          rg_edge_text(I, B, s, T, edge[s], sizeof(edge[s]));   /* the parameter takes the argument in its own type (region_fn_var.inc) */
+          g_edge_ovr_n = 0;
+          if (mpre[0]) {
+            char t_[3072];
+            snprintf(t_, sizeof(t_), "%s%s", mpre, edge[s]);
+            snprintf(edge[s], sizeof(edge[s]), "%s", t_);
+          }
+        }
         eo = strlen(edge[s]);
         if (getenv("QJS_AOT_REGION_WHY") && rg_trust_on() && fn->rpo_pos != NULL) fprintf(stderr, "compact: root %.8s inst %d block %d -> %d %s ok=%d\n", c->hex, ii, b, B->succ_block[s], fn->rpo_pos[B->succ_block[s]] <= fn->rpo_pos[b] ? "BACK" : "fwd", rg_compact_ok(fn, B->succ_block[s]));
         if (rg_trust_on() && ii < 256 && c->park[ii] && rg_compact_ok(fn, B->succ_block[s])) {
@@ -3033,7 +3841,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
         const char *cmp = rg_subop(last->sub);
         int a = (int)last->use[0], bb = (int)last->use[1];
         char xl2[32];
-        rg_xlabel(c, rg_xit(c, ii, last->pc), last->pc, I->pfx, xl2, sizeof(xl2));
+        rg_xlabel(c, rg_xit_x(c, ii, last->pc), last->pc, I->pfx, xl2, sizeof(xl2));
         if (cmp == NULL || last->nuse < 2) return rg_fail(c, "pc %d: a compare-branch of kind %d", last->pc, last->sub);
         if (last->rop == ROP_inc_branch_lt || last->rop == ROP_inc_branch_lt_s) {
           /* `d = d + 1` in place, then compare d with the bound: the exits above leave with d as it was (the generic body does the increment), so the table still has the old d */
@@ -3081,7 +3889,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
         /* a branch on null (the tag), or on null-or-undefined (an object is never nullish unless it is an HTMLDDA object, which leaves) */
         int a = (int)last->use[0], neg = last->rop == ROP_branch_not_null || last->rop == ROP_branch_not_nullish;
         char xl2[32];
-        rg_xlabel(c, rg_xit(c, ii, last->pc), last->pc, I->pfx, xl2, sizeof(xl2));
+        rg_xlabel(c, rg_xit_x(c, ii, last->pc), last->pc, I->pfx, xl2, sizeof(xl2));
         if (last->nuse < 1) return rg_fail(c, "pc %d: a null branch without an operand", last->pc);
         if (last->rop == ROP_branch_null || last->rop == ROP_branch_not_null)
           fprintf(o, "        { int nv_ = JS_VALUE_GET_TAG(%sv%d) == JS_TAG_NULL;\n", I->pfx, a);
@@ -3093,7 +3901,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
       } else if (last != NULL && last->op == Q2_OP_BRANCH && B->nsucc == 2) {
         int a = (int)last->use[0];
         char xl2[32];
-        rg_xlabel(c, rg_xit(c, ii, last->pc), last->pc, I->pfx, xl2, sizeof(xl2));
+        rg_xlabel(c, rg_xit_x(c, ii, last->pc), last->pc, I->pfx, xl2, sizeof(xl2));
         if (rg_ty_num(I, a)) {
           /* a number of known representation: its truthiness (a double is false for 0, -0 and NaN) */
           ROpd ao_;
@@ -3112,7 +3920,7 @@ static int rg_walk_inst(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *root
       } else if (B->nsucc == 1) {
         /* a back edge polls (the root's and an inlined function's): a handler may run anything, so a poll that ran one leaves the region */
         if (fn->rpo_pos != NULL && fn->rpo_pos[B->succ_block[0]] <= fn->rpo_pos[b]) {
-          int xi = rg_xit(c, ii, fn->blocks[B->succ_block[0]].start_pc);
+          int xi = rg_xit_x(c, ii, fn->blocks[B->succ_block[0]].start_pc);
           if (rg_trust_on() && getenv("QJS_AOT_REGION_POLLEXIT") == NULL)
             /* TRUST: the poll is served here and the loop goes on (a long-running region left at its first poll would run the rest generic); an
                interrupt leaves with its exception */
@@ -3152,6 +3960,7 @@ static void rg_emit_init(RCtx *c) {
   if (any_intr) fprintf(o, "static JSValue rg_pf_%s;\n", h);
   if (any_pop) fprintf(o, "static JSValue rg_pp_%s;\n", h);
   fprintf(o, "static void *rk_s_%s[%d]; static JSObject *rk_p_%s[%d];\n", h, c->ncls > 0 ? c->ncls : 1, h, c->ncls > 0 ? c->ncls : 1);
+  if (c->ndsh > 0) fprintf(o, "static void *rk_dx_%s[%d];   /* the shapes the per-site dispatches test against (T13) */\n", h, c->ndsh);
   {
     int any_ms = 0, kq, sq;
     for (kq = 0; kq < c->ncls; kq++) if (c->cls[kq].nsh > 1) any_ms = 1;
@@ -3160,6 +3969,7 @@ static void rg_emit_init(RCtx *c) {
          shorter that an add of the atom rk_ta_[k][s] turns into s (-1: none observed), so a store that adds a field to an object of shape p is the constant transition to the s with rk_tp_[k][s] == p
          and that atom */
       fprintf(o, "static void *rk_sx_%s[%d][%d]; static uint32_t rk_ta_%s[%d][%d];\n", h, c->ncls, QJS_AOT_MAXSHAPES, h, c->ncls, QJS_AOT_MAXSHAPES);
+      fprintf(o, "static inline __attribute__((always_inline)) int rg_inx_%s(void *const *tab, int n, const void *sh) { int i; for (i = 1; i < n; i++) if (tab[i] == sh) return 1; return 0; }\n", h);
       fprintf(o, "static const uint8_t rk_ns_%s[%d] = {", h, c->ncls);
       for (kq = 0; kq < c->ncls; kq++) fprintf(o, "%s%d", kq ? "," : "", c->cls[kq].nsh > 1 ? c->cls[kq].nsh : 0);
       fprintf(o, "};\nstatic const int8_t rk_tp_%s[%d][%d] = {", h, c->ncls, QJS_AOT_MAXSHAPES);
@@ -3172,7 +3982,9 @@ static void rg_emit_init(RCtx *c) {
     }
   }
   fprintf(o, "static uint32_t rgga_%s[%d]; static JSValue rgp_%s[%d]; static JSObject *rgp_o_%s[%d];\n", h, c->ngv > 0 ? c->ngv : 1, h, c->ncp > 0 ? c->ncp : 1, h, c->ncp > 0 ? c->ncp : 1);
-  for (q = 0; q < c->ncons; q++) if (c->cons[q].kind == 0 && c->cons[q].direct) fprintf(o, "static void *rgc_s_%s_%d;\n", h, q);
+  for (q = 0; q < c->ncons; q++) if (c->cons[q].kind == 0 && c->cons[q].direct && !c->cons[q].rslot) fprintf(o, "static void *rgc_s_%s_%d;\n", h, q);
+  for (q = 0; q < c->ncons; q++) if (rg_img_ok(&c->cons[q])) { fprintf(o, "#ifndef RG_IMGW\n#define RG_IMGW(room) ((8 + QJS_AOT_OFF_JSOBJECT_PROP + 16 + (room) * QJS_AOT_SIZEOF_JSPROPERTY) / 8)\n#define RG_IMGPW ((8 + QJS_AOT_OFF_JSOBJECT_PROP) / 8)\n#define RG_IMGPU (8 + QJS_AOT_OFF_JSOBJECT_PROP + 16)\nstatic int rg_img_build(JSContext *, void *, unsigned, uint64_t *, unsigned);\n#endif\n"); break; }
+  for (q = 0; q < c->ncons; q++) if (rg_img_ok(&c->cons[q])) fprintf(o, "#define RGIMGW_%s_%d RG_IMGW(%u)\nstatic uint64_t rg_img_%s_%d[RGIMGW_%s_%d]; static uint8_t rg_imgok_%s_%d;\n", h, q, rg_stack_room(&c->cons[q]), h, q, h, q, h, q);
   fprintf(o, "static uint8_t rg_ini_%s, rg_itry_%s;\n", h, h);
   /* init failures and the entries the fallback (the speculative body, aot_fs_) served instead of the region; QJS_AOT_STATS=1 prints them at exit */
   fprintf(o, "static uint32_t rg_ifail_%s, rg_byp_%s;\nstatic JSValue aot_fs_%s(JSContext *, JSRegRun *, JSValue *, uint32_t);\n", h, h, h);
@@ -3242,6 +4054,12 @@ static void rg_emit_init(RCtx *c) {
       if (ns_ > 1) fprintf(o, "  JS_FreeValue(ctx, cur); cur = JS_UNDEFINED;\n");
     }
     fprintf(o, "  qjs_aot_ctor_prepare(ctx, F);\n");
+    if (K->need_layout) {
+      /* a class made last has no later constructor closure to build its row (the unit builds a row when a closure of the same digest is created or constructs): ask for it now,
+         before the class shape is made, so the shape carries the layout id */
+      fprintf(o, "  { uint8_t ldg_[16]; int qjs_aot_layout_ctor(const uint8_t digest[16]); void qjs_aot_layout_fn_created(JSContext *ctx, JSValue fn, const uint8_t digest[16]);\n");
+      fprintf(o, "    if (qjs_aot_function_digest(F, ldg_) && qjs_aot_layout_ctor(ldg_)) qjs_aot_layout_fn_created(ctx, F, ldg_); }\n");
+    }
     fprintf(o, "  if (!rg_dat_%s(ctx, F, \"prototype\", &P) || JS_VALUE_GET_TAG(P) != JS_TAG_OBJECT || !rg_kx_%s(ctx, F, \"prototype\", P))", h, h); RG_FAIL_("class prototype");
     fprintf(o, "  { uint32_t at_[%d]; int i_; void *sh_;\n", K->nn > 0 ? K->nn : 1);
     for (j = 0; j < K->nn; j++) { fprintf(o, "    at_[%d] = (uint32_t)JS_NewAtom(ctx, ", j); rg_cstr(o, K->names[j]); fprintf(o, ");\n"); }
@@ -3276,7 +4094,34 @@ static void rg_emit_init(RCtx *c) {
         fprintf(o, "    q2_ph[q2_phn++] = sh_; rk_sx_%s[%d][%d] = sh_; }\n", h, k, sq);
       }
     }
+    for (q = 0; q < c->ndsh; q++) {
+      const struct RDsh *D = &c->dsh[q];
+      if (D->k != k) continue;
+      fprintf(o, "  /* dispatch shape %d of class %s: its ordered fields, built from the prototype and held */\n  { uint32_t at_[%d]; int i_; void *sh_;\n", q, K->ctor, D->nn > 0 ? D->nn : 1);
+      for (j = 0; j < D->nn; j++) { fprintf(o, "    at_[%d] = (uint32_t)JS_NewAtom(ctx, ", j); rg_cstr(o, D->names[j]); fprintf(o, ");\n"); }
+      fprintf(o, "    sh_ = qjs_aot_class_shape(ctx, P, at_, %d);\n    for (i_ = 0; i_ < %d; i_++) JS_FreeAtom(ctx, (JSAtom)at_[i_]);\n", D->nn, D->nn);
+      fprintf(o, "    if (sh_ == NULL || q2_phn >= Q2_PH_MAX)"); RG_FAIL_("dispatch shape");
+      fprintf(o, "    q2_ph[q2_phn++] = sh_; rk_dx_%s[%d] = sh_; }\n", h, q);
+    }
     fprintf(o, "  rk_p_%s[%d] = (JSObject *)JS_VALUE_GET_PTR(P);\n  JS_FreeValue(ctx, F); JS_FreeValue(ctx, P); F = P = JS_UNDEFINED;\n", h, k);
+  }
+  {
+    /* the shapes of object literals (T13): built on Object.prototype, the prototype a fresh `{}` has */
+    int any_ = 0;
+    for (q = 0; q < c->ndsh; q++) if (c->dsh[q].k < 0) any_ = 1;
+    if (any_) {
+      fprintf(o, "  { JSValue t_ = JS_NewObject(ctx), op_ = JS_IsException(t_) ? JS_UNDEFINED : JS_GetPrototype(ctx, t_); JS_FreeValue(ctx, t_);\n    if (JS_VALUE_GET_TAG(op_) != JS_TAG_OBJECT) { JS_FreeValue(ctx, op_); goto out; }\n");
+      for (q = 0; q < c->ndsh; q++) {
+        const struct RDsh *D = &c->dsh[q];
+        if (D->k >= 0) continue;
+        fprintf(o, "    { uint32_t at_[%d]; int i_; void *sh_;\n", D->nn > 0 ? D->nn : 1);
+        for (j = 0; j < D->nn; j++) { fprintf(o, "      at_[%d] = (uint32_t)JS_NewAtom(ctx, ", j); rg_cstr(o, D->names[j]); fprintf(o, ");\n"); }
+        fprintf(o, "      sh_ = qjs_aot_class_shape(ctx, op_, at_, %d);\n      for (i_ = 0; i_ < %d; i_++) JS_FreeAtom(ctx, (JSAtom)at_[i_]);\n", D->nn, D->nn);
+        fprintf(o, "      if (sh_ == NULL || q2_phn >= Q2_PH_MAX) { JS_FreeValue(ctx, op_); %s goto out; }\n", fs ? "fprintf(stderr, \"region init literal shape\\n\");" : "");
+        fprintf(o, "      q2_ph[q2_phn++] = sh_; rk_dx_%s[%d] = sh_; }\n", h, q);
+      }
+      fprintf(o, "    JS_FreeValue(ctx, op_); }\n");
+    }
   }
   /* dispatch arms */
   for (gi = 0; gi < c->ngd; gi++) {
@@ -3351,7 +4196,7 @@ static void rg_emit_init(RCtx *c) {
   /* constructs */
   for (q = 0; q < c->ncons; q++) {
     const RCons *K = &c->cons[q];
-    if (K->kind == 2) continue;
+    if (K->kind == 2 || K->rslot) continue;
     fprintf(o, "  if (!rgc_ok_%s_%d && !rg_clearn_%s_%d(ctx))", h, q, h, q); RG_FAIL_("construct");
     if (K->kind == 0 && K->direct) {
       /* the region makes these objects itself: the engine's first-construct work (the unit's layout chain) is done here */
@@ -3362,6 +4207,7 @@ static void rg_emit_init(RCtx *c) {
       fprintf(o, "    rgc_s_%s_%d = qjs_aot_class_shape(ctx, P, at_, %d);\n    for (i_ = 0; i_ < %d; i_++) JS_FreeAtom(ctx, (JSAtom)at_[i_]); }\n", h, q, K->nn, K->nn);
       fprintf(o, "  JS_FreeValue(ctx, P); P = JS_UNDEFINED;\n  if (rgc_s_%s_%d == NULL || q2_phn >= Q2_PH_MAX)", h, q); RG_FAIL_("construct shape");
       fprintf(o, "  q2_ph[q2_phn++] = rgc_s_%s_%d;\n", h, q);
+      if (rg_img_ok(K)) fprintf(o, "  rg_imgok_%s_%d = (uint8_t)rg_img_build(ctx, rgc_s_%s_%d, %uu, rg_img_%s_%d, RGIMGW_%s_%d);\n", h, q, h, q, K->late ? rg_cons_cap(K) : 0u, h, q, h, q);
       if (getenv("QJS_AOT_REGION_SHAPECHECK") != NULL) {
         fprintf(o, "  { JSValue i_ = JS_CallConstructor(ctx, rgc_f_%s_%d, 0, NULL); if (JS_IsException(i_)) JS_FreeValue(ctx, JS_GetException(ctx)); else { const void *is_ = *(const void *const *)((const char *)JS_VALUE_GET_PTR(i_) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n", h, q);
         fprintf(o, "    fprintf(stderr, \"shapecheck construct %s %%s: instance %%p class %%p\\n\", is_ == rgc_s_%s_%d ? \"SAME\" : \"DIFFERENT\", is_, rgc_s_%s_%d); JS_FreeValue(ctx, i_); } }\n", K->gname, h, q, h, q);
@@ -3445,7 +4291,7 @@ static void rg_emit_learners(RCtx *c) {
     for (ki = 0; ki < c->ncons; ki++) {
       const RCons *K = &c->cons[ki];
       const char *h = c->hex;
-      if (K->kind == 2) continue;
+      if (K->kind == 2 || K->rslot) continue;
       int fs_ = getenv("QJS_AOT_FASTSTATS") != NULL, ni;
       fprintf(o, "static JSValue rgc_f_%s_%d; static JSAtom rgc_at_%s_%d[16]; static uint8_t rgc_ok_%s_%d, rgc_try_%s_%d;\n", h, ki, h, ki, h, ki, h, ki);
       fprintf(o, "static JSValue rgc_dv_%s_%d[16];   /* the prototype defaults a direct object starts with (primitives: no reference is held) */\n", h, ki);
@@ -3668,26 +4514,227 @@ static int g_rg_nneed;
    Anything else (stored as a value, compared, returned, an argument or receiver of an out-of-line or unresolved call, an operation the analysis does not know)
    is an escape and the object stays on the heap. */
 static int g_sr_line;
-static int sr_no(int line, int n) { if (!g_sr_line) g_sr_line = line; (void)n; return 0; }
-typedef struct { RCtx *c; char arrname[40]; int arrinst, arrpc, arrfound; int fail, budget; int vis[256][3]; int nvis; } RSR;
+static int g_sr_at_n, g_sr_at_pc, g_sr_at_pos, g_sr_at_fline;
+static int g_sr_wait;   /* set when a construct was refused only because its container is not decided yet */
+static char g_sr_at_op[40], g_sr_at_fn[48];   /* the instance, pc and operand position of the use being checked (the first failure is reported with them) */
+/* Whether every path from the entry of fn to the end of the function passes through instruction k's block (the block post-dominates the entry): a store there is made whenever the function runs to its end. */
+static int sr_on_all_paths(const Q2Func *fn, int k) {
+  int b, tb = -1, nb = fn->nblocks, top = 0, ok = 1;
+  int *stk, *seen;
+  for (b = 0; b < nb; b++) if (k >= fn->blocks[b].first_insn && k < fn->blocks[b].first_insn + fn->blocks[b].ninsns) tb = b;
+  if (tb < 0 || nb <= 0) return 0;
+  if (tb == 0) return 1;
+  stk = malloc(sizeof(int) * (size_t)nb * 2); seen = calloc((size_t)nb, sizeof(int));
+  if (stk == NULL || seen == NULL) { free(stk); free(seen); return 0; }
+  stk[top++] = 0; seen[0] = 1;
+  while (top > 0 && ok) {
+    const Q2Block *B = &fn->blocks[stk[--top]];
+    int sidx;
+    if (B->nsucc == 0) { ok = 0; break; }
+    for (sidx = 0; sidx < B->nsucc; sidx++) {
+      int t = B->succ_block[sidx];
+      if (t < 0 || t >= nb) { ok = 0; break; }
+      if (t == tb || seen[t]) continue;
+      seen[t] = 1; stk[top++] = t;
+    }
+  }
+  free(stk); free(seen);
+  return ok;
+}
+static void sr_vno_at(void *sp, int line, int n, int pc);
+static int sr_no(int line, int n) { if (!g_sr_line) { g_sr_line = line; if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj:   refused at line %d: instance %d pc %d position %d op %s in %s (js line %d)\n", line, g_sr_at_n, g_sr_at_pc, g_sr_at_pos, g_sr_at_op, g_sr_at_fn[0] ? g_sr_at_fn : "<anon>", g_sr_at_fline); } (void)n; return 0; }
+typedef struct { RCtx *c; char arrname[40]; int arrinst, arrpc, arrfound; int fail, budget; int vis[256][3]; int nvis; int cinst, cpc, nmat, mat[4][5], nok, okinst[8]; unsigned long long okcnt[8]; const RCons *K; int latestore; int par, npar; char pfield[40]; int nst, stover; short st[64][4]; int vok, vstore, nvthis; unsigned vcov; short vthis[32]; int nls, ls[4][4]; int matacc[4], retmat; } RSR;
+static void sr_vno_at(void *sp, int line, int n, int pc) {
+  RSR *s = (RSR *)sp;
+  if (s->vok && getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "virtual:   not virtual at region.c:%d (instance %d pc %d)\n", line, n, pc);
+  s->vok = 0;
+}
 static int sr_obj(RSR *s, int n, int v, int kind);
+static unsigned rg_lent_pred_get(const char *hex);
+static void rg_lent_assume(const char *callee, const char *caller, unsigned m);
+/* A stack object handed to parameter `idx` of an out-of-line callee (instance j): allowed when that callee only reads the parameter (its lent mask) and the call is a direct native call; the site
+   (instance, call instruction, value) is recorded, and after the whole object is known no alias of it may be live past the call (the callee may move the block to the heap). */
+static int sr_lend_ok(RSR *s, int j, int idx, int n, int kidx, int v) {
+  RInst *J = s->c->in[j];
+  char hx[33];
+  int q;
+  if (getenv("QJS_AOT_REGION_NOLEND") != NULL || J->g == NULL || idx < 0 || idx > 7) return 0;
+  rg_hexof(J->g, hx);
+  if (!((rg_lent_pred_get(hx) >> idx) & 1)) return 0;
+  for (q = 0; q < s->nls; q++) if (s->ls[q][0] == n && s->ls[q][1] == kidx && s->ls[q][2] == v) return 1;
+  if (s->nls >= 4) return 0;
+  s->ls[s->nls][0] = n; s->ls[s->nls][1] = kidx; s->ls[s->nls][2] = v; s->ls[s->nls][3] = idx;
+  s->nls++;
+  return 1;
+}
+/* An edge where the object may be moved to the heap instead of being an escape: the block runs rarely against the construct (a quarter or less of its count in the profile). The
+   value must also be dead after the edge (checked once the whole object is known). */
+unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
+/* a moved object costs more than a heap one: only a place the profile reaches 1 in this many times as often as the object is made */
+static unsigned long long sr_mat_ratio(void) { const char *e = getenv("QJS_AOT_REGION_MATRATIO"); return e != NULL ? (unsigned long long)atoi(e) : 8ull; }
+static int sr_accum_on(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_REGION_ACCUM") != NULL && getenv("QJS_AOT_REGION_NOACCUM") == NULL; return v; }
+/* The accumulator a move assigns into: a stack object of the root that the root returns, whose value the move's result joins (it flows over an edge into a parameter the accumulator reaches), with
+   none of the accumulator's values used after the move. -1 when there is none. */
+static int sr_acc_target(RSR *s, RInst *A, int n, int idx) {
+  RCtx *c = s->c;
+  const Q2Func *fn = &A->q;
+  const Q2Insn *in = &fn->insns[idx];
+  int k, b, sidx, j, w;
+  if (!sr_accum_on() || n != 0 || in->ndef < 1) return -1;
+  for (k = 0; k < c->ncons; k++) {
+    const RCons *K = &c->cons[k];
+    int found = 0;
+    if (!K->stack || !K->accum || K->inst != 0 || K == s->K) continue;
+    for (b = 0; b < fn->nblocks && !found; b++) {
+      const Q2Block *B = &fn->blocks[b];
+      if (fn->rpo_pos != NULL && fn->rpo_pos[b] < 0) continue;
+      for (sidx = 0; sidx < B->nsucc && !found; sidx++) {
+        const Q2Block *T = &fn->blocks[B->succ_block[sidx]];
+        for (j = 0; j < B->nedge_args[sidx] && j < T->nparams && !found; j++)
+          if ((int)B->edge_arg[sidx][j] == (int)in->def[0])
+            for (w = 0; w < K->acn; w++) if (K->acv[w] == (int)T->param_val[j]) found = 1;
+      }
+    }
+    if (!found) { if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj:   accumulator cons %d: the move at insn %d (value %d) does not reach its parameters\n", k, idx, (int)in->def[0]); continue; }
+    for (w = 0; w < K->acn; w++) {
+      int lv_;
+      g_lw_param_kill = 1;
+      lv_ = rg_live_walk(fn, idx + 1, (Q2ValueId)K->acv[w], -1);
+      g_lw_param_kill = 0;
+      if (lv_) { if (getenv("QJS_AOT_REGION_WHY")) { int vv_ = K->acv[w], bb_, ii_; fprintf(stderr, "stackobj:   accumulator cons %d: its value %d (block %d insn %d param %d) is used after the move at insn %d\n", k, vv_, fn->values[vv_].block, fn->values[vv_].insn, fn->values[vv_].param_of, idx);
+          for (bb_ = 0; bb_ < fn->nblocks; bb_++) { const Q2Block *Bq_ = &fn->blocks[bb_]; int s_, j_; for (ii_ = Bq_->first_insn; ii_ < Bq_->first_insn + Bq_->ninsns; ii_++) { int u_; for (u_ = 0; u_ < fn->insns[ii_].nuse; u_++) if ((int)fn->insns[ii_].use[u_] == vv_) fprintf(stderr, "  use in block %d insn %d\n", bb_, ii_); } for (s_ = 0; s_ < Bq_->nsucc; s_++) for (j_ = 0; j_ < Bq_->nedge_args[s_]; j_++) if ((int)Bq_->edge_arg[s_][j_] == vv_) fprintf(stderr, "  edge arg block %d succ %d -> block %d arg %d\n", bb_, s_, Bq_->succ_block[s_], j_); } } return -1; }
+    }
+    return k;
+  }
+  return -1;
+}
+static int g_sr_nomat;   /* set during a walk that may not use the moves to the heap */
+static int sr_mat_edge(RSR *s, RInst *A, int n, int b, int sidx, int v) {
+  const Q2Func *fn = &A->q;
+  const Q2Block *B = &fn->blocks[b];
+  unsigned long long cb, cc;
+  int q;
+  for (q = 0; q < s->nok && s->okinst[q] != n; q++) {}
+  if (q == s->nok) return 0;   /* only where the object is held by this function's values alone: the construct's own instance and the callers it was returned to */
+  if (g_sr_nomat || getenv("QJS_AOT_REGION_NOMAT") != NULL || A->g == NULL || B->ninsns <= 0 || s->nmat >= 4 || A->ool) return 0;
+  cb = qjs_aot_prof_pc_count(A->g->digest, fn->insns[B->first_insn + B->ninsns - 1].pc);
+  cc = s->okcnt[q];   /* how often the object arrives in this function */
+  if (cb == 0 || cc == 0 || cb * sr_mat_ratio() > cc) return 0;   /* a place the profile never ran is cold code (an exit), its frequency unknown */
+  for (q = 0; q < s->nmat; q++) if (s->mat[q][0] == n && s->mat[q][1] == 0 && s->mat[q][2] == b && s->mat[q][3] == sidx && s->mat[q][4] == v) return 1;
+  if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj:   edge of block %d in instance %d (%s): %llu times against %llu arrivals\n", b, n, A->g != NULL && A->g->name[0] ? A->g->name : "<anon>", cb, cc);
+  s->mat[s->nmat][0] = n; s->mat[s->nmat][1] = 0; s->mat[s->nmat][2] = b; s->mat[s->nmat][3] = sidx; s->mat[s->nmat][4] = v;
+  s->nmat++;
+  return 1;
+}
+/* The same for a move (`best = info`): the result is the heap object. */
+static int sr_mat_move(RSR *s, RInst *A, int n, int idx) {
+  const Q2Func *fn = &A->q;
+  const Q2Insn *in = &fn->insns[idx];
+  unsigned long long cb, cc;
+  int q, acc;
+  for (q = 0; q < s->nok && s->okinst[q] != n; q++) {}
+  if (q == s->nok || in->ndef < 1) return 0;
+  if (g_sr_nomat || getenv("QJS_AOT_REGION_NOMAT") != NULL || A->g == NULL || s->nmat >= 4 || A->ool) return 0;
+  cb = qjs_aot_prof_pc_count(A->g->digest, in->pc);
+  cc = s->okcnt[q];
+  acc = sr_acc_target(s, A, n, idx);
+  if (cb == 0 || cc == 0 || (acc < 0 && cb * sr_mat_ratio() > cc)) return 0;   /* a place the profile never ran is cold code (an exit), its frequency unknown */
+  for (q = 0; q < s->nmat; q++) if (s->mat[q][0] == n && s->mat[q][1] == 1 && s->mat[q][2] == idx) return 1;
+  if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj:   move at instance %d pc %d (%s): %llu times against %llu arrivals\n", n, in->pc, A->g != NULL && A->g->name[0] ? A->g->name : "<anon>", cb, cc);
+  s->mat[s->nmat][0] = n; s->mat[s->nmat][1] = 1; s->mat[s->nmat][2] = idx; s->mat[s->nmat][3] = 0; s->mat[s->nmat][4] = (int)in->def[0];
+  s->matacc[s->nmat] = acc + 1;
+  s->nmat++;
+  return 1;
+}
 static int sr_has_use(const Q2Insn *in, int v, int *pos) {
   int j;
   for (j = 0; j < in->nuse; j++) if ((int)in->use[j] == v) { *pos = j; return 1; }
   for (j = 0; j < in->win_n && in->win_val != NULL; j++) if ((int)in->win_val[j] == v) { *pos = 100 + j; return 1; }
   return 0;
 }
+/* Whether any alias of the container K0 (the ones its analysis followed) reads the field `nm`: such a read hands out whatever the field holds, and a field that holds a stack child is not a value
+   that may flow on. */
+static int sr_k_reads(RCtx *c, const RCons *K0, const char *nm) {
+  int w;
+  if (K0->nkvis <= 0) return 1;
+  for (w = 0; w < K0->nkvis; w++) {
+    RInst *A = c->in[K0->kvis[w][0]];
+    int v = K0->kvis[w][1], k;
+    if (A == NULL) return 1;
+    for (k = 0; k < A->q.ninsns; k++) {
+      const Q2Insn *in = &A->q.insns[k];
+      int pos, a;
+      char an[40];
+      if (!sr_has_use(in, v, &pos)) continue;
+      switch (in->rop) {
+        case ROP_get_field: case ROP_get_field_own: case ROP_get_field2: case ROP_get_field2_own: case ROP_get_field_chain: case ROP_get_field_chain_own:
+          if (pos != 0) break;
+          for (a = 0; a < 3; a++) if (rg_atom_n(in, a, an, sizeof(an)) && strcmp(an, nm) == 0) return 1;
+          break;
+        default: break;
+      }
+    }
+  }
+  return 0;
+}
+/* Whether the object constructed by the instance A (a store of `this` in its constructor walk) may take the construct `s->K`'s place as a stack child of that container's field `nm`. */
+/* WHY only: the first condition of the child-store rule that a refused put_field of a constructed object into a field fails */
+static void sr_child_why(RSR *s, const RInst *A, const Q2Insn *in, int kind, int pos, const char *nm) {
+  RCtx *c = s->c;
+  const RCons *K0;
+  const char *r = "?";
+  int q;
+  if (!getenv("QJS_AOT_REGION_WHY")) return;
+  if (pos != 1) r = "the object is the stored value's container, not the stored value (position != 1)";
+  else if (kind != 0) r = "the stored value is not a kind-0 object";
+  else if (!A->fresh) r = "the store is not in a fresh constructor instance";
+  else if (A->cons <= 0 || A->cons > c->ncons) r = "no container construct for this instance";
+  else if (!rg_is_this(&A->q, in->use[0])) r = "the container is not `this` of the store's function (the store goes through another reference)";
+  else if (getenv("QJS_AOT_REGION_NOCHILD") != NULL) r = "NOCHILD";
+  else if (s->K == NULL || s->K->kind != 0) r = "the stored construct is not kind 0";
+  else {
+    K0 = &c->cons[A->cons - 1];
+    if (K0 == s->K) r = "the container is the stored construct itself";
+    else if (!K0->stack) r = "the container is a heap object (not a stack construct)";
+    else if (K0->kind != 0) r = "the container is not kind 0";
+    else if (K0->chi != 0) r = "the container is itself a child";
+    else if (K0->par != 0) r = "the container has a parent";
+    else if (K0->sk_pair >= 0) r = "the container is paired with an Array";
+    else if (K0->nkvis <= 0) r = "the container's fields are not visible (late field / not walked in its constructor)";
+    else if (s->npar != 0) r = "the stored construct already has a container";
+    else { for (q = 0; q < K0->nn && strcmp(K0->names[q], nm) != 0; q++) {}
+      if (q == K0->nn) r = "the field is not one of the container's constructor fields (late field)";
+      else if (sr_k_reads(c, K0, nm)) r = "the container's field is read where the child could be seen (reads F)"; }
+  }
+  fprintf(stderr, "stackobj:   child store .%s refused: %s [inst %d fresh=%d cons=%d par=%d par_kind=%d par_call_pc=%d ool=%d; parent fresh=%d cons=%d par=%d par_kind=%d] (store pc %d in %s, %lld executions)\n", nm, r, A->id, A->fresh, A->cons, A->par, A->par_kind, A->par_call_pc, A->ool, A->par >= 0 ? c->in[A->par]->fresh : -1, A->par >= 0 ? c->in[A->par]->cons : -1, A->par >= 0 ? c->in[A->par]->par : -1, A->par >= 0 ? c->in[A->par]->par_kind : -1, in->pc, A->g != NULL ? A->g->name : "?", A->g != NULL ? (long long)qjs_aot_prof_pc_count(A->g->digest, in->pc) : 0LL);
+}
+static int sr_child_ok(RSR *s, const RInst *A, const char *nm) {
+  RCtx *c = s->c;
+  const RCons *K0;
+  int q;
+  if (getenv("QJS_AOT_REGION_NOCHILD") != NULL || s->K == NULL || s->K->kind != 0 || A->cons <= 0 || A->cons > c->ncons) return 0;
+  K0 = &c->cons[A->cons - 1];
+  if (!K0->stack && K0 > s->K && K0->kind == 0 && K0->direct && !K0->esc && A->fresh) g_sr_wait = 1;
+  if (K0 == s->K || !K0->stack || K0->kind != 0 || K0->chi != 0 || K0->par != 0 || K0->sk_pair >= 0 || K0->nkvis <= 0 || s->npar != 0) return 0;
+  for (q = 0; q < K0->nn && strcmp(K0->names[q], nm) != 0; q++) {}
+  if (q == K0->nn || sr_k_reads(c, K0, nm)) return 0;
+  s->par = A->cons;
+  s->npar++;
+  snprintf(s->pfield, sizeof(s->pfield), "%s", nm);
+  return 1;
+}
 /* the uses of the receiver (`this`) of instance j */
 static int sr_recv(RSR *s, int j, int kind) {
   RInst *A = s->c->in[j];
   int k;
+  if (kind == 0) { if (s->nvthis < 32) s->vthis[s->nvthis++] = (short)j; else s->vok = 0; }   /* `this` of instance j is the object: the reads of its fields in j are virtual reads */
   for (k = 0; k < A->q.ninsns; k++) {
     const Q2Insn *in = &A->q.insns[k];
     char nm[40];
     if (in->rop == ROP_load_this) { if (in->ndef < 1 || !sr_obj(s, j, (int)in->def[0], kind)) return sr_no(__LINE__, 0); }
     else if (in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2) {
       if (!rg_atom(in, nm, sizeof(nm))) return sr_no(__LINE__, 0);
-      if (in->rop == ROP_get_this_field2 && in->ndef >= 2 && !sr_obj(s, j, (int)in->def[1], kind)) return sr_no(__LINE__, 0);
+      if (in->ndef >= 2 && !sr_obj(s, j, (int)in->def[1], kind)) return sr_no(__LINE__, 0);   /* the copy of `this` the read hands on is the object too */
       if (kind == 0 && s->arrfound && strcmp(nm, s->arrname) == 0) { if (in->ndef < 1 || !sr_obj(s, j, (int)in->def[0], 1)) return sr_no(__LINE__, 0); }
     }
   }
@@ -3721,7 +4768,11 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
       for (sidx = 0; sidx < B->nsucc; sidx++) {
         const Q2Block *T = &fn->blocks[B->succ_block[sidx]];
         for (j = 0; j < B->nedge_args[sidx] && j < T->nparams; j++)
-          if ((int)B->edge_arg[sidx][j] == v && !sr_obj(s, n, (int)T->param_val[j], kind)) return sr_no(__LINE__, 0);
+          if ((int)B->edge_arg[sidx][j] == v) {
+            if (kind == 0 && sr_mat_edge(s, A, n, b, sidx, v)) continue;   /* moved to the heap here: the parameter is the heap object */
+            if (kind == 0) sr_vno_at(s, __LINE__, n, -1);   /* a join: the receiver of a field access is not exactly the object */
+            if (!sr_obj(s, n, (int)T->param_val[j], kind)) return sr_no(__LINE__, 0);
+          }
       }
     }
   }
@@ -3730,8 +4781,11 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
     int pos;
     char nm[40];
     if (!sr_has_use(in, v, &pos)) continue;
+    g_sr_at_n = n; g_sr_at_pc = in->pc; g_sr_at_pos = pos;
+    if (getenv("QJS_AOT_REGION_WHY")) { e_rop_name(in->rop, g_sr_at_op, sizeof(g_sr_at_op)); snprintf(g_sr_at_fn, sizeof(g_sr_at_fn), "%s", A->g != NULL ? A->g->name : ""); g_sr_at_fline = A->g != NULL ? A->g->line : 0; }
     switch (in->rop) {
     case ROP_move: case ROP_move_s: case ROP_move_xfer:
+      if (kind == 0 && pos == 0 && sr_mat_move(s, A, n, (int)(in - A->q.insns))) break;   /* moved to the heap here: the result is the heap object */
       if (in->ndef < 1 || !sr_obj(s, n, (int)in->def[0], kind)) return sr_no(__LINE__, 0);
       break;
     case ROP_get_field: case ROP_get_field_own:
@@ -3740,6 +4794,7 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
       break;
     case ROP_get_field2: case ROP_get_field2_own:
       if (pos != 0 || !rg_atom(in, nm, sizeof(nm)) || (kind == 0 && s->arrfound && strcmp(nm, s->arrname) == 0)) return sr_no(__LINE__, 0);
+      if (kind == 0 && s->K != NULL) { int q; for (q = 0; q < s->K->nn && strcmp(s->K->names[q], nm) != 0; q++) {} if (q < s->K->nn) sr_vno_at(s, __LINE__, n, in->pc); }   /* a field read whose value is called: not a virtual read */
       if (in->ndef >= 2 && !sr_obj(s, n, (int)in->def[1], kind)) return sr_no(__LINE__, 0);
       break;
     case ROP_put_field: case ROP_put_field_xfer:
@@ -3747,6 +4802,18 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
       if (pos == 0) {
         /* a store into the object: the Array its constructor makes is the one value that is followed */
         if (kind != 0 || in->nuse < 2) return sr_no(__LINE__, 0);
+        if (s->K != NULL) { int q; for (q = 0; q < s->K->nn && strcmp(s->K->names[q], nm) != 0; q++) {} if (q == s->K->nn) s->latestore = 1;   /* a field the construction walk did not add */
+          /* the store, to be typed once the value types are decided: the fields that may come to hold a reference decide what the block's release reads */
+          { const Q2Func *fq_ = &A->q; int ki_ = (int)(in - fq_->insns), q_, okc_ = rg_is_this(fq_, in->use[0]) && sr_on_all_paths(fq_, ki_);
+            const RInst *H_ = A;
+            /* the store is made on every path through the constructor: it is in the entry block of the function that makes it, and so is the call that reaches that function from the constructor (the wrapper's forward) */
+            while (okc_ && !H_->fresh && H_->par >= 0 && H_->par_kind != 1 && H_->par < c->nin_total) { const RInst *P_ = c->in[H_->par]; okc_ = P_ != NULL && sr_on_all_paths(&P_->q, rg_insn_at(&P_->q, H_->par_call_pc)); H_ = P_; if (H_ == NULL) okc_ = 0; }
+            if (okc_ && s->nvthis > 0) for (q_ = 0; q_ < s->K->nn && strcmp(s->K->names[q_], nm) != 0; q_++) {}
+            else q_ = s->K->nn;
+            if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "virtual:   store .%s in instance %d (%s): okc=%d fresh=%d par_kind=%d H=%d Hfresh=%d nvthis=%d\n", nm, n, A->g != NULL ? A->g->name : "", okc_, A->fresh, A->par_kind, H_->id, H_->fresh, s->nvthis);
+            if (okc_ && q_ < s->K->nn && (H_->fresh || (H_->par_kind == 1 && H_->par_cons >= 0))) s->vcov |= 1u << q_; }
+
+          if (s->nst < 64) { s->st[s->nst][0] = (short)n; s->st[s->nst][1] = (short)in->use[1]; s->st[s->nst][2] = (short)(q == s->K->nn ? -1 : q); s->st[s->nst][3] = (short)(in - A->q.insns); s->nst++; } else s->stover = 1; } else s->stover = 1;
         {
           int vd = A->q.values[in->use[1]].insn;
           const Q2Insn *d = vd >= 0 && vd < A->q.ninsns ? &A->q.insns[vd] : NULL;
@@ -3762,7 +4829,21 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
         }
       } else if (pos == 1 && kind == 1 && s->arrfound && n == s->arrinst && strcmp(nm, s->arrname) == 0 && rg_is_this(&A->q, in->use[0])) {
         /* the constructor's own store of the Array into the object */
-      } else return sr_no(__LINE__, 0);
+      } else if (pos == 1 && kind == 0 && A->fresh && A->cons > 0 && rg_is_this(&A->q, in->use[0]) && sr_child_ok(s, A, nm)) {
+        /* the constructor's own store of this object into a field of the stack object it constructs: the container holds it, and moves it with itself */
+        sr_vno_at(s, __LINE__, n, in->pc);
+      } else { sr_child_why(s, A, in, kind, pos, nm); return sr_no(__LINE__, 0); }
+      break;
+    case ROP_return:
+      /* an inlined function's result is its caller's call result: the object goes on in the parent, where every use of it is checked in turn. The root's return, a constructor's, and an out-of-line
+         callee's leave the region. */
+      if (kind == 0 && pos == 0 && n == 0 && A->par < 0 && !A->ool && s->K != NULL && s->K->inst == 0 && sr_accum_on()) { s->retmat = 1; break; }   /* the root returns the object: it moves to the heap there (the accumulator) */
+      if (pos != 0 || n == 0 || A->par < 0 || A->par_kind == 1 || A->par_dv < 0 || A->ool || getenv("QJS_AOT_REGION_NOSRRET") != NULL) return sr_no(__LINE__, 0);
+      if (kind == 0 && s->nok < 8) {
+        s->okcnt[s->nok] = c->in[A->par]->g != NULL ? qjs_aot_prof_pc_count(c->in[A->par]->g->digest, A->par_call_pc) : 0;
+        s->okinst[s->nok++] = A->par;
+      }
+      if (!sr_obj(s, A->par, A->par_dv, kind)) return sr_no(__LINE__, 0);
       break;
     case ROP_get_length:
       if (kind != 1 || pos != 0) return sr_no(__LINE__, 0);
@@ -3770,6 +4851,7 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
     case ROP_get_field_chain: case ROP_get_field_chain_own: {
       /* `this.elms.length`: the field that holds the Array, then its length */
       char n0[40] = "", n1[40] = "", n2[40] = "";
+      if (pos == 0 && kind == 0 && !s->arrfound) { sr_vno_at(s, __LINE__, n, in->pc); break; }   /* an object without an Array: the chain's links are reads of its fields, and what they give is another object */
       if (pos != 0 || kind != 0 || !s->arrfound) return sr_no(__LINE__, 0);
       rg_atom_n(in, 0, n0, sizeof(n0)); rg_atom_n(in, 1, n1, sizeof(n1));
       if (rg_atom_n(in, 2, n2, sizeof(n2)) || strcmp(n0, s->arrname) != 0) return sr_no(__LINE__, 0);
@@ -3787,7 +4869,7 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
          writes the slot through SKFIX (the migrated heap object) */
       if (!A->wrap || pos != 0 || getenv("QJS_AOT_REGION_NOWRAPSLOT") != NULL) { if (getenv("QJS_AOT_REGION_WHY") && !g_sr_line) { fprintf(stderr, "stackobj:   used by put_local_s0 at pc %d of instance %d (%s), kind %d pos %d\n", in->pc, n, A->g->name[0] ? A->g->name : "<anon>", kind, pos); } return sr_no(__LINE__, 0); }
       if (kind != 0) return sr_no(__LINE__, 0);
-      break;
+      break;   /* the pointer only is copied into the slot: no field is read */
     case ROP_apply_arguments: {
       /* the wrapper's forward `this.m.apply(this, arguments)`: the object is the receiver (window slot 2) of the call the instance tree holds at this pc */
       int ch2[RG_MAXT], nch2 = 0, kk2, q2;
@@ -3799,6 +4881,24 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
         if (c->in[ch2[q2]]->ool) return sr_no(__LINE__, 0);
         if (!sr_recv(s, ch2[q2], kind)) return sr_no(__LINE__, 0);
       }
+      break;
+    }
+    case ROP_construct: {
+      /* a stack object given to a constructor as an argument: the argument reaches the constructor's parameter, directly or through the forwarding wrapper's apply (the constructor body is inlined, and what it does with the parameter is checked like any inlined callee's) */
+      int jj, kk2, nf = 0;
+      if (kind != 0 || pos < 100 || getenv("QJS_AOT_REGION_NOLEND") != NULL) return sr_no(__LINE__, 0);
+      for (jj = 1; jj < c->nin_total; jj++) {
+        if (c->in[jj] == NULL || c->in[jj]->par != n || c->in[jj]->par_call_pc != in->pc || c->in[jj]->par_kind != 1) continue;
+        if (c->in[jj]->ool) return sr_no(__LINE__, 0);
+        if (!c->in[jj]->wrap) { if (!sr_arg(s, jj, pos - 100, kind)) return sr_no(__LINE__, 0); nf++; continue; }
+        for (kk2 = 1; kk2 < c->nin_total; kk2++) {
+          if (c->in[kk2] == NULL || c->in[kk2]->par != jj) continue;
+          if (c->in[kk2]->ool) return sr_no(__LINE__, 0);
+          if (!sr_arg(s, kk2, pos - 100, kind)) return sr_no(__LINE__, 0);
+          nf++;
+        }
+      }
+      if (nf == 0) return sr_no(__LINE__, 0);
       break;
     }
     case ROP_call_method: case ROP_call: {
@@ -3814,12 +4914,30 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
         break;
       }
       for (q = 0; q < nch; q++) {
-        if (c->in[ch[q]]->ool) return sr_no(__LINE__, 0);
+        if (c->in[ch[q]]->ool) {
+          if (kind == 0 && pos >= 100 && sr_lend_ok(s, ch[q], pos - 100, n, (int)(in - A->q.insns), v)) continue;
+          return sr_no(__LINE__, 0);
+        }
         if (pos == 1) { if (!sr_recv(s, ch[q], kind)) return sr_no(__LINE__, 0); }
         else if (!sr_arg(s, ch[q], pos - 100, kind)) return sr_no(__LINE__, 0);
       }
       break;
     }
+    case ROP_branch_null: case ROP_branch_not_null: case ROP_branch_nullish: case ROP_branch_not_nullish: case ROP_branch_if: case ROP_branch_if_not:
+      /* a branch on the value's tag or truthiness (an object is true, defined and not null; an HTMLDDA object leaves, and the exit migrates) keeps no reference */
+      if (pos == 0 && kind == 0) break;
+      return sr_no(__LINE__, 0);
+    case ROP_unary: case ROP_add: case ROP_sub: case ROP_mul: case ROP_div: {
+      if (in->rop == ROP_unary) {
+        /* `!v`, `v === undefined`, `v == null`: a test of the value that keeps no reference (the object is truthy, defined and not null; the region's LNOT leaves for an HTMLDDA object, and the exit migrates) */
+        int sub = in->narg > 1 ? (int)in->arg[1].val : -1;
+        if (pos == 0 && kind == 0 && (sub == REG_UN_LNOT || sub == REG_UN_IS_UNDEFINED || sub == REG_UN_IS_NULL || sub == REG_UN_IS_UNDEFINED_OR_NULL)) break;
+      } else if (kind == 0 && pos <= 1 && rg_cold(A, in)) {
+        /* arithmetic the profile never executed (the message of a throw): the region's arithmetic takes numbers and a string with a primitive only, so an object operand leaves before any effect, and the exit migrates the object */
+        break;
+      }
+    }
+    /* FALLTHROUGH */
     default:
       if (getenv("QJS_AOT_REGION_WHY") && !g_sr_line) { char rn[40]; e_rop_name(in->rop, rn, sizeof(rn)); fprintf(stderr, "stackobj:   used by %s at pc %d of instance %d (%s), kind %d pos %d\n", rn, in->pc, n, A->g->name[0] ? A->g->name : "<anon>", kind, pos); }
       return sr_no(__LINE__, 0);
@@ -3827,17 +4945,389 @@ static int sr_obj(RSR *s, int n, int v, int kind) {
   }
   return 1;
 }
+/* The lent parameters each emitted region really implements (the protocol is in its code), and what the callers' code assumed of their callees; the driver compares them when every body is out. */
+static struct { char hex[33]; unsigned m; } g_lent_real[1024];
+static int g_nlent_real;
+static struct { char callee[33], caller[33]; unsigned m; } g_lent_assume[256];
+static int g_nlent_assume;
+static char g_rs_real[64][33];
+static int g_nrs_real;
+/* Whether the region of root `hex` returns its accumulator into a shell the caller gives (an `aot_nr_` entry exists). */
+int region_retslot_real(const char *hex) {
+  int i;
+  for (i = 0; i < g_nrs_real; i++) if (strcmp(g_rs_real[i], hex) == 0) return 1;
+  return 0;
+}
+static void rg_lent_real_set(const char *hex, unsigned m) {
+  int i;
+  for (i = 0; i < g_nlent_real; i++) if (strcmp(g_lent_real[i].hex, hex) == 0) { g_lent_real[i].m = m; return; }
+  if (g_nlent_real < 1024) { snprintf(g_lent_real[g_nlent_real].hex, 33, "%s", hex); g_lent_real[g_nlent_real++].m = m; }
+}
+unsigned region_lent_real(const char *hex) {
+  int i;
+  for (i = 0; i < g_nlent_real; i++) if (strcmp(g_lent_real[i].hex, hex) == 0) return g_lent_real[i].m;
+  return 0;
+}
+static void rg_lent_assume(const char *callee, const char *caller, unsigned m) {
+  if (g_nlent_assume < 256) { snprintf(g_lent_assume[g_nlent_assume].callee, 33, "%s", callee); snprintf(g_lent_assume[g_nlent_assume].caller, 33, "%s", caller); g_lent_assume[g_nlent_assume++].m = m; }
+}
+/* 0 when every region that lends a stack object to a callee finds the callee's emitted code taking it (the parameter is lent in the callee's real emission); else the number of mismatches, each named. */
+int region_lent_verify(void) {
+  int i, bad = 0;
+  for (i = 0; i < g_nlent_assume; i++) {
+    unsigned have = region_lent_real(g_lent_assume[i].callee);
+    if ((have & g_lent_assume[i].m) != g_lent_assume[i].m) {
+      fprintf(stderr, "qjsaot: FATAL region %s lends parameters %x to %s, whose emitted region takes only %x (the callee was not emitted as a region, or reads the parameter in a way the lent walk refuses)\n", g_lent_assume[i].caller, g_lent_assume[i].m, g_lent_assume[i].callee, have);
+      bad++;
+    }
+  }
+  return bad;
+}
+/* The lent parameters of every function whose region was walked (the dry pass walks them all, the real emission walks them again): a caller decides from this table what it may lend. */
+static struct { char hex[33]; unsigned m; } g_lent_pred[1024];
+static int g_nlent_pred;
+static void rg_lent_pred_set(const char *hex, unsigned m) {
+  int i;
+  for (i = 0; i < g_nlent_pred; i++) if (strcmp(g_lent_pred[i].hex, hex) == 0) { g_lent_pred[i].m = m; return; }
+  if (g_nlent_pred < 1024) { snprintf(g_lent_pred[g_nlent_pred].hex, 33, "%s", hex); g_lent_pred[g_nlent_pred++].m = m; }
+}
+static unsigned rg_lent_pred_get(const char *hex) {
+  int i;
+  for (i = 0; i < g_nlent_pred; i++) if (strcmp(g_lent_pred[i].hex, hex) == 0) return g_lent_pred[i].m;
+  return 0;
+}
+/* LENT parameters. A caller may hand a stack object to this function's parameter k (it stays in the caller's frame) when the function only READS it: the value and every value loaded from
+   its fields reach field reads, tests, arithmetic (which leaves the region for an object operand) and arguments of inlined instances, and nothing else (no store of it, no return, no
+   construct argument, no call made out of line, no method call on it). The walk is over the instance tree of the root, so it sees the callee bodies the region inlined. */
+typedef struct { RCtx *c; int vis[256][3]; int nvis, budget; } RLT;
+static int g_lt_line;
+static int lt_no(RLT *s, int line) {
+  (void)s;
+  if (!g_lt_line) { g_lt_line = line; if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "lent:   refused at line %d: instance %d pc %d position %d op %s in %s\n", line, g_sr_at_n, g_sr_at_pc, g_sr_at_pos, g_sr_at_op, g_sr_at_fn[0] ? g_sr_at_fn : "<anon>"); }
+  return 0;
+}
+static int lt_obj(RLT *s, int n, int v, int deriv);
+static int lt_recv(RLT *s, int j, int deriv) {
+  RInst *A = s->c->in[j];
+  int k;
+  for (k = 0; k < A->q.ninsns; k++) {
+    const Q2Insn *in = &A->q.insns[k];
+    if (in->rop == ROP_load_this) { if (in->ndef < 1 || !lt_obj(s, j, (int)in->def[0], deriv)) return lt_no(s, __LINE__); }
+    else if (in->rop == ROP_get_this_field || in->rop == ROP_get_this_field2) {
+      if (in->ndef >= 1 && !lt_obj(s, j, (int)in->def[0], 1)) return lt_no(s, __LINE__);   /* the field's value: what the object holds in it */
+      if (in->ndef >= 2 && !lt_obj(s, j, (int)in->def[1], deriv)) return lt_no(s, __LINE__);   /* the copy of `this` the read hands on */
+    }
+  }
+  return 1;
+}
+static int lt_arg(RLT *s, int j, int idx, int deriv) {
+  RInst *A = s->c->in[j];
+  int k;
+  for (k = 0; k < A->q.ninsns; k++) {
+    const Q2Insn *in = &A->q.insns[k];
+    if (in->rop != ROP_get_arg && in->rop != ROP_get_arg2) continue;
+    if (in->narg >= 2 && (int)in->arg[1].val == idx && in->ndef >= 1 && !lt_obj(s, j, (int)in->def[0], deriv)) return lt_no(s, __LINE__);
+    if (in->rop == ROP_get_arg2 && in->narg >= 4 && (int)in->arg[3].val == idx && in->ndef >= 2 && !lt_obj(s, j, (int)in->def[1], deriv)) return lt_no(s, __LINE__);
+  }
+  return 1;
+}
+static int lt_obj(RLT *s, int n, int v, int deriv) {
+  RCtx *c = s->c;
+  RInst *A = c->in[n];
+  int k;
+  if (--s->budget < 0) return lt_no(s, __LINE__);
+  { int q; for (q = 0; q < s->nvis; q++) if (s->vis[q][0] == n && s->vis[q][1] == v && s->vis[q][2] == deriv) return 1; if (s->nvis >= 256) return lt_no(s, __LINE__); s->vis[s->nvis][0] = n; s->vis[s->nvis][1] = v; s->vis[s->nvis][2] = deriv; s->nvis++; }
+  {
+    const Q2Func *fn = &A->q;
+    int b, sidx, j;
+    for (b = 0; b < fn->nblocks; b++) {
+      const Q2Block *B = &fn->blocks[b];
+      if (fn->rpo_pos != NULL && fn->rpo_pos[b] < 0) continue;
+      for (sidx = 0; sidx < B->nsucc; sidx++) {
+        const Q2Block *T = &fn->blocks[B->succ_block[sidx]];
+        for (j = 0; j < B->nedge_args[sidx] && j < T->nparams; j++)
+          if ((int)B->edge_arg[sidx][j] == v && !lt_obj(s, n, (int)T->param_val[j], deriv)) return lt_no(s, __LINE__);
+      }
+    }
+  }
+  for (k = 0; k < A->q.ninsns; k++) {
+    const Q2Insn *in = &A->q.insns[k];
+    int pos;
+    if (!sr_has_use(in, v, &pos)) continue;
+    g_sr_at_n = n; g_sr_at_pc = in->pc; g_sr_at_pos = pos;
+    if (getenv("QJS_AOT_REGION_WHY")) { e_rop_name(in->rop, g_sr_at_op, sizeof(g_sr_at_op)); snprintf(g_sr_at_fn, sizeof(g_sr_at_fn), "%s", A->g != NULL ? A->g->name : ""); }
+    switch (in->rop) {
+    case ROP_move: case ROP_move_s: case ROP_move_xfer:
+      if (in->ndef < 1 || !lt_obj(s, n, (int)in->def[0], deriv)) return lt_no(s, __LINE__);
+      break;
+    case ROP_get_field: case ROP_get_field_own:
+      if (pos != 0) return lt_no(s, __LINE__);
+      if (in->ndef >= 1 && !lt_obj(s, n, (int)in->def[0], 1)) return lt_no(s, __LINE__);
+      break;
+    case ROP_get_field2: case ROP_get_field2_own:
+      if (pos != 0) return lt_no(s, __LINE__);
+      if (in->ndef >= 2 && !lt_obj(s, n, (int)in->def[1], deriv)) return lt_no(s, __LINE__);
+      break;
+    case ROP_branch_null: case ROP_branch_not_null: case ROP_branch_nullish: case ROP_branch_not_nullish: case ROP_branch_if: case ROP_branch_if_not:
+      if (pos != 0) return lt_no(s, __LINE__);
+      break;
+    case ROP_unary: {
+      int sub = in->narg > 1 ? (int)in->arg[1].val : -1;
+      if (pos == 0 && (sub == REG_UN_LNOT || sub == REG_UN_IS_UNDEFINED || sub == REG_UN_IS_NULL || sub == REG_UN_IS_UNDEFINED_OR_NULL)) break;
+      if (!deriv) return lt_no(s, __LINE__);
+      break;
+    }
+    case ROP_add: case ROP_sub: case ROP_mul: case ROP_div: case ROP_mod: case ROP_neg: case ROP_inc: case ROP_dec: case ROP_add_imm_s: case ROP_sub_imm_s:
+    case ROP_mul_add: case ROP_add_mul: case ROP_mul_sub: case ROP_sub_mul:
+    case ROP_branch_cmp_loc_loc: case ROP_branch_cmp_loc_reg: case ROP_branch_cmp_reg_loc: case ROP_branch_cmp_reg_reg: case ROP_branch_cmp_reg_reg_s:
+    case ROP_branch_eq_s: case ROP_branch_gt_s: case ROP_branch_gte_s: case ROP_branch_lt_s: case ROP_branch_lte_s: case ROP_branch_neq_s:
+    case ROP_branch_ngt_s: case ROP_branch_ngte_s: case ROP_branch_nlt_s: case ROP_branch_nlte_s:
+      if (!deriv) return lt_no(s, __LINE__);   /* an operand loaded from a field: a number, or an object the arithmetic or the comparison leaves the region for */
+      break;
+    case ROP_get_length:
+      if (pos != 0) return lt_no(s, __LINE__);
+      break;
+    case ROP_get_field_chain: case ROP_get_field_chain_own: {
+      int d_;
+      if (pos != 0) return lt_no(s, __LINE__);
+      for (d_ = 0; d_ < in->ndef; d_++) if (!lt_obj(s, n, (int)in->def[d_], 1)) return lt_no(s, __LINE__);
+      break;
+    }
+    case ROP_call_method: case ROP_call: {
+      int ch[RG_MAXT], nch = 0, kk, q;
+      if (pos == 0) return lt_no(s, __LINE__);
+      for (kk = 1; kk < c->nin_total && nch < RG_MAXT; kk++)
+        if (c->in[kk] != NULL && c->in[kk]->par == n && c->in[kk]->par_call_pc == in->pc && c->in[kk]->par_kind != 1) ch[nch++] = kk;
+      if (nch == 0) return lt_no(s, __LINE__);
+      for (q = 0; q < nch; q++) {
+        if (c->in[ch[q]]->ool || c->in[ch[q]]->wrap) return lt_no(s, __LINE__);
+        if (pos == 1) { if (!lt_recv(s, ch[q], deriv)) return lt_no(s, __LINE__); }
+        else if (!lt_arg(s, ch[q], pos - 100, deriv)) return lt_no(s, __LINE__);
+      }
+      break;
+    }
+    default:
+      return lt_no(s, __LINE__);
+    }
+  }
+  return 1;
+}
+/* The parameters of the root (bit k: parameter k) that the function only reads. */
+static unsigned rg_lent_mask(RCtx *c, const Q2Func *root) {
+  unsigned m = 0;
+  int k, na = root->g != NULL ? root->g->arg_count : 0, saved = c->nin_total;
+  if (getenv("QJS_AOT_REGION_NOLEND") != NULL) return 0;
+  if (getenv("QJS_AOT_REGION_LENDONLY") != NULL && strncmp(getenv("QJS_AOT_REGION_LENDONLY"), c->hex, strlen(getenv("QJS_AOT_REGION_LENDONLY"))) != 0) return 0;   /* (a debugging aid: only the root with this hex prefix lends) */
+  c->nin_total = c->nin;
+  for (k = 0; k < na && k < 8; k++) {
+    RLT s;
+    int i, used = 0, bad = 0;
+    for (i = 0; i < root->ninsns; i++) {
+      const Q2Insn *in = &root->insns[i];
+      if ((in->rop == ROP_put_arg || in->rop == ROP_put_arg_xfer) && in->narg >= 2 && (int)in->arg[1].val == k) bad = 1;
+      if ((in->rop == ROP_get_arg || in->rop == ROP_get_arg2) && ((in->narg >= 2 && (int)in->arg[1].val == k) || (in->rop == ROP_get_arg2 && in->narg >= 4 && (int)in->arg[3].val == k))) used = 1;
+    }
+    if (bad || !used) continue;
+    memset(&s, 0, sizeof(s));
+    s.c = c;
+    s.budget = 3000;
+    g_lt_line = 0;
+    if (getenv("QJS_AOT_REGION_BORROWKNOCK") != NULL || lt_arg(&s, 0, k, 0)) m |= 1u << k;   /* (BORROWKNOCK lends every read parameter: rg_borrow_check must then refuse the root) */
+    else if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "lent: root %.8s parameter %d is not lent (region.c:%d)\n", c->hex, k, g_lt_line);
+  }
+  c->nin_total = saved;
+  if (m != 0 && getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "lent: root %.8s parameters %x are lent\n", c->hex, m);
+  return m;
+}
+
+/* BORROWCHECK. An independent check of the lent mask (a deny-list over a closure of the values derived from a lent parameter, where lt_obj is an allow-list walk): in the instance tree of a lent
+   root, no store, definition, construct, return or out-of-line call may take a value derived from a lent parameter (the parameter, a copy of it, anything read from a field of it, and the
+   same inside the inlined instances it is passed to). A violation aborts the generator: the caller would hand a stack object to a function that could keep it. QJS_AOT_REGION_BORROWKNOCK
+   skips the walk for the mask (every object parameter the function reads is lent) so that this check is what refuses it. */
+static int rg_borrow_deny(int rop) {
+  switch (rop) {
+    case ROP_put_field: case ROP_put_field_xfer: case ROP_put_element: case ROP_put_element_xfer: case ROP_put_global: case ROP_put_var_ref: case ROP_put_ref: case ROP_put_ref_value:
+    case ROP_put_super_value: case ROP_put_private: case ROP_define_field: case ROP_define_element: case ROP_define_method: case ROP_define_global: case ROP_define_private:
+    case ROP_array_from: case ROP_construct: case ROP_return: case ROP_return_async: case ROP_set_proto: case ROP_set_home_object: case ROP_set_name:
+      return 1;
+    default: return 0;
+  }
+}
+static int rg_borrow_check(RCtx *c, const Q2Func *root) {
+  unsigned char **D;
+  int n, pass, changed = 1, bad = 0, ni = c->nin;
+  (void)root;
+  if (c->lent == 0 || ni <= 0) return 0;
+  D = calloc((size_t)ni, sizeof(*D));
+  for (n = 0; n < ni; n++) D[n] = calloc((size_t)(c->in[n]->q.nvalues + 1), 1);
+  for (pass = 0; pass < 12 && changed; pass++) {
+    changed = 0;
+    for (n = 0; n < ni; n++) {
+      RInst *A = c->in[n];
+      const Q2Func *fn = &A->q;
+      int k, b, sidx, j;
+#define BC_SET(v_) do { int vv_ = (int)(v_); if (vv_ >= 0 && vv_ < fn->nvalues && !D[n][vv_]) { D[n][vv_] = 1; changed = 1; } } while (0)
+      for (k = 0; k < fn->ninsns; k++) {
+        const Q2Insn *in = &fn->insns[k];
+        int pos, d_;
+        if (n == 0 && (in->rop == ROP_get_arg || in->rop == ROP_get_arg2)) {
+          if (in->narg >= 2 && in->ndef >= 1 && (c->lent >> (int)in->arg[1].val & 1u) && (int)in->arg[1].val < 8) BC_SET(in->def[0]);
+          if (in->rop == ROP_get_arg2 && in->narg >= 4 && in->ndef >= 2 && (c->lent >> (int)in->arg[3].val & 1u) && (int)in->arg[3].val < 8) BC_SET(in->def[1]);
+        }
+        {
+          int any = 0;
+          for (j = 0; j < in->nuse; j++) if ((int)in->use[j] >= 0 && (int)in->use[j] < fn->nvalues && D[n][in->use[j]]) any = 1;
+          for (j = 0; j < in->win_n && in->win_val != NULL; j++) if ((int)in->win_val[j] >= 0 && (int)in->win_val[j] < fn->nvalues && D[n][in->win_val[j]]) any = 1;
+          if (!any) continue;
+        }
+        if (rg_borrow_deny(in->rop)) { bad = 1; fprintf(stderr, "qjsaot: BORROWCHECK: root %.8s: %s at pc %d of instance %d takes a value derived from a lent parameter\n", c->hex, "a store/construct/return", in->pc, n); continue; }
+        switch (in->rop) {
+          case ROP_move: case ROP_move_s: case ROP_move_xfer: case ROP_get_field: case ROP_get_field_own: case ROP_get_field2: case ROP_get_field2_own:
+          case ROP_get_field_chain: case ROP_get_field_chain_own:
+            for (d_ = 0; d_ < in->ndef; d_++) BC_SET(in->def[d_]);
+            break;
+          case ROP_call: case ROP_call_method: {
+            int kk;
+            if (!sr_has_use(in, -1, &pos)) pos = 0;
+            for (kk = 1; kk < c->nin; kk++) {
+              RInst *C1 = c->in[kk];
+              int q, m2;
+              if (C1 == NULL || C1->par != n || C1->par_call_pc != in->pc || C1->par_kind == 1) continue;
+              if (C1->ool || C1->wrap) {
+                /* a lent site (the caller lends its own block) is a use of the container; here the callee is out of line: a derived value is passed to it only where its own mask lends that position */
+                continue;
+              }
+              for (q = 0; q < C1->q.ninsns; q++) {
+                const Q2Insn *g2 = &C1->q.insns[q];
+                if (g2->rop == ROP_load_this || g2->rop == ROP_get_this_field || g2->rop == ROP_get_this_field2) {
+                  for (m2 = 0; m2 < in->nuse; m2++) if (m2 == 1 && (int)in->use[1] < fn->nvalues && D[n][in->use[1]]) { int dd; for (dd = 0; dd < g2->ndef; dd++) if ((int)g2->def[dd] < C1->q.nvalues && !D[kk][g2->def[dd]]) { D[kk][g2->def[dd]] = 1; changed = 1; } }
+                } else if (g2->rop == ROP_get_arg || g2->rop == ROP_get_arg2) {
+                  for (m2 = 0; m2 < in->win_n && in->win_val != NULL; m2++)
+                    if (in->win_val[m2] >= 0 && (int)in->win_val[m2] < fn->nvalues && D[n][in->win_val[m2]]) {
+                      if (g2->narg >= 2 && (int)g2->arg[1].val == m2 && g2->ndef >= 1 && !D[kk][g2->def[0]]) { D[kk][g2->def[0]] = 1; changed = 1; }
+                      if (g2->rop == ROP_get_arg2 && g2->narg >= 4 && (int)g2->arg[3].val == m2 && g2->ndef >= 2 && !D[kk][g2->def[1]]) { D[kk][g2->def[1]] = 1; changed = 1; }
+                    }
+                }
+              }
+            }
+            break;
+          }
+          default: break;   /* tests, arithmetic, lengths: they leave nothing derived that a store could keep */
+        }
+      }
+      for (b = 0; b < fn->nblocks; b++) {
+        const Q2Block *B = &fn->blocks[b];
+        if (fn->rpo_pos != NULL && fn->rpo_pos[b] < 0) continue;
+        for (sidx = 0; sidx < B->nsucc; sidx++) {
+          const Q2Block *T = &fn->blocks[B->succ_block[sidx]];
+          for (j = 0; j < B->nedge_args[sidx] && j < T->nparams; j++)
+            if ((int)B->edge_arg[sidx][j] >= 0 && (int)B->edge_arg[sidx][j] < fn->nvalues && D[n][B->edge_arg[sidx][j]]) BC_SET(T->param_val[j]);
+        }
+      }
+#undef BC_SET
+    }
+  }
+  for (n = 0; n < ni; n++) free(D[n]);
+  free(D);
+  return bad;
+}
+
+/* Whether the value `val` of instance `inst` is used after the call (instruction kidx of instance n) in the frame of `inst`: the instance itself, or one the call is inlined into. An instance below
+   the call's is gone when the call runs. */
+static int sr_is_lent_site(RCtx *c, const int (*ls)[4], int nls, const Q2Func *fn, int k) {
+  int m;
+  for (m = 0; m < nls; m++) if (c->in[ls[m][0]] != NULL && &c->in[ls[m][0]]->q == fn && ls[m][1] == k) return 1;
+  return 0;
+}
+/* Whether value v is read by an instruction that can run at or after instruction `from`, other than as the source of a copy whose destination nothing reads (a variable's register that is written
+   again before any read still receives the copy). Followed through copies and block edges. */
+static int sr_reach_use(RCtx *c, const int (*ls)[4], int nls, const Q2Func *fn, int from, int v, int depth) {
+  int b, k, u, sidx, j, b0 = -1, nb = fn->nblocks, res = 0, defblk = -1;
+  unsigned char *rb;
+  int *stk, top = 0;
+  if (depth > 8 || from < 0 || from > fn->ninsns) return 1;
+  for (b = 0; b < nb; b++) if (from >= fn->blocks[b].first_insn && from <= fn->blocks[b].first_insn + fn->blocks[b].ninsns) { b0 = b; break; }
+  if (b0 < 0) return 1;
+  rb = calloc((size_t)nb, 1);
+  stk = malloc(sizeof(int) * (size_t)nb * 4 + 4);
+  if (rb == NULL || stk == NULL) { free(rb); free(stk); return 1; }
+  /* the block that defines v (as an instruction's result or as a block parameter): a path that enters it defines v again, and what it reaches uses the new value, not this one */
+  {
+    int dv = (int)v < fn->nvalues ? fn->values[v].insn : -1, p_;
+    for (b = 0; b < nb && defblk < 0; b++) {
+      const Q2Block *B = &fn->blocks[b];
+      if (dv >= 0 && dv >= B->first_insn && dv < B->first_insn + B->ninsns) defblk = b;
+      for (p_ = 0; p_ < B->nparams && defblk < 0; p_++) if ((int)B->param_val[p_] == v) defblk = b;
+    }
+  }
+  /* the blocks the start block's end reaches (the start block itself only if a path leads back to it) */
+  stk[top++] = b0;
+  while (top > 0) {
+    const Q2Block *B = &fn->blocks[stk[--top]];
+    for (sidx = 0; sidx < B->nsucc; sidx++) { int t = B->succ_block[sidx]; if (t >= 0 && t < nb && !rb[t] && t != defblk) { rb[t] = 1; stk[top++] = t; } }
+  }
+  for (b = 0; b < nb && !res; b++) {
+    const Q2Block *B = &fn->blocks[b];
+    int lo = B->first_insn, hi = B->first_insn + B->ninsns;
+    if (fn->rpo_pos != NULL && fn->rpo_pos[b] < 0) continue;
+    if (b == b0 && !rb[b]) lo = from;
+    else if (!rb[b]) continue;
+    for (k = lo; k < hi && !res; k++) {
+      const Q2Insn *in = &fn->insns[k];
+      int used = 0;
+      for (u = 0; u < in->nuse; u++) if ((int)in->use[u] == v) used = 1;
+      for (u = 0; u < in->win_n && in->win_val != NULL; u++) if ((int)in->win_val[u] == v) used = 1;
+      if (!used) continue;
+      if ((in->rop == ROP_move || in->rop == ROP_move_s || in->rop == ROP_move_xfer) && in->nuse == 1 && in->ndef >= 1) { if (sr_reach_use(c, ls, nls, fn, k + 1, (int)in->def[0], depth + 1)) res = 1; }
+      else if (sr_is_lent_site(c, ls, nls, fn, k)) {}   /* another call the object is lent to: it takes the object (the heap one if an earlier call moved it) */
+      else { res = 1; if (getenv("QJS_AOT_REGION_WHY")) { char un_[40]; e_rop_name(in->rop, un_, sizeof(un_)); fprintf(stderr, "stackobj:    (reach) value %d used by %s at pc %d, depth %d (use positions:", v, un_, in->pc, depth); for (u = 0; u < in->nuse; u++) fprintf(stderr, " %d", (int)in->use[u]); fprintf(stderr, " | win:"); for (u = 0; u < in->win_n && in->win_val != NULL; u++) fprintf(stderr, " %d", (int)in->win_val[u]); fprintf(stderr, ")\n"); } }
+    }
+    /* the edges out of a block that runs at or after `from` */
+    if (!res && (b != b0 || rb[b] || 1)) {
+      int run = (b == b0) ? 1 : rb[b];
+      if (run) for (sidx = 0; sidx < B->nsucc && !res; sidx++) {
+        const Q2Block *T = &fn->blocks[B->succ_block[sidx]];
+        for (j = 0; j < B->nedge_args[sidx] && j < T->nparams && !res; j++)
+          if ((int)B->edge_arg[sidx][j] == v && sr_reach_use(c, ls, nls, fn, T->first_insn, (int)T->param_val[j], depth + 1)) { res = 1; if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj:    (reach) value %d passed on an edge of block %d to a live parameter, depth %d\n", v, b, depth); }
+      }
+    }
+  }
+  free(rb);
+  free(stk);
+  return res;
+}
+static int sr_live_past_call(RCtx *c, const int (*ls)[4], int nls, int n, int kidx, int inst, int val) {
+  int a, prev = n;
+  if (inst == n) return sr_reach_use(c, ls, nls, &c->in[n]->q, kidx + 1, val, 0);
+  for (a = c->in[n]->par; a >= 0; prev = a, a = c->in[a]->par) {
+    if (a == inst) {
+      int pk = rg_insn_at(&c->in[a]->q, c->in[prev]->par_call_pc);
+      return pk < 0 ? 1 : sr_reach_use(c, ls, nls, &c->in[a]->q, pk + 1, val, 0);
+    }
+    if (a == 0) break;
+  }
+  return 0;
+}
 /* The constructs that become stack objects: cons records of kind 0 (direct, complete) and the Array they hold. */
 static void rg_sr_decide(RCtx *c) {
-  int ki;
+  int ki, pass2, ndefer = 0;
+  unsigned char defer[RG_MAXC] = {0};
+  g_nmatdef = 0;
   if (!rg_trust_on() || getenv("QJS_AOT_REGION_NOSTACKOBJ") != NULL) return;
+  /* A construct whose only way to be a stack object is as the stack child of a container the loop has not reached yet (a constructor's argument is made before the object it is given to) waits:
+     once every construct has had its turn, the waiting ones are decided again, in order. That is the whole of the second turn: nothing else about a refused construct changes between the turns
+     (its own walk reads the same instances), so a construct refused for another reason is refused again. */
+  for (pass2 = 0; pass2 < 2; pass2++) {
+  if (pass2 == 1 && ndefer == 0) break;
   for (ki = 0; ki < c->ncons; ki++) {
     RCons *K = &c->cons[ki];
     RSR s;
     RInst *I;
-    int ii, ctor = -1, q, dv = -1, di, ok;
+    int ii, ctor = -1, q, dv = -1, di, ok, tried_nomat = 0;
+    if (pass2 == 1 && !defer[ki]) continue;
+    g_sr_wait = 0;
     if (getenv("QJS_AOT_REGION_WHY") && K->kind == 0) fprintf(stderr, "stackobj: root %.8s cons %d (inst %d pc %d) %s direct=%d esc=%d\n", c->hex, ki, K->inst, K->pc, K->gname, K->direct, K->esc);
-    if (K->kind != 0 || !K->direct || K->esc || K->stack || c->nstack >= 1) continue;   /* one stack pair per region: the exit stubs share one pair of migration slots */
+    if (K->kind != 0 || !K->direct || K->esc || K->stack || c->nstack >= RG_MAXSTK) continue;   /* the region's frame holds this many stack objects */
     ii = K->inst;
     if (ii < 0 || ii >= c->nin_total || c->in[ii] == NULL) continue;
     I = c->in[ii];
@@ -3845,15 +5335,24 @@ static void rg_sr_decide(RCtx *c) {
     if (di < 0 || I->q.insns[di].ndef < 1) continue;
     dv = (int)I->q.insns[di].def[0];
     for (q = 1; q < c->nin_total; q++) if (c->in[q] != NULL && c->in[q]->par == ii && c->in[q]->par_kind == 1 && c->in[q]->par_cons == ki) ctor = q;
-    if (ctor < 0) continue;
-    if ((I->ploop || I->curloop) && (getenv("QJS_AOT_REGION_PARKALL") != NULL || rg_carried_up(c, ii, dv))) { if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d carried over a loop edge\n", c->hex, ki); continue; }
+    if (ctor < 0 && !K->rslot) continue;
+  sr_again:
     memset(&s, 0, sizeof(s));
     s.c = c;
     s.budget = 400;
+    s.cinst = ii;
+    s.cpc = K->pc;
+    s.K = K;
+    s.vok = 1;
+    s.vstore = 1;
+    s.okcnt[s.nok] = I->g != NULL ? qjs_aot_prof_pc_count(I->g->digest, K->pc) : 0;
+    s.okinst[s.nok++] = ii;
     g_sr_line = 0;
     {
       int nskal0 = c->nskal;
-      ok = sr_recv(&s, ctor, 0) && sr_obj(&s, ii, dv, 0);
+      g_sr_nomat = tried_nomat;
+      ok = (K->rslot || sr_recv(&s, ctor, 0)) && sr_obj(&s, ii, dv, 0);
+      g_sr_nomat = 0;
       /* the Array: every use of the construct's own value in the constructor is the store and the pushes/pops that follow, all checked through the field reads above */
       if (ok && s.arrfound) {
         int ai = -1, ad, av;
@@ -3866,7 +5365,89 @@ static void rg_sr_decide(RCtx *c) {
           if (ok && c->cons[ai].stack == 0) { K->sk_pair = ai; c->cons[ai].sk_pair = ki; c->cons[ai].stack = 1; }
         }
       } else K->sk_pair = -1;
-      if (!ok && getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d (inst %d pc %d) escapes (region.c:%d)\n", c->hex, ki, K->inst, K->pc, g_sr_line);
+      if (ok && s.nmat > 0) {
+        /* the moves to the heap: no alias of the object may be used after an edge that moves it, and an object with its Array stays whole */
+        int m, w;
+        if (s.arrfound) ok = 0;
+        for (m = 0; ok && m < s.nmat; m++) {
+          const Q2Func *fq = &c->in[s.mat[m][0]]->q;
+          int from = s.mat[m][1] == 1 ? s.mat[m][2] + 1 : fq->blocks[fq->blocks[s.mat[m][2]].succ_block[s.mat[m][3]]].first_insn;
+          for (w = 0; ok && w < s.nvis; w++)
+            if (s.vis[w][0] == s.mat[m][0] && rg_live_walk(fq, from, (Q2ValueId)s.vis[w][1], -1)) { ok = 0; if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d value %d is used after the place that moves it\n", c->hex, ki, s.vis[w][1]); }
+          if (!ok && K->rslot && !tried_nomat) { tried_nomat = 1; goto sr_again; }   /* a call result: followed to its uses instead of moved at a rare edge */
+        }
+      }
+      if (ok && s.retmat) {
+        /* the root returns this object: it is an accumulator, one stack object that the moves of other objects assign into; it moves to the heap at the return */
+        int w, n0_ = 0;
+        for (w = 0; w < s.nvis; w++) if (s.vis[w][2] == 0 && s.vis[w][0] == 0) n0_++;
+        if (s.nmat > 0 || s.arrfound || s.par > 0 || s.nls > 0 || n0_ > 16) { ok = 0; g_sr_line = -1; }
+      }
+      if (ok && (I->ploop || I->curloop)) {
+        /* alive when the construct runs again (carried over a back edge) is the heap's: the edges that move the object to the heap are not such a carry */
+        int carried_ = 0, m;
+        if (getenv("QJS_AOT_REGION_PARKALL") != NULL) carried_ = 1;
+        else {
+          g_nmskip = s.nmat;
+          for (m = 0; m < s.nmat; m++) { g_mskip_fn[m] = &c->in[s.mat[m][0]]->q; g_mskip[m][0] = s.mat[m][1]; g_mskip[m][1] = s.mat[m][2]; g_mskip[m][2] = s.mat[m][3]; g_mskip[m][3] = s.mat[m][4]; }
+          carried_ = rg_carried_up(c, ii, dv);
+          g_nmskip = 0;
+        }
+        if (carried_) { ok = 0; if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d carried over a loop edge\n", c->hex, ki); g_sr_line = -1; }
+      }
+      if (ok && s.par > 0 && (s.arrfound || s.nmat > 0)) { ok = 0; g_sr_line = -1; }   /* a stack child is one level: no Array of its own, no move to the heap of its own */
+      if (ok && s.nls > 0) {
+        /* lent to a callee that may move it to the heap: neither the object nor anything the walk followed may be used after the call */
+        int m, w;
+        if (s.arrfound || s.nmat > 0 || s.par > 0) ok = 0;
+        { int n0_ = 0; for (w = 0; w < s.nvis; w++) if (s.vis[w][2] == 0) n0_++; if (n0_ > 48) ok = 0; }   /* the aliases are named after the call (K->kvis holds 48) */
+        for (m = 0; ok && m < s.nls; m++)
+          for (w = 0; ok && w < s.nvis; w++)
+            if (s.vis[w][2] == 0 && sr_live_past_call(c, s.ls, s.nls, s.ls[m][0], s.ls[m][1], s.vis[w][0], s.vis[w][1])) {
+              ok = 0;
+              g_sr_line = -1;
+              if (getenv("QJS_AOT_REGION_DUMPPC")) {
+                int lo_ = 0, hi_ = 0, k_;
+                sscanf(getenv("QJS_AOT_REGION_DUMPPC"), "%d-%d", &lo_, &hi_);
+                for (k_ = 0; k_ < c->in[s.vis[w][0]]->q.ninsns; k_++) {
+                  const Q2Insn *di_ = &c->in[s.vis[w][0]]->q.insns[k_];
+                  char dn_[40]; int u_;
+                  if (di_->pc < lo_ || di_->pc > hi_) continue;
+                  e_rop_name(di_->rop, dn_, sizeof(dn_));
+                  fprintf(stderr, "dump: pc %d insn %d %s def:", di_->pc, k_, dn_);
+                  for (u_ = 0; u_ < di_->ndef; u_++) fprintf(stderr, " %d", (int)di_->def[u_]);
+                  fprintf(stderr, " use:");
+                  for (u_ = 0; u_ < di_->nuse; u_++) fprintf(stderr, " %d", (int)di_->use[u_]);
+                  fprintf(stderr, " win:");
+                  for (u_ = 0; u_ < di_->win_n && di_->win_val != NULL; u_++) fprintf(stderr, " %d", (int)di_->win_val[u_]);
+                  fprintf(stderr, "\n");
+                }
+              }
+              if (getenv("QJS_AOT_REGION_WHY")) { int w2_; for (w2_ = 0; w2_ < s.nvis; w2_++) fprintf(stderr, "stackobj:    vis[%d] = (inst %d fn line %d, value %d, kind %d)\n", w2_, s.vis[w2_][0], c->in[s.vis[w2_][0]]->g != NULL ? c->in[s.vis[w2_][0]]->g->line : -1, s.vis[w2_][1], s.vis[w2_][2]); }
+              if (getenv("QJS_AOT_REGION_WHY")) { const Q2Func *vq_ = &c->in[s.vis[w][0]]->q; int vi_ = vq_->values[s.vis[w][1]].insn; char rn_[40] = "-"; if (vi_ >= 0 && vi_ < vq_->ninsns) e_rop_name(vq_->insns[vi_].rop, rn_, sizeof(rn_)); fprintf(stderr, "stackobj: root %.8s cons %d is lent at instance %d insn %d (pc %d) but value %d of instance %d (defined by %s at pc %d) is used after the call (vis kind %d)\n", c->hex, ki, s.ls[m][0], s.ls[m][1], c->in[s.ls[m][0]]->q.insns[s.ls[m][1]].pc, s.vis[w][1], s.vis[w][0], rn_, vi_ >= 0 ? vq_->insns[vi_].pc : -1, s.vis[w][2]);
+              { int u_, uu_; for (u_ = 0; u_ < vq_->ninsns; u_++) { const Q2Insn *ui_ = &vq_->insns[u_]; for (uu_ = 0; uu_ < ui_->nuse; uu_++) if ((int)ui_->use[uu_] == s.vis[w][1]) { char un_[40]; e_rop_name(ui_->rop, un_, sizeof(un_)); fprintf(stderr, "stackobj:    value %d is used by %s at pc %d (pos %d)\n", s.vis[w][1], un_, ui_->pc, uu_); } } } }
+            }
+      }
+      if (ok && s.par > 0) {
+        /* a child of a container that is lent: the callee may move the child with it, so the child must not be used after that call either */
+        const RCons *K0 = &c->cons[s.par - 1];
+        int m, w;
+        for (m = 0; ok && m < K0->nls; m++)
+          for (w = 0; ok && w < s.nvis; w++)
+            if (s.vis[w][2] == 0 && sr_live_past_call(c, K0->ls, K0->nls, K0->ls[m][0], K0->ls[m][1], s.vis[w][0], s.vis[w][1])) {
+              ok = 0;
+              g_sr_line = -1;
+              if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d is a child of cons %d, lent at instance %d insn %d, but its value %d of instance %d is used after the call\n", c->hex, ki, s.par - 1, K0->ls[m][0], K0->ls[m][1], s.vis[w][1], s.vis[w][0]);
+            }
+      }
+      K->late = s.latestore;
+      if (ok && s.latestore && rg_stack_room(K) == 0) {
+        /* a field the class gains after its construction is added to the object here: the add needs room the engine's inline capacity cannot name (it would leave the region at every object) */
+        ok = 0;
+        g_sr_line = -1;
+        if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d has late fields (%u slots wanted, %d in the block)\n", c->hex, ki, rg_cons_cap(K), K->nn);
+      }
+      if (!ok && g_sr_line >= 0 && getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d (inst %d pc %d) escapes (region.c:%d)\n", c->hex, ki, K->inst, K->pc, g_sr_line);
       if (!ok && getenv("QJS_AOT_REGION_SRNOESC") != NULL) {
         /* the vkit knock-out build: an object the analysis refuses is made a stack object anyway, but only when the run sets QJS_AOT_REGION_SRKNOCK (otherwise the construct leaves
            for the generic body), so the case's ordinary run is right and the knocked run shows what the escape rules protect */
@@ -3877,10 +5458,76 @@ static void rg_sr_decide(RCtx *c) {
         if (ai >= 0) { c->cons[ai].sk_pair = ki; c->cons[ai].stack = 1; c->cons[ai].knock = 1; }
         ok = 1;
       }
-      if (!ok) { c->nskal = nskal0; if (K->sk_pair >= 0 && c->cons[K->sk_pair].stack) c->cons[K->sk_pair].stack = 0; K->sk_pair = -1; continue; }
+      if (!ok) { c->nskal = nskal0; if (K->sk_pair >= 0 && c->cons[K->sk_pair].stack) c->cons[K->sk_pair].stack = 0; K->sk_pair = -1; if (pass2 == 0 && g_sr_wait && getenv("QJS_AOT_REGION_NOLEND") == NULL) { defer[ki] = 1; ndefer++; } continue; }
+    }
+    if (s.par > 0) {
+      /* a stack child: its container's field holds it (the constructor's store), and the container migrates and releases it */
+      RCons *K0 = &c->cons[s.par - 1];
+      K0->chi = ki + 1;
+      snprintf(K0->cfield, sizeof(K0->cfield), "%s", s.pfield);
+      K->par = s.par;
+      if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d is held by field .%s of cons %d\n", c->hex, ki, s.pfield, s.par - 1);
+    }
+    {
+      /* the aliases of the object that were followed: a later child of it checks that none reads the field it holds */
+      int w, n0 = 0;
+      for (w = 0; w < s.nvis; w++) if (s.vis[w][2] == 0) n0++;
+      if (n0 <= 48) {
+        n0 = 0;
+        for (w = 0; w < s.nvis; w++) if (s.vis[w][2] == 0) { K->kvis[n0][0] = s.vis[w][0]; K->kvis[n0][1] = s.vis[w][1]; n0++; }
+        K->nkvis = n0;
+      } else K->nkvis = 0;
     }
     K->stack = 1;
+    K->nls = s.nls;
+    memcpy(K->ls, s.ls, sizeof(K->ls));
+    K->nst = s.nst;
+    K->stover = s.stover;
+    K->vok = s.vok;
+    K->vcov = s.vcov;
+    K->nvthis = s.nvthis;
+    { int m; for (m = 0; m < s.nvthis; m++) { K->vthis[m][0] = s.vthis[m]; K->vthis[m][1] = 0; } }
+    memcpy(K->st, s.st, sizeof(K->st));
+    K->nmat = s.nmat;
+    memcpy(K->mat, s.mat, sizeof(K->mat));
+    memcpy(K->matacc, s.matacc, sizeof(K->matacc));
+    if (s.retmat) {
+      int w;
+      K->accum = 1;
+      K->acn = 0;
+      for (w = 0; w < s.nvis; w++) if (s.vis[w][2] == 0 && s.vis[w][0] == 0 && K->acn < 16) K->acv[K->acn++] = s.vis[w][1];
+      if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d is an accumulator (returned by the root, %d values)\n", c->hex, ki, K->acn);
+    }
+    { int m; for (m = 0; m < s.nmat && g_nmatdef < 16; m++) if (s.mat[m][1] == 1 && !s.matacc[m]) { g_matdef_fn[g_nmatdef] = &c->in[s.mat[m][0]]->q; g_matdef_v[g_nmatdef++] = s.mat[m][4]; } }
+    if (s.nmat > 0) rg_note_park(c, ii);
     c->nstack++;
+  }
+  }
+  {
+    /* an accumulator's block is as large as the largest object assigned into it */
+    int kq, m;
+    for (kq = 0; kq < c->ncons; kq++) {
+      const RCons *Kq = &c->cons[kq];
+      if (!Kq->stack) continue;
+      for (m = 0; m < Kq->nmat; m++) if (Kq->matacc[m] > 0) {
+        RCons *K0 = &c->cons[Kq->matacc[m] - 1];
+        unsigned r = rg_stack_room(Kq);
+        if (r > 0 && (int)r > K0->accroom) K0->accroom = (int)r;
+      }
+    }
+  }
+  {
+    /* the stack slots: one per stack object and per Array of a pair; every block has the same size (the region's frame holds them as one array) */
+    int need = 0;
+    c->nss = 0;
+    for (ki = 0; ki < c->ncons; ki++) {
+      RCons *K = &c->cons[ki];
+      int b = K->kind == 1 ? 640 : (int)(8 + 48 + (rg_stack_room(K) > 0 ? (int)rg_stack_room(K) : (K->nn > 0 ? K->nn : 1)) * 16);
+      if (!K->stack) continue;
+      K->ss = c->nss++;
+      if (b > need) need = b;
+    }
+    c->skstride = (need + 15) / 16 * 16;
   }
   if (getenv("QJS_AOT_REGION_WHY")) for (ki = 0; ki < c->ncons; ki++) if (c->cons[ki].stack) fprintf(stderr, "stackobj: root %.8s cons %d (inst %d pc %d) kind %d%s\n", c->hex, ki, c->cons[ki].inst, c->cons[ki].pc, c->cons[ki].kind, c->cons[ki].kind == 0 && c->cons[ki].sk_pair >= 0 ? " with its Array" : "");
 }
@@ -3906,6 +5553,165 @@ int region_needs_digest(const char *hex) {
 
 int region_layout_for(char (*names)[40], int nn);
 int region_class_ambiguous(char (*names)[40], int nn);
+/* The fields of each stack object that can come to hold a counted reference: the release of its block reads only those. A field is left out when every store the analysis met into it
+   (the construct's own stores, the late adds, the stores through aliases) has a value of a number type (an int32 or a double the region guards where it is defined). An object with a
+   store the analysis did not list (more than 64, or a receiver it could not name), an Array pair, or a pointer to a child keeps the engine's full release.
+   QJS_AOT_REGION_NOSKIP=1 keeps every field in the loop. QJS_AOT_REGION_SKIPALL=1 (a vkit knock-out) leaves every field out, which leaks what a field holds. */
+static void rg_sk_fref(RCtx *c) {
+  int ki;
+  static int noskip = -1, skipall = -1;
+  if (noskip < 0) { noskip = getenv("QJS_AOT_REGION_NOSKIP") != NULL; skipall = getenv("QJS_AOT_REGION_SKIPALL") != NULL; }
+  for (ki = 0; ki < c->ncons; ki++) {
+    RCons *K = &c->cons[ki];
+    uint32_t mask = 0;
+    int q;
+    K->fref = ~0u;
+    if (!K->stack || K->kind != 0 || K->sk_pair >= 0 || noskip || K->accum || K->rslot) continue;
+    if (K->stover || K->nst == 0) { if (!skipall) continue; }
+    for (q = 0; q < K->nst && !skipall; q++) {
+      int n = K->st[q][0], v = K->st[q][1], fidx = K->st[q][2], ty;
+      if (n < 0 || n >= c->nin_total || c->in[n] == NULL) { mask = ~0u; break; }
+      ty = rg_tyof(c->in[n], v);
+      if (ty != RT_I32 && ty != RT_F64) mask |= fidx < 0 ? (K->nn < 32 && getenv("QJS_AOT_REGION_NOLATEMASK") == NULL ? ~0u << K->nn : ~0u) : 1u << fidx;   /* a late field's slot is not named here: every slot past the construction's own */
+    }
+    if (K->late && getenv("QJS_AOT_REGION_NOLATEMASK") == NULL) { unsigned room_ = rg_stack_room(K); if (room_ > 0 && room_ < 32) mask &= (1u << room_) - 1u; }   /* an object with late fields holds no more than its block's room: the late region of the mask ends there */
+    K->fref = mask;
+    if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d release reads fields %x of %d%s\n", c->hex, ki, mask, K->nn, K->late ? " + late" : "");
+  }
+}
+
+/* Virtual stack fields: a stack object whose every field access is one the analysis knows (a read or a write at a named field of an alias that is exactly the object) keeps its
+   fields in locals; the block is made as before (its header and shape are real) and the fields are written into it only where it is observed (an exit, before the migration).
+   vcls: the boxing the old store gave the field's value: 0 an int (JS_MKVAL INT), 1 a double made by arithmetic (double-tagged), 2 a typed double through the normalised box. A field
+   is virtual only if every store to it has the same class, so the block a materialise writes holds what the last store of the old code held. */
+static int rg_virt_off(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_REGION_NOVIRT") != NULL || getenv("QJS_AOT_REGION_F64NARROWEXIT") != NULL || getenv("QJS_AOT_REGION_F64NOCLAIM") != NULL; return v; }
+static void rg_virt_decide(RCtx *c) {
+  int ki, nv = 0, nmix = 0, nrej = 0;
+  int why = getenv("QJS_AOT_REGION_WHY") != NULL;
+  for (ki = 0; ki < c->ncons; ki++) {
+    RCons *K = &c->cons[ki];
+    unsigned full;
+    int q, j, cls[16], ok = 1, fresh_;
+    unsigned mixf_ = 0, noint_ = 0, seen_ = 0;
+    const char *r = "";
+    K->virt = 0;
+    if (rg_virt_off() || !K->stack || K->kind != 0) continue;
+    full = K->nn >= 16 ? 0xffffu : (1u << K->nn) - 1;
+    { static char rb_[160]; rb_[0] = 0;
+      if (!K->direct) strcat(rb_, "!direct ");
+      if (K->fref != 0) strcat(rb_, "fref ");
+      if (K->stover) strcat(rb_, "stover ");
+      if (K->nst == 0) strcat(rb_, "nst0 ");
+      if (K->late) strcat(rb_, "late ");
+      if (K->sk_pair >= 0) strcat(rb_, "pair ");
+      if (K->chi) strcat(rb_, "child ");
+      if (K->par) strcat(rb_, "isChild ");
+      if (K->nmat) strcat(rb_, "mat ");
+      if (K->accum) strcat(rb_, "accum ");
+      if (K->nrbs) strcat(rb_, "rbs ");
+      if (K->knock) strcat(rb_, "knock ");
+      if (!K->vok) strcat(rb_, "unclassified-use ");
+      if (K->nn <= 0 || K->nn > 16) strcat(rb_, "nn ");
+      if (K->nkvis <= 0) strcat(rb_, "nokvis ");
+      if (rb_[0]) r = rb_; }
+    if (!r[0] && (K->vcov & full) != full) r = "a field the constructor does not store on every path";
+    if (r[0]) { if (why) fprintf(stderr, "virtual: root %.8s cons %d stays a block (%s)\n", c->hex, ki, r); nrej++; continue; }
+    for (j = 0; j < 16; j++) cls[j] = -1;
+    for (q = 0; ok && q < K->nst; q++) {
+      int n = K->st[q][0], v = K->st[q][1], fx = K->st[q][2], ix = K->st[q][3], ty, cl;
+      RInst *I;
+      char tmp_[96];
+      if (n < 0 || n >= c->nin_total || c->in[n] == NULL || fx < 0 || ix < 0 || ix >= c->in[n]->q.ninsns) { ok = 0; r = "a store the analysis cannot place"; break; }
+      I = c->in[n];
+      ty = rg_tyof(I, v);
+      if (ty != RT_I32 && ty != RT_F64) { ok = 0; r = "a store of a value that is not a number"; break; }
+      /* the constructor's own store of a direct object is by slot index with no claim check, boxed through the normalised form; every other store is the plain one at a fixed slot */
+      fresh_ = I->fresh && I->cons > 0 && rg_is_this(&I->q, I->q.insns[ix].use[0]);
+      if (!fresh_) {
+        int tf_ = rg_trust_field(I, &I->q.insns[ix], 1, tmp_, sizeof(tmp_));
+        if (!tf_) { ok = 0; r = "a store with no fixed slot (trust_field)"; break; }
+        if (!g_rg_plain && __builtin_popcount(g_rg_cls) < 2) { ok = 0; r = "a store into a field of one kind that may be a reference (a claim may be broken by the store)"; break; }
+        if (rg_store_narrow(I, v, g_rg_cls)) { ok = 0; r = "a double store the layout claim narrows to an int"; break; }
+        seen_ |= 1u << fx;
+        if (!(g_rg_cls & (8u | 16u)) || !(g_rg_cls & (32u | 64u))) noint_ |= 1u << fx;   /* the claim must allow BOTH tags: an int (K_INT|K_INTOV) and a double (K_DBL|K_NUM) */
+      }
+      cl = ty == RT_I32 ? 0 : (!fresh_ && I->rw != NULL && I->rw[v] ? 1 : 2);
+      if (cls[fx] < 0) cls[fx] = cl;
+      else if (cls[fx] != cl) {
+        /* int and double stores of one number field: a number is the same JS value whichever tag the block holds, so the field is one double local and the block gets the normalised box
+           (int when exact, else double). Sound only where every plain store's claim already allows an int in the field (the block may then hold either tag at every store) */
+        if (cls[fx] != 3 && getenv("QJS_AOT_REGION_NOMIXBOX") == NULL) { cls[fx] = 3; mixf_ |= 1u << fx; }
+        else if (cls[fx] != 3) { ok = 0; r = "stores of different boxing classes"; nmix++; if (why) fprintf(stderr, "virtual:   mixed classes in cons %d field %d: %d then %d (store %d: fresh=%d rw=%d ty=%d)\n", ki, fx, cls[fx], cl, q, fresh_, I->rw != NULL && I->rw[v], ty); break; }
+      }
+    }
+    if (ok) for (j = 0; j < K->nn; j++) if (cls[j] < 0) { ok = 0; r = "a field that is never stored"; break; }
+    if (ok && getenv("QJS_AOT_REGION_MIXLOOSE") == NULL && (mixf_ & (noint_ | ~seen_))) { ok = 0; r = "stores of different boxing classes (no plain store whose claim allows both an int and a double)"; nmix++; }
+    if (ok) for (j = 0; j < K->nn; j++) if (cls[j] == 3) cls[j] = 2;
+    if (!ok) { if (why) fprintf(stderr, "virtual: root %.8s cons %d stays a block (%s)\n", c->hex, ki, r); nrej++; continue; }
+    for (j = 0; j < K->nn; j++) { K->vcls[j] = (unsigned char)cls[j]; K->vty[j] = cls[j] == 0 ? RT_I32 : RT_F64; }
+    { static int cnt_ = 0; const char *mx_ = getenv("QJS_AOT_REGION_VIRTMAX"), *mn_ = getenv("QJS_AOT_REGION_VIRTMIN"); int me_ = cnt_++; if ((mx_ != NULL && me_ >= atoi(mx_)) || (mn_ != NULL && me_ < atoi(mn_))) continue; }   /* bisection of a fault: only the constructs numbered [MIN, MAX) */
+    K->virt = 1;
+    nv++;
+    if (why) fprintf(stderr, "virtual: root %.8s cons %d (%s, %d fields) is virtual\n", c->hex, ki, K->gname, K->nn);
+  }
+  if (why || getenv("QJS_AOT_REGION_VIRTSTAT") != NULL) fprintf(stderr, "virtual: root %.8s: %d virtual, %d stay blocks (%d of them for mixed boxing classes)\n", c->hex, nv, nrej, nmix);
+}
+/* The virtual construct whose field `nm` an access of instance I (the receiver value u0, or the instance's `this` when thisop) reaches, and the field's index. */
+static int rg_virt_at(RCtx *c, const RInst *I, int u0, int thisop, const char *nm, int *fio) {
+  int ki, w, j;
+  for (ki = 0; ki < c->ncons; ki++) {
+    const RCons *K = &c->cons[ki];
+    int hit = 0;
+    if (!K->virt) continue;
+    if (thisop) { for (w = 0; w < K->nvthis; w++) if (K->vthis[w][0] == I->id) hit = 1; }
+    else for (w = 0; w < K->nkvis; w++) if (K->kvis[w][0] == I->id && K->kvis[w][1] == u0) hit = 1;
+    if (!hit) continue;
+    for (j = 0; j < K->nn && strcmp(K->names[j], nm) != 0; j++) {}
+    if (j == K->nn) return -1;
+    *fio = j;
+    return ki;
+  }
+  return -1;
+}
+/* the boxed form of virtual field j of construct ki, as the old store wrote it */
+static void rg_virt_box(const RCons *K, int ki, int j, char *buf, size_t cap) {
+  if (K->vcls[j] == 0) snprintf(buf, cap, "JS_MKVAL(JS_TAG_INT, vf_%d_%d)", ki, j);
+  else if (K->vcls[j] == 1) snprintf(buf, cap, "__JS_NewFloat64(vf_%d_%d)", ki, j);
+  else snprintf(buf, cap, "qjs_aot_box_num(vf_%d_%d, qjs_aot_fitsi(vf_%d_%d))", ki, j, ki, j);
+}
+/* a store into a virtual field: the local, the mask bit, and under VFCHECK the old store as well */
+static void rg_virt_put(RCtx *c, FILE *o, const RInst *I, int ki, int j, int u1, const char *recv) {
+  const RCons *K = &c->cons[ki];
+  char bx[160];
+  if (K->vty[j] == RT_F64 && rg_tyof(I, u1) == RT_I32) fprintf(o, "        vf_%d_%d = (double)%si%d; vs_%d |= %uu;\n", ki, j, I->pfx, u1, ki, 1u << j);
+  else fprintf(o, "        vf_%d_%d = %s%c%d; vs_%d |= %uu;\n", ki, j, I->pfx, K->vty[j] == RT_I32 ? 'i' : 'd', u1, ki, 1u << j);
+  if (getenv("QJS_AOT_REGION_VFCHECK") != NULL) {
+    rg_virt_box(K, ki, j, bx, sizeof(bx));
+    fprintf(o, "        if (Q2_CLAIM_BAD(%s, %du * QJS_AOT_SIZEOF_JSPROPERTY, %s) && !(Q2_LAYOUT_BROKEN(ctx) & (1ull << (*(const uint16_t *)(*(const unsigned char *const *)((const unsigned char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE) + QJS_AOT_OFF_SHAPE_LAYOUT_ID) - 1u)))) { fprintf(stderr, \"VFCHECK: the old store of cons %d field %d would have failed its layout claim\\n\"); abort(); }\n", recv, j, bx, recv, ki, j);
+    fprintf(o, "        *q2_slotp(%s, %du * QJS_AOT_SIZEOF_JSPROPERTY) = %s;   /* VFCHECK: the block the old code would hold */\n", recv, j, bx);
+  }
+}
+/* a read of a virtual field into the JSValue `dst` */
+/* where a virtual read's result goes: the typed local when the value is typed, else the boxed value */
+static void rg_virt_dst(const RInst *I, int dv, char *buf, size_t cap) {
+  int t = getenv("QJS_AOT_REGION_VTYOFF") != NULL ? RT_ANY : rg_tyof(I, dv);
+  if (t == RT_I32 || t == RT_F64) g_vty_dv = dv;
+  if (t == RT_I32) snprintf(buf, cap, "%si%d", I->pfx, dv);
+  else if (t == RT_F64) snprintf(buf, cap, "%sd%d", I->pfx, dv);
+  else snprintf(buf, cap, "%sv%d", I->pfx, dv);
+}
+static void rg_virt_get(RCtx *c, FILE *o, int ki, int j, const char *dst, const char *recv, int dty) {
+  if (getenv("QJS_AOT_REGION_VTYOFF") != NULL) dty = RT_ANY;
+  const RCons *K = &c->cons[ki];
+  char bx[160];
+  rg_virt_box(K, ki, j, bx, sizeof(bx));
+  if (getenv("QJS_AOT_REGION_VFCHECK") != NULL)
+    fprintf(o, "        { JSValue b_ = *q2_slotp(%s, %du * QJS_AOT_SIZEOF_JSPROPERTY), e_ = %s; if (!(vs_%d & %uu) || rg_vdiff(b_, e_)) { fprintf(stderr, \"VFCHECK read cons %d field %d: block %%llx local %%llx stored %%d\\n\", (unsigned long long)*(uint64_t *)&b_, (unsigned long long)*(uint64_t *)&e_, !!(vs_%d & %uu)); abort(); } }\n",
+            recv, j, bx, ki, 1u << j, ki, j, ki, 1u << j);
+  if (dty == RT_I32 || dty == RT_F64) fprintf(o, "        %s = vf_%d_%d;\n", dst, ki, j);
+  else fprintf(o, "        %s = %s;\n", dst, bx);
+}
+
 static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi, char *why, size_t whyn, int loopinl) {
   RCtx *c;
   char (*rootcur)[40];
@@ -3971,12 +5777,14 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   c->nin = 1;
   c->emit = 0;
   if (!rg_walk_inst(c, 0, NULL, root)) { snprintf(why, whyn, "%s", c->why[0] ? c->why : "the region does not compile"); goto cleanup; }
+  c->lent = rg_lent_mask(c, root);
+  rg_lent_pred_set(hex, c->lent);
   if (rg_trust_on()) {
     /* profitability: one C function holding thousands of inlined values compiles to spill-bound code (and minutes of compile); until a region can call a
        hot callee out of line, such a tree stays with the regions of its parts */
     int vt = 0, ia;
     for (ia = 0; ia < c->nin; ia++) if (!c->in[ia]->ool) vt += c->in[ia]->q.nvalues;
-    if (vt > (getenv("QJS_AOT_REGION_MAXV") ? atoi(getenv("QJS_AOT_REGION_MAXV")) : 2500)) { snprintf(why, whyn, "too large: %d values in %d inlined instances (profitability)", vt, c->nin); goto cleanup; }
+    if (vt > (getenv("QJS_AOT_REGION_MAXV") ? atoi(getenv("QJS_AOT_REGION_MAXV")) : 2800)) { snprintf(why, whyn, "too large: %d values in %d inlined instances (profitability)", vt, c->nin); goto cleanup; }
   }
   if (rg_trust_on() && getenv("QJS_AOT_REGION_NUMERIC") == NULL && !rg_any_construct(c) && !rg_any_ool(c) &&
       ((c->ncls == 0 && (c->nin == 1 || getenv("QJS_AOT_REGION_NOINLGATE") == NULL) && !rg_any_dispatch(c)) || (getenv("QJS_AOT_REGION_DBLGATE") != NULL && c->ngd == 0 && rg_stores_double(c)))) {   /* rule (b) is off by default (f64 S2): QJS_AOT_REGION_DBLGATE=1 brings it back */
@@ -4023,6 +5831,28 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     c->nin = 1;
     rg_sr_decide(c);
     rg_ty_decide(c);
+    rg_sk_fref(c);
+    rg_virt_decide(c);
+    if (getenv("QJS_AOT_REGION_NOVIRTTY") == NULL) {
+      int kv_, anyv_ = 0;
+      for (kv_ = 0; kv_ < c->ncons; kv_++) if (c->cons[kv_].virt) anyv_ = 1;
+      if (anyv_) {
+        /* the second type round may only refine the typed locals: every construct's storage decision (stack, virtual, escape, pairing, field boxing classes and coverage) must come out unchanged */
+        RCons *snap_ = getenv("QJS_AOT_REGION_VIRTCHECK") != NULL ? malloc((size_t)c->ncons * sizeof(RCons)) : NULL;
+        if (snap_ != NULL) memcpy(snap_, c->cons, (size_t)c->ncons * sizeof(RCons));
+        rg_ty_decide(c);
+        if (snap_ != NULL) {
+          for (kv_ = 0; kv_ < c->ncons; kv_++) {
+            const RCons *a_ = &snap_[kv_], *b_ = &c->cons[kv_];
+            if (a_->virt != b_->virt || a_->stack != b_->stack || a_->esc != b_->esc || a_->sk_pair != b_->sk_pair || a_->vok != b_->vok || a_->vcov != b_->vcov || a_->nn != b_->nn || a_->chi != b_->chi || a_->par != b_->par || memcmp(a_->vcls, b_->vcls, sizeof(a_->vcls)) != 0 || memcmp(a_->vty, b_->vty, sizeof(a_->vty)) != 0) {
+              fprintf(stderr, "VIRTCHECK: cons %d changed its storage decision in the second type round\n", kv_);
+              abort();
+            }
+          }
+          free(snap_);
+        }
+      }
+    }
     if (c->nnative > 0 && getenv("QJS_AOT_REGION_NATGATE") != NULL) {
       int ia, va, nf = 0;
       for (ia = 0; ia < c->nin_total; ia++) if (c->in[ia] != NULL && c->in[ia]->ty != NULL) for (va = 0; va < c->in[ia]->q.nvalues; va++) if (c->in[ia]->ty[va] == RT_F64) nf++;
@@ -4035,6 +5865,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   c->emit = 1;
   if (getenv("QJS_AOT_FASTSTATS") != NULL) {
     fprintf(o, "static unsigned long rgx_%s[%d], rgw_%s[4097];\n", hex, RG_MAXX + 1, hex);
+    if (getenv("QJS_AOT_FASTSTATS") != NULL) fprintf(o, "static unsigned long rgn_%s[%d], rgm_%s[%d];\n", hex, RG_MAXC + 1, hex, RG_MAXC + 1);
     
     fprintf(o, "static int rgxpc_%s[%d];\n", hex, RG_MAXX + 1);
   }
@@ -4096,11 +5927,38 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   /* the list starts in the region's stack buffer (a negative capacity) and moves to the heap when it fills */
   fprintf(o, "static __attribute__((noinline)) void rg_own_grow(JSValue **p, int *cap) { int oc = *cap < 0 ? -*cap : *cap, nc = oc * 2; JSValue *q = *cap < 0 ? malloc((size_t)nc * sizeof(JSValue)) : realloc(*p, (size_t)nc * sizeof(JSValue)); if (q == NULL) abort(); if (*cap < 0) memcpy(q, *p, (size_t)oc * sizeof(JSValue)); *p = q; *cap = nc; }\n");
   fprintf(o, "static inline __attribute__((always_inline)) JSValue rg_numnorm(JSValue v)\n{\n  if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) { double d = JS_VALUE_GET_FLOAT64(v); int32_t i = (int32_t)d; if (d == (double)i && !(i == 0 && __builtin_signbit(d))) return JS_MKVAL(JS_TAG_INT, i); }\n  return v;\n}\n");
-  fprintf(o, "static inline void rg_own_put(JSContext *ctx, JSValue **p, int *n, int *cap, JSValue v) { (void)ctx; if (!JS_VALUE_HAS_REF_COUNT(v)) return; if (*n >= (*cap < 0 ? -*cap : *cap)) rg_own_grow(p, cap); (*p)[(*n)++] = v; }\n");
-  fprintf(o, "static inline void rg_own_dup(JSContext *ctx, JSValue **p, int *n, int *cap, JSValue v) { if (!JS_VALUE_HAS_REF_COUNT(v)) return; q2_dup_p(v); rg_own_put(ctx, p, n, cap, v); }\n");
+  fprintf(o, "static inline __attribute__((always_inline)) void rg_own_put(JSContext *ctx, JSValue **p, int *n, int *cap, JSValue v) { (void)ctx; if (!JS_VALUE_HAS_REF_COUNT(v)) return; if (*n >= (*cap < 0 ? -*cap : *cap)) rg_own_grow(p, cap); (*p)[(*n)++] = v; }\n");
+  fprintf(o, "static inline __attribute__((always_inline)) void rg_own_dup(JSContext *ctx, JSValue **p, int *n, int *cap, JSValue v) { if (!JS_VALUE_HAS_REF_COUNT(v)) return; q2_dup_p(v); rg_own_put(ctx, p, n, cap, v); }\n");
   if (getenv("QJS_AOT_REGION_OWNSTAT") != NULL) fprintf(o, "static unsigned long q2_os_[4096]; __attribute__((destructor)) static void q2_os_dump(void) { int i; for (i = 0; i < 4096; i++) if (q2_os_[i]) fprintf(stderr, \"OWNRUN site %%d: %%lu\\n\", i, q2_os_[i]); }\n");
   fprintf(o, "static inline void rg_own_compact(JSContext *ctx, JSValue *p, int *n, int mark, const JSValue *keep, int nk) { int i, w = mark; for (i = mark; i < *n; i++) { int k, kept = 0; for (k = 0; k < nk; k++) if (JS_VALUE_GET_TAG(keep[k]) == JS_VALUE_GET_TAG(p[i]) && JS_VALUE_GET_PTR(keep[k]) == JS_VALUE_GET_PTR(p[i])) { kept = 1; break; } if (kept) p[w++] = p[i]; else JS_FreeValue(ctx, p[i]); } *n = w; }\n");
   fprintf(o, "static inline void rg_own_free(JSContext *ctx, JSValue *p, int n, int heap) { int i; for (i = 0; i < n; i++) JS_FreeValue(ctx, p[i]); if (heap) free(p); }\n#endif\n");
+  fprintf(o, "#ifndef RG_IMG_T\n#define RG_IMG_T 1\n"
+             "/* A stack object's block is made by copying an image: the bytes the engine's own qjs_aot_stack_object_init_cap writes for the class shape, taken once from a call of it. The words\n"
+             "   that point into the block itself (the gc list head, twice, and the property array) are written for the block they are copied to. The size of the image comes from the engine's\n"
+             "   layout header; an engine whose block is not the shape this assumes builds no image and every object is made by the call. */\n"
+             "#ifndef RG_IMGW\n#define RG_IMGW(room) ((8 + QJS_AOT_OFF_JSOBJECT_PROP + 16 + (room) * QJS_AOT_SIZEOF_JSPROPERTY) / 8)\n#define RG_IMGPW ((8 + QJS_AOT_OFF_JSOBJECT_PROP) / 8)\n#define RG_IMGPU (8 + QJS_AOT_OFF_JSOBJECT_PROP + 16)\n#endif\n"
+             "static int rg_img_build(JSContext *ctx, void *shape, unsigned cap, uint64_t *img, unsigned nw)\n{\n"
+             "  _Alignas(64) uint64_t b_[48] = {0};\n  JSValue t_;\n  unsigned i;\n  uintptr_t lo = (uintptr_t)b_, hi = lo + (uintptr_t)nw * 8;\n"
+             "  if (nw > 48 || (QJS_AOT_OFF_JSOBJECT_PROP & 7) != 0 || RG_IMGPW <= 2 || RG_IMGPW >= nw) return 0;\n"
+             "  t_ = qjs_aot_stack_object_init_cap(b_, (size_t)nw * 8, shape, cap);\n  if (JS_VALUE_GET_TAG(t_) != JS_TAG_OBJECT) return 0;\n"
+             "  for (i = 0; i < nw; i++) {\n    uint64_t w = b_[i];\n    int self = w >= lo && w < hi;\n"
+             "    if (i == 1 || i == 2) { if (w != lo + 8) goto bad; }\n    else if (i == RG_IMGPW) { if (w != lo + RG_IMGPU) goto bad; }\n    else if (self) goto bad;\n  }\n"
+             "  memcpy(img, b_, (size_t)nw * 8);\n  img[1] = img[2] = img[RG_IMGPW] = 0;\n  qjs_aot_stack_release(ctx, t_, JS_UNDEFINED);\n  return 1;\n bad:\n  qjs_aot_stack_release(ctx, t_, JS_UNDEFINED);\n  return 0;\n}\n"
+             "/* The release of a stack object none of whose fields can hold a reference: the shape's reference count goes down exactly as js_free_shape does it when the count stays above zero (the decrement,\n"
+             "   no other work); when it would reach zero the engine's release does it, with the count untouched. */\n"
+             "static inline __attribute__((always_inline)) void rg_skrel0(JSContext *ctx, JSValue v)\n{\n"
+             "  uint8_t *p_ = (uint8_t *)JS_VALUE_GET_PTR(v);\n  void **shp_ = (void **)(p_ + QJS_AOT_OFF_JSOBJECT_SHAPE);\n  int *rc_ = (int *)((uint8_t *)*shp_ - QJS_AOT_RC_BACK);\n"
+             "  if (__builtin_expect(*rc_ > 1, 1)) { --*rc_; *shp_ = NULL; } else qjs_aot_stack_release_m(ctx, v, 0u);\n}\n"
+             "/* the release of a stack object whose reference-holding fields are the bits of a constant mask (below 8): those fields are tested in line, then the shape reference is dropped */\n"
+             "#define RG_SKF_(i_) if (((m) >> (i_)) & 1u && (i_) < n_ && JS_VALUE_HAS_REF_COUNT(f_[i_])) JS_FreeValue(ctx, f_[i_]);\n"
+             "static inline __attribute__((always_inline)) void rg_skrelm(JSContext *ctx, JSValue v, uint32_t m)\n{\n"
+             "  uint8_t *p_ = (uint8_t *)JS_VALUE_GET_PTR(v);\n  void **shp_ = (void **)(p_ + QJS_AOT_OFF_JSOBJECT_SHAPE);\n"
+             "  int n_ = *(const int *)((const uint8_t *)*shp_ + QJS_AOT_OFF_JSSHAPE_PROP_COUNT);\n  JSValue *f_ = q2_slotp(v, 0);\n"
+             "  RG_SKF_(0) RG_SKF_(1) RG_SKF_(2) RG_SKF_(3) RG_SKF_(4) RG_SKF_(5) RG_SKF_(6) RG_SKF_(7)\n"
+             "  { int *rc_ = (int *)((uint8_t *)*shp_ - QJS_AOT_RC_BACK);\n"
+             "    if (__builtin_expect(*rc_ > 1, 1)) { --*rc_; *shp_ = NULL; } else qjs_aot_stack_release_m(ctx, v, 0u); }\n}\n#undef RG_SKF_\n"
+             "static inline __attribute__((always_inline)) void rg_img_copy(uint64_t *d, const uint64_t *img, unsigned nw)\n{\n"
+             "  memcpy(d, img, (size_t)nw * 8);\n  d[1] = d[2] = (uint64_t)(uintptr_t)(d + 1);\n  d[RG_IMGPW] = (uint64_t)((uintptr_t)d + RG_IMGPU);\n}\n#endif\n");
   fprintf(o, "#ifndef RG_EQV_T\n#define RG_EQV_T 1\n/* a == b (strict: ===) when the tags decide it with no code run: 1 with the answer, 0 to leave */\n");
   fprintf(o, "static inline __attribute__((always_inline)) int rg_eqv(JSValue a, JSValue b, int strict, int *out)\n{\n  int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);\n");
   fprintf(o, "  int na = ta == JS_TAG_NULL || ta == JS_TAG_UNDEFINED, nb = tb == JS_TAG_NULL || tb == JS_TAG_UNDEFINED;\n");
@@ -4126,7 +5984,111 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   fprintf(o, "  q2_dup_p(v);\n  (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] = v;\n  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count + 1;\n");
   fprintf(o, "  *lenp = JS_MKVAL(JS_TAG_INT, (int32_t)(count + 1));\n  return 1;\n}\n#endif\n");
   /* function header, entry gate (as the speculative body's) */
+  if (c->nss > 0) {
+    /* the exits' work on the stack blocks (migrating the live ones to the heap, releasing them) is two functions per region, not text in every exit stub: the blocks are an array of
+       equal blocks (b), their liveness (on) and the heap objects migration made (h); pr[i] is the Array slot paired with object slot i, -1 for none, -2 for an Array slot */
+    int g1, w = c->skstride / 8;
+    fprintf(o, "static const signed char rg_skp_%s[%d] = {", hex, c->nss);
+    for (g1 = 0; g1 < c->nss; g1++) {
+      int pr = -2, q;
+      for (q = 0; q < c->ncons; q++)
+        if (c->cons[q].stack && c->cons[q].ss == g1) pr = c->cons[q].kind == 1 ? -2 : c->cons[q].par > 0 ? -3 : c->cons[q].sk_pair >= 0 ? c->cons[c->cons[q].sk_pair].ss : -1;
+      fprintf(o, "%s%d", g1 ? ", " : "", pr);
+    }
+    fprintf(o, "};\n");
+    /* a container's stack child (the slot of the object its field holds) and a child's container: the pair migrates together, and a child whose container is gone moves alone */
+    fprintf(o, "static const signed char rg_skc_%s[%d] = {", hex, c->nss);
+    for (g1 = 0; g1 < c->nss; g1++) {
+      int pc_ = -1, q;
+      for (q = 0; q < c->ncons; q++)
+        if (c->cons[q].stack && c->cons[q].ss == g1 && c->cons[q].chi > 0) pc_ = c->cons[c->cons[q].chi - 1].ss;
+      fprintf(o, "%s%d", g1 ? ", " : "", pc_);
+    }
+    fprintf(o, "};\nstatic const signed char rg_skq_%s[%d] = {", hex, c->nss);
+    for (g1 = 0; g1 < c->nss; g1++) {
+      int pc_ = -1, q;
+      for (q = 0; q < c->ncons; q++)
+        if (c->cons[q].stack && c->cons[q].ss == g1 && c->cons[q].par > 0) pc_ = c->cons[c->cons[q].par - 1].ss;
+      fprintf(o, "%s%d", g1 ? ", " : "", pc_);
+    }
+    fprintf(o, "};\n");
+    {
+      /* the materialise of each virtual object: its fields into the block, with the boxing the old stores gave them (only the fields stored so far: vs bit j) */
+      int kv, any_ = 0;
+      for (kv = 0; kv < c->ncons; kv++) if (c->cons[kv].virt) any_ = 1;
+      if (any_) {
+        fprintf(o, "#ifndef RG_VDIFF\n#define RG_VDIFF\nstatic inline int rg_vdiff(JSValue a, JSValue b) {\n  if (JS_VALUE_GET_TAG(a) != JS_VALUE_GET_TAG(b)) return 1;\n"
+                   "  if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) return JS_VALUE_GET_INT(a) != JS_VALUE_GET_INT(b);\n"
+                   "  { double x = JS_VALUE_GET_FLOAT64(a), y = JS_VALUE_GET_FLOAT64(b); return memcmp(&x, &y, sizeof x) != 0; }\n}\n#endif\n");
+        for (kv = 0; kv < c->ncons; kv++) {
+          const RCons *VK = &c->cons[kv];
+          int j;
+          if (!VK->virt) continue;
+          fprintf(o, "static __attribute__((noinline, cold)) void rg_vmat_%s_%d(JSContext *ctx, uint64_t *blk, unsigned vs", hex, kv);
+          for (j = 0; j < VK->nn; j++) fprintf(o, ", %s vf%d", VK->vty[j] == RT_I32 ? "int32_t" : "double", j);
+          fprintf(o, ") {\n  JSValue ob_ = JS_MKPTR(JS_TAG_OBJECT, (void *)((uint8_t *)blk + 8)); (void)ctx;\n");
+          if (getenv("QJS_AOT_REGION_VFCHECK") == NULL) {
+            /* the block of a virtual object is made here, when something first observes it: as the construct would have made it (the image copy and the shape's reference, or the engine's init), then the defaults of the prototype */
+            if (rg_img_ok(VK))
+              fprintf(o, "  if (__builtin_expect(rg_imgok_%s_%d, 1)) { rg_img_copy(blk, rg_img_%s_%d, RGIMGW_%s_%d); ++*(int *)((uint8_t *)rgc_s_%s_%d - QJS_AOT_RC_BACK); }\n  else ", hex, kv, hex, kv, hex, kv, hex, kv);
+            fprintf(o, "{ JSValue t_ = qjs_aot_stack_object_init_cap(blk, %du, rgc_s_%s_%d, 0u); if (JS_VALUE_GET_TAG(t_) == JS_TAG_UNINITIALIZED) abort(); }\n", c->skstride, hex, kv);
+            for (j = 0; j < VK->nn; j++)
+              if (VK->pre & (1u << j)) fprintf(o, "  *q2_slotp(ob_, %uu * QJS_AOT_SIZEOF_JSPROPERTY) = rgc_dv_%s_%d[%d];\n", j, hex, kv, j);
+          }
+          for (j = 0; j < VK->nn; j++) {
+            char bx[160];
+            if (VK->vcls[j] == 0) snprintf(bx, sizeof(bx), "JS_MKVAL(JS_TAG_INT, vf%d)", j);
+            else if (VK->vcls[j] == 1) snprintf(bx, sizeof(bx), "__JS_NewFloat64(vf%d)", j);
+            else snprintf(bx, sizeof(bx), "qjs_aot_box_num(vf%d, qjs_aot_fitsi(vf%d))", j, j);
+            if (getenv("QJS_AOT_REGION_VFCHECK") != NULL)
+              fprintf(o, "  if (vs & %uu) { JSValue b_ = *q2_slotp(ob_, %uu * QJS_AOT_SIZEOF_JSPROPERTY), e_ = %s; if (rg_vdiff(b_, e_)) { fprintf(stderr, \"VFCHECK materialise cons %d field %d\\n\"); abort(); } }\n", 1u << j, j, bx, kv, j);
+            fprintf(o, "  if (vs & %uu) *q2_slotp(ob_, %uu * QJS_AOT_SIZEOF_JSPROPERTY) = %s;\n", 1u << j, j, bx);
+          }
+          fprintf(o, "}\n");
+        }
+      }
+    }
+    fprintf(o, "#define RG_SKV(i_) JS_MKPTR(JS_TAG_OBJECT, (void *)((uint8_t *)(b + (size_t)(i_) * %d) + 8))\n", w);
+    fprintf(o, "static __attribute__((noinline, cold)) int rg_skm_%s(JSContext *ctx, uint64_t *b, int *on, JSValue *h) {\n  JSValue ha_ = JS_UNDEFINED; int i;\n  h[%d] = JS_NULL;   /* heap objects may be parked in h: the release looks */\n  for (i = 0; i < %d; i++) {\n    int a = rg_skp_%s[i], ch = rg_skc_%s[i];\n"
+               "    if (a == -2 || !(on[i] || (a >= 0 && on[a]))) continue;\n"
+               "    if (a == -3 && on[rg_skq_%s[i]]) continue;   /* a child moves with its container */\n"
+               "    if (ch >= 0 && on[ch]) { if (!qjs_aot_stack_migrate_child(ctx, on[i] ? RG_SKV(i) : JS_UNDEFINED, RG_SKV(ch), &h[i], &h[ch])) return 0; on[i] = 0; on[ch] = 0; continue; }\n"
+               "    if (!qjs_aot_stack_migrate(ctx, on[i] ? RG_SKV(i) : JS_UNDEFINED, a >= 0 && on[a] ? RG_SKV(a) : JS_UNDEFINED, &h[i], a >= 0 ? &h[a] : &ha_)) return 0;\n"
+               "    on[i] = 0; if (a >= 0) on[a] = 0;\n  }\n  return 1;\n}\n", hex, c->nss, c->nss, hex, hex, hex);
+    /* the release of every live block, one straight-line test per slot (the slot's pair and field mask are known here) */
+    fprintf(o, "static void rg_skr_%s(JSContext *ctx, uint64_t *b, int *on, JSValue *h) {\n", hex);
+    for (g1 = 0; g1 < c->nss; g1++) {
+      int q, kq = -1;
+      for (q = 0; q < c->ncons; q++) if (c->cons[q].stack && c->cons[q].ss == g1) kq = q;
+      if (kq >= 0 && c->cons[kq].kind != 1) {
+        const RCons *Kq = &c->cons[kq];
+        if (Kq->sk_pair >= 0) {
+          int pj = c->cons[Kq->sk_pair].ss;
+          fprintf(o, "  if (on[%d] || on[%d]) { qjs_aot_stack_release(ctx, on[%d] ? RG_SKV(%d) : JS_UNDEFINED, on[%d] ? RG_SKV(%d) : JS_UNDEFINED); on[%d] = 0; on[%d] = 0; }\n", g1, pj, g1, g1, pj, pj, g1, pj);
+        } else if (Kq->fref == 0 && getenv("QJS_AOT_REGION_MASKCHECK") == NULL && getenv("QJS_AOT_REGION_NOINLREL") == NULL)
+          fprintf(o, "  if (on[%d]) { rg_skrel0(ctx, RG_SKV(%d)); on[%d] = 0; }\n", g1, g1, g1);
+        else if (Kq->fref != ~0u && (Kq->fref >> 8) == 0 && getenv("QJS_AOT_REGION_MASKCHECK") == NULL && getenv("QJS_AOT_REGION_NOINLREL") == NULL)
+          fprintf(o, "  if (on[%d]) { rg_skrelm(ctx, RG_SKV(%d), %uu); on[%d] = 0; }\n", g1, g1, Kq->fref, g1);
+        else if (Kq->fref != ~0u)
+          fprintf(o, "  if (on[%d]) { qjs_aot_stack_release_m(ctx, RG_SKV(%d), %uu); on[%d] = 0; }\n", g1, g1, Kq->fref, g1);
+        else
+          fprintf(o, "  if (on[%d]) { qjs_aot_stack_release(ctx, RG_SKV(%d), JS_UNDEFINED); on[%d] = 0; }\n", g1, g1, g1);
+      }
+    }
+    fprintf(o, "  if (__builtin_expect(JS_VALUE_GET_TAG(h[%d]) != JS_TAG_UNDEFINED, 0)) { int i; for (i = 0; i <= %d; i++) { if (JS_VALUE_HAS_REF_COUNT(h[i])) JS_FreeValue(ctx, h[i]); h[i] = JS_UNDEFINED; } }\n", c->nss, c->nss);
+    fprintf(o, "}\n#undef RG_SKV\n");
+  }
+  if (c->lent != 0) {
+    /* parameters a caller may have lent as stack blocks: whatever leaves this body for another body that reads the arguments (the generic or the speculative one, an exit stub) first moves them to
+       the heap, and the arguments the callee sees are the heap objects. Every `aot_g_`/`aot_fs_` call in this function goes through the move. */
+    int k_;
+    fprintf(o, "#define RG_BORP() ({ JSValue *ba_ = *(JSValue **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_ARG_BUF); int bc_ = (int)((*(uint64_t *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_HDR_PACK) >> 16) & 0xffffu); (void)ba_; (void)bc_;");
+    for (k_ = 0; k_ < 8; k_++) if ((c->lent >> k_) & 1) fprintf(o, " if (%d < bc_ && __builtin_expect(!qjs_aot_stack_unlend(ctx, &ba_[%d]), 0)) return JS_EXCEPTION;", k_, k_);
+    fprintf(o, " 0; })\n");
+    fprintf(o, "#define aot_g_%s(a_, b_, c_, d_) (RG_BORP(), (aot_g_%s)(a_, b_, c_, d_))\n#define aot_fs_%s(a_, b_, c_, d_) (RG_BORP(), (aot_fs_%s)(a_, b_, c_, d_))\n", hex, hex, hex, hex);
+  }
   fprintf(o, "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, uint32_t entry_pc)\n{\n", e_linkage(), hex);
+  if (rg_has_retslot(c)) fprintf(o, "    JSValue *rs_ = q2_rs_pending; q2_rs_pending = NULL;   /* the shell the entry handed over, if any */\n");
   fprintf(o, "    if (__builtin_expect(e_gate[%d] != 0 || entry_pc != 0, 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n", fi, hex);
   fprintf(o, "    _Static_assert(%d < QJS_AOT_NFUNCS, \"function index\");\n    E_SEAL(ctx, f);\n", fi);
   fprintf(o, "    {\n    JSValue *f_argv = *(JSValue **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_ARG_BUF);\n");
@@ -4161,7 +6123,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   fprintf(o, " } }\n");
   if (rg_trust_on()) fprintf(o, "    if (rg_armed_%s && __builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1), 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n", hex, hex, hex);
   /* the functions the region's constructs name, learned (with their facts) before anything is borrowed */
-  for (g = 0; g < c->ncons; g++) if (c->cons[g].kind != 2) fprintf(o, "    if (__builtin_expect(!rgc_ok_%s_%d, 0) && !rg_clearn_%s_%d(ctx)) return aot_g_%s(ctx, f, fr, entry_pc);\n", hex, g, hex, g, hex);
+  for (g = 0; g < c->ncons; g++) if (c->cons[g].kind != 2 && !c->cons[g].rslot) fprintf(o, "    if (__builtin_expect(!rgc_ok_%s_%d, 0) && !rg_clearn_%s_%d(ctx)) return aot_g_%s(ctx, f, fr, entry_pc);\n", hex, g, hex, g, hex);
   /* the globals the region reads as constants */
   for (g = 0; g < c->ngl; g++) fprintf(o, "    JSValue rgc_%d;\n", g);
   if (c->ngl > 0 && rg_trust_on()) {
@@ -4185,26 +6147,25 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   if (c->ngl > 0 && rg_trust_on()) fprintf(o, "    if (rg_armed_%s && rgk_try_%s < 4) rg_kfacts_%s(ctx);\n    }\n", hex, hex, hex);
   }
   for (g = 0; g < c->ncons; g++) fprintf(o, "    JSValue rn_%d = JS_UNDEFINED;\n", g);
-  fprintf(o, "    JSValue sk_ho = JS_UNDEFINED, sk_ha = JS_UNDEFINED; (void)sk_ho; (void)sk_ha;\n");
   for (g = 0; g < c->ncons; g++)
-    if (c->cons[g].stack) {
-      /* a block of the frame: [JSMallocBlockHeader][body]; the object sits 8 bytes in. Its references are counted ones held by native code (the collector's trial decrement leaves them positive: roots). */
-      fprintf(o, "    _Alignas(16) uint64_t skb_%d[80]; int sk_%d = 0; JSValue rnh_%d = JS_UNDEFINED; (void)skb_%d;\n#define SKV_%d JS_MKPTR(JS_TAG_OBJECT, (void *)((uint8_t *)skb_%d + 8))\n", g, g, g, g, g, g);
+    if (c->cons[g].virt) {
+      int j;
+      fprintf(o, "    unsigned vs_%d = 0; int vk_%d = 0; (void)vs_%d; (void)vk_%d;\n", g, g, g, g);
+      for (j = 0; j < c->cons[g].nn; j++) fprintf(o, "    %s vf_%d_%d = 0; (void)vf_%d_%d;\n", c->cons[g].vty[j] == RT_I32 ? "int32_t" : "double", g, j, g, j);
     }
-  {
-    /* SKFIX(x): x, or the heap object a migration made when x is a stack object (only meaningful after rg_sk_migrate) */
-    int any_ = 0;
-    /* variadic: the argument may be a compound literal (JS_UNDEFINED) whose commas the preprocessor would split */
-    fprintf(o, "#define SKFIX(...) ({ JSValue skx_ = (__VA_ARGS__); (");
+  if (c->nss > 0) {
+    /* the stack blocks of the frame: [JSMallocBlockHeader][body] each, the object 8 bytes in. Their references are counted ones held by native code (the collector's trial decrement
+       leaves them positive: roots). sks_on: the block is alive; sks_h: the heap object a migration made of it (the region owns it). */
+    fprintf(o, "    _Alignas(16) uint64_t sks_b[%d][%d]; int sks_on[%d] = {0}; JSValue sks_h[%d], sks_m[%d]; JSValue sk_ha = JS_UNDEFINED; (void)sk_ha; (void)sks_b; (void)sks_m;\n    { int i_; for (i_ = 0; i_ <= %d; i_++) { sks_h[i_] = JS_UNDEFINED; } }\n",
+            c->nss, c->skstride / 8, c->nss, c->nss + 1, c->nss, c->nss);
     for (g = 0; g < c->ncons; g++)
-      if (c->cons[g].stack) {
-        fprintf(o, "(JS_VALUE_GET_TAG(skx_) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(skx_) == JS_VALUE_GET_PTR(SKV_%d)) ? %s : ", g, c->cons[g].kind == 0 ? "sk_ho" : "sk_ha");
-        any_ = 1;
-      }
-    fprintf(o, "skx_); })\n");
-    (void)any_;
-    fprintf(o, "#define RG_PM(R_, I_) ({ JSValue pmr_ = JS_GetPropertyStr(ctx, SKFIX(R_), rg_pmn_[I_]); JS_FreeValue(ctx, pmr_); pmr_; })\n");
-  }
+      if (c->cons[g].stack)
+        fprintf(o, "#define skb_%d sks_b[%d]\n#define sk_%d sks_on[%d]\n#define rnh_%d sks_h[%d]\n#define SKV_%d JS_MKPTR(JS_TAG_OBJECT, (void *)((uint8_t *)sks_b[%d] + 8))\n", g, c->cons[g].ss, g, c->cons[g].ss, g, c->cons[g].ss, g, c->cons[g].ss);
+    /* SKFIX(x): x, or the heap object a migration made when x is a stack block (only meaningful after the exit's migration) */
+    fprintf(o, "#define SKFIX(...) ({ JSValue skx_ = (__VA_ARGS__); (JS_VALUE_GET_TAG(skx_) == JS_TAG_OBJECT && (uintptr_t)JS_VALUE_GET_PTR(skx_) - (uintptr_t)sks_b < sizeof sks_b) ? sks_h[((uintptr_t)JS_VALUE_GET_PTR(skx_) - (uintptr_t)sks_b) / %d] : %s; })\n", c->skstride, c->lent != 0 ? "qjs_aot_stack_forward(skx_)" : "skx_");
+  } else if (c->lent != 0) fprintf(o, "#define SKFIX(...) qjs_aot_stack_forward(__VA_ARGS__)\n");
+  else fprintf(o, "#define SKFIX(...) (__VA_ARGS__)\n");
+  fprintf(o, "#define RG_PM(R_, I_) ({ JSValue pmr_ = JS_GetPropertyStr(ctx, SKFIX(R_), rg_pmn_[I_]); JS_FreeValue(ctx, pmr_); pmr_; })\n");
   fprintf(o, "    JSValue rgo_b_[64]; JSValue *rgo_ = rgo_b_; int rgon_ = 0, rgoc_ = -64; (void)rgon_; (void)rgoc_;\n");
   fprintf(o, "    int rgmk_[48] = {0}; (void)rgmk_;\n");
   /* the owned list is bounded: past this many entries a site that parked one leaves the region through its ordinary exit (the frame state takes what it needs, the list is freed, the
@@ -4213,11 +6174,9 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   else fprintf(o, "#define RG_OWNCAP %d\n", getenv("QJS_AOT_REGION_NOOWNCAP") != NULL ? 0x7fffffff : getenv("QJS_AOT_REGION_OWNCAP") ? atoi(getenv("QJS_AOT_REGION_OWNCAP")) : 65536);
   fprintf(o, "#define RG_FREE_OWNED() do {");
   for (g = 0; g < c->ncons; g++) {
-    if (c->cons[g].stack) {
-      if (c->cons[g].kind == 0) { RStr t = {0}; rg_sk_release_text(c, g, &t); fprintf(o, " %s", t.p ? t.p : ""); free(t.p); }
-      fprintf(o, " JS_FreeValue(ctx, rnh_%d);", g);
-    } else fprintf(o, " JS_FreeValue(ctx, rn_%d);", g);
+    if (!c->cons[g].stack) fprintf(o, " JS_FreeValue(ctx, rn_%d);", g);
   }
+  if (c->nss > 0) fprintf(o, " rg_skr_%s(ctx, &sks_b[0][0], sks_on, sks_h);", hex);
   fprintf(o, " if (rgon_) { rg_own_free(ctx, rgo_, rgon_, rgoc_ > 0); rgo_ = rgo_b_; rgon_ = 0; rgoc_ = -64; }");
   fprintf(o, " } while (0)\n");
   /* the values of every instance are locals of the function: an exit stub builds the inlined frames from them */
@@ -4256,6 +6215,26 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
         if (z < blen && buf[z] == ';' && num < c->nxit) used[num] = 1;
       }
     }
+    if (getenv("QJS_AOT_REGION_EPCENSUS") != NULL) {
+      int *seen = calloc((size_t)c->effn + 2, sizeof(int)), *cnt = calloc((size_t)c->effn + 2, sizeof(int));
+      int nus = 0, nep = 0, multi = 0, nd = 0, ndok = 0, sumlive = 0, k;
+      unsigned char *cu = calloc((size_t)c->nxit + 1, 1);
+      if (seen == NULL || cnt == NULL || cu == NULL) abort();
+      for (k = 0; k < c->ncen; k++) {
+        if (c->cen[k].xi >= c->nxit || !used[c->cen[k].xi]) continue;
+        cnt[c->cen[k].ep]++;
+      }
+      for (k = 0; k < c->ncen; k++) {
+        int e_ = c->cen[k].ep, xi_ = c->cen[k].xi;
+        if (xi_ >= c->nxit || !used[xi_] || cu[xi_]) continue;
+        cu[xi_] = 1; nus++;
+        if (!seen[e_]) { seen[e_] = 1; nep++; sumlive += c->effcnt[e_]; }
+        if (cnt[e_] >= 2) multi++;
+        if (c->cen[k].d > 0) { nd++; if (c->cen[k].outerok) ndok++; }
+      }
+      fprintf(stderr, "epcensus %s: used stubs %d, distinct effect points %d, stubs in a stretch of 2+ exits %d, summed live-in values %d, stubs in inlined frames %d, of those with no effect in the inner frames %d\n", hex, nus, nep, multi, sumlive, nd, ndok);
+      free(seen); free(cnt); free(cu);
+    }
     for (i = 0; i < c->nxit; i++) {
       RXit *x = &c->xit[i];
       if (!used[i]) continue;
@@ -4277,11 +6256,20 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   }
   fprintf(o, "#undef RG_FREE_OWNED\n");
   fprintf(o, "    }\n}\n\n");
+  fprintf(o, "#undef SKFIX\n#undef RG_PM\n");
+  if (c->lent != 0) fprintf(o, "#undef RG_BORP\n#undef aot_g_%s\n#undef aot_fs_%s\n", hex, hex);
+  for (g = 0; g < c->ncons; g++) if (c->cons[g].stack) fprintf(o, "#undef skb_%d\n#undef sk_%d\n#undef rnh_%d\n#undef SKV_%d\n", g, g, g, g);
   rg_ty_undefs(c, o);   /* the boxed-view macros of typed values end with the function */
   if (getenv("QJS_AOT_FASTSTATS") != NULL) {
     int si;
     fprintf(o, "static void __attribute__((destructor)) rg_site_print_%s(void) {\n", hex);
     for (si = 0; si < c->nsite; si++) fprintf(o, "  if (rgw_%s[%d]) fprintf(stderr, \"region %s exit source %s: %%lu\\n\", rgw_%s[%d]);\n", hex, si, hex, c->site[si].what, hex, si);
+    for (si = 0; si < c->ncons; si++) {
+      const RCons *K = &c->cons[si];
+      fprintf(o, "  if (rgn_%s[%d]) fprintf(stderr, \"region %s alloc cons %d inst %d pc %d kind %d class %s fields %d direct %d stack %d esc %d fwd %d: %%lu\\n\", rgn_%s[%d]);\n",
+              hex, si, hex, si, K->inst, K->pc, K->kind, K->gname[0] ? K->gname : (K->npath > 0 ? K->path[K->npath - 1] : "?"), K->nn, K->direct, K->stack, K->esc, K->fwd, hex, si);
+      if (K->stack && K->nmat > 0) fprintf(o, "  if (rgm_%s[%d]) fprintf(stderr, \"region %s moved cons %d inst %d pc %d class %s: %%lu\\n\", rgm_%s[%d]);\n", hex, si, hex, si, K->inst, K->pc, K->gname, hex, si);
+    }
     fprintf(o, "}\n");
   }
   fclose(o);
@@ -4356,7 +6344,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     size_t q3;
     char cs_[16];
     for (q3 = 0; q3 + 12 < blen; q3++) if (memcmp(buf + q3, "rg_own_dup(ctx", 14) == 0 || memcmp(buf + q3, "rg_own_put(ctx", 14) == 0) nsite_++;
-    cap_ = rg_has_loop(root) ? 16 : (nsite_ > 0 ? nsite_ : 1);
+    cap_ = rg_has_loop(root) ? (getenv("QJS_AOT_REGION_OWNBUF") ? atoi(getenv("QJS_AOT_REGION_OWNBUF")) : 64) : (nsite_ > 0 ? nsite_ : 1);
     if (cap_ > 64) cap_ = 64;
     snprintf(cs_, sizeof(cs_), "%d", cap_);
     for (q3 = 0; q3 + 10 < blen; q3++) {
@@ -4380,6 +6368,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
       for (k_ = 0; k_ < c->ncp; k_++) if (!c->cpk[k_] && rg_f64_on() && getenv("QJS_AOT_REGION_NOCPLOCAL") == NULL) fprintf(f, "    JSValue rgq_%d = rgp_%s[%d]; (void)rgq_%d;\n", k_, hex, k_, k_);
       for (k_ = 0; k_ < c->nmemo; k_++)
         fprintf(f, "    JSValue rgm_%d; JSValue *rgma_%d; uint32_t rgmc_%d; uint8_t rgmv_%d = 0; (void)rgm_%d; (void)rgma_%d; (void)rgmc_%d;\n", k_, k_, k_, k_, k_, k_, k_);
+      for (k_ = 0; k_ < c->ndx; k_++) fprintf(f, "    int rgd_%d = -1; (void)rgd_%d;\n", k_, k_);
       if (c->hoist.p) fputs(c->hoist.p, f);
       fwrite(mk_ + 9, 1, blen - pre_ - 9, f);
     } else fwrite(buf, 1, blen, f);
@@ -4395,6 +6384,9 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
       fprintf(stderr, "\n");
     }
   }
+  if (f != NULL && getenv("QJS_AOT_REGION_NOBORROWCHECK") == NULL && rg_borrow_check(c, root)) { fprintf(stderr, "qjsaot: a lent root stores or keeps a lent value (BORROWCHECK)\n"); abort(); }
+  if (f != NULL) rg_lent_real_set(hex, c->lent);
+  if (f != NULL && rg_has_retslot(c) && g_nrs_real < 64 && !region_retslot_real(hex)) snprintf(g_rs_real[g_nrs_real++], 33, "%s", hex);
   ok = 1;
   goto done;
 cleanup:
@@ -4405,6 +6397,7 @@ done:
   if (ok) for (i = 1; i < c->nincap; i++) if (c->in[i] != NULL && c->in[i]->g != NULL) q2_free(&c->in[i]->q);
   for (i = 0; i < c->nincap; i++) if (c->in[i] != NULL) { free(c->in[i]->mname); free(c->in[i]->mpc); free(c->in[i]->ty); free(c->in[i]->rw); if (i > 0) free(c->in[i]->cur); free(c->in[i]); }
   for (i = 0; i < c->nxit; i++) { free(c->xit[i].root); free(c->xit[i].rest); }
+  free(c->cen); free(c->effcnt);
   free(c->in);
   free(c->xit);
   free(c->ools.p); free(c->hoist.p); free(c->orig);
